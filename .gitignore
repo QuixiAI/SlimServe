@@ -217,6 +217,19 @@ _build/
 *.hip
 *_hip*
 hip_compat.h
+!csrc/quantization/gptq_marlin/gptq_marlin_hip.cu
+!csrc/quantization/gptq_marlin/gptq_marlin_hip_kernel.hip
+!csrc/quantization/gptq_marlin/marlin_hip_common.h
+!csrc/quantization/gptq_marlin/awq_marlin_repack_hip.cu
+!csrc/quantization/gptq_marlin/marlin_int4_fp8_preprocess_hip.cu
+!csrc/quantization/gptq_marlin/marlin_perm_hip.cu
+!csrc/quantization/gptq_marlin/marlin_perm_hip.hip
+!csrc/quantization/fp8/fp8_marlin_hip.cu
+!csrc/quantization/fp8/fp8_marlin_hip_kernel.hip
+!csrc/quantization/fp8/fp8_marlin_mfma_hip_kernel.hip
+!csrc/quantization/fp8/gptq_marlin_repack_hip.cu
+!csrc/moe/marlin_moe_hip.cu
+!csrc/moe/marlin_moe_hip_kernel.hip
 
 # Benchmark dataset
 benchmarks/**/*.json

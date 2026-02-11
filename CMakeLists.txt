@@ -914,9 +914,15 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 endif()
 
 if (VLLM_GPU_LANG STREQUAL "HIP")
-  # Add QuickReduce kernels
+  # Add QuickReduce kernels and Marlin HIP kernels
   list(APPEND VLLM_EXT_SRC
     "csrc/custom_quickreduce.cu"
+    "csrc/quantization/fp8/gptq_marlin_repack_hip.cu"
+    "csrc/quantization/fp8/fp8_marlin_hip.cu"
+    "csrc/quantization/gptq_marlin/gptq_marlin_hip.cu"
+    "csrc/quantization/gptq_marlin/awq_marlin_repack_hip.cu"
+    "csrc/quantization/gptq_marlin/marlin_int4_fp8_preprocess_hip.cu"
+    "csrc/quantization/gptq_marlin/marlin_perm_hip.cu"
   )
 # if ROCM endif
 endif()
@@ -953,6 +959,12 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
     "csrc/moe/moe_wna16.cu"
     "csrc/moe/grouped_topk_kernels.cu")
+endif()
+
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  # Add MoE Marlin HIP kernel
+  list(APPEND VLLM_MOE_EXT_SRC
+    "csrc/moe/marlin_moe_hip.cu")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")

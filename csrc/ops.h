@@ -186,6 +186,41 @@ void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
 
 torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 
+#ifdef USE_ROCM
+torch::Tensor fp8_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
+                              torch::Tensor& b_scales, torch::Tensor& workspace,
+                              int64_t num_bits, bool fp8_is_fnuz,
+                              int64_t size_m, int64_t size_n, int64_t size_k);
+
+torch::Tensor fp8_mfma_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
+                                   torch::Tensor& b_scales,
+                                   std::optional<torch::Tensor> a_scales,
+                                   bool fp8_is_fnuz,
+                                   int64_t size_m, int64_t size_n,
+                                   int64_t size_k);
+
+torch::Tensor int4_mfma_marlin_gemm(torch::Tensor& a,
+                                    torch::Tensor& b_q_weight,
+                                    torch::Tensor& b_scales,
+                                    std::optional<torch::Tensor> a_scales,
+                                    int64_t size_m, int64_t size_n,
+                                    int64_t size_k);
+
+torch::Tensor gptq_marlin_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight,
+    std::optional<torch::Tensor> const& b_bias_or_none,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& a_scales,
+    std::optional<torch::Tensor> const& global_scale,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none, torch::Tensor& workspace,
+    vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
+    int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
+    bool is_zp_float);
+#endif
+
 #ifndef USE_ROCM
 
 torch::Tensor awq_gemm(torch::Tensor _in_feats, torch::Tensor _kernel,

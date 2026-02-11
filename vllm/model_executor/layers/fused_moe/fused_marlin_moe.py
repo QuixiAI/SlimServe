@@ -4,6 +4,7 @@
 
 from collections.abc import Callable
 
+import os
 import torch
 
 import vllm._custom_ops as ops
@@ -40,6 +41,25 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
+
+
+def _is_rocm_cdna3() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    arch = getattr(props, "gcnArchName", "")
+    return arch.startswith("gfx94") or arch.startswith("gfx95")
+
+
+def _should_use_fp8_mfma_for_marlin(quant_type: ScalarType) -> bool:
+    if quant_type != scalar_types.float8_e4m3fn:
+        return False
+    if not _is_rocm_cdna3():
+        return False
+    v = os.getenv("VLLM_MARLIN_MOE_FP8_MFMA", "1").strip().lower()
+    return v not in ("0", "false", "no")
 
 
 def _fused_marlin_moe(
@@ -79,6 +99,8 @@ def _fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     is_k_full: bool = True,
+    use_int4_mfma: bool = False,
+    use_w4a8: bool = False,
 ) -> torch.Tensor:
     assert hidden_states.ndim == 2
     M, K = hidden_states.size()
@@ -111,12 +133,32 @@ def _fused_marlin_moe(
 
     a_scales1 = None
     gate_up_input = hidden_states
-    if input_dtype == torch.int8:
-        gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
-        if input_global_scale1 is not None:
-            a_scales1 = a_scales1 * input_global_scale1
-    elif input_dtype == torch.float8_e4m3fn:
-        gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+
+    if use_w4a8:
+        # W4A8: quantize activations to FP8 per-token
+        gate_up_input, a_scales1 = marlin_quant_input(
+            hidden_states, torch.float8_e4m3fn
+        )
+    else:
+        if input_dtype is None and _should_use_fp8_mfma_for_marlin(quant_type):
+            # Enable W8A8 path on ROCm CDNA3+ to allow the HIP kernel to use FP8 MFMA.
+            input_dtype = torch.float8_e4m3fn
+        if input_dtype == torch.int8:
+            gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+            if input_global_scale1 is not None:
+                a_scales1 = a_scales1 * input_global_scale1
+        elif input_dtype == torch.float8_e4m3fn:
+            gate_up_input, a_scales1 = marlin_quant_input(hidden_states, input_dtype)
+
+    # For INT4 MFMA-tiled weights, pass b_fp8_is_fnuz=True to signal the
+    # kernel to use the MFMA fast path. For standard INT4, force False
+    # to prevent the kernel from incorrectly triggering INT4 MFMA.
+    # For FP8 weights, use None (platform default).
+    _b_fp8_is_fnuz: bool | None = None  # default for FP8
+    if use_int4_mfma:
+        _b_fp8_is_fnuz = True
+    elif quant_type in (scalar_types.uint4b8, scalar_types.uint4):
+        _b_fp8_is_fnuz = False
 
     intermediate_cache1 = ops.moe_wna16_marlin_gemm(
         gate_up_input,
@@ -145,7 +187,9 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        b_fp8_is_fnuz=_b_fp8_is_fnuz,
     )
+
     activation_func(
         activation,
         intermediate_cache2,
@@ -159,16 +203,22 @@ def _fused_marlin_moe(
         output.zero_()
 
     a_scales2 = None
-    if input_dtype == torch.int8:
+    if use_w4a8:
+        # W4A8: quantize intermediate activations to FP8 per-token
         intermediate_cache2, a_scales2 = marlin_quant_input(
-            intermediate_cache2, input_dtype
+            intermediate_cache2, torch.float8_e4m3fn
         )
-        if input_global_scale2 is not None:
-            a_scales2 = a_scales2 * input_global_scale2
-    elif input_dtype == torch.float8_e4m3fn:
-        intermediate_cache2, a_scales2 = marlin_quant_input(
-            intermediate_cache2, input_dtype
-        )
+    else:
+        if input_dtype == torch.int8:
+            intermediate_cache2, a_scales2 = marlin_quant_input(
+                intermediate_cache2, input_dtype
+            )
+            if input_global_scale2 is not None:
+                a_scales2 = a_scales2 * input_global_scale2
+        elif input_dtype == torch.float8_e4m3fn:
+            intermediate_cache2, a_scales2 = marlin_quant_input(
+                intermediate_cache2, input_dtype
+            )
 
     output = ops.moe_wna16_marlin_gemm(
         intermediate_cache2,
@@ -197,6 +247,7 @@ def _fused_marlin_moe(
         use_atomic_add=False,
         use_fp32_reduce=True,
         is_zp_float=False,
+        b_fp8_is_fnuz=_b_fp8_is_fnuz,
     )
 
     return output
@@ -238,6 +289,8 @@ def fused_marlin_moe(
     output: torch.Tensor | None = None,
     input_dtype: torch.dtype | None = None,
     inplace: bool = False,
+    use_int4_mfma: bool = False,
+    use_w4a8: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -277,6 +330,12 @@ def fused_marlin_moe(
         scalar_types.float8_e4m3fn,
         scalar_types.float4_e2m1f,
     ]
+
+    # Auto-enable FP8 activation quantization on ROCm CDNA3+ for FP8 weights.
+    # This allows the HIP kernel to use FP8 MFMA (W8A8) instead of
+    # dequant-to-16b (W8A16).
+    if input_dtype is None and _should_use_fp8_mfma_for_marlin(quant_type):
+        input_dtype = torch.float8_e4m3fn
 
     bit4_scalar_types = [
         scalar_types.uint4,
@@ -354,6 +413,8 @@ def fused_marlin_moe(
         output=None,
         input_dtype=input_dtype,
         is_k_full=is_k_full,
+        use_int4_mfma=use_int4_mfma,
+        use_w4a8=use_w4a8,
     ).view(-1, topk, K)
 
     if output is None:
@@ -435,6 +496,10 @@ def batched_fused_marlin_moe(
         scalar_types.float4_e2m1f,
     ]
 
+    input_dtype: torch.dtype | None = None
+    if _should_use_fp8_mfma_for_marlin(quant_type):
+        input_dtype = torch.float8_e4m3fn
+
     bit4_scalar_types = [
         scalar_types.uint4,
         scalar_types.uint4b8,
@@ -514,6 +579,7 @@ def batched_fused_marlin_moe(
         intermediate_cache13=intermediate_cache13,
         intermediate_cache2=intermediate_cache2,
         output=output.view(-1, K) if output is not None else output,
+        input_dtype=input_dtype,
         is_k_full=is_k_full,
     )
 
@@ -541,7 +607,8 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
             or quant_config.use_nvfp4_w4a16
             or quant_config.use_int4_w4a16
             or quant_config.use_fp8_w8a16
-        ), "Supports only {mxfp,nvfp,int}4_w4a16 or fp8_w8a16"
+            or quant_config.use_fp8_w8a8
+        ), "Supports only {mxfp,nvfp,int}4_w4a16, fp8_w8a16, or fp8_w8a8"
         self.w13_g_idx = w13_g_idx
         self.w2_g_idx = w2_g_idx
         self.w13_g_idx_sort_indices = w13_g_idx_sort_indices
@@ -557,7 +624,18 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.has_device_capability((7, 5))
+        # Support CUDA with capability >= 7.5 and ROCm CDNA GPUs
+        if p.is_cuda() and p.has_device_capability((7, 5)):
+            return True
+        if p.is_rocm():
+            # Check for CDNA architecture (gfx90x, gfx94x, gfx95x)
+            import torch
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                arch = getattr(props, 'gcnArchName', '')
+                if any(gfx in arch for gfx in ['gfx90', 'gfx94', 'gfx95']):
+                    return True
+        return False
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -600,10 +678,11 @@ class MarlinExpertsBase(mk.FusedMoEPermuteExpertsUnpermute):
             return scalar_types.uint4b8.id
         elif self.quant_config.use_mxfp4_w4a16 or self.quant_config.use_nvfp4_w4a16:
             return scalar_types.float4_e2m1f.id
-        elif (
-            self.quant_config.use_fp8_w8a16
-            and current_platform.fp8_dtype() == torch.float8_e4m3fn
-        ):
+        elif self.quant_config.use_fp8_w8a16 or self.quant_config.use_fp8_w8a8:
+            # ScalarType cannot currently express the e4m3fnuz exponent-bias
+            # variant, so we use the e4m3fn ScalarTypeId for FP8 weights.
+            # On ROCm, the packed FP8 bytes may follow e4m3fnuz and the kernel
+            # is told via a separate flag.
             return scalar_types.float8_e4m3fn.id
         else:
             raise NotImplementedError("Unsupported quantization type.")

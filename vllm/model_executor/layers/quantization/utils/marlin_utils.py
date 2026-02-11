@@ -34,6 +34,15 @@ MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
 USE_FP32_REDUCE_DEFAULT = True
 
 
+def _is_rocm_cdna() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    if not torch.cuda.is_available():
+        return False
+    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+    return any(gfx in gcn_arch for gfx in ["gfx90", "gfx94", "gfx95"])
+
+
 # For binary size and compile time, we don't support the same types for with and
 #  without runtime zero-point. We support common cases, i.e. AWQ and GPTQ.
 #  TODO: we may want to move this into the C++ so its closer to the actual impl
@@ -42,6 +51,22 @@ def query_marlin_supported_quant_types(
     include_fp_type: bool = True,
     device_capability: int | None = None,
 ):
+    if current_platform.is_rocm():
+        if not _is_rocm_cdna():
+            return []
+        if has_zp is None:
+            return query_marlin_supported_quant_types(
+                False, include_fp_type, device_capability
+            )
+        if has_zp:
+            # AWQ style, unsigned + runtime zero-point
+            return [scalar_types.uint4]
+        # GPTQ style, unsigned + symmetric bias
+        res = [scalar_types.uint4b8, scalar_types.uint8b128]
+        if include_fp_type:
+            res += [scalar_types.float8_e4m3fn, scalar_types.float4_e2m1f]
+        return res
+
     if current_platform.is_cpu():
         return _query_cpu_marlin_supported_quant_types(has_zp, include_fp_type)
 
@@ -227,8 +252,6 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
 
 
 def check_moe_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
-    if current_platform.is_rocm():
-        return False
     hidden_size = layer.hidden_size
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
@@ -516,7 +539,11 @@ def marlin_quant_input(x: torch.Tensor, quant_dtype: torch.dtype):
     if quant_dtype == torch.int8:
         return per_token_quant_int8(x)
     elif quant_dtype == torch.float8_e4m3fn:
-        return get__quant_fp8_method()(x)
+        # Avoid instantiating the QuantFP8 CustomOp here. CustomOp creation
+        # requires an active vLLM config context, which is not always present
+        # (e.g. during engine profiling/dummy runs). Call the underlying op
+        # directly to get (fp8_tensor, per_token_scales).
+        return ops.scaled_fp8_quant(x, scale=None, use_per_token_if_dynamic=True)
     else:
         raise ValueError(f"unsupported quant_dtype {quant_dtype}")
 
@@ -649,4 +676,146 @@ def apply_awq_marlin_linear(
         is_zp_float=False,
     )
 
-    return output.reshape(out_shape)
+    return output.reshape(out_shape)  # apply_gptq_marlin_linear
+
+
+def repack_weight_int4_mfma_tiled(
+    qweight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    """Repack GPTQ INT4 [K/8, N] int32 -> MFMA-tiled [K/16, N*2] int32.
+
+    MFMA-tiled layout: [N/16, K/32, 4groups, 16cols] of uint32.
+    Each uint32 holds 8 INT4 nibbles:
+      nibbles[0..3] -> MFMA0: K = group*4 + {0,1,2,3}
+      nibbles[4..7] -> MFMA1: K = 16 + group*4 + {0,1,2,3}
+    """
+    device = qweight.device
+
+    # 1. Unpack: [K/8, N] int32 -> [K, N] uint8 (one nibble per byte)
+    shifts = torch.arange(8, device=device, dtype=torch.int32) * 4
+    nibbles = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).to(
+        torch.uint8
+    )
+    unpacked = nibbles.reshape(size_k, size_n)  # [K, N]
+
+    # 2. Reshape to tiles: [K_tiles, 32, N_tiles, 16]
+    w = unpacked.reshape(size_k // 32, 32, size_n // 16, 16)
+
+    # 3. Gather K within tile for MFMA lane mapping.
+    #    For group g (0..3): nibbles[0..3]=K{g*4+0..3}, nibbles[4..7]=K{16+g*4+0..3}
+    k_gather = []
+    for g in range(4):
+        k_gather.extend([g * 4 + i for i in range(4)])  # MFMA0
+        k_gather.extend([16 + g * 4 + i for i in range(4)])  # MFMA1
+    k_idx = torch.tensor(k_gather, device=device, dtype=torch.long)
+    w = w[:, k_idx, :, :]  # gather K dim
+
+    # 4. Reshape + permute to [N_tiles, K_tiles, 4groups, 16cols, 8nibbles]
+    #    First isolate the 32 K values so they're contiguous before splitting
+    #    into (4 groups, 8 nibbles). Without this permute, reshape would
+    #    interleave K and N_tile dims when N_tiles > 1.
+    w = w.permute(0, 2, 1, 3).contiguous()  # [K_tiles, N_tiles, 32, 16]
+    w = w.reshape(size_k // 32, size_n // 16, 4, 8, 16)
+    w = w.permute(1, 0, 2, 4, 3).contiguous()  # [N_tiles, K_tiles, groups, cols, nibbles]
+
+    # 5. Pack 8 nibbles -> uint32
+    # NOTE: Use bitwise OR reduction instead of shifted sum to avoid
+    # PyTorch promoting int32 sum to int64 (which doubles element size
+    # and breaks subsequent reshape).
+    shifts_pack = torch.arange(8, device=device, dtype=torch.int32) * 4
+    shifted = w.to(torch.int32) << shifts_pack
+    w_packed = shifted[..., 0]
+    for i in range(1, 8):
+        w_packed = w_packed | shifted[..., i]
+
+    # 6. Reshape to [K/16, N*2] for the kernel's expected format.
+    #    Memory layout: [N/16, K/32, 4groups, 16cols] of int32
+    #    = [N/16, K/32, 64] int32 = 256 bytes per (N_tile, K_tile).
+    #    The kernel addresses: b_tile_base = B + n_tile * k_tiles * 256
+    #    so N-tiles must be the outermost dimension (already the case).
+    w_packed = w_packed.reshape(size_n // 16, size_k // 32, 64)
+    w_flat = w_packed.reshape(size_k // 16, size_n * 2)
+    return w_flat.contiguous()
+
+
+def repack_weight_int4_mfma_tiled_moe(
+    qweight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    """Repack MoE INT4 [E, K/8, N] int32 -> [E, K/16, N*2] int32 MFMA-tiled.
+
+    Loops over experts and calls repack_weight_int4_mfma_tiled per expert.
+    """
+    num_experts = qweight.shape[0]
+    results = []
+    for e in range(num_experts):
+        results.append(
+            repack_weight_int4_mfma_tiled(qweight[e], size_k, size_n)
+        )
+    return torch.stack(results, dim=0)
+
+
+def repack_weight_int4_w4a8_tiled(
+    qweight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    """Repack GPTQ INT4 [K/8, N] int32 -> W4A8 MFMA-tiled [K/16, N*2] int32.
+
+    W4A8 tile layout: [N/16, K/32, 4halves, 16cols] of uint32.
+    Each uint32 holds 8 consecutive INT4 nibbles for K[8h+0..8h+7].
+    This format matches FP8 MFMA lane mapping where each lane group
+    needs 8 consecutive K values.
+    """
+    device = qweight.device
+
+    # 1. Unpack: [K/8, N] int32 -> [K, N] uint8 (one nibble per byte)
+    shifts = torch.arange(8, device=device, dtype=torch.int32) * 4
+    nibbles = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).to(
+        torch.uint8
+    )
+    unpacked = nibbles.reshape(size_k, size_n)  # [K, N]
+
+    # 2. Reshape to tiles: [K_tiles, 32, N_tiles, 16]
+    w = unpacked.reshape(size_k // 32, 32, size_n // 16, 16)
+
+    # 3. No K reordering needed: 8 consecutive K values per half
+    #    (unlike W4A16 which splits K for 2× FP16 MFMA)
+
+    # 4. Permute + reshape to [N_tiles, K_tiles, 4halves, 16cols, 8nibbles]
+    w = w.permute(0, 2, 1, 3).contiguous()  # [K_tiles, N_tiles, 32, 16]
+    w = w.reshape(size_k // 32, size_n // 16, 4, 8, 16)
+    w = w.permute(1, 0, 2, 4, 3).contiguous()
+
+    # 5. Pack 8 nibbles -> uint32 via bitwise OR
+    shifts_pack = torch.arange(8, device=device, dtype=torch.int32) * 4
+    shifted = w.to(torch.int32) << shifts_pack
+    w_packed = shifted[..., 0]
+    for i in range(1, 8):
+        w_packed = w_packed | shifted[..., i]
+
+    # 6. Reshape to [K/16, N*2]
+    w_packed = w_packed.reshape(size_n // 16, size_k // 32, 64)
+    w_flat = w_packed.reshape(size_k // 16, size_n * 2)
+    return w_flat.contiguous()
+
+
+def repack_weight_int4_w4a8_tiled_moe(
+    qweight: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    """Repack MoE INT4 [E, K/8, N] int32 -> [E, K/16, N*2] int32 W4A8-tiled.
+
+    Loops over experts and calls repack_weight_int4_w4a8_tiled per expert.
+    """
+    num_experts = qweight.shape[0]
+    results = []
+    for e in range(num_experts):
+        results.append(
+            repack_weight_int4_w4a8_tiled(qweight[e], size_k, size_n)
+        )
+    return torch.stack(results, dim=0)

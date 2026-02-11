@@ -1,5 +1,31 @@
 #include "core/registration.h"
+#include "core/scalar_type.hpp"
 #include "moe_ops.h"
+
+#ifdef USE_ROCM
+// Forward declaration for ROCm MoE Marlin GEMM
+torch::Tensor moe_wna16_marlin_gemm(
+    torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
+    torch::Tensor& b_q_weight,
+    std::optional<torch::Tensor> const& b_bias_or_none,
+    torch::Tensor& b_scales,
+    std::optional<torch::Tensor> const& a_scales_or_none,
+    std::optional<torch::Tensor> const& global_scale_or_none,
+    std::optional<torch::Tensor> const& b_zeros_or_none,
+    std::optional<torch::Tensor> const& g_idx_or_none,
+    std::optional<torch::Tensor> const& perm_or_none,
+    torch::Tensor& workspace,
+    torch::Tensor& sorted_token_ids,
+    torch::Tensor& expert_ids,
+    torch::Tensor& num_tokens_past_padded,
+    torch::Tensor& topk_weights,
+    int64_t moe_block_size, int64_t top_k, bool mul_topk_weights,
+    vllm::ScalarTypeId const& b_type_id,
+    int64_t size_m, int64_t size_n, int64_t size_k, bool is_k_full,
+    bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float,
+    bool b_fp8_is_fnuz,
+    int64_t thread_k, int64_t thread_n, int64_t blocks_per_sm);
+#endif
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   // Apply topk softmax to the gating outputs.
@@ -59,17 +85,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor? maybe_expert_map) -> () ");
   m.impl("moe_lora_align_block_size", torch::kCUDA, &moe_lora_align_block_size);
 
-#ifndef USE_ROCM
-  m.def(
-      "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
-      "Tensor b_scales, Tensor? b_qzeros, "
-      "Tensor? topk_weights, Tensor sorted_token_ids, "
-      "Tensor expert_ids, Tensor num_tokens_post_pad, "
-      "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
-      "int bit) -> Tensor");
-
-  m.impl("moe_wna16_gemm", torch::kCUDA, &moe_wna16_gemm);
-
+  // MoE Marlin GEMM - available on both CUDA and ROCm
   m.def(
       "moe_wna16_marlin_gemm(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none,"
@@ -83,7 +99,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int size_m, int size_n, int size_k,"
       "bool is_full_k, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
+      "bool b_fp8_is_fnuz,"
       "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
+  m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
+
+#ifndef USE_ROCM
+  m.def(
+      "moe_wna16_gemm(Tensor input, Tensor! output, Tensor b_qweight, "
+      "Tensor b_scales, Tensor? b_qzeros, "
+      "Tensor? topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_post_pad, "
+      "int top_k, int BLOCK_SIZE_M, int BLOCK_SIZE_N, int BLOCK_SIZE_K, "
+      "int bit) -> Tensor");
+
+  m.impl("moe_wna16_gemm", torch::kCUDA, &moe_wna16_gemm);
 
   m.def(
       "marlin_gemm_moe(Tensor! a, Tensor! b_q_weights, Tensor! sorted_ids, "

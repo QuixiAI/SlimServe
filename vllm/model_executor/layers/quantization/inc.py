@@ -438,5 +438,20 @@ class INCConfig(QuantizationConfig):
         """Override the `auto-round` method to `inc`."""
         is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
         if is_auto_round_format:
+            if current_platform.is_rocm():
+                packing_format = str(hf_quant_cfg.get("packing_format", "")).lower()
+                backend = str(
+                    hf_quant_cfg.get("backend", hf_quant_cfg.get("vllm_backend", ""))
+                ).lower()
+                tag = f"{packing_format} {backend}"
+                if "awq" in tag:
+                    logger.info(
+                        "Detected auto-round AWQ format on ROCm; using awq backend."
+                    )
+                    return "awq"
+                logger.info(
+                    "Detected auto-round GPTQ format on ROCm; using gptq_marlin backend."
+                )
+                return "gptq_marlin"
             return cls.get_name()
         return None

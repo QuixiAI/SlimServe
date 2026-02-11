@@ -3,6 +3,7 @@
 
 from typing import TYPE_CHECKING, Literal
 
+import os
 import torch
 
 import vllm.envs as envs
@@ -1203,6 +1204,116 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+def gptq_marlin_gemm(
+    a: torch.Tensor,
+    c: torch.Tensor | None,
+    b_q_weight: torch.Tensor,
+    b_bias: torch.Tensor | None,
+    b_scales: torch.Tensor,
+    a_scales: torch.Tensor | None,
+    global_scale: torch.Tensor | None,
+    b_zeros: torch.Tensor | None,
+    g_idx: torch.Tensor | None,
+    perm: torch.Tensor | None,
+    workspace: torch.Tensor,
+    b_q_type: ScalarType,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+    is_k_full: bool = True,
+    use_atomic_add: bool = False,
+    use_fp32_reduce: bool = False,
+    is_zp_float: bool = False,
+) -> torch.Tensor:
+    return torch.ops._C.gptq_marlin_gemm(
+        a,
+        c,
+        b_q_weight,
+        b_bias,
+        b_scales,
+        a_scales,
+        global_scale,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        b_q_type.id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    )
+
+
+def fp8_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    workspace: torch.Tensor,
+    num_bits: int,
+    fp8_is_fnuz: bool,
+    size_m: int,
+    size_n: int,
+    size_k: int,
+) -> torch.Tensor:
+    return torch.ops._C.fp8_marlin_gemm(
+        a,
+        b_q_weight,
+        b_scales,
+        workspace,
+        num_bits,
+        fp8_is_fnuz,
+        size_m,
+        size_n,
+        size_k,
+    )
+
+
+def fp8_mfma_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    a_scales: torch.Tensor | None = None,
+    fp8_is_fnuz: bool = False,
+    size_m: int = 0,
+    size_n: int = 0,
+    size_k: int = 0,
+) -> torch.Tensor:
+    return torch.ops._C.fp8_mfma_marlin_gemm(
+        a,
+        b_q_weight,
+        b_scales,
+        a_scales,
+        fp8_is_fnuz,
+        size_m,
+        size_n,
+        size_k,
+    )
+
+
+def int4_mfma_marlin_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    a_scales: torch.Tensor | None = None,
+    size_m: int = 0,
+    size_n: int = 0,
+    size_k: int = 0,
+) -> torch.Tensor:
+    return torch.ops._C.int4_mfma_marlin_gemm(
+        a,
+        b_q_weight,
+        b_scales,
+        a_scales,
+        size_m,
+        size_n,
+        size_k,
+    )
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
@@ -1224,6 +1335,29 @@ def marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    if current_platform.is_rocm() and hasattr(torch.ops._C, "gptq_marlin_gemm"):
+        return torch.ops._C.gptq_marlin_gemm(
+            a,
+            c,
+            b_q_weight,
+            b_bias,
+            b_scales,
+            a_scales,
+            global_scale,
+            b_zeros,
+            g_idx,
+            perm,
+            workspace,
+            b_q_type.id,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
+
     return torch.ops._C.marlin_gemm(
         a,
         c,
@@ -1245,6 +1379,89 @@ def marlin_gemm(
         use_fp32_reduce,
         is_zp_float,
     )
+
+
+if hasattr(torch.ops._C, "gptq_marlin_gemm"):
+
+    @register_fake("_C::gptq_marlin_gemm")
+    def _gptq_marlin_gemm_fake(
+        a: torch.Tensor,
+        c: torch.Tensor | None,
+        b_q_weight: torch.Tensor,
+        b_bias: torch.Tensor | None,
+        b_scales: torch.Tensor,
+        a_scales: torch.Tensor | None,
+        global_scale: torch.Tensor | None,
+        b_zeros: torch.Tensor | None,
+        g_idx: torch.Tensor | None,
+        perm: torch.Tensor | None,
+        workspace: torch.Tensor,
+        b_q_type_id: int,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+        is_k_full: bool = True,
+        use_atomic_add: bool = False,
+        use_fp32_reduce: bool = False,
+        is_zp_float: bool = False,
+    ) -> torch.Tensor:
+        dtype = a.dtype
+        if dtype not in [torch.half, torch.bfloat16]:
+            dtype = b_scales.dtype
+        return torch.empty((size_m, size_n), device=a.device, dtype=dtype)
+
+
+if hasattr(torch.ops._C, "fp8_marlin_gemm"):
+
+    @register_fake("_C::fp8_marlin_gemm")
+    def _fp8_marlin_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        workspace: torch.Tensor,
+        num_bits: int,
+        fp8_is_fnuz: bool,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+    ) -> torch.Tensor:
+        return torch.empty((size_m, size_n), device=a.device, dtype=a.dtype)
+
+
+if hasattr(torch.ops._C, "fp8_mfma_marlin_gemm"):
+
+    @register_fake("_C::fp8_mfma_marlin_gemm")
+    def _fp8_mfma_marlin_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        a_scales: torch.Tensor | None,
+        fp8_is_fnuz: bool,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (size_m, size_n), device=a.device, dtype=b_scales.dtype
+        )
+
+
+if hasattr(torch.ops._C, "int4_mfma_marlin_gemm"):
+
+    @register_fake("_C::int4_mfma_marlin_gemm")
+    def _int4_mfma_marlin_gemm_fake(
+        a: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        a_scales: torch.Tensor | None,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+    ) -> torch.Tensor:
+        out_dtype = b_scales.dtype if a_scales is not None else a.dtype
+        return torch.empty(
+            (size_m, size_n), device=a.device, dtype=out_dtype
+        )
 
 
 if hasattr(torch.ops._C, "marlin_gemm"):
@@ -2273,10 +2490,17 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool,
     use_fp32_reduce: bool,
     is_zp_float: bool,
+    b_fp8_is_fnuz: bool | None = None,
     thread_k: int = -1,
     thread_n: int = -1,
     blocks_per_sm: int = -1,
 ) -> torch.Tensor:
+    if b_fp8_is_fnuz is None:
+        b_fp8_is_fnuz = (
+            current_platform.is_rocm()
+            and hasattr(torch, "float8_e4m3fnuz")
+            and current_platform.fp8_dtype() == torch.float8_e4m3fnuz
+        )
     return torch.ops._moe_C.moe_wna16_marlin_gemm(
         input,
         output,
@@ -2304,6 +2528,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        b_fp8_is_fnuz,
         thread_k,
         thread_n,
         blocks_per_sm,
@@ -2365,6 +2590,7 @@ if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "marlin_gemm_moe")
         use_atomic_add: bool,
         use_fp32_reduce: bool,
         is_zp_float: bool,
+        b_fp8_is_fnuz: bool | None = None,
     ):
         return torch.empty(
             (size_m * top_k, size_n), dtype=input.dtype, device=input.device

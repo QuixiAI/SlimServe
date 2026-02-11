@@ -26,6 +26,9 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.machete imp
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.marlin import (  # noqa: E501
     MarlinLinearKernel,
 )
+from vllm.model_executor.layers.quantization.kernels.mixed_precision.rocm_mfma import (  # noqa: E501
+    RocmMfmaLinearKernel,
+)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.MPLinearKernel import (  # noqa: E501
     MPLinearKernel,
     MPLinearLayerConfig,
@@ -46,6 +49,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
+        RocmMfmaLinearKernel,
         ConchLinearKernel,
         ExllamaLinearKernel,
     ],

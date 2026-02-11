@@ -46,6 +46,8 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_moe_permute_scales,
     marlin_permute_bias,
     marlin_repeat_scales_on_all_ranks,
+    repack_weight_int4_mfma_tiled_moe,
+    repack_weight_int4_w4a8_tiled_moe,
     verify_marlin_supported,
 )
 from vllm.model_executor.parameter import (
@@ -194,7 +196,7 @@ class GPTQMarlinConfig(QuantizationConfig):
 
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
-        desc_act = cls.get_from_keys(config, ["desc_act"])
+        desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
         is_sym = cls.get_from_keys(config, ["sym"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         modules_in_block_to_quantize = cls.get_from_keys_or(
@@ -276,7 +278,11 @@ class GPTQMarlinConfig(QuantizationConfig):
         sym = quant_config.get("sym")
         desc_act = quant_config.get("desc_act")
 
-        if not (current_platform.is_cuda() or current_platform.is_cpu()):
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_cpu()
+            or current_platform.is_rocm()
+        ):
             return False
 
         if quant_method != "gptq":
@@ -713,73 +719,130 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             )
-        # Repack weights
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
-            layer.w13_qweight,
-            layer.w13_g_idx_sort_indices,
-            layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
-            layer.w13_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
-            is_a_8bit=is_a_8bit,
+        # Detect INT4 MFMA path on ROCm CDNA3+
+        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
+            _is_rocm_cdna3,
         )
-        replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
-            layer.w2_qweight,
-            layer.w2_g_idx_sort_indices,
-            layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
-            layer.w2_qweight.shape[2],
-            self.quant_config.quant_type.size_bits,
-            is_a_8bit=is_a_8bit,
+
+        import os
+        use_w4a8 = os.getenv("VLLM_W4A8", "0").strip().lower() in ("1", "true")
+
+        # W4A8 also uses INT4 MFMA-tiled weights (allow with FP8 activations)
+        use_int4_mfma = (
+            _is_rocm_cdna3()
+            and self.quant_config.weight_bits == 4
+            and self.quant_config.is_sym
+            and not self.quant_config.desc_act
+            and (not is_a_8bit or use_w4a8)
         )
-        replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
+        layer.use_int4_mfma = use_int4_mfma
+        layer.use_w4a8 = use_w4a8
 
-        # The modular kernel expects w13_weight and w2_weight,
-        # but GPTQ uses w13_qweight and w2_qweight
-        # Alias for modular kernel
-        layer.w13_weight = layer.w13_qweight
-        # Alias for modular kernel
-        layer.w2_weight = layer.w2_qweight
+        if use_int4_mfma:
+            # MFMA-tiled repack instead of gptq_marlin_moe_repack.
+            # Input: [E, K/8, N] int32 (GPTQ packed)
+            # Output: [E, K/16, N*2] int32 (MFMA-tiled)
+            w13_size_k = int(
+                layer.w13_qweight.shape[1] * self.quant_config.pack_factor
+            )
+            w13_size_n = int(layer.w13_qweight.shape[2])
 
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
-            s=layer.w13_scales,
-            size_k=layer.intermediate_size_per_partition,
-            size_n=layer.w13_scales.shape[2],
-            group_size=self.quant_config.group_size,
-            is_a_8bit=is_a_8bit,
-        )
-        if self.input_dtype == torch.int8 and layer.num_groups_w13 > 1:
-            marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w13_scales
-            )
-            layer.register_parameter(
-                "w13_input_global_scale",
-                torch.nn.Parameter(w13_input_global_scale, requires_grad=False),
-            )
+            # Choose tile format: W4A8 format for FP8 MFMA, W4A16 for FP16 MFMA
+            repack_fn = (repack_weight_int4_w4a8_tiled_moe
+                         if use_w4a8
+                         else repack_weight_int4_mfma_tiled_moe)
 
-        replace_parameter(layer, "w13_scales", marlin_w13_scales)
-        marlin_w2_scales = marlin_moe_permute_scales(
-            s=layer.w2_scales,
-            size_k=layer.w2_scales.shape[1]
-            * (
-                self.quant_config.group_size
-                if self.quant_config.group_size != -1
-                else self.quant_config.pack_factor
-            ),
-            size_n=layer.w2_scales.shape[2],
-            group_size=self.quant_config.group_size,
-            is_a_8bit=is_a_8bit,
-        )
-        if self.input_dtype == torch.int8 and layer.num_groups_w2 > 1:
-            marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w2_scales
+            marlin_w13_qweight = repack_fn(
+                layer.w13_qweight, w13_size_k, w13_size_n
             )
-            layer.register_parameter(
-                "w2_input_global_scale",
-                torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
-            )
+            replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
 
-        replace_parameter(layer, "w2_scales", marlin_w2_scales)
+            w2_size_k = int(
+                layer.w2_qweight.shape[1] * self.quant_config.pack_factor
+            )
+            w2_size_n = int(layer.w2_qweight.shape[2])
+            marlin_w2_qweight = repack_fn(
+                layer.w2_qweight, w2_size_k, w2_size_n
+            )
+            replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
+
+            # Alias for modular kernel
+            layer.w13_weight = layer.w13_qweight
+            layer.w2_weight = layer.w2_qweight
+
+            # For MFMA path, scales stay in linear [E, num_groups, N] layout
+            # (no marlin_moe_permute_scales). Just ensure correct dtype.
+            layer.w13_scales.data = layer.w13_scales.data.contiguous()
+            layer.w2_scales.data = layer.w2_scales.data.contiguous()
+        else:
+            # Repack weights (standard Marlin path)
+            marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+                layer.w13_qweight,
+                layer.w13_g_idx_sort_indices,
+                layer.w13_qweight.shape[1] * self.quant_config.pack_factor,
+                layer.w13_qweight.shape[2],
+                self.quant_config.quant_type.size_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
+            marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+                layer.w2_qweight,
+                layer.w2_g_idx_sort_indices,
+                layer.w2_qweight.shape[1] * self.quant_config.pack_factor,
+                layer.w2_qweight.shape[2],
+                self.quant_config.quant_type.size_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
+
+            # Alias for modular kernel
+            layer.w13_weight = layer.w13_qweight
+            layer.w2_weight = layer.w2_qweight
+
+            # Repack scales (standard Marlin permutation)
+            marlin_w13_scales = marlin_moe_permute_scales(
+                s=layer.w13_scales,
+                size_k=layer.intermediate_size_per_partition,
+                size_n=layer.w13_scales.shape[2],
+                group_size=self.quant_config.group_size,
+                is_a_8bit=is_a_8bit,
+            )
+            if self.input_dtype == torch.int8 and layer.num_groups_w13 > 1:
+                marlin_w13_scales, w13_input_global_scale = (
+                    marlin_act_int8_process_scales(marlin_w13_scales)
+                )
+                layer.register_parameter(
+                    "w13_input_global_scale",
+                    torch.nn.Parameter(
+                        w13_input_global_scale, requires_grad=False
+                    ),
+                )
+
+            replace_parameter(layer, "w13_scales", marlin_w13_scales)
+            marlin_w2_scales = marlin_moe_permute_scales(
+                s=layer.w2_scales,
+                size_k=layer.w2_scales.shape[1]
+                * (
+                    self.quant_config.group_size
+                    if self.quant_config.group_size != -1
+                    else self.quant_config.pack_factor
+                ),
+                size_n=layer.w2_scales.shape[2],
+                group_size=self.quant_config.group_size,
+                is_a_8bit=is_a_8bit,
+            )
+            if self.input_dtype == torch.int8 and layer.num_groups_w2 > 1:
+                marlin_w2_scales, w2_input_global_scale = (
+                    marlin_act_int8_process_scales(marlin_w2_scales)
+                )
+                layer.register_parameter(
+                    "w2_input_global_scale",
+                    torch.nn.Parameter(
+                        w2_input_global_scale, requires_grad=False
+                    ),
+                )
+
+            replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
         if hasattr(layer, "w13_bias") and layer.w13_bias is not None:
             layer.w13_bias.data = marlin_permute_bias(layer.w13_bias)
@@ -925,4 +988,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             is_k_full=self.is_k_full,
             input_dtype=self.input_dtype,
             inplace=not self.moe.disable_inplace,
+            use_int4_mfma=getattr(layer, 'use_int4_mfma', False),
+            use_w4a8=getattr(layer, 'use_w4a8', False),
         )
