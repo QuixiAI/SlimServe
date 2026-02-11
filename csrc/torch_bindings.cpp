@@ -232,6 +232,44 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
   // Quantization ops
+#if defined(USE_ROCM)
+  // FP8 Marlin GEMM (ROCm).
+  ops.def(
+      "fp8_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor workspace, int num_bits, bool fp8_is_fnuz, SymInt size_m, "
+      "SymInt size_n, SymInt size_k) -> Tensor");
+  ops.impl("fp8_marlin_gemm", torch::kCUDA, &fp8_marlin_gemm);
+
+  // FP8 MFMA Marlin GEMM (ROCm CDNA3+, W8A8 or W8A16).
+  ops.def(
+      "fp8_mfma_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor? a_scales, bool fp8_is_fnuz, "
+      "SymInt size_m, SymInt size_n, SymInt size_k) -> Tensor");
+  ops.impl("fp8_mfma_marlin_gemm", torch::kCUDA, &fp8_mfma_marlin_gemm);
+
+  // INT4 MFMA Marlin GEMM (ROCm CDNA3+, W4A16).
+  ops.def(
+      "int4_mfma_marlin_gemm(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor? a_scales, "
+      "SymInt size_m, SymInt size_n, SymInt size_k) -> Tensor");
+  ops.impl("int4_mfma_marlin_gemm", torch::kCUDA, &int4_mfma_marlin_gemm);
+
+  // gptq_marlin Optimized Quantized GEMM for GPTQ (ROCm).
+  ops.def(
+      "gptq_marlin_gemm(Tensor a, Tensor? c_or_none, Tensor b_q_weight, "
+      "Tensor? b_bias_or_none,Tensor b_scales, "
+      "Tensor? a_scales, Tensor? global_scale, Tensor? b_zeros_or_none, "
+      "Tensor? "
+      "g_idx_or_none, Tensor? perm_or_none, Tensor workspace, int b_type_id, "
+      "SymInt size_m, SymInt size_n, SymInt size_k, bool is_k_full, "
+      "bool use_atomic_add, bool use_fp32_reduce, bool is_zp_float) -> Tensor");
+  ops.impl("gptq_marlin_gemm", torch::kCUDA, &gptq_marlin_gemm);
+
+  // gptq_marlin repack from GPTQ (ROCm).
+  ops.def(
+      "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
+      "SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
+#endif
 #ifndef USE_ROCM
   // Quantized GEMM for AWQ.
   ops.def(

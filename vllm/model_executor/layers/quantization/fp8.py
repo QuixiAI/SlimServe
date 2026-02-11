@@ -69,6 +69,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
+    is_fp8_marlin_supported,
     prepare_fp8_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -299,9 +300,16 @@ class Fp8LinearMethod(LinearMethodBase):
             not current_platform.has_device_capability(89)
             or envs.VLLM_TEST_FORCE_FP8_MARLIN
         )
-        # Disable marlin for rocm
+        # On ROCm, use Marlin for all CDNA GPUs (both W8A8 MFMA and
+        # W8A16 weight-only paths). Set VLLM_DENSE_FP8_NO_MARLIN=1 to
+        # disable and fall back to Triton.
         if current_platform.is_rocm():
-            self.use_marlin = False
+            import os as _os
+            v = _os.getenv('VLLM_DENSE_FP8_NO_MARLIN', '0').strip().lower()
+            if v in ('1', 'true'):
+                self.use_marlin = False
+            else:
+                self.use_marlin = is_fp8_marlin_supported()
         if vllm_is_batch_invariant():
             self.use_marlin = False
 
@@ -515,6 +523,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 input_dtype=self.marlin_input_dtype,
                 bias=bias,
+                fp8_is_fnuz=getattr(layer, "fp8_is_fnuz", False),
+                use_fp8_mfma=getattr(layer, "use_fp8_mfma", False),
+                use_fp8_activation=getattr(layer, "use_fp8_activation",
+                                           True),
             )
 
         if self.block_quant:
