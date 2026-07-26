@@ -107,6 +107,11 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
     images and video-chunks.
     """
 
+    # Overridable by subclasses that share this processing contract but ship a
+    # different config class / placeholder token (see glm5v.py).
+    config_cls: type = KimiK25Config
+    media_placeholder_token: str = "<|media_pad|>"
+
     def __init__(self, ctx: InputProcessingContext) -> None:
         super().__init__(ctx)
 
@@ -128,17 +133,19 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
         # Resolve token ID from the tokenizer because transformers v5
         # may remap token IDs vs config.json.
         config_token_id = hf_config.media_placeholder_token_id
-        resolved_token_id = tokenizer.convert_tokens_to_ids("<|media_pad|>")
+        resolved_token_id = tokenizer.convert_tokens_to_ids(
+            self.media_placeholder_token
+        )
         is_valid_resolved = isinstance(resolved_token_id, int) and (
             tokenizer.unk_token_id is None
             or resolved_token_id != tokenizer.unk_token_id
         )
         if is_valid_resolved and resolved_token_id != config_token_id:
             logger.warning_once(
-                "Kimi-K2.5 config.media_placeholder_token_id (%d) disagrees "
-                "with tokenizer mapping for <|media_pad|> (%d). "
-                "Using tokenizer value.",
+                "config.media_placeholder_token_id (%d) disagrees with the "
+                "tokenizer mapping for %s (%d). Using tokenizer value.",
                 config_token_id,
+                self.media_placeholder_token,
                 resolved_token_id,
             )
             media_token_id = resolved_token_id
@@ -162,7 +169,7 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
         return self.hf_processor
 
     def get_hf_config(self):
-        return self.ctx.get_hf_config(KimiK25Config)
+        return self.ctx.get_hf_config(self.config_cls)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         # None means unlimited
@@ -298,9 +305,15 @@ class KimiK25ForConditionalGeneration(
     """Kimi-K2.5 model for conditional generation.
 
     Supports both image and video-chunk modalities.
+
+    Subclasses that share this tower/projector but pair it with a different
+    text backbone override ``language_model_architectures`` (see glm5v.py).
     Video-chunks are temporal segments (typically 4 frames) that are
     processed with temporal pooling.
     """
+
+    # Text backbone architecture; overridden by tower-sharing subclasses.
+    language_model_architectures = ["DeepseekV2ForCausalLM"]
 
     supports_encoder_tp_data = True
 
@@ -372,7 +385,7 @@ class KimiK25ForConditionalGeneration(
                 vllm_config=vllm_config,
                 hf_config=config.text_config,
                 prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["DeepseekV2ForCausalLM"],
+                architectures=self.language_model_architectures,
             )
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
