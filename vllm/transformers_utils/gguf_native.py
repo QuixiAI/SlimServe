@@ -27,6 +27,7 @@ from typing import Any
 import gguf
 
 from vllm.logger import init_logger
+from vllm.transformers_utils.gguf_utils import gguf_reader
 
 logger = init_logger(__name__)
 
@@ -149,7 +150,7 @@ def build_config_from_gguf(gguf_path: str) -> Any:
     """Assemble a `Glm5vConfig` from backbone + mmproj metadata."""
     from vllm.transformers_utils.configs.glm5v import Glm5vConfig
 
-    r = gguf.GGUFReader(str(gguf_path))
+    r = gguf_reader(str(gguf_path))
     g = lambda k, d=None: _field(r, f"glm-dsa.{k}", d)  # noqa: E731
 
     # GGUF stores `block_count` including the MTP/nextn layer; the runtime
@@ -223,7 +224,7 @@ def build_config_from_gguf(gguf_path: str) -> Any:
     vision_config: dict[str, Any] = {}
     mmproj = find_mmproj(gguf_path)
     if mmproj is not None:
-        m = gguf.GGUFReader(str(mmproj))
+        m = gguf_reader(str(mmproj))
         c = lambda k, d=None: _field(m, f"clip.vision.{k}", d)  # noqa: E731
         hidden = int(c("embedding_length"))
         layers = int(c("block_count"))
@@ -280,7 +281,7 @@ def build_media_proc_cfg_from_gguf(gguf_path: str) -> dict[str, Any]:
     mmproj = find_mmproj(gguf_path)
     if mmproj is None:
         raise RuntimeError(f"no mmproj GGUF beside {gguf_path}")
-    m = gguf.GGUFReader(str(mmproj))
+    m = gguf_reader(str(mmproj))
     c = lambda k, d=None: _field(m, f"clip.vision.{k}", d)  # noqa: E731
 
     patch = int(c("patch_size"))
@@ -321,7 +322,7 @@ def build_tokenizer_from_gguf(gguf_path: str):
     from tokenizers.models import BPE
     from transformers import PreTrainedTokenizerFast
 
-    r = gguf.GGUFReader(str(gguf_path))
+    r = gguf_reader(str(gguf_path))
     tokens = _field(r, "tokenizer.ggml.tokens")
     merges = _field(r, "tokenizer.ggml.merges")
     if tokens is None or merges is None:
