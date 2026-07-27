@@ -103,6 +103,7 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.plugins import load_general_plugins
 from vllm.ray.lazy_utils import is_in_ray_actor, is_ray_initialized
 from vllm.transformers_utils.config import maybe_override_with_speculators
+from vllm.transformers_utils.gguf_utils import is_gguf
 from vllm.transformers_utils.repo_utils import get_model_path
 from vllm.transformers_utils.utils import is_cloud_storage
 from vllm.utils.argparse_utils import (
@@ -1646,6 +1647,22 @@ class EngineArgs:
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
+        # gguf file needs a specific model loader
+        if is_gguf(self.model):
+            gguf_model = self.model
+            self.quantization = self.load_format = "gguf"
+            if not self.model_weights:
+                self.model_weights = gguf_model
+            if self.served_model_name is None:
+                self.served_model_name = [gguf_model]
+            # Point `model` at the unquantized repo. HF tokenizers, image
+            # processors and the multimodal processor registry all resolve
+            # from `model_config.model`; leaving it as the .gguf path makes
+            # `_create_processing_info` raise, and a multimodal model then
+            # silently degrades to "running in text-only mode". The weights
+            # still come from `model_weights`.
+            self.model = self.hf_config_path or self.tokenizer or gguf_model
+
         if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
             logger.warning(
                 "The global random seed is set to %d. Since "

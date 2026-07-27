@@ -26,6 +26,7 @@ from typing_extensions import TypeVar
 
 from vllm.logger import init_logger
 from vllm.transformers_utils import processors
+from vllm.transformers_utils.gguf_utils import is_gguf
 from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
 from vllm.transformers_utils.utils import convert_model_repo_to_path
 from vllm.utils.func_utils import get_allowed_kwarg_only_overrides
@@ -191,8 +192,17 @@ _cached_get_video_processor_cls_name = lru_cache(
 def get_video_processor_cls_name(
     model_config: "ModelConfig",
 ) -> str | None:
-    model = model_config.model
-    revision = model_config.revision
+    if is_gguf(model_config.model):
+        assert not is_gguf(model_config.tokenizer), (
+            "For multimodal GGUF models, the original tokenizer "
+            "should be used to correctly load video processor metadata."
+        )
+        model = model_config.tokenizer
+        revision = model_config.tokenizer_revision
+    else:
+        model = model_config.model
+        revision = model_config.revision
+
     return _cached_get_video_processor_cls_name(model, revision=revision)
 
 
@@ -376,9 +386,20 @@ def cached_processor_from_config(
     processor_cls: type[_P] | tuple[type[_P], ...] = ProcessorMixin,
     **kwargs: Any,
 ) -> _P:
+    if is_gguf(model_config.model):
+        assert not is_gguf(model_config.tokenizer), (
+            "For multimodal GGUF models, the original tokenizer "
+            "should be used to correctly load processor."
+        )
+        model = model_config.tokenizer
+        revision = model_config.tokenizer_revision
+    else:
+        model = model_config.model
+        revision = model_config.revision
+
     return cached_get_processor_without_dynamic_kwargs(
-        model_config.model,
-        revision=model_config.revision,
+        model,
+        revision=revision,
         trust_remote_code=model_config.trust_remote_code,
         processor_cls=processor_cls,  # type: ignore[arg-type]
         **_merge_mm_kwargs(model_config, processor_cls, **kwargs),
@@ -481,9 +502,19 @@ def cached_image_processor_from_config(
     model_config: "ModelConfig",
     **kwargs: Any,
 ):
+    if is_gguf(model_config.model):
+        assert not is_gguf(model_config.tokenizer), (
+            "For multimodal GGUF models, the original tokenizer "
+            "should be used to correctly load image processor."
+        )
+        model = model_config.tokenizer
+        revision = model_config.tokenizer_revision
+    else:
+        model = model_config.model
+        revision = model_config.revision
     return cached_get_image_processor(
-        model_config.model,
-        revision=model_config.revision,
+        model,
+        revision=revision,
         trust_remote_code=model_config.trust_remote_code,
         **_merge_mm_kwargs(model_config, AutoImageProcessor, **kwargs),
     )

@@ -12,6 +12,7 @@ from typing_extensions import TypeVar, assert_never
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import _maybe_register_hf_config, get_config
+from vllm.transformers_utils.gguf_utils import check_gguf_file
 from vllm.transformers_utils.repo_utils import (
     any_pattern_in_repo_files,
     is_mistral_model_repo,
@@ -126,6 +127,7 @@ def resolve_tokenizer_args(
                 )
                 tokenizer_name = tokenizer_path
 
+
     if "truncation_side" not in kwargs:
         if runner_type == "generate" or runner_type == "draft":
             kwargs["truncation_side"] = "left"
@@ -189,6 +191,17 @@ def get_tokenizer(
     **kwargs,
 ) -> _T:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
+    # A .gguf carries its own vocab, merges and chat template. Build from those
+    # directly -- transformers' GGUF reader rejects `glm-dsa` outright.
+    if check_gguf_file(tokenizer_name):
+        from vllm.tokenizers.hf import get_cached_tokenizer
+        from vllm.transformers_utils.gguf_native import build_tokenizer_from_gguf
+
+        # Wrap it the same way the HF path does: the renderer reads
+        # `max_chars_per_token` / `max_token_id` / `all_special_ids`, which a
+        # bare PreTrainedTokenizerFast does not expose.
+        return get_cached_tokenizer(build_tokenizer_from_gguf(str(tokenizer_name)))
+
     if envs.VLLM_USE_FASTOKENS:
         # Process-global, idempotent patch that swaps the Rust BPE backend
         # of any HF fast tokenizer loaded afterwards. No-op for non-HF modes.
