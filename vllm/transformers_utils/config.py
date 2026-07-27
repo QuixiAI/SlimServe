@@ -1115,12 +1115,23 @@ def try_get_generation_config(
     config_format: str | ConfigFormat = "auto",
     hf_token: bool | str | None = None,
 ) -> GenerationConfig | None:
-    # GGUF files don't have generation_config.json - their config is embedded
-    # in the file header. Skip all filesystem lookups to avoid re-reading the
-    # memory-mapped file, which can hang in multi-process scenarios when the
-    # EngineCore process already has the file mapped.
+    # A .gguf has no generation_config.json; its stop tokens live in the file
+    # header. Returning None here leaves vLLM with the tokenizer's single
+    # `eos_token_id` (<|endoftext|>, 154820), but GLM ends a turn with
+    # <|user|> (154827) or <|observation|> (154829) -- so generation never
+    # stops and every answer runs on until max_tokens and degenerates.
+    # Synthesize the config from the GGUF-derived stop-token list instead. No
+    # filesystem lookup, so the mmap-rereading hang this used to avoid stays
+    # avoided.
     if is_gguf(model):
-        return None
+        from vllm.transformers_utils.gguf_native import build_config_from_gguf
+
+        gguf_config = build_config_from_gguf(str(model))
+        text_config = gguf_config.get_text_config()
+        return GenerationConfig(
+            eos_token_id=getattr(text_config, "eos_token_id", None),
+            pad_token_id=getattr(text_config, "pad_token_id", None),
+        )
 
     try:
         return GenerationConfig.from_pretrained(
