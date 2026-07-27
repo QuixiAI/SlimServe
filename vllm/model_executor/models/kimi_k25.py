@@ -56,6 +56,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_k25 import KimiK25Config
 from vllm.transformers_utils.processor import cached_get_image_processor
+from vllm.transformers_utils.gguf_utils import check_gguf_file
 from vllm.transformers_utils.processors.kimi_k25 import KimiK25Processor
 from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
     KimiK25FusedVisionProcessor,
@@ -123,12 +124,28 @@ class KimiK25ProcessingInfo(BaseProcessingInfo):
             "Using %s image preprocessing for Kimi-K2.5/K2.6 vision chunks.",
             "fused CPU" if processor_cls is not None else "remote HF",
         )
-        image_processor = cached_get_image_processor(
-            self.ctx.model_config.model,
-            revision=self.ctx.model_config.revision,
-            trust_remote_code=self.ctx.model_config.trust_remote_code,
-            processor_cls_overrides=processor_cls,
+        # A GGUF deployment has no preprocessor_config.json to read: the
+        # mmproj carries the same constants under `clip.vision.*`
+        # (`in_patch_limit` is image_max_pixels/patch_size**2), so build the
+        # processor directly rather than reaching for the unquantized repo.
+        gguf_source = (
+            self.ctx.model_config.model_weights or self.ctx.model_config.model
         )
+        if check_gguf_file(gguf_source):
+            from vllm.transformers_utils.gguf_native import (
+                build_media_proc_cfg_from_gguf,
+            )
+
+            image_processor = KimiK25FusedVisionProcessor(
+                media_proc_cfg=build_media_proc_cfg_from_gguf(str(gguf_source))
+            )
+        else:
+            image_processor = cached_get_image_processor(
+                self.ctx.model_config.model,
+                revision=self.ctx.model_config.revision,
+                trust_remote_code=self.ctx.model_config.trust_remote_code,
+                processor_cls_overrides=processor_cls,
+            )
 
         # Resolve token ID from the tokenizer because transformers v5
         # may remap token IDs vs config.json.

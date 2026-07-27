@@ -565,3 +565,32 @@ void ngram_compute_n_gram_ids(
     torch::stable::Tensor& exclusive_req_len_sums,
     torch::stable::Tensor& ne_token_table, torch::stable::Tensor& row_indices,
     torch::stable::Tensor& column_starts, torch::stable::Tensor& n_gram_ids);
+
+// GGML kernels (shared CUDA/ROCm)
+torch::stable::Tensor ggml_dequantize(
+    torch::stable::Tensor W, int64_t type, int64_t m, int64_t n,
+    std::optional<torch::headeronly::ScalarType> const& dtype);
+
+torch::stable::Tensor ggml_mul_mat_vec_a8(torch::stable::Tensor W,
+                                          torch::stable::Tensor X, int64_t type,
+                                          int64_t row);
+
+torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,
+                                      torch::stable::Tensor X, int64_t type,
+                                      int64_t row);
+
+torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,
+                                  torch::stable::Tensor W,
+                                  torch::stable::Tensor sorted_token_ids,
+                                  torch::stable::Tensor expert_ids,
+                                  torch::stable::Tensor num_tokens_post_padded,
+                                  int64_t type, int64_t row, int64_t top_k,
+                                  int64_t tokens);
+
+torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
+                                      torch::stable::Tensor W,
+                                      torch::stable::Tensor topk_ids,
+                                      int64_t top_k, int64_t type, int64_t row,
+                                      int64_t tokens);
+
+int64_t ggml_moe_get_block_size(int64_t type);

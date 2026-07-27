@@ -42,6 +42,10 @@ from vllm.transformers_utils.config import (
     uses_mrope,
     uses_xdrope_dim,
 )
+from vllm.transformers_utils.gguf_utils import (
+    is_gguf,
+    maybe_patch_hf_config_from_gguf,
+)
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
     ModelArchConfigConvertorBase,
@@ -570,6 +574,11 @@ class ModelConfig:
             hf_overrides_fn=hf_overrides_fn,
             token=self.hf_token,
         )
+        hf_config = maybe_patch_hf_config_from_gguf(
+            self.model,
+            hf_config,
+        )
+
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
@@ -761,6 +770,7 @@ class ModelConfig:
             # Rebuild after multimodal_config exists so text-only mm_prefix
             # clearing is applied (and cached for later with_hf_config calls).
             self.model_arch_config = self.get_model_arch_config()
+
 
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len
@@ -1113,6 +1123,7 @@ class ModelConfig:
                 "gpt_oss_mxfp4",
                 "deepseek_v4_fp8",
                 "humming",
+                "gguf",
             ]
             # if the user specifies humming, we should always use humming
             if self.quantization == "humming":

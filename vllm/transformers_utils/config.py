@@ -19,6 +19,7 @@ from transformers import GenerationConfig, PretrainedConfig
 from transformers.configuration_utils import ALLOWED_LAYER_TYPES
 from transformers.models.auto.image_processing_auto import get_image_processor_config
 from transformers.models.auto.modeling_auto import (
+    MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     MODEL_MAPPING_NAMES,
 )
 from transformers.models.auto.tokenization_auto import get_tokenizer_config
@@ -34,6 +35,10 @@ from vllm.transformers_utils.utils import (
 from vllm.utils.torch_utils import common_broadcastable_dtype
 
 from .config_parser_base import ConfigParserBase
+from .gguf_utils import (
+    check_gguf_file,
+    is_gguf,
+)
 from .repo_utils import (
     file_or_path_exists,
     get_hf_file_to_dict,
@@ -100,6 +105,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     kimi_linear="KimiLinearConfig",
     kimi_vl="KimiVLConfig",
     kimi_k25="KimiK25Config",
+    glm5v="Glm5vConfig",
     RefinedWeb="RWConfig",  # For tiiuae/falcon-40b(-instruct)
     RefinedWebModel="RWConfig",  # For tiiuae/falcon-7b(-instruct)
     mlp_speculator="MLPSpeculatorConfig",
@@ -392,15 +398,32 @@ class MistralConfigParser(ConfigParserBase):
         return config_dict, config
 
 
+def _gguf_config_parser() -> type[ConfigParserBase]:
+    # Imported lazily: the GGUF parser reaches into model_executor, which
+    # imports this module.
+    from vllm.transformers_utils.gguf_config_parser import GGUFConfigParser
+
+    return GGUFConfigParser
+
+
+class _LazyGGUFConfigParser(ConfigParserBase):
+    """Stands in for GGUFConfigParser until the registry is actually used."""
+
+    def __new__(cls, *args, **kwargs):
+        return _gguf_config_parser()(*args, **kwargs)
+
+
 _CONFIG_FORMAT_TO_CONFIG_PARSER: dict[str, type[ConfigParserBase]] = {
     "hf": HFConfigParser,
     "mistral": MistralConfigParser,
+    "gguf": _LazyGGUFConfigParser,
 }
 
 ConfigFormat = Literal[
     "auto",
     "hf",
     "mistral",
+    "gguf",
 ]
 
 
@@ -645,9 +668,19 @@ def maybe_override_with_speculators(
     Returns:
         Tuple of (resolved_model, resolved_tokenizer, speculative_config)
     """
+    # A GGUF reference cannot be probed for a speculators config: this goes
+    # through transformers' PretrainedConfig, which rejects architectures it
+    # does not know ("GGUF model with architecture glm-dsa is not supported
+    # yet") long before it could find or fail to find the key. A separate
+    # speculator is configured explicitly via speculative_config, so there is
+    # nothing to discover here anyway.
+    if is_gguf(model):
+        return model, tokenizer, vllm_speculative_config
+
+    gguf_model_repo = None
     kwargs["local_files_only"] = huggingface_hub.constants.HF_HUB_OFFLINE
     config_dict, _ = PretrainedConfig.get_config_dict(
-        model,
+        model if gguf_model_repo is None else gguf_model_repo,
         revision=revision,
         token=hf_token,
         **without_trust_remote_code(kwargs),
@@ -685,6 +718,14 @@ def get_config(
     hf_overrides_fn: Callable[[PretrainedConfig], PretrainedConfig] | None = None,
     **kwargs,
 ) -> PretrainedConfig:
+    # Separate model folder from file path for GGUF models
+
+    # A .gguf carries its own config; do not look for a config.json next to
+    # it and do not hand it to transformers' GGUF reader, whose architecture
+    # whitelist has no `glm-dsa`.
+    if is_gguf(model):
+        config_format = "gguf"
+
     if config_format == "auto":
         try:
             # First check for Mistral to avoid defaulting to
@@ -734,6 +775,7 @@ def get_config(
         ),
         f"Error parsing config for {model}",
     )
+
 
     # Architecture mapping for models without explicit architectures field
     if not config.architectures:
@@ -1041,6 +1083,9 @@ def get_hf_image_processor_config(
     # ModelScope does not provide an interface for image_processor
     if envs.VLLM_USE_MODELSCOPE:
         return dict()
+    # Separate model folder from file path for GGUF models
+    if check_gguf_file(model):
+        model = Path(model).parent
     return get_image_processor_config(
         model, token=hf_token, revision=revision, **kwargs
     )
@@ -1070,6 +1115,13 @@ def try_get_generation_config(
     config_format: str | ConfigFormat = "auto",
     hf_token: bool | str | None = None,
 ) -> GenerationConfig | None:
+    # GGUF files don't have generation_config.json - their config is embedded
+    # in the file header. Skip all filesystem lookups to avoid re-reading the
+    # memory-mapped file, which can hang in multi-process scenarios when the
+    # EngineCore process already has the file mapped.
+    if is_gguf(model):
+        return None
+
     try:
         return GenerationConfig.from_pretrained(
             model,
