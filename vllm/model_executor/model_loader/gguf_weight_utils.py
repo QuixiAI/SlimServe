@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 from vllm.logger import init_logger
+from vllm.transformers_utils.gguf_utils import gguf_reader
 
 logger = init_logger(__name__)
 
@@ -74,7 +75,7 @@ def resolve_local_gguf(local_dir: str, quant_type: str) -> str:
 def get_gguf_extra_tensor_names(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> list[str]:
-    reader = gguf.GGUFReader(gguf_file)
+    reader = gguf_reader(gguf_file)
     expected_gguf_keys = set(gguf_to_hf_name_map.keys())
     exact_gguf_keys = {tensor.name for tensor in reader.tensors}
     extra_keys = expected_gguf_keys - exact_gguf_keys
@@ -84,7 +85,7 @@ def get_gguf_extra_tensor_names(
 def get_gguf_weight_type_map(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> dict[str, str]:
-    reader = gguf.GGUFReader(gguf_file)
+    reader = gguf_reader(gguf_file)
     return {
         gguf_to_hf_name_map[tensor.name]: tensor.tensor_type.name
         for tensor in reader.tensors
@@ -133,7 +134,7 @@ def gguf_quant_weights_iterator_multi(
     _QUANT_TYPES = ("F32", "BF16", "F16")
 
     for gguf_file in gguf_files:
-        reader = gguf.GGUFReader(gguf_file)
+        reader = gguf_reader(gguf_file)
         for tensor in reader.tensors:
             if gguf_to_hf_name_map is not None:
                 if tensor.name not in gguf_to_hf_name_map:
@@ -164,12 +165,12 @@ def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
         {
             tensor.name
             for gguf_file in gguf_files
-            for tensor in gguf.GGUFReader(gguf_file).tensors
+            for tensor in gguf_reader(gguf_file).tensors
             if tensor.tensor_type.name in _QUANT_TYPES
         }
     )
     # for gguf_file in gguf_files:
-    #     reader = gguf.GGUFReader(gguf_file)
+    #     reader = gguf_reader(gguf_file)
     #     for tensor in reader.tensors:
     #         if tensor.tensor_type.name in unquant_types:
     #             yield tensor.name.rsplit(".", 1)[0]

@@ -35,6 +35,7 @@ from vllm.logger import init_logger
 
 from vllm.model_executor.model_loader.gguf_weight_utils import gguf_quant_weights_iterator_multi
 from .default import GGUFWeightsAdapter
+from vllm.transformers_utils.gguf_utils import gguf_reader
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -282,7 +283,7 @@ class GlmDsaGGUFAdapter(GGUFWeightsAdapter):
         special = set(_INDEXER_HALVES) | {"attn_k_b.weight", "attn_v_b.weight"}
         deferred: set[str] = set()
         for gguf_file in self.load_spec.weights_source:
-            reader = gguf.GGUFReader(gguf_file)
+            reader = gguf_reader(gguf_file)
             for tensor in reader.tensors:
                 match = _BLK_RE.match(tensor.name)
                 if match is None:
@@ -429,7 +430,7 @@ class GlmDsaGGUFAdapter(GGUFWeightsAdapter):
         logger.info("Loading vision tower from mmproj %s", path)
         num_heads = self._vision_num_heads()
         count = 0
-        for tensor in gguf.GGUFReader(path).tensors:
+        for tensor in gguf_reader(path).tensors:
             stem, _, suffix = tensor.name.rpartition(".")
             match = _V_BLK_RE.match(tensor.name)
             if match:

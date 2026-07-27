@@ -37,6 +37,7 @@ from vllm.utils.torch_utils import common_broadcastable_dtype
 from .config_parser_base import ConfigParserBase
 from .gguf_utils import (
     check_gguf_file,
+    gguf_reader,
     is_gguf,
 )
 from .repo_utils import (
@@ -1131,7 +1132,7 @@ def try_get_generation_config(
             stop_token_ids_from_gguf,
         )
 
-        reader = gguf_lib.GGUFReader(str(model))
+        reader = gguf_reader(str(model))
         return GenerationConfig(
             eos_token_id=stop_token_ids_from_gguf(reader),
             pad_token_id=_field(reader, "tokenizer.ggml.eos_token_id"),

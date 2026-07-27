@@ -2,16 +2,55 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF utility functions."""
 
+import mmap
+import threading
 from functools import cache
 from os import PathLike
 from pathlib import Path
 
 import gguf
+import gguf.gguf_reader
+import numpy as np
 from gguf.constants import Keys, VisionProjectorType
 from transformers import Gemma3Config, PretrainedConfig, SiglipVisionConfig
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+_reader_lock = threading.Lock()
+
+
+def _plain_mmap(path, mode="r"):
+    """Map `path` as a plain ndarray rather than an `np.memmap`.
+
+    `np.memmap` is an ndarray subclass, so every slice of it runs
+    `__array_finalize__` and a `may_share_memory` check. The reader takes one
+    slice per metadata string, and this model's shard 1 carries a 154,880-entry
+    vocab plus 321,649 merges, so that is ~477k slices and ~4.4M finalize calls.
+    A plain ndarray over the same mapping parses byte-identically in a third of
+    the time.
+    """
+    f = open(path, "rb")
+    mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+    return np.frombuffer(mm, dtype=np.uint8)
+
+
+@cache
+def gguf_reader(path: str | PathLike) -> gguf.GGUFReader:
+    """A `GGUFReader`, parsed the fast way and cached per process.
+
+    Booting opens shard 1 dozens of times across the API server, the engine
+    core and both TP workers; at 8.6 s a parse that dominated startup. Caching
+    is safe because readers are opened read-only and never mutated.
+    """
+    path = str(Path(path).resolve())
+    real = gguf.gguf_reader.np.memmap
+    with _reader_lock:
+        gguf.gguf_reader.np.memmap = _plain_mmap
+        try:
+            return gguf.GGUFReader(path)
+        finally:
+            gguf.gguf_reader.np.memmap = real
 
 
 @cache
@@ -96,7 +135,7 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
         Exception: Exceptions from GGUF reading (file not found, corrupted
             file, etc.) propagate directly from gguf.GGUFReader
     """
-    reader = gguf.GGUFReader(str(mmproj_path))
+    reader = gguf_reader(mmproj_path)
 
     # Detect projector type to apply model-specific parameters
     projector_type = None
@@ -164,7 +203,7 @@ def extract_vocab_size_from_gguf(model_path: str | Path) -> int | None:
     if not check_gguf_file(model_path):
         return None
 
-    reader = gguf.GGUFReader(str(model_path))
+    reader = gguf_reader(model_path)
     field = reader.get_field(Keys.Tokenizer.LIST)
     if field is None:
         logger.warning("Missing tokenizer token list in GGUF file: %s", model_path)
@@ -177,7 +216,7 @@ def extract_lm_head_from_gguf(model_path: str | Path) -> bool:
     if not check_gguf_file(model_path):
         return None
 
-    reader = gguf.GGUFReader(str(model_path))
+    reader = gguf_reader(model_path)
     return any(tensor.name == "output.weight" for tensor in reader.tensors)
 
 
