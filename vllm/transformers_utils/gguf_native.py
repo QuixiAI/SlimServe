@@ -80,6 +80,56 @@ def find_mmproj(gguf_path: str | Path) -> Path | None:
     return None
 
 
+# Token texts llama.cpp treats as end-of-generation regardless of which key
+# points at them (`llama-vocab.cpp`, special_eog_ids construction). Only the
+# ones that can appear in a GLM vocab are kept; the rest of llama.cpp's list is
+# for other model families.
+_EOG_TOKEN_TEXTS = frozenset(
+    {
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<|eot_id|>",
+        "<|eom_id|>",
+        "<end_of_turn>",
+        "</s>",
+        "<eos>",
+    }
+)
+
+# GGUF token_type values (gguf.TokenType): 3 == CONTROL.
+_TOKEN_TYPE_CONTROL = 3
+
+
+def stop_token_ids_from_gguf(reader: gguf.GGUFReader) -> list[int]:
+    """The model's full end-of-generation set, read the way llama.cpp reads it.
+
+    GGUF has no plural stop key -- `gguf-py` defines only the three scalars
+    `eos_token_id`, `eot_token_id` and `eom_token_id`, and their union *is* the
+    convention. llama.cpp unions exactly those (with explicit sanity checks
+    that warn if one is missing) plus any CONTROL token whose text is a known
+    end-of-generation marker.
+
+    Taking `eos_token_id` alone is the trap: this model's eos is
+    `<|endoftext|>` (154820), which it never actually emits. It ends every turn
+    with `<|user|>` (154827, the eot key), so a reader that ignores eot/eom
+    sees no stop token at all and generates until max_tokens.
+    """
+    ids: set[int] = set()
+    for key in ("eos", "eot", "eom"):
+        value = _field(reader, f"tokenizer.ggml.{key}_token_id")
+        if value is not None:
+            ids.add(int(value))
+
+    tokens = _field(reader, "tokenizer.ggml.tokens")
+    types = _field(reader, "tokenizer.ggml.token_type")
+    if tokens is not None and types is not None:
+        for i, (text, ttype) in enumerate(zip(tokens, types)):
+            if int(ttype) == _TOKEN_TYPE_CONTROL and str(text) in _EOG_TOKEN_TEXTS:
+                ids.add(i)
+
+    return sorted(ids)
+
+
 def _indexer_types(num_layers: int, first_dense: int) -> list[str]:
     """Reference pattern: full at 0,1,2 then every layer == 2 (mod 4).
 
@@ -164,13 +214,7 @@ def build_config_from_gguf(gguf_path: str) -> Any:
         "ep_size": 1,
         "moe_layer_freq": 1,
         "pretraining_tp": 1,
-        # Three stop tokens, not one: eos, eot and eom. With only `eos` the
-        # model runs past <|user|>/<|observation|> turn ends.
-        "eos_token_id": [
-            int(_field(r, f"tokenizer.ggml.{k}_token_id"))
-            for k in ("eos", "eot", "eom")
-            if _field(r, f"tokenizer.ggml.{k}_token_id") is not None
-        ],
+        "eos_token_id": stop_token_ids_from_gguf(r),
         # GGUF declares 154821 here but the reference checkpoint pads with the
         # eos id; padding is unused by vLLM's ragged batching either way.
         "pad_token_id": int(_field(r, "tokenizer.ggml.eos_token_id")),
