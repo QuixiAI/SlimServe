@@ -1890,3 +1890,37 @@ box), `compilation/passes/fusion/allreduce_rms_fusion.py` (945),
 different safety argument than file-level: dynamic dispatch, registries and
 `getattr` mean "no lines executed in one workload" is weaker evidence for a
 method than for a whole module.
+
+## Pass 5: ROCm-only platform detection (-8,378 lines)
+
+The first cut that required editing live dispatch rather than deleting leaves,
+and the pattern that makes the rest of the backlog tractable.
+
+`vllm/platforms/__init__.py` ran every builtin probe on every boot. On this box
+the CUDA probe imports the vendored 4,096-statement `third_party/pynvml.py` and
+calls `nvmlInit()` before failing, and the CPU probe runs a Zen detection pass —
+all so the ROCm probe can win. `builtin_platform_plugins` now holds one entry.
+
+Removed with it: the tpu/cuda/xpu/cpu probe functions, `_is_amd_zen_cpu` (and
+its stale `__all__` entry), `utils.import_utils.import_pynvml`, the
+`CpuPlatform` fallback in `entrypoints/cli/main.py` (unreachable once detection
+always resolves to ROCm), and `platforms/{cuda,cpu,xpu}.py` +
+`third_party/pynvml.py`. Verified `current_platform` still resolves to
+`RocmPlatform`, gate 15/15. Committed as `f70373dd7d`.
+
+**Note on why pynvml read 45% covered, not 0%:** it is genuinely executed —
+just only to fail. Coverage alone would never have flagged it; it took knowing
+that NVML cannot matter on an AMD box. Category knowledge beats the profile for
+this class of dead code.
+
+### Next target, sized but not started
+
+`get_quantization_config` in `model_executor/layers/quantization/__init__.py`
+eagerly imports ~20 quant backends inside the function body — awq, gptq,
+bitsandbytes, modelopt (841 stmts), humming (412), fbgemm, torchao, mxfp4,
+inc, fp_quant and more — so one call drags all of them in. That is why they
+all show partial coverage instead of 0%. This tree only resolves `gguf` (plus
+quark/fp8 for the speculator path). Making the dispatch import only the
+selected method would let most of those modules be deleted outright; it is a
+single well-understood function, but it touches the path that every model load
+goes through, so it wants its own commit and gate run.
