@@ -996,39 +996,14 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
+    # This fork builds for ROCm only; the other device requirement files
+    # are gone along with their platform support.
     if _no_device():
         requirements = _read_requirements("common.txt")
-    elif _is_cuda():
-        requirements = _read_requirements("cuda.txt")
-        cuda_major, cuda_minor = torch.version.cuda.split(".")
-        modified_requirements = []
-        for req in requirements:
-            if "vllm-flash-attn" in req and cuda_major != "12":
-                # vllm-flash-attn is built only for CUDA 12.x.
-                # Skip for other versions.
-                continue
-            if "flashinfer-cubin" in req:
-                # Not on PyPI since 0.6.14 (only https://flashinfer.ai/whl), so
-                # it cannot be a wheel dependency; flashinfer falls back to
-                # fetching cubins at runtime when the package is absent.
-                continue
-            if "nvidia-cutlass-dsl[cu13]" in req and cuda_major == "12":
-                # [cu13] extra is the default; strip it on CUDA 12 builds.
-                req = req.replace("nvidia-cutlass-dsl[cu13]", "nvidia-cutlass-dsl")
-            if "humming-kernels[cu13]" in req and cuda_major == "12":
-                req = req.replace("humming-kernels[cu13]", "humming-kernels[cu12]")
-            modified_requirements.append(req)
-        requirements = modified_requirements
     elif _is_hip():
         requirements = _read_requirements("rocm.txt")
-    elif _is_tpu():
-        requirements = _read_requirements("tpu.txt")
-    elif _is_cpu():
-        requirements = _read_requirements("cpu.txt")
-    elif _is_xpu():
-        requirements = _read_requirements("xpu.txt")
     else:
-        raise ValueError("Unsupported platform, please use CUDA, ROCm, or CPU.")
+        raise ValueError("Unsupported platform: this build targets ROCm.")
     return requirements
 
 
