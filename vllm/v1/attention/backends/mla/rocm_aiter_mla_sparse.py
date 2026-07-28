@@ -4,6 +4,8 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import os
+
 import numpy as np
 import torch
 
@@ -30,8 +32,16 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.rocm_aiter_mla import (
     AiterMLAHelper,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
+
+# Diagnostic switch: skip the persistent-metadata fingerprint cache and rebuild
+# every step. Set VLLM_ROCM_MLA_ALWAYS_REBUILD_META=1 to test whether a stale
+# cached fingerprint is behind the CUDA-graph-only output corruption.
+_ALWAYS_REBUILD_MLA_META = (
+    os.environ.get("VLLM_ROCM_MLA_ALWAYS_REBUILD_META", "0") == "1"
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
@@ -333,6 +343,16 @@ class ROCMAiterMLASparseMetadata(AttentionMetadata):
     block_size: int = 1
     topk_tokens: int = 2048
 
+    # Decode/prefill split, consumed by MLAAttention.forward to choose between
+    # the MQA and MHA paths. This backend has no dense-MHA prefill metadata, so
+    # it relies on attention_config.sparse_mla_force_mqa to keep every request
+    # on the top-k MQA path; `prefill` stays None.
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    prefill_max_seq_len: int = 0
+    prefill: None = None
+
     # Persistent MLA metadata (only populated when persistent mode is enabled,
     # i.e. when the aiter sparse decode kernel supports work-stealing splits).
     work_meta_data: torch.Tensor | None = None
@@ -368,7 +388,7 @@ class ROCMAiterMLASparseMetadataBuilder(
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
-        self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+        self.topk_tokens = vllm_config.model_config.hf_text_config.index_topk
         # Bounds the KV-split heuristic (see `_sparse_decode_max_split`).
         self._num_compute_units = current_platform.num_compute_units()
         self.max_model_len_tensor = torch.tensor(
@@ -561,7 +581,7 @@ class ROCMAiterMLASparseMetadataBuilder(
             clamped_context_lens.tobytes(),
             seg_lengths.tobytes(),
         )
-        if metadata_key != self._prev_metadata_key:
+        if metadata_key != self._prev_metadata_key or _ALWAYS_REBUILD_MLA_META:
             from aiter import get_mla_metadata_v1
 
             max_split_per_batch = self._sparse_decode_max_split(
@@ -592,8 +612,23 @@ class ROCMAiterMLASparseMetadataBuilder(
             torch.cuda.current_stream(self.device).synchronize()
             self._prev_metadata_key = metadata_key
 
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
+        )
+        prefill_max_seq_len = 0
+        if num_prefills > 0:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            prefill_max_seq_len = int(
+                seq_lens_cpu[num_decodes : num_decodes + num_prefills].max().item()
+            )
+
         metadata = ROCMAiterMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            prefill_max_seq_len=prefill_max_seq_len,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,

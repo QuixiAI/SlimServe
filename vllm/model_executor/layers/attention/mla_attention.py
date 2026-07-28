@@ -187,6 +187,7 @@ for chunk_idx in range(cdiv(C, MCC)):
 return curr_o @ W_O
 """
 
+import collections
 import functools
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -356,6 +357,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
     2. Perform (multi-head/multi-query/grouped-query) attention.
     3. Return the output tensor.
     """
+
+    _pwal_timing: dict[str, float] = collections.defaultdict(float)
+    _fp8_bmm_precompiled: set[tuple] = set()
 
     def __init__(
         self,
@@ -965,12 +969,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         return output_padded
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        import time as _t
+
+        from vllm.utils.bootstamp import bootstamp
+
+        _acc = MLAAttention._pwal_timing
+        _t0 = _t.perf_counter()
         # we currently do not have quantized bmm's which are needed for
         # `W_UV` and `W_UK_T`, we just store fp16/bf16 copies and perform
         # the bmm's in 16-bit, the extra memory overhead of this is fairly low
         kv_b_proj_weight = get_and_maybe_dequant_weights(
             self.kv_b_proj, out_dtype=act_dtype
         ).T
+        _acc["dequant"] += _t.perf_counter() - _t0
+        _t0 = _t.perf_counter()
 
         if self.dcp_q_replicate:
             # qrep wired here: validate unsupported decode backends once.
@@ -1035,9 +1047,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # triton kernel to avoid runtime compilation for unseen batch sizes
             # Pre-compile for batch sizes 1 to 1024 to cover most use-cases.
             # On DS-R1, this step adds roughly 50s to the model loading time.
+            #
+            # Triton's compilation cache is keyed by shape and dtype, not by
+            # layer, and every decoder layer presents identical W_K/W_V shapes.
+            # Repeating the sweep per layer therefore compiles nothing new and
+            # only re-issues 2 x 1024 launches: measured 11.8 s across 78
+            # layers here. Sweep once per distinct shape instead.
+            precompile_key = (
+                tuple(self.W_K.shape),
+                tuple(self.W_V.shape),
+                self.W_K.dtype,
+                self.W_V.dtype,
+            )
+            already_precompiled = precompile_key in MLAAttention._fp8_bmm_precompiled
+            MLAAttention._fp8_bmm_precompiled.add(precompile_key)
+
             max_batch_size = 1024  # [ToDo] Find the optimal upper limit
-            pre_compilation_list = list(range(1, max_batch_size + 1))
-            if is_global_first_rank():
+            pre_compilation_list = (
+                [] if already_precompiled else list(range(1, max_batch_size + 1))
+            )
+            if pre_compilation_list and is_global_first_rank():
                 pre_compilation_list = tqdm(
                     pre_compilation_list,
                     desc="[Aiter Triton] Pre-compiling fp8 BMM kernel",
@@ -1071,6 +1100,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self.W_UK_T_dcp_qrep = get_dcp_group().all_gather(
                     self.W_UK_T.contiguous(), dim=0
                 )
+        _acc["reshape_replace"] += _t.perf_counter() - _t0
+        _t0 = _t.perf_counter()
 
         # If we should not load quant weights, we initialize the scales to 1.0
         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
@@ -1082,6 +1113,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         if not should_load_quant_weights(quant_method):
             set_default_quant_scales(self, register_buffer=False)
+        _acc["quant_scales"] += _t.perf_counter() - _t0
+        _acc["n"] += 1
+        if _acc["n"] % 39 == 0:
+            bootstamp(
+                f"MLA pwal after {int(_acc['n'])} layers: "
+                + ", ".join(
+                    f"{k}={_acc[k]:.2f}"
+                    for k in ("dequant", "reshape_replace", "quant_scales")
+                )
+            )
 
     def calc_kv_scales(
         self, q: torch.Tensor, kv_c_normed: torch.Tensor, k_pe: torch.Tensor

@@ -22,8 +22,11 @@ timm>=1.0.17
 # amd-quark: required for Quark quantization on ROCm
 # To be consistent with test_quark.py
 amd-quark==0.12.post1
-tilelang==0.1.10
-# Required apache-tvm-ffi matching tilelang version
-apache-tvm-ffi==0.1.10 
+# tilelang is intentionally not installed on ROCm: TileLang MHC is disabled on
+# gfx942 (see vllm/model_executor/layers/mhc.py), and its libstub_hip.so exports
+# the public HIP ABI -- including hipGetDevicePropertiesR0600 backed by the
+# legacy R0000 implementation -- which interposes on every HIP symbol resolved
+# after it loads, corrupting device properties for aiter and other consumers.
+apache-tvm-ffi==0.1.10
 # Required for faster safetensors model loading
 fastsafetensors >= 0.3.2

@@ -84,7 +84,11 @@ def load_general_plugins():
         return
     plugins_loaded = True
 
+    from vllm.utils.bootstamp import bootstamp
+
+    bootstamp("load_general_plugins start")
     plugins = load_plugins_by_group(group=DEFAULT_PLUGINS_GROUP)
+    bootstamp(f"load_general_plugins loaded: {sorted(plugins)}")
     # general plugins, we only need to execute the loaded functions
     for func in plugins.values():
         func()

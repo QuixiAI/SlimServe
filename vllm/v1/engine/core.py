@@ -29,6 +29,7 @@ from vllm.distributed import (
 )
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
+from vllm.utils.bootstamp import bootstamp
 from vllm.logging_utils.dump_input import dump_engine_exception
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -290,6 +291,7 @@ class EngineCore:
                 # much memory can be allocated for kv cache.
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+                bootstamp("engine: determine_available_memory returned")
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = [0] * len(kv_cache_specs)
@@ -302,6 +304,7 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+        bootstamp("engine: get_kv_cache_configs done")
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling
@@ -1267,6 +1270,45 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+        from vllm.utils.bootstamp import bootstamp
+
+        bootstamp("EngineCore process entry")
+
+        # Coverage does not follow the fork into this process either; without
+        # this, everything that only runs here (the scheduler, the KV cache
+        # manager) looks like dead code. Imports are aliased so they cannot
+        # shadow module-level names for the rest of the function.
+        if os.environ.get("VLLM_COV_WORKERS"):
+            import atexit as _atexit
+            import signal as _signal
+            import threading as _threading
+
+            import coverage as _coverage
+
+            _cov = _coverage.Coverage(
+                config_file=os.environ["COVERAGE_PROCESS_START"], data_suffix=True
+            )
+            _cov.start()
+
+            def _flush_cov(*_):
+                _cov.save()
+
+            _atexit.register(_flush_cov)
+            _prev = _signal.getsignal(_signal.SIGTERM)
+            _signal.signal(
+                _signal.SIGTERM,
+                lambda s, f: (_flush_cov(), _prev(s, f) if callable(_prev) else None),
+            )
+
+            def _periodic():
+                while True:
+                    time.sleep(10)
+                    try:
+                        _cov.save()
+                    except Exception:
+                        return
+
+            _threading.Thread(target=_periodic, daemon=True).start()
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()

@@ -504,7 +504,24 @@ def has_triton_kernels() -> bool:
 
 @cache
 def has_tilelang() -> bool:
-    """Whether the optional `tilelang` package is available."""
+    """Whether the optional `tilelang` package is available.
+
+    Always False on gfx942. Importing tilelang loads its bundled
+    ``libhip_stub.so``, which exports the public HIP ABI -- including
+    ``hipGetDevicePropertiesR0600`` backed by the legacy R0000 struct layout.
+    Because those calls are PLT-bound, the stub interposes on every HIP call
+    resolved afterwards, process-wide: ``warpSize`` is then read at the R0600
+    offset of ``clockRate``, so aiter's ASM kernels launch with
+    ``blockDim.x = 2100000`` and die. This is the single trial-import site, so
+    the check belongs here rather than at any one call site.
+    """
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx942
+
+        if on_gfx942():
+            return False
     return _has_module("tilelang")
 
 

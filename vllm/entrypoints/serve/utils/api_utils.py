@@ -162,9 +162,13 @@ def cli_env_setup():
     # - https://pytorch.org/docs/stable/notes/multiprocessing.html#cuda-in-multiprocessing
     # - https://pytorch.org/docs/stable/multiprocessing.html#sharing-cuda-tensors
     # - https://docs.habana.ai/en/latest/PyTorch/Getting_Started_with_PyTorch_and_Gaudi/Getting_Started_with_PyTorch.html?highlight=multiprocessing#torch-multiprocessing-for-dataloaders
+    # This tree serves one model on one known-good ROCm box; fork is safe
+    # here and saves ~10 s of re-imports per child process generation.
+    # `_maybe_force_spawn` still upgrades to spawn when CUDA is already
+    # initialized (or Ray/WSL/NUMA demand it), so leave the env untouched
+    # and let it decide at process-creation time.
     if "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
-        logger.debug("Setting VLLM_WORKER_MULTIPROC_METHOD to 'spawn'")
-        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        logger.debug("Leaving VLLM_WORKER_MULTIPROC_METHOD unset (fork default)")
 
 
 def get_max_tokens(

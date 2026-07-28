@@ -57,6 +57,7 @@ from vllm.profiler.wrapper import CudaProfilerWrapper, TorchProfilerWrapper
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
+from vllm.utils.bootstamp import bootstamp
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.gpu_sync_debug import enable_gpu_sync_check, with_gpu_sync_check
 from vllm.utils.mem_constants import GiB_bytes
@@ -293,6 +294,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        bootstamp(f"worker[{self.rank}]: init_device start")
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -424,13 +426,42 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        with (
-            self._maybe_get_memory_pool_context(tag="weights"),
-            set_current_vllm_config(self.vllm_config),
-            # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
-            self._scoped_allocator_max_split(max_split_size_mb=20),
-        ):
-            self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        bootstamp(f"worker[{self.rank}]: load_model start")
+        # The first pageable host-to-device copy after the KV cache is
+        # allocated stalls ~15 s inside the HSA runtime while it establishes
+        # host staging memory. Do that work now, before ~168 GiB of VRAM and
+        # the checkpoint's page cache are in the way.
+        _t = time.perf_counter()
+        _staging = torch.empty(64 << 20, dtype=torch.uint8, pin_memory=True)
+        torch.tensor([0], dtype=torch.int32).to(self.device)
+        torch.cuda.synchronize()
+        del _staging
+        bootstamp(
+            f"worker[{self.rank}]: host staging warmed in "
+            f"{time.perf_counter() - _t:.2f}s"
+        )
+
+        # Loading allocates millions of tracked objects, so the automatic
+        # collector keeps rescanning the whole model graph: measured 147 ms per
+        # generation-2 pass, 11.8 s of it in MLA post-load alone. Nothing here
+        # depends on cycle collection, so switch it off for the duration and
+        # freeze the (now static) graph afterwards, which also keeps profiling
+        # and capture from rescanning it.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with (
+                self._maybe_get_memory_pool_context(tag="weights"),
+                set_current_vllm_config(self.vllm_config),
+                # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
+                self._scoped_allocator_max_split(max_split_size_mb=20),
+            ):
+                self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+        freeze_gc_heap()
+        bootstamp(f"worker[{self.rank}]: load_model done, gc heap frozen")
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -488,11 +519,13 @@ class Worker(WorkerBase):
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
+        bootstamp(f"worker[{self.rank}]: profile_run start")
         with memory_profiling(
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
             self.model_runner.profile_run()
+        bootstamp(f"worker[{self.rank}]: profile_run done")
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
@@ -500,19 +533,20 @@ class Worker(WorkerBase):
         # the AMD-CI mem tests), and graph_pool_handle resolves to the same
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
+        # The estimate is a trial capture of the largest graphs (~10 s); when
+        # the flag opts out, skip the computation too rather than computing
+        # and discarding it.
         cudagraph_memory_estimate = 0
         if (
-            current_platform.is_cuda_alike()
+            envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            and current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
+            bootstamp(f"worker[{self.rank}]: profile_cudagraph_memory start")
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+            bootstamp(f"worker[{self.rank}]: profile_cudagraph_memory done")
 
-        # Respect the opt-in flag as originally designed.
-        cudagraph_memory_estimate_applied = (
-            cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
-            else 0
-        )
+        cudagraph_memory_estimate_applied = cudagraph_memory_estimate
 
         self.total_consumed = profile_result.total_consumed
         self.peak_activation_memory = (
@@ -640,6 +674,7 @@ class Worker(WorkerBase):
     @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+        bootstamp(f"worker[{self.rank}]: initialize_from_config (KV alloc) start")
 
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
@@ -654,6 +689,14 @@ class Worker(WorkerBase):
 
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
+        bootstamp(f"worker[{self.rank}]: KV cache allocated")
+        _t = time.perf_counter()
+        torch.tensor([0], dtype=torch.int32).to(self.device)
+        torch.cuda.synchronize()
+        bootstamp(
+            f"worker[{self.rank}]: first pageable H2D after KV alloc took "
+            f"{time.perf_counter() - _t:.2f}s"
+        )
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -668,6 +711,9 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
+        bootstamp(f"worker[{self.rank}]: compile_or_warm_up_model start")
+        torch.cuda.synchronize()
+        bootstamp(f"worker[{self.rank}]: device drained (pending work done)")
         warmup_sizes: list[int] = []
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -701,11 +747,14 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        bootstamp(f"worker[{self.rank}]: kernel_warmup start")
         kernel_warmup(self)
+        bootstamp(f"worker[{self.rank}]: kernel_warmup done")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        bootstamp(f"worker[{self.rank}]: capture_model done")
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (

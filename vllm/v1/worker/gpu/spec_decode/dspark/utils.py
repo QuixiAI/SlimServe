@@ -12,6 +12,29 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 )
 
 
+def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
+    """Load config for the draft, which may not share the target's format.
+
+    DSpark heads usually ship inside the target checkpoint, so reusing the
+    target's `LoadConfig` is normally right. A standalone speculators-format
+    head (e.g. RedHatAI/GLM-5.2-speculator.dspark-preview) against a GGUF
+    target is the exception: the GGUF loader is handed a directory of
+    safetensors and fails on the path parse. Fall back to auto-detection for a
+    draft that lives somewhere else.
+    """
+    if (explicit := vllm_config.speculative_config.draft_load_config) is not None:
+        return explicit
+    load_config = vllm_config.load_config
+    target_model_config = vllm_config.model_config
+    if (
+        load_config.load_format == "gguf"
+        and draft_model_config is not None
+        and draft_model_config.model != target_model_config.model
+    ):
+        return replace(load_config, load_format="auto")
+    return load_config
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -22,6 +45,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     draft_vllm_config = replace(
         vllm_config,
+        load_config=_draft_load_config(vllm_config, draft_model_config),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),

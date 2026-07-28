@@ -639,6 +639,45 @@ User-directed inputs for that (2026-07-27):
 Targets are direction, not a contract — record what was achieved and why the
 remainder is hard.
 
+## Startup time baseline (2026-07-27)
+
+**Goal of this phase: reduce startup time.** Baseline first, no optimization until
+the numbers are pinned.
+
+### What is being measured, and why
+
+| engine | definition |
+|---|---|
+| llama.cpp | **process exec -> first generated token** |
+| vLLM | **process exec -> port accepting connections** (`/health` returns 200) |
+
+Both are external wall clock from `Popen`, not internal timers.
+llama.cpp's own `load time` (`llama_perf_context_print`) covers **model load
+only** — it excludes exec, dynamic linking, ROCm/HIP runtime init and backend
+registration, all of which a real deployment pays. Its log timestamps
+(`min.sec.ms.us`, `common/log.cpp:99`) likewise start at log init, after exec.
+vLLM's readiness LOG line and an actually-listening socket are also not the same
+thing, so both are recorded and the socket/health number is the baseline.
+
+Harnesses: `<SCRATCH>/measure_startup_llamacpp.py`,
+`<SCRATCH>/measure_startup_vllm.py`.
+
+### Conditions
+
+- **WARM page cache** — the host has 3 TB RAM with ~2755 GB in buff/cache, so the
+  262 GB model is resident. Cold-cache boots would be disk-bound and much slower.
+  All numbers below are warm unless stated. Do not compare warm to cold.
+- Runs are **serialized**, never concurrent: startup is weight-load dominated, so
+  two 262 GB loads at once contend for memory bandwidth and corrupt both numbers.
+- TP2, GPUs pinned via `HIP_VISIBLE_DEVICES`.
+
+### Results
+
+| engine | metric | time |
+|---|---|---|
+| llama.cpp | exec -> first token | _pending_ |
+| vLLM | exec -> /health 200 | _pending_ |
+
 ## Status
 
 Landed this iteration, **all three correctness gates re-run and PASSING** with
@@ -1338,3 +1377,516 @@ landing — field set and order, tensor names/shapes/types, tensor bytes, all
 - **~85 s between the engine being ready and the port opening** (chat template
   detection, multimodal warmup, task setup). llama.cpp has no equivalent.
 - **72 s** profile + KV cache + cudagraph capture.
+
+---
+
+## STARTUP-TIME BASELINE, measured 2026-07-28 (iteration 7 — new focus: reduce startup)
+
+Fresh measurements, both engines loading the **same GGUF pair**:
+`GLM-5.2-UD-Q2_K_RoutedQ2K-00001-of-00006.gguf` (6 shards, 262 GB) **plus**
+`mmproj-GLM-5.2-Vision-f16.gguf` — unlike the 07-27 numbers, llama.cpp now
+loads the vision projector too (`--mmproj`), so the comparison is apples to
+apples. Same 2x MI300X, TP2 / `-sm layer`.
+
+| run | llama.cpp TTFT (internal) | external (process start -> exit at token 1) |
+|---|---|---|
+| 1 (cold page cache) | 211.9 s | 229.2 s |
+| 2 (warm) | 150.3 s | 167.6 s |
+| 3 (warm) | 151.3 s | 166.6 s |
+
+| vLLM (TP2, warm) | s |
+|---|---|
+| port accepts + `/health` 200 | **271.45** |
+
+**BASELINE: llama.cpp ~150.8 s to first token (167 s external); vLLM 271.5 s
+to servable. vLLM is 1.62x slower (1.80x vs external process clock).**
+Down from 3.1x on 07-27 thanks to the GGUF-reader fix, and llama.cpp went
+141 -> 150 s from carrying the mmproj.
+
+Two structural notes from the runs:
+
+- **17.3 s of exec+dyld before `llama_cli()` even runs** — constant across all
+  three runs (external minus internal). The ROCm userspace stack costs ~17 s
+  of dynamic linking on this box before any code runs. vLLM's equivalent (the
+  ~25 s python-import phase) is not an outlier; everything paying the ROCm tax
+  is slow to exec here.
+- **Cold vs warm page cache is worth ~61 s on llama.cpp** (262 GB read;
+  buff/cache grew ~245 GB during run 1). All baseline numbers are warm-cache.
+
+vLLM phase timeline (from `vllm_boot.log`, t0 = spawn, port at 271.45 s):
+
+| phase | ends at | s |
+|---|---|---|
+| exec + torch import (first log line ~4 s, first vLLM INFO) | ~29 s | ~29 |
+| config resolve, engine + 2 worker spawn, GGUF parse, init | ~125 s | ~96 |
+| weight load (`Model loading took 66.37 s`) | ~191 s | 66 |
+| init engine: profile, KV cache, 21 s graph capture (73.40 s) | ~264 s | 73 |
+| post-engine API setup -> `Starting vLLM server` + port | 271.5 s | ~7 |
+
+Yesterday's ~85 s post-engine tail is now ~7 s (it was the APIServer's 22
+GGUF re-parses, killed by the reader cache). Weight load also improved
+109 -> 66 s run-over-run with no code change — treat 66 s as the warm-cache
+number (llama.cpp's comparable tensor-load phase was 58.4 s on 07-27).
+
+Measurement harness (this session's scratchpad): `run_ttft_llamacpp.sh`
+(now with `--mmproj`), `run_ttft_ext.sh` (external clock), `ttft_vllm.py`;
+logs `ttft_lcpp_run{1,2,3}.log`, `vllm_boot.log`. llama.cpp TTFT patch
+unchanged from 07-27: `LLAMA_TTFT=1`, 27 lines in `tools/cli/`, still built
+into `libllama-cli-impl.so`.
+
+### Where the remaining 120 s gap lives (targets, in order)
+
+1. **~96 s of pre-load setup** (imports in 4 processes, config resolution,
+   worker spawn, per-process GGUF shard-1 parse at 2.8 s x 4). llama.cpp does
+   the equivalent in ~1.5 s.
+2. **73 s init engine** — profile run, KV-cache alloc, cudagraph capture.
+   (llama.cpp's `graph_reserve` analogue was 79.7 s of its 141 s on 07-27,
+   so this one is not unique to us — but it is additive with #1.)
+3. **66 vs 58 s weight load** — small gap now, low priority.
+
+## Startup reduction round 1 (2026-07-28): 271.5 -> 233.3 s, gates passing
+
+Target: beat llama.cpp's 150.8 s to servable. All numbers from `[boot +Xs]`
+stamps (`vllm/utils/bootstamp.py`, `VLLM_BOOT_T0` pinned by the harness);
+each boot ends with a greedy `capital of France -> ' Paris...'` gate.
+
+Landed, in order of measured effect:
+
+1. **xgrammar import: 15.5 s x 3 process generations.** `backend_xgrammar.py`
+   class-body annotation `matcher: xgr.GrammarMatcher` evaluated the LazyLoader
+   at import, pulling `xgrammar -> tvm_ffi -> _optional_torch_c_dlpack`, which
+   attempts a JIT build that always fails on torch-2.14-nightly headers
+   (15 s, per process, unycached because it fails). Fix: one-line
+   `from __future__ import annotations`. APIServer 25 s of imports -> 9.4 s.
+2. **fork instead of spawn: ~21 s.** `entrypoints/serve/utils/api_utils.py`
+   blanket-defaulted `VLLM_WORKER_MULTIPROC_METHOD=spawn` for the whole CLI,
+   overriding vLLM's fork default before `_maybe_force_spawn` could decide.
+   Removed; EngineCore + workers now fork in ~0.2 s and inherit the parsed
+   GGUF reader (kills the 2.8 s shard-1 re-parse per child AND EngineCore's
+   end-of-boot re-parse). Worker imports phase 38.5 s -> 17.7 s.
+3. **cudagraph memory estimate: 10.3 s.** `gpu_worker.determine_available_memory`
+   ran `profile_cudagraph_memory()` (a full trial capture) even when
+   `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0` says to discard it. Now gated;
+   harness opts out. Post-profile gap 10.3 s -> 0.01 s.
+4. **quark plugin: ~1 s/process.** `VLLM_PLUGINS=""` — the quark entry point
+   imports 1 s of quark at every boot; we don't use it.
+
+**Expert loading detour (record so it is not retried):** the adapter unbound
+stacked `ffn_*_exps` into 256 per-expert 2-D slices — 60,265 yields, ~44 s of
+consumer time (0.73 ms per copy). Yielding the 3-D stack instead routes into
+`RoutedExperts.weight_loader`'s existing `full_load` path, but its TP-narrowed
+copy is a host+device *strided* copy — 107 s, WORSE. Fix that stuck: upload the
+contiguous stack to the GPU first (`_gguf_moe_weight_loader`, ndim==3), then
+delegate — the narrows become device-side. 51-55 s, i.e. parity with the old
+path and with llama.cpp's 58 s tensor load; pageable H2D (~5 GB/s effective)
+is the wall. Pinned-ring or hipHostRegister are the next levers if load is
+re-attacked.
+
+Timeline at 233.3 s (best boot): imports+config 17.5, comm init 15.7
+(pynccl 9!), load 55.4 + process_weights 12, profile_run **24.5-85 s
+(unexplained 3.5x variance between clean boots — now instrumented)**,
+15 s stall at the first tiny `torch.tensor(device=cuda)` after KV alloc
+(NOT Triton compile — triton cache untouched; now isolated with a
+synchronize stamp), capture 22, tail 6.
+
+Remaining: profile_run variance, the 15 s stall, capture 22 s, pynccl 9 s,
+process_weights_after_loading 12 s.
+
+### Round 1 final: 271.5 -> 165.0 s (five boots: 166.5 / 166.0 / 168.5 / 167.2 / 165.0)
+
+llama.cpp is 150.3 / 151.3 s to first token. We are **~15 s behind**, from 121 s
+behind this morning. Every boot ends `' Paris. The city is located on the'`.
+
+Worker-0 timeline of the 165.0 s boot:
+
+| phase | window | s |
+|---|---|---|
+| APIServer imports | 0 -> 9.6 | 9.6 |
+| config, GGUF parse, fork EngineCore+workers | 9.6 -> 18.2 | 8.6 |
+| device init + pynccl/aiter/quick all-reduce | 18.2 -> 33.0 | 14.8 |
+| weight load (51.5) + process_weights (12) | 33.0 -> 98.8 | 65.8 |
+| profile_run (mm encoder 2.5, LM dummy 4.3, sync 15.5) | 98.8 -> 122.9 | 24.1 |
+| KV cache alloc + commit | 122.9 -> 123.0 | **0.09** |
+| kernel_warmup | 123.0 -> 137.4 | 15.1 |
+| cudagraph capture (4 sizes) | 137.4 -> 158.4 | 21.0 |
+| API tail -> port open | 158.4 -> 165.0 | 6.6 |
+
+### The 15 s "stall" is a first-pageable-H2D-copy cost, and it is NOT KV alloc
+
+Chased with `sudo py-spy dump --native` (ptrace_scope=1, so plain py-spy is
+Permission Denied; `--nonblocking` cannot do native frames — use sudo).
+Caught mid-stall:
+
+```
+c10::cuda::memcpy_and_sync -> copy_kernel_cuda -> ... -> internal_new_from_data
+-> torch::utils::tensor_ctor    [blocked in libhsa-runtime64.so]
+```
+
+That is `torch.tensor([0, num_tokens], device=device)` — an 8-byte pageable
+H2D copy — taking 15 s. Two hypotheses tested and **rejected**:
+
+- *KV cache page commit*: added `torch.zeros(1, device).cpu()` + synchronize
+  immediately after `initialize_kv_cache`. KV alloc measures **0.09 s** and the
+  15 s did **not** move. Not deferred commit.
+- *Triton compile*: `~/.triton/cache` gained zero entries during the window.
+
+It is the first *pageable* H2D after ~43 GiB is allocated; the runtime appears
+to rebuild its staging path. **Do not "fix" this by deleting the warmup** — the
+cost is paid on first touch either way, and warmup is exactly the right place
+to pay it (before the port opens vs. on a user's first request). Only a fix
+inside the ROCm runtime, or pre-registering pinned staging, removes it.
+
+### Instrumentation left in tree (keep — it is how any of this was found)
+
+`vllm/utils/bootstamp.py`: `bootstamp(tag)` logs `[boot +Xs pid=N] tag`, origin
+pinned in `VLLM_BOOT_T0` so forks/spawns share t0. Harness sets it at spawn, so
+stamps include interpreter startup. Call sites: api_server (run_server,
+build_and_serve), EngineCore/Worker entry, get_mp_context, plugins,
+gguf_reader, gguf_loader (producer vs consumer split), cuda_communicator
+(pynccl/aiter/quick), gpu_worker (init_device, load_model, profile_run,
+KV alloc, kernel_warmup, capture), gpu_model_runner (profile_run internals),
+kernel_warmup + v1_block_table_warmup per step.
+
+Harness: `<SCRATCH>/ttft_vllm.py` — spawn -> port + `/health` 200, then a greedy
+`The capital of France is` gate. It sets `VLLM_PLUGINS=""` and
+`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`.
+
+### Next levers, largest first
+
+1. **51 s weight load.** Pageable H2D at ~5 GB/s effective. A pinned staging
+   ring or `hipHostRegister` on the mmap is the only real lever; the naive
+   pinned-buffer copy was already measured slower (102 -> 117 s).
+2. **21 s cudagraph capture** for 4 sizes. Capture is serial per size.
+3. **15 s first-pageable-copy** (above) — needs a runtime-level fix.
+4. **15 s comm init**, of which pynccl is ~9 s.
+5. **12 s `process_weights_after_loading`** — not yet investigated.
+6. **15.5 s of profile_run is the post-dummy-run `_sync_device()`**, i.e. the
+   16384-token dummy forward itself. Reducing `max_num_batched_tokens` would
+   cut it but changes serving behavior — not done.
+
+### Round 2 attribution (all measured, none fixed yet)
+
+Two of the "unexplored" blocks are now pinned to a single line each:
+
+- **`process_weights_after_loading` = 12 s is entirely `MLAAttention`**:
+  `MLAAttention=11.94s/78` layers (153 ms each), while every quant method
+  combined is `GGUFLinearMethod=0.04s/411, UnquantizedLinearMethod=0.00s/284,
+  GGUFMoEMethod=0.00s/75`. The work is in
+  `model_executor/layers/attention/mla_attention.py:967`
+  (`get_and_maybe_dequant_weights` on `kv_b_proj`, then the W_UK/W_UV
+  transposes via `replace_parameter(..., prefer_copy=True)`). Our `kv_b_proj`
+  is already BF16 from the adapter, so 153 ms for a
+  [512, 16x(128+128)] transpose is far more than the arithmetic — suspect a
+  per-layer device sync inside `replace_parameter`/`device_loading_context`.
+  **Next thing to look at; probably the cheapest remaining 10 s.**
+- **Capture 21 s splits PIECEWISE ~19 s / FULL ~1.3 s** for 4 sizes each.
+  The FULL decode graphs are nearly free; the piecewise mixed prefill-decode
+  graphs are the cost.
+
+Also confirmed cheap and not worth chasing: KV cache alloc+commit **0.09 s**,
+`get_kv_cache_configs` 0.01 s, API tail 6.6 s (was ~85 s this morning).
+
+## Round 3 (2026-07-28): 165 -> ~152 s. The AITER FP8 BMM precompile was 11.8 s.
+
+**Root cause of the 12 s `MLAAttention` post-load.** With `VLLM_ROCM_USE_AITER=1`
+the MLA path takes the `is_aiter_triton_fp8_bmm_enabled` branch, which
+pre-compiles the Triton FP8 BMM over batch sizes 1..1024 — 2 x 1024 kernel
+launches — **once per decoder layer, 78 times**. Triton's cache is keyed by
+shape/dtype and every layer has identical W_K/W_V shapes, so layers 2..78
+compiled nothing and only re-issued ~160k launches. Fix in
+`mla_attention.py`: a class-level `_fp8_bmm_precompiled` set keyed by
+(W_K.shape, W_V.shape, dtypes); sweep once per distinct shape.
+**11.79 s -> 0.73 s**, same kernels compiled, gate passes.
+
+The tell was that `rp_W_UV`/`rp_W_UK_T` timers both read 0.00 s — the `else:`
+branch they live in never executes on this configuration. When per-statement
+timers all read zero, the code you are reading is not the code that runs.
+
+**Rejected on measurement (do not retry):**
+- *GC pressure.* `gc.disable()` across the whole load + `freeze_gc_heap()`
+  after: MLA stayed 11.8 s. The GC change is kept (it is harmless and the
+  freeze legitimately excludes the static model graph) but it bought nothing.
+- *KV-cache page commit / first-pageable-copy-after-big-alloc.* A real pageable
+  H2D issued immediately after `initialize_kv_cache` costs **0.00 s**, so the
+  15 s in `kernel_warmup` is not "the first pageable copy after 43 GiB".
+- *Host staging not yet pinned.* Pinning a 64 MiB host buffer and doing an H2D
+  in `init_device` costs 0.02 s and did not move the stall.
+- *Tensor construction path / wrong device.* Rewriting
+  `torch.tensor(..., device=device)` as `torch.tensor(...).to(device)` stalls
+  identically, and the stamps confirm `device` is `cuda:0` / `cuda:1`
+  correctly per rank.
+  **The 15 s in `warm_v1_block_table_kernels` remains unexplained.** It is one
+  H2D of 8 bytes, both ranks stall simultaneously, the GPU is idle
+  (a `synchronize()` immediately before returns in 0.00 s), and py-spy shows
+  it blocked in `libhsa-runtime64.so` under `memcpy_and_sync`.
+
+**Measurement artifact worth knowing:** every anomalous boot (192 s, 211 s,
+192 s) came *immediately after editing a vLLM source file* — the inductor /
+compile cache key changes and `profile_run` jumps from ~22 s to ~60 s. The
+second and later boots after an edit are the honest steady state. Always
+discard the first boot after a code change.
+
+Also added: the harness now aborts if port 8077 is already serving. Two
+overlapping boots produced a bogus 32 s "measurement" against the previous
+run's server.
+
+### Where the ~152 s goes (steady state, worker 0)
+
+| phase | s |
+|---|---|
+| APIServer imports | 9.6 |
+| config + GGUF parse + fork | 8.2 |
+| device init + NCCL/aiter comm init | 14.5 |
+| weight load | 53 |
+| MLA + other post-load | 1.5 |
+| profile_run (LM dummy 16384 tok) | 22.6 |
+| kernel_warmup (the unexplained 15 s H2D) | 15.1 |
+| cudagraph capture (PIECEWISE 4x4.4 s, FULL 4x0.15 s) | 20.5 |
+| API tail -> port open | 5.8 |
+
+### llama.cpp comparison, corrected
+
+llama.cpp's own run-to-run spread is as wide as ours: 141.4 / 145.2 (07-27,
+no mmproj), 150.3 / 151.3 (07-28 with mmproj, `--no-warmup`), and **135.1 s
+with warmup enabled** — i.e. enabling warmup made it *faster* than a
+no-warmup run, which is variance, not a warmup effect. Its loader confirms
+why our weight load cannot be trivially beaten: `llama_model_loader`'s
+4-buffer pinned async upload path is explicitly disabled when mmap is on
+(`if (use_mmap || check_tensors) return nullptr;`), so with its default mmap
+llama.cpp does the same plain pageable copy vLLM does — 58.4 s there vs 53 s
+here.
+
+vLLM steady state, six boots: 151.76 / 151.80 / 152.01 / 154.75 / 154.77 /
+155.06 (median ~153.4). Every boot gated on
+`'The capital of France is' -> ' Paris. The city is located on the'`.
+
+### CORRECTION — the interleaved A/B says llama.cpp is 67 s, not ~150 s
+
+Back-to-back runs of one engine are not a fair baseline: the machine's page
+cache and the ROCm code-object cache drift over a session. Interleaving the
+two engines in a single window (llama.cpp, vLLM, llama.cpp, vLLM, ...):
+
+| pair | llama.cpp (first token) | vLLM (port + /health) |
+|---|---|---|
+| 1 | 160.9 s | 152.6 s |
+| 2 | **67.4 s** | 154.3 s |
+| 3 | **67.2 s** | 157.3 s |
+
+Both 67 s runs are genuine: llama-cli `_exit(0)`s on the first streamed token,
+and their logs are structurally identical to the 160 s run. llama.cpp's first
+run in the window is slow and then it settles at ~67 s, i.e. **llama.cpp's
+warm steady state is 67 s and vLLM's is ~154 s — we are 2.3x slower, not at
+parity.** Earlier claims of "15 s behind" compared our warm number against a
+llama.cpp number that was not yet warm. Any future comparison must interleave.
+
+**What this reframes.** vLLM's weight load alone (53 s) is nearly llama.cpp's
+entire warm boot (67 s). The gap is no longer about loading bytes; it is the
+~90 s of work vLLM does around the load that llama.cpp does not:
+
+| vLLM-only cost | s |
+|---|---|
+| imports + config + fork | 17.8 |
+| NCCL / aiter comm init | 14.5 |
+| profile_run (16384-token dummy forward) | 22.6 |
+| kernel_warmup (the unexplained 15 s H2D) | 15.1 |
+| cudagraph capture | 20.5 |
+| API tail | 5.8 |
+
+llama.cpp's warm 67 s implies its own `graph_reserve` (79.7 s when cold on
+07-27) is nearly free once the ROCm code-object cache is warm — so the
+comparable vLLM phases (profile + warmup + capture = 58 s) are the single
+biggest structural deficit, followed by comm init.
+
+---
+
+## Dead-code removal, pass 1 (2026-07-28): 259 files / 63,712 statements
+
+**Coverage is taken from real inference, not the test suite.** Harness
+`<SCRATCH>/cov_run.py` boots the actual server and drives 15 workload steps
+(greedy, chat, sampling+penalties+seed+stop, n>1 + logprobs, batched prompts,
+SSE streaming, 11k-token chunked prefill, prefix-cache hit, vision, and the
+models/health/metrics/version/tokenize/detokenize endpoints), then combines
+per-process data. Result: **17.9% of 295,425 statements execute; 980 of 2,110
+files are never imported.**
+
+**Getting the workers measured was the hard part and the first two attempts
+were wrong.** Coverage does not follow vLLM's fork into EngineCore and the TP
+workers: `sitecustomize` only runs for fresh interpreters, and the inherited
+tracer never writes a data file. The first run produced 2 data files and
+reported `gpu_model_runner.py` and `gpu_worker.py` at **0.0%** — files I had
+watched execute earlier the same day. Their apparent 14-20% elsewhere was only
+import-time class/def lines. Acting on that data would have deleted the entire
+model-execution path. Fix: an explicit `coverage.Coverage(data_suffix=True)`
+started in `WorkerProc.worker_main` under `VLLM_COV_WORKERS`, with atexit +
+SIGTERM + a 10 s periodic `save()` (workers die too hard for atexit alone).
+4 data files, and the worker paths then read 46-84%.
+
+**Trap: every import in that hook must be aliased.** A bare `import signal`
+(or `threading`) inside the `if` block binds the name function-locally for all
+of `worker_main` and shadows the module-level import, so with the hook disabled
+the worker dies with `UnboundLocalError`. Cost two failed boots.
+
+**Deleted:** 257 never-imported top-level files in `model_executor/models/`,
+plus `mimo_v2_mtp.py` and `cohere2_moe.py`, plus 247 `registry.py` entries.
+Kept deliberately: `clip/pixtral/siglip` (imported at *runtime* inside
+`vision.get_vision_encoder_info` — not TYPE_CHECKING, checked), and
+`llama4/parakeet/extract_hidden_states/mimo_v2` dependents. Two live files had
+dead branches removed: the MiMo-V2 MTP branches in `config/speculative.py` and
+the Cohere routing branch in `custom_routing_router.py`.
+
+**Verified:** full 15/15 workload passes on the pruned tree, vision included,
+boot 153.8 s (unchanged). Deletions are `git rm`, so `git restore` recovers any
+file without touching the uncommitted perf work.
+
+**Two grep traps while cross-referencing** (both produced false conclusions
+first): an empty line in a `grep -F -f` pattern file matches every line, and
+model basenames collide with unrelated modules (`models/transformers/utils.py`
+-> `utils` matched `from .utils import` everywhere). Use `grep -vxF` and
+fully-qualified dotted paths.
+
+### Remaining 0% files: 721 files / 91,425 statements
+
+| statements | files | category |
+|---|---|---|
+| 41,597 | 309 | everything else (needs per-file triage) |
+| 14,456 | 85 | KV connectors / offload / P-D disaggregation |
+| 7,267 | 89 | HF configs+processors for the deleted models |
+| 5,469 | 24 | benchmarks / profiler / tracing |
+| 5,161 | 41 | tool parsers |
+| 4,826 | 46 | other platforms (tpu/xpu/cpu/neuron) |
+| 3,725 | 22 | model_executor/models subdirectories |
+| 3,025 | 27 | vendored third_party |
+| 1,855 | 26 | other quantization methods |
+| 1,694 | 14 | LoRA |
+| 1,436 | 25 | reasoning parsers |
+| 914 | 13 | spec decode |
+
+Note "0% in this workload" is not "dead": tool parsers, reasoning parsers,
+LoRA and spec decode are features this workload never requested, and the tree
+does have a `GLM-5.2-speculator.dspark-preview` checkout. Those need an
+explicit scope decision rather than a coverage verdict.
+
+## Dead-code removal, pass 2: +256 files / 30,495 statements
+
+Scope decided by the user: keep spec decode, reasoning parsers, tool parsers,
+and benchmarks/profiler/tracing; delete KV connectors + P/D disaggregation,
+other platforms (tpu/xpu/cpu/neuron), HF configs+processors belonging to the
+deleted models, other quantization methods, model subdirectories, and LoRA.
+
+Method: for every candidate, resolve its dotted module path (including package
+`__init__`) and drop it from the deletion set if **any** kept file imports it
+or a parent package. 26 candidates were spared that way, leaving 256. Then 20
+more `registry.py` entries pruned by checking the module file actually exists.
+
+**Verified: 15/15 workload steps pass, vision included, boot 158.1 s.**
+
+### Running total
+
+| | files | statements |
+|---|---|---|
+| pass 1 (model architectures) | 259 | 63,712 |
+| pass 2 (platforms, KV connectors, LoRA, quant, configs) | 256 | 30,495 |
+| **total removed** | **515** | **94,207** |
+
+That is 32% of the 295,425 statements coverage saw, and the tree went from
+2,117 to 1,602 Python files. Everything is `git rm`, so any file is one
+`git restore` away.
+
+### Still on the table
+
+721 -> ~465 files remain at 0%, dominated by the 309-file "everything else"
+bucket (41,597 statements) that needs per-file triage rather than a category
+verdict. Function-level dead code inside *live* files has not been touched yet:
+coverage says only 17.9% of statements in the surviving tree execute, so the
+larger prize is inside the files we keep.
+
+## Dead-code removal, pass 3 + repo hygiene
+
+**First: pass 1 and 2 were measured with EngineCore unmeasured.** The same fork
+problem as the workers — `run_engine_core` never started its own coverage, so
+everything that runs *only* in that process looked dead:
+`v1/core/sched/scheduler.py` and `v1/core/kv_cache_manager.py` both read
+**0.0%**. Deleting the scheduler would have been fatal. Added the same aliased
+hook to `EngineCoreProc.run_engine_core`; with 5 data files they read 44.6% and
+64.2%, and `v1/engine/core.py` went 17.1% -> 45.7%. **9 files were false zeros.**
+Lesson: after any coverage run, sanity-check one known-live file *per process*
+before trusting the report.
+
+Deleted in pass 3 (184 files, 23,323 statements): other attention backends and
+attention ops, other `model_executor/layers` implementations, remaining
+`vllm/models/*` families (inkling, deepseek_v4, deepseek_v32, minimax_m3),
+vendored `third_party`, pooling and speech-to-text entrypoints, helion kernels,
+weight_transfer, leftover `transformers_utils/configs`, CPU worker variants,
+and unused model_loader/multimodal files. 53 further candidates were spared by
+the "still imported by a survivor" filter. Left alone deliberately:
+`vllm/parser`, `vllm/tokenizers`, `vllm/renderers`, `vllm/utils`, `vllm/v1/core`
+and the CLI/serve entrypoints — too load-bearing to delete on a single
+workload's evidence.
+
+Repo hygiene: removed `tests/` (1,520 files — the test suite is not the signal
+for this fork), 44 untracked root `*.log`, and 3 untracked root `*.hip` scratch
+files. **`build/` was left intact**: its 71 `.hip` files are hipify output from
+`cmake/utils.cmake`, and deleting them forces a full C++ recompile for no gain.
+Untracked files are not recoverable by git, so everything untracked was copied
+to `<SCRATCH>/archive_untracked/` before removal.
+
+### Final totals
+
+| pass | files | statements |
+|---|---|---|
+| 1 — model architectures | 259 | 63,712 |
+| 2 — platforms, KV connectors, LoRA, quant, configs | 256 | 30,495 |
+| 3 — attention backends, layers, model families, misc | 184 | 23,323 |
+| **subtotal (vllm/)** | **699** | **117,530** |
+| tests/ + root logs/hip | 1,567 | n/a |
+
+`vllm/` is down from 2,117 to 1,418 Python files. Coverage of the surviving
+tree is 27.3% of 200,743 statements. Every pass gated on the same 15-step real
+inference workload, vision included; boot time unchanged at ~158 s.
+
+**Remaining:** ~270 files still at 0% that were spared as too load-bearing or
+still-imported, plus the real prize — function-level dead code inside live
+files, where ~73% of surviving statements never execute.
+
+## Pass 4: file-level pruning hits its limit (and a filter bug)
+
+Targeted 38 "barely alive" files (<=15% covered) in already-approved
+categories — NVIDIA-only kernels (flashinfer/trtllm/cutlass/cutedsl), LoRA,
+other quant, other model families, elastic-EP. **32 of the 38 had to be
+restored**: they are transitively imported by live MoE dispatch/oracle code
+(`fused_moe/oracle/fp8.py` imports `flashinfer_utils` at module level even
+though nothing in it executes on ROCm). Net gain: 6 files.
+
+**Filter bug found and fixed the hard way: passes 2-4 only matched *absolute*
+imports.** Relative imports (`from .utils import compute_meta`) were invisible,
+which is how `vllm/lora/punica_wrapper/utils.py` got deleted while its live
+importer `punica_base.py` survived. An AST sweep for unresolvable relative
+imports found 63 targets; **54 were restored from HEAD** and 3 untracked ones
+from `<SCRATCH>/archive_untracked/`. Any future pass must resolve both import
+forms — and the untracked archive earned its keep here.
+
+Two false-positive classes in that AST sweep, for the record: `from . import
+name` re-exports a *function*, not a submodule (this made GGUF hot-path files
+look deleted when they never were), and namespace packages without
+`__init__.py` look missing but import fine. Trust the runtime gate over the
+static sweep.
+
+**Verified green: 15/15, boot 161.1 s.**
+
+### Where file-level pruning stands
+
+`vllm/` is at 1,455 Python files. The ~270 files still at 0% are no longer
+free to delete: each is wired into a live import graph, so removing them means
+editing live dispatch tables (MoE oracles, attention backend registry,
+entrypoint routers) rather than deleting leaves. That is a different and
+riskier kind of change than everything done so far.
+
+The remaining prize is inside live files: **5,697 fully-dead functions spanning
+66,127 lines** (`<SCRATCH>/cov/dead_funcs.json`, ranked). Biggest single
+offenders: `third_party/pynvml.py` (2,946 dead lines — NVIDIA-only on a ROCm
+box), `compilation/passes/fusion/allreduce_rms_fusion.py` (945),
+`config/speculative.py` (878), `quantization/modelopt.py` (768),
+`v1/worker/gpu_model_runner.py` (742). Function-level deletion needs a
+different safety argument than file-level: dynamic dispatch, registries and
+`getattr` mean "no lines executed in one workload" is weaker evidence for a
+method than for a whole module.

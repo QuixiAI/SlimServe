@@ -199,6 +199,14 @@ def _gguf_moe_weight_loader(
     return_success: bool = False,
 ) -> bool | None:
     _materialize_gguf_moe_param(layer, param, loaded_weight, shard_id)
+    if loaded_weight.ndim == 3 and loaded_weight.device.type == "cpu":
+        # Stacked all-expert tensor. The base loader TP-narrows it, and a
+        # strided host-to-device copy of that narrow falls off torch's fast
+        # path (measured 107 s for the checkpoint vs 44 s per-expert). One
+        # contiguous upload of the whole stack, then delegating unchanged,
+        # turns the narrowed copies into device-side strided copies.
+        # _materialize_gguf_moe_param has materialized the param on device.
+        loaded_weight = loaded_weight.to(param.device)
     return base_weight_loader(
         param,
         loaded_weight,

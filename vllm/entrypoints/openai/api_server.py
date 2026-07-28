@@ -65,6 +65,7 @@ from vllm.tool_parsers import ToolParserManager
 from vllm.tracing import instrument
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils.bootstamp import bootstamp
 from vllm.utils.network_utils import is_valid_ipv6_address
 from vllm.utils.system_utils import decorate_logs, set_ulimit
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
@@ -674,14 +675,18 @@ async def build_and_serve(
     if log_config is not None:
         uvicorn_kwargs["log_config"] = log_config
 
+    bootstamp("api: engine client ready, querying supported tasks")
     supported_tasks = await engine_client.get_supported_tasks()
     model_config = engine_client.model_config
 
     logger.info("Supported tasks: %s", supported_tasks)
+    bootstamp("api: build_app")
     app = build_app(args, supported_tasks, model_config)
+    bootstamp("api: init_app_state")
     await init_app_state(engine_client, app.state, args, supported_tasks)
 
     logger.info("Starting vLLM server on %s", listen_address)
+    bootstamp("api: serve_http")
 
     return await serve_http(
         app,
@@ -753,6 +758,7 @@ async def build_and_serve_renderer(
 async def run_server(args, **uvicorn_kwargs) -> None:
     """Run a single-worker API server."""
 
+    bootstamp("api: run_server entry (imports done)")
     decorate_logs("APIServer", skip_if_decorated=True)
 
     # Interrupt initialization if SIGTERM arrives before uvicorn installs its

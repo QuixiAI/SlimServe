@@ -12,17 +12,23 @@ from vllm.utils.import_utils import has_tilelang
 
 
 def _has_tilelang_mhc() -> bool:
-    if not has_tilelang():
-        return False
-    if current_platform.is_cuda():
-        return True
+    # Decide against TileLang before probing for it: has_tilelang() performs a
+    # trial import, and importing tilelang loads libhip_stub.so, which exports
+    # the public HIP ABI (including hipGetDevicePropertiesR0600, backed by the
+    # legacy R0000 implementation). That interposes on every HIP call resolved
+    # afterwards -- e.g. aiter's ASM modules read warpSize as the clock rate.
     if current_platform.is_rocm():
         from vllm.platforms.rocm import on_gfx942
 
         # TileLang MHC currently produces incorrect results on gfx942. Keep
         # gfx942 on the existing torch/triton fallbacks until that path is fixed.
-        return not on_gfx942()
-    return False
+        if on_gfx942():
+            return False
+    if not has_tilelang():
+        return False
+    if current_platform.is_cuda():
+        return True
+    return current_platform.is_rocm()
 
 
 HAS_TILELANG_MHC = _has_tilelang_mhc()

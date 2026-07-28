@@ -178,6 +178,9 @@ def get_mp_context():
     # of whether spawn was already set.
     _sync_visible_devices_env_vars()
     mp_method = envs.VLLM_WORKER_MULTIPROC_METHOD
+    from vllm.utils.bootstamp import bootstamp
+
+    bootstamp(f"get_mp_context -> {mp_method}")
     return multiprocessing.get_context(mp_method)
 
 

@@ -4,6 +4,7 @@
 
 import mmap
 import threading
+import time
 from functools import cache
 from os import PathLike
 from pathlib import Path
@@ -14,6 +15,7 @@ import numpy as np
 from gguf.constants import Keys, VisionProjectorType
 from transformers import Gemma3Config, PretrainedConfig, SiglipVisionConfig
 from vllm.logger import init_logger
+from vllm.utils.bootstamp import bootstamp
 
 logger = init_logger(__name__)
 
@@ -47,10 +49,15 @@ def gguf_reader(path: str | PathLike) -> gguf.GGUFReader:
     real = gguf.gguf_reader.np.memmap
     with _reader_lock:
         gguf.gguf_reader.np.memmap = _plain_mmap
+        start = time.perf_counter()
         try:
             return gguf.GGUFReader(path)
         finally:
             gguf.gguf_reader.np.memmap = real
+            bootstamp(
+                f"gguf_reader parsed {Path(path).name} "
+                f"in {time.perf_counter() - start:.2f}s"
+            )
 
 
 @cache

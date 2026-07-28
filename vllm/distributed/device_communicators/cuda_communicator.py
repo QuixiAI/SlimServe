@@ -79,14 +79,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
+        from vllm.utils.bootstamp import bootstamp
+
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
+            bootstamp("comm: pynccl init start")
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group if tcp_store_group is None else tcp_store_group,
                 device=self.device,
             )
             if is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
+            bootstamp("comm: pynccl init done")
 
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
@@ -107,10 +111,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
         if self.use_aiter_allreduce and self.world_size > 1:
+            bootstamp("comm: AiterCustomAllreduce init start")
             self.aiter_ar_comm = AiterCustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
             )
+            bootstamp("comm: AiterCustomAllreduce init done")
 
         if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
@@ -129,7 +135,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # Based on quickreduce (https://github.com/mk1-project/quickreduce).
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
+            bootstamp("comm: QuickAllReduce init start")
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            bootstamp("comm: QuickAllReduce init done")
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
