@@ -188,7 +188,7 @@ class KernelConfig:
     enable_bf16x3_router_gemm: bool = False
     """If True, use the experimental SM100 BF16x3 CuteDSL router GEMM."""
 
-    moe_backend: MoEBackend = "auto"
+    moe_backend: MoEBackend = "aiter"
     """Backend for MoE expert computation kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
@@ -213,7 +213,7 @@ class KernelConfig:
                    running QDQ on activations.
     """
 
-    linear_backend: LinearBackend = "auto"
+    linear_backend: LinearBackend = "aiter"
     """Backend for quantized linear layer GEMM kernels. Available options:
 
     - "auto": Automatically select the best backend based on model and hardware
