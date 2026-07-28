@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
 from typing import Literal, get_args
 
 from vllm.logger import init_logger
@@ -13,8 +14,6 @@ QuantizationMethods = Literal[
     "awq",
     "auto_awq",
     "fp8",
-    "fbgemm_fp8",
-    "fp_quant",
     "modelopt",
     "modelopt_fp4",
     "modelopt_mxfp8",
@@ -24,7 +23,6 @@ QuantizationMethods = Literal[
     "gptq",
     "gptq_marlin",
     "awq_marlin",
-    "humming",
     "compressed-tensors",
     "bitsandbytes",
     "experts_int8",
@@ -49,8 +47,6 @@ QuantizationMethods = Literal[
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 DEPRECATED_QUANTIZATION_METHODS = [
-    "fbgemm_fp8",
-    "fp_quant",
 ]
 
 # The customized quantization methods which will be added to this dict.
@@ -107,83 +103,67 @@ def register_quantization_config(quantization: str):
     return _wrapper
 
 
+# Method -> (module, class name). Resolved one at a time in
+# `get_quantization_config`: importing the whole table eagerly pulled every
+# quantization backend into a process that only ever resolves one of them.
+_ONLINE_CONFIG = (".online.base", "OnlineQuantizationConfig")
+_METHOD_TO_QUANT_CONFIG: dict[str, tuple[str, str]] = {
+    "awq": (".auto_awq", "AutoAWQConfig"),
+    "awq_marlin": (".auto_awq", "AutoAWQConfig"),
+    "auto_awq": (".auto_awq", "AutoAWQConfig"),
+    "fp8": (".fp8", "Fp8Config"),
+    "modelopt": (".modelopt", "ModelOptFp8Config"),
+    "modelopt_fp4": (".modelopt", "ModelOptNvFp4Config"),
+    "modelopt_mxfp8": (".modelopt", "ModelOptMxFp8Config"),
+    "modelopt_mixed": (".modelopt", "ModelOptMixedPrecisionConfig"),
+    "gguf": (".gguf", "GGUFConfig"),
+    "auto_gptq": (".auto_gptq", "AutoGPTQConfig"),
+    "gptq": (".auto_gptq", "AutoGPTQConfig"),
+    "gptq_marlin": (".auto_gptq", "AutoGPTQConfig"),
+    "compressed-tensors": (
+        ".compressed_tensors.compressed_tensors",
+        "CompressedTensorsConfig",
+    ),
+    "bitsandbytes": (".bitsandbytes", "BitsAndBytesConfig"),
+    "experts_int8": (".experts_int8", "ExpertsInt8Config"),
+    "quark": ("vllm.model_executor.layers.quantization.quark.quark", "QuarkConfig"),
+    "moe_wna16": (".moe_wna16", "MoeWNA16Config"),
+    "torchao": (".torchao", "TorchAOConfig"),
+    "inc": (".inc", "INCConfig"),
+    "mxfp4": (".mxfp4", "Mxfp4Config"),
+    "gpt_oss_mxfp4": (".mxfp4", "GptOssMxfp4Config"),
+    "deepseek_v4_fp8": ("vllm.models.deepseek_v4", "DeepseekV4FP8Config"),
+    "online": _ONLINE_CONFIG,
+    # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
+    # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand only
+    # applies to the `--quantization mxfp8` CLI path.
+    "mxfp8": (".modelopt", "ModelOptMxFp8Config"),
+}
+
+
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
+    # Customized methods are registered last and so win over the builtins.
+    if quantization in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG:
+        return _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization]
+
+    target = _METHOD_TO_QUANT_CONFIG.get(quantization)
+    if target is None:
+        # Online shorthands (e.g. "fp8_per_tensor") resolve to the online
+        # config, but only when they are not already a checkpoint method.
+        from vllm.config.quantization import _ONLINE_SHORTHANDS
+
+        if quantization in _ONLINE_SHORTHANDS:
+            target = _ONLINE_CONFIG
+    if target is None:
+        raise KeyError(quantization)
+
+    module, cls_name = target
     # lazy import to avoid triggering `torch.compile` too early
-    from vllm.config.quantization import _ONLINE_SHORTHANDS
-    from vllm.model_executor.layers.quantization.quark.quark import QuarkConfig
-    from vllm.models.deepseek_v4 import DeepseekV4FP8Config
-
-    from .auto_awq import AutoAWQConfig
-    from .auto_gptq import AutoGPTQConfig
-    from .bitsandbytes import BitsAndBytesConfig
-    from .compressed_tensors.compressed_tensors import (
-        CompressedTensorsConfig,
-    )
-    from .experts_int8 import ExpertsInt8Config
-    from .fbgemm_fp8 import FBGEMMFp8Config
-    from .fp8 import Fp8Config
-    from .fp_quant import FPQuantConfig
-    from .gguf import GGUFConfig
-    from .humming import HummingConfig
-    from .inc import INCConfig
-    from .modelopt import (
-        ModelOptFp8Config,
-        ModelOptMixedPrecisionConfig,
-        ModelOptMxFp8Config,
-        ModelOptNvFp4Config,
-    )
-    from .moe_wna16 import MoeWNA16Config
-    from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
-    from .online.base import OnlineQuantizationConfig
-    from .torchao import TorchAOConfig
-
-    method_to_config: dict[str, type[QuantizationConfig]] = {
-        "awq": AutoAWQConfig,
-        "awq_marlin": AutoAWQConfig,
-        "auto_awq": AutoAWQConfig,
-        "fp8": Fp8Config,
-        "fbgemm_fp8": FBGEMMFp8Config,
-        "fp_quant": FPQuantConfig,
-        "modelopt": ModelOptFp8Config,
-        "modelopt_fp4": ModelOptNvFp4Config,
-        "modelopt_mxfp8": ModelOptMxFp8Config,
-        "modelopt_mixed": ModelOptMixedPrecisionConfig,
-        "gguf": GGUFConfig,
-        "auto_gptq": AutoGPTQConfig,
-        "gptq": AutoGPTQConfig,
-        "gptq_marlin": AutoGPTQConfig,
-        "compressed-tensors": CompressedTensorsConfig,
-        "bitsandbytes": BitsAndBytesConfig,
-        "experts_int8": ExpertsInt8Config,
-        "quark": QuarkConfig,
-        "moe_wna16": MoeWNA16Config,
-        "torchao": TorchAOConfig,
-        "inc": INCConfig,
-        "mxfp4": Mxfp4Config,
-        "gpt_oss_mxfp4": GptOssMxfp4Config,
-        "deepseek_v4_fp8": DeepseekV4FP8Config,
-        "humming": HummingConfig,
-        "online": OnlineQuantizationConfig,
-        # MiniMax-style checkpoints tag `quant_method: "mxfp8"`; load with the
-        # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
-        # below only applies to the `--quantization mxfp8` CLI path.
-        "mxfp8": ModelOptMxFp8Config,
-    }
-
-    # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
-    # setdefault so a shorthand that is also a checkpoint method (e.g. "mxfp8")
-    # keeps its checkpoint config; the shorthand still works via the
-    # `--quantization` CLI path in `resolve_quantization_config`.
-    for shorthand in _ONLINE_SHORTHANDS:
-        method_to_config.setdefault(shorthand, OnlineQuantizationConfig)
-
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
-
-    return method_to_config[quantization]
+    mod = importlib.import_module(module, __name__ if module.startswith(".") else None)
+    return getattr(mod, cls_name)
 
 
 __all__ = [
