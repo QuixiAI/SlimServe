@@ -32,79 +32,6 @@ def vllm_version_matches_substr(substr: str) -> bool:
     return substr in vllm_version
 
 
-def tpu_platform_plugin() -> str | None:
-    logger.debug("Checking if TPU platform is available.")
-
-    # Check for Pathways TPU proxy
-    if envs.VLLM_TPU_USING_PATHWAYS:
-        logger.debug("Confirmed TPU platform is available via Pathways proxy.")
-        return "tpu_inference.platforms.tpu_platform.TpuPlatform"
-
-    # Check for libtpu installation
-    try:
-        # While it's technically possible to install libtpu on a
-        # non-TPU machine, this is a very uncommon scenario. Therefore,
-        # we assume that libtpu is installed only if the machine
-        # has TPUs.
-
-        import libtpu  # noqa: F401
-
-        logger.debug("Confirmed TPU platform is available.")
-        return "vllm.platforms.tpu.TpuPlatform"
-    except Exception as e:
-        logger.debug("TPU platform is not available because: %s", str(e))
-        return None
-
-
-def cuda_platform_plugin() -> str | None:
-    is_cuda = False
-    logger.debug("Checking if CUDA platform is available.")
-    try:
-        from vllm.utils.import_utils import import_pynvml
-
-        pynvml = import_pynvml()
-        pynvml.nvmlInit()
-        try:
-            # NOTE: Edge case: vllm cpu build on a GPU machine.
-            # Third-party pynvml can be imported in cpu build,
-            # we need to check if vllm is built with cpu too.
-            # Otherwise, vllm will always activate cuda plugin
-            # on a GPU machine, even if in a cpu build.
-            is_cuda = (
-                pynvml.nvmlDeviceGetCount() > 0
-                and not vllm_version_matches_substr("cpu")
-            )
-            if pynvml.nvmlDeviceGetCount() <= 0:
-                logger.debug("CUDA platform is not available because no GPU is found.")
-            if vllm_version_matches_substr("cpu"):
-                logger.debug(
-                    "CUDA platform is not available because vLLM is built with CPU."
-                )
-            if is_cuda:
-                logger.debug("Confirmed CUDA platform is available.")
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception as e:
-        logger.debug("Exception happens when checking CUDA platform: %s", str(e))
-        if "nvml" not in e.__class__.__name__.lower():
-            # If the error is not related to NVML, re-raise it.
-            raise e
-
-        # CUDA is supported on Jetson, but NVML may not be.
-        import os
-
-        def cuda_is_jetson() -> bool:
-            return os.path.isfile("/etc/nv_tegra_release") or os.path.exists(
-                "/sys/class/tegra-firmware"
-            )
-
-        if cuda_is_jetson():
-            logger.debug("Confirmed CUDA platform is available on Jetson.")
-            is_cuda = True
-        else:
-            logger.debug("CUDA platform is not available because: %s", str(e))
-
-    return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
 
 
 def rocm_platform_plugin() -> str | None:
@@ -128,83 +55,10 @@ def rocm_platform_plugin() -> str | None:
     return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
-def xpu_platform_plugin() -> str | None:
-    is_xpu = False
-    logger.debug("Checking if XPU platform is available.")
-    try:
-        import torch
-
-        if torch.distributed.is_xccl_available():
-            dist_backend = "xccl"
-            from vllm.platforms.xpu import XPUPlatform
-
-            XPUPlatform.dist_backend = dist_backend
-            logger.debug("Confirmed %s backend is available.", XPUPlatform.dist_backend)
-
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            is_xpu = True
-            logger.debug("Confirmed XPU platform is available.")
-    except Exception as e:
-        logger.debug("XPU platform is not available because: %s", str(e))
-
-    return "vllm.platforms.xpu.XPUPlatform" if is_xpu else None
-
-
-def _is_amd_zen_cpu() -> bool:
-    """Detect AMD CPU with AVX-512 via /proc/cpuinfo."""
-    if not os.path.exists("/proc/cpuinfo"):
-        return False
-    with open("/proc/cpuinfo") as f:
-        cpuinfo = f.read()
-    return "AuthenticAMD" in cpuinfo and "avx512" in cpuinfo
-
-
-def cpu_platform_plugin() -> str | None:
-    is_cpu = False
-    logger.debug("Checking if CPU platform is available.")
-    try:
-        is_cpu = vllm_version_matches_substr("cpu")
-        if is_cpu:
-            logger.debug(
-                "Confirmed CPU platform is available because vLLM is built with CPU."
-            )
-        if not is_cpu:
-            import sys
-
-            is_cpu = sys.platform.startswith("darwin")
-            if is_cpu:
-                logger.debug(
-                    "Confirmed CPU platform is available because the machine is MacOS."
-                )
-    except Exception as e:
-        logger.debug("CPU platform is not available because: %s", str(e))
-
-    if not is_cpu:
-        return None
-
-    if _is_amd_zen_cpu():
-        try:
-            import zentorch  # noqa: F401
-
-            logger.info(
-                "AMD Zen CPU detected with zentorch installed, using ZenCpuPlatform."
-            )
-            return "vllm.platforms.zen_cpu.ZenCpuPlatform"
-        except ImportError:
-            logger.debug(
-                "AMD Zen CPU detected but zentorch not installed, "
-                "falling back to CpuPlatform."
-            )
-
-    return "vllm.platforms.cpu.CpuPlatform"
 
 
 builtin_platform_plugins = {
-    "tpu": tpu_platform_plugin,
-    "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
-    "xpu": xpu_platform_plugin,
-    "cpu": cpu_platform_plugin,
 }
 
 
@@ -300,5 +154,4 @@ __all__ = [
     "current_platform",
     "CpuArchEnum",
     "_init_trace",
-    "_is_amd_zen_cpu",
 ]
