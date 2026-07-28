@@ -16,13 +16,19 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
         return True
     if target is None:
         return False
+    w = getattr(draft, "weight", None)
+    target_w = getattr(target, "weight", None)
+    if w is None or target_w is None:
+        # A quantized target keeps packed `qweight` instead of a dense
+        # `weight` (GGUF, for one), so the two tensors are neither comparable
+        # nor interchangeable. The draft must keep its own copy.
+        return False
     # torch.equal on GPU allocates a bool mask the size of the input.
     # Use the faster GPU path when there is plenty of headroom;
     # otherwise compare on CPU.
-    w = draft.weight
     if w.is_cuda and torch.accelerator.get_memory_info(w.device)[0] < w.numel() * 2:
-        return torch.equal(w.cpu(), target.weight.cpu())
-    return torch.equal(w, target.weight)
+        return torch.equal(w.cpu(), target_w.cpu())
+    return torch.equal(w, target_w)
 
 
 def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):

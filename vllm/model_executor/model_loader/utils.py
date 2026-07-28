@@ -101,9 +101,17 @@ def initialize_model(
 def process_weights_after_loading(
     model: nn.Module, model_config: ModelConfig, target_device: torch.device
 ) -> None:
+    import collections
+    import time as _time
+
+    from vllm.utils.bootstamp import bootstamp
+
+    _spent: dict[str, float] = collections.defaultdict(float)
+    _counts: dict[str, int] = collections.defaultdict(int)
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
+            _start = _time.perf_counter()
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the
@@ -121,17 +129,39 @@ def process_weights_after_loading(
             # Repacking transients above can leave large amounts of memory in
             # the caching allocator, which starves the OS on UMA devices.
             release_device_memory_under_pressure(target_device)
+            _key = type(quant_method).__name__
+            _spent[_key] += _time.perf_counter() - _start
+            _counts[_key] += 1
+    bootstamp(
+        "process_weights_after_loading by quant method: "
+        + ", ".join(
+            f"{k}={_spent[k]:.2f}s/{_counts[k]}"
+            for k in sorted(_spent, key=_spent.get, reverse=True)[:5]
+        )
+    )
 
     # Initialize post-load attention weights for Attention, MLA, and MM encoder.
     # NOTE: Happens after other modules so we can easily decompress weights.
+    _attn_spent: dict[str, float] = collections.defaultdict(float)
+    _attn_counts: dict[str, int] = collections.defaultdict(int)
     for _, module in model.named_modules():
         if isinstance(
             module, (Attention, MLAAttention, MMEncoderAttention)
         ) and hasattr(module, "process_weights_after_loading"):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
+            _start = _time.perf_counter()
             with device_loading_context(module, target_device):
                 module.process_weights_after_loading(model_config.dtype)
+            _attn_spent[type(module).__name__] += _time.perf_counter() - _start
+            _attn_counts[type(module).__name__] += 1
+    bootstamp(
+        "process_weights_after_loading attention: "
+        + ", ".join(
+            f"{k}={_attn_spent[k]:.2f}s/{_attn_counts[k]}"
+            for k in sorted(_attn_spent, key=_attn_spent.get, reverse=True)[:5]
+        )
+    )
 
     # Process HPC modules (HpcRopeNorm, etc.) that rely on
     # process_weights_after_loading being called from the model's

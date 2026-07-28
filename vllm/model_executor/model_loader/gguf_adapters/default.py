@@ -236,14 +236,12 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     ) -> Iterable[tuple[str, torch.Tensor]]:
         for hf_name, weight in weights:
             weight = self.transform_weight(hf_name, weight)
-            if weight.ndim == 3 and ".experts.0." in hf_name:
-                for expert_id, expert_weight in enumerate(weight.unbind()):
-                    expert_name = hf_name.replace(
-                        ".experts.0.", f".experts.{expert_id}."
-                    )
-                    yield expert_name, expert_weight
-            else:
-                yield hf_name, weight
+            # Stacked expert tensors (ndim == 3) are yielded whole under the
+            # expert-0 name: RoutedExperts.weight_loader's `full_load` path
+            # materializes and TP-slices the entire stack in one strided copy.
+            # Unbinding into 256 per-expert slices costs ~60k host-to-device
+            # copies per worker (measured 44 s of a 51 s load).
+            yield hf_name, weight
 
     @staticmethod
     def _get_all_gguf_files(model_path: str) -> list[str]:

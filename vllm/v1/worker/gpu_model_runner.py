@@ -6450,15 +6450,20 @@ class GPUModelRunner(
                         )
 
                         # Create dummy batch of multimodal inputs.
+                        from vllm.utils.bootstamp import bootstamp
+
+                        bootstamp("profile_run: building mm dummy batch")
                         batched_dummy_mm_inputs = self._get_mm_dummy_batch(
                             dummy_modality,
                             max_mm_items_per_batch,
                         )
+                        bootstamp("profile_run: mm dummy batch built")
 
                         # Run multimodal encoder.
                         dummy_encoder_outputs = self.model.embed_multimodal(
                             **batched_dummy_mm_inputs
                         )
+                        bootstamp("profile_run: mm encoder dummy run done")
 
                         sanity_check_mm_encoder_outputs(
                             dummy_encoder_outputs,
@@ -6468,9 +6473,13 @@ class GPUModelRunner(
                             self.encoder_cache[f"tmp_{i}"] = output
 
         # Add `is_profile` here to pre-allocate communication buffers
+        from vllm.utils.bootstamp import bootstamp
+
+        bootstamp(f"profile_run: LM dummy run start ({self.max_num_tokens} tokens)")
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        bootstamp("profile_run: LM dummy run submitted")
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
@@ -6479,6 +6488,7 @@ class GPUModelRunner(
         else:
             output = None
         self._sync_device()
+        bootstamp("profile_run: device synced")
         del hidden_states, output
         self.encoder_cache.clear()
         gc.collect()
@@ -6851,6 +6861,8 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
             start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
 
+            from vllm.utils.bootstamp import bootstamp
+
             for (
                 runtime_mode,
                 batch_descs,
@@ -6861,6 +6873,7 @@ class GPUModelRunner(
                     profiler=profiler,
                 )
                 torch.accelerator.synchronize()
+                bootstamp(f"capture: {runtime_mode} x{len(batch_descs)} done")
 
             # Capture encoder CUDA graphs if enabled
             if self.encoder_cudagraph_manager is not None:
@@ -6909,6 +6922,11 @@ class GPUModelRunner(
         if num_warmups is None:
             num_warmups = self.compilation_config.cudagraph_num_of_warmups
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        import time as _t
+
+        from vllm.utils.bootstamp import bootstamp
+
+        _t0 = _t.perf_counter()
         for _ in range(num_warmups):
             self._dummy_run(
                 desc.num_tokens,
@@ -6921,6 +6939,8 @@ class GPUModelRunner(
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
             )
+        _warm_s = _t.perf_counter() - _t0
+        _t0 = _t.perf_counter()
         with (
             profiler,
             torch.profiler.record_function(
@@ -6938,6 +6958,11 @@ class GPUModelRunner(
                 is_graph_capturing=True,
                 profile_seq_lens=profile_seq_lens,
             )
+        bootstamp(
+            f"capture {cudagraph_runtime_mode.name} n={desc.num_tokens}: "
+            f"warmup({num_warmups})={_warm_s:.2f}s "
+            f"capture={_t.perf_counter() - _t0:.2f}s"
+        )
 
     def _capture_cudagraphs(
         self,

@@ -821,6 +821,51 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+        from vllm.utils.bootstamp import bootstamp
+
+        bootstamp("Worker process entry")
+
+        # Coverage does not follow the fork into worker processes: the
+        # sitecustomize hook only runs for fresh interpreters and the
+        # inherited tracer never writes its own data file. Start an explicit
+        # per-worker run so dead-code analysis sees the execution path.
+        # NB: every import here is aliased. A bare `import signal` (or
+        # threading/atexit) would bind the name function-locally for the whole
+        # of worker_main and shadow the module-level import the rest of the
+        # function uses, raising UnboundLocalError when this block is skipped.
+        if os.environ.get("VLLM_COV_WORKERS"):
+            import atexit as _atexit
+            import signal as _signal
+            import threading as _threading
+
+            import coverage as _coverage
+
+            _cov = _coverage.Coverage(
+                config_file=os.environ["COVERAGE_PROCESS_START"], data_suffix=True
+            )
+            _cov.start()
+
+            def _flush_cov(*_):
+                _cov.save()
+
+            _atexit.register(_flush_cov)
+            _prev = _signal.getsignal(_signal.SIGTERM)
+            _signal.signal(
+                _signal.SIGTERM,
+                lambda s, f: (_flush_cov(), _prev(s, f) if callable(_prev) else None),
+            )
+
+            # Workers can be torn down hard enough that neither atexit nor the
+            # signal handler runs, so checkpoint the data periodically.
+            def _periodic():
+                while True:
+                    time.sleep(10)
+                    try:
+                        _cov.save()
+                    except Exception:
+                        return
+
+            _threading.Thread(target=_periodic, daemon=True).start()
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

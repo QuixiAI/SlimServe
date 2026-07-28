@@ -30,17 +30,11 @@ class CustomRoutingRouter(BaseRouter):
 
     @property
     def routing_method_type(self) -> RoutingMethodType:
-        from vllm.model_executor.models.cohere2_moe import token_choice_with_bias
         from vllm.model_executor.models.llama4 import Llama4MoE
 
         # NOTE: FLASHINFER_TRTLLM support the Llama4 router.
         if self.custom_routing_function == Llama4MoE.custom_routing_function:
             return RoutingMethodType.Llama4
-        # Cohere MoE uses sigmoid -> top-k, optionally followed by renormalize.
-        if self.custom_routing_function == token_choice_with_bias:
-            if self.renormalize:
-                return RoutingMethodType.SigmoidRenorm
-            return RoutingMethodType.Sigmoid
         return RoutingMethodType.Custom
 
     def _compute_routing(

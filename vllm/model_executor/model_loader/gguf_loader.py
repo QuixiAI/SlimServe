@@ -11,6 +11,7 @@ to loading this model.
 """
 
 import os
+import time
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -24,6 +25,7 @@ from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
 )
+from vllm.utils.bootstamp import bootstamp
 from vllm.utils.torch_utils import set_default_torch_dtype
 
 if TYPE_CHECKING:
@@ -71,7 +73,30 @@ class GGUFModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter = self._prepare_adapter(model_config)
-        model.load_weights(adapter.prepare_weights(model_config))
+        model.load_weights(self._timed_weights(adapter, model_config))
+
+    def _timed_weights(self, adapter, model_config: ModelConfig):
+        """Yield weights while splitting producer time from consumer time.
+
+        Producer time is spent inside the adapter iterator (mmap reads, dequant
+        and reshape on the CPU); the rest of the wall-clock of
+        ``model.load_weights`` is the consumer (name mapping and H2D copies).
+        """
+        gen = adapter.prepare_weights(model_config)
+        produced = 0
+        producer_s = 0.0
+        while True:
+            start = time.perf_counter()
+            try:
+                item = next(gen)
+            except StopIteration:
+                break
+            producer_s += time.perf_counter() - start
+            produced += 1
+            yield item
+        bootstamp(
+            f"gguf producer: {produced} tensors, {producer_s:.2f}s inside iterator"
+        )
 
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
@@ -89,8 +114,21 @@ class GGUFModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
+            start = time.perf_counter()
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
-            model.load_weights(adapter.prepare_weights(model_config))
+            bootstamp(
+                f"gguf load: initialize_model {time.perf_counter() - start:.2f}s"
+            )
+            start = time.perf_counter()
+            model.load_weights(self._timed_weights(adapter, model_config))
+            bootstamp(
+                f"gguf load: load_weights total {time.perf_counter() - start:.2f}s"
+            )
+            start = time.perf_counter()
             process_weights_after_loading(model, model_config, target_device)
+            bootstamp(
+                "gguf load: process_weights_after_loading "
+                f"{time.perf_counter() - start:.2f}s"
+            )
         return model

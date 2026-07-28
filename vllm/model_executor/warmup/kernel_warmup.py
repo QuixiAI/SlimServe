@@ -76,6 +76,7 @@ def kernel_warmup(worker: "Worker"):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
     )
+    from vllm.utils.bootstamp import bootstamp
 
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
@@ -83,7 +84,9 @@ def kernel_warmup(worker: "Worker"):
             getattr(worker.model_runner, "device", torch.device("cuda")),
             worker.scheduler_config.max_num_batched_tokens,
         )
+    bootstamp("kernel_warmup: block_table done")
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    bootstamp("kernel_warmup: qwen_triton done")
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
@@ -95,10 +98,13 @@ def kernel_warmup(worker: "Worker"):
             worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
         ),
     )
+    bootstamp("kernel_warmup: dsv4_mhc done")
 
     # Run next so input-prep kernels JIT against pristine runner state.
     flashinfer_sparse_mla_decode_autotune_warmup(worker)
+    bootstamp("kernel_warmup: fi_sparse_mla_decode done")
     deepseek_v4_sparse_mla_attention_warmup(worker)
+    bootstamp("kernel_warmup: dsv4_sparse_mla done")
 
     # Deep GEMM warmup
     do_deep_gemm_warmup = (
