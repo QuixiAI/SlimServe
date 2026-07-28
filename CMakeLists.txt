@@ -172,13 +172,9 @@ endif()
 #
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
+# Only ROCm is supported here; the CPU extension and its sources are gone.
 if (NOT VLLM_TARGET_DEVICE STREQUAL "cuda" AND
     NOT VLLM_TARGET_DEVICE STREQUAL "rocm")
-    if (VLLM_TARGET_DEVICE STREQUAL "cpu")
-        include(${CMAKE_CURRENT_LIST_DIR}/cmake/cpu_extension.cmake)
-    else()
-        return()
-    endif()
     return()
 endif()
 
