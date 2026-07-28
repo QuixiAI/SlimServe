@@ -102,17 +102,15 @@ class BaseFrontendArgs:
     """When `--max-logprobs` is specified, represents single tokens as
     strings of the form 'token_id:{token_id}' so that tokens that are not
     JSON-encodable can be identified."""
-    enable_auto_tool_choice: bool = False
-    """Enable auto tool choice for supported models. Use `--tool-call-parser`
-    to specify which parser to use."""
+    enable_auto_tool_choice: bool = True
+    """Always enabled. This fork serves one model (GLM-5.2-Vision), which
+    supports tool calling, so there is no reason to turn it off; the value
+    is forced on in `validate_parsed_serve_args`."""
     exclude_tools_when_tool_choice_none: bool = False
     """If specified, exclude tool definitions in prompts when
     tool_choice='none'."""
-    tool_call_parser: str | None = None
-    """Select the tool call parser depending on the model that you're using.
-    This is used to parse the model-generated tool call into OpenAI API format.
-    Required for `--enable-auto-tool-choice`. You can choose any option from
-    the built-in parsers or register a plugin via `--tool-parser-plugin`."""
+    tool_call_parser: str = "glm47"
+    """Fixed to the GLM parser, which is the one this fork's model needs."""
     tool_parser_plugin: str = ""
     """Special the tool parser plugin write to parse the model-generated tool
     into OpenAI API format, the name register in this plugin can be used in
@@ -391,9 +389,10 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
 
-    # Enable auto tool needs a tool call parser to be valid
-    if args.enable_auto_tool_choice and not args.tool_call_parser:
-        raise TypeError("Error: --enable-auto-tool-choice requires --tool-call-parser")
+    # Tool calling is not optional here, and it always uses the GLM parser.
+    args.enable_auto_tool_choice = True
+    if not args.tool_call_parser:
+        args.tool_call_parser = "glm47"
     if args.enable_log_outputs and not args.enable_log_requests:
         raise TypeError("Error: --enable-log-outputs requires --enable-log-requests")
 
