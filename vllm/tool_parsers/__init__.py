@@ -126,10 +126,6 @@ _TOOL_PARSERS_TO_REGISTER = {
         "minimax_m2_tool_parser",
         "MinimaxM2ToolParser",
     ),
-    "minimax_m3": (
-        "minimax_m3_tool_parser",
-        "MinimaxM3ToolParser",
-    ),
     "minicpm5": (
         "minicpm5xml_tool_parser",
         "MiniCPM5XMLToolParser",
