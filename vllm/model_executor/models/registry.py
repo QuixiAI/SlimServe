@@ -81,7 +81,6 @@ _TEXT_GENERATION_MODELS = {
     "IQuestCoderForCausalLM": ("llama", "LlamaForCausalLM"),
     "LagunaForCausalLM": ("laguna", "LagunaForCausalLM"),
     "LlamaForCausalLM": ("llama", "LlamaForCausalLM"),
-    "Llama4ForCausalLM": ("llama4", "Llama4ForCausalLM"),
     # For decapoda-research/llama-*
     "LLaMAForCausalLM": ("llama", "LlamaForCausalLM"),
     "LongcatFlashNgramForCausalLM": (
