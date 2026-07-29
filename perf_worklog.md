@@ -1924,3 +1924,41 @@ quark/fp8 for the speculator path). Making the dispatch import only the
 selected method would let most of those modules be deleted outright; it is a
 single well-understood function, but it touches the path that every model load
 goes through, so it wants its own commit and gate run.
+
+## Load-time baseline after the specialization work (2026-07-29): 156.3 s
+
+Re-measured after the platform-probe removal, lazy quantization dispatch, the
+FP8 BMM precompile fix, and the new hard-coded defaults (kv-cache fp8_e4m3,
+aiter linear+moe backends, glm47/glm45 parsers). Gate passes.
+
+| phase | window | s |
+|---|---|---|
+| APIServer imports | 0 -> 9.6 | 9.6 |
+| config + GGUF parse + fork | 9.6 -> 17.8 | 8.2 |
+| device init + NCCL/aiter comm | 17.8 -> 33.4 | 15.6 |
+| weight load (53.3) + post-load | 33.4 -> 90.5 | 57.1 |
+| profile_run (16384-token dummy) | 90.5 -> 113.1 | 22.6 |
+| kernel_warmup (the unexplained H2D stall) | 113.3 -> 128.4 | 15.1 |
+| cudagraph capture (4 PIECEWISE + 4 FULL) | 128.4 -> 149.5 | 21.1 |
+| API tail -> port open | 149.5 -> 155.8 | 6.3 |
+
+**llama.cpp warm steady state is 67 s** (interleaved A/B; back-to-back runs of
+one engine are not a valid baseline). Its weight load is ~50 s of that, so its
+non-load overhead is ~17 s against our ~103 s. **The gap is not the load --
+it is everything we do around it.**
+
+Ranked targets, none yet attempted:
+
+1. **capture 21.1 s.** 4 PIECEWISE captures at ~4.4 s each plus 4 nearly-free
+   FULL ones. Capturing fewer sizes is a direct trade against batch-size
+   coverage; worth deciding deliberately now that the config is hard-coded.
+2. **profile_run 22.6 s**, dominated by the 16384-token dummy forward. Scales
+   with max_num_batched_tokens, so it is a serving-capacity trade.
+3. **capture + profile + warmup together are 58.8 s** and llama.cpp's
+   equivalent (`graph_reserve`) is nearly free once its ROCm code-object cache
+   is warm -- this block is the single biggest structural deficit.
+4. **comm init 15.6 s**, of which pynccl bootstrap is ~8.8 s. Overlapping it
+   with weight load in a background thread is the obvious idea and is untried.
+5. **kernel_warmup 15.1 s** -- one 8-byte pageable H2D blocked in
+   libhsa-runtime64.so. Four hypotheses tested and rejected (KV commit, host
+   staging pin, tensor-construction path, Triton compile). Still unexplained.
