@@ -53,7 +53,7 @@ What the specialization buys:
 - DSpark speculative decoding against a GGUF-quantized verifier
 - TurboQuant compressed KV for the draft model (sliding-window support added here)
 - AITER sparse-MLA (DSA) attention with a working 1M-token path
-- ~154 s cold start on a 244 GiB model
+- ~154 s cold start on a 244 GiB model (even faster load time than llama.cpp)
 
 ---
 
