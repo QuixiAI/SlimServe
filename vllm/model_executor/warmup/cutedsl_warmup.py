@@ -36,9 +36,6 @@ class CuTeDSLCompileUnit:
 _CUTEDSL_WARMUP_PROVIDERS: weakref.WeakSet[object] = weakref.WeakSet()
 
 
-def register_cutedsl_warmup_provider(provider: object) -> None:
-    """Register an object that can expose CuTeDSL warmup compile units."""
-    _CUTEDSL_WARMUP_PROVIDERS.add(provider)
 
 
 # Yield compile units from registered providers.

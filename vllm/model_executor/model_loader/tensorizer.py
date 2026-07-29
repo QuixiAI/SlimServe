@@ -75,15 +75,6 @@ def is_valid_deserialization_uri(uri: str | None) -> bool:
     return False
 
 
-def tensorizer_kwargs_arg(value):
-    loaded = json.loads(value)
-    if not isinstance(loaded, dict):
-        raise argparse.ArgumentTypeError(
-            f"Not deserializable to dict: {value}. serialization_kwargs and "
-            f"deserialization_kwargs must be "
-            f"deserializable from a JSON string to a dictionary. "
-        )
-    return loaded
 
 
 class MetaTensorMode(TorchDispatchMode):

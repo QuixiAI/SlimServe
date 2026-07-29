@@ -43,9 +43,6 @@ _USAGE_ENV_VARS_TO_COLLECT = [
 ]
 
 
-def set_runtime_usage_data(key: str, value: str | int | bool) -> None:
-    """Set global usage data that will be sent with every usage heartbeat."""
-    _GLOBAL_RUNTIME_DATA[key] = value
 
 
 def is_usage_stats_enabled():

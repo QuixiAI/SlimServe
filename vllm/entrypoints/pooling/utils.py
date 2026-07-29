@@ -205,16 +205,6 @@ def build_pooling_bytes_streaming_response(
     )
 
 
-def decode_pooling_output(items: list[MetadataItem], body: bytes) -> list[torch.Tensor]:
-    return [
-        binary2tensor(
-            body[item.start : item.end],
-            item.shape,
-            item.embed_dtype,
-            item.endianness,
-        )
-        for item in sorted(items, key=lambda x: x.index)
-    ]
 
 
 @lru_cache(maxsize=1)

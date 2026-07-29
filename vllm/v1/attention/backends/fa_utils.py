@@ -296,62 +296,9 @@ def flash_attn_supports_kv_cache_dtype(
     )
 
 
-def flash_attn_supports_quant_query_input() -> bool:
-    return not current_platform.is_xpu()
 
 
-def flash_attn_supports_sinks() -> bool:
-    if current_platform.is_xpu():
-        return True
-    return get_flash_attn_version() in (3, 4)
 
 
-def flash_attn_supports_mla():
-    from vllm.platforms import current_platform
-
-    if current_platform.is_cuda():
-        try:
-            from vllm.vllm_flash_attn.flash_attn_interface import (
-                is_fa_version_supported,
-            )
-
-            return is_fa_version_supported(
-                3
-            ) and current_platform.is_device_capability_family(90)
-
-            # NOTE(Lucas): FA4 CuteDSL does NOT currently support MLA's non-standard
-            # head dimensions (576 for qk, 512 for v) due to TMEM capacity limits.
-
-        except (ImportError, AssertionError):
-            pass
-    return False
 
 
-def is_flash_attn_varlen_func_available() -> bool:
-    """Check if flash_attn_varlen_func is available.
-
-    This function determines whether the flash_attn_varlen_func imported at module
-    level is a working implementation or a stub.
-
-    Platform-specific sources:
-    - CUDA: vllm.vllm_flash_attn.flash_attn_varlen_func
-    - XPU: xpu_ops.flash_attn_varlen_func
-    - ROCm: upstream flash_attn.flash_attn_varlen_func (if available)
-
-    Note: This is separate from the AITER flash attention backend (rocm_aiter_fa.py)
-    which uses rocm_aiter_ops.flash_attn_varlen_func. The condition to use AITER is
-    handled separately via _aiter_ops.is_aiter_found_and_supported().
-
-    Returns:
-        bool: True if a working flash_attn_varlen_func implementation is available.
-    """
-    if current_platform.is_cuda() or current_platform.is_xpu():
-        # CUDA and XPU always have flash_attn_varlen_func available
-        return True
-
-    if current_platform.is_rocm():
-        # Use the flag set during module import to check if
-        # upstream flash-attn was successfully imported
-        return _ROCM_FLASH_ATTN_AVAILABLE
-
-    return False

@@ -26,12 +26,8 @@ def get_standby_ep_group() -> StatelessGroupCoordinator | None:
     return _STANDBY_EP
 
 
-def get_standby_eplb_group() -> StatelessGroupCoordinator | None:
-    return _STANDBY_EPLB
 
 
-def get_standby_world_group() -> StatelessGroupCoordinator | None:
-    return _STANDBY_WORLD
 
 
 def create_standby_groups(
