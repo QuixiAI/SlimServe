@@ -84,12 +84,6 @@ id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
 into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
 speculation off with `--no-spec`.
 
-**That is everything.** No `config.json`, no tokenizer repo, no external
-downloads. The GGUF pair is self-sufficient: the target carries the tokenizer,
-chat template and text architecture (`glm-dsa.*`), and the mmproj carries the
-vision config (`clip.vision.*`). SlimServe builds the whole `Glm5vConfig` from
-that metadata, so `--hf-config-path` and `--tokenizer` are never needed.
-
 ## Quick start
 
 ```bash
