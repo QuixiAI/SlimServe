@@ -1,5 +1,20 @@
 # SlimServe
 
+### With SlimServe you can run GLM-5.2-Vision at
+
+| | 1 request | 16 concurrent |
+| --- | ---: | ---: |
+| **2× MI300X** | **87 tok/s** | **284 tok/s** |
+| **4× MI300X** | **104 tok/s** | **371 tok/s** |
+
+### …while supporting up to 512k tokens of context
+
+<sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
+responses, temperature 0, DSpark speculative decoding with TurboQuant draft
+KV. 1M-token context is available on 4+ GPUs.</sub>
+
+---
+
 **QuixiAI/SlimServe** — a vLLM fork stripped down and specialized to serve
 [**QuixiAI/GLM-5.2-Vision-GGUF**](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF)
 as efficiently as possible on 2–8 AMD MI300X GPUs.
