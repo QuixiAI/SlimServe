@@ -280,7 +280,11 @@ class GlmDsaGGUFAdapter(GGUFWeightsAdapter):
         # to be dequantized here rather than handed over as packed blocks. The
         # shared iterator only yields packed data, so walk the readers directly
         # and delegate everything ordinary back to it.
-        special = set(_INDEXER_HALVES) | {"attn_k_b.weight", "attn_v_b.weight"}
+        special = set(_INDEXER_HALVES) | {
+            "attn_k_b.weight",
+            "attn_v_b.weight",
+            "nextn.eh_proj.weight",
+        }
         deferred: set[str] = set()
         for gguf_file in self.load_spec.weights_source:
             reader = gguf_reader(gguf_file)
@@ -301,7 +305,7 @@ class GlmDsaGGUFAdapter(GGUFWeightsAdapter):
                 if suffix in _INDEXER_HALVES:
                     # vLLM's loader fuses these two into wk_weights_proj itself.
                     yield hf_name, value.to(torch.bfloat16)
-                else:
+                elif suffix in ("attn_k_b.weight", "attn_v_b.weight"):
                     slot = kv_parts.setdefault(layer, {})
                     slot[suffix] = value
                     if len(slot) == 2:
@@ -316,6 +320,8 @@ class GlmDsaGGUFAdapter(GGUFWeightsAdapter):
                             ),
                         )
                         kv_parts.pop(layer, None)
+                else:
+                    yield hf_name, value.to(torch.bfloat16)
 
         if self._is_multimodal(model_config) and not is_mtp:
             yield from self._vision_weights()

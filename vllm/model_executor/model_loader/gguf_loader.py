@@ -120,6 +120,12 @@ class GGUFModelLoader(BaseModelLoader):
             bootstamp(
                 f"gguf load: initialize_model {time.perf_counter() - start:.2f}s"
             )
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_device_comm = get_tp_group().device_communicator
+            start_async_init = getattr(tp_device_comm, "start_async_init", None)
+            if start_async_init is not None:
+                start_async_init()
             start = time.perf_counter()
             model.load_weights(self._timed_weights(adapter, model_config))
             bootstamp(

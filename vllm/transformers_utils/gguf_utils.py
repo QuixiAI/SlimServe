@@ -2,24 +2,158 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GGUF utility functions."""
 
+import hashlib
+import json
 import mmap
+import os
 import threading
 import time
+from collections import OrderedDict
 from functools import cache
 from os import PathLike
 from pathlib import Path
+from typing import Any
 
 import gguf
 import gguf.gguf_reader
 import numpy as np
-from gguf.constants import Keys, VisionProjectorType
+from gguf.constants import GGMLQuantizationType, Keys, VisionProjectorType
+from gguf.quants import quant_shape_to_byte_shape
 from transformers import Gemma3Config, PretrainedConfig, SiglipVisionConfig
+
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.bootstamp import bootstamp
 
 logger = init_logger(__name__)
 
 _reader_lock = threading.Lock()
+_GGUF_METADATA_CACHE_VERSION = 1
+
+
+class _CachedField:
+    def __init__(self, value: Any):
+        self._value = value
+
+    def contents(self, index_or_slice: int | slice = slice(None)) -> Any:
+        if isinstance(index_or_slice, slice) and index_or_slice == slice(None):
+            return self._value
+        return self._value[index_or_slice]
+
+
+class _CachedGGUFReader:
+    def __init__(self, path: str, metadata: dict[str, Any]):
+        self.data = _plain_mmap(path)
+        self.byte_order = metadata["byte_order"]
+        self.alignment = metadata["alignment"]
+        self.data_offset = metadata["data_offset"]
+        self.fields = OrderedDict(
+            (name, _CachedField(value))
+            for name, value in metadata["fields"].items()
+        )
+        self.tensors = [
+            self._build_tensor(tensor_metadata)
+            for tensor_metadata in metadata["tensors"]
+        ]
+
+    def get_field(self, key: str):
+        return self.fields.get(key)
+
+    def get_tensor(self, idx: int):
+        return self.tensors[idx]
+
+    def _build_tensor(self, metadata: list[Any]):
+        name, raw_type, raw_shape, n_elements, n_bytes, data_offset = metadata
+        tensor_type = GGMLQuantizationType(raw_type)
+        shape = np.asarray(raw_shape, dtype=np.uint64)
+        np_shape = tuple(reversed(raw_shape))
+
+        if tensor_type == GGMLQuantizationType.F16:
+            item_count, item_type = n_elements, np.float16
+        elif tensor_type == GGMLQuantizationType.F32:
+            item_count, item_type = n_elements, np.float32
+        elif tensor_type == GGMLQuantizationType.F64:
+            item_count, item_type = n_elements, np.float64
+        elif tensor_type == GGMLQuantizationType.I8:
+            item_count, item_type = n_elements, np.int8
+        elif tensor_type == GGMLQuantizationType.I16:
+            item_count, item_type = n_elements, np.int16
+        elif tensor_type == GGMLQuantizationType.I32:
+            item_count, item_type = n_elements, np.int32
+        elif tensor_type == GGMLQuantizationType.I64:
+            item_count, item_type = n_elements, np.int64
+        else:
+            item_count, item_type = n_bytes, np.uint8
+            np_shape = quant_shape_to_byte_shape(np_shape, tensor_type)
+
+        item_size = np.dtype(item_type).itemsize
+        data = self.data[data_offset : data_offset + item_count * item_size]
+        data = data.view(item_type)[:item_count].reshape(np_shape)
+        return gguf.gguf_reader.ReaderTensor(
+            name=name,
+            tensor_type=tensor_type,
+            shape=shape,
+            n_elements=n_elements,
+            n_bytes=n_bytes,
+            data_offset=data_offset,
+            data=data,
+            field=None,
+        )
+
+
+def _metadata_cache_path(path: str) -> Path:
+    key = hashlib.sha256(path.encode()).hexdigest()
+    return Path(envs.VLLM_CACHE_ROOT) / "gguf_metadata" / f"{key}.json"
+
+
+def _load_cached_reader(path: str) -> _CachedGGUFReader | None:
+    cache_path = _metadata_cache_path(path)
+    try:
+        with cache_path.open() as cache_file:
+            metadata = json.load(cache_file)
+        stat = os.stat(path)
+        if (
+            metadata["version"] != _GGUF_METADATA_CACHE_VERSION
+            or metadata["size"] != stat.st_size
+            or metadata["mtime_ns"] != stat.st_mtime_ns
+        ):
+            return None
+        return _CachedGGUFReader(path, metadata)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _save_reader_cache(path: str, reader: gguf.GGUFReader) -> None:
+    cache_path = _metadata_cache_path(path)
+    temp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp")
+    stat = os.stat(path)
+    metadata = {
+        "version": _GGUF_METADATA_CACHE_VERSION,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "byte_order": reader.byte_order,
+        "alignment": int(reader.alignment),
+        "data_offset": int(reader.data_offset),
+        "fields": {name: field.contents() for name, field in reader.fields.items()},
+        "tensors": [
+            [
+                tensor.name,
+                int(tensor.tensor_type),
+                [int(dim) for dim in tensor.shape],
+                int(tensor.n_elements),
+                int(tensor.n_bytes),
+                int(tensor.data_offset),
+            ]
+            for tensor in reader.tensors
+        ],
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with temp_path.open("w") as cache_file:
+            json.dump(metadata, cache_file, separators=(",", ":"))
+        os.replace(temp_path, cache_path)
+    except (OSError, TypeError, ValueError):
+        temp_path.unlink(missing_ok=True)
 
 
 def _plain_mmap(path, mode="r"):
@@ -38,7 +172,7 @@ def _plain_mmap(path, mode="r"):
 
 
 @cache
-def gguf_reader(path: str | PathLike) -> gguf.GGUFReader:
+def gguf_reader(path: str | PathLike) -> gguf.GGUFReader | _CachedGGUFReader:
     """A `GGUFReader`, parsed the fast way and cached per process.
 
     Booting opens shard 1 dozens of times across the API server, the engine
@@ -46,18 +180,28 @@ def gguf_reader(path: str | PathLike) -> gguf.GGUFReader:
     is safe because readers are opened read-only and never mutated.
     """
     path = str(Path(path).resolve())
+    start = time.perf_counter()
+    if cached_reader := _load_cached_reader(path):
+        bootstamp(
+            f"gguf_reader restored {Path(path).name} metadata "
+            f"in {time.perf_counter() - start:.2f}s"
+        )
+        return cached_reader
+
     real = gguf.gguf_reader.np.memmap
     with _reader_lock:
         gguf.gguf_reader.np.memmap = _plain_mmap
-        start = time.perf_counter()
         try:
-            return gguf.GGUFReader(path)
+            reader = gguf.GGUFReader(path)
         finally:
             gguf.gguf_reader.np.memmap = real
             bootstamp(
                 f"gguf_reader parsed {Path(path).name} "
                 f"in {time.perf_counter() - start:.2f}s"
             )
+    if time.perf_counter() - start >= 0.5:
+        _save_reader_cache(path, reader)
+    return reader
 
 
 @cache
@@ -286,4 +430,3 @@ def maybe_patch_hf_config_from_gguf(
             hf_config = new_hf_config
 
     return hf_config
-
