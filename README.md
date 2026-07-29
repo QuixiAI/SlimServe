@@ -362,6 +362,23 @@ uv pip install -e . --torch-backend=auto     # C++/HIP changes
 VLLM_USE_PRECOMPILED=1 uv pip install -e .   # Python-only changes
 ```
 
+## Acknowledgements
+
+We stood on the shoulders of giants.
+
+- **Eric Hartford**, **QuixiAI** and **LazarusAI** — for creating
+  [QuixiAI/GLM-5.2-Vision-GGUF](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF),
+  the model this server exists to serve.
+- **Antirez** and **Unsloth** — for the GGUF quantization work. The
+  `antirez-routed` layouts and the Unsloth Dynamic (`UD-`) quants are what make
+  a model this size fit on two GPUs at all.
+- **Baseten** — for the multimodal projector.
+- **ibrahima2222** — for the GGUF mmproj.
+- **[vLLM](https://github.com/vllm-project/vllm)** — for the engine this fork
+  is carved out of. Every good idea in the serving path is theirs; the
+  specialization is ours.
+- **[zAI](https://huggingface.co/zai-org)** — for GLM-5.2 itself.
+
 ## License
 
 Apache 2.0, inherited from vLLM. See [LICENSE](LICENSE).
