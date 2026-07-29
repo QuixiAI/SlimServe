@@ -32,6 +32,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
+    TQSlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
@@ -1447,6 +1449,19 @@ def _promote_local_kv_cache_specs(
                     alignment=spec.alignment,
                     compress_ratio=spec.compress_ratio,
                     model_version=spec.model_version,
+                )
+            elif isinstance(spec, TQSlidingWindowSpec):
+                block_size = full_attention_block_size or spec.block_size
+                promoted_specs[layer_name] = TQFullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=spec.num_kv_heads,
+                    head_size=spec.head_size,
+                    head_size_v=spec.head_size_v,
+                    dtype=spec.dtype,
+                    sliding_window=spec.sliding_window,
+                    page_size_padded=promoted_page_size_padded(spec, block_size),
+                    tq_slot_size=spec.tq_slot_size,
+                    tq_cache_dtype=spec.tq_cache_dtype,
                 )
             elif isinstance(spec, SlidingWindowSpec):
                 block_size = full_attention_block_size or spec.block_size

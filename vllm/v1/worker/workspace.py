@@ -270,3 +270,12 @@ def reset_workspace_manager() -> None:
     """
     global _manager
     _manager = None
+
+
+def is_workspace_manager_initialized() -> bool:
+    """Check if workspace manager has been initialized.
+
+    Returns:
+        True if workspace manager is initialized, False otherwise.
+    """
+    return _manager is not None

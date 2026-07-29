@@ -329,6 +329,12 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
+        text_config = getattr(hf_config, "text_config", None)
+        if (
+            hf_config.model_type == "glm5v"
+            and getattr(text_config, "model_type", None) == "glm_moe_dsa"
+        ):
+            hf_config = text_config
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",

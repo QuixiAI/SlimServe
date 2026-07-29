@@ -309,12 +309,19 @@ def _reshape_kv_cache(
                 # Skipped layers (--kv-cache-dtype-skip-layers) keep the
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
-                layer_cache_dtype = (
-                    "auto"
-                    if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
-                    and not isinstance(kv_cache_spec, TQFullAttentionSpec)
-                    else cache_dtype
-                )
+                spec_tq_dtype = getattr(kv_cache_spec, "tq_cache_dtype", "")
+                if spec_tq_dtype:
+                    # TQ spec built from a per-layer cache dtype (e.g. a TQ
+                    # draft against a non-TQ target): the packed layout comes
+                    # from the spec, not the primary cache dtype.
+                    layer_cache_dtype = spec_tq_dtype
+                else:
+                    layer_cache_dtype = (
+                        "auto"
+                        if kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
+                        and not isinstance(kv_cache_spec, TQFullAttentionSpec)
+                        else cache_dtype
+                    )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
@@ -396,7 +403,9 @@ def _align_mixed_attention_kv_cache_views(
             kernel_block_sizes[group.kv_cache_group_id],
             kv_cache_spec.num_kv_heads,
             kv_cache_spec.head_size,
-            cache_dtype_str=cache_dtype,
+            cache_dtype_str=(
+                getattr(kv_cache_spec, "tq_cache_dtype", "") or cache_dtype
+            ),
         )
         for layer_name in group.layer_names:
             if layer_name in kv_caches:

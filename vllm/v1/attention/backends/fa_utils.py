@@ -302,3 +302,31 @@ def flash_attn_supports_kv_cache_dtype(
 
 
 
+def is_flash_attn_varlen_func_available() -> bool:
+    """Check if flash_attn_varlen_func is available.
+
+    This function determines whether the flash_attn_varlen_func imported at module
+    level is a working implementation or a stub.
+
+    Platform-specific sources:
+    - CUDA: vllm.vllm_flash_attn.flash_attn_varlen_func
+    - XPU: xpu_ops.flash_attn_varlen_func
+    - ROCm: upstream flash_attn.flash_attn_varlen_func (if available)
+
+    Note: This is separate from the AITER flash attention backend (rocm_aiter_fa.py)
+    which uses rocm_aiter_ops.flash_attn_varlen_func. The condition to use AITER is
+    handled separately via _aiter_ops.is_aiter_found_and_supported().
+
+    Returns:
+        bool: True if a working flash_attn_varlen_func implementation is available.
+    """
+    if current_platform.is_cuda() or current_platform.is_xpu():
+        # CUDA and XPU always have flash_attn_varlen_func available
+        return True
+
+    if current_platform.is_rocm():
+        # Use the flag set during module import to check if
+        # upstream flash-attn was successfully imported
+        return _ROCM_FLASH_ATTN_AVAILABLE
+
+    return False

@@ -276,17 +276,22 @@ class SpecDecodeBaseProposer:
             from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
                 ROCMAiterMLASparseMetadata,
             )
-            from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadata
-
             rocm_types = [
                 TritonAttentionMetadata,
-                RocmAttentionMetadata,
                 ROCMAiterMLASparseMetadata,
                 DeepseekV4ROCMAiterMLASparseMetadata,
                 DeepseekV4ROCMAiterSparseSWAMetadata,
                 DeepseekV32IndexerMetadata,
                 MiniMaxM3SparseMetadata,
             ]
+            if find_spec(
+                "vllm.v1.attention.ops.chunked_prefill_paged_decode"
+            ) is not None:
+                from vllm.v1.attention.backends.rocm_attn import (
+                    RocmAttentionMetadata,
+                )
+
+                rocm_types.append(RocmAttentionMetadata)
             # ROCM_AITER_FA is an optional backend
             # We check is_enabled() here to avoid importing the backend module during
             # auto-discovery when VLLM_ROCM_USE_AITER=0, which would trigger aiter
@@ -314,6 +319,11 @@ class SpecDecodeBaseProposer:
             from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadata
 
             rocm_types.append(FlexAttentionMetadata)
+
+            # TurboQuant compressed-KV backend (Triton, ROCm-portable)
+            from vllm.v1.attention.backends.turboquant_attn import TurboQuantMetadata
+
+            rocm_types.append(TurboQuantMetadata)
 
             self.allowed_attn_types = tuple(rocm_types)
 
@@ -1386,7 +1396,10 @@ class SpecDecodeBaseProposer:
                 self.model.config.image_token_index = (
                     target_model.config.vision_config.image_token_id
                 )
-            elif self.get_model_name(target_model) == "KimiK25ForConditionalGeneration":
+            elif self.get_model_name(target_model) in (
+                "Glm5vForConditionalGeneration",
+                "KimiK25ForConditionalGeneration",
+            ):
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id
                 )

@@ -655,6 +655,25 @@ class Attention(nn.Module, AttentionLayerBase):
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend, sw_per_token, shared_page, block_size
             )
+            if self.kv_cache_dtype.startswith("turboquant_"):
+                from vllm.model_executor.layers.quantization.turboquant.config import (
+                    TurboQuantConfig,
+                )
+                from vllm.v1.kv_cache_interface import TQSlidingWindowSpec
+
+                tq_config = TurboQuantConfig.from_cache_dtype(
+                    self.kv_cache_dtype, self.head_size
+                )
+                return TQSlidingWindowSpec(
+                    block_size=sw_block_size,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    head_size_v=self.head_size_v,
+                    dtype=self.kv_cache_torch_dtype,
+                    sliding_window=self.sliding_window,
+                    tq_slot_size=tq_config.slot_size_aligned,
+                    tq_cache_dtype=self.kv_cache_dtype,
+                )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
                 num_kv_heads=self.num_kv_heads,
