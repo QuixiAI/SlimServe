@@ -378,6 +378,11 @@ We stood on the shoulders of giants.
   is carved out of. Every good idea in the serving path is theirs; the
   specialization is ours.
 - **[zAI](https://huggingface.co/zai-org)** — for GLM-5.2 itself.
+- **[Hot Aisle](https://hotaisle.xyz)** — for outstanding MI300X servers. Every
+  number in this README was measured on their hardware. Bare-metal MI300X that
+  actually behaves like the spec sheet, with the ROCm stack in good shape and
+  none of the noisy-neighbour surprises that make performance work miserable
+  elsewhere — this project would have been far harder anywhere else.
 
 ## License
 
