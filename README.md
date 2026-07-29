@@ -69,12 +69,15 @@ id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
 into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
 speculation off with `--no-spec`.
 
-**You also need `config.json` and the tokenizer.** GGUF does not carry the
-multimodal config this model needs, so the server is additionally given
-`--hf-config-path` (see `HF_CONFIG` in the script) pointing at a directory with
-the GLM-5.2-Vision `config.json`, `configuration_glm5v.py`, `tokenizer.json`,
-`tokenizer_config.json`, `preprocessor_config.json` and `generation_config.json`.
-Only those small files are used — never the weights in that repo.
+> **Known issue — `--hf-config-path` should not be necessary.** Everything the
+> server needs is already in the two GGUFs: the target carries the full
+> tokenizer, chat template and text architecture (`glm-dsa.*`), and the mmproj
+> carries the complete vision config (`clip.vision.*`). Today the loader
+> *patches* an HF config from GGUF rather than *constructing* one, so it still
+> wants a base `config.json` to patch, and `run-glm-optimized.sh` points
+> `--hf-config-path` at a local directory for it. This is a bug in this repo,
+> not a limitation of the format; it is being fixed so the GGUF pair is
+> self-sufficient.
 
 ## Quick start
 
