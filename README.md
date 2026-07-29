@@ -19,6 +19,46 @@ What the specialization buys:
 
 ---
 
+## Getting the weights
+
+**Nothing is downloaded automatically for the target model** — the server is
+given a path to a specific `.gguf` shard. The GGUF repo is 845 GB in total, so
+fetch only the quant you intend to serve plus the shared vision projector.
+
+```bash
+export MODELS=~/models   # where run-glm-optimized.sh looks
+
+# 1. One quant — pick ONE of these --include patterns
+hf download QuixiAI/GLM-5.2-Vision-GGUF \
+  --include "antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-*" \
+  --local-dir $MODELS/GLM-5.2-Vision-GGUF          # 244 GiB, default
+
+#   IQ2_XXS: --include "antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-*"   # 196 GiB
+#   Q4_K:    --include "antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-*"                  # 404 GiB
+#   Q6_K:    --include "UD-Q6_K_XL/*"                                                # 638 GiB
+
+# 2. Vision projector + chat template (shared by every quant, ~950 MB)
+hf download QuixiAI/GLM-5.2-Vision-GGUF \
+  --include "mmproj-GLM-5.2-Vision-f16.gguf" "chat_template.jinja" \
+  --local-dir $MODELS/GLM-5.2-Vision-GGUF
+```
+
+The `--include` patterns end in `-*` so every shard of the chosen quant is
+fetched (a quant is split across 5–16 files and all are required).
+
+**The speculator downloads itself.** `run-glm-optimized.sh` passes the HF repo
+id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
+`$MODELS/GLM-5.2-speculator.dspark` already exists, so the first run pulls it
+into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
+speculation off with `--no-spec`.
+
+**You also need `config.json` and the tokenizer.** GGUF does not carry the
+multimodal config this model needs, so the server is additionally given
+`--hf-config-path` (see `HF_CONFIG` in the script) pointing at a directory with
+the GLM-5.2-Vision `config.json`, `configuration_glm5v.py`, `tokenizer.json`,
+`tokenizer_config.json`, `preprocessor_config.json` and `generation_config.json`.
+Only those small files are used — never the weights in that repo.
+
 ## Quick start
 
 ```bash
@@ -129,7 +169,10 @@ Rules of thumb:
 | `--ctx N` | 524288 (TP2) / 1048576 (TP≥4) | Max context ceiling; model max is 1048576. |
 | `--max-seqs N` | 32 | Concurrent requests. |
 | `--port N` | 8000 | |
+| `--draft P` | `RedHatAI/GLM-5.2-speculator.dspark` | Speculator path or HF repo id. |
 | `--no-spec` | off | Disable DSpark speculative decoding. |
+| `--dp N` | 1 | Data-parallel replicas. |
+| `--ep` | off | Shard the 256 routed experts across ranks. |
 
 ### Context and GPU count
 
