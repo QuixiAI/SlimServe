@@ -1756,6 +1756,9 @@ class rocm_aiter_ops:
         from vllm.distributed.parallel_state import get_tp_group
 
         device_comm = get_tp_group().device_communicator
+        wait_for_comm_init = getattr(device_comm, "wait_for_comm_init", None)
+        if wait_for_comm_init is not None:
+            wait_for_comm_init()
         aiter_ar_comm = getattr(device_comm, "aiter_ar_comm", None)
         return (
             aiter_ar_comm if isinstance(aiter_ar_comm, AiterCustomAllreduce) else None

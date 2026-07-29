@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -100,7 +101,14 @@ class BaseRenderer(ABC, Generic[_T]):
         self._async_tokenizer_decode = make_async(self._decode, executor=self._executor)
 
         self.mm_processor: BaseMultiModalProcessor | None = None
+        self._mm_processor_cache: BaseMultiModalProcessorCache | None = None
+        self._mm_processor_lock = threading.Lock()
+        self._supports_mm_inputs = mm_registry.supports_multimodal_inputs(
+            config.model_config
+        )
         self._readonly_mm_processor: BaseMultiModalProcessor | None = None
+        self._readonly_mm_processor_cache: BaseMultiModalProcessorCache | None = None
+        self._readonly_mm_processor_lock = threading.Lock()
         self._mm_cache_stats: MultiModalCacheStats | None = None
         self._clear_mm_cache_async = make_async(
             self.clear_mm_cache, executor=self._executor
@@ -111,7 +119,7 @@ class BaseRenderer(ABC, Generic[_T]):
         self._safe_load_prompt_embeds_async = make_async(
             safe_load_prompt_embeds, executor=self._executor
         )
-        if mm_registry.supports_multimodal_inputs(config.model_config):
+        if self._supports_mm_inputs:
             # Install the process-global GPU memory pool used to gate
             # frontend GPU-side multimodal decoding (no-op when the budget
             # is 0). Lives in the API-server process only.
@@ -123,13 +131,23 @@ class BaseRenderer(ABC, Generic[_T]):
                 )
 
             mm_processor_cache = mm_registry.processor_cache_from_config(config)
+            self._mm_processor_cache = mm_processor_cache
 
-            with set_default_torch_num_threads():
-                self.mm_processor = mm_registry.create_processor(
-                    config.model_config,
-                    tokenizer=self.tokenizer,
-                    cache=mm_processor_cache,
-                )
+            from vllm.multimodal.encoder_budget import (
+                maybe_restore_multimodal_budget_snapshot,
+            )
+
+            defer_processor = (
+                config.cache_config.kv_cache_memory_bytes is not None
+                and maybe_restore_multimodal_budget_snapshot(config)
+            )
+            if not defer_processor:
+                with set_default_torch_num_threads():
+                    self.mm_processor = mm_registry.create_processor(
+                        config.model_config,
+                        tokenizer=self.tokenizer,
+                        cache=mm_processor_cache,
+                    )
 
             if mm_processor_cache:
                 self._mm_cache_stats = MultiModalCacheStats()
@@ -139,12 +157,15 @@ class BaseRenderer(ABC, Generic[_T]):
             # requests don't pollute the sender cache.
             ro_cache = mm_registry.processor_only_cache_from_config(config)
             if ro_cache is not None:
-                with set_default_torch_num_threads():
-                    self._readonly_mm_processor = mm_registry.create_processor(
-                        config.model_config,
-                        tokenizer=self.tokenizer,
-                        cache=ro_cache,
-                    )
+                if config.cache_config.kv_cache_memory_bytes is not None:
+                    self._readonly_mm_processor_cache = ro_cache
+                else:
+                    with set_default_torch_num_threads():
+                        self._readonly_mm_processor = mm_registry.create_processor(
+                            config.model_config,
+                            tokenizer=self.tokenizer,
+                            cache=ro_cache,
+                        )
 
             # This is used to generate internal request ID for MM processing
             # It has no relation to the request ID for engine core
@@ -164,17 +185,42 @@ class BaseRenderer(ABC, Generic[_T]):
         return self.get_tokenizer().decode(*args, **kwargs)
 
     def get_mm_processor(self) -> "BaseMultiModalProcessor":
-        if self.mm_processor is None:
+        if self.mm_processor is not None:
+            return self.mm_processor
+        if not self._supports_mm_inputs:
             raise ValueError("Multi-modal processor not available for text-only models")
 
-        return self.mm_processor
+        with self._mm_processor_lock:
+            if self.mm_processor is None:
+                with set_default_torch_num_threads():
+                    self.mm_processor = mm_registry.create_processor(
+                        self.model_config,
+                        tokenizer=self.tokenizer,
+                        cache=self._mm_processor_cache,
+                    )
+            return self.mm_processor
+
+    def _get_readonly_mm_processor(self) -> BaseMultiModalProcessor | None:
+        processor = self._readonly_mm_processor
+        cache = self._readonly_mm_processor_cache
+        if processor is not None or cache is None:
+            return processor
+
+        with self._readonly_mm_processor_lock:
+            if self._readonly_mm_processor is None:
+                with set_default_torch_num_threads():
+                    self._readonly_mm_processor = mm_registry.create_processor(
+                        self.model_config,
+                        tokenizer=self.tokenizer,
+                        cache=cache,
+                    )
+            return self._readonly_mm_processor
 
     @property
     def mm_processor_cache(self) -> "BaseMultiModalProcessorCache | None":
-        if self.mm_processor is None:
-            return None
-
-        return self.mm_processor.cache
+        if self.mm_processor is not None:
+            return self.mm_processor.cache
+        return self._mm_processor_cache
 
     def stat_mm_cache(self) -> MultiModalCacheStats | None:
         mm_cache_stats = self._mm_cache_stats
@@ -235,7 +281,12 @@ class BaseRenderer(ABC, Generic[_T]):
         elapsed = time.perf_counter() - start_time
         logger.info("%s warmup completed in %.3fs", log_prefix, elapsed)
 
-    def warmup(self, chat_params: ChatParams) -> None:
+    def warmup(
+        self,
+        chat_params: ChatParams,
+        *,
+        include_multimodal: bool = True,
+    ) -> None:
         """
         Warm up this renderer to avoid first-request latency.
 
@@ -257,7 +308,7 @@ class BaseRenderer(ABC, Generic[_T]):
         except Exception:
             logger.warning("Chat template warmup failed", exc_info=True)
 
-        if self.mm_processor:
+        if include_multimodal and self.mm_processor:
             try:
                 logger.debug("Warming up multi-modal processing...")
                 self._warmup_mm_processor(
@@ -269,7 +320,7 @@ class BaseRenderer(ABC, Generic[_T]):
             finally:
                 self.clear_mm_cache()
 
-        if self._readonly_mm_processor is not None:
+        if include_multimodal and self._readonly_mm_processor is not None:
             try:
                 logger.debug("Warming up readonly multi-modal processing...")
                 self._warmup_mm_processor(
@@ -735,8 +786,11 @@ class BaseRenderer(ABC, Generic[_T]):
         *,
         skip_mm_cache: bool = False,
     ) -> "MultiModalInput":
-        if skip_mm_cache and self._readonly_mm_processor is not None:
-            mm_processor = self._readonly_mm_processor
+        if (
+            skip_mm_cache
+            and (readonly := self._get_readonly_mm_processor()) is not None
+        ):
+            mm_processor = readonly
         else:
             mm_processor = self.get_mm_processor()
 

@@ -863,7 +863,13 @@ class GPUModelRunner(
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
         self.mm_budget = (
-            MultiModalBudget(self.vllm_config, self.mm_registry)
+            MultiModalBudget(
+                self.vllm_config,
+                self.mm_registry,
+                use_cached_snapshot=(
+                    self.cache_config.kv_cache_memory_bytes is not None
+                ),
+            )
             if self.supports_mm_inputs
             else None
         )
@@ -5307,8 +5313,17 @@ class GPUModelRunner(
             self.eplb_state = EplbState(self.parallel_config, self.device)
             eplb_models = 0
 
+        fixed_kv_budget = self.cache_config.kv_cache_memory_bytes is not None
+        initial_model_memory = 0
+        memory_profiler: AbstractContextManager[DeviceMemoryProfiler | None]
+        if fixed_kv_budget:
+            initial_model_memory = torch.cuda.memory_allocated(self.device)
+            memory_profiler = nullcontext()
+        else:
+            memory_profiler = DeviceMemoryProfiler()
+
         try:
-            with DeviceMemoryProfiler() as m:
+            with memory_profiler as profiler:
                 time_before_load = time.perf_counter()
                 if load_dummy_weights:
                     self.load_config.load_format = "dummy"
@@ -5382,7 +5397,13 @@ class GPUModelRunner(
                     eplb_models += 1
 
                 time_after_load = time.perf_counter()
-            self.model_memory_usage = m.consumed_memory
+            if fixed_kv_budget:
+                self.model_memory_usage = (
+                    torch.cuda.memory_allocated(self.device) - initial_model_memory
+                )
+            else:
+                assert profiler is not None
+                self.model_memory_usage = profiler.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
             msg = (
                 "Failed to load model - not enough GPU memory. "
@@ -6809,6 +6830,15 @@ class GPUModelRunner(
 
         # Initialize encoder CUDA graph manager if enabled.
         self._maybe_init_encoder_cudagraph_manager()
+
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                SparseAttnIndexer,
+            )
+
+            for module in self.get_model().modules():
+                if isinstance(module, SparseAttnIndexer):
+                    module.reserve_prefill_workspace()
 
         compilation_counter.num_gpu_runner_capture_triggers += 1
 

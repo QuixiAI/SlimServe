@@ -314,6 +314,10 @@ class VllmConfig:
     # try to download a model
     model_config: ModelConfig = None  # type: ignore[assignment]
     """Model configuration."""
+    multimodal_budget_snapshot: dict[str, Any] | None = Field(
+        default=None, exclude=True, repr=False
+    )
+    """Derived multi-modal budget shared with forked startup processes."""
     cache_config: CacheConfig = Field(default_factory=CacheConfig)
     """Cache configuration."""
     parallel_config: ParallelConfig = Field(default_factory=ParallelConfig)

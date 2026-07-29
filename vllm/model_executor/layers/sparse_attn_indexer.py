@@ -753,6 +753,19 @@ class SparseAttnIndexer(CustomOp):
                 "the current vLLM environment."
             )
 
+    def reserve_prefill_workspace(self) -> None:
+        values_spec, scales_spec = _gather_workspace_shapes(
+            self.max_total_seq_len,
+            self.head_dim,
+            current_platform.fp8_dtype(),
+            self.use_fp4_cache,
+        )
+        current_workspace_manager().get_simultaneous(
+            values_spec,
+            scales_spec,
+            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        )
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,

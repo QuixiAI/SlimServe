@@ -59,11 +59,20 @@ class InputProcessor:
         self.mm_encoder_cache_size = 0
         self.skip_prompt_length_check = False
         if self.supports_mm_inputs:
-            mm_budget = MultiModalBudget(vllm_config, mm_registry)
-            self.mm_encoder_cache_size = mm_budget.encoder_cache_size
-            self.skip_prompt_length_check = (
-                mm_budget.processor.info.skip_prompt_length_check
+            use_cached_snapshot = (
+                self.cache_config.kv_cache_memory_bytes is not None
+                and vllm_config.multimodal_budget_snapshot is not None
             )
+            mm_budget = MultiModalBudget(
+                vllm_config,
+                mm_registry,
+                use_cached_snapshot=use_cached_snapshot,
+                processor=(
+                    None if use_cached_snapshot else self.renderer.get_mm_processor()
+                ),
+            )
+            self.mm_encoder_cache_size = mm_budget.encoder_cache_size
+            self.skip_prompt_length_check = mm_budget.skip_prompt_length_check
             mm_budget.reset_cache()  # Not used anymore
 
         self.input_preprocessor = InputPreprocessor(

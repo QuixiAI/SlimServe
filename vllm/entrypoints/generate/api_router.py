@@ -141,7 +141,11 @@ async def init_generate_state(
         else None
     )
     if state.openai_serving_chat is not None:
-        state.openai_serving_chat.warmup()
+        state.openai_serving_chat.warmup(
+            include_multimodal=(
+                engine_client.vllm_config.cache_config.kv_cache_memory_bytes is None
+            )
+        )
     state.openai_serving_completion = (
         OpenAIServingCompletion(
             engine_client,

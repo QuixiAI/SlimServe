@@ -373,6 +373,7 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+            bootstamp(f"worker[{self.rank}]: distributed environment ready")
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
@@ -381,12 +382,14 @@ class Worker(WorkerBase):
             set_random_seed(self.model_config.seed)
 
             # Now take memory snapshot after NCCL is initialized
-            gc.collect()
+            if self.cache_config.kv_cache_memory_bytes is None:
+                gc.collect()
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
+            bootstamp(f"worker[{self.rank}]: initial memory snapshot ready")
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
             logger.debug(
                 "worker requested memory: %sGiB", format_gib(self.requested_memory)
@@ -397,6 +400,7 @@ class Worker(WorkerBase):
         # Initialize workspace manager
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
+        bootstamp(f"worker[{self.rank}]: workspace manager ready")
 
         # Construct the model runner
         if self.use_v2_model_runner:
@@ -414,6 +418,7 @@ class Worker(WorkerBase):
             )
 
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+        bootstamp(f"worker[{self.rank}]: model runner ready")
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.
@@ -456,11 +461,18 @@ class Worker(WorkerBase):
                 # 20 MiB is the minimum PyTorch allows for max_split_size_mb.
                 self._scoped_allocator_max_split(max_split_size_mb=20),
             ):
+                tp_device_comm = get_tp_group().device_communicator
                 self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+                if tp_device_comm is not None:
+                    wait_for_comm_init = getattr(
+                        tp_device_comm, "wait_for_comm_init", None
+                    )
+                    if wait_for_comm_init is not None:
+                        wait_for_comm_init()
         finally:
             if gc_was_enabled:
                 gc.enable()
-        freeze_gc_heap()
+        gc.freeze()
         bootstamp(f"worker[{self.rank}]: load_model done, gc heap frozen")
 
         if self.vllm_config.weight_transfer_config is not None:
@@ -494,15 +506,13 @@ class Worker(WorkerBase):
         maybe_apply_startup_plan(self)
 
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
-            # still need a profile run which compiles the model for
-            # max_num_batched_tokens
-            self.model_runner.profile_run()
-
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
                 f"GiB, reserved {format_gib(kv_cache_memory_bytes)} GiB memory for "
                 "KV Cache as specified by kv_cache_memory_bytes config and "
-                "skipped memory profiling. This does not respect the "
+                "skipped memory profiling and its dummy forward. "
+                "CUDA graph capture warms the serving shapes separately. "
+                "This does not respect the "
                 "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
                 "config when you want manual control of KV cache memory "
                 "size. If OOM'ed, check the difference of initial free "
@@ -729,15 +739,18 @@ class Worker(WorkerBase):
                 cg_capture_sizes = [] if cg_sizes is None else cg_sizes
                 warmup_sizes = [x for x in warmup_sizes if x not in cg_capture_sizes]
 
-            compile_ranges = self.vllm_config.compilation_config.get_compile_ranges()
-            # For each compile_range, if none of the batch sizes
-            # in warmup_sizes or cudagraph_capture_sizes are in the range,
-            # add the end of the range to ensure compilation/warmup.
-            all_sizes = set(cg_capture_sizes)
-            all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
-            for compile_range in compile_ranges:
-                if not any(x in compile_range for x in all_sizes):
-                    warmup_sizes.append(compile_range.end)
+            if self.cache_config.kv_cache_memory_bytes is None:
+                compile_ranges = (
+                    self.vllm_config.compilation_config.get_compile_ranges()
+                )
+                # Ensure every dynamic range is compiled while profiling the
+                # cache size. Manual cache sizing deliberately opts out so
+                # unused large-prefill ranges compile on their first request.
+                all_sizes = set(cg_capture_sizes)
+                all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
+                for compile_range in compile_ranges:
+                    if not any(x in compile_range for x in all_sizes):
+                        warmup_sizes.append(compile_range.end)
 
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
@@ -843,17 +856,41 @@ class Worker(WorkerBase):
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens,
             )
+            if self.cache_config.kv_cache_memory_bytes is not None:
+                max_capture_size = (
+                    self.compilation_config.max_cudagraph_capture_size
+                )
+                if max_capture_size is not None:
+                    max_num_reqs = min(max_num_reqs, max_capture_size)
 
-            # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            bootstamp(
+                f"worker[{self.rank}]: sampler warmup start n={max_num_reqs}"
             )
+            fixed_kv_budget = self.cache_config.kv_cache_memory_bytes is not None
+            if fixed_kv_budget and not self.model_runner.is_pooling_model:
+                last_hidden_states = torch.empty(
+                    (
+                        max_num_reqs,
+                        self.model_config.get_hidden_size(),
+                    ),
+                    dtype=self.model_runner.dtype,
+                    device=self.device,
+                )
+                self.model_runner._dummy_sampler_run(
+                    hidden_states=last_hidden_states
+                )
+            else:
+                # We skip EPLB here since we don't want to record dummy metrics.
+                hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs,
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
-            else:
+            elif not fixed_kv_budget:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+            bootstamp(f"worker[{self.rank}]: sampler warmup done")
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
@@ -880,7 +917,10 @@ class Worker(WorkerBase):
 
         # Freeze the worker heap so the GC won't scan static objects
         # (model weights, KV caches, CUDA graphs) during inference.
-        freeze_gc_heap()
+        if self.cache_config.kv_cache_memory_bytes is not None:
+            gc.freeze()
+        else:
+            freeze_gc_heap()
         maybe_attach_gc_debug_callback()
 
         # Warmup / first-compile is done — activate the `VLLM_GPU_SYNC_CHECK`

@@ -184,9 +184,12 @@ async def build_async_engine_client_from_engine_args(
             client_index=client_index,
         )
 
-        # Don't keep the dummy data in memory
+        # Profiling may populate multi-modal caches with dummy data. The
+        # fixed-memory startup path skips profiling, so its caches are already
+        # empty and the asynchronous reset round trip is unnecessary.
         assert async_llm is not None
-        await async_llm.reset_mm_cache()
+        if vllm_config.cache_config.kv_cache_memory_bytes is None:
+            await async_llm.reset_mm_cache()
 
         yield async_llm
     finally:

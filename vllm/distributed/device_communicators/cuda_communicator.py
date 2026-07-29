@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+import contextvars
+import threading
+from typing import TYPE_CHECKING
 
 import torch
 from torch.distributed import ProcessGroup
@@ -22,6 +27,19 @@ from vllm.platforms import current_platform
 from ..utils import StatelessProcessGroup
 from .aiter_custom_all_reduce import AiterCustomAllreduce
 from .base_device_communicator import DeviceCommunicatorBase
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+    from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+        FlashInferAllReduce,
+    )
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.device_communicators.quick_all_reduce import (
+        QuickAllReduce,
+    )
+    from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
 logger = init_logger(__name__)
 
@@ -66,81 +84,45 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
 
-        # lazy import to avoid documentation build error
-        from vllm.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
-        )
-        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
-            FlashInferAllReduce,
-        )
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.device_communicators.quick_all_reduce import (
-            QuickAllReduce,
-        )
-        from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
-
-        from vllm.utils.bootstamp import bootstamp
-
         self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
-            bootstamp("comm: pynccl init start")
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                device=self.device,
-            )
-            if is_symmetric_memory_enabled():
-                register_nccl_symmetric_ops(self.pynccl_comm)
-            bootstamp("comm: pynccl init done")
-
         self.ca_comm: CustomAllreduce | None = None
         self.qr_comm: QuickAllReduce | None = None
         self.symm_mem_comm: SymmMemCommunicator | None = None
         self.fi_ar_comm: FlashInferAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+        self._comm_init_error: BaseException | None = None
+        self._comm_init_thread: threading.Thread | None = None
+        self._comm_init_started = False
+        self._tcp_store_group = tcp_store_group
 
-        if use_torch_symm_mem and current_platform.is_cuda():
-            self.symm_mem_comm = SymmMemCommunicator(
-                group=self.cpu_group,
-                device=self.device,
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        has_fixed_kv_budget = bool(
+            config is not None
+            and config.cache_config.kv_cache_memory_bytes is not None
+        )
+        self._skip_comm_init = bool(
+            current_platform.is_rocm()
+            and self.is_ep_communicator
+            and not self.use_all2all
+            and has_fixed_kv_budget
+        )
+        self._defer_comm_init = bool(
+            current_platform.is_rocm()
+            and "tp" in unique_name
+            and self.world_size > 1
+            and not self.use_all2all
+            and has_fixed_kv_budget
+        )
+        if self._skip_comm_init:
+            logger.info_once(
+                "Skipping the inactive EP device communicator for fixed-memory "
+                "startup.",
+                scope="global",
             )
-
-        if self.use_flashinfer_allreduce and self.world_size > 1:
-            self.fi_ar_comm = FlashInferAllReduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
-
-        if self.use_aiter_allreduce and self.world_size > 1:
-            bootstamp("comm: AiterCustomAllreduce init start")
-            self.aiter_ar_comm = AiterCustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
-            bootstamp("comm: AiterCustomAllreduce init done")
-
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
-            # Initialize a custom fast all-reduce implementation.
-            self.ca_comm = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-                symm_mem_enabled=(
-                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
-                ),
-            )
-
-        if use_custom_allreduce and self.world_size > 1 and current_platform.is_rocm():
-            # Initialize a custom quick all-reduce implementation for AMD.
-            # Quick reduce is designed as a complement to custom allreduce
-            # (vLLM's or AITER's), so it is initialized for either backend.
-            # Based on quickreduce (https://github.com/mk1-project/quickreduce).
-            # On ROCm, 'use_custom_allreduce==True' means it must currently be
-            # an MI300 series.
-            bootstamp("comm: QuickAllReduce init start")
-            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
-            bootstamp("comm: QuickAllReduce init done")
-
-        if self.world_size > 1:
-            self._log_all_reduce_backend_selection()
+        elif not self._defer_comm_init:
+            self._initialize_communicators(tcp_store_group)
 
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
@@ -212,6 +194,124 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+    def _initialize_communicators(
+        self, tcp_store_group: StatelessProcessGroup | None
+    ) -> None:
+        # lazy import to avoid documentation build error
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+            FlashInferAllReduce,
+        )
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.device_communicators.quick_all_reduce import (
+            QuickAllReduce,
+        )
+        from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
+
+        from vllm.utils.bootstamp import bootstamp
+
+        if self.world_size > 1:
+            bootstamp("comm: pynccl init start")
+            self.pynccl_comm = PyNcclCommunicator(
+                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
+                device=self.device,
+            )
+            if is_symmetric_memory_enabled():
+                register_nccl_symmetric_ops(self.pynccl_comm)
+            bootstamp("comm: pynccl init done")
+
+        if self.use_torch_symm_mem and current_platform.is_cuda():
+            self.symm_mem_comm = SymmMemCommunicator(
+                group=self.cpu_group,
+                device=self.device,
+            )
+
+        if self.use_flashinfer_allreduce and self.world_size > 1:
+            self.fi_ar_comm = FlashInferAllReduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+
+        if self.use_aiter_allreduce and self.world_size > 1:
+            bootstamp("comm: AiterCustomAllreduce init start")
+            self.aiter_ar_comm = AiterCustomAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+            bootstamp("comm: AiterCustomAllreduce init done")
+
+        if (
+            self.use_custom_allreduce
+            and self.aiter_ar_comm is None
+            and self.world_size > 1
+        ):
+            # Initialize a custom fast all-reduce implementation.
+            self.ca_comm = CustomAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+                symm_mem_enabled=(
+                    self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
+                ),
+            )
+
+        if (
+            self.use_custom_allreduce
+            and self.world_size > 1
+            and current_platform.is_rocm()
+        ):
+            # Initialize a custom quick all-reduce implementation for AMD.
+            # Quick reduce is designed as a complement to custom allreduce
+            # (vLLM's or AITER's), so it is initialized for either backend.
+            # Based on quickreduce (https://github.com/mk1-project/quickreduce).
+            # On ROCm, 'use_custom_allreduce==True' means it must currently be
+            # an MI300 series.
+            bootstamp("comm: QuickAllReduce init start")
+            self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+            bootstamp("comm: QuickAllReduce init done")
+
+        if self.world_size > 1:
+            self._log_all_reduce_backend_selection()
+
+    def start_async_init(self) -> None:
+        if not self._defer_comm_init or self._comm_init_started:
+            return
+
+        from vllm.utils.bootstamp import bootstamp
+
+        self._comm_init_started = True
+        context = contextvars.copy_context()
+        bootstamp(f"comm: deferred init start for {self.unique_name}")
+        self._comm_init_thread = threading.Thread(
+            target=context.run,
+            args=(self._run_deferred_init,),
+            name=f"vllm-comm-init-{self.unique_name}",
+        )
+        self._comm_init_thread.start()
+
+    def _run_deferred_init(self) -> None:
+        from vllm.utils.bootstamp import bootstamp
+
+        try:
+            with torch.cuda.device(self.device):
+                self._initialize_communicators(self._tcp_store_group)
+        except BaseException as error:
+            self._comm_init_error = error
+        finally:
+            bootstamp(f"comm: deferred init done for {self.unique_name}")
+
+    def wait_for_comm_init(self) -> None:
+        if not self._defer_comm_init:
+            return
+        self.start_async_init()
+        assert self._comm_init_thread is not None
+        self._comm_init_thread.join()
+        if self._comm_init_error is not None:
+            raise RuntimeError("Deferred communicator initialization failed") from (
+                self._comm_init_error
+            )
+
     def _log_all_reduce_backend_selection(self) -> None:
         """Log the all-reduce backends that are active for this group.
 
@@ -279,6 +379,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        self.wait_for_comm_init()
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
         if self.pynccl_comm is not None and should_nccl_symm_mem_allreduce(
@@ -347,6 +448,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        self.wait_for_comm_init()
         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
         # enabled (mirrors reduce_scatter); otherwise fall back to the
         # PyNccl/base-class all-gather. Sequence parallelism's
@@ -383,6 +485,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+        self.wait_for_comm_init()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -412,6 +515,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ):
+        self.wait_for_comm_init()
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
@@ -526,6 +630,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
+        self.wait_for_comm_init()
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
@@ -540,6 +645,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        self.wait_for_comm_init()
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
@@ -553,6 +659,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
+        self.wait_for_comm_init()
         if self.world_size == 1:
             return tensor
 
@@ -564,6 +671,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        if self._comm_init_thread is not None:
+            self._comm_init_thread.join()
         if self.pynccl_comm is not None:
             self.pynccl_comm.destroy()
             self.pynccl_comm = None
@@ -585,6 +694,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        self.wait_for_comm_init()
         if dim != 0:
             raise NotImplementedError("only dim 0 all-gatherv is supported")
         world_size = self.world_size
@@ -746,6 +856,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def batch_isend_irecv(self, p2p_ops: list):
+        self.wait_for_comm_init()
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.batch_isend_irecv(p2p_ops)

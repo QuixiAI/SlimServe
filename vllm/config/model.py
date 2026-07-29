@@ -1128,6 +1128,7 @@ class ModelConfig:
             # if the user specifies humming, we should always use humming
             if self.quantization == "humming":
                 overrides = ["humming"] + overrides
+            overrides = [name for name in overrides if name in supported_quantization]
             quantization_methods = [
                 q for q in supported_quantization if q not in overrides
             ]

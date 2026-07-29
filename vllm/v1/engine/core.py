@@ -238,7 +238,10 @@ class EngineCore:
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
-        freeze_gc_heap()
+        if vllm_config.cache_config.kv_cache_memory_bytes is not None:
+            gc.freeze()
+        else:
+            freeze_gc_heap()
         # If enable, attach GC debugger after static variable freeze.
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
