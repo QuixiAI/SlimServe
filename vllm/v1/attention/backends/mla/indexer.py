@@ -560,6 +560,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.model_config.max_model_len,
             self.kv_cache_spec.block_size * get_kv_cache_shard_count(),
         )
+        if self.kv_cache_spec.block_size <= 128:
+            block_alignment = 128 // self.kv_cache_spec.block_size
+            max_num_blocks_per_req = (
+                cdiv(max_num_blocks_per_req, block_alignment) * block_alignment
+            )
         self.expanded_block_table_buffer = torch.zeros(
             (
                 scheduler_config.max_num_batched_tokens,

@@ -211,7 +211,15 @@ class Scheduler(SchedulerInterface):
             vllm_config.model_config
         )
         mm_budget = (
-            MultiModalBudget(vllm_config, mm_registry) if supports_mm_inputs else None
+            MultiModalBudget(
+                vllm_config,
+                mm_registry,
+                use_cached_snapshot=(
+                    self.cache_config.kv_cache_memory_bytes is not None
+                ),
+            )
+            if supports_mm_inputs
+            else None
         )
 
         # NOTE: Text-only encoder-decoder models are implemented as

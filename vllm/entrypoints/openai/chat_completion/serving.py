@@ -188,13 +188,14 @@ class OpenAIServingChat(GenerateBaseServing):
         self.supports_code_interpreter = False
         self.python_tool = None
 
-    def warmup(self) -> None:
+    def warmup(self, *, include_multimodal: bool = True) -> None:
         self.renderer.warmup(
             ChatParams(
                 chat_template=self.chat_template,
                 chat_template_content_format=self.chat_template_content_format,
                 chat_template_kwargs=self.default_chat_template_kwargs,
-            )
+            ),
+            include_multimodal=include_multimodal,
         )
 
     def _effective_chat_template_kwargs(

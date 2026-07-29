@@ -23,10 +23,12 @@ def warm_v1_block_table_kernels(
         return
 
     bootstamp(f"block_table warmup: device={device!r}")
-    query_start_loc = torch.tensor([0, num_tokens], dtype=torch.int32).to(device)
-    bootstamp("block_table warmup: query_start_loc via .to(device)")
-    positions = torch.arange(num_tokens, dtype=torch.int64).to(device)
-    bootstamp("block_table warmup: positions via .to(device)")
+    query_start_loc = torch.arange(
+        0, num_tokens + 1, num_tokens, dtype=torch.int32, device=device
+    )
+    bootstamp("block_table warmup: query_start_loc ready")
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    bootstamp("block_table warmup: positions ready")
     for block_size in _SLOT_MAPPING_WARMUP_BLOCK_SIZES:
         max_num_blocks_per_req = max(
             1, (max(num_tokens, max_tokens) + block_size - 1) // block_size
