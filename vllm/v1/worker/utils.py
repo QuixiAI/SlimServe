@@ -139,7 +139,9 @@ class KVBlockZeroer:
                 kernel_bs,
                 spec.num_kv_heads,
                 spec.head_size,
-                cache_dtype_str=cache_dtype,
+                cache_dtype_str=(
+                    getattr(spec, "tq_cache_dtype", "") or cache_dtype
+                ),
             )
 
             for layer_name in group.layer_names:

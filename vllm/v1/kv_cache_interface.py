@@ -361,6 +361,10 @@ class TQFullAttentionSpec(FullAttentionSpec):
     """
 
     tq_slot_size: int = 0
+    # Per-layer TQ cache dtype, for layers whose dtype differs from the
+    # primary cache dtype (e.g. a TQ draft against an fp8/MLA target).
+    # Empty means "use the primary cache dtype".
+    tq_cache_dtype: str = ""
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -371,10 +375,16 @@ class TQFullAttentionSpec(FullAttentionSpec):
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
         merged = super().merge(specs)
-        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
-            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        assert all(
+            s.tq_slot_size == specs[0].tq_slot_size
+            and s.tq_cache_dtype == specs[0].tq_cache_dtype
+            for s in specs
+        ), "All TQ layers in the same KV cache group must use the same TQ layout."
+        return replace(
+            merged,
+            tq_slot_size=specs[0].tq_slot_size,
+            tq_cache_dtype=specs[0].tq_cache_dtype,
         )
-        return replace(merged, tq_slot_size=specs[0].tq_slot_size)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -604,6 +614,39 @@ class SlidingWindowSpec(AttentionSpec):
             isinstance(spec, SlidingWindowSpec)
             and spec.sliding_window == self.sliding_window
             for spec in kv_cache_specs.values()
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TQSlidingWindowSpec(SlidingWindowSpec):
+    """SlidingWindowSpec with TQ-aware page size.
+
+    Carries the TQ cache dtype so the KV reshape can build the packed layout
+    for these layers even when the primary cache dtype is not TurboQuant
+    (e.g. a TQ draft against an fp8/MLA target).
+    """
+
+    tq_slot_size: int = 0
+    tq_cache_dtype: str = ""
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(
+            s.tq_slot_size == specs[0].tq_slot_size
+            and s.tq_cache_dtype == specs[0].tq_cache_dtype
+            for s in specs
+        ), "All TQ layers in the same KV cache group must use the same TQ layout."
+        return replace(
+            merged,
+            tq_slot_size=specs[0].tq_slot_size,
+            tq_cache_dtype=specs[0].tq_cache_dtype,
         )
 
 
