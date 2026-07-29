@@ -84,15 +84,11 @@ id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
 into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
 speculation off with `--no-spec`.
 
-> **Known issue — `--hf-config-path` should not be necessary.** Everything the
-> server needs is already in the two GGUFs: the target carries the full
-> tokenizer, chat template and text architecture (`glm-dsa.*`), and the mmproj
-> carries the complete vision config (`clip.vision.*`). Today the loader
-> *patches* an HF config from GGUF rather than *constructing* one, so it still
-> wants a base `config.json` to patch, and `run-glm-optimized.sh` points
-> `--hf-config-path` at a local directory for it. This is a bug in this repo,
-> not a limitation of the format; it is being fixed so the GGUF pair is
-> self-sufficient.
+**That is everything.** No `config.json`, no tokenizer repo, no external
+downloads. The GGUF pair is self-sufficient: the target carries the tokenizer,
+chat template and text architecture (`glm-dsa.*`), and the mmproj carries the
+vision config (`clip.vision.*`). SlimServe builds the whole `Glm5vConfig` from
+that metadata, so `--hf-config-path` and `--tokenizer` are never needed.
 
 ## Quick start
 
