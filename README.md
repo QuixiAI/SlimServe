@@ -2,6 +2,9 @@
 
 By Eric Hartford, QuixiAI
 
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
+
+
 ### With SlimServe you can run GLM-5.2-Vision at
 
 | | 1 request | 16 concurrent |
