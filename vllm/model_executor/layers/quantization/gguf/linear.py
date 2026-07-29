@@ -6,12 +6,13 @@ import os
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
-from vllm.platforms import current_platform
+
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from . import ops
@@ -41,7 +42,9 @@ def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
     so the crossover is mmq_time / mmvq_time_per_token.  Measured on MI300X at
     GLM-5.2 TP2 shapes it lands at 28-340 for ordinary layers and ~5 for the
     vocab projection, because mmq cannot fill 304 CUs until the output is wide.
-    The historical 2/6 sent every layer to a kernel 5-20x slower from batch 4 up.
+    Q8_0 projections with 6,144 output rows remain faster on the multi-column
+    vector kernel through batch 64. The historical 2/6 sent every layer to a
+    kernel 5-20x slower from batch 4 up.
     """
     override = os.environ.get("VLLM_GGUF_MMVQ_MAX_BATCH")
     if override:
@@ -50,6 +53,8 @@ def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
         return 8 if rows > 5120 else 16
     if rows >= 32768:
         return 4
+    if qweight_type == int(WeightType.Q8_0) and rows <= 6144:
+        return 64
     if rows < 4096:
         return 64
     return 16
@@ -195,7 +200,7 @@ class GGUFLinearMethod(LinearMethodBase):
             padded_data = torch.zeros(
                 (concat_side, padded_side), dtype=dtype, device=qweight.device
             )
-            shard_offset_map = dict[str, tuple[int, int, int]]()
+            shard_offset_map = dict[int | str, tuple[int, int, int]]()
             ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
             current_offset = 0
             for idx in ordered_shard_ids:

@@ -5,7 +5,7 @@ import os
 from functools import partial
 
 import torch
-from vllm.platforms import current_platform
+
 from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
 )
@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from . import ops
@@ -51,6 +52,7 @@ def _fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
     activation_enum = MoEActivation.from_str(activation)
 
@@ -69,39 +71,43 @@ def _fused_moe_gguf(
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
+        global_num_experts = expert_map.shape[0] if expert_map is not None else E
+        local_topk_ids = expert_map[topk_ids] if expert_map is not None else topk_ids
         top_k = topk_ids.shape[1]
         # ggml_moe_a8_vec has no weight reuse across tokens -- it reloads the
         # expert row for every (token, k) pair -- so its cost is linear in rows
         # while ggml_moe_a8 is flat.  w2 sees num_tokens*top_k rows, so it
         # crosses over 8x sooner than w1; gating both on one request count (the
         # old `x.shape[0] > 64`) leaves w2 on the GEMV kernel until it is 3.5x
-        # slower than the GEMM.  Crossovers measured on MI300X at GLM-5.2 TP2
-        # shapes: w1 ~96 rows, w2 ~80 rows.
-        # Defaults reproduce the historical `x.shape[0] > 64` switch exactly
-        # (w1 64 request tokens, w2 64*top_k rows) because the mixed path is
-        # not yet verified element-wise; set the env vars to 96 and 80 to get
-        # the measured-optimal split once it is.
+        # slower than the GEMM. Crossovers measured on MI300X at GLM-5.2 TP2
+        # shapes are between 32 and 64 input rows for w1 and between 128 and
+        # 256 routed rows for w2 after grouping four adjacent output rows in
+        # the Q2_K vector kernel and using a 4x64 Q2_K MMQ tile. Keep
+        # separate overrides because other GGUF model shapes can cross over at
+        # different points.
         w1_vec = vec_ok and (
-            not mmq_ok or num_tokens <= _moe_vec_row_limit(64, "VLLM_GGUF_MOE_VEC_W1")
+            not mmq_ok or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1")
         )
         w2_rows = num_tokens * top_k
         w2_vec = vec_ok and (
-            not mmq_ok
-            or w2_rows <= _moe_vec_row_limit(64 * top_k, "VLLM_GGUF_MOE_VEC_W2")
+            not mmq_ok or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2")
         )
 
         sorted_token_ids = expert_ids = num_tokens_post_padded = None
         if not (w1_vec and w2_vec):
             block_size = ops.ggml_moe_get_block_size(qweight_type)
-            sorted_token_ids, expert_ids, num_tokens_post_padded = (
-                moe_align_block_size(topk_ids, block_size, E)
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids,
+                block_size,
+                global_num_experts,
+                expert_map=expert_map,
             )
 
         # Both kernels emit rows in flat (token, k) order, so either can feed
         # the other.
         if w1_vec:
             out = ops.ggml_moe_a8_vec(
-                x, w1, topk_ids, top_k, qweight_type, N, num_tokens
+                x, w1, local_topk_ids, top_k, qweight_type, N, num_tokens
             )
         else:
             out = ops.ggml_moe_a8(
@@ -118,7 +124,7 @@ def _fused_moe_gguf(
         out = act(out)
         if w2_vec:
             out = ops.ggml_moe_a8_vec(
-                out, w2, topk_ids, 1, qweight_type2, w2.shape[1], w2_rows
+                out, w2, local_topk_ids, 1, qweight_type2, w2.shape[1], w2_rows
             )
         else:
             out = ops.ggml_moe_a8(
@@ -144,10 +150,13 @@ def _fused_moe_gguf(
             "for current quantization method. "
             "Falling back to slow implementation. "
         )
-        for tok, (w, idx) in enumerate(zip(topk_weights, topk_ids)):
+        local_topk_ids = expert_map[topk_ids] if expert_map is not None else topk_ids
+        for tok, (w, idx) in enumerate(zip(topk_weights, local_topk_ids)):
             inp = x[tok].reshape((1,) + x.shape[1:])
             current_hidden_state = None
             for ww, ii in zip(w, idx):
+                if ii < 0:
+                    continue
                 out = fused_mul_mat_gguf_op(inp, w1[ii], qweight_type)
                 out = act(out)
                 current_state = fused_mul_mat_gguf_op(out, w2[ii], qweight_type2).mul_(
@@ -157,7 +166,10 @@ def _fused_moe_gguf(
                     current_hidden_state = current_state
                 else:
                     current_hidden_state.add_(current_state)
-            out_hidden_states[tok] = current_hidden_state
+            if current_hidden_state is None:
+                out_hidden_states[tok].zero_()
+            else:
+                out_hidden_states[tok] = current_hidden_state
     return out_hidden_states
 
 
@@ -170,8 +182,18 @@ def _fused_moe_gguf_fake(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
-    del w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, activation
+    del (
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        qweight_type,
+        qweight_type2,
+        activation,
+        expert_map,
+    )
     return torch.empty_like(x)
 
 
@@ -303,4 +325,5 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
             layer.activation.value,
+            layer.expert_map,
         )

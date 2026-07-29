@@ -1,36 +1,50 @@
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda>
+          vec_dot_q_cuda_t vec_dot_q_cuda, int rows_per_block = 1>
 static __global__ void moe_vec_q(const void* __restrict__ vx,
                                  const void* __restrict__ vy,
                                  scalar_t* __restrict__ dst,
                                  const int* topk_ids, const int topk,
                                  const int ncols, const int nrows,
                                  const int token_stride) {
-  const auto row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row0 = blockIdx.x * rows_per_block;
 
   const auto token = blockIdx.z / topk;
   const auto expert = (topk_ids)[blockIdx.z];
 
-  if (row >= nrows) {
+  if (row0 >= nrows) {
+    return;
+  }
+
+  if (expert < 0) {
+#pragma unroll
+    for (int j = 0; j < rows_per_block; ++j) {
+      if (threadIdx.x == 0 && row0 + j < nrows) {
+        dst[blockIdx.z * nrows + row0 + j] = 0;
+      }
+    }
     return;
   }
 
   const int blocks_per_row = ncols / qk;
   const int blocks_per_warp = vdr * WARP_SIZE / qi;
 
-  // partial sum for each thread
-  float tmp = 0.0f;
-
   const block_q_t* x = ((const block_q_t*)vx) + expert * nrows * blocks_per_row;
   const block_q8_1* y =
       (const block_q8_1*)(((const int*)vy) + token * token_stride);
 
+  const block_q_t* xrow[rows_per_block];
+#pragma unroll
+  for (int j = 0; j < rows_per_block; ++j) {
+    const int row = row0 + j < nrows ? row0 + j : nrows - 1;
+    xrow[j] = x + (size_t)row * blocks_per_row;
+  }
+
+  float tmp[rows_per_block] = {0.0f};
+
   for (auto i = threadIdx.x / (qi / vdr); i < blocks_per_row;
        i += blocks_per_warp) {
-    const int ibx = row * blocks_per_row + i;  // x block index
-
     const int iby = i * (qk / QK8_1);  // y block index that aligns with ibx
 
     const int iqs =
@@ -38,17 +52,23 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
         (threadIdx.x %
          (qi / vdr));  // x block quant index when casting the quants to int
 
-    tmp += vec_dot_q_cuda(&x[ibx], &y[iby], iqs);
+#pragma unroll
+    for (int j = 0; j < rows_per_block; ++j) {
+      tmp[j] += vec_dot_q_cuda(&xrow[j][i], &y[iby], iqs);
+    }
   }
 
   // sum up partial sums and write back result
 #pragma unroll
-  for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-    tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
-  }
+  for (int j = 0; j < rows_per_block; ++j) {
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+      tmp[j] += VLLM_SHFL_XOR_SYNC(tmp[j], mask);
+    }
 
-  if (threadIdx.x == 0) {
-    dst[blockIdx.z * nrows + row] = tmp;
+    if (threadIdx.x == 0 && row0 + j < nrows) {
+      dst[blockIdx.z * nrows + row0 + j] = tmp[j];
+    }
   }
 }
 
@@ -134,12 +154,23 @@ static void moe_vec_q2_K_q8_1_cuda(const void* vx, const void* vy,
                                    const int ncols, const int nrows,
                                    const int token_stride,
                                    cudaStream_t stream) {
-  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
-  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const int routed_rows = tokens * top_k;
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
-  moe_vec_q<scalar_t, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ,
-            vec_dot_q2_K_q8_1><<<block_nums, block_dims, 0, stream>>>(
-      vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+  const int rows_per_block = routed_rows >= 64 || ncols <= 1024 ? 4 : 2;
+#define VLLM_MOE_VEC_Q2_LAUNCH(ROWS)                                          \
+  do {                                                                        \
+    const dim3 block_nums((nrows + (ROWS) - 1) / (ROWS), 1, routed_rows);     \
+    moe_vec_q<scalar_t, QK_K, QI2_K, block_q2_K, VDR_Q2_K_Q8_1_MMVQ,          \
+              vec_dot_q2_K_q8_1, (ROWS)>                                      \
+        <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, topk_ids, top_k, \
+                                                ncols, nrows, token_stride);  \
+  } while (0)
+  if (rows_per_block == 4) {
+    VLLM_MOE_VEC_Q2_LAUNCH(4);
+  } else {
+    VLLM_MOE_VEC_Q2_LAUNCH(2);
+  }
+#undef VLLM_MOE_VEC_Q2_LAUNCH
 }
 
 template <typename scalar_t>

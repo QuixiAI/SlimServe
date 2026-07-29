@@ -5,7 +5,7 @@
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum,
           typename block_q_t, int mmq_x, int mmq_y, int nwarps,
           allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles,
-          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, int y_spans_per_stage = 1>
 static __device__ __forceinline__ void moe_q(
     const void* __restrict__ vx, const void* __restrict__ vy,
     scalar_t* __restrict__ dst, const int* __restrict__ sorted_token_ids,
@@ -43,8 +43,9 @@ static __device__ __forceinline__ void moe_q(
 
   allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
 
-  __shared__ int tile_y_qs[mmq_x * WARP_SIZE_GGUF];
-  __shared__ half2 tile_y_ds[mmq_x * WARP_SIZE_GGUF / QI8_1];
+  __shared__ int tile_y_qs[mmq_x * WARP_SIZE_GGUF * y_spans_per_stage];
+  __shared__ half2
+      tile_y_ds[mmq_x * WARP_SIZE_GGUF / QI8_1 * y_spans_per_stage];
 
   float sum[mmq_y / WARP_SIZE_GGUF][mmq_x / nwarps] = {{0.0f}};
 
@@ -55,54 +56,74 @@ static __device__ __forceinline__ void moe_q(
 
     const int n_per_r = ((qk * blocks_per_warp) / qr);
 #pragma unroll
-    for (int ir = 0; ir < qr && ib0 * qk + ir * n_per_r < ncols_x; ++ir) {
-      const auto kqs = ir * WARP_SIZE_GGUF + threadIdx.x;
-      const int kbxd = kqs / QI8_1;
+    for (int ir0 = 0; ir0 < qr; ir0 += y_spans_per_stage) {
+#pragma unroll
+      for (int ir = ir0;
+           ir < ir0 + y_spans_per_stage && ib0 * qk + ir * n_per_r < ncols_x;
+           ++ir) {
+        const auto kqs = ir * WARP_SIZE_GGUF + threadIdx.x;
+        const int kbxd = kqs / QI8_1;
+        const int span = ir - ir0;
 
 #pragma unroll
-      for (int i = 0; i < mmq_x; i += nwarps) {
-        const int col_y_eff = token_offs[i / nwarps] / top_k;
-        const int block_x = ib0 * (qk / QK8_1) + kbxd;
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
-          const block_q8_1* by0 = &y[col_y_eff * blocks_per_col_y + block_x];
-          const int index_y =
-              (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
-          tile_y_qs[index_y] =
-              get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+        for (int i = 0; i < mmq_x; i += nwarps) {
+          const int col_y_eff = token_offs[i / nwarps] / top_k;
+          const int block_x = ib0 * (qk / QK8_1) + kbxd;
+          if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+            const block_q8_1* by0 = &y[col_y_eff * blocks_per_col_y + block_x];
+            const int index_y = span * mmq_x * WARP_SIZE_GGUF +
+                                (threadIdx.y + i) * WARP_SIZE_GGUF +
+                                kqs % WARP_SIZE_GGUF;
+            tile_y_qs[index_y] =
+                get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+          }
         }
-      }
 
-      if (threadIdx.x < n_per_r / QK8_1) {
-        const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-        const int col_y_eff = token_offs[threadIdx.y] / top_k;
-        const int block_x =
-            ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
+        if (threadIdx.x < n_per_r / QK8_1) {
+          const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
+          const int col_y_eff = token_offs[threadIdx.y] / top_k;
+          const int block_x =
+              ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
 
-        if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
-          const half2* dsi_src = &y[col_y_eff * blocks_per_col_y + block_x].ds;
-          half2* dsi_dst =
-              &tile_y_ds[threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
+          if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+            const half2* dsi_src =
+                &y[col_y_eff * blocks_per_col_y + block_x].ds;
+            half2* dsi_dst =
+                &tile_y_ds[span * mmq_x * (WARP_SIZE_GGUF / QI8_1) +
+                           threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
 
-          if (need_sum) {
-            *dsi_dst = *dsi_src;
-          } else {
-            float* dfi_dst = (float*)dsi_dst;
-            *dfi_dst = __low2float(*dsi_src);
+            if (need_sum) {
+              *dsi_dst = *dsi_src;
+            } else {
+              float* dfi_dst = (float*)dsi_dst;
+              *dfi_dst = __low2float(*dsi_src);
+            }
           }
         }
       }
       __syncthreads();
 
-      // #pragma unroll // unrolling this loop causes too much register pressure
-      for (int k = ir * WARP_SIZE_GGUF / qr; k < (ir + 1) * WARP_SIZE_GGUF / qr;
-           k += vdr) {
 #pragma unroll
-        for (int j = 0; j < mmq_x; j += nwarps) {
+      for (int ir = ir0;
+           ir < ir0 + y_spans_per_stage && ib0 * qk + ir * n_per_r < ncols_x;
+           ++ir) {
+        const int span = ir - ir0;
+        const int* span_y_qs = tile_y_qs + span * mmq_x * WARP_SIZE_GGUF;
+        const half2* span_y_ds =
+            tile_y_ds + span * mmq_x * WARP_SIZE_GGUF / QI8_1;
+
+        // #pragma unroll // unrolling this loop causes too much register
+        // pressure
+        for (int k = ir * WARP_SIZE_GGUF / qr;
+             k < (ir + 1) * WARP_SIZE_GGUF / qr; k += vdr) {
 #pragma unroll
-          for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
-            sum[i / WARP_SIZE_GGUF][j / nwarps] +=
-                vec_dot(tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs,
-                        tile_y_ds, threadIdx.x + i, threadIdx.y + j, k);
+          for (int j = 0; j < mmq_x; j += nwarps) {
+#pragma unroll
+            for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+              sum[i / WARP_SIZE_GGUF][j / nwarps] +=
+                  vec_dot(tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, span_y_qs,
+                          span_y_ds, threadIdx.x + i, threadIdx.y + j, k);
+            }
           }
         }
       }
@@ -434,19 +455,19 @@ static void ggml_moe_q8_0_q8_1_cuda(
 }
 
 #if defined(USE_ROCM)
-  #define MOE_X_Q2_K 8
-  #define MOE_Y_Q2_K 128
-  #define NWARPS_Q2_K 8
+  #define MOE_X_Q2_K 4
+  #define MOE_Y_Q2_K 32
+  #define MOE_NWARPS_Q2_K 4
 #else
   #define MOE_X_Q2_K 4
   #define MOE_Y_Q2_K 32
-  #define NWARPS_Q2_K 4
+  #define MOE_NWARPS_Q2_K 4
 #endif
 
-template <typename scalar_t, bool need_check>
+template <typename scalar_t, bool need_check, int mmq_x, int mmq_y, int nwarps>
 static __global__ void
 #if defined(USE_ROCM)
-__launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
+__launch_bounds__(WARP_SIZE_GGUF* nwarps, 2)
 #endif
     moe_q2_K(const void* __restrict__ vx, const void* __restrict__ vy,
              scalar_t* __restrict__ dst, const int* sorted_token_ids,
@@ -454,13 +475,9 @@ __launch_bounds__(WARP_SIZE_GGUF* NWARPS_Q2_K, 2)
              const int exp_stride, const int ncols_x, const int nrows_x,
              const int ncols_y, const int nrows_y, const int nrows_dst,
              const int top_k) {
-  const int mmq_x = MOE_X_Q2_K;
-  const int mmq_y = MOE_Y_Q2_K;
-  const int nwarps = NWARPS_Q2_K;
-
   moe_q<scalar_t, QK_K, QR2_K, QI2_K, false, block_q2_K, mmq_x, mmq_y, nwarps,
         allocate_tiles_q2_K<mmq_y>, load_tiles_q2_K<mmq_y, nwarps, need_check>,
-        VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat>(
+        VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat, 2>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
 }
@@ -474,24 +491,26 @@ static void ggml_moe_q2_K_q8_1_cuda(
     const int tokens_post_padded, cudaStream_t stream) {
   const int mmq_x = MOE_X_Q2_K;
   const int mmq_y = MOE_Y_Q2_K;
-  const int nwarps = NWARPS_Q2_K;
+  const int nwarps = MOE_NWARPS_Q2_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
   const dim3 block_nums(block_num_x, block_num_y, 1);
   const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
-  if (nrows_x % mmq_y == 0) {
-    constexpr bool need_check = false;
-    moe_q2_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK)                                     \
+  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MOE_Y_Q2_K, MOE_NWARPS_Q2_K>    \
+      <<<block_nums, block_dims, 0, stream>>>(                               \
+          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
+          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k)
+
+  const bool need_check = nrows_x % mmq_y != 0;
+  if (need_check) {
+    VLLM_MOE_Q2_K_LAUNCH(true);
   } else {
-    constexpr bool need_check = true;
-    moe_q2_K<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
-        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
-        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+    VLLM_MOE_Q2_K_LAUNCH(false);
   }
+#undef VLLM_MOE_Q2_K_LAUNCH
 }
 
 #if defined(USE_ROCM)
