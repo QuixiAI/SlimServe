@@ -108,16 +108,6 @@ def is_valid_ipv6_address(address: str) -> bool:
         return False
 
 
-def split_host_port(host_port: str) -> tuple[str, int]:
-    # ipv6
-    if host_port.startswith("["):
-        host, port = host_port.rsplit("]", 1)
-        host = host[1:]
-        port = port.split(":")[1]
-        return host, int(port)
-    else:
-        host, port = host_port.split(":")
-        return host, int(port)
 
 
 def join_host_port(host: str, port: int) -> str:
@@ -262,22 +252,6 @@ def split_zmq_path(path: str) -> tuple[str, str, str]:
     return scheme, host, port
 
 
-def make_zmq_path(scheme: str, host: str, port: int | None = None) -> str:
-    """Make a ZMQ path from its parts.
-
-    Args:
-        scheme: The ZMQ transport scheme (e.g. tcp, ipc, inproc).
-        host: The host - can be an IPv4 address, IPv6 address, or hostname.
-        port: Optional port number, only used for TCP sockets.
-
-    Returns:
-        A properly formatted ZMQ path string.
-    """
-    if port is None:
-        return f"{scheme}://{host}"
-    if is_valid_ipv6_address(host):
-        return f"{scheme}://[{host}]:{port}"
-    return f"{scheme}://{host}:{port}"
 
 
 # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.1/python/sglang/srt/utils.py#L783 # noqa: E501

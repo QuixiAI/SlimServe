@@ -626,12 +626,6 @@ def _embedding_count_expression(embeddings: NestedTensors) -> str:
     return " + ".join(_embedding_count_expression(inner) for inner in embeddings)
 
 
-def split_list_into_ranges(lst: torch.Tensor, interval: int) -> list[list[int]]:
-    ranges: list[list[int]] = [[] for _ in range((max(lst) // interval) + 1)]
-    for num in lst:
-        index = num // interval
-        ranges[index].append(num)
-    return ranges
 
 
 def _merge_multimodal_embeddings(
@@ -948,9 +942,6 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         return layer_index
 
 
-def cast_overflow_tensors(tensors: torch.Tensor, offset: float = 1000) -> torch.Tensor:
-    clamp_value = torch.finfo(tensors.dtype).max - offset
-    return torch.clamp(tensors, min=-clamp_value, max=clamp_value)
 
 
 def fast_topk(
@@ -1047,17 +1038,6 @@ def process_eagle_weight(
         model.has_own_embed_tokens = True
 
 
-def get_layer_index(feature_layer_index: int, num_hidden_layers: int) -> int:
-    """Given a signed vision feature layer, get the number of hidden layers
-       needed to leverage it.
-
-    Args:
-        feature_layer_index: Index of a required layer in the visual encoder.
-        num_hidden_layers: The total number of hidden layers in the visual encoder.
-    """
-    if feature_layer_index < 0:
-        return num_hidden_layers + feature_layer_index + 1
-    return feature_layer_index
 
 
 def scatter_output_slices(

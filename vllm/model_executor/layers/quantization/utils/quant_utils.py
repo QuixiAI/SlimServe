@@ -740,19 +740,6 @@ def gptq_quantize_weights(
     return w_ref, w_q, w_s, g_idx, rand_perm
 
 
-def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
-    orig_device = q_w.device
-
-    sort_indices = torch.argsort(g_idx).to(dtype=torch.int32)  # Sort based on g_idx
-
-    g_idx = g_idx[sort_indices].contiguous()
-    q_w = q_w[sort_indices, :].contiguous()
-
-    return (
-        q_w.to(device=orig_device),
-        g_idx.to(device=orig_device),
-        sort_indices.to(device=orig_device),
-    )
 
 
 def pack_rows(

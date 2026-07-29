@@ -19,12 +19,8 @@ from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
 logger = init_logger(__name__)
 
 
-def format_kib(b: int) -> str:
-    return f"{round(b / KiB_bytes, 2)}"
 
 
-def format_mib(b: int) -> str:
-    return f"{round(b / MiB_bytes, 2)}"
 
 
 def format_gib(b: int) -> str:
@@ -43,9 +39,6 @@ def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     return int(max_shared_mem)
 
 
-def get_cpu_memory() -> int:
-    """Returns the total CPU memory of the node in bytes."""
-    return psutil.virtual_memory().total
 
 
 _UMA_PRESSURE_THRESHOLD = 0.8

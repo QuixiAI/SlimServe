@@ -362,13 +362,6 @@ def get_kv_cache_quant_algo_string(quant_cfg: dict[str, Any]) -> str | None:
     return None
 
 
-def get_kv_cache_quant_algo_dtype(quant_cfg: dict[str, Any]) -> torch.dtype | None:
-    """Get the KV cache quantization algorithm dtype from the quantization config."""
-    kv_algo_str = get_kv_cache_quant_algo_string(quant_cfg)
-    if kv_algo_str is not None and kv_algo_str != "auto":
-        # Only convert if we have a valid dtype string (not "auto" fallback)
-        return STR_DTYPE_TO_TORCH_DTYPE[kv_algo_str]
-    return None
 
 
 def resolve_kv_cache_dtype_string(
@@ -890,8 +883,6 @@ def _encode_layer_name(layer_name: str) -> str | LayerName:
 
 
 # Supports XPU Graph with PyTorch versions >= 2.11.0.dev for XPU platform
-def supports_xpu_graph() -> bool:
-    return is_torch_equal_or_newer("2.11.0.dev")
 
 
 # create a library to hold the custom op

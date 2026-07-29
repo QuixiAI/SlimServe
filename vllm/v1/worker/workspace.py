@@ -191,13 +191,6 @@ class WorkspaceManager:
         return current_workspace
 
 
-def is_workspace_manager_initialized() -> bool:
-    """Check if workspace manager has been initialized.
-
-    Returns:
-        True if workspace manager is initialized, False otherwise.
-    """
-    return _manager is not None
 
 
 def current_workspace_manager() -> "WorkspaceManager":

@@ -958,7 +958,3 @@ def apply_top_k_top_p_triton(
     return logits
 
 
-def reset_buffer_cache():
-    _TRITON_BUFFER_CACHE.clear()
-    _TRITON_TABLE_CACHE.clear()
-    torch.accelerator.empty_cache()

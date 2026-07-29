@@ -53,23 +53,6 @@ def download_gguf(
     return local_files[0]
 
 
-def resolve_local_gguf(local_dir: str, quant_type: str) -> str:
-    """Find a GGUF file matching *quant_type* in a local directory."""
-    import glob as glob_mod
-
-    patterns = [
-        f"*-{quant_type}.gguf",
-        f"*-{quant_type}-*.gguf",
-    ]
-    matches: list[str] = []
-    for pat in patterns:
-        matches.extend(glob_mod.glob(os.path.join(local_dir, pat)))
-    if not matches:
-        raise ValueError(
-            f"No GGUF file matching quant_type '{quant_type}' found in {local_dir}"
-        )
-    matches.sort(key=lambda x: (x.count("-"), x))
-    return matches[0]
 
 
 def get_gguf_extra_tensor_names(
@@ -159,16 +142,6 @@ def gguf_quant_weights_iterator_multi(
             yield name, param
 
 
-def get_gguf_unquantized_params(gguf_files: list[str]) -> list[str]:
-    _QUANT_TYPES = ("F32", "BF16", "F16")
-    return list(
-        {
-            tensor.name
-            for gguf_file in gguf_files
-            for tensor in gguf_reader(gguf_file).tensors
-            if tensor.tensor_type.name in _QUANT_TYPES
-        }
-    )
     # for gguf_file in gguf_files:
     #     reader = gguf_reader(gguf_file)
     #     for tensor in reader.tensors:
