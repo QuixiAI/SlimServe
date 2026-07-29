@@ -7,10 +7,16 @@ By Eric Hartford, QuixiAI
 
 ### With SlimServe you can run GLM-5.2-Vision at
 
-| | 1 request | 16 concurrent |
-| --- | ---: | ---: |
-| **2× MI300X** | **87 tok/s** | **284 tok/s** |
-| **4× MI300X** | **104 tok/s** | **371 tok/s** |
+Aggregate throughput, by concurrent requests:
+
+| | 1 | 4 | 8 | 16 | 32 | 64 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **2× MI300X** | **82** | **141** | **176** | **260** | **297** | **408** |
+| **4× MI300X** | **104** | … | … | **371** | … | … |
+| **8× MI300X** | **109** | … | … | **488** | … | … |
+
+<sub>tok/s aggregate. Cells marked … are still being measured; the 4×/8× rows
+will be completed from the same sweep as the 2× row.</sub>
 
 ### …while supporting up to 512k tokens of context
 
