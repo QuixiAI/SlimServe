@@ -259,6 +259,16 @@ first small request while 100k-token requests keep working fine.
 available: sharded weights leave enough VRAM that the huge ceiling costs you
 nothing on ordinary short requests.
 
+**More GPUs: scale with `--tp`, not `--dp`**
+
+```bash
+./run-glm-optimized.sh --tp 4     # 1.2x single-request, 1.3x at concurrency 16 vs TP2
+./run-glm-optimized.sh --tp 8     # Q6_K territory; also the most KV headroom
+```
+
+See [Parallelism: TP vs DP vs EP](#parallelism-tp-vs-dp-vs-ep) for why
+`--dp` is usually the wrong knob.
+
 **Quality-first agentic serving (4 GPUs)**
 
 ```bash
@@ -318,6 +328,47 @@ Pick a concurrency limit from your latency target, not from peak throughput:
 
 Prefill of the 100k prefix took 129.6 s (**772 tok/s**) and is paid once thanks
 to prefix caching — every later request against the same corpus skips it.
+
+### Parallelism: TP vs DP vs EP
+
+Same workload (100k shared prefix, 2k outputs, Q2_K, spec-3), 4 GPUs for the
+TP4/DP rows. The TP2 row is the table above, shown for scale:
+
+| Config | GPUs | 1 request | 16 concurrent | Prefill |
+| --- | ---: | ---: | ---: | ---: |
+| TP2 | 2 | 87.0 tok/s | 283.9 tok/s | 772 tok/s |
+| **TP4** | 4 | **104.1 tok/s** | **371.4 tok/s** | **1,138 tok/s** |
+| TP2 × DP2 | 4 | 19.2 tok/s | 360.8 tok/s | 967 tok/s |
+| TP4 + EP | 4 | OOM at boot | — | — |
+| TP2 × DP2 + EP | 4 | OOM at boot | — | — |
+
+**Use tensor parallel. It is the right default at every size here.** Going
+from TP2 to TP4 buys 20% on single-request decode, 31% at concurrency 16, and
+47% on prefill. Decode scales sublinearly because it is memory-bandwidth bound
+and the MLA latent KV is replicated on every rank rather than sharded; prefill
+scales much better because it is compute bound.
+
+**Data parallel is a trap below saturation.** DP2×TP2 delivers 19.2 tok/s on a
+single request — **5.4× slower than TP4 on the same four GPUs**. vLLM's
+data-parallel replicas advance in lockstep, so while one replica serves your
+request the other runs dummy batches, and every step pays a synchronization.
+DP only becomes reasonable once every replica is busy: at concurrency 16 it
+reaches 360.8 tok/s, still slightly behind plain TP4. Choose DP only when you
+are permanently saturated and want more independent schedulers; otherwise TP
+wins on both latency and throughput.
+
+**Expert parallel does not fit on this hardware.** GLM-5.2 has 256 routed
+experts with 8 active per token, which normally makes EP attractive — but with
+`--enable-expert-parallel` the resident set reached 187.6 GiB per GPU before
+KV profiling even began, and both EP configurations OOM'd. `--ep` exists in the
+script and reduces the KV budget by 12 GiB to compensate, but at Q2_K on
+MI300X the weights are simply too large for the extra EP overhead. Revisit it
+with a smaller quant or more GPUs.
+
+Caveat: the TP2 row was measured with a 512k context ceiling and the TP4/DP
+rows with 256k. The ceiling changes workspace reservation, not steady-state
+decode throughput, so the comparison holds — but the rows are not
+bit-for-bit identical configurations.
 
 ### Speculative decoding — same hardware, batch 64
 
