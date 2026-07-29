@@ -19,6 +19,7 @@ cd /
 TP=2
 DP=1
 EP=0
+DRAFT_ARG=
 QUANT=Q2_K
 CTX=                 # default depends on --tp; see below
 PORT=8000
@@ -30,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --tp)    TP="$2"; shift 2 ;;
         --dp)    DP="$2"; shift 2 ;;
         --ep)    EP=1; shift ;;
+        --draft) DRAFT_ARG="$2"; shift 2 ;;
         --quant) QUANT="$2"; shift 2 ;;
         --ctx)   CTX="$2"; shift 2 ;;
         --port)  PORT="$2"; shift 2 ;;
@@ -49,7 +51,19 @@ esac
 [[ -f "$MODEL" ]] || { echo "missing model: $MODEL" >&2; exit 1; }
 
 HF_CONFIG="$MODELS/GLM-5.2-Vision-FP8"     # config.json + tokenizer only
-DRAFT="$MODELS/GLM-5.2-speculator.dspark"
+
+# Speculator. Override with --draft <path-or-hf-repo>. A bare repo id is
+# resolved through the HF cache, so the 5.9 GB draft downloads on first run;
+# a local checkout is preferred when present.
+DEFAULT_DRAFT_REPO=RedHatAI/GLM-5.2-speculator.dspark
+DRAFT="${DRAFT_ARG:-}"
+if [[ -z "$DRAFT" ]]; then
+    if [[ -d "$MODELS/GLM-5.2-speculator.dspark" ]]; then
+        DRAFT="$MODELS/GLM-5.2-speculator.dspark"
+    else
+        DRAFT="$DEFAULT_DRAFT_REPO"
+    fi
+fi
 
 # KV pool, sized explicitly. Auto-sizing (gpu_memory_utilization) misjudges
 # this model at large max_model_len: it over-requests and OOMs at init, and
@@ -67,6 +81,10 @@ case "$TP" in
     8) KV_GIB=120 ;;
     *) KV_GIB=47 ;;
 esac
+# Expert parallel needs ~10 GiB more per rank than plain TP at the same GPU
+# count (measured: tp4 --ep OOMs at the tp4 budget, 187.6 GiB resident before
+# profiling), so give the KV pool back that much.
+[[ "$EP" == "1" ]] && KV_GIB=$((KV_GIB - 12))
 KV_BYTES=$((KV_GIB * 1024 * 1024 * 1024))
 
 # Default context ceiling by GPU count. On 2 GPUs the weights leave only ~63
@@ -98,6 +116,7 @@ fi
 
 echo "SlimServe: $QUANT  tp=$TP  dp=$DP  ep=$EP  ctx=$CTX  max_seqs=$MAX_SEQS" \
      "kv=${KV_GIB}GiB  spec=$SPEC"
+[[ "$SPEC" == "1" ]] && echo "  draft: $DRAFT"
 
 # AITER is required: the target's sparse-MLA indexer has no non-AITER ROCm path.
 export VLLM_ROCM_USE_AITER=1
