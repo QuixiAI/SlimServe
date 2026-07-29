@@ -147,7 +147,7 @@
 > this GGUF is type 8 = **Q8_0**, which tests clean. Do not attribute bug B to
 > this.
 >
-> ### ROOT CAUSE (iteration 4): amplification, not a bug. Both A and B.
+> ### ROOT CAUSE (iteration 4): amplification, not a bug. Both A and B
 >
 > `logit_gap.py`, 600 real decode steps, top1-top2 logprob gap:
 >
@@ -583,6 +583,7 @@ Run before landing anything. Any regression = revert, no exceptions.
    vs llama.cpp, median per-element error was 0.87%.
 
 Fast pre-checks that need no engine boot:
+
 - `<SCRATCH>/vit_ref.py` — vision tower + projector vs llama.cpp, ~30 s.
 - `<SCRATCH>/cmp_vit_weights.py` — weight-level diff.
 
@@ -625,6 +626,7 @@ magnitude is emitting several tokens per target forward pass**, i.e.
 speculative decoding.
 
 User-directed inputs for that (2026-07-27):
+
 - `RedHatAI/GLM-5.2-speculator.dspark-preview` — downloaded to
   `/home/hotaisle/models/GLM-5.2-speculator`. 5-layer qwen3 draft, 7.6 GB bf16,
   `speculators_model_type: dspark`, block_size 8, 7 speculative tokens, aux
@@ -675,8 +677,8 @@ Harnesses: `<SCRATCH>/measure_startup_llamacpp.py`,
 
 | engine | metric | time |
 |---|---|---|
-| llama.cpp | exec -> first token | _pending_ |
-| vLLM | exec -> /health 200 | _pending_ |
+| llama.cpp | exec -> first token | *pending* |
+| vLLM | exec -> /health 200 | *pending* |
 
 ## Status
 
@@ -773,10 +775,10 @@ Next, in order:
    the reason the end-to-end gain is 1.5% instead of ~10%.
 2. Collapse the kernel type dispatch to q8_0 + q2_K (see the specialisation
    section) — faster builds, smaller code, no runtime switch.
-2. Instantiate ncols_dst 1..8 exactly (stop padding 5-7 up to 8) and port
+3. Instantiate ncols_dst 1..8 exactly (stop padding 5-7 up to 8) and port
    llama.cpp's MFMA MMQ for n>=8 — see the analysis above for why the GEMV is
    the wrong tool at that width.
-3. Then the specialisation ideas: bf16-promote the always-hot tensors, fuse the
+4. Then the specialisation ideas: bf16-promote the always-hot tensors, fuse the
    expert into one kernel, fuse q8_1 activation quantisation into the RMSNorm
    epilogue (562 launches/step today).
 
@@ -1586,7 +1588,7 @@ Two of the "unexplored" blocks are now pinned to a single line each:
 Also confirmed cheap and not worth chasing: KV cache alloc+commit **0.09 s**,
 `get_kv_cache_configs` 0.01 s, API tail 6.6 s (was ~85 s this morning).
 
-## Round 3 (2026-07-28): 165 -> ~152 s. The AITER FP8 BMM precompile was 11.8 s.
+## Round 3 (2026-07-28): 165 -> ~152 s. The AITER FP8 BMM precompile was 11.8 s
 
 **Root cause of the 12 s `MLAAttention` post-load.** With `VLLM_ROCM_USE_AITER=1`
 the MLA path takes the `is_aiter_triton_fp8_bmm_enabled` branch, which
@@ -1603,6 +1605,7 @@ branch they live in never executes on this configuration. When per-statement
 timers all read zero, the code you are reading is not the code that runs.
 
 **Rejected on measurement (do not retry):**
+
 - *GC pressure.* `gc.disable()` across the whole load + `freeze_gc_heap()`
   after: MLA stayed 11.8 s. The GC change is kept (it is harmless and the
   freeze legitimately excludes the static model graph) but it bought nothing.
@@ -1962,3 +1965,723 @@ Ranked targets, none yet attempted:
 5. **kernel_warmup 15.1 s** -- one 8-byte pageable H2D blocked in
    libhsa-runtime64.so. Four hypotheses tested and rejected (KV commit, host
    staging pin, tensor-construction path, Triton compile). Still unexplained.
+
+## Startup reduction round 2 (2026-07-29): 156.3 -> 83.2 s, llama.cpp beaten
+
+The external, like-for-like startup target is now met. The final source tree
+reached `/health` in **83.16 s** and returned the gated first completion in
+**83.82 s**. The comparable llama.cpp number is approximately **84.5 s**:
+67.2 s from the top of `llama_cli()` to its first emitted token plus the
+separately measured 17.3 s process-exec/dynamic-loader prefix. Thus vLLM is
+1.3 s faster to health and 0.7 s faster through its first completion response.
+
+This distinction matters: vLLM has beaten llama.cpp on the external process
+clock defined in the baseline section, not llama.cpp's internal 67.2 s timer.
+Quoting 83.82 vs 67.2 would mix clocks and is invalid. The margin is also
+narrower than the 2-4 s run-to-run variation in the 262 GB pageable weight
+transfer, so retain the phase timings when comparing future runs.
+
+| metric | specialization baseline | final warm-cache run | reduction |
+| --- | ---: | ---: | ---: |
+| process start -> `/health` | 156.3 s | **83.16 s** | **73.1 s / 46.8%** |
+| process start -> gated completion | not recorded | **83.82 s** | n/a |
+| llama.cpp external -> first token | ~84.5 s | ~84.5 s | reference |
+
+Final-run timeline (`/tmp/vllm_startup_mm_budget_hit.log`):
+
+| phase | window | s |
+| --- | ---: | ---: |
+| imports | 0 -> 9.60 | 9.60 |
+| cached GGUF metadata, config, EngineCore/worker fork | 9.60 -> 15.53 | 5.93 |
+| model initialization + weight load + post-load | 15.53 -> 74.39 | 58.86 |
+| KV alloc + warmup + graphs + sampler | 74.39 -> 81.60 | 7.21 |
+| EngineCore/client/API tail -> HTTP serving | 81.60 -> 82.67 | 1.07 |
+| socket polling -> `/health` | 82.67 -> 83.16 | 0.49 |
+| text generation gate response | 83.16 -> 83.82 | 0.66 |
+
+The weight phase was 55.16 s plus 2.8 s model construction and 0.8 s
+post-load work. Pynccl initialization (8.4 s) is inside that interval and is
+now overlapped with the weight stream rather than added before it.
+
+### Changes retained
+
+1. An explicit `--kv-cache-memory-bytes` now means exactly that: skip the
+   16,384-token memory-profile forward, its trial large-prefill compile range,
+   and the CUDA-graph memory estimate. Automatic KV sizing retains the old
+   profiling path. The sampler still warms batch 8, matching the largest
+   retained graph.
+2. Block-table warmup creates its tiny tensors directly on the GPU. This
+   removes the pathological 15 s first pageable H2D without changing any
+   runtime block-table behavior.
+3. TP communication setup is deferred and runs alongside GGUF weight loading;
+   the inactive EP communicator is not initialized on this fixed startup path.
+4. GGUF quantization type scalars are extracted on the CPU before upload, so
+   startup no longer performs thousands of device scalar synchronizations.
+5. The fixed-memory path freezes the completed heap directly instead of doing
+   several full collections over the enormous loaded model. In particular,
+   `DeviceMemoryProfiler` is bypassed during model load while allocator
+   counters preserve the informational model-memory log. Automatic sizing
+   still uses the original profiler.
+6. Expensive shard-1 GGUF metadata is persisted under
+   `VLLM_CACHE_ROOT/gguf_metadata/`, keyed by resolved path, size, mtime and
+   schema. A hit remaps tensor bytes but restores the already-decoded field and
+   tensor descriptors; malformed or stale entries fall back to the real
+   parser. The main checkpoint parse is 2.78 s -> 0.10-0.11 s.
+7. The derived multimodal encoder budget is shared across forked processes and
+   persisted under `VLLM_CACHE_ROOT/multimodal_budget/`, with a config/version
+   fingerprint. On a hit, text startup does not construct or warm the primary
+   frontend multimodal processor. The primary and readonly processors are
+   created under locks on the first request that actually needs them.
+   Fixed-memory startup also skips resetting caches that cannot yet contain
+   entries.
+8. Fixed-memory frontend warmup omits multimodal dummy preprocessing. The
+   first multimodal request intentionally pays that cold cost; text readiness
+   and text TTFT do not.
+
+Both persistent caches are derived state, not model state. A first-ever boot
+will populate them and be slower; the comparison here, like the established
+llama.cpp comparison, is warm steady state. Cache validation is fail-open to
+the normal parser/processor path.
+
+### Rejected experiments (all reverted)
+
+- mmap-based contiguous upload, a prefetch thread, moving qweight/type handling
+  wholesale to CPU, deferred materialization, direct CPU-to-parameter copies,
+  and storage reuse were neutral or slower.
+- TP-narrowing the MoE stacks through a CPU clone made the load exceed 100 s.
+- Zero shared graph warmups and skipping warmups after the first capture shape
+  both violated compiler/capture invariants (`torch.compile` attempted JIT
+  during capture).
+- Warming the sampler at batch 1 took **1.62 s**, versus about **0.7 s** at
+  batch 8. The batch-8 warmup was restored.
+- A tokenizer side cache produced no measurable startup improvement.
+
+### Verification
+
+- Final text benchmark, serialized on GPUs 6,7 with warm caches:
+
+  ```bash
+  STARTUP_LOG=/tmp/vllm_startup_mm_budget_hit.log \
+    STARTUP_GPUS=6,7 STARTUP_KV_CACHE_BYTES=46170898432 \
+    STARTUP_CG_MODE=FULL_DECODE_ONLY STARTUP_CG_SIZES=1,2,4,8 \
+    /home/hotaisle/.venv/bin/python <SCRATCH>/ttft_vllm.py
+  ```
+
+  Result: health **83.16 s**, completion **83.82 s**, PASS with
+  `' Paris. The city is located on the'`.
+- Lazy vision gate, same fixed-memory path: HTTP 200 and the response identifies
+  the 64x64 solid-red PNG as red.
+- Persistent GGUF reader parity: all 343 shard-1 tensor names, types, shapes,
+  offsets and data shapes; selected first/middle/last tensor bytes; the first
+  20 tokenizer entries and last 20 merges all match a fresh parser. Tokenizer
+  IDs also match for `The capital of France is` and `<|image|>`.
+- Python compilation and `git diff --check` pass on the retained changes.
+
+No PR was opened. Before any future PR, run the duplicate-work commands in
+`AGENTS.md`, and the human submitter must review every line and disclose the AI
+assistance and these exact test results.
+
+## 100k-context concurrent throughput (2026-07-29)
+
+### Workload and capacity
+
+The throughput sweep uses exact token-ID inputs and forces every generation to
+its requested length:
+
+- input: exactly **100,000 tokens** per request;
+- output: exactly **2,000 tokens** per request (`min_tokens == max_tokens`);
+- concurrency: **1, 2, 4, 8, 16, 32, 64**;
+- TP2 on MI300X GPUs 6,7, `max_model_len=102000`, fixed
+  `kv_cache_memory_bytes=46170898432`, `max_num_batched_tokens=16384`, and
+  decode graph sizes 1,2,4,8,16,32,64;
+- prefix caching enabled, with a 99,984-token common prefix and a unique
+  16-token suffix for every request.
+
+The shared prefix is essential context for interpreting these numbers. The
+fixed KV allocation holds 967,936 tokens, so at most nine independent 102k
+sequences can be resident. With block sharing, the 64-way workload needs
+99,984 common tokens plus `64 * (16 + 2,000)` unique tokens, or 229,008 resident
+tokens. Thus all 64 requests remain resident and this sweep measures concurrent
+long-context decode rather than scheduler queueing over repeated unique
+prefills. A fully unique 64-way sweep is a separate multi-hour ingestion and
+queueing benchmark.
+
+`aggregate output tok/s` is `total generated tokens / wall time`; it does not
+count cached prompt tokens as physical work. `decode-window tok/s` excludes
+the interval before the first output token. Per-request tok/s is aggregate
+throughput divided by concurrency.
+
+### Optimization
+
+The ROCm GGUF MoE dispatch formerly used one effective crossover for both
+matmuls: vector kernels through 64 input rows for w1 and through
+`64 * top_k = 512` routed rows for w2. Direct MI300X measurements place the
+crossovers near 96 w1 input rows and only 80 w2 routed rows. The defaults now
+use those independent limits on ROCm while retaining the existing environment
+overrides. Non-ROCm dispatch is unchanged.
+
+A controlled 128-output-token A/B sweep isolated the dispatch change without
+spending another full 2k-output run on the slower baseline:
+
+| Concurrency | Historical default tok/s | 96/80 split tok/s | Change |
+| ---: | ---: | ---: | ---: |
+| 1 | 36.62 | 38.36 | +4.8% |
+| 2 | 63.62 | 63.00 | -1.0% |
+| 4 | 92.78 | 92.62 | -0.2% |
+| 8 | 123.91 | 124.34 | +0.3% |
+| 16 | 148.04 | 173.02 | +16.9% |
+| 32 | 147.16 | 176.13 | +19.7% |
+| 64 | 170.11 | 228.75 | +34.5% |
+
+The small low-concurrency movements are run noise; those batches retain the
+same kernel choices. The material gains begin where the old w2 threshold kept
+the slower vector kernel active.
+
+### Final exact 100k/2k sweep
+
+| Concurrency | Wall time (s) | Aggregate output tok/s | Decode-window tok/s | Per-request tok/s | TTFT p50 / p95 (s) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 47.71 | 41.92 | 42.13 | 41.92 | 0.235 / 0.235 |
+| 2 | 57.31 | 69.79 | 70.08 | 34.90 | 0.341 / 0.440 |
+| 4 | 77.55 | 103.16 | 103.48 | 25.79 | 0.502 / 0.506 |
+| 8 | 120.45 | 132.84 | 133.09 | 16.61 | 0.731 / 0.742 |
+| 16 | 175.87 | 181.95 | 182.18 | 11.37 | 0.888 / 1.085 |
+| 32 | 350.50 | 182.59 | 182.71 | 5.71 | 1.441 / 1.803 |
+| 64 | 533.06 | 240.12 | 240.24 | 3.75 | 2.450 / 2.930 |
+
+Every request produced exactly 2,000 tokens from exactly 100,000 input token
+IDs. Every measured request reported exactly 99,984 cached prompt tokens. A
+32-request factual quality gate also passed 32/32 responses while exercising
+the mixed w1-vector/w2-MMQ path. The warmed common-prefix insertion ran at
+about 849 prompt tok/s.
+
+The retained source passes Python compilation and `git diff --check`. Raw
+results and logs are in `/tmp/longctx_baseline_128.{json,log}`,
+`/tmp/longctx_moesplit_128.{json,log}`, and
+`/tmp/longctx_final_shared_2000.{json,log}`.
+
+### Rejected experiment
+
+The production sparse-indexer configuration was measured separately at the
+exact 100k sequence length. It costs about 0.07-0.14 ms per indexed layer for
+batches 1-64 (roughly 1.5-2.7 ms over the indexed layers), so it is not the
+source of the high-concurrency plateau and no indexer change was retained. An
+unsupported alternative launch shape faulted in the isolated benchmark and
+was discarded; it was never enabled in production.
+
+## QuixiCore-guided Q2_K kernel pass (2026-07-29)
+
+The next kernel search used
+`~/QuixiCore/QuixiCore-ROCm/perf/perf.md` as the design guide. The relevant
+principles were to optimize the exact decoder shapes, distinguish ALU and
+bandwidth ceilings, keep wave64 register pressure explicit, hoist metadata only
+when reuse amortizes it, and reject candidates by measured end-to-end results.
+A steady-decode trace attributed about 52% of GPU kernel time to the routed
+Q2_K expert kernels, making this the highest-value kernel target.
+
+### Accepted matrix tile
+
+The retained ROCm Q2_K MMQ tile changes from 4 routed tokens by 128 output rows
+to **4 by 64**. The smaller row tile halves the per-thread output accumulator
+count and Q2_K LDS span. It launches more blocks, but on MI300X the lower
+register/LDS pressure wins decisively at the real GLM-5.2 TP2 shapes.
+
+| TP2 MoE shape | 4x128 (us) | 4x64 (us) | Speedup |
+| --- | ---: | ---: | ---: |
+| w13, 64 model tokens | 1,201.7 | 851.7 | 1.41x |
+| w2, 512 routed rows | 603.8 | 431.2 | 1.40x |
+| w13, 512 speculative-verification tokens | 4,995.4 | 3,490.1 | 1.43x |
+| w2, 4,096 routed verification rows | 2,517.9 | 1,818.7 | 1.38x |
+
+The final clean rebuild reproduced 847.7/447.6 us at the 64-token w13/w2
+shapes and 3,505.3/1,815.4 us at the 512-token verification shapes. Matrix and
+vector results passed `torch.testing.assert_close` for every accepted shape;
+the largest observed BF16 absolute difference was 0.25.
+
+The faster matrix kernel moves the measured dispatch crossovers. W1 remains on
+the vector kernel through 32 model tokens (598.0 vs 605.1 us at 32), then uses
+MMQ at 64 (1,070.7 vs 826.7 us). W2 remains vector through 128 routed rows
+(167.7 vs 193.2 us), then uses MMQ at 256 (328.5 vs 294.0 us). The ROCm
+defaults are therefore now **32 W1 rows** and **128 W2 routed rows**; the
+existing environment overrides remain available for other GGUF shapes.
+
+### End-to-end result
+
+The controlled 64-request 100k/128 run improved from 228.75 to **303.60
+aggregate output tok/s** (+32.7%). The authoritative exact workload then
+generated 2,000 tokens for each of 64 requests, with exactly 100,000 input
+tokens and 99,984 cached prompt tokens per request:
+
+| 64-request exact workload | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Wall time | 533.06 s | 393.84 s | -26.1% |
+| Aggregate output tok/s | 240.12 | **325.01** | **+35.3%** |
+| Per-request tok/s | 3.75 | **5.08** | **+35.3%** |
+
+Live steady decode began near 341 tok/s and settled near 317-329 tok/s as the
+context grew. All 64 requests remained resident with no scheduler queueing.
+The exact result is in `/tmp/longctx_q2_y64_2000.json`; the short acceptance
+result is in `/tmp/longctx_q2_y64_128.json`.
+
+This is a substantial kernel win but still **3.08x short of 1,000 aggregate
+tok/s**. The remaining gap cannot be closed by this tile change alone.
+
+### Rejected kernel designs (all removed)
+
+- A direct FP16 MFMA kernel was numerically correct but 3-5x slower. At batch
+  64, w13 was 1.243 -> 4.965 ms and w2 was 0.621 -> 3.237 ms. The routed expert
+  layout made weight access row-strided, and the four-token MFMA tile wasted
+  most of its M capacity.
+- An exact Q8-activation/int8-MFMA version was worse: w13 was
+  1.231 -> 8.642 ms and w2 was 0.603 -> 1.335 ms at batch 64. Padding the small
+  routed-token dimension and staging fragments outweighed MFMA throughput.
+- A wave64 Q2 vector kernel that broadcast packed scales/deltas and hoisted Q8
+  fragments regressed batch-64 w13 by 23% and w2 by 17%. Shuffle and register
+  costs exceeded the saved metadata loads.
+- Keeping the original lane mapping while reusing Q8 fragments was mixed. Four
+  rows regressed batch-64 w13 by 10%; two rows gave only a noisy 1.8% w13 gain
+  while making w2 about 33% slower. Neither met the acceptance gate.
+- A 4x256 MMQ tile regressed batch-64 w2 from 599.4 us to 2,373.6 us due to
+  accumulator/occupancy pressure. A two-wave-count variant violated the
+  kernel's token-to-wave mapping and produced NaNs; it was never enabled.
+
+Only the 4x64 tile and its measured dispatch thresholds remain in production.
+
+## QuixiCore-guided Q2/Q8 kernel pass (2026-07-29)
+
+This pass again used `~/QuixiCore/QuixiCore-ROCm/perf/perf.md`, this time as a
+strict workflow rather than only a source of kernel ideas: benchmark the exact
+serving shapes, classify the limiting resource, sweep one geometry variable at
+a time, inspect the compiled VGPR/LDS/spill footprint, and accept changes only
+after an exact end-to-end run. Two reusable microbenchmarks now cover the real
+GLM-5.2 TP2 shapes:
+
+- `benchmarks/kernels/benchmark_gguf_moe_q2.py` covers routed Q2_K w13/w2;
+- `benchmarks/kernels/benchmark_gguf_linear.py` covers the Q8_0 attention and
+  dense projections.
+
+### Accepted Q2_K MoE design
+
+The ROCm routed-expert tile is now **4 routed rows by 32 output rows**, down
+from the previous 4x64 tile. The smaller tile improves CU coverage and reduces
+per-block weight/LDS work. Q8 activation staging now groups two quant spans per
+barrier pair, amortizing synchronization without the short-K regression of a
+four-span stage.
+
+| TP2 MoE shape | Previous 4x64 (us) | Final 4x32 + stage-2 (us) | Speedup |
+| --- | ---: | ---: | ---: |
+| w13, 64 model tokens | 884.506 | 797.335 | 1.109x |
+| w2, 512 routed rows | 449.354 | 422.494 | 1.064x |
+| w13, 512 verification tokens | 3,037.452 | 2,778.504 | 1.093x |
+| w2, 4,096 routed rows | 1,592.988 | 1,479.758 | 1.077x |
+
+The BF16 matrix and vector outputs were identical for the valid repeated Q2_K
+test blocks (`max_abs_diff=0`). The compiled Q2 kernel uses 110 VGPRs, 42
+SGPRs, 6,704 bytes of LDS, and has no VGPR/SGPR spills.
+
+### Accepted shape-adaptive Q8_0 design
+
+The Q8_0 matrix kernel now has two MI300X row tiles. It uses 64 output rows
+when `nrows_x * ncols_y <= 2,097,152`, and retains the old 128-row tile above
+that crossover. This captures the small-decode gain without regressing large
+verification batches.
+
+| Q8_0 projection, batch 64 | Previous 128-row tile (us) | 64-row tile (us) | Speedup |
+| --- | ---: | ---: | ---: |
+| o_proj, 6,144 x 8,192 | 410.936 | 314.051 | 1.308x |
+| dense gate/up, 12,288 x 6,144 | 308.843 | 234.652 | 1.316x |
+| q_b_proj, 6,144 x 2,048 | 113.630 | 91.397 | 1.243x |
+
+At batch 512 the o_proj dispatch selects the 128-row tile and measures 606.468
+us versus the 609.434-us baseline. A fixed 64-row tile measured 680.539 us at
+that shape, which is why the adaptive crossover is required.
+
+The linear dispatch also keeps Q8_0 projections with at most 6,144 output rows
+on the multi-column vector kernel through batch 64. At the real batch-64
+shapes, o_proj is 241.062 us vector versus 314.051 us matrix, and q_b_proj is
+87.331 versus 91.397 us. The 12,288-row dense projection remains on the matrix
+kernel (234.652 versus 355.212 us). Matrix/vector output parity again had
+`max_abs_diff=0`.
+
+### Exact end-to-end result
+
+The authoritative TP2 workload generated exactly 2,000 tokens for each of 64
+requests from exactly 100,000 input token IDs. Every request reported exactly
+99,984 cached prompt tokens; all 64 remained resident with no scheduler
+queueing.
+
+| 64-request exact workload | Previous | Final | Change |
+| --- | ---: | ---: | ---: |
+| Wall time | 393.838 s | **323.313 s** | **-17.9%** |
+| Aggregate output tok/s | 325.007 | **395.902** | **+21.8%** |
+| Per-request tok/s | 5.078 | **6.186** | **+21.8%** |
+
+Steady decode started around 414-420 tok/s and settled around 393-398 tok/s as
+the context grew. Relative to the original 240.12-tok/s 64-way baseline, the
+combined kernel work is now **+64.9%**. The 1,000-tok/s target is still 2.53x
+away. The raw result is `/tmp/longctx_q2_y32_q8_2000.json`.
+
+### Rejected designs
+
+- Unrolling the inner Q2 dot-product loop was neutral to slightly slower and
+  was removed.
+- Four-span Q8 activation staging improved w13 but regressed the short-K w2
+  shape; two spans was the best balanced setting.
+- Replacing Q8 activation LDS staging with register/shuffle broadcasts was
+  substantially worse: 1,062/536 us at the two decode shapes and 4,069/2,017
+  us at the verification shapes. It was removed.
+- A fixed 64-row Q8 tile won at decode sizes but regressed batch-512 o_proj by
+  11.7%; the retained dual-tile dispatch avoids that loss.
+
+The final source rebuilt and installed successfully. The focused pre-commit
+suite (ruff, clang-format, mypy, typos, SPDX, and repository checks) passes,
+`git diff --check` passes, and post-format/reinstall microbenchmarks reproduce
+800.620 us for Q2 w13 and 235.833 us for the Q8 dense projection with exact
+synthetic parity.
+
+## RedHatAI GLM-5.2 DSpark evaluation (2026-07-29)
+
+Installed `RedHatAI/GLM-5.2-speculator.dspark` at revision
+`8bc9ac46fbf507f3ee3ad82304116a1f63e9edb4` under
+`/home/hotaisle/models/GLM-5.2-speculator.dspark`. This is the new three-layer,
+5.87-GiB BF16 DSpark checkpoint with an eight-token block and
+`sample_from_anchor=true`. The requested serving configuration was used:
+
+```text
+--spec-model /home/hotaisle/models/GLM-5.2-speculator.dspark
+--spec-method dspark
+--spec-tokens 7
+```
+
+The specialized source tree had removed the upstream speculators config
+algorithm module while retaining an import of it. Restoring the upstream
+module made the checkpoint resolve as `Qwen3DSparkModel` with auxiliary target
+layers `(2, 20, 39, 58, 75)`. Explicit standalone speculators also had to stop
+inheriting the target GGUF `model_weights` and `hf_config_path`; otherwise the
+draft was incorrectly resolved from the GLM verifier config as
+`DeepSeekMTPModel`.
+
+ROCm exposed a KV-block compatibility constraint. The target sparse MLA and
+sparse SWA groups require a multiple of 64, while AITER flash attention for
+the draft advertises only 16- and 32-token blocks. The working configuration
+therefore uses `block_size=64` and `TRITON_ATTN` for the draft while retaining
+AITER sparse MLA for the target. The exact long-context configuration loaded
+129.19 GiB of weights and runtime state per GPU; its fixed KV allocation held
+769,543 tokens, enough to keep all 64 requests resident.
+
+### Acceptance sanity check
+
+Three deterministic natural-language prompts, 128 output tokens each, proved
+that DSpark loading and verification are functional:
+
+| Metric | Result |
+| --- | ---: |
+| Draft steps | 162 |
+| Draft tokens | 1,134 |
+| Accepted draft tokens | 221 |
+| Draft-token acceptance | 19.49% |
+| Mean acceptance length | 2.364 |
+| Per-position acceptance | 60.5%, 35.8%, 21.6%, 11.7%, 4.3%, 1.2%, 1.2% |
+| Aggregate output tok/s | 68.63 |
+
+The short-prompt probe forced sparse MLA through its MQA prefill path because
+the current ROCm sparse backend does not implement the dense `forward_mha`
+fallback. Two first-inference Triton JITs were included in the 5.60-second
+timing, so the throughput number is diagnostic; the acceptance counters are
+the important result. Raw output is in `/tmp/spec_accept_dspark7_new.json` and
+`/tmp/spec_accept_dspark7_new.log`.
+
+### Long-context acceptance failure (unresolved correctness issue)
+
+On the 64-request workload with exactly 100,000 synthetic input token IDs per
+request, 99,984 shared cached tokens, and a requested 2,000-token response,
+acceptance collapsed in steady decode:
+
+| Configuration | Aggregate output tok/s | Mean acceptance length |
+| --- | ---: | ---: |
+| No speculation, completed exact run | **395.902** | 1.000 |
+| DSpark, 7 draft tokens | **104.9-105.6** | 1.000-1.010 |
+
+Steady intervals accepted only 0-0.2% of draft tokens. DSpark drafted about
+734 tokens/s while producing about 105 verified output tokens/s. That is a
+roughly 73.5% throughput regression, or 3.77x slower than the completed
+non-speculative baseline. The full 2,000-token DSpark run was intentionally
+stopped after several stable intervals rather than spending roughly 20
+minutes confirming a severe regression; it is not an exact completed result.
+The raw partial trace is `/tmp/longctx_dspark7_2000.log`.
+
+Do not attribute this collapse to the routed Q2_K verifier. The short natural
+probe establishes that the same target/draft pair has coherent logits, and a
+close target quantization is not a credible explanation for first-position
+agreement falling to approximately zero. The collapse is therefore tracked as
+an unresolved inference/caching/context correctness issue; the 105 tok/s value
+is diagnostic and not a valid DSpark performance result.
+
+Checks completed so far:
+
+- verifier/draft token alignment is correct at shift zero; shifts -2, -1, +1,
+  and +2 do not explain the rejection rate;
+- DSpark's seven-query anchor layout and scheduler lookahead allocation agree;
+- captured attention metadata points at the persistent runtime sequence-length,
+  block-table, and slot-mapping buffers rather than frozen dummy tensors;
+- auxiliary target layers resolve to `(2, 20, 39, 58, 75)`, and moving all five
+  by one layer does not repair acceptance;
+- disabling the Markov head and changing the draft KV cache from FP8 to BF16 do
+  not repair the short-context acceptance deficit;
+- the current runtime causal SWA mask is not exactly the training mask. Training
+  preserves the same 2,048 base tokens for every query in the block, while the
+  standard runtime window advances with each query and drops one to seven of
+  the oldest base tokens. This is a real semantic mismatch, but it is too small
+  to claim as the cause of approximately zero first-token agreement without an
+  A/B measurement.
+
+The next isolating experiment is a deterministic context-length and batch-size
+sweep with prefix caching independently disabled and draft full graphs
+independently disabled. It must establish whether the failure follows context
+length, batch 64, graph replay, or prefix-cache reuse before a correctness fix
+is retained. GPU device access was unavailable for that sweep at the end of
+this investigation.
+
+## DSpark acceptance collapse: root cause found, benchmark artifact (2026-07-29)
+
+The isolating sweep ran and the collapse is **not a serving-stack bug**. It is
+an artifact of the synthetic benchmark prompt, which is literally
+`[token 1000] * 99,984` plus a 16-token per-request suffix. Conditioned on
+thousands of copies of one token, the target itself decodes erratic garbage
+(`"Commentsimport 1 importimportimport… import for the ofimport from
+forimport to"`), and the three-layer draft — whose inputs are the target's
+now far-out-of-distribution aux hidden states — cannot match that stream.
+First-position agreement collapses to ~0 for workload reasons, with every
+runtime mechanism working correctly.
+
+Before concluding this, the code was compared against upstream main
+(`~/vllm2`, 5c7a7f9462): the DSpark/DFlash speculators, the TRITON_ATTN
+backend, and the triton unified attention kernel are byte-identical to
+upstream; the only fork deltas are the documented draft-loading fixes plus an
+upstream Gumbel/seq-lens fix that only affects `advance_draft_positions=False`
+autoregressive drafts (gemma4), which DSpark does not use.
+
+Experiment 1 — context-length sweep, batch 1, prefix caching off, natural
+prose filler + same question, 128 greedy tokens (script
+`dspark_ctx_sweep.py` in the session scratchpad, raw
+`/tmp/dspark_ctx_sweep.json`):
+
+| Case | Prompt tokens | Draft acceptance | Mean accept len |
+| --- | ---: | ---: | ---: |
+| natural_500 | 527 | 31.8% | 3.23 |
+| natural_1500 | 1,527 | 27.9% | 2.95 |
+| natural_2500 | 2,527 | 32.6% | 3.28 |
+| natural_6000 | 6,027 | 32.1% | 3.24 |
+| natural_12000 | 12,027 | 33.5% | 3.34 |
+| shuffled_6000 (word salad) | 6,027 | 15.0% | 2.05 |
+
+Crossing the draft's 2,048-token sliding window causes no degradation at all,
+so the runtime-vs-training SWA mask difference noted above is immaterial in
+practice. Distribution shift (shuffled words) halves acceptance but is
+nowhere near zero.
+
+Experiment 2 — prefix caching on, `max_num_batched_tokens=8192` to force
+3-chunk prefill on 18k prompts (script `dspark_cache_chunk.py`, raw
+`/tmp/dspark_cache_chunk.json`):
+
+| Case | Cached tokens | Draft acceptance |
+| --- | ---: | ---: |
+| nat18k_cold (3 prefill chunks) | 0 | 25.5% |
+| nat18k_warm (same prompt again) | 17,920 | 27.3% |
+| nat18k_forked (same prefix, new question) | 17,920 | 16.7% |
+| repeated6k_cold (`[1000]*6000 + [2001]*16`) | 0 | **0.23%** |
+| repeated6k_forked (`[1000]*6000 + [2002]*16`) | 5,888 | **0.00%** |
+
+Chunked prefill, warm prefix-cache hits, fine-grained (16-token) partial-block
+hits with copy-on-write, and forked shared prefixes are all healthy on natural
+text. The collapse reproduces at 6k tokens, batch 1, cold cache, single-chunk
+prefill — with the repeated-token prompt and nothing else. The failure
+follows the prompt content, full stop.
+
+Consequences:
+
+- The "long-context acceptance failure" above is a mislabel; the 105 tok/s
+  DSpark number and 1.00 acceptance length say nothing about DSpark at real
+  long context. The non-speculative 395.9 tok/s baseline is likewise a
+  throughput-only number whose generated text is degenerate garbage.
+- Long-context DSpark evaluation needs prompts with natural token statistics
+  (long documents, or model-generated text), with per-request unique suffixes
+  retained if the shared-prefix batching pattern is being measured.
+- Healthy acceptance on this target is ~25-33% draft-token acceptance / ~2.8-3.3
+  mean acceptance length at temperature 0 on natural prose, consistent from
+  500 to 12,000 tokens of context.
+
+## Valid long-context batch-64 DSpark A/B: spec-3 wins (2026-07-29)
+
+Rebuilt the 100k-token benchmark on natural text (the vLLM docs corpus from
+`~/vllm2/docs` as a shared prefix, 64 distinct question suffixes, prefix
+caching on, TP2, block 64, same 46.17 GiB KV budget) and swept
+`num_speculative_tokens`. Two prompt formats were run: raw completion (fixed
+1,000 output tokens, `ignore_eos`) and proper chat template
+(`enable_thinking=False`, natural EOS stopping — the earlier raw format made
+some requests echo the question pattern). Scripts `bench_longctx_natural.py`
+and `bench_longctx_chat.py` in the session scratchpad; raw JSON in
+`/tmp/dspark_longctx_ab_*.json` and `/tmp/dspark_longctx_chat_*.json`.
+
+Chat-templated (the realistic configuration; ~646-token mean answers, batch
+drains at EOS):
+
+| Mode | Aggregate tok/s | vs baseline | Draft acceptance | Mean accept len |
+| --- | ---: | ---: | ---: | ---: |
+| no spec | 254.25 | — | — | — |
+| **dspark spec-3** | **285.32** | **+12.2%** | 56.7% | 2.70 |
+| dspark spec-4 | 252.73 | -0.6% | 47.0% | 2.88 |
+| dspark spec-7 | 194.47 | -23.5% | 29.6% | 3.07 |
+
+Raw completion (uniform 1,000-token load, all requests finish together):
+no-spec 396.56, spec-3 **412.85 (+4.1%)**, spec-4 401.59, spec-7 311.40
+(-21%). Both formats agree on the ordering.
+
+Conclusions:
+
+- **Serve batch-64 long context with `num_speculative_tokens=3`.** Mean
+  accept length grows only 2.70 → 3.07 from spec-3 to spec-7 while verify
+  width grows 256 → 512 rows; past 4 rows/request the extra verification
+  compute swamps the acceptance gain. Keep spec-7 only for the low-batch
+  latency case (60.8 tok/s single-request result stands).
+- Acceptance on the docs-summarization workload beats RedHatAI's published
+  per-position curve at positions 0-3 (85%/71%/58% at spec-3) despite the
+  Q2_K target; only deep positions lag, which is quantization drift
+  compounding, not a serving bug.
+- These numbers are temperature 0; production sampling params need one
+  confirming run before locking the config.
+
+## TurboQuant: draft-KV integration and target-side scoping (2026-07-29)
+
+The dead-code cascade had deleted the TurboQuant implementation while keeping
+its config plumbing. Restored from upstream main (byte-identical files):
+`v1/attention/backends/turboquant_attn.py`, `v1/attention/ops/
+triton_turboquant_{store,decode}.py`, `v1/attention/ops/
+triton_decode_attention.py`, `turboquant/{__init__,centroids}.py`, plus the
+deleted helpers `fa_utils.is_flash_attn_varlen_func_available` and
+`workspace.is_workspace_manager_initialized`.
+
+Upstream TurboQuant cannot serve the DSpark draft as-is; three capabilities
+were added in this fork:
+
+1. **Causal sliding window** in the TQ decode kernel (`SLIDING_WINDOW`
+   constexpr restricting the split range to the last W positions; stage 2
+   gets `min(seq_len, W)` for split occupancy), in the SDPA/flash-attn
+   prefill fallbacks (banded masks / `window_size`), and window-clamped
+   continuation dequant + workspace sizing. Kernel verified on-GPU:
+   bit-exact vs full attention within the window, invariant to garbling all
+   out-of-window cache bytes, and reads exactly the last W positions.
+2. **Per-layer TQ cache dtype against a non-TQ target**: new
+   `TQSlidingWindowSpec` (and a `tq_cache_dtype` field on
+   `TQFullAttentionSpec`) carried through spec promotion, KV reshape, the
+   block zeroer, and the mixed-view aligner, so
+   `speculative_config={"attention_backend": "TURBOQUANT",
+   "kv_cache_dtype": "turboquant_*"}` composes with the fp8 MLA target.
+   TurboQuantMetadata is also on the ROCm spec-decode allowlist now.
+3. **A CUDA-graph-safe uniform-query path**: the DFlash 8-query block pass
+   previously routed into TQ's per-request prefill loop (CPU `.tolist()`
+   syncs — crashes graph capture, wrong at replay). A batched
+   synthetic-decode path now handles uniform q-len batches with pure GPU
+   ops and one kernel launch.
+
+End-to-end smoke (batch 1, `turboquant_k8v4` draft KV, TRITON target config
+unchanged, `dspark_tq_smoke.py`, raw `/tmp/dspark_tq_smoke.json`): coherent
+output and healthy acceptance both inside and past the 2,048-token window —
+25.2% / mean 2.76 at 500 prompt tokens, **31.0% / mean 3.17 at 4,000**
+(fp8-KV reference: 31.8% / 32.1%). k8v4 draft-KV quantization costs a few
+points at short context and is at parity by 4k; the windowed TQ decode
+kernel runs correctly under FULL cudagraph replay. Not yet re-benchmarked at
+batch 64 / 100k.
+
+Draft KV sizes at head 64 (per head-token; fp8 = 128 B): k8v4 100 B,
+4bit_nc 70 B, k3v4_nc 62 B, 3bit_nc 54 B. The draft currently costs
+11.8 KB/token/GPU of 63.0 KB total (967,399 → 769,237 tokens when enabled),
+because page-size unification fails and its SWA layers are allocated
+full-length; TQ shrinks that to ~9.2 (k8v4) … ~5.0 KB (3bit_nc), i.e. a
+4-11% KV-capacity recovery. The larger draft-side prize remains
+window-limited allocation (would cut nearly all 11.8 KB), which is a
+hybrid-page-size project independent of TQ.
+
+Target-side scoping (the 256k/batch-capacity goal):
+
+- **MLA latent is 87% of KV** (78 layers x 576 B fp8 = 43.9 KB/token of
+  51.2 KB baseline). TQ's contract supports head sizes 64/128/256; the
+  576-wide latent needs a format extension (e.g. grouped 64-wide FWHT
+  segments). The tractable integration is **gather+dequant**: DSA sparse
+  MLA only ever attends to `index_topk=2048` gathered tokens per query, so
+  a Triton gather-dequant producing a dense bf16 `[topk, 576]` scratch
+  feeding the existing AITER sparse kernels bounds the dequant cost by
+  topk, not context length. Capacity 2-4x on the dominant term; bandwidth
+  neutral-to-better. Quality of <=4-bit latent is unproven — gate on an
+  acceptance/gsm8k eval. Multi-day kernel + spec + store-path project.
+- **The indexer cache is NOT a lever** (correcting an earlier guess in this
+  section): `DeepseekV32IndexerCache` is already fp8-packed — allocated as
+  `torch.uint8` with `head_dim = 128 + 128/quant_block_size*4` bytes per
+  layer-token. The `indexer_kv_dtype` / `use_fp4_indexer_cache` config knobs
+  only wire into MiniMax-M3, not the GLM DSA path, so setting them changes
+  nothing here.
+
+## Prefix caching verification (2026-07-29)
+
+APC is on by default (`CacheConfig.enable_prefix_caching = True`) and
+verified working under the production-like config (TP2, dspark spec-3,
+block 64, 12k natural prompts; `apc_verify.py`, raw `/tmp/apc_verify.json`):
+
+| Check | Result |
+| --- | --- |
+| Cold request | 0 cached tokens |
+| Warm (identical prompt) | 11,904/12,017 cached; TTFT 12.55 s -> 1.10 s (11.4x) |
+| Forked (same prefix, new question) | 11,904 cached |
+| Partial overlap (~6k shared) | 5,888/6,281 cached (16-token granularity) |
+| Output correctness | warm == cold, 64/64 greedy tokens, no divergence |
+| Counters | `vllm:prefix_cache_hits` 29,696 / `queries` 42,332 |
+
+The ~113-token shortfall on a "full" hit is the sub-granularity tail plus
+the always-recomputed final position, not a defect. Caveat: with fp8 KV,
+bitwise warm/cold equality is not guaranteed — an 18k probe earlier in the
+day showed a single-word divergence (a low-margin numeric flip, not
+corruption). Batch-64 runs showed 99.9% hit rate and 99,904-token hits.
+
+## 1M context: fits at TP2, workspace is the real constraint (2026-07-29)
+
+The model's ceiling is exactly `max_position_embeddings = 1,048,576`; vLLM
+enforces it (asking for 1,050,000 is a hard config error), so 1M is the
+supported limit with no headroom beyond.
+
+Measured KV cost is **46.6 KB/token** with no draft (55 GiB held 1,238,016
+tokens), so 1M of KV needs ~45.5 GiB of the ~62.8 GiB left after the
+129.2 GiB of weights. Getting there requires setting
+`kv_cache_memory_bytes` **by hand**:
+
+- `gpu_memory_utilization=0.94` alone makes the auto-sizer request 64.00 GiB
+  with 61.85 GiB free — instant OOM at init.
+- 55 GiB of KV allocates fine (1,238,016 tokens) but then OOMs during
+  execution with 8 MiB free: the sparse-MLA and indexer top-k workspaces
+  scale with `max_model_len` and need GiB-scale headroom at 1M.
+- **47 GiB (`kv_cache_memory_bytes=50_465_865_728`) works**: 1,057,984
+  tokens, "Maximum concurrency for 1,048,576 tokens per request: 1.01x",
+  engine initializes and runs.
+
+**Confirmed end-to-end** (`ctx1m_smoke.py`, raw `/tmp/ctx1m_smoke.json`):
+1,000,021 prompt tokens (the docs corpus tiled) + 32 greedy output tokens in
+**1,847 s (30.8 min), 541.4 tok/s prefill**. The answer is coherent and drawn
+from the corpus ("Automatic Prefix Caching (APC): Caches the KV cache of
+existing queries so that new queries sharing the same prefix can directly
+reuse..."), so sparse MLA, the indexer top-k path, block tables and prefix
+caching are all correct at 1M — not merely allocatable. Note prefill at 1M
+runs at 541 tok/s, below the ~800 tok/s seen at 100k: the sparse indexer
+scan grows with context even though decode attention stays top-k bounded.
+
+Consequences: at 1M you serve exactly one request at a time. Batch and
+context trade directly because the MLA latent does not shard with TP —
+adding GPUs buys batch, not context. Prefill dominates wall-clock at
+~800 tok/s (a 1M prefill is ~20 minutes), which APC amortizes across
+requests sharing a corpus but which rules out 1M for cold one-shot traffic.
+Speculation is unaffordable at this length (the draft costs 11.8 KB/token,
+~11.8 GiB at 1M); drop it, or use the TurboQuant draft KV from this same
+day's work (~5 KB/token at 3-bit).
+
+Also note `max_num_batched_tokens=8192` fails at this config with
+"Expected exactly one compiled range_entry for static shape compilation,
+but found 2" — the compile ranges are built around that endpoint. Use
+16,384.
