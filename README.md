@@ -20,6 +20,17 @@ KV. 1M-token context is available on 4+ GPUs.</sub>
 
 ---
 
+## ⚡ Made possible by the [QuixiCore Kernel Library](https://github.com/QuixiAI/QuixiCore-rocm)
+
+The throughput above is not vLLM's stock ROCm path. It comes from
+**[QuixiCore-rocm](https://github.com/QuixiAI/QuixiCore-rocm)** — hand-tuned
+gfx942 kernels for the operations this model actually spends its time in: the
+Q2_K format layer, MFMA quantized GEMMs, MoE grouped GEMM, and MLA decode.
+Without those kernels a 244 GiB routed-MoE GGUF simply does not serve at these
+rates on two GPUs.
+
+---
+
 **QuixiAI/SlimServe** — a vLLM fork stripped down and specialized to serve
 [**QuixiAI/GLM-5.2-Vision-GGUF**](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF)
 as efficiently as possible on 2–8 AMD MI300X GPUs.
@@ -31,7 +42,8 @@ use [upstream vLLM](https://github.com/vllm-project/vllm).
 
 What the specialization buys:
 
-- HIP/MFMA GGUF kernels for the routed Q2_K/Q4_K MoE and dense projections
+- [QuixiCore-rocm](https://github.com/QuixiAI/QuixiCore-rocm) HIP/MFMA kernels
+  for the routed Q2_K/Q4_K MoE and dense projections
 - DSpark speculative decoding against a GGUF-quantized verifier
 - TurboQuant compressed KV for the draft model (sliding-window support added here)
 - AITER sparse-MLA (DSA) attention with a working 1M-token path
@@ -452,6 +464,10 @@ We stood on the shoulders of giants.
   is carved out of. Every good idea in the serving path is theirs; the
   specialization is ours.
 - **[zAI](https://huggingface.co/zai-org)** — for GLM-5.2 itself.
+- **[QuixiCore-rocm](https://github.com/QuixiAI/QuixiCore-rocm)** — the kernel
+  library this server stands on. The Q2_K format layer, MFMA quantized GEMMs,
+  MoE grouped GEMM and MLA decode kernels are what make the numbers above
+  possible.
 - **[Hot Aisle](https://hotaisle.xyz)** — for outstanding MI300X servers. Every
   number in this README was measured on their hardware. Bare-metal MI300X that
   actually behaves like the spec sheet, with the ROCm stack in good shape and
