@@ -1,5 +1,7 @@
 # SlimServe
 
+By Eric Hartford, QuixiAI
+
 ### With SlimServe you can run GLM-5.2-Vision at
 
 | | 1 request | 16 concurrent |
