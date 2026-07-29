@@ -431,9 +431,7 @@ text with per-request unique suffixes.
 - 2–8 AMD MI300X (gfx942), ROCm with AITER
 - Python 3.12 via `uv`; all commands go through `.venv/bin/python`
 - Model weights and the `mmproj` vision tower under `~/models/GLM-5.2-Vision-GGUF/`
-- `config.json` + tokenizer from the FP8 repo (`--hf-config-path`), since GGUF
-  alone does not carry the multimodal config
-- The DSpark draft checkpoint under `~/models/GLM-5.2-speculator.dspark`
+- The DSpark draft checkpoint, downloaded automatically on first run
 
 ## Building
 
