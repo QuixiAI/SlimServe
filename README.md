@@ -12,11 +12,12 @@ Aggregate throughput, by concurrent requests:
 | | 1 | 4 | 8 | 16 | 32 | 64 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **2× MI300X** | **82** | **141** | **176** | **260** | **297** | **408** |
-| **4× MI300X** | **104** | … | … | **371** | … | … |
+| **4× MI300X** | **104** | **142** | **260** | **270** | **384** | **475** |
 | **8× MI300X** | **109** | … | … | **488** | … | … |
 
-<sub>tok/s aggregate. Cells marked … are still being measured; the 4×/8× rows
-will be completed from the same sweep as the 2× row.</sub>
+<sub>Aggregate tok/s — total tokens generated divided by the time to drain the
+whole batch. Per-request rates and latencies are in
+[Performance](#performance). The 8× row is still being measured.</sub>
 
 ### …while supporting up to 512k tokens of context
 
@@ -332,38 +333,61 @@ traffic. Use 4 GPUs if 1M matters to you.
 Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
 2,000 output tokens each, DSpark spec-3 + TurboQuant draft KV, temperature 0:
 
+**2× MI300X**
+
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
 | ---: | ---: | ---: | ---: |
-| 1 | 87.0 | 87.0 | 23 s |
-| 2 | 112.5 | 56.7 | 36 s |
-| 4 | 149.7 | 38.1 | 53 s |
-| 8 | 193.4 | 24.8 | 80 s |
-| 16 | 283.9 | 18.4 | 110 s |
-| 32 | 322.3 | 10.6 | 191 s |
+| 1 | 81.6 | 81.6 | 25 s |
+| 4 | 141.3 | 38.9 | 51 s |
+| 8 | 176.2 | 23.6 | 83 s |
+| 16 | 260.2 | 17.7 | 113 s |
+| 32 | 296.9 | 10.0 | 204 s |
+| 64 | 407.9 | 7.0 | 288 s |
 
-How to read this: **aggregate throughput scales 3.7× from 1 to 32 concurrent
-requests, while each individual request gets 8.2× slower.** Decode at 100k
-context is memory-bandwidth bound — every step re-reads a large KV working set —
-so extra concurrency mostly contends rather than filling idle compute.
+**4× MI300X**
+
+| Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 104.3 | 104.3 | 19 s |
+| 4 | 141.8 | 41.6 | 48 s |
+| 8 | 260.4 | 36.2 | 56 s |
+| 16 | 270.0 | 24.9 | 80 s |
+| 32 | 384.4 | 15.3 | 132 s |
+| 64 | 474.8 | 10.5 | 188 s |
+
+How to read this: on 2 GPUs **aggregate throughput scales 5× from 1 to 64
+concurrent requests, while each individual request gets 12× slower.** Decode at
+100k context is memory-bandwidth bound — every step re-reads a large KV working
+set — so extra concurrency mostly contends rather than filling idle compute.
 
 Pick a concurrency limit from your latency target, not from peak throughput:
 
-- **Interactive / chat** (a user waiting on the answer): 1–4. At 87 tok/s a
-  single request is faster than most people read; at 4 concurrent you still get
-  38 tok/s each.
-- **Balanced serving**: 8–16. Concurrency 16 captures 88% of peak aggregate
-  throughput at 18 tok/s per request — the best overall trade.
-- **Batch / offline** (nobody is watching): 32. You gain only 14% aggregate
-  over concurrency 16 while nearly doubling latency, so go here only when
-  total completion time is all that matters.
+- **Interactive / chat** (a user waiting on the answer): 1–4. A single request
+  runs at 82 tok/s on 2 GPUs (104 on 4), faster than most people read; at 4
+  concurrent you still get ~39 tok/s each.
+- **Balanced serving**: 8–16. Concurrency 16 on 2 GPUs gives 64% of the peak
+  aggregate at 18 tok/s per request — usually the best overall trade.
+- **Batch / offline** (nobody is watching): 32–64. Peak aggregate lives here,
+  but per-request rates fall to 7–10 tok/s, so only go there when total
+  completion time is all that matters.
 
-Prefill of the 100k prefix took 129.6 s (**772 tok/s**) and is paid once thanks
-to prefix caching — every later request against the same corpus skips it.
+Prefill of the 100k prefix took 130 s on 2 GPUs (**771 tok/s**) and 83 s on 4
+(**1,207 tok/s**), and is paid once thanks to prefix caching — every later
+request against the same corpus skips it.
+
+Caveats: aggregate is total tokens divided by time to drain the whole batch, so
+it includes the tail where the last requests finish. Requests are admitted in
+waves rather than all at once, which is why wall time runs above median latency
+at high concurrency. Individual cells carry a few percent of run-to-run
+variance.
 
 ### Parallelism: TP vs DP vs EP
 
 Same workload (100k shared prefix, 2k outputs, Q2_K, spec-3), 4 GPUs for the
-TP4/DP rows. The TP2 row is the table above, shown for scale:
+TP4/DP rows. These four rows come from one separate sweep run at
+`--max-seqs 32`, so the absolute values differ slightly from the tables above
+(measured at `--max-seqs 64`); what matters here is the comparison *between*
+parallelism modes, which is internally consistent:
 
 | Config | GPUs | 1 request | 16 concurrent | Prefill |
 | --- | ---: | ---: | ---: | ---: |
