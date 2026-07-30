@@ -14,6 +14,8 @@ from typing import Any
 
 import numpy as np
 import torch
+
+from vllm.compilation.lazy_compile import lazy_compile
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import GELUActivation
@@ -60,7 +62,7 @@ def get_rope_shape_decorate(func):
 
 
 @get_rope_shape_decorate
-@torch.compile(dynamic=True)
+@lazy_compile(dynamic=True)
 def get_rope_shape(org, interpolation_mode, shape):
     return (
         F.interpolate(
