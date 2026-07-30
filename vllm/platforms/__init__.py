@@ -34,6 +34,32 @@ def vllm_version_matches_substr(substr: str) -> bool:
 
 
 
+def cuda_platform_plugin() -> str | None:
+    is_cuda = False
+    logger.debug("Checking if CUDA platform is available.")
+    try:
+        from vllm.utils.import_utils import import_pynvml
+
+        pynvml = import_pynvml()
+        pynvml.nvmlInit()
+        try:
+            is_cuda = pynvml.nvmlDeviceGetCount() > 0
+            if not is_cuda:
+                logger.debug("CUDA platform is not available because no GPU is found.")
+            else:
+                logger.debug("Confirmed CUDA platform is available.")
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as e:
+        logger.debug("Exception happens when checking CUDA platform: %s", str(e))
+        if "nvml" not in e.__class__.__name__.lower():
+            # If the error is not related to NVML, re-raise it.
+            raise e
+        logger.debug("CUDA platform is not available because: %s", str(e))
+
+    return "vllm.platforms.cuda.CudaPlatform" if is_cuda else None
+
+
 def rocm_platform_plugin() -> str | None:
     is_rocm = False
     logger.debug("Checking if ROCm platform is available.")
@@ -59,6 +85,7 @@ def rocm_platform_plugin() -> str | None:
 
 builtin_platform_plugins = {
     "rocm": rocm_platform_plugin,
+    "cuda": cuda_platform_plugin,
 }
 
 

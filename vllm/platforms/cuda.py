@@ -132,6 +132,14 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
+        elif device_capability.major == 8:
+            # Ampere: dense MLA via Triton; sparse MLA (DSA) via the vendored
+            # QuixiCore-CUDA kernels — the sm90+ sparse backends (FlashMLA,
+            # FlashAttn-MLA, FlashInfer-MLA) do not run on sm80/sm86.
+            return [
+                AttentionBackendEnum.TRITON_MLA,
+                AttentionBackendEnum.QUIXICORE_MLA_SPARSE,
+            ]
         else:
             return [
                 AttentionBackendEnum.FLASH_ATTN_MLA,

@@ -719,6 +719,10 @@ class Indexer(nn.Module):
         self.n_head_scale = self.n_head**-0.5
         self.use_fused_indexer_q = (
             current_platform.is_cuda()
+            # The fused kernel emits Triton `fp8e4nv`, which does not exist below
+            # sm89 ("supported fp8 dtypes are ('fp8e4b15', 'fp8e5')"). On Ampere
+            # fall back to the split quantize path.
+            and current_platform.has_device_capability(89)
             and self.quant_block_size == self.head_dim
             and self.head_dim == 128
             and self.rope_dim == 64

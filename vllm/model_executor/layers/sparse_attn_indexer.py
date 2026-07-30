@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+from functools import cache
+
 import torch
 
 import vllm.envs as envs
@@ -19,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.quixicore import quixicore_ops
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -40,6 +43,19 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
+
+
+@cache
+def _use_quixicore_mqa_logits() -> bool:
+    """Route indexer MQA logits through the QuixiCore path on Ampere.
+
+    DeepGEMM (the stock CUDA provider of fp8_fp4_*_mqa_logits) is Hopper+
+    only; on sm80/sm86 quixicore_ops supplies the op (native kernel when
+    available, pure-torch reference otherwise).
+    """
+    return current_platform.is_cuda() and not current_platform.has_device_capability(
+        90
+    )
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -475,6 +491,17 @@ def sparse_attn_indexer(
                         cu_seqlen_ks,
                         cu_seqlen_ke,
                     )
+                elif _use_quixicore_mqa_logits():
+                    assert q_scale_slice is None, (
+                        "FP4 indexer Q is not supported on Ampere"
+                    )
+                    logits = quixicore_ops.fp8_mqa_logits(
+                        q_slice_cast,
+                        (k_quant_cast, k_scale_cast),
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
                 else:
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
@@ -576,6 +603,16 @@ def sparse_attn_indexer(
                 seq_lens_xpu,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
+                max_model_len,
+            )
+        elif _use_quixicore_mqa_logits():
+            assert padded_q_scale is None, "FP4 indexer Q is not supported on Ampere"
+            logits = quixicore_ops.fp8_paged_mqa_logits(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
                 max_model_len,
             )
         else:
@@ -747,7 +784,11 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not _use_quixicore_mqa_logits()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."
