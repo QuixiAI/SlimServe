@@ -21,7 +21,7 @@ whole batch. Per-request rates and latencies are in
 access in vLLM's spec-decode rejection sampler during startup profiling; the
 8× row was measured at `--max-seqs 32`, the 2×/4× rows at 64.</sub>
 
-### …while supporting up to 512k tokens of context
+### …while supporting up to 1 Million tokens of context
 
 <sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
 responses, temperature 0, DSpark speculative decoding with TurboQuant draft
