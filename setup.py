@@ -144,7 +144,8 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+        kwa.setdefault("py_limited_api", not is_freethreaded())
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -996,14 +997,16 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    # This fork builds for ROCm only; the other device requirement files
-    # are gone along with their platform support.
+    # This fork builds for ROCm and CUDA only; the other device requirement
+    # files are gone along with their platform support.
     if _no_device():
         requirements = _read_requirements("common.txt")
     elif _is_hip():
         requirements = _read_requirements("rocm.txt")
+    elif _is_cuda():
+        requirements = _read_requirements("cuda.txt")
     else:
-        raise ValueError("Unsupported platform: this build targets ROCm.")
+        raise ValueError("Unsupported platform: this build targets ROCm or CUDA.")
     return requirements
 
 
@@ -1023,6 +1026,8 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
+    # pybind11 module (not stable-ABI): must keep the full SOABI filename.
+    ext_modules.append(CMakeExtension(name="vllm._quixicore_C", py_limited_api=False))
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")

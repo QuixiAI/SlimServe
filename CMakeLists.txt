@@ -1393,6 +1393,53 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 endif()
 
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  #
+  # _quixicore_C extension: QuixiCore-CUDA (ThunderKittens-derived) Ampere
+  # serving kernels vendored under csrc/quixicore/ (see its README.md for
+  # provenance and resync instructions). Plain pybind11 module, called
+  # directly from vllm/quixicore/ rather than through torch.ops — the same
+  # calling convention the ROCm path uses for AITER.
+  #
+  set(VLLM_QUIXICORE_EXT_SRC
+    "csrc/quixicore/tm_cuda/tm_cuda_ext.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_serving.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_elementwise.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_w6.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_moe_quant.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_m4.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_m5.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_m6.cu"
+    "csrc/quixicore/tm_cuda/tm_cuda_mf_followups.cu")
+
+  # sm80 is the floor: the kernels use mma.m16n8k16 and cp.async.
+  cuda_archs_loose_intersection(QUIXICORE_ARCHS
+    "8.0;8.6;8.9;9.0;10.0;11.0;12.0" "${CUDA_ARCHS}")
+  set_gencode_flags_for_srcs(
+    SRCS "${VLLM_QUIXICORE_EXT_SRC}"
+    CUDA_ARCHS "${QUIXICORE_ARCHS}")
+
+  define_extension_target(
+    _quixicore_C
+    DESTINATION vllm
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES ${VLLM_QUIXICORE_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    INCLUDE_DIRECTORIES
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quixicore/quant"
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/quixicore/serving"
+    WITH_SOABI)
+
+  # pybind11 modules need libtorch_python, which define_extension_target
+  # does not link (the stable-ABI extensions must not link it).
+  find_library(QUIXICORE_TORCH_PYTHON_LIB torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
+  if(NOT QUIXICORE_TORCH_PYTHON_LIB)
+    message(FATAL_ERROR "libtorch_python not found for _quixicore_C")
+  endif()
+  target_link_libraries(_quixicore_C PRIVATE ${QUIXICORE_TORCH_PYTHON_LIB})
+endif()
+
 # Must run after the last HIP `define_extension_target` so every extension
 # has registered its sources.
 if (VLLM_GPU_LANG STREQUAL "HIP")

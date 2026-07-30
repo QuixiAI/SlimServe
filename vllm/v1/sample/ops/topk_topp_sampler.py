@@ -41,7 +41,17 @@ def flashinfer_sampler_supported() -> bool:
             "VLLM_USE_FLASHINFER_SAMPLER=0."
         )
         return False
-    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+    try:
+        from vllm.v1.attention.backends.flashinfer import FlashInferBackend
+    except ImportError:
+        # flashinfer is optional and not a dependency of this fork; a capability
+        # probe must degrade to "unsupported", not kill worker startup.
+        logger.info_once(
+            "FlashInfer top-p/top-k sampling unavailable (flashinfer not "
+            "installed); using the PyTorch sampler.",
+            scope="global",
+        )
+        return False
 
     capability = current_platform.get_device_capability()
     assert capability is not None
