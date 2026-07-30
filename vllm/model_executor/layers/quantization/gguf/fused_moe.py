@@ -34,12 +34,12 @@ from .params import (
 from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 
 
-def _moe_vec_row_limit(default: int, env: str) -> int:
+def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     override = os.environ.get(env)
     if override:
         return int(override)
     if not current_platform.is_rocm():
-        return 64
+        return cuda_default
     return default
 
 
@@ -88,9 +88,14 @@ def _fused_moe_gguf(
         w1_vec = vec_ok and (
             not mmq_ok or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1")
         )
+        # On A100 the w2 crossover sits below any batch this serves: forcing the
+        # MMQ tile kernel measured neutral at 8 routed rows and +2.9% / +6.7% at
+        # 32 / 64 (GLM-5.2 Q2_K, TP8, CUDA graphs), so vec never wins for w2.
+        # w1 is left alone -- the same sweep showed MMQ costs it ~3% at batch 1.
         w2_rows = num_tokens * top_k
         w2_vec = vec_ok and (
-            not mmq_ok or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2")
+            not mmq_ok
+            or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2", 0)
         )
 
         sorted_token_ids = expert_ids = num_tokens_post_padded = None
