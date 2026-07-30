@@ -695,11 +695,18 @@ def _resolve_vision_chunk_items(
             # bytes→PIL conversion in media_processor
             if hasattr(data, "media"):
                 image_data = data.media  # type: ignore[union-attr]
-                processed_chunks.append(
-                    VisionChunkImage(type="image", image=image_data, uuid=uuid)
-                )
-            else:
+            elif isinstance(data, dict):
+                # Already a VisionChunk (callers of generate() build it).
                 processed_chunks.append(data)  # type: ignore[arg-type]
+                continue
+            else:
+                # A bare image, e.g. decoded from a data: URL by the chat
+                # parser. The modality was remapped image -> vision_chunk but
+                # nothing wrapped it, and consumers require the TypedDict.
+                image_data = data
+            processed_chunks.append(
+                VisionChunkImage(type="image", image=image_data, uuid=uuid)
+            )
         elif inner_modality == "video":
             # For video, we may need to split into chunks
             # if processor supports it
