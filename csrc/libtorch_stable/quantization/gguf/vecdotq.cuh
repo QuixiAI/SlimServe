@@ -1085,7 +1085,14 @@ static __device__ __forceinline__ void load_tiles_q2_K(
     half2* __restrict__ x_dm, int* __restrict__ x_qh, int* __restrict__ x_sc,
     const int& i_offset, const int& i_max, const int& k,
     const int& blocks_per_row) {
-  const int kbx = k / QI2_K;
+  // A warp spans WARP_SIZE_GGUF/QI2_K = 2 superblocks, so the block offsets
+  // below live in {0,1}. `need_check` clamps only the ROW index i, never the
+  // block offset, so a row holding a single superblock (K == QK_K, which is
+  // what GLM-5.2's w2 becomes at TP8: 2048/8 = 256) reads one block past the
+  // row -- and past the whole tensor on its last row. The consumer loop is
+  // bounded by ncols_x and never uses that data, so clamping is numerically
+  // free and simply avoids the out-of-bounds read.
+  const int kbx = min(k / QI2_K, blocks_per_row - 1);
   const int kqsx = k % QI2_K;
 
   const block_q2_K* bx0 = (const block_q2_K*)vx;
@@ -1103,7 +1110,7 @@ static __device__ __forceinline__ void load_tiles_q2_K(
   }
 
   const int blocks_per_tile_x_row = WARP_SIZE_GGUF / QI2_K;
-  const int kbxd = k % blocks_per_tile_x_row;
+  const int kbxd = min(k % blocks_per_tile_x_row, blocks_per_row - 1);
 
 #pragma unroll
   for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI2_K) {
@@ -1124,7 +1131,8 @@ static __device__ __forceinline__ void load_tiles_q2_K(
       i = min(i, i_max);
     }
     const block_q2_K* bxi =
-        bx0 + i * blocks_per_row + (k % (WARP_SIZE_GGUF / 4)) / (QI2_K / 4);
+        bx0 + i * blocks_per_row +
+        min((k % (WARP_SIZE_GGUF / 4)) / (QI2_K / 4), blocks_per_row - 1);
     x_sc[i * (WARP_SIZE_GGUF / 4) + i / 4 + k % (WARP_SIZE_GGUF / 4)] =
         get_int_from_uint8_aligned(bxi->scales, k % (QI2_K / 4));
   }
