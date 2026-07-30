@@ -13,11 +13,13 @@ Aggregate throughput, by concurrent requests:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **2× MI300X** | **82** | **141** | **176** | **260** | **297** | **408** |
 | **4× MI300X** | **104** | **142** | **260** | **270** | **384** | **475** |
-| **8× MI300X** | **109** | … | … | **488** | … | … |
+| **8× MI300X** | **111** | **212** | **333** | **501** | **607** | † |
 
 <sub>Aggregate tok/s — total tokens generated divided by the time to drain the
 whole batch. Per-request rates and latencies are in
-[Performance](#performance). The 8× row is still being measured.</sub>
+[Performance](#performance). † 8 GPUs at 64 concurrent trips an illegal memory
+access in vLLM's spec-decode rejection sampler during startup profiling; the
+8× row was measured at `--max-seqs 32`, the 2×/4× rows at 64.</sub>
 
 ### …while supporting up to 512k tokens of context
 
@@ -355,6 +357,16 @@ Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
 | 32 | 384.4 | 15.3 | 132 s |
 | 64 | 474.8 | 10.5 | 188 s |
 
+**8× MI300X** (`--max-seqs 32`; see the footnote on the headline table)
+
+| Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 110.7 | 110.7 | 18 s |
+| 4 | 212.3 | 56.1 | 38 s |
+| 8 | 333.1 | 45.1 | 45 s |
+| 16 | 501.4 | 33.5 | 61 s |
+| 32 | 606.5 | 20.3 | 100 s |
+
 How to read this: on 2 GPUs **aggregate throughput scales 5× from 1 to 64
 concurrent requests, while each individual request gets 12× slower.** Decode at
 100k context is memory-bandwidth bound — every step re-reads a large KV working
@@ -371,9 +383,17 @@ Pick a concurrency limit from your latency target, not from peak throughput:
   but per-request rates fall to 7–10 tok/s, so only go there when total
   completion time is all that matters.
 
-Prefill of the 100k prefix took 130 s on 2 GPUs (**771 tok/s**) and 83 s on 4
-(**1,207 tok/s**), and is paid once thanks to prefix caching — every later
-request against the same corpus skips it.
+Prefill of the 100k prefix took 130 s on 2 GPUs (**771 tok/s**), 83 s on 4
+(**1,207 tok/s**) and 64 s on 8 (**1,572 tok/s**), and is paid once thanks to
+prefix caching — every later request against the same corpus skips it. Prefill
+scales far better with GPU count than decode does, because it is compute bound
+while decode is limited by KV bandwidth.
+
+**Where the GPUs actually pay off.** At one request, 8 GPUs are only 36% faster
+than 2 (111 vs 82 tok/s) — a single decode stream cannot use them. Under load
+the gap widens sharply: at 16 concurrent, 8 GPUs deliver 1.9× the throughput of
+2 (501 vs 260), and per-request speed holds up far better (33 vs 18 tok/s).
+Scale out for concurrency and prefill, not for single-stream latency.
 
 Caveats: aggregate is total tokens divided by time to drain the whole batch, so
 it includes the tail where the last requests finish. Requests are admitted in
