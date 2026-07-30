@@ -265,7 +265,11 @@ class quixicore_ops:
         fp8 tensor cores on Ampere). Until then: pure-torch reference.
         """
         if hasattr(_qc(), "fp8_mqa_logits"):
-            return _qc().fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+            k, kscale = kv
+            return _qc().fp8_mqa_logits(
+                q, k, kscale.view(torch.float32).reshape(-1).contiguous(),
+                weights, cu_seqlen_ks, cu_seqlen_ke
+            )
         from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
             fp8_mqa_logits_torch,
         )

@@ -9,6 +9,8 @@
 #include "beam_xcache_kernels.cuh"
 #include "attn_varlen_kernels.cuh"
 #include "slot_mapping_kernels.cuh"
+#include "indexer_logits_mma.cuh"
+#include "indexer_paged_logits.cuh"
 #include "sampling_kernels.cuh"
 #include "spec_beam_kernels.cuh"
 #include <torch/extension.h>
@@ -414,6 +416,67 @@ static void py_compute_slot_mapping(torch::Tensor query_start_loc,
         (int)cp_rank, (int)cp_interleave, (long)pad_id);
 }
 
+// DSA indexer decode logits over the paged fp8 K cache. Replaces
+// fp8_paged_mqa_logits_torch, which loops the batch in Python and calls
+// .item() -- a host sync that CUDA graph capture rejects outright.
+static torch::Tensor py_fp8_paged_mqa_logits(torch::Tensor q,
+        torch::Tensor kv_cache, torch::Tensor weights,
+        torch::Tensor context_lens, torch::Tensor block_tables,
+        int64_t max_model_len) {
+    CK(q); CK(kv_cache); CK(weights); CK(context_lens); CK(block_tables);
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat, "weights must be fp32");
+    TORCH_CHECK(context_lens.scalar_type() == torch::kInt, "context_lens int32");
+    TORCH_CHECK(block_tables.scalar_type() == torch::kInt, "block_tables int32");
+    constexpr int D = 128, NT = 64, NWARP = 4;
+    const int B = (int)q.size(0), H = (int)q.size(2);
+    TORCH_CHECK(q.size(3) == D, "indexer head_dim must be ", D);
+    TORCH_CHECK(q.size(1) == 1, "paged logits path is next_n==1 (decode)");
+    TORCH_CHECK(H <= 16 * NWARP, "H exceeds heads per block");
+    const int block_size = (int)kv_cache.size(1);
+
+    auto out = torch::full({B, (long)max_model_len},
+                           -std::numeric_limits<float>::infinity(),
+                           q.options().dtype(torch::kFloat));
+    const size_t smem = tms::indexer_paged_mqa_logits_smem<D, NT, NWARP>();
+    auto kern = tms::indexer_paged_mqa_logits<D, NT, NWARP>;
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)smem);
+    dim3 grid((unsigned)((max_model_len + NT - 1) / NT), (unsigned)B);
+    kern<<<grid, 32 * NWARP, smem, stream()>>>(
+        reinterpret_cast<const uint8_t*>(q.data_ptr()),
+        reinterpret_cast<const uint8_t*>(kv_cache.data_ptr()),
+        weights.data_ptr<float>(), context_lens.data_ptr<int>(),
+        block_tables.data_ptr<int>(), out.data_ptr<float>(), H, block_size,
+        (int)block_tables.size(1), (int)max_model_len);
+    return out;
+}
+
+// Non-paged (prefill) indexer logits: the tensor-core kernel from
+// indexer_logits_mma.cuh, which was validated standalone but never bound.
+static torch::Tensor py_fp8_mqa_logits(torch::Tensor q, torch::Tensor k,
+        torch::Tensor kscale, torch::Tensor weights, torch::Tensor ks,
+        torch::Tensor ke) {
+    CK(q); CK(k); CK(kscale); CK(weights); CK(ks); CK(ke);
+    constexpr int D = 128, NT = 64, NWARP = 4;
+    const int M = (int)q.size(0), H = (int)q.size(1), N = (int)k.size(0);
+    TORCH_CHECK(q.size(2) == D, "indexer head_dim must be ", D);
+    TORCH_CHECK(H <= 16 * NWARP, "H exceeds heads per block");
+    auto out = torch::empty({M, N}, q.options().dtype(torch::kFloat));
+    const size_t smem = tms::indexer_mqa_logits_mma_smem<D, NT, NWARP>();
+    auto kern = tms::indexer_mqa_logits_mma<D, NT, NWARP>;
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)smem);
+    dim3 grid((unsigned)((N + NT - 1) / NT), (unsigned)M);
+    kern<<<grid, 32 * NWARP, smem, stream()>>>(
+        reinterpret_cast<const uint8_t*>(q.data_ptr()),
+        reinterpret_cast<const uint8_t*>(k.data_ptr()),
+        kscale.data_ptr<float>(), weights.data_ptr<float>(),
+        ks.data_ptr<int>(), ke.data_ptr<int>(), out.data_ptr<float>(), M, N, H);
+    return out;
+}
+
 // GLM-5.2-Vision, bf16 cache. NFP8=0 means every element is read as bf16, so a
 // slot is 576 bf16 = 1152 B. Ampere (sm80) has no native fp8e4nv, so vLLM cannot
 // store an fp8 KV cache there -- this is the geometry that actually runs on A100.
@@ -526,6 +589,13 @@ void init_serving(py::module_& m) {
           py::arg("query_slice_start"), py::arg("query_slice_stop"),
           py::arg("dcp_rank"), py::arg("dcp_world"),
           py::arg("dcp_interleave"), py::arg("compress_ratio"));
+    m.def("fp8_paged_mqa_logits", &py_fp8_paged_mqa_logits,
+          py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
+          py::arg("context_lens"), py::arg("block_tables"),
+          py::arg("max_model_len"));
+    m.def("fp8_mqa_logits", &py_fp8_mqa_logits,
+          py::arg("q"), py::arg("k"), py::arg("kscale"), py::arg("weights"),
+          py::arg("ks"), py::arg("ke"));
     m.def("compute_slot_mapping", &py_compute_slot_mapping,
           py::arg("query_start_loc"), py::arg("positions"),
           py::arg("block_table"), py::arg("slot_mapping"),
