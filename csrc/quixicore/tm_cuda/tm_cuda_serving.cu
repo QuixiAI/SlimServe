@@ -8,6 +8,7 @@
 #include "mla_kernels.cuh"
 #include "beam_xcache_kernels.cuh"
 #include "attn_varlen_kernels.cuh"
+#include "slot_mapping_kernels.cuh"
 #include "sampling_kernels.cuh"
 #include "spec_beam_kernels.cuh"
 #include <torch/extension.h>
@@ -374,6 +375,45 @@ static torch::Tensor py_mla_decode_fp8_partition(torch::Tensor q, torch::Tensor 
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
 }
+// Native replacement for the DSA indexer's Triton metadata kernel.
+static void py_indexer_metadata(torch::Tensor query_start_loc,
+        torch::Tensor uncompressed_seq_lens, torch::Tensor cu_compressed_seq_lens,
+        torch::Tensor row_start_cu, torch::Tensor token_to_seq,
+        torch::Tensor cu_ks, torch::Tensor cu_ke, int64_t query_slice_start,
+        int64_t query_slice_stop, int64_t dcp_rank, int64_t dcp_world,
+        int64_t dcp_interleave, int64_t compress_ratio) {
+    CK(query_start_loc); CK(uncompressed_seq_lens); CK(cu_compressed_seq_lens);
+    CK(row_start_cu); CK(token_to_seq); CK(cu_ks); CK(cu_ke);
+    const int num_reqs = (int)query_start_loc.size(0) - 1;
+    if (num_reqs <= 0) return;
+    indexer_metadata<<<num_reqs, 256, 0, stream()>>>(
+        query_start_loc.data_ptr<int>(), uncompressed_seq_lens.data_ptr<int>(),
+        cu_compressed_seq_lens.data_ptr<int>(), row_start_cu.data_ptr<int>(),
+        token_to_seq.data_ptr<int>(), cu_ks.data_ptr<int>(), cu_ke.data_ptr<int>(),
+        (int)query_slice_start, (int)query_slice_stop, (int)dcp_rank,
+        (int)dcp_world, (int)dcp_interleave, (int)compress_ratio);
+}
+
+// Native replacement for vLLM's Triton _compute_slot_mapping_kernel.
+static void py_compute_slot_mapping(torch::Tensor query_start_loc,
+        torch::Tensor positions, torch::Tensor block_table,
+        torch::Tensor slot_mapping, int64_t num_tokens, int64_t max_num_tokens,
+        int64_t block_size, int64_t kv_cache_block_size,
+        int64_t blocks_per_kv_block, int64_t cp_world, int64_t cp_rank,
+        int64_t cp_interleave, int64_t pad_id) {
+    CK(query_start_loc); CK(positions); CK(block_table); CK(slot_mapping);
+    TORCH_CHECK(positions.scalar_type() == torch::kLong, "positions must be int64");
+    TORCH_CHECK(slot_mapping.scalar_type() == torch::kLong, "slot_mapping int64");
+    const int num_reqs = (int)query_start_loc.size(0) - 1;
+    compute_slot_mapping<<<num_reqs + 1, 256, 0, stream()>>>(
+        (long)num_tokens, (long)max_num_tokens, query_start_loc.data_ptr<int>(),
+        reinterpret_cast<const long*>(positions.data_ptr()),
+        block_table.data_ptr<int>(), (int)block_table.size(1), (int)block_size,
+        reinterpret_cast<long*>(slot_mapping.data_ptr()),
+        (int)kv_cache_block_size, (int)blocks_per_kv_block, (int)cp_world,
+        (int)cp_rank, (int)cp_interleave, (long)pad_id);
+}
+
 // GLM-5.2-Vision, bf16 cache. NFP8=0 means every element is read as bf16, so a
 // slot is 576 bf16 = 1152 B. Ampere (sm80) has no native fp8e4nv, so vLLM cannot
 // store an fp8 KV cache there -- this is the geometry that actually runs on A100.
@@ -479,6 +519,20 @@ void init_serving(py::module_& m) {
           py::arg("norm_weight") = py::none());
     m.def("mla_decode_partition", &py_mla_decode_partition);
     m.def("mla_decode_fp8_partition", &py_mla_decode_fp8_partition);
+    m.def("indexer_metadata", &py_indexer_metadata,
+          py::arg("query_start_loc"), py::arg("uncompressed_seq_lens"),
+          py::arg("cu_compressed_seq_lens"), py::arg("row_start_cu"),
+          py::arg("token_to_seq"), py::arg("cu_ks"), py::arg("cu_ke"),
+          py::arg("query_slice_start"), py::arg("query_slice_stop"),
+          py::arg("dcp_rank"), py::arg("dcp_world"),
+          py::arg("dcp_interleave"), py::arg("compress_ratio"));
+    m.def("compute_slot_mapping", &py_compute_slot_mapping,
+          py::arg("query_start_loc"), py::arg("positions"),
+          py::arg("block_table"), py::arg("slot_mapping"),
+          py::arg("num_tokens"), py::arg("max_num_tokens"),
+          py::arg("block_size"), py::arg("kv_cache_block_size"),
+          py::arg("blocks_per_kv_block"), py::arg("cp_world"),
+          py::arg("cp_rank"), py::arg("cp_interleave"), py::arg("pad_id"));
     m.def("mla_decode_bf16_sparse_glm", &py_mla_decode_bf16_sparse_glm, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"));

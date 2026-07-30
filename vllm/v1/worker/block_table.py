@@ -4,6 +4,8 @@
 from enum import Enum
 
 import numpy as np
+from functools import cache
+
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -162,6 +164,28 @@ class BlockTable:
             # indices and do not use per-token slot mappings.
             return
         assert self.slot_mapping_mode == SlotMappingMode.TOKEN_TO_KV_SLOT
+
+        if _use_native_slot_mapping():
+            # Native CUDA equivalent; verified bit-identical to the Triton
+            # kernel below across block sizes and context-parallel layouts.
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.compute_slot_mapping(
+                query_start_loc,
+                positions,
+                self.block_table.gpu,
+                self.slot_mapping.gpu,
+                num_tokens,
+                self.max_num_batched_tokens,
+                self.block_size,
+                self.kv_cache_block_size,
+                self.blocks_per_kv_block,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+                PAD_SLOT_ID,
+            )
+            return
 
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
@@ -341,6 +365,18 @@ class MultiGroupBlockTable:
     def __getitem__(self, idx: int) -> "BlockTable":
         """Returns the BlockTable for the i-th KV cache group."""
         return self.block_tables[idx]
+
+
+@cache
+def _use_native_slot_mapping() -> bool:
+    """Prefer the native CUDA slot-mapping kernel over the Triton one."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has("compute_slot_mapping")
 
 
 @triton.jit(do_not_specialize=["num_tokens", "max_num_tokens"])

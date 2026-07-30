@@ -502,10 +502,14 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list[AttentionBackendEnum]:
         if cls.has_device_capability(80):
+            # TORCH_SDPA ahead of TRITON_ATTN: SDPA dispatches to cuDNN/flash
+            # C++ CUDA kernels, so preferring it keeps the ViT path free of
+            # Triton (and of Triton's architecture gates). FLASH_ATTN stays
+            # first because it is faster still when its extension is usable.
             return [
                 AttentionBackendEnum.FLASH_ATTN,
-                AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLASHINFER,
             ]
         else:
