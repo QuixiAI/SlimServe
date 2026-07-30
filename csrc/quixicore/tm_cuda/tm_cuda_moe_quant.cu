@@ -3,6 +3,8 @@
 // scored routing (kernels/moe_quant/tm_moe_quant_kernels.cuh).
 // Registered by init_moe_quant(m) from tm_cuda_ext.cu.
 #include "../moe_quant/tm_moe_quant_kernels.cuh"
+#include "../quant/q2k_ampere.cuh"
+#include "../quant/q2k_moe_ampere.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -10,6 +12,77 @@ namespace py = pybind11;
 using namespace tmoeq;
 
 #define QK(x) TORCH_CHECK(x.is_cuda() && x.is_contiguous(), #x " must be contiguous CUDA")
+
+// ---------------------------------------------------------------- Q2_K (sm80)
+// Repack GGUF Q2_K blocks into the GEMV's three planes. Done once per expert
+// tensor at load time; `src` is the raw [E, N, K/256*84] GGUF payload.
+static std::vector<torch::Tensor> py_q2k_repack(torch::Tensor src, int64_t E,
+                                                int64_t N, int64_t K) {
+    QK(src);
+    TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
+    const int nj = (int)K / 16, nsb = (int)K / 256;
+    auto i32 = src.options().dtype(torch::kInt);
+    auto qp = torch::empty({E, N, nj}, i32);
+    auto sp = torch::empty({E, N, nj}, src.options().dtype(torch::kByte));
+    auto dp = torch::empty({E, N, nsb, 2}, src.options().dtype(torch::kHalf));
+    const size_t src_e = (size_t)N * nsb * 84;
+    for (int64_t e = 0; e < E; ++e) {
+        const int blocks = (int)((N * nsb + 255) / 256);
+        tmq_a100::q2k_repack<<<blocks, 256, 0,
+                          at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const uint8_t*>(src.data_ptr()) + e * src_e,
+            reinterpret_cast<uint32_t*>(qp.data_ptr()) + (size_t)e * N * nj,
+            reinterpret_cast<uint8_t*>(sp.data_ptr()) + (size_t)e * N * nj,
+            reinterpret_cast<half2*>(dp.data_ptr()) + (size_t)e * N * nsb,
+            (int)N, (int)K);
+    }
+    return {qp, sp, dp};
+}
+
+// int8 activations with a per-256 scale and per-16 sums (the amortized SUM x
+// term of the Q2_K factorization d*sc*(q.x) - dmin*m*(SUM x)).
+static std::vector<torch::Tensor> py_q2k_quant_a8(torch::Tensor X) {
+    QK(X);
+    TORCH_CHECK(X.scalar_type() == torch::kHalf, "X must be fp16");
+    const int M = (int)X.size(0), K = (int)X.size(1);
+    TORCH_CHECK(K % 256 == 0, "K must be a multiple of 256");
+    auto xq = torch::empty({M, K}, X.options().dtype(torch::kChar));
+    auto xs = torch::empty({M, K / 256}, X.options());
+    auto xsum = torch::empty({M, K / 16}, X.options().dtype(torch::kInt));
+    dim3 g((unsigned)((K / 256 + 127) / 128), (unsigned)M);
+    tmq_a100::q2k_quant_a8<<<g, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __half*>(X.data_ptr()),
+        reinterpret_cast<int8_t*>(xq.data_ptr()),
+        reinterpret_cast<__half*>(xs.data_ptr()), xsum.data_ptr<int>(), M, K);
+    return {xq, xs, xsum};
+}
+
+static torch::Tensor py_q2k_moe_gemv_a8(torch::Tensor qp, torch::Tensor sp,
+        torch::Tensor dp, torch::Tensor xq, torch::Tensor xs,
+        torch::Tensor xsum, torch::Tensor topk_ids, int64_t top_k, int64_t N,
+        int64_t K) {
+    QK(qp); QK(sp); QK(dp); QK(xq); QK(xs); QK(xsum); QK(topk_ids);
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt, "topk_ids must be int32");
+    constexpr int NR = 4, KC = 4096, QB = 2;
+    const int rows = (int)topk_ids.numel();
+    auto Y = torch::empty({rows, N}, xs.options().dtype(torch::kFloat));
+    const size_t smem = tmq_a100::q2k_moe_gemv_smem<NR, KC>();
+    auto kern = tmq_a100::q2k_moe_gemv_a8<NR, KC, QB>;
+    if (smem > 48 * 1024)
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)smem);
+    const int nwarp = 256 / 32;
+    dim3 grid((unsigned)((N + nwarp * NR - 1) / (nwarp * NR)), (unsigned)rows);
+    kern<<<grid, 256, smem, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const uint32_t*>(qp.data_ptr()),
+        reinterpret_cast<const uint8_t*>(sp.data_ptr()),
+        reinterpret_cast<const half2*>(dp.data_ptr()),
+        reinterpret_cast<const int8_t*>(xq.data_ptr()),
+        reinterpret_cast<const __half*>(xs.data_ptr()), xsum.data_ptr<int>(),
+        topk_ids.data_ptr<int>(), Y.data_ptr<float>(), rows, (int)top_k,
+        (int)N, (int)K);
+    return Y;
+}
 static cudaStream_t qstream() { return at::cuda::getCurrentCUDAStream(); }
 static const half* hp(const torch::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); }
 
@@ -109,6 +182,12 @@ static std::tuple<torch::Tensor, torch::Tensor> py_moe_route_scored(
 }
 
 void init_moe_quant(py::module_& m) {
+    m.def("q2k_repack", &py_q2k_repack, py::arg("src"), py::arg("E"),
+          py::arg("N"), py::arg("K"));
+    m.def("q2k_quant_a8", &py_q2k_quant_a8, py::arg("X"));
+    m.def("q2k_moe_gemv_a8", &py_q2k_moe_gemv_a8, py::arg("qp"), py::arg("sp"),
+          py::arg("dp"), py::arg("xq"), py::arg("xs"), py::arg("xsum"),
+          py::arg("topk_ids"), py::arg("top_k"), py::arg("N"), py::arg("K"));
     m.def("moe_gemm_fp8", &py_moe_gemm_fp8);
     m.def("moe_gemm_wna16", &py_moe_gemm_wna16, py::arg("A"), py::arg("qweight"), py::arg("scales"),
           py::arg("qzeros") = py::none(), py::arg("eot"), py::arg("N"), py::arg("K"),
