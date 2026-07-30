@@ -243,6 +243,10 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = float(scale)
+        # Host copy of layer._k_scale. Reading it per call would be a D2H sync,
+        # which CUDA graph capture rejects; the scale is fixed once weights are
+        # loaded, so it is cached on first use during eager warmup.
+        self._k_scale_host: float | None = None
         # The indexer carries the shared buffer for normal layers; the explicit
         # buffer covers backbone skip layers whose indexer is not constructed.
         self.topk_indices_buffer: torch.Tensor | None = (
@@ -296,9 +300,18 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 attn_metadata.block_size, self.softmax_scale,
             ), None
 
-        k_scale = 1.0
-        if layer is not None and getattr(layer, "_k_scale", None) is not None:
-            k_scale = float(layer._k_scale)
+        if self._k_scale_host is None:
+            ks = getattr(layer, "_k_scale", None) if layer is not None else None
+            if ks is None:
+                self._k_scale_host = 1.0
+            else:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "k_scale not cached before CUDA graph capture; reading "
+                        "it here would be a D2H sync. Run an eager warmup first."
+                    )
+                self._k_scale_host = float(ks)
+        k_scale = self._k_scale_host
 
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
             q,
