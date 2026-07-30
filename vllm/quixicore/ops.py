@@ -114,6 +114,60 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def has(name: str) -> bool:
+        """Whether the compiled extension exposes `name`."""
+        try:
+            return hasattr(_qc(), name)
+        except ImportError:
+            return False
+
+    @staticmethod
+    def indexer_metadata(
+        query_start_loc: torch.Tensor,
+        uncompressed_seq_lens: torch.Tensor,
+        cu_compressed_seq_lens: torch.Tensor,
+        row_start_cu: torch.Tensor,
+        token_to_seq: torch.Tensor,
+        cu_ks: torch.Tensor,
+        cu_ke: torch.Tensor,
+        query_slice_start: int,
+        query_slice_stop: int,
+        dcp_rank: int,
+        dcp_world: int,
+        dcp_interleave: int,
+        compress_ratio: int,
+    ) -> None:
+        """Native CUDA DSA indexer metadata (replaces a Triton kernel)."""
+        _qc().indexer_metadata(
+            query_start_loc, uncompressed_seq_lens, cu_compressed_seq_lens,
+            row_start_cu, token_to_seq, cu_ks, cu_ke, query_slice_start,
+            query_slice_stop, dcp_rank, dcp_world, dcp_interleave, compress_ratio,
+        )
+
+    @staticmethod
+    def compute_slot_mapping(
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_tokens: int,
+        max_num_tokens: int,
+        block_size: int,
+        kv_cache_block_size: int,
+        blocks_per_kv_block: int,
+        cp_world: int,
+        cp_rank: int,
+        cp_interleave: int,
+        pad_id: int,
+    ) -> None:
+        """Native CUDA token -> KV-slot mapping (replaces a Triton kernel)."""
+        _qc().compute_slot_mapping(
+            query_start_loc, positions, block_table, slot_mapping, num_tokens,
+            max_num_tokens, block_size, kv_cache_block_size, blocks_per_kv_block,
+            cp_world, cp_rank, cp_interleave, pad_id,
+        )
+
+    @staticmethod
     def mla_decode_bf16_sparse_glm(
         q: torch.Tensor,
         kv: torch.Tensor,

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
 
+from functools import cache
+
 import torch
 
 import vllm.envs as envs
@@ -40,6 +42,18 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 
 logger = init_logger(__name__)
+
+
+@cache
+def _use_native_indexer_metadata() -> bool:
+    """Prefer the native CUDA indexer metadata kernel over the Triton one."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has("indexer_metadata")
 
 
 @triton.jit
@@ -343,6 +357,10 @@ class BuildPrefillChunkMetadataKernel(
         )
 
     def compile(self, compile_key: CompileKey) -> None:
+        if _use_native_indexer_metadata():
+            # The native CUDA kernel serves every call, so warming the Triton
+            # one only pays JIT cost for code that never runs.
+            return
         warmup = getattr(self.kernel, "warmup", None)
         assert warmup is not None
         int32_ptr = TritonWarmupTensor(torch.int32)
@@ -382,6 +400,29 @@ class BuildPrefillChunkMetadataKernel(
         num_reqs: int,
         COMPRESS_RATIO: int,
     ) -> None:
+        if _use_native_indexer_metadata():
+            # Native CUDA equivalent; verified bit-identical to the Triton
+            # kernel below across compression ratios, query slices and DCP
+            # layouts.
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.indexer_metadata(
+                query_start_loc,
+                uncompressed_seq_lens,
+                cu_compressed_seq_lens,
+                row_start_cu_compressed_seq_lens,
+                token_to_seq,
+                cu_compressed_seq_len_ks,
+                cu_compressed_seq_len_ke,
+                query_slice_start,
+                query_slice_stop,
+                DCP_RANK,
+                DCP_WORLD,
+                DCP_INTERLEAVE,
+                COMPRESS_RATIO,
+            )
+            return
+
         self.kernel[(num_reqs,)](
             query_start_loc,
             uncompressed_seq_lens,
