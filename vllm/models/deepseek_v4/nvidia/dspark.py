@@ -21,10 +21,23 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.mhc.tilelang import (
-    hc_head_fused_kernel_tilelang,
-    mhc_post_tilelang,
-)
+try:
+    import tilelang  # noqa: F401
+
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        hc_head_fused_kernel_tilelang,
+        mhc_post_tilelang,
+    )
+except ImportError:
+    # No tilelang (e.g. sm80 deployments that keep JIT codegen out of the
+    # serving path): identical-signature torch implementations. The mhc ops
+    # are a few T x hc_mult x H elementwise/GEMV passes per draft step.
+    from vllm.model_executor.kernels.mhc.torch import (
+        hc_head_fused_torch as hc_head_fused_kernel_tilelang,
+    )
+    from vllm.model_executor.kernels.mhc.torch import (
+        mhc_post_torch as mhc_post_tilelang,
+    )
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
