@@ -56,6 +56,20 @@ def _use_native_indexer_metadata() -> bool:
     return quixicore_ops.is_available() and quixicore_ops.has("indexer_metadata")
 
 
+@cache
+def _use_native_uniform_decode() -> bool:
+    """Prefer the native CUDA uniform-decode expansion over the Triton one."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has(
+        "prepare_uniform_decode"
+    )
+
+
 @triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
@@ -699,17 +713,32 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if min_decode_len == max_decode_len:
                 # Uniform decode lengths.
                 num_decode_tokens = num_decodes * max_decode_len
-                _prepare_uniform_decode_kernel[(num_decode_tokens,)](
-                    seq_lens,
-                    self.decode_seq_lens_buffer,
-                    block_table,
-                    block_table.stride(0),
-                    self.expanded_block_table_buffer,
-                    self.expanded_block_table_buffer.stride(0),
-                    self.decode_lens_buffer,
-                    max_decode_len,
-                    BLOCK_SIZE=1024,
-                )
+                if _use_native_uniform_decode():
+                    from vllm.quixicore import quixicore_ops
+
+                    quixicore_ops.prepare_uniform_decode(
+                        seq_lens,
+                        self.decode_seq_lens_buffer,
+                        block_table,
+                        block_table.stride(0),
+                        self.expanded_block_table_buffer,
+                        self.expanded_block_table_buffer.stride(0),
+                        self.decode_lens_buffer,
+                        max_decode_len,
+                        num_decode_tokens,
+                    )
+                else:
+                    _prepare_uniform_decode_kernel[(num_decode_tokens,)](
+                        seq_lens,
+                        self.decode_seq_lens_buffer,
+                        block_table,
+                        block_table.stride(0),
+                        self.expanded_block_table_buffer,
+                        self.expanded_block_table_buffer.stride(0),
+                        self.decode_lens_buffer,
+                        max_decode_len,
+                        BLOCK_SIZE=1024,
+                    )
                 self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
                 block_table = self.expanded_block_table_buffer[:num_decode_tokens]

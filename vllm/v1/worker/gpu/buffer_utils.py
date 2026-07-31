@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Sequence
-from functools import partial
+from functools import cache, partial
 
 import numpy as np
 import torch
@@ -16,6 +16,18 @@ from vllm.utils.torch_utils import (
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
 _DEFAULT_MAX_CONCURRENCY = 2
+
+
+@cache
+def _use_native_apply_write() -> bool:
+    """Prefer the native CUDA staged-write kernels over the Triton one."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has("apply_write")
 
 
 def set_default_max_concurrency(n: int) -> None:
@@ -186,17 +198,29 @@ class StagedWriteTensor:
         )
 
         # Write diffs to the GPU buffer
-        _apply_write_kernel[(n,)](
-            self.gpu,
-            self.gpu.stride(0),
-            indices_uva,
-            starts_uva,
-            write_contents,
-            cu_lens_uva,
-            None,
-            BLOCK_SIZE=1024,
-            MULTI_GROUP=False,
-        )
+        if _use_native_apply_write():
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.apply_write(
+                self.gpu,
+                self.gpu.stride(0),
+                indices_uva,
+                starts_uva,
+                write_contents,
+                cu_lens_uva,
+            )
+        else:
+            _apply_write_kernel[(n,)](
+                self.gpu,
+                self.gpu.stride(0),
+                indices_uva,
+                starts_uva,
+                write_contents,
+                cu_lens_uva,
+                None,
+                BLOCK_SIZE=1024,
+                MULTI_GROUP=False,
+            )
         # Clear the staged writes
         self.clear_staged_writes()
 
@@ -256,17 +280,30 @@ class FusedStagedWriter:
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
         contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
 
-        _apply_write_kernel[(len(group_ids),)](
-            output_ptrs,
-            output_strides,
-            indices_uva,
-            starts_uva,
-            contents_gpu,
-            cu_lens_uva,
-            group_ids_uva,
-            BLOCK_SIZE=1024,
-            MULTI_GROUP=True,
-        )
+        if _use_native_apply_write():
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.apply_write_multi(
+                output_ptrs,
+                output_strides,
+                indices_uva,
+                starts_uva,
+                contents_gpu,
+                cu_lens_uva,
+                group_ids_uva,
+            )
+        else:
+            _apply_write_kernel[(len(group_ids),)](
+                output_ptrs,
+                output_strides,
+                indices_uva,
+                starts_uva,
+                contents_gpu,
+                cu_lens_uva,
+                group_ids_uva,
+                BLOCK_SIZE=1024,
+                MULTI_GROUP=True,
+            )
         for t in tensors:
             t.clear_staged_writes()
 

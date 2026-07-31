@@ -171,6 +171,218 @@ class quixicore_ops:
             cp_world, cp_rank, cp_interleave, pad_id,
         )
 
+    # ------------------------------------------------------------------
+    # V2 model-runner batch-prep (native replacements for Triton kernels)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def apply_write(
+        out: torch.Tensor,
+        row_stride: int,
+        indices: torch.Tensor,
+        starts: torch.Tensor,
+        contents: torch.Tensor,
+        cu_lens: torch.Tensor,
+    ) -> None:
+        """Native `_apply_write_kernel` (MULTI_GROUP=False)."""
+        _qc().apply_write(out, row_stride, indices, starts, contents, cu_lens)
+
+    @staticmethod
+    def apply_write_multi(
+        out_ptrs: torch.Tensor,
+        out_strides: torch.Tensor,
+        indices: torch.Tensor,
+        starts: torch.Tensor,
+        contents: torch.Tensor,
+        cu_lens: torch.Tensor,
+        group_ids: torch.Tensor,
+    ) -> None:
+        """Native `_apply_write_kernel` (MULTI_GROUP=True, int32 elements)."""
+        _qc().apply_write_multi(
+            out_ptrs, out_strides, indices, starts, contents, cu_lens, group_ids
+        )
+
+    @staticmethod
+    def prepare_pos_seq_lens(
+        pos: torch.Tensor,
+        seq_lens: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        max_num_reqs: int,
+    ) -> None:
+        """Native `_prepare_pos_seq_lens_kernel`."""
+        _qc().prepare_pos_seq_lens(
+            pos, seq_lens, idx_mapping, query_start_loc, num_computed_tokens,
+            max_num_reqs,
+        )
+
+    @staticmethod
+    def prepare_prefill_inputs(
+        input_ids: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        all_token_ids: torch.Tensor,
+        all_token_ids_stride: int,
+        prefill_lens: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        """Native `_prepare_prefill_inputs_kernel` (input_batch.py)."""
+        _qc().prepare_prefill_inputs(
+            input_ids, next_prefill_tokens, idx_mapping, query_start_loc,
+            all_token_ids, all_token_ids_stride, prefill_lens,
+            num_computed_tokens,
+        )
+
+    @staticmethod
+    def combine_sampled_and_draft_tokens(
+        input_ids: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefill_len: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        draft_tokens_stride: int,
+        cu_num_logits: torch.Tensor,
+        logits_indices: torch.Tensor,
+        num_new_sampled_tokens: int,
+    ) -> None:
+        """Native `_combine_sampled_and_draft_tokens_kernel`."""
+        _qc().combine_sampled_and_draft_tokens(
+            input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
+            seq_lens, prefill_len, draft_tokens, draft_tokens_stride,
+            cu_num_logits, logits_indices, num_new_sampled_tokens,
+        )
+
+    @staticmethod
+    def get_num_sampled_and_rejected(
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        seq_lens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        prefill_len: torch.Tensor,
+    ) -> None:
+        """Native `_get_num_sampled_and_rejected_kernel`."""
+        _qc().get_num_sampled_and_rejected(
+            num_sampled, num_rejected, seq_lens, cu_num_logits, idx_mapping,
+            prefill_len,
+        )
+
+    @staticmethod
+    def post_update(
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        output_bin_counts: torch.Tensor | None,
+        output_bin_counts_stride: int,
+        sampled_tokens: torch.Tensor,
+        sampled_tokens_stride: int,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor | None,
+        all_token_ids: torch.Tensor,
+        all_token_ids_stride: int,
+        total_len: torch.Tensor,
+    ) -> None:
+        """Native `_post_update_kernel`."""
+        _qc().post_update(
+            idx_mapping, num_computed_tokens, last_sampled_tokens,
+            output_bin_counts, output_bin_counts_stride, sampled_tokens,
+            sampled_tokens_stride, num_sampled, num_rejected, query_start_loc,
+            all_token_ids, all_token_ids_stride, total_len,
+        )
+
+    @staticmethod
+    def post_update_num_computed_tokens(
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Native `_post_update_num_computed_tokens_kernel`."""
+        _qc().post_update_num_computed_tokens(
+            idx_mapping, num_computed_tokens, query_start_loc
+        )
+
+    @staticmethod
+    def expand_idx_mapping(
+        idx_mapping: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+    ) -> None:
+        """Native `_expand_idx_mapping_kernel`."""
+        _qc().expand_idx_mapping(
+            idx_mapping, expanded_idx_mapping, expanded_local_pos, cu_num_logits
+        )
+
+    @staticmethod
+    def gather_block_tables(
+        idx_mapping: torch.Tensor,
+        src_ptrs: torch.Tensor,
+        dst_ptrs: torch.Tensor,
+        strides: torch.Tensor,
+        num_blocks: torch.Tensor,
+        num_blocks_stride: int,
+        num_reqs: int,
+        num_reqs_padded: int,
+    ) -> None:
+        """Native `_gather_block_tables_kernel` (V2 worker block tables)."""
+        _qc().gather_block_tables(
+            idx_mapping, src_ptrs, dst_ptrs, strides, num_blocks,
+            num_blocks_stride, num_reqs, num_reqs_padded,
+        )
+
+    @staticmethod
+    def compute_slot_mappings(
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        pos: torch.Tensor,
+        block_table_ptrs: torch.Tensor,
+        block_table_strides: torch.Tensor,
+        block_sizes: torch.Tensor,
+        slot_mappings: torch.Tensor,
+        slot_mappings_stride: int,
+        max_num_tokens: int,
+        cp_rank: int,
+        cp_size: int,
+        cp_interleave: int,
+        pad_id: int,
+    ) -> None:
+        """Native `_compute_slot_mappings_kernel` (V2 worker, multi-group)."""
+        _qc().compute_slot_mappings(
+            idx_mapping, query_start_loc, pos, block_table_ptrs,
+            block_table_strides, block_sizes, slot_mappings,
+            slot_mappings_stride, max_num_tokens, cp_rank, cp_size,
+            cp_interleave, pad_id,
+        )
+
+    @staticmethod
+    def prepare_uniform_decode(
+        seq_lens: torch.Tensor,
+        decode_seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        block_table_stride: int,
+        expanded_block_table: torch.Tensor,
+        expanded_bt_stride: int,
+        decode_lens: torch.Tensor,
+        max_decode_len: int,
+        num_decode_tokens: int,
+    ) -> None:
+        """Native `_prepare_uniform_decode_kernel` (DSA indexer)."""
+        _qc().prepare_uniform_decode(
+            seq_lens, decode_seq_lens, block_table, block_table_stride,
+            expanded_block_table, expanded_bt_stride, decode_lens,
+            max_decode_len, num_decode_tokens,
+        )
+
+    @staticmethod
+    def prepare_dflash_inputs(*args, **kwargs) -> None:
+        """Native `_prepare_dflash_inputs_kernel` (DFlash speculator)."""
+        _qc().prepare_dflash_inputs(*args, **kwargs)
+
     @staticmethod
     def mla_decode_bf16_sparse_glm(
         q: torch.Tensor,
@@ -246,6 +458,170 @@ class quixicore_ops:
     @staticmethod
     def cp_gather_indexer(*args, **kwargs):
         return _qc().cp_gather_indexer(*args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # V2 model-runner sampler / spec-decode kernels (bit-exact ports of
+    # the Triton kernels in vllm/v1/worker/gpu/sample and
+    # spec_decode/rejection_sampler_utils.py).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def v2_apply_temperature(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        _qc().v2_apply_temperature(logits, expanded_idx_mapping, temperature)
+
+    @staticmethod
+    def v2_gumbel_sample(
+        local_argmax: torch.Tensor,
+        local_max: torch.Tensor,
+        processed_logits: torch.Tensor | None,
+        processed_logits_col: torch.Tensor | None,
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        seeds: torch.Tensor,
+        pos: torch.Tensor,
+        temperature: torch.Tensor,
+        apply_temperature: bool,
+        per_token_col: bool,
+    ) -> None:
+        """Per-(token, vocab-block) Gumbel-max partials; the caller reduces."""
+        _qc().v2_gumbel_sample(
+            local_argmax, local_max, processed_logits, processed_logits_col,
+            logits, expanded_idx_mapping, seeds, pos, temperature,
+            apply_temperature, per_token_col,
+        )
+
+    @staticmethod
+    def v2_topk_log_softmax(
+        out: torch.Tensor, logits: torch.Tensor, topk_ids: torch.Tensor
+    ) -> None:
+        _qc().v2_topk_log_softmax(out, logits, topk_ids)
+
+    @staticmethod
+    def v2_ranks(
+        out: torch.Tensor, logits: torch.Tensor, token_ids: torch.Tensor
+    ) -> None:
+        _qc().v2_ranks(out, logits, token_ids)
+
+    @staticmethod
+    def v2_fill_logprob_token_ids(
+        out_token_ids: torch.Tensor,
+        out_valid_mask: torch.Tensor,
+        sampled_token_ids: torch.Tensor,
+        topk_indices: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        num_per_req_token_ids: torch.Tensor,
+        per_req_token_ids: torch.Tensor,
+        num_topk: int,
+    ) -> None:
+        _qc().v2_fill_logprob_token_ids(
+            out_token_ids, out_valid_mask, sampled_token_ids, topk_indices,
+            expanded_idx_mapping, num_per_req_token_ids, per_req_token_ids,
+            num_topk,
+        )
+
+    @staticmethod
+    def v2_penalties(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        token_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        repetition_penalty: torch.Tensor,
+        frequency_penalty: torch.Tensor,
+        presence_penalty: torch.Tensor,
+        prompt_bin_mask: torch.Tensor,
+        output_bin_counts: torch.Tensor,
+    ) -> None:
+        _qc().v2_penalties(
+            logits, expanded_idx_mapping, token_ids, expanded_local_pos,
+            repetition_penalty, frequency_penalty, presence_penalty,
+            prompt_bin_mask, output_bin_counts,
+        )
+
+    @staticmethod
+    def v2_bincount(
+        expanded_idx_mapping: torch.Tensor,
+        all_token_ids: torch.Tensor,
+        prompt_len: torch.Tensor,
+        prefill_len: torch.Tensor,
+        prompt_bin_mask: torch.Tensor,
+        output_bin_counts: torch.Tensor,
+        max_prefill_len: int,
+    ) -> None:
+        _qc().v2_bincount(
+            expanded_idx_mapping, all_token_ids, prompt_len, prefill_len,
+            prompt_bin_mask, output_bin_counts, max_prefill_len,
+        )
+
+    @staticmethod
+    def v2_prompt_logprobs_token_ids(
+        out: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        all_token_ids: torch.Tensor,
+    ) -> None:
+        _qc().v2_prompt_logprobs_token_ids(
+            out, query_start_loc, idx_mapping, num_computed_tokens,
+            all_token_ids,
+        )
+
+    @staticmethod
+    def v2_rejection_sample(
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        target_rejected_lse: torch.Tensor,
+        draft_rejected_lse: torch.Tensor,
+        target_logits: torch.Tensor,
+        t_local_argmax: torch.Tensor,
+        t_local_max: torch.Tensor,
+        t_local_sumexp: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        d_local_max: torch.Tensor,
+        d_local_sumexp: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seed: torch.Tensor,
+        pos: torch.Tensor,
+        vocab_num_blocks: int,
+    ) -> None:
+        """Leviathan-style rejection loop (no block verification/synthetic)."""
+        _qc().v2_rejection_sample(
+            sampled, num_sampled, target_rejected_lse, draft_rejected_lse,
+            target_logits, t_local_argmax, t_local_max, t_local_sumexp,
+            draft_sampled, draft_logits, d_local_max, d_local_sumexp,
+            cu_num_logits, idx_mapping, temperature, seed, pos,
+            vocab_num_blocks,
+        )
+
+    @staticmethod
+    def v2_resample(
+        rl_argmax: torch.Tensor,
+        rl_max: torch.Tensor,
+        target_logits: torch.Tensor,
+        target_rejected_lse: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_rejected_lse: torch.Tensor,
+        rejected_step: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        draft_sampled: torch.Tensor,
+        temperature: torch.Tensor,
+        seed: torch.Tensor,
+        pos: torch.Tensor,
+        vocab_size: int,
+    ) -> None:
+        _qc().v2_resample(
+            rl_argmax, rl_max, target_logits, target_rejected_lse,
+            draft_logits, draft_rejected_lse, rejected_step, cu_num_logits,
+            expanded_idx_mapping, draft_sampled, temperature, seed, pos,
+            vocab_size,
+        )
 
     # ------------------------------------------------------------------
     # Stubs: kernels QuixiCore-CUDA does not implement yet.
