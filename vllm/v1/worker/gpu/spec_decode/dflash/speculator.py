@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping
+from functools import cache
 from typing import Any
 
 import torch
@@ -26,6 +27,20 @@ from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+@cache
+def _use_native_dflash_inputs() -> bool:
+    """Prefer the native CUDA DFlash input-prep kernel over the Triton one."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has(
+        "prepare_dflash_inputs"
+    )
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -652,6 +667,42 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
+    if _use_native_dflash_inputs():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.prepare_dflash_inputs(
+            input_buffers.input_ids,
+            input_buffers.positions,
+            input_buffers.query_start_loc,
+            input_buffers.seq_lens,
+            query_slot_mapping,
+            context_positions,
+            context_slot_mapping,
+            sample_indices,
+            sample_pos,
+            sample_idx_mapping,
+            input_batch.positions,
+            input_batch.query_start_loc,
+            input_batch.idx_mapping,
+            last_sampled,
+            next_prefill_tokens,
+            num_sampled,
+            num_rejected,
+            block_table,
+            block_table.stride(0),
+            parallel_drafting_token_id,
+            block_size,
+            num_query_per_req,
+            num_speculative_steps,
+            max_num_reqs,
+            max_num_tokens,
+            max_model_len,
+            sample_from_anchor,
+            PAD_SLOT_ID,
+            num_reqs,
+            max_tokens_per_req,
+        )
+        return
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
