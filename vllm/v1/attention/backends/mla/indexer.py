@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-
 from functools import cache
 
 import torch
@@ -46,10 +45,10 @@ logger = init_logger(__name__)
 
 @cache
 def _use_native_indexer_metadata() -> bool:
-    """Prefer the native CUDA indexer metadata kernel over the Triton one."""
+    """Prefer the native indexer metadata kernel over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 
@@ -58,16 +57,14 @@ def _use_native_indexer_metadata() -> bool:
 
 @cache
 def _use_native_uniform_decode() -> bool:
-    """Prefer the native CUDA uniform-decode expansion over the Triton one."""
+    """Prefer the native uniform-decode expansion over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 
-    return quixicore_ops.is_available() and quixicore_ops.has(
-        "prepare_uniform_decode"
-    )
+    return quixicore_ops.is_available() and quixicore_ops.has("prepare_uniform_decode")
 
 
 @triton.jit
@@ -372,7 +369,7 @@ class BuildPrefillChunkMetadataKernel(
 
     def compile(self, compile_key: CompileKey) -> None:
         if _use_native_indexer_metadata():
-            # The native CUDA kernel serves every call, so warming the Triton
+            # The native kernel serves every call, so warming the Triton
             # one only pays JIT cost for code that never runs.
             return
         warmup = getattr(self.kernel, "warmup", None)

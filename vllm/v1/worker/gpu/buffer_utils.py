@@ -20,10 +20,10 @@ _DEFAULT_MAX_CONCURRENCY = 2
 
 @cache
 def _use_native_apply_write() -> bool:
-    """Prefer the native CUDA staged-write kernels over the Triton one."""
+    """Prefer the native staged-write kernels over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 

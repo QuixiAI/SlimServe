@@ -305,10 +305,9 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 
 
 def _v2_runner_kernels_available() -> bool:
-    """The V2 runner's data-plane kernels exist natively (quixicore) on this
-    fork's CUDA target, so Triton is not a V2 requirement when they are
-    present. ROCm still needs Triton for the V2 runner until the HIP ports
-    land."""
+    """The V2 runner's data-plane kernels exist natively (quixicore) on both of
+    this fork's targets -- CUDA/sm80 and HIP/gfx942 -- so Triton is not a V2
+    requirement when they are present."""
     if HAS_TRITON:
         return True
     try:

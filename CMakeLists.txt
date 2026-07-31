@@ -1440,6 +1440,43 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   target_link_libraries(_quixicore_C PRIVATE ${QUIXICORE_TORCH_PYTHON_LIB})
 endif()
 
+if(VLLM_GPU_LANG STREQUAL "HIP")
+  #
+  # _quixicore_C on ROCm. Same module name and same kernel headers as the CUDA
+  # build, but only the batch-prep / slot-mapping / indexer-metadata ops -- the
+  # ones that displace Triton on the MI300X serving path. The Ampere GEMM,
+  # quant and MMA indexer-logits kernels are sm80 PTX and stay CUDA-only; on
+  # gfx942 those roles belong to AITER and _rocm_C.
+  #
+  # Must be declared before vllm_finalize_hipify_target() below --
+  # hipify_sources_target hard-errors once the shared hipify target exists.
+  #
+  set(VLLM_QUIXICORE_HIP_EXT_SRC
+    "csrc/quixicore/tm_rocm/qc_rocm_serving.cu")
+
+  define_extension_target(
+    _quixicore_C
+    DESTINATION vllm
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES ${VLLM_QUIXICORE_HIP_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    # The build tree, not the source tree: the kernel headers are only HIP
+    # after hipify has rewritten them into ${CMAKE_CURRENT_BINARY_DIR}.
+    INCLUDE_DIRECTORIES
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/quixicore/serving"
+    WITH_SOABI)
+
+  # pybind11 modules need libtorch_python, which define_extension_target
+  # does not link (the stable-ABI extensions must not link it).
+  find_library(QUIXICORE_HIP_TORCH_PYTHON_LIB torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
+  if(NOT QUIXICORE_HIP_TORCH_PYTHON_LIB)
+    message(FATAL_ERROR "libtorch_python not found for _quixicore_C")
+  endif()
+  target_link_libraries(_quixicore_C PRIVATE ${QUIXICORE_HIP_TORCH_PYTHON_LIB})
+endif()
+
 # Must run after the last HIP `define_extension_target` so every extension
 # has registered its sources.
 if (VLLM_GPU_LANG STREQUAL "HIP")

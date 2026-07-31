@@ -13,10 +13,10 @@ from vllm.utils import random_uuid
 
 @cache
 def _use_native(op_name: str) -> bool:
-    """Prefer the native CUDA batch-prep kernel over the Triton one."""
+    """Prefer the native batch-prep kernel over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 

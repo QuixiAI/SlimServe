@@ -17,10 +17,10 @@ from vllm.v1.worker.gpu.buffer_utils import (
 
 @cache
 def _use_native(op_name: str) -> bool:
-    """Prefer the native CUDA block-table kernel over the Triton one."""
+    """Prefer the native block-table kernel over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 

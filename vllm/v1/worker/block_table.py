@@ -2,10 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
-
-import numpy as np
 from functools import cache
 
+import numpy as np
 import torch
 
 from vllm.distributed import get_dcp_group, get_pcp_group
@@ -369,10 +368,10 @@ class MultiGroupBlockTable:
 
 @cache
 def _use_native_slot_mapping() -> bool:
-    """Prefer the native CUDA slot-mapping kernel over the Triton one."""
+    """Prefer the native slot-mapping kernel over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 
