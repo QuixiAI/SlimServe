@@ -6,11 +6,15 @@ import torch
 
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
+
+_NATIVE_LOGITS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 
 @triton.jit
@@ -90,9 +94,24 @@ def compute_token_logprobs(
     token_ids = token_ids.to(torch.int64)
     num_logprobs = token_ids.shape[1]
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+    if (
+        _use_native_sample_kernels()
+        and logits.dtype in _NATIVE_LOGITS_DTYPES
+        and token_ids.is_contiguous()
+        # The native kernel replicates the reduction tree Triton compiles for
+        # the vectorized (16-aligned) specialization; other geometries would
+        # compile a different fp32 sum order, so keep them on Triton.
+        and vocab_size % 16 == 0
+        and logits.stride(0) % 16 == 0
+        and logits.data_ptr() % 16 == 0
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_topk_log_softmax(logprobs, logits, token_ids)
+        return logprobs
     # Cap the kernel's per-iteration width so very large num_logprobs requests
     # stream the gather in bounded-size chunks, avoiding excessive mem use.
-    topk_block_size = min(triton.next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
+    topk_block_size = min(next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
     _topk_log_softmax_kernel[(batch_size,)](
         logprobs,
         logits,
@@ -147,21 +166,35 @@ def compute_topk_scores(
         num_cols = max(num_logprobs, max_per_req_token_ids)
         logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
         valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
-        _fill_logprob_token_ids_kernel[(batch_size,)](
-            logprob_token_ids,
-            logprob_token_ids.stride(0),
-            valid_mask,
-            valid_mask.stride(0),
-            sampled_token_ids,
-            topk_token_ids,
-            topk_token_ids.stride(0),
-            expanded_idx_mapping,
-            logprob_token_ids_state.num_token_ids.gpu,
-            logprob_token_ids_state.token_ids.gpu,
-            logprob_token_ids_state.token_ids.gpu.stride(0),
-            NUM_TOPK=num_logprobs,
-            PADDED_COLS=triton.next_power_of_2(num_cols),
-        )
+        if _use_native_sample_kernels() and sampled_token_ids.dtype == torch.int64:
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.v2_fill_logprob_token_ids(
+                logprob_token_ids,
+                valid_mask,
+                sampled_token_ids,
+                topk_token_ids,
+                expanded_idx_mapping,
+                logprob_token_ids_state.num_token_ids.gpu,
+                logprob_token_ids_state.token_ids.gpu,
+                num_logprobs,
+            )
+        else:
+            _fill_logprob_token_ids_kernel[(batch_size,)](
+                logprob_token_ids,
+                logprob_token_ids.stride(0),
+                valid_mask,
+                valid_mask.stride(0),
+                sampled_token_ids,
+                topk_token_ids,
+                topk_token_ids.stride(0),
+                expanded_idx_mapping,
+                logprob_token_ids_state.num_token_ids.gpu,
+                logprob_token_ids_state.token_ids.gpu,
+                logprob_token_ids_state.token_ids.gpu.stride(0),
+                NUM_TOPK=num_logprobs,
+                PADDED_COLS=next_power_of_2(num_cols),
+            )
         if logits_mode:
             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
         else:
@@ -169,14 +202,23 @@ def compute_topk_scores(
         scores = scores.masked_fill(~valid_mask, float("-inf"))
 
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
-    _ranks_kernel[(batch_size,)](
-        token_ranks,
-        logits,
-        logits.stride(0),
-        sampled_token_ids,
-        vocab_size,
-        BLOCK_SIZE=8192,  # type: ignore
-    )
+    if (
+        _use_native_sample_kernels()
+        and logits.dtype in _NATIVE_LOGITS_DTYPES
+        and sampled_token_ids.dtype == torch.int64
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_ranks(token_ranks, logits, sampled_token_ids)
+    else:
+        _ranks_kernel[(batch_size,)](
+            token_ranks,
+            logits,
+            logits.stride(0),
+            sampled_token_ids,
+            vocab_size,
+            BLOCK_SIZE=8192,  # type: ignore
+        )
     return LogprobsTensors(
         logprob_token_ids=logprob_token_ids,
         logprobs=scores,

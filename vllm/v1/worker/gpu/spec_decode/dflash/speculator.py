@@ -12,6 +12,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -703,7 +704,7 @@ def prepare_dflash_inputs(
             max_tokens_per_req,
         )
         return
-    BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
+    BLOCK_SIZE = min(256, next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,

@@ -3,7 +3,12 @@
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
+from vllm.utils.math_utils import next_power_of_2, cdiv
+from vllm.v1.worker.gpu.sample.gumbel import (
+    _use_native_sample_kernels,
+    gumbel_block_argmax,
+    tl_rand32,
+)
 
 
 @triton.jit
@@ -907,8 +912,8 @@ def rejection_sample(
     # (for greedy requests), and target max + softmax exponential
     # (for non-greedy requests).
     VOCAB_BLOCK_SIZE = 8192
-    vocab_num_blocks = triton.cdiv(vocab_size, VOCAB_BLOCK_SIZE)
-    padded_vocab_num_blocks = triton.next_power_of_2(vocab_num_blocks)
+    vocab_num_blocks = cdiv(vocab_size, VOCAB_BLOCK_SIZE)
+    padded_vocab_num_blocks = next_power_of_2(vocab_num_blocks)
     target_local_argmax = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.int64
     )
@@ -924,30 +929,66 @@ def rejection_sample(
     draft_local_sumexp = target_logits.new_empty(
         num_logits, vocab_num_blocks, dtype=torch.float32
     )
-    _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
-        target_local_argmax,
-        target_local_argmax.stride(0),
-        target_local_max,
-        target_local_max.stride(0),
-        target_local_sumexp,
-        target_local_sumexp.stride(0),
-        draft_local_max,
-        draft_local_max.stride(0),
-        draft_local_sumexp,
-        draft_local_sumexp.stride(0),
-        target_logits,
-        target_logits.stride(0),
-        draft_logits,
-        draft_logits_stride_0,
-        draft_logits_stride_1,
-        expanded_idx_mapping,
-        expanded_local_pos,
-        temperature,
-        vocab_size,
-        num_speculative_steps,
-        BLOCK_SIZE=VOCAB_BLOCK_SIZE,
-        HAS_DRAFT_LOGITS=has_draft_logits,
+    # Native stats replicate the reduction tree of the vectorized (16-aligned)
+    # Triton specialization; other geometries keep the Triton kernel.
+    use_native_stats = (
+        _use_native_sample_kernels()
+        and target_logits.dtype == torch.float32
+        and vocab_size % 16 == 0
+        and target_logits.stride(0) % 16 == 0
+        and target_logits.data_ptr() % 16 == 0
+        and (
+            not has_draft_logits
+            or (
+                draft_logits.dtype == torch.float32
+                and draft_logits_stride_0 % 16 == 0
+                and draft_logits_stride_1 % 16 == 0
+                and draft_logits.data_ptr() % 16 == 0
+            )
+        )
     )
+    if use_native_stats:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_local_logits_stats(
+            target_local_argmax,
+            target_local_max,
+            target_local_sumexp,
+            draft_local_max,
+            draft_local_sumexp,
+            target_logits,
+            draft_logits,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            vocab_size,
+            num_speculative_steps,
+        )
+    else:
+        _compute_local_logits_stats_kernel[(num_logits, vocab_num_blocks)](
+            target_local_argmax,
+            target_local_argmax.stride(0),
+            target_local_max,
+            target_local_max.stride(0),
+            target_local_sumexp,
+            target_local_sumexp.stride(0),
+            draft_local_max,
+            draft_local_max.stride(0),
+            draft_local_sumexp,
+            draft_local_sumexp.stride(0),
+            target_logits,
+            target_logits.stride(0),
+            draft_logits,
+            draft_logits_stride_0,
+            draft_logits_stride_1,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            vocab_size,
+            num_speculative_steps,
+            BLOCK_SIZE=VOCAB_BLOCK_SIZE,
+            HAS_DRAFT_LOGITS=has_draft_logits,
+        )
 
     # Precompute the running joint ratio and residual mass for block
     # verification.
@@ -1033,49 +1074,88 @@ def rejection_sample(
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
-    _rejection_kernel[(num_reqs,)](
-        sampled,
-        sampled.stride(0),
-        num_sampled,
-        target_rejected_logsumexp,
-        draft_rejected_logsumexp,
-        target_logits,
-        target_logits.stride(0),
-        target_local_argmax,
-        target_local_argmax.stride(0),
-        target_local_max,
-        target_local_max.stride(0),
-        target_local_sumexp,
-        target_local_sumexp.stride(0),
-        draft_sampled,
-        draft_logits,
-        draft_logits_stride_0,
-        draft_logits_stride_1,
-        draft_local_max,
-        draft_local_max.stride(0),
-        draft_local_sumexp,
-        draft_local_sumexp.stride(0),
-        cu_num_logits,
-        idx_mapping,
-        temperature,
-        seed,
-        pos,
-        synthetic_conditional_rates,
-        cumulative_log_p,
-        local_residual_mass,
-        local_residual_mass.stride(0) if local_residual_mass is not None else 0,
-        vocab_num_blocks,
-        PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
-        HAS_DRAFT_LOGITS=has_draft_logits,
-        SYNTHETIC_MODE=synthetic_conditional_rates is not None,
-        USE_BLOCK_VERIFICATION=use_block_verification,
-        num_warps=1,
+    # The native kernels cover the standard Leviathan/greedy path; block
+    # verification and synthetic acceptance stay on Triton.
+    use_native = (
+        _use_native_sample_kernels()
+        and not use_block_verification
+        and synthetic_conditional_rates is None
+        and target_logits.dtype == torch.float32
+        and pos.dtype == torch.int64
+        # serving gathers draft ids from input_ids (int32); tests use int64
+        and draft_sampled.dtype in (torch.int32, torch.int64)
+        and cu_num_logits.dtype == torch.int32
+        and idx_mapping.dtype == torch.int32
+        and seed.dtype == torch.int64
+        and vocab_num_blocks <= 32
     )
+    if use_native:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_rejection_sample(
+            sampled,
+            num_sampled,
+            target_rejected_logsumexp,
+            draft_rejected_logsumexp,
+            target_logits,
+            target_local_argmax,
+            target_local_max,
+            target_local_sumexp,
+            draft_sampled,
+            draft_logits,
+            draft_local_max,
+            draft_local_sumexp,
+            cu_num_logits,
+            idx_mapping,
+            temperature,
+            seed,
+            pos,
+            vocab_num_blocks,
+        )
+    else:
+        _rejection_kernel[(num_reqs,)](
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            target_rejected_logsumexp,
+            draft_rejected_logsumexp,
+            target_logits,
+            target_logits.stride(0),
+            target_local_argmax,
+            target_local_argmax.stride(0),
+            target_local_max,
+            target_local_max.stride(0),
+            target_local_sumexp,
+            target_local_sumexp.stride(0),
+            draft_sampled,
+            draft_logits,
+            draft_logits_stride_0,
+            draft_logits_stride_1,
+            draft_local_max,
+            draft_local_max.stride(0),
+            draft_local_sumexp,
+            draft_local_sumexp.stride(0),
+            cu_num_logits,
+            idx_mapping,
+            temperature,
+            seed,
+            pos,
+            synthetic_conditional_rates,
+            cumulative_log_p,
+            local_residual_mass,
+            local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+            vocab_num_blocks,
+            PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+            HAS_DRAFT_LOGITS=has_draft_logits,
+            SYNTHETIC_MODE=synthetic_conditional_rates is not None,
+            USE_BLOCK_VERIFICATION=use_block_verification,
+            num_warps=1,
+        )
 
     # Resample the rejected/bonus tokens.
     RESAMPLE_BLOCK_SIZE = 1024
-    resample_num_blocks = triton.cdiv(vocab_size, RESAMPLE_BLOCK_SIZE)
-    padded_resample_num_blocks = triton.next_power_of_2(resample_num_blocks)
+    resample_num_blocks = cdiv(vocab_size, RESAMPLE_BLOCK_SIZE)
+    padded_resample_num_blocks = next_power_of_2(resample_num_blocks)
     resampled_local_argmax = target_logits.new_empty(
         num_reqs, resample_num_blocks, dtype=torch.int64
     )
@@ -1084,46 +1164,84 @@ def rejection_sample(
         resample_num_blocks,
         dtype=torch.float64 if use_fp64 else torch.float32,
     )
-    _resample_kernel[(num_reqs, resample_num_blocks)](
-        resampled_local_argmax,
-        resampled_local_argmax.stride(0),
-        resampled_local_max,
-        resampled_local_max.stride(0),
-        target_logits,
-        target_logits.stride(0),
-        target_rejected_logsumexp,
-        draft_logits,
-        draft_logits_stride_0,
-        draft_logits_stride_1,
-        draft_rejected_logsumexp,
-        num_sampled,
-        cu_num_logits,
-        expanded_idx_mapping,
-        draft_sampled,
-        temperature,
-        seed,
-        pos,
-        cumulative_log_p,
-        vocab_size,
-        BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
-        HAS_DRAFT_LOGITS=has_draft_logits,
-        USE_FP64=use_fp64,
-        USE_BLOCK_VERIFICATION=use_block_verification,
-    )
+    if use_native:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_resample(
+            resampled_local_argmax,
+            resampled_local_max,
+            target_logits,
+            target_rejected_logsumexp,
+            draft_logits,
+            draft_rejected_logsumexp,
+            num_sampled,
+            cu_num_logits,
+            expanded_idx_mapping,
+            draft_sampled,
+            temperature,
+            seed,
+            pos,
+            vocab_size,
+        )
+    else:
+        _resample_kernel[(num_reqs, resample_num_blocks)](
+            resampled_local_argmax,
+            resampled_local_argmax.stride(0),
+            resampled_local_max,
+            resampled_local_max.stride(0),
+            target_logits,
+            target_logits.stride(0),
+            target_rejected_logsumexp,
+            draft_logits,
+            draft_logits_stride_0,
+            draft_logits_stride_1,
+            draft_rejected_logsumexp,
+            num_sampled,
+            cu_num_logits,
+            expanded_idx_mapping,
+            draft_sampled,
+            temperature,
+            seed,
+            pos,
+            cumulative_log_p,
+            vocab_size,
+            BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
+            HAS_DRAFT_LOGITS=has_draft_logits,
+            USE_FP64=use_fp64,
+            USE_BLOCK_VERIFICATION=use_block_verification,
+        )
 
     # Insert the resampled tokens into the output sampled.
-    _insert_resampled_kernel[(num_reqs,)](
-        sampled,
-        sampled.stride(0),
-        num_sampled,
-        resampled_local_argmax,
-        resampled_local_argmax.stride(0),
-        resampled_local_max,
-        resampled_local_max.stride(0),
-        resample_num_blocks,
-        cu_num_logits,
-        expanded_idx_mapping,
-        temperature,
-        PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
-    )
+    if (
+        _use_native_sample_kernels()
+        and cu_num_logits.dtype == torch.int32
+        and sampled.dtype == torch.int64
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_insert_resampled(
+            sampled,
+            num_sampled,
+            resampled_local_argmax,
+            resampled_local_max,
+            resample_num_blocks,
+            cu_num_logits,
+            expanded_idx_mapping,
+            temperature,
+        )
+    else:
+        _insert_resampled_kernel[(num_reqs,)](
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            resampled_local_argmax,
+            resampled_local_argmax.stride(0),
+            resampled_local_max,
+            resampled_local_max.stride(0),
+            resample_num_blocks,
+            cu_num_logits,
+            expanded_idx_mapping,
+            temperature,
+            PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+        )
     return sampled, num_sampled

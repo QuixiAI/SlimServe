@@ -63,17 +63,28 @@ class StructuredOutputsWorker:
         num_masks = bitmask.shape[0]
         assert num_masks == len(mapping)
         vocab_size = logits.shape[-1]
-        BLOCK_SIZE = 8192
-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
-        _apply_grammar_bitmask_kernel[grid](
-            logits,
-            logits.stride(0),
-            logits_indices,
-            bitmask,
-            bitmask.stride(0),
-            vocab_size,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
+        from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+        if _use_native_sample_kernels() and logits.dtype in (
+            torch.float32, torch.bfloat16, torch.float16,
+        ):
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.v2_grammar_bitmask(
+                logits, logits_indices, bitmask, num_masks
+            )
+        else:
+            BLOCK_SIZE = 8192
+            grid = (num_masks, cdiv(vocab_size, BLOCK_SIZE))
+            _apply_grammar_bitmask_kernel[grid](
+                logits,
+                logits.stride(0),
+                logits_indices,
+                bitmask,
+                bitmask.stride(0),
+                vocab_size,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them

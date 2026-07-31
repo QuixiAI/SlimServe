@@ -108,14 +108,27 @@ class RejectionSampler:
         flat_sampled = torch.zeros(
             num_logits, dtype=sampled.dtype, device=sampled.device
         )
-        _flatten_sampled_kernel[(num_reqs,)](
-            flat_sampled,
-            sampled,
-            sampled.stride(0),
-            num_sampled,
-            cu_num_logits,
-            num_warps=1,
-        )
+        from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+        if (
+            _use_native_sample_kernels()
+            and sampled.dtype == torch.int64
+            and cu_num_logits.dtype == torch.int32
+        ):
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.v2_flatten_sampled(
+                flat_sampled, sampled, num_sampled, cu_num_logits
+            )
+        else:
+            _flatten_sampled_kernel[(num_reqs,)](
+                flat_sampled,
+                sampled,
+                sampled.stride(0),
+                num_sampled,
+                cu_num_logits,
+                num_warps=1,
+            )
         expanded_logits = num_logits != num_reqs
         return compute_topk_scores(
             logits,
