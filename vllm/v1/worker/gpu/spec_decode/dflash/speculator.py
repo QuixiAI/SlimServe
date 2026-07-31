@@ -32,16 +32,14 @@ logger = init_logger(__name__)
 
 @cache
 def _use_native_dflash_inputs() -> bool:
-    """Prefer the native CUDA DFlash input-prep kernel over the Triton one."""
+    """Prefer the native DFlash input-prep kernel over the Triton one."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 
-    return quixicore_ops.is_available() and quixicore_ops.has(
-        "prepare_dflash_inputs"
-    )
+    return quixicore_ops.is_available() and quixicore_ops.has("prepare_dflash_inputs")
 
 
 class DFlashSpeculator(DraftModelSpeculator):

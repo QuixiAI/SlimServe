@@ -1025,9 +1025,12 @@ if sys.version_info >= (3, 11):
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda():
+if _is_cuda() or _is_hip():
     # pybind11 module (not stable-ABI): must keep the full SOABI filename.
+    # Both targets build it; the ROCm build carries a subset of the ops.
     ext_modules.append(CMakeExtension(name="vllm._quixicore_C", py_limited_api=False))
+
+if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
