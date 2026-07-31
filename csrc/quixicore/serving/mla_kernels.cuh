@@ -426,12 +426,23 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     }
     if (PART) {
         const int64_t stat = (int64_t(batch) * num_heads + head) * num_partitions + part;
+        // Empty partitions write only their skip sentinel: the reduce never
+        // reads tmp_out for a partition whose max_logit is NEG_INF, and at
+        // short sparse contexts most partitions are empty -- zero-filling
+        // their 512-float tiles was pure wasted store traffic.
+        if (l == 0.0f) {
+            if (lane == 0) {
+                max_logits[stat] = MLA_NEG_INF;
+                exp_sums[stat] = 0.0f;
+            }
+            return;
+        }
         const int64_t ob = stat * VW;
         #pragma unroll
         for (int i = 0; i < VPL; i++)
-            tmp_out[ob + lane + 32 * i] = (l == 0.0f) ? 0.0f : acc[i] / l;
+            tmp_out[ob + lane + 32 * i] = acc[i] / l;
         if (lane == 0) {
-            max_logits[stat] = (l == 0.0f) ? MLA_NEG_INF : m;
+            max_logits[stat] = m;
             exp_sums[stat] = l;
         }
     } else {
