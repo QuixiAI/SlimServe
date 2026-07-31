@@ -12,9 +12,9 @@ struct Utils {
 
     if (!is_cached) {
       int device_id;
-      cudaDeviceProp deviceProp;
-      cudaGetDevice(&device_id);
-      cudaGetDeviceProperties(&deviceProp, device_id);
+      hipDeviceProp_t deviceProp;
+      hipGetDevice(&device_id);
+      hipGetDeviceProperties(&deviceProp, device_id);
 
       result = deviceProp.warpSize;
       is_cached = true;
