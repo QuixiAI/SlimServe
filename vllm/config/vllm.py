@@ -304,6 +304,21 @@ OPTIMIZATION_LEVEL_TO_CONFIG = {
 }
 
 
+def _v2_runner_kernels_available() -> bool:
+    """The V2 runner's data-plane kernels exist natively (quixicore) on this
+    fork's CUDA target, so Triton is not a V2 requirement when they are
+    present. ROCm still needs Triton for the V2 runner until the HIP ports
+    land."""
+    if HAS_TRITON:
+        return True
+    try:
+        from vllm.quixicore import quixicore_ops
+
+        return quixicore_ops.is_available() and quixicore_ops.has("post_update")
+    except Exception:
+        return False
+
+
 @config(config=ConfigDict(arbitrary_types_allowed=True))
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
@@ -582,9 +597,10 @@ class VllmConfig:
         if not self._is_default_v2_model_runner_model():
             return False
 
-        if not HAS_TRITON:
+        if not _v2_runner_kernels_available():
             logger.warning_once(
-                "Model Runner V2 requires Triton; using the V1 model runner instead."
+                "Model Runner V2 needs Triton or the native quixicore kernels; "
+                "using the V1 model runner instead."
             )
             return False
 
@@ -2224,8 +2240,10 @@ class VllmConfig:
 
     def _validate_v2_model_runner(self) -> None:
         """Check for features not yet supported by the V2 model runner."""
-        if not HAS_TRITON:
-            raise ValueError("Model Runner V2 requires Triton.")
+        if not _v2_runner_kernels_available():
+            raise ValueError(
+                "Model Runner V2 needs Triton or the native quixicore kernels."
+            )
 
         unsupported = self._get_v2_model_runner_unsupported_features()
         if unsupported:
