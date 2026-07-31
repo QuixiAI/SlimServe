@@ -16,9 +16,10 @@ VENV=/home/hotaisle/.venv/bin/python
 # root on sys.path, where `vllm` resolves to a namespace package and fails.
 cd /
 
-TP=2
+TP=
 DP=1
 EP=0
+GPUS=
 DRAFT_ARG=
 QUANT=Q2_K
 CTX=                 # default depends on --tp; see below
@@ -29,6 +30,7 @@ SPEC=1
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tp)    TP="$2"; shift 2 ;;
+        --gpus)  GPUS="$2"; shift 2 ;;
         --dp)    DP="$2"; shift 2 ;;
         --ep)    EP=1; shift ;;
         --draft) DRAFT_ARG="$2"; shift 2 ;;
@@ -41,6 +43,22 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# --gpus 0,1,2,3 pins the run to those devices. Without it the server takes
+# every GPU it can see. TP defaults to the number of devices selected (2 when
+# neither flag is given), so `--gpus 0,1,2,3` alone means TP4.
+if [[ -n "$GPUS" ]]; then
+    export HIP_VISIBLE_DEVICES="$GPUS"
+    export CUDA_VISIBLE_DEVICES="$GPUS"
+    NUM_GPUS=$(awk -F, '{print NF}' <<<"$GPUS")
+    : "${TP:=$NUM_GPUS}"
+    if (( TP * DP > NUM_GPUS )); then
+        echo "error: tp($TP) x dp($DP) = $((TP*DP)) exceeds the $NUM_GPUS GPU(s)" \
+             "given in --gpus $GPUS" >&2
+        exit 2
+    fi
+fi
+: "${TP:=2}"
+
 case "$QUANT" in
     Q6_K)   MODEL="$MODELS/GLM-5.2-Vision-GGUF/UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf" ;;
     Q4_K)   MODEL="$MODELS/GLM-5.2-Vision-GGUF/antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-00001-of-00010.gguf" ;;
@@ -49,8 +67,6 @@ case "$QUANT" in
     *) echo "unknown quant: $QUANT (Q6_K|Q4_K|Q2_K|IQ2_XXS)" >&2; exit 2 ;;
 esac
 [[ -f "$MODEL" ]] || { echo "missing model: $MODEL" >&2; exit 1; }
-
-HF_CONFIG="$MODELS/GLM-5.2-Vision-FP8"     # config.json + tokenizer only
 
 # Speculator. Override with --draft <path-or-hf-repo>. A bare repo id is
 # resolved through the HF cache, so the 5.9 GB draft downloads on first run;
@@ -114,7 +130,7 @@ JSON
 )
 fi
 
-echo "SlimServe: $QUANT  tp=$TP  dp=$DP  ep=$EP  ctx=$CTX  max_seqs=$MAX_SEQS" \
+echo "SlimServe: $QUANT  tp=$TP  dp=$DP  ep=$EP  gpus=${GPUS:-all}  ctx=$CTX" \
      "kv=${KV_GIB}GiB  spec=$SPEC"
 [[ "$SPEC" == "1" ]] && echo "  draft: $DRAFT"
 
@@ -123,15 +139,21 @@ export VLLM_ROCM_USE_AITER=1
 
 ARGS=(
     --model "$MODEL"
-    --hf-config-path "$HF_CONFIG"
-    --tokenizer "$HF_CONFIG"
+    # No --hf-config-path / --tokenizer: GGUFConfigParser builds the whole
+    # Glm5vConfig from glm-dsa.* plus the mmproj's clip.vision.* metadata, and
+    # the tokenizer comes from the GGUF's own tokenizer.ggml.* fields.
     --trust-remote-code
     --served-model-name GLM-5.2-Vision
     --tensor-parallel-size "$TP"
     --data-parallel-size "$DP"
     --max-model-len "$CTX"
     --max-num-seqs "$MAX_SEQS"
-    --max-num-batched-tokens 16384      # 8192 breaks torch.compile range setup
+    # Prefill chunk size. Measured on 2 GPUs at this KV budget, 16384 is the
+    # only value that works: 8192 fails torch.compile range setup at startup,
+    # 32768 kills the engine mid-request with an AssertionError in the MoE
+    # shared-experts runner (its output slot is still occupied on the next
+    # forward), and 65536 OOMs on activations. Re-measure before changing.
+    --max-num-batched-tokens 16384
     --kv-cache-memory-bytes "$KV_BYTES"
     --block-size 64                     # sparse MLA + sparse SWA require a multiple of 64
     --enable-prefix-caching
