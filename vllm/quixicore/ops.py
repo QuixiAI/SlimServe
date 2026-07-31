@@ -102,15 +102,19 @@ class quixicore_ops:
         block_size: int,
         scale: float,
         kv_scale: float,
+        partition_size: int = 0,
     ) -> torch.Tensor:
         """GLM-5.2-Vision sparse MLA decode (576 fp8 slot, value = leading 512).
 
         `indices` are request-local logical token positions resolved through
         `block_table`; -1 entries are skipped. Returns [tokens, heads, 512].
+        partition_size > 0 splits the index list over blockIdx.z with an exact
+        online-softmax merge; the unpartitioned form is one warp per
+        (token, head) and starves the GPU at small batch.
         """
         return _qc().mla_decode_fp8_sparse_glm(
             q, kv_cache_u8, block_table, indices, topk_length, block_size, scale,
-            kv_scale
+            kv_scale, partition_size
         )
 
     @staticmethod

@@ -247,6 +247,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
         self._k_scale_host: float | None = None
+        self._topk_pos_cache: torch.Tensor | None = None
         # The indexer carries the shared buffer for normal layers; the explicit
         # buffer covers backbone skip layers whose indexer is not constructed.
         self.topk_indices_buffer: torch.Tensor | None = (
@@ -290,8 +291,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             0, attn_metadata.req_id_per_token[:num_tokens].to(torch.int32)
         ).to(torch.int32).contiguous()
 
-        tlen = torch.full(
-            (num_tokens,), topk, dtype=torch.int32, device=q.device
+        # Effective length per token, not the constant 2048: at short context
+        # the indexer pads most of the index list with -1, and a constant tlen
+        # makes the kernel walk every padded slot. Profiled at 48% of ALL
+        # decode GPU time before this. last-valid-position+1 is exact even if
+        # -1s were interleaved rather than trailing.
+        if (
+            self._topk_pos_cache is None
+            or self._topk_pos_cache.shape[0] != topk
+        ):
+            self._topk_pos_cache = torch.arange(
+                1, topk + 1, dtype=torch.int32, device=q.device
+            )
+        tlen = (
+            ((idx >= 0) * self._topk_pos_cache).amax(dim=-1).to(torch.int32)
         )
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
@@ -322,5 +335,6 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             attn_metadata.block_size,
             self.softmax_scale,
             k_scale,
+            partition_size=256,
         )
         return out, None
