@@ -330,3 +330,36 @@ def is_flash_attn_varlen_func_available() -> bool:
         return _ROCM_FLASH_ATTN_AVAILABLE
 
     return False
+
+
+def flash_attn_supports_quant_query_input() -> bool:
+    return not current_platform.is_xpu()
+
+
+
+def flash_attn_supports_sinks() -> bool:
+    if current_platform.is_xpu():
+        return True
+    return get_flash_attn_version() in (3, 4)
+
+
+
+def flash_attn_supports_mla():
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda():
+        try:
+            from vllm.vllm_flash_attn.flash_attn_interface import (
+                is_fa_version_supported,
+            )
+
+            return is_fa_version_supported(
+                3
+            ) and current_platform.is_device_capability_family(90)
+
+            # NOTE(Lucas): FA4 CuteDSL does NOT currently support MLA's non-standard
+            # head dimensions (576 for qk, 512 for v) due to TMEM capacity limits.
+
+        except (ImportError, AssertionError):
+            pass
+    return False
