@@ -133,11 +133,11 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         elif device_capability.major == 8:
-            # Ampere: dense MLA via Triton; sparse MLA (DSA) via the vendored
-            # QuixiCore-CUDA kernels — the sm90+ sparse backends (FlashMLA,
-            # FlashAttn-MLA, FlashInfer-MLA) do not run on sm80/sm86.
+            # Ampere is a no-Triton deployment: sparse MLA (DSA) runs on the
+            # vendored QuixiCore-CUDA kernels and nothing else is offered.
+            # TRITON_MLA is deliberately absent -- a config that needs dense
+            # MLA must fail loudly rather than silently pull Triton back in.
             return [
-                AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.QUIXICORE_MLA_SPARSE,
             ]
         else:
@@ -160,6 +160,15 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+            ]
+        elif device_capability.major == 8:
+            # Ampere, no-Triton deployment: FLASH_ATTN is the native CUDA
+            # (CUTLASS FA2) backend and the only one offered. TRITON_ATTN,
+            # FLEX_ATTENTION (inductor->Triton) and TURBOQUANT (Triton) are
+            # deliberately absent so nothing can fall back to generated
+            # kernels; an unsupportable config fails loudly instead.
+            return [
+                AttentionBackendEnum.FLASH_ATTN,
             ]
         else:
             return [
