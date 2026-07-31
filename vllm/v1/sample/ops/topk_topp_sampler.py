@@ -354,26 +354,12 @@ def apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
+    # No Triton dispatch: this fork runs native kernels only (CUDA/ROCm/ATen).
+    # The sort-based path costs ~1-2 ms at batch 32 over a 155k vocab; if the
+    # sampler ever shows in a profile, the replacement is a native pivot-search
+    # kernel in csrc/quixicore, not the Triton one.
     if current_platform.is_cpu():
-        if HAS_TRITON:
-            return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
-
-    # sm8x is a no-Triton deployment (same gate as the quixicore routing):
-    # the sort-based path is pure ATen. Costs ~1-2 ms at batch 32 over a
-    # 155k vocab; revisit with a native pivot-search kernel only if the
-    # sampler ever shows up in a profile.
-    if (
-        HAS_TRITON
-        and logits.shape[0] >= 8
-        and not (
-            current_platform.is_cuda()
-            and not current_platform.has_device_capability(89)
-        )
-    ):
-        return apply_top_k_top_p_triton(logits, k, p)
-
-    # Use pytorch sort implementation for small batch sizes.
     return apply_top_k_top_p_pytorch(logits, k, p)
 
 
