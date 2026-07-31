@@ -104,3 +104,30 @@ def mhc_post_torch(
     )
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
+
+
+def hc_head_fused_torch(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Torch reference for hc_head_fuse_tilelang (used when tilelang is
+    unavailable, e.g. sm80 deployments that avoid JIT codegen backends).
+
+    Per token: RMS statistic over all hc_mult*H elements, hc_mult projections
+    onto fn rows, sigmoid gate, then a gated sum of the hc copies.
+    """
+    num_tokens, hc_mult, hidden_size = hs_flat.shape
+    x = hs_flat.to(torch.float32).reshape(num_tokens, hc_mult * hidden_size)
+    rsqrt_val = torch.rsqrt(
+        x.square().sum(dim=-1, keepdim=True) / (hc_mult * hidden_size) + rms_eps
+    )
+    mixes = x @ fn.to(torch.float32).t()  # (T, hc_mult)
+    pre_mix = torch.sigmoid(mixes * rsqrt_val * hc_scale + hc_base) + hc_eps
+    out = torch.einsum(
+        "tm,tmh->th", pre_mix, hs_flat.to(torch.float32)
+    )
+    return out.to(torch.bfloat16)
