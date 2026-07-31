@@ -139,6 +139,53 @@ TypeHint: TypeAlias = type[Any] | object
 TypeHintT: TypeAlias = type[T] | object
 
 
+_GLM_DSPARK_DRAFT_REPO = "RedHatAI/GLM-5.2-speculator.dspark"
+
+
+def _default_glm_dspark_config(
+    target_model_config: "ModelConfig",
+) -> dict[str, Any] | None:
+    """DSpark speculation on by default for the GLM-5.2 GGUF this fork serves.
+
+    Mirrors run-glm-optimized.sh: a local checkout next to the weights wins,
+    otherwise the HF repo id is used and the 5.9 GB draft downloads on first
+    run. num_speculative_tokens=3 is the measured sweet spot (mean accept
+    length grows only 2.70 -> 3.07 from 3 to 7 draft tokens while verify
+    width doubles). Disable with VLLM_DISABLE_SPEC=1 or override by passing
+    any speculative_config.
+    """
+    import os as _os
+
+    if _os.environ.get("VLLM_DISABLE_SPEC") == "1":
+        return None
+    model = str(target_model_config.model)
+    if "GLM-5.2" not in model or ".gguf" not in model.lower():
+        return None
+    local = _os.path.join(
+        _os.path.dirname(_os.path.dirname(model)), "GLM-5.2-speculator.dspark"
+    )
+    draft = local if _os.path.isdir(local) else _GLM_DSPARK_DRAFT_REPO
+    cfg: dict[str, Any] = {
+        "method": "dspark",
+        "model": draft,
+        "num_speculative_tokens": 3,
+    }
+    from vllm.platforms import current_platform
+
+    if current_platform.is_cuda() and not current_platform.has_device_capability(
+        89
+    ):
+        # Draft KV stays bf16 below sm89: the standard-attention backends
+        # there reject fp8 KV (no fp8e4nv), and the draft cache is tiny.
+        cfg["kv_cache_dtype"] = "auto"
+    logger.info(
+        "Defaulting to DSpark speculation (draft=%s, k=3). "
+        "Set VLLM_DISABLE_SPEC=1 to disable.",
+        draft,
+    )
+    return cfg
+
+
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
     def _parse_type(val: str) -> T:
         try:
@@ -1797,6 +1844,10 @@ class EngineArgs:
                 )
             self.speculative_config[key] = value
 
+        if self.speculative_config is None:
+            self.speculative_config = _default_glm_dspark_config(
+                target_model_config
+            )
         if self.speculative_config is None:
             return None
 
