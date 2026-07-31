@@ -3,6 +3,7 @@
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 
 
 def prepare_dcp_local_seq_lens(
@@ -19,7 +20,7 @@ def prepare_dcp_local_seq_lens(
 
     max_num_reqs = dcp_local_seq_lens.shape[0]
     BLOCK_SIZE = 128
-    num_blocks = triton.cdiv(max_num_reqs, BLOCK_SIZE)
+    num_blocks = cdiv(max_num_reqs, BLOCK_SIZE)
     _dcp_local_seq_lens_kernel[(num_blocks,)](
         dcp_local_seq_lens,
         seq_lens,

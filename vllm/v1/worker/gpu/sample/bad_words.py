@@ -176,6 +176,25 @@ def apply_bad_words(
     max_num_bad_words: int,
 ) -> None:
     num_tokens = logits.shape[0]
+    from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+    if _use_native_sample_kernels() and logits.dtype == torch.float32:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_bad_words(
+            logits,
+            expanded_idx_mapping,
+            bad_word_token_ids,
+            bad_word_offsets,
+            num_bad_words,
+            all_token_ids,
+            prompt_len,
+            total_len,
+            input_ids,
+            expanded_local_pos,
+        )
+        return
+
     _bad_words_kernel[(num_tokens, max_num_bad_words)](
         logits,
         logits.stride(0),

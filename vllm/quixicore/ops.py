@@ -623,6 +623,109 @@ class quixicore_ops:
             vocab_size,
         )
 
+    @staticmethod
+    def v2_grammar_bitmask(
+        logits: torch.Tensor,
+        logits_indices: torch.Tensor,
+        bitmask: torch.Tensor,
+        num_masks: int,
+    ) -> None:
+        _qc().v2_grammar_bitmask(logits, logits_indices, bitmask, num_masks)
+
+    @staticmethod
+    def v2_min_p(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        min_p: torch.Tensor,
+    ) -> None:
+        _qc().v2_min_p(logits, expanded_idx_mapping, min_p)
+
+    @staticmethod
+    def v2_logit_bias(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        pos: torch.Tensor,
+        num_allowed_token_ids: torch.Tensor,
+        allowed_token_ids: torch.Tensor,
+        num_logit_bias: torch.Tensor,
+        logit_bias_token_ids: torch.Tensor,
+        logit_bias: torch.Tensor,
+        min_lens: torch.Tensor,
+        num_stop_token_ids: torch.Tensor,
+        stop_token_ids: torch.Tensor,
+    ) -> None:
+        _qc().v2_logit_bias(
+            logits, expanded_idx_mapping, pos, num_allowed_token_ids,
+            allowed_token_ids, num_logit_bias, logit_bias_token_ids,
+            logit_bias, min_lens, num_stop_token_ids, stop_token_ids,
+        )
+
+    @staticmethod
+    def v2_bad_words(
+        logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        bad_word_token_ids: torch.Tensor,
+        bad_word_offsets: torch.Tensor,
+        num_bad_words: torch.Tensor,
+        all_token_ids: torch.Tensor,
+        prompt_len: torch.Tensor,
+        total_len: torch.Tensor,
+        input_ids: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+    ) -> None:
+        _qc().v2_bad_words(
+            logits, expanded_idx_mapping, bad_word_token_ids,
+            bad_word_offsets, num_bad_words, all_token_ids, prompt_len,
+            total_len, input_ids, expanded_local_pos,
+        )
+
+    @staticmethod
+    def v2_local_logits_stats(
+        t_local_argmax: torch.Tensor,
+        t_local_max: torch.Tensor,
+        t_local_sumexp: torch.Tensor,
+        d_local_max: torch.Tensor,
+        d_local_sumexp: torch.Tensor,
+        target_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        vocab_size: int,
+        num_speculative_steps: int,
+    ) -> None:
+        _qc().v2_local_logits_stats(
+            t_local_argmax, t_local_max, t_local_sumexp, d_local_max,
+            d_local_sumexp, target_logits, draft_logits, expanded_idx_mapping,
+            expanded_local_pos, temperature, vocab_size, num_speculative_steps,
+        )
+
+    @staticmethod
+    def v2_insert_resampled(
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        rl_argmax: torch.Tensor,
+        rl_max: torch.Tensor,
+        resample_num_blocks: int,
+        cu_num_logits: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> None:
+        _qc().v2_insert_resampled(
+            sampled, num_sampled, rl_argmax, rl_max, resample_num_blocks,
+            cu_num_logits, expanded_idx_mapping, temperature,
+        )
+
+    @staticmethod
+    def v2_flatten_sampled(
+        flat_sampled: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+    ) -> None:
+        _qc().v2_flatten_sampled(flat_sampled, sampled, num_sampled,
+                                 cu_num_logits)
+
     # ------------------------------------------------------------------
     # Stubs: kernels QuixiCore-CUDA does not implement yet.
     # Each delegates to the in-tree pure-torch reference so the path works

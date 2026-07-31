@@ -49,6 +49,14 @@ def apply_min_p(
     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
 ) -> None:
     num_tokens, vocab_size = logits.shape
+    from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+    if _use_native_sample_kernels() and logits.dtype == torch.float32:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_min_p(logits, expanded_idx_mapping, min_p)
+        return
+
     BLOCK_SIZE = 1024
     _min_p_kernel[(num_tokens,)](
         logits,

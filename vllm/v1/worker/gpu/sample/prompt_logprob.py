@@ -184,6 +184,20 @@ def get_prompt_logprobs_token_ids(
 ) -> torch.Tensor:
     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
     num_reqs = idx_mapping.shape[0]
+    from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+    if _use_native_sample_kernels():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_prompt_logprobs_token_ids(
+            token_ids,
+            query_start_loc,
+            idx_mapping,
+            num_computed_tokens,
+            all_token_ids,
+        )
+        return token_ids
+
     _prompt_logprobs_token_ids_kernel[(num_reqs,)](
         token_ids,
         query_start_loc,

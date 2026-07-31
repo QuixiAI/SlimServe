@@ -5,6 +5,7 @@ import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import next_power_of_2
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
@@ -253,7 +254,31 @@ def apply_logit_bias(
     stop_token_ids: torch.Tensor,
 ) -> None:
     num_tokens, vocab_size = logits.shape
-    BLOCK_SIZE = triton.next_power_of_2(
+    from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
+
+    if (
+        _use_native_sample_kernels()
+        and logits.dtype == torch.float32
+        and pos.dtype == torch.int64
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_logit_bias(
+            logits,
+            expanded_idx_mapping,
+            pos,
+            num_allowed_token_ids,
+            allowed_token_ids,
+            num_logit_bias,
+            logit_bias_token_ids,
+            logit_bias,
+            min_lens,
+            num_stop_token_ids,
+            stop_token_ids,
+        )
+        return
+
+    BLOCK_SIZE = next_power_of_2(
         max(
             allowed_token_ids.shape[-1],
             logit_bias_token_ids.shape[-1],

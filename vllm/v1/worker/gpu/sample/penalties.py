@@ -8,6 +8,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 from vllm.v1.worker.gpu.states import RequestState
 
 
@@ -195,6 +196,22 @@ def apply_penalties(
     output_bin_counts: torch.Tensor,
 ) -> None:
     num_tokens, vocab_size = logits.shape
+    if _use_native_sample_kernels() and logits.dtype == torch.float32:
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_penalties(
+            logits,
+            expanded_idx_mapping,
+            token_ids,
+            expanded_local_pos,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            prompt_bin_mask,
+            output_bin_counts,
+        )
+        return
+
     BLOCK_SIZE = 8192
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     _penalties_kernel[(num_tokens, num_blocks)](
@@ -281,6 +298,20 @@ def bincount(
     prompt_bin_mask.index_fill_(0, idx_long, 0)
     output_bin_counts.index_fill_(0, idx_long, 0)
     num_tokens = expanded_idx_mapping.shape[0]
+    if _use_native_sample_kernels():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_bincount(
+            expanded_idx_mapping,
+            all_token_ids,
+            prompt_len,
+            prefill_len,
+            prompt_bin_mask,
+            output_bin_counts,
+            max_prefill_len,
+        )
+        return
+
     BLOCK_SIZE = 1024
     num_blocks = triton.cdiv(max_prefill_len, BLOCK_SIZE)
     _bincount_kernel[(num_tokens, num_blocks)](

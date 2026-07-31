@@ -1,8 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from functools import cache
+
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+from vllm.utils.math_utils import cdiv
+
+
+@cache
+def _use_native_sample_kernels() -> bool:
+    """Prefer the native CUDA sampler kernels over the Triton ones."""
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has("v2_gumbel_sample")
+
+
+_GUMBEL_LOGITS_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
 # zero draws before the flipped Gumbel transform below.
@@ -46,8 +64,17 @@ def apply_temperature(
     temperature: torch.Tensor,
 ) -> None:
     num_tokens, vocab_size = logits.shape
+    if _use_native_sample_kernels() and logits.dtype == torch.float32:
+        # Native CUDA equivalent, bit-identical to the Triton kernel below.
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_apply_temperature(
+            logits, expanded_idx_mapping, temperature
+        )
+        return
+
     BLOCK_SIZE = 8192
-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    num_blocks = cdiv(vocab_size, BLOCK_SIZE)
     _temperature_kernel[(num_tokens, num_blocks)](
         logits,
         logits.stride(0),
@@ -230,7 +257,7 @@ def gumbel_sample(
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
     BLOCK_SIZE = 1024
-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    num_blocks = cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
     local_max_dtype = torch.float64 if use_fp64 else torch.float32
     local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
@@ -238,6 +265,35 @@ def gumbel_sample(
         output_processed_logits_col is not None
         and output_processed_logits_col.dim() > 0
     )
+    if (
+        _use_native_sample_kernels()
+        and logits.dtype in _GUMBEL_LOGITS_DTYPES
+        and pos.dtype == torch.int64
+        and (
+            output_processed_logits is None
+            or output_processed_logits.dtype == torch.float32
+        )
+    ):
+        # Native CUDA equivalent (bit-identical, incl. the Philox-based
+        # Gumbel noise); shares the local argmax/max reduction below.
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_gumbel_sample(
+            local_argmax,
+            local_max,
+            output_processed_logits,
+            output_processed_logits_col,
+            logits,
+            expanded_idx_mapping,
+            seed,
+            pos,
+            temperature,
+            apply_temperature,
+            per_token_col,
+        )
+        max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+        return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+
     _gumbel_sample_kernel[(num_tokens, num_blocks)](
         local_argmax,
         local_argmax.stride(0),
