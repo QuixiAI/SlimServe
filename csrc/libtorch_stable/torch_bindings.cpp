@@ -589,6 +589,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_dequantize(Tensor W, int type, SymInt m, SymInt n, ScalarType? "
       "dtype) -> Tensor");
 
+#ifndef USE_ROCM
+  ops.def(
+      "ggml_dequantize_into(Tensor W, int type, SymInt m, SymInt n, "
+      "Tensor! out) -> ()");
+#endif
+
   // mmvq kernel for GGML.
   ops.def(
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
@@ -765,6 +771,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
   // GGML kernels
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
+#ifndef USE_ROCM
+  ops.impl("ggml_dequantize_into", TORCH_BOX(&ggml_dequantize_into));
+#endif
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));

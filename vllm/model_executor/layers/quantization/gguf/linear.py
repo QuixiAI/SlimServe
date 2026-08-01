@@ -35,6 +35,47 @@ from .utils import (
 )
 
 
+def _cublas_dequant_enabled() -> bool:
+    if current_platform.is_rocm():
+        return False
+    return os.environ.get("VLLM_GGUF_CUBLAS", "1").lower() not in ("0", "false")
+
+
+def _cublas_min_batch(rows: int) -> int:
+    """Smallest batch where dequant-to-bf16 + cuBLAS beats mmq_v2 for q8_0.
+
+    Measured on idle A100 across N in {1536..12288}, K in {2048..8192}:
+    mmq_v2 wins through 64 tokens, the routes cross at 96 for N <= 6144
+    (1.1-1.4x for cuBLAS, growing to 1.5-1.8x at 256), while N = 12288 stays
+    a tie until 160 because mmq_v2's tile wave still fits the SMs there.
+    """
+    override = os.environ.get("VLLM_GGUF_CUBLAS_MIN_BATCH")
+    if override:
+        return int(override)
+    return 160 if rows >= 8192 else 96
+
+
+_q8_0_scratch: dict[tuple[torch.device, int, int, torch.dtype], torch.Tensor] = {}
+
+
+def _q8_0_dequant_scratch(
+    qweight: torch.Tensor, rows: int, cols: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Reused dequant buffer, keyed by shape.
+
+    Allocated once on first use and held forever, so every later call --
+    including CUDA graph replays -- sees a fixed pointer. A first use inside
+    graph capture allocates from the capture pool, which is also safe because
+    the buffer is never freed.
+    """
+    key = (qweight.device, rows, cols, dtype)
+    buf = _q8_0_scratch.get(key)
+    if buf is None:
+        buf = torch.empty(rows, cols, dtype=dtype, device=qweight.device)
+        _q8_0_scratch[key] = buf
+    return buf
+
+
 def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
     """Largest batch for which the GEMV kernel still beats the GEMM kernel.
 
@@ -73,6 +114,18 @@ def _fused_mul_mat_gguf(
         return x @ qweight.T
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
+    elif (
+        qweight_type == WeightType.Q8_0
+        and x.shape[0] >= _cublas_min_batch(qweight.shape[0])
+        and _cublas_dequant_enabled()
+    ):
+        weight = _q8_0_dequant_scratch(
+            qweight, qweight.shape[0], x.shape[1], x.dtype
+        )
+        ops.ggml_dequantize_into(
+            qweight, qweight_type, weight.shape[0], weight.shape[1], weight
+        )
+        y = x @ weight.T
     elif qweight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     elif qweight_type in DEQUANT_TYPES:

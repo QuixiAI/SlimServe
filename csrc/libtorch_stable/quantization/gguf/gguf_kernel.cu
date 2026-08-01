@@ -96,6 +96,24 @@ torch::stable::Tensor ggml_dequantize(
   return DW;
 }
 
+#ifndef USE_ROCM
+// Dequantize into a caller-provided buffer. Skips the alloc and zero-fill of
+// ggml_dequantize so a persistent scratch can be reused per call, which keeps
+// the wide-batch cuBLAS route CUDA-graph safe (fixed pointer, no capture-time
+// allocs beyond the first touch).
+void ggml_dequantize_into(torch::stable::Tensor W, int64_t type, int64_t m,
+                          int64_t n, torch::stable::Tensor Y) {
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      W.get_device_index());
+  cudaStream_t stream = get_current_cuda_stream();
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      Y.scalar_type(), "ggml_dequantize_into", [&] {
+        auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+        to_cuda((void*)W.data_ptr(), (scalar_t*)Y.data_ptr(), m * n, stream);
+      });
+}
+#endif  // USE_ROCM
+
 torch::stable::Tensor ggml_mul_mat_vec_a8(
     torch::stable::Tensor W,  // quant weight
     torch::stable::Tensor X,  // input
