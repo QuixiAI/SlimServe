@@ -534,6 +534,25 @@ static inline bool moe_skip_padding_pays(int rows, int tokens_post_padded,
   return rows < num_experts * mmq_x;
 }
 
+// Taller 4x64 tile once the routed rows can fill the grid twice over: at
+// GLM shapes (E=256, w1 [1024,6144] / w2 [6144,512]) mmq_y=64 measured
+// 13-16% faster at 1024/2048 routed rows (bs=32/64 verify) and slower below,
+// where the wider grid is needed for occupancy. mmq_x stays 4, so
+// moe_align_block_size layout is unchanged. VLLM_GGUF_MOE_Q2K_Y64=0 pins the
+// legacy 4x32 tile at every width.
+static inline bool moe_q2_K_use_y64(int rows) {
+#ifdef USE_ROCM
+  (void)rows;
+  return false;  // ROCm keeps its tuned 8x128 config untouched
+#else
+  static const bool enabled = [] {
+    const char* s = std::getenv("VLLM_GGUF_MOE_Q2K_Y64");
+    return !(s && (s[0] == '0' || s[0] == 'f' || s[0] == 'F'));
+  }();
+  return enabled && rows >= 1024;
+#endif
+}
+
 template <typename scalar_t>
 static void ggml_moe_q2_K_q8_1_cuda(
     const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
@@ -542,36 +561,48 @@ static void ggml_moe_q2_K_q8_1_cuda(
     const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
     const int tokens_post_padded, cudaStream_t stream) {
   const int mmq_x = MOE_X_Q2_K;
-  const int mmq_y = MOE_Y_Q2_K;
   const int nwarps = MOE_NWARPS_Q2_K;
+  const int rows = ncols_y * top_k;
+  const bool y64 = moe_q2_K_use_y64(rows);
+  const int mmq_y = y64 ? 2 * MOE_Y_Q2_K : MOE_Y_Q2_K;
 
   const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
   const int block_num_y = (tokens_post_padded) / mmq_x;
   const dim3 block_nums(block_num_x, block_num_y, 1);
   const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
-#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING)                       \
-  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MOE_Y_Q2_K, MOE_NWARPS_Q2_K,    \
+#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MMQ_Y)                \
+  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MMQ_Y, MOE_NWARPS_Q2_K,         \
            SKIP_PADDING><<<block_nums, block_dims, 0, stream>>>(             \
       w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,     \
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k)
 
+#define VLLM_MOE_Q2_K_LAUNCH_Y(NEED_CHECK, SKIP_PADDING)                     \
+  do {                                                                       \
+    if (y64) {                                                               \
+      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, 2 * MOE_Y_Q2_K);        \
+    } else {                                                                 \
+      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MOE_Y_Q2_K);            \
+    }                                                                        \
+  } while (0)
+
   const bool need_check = nrows_x % mmq_y != 0;
   const bool skip_padding =
-      moe_skip_padding_pays(ncols_y * top_k, tokens_post_padded, mmq_x);
+      moe_skip_padding_pays(rows, tokens_post_padded, mmq_x);
   if (need_check) {
     if (skip_padding) {
-      VLLM_MOE_Q2_K_LAUNCH(true, true);
+      VLLM_MOE_Q2_K_LAUNCH_Y(true, true);
     } else {
-      VLLM_MOE_Q2_K_LAUNCH(true, false);
+      VLLM_MOE_Q2_K_LAUNCH_Y(true, false);
     }
   } else {
     if (skip_padding) {
-      VLLM_MOE_Q2_K_LAUNCH(false, true);
+      VLLM_MOE_Q2_K_LAUNCH_Y(false, true);
     } else {
-      VLLM_MOE_Q2_K_LAUNCH(false, false);
+      VLLM_MOE_Q2_K_LAUNCH_Y(false, false);
     }
   }
+#undef VLLM_MOE_Q2_K_LAUNCH_Y
 #undef VLLM_MOE_Q2_K_LAUNCH
 }
 
