@@ -108,10 +108,13 @@ def _fused_moe_gguf(
         # vec still wins at 4 tokens (40.2 vs 41.3 ms/step; real routing is
         # near-uncorrelated so MMQ streams as many experts as vec) but loses
         # from 32 tokens up (720 vs 604 us kernel-level, -10% ms/step e2e at
-        # bs=8). 16 keeps bs<=4 verify on vec, flips bs>=5 verify to MMQ.
+        # bs=8). Once the MMQ tile stopped computing its padding columns it
+        # also won at 16 tokens (331 vs 360 us kernel-level, -10.3% ms/step at
+        # bs=4), so the limit moved 16 -> 8: bs=1 verify stays on vec, bs>=2
+        # verify goes to MMQ.
         w1_vec = vec_ok and (
             not mmq_ok
-            or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1", 16)
+            or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1", 8)
         )
         # On A100 the w2 crossover sits below any batch this serves: forcing the
         # MMQ tile kernel measured neutral at 8 routed rows and +2.9% / +6.7% at

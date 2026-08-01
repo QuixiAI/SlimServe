@@ -1,11 +1,22 @@
 #include <cstdint>
+#include <cstdlib>
 
 /* Adapted from ./csrc/quantization/gguf/mmq.cuh
    based on ./vllm/model_executor/layers/fused_moe/experts/triton_moe.py */
+// `skip_padding`: moe_align_block_size pads every expert up to a full mmq_x
+// block, so at the verify widths this serves most columns of a tile are
+// padding -- at 256 routed rows over 164 experts only 256 of 656 slots are
+// real. Padding slots hold sorted_token_ids >= ncols_dst, their y-tile is never
+// loaded and the write-back already drops them, but the dot product still ran
+// for them. The predicate is warp-uniform (the column index is derived from
+// threadIdx.y), so skipping costs one branch per column. Callers turn it off
+// once the routed rows outnumber the padded slots, where the branch is pure
+// overhead.
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum,
           typename block_q_t, int mmq_x, int mmq_y, int nwarps,
           allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles,
-          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, int y_spans_per_stage = 1>
+          int vdr, vec_dot_q_mul_mat_cuda_t vec_dot, int y_spans_per_stage = 1,
+          bool skip_padding = false>
 static __device__ __forceinline__ void moe_q(
     const void* __restrict__ vx, const void* __restrict__ vy,
     scalar_t* __restrict__ dst, const int* __restrict__ sorted_token_ids,
@@ -130,12 +141,17 @@ static __device__ __forceinline__ void moe_q(
         const half2* span_y_ds =
             tile_y_ds + span * mmq_x * WARP_SIZE_GGUF / QI8_1;
 
-        // #pragma unroll // unrolling this loop causes too much register
-        // pressure
-        for (int k = ir * WARP_SIZE_GGUF / qr;
-             k < (ir + 1) * WARP_SIZE_GGUF / qr; k += vdr) {
+        // j outermost so a padding column skips its whole k sweep; the k order
+        // per (i, j) is unchanged, so the accumulation stays bitwise identical.
 #pragma unroll
-          for (int j = 0; j < mmq_x; j += nwarps) {
+        for (int j = 0; j < mmq_x; j += nwarps) {
+          if (skip_padding && token_offs[j / nwarps] >= ncols_dst) {
+            continue;
+          }
+          // #pragma unroll // unrolling this loop causes too much register
+          // pressure
+          for (int k = ir * WARP_SIZE_GGUF / qr;
+               k < (ir + 1) * WARP_SIZE_GGUF / qr; k += vdr) {
 #pragma unroll
             for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
               sum[i / WARP_SIZE_GGUF][j / nwarps] +=
@@ -482,7 +498,8 @@ static void ggml_moe_q8_0_q8_1_cuda(
   #define MOE_NWARPS_Q2_K 4
 #endif
 
-template <typename scalar_t, bool need_check, int mmq_x, int mmq_y, int nwarps>
+template <typename scalar_t, bool need_check, int mmq_x, int mmq_y, int nwarps,
+          bool skip_padding = false>
 static __global__ void
 #if defined(USE_ROCM)
 __launch_bounds__(WARP_SIZE_GGUF* nwarps, 2)
@@ -495,9 +512,26 @@ __launch_bounds__(WARP_SIZE_GGUF* nwarps, 2)
              const int top_k) {
   moe_q<scalar_t, QK_K, QR2_K, QI2_K, false, block_q2_K, mmq_x, mmq_y, nwarps,
         allocate_tiles_q2_K<mmq_y>, load_tiles_q2_K<mmq_y, nwarps, need_check>,
-        VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat, 2>(
+        VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat, 2, skip_padding>(
       vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+// True when moe_align_block_size left enough padding for skipping it to pay:
+// the buffer it sizes is rows + num_experts * (mmq_x - 1), so recovering the
+// expert count from the padded length tells us whether experts average fewer
+// than mmq_x routed rows -- the regime where most tile columns are padding.
+static inline bool moe_skip_padding_pays(int rows, int tokens_post_padded,
+                                         int mmq_x) {
+  static const bool enabled = [] {
+    const char* s = std::getenv("VLLM_GGUF_MOE_SKIP_PAD");
+    return !(s && (s[0] == '0' || s[0] == 'f' || s[0] == 'F'));
+  }();
+  if (!enabled || mmq_x <= 1 || tokens_post_padded <= rows) {
+    return false;
+  }
+  const int num_experts = (tokens_post_padded - rows) / (mmq_x - 1);
+  return rows < num_experts * mmq_x;
 }
 
 template <typename scalar_t>
@@ -516,17 +550,27 @@ static void ggml_moe_q2_K_q8_1_cuda(
   const dim3 block_nums(block_num_x, block_num_y, 1);
   const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
-#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK)                                     \
-  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MOE_Y_Q2_K, MOE_NWARPS_Q2_K>    \
-      <<<block_nums, block_dims, 0, stream>>>(                               \
-          w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
-          exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k)
+#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING)                       \
+  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MOE_Y_Q2_K, MOE_NWARPS_Q2_K,    \
+           SKIP_PADDING><<<block_nums, block_dims, 0, stream>>>(             \
+      w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,     \
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k)
 
   const bool need_check = nrows_x % mmq_y != 0;
+  const bool skip_padding =
+      moe_skip_padding_pays(ncols_y * top_k, tokens_post_padded, mmq_x);
   if (need_check) {
-    VLLM_MOE_Q2_K_LAUNCH(true);
+    if (skip_padding) {
+      VLLM_MOE_Q2_K_LAUNCH(true, true);
+    } else {
+      VLLM_MOE_Q2_K_LAUNCH(true, false);
+    }
   } else {
-    VLLM_MOE_Q2_K_LAUNCH(false);
+    if (skip_padding) {
+      VLLM_MOE_Q2_K_LAUNCH(false, true);
+    } else {
+      VLLM_MOE_Q2_K_LAUNCH(false, false);
+    }
   }
 #undef VLLM_MOE_Q2_K_LAUNCH
 }
