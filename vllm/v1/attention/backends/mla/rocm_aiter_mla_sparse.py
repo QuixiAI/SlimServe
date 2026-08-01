@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
-
 import os
+from dataclasses import dataclass
+from functools import cache
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -46,6 +46,16 @@ _ALWAYS_REBUILD_MLA_META = (
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 logger = init_logger(__name__)
+
+
+@cache
+def _use_native_sparse_index() -> bool:
+    """Prefer the native HIP indexer kernels over the Triton ones."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has(
+        "convert_req_index_to_global_index"
+    )
 
 
 @triton.jit
@@ -151,6 +161,20 @@ def triton_convert_req_index_to_global_index(
     bt_stride0, bt_stride1 = block_table_c.stride()
     ti_stride0, ti_stride1 = token_indices_c.stride()
 
+    if _use_native_sparse_index():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.convert_req_index_to_global_index(
+            req_id_c,
+            block_table_c,
+            token_indices_c,
+            cu_seqlens,
+            paged_kv_indices,
+            BLOCK_SIZE,
+            NUM_TOPK_TOKENS,
+        )
+        return
+
     # Exact 2D grid: tokens × column tiles
     grid = (num_tokens, tiles_per_row)
 
@@ -214,6 +238,12 @@ def generate_sparse_seqlen_triton(
     num_seqs = query_lens.size(0)
     # zero initialize the tensor to make sure invalid positions will be zero
     out = torch.zeros([num_tokens], dtype=torch.int32, device=query_lens.device)
+    if _use_native_sparse_index():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.generate_sparse_seqlen(seq_lens, cu_query_lens, out, topk_token)
+        return out
+
     block_size = 64
     num_block_per_row = triton.cdiv(max_query_len, block_size)
     grid = (

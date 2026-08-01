@@ -113,8 +113,15 @@ class quixicore_ops:
         (token, head) and starves the GPU at small batch.
         """
         return _qc().mla_decode_fp8_sparse_glm(
-            q, kv_cache_u8, block_table, indices, topk_length, block_size, scale,
-            kv_scale, partition_size
+            q,
+            kv_cache_u8,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            partition_size,
         )
 
     @staticmethod
@@ -143,9 +150,19 @@ class quixicore_ops:
     ) -> None:
         """Native CUDA DSA indexer metadata (replaces a Triton kernel)."""
         _qc().indexer_metadata(
-            query_start_loc, uncompressed_seq_lens, cu_compressed_seq_lens,
-            row_start_cu, token_to_seq, cu_ks, cu_ke, query_slice_start,
-            query_slice_stop, dcp_rank, dcp_world, dcp_interleave, compress_ratio,
+            query_start_loc,
+            uncompressed_seq_lens,
+            cu_compressed_seq_lens,
+            row_start_cu,
+            token_to_seq,
+            cu_ks,
+            cu_ke,
+            query_slice_start,
+            query_slice_stop,
+            dcp_rank,
+            dcp_world,
+            dcp_interleave,
+            compress_ratio,
         )
 
     @staticmethod
@@ -166,9 +183,19 @@ class quixicore_ops:
     ) -> None:
         """Native CUDA token -> KV-slot mapping (replaces a Triton kernel)."""
         _qc().compute_slot_mapping(
-            query_start_loc, positions, block_table, slot_mapping, num_tokens,
-            max_num_tokens, block_size, kv_cache_block_size, blocks_per_kv_block,
-            cp_world, cp_rank, cp_interleave, pad_id,
+            query_start_loc,
+            positions,
+            block_table,
+            slot_mapping,
+            num_tokens,
+            max_num_tokens,
+            block_size,
+            kv_cache_block_size,
+            blocks_per_kv_block,
+            cp_world,
+            cp_rank,
+            cp_interleave,
+            pad_id,
         )
 
     # ------------------------------------------------------------------
@@ -213,7 +240,11 @@ class quixicore_ops:
     ) -> None:
         """Native `_prepare_pos_seq_lens_kernel`."""
         _qc().prepare_pos_seq_lens(
-            pos, seq_lens, idx_mapping, query_start_loc, num_computed_tokens,
+            pos,
+            seq_lens,
+            idx_mapping,
+            query_start_loc,
+            num_computed_tokens,
             max_num_reqs,
         )
 
@@ -230,8 +261,13 @@ class quixicore_ops:
     ) -> None:
         """Native `_prepare_prefill_inputs_kernel` (input_batch.py)."""
         _qc().prepare_prefill_inputs(
-            input_ids, next_prefill_tokens, idx_mapping, query_start_loc,
-            all_token_ids, all_token_ids_stride, prefill_lens,
+            input_ids,
+            next_prefill_tokens,
+            idx_mapping,
+            query_start_loc,
+            all_token_ids,
+            all_token_ids_stride,
+            prefill_lens,
             num_computed_tokens,
         )
 
@@ -251,9 +287,17 @@ class quixicore_ops:
     ) -> None:
         """Native `_combine_sampled_and_draft_tokens_kernel`."""
         _qc().combine_sampled_and_draft_tokens(
-            input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
-            seq_lens, prefill_len, draft_tokens, draft_tokens_stride,
-            cu_num_logits, logits_indices, num_new_sampled_tokens,
+            input_ids,
+            idx_mapping,
+            last_sampled_tokens,
+            query_start_loc,
+            seq_lens,
+            prefill_len,
+            draft_tokens,
+            draft_tokens_stride,
+            cu_num_logits,
+            logits_indices,
+            num_new_sampled_tokens,
         )
 
     @staticmethod
@@ -267,7 +311,11 @@ class quixicore_ops:
     ) -> None:
         """Native `_get_num_sampled_and_rejected_kernel`."""
         _qc().get_num_sampled_and_rejected(
-            num_sampled, num_rejected, seq_lens, cu_num_logits, idx_mapping,
+            num_sampled,
+            num_rejected,
+            seq_lens,
+            cu_num_logits,
+            idx_mapping,
             prefill_len,
         )
 
@@ -289,10 +337,19 @@ class quixicore_ops:
     ) -> None:
         """Native `_post_update_kernel`."""
         _qc().post_update(
-            idx_mapping, num_computed_tokens, last_sampled_tokens,
-            output_bin_counts, output_bin_counts_stride, sampled_tokens,
-            sampled_tokens_stride, num_sampled, num_rejected, query_start_loc,
-            all_token_ids, all_token_ids_stride, total_len,
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            output_bin_counts,
+            output_bin_counts_stride,
+            sampled_tokens,
+            sampled_tokens_stride,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            all_token_ids,
+            all_token_ids_stride,
+            total_len,
         )
 
     @staticmethod
@@ -331,8 +388,14 @@ class quixicore_ops:
     ) -> None:
         """Native `_gather_block_tables_kernel` (V2 worker block tables)."""
         _qc().gather_block_tables(
-            idx_mapping, src_ptrs, dst_ptrs, strides, num_blocks,
-            num_blocks_stride, num_reqs, num_reqs_padded,
+            idx_mapping,
+            src_ptrs,
+            dst_ptrs,
+            strides,
+            num_blocks,
+            num_blocks_stride,
+            num_reqs,
+            num_reqs_padded,
         )
 
     @staticmethod
@@ -353,10 +416,19 @@ class quixicore_ops:
     ) -> None:
         """Native `_compute_slot_mappings_kernel` (V2 worker, multi-group)."""
         _qc().compute_slot_mappings(
-            idx_mapping, query_start_loc, pos, block_table_ptrs,
-            block_table_strides, block_sizes, slot_mappings,
-            slot_mappings_stride, max_num_tokens, cp_rank, cp_size,
-            cp_interleave, pad_id,
+            idx_mapping,
+            query_start_loc,
+            pos,
+            block_table_ptrs,
+            block_table_strides,
+            block_sizes,
+            slot_mappings,
+            slot_mappings_stride,
+            max_num_tokens,
+            cp_rank,
+            cp_size,
+            cp_interleave,
+            pad_id,
         )
 
     @staticmethod
@@ -373,9 +445,15 @@ class quixicore_ops:
     ) -> None:
         """Native `_prepare_uniform_decode_kernel` (DSA indexer)."""
         _qc().prepare_uniform_decode(
-            seq_lens, decode_seq_lens, block_table, block_table_stride,
-            expanded_block_table, expanded_bt_stride, decode_lens,
-            max_decode_len, num_decode_tokens,
+            seq_lens,
+            decode_seq_lens,
+            block_table,
+            block_table_stride,
+            expanded_block_table,
+            expanded_bt_stride,
+            decode_lens,
+            max_decode_len,
+            num_decode_tokens,
         )
 
     @staticmethod
@@ -426,9 +504,7 @@ class quixicore_ops:
         slot_mapping: torch.Tensor,
         block_size: int,
     ) -> None:
-        _qc().mla_kv_insert(
-            kv_c, k_pe, cos, sin, kv_cache, slot_mapping, block_size
-        )
+        _qc().mla_kv_insert(kv_c, k_pe, cos, sin, kv_cache, slot_mapping, block_size)
 
     # ------------------------------------------------------------------
     # DSA lightning indexer
@@ -489,9 +565,17 @@ class quixicore_ops:
     ) -> None:
         """Per-(token, vocab-block) Gumbel-max partials; the caller reduces."""
         _qc().v2_gumbel_sample(
-            local_argmax, local_max, processed_logits, processed_logits_col,
-            logits, expanded_idx_mapping, seeds, pos, temperature,
-            apply_temperature, per_token_col,
+            local_argmax,
+            local_max,
+            processed_logits,
+            processed_logits_col,
+            logits,
+            expanded_idx_mapping,
+            seeds,
+            pos,
+            temperature,
+            apply_temperature,
+            per_token_col,
         )
 
     @staticmethod
@@ -518,8 +602,13 @@ class quixicore_ops:
         num_topk: int,
     ) -> None:
         _qc().v2_fill_logprob_token_ids(
-            out_token_ids, out_valid_mask, sampled_token_ids, topk_indices,
-            expanded_idx_mapping, num_per_req_token_ids, per_req_token_ids,
+            out_token_ids,
+            out_valid_mask,
+            sampled_token_ids,
+            topk_indices,
+            expanded_idx_mapping,
+            num_per_req_token_ids,
+            per_req_token_ids,
             num_topk,
         )
 
@@ -536,9 +625,15 @@ class quixicore_ops:
         output_bin_counts: torch.Tensor,
     ) -> None:
         _qc().v2_penalties(
-            logits, expanded_idx_mapping, token_ids, expanded_local_pos,
-            repetition_penalty, frequency_penalty, presence_penalty,
-            prompt_bin_mask, output_bin_counts,
+            logits,
+            expanded_idx_mapping,
+            token_ids,
+            expanded_local_pos,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            prompt_bin_mask,
+            output_bin_counts,
         )
 
     @staticmethod
@@ -552,8 +647,13 @@ class quixicore_ops:
         max_prefill_len: int,
     ) -> None:
         _qc().v2_bincount(
-            expanded_idx_mapping, all_token_ids, prompt_len, prefill_len,
-            prompt_bin_mask, output_bin_counts, max_prefill_len,
+            expanded_idx_mapping,
+            all_token_ids,
+            prompt_len,
+            prefill_len,
+            prompt_bin_mask,
+            output_bin_counts,
+            max_prefill_len,
         )
 
     @staticmethod
@@ -565,7 +665,10 @@ class quixicore_ops:
         all_token_ids: torch.Tensor,
     ) -> None:
         _qc().v2_prompt_logprobs_token_ids(
-            out, query_start_loc, idx_mapping, num_computed_tokens,
+            out,
+            query_start_loc,
+            idx_mapping,
+            num_computed_tokens,
             all_token_ids,
         )
 
@@ -592,10 +695,23 @@ class quixicore_ops:
     ) -> None:
         """Leviathan-style rejection loop (no block verification/synthetic)."""
         _qc().v2_rejection_sample(
-            sampled, num_sampled, target_rejected_lse, draft_rejected_lse,
-            target_logits, t_local_argmax, t_local_max, t_local_sumexp,
-            draft_sampled, draft_logits, d_local_max, d_local_sumexp,
-            cu_num_logits, idx_mapping, temperature, seed, pos,
+            sampled,
+            num_sampled,
+            target_rejected_lse,
+            draft_rejected_lse,
+            target_logits,
+            t_local_argmax,
+            t_local_max,
+            t_local_sumexp,
+            draft_sampled,
+            draft_logits,
+            d_local_max,
+            d_local_sumexp,
+            cu_num_logits,
+            idx_mapping,
+            temperature,
+            seed,
+            pos,
             vocab_num_blocks,
         )
 
@@ -617,9 +733,19 @@ class quixicore_ops:
         vocab_size: int,
     ) -> None:
         _qc().v2_resample(
-            rl_argmax, rl_max, target_logits, target_rejected_lse,
-            draft_logits, draft_rejected_lse, rejected_step, cu_num_logits,
-            expanded_idx_mapping, draft_sampled, temperature, seed, pos,
+            rl_argmax,
+            rl_max,
+            target_logits,
+            target_rejected_lse,
+            draft_logits,
+            draft_rejected_lse,
+            rejected_step,
+            cu_num_logits,
+            expanded_idx_mapping,
+            draft_sampled,
+            temperature,
+            seed,
+            pos,
             vocab_size,
         )
 
@@ -655,9 +781,17 @@ class quixicore_ops:
         stop_token_ids: torch.Tensor,
     ) -> None:
         _qc().v2_logit_bias(
-            logits, expanded_idx_mapping, pos, num_allowed_token_ids,
-            allowed_token_ids, num_logit_bias, logit_bias_token_ids,
-            logit_bias, min_lens, num_stop_token_ids, stop_token_ids,
+            logits,
+            expanded_idx_mapping,
+            pos,
+            num_allowed_token_ids,
+            allowed_token_ids,
+            num_logit_bias,
+            logit_bias_token_ids,
+            logit_bias,
+            min_lens,
+            num_stop_token_ids,
+            stop_token_ids,
         )
 
     @staticmethod
@@ -674,9 +808,16 @@ class quixicore_ops:
         expanded_local_pos: torch.Tensor,
     ) -> None:
         _qc().v2_bad_words(
-            logits, expanded_idx_mapping, bad_word_token_ids,
-            bad_word_offsets, num_bad_words, all_token_ids, prompt_len,
-            total_len, input_ids, expanded_local_pos,
+            logits,
+            expanded_idx_mapping,
+            bad_word_token_ids,
+            bad_word_offsets,
+            num_bad_words,
+            all_token_ids,
+            prompt_len,
+            total_len,
+            input_ids,
+            expanded_local_pos,
         )
 
     @staticmethod
@@ -695,9 +836,18 @@ class quixicore_ops:
         num_speculative_steps: int,
     ) -> None:
         _qc().v2_local_logits_stats(
-            t_local_argmax, t_local_max, t_local_sumexp, d_local_max,
-            d_local_sumexp, target_logits, draft_logits, expanded_idx_mapping,
-            expanded_local_pos, temperature, vocab_size, num_speculative_steps,
+            t_local_argmax,
+            t_local_max,
+            t_local_sumexp,
+            d_local_max,
+            d_local_sumexp,
+            target_logits,
+            draft_logits,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            vocab_size,
+            num_speculative_steps,
         )
 
     @staticmethod
@@ -712,8 +862,14 @@ class quixicore_ops:
         temperature: torch.Tensor,
     ) -> None:
         _qc().v2_insert_resampled(
-            sampled, num_sampled, rl_argmax, rl_max, resample_num_blocks,
-            cu_num_logits, expanded_idx_mapping, temperature,
+            sampled,
+            num_sampled,
+            rl_argmax,
+            rl_max,
+            resample_num_blocks,
+            cu_num_logits,
+            expanded_idx_mapping,
+            temperature,
         )
 
     @staticmethod
@@ -723,8 +879,7 @@ class quixicore_ops:
         num_sampled: torch.Tensor,
         cu_num_logits: torch.Tensor,
     ) -> None:
-        _qc().v2_flatten_sampled(flat_sampled, sampled, num_sampled,
-                                 cu_num_logits)
+        _qc().v2_flatten_sampled(flat_sampled, sampled, num_sampled, cu_num_logits)
 
     # ------------------------------------------------------------------
     # Stubs: kernels QuixiCore-CUDA does not implement yet.
@@ -750,8 +905,12 @@ class quixicore_ops:
         if hasattr(_qc(), "fp8_mqa_logits"):
             k, kscale = kv
             return _qc().fp8_mqa_logits(
-                q, k, kscale.view(torch.float32).reshape(-1).contiguous(),
-                weights, cu_seqlen_ks, cu_seqlen_ke
+                q,
+                k,
+                kscale.view(torch.float32).reshape(-1).contiguous(),
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
             )
         from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
             fp8_mqa_logits_torch,
@@ -784,3 +943,40 @@ class quixicore_ops:
         return fp8_paged_mqa_logits_torch(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
+
+    # ------------------------------------------------------------------
+    # ROCm sparse-MLA indexer index arithmetic (no CUDA counterpart)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def convert_req_index_to_global_index(
+        req_id: torch.Tensor,
+        block_table: torch.Tensor,
+        token_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        out: torch.Tensor,
+        block_size: int,
+        topk: int,
+    ) -> None:
+        """Map request-local top-k positions to global paged-KV slots.
+
+        Writes `out` ragged, packed at `cu_seqlens`. An invalid token or an
+        out-of-range block id yields 0, matching the Triton kernel body (whose
+        docstring says -1).
+        """
+        _qc().convert_req_index_to_global_index(
+            req_id, block_table, token_indices, cu_seqlens, out, block_size, topk
+        )
+
+    @staticmethod
+    def generate_sparse_seqlen(
+        seq_lens: torch.Tensor,
+        cu_query_lens: torch.Tensor,
+        out: torch.Tensor,
+        topk_token: int,
+    ) -> None:
+        """Per-query-token sparse KV length, clamped to `topk_token`.
+
+        `out` must be zero-initialized: rows with seq_len == 0 are skipped.
+        """
+        _qc().generate_sparse_seqlen(seq_lens, cu_query_lens, out, topk_token)
