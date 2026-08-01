@@ -29,6 +29,16 @@ def _use_native_indexer_kquant() -> bool:
     )
 
 
+@functools.cache
+def _use_native_cp_gather() -> bool:
+    """Prefer the native HIP indexer gather over the Triton one."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has(
+        "cp_gather_indexer_quant_cache"
+    )
+
+
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
 else:
@@ -267,6 +277,27 @@ def cp_gather_indexer_k_quant_cache_triton(
     grid = (num_tokens,)
     k_fp8_scale = k_fp8_scale.view(torch.float32)
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+
+    if _use_native_cp_gather():
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.cp_gather_indexer_quant_cache(
+            k_cache_value,
+            k_cache_scale,
+            k_fp8,
+            k_fp8_scale,
+            block_table,
+            cu_seqlen,
+            token_to_seq,
+            block_size,
+            block_tile_size,
+            head_tile_size,
+            cu_seqlen.shape[0] - 1,
+            num_blocks,
+            layout == "SHUFFLE",
+        )
+        return
+
     _cp_gather_indexer_quant_cache_kernel[grid](
         k_cache_value,
         k_cache_scale,

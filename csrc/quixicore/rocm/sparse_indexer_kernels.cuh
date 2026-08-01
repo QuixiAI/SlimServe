@@ -147,4 +147,72 @@ __global__ void indexer_k_quant_and_cache(
         kv_cache_scale[block_id * scale_stride + block_offset] = scale;
 }
 
+
+// Gather quantized indexer K (and its scale) out of the paged cache into a
+// contiguous prefill workspace -- the inverse of indexer_k_quant_and_cache.
+//
+// Two asymmetries are carried over deliberately from the Triton kernel:
+//   * an invalid *token* returns early, leaving both outputs untouched;
+//   * an invalid *block* still writes the scale (as 0.0) but leaves the value
+//     row untouched, because the value store is masked while the scale store
+//     is not.
+// The source load is likewise unmasked in the original -- safe only because
+// the block id is clamped to 0 first -- and that clamp is reproduced here.
+template <typename FP8_T>
+__global__ void cp_gather_indexer_quant_cache(
+    const FP8_T* __restrict__ kv_cache, const float* __restrict__ kv_cache_scale,
+    FP8_T* __restrict__ k_fp8, float* __restrict__ k_scale,
+    const int* __restrict__ block_table, const int* __restrict__ cu_seqlen,
+    const int* __restrict__ token_to_seq, int block_size,
+    long block_table_stride, long kv_cache_stride, long kv_cache_scale_stride,
+    int head_dim, int block_tile_size, int head_tile_size, int num_tokens,
+    int num_batches, int block_table_width, int num_blocks, int shuffle) {
+    const int tid = blockIdx.x;
+    if (tid >= num_tokens) return;
+
+    const int batch_id = token_to_seq[tid];
+    const bool valid_batch = batch_id >= 0 && batch_id < num_batches;
+    const int safe_batch = valid_batch ? batch_id : 0;
+    const int batch_start = valid_batch ? cu_seqlen[safe_batch] : 0;
+    const int batch_end = valid_batch ? cu_seqlen[safe_batch + 1] : 0;
+    const int batch_offset = tid - batch_start;
+    if (!(valid_batch && tid >= batch_start && tid < batch_end)) return;
+
+    const int block_table_id = batch_offset / block_size;
+    const int block_offset = batch_offset % block_size;
+    const bool valid_bt = block_table_id >= 0 &&
+                          block_table_id < block_table_width &&
+                          block_offset >= 0 && block_offset < block_size;
+    const int safe_bt = valid_bt ? block_table_id : 0;
+    const int block_id =
+        valid_bt ? block_table[(long)safe_batch * block_table_stride + safe_bt]
+                 : -1;
+    const bool valid_block = valid_bt && block_id >= 0 && block_id < num_blocks;
+    const long safe_block = valid_block ? (long)block_id : 0L;
+    const int safe_off = valid_block ? block_offset : 0;
+
+    long src;
+    if (shuffle)
+        src = safe_block * kv_cache_stride +
+              (long)(safe_off / block_tile_size) * head_dim * block_tile_size +
+              (long)(safe_off % block_tile_size) * head_tile_size;
+    else
+        src = safe_block * kv_cache_stride + (long)safe_off * head_dim;
+
+    if (threadIdx.x == 0)
+        k_scale[tid] =
+            valid_block
+                ? kv_cache_scale[safe_block * kv_cache_scale_stride + safe_off]
+                : 0.0f;
+    if (!valid_block) return;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const int to = shuffle ? (i / head_tile_size) * head_tile_size *
+                                        block_tile_size +
+                                    (i % head_tile_size)
+                               : i;
+        k_fp8[(long)tid * head_dim + i] = kv_cache[src + to];
+    }
+}
+
 }  // namespace qcrocm

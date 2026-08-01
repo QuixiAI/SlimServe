@@ -1005,3 +1005,36 @@ class quixicore_ops:
             fp8_max,
             1 if shuffle else 0,
         )
+
+    @staticmethod
+    def cp_gather_indexer_quant_cache(
+        kv_cache: torch.Tensor,
+        kv_cache_scale: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        block_table: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        token_to_seq: torch.Tensor,
+        block_size: int,
+        block_tile_size: int,
+        head_tile_size: int,
+        num_batches: int,
+        num_blocks: int,
+        shuffle: bool,
+    ) -> None:
+        """Gather quantized indexer K and its scale out of the paged cache."""
+        _qc().cp_gather_indexer_quant_cache(
+            kv_cache,
+            kv_cache_scale,
+            k_fp8,
+            k_scale,
+            block_table,
+            cu_seqlen,
+            token_to_seq,
+            block_size,
+            block_tile_size,
+            head_tile_size,
+            num_batches,
+            num_blocks,
+            1 if shuffle else 0,
+        )
