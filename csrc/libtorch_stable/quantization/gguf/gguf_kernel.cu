@@ -1,6 +1,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 #include "../../../cuda_compat.h"
 #include "../../dispatch_utils.h"
 #include "../../torch_utils.h"
@@ -14,6 +16,10 @@
 #include "mmq.cuh"
 #include "moe.cuh"
 #include "moe_vec.cuh"
+
+#ifndef USE_ROCM
+  #include "mmq_v2/mmq_v2.cuh"
+#endif
 
 // Q8 gemv
 template <typename scalar_t>
@@ -212,6 +218,87 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
   return Y;
 }
 
+#ifndef USE_ROCM
+// Ampere int8-MMA q8_0 path (mmq_v2). Additive: only q8_0 on sm80+ with a K
+// that is a whole number of 256-element iterations routes here, and
+// VLLM_GGUF_MMQ_V2=0 forces the legacy kernels.
+static bool mmq_v2_env_enabled() {
+  static const bool enabled = [] {
+    const char* s = std::getenv("VLLM_GGUF_MMQ_V2");
+    return s == nullptr || (s[0] != '0' && s[0] != 'f' && s[0] != 'F');
+  }();
+  return enabled;
+}
+
+struct mmq_v2_device_info {
+  bool sm80_plus;
+  int nsm;
+};
+
+static mmq_v2_device_info mmq_v2_get_device_info() {
+  int device = 0;
+  cudaGetDevice(&device);
+  static mmq_v2_device_info info[16] = {};
+  static bool init[16] = {};
+  if (device < 16 && !init[device]) {
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    info[device].sm80_plus = prop.major >= 8;
+    info[device].nsm = prop.multiProcessorCount;
+    init[device] = true;
+  }
+  return device < 16 ? info[device] : mmq_v2_device_info{false, 0};
+}
+
+static bool ggml_mul_mat_a8_use_v2(int64_t type, int64_t col, int64_t row) {
+  if (type != 8 || !mmq_v2_env_enabled()) {
+    return false;
+  }
+  const mmq_v2_device_info info = mmq_v2_get_device_info();
+  return info.sm80_plus && vllm_mmq_v2::mmq_v2_supported(col, row);
+}
+
+static torch::stable::Tensor ggml_mul_mat_a8_v2(torch::stable::Tensor W,
+                                                torch::stable::Tensor X,
+                                                int64_t row, int64_t col,
+                                                int64_t batch) {
+  const int nsm = mmq_v2_get_device_info().nsm;
+  auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
+                                W.device());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  auto quant_X = torch::stable::empty(
+      {vllm_mmq_v2::mmq_v2_y_ints(batch, col)},
+      torch::headeronly::ScalarType::Int, std::nullopt, W.device());
+
+  const bool split =
+      vllm_mmq_v2::mmq_v2_needs_scratch(col, row, batch, nsm);
+  auto scratch = torch::stable::empty(
+      {split ? batch * row : int64_t(1)}, torch::headeronly::ScalarType::Float,
+      std::nullopt, W.device());
+  if (split) {
+    torch::stable::fill_(scratch, 0.0);
+  }
+
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_mul_mat_a8_v2", [&] {
+        vllm_mmq_v2::quantize_mmq_q8_1_d4_cuda<scalar_t>(
+            (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), batch, col,
+            stream);
+        vllm_mmq_v2::ggml_mul_mat_q8_0_q8_1_v2_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (float*)scratch.data_ptr(), col, row,
+            batch, row, nsm, stream);
+        if (split) {
+          vllm_mmq_v2::mmq_v2_finalize<scalar_t>((float*)scratch.data_ptr(),
+                                                 (scalar_t*)Y.data_ptr(),
+                                                 batch * row, stream);
+        }
+      });
+  return Y;
+}
+#endif  // USE_ROCM
+
 torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
                                       torch::stable::Tensor X,  // input
                                       int64_t type, int64_t row) {
@@ -220,6 +307,11 @@ torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
   int64_t batch = X.sizes()[0];
   const torch::stable::accelerator::DeviceGuard device_guard(
       X.get_device_index());
+#ifndef USE_ROCM
+  if (ggml_mul_mat_a8_use_v2(type, col, row)) {
+    return ggml_mul_mat_a8_v2(W, X, row, col, batch);
+  }
+#endif
   auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
                                 W.device());
   torch::stable::fill_(Y, 0.0);
