@@ -105,6 +105,35 @@ static void py_indexer_k_quant_and_cache(torch::Tensor k, torch::Tensor kv_cache
         TORCH_CHECK(false, "indexer_k_quant: want bf16/fp16/fp32 k");
 }
 
+
+static void py_cp_gather_indexer_quant_cache(
+    torch::Tensor kv_cache, torch::Tensor kv_cache_scale, torch::Tensor k_fp8,
+    torch::Tensor k_scale, torch::Tensor block_table, torch::Tensor cu_seqlen,
+    torch::Tensor token_to_seq, int64_t block_size, int64_t block_tile_size,
+    int64_t head_tile_size, int64_t num_batches, int64_t num_blocks,
+    int64_t shuffle) {
+    SPCK(block_table);
+    SPCK(cu_seqlen);
+    SPCK(token_to_seq);
+    TORCH_CHECK(k_scale.scalar_type() == torch::kFloat, "k_scale fp32");
+    TORCH_CHECK(kv_cache_scale.scalar_type() == torch::kFloat, "cache scale fp32");
+    const int num_tokens = (int)k_fp8.size(0);
+    if (num_tokens == 0) return;
+    const int head_dim = (int)k_fp8.size(-1);
+
+    using FP8 = c10::Float8_e4m3fnuz;
+    qcrocm::cp_gather_indexer_quant_cache<FP8><<<num_tokens, 64, 0, spst()>>>(
+        reinterpret_cast<const FP8*>(kv_cache.data_ptr()),
+        kv_cache_scale.data_ptr<float>(),
+        reinterpret_cast<FP8*>(k_fp8.data_ptr()), k_scale.data_ptr<float>(),
+        block_table.data_ptr<int>(), cu_seqlen.data_ptr<int>(),
+        token_to_seq.data_ptr<int>(), (int)block_size, block_table.stride(0),
+        kv_cache.stride(0), kv_cache_scale.stride(0), head_dim,
+        (int)block_tile_size, (int)head_tile_size, num_tokens,
+        (int)num_batches, (int)block_table.size(1), (int)num_blocks,
+        (int)shuffle);
+}
+
 void init_sparse(py::module_& m) {
     m.def("convert_req_index_to_global_index",
           &py_convert_req_index_to_global_index, py::arg("req_id"),
@@ -116,6 +145,12 @@ void init_sparse(py::module_& m) {
           py::arg("slot_mapping"), py::arg("block_size"),
           py::arg("block_tile_size"), py::arg("head_tile_size"),
           py::arg("fp8_max"), py::arg("shuffle"));
+    m.def("cp_gather_indexer_quant_cache", &py_cp_gather_indexer_quant_cache,
+          py::arg("kv_cache"), py::arg("kv_cache_scale"), py::arg("k_fp8"),
+          py::arg("k_scale"), py::arg("block_table"), py::arg("cu_seqlen"),
+          py::arg("token_to_seq"), py::arg("block_size"),
+          py::arg("block_tile_size"), py::arg("head_tile_size"),
+          py::arg("num_batches"), py::arg("num_blocks"), py::arg("shuffle"));
     m.def("generate_sparse_seqlen", &py_generate_sparse_seqlen,
           py::arg("seq_lens"), py::arg("cu_query_lens"), py::arg("out"),
           py::arg("topk_token"));
