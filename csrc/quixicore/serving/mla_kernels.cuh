@@ -375,9 +375,38 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     const int j_end = PART ? min(len, j_beg + partition_size) : len;
     const int64_t q_base = (int64_t(batch) * num_heads + head) * QW;
 
+    // All-fp8 slots (NFP8 == QW, the GLM geometry) take a vectorized path:
+    // the scalar loop reads the row as QPL rounds of one-byte-per-lane loads
+    // -- each round a 32-byte uncoalesced transaction at full memory latency,
+    // measured 6.75 us per row. Four bytes per lane per round turns that into
+    // QW/128 coalesced 128-byte rounds, and dims [0, VW) land exactly in the
+    // full rounds while the tail round is rope-only score work.
+    constexpr bool VECFP8 = (NFP8 == QW) && (QW % 4 == 0) && (VW % 128 == 0);
+    constexpr int VR = VW / 128;              // full 4-byte rounds (V dims)
+    constexpr int TAIL = (QW - VW) / 64;      // 2-byte tail rounds (rope dims)
+
     float qv[QPL], acc[VPL];
-    #pragma unroll
-    for (int i = 0; i < QPL; i++) qv[i] = float(q[q_base + lane + 32 * i]);
+    if constexpr (VECFP8) {
+        #pragma unroll
+        for (int i = 0; i < VR; i++) {
+            const uint2 qw = *reinterpret_cast<const uint2*>(
+                &q[q_base + 4 * lane + 128 * i]);
+            const bf16* qb = reinterpret_cast<const bf16*>(&qw);
+            #pragma unroll
+            for (int k = 0; k < 4; k++) qv[4 * i + k] = float(qb[k]);
+        }
+        #pragma unroll
+        for (int i = 0; i < TAIL; i++) {
+            const uint32_t qw = *reinterpret_cast<const uint32_t*>(
+                &q[q_base + VW + 2 * lane + 64 * i]);
+            const bf16* qb = reinterpret_cast<const bf16*>(&qw);
+            qv[4 * VR + 2 * i] = float(qb[0]);
+            qv[4 * VR + 2 * i + 1] = float(qb[1]);
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < QPL; i++) qv[i] = float(q[q_base + lane + 32 * i]);
+    }
     #pragma unroll
     for (int i = 0; i < VPL; i++) acc[i] = 0.0f;
     float m = MLA_NEG_INF, l = 0.0f;
@@ -399,21 +428,60 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         const bf16* rope = reinterpret_cast<const bf16*>(data_cache + dbase + NOPE);
 
         float lat[QPL], partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < QPL; i++) {
-            const int d = lane + 32 * i;
-            if (d < NOPE) {
-                const float dq = tmq::e4m3_decode(data_cache[dbase + d]);
-                if (SMODE == 0) {
-                    const int e = int(scale_cache[sbase + d / 64]);
-                    lat[i] = dq * exp2f(float(e - 127));
-                } else {
-                    lat[i] = dq * kv_scale;
+        if constexpr (VECFP8) {
+            #pragma unroll
+            for (int i = 0; i < VR; i++) {
+                const uint32_t w = *reinterpret_cast<const uint32_t*>(
+                    data_cache + dbase + 4 * lane + 128 * i);
+                #pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const int d = 4 * lane + 128 * i + k;
+                    float dq = tmq::e4m3_decode(uint8_t(w >> (8 * k)));
+                    if (SMODE == 0) {
+                        const int e = int(scale_cache[sbase + d / 64]);
+                        dq *= exp2f(float(e - 127));
+                    } else {
+                        dq *= kv_scale;
+                    }
+                    lat[4 * i + k] = dq;
+                    partial += qv[4 * i + k] * dq;
                 }
-            } else {
-                lat[i] = float(rope[d - NOPE]);
             }
-            partial += qv[i] * lat[i];
+            #pragma unroll
+            for (int i = 0; i < TAIL; i++) {
+                const uint16_t w = *reinterpret_cast<const uint16_t*>(
+                    data_cache + dbase + VW + 2 * lane + 64 * i);
+                #pragma unroll
+                for (int k = 0; k < 2; k++) {
+                    const int d = VW + 2 * lane + 64 * i + k;
+                    float dq = tmq::e4m3_decode(uint8_t(w >> (8 * k)));
+                    if (SMODE == 0) {
+                        const int e = int(scale_cache[sbase + d / 64]);
+                        dq *= exp2f(float(e - 127));
+                    } else {
+                        dq *= kv_scale;
+                    }
+                    lat[4 * VR + 2 * i + k] = dq;
+                    partial += qv[4 * VR + 2 * i + k] * dq;
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < QPL; i++) {
+                const int d = lane + 32 * i;
+                if (d < NOPE) {
+                    const float dq = tmq::e4m3_decode(data_cache[dbase + d]);
+                    if (SMODE == 0) {
+                        const int e = int(scale_cache[sbase + d / 64]);
+                        lat[i] = dq * exp2f(float(e - 127));
+                    } else {
+                        lat[i] = dq * kv_scale;
+                    }
+                } else {
+                    lat[i] = float(rope[d - NOPE]);
+                }
+                partial += qv[i] * lat[i];
+            }
         }
         const float score = warp_sum_f(partial) * scale;
         const float nm = fmaxf(m, score);
@@ -438,18 +506,43 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
             return;
         }
         const int64_t ob = stat * VW;
-        #pragma unroll
-        for (int i = 0; i < VPL; i++)
-            tmp_out[ob + lane + 32 * i] = acc[i] / l;
+        if constexpr (VECFP8) {
+            // acc[4i+k] holds dim 4*lane + 128*i + k; store float4 to the
+            // canonical layout so the unchanged reduce kernel reads it as-is.
+            #pragma unroll
+            for (int i = 0; i < VR; i++) {
+                float4 v;
+                v.x = acc[4 * i] / l;     v.y = acc[4 * i + 1] / l;
+                v.z = acc[4 * i + 2] / l; v.w = acc[4 * i + 3] / l;
+                *reinterpret_cast<float4*>(&tmp_out[ob + 4 * lane + 128 * i]) = v;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < VPL; i++)
+                tmp_out[ob + lane + 32 * i] = acc[i] / l;
+        }
         if (lane == 0) {
             max_logits[stat] = m;
             exp_sums[stat] = l;
         }
     } else {
         const int64_t out_base = (int64_t(batch) * num_heads + head) * VW;
-        #pragma unroll
-        for (int i = 0; i < VPL; i++)
-            out[out_base + lane + 32 * i] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
+        if constexpr (VECFP8) {
+            #pragma unroll
+            for (int i = 0; i < VR; i++) {
+                bf16 v[4];
+                #pragma unroll
+                for (int k = 0; k < 4; k++)
+                    v[k] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[4 * i + k] / l);
+                *reinterpret_cast<uint2*>(&out[out_base + 4 * lane + 128 * i]) =
+                    *reinterpret_cast<const uint2*>(v);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < VPL; i++)
+                out[out_base + lane + 32 * i] =
+                    (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
+        }
     }
 }
 
