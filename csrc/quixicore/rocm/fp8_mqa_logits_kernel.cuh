@@ -46,6 +46,15 @@
  *       -ffp-contract=fast re-forms the FMA, so this does not actually test an
  *       unfused epilogue; use -ffp-contract=off to make that variant meaningful.
  * max|diff| 3.1e-5, mean 1.8e-6 throughout.
+ *
+ * RETRACTED: an earlier commit recorded that the warp-to-tile mapping (cyclic
+ * vs contiguous head halves) is numerically neutral. Do not rely on that. The
+ * two configurations measured identically, which cannot be true -- they give
+ * each lane a different pair of heads, so they must round differently -- and
+ * the runs were taken while shuffling backup copies of this file, so at least
+ * one of them very likely tested a stale binary. That variable is UNTESTED, not
+ * ruled out. A sanity check (scaling the weights by 2, which moved every
+ * element) does confirm the epilogue lines are live.
  */
 #pragma once
 #ifndef QC_EPI
