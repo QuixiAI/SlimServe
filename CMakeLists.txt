@@ -1453,7 +1453,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   set(VLLM_QUIXICORE_HIP_EXT_SRC
     "csrc/quixicore/tm_rocm/qc_rocm_serving.cu"
-    "csrc/quixicore/tm_rocm/qc_rocm_sample.cu")
+    "csrc/quixicore/tm_rocm/qc_rocm_sample.cu"
+    "csrc/quixicore/tm_rocm/qc_rocm_sparse.cu")
 
   define_extension_target(
     _quixicore_C
@@ -1466,6 +1467,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     # after hipify has rewritten them into ${CMAKE_CURRENT_BINARY_DIR}.
     INCLUDE_DIRECTORIES
       "${CMAKE_CURRENT_BINARY_DIR}/csrc/quixicore/serving"
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/quixicore/rocm"
     WITH_SOABI)
 
   # pybind11 modules need libtorch_python, which define_extension_target
