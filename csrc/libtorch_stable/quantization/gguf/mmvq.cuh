@@ -34,6 +34,16 @@ static constexpr __host__ __device__ int mmvq_rows_per_block(int ncols_dst,
   if (ncols_dst == 1) {
     return small_k ? nwarps : 1;
   }
+#ifndef USE_ROCM
+  // A100 (sm80): at the 4-wide spec-verify batch, 4 rows per block amortizes
+  // the per-row weight stream better than 2 across the GLM-5.2 TP4 dense
+  // shapes (25.4 -> 20.7 us on the 6144x4096 attn output, -13% summed over
+  // the step's dense GEMVs). Measured only for ncols_dst == 4; the GCN
+  // geometry below is unchanged for every other width and for ROCm.
+  if (ncols_dst == 4) {
+    return 4;
+  }
+#endif
   return ncols_dst <= 8 ? 2 : 1;
 }
 

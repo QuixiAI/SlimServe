@@ -371,8 +371,17 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     const int head = blockIdx.x, batch = blockIdx.y, lane = threadIdx.x;
     const int part = PART ? blockIdx.z : 0;
     const int len = SPARSE ? topk_length[batch] : context_lens[batch];
-    const int j_beg = PART ? part * partition_size : 0;
-    const int j_end = PART ? min(len, j_beg + partition_size) : len;
+    // Balance the split by the request's ACTUAL length, not the fixed
+    // partition_size: with j_beg = part * partition_size every context
+    // shorter than partition_size lands entirely in partition 0 and the
+    // other P-1 warps exit -- at short contexts that is one warp per
+    // (head, token) again, exactly what the partition axis was added to
+    // avoid. ceil(len / num_partitions) keeps all P partitions busy at
+    // every length; the reduce is boundary-agnostic.
+    const int part_span =
+        PART ? (len + num_partitions - 1) / num_partitions : len;
+    const int j_beg = PART ? part * part_span : 0;
+    const int j_end = PART ? min(len, j_beg + part_span) : len;
     const int64_t q_base = (int64_t(batch) * num_heads + head) * QW;
 
     // All-fp8 slots (NFP8 == QW, the GLM geometry) take a vectorized path:

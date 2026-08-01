@@ -16,6 +16,7 @@
 #include "quant_formats.cuh"
 #include "tm_warp.cuh"
 #include "mla_kernels.cuh"
+#include "paged_attn_v2_kernels.cuh"
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -157,21 +158,45 @@ static int run_case(const char* name, float kv_scale) {
     std::vector<__nv_bfloat16> ob((size_t)B * H * VW);
     CK(cudaMemcpy(ob.data(), dout, ob.size() * 2, cudaMemcpyDeviceToHost));
 
+    // Partitioned launch + reduce (PART=true). Exercises the length-balanced
+    // split: tlen (40..79) is far below P * partition_size, so every partition
+    // must take a ceil(tlen/P) share for this to match the reference.
+    const int P = 8;
+    __nv_bfloat16* dout_p;
+    float *dtmp, *dml, *des;
+    CK(cudaMalloc(&dout_p, (size_t)B * H * VW * 2));
+    CK(cudaMalloc(&dtmp, (size_t)B * H * P * VW * 4));
+    CK(cudaMalloc(&dml, (size_t)B * H * P * 4));
+    CK(cudaMalloc(&des, (size_t)B * H * P * 4));
+    tms::mla_decode_fp8_v<true, true, QW, VW, NFP8, SMODE><<<dim3(H, B, P), 32>>>(
+        dq, dd, dsc, dbt, nullptr, didx, dtl, max_topk, nullptr, dtmp, dml, des,
+        block_size, bt_stride, scale, H, P, max_topk / P, kv_scale);
+    tms::paged_attention_reduce<__nv_bfloat16, VW><<<dim3(H, B), 32>>>(
+        dtmp, dml, des, dout_p, H, P);
+    CK(cudaDeviceSynchronize());
+    CK(cudaGetLastError());
+    std::vector<__nv_bfloat16> obp((size_t)B * H * VW);
+    CK(cudaMemcpy(obp.data(), dout_p, obp.size() * 2, cudaMemcpyDeviceToHost));
+
     std::vector<float> ref;
     host_ref<QW, VW, NFP8, SMODE>(hq, data, scl, bt, idx, tlen, B, H, block_size,
                                   bt_stride, scale, max_topk, kv_scale, ref);
 
-    double worst = 0, mag = 0;
+    double worst = 0, mag = 0, worst_p = 0;
     for (size_t i = 0; i < ob.size(); ++i) {
         worst = std::fmax(worst, std::fabs(__bfloat162float(ob[i]) - ref[i]));
+        worst_p = std::fmax(worst_p, std::fabs(__bfloat162float(obp[i]) - ref[i]));
         mag = std::fmax(mag, std::fabs((double)ref[i]));
     }
     const double rel = worst / (mag > 0 ? mag : 1.0);
-    printf("  %-34s QW=%3d VW=%3d NFP8=%3d SMODE=%d  rel %.5f  %s\n", name, QW, VW,
-           NFP8, SMODE, rel, rel < 0.02 ? "PASS" : "FAIL");
+    const double rel_p = worst_p / (mag > 0 ? mag : 1.0);
+    const bool ok = rel < 0.02 && rel_p < 0.02;
+    printf("  %-34s QW=%3d VW=%3d NFP8=%3d SMODE=%d  rel %.5f  part(P=%d) rel %.5f  %s\n",
+           name, QW, VW, NFP8, SMODE, rel, P, rel_p, ok ? "PASS" : "FAIL");
     cudaFree(dq); cudaFree(dout); cudaFree(dd); cudaFree(dsc);
     cudaFree(dbt); cudaFree(didx); cudaFree(dtl);
-    return rel < 0.02 ? 0 : 1;
+    cudaFree(dout_p); cudaFree(dtmp); cudaFree(dml); cudaFree(des);
+    return ok ? 0 : 1;
 }
 
 int main() {
