@@ -107,7 +107,13 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
       X.get_device_index());
   auto Y = torch::stable::empty({vecs, row}, X.scalar_type(), std::nullopt,
                                 W.device());
+  // CUDA skips the output pre-fill here and in the mmq/moe entry points
+  // below: those kernels write every in-range dst element (moe_q zeroes its
+  // tile for invalid experts). At bs=1 decode the fills were ~560 extra
+  // launches per step. ROCm keeps the fill, unaudited.
+#ifdef USE_ROCM
   torch::stable::fill_(Y, 0.0);
+#endif
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({vecs, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
@@ -314,7 +320,9 @@ torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
 #endif
   auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
                                 W.device());
+#ifdef USE_ROCM
   torch::stable::fill_(Y, 0.0);
+#endif
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({batch, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
@@ -392,7 +400,9 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
       X.get_device_index());
   auto Y = torch::stable::empty({tokens * top_k, row}, X.scalar_type(),
                                 std::nullopt, W.device());
+#ifdef USE_ROCM
   torch::stable::fill_(Y, 0.0);
+#endif
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({tokens, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
@@ -497,7 +507,9 @@ torch::stable::Tensor ggml_moe_a8_vec(
       X.get_device_index());
   auto Y = torch::stable::empty({tokens * top_k, row}, X.scalar_type(),
                                 std::nullopt, W.device());
+#ifdef USE_ROCM
   torch::stable::fill_(Y, 0.0);
+#endif
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({tokens, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,

@@ -93,6 +93,51 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_decode_fp8_sparse_glm_splitq(
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_cache_u8: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+        kv_scale: float,
+        partition_size: int = 0,
+    ) -> torch.Tensor:
+        """GLM sparse MLA decode reading q from its two source buffers.
+
+        `q_nope` is head-major [heads, tokens, 512] (the natural bmm output,
+        pre-transpose) and `q_pe` is [tokens, heads, 64]; this replaces the
+        per-layer torch.cat with direct reads -- bitwise identical to the
+        concatenated path. Returns [tokens, heads, 512].
+        """
+        return _qc().mla_decode_fp8_sparse_glm_splitq(
+            q_nope, q_pe, kv_cache_u8, block_table, indices, topk_length,
+            block_size, scale, kv_scale, partition_size,
+        )
+
+    @staticmethod
+    def moe_weighted_sum(
+        x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        """out[t] = sum_k w[t, k] * x[t, k] with float accumulation.
+
+        Fuses the out.mul_(topk_weights) + moe_sum pair into one launch; one
+        fewer bf16 rounding than the pair (tolerance <= K ulp).
+        """
+        _qc().moe_weighted_sum(x, w, out)
+
+    @staticmethod
+    def sparse_topk_tlen(indices: torch.Tensor) -> torch.Tensor:
+        """Effective top-k length per row: last valid (>= 0) index position + 1.
+
+        One kernel launch replacing the (idx >= 0) * arange -> amax chain.
+        `indices` is [rows, topk] int32; returns [rows] int32.
+        """
+        return _qc().sparse_topk_tlen(indices)
+
+    @staticmethod
     def mla_decode_fp8_sparse_glm(
         q: torch.Tensor,
         kv_cache_u8: torch.Tensor,

@@ -363,7 +363,15 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                                  float* tmp_out, float* max_logits, float* exp_sums,  // PART
                                  int block_size, int bt_stride, float scale, int num_heads,
                                  int num_partitions, int partition_size,
-                                 float kv_scale = 1.0f) {
+                                 float kv_scale = 1.0f,
+                                 // Split-q: when q_pe2 != nullptr, `q` holds the nope part
+                                 // in HEAD-MAJOR [H, B, VW] layout (the natural bmm output,
+                                 // pre-transpose) and q_pe2 the rope tail [B, H, QW-VW] with
+                                 // pe_stride elements between heads (>= QW-VW: a strided
+                                 // split view is read in place). Reads the two source
+                                 // buffers directly instead of a per-layer torch.cat;
+                                 // values and order are identical.
+                                 const bf16* q_pe2 = nullptr, int pe_stride = 0) {
     constexpr int NOPE = NFP8, VPL = VW / 32, QPL = QW / 32;
     constexpr int SLOT_BYTES = NFP8 + 2 * (QW - NFP8);
     static_assert(QW % 32 == 0 && VW % 32 == 0 && VW <= QW, "bad MLA geometry");
@@ -383,6 +391,9 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     const int j_beg = PART ? part * part_span : 0;
     const int j_end = PART ? min(len, j_beg + part_span) : len;
     const int64_t q_base = (int64_t(batch) * num_heads + head) * QW;
+    const bool splitq = (q_pe2 != nullptr);
+    const int64_t qn_base = (int64_t(head) * gridDim.y + batch) * VW;
+    const int64_t pe_base = (int64_t(batch) * num_heads + head) * pe_stride;
 
     // All-fp8 slots (NFP8 == QW, the GLM geometry) take a vectorized path:
     // the scalar loop reads the row as QPL rounds of one-byte-per-lane loads
@@ -398,23 +409,30 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     if constexpr (VECFP8) {
         #pragma unroll
         for (int i = 0; i < VR; i++) {
-            const uint2 qw = *reinterpret_cast<const uint2*>(
-                &q[q_base + 4 * lane + 128 * i]);
+            const bf16* src = splitq ? &q[qn_base + 4 * lane + 128 * i]
+                                     : &q[q_base + 4 * lane + 128 * i];
+            const uint2 qw = *reinterpret_cast<const uint2*>(src);
             const bf16* qb = reinterpret_cast<const bf16*>(&qw);
             #pragma unroll
             for (int k = 0; k < 4; k++) qv[4 * i + k] = float(qb[k]);
         }
         #pragma unroll
         for (int i = 0; i < TAIL; i++) {
-            const uint32_t qw = *reinterpret_cast<const uint32_t*>(
-                &q[q_base + VW + 2 * lane + 64 * i]);
+            const bf16* src = splitq ? &q_pe2[pe_base + 2 * lane + 64 * i]
+                                     : &q[q_base + VW + 2 * lane + 64 * i];
+            const uint32_t qw = *reinterpret_cast<const uint32_t*>(src);
             const bf16* qb = reinterpret_cast<const bf16*>(&qw);
             qv[4 * VR + 2 * i] = float(qb[0]);
             qv[4 * VR + 2 * i + 1] = float(qb[1]);
         }
     } else {
         #pragma unroll
-        for (int i = 0; i < QPL; i++) qv[i] = float(q[q_base + lane + 32 * i]);
+        for (int i = 0; i < QPL; i++) {
+            const int d = lane + 32 * i;
+            qv[i] = float(splitq ? (d < VW ? q[qn_base + d]
+                                           : q_pe2[pe_base + d - VW])
+                                 : q[q_base + d]);
+        }
     }
     #pragma unroll
     for (int i = 0; i < VPL; i++) acc[i] = 0.0f;
@@ -552,6 +570,41 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                 out[out_base + lane + 32 * i] =
                     (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
         }
+    }
+}
+
+// tlen[row] = last valid (>= 0) position + 1 in the top-k index list, in one
+// launch. Replaces the (idx >= 0) * arange -> amax ATen chain, which cost
+// three kernels per layer per decode step. One block per row.
+__global__ void sparse_topk_tlen(const int* __restrict__ idx,
+                                 int* __restrict__ tlen, int topk) {
+    const int row = blockIdx.x;
+    const int* r = idx + (size_t)row * topk;
+    int m = 0;
+    if (topk % 4 == 0) {
+        const int4* r4 = reinterpret_cast<const int4*>(r);
+        for (int p = threadIdx.x; p < topk / 4; p += blockDim.x) {
+            const int4 v = r4[p];
+            const int last = v.w >= 0 ? 4 : v.z >= 0 ? 3 : v.y >= 0 ? 2
+                             : v.x >= 0 ? 1 : 0;
+            if (last) m = max(m, 4 * p + last);
+        }
+    } else {
+        for (int p = threadIdx.x; p < topk; p += blockDim.x)
+            if (r[p] >= 0) m = max(m, p + 1);
+    }
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        m = max(m, __shfl_xor_sync(0xffffffff, m, mask));
+    __shared__ int warp_max[8];
+    if ((threadIdx.x & 31) == 0) warp_max[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        int v = threadIdx.x < (blockDim.x >> 5) ? warp_max[threadIdx.x] : 0;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            v = max(v, __shfl_xor_sync(0xffffffff, v, mask));
+        if (threadIdx.x == 0) tlen[row] = v;
     }
 }
 
