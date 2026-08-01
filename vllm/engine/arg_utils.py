@@ -178,6 +178,11 @@ def _default_glm_dspark_config(
         # Draft KV stays bf16 below sm89: the standard-attention backends
         # there reject fp8 KV (no fp8e4nv), and the draft cache is tiny.
         cfg["kv_cache_dtype"] = "auto"
+        # Replicate the 5.9 GB draft instead of sharding it: a dense stack at
+        # TP4 pays two all-reduces per layer per draft step, and the profile
+        # showed cross_device_reduce as the top kernel (22% of GPU) at
+        # TP4+spec. Measured on 4x A100: +13% bs=1, +18% bs=32 (-5% bs=8).
+        cfg["draft_tensor_parallel_size"] = 1
     logger.info(
         "Defaulting to DSpark speculation (draft=%s, k=3). "
         "Set VLLM_DISABLE_SPEC=1 to disable.",
