@@ -322,179 +322,6 @@ class APIServerProcessManager:
             shutdown(self.processes, timeout=timeout)
 
 
-class RustFrontendProcessManager:
-    """Manages a single Rust frontend subprocess.
-
-    Launches the Rust vllm-rs binary in 'frontend' mode, passing the
-    listening socket fd and ZMQ transport addresses. Provides the same
-    interface as APIServerProcessManager for process monitoring.
-    """
-
-    def __init__(
-        self,
-        binary_path: str,
-        sock: Any,
-        args: argparse.Namespace,
-        input_address: str,
-        output_address: str,
-        engine_start_index: int,
-        engine_count: int,
-        stats_update_address: str | None = None,
-    ):
-        import os
-        import subprocess
-
-        fd = sock.fileno()
-        os.set_inheritable(fd, True)
-
-        cmd = [
-            binary_path,
-            "frontend",
-            "--listen-fd",
-            str(fd),
-            "--input-address",
-            input_address,
-            "--output-address",
-            output_address,
-            "--engine-start-index",
-            str(engine_start_index),
-            "--engine-count",
-            str(engine_count),
-        ]
-        if stats_update_address is not None:
-            cmd.extend(["--coordinator-address", stats_update_address])
-        from vllm.entrypoints.serve.utils.api_utils import jsonify_non_default_args
-
-        args_dict = jsonify_non_default_args(
-            args,
-            exclude={
-                "api_server_count",
-                # Python passes the bootstrapped engine range explicitly.
-                "data_parallel_rank",
-                "data_parallel_external_lb",
-                "data_parallel_hybrid_lb",
-            },
-        )
-        # The Rust `frontend` subcommand parses --args-json via serde_json,
-        # which bypasses clap and therefore ignores any `#[arg(env = ...)]`
-        # declarations on SharedRuntimeArgs fields. Forward the env-driven
-        # values explicitly so VLLM_ENGINE_READY_TIMEOUT_S and
-        # VLLM_HTTP_TIMEOUT_KEEP_ALIVE behave the same on both Python and Rust
-        # frontends.
-        args_dict["engine_ready_timeout_secs"] = envs.VLLM_ENGINE_READY_TIMEOUT_S
-        args_dict["http_timeout_keep_alive"] = envs.VLLM_HTTP_TIMEOUT_KEEP_ALIVE
-        args_json = json.dumps(args_dict, sort_keys=True)
-        cmd.extend(["--args-json", args_json])
-
-        logger.info("Launching Rust frontend: %s", " ".join(cmd))
-        self._proc = subprocess.Popen(cmd, pass_fds=(fd,))
-
-        # Create a process wrapper with a sentinel fd for monitoring
-        self.processes: list[_SubprocessWrapper] = [
-            _SubprocessWrapper(self._proc, "RustFrontend")
-        ]
-
-        self._finalizer = weakref.finalize(self, _shutdown_subprocesses, self.processes)
-
-    def shutdown(self, timeout: float | None = None) -> None:
-        if self._finalizer.detach() is not None:
-            _shutdown_subprocesses(self.processes, timeout=timeout)
-
-
-class _SubprocessWrapper:
-    """Wraps subprocess.Popen to provide the BaseProcess-like interface
-    needed by wait_for_completion_or_failure."""
-
-    def __init__(self, proc, name: str):
-        self._proc = proc
-        self.name = name
-        self.pid = proc.pid
-        self._sentinel_conn: connection.Connection | None = None
-        self._sentinel_send: connection.Connection | None = None
-
-        # Use a Pipe-based sentinel so subprocess monitoring works uniformly
-        # across platforms with multiprocessing.connection.wait().
-        recv, send = connection.Pipe(duplex=False)
-        self._sentinel_conn = recv
-        self._sentinel_send = send
-
-        def monitor_subprocess() -> None:
-            try:
-                proc.wait()
-            finally:
-                with contextlib.suppress(Exception):
-                    send.close()
-
-        threading.Thread(
-            target=monitor_subprocess, daemon=True, name=f"{name}Monitor"
-        ).start()
-
-    @property
-    def sentinel(self):
-        return self._sentinel_conn
-
-    @property
-    def exitcode(self) -> int | None:
-        return self._proc.returncode if self._proc.poll() is not None else None
-
-    def is_alive(self) -> bool:
-        return self._proc.poll() is None
-
-    def terminate(self):
-        self._proc.terminate()
-
-    def join(self, timeout=None):
-        with contextlib.suppress(Exception):
-            self._proc.wait(timeout=timeout)
-
-    def __del__(self):
-        with contextlib.suppress(Exception):
-            if self._sentinel_conn is not None:
-                self._sentinel_conn.close()
-            if self._sentinel_send is not None:
-                self._sentinel_send.close()
-
-
-def _shutdown_subprocesses(
-    procs: list[_SubprocessWrapper], timeout: float | None = None
-) -> None:
-    """Shutdown subprocess wrappers (mirrors the shutdown() function)."""
-    if timeout is None:
-        timeout = 0.0
-    timeout = max(timeout, 5.0)
-
-    logger.debug(
-        "[shutdown] Subprocess manager: start process_count=%d timeout=%ss",
-        len(procs),
-        timeout,
-    )
-
-    for proc in procs:
-        if proc.is_alive():
-            proc.terminate()
-
-    deadline = time.monotonic() + timeout
-    for proc in procs:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        if proc.is_alive():
-            proc.join(remaining)
-
-    remaining_pids = [
-        proc.pid for proc in procs if proc.is_alive() and proc.pid is not None
-    ]
-    if remaining_pids:
-        logger.warning(
-            "[shutdown] Subprocess manager: force killing remaining processes count=%d",
-            len(remaining_pids),
-        )
-    for pid in remaining_pids:
-        kill_process_tree(pid)
-
-    logger.debug_once("[shutdown] Subprocess manager: complete")
-
-
 def run_api_server_worker_proc(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
@@ -515,7 +342,7 @@ def run_api_server_worker_proc(
 
 
 def wait_for_completion_or_failure(
-    api_server_manager: "APIServerProcessManager | RustFrontendProcessManager",
+    api_server_manager: "APIServerProcessManager",
     engine_manager: Union["CoreEngineProcManager", "CoreEngineActorManager"]
     | None = None,
     coordinator: "DPCoordinator | None" = None,
@@ -536,7 +363,7 @@ def wait_for_completion_or_failure(
         logger.info("Waiting for API servers to complete ...")
         # Create a mapping of sentinels to their corresponding processes
         # for efficient lookup
-        sentinel_to_proc: dict[Any, BaseProcess | _SubprocessWrapper | None] = {
+        sentinel_to_proc: dict[Any, BaseProcess | None] = {
             proc.sentinel: proc for proc in api_server_manager.processes
         }
 

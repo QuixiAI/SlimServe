@@ -240,12 +240,6 @@ def _run_python_vllm_dp_server(child_args: argparse.Namespace) -> None:
     uvloop.run(run_server(child_args))
 
 
-def _run_rust_vllm_dp_server(child_args: argparse.Namespace) -> None:
-    from vllm.entrypoints.cli.serve import run_multi_api_server
-
-    run_multi_api_server(child_args)
-
-
 def _run_vllm_dp_server(child_args: argparse.Namespace) -> None:
     """
     Entrypoint function for the vLLM DP Server.
@@ -257,10 +251,7 @@ def _run_vllm_dp_server(child_args: argparse.Namespace) -> None:
     name = f"APIServer_DP{child_args.data_parallel_rank}"
     set_process_title(name)
     decorate_logs(name)
-    if envs.VLLM_RUST_FRONTEND_PATH:
-        _run_rust_vllm_dp_server(child_args)
-    else:
-        _run_python_vllm_dp_server(child_args)
+    _run_python_vllm_dp_server(child_args)
 
 
 class DPSupervisor:
