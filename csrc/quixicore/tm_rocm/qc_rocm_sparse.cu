@@ -3,6 +3,7 @@
 // The ROCm sparse backend's own index kernels, which have no CUDA counterpart
 // (see rocm/sparse_indexer_kernels.cuh). Registered into the module by
 // qc_rocm_serving.cu, which owns the single PYBIND11_MODULE.
+#include "mfma_fp8_dot.cuh"
 #include "sparse_indexer_kernels.cuh"
 
 #include <c10/util/Float8_e4m3fnuz.h>
@@ -134,6 +135,35 @@ static void py_cp_gather_indexer_quant_cache(
         (int)shuffle);
 }
 
+
+// Layout probe: one 16x16 MFMA tile per wave over the full K, so the fragment
+// mapping can be checked against tl.dot in isolation before the full logits
+// kernel depends on it. D[m = 4*(l/16)+v][n = l%16].
+__global__ void mfma_dot_probe_k(const uint8_t* __restrict__ a,
+                                 const uint8_t* __restrict__ b,
+                                 float* __restrict__ out, int M, int N, int K) {
+    const int l = threadIdx.x & 63;
+    const int m0 = blockIdx.y * 16, n0 = blockIdx.x * 16;
+    qcrocm::f32x4 acc = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < K; k += 32)
+        acc = qcrocm::mfma_16x16x32_fp8(qcrocm::load_a_frag(a, K, m0, k),
+                                        qcrocm::load_b_frag(b, K, n0, k), acc);
+    const int n = n0 + (l & 15);
+#pragma unroll
+    for (int v = 0; v < 4; ++v)
+        out[(long)(m0 + 4 * (l >> 4) + v) * N + n] = acc[v];
+}
+
+static void py_mfma_dot_probe(torch::Tensor a, torch::Tensor b,
+                              torch::Tensor out) {
+    const int M = (int)a.size(0), K = (int)a.size(1), N = (int)b.size(0);
+    dim3 grid(N / 16, M / 16);
+    mfma_dot_probe_k<<<grid, 64, 0, spst()>>>(
+        reinterpret_cast<const uint8_t*>(a.data_ptr()),
+        reinterpret_cast<const uint8_t*>(b.data_ptr()), out.data_ptr<float>(),
+        M, N, K);
+}
+
 void init_sparse(py::module_& m) {
     m.def("convert_req_index_to_global_index",
           &py_convert_req_index_to_global_index, py::arg("req_id"),
@@ -151,6 +181,8 @@ void init_sparse(py::module_& m) {
           py::arg("token_to_seq"), py::arg("block_size"),
           py::arg("block_tile_size"), py::arg("head_tile_size"),
           py::arg("num_batches"), py::arg("num_blocks"), py::arg("shuffle"));
+    m.def("mfma_dot_probe", &py_mfma_dot_probe, py::arg("a"), py::arg("b"),
+          py::arg("out"));
     m.def("generate_sparse_seqlen", &py_generate_sparse_seqlen,
           py::arg("seq_lens"), py::arg("cu_query_lens"), py::arg("out"),
           py::arg("topk_token"));
