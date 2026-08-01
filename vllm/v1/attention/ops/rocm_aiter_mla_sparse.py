@@ -19,9 +19,23 @@ from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
 
+def _quixicore_disabled() -> bool:
+    """VLLM_QC_DISABLE_NATIVE=1 forces the Triton path.
+
+    Exists so the native and Triton routes can be compared on an otherwise
+    identical server; the kernels are bitwise-equal, so greedy output must
+    match token for token.
+    """
+    import os
+
+    return os.environ.get("VLLM_QC_DISABLE_NATIVE") == "1"
+
+
 @functools.cache
 def _use_native_indexer_kquant() -> bool:
     """Prefer the native HIP indexer K-quant kernel over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.is_available() and quixicore_ops.has(
@@ -32,6 +46,8 @@ def _use_native_indexer_kquant() -> bool:
 @functools.cache
 def _use_native_cp_gather() -> bool:
     """Prefer the native HIP indexer gather over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.is_available() and quixicore_ops.has(
@@ -42,6 +58,8 @@ def _use_native_cp_gather() -> bool:
 @functools.cache
 def _use_native_mqa_logits() -> bool:
     """Prefer the native HIP MQA logits kernel over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.quixicore import quixicore_ops
 
     return quixicore_ops.is_available() and quixicore_ops.has("mqa_logits_gfx942")

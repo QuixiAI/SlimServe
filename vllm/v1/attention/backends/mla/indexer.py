@@ -43,9 +43,23 @@ from vllm.v1.worker.cp_utils import get_kv_cache_shard_count
 logger = init_logger(__name__)
 
 
+def _quixicore_disabled() -> bool:
+    """VLLM_QC_DISABLE_NATIVE=1 forces the Triton path.
+
+    Exists so the native and Triton routes can be compared on an otherwise
+    identical server; the kernels are bitwise-equal, so greedy output must
+    match token for token.
+    """
+    import os
+
+    return os.environ.get("VLLM_QC_DISABLE_NATIVE") == "1"
+
+
 @cache
 def _use_native_indexer_metadata() -> bool:
     """Prefer the native indexer metadata kernel over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.platforms import current_platform
 
     if not current_platform.is_cuda_alike():
@@ -58,6 +72,8 @@ def _use_native_indexer_metadata() -> bool:
 @cache
 def _use_native_uniform_decode() -> bool:
     """Prefer the native uniform-decode expansion over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.platforms import current_platform
 
     if not current_platform.is_cuda_alike():
