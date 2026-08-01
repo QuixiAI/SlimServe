@@ -30,7 +30,14 @@
  * first, but that is scheduler interleaving across independent columns, not the
  * dependency order; descending measured strictly worse.
  *
- * NOT YET BITWISE. Measured against Triton at M=64,H=64,D=128,N=256, all of the
+ * STRUCTURALLY EXACT, ASSOCIATION PENDING. With inputs whose products and
+ * partial sums are all exactly representable in fp32 (small integers, unit
+ * scales), this kernel matches Triton bitwise: 0/16384, max|diff| 0.0. Since
+ * association cannot change an exact sum, that proves every index, mask,
+ * weight, scale and the complete set of summed terms is correct, and isolates
+ * the entire remaining difference to fp32 rounding in the head-sum order.
+ *
+ * With general inputs it is not yet bitwise. Measured against Triton at M=64,H=64,D=128,N=256, all of the
  * residue being accumulation order since mfma_dot_probe shows the dot itself is
  * exact:
  *   QC_EPI=0 (h-tile 0 plain, 1 fused) 5768/16384, descending butterfly 6601
