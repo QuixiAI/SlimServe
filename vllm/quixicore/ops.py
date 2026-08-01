@@ -1100,3 +1100,107 @@ class quixicore_ops:
         [cu_start, cu_end) are left untouched, matching AITER's semantics.
         """
         _qc().mqa_logits_gfx942(q, kv, kv_scales, weights, cu_start, cu_end, logits)
+
+    # ------------------------------------------------------------------
+    # TurboQuant KV cache (native ports of the Triton store/decode path)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def turboquant_store_fp8(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_kv_heads: int,
+        key_packed_size: int,
+        value_quant_bits: int,
+    ) -> None:
+        """FP8(e4b15) key scatter + uniform value quantization store.
+
+        Bitwise-equal to `_tq_fused_store_fp8` on Ampere/Ada (the e4b15
+        cache format). key/value are [N*H, D] contiguous fp16/bf16;
+        kv_cache is the (num_blocks, block_size, Hk, slot) strided view.
+        """
+        _qc().turboquant_store_fp8(
+            key, value, kv_cache, slot_mapping, num_kv_heads,
+            key_packed_size, value_quant_bits,
+        )
+
+    @staticmethod
+    def turboquant_store_mse(
+        y: torch.Tensor,
+        norms: torch.Tensor,
+        value: torch.Tensor,
+        midpoints: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_kv_heads: int,
+        mse_bits: int,
+        key_packed_size: int,
+        value_quant_bits: int,
+    ) -> None:
+        """Fused bucketize + MSE index pack + norm + value store.
+
+        Bitwise-equal to `_tq_fused_store_mse`; y/norms/value are the
+        launcher's fp32 tensors (rotation GEMM stays in cuBLAS).
+        """
+        _qc().turboquant_store_mse(
+            y, norms, value, midpoints, kv_cache, slot_mapping,
+            num_kv_heads, mse_bits, key_packed_size, value_quant_bits,
+        )
+
+    @staticmethod
+    def turboquant_decode_stage1(
+        q_rot: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        centroids: torch.Tensor,
+        mid_o: torch.Tensor,
+        num_kv_splits: int,
+        mse_bits: int,
+        key_packed_size: int,
+        value_quant_bits: int,
+        scale: float,
+        key_fp8: bool,
+        norm_correction: bool,
+        sliding_window: int = 0,
+    ) -> None:
+        """Split-KV TQ decode scoring + value accumulation (stage 1)."""
+        _qc().turboquant_decode_stage1(
+            q_rot, kv_cache, block_table, seq_lens, centroids, mid_o,
+            num_kv_splits, mse_bits, key_packed_size, value_quant_bits,
+            scale, key_fp8, norm_correction, sliding_window,
+        )
+
+    @staticmethod
+    def turboquant_decode_stage2(
+        mid_o: torch.Tensor,
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_kv_splits: int,
+    ) -> None:
+        """Log-sum-exp reduction across KV splits (stage 2)."""
+        _qc().turboquant_decode_stage2(mid_o, output, lse, seq_lens, num_kv_splits)
+
+    @staticmethod
+    def turboquant_dequant_kv(
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        centroids: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        num_positions: int,
+        mse_bits: int,
+        key_packed_size: int,
+        value_quant_bits: int,
+        key_fp8: bool,
+        norm_correction: bool,
+    ) -> None:
+        """Bulk dequant of cached TQ K/V to fp16 (continuation prefill)."""
+        _qc().turboquant_dequant_kv(
+            kv_cache, block_table, centroids, k_out, v_out, num_positions,
+            mse_bits, key_packed_size, value_quant_bits, key_fp8,
+            norm_correction,
+        )

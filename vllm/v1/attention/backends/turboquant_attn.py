@@ -53,6 +53,11 @@ from vllm.v1.attention.ops.triton_turboquant_decode import (
     triton_turboquant_decode_attention,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
+from vllm.v1.attention.ops.turboquant_native import (
+    native_turboquant_decode_attention,
+    native_turboquant_store,
+    native_turboquant_supported,
+)
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -355,6 +360,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
+        # Native (QuixiCore CUDA) kernels first; Triton stays as the
+        # fallback on platforms the native port does not cover (ROCm,
+        # sm89+ e4nv fp8, unusual head sizes).
+        self._use_native_kernels = native_turboquant_supported(
+            head_size, self.tq_config.key_fp8
+        )
+        self._decode_attention_fn = (
+            native_turboquant_decode_attention
+            if self._use_native_kernels
+            else triton_turboquant_decode_attention
+        )
+
         # Detect flash-attn version (FA2/3/4) for prefill paths.
         self.fa_version = get_flash_attn_version(head_size=head_size)
 
@@ -621,8 +638,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         slot_mapping: torch.Tensor,
         layer: Any,
     ):
-        """Quantize + store via fused Triton kernel."""
-        triton_turboquant_store(
+        """Quantize + store via the fused native or Triton kernel."""
+        store_fn = (
+            native_turboquant_store
+            if self._use_native_kernels
+            else triton_turboquant_store
+        )
+        store_fn(
             key,
             value,
             kv_cache,
@@ -769,7 +791,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     # Slice from pre-built arange (no kernel launch)
                     synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
+                    out = self._decode_attention_fn(
                         query=q_seq,
                         kv_cache=kv_cache,
                         block_table=synth_bt,
@@ -835,7 +857,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         synth_block_table = attn_metadata.block_table[:num_reqs].repeat_interleave(
             q_len, dim=0
         )
-        return triton_turboquant_decode_attention(
+        return self._decode_attention_fn(
             query=query,
             kv_cache=kv_cache,
             block_table=synth_block_table,
@@ -876,7 +898,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         Hk = key_chunk.shape[1]
         device = query.device
         block_size = kv_cache.shape[1]
-        BLOCK_D = triton.next_power_of_2(D)
 
         mse_bytes = self._mse_bytes
         val_data_bytes = self._val_data_bytes
@@ -911,37 +932,54 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :]
         v_cached = v_buf[:, :, :alloc_len, :]
 
-        grid = (alloc_len, 1 * Hk)
-        _tq_full_dequant_kv[grid](
-            kv_cache,
-            block_table,
-            centroids,
-            k_cached,
-            v_cached,
-            k_cached.stride(0),
-            k_cached.stride(1),
-            k_cached.stride(2),
-            v_cached.stride(0),
-            v_cached.stride(1),
-            v_cached.stride(2),
-            kv_cache.stride(0),
-            kv_cache.stride(1),
-            kv_cache.stride(2),
-            block_table.stride(0),
-            HEAD_DIM=D,
-            BLOCK_SIZE=block_size,
-            NUM_KV_HEADS=Hk,
-            MSE_BYTES=mse_bytes,
-            KPS=self.tq_config.key_packed_size,
-            VQB=self.tq_config.effective_value_quant_bits,
-            VAL_DATA_BYTES=val_data_bytes,
-            MSE_BITS=self.tq_config.key_mse_bits,
-            KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-            BLOCK_D=BLOCK_D,
-            NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-            FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-            num_warps=4,
-        )
+        if self._use_native_kernels:
+            from vllm.quixicore.ops import quixicore_ops
+
+            quixicore_ops.turboquant_dequant_kv(
+                kv_cache,
+                block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                alloc_len,
+                self.tq_config.key_mse_bits,
+                self.tq_config.key_packed_size,
+                self.tq_config.effective_value_quant_bits,
+                self.tq_config.key_fp8,
+                self.tq_config.norm_correction,
+            )
+        else:
+            grid = (alloc_len, 1 * Hk)
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                block_table,
+                centroids,
+                k_cached,
+                v_cached,
+                k_cached.stride(0),
+                k_cached.stride(1),
+                k_cached.stride(2),
+                v_cached.stride(0),
+                v_cached.stride(1),
+                v_cached.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+                BLOCK_D=triton.next_power_of_2(D),
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                num_warps=4,
+            )
 
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
@@ -1043,7 +1081,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             )
 
-        result = triton_turboquant_decode_attention(
+        result = self._decode_attention_fn(
             query=query,
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table,

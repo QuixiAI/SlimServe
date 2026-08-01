@@ -14,6 +14,7 @@
 #include "indexer_paged_logits.cuh"
 #include "sampling_kernels.cuh"
 #include "spec_beam_kernels.cuh"
+#include "turboquant_kernels.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -26,6 +27,8 @@ static const half* hp(const torch::Tensor& t) { return reinterpret_cast<const ha
 static half* hpm(torch::Tensor& t) { return reinterpret_cast<half*>(t.data_ptr()); }
 static const __nv_bfloat16* bp(const torch::Tensor& t) { return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr()); }
 static __nv_bfloat16* bpm(torch::Tensor& t) { return reinterpret_cast<__nv_bfloat16*>(t.data_ptr()); }
+static const float* fp(const torch::Tensor& t) { return t.data_ptr<float>(); }
+static float* fpm(torch::Tensor& t) { return t.data_ptr<float>(); }
 
 // ---- kv cache management ----
 static void py_kv_scatter(torch::Tensor key, torch::Tensor value, torch::Tensor slot_mapping,
@@ -964,6 +967,139 @@ static torch::Tensor py_attn_window(torch::Tensor q, torch::Tensor k, torch::Ten
     return out;
 }
 
+// ---- TurboQuant KV cache (turboquant_kernels.cuh) ----
+// kv_cache arrives as the backend's (num_blocks, block_size, Hk, slot) view of
+// the (num_blocks, Hk, block_size, slot) allocation -- strided, so no CK.
+#define CKTQ(x) TORCH_CHECK(x.is_cuda(), #x " must be CUDA")
+
+static void py_turboquant_store_fp8(torch::Tensor key, torch::Tensor value,
+        torch::Tensor kv_cache, torch::Tensor slot_mapping,
+        int64_t num_kv_heads, int64_t kps, int64_t vqb) {
+    CK(key); CK(value); CK(slot_mapping); CKTQ(kv_cache);
+    TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8 && kv_cache.stride(3) == 1,
+                "kv_cache must be uint8 with contiguous slots");
+    const int NH = key.size(0), D = key.size(1), H = int(num_kv_heads);
+    const int block_size = kv_cache.size(1);
+    const int vdb = (D * int(vqb) + 7) / 8;
+    TORCH_CHECK(D <= 256, "turboquant store supports D <= 256");
+    if (NH == 0) return;
+    #define LAUNCH(T, RD, ST) tq_store_fp8<T, ST><<<NH, 32, 0, stream()>>>( \
+        RD(key), RD(value), kv_cache.data_ptr<uint8_t>(), \
+        slot_mapping.data_ptr<ST>(), kv_cache.stride(0), kv_cache.stride(1), \
+        kv_cache.stride(2), D, H, block_size, int(kps), int(vqb), vdb)
+    #define DISPATCH_SLOT(T, RD) do { \
+        if (slot_mapping.scalar_type() == torch::kLong) LAUNCH(T, RD, int64_t); \
+        else LAUNCH(T, RD, int); } while (0)
+    if (key.scalar_type() == torch::kHalf) DISPATCH_SLOT(half, hp);
+    else if (key.scalar_type() == torch::kBFloat16) DISPATCH_SLOT(__nv_bfloat16, bp);
+    else TORCH_CHECK(false, "turboquant_store_fp8: key must be fp16/bf16");
+    #undef DISPATCH_SLOT
+    #undef LAUNCH
+}
+
+static void py_turboquant_store_mse(torch::Tensor y, torch::Tensor norms,
+        torch::Tensor value, torch::Tensor midpoints, torch::Tensor kv_cache,
+        torch::Tensor slot_mapping, int64_t num_kv_heads, int64_t mse_bits,
+        int64_t kps, int64_t vqb) {
+    CK(y); CK(norms); CK(value); CK(midpoints); CK(slot_mapping); CKTQ(kv_cache);
+    TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8 && kv_cache.stride(3) == 1,
+                "kv_cache must be uint8 with contiguous slots");
+    TORCH_CHECK(y.scalar_type() == torch::kFloat && value.scalar_type() == torch::kFloat,
+                "turboquant_store_mse expects fp32 y/value");
+    const int NH = y.size(0), D = y.size(1), H = int(num_kv_heads);
+    const int block_size = kv_cache.size(1);
+    const int mse_bytes = (D * int(mse_bits) + 7) / 8;
+    const int vdb = (D * int(vqb) + 7) / 8;
+    TORCH_CHECK(D <= 256, "turboquant store supports D <= 256");
+    if (NH == 0) return;
+    #define LAUNCH(ST) tq_store_mse<ST><<<NH, 32, 0, stream()>>>( \
+        y.data_ptr<float>(), norms.data_ptr<float>(), value.data_ptr<float>(), \
+        midpoints.data_ptr<float>(), kv_cache.data_ptr<uint8_t>(), \
+        slot_mapping.data_ptr<ST>(), kv_cache.stride(0), kv_cache.stride(1), \
+        kv_cache.stride(2), D, H, block_size, int(mse_bits), mse_bytes, \
+        1 << int(mse_bits), int(kps), int(vqb), vdb)
+    if (slot_mapping.scalar_type() == torch::kLong) LAUNCH(int64_t); else LAUNCH(int);
+    #undef LAUNCH
+}
+
+static void py_turboquant_decode_stage1(torch::Tensor q_rot, torch::Tensor kv_cache,
+        torch::Tensor block_table, torch::Tensor seq_lens, torch::Tensor centroids,
+        torch::Tensor mid_o, int64_t num_splits, int64_t mse_bits, int64_t kps,
+        int64_t vqb, double scale, bool key_fp8, bool norm_correction,
+        int64_t window) {
+    CK(centroids); CKTQ(q_rot); CKTQ(kv_cache); CKTQ(block_table);
+    CKTQ(seq_lens); CKTQ(mid_o);
+    TORCH_CHECK(kv_cache.stride(3) == 1 && q_rot.stride(2) == 1 && mid_o.stride(3) == 1,
+                "innermost dims must be contiguous");
+    const int B = q_rot.size(0), Hq = q_rot.size(1), D = q_rot.size(2);
+    const int Hk = kv_cache.size(2), block_size = kv_cache.size(1);
+    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant decode supports D in {32,64,96,128}");
+    const int mse_bytes = (D * int(mse_bits) + 7) / 8;
+    const int vdb = (D * int(vqb) + 7) / 8;
+    if (B == 0) return;
+    dim3 grid(B, Hq, unsigned(num_splits));
+    #define LAUNCH(T, RD) tq_decode_stage1<T><<<grid, 32, 0, stream()>>>( \
+        RD(q_rot), kv_cache.data_ptr<uint8_t>(), block_table.data_ptr<int>(), \
+        seq_lens.data_ptr<int>(), centroids.data_ptr<float>(), \
+        mid_o.data_ptr<float>(), q_rot.stride(0), q_rot.stride(1), \
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2), \
+        block_table.stride(0), mid_o.stride(0), mid_o.stride(1), mid_o.stride(2), \
+        D, block_size, int(num_splits), Hq / Hk, int(mse_bits), mse_bytes, \
+        int(kps), int(vqb), vdb, float(scale), key_fp8 ? 1 : 0, \
+        norm_correction ? 1 : 0, int(window))
+    if (q_rot.scalar_type() == torch::kFloat) LAUNCH(float, fp);
+    else if (q_rot.scalar_type() == torch::kHalf) LAUNCH(half, hp);
+    else if (q_rot.scalar_type() == torch::kBFloat16) LAUNCH(__nv_bfloat16, bp);
+    else TORCH_CHECK(false, "turboquant_decode_stage1: q must be fp32/fp16/bf16");
+    #undef LAUNCH
+}
+
+static void py_turboquant_decode_stage2(torch::Tensor mid_o, torch::Tensor output,
+        torch::Tensor lse, torch::Tensor seq_lens, int64_t num_splits) {
+    CKTQ(mid_o); CKTQ(output); CKTQ(lse); CKTQ(seq_lens);
+    TORCH_CHECK(mid_o.stride(3) == 1 && output.stride(2) == 1,
+                "innermost dims must be contiguous");
+    const int B = output.size(0), Hq = output.size(1), D = output.size(2);
+    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant decode supports D in {32,64,96,128}");
+    if (B == 0) return;
+    dim3 grid(B, Hq);
+    #define LAUNCH(T, WP) tq_decode_stage2<T><<<grid, 32, 0, stream()>>>( \
+        mid_o.data_ptr<float>(), WP(output), lse.data_ptr<float>(), \
+        seq_lens.data_ptr<int>(), mid_o.stride(0), mid_o.stride(1), \
+        mid_o.stride(2), output.stride(0), output.stride(1), lse.stride(0), \
+        int(num_splits), D)
+    if (output.scalar_type() == torch::kHalf) LAUNCH(half, hpm);
+    else if (output.scalar_type() == torch::kBFloat16) LAUNCH(__nv_bfloat16, bpm);
+    else if (output.scalar_type() == torch::kFloat) LAUNCH(float, fpm);
+    else TORCH_CHECK(false, "turboquant_decode_stage2: output must be fp32/fp16/bf16");
+    #undef LAUNCH
+}
+
+static void py_turboquant_dequant_kv(torch::Tensor kv_cache, torch::Tensor block_table,
+        torch::Tensor centroids, torch::Tensor k_out, torch::Tensor v_out,
+        int64_t num_positions, int64_t mse_bits, int64_t kps, int64_t vqb,
+        bool key_fp8, bool norm_correction) {
+    CK(centroids); CKTQ(kv_cache); CKTQ(block_table); CKTQ(k_out); CKTQ(v_out);
+    TORCH_CHECK(kv_cache.stride(3) == 1 && k_out.stride(3) == 1 && v_out.stride(3) == 1,
+                "innermost dims must be contiguous");
+    TORCH_CHECK(k_out.scalar_type() == torch::kHalf, "dequant writes fp16");
+    const int B = k_out.size(0), Hk = k_out.size(1), D = k_out.size(3);
+    const int block_size = kv_cache.size(1);
+    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant dequant supports D in {32,64,96,128}");
+    const int mse_bytes = (D * int(mse_bits) + 7) / 8;
+    const int vdb = (D * int(vqb) + 7) / 8;
+    if (num_positions == 0) return;
+    dim3 grid(unsigned(num_positions), B * Hk);
+    tq_full_dequant_kv<<<grid, 32, 0, stream()>>>(
+        kv_cache.data_ptr<uint8_t>(), block_table.data_ptr<int>(),
+        centroids.data_ptr<float>(), hpm(k_out), hpm(v_out),
+        k_out.stride(0), k_out.stride(1), k_out.stride(2),
+        v_out.stride(0), v_out.stride(1), v_out.stride(2),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        block_table.stride(0), D, block_size, Hk, mse_bytes, int(kps), int(vqb),
+        vdb, int(mse_bits), key_fp8 ? 1 : 0, norm_correction ? 1 : 0);
+}
+
 void init_serving(py::module_& m) {
     m.def("mla_kv_insert", &py_mla_kv_insert, py::arg("kv_c"), py::arg("k_pe"), py::arg("cos"),
           py::arg("sin"), py::arg("positions"), py::arg("slot_mapping"), py::arg("kv_cache"),
@@ -1125,4 +1261,29 @@ void init_serving(py::module_& m) {
     m.def("spec_verify_tree", &py_spec_verify_tree);
     m.def("spec_compact", &py_spec_compact);
     m.def("spec_update_kv_meta", &py_spec_update_kv_meta);
+    m.def("turboquant_store_fp8", &py_turboquant_store_fp8,
+          py::arg("key"), py::arg("value"), py::arg("kv_cache"),
+          py::arg("slot_mapping"), py::arg("num_kv_heads"),
+          py::arg("key_packed_size"), py::arg("value_quant_bits"));
+    m.def("turboquant_store_mse", &py_turboquant_store_mse,
+          py::arg("y"), py::arg("norms"), py::arg("value"), py::arg("midpoints"),
+          py::arg("kv_cache"), py::arg("slot_mapping"), py::arg("num_kv_heads"),
+          py::arg("mse_bits"), py::arg("key_packed_size"),
+          py::arg("value_quant_bits"));
+    m.def("turboquant_decode_stage1", &py_turboquant_decode_stage1,
+          py::arg("q_rot"), py::arg("kv_cache"), py::arg("block_table"),
+          py::arg("seq_lens"), py::arg("centroids"), py::arg("mid_o"),
+          py::arg("num_kv_splits"), py::arg("mse_bits"),
+          py::arg("key_packed_size"), py::arg("value_quant_bits"),
+          py::arg("scale"), py::arg("key_fp8"), py::arg("norm_correction"),
+          py::arg("sliding_window") = 0);
+    m.def("turboquant_decode_stage2", &py_turboquant_decode_stage2,
+          py::arg("mid_o"), py::arg("output"), py::arg("lse"),
+          py::arg("seq_lens"), py::arg("num_kv_splits"));
+    m.def("turboquant_dequant_kv", &py_turboquant_dequant_kv,
+          py::arg("kv_cache"), py::arg("block_table"), py::arg("centroids"),
+          py::arg("k_out"), py::arg("v_out"), py::arg("num_positions"),
+          py::arg("mse_bits"), py::arg("key_packed_size"),
+          py::arg("value_quant_bits"), py::arg("key_fp8"),
+          py::arg("norm_correction"));
 }
