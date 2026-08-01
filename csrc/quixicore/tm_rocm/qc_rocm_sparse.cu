@@ -3,6 +3,7 @@
 // The ROCm sparse backend's own index kernels, which have no CUDA counterpart
 // (see rocm/sparse_indexer_kernels.cuh). Registered into the module by
 // qc_rocm_serving.cu, which owns the single PYBIND11_MODULE.
+#include "fp8_mqa_logits_kernel.cuh"
 #include "mfma_fp8_dot.cuh"
 #include "sparse_indexer_kernels.cuh"
 
@@ -164,6 +165,26 @@ static void py_mfma_dot_probe(torch::Tensor a, torch::Tensor b,
         M, N, K);
 }
 
+
+// Not wired into dispatch: the dot is verified bitwise but the epilogue
+// ordering is still being pinned against Triton, so this stays a bound-but-
+// unused op until the differential test is clean.
+static void py_fp8_mqa_logits(torch::Tensor q, torch::Tensor kv,
+                              torch::Tensor kv_scales, torch::Tensor weights,
+                              torch::Tensor cu_start, torch::Tensor cu_end,
+                              torch::Tensor logits) {
+    const int M = (int)q.size(0), H = (int)q.size(1), D = (int)q.size(2);
+    const int N = (int)kv.size(0);
+    TORCH_CHECK(H == 64 && D == 128, "probe kernel is specialised to H=64 D=128");
+    qcrocm::fp8_mqa_logits<64, 128, 64, 4><<<M, 256, 0, spst()>>>(
+        reinterpret_cast<const uint8_t*>(q.data_ptr()),
+        reinterpret_cast<const uint8_t*>(kv.data_ptr()),
+        kv_scales.data_ptr<float>(), weights.data_ptr<float>(),
+        cu_start.data_ptr<int>(), cu_end.data_ptr<int>(),
+        logits.data_ptr<float>(), q.stride(0), weights.stride(0),
+        logits.stride(0), N);
+}
+
 void init_sparse(py::module_& m) {
     m.def("convert_req_index_to_global_index",
           &py_convert_req_index_to_global_index, py::arg("req_id"),
@@ -181,6 +202,9 @@ void init_sparse(py::module_& m) {
           py::arg("token_to_seq"), py::arg("block_size"),
           py::arg("block_tile_size"), py::arg("head_tile_size"),
           py::arg("num_batches"), py::arg("num_blocks"), py::arg("shuffle"));
+    m.def("fp8_mqa_logits", &py_fp8_mqa_logits, py::arg("q"), py::arg("kv"),
+          py::arg("kv_scales"), py::arg("weights"), py::arg("cu_start"),
+          py::arg("cu_end"), py::arg("logits"));
     m.def("mfma_dot_probe", &py_mfma_dot_probe, py::arg("a"), py::arg("b"),
           py::arg("out"));
     m.def("generate_sparse_seqlen", &py_generate_sparse_seqlen,
