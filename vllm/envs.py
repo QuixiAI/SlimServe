@@ -184,6 +184,7 @@ if TYPE_CHECKING:
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
     VLLM_DCP_Q_REPLICATE: bool = False
+    VLLM_FUSED_AR_NORM: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1444,6 +1445,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Opt-in MLA DCP query replication: skip the decode query all-gather.
     "VLLM_DCP_Q_REPLICATE": lambda: bool(int(os.getenv("VLLM_DCP_Q_REPLICATE", "0"))),
+    # Opt-in: fuse the custom one-shot allreduce with the following residual
+    # add + RMSNorm in supported decoder layers (small decode-sized messages
+    # only). Measured neutral on A100 TP4 decode, so off by default.
+    "VLLM_FUSED_AR_NORM": lambda: bool(int(os.getenv("VLLM_FUSED_AR_NORM", "0"))),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine

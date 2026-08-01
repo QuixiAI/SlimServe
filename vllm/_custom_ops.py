@@ -3141,6 +3141,21 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
+def all_reduce_add_rms_norm(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    epsilon: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.all_reduce_add_rms_norm(
+        fa, inp, residual, weight, out, epsilon, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
 def dispose(fa: int) -> None:
     torch.ops._C_custom_ar.dispose(fa)
 

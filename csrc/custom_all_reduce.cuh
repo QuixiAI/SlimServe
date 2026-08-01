@@ -313,6 +313,61 @@ __global__ void __launch_bounds__(512, 1)
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
 
+// One-shot allreduce fused with residual add + RMSNorm:
+//   residual += allreduce(input); result = rmsnorm(residual) * weight
+// Matches the semantics of running cross_device_reduce_1stage followed by
+// fused_add_rms_norm. One block strides over tokens; the shared-memory tree
+// reduction keeps the variance accumulation order fixed, so results are
+// deterministic across repeats.
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(512, 1) cross_device_reduce_norm_1stage(
+    RankData* _dp, RankSignals sg, Signal* self_sg, T* __restrict__ result,
+    T* __restrict__ residual, const T* __restrict__ weight, float epsilon,
+    int rank, int num_tokens, int vec_hidden_size) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  __shared__ float red_smem[512];
+  __shared__ float s_variance;
+  auto dp = *_dp;
+  P* res_v = (P*)residual;
+  P* out_v = (P*)result;
+  const P* w_v = (const P*)weight;
+  const int hidden_size = vec_hidden_size * P::size;
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
+    const int base = token * vec_hidden_size;
+    float variance = 0.0f;
+    for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+      P tmp = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], base + idx);
+      packed_assign_add(tmp, res_v[base + idx]);
+      res_v[base + idx] = tmp;
+      A acc = upcast(tmp);
+#pragma unroll
+      for (int i = 0; i < P::size; i++) variance += acc.data[i] * acc.data[i];
+    }
+    red_smem[threadIdx.x] = variance;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (threadIdx.x < s) red_smem[threadIdx.x] += red_smem[threadIdx.x + s];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0)
+      s_variance = rsqrtf(red_smem[0] / hidden_size + epsilon);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < vec_hidden_size; idx += blockDim.x) {
+      A x = upcast(res_v[base + idx]);
+      A w = upcast(w_v[idx]);
+      P out;
+#pragma unroll
+      for (int i = 0; i < P::size; i++)
+        out.data[i] = downcast_s<T>(x.data[i] * s_variance * w.data[i]);
+      out_v[base + idx] = out;
+    }
+    __syncthreads();
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename P>
 DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
@@ -614,6 +669,72 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  /**
+   * One-shot allreduce fused with residual add + RMSNorm. Only profitable
+   * for small (decode-sized) messages; the caller is responsible for
+   * falling back to the unfused path when the two-stage algorithm would
+   * have been selected.
+   */
+  template <typename T>
+  void allreduce_norm(cudaStream_t stream, T* input, T* residual,
+                      const T* weight, T* output, int num_tokens,
+                      int hidden_size, float epsilon,
+                      int block_limit = defaultBlockLimit) {
+    auto d = packed_t<T>::P::size;
+    if (hidden_size % d != 0)
+      throw std::runtime_error(
+          "fused allreduce_norm requires hidden size to be multiple of " +
+          std::to_string(d));
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("max supported block limit is " +
+                               std::to_string(kMaxBlocks) + ". Got " +
+                               std::to_string(block_limit));
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+
+    int vec_hidden_size = hidden_size / d;
+    int blocks = std::min(block_limit, num_tokens);
+    // blockDim must stay a power of two for the tree reduction.
+    constexpr int threads = 512;
+
+#define NORM_CASE(ngpus)                                                 \
+  case ngpus: {                                                          \
+    cross_device_reduce_norm_1stage<T, ngpus>                            \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output,    \
+                                         residual, weight, epsilon,      \
+                                         rank_, num_tokens,              \
+                                         vec_hidden_size);               \
+    break;                                                               \
+  }
+
+    switch (world_size_) {
+      NORM_CASE(2)
+      NORM_CASE(4)
+      NORM_CASE(6)
+      NORM_CASE(8)
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual "
+            "num gpus = " +
+            std::to_string(world_size_));
+    }
+#undef NORM_CASE
   }
 
   ~CustomAllreduce() {
