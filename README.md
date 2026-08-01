@@ -14,20 +14,20 @@ Aggregate throughput, by concurrent requests:
 | **2× MI300X** | **82** | **141** | **176** | **260** | **297** | **408** |
 | **4× MI300X** | **104** | **142** | **260** | **270** | **384** | **475** |
 | **8× MI300X** | **111** | **212** | **333** | **501** | **607** | † |
-| **4× A100** | **31** | — | **106** | **148** | **243** | |
-| **8× A100** | **30** | — | **158** | **206** | **286** | |
+| **4× A100** | **23** | **58** | **83** | **105** | **186** | **217** |
+| **8× A100** | **21** | **60** | **98** | **173** | **290** | **352** |
 
 <sub>Aggregate tok/s — total tokens generated divided by the time to drain the
 whole batch. Per-request rates and latencies are in
 [Performance](#performance). † 8 GPUs at 64 concurrent trips an illegal memory
 access in vLLM's spec-decode rejection sampler during startup profiling; the
-8× row was measured at `--max-seqs 32`, the 2×/4× rows at 64. A100 rows:
-Q2_K, `max_model_len` 4096, `max_num_seqs` 32, fp8 KV, DSpark k=3, CUDA
-graphs, measured with the `triton` package absent (the A100 serving path is
-fully native CUDA). At 1 concurrent request A100 decode is latency-bound, so
-4 GPUs match 8; the gap opens with batch as speculative verify becomes
-bandwidth-bound. An 8-GPU A100 box can also run two independent TP4
-instances: ~2× the single-instance row at double the connection count.</sub>
+8× row was measured at `--max-seqs 32`, the 2×/4× rows at 64. A100 rows: same
+methodology as the MI300X rows (varied real prompts, temperature 0, natural
+stops, aggregate = total tokens / drain time). Q2_K, `max_model_len` 4096,
+`max_num_seqs` 64, fp8 KV, DSpark k=3 with the draft replicated per GPU,
+CUDA graphs; the A100 serving path is fully native CUDA (verified serving
+with the `triton` package absent). An 8-GPU A100 box can also run two
+independent TP4 instances for isolation, at roughly the 4× row each.</sub>
 
 ### …while supporting up to 1 Million tokens of context
 
