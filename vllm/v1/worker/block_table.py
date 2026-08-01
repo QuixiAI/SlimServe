@@ -366,9 +366,23 @@ class MultiGroupBlockTable:
         return self.block_tables[idx]
 
 
+def _quixicore_disabled() -> bool:
+    """VLLM_QC_DISABLE_NATIVE=1 forces the Triton path.
+
+    Exists so the native and Triton routes can be compared on an otherwise
+    identical server; the kernels are bitwise-equal, so greedy output must
+    match token for token.
+    """
+    import os
+
+    return os.environ.get("VLLM_QC_DISABLE_NATIVE") == "1"
+
+
 @cache
 def _use_native_slot_mapping() -> bool:
     """Prefer the native slot-mapping kernel over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.platforms import current_platform
 
     if not current_platform.is_cuda_alike():

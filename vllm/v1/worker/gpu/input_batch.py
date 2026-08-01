@@ -7,13 +7,27 @@ import numpy as np
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.math_utils import next_power_of_2
 from vllm.utils import random_uuid
+from vllm.utils.math_utils import next_power_of_2
+
+
+def _quixicore_disabled() -> bool:
+    """VLLM_QC_DISABLE_NATIVE=1 forces the Triton path.
+
+    Exists so the native and Triton routes can be compared on an otherwise
+    identical server; the kernels are bitwise-equal, so greedy output must
+    match token for token.
+    """
+    import os
+
+    return os.environ.get("VLLM_QC_DISABLE_NATIVE") == "1"
 
 
 @cache
 def _use_native(op_name: str) -> bool:
     """Prefer the native batch-prep kernel over the Triton one."""
+    if _quixicore_disabled():
+        return False
     from vllm.platforms import current_platform
 
     if not current_platform.is_cuda_alike():
@@ -456,9 +470,7 @@ def combine_sampled_and_draft_tokens(
         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
         # last sampled token in addition to all draft tokens.
-        BLOCK_SIZE=next_power_of_2(
-            num_speculative_steps + num_new_sampled_tokens
-        ),
+        BLOCK_SIZE=next_power_of_2(num_speculative_steps + num_new_sampled_tokens),
     )
     return logits_indices
 
