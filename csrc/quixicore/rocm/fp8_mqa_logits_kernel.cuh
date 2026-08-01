@@ -21,10 +21,29 @@
  * multiply is FUSED into the accumulate, one rounding rather than the two a
  * separate multiply and add would take. The remaining 16 heads of a wave's
  * range are then folded by an xor butterfly over lane%16 (offsets 8,4,2,1 --
- * the row_shr:8 / row_shl:8 DPP pairs), and the two head-halves finally meet
- * through LDS.
+ * the DPP stages), and the two head-halves finally meet through LDS.
+ *
+ * The butterfly runs 1,2,4,8 ASCENDING. The full DPP inventory in the generated
+ * ISA is quad_perm[1,0,3,2] (xor 1), quad_perm[2,3,0,1] (xor 2), row_shr/shl:4
+ * and row_shr/shl:8 -- 16 of each, i.e. one per stage per column per dot site.
+ * Reading only the first few instructions of the listing suggests 8 comes
+ * first, but that is scheduler interleaving across independent columns, not the
+ * dependency order; descending measured strictly worse.
+ *
+ * NOT YET BITWISE. Measured against Triton at M=64,H=64,D=128,N=256, all of the
+ * residue being accumulation order since mfma_dot_probe shows the dot itself is
+ * exact:
+ *   QC_EPI=0 (h-tile 0 plain, 1 fused) 5768/16384, descending butterfly 6601
+ *   QC_EPI=1 (h-tile 1 plain, 0 fused) 5484/16384   <- current
+ *   QC_EPI=2 (separate multiplies)     5484/16384   -- identical to 1 because
+ *       -ffp-contract=fast re-forms the FMA, so this does not actually test an
+ *       unfused epilogue; use -ffp-contract=off to make that variant meaningful.
+ * max|diff| 3.1e-5, mean 1.8e-6 throughout.
  */
 #pragma once
+#ifndef QC_EPI
+  #define QC_EPI 1
+#endif
 #include "mfma_fp8_dot.cuh"
 
 #include <cstdint>
@@ -104,17 +123,36 @@ __global__ __launch_bounds__(64 * NWAVE) void fp8_mqa_logits(
                 // Two heads per lane per column: plain multiply then a fused
                 // multiply-add, exactly as Triton's v_mul/v_fmac pair.
                 float sum = 0.0f;
+#if QC_EPI == 0   // h-tile 0 plain, h-tile 1 fused
 #pragma unroll
                 for (int j = 0; j < H_TILES; ++j) {
                     const float t = fmaxf(acc[i][j][v] * ks, 0.0f);
                     const float w = w_row[j * 16 * WH + wh * 16 + lo];
                     sum = (j == 0) ? (w * t) : fmaf(w, t, sum);
                 }
+#elif QC_EPI == 1  // h-tile 1 plain, h-tile 0 fused
+#pragma unroll
+                for (int j = H_TILES - 1; j >= 0; --j) {
+                    const float t = fmaxf(acc[i][j][v] * ks, 0.0f);
+                    const float w = w_row[j * 16 * WH + wh * 16 + lo];
+                    sum = (j == H_TILES - 1) ? (w * t) : fmaf(w, t, sum);
+                }
+#else              // no fusion: separate multiplies then an add
+                {
+                    float acc0 = 0.0f;
+#pragma unroll
+                    for (int j = 0; j < H_TILES; ++j) {
+                        const float t = fmaxf(acc[i][j][v] * ks, 0.0f);
+                        acc0 += w_row[j * 16 * WH + wh * 16 + lo] * t;
+                    }
+                    sum = acc0;
+                }
+#endif
                 // Fold the wave's remaining heads across lane%16.
-                sum += __shfl_xor(sum, 8, 64);
-                sum += __shfl_xor(sum, 4, 64);
-                sum += __shfl_xor(sum, 2, 64);
                 sum += __shfl_xor(sum, 1, 64);
+                sum += __shfl_xor(sum, 2, 64);
+                sum += __shfl_xor(sum, 4, 64);
+                sum += __shfl_xor(sum, 8, 64);
                 if (lo == 0) part[wh][n - tile] = sum;
             }
         }
