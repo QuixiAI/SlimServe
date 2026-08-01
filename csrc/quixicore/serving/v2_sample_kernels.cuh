@@ -23,6 +23,26 @@
 
 namespace tmv2s {
 
+// Cross-lane primitives. The reduction trees below reproduce Triton's shfl.bfly
+// order over 32 lanes, and that order is what makes the fp32 results bitwise
+// equal -- so the tree width is load-bearing, not incidental.
+//
+// A CDNA wavefront is 64 lanes, so the width-32 form is required: it splits the
+// wave into two independent 32-lane groups that each walk the same 16->1
+// butterfly in the same order. Widening the tree to 64 would change the
+// summation order, and fp32 addition is not associative. The maskless form is
+// also the right one on HIP -- __shfl_*_sync there asserts a 64-bit full mask
+// and expands to a waterfall loop on every call.
+#if defined(__HIP_PLATFORM_AMD__)
+  #define V2S_SHFL_XOR(v, off) __shfl_xor((v), (off), 32)
+  // 32-lane groups are halves of one wavefront and advance in lockstep, so the
+  // wave barrier carries __syncwarp's guarantee here.
+  #define V2S_SYNCWARP() __builtin_amdgcn_wave_barrier()
+#else
+  #define V2S_SHFL_XOR(v, off) __shfl_xor_sync(0xffffffffu, (v), (off))
+  #define V2S_SYNCWARP() __syncwarp()
+#endif
+
 #define V2S_NEG_INF (-CUDART_INF_F)
 // Smallest positive tl.rand output (matches _TL_RAND_MIN / triton's scale).
 #define V2S_TL_RAND_SCALE 4.6566127342e-10f
@@ -33,16 +53,30 @@ namespace tmv2s {
 // Triton-lowering-exact scalar ops
 // ---------------------------------------------------------------------------
 
+// The bitwise target is the Triton kernel on the *same* hardware, so each branch
+// pins that platform's lowering rather than the other's instruction. Measured on
+// MI300X over 65536 samples spanning [-20, 20]: ROCm Triton's tl.exp is bitwise
+// identical to exp2(x*log2e) -- the same log2e-multiply plus hardware exp2 the
+// PTX does -- and its fp32 `/` is bitwise identical to an IEEE divide. NVIDIA's
+// div.full.f32 is the approximate form and has no CDNA equivalent.
 __device__ __forceinline__ float tt_exp(float x) {
     float y = x * 1.4426950408889634f;  // 0f3FB8AA3B, same constant as triton
+#if defined(__HIP_PLATFORM_AMD__)
+    return __builtin_amdgcn_exp2f(y);  // v_exp_f32, what tl.exp lowers to
+#else
     asm("ex2.approx.f32 %0, %0;" : "+f"(y));
     return y;
+#endif
 }
 
 __device__ __forceinline__ float tt_div(float a, float b) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return a / b;
+#else
     float c;
     asm("div.full.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
     return c;
+#endif
 }
 
 template <typename T>
@@ -125,21 +159,21 @@ __device__ __forceinline__ double tt_gumbel64(uint64_t seed, uint64_t off) {
 __device__ __forceinline__ float warp_bfly_sum_f32(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        v += __shfl_xor_sync(0xffffffffu, v, off);
+        v += V2S_SHFL_XOR(v, off);
     return v;
 }
 
 __device__ __forceinline__ float warp_bfly_max_f32(float v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, off));
+        v = fmaxf(v, V2S_SHFL_XOR(v, off));
     return v;
 }
 
 __device__ __forceinline__ int warp_bfly_sum_i32(int v) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        v += __shfl_xor_sync(0xffffffffu, v, off);
+        v += V2S_SHFL_XOR(v, off);
     return v;
 }
 
@@ -154,8 +188,8 @@ template <typename VT>
 __device__ __forceinline__ void warp_bfly_argmax(VT& v, int& i) {
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        const VT ov = __shfl_xor_sync(0xffffffffu, v, off);
-        const int oi = __shfl_xor_sync(0xffffffffu, i, off);
+        const VT ov = V2S_SHFL_XOR(v, off);
+        const int oi = V2S_SHFL_XOR(i, off);
         argmax_combine(v, i, ov, oi);
     }
 }
@@ -548,12 +582,12 @@ __device__ __forceinline__ float v2_global_lse(
     const float s = el < nb ? local_sumexp[logit_idx * ls_stride + el] : 0.0f;
     float gmax = m;
     for (int off = P >> 1; off > 0; off >>= 1)
-        gmax = fmaxf(gmax, __shfl_xor_sync(0xffffffffu, gmax, off));
+        gmax = fmaxf(gmax, V2S_SHFL_XOR(gmax, off));
     const float e = tt_exp(m - gmax);
     float acc = s * e;
     bool first = true;
     for (int off = P >> 1; off > 0; off >>= 1) {
-        const float other = __shfl_xor_sync(0xffffffffu, acc, off);
+        const float other = V2S_SHFL_XOR(acc, off);
         acc = first ? __fmaf_rn(e, s, other) : acc + other;
         first = false;
     }
@@ -569,8 +603,8 @@ __device__ __forceinline__ int64_t v2_global_target_argmax(
     float v = el < nb ? local_max[logit_idx * lm_stride + el] : V2S_NEG_INF;
     int i = el;
     for (int off = P >> 1; off > 0; off >>= 1) {
-        const float ov = __shfl_xor_sync(0xffffffffu, v, off);
-        const int oi = __shfl_xor_sync(0xffffffffu, i, off);
+        const float ov = V2S_SHFL_XOR(v, off);
+        const int oi = V2S_SHFL_XOR(i, off);
         argmax_combine(v, i, ov, oi);
     }
     return local_argmax[logit_idx * la_stride + i];
@@ -1036,7 +1070,7 @@ __global__ void v2_insert_resampled_k(
     const int64_t end_idx = cu_num_logits[req_idx + 1];
     const int64_t resample_token_idx = start_idx + num_sampled;
     const int64_t req_state_idx = expanded_idx_mapping[resample_token_idx];
-    __syncwarp();
+    V2S_SYNCWARP();
     if (lane == 0) num_sampled_ptr[req_idx] = num_sampled + 1;
 
     const float temp = temp_ptr[req_state_idx];
