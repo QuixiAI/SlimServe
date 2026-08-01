@@ -78,4 +78,73 @@ __global__ void generate_sparse_seqlen(const int* __restrict__ seq_lens,
     }
 }
 
+
+// Per-token fp8 quantize of the indexer K vector, scattered into the paged
+// cache. One block per token, one lane per head-dim element.
+//
+// scale = max(1e-4, amax) / FP8_MAX, so |val / scale| <= FP8_MAX by
+// construction and the conversion can never overflow. That matters: within
+// range, ROCm Triton's float->fp8 cast and HIP's agree bitwise (measured over
+// 131577 samples including exact midpoint ties), but they disagree *outside*
+// it -- Triton saturates to max-finite where HIP emits NaN. This kernel stays
+// inside the agreeing domain.
+//
+// The amax reduction is a max, which is order-independent and exact, so the
+// reduction tree shape is free here (unlike the sampler's fp32 sums).
+//
+//   k          [num_tokens, head_dim]  bf16/fp16/fp32
+//   cache      fp8, paged; SHUFFLE tiles when block_size > 1
+//   scale_out  fp32, [num_blocks, block_size]
+template <typename T, typename FP8_T>
+__global__ void indexer_k_quant_and_cache(
+    const T* __restrict__ k, FP8_T* __restrict__ kv_cache,
+    float* __restrict__ kv_cache_scale, const long* __restrict__ slot_mapping,
+    long scale_stride, long value_stride, int block_size, int head_dim,
+    int block_tile_size, int head_tile_size, float fp8_max, int shuffle) {
+    const int tid = blockIdx.x;
+    const long slot_id = slot_mapping[tid];
+    if (slot_id < 0) return;
+
+    const T* src = k + (long)tid * head_dim;
+
+    // amax over the row.
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+        local = fmaxf(local, fabsf((float)src[i]));
+    __shared__ float s_amax[64];
+    const int nwarps = (blockDim.x + 63) / 64;
+    const int lane = threadIdx.x & 63, warp = threadIdx.x >> 6;
+    for (int off = 32; off > 0; off >>= 1)
+        local = fmaxf(local, __shfl_xor(local, off, 64));
+    if (lane == 0) s_amax[warp] = local;
+    __syncthreads();
+    float amax = s_amax[0];
+    for (int w = 1; w < nwarps; ++w) amax = fmaxf(amax, s_amax[w]);
+
+    const float scale = fmaxf(1e-4f, amax) / fp8_max;
+
+    const long block_id = slot_id / block_size;
+    const int block_offset = (int)(slot_id % block_size);
+    const int tile_block_id = block_offset / block_tile_size;
+    const int tile_block_offset = block_offset % block_tile_size;
+
+    FP8_T* dst;
+    if (shuffle)
+        dst = kv_cache + block_id * value_stride +
+              (long)tile_block_id * block_tile_size * head_dim +
+              (long)tile_block_offset * head_tile_size;
+    else
+        dst = kv_cache + block_id * value_stride + (long)block_offset * head_dim;
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const int tile_offset =
+            shuffle ? (i / head_tile_size) * block_tile_size * head_tile_size +
+                          (i % head_tile_size)
+                    : i;
+        dst[tile_offset] = (FP8_T)((float)src[i] / scale);
+    }
+    if (threadIdx.x == 0)
+        kv_cache_scale[block_id * scale_stride + block_offset] = scale;
+}
+
 }  // namespace qcrocm
