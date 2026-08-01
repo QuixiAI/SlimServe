@@ -1452,7 +1452,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   # hipify_sources_target hard-errors once the shared hipify target exists.
   #
   set(VLLM_QUIXICORE_HIP_EXT_SRC
-    "csrc/quixicore/tm_rocm/qc_rocm_serving.cu")
+    "csrc/quixicore/tm_rocm/qc_rocm_serving.cu"
+    "csrc/quixicore/tm_rocm/qc_rocm_sample.cu")
 
   define_extension_target(
     _quixicore_C
