@@ -163,12 +163,16 @@ def _get_backend_priorities(
             ]
         elif device_capability.major == 8:
             # Ampere, no-Triton deployment: FLASH_ATTN is the native CUDA
-            # (CUTLASS FA2) backend and the only one offered. TRITON_ATTN,
-            # FLEX_ATTENTION (inductor->Triton) and TURBOQUANT (Triton) are
-            # deliberately absent so nothing can fall back to generated
-            # kernels; an unsupportable config fails loudly instead.
+            # (CUTLASS FA2) backend and stays first for regular KV dtypes.
+            # TURBOQUANT runs on the native QuixiCore kernels here (e4b15
+            # fp8 keys) and is only selected for turboquant_* kv dtypes,
+            # which FLASH_ATTN rejects. TRITON_ATTN and FLEX_ATTENTION
+            # (inductor->Triton) are deliberately absent so nothing can
+            # fall back to generated kernels; an unsupportable config
+            # fails loudly instead.
             return [
                 AttentionBackendEnum.FLASH_ATTN,
+                AttentionBackendEnum.TURBOQUANT,
             ]
         else:
             return [
