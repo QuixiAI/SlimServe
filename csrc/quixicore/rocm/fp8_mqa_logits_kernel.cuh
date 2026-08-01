@@ -76,18 +76,21 @@ __global__ __launch_bounds__(64 * NWAVE) void fp8_mqa_logits(
     const int* __restrict__ cu_start, const int* __restrict__ cu_end,
     float* __restrict__ logits,  // [M, N] fp32, pre-filled -inf
     long stride_q_s, long stride_w_s, long stride_logits_s, int seq_len_kv) {
-    constexpr int WH = 2;                        // waves over heads
+    // A wave covers 32 heads: 16 lanes x the 2-head intra-lane pair. Anything
+    // wider than that splits across waves, and the rest of the waves go to kv.
+    constexpr int WH = NUM_HEADS / 32;           // waves over heads
     constexpr int WN = NWAVE / WH;               // waves over kv
-    constexpr int H_PER_WAVE = NUM_HEADS / WH;   // 32
-    constexpr int N_PER_WAVE = BLOCK_KV / WN;    // 32
-    constexpr int H_TILES = H_PER_WAVE / 16;     // 2
-    constexpr int N_TILES = N_PER_WAVE / 16;     // 2
+    constexpr int N_PER_WAVE = BLOCK_KV / WN;
+    constexpr int H_TILES = 2;                   // the intra-lane pair
+    constexpr int N_TILES = N_PER_WAVE / 16;
 
     const int row = blockIdx.x;
     const int lane = threadIdx.x & 63;
     const int wave = threadIdx.x >> 6;
     const int wh = wave % WH, wn = wave / WH;
     const int lo = lane & 15, hi = lane >> 4;
+    // Measured: heads map to lanes bit-reversed (see header).
+    const int hrev = bitrev4(lo);
 
     int start = cu_start[row];
     int end = cu_end[row];
@@ -124,7 +127,9 @@ __global__ __launch_bounds__(64 * NWAVE) void fp8_mqa_logits(
 #pragma unroll
                 for (int j = 0; j < H_TILES; ++j)
                     acc[i][j] = mfma_16x16x32_fp8(
-                        a, load_b_frag(q_row, HEAD_SIZE, j * 16 * WH + wh * 16, k),
+                        a,
+                        load_frag_at_row(q_row, HEAD_SIZE,
+                                         (NUM_HEADS / 2) * j + 16 * wh + hrev, k),
                         acc[i][j]);
             }
         }
@@ -143,14 +148,14 @@ __global__ __launch_bounds__(64 * NWAVE) void fp8_mqa_logits(
 #pragma unroll
                 for (int j = 0; j < H_TILES; ++j) {
                     const float t = fmaxf(acc[i][j][v] * ks, 0.0f);
-                    const float w = w_row[j * 16 * WH + wh * 16 + lo];
+                    const float w = w_row[(NUM_HEADS / 2) * j + 16 * wh + hrev];
                     sum = (j == 0) ? (w * t) : fmaf(w, t, sum);
                 }
 #elif QC_EPI == 1  // h-tile 1 plain, h-tile 0 fused
 #pragma unroll
                 for (int j = H_TILES - 1; j >= 0; --j) {
                     const float t = fmaxf(acc[i][j][v] * ks, 0.0f);
-                    const float w = w_row[j * 16 * WH + wh * 16 + lo];
+                    const float w = w_row[(NUM_HEADS / 2) * j + 16 * wh + hrev];
                     sum = (j == H_TILES - 1) ? (w * t) : fmaf(w, t, sum);
                 }
 #else              // no fusion: separate multiplies then an add

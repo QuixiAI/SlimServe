@@ -51,4 +51,19 @@ __device__ __forceinline__ long load_b_frag(const uint8_t* Bt, long ldb, int n0,
     return v;
 }
 
+// Same fragment shape, but the caller picks this lane's row. Needed when the
+// logical index a lane owns is a permutation of l%16 rather than l%16 itself.
+__device__ __forceinline__ long load_frag_at_row(const uint8_t* P, long ld,
+                                                 int row, int k0) {
+    const int l = threadIdx.x & 63;
+    long v;
+    __builtin_memcpy(&v, P + (long)row * ld + k0 + (l >> 4) * 8, 8);
+    return v;
+}
+
+// 4-bit reversal of a lane's low index.
+__device__ __forceinline__ int bitrev4(int x) {
+    return ((x & 1) << 3) | ((x & 2) << 1) | ((x & 4) >> 1) | ((x & 8) >> 3);
+}
+
 }  // namespace qcrocm

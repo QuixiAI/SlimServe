@@ -39,6 +39,14 @@ def _use_native_cp_gather() -> bool:
     )
 
 
+@functools.cache
+def _use_native_mqa_logits() -> bool:
+    """Prefer the native HIP MQA logits kernel over the Triton one."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has("mqa_logits_gfx942")
+
+
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
 else:
@@ -634,6 +642,31 @@ def rocm_fp8_mqa_logits(
     # Remove this branch once vLLM bumps AITER to a version that includes
     # ROCm/aiter#3257.
     if _ON_GFX942 and rocm_aiter_ops.is_enabled():
+        # Native HIP first: bitwise-equal to the Triton kernel below (same
+        # v_mfma_f32_16x16x32_fp8_fp8, same reduction tree), verified across
+        # full/causal/ragged/windowed shapes at both head counts. Covers the
+        # D=128 sparse-indexer shapes -- H=32, which is what GLM-5.2 actually
+        # uses, and H=64. Anything else falls through to Triton.
+        if _use_native_mqa_logits() and q.shape[1] in (32, 64) and q.shape[2] == 128:
+            from vllm.quixicore import quixicore_ops
+
+            logits = torch.full(
+                (q.shape[0], k_fp8.shape[0]),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q.device,
+            )
+            quixicore_ops.mqa_logits_gfx942(
+                q,
+                k_fp8,
+                scale.reshape(-1),
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                logits,
+            )
+            return logits
+
         from vllm.v1.attention.ops.triton_fp8_mqa_logits import (
             fp8_mqa_logits_gfx942,
         )
