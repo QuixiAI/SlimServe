@@ -35,6 +35,8 @@
   #include <cuda_fp16.h>
   #include <cuda_runtime.h>
 
+  #include <cstdlib>
+
   #include "mma_int8.cuh"
 
 namespace vllm_mmq_v2 {
@@ -387,11 +389,24 @@ __launch_bounds__(MMQ_NTHREADS, 1) static __global__
 
 // -------------------------------------------------------------------- launch
 // Without stream-k the plain tiled grid can leave most of the chip idle at low
-// batch (nty*ntx tiles only), so split K across blockIdx.z to fill it.
+// batch (nty*ntx tiles only), so split K across blockIdx.z to fill it. The
+// split is the largest one that still fits a single wave (floor, not ceil):
+// rounding up puts tiles*nsplit past nsm and the tail wave costs more than the
+// idle SMs it fills -- measured 20-43% slower at K=6144 with 32-96 row tiles.
+// VLLM_GGUF_MMQ_V2_CEIL_SPLIT=1 restores the old round-up.
+static inline bool mmq_v2_ceil_split() {
+  static const bool ceil_split = [] {
+    const char* s = std::getenv("VLLM_GGUF_MMQ_V2_CEIL_SPLIT");
+    return s != nullptr && s[0] == '1';
+  }();
+  return ceil_split;
+}
+
 static inline int mmq_v2_nsplit(int nty, int ntx, int ncols_x, int nsm) {
   const int niter = ncols_x / MMQ_ITER_K;
   const int tiles = nty * ntx;
-  int nsplit = (nsm + tiles - 1) / tiles;
+  int nsplit =
+      mmq_v2_ceil_split() ? (nsm + tiles - 1) / tiles : nsm / tiles;
   nsplit = min(nsplit, niter);
   return max(nsplit, 1);
 }
