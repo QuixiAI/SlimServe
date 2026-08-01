@@ -34,7 +34,13 @@ static void py_v2_apply_temperature(torch::Tensor logits,
     const int num_tokens = logits.size(0), V = logits.size(1);
     if (num_tokens == 0) return;
     dim3 grid(num_tokens, (V + 8191) / 8192);
-    tmv2s::v2_temperature_k<<<grid, 256, 0, m6st()>>>(
+    // 1024 rather than the CUDA unit's 256: this is a bandwidth-bound
+    // elementwise divide over the whole vocab, and on MI300X the wider block
+    // measured 2.0x at 1 token, 1.8x at 4 and 1.3x at 32, with no shape
+    // regressing (perf/optimization_status.md in QuixiCore-ROCm, 2026-08-01).
+    // The kernel keeps no cross-lane or shared state, so the block size cannot
+    // change its output.
+    tmv2s::v2_temperature_k<<<grid, 1024, 0, m6st()>>>(
         logits.data_ptr<float>(), logits.stride(0),
         expanded_idx_mapping.data_ptr<int>(), temperature.data_ptr<float>(), V);
 }
