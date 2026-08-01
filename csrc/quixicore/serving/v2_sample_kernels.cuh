@@ -19,7 +19,15 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cstdint>
-#include <math_constants.h>
+// hipify maps the fp16/bf16 headers but has no entry for math_constants.h, so
+// the infinity constant is selected here rather than left to the rewriter.
+#if defined(__HIP_PLATFORM_AMD__)
+  #include <hip/hip_math_constants.h>
+  #define V2S_INF_F HIP_INF_F
+#else
+  #include <math_constants.h>
+  #define V2S_INF_F CUDART_INF_F
+#endif
 
 namespace tmv2s {
 
@@ -43,7 +51,7 @@ namespace tmv2s {
   #define V2S_SYNCWARP() __syncwarp()
 #endif
 
-#define V2S_NEG_INF (-CUDART_INF_F)
+#define V2S_NEG_INF (-V2S_INF_F)
 // Smallest positive tl.rand output (matches _TL_RAND_MIN / triton's scale).
 #define V2S_TL_RAND_SCALE 4.6566127342e-10f
 #define V2S_TL_RAND64_SCALE 5.421010862427522170037e-20

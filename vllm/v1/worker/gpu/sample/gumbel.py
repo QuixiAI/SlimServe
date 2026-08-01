@@ -10,10 +10,10 @@ from vllm.utils.math_utils import cdiv
 
 @cache
 def _use_native_sample_kernels() -> bool:
-    """Prefer the native CUDA sampler kernels over the Triton ones."""
+    """Prefer the native sampler kernels over the Triton ones."""
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda():
+    if not current_platform.is_cuda_alike():
         return False
     from vllm.quixicore import quixicore_ops
 
@@ -68,9 +68,7 @@ def apply_temperature(
         # Native CUDA equivalent, bit-identical to the Triton kernel below.
         from vllm.quixicore import quixicore_ops
 
-        quixicore_ops.v2_apply_temperature(
-            logits, expanded_idx_mapping, temperature
-        )
+        quixicore_ops.v2_apply_temperature(logits, expanded_idx_mapping, temperature)
         return
 
     BLOCK_SIZE = 8192
