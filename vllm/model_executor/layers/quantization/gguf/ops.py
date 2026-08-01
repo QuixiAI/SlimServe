@@ -26,6 +26,16 @@ def ggml_dequantize(
     return torch.ops._C.ggml_dequantize(W, quant_type, m, n, dtype)
 
 
+def ggml_dequantize_into(
+    W: torch.Tensor,
+    quant_type: int,
+    m: int,
+    n: int,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._C.ggml_dequantize_into(W, quant_type, m, n, out)
+
+
 def ggml_mul_mat_vec_a8(
     W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:

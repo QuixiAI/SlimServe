@@ -576,6 +576,11 @@ torch::stable::Tensor ggml_dequantize(
     torch::stable::Tensor W, int64_t type, int64_t m, int64_t n,
     std::optional<torch::headeronly::ScalarType> const& dtype);
 
+#ifndef USE_ROCM
+void ggml_dequantize_into(torch::stable::Tensor W, int64_t type, int64_t m,
+                          int64_t n, torch::stable::Tensor Y);
+#endif
+
 torch::stable::Tensor ggml_mul_mat_vec_a8(torch::stable::Tensor W,
                                           torch::stable::Tensor X, int64_t type,
                                           int64_t row);
