@@ -30,7 +30,25 @@ static __device__ __forceinline__ void moe_q(
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
+#ifndef USE_ROCM
+  // CUDA callers no longer pre-fill dst; zero this tile before bailing out.
+  if (exp_idx > 255 || exp_idx < 0) {
+#pragma unroll
+    for (int j = 0; j < mmq_x; j += nwarps) {
+      const int col_dst = token_offs[j / nwarps];
+      if (col_dst >= ncols_dst) continue;
+#pragma unroll
+      for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+        const auto row_dst = row_dst_0 + threadIdx.x + i;
+        if (row_dst >= nrows_dst) continue;
+        dst[col_dst * nrows_dst + row_dst] = scalar_t(0);
+      }
+    }
+    return;
+  }
+#else
   if (exp_idx > 255 || exp_idx < 0) return;
+#endif
   if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);

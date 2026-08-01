@@ -43,6 +43,25 @@ def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     return default
 
 
+def _use_quixi_weighted_sum(
+    out: torch.Tensor, topk_weights: torch.Tensor, out_hidden: torch.Tensor
+) -> bool:
+    """One-launch weighted reduce instead of mul_ + moe_sum (CUDA only)."""
+    if current_platform.is_rocm():
+        return False
+    if not (
+        out.dtype == torch.bfloat16
+        and out_hidden.dtype == torch.bfloat16
+        and topk_weights.dtype == torch.float32
+        and out.is_contiguous()
+        and out_hidden.is_contiguous()
+    ):
+        return False
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available()
+
+
 def _fused_moe_gguf(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -149,10 +168,16 @@ def _fused_moe_gguf(
                 1,
                 w2_rows,
             )
-        out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
-            topk_weights.view(num_tokens, top_k, 1)
-        )
-        ops.moe_sum(out, out_hidden_states)
+        out = out.reshape(num_tokens, top_k, w2.shape[1])
+        if _use_quixi_weighted_sum(out, topk_weights, out_hidden_states):
+            from vllm.quixicore import quixicore_ops
+
+            quixicore_ops.moe_weighted_sum(
+                out, topk_weights.contiguous(), out_hidden_states
+            )
+        else:
+            out = out.mul_(topk_weights.view(num_tokens, top_k, 1))
+            ops.moe_sum(out, out_hidden_states)
     else:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 

@@ -820,6 +820,92 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm(torch::Tensor q, torch::Tensor
     return out;
 }
 
+// Split-q GLM sparse decode: q_nope head-major [H, B, 512] (the natural bmm
+// output, pre-transpose) + q_pe [B, H, 64], replacing the per-layer
+// torch.cat([ql_nope, q_pe]) with direct reads. Same values, same order.
+static torch::Tensor py_mla_decode_fp8_sparse_glm_splitq(torch::Tensor q_nope,
+        torch::Tensor q_pe, torch::Tensor data, torch::Tensor bt,
+        torch::Tensor indices, torch::Tensor topk_length, int64_t block_size,
+        double scale, double kv_scale, int64_t partition_size) {
+    CK(q_nope); CK(data); CK(bt); CK(indices); CK(topk_length);
+    const int H = q_nope.size(0), B = q_nope.size(1);
+    TORCH_CHECK(q_nope.size(2) == 512 && q_pe.size(2) == 64,
+                "splitq expects nope width 512 and pe width 64");
+    TORCH_CHECK(q_pe.size(0) == B && q_pe.size(1) == H,
+                "q_pe must be [B, H, 64] matching q_nope [H, B, 512]");
+    // q_pe may be a strided split view: unit inner stride and a batch stride
+    // that is H x the head stride let the kernel read it in place.
+    TORCH_CHECK(q_pe.is_cuda() && q_pe.stride(2) == 1 &&
+                q_pe.stride(0) == H * q_pe.stride(1),
+                "q_pe must have unit inner stride and batch stride == H * head stride");
+    const int pe_stride = int(q_pe.stride(1));
+    const int max_topk = indices.size(1);
+    auto out = torch::empty({B, H, 512}, q_nope.options());
+    if (partition_size <= 0) {
+        mla_decode_fp8_v<true, false, 576, 512, 576, 1><<<dim3(H, B), 32, 0, stream()>>>(
+            bp(q_nope), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+            indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, bpm(out),
+            nullptr, nullptr, nullptr, int(block_size), int(bt.size(1)), float(scale), H,
+            1, 0, float(kv_scale), bp(q_pe), pe_stride);
+        return out;
+    }
+    const int P = int((max_topk + partition_size - 1) / partition_size);
+    auto opts = q_nope.options().dtype(torch::kFloat);
+    auto tmp = torch::empty({B, H, P, 512}, opts);
+    auto ml = torch::empty({B, H, P}, opts);
+    auto es = torch::empty({B, H, P}, opts);
+    mla_decode_fp8_v<true, true, 576, 512, 576, 1><<<dim3(H, B, P), 32, 0, stream()>>>(
+        bp(q_nope), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
+        indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, nullptr,
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
+        float(kv_scale), bp(q_pe), pe_stride);
+    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
+    return out;
+}
+
+// out[t, h] = sum_k w[t, k] * x[t, k, h], float accumulate, one rounding to
+// bf16. Replaces the out.mul_(topk_weights) + moe_sum pair (one launch fewer
+// and one fewer bf16 rounding; tolerance vs the pair is <= K ulp).
+__global__ void moe_weighted_sum_k(const __nv_bfloat16* __restrict__ x,
+                                   const float* __restrict__ w,
+                                   __nv_bfloat16* __restrict__ out,
+                                   int K, int Hdim) {
+    const int t = blockIdx.x;
+    for (int h = blockIdx.y * blockDim.x + threadIdx.x; h < Hdim;
+         h += gridDim.y * blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k)
+            acc += w[t * K + k] * float(x[((long)t * K + k) * Hdim + h]);
+        out[(long)t * Hdim + h] = __nv_bfloat16(acc);
+    }
+}
+
+static void py_moe_weighted_sum(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
+    CK(x); CK(w); CK(out);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && out.scalar_type() == torch::kBFloat16
+                && w.scalar_type() == torch::kFloat, "moe_weighted_sum: bf16 x/out, f32 w");
+    const int T = x.size(0), K = x.size(1), Hdim = x.size(2);
+    TORCH_CHECK(w.size(0) == T && w.size(1) == K && out.size(0) == T && out.size(1) == Hdim,
+                "moe_weighted_sum shape mismatch");
+    if (T == 0) return;
+    const int hb = std::min(24, (Hdim + 255) / 256);
+    moe_weighted_sum_k<<<dim3(T, hb), 256, 0, stream()>>>(
+        bp(x), w.data_ptr<float>(), bpm(out), K, Hdim);
+}
+
+// Effective top-k length per row (last valid index + 1) in one launch.
+static torch::Tensor py_sparse_topk_tlen(torch::Tensor indices) {
+    CKD(indices, torch::kInt);
+    const int rows = indices.size(0), topk = indices.size(1);
+    auto tlen = torch::empty({rows}, indices.options());
+    if (rows > 0)
+        sparse_topk_tlen<<<rows, 256, 0, stream()>>>(
+            indices.data_ptr<int>(), tlen.data_ptr<int>(), topk);
+    return tlen;
+}
+
 static torch::Tensor py_mla_decode_fp8_sparse(torch::Tensor q, torch::Tensor data,
         torch::Tensor scl, torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, int64_t partition_size) {
@@ -987,6 +1073,13 @@ void init_serving(py::module_& m) {
           py::arg("data"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("kv_scale"), py::arg("partition_size") = 0);
+    m.def("sparse_topk_tlen", &py_sparse_topk_tlen, py::arg("indices"));
+    m.def("mla_decode_fp8_sparse_glm_splitq", &py_mla_decode_fp8_sparse_glm_splitq,
+          py::arg("q_nope"), py::arg("q_pe"), py::arg("data"), py::arg("block_table"),
+          py::arg("indices"), py::arg("topk_length"), py::arg("block_size"),
+          py::arg("scale"), py::arg("kv_scale"), py::arg("partition_size") = 0);
+    m.def("moe_weighted_sum", &py_moe_weighted_sum, py::arg("x"), py::arg("w"),
+          py::arg("out"));
     m.def("mla_decode_fp8_sparse", &py_mla_decode_fp8_sparse, py::arg("q"), py::arg("data"),
           py::arg("scale_cache"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),

@@ -115,6 +115,12 @@ class QuixiCoreMLASparseMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     attn_out_dtype: torch.dtype
 
+    # Per-token block-table gather, identical for every layer in a step.
+    # Computed lazily by the first forward_mqa call and reused by the rest;
+    # under CUDA graph capture the first layer's gather is captured once and
+    # replays against the persistent block_table/req_id buffers.
+    bt_per_token: torch.Tensor | None = None
+
     block_size: int = 64
     topk_tokens: int = 2048
 
@@ -247,7 +253,6 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
         self._k_scale_host: float | None = None
-        self._topk_pos_cache: torch.Tensor | None = None
         # The indexer carries the shared buffer for normal layers; the explicit
         # buffer covers backbone skip layers whose indexer is not constructed.
         self.topk_indices_buffer: torch.Tensor | None = (
@@ -274,38 +279,49 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         needs no global-index conversion pass. Entries of -1 are skipped by the
         kernel, so `topk_length` can stay at the padded width.
         """
+        num_tokens = attn_metadata.num_actual_tokens
+        splitq = None
         if isinstance(q, tuple):
             ql_nope, q_pe = q
-            q = torch.cat([ql_nope, q_pe], dim=-1)
+            # ql_nope arrives as the transpose view of a head-major bmm
+            # output; when that and q_pe are directly readable and the cache
+            # is fp8, skip the per-layer cat and read both buffers in-kernel.
+            nope_hm = ql_nope.transpose(0, 1)
+            if (
+                ql_nope.shape[0] == num_tokens
+                and nope_hm.is_contiguous()
+                and ql_nope.shape[-1] == 512
+                and q_pe.shape[-1] == 64
+                and q_pe.stride(-1) == 1
+                and q_pe.stride(0) == q_pe.shape[1] * q_pe.stride(1)
+                and kv_c_and_k_pe_cache.dtype != torch.bfloat16
+            ):
+                splitq = (nope_hm, q_pe)
+            else:
+                q = torch.cat([ql_nope, q_pe], dim=-1)
 
-        num_tokens = attn_metadata.num_actual_tokens
-        q = q[:num_tokens].contiguous()
+        if splitq is None:
+            q = q[:num_tokens].contiguous()
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_tokens]
-        topk = topk_indices.shape[-1]
         idx = topk_indices.to(torch.int32).contiguous()
 
         # One kernel "batch" entry per query token; each needs its request's
-        # block table row.
-        bt = attn_metadata.block_table.index_select(
-            0, attn_metadata.req_id_per_token[:num_tokens].to(torch.int32)
-        ).to(torch.int32).contiguous()
+        # block table row. The gather is step-level metadata, so the first
+        # layer computes it and the rest reuse it.
+        bt = attn_metadata.bt_per_token
+        if bt is None:
+            bt = attn_metadata.block_table.index_select(
+                0, attn_metadata.req_id_per_token[:num_tokens].to(torch.int32)
+            ).to(torch.int32).contiguous()
+            attn_metadata.bt_per_token = bt
 
         # Effective length per token, not the constant 2048: at short context
         # the indexer pads most of the index list with -1, and a constant tlen
         # makes the kernel walk every padded slot. Profiled at 48% of ALL
         # decode GPU time before this. last-valid-position+1 is exact even if
         # -1s were interleaved rather than trailing.
-        if (
-            self._topk_pos_cache is None
-            or self._topk_pos_cache.shape[0] != topk
-        ):
-            self._topk_pos_cache = torch.arange(
-                1, topk + 1, dtype=torch.int32, device=q.device
-            )
-        tlen = (
-            ((idx >= 0) * self._topk_pos_cache).amax(dim=-1).to(torch.int32)
-        )
+        tlen = quixicore_ops.sparse_topk_tlen(idx)
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             return quixicore_ops.mla_decode_bf16_sparse_glm(
@@ -325,6 +341,21 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                     )
                 self._k_scale_host = float(ks)
         k_scale = self._k_scale_host
+
+        if splitq is not None:
+            out = quixicore_ops.mla_decode_fp8_sparse_glm_splitq(
+                splitq[0],
+                splitq[1],
+                kv_c_and_k_pe_cache.view(torch.uint8).reshape(-1),
+                bt,
+                idx,
+                tlen,
+                attn_metadata.block_size,
+                self.softmax_scale,
+                k_scale,
+                partition_size=256,
+            )
+            return out, None
 
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
             q,
