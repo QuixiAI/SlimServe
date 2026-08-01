@@ -18,6 +18,17 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.ops.common import pack_seq_triton, unpack_seq_triton
 from vllm.v1.worker.workspace import current_workspace_manager
 
+
+@functools.cache
+def _use_native_indexer_kquant() -> bool:
+    """Prefer the native HIP indexer K-quant kernel over the Triton one."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.is_available() and quixicore_ops.has(
+        "indexer_k_quant_and_cache"
+    )
+
+
 if current_platform.is_rocm():
     from vllm.platforms.rocm import _ON_GFX942, _ON_GFX950
 else:
@@ -112,6 +123,25 @@ def indexer_k_quant_and_cache_triton(
     kv_cache_scale = kv_cache[:, block_size * head_dim :].view(torch.float32)
     head_tile_size = head_tile_size // kv_cache.element_size()
     layout = "NORMAL" if block_size == 1 else "SHUFFLE"
+
+    # ue8m0 stays on Triton: its scale rounding (exp2(ceil(log2))) is not
+    # ported, and this model does not use it.
+    if _use_native_indexer_kquant() and scale_fmt != "ue8m0":
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.indexer_k_quant_and_cache(
+            k,
+            kv_cache_value,
+            kv_cache_scale,
+            slot_mapping,
+            block_size,
+            block_tile_size,
+            head_tile_size,
+            224.0 if fp8_dtype == torch.float8_e4m3fnuz else 448.0,
+            layout == "SHUFFLE",
+        )
+        return
+
     grid = (num_tokens,)
     _indexer_k_quant_and_cache_kernel[grid](
         k,

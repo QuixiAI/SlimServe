@@ -980,3 +980,28 @@ class quixicore_ops:
         `out` must be zero-initialized: rows with seq_len == 0 are skipped.
         """
         _qc().generate_sparse_seqlen(seq_lens, cu_query_lens, out, topk_token)
+
+    @staticmethod
+    def indexer_k_quant_and_cache(
+        k: torch.Tensor,
+        kv_cache: torch.Tensor,
+        kv_cache_scale: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_size: int,
+        block_tile_size: int,
+        head_tile_size: int,
+        fp8_max: float,
+        shuffle: bool,
+    ) -> None:
+        """Per-token fp8 quantize of the indexer K vector into the paged cache."""
+        _qc().indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            kv_cache_scale,
+            slot_mapping,
+            block_size,
+            block_tile_size,
+            head_tile_size,
+            fp8_max,
+            1 if shuffle else 0,
+        )
