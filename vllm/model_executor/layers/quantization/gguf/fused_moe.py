@@ -85,8 +85,14 @@ def _fused_moe_gguf(
         # the Q2_K vector kernel and using a 4x64 Q2_K MMQ tile. Keep
         # separate overrides because other GGUF model shapes can cross over at
         # different points.
+        # A100 w1 crossover at spec verify width (4 query tokens/request):
+        # vec still wins at 4 tokens (40.2 vs 41.3 ms/step; real routing is
+        # near-uncorrelated so MMQ streams as many experts as vec) but loses
+        # from 32 tokens up (720 vs 604 us kernel-level, -10% ms/step e2e at
+        # bs=8). 16 keeps bs<=4 verify on vec, flips bs>=5 verify to MMQ.
         w1_vec = vec_ok and (
-            not mmq_ok or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1")
+            not mmq_ok
+            or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1", 16)
         )
         # On A100 the w2 crossover sits below any batch this serves: forcing the
         # MMQ tile kernel measured neutral at 8 routed rows and +2.9% / +6.7% at
