@@ -11,6 +11,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
+#include <type_traits>
 
 namespace py = pybind11;
 
@@ -175,14 +176,22 @@ static void py_fp8_mqa_logits(torch::Tensor q, torch::Tensor kv,
                               torch::Tensor logits) {
     const int M = (int)q.size(0), H = (int)q.size(1), D = (int)q.size(2);
     const int N = (int)kv.size(0);
-    TORCH_CHECK(H == 64 && D == 128, "probe kernel is specialised to H=64 D=128");
-    qcrocm::fp8_mqa_logits<64, 128, 64, 4><<<M, 256, 0, spst()>>>(
-        reinterpret_cast<const uint8_t*>(q.data_ptr()),
-        reinterpret_cast<const uint8_t*>(kv.data_ptr()),
-        kv_scales.data_ptr<float>(), weights.data_ptr<float>(),
-        cu_start.data_ptr<int>(), cu_end.data_ptr<int>(),
-        logits.data_ptr<float>(), q.stride(0), weights.stride(0),
-        logits.stride(0), N);
+    TORCH_CHECK(D == 128, "fp8_mqa_logits: D must be 128");
+    TORCH_CHECK(H == 32 || H == 64, "fp8_mqa_logits: H must be 32 or 64");
+    auto launch = [&](auto tag) {
+        constexpr int HH = decltype(tag)::value;
+        qcrocm::fp8_mqa_logits<HH, 128, 64, 4><<<M, 256, 0, spst()>>>(
+            reinterpret_cast<const uint8_t*>(q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(kv.data_ptr()),
+            kv_scales.data_ptr<float>(), weights.data_ptr<float>(),
+            cu_start.data_ptr<int>(), cu_end.data_ptr<int>(),
+            logits.data_ptr<float>(), q.stride(0), weights.stride(0),
+            logits.stride(0), N);
+    };
+    if (H == 32)
+        launch(std::integral_constant<int, 32>{});
+    else
+        launch(std::integral_constant<int, 64>{});
 }
 
 void init_sparse(py::module_& m) {
@@ -202,7 +211,7 @@ void init_sparse(py::module_& m) {
           py::arg("token_to_seq"), py::arg("block_size"),
           py::arg("block_tile_size"), py::arg("head_tile_size"),
           py::arg("num_batches"), py::arg("num_blocks"), py::arg("shuffle"));
-    m.def("fp8_mqa_logits", &py_fp8_mqa_logits, py::arg("q"), py::arg("kv"),
+    m.def("mqa_logits_gfx942", &py_fp8_mqa_logits, py::arg("q"), py::arg("kv"),
           py::arg("kv_scales"), py::arg("weights"), py::arg("cu_start"),
           py::arg("cu_end"), py::arg("logits"));
     m.def("mfma_dot_probe", &py_mfma_dot_probe, py::arg("a"), py::arg("b"),

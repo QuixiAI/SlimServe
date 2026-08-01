@@ -1083,3 +1083,20 @@ class quixicore_ops:
             num_blocks,
             1 if shuffle else 0,
         )
+
+    @staticmethod
+    def mqa_logits_gfx942(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        kv_scales: torch.Tensor,
+        weights: torch.Tensor,
+        cu_start: torch.Tensor,
+        cu_end: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> None:
+        """DSA indexer MQA logits, bitwise-equal to the Triton kernel.
+
+        `logits` must arrive pre-filled with -inf: positions outside
+        [cu_start, cu_end) are left untouched, matching AITER's semantics.
+        """
+        _qc().mqa_logits_gfx942(q, kv, kv_scales, weights, cu_start, cu_end, logits)
