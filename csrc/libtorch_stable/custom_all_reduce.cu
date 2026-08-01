@@ -115,6 +115,76 @@ void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
   }
 }
 
+/**
+ * Fused one-shot allreduce + residual add + RMSNorm:
+ *   residual += allreduce(inp); out = rmsnorm(residual) * weight
+ *
+ * If _reg_buffer is null, assumes inp.data_ptr() is already IPC-registered.
+ * Otherwise, _reg_buffer is assumed to be IPC-registered and inp is first
+ * copied into _reg_buffer.
+ */
+void all_reduce_add_rms_norm(fptr_t _fa, torch::stable::Tensor& inp,
+                             torch::stable::Tensor& residual,
+                             torch::stable::Tensor& weight,
+                             torch::stable::Tensor& out, double epsilon,
+                             fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      inp.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(inp.get_device_index());
+
+  STD_TORCH_CHECK((inp.scalar_type()) == (out.scalar_type()));
+  STD_TORCH_CHECK((inp.scalar_type()) == (residual.scalar_type()));
+  STD_TORCH_CHECK((inp.scalar_type()) == (weight.scalar_type()));
+  STD_TORCH_CHECK((inp.numel()) == (out.numel()));
+  STD_TORCH_CHECK((inp.numel()) == (residual.numel()));
+  STD_TORCH_CHECK(_is_weak_contiguous(inp));
+  STD_TORCH_CHECK(out.is_contiguous());
+  STD_TORCH_CHECK(residual.is_contiguous());
+  STD_TORCH_CHECK(weight.is_contiguous());
+
+  int64_t hidden_size = inp.size(inp.dim() - 1);
+  STD_TORCH_CHECK((weight.numel()) == (hidden_size));
+  int64_t num_tokens = inp.numel() / hidden_size;
+
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    STD_TORCH_CHECK((input_size) <= (reg_buffer_sz_bytes));
+    STD_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.const_data_ptr(), input_size,
+                                   cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.mutable_data_ptr();
+  }
+  switch (out.scalar_type()) {
+    case torch::headeronly::ScalarType::Half: {
+      fa->allreduce_norm<half>(
+          stream, reinterpret_cast<half*>(reg_buffer),
+          reinterpret_cast<half*>(residual.mutable_data_ptr()),
+          reinterpret_cast<const half*>(weight.const_data_ptr()),
+          reinterpret_cast<half*>(out.mutable_data_ptr()),
+          static_cast<int>(num_tokens), static_cast<int>(hidden_size),
+          static_cast<float>(epsilon));
+      break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case torch::headeronly::ScalarType::BFloat16: {
+      fa->allreduce_norm<nv_bfloat16>(
+          stream, reinterpret_cast<nv_bfloat16*>(reg_buffer),
+          reinterpret_cast<nv_bfloat16*>(residual.mutable_data_ptr()),
+          reinterpret_cast<const nv_bfloat16*>(weight.const_data_ptr()),
+          reinterpret_cast<nv_bfloat16*>(out.mutable_data_ptr()),
+          static_cast<int>(num_tokens), static_cast<int>(hidden_size),
+          static_cast<float>(epsilon));
+      break;
+    }
+#endif
+    default:
+      throw std::runtime_error(
+          "fused allreduce rms norm only supports float16 and bfloat16");
+  }
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

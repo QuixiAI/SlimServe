@@ -261,6 +261,75 @@ class CustomAllreduce:
             )
         return out
 
+    def should_fuse_ar_norm(self, inp: torch.Tensor):
+        """Whether the fused allreduce + residual add + RMSNorm kernel
+        applies. It is one-shot only, so restrict to message sizes where
+        the one-shot algorithm would have been picked anyway."""
+        if not self.should_custom_ar(inp):
+            return False
+        if inp.dtype not in (torch.float16, torch.bfloat16):
+            return False
+        inp_size = inp.numel() * inp.element_size()
+        if self.world_size == 2:
+            return True
+        # one-shot/two-shot crossover in custom_all_reduce.cuh
+        limit = 512 * 1024 if self.world_size <= 4 else 256 * 1024
+        return inp_size < limit
+
+    def all_reduce_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+        *,
+        registered: bool = False,
+    ):
+        """Out-of-place fused op: residual += allreduce(inp);
+        returns rmsnorm(residual) * weight."""
+        out = torch.empty_like(inp)
+        if registered:
+            ops.all_reduce_add_rms_norm(
+                self._ptr, inp, residual, weight, out, epsilon, 0, 0
+            )
+        else:
+            ops.all_reduce_add_rms_norm(
+                self._ptr,
+                inp,
+                residual,
+                weight,
+                out,
+                epsilon,
+                self.buffer_ptrs[self.rank],
+                self.max_size,
+            )
+        return out
+
+    def fused_all_reduce_add_rms_norm(
+        self,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> torch.Tensor | None:
+        """Cuda-graph-aware entry for the fused kernel. Returns None when
+        the fused path does not apply and the caller must fall back to
+        allreduce followed by fused_add_rms_norm."""
+        if self.disabled or not self.should_fuse_ar_norm(input):
+            return None
+        if self._IS_CAPTURING:
+            if torch.cuda.is_current_stream_capturing():
+                return self.all_reduce_add_rms_norm(
+                    input, residual, weight, epsilon, registered=True
+                )
+            else:
+                # Warmup only mimics the allocation pattern.
+                return torch.empty_like(input)
+        else:
+            return self.all_reduce_add_rms_norm(
+                input, residual, weight, epsilon, registered=False
+            )
+
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.

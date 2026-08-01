@@ -372,6 +372,11 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
 void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
                 torch::stable::Tensor& out, fptr_t reg_buffer,
                 int64_t reg_buffer_sz_bytes);
+void all_reduce_add_rms_norm(fptr_t _fa, torch::stable::Tensor& inp,
+                             torch::stable::Tensor& residual,
+                             torch::stable::Tensor& weight,
+                             torch::stable::Tensor& out, double epsilon,
+                             fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

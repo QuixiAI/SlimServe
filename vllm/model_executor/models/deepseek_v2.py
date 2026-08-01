@@ -42,7 +42,9 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
@@ -274,6 +276,28 @@ class DeepseekV2MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+def _fused_ar_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: RMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-reduce hidden_states, then residual add + RMSNorm.
+
+    Uses the fused one-shot custom-allreduce kernel for decode-sized
+    messages; otherwise falls back to allreduce + fused_add_rms_norm.
+    """
+    comm = get_tp_group().device_communicator
+    ca_comm = getattr(comm, "ca_comm", None) if comm is not None else None
+    if ca_comm is not None and not ca_comm.disabled:
+        out = ca_comm.fused_all_reduce_add_rms_norm(
+            hidden_states, residual, norm.weight, norm.variance_epsilon
+        )
+        if out is not None:
+            return out, residual
+    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+    return norm(hidden_states, residual)
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1195,6 +1219,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        fuse_ar_norm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1242,6 +1267,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             and parallel_config.pipeline_parallel_size == 1
             and is_moe_layer
         )
+        # Defer the attention/MLP output allreduce and fuse it with the
+        # following residual add + RMSNorm. The MLP-side allreduce is
+        # performed by the next layer's input_layernorm (or the model's
+        # final norm), so this is only enabled by DeepseekV2Model, which
+        # controls both consumers.
+        self.fuse_ar_norm = (
+            fuse_ar_norm
+            and envs.VLLM_FUSED_AR_NORM
+            and not self.use_sequence_parallel_moe
+            and get_tensor_model_parallel_world_size() > 1
+            and parallel_config.pipeline_parallel_size == 1
+            and parallel_config.data_parallel_size == 1
+            and not parallel_config.enable_expert_parallel
+        )
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
             config=config,
@@ -1257,7 +1296,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
-            reduce_results=not self.use_sequence_parallel_moe,
+            reduce_results=not (self.use_sequence_parallel_moe or self.fuse_ar_norm),
         )
 
         if is_moe_layer:
@@ -1265,16 +1304,22 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config=config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
+                reduce_results=not self.fuse_ar_norm,
                 prefix=f"{prefix}.mlp",
                 # aiter applies routed_scaling_factor internally
                 apply_routed_scale_to_output=not rocm_aiter_ops.is_fused_moe_enabled(),
             )
+            if self.fuse_ar_norm:
+                # The deferred allreduce request must have been honored,
+                # otherwise the downstream fused allreduce double-reduces.
+                assert self.mlp.experts.moe_config.skip_final_all_reduce
         else:
             self.mlp = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                reduce_results=not self.fuse_ar_norm,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1289,6 +1334,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
+        input_is_reduced: bool = False,
     ) -> torch.Tensor:
         full_num_tokens = positions.shape[0]
         input_is_sequence_parallel = (
@@ -1301,6 +1347,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif self.fuse_ar_norm and not input_is_reduced:
+            # hidden_states holds the previous layer's unreduced MLP output.
+            hidden_states, residual = _fused_ar_rms_norm(
+                hidden_states, residual, self.input_layernorm
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -1337,7 +1388,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 residual = sequence_parallel_chunk(residual)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if self.fuse_ar_norm:
+            hidden_states, residual = _fused_ar_rms_norm(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         if self.use_sequence_parallel_moe:
             hidden_states = self.mlp(
                 hidden_states,
@@ -1397,8 +1455,12 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                fuse_ar_norm=True,
             ),
             prefix=f"{prefix}.layers",
+        )
+        self.fuse_ar_norm = bool(
+            getattr(self.layers[self.end_layer - 1], "fuse_ar_norm", False)
         )
 
         if get_pp_group().is_last_rank:
@@ -1479,7 +1541,13 @@ class DeepseekV2Model(nn.Module):
                 )
                 # fused_add_rms_norm requires a contiguous residual
                 residual = residual.contiguous()
+            input_is_reduced = False
             if idx in self.aux_hidden_state_layers:
+                if self.fuse_ar_norm and residual is not None:
+                    # Aux hidden states must see the reduced MLP output, so
+                    # reduce here and skip the layer's fused input norm.
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    input_is_reduced = True
                 aux_hidden_state = hidden_states + residual
                 if aux_hidden_state.shape[0] != positions.shape[0]:
                     aux_hidden_state = tensor_model_parallel_all_gather(
@@ -1488,7 +1556,11 @@ class DeepseekV2Model(nn.Module):
                     aux_hidden_state = aux_hidden_state[: positions.shape[0]]
                 aux_hidden_states.append(aux_hidden_state)
             hidden_states, residual = layer(
-                positions, hidden_states, residual, llama_4_scaling
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+                input_is_reduced=input_is_reduced,
             )
 
         if not get_pp_group().is_last_rank:
@@ -1506,10 +1578,18 @@ class DeepseekV2Model(nn.Module):
             # fused_add_rms_norm requires a contiguous residual
             residual = residual.contiguous()
 
+        output_is_reduced = False
         if self.end_layer in self.aux_hidden_state_layers:
+            if self.fuse_ar_norm:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                output_is_reduced = True
             aux_hidden_states.append(hidden_states + residual)
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if self.fuse_ar_norm and not output_is_reduced:
+            # The last layer's MLP output allreduce was deferred.
+            hidden_states, _ = _fused_ar_rms_norm(hidden_states, residual, self.norm)
+        else:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
