@@ -77,7 +77,11 @@ static void py_indexer_k_quant_and_cache(torch::Tensor k, torch::Tensor kv_cache
     const int num_tokens = (int)slot_mapping.size(0);
     if (num_tokens == 0) return;
     const int head_dim = (int)k.size(-1);
-    const int threads = head_dim < 256 ? head_dim : 256;
+    // One wave per token. Measured on MI300X: 64 threads beat 128 at every
+    // token count and by 1.6x at 8192 (perf/optimization_status.md in
+    // QuixiCore-ROCm, 2026-08-01). amax is a max, so the reduction is
+    // order-independent and the block size cannot change the result.
+    const int threads = 64;
 
     using FP8 = c10::Float8_e4m3fnuz;
     auto* cache = reinterpret_cast<FP8*>(kv_cache.data_ptr());
