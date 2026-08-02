@@ -90,3 +90,39 @@ paths and the DSA indexer is already covered.
 The DSA indexer is `head_count` 64, `key_length` 128 — exactly the second
 specialization of `fp8_mqa_logits` in `csrc/quixicore/rocm/`, already verified
 bitwise at that shape. No indexer kernel work is needed.
+
+`vllm/models/deepseek_v4/` is present and its ROCm backend (`amd/rocm.py`) is a
+real implementation, not a stub: sparse-MLA attention, ragged top-k/SWA index
+metadata, CUDA-graph-safe buffers, aiter prefill/decode dispatch. It does still
+carry its own Triton kernels for index packing, which the Triton purge has not
+reached.
+
+## Writing the adapter is five changes, not one
+
+Verified against the tree, because two of these are pre-existing gaps rather
+than new work and neither is visible from the adapter file alone:
+
+1. **The adapter itself.** `glm_dsa.py` is the model to copy: static rename
+   tables (transformers has no entry for these architectures, so the default
+   adapter's introspect-the-HF-model trick cannot work), MLA `kv_b_proj`
+   reassembly, indexer halves emitted separately so vLLM's merged linear fuses
+   them, and `unquantized_modules` for whatever gets dequantized on the way in.
+   Its vision/mmproj half is not needed here.
+2. **`gguf_loader.py::_prepare_adapter` hardcodes `GlmDsaGGUFAdapter`.** There
+   is no adapter registry — `BaseGGUFWeightsAdapter.matches()` is declared and
+   never called anywhere in the tree. Writing an adapter that claims `deepseek4`
+   does nothing until that function actually dispatches on architecture.
+3. **`gguf_config_parser.py` has the same shape of problem**: it calls
+   `build_config_from_gguf`, which is hand-written to read `glm-dsa.*` keys and
+   return a `Glm5vConfig`, with no branch on `general.architecture`.
+4. **`DeepseekV4Config` is registered but does not exist.** `config.py` maps
+   `deepseek_v4` to it and `configs/__init__.py` points it at
+   `vllm.transformers_utils.configs.deepseek_v4` — a module with no file. Any
+   non-GGUF config path for this model raises ImportError today.
+5. **No registry entry.** `registry.py` maps no architecture string to
+   `vllm.models.deepseek_v4`, though `_resolve_module_name` names that package
+   as the example of the layout it supports.
+
+The model code reads `hf_config` by plain attribute access, so it needs no
+particular config class — an object carrying the fields in the table above is
+enough, which is how the GLM path already works.
