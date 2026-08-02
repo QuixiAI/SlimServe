@@ -1938,12 +1938,24 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
   const int8_t* q8 = bq8_1[ib32].qs;
   uint32_t aux32 = q2[2] | (q2[3] << 16);
   int sumi = 0;
+  // Byte-wise sign application feeding dp4a, the same shape the iq2_s and
+  // iq3_s paths in this file already use. The scalar form this replaces ran
+  // 32 multiplies and 32 adds per 32-value group -- one per element, with a
+  // branch on the sign mask -- where this is two dp4a per group. IQ2_XXS is
+  // the only expert quant DeepSeek-V4 ships with no MMQ tile kernel, so its
+  // vector path is what every batch size lands on and it was measurably the
+  // slowest of the four despite being the smallest.
   for (int l = 0; l < 4; ++l) {
-    const uint8_t* grid = (const uint8_t*)(iq2xxs_grid + aux8[l]);
+    const uint32_t* grid = (const uint32_t*)(iq2xxs_grid + aux8[l]);
     const uint8_t signs = ksigns_iq2xs[aux32 & 127];
-    for (int j = 0; j < 8; ++j) {
-      sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
-    }
+    const uint32_t signs0 =
+        __vcmpeq4(((signs & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+    const uint32_t signs1 =
+        __vcmpeq4(((signs >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+    const int grid_l = __vsub4(grid[0] ^ signs0, signs0);
+    const int grid_h = __vsub4(grid[1] ^ signs1, signs1);
+    sumi = __dp4a(grid_l, *((const int*)q8 + 0), sumi);
+    sumi = __dp4a(grid_h, *((const int*)q8 + 1), sumi);
     q8 += 8;
     aux32 >>= 7;
   }
