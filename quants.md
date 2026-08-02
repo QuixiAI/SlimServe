@@ -283,3 +283,52 @@ models split into 5, 6 and 10 parts. Both sets are present, so roughly 845 GiB
 is duplicated. That is affordable today — 74 TiB free — but it is worth knowing
 that deleting this directory would not affect serving, and that these unsharded
 files are the more convenient ones to inspect.
+
+### The vision half: mmproj-GLM-5.2-Vision-f16.gguf
+
+The three builds above are text only. Vision lives in a separate 0.88 GiB
+file under `~/models/GLM-5.2-Vision-GGUF/`, and it is not quantized at all —
+335 tensors, F16 weights with F32 norms and biases:
+
+```text
+   general.architecture      clip             general.type = mmproj
+   clip.projector_type       kimik25
+   clip.vision.block_count   27
+   clip.vision.embedding_length 1152
+   attention.head_count      16
+   feed_forward_length       4304
+   patch_size                14
+   image_size                896
+   projection_dim            6144
+   projector.scale_factor    2
+   image_min_pixels          1568
+   image_max_pixels          3211264
+   pos_emb                   64 x 64, time 4
+```
+
+324 tensors are the 27-block tower (`attn_qkv`, `attn_out`, `ffn_up`,
+`ffn_down`, `ln1`, `ln2` — 12 per block), and 11 are outside it: the patch
+embedding `[14, 14, 3, 1152]`, a `[1152, 64, 64]` position embedding, a post
+layernorm, and the projector proper — `mm.input_norm`, `mm.1` `[4608, 4608]`,
+`mm.2` `[4608, 6144]`. The `mm.2` output width is the text model's
+`feed_forward_length`, which is what makes it a projector into GLM-5.2.
+
+Two entries here are load-bearing rather than descriptive.
+
+`projector_type = kimik25` is why the GLM adapter cannot treat `attn_qkv` as a
+plain rename. llama.cpp's converter permutes Q and K into "split" 2D-RoPE
+layout, while vLLM's MoonViT keeps the native interleaved form, so the adapter
+undoes that permutation on load. It is the only tensor in the vision half that
+is not a straight copy.
+
+`image_max_pixels / patch_size²` is `3211264 / 196 = 16384`, which is the
+`in_patch_limit` the image processor is built with. That is derived rather than
+stored, so the value in `build_media_proc_cfg_from_gguf` is not a magic number.
+
+Because none of it is quantized, the vision half costs the same 0.88 GiB
+whichever text build it is paired with — it is 0.4% of the IQ2_XXS
+configuration and 0.2% of Q4_K. There is no quality decision to make here, and
+no smaller variant exists. `run-glm-optimized.sh` finds it automatically:
+`find_mmproj` looks beside the text GGUF and one directory up, with
+`VLLM_GGUF_MMPROJ` as an override, so the sharded text builds in
+`antirez-routed/` pick up this file from the parent.
