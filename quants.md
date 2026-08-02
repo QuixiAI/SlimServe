@@ -196,6 +196,66 @@ realistically 8 with a usable KV pool — this is the first model discussed here
 that does not fit the 2–4 GPU envelope. At 896 experts with top-16 routing,
 expert-parallel placement is worth considering before tensor-parallel.
 
+### The vision half: three mmproj builds
+
+The text file above says `kimi-k3.vision = false`, but three vision
+projectors ship beside it. They are the same 168 tensors and the same
+`clip` metadata, differing only in weight precision:
+
+```text
+   File             Size       Weights
+  ━━━━━━━━━━━━━━━  ━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   mmproj-BF16      0.84 GiB   BF16 x110, F32 x58
+   mmproj-F16       0.84 GiB   F16 x111, F32 x57
+   mmproj-F32       1.67 GiB   F32 x168
+```
+
+BF16 and F16 differ by exactly one tensor, and it is the interesting one:
+`v.patch_embd.weight` `[14, 14, 3, 1024]` is kept **F32** in the BF16 build
+and F16 in the F16 build. BF16 has 8 mantissa bits against F16's 10, and the
+patch embedding is the first projection off raw pixels, so the packer declined
+to round it. The cost is about 0.6 MB, which is why both files still measure
+0.84 GiB.
+
+Choosing between them is a numerics question, not a size one: F16 carries more
+mantissa, BF16 more exponent, and at 0.84 GiB against a 799.8 GiB text model
+neither is a memory decision. F32 doubles the projector to no obvious end
+unless something downstream refuses to convert.
+
+```text
+   clip.projector_type       kimik3           note: NOT kimik25
+   clip.vision.block_count   27
+   clip.vision.embedding_length 1024
+   attention.head_count      12
+   attention.head_dim        128
+   feed_forward_length       4096
+   patch_size                14
+   projection_dim            7168
+   image_max_pixels          12845056
+   projector.scale_factor    2
+```
+
+Two structural differences from the GLM-5.2 projector are worth noting, since
+that is the only vision path this repo currently serves.
+
+**No biases anywhere.** 168 tensors is 27 blocks x 6 plus 6 globals. GLM's is
+335 — 27 x 12 plus 11 — because every attention, FFN and norm there carries a
+bias. Kimi K3's tower has none, and its projector is `mm.1` `[4096, 4096]`,
+`mm.2` `[4096, 7168]` and a `mm.post_norm`, where GLM has an `mm.input_norm`
+and biases on both projector layers. The norm moved from the input side to the
+output side.
+
+**`projector_type = kimik3`, not `kimik25`.** The GLM adapter special-cases
+`attn_qkv` because the `kimik25` converter permutes Q and K into split 2D-RoPE
+layout. Whether `kimik3` does the same is not answerable from metadata — it
+needs llama.cpp's `kimik3` converter read the way `kimik25.cpp` was. Assuming
+they match would be exactly the kind of guess that produces plausible-looking
+vision output that is subtly wrong.
+
+`projection_dim` 7168 matches the text model's `embedding_length`, and
+`image_max_pixels / patch_size²` is `12845056 / 196 = 65536` — four times
+GLM's 16384 patch limit.
+
 ---
 
 ## GLM-5.2 UD routed — antirez / Unsloth
