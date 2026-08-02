@@ -4,7 +4,6 @@ By Eric Hartford, QuixiAI
 
 <img width="480" height="480" alt="image" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
 
-
 ### With SlimServe you can run GLM-5.2-Vision at
 
 Aggregate throughput, by concurrent requests:
@@ -197,6 +196,44 @@ Rules of thumb:
 - **Q6_K is a measuring stick, not a serving target** on this hardware.
 - Speculative decoding costs quality **nothing** — the verifier accepts or
   rejects every draft token — so leave it on regardless of quant.
+
+---
+
+## Also supported: DeepSeek-V4-Flash (text only)
+
+The second architecture this fork serves. Text only — the model has no vision
+tower, so none of the mmproj path applies.
+
+| | |
+| --- | --- |
+| Weights | 145 GiB, MXFP4 experts — [antirez/deepseek-v4-gguf][ds4w] |
+| Drafter | DSpark, MXFP4-Q8_0 — [alessandrobologna][ds4d] |
+| Min GPUs | 4 × MI300X |
+| Context | 1048576 (yarn, 65536 base) |
+
+[ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
+[ds4d]: <https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF> <!-- markdownlint-disable-line MD013 -->
+
+```bash
+GGUF=$MODELS/DeepSeek-V4-Flash-GGUF
+VLLM_ROCM_USE_AITER=1 python -m vllm.entrypoints.openai.api_server \
+  --model $GGUF/DeepSeek-V4-Flash-...-mxfp4-0731.gguf \
+  --trust-remote-code --served-model-name DeepSeek-V4-Flash \
+  --tensor-parallel-size 4 --block-size 256 \
+  --attention-config '{"sparse_mla_force_mqa": true}' \
+  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+```
+
+Two flags are not optional. `--block-size 256` is what the DeepSeek-V4 sparse
+MLA backend supports; the GLM value of 64 fails at KV-cache setup with "no
+common block size". `sparse_mla_force_mqa` is required for the same reason it
+is on the GLM path — short prompts otherwise take a dense forward the ROCm
+sparse backend does not implement.
+
+Everything is read from the GGUF: no `--hf-config-path`, no `--tokenizer`. The
+routed experts are MXFP4, which this fork reads through its own HIP dequant,
+GEMV and MMQ tile kernels, and the DSA indexer (64 heads, 128 key length) runs
+on the bitwise-verified MFMA `fp8_mqa_logits`.
 
 ---
 
