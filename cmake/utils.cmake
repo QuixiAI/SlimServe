@@ -113,6 +113,32 @@ function (vllm_finalize_hipify_target)
   list(REMOVE_DUPLICATES ALL_BYPRODUCTS)
 
   set(CSRC_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR}/csrc)
+
+  # Hipify once at CONFIGURE time, as well as at build time below.
+  #
+  # hipify rewrites headers in the build tree, and those headers are what ninja
+  # records as the discovered dependencies of every HIP object. Ninja decides
+  # what is dirty before it runs any edge, so when hipify only runs as a build
+  # step the updated header arrives after that decision: a header-only edit
+  # compiles nothing on build N and compiles on build N+1.
+  #
+  # The failure mode is not a missing rebuild, it is a *successful* build that
+  # installed a stale binary -- `setup.py build_ext` exits 0 with "Installing:"
+  # lines and the .so is the previous one. Benchmarks and correctness tests then
+  # measure code that is not in the tree. Running hipify here means the build
+  # tree is already settled when ninja plans, so one build is enough.
+  execute_process(
+    COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py
+            -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${ALL_SRCS}
+    RESULT_VARIABLE VLLM_HIPIFY_CONFIGURE_RESULT
+    OUTPUT_QUIET)
+  if (NOT VLLM_HIPIFY_CONFIGURE_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "configure-time hipify failed (${VLLM_HIPIFY_CONFIGURE_RESULT})")
+  endif()
+
+  # Kept so a direct `ninja` invocation, which does not re-run configure, still
+  # regenerates sources.
   add_custom_target(
     hipify_all
     COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/cmake/hipify.py -p ${CMAKE_SOURCE_DIR}/csrc -o ${CSRC_BUILD_DIR} ${ALL_SRCS}
