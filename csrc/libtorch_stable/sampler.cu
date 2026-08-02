@@ -410,6 +410,20 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     smemFinalDstIdx[0] = 0;
     smemFoundTopKValues[0] = 0;
   }
+  // The histogram passes below fill smemOutput only up to the number of
+  // candidates they actually select, which can fall short of topK when the
+  // logits tie or a pass terminates early. Every one of the topK slots is
+  // stored back to global memory unconditionally, so an unfilled slot ships
+  // whatever was in shared memory -- uninitialized ints, which read as large
+  // positive values and pass a `>= 0` validity check downstream. Seeding the
+  // sentinel here costs one strided store and cannot disturb a slot the
+  // selection does fill.
+  for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
+    smemOutput[i] = -1;
+    if constexpr (multipleBlocksPerRow) {
+      reinterpret_cast<float*>(smemOutput + topK)[i] = -FLT_MAX;
+    }
+  }
   __syncthreads();
   int thresholdBinIdx = -1;
   uint32_t logitPattern = 0;

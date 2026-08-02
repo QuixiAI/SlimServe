@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -167,6 +168,7 @@ def _compute_topk_lens_kernel(
     topk_indices_stride,
     topk,
     is_valid_token_ptr,
+    max_index,
     TRITON_BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -181,7 +183,10 @@ def _compute_topk_lens_kernel(
             mask=mask,
             other=-1,
         )
-        count += tl.sum((local_idx >= 0).to(tl.int32), axis=0)
+        # Bound as well as sign-check: see _pack_global_topk_ragged_kernel.
+        count += tl.sum(
+            ((local_idx >= 0) & (local_idx < max_index)).to(tl.int32), axis=0
+        )
 
     tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
 
@@ -197,6 +202,7 @@ def _pack_global_topk_ragged_kernel(
     block_table_stride,
     block_size,
     topk,
+    max_index,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -216,8 +222,17 @@ def _pack_global_topk_ragged_kernel(
         mask=mask,
         other=-1,
     )
-    valid = mask & (local_idx >= 0)
-    block_indices = local_idx // block_size
+    # `max_index` is the addressable extent of one block-table row. An index at
+    # or beyond it cannot name a slot this request owns, so dereferencing it
+    # reads past the block table -- which is exactly the illegal access this
+    # kernel used to take under load. The AITER decode top-k leaves a few of the
+    # `topk` output slots uninitialized when a request has fewer than `topk`
+    # candidates, and uninitialized memory reads as large positive ints, so the
+    # sign check alone does not reject them. The prefill path next door already
+    # bounds its indices the same way (`topk_indices < N` in
+    # _combine_topk_swa_indices_kernel); this is the decode half of that.
+    valid = mask & (local_idx >= 0) & (local_idx < max_index)
+    block_indices = tl.where(valid, local_idx // block_size, 0)
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
         mask=valid,
@@ -226,6 +241,53 @@ def _pack_global_topk_ragged_kernel(
     block_offsets = local_idx % block_size
     slot_ids = tl.where(valid, block_numbers * block_size + block_offsets, -1)
     tl.store(global_topk_ragged_ptr + out_start + offset, slot_ids, mask=mask)
+
+
+def _debug_check_topk_bounds(
+    topk_indices: torch.Tensor,
+    topk_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+) -> None:
+    """Reproduce the pack kernel's addressing on the host and report overruns.
+
+    The kernel's fault is asynchronous and names nothing; this turns it into a
+    Python error carrying the offending values. Debug only, behind
+    VLLM_DSV4_DEBUG_TOPK.
+
+    Reading the values back synchronizes, which a capturing stream forbids, so
+    this is a no-op during CUDA graph capture rather than a crash of its own.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return
+    num_tokens, topk = topk_indices.shape
+    n_rows, row_width = block_table.shape
+    max_index = row_width * block_size
+    offs = torch.arange(topk, device=topk_indices.device).unsqueeze(0)
+    in_window = offs < topk_lens[:num_tokens].unsqueeze(1).to(offs.dtype)
+    valid = in_window & (topk_indices >= 0) & (topk_indices < max_index)
+    req = token_to_req_indices[:num_tokens]
+    bad_req = (req < 0) | (req >= n_rows)
+    blk = torch.where(valid, topk_indices // block_size, torch.zeros_like(topk_indices))
+    bad_blk = valid & (blk >= row_width)
+    if bad_req.any() or bad_blk.any():
+        rows = bad_blk.any(dim=1).nonzero().flatten().tolist()
+        detail = []
+        for r in rows[:4]:
+            row = topk_indices[r]
+            detail.append(
+                f"row{r}: len={int(topk_lens[r])} req={int(req[r])} "
+                f"first8={row[:8].tolist()} "
+                f"n_neg1={int((row == -1).sum())} n_huge={int((row > 1 << 20).sum())}"
+            )
+        raise RuntimeError(
+            "dsv4 topk pack would read out of bounds: "
+            f"block_table={tuple(block_table.shape)} block_size={block_size} "
+            f"num_tokens={num_tokens} topk={topk} "
+            f"bad_req={int(bad_req.sum())} bad_blk={int(bad_blk.sum())} "
+            f"bad_rows={rows} | " + " | ".join(detail)
+        )
 
 
 def compute_global_topk_ragged_indices_and_indptr(
@@ -239,6 +301,10 @@ def compute_global_topk_ragged_indices_and_indptr(
     num_tokens = topk_indices.shape[0]
     topk = topk_indices.shape[1]
 
+    # Every position a block-table row can address. Both kernels reject indices
+    # at or beyond it rather than dereferencing them.
+    max_index = block_table.shape[1] * block_size
+
     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
     _compute_topk_lens_kernel[(num_tokens,)](
         topk_lens,
@@ -246,6 +312,7 @@ def compute_global_topk_ragged_indices_and_indptr(
         topk_indices.stride(0),
         topk,
         is_valid_token,
+        max_index,
         TRITON_BLOCK_SIZE=1024,
     )
 
@@ -255,6 +322,10 @@ def compute_global_topk_ragged_indices_and_indptr(
         dtype=torch.int32,
         device=topk_indices.device,
     )
+    if os.environ.get("VLLM_DSV4_DEBUG_TOPK"):
+        _debug_check_topk_bounds(
+            topk_indices, topk_lens, token_to_req_indices, block_table, block_size
+        )
     if global_topk_ragged.numel() > 0:
         block = 128
         _pack_global_topk_ragged_kernel[(num_tokens, triton.cdiv(topk, block))](
@@ -267,6 +338,7 @@ def compute_global_topk_ragged_indices_and_indptr(
             block_table.stride(0),
             block_size,
             topk,
+            max_index,
             BLOCK_SIZE=block,
         )
     return global_topk_ragged, topk_indptr, topk_lens
