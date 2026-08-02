@@ -1964,6 +1964,130 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
   return d * sumi;
 }
 
+// ------------------------------------------------------- IQ2_XXS tile path
+//
+// Two things had to change for an imatrix quant to work here at all.
+//
+// 1. Geometry. Feeding the framework IQ2_XXS's own QR/QI does not fit:
+//    QI2_XXS = QK_K/(4*QR2_XXS) = 8, so `blocks_per_warp = WARP/QI` asks for 4
+//    superblocks per warp iteration, and 4 x 16 ints of packed qs is 64 against
+//    the 32 a WARP-wide x tile holds. But QR2_XXS is the format's *decode*
+//    ratio -- 8 weights per grid byte -- not a tile shape. With q2_K's geometry
+//    (qk = QK_K, qr = 4, qi = 16) it closes exactly: 2 superblocks, 512
+//    weights, which is the 4 x 128 the y tile supplies over qr = 4 passes.
+//
+// 2. Where the decode happens. Storing packed qs and decoding inside vec_dot
+//    is what every other type here does, and for them decode is a shift and a
+//    mask. IQ2_XXS decode is four dependent random reads of a 2 KB codebook
+//    plus a sign-table read, and vec_dot runs once per (row, column) pair -- so
+//    packing multiplies the gather by mmq_x. Measured that way the tile path
+//    was 1.07x the vector path at 512 routed tokens, against 2.5-4x for the
+//    other quants: the tile amortized the weight *load* and then paid the
+//    gather 8 times over.
+//
+//    So this decodes in load_tiles instead, once per weight, into a q8_0-shaped
+//    tile of signed bytes plus one float scale per 32 weights. vec_dot becomes
+//    eight dp4a, the same as q8_0. That is what llama.cpp means by mapping
+//    IQ2_XXS to MMQ_DP4A_TXS_Q8_0.
+//
+//    The cost is tile width: 512 decoded weights per row is 128 ints against
+//    the 32 packed, so mmq_y comes down to 32 to keep LDS in budget. The
+//    framework never touches these tiles -- it only forwards the pointers -- so
+//    a type-specific width is free.
+#define VDR_IQ2_XXS_Q8_1_MMQ 2
+#define QI2_XXS_MMQ 16
+#define QR2_XXS_MMQ 4
+// Decoded ints per row per warp iteration: 2 superblocks * 256 weights / 4.
+#define IQ2_XXS_TILE_INTS 128
+// One scale per 32 decoded weights.
+#define IQ2_XXS_TILE_SCALES (IQ2_XXS_TILE_INTS / 8)
+
+template <int mmq_y>
+static __device__ __forceinline__ void allocate_tiles_iq2_xxs(int** x_ql,
+                                                              half2** x_dm,
+                                                              int** x_qh,
+                                                              int** x_sc) {
+  __shared__ int tile_x_qs[mmq_y * (IQ2_XXS_TILE_INTS + 1)];
+  __shared__ float tile_x_d[mmq_y * IQ2_XXS_TILE_SCALES];
+  *x_ql = tile_x_qs;
+  *x_dm = (half2*)tile_x_d;
+}
+
+template <int mmq_y, int nwarps, bool need_check>
+static __device__ __forceinline__ void load_tiles_iq2_xxs(
+    const void* __restrict__ vx, int* __restrict__ x_ql,
+    half2* __restrict__ x_dm, int* __restrict__ x_qh, int* __restrict__ x_sc,
+    const int& i_offset, const int& i_max, const int& k,
+    const int& blocks_per_row) {
+  const block_iq2_xxs* bx0 = (const block_iq2_xxs*)vx;
+  float* x_dmf = (float*)x_dm;
+
+  // Thread k owns 32-weight group k/2 and, within it, the pair of grid entries
+  // selected by k%2 -- four decoded ints each, so the 32 threads cover all 128.
+  const int g = k / 2;
+  const int hlf = k % 2;
+  const int sb = min(g / 8, blocks_per_row - 1);
+  const int ib32 = g % 8;
+
+#pragma unroll
+  for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+    int i = i0 + i_offset;
+    if (need_check) {
+      i = min(i, i_max);
+    }
+    const block_iq2_xxs* bxi = bx0 + i * blocks_per_row + sb;
+    // 66-byte block with qs at offset 2: nothing is 4 byte aligned.
+    uint32_t aux_g, aux_s;
+    memcpy(&aux_g, (const uint8_t*)bxi->qs + sizeof(int) * (2 * ib32 + 0), 4);
+    memcpy(&aux_s, (const uint8_t*)bxi->qs + sizeof(int) * (2 * ib32 + 1), 4);
+    const uint8_t* aux8 = (const uint8_t*)&aux_g;
+
+    int* dst = &x_ql[i * (IQ2_XXS_TILE_INTS + 1) + g * 8 + hlf * 4];
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+      const int e = 2 * hlf + l;
+      const uint32_t* grid = (const uint32_t*)(iq2xxs_grid + aux8[e]);
+      const uint8_t signs = ksigns_iq2xs[(aux_s >> (7 * e)) & 127];
+      const uint32_t signs0 =
+          __vcmpeq4(((signs & 0xf) * 0x01010101) & 0x08040201, 0x08040201);
+      const uint32_t signs1 =
+          __vcmpeq4(((signs >> 4) * 0x01010101) & 0x08040201, 0x08040201);
+      dst[2 * l + 0] = __vsub4(grid[0] ^ signs0, signs0);
+      dst[2 * l + 1] = __vsub4(grid[1] ^ signs1, signs1);
+    }
+
+    if (hlf == 0) {
+      x_dmf[i * IQ2_XXS_TILE_SCALES + g] =
+          __half2float(bxi->d) * (0.5f + (aux_s >> 28)) * 0.25f;
+    }
+  }
+}
+
+static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1_mul_mat(
+    const int* __restrict__ x_ql, const half2* __restrict__ x_dm,
+    const int* __restrict__ x_qh, const int* __restrict__ x_sc,
+    const int* __restrict__ y_qs, const half2* __restrict__ y_ds, const int& i,
+    const int& j, const int& k) {
+  (void)x_qh;
+  (void)x_sc;
+
+  const float* x_dmf = (const float*)x_dm;
+  const float* y_df = (const float*)y_ds;
+
+  // k steps by vdr = 2 and covers weights 16k .. 16k+31: decoded ints 4k..4k+7,
+  // scale k/2, and the single q8_1 block at the matching y offset.
+  const int* xq = &x_ql[i * (IQ2_XXS_TILE_INTS + 1) + 4 * k];
+  const int index_y = j * WARP_SIZE_GGUF + (QR2_XXS_MMQ * k) % WARP_SIZE_GGUF;
+
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < 8; ++l) {
+    sumi = __dp4a(xq[l], y_qs[index_y + l], sumi);
+  }
+
+  return x_dmf[i * IQ2_XXS_TILE_SCALES + k / 2] * sumi * y_df[index_y / QI8_1];
+}
+
 static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
     const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
     const int& iqs) {

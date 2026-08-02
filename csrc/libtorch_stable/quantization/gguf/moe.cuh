@@ -244,6 +244,75 @@ static void ggml_moe_q4_0_q8_1_cuda(
   }
 }
 
+// IQ2_XXS rides q2_K's tile geometry (QK_K, qr 4, qi 16) rather than its own
+// QR/QI, which describe a decode ratio and not a tile. See the note on
+// vec_dot_iq2_xxs_q8_1_mul_mat in vecdotq.cuh.
+#if defined(USE_ROCM)
+  // mmq_x must equal the width moe_align_block_size used, and w1/w2 of one
+  // model share that layout -- IQ2_XXS is paired with Q2_K in the shipped
+  // files, so it takes Q2_K's 4. nwarps follows: token_offs is
+  // mmq_x / nwarps entries and must not be empty.
+  #define MOE_X_IQ2_XXS 4
+  #define MOE_Y_IQ2_XXS 32
+  #define NWARPS_IQ2_XXS 4
+#else
+  #define MOE_X_IQ2_XXS 4
+  #define MOE_Y_IQ2_XXS 32
+  #define NWARPS_IQ2_XXS 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_IQ2_XXS, 2)
+#endif
+    moe_iq2_xxs(const void* __restrict__ vx, const void* __restrict__ vy,
+                scalar_t* __restrict__ dst, const int* sorted_token_ids,
+                const int* expert_ids, const int* num_tokens_post_padded,
+                const int exp_stride, const int ncols_x, const int nrows_x,
+                const int ncols_y, const int nrows_y, const int nrows_dst,
+                const int top_k) {
+  const int mmq_x = MOE_X_IQ2_XXS;
+  const int mmq_y = MOE_Y_IQ2_XXS;
+  const int nwarps = NWARPS_IQ2_XXS;
+
+  moe_q<scalar_t, QK_K, QR2_XXS_MMQ, QI2_XXS_MMQ, false, block_iq2_xxs, mmq_x,
+        mmq_y, nwarps, allocate_tiles_iq2_xxs<mmq_y>,
+        load_tiles_iq2_xxs<mmq_y, nwarps, need_check>, VDR_IQ2_XXS_Q8_1_MMQ,
+        vec_dot_iq2_xxs_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_iq2_xxs_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
+    const int* expert_ids, const int* num_tokens_post_padded,
+    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  int mmq_x = MOE_X_IQ2_XXS;
+  int mmq_y = MOE_Y_IQ2_XXS;
+  int nwarps = NWARPS_IQ2_XXS;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (tokens_post_padded) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    constexpr bool need_check = false;
+    moe_iq2_xxs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    constexpr bool need_check = true;
+    moe_iq2_xxs<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
 // Same geometry as q4_0: identical block size and quants per int, so the tile
 // shape that suits one suits the other.
 #if defined(USE_ROCM)
