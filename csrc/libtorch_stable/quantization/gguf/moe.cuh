@@ -248,13 +248,15 @@ static void ggml_moe_q4_0_q8_1_cuda(
 // QR/QI, which describe a decode ratio and not a tile. See the note on
 // vec_dot_iq2_xxs_q8_1_mul_mat in vecdotq.cuh.
 #if defined(USE_ROCM)
-  // mmq_x must equal the width moe_align_block_size used, and w1/w2 of one
-  // model share that layout -- IQ2_XXS is paired with Q2_K in the shipped
-  // files, so it takes Q2_K's 4. nwarps follows: token_offs is
-  // mmq_x / nwarps entries and must not be empty.
-  #define MOE_X_IQ2_XXS 4
+  // This type's own best width, independent of whatever it is paired with:
+  // the layout aligns to the LCM across w1/w2 and each kernel gets an
+  // expert_ids expanded to its own tile count. At 8 the tile amortizes the
+  // codebook decode over twice the columns -- 3.4x the vector path at 512
+  // routed tokens against 1.75x at 4. nwarps tracks mmq_x so token_offs
+  // (mmq_x / nwarps entries) is never empty.
+  #define MOE_X_IQ2_XXS 8
   #define MOE_Y_IQ2_XXS 32
-  #define NWARPS_IQ2_XXS 4
+  #define NWARPS_IQ2_XXS 8
 #else
   #define MOE_X_IQ2_XXS 4
   #define MOE_Y_IQ2_XXS 32
