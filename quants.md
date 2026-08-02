@@ -195,3 +195,91 @@ Three real blockers remain, in order of severity:
 realistically 8 with a usable KV pool — this is the first model discussed here
 that does not fit the 2–4 GPU envelope. At 896 experts with top-16 routing,
 expert-parallel placement is worth considering before tensor-parallel.
+
+---
+
+## GLM-5.2 UD routed — antirez / Unsloth
+
+`~/models/antirez-GLM-5.2-gguf`, three unsharded builds of the model this
+fork is tuned for. Architecture `glm-dsa`, 1809 tensors each, and the same
+structure throughout: the builds differ *only* in how the routed experts are
+stored.
+
+```text
+   Build                            Routed experts        Size    imatrix
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━  ━━━━━━━
+   UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K IQ2_XXS, blk 78 Q2_K  196.6 GiB   yes
+   UD-Q2_K_RoutedQ2K                Q2_K                  244.0 GiB   yes
+   UD-Q4_K_RoutedQ4K                Q4_K                  404.4 GiB   yes
+```
+
+### Shape and routing
+
+```text
+   general.architecture     glm-dsa          256x22B, Zai Org GLM 5.2
+   quantized_by             Unsloth
+   expert_count             256
+   expert_used_count        8
+   expert_shared_count      1
+   expert_feed_forward_length 2048
+   feed_forward_length      12288            dense layers
+   leading_dense_block_count 3               layers 0-2 are dense
+   expert_gating_func       2                sigmoid
+   expert_weights_scale     2.5
+   attention.head_count     64
+   attention.head_count_kv  1                MLA
+   rope.freq_base           8000000
+   vocab_size               154880
+   nextn_predict_layers     1
+```
+
+### Where the bits go
+
+Only the routed experts are below 8 bits. Everything else — attention, the
+shared expert, norms, embeddings, output — is Q8_0 or F32, identically in all
+three files:
+
+```text
+   Group                              IQ2 build   Q2_K build   Q4_K build
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━  ━━━━━━━━━━━  ━━━━━━━━━━━
+   ffn_{gate,up,down}_exps (76 lay)   IQ2_XXS x225  Q2_K x228   Q4_K x228
+                                      + Q2_K x3
+   everything else per layer          Q8_0 x870, F32 x708
+   globals                            Q8_0 x2, F32 x1
+```
+
+Routed experts live on layers 3–78, which is `leading_dense_block_count = 3`
+and 76 MoE layers, three tensors each: 228. Expert stacks are
+`[6144, 2048, 256]` for gate/up and `[2048, 6144, 256]` for down.
+
+`blk78Q2K` in the first filename is literal and small: layer 78 — the last MoE
+layer — keeps its three expert tensors in Q2_K while the other 75 layers go to
+IQ2_XXS. Three tensors out of 228. It is the same idea as DeepSeek-V4's
+`Layers37-42Q4K` hybrid but at a much smaller dose, spending a little to
+protect the final transformation stage.
+
+All three carry imatrix provenance in the metadata —
+`unsloth_calibration_GLM-5.2.txt`, 88 chunks, 1002 entries — and
+`imatrix_unsloth.gguf_file` (1.1 GiB) sits beside them, so these are
+reproducible rather than opaque.
+
+### Serving
+
+Nothing to do: this is the tuned path. `glm-dsa` is what `GlmDsaGGUFAdapter`
+and `build_config_from_gguf` were written for, the tokenizer is the ordinary
+`gpt2` BPE with the `glm4` pre-tokenizer that `build_bpe_tokenizer` handles,
+and `run-glm-optimized.sh` already selects between these three by `--quant`.
+
+Kernel coverage is complete for all three. IQ2_XXS gained an MMQ tile path
+recently, so the smallest build no longer falls back to the vector kernel at
+every batch size; Q2_K and Q4_K already had one. The mixed IQ2_XXS/Q2_K layer
+78 is also the heterogeneous tile-width case — IQ2_XXS uses width 8 and Q2_K
+width 4 — which works because row alignment is now the LCM of the two rather
+than whichever type came first.
+
+One practical note: the run script does not point here. It serves the sharded
+copies under `GLM-5.2-Vision-GGUF/antirez-routed/`, which are the same three
+models split into 5, 6 and 10 parts. Both sets are present, so roughly 845 GiB
+is duplicated. That is affordable today — 74 TiB free — but it is worth knowing
+that deleting this directory would not affect serving, and that these unsharded
+files are the more convenient ones to inspect.
