@@ -233,6 +233,15 @@ static void mul_mat_vec_q8_0_q8_1_cuda(const void* vx, const void* vy,
 }
 
 template <typename scalar_t>
+static void mul_mat_vec_mxfp4_q8_1_cuda(const void* vx, const void* vy,
+                                        scalar_t* dst, const int ncols,
+                                        const int nrows, const int nvecs,
+                                        cudaStream_t stream) {
+  VLLM_MMVQ_DISPATCH(QK_MXFP4, QI_MXFP4, block_mxfp4, VDR_MXFP4_Q8_1_MMVQ,
+                     vec_dot_mxfp4_q8_1);
+}
+
+template <typename scalar_t>
 static void mul_mat_vec_q2_K_q8_1_cuda(const void* vx, const void* vy,
                                        scalar_t* dst, const int ncols,
                                        const int nrows, const int nvecs,

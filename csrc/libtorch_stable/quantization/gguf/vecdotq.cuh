@@ -188,6 +188,69 @@ static __device__ __forceinline__ float vec_dot_q5_1_q8_1_impl(
 }
 
 #define VDR_Q8_0_Q8_1_MMVQ 2
+
+// ---------------------------------------------------------------- MXFP4
+// e2m1 is not uniform, so unlike q4_0 the nibbles cannot go straight into
+// __dp4a. They index a table of 2x the true values (all integers) and the
+// factor of 2 is folded into the scale, keeping the inner loop on v_dot4.
+#define VDR_MXFP4_Q8_1_MMVQ 2
+
+static __device__ __constant__ const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// e8m0: the byte IS the fp32 exponent field; 0 is the smallest normal, not zero.
+static __device__ __forceinline__ float mxfp4_e8m0_to_fp32(uint8_t x) {
+  const uint32_t bits = (x == 0) ? 0x00400000u : ((uint32_t)x << 23);
+  float r;
+  memcpy(&r, &bits, 4);
+  return r;
+}
+
+// 16-byte table lookup by byte permute: bit 3 of each nibble selects the upper
+// half of the table, so both halves are permuted and blended on it.
+static __device__ __forceinline__ void mxfp4_table16(int q4, int& x, int& y) {
+  const uint32_t* t = (const uint32_t*)kvalues_mxfp4;
+  const uint32_t lo = (uint32_t)q4, hi = ((uint32_t)q4 >> 4);
+#ifdef USE_ROCM
+  const uint32_t lo_l = __builtin_amdgcn_perm(t[1], t[0], lo & 0x07070707u);
+  const uint32_t lo_h = __builtin_amdgcn_perm(t[3], t[2], lo & 0x07070707u);
+  const uint32_t hi_l = __builtin_amdgcn_perm(t[1], t[0], hi & 0x07070707u);
+  const uint32_t hi_h = __builtin_amdgcn_perm(t[3], t[2], hi & 0x07070707u);
+  const uint32_t lo_s = ((lo >> 3) & 0x01010101u) * 0xFFu;
+  const uint32_t hi_s = ((hi >> 3) & 0x01010101u) * 0xFFu;
+  x = (int)((lo_l & ~lo_s) | (lo_h & lo_s));
+  y = (int)((hi_l & ~hi_s) | (hi_h & hi_s));
+#else
+  int8_t bx[4], by[4];
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    bx[i] = kvalues_mxfp4[(lo >> (8 * i)) & 0xF];
+    by[i] = kvalues_mxfp4[(hi >> (8 * i)) & 0xF];
+  }
+  memcpy(&x, bx, 4);
+  memcpy(&y, by, 4);
+#endif
+}
+
+static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
+    const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+    const int& iqs) {
+  const block_mxfp4* bq4 = (const block_mxfp4*)vbq;
+  const int* q8 = (const int*)bq8_1->qs + iqs;
+
+  int sumi = 0;
+#pragma unroll
+  for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+    int q4;
+    memcpy(&q4, bq4->qs + sizeof(int) * (iqs + l), sizeof(int));
+    int vx, vy;
+    mxfp4_table16(q4, vx, vy);
+    sumi = __dp4a(vx, q8[l + 0], sumi);
+    sumi = __dp4a(vy, q8[l + 4], sumi);
+  }
+  return mxfp4_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds) * sumi;
+}
+
 #define VDR_Q8_0_Q8_1_MMQ 8
 
 template <int vdr>

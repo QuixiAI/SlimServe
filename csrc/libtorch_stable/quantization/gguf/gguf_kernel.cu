@@ -167,6 +167,11 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
                 (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
                 (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
             break;
+          case 39:
+            mul_mat_vec_mxfp4_q8_1_cuda<scalar_t>(
+                (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+                (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            break;
           case 10:
             mul_mat_vec_q2_K_q8_1_cuda<scalar_t>(
                 (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
@@ -563,6 +568,12 @@ torch::stable::Tensor ggml_moe_a8_vec(
         break;
       case 8:
         moe_vec_q8_0_q8_1_cuda<scalar_t>(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
+            col, row, quant_X.stride(0), stream);
+        break;
+      case 39:
+        moe_vec_mxfp4_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
             col, row, quant_X.stride(0), stream);
