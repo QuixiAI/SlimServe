@@ -56,6 +56,19 @@ typedef struct {
     int8_t  qs[QK8_0];      // quants
 } block_q8_0;
 
+
+// ---- MXFP4 (GGML_TYPE_MXFP4 = 39): OCP MX, 32 values in 17 bytes. ----
+// One e8m0 exponent-only scale, then 16 bytes of e2m1 nibble pairs. The LOW
+// nibbles supply values [0,16) and the HIGH nibbles [16,32) -- not an even/odd
+// interleave. Ported from QuixiCore-ROCm kernels/quantization/mxfp4_gguf.
+#define QK_MXFP4 32
+#define QR_MXFP4 2
+#define QI_MXFP4 (QK_MXFP4 / (4 * QR_MXFP4))
+typedef struct {
+    uint8_t e;                    // E8M0 scale
+    uint8_t qs[QK_MXFP4 / 2];     // two e2m1 codes per byte
+} block_mxfp4;
+
 #define QK8_1 32
 #define QR8_1 1
 #define QI8_1 (QK8_1 / (4 * QR8_1))
