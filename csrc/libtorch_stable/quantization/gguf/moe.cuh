@@ -44,11 +44,11 @@ static __device__ __forceinline__ void moe_q(
 #ifndef USE_ROCM
   // CUDA callers no longer pre-fill dst; zero this tile before bailing out.
   if (exp_idx > 255 || exp_idx < 0) {
-#pragma unroll
+  #pragma unroll
     for (int j = 0; j < mmq_x; j += nwarps) {
       const int col_dst = token_offs[j / nwarps];
       if (col_dst >= ncols_dst) continue;
-#pragma unroll
+  #pragma unroll
       for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
         const auto row_dst = row_dst_0 + threadIdx.x + i;
         if (row_dst >= nrows_dst) continue;
@@ -239,6 +239,70 @@ static void ggml_moe_q4_0_q8_1_cuda(
   } else {
     constexpr bool need_check = true;
     moe_q4_0<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+
+// Same geometry as q4_0: identical block size and quants per int, so the tile
+// shape that suits one suits the other.
+#if defined(USE_ROCM)
+  #define MOE_X_MXFP4 8
+  #define MOE_Y_MXFP4 128
+  #define NWARPS_MXFP4 8
+#else
+  #define MOE_X_MXFP4 4
+  #define MOE_Y_MXFP4 32
+  #define NWARPS_MXFP4 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_MXFP4, 2)
+#endif
+    moe_mxfp4(const void* __restrict__ vx, const void* __restrict__ vy,
+              scalar_t* __restrict__ dst, const int* sorted_token_ids,
+              const int* expert_ids, const int* num_tokens_post_padded,
+              const int exp_stride, const int ncols_x, const int nrows_x,
+              const int ncols_y, const int nrows_y, const int nrows_dst,
+              const int top_k) {
+  const int mmq_x = MOE_X_MXFP4;
+  const int mmq_y = MOE_Y_MXFP4;
+  const int nwarps = NWARPS_MXFP4;
+
+  moe_q<scalar_t, QK_MXFP4, QR_MXFP4, QI_MXFP4, true, block_mxfp4, mmq_x, mmq_y,
+        nwarps, allocate_tiles_mxfp4<mmq_y>,
+        load_tiles_mxfp4<mmq_y, nwarps, need_check>, VDR_MXFP4_Q8_1_MMQ,
+        vec_dot_mxfp4_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_mxfp4_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
+    const int* expert_ids, const int* num_tokens_post_padded,
+    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  int mmq_x = MOE_X_MXFP4;
+  int mmq_y = MOE_Y_MXFP4;
+  int nwarps = NWARPS_MXFP4;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (tokens_post_padded) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    constexpr bool need_check = false;
+    moe_mxfp4<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    constexpr bool need_check = true;
+    moe_mxfp4<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
         w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
         exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
   }
@@ -571,19 +635,19 @@ static void ggml_moe_q2_K_q8_1_cuda(
   const dim3 block_nums(block_num_x, block_num_y, 1);
   const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
 
-#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MMQ_Y)                \
-  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MMQ_Y, MOE_NWARPS_Q2_K,         \
-           SKIP_PADDING><<<block_nums, block_dims, 0, stream>>>(             \
-      w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,     \
+#define VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MMQ_Y)            \
+  moe_q2_K<scalar_t, NEED_CHECK, MOE_X_Q2_K, MMQ_Y, MOE_NWARPS_Q2_K,     \
+           SKIP_PADDING><<<block_nums, block_dims, 0, stream>>>(         \
+      w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded, \
       exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k)
 
-#define VLLM_MOE_Q2_K_LAUNCH_Y(NEED_CHECK, SKIP_PADDING)                     \
-  do {                                                                       \
-    if (y64) {                                                               \
-      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, 2 * MOE_Y_Q2_K);        \
-    } else {                                                                 \
-      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MOE_Y_Q2_K);            \
-    }                                                                        \
+#define VLLM_MOE_Q2_K_LAUNCH_Y(NEED_CHECK, SKIP_PADDING)              \
+  do {                                                                \
+    if (y64) {                                                        \
+      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, 2 * MOE_Y_Q2_K); \
+    } else {                                                          \
+      VLLM_MOE_Q2_K_LAUNCH(NEED_CHECK, SKIP_PADDING, MOE_Y_Q2_K);     \
+    }                                                                 \
   } while (0)
 
   const bool need_check = nrows_x % mmq_y != 0;
