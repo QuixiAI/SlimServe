@@ -224,15 +224,25 @@ tensors and the same `clip` metadata, differing only in weight precision:
 
 BF16 and F16 differ by exactly one tensor, and it is the interesting one:
 `v.patch_embd.weight` `[14, 14, 3, 1024]` is kept **F32** in the BF16 build
-and F16 in the F16 build. BF16 has 8 mantissa bits against F16's 10, and the
-patch embedding is the first projection off raw pixels, so the packer declined
-to round it. The cost is about 0.6 MB, which is why both files still measure
-0.84 GiB.
+and F16 in the F16 build. BF16 carries 7 explicit mantissa bits against F16's
+10, and the patch embedding is the first projection off raw pixels, so the
+packer declined to round it. The cost is about 0.6 MB, which is why both files
+still measure 0.84 GiB.
 
-Choosing between them is a numerics question, not a size one: F16 carries more
-mantissa, BF16 more exponent, and at 0.84 GiB against a 799.8 GiB text model
-neither is a memory decision. F32 doubles the projector to no obvious end
-unless something downstream refuses to convert.
+**Use the BF16 build.** The source decides it: all 168 vision tensors in the
+HF checkout are BF16 and `config.json` declares `dtype: bfloat16` throughout,
+so the BF16 file is the released weights unchanged while F16 is a conversion
+away from them. F16's extra mantissa bits cannot recover information a BF16
+source never carried — they are zero-filled — and its narrower exponent adds a
+floor the source does not have. Measured across all 401,214,464 nonzero vision
+weights: the largest is 5.06, nowhere near F16's 65504 ceiling, but 789,267
+(0.197%) fall below F16's smallest normal into its subnormal band and 762
+flush to zero. Small damage in exchange for nothing.
+
+That makes SlimServe's alphabetical fallback correct by luck —
+`_find_mmproj` takes `sorted(glob("mmproj*.gguf"))[0]` and `mmproj-BF16.gguf`
+sorts first — so no `VLLM_GGUF_MMPROJ` override is needed here. F32 doubles
+the projector to no end: it is a lossless upcast of the same BF16 values.
 
 ```text
    clip.projector_type       kimik3           note: NOT kimik25
