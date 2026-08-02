@@ -204,12 +204,28 @@ Rules of thumb:
 The second architecture this fork serves. Text only — the model has no vision
 tower, so none of the mmproj path applies.
 
-| | |
-| --- | --- |
-| Weights | 145 GiB, MXFP4 experts — [antirez/deepseek-v4-gguf][ds4w] |
-| Drafter | DSpark, MXFP4-Q8_0 — [alessandrobologna][ds4d] |
-| Min GPUs | 4 × MI300X |
-| Context | 1048576 (yarn, 65536 base) |
+All four 0731 quants from [antirez/deepseek-v4-gguf][ds4w] load and serve.
+They differ only in how the routed experts are stored — every other tensor is
+the same F32/F16/Q8_0 in all of them — so the adapter is quant-agnostic and the
+choice is purely quality against footprint.
+
+| Expert quant | Size | Min GPUs | Notes |
+| --- | ---: | ---: | --- |
+| `MXFP4Experts` | 145 GiB | 4 | Tuned path; own MXFP4 HIP kernels. |
+| `Q4KExperts` | 153 GiB | 4 | Highest quality of the four; imatrix. |
+| `Layers37-42Q4KExperts` | 91 GiB | 2 | Mixed; see note below. |
+| `IQ2XXS-w2Q2K` | 81 GiB | 2 | Smallest; IQ2_XXS experts, Q2_K down. |
+
+Drafter (all quants): DSpark MXFP4-Q8_0 — [alessandrobologna][ds4d].
+Context 1048576 (yarn, 65536 base).
+
+`Layers37-42Q4KExperts` puts Q4_K on the last six expert layers and
+IQ2_XXS gate/up with Q2_K down on the rest, which is why it is the one file
+carrying three expert quants at once.
+
+IQ2_XXS has no MMQ tile kernel, so the two quants that use it stay on the
+vector MoE path at every batch size. That is a throughput ceiling, not a
+correctness limit.
 
 [ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
 [ds4d]: <https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF> <!-- markdownlint-disable-line MD013 -->
