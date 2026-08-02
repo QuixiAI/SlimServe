@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 from functools import partial
 
@@ -86,16 +87,6 @@ def _fused_moe_gguf(
 
     out_hidden_states = torch.empty_like(x)
     mmq_ok = qweight_type in MMQ_QUANT_TYPES and qweight_type2 in MMQ_QUANT_TYPES
-    if mmq_ok and qweight_type != qweight_type2:
-        # One moe_align_block_size layout feeds both tile kernels: expert_ids
-        # carries one entry per block_size columns, and each kernel indexes it
-        # with its own mmq_x. If those disagree, every w2 tile reads the wrong
-        # expert and the output is quietly wrong rather than crashing. Mixed
-        # files exist -- DeepSeek-V4 ships IQ2_XXS gate/up with Q2_K down -- so
-        # verify the widths agree instead of assuming they do.
-        mmq_ok = ops.ggml_moe_get_block_size(
-            qweight_type
-        ) == ops.ggml_moe_get_block_size(qweight_type2)
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
@@ -135,14 +126,40 @@ def _fused_moe_gguf(
             not mmq_ok or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2", 0)
         )
 
-        sorted_token_ids = expert_ids = num_tokens_post_padded = None
+        sorted_token_ids = num_tokens_post_padded = None
+        w1_expert_ids = w2_expert_ids = None
         if not (w1_vec and w2_vec):
-            block_size = ops.ggml_moe_get_block_size(qweight_type)
+            # w1 and w2 need not be the same quant -- DeepSeek-V4 ships IQ2_XXS
+            # gate/up with Q2_K down -- and each tile kernel has its own mmq_x.
+            # A kernel reads expert_ids[blockIdx.y] with blockIdx.y counting its
+            # own tiles, so one shared array is only correct when the widths
+            # match; otherwise every w2 tile picks the wrong expert and the
+            # output is quietly wrong.
+            #
+            # So align the rows to a width both agree on (their LCM, which each
+            # mmq_x divides) and hand each kernel an expert_ids expanded to its
+            # own tile count. The alignment is a property of the layout, the
+            # tile width a property of the kernel; conflating them is what tied
+            # a type's mmq_x to whatever it was paired with.
+            w1_block = ops.ggml_moe_get_block_size(qweight_type)
+            w2_block = ops.ggml_moe_get_block_size(qweight_type2)
+            align = math.lcm(w1_block, w2_block)
             sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
                 topk_ids,
-                block_size,
+                align,
                 global_num_experts,
                 expert_map=expert_map,
+            )
+            # One entry per align columns -> one per mmq_x columns.
+            w1_expert_ids = (
+                expert_ids
+                if align == w1_block
+                else expert_ids.repeat_interleave(align // w1_block)
+            )
+            w2_expert_ids = (
+                expert_ids
+                if align == w2_block
+                else expert_ids.repeat_interleave(align // w2_block)
             )
 
         # Both kernels emit rows in flat (token, k) order, so either can feed
@@ -156,7 +173,7 @@ def _fused_moe_gguf(
                 x,
                 w1,
                 sorted_token_ids,
-                expert_ids,
+                w1_expert_ids,
                 num_tokens_post_padded,
                 qweight_type,
                 N,
@@ -173,7 +190,7 @@ def _fused_moe_gguf(
                 out,
                 w2,
                 sorted_token_ids,
-                expert_ids,
+                w2_expert_ids,
                 num_tokens_post_padded,
                 qweight_type2,
                 w2.shape[1],
