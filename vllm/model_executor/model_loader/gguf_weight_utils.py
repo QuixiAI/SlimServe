@@ -1,58 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import warnings
-import glob
-import itertools
-import os
 from collections.abc import Generator
 from pathlib import Path
 
-import gguf
 import numpy as np
 import torch
-from huggingface_hub import snapshot_download
+
 from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import gguf_reader
 
 logger = init_logger(__name__)
-
-
-def download_gguf(
-    repo_id: str,
-    quant_type: str,
-    cache_dir: str | None = None,
-    revision: str | None = None,
-    ignore_patterns: str | list[str] | None = None,
-) -> str:
-    prefix_list = ["*.", "*-"]
-    suffix_list = ["-*", ""]
-    allow_patterns = [
-        f"{prefix}{qt}{suffix}.gguf"
-        for qt in (quant_type.upper(), quant_type.lower())
-        for prefix, suffix in itertools.product(prefix_list, suffix_list)
-    ]
-
-    folder = snapshot_download(
-        repo_id=repo_id,
-        cache_dir=cache_dir,
-        allow_patterns=allow_patterns,
-        revision=revision,
-        ignore_patterns=ignore_patterns,
-    )
-
-    local_files: list[str] = []
-    for pattern in allow_patterns:
-        local_files.extend(glob.glob(os.path.join(folder, pattern)))
-
-    if not local_files:
-        raise ValueError(
-            f"Downloaded GGUF files not found in {folder} for quant_type {quant_type}"
-        )
-
-    local_files.sort(key=lambda x: (x.count("-"), x))
-    return local_files[0]
-
-
 
 
 def get_gguf_extra_tensor_names(
@@ -114,7 +73,13 @@ def gguf_quant_weights_iterator_multi(
     afterwards).  When a mapping is provided, tensors not present in the map
     are skipped and names are translated accordingly.
     """
-    _QUANT_TYPES = ("F32", "BF16", "F16")
+    # Types stored plain, i.e. everything that is not a quantization. The
+    # integer types matter: DeepSeek-V4's hash-layer routing table
+    # (`ffn_gate_tid2eid`) is I32, and treating it as quantized emits a scalar
+    # type tag under a name that has no "weight" to replace -- so the tag lands
+    # on the table's own name and the loader is handed a 0-d tensor for a
+    # [vocab_size, topk] parameter.
+    _QUANT_TYPES = ("F32", "F64", "BF16", "F16", "I8", "I16", "I32", "I64")
 
     for gguf_file in gguf_files:
         reader = gguf_reader(gguf_file)
@@ -140,7 +105,6 @@ def gguf_quant_weights_iterator_multi(
             else:
                 param = _as_tensor(weight)
             yield name, param
-
 
     # for gguf_file in gguf_files:
     #     reader = gguf_reader(gguf_file)

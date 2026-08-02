@@ -58,13 +58,23 @@ class GGUFModelLoader(BaseModelLoader):
         return path
 
     def _prepare_adapter(self, model_config: ModelConfig):
-        # Imported here, not at module scope: the adapter pulls in
-        # models.utils, which imports this package.
+        # Imported here, not at module scope: the adapters pull in models.utils,
+        # which imports this package.
         from vllm.model_executor.model_loader.gguf_adapters import (
+            Deepseek4GGUFAdapter,
             GlmDsaGGUFAdapter,
         )
+        from vllm.transformers_utils.gguf_utils import gguf_architecture
 
-        adapter = GlmDsaGGUFAdapter(model_config.hf_config)
+        path = self._gguf_path(model_config)
+        # Dispatch on the file rather than the config: at this point the config
+        # was itself built from the GGUF, so the architecture string is the one
+        # authority both agree on.
+        if gguf_architecture(path) == "deepseek4":
+            adapter_cls = Deepseek4GGUFAdapter
+        else:
+            adapter_cls = GlmDsaGGUFAdapter
+        adapter = adapter_cls(model_config.hf_config)
         adapter.prepare_loading(self._gguf_path(model_config), model_config)
         return adapter
 
@@ -117,9 +127,7 @@ class GGUFModelLoader(BaseModelLoader):
             start = time.perf_counter()
             with target_device:
                 model = initialize_model(vllm_config=vllm_config, prefix=prefix)
-            bootstamp(
-                f"gguf load: initialize_model {time.perf_counter() - start:.2f}s"
-            )
+            bootstamp(f"gguf load: initialize_model {time.perf_counter() - start:.2f}s")
             from vllm.distributed.parallel_state import get_tp_group
 
             tp_device_comm = get_tp_group().device_communicator

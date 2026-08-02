@@ -305,11 +305,42 @@ def build_media_proc_cfg_from_gguf(gguf_path: str) -> dict[str, Any]:
 
 
 def build_tokenizer_from_gguf(gguf_path: str):
-    """Build a fast BPE tokenizer from `tokenizer.ggml.*`.
+    """Build GLM-5.2's fast BPE tokenizer from `tokenizer.ggml.*`.
 
     `tokenizer.ggml.model` is `gpt2` with a `glm4` pre-tokenizer, i.e. plain
     byte-level BPE, so the vocab and merge list are enough to reconstruct it
     without transformers' GGUF reader.
+    """
+    return build_bpe_tokenizer(
+        gguf_path,
+        regexes=(GLM4_PRETOKENIZER_REGEX,),
+        # The GGUF's own `tokenizer.chat_template` is the TEXT-ONLY one: given
+        # image content it emits "You are unable to process this image" instead
+        # of `<|begin_of_image|><|image|><|end_of_image|>`, so the placeholder
+        # never appears and multimodal prompt replacement fails outright. The
+        # vision-capable template is a static asset of this model, vendored
+        # beside this file.
+        chat_template_path=Path(__file__).parent / "chat_templates" / "glm5v.jinja",
+    )
+
+
+def build_bpe_tokenizer(
+    gguf_path: str,
+    *,
+    regexes: tuple[str, ...],
+    chat_template_path: Path | None,
+):
+    """Byte-level BPE from `tokenizer.ggml.*`, given a pre-tokenizer split.
+
+    `regexes` is the architecture's llama.cpp pre-tokenizer split, applied in
+    order ahead of ByteLevel. It is not optional detail: plain ByteLevel
+    groups digits wrongly ("7742" as one token, not "77"+"42") and runs of
+    whitespace, which silently shifts every id after the first number in a
+    prompt.
+
+    `chat_template_path` overrides the GGUF's own template when the shipped one
+    is wrong for how vLLM serves the model; pass None to use what the file
+    carries.
     """
     from tokenizers import (
         AddedToken,
@@ -337,20 +368,16 @@ def build_tokenizer_from_gguf(gguf_path: str):
 
     bpe = BPE(vocab=vocab, merges=merge_pairs, fuse_unk=False)
     tk = Tokenizer(bpe)
-    # `tokenizer.ggml.pre` is "glm4", not plain byte-level: it is the GPT-4
-    # style split. Plain ByteLevel mis-groups digits ("7742" -> one token
-    # instead of "77"+"42") and runs of spaces, which silently shifts every
-    # id after the first number in a prompt. `\p{N}{1,3}` is the part that
-    # matters most here.
     tk.pre_tokenizer = pre_tokenizers.Sequence(
         [
             pre_tokenizers.Split(
-                pattern=Regex(GLM4_PRETOKENIZER_REGEX),
+                pattern=Regex(rx),
                 behavior="isolated",
                 invert=False,
-            ),
-            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            )
+            for rx in regexes
         ]
+        + [pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)]
     )
     tk.decoder = decoders.ByteLevel()
     tk.post_processor = processors.ByteLevel(trim_offsets=False)
@@ -378,15 +405,8 @@ def build_tokenizer_from_gguf(gguf_path: str):
         pad_token=_tok("padding_token_id"),
         unk_token=_tok("unknown_token_id"),
     )
-    # The GGUF's own `tokenizer.chat_template` is the TEXT-ONLY one: given
-    # image content it emits "You are unable to process this image" instead of
-    # `<|begin_of_image|><|image|><|end_of_image|>`, so the placeholder never
-    # appears and multimodal prompt replacement fails outright. The
-    # vision-capable template is a static asset of this model, vendored beside
-    # this file.
-    template_path = Path(__file__).parent / "chat_templates" / "glm5v.jinja"
-    if template_path.is_file():
-        fast.chat_template = template_path.read_text()
+    if chat_template_path is not None and chat_template_path.is_file():
+        fast.chat_template = chat_template_path.read_text()
     else:
         chat_template = _field(r, "tokenizer.chat_template")
         if chat_template:
