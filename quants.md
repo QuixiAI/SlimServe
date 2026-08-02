@@ -1,5 +1,6 @@
 ## DeepSeek v4 Flash 0731 antirez 
 
+```
    Variant         Routed-expert quantization                                 Size    Practical positioning
   ━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
    IQ2XXS + Q2K    Gate/up: IQ2_XXS; down/W2: Q2_K in every layer       80.764 GiB    Smallest, most aggressive
@@ -9,8 +10,9 @@
    MXFP4           Gate/up/down all MXFP4                              145.264 GiB    FP4-oriented performance option
   ──────────────  ──────────────────────────────────────────────────  ─────────────  ─────────────────────────────────
    Q4K             Gate/up/down all Q4_K                               153.327 GiB    Quality-first quantization
+```
 
-  ### 1. IQ2XXS-w2Q2K — 80.8 GiB
+### 1. IQ2XXS-w2Q2K — 80.8 GiB
 
   The routed experts use:
 
@@ -23,7 +25,7 @@
   This is the memory-saving version. Expect the largest reduction in reasoning, coding accuracy, and difficult long-context behavior compared with
   the 4-bit variants.
 
-  ### 2. Layers37–42Q4K hybrid — 90.9 GiB
+### 2. Layers37–42Q4K hybrid — 90.9 GiB
 
   This is the same layout as the 80.8 GiB model for layers 0–36, but the final six zero-indexed layers—37 through 42—use Q4_K for all routed-
   expert matrices.
@@ -38,7 +40,7 @@
 
   fixed is only present in the filename; the GGUF metadata does not describe what was fixed. The file itself parses correctly.
 
-  ### 3. MXFP4 experts — 145.3 GiB
+### 3. MXFP4 experts — 145.3 GiB
 
   Every routed-expert matrix uses MXFP4:
 
@@ -52,7 +54,7 @@
 
   Unlike the other three, this file contains no recorded importance-matrix metadata.
 
-  ### 4. Q4_K experts — 153.3 GiB
+### 4. Q4_K experts — 153.3 GiB
 
   Every routed-expert gate, up, and down tensor uses Q4_K, effectively 4.5 bits/weight.
 
