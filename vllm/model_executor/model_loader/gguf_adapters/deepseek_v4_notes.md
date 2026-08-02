@@ -2,10 +2,10 @@
 
 Read from the 0731 MXFP4 release
 (`DeepSeek-V4-Flash-MXFP4Experts-...-mxfp4-0731.gguf`, 145.3 GiB, 1328 tensors).
-`general.architecture` is **`deepseek4`**, which no adapter currently claims —
-`default.py` maps only `deepseek2/v2/v3/mtp` and `glm_dsa.py` claims
-`glm_moe_dsa`. The model code exists (`vllm/models/deepseek_v4/`, including
-`amd/rocm.py`); the loader is the gap.
+`general.architecture` is **`deepseek4`**, now claimed by
+`gguf_adapters/deepseek4.py`. The model code was already here
+(`vllm/models/deepseek_v4/`, including `amd/rocm.py`); loading was the gap, and
+this file is why the numbers below are what they are.
 
 Everything below is read from the file, not inferred, so it does not need
 rediscovering. `~/ds4` is a complete DeepSeek-V4-Flash engine in C with its own
@@ -42,7 +42,10 @@ Also present and needed for MLA / RoPE: `attention.q_lora_rank` 1024,
 `attention.output_lora_rank` 1024, `attention.output_group_count` 8,
 `attention.sliding_window` 128, `rope.dimension_count` 64, yarn scaling
 (`factor` 16, `original_context_length` 65536 → `context_length` 1048576),
-`expert_gating_func` 4, `expert_weights_scale` 1.5, `nextn_predict_layers` 1.
+`expert_gating_func` 4 (= sqrtsoftplus), `expert_weights_scale` 1.5, and
+`nextn_predict_layers` 1 — which is a lie about this file: it carries no MTP
+tensors, so the config sets `num_nextn_predict_layers` to 0 and the nextn head
+comes from the separate DSpark drafter GGUF.
 
 ## Tensors, and the parts that are NOT uniform across layers
 
@@ -97,32 +100,51 @@ metadata, CUDA-graph-safe buffers, aiter prefill/decode dispatch. It does still
 carry its own Triton kernels for index packing, which the Triton purge has not
 reached.
 
-## Writing the adapter is five changes, not one
+## The five changes loading needed — all done
 
-Verified against the tree, because two of these are pre-existing gaps rather
-than new work and neither is visible from the adapter file alone:
+Kept because the reasoning is not recoverable from the result, and because two
+of them were pre-existing gaps rather than new work:
 
-1. **The adapter itself.** `glm_dsa.py` is the model to copy: static rename
-   tables (transformers has no entry for these architectures, so the default
-   adapter's introspect-the-HF-model trick cannot work), MLA `kv_b_proj`
-   reassembly, indexer halves emitted separately so vLLM's merged linear fuses
-   them, and `unquantized_modules` for whatever gets dequantized on the way in.
-   Its vision/mmproj half is not needed here.
-2. **`gguf_loader.py::_prepare_adapter` hardcodes `GlmDsaGGUFAdapter`.** There
-   is no adapter registry — `BaseGGUFWeightsAdapter.matches()` is declared and
-   never called anywhere in the tree. Writing an adapter that claims `deepseek4`
-   does nothing until that function actually dispatches on architecture.
-3. **`gguf_config_parser.py` has the same shape of problem**: it calls
-   `build_config_from_gguf`, which is hand-written to read `glm-dsa.*` keys and
-   return a `Glm5vConfig`, with no branch on `general.architecture`.
-4. **`DeepseekV4Config` is registered but does not exist.** `config.py` maps
-   `deepseek_v4` to it and `configs/__init__.py` points it at
-   `vllm.transformers_utils.configs.deepseek_v4` — a module with no file. Any
-   non-GGUF config path for this model raises ImportError today.
-5. **No registry entry.** `registry.py` maps no architecture string to
-   `vllm.models.deepseek_v4`, though `_resolve_module_name` names that package
-   as the example of the layout it supports.
+1. **The adapter** (`deepseek4.py`). Static rename tables, since transformers
+   has no entry for this architecture and the default adapter's
+   introspect-the-HF-model trick cannot work. Unlike `glm_dsa` nothing needs
+   assembling: every one of the 1328 tensors is a pure rename, because each
+   fused module is fed the pre-fusion shard names `stacked_params_mapping`
+   expects. Only `attn_output_a` and `output.weight` are dequantized.
+2. **`_prepare_adapter` hardcoded `GlmDsaGGUFAdapter`.** There was no adapter
+   registry — `BaseGGUFWeightsAdapter.matches()` is declared and still has no
+   call site anywhere. An adapter claiming `deepseek4` was unreachable until
+   that function dispatched on architecture, which it now does.
+3. **`gguf_config_parser` had the same problem** one layer up: it called a
+   builder hand-written for `glm-dsa.*` keys that returns a `Glm5vConfig`, with
+   no branch on `general.architecture`. Also dispatched now.
+4. **`DeepseekV4Config` was registered but did not exist.** The GLM-only
+   specialization deleted the module and left `config.py` and
+   `configs/__init__.py` pointing at it, so any non-GGUF config path raised
+   ImportError. Restored from that commit's parent.
+5. **No registry entry** mapped an architecture to `vllm.models.deepseek_v4`,
+   though `_resolve_module_name` names that package as its example of the
+   layout. Restored, with the DSpark draft and MTP entries.
 
 The model code reads `hf_config` by plain attribute access, so it needs no
 particular config class — an object carrying the fields in the table above is
 enough, which is how the GLM path already works.
+
+## What only showed up by running it
+
+- **`block_size` must be 256.** The DeepSeek-V4 sparse MLA backend reports
+  `[256]`; the GLM value of 64 fails at KV-cache setup with "no common block
+  size for 64", which does not name the backend that rejected it.
+- **`ffn_gate_tid2eid` is I32**, and the GGUF weight iterator treated anything
+  outside F32/BF16/F16 as quantized. Its scalar type tag was emitted under a
+  name with no "weight" to replace, so the tag landed on the table's own name
+  and the loader saw a 0-d tensor for a `[129280, 6]` parameter.
+- **`attn_output_a` cannot stay packed**: the ROCm inv-rope path reads
+  `wo_a.weight` directly to build a per-group einsum operand.
+- **`output.weight` cannot either**: `lm_head` is built unquantized, and
+  renaming a quantized tensor to `.qweight` also drops it out of the model's
+  `head.weight -> lm_head.weight` suffix rule.
+- **The chat template must not be used.** DeepSeek-V4 renders prompts through
+  `deepseek_v4_encoding.encode_messages`, and the GGUF's own jinja template
+  binds `messages` itself, so rendering it raises "got multiple values for
+  keyword argument 'messages'".
