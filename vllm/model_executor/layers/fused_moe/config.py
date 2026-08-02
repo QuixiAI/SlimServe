@@ -1314,6 +1314,10 @@ class FusedMoEConfig:
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
 
+    # SituGLU (Kimi K3) activation parameters; see MoEActivation.SITU.
+    activation_situ_beta: float | None = None
+    activation_situ_linear_beta: float | None = None
+
     max_capture_size: int = 0
 
     # Set by __post_init__

@@ -17,6 +17,9 @@ class MoEActivation(Enum):
     GELU = "gelu"
     GELU_TANH = "gelu_tanh"
     RELU2 = "relu2"
+    # SituGLU, used by Kimi K3: beta*tanh(gate/beta)*sigmoid(gate) * up, with
+    # the up half optionally soft-clipped by linear_beta.
+    SITU = "situ"
     # SWIGLUOAI expects gate/up *interleaved* in w13 ([gate0, up0, gate1, ...]),
     # as in gpt-oss checkpoints. SWIGLUOAI_UNINTERLEAVE has identical math but
     # expects the *packed* layout ([all gates; all ups]), as produced by a
@@ -75,6 +78,7 @@ _STR_ALIASES: dict[str, str] = {
 
 _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.SILU: "silu_and_mul",
+    MoEActivation.SITU: "situ_and_mul",
     MoEActivation.GELU: "gelu_and_mul",
     MoEActivation.GELU_TANH: "gelu_tanh_and_mul",
     MoEActivation.SWIGLUOAI: "swigluoai_and_mul",
@@ -133,12 +137,17 @@ def apply_moe_activation(
     beta: float = 0.0,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    activation_situ_beta: float | None = None,
+    activation_situ_linear_beta: float | None = None,
 ) -> torch.Tensor:
     """Apply MoE activation function.
 
     ``clamp_limit``/``alpha``/``beta`` (from the quant config) drive the clamped
     SwiGLU kernels: ``SILU`` + ``clamp_limit`` and ``SWIGLUOAI_UNINTERLEAVE`` both
     map to ``silu_and_mul_with_clamp``. Other activations ignore them.
+
+    ``activation_situ_beta``/``activation_situ_linear_beta`` come from
+    ``FusedMoEConfig`` and drive ``SITU``; other activations ignore them.
     """
     assert input.dim() == 2, "Input must be 2D"
     assert output.dim() == 2, "Output must be 2D"
@@ -159,6 +168,23 @@ def apply_moe_activation(
             silu_and_mul_with_clamp(output, input, clamp_limit, topk_ids, expert_map)
         else:
             torch.ops._C.silu_and_mul(output, input)
+    elif activation == MoEActivation.SITU:
+        # Fused kernel: writes straight to `output`, no fp32 temporaries.
+        # Both betas come from FusedMoEConfig; a missing beta means the caller
+        # bypassed the config plumbing, so fail rather than silently use 1.0.
+        # linear_beta is genuinely optional: <= 0 signals "unset" to the kernel
+        # (up passed through), matching SituAndMul(linear_beta=None).
+        assert activation_situ_beta is not None, (
+            "SITU requires activation_situ_beta from FusedMoEConfig"
+        )
+        torch.ops._C.situ_and_mul(
+            output,
+            input,
+            activation_situ_beta,
+            -1.0
+            if activation_situ_linear_beta is None
+            else activation_situ_linear_beta,
+        )
     elif activation == MoEActivation.GELU:
         torch.ops._C.gelu_and_mul(output, input)
     elif activation == MoEActivation.GELU_TANH:
