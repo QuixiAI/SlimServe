@@ -299,6 +299,10 @@ _MULTIMODAL_MODELS = {
         "llava_onevision2",
         "LlavaOnevision2ForConditionalGeneration",
     ),
+    "KimiK3ForConditionalGeneration": (
+        "vllm.models.kimi_k3",
+        "KimiK3ForConditionalGeneration",
+    ),
     "MiniMaxM3SparseForConditionalGeneration": (
         "vllm.models.minimax_m3",
         "MiniMaxM3SparseForConditionalGeneration",

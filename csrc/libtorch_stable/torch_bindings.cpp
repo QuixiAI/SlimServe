@@ -530,6 +530,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "limit=7.0) "
       "-> ()");
 
+  ops.def(
+      "situ_and_mul(Tensor! out, Tensor input, float beta=1.0, float "
+      "linear_beta=-1.0) -> ()");
+  ops.def(
+      "masked_situ_and_mul(Tensor! out, Tensor input, Tensor "
+      "expert_num_tokens, float beta=1.0, float linear_beta=-1.0) -> ()");
+
   // GELU implementation used in GPT-2.
   ops.def("gelu_new(Tensor! out, Tensor input) -> ()");
 
@@ -749,6 +756,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));
   ops.impl("fatrelu_and_mul", TORCH_BOX(&fatrelu_and_mul));
   ops.impl("swigluoai_and_mul", TORCH_BOX(&swigluoai_and_mul));
+  ops.impl("situ_and_mul", TORCH_BOX(&situ_and_mul));
+  ops.impl("masked_situ_and_mul", TORCH_BOX(&masked_situ_and_mul));
   ops.impl("gelu_new", TORCH_BOX(&gelu_new));
   ops.impl("gelu_fast", TORCH_BOX(&gelu_fast));
   ops.impl("gelu_quick", TORCH_BOX(&gelu_quick));
@@ -932,7 +941,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
-  custom_ar.impl("all_reduce_add_rms_norm", TORCH_BOX(&all_reduce_add_rms_norm));
+  custom_ar.impl("all_reduce_add_rms_norm",
+                 TORCH_BOX(&all_reduce_add_rms_norm));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {

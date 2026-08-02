@@ -132,6 +132,8 @@ extend-ignore-identifiers-re = [".*[Uu][Ee][0-9][Mm][0-9].*"]
 
 [tool.typos.default.extend-identifiers]
 bbc5b7ede = "bbc5b7ede"
+# Upstream tracker name in the vendored Kimi KDA provenance header.
+mke = "mke"
 NOOPs = "NOOPs"
 nin_shortcut = "nin_shortcut"
 cudaDevAttrMaxSharedMemoryPerBlockOptin = "cudaDevAttrMaxSharedMemoryPerBlockOptin"
