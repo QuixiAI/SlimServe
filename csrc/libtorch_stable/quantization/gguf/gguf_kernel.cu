@@ -446,6 +446,14 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
             (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
             tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
         break;
+      case 16:
+        ggml_moe_iq2_xxs_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
       case 39:
         ggml_moe_mxfp4_q8_1_cuda(
             (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
@@ -691,6 +699,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_1;
     case 8:
       return MOE_X_Q8_0;
+    case 16:
+      return MOE_X_IQ2_XXS;
     case 39:
       return MOE_X_MXFP4;
     case 10:

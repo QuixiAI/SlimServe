@@ -86,6 +86,16 @@ def _fused_moe_gguf(
 
     out_hidden_states = torch.empty_like(x)
     mmq_ok = qweight_type in MMQ_QUANT_TYPES and qweight_type2 in MMQ_QUANT_TYPES
+    if mmq_ok and qweight_type != qweight_type2:
+        # One moe_align_block_size layout feeds both tile kernels: expert_ids
+        # carries one entry per block_size columns, and each kernel indexes it
+        # with its own mmq_x. If those disagree, every w2 tile reads the wrong
+        # expert and the output is quietly wrong rather than crashing. Mixed
+        # files exist -- DeepSeek-V4 ships IQ2_XXS gate/up with Q2_K down -- so
+        # verify the widths agree instead of assuming they do.
+        mmq_ok = ops.ggml_moe_get_block_size(
+            qweight_type
+        ) == ops.ggml_moe_get_block_size(qweight_type2)
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
@@ -122,8 +132,7 @@ def _fused_moe_gguf(
         # w1 is left alone -- the same sweep showed MMQ costs it ~3% at batch 1.
         w2_rows = num_tokens * top_k
         w2_vec = vec_ok and (
-            not mmq_ok
-            or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2", 0)
+            not mmq_ok or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2", 0)
         )
 
         sorted_token_ids = expert_ids = num_tokens_post_padded = None
