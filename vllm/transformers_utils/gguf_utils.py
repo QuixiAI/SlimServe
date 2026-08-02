@@ -35,7 +35,7 @@ class _CachedField:
     def __init__(self, value: Any):
         self._value = value
 
-    def contents(self, index_or_slice: int | slice = slice(None)) -> Any:
+    def contents(self, index_or_slice: int | slice = slice(None)) -> Any:  # noqa: B008
         if isinstance(index_or_slice, slice) and index_or_slice == slice(None):
             return self._value
         return self._value[index_or_slice]
@@ -48,8 +48,7 @@ class _CachedGGUFReader:
         self.alignment = metadata["alignment"]
         self.data_offset = metadata["data_offset"]
         self.fields = OrderedDict(
-            (name, _CachedField(value))
-            for name, value in metadata["fields"].items()
+            (name, _CachedField(value)) for name, value in metadata["fields"].items()
         )
         self.tensors = [
             self._build_tensor(tensor_metadata)
@@ -166,7 +165,7 @@ def _plain_mmap(path, mode="r"):
     A plain ndarray over the same mapping parses byte-identically in a third of
     the time.
     """
-    f = open(path, "rb")
+    f = open(path, "rb")  # noqa: SIM115 -- the mmap must outlive this call
     mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     return np.frombuffer(mm, dtype=np.uint8)
 
@@ -202,6 +201,18 @@ def gguf_reader(path: str | PathLike) -> gguf.GGUFReader | _CachedGGUFReader:
     if time.perf_counter() - start >= 0.5:
         _save_reader_cache(path, reader)
     return reader
+
+
+@cache
+def gguf_architecture(path: str | PathLike) -> str:
+    """The `general.architecture` string, e.g. "glm-dsa" or "deepseek4".
+
+    This is what the config parser, the tokenizer registry and the weights
+    adapter all dispatch on, so it is read once here rather than three times
+    with three spellings of the same lookup.
+    """
+    field = gguf_reader(str(path)).fields.get("general.architecture")
+    return "" if field is None else str(field.contents())
 
 
 @cache
@@ -398,7 +409,7 @@ def maybe_patch_hf_config_from_gguf(
             # Composite configs (Glm5vConfig) expose vocab_size as a read-only
             # property delegating to text_config, which is patched below
             # anyway, so a failure here is expected and harmless.
-            try:
+            try:  # noqa: SIM105 -- the comment above is the point
                 hf_config.update({"vocab_size": vocab_size})
             except AttributeError:
                 pass

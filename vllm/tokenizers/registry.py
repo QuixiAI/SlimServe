@@ -127,7 +127,6 @@ def resolve_tokenizer_args(
                 )
                 tokenizer_name = tokenizer_path
 
-
     if "truncation_side" not in kwargs:
         if runner_type == "generate" or runner_type == "draft":
             kwargs["truncation_side"] = "left"
@@ -192,15 +191,39 @@ def get_tokenizer(
 ) -> _T:
     """Gets a tokenizer for the given model name via HuggingFace or ModelScope."""
     # A .gguf carries its own vocab, merges and chat template. Build from those
-    # directly -- transformers' GGUF reader rejects `glm-dsa` outright.
+    # directly -- transformers' GGUF reader rejects `glm-dsa` and `deepseek4`
+    # outright. The two use different llama.cpp pre-tokenizer splits, so which
+    # builder runs depends on the architecture.
     if check_gguf_file(tokenizer_name):
         from vllm.tokenizers.hf import get_cached_tokenizer
-        from vllm.transformers_utils.gguf_native import build_tokenizer_from_gguf
+        from vllm.transformers_utils.gguf_utils import gguf_architecture
+
+        if gguf_architecture(str(tokenizer_name)) == "deepseek4":
+            from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+            from vllm.transformers_utils.gguf_deepseek4 import (
+                build_deepseek4_tokenizer_from_gguf,
+            )
+
+            # DeepSeek-V4 does not go through jinja at all: its prompt format
+            # is built by `deepseek_v4_encoding.encode_messages`, which handles
+            # the thinking modes and tool blocks the shipped template cannot.
+            # Falling back to the GGUF's own template fails outright -- it
+            # binds `messages` itself, so rendering raises "got multiple values
+            # for keyword argument 'messages'".
+            tok = get_deepseek_v4_tokenizer(
+                build_deepseek4_tokenizer_from_gguf(str(tokenizer_name))
+            )
+        else:
+            from vllm.transformers_utils.gguf_native import (
+                build_tokenizer_from_gguf,
+            )
+
+            tok = build_tokenizer_from_gguf(str(tokenizer_name))
 
         # Wrap it the same way the HF path does: the renderer reads
         # `max_chars_per_token` / `max_token_id` / `all_special_ids`, which a
         # bare PreTrainedTokenizerFast does not expose.
-        return get_cached_tokenizer(build_tokenizer_from_gguf(str(tokenizer_name)))
+        return get_cached_tokenizer(tok)
 
     if envs.VLLM_USE_FASTOKENS:
         # Process-global, idempotent patch that swaps the Rust BPE backend
