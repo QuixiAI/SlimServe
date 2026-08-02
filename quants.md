@@ -198,9 +198,21 @@ expert-parallel placement is worth considering before tensor-parallel.
 
 ### The vision half: three mmproj builds
 
-The text file above says `kimi-k3.vision = false`, but three vision
-projectors ship beside it. They are the same 168 tensors and the same
-`clip` metadata, differing only in weight precision:
+The text file above says `kimi-k3.vision = false`. That is a packaging bug,
+not a description of a text-only build. Upstream Kimi K3 ships exactly one
+architecture, `KimiK3ForConditionalGeneration`, and its `config.json` carries
+a full `vision_config` — there is no text-only variant for the flag to be
+describing. The tensor names agree: the text GGUF puts everything under
+`language_model.`, which is the multimodal wrapper's namespace.
+
+Nothing caught it because nothing reads the key. `<arch>.vision` is not a
+GGUF standard key, and llama.cpp as of `fffbcbdb9` still has no `kimi-k3`
+architecture at all — this file came from a private converter, and the key is
+its own invention. A `kimi-k3` adapter must therefore decide whether to load a
+projector from the presence of one, never from `kimi-k3.vision`.
+
+Three vision projectors ship beside the text file. They are the same 168
+tensors and the same `clip` metadata, differing only in weight precision:
 
 ```text
    File             Size       Weights
@@ -240,7 +252,9 @@ that is the only vision path this repo currently serves.
 
 **No biases anywhere.** 168 tensors is 27 blocks x 6 plus 6 globals. GLM's is
 335 — 27 x 12 plus 11 — because every attention, FFN and norm there carries a
-bias. Kimi K3's tower has none, and its projector is `mm.1` `[4096, 4096]`,
+bias. Kimi K3's tower has none — `vision_config` sets `linear_bias`,
+`attn_bias` and `patch_embed_proj_bias` all false — and its projector is
+`mm.1` `[4096, 4096]`,
 `mm.2` `[4096, 7168]` and a `mm.post_norm`, where GLM has an `mm.input_norm`
 and biases on both projector layers. The norm moved from the input side to the
 output side.
@@ -252,9 +266,16 @@ needs llama.cpp's `kimik3` converter read the way `kimik25.cpp` was. Assuming
 they match would be exactly the kind of guess that produces plausible-looking
 vision output that is subtly wrong.
 
-`projection_dim` 7168 matches the text model's `embedding_length`, and
+Every one of those dimensions matches `vision_config` in the HF checkout at
+`~/models/Kimi-K3`: `vt_hidden_size` 1024, `vt_num_hidden_layers` 27,
+`vt_num_attention_heads` 12, `vt_intermediate_size` 4096, `patch_size` 14,
+and `text_hidden_size` 7168 against the projector's `projection_dim`. These
+files are built for this model, whatever its `vision` flag says.
+
 `image_max_pixels / patch_size²` is `12845056 / 196 = 65536` — four times
-GLM's 16384 patch limit.
+GLM's 16384 patch limit. The GGUF's `projector.scale_factor 2` is HF's
+`merge_kernel_size [2, 2]`, so those patches merge 2x2 down to 16384 tokens
+before anything reaches the language model.
 
 ---
 
