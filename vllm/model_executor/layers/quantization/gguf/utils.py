@@ -72,9 +72,8 @@ IMATRIX_QUANT_TYPES = {
     WeightType.IQ4_NL,
 }
 # OCP MXFP4 (GGML_TYPE_MXFP4 = 39), the format DeepSeek-V4-Flash stores its
-# routed experts in. Dequant and the q8_1 vector paths are implemented; the MMQ
-# tile kernel is not, so it is deliberately absent from MMQ_QUANT_TYPES and
-# large-batch matmuls fall back to the vec path.
+# routed experts in. Dequant, the q8_1 vector paths and the MMQ tile paths are
+# all implemented.
 MXFP4_QUANT_TYPES = {WeightType.MXFP4}
 
 DEQUANT_TYPES = (
@@ -83,4 +82,4 @@ DEQUANT_TYPES = (
 MMVQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | MXFP4_QUANT_TYPES
 )
-MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | MXFP4_QUANT_TYPES

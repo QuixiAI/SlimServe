@@ -296,15 +296,14 @@ static torch::stable::Tensor ggml_mul_mat_a8_v2(torch::stable::Tensor W,
                                 W.device());
   cudaStream_t stream = get_current_cuda_stream();
 
-  auto quant_X = torch::stable::empty(
-      {vllm_mmq_v2::mmq_v2_y_ints(batch, col)},
-      torch::headeronly::ScalarType::Int, std::nullopt, W.device());
+  auto quant_X = torch::stable::empty({vllm_mmq_v2::mmq_v2_y_ints(batch, col)},
+                                      torch::headeronly::ScalarType::Int,
+                                      std::nullopt, W.device());
 
-  const bool split =
-      vllm_mmq_v2::mmq_v2_needs_scratch(col, row, batch, nsm);
-  auto scratch = torch::stable::empty(
-      {split ? batch * row : int64_t(1)}, torch::headeronly::ScalarType::Float,
-      std::nullopt, W.device());
+  const bool split = vllm_mmq_v2::mmq_v2_needs_scratch(col, row, batch, nsm);
+  auto scratch = torch::stable::empty({split ? batch * row : int64_t(1)},
+                                      torch::headeronly::ScalarType::Float,
+                                      std::nullopt, W.device());
   if (split) {
     torch::stable::fill_(scratch, 0.0);
   }
@@ -362,6 +361,11 @@ torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
         break;
       case 3:
         ggml_mul_mat_q4_1_q8_1_cuda(
+            (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+            (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
+        break;
+      case 39:
+        ggml_mul_mat_mxfp4_q8_1_cuda(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), col, row, batch, padded, row, stream);
         break;
@@ -436,6 +440,14 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
     switch (type) {
       case 2:
         ggml_moe_q4_0_q8_1_cuda(
+            (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
+            (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
+            (int*)expert_ids.data_ptr(),
+            (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
+            tokens, padded, row, top_k, sorted_token_ids.sizes()[0], stream);
+        break;
+      case 39:
+        ggml_moe_mxfp4_q8_1_cuda(
             (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
             (int*)expert_ids.data_ptr(),
@@ -679,6 +691,8 @@ int64_t ggml_moe_get_block_size(int64_t type) {
       return MOE_X_Q5_1;
     case 8:
       return MOE_X_Q8_0;
+    case 39:
+      return MOE_X_MXFP4;
     case 10:
       return MOE_X_Q2_K;
     case 11:

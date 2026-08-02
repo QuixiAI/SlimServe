@@ -75,16 +75,15 @@ are the routed experts, stored per layer as `[4096, 2048, 256]` (gate/up) and
 `[2048, 4096, 256]` (down) — expert-major, so the MoE grouped path indexes the
 last dim.
 
-MXFP4 reading is implemented: dequant and the q8_1 vector paths are wired
-(`ggml-common.h`, `vecdotq.cuh`, `mmvq.cuh`, `moe_vec.cuh`, and
-`MXFP4_QUANT_TYPES` in the gguf quant utils), verified at 4.6e-08 err/|terms|
-through `torch.ops._C.ggml_mul_mat_vec_a8`.
+MXFP4 reading is fully implemented: dequant, the q8_1 vector paths and the MMQ
+tile paths (`ggml-common.h`, `vecdotq.cuh`, `mmvq.cuh`, `moe_vec.cuh`,
+`mmq.cuh`, `moe.cuh`, and `MXFP4_QUANT_TYPES` in the gguf quant utils, which is
+now in all three of `DEQUANT`/`MMVQ`/`MMQ`).
 
-**The MMQ tile kernel is not written**, so MXFP4 is deliberately absent from
-`MMQ_QUANT_TYPES` and large batches fall back to the vec path. That is the
-throughput ceiling to lift first if this model needs to match GLM-5.2's numbers;
-llama.cpp's `mmq-config-cdna.cuh` already carries CDNA-tuned MXFP4 tile configs
-to port from, and this stack's gguf kernels are forks of those same files.
+The MoE tile path is 1.5x the vec path at 32 routed tokens and 2.4x at 512, and
+loses below ~8, so the existing `_moe_vec_row_limit` crossover does the right
+thing unchanged. No kernel work is left for this model: the experts have both
+paths and the DSA indexer is already covered.
 
 ## Already covered
 

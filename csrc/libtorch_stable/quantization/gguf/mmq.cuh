@@ -174,6 +174,63 @@ static void ggml_mul_mat_q4_0_q8_1_cuda(const void* vx, const void* vy,
   }
 }
 
+// Same geometry as q4_0: identical block size and quants per int.
+#if defined(USE_ROCM)
+  #define MMQ_X_MXFP4 64
+  #define MMQ_Y_MXFP4 128
+  #define NWARPS_MXFP4 8
+#else
+  #define MMQ_X_MXFP4 4
+  #define MMQ_Y_MXFP4 32
+  #define NWARPS_MXFP4 4
+#endif
+
+template <typename scalar_t, bool need_check>
+static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF* NWARPS_MXFP4, 2)
+#endif
+    mul_mat_mxfp4(const void* __restrict__ vx, const void* __restrict__ vy,
+                  scalar_t* __restrict__ dst, const int ncols_x,
+                  const int nrows_x, const int ncols_y, const int nrows_y,
+                  const int nrows_dst) {
+  const int mmq_x = MMQ_X_MXFP4;
+  const int mmq_y = MMQ_Y_MXFP4;
+  const int nwarps = NWARPS_MXFP4;
+
+  mul_mat_q<scalar_t, QK_MXFP4, QR_MXFP4, QI_MXFP4, true, block_mxfp4, mmq_x,
+            mmq_y, nwarps, allocate_tiles_mxfp4<mmq_y>,
+            load_tiles_mxfp4<mmq_y, nwarps, need_check>, VDR_MXFP4_Q8_1_MMQ,
+            vec_dot_mxfp4_q8_1_mul_mat>(vx, vy, dst, ncols_x, nrows_x, ncols_y,
+                                        nrows_y, nrows_dst);
+}
+
+template <typename scalar_t>
+static void ggml_mul_mat_mxfp4_q8_1_cuda(const void* vx, const void* vy,
+                                         scalar_t* dst, const int ncols_x,
+                                         const int nrows_x, const int ncols_y,
+                                         const int nrows_y, const int nrows_dst,
+                                         cudaStream_t stream) {
+  int mmq_x = MMQ_X_MXFP4;
+  int mmq_y = MMQ_Y_MXFP4;
+  int nwarps = NWARPS_MXFP4;
+
+  const int block_num_x = (nrows_x + mmq_y - 1) / mmq_y;
+  const int block_num_y = (ncols_y + mmq_x - 1) / mmq_x;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, nwarps, 1);
+
+  if (nrows_x % mmq_y == 0) {
+    const bool need_check = false;
+    mul_mat_mxfp4<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  } else {
+    const bool need_check = true;
+    mul_mat_mxfp4<scalar_t, need_check><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+  }
+}
+
 #if defined(USE_ROCM)
   #define MMQ_X_Q4_1 64
   #define MMQ_Y_Q4_1 128
