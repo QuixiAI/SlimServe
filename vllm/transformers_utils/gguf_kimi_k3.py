@@ -74,6 +74,30 @@ _ARCH_CONSTANTS = {
 # Likewise not in the file; the KDA gate floor and the full-rank gate flag.
 _LINEAR_ATTN_CONSTANTS = {"gate_lower_bound": -5.0, "use_full_rank_gate": True}
 
+# The GGUF stores only the 163584 base ranks. The 256 ids above them are
+# special, and the named ones come from the release's `added_tokens_decoder`;
+# anything unnamed falls back to `<|reserved_token_N|>` inside the tokenizer.
+# `<|media_pad|>` is the one the multimodal path substitutes image features
+# into, so it has to keep id 163605.
+_SPECIAL_TOKEN_NAMES = {
+    163584: "[BOS]",
+    163585: "[EOS]",
+    163586: "<|end_of_msg|>",
+    163587: "<|open|>",
+    163588: "<|close|>",
+    163589: "<|sep|>",
+    163590: "[start_header_id]",
+    163591: "[end_header_id]",
+    163593: "[EOT]",
+    163602: "<|media_begin|>",
+    163603: "<|media_content|>",
+    163604: "<|media_end|>",
+    163605: "<|media_pad|>",
+    163649: "<osagent_mode>",
+    163838: "[UNK]",
+    163839: "[PAD]",
+}
+
 _LAYER_RE = re.compile(r"^language_model\.model\.layers\.(\d+)\.(.+)$")
 
 
@@ -205,3 +229,67 @@ def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
     )
 
     return KimiK3Config(text_config=text_config, vision_config=vision_config)
+
+
+def _tiktoken_vocab_path(gguf_path: str) -> str:
+    """Materialise `tokenizer.kimi-k3.tiktoken` as a tiktoken.model file.
+
+    `tiktoken.load.load_tiktoken_bpe` reads a path, and the GGUF stores the
+    identical content -- 163584 `base64 rank` lines, byte-for-byte the same as
+    the `tiktoken.model` shipped in the model repo. Writing it out beside the
+    HF cache keeps the vendored tokenizer unmodified.
+    """
+    import hashlib
+    import os
+    import tempfile
+
+    reader = gguf_reader(str(gguf_path))
+    field = reader.fields.get(f"tokenizer.{ARCH}.tiktoken")
+    if field is None:
+        raise ValueError(
+            f"no tokenizer.{ARCH}.tiktoken in {gguf_path}; cannot build a vocab"
+        )
+    blob = bytes(field.parts[-1])
+
+    digest = hashlib.sha256(blob).hexdigest()[:16]
+    out = os.path.join(tempfile.gettempdir(), f"kimi-k3-{digest}.tiktoken.model")
+    if not os.path.exists(out):
+        tmp = f"{out}.{os.getpid()}"
+        with open(tmp, "wb") as handle:
+            handle.write(blob)
+        os.replace(tmp, out)
+    return out
+
+
+@cache
+def build_kimi_k3_tokenizer_from_gguf(gguf_path: str):
+    """Kimi K3's own tiktoken tokenizer, fed from the GGUF's vocabulary.
+
+    The 256 special ids above the 163584 base ranks are not in the file; the
+    named ones below come from the release's `added_tokens_decoder` and the
+    rest fall back to `<|reserved_token_N|>`, matching the reference.
+    """
+    from tokenizers import AddedToken
+
+    from vllm.transformers_utils.tokenizers.kimi_k3 import TikTokenTokenizer
+
+    added = {
+        i: AddedToken(name, special=True) for i, name in _SPECIAL_TOKEN_NAMES.items()
+    }
+    tokenizer = TikTokenTokenizer(
+        vocab_file=_tiktoken_vocab_path(gguf_path),
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+        pad_token="[PAD]",
+        # Not optional despite the signature: __init__ looks unk_token up in
+        # special_tokens unconditionally, so None becomes KeyError('None').
+        unk_token="[UNK]",
+        added_tokens_decoder=added,
+    )
+    logger.info(
+        "Kimi K3 tokenizer: %d tokens (%d base + %d special)",
+        tokenizer.vocab_size,
+        tokenizer.vocab_size - TikTokenTokenizer.num_reserved_special_tokens,
+        TikTokenTokenizer.num_reserved_special_tokens,
+    )
+    return tokenizer

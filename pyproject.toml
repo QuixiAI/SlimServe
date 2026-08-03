@@ -53,6 +53,10 @@ include = ["vllm*"]
 
 [tool.ruff.lint.per-file-ignores]
 "vllm/third_party/**" = ["ALL"]
+# Vendored verbatim from the Kimi K3 release. Reflowing these would edit a
+# tokenizer regex, which is exactly what carrying them unchanged avoids.
+"vllm/transformers_utils/tokenizers/kimi_k3.py" = ["ALL"]
+"vllm/transformers_utils/tokenizers/encoding_k3.py" = ["ALL"]
 "vllm/version.py" = ["F401"]
 "vllm/_version.py" = ["ALL"]
 
