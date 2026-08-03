@@ -90,6 +90,10 @@ torch::stable::Tensor ggml_dequantize(
 
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(DW.scalar_type(), "ggml_dequantize", [&] {
     auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+    // An unhandled type used to return nullptr and be called anyway, which
+    // segfaults instead of naming the type that is missing.
+    STD_TORCH_CHECK(to_cuda != nullptr,
+                    "ggml_dequantize: no dequant kernel for GGUF type ", type);
     to_cuda((void*)W.data_ptr(), (scalar_t*)DW.data_ptr(), m * n, stream);
   });
 
@@ -109,6 +113,9 @@ void ggml_dequantize_into(torch::stable::Tensor W, int64_t type, int64_t m,
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(
       Y.scalar_type(), "ggml_dequantize_into", [&] {
         auto to_cuda = ggml_get_to_cuda<scalar_t>(type);
+        STD_TORCH_CHECK(
+            to_cuda != nullptr,
+            "ggml_dequantize_into: no dequant kernel for GGUF type ", type);
         to_cuda((void*)W.data_ptr(), (scalar_t*)Y.data_ptr(), m * n, stream);
       });
 }

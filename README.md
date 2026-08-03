@@ -89,13 +89,17 @@ an API answer come from one engine with one configuration.
 | `glm52-2` | GLM-5.2-Vision | 2 | MI300X |
 | `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 |
 | `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 |
+| `dsv4-2` | DeepSeek-V4-Flash (text) | 2 | MI300X |
+| `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
 | `k3-6` | Kimi K3 | 6 | MI300X |
 | `k3-8` | Kimi K3 | 8 | MI300X |
 
-GLM profiles take `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs); Kimi K3 has
-one published quant. `slimserve --list` shows every profile and why any of them
-will not run here; `slimserve <profile> --dry-run` prints the resolved settings
-without loading anything.
+GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
+takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
+larger ones need 4 GPUs. Kimi K3 has one published quant. `slimserve --list`
+shows every profile and why any of them will not run here;
+`slimserve <profile> --dry-run` prints the resolved settings without loading
+anything.
 
 **Every legal configuration lives in
 [`slimserve/profiles.json`](slimserve/profiles.json)** — model sources, download

@@ -45,13 +45,16 @@ def is_layer_skipped_gguf(
 
 
 UNQUANTIZED_TYPES = {WeightType.F32, WeightType.F16, WeightType.BF16}
+# Q8_1 is deliberately absent: it is the activation format the q8 dot-product
+# kernels quantize *into*, never a weight storage type, and no dequant, MMVQ or
+# MMQ kernel has a case for it. Listing it here promised a path that would have
+# dereferenced a null dequant function.
 STANDARD_QUANT_TYPES = {
     WeightType.Q4_0,
     WeightType.Q4_1,
     WeightType.Q5_0,
     WeightType.Q5_1,
     WeightType.Q8_0,
-    WeightType.Q8_1,
 }
 KQUANT_TYPES = {
     WeightType.Q2_K,

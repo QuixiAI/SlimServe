@@ -512,6 +512,29 @@ static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t 
     dequantize_block_iq1_m<<<nb, 32, 0, stream>>>(vx, y);
 }
 
+// MXFP4: one e8m0 scale, then 16 bytes whose LOW nibbles are values [0,16) and
+// HIGH nibbles values [16,32). kvalues_mxfp4 holds 2x the true values so the
+// dot-product kernels can stay integer, so halve the scale here.
+template<typename dst_t>
+static __global__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const auto i = blockIdx.x;
+    const block_mxfp4 * x = (const block_mxfp4 *) vx + i;
+
+    const auto tid = threadIdx.x; // one byte, i.e. two values, per thread
+    const float d = 0.5f * mxfp4_e8m0_to_fp32(x->e);
+    const uint8_t q = x->qs[tid];
+
+    dst_t * y = yy + i*QK_MXFP4;
+    y[tid]              = (dst_t)(d * kvalues_mxfp4[q & 0xF]);
+    y[tid + QK_MXFP4/2] = (dst_t)(d * kvalues_mxfp4[q >>  4]);
+}
+
+template<typename dst_t>
+static void dequantize_row_mxfp4_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+    const int nb = k / QK_MXFP4;
+    dequantize_block_mxfp4<<<nb, QK_MXFP4/2, 0, stream>>>(vx, y);
+}
+
 template<typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
@@ -565,6 +588,8 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
             return dequantize_row_iq4_xs_cuda;
         case 29:
             return dequantize_row_iq1_m_cuda;
+        case 39:
+            return dequantize_row_mxfp4_cuda;
         default:
             return nullptr;
     }
