@@ -230,6 +230,17 @@ class RoutedExperts(PluggableLayer):
             self._expert_map if not self.rocm_aiter_fmoe_enabled else self.expert_mask
         )
 
+    @property
+    def global_to_local_expert_map(self) -> torch.Tensor | None:
+        """Global expert id -> local index, or -1 when not held here.
+
+        `expert_map` yields AITER's 0/1 residency mask whenever its fused MoE
+        is enabled, which is what AITER's kernels want. Kernels that *index*
+        their local expert stack with the map must use this instead, or every
+        routed token lands on local expert 0 or 1.
+        """
+        return self._expert_map
+
     def update_expert_map_info(self):
         # Update local attributes from ExpertMapManager
         self.local_num_experts = self.expert_map_manager.local_num_experts

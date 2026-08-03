@@ -8,11 +8,11 @@ carries HF names under a ``language_model.`` prefix -- the multimodal wrapper's
 namespace -- so those map to themselves. Only the three expert stacks use
 llama.cpp's ``blk.N.ffn_*_exps.weight`` form, and only those need renaming.
 
-The expert stacks are 3D (``[..., ..., num_experts]``); as in the DeepSeek-V4
-adapter they are mapped onto the ``experts.0.wN`` slot and the shared
-``map_weights`` unbinds them into per-expert rows. Kimi's checkpoint names for
-the three projections are ``w1``/``w2``/``w3`` (gate/down/up), which is what
-``KimiLinearForCausalLM.load_weights`` asks
+The expert stacks are 3D and are mapped onto the ``experts.0.wN`` slot. Under
+expert parallelism this adapter selects only the rank-local rows and shifts
+that synthetic expert id to the first global expert in the local shard. Kimi's
+checkpoint names for the three projections are ``w1``/``w2``/``w3``
+(gate/down/up), which is what ``KimiLinearForCausalLM.load_weights`` asks
 ``fused_moe_make_expert_params_mapping`` for.
 """
 
@@ -150,6 +150,30 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
         )
         spec.unquantized_modules.extend(fused_parents)
         return spec
+
+    def map_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        """Select rank-local rows from fused routed-expert stacks."""
+        for hf_name, weight in super().map_weights(weights):
+            expert_ids = self.local_expert_ids
+            if expert_ids is not None and weight.ndim == 3 and ".experts.0." in hf_name:
+                if not expert_ids:
+                    raise ValueError("GGUF EP rank owns no routed experts")
+                if expert_ids[-1] >= weight.shape[0]:
+                    raise ValueError(
+                        f"expert id {expert_ids[-1]} exceeds fused stack "
+                        f"size {weight.shape[0]} for {hf_name}"
+                    )
+                first = expert_ids[0]
+                if expert_ids == tuple(range(first, first + len(expert_ids))):
+                    weight = weight.narrow(0, first, len(expert_ids))
+                else:
+                    index = torch.tensor(expert_ids, dtype=torch.long)
+                    weight = weight.index_select(0, index)
+                hf_name = hf_name.replace(".experts.0.", f".experts.{first}.", 1)
+            yield hf_name, weight
 
     @staticmethod
     def _unquantized_fused_parents(weight_type_map: dict[str, str]) -> list[str]:

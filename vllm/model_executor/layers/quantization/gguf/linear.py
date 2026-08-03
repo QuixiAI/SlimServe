@@ -119,9 +119,7 @@ def _fused_mul_mat_gguf(
         and x.shape[0] >= _cublas_min_batch(qweight.shape[0])
         and _cublas_dequant_enabled()
     ):
-        weight = _q8_0_dequant_scratch(
-            qweight, qweight.shape[0], x.shape[1], x.dtype
-        )
+        weight = _q8_0_dequant_scratch(qweight, qweight.shape[0], x.shape[1], x.dtype)
         ops.ggml_dequantize_into(
             qweight, qweight_type, weight.shape[0], weight.shape[1], weight
         )
@@ -194,6 +192,8 @@ class GGUFLinearMethod(LinearMethodBase):
                 "data_container": [],
                 "shard_id": [],
                 "shard_id_map": {},
+                "tp_rank": layer.tp_rank,
+                "tp_size": layer.tp_size,
             },
         )
         set_weight_attrs(qweight, extra_weight_attrs)
@@ -212,6 +212,8 @@ class GGUFLinearMethod(LinearMethodBase):
                 "shard_weight_type": {},
                 "num_elements": len(output_partition_sizes),
                 "ignore_warning": True,
+                "tp_rank": layer.tp_rank,
+                "tp_size": layer.tp_size,
             },
         )
         set_weight_attrs(qweight_type, extra_weight_attrs)

@@ -40,10 +40,14 @@ static __device__ __forceinline__ void moe_q(
     token_offs[i / nwarps] = sorted_token_ids[col_dst_0 + threadIdx.y + i];
   }
 
+  // moe_align_block_size marks a block whose expert is not held by this rank
+  // with -1, and that is the only invalid id. The upstream kernel also rejected
+  // ids above 255, which silently zeroed every expert past 255 on checkpoints
+  // with more than 256 experts -- Kimi K3 has 896.
   const int exp_idx = expert_ids[blockIdx.y];
 #ifndef USE_ROCM
   // CUDA callers no longer pre-fill dst; zero this tile before bailing out.
-  if (exp_idx > 255 || exp_idx < 0) {
+  if (exp_idx < 0) {
   #pragma unroll
     for (int j = 0; j < mmq_x; j += nwarps) {
       const int col_dst = token_offs[j / nwarps];
@@ -58,11 +62,14 @@ static __device__ __forceinline__ void moe_q(
     return;
   }
 #else
-  if (exp_idx > 255 || exp_idx < 0) return;
+  if (exp_idx < 0) return;
 #endif
   if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
-  const block_q_t* x = (const block_q_t*)((char*)vx + exp_idx * exp_stride);
+  // One Kimi K3 w13 expert is 5.7 MB, so a 32-bit product overflows from
+  // expert 378 up.
+  const block_q_t* x =
+      (const block_q_t*)((char*)vx + (int64_t)exp_idx * exp_stride);
   const block_q8_1* y = (const block_q8_1*)(vy);
 
   int* tile_x_ql = nullptr;

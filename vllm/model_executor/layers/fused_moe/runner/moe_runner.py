@@ -392,7 +392,13 @@ class MoERunner(MoERunnerInterface):
         shared_output: torch.Tensor | None,
         fused_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
-        """Reduce partial outputs before a nonlinear routed transform."""
+        """Reduce partial outputs before a nonlinear routed transform.
+
+        Sequence-parallel dispatch/combine already returns the complete
+        routed result for each rank's token shard. Shared experts in that
+        mode operate on the same token shard with replicated weights, so both
+        inputs can enter the nonlinear transform without another collective.
+        """
         requires_reduced_input = bool(
             getattr(
                 self.routed_output_transform,
@@ -404,10 +410,7 @@ class MoERunner(MoERunnerInterface):
             return shared_output, fused_output, False
 
         if self.moe_config.is_sequence_parallel:
-            raise NotImplementedError(
-                "Routed output transforms requiring reduced inputs do not "
-                "support sequence parallelism."
-            )
+            return shared_output, fused_output, True
 
         if not self._fused_output_is_reduced and (
             self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1
