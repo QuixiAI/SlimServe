@@ -72,6 +72,8 @@ def _fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    activation_situ_beta: float | None,
+    activation_situ_linear_beta: float | None,
     expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
     activation_enum = MoEActivation.from_str(activation)
@@ -80,7 +82,13 @@ def _fused_moe_gguf(
         d = inp.shape[-1] // 2
         output_shape = inp.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=inp.dtype, device=inp.device)
-        apply_moe_activation(activation_enum, out, inp)
+        apply_moe_activation(
+            activation_enum,
+            out,
+            inp,
+            activation_situ_beta=activation_situ_beta,
+            activation_situ_linear_beta=activation_situ_linear_beta,
+        )
         return out
 
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
@@ -247,6 +255,8 @@ def _fused_moe_gguf_fake(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    activation_situ_beta: float | None,
+    activation_situ_linear_beta: float | None,
     expert_map: torch.Tensor | None,
 ) -> torch.Tensor:
     del (
@@ -257,6 +267,8 @@ def _fused_moe_gguf_fake(
         qweight_type,
         qweight_type2,
         activation,
+        activation_situ_beta,
+        activation_situ_linear_beta,
         expert_map,
     )
     return torch.empty_like(x)
@@ -390,5 +402,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             layer.w13_qweight_type.weight_type,
             layer.w2_qweight_type.weight_type,
             layer.activation.value,
+            self.moe.activation_situ_beta,
+            self.moe.activation_situ_linear_beta,
             layer.expert_map,
         )

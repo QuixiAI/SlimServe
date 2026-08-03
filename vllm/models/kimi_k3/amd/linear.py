@@ -127,6 +127,7 @@ class KimiRoutedOutputTransform(nn.Module):
         super().__init__()
         self.norm = norm
         self.up_proj = up_proj
+        self.requires_reduced_input = norm is not None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.norm is not None:
@@ -232,11 +233,16 @@ class KimiMoE(nn.Module):
         self.routed_expert_up_proj: ReplicatedLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
+            latent_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "gguf"
+                else None
+            )
             self.routed_expert_down_proj = ReplicatedLinear(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_down_proj",
             )
             self.routed_expert_norm = (
@@ -248,7 +254,7 @@ class KimiMoE(nn.Module):
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=latent_quant_config,
                 prefix=f"{prefix}.routed_expert_up_proj",
             )
             self.routed_output_transform = KimiRoutedOutputTransform(

@@ -75,8 +75,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
             use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
             use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
-            use_aiter_allreduce = use_custom_allreduce and bool(
-                rocm_aiter_ops.is_custom_all_reduce_enabled()
+            # AITER's TP6 kernel can issue invalid peer accesses on MI300X.
+            use_aiter_allreduce = (
+                use_custom_allreduce
+                and self.world_size != 6
+                and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
             )
 
         self.use_custom_allreduce = use_custom_allreduce
@@ -99,8 +102,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         config = get_current_vllm_config_or_none()
         has_fixed_kv_budget = bool(
-            config is not None
-            and config.cache_config.kv_cache_memory_bytes is not None
+            config is not None and config.cache_config.kv_cache_memory_bytes is not None
         )
         self._skip_comm_init = bool(
             current_platform.is_rocm()
@@ -209,7 +211,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             QuickAllReduce,
         )
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
-
         from vllm.utils.bootstamp import bootstamp
 
         if self.world_size > 1:

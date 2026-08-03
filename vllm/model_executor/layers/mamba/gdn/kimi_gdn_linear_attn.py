@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from typing import Any
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
@@ -41,6 +43,65 @@ from ..ops.gather_initial_states import gather_initial_states
 
 # Empirical lower bound for the KDA gate to avoid numerical underflow.
 _KDA_GATE_LOGBOUND_MIN = -5.0
+
+
+def _materialize_kda_gate_and_beta(
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    a_log: torch.Tensor,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    gate_input = raw_g.float()
+    if dt_bias is not None:
+        gate_input = gate_input + dt_bias.float().view(
+            1, 1, raw_g.shape[2], raw_g.shape[3]
+        )
+    decay = a_log.float().exp().view(1, 1, -1, 1)
+    if lower_bound is not None:
+        gate = lower_bound * torch.sigmoid(decay * gate_input)
+    else:
+        gate = -decay * F.softplus(gate_input)
+    return gate, raw_beta.float().sigmoid()
+
+
+def _use_recurrent_kda_prefill() -> bool:
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx942
+
+    return on_gfx942()
+
+
+def _get_kda_kernels() -> tuple[
+    Callable[..., Any],
+    Callable[..., Any],
+    Callable[..., Any],
+]:
+    if current_platform.is_rocm():
+        from vllm.models.kimi_k3.amd.ops.third_party.kda import (
+            chunk_kda_with_fused_gate as amd_chunk_kda,
+        )
+        from vllm.models.kimi_k3.amd.ops.third_party.kda import (
+            fused_recurrent_kda as amd_recurrent_kda,
+        )
+        from vllm.models.kimi_k3.amd.ops.third_party.kda import (
+            fused_recurrent_kda_packed_decode as amd_packed_decode,
+        )
+
+        return amd_chunk_kda, amd_recurrent_kda, amd_packed_decode
+
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        chunk_kda_with_fused_gate as nvidia_chunk_kda,
+    )
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        fused_recurrent_kda as nvidia_recurrent_kda,
+    )
+    from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+        fused_recurrent_kda_packed_decode as nvidia_packed_decode,
+    )
+
+    return nvidia_chunk_kda, nvidia_recurrent_kda, nvidia_packed_decode
 
 
 def a_log_weight_loader(
@@ -393,18 +454,11 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # Vendor-specific KDA kernels: AMD/ROCm and NVIDIA keep their own copies
         # under kimi_k3/{amd,nvidia}/ops so each can diverge independently.
-        if current_platform.is_rocm():
-            from vllm.models.kimi_k3.amd.ops.third_party.kda import (
-                chunk_kda_with_fused_gate,
-                fused_recurrent_kda,
-                fused_recurrent_kda_packed_decode,
-            )
-        else:
-            from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
-                chunk_kda_with_fused_gate,
-                fused_recurrent_kda,
-                fused_recurrent_kda_packed_decode,
-            )
+        (
+            chunk_kda_with_fused_gate,
+            fused_recurrent_kda,
+            fused_recurrent_kda_packed_decode,
+        ) = _get_kda_kernels()
 
         assert isinstance(attn_metadata_raw, dict)
         attn_metadata_narrowed = attn_metadata_raw[self.prefix]
@@ -556,30 +610,63 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
                 assert non_spec_state_indices_tensor is not None
                 assert has_initial_state is not None
-                initial_state = gather_initial_states(
-                    recurrent_state,
-                    non_spec_state_indices_tensor,
-                    has_initial_state,
-                )
-                (
-                    core_attn_out_non_spec,
-                    last_recurrent_state,
-                ) = chunk_kda_with_fused_gate(
-                    q=q_ns,
-                    k=k_ns,
-                    v=v_ns,
-                    raw_g=g1_ns,
-                    raw_beta=beta_ns,
-                    A_log=self.A_log,
-                    g_bias=self.dt_bias,
-                    lower_bound=self.gate_lower_bound,
-                    initial_state=initial_state,
-                    output_final_state=True,
-                    use_qk_l2norm_in_kernel=True,
-                    cu_seqlens=non_spec_query_start_loc,
-                )
-                # Init cache
-                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                if _use_recurrent_kda_prefill():
+                    from vllm.third_party.flash_linear_attention.ops.kda import (
+                        fused_recurrent_kda as recurrent_kda_prefill,
+                    )
+
+                    new_state_indices = non_spec_state_indices_tensor[
+                        ~has_initial_state
+                    ]
+                    recurrent_state.index_fill_(0, new_state_indices.long(), 0)
+                    gate, recurrent_beta = _materialize_kda_gate_and_beta(
+                        g1_ns,
+                        beta_ns,
+                        self.A_log,
+                        self.dt_bias,
+                        self.gate_lower_bound,
+                    )
+                    state_indices = non_spec_state_indices_tensor[:, None].expand(
+                        -1, q_ns.shape[1]
+                    )
+                    core_attn_out_non_spec, _ = recurrent_kda_prefill(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        g=gate,
+                        beta=recurrent_beta,
+                        initial_state=recurrent_state,
+                        inplace_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        ssm_state_indices=state_indices,
+                    )
+                else:
+                    initial_state = gather_initial_states(
+                        recurrent_state,
+                        non_spec_state_indices_tensor,
+                        has_initial_state,
+                    )
+                    (
+                        core_attn_out_non_spec,
+                        last_recurrent_state,
+                    ) = chunk_kda_with_fused_gate(
+                        q=q_ns,
+                        k=k_ns,
+                        v=v_ns,
+                        raw_g=g1_ns,
+                        raw_beta=beta_ns,
+                        A_log=self.A_log,
+                        g_bias=self.dt_bias,
+                        lower_bound=self.gate_lower_bound,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                    )
+                    recurrent_state[non_spec_state_indices_tensor] = (
+                        last_recurrent_state
+                    )
 
             else:
                 # pure-decode non-spec batch

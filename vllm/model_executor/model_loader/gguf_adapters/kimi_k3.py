@@ -139,7 +139,56 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
     def prepare_loading(self, model_path: str, model_config: ModelConfig):
         spec = super().prepare_loading(model_path, model_config)
         spec.unquantized_modules.extend(_UNQUANTIZED_MODULES)
+        weight_type_map = self.get_weight_type_map(
+            model_path, spec.gguf_to_hf_name_map or {}
+        )
+        fused_parents = self._unquantized_fused_parents(weight_type_map)
+        logger.info(
+            "kimi-k3 GGUF: %d fused parents marked unquantized (e.g. %s)",
+            len(fused_parents),
+            fused_parents[:2],
+        )
+        spec.unquantized_modules.extend(fused_parents)
         return spec
+
+    @staticmethod
+    def _unquantized_fused_parents(weight_type_map: dict[str, str]) -> list[str]:
+        """Mark parents whose every child tensor is unquantized.
+
+        `get_unquantized_modules` works off checkpoint names, but the model
+        fuses projections the GGUF stores separately -- the KDA block merges
+        six (q/k/v/g/f_a/b) into one `in_proj_qkvgfab`. That fused name is in
+        no checkpoint, and `is_layer_skipped_gguf` only expands fused names it
+        finds in a `packed_modules_mapping`, which Kimi K3 does not declare.
+        So the fused layer was built quantized and blew up reaching for
+        `.weight` on a module that only had `.qweight`.
+
+        Every attention tensor in this release is BF16 or F32 -- 1158 of them,
+        nothing quantized -- so marking the parent is right here. It is
+        derived rather than hardcoded: a future build that quantizes attention
+        stops matching and the layer goes back to the quantized path.
+        """
+        quantized: set[str] = set()
+        unquantized: set[str] = set()
+        for hf_name, weight_type in weight_type_map.items():
+            # Strip `.weight`/`.bias`, then the projection name, leaving the
+            # block that owns it -- `...layers.5.self_attn` for `q_proj`.
+            parent = hf_name.rpartition(".")[0].rpartition(".")[0]
+            if not parent:
+                continue
+            target = unquantized if weight_type in ("F32", "F16", "BF16") else quantized
+            target.add(parent)
+
+        # Drop any candidate that is an ancestor of a quantized block.
+        # `is_layer_skipped_gguf` matches by substring, so a shallow prefix
+        # like `language_model` -- unquantized only because lm_head sits
+        # directly under it -- would match every layer in the model and
+        # silently unquantize the whole MoE.
+        return sorted(
+            parent
+            for parent in unquantized - quantized
+            if not any(q.startswith(f"{parent}.") for q in quantized)
+        )
 
     @staticmethod
     def _find_mmproj(text_gguf: str) -> str:
@@ -193,6 +242,39 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
             )
         return name_map
 
+    @staticmethod
+    def _qk_split_to_interleaved(value: torch.Tensor, num_heads: int) -> torch.Tensor:
+        """Restore K3's native interleaved 2D-RoPE Q/K layout.
+
+        llama.cpp stores the Q and K rows in split ``[x | y]`` order, while
+        the MoonViT implementation applies RoPE to native interleaved
+        ``[x0, x1, y0, y1, ...]`` groups. V is not rotary and stays unchanged.
+        """
+        rows = value.shape[0]
+        if rows % 3 != 0:
+            raise RuntimeError(f"fused qkv first dim {rows} is not divisible by 3")
+        part = rows // 3
+        head_dim = part // num_heads
+        if part % num_heads != 0 or head_dim % 4 != 0:
+            raise RuntimeError(
+                f"invalid fused qkv layout: part={part}, heads={num_heads}"
+            )
+
+        half = head_dim // 2
+        index = torch.empty(head_dim, dtype=torch.long)
+        for offset in range(half // 2):
+            index[4 * offset] = 2 * offset
+            index[4 * offset + 1] = 2 * offset + 1
+            index[4 * offset + 2] = half + 2 * offset
+            index[4 * offset + 3] = half + 2 * offset + 1
+
+        def convert(block: torch.Tensor) -> torch.Tensor:
+            tail = block.shape[1:]
+            return block.view(num_heads, head_dim, *tail)[:, index].reshape(part, *tail)
+
+        query, key, value_rows = value.split(part, dim=0)
+        return torch.cat((convert(query), convert(key), value_rows))
+
     def prepare_weights(
         self, model_config: ModelConfig
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -205,8 +287,12 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
 
         yield from super().prepare_weights(model_config)
 
-        mmproj = self._find_mmproj(self.load_spec.weights_source[0])
+        load_spec = self.load_spec
+        assert load_spec is not None
+        mmproj = self._find_mmproj(load_spec.weights_source[0])
         name_map = self._vision_name_map(mmproj)
+        vision_config = model_config.hf_config.vision_config
+        num_heads = int(vision_config.num_attention_heads)
         logger.info("kimi-k3: loading %d vision tensors from %s", len(name_map), mmproj)
         for tensor in gguf_reader(mmproj).tensors:
             hf_name = name_map.get(tensor.name)
@@ -215,4 +301,6 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
             value = torch.from_numpy(
                 gguf.quants.dequantize(tensor.data, tensor.tensor_type)
             )
+            if tensor.name.endswith(".attn_qkv.weight"):
+                value = self._qk_split_to_interleaved(value, num_heads)
             yield hf_name, value.to(torch.bfloat16)

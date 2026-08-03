@@ -138,7 +138,11 @@ class KimiK3ForConditionalGeneration(
     def _maybe_ignore_quant_config(
         self, quant_config: QuantizationConfig | None
     ) -> QuantizationConfig | None:
-        if isinstance(quant_config, compressed_tensors.CompressedTensorsConfig):
+        if (
+            isinstance(quant_config, compressed_tensors.CompressedTensorsConfig)
+            or quant_config is not None
+            and quant_config.get_name() == "gguf"
+        ):
             return None
         return quant_config
 

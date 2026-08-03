@@ -8,6 +8,7 @@ from typing import Literal
 import torch
 
 from vllm.config import VllmConfig
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -36,6 +37,42 @@ class GDNAttentionBackend(AttentionBackend):
     @classmethod
     def is_ssm(cls) -> bool:
         return True
+
+
+def _resolve_gdn_prefill_backend(
+    vllm_config: VllmConfig,
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+    additional_config = vllm_config.additional_config
+    backend_cfg = (
+        additional_config.get("gdn_prefill_backend", "auto")
+        if isinstance(additional_config, dict)
+        else "auto"
+    )
+    backend = str(backend_cfg).strip().lower()
+
+    if not current_platform.is_cuda():
+        return backend, "triton"
+
+    head_k_dim = getattr(
+        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
+    )
+    if current_platform.is_device_capability(90):
+        supports_flashinfer = True
+        supports_cutedsl = False
+    elif (
+        current_platform.is_device_capability_family(100)
+        and head_k_dim == 128
+        and current_platform.get_cuda_runtime_major() >= 13
+    ):
+        supports_flashinfer = supports_cutedsl = True
+    else:
+        supports_flashinfer = supports_cutedsl = False
+
+    if backend in ["flashinfer", "auto"] and supports_flashinfer:
+        return backend, "flashinfer"
+    if backend == "cutedsl" and supports_cutedsl:
+        return backend, "cutedsl"
+    return backend, "triton"
 
 
 @dataclass
@@ -96,9 +133,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.compilation_config = vllm_config.compilation_config
         self.speculative_config = vllm_config.speculative_config
         self.kv_cache_spec = kv_cache_spec
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            _resolve_gdn_prefill_backend,
-        )
 
         self.gdn_prefill_backend: Literal["triton", "flashinfer", "cutedsl"]
         _, self.gdn_prefill_backend = _resolve_gdn_prefill_backend(vllm_config)

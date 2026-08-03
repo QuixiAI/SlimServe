@@ -350,6 +350,10 @@ def build_kimi_k3_tokenizer_from_gguf(gguf_path: str):
         unk_token="[UNK]",
         added_tokens_decoder=added,
     )
+    # vLLM resolves a template before calling the tokenizer. K3 renders XTML
+    # in its apply_chat_template override, so provide a non-empty sentinel;
+    # the override intentionally ignores the resolved Jinja string.
+    tokenizer.chat_template = "{# Rendered by TikTokenTokenizer.apply_chat_template. #}"
     logger.info(
         "Kimi K3 tokenizer: %d tokens (%d base + %d special)",
         tokenizer.vocab_size,
