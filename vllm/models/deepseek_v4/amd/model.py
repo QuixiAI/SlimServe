@@ -520,9 +520,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
-        self.topk_indices_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            config.index_topk,
+        # Seeded with the -1 "no token" sentinel rather than left uninitialized:
+        # the per-step reset only covers [:hidden_states.shape[0]], while the
+        # decode path slices [:num_padded_tokens], so padded rows would
+        # otherwise carry whatever was in the allocation and index real KV
+        # slots.
+        self.topk_indices_buffer = torch.full(
+            (
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.index_topk,
+            ),
+            -1,
             dtype=torch.int32,
             device=self.device,
         )

@@ -84,7 +84,7 @@
         "MXFP4": {
           "title": "MXFP4Experts (0731)",
           "bytes": 155976458848,
-          "summary": "Routed experts in OCP MXFP4, read through this fork's own HIP dequant, GEMV and MMQ tile kernels. Smallest of the two four-GPU builds, and the only one without imatrix calibration -- measurably weaker at arithmetic than Q4_K, which is why Q4_K is the default.",
+          "summary": "The tuned path. Routed experts in OCP MXFP4, read through this fork's own HIP dequant, GEMV and MMQ tile kernels, and the smaller of the two four-GPU builds.",
           "min_gpus": {"mi300x": 4},
           "files": [
             {"path": "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf", "bytes": 155976458848}
@@ -288,6 +288,7 @@
         "attention_config": {"sparse_mla_force_mqa": true},
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
       "speculative": false,
@@ -295,7 +296,8 @@
       "notes": [
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget."
+        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     },
 
@@ -304,14 +306,15 @@
       "source": "dsv4-flash",
       "gpus": 4,
       "platforms": ["mi300x"],
-      "default_quant": "Q4_K",
-      "summary": "Text only. Four cards fit the larger expert quants.",
+      "default_quant": "MXFP4",
+      "summary": "Text only. Four cards fit every expert quant, including the tuned MXFP4 build.",
       "engine": {
         "tensor_parallel_size": 4,
         "block_size": 256,
         "attention_config": {"sparse_mla_force_mqa": true},
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
       "speculative": false,
@@ -319,7 +322,8 @@
       "notes": [
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget."
+        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     },
 

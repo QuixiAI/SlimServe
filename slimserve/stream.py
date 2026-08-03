@@ -103,8 +103,10 @@ def chat_completion(
                 continue
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
-                # Reasoning models split the two; show thinking as it happens.
-                for key in ("reasoning_content", "content"):
+                # Reasoning models split the reply across fields, and which
+                # name carries it depends on the parser. Missing one of these
+                # shows an empty answer for a model that in fact replied.
+                for key in ("reasoning_content", "reasoning", "content"):
                     piece = delta.get(key)
                     if piece:
                         yield piece

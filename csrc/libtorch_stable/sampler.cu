@@ -1,3 +1,5 @@
+#include <climits>
+
 #include "../cuda_compat.h"
 #include "dispatch_utils.h"
 #include "torch_utils.h"
@@ -409,6 +411,16 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   if (threadIdx.x == 0) {
     smemFinalDstIdx[0] = 0;
     smemFoundTopKValues[0] = 0;
+    // A histogram pass writes these two only when it finds a bin that straddles
+    // topK. If a pass finds none they are read anyway, and LDS is not zeroed at
+    // workgroup launch on CDNA, so the read returns whatever the previous
+    // kernel on that CU left behind -- a process- and schedule-dependent value
+    // that then decides which elements are selected. Seed them so that case
+    // selects nothing and leaves the -1 sentinels below in place: bin 0 admits
+    // no `binIdx < thresholdBinIdx`, and a bin size past kNumFinalItems keeps
+    // the final-items path from running with an unknown count.
+    smemThresholdBinIdx[0] = 0;
+    smemFinalBinSize[0] = INT_MAX;
   }
   // The histogram passes below fill smemOutput only up to the number of
   // candidates they actually select, which can fall short of topK when the
