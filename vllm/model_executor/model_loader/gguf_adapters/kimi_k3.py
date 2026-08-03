@@ -43,6 +43,31 @@ _EXPERT_RENAMES = {
 
 _LM_PREFIX = "language_model."
 
+# Vision half, from the sibling mmproj. The tower is the (config-driven)
+# Kimi-K2.5 MoonViT, so the module names are that implementation's; K3 only
+# differs in what the config asks it for -- rmsnorm, an asymmetric 1536-wide
+# QKV and an output-side projector norm.
+_VISION_BLOCK_RENAMES = {
+    "ln1.weight": "norm0.weight",
+    "ln2.weight": "norm1.weight",
+    "attn_qkv.weight": "wqkv.weight",
+    "attn_out.weight": "wo.weight",
+    "ffn_up.weight": "mlp.fc0.weight",
+    "ffn_down.weight": "mlp.fc1.weight",
+}
+
+_VISION_GLOBAL_RENAMES = {
+    "v.patch_embd.weight": "vision_tower.patch_embed.proj.weight",
+    "v.position_embd.weight": "vision_tower.patch_embed.pos_emb.weight",
+    "v.post_ln.weight": "vision_tower.encoder.final_layernorm.weight",
+    # patchmergerv2: two projections and a norm on the output side.
+    "mm.1.weight": "mm_projector.linear_1.weight",
+    "mm.2.weight": "mm_projector.linear_2.weight",
+    "mm.post_norm.weight": "mm_projector.post_norm.weight",
+}
+
+_VISION_BLK_RE = re.compile(r"^v\.blk\.(\d+)\.(.+)$")
+
 # lm_head is BF16 in the file and feeds a module built unquantized, so it must
 # be dequantized rather than renamed to `.qweight`.
 _UNQUANTIZED_MODULES = ("lm_head",)
@@ -116,7 +141,78 @@ class KimiK3GGUFAdapter(GGUFWeightsAdapter):
         spec.unquantized_modules.extend(_UNQUANTIZED_MODULES)
         return spec
 
+    @staticmethod
+    def _find_mmproj(text_gguf: str) -> str:
+        """Locate the vision projector beside the text GGUF, or one level up.
+
+        ``VLLM_GGUF_MMPROJ`` overrides. Otherwise prefer the BF16 build: the
+        released vision weights are BF16, so it is the identity encoding,
+        while the F16 build is a conversion away from them that gains nothing
+        (its extra mantissa bits are zero-filled from a BF16 source) and puts
+        ~0.2% of weights below F16's smallest normal.
+        """
+        import glob
+        import os
+
+        override = os.environ.get("VLLM_GGUF_MMPROJ")
+        if override:
+            if not os.path.isfile(override):
+                raise RuntimeError(f"VLLM_GGUF_MMPROJ does not exist: {override}")
+            return override
+
+        text_dir = os.path.dirname(os.path.abspath(text_gguf))
+        for directory in (text_dir, os.path.dirname(text_dir)):
+            hits = sorted(glob.glob(os.path.join(directory, "mmproj*.gguf")))
+            if not hits:
+                continue
+            preferred = [h for h in hits if "bf16" in os.path.basename(h).lower()]
+            return (preferred or hits)[0]
+        raise RuntimeError(
+            f"no mmproj*.gguf beside {text_dir} or its parent; Kimi K3 keeps "
+            "its vision half there and there is no other source"
+        )
+
+    def _vision_name_map(self, mmproj: str) -> dict[str, str]:
+        name_map = dict(_VISION_GLOBAL_RENAMES)
+        unmapped: list[str] = []
+        for tensor in gguf_reader(mmproj).tensors:
+            name = tensor.name
+            if name in _VISION_GLOBAL_RENAMES:
+                continue
+            match = _VISION_BLK_RE.match(name)
+            suffix = _VISION_BLOCK_RENAMES.get(match.group(2)) if match else None
+            if suffix is None:
+                unmapped.append(name)
+                continue
+            block = int(match.group(1))
+            name_map[name] = f"vision_tower.encoder.blocks.{block}.{suffix}"
+        if unmapped:
+            raise RuntimeError(
+                f"kimi-k3 mmproj {mmproj}: {len(unmapped)} unmapped tensors, "
+                f"e.g. {unmapped[:3]}"
+            )
+        return name_map
+
     def prepare_weights(
         self, model_config: ModelConfig
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return super().prepare_weights(model_config)
+        """Text weights from the backbone, vision weights from the mmproj.
+
+        The tower is built unquantized, so its tensors are dequantized here
+        rather than handed to the loader under `.qweight` names.
+        """
+        import gguf
+
+        yield from super().prepare_weights(model_config)
+
+        mmproj = self._find_mmproj(self.load_spec.weights_source[0])
+        name_map = self._vision_name_map(mmproj)
+        logger.info("kimi-k3: loading %d vision tensors from %s", len(name_map), mmproj)
+        for tensor in gguf_reader(mmproj).tensors:
+            hf_name = name_map.get(tensor.name)
+            if hf_name is None:
+                continue
+            value = torch.from_numpy(
+                gguf.quants.dequantize(tensor.data, tensor.tensor_type)
+            )
+            yield hf_name, value.to(torch.bfloat16)
