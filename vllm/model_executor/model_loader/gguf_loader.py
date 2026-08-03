@@ -21,6 +21,9 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.ep_weight_filter import (
+    compute_local_expert_ids,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -72,6 +75,7 @@ class GGUFModelLoader(BaseModelLoader):
         # was itself built from the GGUF, so the architecture string is the one
         # authority both agree on.
         architecture = gguf_architecture(path)
+        adapter_cls: type
         if architecture == "deepseek4":
             adapter_cls = Deepseek4GGUFAdapter
         elif architecture == "kimi-k3":
@@ -80,7 +84,49 @@ class GGUFModelLoader(BaseModelLoader):
             adapter_cls = GlmDsaGGUFAdapter
         adapter = adapter_cls(model_config.hf_config)
         adapter.prepare_loading(self._gguf_path(model_config), model_config)
+        if architecture == "kimi-k3":
+            self._configure_ep_expert_shard(adapter, model_config)
         return adapter
+
+    @staticmethod
+    def _configure_ep_expert_shard(adapter, model_config: ModelConfig) -> None:
+        """Give GGUF adapters the global expert ids owned by this EP rank."""
+        from vllm.config import get_current_vllm_config
+        from vllm.distributed import (
+            get_dp_group,
+            get_pcp_group,
+            get_tensor_model_parallel_rank,
+        )
+
+        parallel_config = get_current_vllm_config().parallel_config
+        if not model_config.is_moe or not parallel_config.enable_expert_parallel:
+            return
+        if parallel_config.enable_eplb:
+            raise ValueError("Fused GGUF expert loading does not support EPLB")
+
+        dp_size = parallel_config.data_parallel_size
+        pcp_size = parallel_config.prefill_context_parallel_size
+        tp_size = parallel_config.tensor_parallel_size
+        dp_rank = get_dp_group().rank_in_group if dp_size > 1 else 0
+        pcp_rank = get_pcp_group().rank_in_group if pcp_size > 1 else 0
+        tp_rank = get_tensor_model_parallel_rank() if tp_size > 1 else 0
+        ep_size = dp_size * pcp_size * tp_size
+        ep_rank = dp_rank * pcp_size * tp_size + pcp_rank * tp_size + tp_rank
+        local_expert_ids = compute_local_expert_ids(
+            model_config.get_num_experts(),
+            ep_size,
+            ep_rank,
+            placement=parallel_config.expert_placement_strategy,
+        )
+        adapter.set_local_expert_ids(local_expert_ids)
+        if local_expert_ids is not None:
+            logger.info_once(
+                "GGUF EP shard: ep_size=%d, ep_rank=%d, loading %d/%d experts",
+                ep_size,
+                ep_rank,
+                len(local_expert_ids),
+                model_config.get_num_experts(),
+            )
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._gguf_path(model_config)

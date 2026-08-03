@@ -3,6 +3,7 @@
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
+
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -230,9 +231,25 @@ def _gguf_moe_weight_type_loader(
 class _GGUFParamLoadMixin:
     """Mixin providing GGUF parameter weight loading methods."""
 
+    def _store(
+        self,
+        loaded_weight: torch.Tensor,
+        shard_id: int | str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def _get_tp_rank_and_size(self) -> tuple[int, int]:
+        tp_rank = getattr(self, "tp_rank", None)
+        tp_size = getattr(self, "tp_size", None)
+        if tp_rank is None or tp_size is None:
+            return (
+                get_tensor_model_parallel_rank(),
+                get_tensor_model_parallel_world_size(),
+            )
+        return tp_rank, tp_size
+
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank, tp_size = self._get_tp_rank_and_size()
         if tp_size > 1 and loaded_weight.ndim >= 1:
             shard_size = loaded_weight.shape[0] // tp_size
             if shard_size > 0:
@@ -242,8 +259,7 @@ class _GGUFParamLoadMixin:
         self._store(loaded_weight)
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
-        tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank, tp_size = self._get_tp_rank_and_size()
         if tp_size > 1 and loaded_weight.ndim >= 2:
             shard_size = loaded_weight.shape[1] // tp_size
             if shard_size > 0:
@@ -253,13 +269,8 @@ class _GGUFParamLoadMixin:
         self._store(loaded_weight)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
-        # The rank comes from the process group, never from kwargs: vLLM's
-        # MergedColumnParallelLinear.weight_loader_v2 passes only shard_id,
-        # shard_offset and shard_size. Reading a "tp_rank" kwarg made every rank
-        # narrow to rows [0:shard_size], so both ranks held the same half of
-        # gate/up and intermediate columns [6144:12288] were never computed.
         shard_id = kwargs.get("shard_id")
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank, _ = self._get_tp_rank_and_size()
         shard_size = kwargs.get("shard_size")
         if (
             shard_size is not None
@@ -276,7 +287,7 @@ class _GGUFParamLoadMixin:
         # shard (num_heads == tp_size, e.g. index_k) lands on rank 0 for all
         # ranks. Special-casing only ("k", "v") left index_k/index_q unscaled.
         shard_id = kwargs.get("shard_id")
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_rank, _ = self._get_tp_rank_and_size()
         shard_size = kwargs.get("shard_size")
         num_heads = kwargs.get("num_heads", 1)
         if (

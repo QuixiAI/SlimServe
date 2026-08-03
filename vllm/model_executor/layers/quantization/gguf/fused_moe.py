@@ -404,5 +404,5 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             layer.activation.value,
             self.moe.activation_situ_beta,
             self.moe.activation_situ_linear_beta,
-            layer.expert_map,
+            layer.global_to_local_expert_map,
         )

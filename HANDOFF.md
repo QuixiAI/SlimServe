@@ -2,7 +2,282 @@
 
 Updated: 2026-08-03 UTC
 
-## Status
+## Resume here: DP4xTP2 attention + EP8 MoE (semantics fixed)
+
+DP4xTP2/EP8 now produces coherent text and vision output that matches the TP6
+baseline's semantic facts. The previous incoherence had a single cause, and it
+was not the sequence-parallel design: under expert parallelism the GGUF MoE
+kernel was handed AITER's 0/1 residency mask where it expected the
+global-to-local expert map.
+
+Diagnosing that turned up a second, independent kernel defect that had been
+degrading the TP6 baseline all along -- the MMQ tile kernel refused expert ids
+above 255, so 71% of Kimi's experts were zeroed at prefill width. Both are
+described under "Root semantic defects" 5 and 6 below; the second one needs a
+rebuilt `_C_stable_libtorch.abi3.so`, which is already in place.
+
+The work is still uncommitted and still needs the human line-by-line review
+`AGENTS.md` requires.
+
+### Objective and topology
+
+Run Kimi K3 as four request replicas with TP2 attention and EP8 routed MoE:
+
+- attention/KDA/MLA stay TP2 within each request's GPU pair;
+- MoE sequence-parallelizes the replicated TP2 token stream;
+- all eight ranks own 112 of 896 complete routed experts each;
+- embeddings, attention, latent projections, router, shared expert, vision
+  tower, and mmproj remain replicated as required by their parallel axis.
+
+This is the memory-safe fallback for this quantized GGUF. Pure DP8 cannot fit
+the replicated byte set; padded attention TP8 does not improve unique latent
+KV capacity.
+
+### Uncommitted implementation
+
+The following changes are present in the working tree:
+
+- `vllm/model_executor/layers/fused_moe/runner/moe_runner.py`
+  - allows a routed output transform with `requires_reduced_input=True` in
+    sequence-parallel mode;
+  - treats EP reduce-scatter output as complete for the local token shard, so
+    K3's RMSNorm is applied after expert contributions have been combined.
+- `vllm/models/kimi_k3/amd/linear.py`
+  - enables FusedMoE sequence parallelism from
+    `ParallelConfig.use_sequence_parallel_moe`;
+  - chunks tokens across the TP2 pair before routing and gathers them after
+    MoE, trimming sequence-padding tokens;
+  - builds the shared expert with `disable_tp=True`, because it operates on a
+    token shard and therefore needs complete replicated weights.
+- `vllm/model_executor/model_loader/gguf_adapters/base.py`
+  - lets an adapter receive the sorted global expert IDs assigned to its rank.
+- `vllm/model_executor/model_loader/gguf_loader.py`
+  - computes the flattened EP rank exactly like `FusedMoEParallelConfig`;
+  - configures rank-local fused-stack loading for Kimi K3 only;
+  - rejects Kimi K3 fused GGUF loading with EPLB because redundant physical
+    expert population has not been implemented.
+- `vllm/model_executor/model_loader/gguf_adapters/kimi_k3.py`
+  - slices each fused 3D expert stack down to the rank-local expert rows before
+    device upload;
+  - uses an mmap-sharing `narrow` for contiguous linear placement and
+    `index_select` for round-robin placement;
+  - renames the synthetic expert-0 anchor to the first global expert in the
+    local stack so Kimi's existing expert mapping invokes the full-stack load.
+- `vllm/model_executor/layers/quantization/gguf/{linear.py,params.py}`
+  - makes GGUF parameter loaders honor the parameter/layer `tp_rank` and
+    `tp_size` instead of always consulting the global TP group;
+  - this is required for `disable_tp=True` shared experts. Before the fix, a
+    replicated shared-expert weight was silently narrowed to half width and
+    the profile run ended in a HIP illegal-memory access.
+- `vllm/model_executor/layers/fused_moe/routed_experts.py`
+  - adds `global_to_local_expert_map`, which always returns the real map.
+    `expert_map` degrades to AITER's 0/1 mask whenever AITER's fused MoE is
+    enabled, and a kernel that *indexes* its local stack cannot use that.
+- `vllm/model_executor/layers/quantization/gguf/fused_moe.py`
+  - indexes experts with that map instead of `expert_map`.
+- `csrc/libtorch_stable/quantization/gguf/moe.cuh`
+  - stops rejecting expert ids above 255 in the MMQ tile kernel, and widens the
+    expert byte offset to 64 bits.
+- `tests/model_executor/test_kimi_k3_ep.py` (new)
+  - eleven focused tests for nonlinear SP combine semantics, contiguous and
+    round-robin fused-stack localization, invalid expert IDs, zero/odd token
+    chunk-and-gather behavior, replicated versus sharded GGUF row and
+    merged-column loading, and map-versus-mask expert indexing.
+
+Do not discard these changes. The configured Git remote is already correct:
+`origin` and `slimserve` both point to
+`git@github.com:QuixiAI/SlimServe.git`; `upstream` points to vLLM.
+
+### Validation completed
+
+Focused validation is green:
+
+```text
+.venv/bin/python -m pytest tests/model_executor/test_kimi_k3_ep.py -v
+8 passed in 10.46s
+
+.venv/bin/python -m compileall -q <changed Python files>
+passed
+
+pre-commit run --files <changed files and focused test>
+ruff, format, typos, mypy, SPDX, forbidden imports, and config checks passed
+
+git diff --check
+passed
+```
+
+The final one-line loader scoping edit (Kimi-only configuration) happened
+after that hook run, so rerun the focused tests and hooks before committing.
+
+The real 858 GB DP4xTP2/EP8 startup now succeeds repeatedly:
+
+- every rank reports `loading 112/896 experts`;
+- per-rank model memory is 145.17 GiB;
+- weight load, multimodal profile, 512-token LM profile, hybrid KV allocation,
+  sampler warmup, KDA/MLA prefill and decode, and EP collectives all complete;
+- with `max_num_batched_tokens=512`, each request pair gets 16,384 cache
+  tokens and reports 2.0x concurrency at an 8,192-token maximum length;
+- all three requests and shutdown complete with process exit code 0;
+- GPUs return to their approximately 298 MB idle baseline afterward.
+
+The five requested images are still available at:
+
+```text
+/tmp/testimg/yosemite.png
+/tmp/testimg/picsum1.jpg
+/tmp/testimg/picsum2.jpg
+/tmp/testimg/wolfram.png
+/tmp/testimg/jogging.jpg
+```
+
+An untracked temporary runner, `.tmp_kimi_ep_smoke.py`, launches four external
+DP controller processes with TP2 each. Keep it while diagnosing, then delete it
+before committing. Run it with:
+
+```bash
+HSA_XNACK=1 \
+VLLM_USE_V1=1 \
+VLLM_ROCM_USE_AITER=1 \
+VLLM_GGUF_MMPROJ=/home/hotaisle/models/antirez-kimi-k3-gguf/mmproj-BF16.gguf \
+ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+.venv/bin/python -u .tmp_kimi_ep_smoke.py
+```
+
+The harness must pass K3's mode as
+`chat_template_kwargs={"thinking": False}`. `LLM.chat` does **not** accept a
+top-level `thinking=False` argument in this checkout. A first mechanical run
+left thinking enabled and exhausted the output cap on reasoning markers; that
+was a harness error, not a useful semantic test.
+
+### EP8 semantic result
+
+The three-turn/five-image run with the text gates added to rank 1 completed
+with exit code 0 and answers that carry the TP6 baseline's facts:
+
+```text
+rank 1: 2 + 2                -> 4
+rank 1: capital of France    -> Paris
+rank 1: largest ocean        -> Pacific Ocean
+rank 0 turn 1 (1961 prompt tokens): Yosemite Valley, El Capitan, granite
+        cliffs and river, versus the snowy mountain
+rank 0 turn 2 (3867 prompt tokens): weathered wooden bench against the
+        two-toned distressed wall
+rank 0 turn 3 (4402 prompt tokens, stop): three people jogging, and recalls
+        five people in the earlier family image
+```
+
+Turns 1 and 2 stop at the 96-token cap mid-description because K3 answers in
+detailed markdown here; that is the harness cap, not truncation of meaning.
+Raise `max_tokens` if a run needs the complete turn-2 answer.
+
+The run was repeated after the MMQ kernel rebuild described below and produced
+the same answers with exit code 0, as expected: under EP8 each rank sees local
+expert ids 0-111, so the 255 ceiling never applied there.
+
+### The bug that caused the incoherence
+
+`RoutedExperts.expert_map` does not always return the expert map. When AITER's
+fused MoE is enabled -- the default on ROCm, and the validated invocation sets
+`VLLM_ROCM_USE_AITER=1` -- it returns AITER's `expert_mask` instead: a 0/1
+residency vector of length `global_num_experts + 1`.
+
+The GGUF MoE kernel indexes with that tensor (`expert_map[topk_ids]`), so every
+routed token was sent to local expert 0 or 1 out of 112, and
+`moe_align_block_size` was told there were 897 global experts. TP6 was immune
+because EP is off there and the tensor is `None`.
+
+`global_to_local_expert_map` now exposes the real map and the GGUF method uses
+it. Only the GGUF method was changed: the other quantization methods that pass
+`layer.expert_map` on ROCm dispatch into AITER kernels, which want the mask —
+`vllm/model_executor/layers/fused_moe/experts/aiter_mxfp8_moe.py` handles both
+forms explicitly. Anything new that indexes a local expert stack on this fork
+should take the map property, not `expert_map`.
+
+Numbers from the single-GPU oracle over `blk.1`'s real GGUF stacks, 96
+experts spanning all eight ranks, against a dequantized f32 reference (relative
+mean error; 1.8e-1 is this reference's own IQ2_XXS/Q2_K quantization floor):
+
+```text
+decode/vec    eight 112-expert shards summed   1.8e-1   (at the floor)
+decode/vec    mask instead of map              6.4e+00
+prefill/mmq   eight 112-expert shards summed   1.8e-1   (at the floor)
+prefill/mmq   mask instead of map              6.1e+00
+```
+
+### A second, independent defect: MMQ dropped experts above 255
+
+The same oracle showed the *non*-EP prefill path failing where the EP path
+passed: a single 896-expert call scored 8.1e-1 against the same reference while
+the eight-shard sum scored 1.8e-1.
+
+`moe_q` in `csrc/libtorch_stable/quantization/gguf/moe.cuh` rejected any
+`exp_idx > 255`, inherited from upstream's original GGUF MoE kernel
+(vllm-project/vllm#14613). The only invalid id `moe_align_block_size` produces
+is `-1`, so the ceiling silently zeroed experts 256-895 -- 71% of Kimi's
+experts -- in every MMQ (prefill-width) MoE call whenever global ids reach the
+kernel. That is exactly the TP6 configuration, so **the TP6 baseline's prefill
+was itself degraded**; its decode path uses the vector kernel and was correct,
+which is why it still read as coherent.
+
+The ceiling also masked a 32-bit overflow: one Kimi w13 expert is 5.7 MB, so
+`exp_idx * exp_stride` overflows `int` from expert 378 up. The fix drops the
+ceiling and widens that product to `int64_t`.
+
+Reproduce with a synthetic Q8_0 stack of 896 experts routed both below and
+above 255, comparing `ggml_moe_a8` against `ggml_moe_a8_vec` and a dequantized
+reference. Before the fix, every id above 255 returned exactly zero from the
+MMQ path while the vector path was correct; after it, MMQ and vector agree to
+the shared q8_1 activation-quantization floor (5.6e-3). On the real `blk.1`
+stacks the single full 896-expert prefill call went from 8.1e-1 to 1.8e-1,
+matching the eight-shard sum exactly.
+
+TP6 was re-run on the rebuilt kernel with the same prompts and images
+(`max_tokens=256`, exit code 0). Text gates still return `4` and `Paris.`, and
+the vision answers are substantially richer than the ones recorded further down
+this document:
+
+```text
+turn 1 (1961 prompt tokens, 232 out, stop): names El Capitan *and* the
+        Cathedral Rocks / Bridalveil side
+turn 2 (4007 prompt tokens, 209 out, stop): reads "ESPERANÇA" off the sign,
+        and counts and describes all five family members individually
+turn 3 (4659 prompt tokens, 110 out, stop): three joggers, recalls five
+```
+
+The old baseline's 74/45/39-token answers were produced under a different
+output cap, so treat the length change as suggestive rather than measured. The
+per-expert detail is the substantive difference.
+
+Note for whoever edits these kernels next: the hipify ninja rule depends only
+on the `.cu` list, so editing a `.cuh` alone neither re-hipifies nor rebuilds,
+and the build still exits 0 shipping the old `.so`. Re-run hipify by hand,
+delete the stale `.hip.o`, `ninja _C_stable_libtorch`, then copy the result
+over `vllm/_C_stable_libtorch.abi3.so` -- ninja links into `build/temp/`, but
+the importable module is the copy under `vllm/`. About 90 seconds end to end.
+
+```bash
+cd build/temp.linux-x86_64-cpython-312
+~/.venv/bin/python ../../cmake/hipify.py -p ../../csrc -o ./csrc \
+  csrc/libtorch_stable/quantization/gguf/gguf_kernel.cu
+rm CMakeFiles/_C_stable_libtorch.dir/csrc/libtorch_stable/quantization/gguf/\
+gguf_kernel.hip.o
+ninja _C_stable_libtorch
+cp _C_stable_libtorch.abi3.so ../../vllm/
+```
+
+### Finish criteria
+
+- [x] text gates return `4` and `Paris`;
+- [x] the three-turn test correctly identifies the two landscapes, bench/wall,
+  family of five, and three runners while recalling the family count;
+- [x] focused tests, compilation, pre-commit, and `git diff --check` pass
+  (11 focused tests; ruff, format, typos, clang-format, markdownlint, mypy,
+  SPDX, lazy imports, forbidden imports, and config checks);
+- [ ] remove `.tmp_kimi_ep_smoke.py`;
+- [ ] human-review every changed line before any commit or push, per
+  `AGENTS.md`.
+
+## TP6 baseline status
 
 **Working end to end.** SlimServe loads the 858 GB
 `Kimi-K3-IQ2_XXS-Q2_K.gguf` with the BF16 vision projector on six MI300X
@@ -23,6 +298,10 @@ A sequential three-user-turn multimodal validation also completed with all five
 requested images, preserved assistant history, and exit code 0. The model
 correctly identified both landscapes, the weathered bench scene, the family of
 five, and three people running.
+
+The numbers in this section predate the MMQ expert-id fix, so they describe a
+TP6 whose prefill was dropping every expert above 255. See the re-run recorded
+under "A second, independent defect" above for current behaviour.
 
 The source changes and this handoff are published together for human review.
 
@@ -186,6 +465,21 @@ safetensors; block 0's pre-fix maximum error was `2.34375`, and its post-fix
 error is `0.0`. The full three-turn image run above then produced the expected
 semantics.
 
+### 5. The GGUF MoE kernel was handed AITER's residency mask under EP
+
+`RoutedExperts.expert_map` returns AITER's 0/1 `expert_mask` instead of the
+global-to-local map whenever AITER's fused MoE is enabled. The GGUF kernel
+indexes its local expert stack with that tensor, so under EP every routed token
+went to local expert 0 or 1. `global_to_local_expert_map` now returns the real
+map unconditionally. See "The bug that caused the incoherence" above for the
+oracle numbers.
+
+### 6. The MMQ tile kernel refused expert ids above 255
+
+Inherited from upstream's GGUF MoE kernel. Kimi has 896 experts, so 71% of them
+were silently zeroed in every prefill-width MoE call that saw global ids -- the
+TP6 configuration. See "A second, independent defect" above.
+
 ## Other required working-tree fixes
 
 - `vllm/models/kimi_k3/common/mm_preprocess.py`: build preprocessing from the
@@ -270,6 +564,12 @@ vision weights are BF16.
   desired reasoning/content parser settings when exposing the OpenAI endpoint.
 - Full mypy was not run. Final ruff/compile/diff checks are recorded at handoff
   time after the last source change.
+- The MMQ expert-id fix lives in a `.cuh`, so a fresh clone must rebuild the
+  stable-ABI extension before it takes effect; a stale `_C_stable_libtorch`
+  silently reinstates the 255-expert ceiling.
+- Both fixes affect any GGUF MoE checkpoint with more than 256 experts, not
+  only Kimi K3. DeepSeek-V4 (256 experts) sits exactly at the old boundary and
+  was unaffected; GLM-5.2 has 160.
 - No duplicate-work/PR checks were run because no PR to upstream was proposed
   or opened. A human must review every changed line and run the relevant tests
   before submitting anything upstream.

@@ -28,6 +28,13 @@ class BaseGGUFWeightsAdapter(ABC):
 
     def __init__(self, config: PretrainedConfig) -> None:
         self.config = config
+        self.local_expert_ids: tuple[int, ...] | None = None
+
+    def set_local_expert_ids(self, expert_ids: set[int] | None) -> None:
+        """Configure the global expert ids assigned to this loading rank."""
+        self.local_expert_ids = (
+            tuple(sorted(expert_ids)) if expert_ids is not None else None
+        )
 
     @classmethod
     @abstractmethod
