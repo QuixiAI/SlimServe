@@ -294,6 +294,15 @@ __device__ bool processHistogramStep(
       } else {
         if (binIdx == thresholdBinIdx) {
           // The elements in the threshold bin share the same 32 bits at step 3
+          // -- identical logits -- so which of them survive is decided by the
+          // order threads win this atomic, and it differs between launches.
+          // Measured on gfx942 at seq 32768 with 800 non-zero indexer logits:
+          // the selected set repeated on 2 of 8 launches, Jaccard >= 0.91, and
+          // every difference was among positions scoring exactly 0.0. No
+          // above-threshold token is ever dropped, so this costs bitwise
+          // reproducibility at long context, not selection quality. Making it
+          // canonical means ranking ties by index, which is a scan over the
+          // whole bin in the decode hot path.
           int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
           if (dstIdx < topK) {
             if constexpr (mergeBlocks) {
