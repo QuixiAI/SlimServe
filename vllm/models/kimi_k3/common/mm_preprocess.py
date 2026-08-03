@@ -27,8 +27,13 @@ from vllm.multimodal.processing import (
     PromptUpdateDetails,
 )
 from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
+from vllm.transformers_utils.gguf_native import build_media_proc_cfg_from_gguf
+from vllm.transformers_utils.gguf_utils import check_gguf_file
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.transformers_utils.processors.kimi_k3 import KimiK3Processor
+from vllm.transformers_utils.processors.kimi_k25_vision_fused import (
+    KimiK25FusedVisionProcessor,
+)
 
 logger = init_logger(__name__)
 
@@ -101,11 +106,27 @@ class KimiK3ProcessingInfo(BaseProcessingInfo):
         self.hf_config = hf_config = self.get_hf_config()
 
         tokenizer = self.get_tokenizer()
-        image_processor = cached_get_image_processor(
-            self.ctx.model_config.model,
-            revision=self.ctx.model_config.revision,
-            trust_remote_code=self.ctx.model_config.trust_remote_code,
-        )
+        # A GGUF deployment has no preprocessor_config.json to read, and
+        # `model` points at the weights file itself. Handing that to
+        # `AutoImageProcessor.from_pretrained` makes transformers try to
+        # decode the whole GGUF as UTF-8 JSON -- on the 858 GB Kimi K3 build
+        # that grew to 2.7 TB of anonymous memory and took the host to the
+        # OOM killer before a single weight had been read.
+        #
+        # The mmproj carries the same spatial constants under `clip.vision.*`,
+        # so build the processor from those instead, exactly as the Kimi-K2.5
+        # path does.
+        gguf_source = self.ctx.model_config.model_weights or self.ctx.model_config.model
+        if check_gguf_file(gguf_source):
+            image_processor = KimiK25FusedVisionProcessor(
+                media_proc_cfg=build_media_proc_cfg_from_gguf(str(gguf_source))
+            )
+        else:
+            image_processor = cached_get_image_processor(
+                self.ctx.model_config.model,
+                revision=self.ctx.model_config.revision,
+                trust_remote_code=self.ctx.model_config.trust_remote_code,
+            )
 
         # Resolve token ID from the tokenizer because transformers v5
         # may remap token IDs vs config.json.

@@ -387,6 +387,37 @@ class MoERunner(MoERunnerInterface):
             fused_output = r[0] if isinstance(r, tuple) else r
         return fused_output
 
+    def _reduce_routed_transform_inputs(
+        self,
+        shared_output: torch.Tensor | None,
+        fused_output: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
+        """Reduce partial outputs before a nonlinear routed transform."""
+        requires_reduced_input = bool(
+            getattr(
+                self.routed_output_transform,
+                "requires_reduced_input",
+                False,
+            )
+        )
+        if not requires_reduced_input:
+            return shared_output, fused_output, False
+
+        if self.moe_config.is_sequence_parallel:
+            raise NotImplementedError(
+                "Routed output transforms requiring reduced inputs do not "
+                "support sequence parallelism."
+            )
+
+        if not self._fused_output_is_reduced and (
+            self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1
+        ):
+            fused_output = tensor_model_parallel_all_reduce(fused_output)
+            if shared_output is not None:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
+
+        return shared_output, fused_output, True
+
     def _maybe_apply_routed_scale_to_output(
         self,
         shared_output: torch.Tensor | None,
@@ -437,6 +468,7 @@ class MoERunner(MoERunnerInterface):
         self,
         states: torch.Tensor,
         trunc_size: int | None,
+        output_is_reduced: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -458,6 +490,7 @@ class MoERunner(MoERunnerInterface):
         if (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
+            and not output_is_reduced
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
@@ -716,6 +749,10 @@ class MoERunner(MoERunnerInterface):
             shared_output, fused_output
         )
 
+        shared_output, fused_output, transform_inputs_reduced = (
+            self._reduce_routed_transform_inputs(shared_output, fused_output)
+        )
+
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
 
@@ -724,7 +761,11 @@ class MoERunner(MoERunnerInterface):
         else:
             result = fused_output
 
-        result = self._maybe_reduce_final_output(result, og_hidden_dim_post_xform)
+        result = self._maybe_reduce_final_output(
+            result,
+            og_hidden_dim_post_xform,
+            output_is_reduced=transform_inputs_reduced,
+        )
 
         return self._maybe_add_zero_expert_output(result)
 

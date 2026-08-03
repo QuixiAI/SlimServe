@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,7 @@ import torch
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
+
     from vllm.config import ModelConfig
 
 
@@ -33,11 +35,17 @@ class BaseGGUFWeightsAdapter(ABC):
         """Return whether this adapter supports *config*."""
 
     @abstractmethod
-    def prepare_weights(self, model_config: ModelConfig) -> None:
+    def prepare_weights(
+        self, model_config: ModelConfig
+    ) -> Iterable[tuple[str, torch.Tensor]]:
         """Return HF-style weights."""
 
     @abstractmethod
-    def prepare_loading(self, model_config: ModelConfig) -> None:
+    def prepare_loading(
+        self,
+        model_path: str,
+        model_config: ModelConfig,
+    ) -> GGUFLoadSpec:
         """Preparation before loading, e.g., patching the HF config."""
 
     def patch_hf_config(

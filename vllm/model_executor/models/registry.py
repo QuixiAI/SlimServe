@@ -303,6 +303,10 @@ _MULTIMODAL_MODELS = {
         "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
     ),
+    # The inner text model. KimiK3ForConditionalGeneration builds it through
+    # init_vllm_registered_model, which resolves text_config.architectures
+    # against this table, so registering only the wrapper is not enough.
+    "KimiLinearForCausalLM": ("vllm.models.kimi_k3", "KimiLinearForCausalLM"),
     "MiniMaxM3SparseForConditionalGeneration": (
         "vllm.models.minimax_m3",
         "MiniMaxM3SparseForConditionalGeneration",
