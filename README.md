@@ -51,10 +51,15 @@ rates on two GPUs.
 [**QuixiAI/GLM-5.2-Vision-GGUF**](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF)
 as efficiently as possible on 2–8 AMD MI300X GPUs.
 
+Two more GGUF architectures serve on the same stack:
+[DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only) (text) and
+[Kimi K3](#also-supported-kimi-k3-vision) (vision). GLM-5.2-Vision is the model
+the tuning targets; the other two reuse its kernels.
+
 This is not general-purpose vLLM. Support for other models, other accelerators,
 and most non-GGUF quantization paths has been deleted so the remaining code can
-be tuned hard for one model on one machine. If you want to serve something else,
-use [upstream vLLM](https://github.com/vllm-project/vllm).
+be tuned hard for a handful of models on one machine. If you want to serve
+something else, use [upstream vLLM](https://github.com/vllm-project/vllm).
 
 What the specialization buys:
 
@@ -199,6 +204,14 @@ is a truncated think, not an error. A few hundred tokens is rarely enough for a
 vision or analysis request; 2048 is a safe starting point, and reasoning-heavy
 prompts want more.
 
+**The split depends on the reasoning parser, and its default is GLM's.** This
+fork defaults `reasoning_parser` to `glm45`, which is right for GLM-5.2 and
+wrong for everything else: pointed at another model's output it classifies the
+*whole* reply as reasoning, so `content` is `null` however large `max_tokens`
+is. That looks exactly like a truncated think but never resolves. The
+`slimserve` profiles pin the correct parser per model; if you launch the API
+server by hand, pass `--reasoning-parser` to match the model you loaded.
+
 If you have a genuinely latency-critical path where you want the answer only,
 you can pass `"chat_template_kwargs": {"enable_thinking": false}` per request —
 but expect lower quality on anything requiring multi-step reasoning, and prefer
@@ -249,6 +262,12 @@ Rules of thumb:
 The second architecture this fork serves. Text only — the model has no vision
 tower, so none of the mmproj path applies.
 
+```bash
+slimserve dsv4-4                    # MXFP4 on 4 GPUs, the tuned path
+slimserve dsv4-2 --quant IQ2_XXS    # smallest, 2 GPUs
+slimserve dsv4-4 --serve            # OpenAI-compatible endpoint
+```
+
 All four 0731 quants from [antirez/deepseek-v4-gguf][ds4w] load and serve.
 They differ only in how the routed experts are stored — every other tensor is
 the same F32/F16/Q8_0 in all of them — so the adapter is quant-agnostic and the
@@ -275,26 +294,69 @@ correctness limit.
 [ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
 [ds4d]: <https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF> <!-- markdownlint-disable-line MD013 -->
 
+The equivalent by hand, which is what `slimserve dsv4-4` runs:
+
 ```bash
-GGUF=$MODELS/DeepSeek-V4-Flash-GGUF
+GGUF=$MODELS/antirez-deepseek-v4-gguf
 VLLM_ROCM_USE_AITER=1 python -m vllm.entrypoints.openai.api_server \
   --model $GGUF/DeepSeek-V4-Flash-...-mxfp4-0731.gguf \
   --trust-remote-code --served-model-name DeepSeek-V4-Flash \
   --tensor-parallel-size 4 --block-size 256 \
+  --reasoning-parser deepseek_v4 \
   --attention-config '{"sparse_mla_force_mqa": true}' \
   --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
 ```
 
-Two flags are not optional. `--block-size 256` is what the DeepSeek-V4 sparse
+Three flags are not optional. `--block-size 256` is what the DeepSeek-V4 sparse
 MLA backend supports; the GLM value of 64 fails at KV-cache setup with "no
 common block size". `sparse_mla_force_mqa` is required for the same reason it
 is on the GLM path — short prompts otherwise take a dense forward the ROCm
-sparse backend does not implement.
+sparse backend does not implement. `--reasoning-parser deepseek_v4` overrides
+the GLM default, which would otherwise return every answer as `reasoning` with
+`content: null` — see [Reasoning output](#reasoning-output).
 
 Everything is read from the GGUF: no `--hf-config-path`, no `--tokenizer`. The
 routed experts are MXFP4, which this fork reads through its own HIP dequant,
 GEMV and MMQ tile kernels, and the DSA indexer (64 heads, 128 key length) runs
 on the bitwise-verified MFMA `fp8_mqa_logits`.
+
+---
+
+## Also supported: Kimi K3 (vision)
+
+The third architecture, and the largest thing this fork serves: an 858 GB
+IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
+a BF16 vision tower.
+
+```bash
+slimserve k3-6            # tensor parallel across 6 GPUs
+slimserve k3-8            # 4 replicas x TP2, experts split 112-per-rank
+```
+
+| Profile | Topology | Why |
+| --- | --- | --- |
+| `k3-6` | TP6 | 16 attention heads per rank. |
+| `k3-8` | DP4 × TP2, EP8 | Uses all eight cards; smaller per-replica context. |
+
+**TP8 is invalid.** 96 attention heads over 8 ranks gives 12 per rank, and the
+only viable ROCm MLA backend needs a multiple or divisor of 16. TP6 gives 16 and
+fits the checkpoint at ~142 GiB per GPU, leaving two cards idle — which is what
+`k3-8` reclaims by running four TP2 replicas and sharding the 896 routed experts
+112-per-rank instead of splitting every expert's matrices.
+
+Two things are required and are set by the profiles: `kv_cache_dtype=auto`,
+because this fork defaults the cache to fp8 for GLM and K3 cannot use it, and
+`HSA_XNACK=1` for the load. The text GGUF ships as five parts to concatenate,
+and its published header has `kimi-k3.vision = false`, which is wrong; the
+downloader reassembles the parts and corrects that byte. The vision projector
+comes from `unsloth/Kimi-K3-GGUF`, not from the text repo.
+
+Both profiles need a `_C_stable_libtorch` built from this tree, `k3-6` most of
+all. The MMQ expert-id fix lives in a `.cuh`, and a stale extension silently
+zeroes every expert above 255 — 71% of this model's experts — in any
+prefill-width MoE call that sees global expert ids, which is exactly what
+tensor parallel does. Under `k3-8` each rank holds ids 0–111 and never reaches
+the ceiling, so `k3-6` is the configuration a stale build degrades.
 
 ---
 
