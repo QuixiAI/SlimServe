@@ -67,11 +67,52 @@ What the specialization buys:
 
 ---
 
-## Getting the weights
+## Quick start
 
-**Nothing is downloaded automatically for the target model** — the server is
-given a path to a specific `.gguf` shard. The GGUF repo is 845 GB in total, so
-fetch only the quant you intend to serve plus the shared vision projector.
+```bash
+slimserve                      # pick a profile, then chat
+slimserve glm52-2              # chat on 2 GPUs
+slimserve glm52-4 --serve      # OpenAI-compatible endpoint on :8000
+slimserve k3-6 -p "2 + 2?"     # one shot, then exit
+```
+
+`slimserve` runs a fixed set of tested configurations and refuses everything
+else. Weights download on first use into `~/models` (override with `--cache` or
+`$SLIMSERVE_CACHE`).
+
+Output streams token by token in both modes. The prompt is an SSE client of the
+same OpenAI-compatible endpoint `--serve` exposes, so an interactive answer and
+an API answer come from one engine with one configuration.
+
+| Profile | Model | GPUs | Runs on |
+| --- | --- | ---: | --- |
+| `glm52-2` | GLM-5.2-Vision | 2 | MI300X |
+| `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 |
+| `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 |
+| `k3-6` | Kimi K3 | 6 | MI300X |
+| `k3-8` | Kimi K3 | 8 | MI300X |
+
+GLM profiles take `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs); Kimi K3 has
+one published quant. `slimserve --list` shows every profile and why any of them
+will not run here; `slimserve <profile> --dry-run` prints the resolved settings
+without loading anything.
+
+**Every legal configuration lives in
+[`slimserve/profiles.json`](slimserve/profiles.json)** — model sources, download
+URLs, per-platform engine settings, and the minimum GPU count for each quant.
+That file is the authority; nothing outside it can be run.
+
+The lower-level `run-glm-optimized.sh` still exists for GLM experiments that
+step outside the profiles (arbitrary `--tp`, `--ctx`, `--kv`, `--ep`).
+
+---
+
+## Getting the weights manually
+
+`slimserve` fetches what a profile needs, so this section is only for setting up
+a cache by hand or for the lower-level script. The GGUF repo is 845 GB in
+total, so fetch only the quant you intend to serve plus the shared vision
+projector.
 
 ```bash
 export MODELS=~/models   # where run-glm-optimized.sh looks
@@ -100,7 +141,7 @@ id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
 into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
 speculation off with `--no-spec`.
 
-## Quick start
+## Running the lower-level script
 
 ```bash
 ./run-glm-optimized.sh                      # Q2_K, TP2, 512k ctx, 32 concurrent

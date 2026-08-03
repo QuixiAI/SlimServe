@@ -1082,6 +1082,8 @@ if _build_custom_ops():
         ext_modules.append(CMakeExtension(name="vllm._moe_C_stable_libtorch"))
 
 package_data = {
+    # Every configuration slimserve is allowed to run.
+    "slimserve": ["profiles.json"],
     "vllm": [
         "py.typed",
         "libs/*.so*",
@@ -1105,7 +1107,7 @@ package_data = {
         "third_party/fmha_sm100/cutlass/include/**/*.hpp",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.h",
         "third_party/fmha_sm100/cutlass/tools/util/include/**/*.hpp",
-    ]
+    ],
 }
 
 
