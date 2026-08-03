@@ -24,9 +24,12 @@ Layer types come from which tensors a layer actually has -- `A_log` means KDA,
 `kv_a_proj_with_mqa` means full MLA -- rather than from a hardcoded index list,
 so a repack with a different interleave still loads correctly.
 
-What genuinely cannot be recovered is listed in `_ARCH_CONSTANTS`: values that
-leave no trace in any shape. The SITU betas matter most; they are numerically
-load-bearing and a wrong guess degrades output quietly rather than loudly.
+Four more have real GGUF keys upstream (unslothai/llama.cpp#48) that this
+build simply omits -- the SITU betas, attn_res.block_size and the expert
+latent length. Those go through `_KEYED_HPARAMS`, which reads the file first
+and warns loudly when it has to fall back, so a fixed converter needs no code
+change here. `_ARCH_CONSTANTS` is what is left: values with no key even
+upstream and no trace in any shape.
 """
 
 from __future__ import annotations
@@ -44,15 +47,50 @@ logger = init_logger(__name__)
 
 ARCH = "kimi-k3"
 
-# Not derivable from any tensor shape or metadata key. Taken from the released
-# moonshotai/Kimi-K3 `config.json`; see the module docstring.
+# Values that a conformant Kimi-K3 GGUF carries as keys. Unsloth's llama.cpp
+# fork (unslothai/llama.cpp#48) defines LLM_KV_ACTIVATION_SITU_BETA,
+# LLM_KV_ACTIVATION_SITU_LINEAR_BETA, LLM_KV_ATTN_RES_BLOCK_SIZE and
+# LLM_KV_EXPERT_LATENT_LENGTH, and hard-fails on the last two ("Kimi-K3
+# requires attn_res.block_size" / "... expert_latent_length").
+#
+# The antirez build carries none of them and spells the latent length
+# `routed_hidden_length`, so each entry lists the spellings to try. The PR
+# diff does not include the key table itself, so the exact format strings are
+# inferred from those assertion messages and llama.cpp's `%s.` convention --
+# hence several candidates rather than one.
+#
+# A missing key falls back to the released config.json value, but *loudly*:
+# the point of this project is that the GGUF is the sole authority, so an
+# external value has to announce itself rather than hide. When the converter
+# is fixed these reads start succeeding with no code change.
+_KEYED_HPARAMS: dict[str, tuple[tuple[str, ...], Any]] = {
+    "activation_situ_beta": (
+        ("activation.situ_beta", "activation_situ_beta", "situ_beta"),
+        4.0,
+    ),
+    "activation_situ_linear_beta": (
+        (
+            "activation.situ_linear_beta",
+            "activation_situ_linear_beta",
+            "situ_linear_beta",
+        ),
+        25.0,
+    ),
+    "attn_res_block_size": (
+        ("attn_res.block_size", "attn_res_block_size"),
+        12,
+    ),
+    "routed_expert_hidden_size": (
+        ("expert_latent_length", "routed_hidden_length"),
+        3584,
+    ),
+}
+
+# Not derivable from any tensor shape, and with no key defined for them even
+# upstream. Taken from the released moonshotai/Kimi-K3 `config.json`.
 _ARCH_CONSTANTS = {
-    # SituGLU. beta shapes the gate, linear_beta soft-clips the up half.
-    "activation_situ_beta": 4.0,
-    "activation_situ_linear_beta": 25.0,
     "hidden_act": "situ",
     "rms_norm_eps": 1e-5,
-    "attn_res_block_size": 12,
     "mla_use_nope": True,
     "mla_use_output_gate": True,
     "latent_moe_use_norm": True,
@@ -134,6 +172,23 @@ def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
     def meta(key: str, default: Any = None) -> Any:
         return _field(reader, f"{ARCH}.{key}", default)
 
+    def keyed(field: str) -> Any:
+        """Read a hparam the GGUF is supposed to carry, or say so out loud."""
+        candidates, fallback = _KEYED_HPARAMS[field]
+        for suffix in candidates:
+            value = meta(suffix)
+            if value is not None:
+                return value
+        logger.warning(
+            "kimi-k3 GGUF: none of %s present; falling back to the released "
+            "config.json value %r for %s. The file is supposed to carry this "
+            "-- see unslothai/llama.cpp#48, which hard-fails without it.",
+            [f"{ARCH}.{s}" for s in candidates],
+            fallback,
+            field,
+        )
+        return fallback
+
     hidden_size = int(meta("embedding_length"))
     num_layers = int(meta("block_count"))
 
@@ -200,7 +255,7 @@ def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
         "num_experts_per_token": int(meta("expert_used_count")),
         "moe_intermediate_size": moe_intermediate,
         "num_shared_experts": shared_intermediate // moe_intermediate,
-        "routed_expert_hidden_size": int(meta("routed_hidden_length")),
+        "routed_expert_hidden_size": int(keyed("routed_expert_hidden_size")),
         "first_k_dense_replace": dense_layers,
         "linear_attn_config": {
             "kda_layers": kda_layers,
@@ -210,6 +265,9 @@ def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
             "short_conv_kernel_size": conv_kernel,
             **_LINEAR_ATTN_CONSTANTS,
         },
+        "activation_situ_beta": float(keyed("activation_situ_beta")),
+        "activation_situ_linear_beta": float(keyed("activation_situ_linear_beta")),
+        "attn_res_block_size": int(keyed("attn_res_block_size")),
         **_ARCH_CONSTANTS,
     }
 
@@ -228,7 +286,13 @@ def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
         q_lora_rank,
     )
 
-    return KimiK3Config(text_config=text_config, vision_config=vision_config)
+    # A GGUF has no `architectures`; without it ModelConfig rejects the model
+    # outright ("No model architectures are specified") before any loader runs.
+    return KimiK3Config(
+        text_config=text_config,
+        vision_config=vision_config,
+        architectures=["KimiK3ForConditionalGeneration"],
+    )
 
 
 def _tiktoken_vocab_path(gguf_path: str) -> str:
