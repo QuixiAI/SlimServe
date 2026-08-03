@@ -10,6 +10,7 @@ temporal pooling for video chunks.
 
 from collections.abc import Sequence
 from copy import deepcopy
+from functools import cache
 from typing import Any
 
 import numpy as np
@@ -187,6 +188,21 @@ class Learnable2DInterpPosEmbDivided_fixed(nn.Module):
         return x + self.get_pos_embeds(grid_thws)
 
 
+@cache
+def _aiter_conv2d():
+    """aiter's Triton conv2d if this build has it, else None (warn once)."""
+    try:
+        from aiter.ops.triton.conv.conv2d import conv2d
+    except ImportError:
+        logger.warning(
+            "aiter.ops.triton.conv.conv2d is unavailable in this aiter build; "
+            "the vision patch embedding falls back to MIOpen conv2d, which "
+            "upstream reports as intermittently failing under load on ROCm."
+        )
+        return None
+    return conv2d
+
+
 class MoonVision3dPatchEmbed(nn.Module):
     """3D patch embedding for vision tower."""
 
@@ -246,17 +262,27 @@ class MoonVision3dPatchEmbed(nn.Module):
         return self.pos_emb(x, grid_thws)
 
     def _proj(self, x: torch.Tensor) -> torch.Tensor:
-        # MIOpen conv2d intermittently fails under load on ROCm; use aiter Triton.
+        # MIOpen conv2d intermittently fails under load on ROCm, so upstream
+        # routes this through aiter's Triton conv2d. That module does not
+        # exist in every aiter build -- ours ships only `causal_conv1d` under
+        # `aiter.ops.triton` -- and importing it unguarded takes the whole
+        # engine down at vision-tower construction.
+        #
+        # Fall back to MIOpen and say so once. That reinstates the flakiness
+        # upstream was working around, which is worth knowing about if the
+        # vision path starts failing intermittently under load; the durable
+        # fix is a HIP conv2d rather than a Triton one, given this fork is
+        # removing Triton rather than adding to it.
         if current_platform.is_rocm() and x.dtype in (torch.float16, torch.bfloat16):
-            from aiter.ops.triton.conv.conv2d import conv2d
-
-            return conv2d(
-                x,
-                self.proj.weight,
-                self.proj.bias,
-                stride=self.patch_size,
-                layout="nchw",
-            )
+            conv2d = _aiter_conv2d()
+            if conv2d is not None:
+                return conv2d(
+                    x,
+                    self.proj.weight,
+                    self.proj.bias,
+                    stride=self.patch_size,
+                    layout="nchw",
+                )
         return self.proj(x)
 
 
