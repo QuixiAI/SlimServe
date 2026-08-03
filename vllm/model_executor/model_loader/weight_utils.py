@@ -1295,6 +1295,25 @@ def get_gguf_weight_type_map(
     }
 
 
+def _gguf_tensor(weight: "np.ndarray") -> torch.Tensor:
+    """Wrap a GGUF tensor's bytes without copying them.
+
+    `GGUFReader` hands back numpy views into the mmapped file, so
+    `torch.tensor(weight)` duplicates every weight into anonymous memory --
+    the whole model a second time, on top of the mapping. Measured on the
+    858 GB Kimi K3 build: 55.0 GB of expert stacks cost +55.7 GB of RSS this
+    way and +0.0 GB via `from_numpy`. At full model size that is what took a
+    3 TB host to the OOM killer before a single byte reached a GPU.
+
+    The view is read-only, which is what the loaders want: they only ever
+    `copy_()` these into device parameters. torch has no read-only tensor, so
+    it emits one UserWarning per process about the non-writable buffer; that
+    is expected here and the alternative is the copy this exists to avoid.
+    Writing through one of these tensors would be undefined behaviour.
+    """
+    return torch.from_numpy(weight)
+
+
 def gguf_quant_weights_iterator(
     gguf_file: str | Path, gguf_to_hf_name_map: dict[str, str]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1334,9 +1353,9 @@ def gguf_quant_weights_iterator(
                 if reader.byte_order == "S":
                     # GGUF endianness != system endianness
                     weight = weight.byteswap()
-                param = torch.tensor(weight).view(torch.bfloat16)
+                param = _gguf_tensor(weight).view(torch.bfloat16)
             else:
-                param = torch.tensor(weight)
+                param = _gguf_tensor(weight)
             yield name, param
 
 
@@ -1377,12 +1396,10 @@ def gguf_quant_weights_iterator_multi(
                     weight = weight.view(np.uint16)
                     if reader.byte_order == "S":
                         weight = weight.byteswap()
-                    param = torch.tensor(weight).view(torch.bfloat16)
+                    param = _gguf_tensor(weight).view(torch.bfloat16)
                 else:
-                    param = torch.tensor(weight)
+                    param = _gguf_tensor(weight)
                 yield name, param
-
-
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
