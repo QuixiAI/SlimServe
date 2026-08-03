@@ -47,6 +47,13 @@ __global__ void convert_req_index_to_global_index(
         const int inblock_off = tok % block_size;
         const bool valid_block =
             block_id < max_num_blocks_per_req && block_id >= 0;
+        // 0 is physical KV slot 0, not a skip sentinel -- an invalid `tok`
+        // reaching here would be attended to with full weight. That is safe
+        // only because of the guard above: this loop stops at seq_end, and the
+        // consumer reads exactly min(position + 1, topk) entries, which is the
+        // span top_k_per_row_decode always fills with real indices. Its -1
+        // padding lives past seq_end. tests/kernels/test_sparse_topk_indices.py
+        // pins that invariant; if it ever breaks, this needs a real sentinel.
         int val = 0;
         if (tok >= 0 && valid_block) {
             const int base = block_table[(long)req * bt_stride0 +
