@@ -31,12 +31,19 @@ class GGUFConfigParser(ConfigParserBase):
         code_revision: str | None = None,
         **kwargs,
     ) -> tuple[dict, PretrainedConfig]:
-        if gguf_architecture(str(model)) == "deepseek4":
+        architecture = gguf_architecture(str(model))
+        if architecture == "deepseek4":
             from vllm.transformers_utils.gguf_deepseek4 import (
                 build_deepseek4_config_from_gguf,
             )
 
             config = build_deepseek4_config_from_gguf(str(model))
+        elif architecture == "kimi-k3":
+            from vllm.transformers_utils.gguf_kimi_k3 import (
+                build_kimi_k3_config_from_gguf,
+            )
+
+            config = build_kimi_k3_config_from_gguf(str(model))
         else:
             config = build_config_from_gguf(str(model))
         return config.to_dict(), config

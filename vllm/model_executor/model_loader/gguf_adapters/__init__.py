@@ -12,10 +12,12 @@ from .base import BaseGGUFWeightsAdapter
 from .deepseek4 import Deepseek4GGUFAdapter
 from .default import GGUFWeightsAdapter
 from .glm_dsa import GlmDsaGGUFAdapter
+from .kimi_k3 import KimiK3GGUFAdapter
 
 __all__ = [
     "BaseGGUFWeightsAdapter",
     "Deepseek4GGUFAdapter",
     "GGUFWeightsAdapter",
     "GlmDsaGGUFAdapter",
+    "KimiK3GGUFAdapter",
 ]
