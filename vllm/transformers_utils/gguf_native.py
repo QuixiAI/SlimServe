@@ -20,6 +20,7 @@ with the reason attached, rather than being guessed at load time.
 
 from __future__ import annotations
 
+import os
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -71,7 +72,20 @@ def _field(reader: gguf.GGUFReader, key: str, default: Any = None) -> Any:
 
 
 def find_mmproj(gguf_path: str | Path) -> Path | None:
-    """Locate the vision projector beside (or one level above) the backbone."""
+    """Locate the vision projector beside (or one level above) the backbone.
+
+    ``VLLM_GGUF_MMPROJ`` overrides, as it does for the weight adapters. It has
+    to be honoured in both places or the override moves the vision *weights*
+    while the image-processor config still comes from whichever projector the
+    glob happens to find -- pairing one tower's weights with another tower's
+    patch limit, which misreads images rather than failing.
+    """
+    override = os.environ.get("VLLM_GGUF_MMPROJ")
+    if override:
+        path = Path(override)
+        if not path.is_file():
+            raise RuntimeError(f"VLLM_GGUF_MMPROJ does not exist: {override}")
+        return path
     p = Path(gguf_path)
     for directory in (p.parent, p.parent.parent):
         for pattern in ("mmproj*.gguf", "*mmproj*.gguf"):
