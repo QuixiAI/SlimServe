@@ -213,6 +213,17 @@ def get_tokenizer(
             tok = get_deepseek_v4_tokenizer(
                 build_deepseek4_tokenizer_from_gguf(str(tokenizer_name))
             )
+        elif gguf_architecture(str(tokenizer_name)) == "kimi-k3":
+            from vllm.transformers_utils.gguf_kimi_k3 import (
+                build_kimi_k3_tokenizer_from_gguf,
+            )
+
+            # Kimi K3 is tiktoken, not BPE: the file carries its vocabulary
+            # under `tokenizer.kimi-k3.tiktoken` as base64 rank lines, and
+            # none of the `tokenizer.ggml.*` keys the BPE builder wants. The
+            # tokenizer class itself is vendored from the release rather than
+            # reimplemented, so the pre-tokenizer split stays identical.
+            tok = build_kimi_k3_tokenizer_from_gguf(str(tokenizer_name))
         else:
             from vllm.transformers_utils.gguf_native import (
                 build_tokenizer_from_gguf,
