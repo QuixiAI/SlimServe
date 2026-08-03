@@ -63,6 +63,7 @@ class GGUFModelLoader(BaseModelLoader):
         from vllm.model_executor.model_loader.gguf_adapters import (
             Deepseek4GGUFAdapter,
             GlmDsaGGUFAdapter,
+            KimiK3GGUFAdapter,
         )
         from vllm.transformers_utils.gguf_utils import gguf_architecture
 
@@ -70,8 +71,11 @@ class GGUFModelLoader(BaseModelLoader):
         # Dispatch on the file rather than the config: at this point the config
         # was itself built from the GGUF, so the architecture string is the one
         # authority both agree on.
-        if gguf_architecture(path) == "deepseek4":
+        architecture = gguf_architecture(path)
+        if architecture == "deepseek4":
             adapter_cls = Deepseek4GGUFAdapter
+        elif architecture == "kimi-k3":
+            adapter_cls = KimiK3GGUFAdapter
         else:
             adapter_cls = GlmDsaGGUFAdapter
         adapter = adapter_cls(model_config.hf_config)

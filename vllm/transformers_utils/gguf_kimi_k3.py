@@ -1,0 +1,207 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Build the Kimi K3 config from its GGUF.
+
+Same reasoning as `gguf_deepseek4`: `transformers`' GGUF reader has an
+architecture whitelist and `kimi-k3` is not on it, so reading the metadata
+directly is the only way in.
+
+Unlike the DeepSeek-V4 file, this one is metadata-poor -- fourteen keys, none
+of which describe attention. Every dimension below is therefore recovered from
+*tensor shapes*, which is both the only option and the more trustworthy one:
+a shape cannot drift from the weights it describes. The derivations, all
+checked against the released `config.json`:
+
+    q_b_proj      [1536, 18432]  -> q_lora_rank 1536, and 18432 / 96 heads
+                                    = 192 = qk_nope 128 + qk_rope 64
+    kv_b_proj     [512, 24576]   -> kv_lora_rank 512, 24576 / 96
+                                    = 256 = qk_nope 128 + v_head_dim 128
+    kv_a_proj     [7168, 576]    -> 576 = kv_lora_rank 512 + qk_rope 64
+    q_proj (KDA)  [7168, 12288]  -> 12288 = 96 heads x head_dim 128
+    q_conv1d      [4, 1, 12288]  -> short_conv_kernel_size 4
+
+Layer types come from which tensors a layer actually has -- `A_log` means KDA,
+`kv_a_proj_with_mqa` means full MLA -- rather than from a hardcoded index list,
+so a repack with a different interleave still loads correctly.
+
+What genuinely cannot be recovered is listed in `_ARCH_CONSTANTS`: values that
+leave no trace in any shape. The SITU betas matter most; they are numerically
+load-bearing and a wrong guess degrades output quietly rather than loudly.
+"""
+
+from __future__ import annotations
+
+from functools import cache
+from typing import Any
+
+import regex as re
+
+from vllm.logger import init_logger
+from vllm.transformers_utils.gguf_native import _field
+from vllm.transformers_utils.gguf_utils import gguf_reader
+
+logger = init_logger(__name__)
+
+ARCH = "kimi-k3"
+
+# Not derivable from any tensor shape or metadata key. Taken from the released
+# moonshotai/Kimi-K3 `config.json`; see the module docstring.
+_ARCH_CONSTANTS = {
+    # SituGLU. beta shapes the gate, linear_beta soft-clips the up half.
+    "activation_situ_beta": 4.0,
+    "activation_situ_linear_beta": 25.0,
+    "hidden_act": "situ",
+    "rms_norm_eps": 1e-5,
+    "attn_res_block_size": 12,
+    "mla_use_nope": True,
+    "mla_use_output_gate": True,
+    "latent_moe_use_norm": True,
+    "moe_renormalize": True,
+    "moe_router_activation_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "use_grouped_topk": True,
+    "num_expert_group": 1,
+    "topk_group": 1,
+    "routed_scaling_factor": 1.0,
+    "moe_layer_freq": 1,
+    "num_nextn_predict_layers": 0,
+    "tie_word_embeddings": False,
+    "bos_token_id": 163584,
+    "eos_token_id": 163586,
+    "pad_token_id": 163839,
+}
+
+# Likewise not in the file; the KDA gate floor and the full-rank gate flag.
+_LINEAR_ATTN_CONSTANTS = {"gate_lower_bound": -5.0, "use_full_rank_gate": True}
+
+_LAYER_RE = re.compile(r"^language_model\.model\.layers\.(\d+)\.(.+)$")
+
+
+def is_kimi_k3_gguf(gguf_path: str) -> bool:
+    return str(_field(gguf_reader(str(gguf_path)), "general.architecture")) == ARCH
+
+
+def _shapes(reader) -> dict[str, list[int]]:
+    return {t.name: [int(d) for d in t.shape] for t in reader.tensors}
+
+
+def _layer_suffixes(shapes: dict[str, list[int]]) -> dict[int, set[str]]:
+    """Map layer index -> the set of tensor suffixes that layer carries."""
+    out: dict[int, set[str]] = {}
+    for name in shapes:
+        m = _LAYER_RE.match(name)
+        if m:
+            out.setdefault(int(m.group(1)), set()).add(m.group(2))
+    return out
+
+
+@cache
+def build_kimi_k3_config_from_gguf(gguf_path: str) -> Any:
+    """Assemble a `KimiK3Config` from `kimi-k3.*` metadata and tensor shapes."""
+    from vllm.transformers_utils.configs.kimi_k3 import (
+        KimiK3Config,
+        KimiK3VisionConfig,
+    )
+
+    reader = gguf_reader(str(gguf_path))
+    shapes = _shapes(reader)
+    per_layer = _layer_suffixes(shapes)
+
+    def meta(key: str, default: Any = None) -> Any:
+        return _field(reader, f"{ARCH}.{key}", default)
+
+    hidden_size = int(meta("embedding_length"))
+    num_layers = int(meta("block_count"))
+
+    # Layer types from tensor presence, not an index list. The config's lists
+    # are 1-based, matching the released config.json.
+    kda_layers, full_attn_layers = [], []
+    for idx in sorted(per_layer):
+        suffixes = per_layer[idx]
+        if any(s.startswith("self_attn.A_log") for s in suffixes):
+            kda_layers.append(idx + 1)
+        elif any(s.startswith("self_attn.kv_a_proj_with_mqa") for s in suffixes):
+            full_attn_layers.append(idx + 1)
+    if len(kda_layers) + len(full_attn_layers) != num_layers:
+        raise ValueError(
+            f"classified {len(kda_layers)} KDA + {len(full_attn_layers)} full "
+            f"attention layers but block_count is {num_layers}"
+        )
+
+    def find(suffix: str) -> list[int]:
+        for name, shape in shapes.items():
+            if name.endswith(suffix):
+                return shape
+        raise ValueError(f"no tensor ending in {suffix!r}; not a Kimi K3 GGUF?")
+
+    # KDA: q_proj is [hidden, num_heads * head_dim].
+    num_heads = int(meta("attention.head_count", 0)) or None
+    kda_head_dim = int(find("self_attn.o_norm.weight")[0])
+    if num_heads is None:
+        num_heads = find("self_attn.q_proj.weight")[1] // kda_head_dim
+
+    q_lora_rank = find("self_attn.q_a_proj.weight")[1]
+    kv_lora_rank = find("self_attn.kv_a_layernorm.weight")[0]
+    # kv_a_proj packs the latent plus the rope half of the shared key.
+    qk_rope_head_dim = find("self_attn.kv_a_proj_with_mqa.weight")[1] - kv_lora_rank
+    qk_nope_head_dim = (
+        find("self_attn.q_b_proj.weight")[1] // num_heads - qk_rope_head_dim
+    )
+    v_head_dim = find("self_attn.kv_b_proj.weight")[1] // num_heads - qk_nope_head_dim
+    conv_kernel = find("self_attn.q_conv1d.weight")[0]
+
+    # Dense-vs-MoE split: the dense prefix is the layers carrying `mlp.*`.
+    dense_layers = sum(
+        1 for s in per_layer.values() if any(x.startswith("mlp.") for x in s)
+    )
+    moe_intermediate = int(meta("expert_feed_forward_length"))
+    shared_intermediate = find("shared_experts.gate_proj.weight")[1]
+
+    text_config = {
+        "model_type": "kimi_linear",
+        "vocab_size": int(meta("vocabulary_size")),
+        "hidden_size": hidden_size,
+        "num_hidden_layers": num_layers,
+        "num_attention_heads": num_heads,
+        "num_key_value_heads": num_heads,
+        "head_dim": kda_head_dim,
+        "intermediate_size": find("mlp.gate_proj.weight")[1],
+        "max_position_embeddings": int(meta("context_length")),
+        "q_lora_rank": q_lora_rank,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_nope_head_dim": qk_nope_head_dim,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "v_head_dim": v_head_dim,
+        "num_experts": int(meta("expert_count")),
+        "num_experts_per_token": int(meta("expert_used_count")),
+        "moe_intermediate_size": moe_intermediate,
+        "num_shared_experts": shared_intermediate // moe_intermediate,
+        "routed_expert_hidden_size": int(meta("routed_hidden_length")),
+        "first_k_dense_replace": dense_layers,
+        "linear_attn_config": {
+            "kda_layers": kda_layers,
+            "full_attn_layers": full_attn_layers,
+            "num_heads": num_heads,
+            "head_dim": kda_head_dim,
+            "short_conv_kernel_size": conv_kernel,
+            **_LINEAR_ATTN_CONSTANTS,
+        },
+        **_ARCH_CONSTANTS,
+    }
+
+    vision_config = KimiK3VisionConfig(text_hidden_size=hidden_size)
+
+    logger.info(
+        "Kimi K3 GGUF: %d layers (%d KDA, %d MLA), %d experts top-%d, "
+        "%d heads, kv_lora %d, q_lora %d",
+        num_layers,
+        len(kda_layers),
+        len(full_attn_layers),
+        text_config["num_experts"],
+        text_config["num_experts_per_token"],
+        num_heads,
+        kv_lora_rank,
+        q_lora_rank,
+    )
+
+    return KimiK3Config(text_config=text_config, vision_config=vision_config)
