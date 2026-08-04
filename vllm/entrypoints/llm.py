@@ -136,9 +136,6 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             these segments will be offloaded (e.g., {"gate_up_proj", "down_proj"}
             for MLP weights, or {"w13_weight", "w2_weight"} for MoE expert
             weights). If None or empty, all parameters are offloaded.
-        enforce_eager: Whether to enforce eager execution. If True, we will
-            disable CUDA graph and always execute the model in eager mode.
-            If False, we will use CUDA graph and eager execution in hybrid.
         enable_return_routed_experts: Whether to return routed experts.
         disable_custom_all_reduce: See
             [ParallelConfig][vllm.config.ParallelConfig].
@@ -198,7 +195,6 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
         offload_num_in_group: int = 1,
         offload_prefetch_step: int = 1,
         offload_params: set[str] | None = None,
-        enforce_eager: bool = False,
         enable_return_routed_experts: bool = False,
         disable_custom_all_reduce: bool = False,
         hf_token: bool | str | None = None,
@@ -314,7 +310,6 @@ class LLM(BeamSearchOfflineMixin, PoolingOfflineMixin, OfflineInferenceMixin):
             offload_num_in_group=offload_num_in_group,
             offload_prefetch_step=offload_prefetch_step,
             offload_params=offload_params or set(),
-            enforce_eager=enforce_eager,
             enable_return_routed_experts=enable_return_routed_experts,
             disable_custom_all_reduce=disable_custom_all_reduce,
             hf_token=hf_token,

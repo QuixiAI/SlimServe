@@ -18,15 +18,13 @@ VLLM_LOGGING_LEVEL=WARNING ~/.venv/bin/python -m vllm.entrypoints.openai.api_ser
     --model "$MODEL" \
     --max-model-len 512 \
     --gpu-memory-utilization 0.85 \
-    --enforce-eager \
     --port $PORT \
     --disable-log-requests \
     2>&1 &
 SERVER_PID=$!
 
-# Wait for server to be ready (check health endpoint)
 echo "Waiting for server to start..."
-for i in $(seq 1 120); do
+for i in $(seq 1 360); do
     if curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
         echo "Server ready after ${i}s"
         break
@@ -39,19 +37,20 @@ for i in $(seq 1 120); do
 done
 
 if ! curl -s http://localhost:$PORT/health > /dev/null 2>&1; then
-    echo "Server failed to start within 120s"
+    echo "Server failed to start within 360s"
     kill $SERVER_PID 2>/dev/null
     exit 1
 fi
 
-# Warmup
+# Warmup (2 runs to capture CUDA graphs)
 echo "Warming up..."
-curl -s http://localhost:$PORT/v1/completions \
-    -H "Content-Type: application/json" \
-    -d "{\"model\": \"$MODEL\", \"prompt\": \"Hello\", \"max_tokens\": 50, \"temperature\": 0}" \
-    > /dev/null
+for w in 1 2 3; do
+    curl -s http://localhost:$PORT/v1/completions \
+        -H "Content-Type: application/json" \
+        -d "{\"model\": \"$MODEL\", \"prompt\": \"Hello world\", \"max_tokens\": 50, \"temperature\": 0}" \
+        > /dev/null
+done
 
-# Benchmark: 3 runs, 200 tokens each
 PROMPT="Explain the theory of general relativity in detail, covering spacetime curvature, the equivalence principle, and gravitational waves."
 
 echo "Benchmarking (3 runs, 200 tokens each)..."
@@ -75,6 +74,5 @@ echo ""
 echo "  Average: $AVG tok/s"
 echo "============================================================"
 
-# Cleanup
 kill $SERVER_PID 2>/dev/null
 wait $SERVER_PID 2>/dev/null

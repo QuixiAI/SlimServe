@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Benchmark tokens/sec for PR1 dense models."""
+
+import os
 import sys
 import time
-import os
 
 
 def main():
@@ -13,16 +17,15 @@ def main():
 
     from vllm import LLM, SamplingParams
 
-    print(f"\n{'='*60}", flush=True)
+    print(f"\n{'=' * 60}", flush=True)
     print(f"Benchmarking: {label}", flush=True)
     print(f"Model: {model_name}", flush=True)
-    print(f"{'='*60}", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
     llm = LLM(
         model=model_name,
         max_model_len=512,
         gpu_memory_utilization=0.85,
-        enforce_eager=True,
         disable_log_stats=True,
     )
 
@@ -37,7 +40,10 @@ def main():
     llm.generate(["Hello"], sampling_params)
 
     # Benchmark: single request, measure decode throughput
-    prompt = "Explain the theory of general relativity in detail, covering spacetime curvature, the equivalence principle, and gravitational waves."
+    prompt = (
+        "Explain the theory of general relativity in detail, covering "
+        "spacetime curvature, the equivalence principle, and gravitational waves."
+    )
 
     print("Benchmarking (3 runs)...", flush=True)
     times = []
@@ -49,12 +55,14 @@ def main():
         elapsed = t1 - t0
         tps = n_tokens / elapsed
         times.append(tps)
-        print(f"  Run {i+1}: {n_tokens} tokens in {elapsed:.2f}s = {tps:.1f} tok/s",
-              flush=True)
+        print(
+            f"  Run {i + 1}: {n_tokens} tokens in {elapsed:.2f}s = {tps:.1f} tok/s",
+            flush=True,
+        )
 
     avg = sum(times) / len(times)
     print(f"\n  Average: {avg:.1f} tok/s", flush=True)
-    print(f"{'='*60}", flush=True)
+    print(f"{'=' * 60}", flush=True)
 
 
 if __name__ == "__main__":

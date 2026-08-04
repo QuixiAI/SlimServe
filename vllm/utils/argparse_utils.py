@@ -270,9 +270,9 @@ class FlexibleArgumentParser(ArgumentParser):
 
                 # Move <model> to the front, e,g:
                 # [Before]
-                # vllm serve -tp 2 --model <model> --enforce-eager --port 8001
+                # vllm serve -tp 2 --model <model> --seed 0 --port 8001
                 # [After]
-                # vllm serve <model> -tp 2 --enforce-eager --port 8001
+                # vllm serve <model> -tp 2 --seed 0 --port 8001
                 args = [
                     "serve",
                     model_tag,

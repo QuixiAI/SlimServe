@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Model-level coherence + throughput benchmark for PR1 Marlin HIP."""
+
 import argparse
 import time
 
@@ -16,8 +20,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-max-tokens", type=int, default=50)
     parser.add_argument("--bench-max-tokens", type=int, default=200)
     parser.add_argument("--bench-min-tokens", type=int, default=200)
-    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction,
-                        default=False)
     parser.add_argument("--use-tqdm", action="store_true")
     return parser.parse_args()
 
@@ -33,14 +35,12 @@ def main() -> None:
     print(f"Model: {args.model}", flush=True)
     print(f"gpu_memory_utilization={args.gpu_util}", flush=True)
     print(f"max_num_batched_tokens={args.max_num_batched_tokens}", flush=True)
-    print(f"enforce_eager={args.enforce_eager}", flush=True)
     print("=" * 60, flush=True)
 
     llm_kwargs = dict(
         model=args.model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_util,
-        enforce_eager=args.enforce_eager,
         disable_log_stats=True,
     )
     if args.max_num_batched_tokens > 0:
@@ -72,7 +72,9 @@ def main() -> None:
 
     # Warmup.
     if args.warmup_max_tokens > 0:
-        warmup_params = SamplingParams(temperature=0.0, max_tokens=args.warmup_max_tokens)
+        warmup_params = SamplingParams(
+            temperature=0.0, max_tokens=args.warmup_max_tokens
+        )
         llm.generate(["Hello"], warmup_params, use_tqdm=args.use_tqdm)
 
     # Throughput benchmark.
@@ -95,8 +97,10 @@ def main() -> None:
         token_count = len(outputs[0].outputs[0].token_ids)
         rate = token_count / (t1 - t0)
         tps.append(rate)
-        print(f"RUN{run_idx + 1}_TOKENS={token_count} RUN{run_idx + 1}_TPS={rate:.3f}",
-              flush=True)
+        print(
+            f"RUN{run_idx + 1}_TOKENS={token_count} RUN{run_idx + 1}_TPS={rate:.3f}",
+            flush=True,
+        )
 
     if tps:
         avg_tps = sum(tps) / len(tps)

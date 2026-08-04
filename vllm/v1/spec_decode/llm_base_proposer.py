@@ -276,6 +276,7 @@ class SpecDecodeBaseProposer:
             from vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse import (
                 ROCMAiterMLASparseMetadata,
             )
+
             rocm_types = [
                 TritonAttentionMetadata,
                 ROCMAiterMLASparseMetadata,
@@ -284,9 +285,10 @@ class SpecDecodeBaseProposer:
                 DeepseekV32IndexerMetadata,
                 MiniMaxM3SparseMetadata,
             ]
-            if find_spec(
-                "vllm.v1.attention.ops.chunked_prefill_paged_decode"
-            ) is not None:
+            if (
+                find_spec("vllm.v1.attention.ops.chunked_prefill_paged_decode")
+                is not None
+            ):
                 from vllm.v1.attention.backends.rocm_attn import (
                     RocmAttentionMetadata,
                 )
@@ -425,7 +427,7 @@ class SpecDecodeBaseProposer:
         This should be called after adjust_cudagraph_sizes_for_spec_decode.
         """
         if (
-            not self.speculative_config.enforce_eager
+            not self.speculative_config.disable_draft_cudagraphs
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):

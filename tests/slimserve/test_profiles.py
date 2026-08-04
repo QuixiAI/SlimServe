@@ -105,20 +105,28 @@ def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
     assert "".join(frame.feed(d) for d in deltas) + frame.flush() == expected
 
 
-def test_no_profile_ever_runs_eager():
-    """enforce_eager says performance does not matter, which is never true here.
+def test_every_profile_captures_cuda_graphs():
+    """Eager execution says performance does not matter, which is never true here.
 
-    K3 carried it from bring-up, where it was a debugging crutch, and it stayed
+    K3 ran eager from bring-up, where it was a debugging crutch, and it stayed
     long enough to be measured as a throughput problem: a 93-layer decode step is
     thousands of tiny launches, so eager makes the loop launch-bound and no
-    kernel work underneath it can help. Every profile gets CUDA graphs.
+    kernel work underneath it can help. The engine no longer has a way to ask
+    for eager; every profile must still name the graph mode it wants.
     """
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
                 profile_id, platform, registry.describe(profile_id)["gpus"], None
             ).engine
-            assert not engine.get("enforce_eager"), profile_id
-            assert engine.get("compilation_config", {}).get("cudagraph_mode"), (
-                profile_id
-            )
+            cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
+            assert cudagraph_mode not in (None, "NONE"), profile_id
+
+
+def test_the_engine_has_no_eager_switch_left():
+    """A profile cannot reintroduce eager, because the knob is gone."""
+    from vllm.config import ModelConfig
+    from vllm.engine.arg_utils import EngineArgs
+
+    assert not hasattr(ModelConfig, "enforce_eager")
+    assert not hasattr(EngineArgs, "enforce_eager")

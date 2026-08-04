@@ -6191,7 +6191,7 @@ class GPUModelRunner(
                         not is_graph_capturing
                         and cudagraph_runtime_mode != CUDAGraphMode.NONE
                     )
-                ) and not self.speculative_config.enforce_eager
+                ) and not self.speculative_config.disable_draft_cudagraphs
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two
                 # lora cases when cudagraph_specialize_lora is enabled. This is a
