@@ -349,7 +349,7 @@
       "env": {"VLLM_ROCM_USE_AITER": "1", "HSA_XNACK": "1"},
       "chat_template_kwargs": {"thinking": false},
       "notes": [
-        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM, which K3 cannot use.",
+        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
         "HSA_XNACK=1 is required for this load."
       ]
     },
