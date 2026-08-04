@@ -381,19 +381,42 @@ The corrected run took about 14.2, 9.8, and 9.7 seconds for the three requests
 after model initialization. It used the MIOpen vision patch-embedding fallback
 and completed without a vision-kernel failure.
 
-## Why TP6, and why TP8 now works
+## Why TP6, and why TP8 still does not work
 
 TP6 was chosen because TP8 could not start: 96 heads / 8 ranks gives 12 per
 rank, and AITER MLA requires a multiple or divisor of 16. TP6 gives 16 and fits
 the 858 GB checkpoint at about 142 GiB of weights per GPU; TP4 exceeds the
-memory budget and also fails the head rule. Two GPUs therefore remained idle.
+memory budget and also fails the head rule. Two GPUs therefore remain idle.
 
-That constraint was AITER's, not the hardware's -- its gfx942 MLA decode ships
-as pre-assembled code objects with the query head count baked in. The HIP decode
-kernel in `csrc/quixicore/rocm/mla_decode_kernels.cuh` takes the head count as a
-grid dimension, so TP8 runs, and the `k3-8t` profile is the faster one: 34.6 /
-106.4 / 149.8 aggregate tok/s at concurrency 1 / 4 / 8, against TP6's 32.8 /
-91.7 / 122.5.
+The attention half of that is now solved: the HIP decode kernel in
+`csrc/quixicore/rocm/mla_decode_kernels.cuh` takes the head count as a grid
+dimension, so 12 heads per rank runs.
+
+TP8 is still wrong, for an unrelated reason in the quantized MoE.
+`ffn_down_exps` is row-parallel, so TP splits its contiguous dimension -- which
+is the dimension GGUF packs into 256-element quant blocks. That dimension is
+3072 = 12 Q2_K blocks = 1008 bytes per row:
+
+    TP2  504 bytes = 6.00 blocks   ok
+    TP4  252 bytes = 3.00 blocks   ok
+    TP6  168 bytes = 2.00 blocks   ok
+    TP8  126 bytes = 1.50 blocks   slices a block in half
+
+`GGUFUninitializedParameter.load_row_parallel_weight` narrows dim 1 of the
+*packed* tensor, which is measured in bytes, by `shape[1] // tp_size` with no
+block-boundary check. At TP8 every rank therefore decodes scales and quants
+starting mid-block, and the model emits `!!!!!!!!` for every prompt.
+
+`gate`/`up` are column-parallel and split the non-contiguous dim, so they are
+safe at every TP. The `padded_moe_intermediate_size` mechanism does not help:
+it enlarges the buffer but still shards at `moe_intermediate_size // tp_size`.
+
+A correct fix must make the shard boundaries whole blocks. Either pad the
+intermediate to a multiple of `256 * tp_size` (3072 -> 4096; correct, costs
+~33% MoE weight memory, leaves two of eight ranks with only zero weights), or
+shard the 12 blocks unevenly as 4x2 + 4x1 (lossless, but the fused MoE path
+assumes a uniform partition per rank). Neither is implemented; the `k3-8t`
+profile has been withdrawn.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
