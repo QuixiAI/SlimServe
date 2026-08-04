@@ -2,6 +2,9 @@
 
 By Eric Hartford, QuixiAI
 
+*A simplicity-first, opinionated inference engine for the antirez GGUF quants —
+ds4's interface, vLLM's engine, and every performance trick we can land.*
+
 <img width="480" height="480" alt="image" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
 
 ### With SlimServe you can run GLM-5.2-Vision at
@@ -47,19 +50,57 @@ rates on two GPUs.
 
 ---
 
-**QuixiAI/SlimServe** — a vLLM fork stripped down and specialized to serve
-[**QuixiAI/GLM-5.2-Vision-GGUF**](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF)
-as efficiently as possible on 2–8 AMD MI300X GPUs.
+## What SlimServe is
 
-Two more GGUF architectures serve on the same stack:
-[DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only) (text) and
-[Kimi K3](#also-supported-kimi-k3-vision) (vision). GLM-5.2-Vision is the model
-the tuning targets; the other two reuse its kernels.
+**A simplicity-first inference engine for the [antirez][antirez] GGUF quants,
+with vision enabled wherever the model has it.**
 
-This is not general-purpose vLLM. Support for other models, other accelerators,
-and most non-GGUF quantization paths has been deleted so the remaining code can
-be tuned hard for a handful of models on one machine. If you want to serve
-something else, use [upstream vLLM](https://github.com/vllm-project/vllm).
+One command, a fixed set of tested profiles, no flag archaeology:
+
+```bash
+slimserve                 # pick a profile, then chat
+slimserve glm52-2         # or name one
+slimserve k3-6 --serve    # OpenAI-compatible endpoint
+```
+
+It is **opinionated**. Every configuration it will run lives in
+[`slimserve/profiles.json`](slimserve/profiles.json), and it refuses anything
+that is not in there rather than letting you discover the hard way, eight hours
+into a 244 GiB download, that the combination does not fit. Settings are the
+measured ones; the file records why each number is what it is.
+
+It is **inspired by [ds4][ds4]** — antirez's from-scratch C engine — and takes
+its interface philosophy from it: the model's voice on stdout and the tool's on
+stderr, Ctrl-C stops generation without leaving the prompt, one line of rates
+after each turn. Where ds4 is built from scratch against llama.cpp's world,
+SlimServe is built from vLLM, so it inherits continuous batching, paged KV,
+prefix caching and a production HTTP server.
+
+It is **performance-focused, and every bleeding-edge trick is in scope.**
+Right now that means DSpark speculative decoding against a GGUF-quantized
+verifier and TurboQuant compressed KV for the draft. That list is expected to
+turn over as better tricks appear — this is not a codebase that will refuse a
+hack because it is exotic.
+
+### Hardware
+
+| Runs today | Coming |
+| --- | --- |
+| AMD MI300X (2–8 GPUs) | RTX 3090 / 4090 / 5090 |
+| NVIDIA A100 (4–8 GPUs) | RTX PRO 6000 |
+| Apple Metal | NVIDIA DGX Spark, multi-node |
+
+### Models
+
+Three architectures: [GLM-5.2-Vision][glm] and [Kimi K3](#also-supported-kimi-k3-vision)
+with vision, [DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only)
+text-only. GLM-5.2-Vision is what the tuning targets; the others reuse its
+kernels. The [profile table](#quick-start) below has the GPU counts.
+
+This is not general-purpose vLLM. Support for models, accelerators and
+quantization paths outside the ones above has been deleted so the rest can be
+tuned hard. If you want to serve something else, use
+[upstream vLLM](https://github.com/vllm-project/vllm).
 
 What the specialization buys:
 
@@ -69,6 +110,10 @@ What the specialization buys:
 - TurboQuant compressed KV for the draft model (sliding-window support added here)
 - AITER sparse-MLA (DSA) attention with a working 1M-token path
 - ~154 s cold start on a 244 GiB model (even faster load time than llama.cpp)
+
+[antirez]: https://huggingface.co/antirez
+[ds4]: https://github.com/antirez/ds4
+[glm]: https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF
 
 ---
 
