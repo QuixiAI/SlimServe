@@ -81,6 +81,12 @@ class ChatParams:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     """The kwargs to pass to the chat template."""
 
+    tool_choice: Any | None = None
+    """Request-level tool choice for renderers that need API metadata."""
+
+    response_format: Any | None = None
+    """Request-level response format for renderers that need API metadata."""
+
     media_io_kwargs: dict[str, dict[str, Any]] | None = None
     """Per-modality kwargs for media I/O (loading/decoding images, videos, etc.)."""
 

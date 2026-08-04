@@ -195,6 +195,7 @@
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
         "reasoning_parser": "glm45",
+        "tool_call_parser": "glm47",
         "served_model_name": "GLM-5.2-Vision"
       },
       "speculative": true,
@@ -222,6 +223,7 @@
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
         "reasoning_parser": "glm45",
+        "tool_call_parser": "glm47",
         "served_model_name": "GLM-5.2-Vision"
       },
       "speculative": true,
@@ -261,6 +263,7 @@
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
         "reasoning_parser": "glm45",
+        "tool_call_parser": "glm47",
         "served_model_name": "GLM-5.2-Vision"
       },
       "speculative": true,
@@ -292,6 +295,7 @@
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
       "speculative": false,
@@ -318,6 +322,7 @@
         "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
       "speculative": false,
@@ -347,6 +352,7 @@
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
         "reasoning_parser": "kimi_k3",
+        "tool_call_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
       "speculative": false,
@@ -380,6 +386,7 @@
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
         "reasoning_parser": "kimi_k3",
+        "tool_call_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
       "speculative": false,
