@@ -417,15 +417,35 @@ EP pays an all-to-all dispatch and combine on all 93 MoE layers, which costs
 more than the extra four GPUs return. Tensor-parallel MoE would use a cheaper
 all-reduce -- and that is exactly the path that slices blocks.
 
-So the padding fix is no longer the expensive alternative; it is the only route
-to TP8 MoE without all-to-all. Pad the intermediate from 3072 to 4096 (16 Q2_K
-blocks) so the byte shard lands on whole blocks: 168 bytes = 2 blocks per rank,
-ranks 0-5 holding the 12 real blocks and 6-7 only zeros. Cost is ~33% more MoE
-weight memory and two idle ranks; the win is dropping all-to-all. Whether that
-beats TP6 is unmeasured. The loader must also clamp the narrow when
-`rank * shard_bytes >= src_bytes`; `padded_moe_intermediate_size` does not do
-this -- it enlarges the buffer but still derives the shard from
-`moe_intermediate_size // tp_size`.
+### The padding fix is not worth building
+
+Tensor-parallel MoE at TP8 would need the intermediate padded from 3072 to 4096
+so byte shards land on whole blocks. Work it out in per-rank intermediate units:
+
+    TP6, tensor-parallel MoE   3072 / 6 = 512 units = 2.0 blocks   works today
+    TP8, tensor-parallel MoE   3072 / 8 = 384 units = 1.5 blocks   slices blocks
+    TP8, padded to 4096        4096 / 8 = 512 units = 2.0 blocks   legal
+
+TP8-with-padding lands on **exactly** TP6's per-rank MoE work. The 33% padding
+waste cancels the two extra ranks to the unit, because 3072 happens to be
+6 x 2 blocks. So the fix would buy identical MoE throughput while costing ~33%
+more MoE weight memory per rank and two more GPUs. Do not build it.
+
+### What would actually make TP8 win
+
+Only two things, neither cheap:
+
+- **A real EP all-to-all.** `allgather_reducescatter` is the fallback; it
+  allgathers every token to all eight ranks and reduce-scatters back, twice per
+  MoE layer, 93 layers deep. AMD's MORI (`mori_low_latency`) is the ROCm
+  equivalent of DeepEP and is what `all2all_backend` is designed to accept, but
+  `mori`, `deep_ep` and `pplx_kernels` are all absent from this environment.
+  Installing MORI is the one lever with real headroom.
+- **A checkpoint whose `moe_intermediate_size` is a multiple of `256 * 8`.**
+  3072 is not; 4096 would be. Nothing to do about that here.
+
+Until then TP6 is the right profile for this checkpoint, and k3-8 exists for
+users who want all eight cards busy rather than the fastest answer.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
