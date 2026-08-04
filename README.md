@@ -143,6 +143,7 @@ an API answer come from one engine with one configuration.
 | `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
 | `k3-6` | Kimi K3 | 6 | MI300X |
 | `k3-8` | Kimi K3 | 8 | MI300X |
+| `k3-8t` | Kimi K3 | 8 | MI300X |
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -374,20 +375,33 @@ IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
 a BF16 vision tower.
 
 ```bash
+slimserve k3-8t           # tensor parallel across all 8 GPUs — fastest
 slimserve k3-6            # tensor parallel across 6 GPUs
 slimserve k3-8            # 4 replicas x TP2, experts split 112-per-rank
 ```
 
 | Profile | Topology | Why |
 | --- | --- | --- |
-| `k3-6` | TP6 | 16 attention heads per rank. |
-| `k3-8` | DP4 × TP2, EP8 | Uses all eight cards; smaller per-replica context. |
+| `k3-8t` | TP8 | 12 attention heads per rank, decoded by the HIP MLA kernel. |
+| `k3-6` | TP6 | 16 heads per rank; leaves two cards idle. |
+| `k3-8` | DP4 × TP2, EP8 | Aggregate throughput at high concurrency. |
 
-**TP8 is invalid.** 96 attention heads over 8 ranks gives 12 per rank, and the
-only viable ROCm MLA backend needs a multiple or divisor of 16. TP6 gives 16 and
-fits the checkpoint at ~142 GiB per GPU, leaving two cards idle — which is what
-`k3-8` reclaims by running four TP2 replicas and sharding the 896 routed experts
-112-per-rank instead of splitting every expert's matrices.
+**On TP8.** 96 attention heads over 8 ranks gives 12 per rank, which AITER's MLA
+cannot run: its gfx942 decode ships as pre-assembled code objects with the query
+head count baked in, so only multiples and divisors of 16 work. That made TP8
+unservable, and `k3-8` existed to reclaim the two cards TP6 leaves idle by
+running four TP2 replicas instead. But four two-GPU replicas is the wrong shape
+for latency — one replica serves any single request. `csrc/quixicore/rocm/`
+now carries a HIP decode kernel that takes the head count as a grid dimension,
+so TP8 runs, and `k3-8t` puts all eight cards on every request.
+
+Aggregate tok/s, 1k in / 2k out, `--ignore-eos`:
+
+| Profile | 1 | 4 | 8 |
+| --- | --- | --- | --- |
+| `k3-8t` (TP8, HIP MLA) | **34.6** | **106.4** | **149.8** |
+| `k3-6` (TP6, AITER MLA) | 32.8 | 91.7 | 122.5 |
+| `k3-8` (DP4 × TP2) | 11.3 | — | — |
 
 Two things are required and are set by the profiles: `kv_cache_dtype=auto`,
 because this fork defaults the cache to fp8 for GLM and K3 cannot use it, and
