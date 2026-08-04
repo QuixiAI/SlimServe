@@ -161,6 +161,16 @@ class AttentionBackend(ABC):
         return (not supported_head_sizes) or head_size in supported_head_sizes
 
     @classmethod
+    def supports_num_heads(cls, num_heads: int) -> bool:
+        """Whether this backend can serve a rank holding `num_heads` heads.
+
+        Backends whose kernels are built for particular head counts say so here
+        rather than asserting in the impl, so the selector can fall through to
+        one that fits instead of failing the whole engine.
+        """
+        return True
+
+    @classmethod
     def supports_dtype(cls, dtype: torch.dtype) -> bool:
         return dtype in cls.supported_dtypes
 
