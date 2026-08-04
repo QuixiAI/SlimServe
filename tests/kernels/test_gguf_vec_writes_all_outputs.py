@@ -17,7 +17,10 @@ leaving gaps there, which is why that path keeps its fill.
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization.gguf.ops import ggml_mul_mat_vec_a8
+from vllm.model_executor.layers.quantization.gguf.ops import (
+    ggml_moe_a8_vec,
+    ggml_mul_mat_vec_a8,
+)
 from vllm.platforms import current_platform
 
 if not current_platform.is_rocm():
@@ -57,4 +60,34 @@ def test_every_output_element_is_written(qtype, block_bytes, block_elems, cols, 
     out = ggml_mul_mat_vec_a8(weight, x, qtype, rows)
     assert not torch.isnan(out).any(), (
         f"{int(torch.isnan(out).sum())} of {out.numel()} outputs left unwritten"
+    )
+
+
+@pytest.mark.parametrize(("qtype", "block_bytes", "block_elems"), QUANTS)
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_moe_vector_kernel_writes_every_row(qtype, block_bytes, block_elems, tokens):
+    """Same contract on the expert path, which lost its pre-fill for the same reason.
+
+    Every (token, top_k) output row must be written, including when the router
+    sends several tokens to the same expert and when it sends none to some.
+    """
+    experts, top_k, cols, rows = 32, 8, 512, 3072
+    weight = torch.zeros(
+        (experts, rows, cols // block_elems * block_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    x = torch.randn(tokens, cols, device="cuda", dtype=torch.bfloat16)
+    topk_ids = torch.randint(
+        0, experts, (tokens, top_k), device="cuda", dtype=torch.int32
+    )
+
+    poison = torch.full(
+        (8, tokens * top_k, rows), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    del poison
+
+    out = ggml_moe_a8_vec(x, weight, topk_ids, top_k, qtype, rows, tokens)
+    assert not torch.isnan(out).any(), (
+        f"{int(torch.isnan(out).sum())} of {out.numel()} expert outputs unwritten"
     )
