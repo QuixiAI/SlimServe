@@ -143,6 +143,7 @@ an API answer come from one engine with one configuration.
 | `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
 | `k3-6` | Kimi K3 | 6 | MI300X |
 | `k3-8` | Kimi K3 | 8 | MI300X |
+| `k3-8t` | Kimi K3 | 8 | MI300X |
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -374,31 +375,43 @@ IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
 a BF16 vision tower.
 
 ```bash
-slimserve k3-6            # tensor parallel across 6 GPUs
+slimserve k3-6            # tensor parallel across 6 GPUs — fastest
+slimserve k3-8t           # all 8 cards, one replica, expert-parallel MoE
 slimserve k3-8            # 4 replicas x TP2, experts split 112-per-rank
 ```
 
 | Profile | Topology | Why |
 | --- | --- | --- |
-| `k3-6` | TP6 | 16 attention heads per rank. |
-| `k3-8` | DP4 × TP2, EP8 | Uses all eight cards; smaller per-replica context. |
+| `k3-6` | TP6 | Fastest. 16 attention heads per rank; two cards idle. |
+| `k3-8t` | TP8 + EP8 | All eight cards on every request, but slower — see below. |
+| `k3-8` | DP4 × TP2, EP8 | Aggregate throughput at high concurrency. |
 
-**TP8 does not work for this checkpoint.** Not for the reason previously given
-here — a HIP MLA decode kernel now serves the 12 attention heads per rank that
-AITER cannot. The blocker is the quantized MoE. `ffn_down_exps` is row-parallel,
-so tensor parallelism splits its *contiguous* dimension, which is also the
-dimension GGUF packs into 256-element quant blocks: 3072 elements = 12 Q2_K
-blocks = 1008 bytes per row. TP2/4/6 take 6/3/2 whole blocks per rank, but TP8
-takes 1.5, so every partition boundary cuts a block in half and each rank
-decodes scales and quants from the middle of one. The model then emits pure
-garbage while benchmarking at full speed, because `--ignore-eos` runs do not
-look at the output.
+Aggregate tok/s, 1k in / 2k out, `--ignore-eos`, each run gated on the model
+answering a known question first:
 
-Fixing it means making the shard boundaries block-aligned — either padding the
-intermediate size to a multiple of `256 * tp_size` (correct, ~33% more MoE
-weight memory, and two of eight ranks idle) or sharding the 12 blocks unevenly
-as 4x2 + 4x1 (lossless, but the fused MoE path assumes a uniform partition).
-Neither is implemented.
+| Profile | 1 | 8 |
+| --- | --- | --- |
+| `k3-6` | **34.0** | **120.4** |
+| `k3-8t` | 31.1 | 94.8 |
+
+**Why eight cards lose to six.** TP8 puts 12 attention heads on each rank, which
+AITER's MLA cannot run — its gfx942 decode ships as pre-assembled code objects
+with the head count baked in. The HIP kernel in `csrc/quixicore/rocm/` takes the
+head count as a grid dimension and serves it fine.
+
+The MoE is the real constraint. Tensor-sharding an expert splits its `w2` along
+the *packed byte* axis: 1008 bytes of Q2_K over 8 ranks is 126, and the
+`type_size` is 84, so every rank would start decoding 1.5 blocks into a
+quantized block and the model emits garbage. TP2/4/6 give 6/3/2 whole blocks,
+which is why only TP8 breaks. `k3-8t` avoids this with expert parallelism —
+each rank holds 112 of the 896 experts whole, so no block is ever cut — but EP
+pays an all-to-all dispatch and combine on all 93 MoE layers, and that costs
+more than the extra four GPUs return.
+
+Getting tensor-parallel MoE at TP8 would need the intermediate padded from 3072
+to 4096 so the byte shard lands on whole blocks, at ~33% more MoE weight memory
+with two of eight ranks holding only zeros. Not implemented, and not obviously a
+win.
 
 Two things are required and are set by the profiles: `kv_cache_dtype=auto`,
 because this fork defaults the cache to fp8 for GLM and K3 cannot use it, and
