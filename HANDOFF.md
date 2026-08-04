@@ -381,13 +381,19 @@ The corrected run took about 14.2, 9.8, and 9.7 seconds for the three requests
 after model initialization. It used the MIOpen vision patch-embedding fallback
 and completed without a vision-kernel failure.
 
-## Why TP6
+## Why TP6, and why TP8 now works
 
-TP8 is invalid for the only viable ROCm MLA backend: 96 heads / 8 ranks gives
-12 heads per rank, while AITER MLA requires a head count that is a multiple or
-divisor of 16. TP6 gives 16 heads per rank and fits the 858 GB checkpoint at
-about 142 GiB of weights per GPU. TP4 would exceed the memory budget and also
-fails the head rule. Two GPUs therefore remain idle.
+TP6 was chosen because TP8 could not start: 96 heads / 8 ranks gives 12 per
+rank, and AITER MLA requires a multiple or divisor of 16. TP6 gives 16 and fits
+the 858 GB checkpoint at about 142 GiB of weights per GPU; TP4 exceeds the
+memory budget and also fails the head rule. Two GPUs therefore remained idle.
+
+That constraint was AITER's, not the hardware's -- its gfx942 MLA decode ships
+as pre-assembled code objects with the query head count baked in. The HIP decode
+kernel in `csrc/quixicore/rocm/mla_decode_kernels.cuh` takes the head count as a
+grid dimension, so TP8 runs, and the `k3-8t` profile is the faster one: 34.6 /
+106.4 / 149.8 aggregate tok/s at concurrency 1 / 4 / 8, against TP6's 32.8 /
+91.7 / 122.5.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
