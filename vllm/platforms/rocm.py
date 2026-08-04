@@ -295,8 +295,6 @@ def on_gfx1x() -> bool:
     return _ON_GFX1X
 
 
-
-
 def on_gfx1100() -> bool:
     return _ON_GFX1100
 
@@ -315,8 +313,6 @@ def on_mi3xx() -> bool:
 
 def on_gfx9() -> bool:
     return _ON_GFX9
-
-
 
 
 def on_gfx942() -> bool:
@@ -530,6 +526,12 @@ class RocmPlatform(Platform):
                 )
             except ImportError:
                 invalid_reasons_i = ["ImportError"]
+            if (
+                not invalid_reasons_i
+                and num_heads is not None
+                and not backend_class.supports_num_heads(num_heads)
+            ):
+                invalid_reasons_i = [f"num_heads={num_heads} not supported"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = invalid_reasons_i
             else:
@@ -557,6 +559,12 @@ class RocmPlatform(Platform):
                 )
             except ImportError:
                 invalid_reasons = ["ImportError"]
+            if (
+                not invalid_reasons
+                and num_heads is not None
+                and not backend_class.supports_num_heads(num_heads)
+            ):
+                invalid_reasons = [f"num_heads={num_heads} not supported"]
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

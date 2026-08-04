@@ -66,6 +66,13 @@ class AiterMLABackend(MLACommonBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         return []
 
+    @classmethod
+    def supports_num_heads(cls, num_heads: int) -> bool:
+        # AITER ships its gfx942 MLA decode as pre-assembled code objects with
+        # the query-head count baked in, so only multiples and divisors of 16
+        # run. TP8 on Kimi K3 gives 12; TRITON_MLA takes over there.
+        return AiterMLAHelper.is_valid_num_heads(num_heads)
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # The aiter MLA decode kernel always operates with page_size=1
