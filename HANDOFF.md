@@ -381,69 +381,51 @@ The corrected run took about 14.2, 9.8, and 9.7 seconds for the three requests
 after model initialization. It used the MIOpen vision patch-embedding fallback
 and completed without a vision-kernel failure.
 
-## Why TP6, and why TP8 still does not work
+## TP8: what broke it, and what it costs
 
-TP6 was chosen because TP8 could not start: 96 heads / 8 ranks gives 12 per
-rank, and AITER MLA requires a multiple or divisor of 16. TP6 gives 16 and fits
-the 858 GB checkpoint at about 142 GiB of weights per GPU; TP4 exceeds the
-memory budget and also fails the head rule. Two GPUs therefore remain idle.
-
-The attention half of that is now solved: the HIP decode kernel in
+TP8 could not start at all until recently: 96 heads / 8 ranks gives 12 per rank
+and AITER MLA requires a multiple or divisor of 16. The HIP decode kernel in
 `csrc/quixicore/rocm/mla_decode_kernels.cuh` takes the head count as a grid
-dimension, so 12 heads per rank runs.
+dimension, so attention at 12 heads now runs.
 
-TP8 is still wrong, for an unrelated reason in the quantized MoE.
-`ffn_down_exps` is row-parallel, so TP splits its contiguous dimension -- which
-is the dimension GGUF packs into 256-element quant blocks. That dimension is
-3072 = 12 Q2_K blocks = 1008 bytes per row:
-
-    TP2  504 bytes = 6.00 blocks   ok
-    TP4  252 bytes = 3.00 blocks   ok
-    TP6  168 bytes = 2.00 blocks   ok
-    TP8  126 bytes = 1.50 blocks   slices a block in half
-
-Proven at runtime by tracing `_gguf_moe_weight_loader` during a TP8 load
-(`VLLM_TRACE_MOE_SHARD`), expert 0:
+That exposed a second, unrelated break in the quantized MoE. Traced from a live
+TP8 load (`VLLM_TRACE_MOE_SHARD`), expert 0:
 
     w1  src=(896, 3072, 924)   dst=(896, 768, 924)
     w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
     w3  src=(896, 3072, 924)   dst=(896, 768, 924)
 
-`w2`'s sharded axis is the **byte** axis: 1008 -> 126 bytes per rank, and Q2_K's
-`type_size` is 84, so each rank gets 1.5 blocks and starts decoding scales and
-quants halfway through one. `w1`/`w3` split dim 1 in *elements* (3072 -> 768,
-the fused 2x384) and leave their 924-byte axis whole, so they are safe at any
-tensor-parallel size.
+`w2`'s sharded axis is the **byte** axis. `_materialize_gguf_moe_param` divides
+it by `tp_size` with no block awareness: 1008 / 8 = 126, against a Q2_K
+`type_size` of 84, so every rank starts decoding 1.5 blocks in and the model
+emits `!!!!!!!!`. TP2/4/6 give 6/3/2 whole blocks, which is why only TP8 broke.
+`w1`/`w3` split dim 1 in *elements* and leave their byte axis whole, so they are
+safe at any size. Note `create_weights` sets `input_dim: 1` on w2, describing
+the logical layout rather than the packed one -- reading that attribute alone
+suggests the split is safe.
 
-Note `create_weights` sets `input_dim: 1` on w2, which describes the logical
-layout and not the packed one -- the packed tensor carries bytes in its last
-dim, and that is what gets narrowed. Reading that attribute alone suggests the
-split is safe; it is not.
+**The shipped fix is expert parallelism.** EP never slices inside an expert:
+each rank holds 112 of the 896 whole, so no quant block is ever cut. `k3-8t` is
+TP8 attention + EP8 MoE, verified 3/3 coherent.
 
-The model emits `!!!!!!!!` for every prompt, and `--ignore-eos` benchmarks
-report full throughput throughout, which is how a broken TP8 profile shipped.
+**But it is slower than TP6**, measured at 1k in / 2k out:
 
-`gate`/`up` are column-parallel and split the non-contiguous dim, so they are
-safe at every TP. The `padded_moe_intermediate_size` mechanism does not help:
-it enlarges the buffer but still shards at `moe_intermediate_size // tp_size`.
+    k3-8t  TP8 + EP8   31.07 tok/s @ c1   94.77 @ c8
+    k3-6   TP6         ~32.8             ~122.5
 
-A correct fix must make the byte shard a whole number of `type_size` blocks.
+EP pays an all-to-all dispatch and combine on all 93 MoE layers, which costs
+more than the extra four GPUs return. Tensor-parallel MoE would use a cheaper
+all-reduce -- and that is exactly the path that slices blocks.
 
-Option A -- pad the intermediate to a multiple of `256 * tp_size`: 3072 -> 4096
-(16 blocks). Per rank 168 bytes = 2 blocks; ranks 0-5 receive the 12 real
-blocks, ranks 6-7 only zeros. Uniform per-rank shapes, so the fused MoE path is
-unchanged, but it costs ~33% MoE weight memory and idles two ranks. The loader
-must clamp the narrow when `rank * shard_bytes >= src_bytes` and leave the
-destination zeroed, which the existing `padded_moe_intermediate_size` does not
-do -- that mechanism enlarges the buffer but still derives the shard from
+So the padding fix is no longer the expensive alternative; it is the only route
+to TP8 MoE without all-to-all. Pad the intermediate from 3072 to 4096 (16 Q2_K
+blocks) so the byte shard lands on whole blocks: 168 bytes = 2 blocks per rank,
+ranks 0-5 holding the 12 real blocks and 6-7 only zeros. Cost is ~33% more MoE
+weight memory and two idle ranks; the win is dropping all-to-all. Whether that
+beats TP6 is unmeasured. The loader must also clamp the narrow when
+`rank * shard_bytes >= src_bytes`; `padded_moe_intermediate_size` does not do
+this -- it enlarges the buffer but still derives the shard from
 `moe_intermediate_size // tp_size`.
-
-Option B -- shard the 12 blocks unevenly, 4 ranks x 2 blocks + 4 ranks x 1
-block. Lossless and better balanced, but `intermediate_size_per_partition`
-becomes rank-dependent, which touches the config plumbing and every consumer
-that assumes a uniform partition.
-
-Neither is implemented; the `k3-8t` profile has been withdrawn.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
