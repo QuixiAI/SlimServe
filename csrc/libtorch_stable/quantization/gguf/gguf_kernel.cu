@@ -132,13 +132,15 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
       X.get_device_index());
   auto Y = torch::stable::empty({vecs, row}, X.scalar_type(), std::nullopt,
                                 W.device());
-  // CUDA skips the output pre-fill here and in the mmq/moe entry points
-  // below: those kernels write every in-range dst element (moe_q zeroes its
-  // tile for invalid experts). At bs=1 decode the fills were ~560 extra
-  // launches per step. ROCm keeps the fill, unaudited.
-#ifdef USE_ROCM
-  torch::stable::fill_(Y, 0.0);
-#endif
+  // No output pre-fill: the vector kernels write every in-range dst element.
+  // Audited on gfx942 by poisoning Y with NaN and checking for survivors over
+  // Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and IQ2_XXS, at row counts that do and
+  // do not divide the tile -- clean for every type. The fill it replaces cost
+  // ~1.8us against 7-9us of kernel, i.e. a fifth of every bs=1 decode matmul,
+  // and there are hundreds of them per step.
+  //
+  // The mmq/moe entry points below keep theirs: the same audit shows the IQ2_XXS
+  // *tile* kernel leaving elements unwritten, so there the fill is load-bearing.
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({vecs, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
