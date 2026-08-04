@@ -365,36 +365,6 @@
         "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]
     },
-    "k3-8t": {
-      "title": "Kimi K3 on 8 GPUs, one replica",
-      "source": "kimi-k3",
-      "gpus": 8,
-      "platforms": ["mi300x"],
-      "default_quant": "IQ2_XXS-Q2_K",
-      "summary": "Tensor parallel across all eight cards: 12 attention heads per rank, served by the HIP MLA decode kernel. One replica, so the whole machine works on every request.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "max_model_len": 8192,
-        "max_num_seqs": 64,
-        "max_num_batched_tokens": 4096,
-        "gpu_memory_utilization": 0.95,
-        "block_size": 64,
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
-        "mm_encoder_tp_mode": "data",
-        "kv_cache_dtype": "auto",
-        "reasoning_parser": "kimi_k3",
-        "tool_call_parser": "kimi_k3",
-        "served_model_name": "Kimi-K3"
-      },
-      "speculative": false,
-      "env": {"VLLM_ROCM_USE_AITER": "1", "HSA_XNACK": "1"},
-      "chat_template_kwargs": {"thinking": false},
-      "notes": [
-        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
-        "HSA_XNACK=1 is required for this load.",
-        "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
-      ]
-    },
 
     "k3-8": {
       "title": "Kimi K3 on 8 GPUs",
