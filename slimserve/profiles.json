@@ -345,6 +345,7 @@
       "engine": {
         "tensor_parallel_size": 6,
         "max_model_len": 8192,
+        "max_num_seqs": 64,
         "max_num_batched_tokens": 4096,
         "gpu_memory_utilization": 0.95,
         "block_size": 64,
@@ -379,6 +380,7 @@
         "enable_ep_weight_filter": true,
         "all2all_backend": "allgather_reducescatter",
         "max_model_len": 8192,
+        "max_num_seqs": 64,
         "max_num_batched_tokens": 512,
         "gpu_memory_utilization": 0.95,
         "block_size": 64,
