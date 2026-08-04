@@ -433,19 +433,44 @@ more MoE weight memory per rank and two more GPUs. Do not build it.
 
 ### What would actually make TP8 win
 
-Only two things, neither cheap:
+Not a faster all-to-all. Measured on this box, 93 layers of decode collectives
+at the c8 shape:
 
-- **A real EP all-to-all.** `allgather_reducescatter` is the fallback; it
-  allgathers every token to all eight ranks and reduce-scatters back, twice per
-  MoE layer, 93 layers deep. AMD's MORI (`mori_low_latency`) is the ROCm
-  equivalent of DeepEP and is what `all2all_backend` is designed to accept, but
-  `mori`, `deep_ep` and `pplx_kernels` are all absent from this environment.
-  Installing MORI is the one lever with real headroom.
-- **A checkpoint whose `moe_intermediate_size` is a multiple of `256 * 8`.**
-  3072 is not; 4096 would be. Nothing to do about that here.
+    EP8   all_gather[8,3584] + reduce_scatter   10.08 ms   54.2 us/collective
+    TP6   2 x all_reduce[8,7168]                10.63 ms   57.2 us/collective
 
-Until then TP6 is the right profile for this checkpoint, and k3-8 exists for
-users who want all eight cards busy rather than the fastest answer.
+They cost the same, so replacing RCCL with a hand-written HIP peer-to-peer
+all-to-all would buy ~nothing. (54 us to move 56 KiB is ~98% latency, but TP6
+pays the same latency.)
+
+Nor is it the duplicate MoE work. Under pure TP+EP the attention all_reduce
+leaves tokens replicated on all 8 ranks, so the EP all_gather produces 64 rows
+of which 8 are unique and every local expert runs over all 64.
+`use_sequence_parallel_moe` exists to prevent exactly this but is gated on
+`data_parallel_size > 1`, so it is off for TP8/dp1. Dropping that gate --
+deduplicating the tokens -- made it **worse**: TPOT 31.45 -> 82.15 ms at c1 and
+80.98 -> 86.79 ms at c8. Reverted. The `dp > 1` guard is doing real work.
+
+The reason both fail is the same, and it is the governing fact for this model:
+
+**K3 decode is latency-bound on sequential kernel count, not on work.** The
+whole step runs at 4.4% of HBM roofline; MLA decode achieves 55-280 GB/s against
+5.3 TB/s; a collective spends 98% of its time on latency; and cutting MoE work
+8x made the step slower. Kernel count per rank does not change with tp_size --
+every rank still walks 93 layers -- so more GPUs cannot shorten a decode step.
+TP8 loses to TP6 because expert parallelism *adds* per-layer kernels (dispatch,
+combine, expert indexing) on top of an unchanged sequential depth.
+
+So the only lever that can make TP8 win is **fewer, larger kernels per layer**:
+fuse the EP dispatch/combine/index sequence, or drop EP entirely by making
+tensor-parallel MoE legal at 8 ranks (pad the intermediate 3072 -> 4096) and
+lose the extra collective and indexing kernels with it. The padding costs ~33%
+more MoE weight memory and gives per-rank MoE work identical to TP6 -- but on a
+latency-bound step that equality is not the point; removing kernels is.
+
+Unmeasured: the remaining ~13 ms of the 18 ms TPOT gap is not explained by
+collectives (equal) or MoE row count (dedup made it worse). Find it before
+building anything.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
