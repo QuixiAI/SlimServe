@@ -130,20 +130,11 @@ The five requested images are still available at:
 /tmp/testimg/jogging.jpg
 ```
 
-An untracked temporary runner, `.tmp_kimi_ep_smoke.py`, launches four external
-DP controller processes with TP2 each. Keep it while diagnosing, then delete it
-before committing. Run it with:
+The temporary `.tmp_kimi_ep_smoke.py` runner that drove this diagnosis has been
+removed; it was never committed. `slimserve k3-8` now covers the same ground,
+and `slimserve k3-8 --dry-run` prints the settings it used.
 
-```bash
-HSA_XNACK=1 \
-VLLM_USE_V1=1 \
-VLLM_ROCM_USE_AITER=1 \
-VLLM_GGUF_MMPROJ=/home/hotaisle/models/antirez-kimi-k3-gguf/mmproj-BF16.gguf \
-ROCR_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-.venv/bin/python -u .tmp_kimi_ep_smoke.py
-```
-
-The harness must pass K3's mode as
+Any replacement harness must pass K3's mode as
 `chat_template_kwargs={"thinking": False}`. `LLM.chat` does **not** accept a
 top-level `thinking=False` argument in this checkout. A first mechanical run
 left thinking enabled and exhausted the output cap on reasoning markers; that
@@ -273,7 +264,7 @@ cp _C_stable_libtorch.abi3.so ../../vllm/
 - [x] focused tests, compilation, pre-commit, and `git diff --check` pass
   (11 focused tests; ruff, format, typos, clang-format, markdownlint, mypy,
   SPDX, lazy imports, forbidden imports, and config checks);
-- [ ] remove `.tmp_kimi_ep_smoke.py`;
+- [x] remove `.tmp_kimi_ep_smoke.py`;
 - [ ] human-review every changed line before any commit or push, per
   `AGENTS.md`.
 
