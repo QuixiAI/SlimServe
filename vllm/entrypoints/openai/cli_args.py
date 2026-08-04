@@ -20,6 +20,7 @@ from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     validate_chat_template,
 )
+from vllm.entrypoints.openai.model_parsers import apply_default_parsers
 from vllm.entrypoints.openai.models.protocol import LoRAModulePath
 from vllm.entrypoints.serve.utils.constants import (
     H11_MAX_HEADER_COUNT_DEFAULT,
@@ -103,14 +104,16 @@ class BaseFrontendArgs:
     strings of the form 'token_id:{token_id}' so that tokens that are not
     JSON-encodable can be identified."""
     enable_auto_tool_choice: bool = True
-    """Always enabled. This fork serves one model (GLM-5.2-Vision), which
-    supports tool calling, so there is no reason to turn it off; the value
-    is forced on in `validate_parsed_serve_args`."""
+    """Always enabled. Every model this fork serves supports tool calling, so
+    there is no reason to turn it off; the value is forced on in
+    `validate_parsed_serve_args`."""
     exclude_tools_when_tool_choice_none: bool = False
     """If specified, exclude tool definitions in prompts when
     tool_choice='none'."""
     tool_call_parser: str = "glm47"
-    """Fixed to the GLM parser, which is the one this fork's model needs."""
+    """Defaults to the GLM parser, but the served model normally chooses:
+    `validate_parsed_serve_args` reads the architecture out of the GGUF and
+    selects the matching parser unless this was passed explicitly."""
     tool_parser_plugin: str = ""
     """Special the tool parser plugin write to parse the model-generated tool
     into OpenAI API format, the name register in this plugin can be used in
@@ -389,8 +392,13 @@ def validate_parsed_serve_args(args: argparse.Namespace):
     # Ensure that the chat template is valid; raises if it likely isn't
     validate_chat_template(args.chat_template)
 
-    # Tool calling is not optional here, and it always uses the GLM parser.
+    # Tool calling is not optional here. Which parser to use is the model's
+    # business, not the operator's: this fork serves three architectures that
+    # frame reasoning and tool calls differently, and the wrong parser fails
+    # quietly. apply_default_parsers reads the architecture out of the GGUF and
+    # fills both in, leaving an explicitly passed flag alone.
     args.enable_auto_tool_choice = True
+    apply_default_parsers(args)
     if not args.tool_call_parser:
         args.tool_call_parser = "glm47"
     if args.enable_log_outputs and not args.enable_log_requests:

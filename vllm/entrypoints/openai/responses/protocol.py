@@ -337,6 +337,10 @@ class ResponsesRequest(OpenAIBaseModel):
                 extra_kwargs,
             ),
             media_io_kwargs=self.media_io_kwargs,
+            # Mirrors the chat-completions path: only a request that
+            # actually carries tools should render a tool-choice
+            # instruction into the prompt.
+            tool_choice=self.tool_choice if self.tools else None,
         )
 
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
