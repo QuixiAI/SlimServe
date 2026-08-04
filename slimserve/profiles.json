@@ -346,7 +346,7 @@
         "enforce_eager": true,
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
-        "reasoning_parser": "glm45",
+        "reasoning_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
       "speculative": false,
@@ -355,7 +355,7 @@
       "notes": [
         "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
         "HSA_XNACK=1 is required for this load.",
-        "Served answers carry K3's XTML frame: content comes back as \"... <|close|> response <|sep|> <|close|> message <|sep|> <|end_of_msg|>\". The slimserve prompt strips it client-side; --serve clients see it. No parser in tree understands K3's frame -- glm45 is pinned because it at least leaves the answer in content, and it does not handle thinking mode, which K3 frames the same way rather than with <think>."
+        "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]
     },
 
@@ -379,7 +379,7 @@
         "enforce_eager": true,
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
-        "reasoning_parser": "glm45",
+        "reasoning_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
       "speculative": false,
