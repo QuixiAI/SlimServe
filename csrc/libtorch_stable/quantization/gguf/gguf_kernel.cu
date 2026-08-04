@@ -559,10 +559,9 @@ torch::stable::Tensor ggml_moe_a8_vec(
       X.get_device_index());
   auto Y = torch::stable::empty({tokens * top_k, row}, X.scalar_type(),
                                 std::nullopt, W.device());
-  // No pre-fill: audited like the mul_mat_vec path above -- the moe
-  // vector kernels cover every (token, top_k) output row for all seven
-  // quant types. ggml_moe_a8 above keeps its fill; its tile kernel is
-  // not audited.
+#ifdef USE_ROCM
+  torch::stable::fill_(Y, 0.0);
+#endif
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({tokens, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
