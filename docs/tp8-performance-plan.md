@@ -28,7 +28,25 @@ while the step is overhead-dominated.
 Current: `k3-6` 34.0 / 120.4 tok/s, `k3-8` 31.1 / 94.8 (c1 / c8).
 TPOT: 28.74 / 62.85 ms vs 31.45 / 80.98 ms.
 
-## Phase 0 — attribute the missing 13 ms (do this first)
+## Phase 0 — status: microbenchmarks are the wrong instrument
+
+Attempted and abandoned. Synthetic MoE microbenchmarks produced 888 ms against
+an 81 ms step, because these kernels' cost depends on the *routing
+distribution*: random `topk_ids` over 112 local experts touch nearly every
+expert's weights, while real EP routing touches far fewer. Attribution by
+microbenchmark does not work for the MoE.
+
+What did come out of reading the selection logic to build them: at c1 under
+TP8+EP, `w2_rows = num_tokens * top_k` is 8 * 16 = exactly 128, landing on the
+ROCm `VLLM_GGUF_MOE_VEC_W2` threshold. CUDA defaults that to 0 (always tile).
+Tested end to end -- forcing the tile kernel is **worse**: 31.14 -> 28.88 tok/s
+at c1, 94.80 -> 93.34 at c8. The ROCm default is correct; vec wins for w2 here.
+
+Attribution still needs a working profiler. `rocprofv3` aborts on tool
+registration on this box and TP8's workers are separate processes. Getting
+either fixed is the prerequisite for the rest of this plan.
+
+## Phase 0 (original) — attribute the missing 13 ms
 
 18 ms of the c8 TPOT gap is unexplained. Collectives are equal (EP8 10.08 ms vs
 TP6 10.63 ms) and MoE row count is disproven. Do not build anything until this
@@ -109,5 +127,8 @@ ordering should invert.
   → 82.15 ms at c1. The `dp > 1` gate is doing real work.
 - **Do not repack `w2` transposed to get a finer MoE split.** Measured: 384 vs
   512 units per rank is a 3–7% difference. Not worth a requantization.
+- **Do not force the MMQ tile kernel for w2 on ROCm.** Tried
+  `VLLM_GGUF_MOE_VEC_W2=0`: 31.14 -> 28.88 tok/s at c1. The 128-row default is
+  measured-correct, unlike the pre-fill it superficially resembles.
 - **Do not trust `--ignore-eos` throughput alone.** It reported 154 tok/s on a
   model emitting `!!!!!!!!`. The harness now gates on a known answer; keep it.
