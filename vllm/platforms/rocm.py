@@ -407,14 +407,19 @@ def _get_backend_priorities(
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
 
     if use_mla:
+        # HIP_MLA first: a native wave64 kernel with no head-count or paging
+        # constraints. AITER stays ahead of Triton behind it for the shapes its
+        # assembly does cover, and Triton remains the portable last resort.
         if rocm_aiter_ops.is_mla_enabled():
             return [
+                AttentionBackendEnum.HIP_MLA,
                 AttentionBackendEnum.ROCM_AITER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
             ]
         else:
             return [
+                AttentionBackendEnum.HIP_MLA,
                 AttentionBackendEnum.TRITON_MLA,
             ]
 

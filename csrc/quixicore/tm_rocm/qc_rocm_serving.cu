@@ -405,11 +405,14 @@ static void py_prepare_dflash_inputs(
 void init_sample(py::module_& m);
 // qc_rocm_sparse.cu: the ROCm sparse-MLA indexer index kernels.
 void init_sparse(py::module_& m);
+// qc_rocm_mla.cu: the HIP absorbed-MLA decode kernel.
+void init_mla(py::module_& m);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "QuixiCore-HIP serving kernels (gfx942)";
   init_sample(m);
   init_sparse(m);
+  init_mla(m);
   m.def("indexer_metadata", &py_indexer_metadata, py::arg("query_start_loc"),
         py::arg("uncompressed_seq_lens"), py::arg("cu_compressed_seq_lens"),
         py::arg("row_start_cu"), py::arg("token_to_seq"), py::arg("cu_ks"),

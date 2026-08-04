@@ -61,8 +61,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse.ROCMAiterMLASparseBackend"
     )
     QUIXICORE_MLA_SPARSE = (
-        "vllm.v1.attention.backends.mla.quixicore_mla_sparse."
-        "QuixiCoreMLASparseBackend"
+        "vllm.v1.attention.backends.mla.quixicore_mla_sparse.QuixiCoreMLASparseBackend"
     )
     XPU_MLA_SPARSE = "vllm.v1.attention.backends.mla.xpu_mla_sparse.XPUMLASparseBackend"
     TORCH_SDPA = ""  # this tag is only used for ViT
@@ -81,6 +80,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
         "vllm.v1.attention.backends.mla.flashinfer_mla_sparse."
         "FlashInferMLASparseSM120Backend"
     )
+    HIP_MLA = "vllm.v1.attention.backends.mla.hip_mla.HipMLABackend"
     TRITON_MLA = "vllm.v1.attention.backends.mla.triton_mla.TritonMLABackend"
     CUTLASS_MLA = "vllm.v1.attention.backends.mla.cutlass_mla.CutlassMLABackend"
     FLASHMLA = "vllm.v1.attention.backends.mla.flashmla.FlashMLABackend"
