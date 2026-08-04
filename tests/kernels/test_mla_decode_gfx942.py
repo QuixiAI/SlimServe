@@ -100,6 +100,35 @@ def test_context_longer_than_one_split():
     )
 
 
+def test_split_count_override_does_not_change_the_answer():
+    """The split count is a tuning knob, so no choice may alter the output.
+
+    Split-K correctness lives entirely in the running max/sum merge; a bug there
+    shows up as an answer that drifts with the slice count rather than as a
+    crash.
+    """
+    device = "cuda"
+    block_size = 16
+    q, kv_cache, block_table, lens = build_case(
+        2, 12, [700, 300], block_size, torch.bfloat16, device, seed=11
+    )
+    expected = reference(
+        q.cpu(), kv_cache.cpu(), block_table.cpu(), lens.cpu(), block_size
+    )
+    for splits in (1, 3, 8, 64, 256):
+        out = torch.empty(2, 12, LATENT, device=device, dtype=torch.bfloat16)
+        qc.mla_decode_fwd(
+            q, kv_cache, block_table, lens, out, SCALE, int(lens.max()), splits
+        )
+        torch.testing.assert_close(
+            out.cpu().to(torch.float64),
+            expected,
+            atol=6e-3,
+            rtol=6e-3,
+            msg=lambda m, s=splits: f"num_splits={s}: {m}",
+        )
+
+
 def test_large_paged_block_size():
     """K3 is hybrid, so its MLA pages are inflated to match the KDA state page.
 

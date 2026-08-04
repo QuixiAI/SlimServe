@@ -19,15 +19,20 @@ using namespace qc_rocm_mla;
 
 static cudaStream_t stream() { return at::cuda::getCurrentCUDAStream(); }
 
-// Enough slices to give every CU work at small batch, without splitting a
-// short context into slivers.
+// Split count, swept on MI300X (gfx942) at seq=3072, H=12, over B in
+// {1,2,4,8,16,32}: the optimum is 48-64 slices at *every* batch size, i.e. it
+// tracks the work in one slice, not the total wave count. Scaling slices down
+// as batch grows -- the obvious "we already have enough parallelism" rule --
+// costs 29% at B=16 and 50% at B=32, so it is not done here.
+//
+// ~48 KV tokens per slice is the knee. Below it the per-slice fixed cost (the
+// query load, and a reduce pass that grows with the slice count) dominates;
+// above it there is too little parallelism to hide the load latency.
 static int choose_num_splits(int batch, int num_heads, int max_seq_len) {
-  const int waves = batch * num_heads;
-  int splits = (2048 + waves - 1) / std::max(waves, 1);
-  splits = std::max(1, std::min(splits, 32));
-  // A slice shorter than a cache line's worth of tokens is pure overhead.
-  const int cap = std::max(1, max_seq_len / 64);
-  return std::min(splits, cap);
+  constexpr int kMinTokensPerSplit = 48;
+  constexpr int kMaxSplits = 64;
+  const int by_work = max_seq_len / kMinTokensPerSplit;
+  return std::max(1, std::min(by_work, kMaxSplits));
 }
 
 // max_seq_len comes from the metadata builder rather than seq_lens.max():
@@ -35,7 +40,8 @@ static int choose_num_splits(int batch, int num_heads, int max_seq_len) {
 // captured into a CUDA graph.
 void mla_decode_fwd(torch::Tensor q, torch::Tensor kv_cache,
                     torch::Tensor block_table, torch::Tensor seq_lens,
-                    torch::Tensor out, double scale, int64_t max_seq_len) {
+                    torch::Tensor out, double scale, int64_t max_seq_len,
+                    int64_t num_splits_override) {
   CK(q);
   CK(kv_cache);
   CK(block_table);
@@ -60,7 +66,10 @@ void mla_decode_fwd(torch::Tensor q, torch::Tensor kv_cache,
   const int bt_stride = (int)block_table.stride(0);
   if (batch == 0 || num_heads == 0) return;
 
-  const int num_splits = choose_num_splits(batch, num_heads, (int)max_seq_len);
+  const int num_splits =
+      num_splits_override > 0
+          ? (int)num_splits_override
+          : choose_num_splits(batch, num_heads, (int)max_seq_len);
 
   auto f32 = q.options().dtype(torch::kFloat);
   auto partial_out =
@@ -92,5 +101,6 @@ void mla_decode_fwd(torch::Tensor q, torch::Tensor kv_cache,
 void init_mla(py::module_& m) {
   m.def("mla_decode_fwd", &mla_decode_fwd, py::arg("q"), py::arg("kv_cache"),
         py::arg("block_table"), py::arg("seq_lens"), py::arg("out"),
-        py::arg("scale"), py::arg("max_seq_len"));
+        py::arg("scale"), py::arg("max_seq_len"),
+        py::arg("num_splits") = -1);
 }

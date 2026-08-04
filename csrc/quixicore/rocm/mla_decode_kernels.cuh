@@ -32,6 +32,7 @@ constexpr int kRope = 64;     // qk_rope_head_dim
 constexpr int kEntry = kLatent + kRope;  // one paged cache row
 constexpr int kLatentPerLane = kLatent / kWave;  // 8
 constexpr int kEntryPerLane = kEntry / kWave;    // 9
+constexpr int kGroup = 4;  // KV tokens processed per loop iteration
 
 // xor-reduction across a full 64-lane wavefront. Leaves the total in every
 // lane, so the score needs no shared memory and all lanes run the identical
@@ -105,13 +106,68 @@ __global__ void mla_decode_partition(
   float running_sum = 0.0f;
 
   const int* bt = block_table + int64_t(batch) * bt_stride;
-  for (int token = start; token < end; token++) {
+  int token = start;
+
+  // kGroup tokens per iteration. One token per iteration serialises the whole
+  // chain -- a long-latency row load, then a 6-deep shuffle reduction, then a
+  // dependent softmax update -- with nothing to overlap it. Issuing kGroup row
+  // loads before the first reduction gives the memory system that many requests
+  // in flight, and the reductions then pipeline into each other. It also folds
+  // kGroup accumulator rescales into one, since the running max only has to move
+  // once per group.
+  for (; token + kGroup <= end; token += kGroup) {
+    float kv[kGroup][kEntryPerLane];
+    bool live[kGroup];
+#pragma unroll
+    for (int j = 0; j < kGroup; j++) {
+      const int block = bt[(token + j) / block_size];
+      live[j] = block >= 0;
+      const int64_t base =
+          (int64_t(block < 0 ? 0 : block) * block_size +
+           ((token + j) % block_size)) * kEntry;
+#pragma unroll
+      for (int i = 0; i < kEntryPerLane; i++)
+        kv[j][i] = to_f32(kv_cache[base + lane + kWave * i]);
+    }
+
+    float score[kGroup];
+#pragma unroll
+    for (int j = 0; j < kGroup; j++) {
+      float partial = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kEntryPerLane; i++) partial += qv[i] * kv[j][i];
+      score[j] = live[j] ? wave_sum(partial) * scale : -FLT_MAX;
+    }
+
+    float group_max = running_max;
+#pragma unroll
+    for (int j = 0; j < kGroup; j++) group_max = fmaxf(group_max, score[j]);
+
+    const float alpha = __expf(running_max - group_max);
+    float beta[kGroup];
+#pragma unroll
+    for (int j = 0; j < kGroup; j++)
+      beta[j] = live[j] ? __expf(score[j] - group_max) : 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < kLatentPerLane; i++) {
+      float v = acc[i] * alpha;
+#pragma unroll
+      for (int j = 0; j < kGroup; j++) v += beta[j] * kv[j][i];
+      acc[i] = v;
+    }
+    running_sum *= alpha;
+#pragma unroll
+    for (int j = 0; j < kGroup; j++) running_sum += beta[j];
+    running_max = group_max;
+  }
+
+  for (; token < end; token++) {
     const int block = bt[token / block_size];
     if (block < 0) continue;
     const int64_t base =
         (int64_t(block) * block_size + (token % block_size)) * kEntry;
 
-    // One read of the row serves both the score and the accumulate.
     float kv[kEntryPerLane];
 #pragma unroll
     for (int i = 0; i < kEntryPerLane; i++)
