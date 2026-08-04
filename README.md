@@ -143,7 +143,6 @@ an API answer come from one engine with one configuration.
 | `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
 | `k3-6` | Kimi K3 | 6 | MI300X |
 | `k3-8` | Kimi K3 | 8 | MI300X |
-| `k3-8t` | Kimi K3 | 8 | MI300X |
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -376,15 +375,13 @@ a BF16 vision tower.
 
 ```bash
 slimserve k3-6            # tensor parallel across 6 GPUs — fastest
-slimserve k3-8t           # all 8 cards, one replica, expert-parallel MoE
-slimserve k3-8            # 4 replicas x TP2, experts split 112-per-rank
+slimserve k3-8            # tensor parallel across all 8 GPUs
 ```
 
 | Profile | Topology | Why |
 | --- | --- | --- |
 | `k3-6` | TP6 | Fastest. 16 attention heads per rank; two cards idle. |
-| `k3-8t` | TP8 + EP8 | All eight cards on every request, but slower — see below. |
-| `k3-8` | DP4 × TP2, EP8 | Aggregate throughput at high concurrency. |
+| `k3-8` | TP8, expert-parallel MoE | All eight cards on every request, but slower — see below. |
 
 Aggregate tok/s, 1k in / 2k out, `--ignore-eos`, each run gated on the model
 answering a known question first:
@@ -392,7 +389,7 @@ answering a known question first:
 | Profile | 1 | 8 |
 | --- | --- | --- |
 | `k3-6` | **34.0** | **120.4** |
-| `k3-8t` | 31.1 | 94.8 |
+| `k3-8` | 31.1 | 94.8 |
 
 **Why eight cards lose to six.** TP8 puts 12 attention heads on each rank, which
 AITER's MLA cannot run — its gfx942 decode ships as pre-assembled code objects
@@ -403,7 +400,7 @@ The MoE is the real constraint. Tensor-sharding an expert splits its `w2` along
 the *packed byte* axis: 1008 bytes of Q2_K over 8 ranks is 126, and the
 `type_size` is 84, so every rank would start decoding 1.5 blocks into a
 quantized block and the model emits garbage. TP2/4/6 give 6/3/2 whole blocks,
-which is why only TP8 breaks. `k3-8t` avoids this with expert parallelism —
+which is why only TP8 breaks. `k3-8` avoids this with expert parallelism —
 each rank holds 112 of the 896 experts whole, so no block is ever cut — but EP
 pays an all-to-all dispatch and combine on all 93 MoE layers, and that costs
 more than the extra four GPUs return.

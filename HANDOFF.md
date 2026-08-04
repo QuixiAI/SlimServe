@@ -405,12 +405,12 @@ the logical layout rather than the packed one -- reading that attribute alone
 suggests the split is safe.
 
 **The shipped fix is expert parallelism.** EP never slices inside an expert:
-each rank holds 112 of the 896 whole, so no quant block is ever cut. `k3-8t` is
-TP8 attention + EP8 MoE, verified 3/3 coherent.
+each rank holds 112 of the 896 whole, so no quant block is ever cut. `k3-8` is TP8
+attention + EP8 MoE, verified 3/3 coherent.
 
 **But it is slower than TP6**, measured at 1k in / 2k out:
 
-    k3-8t  TP8 + EP8   31.07 tok/s @ c1   94.77 @ c8
+    k3-8   TP8 + EP8   31.07 tok/s @ c1   94.77 @ c8
     k3-6   TP6         ~32.8             ~122.5
 
 EP pays an all-to-all dispatch and combine on all 93 MoE layers, which costs
