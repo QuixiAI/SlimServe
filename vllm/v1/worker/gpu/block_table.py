@@ -28,6 +28,51 @@ def _quixicore_disabled() -> bool:
 
 
 @cache
+def _integrity_checks_enabled() -> bool:
+    """VLLM_KV_INTEGRITY_CHECK=1 validates slot mappings before they are used.
+
+    Paged attention is all bookkeeping: a slot mapping that addresses the wrong
+    page returns another request's tokens, and the model stays fluent while
+    doing it, so the failure reads as a quality problem rather than a bug. This
+    turns that class into a loud abort. Off by default -- the check costs a
+    sort per step, and correct bookkeeping is the normal case.
+    """
+    import os
+
+    return os.environ.get("VLLM_KV_INTEGRITY_CHECK") == "1"
+
+
+def _check_slot_mappings(slot_mappings: torch.Tensor, num_tokens: int) -> None:
+    """Every token this step writes must own a distinct, real KV slot.
+
+    Catches aliasing (two tokens handed the same physical slot, so one
+    overwrites the other) and negative indices that are not the pad sentinel.
+    It does not catch a slot that is individually plausible but stale -- that
+    needs a generation tag on each page, which has to live in the allocator.
+    """
+    live = slot_mappings[:, :num_tokens]
+    for group, mapping in enumerate(live):
+        valid = mapping[mapping != PAD_SLOT_ID]
+        if valid.numel() == 0:
+            continue
+        if bool((valid < 0).any()):
+            bad = valid[valid < 0][:8].tolist()
+            raise RuntimeError(
+                f"KV integrity: group {group} produced negative slots {bad}, "
+                f"which are not the pad sentinel ({PAD_SLOT_ID})"
+            )
+        unique = torch.unique(valid)
+        if unique.numel() != valid.numel():
+            counts = torch.bincount(valid - int(valid.min()))
+            worst = int(torch.argmax(counts)) + int(valid.min())
+            raise RuntimeError(
+                f"KV integrity: group {group} mapped {valid.numel()} tokens "
+                f"onto {unique.numel()} distinct slots; slot {worst} is "
+                f"claimed {int(counts.max())} times in one step"
+            )
+
+
+@cache
 def _use_native(op_name: str) -> bool:
     """Prefer the native block-table kernel over the Triton one."""
     if _quixicore_disabled():
@@ -235,6 +280,8 @@ class BlockTables:
                 self.cp_interleave,
                 PAD_SLOT_ID,
             )
+            if _integrity_checks_enabled():
+                _check_slot_mappings(slot_mappings, num_tokens_padded)
             return slot_mappings[:, :num_tokens_padded]
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
@@ -252,6 +299,8 @@ class BlockTables:
             PAD_ID=PAD_SLOT_ID,
             TRITON_BLOCK_SIZE=1024,  # type: ignore
         )
+        if _integrity_checks_enabled():
+            _check_slot_mappings(slot_mappings, num_tokens_padded)
         return slot_mappings[:, :num_tokens_padded]
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
