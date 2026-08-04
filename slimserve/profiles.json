@@ -341,7 +341,7 @@
       "gpus": 6,
       "platforms": ["mi300x"],
       "default_quant": "IQ2_XXS-Q2_K",
-      "summary": "Tensor parallel across six cards. Two GPUs stay idle: TP8 gives 12 attention heads per rank and AITER MLA needs a multiple or divisor of 16, while TP4 does not fit.",
+      "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay idle, so prefer k3-8t on a full machine -- TP8 became servable once the HIP MLA kernel removed the 16-head floor.",
       "engine": {
         "tensor_parallel_size": 6,
         "max_model_len": 8192,
