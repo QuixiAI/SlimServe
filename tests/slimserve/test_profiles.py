@@ -103,3 +103,22 @@ def test_xtml_frame_is_stripped_from_the_answer(raw, expected):
 def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
     frame = FrameFilter()
     assert "".join(frame.feed(d) for d in deltas) + frame.flush() == expected
+
+
+def test_no_profile_ever_runs_eager():
+    """enforce_eager says performance does not matter, which is never true here.
+
+    K3 carried it from bring-up, where it was a debugging crutch, and it stayed
+    long enough to be measured as a throughput problem: a 93-layer decode step is
+    thousands of tiny launches, so eager makes the loop launch-bound and no
+    kernel work underneath it can help. Every profile gets CUDA graphs.
+    """
+    for profile_id in registry.profile_ids():
+        for platform in registry.describe(profile_id)["platforms"]:
+            engine = resolve(
+                profile_id, platform, registry.describe(profile_id)["gpus"], None
+            ).engine
+            assert not engine.get("enforce_eager"), profile_id
+            assert engine.get("compilation_config", {}).get("cudagraph_mode"), (
+                profile_id
+            )
