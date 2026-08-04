@@ -402,21 +402,48 @@ is the dimension GGUF packs into 256-element quant blocks. That dimension is
     TP6  168 bytes = 2.00 blocks   ok
     TP8  126 bytes = 1.50 blocks   slices a block in half
 
-`GGUFUninitializedParameter.load_row_parallel_weight` narrows dim 1 of the
-*packed* tensor, which is measured in bytes, by `shape[1] // tp_size` with no
-block-boundary check. At TP8 every rank therefore decodes scales and quants
-starting mid-block, and the model emits `!!!!!!!!` for every prompt.
+Proven at runtime by tracing `_gguf_moe_weight_loader` during a TP8 load
+(`VLLM_TRACE_MOE_SHARD`), expert 0:
+
+    w1  src=(896, 3072, 924)   dst=(896, 768, 924)
+    w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
+    w3  src=(896, 3072, 924)   dst=(896, 768, 924)
+
+`w2`'s sharded axis is the **byte** axis: 1008 -> 126 bytes per rank, and Q2_K's
+`type_size` is 84, so each rank gets 1.5 blocks and starts decoding scales and
+quants halfway through one. `w1`/`w3` split dim 1 in *elements* (3072 -> 768,
+the fused 2x384) and leave their 924-byte axis whole, so they are safe at any
+tensor-parallel size.
+
+Note `create_weights` sets `input_dim: 1` on w2, which describes the logical
+layout and not the packed one -- the packed tensor carries bytes in its last
+dim, and that is what gets narrowed. Reading that attribute alone suggests the
+split is safe; it is not.
+
+The model emits `!!!!!!!!` for every prompt, and `--ignore-eos` benchmarks
+report full throughput throughout, which is how a broken TP8 profile shipped.
 
 `gate`/`up` are column-parallel and split the non-contiguous dim, so they are
 safe at every TP. The `padded_moe_intermediate_size` mechanism does not help:
 it enlarges the buffer but still shards at `moe_intermediate_size // tp_size`.
 
-A correct fix must make the shard boundaries whole blocks. Either pad the
-intermediate to a multiple of `256 * tp_size` (3072 -> 4096; correct, costs
-~33% MoE weight memory, leaves two of eight ranks with only zero weights), or
-shard the 12 blocks unevenly as 4x2 + 4x1 (lossless, but the fused MoE path
-assumes a uniform partition per rank). Neither is implemented; the `k3-8t`
-profile has been withdrawn.
+A correct fix must make the byte shard a whole number of `type_size` blocks.
+
+Option A -- pad the intermediate to a multiple of `256 * tp_size`: 3072 -> 4096
+(16 blocks). Per rank 168 bytes = 2 blocks; ranks 0-5 receive the 12 real
+blocks, ranks 6-7 only zeros. Uniform per-rank shapes, so the fused MoE path is
+unchanged, but it costs ~33% MoE weight memory and idles two ranks. The loader
+must clamp the narrow when `rank * shard_bytes >= src_bytes` and leave the
+destination zeroed, which the existing `padded_moe_intermediate_size` does not
+do -- that mechanism enlarges the buffer but still derives the shard from
+`moe_intermediate_size // tp_size`.
+
+Option B -- shard the 12 blocks unevenly, 4 ranks x 2 blocks + 4 ranks x 1
+block. Lossless and better balanced, but `intermediate_size_per_partition`
+becomes rank-dependent, which touches the config plumbing and every consumer
+that assumes a uniform partition.
+
+Neither is implemented; the `k3-8t` profile has been withdrawn.
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
