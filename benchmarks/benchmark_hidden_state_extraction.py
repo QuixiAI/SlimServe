@@ -331,7 +331,6 @@ def main():
     parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     parser.add_argument("--max-cudagraph-capture-size", type=int, default=None)
     parser.add_argument("--max-model-len", type=int, default=None)
-    parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--load-format", type=str, default=None)
     parser.add_argument(
         "--profile",
@@ -364,8 +363,6 @@ def main():
                 "max_num_batched_tokens must be >= max_model_len since chunked prefill"
                 " is not supported by hidden state extraction."
             )
-    if args.enforce_eager:
-        extra_args["enforce_eager"] = True
     if args.load_format is not None:
         extra_args["load_format"] = args.load_format
     if args.max_cudagraph_capture_size is not None:

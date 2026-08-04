@@ -110,7 +110,6 @@ def run_worker(args):
         enable_chunked_prefill=False,
         max_num_seqs=args.batch_size,
         max_num_batched_tokens=max(max_model_len, args.batch_size * 64),
-        enforce_eager=False,
         disable_log_stats=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
         # SSM state dtype (applies to both standard and ReplaySSM).

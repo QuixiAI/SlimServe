@@ -81,8 +81,9 @@ DraftSampleMethod = Literal["greedy", "probabilistic"]
 class SpeculativeConfig:
     """Configuration for speculative decoding."""
 
-    enforce_eager: bool | None = None
-    """Override the default enforce_eager from model_config"""
+    disable_draft_cudagraphs: bool = False
+    """Run the drafter outside CUDA graphs. Only for draft models whose graphs
+    are known to be broken; it does not affect the target model."""
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
@@ -659,7 +660,7 @@ class SpeculativeConfig:
                 if self.target_model_config.hf_text_config.model_type == "deepseek_v32":
                     # FIXME(luccafong): cudagraph with v32 MTP is not supported,
                     # remove this when the issue is fixed.
-                    self.enforce_eager = True
+                    self.disable_draft_cudagraphs = True
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
                 # Align the quantization of draft model for cases such as
@@ -811,7 +812,6 @@ class SpeculativeConfig:
                     max_model_len=self.max_model_len,  # type: ignore[arg-type]
                     spec_target_max_model_len=self.target_model_config.max_model_len,
                     quantization=self.quantization,
-                    enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
                     hf_overrides=draft_hf_overrides,
                     config_format=self.target_model_config.config_format,

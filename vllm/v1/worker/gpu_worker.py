@@ -765,7 +765,7 @@ class Worker(WorkerBase):
         bootstamp(f"worker[{self.rank}]: kernel_warmup done")
 
         cuda_graph_memory_bytes = 0
-        if not self.model_config.enforce_eager:
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
         bootstamp(f"worker[{self.rank}]: capture_model done")
 
@@ -857,15 +857,11 @@ class Worker(WorkerBase):
                 self.scheduler_config.max_num_batched_tokens,
             )
             if self.cache_config.kv_cache_memory_bytes is not None:
-                max_capture_size = (
-                    self.compilation_config.max_cudagraph_capture_size
-                )
+                max_capture_size = self.compilation_config.max_cudagraph_capture_size
                 if max_capture_size is not None:
                     max_num_reqs = min(max_num_reqs, max_capture_size)
 
-            bootstamp(
-                f"worker[{self.rank}]: sampler warmup start n={max_num_reqs}"
-            )
+            bootstamp(f"worker[{self.rank}]: sampler warmup start n={max_num_reqs}")
             fixed_kv_budget = self.cache_config.kv_cache_memory_bytes is not None
             if fixed_kv_budget and not self.model_runner.is_pooling_model:
                 last_hidden_states = torch.empty(
@@ -876,9 +872,7 @@ class Worker(WorkerBase):
                     dtype=self.model_runner.dtype,
                     device=self.device,
                 )
-                self.model_runner._dummy_sampler_run(
-                    hidden_states=last_hidden_states
-                )
+                self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
             else:
                 # We skip EPLB here since we don't want to record dummy metrics.
                 hidden_states, last_hidden_states = self.model_runner._dummy_run(

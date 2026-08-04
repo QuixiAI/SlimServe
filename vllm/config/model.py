@@ -43,7 +43,6 @@ from vllm.transformers_utils.config import (
     uses_xdrope_dim,
 )
 from vllm.transformers_utils.gguf_utils import (
-    is_gguf,
     maybe_patch_hf_config_from_gguf,
 )
 from vllm.transformers_utils.model_arch_config_convertor import (
@@ -222,11 +221,6 @@ class ModelConfig:
     one of the values in `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = False
     """Whether to allow deprecated quantization methods."""
-    enforce_eager: bool = False
-    """Whether to always use eager-mode PyTorch. If True, we will disable CUDA
-    graph and always execute the model in eager mode. If False, we will use
-    CUDA graph and eager execution in hybrid for maximal performance and
-    flexibility."""
     enable_return_routed_experts: bool = False
     """Whether to return routed experts."""
     max_logprobs: int = Field(default=20, ge=-1)
@@ -405,7 +399,6 @@ class ModelConfig:
             "allowed_media_domains",
             "tokenizer_revision",
             "spec_target_max_model_len",
-            "enforce_eager",
             "logprobs_mode",
             "use_fp64_gumbel",
             "disable_cascade_attn",
@@ -771,7 +764,6 @@ class ModelConfig:
             # clearing is applied (and cached for later with_hf_config calls).
             self.model_arch_config = self.get_model_arch_config()
 
-
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len
             # can be correctly capped to sliding window size
@@ -781,8 +773,6 @@ class ModelConfig:
         self.config_updated = False
         self._try_verify_and_update_model_config()
         self._verify_quantization()
-        self._verify_cuda_graph()
-        self._verify_bnb_config()
 
     def _supports_multimodal_for_mm_prefix(self) -> bool:
         """Whether multimodal inputs can still appear for this deployment.
@@ -1196,44 +1186,19 @@ class ModelConfig:
                     self.quantization,
                 )
 
-    def _verify_cuda_graph(self) -> None:
-        # CUDAGraph capture not supported for encoder-decoder models on ROCm
-        unsupported_rocm = self.is_encoder_decoder
-        if unsupported_rocm and not self.enforce_eager and current_platform.is_rocm():
-            logger.warning(
-                "CUDA graph is not supported for %s on ROCm yet, fallback "
-                "to eager mode.",
-                self.model_arch_config.model_type,
-            )
-            self.enforce_eager = True
-
-    def _verify_bnb_config(self) -> None:
-        """
-        The current version of bitsandbytes (0.46.1) with 8-bit models does not
-        yet support CUDA graph.
-        # TODO Remove this when bitsandbytes supports.
-        """
-        is_bitsandbytes = self.quantization == "bitsandbytes"
-        has_quantization_config = self.model_arch_config.quantization_config is not None
-        is_8bit = (
-            self.model_arch_config.quantization_config.get("load_in_8bit", False)  # type: ignore[union-attr]
-            if has_quantization_config
-            else False
-        )
-        if all(
-            [
-                is_bitsandbytes,
-                has_quantization_config,
-                is_8bit,
-                not self.enforce_eager,
-            ]
+    def cudagraph_unsupported_reason(self) -> str | None:
+        """Why this model cannot be captured into CUDA graphs, if it cannot."""
+        if self.is_encoder_decoder and current_platform.is_rocm():
+            return f"{self.model_arch_config.model_type} is encoder-decoder on ROCm"
+        quantization_config = self.model_arch_config.quantization_config
+        if self.quantization == "bitsandbytes" and (
+            quantization_config is not None
+            and quantization_config.get("load_in_8bit", False)
         ):
-            logger.warning(
-                "CUDA graph is not supported on BitsAndBytes 8bit yet, "
-                "fallback to the eager mode."
-            )
-
-            self.enforce_eager = True
+            # TODO Remove this when bitsandbytes supports CUDA graph (0.46.1
+            # does not).
+            return "bitsandbytes 8-bit"
+        return None
 
     def _verify_with_expert_parallelism(self) -> None:
         if not self.is_moe:

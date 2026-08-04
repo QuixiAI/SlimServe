@@ -1183,13 +1183,16 @@ class VllmConfig:
                 "precision for chunked prefill triton kernels."
             )
 
-        if self.model_config is not None and self.model_config.enforce_eager:
-            logger.warning(
-                "Enforce eager set, disabling torch.compile and CUDAGraphs. "
-                "This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none"
-            )
-            self.compilation_config.mode = CompilationMode.NONE
-            self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        if self.model_config is not None:
+            unsupported = self.model_config.cudagraph_unsupported_reason()
+            if unsupported is not None:
+                logger.warning(
+                    "CUDA graphs are not supported for %s; disabling "
+                    "torch.compile and CUDA graphs for this model.",
+                    unsupported,
+                )
+                self.compilation_config.mode = CompilationMode.NONE
+                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
 
         if os.environ.get("TORCH_COMPILE_DISABLE") == "1":
             logger.warning(
@@ -1411,11 +1414,7 @@ class VllmConfig:
                     )
                     self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
-            # disable cudagraph when enforce eager execution
-            if self.model_config is not None and self.model_config.enforce_eager:
-                logger.info("Cudagraph is disabled under eager mode")
-                self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-                # override related settings when enforce eager
+            if self.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
                 self.compilation_config.max_cudagraph_capture_size = 0
                 self.compilation_config.cudagraph_capture_sizes = []
             else:
@@ -1806,7 +1805,6 @@ class VllmConfig:
 
         if (
             self.model_config is not None
-            and not self.model_config.enforce_eager
             and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         ):
             # determine the initial max_cudagraph_capture_size
@@ -2133,7 +2131,6 @@ class VllmConfig:
             f"disable_custom_all_reduce={self.parallel_config.disable_custom_all_reduce}, "  # noqa
             f"quantization={self.model_config.quantization}, "
             f"quantization_config={self.model_config.quantization_config}, "  # noqa
-            f"enforce_eager={self.model_config.enforce_eager}, "
             f"enable_return_routed_experts={self.model_config.enable_return_routed_experts}, "  # noqa
             f"kv_cache_dtype={self.cache_config.cache_dtype}, "
             f"device_config={self.device_config.device}, "

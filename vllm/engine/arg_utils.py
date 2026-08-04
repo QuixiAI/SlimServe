@@ -172,9 +172,7 @@ def _default_glm_dspark_config(
     }
     from vllm.platforms import current_platform
 
-    if current_platform.is_cuda() and not current_platform.has_device_capability(
-        89
-    ):
+    if current_platform.is_cuda() and not current_platform.has_device_capability(89):
         # Draft KV stays bf16 below sm89: the standard-attention backends
         # there reject fp8 KV (no fp8e4nv), and the draft cache is tiny.
         cfg["kv_cache_dtype"] = "auto"
@@ -603,7 +601,6 @@ class EngineArgs:
     shorthand when `quantization` is one of the values in
     `ONLINE_QUANT_SHORTHAND_NAMES`."""
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
-    enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
@@ -903,7 +900,6 @@ class EngineArgs:
             "--allow-deprecated-quantization",
             **model_kwargs["allow_deprecated_quantization"],
         )
-        model_group.add_argument("--enforce-eager", **model_kwargs["enforce_eager"])
         model_group.add_argument(
             "--enable-return-routed-experts",
             **model_kwargs["enable_return_routed_experts"],
@@ -1747,7 +1743,6 @@ class EngineArgs:
             quantization=self.quantization,
             quantization_config=self.quantization_config,
             allow_deprecated_quantization=self.allow_deprecated_quantization,
-            enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
             max_logprobs=self.max_logprobs,
             logprobs_mode=self.logprobs_mode,
@@ -1850,9 +1845,7 @@ class EngineArgs:
             self.speculative_config[key] = value
 
         if self.speculative_config is None:
-            self.speculative_config = _default_glm_dspark_config(
-                target_model_config
-            )
+            self.speculative_config = _default_glm_dspark_config(target_model_config)
         if self.speculative_config is None:
             return None
 

@@ -320,7 +320,7 @@ llm = LLM(
     max_num_batched_tokens=4096,
     gpu_memory_utilization=0.95,
     block_size=64,
-    enforce_eager=True,
+    compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
     mm_encoder_tp_mode="data",
     kv_cache_dtype="auto",
 )

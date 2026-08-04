@@ -189,7 +189,6 @@ def create_minimal_vllm_config(
             seed=0,
             max_model_len=max_model_len,
             quantization=None,
-            enforce_eager=False,
             max_logprobs=20,
             disable_sliding_window=False,
             skip_tokenizer_init=True,

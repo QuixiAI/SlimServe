@@ -251,7 +251,7 @@ class ExtractHiddenStatesProposer:
         """
         assert self.vllm_config.speculative_config is not None
         if (
-            not self.vllm_config.speculative_config.enforce_eager
+            not self.vllm_config.speculative_config.disable_draft_cudagraphs
             and cudagraph_mode.mixed_mode()
             in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
         ):

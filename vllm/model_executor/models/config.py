@@ -462,8 +462,7 @@ class JinaRobertaModelConfig(VerifyAndUpdateConfig):
             # because it can't be divided by triton num_warps(default=4 or 8).
             # To deal with this, we increase max_position to multiple of n_warps,
             # so that triton kernel won't hit out-of-bound index in RoPE cache.
-            if not model_config.enforce_eager:
-                max_position = round_up(max_position, 8)
+            max_position = round_up(max_position, 8)
 
             rotary_dim = getattr(config, "rotary_emb_dim", head_dim)
             config.rope_parameters["partial_rotary_factor"] = rotary_dim / head_dim

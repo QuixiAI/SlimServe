@@ -15,7 +15,6 @@ LONG_PROMPT = " ".join(LONG_PROMPT)
 def main(args):
     llm = LLM(
         model=args.model,
-        enforce_eager=True,
         enable_prefix_caching=True,
         tensor_parallel_size=args.tensor_parallel_size,
     )
