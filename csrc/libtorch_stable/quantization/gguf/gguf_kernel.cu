@@ -139,8 +139,9 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
   // ~1.8us against 7-9us of kernel, i.e. a fifth of every bs=1 decode matmul,
   // and there are hundreds of them per step.
   //
-  // The mmq/moe entry points below keep theirs: the same audit shows the IQ2_XXS
-  // *tile* kernel leaving elements unwritten, so there the fill is load-bearing.
+  // The mmq/moe entry points below keep theirs: the same audit shows the
+  // IQ2_XXS *tile* kernel leaving elements unwritten, so there the fill is
+  // load-bearing.
   cudaStream_t stream = get_current_cuda_stream();
   auto quant_X = torch::stable::empty({vecs, padded / 32 * 9},
                                       torch::headeronly::ScalarType::Int,
@@ -552,7 +553,7 @@ torch::stable::Tensor ggml_moe_a8_vec(
     torch::stable::Tensor X,  // input
     torch::stable::Tensor W,  // expert weights
     torch::stable::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row,
-    int64_t tokens) {
+    int64_t tokens, bool expert_parallel) {
   int64_t col = X.sizes()[1];
   const int64_t padded = (col + 512 - 1) / 512 * 512;
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -641,7 +642,7 @@ torch::stable::Tensor ggml_moe_a8_vec(
         moe_vec_iq2_xxs_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
-            col, row, quant_X.stride(0), stream);
+            col, row, quant_X.stride(0), stream, expert_parallel);
         break;
       case 17:
         moe_vec_iq2_xs_q8_1_cuda<scalar_t>(

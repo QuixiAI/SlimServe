@@ -1,12 +1,16 @@
 # Kimi K3 GGUF on MI300X — handoff
 
+<!-- markdownlint-disable MD013 -->
+
 Updated: 2026-08-06 UTC
 
 ## Resume here
 
-Kimi K3 serves correctly on this box. The open problem is that **TP8 is slower
-than TP6 and we have not yet found why**, and the next step is blocked on
-getting a profiler working. Everything below is what you need to pick that up.
+Kimi K3 serves correctly on this box. **TP8 now beats TP6 at c8.** The
+regression was the IQ2_XXS `w13` vector kernel expanding every route over the
+full 6144 output rows even though expert parallelism makes 7/8 of the routes
+non-local. The working-tree change adds an EP-aware, token-major kernel that
+loops over the 16 routes inside each workgroup.
 
 ### Verified state
 
@@ -15,13 +19,15 @@ answering a known question first. Both coherence-checked 3/3 on arithmetic,
 geography and general knowledge.
 
 | profile | topology | c1 tok/s | c8 tok/s | TPOT c1 / c8 |
-|---|---|---|---|---|
-| `k3-6` | TP6, tensor-parallel MoE | **34.0** | **120.4** | 28.74 / 62.85 ms |
-| `k3-8` | TP8, expert-parallel MoE | 31.1 | 94.8 | 31.45 / 80.98 ms |
+| --- | --- | --- | --- | --- |
+| `k3-6` | TP6, tensor-parallel MoE | **34.0** | 120.4 | 28.74 / 62.85 ms |
+| `k3-8` before fix | TP8, expert-parallel MoE | 31.1 | 94.8 | 31.45 / 80.98 ms |
+| `k3-8` now | TP8, EP token-major `w13` | not rerun | **124.6** | not rerun / **60.78 ms** |
 
-`k3-6` is the fastest profile and the one to serve. For reference, at the start
-of this work it managed 6.30 tok/s single stream and crashed outright at
-concurrency 8.
+`k3-8` is now the fastest measured c8 profile: 3.5% more throughput and 3.3%
+lower TPOT than TP6. Its c1 result has not been rerun on this build, so retain
+the TP6 c1 number for latency comparisons. For reference, at the start of this
+work TP6 managed 6.30 tok/s single stream and crashed outright at concurrency 8.
 
 ### How to run anything
 
@@ -32,9 +38,9 @@ source /home/hotaisle/SlimServe/.venv/bin/activate   # never system python/pip
 Serving and one-shot chat:
 
 ```bash
-slimserve k3-6                 # interactive
-slimserve k3-6 --serve         # OpenAI endpoint
-slimserve k3-6 -p "2 + 2?"     # one shot
+slimserve k3-8                 # interactive
+slimserve k3-8 --serve         # OpenAI endpoint
+slimserve k3-8 -p "2 + 2?"     # one shot
 slimserve --list               # legal profiles
 ```
 
@@ -56,42 +62,57 @@ full speed. This cost two iterations of reported "gains" on a broken build
 before it was caught. The harness now gates on a correct answer; keep that gate,
 and never report a number from a run that skipped it.
 
-## The open problem: why TP8 loses to TP6
+## Why TP8 used to lose to TP6 — attributed
 
-18 ms of the c8 TPOT gap (62.85 → 80.98 ms) is unattributed. Collectives are
-equal and MoE row count is disproven, so it is something else.
+Matched 120-second `rocprofv3` traces of rank 0 account for 17.90 ms of the
+18.13 ms c8 TPOT gap (62.85 → 80.98 ms). The residual is 0.23 ms, well within
+run noise. The profiled runs themselves were slower, so use the original
+coherence-gated numbers above for throughput and the matched traces only for
+kernel attribution.
 
 ### What is measured
 
 | component | cost per decode step | how |
-|---|---|---|
-| MLA attention, 24 layers | 2.49 ms (4.7%) | in-graph microbenchmark |
-| KDA attention, 69 layers | 0.77 ms (1.0–1.5%) | in-graph microbenchmark |
-| `mul_mat_vec` (dense) | ~17% | inferred from a 20% kernel cut giving 3.4% |
+| --- | --- | --- |
+| TP8 IQ2_XXS `w13` MoE vec | 37.87 ms | rank-0 kernel trace, 92 calls/step |
+| TP6 IQ2_XXS `w13` MoE vec | 16.66 ms | matched trace, 92 calls/step |
+| TP8 Q2_K `w2` MoE vec | 6.48 ms | rank-0 kernel trace, 92 calls/step |
+| TP6 Q2_K `w2` MoE vec | 9.79 ms | matched trace, 92 calls/step |
 | EP8 collectives | 10.08 ms | 8-GPU torchrun, 93 layers |
 | TP6 collectives | 10.63 ms | same |
-| **residual** | **~13 ms** | **unattributed** |
+| **net traced MoE penalty** | **17.90 ms** | vs **18.13 ms** end to end |
 
 ### The governing fact
 
-**K3 decode is overhead-bound, not work-bound.** Five independent measurements:
-the step runs at 4.4% of HBM roofline; MLA decode achieves 55–280 GB/s against
-5300; one 56 KiB collective takes 54 µs (~98% latency); halving MoE work per
-rank changes it 3–7%; and deduplicating MoE tokens 8× made it *slower*.
+`moe_vec_q` launches one output-row workgroup for every `(token, route)` pair.
+For eight tokens and top-k 16, TP8 launches 6144 × 128 = 786,432 workgroups per
+MoE layer. Only about 1/8 of routes are local, so 688,128 workgroups read a `-1`
+expert id, write zero, and return. TP6 tensor-shards `w13` to 1024 rows and all
+routes are valid, so it launches only 1024 × 128 = 131,072 useful workgroups.
 
-Kernel count per rank does not change with `tp_size` — every rank still walks 93
-layers — so more GPUs cannot shorten a decode step. TP8 loses because expert
-parallelism *adds* per-layer kernels on top of unchanged sequential depth.
+This geometry makes TP8 `w13` 230.59 µs/call slower: 21.21 ms over 92 MoE
+layers. TP8's `w2` is 35.99 µs/call faster, recovering 3.31 ms. The net 17.90
+ms is the regression. This is not an extra-launch or collective problem: the
+MoE call counts match; it is excessive work inside the same `w13` calls.
 
-The plan for fixing this is `docs/tp8-performance-plan.md`. Its short form: cut
-kernels per layer, then the step becomes work-bound, and only then does 8 > 6.
+The fix plan is `docs/tp8-performance-plan.md`. Keep `w2` on its current path;
+it already wins on TP8. Change only the EP `w13` geometry: launch over tokens,
+loop over top-k routes inside each workgroup, and skip non-local experts. The
+new kernel writes zeros for skipped routes without launching a separate
+workgroup for every route and output row.
+
+That fix is implemented in the current working tree. At the exact live shape,
+the route-major op took 406.89 µs and the token-major op 112.23 µs (3.63×), with
+bit-identical output. The unchanged end-to-end harness passed its Paris gate and
+measured 124.62 tok/s / 60.78 ms TPOT at c8, up from 94.8 / 80.98. The separate
+three-question evaluation passed 3/3 (`4`, `Paris`, `The Pacific Ocean`).
 
 ### Dead ends — do not retry
 
 Each was tested end to end with a number:
 
 | idea | result |
-|---|---|
+| --- | --- |
 | Hand-written HIP peer-to-peer all-to-all | EP8 collectives 10.08 ms vs TP6 10.63 ms — not the differentiator |
 | `use_sequence_parallel_moe` at dp1 (drop the `dp > 1` gate) | TPOT 31.45 → 82.15 ms at c1. The gate is doing real work |
 | `VLLM_GGUF_MOE_VEC_W2=0` (force MMQ tile for w2) | 31.14 → 28.88 tok/s at c1. The ROCm 128-row default is correct |
@@ -99,21 +120,54 @@ Each was tested end to end with a number:
 | Pad intermediate 3072 → 4096 for tensor-parallel MoE at TP8 | Per-rank work becomes 512, identical to TP6, and work is not what costs |
 | Vectorized (`dwordx4`) loads in the MLA kernel | Both layouts move 18 cache lines/row; instruction count is not the limit |
 
-### The blocking item
+### Working profiler recipe
 
-`rocprofv3` aborts here with *"Configuration request occurred outside of valid
-rocprofiler configuration period"* (api registration error 16), and TP8's
-workers are separate processes so in-process profilers cannot see them.
-Synthetic MoE microbenchmarks do **not** substitute: they gave 888 ms against an
-81 ms step, because MoE cost tracks the routing distribution and random
-`topk_ids` over 112 local experts touch nearly every expert's weights.
+The original registration failure came from mixing PyTorch's bundled,
+unversioned rocprofiler SDK/register libraries with the system ROCm 7.2.4
+profiler. The working setup is:
 
-Getting a profiler working is the prerequisite for everything else. Likely
-angles: the `HSA_TOOLS_LIB` / library-interposition hazard in
-`~/QuixiCore/QuixiCore-ROCm/perf/perf.md` §4, or attaching to a single worker
-rather than the launcher.
+1. Build two empty shared-library shims whose SONAMEs are the unversioned names
+   PyTorch requests and whose `NEEDED` entries point to the system
+   `librocprofiler-sdk.so.1` and `librocprofiler-register.so.0`.
+2. Preload the register shim before the SDK shim, set `ROCP_TOOL_ATTACH=1`, and
+   start the benchmark normally. This loads
+   `/opt/rocm/lib/librocprofiler-sdk-attach.so` before HSA initialization.
+3. With Yama `ptrace_scope=1`, have each worker call
+   `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` at startup. A temporary
+   `sitecustomize.py` on `PYTHONPATH` is sufficient.
+4. After CUDA/HIP initialization, identify rank 0 and attach:
+
+   ```bash
+   rocprofv3 --attach <rank-0-pid> --attach-duration-msec 120000 \
+     --kernel-trace --output-format csv --output-directory <trace-dir>
+   ```
+
+Attaching before `torch.cuda.init()` returned no trace; direct launch reproduced
+the registration error. The successful TP8 trace has 7,096,093 dispatches over
+120.111 seconds; the matched TP6 trace has 7,963,792 over 119.285 seconds.
+Synthetic MoE microbenchmarks remain unsuitable because random routing changes
+which experts' weights are touched.
 
 ## What changed in this work
+
+Uncommitted current working tree:
+
+- Attribute the entire TP8 regression with matched rank-0 kernel traces.
+- Add the EP token-major IQ2_XXS `w13` kernel and route only EP `w13` calls to it.
+- Add a mixed local/non-local expert correctness test to the existing GGUF
+  vector test file.
+- Validate 3/3 coherence and c8 at 124.62 tok/s / 60.78 ms TPOT.
+
+Validation run:
+
+- Focused EP kernel test: 1 passed.
+- `tests/model_executor/test_kimi_k3_ep.py`: 11 passed.
+- Selected pre-commit hooks: all passed, including Ruff, mypy, clang-format,
+  markdownlint, SPDX, and configuration checks.
+- The full `test_gguf_vec_writes_all_outputs.py` run was 8 passed / 7 failed in
+  its older dequant-reference cases. Those cases feed arbitrary bytes to quant
+  formats and produce pathological scales; the new EP test passes. Do not claim
+  the whole file is green.
 
 Committed, newest first:
 
@@ -216,7 +270,7 @@ Tensor-sharding the MoE splits each expert's `w2` along its **packed byte**
 axis. Traced from a live TP8 load (`VLLM_TRACE_MOE_SHARD` in
 `_gguf_moe_weight_loader`), expert 0:
 
-```
+```text
 w1  src=(896, 3072, 924)   dst=(896, 768, 924)
 w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
 w3  src=(896, 3072, 924)   dst=(896, 768, 924)

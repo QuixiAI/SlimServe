@@ -775,6 +775,7 @@ if hasattr(torch.ops._C, "ggml_moe_a8_vec"):
         quant_type: int,
         row: torch.SymInt,
         tokens: torch.SymInt,
+        expert_parallel: bool = False,
     ) -> torch.Tensor:
         tokens = X.size(0)
         return torch.empty((tokens * top_k, row), dtype=X.dtype, device=W.device)
@@ -2143,8 +2144,11 @@ def ggml_moe_a8_vec(
     quant_type: int,
     row: torch.SymInt,
     tokens: torch.SymInt,
+    expert_parallel: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_a8_vec(X, W, topk_ids, top_k, quant_type, row, tokens)
+    return torch.ops._C.ggml_moe_a8_vec(
+        X, W, topk_ids, top_k, quant_type, row, tokens, expert_parallel
+    )
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:
@@ -3913,8 +3917,6 @@ def cpu_gemm_wna16(
         isa_hint,
     )
     return output
-
-
 
 
 def cpu_prepack_moe_weight(

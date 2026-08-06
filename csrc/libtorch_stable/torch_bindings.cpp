@@ -621,7 +621,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "ggml_moe_a8_vec(Tensor X, Tensor W, "
       "Tensor topk_ids, int top_k, "
-      "int type, SymInt row, SymInt tokens) -> Tensor");
+      "int type, SymInt row, SymInt tokens, "
+      "bool expert_parallel=False) -> Tensor");
 
   ops.def("ggml_moe_get_block_size(int type) -> int");
 

@@ -71,3 +71,38 @@ def test_matches_dequantized_reference(name, qtype, blk_bytes, blk_elems, cols, 
     torch.testing.assert_close(
         got.to(torch.float32)[finite], want[finite], atol=2e-1, rtol=2e-1
     )
+
+
+def test_iq2_xxs_moe_ep_matches_route_major_with_nonlocal_experts():
+    qtype = 16
+    if qtype not in SUPPORTED:
+        pytest.skip("IQ2_XXS has no dequant kernel in this build")
+
+    generator = torch.Generator(device="cpu").manual_seed(1)
+    tokens, top_k, experts, rows, cols = 2, 4, 3, 129, 256
+    weight = torch.randint(
+        0,
+        256,
+        (experts, rows, 66),
+        generator=generator,
+        dtype=torch.uint8,
+    ).cuda()
+    x = torch.randn(tokens, cols, generator=generator, dtype=torch.bfloat16).cuda()
+    topk_ids = torch.tensor(
+        [[0, -1, 1, -1], [-1, 2, -1, 0]], dtype=torch.int32, device="cuda"
+    )
+
+    want = ops.ggml_moe_a8_vec(x, weight, topk_ids, top_k, qtype, rows, tokens)
+    got = ops.ggml_moe_a8_vec(
+        x,
+        weight,
+        topk_ids,
+        top_k,
+        qtype,
+        rows,
+        tokens,
+        expert_parallel=True,
+    )
+
+    torch.testing.assert_close(got, want, rtol=0, atol=0, equal_nan=True)
+    assert torch.count_nonzero(got[topk_ids.flatten() < 0]) == 0

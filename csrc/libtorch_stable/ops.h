@@ -607,6 +607,6 @@ torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
                                       torch::stable::Tensor W,
                                       torch::stable::Tensor topk_ids,
                                       int64_t top_k, int64_t type, int64_t row,
-                                      int64_t tokens);
+                                      int64_t tokens, bool expert_parallel);
 
 int64_t ggml_moe_get_block_size(int64_t type);
