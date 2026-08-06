@@ -80,8 +80,11 @@ def ggml_moe_a8_vec(
     quant_type: int,
     row: int,
     tokens: int,
+    expert_parallel: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_a8_vec(X, W, topk_ids, top_k, quant_type, row, tokens)
+    return torch.ops._C.ggml_moe_a8_vec(
+        X, W, topk_ids, top_k, quant_type, row, tokens, expert_parallel
+    )
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:

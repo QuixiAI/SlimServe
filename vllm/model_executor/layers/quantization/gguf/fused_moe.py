@@ -174,7 +174,14 @@ def _fused_moe_gguf(
         # the other.
         if w1_vec:
             out = ops.ggml_moe_a8_vec(
-                x, w1, local_topk_ids, top_k, qweight_type, N, num_tokens
+                x,
+                w1,
+                local_topk_ids,
+                top_k,
+                qweight_type,
+                N,
+                num_tokens,
+                expert_parallel=expert_map is not None,
             )
         else:
             out = ops.ggml_moe_a8(

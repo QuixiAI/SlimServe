@@ -73,6 +73,50 @@ static __global__ void moe_vec_q(const void* __restrict__ vx,
 }
 
 template <typename scalar_t>
+static __global__ void moe_vec_iq2_xxs_ep(const void* __restrict__ vx,
+                                          const void* __restrict__ vy,
+                                          scalar_t* __restrict__ dst,
+                                          const int* topk_ids, const int topk,
+                                          const int ncols, const int nrows,
+                                          const int token_stride) {
+  const int row = blockIdx.x;
+  const int token = blockIdx.z;
+  const int blocks_per_row = ncols / QK_K;
+  const int blocks_per_warp = WARP_SIZE / QI2_XXS;
+  const block_q8_1* y =
+      (const block_q8_1*)(((const int*)vy) + token * token_stride);
+
+  for (int route = 0; route < topk; ++route) {
+    const int routed_row = token * topk + route;
+    const int expert = topk_ids[routed_row];
+    if (expert < 0) {
+      if (threadIdx.x == 0) {
+        dst[routed_row * nrows + row] = 0;
+      }
+      continue;
+    }
+
+    const block_iq2_xxs* x = ((const block_iq2_xxs*)vx) +
+                             ((size_t)expert * nrows + row) * blocks_per_row;
+    float tmp = 0.0f;
+    for (auto i = threadIdx.x / QI2_XXS; i < blocks_per_row;
+         i += blocks_per_warp) {
+      const int iby = i * (QK_K / QK8_1);
+      const int iqs = threadIdx.x % QI2_XXS;
+      tmp += vec_dot_iq2_xxs_q8_1(&x[i], &y[iby], iqs);
+    }
+
+#pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+      tmp += VLLM_SHFL_XOR_SYNC(tmp, mask);
+    }
+    if (threadIdx.x == 0) {
+      dst[routed_row * nrows + row] = tmp;
+    }
+  }
+}
+
+template <typename scalar_t>
 static void moe_vec_q4_0_q8_1_cuda(const void* vx, const void* vy,
                                    scalar_t* dst, const int* topk_ids,
                                    const int top_k, const int tokens,
@@ -149,11 +193,11 @@ static void moe_vec_q8_0_q8_1_cuda(const void* vx, const void* vy,
 
 template <typename scalar_t>
 static void moe_vec_mxfp4_q8_1_cuda(const void* vx, const void* vy,
-                                   scalar_t* dst, const int* topk_ids,
-                                   const int top_k, const int tokens,
-                                   const int ncols, const int nrows,
-                                   const int token_stride,
-                                   cudaStream_t stream) {
+                                    scalar_t* dst, const int* topk_ids,
+                                    const int top_k, const int tokens,
+                                    const int ncols, const int nrows,
+                                    const int token_stride,
+                                    cudaStream_t stream) {
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
@@ -249,12 +293,17 @@ static void moe_vec_q6_K_q8_1_cuda(const void* vx, const void* vy,
 }
 
 template <typename scalar_t>
-static void moe_vec_iq2_xxs_q8_1_cuda(const void* vx, const void* vy,
-                                      scalar_t* dst, const int* topk_ids,
-                                      const int top_k, const int tokens,
-                                      const int ncols, const int nrows,
-                                      const int token_stride,
-                                      cudaStream_t stream) {
+static void moe_vec_iq2_xxs_q8_1_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, cudaStream_t stream, const bool expert_parallel) {
+  if (expert_parallel && top_k > 1) {
+    const dim3 block_nums(nrows, 1, tokens);
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    moe_vec_iq2_xxs_ep<scalar_t><<<block_nums, block_dims, 0, stream>>>(
+        vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);
+    return;
+  }
   const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
   const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
