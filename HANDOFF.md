@@ -1,272 +1,239 @@
 # Kimi K3 GGUF on MI300X — handoff
 
-Updated: 2026-08-03 UTC
+Updated: 2026-08-06 UTC
 
-## Resume here: DP4xTP2 attention + EP8 MoE (semantics fixed)
+## Resume here
 
-DP4xTP2/EP8 now produces coherent text and vision output that matches the TP6
-baseline's semantic facts. The previous incoherence had a single cause, and it
-was not the sequence-parallel design: under expert parallelism the GGUF MoE
-kernel was handed AITER's 0/1 residency mask where it expected the
-global-to-local expert map.
+Kimi K3 serves correctly on this box. The open problem is that **TP8 is slower
+than TP6 and we have not yet found why**, and the next step is blocked on
+getting a profiler working. Everything below is what you need to pick that up.
 
-Diagnosing that turned up a second, independent kernel defect that had been
-degrading the TP6 baseline all along -- the MMQ tile kernel refused expert ids
-above 255, so 71% of Kimi's experts were zeroed at prefill width. Both are
-described under "Root semantic defects" 5 and 6 below; the second one needs a
-rebuilt `_C_stable_libtorch.abi3.so`, which is already in place.
+### Verified state
 
-The work is still uncommitted and still needs the human line-by-line review
-`AGENTS.md` requires.
+Measured at 1k in / 2k out, `--ignore-eos`, each run gated on the model
+answering a known question first. Both coherence-checked 3/3 on arithmetic,
+geography and general knowledge.
 
-### Objective and topology
+| profile | topology | c1 tok/s | c8 tok/s | TPOT c1 / c8 |
+|---|---|---|---|---|
+| `k3-6` | TP6, tensor-parallel MoE | **34.0** | **120.4** | 28.74 / 62.85 ms |
+| `k3-8` | TP8, expert-parallel MoE | 31.1 | 94.8 | 31.45 / 80.98 ms |
 
-Run Kimi K3 as four request replicas with TP2 attention and EP8 routed MoE:
+`k3-6` is the fastest profile and the one to serve. For reference, at the start
+of this work it managed 6.30 tok/s single stream and crashed outright at
+concurrency 8.
 
-- attention/KDA/MLA stay TP2 within each request's GPU pair;
-- MoE sequence-parallelizes the replicated TP2 token stream;
-- all eight ranks own 112 of 896 complete routed experts each;
-- embeddings, attention, latent projections, router, shared expert, vision
-  tower, and mmproj remain replicated as required by their parallel axis.
+### How to run anything
 
-This is the memory-safe fallback for this quantized GGUF. Pure DP8 cannot fit
-the replicated byte set; padded attention TP8 does not improve unique latent
-KV capacity.
-
-### Uncommitted implementation
-
-The following changes are present in the working tree:
-
-- `vllm/model_executor/layers/fused_moe/runner/moe_runner.py`
-  - allows a routed output transform with `requires_reduced_input=True` in
-    sequence-parallel mode;
-  - treats EP reduce-scatter output as complete for the local token shard, so
-    K3's RMSNorm is applied after expert contributions have been combined.
-- `vllm/models/kimi_k3/amd/linear.py`
-  - enables FusedMoE sequence parallelism from
-    `ParallelConfig.use_sequence_parallel_moe`;
-  - chunks tokens across the TP2 pair before routing and gathers them after
-    MoE, trimming sequence-padding tokens;
-  - builds the shared expert with `disable_tp=True`, because it operates on a
-    token shard and therefore needs complete replicated weights.
-- `vllm/model_executor/model_loader/gguf_adapters/base.py`
-  - lets an adapter receive the sorted global expert IDs assigned to its rank.
-- `vllm/model_executor/model_loader/gguf_loader.py`
-  - computes the flattened EP rank exactly like `FusedMoEParallelConfig`;
-  - configures rank-local fused-stack loading for Kimi K3 only;
-  - rejects Kimi K3 fused GGUF loading with EPLB because redundant physical
-    expert population has not been implemented.
-- `vllm/model_executor/model_loader/gguf_adapters/kimi_k3.py`
-  - slices each fused 3D expert stack down to the rank-local expert rows before
-    device upload;
-  - uses an mmap-sharing `narrow` for contiguous linear placement and
-    `index_select` for round-robin placement;
-  - renames the synthetic expert-0 anchor to the first global expert in the
-    local stack so Kimi's existing expert mapping invokes the full-stack load.
-- `vllm/model_executor/layers/quantization/gguf/{linear.py,params.py}`
-  - makes GGUF parameter loaders honor the parameter/layer `tp_rank` and
-    `tp_size` instead of always consulting the global TP group;
-  - this is required for `disable_tp=True` shared experts. Before the fix, a
-    replicated shared-expert weight was silently narrowed to half width and
-    the profile run ended in a HIP illegal-memory access.
-- `vllm/model_executor/layers/fused_moe/routed_experts.py`
-  - adds `global_to_local_expert_map`, which always returns the real map.
-    `expert_map` degrades to AITER's 0/1 mask whenever AITER's fused MoE is
-    enabled, and a kernel that *indexes* its local stack cannot use that.
-- `vllm/model_executor/layers/quantization/gguf/fused_moe.py`
-  - indexes experts with that map instead of `expert_map`.
-- `csrc/libtorch_stable/quantization/gguf/moe.cuh`
-  - stops rejecting expert ids above 255 in the MMQ tile kernel, and widens the
-    expert byte offset to 64 bits.
-- `tests/model_executor/test_kimi_k3_ep.py` (new)
-  - eleven focused tests for nonlinear SP combine semantics, contiguous and
-    round-robin fused-stack localization, invalid expert IDs, zero/odd token
-    chunk-and-gather behavior, replicated versus sharded GGUF row and
-    merged-column loading, and map-versus-mask expert indexing.
-
-Do not discard these changes. The configured Git remote is already correct:
-`origin` and `slimserve` both point to
-`git@github.com:QuixiAI/SlimServe.git`; `upstream` points to vLLM.
-
-### Validation completed
-
-Focused validation is green:
-
-```text
-.venv/bin/python -m pytest tests/model_executor/test_kimi_k3_ep.py -v
-8 passed in 10.46s
-
-.venv/bin/python -m compileall -q <changed Python files>
-passed
-
-pre-commit run --files <changed files and focused test>
-ruff, format, typos, mypy, SPDX, forbidden imports, and config checks passed
-
-git diff --check
-passed
+```bash
+source /home/hotaisle/SlimServe/.venv/bin/activate   # never system python/pip
 ```
 
-The final one-line loader scoping edit (Kimi-only configuration) happened
-after that hook run, so rerun the focused tests and hooks before committing.
+Serving and one-shot chat:
 
-The real 858 GB DP4xTP2/EP8 startup now succeeds repeatedly:
-
-- every rank reports `loading 112/896 experts`;
-- per-rank model memory is 145.17 GiB;
-- weight load, multimodal profile, 512-token LM profile, hybrid KV allocation,
-  sampler warmup, KDA/MLA prefill and decode, and EP collectives all complete;
-- with `max_num_batched_tokens=512`, each request pair gets 16,384 cache
-  tokens and reports 2.0x concurrency at an 8,192-token maximum length;
-- all three requests and shutdown complete with process exit code 0;
-- GPUs return to their approximately 298 MB idle baseline afterward.
-
-The five requested images are still available at:
-
-```text
-/tmp/testimg/yosemite.png
-/tmp/testimg/picsum1.jpg
-/tmp/testimg/picsum2.jpg
-/tmp/testimg/wolfram.png
-/tmp/testimg/jogging.jpg
+```bash
+slimserve k3-6                 # interactive
+slimserve k3-6 --serve         # OpenAI endpoint
+slimserve k3-6 -p "2 + 2?"     # one shot
+slimserve --list               # legal profiles
 ```
 
-The temporary `.tmp_kimi_ep_smoke.py` runner that drove this diagnosis has been
-removed; it was never committed. `slimserve k3-8` now covers the same ground,
-and `slimserve k3-8 --dry-run` prints the settings it used.
+Benchmarks and the coherence check live in the session scratchpad
+(`/tmp/claude-1000/.../scratchpad/`), not in the repo:
 
-Any replacement harness must pass K3's mode as
-`chat_template_kwargs={"thinking": False}`. `LLM.chat` does **not** accept a
-top-level `thinking=False` argument in this checkout. A first mechanical run
-left thinking enabled and exhausted the output cap on reasoning markers; that
-was a harness error, not a useful semantic test.
+- `bench_k3.py <profile>` — throughput sweep. `CONC=1,8` picks concurrencies;
+  `BACKEND=HIP_MLA` forces an attention backend. **It refuses to report numbers
+  until the model answers a known question**, which is the single most important
+  guard here — see below.
+- `coherence.py` — three known-answer questions against a profile.
+  `PROFILE=` and `BACKEND=` env overrides.
 
-### EP8 semantic result
+### The rule that matters most
 
-The three-turn/five-image run with the text gates added to rank 1 completed
-with exit code 0 and answers that carry the TP6 baseline's facts:
+**`--ignore-eos` throughput cannot detect a broken model.** It generates a fixed
+token count whatever the content, so a model emitting `!!!!!!!!` benchmarks at
+full speed. This cost two iterations of reported "gains" on a broken build
+before it was caught. The harness now gates on a correct answer; keep that gate,
+and never report a number from a run that skipped it.
 
-```text
-rank 1: 2 + 2                -> 4
-rank 1: capital of France    -> Paris
-rank 1: largest ocean        -> Pacific Ocean
-rank 0 turn 1 (1961 prompt tokens): Yosemite Valley, El Capitan, granite
-        cliffs and river, versus the snowy mountain
-rank 0 turn 2 (3867 prompt tokens): weathered wooden bench against the
-        two-toned distressed wall
-rank 0 turn 3 (4402 prompt tokens, stop): three people jogging, and recalls
-        five people in the earlier family image
-```
+## The open problem: why TP8 loses to TP6
 
-Turns 1 and 2 stop at the 96-token cap mid-description because K3 answers in
-detailed markdown here; that is the harness cap, not truncation of meaning.
-Raise `max_tokens` if a run needs the complete turn-2 answer.
+18 ms of the c8 TPOT gap (62.85 → 80.98 ms) is unattributed. Collectives are
+equal and MoE row count is disproven, so it is something else.
 
-The run was repeated after the MMQ kernel rebuild described below and produced
-the same answers with exit code 0, as expected: under EP8 each rank sees local
-expert ids 0-111, so the 255 ceiling never applied there.
+### What is measured
 
-### The bug that caused the incoherence
+| component | cost per decode step | how |
+|---|---|---|
+| MLA attention, 24 layers | 2.49 ms (4.7%) | in-graph microbenchmark |
+| KDA attention, 69 layers | 0.77 ms (1.0–1.5%) | in-graph microbenchmark |
+| `mul_mat_vec` (dense) | ~17% | inferred from a 20% kernel cut giving 3.4% |
+| EP8 collectives | 10.08 ms | 8-GPU torchrun, 93 layers |
+| TP6 collectives | 10.63 ms | same |
+| **residual** | **~13 ms** | **unattributed** |
 
-`RoutedExperts.expert_map` does not always return the expert map. When AITER's
-fused MoE is enabled -- the default on ROCm, and the validated invocation sets
-`VLLM_ROCM_USE_AITER=1` -- it returns AITER's `expert_mask` instead: a 0/1
-residency vector of length `global_num_experts + 1`.
+### The governing fact
 
-The GGUF MoE kernel indexes with that tensor (`expert_map[topk_ids]`), so every
-routed token was sent to local expert 0 or 1 out of 112, and
-`moe_align_block_size` was told there were 897 global experts. TP6 was immune
-because EP is off there and the tensor is `None`.
+**K3 decode is overhead-bound, not work-bound.** Five independent measurements:
+the step runs at 4.4% of HBM roofline; MLA decode achieves 55–280 GB/s against
+5300; one 56 KiB collective takes 54 µs (~98% latency); halving MoE work per
+rank changes it 3–7%; and deduplicating MoE tokens 8× made it *slower*.
 
-`global_to_local_expert_map` now exposes the real map and the GGUF method uses
-it. Only the GGUF method was changed: the other quantization methods that pass
-`layer.expert_map` on ROCm dispatch into AITER kernels, which want the mask —
-`vllm/model_executor/layers/fused_moe/experts/aiter_mxfp8_moe.py` handles both
-forms explicitly. Anything new that indexes a local expert stack on this fork
-should take the map property, not `expert_map`.
+Kernel count per rank does not change with `tp_size` — every rank still walks 93
+layers — so more GPUs cannot shorten a decode step. TP8 loses because expert
+parallelism *adds* per-layer kernels on top of unchanged sequential depth.
 
-Numbers from the single-GPU oracle over `blk.1`'s real GGUF stacks, 96
-experts spanning all eight ranks, against a dequantized f32 reference (relative
-mean error; 1.8e-1 is this reference's own IQ2_XXS/Q2_K quantization floor):
+The plan for fixing this is `docs/tp8-performance-plan.md`. Its short form: cut
+kernels per layer, then the step becomes work-bound, and only then does 8 > 6.
 
-```text
-decode/vec    eight 112-expert shards summed   1.8e-1   (at the floor)
-decode/vec    mask instead of map              6.4e+00
-prefill/mmq   eight 112-expert shards summed   1.8e-1   (at the floor)
-prefill/mmq   mask instead of map              6.1e+00
-```
+### Dead ends — do not retry
 
-### A second, independent defect: MMQ dropped experts above 255
+Each was tested end to end with a number:
 
-The same oracle showed the *non*-EP prefill path failing where the EP path
-passed: a single 896-expert call scored 8.1e-1 against the same reference while
-the eight-shard sum scored 1.8e-1.
+| idea | result |
+|---|---|
+| Hand-written HIP peer-to-peer all-to-all | EP8 collectives 10.08 ms vs TP6 10.63 ms — not the differentiator |
+| `use_sequence_parallel_moe` at dp1 (drop the `dp > 1` gate) | TPOT 31.45 → 82.15 ms at c1. The gate is doing real work |
+| `VLLM_GGUF_MOE_VEC_W2=0` (force MMQ tile for w2) | 31.14 → 28.88 tok/s at c1. The ROCm 128-row default is correct |
+| Repack `w2` transposed for a finer MoE split | 384 vs 512 units/rank is 3–7%. Not worth a requantization |
+| Pad intermediate 3072 → 4096 for tensor-parallel MoE at TP8 | Per-rank work becomes 512, identical to TP6, and work is not what costs |
+| Vectorized (`dwordx4`) loads in the MLA kernel | Both layouts move 18 cache lines/row; instruction count is not the limit |
 
-`moe_q` in `csrc/libtorch_stable/quantization/gguf/moe.cuh` rejected any
-`exp_idx > 255`, inherited from upstream's original GGUF MoE kernel
-(vllm-project/vllm#14613). The only invalid id `moe_align_block_size` produces
-is `-1`, so the ceiling silently zeroed experts 256-895 -- 71% of Kimi's
-experts -- in every MMQ (prefill-width) MoE call whenever global ids reach the
-kernel. That is exactly the TP6 configuration, so **the TP6 baseline's prefill
-was itself degraded**; its decode path uses the vector kernel and was correct,
-which is why it still read as coherent.
+### The blocking item
 
-The ceiling also masked a 32-bit overflow: one Kimi w13 expert is 5.7 MB, so
-`exp_idx * exp_stride` overflows `int` from expert 378 up. The fix drops the
-ceiling and widens that product to `int64_t`.
+`rocprofv3` aborts here with *"Configuration request occurred outside of valid
+rocprofiler configuration period"* (api registration error 16), and TP8's
+workers are separate processes so in-process profilers cannot see them.
+Synthetic MoE microbenchmarks do **not** substitute: they gave 888 ms against an
+81 ms step, because MoE cost tracks the routing distribution and random
+`topk_ids` over 112 local experts touch nearly every expert's weights.
 
-Reproduce with a synthetic Q8_0 stack of 896 experts routed both below and
-above 255, comparing `ggml_moe_a8` against `ggml_moe_a8_vec` and a dequantized
-reference. Before the fix, every id above 255 returned exactly zero from the
-MMQ path while the vector path was correct; after it, MMQ and vector agree to
-the shared q8_1 activation-quantization floor (5.6e-3). On the real `blk.1`
-stacks the single full 896-expert prefill call went from 8.1e-1 to 1.8e-1,
-matching the eight-shard sum exactly.
+Getting a profiler working is the prerequisite for everything else. Likely
+angles: the `HSA_TOOLS_LIB` / library-interposition hazard in
+`~/QuixiCore/QuixiCore-ROCm/perf/perf.md` §4, or attaching to a single worker
+rather than the launcher.
 
-TP6 was re-run on the rebuilt kernel with the same prompts and images
-(`max_tokens=256`, exit code 0). Text gates still return `4` and `Paris.`, and
-the vision answers are substantially richer than the ones recorded further down
-this document:
+## What changed in this work
 
-```text
-turn 1 (1961 prompt tokens, 232 out, stop): names El Capitan *and* the
-        Cathedral Rocks / Bridalveil side
-turn 2 (4007 prompt tokens, 209 out, stop): reads "ESPERANÇA" off the sign,
-        and counts and describes all five family members individually
-turn 3 (4659 prompt tokens, 110 out, stop): three joggers, recalls five
-```
+Committed, newest first:
 
-The old baseline's 74/45/39-token answers were produced under a different
-output cap, so treat the length change as suggestive rather than measured. The
-per-expert detail is the substantive difference.
+- `9d70023` phase 0 needs a profiler, not microbenchmarks
+- `a70bf06` a measured plan for making TP8 beat TP6 → `docs/tp8-performance-plan.md`
+- `e9fba4a` K3 decode is latency-bound, so more GPUs cannot shorten a step
+- `da84a78` the TP8 padding fix would buy nothing
+- `edef4b9` **k3-8 means TP8** (was DP4×TP2; that profile is dropped)
+- `ffb2e82` **TP8 works, with the experts kept whole** (expert parallelism)
+- `298acb4` prove the TP8 MoE break; fix a test that could not fail
+- `3fce38c` withdraw the TP8 profile (later restored correctly)
+- `bd3967b` **drop the GGUF output pre-fill from the decode matmul** (~20%/call)
+- `911d145` **MLA: 4 KV tokens per iteration, and a measured split count**
+- `839f10f` **a HIP MLA decode kernel** — head count as a grid dimension
+- `fd760db` let a backend decline a head count instead of asserting
+- `98adf79` cap `max_num_seqs` to the KDA state slots
+- `9474c1c` **delete `enforce_eager`** from the fork entirely
+- `d9fd45a` stop serving K3 eager
 
-Note for whoever edits these kernels next: the hipify ninja rule depends only
-on the `.cu` list, so editing a `.cuh` alone neither re-hipifies nor rebuilds,
-and the build still exits 0 shipping the old `.so`. Re-run hipify by hand,
-delete the stale `.hip.o`, `ninja _C_stable_libtorch`, then copy the result
-over `vllm/_C_stable_libtorch.abi3.so` -- ninja links into `build/temp/`, but
-the importable module is the copy under `vllm/`. About 90 seconds end to end.
+### The HIP MLA decode kernel
+
+`csrc/quixicore/rocm/mla_decode_kernels.cuh` + `csrc/quixicore/tm_rocm/qc_rocm_mla.cu`,
+exposed as `HIP_MLA` in `vllm/v1/attention/backends/mla/hip_mla.py`, first in
+ROCm's MLA priority list.
+
+Why it exists: AITER's gfx942 MLA decode ships as pre-assembled code objects
+with the query head count baked in, so only multiples and divisors of 16 run.
+TP8 gives 12 heads per rank. This kernel takes the head count as a grid
+dimension, so any TP size that divides K3's 96 heads works.
+
+Performance: **parity with AITER's hand-written assembly** at 16 heads per rank
+(32.46 vs 32.81/33.27 tok/s at c1, 90.67 vs 91.70/91.81 at c4) — it ties where
+AITER works and runs the shapes AITER cannot. Validated against a float64
+reference at 12/16/48 heads, shuffled block tables, split-K, and the 960-token
+page K3's hybrid cache uses (`tests/kernels/test_mla_decode_gfx942.py`).
+
+Design notes worth keeping: no MFMA (at 12 heads it is ~23 FLOP/byte against a
+~246 balance point, and the 16-wide tile is what makes head counts rigid); no
+branch on the nope/rope split (k_pe is rotated at insert, so the score runs over
+all 576 lanes and the accumulate stops at 512); `max_seq_len` comes from the
+metadata builder, never `seq_lens.max()`, which would sync the decode path and
+break graph capture.
+
+## Environment traps
+
+These each cost real time. All are load-bearing.
+
+**Header edits do not trigger a rebuild.** The ROCm build tracks no header
+dependencies. Editing only a `.cuh` leaves ninja with "no work to do" and the
+build still exits 0, shipping the previous binary. `touch`ing the `.cu` is *not*
+enough — it recompiles against the stale hipified header in the build tree.
+Delete both, rebuild, and grep the regenerated header for a token unique to your
+edit:
 
 ```bash
 cd build/temp.linux-x86_64-cpython-312
-~/.venv/bin/python ../../cmake/hipify.py -p ../../csrc -o ./csrc \
-  csrc/libtorch_stable/quantization/gguf/gguf_kernel.cu
-rm CMakeFiles/_C_stable_libtorch.dir/csrc/libtorch_stable/quantization/gguf/\
-gguf_kernel.hip.o
-ninja _C_stable_libtorch
-cp _C_stable_libtorch.abi3.so ../../vllm/
+rm -f CMakeFiles/_quixicore_C.dir/csrc/quixicore/tm_rocm/qc_rocm_mla.hip.o \
+      csrc/quixicore/rocm/mla_decode_kernels.cuh
+ninja _quixicore_C
+grep -c <your-token> csrc/quixicore/rocm/mla_decode_kernels.cuh
 ```
 
-### Finish criteria
+**Install a rebuilt `.so` with `mv`, not `cp`**, when a server may have it
+mapped — `cp` writes in place and can crash the running process.
 
-- [x] text gates return `4` and `Paris`;
-- [x] the three-turn test correctly identifies the two landscapes, bench/wall,
-  family of five, and three runners while recalling the family count;
-- [x] focused tests, compilation, pre-commit, and `git diff --check` pass
-  (11 focused tests; ruff, format, typos, clang-format, markdownlint, mypy,
-  SPDX, lazy imports, forbidden imports, and config checks);
-- [x] remove `.tmp_kimi_ep_smoke.py`;
-- [ ] human-review every changed line before any commit or push, per
-  `AGENTS.md`.
+**Eager microbenchmarks lie about launch-bound kernels.** The serving path is
+`cudagraph_mode: FULL_DECODE_ONLY`, so measure inside a `torch.cuda.CUDAGraph`.
+K3's KDA kernels measured 78 µs eager and 4.1 µs in-graph — a 19× error that
+pointed at the wrong target. If eager and in-graph differ wildly, the kernel is
+launch-bound and its eager number is meaningless.
+
+**Never `pkill -f <pattern>` or kill the output of a bare `pgrep -f`.** Each
+Bash tool call runs in a wrapper shell whose command line contains the command
+text, so the pattern matches the caller and kills it (exit 144). The same breaks
+wait-loops: `while pgrep -f "bench_x.py"` never exits because the heredoc that
+created the script is still on the spawning wrapper's command line. Collect PIDs,
+verify none is a `shell-snapshots/snapshot-bash-*.sh` wrapper, then kill by PID.
+
+**Killing a benchmark driver does not free the GPUs.** `slimserve.server.Server`
+spawns `vllm serve` as a child that survives, holding all eight cards at 97%, so
+the next run dies with "Free memory on device cuda:N (0.79/191.98 GiB)". After
+stopping a run, check `rocm-smi --showmemuse` and kill surviving `api_server` /
+`VLLM::*` PIDs explicitly.
+
+**Auditing kernel output coverage.** To prove a kernel writes its whole output
+(the prerequisite for deleting a defensive `fill_`), recompile that entry
+point's fill as `quiet_NaN()` and look for survivors. Two weaker versions both
+returned false "clean" results and shipped a broken model: testing entry point A
+while B's zero-fill was still compiled in (the fill zeroed the buffer, so the
+result measured the fill); and poisoning a tensor, freeing it, and hoping the
+caching allocator returned the same block. Also use **zeroed weights** — random
+bytes decode to NaN K-quant scales and produce NaN *outputs* indistinguishable
+from unwritten memory.
+
+## Why TP8 needs expert parallelism
+
+`k3-8` sets `enable_expert_parallel`. This is not optional and not a leftover.
+
+Tensor-sharding the MoE splits each expert's `w2` along its **packed byte**
+axis. Traced from a live TP8 load (`VLLM_TRACE_MOE_SHARD` in
+`_gguf_moe_weight_loader`), expert 0:
+
+```
+w1  src=(896, 3072, 924)   dst=(896, 768, 924)
+w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
+w3  src=(896, 3072, 924)   dst=(896, 768, 924)
+```
+
+`_materialize_gguf_moe_param` divides that byte axis by `tp_size`: 1008 / 8 =
+126, against a Q2_K `type_size` of 84 — **1.5 blocks**, so every rank starts
+decoding mid-block and the model emits `!!!!!!!!`. TP2/4/6 give 6/3/2 whole
+blocks, which is why only TP8 broke. `w1`/`w3` split dim 1 in *elements* and
+leave their byte axis whole, so they are safe at any size.
+
+Beware: `create_weights` sets `input_dim: 1` on w2, which describes the logical
+layout, not the packed one. Reading that attribute alone suggests the split is
+safe. It is not — trace it.
+
+Expert parallelism sidesteps this entirely: each rank holds 112 of the 896
+experts whole, so no quant block is ever cut.
 
 ## TP6 baseline status
 
@@ -381,96 +348,7 @@ The corrected run took about 14.2, 9.8, and 9.7 seconds for the three requests
 after model initialization. It used the MIOpen vision patch-embedding fallback
 and completed without a vision-kernel failure.
 
-## TP8: what broke it, and what it costs
-
-TP8 could not start at all until recently: 96 heads / 8 ranks gives 12 per rank
-and AITER MLA requires a multiple or divisor of 16. The HIP decode kernel in
-`csrc/quixicore/rocm/mla_decode_kernels.cuh` takes the head count as a grid
-dimension, so attention at 12 heads now runs.
-
-That exposed a second, unrelated break in the quantized MoE. Traced from a live
-TP8 load (`VLLM_TRACE_MOE_SHARD`), expert 0:
-
-    w1  src=(896, 3072, 924)   dst=(896, 768, 924)
-    w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
-    w3  src=(896, 3072, 924)   dst=(896, 768, 924)
-
-`w2`'s sharded axis is the **byte** axis. `_materialize_gguf_moe_param` divides
-it by `tp_size` with no block awareness: 1008 / 8 = 126, against a Q2_K
-`type_size` of 84, so every rank starts decoding 1.5 blocks in and the model
-emits `!!!!!!!!`. TP2/4/6 give 6/3/2 whole blocks, which is why only TP8 broke.
-`w1`/`w3` split dim 1 in *elements* and leave their byte axis whole, so they are
-safe at any size. Note `create_weights` sets `input_dim: 1` on w2, describing
-the logical layout rather than the packed one -- reading that attribute alone
-suggests the split is safe.
-
-**The shipped fix is expert parallelism.** EP never slices inside an expert:
-each rank holds 112 of the 896 whole, so no quant block is ever cut. `k3-8` is TP8
-attention + EP8 MoE, verified 3/3 coherent.
-
-**But it is slower than TP6**, measured at 1k in / 2k out:
-
-    k3-8   TP8 + EP8   31.07 tok/s @ c1   94.77 @ c8
-    k3-6   TP6         ~32.8             ~122.5
-
-EP pays an all-to-all dispatch and combine on all 93 MoE layers, which costs
-more than the extra four GPUs return. Tensor-parallel MoE would use a cheaper
-all-reduce -- and that is exactly the path that slices blocks.
-
-### The padding fix is not worth building
-
-Tensor-parallel MoE at TP8 would need the intermediate padded from 3072 to 4096
-so byte shards land on whole blocks. Work it out in per-rank intermediate units:
-
-    TP6, tensor-parallel MoE   3072 / 6 = 512 units = 2.0 blocks   works today
-    TP8, tensor-parallel MoE   3072 / 8 = 384 units = 1.5 blocks   slices blocks
-    TP8, padded to 4096        4096 / 8 = 512 units = 2.0 blocks   legal
-
-TP8-with-padding lands on **exactly** TP6's per-rank MoE work. The 33% padding
-waste cancels the two extra ranks to the unit, because 3072 happens to be
-6 x 2 blocks. So the fix would buy identical MoE throughput while costing ~33%
-more MoE weight memory per rank and two more GPUs. Do not build it.
-
-### What would actually make TP8 win
-
-Not a faster all-to-all. Measured on this box, 93 layers of decode collectives
-at the c8 shape:
-
-    EP8   all_gather[8,3584] + reduce_scatter   10.08 ms   54.2 us/collective
-    TP6   2 x all_reduce[8,7168]                10.63 ms   57.2 us/collective
-
-They cost the same, so replacing RCCL with a hand-written HIP peer-to-peer
-all-to-all would buy ~nothing. (54 us to move 56 KiB is ~98% latency, but TP6
-pays the same latency.)
-
-Nor is it the duplicate MoE work. Under pure TP+EP the attention all_reduce
-leaves tokens replicated on all 8 ranks, so the EP all_gather produces 64 rows
-of which 8 are unique and every local expert runs over all 64.
-`use_sequence_parallel_moe` exists to prevent exactly this but is gated on
-`data_parallel_size > 1`, so it is off for TP8/dp1. Dropping that gate --
-deduplicating the tokens -- made it **worse**: TPOT 31.45 -> 82.15 ms at c1 and
-80.98 -> 86.79 ms at c8. Reverted. The `dp > 1` guard is doing real work.
-
-The reason both fail is the same, and it is the governing fact for this model:
-
-**K3 decode is latency-bound on sequential kernel count, not on work.** The
-whole step runs at 4.4% of HBM roofline; MLA decode achieves 55-280 GB/s against
-5.3 TB/s; a collective spends 98% of its time on latency; and cutting MoE work
-8x made the step slower. Kernel count per rank does not change with tp_size --
-every rank still walks 93 layers -- so more GPUs cannot shorten a decode step.
-TP8 loses to TP6 because expert parallelism *adds* per-layer kernels (dispatch,
-combine, expert indexing) on top of an unchanged sequential depth.
-
-So the only lever that can make TP8 win is **fewer, larger kernels per layer**:
-fuse the EP dispatch/combine/index sequence, or drop EP entirely by making
-tensor-parallel MoE legal at 8 ranks (pad the intermediate 3072 -> 4096) and
-lose the extra collective and indexing kernels with it. The padding costs ~33%
-more MoE weight memory and gives per-rank MoE work identical to TP6 -- but on a
-latency-bound step that equality is not the point; removing kernels is.
-
-Unmeasured: the remaining ~13 ms of the 18 ms TPOT gap is not explained by
-collectives (equal) or MoE row count (dedup made it worse). Find it before
-building anything.
+## TP6 and AITER's custom all-reduce
 
 At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
 `[5, 7168]` BF16 collective. The communicator change disables only that AITER
