@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -74,7 +75,11 @@ class Server:
         if log_path:
             term.info(f"engine log: {log_path}")
         self.process = subprocess.Popen(
-            argv, stdout=self._log, stderr=subprocess.STDOUT, env=env
+            argv,
+            stdout=self._log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
         )
 
     def wait_until_ready(self, timeout: float = 3600.0) -> None:
@@ -108,11 +113,14 @@ class Server:
 
     def stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
-            self.process.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.process.pid, signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self.process.wait(timeout=30)
             if self.process.poll() is None:
-                self.process.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
         if self._log is not None:
             self._log.close()
 

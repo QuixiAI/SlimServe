@@ -26,19 +26,19 @@ def _complete(path: Path, size: int) -> bool:
 
 def missing(plan: Plan) -> list[dict[str, Any]]:
     """Registry entries whose local copy is absent or the wrong size."""
+    entries = files_for(plan)
     if plan.quant.assembly and _complete(plan.entry_file, plan.quant.assembly["bytes"]):
-        # The assembled file is what gets served; the parts are scaffolding.
-        return [
-            entry
-            for entry in files_for(plan)
-            if entry not in plan.quant.files
-            and not _complete(plan.model_dir / entry["path"], entry["bytes"])
-        ]
+        # The assembled file is what gets served; the model parts are scaffolding.
+        entries = [entry for entry in entries if entry["role"] != "model"]
     return [
-        entry
-        for entry in files_for(plan)
-        if not _complete(plan.model_dir / entry["path"], entry["bytes"])
+        entry for entry in entries if not _complete(_destination(entry), entry["bytes"])
     ]
+
+
+def _destination(entry: dict[str, Any]) -> Path:
+    from slimserve.registry import cache_root
+
+    return cache_root() / entry["local_dir"] / entry["path"]
 
 
 def total_bytes(entries: list[dict[str, Any]]) -> int:
@@ -154,7 +154,9 @@ def ensure(plan: Plan, assume_yes: bool = False) -> None:
         # An assembled model is written alongside its parts, so the transient
         # peak is both. Say so before starting, not 8 hours in.
         peak = need
-        if plan.quant.assembly:
+        if plan.quant.assembly and any(
+            entry["role"] == "model" for entry in outstanding
+        ):
             peak += plan.quant.assembly["bytes"]
 
         term.note(
@@ -170,7 +172,7 @@ def ensure(plan: Plan, assume_yes: bool = False) -> None:
             term.die("cancelled", code=1)
 
         for entry in outstanding:
-            _download(entry, plan.model_dir / entry["path"])
+            _download(entry, _destination(entry))
 
     if plan.quant.assembly:
         _assemble(plan)

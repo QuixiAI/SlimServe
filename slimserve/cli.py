@@ -26,7 +26,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slimserve",
         usage=USAGE,
-        description="Serve GLM-5.2-Vision or Kimi K3 from a tested profile.",
+        description=(
+            "Serve GLM-5.2-Vision, Kimi K3, or DeepSeek-V4-Flash from a tested profile."
+        ),
         add_help=False,
     )
     parser.add_argument("profile", nargs="?", help="profile id, e.g. glm52-2")
@@ -59,7 +61,7 @@ def _parser() -> argparse.ArgumentParser:
 def _help() -> None:
     out = sys.stdout
     print(term.paint("slimserve", term.BOLD, out))
-    print("Run GLM-5.2-Vision or Kimi K3 from a tested profile.\n")
+    print("Run GLM-5.2-Vision, Kimi K3, or DeepSeek-V4-Flash.\n")
     print(f"Usage: {USAGE}\n")
     machine = hardware.detect()
     _print_profiles(machine)
@@ -193,7 +195,8 @@ def _show(plan: Plan) -> None:
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
     if plan.speculative:
-        print("  spec      DSpark k=3")
+        spec = plan.source["speculator"]
+        print(f"  spec      DSpark k={spec['engine']['num_speculative_tokens']}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:

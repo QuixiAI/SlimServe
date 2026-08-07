@@ -4,11 +4,15 @@
 that is not a tested configuration, before a multi-hundred-GiB load finds out.
 """
 
+import signal
+from unittest.mock import Mock
+
 import pytest
 
 from slimserve import registry
 from slimserve.engine import engine_kwargs, serve_argv
-from slimserve.registry import ProfileError, resolve
+from slimserve.registry import ProfileError, files_for, resolve
+from slimserve.server import Server
 from slimserve.stream import FrameFilter, visible_text
 
 
@@ -59,6 +63,87 @@ def test_kimi_needs_the_native_kv_dtype():
         assert resolve(profile_id, "mi300x", 8, None).engine["kv_cache_dtype"] == "auto"
 
 
+def test_registry_contains_only_the_supported_model_artifacts():
+    data = registry._registry()
+    assert set(data["sources"]) == {"glm52-vision", "kimi-k3", "dsv4-flash"}
+    glm = data["sources"]["glm52-vision"]
+    kimi = data["sources"]["kimi-k3"]
+    deepseek = data["sources"]["dsv4-flash"]
+    assert set(glm["quants"]) == {
+        "IQ2_XXS",
+        "Q2_K",
+        "Q4_K",
+    }
+    assert [entry["path"] for entry in glm["shared"]] == [
+        "mmproj-GLM-5.2-Vision-f16.gguf",
+        "chat_template.jinja",
+    ]
+    assert glm["speculator"]["repo"] == "RedHatAI/GLM-5.2-speculator.dspark"
+    assert {
+        entry["path"] for quant in glm["quants"].values() for entry in quant["files"]
+    } == {
+        f"antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-"
+        f"{shard:05d}-of-00005.gguf"
+        for shard in range(1, 6)
+    } | {
+        f"antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-{shard:05d}-of-00006.gguf"
+        for shard in range(1, 7)
+    } | {
+        f"antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-{shard:05d}-of-00010.gguf"
+        for shard in range(1, 11)
+    }
+
+    assert set(kimi["quants"]) == {"IQ2_XXS-Q2_K"}
+    assert kimi["quants"]["IQ2_XXS-Q2_K"]["assembly"]["output"] == (
+        "Kimi-K3-IQ2_XXS-Q2_K.gguf"
+    )
+    assert [entry["path"] for entry in kimi["shared"]] == ["mmproj-BF16.gguf"]
+    assert kimi["speculator"]["file"]["path"] == "Kimi-K3-DSpark-Q8_0.gguf"
+
+    assert set(deepseek["quants"]) == {
+        "MXFP4",
+        "Q4_K",
+        "Q4K-tail",
+        "IQ2_XXS",
+    }
+    assert {
+        entry["path"]
+        for quant in deepseek["quants"].values()
+        for entry in quant["files"]
+    } == {
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
+        "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
+        "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+        "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
+        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+        "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+    }
+
+
+def test_kimi_uses_the_registered_q8_dspark_gguf():
+    assert "speculative_config" not in engine_kwargs(resolve("k3-6", "mi300x", 8, None))
+    plan = resolve("k3-8", "mi300x", 8, None)
+    speculative = engine_kwargs(plan)["speculative_config"]
+
+    assert speculative["model"].endswith(
+        "/Kimi-K3-DSpark-Q8_0-GGUF/Kimi-K3-DSpark-Q8_0.gguf"
+    )
+    assert speculative["method"] == "dspark"
+    assert speculative["num_speculative_tokens"] == 7
+    assert speculative["quantization"] == "gguf"
+    assert speculative["attention_backend"] == "TRITON_ATTN"
+    assert speculative["disable_draft_cudagraphs"] is True
+    assert "draft_tensor_parallel_size" not in speculative
+
+    [draft] = [entry for entry in files_for(plan) if entry["role"] == "speculator"]
+    assert draft["bytes"] == 2390153888
+    assert draft["url"] == (
+        "https://huggingface.co/Lucebox/Kimi-K3-DSpark-Q8_0-GGUF/"
+        "resolve/main/Kimi-K3-DSpark-Q8_0.gguf"
+    )
+
+
 def test_serve_argv_renders_flags_the_api_server_accepts():
     argv = serve_argv(resolve("glm52-2", "mi300x", 2, None), "127.0.0.1", 8000)
     assert "--enable-prefix-caching" in argv
@@ -105,28 +190,40 @@ def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
     assert "".join(frame.feed(d) for d in deltas) + frame.flush() == expected
 
 
-def test_every_profile_captures_cuda_graphs():
-    """Eager execution says performance does not matter, which is never true here.
-
-    K3 ran eager from bring-up, where it was a debugging crutch, and it stayed
-    long enough to be measured as a throughput problem: a 93-layer decode step is
-    thousands of tiny launches, so eager makes the loop launch-bound and no
-    kernel work underneath it can help. The engine no longer has a way to ask
-    for eager; every profile must still name the graph mode it wants.
-    """
+def test_profiles_use_their_validated_graph_mode():
+    """Only Kimi TP8 needs eager target execution for its stateful decode path."""
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
                 profile_id, platform, registry.describe(profile_id)["gpus"], None
             ).engine
             cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
-            assert cudagraph_mode not in (None, "NONE"), profile_id
+            if profile_id == "k3-8":
+                assert cudagraph_mode == "NONE"
+            else:
+                assert cudagraph_mode not in (None, "NONE"), profile_id
 
 
-def test_the_engine_has_no_eager_switch_left():
-    """A profile cannot reintroduce eager, because the knob is gone."""
+def test_obsolete_enforce_eager_switch_stays_removed():
+    """Graph mode is selected only through the compilation configuration."""
     from vllm.config import ModelConfig
     from vllm.engine.arg_utils import EngineArgs
 
     assert not hasattr(ModelConfig, "enforce_eager")
     assert not hasattr(EngineArgs, "enforce_eager")
+
+
+def test_server_stops_its_entire_worker_process_group(monkeypatch):
+    process = Mock(pid=4321)
+    process.poll.side_effect = [None, 0]
+    signals = []
+    monkeypatch.setattr(
+        "slimserve.server.os.killpg", lambda pid, sig: signals.append((pid, sig))
+    )
+    server = Server.__new__(Server)
+    server.process = process
+    server._log = None
+
+    server.stop()
+
+    assert signals == [(4321, signal.SIGTERM)]

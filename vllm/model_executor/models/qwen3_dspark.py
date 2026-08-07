@@ -22,6 +22,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -48,14 +49,21 @@ class DSparkMarkovHead(nn.Module):
         draft_vocab_size: int,
         markov_rank: int,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         # TODO(ben): profile for which (if any) it makes sense to replicate or TP-shard
         self.markov_w1 = VocabParallelEmbedding(
-            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
+            vocab_size,
+            markov_rank,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "markov_w1"),
         )
         self.markov_w2 = ParallelLMHead(
-            draft_vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
+            draft_vocab_size,
+            markov_rank,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "markov_w2"),
         )
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -89,6 +97,7 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             draft_vocab_size,
             config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            quant_config=self.quant_config,
         )
 
 

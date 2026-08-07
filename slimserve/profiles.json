@@ -70,6 +70,12 @@
         "repo": "RedHatAI/GLM-5.2-speculator.dspark",
         "local_dir": "GLM-5.2-speculator.dspark",
         "bytes": 5900000000,
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 3,
+          "attention_backend": "TURBOQUANT",
+          "kv_cache_dtype": "turboquant_k8v4"
+        },
         "note": "DSpark draft. Speculation costs quality nothing -- the verifier accepts or rejects every draft token -- so it is on by default."
       }
     },
@@ -134,6 +140,23 @@
         }
       ],
       "shared_note": "The vision projector is not in antirez's text repo; it comes from unsloth/Kimi-K3-GGUF. BF16 is preferred because the source vision weights are BF16.",
+      "speculator": {
+        "repo": "Lucebox/Kimi-K3-DSpark-Q8_0-GGUF",
+        "base_url": "https://huggingface.co/Lucebox/Kimi-K3-DSpark-Q8_0-GGUF/resolve/main",
+        "local_dir": "Kimi-K3-DSpark-Q8_0-GGUF",
+        "file": {
+          "path": "Kimi-K3-DSpark-Q8_0.gguf",
+          "bytes": 2390153888
+        },
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 7,
+          "quantization": "gguf",
+          "attention_backend": "TRITON_ATTN",
+          "disable_draft_cudagraphs": true
+        },
+        "note": "The draft has 64 attention heads, so it runs with the TP8 profile. It cannot shard across TP6, and this runtime does not support a TP1 draft under a TP6 verifier."
+      },
       "quants": {
         "IQ2_XXS-Q2_K": {
           "title": "Kimi-K3-IQ2_XXS-Q2_K",
@@ -341,7 +364,7 @@
       "gpus": 6,
       "platforms": ["mi300x"],
       "default_quant": "IQ2_XXS-Q2_K",
-      "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay idle, but this is still the fastest K3 profile -- k3-8 uses all eight and loses to it, because expert parallelism pays an all-to-all on every MoE layer.",
+      "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay free, and this remains the measured low-concurrency reference while k3-8 has the highest measured throughput at concurrency 8.",
       "engine": {
         "tensor_parallel_size": 6,
         "max_model_len": 8192,
@@ -383,19 +406,20 @@
         "max_num_batched_tokens": 4096,
         "gpu_memory_utilization": 0.95,
         "block_size": 64,
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "compilation_config": {"cudagraph_mode": "NONE"},
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
         "reasoning_parser": "kimi_k3",
         "tool_call_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
-      "speculative": false,
+      "speculative": true,
       "env": {"VLLM_ROCM_USE_AITER": "1", "HSA_XNACK": "1"},
       "chat_template_kwargs": {"thinking": false},
       "notes": [
         "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
         "HSA_XNACK=1 is required for this load.",
+        "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
         "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]
     }

@@ -135,6 +135,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        if self.speculative_config.disable_draft_cudagraphs:
+            cudagraph_mode = CUDAGraphMode.NONE
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
@@ -161,6 +163,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     def capture(self) -> None:
+        if self.speculative_config.disable_draft_cudagraphs:
+            logger.info(
+                "Skipping CUDA graph capture for %s speculator.",
+                self._speculator_name,
+            )
+            return
         logger.info("Capturing model for %s speculator...", self._speculator_name)
         # Reset sampling indices to zero to prevent stale values from prior
         # dummy runs from being baked into the captured graph.
