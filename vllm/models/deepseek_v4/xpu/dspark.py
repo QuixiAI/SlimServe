@@ -32,7 +32,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
+from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
+    DSparkMarkovHead,
+)
 from vllm.model_executor.models.utils import maybe_prefix
 
 from .model import (
@@ -109,6 +112,12 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+        )
+        self.confidence_head = DSparkConfidenceHead(
+            config.hidden_size,
+            config.dspark_markov_rank,
+            vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "confidence_head"),
         )
 
         # XPU MHC ops (replaces tilelang)
@@ -420,14 +429,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        if rest.startswith("confidence_head."):
-            return None
         head_prefixes = (
             "norm.",
             "hc_head_fn",
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
+            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes

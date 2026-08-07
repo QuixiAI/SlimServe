@@ -55,8 +55,16 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
-from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
+
+if current_platform.is_metal():
+    from vllm.models.deepseek_v4.metal import (
+        DeepseekV4MetalAttention as DeepseekV4PlatformAttention,
+    )
+else:
+    from vllm.models.deepseek_v4.amd.rocm import (
+        DeepseekV4ROCMAiterMLAAttention as DeepseekV4PlatformAttention,
+    )
 from vllm.sequence import IntermediateTensors
 
 
@@ -300,7 +308,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = DeepseekV4ROCMAiterMLAAttention(
+        self.attn = DeepseekV4PlatformAttention(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
@@ -514,7 +522,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # Disable them on ROCm because of hang issues.
         aux_stream_list = (
             None
-            if current_platform.is_rocm()
+            if current_platform.is_rocm() or current_platform.is_metal()
             else [torch.cuda.Stream() for _ in range(3)]
         )
 

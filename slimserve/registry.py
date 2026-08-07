@@ -16,6 +16,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from slimserve.term import human_bytes
+
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
 
 
@@ -34,6 +36,26 @@ def platform_title(platform: str) -> str:
     return entry["title"] if entry else platform
 
 
+def platform_gate(platform: str) -> str:
+    """What limits this platform: "gpus" (discrete cards) or "memory" (unified)."""
+    entry = _registry()["platforms"].get(platform) or {}
+    return entry.get("gate", "gpus")
+
+
+def platform_blocked(platform: str) -> str | None:
+    """Why this platform cannot serve yet, or None when it can."""
+    entry = _registry()["platforms"].get(platform) or {}
+    if entry.get("status", "supported") == "supported":
+        return None
+    return entry.get("status_reason", "not supported yet")
+
+
+def platform_blocked_detail(platform: str) -> str:
+    """The long form of `platform_blocked`, for the message that stops a run."""
+    entry = _registry()["platforms"].get(platform) or {}
+    return entry.get("status_detail") or platform_blocked(platform) or ""
+
+
 @dataclass(frozen=True)
 class Quant:
     name: str
@@ -42,11 +64,21 @@ class Quant:
     summary: str
     files: list[dict[str, Any]]
     min_gpus: dict[str, int]
+    min_memory_bytes: dict[str, int]
     assembly: dict[str, Any] | None
 
-    def allowed_on(self, platform: str, gpus: int) -> bool:
-        minimum = self.min_gpus.get(platform)
-        return minimum is not None and gpus >= minimum
+    def requirement(self, platform: str) -> int | None:
+        """The gating figure for this platform: GPU count or bytes of memory."""
+        if platform_gate(platform) == "memory":
+            return self.min_memory_bytes.get(platform)
+        return self.min_gpus.get(platform)
+
+    def allowed_on(self, platform: str, gpus: int, memory_bytes: int = 0) -> bool:
+        minimum = self.requirement(platform)
+        if minimum is None:
+            return False
+        have = memory_bytes if platform_gate(platform) == "memory" else gpus
+        return have >= minimum
 
 
 @dataclass(frozen=True)
@@ -100,6 +132,7 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         summary=raw["summary"],
         files=raw["files"],
         min_gpus=raw["min_gpus"],
+        min_memory_bytes=raw.get("min_memory_bytes") or {},
         assembly=raw.get("assembly"),
     )
 
@@ -114,7 +147,7 @@ def describe(profile_id: str) -> dict[str, Any]:
     return profiles[profile_id]
 
 
-def quants_for(profile_id: str, platform: str) -> list[Quant]:
+def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Quant]:
     """Every quant this profile can legally serve on this platform."""
     profile = describe(profile_id)
     source = _registry()["sources"][profile["source"]]
@@ -122,7 +155,7 @@ def quants_for(profile_id: str, platform: str) -> list[Quant]:
     return [
         quant
         for quant in (_quant(source, name) for name in source["quants"])
-        if quant.allowed_on(platform, gpus)
+        if quant.allowed_on(platform, gpus, memory_bytes)
     ]
 
 
@@ -144,10 +177,17 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     return {"engine": engine, "env": env, "default_quant": default_quant}
 
 
-def resolve(profile_id: str, platform: str, gpus: int, quant: str | None) -> Plan:
+def resolve(
+    profile_id: str,
+    platform: str,
+    gpus: int,
+    quant: str | None,
+    memory_bytes: int = 0,
+) -> Plan:
     """Turn a request into a Plan, or explain why it is not legal.
 
-    `gpus` is what the machine has; the profile decides how many it uses.
+    `gpus` is what the machine has; the profile decides how many it uses. On a
+    unified-memory platform `memory_bytes` is what gates instead.
     """
     profile = describe(profile_id)
     supported = profile["platforms"]
@@ -157,7 +197,7 @@ def resolve(profile_id: str, platform: str, gpus: int, quant: str | None) -> Pla
             f"it runs on {', '.join(platform_title(p) for p in supported)}"
         )
     needed = profile["gpus"]
-    if gpus < needed:
+    if platform_gate(platform) != "memory" and gpus < needed:
         raise ProfileError(
             f"{profile_id} needs {needed} GPUs and this machine shows {gpus}"
         )
@@ -172,11 +212,23 @@ def resolve(profile_id: str, platform: str, gpus: int, quant: str | None) -> Pla
             f"available: {', '.join(source['quants'])}"
         )
     chosen = _quant(source, name)
-    if not chosen.allowed_on(platform, needed):
-        minimum = chosen.min_gpus.get(platform)
+    if not chosen.allowed_on(platform, needed, memory_bytes):
+        minimum = chosen.requirement(platform)
         if minimum is None:
             raise ProfileError(
                 f"{chosen.title} is not supported on {platform_title(platform)}"
+            )
+        if platform_gate(platform) == "memory":
+            smaller = _suggest_quant(profile_id, platform, memory_bytes)
+            advice = (
+                f"try {smaller}"
+                if smaller
+                else "no quant of this model fits a machine that size"
+            )
+            raise ProfileError(
+                f"{chosen.title} needs {human_bytes(minimum)} of unified "
+                f"memory and this machine has {human_bytes(memory_bytes)}; "
+                f"{advice}"
             )
         raise ProfileError(
             f"{chosen.title} needs at least {minimum} "
@@ -199,6 +251,18 @@ def resolve(profile_id: str, platform: str, gpus: int, quant: str | None) -> Pla
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=list(profile.get("notes") or []),
     )
+
+
+def _suggest_quant(profile_id: str, platform: str, memory_bytes: int) -> str | None:
+    """The largest quant this machine could actually hold, or None if it holds none.
+
+    More memory is not a profile the user can pick, so on a unified-memory
+    platform the useful advice is a smaller quant.
+    """
+    fits = quants_for(profile_id, platform, memory_bytes)
+    if not fits:
+        return None
+    return max(fits, key=lambda quant: quant.bytes).name
 
 
 def _suggest(profile_id: str, platform: str, minimum: int) -> str:

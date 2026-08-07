@@ -36,9 +36,23 @@ from .utils import (
 
 
 def _cublas_dequant_enabled() -> bool:
-    if current_platform.is_rocm():
+    # Metal has no generic GGUF dequant kernel, so the dequant-then-dense route
+    # does not exist there; it reads the quantized blocks directly instead.
+    if current_platform.is_rocm() or current_platform.is_metal():
         return False
     return os.environ.get("VLLM_GGUF_CUBLAS", "1").lower() not in ("0", "false")
+
+
+def _mmq_shape_ok(x: torch.Tensor, qweight: torch.Tensor) -> bool:
+    """Whether the tile GEMM can take this shape.
+
+    Only Metal constrains it: that kernel derives its grid by integer division,
+    so a partial tile is skipped rather than computed. Everywhere else the tile
+    kernels handle the remainder themselves.
+    """
+    if not current_platform.is_metal():
+        return True
+    return x.shape[0] % 32 == 0 and qweight.shape[0] % 32 == 0
 
 
 def _cublas_min_batch(rows: int) -> int:
@@ -124,8 +138,13 @@ def _fused_mul_mat_gguf(
             qweight, qweight_type, weight.shape[0], weight.shape[1], weight
         )
         y = x @ weight.T
-    elif qweight_type in MMQ_QUANT_TYPES:
+    elif qweight_type in MMQ_QUANT_TYPES and _mmq_shape_ok(x, qweight):
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
+    elif qweight_type in MMVQ_QUANT_TYPES and current_platform.is_metal():
+        # Ragged batch on Metal: the tile kernel cannot take this shape and
+        # there is no dequant fallback, so widen the vector path rather than
+        # failing. Slower than a tile pass, still correct.
+        y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)

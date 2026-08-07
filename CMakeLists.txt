@@ -170,6 +170,17 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.11")
 endif()
 
 #
+# Apple Metal shares none of the machinery below: there is no CUDA/HIP
+# language to enable, no arch flags to intersect, and no hipify pass. It
+# builds one extension from ObjC++ plus a metallib compiled out of the
+# vendored MSL, so it is handled entirely in cmake/metal.cmake and returns.
+#
+if (VLLM_TARGET_DEVICE STREQUAL "metal")
+  include(${CMAKE_CURRENT_LIST_DIR}/cmake/metal.cmake)
+  return()
+endif()
+
+#
 # Forward the non-CUDA device extensions to external CMake scripts.
 #
 # Only ROCm is supported here; the CPU extension and its sources are gone.

@@ -352,8 +352,27 @@ class HCHeadOp(CustomOp):
 
         return out.view(*outer_shape, hidden_size)
 
-    def forward_native(self, *args, **kwargs):
-        raise NotImplementedError("Native implementation of hc_head is not available")
+    def forward_native(
+        self,
+        hidden_states: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_norm_eps: float,
+        hc_eps: float,
+    ) -> torch.Tensor:
+        hc_mult, hidden_size = hidden_states.shape[-2:]
+        outer_shape = hidden_states.shape[:-2]
+        hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+        out = mhc_kernels.hc_head_fused_torch(
+            hs_flat,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            rms_norm_eps,
+            hc_eps,
+        )
+        return out.view(*outer_shape, hidden_size)
 
     def forward_xpu(
         self,

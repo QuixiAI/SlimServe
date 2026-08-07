@@ -6,6 +6,7 @@ import importlib.util
 import json
 import logging
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -39,9 +40,15 @@ envs = load_module_from_path("envs", os.path.join(ROOT_DIR, "vllm", "envs.py"))
 
 VLLM_TARGET_DEVICE = envs.VLLM_TARGET_DEVICE
 USE_PRECOMPILED_EXTENSIONS = envs.VLLM_USE_PRECOMPILED
-if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE != "cpu":
-    logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
-    VLLM_TARGET_DEVICE = "cpu"
+if sys.platform.startswith("darwin") and VLLM_TARGET_DEVICE not in ("cpu", "metal"):
+    # Apple Silicon serves on the GPU through Metal; only an explicit
+    # VLLM_TARGET_DEVICE=cpu opts out.
+    if platform.machine() == "arm64":
+        logger.info("VLLM_TARGET_DEVICE automatically set to `metal` on Apple Silicon")
+        VLLM_TARGET_DEVICE = "metal"
+    else:
+        logger.warning("VLLM_TARGET_DEVICE automatically set to `cpu` due to macOS")
+        VLLM_TARGET_DEVICE = "cpu"
 elif not (sys.platform.startswith("linux") or sys.platform.startswith("darwin")):
     logger.warning(
         "vLLM only supports Linux platform (including WSL) and MacOS."
@@ -341,6 +348,18 @@ class cmake_build_ext(build_ext):
                 target_name(ext.name),
             ]
             subprocess.check_call(install_args, cwd=self.build_temp)
+
+            # CMake's per-extension component install reliably carries the
+            # pybind module, but editable builds can omit non-extension files
+            # from the same component.  Metal needs its precompiled shaders
+            # beside `_quixicore_C`, so copy that build artifact explicitly.
+            if _is_metal() and ext.name == "vllm._quixicore_C":
+                metallib = Path(self.build_temp) / "quixicore_metal.metallib"
+                if not metallib.is_file():
+                    raise RuntimeError(f"Metal library was not built: {metallib}")
+                self.copy_file(
+                    str(metallib), str(outdir / "quixicore_metal.metallib")
+                )
 
     def run(self):
         # First, run the standard build_ext command to compile the extensions
@@ -881,6 +900,10 @@ def _is_xpu() -> bool:
     return VLLM_TARGET_DEVICE == "xpu"
 
 
+def _is_metal() -> bool:
+    return VLLM_TARGET_DEVICE == "metal"
+
+
 def _build_custom_ops() -> bool:
     return _is_cuda() or _is_hip()
 
@@ -972,6 +995,8 @@ def get_vllm_version() -> str:
             version += f"{sep}cpu"
     elif _is_xpu():
         version += f"{sep}xpu"
+    elif _is_metal():
+        version += f"{sep}metal"
     else:
         raise RuntimeError("Unknown runtime environment")
 
@@ -997,16 +1022,20 @@ def get_requirements() -> list[str]:
                 resolved_requirements.append(line)
         return resolved_requirements
 
-    # This fork builds for ROCm and CUDA only; the other device requirement
-    # files are gone along with their platform support.
+    # This fork builds for ROCm, CUDA and Apple Metal; the other device
+    # requirement files are gone along with their platform support.
     if _no_device():
         requirements = _read_requirements("common.txt")
     elif _is_hip():
         requirements = _read_requirements("rocm.txt")
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
+    elif _is_metal():
+        requirements = _read_requirements("metal.txt")
     else:
-        raise ValueError("Unsupported platform: this build targets ROCm or CUDA.")
+        raise ValueError(
+            "Unsupported platform: this build targets ROCm, CUDA or Metal."
+        )
     return requirements
 
 
@@ -1025,9 +1054,9 @@ if sys.version_info >= (3, 11):
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
-if _is_cuda() or _is_hip():
+if _is_cuda() or _is_hip() or _is_metal():
     # pybind11 module (not stable-ABI): must keep the full SOABI filename.
-    # Both targets build it; the ROCm build carries a subset of the ops.
+    # All three targets build it; each carries its own subset of the ops.
     ext_modules.append(CMakeExtension(name="vllm._quixicore_C", py_limited_api=False))
 
 if _is_cuda():
@@ -1086,6 +1115,7 @@ package_data = {
     "slimserve": ["profiles.json"],
     "vllm": [
         "py.typed",
+        "quixicore_metal.metallib",
         "libs/*.so*",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",

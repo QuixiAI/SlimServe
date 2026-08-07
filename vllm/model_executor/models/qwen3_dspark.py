@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -73,6 +74,33 @@ class DSparkMarkovHead(nn.Module):
     def bias(self, markov_embed: torch.Tensor, logits_processor) -> torch.Tensor:
         """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
         return logits_processor(self.markov_w2, markov_embed)
+
+
+class DSparkConfidenceHead(nn.Module):
+    """Acceptance confidence projection published with DSpark drafts."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        markov_rank: int,
+        quant_config,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.proj = ReplicatedLinear(
+            hidden_size + markov_rank,
+            1,
+            bias=False,
+            return_bias=False,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "proj"),
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        confidence = self.proj(torch.cat((hidden_states, markov_embed), dim=-1))
+        return confidence.sigmoid()
 
 
 class Qwen3DSparkModel(DFlashQwen3Model):

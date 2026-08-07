@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -75,6 +76,17 @@ def fused_q_kv_rmsnorm(
     kv_out = torch.empty_like(kv)
     if num_tokens == 0:
         return qr_out, kv_out
+
+    if current_platform.is_metal():
+        # Triton has no Metal target. Preserve the kernel's fp32 reduction and
+        # single output cast so this is also a correctness oracle for a future
+        # fused MSL implementation.
+        def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+            x_fp32 = x.float()
+            rrms = torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)
+            return (x_fp32 * rrms * weight.float()).to(x.dtype)
+
+        return rms_norm(qr, q_weight), rms_norm(kv, kv_weight)
 
     block_size = triton.next_power_of_2(max(q_size, kv_size))
     _fused_q_kv_rmsnorm_kernel[(num_tokens, 2)](

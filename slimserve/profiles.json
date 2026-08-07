@@ -5,7 +5,14 @@
     "legal run: the CLI refuses a profile that is not listed, a quant that is",
     "not listed under that profile's model, and a platform that is not listed",
     "under that profile. Engine settings here are the tested ones -- see the",
-    "'why' notes before changing a number."
+    "'why' notes before changing a number. The exception is any platform whose",
+    "status is not 'supported': those rows describe a configuration that fits",
+    "but has never run, they say so in their notes, and the CLI refuses them.",
+    "",
+    "Each platform declares what gates it. 'gpus' platforms are discrete cards",
+    "and a quant lists min_gpus; 'memory' platforms have one unified pool and a",
+    "quant lists min_memory_bytes in physical bytes. A quant with no entry for",
+    "a platform cannot run there at all, which is how Kimi K3 stays off Metal."
   ],
 
   "sources": {
@@ -25,6 +32,7 @@
           "bytes": 211075857024,
           "summary": "Maximum throughput and longest context. Noticeably weaker at reasoning and precise transcription; fine for classification, routing, short summarization.",
           "min_gpus": {"mi300x": 2, "a100": 4},
+          "min_memory_bytes": {"metal": 274877906944},
           "files": [
             {"path": "antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-00001-of-00005.gguf", "bytes": 44342874752},
             {"path": "antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-00002-of-00005.gguf", "bytes": 44423798336},
@@ -38,6 +46,7 @@
           "bytes": 262036650752,
           "summary": "The tuned path, and what the published throughput numbers were measured on. Best quality that still fits two MI300X with a large KV pool.",
           "min_gpus": {"mi300x": 2, "a100": 4},
+          "min_memory_bytes": {"metal": 549755813888},
           "files": [
             {"path": "antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-00001-of-00006.gguf", "bytes": 44325359872},
             {"path": "antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-00002-of-00006.gguf", "bytes": 44241919040},
@@ -52,6 +61,7 @@
           "bytes": 434170887392,
           "summary": "Reach for this when the task is precision-sensitive: multi-step tool use, code, math, or reading small text out of images. Quantization error compounds across reasoning steps in a way it does not in summarization.",
           "min_gpus": {"mi300x": 4},
+          "min_memory_bytes": {"metal": 549755813888},
           "files": [
             {"path": "antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-00001-of-00010.gguf", "bytes": 44989015168},
             {"path": "antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-00002-of-00010.gguf", "bytes": 43519880832},
@@ -92,6 +102,7 @@
           "bytes": 155976458848,
           "summary": "The tuned path. Routed experts in OCP MXFP4, read through this fork's own HIP dequant, GEMV and MMQ tile kernels, and the smaller of the two four-GPU builds.",
           "min_gpus": {"mi300x": 4},
+          "min_memory_bytes": {"metal": 206158430208},
           "files": [
             {"path": "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf", "bytes": 155976458848}
           ]
@@ -101,6 +112,7 @@
           "bytes": 164633502592,
           "summary": "Highest quality of the four, imatrix. Every non-expert tensor is identical to the MXFP4 build; only the routed experts differ.",
           "min_gpus": {"mi300x": 4},
+          "min_memory_bytes": {"metal": 206158430208},
           "files": [
             {"path": "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf", "bytes": 164633502592}
           ]
@@ -110,6 +122,7 @@
           "bytes": 97591747456,
           "summary": "Q4_K on the last six expert layers, IQ2_XXS gate/up with Q2_K down on the rest. Fits two GPUs while keeping the layers nearest the output at higher precision.",
           "min_gpus": {"mi300x": 2},
+          "min_memory_bytes": {"metal": 137438953472},
           "files": [
             {"path": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf", "bytes": 97591747456}
           ]
@@ -119,10 +132,30 @@
           "bytes": 86720111488,
           "summary": "Smallest. IQ2_XXS experts with Q2_K down. IQ2_XXS gate/up has no MMQ tile kernel, so this stays on the vector MoE path at every batch size -- a throughput ceiling, not a correctness limit.",
           "min_gpus": {"mi300x": 2},
+          "min_memory_bytes": {"metal": 137438953472},
           "files": [
             {"path": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf", "bytes": 86720111488}
           ]
         }
+      },
+      "speculator": {
+        "repo": "alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
+        "revision": "799216bd6a33457ae41a26968773d7cb47e157b6",
+        "base_url": "https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF/resolve/799216bd6a33457ae41a26968773d7cb47e157b6",
+        "local_dir": "DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
+        "file": {
+          "path": "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf",
+          "bytes": 6971243008,
+          "sha256": "3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914"
+        },
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 5,
+          "quantization": "gguf",
+          "attention_backend": "TURBOQUANT",
+          "kv_cache_dtype": "turboquant_k8v4"
+        },
+        "note": "Blessed standardized dflash drafter for the 0731 target. Its published DSpark block size is 5, so a shorter speculative length is invalid. SlimServe downloads and verifies it with the target model when it is not already cached."
       }
     },
 
@@ -187,13 +220,57 @@
             "note": "Concatenate in lexical order, then apply the patch. Needs 799 GiB free on top of the parts unless the parts are removed as it goes."
           }
         }
+      },
+      "speculator": {
+        "repo": "Lucebox/Kimi-K3-DSpark-Q8_0-GGUF",
+        "base_url": "https://huggingface.co/Lucebox/Kimi-K3-DSpark-Q8_0-GGUF/resolve/main",
+        "local_dir": "Kimi-K3-DSpark-Q8_0-GGUF",
+        "file": {
+          "path": "Kimi-K3-DSpark-Q8_0.gguf",
+          "bytes": 2390153888
+        },
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 7,
+          "quantization": "gguf",
+          "attention_backend": "TRITON_ATTN",
+          "disable_draft_cudagraphs": true
+        },
+        "note": "The draft has 64 attention heads, so it runs with the TP8 profile. It cannot shard across TP6, and this runtime does not support a TP1 draft under a TP6 verifier."
       }
     }
   },
 
   "platforms": {
-    "mi300x": {"title": "AMD Instinct MI300X", "gcn_arch": "gfx942", "vram_bytes": 206158430208},
-    "a100": {"title": "NVIDIA A100", "compute_capability": [8, 0], "vram_bytes": 85899345920}
+    "mi300x": {
+      "title": "AMD Instinct MI300X",
+      "gcn_arch": "gfx942",
+      "vram_bytes": 206158430208,
+      "gate": "gpus",
+      "status": "supported"
+    },
+    "a100": {
+      "title": "NVIDIA A100",
+      "compute_capability": [8, 0],
+      "vram_bytes": 85899345920,
+      "gate": "gpus",
+      "status": "supported"
+    },
+    "metal": {
+      "title": "Apple Silicon (Metal)",
+      "min_chip": "m1",
+      "unified_memory": true,
+      "gate": "memory",
+      "status": "in-progress",
+      "status_reason": "sparse-MLA kernels are missing",
+      "status_detail": "The platform, worker, build and the dense/GQA attention path are in place, and the QuixiCore Metal kernels are vendored under csrc/quixicore/metal/. What is missing is sparse MLA: both models here use it, and QuixiCore-Metal has only the generic mla_decode_fp8_sparse kernel, not the GLM-shaped variants the serving path calls -- and the generic one takes separate data/scale caches rather than vLLM's single packed latent page. That is kernel work, not wiring. See vllm/v1/attention/backends/mla/metal_mla_sparse.py.",
+      "why_gate_is_memory": "A Mac is one device with one pool, so counting GPUs says nothing about whether a model fits. Weights, KV and activations all come out of unified memory, and the ceiling that matters is what Metal will let the GPU hold, not what the box advertises.",
+      "notes": [
+        "Metal caps a single MTLBuffer well below total memory -- 80.6 GiB of 128 GiB on an M5 Max -- so any model larger than that needs the overlapping-view mapping llama.cpp and ds4 both implement, not one buffer per file.",
+        "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
+        "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
+      ]
+    }
   },
 
   "profiles": {
@@ -304,6 +381,71 @@
       }
     },
 
+    "glm52-mac": {
+      "title": "GLM-5.2-Vision on one Mac",
+      "source": "glm52-vision",
+      "gpus": 1,
+      "platforms": ["metal"],
+      "default_quant": "IQ2_XXS",
+      "summary": "Single Apple Silicon machine, sized by unified memory rather than card count. Needs 256 GB for IQ2_XXS and 512 GB for Q2_K or Q4_K.",
+      "engine": {
+        "tensor_parallel_size": 1,
+        "max_model_len": 32768,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 2048,
+        "gpu_memory_utilization": 0.85,
+        "block_size": 64,
+        "compilation_config": {"cudagraph_mode": "NONE"},
+        "enable_prefix_caching": true,
+        "enable_chunked_prefill": true,
+        "limit_mm_per_prompt": {"vision_chunk": 1},
+        "trust_remote_code": true,
+        "reasoning_parser": "glm45",
+        "tool_call_parser": "glm47",
+        "served_model_name": "GLM-5.2-Vision"
+      },
+      "speculative": true,
+      "env": {},
+      "notes": [
+        "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
+        "Metal has no CUDA-graph equivalent, so graph capture is disabled through compilation_config.",
+        "max_num_seqs is deliberately small. Batched serving is the weakest part of every Metal engine surveyed -- ds4 still runs attention and routed experts per session -- so concurrency here is a guess, not a tested ceiling.",
+        "DSpark is enabled, with TurboQuant attention and a turboquant_k8v4 draft KV cache.",
+        "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold."
+      ]
+    },
+
+    "dsv4-mac": {
+      "title": "DeepSeek-V4-Flash on one Mac",
+      "source": "dsv4-flash",
+      "gpus": 1,
+      "platforms": ["metal"],
+      "default_quant": "IQ2_XXS",
+      "summary": "Text only, and the one model in this matrix that fits a 128 GB laptop. ds4 sustains ~26 tok/s decode on an M5 Max at this size.",
+      "engine": {
+        "tensor_parallel_size": 1,
+        "max_model_len": 32768,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 2048,
+        "gpu_memory_utilization": 0.85,
+        "block_size": 256,
+        "compilation_config": {"cudagraph_mode": "NONE"},
+        "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
+        "served_model_name": "DeepSeek-V4-Flash"
+      },
+      "speculative": true,
+      "env": {},
+      "notes": [
+        "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
+        "block_size must be 256, the same constraint the ROCm sparse MLA backend imposes.",
+        "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
+        "IQ2_XXS (80.8 GiB) and Q4K-tail (90.9 GiB) fit 128 GB; MXFP4 and Q4_K need 192 GB. ds4 runs a 91 GiB build of this model on a 128 GB M5 Max, which is what makes the tighter of those two credible.",
+        "max_model_len is 32768 rather than the GGUF's 1M: KV competes with weights for the same pool, and at 90.9 GiB of weights there is little left."
+      ]
+    },
+
     "dsv4-2": {
       "title": "DeepSeek-V4-Flash on 2 GPUs",
       "source": "dsv4-flash",
@@ -321,7 +463,7 @@
         "tool_call_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
-      "speculative": false,
+      "speculative": true,
       "env": {"VLLM_ROCM_USE_AITER": "1"},
       "notes": [
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
@@ -348,7 +490,7 @@
         "tool_call_parser": "deepseek_v4",
         "served_model_name": "DeepSeek-V4-Flash"
       },
-      "speculative": false,
+      "speculative": true,
       "env": {"VLLM_ROCM_USE_AITER": "1"},
       "notes": [
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",

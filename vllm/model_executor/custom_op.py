@@ -166,6 +166,12 @@ class CustomOp(nn.Module):
         # NOTE(woosuk): This is a placeholder for future extensions.
         return self.forward_native(*args, **kwargs)
 
+    def forward_mps(self, *args, **kwargs):
+        # Metal custom kernels opt in explicitly.  Until then, MPS tensors can
+        # execute the same PyTorch-native reference used by CPU/XPU instead of
+        # falling through to a CUDA implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_oot(self, *args, **kwargs):
         # By default, we assume that OOT ops are compatible with the
         # PyTorch-native implementation.
@@ -201,6 +207,8 @@ class CustomOp(nn.Module):
             return self.forward_tpu
         elif current_platform.is_xpu():
             return self.forward_xpu
+        elif current_platform.is_metal():
+            return self.forward_mps
         elif current_platform.is_out_of_tree():
             return self.forward_oot
         else:

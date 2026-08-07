@@ -1,0 +1,21 @@
+# Common dependencies
+-r common.txt
+
+# Dependencies for Apple Silicon (Metal / PyTorch-MPS).
+#
+# Deliberately thin next to cuda.txt and rocm.txt. Most of what those pull in
+# is unavailable or meaningless here:
+#   - no triton: it does not target Metal. The batch-prep helpers vLLM ships as
+#     Triton kernels are replaced with torch equivalents in
+#     vllm/platforms/metal_compat.py.
+#   - no nccl/amdsmi/pynvml: one device, no collectives, and the Apple probe is
+#     two sysctl reads.
+#   - no flash-attn/deep_gemm/flashinfer: CUDA-only, and their roles here
+#     belong to the vendored QuixiCore-Metal kernels in csrc/quixicore/metal/.
+
+# torch with MPS. 2.13 is what the Metal kernels are developed and tested
+# against; bf16 support on MPS is the reason for the floor.
+torch == 2.13.0
+
+# GGUF metadata parsing for the loader and the config parsers.
+gguf >= 0.10.0

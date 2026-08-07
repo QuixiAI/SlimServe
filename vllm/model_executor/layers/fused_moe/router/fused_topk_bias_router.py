@@ -131,7 +131,7 @@ def vllm_topk_softplus_sqrt(
 ) -> tuple[torch.Tensor, ...]:
     from vllm.platforms import current_platform
 
-    if current_platform.is_xpu():
+    if current_platform.is_xpu() or current_platform.is_metal():
         return _topk_softplus_sqrt_torch(
             topk_weights,
             topk_indices,

@@ -2,20 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Get a plan's model files onto disk.
 
-Every download is resumable and idempotent: a file whose size already matches
-the registry is left alone, so re-running after an interruption costs one HEAD
-per file. Kimi additionally needs its five parts concatenated and one header
-byte corrected; that is described in profiles.json and carried out here.
+Every download is resumable and idempotent: a file whose registry constraints
+already match is left alone. Exact draft artifacts are fetched alongside their
+target and checksum-verified. Kimi additionally needs its five parts
+concatenated and one header byte corrected; profiles.json describes that here.
 """
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 from pathlib import Path
 from typing import Any
 
 from slimserve import term
-from slimserve.registry import Plan, files_for
+from slimserve.registry import Plan, cache_root, files_for
 
 _CHUNK = 32 << 20
 
@@ -24,21 +25,40 @@ def _complete(path: Path, size: int) -> bool:
     return path.is_file() and path.stat().st_size == size
 
 
-def missing(plan: Plan) -> list[dict[str, Any]]:
-    """Registry entries whose local copy is absent or the wrong size."""
+def _destination(entry: dict[str, Any]) -> Path:
+    return cache_root() / entry["local_dir"] / entry["path"]
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid(path: Path, entry: dict[str, Any]) -> bool:
+    if not _complete(path, entry["bytes"]):
+        return False
+    expected = entry.get("sha256")
+    return expected is None or _sha256(path) == expected
+
+
+def _pending(plan: Plan) -> list[tuple[dict[str, Any], Path]]:
     entries = files_for(plan)
     if plan.quant.assembly and _complete(plan.entry_file, plan.quant.assembly["bytes"]):
         # The assembled file is what gets served; the model parts are scaffolding.
         entries = [entry for entry in entries if entry["role"] != "model"]
     return [
-        entry for entry in entries if not _complete(_destination(entry), entry["bytes"])
+        (entry, destination)
+        for entry in entries
+        if not _valid(destination := _destination(entry), entry)
     ]
 
 
-def _destination(entry: dict[str, Any]) -> Path:
-    from slimserve.registry import cache_root
-
-    return cache_root() / entry["local_dir"] / entry["path"]
+def missing(plan: Plan) -> list[dict[str, Any]]:
+    """Registry entries whose local copy is absent, damaged, or wrong-sized."""
+    return [entry for entry, _destination in _pending(plan)]
 
 
 def total_bytes(entries: list[dict[str, Any]]) -> int:
@@ -88,6 +108,14 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
     if done != entry["bytes"]:
         part.unlink(missing_ok=True)
         raise RuntimeError(f"{label}: got {done} bytes, registry says {entry['bytes']}")
+    expected_hash = entry.get("sha256")
+    if expected_hash is not None:
+        actual_hash = _sha256(part)
+        if actual_hash != expected_hash:
+            part.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"{label}: SHA-256 is {actual_hash}, registry says {expected_hash}"
+            )
     part.replace(dest)
 
 
@@ -146,9 +174,10 @@ def _assemble(plan: Plan) -> None:
 
 def ensure(plan: Plan, assume_yes: bool = False) -> None:
     """Make sure every file the plan needs is present, downloading if not."""
-    outstanding = missing(plan)
+    outstanding = _pending(plan)
     if outstanding:
-        need = total_bytes(outstanding)
+        entries = [entry for entry, _destination in outstanding]
+        need = total_bytes(entries)
         plan.model_dir.mkdir(parents=True, exist_ok=True)
         available = free_bytes(plan.model_dir)
         # An assembled model is written alongside its parts, so the transient
@@ -171,8 +200,8 @@ def ensure(plan: Plan, assume_yes: bool = False) -> None:
         if not assume_yes and not _confirm():
             term.die("cancelled", code=1)
 
-        for entry in outstanding:
-            _download(entry, _destination(entry))
+        for entry, destination in outstanding:
+            _download(entry, destination)
 
     if plan.quant.assembly:
         _assemble(plan)

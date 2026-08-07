@@ -91,8 +91,16 @@ def _help() -> None:
         print(f"  {label:<16} {term.paint(command, term.CYAN, out)}")
 
 
+def _machine_label(machine: hardware.Machine) -> str:
+    """How to describe this machine: card count, or memory when that is the gate."""
+    if machine.memory_bytes:
+        unified = term.human_bytes(machine.memory_bytes)
+        return f"{machine.device_name}, {unified} unified"
+    return f"{machine.device_name}, {machine.count} visible"
+
+
 def _print_profiles(machine: hardware.Machine, everything: bool = False) -> None:
-    print(f"Profiles ({machine.device_name}, {machine.count} visible):")
+    print(f"Profiles ({_machine_label(machine)}):")
     out = sys.stdout
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
@@ -114,6 +122,16 @@ def _runnable(profile_id: str, machine: hardware.Machine) -> tuple[bool, str]:
         return False, "unrecognized hardware"
     if machine.platform not in entry["platforms"]:
         return False, f"not supported on {registry.platform_title(machine.platform)}"
+    blocked = registry.platform_blocked(machine.platform)
+    if blocked:
+        return False, blocked
+    if registry.platform_gate(machine.platform) == "memory":
+        if not registry.quants_for(profile_id, machine.platform, machine.memory_bytes):
+            return False, (
+                f"no quant fits {term.human_bytes(machine.memory_bytes)} "
+                "of unified memory"
+            )
+        return True, ""
     if machine.count < entry["gpus"]:
         return False, f"needs {entry['gpus']} GPUs, this machine shows {machine.count}"
     return True, ""
@@ -127,15 +145,12 @@ def _pick(machine: hardware.Machine) -> str | None:
         if _runnable(profile_id, machine)[0]
     ]
     if not choices:
-        term.fail(
-            f"no profile runs on this machine ({machine.device_name}, "
-            f"{machine.count} GPUs)"
-        )
+        term.fail(f"no profile runs on this machine ({_machine_label(machine)})")
         _print_profiles(machine, everything=True)
         return None
 
     out = sys.stdout
-    print(f"{machine.device_name} x{machine.count}\n")
+    print(f"{_machine_label(machine)}\n")
     for index, profile_id in enumerate(choices, start=1):
         entry = registry.describe(profile_id)
         print(
@@ -147,9 +162,9 @@ def _pick(machine: hardware.Machine) -> str | None:
     return _choose(choices, "profile")
 
 
-def _pick_quant(profile_id: str, platform: str) -> str | None:
+def _pick_quant(profile_id: str, platform: str, memory_bytes: int = 0) -> str | None:
     """Ask which quant, showing what the choice costs and buys."""
-    quants = registry.quants_for(profile_id, platform)
+    quants = registry.quants_for(profile_id, platform, memory_bytes)
     if len(quants) <= 1:
         return quants[0].name if quants else None
 
@@ -190,7 +205,10 @@ def _show(plan: Plan) -> None:
     out = sys.stdout
     print(f"{term.paint(plan.profile_id, term.BOLD, out)}  {plan.title}")
     print(f"  quant     {plan.quant.title}  ({term.human_bytes(plan.quant.bytes)})")
-    print(f"  platform  {registry.platform_title(plan.platform)} x{plan.gpus}")
+    if registry.platform_gate(plan.platform) == "memory":
+        print(f"  platform  {registry.platform_title(plan.platform)}")
+    else:
+        print(f"  platform  {registry.platform_title(plan.platform)} x{plan.gpus}")
     print(f"  model     {plan.entry_file}")
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
@@ -257,17 +275,29 @@ def main(argv: list[str] | None = None) -> int:
     if not machine.known:
         term.die(
             f"unrecognized hardware ({machine.device_name}); "
-            "slimserve runs on MI300X and A100"
+            "slimserve runs on MI300X, A100 and Apple Silicon"
+        )
+
+    if registry.platform_blocked(machine.platform):
+        term.die(
+            f"{registry.platform_title(machine.platform)} is not ready yet. "
+            f"{registry.platform_blocked_detail(machine.platform)}"
         )
 
     quant = args.quant
     if quant is None and interactive:
-        quant = _pick_quant(profile_id, machine.platform)
+        quant = _pick_quant(profile_id, machine.platform, machine.memory_bytes)
         if quant is None:
             return 1
 
     try:
-        plan = registry.resolve(profile_id, machine.platform, machine.count, quant)
+        plan = registry.resolve(
+            profile_id,
+            machine.platform,
+            machine.count,
+            quant,
+            machine.memory_bytes,
+        )
     except ProfileError as error:
         term.fail(str(error))
         return 2

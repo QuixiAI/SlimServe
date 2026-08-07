@@ -778,6 +778,14 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                # EngineArgs auto-selects GGUF only for the target model. A
+                # standalone GGUF drafter is constructed here directly, so it
+                # needs the same inference before ModelConfig chooses its
+                # quantization method and loader.
+                from vllm.transformers_utils.gguf_utils import check_gguf_file
+
+                if check_gguf_file(self.model):
+                    self.quantization = "gguf"
                 # Old-format Medusa checkpoints (e.g. FasterDecoding/medusa-*)
                 # lack a model_type key in config.json, so AutoConfig cannot
                 # detect them. When the method is explicitly "medusa", inject

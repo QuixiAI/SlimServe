@@ -4,21 +4,25 @@
 
 Deliberately does not import torch or vllm: the profile picker runs before any
 engine exists and must stay instant. amdsmi and pynvml both answer in well
-under a second and neither initializes a CUDA/HIP context.
+under a second and neither initializes a CUDA/HIP context, and the Apple probe
+is two sysctl reads.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import platform as _platform
+import subprocess
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class Machine:
-    platform: str | None  # "mi300x", "a100", or None when unrecognized
+    platform: str | None  # "mi300x", "a100", "metal", or None when unrecognized
     device_name: str
     count: int  # visible devices, after the *_VISIBLE_DEVICES masks
+    memory_bytes: int = 0  # unified memory; 0 on the discrete-GPU platforms
 
     @property
     def known(self) -> bool:
@@ -83,6 +87,39 @@ def _probe_nvidia() -> tuple[str, int] | None:
             pynvml.nvmlShutdown()
 
 
+def _sysctl(name: str) -> str | None:
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = out.stdout.strip()
+    return value or None
+
+
+def _probe_apple() -> Machine | None:
+    """Apple Silicon: one GPU, and unified memory is the number that matters.
+
+    Reported memory is physical RAM. Metal will not let the GPU hold all of it
+    -- recommendedMaxWorkingSetSize is about 90% -- so the registry's
+    min_memory_bytes figures already carry that margin.
+    """
+    if _platform.system() != "Darwin" or _platform.machine() != "arm64":
+        return None
+    chip = _sysctl("machdep.cpu.brand_string") or "Apple Silicon"
+    raw = _sysctl("hw.memsize")
+    try:
+        memory = int(raw) if raw else 0
+    except ValueError:
+        memory = 0
+    return Machine(platform="metal", device_name=chip, count=1, memory_bytes=memory)
+
+
 def _classify(device_name: str) -> str | None:
     lowered = device_name.lower()
     if "mi300x" in lowered or "mi325" in lowered:
@@ -93,6 +130,9 @@ def _classify(device_name: str) -> str | None:
 
 
 def detect() -> Machine:
+    apple = _probe_apple()
+    if apple is not None:
+        return apple
     probed = _probe_amd() or _probe_nvidia()
     if probed is None:
         return Machine(platform=None, device_name="none detected", count=0)
