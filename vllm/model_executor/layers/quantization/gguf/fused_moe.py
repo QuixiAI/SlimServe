@@ -96,6 +96,14 @@ def _fused_moe_gguf(
     out_hidden_states = torch.empty_like(x)
     mmq_ok = qweight_type in MMQ_QUANT_TYPES and qweight_type2 in MMQ_QUANT_TYPES
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
+    if current_platform.is_metal():
+        # QuixiCore-Metal has no grouped GEMM over GGUF-quantized experts --
+        # its moe_grouped_gemm is bf16/fp32 only, and base_qmoe_gemm wants the
+        # BaseQN packing, not raw GGUF blocks. Fall through to the per-expert
+        # loop below, which reaches the same qgemv/qgemm kernels one expert at
+        # a time. Correct, and the throughput ceiling for MoE on Metal until a
+        # grouped kernel exists.
+        mmq_ok = vec_ok = False
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -231,12 +239,23 @@ def _fused_moe_gguf(
             "Falling back to slow implementation. "
         )
         local_topk_ids = expert_map[topk_ids] if expert_map is not None else topk_ids
-        for tok, (w, idx) in enumerate(zip(topk_weights, local_topk_ids)):
+        if current_platform.is_metal():
+            # Iterating MPS scalar tensors performs a device/host sync for each
+            # `ii < 0` test and again when the tensor is used as a Python
+            # index.  DSV4 has six routes in 43 layers, making those tiny
+            # synchronizations dominate the actual matvecs.  Transfer the
+            # 6*token integer routing table once per layer and keep route
+            # weights on-device.
+            local_topk_ids_host = local_topk_ids.to("cpu").tolist()
+        else:
+            local_topk_ids_host = local_topk_ids
+        for tok, idx in enumerate(local_topk_ids_host):
             inp = x[tok].reshape((1,) + x.shape[1:])
             current_hidden_state = None
-            for ww, ii in zip(w, idx):
+            for slot, ii in enumerate(idx):
                 if ii < 0:
                     continue
+                ww = topk_weights[tok, slot]
                 out = fused_mul_mat_gguf_op(inp, w1[ii], qweight_type)
                 out = act(out)
                 current_state = fused_mul_mat_gguf_op(out, w2[ii], qweight_type2).mul_(

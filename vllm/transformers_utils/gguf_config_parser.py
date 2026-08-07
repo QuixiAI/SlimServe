@@ -9,7 +9,8 @@ GGUF metadata alone, validated field-for-field against the reference
 checkpoint.
 
 Dispatch is on `general.architecture`, because the supported artifacts share
-nothing at the metadata level.
+nothing at the metadata level. Standalone DSpark drafts use the `dflash` or
+`dflash-draft` schemas and carry no tokenizer vocabulary.
 """
 
 from pathlib import Path
@@ -43,6 +44,12 @@ class GGUFConfigParser(ConfigParserBase):
             )
 
             config = build_kimi_k3_dspark_config_from_gguf(str(model))
+        elif architecture == "dflash":
+            from vllm.transformers_utils.gguf_dflash import (
+                build_dflash_config_from_gguf,
+            )
+
+            config = build_dflash_config_from_gguf(str(model))
         elif architecture == "kimi-k3":
             from vllm.transformers_utils.gguf_kimi_k3 import (
                 build_kimi_k3_config_from_gguf,

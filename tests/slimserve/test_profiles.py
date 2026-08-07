@@ -4,25 +4,135 @@
 that is not a tested configuration, before a multi-hundred-GiB load finds out.
 """
 
+import hashlib
 import signal
+from dataclasses import replace
 from unittest.mock import Mock
 
 import pytest
 
-from slimserve import registry
+from slimserve import fetch, registry
 from slimserve.engine import engine_kwargs, serve_argv
 from slimserve.registry import ProfileError, files_for, resolve
 from slimserve.server import Server
 from slimserve.stream import FrameFilter, visible_text
 
 
+def _big_enough(profile_id: str, platform: str) -> int:
+    """The smallest machine that can hold this profile's default quant."""
+    if registry.platform_gate(platform) != "memory":
+        return 0
+    entry = registry.describe(profile_id)
+    source = registry._registry()["sources"][entry["source"]]
+    return source["quants"][entry["default_quant"]]["min_memory_bytes"][platform]
+
+
 def test_every_profile_resolves_on_a_platform_it_claims():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
         for platform in entry["platforms"]:
-            plan = resolve(profile_id, platform, entry["gpus"], None)
-            assert plan.quant.allowed_on(platform, entry["gpus"])
+            memory = _big_enough(profile_id, platform)
+            plan = resolve(profile_id, platform, entry["gpus"], None, memory)
+            assert plan.quant.allowed_on(platform, entry["gpus"], memory)
             assert plan.engine, "a profile with no engine settings would serve nothing"
+
+
+def test_every_profile_uses_dspark_with_turboquant():
+    for profile_id in registry.profile_ids():
+        entry = registry.describe(profile_id)
+        for platform in entry["platforms"]:
+            memory = _big_enough(profile_id, platform)
+            plan = resolve(profile_id, platform, entry["gpus"], None, memory)
+            if not plan.speculative:
+                assert "speculative_config" not in engine_kwargs(plan)
+                continue
+            config = engine_kwargs(plan)["speculative_config"]
+            assert config["method"] == "dspark"
+            if profile_id != "k3-8":
+                assert config["attention_backend"] == "TURBOQUANT"
+                assert config["kv_cache_dtype"] == "turboquant_k8v4"
+
+
+def test_every_profile_source_names_a_blessed_dspark_download():
+    sources = registry._registry()["sources"]
+    for profile_id in registry.profile_ids():
+        speculator = sources[registry.describe(profile_id)["source"]]["speculator"]
+        assert speculator.get("base_url", "https://huggingface.co/").startswith(
+            "https://huggingface.co/"
+        )
+
+
+def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
+    sources = registry._registry()["sources"]
+    expected_repo = "alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF"
+    expected_file = "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
+    for profile_id in ("dsv4-mac", "dsv4-2", "dsv4-4"):
+        entry = registry.describe(profile_id)
+        assert entry["source"] == "dsv4-flash"
+        speculator = sources[entry["source"]]["speculator"]
+        assert speculator["repo"] == expected_repo
+        assert speculator["file"]["path"] == expected_file
+        assert "Kimi" not in speculator["repo"]
+
+        platform = "metal" if profile_id == "dsv4-mac" else "mi300x"
+        memory = _big_enough(profile_id, platform)
+        plan = resolve(profile_id, platform, entry["gpus"], None, memory)
+        config = engine_kwargs(plan)["speculative_config"]
+        assert config["num_speculative_tokens"] == 5
+        assert config["quantization"] == "gguf"
+        assert config["model"].endswith(expected_file)
+
+
+def test_deepseek_drafter_is_fetched_once_with_the_plan(tmp_path, monkeypatch):
+    payload = b"GGUF"
+    filename = "draft.gguf"
+    plan = resolve("dsv4-2", "mi300x", 2, None)
+    source = {
+        **plan.source,
+        "speculator": {
+            "repo": "publisher/drafter",
+            "base_url": "https://huggingface.co/publisher/drafter/resolve/rev",
+            "local_dir": "drafter",
+            "file": {
+                "path": filename,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            "engine": {
+                "method": "dspark",
+                "num_speculative_tokens": 5,
+            },
+        },
+    }
+    plan = replace(
+        plan,
+        source=source,
+        quant=replace(plan.quant, files=[], assembly=None),
+    )
+    monkeypatch.setenv("SLIMSERVE_CACHE", str(tmp_path))
+    calls = []
+
+    def fake_download(entry, destination):
+        calls.append((entry, destination))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+
+    monkeypatch.setattr(fetch, "_download", fake_download)
+
+    fetch.ensure(plan, assume_yes=True)
+    fetch.ensure(plan, assume_yes=True)
+
+    assert len(calls) == 1
+    assert calls[0][1] == tmp_path / "drafter" / filename
+
+
+def test_kimi_drafter_is_scoped_only_to_kimi_profiles():
+    sources = registry._registry()["sources"]
+    for profile_id in ("k3-6", "k3-8"):
+        entry = registry.describe(profile_id)
+        assert entry["source"] == "kimi-k3"
+        speculator = sources[entry["source"]]["speculator"]
+        assert speculator["repo"] == "Lucebox/Kimi-K3-DSpark-Q8_0-GGUF"
 
 
 def test_quant_too_large_for_the_profile_names_a_bigger_one():
@@ -144,6 +254,46 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
     )
 
 
+GB = 1 << 30
+
+
+def test_metal_gates_on_memory_not_on_gpu_count():
+    """One Mac is always one GPU, so the card count must not decide anything."""
+    assert registry.platform_gate("metal") == "memory"
+    plan = resolve("dsv4-mac", "metal", 1, "IQ2_XXS", 128 * GB)
+    assert plan.engine["tensor_parallel_size"] == 1
+    # The same single "GPU" cannot hold the 145 GiB build.
+    with pytest.raises(ProfileError, match="unified memory"):
+        resolve("dsv4-mac", "metal", 1, "MXFP4", 128 * GB)
+
+
+def test_metal_suggests_a_smaller_quant_not_a_bigger_machine():
+    """More RAM is not a choice the user can make at the prompt; a quant is."""
+    with pytest.raises(ProfileError, match="try Q4K-tail"):
+        resolve("dsv4-mac", "metal", 1, "MXFP4", 128 * GB)
+
+
+def test_a_laptop_cannot_hold_glm_at_any_quant():
+    with pytest.raises(ProfileError, match="no quant of this model fits"):
+        resolve("glm52-mac", "metal", 1, "IQ2_XXS", 128 * GB)
+
+
+def test_kimi_is_absent_from_metal_because_no_mac_is_large_enough():
+    """K3 is 800 GiB and the largest Mac is 512 GB; claiming it would be a lie."""
+    for profile_id in ("k3-6", "k3-8"):
+        assert "metal" not in registry.describe(profile_id)["platforms"]
+    with pytest.raises(ProfileError, match="not supported"):
+        resolve("k3-6", "metal", 1, None, 512 * GB)
+
+
+def test_metal_profiles_are_flagged_as_not_yet_runnable():
+    """The matrix may describe a configuration before the engine can run it,
+    but it must never let the CLI start one."""
+    assert registry.platform_blocked("metal")
+    assert registry.platform_blocked("mi300x") is None
+    assert registry.platform_blocked("a100") is None
+
+
 def test_serve_argv_renders_flags_the_api_server_accepts():
     argv = serve_argv(resolve("glm52-2", "mi300x", 2, None), "127.0.0.1", 8000)
     assert "--enable-prefix-caching" in argv
@@ -191,14 +341,18 @@ def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
 
 
 def test_profiles_use_their_validated_graph_mode():
-    """Only Kimi TP8 needs eager target execution for its stateful decode path."""
+    """Kimi TP8 and Metal run without target graph capture."""
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
-                profile_id, platform, registry.describe(profile_id)["gpus"], None
+                profile_id,
+                platform,
+                registry.describe(profile_id)["gpus"],
+                None,
+                _big_enough(profile_id, platform),
             ).engine
             cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
-            if profile_id == "k3-8":
+            if profile_id == "k3-8" or platform == "metal":
                 assert cudagraph_mode == "NONE"
             else:
                 assert cudagraph_mode not in (None, "NONE"), profile_id

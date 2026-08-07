@@ -11,6 +11,7 @@ halves of loading agree on.
 from .base import BaseGGUFWeightsAdapter
 from .deepseek4 import Deepseek4GGUFAdapter
 from .default import GGUFWeightsAdapter
+from .dflash import DFlashGGUFAdapter
 from .glm_dsa import GlmDsaGGUFAdapter
 from .kimi_k3 import KimiK3GGUFAdapter
 from .kimi_k3_dspark import KimiK3DSparkGGUFAdapter
@@ -18,6 +19,7 @@ from .kimi_k3_dspark import KimiK3DSparkGGUFAdapter
 __all__ = [
     "BaseGGUFWeightsAdapter",
     "Deepseek4GGUFAdapter",
+    "DFlashGGUFAdapter",
     "GGUFWeightsAdapter",
     "GlmDsaGGUFAdapter",
     "KimiK3GGUFAdapter",

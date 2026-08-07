@@ -34,6 +34,21 @@ logger = init_logger(__name__)
 def _qc():
     import vllm._quixicore_C as qc
 
+    # The Metal build ships its kernels as a separate metallib beside the
+    # extension; CUDA and ROCm link theirs in. Point it at the file once, here,
+    # rather than from the first kernel call: loading a metallib mid-decode,
+    # against in-flight MPS work, is a documented way to deadlock.
+    if hasattr(qc, "_set_library"):
+        from pathlib import Path
+
+        metallib = Path(qc.__file__).with_name("quixicore_metal.metallib")
+        if not metallib.is_file():
+            raise ImportError(
+                f"QuixiCore Metal kernels missing at {metallib}. The extension "
+                "built without its metallib; rebuild with VLLM_TARGET_DEVICE=metal."
+            )
+        qc._set_library(str(metallib))
+
     return qc
 
 
@@ -113,14 +128,20 @@ class quixicore_ops:
         concatenated path. Returns [tokens, heads, 512].
         """
         return _qc().mla_decode_fp8_sparse_glm_splitq(
-            q_nope, q_pe, kv_cache_u8, block_table, indices, topk_length,
-            block_size, scale, kv_scale, partition_size,
+            q_nope,
+            q_pe,
+            kv_cache_u8,
+            block_table,
+            indices,
+            topk_length,
+            block_size,
+            scale,
+            kv_scale,
+            partition_size,
         )
 
     @staticmethod
-    def moe_weighted_sum(
-        x: torch.Tensor, w: torch.Tensor, out: torch.Tensor
-    ) -> None:
+    def moe_weighted_sum(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
         """out[t] = sum_k w[t, k] * x[t, k] with float accumulation.
 
         Fuses the out.mul_(topk_weights) + moe_sum pair into one launch; one
@@ -176,6 +197,53 @@ class quixicore_ops:
             return hasattr(_qc(), name)
         except ImportError:
             return False
+
+    @staticmethod
+    def paged_attention(
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_lens: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Dense/GQA paged decode (Metal build).
+
+        `key_cache`/`value_cache` are the two contiguous halves of the KV
+        cache, each [num_blocks, block_size, kv_heads, head_size]. The GQA head
+        ratio is resolved inside the kernel. Returns [batch, heads, head_size].
+        """
+        return _qc().paged_attention(
+            q, key_cache, value_cache, block_table, context_lens, scale
+        )
+
+    # ------------------------------------------------------------------
+    # GGUF quantized matmul (Metal build only)
+    #
+    # The CUDA and ROCm builds reach these through torch.ops._C.ggml_*, which
+    # `_C_stable_libtorch` registers. That extension is a CUDA/HIP target, so
+    # on Apple the same ops come from here instead. Both read raw GGUF blocks;
+    # neither materializes a dequantized weight.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def ggml_mul_mat_vec_a8(
+        w: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+    ) -> torch.Tensor:
+        """Weight-only GEMV, one output row per simdgroup."""
+        return _qc().ggml_mul_mat_vec_a8(w, x, quant_type, row)
+
+    @staticmethod
+    def ggml_mul_mat_a8(
+        w: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+    ) -> torch.Tensor:
+        """Weight-only tile GEMM. Requires M % 32 == 0 and N % 32 == 0.
+
+        The tile kernel derives its grid by integer division, so a partial tile
+        is skipped rather than computed; the binding rejects those shapes
+        instead of returning an uninitialized tail.
+        """
+        return _qc().ggml_mul_mat_a8(w, x, quant_type, row)
 
     @staticmethod
     def indexer_metadata(
@@ -1122,8 +1190,13 @@ class quixicore_ops:
         kv_cache is the (num_blocks, block_size, Hk, slot) strided view.
         """
         _qc().turboquant_store_fp8(
-            key, value, kv_cache, slot_mapping, num_kv_heads,
-            key_packed_size, value_quant_bits,
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            num_kv_heads,
+            key_packed_size,
+            value_quant_bits,
         )
 
     @staticmethod
@@ -1145,8 +1218,16 @@ class quixicore_ops:
         launcher's fp32 tensors (rotation GEMM stays in cuBLAS).
         """
         _qc().turboquant_store_mse(
-            y, norms, value, midpoints, kv_cache, slot_mapping,
-            num_kv_heads, mse_bits, key_packed_size, value_quant_bits,
+            y,
+            norms,
+            value,
+            midpoints,
+            kv_cache,
+            slot_mapping,
+            num_kv_heads,
+            mse_bits,
+            key_packed_size,
+            value_quant_bits,
         )
 
     @staticmethod
@@ -1168,9 +1249,20 @@ class quixicore_ops:
     ) -> None:
         """Split-KV TQ decode scoring + value accumulation (stage 1)."""
         _qc().turboquant_decode_stage1(
-            q_rot, kv_cache, block_table, seq_lens, centroids, mid_o,
-            num_kv_splits, mse_bits, key_packed_size, value_quant_bits,
-            scale, key_fp8, norm_correction, sliding_window,
+            q_rot,
+            kv_cache,
+            block_table,
+            seq_lens,
+            centroids,
+            mid_o,
+            num_kv_splits,
+            mse_bits,
+            key_packed_size,
+            value_quant_bits,
+            scale,
+            key_fp8,
+            norm_correction,
+            sliding_window,
         )
 
     @staticmethod
@@ -1200,7 +1292,15 @@ class quixicore_ops:
     ) -> None:
         """Bulk dequant of cached TQ K/V to fp16 (continuation prefill)."""
         _qc().turboquant_dequant_kv(
-            kv_cache, block_table, centroids, k_out, v_out, num_positions,
-            mse_bits, key_packed_size, value_quant_bits, key_fp8,
+            kv_cache,
+            block_table,
+            centroids,
+            k_out,
+            v_out,
+            num_positions,
+            mse_bits,
+            key_packed_size,
+            value_quant_bits,
+            key_fp8,
             norm_correction,
         )

@@ -16,9 +16,9 @@ def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
     """Load config for the draft, which may not share the target's format.
 
     DSpark heads usually ship inside the target checkpoint, so reusing the
-    target's `LoadConfig` is normally right. A standalone draft against a GGUF
-    target is the exception: retain GGUF for a draft file, or use automatic
-    detection for a directory of safetensors.
+    target's `LoadConfig` is normally right. Standalone drafters must instead
+    select their own format: ``gguf`` for a local GGUF and auto-detection for
+    a separate safetensors repository.
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -26,6 +26,11 @@ def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
         return explicit
     load_config = vllm_config.load_config
     target_model_config = vllm_config.model_config
+    if draft_model_config is not None:
+        from vllm.transformers_utils.gguf_utils import check_gguf_file
+
+        if check_gguf_file(draft_model_config.model):
+            return replace(load_config, load_format="gguf")
     if (
         load_config.load_format == "gguf"
         and draft_model_config is not None
@@ -41,13 +46,21 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    assert draft_model_config is not None
+
+    draft_load_config = _draft_load_config(vllm_config, draft_model_config)
+    draft_quant_config = VllmConfig.get_quantization_config(
+        draft_model_config, draft_load_config
+    )
 
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
     draft_vllm_config = replace(
         vllm_config,
-        load_config=_draft_load_config(vllm_config, draft_model_config),
+        model_config=draft_model_config,
+        load_config=draft_load_config,
+        quant_config=draft_quant_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),

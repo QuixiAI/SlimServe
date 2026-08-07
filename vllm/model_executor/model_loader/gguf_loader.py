@@ -3,8 +3,8 @@
 """GGUF loader for SlimServe's supported model artifacts.
 
 This loader is deliberately not general. It takes a local GGUF path and
-dispatches only to the adapters required by the registered GLM-5.2-Vision,
-Kimi K3, Kimi DSpark, and DeepSeek-V4-Flash artifacts.
+dispatches by ``general.architecture`` to the adapters required by the
+registered GLM-5.2-Vision, Kimi K3, DSpark, and DeepSeek-V4-Flash artifacts.
 """
 
 import os
@@ -61,6 +61,7 @@ class GGUFModelLoader(BaseModelLoader):
         # which imports this package.
         from vllm.model_executor.model_loader.gguf_adapters import (
             Deepseek4GGUFAdapter,
+            DFlashGGUFAdapter,
             GlmDsaGGUFAdapter,
             KimiK3DSparkGGUFAdapter,
             KimiK3GGUFAdapter,
@@ -77,6 +78,8 @@ class GGUFModelLoader(BaseModelLoader):
             adapter_cls = Deepseek4GGUFAdapter
         elif architecture == "dflash-draft":
             adapter_cls = KimiK3DSparkGGUFAdapter
+        elif architecture == "dflash":
+            adapter_cls = DFlashGGUFAdapter
         elif architecture == "kimi-k3":
             adapter_cls = KimiK3GGUFAdapter
         elif architecture == "glm-dsa":

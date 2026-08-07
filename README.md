@@ -82,13 +82,18 @@ verifier and TurboQuant compressed KV for the draft. That list is expected to
 turn over as better tricks appear — this is not a codebase that will refuse a
 hack because it is exotic.
 
+Every profile on every platform enables that same pair: DSpark is never
+silently dropped, and every draft uses TurboQuant attention with a
+`turboquant_k8v4` KV cache. The registry names one blessed Hugging Face download
+for each model family.
+
 ### Hardware
 
 | Runs today | Coming |
 | --- | --- |
-| AMD MI300X (2–8 GPUs) | RTX 3090 / 4090 / 5090 |
-| NVIDIA A100 (4–8 GPUs) | RTX PRO 6000 |
-| Apple Metal | NVIDIA DGX Spark, multi-node |
+| AMD MI300X (2–8 GPUs) | [Apple Metal](#apple-silicon-in-progress) — in progress |
+| NVIDIA A100 (4–8 GPUs) | RTX 3090 / 4090 / 5090, RTX PRO 6000 |
+| | NVIDIA DGX Spark, multi-node |
 
 ### Models
 
@@ -128,7 +133,9 @@ slimserve k3-6 -p "2 + 2?"     # one shot, then exit
 
 `slimserve` runs a fixed set of tested configurations and refuses everything
 else. Weights download on first use into `~/models` (override with `--cache` or
-`$SLIMSERVE_CACHE`).
+`$SLIMSERVE_CACHE`). When a profile pins an exact DSpark file, that drafter is
+included in the same download confirmation, checksum-verified, and reused on
+later runs.
 
 Output streams token by token in both modes. The prompt is an SSE client of the
 same OpenAI-compatible endpoint `--serve` exposes, so an interactive answer and
@@ -143,6 +150,10 @@ an API answer come from one engine with one configuration.
 | `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
 | `k3-6` | Kimi K3 | 6 | MI300X |
 | `k3-8` | Kimi K3 | 8 | MI300X |
+| `glm52-mac` † | GLM-5.2-Vision | 1 | Apple Silicon |
+| `dsv4-mac` † | DeepSeek-V4-Flash (text) | 1 | Apple Silicon |
+
+† Described but not yet runnable — see [Apple Silicon](#apple-silicon-in-progress).
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -325,7 +336,8 @@ choice is purely quality against footprint.
 | `Layers37-42Q4KExperts` | 91 GiB | 2 | Mixed; see note below. |
 | `IQ2XXS-w2Q2K` | 81 GiB | 2 | Smallest; IQ2_XXS experts, Q2_K down. |
 
-Drafter (all quants): DSpark MXFP4-Q8_0 — [alessandrobologna][ds4d].
+Drafter (all quants): the standardized Q2_K/Q8_0 `dflash` artifact from
+[alessandrobologna][ds4d].
 Context 1048576 (yarn, 65536 base).
 
 `Layers37-42Q4KExperts` puts Q4_K on the last six expert layers and
@@ -417,12 +429,68 @@ and its published header has `kimi-k3.vision = false`, which is wrong; the
 downloader reassembles the parts and corrects that byte. The vision projector
 comes from `unsloth/Kimi-K3-GGUF`, not from the text repo.
 
+Both profiles use the blessed [Inferact/Kimi-K3-DSpark][k3d] draft through the
+common DSpark/TurboQuant configuration.
+
+[k3d]: https://huggingface.co/Inferact/Kimi-K3-DSpark
+
 Both profiles need a `_C_stable_libtorch` built from this tree, `k3-6` most of
 all. The MMQ expert-id fix lives in a `.cuh`, and a stale extension silently
 zeroes every expert above 255 — 71% of this model's experts — in any
 prefill-width MoE call that sees global expert ids, which is exactly what
 tensor parallel does. Under `k3-8` each rank holds ids 0–111 and never reaches
 the ceiling, so `k3-6` is the configuration a stale build degrades.
+
+---
+
+## Apple Silicon (in progress)
+
+The matrix now has a third platform. It is honest about its own status: the
+rows exist, the memory arithmetic is real, and `slimserve` refuses to start
+them.
+
+```console
+$ slimserve --list
+Profiles (Apple M5 Max, 128 GiB unified):
+  ! glm52-mac  GLM-5.2-Vision on one Mac — engine support is not built yet
+  ! dsv4-mac   DeepSeek-V4-Flash on one Mac — engine support is not built yet
+```
+
+**A Mac is gated by memory, not by card count.** Every other platform in this
+file answers "will it fit?" by counting GPUs. Apple exposes one GPU per machine
+and weights, KV and activations all come out of one unified pool, so counting
+cards says nothing. Quants therefore carry `min_memory_bytes` alongside
+`min_gpus`, and each platform declares which of the two gates it:
+
+| Mac | DeepSeek-V4-Flash | GLM-5.2-Vision |
+| --- | --- | --- |
+| 128 GB | `IQ2_XXS`, `Q4K-tail` | — |
+| 192 GB | + `MXFP4`, `Q4_K` | — |
+| 256 GB | all four | `IQ2_XXS` |
+| 512 GB | all four | + `Q2_K`, `Q4_K` |
+
+Kimi K3 is deliberately absent: at 800 GiB it does not fit the largest Mac ever
+built, so no Metal row claims it.
+
+The figures are physical RAM and already carry the margin Metal imposes — on
+this M5 Max, `recommendedMaxWorkingSetSize` is 115.4 of 128 GiB. A second limit
+bites before that one: `maxBufferLength` is 80.6 GiB, well under the 90.9 GiB
+`Q4K-tail` build, so weights cannot be one buffer per file. Both llama.cpp
+(`ggml/src/ggml-metal/ggml-metal-device.m`) and ds4 (`ds4_metal.m`) solve this
+the same way, by mapping the GGUF into overlapping `MTLBuffer` views sized so
+any single tensor lands wholly inside one view.
+
+**What is missing is the engine, not the kernels.** `vllm/platforms/` has only
+`cuda.py` and `rocm.py`; there is no MPS backend, and the QuixiCore Metal
+kernels are not vendored into `csrc/`. That library already covers most of the
+surface this fork needs — paged attention with block tables, MLA including a
+DeepSeek-V4 sparse fp8 decode, MoE routing and grouped GEMM, and GGUF dequant
+and GEMV for the k-quants and i-quants used here — behind a PyTorch MPS pybind
+extension shaped like the `vllm._quixicore_C` this fork already builds. The
+known hard part is batched serving: ds4 still runs attention and routed experts
+per session on Metal, which is the one thing a continuous-batching server
+cannot leave unsolved. That is why `max_num_seqs` in the two Mac profiles is a
+guess and is labelled as one.
 
 ---
 

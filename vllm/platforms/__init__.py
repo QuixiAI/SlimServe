@@ -32,8 +32,6 @@ def vllm_version_matches_substr(substr: str) -> bool:
     return substr in vllm_version
 
 
-
-
 def cuda_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA platform is available.")
@@ -81,11 +79,24 @@ def rocm_platform_plugin() -> str | None:
     return "vllm.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
+def metal_platform_plugin() -> str | None:
+    logger.debug("Checking if Metal platform is available.")
+    try:
+        from vllm.platforms.metal import metal_is_available
+
+        if metal_is_available():
+            logger.debug("Confirmed Metal platform is available.")
+            return "vllm.platforms.metal.MetalPlatform"
+        logger.debug("Metal platform is not available on this host.")
+    except Exception as e:
+        logger.debug("Exception happens when checking Metal platform: %s", str(e))
+    return None
 
 
 builtin_platform_plugins = {
     "rocm": rocm_platform_plugin,
     "cuda": cuda_platform_plugin,
+    "metal": metal_platform_plugin,
 }
 
 

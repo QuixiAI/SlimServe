@@ -21,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+
 try:
     import tilelang  # noqa: F401
 
@@ -50,6 +51,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.qwen3_dspark import (
+    DSparkConfidenceHead,
     DSparkMarkovHead,
 )
 from vllm.model_executor.models.utils import maybe_prefix
@@ -132,6 +134,12 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+        )
+        self.confidence_head = DSparkConfidenceHead(
+            config.hidden_size,
+            config.dspark_markov_rank,
+            vllm_config.quant_config,
+            prefix=maybe_prefix(prefix, "confidence_head"),
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -492,9 +500,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             return None
         stage = int(m.group(1))
         rest = m.group(2)
-        # The confidence head is not wired into inference yet; drop its weights.
-        if rest.startswith("confidence_head."):
-            return None
         # Head-stack params live at model level (mtp.last), context combiner at
         # model level (mtp.0); everything else is a per-layer decoder block.
         head_prefixes = (
@@ -503,6 +508,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             "hc_head_base",
             "hc_head_scale",
             "markov_head.",
+            "confidence_head.",
         )
         if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
             head_prefixes

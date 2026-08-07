@@ -7,6 +7,8 @@ from enum import Enum
 import torch
 import torch.nn.functional as F
 
+from vllm.platforms import current_platform
+
 
 class MoEActivation(Enum):
     """Activation functions for MoE layers."""
@@ -161,6 +163,36 @@ def apply_moe_activation(
             f"{activation.value} expects equal sizes: "
             f"{output.size(-1)} vs {input.size(-1)}"
         )
+
+    if current_platform.is_metal():
+        if activation == MoEActivation.SILU:
+            gate, up = input.chunk(2, dim=-1)
+            output.copy_(F.silu(gate) * up)
+        elif activation == MoEActivation.GELU:
+            gate, up = input.chunk(2, dim=-1)
+            output.copy_(F.gelu(gate) * up)
+        elif activation == MoEActivation.GELU_TANH:
+            gate, up = input.chunk(2, dim=-1)
+            output.copy_(F.gelu(gate, approximate="tanh") * up)
+        elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            assert clamp_limit is not None
+            gate, up = input.chunk(2, dim=-1)
+            gate = torch.clamp(gate, max=clamp_limit)
+            up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
+            output.copy_(gate * torch.sigmoid(alpha * gate) * (up + beta))
+        elif activation == MoEActivation.SILU_NO_MUL:
+            output.copy_(F.silu(input))
+        elif activation == MoEActivation.GELU_NO_MUL:
+            output.copy_(F.gelu(input))
+        elif activation == MoEActivation.GELU_TANH_NO_MUL:
+            output.copy_(F.gelu(input, approximate="tanh"))
+        elif activation == MoEActivation.RELU2_NO_MUL:
+            output.copy_(F.relu(input).square())
+        else:
+            raise NotImplementedError(
+                f"Metal reference activation is unavailable for {activation.value}"
+            )
+        return output
 
     # Activations with gated multiplication (gate × activation(up))
     if activation == MoEActivation.SILU:

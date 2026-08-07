@@ -53,7 +53,9 @@ def release_device_memory_under_pressure(device: torch.device) -> bool:
     Returns:
         True if memory was released.
     """
-    if device.type != "cuda" or not current_platform.is_integrated_gpu(device.index):
+    if device.type not in ("cuda", "mps") or not current_platform.is_integrated_gpu(
+        device.index
+    ):
         return False
 
     releasable = torch.accelerator.memory_reserved(
