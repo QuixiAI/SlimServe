@@ -154,6 +154,7 @@ def _tq_fused_store_fp8(
     # Dimensions
     D: tl.constexpr,
     H: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     # TQ layout
@@ -175,6 +176,8 @@ def _tq_fused_store_fp8(
     if slot < 0:
         return
     blk = (slot // BLOCK_SIZE).to(tl.int64)
+    if blk >= NUM_BLOCKS:
+        return
     off = (slot % BLOCK_SIZE).to(tl.int64)
     head_idx_i64 = tl.cast(head_idx, tl.int64)
     slot_base = (
@@ -235,6 +238,7 @@ def _tq_fused_store_mse(
     # Dimensions
     D: tl.constexpr,
     H: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     # TQ layout
@@ -263,6 +267,8 @@ def _tq_fused_store_mse(
     if slot < 0:
         return
     blk = (slot // BLOCK_SIZE).to(tl.int64)
+    if blk >= NUM_BLOCKS:
+        return
     off = (slot % BLOCK_SIZE).to(tl.int64)
     head_idx_i64 = tl.cast(head_idx, tl.int64)
     slot_base = (
@@ -396,6 +402,7 @@ def triton_turboquant_store(
             stride_cache_head=stride_head,
             D=D,
             H=H,
+            NUM_BLOCKS=kv_cache.shape[0],
             BLOCK_SIZE=block_size,
             BLOCK_D=BLOCK_D,
             KPS=key_packed_size,
@@ -432,6 +439,7 @@ def triton_turboquant_store(
         stride_cache_head=stride_head,
         D=D,
         H=H,
+        NUM_BLOCKS=kv_cache.shape[0],
         BLOCK_SIZE=block_size,
         BLOCK_D=BLOCK_D,
         MSE_BYTES=mse_bytes,

@@ -84,6 +84,11 @@ class SpeculativeConfig:
     disable_draft_cudagraphs: bool = False
     """Run the drafter outside CUDA graphs. Only for draft models whose graphs
     are known to be broken; it does not affect the target model."""
+    replicate_draft_backbone: bool = False
+    """Replicate a DSpark/DFlash decoder backbone on every tensor-parallel
+    rank. This is useful when the exact draft's attention heads or intermediate
+    width cannot be evenly sharded at the target model's TP size. Vocabulary
+    embeddings and logits remain tensor-parallel."""
     # General speculative decoding control
     num_speculative_tokens: int = Field(default=None, gt=0)  # type: ignore[assignment]
     """The number of speculative tokens, if provided. It will default to the
@@ -1223,8 +1228,12 @@ class SpeculativeConfig:
             )
 
         if self.draft_model_config:
+            verification_parallel_config = self.draft_parallel_config
+            if self.replicate_draft_backbone:
+                verification_parallel_config = copy.copy(self.draft_parallel_config)
+                verification_parallel_config.tensor_parallel_size = 1
             self.draft_model_config.verify_with_parallel_config(
-                self.draft_parallel_config
+                verification_parallel_config
             )
 
         if self.use_heterogeneous_vocab and not self.uses_draft_model():

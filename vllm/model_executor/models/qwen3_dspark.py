@@ -51,20 +51,25 @@ class DSparkMarkovHead(nn.Module):
         markov_rank: int,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
-        # TODO(ben): profile for which (if any) it makes sense to replicate or TP-shard
+        # Quantized vocabulary rows cannot always be split at an arbitrary TP
+        # boundary (Kimi's exact Q8 head on TP6 is one such case). The Markov
+        # head is small, so replicate it with a replicated draft backbone.
         self.markov_w1 = VocabParallelEmbedding(
             vocab_size,
             markov_rank,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w1"),
+            disable_tp=disable_tp,
         )
         self.markov_w2 = ParallelLMHead(
             draft_vocab_size,
             markov_rank,
             quant_config=quant_config,
             prefix=maybe_prefix(prefix, "markov_w2"),
+            disable_tp=disable_tp,
         )
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -126,6 +131,7 @@ class Qwen3DSparkModel(DFlashQwen3Model):
             config.markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
             quant_config=self.quant_config,
+            disable_tp=self.replicate_backbone,
         )
 
 

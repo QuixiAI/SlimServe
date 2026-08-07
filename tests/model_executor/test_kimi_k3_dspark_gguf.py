@@ -8,7 +8,12 @@ import pytest
 import torch
 from gguf import GGUFWriter
 
+from vllm.model_executor.layers import vocab_parallel_embedding
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.model_loader.gguf_adapters import kimi_k3_dspark
 from vllm.model_executor.model_loader.gguf_adapters.kimi_k3_dspark import (
     KimiK3DSparkGGUFAdapter,
@@ -20,6 +25,51 @@ from vllm.transformers_utils.gguf_kimi_k3_dspark import (
     build_kimi_k3_dspark_config_from_gguf,
 )
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    _draft_validation_parallel_config,
+)
+
+
+def test_replicated_vocab_layers_skip_tensor_parallel_collectives(monkeypatch):
+    monkeypatch.setattr(
+        vocab_parallel_embedding,
+        "tensor_model_parallel_all_reduce",
+        lambda _: pytest.fail("a replicated embedding must not be reduced"),
+    )
+    embedding = SimpleNamespace(
+        tp_size=1,
+        quant_method=SimpleNamespace(embedding=lambda _layer, inputs: inputs.float()),
+    )
+    token_ids = torch.tensor([1, 2, 3])
+
+    output = VocabParallelEmbedding.forward(embedding, token_ids)
+
+    assert torch.equal(output, token_ids.float())
+
+    full_logits = torch.arange(6).reshape(2, 3)
+    processor = SimpleNamespace(
+        org_vocab_size=3,
+        _apply_head=lambda *_: full_logits,
+        _gather_logits=lambda _: pytest.fail("a replicated head must not be gathered"),
+    )
+    head = SimpleNamespace(tp_size=1)
+
+    logits = LogitsProcessor._get_logits(processor, torch.empty(0), head, None)
+
+    assert torch.equal(logits, full_logits)
+
+
+def test_replicated_draft_validates_as_tp1_without_mutating_target_parallelism():
+    target_parallel = SimpleNamespace(tensor_parallel_size=6)
+    vllm_config = SimpleNamespace(
+        parallel_config=target_parallel,
+        speculative_config=SimpleNamespace(replicate_draft_backbone=True),
+    )
+
+    validation_parallel = _draft_validation_parallel_config(vllm_config)
+
+    assert validation_parallel.tensor_parallel_size == 1
+    assert target_parallel.tensor_parallel_size == 6
 
 
 def test_gguf_config_parser_rejects_unregistered_architectures(monkeypatch):

@@ -5,9 +5,10 @@ By Eric Hartford, QuixiAI
 *A simplicity-first, opinionated inference engine for the antirez GGUF quants —
 ds4's interface, vLLM's engine, and every performance trick we can land.*
 
-<img width="480" height="480" alt="image" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
+<!-- markdownlint-disable-next-line MD013 MD033 -->
+<img width="480" height="480" alt="SlimServe" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
 
-### With SlimServe you can run GLM-5.2-Vision at
+## With SlimServe you can run GLM-5.2-Vision at
 
 Aggregate throughput, by concurrent requests:
 
@@ -19,6 +20,7 @@ Aggregate throughput, by concurrent requests:
 | **4× A100** | **66** | **138** | **204** | **273** | **326** | **392** |
 | **8× A100** | **81** | **167** | **305** | **333** | **550** | **626** |
 
+<!-- markdownlint-disable MD033 -->
 <sub>Aggregate tok/s — total tokens generated divided by the time to drain the
 whole batch. Per-request rates and latencies are in
 [Performance](#performance). † 8 GPUs at 64 concurrent trips an illegal memory
@@ -36,6 +38,7 @@ independent TP4 instances for isolation, at roughly the 4× row each.</sub>
 <sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
 responses, temperature 0, DSpark speculative decoding with TurboQuant draft
 KV. 1M-token context is available on 4+ GPUs.</sub>
+<!-- markdownlint-enable MD033 -->
 
 ---
 
@@ -141,19 +144,21 @@ Output streams token by token in both modes. The prompt is an SSE client of the
 same OpenAI-compatible endpoint `--serve` exposes, so an interactive answer and
 an API answer come from one engine with one configuration.
 
-| Profile | Model | GPUs | Runs on |
-| --- | --- | ---: | --- |
-| `glm52-2` | GLM-5.2-Vision | 2 | MI300X |
-| `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 |
-| `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 |
-| `dsv4-2` | DeepSeek-V4-Flash (text) | 2 | MI300X |
-| `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X |
-| `k3-6` | Kimi K3 | 6 | MI300X |
-| `k3-8` | Kimi K3 | 8 | MI300X |
-| `glm52-mac` † | GLM-5.2-Vision | 1 | Apple Silicon |
-| `dsv4-mac` † | DeepSeek-V4-Flash (text) | 1 | Apple Silicon |
+| Profile | Model | GPUs | Runs on | Draft cache |
+| --- | --- | ---: | --- | --- |
+| `glm52-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
+| `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
+| `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
+| `dsv4-1` † | DeepSeek-V4-Flash (text) | 1 | MI300X/Mac | DSpark + TurboQuant |
+| `dsv4-2` | DeepSeek-V4-Flash (text) | 2 | MI300X | DSpark + TurboQuant |
+| `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X | DSpark + TurboQuant |
+| `dsv4-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
+| `k3-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
+| `k3-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
+| `glm52-mac` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
 
-† Described but not yet runnable — see [Apple Silicon](#apple-silicon-in-progress).
+† The Apple Silicon variant is described but not yet runnable — see
+[Apple Silicon](#apple-silicon-in-progress).
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -167,8 +172,9 @@ anything.
 URLs, per-platform engine settings, and the minimum GPU count for each quant.
 That file is the authority; nothing outside it can be run.
 
-The lower-level `run-glm-optimized.sh` still exists for GLM experiments that
-step outside the profiles (arbitrary `--tp`, `--ctx`, `--kv`, `--ep`).
+The lower-level `run-glm-optimized.sh` still exists for the three exact GLM
+quants. Like the profiles, it always enables the matching DSpark draft with a
+TurboQuant cache.
 
 ---
 
@@ -187,9 +193,10 @@ hf download QuixiAI/GLM-5.2-Vision-GGUF \
   --include "antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-*" \
   --local-dir $MODELS/GLM-5.2-Vision-GGUF          # 244 GiB, default
 
-#   IQ2_XXS: --include "antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-*"   # 196 GiB
-#   Q4_K:    --include "antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-*"                  # 404 GiB
-#   Q6_K:    --include "UD-Q6_K_XL/*"                                                # 638 GiB
+#   IQ2_XXS (196 GiB):
+#     --include "antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-*"
+#   Q4_K (404 GiB):
+#     --include "antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-*"
 
 # 2. Vision projector + chat template (shared by every quant, ~950 MB)
 hf download QuixiAI/GLM-5.2-Vision-GGUF \
@@ -200,11 +207,10 @@ hf download QuixiAI/GLM-5.2-Vision-GGUF \
 The `--include` patterns end in `-*` so every shard of the chosen quant is
 fetched (a quant is split across 5–16 files and all are required).
 
-**The speculator downloads itself.** `run-glm-optimized.sh` passes the HF repo
-id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
+**The speculator downloads itself.** `run-glm-optimized.sh` passes the exact HF
+repo id `RedHatAI/GLM-5.2-speculator.dspark` (5.9 GB) unless
 `$MODELS/GLM-5.2-speculator.dspark` already exists, so the first run pulls it
-into the HF cache. Point somewhere else with `--draft <path-or-repo>`, or turn
-speculation off with `--no-spec`.
+into the HF cache.
 
 ## Running the lower-level script
 
@@ -212,7 +218,6 @@ speculation off with `--no-spec`.
 ./run-glm-optimized.sh                      # Q2_K, TP2, 512k ctx, 32 concurrent
 ./run-glm-optimized.sh --tp 4               # 4 GPUs → full 1M context by default
 ./run-glm-optimized.sh --quant Q4_K --tp 4  # higher quality, 4 GPUs
-./run-glm-optimized.sh --quant Q6_K --tp 8  # near-lossless, 8 GPUs
 ```
 
 **Context ceiling scales with GPU count.** The default is 512k on 2 GPUs and
@@ -223,6 +228,7 @@ the model name `GLM-5.2-Vision`.
 
 ### Vision request
 
+<!-- markdownlint-disable MD013 -->
 ```bash
 curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -239,6 +245,7 @@ curl -s http://localhost:8000/v1/chat/completions \
     "temperature": 0
   }' | jq -r '.choices[0].message.content'
 ```
+<!-- markdownlint-enable MD013 -->
 
 ### Reasoning output
 
@@ -297,7 +304,6 @@ GPUs for the weights **plus** the KV pool (192 GB per MI300X).
 | [`UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K`](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF/blob/main/antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-00001-of-00005.gguf) | 196 GiB | 2 | Maximum throughput / longest context on 2 GPUs. Noticeably weaker on reasoning and precise transcription; fine for classification, routing, short summarization. |
 | [`UD-Q2_K_RoutedQ2K`](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF/blob/main/antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-00001-of-00006.gguf) | 244 GiB | 2 | **Default.** Best quality that still fits 2 GPUs with room for a large KV pool. The configuration this fork is tuned against. |
 | [`UD-Q4_K_RoutedQ4K`](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF/blob/main/antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-00001-of-00010.gguf) | 404 GiB | 4 | Quality matters more than GPU count: agentic/tool use, code, math, careful OCR. The best quality/cost point if you have 4 GPUs. |
-| [`UD-Q6_K_XL`](https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF/blob/main/UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf) | 638 GiB | 8 | Near-lossless reference. Use for evaluation baselines, or when an accuracy regression must not come from quantization. Lowest throughput per GPU. |
 
 Rules of thumb:
 
@@ -307,9 +313,9 @@ Rules of thumb:
   compounds across reasoning steps in a way it does not in summarization.
 - **Go down (IQ2_XXS) only when throughput or context is the binding constraint**
   and the task is tolerant. Test it on your own eval before trusting it.
-- **Q6_K is a measuring stick, not a serving target** on this hardware.
 - Speculative decoding costs quality **nothing** — the verifier accepts or
-  rejects every draft token — so leave it on regardless of quant.
+  rejects every draft token. All profiles use the model family's exact DSpark
+  artifact and a `turboquant_k8v4` draft cache.
 
 ---
 
@@ -319,9 +325,11 @@ The second architecture this fork serves. Text only — the model has no vision
 tower, so none of the mmproj path applies.
 
 ```bash
+slimserve dsv4-1 --quant IQ2_XXS    # smallest target on one GPU
+slimserve dsv4-2                    # mixed Q4_K tail on two GPUs
 slimserve dsv4-4                    # MXFP4 on 4 GPUs, the tuned path
-slimserve dsv4-2 --quant IQ2_XXS    # smallest, 2 GPUs
-slimserve dsv4-4 --serve            # OpenAI-compatible endpoint
+slimserve dsv4-8                    # highest-quality Q4_K default
+slimserve dsv4-4 --serve            # any profile can expose the API
 ```
 
 All four 0731 quants from [antirez/deepseek-v4-gguf][ds4w] load and serve.
@@ -333,12 +341,14 @@ choice is purely quality against footprint.
 | --- | ---: | ---: | --- |
 | `MXFP4Experts` | 145 GiB | 4 | Tuned path; own MXFP4 HIP kernels. |
 | `Q4KExperts` | 153 GiB | 4 | Highest quality of the four; imatrix. |
-| `Layers37-42Q4KExperts` | 91 GiB | 2 | Mixed; see note below. |
-| `IQ2XXS-w2Q2K` | 81 GiB | 2 | Smallest; IQ2_XXS experts, Q2_K down. |
+| `Layers37-42Q4KExperts` | 91 GiB | 1 | Mixed; see note below. |
+| `IQ2XXS-w2Q2K` | 81 GiB | 1 | Smallest; IQ2_XXS experts, Q2_K down. |
 
-Drafter (all quants): the standardized Q2_K/Q8_0 `dflash` artifact from
-[alessandrobologna][ds4d].
-Context 1048576 (yarn, 65536 base).
+All four use the pinned 6.5 GiB [DeepSeek-V4-Flash 0731 DSpark drafter][ds4d]:
+`DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf`. The drafter is
+from the same 0731 model revision as the verifier; older DeepSeek-V4-Flash
+drafters are not supported. Its sliding-window K/V is stored with TurboQuant.
+Context is 1048576 (yarn, 65536 base).
 
 `Layers37-42Q4KExperts` puts Q4_K on the last six expert layers and
 IQ2_XXS gate/up with Q2_K down on the rest, which is why it is the one file
@@ -349,28 +359,35 @@ vector MoE path at every batch size. That is a throughput ceiling, not a
 correctness limit.
 
 [ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
-[ds4d]: <https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF> <!-- markdownlint-disable-line MD013 -->
+[ds4d]: https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF
 
 The equivalent by hand, which is what `slimserve dsv4-4` runs:
 
 ```bash
 GGUF=$MODELS/antirez-deepseek-v4-gguf
+MODEL=$GGUF/DeepSeek-V4-Flash-...-mxfp4-0731.gguf
+DRAFT_DIR=$MODELS/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF
+DRAFT=$DRAFT_DIR/DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf
 VLLM_ROCM_USE_AITER=1 python -m vllm.entrypoints.openai.api_server \
-  --model $GGUF/DeepSeek-V4-Flash-...-mxfp4-0731.gguf \
+  --model "$MODEL" \
   --trust-remote-code --served-model-name DeepSeek-V4-Flash \
-  --tensor-parallel-size 4 --block-size 256 \
+  --tensor-parallel-size 4 --block-size 256 --max-num-seqs 64 \
   --reasoning-parser deepseek_v4 \
   --attention-config '{"sparse_mla_force_mqa": true}' \
-  --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+  --compilation-config '{"cudagraph_mode": "NONE"}' \
+  --speculative-config "{\"model\": \"$DRAFT\", \"method\": \"dspark\", \
+    \"num_speculative_tokens\": 5, \"quantization\": \"gguf\", \
+    \"attention_backend\": \"TURBOQUANT\", \
+    \"kv_cache_dtype\": \"turboquant_k8v4\"}"
 ```
 
-Three flags are not optional. `--block-size 256` is what the DeepSeek-V4 sparse
-MLA backend supports; the GLM value of 64 fails at KV-cache setup with "no
-common block size". `sparse_mla_force_mqa` is required for the same reason it
-is on the GLM path — short prompts otherwise take a dense forward the ROCm
-sparse backend does not implement. `--reasoning-parser deepseek_v4` overrides
-the GLM default, which would otherwise return every answer as `reasoning` with
-`content: null` — see [Reasoning output](#reasoning-output).
+The cache and execution settings are deliberate. `--block-size 256` is what
+the DeepSeek-V4 sparse MLA backend supports; the GLM value of 64 fails at
+KV-cache setup with "no common block size". `sparse_mla_force_mqa` keeps short
+prompts off a dense ROCm path that is not implemented. The eager graph mode is
+required for the stateful DSpark/TurboQuant path, and `max_num_seqs=64` bounds
+its startup warmup. `--reasoning-parser deepseek_v4` prevents the GLM default
+from returning every answer as reasoning with `content: null`.
 
 Everything is read from the GGUF: no `--hf-config-path`, no `--tokenizer`. The
 routed experts are MXFP4, which this fork reads through its own HIP dequant,
@@ -386,14 +403,14 @@ IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
 a BF16 vision tower.
 
 ```bash
-slimserve k3-6            # tensor parallel across 6 GPUs — fastest
-slimserve k3-8            # tensor parallel across all 8 GPUs
+slimserve k3-6            # best measured single-request latency
+slimserve k3-8            # best measured throughput at concurrency 8
 ```
 
 | Profile | Topology | Why |
 | --- | --- | --- |
-| `k3-6` | TP6 | Fastest. 16 attention heads per rank; two cards idle. |
-| `k3-8` | TP8, expert-parallel MoE | All eight cards on every request, but slower — see below. |
+| `k3-6` | TP6 target; replicated draft | Lowest measured c1 latency. |
+| `k3-8` | TP8 target/draft; EP MoE | Highest measured c8 throughput. |
 
 Aggregate tok/s, 1k in / 2k out, `--ignore-eos`, each run gated on the model
 answering a known question first:
@@ -401,9 +418,9 @@ answering a known question first:
 | Profile | 1 | 8 |
 | --- | --- | --- |
 | `k3-6` | **34.0** | **120.4** |
-| `k3-8` | 31.1 | 94.8 |
+| `k3-8` | not rerun | **124.6** |
 
-**Why eight cards lose to six.** TP8 puts 12 attention heads on each rank, which
+**Why TP8 originally lost to TP6.** TP8 puts 12 attention heads on each rank, which
 AITER's MLA cannot run — its gfx942 decode ships as pre-assembled code objects
 with the head count baked in. The HIP kernel in `csrc/quixicore/rocm/` takes the
 head count as a grid dimension and serves it fine.
@@ -414,8 +431,9 @@ the *packed byte* axis: 1008 bytes of Q2_K over 8 ranks is 126, and the
 quantized block and the model emits garbage. TP2/4/6 give 6/3/2 whole blocks,
 which is why only TP8 breaks. `k3-8` avoids this with expert parallelism —
 each rank holds 112 of the 896 experts whole, so no block is ever cut — but EP
-pays an all-to-all dispatch and combine on all 93 MoE layers, and that costs
-more than the extra four GPUs return.
+pays an all-to-all dispatch and combine on all 93 MoE layers. The EP-aware,
+token-major `w13` path removed the larger non-local expert work and put TP8
+slightly ahead at concurrency 8.
 
 Getting tensor-parallel MoE at TP8 would need the intermediate padded from 3072
 to 4096 so the byte shard lands on whole blocks, at ~33% more MoE weight memory
@@ -429,10 +447,11 @@ and its published header has `kimi-k3.vision = false`, which is wrong; the
 downloader reassembles the parts and corrects that byte. The vision projector
 comes from `unsloth/Kimi-K3-GGUF`, not from the text repo.
 
-Both profiles use the blessed [Inferact/Kimi-K3-DSpark][k3d] draft through the
-common DSpark/TurboQuant configuration.
-
-[k3d]: https://huggingface.co/Inferact/Kimi-K3-DSpark
+Both profiles use `Kimi-K3-DSpark-Q8_0.gguf` with a
+`turboquant_k8v4` draft cache. At TP6 the draft's 64 query heads, 16 KV heads
+and 14336-wide MLP do not divide evenly, so its five-layer backbone and small
+Markov head are replicated on each rank while the target and vocabulary logits
+remain distributed. TP8 shards the same exact draft normally.
 
 Both profiles need a `_C_stable_libtorch` built from this tree, `k3-6` most of
 all. The MMQ expert-id fix lives in a `.cuh`, and a stale extension silently
@@ -453,7 +472,7 @@ them.
 $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
   ! glm52-mac  GLM-5.2-Vision on one Mac — engine support is not built yet
-  ! dsv4-mac   DeepSeek-V4-Flash on one Mac — engine support is not built yet
+  ! dsv4-1     DeepSeek-V4-Flash TP1 — Metal support is not built yet
 ```
 
 **A Mac is gated by memory, not by card count.** Every other platform in this
@@ -501,12 +520,10 @@ guess and is labelled as one.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--tp N` | 2 | Tensor-parallel size. Must divide into your GPU count. |
-| `--quant NAME` | `Q2_K` | `IQ2_XXS`, `Q2_K`, `Q4_K`, `Q6_K` |
-| `--ctx N` | 524288 (TP2) / 1048576 (TP≥4) | Max context ceiling; model max is 1048576. |
+| `--quant NAME` | `Q2_K` | `IQ2_XXS`, `Q2_K`, `Q4_K` |
+| `--ctx N` | 524288 / 1048576 | TP2 / TP≥4 context ceiling. |
 | `--max-seqs N` | 32 | Concurrent requests. |
 | `--port N` | 8000 | |
-| `--draft P` | `RedHatAI/GLM-5.2-speculator.dspark` | Speculator path or HF repo id. |
-| `--no-spec` | off | Disable DSpark speculative decoding. |
 | `--dp N` | 1 | Data-parallel replicas. |
 | `--ep` | off | Shard the 256 routed experts across ranks. |
 
@@ -517,20 +534,11 @@ so each card has far more room left for KV — 1M with speculative decoding stil
 on fits comfortably, and the script defaults `--ctx` to 1048576 at `--tp 4` and
 above. Nothing needs to be turned off.
 
-**On 2 GPUs, 512k is the practical ceiling.** The weights leave only ~63 GiB per
-card. A 1M ceiling needs ~52 GiB of KV once the draft model's KV is included,
-and the sparse-MLA and indexer workspaces — which also scale with
-`max_model_len` — need several GiB on top of that. 1M on 2 GPUs therefore
-requires giving up speculative decoding:
-
-```bash
-./run-glm-optimized.sh --tp 2 --ctx 1048576 --max-seqs 1 --no-spec
-```
-
-That configuration is verified working (1,000,021 tokens prefilled and answered
-correctly), but it serves one request at a time and prefills at ~541 tok/s —
-**~31 minutes for a cold 1M prompt**. If you have 4+ GPUs, prefer those; if you
-have 2, prefer 512k and keep speculation.
+**On 2 GPUs, 512k is the ceiling for the required DSpark/TurboQuant path.** The
+weights leave only ~63 GiB per card. A 1M ceiling needs ~52 GiB of KV once the
+draft cache is included, and the sparse-MLA and indexer workspaces — which also
+scale with `max_model_len` — need several GiB on top. Use 4+ GPUs when 1M
+context is required.
 
 One caveat that applies at every size: the MLA latent KV does **not** shard with
 tensor parallelism — every rank keeps the full latent. Extra GPUs buy you
@@ -579,13 +587,13 @@ first small request while 100k-token requests keep working fine.
 
 ## Example configurations
 
-**Default: many short requests, high concurrency (2 GPUs)**
+### Default: many short requests, high concurrency (2 GPUs)
 
 ```bash
 ./run-glm-optimized.sh --quant Q2_K --tp 2 --ctx 524288 --max-seqs 32
 ```
 
-**Full 1M context with speculation kept on (4 GPUs)**
+### Full 1M context with speculation kept on (4 GPUs)
 
 ```bash
 ./run-glm-optimized.sh --quant Q2_K --tp 4 --max-seqs 32
@@ -595,37 +603,22 @@ first small request while 100k-token requests keep working fine.
 available: sharded weights leave enough VRAM that the huge ceiling costs you
 nothing on ordinary short requests.
 
-**More GPUs: scale with `--tp`, not `--dp`**
+### More GPUs: scale with `--tp`, not `--dp`
 
 ```bash
-./run-glm-optimized.sh --tp 4     # 1.2x single-request, 1.3x at concurrency 16 vs TP2
-./run-glm-optimized.sh --tp 8     # Q6_K territory; also the most KV headroom
+# 1.2x single-request, 1.3x at concurrency 16 vs TP2
+./run-glm-optimized.sh --tp 4
+# Most KV headroom for the supported quants
+./run-glm-optimized.sh --tp 8
 ```
 
 See [Parallelism: TP vs DP vs EP](#parallelism-tp-vs-dp-vs-ep) for why
 `--dp` is usually the wrong knob.
 
-**Quality-first agentic serving (4 GPUs)**
+### Quality-first agentic serving (4 GPUs)
 
 ```bash
 ./run-glm-optimized.sh --quant Q4_K --tp 4 --ctx 262144 --max-seqs 64
-```
-
-**Maximum context on only 2 GPUs**
-
-```bash
-./run-glm-optimized.sh --quant Q2_K --tp 2 --ctx 1048576 --max-seqs 1 --no-spec
-```
-
-Speculation must be off and concurrency drops to 1. Prefill dominates at
-~541 tok/s — **~31 minutes for a cold 1M prompt**. Prefix caching makes that a
-one-time cost for a shared corpus, but this is impractical for cold one-shot
-traffic. Use 4 GPUs if 1M matters to you.
-
-**Evaluation baseline (8 GPUs)**
-
-```bash
-./run-glm-optimized.sh --quant Q6_K --tp 8 --ctx 131072 --max-seqs 16
 ```
 
 ---
@@ -637,7 +630,7 @@ traffic. Use 4 GPUs if 1M matters to you.
 Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
 2,000 output tokens each, DSpark spec-3 + TurboQuant draft KV, temperature 0:
 
-**2× MI300X**
+#### 2× MI300X
 
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
 | ---: | ---: | ---: | ---: |
@@ -648,7 +641,7 @@ Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
 | 32 | 296.9 | 10.0 | 204 s |
 | 64 | 407.9 | 7.0 | 288 s |
 
-**4× MI300X**
+#### 4× MI300X
 
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
 | ---: | ---: | ---: | ---: |
@@ -659,7 +652,9 @@ Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
 | 32 | 384.4 | 15.3 | 132 s |
 | 64 | 474.8 | 10.5 | 188 s |
 
-**8× MI300X** (`--max-seqs 32`; see the footnote on the headline table)
+#### 8× MI300X
+
+`--max-seqs 32`; see the footnote on the headline table.
 
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
 | ---: | ---: | ---: | ---: |

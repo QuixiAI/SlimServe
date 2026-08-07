@@ -48,9 +48,8 @@ def test_every_profile_uses_dspark_with_turboquant():
                 continue
             config = engine_kwargs(plan)["speculative_config"]
             assert config["method"] == "dspark"
-            if profile_id != "k3-8":
-                assert config["attention_backend"] == "TURBOQUANT"
-                assert config["kv_cache_dtype"] == "turboquant_k8v4"
+            assert config["attention_backend"] == "TURBOQUANT"
+            assert config["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_every_profile_source_names_a_blessed_dspark_download():
@@ -62,25 +61,31 @@ def test_every_profile_source_names_a_blessed_dspark_download():
         )
 
 
+def test_registry_rejects_duplicate_json_keys():
+    with pytest.raises(ValueError, match="duplicate key.*speculator"):
+        registry._unique_object([("speculator", 1), ("speculator", 2)])
+
+
 def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
     sources = registry._registry()["sources"]
     expected_repo = "alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF"
+    expected_revision = "799216bd6a33457ae41a26968773d7cb47e157b6"
     expected_file = "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
-    for profile_id in ("dsv4-mac", "dsv4-2", "dsv4-4"):
+    for profile_id in ("dsv4-1", "dsv4-2", "dsv4-4", "dsv4-8"):
         entry = registry.describe(profile_id)
         assert entry["source"] == "dsv4-flash"
         speculator = sources[entry["source"]]["speculator"]
         assert speculator["repo"] == expected_repo
+        assert speculator["revision"] == expected_revision
         assert speculator["file"]["path"] == expected_file
-        assert "Kimi" not in speculator["repo"]
 
-        platform = "metal" if profile_id == "dsv4-mac" else "mi300x"
-        memory = _big_enough(profile_id, platform)
-        plan = resolve(profile_id, platform, entry["gpus"], None, memory)
+        plan = resolve(profile_id, "mi300x", 8, None)
         config = engine_kwargs(plan)["speculative_config"]
         assert config["num_speculative_tokens"] == 5
         assert config["quantization"] == "gguf"
-        assert config["model"].endswith(expected_file)
+        assert config["attention_backend"] == "TURBOQUANT"
+        assert config["kv_cache_dtype"] == "turboquant_k8v4"
+        assert config["model"].endswith(f"/{expected_file}")
 
 
 def test_deepseek_drafter_is_fetched_once_with_the_plan(tmp_path, monkeypatch):
@@ -216,6 +221,9 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "Q4K-tail",
         "IQ2_XXS",
     }
+    assert deepseek["speculator"]["file"]["path"] == (
+        "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
+    )
     assert {
         entry["path"]
         for quant in deepseek["quants"].values()
@@ -232,21 +240,33 @@ def test_registry_contains_only_the_supported_model_artifacts():
 
 
 def test_kimi_uses_the_registered_q8_dspark_gguf():
-    assert "speculative_config" not in engine_kwargs(resolve("k3-6", "mi300x", 8, None))
-    plan = resolve("k3-8", "mi300x", 8, None)
-    speculative = engine_kwargs(plan)["speculative_config"]
+    plans = [
+        resolve("k3-6", "mi300x", 8, None),
+        resolve("k3-8", "mi300x", 8, None),
+    ]
+    for plan in plans:
+        speculative = engine_kwargs(plan)["speculative_config"]
 
-    assert speculative["model"].endswith(
-        "/Kimi-K3-DSpark-Q8_0-GGUF/Kimi-K3-DSpark-Q8_0.gguf"
+        assert speculative["model"].endswith(
+            "/Kimi-K3-DSpark-Q8_0-GGUF/Kimi-K3-DSpark-Q8_0.gguf"
+        )
+        assert speculative["method"] == "dspark"
+        assert speculative["num_speculative_tokens"] == 7
+        assert speculative["quantization"] == "gguf"
+        assert speculative["attention_backend"] == "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+        assert speculative["disable_draft_cudagraphs"] is True
+        assert "draft_tensor_parallel_size" not in speculative
+
+    assert (
+        engine_kwargs(plans[0])["speculative_config"]["replicate_draft_backbone"]
+        is True
     )
-    assert speculative["method"] == "dspark"
-    assert speculative["num_speculative_tokens"] == 7
-    assert speculative["quantization"] == "gguf"
-    assert speculative["attention_backend"] == "TRITON_ATTN"
-    assert speculative["disable_draft_cudagraphs"] is True
-    assert "draft_tensor_parallel_size" not in speculative
+    assert (
+        "replicate_draft_backbone" not in engine_kwargs(plans[1])["speculative_config"]
+    )
 
-    [draft] = [entry for entry in files_for(plan) if entry["role"] == "speculator"]
+    [draft] = [entry for entry in files_for(plans[1]) if entry["role"] == "speculator"]
     assert draft["bytes"] == 2390153888
     assert draft["url"] == (
         "https://huggingface.co/Lucebox/Kimi-K3-DSpark-Q8_0-GGUF/"
@@ -260,17 +280,17 @@ GB = 1 << 30
 def test_metal_gates_on_memory_not_on_gpu_count():
     """One Mac is always one GPU, so the card count must not decide anything."""
     assert registry.platform_gate("metal") == "memory"
-    plan = resolve("dsv4-mac", "metal", 1, "IQ2_XXS", 128 * GB)
+    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
     assert plan.engine["tensor_parallel_size"] == 1
     # The same single "GPU" cannot hold the 145 GiB build.
     with pytest.raises(ProfileError, match="unified memory"):
-        resolve("dsv4-mac", "metal", 1, "MXFP4", 128 * GB)
+        resolve("dsv4-1", "metal", 1, "MXFP4", 128 * GB)
 
 
 def test_metal_suggests_a_smaller_quant_not_a_bigger_machine():
     """More RAM is not a choice the user can make at the prompt; a quant is."""
     with pytest.raises(ProfileError, match="try Q4K-tail"):
-        resolve("dsv4-mac", "metal", 1, "MXFP4", 128 * GB)
+        resolve("dsv4-1", "metal", 1, "MXFP4", 128 * GB)
 
 
 def test_a_laptop_cannot_hold_glm_at_any_quant():
@@ -292,6 +312,41 @@ def test_metal_profiles_are_flagged_as_not_yet_runnable():
     assert registry.platform_blocked("metal")
     assert registry.platform_blocked("mi300x") is None
     assert registry.platform_blocked("a100") is None
+
+
+def test_deepseek_dspark_fetches_the_pinned_0731_drafter():
+    plan = resolve("dsv4-4", "mi300x", 8, None)
+    speculative = engine_kwargs(plan)["speculative_config"]
+    assert speculative["model"].endswith(
+        "/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF/"
+        "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
+    )
+    [drafter] = [entry for entry in files_for(plan) if entry["role"] == "speculator"]
+    assert drafter["bytes"] == 6971243008
+    assert drafter["sha256"] == (
+        "3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914"
+    )
+    assert drafter["local_dir"] == "DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF"
+
+
+def test_deepseek_profiles_cover_all_supported_tensor_parallel_sizes():
+    expected = {
+        "dsv4-1": (1, "IQ2_XXS"),
+        "dsv4-2": (2, "Q4K-tail"),
+        "dsv4-4": (4, "MXFP4"),
+        "dsv4-8": (8, "Q4_K"),
+    }
+
+    assert {
+        profile_id
+        for profile_id in registry.profile_ids()
+        if profile_id.startswith("dsv4-")
+    } == set(expected)
+    for profile_id, (tp_size, default_quant) in expected.items():
+        plan = resolve(profile_id, "mi300x", 8, None)
+        assert plan.gpus == tp_size
+        assert plan.engine["tensor_parallel_size"] == tp_size
+        assert plan.quant.name == default_quant
 
 
 def test_serve_argv_renders_flags_the_api_server_accepts():
@@ -341,7 +396,7 @@ def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
 
 
 def test_profiles_use_their_validated_graph_mode():
-    """Kimi TP8 and Metal run without target graph capture."""
+    """Stateful DSpark/TurboQuant profiles use eager target execution."""
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
@@ -352,7 +407,11 @@ def test_profiles_use_their_validated_graph_mode():
                 _big_enough(profile_id, platform),
             ).engine
             cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
-            if profile_id == "k3-8" or platform == "metal":
+            if (
+                profile_id.startswith("dsv4-")
+                or profile_id in ("k3-6", "k3-8")
+                or platform == "metal"
+            ):
                 assert cudagraph_mode == "NONE"
             else:
                 assert cudagraph_mode not in (None, "NONE"), profile_id

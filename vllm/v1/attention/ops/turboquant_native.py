@@ -38,9 +38,7 @@ def native_turboquant_supported(head_size: int, key_fp8: bool) -> bool:
         return False
     # Native fp8 keys implement the e4b15 (Ampere/Ada) format only; on
     # sm89+ the Triton path keeps using e4nv.
-    if key_fp8 and not _use_fp8_e4b15(0):
-        return False
-    return True
+    return not (key_fp8 and not _use_fp8_e4b15(0))
 
 
 def native_turboquant_store(
@@ -63,8 +61,13 @@ def native_turboquant_store(
         k_flat = key.reshape(NH, D).contiguous()
         v_flat = value.reshape(NH, D).contiguous()
         quixicore_ops.turboquant_store_fp8(
-            k_flat, v_flat, kv_cache, slot_mapping, H,
-            key_packed_size, value_quant_bits,
+            k_flat,
+            v_flat,
+            kv_cache,
+            slot_mapping,
+            H,
+            key_packed_size,
+            value_quant_bits,
         )
         return
 
@@ -76,8 +79,15 @@ def native_turboquant_store(
     y = x_hat @ PiT
     v_flat = value.float().reshape(NH, D)
     quixicore_ops.turboquant_store_mse(
-        y.contiguous(), norms.squeeze(1).contiguous(), v_flat.contiguous(),
-        midpoints, kv_cache, slot_mapping, H, mse_bits, key_packed_size,
+        y.contiguous(),
+        norms.squeeze(1).contiguous(),
+        v_flat.contiguous(),
+        midpoints,
+        kv_cache,
+        slot_mapping,
+        H,
+        mse_bits,
+        key_packed_size,
         value_quant_bits,
     )
 
@@ -102,6 +112,7 @@ def native_turboquant_decode_attention(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,
     sliding_window: int = 0,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native TQ decode; mirrors `triton_turboquant_decode_attention`."""
     B, Hq, D = query.shape
@@ -131,9 +142,20 @@ def native_turboquant_decode_attention(
             buf_holder._tq_mid_o_buf = mid_o
 
     quixicore_ops.turboquant_decode_stage1(
-        q_rot, kv_cache, block_table, seq_lens, centroids, mid_o,
-        NUM_KV_SPLITS, mse_bits, key_packed_size, value_quant_bits, scale,
-        key_fp8, norm_correction, sliding_window,
+        q_rot,
+        kv_cache,
+        block_table,
+        seq_lens,
+        centroids,
+        mid_o,
+        NUM_KV_SPLITS,
+        mse_bits,
+        key_packed_size,
+        value_quant_bits,
+        scale,
+        key_fp8,
+        norm_correction,
+        sliding_window,
     )
 
     # Stage 2 derives per-split occupancy from seq_len; with a window the
@@ -159,7 +181,8 @@ def native_turboquant_decode_attention(
         if buf_holder is not None:
             buf_holder._tq_lse_buf = lse
 
-    quixicore_ops.turboquant_decode_stage2(
-        mid_o, output, lse, seq_lens, NUM_KV_SPLITS
-    )
+    quixicore_ops.turboquant_decode_stage2(mid_o, output, lse, seq_lens, NUM_KV_SPLITS)
+    if sinks is not None:
+        sink_scale = torch.sigmoid(lse - sinks.to(lse.dtype).unsqueeze(0))
+        output.mul_(sink_scale.unsqueeze(-1).to(output.dtype))
     return output

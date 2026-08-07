@@ -1,15 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ParallelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
 )
+
+
+def _draft_validation_parallel_config(vllm_config: VllmConfig) -> ParallelConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    if not speculative_config.replicate_draft_backbone:
+        return vllm_config.parallel_config
+
+    validation_config = copy.copy(vllm_config.parallel_config)
+    validation_config.tensor_parallel_size = 1
+    return validation_config
 
 
 def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
@@ -59,6 +72,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_vllm_config = replace(
         vllm_config,
         model_config=draft_model_config,
+        parallel_config=_draft_validation_parallel_config(vllm_config),
         load_config=draft_load_config,
         quant_config=draft_quant_config,
         attention_config=replace(
@@ -75,6 +89,12 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
+    if speculative_config.replicate_draft_backbone:
+        # VllmConfig validates draft head divisibility during construction.
+        # The replicated backbone satisfies that invariant as TP1, but it still
+        # executes inside the target's real TP group for collectives used by the
+        # shared/partitioned vocabulary layers.
+        draft_vllm_config.parallel_config = vllm_config.parallel_config
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(

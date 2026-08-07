@@ -117,6 +117,20 @@ def _largest_kernel_block_within(
     smallest = min(candidates)
     if not page_budget or per_token_bytes <= 0:
         return smallest
+
+    # Backends commonly advertise a short list of preferred sizes while also
+    # accepting larger multiples (TurboQuant accepts any multiple of 16). A
+    # divisor of the primary block keeps the scheduler LCM unchanged, so also
+    # consider every supported divisor of ``fallback``. This matters when a
+    # per-layer compressed draft cache shares pages with a hybrid target: using
+    # only the advertised 256-token size would double the number of padded
+    # draft pages compared with the equally valid 512-token size.
+    candidates.extend(
+        block
+        for block in range(smallest, fallback + 1, smallest)
+        if fallback % block == 0 and attn_backend.supports_block_size(block)
+    )
+    candidates = list(set(candidates))
     fitting = [b for b in candidates if b * per_token_bytes <= page_budget]
     return max(fitting) if fitting else smallest
 
@@ -693,13 +707,29 @@ class Attention(nn.Module, AttentionLayerBase):
             tq_config = TurboQuantConfig.from_cache_dtype(
                 self.kv_cache_dtype, self.head_size
             )
+            # A speculative TQ layer can share the cache pool with a hybrid
+            # target whose attention block was enlarged to cover fixed-size
+            # recurrent state. Keep the TQ layer below that shared page; it can
+            # then be safely padded because its backend indexes by block
+            # stride. Using the enlarged target block directly can make the TQ
+            # page the new maximum and leave the target page unpaddable.
+            shared_page = vllm_config.cache_config.mamba_page_size_padded
+            tq_block_size = block_size
+            if shared_page is not None:
+                tq_block_size = _largest_kernel_block_within(
+                    self.attn_backend,
+                    self.num_kv_heads * tq_config.slot_size_aligned,
+                    shared_page,
+                    block_size,
+                )
             return TQFullAttentionSpec(
-                block_size=block_size,
+                block_size=tq_block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 head_size_v=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
                 tq_slot_size=tq_config.slot_size_aligned,
+                tq_cache_dtype=self.kv_cache_dtype,
             )
         else:
             return FullAttentionSpec(

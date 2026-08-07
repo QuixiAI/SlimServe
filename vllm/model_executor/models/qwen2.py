@@ -85,6 +85,7 @@ class Qwen2MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -93,6 +94,7 @@ class Qwen2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
+            disable_tp=disable_tp,
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -100,6 +102,7 @@ class Qwen2MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
+            disable_tp=disable_tp,
         )
         if hidden_act != "silu":
             raise ValueError(

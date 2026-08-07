@@ -67,6 +67,8 @@ def _tq_decode_stage1(
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,  # KV cache block_size (pages)
+    NUM_BLOCKS: tl.constexpr,
+    MAX_NUM_BLOCKS: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
     KV_GROUP_SIZE: tl.constexpr,  # Hq // Hk
     # TQ layout constants
@@ -146,11 +148,15 @@ def _tq_decode_stage1(
 
         page_idx = kv_offs // BLOCK_SIZE
         page_off = kv_offs % BLOCK_SIZE
+        page_valid = (page_idx >= 0) & (page_idx < MAX_NUM_BLOCKS)
         block_nums = tl.load(
             Block_table_ptr + bt_base + page_idx,
-            mask=kv_mask,
+            mask=kv_mask & page_valid,
             other=0,
         ).to(tl.int64)
+        block_valid = (block_nums >= 0) & (block_nums < NUM_BLOCKS)
+        kv_mask = kv_mask & page_valid & block_valid
+        block_nums = tl.where(block_valid, block_nums, 0)
 
         slot_bases = (
             block_nums * stride_cache_block
@@ -511,6 +517,7 @@ def triton_turboquant_decode_attention(
     buf_holder: Any = None,
     max_num_kv_splits: int = 32,  # fixed split count (must be constant for cudagraph)
     sliding_window: int = 0,  # 0 = full attention; else attend to last W tokens
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Launch fused TQ decode attention (Triton stage1 + stage2).
 
@@ -578,6 +585,8 @@ def triton_turboquant_decode_attention(
         NUM_KV_HEADS=Hk,
         HEAD_DIM=D,
         BLOCK_SIZE=block_size,
+        NUM_BLOCKS=kv_cache.shape[0],
+        MAX_NUM_BLOCKS=block_table.shape[1],
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         KV_GROUP_SIZE=kv_group_size,
         MSE_BITS=mse_bits,
@@ -640,5 +649,12 @@ def triton_turboquant_decode_attention(
         num_warps=4,
         num_stages=2,
     )
+
+    if sinks is not None:
+        # An attention sink is a zero-valued pseudo-token with a learned
+        # per-head logit. It changes only the softmax denominator, so the
+        # ordinary output can be corrected from the stage-2 log-sum-exp.
+        sink_scale = torch.sigmoid(lse - sinks.to(lse.dtype).unsqueeze(0))
+        output.mul_(sink_scale.unsqueeze(-1).to(output.dtype))
 
     return output  # already in query dtype

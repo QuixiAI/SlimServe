@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SlimServe — optimized GLM-5.2-Vision-GGUF server for MI300X.
 #
-#   ./run-glm-optimized.sh [--tp N] [--quant NAME] [--ctx N] [--port N] [--no-spec]
+#   ./run-glm-optimized.sh [--tp N] [--quant NAME] [--ctx N] [--port N]
 #
 # Defaults target the common case: many short (~2k) requests, with a very large
 # ceiling available for the occasional huge one. max_model_len is a ceiling, not
@@ -20,12 +20,10 @@ TP=
 DP=1
 EP=0
 GPUS=
-DRAFT_ARG=
 QUANT=Q2_K
 CTX=                 # default depends on --tp; see below
 PORT=8000
 MAX_SEQS=32
-SPEC=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -33,12 +31,10 @@ while [[ $# -gt 0 ]]; do
         --gpus)  GPUS="$2"; shift 2 ;;
         --dp)    DP="$2"; shift 2 ;;
         --ep)    EP=1; shift ;;
-        --draft) DRAFT_ARG="$2"; shift 2 ;;
         --quant) QUANT="$2"; shift 2 ;;
         --ctx)   CTX="$2"; shift 2 ;;
         --port)  PORT="$2"; shift 2 ;;
         --max-seqs) MAX_SEQS="$2"; shift 2 ;;
-        --no-spec) SPEC=0; shift ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -60,25 +56,21 @@ fi
 : "${TP:=2}"
 
 case "$QUANT" in
-    Q6_K)   MODEL="$MODELS/GLM-5.2-Vision-GGUF/UD-Q6_K_XL/GLM-5.2-UD-Q6_K_XL-00001-of-00016.gguf" ;;
     Q4_K)   MODEL="$MODELS/GLM-5.2-Vision-GGUF/antirez-routed/GLM-5.2-UD-Q4_K_RoutedQ4K-00001-of-00010.gguf" ;;
     Q2_K)   MODEL="$MODELS/GLM-5.2-Vision-GGUF/antirez-routed/GLM-5.2-UD-Q2_K_RoutedQ2K-00001-of-00006.gguf" ;;
     IQ2_XXS) MODEL="$MODELS/GLM-5.2-Vision-GGUF/antirez-routed/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K-00001-of-00005.gguf" ;;
-    *) echo "unknown quant: $QUANT (Q6_K|Q4_K|Q2_K|IQ2_XXS)" >&2; exit 2 ;;
+    *) echo "unknown quant: $QUANT (Q4_K|Q2_K|IQ2_XXS)" >&2; exit 2 ;;
 esac
 [[ -f "$MODEL" ]] || { echo "missing model: $MODEL" >&2; exit 1; }
 
-# Speculator. Override with --draft <path-or-hf-repo>. A bare repo id is
-# resolved through the HF cache, so the 5.9 GB draft downloads on first run;
-# a local checkout is preferred when present.
+# Exact GLM-5.2 DSpark speculator. A bare repo id is resolved through the HF
+# cache, so the 5.9 GB draft downloads on first run; a local checkout is
+# preferred when present.
 DEFAULT_DRAFT_REPO=RedHatAI/GLM-5.2-speculator.dspark
-DRAFT="${DRAFT_ARG:-}"
-if [[ -z "$DRAFT" ]]; then
-    if [[ -d "$MODELS/GLM-5.2-speculator.dspark" ]]; then
-        DRAFT="$MODELS/GLM-5.2-speculator.dspark"
-    else
-        DRAFT="$DEFAULT_DRAFT_REPO"
-    fi
+if [[ -d "$MODELS/GLM-5.2-speculator.dspark" ]]; then
+    DRAFT="$MODELS/GLM-5.2-speculator.dspark"
+else
+    DRAFT="$DEFAULT_DRAFT_REPO"
 fi
 
 # KV pool, sized explicitly. Auto-sizing (gpu_memory_utilization) misjudges
@@ -106,33 +98,31 @@ KV_BYTES=$((KV_GIB * 1024 * 1024 * 1024))
 # Default context ceiling by GPU count. On 2 GPUs the weights leave only ~63
 # GiB per card, and a 1M ceiling needs ~52 GiB of KV *plus* GiB-scale
 # sparse-MLA/indexer workspace that also scales with max_model_len — so 1M on
-# TP2 only fits with speculation off. From 4 GPUs up the weights shard and
-# there is ample room, so 1M is the default there.
+# TP2 cannot fit the required DSpark/TurboQuant path at a 1M ceiling. From 4
+# GPUs up the weights shard and there is ample room, so 1M is the default there.
 if [[ -z "$CTX" ]]; then
     if (( TP >= 4 )); then CTX=1048576; else CTX=524288; fi
 fi
-if (( TP < 4 )) && (( CTX > 524288 )) && [[ "$SPEC" == "1" ]]; then
-    echo "note: ${CTX}-token ceiling on tp=$TP needs speculation off; " \
-         "use --no-spec, --ctx 524288, or --tp 4." >&2
+if (( TP < 4 )) && (( CTX > 524288 )); then
+    echo "error: ${CTX}-token ceiling on tp=$TP does not fit the required " \
+         "DSpark/TurboQuant path; use --ctx 524288 or --tp 4." >&2
+    exit 2
 fi
 
-SPEC_CFG=""
-if [[ "$SPEC" == "1" ]]; then
-    # num_speculative_tokens=3 measured best at batch scale: mean accept length
-    # only grows 2.70 -> 3.07 from 3 to 7 draft tokens while verify width
-    # doubles, so 7 loses ~23% throughput at batch 64. TurboQuant draft KV
-    # (turboquant_k8v4) reaches fp8 acceptance parity by ~4k context and is
-    # ~22% smaller per token.
-    SPEC_CFG=$(cat <<JSON
+# num_speculative_tokens=3 measured best at batch scale: mean accept length
+# only grows 2.70 -> 3.07 from 3 to 7 draft tokens while verify width doubles,
+# so 7 loses ~23% throughput at batch 64. TurboQuant draft KV
+# (turboquant_k8v4) reaches fp8 acceptance parity by ~4k context and is ~22%
+# smaller per token.
+SPEC_CFG=$(cat <<JSON
 {"model": "$DRAFT", "method": "dspark", "num_speculative_tokens": 3,
  "attention_backend": "TURBOQUANT", "kv_cache_dtype": "turboquant_k8v4"}
 JSON
 )
-fi
 
 echo "SlimServe: $QUANT  tp=$TP  dp=$DP  ep=$EP  gpus=${GPUS:-all}  ctx=$CTX" \
-     "kv=${KV_GIB}GiB  spec=$SPEC"
-[[ "$SPEC" == "1" ]] && echo "  draft: $DRAFT"
+     "kv=${KV_GIB}GiB  spec=dspark/turboquant"
+echo "  draft: $DRAFT"
 
 # AITER is required: the target's sparse-MLA indexer has no non-AITER ROCm path.
 export VLLM_ROCM_USE_AITER=1
@@ -166,7 +156,7 @@ ARGS=(
     --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
     --port "$PORT"
 )
-[[ -n "$SPEC_CFG" ]] && ARGS+=(--speculative-config "$SPEC_CFG")
+ARGS+=(--speculative-config "$SPEC_CFG")
 # Expert parallel: shard the 256 routed experts across ranks instead of
 # splitting every expert's matrices (which is what plain TP does).
 [[ "$EP" == "1" ]] && ARGS+=(--enable-expert-parallel)
