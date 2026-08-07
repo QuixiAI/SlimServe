@@ -96,6 +96,25 @@
       "base_url": "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main",
       "local_dir": "antirez-deepseek-v4-gguf",
       "shared_note": "Text only -- this model has no vision tower, so there is no projector to fetch.",
+      "speculator": {
+        "repo": "alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
+        "revision": "799216bd6a33457ae41a26968773d7cb47e157b6",
+        "base_url": "https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF/resolve/799216bd6a33457ae41a26968773d7cb47e157b6",
+        "local_dir": "DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
+        "file": {
+          "path": "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf",
+          "bytes": 6971243008,
+          "sha256": "3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914"
+        },
+        "engine": {
+          "method": "dspark",
+          "num_speculative_tokens": 5,
+          "quantization": "gguf",
+          "attention_backend": "TURBOQUANT",
+          "kv_cache_dtype": "turboquant_k8v4"
+        },
+        "note": "Pinned DSpark/DFlash drafter built for the 0731 verifier. Its published DSpark block size is 5, and its draft KV uses TurboQuant."
+      },
       "quants": {
         "MXFP4": {
           "title": "MXFP4Experts (0731)",
@@ -121,7 +140,7 @@
           "title": "Layers37-42Q4KExperts (0731)",
           "bytes": 97591747456,
           "summary": "Q4_K on the last six expert layers, IQ2_XXS gate/up with Q2_K down on the rest. Fits two GPUs while keeping the layers nearest the output at higher precision.",
-          "min_gpus": {"mi300x": 2},
+          "min_gpus": {"mi300x": 1},
           "min_memory_bytes": {"metal": 137438953472},
           "files": [
             {"path": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf", "bytes": 97591747456}
@@ -131,31 +150,12 @@
           "title": "IQ2XXS-w2Q2K (0731)",
           "bytes": 86720111488,
           "summary": "Smallest. IQ2_XXS experts with Q2_K down. IQ2_XXS gate/up has no MMQ tile kernel, so this stays on the vector MoE path at every batch size -- a throughput ceiling, not a correctness limit.",
-          "min_gpus": {"mi300x": 2},
+          "min_gpus": {"mi300x": 1},
           "min_memory_bytes": {"metal": 137438953472},
           "files": [
             {"path": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf", "bytes": 86720111488}
           ]
         }
-      },
-      "speculator": {
-        "repo": "alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
-        "revision": "799216bd6a33457ae41a26968773d7cb47e157b6",
-        "base_url": "https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF/resolve/799216bd6a33457ae41a26968773d7cb47e157b6",
-        "local_dir": "DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF",
-        "file": {
-          "path": "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf",
-          "bytes": 6971243008,
-          "sha256": "3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914"
-        },
-        "engine": {
-          "method": "dspark",
-          "num_speculative_tokens": 5,
-          "quantization": "gguf",
-          "attention_backend": "TURBOQUANT",
-          "kv_cache_dtype": "turboquant_k8v4"
-        },
-        "note": "Blessed standardized dflash drafter for the 0731 target. Its published DSpark block size is 5, so a shorter speculative length is invalid. SlimServe downloads and verifies it with the target model when it is not already cached."
       }
     },
 
@@ -185,10 +185,11 @@
           "method": "dspark",
           "num_speculative_tokens": 7,
           "quantization": "gguf",
-          "attention_backend": "TRITON_ATTN",
+          "attention_backend": "TURBOQUANT",
+          "kv_cache_dtype": "turboquant_k8v4",
           "disable_draft_cudagraphs": true
         },
-        "note": "The draft has 64 attention heads, so it runs with the TP8 profile. It cannot shard across TP6, and this runtime does not support a TP1 draft under a TP6 verifier."
+        "note": "The exact 64-head draft is tensor-sharded at TP8. At TP6 its five-layer backbone is replicated per rank because neither 64 attention heads nor its width divide by six; vocabulary logits remain distributed."
       },
       "quants": {
         "IQ2_XXS-Q2_K": {
@@ -220,23 +221,6 @@
             "note": "Concatenate in lexical order, then apply the patch. Needs 799 GiB free on top of the parts unless the parts are removed as it goes."
           }
         }
-      },
-      "speculator": {
-        "repo": "Lucebox/Kimi-K3-DSpark-Q8_0-GGUF",
-        "base_url": "https://huggingface.co/Lucebox/Kimi-K3-DSpark-Q8_0-GGUF/resolve/main",
-        "local_dir": "Kimi-K3-DSpark-Q8_0-GGUF",
-        "file": {
-          "path": "Kimi-K3-DSpark-Q8_0.gguf",
-          "bytes": 2390153888
-        },
-        "engine": {
-          "method": "dspark",
-          "num_speculative_tokens": 7,
-          "quantization": "gguf",
-          "attention_backend": "TRITON_ATTN",
-          "disable_draft_cudagraphs": true
-        },
-        "note": "The draft has 64 attention heads, so it runs with the TP8 profile. It cannot shard across TP6, and this runtime does not support a TP1 draft under a TP6 verifier."
       }
     }
   },
@@ -415,20 +399,18 @@
       ]
     },
 
-    "dsv4-mac": {
-      "title": "DeepSeek-V4-Flash on one Mac",
+    "dsv4-1": {
+      "title": "DeepSeek-V4-Flash on 1 GPU",
       "source": "dsv4-flash",
       "gpus": 1,
-      "platforms": ["metal"],
+      "platforms": ["mi300x", "metal"],
       "default_quant": "IQ2_XXS",
-      "summary": "Text only, and the one model in this matrix that fits a 128 GB laptop. ds4 sustains ~26 tok/s decode on an M5 Max at this size.",
+      "summary": "Text only. The smallest 0731 target and its matching DSpark drafter fit on one MI300X; the same profile describes the blocked Metal configuration.",
       "engine": {
         "tensor_parallel_size": 1,
-        "max_model_len": 32768,
-        "max_num_seqs": 4,
-        "max_num_batched_tokens": 2048,
-        "gpu_memory_utilization": 0.85,
         "block_size": 256,
+        "max_num_seqs": 64,
+        "attention_config": {"sparse_mla_force_mqa": true},
         "compilation_config": {"cudagraph_mode": "NONE"},
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -436,14 +418,32 @@
         "served_model_name": "DeepSeek-V4-Flash"
       },
       "speculative": true,
-      "env": {},
+      "env": {"VLLM_ROCM_USE_AITER": "1"},
       "notes": [
-        "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
-        "block_size must be 256, the same constraint the ROCm sparse MLA backend imposes.",
-        "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-        "IQ2_XXS (80.8 GiB) and Q4K-tail (90.9 GiB) fit 128 GB; MXFP4 and Q4_K need 192 GB. ds4 runs a 91 GiB build of this model on a 128 GB M5 Max, which is what makes the tighter of those two credible.",
-        "max_model_len is 32768 rather than the GGUF's 1M: KV competes with weights for the same pool, and at 90.9 GiB of weights there is little left."
-      ]
+        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+      ],
+      "platform_overrides": {
+        "metal": {
+          "engine": {
+            "max_model_len": 32768,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 2048,
+            "gpu_memory_utilization": 0.85,
+            "attention_config": null
+          },
+          "env": {},
+          "notes": [
+            "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every supported platform in this file.",
+            "block_size must be 256, the same constraint the ROCm sparse MLA backend imposes.",
+            "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
+            "IQ2_XXS (80.8 GiB) and Q4K-tail (90.9 GiB) fit 128 GB; MXFP4 and Q4_K need 192 GB. ds4 runs a 91 GiB build of this model on a 128 GB M5 Max, which is what makes the tighter of those two credible.",
+            "max_model_len is 32768 rather than the GGUF's 1M: KV competes with weights for the same pool, and at 90.9 GiB of weights there is little left."
+          ]
+        }
+      }
     },
 
     "dsv4-2": {
@@ -456,8 +456,9 @@
       "engine": {
         "tensor_parallel_size": 2,
         "block_size": 256,
+        "max_num_seqs": 64,
         "attention_config": {"sparse_mla_force_mqa": true},
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "compilation_config": {"cudagraph_mode": "NONE"},
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
         "tool_call_parser": "deepseek_v4",
@@ -483,8 +484,37 @@
       "engine": {
         "tensor_parallel_size": 4,
         "block_size": 256,
+        "max_num_seqs": 64,
         "attention_config": {"sparse_mla_force_mqa": true},
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "compilation_config": {"cudagraph_mode": "NONE"},
+        "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
+        "served_model_name": "DeepSeek-V4-Flash"
+      },
+      "speculative": true,
+      "env": {"VLLM_ROCM_USE_AITER": "1"},
+      "notes": [
+        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+      ]
+    },
+
+    "dsv4-8": {
+      "title": "DeepSeek-V4-Flash on 8 GPUs",
+      "source": "dsv4-flash",
+      "gpus": 8,
+      "platforms": ["mi300x"],
+      "default_quant": "Q4_K",
+      "summary": "Text only. Eight-way tensor parallelism with the highest-quality 0731 Q4_K target by default.",
+      "engine": {
+        "tensor_parallel_size": 8,
+        "block_size": 256,
+        "max_num_seqs": 64,
+        "attention_config": {"sparse_mla_force_mqa": true},
+        "compilation_config": {"cudagraph_mode": "NONE"},
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
         "tool_call_parser": "deepseek_v4",
@@ -514,18 +544,21 @@
         "max_num_batched_tokens": 4096,
         "gpu_memory_utilization": 0.95,
         "block_size": 64,
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "compilation_config": {"cudagraph_mode": "NONE"},
         "mm_encoder_tp_mode": "data",
         "kv_cache_dtype": "auto",
         "reasoning_parser": "kimi_k3",
         "tool_call_parser": "kimi_k3",
         "served_model_name": "Kimi-K3"
       },
-      "speculative": false,
+      "speculative": true,
+      "speculative_overrides": {"replicate_draft_backbone": true},
       "env": {"VLLM_ROCM_USE_AITER": "1", "HSA_XNACK": "1"},
       "chat_template_kwargs": {"thinking": false},
       "notes": [
-        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
+        "The Kimi verifier keeps its native hybrid cache at auto. The replicated DSpark backbone uses a separate TurboQuant compressed cache on every rank.",
+        "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
+        "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
         "HSA_XNACK=1 is required for this load.",
         "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]

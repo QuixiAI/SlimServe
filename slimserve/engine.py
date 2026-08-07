@@ -39,7 +39,11 @@ def _speculative_config(plan: Plan) -> dict[str, Any] | None:
         draft = str(local / file["path"])
     else:
         draft = str(local) if local.is_dir() else spec["repo"]
-    return {"model": draft, **spec["engine"]}
+    return {
+        "model": draft,
+        **spec["engine"],
+        **plan.speculative_overrides,
+    }
 
 
 def engine_kwargs(plan: Plan) -> dict[str, Any]:

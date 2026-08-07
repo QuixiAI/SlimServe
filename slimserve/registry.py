@@ -21,10 +21,19 @@ from slimserve.term import human_bytes
 REGISTRY_PATH = Path(__file__).with_name("profiles.json")
 
 
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key in profiles.json: {key!r}")
+        result[key] = value
+    return result
+
+
 @lru_cache(maxsize=1)
 def _registry() -> dict[str, Any]:
     with REGISTRY_PATH.open(encoding="utf-8") as fp:
-        return json.load(fp)
+        return json.load(fp, object_pairs_hook=_unique_object)
 
 
 def profile_ids() -> list[str]:
@@ -96,6 +105,7 @@ class Plan:
     engine: dict[str, Any]
     env: dict[str, str]
     speculative: bool
+    speculative_overrides: dict[str, Any]
     chat_template_kwargs: dict[str, Any]
     notes: list[str] = field(default_factory=list)
 
@@ -164,6 +174,7 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     override = (profile.get("platform_overrides") or {}).get(platform)
     engine = dict(profile["engine"])
     env = dict(profile.get("env") or {})
+    notes = list(profile.get("notes") or [])
     default_quant = profile["default_quant"]
     if override:
         for key, value in (override.get("engine") or {}).items():
@@ -173,8 +184,15 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
                 engine[key] = value
         if "env" in override:
             env = dict(override["env"])
+        if "notes" in override:
+            notes = list(override["notes"])
         default_quant = override.get("default_quant", default_quant)
-    return {"engine": engine, "env": env, "default_quant": default_quant}
+    return {
+        "engine": engine,
+        "env": env,
+        "notes": notes,
+        "default_quant": default_quant,
+    }
 
 
 def resolve(
@@ -248,8 +266,9 @@ def resolve(
         engine=merged["engine"],
         env=merged["env"],
         speculative=bool(profile.get("speculative")),
+        speculative_overrides=dict(profile.get("speculative_overrides") or {}),
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
-        notes=list(profile.get("notes") or []),
+        notes=merged["notes"],
     )
 
 

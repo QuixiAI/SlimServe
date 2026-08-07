@@ -429,8 +429,6 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
 
 
-
-
 def _gen_mm_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[list[Any], int]:
@@ -1037,8 +1035,6 @@ def _get_kv_cache_groups_uniform_type(
     return [KVCacheGroupSpec(list(spec.kv_cache_specs.keys()), spec)]
 
 
-
-
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1564,7 +1560,6 @@ def group_and_unify_kv_cache_specs(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
     ):
         return None
-
     # SlidingWindowMLASpec models with uniform page sizes don't need tuple packing.
     page_sizes = {spec.page_size_bytes for spec in kv_cache_spec.values()}
     if len(page_sizes) <= 1:
@@ -1779,6 +1774,27 @@ def get_kv_cache_groups(
         # attention in different sizes. Need to group layers into multiple
         # UniformTypeKVCacheSpecs.
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
+        grouped_layers = {
+            layer_name for group in kv_cache_groups for layer_name in group.layer_names
+        }
+        remaining_specs = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if name not in grouped_layers
+        }
+        if remaining_specs:
+            remaining_uniform = UniformTypeKVCacheSpecs.from_specs(remaining_specs)
+            if remaining_uniform is None:
+                raise NotImplementedError(
+                    "DeepSeek-V4 caches added by a speculative drafter must "
+                    "form one uniform cache group."
+                )
+            kv_cache_groups.append(
+                KVCacheGroupSpec(
+                    layer_names=list(remaining_specs),
+                    kv_cache_spec=remaining_uniform,
+                )
+            )
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
 
@@ -1878,27 +1894,18 @@ def _max_memory_usage_bytes_from_groups(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
     ):
-        # Special case (only DeepseekV4 for now): all groups are
-        # UniformTypeKVCacheSpecs.
-        # They must already be page_size aligned and share a common padded
-        # layer-tuple layout. Even groups with fewer actual tuples still reserve
-        # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
-        num_layer_tuples = max(
-            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
+        # Packed groups overlap inside a slab whose stride is the widest dense
+        # group. Block ids are shared across groups, so each group's maximum
+        # page demand consumes that common stride. This covers DeepSeek-V4's
+        # MLA tuples and independent uniform draft-cache groups alike.
+        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        return sum(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
+                vllm_config
+            )
+            * block_stride
             for group in kv_cache_groups
         )
-
-        total_max_mem_usage_bytes = 0
-        for group in kv_cache_groups:
-            group_spec = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec)
-            g_max_mem_usage_pages = group_spec.max_memory_usage_pages(vllm_config)
-            g_max_mem_usage_page_bytes = (
-                num_layer_tuples * g_max_mem_usage_pages * layer_tuple_bytes
-            )
-            total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
-        return total_max_mem_usage_bytes
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -2162,9 +2169,22 @@ def get_kv_cache_configs(
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
         projected_groups_per_worker, kv_cache_specs, available_memory
     ):
-        assert sum(len(group.layer_names) for group in projected_groups) == len(
-            kv_cache_spec_one_worker
-        ), "Some layers are not assigned to any group."
+        assigned_layers = [
+            layer_name for group in projected_groups for layer_name in group.layer_names
+        ]
+        expected_layers = set(kv_cache_spec_one_worker)
+        seen_layers: set[str] = set()
+        duplicate_layers: set[str] = set()
+        for name in assigned_layers:
+            if name in seen_layers:
+                duplicate_layers.add(name)
+            seen_layers.add(name)
+        missing_layers = expected_layers - seen_layers
+        assert not missing_layers and not duplicate_layers, (
+            "KV cache layers were not assigned exactly once: "
+            f"missing={sorted(missing_layers)}, "
+            f"duplicates={sorted(duplicate_layers)}"
+        )
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
                 vllm_config, projected_groups, available_memory_one_worker

@@ -170,11 +170,12 @@ class DFlashQwen3Attention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         attn_type: str = AttentionType.DECODER,
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.layer_name = prefix
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -197,6 +198,7 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            disable_tp=disable_tp,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -204,6 +206,7 @@ class DFlashQwen3Attention(nn.Module):
             bias=attention_bias,  # DFlash has o_proj bias when using attention bias
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
+            disable_tp=disable_tp,
         )
 
         self.rotary_emb = get_rope(
@@ -273,6 +276,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -307,6 +311,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rope_parameters=config.rope_parameters,
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
+            disable_tp=disable_tp,
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -314,6 +319,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
+            disable_tp=disable_tp,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -376,6 +382,9 @@ class DFlashQwen3Model(nn.Module):
             self.use_aux_hidden_state = True
 
         current_vllm_config = get_current_vllm_config()
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        self.replicate_backbone = speculative_config.replicate_draft_backbone
 
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -404,6 +413,7 @@ class DFlashQwen3Model(nn.Module):
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
+                    disable_tp=self.replicate_backbone,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -659,8 +669,10 @@ class DFlashQwen3Model(nn.Module):
     def _preprocess(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = (
+            1 if self.replicate_backbone else get_tensor_model_parallel_world_size()
+        )
+        tp_rank = 0 if self.replicate_backbone else get_tensor_model_parallel_rank()
         for name, loaded_weight in weights:
             if "attention_sink_bias" in name:
                 # Sink bias is per-head; shard it across TP ranks like the

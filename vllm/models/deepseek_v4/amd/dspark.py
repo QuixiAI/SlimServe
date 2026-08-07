@@ -19,7 +19,7 @@ sliding-window context-KV insert, and the checkpoint ``mtp.*`` weight remap — 
 pure torch / Triton and shared with the nvidia implementation unchanged.
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import regex as re
 import torch
@@ -93,11 +93,17 @@ class DSparkDeepseekV4Model(nn.Module):
         self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         current_vllm_config = get_current_vllm_config()
+        attention_factory: Callable[[VllmConfig, str], nn.Module] | None = None
+        if current_vllm_config.cache_config.cache_dtype.startswith("turboquant_"):
+            from .dspark_turboquant import DeepseekV4TurboQuantDraftAttention
+
+            attention_factory = DeepseekV4TurboQuantDraftAttention
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
+                    attention_factory=attention_factory,
                 )
                 for i in range(self.num_dspark_layers)
             ]
@@ -178,7 +184,10 @@ class DSparkDeepseekV4Model(nn.Module):
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
-            _insert_context_kv(attn, kv, context_positions, slot_mapping)
+            if hasattr(attn, "insert_context_kv"):
+                attn.insert_context_kv(kv, context_positions, slot_mapping)
+            else:
+                _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(
         self,
@@ -325,7 +334,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
         # layer, named by its prefix.
-        return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
+        return [
+            layer.attn.cache_layer_name
+            if hasattr(layer.attn, "cache_layer_name")
+            else layer.attn.swa_cache_layer.prefix
+            for layer in self.model.layers
+        ]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        return [False] * len(self.model.layers)
 
     def precompute_and_store_context_kv(
         self,

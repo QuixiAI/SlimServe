@@ -297,6 +297,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        attention_factory: Callable[[VllmConfig, str], nn.Module] | None = None,
     ):
         super().__init__()
 
@@ -308,12 +309,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = DeepseekV4PlatformAttention(
-            vllm_config,
-            prefix=f"{prefix}.attn",
-            topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
-        )
+        attention_prefix = f"{prefix}.attn"
+        if attention_factory is None:
+            self.attn = DeepseekV4PlatformAttention(
+                vllm_config,
+                prefix=attention_prefix,
+                topk_indices_buffer=topk_indices_buffer,
+                aux_stream_list=aux_stream_list,
+            )
+        else:
+            self.attn = attention_factory(vllm_config, attention_prefix)
         self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)

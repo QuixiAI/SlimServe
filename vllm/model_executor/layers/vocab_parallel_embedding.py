@@ -241,12 +241,13 @@ class VocabParallelEmbedding(PluggableLayer):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = 0 if disable_tp else get_tensor_model_parallel_rank()
+        self.tp_size = 1 if disable_tp else get_tensor_model_parallel_world_size()
         self.num_embeddings = num_embeddings
         self.padding_size = math.lcm(padding_size, self.tp_size)
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -494,9 +495,11 @@ class VocabParallelEmbedding(PluggableLayer):
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-        # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        return output
+        # A disabled-TP layer is fully replicated on every rank, so reducing it
+        # would multiply identical embeddings by the global TP world size.
+        if self.tp_size == 1:
+            return output_parallel
+        return tensor_model_parallel_all_reduce(output_parallel)
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"
@@ -537,6 +540,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ):
         super().__init__(
             num_embeddings,
@@ -546,6 +550,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size,
             quant_config,
             prefix,
+            disable_tp,
         )
         self.quant_config = quant_config
         if bias:
