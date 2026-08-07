@@ -8,9 +8,8 @@ had to exist somewhere -- either in the GGUF's directory or via
 GGUF metadata alone, validated field-for-field against the reference
 checkpoint.
 
-Dispatch is on `general.architecture`, because the two supported models share
-nothing at the metadata level: GLM-5.2-Vision is `glm-dsa` plus an mmproj with
-`clip.vision.*`, DeepSeek-V4-Flash is `deepseek4` with no vision at all.
+Dispatch is on `general.architecture`, because the supported artifacts share
+nothing at the metadata level.
 """
 
 from pathlib import Path
@@ -38,12 +37,20 @@ class GGUFConfigParser(ConfigParserBase):
             )
 
             config = build_deepseek4_config_from_gguf(str(model))
+        elif architecture == "dflash-draft":
+            from vllm.transformers_utils.gguf_kimi_k3_dspark import (
+                build_kimi_k3_dspark_config_from_gguf,
+            )
+
+            config = build_kimi_k3_dspark_config_from_gguf(str(model))
         elif architecture == "kimi-k3":
             from vllm.transformers_utils.gguf_kimi_k3 import (
                 build_kimi_k3_config_from_gguf,
             )
 
             config = build_kimi_k3_config_from_gguf(str(model))
-        else:
+        elif architecture == "glm-dsa":
             config = build_config_from_gguf(str(model))
+        else:
+            raise ValueError(f"Unsupported GGUF architecture: {architecture}")
         return config.to_dict(), config

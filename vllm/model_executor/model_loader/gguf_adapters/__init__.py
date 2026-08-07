@@ -13,6 +13,7 @@ from .deepseek4 import Deepseek4GGUFAdapter
 from .default import GGUFWeightsAdapter
 from .glm_dsa import GlmDsaGGUFAdapter
 from .kimi_k3 import KimiK3GGUFAdapter
+from .kimi_k3_dspark import KimiK3DSparkGGUFAdapter
 
 __all__ = [
     "BaseGGUFWeightsAdapter",
@@ -20,4 +21,5 @@ __all__ = [
     "GGUFWeightsAdapter",
     "GlmDsaGGUFAdapter",
     "KimiK3GGUFAdapter",
+    "KimiK3DSparkGGUFAdapter",
 ]

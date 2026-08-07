@@ -219,8 +219,32 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
     base = plan.source["base_url"]
     wanted: list[dict[str, Any]] = []
     for entry in plan.quant.files:
-        wanted.append({**entry, "url": f"{base}/{entry['path']}"})
+        wanted.append(
+            {
+                **entry,
+                "url": f"{base}/{entry['path']}",
+                "local_dir": plan.source["local_dir"],
+                "role": "model",
+            }
+        )
     for entry in plan.source.get("shared") or []:
         entry_base = entry.get("base_url", base)
-        wanted.append({**entry, "url": f"{entry_base}/{entry['path']}"})
+        wanted.append(
+            {
+                **entry,
+                "url": f"{entry_base}/{entry['path']}",
+                "local_dir": plan.source["local_dir"],
+                "role": "shared",
+            }
+        )
+    spec = plan.source.get("speculator") if plan.speculative else None
+    if spec and (entry := spec.get("file")):
+        wanted.append(
+            {
+                **entry,
+                "url": f"{spec['base_url']}/{entry['path']}",
+                "local_dir": spec["local_dir"],
+                "role": "speculator",
+            }
+        )
     return wanted

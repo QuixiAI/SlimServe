@@ -19,13 +19,6 @@ from slimserve.registry import Plan
 # server-side concepts and get dropped when building an in-process engine.
 _SERVE_ONLY = frozenset({"served_model_name"})
 
-_DSPARK = {
-    "method": "dspark",
-    "num_speculative_tokens": 3,
-    "attention_backend": "TURBOQUANT",
-    "kv_cache_dtype": "turboquant_k8v4",
-}
-
 
 def apply_env(plan: Plan) -> None:
     """Export the profile's environment. Anything already set by the user wins."""
@@ -42,8 +35,11 @@ def _speculative_config(plan: Plan) -> dict[str, Any] | None:
     from slimserve.registry import cache_root
 
     local = cache_root() / spec["local_dir"]
-    draft = str(local) if local.is_dir() else spec["repo"]
-    return {"model": draft, **_DSPARK}
+    if file := spec.get("file"):
+        draft = str(local / file["path"])
+    else:
+        draft = str(local) if local.is_dir() else spec["repo"]
+    return {"model": draft, **spec["engine"]}
 
 
 def engine_kwargs(plan: Plan) -> dict[str, Any]:

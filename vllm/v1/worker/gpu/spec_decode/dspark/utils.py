@@ -16,13 +16,13 @@ def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
     """Load config for the draft, which may not share the target's format.
 
     DSpark heads usually ship inside the target checkpoint, so reusing the
-    target's `LoadConfig` is normally right. A standalone speculators-format
-    head (e.g. RedHatAI/GLM-5.2-speculator.dspark-preview) against a GGUF
-    target is the exception: the GGUF loader is handed a directory of
-    safetensors and fails on the path parse. Fall back to auto-detection for a
-    draft that lives somewhere else.
+    target's `LoadConfig` is normally right. A standalone draft against a GGUF
+    target is the exception: retain GGUF for a draft file, or use automatic
+    detection for a directory of safetensors.
     """
-    if (explicit := vllm_config.speculative_config.draft_load_config) is not None:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    if (explicit := speculative_config.draft_load_config) is not None:
         return explicit
     load_config = vllm_config.load_config
     target_model_config = vllm_config.model_config
@@ -31,7 +31,9 @@ def _draft_load_config(vllm_config: VllmConfig, draft_model_config):
         and draft_model_config is not None
         and draft_model_config.model != target_model_config.model
     ):
-        return replace(load_config, load_format="auto")
+        is_gguf = str(draft_model_config.model).lower().endswith(".gguf")
+        draft_format = "gguf" if is_gguf else "auto"
+        return replace(load_config, load_format=draft_format)
     return load_config
 
 

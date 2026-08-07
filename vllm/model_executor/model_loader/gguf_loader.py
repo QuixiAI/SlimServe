@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GGUF loader for GLM-5.2-Vision.
+"""GGUF loader for SlimServe's supported model artifacts.
 
-This repo serves exactly one model on exactly one GPU configuration, so this
-loader is deliberately not general. It takes a local path to the first shard
-and hands the weights to the glm-dsa adapter. There is no remote download, no
-`<repo_id>:<quant_type>` resolution, and no adapter registry -- every one of
-those paths was dead code that only ever produced misleading errors on the way
-to loading this model.
+This loader is deliberately not general. It takes a local GGUF path and
+dispatches only to the adapters required by the registered GLM-5.2-Vision,
+Kimi K3, Kimi DSpark, and DeepSeek-V4-Flash artifacts.
 """
 
 import os
@@ -55,8 +52,7 @@ class GGUFModelLoader(BaseModelLoader):
         if not os.path.isfile(path):
             raise ValueError(
                 f"Expected a local .gguf file, got {path!r}. This loader is "
-                "specialised for the local GLM-5.2-Vision shards; pass the "
-                "path to shard 00001-of-00006."
+                "restricted to SlimServe's registered local artifacts."
             )
         return path
 
@@ -66,6 +62,7 @@ class GGUFModelLoader(BaseModelLoader):
         from vllm.model_executor.model_loader.gguf_adapters import (
             Deepseek4GGUFAdapter,
             GlmDsaGGUFAdapter,
+            KimiK3DSparkGGUFAdapter,
             KimiK3GGUFAdapter,
         )
         from vllm.transformers_utils.gguf_utils import gguf_architecture
@@ -78,10 +75,14 @@ class GGUFModelLoader(BaseModelLoader):
         adapter_cls: type
         if architecture == "deepseek4":
             adapter_cls = Deepseek4GGUFAdapter
+        elif architecture == "dflash-draft":
+            adapter_cls = KimiK3DSparkGGUFAdapter
         elif architecture == "kimi-k3":
             adapter_cls = KimiK3GGUFAdapter
-        else:
+        elif architecture == "glm-dsa":
             adapter_cls = GlmDsaGGUFAdapter
+        else:
+            raise ValueError(f"Unsupported GGUF architecture: {architecture}")
         adapter = adapter_cls(model_config.hf_config)
         adapter.prepare_loading(self._gguf_path(model_config), model_config)
         if architecture == "kimi-k3":
@@ -163,7 +164,6 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
         device_config = vllm_config.device_config
         adapter = self._prepare_adapter(model_config)
-        vllm_config.model_config.hf_config = model_config.hf_config
         logger.debug(
             "GGUF unquantized modules: %s", adapter.load_spec.unquantized_modules
         )
@@ -176,7 +176,11 @@ class GGUFModelLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             start = time.perf_counter()
             with target_device:
-                model = initialize_model(vllm_config=vllm_config, prefix=prefix)
+                model = initialize_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
             bootstamp(f"gguf load: initialize_model {time.perf_counter() - start:.2f}s")
             from vllm.distributed.parallel_state import get_tp_group
 
