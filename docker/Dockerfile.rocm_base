@@ -9,7 +9,7 @@ ARG PYTORCH_AUDIO_BRANCH="v2.9.0"
 ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="v0.1.16.post5"
+ARG AITER_COMMIT="17f24ec6e93f48722a6b4ec8e54738434194f3d6"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
@@ -230,15 +230,22 @@ RUN mkdir -p /app/install && cp /app/flash-attention/dist/*.whl /app/install
 ### AITER Build
 ###
 FROM base AS build_aiter
-ARG AITER_BRANCH
+ARG AITER_COMMIT
 ARG AITER_REPO
 ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
+RUN git clone ${AITER_REPO}
 RUN cd aiter \
+    && git checkout --detach ${AITER_COMMIT} \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
+COPY docker/patches/aiter/custom-all-reduce-graph-buffer-order.patch /app/aiter-patches/
+RUN cd aiter \
+    && git apply --unidiff-zero --check \
+        /app/aiter-patches/custom-all-reduce-graph-buffer-order.patch \
+    && git apply --unidiff-zero \
+        /app/aiter-patches/custom-all-reduce-graph-buffer-order.patch
 RUN pip install pyyaml && cd aiter \
     && if [ "$USE_SCCACHE" = "1" ]; then \
            export HIP_CLANG_PATH=/opt/sccache-wrappers \
@@ -300,7 +307,7 @@ ARG PYTORCH_AUDIO_BRANCH
 ARG PYTORCH_AUDIO_REPO
 ARG FA_BRANCH
 ARG FA_REPO
-ARG AITER_BRANCH
+ARG AITER_COMMIT
 ARG AITER_REPO
 ARG MORI_BRANCH
 ARG MORI_REPO
@@ -315,7 +322,7 @@ RUN echo "BASE_IMAGE: ${BASE_IMAGE}" > /app/versions.txt \
     && echo "PYTORCH_AUDIO_REPO: ${PYTORCH_AUDIO_REPO}" >> /app/versions.txt \
     && echo "FA_BRANCH: ${FA_BRANCH}" >> /app/versions.txt \
     && echo "FA_REPO: ${FA_REPO}" >> /app/versions.txt \
-    && echo "AITER_BRANCH: ${AITER_BRANCH}" >> /app/versions.txt \
+    && echo "AITER_COMMIT: ${AITER_COMMIT}" >> /app/versions.txt \
     && echo "AITER_REPO: ${AITER_REPO}" >> /app/versions.txt \
     && echo "MORI_BRANCH: ${MORI_BRANCH}" >> /app/versions.txt \
     && echo "MORI_REPO: ${MORI_REPO}" >> /app/versions.txt

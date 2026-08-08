@@ -801,6 +801,13 @@ uv pip install -e . --torch-backend=auto     # C++/HIP changes
 VLLM_USE_PRECOMPILED=1 uv pip install -e .   # Python-only changes
 ```
 
+The ROCm base image pins the exact tested AITER revision and applies
+SlimServe's dependency patches before building its wheel. For a source-tree
+AITER installation, apply the same patch set as described in
+[`docker/patches/aiter/README.md`](docker/patches/aiter/README.md); an
+unpatched AITER build can corrupt graph-buffer registration when a captured
+graph contains consecutive custom all-reduces.
+
 ## Acknowledgements
 
 We stood on the shoulders of giants.
