@@ -131,9 +131,20 @@ def ggml_moe_a8_vec(
     expert_parallel: bool = False,
 ) -> torch.Tensor:
     if _is_metal():
-        raise NotImplementedError(
-            "quixicore(metal): no grouped GEMV over GGUF-quantized experts; "
-            "the MoE layer takes the per-expert loop instead."
+        if expert_parallel:
+            raise NotImplementedError(
+                "Metal exposes one device and does not support expert parallelism."
+            )
+        from vllm.quixicore import quixicore_ops
+
+        return quixicore_ops.ggml_moe_a8_vec(
+            X,
+            W,
+            topk_ids,
+            top_k,
+            quant_type,
+            row,
+            tokens,
         )
     _load_stable_libtorch()
     return torch.ops._C.ggml_moe_a8_vec(

@@ -153,6 +153,10 @@ class BlockTables:
 
     def _make_ptr_tensor(self, x: Iterable[torch.Tensor]) -> torch.Tensor:
         # NOTE(woosuk): Use uint64 instead of int64 to cover all possible addresses.
+        if self.device.type == "mps":
+            # Metal paths address the tensors directly and never dereference
+            # device-side pointer tables. Keep a shape-compatible placeholder.
+            return torch.zeros(len(list(x)), dtype=torch.int64, device=self.device)
         return torch.tensor(
             [t.data_ptr() for t in x], dtype=torch.uint64, device=self.device
         )
@@ -218,7 +222,12 @@ class BlockTables:
             assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
-        if _use_native("gather_block_tables"):
+        if self.device.type == "mps":
+            mapped = idx_mapping.to(torch.int64)
+            for src, dst in zip(self.block_tables, out):
+                dst.zero_()
+                dst[:num_reqs].copy_(src.gpu.index_select(0, mapped))
+        elif _use_native("gather_block_tables"):
             from vllm.quixicore import quixicore_ops
 
             quixicore_ops.gather_block_tables(
@@ -262,6 +271,44 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        if self.device.type == "mps":
+            slot_mappings.fill_(PAD_SLOT_ID)
+            actual_num_tokens = int(query_start_loc[num_reqs].cpu())
+            if actual_num_tokens:
+                query_lens = (
+                    query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+                )
+                batch_indices = torch.repeat_interleave(
+                    torch.arange(num_reqs, device=self.device),
+                    query_lens.to(torch.int64),
+                )
+                req_indices = idx_mapping.to(torch.int64)[batch_indices]
+                token_positions = positions[:actual_num_tokens]
+                for group_id, (block_table, block_size) in enumerate(
+                    zip(self.block_tables, self.kernel_block_sizes)
+                ):
+                    block_span = block_size * self.cp_size
+                    block_indices = token_positions // block_span
+                    block_offsets = token_positions % block_span
+                    block_numbers = block_table.gpu[
+                        req_indices, block_indices.to(torch.int64)
+                    ].to(torch.int64)
+                    if self.cp_size == 1:
+                        slots = block_numbers * block_size + block_offsets
+                    else:
+                        is_local = (
+                            block_offsets // self.cp_interleave % self.cp_size
+                            == self.cp_rank
+                        )
+                        rounds = block_offsets // (self.cp_interleave * self.cp_size)
+                        remainders = block_offsets % self.cp_interleave
+                        local_offsets = rounds * self.cp_interleave + remainders
+                        slots = block_numbers * block_size + local_offsets
+                        slots = torch.where(is_local, slots, PAD_SLOT_ID)
+                    slot_mappings[group_id, :actual_num_tokens].copy_(slots)
+            if _integrity_checks_enabled():
+                _check_slot_mappings(slot_mappings, num_tokens_padded)
+            return slot_mappings[:, :num_tokens_padded]
         if _use_native("compute_slot_mappings"):
             from vllm.quixicore import quixicore_ops
 

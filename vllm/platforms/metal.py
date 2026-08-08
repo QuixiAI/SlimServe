@@ -101,6 +101,10 @@ class MetalPlatform(Platform):
         return DeviceCapability(major=8, minor=0)
 
     @classmethod
+    def num_compute_units(cls, device_id: int = 0) -> int:
+        return _gpu_core_count()
+
+    @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """What Metal will actually let the GPU hold, not what the box has.
 
@@ -159,7 +163,11 @@ class MetalPlatform(Platform):
 
     @classmethod
     def support_hybrid_kv_cache(cls) -> bool:
-        return False
+        # DeepSeek-V4 and its DSpark drafter use distinct full, sliding-window,
+        # compressed-MLA, and TurboQuant page groups. The Metal kernels consume
+        # the runtime tensor strides, so those groups do not need to be promoted
+        # to one padded full-attention allocation.
+        return True
 
     @classmethod
     def check_if_supports_dtype(cls, dtype: torch.dtype) -> None:
@@ -188,6 +196,10 @@ class MetalPlatform(Platform):
         attn_selector_config: "AttentionSelectorConfig",
         num_heads: int | None = None,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.TURBOQUANT:
+            return (
+                "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
+            )
         if getattr(attn_selector_config, "use_mla", False):
             # Resolves so the failure names the missing kernels rather than
             # surfacing as an ImportError; see that module for what is left.

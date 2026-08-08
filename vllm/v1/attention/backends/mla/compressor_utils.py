@@ -72,6 +72,29 @@ def get_compressed_slot_mapping(
         )
 
     num_reqs = block_table.shape[0]
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        query_lens = torch.diff(query_start_loc[: num_reqs + 1]).to(torch.long)
+        req_ids = torch.repeat_interleave(
+            torch.arange(num_reqs, device=query_start_loc.device), query_lens
+        )[:num_tokens]
+        token_ids = torch.arange(num_tokens, device=query_start_loc.device)
+        local = token_ids - query_start_loc.index_select(0, req_ids).to(torch.long)
+        start = seq_lens.index_select(0, req_ids).to(
+            torch.long
+        ) - query_lens.index_select(0, req_ids)
+        positions = start + local
+        valid = torch.remainder(positions + 1, compress_ratio) == 0
+        compressed_pos = torch.div(positions, compress_ratio, rounding_mode="floor")
+        block_col = torch.div(compressed_pos, block_size, rounding_mode="floor").clamp(
+            min=0, max=block_table.shape[1] - 1
+        )
+        blocks = block_table[req_ids, block_col]
+        slots = blocks * block_size + torch.remainder(compressed_pos, block_size)
+        slot_mapping.copy_(torch.where(valid, slots, -1).to(torch.int64))
+        return slot_mapping
+
     _compressed_slot_mapping_kernel[(num_reqs,)](
         slot_mapping,
         query_start_loc,

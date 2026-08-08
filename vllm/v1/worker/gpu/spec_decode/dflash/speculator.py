@@ -688,6 +688,82 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
+    if input_buffers.input_ids.device.type == "mps":
+        query_locs = input_batch.query_start_loc_np[: num_reqs + 1].tolist()
+        req_indices = input_batch.idx_mapping_np.tolist()
+        sampled_counts = num_sampled.cpu().tolist()
+        rejected_counts = num_rejected.cpu().tolist()
+        query_slot_mapping.fill_(PAD_SLOT_ID)
+        context_slot_mapping.fill_(PAD_SLOT_ID)
+
+        for req_idx, req_state_idx in enumerate(req_indices):
+            ctx_start = query_locs[req_idx]
+            ctx_end = query_locs[req_idx + 1]
+            valid_ctx_end = ctx_end - rejected_counts[req_idx]
+            bonus_token = (
+                last_sampled[req_state_idx]
+                if sampled_counts[req_idx] > 0
+                else next_prefill_tokens[req_state_idx]
+            )
+            last_valid_pos = input_batch.positions[valid_ctx_end - 1]
+            query_base = req_idx * num_query_per_req
+
+            ctx_pos = input_batch.positions[ctx_start:ctx_end]
+            context_positions[ctx_start:ctx_end].copy_(ctx_pos)
+            ctx_block_indices = (ctx_pos // block_size).to(torch.int64)
+            ctx_block_ids = block_table[req_idx, ctx_block_indices].to(torch.int64)
+            context_slot_mapping[ctx_start:ctx_end] = (
+                ctx_block_ids * block_size + ctx_pos % block_size
+            )
+
+            query_offsets = torch.arange(
+                num_query_per_req,
+                dtype=input_buffers.positions.dtype,
+                device=input_buffers.positions.device,
+            )
+            query_pos = last_valid_pos + 1 + query_offsets
+            query_end = query_base + num_query_per_req
+            input_buffers.input_ids[query_base] = bonus_token
+            if num_query_per_req > 1:
+                input_buffers.input_ids[query_base + 1 : query_end].fill_(
+                    parallel_drafting_token_id
+                )
+            input_buffers.positions[query_base:query_end].copy_(
+                query_pos.clamp_max(max_model_len - 1)
+            )
+            query_block_indices = (query_pos // block_size).to(torch.int64)
+            query_block_ids = block_table[req_idx, query_block_indices].to(torch.int64)
+            query_slot_mapping[query_base:query_end] = (
+                query_block_ids * block_size + query_pos % block_size
+            )
+            input_buffers.query_start_loc[req_idx] = query_base
+            input_buffers.seq_lens[req_idx] = last_valid_pos + 1 + num_query_per_req
+
+            sample_offset = 0 if sample_from_anchor else 1
+            sample_count = num_query_per_req - sample_offset
+            sample_start = req_idx * num_speculative_steps
+            sample_end = sample_start + sample_count
+            sample_indices[sample_start:sample_end] = torch.arange(
+                query_base + sample_offset,
+                query_end,
+                dtype=sample_indices.dtype,
+                device=sample_indices.device,
+            )
+            sampled_pos = query_pos[sample_offset:]
+            if sample_from_anchor:
+                sampled_pos = sampled_pos + 1
+            sample_pos[sample_start:sample_end].copy_(sampled_pos)
+            sample_idx_mapping[sample_start:sample_end].fill_(req_state_idx)
+
+        last_query_end = num_reqs * num_query_per_req
+        input_buffers.query_start_loc[num_reqs:].fill_(last_query_end)
+        input_buffers.seq_lens[num_reqs:].zero_()
+        pad_sample_start = num_reqs * num_speculative_steps
+        sample_indices[pad_sample_start:].zero_()
+        sample_pos[pad_sample_start:].zero_()
+        sample_idx_mapping[pad_sample_start:].fill_(-1)
+        query_slot_mapping[last_query_end:].fill_(PAD_SLOT_ID)
+        return
     if _use_native_dflash_inputs():
         from vllm.quixicore import quixicore_ops
 

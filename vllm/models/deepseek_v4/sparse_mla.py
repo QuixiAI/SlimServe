@@ -318,6 +318,47 @@ def build_c128a_topk_metadata(
     if num_tokens == 0:
         return global_decode, decode_lens, prefill_local
 
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        offsets = torch.arange(
+            max_compressed_tokens, device=positions.device, dtype=torch.long
+        )
+        counts = torch.div(
+            positions[:num_tokens] + 1,
+            compress_ratio,
+            rounding_mode="floor",
+        ).clamp(max=max_compressed_tokens)
+        if num_decode_tokens > 0:
+            decode_counts = counts[:num_decode_tokens]
+            req = token_to_req_indices[:num_decode_tokens].to(torch.long)
+            tables = block_table.index_select(0, req)
+            block_col = torch.div(offsets, block_size, rounding_mode="floor").clamp(
+                max=tables.shape[1] - 1
+            )
+            blocks = tables.gather(
+                1, block_col.unsqueeze(0).expand(num_decode_tokens, -1)
+            )
+            slots = blocks * block_size + torch.remainder(offsets, block_size)
+            valid = offsets.unsqueeze(0) < decode_counts.unsqueeze(1)
+            token_valid = slot_mapping[:num_decode_tokens] >= 0
+            global_decode.copy_(
+                torch.where(valid & token_valid.unsqueeze(1), slots, -1).to(torch.int32)
+            )
+            decode_lens.copy_(
+                torch.where(token_valid, decode_counts, 0).to(torch.int32)
+            )
+        if num_prefill_tokens > 0:
+            prefill_counts = counts[num_decode_tokens:]
+            prefill_local.copy_(
+                torch.where(
+                    offsets.unsqueeze(0) < prefill_counts.unsqueeze(1),
+                    offsets.unsqueeze(0),
+                    -1,
+                ).to(torch.int32)
+            )
+        return global_decode, decode_lens, prefill_local
+
     _build_c128a_topk_metadata_kernel[(num_tokens,)](
         global_decode_buffer,
         global_decode_buffer.stride(0),

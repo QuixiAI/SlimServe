@@ -702,7 +702,7 @@ class Worker(WorkerBase):
         bootstamp(f"worker[{self.rank}]: KV cache allocated")
         _t = time.perf_counter()
         torch.tensor([0], dtype=torch.int32).to(self.device)
-        torch.cuda.synchronize()
+        self.model_runner._sync_device()
         bootstamp(
             f"worker[{self.rank}]: first pageable H2D after KV alloc took "
             f"{time.perf_counter() - _t:.2f}s"
@@ -722,7 +722,7 @@ class Worker(WorkerBase):
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         bootstamp(f"worker[{self.rank}]: compile_or_warm_up_model start")
-        torch.cuda.synchronize()
+        self.model_runner._sync_device()
         bootstamp(f"worker[{self.rank}]: device drained (pending work done)")
         warmup_sizes: list[int] = []
 

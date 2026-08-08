@@ -150,6 +150,9 @@ def _maybe_force_spawn():
     elif xpu_is_initialized():
         reasons.append("XPU is initialized")
 
+    if current_platform.is_metal():
+        reasons.append("Metal does not support fork after MPS initialization")
+
     if in_wsl():
         reasons.append("WSL is detected and NVML is not compatible with fork")
 

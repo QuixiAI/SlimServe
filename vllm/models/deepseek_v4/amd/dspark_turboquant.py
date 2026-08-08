@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
+from vllm.platforms import current_platform
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
 
@@ -162,13 +163,42 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
         q, key = self.rotary_emb(positions, q, kv)
         assert key is not None
         output = self.tq_attn(q, key, key).view(-1, self.n_local_heads, self.head_dim)
-        z = rocm_inv_rope_einsum(
-            self.rotary_emb,
-            output,
-            positions,
-            self.rope_head_dim,
-            self.n_local_groups,
-            self.o_lora_rank,
-            self.wo_a,
-        )
+        if current_platform.is_metal():
+            o_ref, _ = self.rotary_emb.forward_native(
+                positions, output, key=None, inverse=True
+            )  # type: ignore[call-arg]
+            grouped = o_ref.reshape(output.shape[0], self.n_local_groups, -1)
+            if hasattr(self.wo_a, "qweight"):
+                from vllm.model_executor.layers.quantization.gguf import (
+                    fused_mul_mat_gguf,
+                )
+
+                qweight = self.wo_a.qweight
+                qweight_type = self.wo_a.qweight_type.weight_type
+                projected = [
+                    fused_mul_mat_gguf(
+                        grouped[:, group],
+                        qweight[
+                            group * self.o_lora_rank : (group + 1) * self.o_lora_rank
+                        ].contiguous(),
+                        qweight_type,
+                    )
+                    for group in range(self.n_local_groups)
+                ]
+                z = torch.stack(projected, dim=1)
+            else:
+                weight = self.wo_a.weight.reshape(
+                    self.n_local_groups, self.o_lora_rank, grouped.shape[-1]
+                )
+                z = torch.einsum("tgd,grd->tgr", grouped, weight)
+        else:
+            z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                output,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
         return self.wo_b(z.flatten(1))

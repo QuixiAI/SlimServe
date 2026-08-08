@@ -259,6 +259,27 @@ def prepare_prefill_inputs(
     num_computed_tokens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if input_ids.device.type == "mps":
+        req_indices = idx_mapping.cpu().tolist()
+        query_locs = query_start_loc[: num_reqs + 1].cpu().tolist()
+        prefill_lens = prefill_len.cpu().tolist()
+        num_computed = num_computed_tokens.cpu().tolist()
+        for batch_idx, req_state_idx in enumerate(req_indices):
+            computed = num_computed[req_state_idx]
+            if computed >= prefill_lens[req_state_idx]:
+                continue
+            query_start = query_locs[batch_idx]
+            query_end = query_locs[batch_idx + 1]
+            query_len = query_end - query_start
+            input_ids[query_start:query_end].copy_(
+                all_token_ids[req_state_idx, computed : computed + query_len]
+            )
+            next_pos = computed + query_len
+            if next_pos < prefill_lens[req_state_idx]:
+                next_prefill_tokens[req_state_idx] = all_token_ids[
+                    req_state_idx, next_pos
+                ]
+        return
     if _use_native("prepare_prefill_inputs"):
         from vllm.quixicore import quixicore_ops
 
@@ -331,6 +352,20 @@ def prepare_pos_seq_lens(
     seq_lens: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if pos.device.type == "mps":
+        req_indices = idx_mapping.cpu().tolist()
+        query_locs = query_start_loc[: num_reqs + 1].cpu().tolist()
+        num_computed = num_computed_tokens.cpu().tolist()
+        seq_lens[num_reqs:].zero_()
+        for batch_idx, req_state_idx in enumerate(req_indices):
+            start = query_locs[batch_idx]
+            end = query_locs[batch_idx + 1]
+            computed = num_computed[req_state_idx]
+            seq_lens[batch_idx] = computed + end - start
+            pos[start:end] = torch.arange(
+                computed, computed + end - start, dtype=pos.dtype, device=pos.device
+            )
+        return
     if _use_native("prepare_pos_seq_lens"):
         from vllm.quixicore import quixicore_ops
 
@@ -441,6 +476,36 @@ def combine_sampled_and_draft_tokens(
         dtype=torch.int64,
         device=input_ids.device,
     )
+    if input_ids.device.type == "mps":
+        req_indices = idx_mapping.cpu().tolist()
+        query_locs = query_start_loc[: num_reqs + 1].cpu().tolist()
+        cu_logits = cu_num_logits.cpu().tolist()
+        seq_lens_cpu = seq_lens[:num_reqs].cpu().tolist()
+        prefill_lens = prefill_len.cpu().tolist()
+        for batch_idx, req_state_idx in enumerate(req_indices):
+            logits_start_idx = cu_logits[batch_idx]
+            logits_end_idx = cu_logits[batch_idx + 1]
+            req_num_logits = logits_end_idx - logits_start_idx
+            num_draft_tokens = req_num_logits - num_new_sampled_tokens
+            query_end = query_locs[batch_idx + 1]
+            input_start = query_end - req_num_logits
+            logits_indices[logits_start_idx:logits_end_idx] = torch.arange(
+                input_start,
+                input_start + req_num_logits,
+                dtype=logits_indices.dtype,
+                device=logits_indices.device,
+            )
+            first_logit_pos = seq_lens_cpu[batch_idx] - req_num_logits
+            if (
+                num_new_sampled_tokens
+                and first_logit_pos >= prefill_lens[req_state_idx]
+            ):
+                input_ids[input_start] = last_sampled_tokens[req_state_idx]
+            if num_draft_tokens:
+                input_ids[query_end - num_draft_tokens : query_end].copy_(
+                    draft_tokens[req_state_idx, :num_draft_tokens]
+                )
+        return logits_indices
     if _use_native("combine_sampled_and_draft_tokens"):
         from vllm.quixicore import quixicore_ops
 
@@ -515,6 +580,13 @@ def get_num_sampled_and_rejected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
+    if num_sampled.device.type == "mps":
+        mapped_prefill_len = prefill_len[idx_mapping.to(torch.int64)]
+        is_chunked_prefill = seq_lens[:num_reqs] < mapped_prefill_len
+        num_sampled.masked_fill_(is_chunked_prefill, 0)
+        num_logits = cu_num_logits[1 : num_reqs + 1] - cu_num_logits[:num_reqs]
+        num_rejected.copy_(torch.where(is_chunked_prefill, 0, num_logits - num_sampled))
+        return num_sampled, num_rejected
     if _use_native("get_num_sampled_and_rejected"):
         from vllm.quixicore import quixicore_ops
 
@@ -622,6 +694,42 @@ def post_update(
     total_len: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if idx_mapping.device.type == "mps":
+        req_indices = idx_mapping.cpu().tolist()
+        sampled_counts = num_sampled.cpu().tolist()
+        rejected_counts = num_rejected.cpu().tolist()
+        total_lens = total_len.cpu().tolist()
+        query_locs = (
+            query_start_loc.cpu().tolist() if query_start_loc is not None else None
+        )
+        for batch_idx, req_state_idx in enumerate(req_indices):
+            if req_state_idx < 0:
+                continue
+            count = sampled_counts[batch_idx]
+            old_total_len = total_lens[req_state_idx]
+            if count:
+                tokens = sampled_tokens[batch_idx, :count]
+                last_sampled_tokens[req_state_idx] = tokens[-1]
+                total_len[req_state_idx] = old_total_len + count
+                all_token_ids[
+                    req_state_idx, old_total_len : old_total_len + count
+                ].copy_(tokens.to(all_token_ids.dtype))
+                if output_bin_counts is not None:
+                    token_indices = tokens.to(torch.int64)
+                    output_bin_counts[req_state_idx].index_add_(
+                        0,
+                        token_indices,
+                        torch.ones_like(token_indices, dtype=output_bin_counts.dtype),
+                    )
+            query_len = (
+                0
+                if query_locs is None
+                else query_locs[batch_idx + 1] - query_locs[batch_idx]
+            )
+            computed_delta = query_len - rejected_counts[batch_idx]
+            if computed_delta:
+                num_computed_tokens[req_state_idx] += computed_delta
+        return
     if _use_native("post_update"):
         from vllm.quixicore import quixicore_ops
 
@@ -684,6 +792,12 @@ def post_update_num_computed_tokens(
     query_start_loc: torch.Tensor,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    if idx_mapping.device.type == "mps":
+        query_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
+        num_computed_tokens.index_add_(
+            0, idx_mapping.to(torch.int64), query_lens.to(num_computed_tokens.dtype)
+        )
+        return
     if _use_native("post_update_num_computed_tokens"):
         from vllm.quixicore import quixicore_ops
 
@@ -731,6 +845,18 @@ def expand_idx_mapping(
     expanded_local_pos = torch.empty(
         total_num_logits, dtype=torch.int32, device=idx_mapping.device
     )
+    if idx_mapping.device.type == "mps":
+        cu_logits = cu_num_logits.cpu().tolist()
+        for req_idx in range(num_reqs):
+            start = cu_logits[req_idx]
+            end = cu_logits[req_idx + 1]
+            expanded_idx_mapping[start:end] = idx_mapping[req_idx]
+            expanded_local_pos[start:end] = torch.arange(
+                end - start,
+                dtype=expanded_local_pos.dtype,
+                device=expanded_local_pos.device,
+            )
+        return expanded_idx_mapping, expanded_local_pos
     if _use_native("expand_idx_mapping"):
         from vllm.quixicore import quixicore_ops
 

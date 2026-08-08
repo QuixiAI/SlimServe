@@ -70,7 +70,7 @@ def test_turboquant_draft_page_can_pad_to_hybrid_target() -> None:
         head_size=64,
         head_size_v=64,
         dtype=torch.bfloat16,
-        tq_slot_size=100,
+        tq_slot_size=108,
         tq_cache_dtype="turboquant_k8v4",
         indexes_kv_by_block_stride=True,
     )
@@ -100,7 +100,7 @@ def test_deepseek_mla_tuple_planner_keeps_mixed_turboquant_cache() -> None:
             head_size=64,
             head_size_v=64,
             dtype=torch.bfloat16,
-            tq_slot_size=100,
+            tq_slot_size=108,
             tq_cache_dtype="turboquant_k8v4",
             indexes_kv_by_block_stride=True,
         ),
@@ -126,7 +126,7 @@ def test_padded_turboquant_view_fits_its_backing_storage() -> None:
         head_size=64,
         head_size_v=64,
         dtype=torch.uint8,
-        tq_slot_size=100,
+        tq_slot_size=108,
         tq_cache_dtype="turboquant_k8v4",
         page_size_padded=page_size,
         indexes_kv_by_block_stride=True,
@@ -149,7 +149,7 @@ def test_padded_turboquant_view_fits_its_backing_storage() -> None:
         packing=None,
     )
 
-    assert cache.shape == (num_blocks, spec.block_size, 16, 100)
+    assert cache.shape == (num_blocks, spec.block_size, 16, 108)
     assert cache.stride(0) == page_size
 
 

@@ -4,6 +4,37 @@
 using namespace metal;
 using namespace mittens;
 
+kernel void dsv4_save_partial_states(
+        device const bf16 *kv [[buffer(0)]],
+        device const bf16 *score [[buffer(1)]],
+        device const bf16 *ape [[buffer(2)]],
+        device const int *positions [[buffer(3)]],
+        device float *state_cache [[buffer(4)]],
+        device const long *slot_mapping [[buffer(5)]],
+        constant int &num_tokens [[buffer(6)]],
+        constant int &head_size [[buffer(7)]],
+        constant int &block_size [[buffer(8)]],
+        constant int &block_stride [[buffer(9)]],
+        constant int &token_stride [[buffer(10)]],
+        constant int &state_width [[buffer(11)]],
+        constant int &compress_ratio [[buffer(12)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    if (int(token) >= num_tokens) { return; }
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long block = slot / block_size;
+    const long offset = slot - block * block_size;
+    const long cache_base = block * block_stride + offset * token_stride;
+    const long input_base = long(token) * head_size;
+    const long ape_base = long(positions[token] % compress_ratio) * head_size;
+    for (int dim = int(tid); dim < head_size; dim += 256) {
+        state_cache[cache_base + dim] = kv[input_base + dim];
+        state_cache[cache_base + state_width + dim] =
+            score[input_base + dim] + ape[ape_base + dim];
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DeepSeek Multi-head Latent Attention (MLA) — preprocessing kernels.
 //
@@ -244,6 +275,69 @@ kernel void mla_kv_insert_fp8(device const bf16 *kv          [[buffer(0)]],   //
         }
     }
     if (laneId == 0) { scale_cache[dst_scale + 7] = 0; }   // pad byte
+}
+
+// vLLM allocates the DeepSeek-V4 cache as one 584-byte token slot rather than
+// the split 576-byte data and 8-byte scale arrays used by the standalone
+// QuixiCore API. Keep the shader math identical and only change the address
+// calculation so the serving path can update its cache in place.
+kernel void mla_kv_insert_fp8_packed(
+        device const bf16 *kv           [[buffer(0)]],
+        device const bf16 *cosb         [[buffer(1)]],
+        device const bf16 *sinb         [[buffer(2)]],
+        device const int  *positions    [[buffer(3)]],
+        device const long *slot_mapping [[buffer(4)]],
+        device uchar      *kv_cache     [[buffer(5)]],
+        constant int &block_size        [[buffer(6)]],
+        constant int &cache_block_stride [[buffer(7)]],
+        uint3 blockIdx [[threadgroup_position_in_grid]],
+        uint laneId [[thread_index_in_simdgroup]]) {
+    constexpr int LAT = 512, NOPE = 448, PER_LANE = 16;
+    constexpr int NOPE_LANES = NOPE / PER_LANE;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    constexpr float FP8_MAX = 448.0f;
+    const int token = blockIdx.x;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long base = (slot / block_size) * (long)cache_block_stride +
+                      (slot % block_size) * SLOT_BYTES;
+    const int pos = positions[token];
+    const long kbase = (long)token * LAT + (long)laneId * PER_LANE;
+
+    float v[PER_LANE];
+    for (int k = 0; k < PER_LANE; ++k) { v[k] = float(kv[kbase + k]); }
+
+    float amax = 0.0f;
+    for (int k = 0; k < PER_LANE; ++k) {
+        amax = metal::max(amax, metal::fabs(v[k]));
+    }
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
+    const float exponent = metal::ceil(
+        metal::log2(metal::max(amax, 1e-4f) / FP8_MAX));
+    const float inv_scale = metal::exp2(-exponent);
+
+    if ((int)laneId < NOPE_LANES) {
+        for (int k = 0; k < PER_LANE; ++k) {
+            kv_cache[base + laneId * PER_LANE + k] =
+                tk_e4m3_encode(v[k] * inv_scale);
+        }
+        if ((laneId & 3) == 0) {
+            const int e = metal::clamp((int)exponent + 127, 0, 255);
+            kv_cache[base + DATA_BYTES + laneId / 4] = (uchar)e;
+        }
+    } else {
+        const int rl = ((int)laneId - NOPE_LANES) * PER_LANE;
+        device bf16 *rope_out = (device bf16 *)(kv_cache + base + NOPE);
+        for (int j = 0; j < PER_LANE; j += 2) {
+            const int p = (rl + j) / 2;
+            const float c = float(cosb[(long)pos * 32 + p]);
+            const float s = float(sinb[(long)pos * 32 + p]);
+            rope_out[rl + j] = bf16(v[j] * c - v[j + 1] * s);
+            rope_out[rl + j + 1] = bf16(v[j] * s + v[j + 1] * c);
+        }
+    }
+    if (laneId == 0) { kv_cache[base + DATA_BYTES + 7] = 0; }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +649,120 @@ kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
     const long out_base = ((long)batch * num_heads + head) * LATENT;
     for (int i = 0; i < VPL; ++i) {
         out[out_base + lane + 32 * i] = l == 0.0f ? bf16(0) : bf16(acc[i] / l);
+    }
+}
+
+// DeepSeek-V4 combines a compressed long-range cache with the uncompressed
+// sliding-window cache. The vLLM metadata builder supplies physical slot ids
+// for both lists, so this kernel can consume both cache allocations without a
+// gather/copy workspace and merge them in one exact online softmax.
+kernel void mla_decode_fp8_sparse_two_cache_packed(
+        device const bf16 *q             [[buffer(0)]],
+        device const uchar *compressed   [[buffer(1)]],
+        device const int *compressed_idx [[buffer(2)]],
+        device const int *compressed_len [[buffer(3)]],
+        device const uchar *swa          [[buffer(4)]],
+        device const int *swa_idx        [[buffer(5)]],
+        device const int *swa_len        [[buffer(6)]],
+        device const float *sinks        [[buffer(7)]],
+        device bf16 *out                 [[buffer(8)]],
+        constant int &num_heads          [[buffer(9)]],
+        constant int &compressed_width   [[buffer(10)]],
+        constant int &swa_width          [[buffer(11)]],
+        constant float &scale            [[buffer(12)]],
+        constant int &compressed_block_size [[buffer(13)]],
+        constant int &compressed_block_stride [[buffer(14)]],
+        constant int &swa_block_size [[buffer(15)]],
+        constant int &swa_block_stride [[buffer(16)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) {
+        qv[i] = float(q[q_base + lane + 32 * i]);
+        acc[i] = 0.0f;
+    }
+    float m = -3.4028234663852886e38f, l = 0.0f;
+
+    const int compressed_count = compressed_len[batch];
+    for (int j = 0; j < compressed_count; ++j) {
+        const int slot = compressed_idx[batch * compressed_width + j];
+        if (slot < 0) { continue; }
+        const long base = (slot / compressed_block_size) *
+                              (long)compressed_block_stride +
+                          (slot % compressed_block_size) * SLOT_BYTES;
+        device const bf16 *rope =
+            (device const bf16 *)(compressed + base + NOPE);
+        float lat[VPL], partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const int e = (int)compressed[base + DATA_BYTES + d / 64];
+                lat[i] = float(tk_e4m3_decode(compressed[base + d])) *
+                         metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) {
+            acc[i] = acc[i] * alpha + beta * lat[i];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const int slen = swa_len[batch];
+    for (int j = 0; j < slen; ++j) {
+        const int slot = swa_idx[batch * swa_width + j];
+        if (slot < 0) { continue; }
+        const long base = (slot / swa_block_size) * (long)swa_block_stride +
+                          (slot % swa_block_size) * SLOT_BYTES;
+        device const bf16 *rope = (device const bf16 *)(swa + base + NOPE);
+        float lat[VPL], partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const int e = (int)swa[base + DATA_BYTES + d / 64];
+                lat[i] = float(tk_e4m3_decode(swa[base + d])) *
+                         metal::exp2((float)(e - 127));
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) {
+            acc[i] = acc[i] * alpha + beta * lat[i];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const float sink = sinks[head];
+    if (isfinite(sink)) {
+        const float new_m = max(m, sink);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        l = l * alpha + exp(sink - new_m);
+        for (int i = 0; i < VPL; ++i) { acc[i] *= alpha; }
+    }
+
+    const long out_base = ((long)batch * num_heads + head) * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        out[out_base + lane + 32 * i] =
+            l == 0.0f ? bf16(0) : bf16(acc[i] / l);
     }
 }
 

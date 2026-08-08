@@ -717,6 +717,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         layer: Any,
     ):
         """Quantize + store via the fused native or Triton kernel."""
+        from vllm.platforms import current_platform
+
+        if current_platform.is_metal():
+            from vllm.quixicore.ops import quixicore_ops
+
+            centroids = (layer._tq_centroids * self.head_size**0.5).contiguous()
+            signs = torch.ones(self.head_size, dtype=torch.float32, device=key.device)
+            quixicore_ops.turboquant_encode_metal(
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                centroids,
+                signs,
+                8 if self.tq_config.key_fp8 else self.tq_config.key_mse_bits,
+                self.tq_config.key_fp8,
+                self.tq_config.effective_value_quant_bits,
+            )
+            return
+
         store_fn = (
             native_turboquant_store
             if self._use_native_kernels

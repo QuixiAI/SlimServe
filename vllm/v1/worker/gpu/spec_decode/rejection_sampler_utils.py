@@ -3,7 +3,7 @@
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.utils.math_utils import next_power_of_2, cdiv
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.worker.gpu.sample.gumbel import (
     _use_native_sample_kernels,
     gumbel_block_argmax,
@@ -908,6 +908,37 @@ def rejection_sample(
         # vocab size is larger than the draft's due to padding.
         vocab_size = min(vocab_size, draft_logits.size(-1))
 
+    if target_logits.device.type == "mps":
+        req_indices = idx_mapping.to(torch.int64)
+        active_temperatures = temperature[req_indices]
+        if bool((active_temperatures == 0).all().cpu()):
+            target_ids = target_logits[:, :vocab_size].argmax(dim=-1).cpu().tolist()
+            draft_ids = draft_sampled.cpu().tolist()
+            cu_logits = cu_num_logits.cpu().tolist()
+            sampled_cpu = torch.full(
+                (num_reqs, num_speculative_steps + 1),
+                -1,
+                dtype=torch.int64,
+            )
+            num_sampled_cpu = torch.empty(num_reqs, dtype=torch.int32)
+            for req_idx in range(num_reqs):
+                start = cu_logits[req_idx]
+                end = cu_logits[req_idx + 1]
+                num_draft = end - start - 1
+                accepted = 0
+                while (
+                    accepted < num_draft
+                    and draft_ids[start + accepted + 1] == target_ids[start + accepted]
+                ):
+                    sampled_cpu[req_idx, accepted] = draft_ids[start + accepted + 1]
+                    accepted += 1
+                sampled_cpu[req_idx, accepted] = target_ids[start + accepted]
+                num_sampled_cpu[req_idx] = accepted + 1
+            return (
+                sampled_cpu.to(target_logits.device),
+                num_sampled_cpu.to(target_logits.device),
+            )
+
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential
     # (for non-greedy requests).
@@ -940,7 +971,8 @@ def rejection_sample(
         and (
             not has_draft_logits
             or (
-                draft_logits.dtype == torch.float32
+                draft_logits is not None
+                and draft_logits.dtype == torch.float32
                 and draft_logits_stride_0 % 16 == 0
                 and draft_logits_stride_1 % 16 == 0
                 and draft_logits.data_ptr() % 16 == 0

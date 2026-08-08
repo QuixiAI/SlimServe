@@ -156,6 +156,8 @@ class MetalAttentionImpl(AttentionImpl):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
+        **kwargs,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -168,6 +170,8 @@ class MetalAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
 
+        if sinks is not None:
+            raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi has no Metal attention path.")
         if sliding_window is not None:

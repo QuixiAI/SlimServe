@@ -547,38 +547,67 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                         device=self.device,
                     )
                 decode_swa_indices = self.decode_swa_indices_noncausal
-                _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
-                    decode_swa_indices.stride(0),
-                    self.decode_swa_lens,
-                    self.window_size,
-                    self.noncausal_index_width,
-                    query_start_loc,
-                    seq_lens,
-                    token_to_req_indices,
-                    is_valid_token,
-                    block_table,
-                    block_table.stride(0),
-                    self.block_size,
-                    token_offset=0,
-                    TRITON_BLOCK_SIZE=1024,
-                )
+                if current_platform.is_metal():
+                    _compute_swa_indices_torch(
+                        decode_swa_indices[:num_decode_tokens],
+                        self.decode_swa_lens[:num_decode_tokens],
+                        query_start_loc,
+                        seq_lens,
+                        token_to_req_indices,
+                        is_valid_token,
+                        block_table,
+                        self.block_size,
+                        token_offset=0,
+                        window_size=self.window_size,
+                        noncausal=True,
+                    )
+                else:
+                    _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
+                        decode_swa_indices,
+                        decode_swa_indices.stride(0),
+                        self.decode_swa_lens,
+                        self.window_size,
+                        self.noncausal_index_width,
+                        query_start_loc,
+                        seq_lens,
+                        token_to_req_indices,
+                        is_valid_token,
+                        block_table,
+                        block_table.stride(0),
+                        self.block_size,
+                        token_offset=0,
+                        TRITON_BLOCK_SIZE=1024,
+                    )
             else:
-                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                    decode_swa_indices,
-                    decode_swa_indices.stride(0),
-                    self.decode_swa_lens,
-                    self.window_size,
-                    query_start_loc,
-                    seq_lens,
-                    token_to_req_indices,
-                    is_valid_token,
-                    block_table,
-                    block_table.stride(0),
-                    self.block_size,
-                    token_offset=0,
-                    TRITON_BLOCK_SIZE=1024,
-                )
+                if current_platform.is_metal():
+                    _compute_swa_indices_torch(
+                        decode_swa_indices[:num_decode_tokens],
+                        self.decode_swa_lens[:num_decode_tokens],
+                        query_start_loc,
+                        seq_lens,
+                        token_to_req_indices,
+                        is_valid_token,
+                        block_table,
+                        self.block_size,
+                        token_offset=0,
+                        window_size=self.window_size,
+                    )
+                else:
+                    _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+                        decode_swa_indices,
+                        decode_swa_indices.stride(0),
+                        self.decode_swa_lens,
+                        self.window_size,
+                        query_start_loc,
+                        seq_lens,
+                        token_to_req_indices,
+                        is_valid_token,
+                        block_table,
+                        block_table.stride(0),
+                        self.block_size,
+                        token_offset=0,
+                        TRITON_BLOCK_SIZE=1024,
+                    )
 
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
@@ -586,21 +615,35 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         if num_prefill_tokens > 0:
             prefill_swa_indices = self.prefill_swa_indices[:num_prefill_tokens]
             prefill_swa_lens = self.prefill_swa_lens[:num_prefill_tokens]
-            _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
-                prefill_swa_indices,
-                prefill_swa_indices.stride(0),
-                prefill_swa_lens,
-                self.window_size,
-                query_start_loc,
-                seq_lens,
-                token_to_req_indices,
-                is_valid_token,
-                block_table,
-                block_table.stride(0),
-                self.block_size,
-                token_offset=num_decode_tokens,
-                TRITON_BLOCK_SIZE=1024,
-            )
+            if current_platform.is_metal():
+                _compute_swa_indices_torch(
+                    prefill_swa_indices,
+                    prefill_swa_lens,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    self.block_size,
+                    token_offset=num_decode_tokens,
+                    window_size=self.window_size,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_prefill_tokens,)](
+                    prefill_swa_indices,
+                    prefill_swa_indices.stride(0),
+                    prefill_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    token_offset=num_decode_tokens,
+                    TRITON_BLOCK_SIZE=1024,
+                )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
         deepseek_v4_fields = self._build_deepseek_v4_metadata(
@@ -672,6 +715,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
+            or current_platform.is_metal()
             or current_platform.is_device_capability_family(120)
         ):
             return out
@@ -708,14 +752,24 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             pfx_gather_lens = torch.empty(
                 num_prefills, dtype=torch.int32, device=seq_lens.device
             )
-            _COMPUTE_PREFILL_METADATA_KERNEL(
-                pfx_gather_lens,
-                seq_lens,
-                query_start_loc,
-                num_prefills,
-                num_decodes,
-                self.window_size,
-            )
+            if current_platform.is_metal():
+                query_lens = (
+                    query_start_loc[num_decodes + 1 : num_decodes + num_prefills + 1]
+                    - query_start_loc[num_decodes : num_decodes + num_prefills]
+                )
+                prefix_lens = seq_lens[num_decodes:] - query_lens
+                pfx_gather_lens.copy_(
+                    query_lens + prefix_lens.clamp(min=0, max=self.window_size - 1)
+                )
+            else:
+                _COMPUTE_PREFILL_METADATA_KERNEL(
+                    pfx_gather_lens,
+                    seq_lens,
+                    query_start_loc,
+                    num_prefills,
+                    num_decodes,
+                    self.window_size,
+                )
 
             result["prefill_seq_lens"] = seq_lens[num_decodes:]
             result["prefill_seq_lens_cpu"] = seq_lens_cpu[num_decodes:]
@@ -729,6 +783,53 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             result["prefill_max_num_batched_tokens"] = self.max_num_batched_tokens
 
         return result
+
+
+def _compute_swa_indices_torch(
+    output: torch.Tensor,
+    lengths: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    is_valid_token: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    *,
+    token_offset: int,
+    window_size: int,
+    noncausal: bool = False,
+) -> None:
+    """MPS replacement for the SWA metadata Triton kernels."""
+    rows = output.shape[0]
+    token_idx = torch.arange(rows, device=output.device) + token_offset
+    req = token_to_req_indices.index_select(0, token_idx).to(torch.long)
+    query_start = query_start_loc.index_select(0, req).to(torch.long)
+    query_end = query_start_loc.index_select(0, req + 1).to(torch.long)
+    query_len = query_end - query_start
+    seq_len = seq_lens.index_select(0, req).to(torch.long)
+    prefix_len = seq_len - query_len
+    if noncausal:
+        start = (prefix_len - window_size).clamp_min(0)
+        end = seq_len
+    else:
+        pos = prefix_len + token_idx - query_start
+        start = (pos - window_size + 1).clamp_min(0)
+        end = pos + 1
+    lens = end - start
+    valid_token = is_valid_token.index_select(0, token_idx)
+    lens = torch.where(valid_token, lens, 0)
+    width = output.shape[-1]
+    offsets = torch.arange(width, device=output.device, dtype=torch.long)
+    logical = start.unsqueeze(1) + offsets.unsqueeze(0)
+    valid = offsets.unsqueeze(0) < lens.unsqueeze(1)
+    tables = block_table.index_select(0, req)
+    block_col = torch.div(logical, block_size, rounding_mode="floor").clamp(
+        min=0, max=tables.shape[1] - 1
+    )
+    blocks = tables.gather(1, block_col)
+    slots = blocks * block_size + torch.remainder(logical, block_size)
+    output.view(rows, width).copy_(torch.where(valid, slots, -1).to(torch.int32))
+    lengths.copy_(lens.to(torch.int32))
 
 
 @triton.jit(do_not_specialize=["token_offset"])

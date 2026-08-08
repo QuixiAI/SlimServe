@@ -24,6 +24,24 @@ def save_partial_states(
     """
     num_actual = slot_mapping.shape[0]
     head_size = kv.shape[-1]
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        from vllm.quixicore.ops import quixicore_ops
+
+        quixicore_ops.deepseek_v4_save_partial_states(
+            kv[:num_actual].to(torch.bfloat16).contiguous(),
+            score[:num_actual].to(torch.bfloat16).contiguous(),
+            ape.to(torch.bfloat16).contiguous(),
+            positions,
+            state_cache,
+            slot_mapping,
+            block_size,
+            state_width,
+            compress_ratio,
+        )
+        return
+
     _save_partial_states_kernel[(num_actual,)](
         kv,
         kv.stride(0),

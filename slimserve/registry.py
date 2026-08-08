@@ -65,6 +65,33 @@ def platform_blocked_detail(platform: str) -> str:
     return entry.get("status_detail") or platform_blocked(platform) or ""
 
 
+def profile_blocked(profile_id: str, platform: str) -> str | None:
+    """Why one profile cannot serve on a platform, or None when it can."""
+    blocked = platform_blocked(platform)
+    if blocked:
+        return blocked
+    profile = describe(profile_id)
+    override = (profile.get("platform_overrides") or {}).get(platform) or {}
+    status = override.get("status", profile.get("status", "supported"))
+    if status == "supported":
+        return None
+    return override.get(
+        "status_reason", profile.get("status_reason", "not supported yet")
+    )
+
+
+def profile_blocked_detail(profile_id: str, platform: str) -> str:
+    """Long-form explanation for a profile-specific serving gate."""
+    profile = describe(profile_id)
+    override = (profile.get("platform_overrides") or {}).get(platform) or {}
+    return (
+        override.get("status_detail")
+        or profile.get("status_detail")
+        or profile_blocked(profile_id, platform)
+        or ""
+    )
+
+
 @dataclass(frozen=True)
 class Quant:
     name: str
@@ -175,6 +202,7 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     engine = dict(profile["engine"])
     env = dict(profile.get("env") or {})
     notes = list(profile.get("notes") or [])
+    speculative_overrides = dict(profile.get("speculative_overrides") or {})
     default_quant = profile["default_quant"]
     if override:
         for key, value in (override.get("engine") or {}).items():
@@ -186,12 +214,14 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
             env = dict(override["env"])
         if "notes" in override:
             notes = list(override["notes"])
+        speculative_overrides.update(override.get("speculative_overrides") or {})
         default_quant = override.get("default_quant", default_quant)
     return {
         "engine": engine,
         "env": env,
         "notes": notes,
         "default_quant": default_quant,
+        "speculative_overrides": speculative_overrides,
     }
 
 
@@ -266,7 +296,7 @@ def resolve(
         engine=merged["engine"],
         env=merged["env"],
         speculative=bool(profile.get("speculative")),
-        speculative_overrides=dict(profile.get("speculative_overrides") or {}),
+        speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
     )
