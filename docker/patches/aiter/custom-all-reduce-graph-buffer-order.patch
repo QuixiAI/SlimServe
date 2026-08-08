@@ -1,0 +1,206 @@
+diff --git a/csrc/include/custom_all_reduce.cuh b/csrc/include/custom_all_reduce.cuh
+index d1545e3cb..0b1e255b2 100644
+--- a/csrc/include/custom_all_reduce.cuh
++++ b/csrc/include/custom_all_reduce.cuh
+@@ -3361,2 +3361,6 @@ class CustomAllreduce
+-    std::vector<void*> graph_unreg_input_buffers_;
+-    std::vector<void*> graph_unreg_output_buffers_;
++    struct GraphBuffer
++    {
++        void* ptr;
++        bool is_output;
++    };
++    std::vector<GraphBuffer> graph_unreg_buffers_;
+@@ -3428,3 +3432 @@ class CustomAllreduce
+-        auto num_input_buffers  = graph_unreg_input_buffers_.size();
+-        auto num_output_buffers = graph_unreg_output_buffers_.size();
+-        auto num_buffers        = num_input_buffers + num_output_buffers;
++        auto num_buffers = graph_unreg_buffers_.size();
+@@ -3434 +3436 @@ class CustomAllreduce
+-        for(int i = 0; i < num_input_buffers; i++)
++        for(int i = 0; i < num_buffers; i++)
+@@ -3436 +3438 @@ class CustomAllreduce
+-            auto ptr = graph_unreg_input_buffers_[i];
++            auto ptr = graph_unreg_buffers_[i].ptr;
+@@ -3452,18 +3453,0 @@ class CustomAllreduce
+-        // Process output buffers
+-        for(int i = 0; i < num_output_buffers; i++)
+-        {
+-            auto ptr = graph_unreg_output_buffers_[i];
+-            void* base_ptr;
+-            if(hipPointerGetAttribute(&base_ptr,
+-#ifdef USE_ROCM
+-                                      HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+-#else
+-                                      CU_POINTER_ATTRIBUTE_RANGE_START_ADDR,
+-#endif
+-                                      (hipDeviceptr_t)ptr) != CUDA_SUCCESS)
+-                throw std::runtime_error("failed to get pointer attr for output");
+-            HIP_CALL(hipIpcGetMemHandle(
+-                (hipIpcMemHandle_t*)&handles[(num_input_buffers + i) * handle_sz], base_ptr));
+-            offsets[num_input_buffers + i] = ((char*)ptr) - ((char*)base_ptr);
+-        }
+-
+@@ -3542,2 +3526,2 @@ class CustomAllreduce
+-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
+-                graph_unreg_input_buffers_.push_back(input);
++                ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
++                graph_unreg_buffers_.push_back({input, false});
+@@ -3570,4 +3554,2 @@ class CustomAllreduce
+-                // For graph mode, collect output addresses
+-                ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
+-                       graph_unreg_output_buffers_.size();
+-                graph_unreg_output_buffers_.push_back(output);
++                ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
++                graph_unreg_buffers_.push_back({output, true});
+@@ -3586 +3568,3 @@ class CustomAllreduce
+-    // note: when registering graph buffers, we intentionally choose to not
++    // Note: graph inputs and outputs must remain in capture order. Assigning
++    // them from separate growing lists makes a later input reuse the slot
++    // already recorded for an earlier output. We intentionally do not
+@@ -3596,3 +3580 @@ class CustomAllreduce
+-        auto num_input_buffers  = graph_unreg_input_buffers_.size();
+-        auto num_output_buffers = graph_unreg_output_buffers_.size();
+-        auto total_buffers      = num_input_buffers + num_output_buffers;
++        auto total_buffers = graph_unreg_buffers_.size();
+@@ -3602,2 +3584 @@ class CustomAllreduce
+-        // Register input buffers
+-        for(int i = 0; i < num_input_buffers; i++)
++        for(int i = 0; i < total_buffers; i++)
+@@ -3605 +3586,2 @@ class CustomAllreduce
+-            auto self_ptr = graph_unreg_input_buffers_[i];
++            const auto& graph_buffer = graph_unreg_buffers_[i];
++            auto self_ptr = graph_buffer.ptr;
+@@ -3622,7 +3604,2 @@ class CustomAllreduce
+-        }
+-        // Register output buffers
+-        for(int i = 0; i < num_output_buffers; i++)
+-        {
+-            auto self_ptr = graph_unreg_output_buffers_[i];
+-            auto& rd      = rank_data[num_input_buffers + i];
+-            for(int j = 0; j < world_size_; j++)
++            auto* device_rank_data = d_rank_data_base_ + i;
++            if(graph_buffer.is_output)
+@@ -3630,12 +3607 @@ class CustomAllreduce
+-                if(j != rank_)
+-                {
+-                    auto* ipc_handle_ptr =
+-                        (const hipIpcMemHandle_t*)handles_per_rank[j] + num_input_buffers + i;
+-                    char* handle = open_ipc_handle(ipc_handle_ptr);
+-                    handle += offsets_per_rank[j][num_input_buffers + i];
+-                    rd.ptrs[j] = handle;
+-                }
+-                else
+-                {
+-                    rd.ptrs[j] = self_ptr;
+-                }
++                output_buffers_[self_ptr] = device_rank_data;
+@@ -3643 +3608,0 @@ class CustomAllreduce
+-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
+@@ -3651,2 +3616 @@ class CustomAllreduce
+-        graph_unreg_input_buffers_.clear();
+-        graph_unreg_output_buffers_.clear();
++        graph_unreg_buffers_.clear();
+diff --git a/csrc/include/custom_all_reduce_gfx1250.cuh b/csrc/include/custom_all_reduce_gfx1250.cuh
+index 01b6f3b01..e347ff0f4 100644
+--- a/csrc/include/custom_all_reduce_gfx1250.cuh
++++ b/csrc/include/custom_all_reduce_gfx1250.cuh
+@@ -928,2 +928,6 @@ public:
+-    std::vector<void*> graph_unreg_input_buffers_;
+-    std::vector<void*> graph_unreg_output_buffers_;
++    struct GraphBuffer
++    {
++        void* ptr;
++        bool is_output;
++    };
++    std::vector<GraphBuffer> graph_unreg_buffers_;
+@@ -1102,3 +1106 @@ public:
+-        auto num_input_buffers  = graph_unreg_input_buffers_.size();
+-        auto num_output_buffers = graph_unreg_output_buffers_.size();
+-        auto num_buffers        = num_input_buffers + num_output_buffers;
++        auto num_buffers = graph_unreg_buffers_.size();
+@@ -1106,4 +1108,2 @@ public:
+-        for(size_t i = 0; i < num_input_buffers; i++)
+-            ptrs[i] = (int64_t)graph_unreg_input_buffers_[i];
+-        for(size_t i = 0; i < num_output_buffers; i++)
+-            ptrs[num_input_buffers + i] = (int64_t)graph_unreg_output_buffers_[i];
++        for(size_t i = 0; i < num_buffers; i++)
++            ptrs[i] = (int64_t)graph_unreg_buffers_[i].ptr;
+@@ -1201,2 +1201,2 @@ public:
+-            auto ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size();
+-            graph_unreg_input_buffers_.push_back(input);
++            auto ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
++            graph_unreg_buffers_.push_back({input, false});
+@@ -1219,3 +1219,2 @@ public:
+-            auto ptrs = d_rank_data_base_ + graph_unreg_input_buffers_.size() +
+-                        graph_unreg_output_buffers_.size();
+-            graph_unreg_output_buffers_.push_back(output);
++            auto ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
++            graph_unreg_buffers_.push_back({output, true});
+@@ -1231,2 +1230 @@ public:
+-    // one per buffer (inputs first, then outputs), in the same order as
+-    // graph_unreg_input_buffers_ + graph_unreg_output_buffers_.
++    // one per buffer in capture order.
+@@ -1235,3 +1233 @@ public:
+-        auto num_input_buffers  = graph_unreg_input_buffers_.size();
+-        auto num_output_buffers = graph_unreg_output_buffers_.size();
+-        auto total_buffers      = num_input_buffers + num_output_buffers;
++        auto total_buffers = graph_unreg_buffers_.size();
+@@ -1240 +1236 @@ public:
+-        for(size_t i = 0; i < num_input_buffers; i++)
++        for(size_t i = 0; i < total_buffers; i++)
+@@ -1242 +1238,2 @@ public:
+-            auto self_ptr = graph_unreg_input_buffers_[i];
++            const auto& graph_buffer = graph_unreg_buffers_[i];
++            auto self_ptr = graph_buffer.ptr;
+@@ -1246,9 +1243,2 @@ public:
+-        }
+-        for(size_t i = 0; i < num_output_buffers; i++)
+-        {
+-            auto self_ptr = graph_unreg_output_buffers_[i];
+-            auto& rd      = rank_data[num_input_buffers + i];
+-            for(int j = 0; j < world_size_; j++)
+-                rd.ptrs[j] = (j != rank_) ? (void*)ptrs_per_rank[j][num_input_buffers + i]
+-                                          : self_ptr;
+-            output_buffers_[self_ptr] = d_rank_data_base_ + num_input_buffers + i;
++            if(graph_buffer.is_output)
++                output_buffers_[self_ptr] = d_rank_data_base_ + i;
+@@ -1261,2 +1251 @@ public:
+-        graph_unreg_input_buffers_.clear();
+-        graph_unreg_output_buffers_.clear();
++        graph_unreg_buffers_.clear();
+diff --git a/csrc/kernels/custom_all_reduce.cu b/csrc/kernels/custom_all_reduce.cu
+index e536f9741..98faa5081 100644
+--- a/csrc/kernels/custom_all_reduce.cu
++++ b/csrc/kernels/custom_all_reduce.cu
+@@ -345,2 +345 @@ int64_t get_graph_buffer_count(fptr_t _fa)
+-    return (int64_t)(fa->graph_unreg_input_buffers_.size() +
+-                     fa->graph_unreg_output_buffers_.size());
++    return (int64_t)fa->graph_unreg_buffers_.size();
+diff --git a/csrc/kernels/custom_all_reduce_gfx1250.cu b/csrc/kernels/custom_all_reduce_gfx1250.cu
+index 98a10a0ea..bebe56e47 100644
+--- a/csrc/kernels/custom_all_reduce_gfx1250.cu
++++ b/csrc/kernels/custom_all_reduce_gfx1250.cu
+@@ -261,2 +261 @@ int64_t get_graph_buffer_count(fptr_t _fa)
+-    return (int64_t)(fa->graph_unreg_input_buffers_.size() +
+-                     fa->graph_unreg_output_buffers_.size());
++    return (int64_t)fa->graph_unreg_buffers_.size();
+@@ -277,2 +276 @@ void register_graph_buffers(fptr_t _fa,
+-    int total_buffers = fa->graph_unreg_input_buffers_.size() +
+-                        fa->graph_unreg_output_buffers_.size();
++    int total_buffers = fa->graph_unreg_buffers_.size();
+diff --git a/op_tests/multigpu_tests/test_custom_allreduce.py b/op_tests/multigpu_tests/test_custom_allreduce.py
+index d2cf62333..8f3de9d8f 100644
+--- a/op_tests/multigpu_tests/test_custom_allreduce.py
++++ b/op_tests/multigpu_tests/test_custom_allreduce.py
+@@ -62,2 +62,5 @@ def allreduce_custom(
+-            out = tensor_model_parallel_all_reduce(x)
+-        out.fill_(0)
++            # Capture more than one call so input/output graph-buffer
++            # registration is exercised in its actual alternating order.
++            graph_outputs = [tensor_model_parallel_all_reduce(x) for _ in range(2)]
++        for graph_output in graph_outputs:
++            graph_output.fill_(0)
+@@ -70 +73 @@ def allreduce_custom(
+-        out = (out, us)
++        out = (graph_outputs[0], us / len(graph_outputs))
