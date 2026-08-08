@@ -329,7 +329,8 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
 
 void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           const torch::stable::Tensor& seqLens,
-                          torch::stable::Tensor& indices, int64_t numRows,
+                          torch::stable::Tensor& indices,
+                          torch::stable::Tensor& workspace, int64_t numRows,
                           int64_t stride0, int64_t stride1, int64_t topK);
 
 void persistent_topk(const torch::stable::Tensor& logits,

@@ -524,7 +524,17 @@ def triton_turboquant_decode_attention(
     Returns: output tensor [B, Hq, D] in query's dtype.
     """
     B, Hq, D = query.shape
+    if kv_cache.ndim != 4:
+        raise ValueError(
+            "TurboQuant cache must use [blocks, block_size, kv_heads, slot] "
+            f"layout; got shape {tuple(kv_cache.shape)}"
+        )
     Hk = kv_cache.shape[2]
+    if Hk <= 0 or Hq % Hk:
+        raise ValueError(
+            f"TurboQuant query heads ({Hq}) must be divisible by cache KV "
+            f"heads ({Hk}); cache shape is {tuple(kv_cache.shape)}"
+        )
     block_size = kv_cache.shape[1]
     kv_group_size = Hq // Hk
     device = query.device

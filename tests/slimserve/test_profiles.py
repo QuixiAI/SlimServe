@@ -13,8 +13,10 @@ import pytest
 
 from slimserve import fetch, registry
 from slimserve.engine import engine_kwargs, serve_argv
+from slimserve.hardware import Machine
 from slimserve.registry import ProfileError, files_for, resolve
 from slimserve.server import Server
+from slimserve.smoke import compatible_profile_ids, validate_acceleration
 from slimserve.stream import FrameFilter, visible_text
 
 
@@ -59,6 +61,38 @@ def test_every_profile_source_names_a_blessed_dspark_download():
         assert speculator.get("base_url", "https://huggingface.co/").startswith(
             "https://huggingface.co/"
         )
+
+
+def test_every_source_declares_its_live_smoke_modalities():
+    sources = registry._registry()["sources"]
+    assert sources["glm52-vision"]["modalities"] == ["text", "image"]
+    assert sources["kimi-k3"]["modalities"] == ["text", "image"]
+    assert sources["dsv4-flash"]["modalities"] == ["text"]
+
+
+def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
+    machine = Machine("mi300x", "AMD Instinct MI300X", 8)
+    expected = {
+        profile_id
+        for profile_id in registry.profile_ids()
+        if "mi300x" in registry.describe(profile_id)["platforms"]
+    }
+
+    compatible = compatible_profile_ids(machine)
+
+    assert set(compatible) == expected
+    assert {"k3-6", "k3-8"}.issubset(compatible)
+    assert {"dsv4-1", "dsv4-2", "dsv4-4", "dsv4-8"}.issubset(compatible)
+
+
+def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
+    machine = Machine("mi300x", "AMD Instinct MI300X", 8)
+    for profile_id in compatible_profile_ids(machine):
+        plan = resolve(profile_id, "mi300x", 8, None)
+        speculative = validate_acceleration(plan)
+        assert speculative["method"] == "dspark"
+        assert speculative["attention_backend"] == "TURBOQUANT"
+        assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_registry_rejects_duplicate_json_keys():

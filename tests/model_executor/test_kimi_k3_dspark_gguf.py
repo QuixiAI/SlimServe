@@ -60,16 +60,44 @@ def test_replicated_vocab_layers_skip_tensor_parallel_collectives(monkeypatch):
 
 
 def test_replicated_draft_validates_as_tp1_without_mutating_target_parallelism():
-    target_parallel = SimpleNamespace(tensor_parallel_size=6)
+    target_parallel = SimpleNamespace(
+        tensor_parallel_size=6,
+        enable_expert_parallel=False,
+        enable_ep_weight_filter=False,
+    )
     vllm_config = SimpleNamespace(
         parallel_config=target_parallel,
         speculative_config=SimpleNamespace(replicate_draft_backbone=True),
     )
 
-    validation_parallel = _draft_validation_parallel_config(vllm_config)
+    validation_parallel = _draft_validation_parallel_config(
+        vllm_config, SimpleNamespace(is_moe=False)
+    )
 
     assert validation_parallel.tensor_parallel_size == 1
     assert target_parallel.tensor_parallel_size == 6
+
+
+def test_dense_tp8_draft_does_not_inherit_target_expert_parallelism():
+    target_parallel = SimpleNamespace(
+        tensor_parallel_size=8,
+        enable_expert_parallel=True,
+        enable_ep_weight_filter=True,
+    )
+    vllm_config = SimpleNamespace(
+        parallel_config=target_parallel,
+        speculative_config=SimpleNamespace(replicate_draft_backbone=False),
+    )
+
+    validation_parallel = _draft_validation_parallel_config(
+        vllm_config, SimpleNamespace(is_moe=False)
+    )
+
+    assert validation_parallel.tensor_parallel_size == 8
+    assert validation_parallel.enable_expert_parallel is False
+    assert validation_parallel.enable_ep_weight_filter is False
+    assert target_parallel.enable_expert_parallel is True
+    assert target_parallel.enable_ep_weight_filter is True
 
 
 def test_gguf_config_parser_rejects_unregistered_architectures(monkeypatch):

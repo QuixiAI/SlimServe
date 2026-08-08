@@ -367,6 +367,11 @@ def triton_turboquant_store(
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
+    if kv_cache.ndim != 4 or kv_cache.shape[2] != H:
+        raise ValueError(
+            "TurboQuant cache must use [blocks, block_size, kv_heads, slot] "
+            f"layout; got shape {tuple(kv_cache.shape)} for {H} KV heads"
+        )
     NH = N * H
     block_size = kv_cache.shape[1]
     BLOCK_D = triton.next_power_of_2(D)

@@ -18,6 +18,7 @@
   "sources": {
     "glm52-vision": {
       "title": "GLM-5.2-Vision",
+      "modalities": ["text", "image"],
       "repo": "QuixiAI/GLM-5.2-Vision-GGUF",
       "base_url": "https://huggingface.co/QuixiAI/GLM-5.2-Vision-GGUF/resolve/main",
       "local_dir": "GLM-5.2-Vision-GGUF",
@@ -92,6 +93,7 @@
 
     "dsv4-flash": {
       "title": "DeepSeek-V4-Flash",
+      "modalities": ["text"],
       "repo": "antirez/deepseek-v4-gguf",
       "base_url": "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main",
       "local_dir": "antirez-deepseek-v4-gguf",
@@ -161,6 +163,7 @@
 
     "kimi-k3": {
       "title": "Kimi K3",
+      "modalities": ["text", "image"],
       "repo": "antirez/kimi-k3-gguf",
       "base_url": "https://huggingface.co/antirez/kimi-k3-gguf/resolve/main",
       "local_dir": "antirez-kimi-k3-gguf",

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 """Exact-shape DSV4 throughput benchmark for a local OpenAI completion API."""
 
 from __future__ import annotations
@@ -7,10 +10,15 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import os
 import statistics
 import time
 import urllib.request
 from pathlib import Path
+
+# Reserve stdout for the benchmark's JSON before vLLM configures its log
+# handlers at import time.
+os.environ["VLLM_LOGGING_STREAM"] = "ext://sys.stderr"
 
 from vllm.tokenizers.registry import get_tokenizer
 
@@ -20,6 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Local GGUF path")
     parser.add_argument("--source", required=True, help="Natural-text prompt source")
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
+    parser.add_argument("--served-model-name", default="DeepSeek-V4-Flash")
     parser.add_argument("--concurrency", type=int, choices=(1, 8), required=True)
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
@@ -33,9 +42,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def exact_prompts(
-    tokenizer, source: str, count: int, token_count: int
-) -> list[str]:
+def exact_prompts(tokenizer, source: str, count: int, token_count: int) -> list[str]:
     source_ids = tokenizer.encode(source, add_special_tokens=False)
     if len(source_ids) < token_count:
         raise ValueError(
@@ -57,11 +64,15 @@ def exact_prompts(
 
 
 def request_completion(
-    url: str, prompt: str, output_tokens: int, timeout: float
+    url: str,
+    served_model_name: str,
+    prompt: str,
+    output_tokens: int,
+    timeout: float,
 ) -> dict[str, object]:
     body = json.dumps(
         {
-            "model": "deepseek-v4-flash",
+            "model": served_model_name,
             "prompt": prompt,
             "max_tokens": output_tokens,
             "temperature": 0,
@@ -98,6 +109,7 @@ def main() -> None:
             executor.submit(
                 request_completion,
                 args.url,
+                args.served_model_name,
                 prompt,
                 args.output_tokens,
                 args.timeout,

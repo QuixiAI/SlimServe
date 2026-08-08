@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
@@ -475,6 +476,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    out_workspace: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -513,10 +515,16 @@ def rocm_fp8_paged_mqa_logits(
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
             batch_size, next_n, heads, _ = q_fp8.shape
-            (out_logits,) = current_workspace_manager().get_simultaneous(
-                ((batch_size * next_n, max_model_len), torch.float32),
-            )
-            out_logits.fill_(float("-inf"))
+            if out_workspace is None:
+                (out_logits,) = current_workspace_manager().get_simultaneous(
+                    ((batch_size * next_n, max_model_len), torch.float32),
+                )
+            else:
+                out_logits = out_workspace
+            # The paged kernel writes every logit that decode top-k reads; the
+            # remainder of each max-model-length row is outside seq_lens.
+            # Clearing the dense 1M-token allocation is unnecessary and made
+            # ROCm graph replay issue a 512 MiB fill for every model layer.
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -535,9 +543,12 @@ def rocm_fp8_paged_mqa_logits(
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
         batch_size, next_n, heads, _ = q_fp8.shape
-        (out_qk,) = current_workspace_manager().get_simultaneous(
-            ((heads, batch_size * next_n, max_model_len), torch.float32),
-        )
+        if out_workspace is None:
+            (out_qk,) = current_workspace_manager().get_simultaneous(
+                ((heads, batch_size * next_n, max_model_len), torch.float32),
+            )
+        else:
+            out_qk = out_workspace
         out_qk.fill_(float("-inf"))
         deepgemm_fp8_paged_mqa_logits_stage1(
             q_fp8,
@@ -795,17 +806,25 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
-        if _ON_GFX942 or _ON_GFX950:
-            workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
+        decode_logits_spec = (
+            ((hidden_states.shape[0], max_model_len), torch.float32)
+            if _ON_GFX942 or _ON_GFX950
+            else (
+                (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
+                torch.float32,
             )
-        else:
-            workspace_manager.get_simultaneous(
-                (
-                    (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
-                    torch.float32,
-                ),
-            )
+        )
+        decode_topk_workspace_bytes = max(
+            1,
+            ops.top_k_per_row_decode_workspace_size(
+                hidden_states.shape[0], max_model_len, topk_tokens
+            ),
+        )
+        workspace_manager.get_named_simultaneous(
+            "rocm_sparse_indexer_decode",
+            decode_logits_spec,
+            ((decode_topk_workspace_bytes,), torch.uint8),
+        )
         # Transient logits tensor peak memory, produced by
         # rocm_fp8_mqa_logits (prefill) and rocm_fp8_paged_mqa_logits
         # (decode). Prefill logits are bounded by
@@ -928,6 +947,29 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        heads = padded_q_fp8_decode_tokens.shape[2]
+        decode_logits_spec = (
+            ((num_padded_tokens, max_model_len), torch.float32)
+            if _ON_GFX942 or _ON_GFX950
+            else (
+                (heads, num_padded_tokens, max_model_len),
+                torch.float32,
+            )
+        )
+        decode_topk_workspace_bytes = max(
+            1,
+            ops.top_k_per_row_decode_workspace_size(
+                num_padded_tokens, max_model_len, topk_tokens
+            ),
+        )
+        logits_workspace, topk_workspace = (
+            current_workspace_manager().get_named_simultaneous(
+                "rocm_sparse_indexer_decode",
+                decode_logits_spec,
+                ((decode_topk_workspace_bytes,), torch.uint8),
+            )
+        )
+
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -936,16 +978,18 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            out_workspace=logits_workspace,
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
-        torch.ops._C.top_k_per_row_decode(
+        ops.top_k_per_row_decode(
             logits,
             next_n,
             decode_metadata.seq_lens,
             topk_indices,
+            topk_workspace,
             num_rows,
             logits.stride(0),
             logits.stride(1),
