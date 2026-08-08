@@ -481,7 +481,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 
   ops.def(
       "top_k_per_row_decode(Tensor logits, int next_n, "
-      "Tensor seq_lens, Tensor! indices, "
+      "Tensor seq_lens, Tensor! indices, Tensor! workspace, "
       "int numRows, int stride0, int stride1, int topK) -> ()");
 
   ops.def(

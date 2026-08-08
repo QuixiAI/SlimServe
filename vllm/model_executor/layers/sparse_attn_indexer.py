@@ -20,8 +20,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 from vllm.quixicore import quixicore_ops
+from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -45,6 +45,15 @@ logger = init_logger(__name__)
 RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 
 
+def _decode_topk_workspace_size(
+    num_rows: int, num_columns: int, topk_tokens: int
+) -> int:
+    return max(
+        RADIX_TOPK_WORKSPACE_SIZE,
+        ops.top_k_per_row_decode_workspace_size(num_rows, num_columns, topk_tokens),
+    )
+
+
 @cache
 def _use_quixicore_mqa_logits() -> bool:
     """Route indexer MQA logits through the QuixiCore path on Ampere.
@@ -53,9 +62,8 @@ def _use_quixicore_mqa_logits() -> bool:
     only; on sm80/sm86 quixicore_ops supplies the op (native kernel when
     available, pure-torch reference otherwise).
     """
-    return current_platform.is_cuda() and not current_platform.has_device_capability(
-        90
-    )
+    return current_platform.is_cuda() and not current_platform.has_device_capability(90)
+
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -346,7 +354,14 @@ def sparse_attn_indexer(
         current_workspace_manager().get_simultaneous(
             values_spec,
             scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            (
+                (
+                    _decode_topk_workspace_size(
+                        hidden_states.shape[0], max_model_len, topk_tokens
+                    ),
+                ),
+                torch.uint8,
+            ),
         )
 
         # Dummy allocation to simulate for peak logits tensor memory during inference.
@@ -669,11 +684,23 @@ def sparse_attn_indexer(
                 logits.shape[1],
             )
         else:
+            workspace_manager = current_workspace_manager()
+            (topk_workspace,) = workspace_manager.get_simultaneous(
+                (
+                    (
+                        _decode_topk_workspace_size(
+                            num_rows, logits.shape[1], topk_tokens
+                        ),
+                    ),
+                    torch.uint8,
+                ),
+            )
             ops.top_k_per_row_decode(
                 logits,
                 next_n,
                 seq_lens,
                 topk_indices,
+                topk_workspace,
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
@@ -804,7 +831,16 @@ class SparseAttnIndexer(CustomOp):
         current_workspace_manager().get_simultaneous(
             values_spec,
             scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            (
+                (
+                    _decode_topk_workspace_size(
+                        self.topk_indices_buffer.shape[0],
+                        self.max_model_len,
+                        self.topk_tokens,
+                    ),
+                ),
+                torch.uint8,
+            ),
         )
 
     def forward_native(

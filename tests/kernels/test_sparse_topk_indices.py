@@ -22,9 +22,22 @@ TOPK = 2048
 def _select(logits: torch.Tensor, seq_len: int) -> torch.Tensor:
     rows = logits.shape[0]
     out = torch.empty(rows, TOPK, dtype=torch.int32, device=logits.device)
+    workspace = torch.empty(
+        ops.top_k_per_row_decode_workspace_size(rows, logits.shape[1], TOPK),
+        dtype=torch.uint8,
+        device=logits.device,
+    )
     seq_lens = torch.full((rows,), seq_len, dtype=torch.int32, device=logits.device)
     ops.top_k_per_row_decode(
-        logits, 1, seq_lens, out, rows, logits.stride(0), logits.stride(1), TOPK
+        logits,
+        1,
+        seq_lens,
+        out,
+        workspace,
+        rows,
+        logits.stride(0),
+        logits.stride(1),
+        TOPK,
     )
     return out
 
@@ -82,3 +95,56 @@ def test_selection_is_stable_across_launches_when_no_tie_straddles_the_cut():
     for _ in range(4):
         again = torch.sort(_select(logits, seq_len).long(), dim=1).values
         torch.testing.assert_close(again, first)
+
+
+def test_long_decode_topk_is_graph_safe_across_all_model_layers():
+    """Exercise the 1M-token split path as it is captured by the 78-layer model.
+
+    All layer launches deliberately share one caller-owned workspace. Native
+    temporary allocations here are unsafe because graph-pool reuse can alias a
+    later layer's live buffers.
+    """
+    rows = 4
+    seq_len = 1_048_576
+    num_layers = 78
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    logits = torch.randn(rows, seq_len, device="cuda", generator=generator)
+    seq_lens = torch.full((rows,), seq_len, dtype=torch.int32, device="cuda")
+    outputs = [
+        torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+        for _ in range(num_layers)
+    ]
+    workspace = torch.empty(
+        ops.top_k_per_row_decode_workspace_size(rows, seq_len, TOPK),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    def launch_all_layers() -> None:
+        for output in outputs:
+            ops.top_k_per_row_decode(
+                logits,
+                1,
+                seq_lens,
+                output,
+                workspace,
+                rows,
+                logits.stride(0),
+                logits.stride(1),
+                TOPK,
+            )
+
+    launch_all_layers()  # initialize the kernel before graph capture
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch_all_layers()
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    expected = torch.sort(outputs[0].long(), dim=1).values
+    assert (expected >= 0).all()
+    assert (expected < seq_len).all()
+    for output in outputs[1:]:
+        torch.testing.assert_close(torch.sort(output.long(), dim=1).values, expected)

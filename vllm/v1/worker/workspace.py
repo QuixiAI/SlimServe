@@ -3,6 +3,7 @@
 
 import inspect
 import os
+from collections.abc import Callable
 from itertools import accumulate
 from math import prod
 
@@ -42,6 +43,10 @@ class WorkspaceManager:
         self._current_workspaces: list[torch.Tensor | None] = [
             None
         ] * self._num_ubatches
+        # Some kernels need a workspace whose contents stay live across calls
+        # to other workspace consumers. Keep those allocations in named pools
+        # instead of aliasing the general-purpose transient workspace.
+        self._named_workspaces: dict[str, list[torch.Tensor | None]] = {}
         self._locked: bool = False
 
     @staticmethod
@@ -100,21 +105,70 @@ class WorkspaceManager:
         Returns:
             List of tensor views into the workspace buffer, one per shape/dtype pair.
         """
+        return self._get_views(shapes_and_dtypes, self._ensure_workspace_size)
+
+    def get_named_simultaneous(
+        self, name: str, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> list[torch.Tensor]:
+        """Get simultaneous views from a dedicated per-ubatch workspace.
+
+        Named workspaces isolate long-lived or very large kernel pipelines from
+        unrelated transient consumers while retaining one allocation shared by
+        every layer that uses the same name.
+        """
+        assert name, "workspace name must not be empty"
+        return self._get_views(
+            shapes_and_dtypes,
+            lambda size: self._ensure_named_workspace_size(name, size),
+        )
+
+    def _get_views(
+        self,
+        shapes_and_dtypes: tuple[tuple[tuple[int, ...], torch.dtype], ...],
+        ensure_size: Callable[[int], torch.Tensor],
+    ) -> list[torch.Tensor]:
         actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
         aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
-        total_bytes = sum(aligned_bytes)
-
-        # Calculate cumulative offsets using itertools.accumulate
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
-
-        current_workspace = self._ensure_workspace_size(total_bytes)
-
+        workspace = ensure_size(sum(aligned_bytes))
         return [
-            current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
+            workspace[offsets[i] : offsets[i] + actual_bytes[i]]
             .view(shapes_and_dtypes[i][1])
             .reshape(shapes_and_dtypes[i][0])
             for i in range(len(shapes_and_dtypes))
         ]
+
+    def _ensure_named_workspace_size(
+        self, name: str, required_bytes: int
+    ) -> torch.Tensor:
+        workspaces = self._named_workspaces.setdefault(
+            name, [None] * self._num_ubatches
+        )
+        ubatch_id = dbo_current_ubatch_id()
+        workspace = workspaces[ubatch_id]
+        current_size = self._workspace_size_bytes(workspace)
+        if current_size < required_bytes:
+            if self._locked:
+                raise AssertionError(
+                    f"Named workspace {name!r} is locked but requires "
+                    f"{required_bytes / _MB:.2f} MB, current size is "
+                    f"{current_size / _MB:.2f} MB"
+                )
+            workspaces[ubatch_id] = torch.empty(
+                (required_bytes,), dtype=torch.uint8, device=self._device
+            )
+            workspace = workspaces[ubatch_id]
+            if envs.VLLM_DEBUG_WORKSPACE:
+                logger.info(
+                    "[WORKSPACE DEBUG] Resized named workspace %r: %.2f MB -> "
+                    "%.2f MB (ubatch %d)",
+                    name,
+                    current_size / _MB,
+                    required_bytes / _MB,
+                    ubatch_id,
+                )
+        assert workspace is not None
+        return workspace
 
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
@@ -189,8 +243,6 @@ class WorkspaceManager:
                 )
 
         return current_workspace
-
-
 
 
 def current_workspace_manager() -> "WorkspaceManager":

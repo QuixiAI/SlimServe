@@ -3083,6 +3083,7 @@ def top_k_per_row_decode(
     next_n: int,
     seq_lens: torch.Tensor,
     raw_topk_indices: torch.Tensor,
+    workspace: torch.Tensor,
     num_rows: int,
     stride0: int,
     stride1: int,
@@ -3093,11 +3094,23 @@ def top_k_per_row_decode(
         next_n,
         seq_lens,
         raw_topk_indices,
+        workspace,
         num_rows,
         stride0,
         stride1,
         topk_tokens,
     )
+
+
+def top_k_per_row_decode_workspace_size(
+    num_rows: int, num_columns: int, topk_tokens: int
+) -> int:
+    """Return bytes required by the graph-safe split decode top-k path."""
+    if num_columns < 200 * 1000:
+        return 0
+    split_count = 10
+    bytes_per_split_element = torch.int32.itemsize + torch.float32.itemsize
+    return num_rows * split_count * topk_tokens * bytes_per_split_element
 
 
 def cp_gather_indexer_k_quant_cache(

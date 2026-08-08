@@ -695,7 +695,8 @@ void apply_repetition_penalties_(
 
 void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
                           const torch::stable::Tensor& seqLens,
-                          torch::stable::Tensor& indices, int64_t numRows,
+                          torch::stable::Tensor& indices,
+                          torch::stable::Tensor& workspace, int64_t numRows,
                           int64_t stride0, int64_t stride1, int64_t topK) {
   constexpr int kSortingAlgorithmThreshold = 12288;
   constexpr int kSplitWorkThreshold = 200 * 1000;
@@ -729,31 +730,37 @@ void top_k_per_row_decode(const torch::stable::Tensor& logits, int64_t next_n,
   } else {
     // Long sequences are run in two steps
     constexpr auto multipleBlocksPerRowConfig = 10;
-
-    const auto outIndicesAux = torch::stable::empty(
-        {numRows, multipleBlocksPerRowConfig, topK},
-        torch::headeronly::ScalarType::Int, std::nullopt, logits.device());
-    const auto outLogitsAux = torch::stable::empty(
-        {numRows, multipleBlocksPerRowConfig, topK},
-        torch::headeronly::ScalarType::Float, std::nullopt, logits.device());
+    const auto auxElements =
+        static_cast<size_t>(numRows) * multipleBlocksPerRowConfig * topK;
+    const auto auxBytes = auxElements * (sizeof(int32_t) + sizeof(float));
+    STD_TORCH_CHECK(workspace.is_cuda(), "workspace must be a CUDA tensor");
+    STD_TORCH_CHECK(
+        workspace.scalar_type() == torch::headeronly::ScalarType::Byte,
+        "workspace must be uint8");
+    STD_TORCH_CHECK(workspace.is_contiguous(), "workspace must be contiguous");
+    STD_TORCH_CHECK(static_cast<size_t>(workspace.numel()) >= auxBytes,
+                    "top_k_per_row_decode workspace is too small: need ",
+                    auxBytes, " bytes, got ", workspace.numel());
+    auto* workspacePtr = workspace.mutable_data_ptr<uint8_t>();
+    auto* outIndicesAux = reinterpret_cast<int32_t*>(workspacePtr);
+    auto* outLogitsAux =
+        reinterpret_cast<float*>(workspacePtr + auxElements * sizeof(int32_t));
 
     vllm::topKPerRowDecode<kNumThreadsPerBlock, true, true>
         <<<dim3(numRows, multipleBlocksPerRowConfig), kNumThreadsPerBlock,
            2 * topK * sizeof(int32_t), stream>>>(
             logits.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
-            outIndicesAux.mutable_data_ptr<int>(), static_cast<int>(stride0),
-            static_cast<int>(stride1), static_cast<int>(topK),
-            static_cast<int>(next_n), seqLensIs2D,
-            outLogitsAux.mutable_data_ptr<float>());
+            outIndicesAux, static_cast<int>(stride0), static_cast<int>(stride1),
+            static_cast<int>(topK), static_cast<int>(next_n), seqLensIs2D,
+            outLogitsAux);
 
     constexpr int kNumThreadsPerBlockMerge = 1024;
     vllm::topKPerRowDecode<kNumThreadsPerBlockMerge, true, false, true>
         <<<numRows, kNumThreadsPerBlockMerge, topK * sizeof(int32_t), stream>>>(
-            outLogitsAux.const_data_ptr<float>(), seqLens.const_data_ptr<int>(),
+            outLogitsAux, seqLens.const_data_ptr<int>(),
             indices.mutable_data_ptr<int>(), multipleBlocksPerRowConfig * topK,
             1, static_cast<int>(topK), static_cast<int>(next_n), seqLensIs2D,
-            nullptr, multipleBlocksPerRowConfig,
-            outIndicesAux.const_data_ptr<int>());
+            nullptr, multipleBlocksPerRowConfig, outIndicesAux);
   }
 }
 

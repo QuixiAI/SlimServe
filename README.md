@@ -176,6 +176,24 @@ The lower-level `run-glm-optimized.sh` still exists for the three exact GLM
 quants. Like the profiles, it always enables the matching DSpark draft with a
 TurboQuant cache.
 
+### Validate every compatible profile
+
+The live smoke runner discovers every registry profile compatible with the
+current machine; it does not keep a separate list that can silently omit a new
+TP size. Each resolved plan must use its registered DSpark drafter and
+TurboQuant KV cache. It sends text and image requests to GLM and Kimi, and a
+text request to DeepSeek:
+
+```bash
+source .venv/bin/activate
+python benchmarks/smoke_profiles.py
+```
+
+The runner attempts the complete matrix even if one profile fails, isolates
+each model in its own server process, and prints a JSON result with the log path
+for every profile. Use repeated `--profile` options for a focused subset, or
+`--download-missing` to fetch registered artifacts non-interactively.
+
 ---
 
 ## Getting the weights manually

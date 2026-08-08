@@ -14,14 +14,32 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 )
 
 
-def _draft_validation_parallel_config(vllm_config: VllmConfig) -> ParallelConfig:
+def _draft_execution_parallel_config(
+    vllm_config: VllmConfig, draft_model_config
+) -> ParallelConfig:
+    """Copy target parallelism, removing modes the draft cannot use."""
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    if not speculative_config.replicate_draft_backbone:
-        return vllm_config.parallel_config
+    draft_parallel = copy.copy(vllm_config.parallel_config)
+    if speculative_config.replicate_draft_backbone or not draft_model_config.is_moe:
+        # EP belongs to the target model. A dense DSpark backbone has no routed
+        # experts to partition, and validating it with the target's EP flag is
+        # rejected before its weights can load.
+        draft_parallel.enable_expert_parallel = False
+        draft_parallel.enable_ep_weight_filter = False
+    return draft_parallel
 
-    validation_config = copy.copy(vllm_config.parallel_config)
-    validation_config.tensor_parallel_size = 1
+
+def _draft_validation_parallel_config(
+    vllm_config: VllmConfig, draft_model_config
+) -> ParallelConfig:
+    validation_config = _draft_execution_parallel_config(
+        vllm_config, draft_model_config
+    )
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    if speculative_config.replicate_draft_backbone:
+        validation_config.tensor_parallel_size = 1
     return validation_config
 
 
@@ -72,7 +90,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_vllm_config = replace(
         vllm_config,
         model_config=draft_model_config,
-        parallel_config=_draft_validation_parallel_config(vllm_config),
+        parallel_config=_draft_validation_parallel_config(
+            vllm_config, draft_model_config
+        ),
         load_config=draft_load_config,
         quant_config=draft_quant_config,
         attention_config=replace(
@@ -89,12 +109,13 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
-    if speculative_config.replicate_draft_backbone:
-        # VllmConfig validates draft head divisibility during construction.
-        # The replicated backbone satisfies that invariant as TP1, but it still
-        # executes inside the target's real TP group for collectives used by the
-        # shared/partitioned vocabulary layers.
-        draft_vllm_config.parallel_config = vllm_config.parallel_config
+    # A replicated backbone validates as TP1, but executes inside the target's
+    # real TP group for collectives used by shared/partitioned vocabulary
+    # layers. Non-replicated dense drafts likewise keep target TP while dropping
+    # target-only expert parallelism.
+    draft_vllm_config.parallel_config = _draft_execution_parallel_config(
+        vllm_config, draft_model_config
+    )
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(
