@@ -170,7 +170,17 @@ class TurboQuantConfig:
         Even-number is required so effective_head_size = slot_size_aligned // 2
         is integral.
         """
-        s = self.slot_size
+        from vllm.platforms import current_platform
+
+        if current_platform.is_metal():
+            scale_groups = self.head_dim // 32
+            s = (
+                math.ceil(self.head_dim * self.key_quant_bits / 8)
+                + math.ceil(self.head_dim * self.value_quant_bits / 8)
+                + 3 * scale_groups * 2
+            )
+        else:
+            s = self.slot_size
         return s + (s % 2)  # round up to even
 
     @staticmethod

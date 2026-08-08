@@ -310,11 +310,14 @@ def _reshape_kv_cache(
                 # unquantized shape; only the quantized primary uses the
                 # quantized cache dtype's (possibly packed) layout.
                 spec_tq_dtype = getattr(kv_cache_spec, "tq_cache_dtype", "")
+                explicit_cache_dtype = getattr(kv_cache_spec, "cache_dtype_str", None)
                 if spec_tq_dtype:
                     # TQ spec built from a per-layer cache dtype (e.g. a TQ
                     # draft against a non-TQ target): the packed layout comes
                     # from the spec, not the primary cache dtype.
                     layer_cache_dtype = spec_tq_dtype
+                elif explicit_cache_dtype is not None:
+                    layer_cache_dtype = explicit_cache_dtype
                 else:
                     layer_cache_dtype = (
                         "auto"

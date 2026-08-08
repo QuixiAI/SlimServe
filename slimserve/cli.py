@@ -122,7 +122,7 @@ def _runnable(profile_id: str, machine: hardware.Machine) -> tuple[bool, str]:
         return False, "unrecognized hardware"
     if machine.platform not in entry["platforms"]:
         return False, f"not supported on {registry.platform_title(machine.platform)}"
-    blocked = registry.platform_blocked(machine.platform)
+    blocked = registry.profile_blocked(profile_id, machine.platform)
     if blocked:
         return False, blocked
     if registry.platform_gate(machine.platform) == "memory":
@@ -278,10 +278,11 @@ def main(argv: list[str] | None = None) -> int:
             "slimserve runs on MI300X, A100 and Apple Silicon"
         )
 
-    if registry.platform_blocked(machine.platform):
+    if blocked := registry.profile_blocked(profile_id, machine.platform):
         term.die(
-            f"{registry.platform_title(machine.platform)} is not ready yet. "
-            f"{registry.platform_blocked_detail(machine.platform)}"
+            f"{profile_id} is not ready on "
+            f"{registry.platform_title(machine.platform)}: {blocked}. "
+            f"{registry.profile_blocked_detail(profile_id, machine.platform)}"
         )
 
     quant = args.quant

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native-CUDA TurboQuant launchers over the QuixiCore kernels.
+"""Native TurboQuant launchers over the QuixiCore CUDA and Metal kernels.
 
 Drop-in equivalents of `triton_turboquant_store` and
 `triton_turboquant_decode_attention` for the no-Triton Ampere deployment.
@@ -23,6 +23,10 @@ from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 def native_turboquant_available() -> bool:
     from vllm.platforms import current_platform
 
+    if current_platform.is_metal():
+        return quixicore_ops.is_available() and quixicore_ops.has(
+            "turboquant_attention_metal"
+        )
     if not current_platform.is_cuda():
         return False
     return quixicore_ops.is_available() and quixicore_ops.has(
@@ -34,6 +38,10 @@ def native_turboquant_supported(head_size: int, key_fp8: bool) -> bool:
     """Whether the native kernels cover this TQ configuration."""
     if not native_turboquant_available():
         return False
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        return head_size in (64, 128, 256, 512)
     if head_size % 32 != 0 or head_size > 128:
         return False
     # Native fp8 keys implement the e4b15 (Ampere/Ada) format only; on
@@ -54,6 +62,32 @@ def native_turboquant_store(
     key_fp8: bool = False,
 ) -> None:
     """Native TQ store; mirrors `triton_turboquant_store` exactly."""
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        centroids = torch.cat(
+            (
+                -midpoints.new_tensor([float("inf")]),
+                midpoints,
+                midpoints.new_tensor([float("inf")]),
+            )
+        )
+        centroids = (centroids[:-1] + centroids[1:]) * 0.5
+        centroids = centroids.clamp(-4.0, 4.0)
+        signs = torch.ones(key.shape[-1], dtype=torch.float32, device=key.device)
+        quixicore_ops.turboquant_encode_metal(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            centroids,
+            signs,
+            8 if key_fp8 else mse_bits,
+            key_fp8,
+            value_quant_bits,
+        )
+        return
+
     N, H, D = key.shape
     NH = N * H
 
@@ -115,7 +149,50 @@ def native_turboquant_decode_attention(
     sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Native TQ decode; mirrors `triton_turboquant_decode_attention`."""
+    from vllm.platforms import current_platform
+
     B, Hq, D = query.shape
+    if current_platform.is_metal():
+        block_size = kv_cache.shape[1]
+        width = (
+            sliding_window if sliding_window > 0 else block_table.shape[1] * block_size
+        )
+        positions = torch.arange(width, device=query.device, dtype=seq_lens.dtype)
+        visible = seq_lens.clamp(max=width)
+        logical = (seq_lens - visible).unsqueeze(1) + positions.unsqueeze(0)
+        valid = positions.unsqueeze(0) < visible.unsqueeze(1)
+        block_col = torch.div(logical, block_size, rounding_mode="floor")
+        block_col = block_col.clamp(min=0, max=block_table.shape[1] - 1)
+        blocks = block_table.gather(1, block_col.to(torch.long))
+        slots = blocks * block_size + torch.remainder(logical, block_size)
+        slots = torch.where(valid, slots, -1).to(torch.int32).contiguous()
+        metal_centroids = (centroids * D**0.5).contiguous()
+        signs = torch.ones(D, dtype=torch.float32, device=query.device)
+        metal_sinks = (
+            sinks
+            if sinks is not None
+            else torch.full(
+                (query.shape[1],),
+                -float("inf"),
+                dtype=torch.float32,
+                device=query.device,
+            )
+        )
+        return quixicore_ops.turboquant_attention_metal(
+            query,
+            kv_cache,
+            slots,
+            visible,
+            metal_centroids,
+            signs,
+            metal_sinks,
+            scale,
+            kv_cache.shape[2],
+            8 if key_fp8 else mse_bits,
+            key_fp8,
+            value_quant_bits,
+        )
+
     device = query.device
 
     if key_fp8:

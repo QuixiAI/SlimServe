@@ -11,9 +11,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device
-        self.copy_stream = torch.cuda.Stream(device)
+        self.copy_stream = torch.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        self.copy_event = torch.Event()
 
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
@@ -32,15 +32,18 @@ class DraftTokensHandler:
 
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
-        current_stream = torch.cuda.current_stream(self.device)
+        current_stream = torch.accelerator.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
-        with torch.cuda.stream(self.copy_stream):
+        torch.accelerator.set_stream(self.copy_stream)
+        try:
             self.draft_tokens_np = async_copy_to_np(draft_tokens)
             # draft_tokens is a temporary allocation on the main stream and read here on
             # copy_stream; without record_stream, the caching allocator may reuse its
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
+        finally:
+            torch.accelerator.set_stream(current_stream)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:

@@ -97,13 +97,11 @@ def _fused_moe_gguf(
     mmq_ok = qweight_type in MMQ_QUANT_TYPES and qweight_type2 in MMQ_QUANT_TYPES
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
     if current_platform.is_metal():
-        # QuixiCore-Metal has no grouped GEMM over GGUF-quantized experts --
-        # its moe_grouped_gemm is bf16/fp32 only, and base_qmoe_gemm wants the
-        # BaseQN packing, not raw GGUF blocks. Fall through to the per-expert
-        # loop below, which reaches the same qgemv/qgemm kernels one expert at
-        # a time. Correct, and the throughput ceiling for MoE on Metal until a
-        # grouped kernel exists.
-        mmq_ok = vec_ok = False
+        # Metal's grouped path reads the selected raw GGUF expert blocks with
+        # one device-resident GEMV dispatch. It is vector-only for now, but it
+        # avoids the per-route host synchronization that made startup and
+        # decode unusable.
+        mmq_ok = False
     if mmq_ok or vec_ok:
         num_tokens, _ = x.shape
         E, N, _ = w1.shape
@@ -221,7 +219,10 @@ def _fused_moe_gguf(
                 w2_rows,
             )
         out = out.reshape(num_tokens, top_k, w2.shape[1])
-        if _use_quixi_weighted_sum(out, topk_weights, out_hidden_states):
+        if current_platform.is_metal():
+            reduced = (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1)
+            out_hidden_states.copy_(reduced.to(out_hidden_states.dtype))
+        elif _use_quixi_weighted_sum(out, topk_weights, out_hidden_states):
             from vllm.quixicore import quixicore_ops
 
             quixicore_ops.moe_weighted_sum(

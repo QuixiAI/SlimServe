@@ -58,6 +58,69 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
+    from vllm.platforms import current_platform
+
+    if current_platform.is_metal():
+        if num_actual == 0:
+            return
+        if head_dim != 512 or use_fp4_cache:
+            raise NotImplementedError(
+                "Metal's DeepSeek compressor currently supports the 512-wide "
+                "attention cache; the indexer bypasses compression while all "
+                "candidates fit inside index_topk."
+            )
+        from vllm.quixicore.ops import quixicore_ops
+
+        positions = positions[:num_actual]
+        valid = (slot_mapping[:num_actual] >= 0) & (
+            torch.remainder(positions + 1, compress_ratio) == 0
+        )
+        selected_pos = positions
+        req = token_to_req_indices[:num_actual].to(torch.long)
+        history = compress_ratio * (2 if overlap else 1)
+        history_offsets = torch.arange(
+            history, device=positions.device, dtype=positions.dtype
+        )
+        source_pos = (
+            selected_pos.unsqueeze(1) - history + 1 + history_offsets.unsqueeze(0)
+        )
+        source_valid = source_pos >= 0
+        safe_pos = source_pos.clamp_min(0)
+        req_block_table = block_table.index_select(0, req)
+        source_block_col = torch.div(safe_pos, block_size, rounding_mode="floor").clamp(
+            max=req_block_table.shape[1] - 1
+        )
+        source_blocks = req_block_table.gather(1, source_block_col.to(torch.long))
+        source_offsets = torch.remainder(safe_pos, block_size)
+        rows = state_cache[source_blocks.to(torch.long), source_offsets.to(torch.long)]
+        head_offsets = (history_offsets >= compress_ratio).to(torch.long) * head_dim
+        dims = torch.arange(head_dim, device=positions.device, dtype=torch.long)
+        gather_dims = head_offsets.view(1, history, 1) + dims.view(1, 1, -1)
+        gather_dims = gather_dims.expand(rows.shape[0], -1, -1)
+        values = rows.gather(2, gather_dims)
+        scores = rows.gather(2, gather_dims + state_width)
+        scores = scores.masked_fill(~source_valid.unsqueeze(-1), -float("inf"))
+        compressed = (values * torch.softmax(scores, dim=1)).sum(dim=1)
+        compressed_fp32 = compressed.float()
+        rrms = torch.rsqrt(
+            compressed_fp32.square().mean(dim=-1, keepdim=True) + rms_norm_eps
+        )
+        normed = (compressed_fp32 * rrms * rms_norm_weight.float()).to(torch.bfloat16)
+        output_slots = torch.where(
+            valid,
+            k_cache_metadata.slot_mapping[:num_actual],
+            -1,
+        )
+        quixicore_ops.deepseek_v4_kv_insert(
+            normed,
+            kv_cache,
+            output_slots,
+            selected_pos,
+            cos_sin_cache,
+            kv_cache.shape[1],
+        )
+        return
+
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4

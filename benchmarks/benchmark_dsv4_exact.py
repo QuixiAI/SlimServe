@@ -13,6 +13,7 @@ import json
 import os
 import statistics
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -26,23 +27,62 @@ from vllm.tokenizers.registry import get_tokenizer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Local GGUF path")
+    parser.add_argument("--served-model-name", default="DeepSeek-V4-Flash")
     parser.add_argument("--source", required=True, help="Natural-text prompt source")
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
-    parser.add_argument("--served-model-name", default="DeepSeek-V4-Flash")
-    parser.add_argument("--concurrency", type=int, choices=(1, 8), required=True)
+    parser.add_argument(
+        "--metrics-url",
+        help="Prometheus endpoint; defaults to /metrics on the completion host",
+    )
+    parser.add_argument(
+        "--concurrency", type=int, choices=(1, 4, 8, 16, 32), required=True
+    )
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
+    parser.add_argument(
+        "--prompt-offset",
+        type=int,
+        default=0,
+        help="Starting source-token offset; vary it between prefix-cached runs",
+    )
     parser.add_argument(
         "--prompt-overhead",
         type=int,
         default=0,
         help="Server-added wrapper tokens included in API prompt usage",
     )
-    parser.add_argument("--timeout", type=float, default=1800.0)
+    parser.add_argument("--timeout", type=float, default=14400.0)
     return parser.parse_args()
 
 
-def exact_prompts(tokenizer, source: str, count: int, token_count: int) -> list[str]:
+SPEC_METRICS = {
+    "spec_decode_drafts": "vllm:spec_decode_num_drafts_total",
+    "spec_decode_draft_tokens": "vllm:spec_decode_num_draft_tokens_total",
+    "spec_decode_accepted_tokens": "vllm:spec_decode_num_accepted_tokens_total",
+}
+
+
+def metric_counters(url: str, served_model_name: str) -> dict[str, float]:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        body = response.read().decode("utf-8")
+    counters = dict.fromkeys(SPEC_METRICS, 0.0)
+    model_label = f'model_name="{served_model_name}"'
+    for line in body.splitlines():
+        if not line or line.startswith("#") or model_label not in line:
+            continue
+        for key, metric_name in SPEC_METRICS.items():
+            if line.startswith(f"{metric_name}{{"):
+                counters[key] += float(line.rsplit(maxsplit=1)[1])
+    return counters
+
+
+def exact_prompts(
+    tokenizer,
+    source: str,
+    count: int,
+    token_count: int,
+    prompt_offset: int,
+) -> list[str]:
     source_ids = tokenizer.encode(source, add_special_tokens=False)
     if len(source_ids) < token_count:
         raise ValueError(
@@ -50,9 +90,11 @@ def exact_prompts(tokenizer, source: str, count: int, token_count: int) -> list[
         )
 
     max_start = len(source_ids) - token_count
-    stride = max(1, max_start // max(1, count - 1))
+    if prompt_offset < 0 or prompt_offset > max_start:
+        raise ValueError(f"prompt offset must be between 0 and {max_start}")
+    stride = max(1, (max_start - prompt_offset) // max(1, count - 1))
     prompts: list[str] = []
-    candidate = 0
+    candidate = prompt_offset
     while len(prompts) < count and candidate <= max_start:
         text = tokenizer.decode(source_ids[candidate : candidate + token_count])
         if len(tokenizer.encode(text, add_special_tokens=False)) == token_count:
@@ -93,14 +135,21 @@ def request_completion(
 
 def main() -> None:
     args = parse_args()
+    if args.metrics_url is None:
+        parsed_url = urllib.parse.urlsplit(args.url)
+        args.metrics_url = urllib.parse.urlunsplit(
+            (parsed_url.scheme, parsed_url.netloc, "/metrics", "", "")
+        )
     tokenizer = get_tokenizer(args.model)
     prompts = exact_prompts(
         tokenizer,
         Path(args.source).read_text(),
         args.concurrency,
         args.input_tokens - args.prompt_overhead,
+        args.prompt_offset,
     )
 
+    metrics_before = metric_counters(args.metrics_url, args.served_model_name)
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.concurrency
@@ -118,6 +167,10 @@ def main() -> None:
         ]
         results = [future.result() for future in futures]
     wall_seconds = time.perf_counter() - started
+    metrics_after = metric_counters(args.metrics_url, args.served_model_name)
+    spec_metrics = {
+        key: metrics_after[key] - metrics_before[key] for key in SPEC_METRICS
+    }
 
     prompt_counts: list[int] = []
     completion_counts: list[int] = []
@@ -143,9 +196,12 @@ def main() -> None:
         )
 
     summary = {
+        "model": str(Path(args.model).resolve()),
+        "served_model_name": args.served_model_name,
         "concurrency": args.concurrency,
         "requested_input_tokens": args.input_tokens,
         "requested_output_tokens": args.output_tokens,
+        "prompt_offset": args.prompt_offset,
         "prompt_tokens": prompt_counts,
         "completion_tokens": completion_counts,
         "wall_seconds": wall_seconds,
@@ -153,12 +209,15 @@ def main() -> None:
         "request_latency_mean_seconds": statistics.mean(latencies),
         "request_latency_median_seconds": statistics.median(latencies),
         "response_sha256": response_sha256,
+        **spec_metrics,
         "exact": prompt_counts == [args.input_tokens] * args.concurrency
         and completion_counts == [args.output_tokens] * args.concurrency,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     if not summary["exact"]:
         raise SystemExit("server did not honor the exact benchmark token counts")
+    if summary["spec_decode_draft_tokens"] <= 0:
+        raise SystemExit("server produced no DSpark draft tokens")
 
 
 if __name__ == "__main__":

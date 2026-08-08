@@ -155,7 +155,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        self.output_copy_stream = torch.cuda.Stream(self.device)
+        self.output_copy_stream = torch.Stream(self.device)
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -388,6 +388,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def get_model(self) -> nn.Module:
         return self.model
 
+    def _sync_device(self) -> None:
+        torch.accelerator.synchronize()
+
     def get_draft_model(self) -> nn.Module | None:
         speculator = self.speculator
         if not isinstance(speculator, DraftModelSpeculator):
@@ -412,9 +415,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.vllm_config.load_config = self.load_config
 
     @functools.cached_property
-    def main_stream(self) -> torch.cuda.Stream:
-        # Cache the default CUDA stream to avoid lookup overhead.
-        return torch.cuda.current_stream(self.device)
+    def main_stream(self) -> torch.Stream:
+        # Cache the default accelerator stream to avoid lookup overhead.
+        return torch.accelerator.current_stream(self.device)
 
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)

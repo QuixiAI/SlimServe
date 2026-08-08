@@ -94,9 +94,9 @@ for each model family.
 
 | Runs today | Coming |
 | --- | --- |
-| AMD MI300X (2–8 GPUs) | [Apple Metal](#apple-silicon-in-progress) — in progress |
+| AMD MI300X (2–8 GPUs) | Apple Metal for GLM-5.2-Vision |
 | NVIDIA A100 (4–8 GPUs) | RTX 3090 / 4090 / 5090, RTX PRO 6000 |
-| | NVIDIA DGX Spark, multi-node |
+| [Apple Metal](#apple-silicon) (DeepSeek-V4, 128 GiB+) | NVIDIA DGX Spark, multi-node |
 
 ### Models
 
@@ -149,7 +149,7 @@ an API answer come from one engine with one configuration.
 | `glm52-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
 | `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
 | `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
-| `dsv4-1` † | DeepSeek-V4-Flash (text) | 1 | MI300X/Mac | DSpark + TurboQuant |
+| `dsv4-1` | DeepSeek-V4-Flash (text) | 1 | MI300X/Mac | DSpark + TurboQuant |
 | `dsv4-2` | DeepSeek-V4-Flash (text) | 2 | MI300X | DSpark + TurboQuant |
 | `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X | DSpark + TurboQuant |
 | `dsv4-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
@@ -157,8 +157,8 @@ an API answer come from one engine with one configuration.
 | `k3-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
 | `glm52-mac` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
 
-† The Apple Silicon variant is described but not yet runnable — see
-[Apple Silicon](#apple-silicon-in-progress).
+† The GLM Apple Silicon variant is described but not yet runnable. DeepSeek-V4
+is measured and supported; see [Apple Silicon](#apple-silicon).
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
@@ -372,9 +372,10 @@ Context is 1048576 (yarn, 65536 base).
 IQ2_XXS gate/up with Q2_K down on the rest, which is why it is the one file
 carrying three expert quants at once.
 
-IQ2_XXS has no MMQ tile kernel, so the two quants that use it stay on the
-vector MoE path at every batch size. That is a throughput ceiling, not a
-correctness limit.
+On Metal, IQ2_XXS deliberately stays on the device-selected grouped vector MoE
+path at every batch size. The padded per-expert tile alternative was slower at
+the DeepSeek shapes; grouped dispatch still keeps routing and every selected
+expert row on-device, without a per-route host loop.
 
 [ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
 [ds4d]: https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF
@@ -480,24 +481,25 @@ the ceiling, so `k3-6` is the configuration a stale build degrades.
 
 ---
 
-## Apple Silicon (in progress)
+## Apple Silicon
 
-The matrix now has a third platform. It is honest about its own status: the
-rows exist, the memory arithmetic is real, and `slimserve` refuses to start
-them.
+DeepSeek-V4-Flash runs through the in-tree PyTorch-MPS worker and the vendored
+QuixiCore Metal kernels. The supported `dsv4-1` path includes the packed sparse
+MLA target cache, hybrid cache allocation, GGUF i-quant/k-quant projections,
+the matching 0731 DSpark drafter, and a `turboquant_k8v4` draft cache. GLM's
+separate sparse-MLA/vision path remains individually gated in the CLI.
 
 ```console
 $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
-  ! glm52-mac  GLM-5.2-Vision on one Mac — engine support is not built yet
-  ! dsv4-1     DeepSeek-V4-Flash TP1 — Metal support is not built yet
+  ! glm52-mac  GLM-5.2-Vision on one Mac — not validated on Metal
+    dsv4-1     DeepSeek-V4-Flash on 1 GPU
 ```
 
-**A Mac is gated by memory, not by card count.** Every other platform in this
-file answers "will it fit?" by counting GPUs. Apple exposes one GPU per machine
-and weights, KV and activations all come out of one unified pool, so counting
-cards says nothing. Quants therefore carry `min_memory_bytes` alongside
-`min_gpus`, and each platform declares which of the two gates it:
+**A Mac is gated by memory, not by card count.** Apple exposes one GPU per
+machine and weights, KV, and activations share one unified pool. Quants carry
+`min_memory_bytes` alongside `min_gpus`, and the registry uses the memory gate
+on Metal:
 
 | Mac | DeepSeek-V4-Flash | GLM-5.2-Vision |
 | --- | --- | --- |
@@ -509,25 +511,20 @@ cards says nothing. Quants therefore carry `min_memory_bytes` alongside
 Kimi K3 is deliberately absent: at 800 GiB it does not fit the largest Mac ever
 built, so no Metal row claims it.
 
-The figures are physical RAM and already carry the margin Metal imposes — on
-this M5 Max, `recommendedMaxWorkingSetSize` is 115.4 of 128 GiB. A second limit
-bites before that one: `maxBufferLength` is 80.6 GiB, well under the 90.9 GiB
-`Q4K-tail` build, so weights cannot be one buffer per file. Both llama.cpp
-(`ggml/src/ggml-metal/ggml-metal-device.m`) and ds4 (`ds4_metal.m`) solve this
-the same way, by mapping the GGUF into overlapping `MTLBuffer` views sized so
-any single tensor lands wholly inside one view.
+The figures are physical RAM and include Metal's working-set margin. On the
+measured M5 Max, `recommendedMaxWorkingSetSize` is 115.4 of 128 GiB. The default
+81 GiB IQ2XXS target plus the 6.5 GiB drafter leaves room for a fixed 1 GiB
+hybrid KV pool. The measured pool holds 3,268 cache tokens, enough for one
+complete 1k-input/2k-output request under the 3,072-token per-request ceiling.
+Higher request counts remain valid API concurrency but drain in scheduler
+waves; `max_num_seqs=32` is the admission ceiling, not a claim that 32 full
+responses stay resident together.
 
-**What is missing is the engine, not the kernels.** `vllm/platforms/` has only
-`cuda.py` and `rocm.py`; there is no MPS backend, and the QuixiCore Metal
-kernels are not vendored into `csrc/`. That library already covers most of the
-surface this fork needs — paged attention with block tables, MLA including a
-DeepSeek-V4 sparse fp8 decode, MoE routing and grouped GEMM, and GGUF dequant
-and GEMV for the k-quants and i-quants used here — behind a PyTorch MPS pybind
-extension shaped like the `vllm._quixicore_C` this fork already builds. The
-known hard part is batched serving: ds4 still runs attention and routed experts
-per session on Metal, which is the one thing a continuous-batching server
-cannot leave unsolved. That is why `max_num_seqs` in the two Mac profiles is a
-guess and is labelled as one.
+Metal also has a per-buffer limit below total unified memory. The loader keeps
+GGUF tensors as separate MPS allocations rather than trying to place the whole
+file in one `MTLBuffer`. The larger 91 GiB Q4K-tail target loads, but the 81 GiB
+IQ2XXS build is the measured default because it stays clear of swap once the
+drafter and serving caches are resident.
 
 ---
 

@@ -311,6 +311,12 @@ def _v2_runner_kernels_available() -> bool:
     if HAS_TRITON:
         return True
     try:
+        from vllm.platforms import current_platform
+
+        if current_platform.device_type == "mps":
+            # The Metal runner has PyTorch/MPS implementations for the V2
+            # batch-preparation and block-table operations.
+            return True
         from vllm.quixicore import quixicore_ops
 
         return quixicore_ops.is_available() and quixicore_ops.has("post_update")

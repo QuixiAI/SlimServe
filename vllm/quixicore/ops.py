@@ -108,6 +108,98 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def deepseek_v4_qnorm_rope_kv_insert(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        eps: float,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Normalize/rotate Q and write KV into Metal's packed V4 cache."""
+        return _qc().deepseek_v4_qnorm_rope_kv_insert(
+            q,
+            kv,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            eps,
+            block_size,
+        )
+
+    @staticmethod
+    def deepseek_v4_save_partial_states(
+        kv: torch.Tensor,
+        score: torch.Tensor,
+        ape: torch.Tensor,
+        positions: torch.Tensor,
+        state_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        block_size: int,
+        state_width: int,
+        compress_ratio: int,
+    ) -> None:
+        """Store compressor state through the native Metal path."""
+        _qc().deepseek_v4_save_partial_states(
+            kv,
+            score,
+            ape,
+            positions,
+            state_cache,
+            slot_mapping,
+            block_size,
+            state_width,
+            compress_ratio,
+        )
+
+    @staticmethod
+    def deepseek_v4_kv_insert(
+        kv: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """Write already-compressed V4 rows into Metal's packed FP8 cache."""
+        _qc().deepseek_v4_kv_insert(
+            kv,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            block_size,
+        )
+
+    @staticmethod
+    def deepseek_v4_sparse_attention(
+        q: torch.Tensor,
+        compressed_cache: torch.Tensor,
+        compressed_slots: torch.Tensor,
+        compressed_lens: torch.Tensor,
+        swa_cache: torch.Tensor,
+        swa_slots: torch.Tensor,
+        swa_lens: torch.Tensor,
+        sinks: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        """Run two-cache packed sparse MLA attention on Metal."""
+        return _qc().deepseek_v4_sparse_attention(
+            q,
+            compressed_cache,
+            compressed_slots,
+            compressed_lens,
+            swa_cache,
+            swa_slots,
+            swa_lens,
+            sinks,
+            scale,
+        )
+
+    @staticmethod
     def mla_decode_fp8_sparse_glm_splitq(
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -232,6 +324,19 @@ class quixicore_ops:
     ) -> torch.Tensor:
         """Weight-only GEMV, one output row per simdgroup."""
         return _qc().ggml_mul_mat_vec_a8(w, x, quant_type, row)
+
+    @staticmethod
+    def ggml_moe_a8_vec(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        quant_type: int,
+        row: int,
+        tokens: int,
+    ) -> torch.Tensor:
+        """Device-selected GGUF MoE GEMV on Metal."""
+        return _qc().ggml_moe_a8_vec(x, w, topk_ids, top_k, quant_type, row, tokens)
 
     @staticmethod
     def ggml_mul_mat_a8(
@@ -1172,6 +1277,62 @@ class quixicore_ops:
     # ------------------------------------------------------------------
     # TurboQuant KV cache (native ports of the Triton store/decode path)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def turboquant_encode_metal(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        centroids: torch.Tensor,
+        signs: torch.Tensor,
+        k_bits: int,
+        k_signed: bool,
+        v_bits: int,
+    ) -> None:
+        """Encode K/V into the combined Metal TurboQuant cache."""
+        _qc().turboquant_encode_metal(
+            key,
+            value,
+            kv_cache,
+            slot_mapping,
+            centroids,
+            signs,
+            k_bits,
+            k_signed,
+            v_bits,
+        )
+
+    @staticmethod
+    def turboquant_attention_metal(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slots: torch.Tensor,
+        lengths: torch.Tensor,
+        centroids: torch.Tensor,
+        signs: torch.Tensor,
+        sinks: torch.Tensor,
+        scale: float,
+        num_kv_heads: int,
+        k_bits: int,
+        k_signed: bool,
+        v_bits: int,
+    ) -> torch.Tensor:
+        """Fused paged TurboQuant decode attention on Metal."""
+        return _qc().turboquant_attention_metal(
+            q,
+            kv_cache,
+            slots,
+            lengths,
+            centroids,
+            signs,
+            sinks,
+            scale,
+            num_kv_heads,
+            k_bits,
+            k_signed,
+            v_bits,
+        )
 
     @staticmethod
     def turboquant_store_fp8(

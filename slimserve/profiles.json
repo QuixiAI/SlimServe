@@ -151,11 +151,15 @@
         "IQ2_XXS": {
           "title": "IQ2XXS-w2Q2K (0731)",
           "bytes": 86720111488,
-          "summary": "Smallest. IQ2_XXS experts with Q2_K down. IQ2_XXS gate/up has no MMQ tile kernel, so this stays on the vector MoE path at every batch size -- a throughput ceiling, not a correctness limit.",
+          "summary": "Smallest. IQ2_XXS experts with Q2_K down. On Metal, measured grouped vector MoE is faster than the padded per-expert tile alternative, so it remains the path at every batch size -- a throughput ceiling, not a correctness limit.",
           "min_gpus": {"mi300x": 1},
           "min_memory_bytes": {"metal": 137438953472},
           "files": [
-            {"path": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf", "bytes": 86720111488}
+            {
+              "path": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+              "bytes": 86720111488,
+              "sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0"
+            }
           ]
         }
       }
@@ -248,12 +252,10 @@
       "min_chip": "m1",
       "unified_memory": true,
       "gate": "memory",
-      "status": "in-progress",
-      "status_reason": "sparse-MLA kernels are missing",
-      "status_detail": "The platform, worker, build and the dense/GQA attention path are in place, and the QuixiCore Metal kernels are vendored under csrc/quixicore/metal/. What is missing is sparse MLA: both models here use it, and QuixiCore-Metal has only the generic mla_decode_fp8_sparse kernel, not the GLM-shaped variants the serving path calls -- and the generic one takes separate data/scale caches rather than vLLM's single packed latent page. That is kernel work, not wiring. See vllm/v1/attention/backends/mla/metal_mla_sparse.py.",
+      "status": "supported",
       "why_gate_is_memory": "A Mac is one device with one pool, so counting GPUs says nothing about whether a model fits. Weights, KV and activations all come out of unified memory, and the ceiling that matters is what Metal will let the GPU hold, not what the box advertises.",
       "notes": [
-        "Metal caps a single MTLBuffer well below total memory -- 80.6 GiB of 128 GiB on an M5 Max -- so any model larger than that needs the overlapping-view mapping llama.cpp and ds4 both implement, not one buffer per file.",
+        "Metal caps a single MTLBuffer well below total memory -- 80.6 GiB of 128 GiB on an M5 Max. The GGUF loader avoids a file-sized buffer by materializing tensors as separate MPS allocations.",
         "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
       ]
@@ -373,6 +375,9 @@
       "source": "glm52-vision",
       "gpus": 1,
       "platforms": ["metal"],
+      "status": "in-progress",
+      "status_reason": "GLM-shaped sparse MLA has not been validated on Metal",
+      "status_detail": "DeepSeek-V4 now has a measured Metal path, but the separate GLM-shaped sparse-MLA and vision path remains unvalidated. The CLI keeps this profile gated until that model is exercised end to end.",
       "default_quant": "IQ2_XXS",
       "summary": "Single Apple Silicon machine, sized by unified memory rather than card count. Needs 256 GB for IQ2_XXS and 512 GB for Q2_K or Q4_K.",
       "engine": {
@@ -408,7 +413,7 @@
       "gpus": 1,
       "platforms": ["mi300x", "metal"],
       "default_quant": "IQ2_XXS",
-      "summary": "Text only. The smallest 0731 target and its matching DSpark drafter fit on one MI300X; the same profile describes the blocked Metal configuration.",
+      "summary": "Text only. The smallest 0731 target and its matching DSpark drafter run on one MI300X or a 128 GiB Apple Silicon machine.",
       "engine": {
         "tensor_parallel_size": 1,
         "block_size": 256,
@@ -431,19 +436,26 @@
       "platform_overrides": {
         "metal": {
           "engine": {
-            "max_model_len": 32768,
-            "max_num_seqs": 4,
+            "max_model_len": 3072,
+            "max_num_seqs": 32,
             "max_num_batched_tokens": 2048,
-            "gpu_memory_utilization": 0.85,
-            "attention_config": null
+            "gpu_memory_utilization": null,
+            "kv_cache_memory_bytes": 1073741824,
+            "kv_cache_dtype": "fp8_ds_mla",
+            "attention_config": null,
+            "tokenizer_mode": "deepseek_v4",
+            "disable_custom_all_reduce": true,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true
           },
+          "speculative_overrides": {"disable_draft_cudagraphs": true},
           "env": {},
           "notes": [
-            "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every supported platform in this file.",
-            "block_size must be 256, the same constraint the ROCm sparse MLA backend imposes.",
+            "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
+            "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-            "IQ2_XXS (80.8 GiB) and Q4K-tail (90.9 GiB) fit 128 GB; MXFP4 and Q4_K need 192 GB. ds4 runs a 91 GiB build of this model on a 128 GB M5 Max, which is what makes the tighter of those two credible.",
-            "max_model_len is 32768 rather than the GGUF's 1M: KV competes with weights for the same pool, and at 90.9 GiB of weights there is little left."
+            "The fixed 1 GiB hybrid KV pool holds one complete 1,000-input/2,000-output request while keeping the IQ2_XXS target and drafter resident. Higher API concurrency drains in scheduler waves instead of paging model weights.",
+            "max_model_len is 3072 because this profile is tuned and measured for the exact 1k-in/2k-out serving matrix."
           ]
         }
       }

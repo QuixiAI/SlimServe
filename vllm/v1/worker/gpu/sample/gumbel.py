@@ -268,6 +268,43 @@ def gumbel_sample(
     if output_processed_logits_col is not None:
         output_processed_logits_col = output_processed_logits_col.contiguous()
     num_tokens, vocab_size = logits.shape
+    if logits.device.type == "mps":
+        req_indices = expanded_idx_mapping.to(torch.int64)
+        row_temperatures = temperature[req_indices]
+        processed = logits.float()
+        if apply_temperature:
+            divisors = torch.where(
+                row_temperatures == 0, 1, row_temperatures
+            ).unsqueeze(1)
+            processed = processed / divisors
+
+        greedy = row_temperatures == 0
+        greedy_sampled = processed.argmax(dim=-1)
+        if bool(greedy.all().cpu()):
+            sampled = greedy_sampled
+        else:
+            # MPS does not expose Triton's stateless Philox primitive. This
+            # path preserves sampling semantics; explicit per-request seed
+            # parity remains provided by the native CUDA/HIP kernels.
+            gumbel = -torch.empty_like(processed).exponential_().log()
+            random_sampled = (processed + gumbel).argmax(dim=-1)
+            sampled = torch.where(greedy, greedy_sampled, random_sampled)
+
+        if output_processed_logits is not None:
+            if output_processed_logits_col is None:
+                output_processed_logits.copy_(processed)
+            else:
+                cols = output_processed_logits_col
+                if cols.ndim == 0:
+                    output_processed_logits[req_indices, int(cols.cpu())].copy_(
+                        processed
+                    )
+                else:
+                    output_processed_logits[req_indices, cols.to(torch.int64)].copy_(
+                        processed
+                    )
+        return sampled.to(torch.int64)
+
     BLOCK_SIZE = 1024
     num_blocks = cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)

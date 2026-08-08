@@ -427,6 +427,47 @@ class BuildPrefillChunkMetadataKernel(
         num_reqs: int,
         COMPRESS_RATIO: int,
     ) -> None:
+        if query_start_loc.device.type == "mps":
+            query_locs = query_start_loc.cpu().tolist()
+            uncompressed = uncompressed_seq_lens.cpu().tolist()
+            compressed_locs = cu_compressed_seq_lens.cpu().tolist()
+            row_starts = row_start_cu_compressed_seq_lens.cpu().tolist()
+            for batch_idx in range(num_reqs):
+                query_start = query_locs[batch_idx]
+                query_end = query_locs[batch_idx + 1]
+                query_len = query_end - query_start
+                seq_start = compressed_locs[batch_idx]
+                seq_end = compressed_locs[batch_idx + 1]
+                row_start = row_starts[batch_idx]
+
+                token_to_seq[seq_start:seq_end].fill_(batch_idx)
+                selected_start = max(query_start, query_slice_start)
+                selected_end = min(query_end, query_slice_stop)
+                if selected_start >= selected_end:
+                    continue
+                out_start = selected_start - query_slice_start
+                out_end = selected_end - query_slice_start
+                offsets = torch.arange(
+                    selected_start - query_start,
+                    selected_end - query_start,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                global_context = uncompressed[batch_idx] - query_len + 1 + offsets
+                local_lens = global_context // COMPRESS_RATIO
+                if DCP_WORLD > 1:
+                    base = (local_lens // DCP_INTERLEAVE // DCP_WORLD) * DCP_INTERLEAVE
+                    remainder = local_lens - base * DCP_WORLD
+                    remainder = torch.clamp(
+                        remainder - DCP_RANK * DCP_INTERLEAVE,
+                        min=0,
+                        max=DCP_INTERLEAVE,
+                    )
+                    local_lens = base + remainder
+                cu_compressed_seq_len_ks[out_start:out_end].fill_(row_start)
+                cu_compressed_seq_len_ke[out_start:out_end] = row_start + local_lens
+            return
+
         if _use_native_indexer_metadata():
             # Native CUDA equivalent; verified bit-identical to the Triton
             # kernel below across compression ratios, query slices and DCP
@@ -726,7 +767,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if min_decode_len == max_decode_len:
                 # Uniform decode lengths.
                 num_decode_tokens = num_decodes * max_decode_len
-                if _use_native_uniform_decode():
+                if seq_lens.device.type == "mps":
+                    token_indices = self.arange_buffer[:num_decode_tokens]
+                    req_indices = token_indices // max_decode_len
+                    local_indices = token_indices % max_decode_len
+                    self.decode_seq_lens_buffer[:num_decode_tokens] = (
+                        seq_lens[req_indices.to(torch.int64)]
+                        - max_decode_len
+                        + local_indices
+                        + 1
+                    )
+                    self.expanded_block_table_buffer[:num_decode_tokens].copy_(
+                        block_table.index_select(0, req_indices.to(torch.int64))
+                    )
+                    self.decode_lens_buffer[:num_decode_tokens].fill_(1)
+                elif _use_native_uniform_decode():
                     from vllm.quixicore import quixicore_ops
 
                     quixicore_ops.prepare_uniform_decode(

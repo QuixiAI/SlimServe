@@ -120,6 +120,7 @@ class KVBlockZeroer:
         """
         self.device = device
         self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+        self._metal_segments: list[tuple[torch.Tensor, int, int]] = []
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
@@ -139,9 +140,7 @@ class KVBlockZeroer:
                 kernel_bs,
                 spec.num_kv_heads,
                 spec.head_size,
-                cache_dtype_str=(
-                    getattr(spec, "tq_cache_dtype", "") or cache_dtype
-                ),
+                cache_dtype_str=(getattr(spec, "tq_cache_dtype", "") or cache_dtype),
             )
 
             for layer_name in group.layer_names:
@@ -154,6 +153,10 @@ class KVBlockZeroer:
                 if dp in seen_ptrs:
                     continue
                 seen_ptrs.add(dp)
+
+                if current_platform.is_metal():
+                    self._metal_segments.append((kv, block_dim, ratio))
+                    continue
 
                 el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
@@ -192,6 +195,11 @@ class KVBlockZeroer:
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
+        if current_platform.is_metal():
+            for kv, block_dim, ratio in self._metal_segments:
+                for block_id in block_ids:
+                    kv.narrow(block_dim, block_id * ratio, ratio).zero_()
+            return
         if not block_ids or self._meta is None:
             return
         seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
@@ -491,6 +499,7 @@ def bind_kv_cache(
             # in the same decoder block.
             if (
                 current_platform.is_cuda_alike()
+                or current_platform.is_metal()
                 or current_platform.is_xpu()
                 or current_platform.is_cpu()
             ):

@@ -62,6 +62,9 @@ def async_copy_to_gpu(
         assert device is not None
         out = torch.empty_like(x, device=device)
 
+    if out.device.type == "mps":
+        return out.copy_(x)
+
     # pin_memory() is no-op if the memory is already pinned.
     pinned = x.pin_memory()
     return out.copy_(pinned, non_blocking=True)
@@ -69,11 +72,19 @@ def async_copy_to_gpu(
 
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
-        if not is_uva_available():
+        from vllm.platforms import current_platform
+
+        self.is_metal = current_platform.device_type == "mps"
+        if not self.is_metal and not is_uva_available():
             raise RuntimeError("UVA is not available")
-        self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
+        self.cpu = torch.zeros(
+            size, dtype=dtype, device="cpu", pin_memory=not self.is_metal
+        )
         self.np = self.cpu.numpy()
-        self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
+        if self.is_metal:
+            self.uva = torch.zeros(size, dtype=dtype, device="mps")
+        else:
+            self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
 
 
 class UvaBufferPool:
@@ -102,6 +113,8 @@ class UvaBufferPool:
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         n = len(x)
         dst[:n] = x
+        if buf.is_metal:
+            buf.uva[:n].copy_(buf.cpu[:n])
         return buf.uva[:n]
 
     def copy_to_gpu(
@@ -202,6 +215,25 @@ class StagedWriteTensor:
         if n == 0:
             return
 
+        if self.device.type == "mps":
+            contents = torch.tensor(
+                self._staged_write_contents, dtype=self.dtype, device=self.device
+            )
+            content_start = 0
+            for index, start, content_end in zip(
+                self._staged_write_indices,
+                self._staged_write_starts,
+                self._staged_write_cu_lens,
+            ):
+                values = contents[content_start:content_end]
+                if self.gpu.ndim == 1:
+                    self.gpu[index] = values[0]
+                else:
+                    self.gpu[index, start : start + values.numel()] = values
+                content_start = content_end
+            self.clear_staged_writes()
+            return
+
         indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
@@ -267,6 +299,11 @@ class FusedStagedWriter:
         output_strides: torch.Tensor,
     ) -> None:
         """Apply and clear the staged writes of `tensors` with one kernel."""
+        if self.device.type == "mps":
+            for tensor in tensors:
+                tensor.apply_write()
+            return
+
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []

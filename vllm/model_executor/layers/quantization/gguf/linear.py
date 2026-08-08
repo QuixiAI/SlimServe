@@ -52,7 +52,7 @@ def _mmq_shape_ok(x: torch.Tensor, qweight: torch.Tensor) -> bool:
     """
     if not current_platform.is_metal():
         return True
-    return x.shape[0] % 32 == 0 and qweight.shape[0] % 32 == 0
+    return qweight.shape[0] % 32 == 0
 
 
 def _cublas_min_batch(rows: int) -> int:
@@ -140,11 +140,6 @@ def _fused_mul_mat_gguf(
         y = x @ weight.T
     elif qweight_type in MMQ_QUANT_TYPES and _mmq_shape_ok(x, qweight):
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
-    elif qweight_type in MMVQ_QUANT_TYPES and current_platform.is_metal():
-        # Ragged batch on Metal: the tile kernel cannot take this shape and
-        # there is no dequant fallback, so widen the vector path rather than
-        # failing. Slower than a tile pass, still correct.
-        y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)

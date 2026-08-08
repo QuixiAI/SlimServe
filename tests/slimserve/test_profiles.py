@@ -340,12 +340,25 @@ def test_kimi_is_absent_from_metal_because_no_mac_is_large_enough():
         resolve("k3-6", "metal", 1, None, 512 * GB)
 
 
-def test_metal_profiles_are_flagged_as_not_yet_runnable():
-    """The matrix may describe a configuration before the engine can run it,
-    but it must never let the CLI start one."""
-    assert registry.platform_blocked("metal")
+def test_deepseek_metal_is_runnable_while_glm_stays_gated():
+    assert registry.platform_blocked("metal") is None
+    assert registry.profile_blocked("dsv4-1", "metal") is None
+    assert registry.profile_blocked("glm52-mac", "metal")
     assert registry.platform_blocked("mi300x") is None
     assert registry.platform_blocked("a100") is None
+
+
+def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
+    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
+    assert plan.engine["max_model_len"] == 3072
+    assert plan.engine["max_num_seqs"] == 32
+    assert plan.engine["kv_cache_memory_bytes"] == 1 * GB
+    assert plan.engine["kv_cache_dtype"] == "fp8_ds_mla"
+    speculative = engine_kwargs(plan)["speculative_config"]
+    assert speculative["method"] == "dspark"
+    assert speculative["attention_backend"] == "TURBOQUANT"
+    assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
+    assert speculative["disable_draft_cudagraphs"] is True
 
 
 def test_deepseek_dspark_fetches_the_pinned_0731_drafter():
@@ -361,6 +374,15 @@ def test_deepseek_dspark_fetches_the_pinned_0731_drafter():
         "3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914"
     )
     assert drafter["local_dir"] == "DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF"
+
+
+def test_deepseek_metal_verifier_is_checksum_pinned():
+    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
+    [target] = [entry for entry in files_for(plan) if entry["role"] == "model"]
+    assert target["bytes"] == 86720111488
+    assert target["sha256"] == (
+        "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0"
+    )
 
 
 def test_deepseek_profiles_cover_all_supported_tensor_parallel_sizes():

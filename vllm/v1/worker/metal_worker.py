@@ -9,13 +9,14 @@ Weight loading, ``execute_model`` and the KV plumbing are inherited.
 
 import gc
 from contextlib import AbstractContextManager, nullcontext
+from typing import Any, cast
 
 import torch
 
 from vllm.config import set_current_vllm_config
 from vllm.distributed import (
-    get_tp_group,
     ensure_model_parallel_initialized,
+    get_tp_group,
     init_distributed_environment,
 )
 from vllm.logger import init_logger
@@ -58,15 +59,20 @@ class MetalWorker(Worker):
 
         # No CUDA MemorySnapshot: determine_available_memory() budgets from
         # unified-memory totals instead.
-        self.init_snapshot = None
-        self.requested_memory = None
+        self.init_snapshot = None  # type: ignore[assignment]
+        self.requested_memory = None  # type: ignore[assignment]
 
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        from vllm.v1.worker.metal_model_runner import MetalModelRunner
+        if self.use_v2_model_runner:
+            from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-        self.model_runner = MetalModelRunner(self.vllm_config, self.device)
+            self.model_runner = cast(Any, GPUModelRunner(self.vllm_config, self.device))
+        else:
+            from vllm.v1.worker.metal_model_runner import MetalModelRunner
+
+            self.model_runner = MetalModelRunner(self.vllm_config, self.device)
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         # No CuMem sleep-mode allocator; weights load straight into the
@@ -110,11 +116,14 @@ class MetalWorker(Worker):
         import vllm.v1.worker.gpu_worker as gpu_worker
 
         original = gpu_worker.kernel_warmup
+        original_v2 = gpu_worker.warmup_kernels
         gpu_worker.kernel_warmup = lambda worker: None
+        gpu_worker.warmup_kernels = lambda *args, **kwargs: None
         try:
             return super().compile_or_warm_up_model()
         finally:
             gpu_worker.kernel_warmup = original
+            gpu_worker.warmup_kernels = original_v2
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -124,6 +133,14 @@ class MetalWorker(Worker):
         activations all come out of one pool. Run the profile pass for shape
         warmup, then budget against what Metal will let the GPU hold.
         """
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            logger.info(
+                "Using %.2f GiB fixed Metal KV-cache budget; skipping the "
+                "memory-profiling dummy forward",
+                kv_cache_memory_bytes / 2**30,
+            )
+            return kv_cache_memory_bytes
+
         self.model_runner.profile_run()
 
         total = current_platform.get_device_total_memory()

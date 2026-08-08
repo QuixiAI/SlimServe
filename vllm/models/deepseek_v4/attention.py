@@ -47,6 +47,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -407,6 +408,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             compressor = self.compressor
 
             def compressor_kv_score() -> torch.Tensor:
+                if current_platform.is_metal():
+                    return torch.mm(
+                        hidden_states, compressor.fused_wkv_wgate.weight.T
+                    ).float()
                 return torch.mm(
                     hidden_states,
                     compressor.fused_wkv_wgate.weight.T,
@@ -424,6 +429,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 return weights
 
             def indexer_compressor_kv_score() -> torch.Tensor:
+                if current_platform.is_metal():
+                    return torch.mm(
+                        hidden_states,
+                        indexer.compressor.fused_wkv_wgate.weight.T,
+                    ).float()
                 return torch.mm(
                     hidden_states,
                     indexer.compressor.fused_wkv_wgate.weight.T,
@@ -813,21 +823,39 @@ class DeepseekV4Indexer(nn.Module):
             if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
-                compressor(compressed_kv_score, positions, rotary_emb)
+                if not current_platform.is_metal():
+                    compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
                     + indexer_metadata.num_prefill_tokens
                 )
                 if num_tokens > 0:
-                    _fill_short_context_topk_indices[(num_tokens,)](
-                        self.topk_indices_buffer,
-                        positions,
-                        TOP_K=self.topk_tokens,
-                        COMPRESS_RATIO=self.compress_ratio,
-                        PADDED_TOP_K=triton.next_power_of_2(self.topk_tokens),
-                        num_warps=8,
-                    )
+                    if current_platform.is_metal():
+                        offsets = torch.arange(
+                            self.topk_tokens,
+                            device=positions.device,
+                            dtype=torch.int32,
+                        )
+                        lengths = torch.div(
+                            positions[:num_tokens] + 1,
+                            self.compress_ratio,
+                            rounding_mode="floor",
+                        ).to(torch.int32)
+                        self.topk_indices_buffer[:num_tokens] = torch.where(
+                            offsets.unsqueeze(0) < lengths.unsqueeze(1),
+                            offsets.unsqueeze(0),
+                            -1,
+                        )
+                    else:
+                        _fill_short_context_topk_indices[(num_tokens,)](
+                            self.topk_indices_buffer,
+                            positions,
+                            TOP_K=self.topk_tokens,
+                            COMPRESS_RATIO=self.compress_ratio,
+                            PADDED_TOP_K=triton.next_power_of_2(self.topk_tokens),
+                            num_warps=8,
+                        )
                 return self.topk_indices_buffer
 
         def wq_b_and_q_quant():

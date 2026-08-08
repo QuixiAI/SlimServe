@@ -9,11 +9,11 @@ namespace mittens {
 // 32/(block_k/8) blocks per iteration). The span keeps the block-scale reads CSE-able, kills
 // the per-element div/mod of the old strided walk, and lets X load as half4. This is the
 // memory-bound decode path where shrinking the weight bytes (4-8x) is the real Apple win.
-template<typename FMT>
+template<typename FMT, typename T>
 kernel void qgemv(
-    device   half*  D  [[buffer(0)]],   // (N, 1) output
+    device   T*     D  [[buffer(0)]],   // (N, 1) output
     device   uchar* Wq [[buffer(1)]],   // (N, K/block_k) packed weight blocks
-    device   half*  X  [[buffer(2)]],   // (K, 1) activation vector
+    device   T*     X  [[buffer(2)]],   // (K, 1) activation vector
     const constant int &N [[buffer(3)]],
     const constant int &K [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -31,17 +31,64 @@ kernel void qgemv(
     float acc = 0.0f;
     for (int kb = b_off; kb < bpr; kb += BPI) {
         device const uchar* base = row_base + (uint)kb * FMT::block_bytes;
-        device const half4* xv = (device const half4*)(X + kb * FMT::block_k + col0);
-        const half4 x0 = xv[0], x1 = xv[1];
+        const int x_base = kb * FMT::block_k + col0;
         half w[8];
         tk_dequant8<FMT>(base, col0, w);
         #pragma clang loop unroll(full)
-        for (int i = 0; i < 4; ++i) acc += float(w[i]) * float(x0[i]);
-        #pragma clang loop unroll(full)
-        for (int i = 0; i < 4; ++i) acc += float(w[4 + i]) * float(x1[i]);
+        for (int i = 0; i < 8; ++i) acc += float(w[i]) * float(X[x_base + i]);
     }
     acc = metal::simd_sum(acc);                      // reduce the dot across the 32 lanes
-    if (lane == 0) D[row] = half(acc);
+    if (lane == 0) D[row] = T(acc);
+}
+
+// Device-selected grouped GEMV for GGUF MoE weights. One dispatch consumes
+// the complete routing table and avoids synchronizing every expert id back to
+// the host. Wq is [experts, N, packed-K], X is [tokens, K], and D is emitted
+// in flat [token, route, N] order for the following activation/down pass.
+template<typename FMT, typename T>
+kernel void qgemv_moe(
+    device T *D [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device const T *X [[buffer(2)]],
+    device const int *topk_ids [[buffer(3)]],
+    constant int &N [[buffer(4)]],
+    constant int &K [[buffer(5)]],
+    constant int &topk [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int row = int(tgid.x);
+    const int route = int(tgid.y);
+    const int token = route / topk;
+    const int expert = topk_ids[route];
+    if (expert < 0) {
+        if (lane == 0) D[(long)route * N + row] = T(0);
+        return;
+    }
+
+    const int bpr = K / FMT::block_k;
+    device const uchar *row_base =
+        Wq + ((long)expert * N + row) * bpr * FMT::block_bytes;
+    device const T *x = X + (long)token * K;
+    constexpr int CPL = 8;
+    constexpr int LPB = FMT::block_k / CPL;
+    constexpr int BPI = 32 / LPB;
+    const int b_off = int(lane) / LPB;
+    const int col0 = (int(lane) % LPB) * CPL;
+
+    float acc = 0.0f;
+    for (int kb = b_off; kb < bpr; kb += BPI) {
+        device const uchar *base =
+            row_base + (long)kb * FMT::block_bytes;
+        const int x_base = kb * FMT::block_k + col0;
+        half w[8];
+        tk_dequant8<FMT>(base, col0, w);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            acc += float(w[i]) * float(x[x_base + i]);
+        }
+    }
+    acc = metal::simd_sum(acc);
+    if (lane == 0) D[(long)route * N + row] = T(acc);
 }
 
 [[host_name("qgemv_q8_0")]]
@@ -262,12 +309,22 @@ kernel void qgemv_q6_K_float32(
     if (lane == 0) D[row] = sum;
 }
 
-#define instantiate_qgemv(name, FMT)                                          \
+#define instantiate_qgemv(name, FMT, T)                                       \
    template [[host_name(name)]] [[kernel]]                                    \
-   void qgemv<FMT>(                                                           \
-     device half* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device half* X [[buffer(2)]], \
+   void qgemv<FMT, T>(                                                        \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device T* X [[buffer(2)]], \
      const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
      uint3 tgid [[threadgroup_position_in_grid]],                            \
+     uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_qgemv_moe(name, FMT, T)                                  \
+   template [[host_name(name)]] [[kernel]]                                   \
+   void qgemv_moe<FMT, T>(                                                   \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const int* topk_ids [[buffer(3)]], \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]], \
+     const constant int &topk [[buffer(6)]],                                  \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
      uint lane [[thread_index_in_simdgroup]]);
 
 // Full-weight dequant to fp16: packed (N, K/bk, bytes) -> W (N, K) half. Flat, one thread per
@@ -316,33 +373,48 @@ instantiate_qdequant("qdequant_iq3_xxs", iq3_xxs);
 instantiate_qdequant("qdequant_iq1_s", iq1_s);
 instantiate_qdequant("qdequant_tq2_0", tq2_0);
 
-instantiate_qgemv("qgemv_q8_0_small", q8_0);
-instantiate_qgemv("qgemv_q4_0_small", q4_0);
-instantiate_qgemv("qgemv_q4_K", q4_K);
-instantiate_qgemv("qgemv_kU4B8", kU4B8);
-instantiate_qgemv("qgemv_kU4", kU4);
-instantiate_qgemv("qgemv_fp8_e4m3", fp8_e4m3);
-instantiate_qgemv("qgemv_fp4_e2m1", fp4_e2m1);
-instantiate_qgemv("qgemv_nvfp4", nvfp4);
-instantiate_qgemv("qgemv_bitnet", bitnet);
-instantiate_qgemv("qgemv_tq2_0", tq2_0);
-instantiate_qgemv("qgemv_iq4_nl", iq4_nl);
-instantiate_qgemv("qgemv_iq4_xs", iq4_xs);
-instantiate_qgemv("qgemv_iq2_xxs", iq2_xxs);
-instantiate_qgemv("qgemv_iq2_xs", iq2_xs);
-instantiate_qgemv("qgemv_iq3_xxs", iq3_xxs);
-instantiate_qgemv("qgemv_iq1_s", iq1_s);
-instantiate_qgemv("qgemv_q4_1", q4_1);
-instantiate_qgemv("qgemv_q5_0", q5_0);
-instantiate_qgemv("qgemv_q5_1", q5_1);
-instantiate_qgemv("qgemv_q2_K", q2_K);
-instantiate_qgemv("qgemv_q3_K", q3_K);
-instantiate_qgemv("qgemv_q5_K", q5_K);
-instantiate_qgemv("qgemv_q6_K", q6_K);
-instantiate_qgemv("qgemv_e5m2", e5m2);
-instantiate_qgemv("qgemv_fp8_block", fp8_block);
-instantiate_qgemv("qgemv_mxfp6_e3m2", mxfp6_e3m2);
-instantiate_qgemv("qgemv_mxfp6_e2m3", mxfp6_e2m3);
-instantiate_qgemv("qgemv_hqq", hqq);
+#define instantiate_qgemv_format(name, FMT)                                  \
+    instantiate_qgemv(name, FMT, half);                                      \
+    instantiate_qgemv(name "_bfloat16", FMT, bf16);                         \
+    instantiate_qgemv_moe(name "_moe", FMT, half);                          \
+    instantiate_qgemv_moe(name "_moe_bfloat16", FMT, bf16);
+
+// q8_0/q4_0 retain their specialized half decode kernels. BF16 and MoE use
+// the generic typed implementation, whose names do not collide with them.
+instantiate_qgemv("qgemv_q8_0_bfloat16", q8_0, bf16);
+instantiate_qgemv("qgemv_q4_0_bfloat16", q4_0, bf16);
+instantiate_qgemv_moe("qgemv_q8_0_moe", q8_0, half);
+instantiate_qgemv_moe("qgemv_q8_0_moe_bfloat16", q8_0, bf16);
+instantiate_qgemv_moe("qgemv_q4_0_moe", q4_0, half);
+instantiate_qgemv_moe("qgemv_q4_0_moe_bfloat16", q4_0, bf16);
+instantiate_qgemv("qgemv_q8_0_small", q8_0, half);
+instantiate_qgemv("qgemv_q4_0_small", q4_0, half);
+
+instantiate_qgemv_format("qgemv_q4_K", q4_K);
+instantiate_qgemv_format("qgemv_kU4B8", kU4B8);
+instantiate_qgemv_format("qgemv_kU4", kU4);
+instantiate_qgemv_format("qgemv_fp8_e4m3", fp8_e4m3);
+instantiate_qgemv_format("qgemv_fp4_e2m1", fp4_e2m1);
+instantiate_qgemv_format("qgemv_nvfp4", nvfp4);
+instantiate_qgemv_format("qgemv_bitnet", bitnet);
+instantiate_qgemv_format("qgemv_tq2_0", tq2_0);
+instantiate_qgemv_format("qgemv_iq4_nl", iq4_nl);
+instantiate_qgemv_format("qgemv_iq4_xs", iq4_xs);
+instantiate_qgemv_format("qgemv_iq2_xxs", iq2_xxs);
+instantiate_qgemv_format("qgemv_iq2_xs", iq2_xs);
+instantiate_qgemv_format("qgemv_iq3_xxs", iq3_xxs);
+instantiate_qgemv_format("qgemv_iq1_s", iq1_s);
+instantiate_qgemv_format("qgemv_q4_1", q4_1);
+instantiate_qgemv_format("qgemv_q5_0", q5_0);
+instantiate_qgemv_format("qgemv_q5_1", q5_1);
+instantiate_qgemv_format("qgemv_q2_K", q2_K);
+instantiate_qgemv_format("qgemv_q3_K", q3_K);
+instantiate_qgemv_format("qgemv_q5_K", q5_K);
+instantiate_qgemv_format("qgemv_q6_K", q6_K);
+instantiate_qgemv_format("qgemv_e5m2", e5m2);
+instantiate_qgemv_format("qgemv_fp8_block", fp8_block);
+instantiate_qgemv_format("qgemv_mxfp6_e3m2", mxfp6_e3m2);
+instantiate_qgemv_format("qgemv_mxfp6_e2m3", mxfp6_e2m3);
+instantiate_qgemv_format("qgemv_hqq", hqq);
 
 }

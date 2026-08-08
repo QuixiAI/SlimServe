@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Apple Metal implementation boundary for DeepSeek-V4 sparse MLA."""
 
+from typing import Any, cast
+
 import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.sparse_mla import DeepseekV4FlashMLABackend
+from vllm.quixicore.ops import quixicore_ops
+from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 
 class DeepseekV4MetalSparseBackend(DeepseekV4FlashMLABackend):
@@ -16,13 +20,7 @@ class DeepseekV4MetalSparseBackend(DeepseekV4FlashMLABackend):
 
 
 class DeepseekV4MetalAttention(DeepseekV4Attention):
-    """DeepSeek-V4 attention hosted by QuixiCore-Metal kernels.
-
-    Model construction is deliberately separated from the sparse-attention
-    kernel implementation so Metal never falls through to CUDA.  The forward
-    methods remain explicit failure boundaries until the packed DSV4 cache
-    kernels are connected.
-    """
+    """DeepSeek-V4 attention hosted by QuixiCore-Metal kernels."""
 
     backend_cls = DeepseekV4MetalSparseBackend
 
@@ -44,9 +42,19 @@ class DeepseekV4MetalAttention(DeepseekV4Attention):
     def _fused_qnorm_rope_kv_insert(self, q, kv, positions, attn_metadata):
         if not isinstance(attn_metadata, dict):
             return q
-        raise NotImplementedError(
-            "DeepSeek-V4 Q/KV normalization, RoPE, and cache insertion "
-            "are not connected to QuixiCore-Metal yet."
+        swa_metadata = cast(
+            DeepseekSparseSWAMetadata,
+            attn_metadata[self.swa_cache_layer.prefix],
+        )
+        return quixicore_ops.deepseek_v4_qnorm_rope_kv_insert(
+            q.contiguous(),
+            kv.contiguous(),
+            self.swa_cache_layer.kv_cache,
+            swa_metadata.slot_mapping,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.eps,
+            swa_metadata.block_size,
         )
 
     def forward(
@@ -67,9 +75,7 @@ class DeepseekV4MetalAttention(DeepseekV4Attention):
         # The DSV4 A projection is eight independent matrices.  GGUF stores
         # them as consecutive row groups; apply each group to its matching
         # attention heads, then feed the concatenated low-rank result to WO_B.
-        o_ref, _ = self.rotary_emb.forward_native(
-            positions, o, key=None, inverse=True
-        )
+        o_ref, _ = self.rotary_emb.forward_native(positions, o, key=None, inverse=True)  # type: ignore[call-arg]
         grouped = o_ref.reshape(o.shape[0], self.n_local_groups, -1)
 
         if hasattr(self.wo_a, "qweight"):
@@ -108,7 +114,99 @@ class DeepseekV4MetalAttention(DeepseekV4Attention):
         if get_forward_context().attn_metadata is None:
             output.zero_()
             return
-        raise NotImplementedError(
-            "DeepSeek-V4 two-cache sparse MLA is not connected to "
-            "QuixiCore-Metal yet."
+        metadata = get_forward_context().attn_metadata
+        assert isinstance(metadata, dict)
+        swa_metadata = cast(
+            DeepseekSparseSWAMetadata,
+            metadata[self.swa_cache_layer.prefix],
         )
+        layer_metadata = cast(Any, metadata.get(self.prefix))
+        num_tokens = q.shape[0]
+        token_to_req_indices = swa_metadata.token_to_req_indices
+        valid_token = swa_metadata.is_valid_token
+        assert token_to_req_indices is not None and valid_token is not None
+        req_ids = token_to_req_indices[:num_tokens].to(torch.long)
+        valid_tokens = valid_token[:num_tokens]
+
+        swa_width = self.window_size
+        swa_offsets = torch.arange(swa_width, device=q.device, dtype=positions.dtype)
+        swa_lens = torch.minimum(
+            positions + 1,
+            positions.new_full(positions.shape, swa_width),
+        )
+        swa_start = positions + 1 - swa_lens
+        swa_pos = swa_start.unsqueeze(1) + swa_offsets.unsqueeze(0)
+        swa_valid = swa_offsets.unsqueeze(0) < swa_lens.unsqueeze(1)
+        swa_blocks = swa_metadata.block_table.index_select(0, req_ids)
+        swa_block_col = torch.div(
+            swa_pos, swa_metadata.block_size, rounding_mode="floor"
+        ).clamp(min=0, max=swa_blocks.shape[1] - 1)
+        swa_block = swa_blocks.gather(1, swa_block_col.to(torch.long))
+        swa_slots = swa_block * swa_metadata.block_size + torch.remainder(
+            swa_pos, swa_metadata.block_size
+        )
+        swa_slots = torch.where(swa_valid, swa_slots, -1).to(torch.int32)
+        swa_lens = torch.where(valid_tokens, swa_lens, 0).to(torch.int32)
+
+        if self.compress_ratio > 1:
+            assert layer_metadata is not None
+            assert self.topk_indices_buffer is not None
+            compressed_width = min(
+                self.topk_indices_buffer.shape[1],
+                (self.max_model_len + self.compress_ratio - 1) // self.compress_ratio,
+            )
+            compressed_offsets = torch.arange(
+                compressed_width, device=q.device, dtype=positions.dtype
+            )
+            compressed_lens = torch.minimum(
+                torch.div(
+                    positions + 1,
+                    self.compress_ratio,
+                    rounding_mode="floor",
+                ),
+                positions.new_full(positions.shape, compressed_width),
+            )
+            compressed_valid = compressed_offsets.unsqueeze(
+                0
+            ) < compressed_lens.unsqueeze(1)
+            compressed_blocks = layer_metadata.block_table.index_select(0, req_ids)
+            storage_block_size = layer_metadata.block_size // self.compress_ratio
+            compressed_block_col = torch.div(
+                compressed_offsets,
+                storage_block_size,
+                rounding_mode="floor",
+            ).clamp(max=compressed_blocks.shape[1] - 1)
+            compressed_block = compressed_blocks.gather(
+                1, compressed_block_col.unsqueeze(0).expand(num_tokens, -1)
+            )
+            compressed_slots = compressed_block * storage_block_size + torch.remainder(
+                compressed_offsets, storage_block_size
+            )
+            compressed_slots = torch.where(compressed_valid, compressed_slots, -1).to(
+                torch.int32
+            )
+            compressed_lens = torch.where(valid_tokens, compressed_lens, 0).to(
+                torch.int32
+            )
+            compressed_cache = self.kv_cache
+        else:
+            compressed_slots = torch.full(
+                (num_tokens, 1), -1, dtype=torch.int32, device=q.device
+            )
+            compressed_lens = torch.zeros(
+                num_tokens, dtype=torch.int32, device=q.device
+            )
+            compressed_cache = self.swa_cache_layer.kv_cache
+
+        result = quixicore_ops.deepseek_v4_sparse_attention(
+            q.contiguous(),
+            compressed_cache,
+            compressed_slots.contiguous(),
+            compressed_lens.contiguous(),
+            self.swa_cache_layer.kv_cache,
+            swa_slots.contiguous(),
+            swa_lens.contiguous(),
+            self.attn_sink,
+            self.scale,
+        )
+        output.copy_(result)

@@ -7,20 +7,29 @@ material wins.
 
 ## Fixed workload
 
-- Host: Apple M5 Max, 128 GiB unified memory, macOS 26.5.2.
-- Target: the local 97,591,747,456-byte DeepSeek V4 Flash 0731 hybrid GGUF.
+- Host: Apple M5 Max (40-core GPU, Metal 4), 128 GiB unified memory,
+  macOS 26.5.2 (25F84).
+- Power: AC, battery fully charged, with no macOS thermal or performance
+  warning recorded before the sweep.
+- Target: the 86,720,111,488-byte DeepSeek V4 Flash 0731 IQ2XXS-w2Q2K GGUF,
+  SHA-256
+  `ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`.
+- Draft: the pinned 6,971,243,008-byte 0731 DSpark Q2_K/Q8_0 GGUF, SHA-256
+  `3e2be643b7881ac61e49c9907a963bdbbfcffe89c4d15c5f0e99e827e0305914`.
+- Draft attention: TurboQuant with a `turboquant_k8v4` KV cache.
 - Prompt source: natural text from `perf.md`, with distinct windows for each
   concurrent request.
 - Request: exactly 1,000 API input tokens and 2,000 generated tokens.
 - Sampling: greedy (`temperature=0`), `ignore_eos=true`.
-- Thinking: enabled through the model's default DeepSeek completion template.
-- Concurrency: measured separately at 1 and 8.
+- API surface: raw OpenAI completions, with no chat wrapper or template tokens.
+- Concurrency: measured separately at 1, 4, 8, 16, and 32.
 - Correctness gate: every API response must report the exact requested input
   and output token counts. The harness exits nonzero otherwise.
 
-The completion adapter adds nine template tokens. The harness therefore builds
-991-token raw prompts (`--prompt-overhead 9`) and validates that the server
-reports exactly 1,000 input tokens.
+The vLLM completion endpoint adds no template tokens. The harness builds raw
+1,000-token prompts and validates that the server reports exactly 1,000 input
+tokens. The historical DS4 measurements below used that adapter's old
+nine-token adjustment.
 
 ## Harness
 
@@ -34,26 +43,59 @@ Canonical invocation:
 .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
   --model "$MODEL" \
   --source ~/QuixiCore/QuixiCore-Metal/perf/perf.md \
-  --url http://127.0.0.1:18080/v1/completions \
-  --concurrency 8 \
+  --served-model-name DeepSeek-V4-Flash \
+  --url http://192.168.86.162:18080/v1/completions \
+  --concurrency 32 \
+  --prompt-offset 32 \
   --input-tokens 1000 \
-  --output-tokens 2000 \
-  --prompt-overhead 9
+  --output-tokens 2000
 ```
+
+The five matrix rows use prompt offsets 1, 4, 8, 16, and 32 respectively.
+This prevents prefix-cached prompts from an earlier row from making a later
+row's prefill artificially faster while retaining the supported profile's
+real prefix-cache setting.
 
 ## Engine selection
 
-The in-tree vLLM Metal port can load the model, but its copied MPS residency is
-96.77 GiB before KV/cache overhead. Profiling a single token drove system swap
-from about 12 GiB to about 29 GiB and stalled in per-expert MoE execution. It
-also still lacks the real two-cache sparse MLA path required by this model.
+The measured engine is the in-tree vLLM Metal worker. The target uses the
+QuixiCore packed sparse-MLA kernels and hybrid cache planner; the DSpark draft
+uses the native TurboQuant encode/decode kernels. The profile fixes a 1 GiB KV
+budget, a 3,072-token request ceiling, and `max_num_seqs=32`.
 
-The DS4 Metal backend maps the same local GGUF without copying the weights and
-plans 91.18 GiB total at a 3,008-token context (90.88 GiB model, 0.28 GiB KV,
-0.02 GiB other buffers). It already implements the DeepSeek V4 sparse attention
-and routed-expert kernels, so it is the viable Metal backend for SlimServe.
+The older DS4 experiment below remains useful as a pre-restoration baseline,
+but it did not run the required DSpark drafter or TurboQuant cache and is not
+part of the current matrix.
 
-## Baselines
+## vLLM Metal restoration
+
+The restored path was gated by runtime contracts rather than absent Metal
+capability. The retained fixes cover:
+
+- layer-interleaved TurboQuant cache strides and k8v4 encode/attention;
+- packed sparse MLA with simultaneous compressed and sliding-window caches;
+- FP32 compressor-state storage and the compressed-cache write path;
+- hybrid target/draft cache allocation, including padded draft pages;
+- GGUF i-quant/k-quant GEMV, padded batched GEMM, and device-selected experts;
+- V2 runner input, block-table, sampling, and rejection fallbacks for MPS.
+
+The end-to-end correctness screen loaded the matching target and drafter,
+returned HTTP 200, and recorded one speculative round with five DSpark draft
+tokens. That exercises TurboQuant cache update/attention, target verification,
+and the Metal rejection sampler; it is not inferred from configuration flags.
+A direct device test also encoded and attended over both compact and
+hybrid-strided `k8v4` pages; the cache rows and attention outputs matched
+bit-for-bit with the real layer stride `(3456, 108, 108, 1)`. Against
+uncompressed 32-token attention, the actual signed-k8/value-4 path measured
+0.01650 mean absolute error and 0.99621 cosine similarity.
+
+For the target's actual IQ2_XXS gate/up weights, grouped device-selected GEMV
+beat the padded per-expert GEMM alternative from 16 through 256 input rows. At
+16 rows the pair measured 1.74 ms versus 57.6 ms; at 256 rows it measured
+12.64 ms versus 80.8 ms. The grouped vector path was retained for every Metal
+batch width.
+
+## Historical DS4 baselines
 
 ### Concurrency 1
 
@@ -215,7 +257,7 @@ Three exact 8 x (1,000 input / 300 output) screens used the retained kernels
 and 2,048-token mixed prefill quantum:
 
 | Variant | Aggregate tok/s | Wall seconds | Versus control |
-|---|---:|---:|---:|
+| --- | ---: | ---: | ---: |
 | Control | 30.7858 | 77.9581 | -- |
 | Extend tiny pair/SwiGLU from <=5 to 8 rows | 28.6159 | 83.8694 | -7.05% |
 | Extend direct down-sum from <=4 to 8 rows | 29.0222 | 82.6955 | -5.73% |
@@ -305,7 +347,7 @@ groups and two output rows per dispatch. Every alternate SIMD-group count was
 slower in isolated screens:
 
 | SIMD groups | Aggregate tok/s | Versus control |
-|---:|---:|---:|
+| ---: | ---: | ---: |
 | 1 | 26.998 | -2.61% |
 | 2 | 27.300 | -1.52% |
 | 3 | 27.464 | -0.93% |
@@ -329,7 +371,7 @@ tok/s. Alternate split sizes all reproduced the control completion SHA-256
 `88723fce4fa516f512681306b296d86824515435b72abe3d289f286fd15f9ea3`:
 
 | Layers per command buffer | Aggregate tok/s | Versus control |
-|---:|---:|---:|
+| ---: | ---: | ---: |
 | 0 (single buffer) | 27.140 | -2.10% |
 | 1 | 27.511 | -0.76% |
 | 2 | 27.785 | +0.23% |
@@ -351,7 +393,7 @@ Metal fast-path flags on the exact 1 x (1,000 input / 300 output) screen. Every
 candidate reproduced the control completion digest, but none cleared noise:
 
 | Candidate | Aggregate tok/s |
-|---|---:|
+| --- | ---: |
 | Compressor APE-add fusion | 27.591 |
 | Ratio-4 compressor pack fusion | 27.553 |
 | Ratio-4 direct pool | 27.585 |
@@ -428,7 +470,7 @@ these controls decoded at about 13.5 tok/s), not replacements for the clean
 headline numbers.
 
 | IQ2 rows | Q2 rows | Mean aggregate tok/s | Versus paired control |
-|---:|---:|---:|---:|
+| ---: | ---: | ---: | ---: |
 | 4 | 4 | 6.132 | -- |
 | 8 | 8 | 6.054 | -1.27% |
 | 2 | 2 | 5.971 | -2.63% |
@@ -443,13 +485,9 @@ reverted. The active fused path remains pair-projection + SwiGLU followed by the
 direct six-expert Q2 down-sum; there is no remaining decomposed launch to remove
 without changing the cross-threadgroup dependency.
 
-## Constraints
+## Historical constraints
 
-- No additional target models or DSpark drafters may be downloaded.
-- The previously downloaded target is the only model used here.
-- DSpark cannot be benchmarked until its already-approved local drafter exists.
-  This work does not relabel DS4's built-in MTP mechanism as DSpark.
-- TurboQuant/DSpark profile policy is tracked separately from these kernel
-  measurements. Every SlimServe profile now emits DSpark with TurboQuant and
-  names a blessed download URL, but this benchmark did not fetch or run those
-  auxiliary weights.
+The DS4 experiments above predated the local drafter and therefore did not
+claim DSpark or TurboQuant results. The current vLLM matrix supersedes those
+constraints: it uses the pinned local DSpark artifact and verifies the active
+TurboQuant backend before recording throughput.
