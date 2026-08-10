@@ -229,6 +229,18 @@ in `perf/baseline_status.md`):
      test-discipline ports (oracle-from-stored-codes, memcmp cache
      contracts, bit-equal RoPE tails, worst_excess<=0); gate-768 e2e pair
      on the next qualification pass.
+   - MXFP4 SoA repack + cp.async tile staging: the tile/seg loaders read
+     raw unaligned 17-byte AoS; the byte-neutral repack is wired
+     (ggml_dsv4_repack_mxfp4, REPACKED templates exist in every wide
+     consumer now) but load-time enablement + flag threading through
+     ggml_moe_a8 case 39 / the seg op is not. Expected 10-30% on the
+     tile kernels; microbench before e2e.
+   - Q4_K kernel family for A100 (the (12,12) pair): one effort, two
+     beneficiaries -- accelerates q4ktail's 6 tail layers AND unlocks a
+     dsv4-q4k-8 a100 quality tier (expected ~10-15% under MXFP4 speed at
+     better quality). Quality can be evaluated today unoptimized via
+     `dsv4-mxfp4-4 --quant Q4_K`. Verify-width tile routing for MXFP4
+     was measured and REJECTED (fused GEMV wins below ~72 tokens).
    - Cross-platform contract watch (XPU-side bugs, do not port): XPU
      mqa_logits folds kv_scale inside the relu (our indexer_paged_logits
      placement is authoritative); XPU turboquant v2 rotated-key centroids
