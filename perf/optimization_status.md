@@ -1457,6 +1457,25 @@ decision, and raw artifact locations.
 - Raw: `perf/results/2026-08-10/dsv4-q4ktail-iq2seg/`, bench script in
   session scratchpad `bench_iq2_seg.py`.
 
+## 2026-08-10 - MXFP4 verify-width tile routing: REJECTED with data
+
+- Hypothesis: at c8 verify widths (48 tokens) the fused per-route GEMV
+  re-reads expert weights once per route, and MXFP4's rows are ~1.7x
+  IQ2's, so the segmented tiles should win there and the fused row gate
+  (VLLM_GGUF_DSV4_MXFP4_ROWS=64) should drop.
+- Measurement (per-layer op pair, A100 TP4 shapes, ms):
+  8: 0.38/0.80, 16: 0.71/1.24, 32: 1.36/1.98, 48: 2.03/2.55,
+  64: 2.69/2.94 (fused/seg). The fused GEMV wins at every verify width;
+  extrapolated crossover ~72 tokens. The shared-activation per-route
+  pattern plus zero padding beats the tile's fixed costs below ~70
+  tokens even at MXFP4 byte weights.
+- Decision: gate stays at 64 (already within a few tokens of optimal).
+  Bench: session scratchpad `bench_mxfp4_verify.py`.
+- Same session: dsv4-mxfp4-4 graph capture 32 -> 64 (the fix q4ktail-4
+  and the 8-GPU tiers already carry; mxfp4-4 had been missed, so every
+  earlier mxfp4-4 c8 number ran its 48-token verify eager). E2e with
+  128K re-measure in flight.
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness
