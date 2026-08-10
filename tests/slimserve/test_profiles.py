@@ -55,7 +55,7 @@ def test_every_profile_uses_dspark_with_turboquant():
 
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
-    plan = resolve("dsv4-hybrid-2", "a100", 2, "IQ2_XXS")
+    plan = resolve("dsv4-q4ktail-2", "a100", 2, "IQ2_XXS")
     monkeypatch.setattr(cli.hardware, "detect", Mock(return_value=Mock(
         known=True,
         platform="a100",
@@ -68,7 +68,7 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     seen = []
     monkeypatch.setattr(cli, "_chat", lambda resolved, *_args: seen.append(resolved) or 0)
 
-    assert cli.main(["dsv4-hybrid-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
+    assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
     assert len(seen) == 1
     assert seen[0].speculative is False
     assert "speculative_config" not in engine_kwargs(seen[0])
@@ -102,7 +102,7 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
 
     assert set(compatible) == expected
     assert {"k3-xxs-6", "k3-xxs-8"}.issubset(compatible)
-    assert {"dsv4-xxs-1", "dsv4-hybrid-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(compatible)
+    assert {"dsv4-xxs-1", "dsv4-q4ktail-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(compatible)
 
 
 def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
@@ -127,11 +127,11 @@ def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
     expected_file = "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
     for profile_id, platform in (
         ("dsv4-xxs-1", "mi300x"),
-        ("dsv4-hybrid-2", "mi300x"),
+        ("dsv4-q4ktail-2", "mi300x"),
         ("dsv4-mxfp4-4", "mi300x"),
         ("dsv4-q4k-8", "mi300x"),
-        ("dsv4-hybrid-2", "a100"),
-        ("dsv4-hybrid-4", "a100"),
+        ("dsv4-q4ktail-2", "a100"),
+        ("dsv4-q4ktail-4", "a100"),
     ):
         entry = registry.describe(profile_id)
         assert entry["source"] == "dsv4-flash"
@@ -152,7 +152,7 @@ def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
 def test_deepseek_drafter_is_fetched_once_with_the_plan(tmp_path, monkeypatch):
     payload = b"GGUF"
     filename = "draft.gguf"
-    plan = resolve("dsv4-hybrid-2", "a100", 2, None)
+    plan = resolve("dsv4-q4ktail-2", "a100", 2, None)
     source = {
         **plan.source,
         "speculator": {
@@ -234,7 +234,7 @@ def test_platform_override_replaces_the_mi300x_kv_budget():
 
 
 def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
-    tp2 = resolve("dsv4-hybrid-2", "a100", 2, "Q4K-tail")
+    tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
     assert tp2.engine["kv_cache_dtype"] == "fp8"
@@ -243,7 +243,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
         "VLLM_DSV4_MHC_SCHEDULE": "async",
     }
 
-    tp4 = resolve("dsv4-hybrid-4", "a100", 4, "MXFP4")
+    tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
     assert tp4.engine["kv_cache_dtype"] == "fp8"
@@ -436,18 +436,18 @@ def test_deepseek_profiles_cover_all_supported_tensor_parallel_sizes():
     # MI300X/Metal lineage keeps the numeric names; A100 serves the
     # user-confirmed hybrid/mxfp4 family (see perf/optimization_status.md).
     # (platform, gpus, engine tensor_parallel_size, default quant);
-    # dsv4-hybrid-8 is the TP4 x DP2 throughput tier, so gpus != tp there.
+    # dsv4-q4ktail-8 is the TP4 x DP2 throughput tier, so gpus != tp there.
     # One namespace: <model>-<quant>-<gpus>; a profile resolves on every
-    # platform it lists and nowhere else. dsv4-hybrid-8 is the TP4 x DP2
+    # platform it lists and nowhere else. dsv4-q4ktail-8 is the TP4 x DP2
     # throughput tier, so gpus != tensor_parallel_size there.
     expected = {
         "dsv4-xxs-1": [("mi300x", 1, 1, "IQ2_XXS")],
-        "dsv4-hybrid-2": [
+        "dsv4-q4ktail-2": [
             ("mi300x", 2, 2, "Q4K-tail"),
             ("a100", 2, 2, "Q4K-tail"),
         ],
-        "dsv4-hybrid-4": [("a100", 4, 4, "Q4K-tail")],
-        "dsv4-hybrid-8": [("a100", 8, 4, "Q4K-tail")],
+        "dsv4-q4ktail-4": [("a100", 4, 4, "Q4K-tail")],
+        "dsv4-q4ktail-8": [("a100", 8, 4, "Q4K-tail")],
         "dsv4-mxfp4-4": [
             ("mi300x", 4, 4, "MXFP4"),
             ("a100", 4, 4, "MXFP4"),
@@ -543,7 +543,7 @@ def test_profiles_use_their_validated_graph_mode():
 
 def test_a100_deepseek_profiles_default_to_the_hybrid_quant():
     """Datacenter GPUs serve Q4K-tail; IQ2_XXS is the MacBook-footprint quant."""
-    for profile_id in ("dsv4-hybrid-2", "dsv4-hybrid-4"):
+    for profile_id in ("dsv4-q4ktail-2", "dsv4-q4ktail-4"):
         plan = resolve(profile_id, "a100", 8, None)
         assert plan.quant.name == "Q4K-tail", profile_id
     assert resolve("dsv4-mxfp4-4", "a100", 8, None).quant.name == "MXFP4"
@@ -555,7 +555,7 @@ def test_a100_deepseek_profiles_default_to_the_hybrid_quant():
 def test_dsv4_hybrid_8_is_the_tp4_dp2_throughput_tier():
     """The box-record layout (858-926 tok/s hot c8): two TP4 replicas keep
     each engine's verify batches on CUDA graphs."""
-    plan = resolve("dsv4-hybrid-8", "a100", 8, None)
+    plan = resolve("dsv4-q4ktail-8", "a100", 8, None)
     assert plan.quant.name == "Q4K-tail"
     assert plan.engine["tensor_parallel_size"] == 4
     assert plan.engine["data_parallel_size"] == 2
@@ -576,8 +576,8 @@ def test_dsv4_mxfp4_8_is_tp8_with_wide_capture():
 
 def test_dsv4_2_a100_kv_budget_is_per_quant():
     """A KV byte budget measured for one artifact must not follow another."""
-    hybrid = resolve("dsv4-hybrid-2", "a100", 2, None)
-    xxs = resolve("dsv4-hybrid-2", "a100", 2, "IQ2_XXS")
+    hybrid = resolve("dsv4-q4ktail-2", "a100", 2, None)
+    xxs = resolve("dsv4-q4ktail-2", "a100", 2, "IQ2_XXS")
     assert hybrid.engine["kv_cache_memory_bytes"] == 13958643712
     assert xxs.engine["kv_cache_memory_bytes"] == 20401094656
 

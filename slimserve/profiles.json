@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), hybrid=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.",
+  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.",
   "sources": {
     "glm52-vision": {
       "title": "GLM-5.2-Vision",
@@ -714,8 +714,8 @@
         }
       }
     },
-    "dsv4-hybrid-2": {
-      "title": "DeepSeek-V4-Flash hybrid on 2 GPUs",
+    "dsv4-q4ktail-2": {
+      "title": "DeepSeek-V4-Flash Q4K-tail on 2 GPUs",
       "source": "dsv4-flash",
       "gpus": 2,
       "platforms": [
@@ -793,8 +793,8 @@
         "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     },
-    "dsv4-hybrid-4": {
-      "title": "DeepSeek-V4-Flash hybrid on 4 GPUs",
+    "dsv4-q4ktail-4": {
+      "title": "DeepSeek-V4-Flash Q4K-tail on 4 GPUs",
       "source": "dsv4-flash",
       "gpus": 4,
       "platforms": [
@@ -844,8 +844,8 @@
         "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     },
-    "dsv4-hybrid-8": {
-      "title": "DeepSeek-V4-Flash hybrid on 8 GPUs",
+    "dsv4-q4ktail-8": {
+      "title": "DeepSeek-V4-Flash Q4K-tail on 8 GPUs",
       "source": "dsv4-flash",
       "gpus": 8,
       "platforms": [
@@ -904,7 +904,7 @@
         "a100"
       ],
       "default_quant": "MXFP4",
-      "summary": "Text only. The MXFP4 expert build at TP4 (the only 4-GPU layout that fits); the tuned path on ROCm. Use dsv4-hybrid-4 for the hybrid.",
+      "summary": "Text only. The MXFP4 expert build at TP4 (the only 4-GPU layout that fits); the tuned path on ROCm. Use dsv4-q4ktail-4 for the hybrid.",
       "engine": {
         "tensor_parallel_size": 4,
         "kv_cache_dtype": "fp8",
@@ -1006,7 +1006,7 @@
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async"
           },
-          "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-hybrid-8."
+          "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
         }
       },
       "notes": [

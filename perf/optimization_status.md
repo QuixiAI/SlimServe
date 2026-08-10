@@ -1363,3 +1363,12 @@ decision, and raw artifact locations.
 - `benchmarks/dsv4_metal_perf.md` contains DeepSeek V4 Flash 0731 Metal
   throughput history and should be studied when translating wins across
   platforms.
+
+## 2026-08-10 - Naming note: dsv4-hybrid-* is now dsv4-q4ktail-*
+
+Entries above reference the profile ids in force when each run was made
+(dsv4-2 -> dsv4-hybrid-N -> dsv4-q4ktail-N for the Q4K-tail artifact).
+"hybrid" was dropped because it does not discriminate (every serious GGUF
+build is a mix) and broke the tag -> registry-quant mapping; q4ktail names
+the distinguishing feature (layers 37-42 experts in Q4_K). Configs are
+unchanged -- ids only.

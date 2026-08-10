@@ -157,7 +157,7 @@ in `perf/baseline_status.md`):
   - mxfp4 TP2-shards don't fit 80 GB; hybrid TP2xDP4 fails engine init
     (illegal access in the DP4 dummy run, distinct from the fixed bug) and
     is marked illegal pending investigation.
-- Follow-ups queued: dsv4-hybrid-2 with FULL_DECODE_ONLY graphs (+12% c1
+- Follow-ups queued: dsv4-q4ktail-2 with FULL_DECODE_ONLY graphs (+12% c1
   suspected), TP2xDP4 init crash, MXFP4 prefill tiles.
 
 ## 2026-08-10 late: fused-256, concurrency curves, hot methodology
@@ -210,7 +210,7 @@ in `perf/baseline_status.md`):
 5. **DP prefix-affinity routing:** DP round-robin defeats APC for repeated
    long prefixes at low concurrency (hybrid-8 128K cold 3.0 tok/s c1).
    Only matters if c1 long-context on the throughput tier ever matters.
-6. **dsv4-hybrid-2 FULL_DECODE_ONLY graphs:** suspected +12% c1; unmeasured.
+6. **dsv4-q4ktail-2 FULL_DECODE_ONLY graphs:** suspected +12% c1; unmeasured.
 7. **QuixiCore-XPU code-review ideas: IMPLEMENTED 2026-08-10.**
    - Segmented MoE + fused SwiGLU+Q8_1 epilogue: DONE
      (dsv4_mxfp4_seg_ampere.cuh, op ggml_dsv4_moe_a8_mxfp4_seg, env
@@ -233,7 +233,7 @@ in `perf/baseline_status.md`):
 ## Canonical reproducer / harness
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-hybrid-2 \
+PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-q4ktail-2 \
   --serve --host 127.0.0.1 --port 8012 -y
 
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
@@ -259,8 +259,8 @@ No SlimServe server was left running; GPUs are idle.
 
 ## 2026-08-10 final: profile structure settled
 
-DSV4 A100 profiles are now `dsv4-hybrid-2` (TP2, 13 GiB KV, 128K-qualified),
-`dsv4-hybrid-4` (TP4), `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8,
+DSV4 A100 profiles are now `dsv4-q4ktail-2` (TP2, 13 GiB KV, 128K-qualified),
+`dsv4-q4ktail-4` (TP4), `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8,
 capture 64). mxfp4-8 layout settled by hot pairs: TP8 (167.6 c1 / 275 c8)
 beats TP4xDP2 (111 c1 / 118-271 unstable). The hybrid TP4xDP2 box record
 (~858-926 tok/s hot c8) is intentionally unserved (quality-quant policy);
@@ -273,8 +273,8 @@ history).
 
 ## 2026-08-10 final profile set (user-confirmed)
 
-A100 dsv4 profiles: `dsv4-hybrid-2` (TP2, 13 GiB KV, 128K-qualified),
-`dsv4-hybrid-4` (TP4), `dsv4-hybrid-8` (TP4 x DP2, capture 64 -- throughput
+A100 dsv4 profiles: `dsv4-q4ktail-2` (TP2, 13 GiB KV, 128K-qualified),
+`dsv4-q4ktail-4` (TP4), `dsv4-q4ktail-8` (TP4 x DP2, capture 64 -- throughput
 tier, accepted at 921.8 tok/s hot c8 on the named profile),
 `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8, capture 64 -- quality/latency
 tier). All five run DSpark k=5 + TurboQuant draft KV + 1M max_model_len
@@ -306,10 +306,10 @@ running.
 
 Profile ids now follow `<model>-<quant>-<gpus>` on every platform; a profile
 lists exactly the platforms it is validated on and refuses elsewhere. Quant
-tags: xxs=IQ2_XXS(-Q2_K), hybrid=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.
+tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.
 Renames: dsv4-1 -> dsv4-xxs-1 (mi300x+metal; absorbed dsv4-mac, whose stale
 pre-split Metal config was dropped in favor of the measured M5 Max one),
-dsv4-2 -> the mi300x side of dsv4-hybrid-2, dsv4-4 -> the mi300x side of
+dsv4-2 -> the mi300x side of dsv4-q4ktail-2, dsv4-4 -> the mi300x side of
 dsv4-mxfp4-4, dsv4-8 -> dsv4-q4k-8, glm52-2/4/8 -> glm52-q2k-*,
 glm52-mac -> glm52-xxs-1, k3-6/8 -> k3-xxs-*. Merged-config parity with the
 old profiles was verified per (profile, platform) before the switch.
