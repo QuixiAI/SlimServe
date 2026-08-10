@@ -1402,6 +1402,23 @@ decision, and raw artifact locations.
   hash matching the existing verified pin exactly (control); Q4_K pin
   pending a hash on the MI300X box (test-enforced allowlist).
 
+## 2026-08-10 - dsv4-q4ktail-4 capture 32 -> 64 (c8 verify graphs)
+
+- Status: accepted (profile shipped with capture 64)
+- Hypothesis: c8 verify batches are 8x6 = 48 tokens > capture 32, so every
+  c8 verify step ran eager -- the same cliff fixed on the 8-GPU tiers
+  (TP8 hybrid 205 -> 465).
+- A/B on the fixed serving stack (exact harness, spec metrics recorded):
+  c1 122.4/153.0 and 12K 152.5/155.6 are par with baseline (128.1/161.8,
+  152.6/155.2); c8 measured 290.4 (acc 3.02) / 752.0 (acc 5.98) vs the
+  417 hot baseline. The 752 rides the high end of the documented
+  acceptance window (2.6-6.0 by text position), so the honest claim is
+  "hot c8 moves from the ~417 band into the 500-750 band with the
+  46-token verify step captured"; the mechanism (eager -> FULL_DECODE_ONLY
+  replay at verify width) is the same one measured 2.3x on TP8 with
+  matched methodology. More paired runs would tighten the magnitude.
+- Raw: `perf/results/2026-08-10/dsv4-q4ktail-cap64/`.
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness

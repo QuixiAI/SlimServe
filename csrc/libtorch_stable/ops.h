@@ -787,6 +787,12 @@ torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
     torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
     int64_t top_k, int64_t tokens, double swiglu_limit);
 
+torch::stable::Tensor ggml_dsv4_moe_a8_iq2_seg(
+    torch::stable::Tensor X, torch::stable::Tensor W1,
+    torch::stable::Tensor W2, torch::stable::Tensor topk_weights,
+    torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
+    int64_t top_k, int64_t tokens, double swiglu_limit);
+
 #ifndef USE_ROCM
 std::tuple<torch::stable::Tensor, torch::stable::Tensor>
 ggml_dsv4_rms_norm_q8_1(torch::stable::Tensor X,
