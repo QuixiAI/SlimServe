@@ -62,8 +62,8 @@ One command, a fixed set of tested profiles, no flag archaeology:
 
 ```bash
 slimserve                 # pick a profile, then chat
-slimserve glm52-2         # or name one
-slimserve k3-6 --serve    # OpenAI-compatible endpoint
+slimserve glm52-q2k-2     # or name one
+slimserve k3-xxs-6 --serve  # OpenAI-compatible endpoint
 ```
 
 It is **opinionated**. Every configuration it will run lives in
@@ -129,9 +129,9 @@ What the specialization buys:
 
 ```bash
 slimserve                      # pick a profile, then chat
-slimserve glm52-2              # chat on 2 GPUs
-slimserve glm52-4 --serve      # OpenAI-compatible endpoint on :8000
-slimserve k3-6 -p "2 + 2?"     # one shot, then exit
+slimserve glm52-q2k-2          # chat on 2 GPUs
+slimserve glm52-q2k-4 --serve  # OpenAI-compatible endpoint on :8000
+slimserve k3-xxs-6 -p "2 + 2?" # one shot, then exit
 ```
 
 `slimserve` runs a fixed set of tested configurations and refuses everything
@@ -144,18 +144,27 @@ Output streams token by token in both modes. The prompt is an SSE client of the
 same OpenAI-compatible endpoint `--serve` exposes, so an interactive answer and
 an API answer come from one engine with one configuration.
 
+Profile ids follow one scheme everywhere: `<model>-<quant>-<gpus>`. A
+profile exists for exactly the platforms it is validated on — if it is
+listed for your platform it works there, and it refuses to resolve anywhere
+else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `hybrid` = Q4K-tail, `mxfp4` =
+MXFP4, `q4k` = Q4_K, `q2k` = Q2_K.
+
 | Profile | Model | GPUs | Runs on | Draft cache |
 | --- | --- | ---: | --- | --- |
-| `glm52-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
-| `glm52-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
-| `glm52-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
-| `dsv4-1` | DeepSeek-V4-Flash (text) | 1 | MI300X/Mac | DSpark + TurboQuant |
-| `dsv4-2` | DeepSeek-V4-Flash (text) | 2 | MI300X | DSpark + TurboQuant |
-| `dsv4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X | DSpark + TurboQuant |
-| `dsv4-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
-| `k3-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
-| `k3-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
-| `glm52-mac` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
+| `glm52-q2k-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
+| `glm52-q2k-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
+| `glm52-q2k-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
+| `dsv4-xxs-1` | DeepSeek-V4-Flash (text) | 1 | MI300X, Mac | DSpark + TurboQuant |
+| `dsv4-hybrid-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + TurboQuant |
+| `dsv4-hybrid-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + TurboQuant |
+| `dsv4-hybrid-8` | DeepSeek-V4-Flash (text) | 8 | A100 (TP4 x DP2) | DSpark + TurboQuant |
+| `dsv4-mxfp4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X, A100 | DSpark + TurboQuant |
+| `dsv4-mxfp4-8` | DeepSeek-V4-Flash (text) | 8 | A100 | DSpark + TurboQuant |
+| `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
+| `k3-xxs-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
+| `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
+| `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
 
 † The GLM Apple Silicon variant is described but not yet runnable. DeepSeek-V4
 is measured and supported; see [Apple Silicon](#apple-silicon).
@@ -343,11 +352,11 @@ The second architecture this fork serves. Text only — the model has no vision
 tower, so none of the mmproj path applies.
 
 ```bash
-slimserve dsv4-1 --quant IQ2_XXS    # smallest target on one GPU
-slimserve dsv4-2                    # mixed Q4_K tail on two GPUs
-slimserve dsv4-4                    # MXFP4 on 4 GPUs, the tuned path
-slimserve dsv4-8                    # highest-quality Q4_K default
-slimserve dsv4-4 --serve            # any profile can expose the API
+slimserve dsv4-xxs-1                # smallest target on one GPU or a Mac
+slimserve dsv4-hybrid-2             # mixed Q4_K tail on two GPUs
+slimserve dsv4-mxfp4-4              # MXFP4 on 4 GPUs, the tuned path
+slimserve dsv4-q4k-8                # highest-quality Q4_K on 8 MI300X
+slimserve dsv4-mxfp4-4 --serve      # any profile can expose the API
 ```
 
 All four 0731 quants from [antirez/deepseek-v4-gguf][ds4w] load and serve.
@@ -492,7 +501,7 @@ separate sparse-MLA/vision path remains individually gated in the CLI.
 ```console
 $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
-  ! glm52-mac  GLM-5.2-Vision on one Mac — not validated on Metal
+  ! glm52-xxs-1 GLM-5.2-Vision on one Mac — not validated on Metal
     dsv4-1     DeepSeek-V4-Flash on 1 GPU
 ```
 

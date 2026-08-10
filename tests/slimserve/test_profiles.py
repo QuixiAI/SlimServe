@@ -101,8 +101,8 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     compatible = compatible_profile_ids(machine)
 
     assert set(compatible) == expected
-    assert {"k3-6", "k3-8"}.issubset(compatible)
-    assert {"dsv4-1", "dsv4-2", "dsv4-4", "dsv4-8"}.issubset(compatible)
+    assert {"k3-xxs-6", "k3-xxs-8"}.issubset(compatible)
+    assert {"dsv4-xxs-1", "dsv4-hybrid-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(compatible)
 
 
 def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
@@ -126,10 +126,10 @@ def test_deepseek_profiles_use_only_the_matching_0731_dspark_drafter():
     expected_revision = "799216bd6a33457ae41a26968773d7cb47e157b6"
     expected_file = "DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf"
     for profile_id, platform in (
-        ("dsv4-1", "mi300x"),
-        ("dsv4-2", "mi300x"),
-        ("dsv4-4", "mi300x"),
-        ("dsv4-8", "mi300x"),
+        ("dsv4-xxs-1", "mi300x"),
+        ("dsv4-hybrid-2", "mi300x"),
+        ("dsv4-mxfp4-4", "mi300x"),
+        ("dsv4-q4k-8", "mi300x"),
         ("dsv4-hybrid-2", "a100"),
         ("dsv4-hybrid-4", "a100"),
     ):
@@ -194,7 +194,7 @@ def test_deepseek_drafter_is_fetched_once_with_the_plan(tmp_path, monkeypatch):
 
 def test_kimi_drafter_is_scoped_only_to_kimi_profiles():
     sources = registry._registry()["sources"]
-    for profile_id in ("k3-6", "k3-8"):
+    for profile_id in ("k3-xxs-6", "k3-xxs-8"):
         entry = registry.describe(profile_id)
         assert entry["source"] == "kimi-k3"
         speculator = sources[entry["source"]]["speculator"]
@@ -202,31 +202,31 @@ def test_kimi_drafter_is_scoped_only_to_kimi_profiles():
 
 
 def test_quant_too_large_for_the_profile_names_a_bigger_one():
-    with pytest.raises(ProfileError, match="try glm52-4"):
-        resolve("glm52-2", "mi300x", 8, "Q4_K")
+    with pytest.raises(ProfileError, match="try glm52-q2k-4"):
+        resolve("glm52-q2k-2", "mi300x", 8, "Q4_K")
 
 
 def test_profile_rejected_on_an_unsupported_platform():
     with pytest.raises(ProfileError, match="not supported"):
-        resolve("k3-6", "a100", 8, None)
+        resolve("k3-xxs-6", "a100", 8, None)
 
 
 def test_profile_rejected_when_the_machine_is_too_small():
     with pytest.raises(ProfileError, match="needs 8 GPUs"):
-        resolve("glm52-8", "mi300x", 6, None)
+        resolve("glm52-q2k-8", "mi300x", 6, None)
 
 
 def test_unknown_names_are_rejected_with_the_legal_set():
-    with pytest.raises(ProfileError, match="glm52-2"):
+    with pytest.raises(ProfileError, match="glm52-q2k-2"):
         registry.describe("nope")
     with pytest.raises(ProfileError, match="IQ2_XXS"):
-        resolve("glm52-2", "mi300x", 2, "Q9_Z")
+        resolve("glm52-q2k-2", "mi300x", 2, "Q9_Z")
 
 
 def test_platform_override_replaces_the_mi300x_kv_budget():
     """A100 has 80 GB cards; the MI300X byte budget would not fit."""
-    amd = resolve("glm52-4", "mi300x", 4, "Q2_K")
-    nvidia = resolve("glm52-4", "a100", 4, "Q2_K")
+    amd = resolve("glm52-q2k-4", "mi300x", 4, "Q2_K")
+    nvidia = resolve("glm52-q2k-4", "a100", 4, "Q2_K")
     assert "kv_cache_memory_bytes" in amd.engine
     assert "kv_cache_memory_bytes" not in nvidia.engine
     assert nvidia.engine["gpu_memory_utilization"] == 0.92
@@ -255,7 +255,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
 
 def test_kimi_needs_the_native_kv_dtype():
     """This fork defaults the cache to fp8, which K3 cannot use."""
-    for profile_id in ("k3-6", "k3-8"):
+    for profile_id in ("k3-xxs-6", "k3-xxs-8"):
         assert resolve(profile_id, "mi300x", 8, None).engine["kv_cache_dtype"] == "auto"
 
 
@@ -322,8 +322,8 @@ def test_registry_contains_only_the_supported_model_artifacts():
 
 def test_kimi_uses_the_registered_q8_dspark_gguf():
     plans = [
-        resolve("k3-6", "mi300x", 8, None),
-        resolve("k3-8", "mi300x", 8, None),
+        resolve("k3-xxs-6", "mi300x", 8, None),
+        resolve("k3-xxs-8", "mi300x", 8, None),
     ]
     for plan in plans:
         speculative = engine_kwargs(plan)["speculative_config"]
@@ -361,42 +361,42 @@ GB = 1 << 30
 def test_metal_gates_on_memory_not_on_gpu_count():
     """One Mac is always one GPU, so the card count must not decide anything."""
     assert registry.platform_gate("metal") == "memory"
-    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
+    plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     assert plan.engine["tensor_parallel_size"] == 1
     # The same single "GPU" cannot hold the 145 GiB build.
     with pytest.raises(ProfileError, match="unified memory"):
-        resolve("dsv4-1", "metal", 1, "MXFP4", 128 * GB)
+        resolve("dsv4-xxs-1", "metal", 1, "MXFP4", 128 * GB)
 
 
 def test_metal_suggests_a_smaller_quant_not_a_bigger_machine():
     """More RAM is not a choice the user can make at the prompt; a quant is."""
     with pytest.raises(ProfileError, match="try Q4K-tail"):
-        resolve("dsv4-1", "metal", 1, "MXFP4", 128 * GB)
+        resolve("dsv4-xxs-1", "metal", 1, "MXFP4", 128 * GB)
 
 
 def test_a_laptop_cannot_hold_glm_at_any_quant():
     with pytest.raises(ProfileError, match="no quant of this model fits"):
-        resolve("glm52-mac", "metal", 1, "IQ2_XXS", 128 * GB)
+        resolve("glm52-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
 
 
 def test_kimi_is_absent_from_metal_because_no_mac_is_large_enough():
     """K3 is 800 GiB and the largest Mac is 512 GB; claiming it would be a lie."""
-    for profile_id in ("k3-6", "k3-8"):
+    for profile_id in ("k3-xxs-6", "k3-xxs-8"):
         assert "metal" not in registry.describe(profile_id)["platforms"]
     with pytest.raises(ProfileError, match="not supported"):
-        resolve("k3-6", "metal", 1, None, 512 * GB)
+        resolve("k3-xxs-6", "metal", 1, None, 512 * GB)
 
 
 def test_deepseek_metal_is_runnable_while_glm_stays_gated():
     assert registry.platform_blocked("metal") is None
-    assert registry.profile_blocked("dsv4-1", "metal") is None
-    assert registry.profile_blocked("glm52-mac", "metal")
+    assert registry.profile_blocked("dsv4-xxs-1", "metal") is None
+    assert registry.profile_blocked("glm52-xxs-1", "metal")
     assert registry.platform_blocked("mi300x") is None
     assert registry.platform_blocked("a100") is None
 
 
 def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
-    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
+    plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     assert plan.engine["max_model_len"] == 3072
     assert plan.engine["max_num_seqs"] == 32
     assert plan.engine["kv_cache_memory_bytes"] == 1 * GB
@@ -409,7 +409,7 @@ def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
 
 
 def test_deepseek_dspark_fetches_the_pinned_0731_drafter():
-    plan = resolve("dsv4-4", "mi300x", 8, None)
+    plan = resolve("dsv4-mxfp4-4", "mi300x", 8, None)
     speculative = engine_kwargs(plan)["speculative_config"]
     assert speculative["model"].endswith(
         "/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF/"
@@ -424,7 +424,7 @@ def test_deepseek_dspark_fetches_the_pinned_0731_drafter():
 
 
 def test_deepseek_metal_verifier_is_checksum_pinned():
-    plan = resolve("dsv4-1", "metal", 1, "IQ2_XXS", 128 * GB)
+    plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
     [target] = [entry for entry in files_for(plan) if entry["role"] == "model"]
     assert target["bytes"] == 86720111488
     assert target["sha256"] == (
@@ -437,32 +437,40 @@ def test_deepseek_profiles_cover_all_supported_tensor_parallel_sizes():
     # user-confirmed hybrid/mxfp4 family (see perf/optimization_status.md).
     # (platform, gpus, engine tensor_parallel_size, default quant);
     # dsv4-hybrid-8 is the TP4 x DP2 throughput tier, so gpus != tp there.
+    # One namespace: <model>-<quant>-<gpus>; a profile resolves on every
+    # platform it lists and nowhere else. dsv4-hybrid-8 is the TP4 x DP2
+    # throughput tier, so gpus != tensor_parallel_size there.
     expected = {
-        "dsv4-1": ("mi300x", 1, 1, "IQ2_XXS"),
-        "dsv4-2": ("mi300x", 2, 2, "Q4K-tail"),
-        "dsv4-4": ("mi300x", 4, 4, "MXFP4"),
-        "dsv4-8": ("mi300x", 8, 8, "Q4_K"),
-        "dsv4-hybrid-2": ("a100", 2, 2, "Q4K-tail"),
-        "dsv4-hybrid-4": ("a100", 4, 4, "Q4K-tail"),
-        "dsv4-hybrid-8": ("a100", 8, 4, "Q4K-tail"),
-        "dsv4-mxfp4-4": ("a100", 4, 4, "MXFP4"),
-        "dsv4-mxfp4-8": ("a100", 8, 8, "MXFP4"),
+        "dsv4-xxs-1": [("mi300x", 1, 1, "IQ2_XXS")],
+        "dsv4-hybrid-2": [
+            ("mi300x", 2, 2, "Q4K-tail"),
+            ("a100", 2, 2, "Q4K-tail"),
+        ],
+        "dsv4-hybrid-4": [("a100", 4, 4, "Q4K-tail")],
+        "dsv4-hybrid-8": [("a100", 8, 4, "Q4K-tail")],
+        "dsv4-mxfp4-4": [
+            ("mi300x", 4, 4, "MXFP4"),
+            ("a100", 4, 4, "MXFP4"),
+        ],
+        "dsv4-mxfp4-8": [("a100", 8, 8, "MXFP4")],
+        "dsv4-q4k-8": [("mi300x", 8, 8, "Q4_K")],
     }
 
     assert {
         profile_id
         for profile_id in registry.profile_ids()
         if profile_id.startswith("dsv4-")
-    } == set(expected) | {"dsv4-mac"}
-    for profile_id, (platform, gpus, tp_size, default_quant) in expected.items():
-        plan = resolve(profile_id, platform, 8, None)
-        assert plan.gpus == gpus
-        assert plan.engine["tensor_parallel_size"] == tp_size
-        assert plan.quant.name == default_quant
+    } == set(expected)
+    for profile_id, cases in expected.items():
+        for platform, gpus, tp_size, default_quant in cases:
+            plan = resolve(profile_id, platform, 8, None)
+            assert plan.gpus == gpus
+            assert plan.engine["tensor_parallel_size"] == tp_size
+            assert plan.quant.name == default_quant
 
 
 def test_serve_argv_renders_flags_the_api_server_accepts():
-    argv = serve_argv(resolve("glm52-2", "mi300x", 2, None), "127.0.0.1", 8000)
+    argv = serve_argv(resolve("glm52-q2k-2", "mi300x", 2, None), "127.0.0.1", 8000)
     assert "--enable-prefix-caching" in argv
     assert "--tensor-parallel-size" in argv
     # Booleans are flags, never "--flag True".
@@ -473,7 +481,7 @@ def test_serve_argv_renders_flags_the_api_server_accepts():
 
 
 def test_engine_kwargs_drop_server_only_settings():
-    kwargs = engine_kwargs(resolve("k3-6", "mi300x", 6, None))
+    kwargs = engine_kwargs(resolve("k3-xxs-6", "mi300x", 6, None))
     assert "served_model_name" not in kwargs
     assert kwargs["tensor_parallel_size"] == 6
     assert kwargs["model"].endswith(".gguf")
@@ -525,7 +533,7 @@ def test_profiles_use_their_validated_graph_mode():
                 assert cudagraph_mode in ("PIECEWISE", "FULL_DECODE_ONLY"), profile_id
             elif (
                 profile_id.startswith("dsv4-")
-                or profile_id in ("k3-6", "k3-8")
+                or profile_id in ("k3-xxs-6", "k3-xxs-8")
                 or platform == "metal"
             ):
                 assert cudagraph_mode == "NONE", (profile_id, platform)

@@ -157,7 +157,7 @@ in `perf/baseline_status.md`):
   - mxfp4 TP2-shards don't fit 80 GB; hybrid TP2xDP4 fails engine init
     (illegal access in the DP4 dummy run, distinct from the fixed bug) and
     is marked illegal pending investigation.
-- Follow-ups queued: dsv4-2 with FULL_DECODE_ONLY graphs (+12% c1
+- Follow-ups queued: dsv4-hybrid-2 with FULL_DECODE_ONLY graphs (+12% c1
   suspected), TP2xDP4 init crash, MXFP4 prefill tiles.
 
 ## 2026-08-10 late: fused-256, concurrency curves, hot methodology
@@ -233,7 +233,7 @@ in `perf/baseline_status.md`):
 ## Canonical reproducer / harness
 
 ```bash
-PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-2 \
+PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-hybrid-2 \
   --serve --host 127.0.0.1 --port 8012 -y
 
 PYTHONPATH=. .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
@@ -301,3 +301,15 @@ Its service point is c8 (921.8 hot). Post-128K dip is TP2-only. Details:
 (2026-08-10 lifecycle entry). Raw:
 `perf/results/2026-08-10/dsv4-lifecycle-qual/`. GPUs left idle, no servers
 running.
+
+## 2026-08-10: unified profile naming
+
+Profile ids now follow `<model>-<quant>-<gpus>` on every platform; a profile
+lists exactly the platforms it is validated on and refuses elsewhere. Quant
+tags: xxs=IQ2_XXS(-Q2_K), hybrid=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.
+Renames: dsv4-1 -> dsv4-xxs-1 (mi300x+metal; absorbed dsv4-mac, whose stale
+pre-split Metal config was dropped in favor of the measured M5 Max one),
+dsv4-2 -> the mi300x side of dsv4-hybrid-2, dsv4-4 -> the mi300x side of
+dsv4-mxfp4-4, dsv4-8 -> dsv4-q4k-8, glm52-2/4/8 -> glm52-q2k-*,
+glm52-mac -> glm52-xxs-1, k3-6/8 -> k3-xxs-*. Merged-config parity with the
+old profiles was verified per (profile, platform) before the switch.

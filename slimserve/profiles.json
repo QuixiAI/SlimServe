@@ -1,19 +1,6 @@
 {
   "schema": 1,
-  "comment": [
-    "Every configuration SlimServe supports. Nothing outside this file is a",
-    "legal run: the CLI refuses a profile that is not listed, a quant that is",
-    "not listed under that profile's model, and a platform that is not listed",
-    "under that profile. Engine settings here are the tested ones -- see the",
-    "'why' notes before changing a number. The exception is any platform whose",
-    "status is not 'supported': those rows describe a configuration that fits",
-    "but has never run, they say so in their notes, and the CLI refuses them.",
-    "",
-    "Each platform declares what gates it. 'gpus' platforms are discrete cards",
-    "and a quant lists min_gpus; 'memory' platforms have one unified pool and a",
-    "quant lists min_memory_bytes in physical bytes. A quant with no entry for",
-    "a platform cannot run there at all, which is how Kimi K3 stays off Metal."
-  ],
+  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), hybrid=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.",
   "sources": {
     "glm52-vision": {
       "title": "GLM-5.2-Vision",
@@ -398,7 +385,7 @@
     }
   },
   "profiles": {
-    "glm52-2": {
+    "glm52-q2k-2": {
       "title": "GLM-5.2-Vision on 2 GPUs",
       "source": "glm52-vision",
       "gpus": 2,
@@ -435,7 +422,7 @@
         "VLLM_ROCM_USE_AITER": "1"
       }
     },
-    "glm52-4": {
+    "glm52-q2k-4": {
       "title": "GLM-5.2-Vision on 4 GPUs",
       "source": "glm52-vision",
       "gpus": 4,
@@ -485,7 +472,7 @@
         }
       }
     },
-    "glm52-8": {
+    "glm52-q2k-8": {
       "title": "GLM-5.2-Vision on 8 GPUs",
       "source": "glm52-vision",
       "gpus": 8,
@@ -534,7 +521,7 @@
         }
       }
     },
-    "glm52-mac": {
+    "glm52-xxs-1": {
       "title": "GLM-5.2-Vision on one Mac",
       "source": "glm52-vision",
       "gpus": 1,
@@ -576,7 +563,7 @@
         "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold."
       ]
     },
-    "k3-6": {
+    "k3-xxs-6": {
       "title": "Kimi K3 on 6 GPUs",
       "source": "kimi-k3",
       "gpus": 6,
@@ -584,7 +571,7 @@
         "mi300x"
       ],
       "default_quant": "IQ2_XXS-Q2_K",
-      "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay free, and this remains the measured low-concurrency reference while k3-8 has the highest measured throughput at concurrency 8.",
+      "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay free, and this remains the measured low-concurrency reference while k3-xxs-8 has the highest measured throughput at concurrency 8.",
       "engine": {
         "tensor_parallel_size": 6,
         "max_model_len": 8192,
@@ -620,7 +607,7 @@
         "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]
     },
-    "k3-8": {
+    "k3-xxs-8": {
       "title": "Kimi K3 on 8 GPUs",
       "source": "kimi-k3",
       "gpus": 8,
@@ -663,8 +650,8 @@
         "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
       ]
     },
-    "dsv4-1": {
-      "title": "DeepSeek-V4-Flash on 1 GPU",
+    "dsv4-xxs-1": {
+      "title": "DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon",
       "source": "dsv4-flash",
       "gpus": 1,
       "platforms": [
@@ -727,150 +714,12 @@
         }
       }
     },
-    "dsv4-2": {
-      "title": "DeepSeek-V4-Flash on 2 GPUs",
-      "source": "dsv4-flash",
-      "gpus": 2,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "Q4K-tail",
-      "summary": "Text only. The two smaller expert quants fit two cards, leaving six free.",
-      "engine": {
-        "tensor_parallel_size": 2,
-        "block_size": 256,
-        "max_num_seqs": 64,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-      ]
-    },
-    "dsv4-4": {
-      "title": "DeepSeek-V4-Flash on 4 GPUs",
-      "source": "dsv4-flash",
-      "gpus": 4,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "MXFP4",
-      "summary": "Text only. Four cards fit every expert quant, including the tuned MXFP4 build.",
-      "engine": {
-        "tensor_parallel_size": 4,
-        "block_size": 256,
-        "max_num_seqs": 64,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-      ]
-    },
-    "dsv4-8": {
-      "title": "DeepSeek-V4-Flash on 8 GPUs",
-      "source": "dsv4-flash",
-      "gpus": 8,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "Q4_K",
-      "summary": "Text only. Eight-way tensor parallelism with the highest-quality 0731 Q4_K target by default.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "block_size": 256,
-        "max_num_seqs": 64,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-      ]
-    },
-    "dsv4-mac": {
-      "title": "DeepSeek-V4-Flash on one Mac",
-      "source": "dsv4-flash",
-      "gpus": 1,
-      "platforms": [
-        "metal"
-      ],
-      "default_quant": "IQ2_XXS",
-      "summary": "Text only, and the one model in this matrix that fits a 128 GB laptop. ds4 sustains ~26 tok/s decode on an M5 Max at this size.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "max_model_len": 32768,
-        "max_num_seqs": 4,
-        "max_num_batched_tokens": 2048,
-        "gpu_memory_utilization": 0.85,
-        "block_size": 256,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {},
-      "notes": [
-        "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
-        "block_size must be 256, the same constraint the ROCm sparse MLA backend imposes.",
-        "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-        "IQ2_XXS (80.8 GiB) and Q4K-tail (90.9 GiB) fit 128 GB; MXFP4 and Q4_K need 192 GB. ds4 runs a 91 GiB build of this model on a 128 GB M5 Max, which is what makes the tighter of those two credible.",
-        "max_model_len is 32768 rather than the GGUF's 1M: KV competes with weights for the same pool, and at 90.9 GiB of weights there is little left."
-      ]
-    },
     "dsv4-hybrid-2": {
       "title": "DeepSeek-V4-Flash hybrid on 2 GPUs",
       "source": "dsv4-flash",
       "gpus": 2,
       "platforms": [
+        "mi300x",
         "a100"
       ],
       "default_quant": "Q4K-tail",
@@ -916,6 +765,25 @@
             }
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. KV byte budgets are per quant: 19 GiB for IQ2_XXS (qualified 2026-08-09 with ~1 GiB allocator headroom after graph capture and long-prefill workspace growth) and a provisional 14 GiB for the ~5 GiB/GPU heavier Q4K-tail default, pending the same qualification."
+        },
+        "mi300x": {
+          "engine": {
+            "max_num_seqs": 64,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "kv_cache_dtype": null,
+            "enable_prefix_caching": null
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+          ]
         }
       },
       "notes": [
@@ -1032,6 +900,7 @@
       "source": "dsv4-flash",
       "gpus": 4,
       "platforms": [
+        "mi300x",
         "a100"
       ],
       "default_quant": "MXFP4",
@@ -1069,6 +938,24 @@
             "VLLM_DSV4_MHC_SCHEDULE": "async"
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
+        },
+        "mi300x": {
+          "engine": {
+            "max_num_seqs": 64,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "kv_cache_dtype": null
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+          ]
         }
       },
       "notes": [
@@ -1127,6 +1014,41 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+      ]
+    },
+    "dsv4-q4k-8": {
+      "title": "DeepSeek-V4-Flash Q4_K on 8 GPUs",
+      "source": "dsv4-flash",
+      "gpus": 8,
+      "platforms": [
+        "mi300x"
+      ],
+      "default_quant": "Q4_K",
+      "summary": "Text only. Eight-way tensor parallelism with the highest-quality 0731 Q4_K target by default.",
+      "engine": {
+        "tensor_parallel_size": 8,
+        "block_size": 256,
+        "max_num_seqs": 64,
+        "attention_config": {
+          "sparse_mla_force_mqa": true
+        },
+        "compilation_config": {
+          "cudagraph_mode": "NONE"
+        },
+        "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
+        "served_model_name": "DeepSeek-V4-Flash"
+      },
+      "speculative": true,
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1"
+      },
+      "notes": [
+        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     }

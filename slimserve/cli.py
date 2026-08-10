@@ -3,8 +3,8 @@
 """slimserve — run one of the tested configurations, and nothing else.
 
     slimserve                 pick a profile, then chat
-    slimserve glm52-2         chat on that profile
-    slimserve k3-6 --serve    OpenAI-compatible endpoint instead of the prompt
+    slimserve glm52-q2k-2         chat on that profile
+    slimserve k3-xxs-6 --serve    OpenAI-compatible endpoint instead of the prompt
 
 Every legal configuration lives in profiles.json. The CLI's job is to refuse
 anything that is not in there, before a 244 GiB load discovers it the hard way.
@@ -33,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
         ),
         add_help=False,
     )
-    parser.add_argument("profile", nargs="?", help="profile id, e.g. glm52-2")
+    parser.add_argument("profile", nargs="?", help="profile id, e.g. glm52-q2k-2")
     parser.add_argument("-h", "--help", action="store_true", help="show this help")
     parser.add_argument("--list", action="store_true", help="list every profile")
     parser.add_argument("--quant", help="quant to serve; profile default otherwise")
@@ -96,10 +96,10 @@ def _help() -> None:
     print("\nExamples:")
     for label, command in (
         ("pick a profile", "slimserve"),
-        ("chat", "slimserve glm52-2"),
-        ("one shot", 'slimserve k3-6 -p "What is 2 + 2?"'),
-        ("serve", "slimserve glm52-4 --serve --port 8000"),
-        ("higher quality", "slimserve glm52-4 --quant Q4_K"),
+        ("chat", "slimserve glm52-q2k-2"),
+        ("one shot", 'slimserve k3-xxs-6 -p "What is 2 + 2?"'),
+        ("serve", "slimserve glm52-q2k-4 --serve --port 8000"),
+        ("higher quality", "slimserve glm52-q2k-4 --quant Q4_K"),
     ):
         print(f"  {label:<16} {term.paint(command, term.CYAN, out)}")
 
