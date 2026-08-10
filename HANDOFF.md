@@ -1,6 +1,29 @@
 # DeepSeek V4 0731 A100 Handoff
 
-Updated: 2026-08-09 19:10 UTC
+Updated: 2026-08-10 22:20 UTC
+
+## URGENT open item: silent output degeneration under load (NaN-class race)
+
+Production dsv4-q4ktail-4 instances can silently degenerate under sustained
+DSpark c16+ verify load at TP4 with FULL_DECODE_ONLY capture-64 graphs: one
+NaN-class step emits token 0, the BOS self-sustains at temp 0, and the
+instance keeps returning exact token counts that decode to almost no text
+until restart. Acceptance pegs at ~6.0 (drafter predicts the loop), so
+throughput records taken in this state are inflated garbage - yesterday's
+c16-c64 deployed-sweep rows are retracted. The trigger is a timing-sensitive
+race: it reproduced on both GPU quartets and under both custom-allreduce and
+NCCL (flipping either flips which config loses), so the earlier custom-AR
+attribution is disproven. TP2/PIECEWISE and no-spec runs stayed clean.
+Full trigger matrix, retractions, and suspect list: the INCIDENT entry at
+the end of `perf/optimization_status.md`. Protections in place: harness
+chars-per-token guard, fresh-region benchmark protocol, and
+`slimserve-canary.timer` (5-min long-prompt probe that auto-restarts a
+degenerate daemon). Next discriminators: PIECEWISE at TP4 with spec,
+turboquant->auto draft KV, aux-stream overlaps off, zero freed KV blocks as
+a diagnostic. Do not chase new performance on this family until this is
+root-caused; benchmark numbers taken without the guard are not trustworthy.
+Related latent bug: VLLM_DSV4_DEFER_TP_REDUCE=0 collapses acceptance to
+1.11 - the drafter consumes deferred-path state unconditionally.
 
 ## Read First
 

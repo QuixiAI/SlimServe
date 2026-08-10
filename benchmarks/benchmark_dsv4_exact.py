@@ -215,6 +215,7 @@ def main() -> None:
     completion_counts: list[int] = []
     latencies: list[float] = []
     response_sha256: list[str] = []
+    chars_per_token: list[float] = []
     for result in results:
         response = result["response"]
         assert isinstance(response, dict)
@@ -233,6 +234,10 @@ def main() -> None:
         response_sha256.append(
             hashlib.sha256(choice["text"].encode("utf-8")).hexdigest()
         )
+        completion_tokens = int(usage["completion_tokens"])
+        chars_per_token.append(
+            len(choice["text"]) / completion_tokens if completion_tokens else 0.0
+        )
 
     summary = {
         "model": str(Path(args.model).resolve()),
@@ -249,6 +254,7 @@ def main() -> None:
         "request_latency_mean_seconds": statistics.mean(latencies),
         "request_latency_median_seconds": statistics.median(latencies),
         "response_sha256": response_sha256,
+        "chars_per_token": chars_per_token,
         **spec_metrics,
         "exact": prompt_counts == [args.input_tokens] * args.concurrency
         and completion_counts == [args.output_tokens] * args.concurrency,
@@ -258,6 +264,15 @@ def main() -> None:
         raise SystemExit("server did not honor the exact benchmark token counts")
     if summary["spec_decode_draft_tokens"] <= 0:
         raise SystemExit("server produced no DSpark draft tokens")
+    # A degenerate server (NaN logits -> special-token loop) still returns the
+    # exact token counts, but the tokens decode to almost no visible text.
+    # Healthy prose/code sits well above 1 char/token; the BOS loop is ~0.
+    degenerate = [ratio for ratio in chars_per_token if ratio < 0.5]
+    if degenerate:
+        raise SystemExit(
+            f"{len(degenerate)}/{len(chars_per_token)} responses look degenerate "
+            f"(chars/token {min(degenerate):.3f}); throughput is not valid"
+        )
 
 
 if __name__ == "__main__":

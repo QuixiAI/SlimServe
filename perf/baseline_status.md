@@ -182,3 +182,25 @@ harness, c1, spec decode on, every stage `exact: true`, zero preemptions):
   c8 ~2.5x. These are the current mxfp4-4 baselines.
 - Raw artifacts: `perf/results/2026-08-10/dsv4-lifecycle-qual/`,
   `perf/results/2026-08-10/dsv4-a100-matrix/`.
+
+### 2026-08-10 evening correction: deployed q4ktail-4 capacity + degeneration incident
+
+The deployed-instance concurrency sweep recorded in
+`perf/optimization_status.md` earlier today (c16 732.4 / c32 925.3 /
+c64 1023.8) is retracted as a capacity claim: those rows ran with
+acceptance 5.70-5.88 (k=5 ceiling 6.0), which matches the silent
+BOS-loop degeneration discovered the same evening -- the server emitted
+special-token loops the drafter predicts perfectly -- compounded by a
+same-source prompt confound. The c1-c8 rows (acceptance 3.53-4.24)
+remain plausible.
+
+Valid replacement band, measured on fresh disjoint text with healthy
+acceptance (3.9-4.6), both daemons under simultaneous load, summing
+per-instance valid cells across equivalent runs: c16 ~1050-1150,
+c32 ~1300-1370, c64 ~1400-1550 aggregate tok/s for the box (two TP4
+instances). No single row yet has both instances simultaneously healthy
+end to end; treat these as banded estimates until the degeneration race
+is fixed. Trigger matrix, retractions, harness degeneration guard, and
+the slimserve-canary auto-restart are documented in the incident entry
+in `perf/optimization_status.md`. TP8-tier numbers share the same
+spec+full-graph machinery and inherit the same risk caveat.
