@@ -1490,6 +1490,39 @@ decision, and raw artifact locations.
   reads across 4-8 routes, the tuned-IQ2 trick -- MXFP4's fused path is
   1-wide today) and the SoA repack + cp.async (helps this loader too).
 
+## 2026-08-10 - MXFP4 SoA Repack Enabled: the whole profile moves
+
+- Status: accepted, default on (VLLM_GGUF_DSV4_REPACK_MXFP4=0 reverts)
+- The byte-neutral AoS(17)->SoA(scales | aligned codes) repack existed as
+  a dormant template in every wide consumer; the original blocker
+  (generic MMQ reading raw) no longer applies since the tile/seg/fused
+  family owns every type-39 path. Load-time repack now runs for (39,39)
+  pairs; flags thread through the seg op and ggml_moe_a8; raw-only MMVQ
+  paths are fenced for repacked stacks.
+- Kernel A/B (bit-identical outputs everywhere, maxdiff 0.00e+00):
+  fused per-route GEMV 2.0x at all decode/verify widths (2.03 -> 1.01 ms
+  at 48 tokens); segmented tiles 1.12-1.34x.
+- E2e dsv4-mxfp4-4 (all exact, acceptance 3.0-3.54 = normal band, no
+  confounds):
+
+| stage | pre-repack (same day) | repacked | delta |
+| --- | ---: | ---: | ---: |
+| 1K/2K c1 | 126.7 / 125.6 | 159.5 / 158.2 | +26% |
+| 12K cold/hot | 118.4 / 114.6 | 139.0 / 139.1 | +18% |
+| 128K cold/hot | 79.0 / 80.7 | 89.9 / 92.5 | +14% |
+| 1K/2K c8 | 211.9 / 186.8 | 322.8 / 248.3 | +33-52% |
+
+  Cumulative today for mxfp4-4 vs the morning qualification: c1 111->159
+  (+43%), 12K 76->139 (+83%), 128K 56->90 (+61%), c8 ~110->250-320
+  (~2.5x). c1 now sits within ~2% of q4ktail-4's r2 (158 vs 162) despite
+  1.7x the activated bytes.
+- Multi-wide GEMV re-ranked: with aligned loads the fused path runs
+  ~1.01 ms at 48 tokens; route dedup's remaining ceiling is ~1.67x at
+  verify widths (~0.6 ms floor). Still the next fused-path lever, after
+  the cheaper wins are exhausted.
+- Raw: `perf/results/2026-08-10/dsv4-mxfp4-repack/`, benches
+  `bench_mxfp4_repack.py` / `bench_seg_repack.py` in session scratchpad.
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness
