@@ -202,7 +202,7 @@ in `perf/baseline_status.md`):
    Remaining levers recorded in the notebook: cp.async + SoA repack,
    decode-gate crossover sweep. (Fused SwiGLU epilogue and permuted
    segments: DONE, see item 7.) QuixiCore-CUDA port DONE: commit
-   ef725219, kernels/quant/mxfp4_moe_ampere.cuh + standalone harness
+   e866bf16, kernels/quant/mxfp4_moe_ampere.cuh + standalone harness
    (fused decode + mma tile + segmented pipeline, all PASS on A100).
 4. **TP2 post-128K dip** (168 -> 94.5 after a 1M-scale context): TP2-only —
    TP4/TP8 hold their fresh-server band post-128K, supporting KV-pool
