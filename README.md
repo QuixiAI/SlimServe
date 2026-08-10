@@ -367,9 +367,9 @@ choice is purely quality against footprint.
 | Expert quant | Size | Min GPUs (MI300X / A100) | Notes |
 | --- | ---: | ---: | --- |
 | `MXFP4Experts` | 145 GiB | 4 / 4 | Tuned path; own HIP kernels on MI300X, native CUDA fused/tile/segmented kernels on A100. |
-| `Q4KExperts` | 153 GiB | 4 / — | Highest quality of the four; imatrix. MI300X tier. |
+| `Q4KExperts` | 153 GiB | 4 / 4 | Highest quality of the four; imatrix. The MI300X 8-GPU default; serves on A100 via `--quant Q4_K` (generic kernels, unoptimized). |
 | `Layers37-42Q4KExperts` | 91 GiB | 1 / 2 | Mixed (`q4ktail`); see note below. The A100 default. |
-| `IQ2XXS-w2Q2K` | 81 GiB | 1 / — | Smallest; IQ2_XXS experts, Q2_K down. One MI300X or a Mac. |
+| `IQ2XXS-w2Q2K` | 81 GiB | 1 / 2 | Smallest; IQ2_XXS experts, Q2_K down. One MI300X or a Mac. |
 
 Artifacts are checksum-pinned: the repo hosts same-size pre-0731 twins of
 every 0731 build, so the registry verifies sha256, not just byte counts.
