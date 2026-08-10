@@ -93,6 +93,46 @@ static __device__ __forceinline__ void mma(tile<16, 8>& D, const tile<16, 8>& A,
         "r"(B.x[1]));
 }
 
+// K=16 (4-int) fragments for quants whose scales change every 16 values
+// (Q2_K per-16 scale/min pairs): A lane l holds ints at
+// (row = l*8 + tx/4, k-int = tx%4); B at (col = tx/4, k-int = tx%4).
+template <>
+struct tile<16, 4> {
+  static constexpr int I = 16;
+  static constexpr int J = 4;
+  static constexpr int ne = 2;
+  int x[ne] = {0};
+  static __device__ __forceinline__ int get_i(const int l) {
+    return l * 8 + threadIdx.x / 4;
+  }
+  static __device__ __forceinline__ int get_j(const int) {
+    return threadIdx.x % 4;
+  }
+};
+
+template <>
+struct tile<8, 4> {
+  static constexpr int I = 8;
+  static constexpr int J = 4;
+  static constexpr int ne = 1;
+  int x[ne] = {0};
+  static __device__ __forceinline__ int get_i(const int) {
+    return threadIdx.x / 4;
+  }
+  static __device__ __forceinline__ int get_j(const int) {
+    return threadIdx.x % 4;
+  }
+};
+
+static __device__ __forceinline__ void mma(tile<16, 8>& D,
+                                           const tile<16, 4>& A,
+                                           const tile<8, 4>& B) {
+  asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, "
+      "{%4, %5}, {%6}, {%0, %1, %2, %3};"
+      : "+r"(D.x[0]), "+r"(D.x[1]), "+r"(D.x[2]), "+r"(D.x[3])
+      : "r"(A.x[0]), "r"(A.x[1]), "r"(B.x[0]));
+}
+
 }  // namespace vllm_mmq_v2
 
 #endif  // USE_ROCM

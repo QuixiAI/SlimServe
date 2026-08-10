@@ -605,3 +605,18 @@ def test_server_stops_its_entire_worker_process_group(monkeypatch):
     server.stop()
 
     assert signals == [(4321, signal.SIGTERM)]
+
+
+def test_dsv4_flash_artifacts_are_0731_and_checksum_pinned():
+    """The repo hosts same-size non-0731 twins of every 0731 build, so byte
+    counts cannot distinguish them; only the -0731 path plus a sha256 pin
+    gates 'we only support 0731'. Q4_K's pin is pending a hash on the MI300X
+    box that holds the file."""
+    quants = registry._registry()["sources"]["dsv4-flash"]["quants"]
+    pending_pin = {"Q4_K"}
+    for name, info in quants.items():
+        for entry in info["files"]:
+            assert entry["path"].endswith("-0731.gguf"), (name, entry["path"])
+            if name not in pending_pin:
+                sha = entry.get("sha256")
+                assert sha and len(sha) == 64, f"{name} missing sha256 pin"

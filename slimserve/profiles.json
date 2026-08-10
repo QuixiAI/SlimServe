@@ -205,7 +205,8 @@
           "files": [
             {
               "path": "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
-              "bytes": 155976458848
+              "bytes": 155976458848,
+              "sha256": "0e3a161b670f686128ec5f92a601dfde616a37bf5e7e48999fa2d32471b57ec6"
             }
           ]
         },
@@ -241,7 +242,8 @@
           "files": [
             {
               "path": "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
-              "bytes": 97591747456
+              "bytes": 97591747456,
+              "sha256": "659e22fbd01c9e13ea37a57c8d9c41e0a8819dffa3473d3c5286ee44b2d3398f"
             }
           ]
         },
@@ -827,7 +829,7 @@
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 32
+              "max_cudagraph_capture_size": 64
             }
           },
           "env": {
