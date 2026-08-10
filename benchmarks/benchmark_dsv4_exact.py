@@ -38,9 +38,13 @@ def parse_args() -> argparse.Namespace:
         "--metrics-url",
         help="Prometheus endpoint; defaults to /metrics on the completion host",
     )
-    parser.add_argument(
-        "--concurrency", type=int, choices=(1, 2, 4, 6, 8, 16, 32, 64), required=True
-    )
+    def _concurrency(value: str) -> int:
+        parsed = int(value)
+        if not 1 <= parsed <= 128:
+            raise argparse.ArgumentTypeError("concurrency must be 1..128")
+        return parsed
+
+    parser.add_argument("--concurrency", type=_concurrency, required=True)
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
     parser.add_argument(
