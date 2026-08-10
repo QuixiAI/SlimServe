@@ -147,7 +147,7 @@ an API answer come from one engine with one configuration.
 Profile ids follow one scheme everywhere: `<model>-<quant>-<gpus>`. A
 profile exists for exactly the platforms it is validated on — if it is
 listed for your platform it works there, and it refuses to resolve anywhere
-else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `hybrid` = Q4K-tail, `mxfp4` =
+else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `q4ktail` = Q4K-tail, `mxfp4` =
 MXFP4, `q4k` = Q4_K, `q2k` = Q2_K.
 
 | Profile | Model | GPUs | Runs on | Draft cache |
@@ -156,9 +156,9 @@ MXFP4, `q4k` = Q4_K, `q2k` = Q2_K.
 | `glm52-q2k-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
 | `glm52-q2k-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
 | `dsv4-xxs-1` | DeepSeek-V4-Flash (text) | 1 | MI300X, Mac | DSpark + TurboQuant |
-| `dsv4-hybrid-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + TurboQuant |
-| `dsv4-hybrid-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + TurboQuant |
-| `dsv4-hybrid-8` | DeepSeek-V4-Flash (text) | 8 | A100 (TP4 x DP2) | DSpark + TurboQuant |
+| `dsv4-q4ktail-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + TurboQuant |
+| `dsv4-q4ktail-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + TurboQuant |
+| `dsv4-q4ktail-8` | DeepSeek-V4-Flash (text) | 8 | A100 (TP4 x DP2) | DSpark + TurboQuant |
 | `dsv4-mxfp4-4` | DeepSeek-V4-Flash (text) | 4 | MI300X, A100 | DSpark + TurboQuant |
 | `dsv4-mxfp4-8` | DeepSeek-V4-Flash (text) | 8 | A100 | DSpark + TurboQuant |
 | `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
@@ -353,7 +353,7 @@ tower, so none of the mmproj path applies.
 
 ```bash
 slimserve dsv4-xxs-1                # smallest target on one GPU or a Mac
-slimserve dsv4-hybrid-2             # mixed Q4_K tail on two GPUs
+slimserve dsv4-q4ktail-2             # mixed Q4_K tail on two GPUs
 slimserve dsv4-mxfp4-4              # MXFP4 on 4 GPUs, the tuned path
 slimserve dsv4-q4k-8                # highest-quality Q4_K on 8 MI300X
 slimserve dsv4-mxfp4-4 --serve      # any profile can expose the API
