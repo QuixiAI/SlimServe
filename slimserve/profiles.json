@@ -932,7 +932,7 @@
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 32
+              "max_cudagraph_capture_size": 64
             }
           },
           "env": {
