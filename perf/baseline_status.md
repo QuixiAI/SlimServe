@@ -175,5 +175,10 @@ harness, c1, spec decode on, every stage `exact: true`, zero preemptions):
   the segmented-tile prefill win). Hybrid seg tiles gated at 768 tokens
   by measured crossover; MXFP4 verify-width tile routing rejected by
   measurement (fused GEMV wins below ~72 tokens).
+- UPDATE 4: the MXFP4 SoA repack (enabled at load, bit-identical) moved
+  the whole mxfp4-4 profile: c1 159.5/158.2, 12K 139.0/139.1, 128K
+  89.9/92.5, c8 322.8/248.3, all at normal acceptance (3.0-3.54).
+  Cumulative vs the morning qualification: c1 +43%, 12K +83%, 128K +61%,
+  c8 ~2.5x. These are the current mxfp4-4 baselines.
 - Raw artifacts: `perf/results/2026-08-10/dsv4-lifecycle-qual/`,
   `perf/results/2026-08-10/dsv4-a100-matrix/`.
