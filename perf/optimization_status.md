@@ -1473,8 +1473,22 @@ decision, and raw artifact locations.
   Bench: session scratchpad `bench_mxfp4_verify.py`.
 - Same session: dsv4-mxfp4-4 graph capture 32 -> 64 (the fix q4ktail-4
   and the 8-GPU tiers already carry; mxfp4-4 had been missed, so every
-  earlier mxfp4-4 c8 number ran its 48-token verify eager). E2e with
-  128K re-measure in flight.
+  earlier mxfp4-4 c8 number ran its 48-token verify eager).
+- E2e verdict (all exact, acceptance 3.2-3.6 = normal band):
+  c1 126.7/125.6 par; 12K 118.4/114.6 par-to-up; 128K 79.0/80.7 vs the
+  stale qualification cells 55.7/57.2 (+42% -- the segmented-tile
+  prefill win, now on the record); c8 211.9/186.8 = PAR, capture-64 is
+  NEUTRAL for mxfp4-4. Why, and why that differs from its siblings: the
+  mxfp4 TP4 verify step is kernel-bound -- the fused per-route GEMV
+  costs ~2.0 ms/layer at 48 tokens (~120 ms/verify step), so eager
+  launch overhead was already amortized. q4ktail (0.93 ms/layer) and
+  mxfp4 TP8 (I=256 shard, ~4x cheaper per rank) were launch-bound at
+  verify width, which is why graphs moved them 1.8-2.3x. Capture 64
+  retained anyway (harmless, uniform with the family).
+- The mxfp4-4 c8 limiter is therefore the verify-step MoE kernel time
+  itself. Next levers, in order: a multi-wide fused GEMV (share weight
+  reads across 4-8 routes, the tuned-IQ2 trick -- MXFP4's fused path is
+  1-wide today) and the SoA repack + cp.async (helps this loader too).
 
 ## Historical Notes
 

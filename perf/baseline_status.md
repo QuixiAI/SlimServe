@@ -167,5 +167,13 @@ harness, c1, spec decode on, every stage `exact: true`, zero preemptions):
   cold c8 303->356 (+18%); decode-dominated stages par. (A 694.8 hot-c8
   sample on mxfp4-8 is recorded as variance, not a kernel claim -- see
   the optimization notebook caveat.)
+- UPDATE 3 (final for 2026-08-10): capture-64 landed on every A100 tier;
+  q4ktail-4 hot c8 moved into the 500-750 band (mechanism = graph-replayed
+  48-token verify; magnitude partially acceptance-confounded), while
+  mxfp4-4 c8 is capture-neutral (kernel-bound verify, see notebook) at
+  ~187-212. mxfp4-4 128K re-measured at 79.0/80.7 (was 55.7/57.2, +42%,
+  the segmented-tile prefill win). Hybrid seg tiles gated at 768 tokens
+  by measured crossover; MXFP4 verify-width tile routing rejected by
+  measurement (fused GEMV wins below ~72 tokens).
 - Raw artifacts: `perf/results/2026-08-10/dsv4-lifecycle-qual/`,
   `perf/results/2026-08-10/dsv4-a100-matrix/`.
