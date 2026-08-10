@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         help="Prometheus endpoint; defaults to /metrics on the completion host",
     )
     parser.add_argument(
-        "--concurrency", type=int, choices=(1, 2, 4, 6, 8, 16, 32), required=True
+        "--concurrency", type=int, choices=(1, 2, 4, 6, 8, 16, 32, 64), required=True
     )
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
