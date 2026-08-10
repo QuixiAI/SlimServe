@@ -47,6 +47,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--ctx",
+        type=int,
+        help="cap max_model_len in tokens (default: the profile's context)",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        help="model name the OpenAI endpoint reports (default: the profile's)",
+    )
+    parser.add_argument(
         "--cache", help="model directory (default $SLIMSERVE_CACHE or ~/models)"
     )
     parser.add_argument(
@@ -318,6 +327,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_spec:
         plan = replace(plan, speculative=False)
+    if args.ctx:
+        plan = replace(plan, engine={**plan.engine, "max_model_len": args.ctx})
+    if args.served_model_name:
+        plan = replace(
+            plan,
+            engine={**plan.engine, "served_model_name": args.served_model_name},
+        )
     if args.torch_profile_dir:
         profile_dir = Path(args.torch_profile_dir).expanduser().resolve()
         profile_dir.mkdir(parents=True, exist_ok=True)
