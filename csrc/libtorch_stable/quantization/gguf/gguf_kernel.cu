@@ -831,7 +831,7 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
                                   torch::stable::Tensor expert_ids,
                                   torch::stable::Tensor num_tokens_post_padded,
                                   int64_t type, int64_t row, int64_t top_k,
-                                  int64_t tokens) {
+                                  int64_t tokens, bool mxfp4_repacked) {
   int64_t col = X.sizes()[1];
   int64_t padded = (col + 512 - 1) / 512 * 512;
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -876,8 +876,12 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
                 (int*)expert_ids.data_ptr(),
                 (int*)num_tokens_post_padded.data_ptr(), W.stride(0), col, row,
                 tokens, padded, row, top_k, sorted_token_ids.sizes()[0],
-                /*repacked=*/false, stream);
+                mxfp4_repacked, stream);
           } else {
+            // The dp4a fallback reads raw AoS only; the Python repack gate
+            // requires K % 256 == 0, which moe_mxfp4_mmq_v2_supported covers.
+            STD_TORCH_CHECK(!mxfp4_repacked,
+                            "repacked MXFP4 experts need the mma tile path");
             ggml_moe_mxfp4_w64_q8_1_cuda(
                 (void*)quant_X.data_ptr(), (void*)W.data_ptr(),
                 (scalar_t*)Y.data_ptr(), (int*)sorted_token_ids.data_ptr(),
@@ -1669,7 +1673,7 @@ torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
     torch::stable::Tensor W2,  // [experts, out_row, packed MXFP4]
     torch::stable::Tensor topk_weights, torch::stable::Tensor topk_ids,
     int64_t intermediate, int64_t out_row, int64_t top_k, int64_t tokens,
-    double swiglu_limit) {
+    double swiglu_limit, bool w1_repacked, bool w2_repacked) {
 #ifdef USE_ROCM
   STD_TORCH_CHECK(false, "ggml_dsv4_moe_a8_mxfp4_seg is a CUDA-only path");
 #else
@@ -1737,7 +1741,7 @@ torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
             (const float*)topk_weights.data_ptr(), meta_ptr, W1.stride(0),
             W2.stride(0), (int)col, (int)(padded_x / 32), (int)intermediate,
             (int)out_row, (int)tokens, (int)top_k, experts,
-            (float)swiglu_limit, use_j16, stream);
+            (float)swiglu_limit, use_j16, w1_repacked, w2_repacked, stream);
       });
   return out;
 #endif

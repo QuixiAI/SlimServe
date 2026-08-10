@@ -153,6 +153,7 @@ def ggml_moe_a8(
     row: int,
     top_k: int,
     tokens: int,
+    mxfp4_repacked: bool = False,
 ) -> torch.Tensor:
     if _is_metal():
         raise NotImplementedError(
@@ -170,6 +171,7 @@ def ggml_moe_a8(
         row,
         top_k,
         tokens,
+        mxfp4_repacked,
     )
 
 
@@ -378,6 +380,8 @@ def ggml_dsv4_moe_a8_mxfp4_seg(
     top_k: int,
     tokens: int,
     swiglu_limit: float,
+    w1_repacked: bool = False,
+    w2_repacked: bool = False,
 ) -> torch.Tensor:
     if _is_metal():
         raise NotImplementedError("DSV4 MXFP4 segmented MoE is CUDA-only")
@@ -393,6 +397,8 @@ def ggml_dsv4_moe_a8_mxfp4_seg(
         top_k,
         tokens,
         swiglu_limit,
+        w1_repacked,
+        w2_repacked,
     )
 
 
