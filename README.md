@@ -353,7 +353,7 @@ tower, so none of the mmproj path applies.
 
 ```bash
 slimserve dsv4-xxs-1                # smallest target on one GPU or a Mac
-slimserve dsv4-q4ktail-2             # mixed Q4_K tail on two GPUs
+slimserve dsv4-q4ktail-2            # mixed Q4_K tail on two GPUs
 slimserve dsv4-mxfp4-4              # MXFP4 on 4 GPUs, the tuned path
 slimserve dsv4-q4k-8                # highest-quality Q4_K on 8 MI300X
 slimserve dsv4-mxfp4-4 --serve      # any profile can expose the API
@@ -364,12 +364,15 @@ They differ only in how the routed experts are stored — every other tensor is
 the same F32/F16/Q8_0 in all of them — so the adapter is quant-agnostic and the
 choice is purely quality against footprint.
 
-| Expert quant | Size | Min GPUs | Notes |
+| Expert quant | Size | Min GPUs (MI300X / A100) | Notes |
 | --- | ---: | ---: | --- |
-| `MXFP4Experts` | 145 GiB | 4 | Tuned path; own MXFP4 HIP kernels. |
-| `Q4KExperts` | 153 GiB | 4 | Highest quality of the four; imatrix. |
-| `Layers37-42Q4KExperts` | 91 GiB | 1 | Mixed; see note below. |
-| `IQ2XXS-w2Q2K` | 81 GiB | 1 | Smallest; IQ2_XXS experts, Q2_K down. |
+| `MXFP4Experts` | 145 GiB | 4 / 4 | Tuned path; own HIP kernels on MI300X, native CUDA fused/tile/segmented kernels on A100. |
+| `Q4KExperts` | 153 GiB | 4 / — | Highest quality of the four; imatrix. MI300X tier. |
+| `Layers37-42Q4KExperts` | 91 GiB | 1 / 2 | Mixed (`q4ktail`); see note below. The A100 default. |
+| `IQ2XXS-w2Q2K` | 81 GiB | 1 / — | Smallest; IQ2_XXS experts, Q2_K down. One MI300X or a Mac. |
+
+Artifacts are checksum-pinned: the repo hosts same-size pre-0731 twins of
+every 0731 build, so the registry verifies sha256, not just byte counts.
 
 All four use the pinned 6.5 GiB [DeepSeek-V4-Flash 0731 DSpark drafter][ds4d]:
 `DeepSeek-V4-Flash-0731-DSpark-Drafter-Q2_K-Q8_0-dflash.gguf`. The drafter is
@@ -389,7 +392,8 @@ expert row on-device, without a per-route host loop.
 [ds4w]: https://huggingface.co/antirez/deepseek-v4-gguf
 [ds4d]: https://huggingface.co/alessandrobologna/DeepSeek-V4-Flash-0731-DSpark-Drafter-GGUF
 
-The equivalent by hand, which is what `slimserve dsv4-4` runs:
+The equivalent by hand, which is what `slimserve dsv4-mxfp4-4` runs on
+MI300X:
 
 ```bash
 GGUF=$MODELS/antirez-deepseek-v4-gguf
@@ -413,9 +417,21 @@ The cache and execution settings are deliberate. `--block-size 256` is what
 the DeepSeek-V4 sparse MLA backend supports; the GLM value of 64 fails at
 KV-cache setup with "no common block size". `sparse_mla_force_mqa` keeps short
 prompts off a dense ROCm path that is not implemented. The eager graph mode is
-required for the stateful DSpark/TurboQuant path, and `max_num_seqs=64` bounds
-its startup warmup. `--reasoning-parser deepseek_v4` prevents the GLM default
-from returning every answer as reasoning with `content: null`.
+the MI300X form of the stateful DSpark/TurboQuant path, and `max_num_seqs=64`
+bounds its startup warmup. `--reasoning-parser deepseek_v4` prevents the GLM
+default from returning every answer as reasoning with `content: null`.
+
+On A100 the profiles instead run `FULL_DECODE_ONLY` CUDA graphs with
+`max_cudagraph_capture_size: 64`, sized so the concurrency-8 spec-decode
+verify step (48 tokens) replays as a graph instead of falling to eager --
+worth roughly 2x at concurrency 8. All five A100 profiles
+(`dsv4-q4ktail-2/4/8`, `dsv4-mxfp4-4/8`) passed a full 128K-context
+lifecycle qualification (1K through 128K cold/hot plus post-128K
+continuation, exact token counts at every stage), serve fully native CUDA
+(no Triton), and read the routed experts through this tree's own kernels:
+the fused per-route decode path at small batches and segmented tensor-core
+tiles at prefill widths, for both the MXFP4 and the IQ2_XXS/Q2_K expert
+formats.
 
 Everything is read from the GGUF: no `--hf-config-path`, no `--tokenizer`. The
 routed experts are MXFP4, which this fork reads through its own HIP dequant,
@@ -431,22 +447,22 @@ IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
 a BF16 vision tower.
 
 ```bash
-slimserve k3-6            # best measured single-request latency
-slimserve k3-8            # best measured throughput at concurrency 8
+slimserve k3-xxs-6        # best measured single-request latency
+slimserve k3-xxs-8        # best measured throughput at concurrency 8
 ```
 
 | Profile | Topology | Why |
 | --- | --- | --- |
-| `k3-6` | TP6 target; replicated draft | Lowest measured c1 latency. |
-| `k3-8` | TP8 target/draft; EP MoE | Highest measured c8 throughput. |
+| `k3-xxs-6` | TP6 target; replicated draft | Lowest measured c1 latency. |
+| `k3-xxs-8` | TP8 target/draft; EP MoE | Highest measured c8 throughput. |
 
 Aggregate tok/s, 1k in / 2k out, `--ignore-eos`, each run gated on the model
 answering a known question first:
 
 | Profile | 1 | 8 |
 | --- | --- | --- |
-| `k3-6` | **34.0** | **120.4** |
-| `k3-8` | not rerun | **124.6** |
+| `k3-xxs-6` | **34.0** | **120.4** |
+| `k3-xxs-8` | not rerun | **124.6** |
 
 **Why TP8 originally lost to TP6.** TP8 puts 12 attention heads on each rank, which
 AITER's MLA cannot run — its gfx942 decode ships as pre-assembled code objects
@@ -457,7 +473,7 @@ The MoE is the real constraint. Tensor-sharding an expert splits its `w2` along
 the *packed byte* axis: 1008 bytes of Q2_K over 8 ranks is 126, and the
 `type_size` is 84, so every rank would start decoding 1.5 blocks into a
 quantized block and the model emits garbage. TP2/4/6 give 6/3/2 whole blocks,
-which is why only TP8 breaks. `k3-8` avoids this with expert parallelism —
+which is why only TP8 breaks. `k3-xxs-8` avoids this with expert parallelism —
 each rank holds 112 of the 896 experts whole, so no block is ever cut — but EP
 pays an all-to-all dispatch and combine on all 93 MoE layers. The EP-aware,
 token-major `w13` path removed the larger non-local expert work and put TP8
@@ -481,19 +497,19 @@ and 14336-wide MLP do not divide evenly, so its five-layer backbone and small
 Markov head are replicated on each rank while the target and vocabulary logits
 remain distributed. TP8 shards the same exact draft normally.
 
-Both profiles need a `_C_stable_libtorch` built from this tree, `k3-6` most of
+Both profiles need a `_C_stable_libtorch` built from this tree, `k3-xxs-6` most of
 all. The MMQ expert-id fix lives in a `.cuh`, and a stale extension silently
 zeroes every expert above 255 — 71% of this model's experts — in any
 prefill-width MoE call that sees global expert ids, which is exactly what
-tensor parallel does. Under `k3-8` each rank holds ids 0–111 and never reaches
-the ceiling, so `k3-6` is the configuration a stale build degrades.
+tensor parallel does. Under `k3-xxs-8` each rank holds ids 0–111 and never reaches
+the ceiling, so `k3-xxs-6` is the configuration a stale build degrades.
 
 ---
 
 ## Apple Silicon
 
 DeepSeek-V4-Flash runs through the in-tree PyTorch-MPS worker and the vendored
-QuixiCore Metal kernels. The supported `dsv4-1` path includes the packed sparse
+QuixiCore Metal kernels. The supported `dsv4-xxs-1` path includes the packed sparse
 MLA target cache, hybrid cache allocation, GGUF i-quant/k-quant projections,
 the matching 0731 DSpark drafter, and a `turboquant_k8v4` draft cache. GLM's
 separate sparse-MLA/vision path remains individually gated in the CLI.
@@ -502,7 +518,7 @@ separate sparse-MLA/vision path remains individually gated in the CLI.
 $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
   ! glm52-xxs-1 GLM-5.2-Vision on one Mac — not validated on Metal
-    dsv4-1     DeepSeek-V4-Flash on 1 GPU
+    dsv4-xxs-1  DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon
 ```
 
 **A Mac is gated by memory, not by card count.** Apple exposes one GPU per
