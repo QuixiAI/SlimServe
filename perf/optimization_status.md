@@ -1523,6 +1523,35 @@ decision, and raw artifact locations.
 - Raw: `perf/results/2026-08-10/dsv4-mxfp4-repack/`, benches
   `bench_mxfp4_repack.py` / `bench_seg_repack.py` in session scratchpad.
 
+## 2026-08-10 - Deployed dsv4-q4ktail-4 concurrency sweep (production daemon)
+
+- Setup: the slimserve-a systemd instance (GPUs 0-3, port 27830, ctx
+  262144, served name DeepSeek-v4-Flash-0731, DSpark k=5 + TurboQuant),
+  ~/.local/SlimServe-env runtime, instance B idle on GPUs 4-7. Exact
+  1000-in/2000-out, 8-token warmup, single run per level, all exact.
+
+| conc | agg tok/s | per-req tok/s | acc len | mean latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 175.7 | 175.7 | 3.53 | 11.4s |
+| 2 | 216.1 | 108.0 | 3.75 | 16.7s |
+| 4 | 292.7 | 73.2 | 3.63 | 25.9s |
+| 8 | 372.4 | 46.5 | 4.24 | 27.7s |
+| 16 | 732.4 | 45.8 | 5.72 | 39.9s |
+| 32 | 925.3 | 28.9 | 5.88 | 65.6s |
+| 64 | 1023.8 | 16.0 | 5.70 | 115.8s |
+
+- 1023.8 aggregate on one TP4 instance exceeds the 8-GPU TP4xDP2 hot-c8
+  record (921.8) -- more concurrent sequences per engine beats a second
+  engine at these widths. Acceptance climbs with concurrency (deeper
+  same-source windows at higher c inflate the c16+ cells somewhat; the
+  cross-level shape is still informative). c16 doubling c8 despite
+  96-token verify batches exceeding capture 64 says eager verify at high
+  occupancy is launch-amortized, consistent with the capture-neutral
+  mxfp4-4 finding.
+- The box now serves two such instances; aggregate ceiling with both
+  loaded is a future measurement (host CPU contention unknown).
+- Raw: `perf/results/2026-08-10/deployed-q4ktail-4-sweep/`.
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness
