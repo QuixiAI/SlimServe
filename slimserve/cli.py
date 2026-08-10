@@ -56,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
         help="model name the OpenAI endpoint reports (default: the profile's)",
     )
     parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="render chat requests in thinking mode unless the request opts out",
+    )
+    parser.add_argument(
         "--cache", help="model directory (default $SLIMSERVE_CACHE or ~/models)"
     )
     parser.add_argument(
@@ -333,6 +338,14 @@ def main(argv: list[str] | None = None) -> int:
         plan = replace(
             plan,
             engine={**plan.engine, "served_model_name": args.served_model_name},
+        )
+    if args.thinking:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "default_chat_template_kwargs": {"thinking": True},
+            },
         )
     if args.torch_profile_dir:
         profile_dir = Path(args.torch_profile_dir).expanduser().resolve()
