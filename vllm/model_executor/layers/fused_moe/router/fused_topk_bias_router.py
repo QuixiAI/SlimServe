@@ -24,7 +24,16 @@ from vllm.model_executor.layers.fused_moe.router.dsv4_topk import (
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
         is_padding = get_forward_context().is_padding
-        return is_padding[:num_tokens] if is_padding is not None else None
+        if is_padding is None:
+            return None
+        if is_padding.shape[0] != num_tokens:
+            # The context mask describes the LOCAL padded batch. A different
+            # width means this MoE call runs on a DP/SP-gathered batch (naive
+            # dispatch all-gathers hidden and router logits across ranks);
+            # slicing or extending the local mask would mislabel other ranks'
+            # real tokens as padding. Compute every row instead.
+            return None
+        return is_padding
     return None
 
 

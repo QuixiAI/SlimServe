@@ -85,7 +85,7 @@ template <typename TV>
 __device__ __forceinline__ void tq_store_value_q(
         const TV* value, uint8_t* cache, int64_t base, int64_t slot_base,
         int D, int kps, int vqb, int val_data_bytes, int lane, uint8_t* sq) {
-    float vals[8];
+    float vals[16];
     float vmin = CUDART_INF_F_TQ, vmax = -CUDART_INF_F_TQ;
     for (int d = lane, i = 0; d < D; d += 32, i++) {
         const float x = tq_to_f32(value[base + d]);
@@ -134,7 +134,7 @@ __global__ void tq_store_fp8(const T* __restrict__ key, const T* __restrict__ va
                              int64_t stride_block, int64_t stride_pos, int64_t stride_head,
                              int D, int H, int block_size,
                              int kps, int vqb, int val_data_bytes) {
-    __shared__ uint8_t sq[256];
+    __shared__ uint8_t sq[512];
     const int pid = blockIdx.x;
     const int token = pid / H, head = pid % H;
     const int64_t slot = int64_t(slot_mapping[token]);
@@ -163,7 +163,7 @@ __global__ void tq_store_mse(const float* __restrict__ y, const float* __restric
                              int D, int H, int block_size,
                              int mse_bits, int mse_bytes, int n_centroids,
                              int kps, int vqb, int val_data_bytes) {
-    __shared__ uint8_t sq[256];
+    __shared__ uint8_t sq[512];
     const int pid = blockIdx.x;
     const int token = pid / H, head = pid % H;
     const int64_t slot = int64_t(slot_mapping[token]);
@@ -233,7 +233,7 @@ __device__ __forceinline__ int tq_mse_idx(const uint8_t* cache, int64_t slot_bas
 // ---- decode stage 1 (_tq_decode_stage1) ----
 // grid (B, Hq, NUM_KV_SPLITS), block 32. TQ = q element type (fp16/bf16 for
 // the fp8-key path, fp32 for the rotated MSE query). Element d -> lane d%32,
-// register i = d/32; VPL = D/32 <= 4.
+// register i = d/32; VPL = D/32 <= 16.
 template <typename TQ>
 __global__ void tq_decode_stage1(const TQ* __restrict__ q_rot,
                                  const uint8_t* __restrict__ cache,
@@ -260,17 +260,17 @@ __global__ void tq_decode_stage1(const TQ* __restrict__ q_rot,
     if (split_start >= split_end) return;
 
     const int lane = threadIdx.x;
-    const int VPL = D / 32;  // <= 4 (checked in the launcher)
-    float qv[4];
+    const int VPL = D / 32;  // <= 16 (checked in the launcher)
+    float qv[16];
     const int64_t q_base = int64_t(bid) * stride_qb + int64_t(hid) * stride_qh;
     for (int i = 0; i < VPL; i++) qv[i] = tq_to_f32(q_rot[q_base + lane + 32 * i]);
 
     float m_prev = -CUDART_INF_F_TQ, l_prev = 0.0f;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[16] = {};
     const int64_t bt_base = int64_t(bid) * stride_bt;
 
     for (int start_n = split_start; start_n < split_end; start_n += 4) {
-        float p[4], v[4][4], raw[4];
+        float p[4], v[4][16], raw[4];
         bool valid[4];
         int64_t sb[4];
         for (int t = 0; t < 4; t++) {
@@ -297,7 +297,7 @@ __global__ void tq_decode_stage1(const TQ* __restrict__ q_rot,
                 }
                 raw[t] = tq_warp_sum(partial);
             } else {
-                float c[4];
+                float c[16];
                 for (int i = 0; i < VPL; i++)
                     c[i] = centroids[tq_mse_idx(cache, sb[t], mse_bits, lane + 32 * i)];
                 if (norm_correction) {
@@ -377,7 +377,7 @@ __global__ void tq_decode_stage2(const float* __restrict__ mid_o, TO* __restrict
     const int seq_len = seq_lens[bid];
     const int lane = threadIdx.x;
     const int VPL = D / 32;
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc[16] = {};
     float e_sum = 0.0f, e_max = -CUDART_INF_F_TQ;
     const int64_t base = int64_t(bid) * stride_mb + int64_t(hid) * stride_mh;
     const int kv_per_split = (seq_len + num_splits - 1) / num_splits;
@@ -432,7 +432,10 @@ __global__ void tq_full_dequant_kv(const uint8_t* __restrict__ cache,
                 __ushort_as_half(tq_e4b15_to_f16_bits(cache[slot_base + d]));
         }
     } else {
-        float c[4];
+        // D/32 values per lane. D=512 needs all 16 entries; the original
+        // four-entry scratch silently overran thread-local storage when the
+        // native full-dequant path was used for DSV4 draft attention.
+        float c[16];
         for (int i = 0; i < VPL; i++)
             c[i] = centroids[tq_mse_idx(cache, slot_base, mse_bits, lane + 32 * i)];
         if (norm_correction) {

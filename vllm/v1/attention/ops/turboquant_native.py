@@ -42,11 +42,40 @@ def native_turboquant_supported(head_size: int, key_fp8: bool) -> bool:
 
     if current_platform.is_metal():
         return head_size in (64, 128, 256, 512)
-    if head_size % 32 != 0 or head_size > 128:
+    if head_size % 32 != 0 or head_size > 512:
         return False
     # Native fp8 keys implement the e4b15 (Ampere/Ada) format only; on
     # sm89+ the Triton path keeps using e4nv.
     return not (key_fp8 and not _use_fp8_e4b15(0))
+
+
+def _select_num_kv_splits(
+    batch_size: int,
+    num_query_heads: int,
+    max_num_kv_splits: int,
+    sliding_window: int,
+) -> int:
+    """Choose enough split-KV work to occupy the GPU without excess scratch.
+
+    The native stage-1 grid has one warp-sized block per
+    ``(request, query_head, split)``. A fixed 32 splits is useful for a single
+    full-attention decode, but is actively harmful for DSpark's large
+    synthetic-decode batches: its partial-output tensor scales with every
+    query token and head. The batch shape is fixed for each CUDA graph, so this
+    launch choice is capture/replay stable.
+    """
+    if sliding_window <= 0:
+        return max_num_kv_splits
+
+    # Roughly ten warp blocks per A100 SM is enough to cover the long register
+    # dependency chain in the D=512 kernel. Never create more partitions than
+    # visible tokens or the configured graph-safe maximum.
+    blocks_per_split = max(1, batch_size * num_query_heads)
+    occupancy_splits = (1024 + blocks_per_split - 1) // blocks_per_split
+    return max(
+        1,
+        min(max_num_kv_splits, sliding_window, occupancy_splits),
+    )
 
 
 def native_turboquant_store(
@@ -203,7 +232,7 @@ def native_turboquant_decode_attention(
             PiT = Pi.T.contiguous()
         q_rot = (q_float @ PiT).contiguous()
 
-    NUM_KV_SPLITS = max_num_kv_splits
+    NUM_KV_SPLITS = _select_num_kv_splits(B, Hq, max_num_kv_splits, sliding_window)
 
     if (
         mid_o_buf is not None

@@ -292,6 +292,17 @@ class BaseRouter(FusedMoERouter):
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
         )
 
+        return self.finalize_experts(topk_weights, topk_ids, topk_indices_dtype)
+
+    def finalize_experts(
+        self,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_indices_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply common bookkeeping to externally preselected experts."""
+        self._validate_eplb_state()
+
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)

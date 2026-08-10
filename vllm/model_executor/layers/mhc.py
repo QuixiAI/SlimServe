@@ -35,6 +35,47 @@ HAS_TILELANG_MHC = _has_tilelang_mhc()
 HAS_AITER_MHC = is_aiter_found_and_supported()
 
 
+def _has_quixicore_mhc() -> bool:
+    if not current_platform.is_cuda():
+        return False
+    try:
+        if torch.cuda.get_device_capability()[0] != 8:
+            return False
+        from vllm.quixicore import quixicore_ops
+
+        return all(
+            quixicore_ops.has(name)
+            for name in (
+                "dsv4_mhc_pre",
+                "dsv4_mhc_fused_post_pre",
+                "dsv4_mhc_post",
+                "dsv4_hc_head",
+            )
+        )
+    except (ImportError, RuntimeError):
+        return False
+
+
+HAS_QUIXICORE_MHC = _has_quixicore_mhc()
+# The native fallback launches independent split-K work per token and supports
+# the full SlimServe prefill quantum. Keeping this at decode width forced F16
+# GGUF weights through the FP32 torch fallback during memory profiling/prefill.
+_QUIXICORE_MHC_MAX_TOKENS = 2048
+
+
+def _use_quixicore_mhc(tensor: torch.Tensor) -> bool:
+    return (
+        HAS_QUIXICORE_MHC
+        and tensor.shape[-2] == 4
+        and tensor.numel() // (4 * tensor.shape[-1]) <= _QUIXICORE_MHC_MAX_TOKENS
+    )
+
+
+def use_quixicore_mhc(tensor: torch.Tensor) -> bool:
+    """Whether this concrete activation shape takes the native Ampere path."""
+    return _use_quixicore_mhc(tensor)
+
+
 # --8<-- [start:mhc_pre]
 @CustomOp.register("mhc_pre")
 class MHCPreOp(CustomOp):
@@ -65,6 +106,45 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_quixicore_mhc(residual):
+            from vllm.quixicore import quixicore_ops
+
+            outer_shape = residual.shape[:-2]
+            hidden_size = residual.shape[-1]
+            residual_flat = residual.view(-1, 4, hidden_size)
+            post, comb, layer_input = quixicore_ops.dsv4_mhc_pre(
+                residual_flat,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_weight,
+                norm_eps,
+            )
+            return (
+                post.view(*outer_shape, 4, 1),
+                comb.view(*outer_shape, 4, 4),
+                layer_input.view(*outer_shape, hidden_size),
+            )
+        if not HAS_TILELANG_MHC:
+            return self.forward_native(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -216,6 +296,20 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if _use_quixicore_mhc(residual):
+            from vllm.quixicore import quixicore_ops
+
+            outer_shape = residual.shape[:-2]
+            hidden_size = residual.shape[-1]
+            output = quixicore_ops.dsv4_mhc_post(
+                x.view(-1, hidden_size),
+                residual.view(-1, 4, hidden_size),
+                post_layer_mix.view(-1, 4).contiguous(),
+                comb_res_mix.view(-1, 4, 4).contiguous(),
+            )
+            return output.view(*outer_shape, 4, hidden_size)
+        if not HAS_TILELANG_MHC:
+            return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -298,14 +392,35 @@ class HCHeadOp(CustomOp):
         hc_mult, hidden_size = hidden_states.shape[-2:]
         outer_shape = hidden_states.shape[:-2]
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
-        out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
-            hs_flat,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            rms_norm_eps,
-            hc_eps,
-        )
+        if _use_quixicore_mhc(hidden_states):
+            from vllm.quixicore import quixicore_ops
+
+            out = quixicore_ops.dsv4_hc_head(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+        elif HAS_TILELANG_MHC:
+            out = torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+        else:
+            out = mhc_kernels.hc_head_fused_torch(
+                hs_flat,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
         return out.view(*outer_shape, hidden_size)
 
     def forward_hip(
@@ -431,6 +546,54 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _use_quixicore_mhc(residual):
+            from vllm.quixicore import quixicore_ops
+
+            outer_shape = residual.shape[:-2]
+            hidden_size = residual.shape[-1]
+            residual_cur, post_cur, comb_cur, layer_input_cur = (
+                quixicore_ops.dsv4_mhc_fused_post_pre(
+                    x.view(-1, hidden_size),
+                    residual.view(-1, 4, hidden_size),
+                    post_layer_mix.view(-1, 4).contiguous(),
+                    comb_res_mix.view(-1, 4, 4).contiguous(),
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps,
+                    hc_pre_eps,
+                    hc_sinkhorn_eps,
+                    hc_post_mult_value,
+                    sinkhorn_repeat,
+                    norm_weight,
+                    norm_eps,
+                )
+            )
+            return (
+                residual_cur.view(*outer_shape, 4, hidden_size),
+                post_cur.view(*outer_shape, 4, 1),
+                comb_cur.view(*outer_shape, 4, 4),
+                layer_input_cur.view(*outer_shape, hidden_size),
+            )
+        if not HAS_TILELANG_MHC:
+            return self.forward_native(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,

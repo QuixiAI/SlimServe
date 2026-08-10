@@ -216,6 +216,11 @@ class DSparkDeepseekV4Model(nn.Module):
         # amd/mtp.py.
         last_layer = self.layers[-1]
         if last_layer.use_fused_mhc:
+            # Ampere defers the final MoE local/shared add and TP all-reduce so
+            # it can fuse that communication into the next layer's mHC
+            # transition. DSpark has no next layer after this loop, so resolve
+            # the deferred tuple before the trailing standalone hc_post.
+            hidden_states = last_layer.reduce_deferred_output(hidden_states)
             hidden_states = last_layer.hc_post(
                 hidden_states, residual, post_mix, res_mix
             )
@@ -248,11 +253,37 @@ def _insert_context_kv(
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
+    tq_impl = getattr(attn, "_tq_impl", None)
     dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
+        (n_ctx, 1 if tq_impl is not None else attn.n_local_heads, attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
+    if tq_impl is not None:
+        # Ampere shares this decoder-layer implementation with ROCm, but owns
+        # a different uint8 page format for the DSpark draft cache. Transform
+        # the normalized KV in place, then let TurboQuant pack its 772-byte
+        # K8V4 slot. Treating every uint8 cache as fp8_ds_mla corrupts these
+        # pages and drives draft acceptance to zero.
+        transform_slots = attn._tq_transform_slots[:n_ctx]
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q[:, :1],
+            kv,
+            kv.view(n_ctx, 1, attn.head_dim),
+            transform_slots,
+            positions,
+            cos_sin_cache,
+            attn.eps,
+            1,
+        )
+        tq_impl.do_kv_cache_update(
+            attn,
+            kv,
+            kv,
+            swa_cache,
+            slot_mapping,
+        )
+        return
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout (the gfx950 aiter SWA cache path).
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)

@@ -284,6 +284,23 @@ def resolve(
             f"try {_suggest(profile_id, platform, minimum)}"
         )
 
+    # Quant-specific engine/env adjustments (e.g. a KV byte budget measured
+    # for one artifact does not transfer to a larger one). Applied after the
+    # platform merge so they win over both base and platform settings.
+    quant_override = (
+        ((profile.get("platform_overrides") or {}).get(platform) or {})
+        .get("quant_overrides", {})
+        .get(name)
+    )
+    if quant_override:
+        for key, value in (quant_override.get("engine") or {}).items():
+            if value is None:
+                merged["engine"].pop(key, None)
+            else:
+                merged["engine"][key] = value
+        for key, value in (quant_override.get("env") or {}).items():
+            merged["env"][key] = value
+
     return Plan(
         profile_id=profile_id,
         title=profile["title"],

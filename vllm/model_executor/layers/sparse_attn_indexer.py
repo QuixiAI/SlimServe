@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
 from functools import cache
 
 import torch
@@ -11,7 +12,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import get_current_vllm_config
-from vllm.distributed import get_dcp_group, get_pcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -64,6 +65,26 @@ def _use_quixicore_mqa_logits() -> bool:
     """
     return current_platform.is_cuda() and not current_platform.has_device_capability(90)
 
+
+
+@cache
+def _use_dsv4_tp_token_sharded_indexer() -> bool:
+    """Exact TP token sharding for the Ampere DSV4 Lightning indexer."""
+    if not _use_quixicore_mqa_logits():
+        return False
+    if os.getenv("VLLM_DSV4_TP_INDEXER", "0").lower() in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }:
+        return False
+    config = get_current_vllm_config()
+    if config.parallel_config.tensor_parallel_size <= 1:
+        return False
+    if config.parallel_config.decode_context_parallel_size != 1:
+        return False
+    return any("DeepseekV4" in arch for arch in config.model_config.architectures)
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
@@ -339,6 +360,7 @@ def sparse_attn_indexer(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    tp_head_sharded: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -396,7 +418,6 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
     if use_fp4_cache:
@@ -526,6 +547,8 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
+                if tp_head_sharded:
+                    logits = get_tp_group().all_reduce(logits)
                 num_rows = logits.shape[0]
                 ops.top_k_per_row_prefill(
                     logits,
@@ -605,6 +628,23 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
+        use_tp_token_shard = _use_dsv4_tp_token_sharded_indexer()
+        tp_group = get_tp_group() if use_tp_token_shard else None
+        tp_world_size = tp_group.world_size if tp_group is not None else 1
+        tp_rank = tp_group.rank_in_group if tp_group is not None else 0
+        local_max_model_len = (max_model_len + tp_world_size - 1) // tp_world_size
+        topk_seq_lens = (
+            torch.div(
+                seq_lens - tp_rank + tp_world_size - 1,
+                tp_world_size,
+                rounding_mode="floor",
+            ).clamp(
+                min=0,
+                max=local_max_model_len,
+            )
+            if use_tp_token_shard
+            else seq_lens
+        )
         if current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
@@ -622,13 +662,22 @@ def sparse_attn_indexer(
             )
         elif _use_quixicore_mqa_logits():
             assert padded_q_scale is None, "FP4 indexer Q is not supported on Ampere"
+            scan_max_model_len = min(
+                max_model_len,
+                max(topk_tokens, attn_metadata_narrowed.max_seq_len),
+            )
             logits = quixicore_ops.fp8_paged_mqa_logits(
                 padded_q_quant_cast,
                 kv_cache,
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                max_model_len,
+                scan_max_model_len,
+                tp_rank,
+                tp_world_size,
+                topk_tokens
+                if not use_tp_token_shard and dcp_world_size == 1
+                else 0,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(
@@ -657,28 +706,63 @@ def sparse_attn_indexer(
             1024,
             2048,
         )
-        if use_cooperative_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        tp_custom_ar = None
+        if (tp_head_sharded or use_tp_token_shard) and num_rows <= 32:
+            tp_device_comm = get_tp_group().device_communicator
+            tp_custom_ar = (
+                tp_device_comm.ca_comm if tp_device_comm is not None else None
             )
+            if tp_custom_ar is not None and tp_custom_ar.disabled:
+                tp_custom_ar = None
+
+        topk_workspace = None
+        local_topk_indices = topk_indices
+        if use_persistent_topk:
+            workspace_manager = current_workspace_manager()
+            if use_tp_token_shard:
+                topk_workspace, local_topk_indices = (
+                    workspace_manager.get_simultaneous(
+                        ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                        ((num_rows, topk_tokens), torch.int32),
+                    )
+                )
+            else:
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+
+        if tp_head_sharded and tp_custom_ar is not None and use_persistent_topk:
+            assert topk_workspace is not None
+            tp_custom_ar.dsv4_indexer_topk(
+                logits,
+                topk_seq_lens,
+                topk_indices,
+                topk_workspace,
+                topk_tokens,
+                logits.shape[1],
+            )
+        else:
+            if tp_head_sharded:
+                logits = get_tp_group().all_reduce(logits)
+
+        if tp_head_sharded and tp_custom_ar is not None and use_persistent_topk:
+            pass
+        elif use_cooperative_topk:
+            assert topk_workspace is not None
             torch.ops._C.cooperative_topk(
                 logits,
-                seq_lens,
-                topk_indices,
+                topk_seq_lens,
+                local_topk_indices,
                 topk_workspace,
                 topk_tokens,
                 attn_metadata_narrowed.max_seq_len,
             )
         elif use_persistent_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
+            assert topk_workspace is not None
             torch.ops._C.persistent_topk(
                 logits,
-                seq_lens,
-                topk_indices,
+                topk_seq_lens,
+                local_topk_indices,
                 topk_workspace,
                 topk_tokens,
                 logits.shape[1],
@@ -698,14 +782,50 @@ def sparse_attn_indexer(
             ops.top_k_per_row_decode(
                 logits,
                 next_n,
-                seq_lens,
-                topk_indices,
+                topk_seq_lens,
+                local_topk_indices,
                 topk_workspace,
                 num_rows,
                 logits.stride(0),
                 logits.stride(1),
                 topk_tokens,
             )
+
+        if use_tp_token_shard:
+            assert tp_group is not None
+            if (
+                tp_custom_ar is not None
+                and tp_world_size in (2, 4)
+                and topk_tokens == 512
+                and num_rows <= 32
+            ):
+                tp_custom_ar.dsv4_indexer_token_merge(
+                    logits,
+                    topk_seq_lens,
+                    local_topk_indices,
+                    topk_indices,
+                    topk_tokens,
+                )
+            else:
+                packed_candidates = quixicore_ops.indexer_pack_tp_candidates(
+                    logits, local_topk_indices, tp_rank, tp_world_size
+                )
+                gathered_candidates = tp_group.all_gather(packed_candidates, dim=1)
+                candidate_scores, candidate_lens = (
+                    quixicore_ops.indexer_unpack_tp_scores(gathered_candidates)
+                )
+                assert topk_workspace is not None
+                torch.ops._C.persistent_topk(
+                    candidate_scores,
+                    candidate_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    candidate_scores.shape[1],
+                )
+                quixicore_ops.indexer_resolve_tp_candidates(
+                    gathered_candidates, topk_indices, topk_indices
+                )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
@@ -753,6 +873,7 @@ def sparse_attn_indexer_fake(
     dcp_world_size: int = 1,
     cp_kv_cache_interleave_size: int = 1,
     skip_topk_buffer_clear: bool = False,
+    tp_head_sharded: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -791,6 +912,7 @@ class SparseAttnIndexer(CustomOp):
         topk_indices_buffer: torch.Tensor,
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
+        tp_head_sharded: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -803,6 +925,7 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
+        self.tp_head_sharded = tp_head_sharded
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
@@ -851,7 +974,12 @@ class SparseAttnIndexer(CustomOp):
         weights: torch.Tensor,
     ):
         if current_platform.is_cuda() or current_platform.is_xpu():
-            return self.forward_cuda(hidden_states, q_quant, k, weights)
+            return self.forward_cuda(
+                hidden_states,
+                q_quant,
+                k,
+                weights,
+            )
         elif current_platform.is_rocm():
             return self.forward_hip(hidden_states, q_quant, k, weights)
         else:
@@ -894,6 +1022,8 @@ class SparseAttnIndexer(CustomOp):
             self.dcp_rank,
             self.dcp_world_size,
             self.cp_kv_cache_interleave_size,
+            False,
+            self.tp_head_sharded,
         )
 
     def forward_xpu(

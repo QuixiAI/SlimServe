@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.utils.import_utils import has_cutedsl
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
@@ -414,7 +415,13 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        use_cutedsl_compressor = (
+            current_platform.is_cuda()
+            and current_platform.has_device_capability(89)
+            and has_cutedsl()
+            and self.head_dim == 512
+        )
+        if use_cutedsl_compressor:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )

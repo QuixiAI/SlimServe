@@ -8,6 +8,7 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <cub/cub.cuh>
 #include <cstdint>
 
@@ -38,6 +39,178 @@ constexpr uint32_t RADIX_THRESHOLD = 32768;
 // Decode path constants
 constexpr int kDecodeBins = 2048;
 constexpr uint32_t HIST2048_THRESHOLD = 8192;
+
+constexpr int kPeerMaxBlocks = 64;
+using PeerFlagType = uint32_t;
+
+struct PeerSignal {
+  alignas(128) PeerFlagType start[kPeerMaxBlocks][8];
+  alignas(128) PeerFlagType end[kPeerMaxBlocks][8];
+  alignas(128) PeerFlagType flag[kPeerMaxBlocks];
+};
+
+struct __align__(16) PeerRankData {
+  const void* ptrs[8];
+};
+
+struct __align__(16) PeerRankSignals {
+  PeerSignal* signals[8];
+};
+
+__device__ __forceinline__ void peer_store_release(PeerFlagType* address,
+                                                   PeerFlagType value) {
+  asm volatile("st.release.sys.global.u32 [%1], %0;" : : "r"(value),
+               "l"(address));
+}
+
+__device__ __forceinline__ PeerFlagType peer_load_acquire(
+    PeerFlagType* address) {
+  PeerFlagType value;
+  asm volatile("ld.acquire.sys.global.u32 %0, [%1];"
+               : "=r"(value)
+               : "l"(address));
+  return value;
+}
+
+template <int NGPU>
+__device__ __forceinline__ void peer_publish_barrier(
+    const PeerRankSignals& signals, PeerSignal* self, int rank) {
+  __syncthreads();
+  const PeerFlagType value = self->flag[0] + 1;
+  if (threadIdx.x < NGPU) {
+    auto* peer = &signals.signals[threadIdx.x]->end[0][rank];
+    auto* local = &self->end[0][threadIdx.x];
+    peer_store_release(peer, value);
+    while (peer_load_acquire(local) != value) {
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) self->flag[0] = value;
+}
+
+// Batch-one indexer ownership has one consumer (rank 0), so a full all-to-all
+// barrier is unnecessary. Producers release only to the owner; the owner
+// acquires every producer before reading peer logits and releases completion
+// only after publishing the selected indices to every peer output.
+template <int NGPU>
+__device__ __forceinline__ PeerFlagType owner_peer_publish_begin(
+    const PeerRankSignals& signals, PeerSignal* self, int rank) {
+  const PeerFlagType value = self->flag[0] + 1;
+  if (threadIdx.x == 0) {
+    if (rank == 0) {
+#pragma unroll
+      for (int peer = 1; peer < NGPU; ++peer) {
+        while (peer_load_acquire(&self->end[0][peer]) != value) {
+        }
+      }
+    } else {
+      peer_store_release(&signals.signals[0]->end[0][rank], value);
+    }
+  }
+  __syncthreads();
+  return value;
+}
+
+template <int NGPU>
+__device__ __forceinline__ void owner_peer_publish_end(
+    const PeerRankSignals& signals, PeerSignal* self, int rank,
+    PeerFlagType value) {
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (rank == 0) {
+#pragma unroll
+      for (int peer = 1; peer < NGPU; ++peer) {
+        peer_store_release(&signals.signals[peer]->start[0][0], value);
+      }
+    } else {
+      while (peer_load_acquire(&self->start[0][0]) != value) {
+      }
+    }
+    self->flag[0] = value;
+  }
+  __syncthreads();
+}
+
+struct TokenShardMergeParams {
+  const PeerRankData* logits;
+  const PeerRankData* indices;
+  const PeerRankData* lengths;
+  PeerRankSignals peer_signals;
+  PeerSignal* self_signal;
+  int32_t* output;
+  uint32_t rows;
+  uint32_t logit_stride;
+  uint32_t top_k;
+  uint32_t logits_byte_offset;
+  uint32_t indices_byte_offset;
+  uint32_t lengths_byte_offset;
+  int rank;
+};
+
+template <int NGPU, int TopK>
+__global__ void __launch_bounds__(256, 1)
+    token_shard_candidate_merge_kernel(TokenShardMergeParams params) {
+  constexpr int kThreads = 256;
+  constexpr int kItems = 8;
+  constexpr int kCapacity = kThreads * kItems;
+  static_assert(NGPU * TopK <= kCapacity);
+
+  using Sort = cub::BlockRadixSort<float, kThreads, kItems, int32_t>;
+  __shared__ typename Sort::TempStorage sort_storage;
+
+  if (blockIdx.x == 0) {
+    peer_publish_barrier<NGPU>(params.peer_signals, params.self_signal,
+                               params.rank);
+  }
+  cooperative_groups::this_grid().sync();
+
+  const auto peer_logits = *params.logits;
+  const auto peer_indices = *params.indices;
+  const auto peer_lengths = *params.lengths;
+  const int row = blockIdx.x;
+  float scores[kItems];
+  int32_t global_ids[kItems];
+
+#pragma unroll
+  for (int item = 0; item < kItems; ++item) {
+    const int candidate = threadIdx.x * kItems + item;
+    float score = -__int_as_float(0x7f800000);
+    int32_t global_id = -1;
+    if (candidate < NGPU * TopK) {
+      const int owner = candidate / TopK;
+      const int slot = candidate - owner * TopK;
+      const auto* rank_indices = reinterpret_cast<const int32_t*>(
+          reinterpret_cast<const char*>(peer_indices.ptrs[owner]) +
+          params.indices_byte_offset);
+      const auto* rank_lengths = reinterpret_cast<const int32_t*>(
+          reinterpret_cast<const char*>(peer_lengths.ptrs[owner]) +
+          params.lengths_byte_offset);
+      const int32_t local_id = rank_indices[row * TopK + slot];
+      const int32_t local_length = rank_lengths[row];
+      if (local_id >= 0 && local_id < local_length) {
+        const auto* rank_logits = reinterpret_cast<const float*>(
+            reinterpret_cast<const char*>(peer_logits.ptrs[owner]) +
+            params.logits_byte_offset);
+        score = rank_logits[static_cast<size_t>(row) * params.logit_stride +
+                            local_id];
+        global_id = local_id * NGPU + owner;
+      }
+    }
+    scores[item] = score;
+    global_ids[item] = global_id;
+  }
+
+  Sort(sort_storage).SortDescending(scores, global_ids);
+
+#pragma unroll
+  for (int item = 0; item < kItems; ++item) {
+    const int position = threadIdx.x * kItems + item;
+    if (position < TopK) {
+      params.output[static_cast<size_t>(row) * TopK + position] =
+          global_ids[item];
+    }
+  }
+}
 
 // Large path: fixed shared memory for histograms + scalars
 constexpr size_t kFixedSmemLarge =
@@ -111,6 +284,50 @@ __device__ __forceinline__ void load_float4_predicated(const float* ptr,
   v3 = __uint_as_float(r3);
 }
 
+template <int NGPU>
+__device__ __forceinline__ float load_peer_logit(
+    const float* local, uint32_t index, const PeerRankData& peers,
+    uint32_t peer_offset) {
+  if constexpr (NGPU == 1) {
+    return local[index];
+  } else {
+    float value = 0.0f;
+#pragma unroll
+    for (int rank = 0; rank < NGPU; ++rank) {
+      const auto* input = static_cast<const float*>(peers.ptrs[rank]);
+      value += input[peer_offset + index];
+    }
+    return value;
+  }
+}
+
+template <int NGPU>
+__device__ __forceinline__ void load_peer_float4(
+    const float* local, uint32_t index, const PeerRankData& peers,
+    uint32_t peer_offset, bool predicated, uint32_t length, float& v0,
+    float& v1, float& v2, float& v3) {
+  if constexpr (NGPU == 1) {
+    if (!predicated) {
+      load_float4(local + index, v0, v1, v2, v3);
+    } else {
+      load_float4_predicated(local + index, index, length, v0, v1, v2, v3);
+    }
+  } else {
+    v0 = index < length
+             ? load_peer_logit<NGPU>(local, index, peers, peer_offset)
+             : -__int_as_float(0x7f800000);
+    v1 = index + 1 < length
+             ? load_peer_logit<NGPU>(local, index + 1, peers, peer_offset)
+             : -__int_as_float(0x7f800000);
+    v2 = index + 2 < length
+             ? load_peer_logit<NGPU>(local, index + 2, peers, peer_offset)
+             : -__int_as_float(0x7f800000);
+    v3 = index + 3 < length
+             ? load_peer_logit<NGPU>(local, index + 3, peers, peer_offset)
+             : -__int_as_float(0x7f800000);
+  }
+}
+
 // ============================================================================
 // Large path: inter-CTA coordination state (one per group)
 // ============================================================================
@@ -138,7 +355,59 @@ struct PersistentTopKParams {
   uint32_t chunk_size;      // large path: elements per CTA
   uint32_t ctas_per_group;  // 1=medium, >1=large
   uint32_t max_seq_len;     // max seq_len across all rows (for early CTA exit)
+  const PeerRankData* peer_data;
+  PeerRankSignals peer_signals;
+  PeerSignal* self_signal;
+  int rank;
 };
+
+struct OwnerPeerTopKParams {
+  const float* input;
+  const int32_t* lengths;
+  int32_t* output;
+  uint32_t num_rows;
+  uint32_t stride;
+  const PeerRankData* input_peers;
+  const PeerRankData* output_peers;
+  PeerRankSignals peer_signals;
+  PeerSignal* self_signal;
+  int rank;
+};
+
+// Decode contexts just above the trivial identity range select 512 entries
+// from at most 1024 scores. A full block radix sort avoids the 2048-bin
+// histogram's initialization, atomics, and refinement for this narrow case.
+template <int TopK>
+__global__ void __launch_bounds__(256, 1) short_row_radix_topk_kernel(
+    const float* __restrict__ input, const int32_t* __restrict__ lengths,
+    int32_t* __restrict__ output, uint32_t stride) {
+  constexpr int kThreads = 256;
+  constexpr int kItems = 4;
+  static_assert(TopK <= kThreads * kItems);
+  using Sort = cub::BlockRadixSort<float, kThreads, kItems, int32_t>;
+  __shared__ typename Sort::TempStorage sort_storage;
+
+  const int row = blockIdx.x;
+  const int length = min(lengths[row], int(stride));
+  float scores[kItems];
+  int32_t indices[kItems];
+#pragma unroll
+  for (int item = 0; item < kItems; ++item) {
+    const int index = threadIdx.x * kItems + item;
+    scores[item] = index < length
+                       ? input[static_cast<size_t>(row) * stride + index]
+                       : -__int_as_float(0x7f800000);
+    indices[item] = index < length ? index : -1;
+  }
+  Sort(sort_storage).SortDescending(scores, indices);
+#pragma unroll
+  for (int item = 0; item < kItems; ++item) {
+    const int position = threadIdx.x * kItems + item;
+    if (position < TopK) {
+      output[static_cast<size_t>(row) * TopK + position] = indices[item];
+    }
+  }
+}
 
 // ============================================================================
 // Decode path: 2048-bin histogram for short sequences (seq_len <= 8192)
@@ -156,10 +425,10 @@ __device__ __forceinline__ uint32_t decode_bin(float x) {
   return key >> 5;
 }
 
-template <int TopK>
+template <int TopK, int NGPU>
 __device__ __noinline__ void histogram_2048_topk(
     const float* __restrict__ logits, int32_t* __restrict__ output_indices,
-    int32_t seq_len) {
+    int32_t seq_len, const PeerRankData& peers, uint32_t peer_offset) {
   extern __shared__ int decode_smem[];
   const int tx = threadIdx.x;
   const int lane = tx & 31;
@@ -196,11 +465,9 @@ __device__ __noinline__ void histogram_2048_topk(
     const int base = i << 2;
     float v0, v1, v2, v3;
 
-    if (row_aligned && base + 3 < seq_len) {
-      load_float4(logits + base, v0, v1, v2, v3);
-    } else {
-      load_float4_predicated(logits + base, base, seq_len, v0, v1, v2, v3);
-    }
+    const bool predicated = !(row_aligned && base + 3 < seq_len);
+    load_peer_float4<NGPU>(logits, base, peers, peer_offset, predicated,
+                           seq_len, v0, v1, v2, v3);
 
     const uint16_t b0 = static_cast<uint16_t>(decode_bin(v0));
     const uint16_t b1 = static_cast<uint16_t>(decode_bin(v1));
@@ -325,7 +592,8 @@ __device__ __noinline__ void histogram_2048_topk(
   __syncthreads();
 
   for (int i = tx; i < num_buf0; i += kThreadsPerBlock) {
-    const uint32_t fp32 = convert_to_uint32_v2(logits[bufs[0][i]]);
+    const uint32_t fp32 = convert_to_uint32_v2(load_peer_logit<NGPU>(
+        logits, bufs[0][i], peers, peer_offset));
     atomicAdd(&refine[0][(fp32 >> 24) & 0xFF], 1);
   }
   __syncthreads();
@@ -370,7 +638,8 @@ __device__ __noinline__ void histogram_2048_topk(
     if (remaining_k == 0) {
       for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
         const int idx = bufs[src][i];
-        const uint32_t fp32 = convert_to_uint32_v2(logits[idx]);
+        const uint32_t fp32 = convert_to_uint32_v2(
+            load_peer_logit<NGPU>(logits, idx, peers, peer_offset));
         if (((fp32 >> bit_offset) & 0xFF) > static_cast<uint32_t>(ref_thr)) {
           const int pos = atomicAdd(&decode_smem[SBASE + sOUT], 1);
           output_indices[pos] = idx;
@@ -386,7 +655,8 @@ __device__ __noinline__ void histogram_2048_topk(
 
     for (int i = tx; i < num_buffered; i += kThreadsPerBlock) {
       const int idx = bufs[src][i];
-      const float logit_val = logits[idx];
+      const float logit_val =
+          load_peer_logit<NGPU>(logits, idx, peers, peer_offset);
       const uint32_t fp32 = convert_to_uint32_v2(logit_val);
       const int bin = (fp32 >> bit_offset) & 0xFF;
 
@@ -411,6 +681,94 @@ __device__ __noinline__ void histogram_2048_topk(
   }
 }
 
+// One rank owns score reduction and selection for each decode row. All ranks
+// enter the publication epochs, but only the owner reads peer partials and
+// runs top-k; it writes the compact index result to every graph output.
+template <int TopK, int NGPU>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    owner_peer_decode_topk_kernel(OwnerPeerTopKParams params) {
+  const PeerRankData input_peers = *params.input_peers;
+  const PeerRankData output_peers = *params.output_peers;
+
+  if (blockIdx.x == 0) {
+    peer_publish_barrier<NGPU>(params.peer_signals, params.self_signal,
+                               params.rank);
+  }
+  cooperative_groups::this_grid().sync();
+
+  const uint32_t row = blockIdx.x;
+  const int owner = int(row % NGPU);
+  if (params.rank == owner) {
+    const int32_t seq_len = min(params.lengths[row], int32_t(params.stride));
+    int32_t* local_output = params.output + row * TopK;
+    if (seq_len <= TopK) {
+      for (int index = threadIdx.x; index < TopK; index += blockDim.x) {
+        local_output[index] = index < seq_len ? index : -1;
+      }
+    } else {
+      histogram_2048_topk<TopK, NGPU>(
+          params.input + row * params.stride, local_output, seq_len,
+          input_peers, row * params.stride);
+    }
+    __syncthreads();
+
+    for (int index = threadIdx.x; index < TopK; index += blockDim.x) {
+      const int32_t selected = local_output[index];
+#pragma unroll
+      for (int peer = 0; peer < NGPU; ++peer) {
+        if (peer != owner) {
+          auto* peer_output = reinterpret_cast<int32_t*>(
+              const_cast<void*>(output_peers.ptrs[peer]));
+          peer_output[row * TopK + index] = selected;
+        }
+      }
+    }
+  }
+
+  cooperative_groups::this_grid().sync();
+  if (blockIdx.x == 0) {
+    peer_publish_barrier<NGPU>(params.peer_signals, params.self_signal,
+                               params.rank);
+  }
+}
+
+// Decode's steady-state batch-one path avoids cooperative launch and grid
+// barriers. Rank 0 owns the only row and publishes the compact result.
+template <int TopK, int NGPU>
+__global__ void __launch_bounds__(kThreadsPerBlock, 2)
+    owner_peer_decode_topk_batch_one_kernel(OwnerPeerTopKParams params) {
+  const PeerRankData input_peers = *params.input_peers;
+  const PeerRankData output_peers = *params.output_peers;
+  const PeerFlagType epoch = owner_peer_publish_begin<NGPU>(
+      params.peer_signals, params.self_signal, params.rank);
+
+  if (params.rank == 0) {
+    const int32_t seq_len = min(params.lengths[0], int32_t(params.stride));
+    if (seq_len <= TopK) {
+      for (int index = threadIdx.x; index < TopK; index += blockDim.x) {
+        params.output[index] = index < seq_len ? index : -1;
+      }
+    } else {
+      histogram_2048_topk<TopK, NGPU>(params.input, params.output, seq_len,
+                                      input_peers, 0);
+    }
+    __syncthreads();
+
+    for (int index = threadIdx.x; index < TopK; index += blockDim.x) {
+      const int32_t selected = params.output[index];
+#pragma unroll
+      for (int peer = 1; peer < NGPU; ++peer) {
+        auto* peer_output = reinterpret_cast<int32_t*>(
+            const_cast<void*>(output_peers.ptrs[peer]));
+        peer_output[index] = selected;
+      }
+    }
+  }
+
+  owner_peer_publish_end<NGPU>(params.peer_signals, params.self_signal,
+                               params.rank, epoch);
+}
+
 // ============================================================================
 // Medium path: coarse FP16 histogram + 4-pass FP32 radix refinement
 // For sequences 8K < seq_len <= 64K.
@@ -421,10 +779,11 @@ __device__ __noinline__ void histogram_2048_topk(
 // by: DarkSharpness
 // which at the same time is an optimized topk kernel copied from tilelang
 // kernel
-template <int TopK>
+template <int TopK, int NGPU>
 __device__ __noinline__ void histogram_256_topk(
     const float* __restrict__ logits, int* __restrict__ output_indices,
-    int logits_offset, int seq_len) {
+    int logits_offset, int seq_len, const PeerRankData& peers,
+    uint32_t peer_offset) {
   // All shared state lives in dynamic shared memory to avoid static
   extern __shared__ char medium_smem[];
 
@@ -448,7 +807,8 @@ __device__ __noinline__ void histogram_256_topk(
   __syncthreads();
 
   for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-    const auto bin = convert_to_uint8(logits[idx + logits_offset]);
+    const auto bin = convert_to_uint8(load_peer_logit<NGPU>(
+        logits, idx + logits_offset, peers, peer_offset));
     atomicAdd(&shared_histogram[0][bin], 1);
   }
   __syncthreads();
@@ -485,7 +845,8 @@ __device__ __noinline__ void histogram_256_topk(
 
   if (remaining_k == 0) {
     for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-      const int bin = convert_to_uint8(logits[idx + logits_offset]);
+      const int bin = convert_to_uint8(load_peer_logit<NGPU>(
+          logits, idx + logits_offset, peers, peer_offset));
       if (bin > threshold_bin) {
         const int output_pos = atomicAdd(&shared_output_count, 1);
         output_indices[output_pos] = idx;
@@ -502,7 +863,8 @@ __device__ __noinline__ void histogram_256_topk(
   __syncthreads();
 
   for (int idx = thread_id; idx < seq_len; idx += kThreadsPerBlock) {
-    const float logit_value = logits[idx + logits_offset];
+    const float logit_value = load_peer_logit<NGPU>(
+        logits, idx + logits_offset, peers, peer_offset);
     const int bin = convert_to_uint8(logit_value);
     if (bin > threshold_bin) {
       const int output_pos = atomicAdd(&shared_output_count, 1);
@@ -545,7 +907,8 @@ __device__ __noinline__ void histogram_256_topk(
       for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
         const int idx = buffered_indices[src_buffer][i];
         const uint32_t fp32_bits =
-            convert_to_uint32_v2(logits[idx + logits_offset]);
+            convert_to_uint32_v2(load_peer_logit<NGPU>(
+                logits, idx + logits_offset, peers, peer_offset));
         const int bin = (fp32_bits >> bit_offset) & 0xFF;
         if (bin > threshold_bin) {
           const int output_pos = atomicAdd(&shared_output_count, 1);
@@ -564,7 +927,8 @@ __device__ __noinline__ void histogram_256_topk(
 
     for (int i = thread_id; i < num_buffered; i += kThreadsPerBlock) {
       const int idx = buffered_indices[src_buffer][i];
-      const float logit_value = logits[idx + logits_offset];
+      const float logit_value = load_peer_logit<NGPU>(
+          logits, idx + logits_offset, peers, peer_offset);
       const uint32_t fp32_bits = convert_to_uint32_v2(logit_value);
       const int bin = (fp32_bits >> bit_offset) & 0xFF;
       if (bin > threshold_bin) {
@@ -653,7 +1017,7 @@ __device__ __forceinline__ void wait_ge(int* ptr, int target_val,
 // Adapted from https://github.com/flashinfer-ai/flashinfer/pull/2215
 // ============================================================================
 
-template <int TopK, uint32_t VEC_SIZE>
+template <int TopK, uint32_t VEC_SIZE, int NGPU>
 __device__ void radix_topk(const float* __restrict__ row_input,
                            int32_t* __restrict__ row_output, uint32_t seq_len,
                            uint32_t my_chunk_start, uint32_t chunk_size,
@@ -661,7 +1025,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
                            uint32_t* shared_scalars, uint32_t* shared_ordered,
                            RadixRowState* state, uint32_t cta_in_group,
                            uint32_t ctas_per_group, int& barrier_phase,
-                           uint32_t iter, uint32_t tx) {
+                           uint32_t iter, uint32_t tx,
+                           const PeerRankData& peers, uint32_t peer_offset) {
   const uint32_t my_chunk_end = (my_chunk_start + chunk_size < seq_len)
                                     ? my_chunk_start + chunk_size
                                     : seq_len;
@@ -674,24 +1039,34 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 
     for (uint32_t i = tx * VEC_SIZE; i < aligned_size;
          i += kThreadsPerBlock * VEC_SIZE) {
-      const float* src = row_input + my_chunk_start + i;
-      if constexpr (VEC_SIZE == 4) {
-        float4 v = *reinterpret_cast<const float4*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
-        shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
-        shared_ordered[i + 3] = convert_to_uint32_v2(v.w);
-      } else if constexpr (VEC_SIZE == 2) {
-        float2 v = *reinterpret_cast<const float2*>(src);
-        shared_ordered[i] = convert_to_uint32_v2(v.x);
-        shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+      if constexpr (NGPU > 1) {
+#pragma unroll
+        for (uint32_t element = 0; element < VEC_SIZE; ++element) {
+          shared_ordered[i + element] = convert_to_uint32_v2(
+              load_peer_logit<NGPU>(row_input, my_chunk_start + i + element,
+                                    peers, peer_offset));
+        }
       } else {
-        shared_ordered[i] = convert_to_uint32_v2(*src);
+        const float* src = row_input + my_chunk_start + i;
+        if constexpr (VEC_SIZE == 4) {
+          float4 v = *reinterpret_cast<const float4*>(src);
+          shared_ordered[i] = convert_to_uint32_v2(v.x);
+          shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+          shared_ordered[i + 2] = convert_to_uint32_v2(v.z);
+          shared_ordered[i + 3] = convert_to_uint32_v2(v.w);
+        } else if constexpr (VEC_SIZE == 2) {
+          float2 v = *reinterpret_cast<const float2*>(src);
+          shared_ordered[i] = convert_to_uint32_v2(v.x);
+          shared_ordered[i + 1] = convert_to_uint32_v2(v.y);
+        } else {
+          shared_ordered[i] = convert_to_uint32_v2(*src);
+        }
       }
     }
     for (uint32_t i = aligned_size + tx; i < actual_chunk_size;
          i += kThreadsPerBlock) {
-      shared_ordered[i] = convert_to_uint32_v2(row_input[my_chunk_start + i]);
+      shared_ordered[i] = convert_to_uint32_v2(load_peer_logit<NGPU>(
+          row_input, my_chunk_start + i, peers, peer_offset));
     }
   }
   __syncthreads();
@@ -861,11 +1236,21 @@ __device__ void radix_topk(const float* __restrict__ row_input,
 // see filtered_topk.cuh)
 // ============================================================================
 
-template <int TopK = 2048, uint32_t VEC_SIZE = 1>
+template <int TopK = 2048, uint32_t VEC_SIZE = 1, int NGPU = 1>
 __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     persistent_topk_kernel(PersistentTopKParams params) {
   const uint32_t tx = threadIdx.x;
   extern __shared__ uint8_t smem_raw[];
+  PeerRankData peers{};
+
+  if constexpr (NGPU > 1) {
+    peers = *params.peer_data;
+    if (blockIdx.x == 0) {
+      peer_publish_barrier<NGPU>(params.peer_signals, params.self_signal,
+                                 params.rank);
+    }
+    cooperative_groups::this_grid().sync();
+  }
 
   // ========================================================================
   // Group mode: multi-CTA groups with static round-robin row assignment.
@@ -908,6 +1293,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
     const uint32_t seq_len = params.lengths[row_idx];
     int32_t* row_output = params.output + row_idx * params.top_k;
     const float* row_input = params.input + row_idx * params.stride;
+    const uint32_t peer_offset = row_idx * params.stride;
 
     if (seq_len <= RADIX_THRESHOLD) {
       if (cta_in_group == 0) {
@@ -918,19 +1304,22 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 2)
             row_output[i] = (i < seq_len) ? static_cast<int32_t>(i) : -1;
           }
         } else if (seq_len <= static_cast<uint32_t>(HIST2048_THRESHOLD)) {
-          histogram_2048_topk<TopK>(row_input, row_output, seq_len);
+          histogram_2048_topk<TopK, NGPU>(row_input, row_output, seq_len,
+                                          peers, peer_offset);
         } else {
-          histogram_256_topk<TopK>(row_input, row_output, 0, seq_len);
+          histogram_256_topk<TopK, NGPU>(row_input, row_output, 0, seq_len,
+                                         peers, peer_offset);
         }
       }
       continue;
     }
 
     const uint32_t my_chunk_start = cta_in_group * chunk_size;
-    radix_topk<TopK, VEC_SIZE>(
+    radix_topk<TopK, VEC_SIZE, NGPU>(
         row_input, row_output, seq_len, my_chunk_start, chunk_size,
         local_histogram, suffix_sum, shared_scalars, shared_ordered, state,
-        cta_in_group, ctas_per_group, barrier_phase, iter, tx);
+        cta_in_group, ctas_per_group, barrier_phase, iter, tx, peers,
+        peer_offset);
   }
 }
 

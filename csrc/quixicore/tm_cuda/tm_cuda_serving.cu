@@ -15,8 +15,14 @@
 #include "sampling_kernels.cuh"
 #include "spec_beam_kernels.cuh"
 #include "turboquant_kernels.cuh"
+#include "mhc_ampere.cuh"
+#include "dsv4_router_ampere.cuh"
+#include "dsv4_projection_ampere.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 
 using namespace tms;
 namespace py = pybind11;
@@ -29,6 +35,443 @@ static const __nv_bfloat16* bp(const torch::Tensor& t) { return reinterpret_cast
 static __nv_bfloat16* bpm(torch::Tensor& t) { return reinterpret_cast<__nv_bfloat16*>(t.data_ptr()); }
 static const float* fp(const torch::Tensor& t) { return t.data_ptr<float>(); }
 static float* fpm(torch::Tensor& t) { return t.data_ptr<float>(); }
+
+static torch::Tensor py_dsv4_router_gemm(torch::Tensor x,
+                                         torch::Tensor weight) {
+    CK(x); CK(weight);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
+                    weight.scalar_type() == torch::kBFloat16,
+                "DSV4 router requires bf16 input and weight");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2,
+                "DSV4 router requires 2D input and weight");
+    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8 &&
+                    x.size(1) == dsv4_router::HIDDEN,
+                "DSV4 router input must have shape [1..8, 4096]");
+    TORCH_CHECK(weight.size(0) == dsv4_router::EXPERTS &&
+                    weight.size(1) == dsv4_router::HIDDEN,
+                "DSV4 router weight must have shape [256, 4096]");
+    auto output = torch::empty(
+        {x.size(0), dsv4_router::EXPERTS},
+        x.options().dtype(torch::kFloat));
+    dsv4_router::launch(bp(x), bp(weight), fpm(output), int(x.size(0)),
+                        stream());
+    return output;
+}
+
+// Diagnostic slot for bf16_hash_router out-of-range token IDs:
+// {flag, token_index, raw_id_lo32, raw_id_hi32}. Allocated lazily; the kernel
+// records the first offender and treats the token as padding instead of
+// dereferencing garbage.
+static int32_t* dsv4_hash_router_debug_slot() {
+    static int32_t* slot = nullptr;
+    if (slot == nullptr) {
+        cudaMalloc(&slot, 4 * sizeof(int32_t));
+        cudaMemset(slot, 0, 4 * sizeof(int32_t));
+    }
+    return slot;
+}
+
+// Returns {flag, token_index, raw_id_lo32, raw_id_hi32} as a CPU int32 tensor
+// and clears the slot. Synchronous D2H; intended for post-step diagnostics.
+static torch::Tensor py_dsv4_hash_router_debug() {
+    auto out = torch::zeros({4}, torch::dtype(torch::kInt));
+    int32_t* slot = dsv4_hash_router_debug_slot();
+    cudaMemcpy(out.data_ptr<int32_t>(), slot, 4 * sizeof(int32_t),
+               cudaMemcpyDeviceToHost);
+    cudaMemset(slot, 0, 4 * sizeof(int32_t));
+    return out;
+}
+
+static std::tuple<torch::Tensor, torch::Tensor> py_dsv4_hash_router(
+        torch::Tensor x, torch::Tensor weight, torch::Tensor input_ids,
+        torch::Tensor tid2eid, double routed_scaling_factor,
+        c10::optional<torch::Tensor> is_padding) {
+    CK(x); CK(weight); CK(input_ids); CK(tid2eid);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
+                    weight.scalar_type() == torch::kBFloat16,
+                "DSV4 hash router requires bf16 input and weight");
+    TORCH_CHECK((input_ids.scalar_type() == torch::kInt ||
+                 input_ids.scalar_type() == torch::kLong) &&
+                    tid2eid.scalar_type() == torch::kInt,
+                "DSV4 hash router requires int32/int64 input IDs and int32 table");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 &&
+                    input_ids.dim() == 1 && tid2eid.dim() == 2,
+                "invalid DSV4 hash router tensor rank");
+    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8 &&
+                    x.size(1) == dsv4_router::HIDDEN,
+                "DSV4 hash router input must have shape [1..8, 4096]");
+    TORCH_CHECK(weight.size(0) == dsv4_router::EXPERTS &&
+                    weight.size(1) == dsv4_router::HIDDEN,
+                "DSV4 hash router weight must have shape [256, 4096]");
+    TORCH_CHECK(input_ids.size(0) == x.size(0) &&
+                    tid2eid.size(1) == dsv4_router::HASH_TOPK,
+                "DSV4 hash router IDs must match tokens and top-k 6");
+    const bool* padding_ptr = nullptr;
+    if (is_padding.has_value()) {
+        TORCH_CHECK(is_padding->is_cuda() && is_padding->is_contiguous(),
+                    "is_padding must be contiguous CUDA");
+        TORCH_CHECK(is_padding->scalar_type() == torch::kBool &&
+                        is_padding->numel() == x.size(0),
+                    "DSV4 hash router padding mask must be bool [tokens]");
+        padding_ptr = is_padding->data_ptr<bool>();
+    }
+    auto topk_weights = torch::empty(
+        {x.size(0), dsv4_router::HASH_TOPK},
+        x.options().dtype(torch::kFloat));
+    auto topk_ids = torch::empty(
+        {x.size(0), dsv4_router::HASH_TOPK},
+        x.options().dtype(torch::kInt));
+    if (input_ids.scalar_type() == torch::kInt) {
+        dsv4_router::launch_hash(
+            bp(x), bp(weight), input_ids.data_ptr<int32_t>(),
+            tid2eid.data_ptr<int32_t>(), padding_ptr,
+            float(routed_scaling_factor), fpm(topk_weights),
+            topk_ids.data_ptr<int32_t>(), int(x.size(0)),
+            int(tid2eid.size(0)), dsv4_hash_router_debug_slot(), stream());
+    } else {
+        dsv4_router::launch_hash(
+            bp(x), bp(weight), input_ids.data_ptr<int64_t>(),
+            tid2eid.data_ptr<int32_t>(), padding_ptr,
+            float(routed_scaling_factor), fpm(topk_weights),
+            topk_ids.data_ptr<int32_t>(), int(x.size(0)),
+            int(tid2eid.size(0)), dsv4_hash_router_debug_slot(), stream());
+    }
+    return {topk_weights, topk_ids};
+}
+
+static torch::Tensor py_dsv4_projection_gemv(torch::Tensor x,
+                                             torch::Tensor weight,
+                                             bool bf16_output) {
+    CK(x); CK(weight);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
+                    weight.scalar_type() == torch::kBFloat16,
+                "DSV4 projection requires bf16 input and weight");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2,
+                "DSV4 projection requires 2D input and weight");
+    TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8 &&
+                    x.size(1) == dsv4_projection::HIDDEN,
+                "DSV4 projection input must have shape [1..8, 4096]");
+    TORCH_CHECK(weight.size(1) == dsv4_projection::HIDDEN,
+                "DSV4 projection weight must have 4096 columns");
+    auto output = torch::empty({x.size(0), weight.size(0)}, x.options().dtype(
+        bf16_output ? torch::kBFloat16 : torch::kFloat));
+    if (bf16_output) {
+        dsv4_projection::launch(bp(x), bp(weight), bpm(output), int(x.size(0)),
+                                int(weight.size(0)), stream());
+    } else {
+        dsv4_projection::launch(bp(x), bp(weight), fpm(output), int(x.size(0)),
+                                int(weight.size(0)), stream());
+    }
+    return output;
+}
+
+__global__ void fill_short_context_topk_indices_kernel(
+        int* __restrict__ output, const int64_t* __restrict__ positions,
+        int rows, int topk, int compress_ratio) {
+    const int row = int(blockIdx.x);
+    if (row >= rows) return;
+    const int num_compressed = int((positions[row] + 1) / compress_ratio);
+    for (int col = int(threadIdx.x); col < topk; col += int(blockDim.x)) {
+        output[(size_t)row * topk + col] = col < num_compressed ? col : -1;
+    }
+}
+
+static void py_fill_short_context_topk_indices(
+        torch::Tensor output, torch::Tensor positions, int64_t topk,
+        int64_t compress_ratio) {
+    CK(output); CK(positions);
+    TORCH_CHECK(output.scalar_type() == torch::kInt,
+                "output must be int32");
+    TORCH_CHECK(positions.scalar_type() == torch::kLong,
+                "positions must be int64");
+    TORCH_CHECK(output.dim() == 2 && positions.dim() == 1,
+                "output must be 2D and positions must be 1D");
+    TORCH_CHECK(topk > 0 && topk <= output.size(1), "invalid topk");
+    TORCH_CHECK(compress_ratio > 0, "compress_ratio must be positive");
+    const int rows = int(positions.size(0));
+    TORCH_CHECK(rows <= output.size(0), "output has too few rows");
+    if (rows > 0) {
+        fill_short_context_topk_indices_kernel<<<rows, 256, 0, stream()>>>(
+            output.data_ptr<int>(), positions.data_ptr<int64_t>(), rows,
+            int(topk), int(compress_ratio));
+    }
+}
+
+// ---- DeepSeek-V4 mHC, decode-specialized for Ampere ----
+static bool dsv4_mhc_cooperative_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VLLM_DSV4_MHC_COOPERATIVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+static int dsv4_mhc_splits() {
+    static const int splits = [] {
+        const char* value = std::getenv("VLLM_DSV4_MHC_SPLITS");
+        if (value == nullptr) return 64;
+        const int parsed = std::atoi(value);
+        return parsed == 32 || parsed == 64 ? parsed : 64;
+    }();
+    return splits;
+}
+
+template <typename FnT, bool FUSED_POST, bool RMS_NORM, int NSPLITS>
+static void launch_dsv4_mhc_pre_transition(
+        const torch::Tensor* x, torch::Tensor residual,
+        const torch::Tensor* post_mix, const torch::Tensor* comb_mix,
+        torch::Tensor fn, torch::Tensor* residual_out, torch::Tensor partial,
+        torch::Tensor scale, torch::Tensor base, torch::Tensor next_post,
+        torch::Tensor next_comb, torch::Tensor layer_input,
+        const torch::Tensor* norm_weight, float rms_eps, float pre_eps,
+        float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat,
+        float norm_eps) {
+    const __nv_bfloat16* x_ptr = FUSED_POST ? bp(*x) : nullptr;
+    const __nv_bfloat16* residual_ptr = bp(residual);
+    const float* post_ptr = FUSED_POST ? fp(*post_mix) : nullptr;
+    const float* comb_ptr = FUSED_POST ? fp(*comb_mix) : nullptr;
+    const FnT* fn_ptr = reinterpret_cast<const FnT*>(fn.data_ptr());
+    __nv_bfloat16* residual_out_ptr =
+        FUSED_POST ? bpm(*residual_out) : nullptr;
+    float* partial_ptr = fpm(partial);
+    const float* scale_ptr = fp(scale);
+    const float* base_ptr = fp(base);
+    float* next_post_ptr = fpm(next_post);
+    float* next_comb_ptr = fpm(next_comb);
+    __nv_bfloat16* layer_input_ptr = bpm(layer_input);
+    const __nv_bfloat16* norm_ptr = RMS_NORM ? bp(*norm_weight) : nullptr;
+    auto kernel =
+        dsv4_mhc::fused_pre_transition<FUSED_POST, RMS_NORM, 4096, NSPLITS,
+                                       FnT>;
+    void* args[] = {
+        &x_ptr, &residual_ptr, &post_ptr, &comb_ptr, &fn_ptr,
+        &residual_out_ptr, &partial_ptr, &scale_ptr, &base_ptr,
+        &next_post_ptr, &next_comb_ptr, &layer_input_ptr, &norm_ptr,
+        &rms_eps, &pre_eps, &sinkhorn_eps, &post_multiplier,
+        &sinkhorn_repeat, &norm_eps,
+    };
+    const cudaError_t error = cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(kernel), dim3(NSPLITS, 1),
+        dim3(dsv4_mhc::THREADS), args, 0, stream());
+    TORCH_CHECK(error == cudaSuccess,
+                "DSV4 cooperative mHC launch failed: ",
+                cudaGetErrorString(error));
+}
+
+template <bool FUSED_POST, bool RMS_NORM>
+static void launch_dsv4_mhc_pre_transition_selected(
+        const torch::Tensor* x, torch::Tensor residual,
+        const torch::Tensor* post_mix, const torch::Tensor* comb_mix,
+        torch::Tensor fn, torch::Tensor* residual_out, torch::Tensor partial,
+        torch::Tensor scale, torch::Tensor base, torch::Tensor next_post,
+        torch::Tensor next_comb, torch::Tensor layer_input,
+        const torch::Tensor* norm_weight, float rms_eps, float pre_eps,
+        float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat,
+        float norm_eps) {
+#define LAUNCH_MHC_TYPED(FN_T, NSPLITS)                                      \
+    launch_dsv4_mhc_pre_transition<FN_T, FUSED_POST, RMS_NORM, NSPLITS>(     \
+        x, residual, post_mix, comb_mix, fn, residual_out, partial, scale,   \
+        base, next_post, next_comb, layer_input, norm_weight, rms_eps,       \
+        pre_eps, sinkhorn_eps, post_multiplier, sinkhorn_repeat, norm_eps)
+    if (fn.scalar_type() == torch::kHalf) {
+        if (dsv4_mhc_splits() == 32) {
+            LAUNCH_MHC_TYPED(half, 32);
+        } else {
+            LAUNCH_MHC_TYPED(half, 64);
+        }
+    } else if (dsv4_mhc_splits() == 32) {
+        LAUNCH_MHC_TYPED(float, 32);
+    } else {
+        LAUNCH_MHC_TYPED(float, 64);
+    }
+#undef LAUNCH_MHC_TYPED
+}
+
+template <int NOUT, bool FUSED_POST>
+static void launch_dsv4_mhc_partials(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int hidden_size,
+        dim3 grid) {
+    if (fn.scalar_type() == torch::kHalf) {
+        dsv4_mhc::partials<NOUT, FUSED_POST, half>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb,
+                reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+                partial, hidden_size);
+    } else {
+        dsv4_mhc::partials<NOUT, FUSED_POST, float>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, fp(fn), residual_out, partial,
+                hidden_size);
+    }
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
+        torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale,
+        torch::Tensor hc_base, double rms_eps, double pre_eps,
+        double sinkhorn_eps, double post_multiplier, int64_t sinkhorn_repeat,
+        c10::optional<torch::Tensor> norm_weight, double norm_eps) {
+    CK(residual); CK(fn); CK(hc_scale); CK(hc_base);
+    TORCH_CHECK(residual.scalar_type() == torch::kBFloat16, "residual must be bf16");
+    TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
+                fn.scalar_type() == torch::kFloat16,
+                "fn must be float16 or float32");
+    const int T = residual.size(0), H = residual.size(2);
+    TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
+                "DSV4 mHC expects hc_mult=4 and 24 mix rows");
+    auto float_options = fn.options().dtype(torch::kFloat32);
+    auto partial = torch::empty({T, 64, dsv4_mhc::MIXES + 1}, float_options);
+    auto post = torch::empty({T, dsv4_mhc::HC}, float_options);
+    auto comb = torch::empty({T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
+    auto layer_input = torch::empty({T, H}, residual.options());
+    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+        if (norm_weight) {
+            launch_dsv4_mhc_pre_transition_selected<false, true>(
+                nullptr, residual, nullptr, nullptr, fn, nullptr, partial,
+                hc_scale, hc_base, post, comb, layer_input, &*norm_weight,
+                float(rms_eps), float(pre_eps), float(sinkhorn_eps),
+                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
+        } else {
+            launch_dsv4_mhc_pre_transition_selected<false, false>(
+                nullptr, residual, nullptr, nullptr, fn, nullptr, partial,
+                hc_scale, hc_base, post, comb, layer_input, nullptr,
+                float(rms_eps), float(pre_eps), float(sinkhorn_eps),
+                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
+        }
+        return {post, comb, layer_input};
+    }
+    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
+        nullptr, bp(residual), nullptr, nullptr, fn, nullptr, fpm(partial), H,
+        dim3(dsv4_mhc::SPLITS, T));
+    dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
+        fpm(partial), fp(hc_scale), fp(hc_base), fpm(post),
+        fpm(comb), H, float(rms_eps), float(pre_eps),
+        float(sinkhorn_eps), float(post_multiplier), int(sinkhorn_repeat));
+    if (norm_weight) {
+        TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous(),
+                    "norm_weight must be contiguous CUDA");
+        TORCH_CHECK(H == 4096 && norm_weight->scalar_type() == torch::kBFloat16 &&
+                    norm_weight->numel() == H,
+                    "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
+        dsv4_mhc::apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1>
+            <<<T, dsv4_mhc::THREADS, 0, stream()>>>(
+                fp(partial), bp(residual), bp(*norm_weight), bpm(layer_input),
+                float(norm_eps));
+    } else {
+        dsv4_mhc::apply_pre_mix<dsv4_mhc::MIXES + 1>
+            <<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, T),
+                dsv4_mhc::THREADS, 0, stream()>>>(
+                fp(partial), bp(residual), bpm(layer_input), H);
+    }
+    return {post, comb, layer_input};
+}
+
+static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+py_dsv4_mhc_fused_post_pre(
+        torch::Tensor x, torch::Tensor residual, torch::Tensor post_mix,
+        torch::Tensor comb_mix, torch::Tensor fn, torch::Tensor hc_scale,
+        torch::Tensor hc_base, double rms_eps, double pre_eps,
+        double sinkhorn_eps, double post_multiplier, int64_t sinkhorn_repeat,
+        c10::optional<torch::Tensor> norm_weight, double norm_eps) {
+    CK(x); CK(residual); CK(post_mix); CK(comb_mix); CK(fn); CK(hc_scale); CK(hc_base);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
+                residual.scalar_type() == torch::kBFloat16, "x/residual must be bf16");
+    TORCH_CHECK((fn.scalar_type() == torch::kFloat32 ||
+                 fn.scalar_type() == torch::kFloat16) &&
+                post_mix.scalar_type() == torch::kFloat32 &&
+                comb_mix.scalar_type() == torch::kFloat32,
+                "mHC fn must be float16/float32 and mixes must be float32");
+    const int T = residual.size(0), H = residual.size(2);
+    TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
+                "DSV4 mHC expects hc_mult=4 and 24 mix rows");
+    auto residual_out = torch::empty_like(residual);
+    auto float_options = fn.options().dtype(torch::kFloat32);
+    auto partial = torch::empty({T, 64, dsv4_mhc::MIXES + 1}, float_options);
+    auto next_post = torch::empty({T, dsv4_mhc::HC}, float_options);
+    auto next_comb = torch::empty(
+        {T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
+    auto layer_input = torch::empty({T, H}, residual.options());
+    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+        if (norm_weight) {
+            launch_dsv4_mhc_pre_transition_selected<true, true>(
+                &x, residual, &post_mix, &comb_mix, fn, &residual_out,
+                partial, hc_scale, hc_base, next_post, next_comb, layer_input,
+                &*norm_weight, float(rms_eps), float(pre_eps),
+                float(sinkhorn_eps), float(post_multiplier),
+                int(sinkhorn_repeat), float(norm_eps));
+        } else {
+            launch_dsv4_mhc_pre_transition_selected<true, false>(
+                &x, residual, &post_mix, &comb_mix, fn, &residual_out,
+                partial, hc_scale, hc_base, next_post, next_comb, layer_input,
+                nullptr, float(rms_eps), float(pre_eps), float(sinkhorn_eps),
+                float(post_multiplier), int(sinkhorn_repeat), float(norm_eps));
+        }
+        return {residual_out, next_post, next_comb, layer_input};
+    }
+    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
+        fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
+        fpm(next_comb), H, float(rms_eps), float(pre_eps),
+        float(sinkhorn_eps), float(post_multiplier), int(sinkhorn_repeat));
+    if (norm_weight) {
+        TORCH_CHECK(norm_weight->is_cuda() && norm_weight->is_contiguous(),
+                    "norm_weight must be contiguous CUDA");
+        TORCH_CHECK(H == 4096 && norm_weight->scalar_type() == torch::kBFloat16 &&
+                    norm_weight->numel() == H,
+                    "fused DSV4 mHC RMSNorm expects a 4096-element bf16 weight");
+        dsv4_mhc::apply_pre_mix_rms_norm<dsv4_mhc::MIXES + 1>
+            <<<T, dsv4_mhc::THREADS, 0, stream()>>>(
+                fp(partial), bp(residual_out), bp(*norm_weight),
+                bpm(layer_input), float(norm_eps));
+    } else {
+        dsv4_mhc::apply_pre_mix<dsv4_mhc::MIXES + 1>
+            <<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, T),
+                dsv4_mhc::THREADS, 0, stream()>>>(
+                fp(partial), bp(residual_out), bpm(layer_input), H);
+    }
+    return {residual_out, next_post, next_comb, layer_input};
+}
+
+static torch::Tensor py_dsv4_mhc_post(
+        torch::Tensor x, torch::Tensor residual, torch::Tensor post_mix,
+        torch::Tensor comb_mix) {
+    CK(x); CK(residual); CK(post_mix); CK(comb_mix);
+    const int T = residual.size(0), H = residual.size(2);
+    auto output = torch::empty_like(residual);
+    dsv4_mhc::post<<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, T),
+                          dsv4_mhc::THREADS, 0, stream()>>>(
+        bp(x), bp(residual), fp(post_mix), fp(comb_mix), bpm(output), H);
+    return output;
+}
+
+static torch::Tensor py_dsv4_hc_head(
+        torch::Tensor residual, torch::Tensor fn, torch::Tensor hc_scale,
+        torch::Tensor hc_base, double rms_eps, double hc_eps) {
+    CK(residual); CK(fn); CK(hc_scale); CK(hc_base);
+    TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
+                fn.scalar_type() == torch::kFloat16,
+                "HC head fn must be float16 or float32");
+    const int T = residual.size(0), H = residual.size(2);
+    TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::HC,
+                "DSV4 HC head expects hc_mult=4");
+    auto partial = torch::empty(
+        {T, dsv4_mhc::SPLITS, dsv4_mhc::HC + 1},
+        fn.options().dtype(torch::kFloat32));
+    auto output = torch::empty({T, H}, residual.options());
+    launch_dsv4_mhc_partials<dsv4_mhc::HC, false>(
+        nullptr, bp(residual), nullptr, nullptr, fn, nullptr, fpm(partial), H,
+        dim3(dsv4_mhc::SPLITS, T));
+    dsv4_mhc::finalize_head_mix<<<T, 32, 0, stream()>>>(
+        fpm(partial), fp(hc_scale), fp(hc_base), H, float(rms_eps), float(hc_eps));
+    dsv4_mhc::apply_pre_mix<dsv4_mhc::HC + 1>
+        <<<dim3((H + dsv4_mhc::THREADS - 1) / dsv4_mhc::THREADS, T),
+            dsv4_mhc::THREADS, 0, stream()>>>(
+            fp(partial), bp(residual), bpm(output), H);
+    return output;
+}
 
 // ---- kv cache management ----
 static void py_kv_scatter(torch::Tensor key, torch::Tensor value, torch::Tensor slot_mapping,
@@ -706,34 +1149,193 @@ static void py_prepare_dflash_inputs(torch::Tensor out_input_ids,
 static torch::Tensor py_fp8_paged_mqa_logits(torch::Tensor q,
         torch::Tensor kv_cache, torch::Tensor weights,
         torch::Tensor context_lens, torch::Tensor block_tables,
-        int64_t max_model_len) {
-    CK(q); CK(kv_cache); CK(weights); CK(context_lens); CK(block_tables);
-    TORCH_CHECK(weights.scalar_type() == torch::kFloat, "weights must be fp32");
+        int64_t max_model_len, int64_t token_shard_rank,
+        int64_t token_shard_world_size, int64_t trivial_topk) {
+    CK(q); CK(weights); CK(context_lens); CK(block_tables);
+    TORCH_CHECK(kv_cache.is_cuda(), "kv_cache must be CUDA");
+    TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8, "kv_cache must be uint8");
     TORCH_CHECK(context_lens.scalar_type() == torch::kInt, "context_lens int32");
     TORCH_CHECK(block_tables.scalar_type() == torch::kInt, "block_tables int32");
-    constexpr int D = 128, NT = 64, NWARP = 4;
+    constexpr int D = 128;
     const int B = (int)q.size(0), H = (int)q.size(2);
+    TORCH_CHECK(q.scalar_type() == torch::kFloat8_e4m3fn,
+                "indexer Q must be FP8 E4M3FN");
+    TORCH_CHECK(weights.scalar_type() == torch::kFloat,
+                "quantized indexer weights must be FP32");
     TORCH_CHECK(q.size(3) == D, "indexer head_dim must be ", D);
     TORCH_CHECK(q.size(1) == 1, "paged logits path is next_n==1 (decode)");
-    TORCH_CHECK(H <= 16 * NWARP, "H exceeds heads per block");
+    TORCH_CHECK(H <= 64, "H exceeds heads per block");
+    TORCH_CHECK(token_shard_world_size > 0 && token_shard_rank >= 0 &&
+                    token_shard_rank < token_shard_world_size,
+                "invalid indexer token shard");
+    TORCH_CHECK(kv_cache.dim() == 3 || kv_cache.dim() == 4,
+                "kv_cache must be [num_blocks, block_size, bytes] or "
+                "[num_blocks, block_size, 1, bytes]");
     const int block_size = (int)kv_cache.size(1);
+    const long kv_block_stride = (long)kv_cache.stride(0);
+    TORCH_CHECK(kv_block_stride >= (long)block_size * (D + 4),
+                "kv_cache block stride is too small for fp8 indexer cache");
 
-    auto out = torch::full({B, (long)max_model_len},
-                           -std::numeric_limits<float>::infinity(),
-                           q.options().dtype(torch::kFloat));
-    const size_t smem = tms::indexer_paged_mqa_logits_smem<D, NT, NWARP>();
-    auto kern = tms::indexer_paged_mqa_logits<D, NT, NWARP>;
-    if (smem > 48 * 1024)
-        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem);
-    dim3 grid((unsigned)((max_model_len + NT - 1) / NT), (unsigned)B);
-    kern<<<grid, 32 * NWARP, smem, stream()>>>(
-        reinterpret_cast<const uint8_t*>(q.data_ptr()),
-        reinterpret_cast<const uint8_t*>(kv_cache.data_ptr()),
-        weights.data_ptr<float>(), context_lens.data_ptr<int>(),
-        block_tables.data_ptr<int>(), out.data_ptr<float>(), H, block_size,
-        (int)block_tables.size(1), (int)max_model_len);
+    // TP ranks score disjoint interleaved token ranges. Interleaving balances
+    // every prefix rather than leaving short contexts entirely on rank zero.
+    // Local top-k candidates are sufficient for an exact global top-k merge,
+    // while both this kernel and persistent_topk process only 1/TP of the
+    // 1M-token ceiling.
+    const int local_max_len = int(
+        (max_model_len + token_shard_world_size - 1) / token_shard_world_size);
+    auto out = torch::empty({B, (long)local_max_len},
+                            q.options().dtype(torch::kFloat));
+    static const int persistent_ctas = [] {
+        const char* value = std::getenv("VLLM_DSV4_INDEXER_CTAS");
+        return value == nullptr ? 216 : std::max(1, std::atoi(value));
+    }();
+    static const int short_context_threshold = [] {
+        const char* value =
+            std::getenv("VLLM_DSV4_INDEXER_SHORT_CONTEXT_THRESHOLD");
+        return value == nullptr ? 4096 : std::max(0, std::atoi(value));
+    }();
+    static const int head_shard_schedule = [] {
+        const char* value = std::getenv("VLLM_DSV4_INDEXER_HEAD_SHARD_SCHEDULE");
+        return value == nullptr ? 3 : std::max(0, std::atoi(value));
+    }();
+    const int logical_nt = H > 32
+        ? 32
+        : short_context_threshold > 0 ? 8 : 16;
+    const int max_tiles = int((local_max_len + logical_nt - 1) / logical_nt);
+    const dim3 grid((unsigned)std::min(max_tiles, persistent_ctas),
+                    (unsigned)B);
+    auto launch = [&]<int NT, int HEAD_WARPS, int TOKEN_GROUPS>() {
+        const size_t smem =
+            tms::indexer_paged_mqa_logits_smem<D, NT, HEAD_WARPS, TOKEN_GROUPS>();
+        auto kern =
+            tms::indexer_paged_mqa_logits<D, NT, HEAD_WARPS, TOKEN_GROUPS>;
+        constexpr int threads =
+            32 * HEAD_WARPS * TOKEN_GROUPS > 128
+                ? 32 * HEAD_WARPS * TOKEN_GROUPS
+                : 128;
+        if (smem > 48 * 1024)
+            cudaFuncSetAttribute(
+                kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        kern<<<grid, threads, smem, stream()>>>(
+            reinterpret_cast<const uint8_t*>(q.data_ptr()),
+            reinterpret_cast<const uint8_t*>(kv_cache.data_ptr()),
+            weights.data_ptr<float>(), context_lens.data_ptr<int>(),
+            block_tables.data_ptr<int>(), out.data_ptr<float>(),
+            H, block_size, kv_block_stride,
+            (int)block_tables.size(1), local_max_len,
+            int(token_shard_rank), int(token_shard_world_size),
+            short_context_threshold, int(trivial_topk));
+    };
+    if (H <= 16) {
+        if (head_shard_schedule == 0)
+            launch.template operator()<16, 1, 1>();
+        else if (head_shard_schedule == 2)
+            launch.template operator()<32, 1, 4>();
+        else
+            launch.template operator()<16, 1, 2>();
+    } else if (H <= 32) {
+        if (head_shard_schedule == 0)
+            launch.template operator()<16, 2, 1>();
+        else if (head_shard_schedule == 1)
+            launch.template operator()<16, 2, 2>();
+        else if (head_shard_schedule == 3)
+            launch.template operator()<32, 2, 4>();
+        else
+            launch.template operator()<32, 2, 2>();
+    } else {
+        launch.template operator()<32, 4, 4>();
+    }
     return out;
+}
+
+__global__ void indexer_pack_tp_candidates_k(
+        const float* __restrict__ logits, const int* __restrict__ indices,
+        float* __restrict__ packed, int rows, int k, int logit_stride,
+        int token_shard_rank, int token_shard_world) {
+    const int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = rows * k;
+    if (i >= total) return;
+    const int row = i / k;
+    const int local_id = indices[i];
+    const bool valid = local_id >= 0 && local_id < logit_stride;
+    packed[2 * i] = valid ? logits[(size_t)row * logit_stride + local_id]
+                          : -3.4028234663852886e38f;
+    packed[2 * i + 1] = valid
+        ? float(local_id * token_shard_world + token_shard_rank)
+        : -1.0f;
+}
+
+static torch::Tensor py_indexer_pack_tp_candidates(
+        torch::Tensor logits, torch::Tensor indices, int64_t token_shard_rank,
+        int64_t token_shard_world_size) {
+    CKD(logits, torch::kFloat); CKD(indices, torch::kInt);
+    TORCH_CHECK(logits.dim() == 2 && indices.dim() == 2 &&
+                    logits.size(0) == indices.size(0),
+                "indexer TP candidate shape mismatch");
+    const int rows = int(indices.size(0)), k = int(indices.size(1));
+    auto packed = torch::empty({rows, k, 2}, logits.options());
+    const int total = rows * k;
+    if (total > 0)
+        indexer_pack_tp_candidates_k<<<(total + 255) / 256, 256, 0, stream()>>>(
+            logits.data_ptr<float>(), indices.data_ptr<int>(),
+            packed.data_ptr<float>(), rows, k, int(logits.size(1)),
+            int(token_shard_rank), int(token_shard_world_size));
+    return packed;
+}
+
+__global__ void indexer_unpack_tp_scores_k(
+        const float* __restrict__ packed, float* __restrict__ scores,
+        int* __restrict__ lengths, int rows, int candidates) {
+    const int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = rows * candidates;
+    if (i < total) scores[i] = packed[2 * i];
+    if (i < rows) lengths[i] = candidates;
+}
+
+static std::tuple<torch::Tensor, torch::Tensor> py_indexer_unpack_tp_scores(
+        torch::Tensor packed) {
+    CKD(packed, torch::kFloat);
+    TORCH_CHECK(packed.dim() == 3 && packed.size(2) == 2,
+                "indexer gathered candidates must be [rows, candidates, 2]");
+    const int rows = int(packed.size(0)), candidates = int(packed.size(1));
+    auto scores = torch::empty({rows, candidates}, packed.options());
+    auto lengths = torch::empty(
+        {rows}, packed.options().dtype(torch::kInt));
+    const int work = std::max(rows * candidates, rows);
+    if (work > 0)
+        indexer_unpack_tp_scores_k<<<(work + 255) / 256, 256, 0, stream()>>>(
+            packed.data_ptr<float>(), scores.data_ptr<float>(),
+            lengths.data_ptr<int>(), rows, candidates);
+    return std::make_tuple(scores, lengths);
+}
+
+__global__ void indexer_resolve_tp_candidates_k(
+        const float* __restrict__ packed, const int* __restrict__ positions,
+        int* __restrict__ output, int rows, int k, int candidates) {
+    const int i = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total = rows * k;
+    if (i >= total) return;
+    const int row = i / k;
+    const int pos = positions[i];
+    output[i] = pos >= 0 && pos < candidates
+        ? __float2int_rn(packed[((size_t)row * candidates + pos) * 2 + 1])
+        : -1;
+}
+
+static void py_indexer_resolve_tp_candidates(
+        torch::Tensor packed, torch::Tensor positions, torch::Tensor output) {
+    CKD(packed, torch::kFloat); CKD(positions, torch::kInt);
+    CKD(output, torch::kInt);
+    TORCH_CHECK(packed.dim() == 3 && packed.size(2) == 2 &&
+                    positions.dim() == 2 && output.sizes() == positions.sizes() &&
+                    packed.size(0) == positions.size(0),
+                "indexer TP resolve shape mismatch");
+    const int rows = int(positions.size(0)), k = int(positions.size(1));
+    const int total = rows * k;
+    if (total > 0)
+        indexer_resolve_tp_candidates_k<<<(total + 255) / 256, 256, 0, stream()>>>(
+            packed.data_ptr<float>(), positions.data_ptr<int>(),
+            output.data_ptr<int>(), rows, k, int(packed.size(1)));
 }
 
 // Non-paged (prefill) indexer logits: the tensor-core kernel from
@@ -909,6 +1511,170 @@ static torch::Tensor py_sparse_topk_tlen(torch::Tensor indices) {
     return tlen;
 }
 
+static int dsv4_mla_persistent_partitions();
+
+static int dsv4_partitions(int max_topk, int partition_size) {
+    if (max_topk <= 0) return 0;
+    if (partition_size <= 0) return 1;
+    // The persistent kernel balances the request's actual sparse length over
+    // its logical partitions. More logical partitions than resident warps only
+    // enlarge the fp32 partial workspace and make each resident warp loop over
+    // additional empty partitions. This is especially costly for C128A, whose
+    // metadata width is padded for the 1M-token ceiling: batch-32 warmup used
+    // to request 17.5 GiB of partials for a handful of valid indices.
+    return std::min(
+        int((max_topk + partition_size - 1) / partition_size),
+        dsv4_mla_persistent_partitions());
+}
+
+static int dsv4_mla_persistent_partitions() {
+    static const int partitions = [] {
+        const char* value = std::getenv("VLLM_DSV4_MLA_PERSISTENT_PARTITIONS");
+        return value == nullptr ? 64 : std::max(1, std::atoi(value));
+    }();
+    return partitions;
+}
+
+static bool dsv4_mla_adaptive_partitions_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("VLLM_DSV4_MLA_ADAPTIVE_PARTITIONS");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+static void launch_mla_decode_fp8_sparse_dsv4_merged(
+        torch::Tensor q,
+        torch::Tensor main_cache, torch::Tensor main_bt,
+        torch::Tensor main_indices, torch::Tensor main_topk_length,
+        bool main_indices_are_slots, int main_block_size, int main_partitions,
+        torch::Tensor extra_cache, torch::Tensor extra_bt,
+        torch::Tensor extra_indices, torch::Tensor extra_topk_length,
+        bool extra_indices_are_slots, int extra_block_size,
+        int extra_partitions, double scale, int partition_size,
+        float* tmp, float* ml, float* es) {
+    const int B = q.size(0), H = q.size(1);
+    const int main_launched = std::min(
+        main_partitions, dsv4_mla_persistent_partitions());
+    const int extra_launched = std::min(
+        extra_partitions, dsv4_mla_persistent_partitions());
+    const int launched = main_launched + extra_launched;
+    if (launched <= 0) return;
+
+    constexpr int SCALE_SLOT_STRIDE_BYTES = 8;
+    const int main_page_stride_bytes = int(main_cache.stride(0));
+    const int extra_page_stride_bytes = int(extra_cache.stride(0));
+    const int main_scale_block_offset_bytes = main_block_size * 576;
+    const int extra_scale_block_offset_bytes = extra_block_size * 576;
+    const int total_partitions = main_partitions + extra_partitions;
+    mla_decode_fp8_v<true, true><<<dim3(H, B, launched), 32, 0, stream()>>>(
+        bp(q), main_cache.data_ptr<uint8_t>(), main_cache.data_ptr<uint8_t>(),
+        main_bt.numel() > 0 ? main_bt.data_ptr<int>() : nullptr, nullptr,
+        main_indices.data_ptr<int>(), main_topk_length.data_ptr<int>(),
+        int(main_indices.size(1)), nullptr, tmp, ml, es, main_block_size,
+        main_bt.numel() > 0 ? int(main_bt.size(1)) : 0, float(scale), H,
+        main_partitions, partition_size, 1.0f, nullptr, 0,
+        main_page_stride_bytes, main_scale_block_offset_bytes,
+        SCALE_SLOT_STRIDE_BYTES, total_partitions, 0,
+        main_indices_are_slots, true,
+        extra_cache.data_ptr<uint8_t>(), extra_cache.data_ptr<uint8_t>(),
+        extra_bt.numel() > 0 ? extra_bt.data_ptr<int>() : nullptr, nullptr,
+        extra_indices.data_ptr<int>(), extra_topk_length.data_ptr<int>(),
+        int(extra_indices.size(1)), extra_block_size,
+        extra_bt.numel() > 0 ? int(extra_bt.size(1)) : 0,
+        extra_partitions, partition_size, 1.0f, extra_page_stride_bytes,
+        extra_scale_block_offset_bytes, SCALE_SLOT_STRIDE_BYTES,
+        main_partitions, extra_indices_are_slots, main_launched,
+        extra_launched, int(main_cache.size(0)), int(extra_cache.size(0)));
+}
+
+static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
+        torch::Tensor q,
+        torch::Tensor main_cache, torch::Tensor main_bt,
+        torch::Tensor main_indices, torch::Tensor main_topk_length,
+        bool main_indices_are_slots,
+        torch::Tensor extra_cache, torch::Tensor extra_bt,
+        torch::Tensor extra_indices, torch::Tensor extra_topk_length,
+        bool extra_indices_are_slots,
+        c10::optional<torch::Tensor> sink,
+        int64_t main_block_size, int64_t extra_block_size,
+        double scale, int64_t partition_size) {
+    CK(q); CK(main_indices); CK(main_topk_length);
+    CK(extra_indices); CK(extra_topk_length);
+    TORCH_CHECK(main_cache.is_cuda(), "main_cache must be CUDA");
+    TORCH_CHECK(extra_cache.is_cuda(), "extra_cache must be CUDA");
+    if (main_bt.numel() > 0) CK(main_bt);
+    if (extra_bt.numel() > 0) CK(extra_bt);
+    if (sink) {
+        TORCH_CHECK(sink->is_cuda() && sink->is_contiguous(),
+                    "sink must be contiguous CUDA");
+    }
+    TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bf16");
+    TORCH_CHECK(main_cache.scalar_type() == torch::kUInt8, "main_cache must be uint8");
+    TORCH_CHECK(extra_cache.scalar_type() == torch::kUInt8, "extra_cache must be uint8");
+    TORCH_CHECK(main_indices.scalar_type() == torch::kInt, "main_indices must be int32");
+    TORCH_CHECK(extra_indices.scalar_type() == torch::kInt, "extra_indices must be int32");
+    TORCH_CHECK(q.size(2) == 512, "DSV4 MLA expects q width 512, got ", q.size(2));
+    const int B = q.size(0), H = q.size(1);
+    TORCH_CHECK(main_indices.size(0) == B && main_topk_length.size(0) == B,
+                "main sparse metadata batch mismatch");
+    TORCH_CHECK(extra_indices.size(0) == B && extra_topk_length.size(0) == B,
+                "extra sparse metadata batch mismatch");
+    if (sink) TORCH_CHECK(sink->size(0) >= H, "sink must have at least H entries");
+
+    int ps = int(partition_size);
+    if (dsv4_mla_adaptive_partitions_enabled() &&
+        extra_indices.size(1) >= 1024 && ps > 2)
+        ps = 2;
+    int main_p = dsv4_partitions(int(main_indices.size(1)), ps);
+    int extra_p = dsv4_partitions(int(extra_indices.size(1)), ps);
+    // Split-K partials are fp32 [B, H, partitions, 512]. Keep full persistent
+    // occupancy for latency-critical batch-one decode, but bound graph warmup
+    // and high-concurrency decode to a fixed workspace. The kernel balances the
+    // actual sparse length over however many partitions remain.
+    constexpr int64_t MAX_PARTIAL_BYTES = int64_t(256) << 20;
+    const int active_sources = (main_p > 0 ? 1 : 0) + (extra_p > 0 ? 1 : 0);
+    if (active_sources > 0) {
+        const int64_t bytes_per_partition =
+            int64_t(B) * H * 512 * int64_t(sizeof(float));
+        const int max_total_partitions = std::max(
+            active_sources,
+            int(MAX_PARTIAL_BYTES / std::max<int64_t>(bytes_per_partition, 1)));
+        const int per_source_cap =
+            std::max(1, max_total_partitions / active_sources);
+        main_p = std::min(main_p, per_source_cap);
+        extra_p = std::min(extra_p, per_source_cap);
+    }
+    const int total_p = main_p + extra_p;
+    auto out = torch::empty_like(q);
+    if (total_p == 0) {
+        out.zero_();
+        return out;
+    }
+    if (ps <= 0) {
+        const int max_width = std::max(int(main_indices.size(1)), int(extra_indices.size(1)));
+        ps = std::max(max_width, 1);
+    }
+
+    auto opts = q.options().dtype(torch::kFloat);
+    auto tmp = torch::empty({B, H, total_p, 512}, opts);
+    auto ml = torch::empty({B, H, total_p}, opts);
+    auto es = torch::empty({B, H, total_p}, opts);
+    launch_mla_decode_fp8_sparse_dsv4_merged(
+        q, main_cache, main_bt, main_indices, main_topk_length,
+        main_indices_are_slots, int(main_block_size), main_p,
+        extra_cache, extra_bt, extra_indices, extra_topk_length,
+        extra_indices_are_slots, int(extra_block_size), extra_p, scale, ps,
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>());
+    dsv4_attention_reduce_active_channels<__nv_bfloat16, 512>
+        <<<dim3(H, B), 512, total_p * sizeof(float), stream()>>>(
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
+        main_topk_length.data_ptr<int>(), extra_topk_length.data_ptr<int>(),
+        sink ? sink->data_ptr<float>() : nullptr, bpm(out), H, main_p, extra_p,
+        total_p);
+    return out;
+}
+
 static torch::Tensor py_mla_decode_fp8_sparse(torch::Tensor q, torch::Tensor data,
         torch::Tensor scl, torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, int64_t partition_size) {
@@ -981,7 +1747,7 @@ static void py_turboquant_store_fp8(torch::Tensor key, torch::Tensor value,
     const int NH = key.size(0), D = key.size(1), H = int(num_kv_heads);
     const int block_size = kv_cache.size(1);
     const int vdb = (D * int(vqb) + 7) / 8;
-    TORCH_CHECK(D <= 256, "turboquant store supports D <= 256");
+    TORCH_CHECK(D <= 512, "turboquant store supports D <= 512");
     if (NH == 0) return;
     #define LAUNCH(T, RD, ST) tq_store_fp8<T, ST><<<NH, 32, 0, stream()>>>( \
         RD(key), RD(value), kv_cache.data_ptr<uint8_t>(), \
@@ -1010,7 +1776,7 @@ static void py_turboquant_store_mse(torch::Tensor y, torch::Tensor norms,
     const int block_size = kv_cache.size(1);
     const int mse_bytes = (D * int(mse_bits) + 7) / 8;
     const int vdb = (D * int(vqb) + 7) / 8;
-    TORCH_CHECK(D <= 256, "turboquant store supports D <= 256");
+    TORCH_CHECK(D <= 512, "turboquant store supports D <= 512");
     if (NH == 0) return;
     #define LAUNCH(ST) tq_store_mse<ST><<<NH, 32, 0, stream()>>>( \
         y.data_ptr<float>(), norms.data_ptr<float>(), value.data_ptr<float>(), \
@@ -1033,9 +1799,28 @@ static void py_turboquant_decode_stage1(torch::Tensor q_rot, torch::Tensor kv_ca
                 "innermost dims must be contiguous");
     const int B = q_rot.size(0), Hq = q_rot.size(1), D = q_rot.size(2);
     const int Hk = kv_cache.size(2), block_size = kv_cache.size(1);
-    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant decode supports D in {32,64,96,128}");
-    const int mse_bytes = (D * int(mse_bits) + 7) / 8;
+    TORCH_CHECK(block_table.scalar_type() == torch::kInt &&
+                    seq_lens.scalar_type() == torch::kInt,
+                "turboquant decode expects int32 block_table and seq_lens");
+    TORCH_CHECK(centroids.scalar_type() == torch::kFloat &&
+                    mid_o.scalar_type() == torch::kFloat,
+                "turboquant decode expects fp32 centroids and mid_o");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) >= B &&
+                    seq_lens.numel() >= B,
+                "turboquant decode metadata batch is smaller than query batch");
+    TORCH_CHECK(Hk > 0 && Hq % Hk == 0,
+                "turboquant decode requires query heads divisible by KV heads");
+    TORCH_CHECK(mid_o.dim() == 4 && mid_o.size(0) >= B &&
+                    mid_o.size(1) >= Hq && mid_o.size(2) >= num_splits &&
+                    mid_o.size(3) >= D + 1,
+                "turboquant decode mid_o workspace is too small");
     const int vdb = (D * int(vqb) + 7) / 8;
+    TORCH_CHECK(kps + vdb + 4 <= kv_cache.size(3),
+                "turboquant decode cache slot is smaller than packed K/V layout");
+    TORCH_CHECK(num_splits > 0, "turboquant decode requires num_splits > 0");
+    TORCH_CHECK(D % 32 == 0 && D <= 512,
+                "turboquant decode supports 32-aligned D <= 512");
+    const int mse_bytes = (D * int(mse_bits) + 7) / 8;
     if (B == 0) return;
     dim3 grid(B, Hq, unsigned(num_splits));
     #define LAUNCH(T, RD) tq_decode_stage1<T><<<grid, 32, 0, stream()>>>( \
@@ -1060,7 +1845,8 @@ static void py_turboquant_decode_stage2(torch::Tensor mid_o, torch::Tensor outpu
     TORCH_CHECK(mid_o.stride(3) == 1 && output.stride(2) == 1,
                 "innermost dims must be contiguous");
     const int B = output.size(0), Hq = output.size(1), D = output.size(2);
-    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant decode supports D in {32,64,96,128}");
+    TORCH_CHECK(D % 32 == 0 && D <= 512,
+                "turboquant decode supports 32-aligned D <= 512");
     if (B == 0) return;
     dim3 grid(B, Hq);
     #define LAUNCH(T, WP) tq_decode_stage2<T><<<grid, 32, 0, stream()>>>( \
@@ -1085,7 +1871,8 @@ static void py_turboquant_dequant_kv(torch::Tensor kv_cache, torch::Tensor block
     TORCH_CHECK(k_out.scalar_type() == torch::kHalf, "dequant writes fp16");
     const int B = k_out.size(0), Hk = k_out.size(1), D = k_out.size(3);
     const int block_size = kv_cache.size(1);
-    TORCH_CHECK(D % 32 == 0 && D <= 128, "turboquant dequant supports D in {32,64,96,128}");
+    TORCH_CHECK(D % 32 == 0 && D <= 512,
+                "turboquant dequant supports 32-aligned D <= 512");
     const int mse_bytes = (D * int(mse_bits) + 7) / 8;
     const int vdb = (D * int(vqb) + 7) / 8;
     if (num_positions == 0) return;
@@ -1101,6 +1888,37 @@ static void py_turboquant_dequant_kv(torch::Tensor kv_cache, torch::Tensor block
 }
 
 void init_serving(py::module_& m) {
+    m.def("dsv4_router_gemm", &py_dsv4_router_gemm, py::arg("x"),
+          py::arg("weight"));
+    m.def("dsv4_hash_router", &py_dsv4_hash_router, py::arg("x"),
+          py::arg("weight"), py::arg("input_ids"), py::arg("tid2eid"),
+          py::arg("routed_scaling_factor"), py::arg("is_padding") = c10::nullopt);
+    m.def("dsv4_hash_router_debug", &py_dsv4_hash_router_debug);
+    m.def("dsv4_projection_gemv", &py_dsv4_projection_gemv, py::arg("x"),
+          py::arg("weight"), py::arg("bf16_output") = false);
+    m.def("fill_short_context_topk_indices",
+          &py_fill_short_context_topk_indices, py::arg("output"),
+          py::arg("positions"), py::arg("topk"),
+          py::arg("compress_ratio"));
+    m.def("dsv4_mhc_pre", &py_dsv4_mhc_pre,
+          py::arg("residual"), py::arg("fn"), py::arg("hc_scale"),
+          py::arg("hc_base"), py::arg("rms_eps"), py::arg("pre_eps"),
+          py::arg("sinkhorn_eps"), py::arg("post_multiplier"),
+          py::arg("sinkhorn_repeat"), py::arg("norm_weight") = c10::nullopt,
+          py::arg("norm_eps") = 0.0);
+    m.def("dsv4_mhc_fused_post_pre", &py_dsv4_mhc_fused_post_pre,
+          py::arg("x"), py::arg("residual"), py::arg("post_mix"),
+          py::arg("comb_mix"), py::arg("fn"), py::arg("hc_scale"),
+          py::arg("hc_base"), py::arg("rms_eps"), py::arg("pre_eps"),
+          py::arg("sinkhorn_eps"), py::arg("post_multiplier"),
+          py::arg("sinkhorn_repeat"), py::arg("norm_weight") = c10::nullopt,
+          py::arg("norm_eps") = 0.0);
+    m.def("dsv4_mhc_post", &py_dsv4_mhc_post,
+          py::arg("x"), py::arg("residual"), py::arg("post_mix"),
+          py::arg("comb_mix"));
+    m.def("dsv4_hc_head", &py_dsv4_hc_head,
+          py::arg("residual"), py::arg("fn"), py::arg("hc_scale"),
+          py::arg("hc_base"), py::arg("rms_eps"), py::arg("hc_eps"));
     m.def("mla_kv_insert", &py_mla_kv_insert, py::arg("kv_c"), py::arg("k_pe"), py::arg("cos"),
           py::arg("sin"), py::arg("positions"), py::arg("slot_mapping"), py::arg("kv_cache"),
           py::arg("block_size"), py::arg("norm_mode") = 0, py::arg("eps") = 1e-6,
@@ -1117,7 +1935,16 @@ void init_serving(py::module_& m) {
     m.def("fp8_paged_mqa_logits", &py_fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_tables"),
-          py::arg("max_model_len"));
+          py::arg("max_model_len"), py::arg("token_shard_rank") = 0,
+          py::arg("token_shard_world_size") = 1,
+          py::arg("trivial_topk") = 0);
+    m.def("indexer_pack_tp_candidates", &py_indexer_pack_tp_candidates,
+          py::arg("logits"), py::arg("indices"), py::arg("token_shard_rank"),
+          py::arg("token_shard_world_size"));
+    m.def("indexer_unpack_tp_scores", &py_indexer_unpack_tp_scores,
+          py::arg("packed"));
+    m.def("indexer_resolve_tp_candidates", &py_indexer_resolve_tp_candidates,
+          py::arg("packed"), py::arg("positions"), py::arg("output"));
     m.def("fp8_mqa_logits", &py_fp8_mqa_logits,
           py::arg("q"), py::arg("k"), py::arg("kscale"), py::arg("weights"),
           py::arg("ks"), py::arg("ke"));
@@ -1220,6 +2047,17 @@ void init_serving(py::module_& m) {
           py::arg("scale_cache"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
           py::arg("partition_size") = 0);
+    m.def("mla_decode_fp8_sparse_dsv4", &py_mla_decode_fp8_sparse_dsv4,
+          py::arg("q"),
+          py::arg("main_cache"), py::arg("main_block_table"),
+          py::arg("main_indices"), py::arg("main_topk_length"),
+          py::arg("main_indices_are_slots"),
+          py::arg("extra_cache"), py::arg("extra_block_table"),
+          py::arg("extra_indices"), py::arg("extra_topk_length"),
+          py::arg("extra_indices_are_slots"),
+          py::arg("sink"),
+          py::arg("main_block_size"), py::arg("extra_block_size"),
+          py::arg("scale"), py::arg("partition_size") = 0);
     m.def("paged_attention_gqa_staged", &py_paged_attention_gqa_staged);
     m.def("attn_window", &py_attn_window, py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("scale"), py::arg("window") = 0);

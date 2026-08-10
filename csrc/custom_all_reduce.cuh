@@ -13,10 +13,16 @@ typedef __hip_bfloat16 nv_bfloat16;
 #include <array>
 #include <limits>
 #include <map>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include <cstdlib>
 #include <cstring>
+
+#if !defined(USE_ROCM)
+#include "quixicore/serving/mhc_ampere.cuh"
+#include "libtorch_stable/quantization/gguf/ggml-common.h"
+#endif
 
 namespace vllm {
 #define CUDACHECK(cmd)                                              \
@@ -30,7 +36,7 @@ namespace vllm {
   } while (0)
 
 // Maximal number of blocks in allreduce kernel.
-constexpr int kMaxBlocks = 36;
+constexpr int kMaxBlocks = 64;
 
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
@@ -56,6 +62,27 @@ struct Signal {
   alignas(128) FlagType start[kMaxBlocks][8];
   alignas(128) FlagType end[kMaxBlocks][8];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
+  // DSV4 TP-owned mHC projection state. Urgent coefficients are published
+  // before the existing end epoch; deferred coefficients are published by the
+  // auxiliary stream and made visible by the next existing start epoch.
+  alignas(128) float dsv4_mhc_pre[4];
+  alignas(128) float dsv4_mhc_deferred[20];
+  // Channel-owned mHC uses dedicated stage epochs because its three control
+  // exchanges cannot share the generic start/end epoch. Peer payloads are
+  // double-buffered; a rank cannot reach epoch N+2 until every peer published
+  // epoch N+1, which makes reuse of the parity-N payload explicit and safe.
+  alignas(128) FlagType dsv4_channel_epoch[3];
+  alignas(128) FlagType dsv4_channel_ready[3][8];
+  alignas(128) FlagType dsv4_channel_q2_epoch;
+  alignas(128) FlagType dsv4_channel_q2_ready[8];
+  alignas(128) FlagType dsv4_channel_q2_done[8];
+  // Generic output-owned Q8 projection publication. This is separate from
+  // routed MoE state so attention and shared projections have one explicit,
+  // reusable TP ownership contract.
+  alignas(128) FlagType dsv4_owned_epoch;
+  alignas(128) FlagType dsv4_owned_ready[8];
+  alignas(128) FlagType dsv4_rs_epoch;
+  alignas(128) FlagType dsv4_rs_ready[8];
 };
 
 struct __align__(16) RankData {
@@ -196,7 +223,7 @@ static DINLINE FlagType ld_flag_volatile(FlagType* flag_addr) {
 // reduce kernel. Thus, it doesn't need to make any visibility guarantees for
 // prior memory accesses. Note: volatile writes will not be reordered against
 // other volatile writes.
-template <int ngpus>
+template <int ngpus, bool acquire_previous = false>
 DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
@@ -205,8 +232,13 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
     auto self_counter_ptr = &self_sg->start[blockIdx.x][threadIdx.x];
     // Write the expected counter value to peer and wait for correct value
     // from peer.
-    st_flag_volatile(peer_counter_ptr, flag);
-    while (ld_flag_volatile(self_counter_ptr) != flag);
+    if constexpr (acquire_previous) {
+      st_flag_release(peer_counter_ptr, flag);
+      while (ld_flag_acquire(self_counter_ptr) != flag);
+    } else {
+      st_flag_volatile(peer_counter_ptr, flag);
+      while (ld_flag_volatile(self_counter_ptr) != flag);
+    }
   }
   __syncthreads();
   // use one thread to update flag
@@ -373,6 +405,15 @@ DINLINE P* get_tmp_buf(Signal* sg) {
   return (P*)(((Signal*)sg) + 1);
 }
 
+#if !defined(USE_ROCM)
+#include "quixicore/serving/mhc_allreduce_ampere.cuh"
+#include "quixicore/serving/dsv4_q2_mhc_ampere.cuh"
+#include "quixicore/serving/mhc_channel_owned_ampere.cuh"
+#include "quixicore/serving/tp_output_owned_ampere.cuh"
+#include "quixicore/serving/tp_reduce_scatter_ampere.cuh"
+#include "quixicore/serving/tp_input_owned_ampere.cuh"
+#endif
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -456,6 +497,22 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
+#if !defined(USE_ROCM)
+  enum class Dsv4MhcSchedule {
+    kMonolithic,
+    kSequentialSplit,
+    kAsyncSplit,
+  };
+  Dsv4MhcSchedule dsv4_mhc_schedule_ = Dsv4MhcSchedule::kMonolithic;
+  cudaStream_t dsv4_mhc_deferred_stream_ = nullptr;
+  cudaStream_t dsv4_q2_progress_stream_ = nullptr;
+  cudaEvent_t dsv4_mhc_urgent_done_ = nullptr;
+  cudaEvent_t dsv4_mhc_deferred_done_ = nullptr;
+  cudaEvent_t dsv4_q2_progress_start_ = nullptr;
+  cudaEvent_t dsv4_q2_progress_done_ = nullptr;
+  bool dsv4_mhc_deferred_pending_ = false;
+  bool dsv4_q2_progress_enabled_ = false;
+#endif
 
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -479,6 +536,41 @@ class CustomAllreduce {
     for (int i = 0; i < world_size_; i++) {
       sg_.signals[i] = signals[i];
     }
+#if !defined(USE_ROCM)
+    const char* schedule = std::getenv("VLLM_DSV4_MHC_SCHEDULE");
+    if (schedule != nullptr && std::strcmp(schedule, "sequential") == 0) {
+      dsv4_mhc_schedule_ = Dsv4MhcSchedule::kSequentialSplit;
+    } else if (schedule != nullptr && std::strcmp(schedule, "async") == 0) {
+      dsv4_mhc_schedule_ = Dsv4MhcSchedule::kAsyncSplit;
+      int least_priority = 0;
+      int greatest_priority = 0;
+      CUDACHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
+                                                &greatest_priority));
+      CUDACHECK(cudaStreamCreateWithPriority(&dsv4_mhc_deferred_stream_,
+                                             cudaStreamNonBlocking,
+                                             least_priority));
+      CUDACHECK(cudaEventCreateWithFlags(&dsv4_mhc_urgent_done_,
+                                        cudaEventDisableTiming));
+      CUDACHECK(cudaEventCreateWithFlags(&dsv4_mhc_deferred_done_,
+                                        cudaEventDisableTiming));
+    }
+    const char* q2_progress = std::getenv("VLLM_DSV4_Q2_MHC_PROGRESS");
+    dsv4_q2_progress_enabled_ =
+        q2_progress != nullptr && std::strcmp(q2_progress, "1") == 0;
+    if (dsv4_q2_progress_enabled_) {
+      int least_priority = 0;
+      int greatest_priority = 0;
+      CUDACHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
+                                                 &greatest_priority));
+      CUDACHECK(cudaStreamCreateWithPriority(&dsv4_q2_progress_stream_,
+                                             cudaStreamNonBlocking,
+                                             greatest_priority));
+      CUDACHECK(cudaEventCreateWithFlags(&dsv4_q2_progress_start_,
+                                         cudaEventDisableTiming));
+      CUDACHECK(cudaEventCreateWithFlags(&dsv4_q2_progress_done_,
+                                         cudaEventDisableTiming));
+    }
+#endif
   }
 
   char* open_ipc_handle(const void* ipc_handle) {
@@ -534,6 +626,25 @@ class CustomAllreduce {
     CUDACHECK(
         cudaMemcpy(d_data, &data, sizeof(RankData), cudaMemcpyHostToDevice));
     buffers_[ptrs[rank_]] = d_data;
+  }
+
+  RankData* resolve_rank_data(cudaStream_t stream, void* input) {
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      RankData* ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+      return ptrs;
+    }
+
+    auto it = buffers_.find(input);
+    if (it == buffers_.end()) {
+      throw std::runtime_error(
+          "buffer address " +
+          std::to_string(reinterpret_cast<uint64_t>(input)) +
+          " is not registered!");
+    }
+    return it->second;
   }
 
   // Note: when registering graph buffers, we intentionally choose to not
@@ -737,7 +848,395 @@ class CustomAllreduce {
 #undef NORM_CASE
   }
 
+#if !defined(USE_ROCM)
+  void wait_dsv4_mhc(cudaStream_t stream) {
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kAsyncSplit &&
+        dsv4_mhc_deferred_pending_) {
+      CUDACHECK(cudaStreamWaitEvent(stream, dsv4_mhc_deferred_done_, 0));
+      dsv4_mhc_deferred_pending_ = false;
+    }
+  }
+
+  template <typename FnT, int NGPU, bool ADD_LOCAL_PARTIAL, bool RMS_NORM_Q8,
+            bool INPUT_PREPARED = false, bool OWN_PROJECTIONS = false,
+            bool LOCAL_INPUT_OWNED = false, bool CHANNEL_OWNED_X = false>
+  void launch_dsv4_mhc(
+      cudaStream_t stream, RankData* ptrs, RankData* addend_ptrs,
+      nv_bfloat16* input, const nv_bfloat16* residual, const float* post_mix,
+      const float* comb_mix, const FnT* fn, nv_bfloat16* residual_out,
+      float* partial, const float* scale, const float* base, float* next_post,
+      float* next_comb, nv_bfloat16* layer_input, float rms_eps, float pre_eps,
+      float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat,
+      const nv_bfloat16* norm_weight,
+      tms::dsv4_mhc::block_q8_1* quant_input, float norm_eps,
+      bool publish_prepared) {
+    constexpr int splits = 16;
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kMonolithic) {
+      if (publish_prepared) {
+        throw std::runtime_error(
+            "DSV4 TP-owned mHC requires VLLM_DSV4_MHC_SCHEDULE=async");
+      }
+      if constexpr (INPUT_PREPARED || OWN_PROJECTIONS) {
+        throw std::runtime_error(
+            "DSV4 TP-owned mHC requires VLLM_DSV4_MHC_SCHEDULE=async");
+      }
+      void* args[] = {
+          &ptrs,          &addend_ptrs,   &sg_,           &self_sg_,
+          &input,         &residual,      &post_mix,      &comb_mix,
+          &fn,            &residual_out,  &partial,       &scale,
+          &base,          &next_post,     &next_comb,     &layer_input,
+          &norm_weight,   &quant_input,   &rms_eps,       &pre_eps,
+          &sinkhorn_eps,  &post_multiplier, &sinkhorn_repeat, &norm_eps,
+          &rank_,
+      };
+      auto kernel = dsv4_mhc_ar::fused_allreduce_post_pre<
+          NGPU, splits, ADD_LOCAL_PARTIAL, RMS_NORM_Q8, FnT>;
+      CUDACHECK(cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void*>(kernel), dim3(splits * 2, 1),
+          dim3(tms::dsv4_mhc::THREADS), args, 0, stream));
+      return;
+    }
+
+    wait_dsv4_mhc(stream);
+    void* urgent_args[] = {
+        &ptrs,         &addend_ptrs, &sg_,          &self_sg_,
+        &input,        &residual,    &post_mix,     &comb_mix,
+        &fn,           &residual_out, &partial,      &scale,
+        &base,         &layer_input, &norm_weight,  &quant_input,
+        &rms_eps,      &pre_eps,     &sinkhorn_eps, &sinkhorn_repeat,
+        &norm_eps,     &rank_,
+    };
+    auto urgent = dsv4_mhc_ar::fused_allreduce_post_pre_urgent<
+        NGPU, splits, ADD_LOCAL_PARTIAL, RMS_NORM_Q8, INPUT_PREPARED,
+        OWN_PROJECTIONS, LOCAL_INPUT_OWNED, CHANNEL_OWNED_X, FnT>;
+    CUDACHECK(cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(urgent), dim3(splits, 1),
+        dim3(tms::dsv4_mhc::THREADS), urgent_args, 0, stream));
+
+    cudaStream_t deferred_stream = stream;
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kAsyncSplit) {
+      CUDACHECK(cudaEventRecord(dsv4_mhc_urgent_done_, stream));
+      CUDACHECK(cudaStreamWaitEvent(dsv4_mhc_deferred_stream_,
+                                   dsv4_mhc_urgent_done_, 0));
+      deferred_stream = dsv4_mhc_deferred_stream_;
+    }
+    if (publish_prepared) {
+      void* deferred_args[] = {
+          &residual_out, &fn, &partial, &scale, &base,
+          &sg_, &rank_, &post_multiplier,
+      };
+      auto deferred =
+          dsv4_mhc_ar::fused_post_pre_deferred_owned<NGPU, splits, FnT>;
+      CUDACHECK(cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void*>(deferred), dim3(splits, 1),
+          dim3(tms::dsv4_mhc::THREADS), deferred_args, 0, deferred_stream));
+    } else {
+      void* deferred_args[] = {
+          &residual_out, &fn,              &partial,         &scale,
+          &base,         &next_post,       &next_comb,       &sinkhorn_eps,
+          &post_multiplier, &sinkhorn_repeat,
+      };
+      auto deferred = dsv4_mhc_ar::fused_post_pre_deferred<splits, FnT>;
+      CUDACHECK(cudaLaunchCooperativeKernel(
+          reinterpret_cast<const void*>(deferred), dim3(splits * 2, 1),
+          dim3(tms::dsv4_mhc::THREADS), deferred_args, 0, deferred_stream));
+    }
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kAsyncSplit) {
+      CUDACHECK(cudaEventRecord(dsv4_mhc_deferred_done_, deferred_stream));
+      dsv4_mhc_deferred_pending_ = true;
+    }
+  }
+
+  template <typename FnT>
+  void allreduce_dsv4_mhc(
+      cudaStream_t stream, nv_bfloat16* input, const nv_bfloat16* residual,
+      const float* post_mix, const float* comb_mix, const FnT* fn,
+      nv_bfloat16* residual_out, float* partial, const float* scale,
+      const float* base, float* next_post, float* next_comb,
+      nv_bfloat16* layer_input, float rms_eps, float pre_eps,
+      float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat,
+      const nv_bfloat16* norm_weight,
+      tms::dsv4_mhc::block_q8_1* quant_input, float norm_eps,
+      bool input_prepared, bool own_projections, bool publish_prepared,
+      bool local_input_owned, bool channel_owned_x) {
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "DSV4 mHC all-reduce input buffer is not registered");
+      ptrs = it->second;
+    }
+
+    RankData* addend_ptrs = nullptr;
+    auto launch_for = [&](auto ngpus_tag, auto norm_tag) {
+      constexpr int ngpus = decltype(ngpus_tag)::value;
+      constexpr bool fused_norm = decltype(norm_tag)::value;
+#define DSV4_MHC_INVOKE(input_owned, output_owned, local_owned, channel_x)    \
+      launch_dsv4_mhc<FnT, ngpus, false, fused_norm, input_owned,             \
+                      output_owned, local_owned, channel_x>(                  \
+          stream, ptrs, addend_ptrs, input, residual, post_mix, comb_mix, fn, \
+          residual_out, partial, scale, base, next_post, next_comb,           \
+          layer_input, rms_eps, pre_eps, sinkhorn_eps, post_multiplier,       \
+          sinkhorn_repeat, norm_weight, quant_input, norm_eps,                \
+          publish_prepared)
+      if (channel_owned_x) {
+        if constexpr (!fused_norm) {
+          throw std::runtime_error(
+              "DSV4 channel-owned producer requires fused RMSNorm/Q8");
+        } else if (!local_input_owned || !own_projections) {
+          throw std::runtime_error(
+              "DSV4 channel-owned producer requires local output ownership");
+        } else if (input_prepared) {
+          DSV4_MHC_INVOKE(true, true, true, true);
+        } else {
+          DSV4_MHC_INVOKE(false, true, true, true);
+        }
+      } else if (local_input_owned) {
+        if constexpr (!fused_norm) {
+          throw std::runtime_error(
+              "DSV4 local input ownership requires fused RMSNorm/Q8");
+        } else if (!own_projections) {
+          throw std::runtime_error(
+              "DSV4 local input ownership requires owned mHC projections");
+        } else if (input_prepared) {
+          DSV4_MHC_INVOKE(true, true, true, false);
+        } else {
+          DSV4_MHC_INVOKE(false, true, true, false);
+        }
+      } else if (own_projections) {
+        if (input_prepared) {
+          DSV4_MHC_INVOKE(true, true, false, false);
+        } else {
+          DSV4_MHC_INVOKE(false, true, false, false);
+        }
+      } else if (input_prepared) {
+        DSV4_MHC_INVOKE(true, false, false, false);
+      } else {
+        DSV4_MHC_INVOKE(false, false, false, false);
+      }
+#undef DSV4_MHC_INVOKE
+    };
+#define DSV4_MHC_CASE(ngpus)                                                 \
+  case ngpus: {                                                              \
+    if (norm_weight != nullptr) {                                            \
+      launch_for(std::integral_constant<int, ngpus>{}, std::true_type{});    \
+    } else {                                                                 \
+      launch_for(std::integral_constant<int, ngpus>{}, std::false_type{});   \
+    }                                                                        \
+    break;                                                                   \
+  }
+    switch (world_size_) {
+      DSV4_MHC_CASE(2)
+      DSV4_MHC_CASE(4)
+      DSV4_MHC_CASE(8)
+      default:
+        throw std::runtime_error(
+            "DSV4 fused all-reduce mHC supports TP2, TP4, and TP8");
+    }
+#undef DSV4_MHC_CASE
+  }
+
+  template <typename FnT, int NGPU, int K>
+  void launch_dsv4_q2_mhc(
+      cudaStream_t stream, const block_q8_1* pending_q8,
+      const dsv4_q2_mhc_ar::PendingQ2Header* header,
+      nv_bfloat16* local_output, RankData* output_ptrs,
+      const nv_bfloat16* local_addend, const nv_bfloat16* residual,
+      const float* post_mix, const float* comb_mix, const FnT* fn,
+      nv_bfloat16* residual_out, float* partial, const float* scale,
+      const float* base, float* next_post, float* next_comb,
+      nv_bfloat16* layer_input, float rms_eps, float pre_eps,
+      float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat,
+      const nv_bfloat16* norm_weight,
+      tms::dsv4_mhc::block_q8_1* quant_input, float norm_eps) {
+    constexpr int splits = 16;
+    if (!dsv4_q2_progress_enabled_) {
+      throw std::runtime_error(
+          "DSV4 Q2 progress path requires VLLM_DSV4_Q2_MHC_PROGRESS=1");
+    }
+    wait_dsv4_mhc(stream);
+    CUDACHECK(cudaEventRecord(dsv4_q2_progress_start_, stream));
+    dsv4_q2_mhc_ar::q2_progress_producer<K>
+        <<<dsv4_q2_mhc_ar::kProducerCtas, 256, 0, stream>>>(
+            pending_q8, header, local_output, local_addend);
+    CUDACHECK(cudaStreamWaitEvent(dsv4_q2_progress_stream_,
+                                 dsv4_q2_progress_start_, 0));
+    dsv4_q2_mhc_ar::q2_mhc_consumer<NGPU, FnT>
+        <<<dsv4_q2_mhc_ar::kConsumerCtas, 256, 0,
+           dsv4_q2_progress_stream_>>>(
+            header, output_ptrs, sg_, self_sg_, residual, post_mix, comb_mix,
+            fn, residual_out, partial, scale, base, layer_input, norm_weight,
+            quant_input, rms_eps, pre_eps, norm_eps, rank_);
+    CUDACHECK(cudaEventRecord(dsv4_q2_progress_done_,
+                              dsv4_q2_progress_stream_));
+    CUDACHECK(cudaStreamWaitEvent(stream, dsv4_q2_progress_done_, 0));
+
+    cudaStream_t deferred_stream = stream;
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kAsyncSplit) {
+      CUDACHECK(cudaEventRecord(dsv4_mhc_urgent_done_, stream));
+      CUDACHECK(cudaStreamWaitEvent(dsv4_mhc_deferred_stream_,
+                                   dsv4_mhc_urgent_done_, 0));
+      deferred_stream = dsv4_mhc_deferred_stream_;
+    }
+    void* deferred_args[] = {
+        &residual_out, &fn,              &partial,         &scale,
+        &base,         &next_post,       &next_comb,       &sinkhorn_eps,
+        &post_multiplier, &sinkhorn_repeat,
+    };
+    auto deferred = dsv4_mhc_ar::fused_post_pre_deferred<splits, FnT>;
+    CUDACHECK(cudaLaunchCooperativeKernel(
+        reinterpret_cast<const void*>(deferred), dim3(splits * 2, 1),
+        dim3(tms::dsv4_mhc::THREADS), deferred_args, 0, deferred_stream));
+    if (dsv4_mhc_schedule_ == Dsv4MhcSchedule::kAsyncSplit) {
+      CUDACHECK(cudaEventRecord(dsv4_mhc_deferred_done_, deferred_stream));
+      dsv4_mhc_deferred_pending_ = true;
+    }
+  }
+
+  template <typename FnT>
+  void allreduce_dsv4_q2_mhc(
+      cudaStream_t stream, const block_q8_1* pending_q8,
+      const dsv4_q2_mhc_ar::PendingQ2Header* header,
+      nv_bfloat16* local_output, const nv_bfloat16* local_addend,
+      const nv_bfloat16* residual, const float* post_mix,
+      const float* comb_mix, const FnT* fn, nv_bfloat16* residual_out,
+      float* partial, const float* scale, const float* base, float* next_post,
+      float* next_comb, nv_bfloat16* layer_input, float rms_eps,
+      float pre_eps, float sinkhorn_eps, float post_multiplier,
+      int sinkhorn_repeat, const nv_bfloat16* norm_weight,
+      tms::dsv4_mhc::block_q8_1* quant_input, float norm_eps) {
+    RankData* output_ptrs = resolve_rank_data(stream, local_output);
+    switch (world_size_) {
+      case 2:
+        launch_dsv4_q2_mhc<FnT, 2, 1024>(
+            stream, pending_q8, header, local_output, output_ptrs,
+            local_addend, residual, post_mix, comb_mix, fn, residual_out,
+            partial, scale, base, next_post, next_comb, layer_input, rms_eps,
+            pre_eps, sinkhorn_eps, post_multiplier, sinkhorn_repeat,
+            norm_weight, quant_input, norm_eps);
+        break;
+      case 4:
+        launch_dsv4_q2_mhc<FnT, 4, 512>(
+            stream, pending_q8, header, local_output, output_ptrs,
+            local_addend, residual, post_mix, comb_mix, fn, residual_out,
+            partial, scale, base, next_post, next_comb, layer_input, rms_eps,
+            pre_eps, sinkhorn_eps, post_multiplier, sinkhorn_repeat,
+            norm_weight, quant_input, norm_eps);
+        break;
+      default:
+        throw std::runtime_error(
+            "DSV4 fused Q2_K producer mHC supports TP2 and TP4");
+    }
+  }
+
+  template <typename FnT>
+  void allreduce_dsv4_mhc_add(
+      cudaStream_t stream, nv_bfloat16* input, nv_bfloat16* addend,
+      const nv_bfloat16* residual, const float* post_mix,
+      const float* comb_mix, const FnT* fn, nv_bfloat16* residual_out,
+      float* partial, const float* scale, const float* base, float* next_post,
+      float* next_comb, nv_bfloat16* layer_input, float rms_eps,
+      float pre_eps, float sinkhorn_eps, float post_multiplier,
+      int sinkhorn_repeat, const nv_bfloat16* norm_weight,
+      tms::dsv4_mhc::block_q8_1* quant_input, float norm_eps,
+      bool input_prepared, bool own_projections, bool publish_prepared,
+      bool local_input_owned) {
+    RankData* ptrs;
+    RankData* addend_ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+      addend_ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(addend);
+    } else {
+      auto input_it = buffers_.find(input);
+      auto addend_it = buffers_.find(addend);
+      if (input_it == buffers_.end() || addend_it == buffers_.end())
+        throw std::runtime_error(
+            "DSV4 fused local-add mHC input buffer is not registered");
+      ptrs = input_it->second;
+      addend_ptrs = addend_it->second;
+    }
+    auto launch_for = [&](auto ngpus_tag, auto norm_tag) {
+      constexpr int ngpus = decltype(ngpus_tag)::value;
+      constexpr bool fused_norm = decltype(norm_tag)::value;
+#define DSV4_MHC_ADD_INVOKE(input_owned, output_owned, local_owned)           \
+      launch_dsv4_mhc<FnT, ngpus, true, fused_norm, input_owned,              \
+                      output_owned, local_owned, false>(                      \
+          stream, ptrs, addend_ptrs, input, residual, post_mix, comb_mix, fn, \
+          residual_out, partial, scale, base, next_post, next_comb,           \
+          layer_input, rms_eps, pre_eps, sinkhorn_eps, post_multiplier,       \
+          sinkhorn_repeat, norm_weight, quant_input, norm_eps,                \
+          publish_prepared)
+      if (local_input_owned) {
+        if constexpr (!fused_norm) {
+          throw std::runtime_error(
+              "DSV4 local input ownership requires fused RMSNorm/Q8");
+        } else if (!own_projections) {
+          throw std::runtime_error(
+              "DSV4 local input ownership requires owned mHC projections");
+        } else if (input_prepared) {
+          DSV4_MHC_ADD_INVOKE(true, true, true);
+        } else {
+          DSV4_MHC_ADD_INVOKE(false, true, true);
+        }
+      } else if (own_projections) {
+        if (input_prepared) {
+          DSV4_MHC_ADD_INVOKE(true, true, false);
+        } else {
+          DSV4_MHC_ADD_INVOKE(false, true, false);
+        }
+      } else if (input_prepared) {
+        DSV4_MHC_ADD_INVOKE(true, false, false);
+      } else {
+        DSV4_MHC_ADD_INVOKE(false, false, false);
+      }
+#undef DSV4_MHC_ADD_INVOKE
+    };
+#define DSV4_MHC_ADD_CASE(ngpus)                                             \
+  case ngpus: {                                                              \
+    if (norm_weight != nullptr) {                                            \
+      launch_for(std::integral_constant<int, ngpus>{}, std::true_type{});    \
+    } else {                                                                 \
+      launch_for(std::integral_constant<int, ngpus>{}, std::false_type{});   \
+    }                                                                        \
+    break;                                                                   \
+  }
+    switch (world_size_) {
+      DSV4_MHC_ADD_CASE(2)
+      DSV4_MHC_ADD_CASE(4)
+      DSV4_MHC_ADD_CASE(8)
+      default:
+        throw std::runtime_error(
+            "DSV4 fused local-add all-reduce mHC supports TP2, TP4, and TP8");
+    }
+#undef DSV4_MHC_ADD_CASE
+  }
+#endif
+
   ~CustomAllreduce() {
+#if !defined(USE_ROCM)
+    if (dsv4_q2_progress_stream_ != nullptr) {
+      CUDACHECK(cudaStreamSynchronize(dsv4_q2_progress_stream_));
+      CUDACHECK(cudaEventDestroy(dsv4_q2_progress_start_));
+      CUDACHECK(cudaEventDestroy(dsv4_q2_progress_done_));
+      CUDACHECK(cudaStreamDestroy(dsv4_q2_progress_stream_));
+    }
+    if (dsv4_mhc_deferred_stream_ != nullptr) {
+      CUDACHECK(cudaStreamSynchronize(dsv4_mhc_deferred_stream_));
+      CUDACHECK(cudaEventDestroy(dsv4_mhc_urgent_done_));
+      CUDACHECK(cudaEventDestroy(dsv4_mhc_deferred_done_));
+      CUDACHECK(cudaStreamDestroy(dsv4_mhc_deferred_stream_));
+    }
+#endif
     for (auto [_, ptr] : ipc_handles_) {
       CUDACHECK(cudaIpcCloseMemHandle(ptr));
     }

@@ -5,6 +5,8 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+from .fp8 import e4m3fn_encode_software
 from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
@@ -91,6 +93,7 @@ def _fused_indexer_q_rope_quant_kernel(
     index_weights_out_stride,
     FP8_MAX: tl.constexpr = 448.0,
     USE_FNUZ: tl.constexpr = False,
+    USE_SOFTWARE_E4M3: tl.constexpr = False,
 ):
     # Layout matches the unfused reference (DeepseekV4ScalingRotaryEmbedding
     # + per_token_group_quant_fp8): GPT-J interleaved RoPE applied to the
@@ -135,24 +138,43 @@ def _fused_indexer_q_rope_quant_kernel(
     index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
 
     # Store quantized values to index_q_fp8. FNUZ (e4m3fnuz) on gfx942, OCP
-    # (e4m3fn) elsewhere -- matches the K cache.
+    # (e4m3fn) elsewhere -- matches the K cache. Ampere cannot compile
+    # fp8e4nv, so emit the OCP bytes with explicit bit arithmetic there.
     fp8_dtype = tl.float8e4b8 if USE_FNUZ else tl.float8e4nv
     fp8_base_ptr = (
         index_q_fp8_ptr + tok_idx * index_q_fp8_stride0 + head_idx * index_q_fp8_stride1
     )
     if INDEX_Q_NOPE_DIM > 0:
+        x_nope_scaled = tl.div_rn(x_nope, index_q_scale)
+        x_nope_fp8 = (
+            e4m3fn_encode_software(x_nope_scaled)
+            if USE_SOFTWARE_E4M3
+            else x_nope_scaled.to(fp8_dtype)
+        )
         tl.store(
             fp8_base_ptr + nope_offset,
-            tl.div_rn(x_nope, index_q_scale).to(fp8_dtype),
+            x_nope_fp8,
         )
     fp8_rot_base = fp8_base_ptr + INDEX_Q_NOPE_DIM
+    r_even_scaled = tl.div_rn(r_even, index_q_scale)
+    r_odd_scaled = tl.div_rn(r_odd, index_q_scale)
+    r_even_fp8 = (
+        e4m3fn_encode_software(r_even_scaled)
+        if USE_SOFTWARE_E4M3
+        else r_even_scaled.to(fp8_dtype)
+    )
+    r_odd_fp8 = (
+        e4m3fn_encode_software(r_odd_scaled)
+        if USE_SOFTWARE_E4M3
+        else r_odd_scaled.to(fp8_dtype)
+    )
     tl.store(
         fp8_rot_base + half_offset * 2,
-        tl.div_rn(r_even, index_q_scale).to(fp8_dtype),
+        r_even_fp8,
     )
     tl.store(
         fp8_rot_base + half_offset * 2 + 1,
-        tl.div_rn(r_odd, index_q_scale).to(fp8_dtype),
+        r_odd_fp8,
     )
 
     # FP8 weight-fold contract:
@@ -417,6 +439,10 @@ def fused_indexer_q_rope_quant(
 
     fp8_dtype = current_platform.fp8_dtype()
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
+    use_software_e4m3 = False
+    if current_platform.is_cuda() and not use_fnuz:
+        major, minor = torch.cuda.get_device_capability(index_q.device)
+        use_software_e4m3 = major * 10 + minor < 89
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
     if has_cutedsl():
@@ -447,6 +473,9 @@ def fused_indexer_q_rope_quant(
             index_weights_out,
         )
     else:
+        index_q_fp8_arg = (
+            index_q_fp8.view(torch.uint8) if use_software_e4m3 else index_q_fp8
+        )
         _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
             positions,
             index_q,
@@ -455,9 +484,9 @@ def fused_indexer_q_rope_quant(
             index_q_cos_sin_cache,
             index_q_cos_sin_cache.stride(0),
             index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
-            index_q_fp8.stride(0),
-            index_q_fp8.stride(1),
+            index_q_fp8_arg,
+            index_q_fp8_arg.stride(0),
+            index_q_fp8_arg.stride(1),
             index_q_head_dim,
             index_weights,
             index_weights.stride(0),
@@ -467,6 +496,7 @@ def fused_indexer_q_rope_quant(
             index_weights_out.stride(0),
             FP8_MAX=fp8_max,
             USE_FNUZ=use_fnuz,
+            USE_SOFTWARE_E4M3=use_software_e4m3,
             num_warps=1,  # TODO: Tune this
         )
     return index_q_fp8, index_weights_out

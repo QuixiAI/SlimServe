@@ -28,6 +28,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    TQSlidingWindowSpec,
     get_kv_quant_mode,
 )
 
@@ -85,6 +86,27 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         assert self.dtype in (torch.uint8, torch.bfloat16, torch.float8_e4m3fn)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if (
+            self.cache_config.cache_dtype.startswith("turboquant_")
+            and self.dtype == torch.uint8
+        ):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            tq_config = TurboQuantConfig.from_cache_dtype(
+                self.cache_config.cache_dtype, self.head_dim
+            )
+            return TQSlidingWindowSpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=self.head_dim,
+                head_size_v=self.head_dim,
+                dtype=torch.uint8,
+                sliding_window=self.window_size,
+                tq_slot_size=tq_config.slot_size_aligned,
+                tq_cache_dtype=self.cache_config.cache_dtype,
+            )
         # fp8_ds_mla's UE8M0 paged layout needs 576B alignment; contiguous
         # bf16/fp8 cache uses the natural element-size page.
         uses_fp8_ds_mla_layout = self.cache_config.cache_dtype == "fp8_ds_mla"
@@ -104,6 +126,15 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
     def forward(self): ...
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        if (
+            self.cache_config.cache_dtype.startswith("turboquant_")
+            and self.dtype == torch.uint8
+        ):
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantAttentionBackend,
+            )
+
+            return TurboQuantAttentionBackend
         return DeepseekSparseSWABackend
 
 
@@ -126,7 +157,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm():
+        if current_platform.is_rocm() or (
+            current_platform.is_cuda()
+            and not current_platform.has_device_capability(89)
+        ):
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,
             )
@@ -716,6 +750,10 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_metal()
+            or (
+                current_platform.is_cuda()
+                and not current_platform.has_device_capability(89)
+            )
             or current_platform.is_device_capability_family(120)
         ):
             return out

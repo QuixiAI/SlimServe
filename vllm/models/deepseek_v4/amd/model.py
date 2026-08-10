@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -12,8 +14,11 @@ import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -29,11 +34,13 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import (
     HAS_AITER_MHC,
+    HAS_QUIXICORE_MHC,
     HAS_TILELANG_MHC,
     HCHeadOp,
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
+    use_quixicore_mhc,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -61,11 +68,40 @@ if current_platform.is_metal():
     from vllm.models.deepseek_v4.metal import (
         DeepseekV4MetalAttention as DeepseekV4PlatformAttention,
     )
+elif current_platform.is_cuda():
+    from vllm.models.deepseek_v4.ampere import (
+        DeepseekV4AmpereMLAAttention as DeepseekV4PlatformAttention,
+    )
 else:
     from vllm.models.deepseek_v4.amd.rocm import (
         DeepseekV4ROCMAiterMLAAttention as DeepseekV4PlatformAttention,
     )
 from vllm.sequence import IntermediateTensors
+
+
+def _use_quixicore_fused_mhc_norm(tensor: torch.Tensor) -> bool:
+    return use_quixicore_mhc(tensor) and os.getenv(
+        "VLLM_DSV4_MHC_FUSED_NORM", "0"
+    ).lower() not in {"0", "false", "off", "no"}
+
+
+def _mhc_fn_dtype(vllm_config: VllmConfig) -> torch.dtype:
+    """Keep the GGUF F16 hyper-connection matrices packed on Ampere."""
+    capability = (
+        current_platform.get_device_capability()
+        if current_platform.is_cuda()
+        else None
+    )
+    quant_config = vllm_config.quant_config
+    if (
+        capability is not None
+        and capability.major == 8
+        and vllm_config.model_config.hf_config.hidden_size == 4096
+        and quant_config is not None
+        and quant_config.get_name() == "gguf"
+    ):
+        return torch.float16
+    return torch.float32
 
 
 class DeepseekV4MLP(nn.Module):
@@ -103,6 +139,12 @@ class DeepseekV4MLP(nn.Module):
             disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
+        self._ampere_shared_q8_fusion = (
+            current_platform.is_cuda()
+            and prefix.endswith(".shared_experts")
+            and os.getenv("VLLM_DSV4_SHARED_Q8_FUSION", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
         if hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
@@ -112,9 +154,76 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+    def forward(
+        self,
+        x: torch.Tensor,
+        prequant_input: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        qweight_type = getattr(self.gate_up_proj, "qweight_type", None)
+        qweight = getattr(self.gate_up_proj, "qweight", None)
+        q8_types = (
+            list(qweight_type.shard_weight_type.values())
+            if qweight_type is not None and qweight_type.shard_weight_type
+            else [getattr(qweight_type, "weight_type", -1)]
+        )
+        use_ampere_fusion = (
+            self._ampere_shared_q8_fusion
+            and x.ndim == 2
+            and x.shape[0] == 1
+            and qweight is not None
+            and q8_types
+            and all(weight_type == 8 for weight_type in q8_types)
+            and isinstance(self.act_fn, SiluAndMulWithClamp)
+            and self.act_fn.alpha == 1.0
+            and self.act_fn.beta == 0.0
+        )
+        output_owned_down = getattr(self.down_proj, "_dsv4_output_owned", False)
+        if output_owned_down:
+            if use_ampere_fusion:
+                from vllm.model_executor.layers.quantization.gguf import ops
+
+                local_x = ops.ggml_dsv4_shared_gate_up_swiglu(
+                    qweight, x, self.act_fn.swiglu_limit, prequant_input
+                )
+            else:
+                gate_up, _ = self.gate_up_proj(x)
+                local_x = self.act_fn(gate_up)
+            full_x = tensor_model_parallel_all_gather(local_x, dim=-1)
+            local_output, _ = self.down_proj(full_x)
+            partial_output = local_output.new_zeros(
+                (local_output.shape[0], self.down_proj.output_size)
+            )
+            row_start = self.down_proj.tp_rank * local_output.shape[1]
+            partial_output[
+                :, row_start : row_start + local_output.shape[1]
+            ].copy_(local_output)
+            return partial_output
+
+        if use_ampere_fusion:
+            from vllm.model_executor.layers.quantization.gguf import ops
+
+            down_qweight_type = getattr(self.down_proj, "qweight_type", None)
+            down_type = getattr(down_qweight_type, "weight_type", -1)
+            down_quant_method = getattr(self.down_proj, "quant_method", None)
+            apply_prequant = getattr(down_quant_method, "apply_prequant", None)
+            fuse_down_quant = (
+                down_type == 8
+                and apply_prequant is not None
+                and self.down_proj.input_size_per_partition <= 512
+                and os.getenv("VLLM_DSV4_SHARED_DOWN_PREQUANT", "1").lower()
+                not in {"0", "false", "off", "no"}
+            )
+            if fuse_down_quant:
+                x, down_quant = ops.ggml_dsv4_shared_gate_up_swiglu_q8_1(
+                    qweight, x, self.act_fn.swiglu_limit, prequant_input
+                )
+                return apply_prequant(self.down_proj, x, down_quant)
+            x = ops.ggml_dsv4_shared_gate_up_swiglu(
+                qweight, x, self.act_fn.swiglu_limit, prequant_input
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -173,6 +282,12 @@ class DeepseekV4MoE(nn.Module):
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.defer_tp_reduce = (
+            current_platform.is_cuda()
+            and self.tp_size > 1
+            and os.getenv("VLLM_DSV4_DEFER_TP_REDUCE", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
@@ -263,21 +378,138 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            reduce_results=not self.defer_tp_reduce,
+        )
+        self.experts.defer_shared_expert_add = self.defer_tp_reduce
+
+    def _output_owned_decode(
+        self,
+        kernel_input: torch.Tensor,
+        full_quant: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        ca_comm,
+    ) -> torch.Tensor | None:
+        routed = self.experts.routed_experts
+        shared = self.shared_experts
+        if (
+            shared is None
+            or not getattr(routed, "_dsv4_w1_repacked", False)
+            or not getattr(routed, "_dsv4_w2_repacked", False)
+            or not getattr(routed, "_dsv4_w2_output_sharded", False)
+            or not getattr(shared.down_proj, "_dsv4_output_owned", False)
+        ):
+            return None
+        shared_down = getattr(shared.down_proj, "_dsv4_q8_aligned", None)
+        if shared_down is None or self.swiglu_limit is None:
+            return None
+
+        topk_weights, topk_ids = self.experts.router.select_experts(
+            hidden_states=kernel_input,
+            router_logits=router_logits,
+            topk_indices_dtype=torch.int32,
+            input_ids=input_ids,
+        )
+        expert_map = routed.global_to_local_expert_map
+        if expert_map is not None:
+            topk_ids = expert_map[topk_ids]
+
+        from vllm.model_executor.layers.quantization.gguf import ops
+
+        _, shared_quant = ops.ggml_dsv4_shared_gate_up_swiglu_q8_1(
+            shared.gate_up_proj.qweight,
+            kernel_input,
+            self.swiglu_limit,
+            full_quant,
+        )
+        return ca_comm.dsv4_output_owned_moe(
+            full_quant,
+            routed.w13_qweight,
+            routed.w2_qweight,
+            topk_weights.contiguous(),
+            topk_ids.contiguous(),
+            shared_quant,
+            shared_down,
+            self.swiglu_limit,
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         org_shape = hidden_states.shape
+        local_hidden = 4096 // self.tp_size
+        owned_decode = (
+            os.getenv("VLLM_DSV4_TP_OWNERSHIP", "0").lower()
+            in {"1", "true", "on", "yes"}
+            and hidden_states.shape == (1, local_hidden)
+            and prequant_input is not None
+            and prequant_input.numel() == local_hidden // 32 * 9
+        )
+        if owned_decode:
+            communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(communicator, "ca_comm", None)
+                if communicator is not None
+                else None
+            )
+            if ca_comm is None:
+                raise RuntimeError("DSV4 TP ownership requires custom all-reduce")
+            full_quant = ca_comm.dsv4_gather_owned_q8(prequant_input)
+            if self.gate.weight.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "DSV4 input-owned router requires BF16 gate weights"
+                )
+            router_logits = ca_comm.dsv4_owned_router(
+                hidden_states, self.gate.weight
+            )
+            # Native GGUF kernels consume full Q8_1 directly. The BF16 tensor
+            # carries shape/dtype metadata only and is never dequantized.
+            kernel_input = torch.empty(
+                (hidden_states.shape[0], 4096),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            output_owned = self._output_owned_decode(
+                kernel_input,
+                full_quant,
+                router_logits,
+                input_ids,
+                ca_comm,
+            )
+            if output_owned is not None:
+                return output_owned
+            org_shape = kernel_input.shape
+            if self.experts.is_internal_router:
+                final_hidden_states = self.experts(
+                    hidden_states=kernel_input,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    prequant_input=full_quant,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states=kernel_input,
+                    router_logits=router_logits,
+                    input_ids=input_ids,
+                    prequant_input=full_quant,
+                )
+            if isinstance(final_hidden_states, tuple):
+                return tuple(output.view(org_shape) for output in final_hidden_states)
+            return final_hidden_states.view(org_shape)
+
         if self.experts.is_internal_router:
             # In this case, the gate/router runs inside the FusedMoE class
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=hidden_states,
                 input_ids=input_ids,
+                prequant_input=prequant_input,
             )
         else:
             router_logits, _ = self.gate(hidden_states)
@@ -285,9 +517,34 @@ class DeepseekV4MoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+                prequant_input=prequant_input,
             )
 
-        return final_hidden_states.view(org_shape)
+        def restore_prefill_partial(output: torch.Tensor) -> torch.Tensor:
+            if output.numel() == math.prod(org_shape):
+                return output.view(org_shape)
+            if (
+                org_shape[-1] == self.hidden_size
+                and output.shape[-1] == self.hidden_size // self.tp_size
+                and output.numel()
+                == math.prod(org_shape[:-1]) * output.shape[-1]
+            ):
+                partial = output.new_zeros(org_shape)
+                row_start = self.tp_rank * output.shape[-1]
+                partial[..., row_start : row_start + output.shape[-1]].copy_(
+                    output.view(*org_shape[:-1], output.shape[-1])
+                )
+                return partial
+            raise RuntimeError(
+                f"DSV4 MoE output shape {tuple(output.shape)} does not match "
+                f"the {org_shape} layer contract"
+            )
+
+        if isinstance(final_hidden_states, tuple):
+            return tuple(
+                restore_prefill_partial(output) for output in final_hidden_states
+            )
+        return restore_prefill_partial(final_hidden_states)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -306,6 +563,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         import vllm.model_executor.layers.mhc  # noqa: F401
 
         config = vllm_config.model_config.hf_config
+        quant_config = vllm_config.quant_config
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -323,23 +581,59 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        capability = (
+            current_platform.get_device_capability()
+            if current_platform.is_cuda()
+            else None
+        )
+        self._ampere_prequant_fusion = bool(
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 8
+            and self.hidden_size == 4096
+            and quant_config is not None
+            and quant_config.get_name() == "gguf"
+            and os.getenv("VLLM_DSV4_PREQUANT_FUSION", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
+        self._ampere_prequant_attention = bool(
+            self._ampere_prequant_fusion
+            and os.getenv("VLLM_DSV4_PREQUANT_ATTN", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
+        self._ampere_prequant_moe = bool(
+            self._ampere_prequant_fusion
+            and os.getenv("VLLM_DSV4_PREQUANT_MOE", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
+        self._ampere_prequant_standalone = bool(
+            self._ampere_prequant_fusion
+            and os.getenv("VLLM_DSV4_PREQUANT_STANDALONE", "0").lower()
+            not in {"0", "false", "off", "no"}
+        )
+        self._ampere_prequant_transition = bool(
+            self._ampere_prequant_fusion
+            and os.getenv("VLLM_DSV4_PREQUANT_TRANSITION", "1").lower()
+            not in {"0", "false", "off", "no"}
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
+        hc_fn_dtype = _mhc_fn_dtype(vllm_config)
         self.hc_attn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
-                dtype=torch.float32,
+                dtype=hc_fn_dtype,
             ),
             requires_grad=False,
         )
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(
                 (mix_hc, hc_dim),
-                dtype=torch.float32,
+                dtype=hc_fn_dtype,
             ),
             requires_grad=False,
         )
@@ -374,8 +668,255 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.use_fused_mhc = HAS_TILELANG_MHC and not (
+        self.use_fused_mhc = (HAS_TILELANG_MHC or HAS_QUIXICORE_MHC) and not (
             HAS_AITER_MHC and self.hidden_size % 256 == 0
+        )
+        self.defer_tp_reduce = bool(
+            self.use_fused_mhc
+            and getattr(self.attn, "defer_tp_reduce", False)
+            and self.ffn.defer_tp_reduce
+        )
+        if not self.defer_tp_reduce:
+            self.attn.wo_b.reduce_results = True
+            self.ffn.experts.moe_config.skip_final_all_reduce = False
+            self.ffn.experts.defer_shared_expert_add = False
+            self.ffn.defer_tp_reduce = False
+        layer_match = re.search(r"\.layers\.(\d+)$", prefix)
+        layer_index = int(layer_match.group(1)) if layer_match is not None else -1
+        ownership_requested = os.getenv(
+            "VLLM_DSV4_TP_OWNERSHIP", "0"
+        ).lower() in {"1", "true", "on", "yes"}
+        if ownership_requested and os.getenv("VLLM_DSV4_MHC_SCHEDULE") != "async":
+            raise RuntimeError(
+                "VLLM_DSV4_TP_OWNERSHIP requires "
+                "VLLM_DSV4_MHC_SCHEDULE=async"
+            )
+        self._tp_owned_mhc = bool(
+            ownership_requested
+            and current_platform.is_cuda()
+            and self.defer_tp_reduce
+            and layer_index >= 0
+        )
+        deferred_ownership_requested = os.getenv(
+            "VLLM_DSV4_TP_DEFERRED_OWNERSHIP", "0"
+        ).lower() in {"1", "true", "on", "yes"}
+        self._tp_deferred_owned_mhc = bool(
+            self._tp_owned_mhc and deferred_ownership_requested
+        )
+        self._layer_index = layer_index
+        self._is_last_layer = layer_index + 1 == config.num_hidden_layers
+        q2_progress_enabled = os.getenv(
+            "VLLM_DSV4_Q2_MHC_PROGRESS", "0"
+        ).lower() in {"1", "true", "on", "yes"}
+        self._ampere_q2_mhc = bool(
+            q2_progress_enabled
+            and self._ampere_prequant_transition
+            and self.defer_tp_reduce
+            and layer_index >= 0
+        )
+        # The final decoder output is consumed by hc_post rather than another
+        # fused transition, so it must remain materialized. Every earlier
+        # decode layer hands its native Q8_1 intermediate to the next layer's
+        # custom-allreduce-owned Q2_K producer.
+        self.ffn.experts.routed_experts._dsv4_defer_down = bool(
+            self._ampere_q2_mhc and layer_index + 1 < config.num_hidden_layers
+        )
+
+    def reduce_deferred_output(
+        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        if self.defer_tp_reduce:
+            device_communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(device_communicator, "ca_comm", None)
+                if device_communicator is not None
+                else None
+            )
+            if ca_comm is not None:
+                ca_comm.wait_dsv4_mhc(x[0] if isinstance(x, tuple) else x)
+        if isinstance(x, tuple):
+            x = x[0] + x[1]
+        if self.defer_tp_reduce:
+            return tensor_model_parallel_all_reduce(x)
+        return x
+
+    def reconstruct_deferred_output(
+        self,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        local_hidden = 4096 // get_tensor_model_parallel_world_size()
+        primary = x[0] if isinstance(x, tuple) else x
+        if (
+            self._tp_owned_mhc
+            and residual.shape[-1] == 4096
+            and primary.shape[-1] == local_hidden
+        ):
+            if isinstance(x, tuple):
+                raise RuntimeError(
+                    "DSV4 output ownership requires fused routed/shared output"
+                )
+            communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(communicator, "ca_comm", None)
+                if communicator is not None
+                else None
+            )
+            if ca_comm is None:
+                raise RuntimeError("DSV4 TP ownership requires custom all-reduce")
+            ca_comm.wait_dsv4_mhc(primary)
+            return self.hc_post(
+                ca_comm.dsv4_gather_owned_bf16(primary),
+                residual,
+                post_mix,
+                res_mix,
+            )
+        if self._tp_owned_mhc and residual.shape[-1] == local_hidden:
+            communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(communicator, "ca_comm", None)
+                if communicator is not None
+                else None
+            )
+            if ca_comm is None:
+                raise RuntimeError("DSV4 TP ownership requires custom all-reduce")
+            primary, addend = (
+                (x[0], x[1]) if isinstance(x, tuple) else (x, None)
+            )
+            local_x = ca_comm.dsv4_owned_reduce_scatter(primary, addend)
+            ca_comm.wait_dsv4_mhc(local_x)
+            local_reconstructed = self.hc_post(
+                local_x, residual, post_mix, res_mix
+            )
+            return ca_comm.dsv4_gather_owned_bf16(local_reconstructed)
+        reduced = self.reduce_deferred_output(x)
+        return self.hc_post(reduced, residual, post_mix, res_mix)
+
+    def _fused_post_pre_with_optional_reduce(
+        self,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        res_mix: torch.Tensor,
+        fn: torch.Tensor,
+        scale: torch.Tensor,
+        base: torch.Tensor,
+        norm_weight: torch.Tensor | None,
+        reduce_x: bool,
+        input_prepared: bool = False,
+        own_projections: bool = False,
+        publish_prepared: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
+        if reduce_x:
+            device_communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(device_communicator, "ca_comm", None)
+                if device_communicator is not None
+                else None
+            )
+            if ca_comm is not None:
+                owned_decode = (
+                    self._tp_owned_mhc
+                    and norm_weight is not None
+                    and residual.shape == (1, 4, 4096)
+                    and (
+                        (
+                            isinstance(x, tuple)
+                            and x[0].shape
+                            in ((1, 4096), (1, 4096 // self.ffn.tp_size))
+                        )
+                        or (
+                            isinstance(x, torch.Tensor)
+                            and x.shape
+                            in ((1, 4096), (1, 4096 // self.ffn.tp_size))
+                        )
+                    )
+                )
+                if (
+                    self._ampere_q2_mhc
+                    and isinstance(x, tuple)
+                    and len(x) == 2
+                    and x[1].shape == (1, 4096)
+                    and norm_weight is not None
+                    and not (
+                        input_prepared or own_projections or publish_prepared
+                    )
+                ):
+                    fused = ca_comm.fused_all_reduce_dsv4_q2_mhc(
+                        x[1],
+                        x[0],
+                        residual,
+                        post_mix.contiguous(),
+                        res_mix.contiguous(),
+                        fn,
+                        scale,
+                        base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        self.hc_post_alpha,
+                        self.hc_sinkhorn_iters,
+                        norm_weight,
+                        self.rms_norm_eps,
+                    )
+                    if fused is not None:
+                        return fused
+                fused_fn = (
+                    ca_comm.fused_all_reduce_dsv4_mhc_add
+                    if isinstance(x, tuple)
+                    else ca_comm.fused_all_reduce_dsv4_mhc
+                )
+                fused_args = x if isinstance(x, tuple) else (x,)
+                fused = fused_fn(
+                    *fused_args,
+                    residual,
+                    post_mix.contiguous(),
+                    res_mix.contiguous(),
+                    fn,
+                    scale,
+                    base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    norm_weight,
+                    self.rms_norm_eps,
+                    input_prepared=input_prepared,
+                    own_projections=own_projections,
+                    publish_prepared=publish_prepared,
+                    local_input_owned=owned_decode,
+                )
+                if fused is not None:
+                    return fused
+                if owned_decode:
+                    raise RuntimeError(
+                        "DSV4 TP-owned decode transition did not match the "
+                        "native mHC contract"
+                    )
+                # Memory profiling, prefill, and batched eager probes still
+                # carry the static ownership flags, but remain full-width.
+        if isinstance(x, tuple):
+            x = x[0] + x[1]
+        if reduce_x:
+            x = tensor_model_parallel_all_reduce(x)
+        return self.mhc_fused_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=0.0,
         )
 
     def hc_pre(
@@ -384,6 +925,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm_weight: torch.Tensor | None = None,
     ):
         post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
@@ -395,6 +937,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            norm_weight=norm_weight,
+            norm_eps=self.rms_norm_eps,
         )
         return layer_input, post_mix, res_mix
 
@@ -406,6 +950,25 @@ class DeepseekV4DecoderLayer(nn.Module):
         comb: torch.Tensor,
     ):
         return self.mhc_post(x, residual, post, comb)
+
+    def _norm_with_prequant(
+        self,
+        x: torch.Tensor,
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self._ampere_prequant_standalone
+            and x.ndim == 2
+            and 0 < x.shape[0] <= 8
+            and x.shape[1] == 4096
+            and x.dtype == torch.bfloat16
+        ):
+            from vllm.model_executor.layers.quantization.gguf import ops
+
+            return ops.ggml_dsv4_rms_norm_q8_1(
+                x, norm.weight, self.rms_norm_eps
+            )
+        return norm(x), None
 
     def _forward_fused_post_pre(
         self,
@@ -419,11 +982,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             # Run standalone hc_pre on first layer
             residual = x
+            fused_norm = False
             x, post_mix, res_mix = self.hc_pre(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
+            prequant_input = None
         else:
-            residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+            transition = self._fused_post_pre_with_optional_reduce(
                 x,
                 residual,
                 post_mix,
@@ -431,17 +996,30 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_fn,
                 self.hc_attn_scale,
                 self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                self.hc_post_alpha,
-                self.hc_sinkhorn_iters,
+                self.attn_norm.weight
+                if self._ampere_prequant_transition
+                else None,
+                self.defer_tp_reduce,
+                input_prepared=self._tp_deferred_owned_mhc,
+                own_projections=self._tp_owned_mhc,
+                publish_prepared=self._tp_deferred_owned_mhc,
             )
+            fused_norm = len(transition) == 5
+            residual, post_mix, res_mix, x = transition[:4]
+            prequant_input = transition[4] if fused_norm else None
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        if not fused_norm:
+            x, prequant_input = self._norm_with_prequant(x, self.attn_norm)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            prequant_input=(
+                prequant_input if self._ampere_prequant_attention else None
+            ),
+        )
 
-        residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
+        transition = self._fused_post_pre_with_optional_reduce(
             x,
             residual,
             post_mix,
@@ -449,14 +1027,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
-            self.hc_sinkhorn_iters,
+            self.ffn_norm.weight if self._ampere_prequant_transition else None,
+            self.defer_tp_reduce,
+            input_prepared=(
+                self._tp_deferred_owned_mhc and self._layer_index > 0
+            ),
+            own_projections=self._tp_owned_mhc,
+            publish_prepared=(
+                self._tp_deferred_owned_mhc and not self._is_last_layer
+            ),
         )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        fused_norm = len(transition) == 5
+        residual, post_mix, res_mix, x = transition[:4]
+        prequant_input = transition[4] if fused_norm else None
+        if not fused_norm:
+            x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
+        x = self.ffn(
+            x,
+            input_ids,
+            prequant_input=(prequant_input if self._ampere_prequant_moe else None),
+        )
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(
@@ -474,16 +1064,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        x, prequant_input = self._norm_with_prequant(x, self.attn_norm)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            prequant_input=(
+                prequant_input if self._ampere_prequant_attention else None
+            ),
+        )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
+        x = self.ffn(
+            x,
+            input_ids,
+            prequant_input=(prequant_input if self._ampere_prequant_moe else None),
+        )
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
 
@@ -525,9 +1126,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         # Disable them on ROCm because of hang issues.
+        aux_streams_enabled = os.getenv("VLLM_DSV4_AUX_STREAMS", "1").lower() not in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }
         aux_stream_list = (
             None
-            if current_platform.is_rocm() or current_platform.is_metal()
+            if (
+                current_platform.is_rocm()
+                or current_platform.is_metal()
+                or not aux_streams_enabled
+            )
             else [torch.cuda.Stream() for _ in range(3)]
         )
 
@@ -578,7 +1189,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             torch.empty(
                 self.hc_mult,
                 self.hc_dim,
-                dtype=torch.float32,
+                dtype=_mhc_fn_dtype(vllm_config),
             ),
             requires_grad=False,
         )
@@ -677,7 +1288,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # so hidden_states is the reconstructed stream; on the fused
                 # path reconstruct it via hc_post before averaging.
                 if layer.use_fused_mhc:
-                    aux_recon = layer.hc_post(
+                    aux_recon = layer.reconstruct_deferred_output(
                         hidden_states, residual, post_mix, res_mix
                     )
                     final_aux_recon = aux_recon
@@ -693,7 +1304,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ):
                 hidden_states = final_aux_recon
             else:
-                hidden_states = layer.hc_post(
+                hidden_states = layer.reconstruct_deferred_output(
                     hidden_states, residual, post_mix, res_mix
                 )
 

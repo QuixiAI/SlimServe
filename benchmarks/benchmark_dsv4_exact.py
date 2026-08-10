@@ -27,7 +27,11 @@ from vllm.tokenizers.registry import get_tokenizer
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, help="Local GGUF path")
-    parser.add_argument("--served-model-name", default="DeepSeek-V4-Flash")
+    parser.add_argument(
+        "--served-model-name",
+        default="DeepSeek-V4-Flash",
+        help="Model name to send to the OpenAI-compatible endpoint",
+    )
     parser.add_argument("--source", required=True, help="Natural-text prompt source")
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
     parser.add_argument(
@@ -35,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         help="Prometheus endpoint; defaults to /metrics on the completion host",
     )
     parser.add_argument(
-        "--concurrency", type=int, choices=(1, 4, 8, 16, 32), required=True
+        "--concurrency", type=int, choices=(1, 2, 4, 6, 8, 16, 32), required=True
     )
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
@@ -46,10 +50,21 @@ def parse_args() -> argparse.Namespace:
         help="Starting source-token offset; vary it between prefix-cached runs",
     )
     parser.add_argument(
+        "--repeat-source",
+        action="store_true",
+        help="Repeat the tokenized source when it is shorter than the prompt",
+    )
+    parser.add_argument(
         "--prompt-overhead",
         type=int,
         default=0,
         help="Server-added wrapper tokens included in API prompt usage",
+    )
+    parser.add_argument(
+        "--warmup-output-tokens",
+        type=int,
+        default=8,
+        help="Prime each prompt before timing; set to 0 to measure cold serving",
     )
     parser.add_argument("--timeout", type=float, default=14400.0)
     return parser.parse_args()
@@ -82,12 +97,16 @@ def exact_prompts(
     count: int,
     token_count: int,
     prompt_offset: int,
+    repeat_source: bool,
 ) -> list[str]:
     source_ids = tokenizer.encode(source, add_special_tokens=False)
     if len(source_ids) < token_count:
-        raise ValueError(
-            f"source has {len(source_ids)} tokens, need at least {token_count}"
-        )
+        if not repeat_source:
+            raise ValueError(
+                f"source has {len(source_ids)} tokens, need at least {token_count}"
+            )
+        repeats = (token_count + len(source_ids) - 1) // len(source_ids)
+        source_ids = (source_ids * repeats)[:token_count]
 
     max_start = len(source_ids) - token_count
     if prompt_offset < 0 or prompt_offset > max_start:
@@ -106,11 +125,7 @@ def exact_prompts(
 
 
 def request_completion(
-    url: str,
-    served_model_name: str,
-    prompt: str,
-    output_tokens: int,
-    timeout: float,
+    url: str, served_model_name: str, prompt: str, output_tokens: int, timeout: float
 ) -> dict[str, object]:
     body = json.dumps(
         {
@@ -147,8 +162,28 @@ def main() -> None:
         args.concurrency,
         args.input_tokens - args.prompt_overhead,
         args.prompt_offset,
+        args.repeat_source,
     )
 
+    if args.warmup_output_tokens:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=args.concurrency
+        ) as executor:
+            warmups = [
+                executor.submit(
+                    request_completion,
+                    args.url,
+                    args.served_model_name,
+                    prompt,
+                    args.warmup_output_tokens,
+                    args.timeout,
+                )
+                for prompt in prompts
+            ]
+            for warmup in warmups:
+                warmup.result()
+
+    # Sampled after the warmup so warmup drafts stay out of the delta.
     metrics_before = metric_counters(args.metrics_url, args.served_model_name)
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(
@@ -202,6 +237,7 @@ def main() -> None:
         "requested_input_tokens": args.input_tokens,
         "requested_output_tokens": args.output_tokens,
         "prompt_offset": args.prompt_offset,
+        "warmup_output_tokens": args.warmup_output_tokens,
         "prompt_tokens": prompt_counts,
         "completion_tokens": completion_counts,
         "wall_seconds": wall_seconds,

@@ -19,7 +19,14 @@ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
         is_padding = get_forward_context().is_padding
-        return is_padding[:num_tokens] if is_padding is not None else None
+        if is_padding is None:
+            return None
+        if is_padding.shape[0] != num_tokens:
+            # Local-batch mask; a different width means a DP/SP-gathered MoE
+            # batch, which the local mask cannot describe. See the matching
+            # guard in fused_topk_bias_router.
+            return None
+        return is_padding
     return None
 
 

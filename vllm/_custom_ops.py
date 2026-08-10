@@ -2146,9 +2146,15 @@ def ggml_moe_a8_vec(
     tokens: torch.SymInt,
     expert_parallel: bool = False,
 ) -> torch.Tensor:
-    return torch.ops._C.ggml_moe_a8_vec(
-        X, W, topk_ids, top_k, quant_type, row, tokens, expert_parallel
-    )
+    op = torch.ops._C.ggml_moe_a8_vec
+    schema = str(op.default._schema)
+    if "expert_parallel" in schema:
+        return op(X, W, topk_ids, top_k, quant_type, row, tokens, expert_parallel)
+    if expert_parallel:
+        raise NotImplementedError(
+            "loaded ggml_moe_a8_vec extension does not support expert_parallel"
+        )
+    return op(X, W, topk_ids, top_k, quant_type, row, tokens)
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:
@@ -3170,6 +3176,444 @@ def all_reduce_add_rms_norm(
 ) -> None:
     torch.ops._C_custom_ar.all_reduce_add_rms_norm(
         fa, inp, residual, weight, out, epsilon, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def all_reduce_dsv4_mhc(
+    fa: int,
+    inp: torch.Tensor,
+    addend: torch.Tensor | None,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    fn: torch.Tensor,
+    residual_out: torch.Tensor,
+    partial: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    next_post: torch.Tensor,
+    next_comb: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor | None,
+    quant_input: torch.Tensor | None,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    input_prepared: bool,
+    own_projections: bool,
+    publish_prepared: bool,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.all_reduce_dsv4_mhc(
+        fa,
+        inp,
+        addend,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        residual_out,
+        partial,
+        scale,
+        base,
+        next_post,
+        next_comb,
+        layer_input,
+        norm_weight,
+        quant_input,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        sinkhorn_repeat,
+        norm_eps,
+        input_prepared,
+        own_projections,
+        publish_prepared,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def wait_dsv4_mhc(fa: int, anchor: torch.Tensor) -> None:
+    torch.ops._C_custom_ar.wait_dsv4_mhc(fa, anchor)
+
+
+def dsv4_channel_owned_mhc(
+    fa: int,
+    inp: torch.Tensor,
+    addend: torch.Tensor | None,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    fn: torch.Tensor,
+    residual_out: torch.Tensor,
+    partial: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    next_post: torch.Tensor,
+    next_comb: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    quant_input: torch.Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_channel_owned_mhc(
+        fa,
+        inp,
+        addend,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        residual_out,
+        partial,
+        scale,
+        base,
+        next_post,
+        next_comb,
+        layer_input,
+        norm_weight,
+        quant_input,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        sinkhorn_repeat,
+        norm_eps,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_channel_owned_q2_down(
+    fa: int,
+    quant_mid: torch.Tensor,
+    weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_channel_owned_q2_down(
+        fa,
+        quant_mid,
+        weights,
+        topk_ids,
+        output,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_owned_attention_projections(
+    fa: int,
+    local_input: torch.Tensor,
+    local_quant: torch.Tensor,
+    aligned_q8_weight: torch.Tensor,
+    bf16_weight0: torch.Tensor,
+    bf16_weight1: torch.Tensor,
+    bf16_weight2: torch.Tensor,
+    q8_output: torch.Tensor,
+    bf16_output0: torch.Tensor,
+    bf16_output1: torch.Tensor,
+    bf16_output2: torch.Tensor,
+    partial: torch.Tensor,
+    reduced: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_owned_attention_projections(
+        fa,
+        local_input,
+        local_quant,
+        aligned_q8_weight,
+        bf16_weight0,
+        bf16_weight1,
+        bf16_weight2,
+        q8_output,
+        bf16_output0,
+        bf16_output1,
+        bf16_output2,
+        partial,
+        reduced,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_gather_owned_q8(
+    fa: int,
+    local_quant: torch.Tensor,
+    full_quant: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_gather_owned_q8(
+        fa, local_quant, full_quant, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def dsv4_gather_owned_bf16(
+    fa: int,
+    local_input: torch.Tensor,
+    full_output: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_gather_owned_bf16(
+        fa, local_input, full_output, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def dsv4_owned_router(
+    fa: int,
+    local_input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    partial: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_owned_router(
+        fa,
+        local_input,
+        weight,
+        output,
+        partial,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_channel_owned_q2_down_pending(
+    fa: int,
+    pending: torch.Tensor,
+    addend: torch.Tensor,
+    scratch: torch.Tensor,
+    output: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_channel_owned_q2_down_pending(
+        fa,
+        pending,
+        addend,
+        scratch,
+        output,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_channel_owned_moe(
+    fa: int,
+    quant_input: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    addend: torch.Tensor,
+    scratch: torch.Tensor,
+    output: torch.Tensor,
+    swiglu_limit: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_channel_owned_moe(
+        fa,
+        quant_input,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        addend,
+        scratch,
+        output,
+        swiglu_limit,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_output_owned_moe(
+    fa: int,
+    quant_input: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    shared_quant: torch.Tensor,
+    shared_w2: torch.Tensor,
+    output: torch.Tensor,
+    swiglu_limit: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_output_owned_moe(
+        fa,
+        quant_input,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        shared_quant,
+        shared_w2,
+        output,
+        swiglu_limit,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_output_owned_q8(
+    fa: int,
+    local_quant: torch.Tensor,
+    aligned_weight: torch.Tensor,
+    output: torch.Tensor,
+    rows_per_cta: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_output_owned_q8(
+        fa,
+        local_quant,
+        aligned_weight,
+        output,
+        rows_per_cta,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_owned_reduce_scatter(
+    fa: int,
+    input: torch.Tensor,
+    addend: torch.Tensor | None,
+    output: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_owned_reduce_scatter(
+        fa,
+        input,
+        addend,
+        output,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def all_reduce_dsv4_q2_mhc(
+    fa: int,
+    pending: torch.Tensor,
+    addend: torch.Tensor,
+    producer_output: torch.Tensor,
+    residual: torch.Tensor,
+    post_mix: torch.Tensor,
+    comb_mix: torch.Tensor,
+    fn: torch.Tensor,
+    residual_out: torch.Tensor,
+    partial: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    next_post: torch.Tensor,
+    next_comb: torch.Tensor,
+    layer_input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    quant_input: torch.Tensor,
+    rms_eps: float,
+    pre_eps: float,
+    sinkhorn_eps: float,
+    post_multiplier: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.all_reduce_dsv4_q2_mhc(
+        fa,
+        pending,
+        addend,
+        producer_output,
+        residual,
+        post_mix,
+        comb_mix,
+        fn,
+        residual_out,
+        partial,
+        scale,
+        base,
+        next_post,
+        next_comb,
+        layer_input,
+        norm_weight,
+        quant_input,
+        rms_eps,
+        pre_eps,
+        sinkhorn_eps,
+        post_multiplier,
+        sinkhorn_repeat,
+        norm_eps,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_indexer_peer_topk(
+    fa: int,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    output: torch.Tensor,
+    workspace: torch.Tensor,
+    k: int,
+    max_seq_len: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_indexer_peer_topk(
+        fa,
+        logits,
+        lengths,
+        output,
+        workspace,
+        k,
+        max_seq_len,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
+
+
+def dsv4_indexer_token_merge(
+    fa: int,
+    logits: torch.Tensor,
+    lengths: torch.Tensor,
+    local_indices: torch.Tensor,
+    output: torch.Tensor,
+    k: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.dsv4_indexer_token_merge(
+        fa,
+        logits,
+        lengths,
+        local_indices,
+        output,
+        k,
+        reg_buffer,
+        reg_buffer_sz_bytes,
     )
 
 

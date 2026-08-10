@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader.gguf_weight_utils import (
     gguf_quant_weights_iterator_multi,
 )
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_utils import gguf_architecture, gguf_reader
 
 from .default import GGUFWeightsAdapter
@@ -123,15 +124,15 @@ _GLOBAL_RENAMES = {
 }
 
 
-# Modules this adapter emits dequantized, so the GGUF linear method must not
-# claim them. Matching is a substring test against the module prefix, so the
-# bare suffix covers every layer.
-#
-#  - `attn.wo_a`: the ROCm inv-rope path reads `wo_a.weight` directly to build
-#    a per-group einsum operand, so a packed `qweight` is not usable there.
-#  - `lm_head`: built unquantized, and the model's `head.weight ->
-#    lm_head.weight` suffix rule stops matching once a name becomes `.qweight`.
-_UNQUANTIZED_MODULES = ("attn.wo_a", "lm_head")
+# The LM head is built unquantized, and the model's `head.weight ->
+# lm_head.weight` suffix rule stops matching once a name becomes `.qweight`.
+# ROCm's established inverse-RoPE path also consumes a BF16 `wo_a.weight`.
+# Ampere instead owns a native grouped Q8_0 kernel and must retain the GGUF
+# blocks in `wo_a.qweight`.
+def _unquantized_modules() -> tuple[str, ...]:
+    if current_platform.is_cuda():
+        return ("lm_head",)
+    return ("attn.wo_a", "lm_head")
 
 
 class Deepseek4GGUFAdapter(GGUFWeightsAdapter):
@@ -197,25 +198,26 @@ class Deepseek4GGUFAdapter(GGUFWeightsAdapter):
 
     def prepare_loading(self, model_path: str, model_config: ModelConfig):
         spec = super().prepare_loading(model_path, model_config)
-        spec.unquantized_modules.extend(_UNQUANTIZED_MODULES)
+        spec.unquantized_modules.extend(_unquantized_modules())
         return spec
 
     def prepare_weights(
         self, model_config: ModelConfig
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        """Yield every tensor, dequantizing the two that cannot stay packed.
+        """Yield tensors in the representation consumed by each platform.
 
-        Both are Q8_0 in the file and both feed modules built unquantized, so
-        the ordinary iterator would rename them to `.qweight` and hand the
-        loader a parameter that does not exist. Together they are ~3.9 GB in
-        bf16 before TP sharding.
+        The Q8_0 LM head is always dequantized because that module is built
+        unquantized. ROCm/Metal also retain their established BF16 ``wo_a``
+        path; CUDA leaves those Q8_0 blocks packed for the Ampere native op.
         """
         name_map = self.load_spec.gguf_to_hf_name_map
-        dequant_names = {
-            name
-            for name in name_map
-            if name == "output.weight" or name.endswith(".attn_output_a.weight")
-        }
+        dequant_names = {name for name in name_map if name == "output.weight"}
+        if not current_platform.is_cuda():
+            dequant_names.update(
+                name
+                for name in name_map
+                if name.endswith(".attn_output_a.weight")
+            )
 
         for gguf_file in self.load_spec.weights_source:
             for tensor in gguf_reader(gguf_file).tensors:

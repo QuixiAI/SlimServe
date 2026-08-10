@@ -12,6 +12,16 @@ from vllm.v1.worker.gpu.sample.gumbel import (
 
 
 @triton.jit
+def _sanitize_nan(logits):
+    # NaN logits poison max/argmax reductions: the block argmax can return a
+    # masked lane, producing a token id >= vocab_size that then corrupts
+    # last_sampled_tokens / input_ids downstream (observed as id 129280 ==
+    # vocab_size with DeepSeek V4). Treat NaN as -inf so a NaN row degrades
+    # to the all--inf behavior (token 0) instead of an out-of-vocab id.
+    return tl.where(logits == logits, logits, float("-inf"))
+
+
+@triton.jit
 def _compute_max_and_sumexp(logits):
     max = tl.max(logits, axis=0)
     sumexp = tl.where(
@@ -244,6 +254,7 @@ def _compute_local_logits_stats_kernel(
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)
+        target_logits = _sanitize_nan(target_logits)
         value, idx = tl.max(target_logits, axis=0, return_indices=True)
         token_id = block_idx * BLOCK_SIZE + idx
         tl.store(
@@ -263,6 +274,7 @@ def _compute_local_logits_stats_kernel(
             mask=mask,
             other=float("-inf"),
         ).to(tl.float32)
+        target_logits = _sanitize_nan(target_logits)
         target_max, target_sumexp = _compute_max_and_sumexp(target_logits)
         tl.store(
             target_local_max_ptr + logit_idx * target_local_max_stride + block_idx,
@@ -284,6 +296,7 @@ def _compute_local_logits_stats_kernel(
                 mask=mask,
                 other=float("-inf"),
             ).to(tl.float32)
+            draft_logits = _sanitize_nan(draft_logits)
             draft_max, draft_sumexp = _compute_max_and_sumexp(draft_logits)
             tl.store(
                 draft_local_max_ptr + logit_idx * draft_local_max_stride + block_idx,
@@ -721,6 +734,7 @@ def _resample_kernel(
         mask=mask,
         other=float("-inf"),
     ).to(tl.float32)
+    target_logits = _sanitize_nan(target_logits)
 
     # Compute the residual logits to resample the rejected token from.
     if is_bonus:

@@ -339,6 +339,19 @@ void persistent_topk(const torch::stable::Tensor& logits,
                      torch::stable::Tensor& workspace, int64_t k,
                      int64_t max_seq_len);
 
+void dsv4_indexer_peer_topk(
+    int64_t fa, torch::stable::Tensor& logits,
+    const torch::stable::Tensor& lengths, torch::stable::Tensor& output,
+    torch::stable::Tensor& workspace, int64_t k, int64_t max_seq_len,
+    int64_t reg_buffer, int64_t reg_buffer_sz_bytes);
+
+void dsv4_indexer_token_merge(
+    int64_t fa, torch::stable::Tensor& logits,
+    const torch::stable::Tensor& lengths,
+    const torch::stable::Tensor& local_indices,
+    torch::stable::Tensor& output, int64_t k, int64_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+
 #ifdef VLLM_ENABLE_COOPERATIVE_TOPK
 void cooperative_topk(const torch::stable::Tensor& logits,
                       const torch::stable::Tensor& lengths,
@@ -378,6 +391,113 @@ void all_reduce_add_rms_norm(fptr_t _fa, torch::stable::Tensor& inp,
                              torch::stable::Tensor& weight,
                              torch::stable::Tensor& out, double epsilon,
                              fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void all_reduce_dsv4_mhc(
+    fptr_t _fa, torch::stable::Tensor& inp,
+    const std::optional<torch::stable::Tensor>& addend,
+    const torch::stable::Tensor& residual,
+    const torch::stable::Tensor& post_mix,
+    const torch::stable::Tensor& comb_mix, const torch::stable::Tensor& fn,
+    torch::stable::Tensor& residual_out, torch::stable::Tensor& partial,
+    const torch::stable::Tensor& scale, const torch::stable::Tensor& base,
+    torch::stable::Tensor& next_post, torch::stable::Tensor& next_comb,
+    torch::stable::Tensor& layer_input,
+    const std::optional<torch::stable::Tensor>& norm_weight,
+    const std::optional<torch::stable::Tensor>& quant_input,
+    double rms_eps, double pre_eps, double sinkhorn_eps,
+    double post_multiplier, int64_t sinkhorn_repeat, double norm_eps,
+    bool input_prepared, bool own_projections, bool publish_prepared,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_channel_owned_mhc(
+    fptr_t _fa, const torch::stable::Tensor& inp,
+    const std::optional<torch::stable::Tensor>& addend,
+    const torch::stable::Tensor& residual,
+    const torch::stable::Tensor& post_mix,
+    const torch::stable::Tensor& comb_mix, const torch::stable::Tensor& fn,
+    torch::stable::Tensor& residual_out, torch::stable::Tensor& partial,
+    const torch::stable::Tensor& scale, const torch::stable::Tensor& base,
+    torch::stable::Tensor& next_post, torch::stable::Tensor& next_comb,
+    torch::stable::Tensor& layer_input,
+    const torch::stable::Tensor& norm_weight,
+    torch::stable::Tensor& quant_input, double rms_eps, double pre_eps,
+    double sinkhorn_eps, double post_multiplier, int64_t sinkhorn_repeat,
+    double norm_eps, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_channel_owned_q2_down(
+    fptr_t _fa, const torch::stable::Tensor& quant_mid,
+    const torch::stable::Tensor& weights,
+    const torch::stable::Tensor& topk_ids, torch::stable::Tensor& output,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_owned_attention_projections(
+    fptr_t _fa, const torch::stable::Tensor& local_input,
+    const torch::stable::Tensor& local_quant,
+    const torch::stable::Tensor& aligned_q8_weight,
+    const torch::stable::Tensor& bf16_weight0,
+    const torch::stable::Tensor& bf16_weight1,
+    const torch::stable::Tensor& bf16_weight2,
+    torch::stable::Tensor& q8_output, torch::stable::Tensor& bf16_output0,
+    torch::stable::Tensor& bf16_output1, torch::stable::Tensor& bf16_output2,
+    torch::stable::Tensor& partial, torch::stable::Tensor& reduced,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_gather_owned_q8(
+    fptr_t _fa, const torch::stable::Tensor& local_quant,
+    torch::stable::Tensor& full_quant, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void dsv4_gather_owned_bf16(
+    fptr_t _fa, const torch::stable::Tensor& local_input,
+    torch::stable::Tensor& full_output, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void dsv4_owned_router(
+    fptr_t _fa, const torch::stable::Tensor& local_input,
+    const torch::stable::Tensor& weight, torch::stable::Tensor& output,
+    torch::stable::Tensor& partial, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void dsv4_channel_owned_q2_down_pending(
+    fptr_t _fa, const torch::stable::Tensor& pending,
+    const torch::stable::Tensor& addend, torch::stable::Tensor& scratch,
+    torch::stable::Tensor& output,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_channel_owned_moe(
+    fptr_t _fa, const torch::stable::Tensor& quant_input,
+    const torch::stable::Tensor& w1, const torch::stable::Tensor& w2,
+    const torch::stable::Tensor& topk_weights,
+    const torch::stable::Tensor& topk_ids,
+    const torch::stable::Tensor& addend, torch::stable::Tensor& scratch,
+    torch::stable::Tensor& output, double swiglu_limit,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_output_owned_moe(
+    fptr_t _fa, const torch::stable::Tensor& quant_input,
+    const torch::stable::Tensor& w1, const torch::stable::Tensor& w2,
+    const torch::stable::Tensor& topk_weights,
+    const torch::stable::Tensor& topk_ids,
+    const torch::stable::Tensor& shared_quant,
+    const torch::stable::Tensor& shared_w2, torch::stable::Tensor& output,
+    double swiglu_limit, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void dsv4_output_owned_q8(
+    fptr_t _fa, const torch::stable::Tensor& local_quant,
+    const torch::stable::Tensor& aligned_weight,
+    torch::stable::Tensor& output, int64_t rows_per_cta,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void dsv4_owned_reduce_scatter(
+    fptr_t _fa, const torch::stable::Tensor& input,
+    const std::optional<torch::stable::Tensor>& addend,
+    torch::stable::Tensor& output, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void all_reduce_dsv4_q2_mhc(
+    fptr_t _fa, const torch::stable::Tensor& pending,
+    const torch::stable::Tensor& addend,
+    torch::stable::Tensor& producer_output,
+    const torch::stable::Tensor& residual,
+    const torch::stable::Tensor& post_mix,
+    const torch::stable::Tensor& comb_mix, const torch::stable::Tensor& fn,
+    torch::stable::Tensor& residual_out, torch::stable::Tensor& partial,
+    const torch::stable::Tensor& scale, const torch::stable::Tensor& base,
+    torch::stable::Tensor& next_post, torch::stable::Tensor& next_comb,
+    torch::stable::Tensor& layer_input,
+    const torch::stable::Tensor& norm_weight,
+    torch::stable::Tensor& quant_input, double rms_eps, double pre_eps,
+    double sinkhorn_eps, double post_multiplier, int64_t sinkhorn_repeat,
+    double norm_eps, fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void wait_dsv4_mhc(fptr_t _fa, const torch::stable::Tensor& anchor);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
@@ -592,6 +712,8 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(torch::stable::Tensor W,
                                           torch::stable::Tensor X, int64_t type,
                                           int64_t row);
 
+torch::stable::Tensor ggml_quantize_q8_1(torch::stable::Tensor X);
+
 torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,
                                       torch::stable::Tensor X, int64_t type,
                                       int64_t row);
@@ -609,5 +731,93 @@ torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
                                       torch::stable::Tensor topk_ids,
                                       int64_t top_k, int64_t type, int64_t row,
                                       int64_t tokens, bool expert_parallel);
+
+torch::stable::Tensor ggml_dsv4_moe_a8(torch::stable::Tensor X,
+                                       torch::stable::Tensor W1,
+                                       torch::stable::Tensor W2,
+                                       torch::stable::Tensor topk_weights,
+                                       torch::stable::Tensor topk_ids,
+                                       torch::stable::Tensor sorted_token_ids,
+                                       torch::stable::Tensor w1_expert_ids,
+                                       torch::stable::Tensor w2_expert_ids,
+                                       torch::stable::Tensor num_tokens_post_padded,
+                                       int64_t intermediate, int64_t out_row,
+                                       int64_t top_k, int64_t tokens,
+                                       double swiglu_limit,
+                                       bool w1_repacked = false,
+                                       bool w2_repacked = false,
+                                       const std::optional<torch::stable::Tensor>&
+                                           quant_input = std::nullopt,
+                                       bool defer_down = false);
+
+torch::stable::Tensor ggml_dsv4_moe_w1_a8(
+    torch::stable::Tensor X, torch::stable::Tensor W1,
+    torch::stable::Tensor topk_weights, torch::stable::Tensor topk_ids,
+    torch::stable::Tensor sorted_token_ids,
+    torch::stable::Tensor w1_expert_ids,
+    torch::stable::Tensor num_tokens_post_padded, int64_t intermediate,
+    int64_t top_k, int64_t tokens, double swiglu_limit,
+    bool w1_repacked = false,
+    const std::optional<torch::stable::Tensor>& quant_input = std::nullopt);
+
+torch::stable::Tensor ggml_dsv4_moe_down_output_owned(
+    torch::stable::Tensor W2, torch::stable::Tensor quant_mid,
+    torch::stable::Tensor topk_ids, int64_t tokens, int64_t top_k);
+
+torch::stable::Tensor ggml_dsv4_repack_q2_k(torch::stable::Tensor W2,
+                                            int64_t intermediate);
+
+torch::stable::Tensor ggml_dsv4_repack_iq2_xxs(torch::stable::Tensor W1,
+                                               int64_t hidden);
+
+torch::stable::Tensor ggml_dsv4_repack_mxfp4(torch::stable::Tensor W,
+                                             int64_t values_per_row);
+
+torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4(
+    torch::stable::Tensor X, torch::stable::Tensor W1,
+    torch::stable::Tensor W2, torch::stable::Tensor topk_weights,
+    torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
+    int64_t top_k, int64_t tokens, double swiglu_limit,
+    bool w1_repacked = false, bool w2_repacked = false,
+    const std::optional<torch::stable::Tensor>& quant_input = std::nullopt);
+
+torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
+    torch::stable::Tensor X, torch::stable::Tensor W1,
+    torch::stable::Tensor W2, torch::stable::Tensor topk_weights,
+    torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
+    int64_t top_k, int64_t tokens, double swiglu_limit);
+
+#ifndef USE_ROCM
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+ggml_dsv4_rms_norm_q8_1(torch::stable::Tensor X,
+                         torch::stable::Tensor weight, double epsilon);
+
+torch::stable::Tensor ggml_mul_mat_vec_prequant_a8(
+    torch::stable::Tensor W, torch::stable::Tensor X,
+    torch::stable::Tensor quant_X, int64_t type, int64_t row);
+
+torch::stable::Tensor ggml_dsv4_repack_q8_0_aligned(
+    torch::stable::Tensor W);
+
+torch::stable::Tensor ggml_dsv4_mul_mat_vec_aligned_q8_0(
+    torch::stable::Tensor W, torch::stable::Tensor X,
+    const std::optional<torch::stable::Tensor>& quant_input, int64_t row,
+    int64_t rows_per_cta);
+
+torch::stable::Tensor ggml_dsv4_shared_gate_up_swiglu(
+    torch::stable::Tensor W, torch::stable::Tensor X, double swiglu_limit,
+    const std::optional<torch::stable::Tensor>& quant_input = std::nullopt);
+
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+ggml_dsv4_shared_gate_up_swiglu_q8_1(
+    torch::stable::Tensor W, torch::stable::Tensor X, double swiglu_limit,
+    const std::optional<torch::stable::Tensor>& quant_input = std::nullopt);
+
+std::tuple<torch::stable::Tensor, torch::stable::Tensor>
+ggml_dsv4_o_proj_q8_0(torch::stable::Tensor W, torch::stable::Tensor O,
+                       torch::stable::Tensor positions,
+                       torch::stable::Tensor cos_sin_cache,
+                       int64_t local_groups, int64_t rope_dim);
+#endif
 
 int64_t ggml_moe_get_block_size(int64_t type);

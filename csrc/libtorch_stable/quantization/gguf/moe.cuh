@@ -115,24 +115,32 @@ static __device__ __forceinline__ void moe_q(
           }
         }
 
+        // Every warp covers columns threadIdx.y, threadIdx.y + nwarps, ...
+        // like the qs copy above. The historical token_offs[threadIdx.y]
+        // read only worked because every instantiation had mmq_x == nwarps
+        // (a one-element token_offs, so any index hit the warp's own
+        // column); wider tiles need the real per-column loop.
         if (threadIdx.x < n_per_r / QK8_1) {
           const auto kby = threadIdx.x % (WARP_SIZE_GGUF / QI8_1);
-          const int col_y_eff = token_offs[threadIdx.y] / top_k;
           const int block_x =
               ib0 * (qk / QK8_1) + ir * (WARP_SIZE_GGUF / QI8_1) + kby;
+#pragma unroll
+          for (int i = 0; i < mmq_x; i += nwarps) {
+            const int col_y_eff = token_offs[i / nwarps] / top_k;
+            if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
+              const half2* dsi_src =
+                  &y[col_y_eff * blocks_per_col_y + block_x].ds;
+              half2* dsi_dst =
+                  &tile_y_ds[span * mmq_x * (WARP_SIZE_GGUF / QI8_1) +
+                             (threadIdx.y + i) * (WARP_SIZE_GGUF / QI8_1) +
+                             kby];
 
-          if (col_y_eff < ncols_y && block_x < blocks_per_col_y) {
-            const half2* dsi_src =
-                &y[col_y_eff * blocks_per_col_y + block_x].ds;
-            half2* dsi_dst =
-                &tile_y_ds[span * mmq_x * (WARP_SIZE_GGUF / QI8_1) +
-                           threadIdx.y * (WARP_SIZE_GGUF / QI8_1) + kby];
-
-            if (need_sum) {
-              *dsi_dst = *dsi_src;
-            } else {
-              float* dfi_dst = (float*)dsi_dst;
-              *dfi_dst = __low2float(*dsi_src);
+              if (need_sum) {
+                *dsi_dst = *dsi_src;
+              } else {
+                float* dfi_dst = (float*)dsi_dst;
+                *dfi_dst = __low2float(*dsi_src);
+              }
             }
           }
         }
@@ -385,6 +393,57 @@ static void ggml_moe_mxfp4_q8_1_cuda(
         exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
   }
 }
+
+#ifndef USE_ROCM
+// 64-column dp4a fallback for the tensor-core MXFP4 MoE path: when
+// ggml_moe_get_block_size(39) reports 64 (mmq_v2 enabled), the alignment
+// metadata is 64-wide, so any shape the v2 kernel cannot take (K not a
+// multiple of 256) must run a 64-wide tile to read expert_ids correctly.
+template <typename scalar_t, bool need_check>
+static __global__ void moe_mxfp4_w64(
+    const void* __restrict__ vx, const void* __restrict__ vy,
+    scalar_t* __restrict__ dst, const int* sorted_token_ids,
+    const int* expert_ids, const int* num_tokens_post_padded,
+    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst,
+    const int top_k) {
+  constexpr int mmq_x = 64;
+  constexpr int mmq_y = 32;
+  constexpr int nwarps = 8;
+
+  moe_q<scalar_t, QK_MXFP4, QR_MXFP4, QI_MXFP4, true, block_mxfp4, mmq_x, mmq_y,
+        nwarps, allocate_tiles_mxfp4<mmq_y>,
+        load_tiles_mxfp4<mmq_y, nwarps, need_check>, VDR_MXFP4_Q8_1_MMQ,
+        vec_dot_mxfp4_q8_1_mul_mat>(
+      vx, vy, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+      exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+}
+
+template <typename scalar_t>
+static void ggml_moe_mxfp4_w64_q8_1_cuda(
+    const void* inp, const void* w, scalar_t* dst, const int* sorted_token_ids,
+    const int* expert_ids, const int* num_tokens_post_padded,
+    const int exp_stride, const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y, const int nrows_dst, const int top_k,
+    const int tokens_post_padded, cudaStream_t stream) {
+  const int block_num_x = (nrows_x + 32 - 1) / 32;
+  // Floor like every moe_q launcher: the tail past the last full tile holds
+  // only padding slots, and moe_q reads sorted ids without a bounds clamp.
+  const int block_num_y = tokens_post_padded / 64;
+  const dim3 block_nums(block_num_x, block_num_y, 1);
+  const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+
+  if (nrows_x % 32 == 0) {
+    moe_mxfp4_w64<scalar_t, false><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  } else {
+    moe_mxfp4_w64<scalar_t, true><<<block_nums, block_dims, 0, stream>>>(
+        w, inp, dst, sorted_token_ids, expert_ids, num_tokens_post_padded,
+        exp_stride, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst, top_k);
+  }
+}
+#endif  // !USE_ROCM
 
 #if defined(USE_ROCM)
   #define MOE_X_Q4_1 8

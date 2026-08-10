@@ -32,6 +32,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.math_utils import next_power_of_2
 
+from .fp8 import e4m3fn_decode_software, e4m3fn_encode_software
+
 
 @triton.jit
 def quantize_and_insert_k_kernel(
@@ -53,6 +55,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_fnuz: tl.constexpr = False,
+    use_software_e4m3: tl.constexpr = False,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -129,12 +132,13 @@ def quantize_and_insert_k_kernel(
             x_scaled = x / scale
             x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
 
-            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then bitcast to uint8.
+            # Convert to fp8 (FNUZ on gfx942, OCP elsewhere), then store bytes.
             if use_fnuz:
-                x_fp8 = x_clamped.to(tl.float8e4b8)
+                x_uint8 = x_clamped.to(tl.float8e4b8).to(tl.uint8, bitcast=True)
+            elif use_software_e4m3:
+                x_uint8 = e4m3fn_encode_software(x_clamped)
             else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+                x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
 
             # Store as uint8 (1 byte each)
             tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
@@ -202,6 +206,13 @@ def quantize_and_insert_k_cache(
         _, FP8_MAX = get_fp8_min_max()
     else:
         FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    use_software_e4m3 = (
+        current_platform.is_cuda()
+        and not use_fnuz
+        and torch.cuda.get_device_capability(k.device)[0] * 10
+        + torch.cuda.get_device_capability(k.device)[1]
+        < 89
+    )
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     grid = (num_tokens,)
@@ -222,6 +233,7 @@ def quantize_and_insert_k_cache(
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_fnuz=use_fnuz,
+        use_software_e4m3=use_software_e4m3,
     )
 
 
@@ -248,6 +260,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_fnuz: tl.constexpr = False,
+    use_software_e4m3: tl.constexpr = False,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -307,12 +320,15 @@ def _dequantize_and_gather_k_kernel(
 
                 # Bitcast uint8 back to fp8 (FNUZ on gfx942, OCP elsewhere).
                 if use_fnuz:
-                    x_fp8 = x_uint8.to(tl.float8e4b8, bitcast=True)
+                    x_float = x_uint8.to(tl.float8e4b8, bitcast=True).to(
+                        tl.float32
+                    )
+                elif use_software_e4m3:
+                    x_float = e4m3fn_decode_software(x_uint8)
                 else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-
-                # Convert fp8 to float32 for computation
-                x_float = x_fp8.to(tl.float32)
+                    x_float = x_uint8.to(tl.float8e4nv, bitcast=True).to(
+                        tl.float32
+                    )
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
@@ -360,6 +376,13 @@ def dequantize_and_gather_k_cache_triton(
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    use_software_e4m3 = (
+        current_platform.is_cuda()
+        and not use_fnuz
+        and torch.cuda.get_device_capability(k_cache.device)[0] * 10
+        + torch.cuda.get_device_capability(k_cache.device)[1]
+        < 89
+    )
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
@@ -384,6 +407,7 @@ def dequantize_and_gather_k_cache_triton(
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
+        use_software_e4m3=use_software_e4m3,
     )
 
 

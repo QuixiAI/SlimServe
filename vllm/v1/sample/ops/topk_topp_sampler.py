@@ -48,7 +48,7 @@ def flashinfer_sampler_supported() -> bool:
         # probe must degrade to "unsupported", not kill worker startup.
         logger.info_once(
             "FlashInfer top-p/top-k sampling unavailable (flashinfer not "
-            "installed); using the PyTorch sampler.",
+            "installed); using the local sampler.",
             scope="global",
         )
         return False
@@ -354,10 +354,8 @@ def apply_top_k_top_p(
     if p is None and k is None:
         return logits
 
-    # No Triton dispatch: this fork runs native kernels only (CUDA/ROCm/ATen).
-    # The sort-based path costs ~1-2 ms at batch 32 over a 155k vocab; if the
-    # sampler ever shows in a profile, the replacement is a native pivot-search
-    # kernel in csrc/quixicore, not the Triton one.
+    if current_platform.is_cuda() and HAS_TRITON:
+        return apply_top_k_top_p_triton(logits, k, p)
     if current_platform.is_cpu():
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
     return apply_top_k_top_p_pytorch(logits, k, p)

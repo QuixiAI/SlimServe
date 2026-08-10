@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -1374,6 +1375,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_descriptor=batch_descriptor,
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
+                # The local slice; its length is the marker for validity. MoE
+                # layers running on a DP/SP-gathered batch (different width)
+                # must not consume it -- see _get_padding_mask.
                 is_padding=input_batch.is_padding,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
@@ -1561,6 +1565,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+
+        # Diagnostic: report out-of-range token IDs observed by the DSV4 hash
+        # router kernel (recorded device-side; see dsv4_router_ampere.cuh).
+        if os.getenv("VLLM_DSV4_HASH_ROUTER_DEBUG", "0") == "1":
+            from vllm.quixicore import quixicore_ops
+
+            if quixicore_ops.has("dsv4_hash_router_debug"):
+                dbg = quixicore_ops.dsv4_hash_router_debug()
+                if int(dbg[0]) != 0:
+                    raw_id = int(dbg[2]) | (int(dbg[3]) << 32)
+                    logger.error(
+                        "DSV4 hash router saw out-of-range token id: "
+                        "token_index=%d raw_token_id=%d (0x%x)",
+                        int(dbg[1]),
+                        raw_id,
+                        raw_id & 0xFFFFFFFFFFFFFFFF,
+                    )
 
         return async_output
 

@@ -73,6 +73,7 @@ if _HAS_FLASH_ATTN:
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+_MAX_SLIDING_WINDOW_KV_SPLITS = 16
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -258,6 +259,13 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         max_num_splits = (
             self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        spec_window = getattr(self.kv_cache_spec, "sliding_window", None)
+        if spec_window:
+            max_num_splits = min(
+                max_num_splits,
+                _MAX_SLIDING_WINDOW_KV_SPLITS,
+                spec_window,
+            )
 
         current_workspace_manager().get_simultaneous(
             ((max_num_reqs, num_heads, max_num_splits, head_size + 1), torch.float32),
@@ -274,7 +282,6 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
         max_cached_len = max(0, model_config.max_model_len - 1)
         # Sliding-window layers only ever dequant the visible window.
-        spec_window = getattr(self.kv_cache_spec, "sliding_window", None)
         if spec_window:
             max_cached_len = min(max_cached_len, spec_window)
         alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
@@ -454,6 +461,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        if self.sliding_window:
+            self.max_num_kv_splits = min(
+                self.max_num_kv_splits,
+                _MAX_SLIDING_WINDOW_KV_SPLITS,
+                self.sliding_window,
+            )
 
     def _flash_attn_varlen(
         self,

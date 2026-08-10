@@ -1216,6 +1216,7 @@ class RoutedExperts(PluggableLayer):
         topk_ids: torch.Tensor,
         shared_experts: "SharedExperts | None" = None,
         shared_experts_input: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Execute routed experts using the quantization method's apply function.
@@ -1237,6 +1238,18 @@ class RoutedExperts(PluggableLayer):
         assert not self.quant_method.is_monolithic
 
         # Modular kernels use pre-computed routing
+        if prequant_input is not None:
+            apply_prequant = getattr(self.quant_method, "apply_prequant", None)
+            if apply_prequant is not None:
+                return apply_prequant(
+                    layer=self,
+                    x=x,
+                    quant_input=prequant_input,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
         return self.quant_method.apply(
             layer=self,
             x=x,

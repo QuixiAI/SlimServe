@@ -133,11 +133,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
             ]
         elif device_capability.major == 8:
-            # Ampere is a no-Triton deployment: sparse MLA (DSA) runs on the
-            # vendored QuixiCore-CUDA kernels and nothing else is offered.
-            # TRITON_MLA is deliberately absent -- a config that needs dense
-            # MLA must fail loudly rather than silently pull Triton back in.
+            # Ampere is a no-Hopper-kernel deployment: sparse MLA (DSA) routes
+            # through model-specific QuixiCore/DSv4 backends. TRITON_MLA is
+            # deliberately absent -- a config that needs dense MLA must fail
+            # loudly rather than silently pull Triton back in.
             return [
+                AttentionBackendEnum.QUIXICORE_MLA_SPARSE_DSV4,
                 AttentionBackendEnum.QUIXICORE_MLA_SPARSE,
             ]
         else:
