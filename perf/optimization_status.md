@@ -1568,3 +1568,103 @@ Entries above reference the profile ids in force when each run was made
 build is a mix) and broke the tag -> registry-quant mapping; q4ktail names
 the distinguishing feature (layers 37-42 experts in Q4_K). Configs are
 unchanged -- ids only.
+
+## 2026-08-10 - INCIDENT: silent output degeneration under load (NaN-class), production dsv4-q4ktail-4
+
+### Discovery
+
+While measuring the dual-instance aggregate ceiling, instance A reported
+acceptance 5.98 (k=5 ceiling is 6.0) on brand-new text while instance B
+reported 3.7-4.3 on adjacent regions. Cross-swapping prompt regions showed
+the anomaly follows the instance, not the content. Direct probing showed the
+"fast" instance emits token 0 (`<|begin_of_sentence|>`) in an endless loop:
+2000-token completions with exact usage counts that decode to almost no
+visible text. The drafter predicts the loop perfectly, which is why
+acceptance pegs at ~6.0 and throughput inflates. The instance stays poisoned
+for every subsequent request (fresh prompts, short prompts after ~28 tokens)
+until process restart. `exact: true` does not catch it: token counts are
+honored; only the text is garbage.
+
+### Trigger matrix (all cells: exact 1K/2K c16 loads on fresh disjoint text)
+
+| GPUs | allreduce | graphs | spec | boots x runs | result |
+| --- | --- | --- | --- | --- | --- |
+| 0-3 (TP4) | custom | FULL cap64 | DSpark k=5 | 4 boots | degenerate by run 2, every boot |
+| 0-3 (TP4) | NCCL | FULL cap64 | DSpark k=5 | 2 boots, 7 runs (incl. clean c1+c16+c32+c64 sweep) | clean |
+| 0-3 (TP4) | custom | FULL cap64 | none | 1 boot, 2 runs | clean text |
+| 0-3 (TP4) | custom, VLLM_DSV4_DEFER_TP_REDUCE=0 | FULL cap64 | DSpark k=5 | 1 boot, 3 runs | text clean, but acceptance collapses to 1.11 (~150 tok/s) - separate latent bug |
+| 0-1 / 2-3 (TP2 pairs) | custom | PIECEWISE cap32 | DSpark k=5 | 1 boot each, 2 runs each | clean |
+| 4-7 (TP4) | custom | FULL cap64 | DSpark k=5 | 3 boots, ~10 runs | clean |
+| 4-7 (TP4) | NCCL | FULL cap64 | DSpark k=5 | 1 boot | degenerate at run 2 |
+
+The last row disproves the custom-allreduce attribution the earlier rows
+suggested (a profile mitigation was applied and then reverted the same
+evening). The failure is a timing-sensitive race: flipping either the
+allreduce implementation or the GPU quartet flips which configuration loses
+the race. Every degenerate cell shares: TP4 + FULL_DECODE_ONLY capture-64 +
+DSpark speculation + sustained c16+ verify load. TP2/PIECEWISE and no-spec
+never degenerated (few runs; not proof). Hardware checked clean: zero ECC,
+zero row-remap, no fresh Xids (GPU2/PCI 06:1B logged an Xid 13 warp
+exception at 01:33 during earlier kernel dev; correlation with the first
+failing quartet may be coincidence given the 4-7 NCCL failure).
+
+Suspected mechanism: one NaN-class step emits token 0 via the sampler's NaN
+guard; a BOS token in context self-sustains at temperature 0; the poisoned
+sequence's KV blocks return to the pool unzeroed and the instance never
+recovers, implying a pool/graph-replay reuse path that lets stale garbage
+reach live sequences. The prime suspects are the spec-decode verify path
+interacting with full-decode graph replay and the async aux streams
+(indexer/MLA compressor overlap), not the reduce collectives themselves.
+
+### Retractions and corrections
+
+- Yesterday's deployed-sweep c16/c32/c64 rows (732.4 / 925.3 / 1023.8,
+  acceptance 5.72-5.88) are retracted as capacity claims: acceptance within
+  2% of the degenerate signature says those runs were substantially
+  BOS-degenerate, on top of the sonnet.txt same-source confound. c1-c8 rows
+  (acceptance 3.53-4.24) remain plausible.
+- Same-source confound quantified separately: single-instance c32 on fresh
+  diverse text = 666.6 tok/s at acceptance 4.52 vs 925.3 at 5.88 on
+  overlapping sonnet windows.
+
+### Valid capacity data (healthy acceptance 3.9-4.6, both instances under
+### simultaneous load, per-instance cells)
+
+| conc | per-instance tok/s (valid cells) | est. healthy box total |
+| ---: | --- | ---: |
+| 16 | 477-566 (B/cAR), 534-582 (A/NCCL) | ~1050-1150 |
+| 32 | 635-686 | ~1300-1370 |
+| 64 | 684-788 | ~1400-1550 |
+
+No single sweep row yet has both instances simultaneously healthy end-to-end
+(each sweep had one instance degenerate); the box totals are sums of valid
+per-instance cells from different runs under equivalent contention, labeled
+estimates. c1 per instance (NCCL boot, fresh text): 137.0 at acc 3.12 and
+201.2 at acc 4.56 - content-dependent acceptance dominates c1 variance.
+
+### Hardening landed
+
+- `benchmarks/benchmark_dsv4_exact.py` now records per-request
+  `chars_per_token` and hard-fails a run when any response decodes below
+  0.5 chars/token, so a degenerate server can no longer post a record.
+- Benchmark protocol: every run draws a never-served disjoint token region
+  (window overlap and repeat-request caching both inflate acceptance).
+- `slimserve-canary.timer` (5 min): long-prompt 60-token probe against both
+  daemons; restarts an instance whose output decodes below 60 chars. The
+  first (short-prompt) canary version missed partial degeneration - poisoned
+  instances still emit ~28 good tokens on short prompts.
+
+### Open (top priority, blocks perf work on this profile family)
+
+1. Root-cause the race. Next discriminators: FULL->PIECEWISE graphs at TP4
+   with spec (many runs); spec with turboquant draft KV -> auto draft KV;
+   aux-stream overlaps disabled; zero freed KV blocks as a diagnostic.
+2. The defer-off acceptance collapse (1.11) says the drafter consumes
+   deferred-path state unconditionally; fix the fallback.
+3. TP8 tiers use the same spec+full-graph machinery across all 8 GPUs;
+   treat their qualification numbers as exposed to the same risk until the
+   race is fixed.
+
+Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` (51 files:
+every benchmark JSON incl. degenerate runs, server logs for the manual
+TP4/TP2/no-spec/defer-off boots).
