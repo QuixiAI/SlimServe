@@ -95,6 +95,22 @@ def _use_dsv4_mxfp4_seg() -> bool:
     return not value.startswith("0")
 
 
+def _use_dsv4_iq2_seg() -> bool:
+    """Segmented tensor-core wide route for the hybrid (IQ2_XXS, Q2_K)
+    expert pair; below the token gate the tuned fused per-route pipeline
+    keeps the batch."""
+    value = os.environ.get("VLLM_GGUF_DSV4_IQ2_SEG", "1")
+    return not value.startswith("0")
+
+
+def _dsv4_iq2_seg_tokens() -> int:
+    value = os.environ.get("VLLM_GGUF_DSV4_IQ2_SEG_TOKENS", "32")
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return 32
+
+
 def _use_dsv4_ampere_mxfp4_repack() -> bool:
     value = os.environ.get("VLLM_GGUF_DSV4_REPACK_MXFP4", "1")
     return value.lower() not in {"0", "false", "off", "no"}
@@ -325,6 +341,37 @@ def _fused_moe_gguf(
                 True,
                 quant_input,
                 defer_down,
+            )
+
+        # Hybrid pair, wide batches: segmented tensor-core pipeline (IQ2 W1
+        # with the fused SwiGLU+Q8_1 epilogue, Q2_K W2 with min-term mma).
+        # Requires the load-time repacked layouts, which are the A100
+        # production state.
+        if (
+            dsv4_fused_native
+            and _use_dsv4_iq2_seg()
+            and w1_repacked
+            and w2_repacked
+            and not output_owned_w2
+            and not defer_down
+            and num_tokens > _dsv4_iq2_seg_tokens()
+            and top_k in (6, 8)
+            and x.shape[1] % 256 == 0
+            and (N // 2) % 256 == 0
+            and w2.shape[1] % 128 == 0
+            and E <= 256
+        ):
+            return ops.ggml_dsv4_moe_a8_iq2_seg(
+                x,
+                w1,
+                w2,
+                topk_weights.contiguous(),
+                local_topk_ids.contiguous(),
+                N // 2,
+                w2.shape[1],
+                top_k,
+                num_tokens,
+                0.0 if swiglu_limit is None else swiglu_limit,
             )
 
         sorted_token_ids = num_tokens_post_padded = None
