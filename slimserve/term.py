@@ -4,7 +4,7 @@
 
 One colour per kind of message, applied only when the destination is a TTY, so
 a piped run is plain text. Generated tokens go to stdout; everything else goes
-to stderr, which is what lets `slimserve k3-6 -p ... > answer.txt` work.
+to stderr, which is what lets `slimserve k3-xxs-6 -p ... > answer.txt` work.
 """
 
 from __future__ import annotations
