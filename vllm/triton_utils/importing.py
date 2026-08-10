@@ -57,8 +57,15 @@ if HAS_TRITON:
             )
             HAS_TRITON = False
 
-        # Check Triton CPU
-        if "cpu" in version("vllm"):
+        # Check Triton CPU. A PYTHONPATH-only deployment has no installed
+        # vllm distribution, so treat missing metadata as the GPU build
+        # instead of letting PackageNotFoundError (an ImportError subclass)
+        # cascade into the blanket except and silently disable Triton.
+        try:
+            vllm_version = version("vllm")
+        except Exception:
+            vllm_version = ""
+        if "cpu" in vllm_version:
             if "cpu" in backends:
                 HAS_TRITON = True
             else:
@@ -67,12 +74,13 @@ if HAS_TRITON:
                     "Disabling Triton."
                 )
                 HAS_TRITON = False
-    except ImportError:
+    except ImportError as e:
         # This can occur if Triton is partially installed or triton.backends
         # is missing.
         logger.warning(
-            "Triton is installed, but `triton.backends` could not be imported. "
-            "Disabling Triton."
+            "Triton is installed, but `triton.backends` could not be imported "
+            "(%s). Disabling Triton.",
+            e,
         )
         HAS_TRITON = False
     except Exception as e:
