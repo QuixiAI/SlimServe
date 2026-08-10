@@ -240,3 +240,93 @@ def test_moe_a8_mxfp4_k_fallback(tokens=90):
     # K % 256 != 0 cannot take the tensor-core tile; exercises the 64-wide
     # dp4a fallback against the same 64-wide alignment metadata.
     _moe_a8_vs_reference(tokens, 6, 288, 128, 16, 6)
+
+
+def _random_gguf_bytes(experts, rows, cols, block_bytes, values_per_block,
+                       device, seed, scale_byte_offsets=()):
+    """Random raw GGUF blocks; fp16 d fields are patched to ~1.0 so the
+    dequant reference stays in a sane range."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    blocks = cols // values_per_block
+    raw = torch.randint(
+        0, 256, (experts, rows, blocks, block_bytes), generator=gen
+    ).to(torch.uint8)
+    for off in scale_byte_offsets:
+        # fp16 ~= 0.00x-0.03 range: exponent bits low, keeps sums finite.
+        raw[..., off] = torch.randint(0, 256, raw.shape[:-1], generator=gen)
+        raw[..., off + 1] = 0x2C  # fp16 exponent for ~0.0x magnitudes
+    return raw.reshape(experts, rows, blocks * block_bytes).to(device)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [40, 300])
+def test_iq2_seg_moe_matches_dequant_reference(tokens):
+    """Full hybrid segmented pipeline (perm + IQ2 W1 fused SwiGLU + Q2_K W2 +
+    reduce) on repacked weights vs the fp32 ggml_dequantize reference."""
+    device = "cuda"
+    torch.manual_seed(11)
+    experts, top_k, hidden, intermediate = 16, 6, 256, 256
+
+    # IQ2_XXS: 66-byte superblocks (fp16 d at offset 0), 256 values.
+    w1_raw = _random_gguf_bytes(
+        experts, 2 * intermediate, hidden, 66, 256, device, 21,
+        scale_byte_offsets=(0,),
+    )
+    # Q2_K: 84-byte superblocks (scales[16] | qs[64] | d | dmin).
+    w2_raw = _random_gguf_bytes(
+        experts, hidden, intermediate, 84, 256, device, 22,
+        scale_byte_offsets=(80, 82),
+    )
+
+    w1_ref = torch.stack(
+        [
+            ops.ggml_dequantize(w1_raw[e], 16, 2 * intermediate, hidden,
+                                torch.float32)
+            for e in range(experts)
+        ]
+    )
+    w2_ref = torch.stack(
+        [
+            ops.ggml_dequantize(w2_raw[e], 10, hidden, intermediate,
+                                torch.float32)
+            for e in range(experts)
+        ]
+    )
+
+    w1_rep = ops.ggml_dsv4_repack_iq2_xxs(w1_raw, hidden)
+    w2_rep = ops.ggml_dsv4_repack_q2_k(w2_raw, intermediate)
+
+    x = (torch.randn(tokens, hidden, device=device) * 0.3).to(torch.bfloat16)
+    topk_ids = torch.stack(
+        [torch.randperm(experts, device=device)[:top_k] for _ in range(tokens)]
+    ).to(torch.int32)
+    topk_weights = torch.rand(tokens, top_k, device=device) + 0.25
+
+    out = ops.ggml_dsv4_moe_a8_iq2_seg(
+        x,
+        w1_rep,
+        w2_rep,
+        topk_weights.float().contiguous(),
+        topk_ids.contiguous(),
+        intermediate,
+        hidden,
+        top_k,
+        tokens,
+        0.0,
+    )
+
+    xf = x.to(torch.float32)
+    ref = torch.zeros(tokens, hidden, device=device, dtype=torch.float32)
+    for t in range(tokens):
+        for k in range(top_k):
+            e = int(topk_ids[t, k])
+            gates_ups = w1_ref[e] @ xf[t]
+            gate, up = gates_ups[:intermediate], gates_ups[intermediate:]
+            act = (gate / (1.0 + torch.exp(-gate))) * up
+            ref[t] += float(topk_weights[t, k]) * (w2_ref[e] @ act)
+
+    out_f = out.to(torch.float32)
+    scale = ref.abs().max().clamp(min=1.0)
+    rel = (out_f - ref).abs().max() / scale
+    assert torch.isfinite(out_f).all()
+    assert rel < 0.03, f"iq2 segmented MoE deviates: rel={float(rel):.4f}"

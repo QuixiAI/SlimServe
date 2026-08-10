@@ -396,6 +396,35 @@ def ggml_dsv4_moe_a8_mxfp4_seg(
     )
 
 
+def ggml_dsv4_moe_a8_iq2_seg(
+    X: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    intermediate: int,
+    out_row: int,
+    top_k: int,
+    tokens: int,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    if _is_metal():
+        raise NotImplementedError("DSV4 hybrid segmented MoE is CUDA-only")
+    _load_stable_libtorch()
+    return torch.ops._C.ggml_dsv4_moe_a8_iq2_seg(
+        X,
+        W1,
+        W2,
+        topk_weights,
+        topk_ids,
+        intermediate,
+        out_row,
+        top_k,
+        tokens,
+        swiglu_limit,
+    )
+
+
 def ggml_dsv4_shared_gate_up_swiglu(
     W: torch.Tensor,
     X: torch.Tensor,
