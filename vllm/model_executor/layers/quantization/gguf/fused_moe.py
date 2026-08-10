@@ -104,11 +104,16 @@ def _use_dsv4_iq2_seg() -> bool:
 
 
 def _dsv4_iq2_seg_tokens() -> int:
-    value = os.environ.get("VLLM_GGUF_DSV4_IQ2_SEG_TOKENS", "32")
+    """Measured crossover vs the 8-wide fused pipeline (A100 TP4 shapes,
+    per-layer op pair): fused wins 0.93/1.75 ms at 48 tokens through
+    4.65/6.05 at 512; seg wins 6.85/8.77 at 1024 and 8.50/17.00 at 2048.
+    768 splits the bracket: prefill chunks ride the tiles, decode/verify
+    widths keep the fused route."""
+    value = os.environ.get("VLLM_GGUF_DSV4_IQ2_SEG_TOKENS", "768")
     try:
         return max(0, int(value))
     except ValueError:
-        return 32
+        return 768
 
 
 def _use_dsv4_ampere_mxfp4_repack() -> bool:

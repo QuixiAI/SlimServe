@@ -1419,6 +1419,44 @@ decision, and raw artifact locations.
   matched methodology. More paired runs would tighten the magnitude.
 - Raw: `perf/results/2026-08-10/dsv4-q4ktail-cap64/`.
 
+## 2026-08-10 - Hybrid (IQ2_XXS/Q2_K) Segmented Tiles: measured, gated at 768
+
+- Status: retained with the measured crossover gate
+  (VLLM_GGUF_DSV4_IQ2_SEG_TOKENS=768); kernels correct at both J widths
+  vs the ggml_dequantize reference (rel < 0.03).
+- Design: dsv4_hybrid_seg_ampere.cuh -- paired-IQ2-repack W1 loader into
+  the Q8_0 mma tile with the fused SwiGLU+route-weight+Q8_1 epilogue;
+  three-plane Q2_K W2 on m16n8k16 fragments with per-16 (d*sc, dmin*m)
+  half2 planes and ones-matrix-mma min-term synthesis (upstream llama.cpp
+  Turing recipe, ones-mma in place of their d2s6 y layout so plain
+  block_q8_1 y tiles serve).
+- Kernel A/B vs the tuned 8-wide fused pipeline (per-layer op pair, A100
+  TP4 shapes E=256/hidden 4096/I=512, ms):
+
+| tokens | fused | seg |
+| ---: | ---: | ---: |
+| 48 | 0.93 | 1.75 |
+| 128 | 1.63 | 2.41 |
+| 512 | 4.65 | 6.05 |
+| 1024 | 8.77 | 6.85 |
+| 2048 | 17.00 | 8.50 |
+
+  The fused pipeline earns its keep below ~768 routed tokens (the
+  notebook's standing warning that hybrid never had MXFP4's wide-path
+  collapse, quantified); the tiles win 1.3-2.0x at prefill-chunk widths.
+  Gate set to 768: prefill chunks ride the tiles, decode/verify widths
+  keep the fused route.
+- E2e note (gate was 32 during the run, i.e. seg over-applied): c1/12K/c8
+  par with the capture-64 baseline; c1 cold 202.6 (acc 4.06). The c8
+  cross-boot comparison is acceptance-confounded in BOTH directions
+  because different kernel numerics change the greedy continuation and
+  therefore the text's acceptance window (752@5.98 vs 294@3.37 on
+  identical stages) -- `exact` checks token counts, not content. Op-level
+  timing above is the retention evidence; a gate-768 e2e pair rides the
+  next qualification pass.
+- Raw: `perf/results/2026-08-10/dsv4-q4ktail-iq2seg/`, bench script in
+  session scratchpad `bench_iq2_seg.py`.
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness

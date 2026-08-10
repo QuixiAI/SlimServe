@@ -220,9 +220,15 @@ in `perf/baseline_status.md`):
      reduce. Notebook has the full entry.
    - NaN-guard audit: DONE -- six paged_attn_v2 reducer guard sites
      upgraded to `!(mp > NEG_INF)` (NaN partial degrades to empty).
-   - Still open (smaller): apply the same seg design to the IQ2/Q2_K
-     hybrid moe_q tiles; test-discipline ports (oracle-from-stored-codes,
-     memcmp cache contracts, bit-equal RoPE tails, worst_excess<=0).
+   - Hybrid IQ2/Q2_K seg tiles: DONE 2026-08-10
+     (dsv4_hybrid_seg_ampere.cuh, op ggml_dsv4_moe_a8_iq2_seg, measured
+     crossover gate VLLM_GGUF_DSV4_IQ2_SEG_TOKENS=768 -- fused 8-wide
+     pipeline keeps <768 tokens, tiles win 1.3-2x at prefill widths).
+     dsv4-q4ktail-4 also ships capture 64 (hot c8 into the 500-750 band;
+     mechanism = the TP8 eager-verify fix). Still open (smaller):
+     test-discipline ports (oracle-from-stored-codes, memcmp cache
+     contracts, bit-equal RoPE tails, worst_excess<=0); gate-768 e2e pair
+     on the next qualification pass.
    - Cross-platform contract watch (XPU-side bugs, do not port): XPU
      mqa_logits folds kv_scale inside the relu (our indexer_paged_logits
      placement is authoritative); XPU turboquant v2 rotated-key centroids
