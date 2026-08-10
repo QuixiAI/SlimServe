@@ -58,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--thinking",
         action="store_true",
-        help="render chat requests in thinking mode unless the request opts out",
+        help=argparse.SUPPRESS,  # now the default for every profile; kept as a no-op
     )
     parser.add_argument(
         "--cache", help="model directory (default $SLIMSERVE_CACHE or ~/models)"

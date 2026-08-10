@@ -9,6 +9,7 @@ explains, in the user's terms, why a combination is not allowed.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass, field
@@ -225,6 +226,15 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
     }
 
 
+# Serving behavior every profile gets unless it overrides the key itself.
+# "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
+# GLM/Qwen one; templates ignore the name they do not use.
+_SERVING_DEFAULTS: dict[str, Any] = {
+    "enable_auto_tool_choice": True,
+    "default_chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+}
+
+
 def resolve(
     profile_id: str,
     platform: str,
@@ -300,6 +310,11 @@ def resolve(
                 merged["engine"][key] = value
         for key, value in (quant_override.get("env") or {}).items():
             merged["env"][key] = value
+
+    # Thinking and tool calling are on by default for every profile on every
+    # platform. A profile sets these keys itself only to opt out.
+    for key, value in _SERVING_DEFAULTS.items():
+        merged["engine"].setdefault(key, copy.deepcopy(value))
 
     return Plan(
         profile_id=profile_id,

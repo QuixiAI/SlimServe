@@ -277,7 +277,10 @@ curl -s http://localhost:8000/v1/chat/completions \
 ### Reasoning output
 
 GLM-5.2 is a reasoning model and thinking is on by default — that is the point
-of the model, and you should normally leave it on. This build parses the chain
+of the model, and you should normally leave it on. This is SlimServe policy,
+not a GLM special case: every profile on every platform serves with thinking
+mode and automatic tool calling enabled by default, with the reasoning and
+tool parsers pinned per model in `profiles.json`. This build parses the chain
 of thought into a separate `reasoning` field on the message:
 
 ```bash
