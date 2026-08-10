@@ -144,8 +144,12 @@ class DeepseekV4TurboQuantDraftAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del llama_4_scaling
+        # The shared decoder layer forwards the Ampere aligned-Q8 prequant
+        # alongside hidden_states; the draft projections have no fused-Q8
+        # path, so it is accepted and ignored here.
+        del llama_4_scaling, prequant_input
         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(

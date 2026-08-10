@@ -150,7 +150,10 @@ def test_padded_turboquant_view_fits_its_backing_storage() -> None:
         packing=None,
     )
 
-    assert cache.shape == (num_blocks, spec.block_size, 16, slot_size)
+    # The dim order is platform-dependent (Metal NHD, CUDA head-major); the
+    # invariant is that the view matches the backend's declared shape and
+    # strides by whole padded pages.
+    assert cache.shape == tuple(shape)
     assert cache.stride(0) == page_size
 
 

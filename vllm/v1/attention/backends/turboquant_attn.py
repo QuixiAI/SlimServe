@@ -67,6 +67,13 @@ _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
+
+@functools.cache
+def _is_metal_platform() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_metal()
+
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
@@ -340,7 +347,12 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             query_start_loc_cpu=cam.query_start_loc_cpu,
             seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
             uniform_q_len=uniform_q_len,
-            causal=cam.causal,
+            # On CUDA/HIP every TQ path (decode kernel, continuation decode,
+            # flash prefill) was written and qualified causal-only; honoring
+            # the drafter's declared non-causal layers here collapsed DSpark
+            # per-position acceptance to 0.89/0.05/0.00/... (2026-08-10).
+            # Metal's kernels implement the flag and keep it.
+            causal=cam.causal if _is_metal_platform() else True,
         )
 
 

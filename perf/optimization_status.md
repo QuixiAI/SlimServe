@@ -1356,6 +1356,52 @@ decision, and raw artifact locations.
   TP8 +18%, both where prefill actually executes.
 - Raw: `perf/results/2026-08-10/dsv4-mxfp4-seg/` (+ `-tp8/`).
 
+## 2026-08-10 - Merge Regression: Metal drafter class captured the A100 path
+
+- Status: fixed (platform gate); found because the capture-64 A/B doubled
+  as the first post-rebase serving boot.
+- Two regressions from reconciling the force-pushed Metal/ROCm lineage:
+  1. Boot failure: the shared decoder layer passes `prequant_input` (our
+     Ampere aligned-Q8 plumbing) to its attention module; the remote-new
+     `DeepseekV4TurboQuantDraftAttention` did not accept it. Fixed by
+     accepting-and-ignoring in the draft class.
+  2. Throughput collapse: after (1), dsv4-q4ktail-4 measured c1 95.3
+     (baseline 128-162), 12K 89.9/90.2 (baseline 152.6/155.2), all exact.
+     The harness's new spec-metrics deltas narrowed it fast: DSpark
+     acceptance 1.9-2.0 vs the 3.5-3.7 band, and the per-position rates
+     were the smoking gun -- 0.89, 0.05, 0.00, 0.00, 0.00 (position 0
+     healthy, every parallel-drafted position dead) at decode widths,
+     recovering to a normal cascade during wide c8 batches.
+     Investigation path: (a) drafter attention_factory platform-gate --
+     no effect (same acceptance with the factory off; gate kept anyway as
+     the conservative validated config); (b) suspected NHD cache-layout
+     change -- wrong, the old regime transposed a head-major allocation
+     into the same NHD view the kernels always consumed; (c) file-swap
+     probe with the pre-rebase turboquant_attn.py restored 129 tok/s and
+     the healthy 0.94/0.82/0.46/0.14/0.04 cascade -> regression isolated
+     to that file's rewrite. ROOT CAUSE: the rewrite honors the drafter
+     config's declared non-causal layers (cam.causal) on every path; the
+     native CUDA/HIP TQ decode kernels are causal-only, so non-causal-
+     marked draft decode fed them an unimplementable flag and every
+     same-step parallel-draft position lost intra-block visibility. The
+     prefill path (flash/SDPA) implements non-causal correctly, which is
+     why wide batches were unaffected. FIX: clamp causal to True at the
+     metadata builder on non-Metal platforms (the drafter's per-step
+     6-token forward routes through the CONTINUATION-decode path, not the
+     decode portion, so a decode-site-only clamp measured no change --
+     94.8/1.86; the builder-level clamp restores 129.5 tok/s and the
+     0.92/0.75/0.46/0.15/0.02 cascade, matching the old-file probe
+     exactly. Metal's kernels implement the flag and keep it.)
+- Lesson recorded: post-merge unit suites are not serving validation --
+  the first profile boot after any cross-lineage merge is part of the
+  merge. The spec-metrics columns in benchmark_dsv4_exact.py (adopted
+  from the Metal lineage in the same merge) are what made the diagnosis
+  a one-liner; keep them.
+- Also this session: sha256 pins landed for Q4K-tail
+  (659e22fb...) and MXFP4 (0e3a161b...) hashed on-box with the IQ2_XXS
+  hash matching the existing verified pin exactly (control); Q4_K pin
+  pending a hash on the MI300X box (test-enforced allowlist).
+
 ## Historical Notes
 
 - `perf_worklog.md` contains prior GLM-5.2 performance and correctness

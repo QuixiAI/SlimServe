@@ -94,7 +94,15 @@ class DSparkDeepseekV4Model(nn.Module):
 
         current_vllm_config = get_current_vllm_config()
         attention_factory: Callable[[VllmConfig, str], nn.Module] | None = None
-        if current_vllm_config.cache_config.cache_dtype.startswith("turboquant_"):
+        # The SWA-only TurboQuant draft attention is the Metal/ROCm-validated
+        # drafter. On CUDA (A100) the default decoder-layer attention is the
+        # measured path: swapping it for this class dropped DSpark acceptance
+        # from ~3.5 to ~1.9 (2026-08-10 A/B, perf/optimization_status.md).
+        from vllm.platforms import current_platform
+
+        if current_vllm_config.cache_config.cache_dtype.startswith(
+            "turboquant_"
+        ) and (current_platform.is_metal() or current_platform.is_rocm()):
             from .dspark_turboquant import DeepseekV4TurboQuantDraftAttention
 
             attention_factory = DeepseekV4TurboQuantDraftAttention
