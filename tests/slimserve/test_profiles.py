@@ -487,17 +487,40 @@ def test_engine_kwargs_drop_server_only_settings():
     assert kwargs["model"].endswith(".gguf")
 
 
-def test_thinking_default_is_a_serve_only_json_flag():
+def _all_plans():
+    for profile_id in registry.profile_ids():
+        for platform in registry.describe(profile_id)["platforms"]:
+            yield resolve(
+                profile_id, platform, 8, None, memory_bytes=512 * 1024**3
+            )
+
+
+def test_every_profile_serves_thinking_and_tool_calling_by_default():
+    for plan in _all_plans():
+        engine = plan.engine
+        assert engine["enable_auto_tool_choice"] is True, plan.profile_id
+        kwargs = engine["default_chat_template_kwargs"]
+        assert kwargs["thinking"] is True, plan.profile_id
+        assert kwargs["enable_thinking"] is True, plan.profile_id
+        assert engine["reasoning_parser"], plan.profile_id
+        assert engine["tool_call_parser"], plan.profile_id
+        # No profile forces the chat client back out of thinking mode.
+        assert plan.chat_template_kwargs.get("thinking") is not False, (
+            plan.profile_id
+        )
+
+
+def test_thinking_and_tool_defaults_are_serve_only():
     plan = resolve("dsv4-q4ktail-4", "a100", 8, None)
-    plan = replace(
-        plan,
-        engine={**plan.engine, "default_chat_template_kwargs": {"thinking": True}},
-    )
     argv = serve_argv(plan, "127.0.0.1", 8000)
+    assert "--enable-auto-tool-choice" in argv
     assert (
-        argv[argv.index("--default-chat-template-kwargs") + 1] == '{"thinking": true}'
+        argv[argv.index("--default-chat-template-kwargs") + 1]
+        == '{"thinking": true, "enable_thinking": true}'
     )
-    assert "default_chat_template_kwargs" not in engine_kwargs(plan)
+    kwargs = engine_kwargs(plan)
+    assert "default_chat_template_kwargs" not in kwargs
+    assert "enable_auto_tool_choice" not in kwargs
 
 
 @pytest.mark.parametrize(
