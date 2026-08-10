@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from dataclasses import replace
+from pathlib import Path
 
 from slimserve import chat, fetch, hardware, registry, term
 from slimserve.registry import Plan, ProfileError
@@ -37,6 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--quant", help="quant to serve; profile default otherwise")
     parser.add_argument("-p", "--prompt", help="run one prompt and exit")
     parser.add_argument("--serve", action="store_true", help="open an HTTP endpoint")
+    parser.add_argument(
+        "--no-spec",
+        action="store_true",
+        help="disable speculative decoding for performance diagnosis",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -55,6 +62,10 @@ def _parser() -> argparse.ArgumentParser:
         "--engine-log",
         help="write the engine's own log here instead of discarding it",
     )
+    parser.add_argument(
+        "--torch-profile-dir",
+        help="capture eight steady engine iterations after /start_profile",
+    )
     return parser
 
 
@@ -70,6 +81,7 @@ def _help() -> None:
         ("--quant NAME", "Quant to serve. Profile default otherwise."),
         ("-p, --prompt TEXT", "Run one prompt and exit."),
         ("--serve", "OpenAI-compatible endpoint instead of the prompt."),
+        ("--no-spec", "Disable speculative decoding for performance diagnosis."),
         ("--host HOST", "Bind address for --serve. Default: 127.0.0.1"),
         ("--port N", "Bind port for --serve. Default: 8000"),
         ("--cache DIR", "Model directory. Default: $SLIMSERVE_CACHE or ~/models"),
@@ -77,6 +89,7 @@ def _help() -> None:
         ("-y, --yes", "Do not ask before downloading."),
         ("--dry-run", "Print the resolved plan and stop."),
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
+        ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         ("--list", "List every profile, including ones this machine cannot run."),
     ):
         print(f"  {term.paint(flag, term.CYAN, out):<38} {description}")
@@ -302,6 +315,27 @@ def main(argv: list[str] | None = None) -> int:
     except ProfileError as error:
         term.fail(str(error))
         return 2
+
+    if args.no_spec:
+        plan = replace(plan, speculative=False)
+    if args.torch_profile_dir:
+        profile_dir = Path(args.torch_profile_dir).expanduser().resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "profiler_config": {
+                    "profiler": "torch",
+                    "torch_profiler_dir": str(profile_dir),
+                    "torch_profiler_with_stack": False,
+                    "torch_profiler_use_gzip": False,
+                    "ignore_frontend": True,
+                    "max_iterations": 8,
+                    "detailed_trace_annotation": True,
+                },
+            },
+        )
 
     if args.dry_run:
         _show(plan)

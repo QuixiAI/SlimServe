@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -120,6 +121,7 @@ def _moe_forward(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
+    prequant_input: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
 ) -> torch.Tensor:
@@ -129,6 +131,7 @@ def _moe_forward(
         router_logits,
         shared_experts_input,
         input_ids,
+        prequant_input,
     )
 
 
@@ -137,6 +140,7 @@ def _moe_forward_fake(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
+    prequant_input: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
 ) -> torch.Tensor:
@@ -154,6 +158,7 @@ def _moe_forward_shared(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
+    prequant_input: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -163,6 +168,7 @@ def _moe_forward_shared(
         router_logits,
         shared_experts_input,
         input_ids,
+        prequant_input,
     )
 
 
@@ -171,6 +177,7 @@ def _moe_forward_shared_fake(
     router_logits: torch.Tensor,
     shared_experts_input: torch.Tensor | None,
     input_ids: torch.Tensor | None,
+    prequant_input: torch.Tensor | None,
     layer_name: _layer_name_type,
     hidden_dim_unpadded: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -265,6 +272,9 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
+        # DSV4 Ampere can carry shared/routed TP partials separately into its
+        # custom all-reduce+mHC transition, avoiding a materialized local add.
+        self.defer_shared_expert_add = False
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -575,10 +585,11 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_experts_input: torch.Tensor | None,
         order: SharedExpertsOrder,
+        prequant_input: torch.Tensor | None = None,
     ):
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts(shared_experts_input, order)
+            self._shared_experts(shared_experts_input, order, prequant_input)
 
     def _apply_quant_method(
         self,
@@ -586,6 +597,8 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
+        preselected: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -594,7 +607,7 @@ class MoERunner(MoERunnerInterface):
         (shared_expert_output, fused_expert_output).
         """
         self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP, prequant_input
         )
 
         if self.routed_experts.quant_method.is_monolithic:
@@ -606,12 +619,15 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if preselected is None:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
+            else:
+                topk_weights, topk_ids = preselected
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -619,11 +635,13 @@ class MoERunner(MoERunnerInterface):
                 topk_ids=topk_ids,
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
+                prequant_input=prequant_input,
             )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+            prequant_input,
         )
 
         return (
@@ -649,6 +667,7 @@ class MoERunner(MoERunnerInterface):
     def _maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor | None,
+        prequant_input: torch.Tensor | None = None,
     ):
         # If router/gate provided, then apply it here.
         # (Note: This code runs only when "overlapped mode" is on to allow
@@ -656,7 +675,9 @@ class MoERunner(MoERunnerInterface):
         #        separate cuda stream)
         if self._shared_experts is not None:
             assert shared_experts_input is not None
-            self._shared_experts.maybe_sync_shared_experts_stream(shared_experts_input)
+            self._shared_experts.maybe_sync_shared_experts_stream(
+                shared_experts_input, prequant_input
+            )
 
     def _maybe_add_zero_expert_output(
         self,
@@ -679,7 +700,8 @@ class MoERunner(MoERunnerInterface):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        prequant_input: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Invoke the fused moe layer.
 
         Input:
@@ -705,6 +727,12 @@ class MoERunner(MoERunnerInterface):
         hidden_states, shared_experts_input = self.apply_routed_input_transform(
             hidden_states
         )
+        if prequant_input is not None:
+            if (
+                hidden_states.shape[-1] != 4096
+                or prequant_input.shape[0] != hidden_states.shape[0]
+            ):
+                raise ValueError("prequantized MoE input does not match hidden states")
 
         # Record before `_maybe_pad_hidden_states` pads activations to match
         # `moe_config.hidden_dim`, e.g. after `align_trtllm_fp4_moe_hidden_dim_for_fi`
@@ -723,6 +751,7 @@ class MoERunner(MoERunnerInterface):
             router_logits,
             shared_experts_input,
             input_ids,
+            prequant_input,
             self._encode_layer_name(),
             self.moe_config.hidden_dim_unpadded
             if self._quant_method.has_unpadded_output
@@ -759,6 +788,10 @@ class MoERunner(MoERunnerInterface):
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)
 
+        if shared_output is not None and self.defer_shared_expert_add:
+            assert self.moe_config.skip_final_all_reduce
+            assert og_hidden_dim_post_xform is None
+            return shared_output, fused_output
         if shared_output is not None:
             result = shared_output + fused_output
         else:
@@ -833,6 +866,7 @@ class MoERunner(MoERunnerInterface):
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -850,12 +884,66 @@ class MoERunner(MoERunnerInterface):
         self.routed_experts._ensure_moe_quant_config_init()
 
         # Sync aux and main stream for shared expert multi-stream overlap.
-        self._maybe_sync_shared_experts_stream(shared_experts_input)
+        self._maybe_sync_shared_experts_stream(
+            shared_experts_input, prequant_input
+        )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
+        preselected = None
+        owned_precomputed_router = (
+            os.getenv("VLLM_DSV4_TP_OWNERSHIP", "0").lower()
+            in {"1", "true", "on", "yes"}
+            and prequant_input is not None
+            and router_logits.ndim == 2
+            and router_logits.shape[0] == hidden_states.shape[0]
+            and router_logits.shape[1] == self.moe_config.num_experts
+        )
+        use_ampere_hash_router = (
+            not owned_precomputed_router
+            and
+            os.getenv("VLLM_DSV4_HASH_ROUTER", "1").lower()
+            not in {"0", "false", "off", "no"}
+            and self.gate is not None
+            and getattr(self.gate, "allow_dsv4_ampere_router_gemm", False)
+            and hidden_states.shape[0] <= 8
+            and hidden_states.dtype == torch.bfloat16
+            and input_ids is not None
+            and getattr(self.router, "_hash_indices_table", None) is not None
+            and self.moe_config.experts_per_token == 6
+            and not self.do_naive_dispatch_combine
+            and self.moe_config.pcp_size == 1
+            and not self.routed_experts.quant_method.is_monolithic
+        )
+        if use_ampere_hash_router:
+            from vllm.model_executor.layers.fused_moe.router.base_router import (
+                BaseRouter,
+            )
+            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (  # noqa: E501
+                _get_padding_mask,
+            )
+
+            assert isinstance(self.router, BaseRouter)
+            topk_weights, topk_ids = torch.ops.vllm.dsv4_ampere_hash_router(
+                hidden_states,
+                self.gate.weight,
+                input_ids,
+                self.router._hash_indices_table,
+                self.router.routed_scaling_factor,
+                _get_padding_mask(hidden_states.shape[0]),
+            )
+            preselected = self.router.finalize_experts(
+                topk_weights,
+                topk_ids,
+                self._quant_method.topk_indices_dtype,
+            )
+            if self.router._routing_replay_out is not None:
+                self.router._routing_replay_out[: topk_ids.shape[0]].copy_(
+                    topk_ids.to(torch.int16)
+                )
+            router_logits = hidden_states
+        elif self.gate is not None and not owned_precomputed_router:
             if self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
@@ -876,6 +964,8 @@ class MoERunner(MoERunnerInterface):
                 router_logits=router_logits,
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
+                prequant_input=prequant_input,
+                preselected=preselected,
             )
 
             return self._maybe_combine(

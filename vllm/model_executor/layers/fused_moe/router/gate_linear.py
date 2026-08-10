@@ -18,14 +18,15 @@ logger = init_logger(__name__)
 class GateLinear(ReplicatedLinear):
     """MoE gate linear layer with multi-tier GEMM dispatch:
 
-    1. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
+    1. DSV4 Ampere GEMV (SM80, M<=8, H=4096, E=256, bf16 in, fp32 out)
+    2. cuteDSL ll_bf16_gemm (SM90+, M<=16, bf16 in, fp32 out,
        K divisible by 8)
-    2. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384, H=6144 E=256)
-    3. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
+    3. DSV3 specialized kernel (SM90+, M<=16, H=7168 E=256/384, H=6144 E=256)
+    4. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
-    4. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
-    5. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
-    6. F.linear via ReplicatedLinear (ultimate fallback)
+    5. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
+    6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
     (e.g. when the required dtype depends on the expert quantization
@@ -76,6 +77,18 @@ class GateLinear(ReplicatedLinear):
             prefix=prefix,
         )
         self.out_dtype = out_dtype
+
+        self._dsv4_ampere_router_shape = (
+            not bias
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and self.weight.dtype == torch.bfloat16
+            and input_size == 4096
+            and output_size == 256
+        )
+        self.allow_dsv4_ampere_router_gemm = (
+            self._dsv4_ampere_router_shape and out_dtype == torch.float32
+        )
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -145,6 +158,9 @@ class GateLinear(ReplicatedLinear):
         if self.out_dtype is not None:
             raise ValueError("out_dtype has already been set")
         self.out_dtype = out_dtype
+        self.allow_dsv4_ampere_router_gemm = (
+            self._dsv4_ampere_router_shape and out_dtype == torch.float32
+        )
 
         if (
             not self.allow_cublas_router_gemm
@@ -168,7 +184,16 @@ class GateLinear(ReplicatedLinear):
     def forward(
         self, x: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        # Tier 1: cuteDSL ll_bf16_gemm (SM90+, any dims)
+        # Tier 1: native decode router for DeepSeek-V4 on A100.
+        if (
+            self.allow_dsv4_ampere_router_gemm
+            and x.shape[0] <= 8
+            and x.dtype == torch.bfloat16
+        ):
+            output = torch.ops.vllm.dsv4_ampere_router_gemm(x, self.weight)
+            return output, None
+
+        # Tier 2: cuteDSL ll_bf16_gemm (SM90+, any dims)
         if self.allow_ll_bf16_gemm and x.shape[0] <= 16 and x.dtype == torch.bfloat16:
             from vllm.model_executor.kernels.linear.cute_dsl.ll_bf16 import (
                 ll_bf16_gemm,
@@ -177,7 +202,7 @@ class GateLinear(ReplicatedLinear):
             output = ll_bf16_gemm(x, self.weight)
             return output, None
 
-        # Tier 2: DSV3 specialized kernel (fallback for when cuteDSL unavailable)
+        # Tier 3: DSV3 specialized kernel (fallback for when cuteDSL unavailable)
         if self.allow_dsv3_router_gemm and x.shape[0] <= self._dsv3_max_batch:
             output = ops.dsv3_router_gemm(
                 hidden_states=x,
@@ -186,7 +211,7 @@ class GateLinear(ReplicatedLinear):
             )
             return output, None
 
-        # Tier 3: fp32 specialized kernel (H=3072, E=256, M<=32)
+        # Tier 4: fp32 specialized kernel (H=3072, E=256, M<=32)
         # Dispatch is wrapped in a custom op so that torch.compile/CUDA-graph
         # capture does not freeze the runtime num_tokens branch.
         if self.allow_fp32_router_gemm and x.dtype in (
@@ -198,7 +223,7 @@ class GateLinear(ReplicatedLinear):
             )
             return output, None
 
-        # Tier 4: experimental bf16x3 CuteDSL kernel for fp32 router weights
+        # Tier 5: experimental bf16x3 CuteDSL kernel for fp32 router weights
         if self.allow_bf16x3_router_gemm and x.dtype == torch.bfloat16:
             from vllm.model_executor.layers.fused_moe.router.bf16x3_router_gemm_cutedsl import (  # noqa: E501
                 bf16x3_router_gemm,
@@ -207,12 +232,12 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return output, None
 
-        # Tier 5: cuBLAS bf16→fp32
+        # Tier 6: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
 
-        # Tier 6: F.linear (ReplicatedLinear)
+        # Tier 7: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:
             x = x.to(self.weight.dtype)
         output, output_bias = super().forward(x)
@@ -224,6 +249,70 @@ class GateLinear(ReplicatedLinear):
 _FP32_ROUTER_GEMM_MAX_TOKENS = GateLinear.FP32_MAX_TOKENS
 
 
+def dsv4_ampere_router_gemm_impl(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.dsv4_router_gemm(x, weight)
+
+
+def dsv4_ampere_router_gemm_fake(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+direct_register_custom_op(
+    op_name="dsv4_ampere_router_gemm",
+    op_func=dsv4_ampere_router_gemm_impl,
+    fake_impl=dsv4_ampere_router_gemm_fake,
+)
+
+
+def dsv4_ampere_hash_router_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routed_scaling_factor: float,
+    is_padding: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.dsv4_hash_router(
+        x,
+        weight,
+        input_ids,
+        tid2eid,
+        routed_scaling_factor,
+        is_padding,
+    )
+
+
+def dsv4_ampere_hash_router_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routed_scaling_factor: float,
+    is_padding: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del weight, input_ids, tid2eid, routed_scaling_factor, is_padding
+    shape = (x.shape[0], 6)
+    return (
+        x.new_empty(shape, dtype=torch.float32),
+        x.new_empty(shape, dtype=torch.int32),
+    )
+
+
+direct_register_custom_op(
+    op_name="dsv4_ampere_hash_router",
+    op_func=dsv4_ampere_hash_router_impl,
+    fake_impl=dsv4_ampere_hash_router_fake,
+)
+
+
 def fp32_router_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -231,7 +320,6 @@ def fp32_router_gemm_dispatch_impl(
 ) -> torch.Tensor:
     """
     Dynamically run fp32 specialized gemm if num_tokens <= FP32_MAX_TOKENS,
-    otherwise optionally run the experimental BF16x3 kernel for medium/large
     SM100 router batches, then fall back to F.linear.
     This must be wrapped in a custom op because our torch.compile integration
     does not support runtime dispatching on num_tokens.

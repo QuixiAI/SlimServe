@@ -607,6 +607,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
       "-> Tensor");
 
+  ops.def("ggml_quantize_q8_1(Tensor X) -> Tensor");
+
   // mmq kernel for GGML.
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
@@ -623,6 +625,73 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens, "
       "bool expert_parallel=False) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_moe_a8(Tensor X, Tensor W1, Tensor W2, "
+      "Tensor topk_weights, Tensor topk_ids, Tensor sorted_token_ids, Tensor w1_expert_ids, "
+      "Tensor w2_expert_ids, Tensor num_tokens_post_padded, "
+      "SymInt intermediate, SymInt out_row, SymInt top_k, "
+      "SymInt tokens, float swiglu_limit, bool w1_repacked=False, "
+      "bool w2_repacked=False, "
+      "Tensor? quant_input=None, bool defer_down=False) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_moe_w1_a8(Tensor X, Tensor W1, Tensor topk_weights, "
+      "Tensor topk_ids, Tensor sorted_token_ids, Tensor w1_expert_ids, "
+      "Tensor num_tokens_post_padded, SymInt intermediate, SymInt top_k, "
+      "SymInt tokens, float swiglu_limit, bool w1_repacked=False, "
+      "Tensor? quant_input=None) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_moe_down_output_owned(Tensor W2, Tensor quant_mid, "
+      "Tensor topk_ids, SymInt tokens, SymInt top_k) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_repack_q2_k(Tensor W2, SymInt intermediate) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_repack_iq2_xxs(Tensor W1, SymInt hidden) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_repack_mxfp4(Tensor W, SymInt values_per_row) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_moe_a8_mxfp4(Tensor X, Tensor W1, Tensor W2, "
+      "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
+      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit, "
+      "bool w1_repacked=False, bool w2_repacked=False, "
+      "Tensor? quant_input=None) -> Tensor");
+
+  ops.def(
+      "ggml_dsv4_moe_a8_mxfp4_seg(Tensor X, Tensor W1, Tensor W2, "
+      "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
+      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit) "
+      "-> Tensor");
+
+#ifndef USE_ROCM
+  ops.def(
+      "ggml_dsv4_rms_norm_q8_1(Tensor X, Tensor weight, float epsilon) "
+      "-> (Tensor, Tensor)");
+
+  ops.def(
+      "ggml_mul_mat_vec_prequant_a8(Tensor W, Tensor X, Tensor quant_X, "
+      "int type, SymInt row) -> Tensor");
+
+  ops.def("ggml_dsv4_repack_q8_0_aligned(Tensor W) -> Tensor");
+  ops.def(
+      "ggml_dsv4_mul_mat_vec_aligned_q8_0(Tensor W, Tensor X, "
+      "Tensor? quant_input, SymInt row, SymInt rows_per_cta) -> Tensor");
+  ops.def(
+      "ggml_dsv4_shared_gate_up_swiglu(Tensor W, Tensor X, "
+      "float swiglu_limit, Tensor? quant_input=None) -> Tensor");
+  ops.def(
+      "ggml_dsv4_shared_gate_up_swiglu_q8_1(Tensor W, Tensor X, "
+      "float swiglu_limit, Tensor? quant_input=None) -> (Tensor, Tensor)");
+  ops.def(
+      "ggml_dsv4_o_proj_q8_0(Tensor W, Tensor O, Tensor positions, "
+      "Tensor cos_sin_cache, SymInt local_groups, SymInt rope_dim) "
+      "-> (Tensor, Tensor)");
+#endif
 
   ops.def("ggml_moe_get_block_size(int type) -> int");
 
@@ -785,9 +854,36 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_dequantize_into", TORCH_BOX(&ggml_dequantize_into));
 #endif
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
+  ops.impl("ggml_quantize_q8_1", TORCH_BOX(&ggml_quantize_q8_1));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
+  ops.impl("ggml_dsv4_moe_a8", TORCH_BOX(&ggml_dsv4_moe_a8));
+  ops.impl("ggml_dsv4_moe_w1_a8", TORCH_BOX(&ggml_dsv4_moe_w1_a8));
+  ops.impl("ggml_dsv4_moe_down_output_owned",
+           TORCH_BOX(&ggml_dsv4_moe_down_output_owned));
+  ops.impl("ggml_dsv4_repack_q2_k", TORCH_BOX(&ggml_dsv4_repack_q2_k));
+  ops.impl("ggml_dsv4_repack_iq2_xxs",
+           TORCH_BOX(&ggml_dsv4_repack_iq2_xxs));
+  ops.impl("ggml_dsv4_repack_mxfp4", TORCH_BOX(&ggml_dsv4_repack_mxfp4));
+  ops.impl("ggml_dsv4_moe_a8_mxfp4", TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4));
+  ops.impl("ggml_dsv4_moe_a8_mxfp4_seg",
+           TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4_seg));
+#ifndef USE_ROCM
+  ops.impl("ggml_dsv4_rms_norm_q8_1",
+           TORCH_BOX(&ggml_dsv4_rms_norm_q8_1));
+  ops.impl("ggml_mul_mat_vec_prequant_a8",
+           TORCH_BOX(&ggml_mul_mat_vec_prequant_a8));
+  ops.impl("ggml_dsv4_repack_q8_0_aligned",
+           TORCH_BOX(&ggml_dsv4_repack_q8_0_aligned));
+  ops.impl("ggml_dsv4_mul_mat_vec_aligned_q8_0",
+           TORCH_BOX(&ggml_dsv4_mul_mat_vec_aligned_q8_0));
+  ops.impl("ggml_dsv4_shared_gate_up_swiglu",
+           TORCH_BOX(&ggml_dsv4_shared_gate_up_swiglu));
+  ops.impl("ggml_dsv4_shared_gate_up_swiglu_q8_1",
+           TORCH_BOX(&ggml_dsv4_shared_gate_up_swiglu_q8_1));
+  ops.impl("ggml_dsv4_o_proj_q8_0", TORCH_BOX(&ggml_dsv4_o_proj_q8_0));
+#endif
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
 }
 
@@ -928,6 +1024,83 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
       "all_reduce_add_rms_norm(int fa, Tensor inp, Tensor! residual, "
       "Tensor weight, Tensor! out, float epsilon, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "all_reduce_dsv4_mhc(int fa, Tensor inp, Tensor? addend, Tensor residual, "
+      "Tensor post_mix, Tensor comb_mix, Tensor fn, Tensor! residual_out, "
+      "Tensor! partial, Tensor scale, Tensor base, Tensor! next_post, "
+      "Tensor! next_comb, Tensor! layer_input, Tensor? norm_weight, "
+      "Tensor!? quant_input, float rms_eps, float pre_eps, float sinkhorn_eps, "
+      "float post_multiplier, int sinkhorn_repeat, float norm_eps, "
+      "bool input_prepared, bool own_projections, bool publish_prepared, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "all_reduce_dsv4_q2_mhc(int fa, Tensor pending, Tensor addend, "
+      "Tensor! producer_output, Tensor residual, Tensor post_mix, "
+      "Tensor comb_mix, Tensor fn, Tensor! residual_out, Tensor! partial, "
+      "Tensor scale, Tensor base, Tensor! next_post, Tensor! next_comb, "
+      "Tensor! layer_input, Tensor norm_weight, Tensor! quant_input, "
+      "float rms_eps, float pre_eps, float sinkhorn_eps, "
+      "float post_multiplier, int sinkhorn_repeat, float norm_eps, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_channel_owned_mhc(int fa, Tensor inp, Tensor? addend, Tensor residual, "
+      "Tensor post_mix, Tensor comb_mix, Tensor fn, Tensor! residual_out, "
+      "Tensor! partial, Tensor scale, Tensor base, Tensor! next_post, "
+      "Tensor! next_comb, Tensor! layer_input, Tensor norm_weight, "
+      "Tensor! quant_input, float rms_eps, float pre_eps, "
+      "float sinkhorn_eps, float post_multiplier, int sinkhorn_repeat, "
+      "float norm_eps, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_channel_owned_q2_down(int fa, Tensor quant_mid, Tensor weights, "
+      "Tensor topk_ids, Tensor! output, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_owned_attention_projections(int fa, Tensor local_input, "
+      "Tensor local_quant, Tensor aligned_q8_weight, Tensor bf16_weight0, "
+      "Tensor bf16_weight1, Tensor bf16_weight2, Tensor! q8_output, "
+      "Tensor! bf16_output0, Tensor! bf16_output1, Tensor! bf16_output2, "
+      "Tensor! partial, Tensor! reduced, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_gather_owned_q8(int fa, Tensor local_quant, Tensor! full_quant, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_gather_owned_bf16(int fa, Tensor local_input, Tensor! full_output, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_owned_router(int fa, Tensor local_input, Tensor weight, "
+      "Tensor! output, Tensor! partial, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_channel_owned_q2_down_pending(int fa, Tensor pending, "
+      "Tensor addend, Tensor! scratch, Tensor! output, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_channel_owned_moe(int fa, Tensor quant_input, Tensor w1, "
+      "Tensor w2, Tensor topk_weights, Tensor topk_ids, Tensor addend, "
+      "Tensor! scratch, Tensor! output, float swiglu_limit, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_output_owned_moe(int fa, Tensor quant_input, Tensor w1, "
+      "Tensor w2, Tensor topk_weights, Tensor topk_ids, Tensor shared_quant, "
+      "Tensor shared_w2, Tensor! output, float swiglu_limit, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_output_owned_q8(int fa, Tensor local_quant, "
+      "Tensor aligned_weight, Tensor! output, int rows_per_cta, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_owned_reduce_scatter(int fa, Tensor input, Tensor? addend, "
+      "Tensor! output, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_indexer_peer_topk(int fa, Tensor logits, Tensor lengths, "
+      "Tensor! output, Tensor workspace, int k, int max_seq_len, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def(
+      "dsv4_indexer_token_merge(int fa, Tensor logits, Tensor lengths, "
+      "Tensor local_indices, Tensor! output, int k, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> ()");
+  custom_ar.def("wait_dsv4_mhc(int fa, Tensor anchor) -> ()");
   custom_ar.def("dispose(int fa) -> ()");
   custom_ar.def("meta_size() -> int");
   custom_ar.def("register_buffer(int fa, int[] ipc_tensors) -> ()");
@@ -944,6 +1117,33 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
   custom_ar.impl("all_reduce_add_rms_norm",
                  TORCH_BOX(&all_reduce_add_rms_norm));
+  custom_ar.impl("all_reduce_dsv4_mhc", TORCH_BOX(&all_reduce_dsv4_mhc));
+  custom_ar.impl("dsv4_channel_owned_mhc",
+                 TORCH_BOX(&dsv4_channel_owned_mhc));
+  custom_ar.impl("dsv4_channel_owned_q2_down",
+                 TORCH_BOX(&dsv4_channel_owned_q2_down));
+  custom_ar.impl("dsv4_owned_attention_projections",
+                 TORCH_BOX(&dsv4_owned_attention_projections));
+  custom_ar.impl("dsv4_gather_owned_q8", TORCH_BOX(&dsv4_gather_owned_q8));
+  custom_ar.impl("dsv4_gather_owned_bf16", TORCH_BOX(&dsv4_gather_owned_bf16));
+  custom_ar.impl("dsv4_owned_router", TORCH_BOX(&dsv4_owned_router));
+  custom_ar.impl("dsv4_channel_owned_q2_down_pending",
+                 TORCH_BOX(&dsv4_channel_owned_q2_down_pending));
+  custom_ar.impl("dsv4_channel_owned_moe",
+                 TORCH_BOX(&dsv4_channel_owned_moe));
+  custom_ar.impl("dsv4_output_owned_moe",
+                 TORCH_BOX(&dsv4_output_owned_moe));
+  custom_ar.impl("dsv4_output_owned_q8",
+                 TORCH_BOX(&dsv4_output_owned_q8));
+  custom_ar.impl("dsv4_owned_reduce_scatter",
+                 TORCH_BOX(&dsv4_owned_reduce_scatter));
+  custom_ar.impl("all_reduce_dsv4_q2_mhc",
+                 TORCH_BOX(&all_reduce_dsv4_q2_mhc));
+  custom_ar.impl("dsv4_indexer_peer_topk",
+                 TORCH_BOX(&dsv4_indexer_peer_topk));
+  custom_ar.impl("dsv4_indexer_token_merge",
+                 TORCH_BOX(&dsv4_indexer_token_merge));
+  custom_ar.impl("wait_dsv4_mhc", TORCH_BOX(&wait_dsv4_mhc));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {

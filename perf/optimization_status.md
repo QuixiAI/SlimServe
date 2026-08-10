@@ -1,0 +1,1365 @@
+# SlimServe Optimization Status
+
+This is the running performance notebook. Follow `perf/perf.md`: record the
+baseline, hypothesis, controlled change, correctness result, throughput result,
+decision, and raw artifact locations.
+
+## 2026-08-09 - Retained Merged Sparse-MLA Decode And Exact Baseline
+
+- Status: retained production improvement; tensor-parallel scaling gate still
+  failed.
+- Baseline: the previous exact native baseline was 90.835 tok/s at TP2 and
+  110.218 tok/s at TP4 for concurrency 1, 1,000 input tokens, exactly 2,000
+  generated tokens, no speculation, and full decode CUDA graphs.
+- Hypothesis: DSV4's main and extra sparse-MLA sources have the same query and
+  reduction shape, so launching the FP8-value decode twice per layer repeats
+  fixed scheduling and reduction overhead.
+- Change: extend the vendored native sparse-MLA kernel to consume the main and
+  extra value sources in one launch and accumulate both into the same output.
+  This removes one production CUDA-graph node per affected layer without
+  changing cache ownership or arithmetic order within either source.
+- Kernel result: isolated graph latency fell from about 27.56 us to 21.00 us,
+  saving about 6.55 us per layer. Synthetic output matched exactly with
+  `max_abs_diff=0`.
+- End-to-end result: TP2 measured 92.003 and 92.040 tok/s (median 92.022), and
+  TP4 measured 112.572 and 112.573 tok/s (median 112.573). All four runs set
+  `exact=true` and returned exactly 2,000 completion tokens. This is +1.31% at
+  TP2 and +2.14% at TP4 over the previous exact baseline.
+- Scaling: TP4/TP2 improved from 1.213x to 1.223x, but still fails the required
+  1.5x gate. The current TP2 result requires at least 138.03 tok/s at TP4;
+  112.573 tok/s remains 25.46 tok/s below the minimum.
+- Decision: retain the merged MLA launch. It removes measured replicated work,
+  but is not sufficient to repair TP ownership by itself.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-merged-mla-tp2/` and
+  `perf/results/2026-08-09/dsv4-a100-merged-mla-tp4/`.
+
+## 2026-08-09 - Rejected mHC Single-Leader Start Rendezvous
+
+- Status: rejected and removed.
+- Hypothesis: the urgent mHC kernel currently runs the cross-GPU start epoch
+  exchange from all 16 CTAs. A sense-reversing local arrival counter could
+  select one CTA per rank for the remote exchange without paying the extra
+  cooperative grid barrier used by an earlier rejected leader design.
+- Change: add an opt-in local CTA arrival counter, one cross-rank leader, and
+  one local release epoch inside the existing urgent graph node. Rank-ordered
+  BF16 reduction and all mHC arithmetic were unchanged.
+- Correctness: TP4 eager and captured outputs were exact across 32 randomized
+  seeds, including fused RMSNorm and Q8_1 output.
+- Result: the TP4 fused norm graph regressed from 28.86 us in the same-binary
+  control to 35.08 us, a 21.6% loss. Waiting for all 16 local CTAs before any
+  peer data work costs more than the distributed remote flag traffic.
+- Decision: remove the candidate. A viable synchronization redesign cannot
+  introduce an all-CTA local rendezvous before reduction.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-mhc-leader-start/`.
+
+## 2026-08-09 - Rejected Q2 Producer-Progress Ownership
+
+- Status: rejected and disabled by default; retained only as an explicitly
+  gated diagnostic under `VLLM_DSV4_Q2_MHC_PROGRESS=1`.
+- Baseline/hypothesis: the Q2_K producer and urgent mHC transition are adjacent
+  on every layer. Publishing completed output tiles to a peer-reading consumer
+  was intended to overlap the full-rank transition with the Q2_K producer tail.
+- Implemented candidates covered 64-tile publication, whole-grid persistent
+  barriers, barrier-free consumer phases, split streams, producer-first stream
+  ordering, 16 logical 256-row publications, and a high-priority consumer
+  stream. Corrected producer-first variants were exact.
+- Root result: 64 tile handshakes added about 18 us and serial 64-row mHC
+  chunks added another roughly 14 us. Reducing publication to 16 logical
+  chunks removed most of that cost, but remained slower: TP2 measured 65.064
+  us versus 61.805 us reference, and TP4 measured 52.950 us versus 49.151 us
+  reference. The high-priority variant was also slower at 53.274 us versus
+  49.148 us.
+- Decision: A100 does not overlap this short Q2 producer with a polling mHC
+  consumer cheaply enough. Do not enable the path in a serving profile. A
+  future retry needs a materially different warp-specialized kernel with no
+  inter-CTA polling protocol, not another publication-granularity sweep.
+- Raw artifacts are under
+  `perf/results/2026-08-09/dsv4-a100-q2-progress-v*/`.
+
+## 2026-08-09 - Rejected Head-Sharded Indexer Ownership
+
+- Status: rejected and disabled by default; diagnostic opt-in is
+  `VLLM_DSV4_HEAD_SHARDED_INDEXER=1`.
+- Hypothesis: shard 64 indexer heads across TP ranks, produce partial token
+  scores, and have the persistent top-k node sum peer partials before selection.
+- Correctness: peer partial-score reduction and global top-k were exact in the
+  synthetic multi-rank harness and the real profiles returned exact token
+  counts.
+- Result: isolated peer top-k cost about 61 us at TP2 and 69 us at TP4, while
+  H64, H32, and H16 paged-logit producer schedules all remained near 18 us at
+  the C1 decode shape. The reduced head count therefore saved almost no
+  producer latency and added a full peer reduction. Exact profile throughput
+  fell to 89.865 tok/s at TP2 and 109.617 tok/s at TP4 before the merged-MLA
+  change.
+- Decision: partial-head ownership is fundamentally mismatched to this
+  batch-one producer geometry. The next indexer ownership design is token
+  sharding with direct peer merge of only rank-local top-k candidates; it must
+  not restore the previous generic all-gather, pack, unpack, and second-top-k
+  sequence.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-head-sharded-indexer-tp2/` and
+  `perf/results/2026-08-08/dsv4-a100-head-sharded-indexer-tp4/`.
+
+## 2026-08-08 - DSV4 0731 A100 Exact Baseline And Scaling Gate
+
+- Status: active baseline; scaling gate failed.
+- Scope: the all-layer IQ2_XXS gate/up + Q2_K down model, concurrency 1,
+  1,000 input tokens, exactly 2,000 generated tokens, no speculation, full
+  decode CUDA graphs, and native Ampere kernels. TP2 and TP4 use the same model
+  and workload.
+- Current exact results are 90.808 and 90.862 tok/s at TP2, and 110.232 and
+  110.205 tok/s at TP4. The medians are 90.835 and 110.218 tok/s.
+- TP4/TP2 scaling is only 1.213x. The repository's minimum 1.5x gate requires
+  at least 136.25 tok/s at TP4 for this TP2 result. The current TP4 path is
+  26.03 tok/s, or 19.1%, below that minimum target.
+- Correctness: every retained run set `exact=true`, returned exactly 2,000
+  completion tokens, and completed the fixed prompt without a server error.
+- Warm decode trace: TP2 has 1,513 graph kernels and settles near
+  10.75-10.90 ms/replay; TP4 has 1,470 graph kernels and settles near
+  9.01-10.65 ms/replay as the traced context changes. TP4 reduces routed
+  weight work, but replicated projections, indexer work, mHC work, and two
+  synchronization boundaries per layer dominate the remainder.
+- The model is already using tensor-parallel routed experts, not expert
+  parallelism: every selected expert is available on every rank and its
+  intermediate dimension is sharded. Random expert-owner imbalance is
+  therefore not the cause of the failed scaling.
+- Corrected trace diagnosis: raw cross-process GPU timestamps contain stable
+  per-device clock offsets. Relative to rank 0, barrier-end-derived offsets
+  were 0, -10.268, -30.089, and -15.771 us; interpreting unnormalized starts
+  overstated rank arrival skew as 30-35 us. After normalization, median
+  producer/urgent arrival skew is about 16.4 us at the aligned-Q8 projection
+  boundary and 10.2 us at the routed Q2_K boundary; median barrier-end skew is
+  about 2 us. Each producer ends within 0.3-0.9 us of its local urgent launch.
+- Urgent-kernel duration remains materially worse at TP4 even without
+  cross-clock comparison: all-rank mean duration is 17.943 us at TP2 and
+  26.499 us at TP4. Deferred mHC projection is still replicated and consumes
+  roughly 1.5-2.0 ms of aggregate kernel time per token, though it overlaps
+  foreground work on a low-priority stream.
+- Decision: do not call 110 tok/s acceptable. Continue with design changes
+  that remove replicated graph work or collective latency; sub-percent local
+  fusions do not address the failed scaling gate.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-indexer-group4-tp2/`,
+  `perf/results/2026-08-08/dsv4-a100-mhc-low-priority-tp4/`,
+  `perf/results/2026-08-08/dsv4-a100-active-indexer-trace-tp2/`, and
+  `perf/results/2026-08-08/dsv4-a100-active-indexer-trace-current-tp4/`.
+
+## 2026-08-08 - DSV4 TP4 Scaling Root-Cause Audit
+
+- Status: root cause confirmed; no profile, placement, or model mismatch.
+- Method: classify every graph-id-26 kernel from all two TP2 ranks and all four
+  TP4 ranks across seven warm replays. The checked-in analyzer is
+  `benchmarks/analyze_dsv4_tp_scaling.py`; its machine-readable result is
+  `perf/results/2026-08-08/dsv4-a100-tp-scaling-root-cause/trace-classification.json`.
+- Both SlimServe dry runs resolve the same all-layer IQ2_XXS/Q2_K GGUF, no
+  speculation, FP8 KV, and full decode graphs. `nvidia-smi topo -m` reports
+  NV12 between every GPU pair. Tensor-parallel placement is not the cause.
+- Exact throughput is 11.009 ms/token at TP2 and 9.073 ms/token at TP4. The
+  1.5x gate is 7.339 ms/token, so TP4 must recover 1.734 ms/token. Fitting
+  `T(tp) = R + W/tp` to the two exact measurements gives `R = 7.137 ms` and
+  `W = 7.744 ms`: 78.7% of current TP4 latency behaves as non-scaling work.
+  With the current ownership boundaries, even infinite TP asymptotes to only
+  1.543x TP2. Kernel retuning inside the existing design cannot provide a
+  defensible 1.5x TP4 result.
+- Mean aggregate kernel duration per replay, averaged across ranks:
+
+| ownership/category | TP2 us | TP4 us | TP2/TP4 |
+| --- | ---: | ---: | ---: |
+| TP-sharded quantized linear/MoE | 5432.822 | 3706.243 | 1.466x |
+| TP-sharded attention (intended) | 1640.020 | 1525.079 | 1.075x |
+| mHC urgent collective/transition | 1525.121 | 2252.374 | 0.677x |
+| mHC deferred replicated | 1518.867 | 1622.130 | 0.936x |
+| replicated indexer/router/projection | 2721.468 | 2862.252 | 0.951x |
+| replicated fixed Q8 projection | 465.462 | 485.445 | 0.959x |
+| other graph work | 1660.968 | 1753.890 | 0.947x |
+
+- Only 47.3% of TP2 aggregate kernel work is even intended to shard in this
+  classification. Quantized linear/MoE work saves 1.727 ms but reaches only
+  1.466x because batch-one kernels and graph launches do not halve with the
+  weights. Attention halves local heads from 32 to 16 but improves only 1.075x.
+  Everything else is flat or slower, and mHC gives back 0.831 ms of the local
+  kernel savings before stream-overlap effects.
+- The graph shape corroborates the ownership problem: TP2 has 1513 nodes per
+  replay and TP4 still has 1470. The 43-node reduction is the TP4-only shared
+  down-input quantization fusion, not broad TP scaling. There are still 85
+  global mHC transitions per token.
+- The model source explicitly replicates the fixed attention input projection
+  (`fused_wqa_wkv`, `disable_tp=True`) and all 64 Lightning-indexer heads
+  (`ReplicatedLinear` for `wq_b` and `weights_proj`). The router also scores all
+  256 experts on every rank. By contrast, ordinary attention heads correctly
+  shrink from 32 at TP2 to 16 at TP4. The indexer is therefore a concrete
+  ownership defect, not merely a slow kernel.
+- The native DSV4 MoE boundary is fused at the PyTorch-op level but remains two
+  CUDA phases per layer: IQ2_XXS gate/up + SwiGLU + Q8_1, then repacked Q2_K
+  down + weighted reduce. The measured one-node cooperative TP4 candidate was
+  neutral end to end because it left the following global mHC boundary and all
+  replicated work intact. It is not the missing 1.734 ms solution by itself.
+- Corrected collective conclusion: each materialized producer ends only
+  0.3-0.9 us before its local urgent mHC launch. Removing only that launch gap
+  can save at most about 0.08 ms over 85 boundaries, far below the target.
+  Producer/collective fusion remains useful only if it replaces the full-rank
+  arrival barrier with deadlock-safe tile-progress publication so early peer
+  tiles overlap the producer tail. Appending the existing urgent transition to
+  a cooperative producer is not a sufficient design.
+- Required structural work, in priority order:
+  1. Implement head-sharded indexer query/weight projections and H16 local
+     logits at TP4, with the existing persistent top-k node performing the
+     peer partial-score reduction. Do not repeat the rejected token-shard +
+     generic all-gather design.
+  2. Implement tile-progress producer/collective transitions for both Q2_K
+     down and aligned-Q8 output projection. Preserve rank-ordered BF16 math and
+     pipeline peer readiness; node-count reduction alone is not the objective.
+  3. Merge the two DSV4 sparse-MLA source launches into one source-selecting
+     persistent kernel. The current wrapper launches main and extra sources
+     separately in every layer even though they share query and reduction
+     shape.
+  4. Shard deferred mHC coefficient ownership only by publishing through the
+     next existing transition handshake; all variants with an extra fence or
+     barrier have already lost.
+  5. Partition router rows and merge only rank-local top-k candidates inside
+     an existing routing node after the larger indexer/collective defects are
+     fixed.
+- Decision: the 110.218 tok/s result is caused by fundamentally insufficient
+  parallel ownership plus worsening per-layer synchronization. Do not spend
+  the next iteration on another standalone GEMV geometry sweep or launch-only
+  fusion.
+
+## 2026-08-08 - A100 mHC Schedule And Deferred Sharding
+
+- Status: async schedule retained; sharded candidates rejected and removed.
+- Scope: DSV4 0731 IQ2_XXS, `dsv4-4`, concurrency 1, 1,000 input and 2,000
+  output tokens, no speculation, locked 1,410 MHz A100 clocks.
+- Baseline: the profile's low-priority asynchronous urgent/deferred split.
+  Hypothesis: moving deferred projection onto the main stream, merging it into
+  the urgent kernel, or distributing its 20 rows across ranks might reduce the
+  TP4 arrival skew and replicated work.
+- Schedule results: async measured 110.232 and 110.181 tok/s (median 110.206);
+  sequential measured 101.655 and 101.664 (median 101.660); monolithic measured
+  102.956 and 102.988 (median 102.972). All runs returned exact token counts.
+  Async overlap is essential and remains the production schedule.
+- Sharded candidate A computed local deferred rows and gathered the next urgent
+  state through the existing handshake. It was exact in the four-rank graph
+  harness for 16 seeds, but TP4 fell to 99.357 tok/s. Candidate B published
+  encoded state to peers and added one barrier inside the deferred kernel; it
+  was also graph-exact but reached only 109.656 tok/s versus the 110.218
+  baseline. Both designs were removed.
+- An owner-deferred candidate made rank 3 compute all 20 deferred projection
+  rows and Sinkhorn once, then remote-write the final contiguous state to the
+  peers for publication at the next existing urgent transition. It was exact
+  across four ranks and 16 seeds, but the final publication fence raised the
+  isolated graph from about 32.11 to 34.74 us and the real TP4 profile reached
+  only 105.596 tok/s. It was rejected and removed.
+- Decision: do not revisit deferred sharding with an extra synchronization
+  point. A viable design must preserve async overlap and piggyback publication
+  on an existing transition without extending the urgent critical path.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-mhc-schedule-ab-tp4/` and
+  `perf/results/2026-08-08/dsv4-a100-mhc-sharded-deferred/`, and
+  `perf/results/2026-08-08/dsv4-a100-mhc-owner-deferred/`.
+
+## 2026-08-08 - A100 mHC Arrival And Deferred Overlap Geometry
+
+- Status: all candidates rejected and removed; retained production remains 16
+  urgent CTAs, 16 logical partials, and a one-node 32-CTA/two-partition
+  cooperative deferred kernel on the low-priority stream.
+- Baseline/diagnosis: the retained graph-id-26 captures contain 10,591 kernels
+  across seven TP2 replays and 10,290 across seven TP4 replays. Aggregate
+  kernel duration is 14,907.402 us per TP2 replay and 14,051.698 us per TP4
+  replay. TP4 saves about 1.7 ms in routed IQ2_XXS, Q2_K, grouped-Q8, and
+  aligned-Q8 work, but urgent mHC grows from 1,567.100 to 2,361.672 us and
+  deferred mHC grows from 1,508.681 to 1,607.889 us. Those mHC costs erase
+  more than half of the measured sharding benefit.
+- A rank-local preload candidate moved residual, coefficient, and local-input
+  loads before the start barrier while preserving rank-ordered accumulation.
+  It was exact on four ranks and 16 seeds, but its norm graph rose from 28.973
+  to 29.081 us and exact TP4 fell to 109.831-109.902 tok/s versus a restored
+  same-session control of 110.255-110.284. It was removed.
+- Deferred output partition sweeps preserved every dot-product reduction tree.
+  Four partitions/64 CTAs improved the isolated norm graph to 28.312 us but
+  fell to 109.667-109.693 tok/s because the low-priority kernel interfered
+  more with foreground work. One partition/16 CTAs slowed the graph to 29.999
+  us and measured 110.203-110.242 tok/s, neutral/slightly below control. The
+  retained two partitions/32 CTAs remain the measured balance.
+- A DS4-style staged deferred design replaced the cooperative grid barrier
+  with a normal 32-CTA partial kernel followed by a one-CTA Sinkhorn/finalize
+  kernel on the same stream. It was exact and improved isolated norm timing
+  slightly to 28.818 us, but the extra CUDA-graph node reduced exact TP4 to
+  109.536-109.596 tok/s. It was removed.
+- A corrected reduced-handshake urgent design separated eight physical CTAs
+  from 16 logical reduction splits. Unlike the older invalid eight-split
+  experiment, it computed each reduced dimension independently and reproduced
+  all 16 partial slots, RMSNorm blocks, and Q8 blocks exactly across 32 seeds.
+  Serializing two logical chunks per CTA raised the norm graph to 31.597 us
+  and exact TP4 fell decisively to 105.638 tok/s. It was removed.
+- Decision: local work motion, more/fewer deferred CTAs, splitting the deferred
+  node, and reducing urgent handshake CTAs do not fix scaling. Isolated graph
+  improvements are not sufficient evidence because low-priority occupancy and
+  graph-node count dominate end-to-end behavior. The next mHC design should
+  remove a foreground launch by fusing the Q2_K or aligned-Q8 producer with
+  the existing collective/transition boundary; it must preserve the async
+  deferred overlap and add no new cross-rank synchronization point.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-mhc-local-preload/`,
+  `perf/results/2026-08-08/dsv4-a100-mhc-deferred-geometry/`,
+  `perf/results/2026-08-08/dsv4-a100-mhc-deferred-staged/`, and
+  `perf/results/2026-08-08/dsv4-a100-mhc-physical8-logical16/`.
+
+## 2026-08-08 - A100 Native MoE Decode Geometry And Fusion
+
+- Status: all candidates rejected and removed; retained geometry remains eight
+  warps per Q2_K CTA and two output rows per warp.
+- Scope: native combined-layout IQ2_XXS gate/up, SwiGLU, Q8_1 handoff,
+  byte-neutral repacked Q2_K down, and weighted final sum at TP4-local `I=512`
+  and TP2-local `I=1024` decode shapes.
+- Baseline/hypothesis: the Q2 down kernel duplicates Q8 activation staging per
+  CTA. Wider CTAs or a cooperative W1/down fusion could reduce staging and one
+  launch without changing quantization or materializing dequantized weights.
+- Serialized row-geometry results: at `I=512`, rows-per-warp 2/4/8 measured
+  34.816/37.888/43.008 us for the full W1+down operation. At `I=1024`, the
+  controlled retained geometry was about 49 us while 4 and 8 rows measured
+  51.200 and 56.320 us. Output hashes were identical across geometries.
+- Staging the 4.5 KiB W1 Q8 input in shared memory was neutral at `I=512`
+  (34.816 versus 34.816 us) and slower at `I=1024` (47.616 versus 47.104 us).
+  It was removed.
+- Wider Q2 CTAs were exact but slower under 20-launch CUDA-event samples:
+  TP4-local 16-warps/2-rows measured 24.090 us versus 23.014 for the retained
+  8-warps/2-rows path; TP2-local 32-warps/1-row measured 37.325 versus 35.661
+  us. The roughly 4.7% losses show that occupancy is worth more than reducing
+  activation staging copies in this form.
+- A true cooperative TP4 decode candidate fused the 96-CTA IQ2_XXS/SwiGLU
+  phase, a grid handoff, and the Q2_K weighted down sum into one native kernel.
+  Its final 64-CTA/two-row down phase was bit-exact and improved repeated
+  microtiming from 22.989-23.040 to 22.323-22.349 us (about 3%). Under the real
+  CUDA-graph profile, however, it measured only 110.362-110.382 tok/s versus
+  same-build control at 110.409-110.454 tok/s. It was rejected and removed;
+  isolated stream timing did not predict graph scheduling cost.
+- Correctness: every micro candidate matched the retained BF16 output SHA-256;
+  every serving run returned exact prompt/completion counts. Completion hashes
+  vary between repeated temperature-zero runs even on the same binary, so they
+  are recorded but are not treated as deterministic numerical parity.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-moe-decode-geometry/`,
+  `perf/results/2026-08-08/dsv4-a100-moe-stage-input/`,
+  `perf/results/2026-08-08/dsv4-a100-q2-cta-geometry/`, and
+  `perf/results/2026-08-08/dsv4-a100-cooperative-moe/`.
+
+## 2026-08-08 - A100 Aligned Q8 Decode Geometry
+
+- Status: all serving candidates rejected and removed; benchmark methodology
+  retained.
+- Trace scope: the TP4 decode graph contains four aligned-Q8 projections per
+  layer: `1536x4096/r1`, `4096x2048/r1`, `4096x8192/r2`, and
+  `8192x1024/r4`. The aligned Q8 kernels account for about 1.83 ms of aggregate
+  kernel time per token and the first urgent collective follows this work.
+- Measurement correction: the old microbenchmark included activation
+  quantization and repeatedly hit one resident weight. It now reports
+  prequantized GEMV separately and rotates eight byte-identical aligned
+  weights, exceeding A100 L2 even for the smallest active tensor.
+- Existing-kernel selector candidate changed `4096x2048` from r1 to r2 and
+  `4096x8192` from r2 to r1. Every geometry was bit-exact in the kernel harness,
+  but the real TP4 profile fell to 109.516 and 109.605 tok/s versus same-session
+  production control at 110.282 and 110.358. The dispatch changes were removed.
+- A SlimServe-owned DS4/QuixiCore-inspired candidate used aligned 32-byte
+  weight loads with one or two rows per warp and no shared reduction. Row-pair
+  variants were not faster. The one-row variant improved only the deep-K
+  microkernel, from about 29.92 to 27.13 us under rotated weights. End to end it
+  measured 110.423 and 110.437 tok/s versus same-binary control at 110.324 and
+  110.390: about +0.07%, below the retention threshold and irrelevant to the
+  failed TP scaling gate. All candidate kernel and dispatch code was removed.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-q8-decode/`,
+  `perf/results/2026-08-08/dsv4-a100-q8-selector-tp4/`, and
+  `perf/results/2026-08-08/dsv4-a100-q8-single-warp-tp4/`.
+
+## 2026-08-08 - Locked A100 Clock Control
+
+- Status: diagnostic; no production change.
+- Change: locked all eight A100 graphics clocks at 1,410 MHz to remove clock
+  drift from controlled comparisons.
+- Results: exact TP2 measured 90.664 tok/s median and exact TP4 measured
+  110.288 tok/s median. This did not explain the failed scaling ratio or
+  materially improve the unlocked exact baseline.
+- Decision: use locked clocks for kernel A/B work, but do not attribute the
+  TP2/TP4 gap to clock variance. Reset clocks after the experiment session.
+- Raw artifacts: `perf/results/2026-08-08/dsv4-a100-locked-clocks/`.
+
+## 2026-08-08 - Retained A100 Native Path
+
+- Status: retained production path.
+- Native routed MoE reads the combined vLLM
+  `[expert, gate | up, packed]` IQ2_XXS layout, performs paired gate/up and
+  SwiGLU, emits Q8_1, runs repacked Q2_K down, and performs weighted reduction.
+  It does not dequantize model weights or use standalone Q2_K GEMV as the
+  production boundary.
+- Load-time/first-use layout work retained after correctness and end-to-end
+  validation: byte-neutral aligned Q8_0 SoA, paired aligned IQ2_XXS SoA, and
+  repacked Q2_K down. The runtime does not retain an expanded dequantized expert
+  stack.
+- Other retained components: native Q8 shared experts and output projection,
+  native BF16 projection GEMV, native router and hash router, active-channel
+  MLA partitioning, graph-capturable persistent paged indexer logits, live
+  prefix sizing, H64 grouped-token indexer scheduling, native mHC, fused custom
+  all-reduce+mHC, FP16 mHC projection weights, and low-priority deferred mHC.
+- Measured progression on the evolving same-day tree: the first corrected TP4
+  exact run was 105.364 tok/s; native projection reached 108.522-108.549;
+  native hash routing measured 108.832-108.854 versus 108.537-108.598 control;
+  H64/live-prefix work reached about 110.09-110.14; low-priority deferred mHC
+  reached 110.205-110.232 tok/s.
+- DSpark correctness fix retained: the final deferred target tuple is consumed
+  before returning from the target model. TurboQuant remains the configured
+  draft KV backend in the SlimServe profile. Both still require a fresh
+  acceptance-qualified TP2/TP4 benchmark after the no-spec scaling work.
+- Raw artifacts are under `perf/results/2026-08-08/dsv4-a100-{projection,hash-router,indexer-group4,mhc-low-priority}-*/`.
+
+## 2026-08-08 - Rejected A100 Experiments
+
+- Indexer head sharding: exact but TP4 fell to 105.250-105.368 tok/s from
+  108.848-108.864 control. The generic cross-rank merge cost exceeded the
+  saved head work. Rejected; a future distributed indexer must fuse partial
+  reduction and top-k rather than repeat this design.
+- Short top-512 radix path: no-spec TP4 measured 110.141-110.213 tok/s versus
+  110.451-110.524 control. Rejected and removed.
+- Fused aligned-Q8 projection plus RoPE/FP8 preparation: bit-exact and faster
+  when streamed, but CUDA-graph latency regressed from 14.69 us to 32.27 us for
+  the head-owned topology and to 25.73 us for the four-segment topology.
+  Rejected and removed.
+- Raw-BF16 Q preparation inside paged indexer logits: exact top-512 across the
+  context/TP sweep. TP4 reached 110.363-110.377 tok/s, only about +0.13% over
+  the retained baseline, while same-build TP2 regressed from 90.711 to 90.367
+  tok/s (-0.38%). Rejected and removed.
+- Fused non-hash router plus top-k, projection bundling, mHC 8-split, paired
+  CTA, alternate norm mapping, and leader-grid handshake variants either lost
+  under CUDA graphs or failed the end-to-end threshold. None remain on the
+  production path.
+- Rank-sharded mHC projection with an additional scalar-exchange barrier was
+  exact on all four ranks and 16 randomized seeds, but the production norm
+  graph path rose from 35.36 to 45.15 us (+27.7%); the local-add norm path rose
+  from 35.10 to 44.97 us (+28.1%). Rejected and removed; any retry must
+  piggyback scalar visibility on an existing transition handshake rather than
+  add a barrier.
+- Raw artifacts:
+  `perf/results/2026-08-08/dsv4-a100-indexer-head-shard/`,
+  `perf/results/2026-08-08/dsv4-a100-short-topk-nospec-{tp4,control-tp4}/`,
+  `perf/results/2026-08-08/dsv4-a100-fused-indexer-{logits,control}-tp*/`,
+  `perf/results/2026-08-08/dsv4-a100-mhc-{grid-barrier,paired-cta,norm-map}-tp4/`,
+  and `perf/results/2026-08-08/dsv4-a100-mhc-rank-shard-tp4/`.
+
+## 2026-08-07 - DSV4 0731 A100 Native MoE Path
+
+- Status: in progress
+- Scope: DeepSeek V4 Flash 0731, `dsv4-2` and `dsv4-4`, A100, IQ2_XXS gate/up
+  plus Q2_K down routed MoE.
+- Baseline: ROCm DeepSeek V4 Flash 0731 optimized path is the cross-platform
+  reference. Existing A100 numbers must be re-measured through SlimServe
+  profiles after the model download resumes.
+- Hypothesis: A100 inference is leaving performance on the table because the
+  DSV4 routed MoE path is not using a model-specific fused native kernel path
+  equivalent in spirit to the optimized ROCm/DS4 flow.
+- Target change: support vLLM's combined `[expert, gate|up, packed]` GGUF
+  layout or split/aligned artifacts, then run fused native
+  `IQ2_XXS gate/up -> SwiGLU -> Q2_K down -> weighted reduce` without dequant
+  and without treating standalone Q2_K GEMV as the final answer.
+- Correctness: use exact-token serving validation and focused kernel parity
+  tests for any new fused op.
+- Implemented stage 1:
+  - Added `csrc/quixicore/quant/dsv4_moe_ampere.cuh` on the real stable-libtorch
+    serving path.
+  - The Ampere kernel reads vLLM's combined W1 layout, stages each activation
+    tile once, decodes paired gate/up IQ2_XXS weights at tile load, applies
+    SwiGLU in registers, and emits Q8_1 directly for Q2_K down.
+  - Removed the fp32 gate/up and fp32 mid tensors plus the standalone SwiGLU
+    and mid-quantize launches. No model weights are dequantized, expanded, or
+    persistently duplicated.
+  - W1 uses 4 routed rows below 256 total routed rows and 8 at or above 256;
+    W2 remains 4-wide and receives its own expanded expert-id view.
+- Stage 1 correctness: valid synthetic IQ2_XXS and Q2_K blocks at TP2-local
+  DSV4 dimensions (`H=4096`, local `I=1024`, top-8) produced finite output.
+  At 128 routed rows, mean/max absolute error versus the generic path was
+  `2.63e-6 / 5.35e-6`; at 512 routed rows it was
+  `2.77e-6 / 1.63e-5`.
+- Stage 1 kernel results on one A100, median CUDA-event timing:
+
+| Tokens | Routed rows | W1 width | Fused us | Generic us | Speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 4 | 192.512 | 199.680 | 1.037x |
+| 4 | 32 | 4 | 477.184 | 553.984 | 1.161x |
+| 16 | 128 | 4 | 573.952 | 611.328 | 1.065x |
+| 64 | 512 | 8 | 1495.040 | 1994.752 | 1.334x |
+
+- Results: superseded by the exact TP2/TP4 baseline above. SlimServe downloaded
+  and loaded the correct all-layer IQ2_XXS model; missing-model handling was not
+  a blocker.
+- Decision: retain stage 1. It is a correctness-qualified win at verification
+  width and establishes the production operation boundary. It is not the final
+  design: Q2_K down still uses the generic dp4a tile and materializes routed
+  down outputs. The next controlled work is the short-K Q2_K design in
+  `csrc/quixicore/dsv4_ampere_design.md`, followed by byte-neutral Ampere MMA
+  layouts.
+- Existing A100 diagnostics:
+  - `/home/ubuntu/logs/dsv4-a100-tp2-native.log`: TP2 loaded the target at
+    51.75 GiB/GPU in about 32.9 s, allocated 18.23 GiB KV cache, reported
+    2,203,531 KV tokens and 2.10x maximum concurrency at 1,048,576-token
+    requests, then failed warmup with `main_cache must be uint8`.
+  - `/home/ubuntu/logs/dsv4-a100-tp2-dspark-tq.log`: TP2 with DSpark and
+    TurboQuant loaded target + draft, reached health, and reported 11.89 GiB KV
+    cache. No exact benchmark was run; only an idle/short health probe appears.
+  - `/home/ubuntu/logs/dsv4-a100-tp2-tps.log`: TP2 with DSpark/TurboQuant
+    reached health and served probes. vLLM interval logs showed generation
+    throughput around 32.4, 31.5, and 28.8 tok/s during a 9-request probe, then
+    around 30.4, 30.4, and 29.6 tok/s during an 8-request probe. DSpark accepted
+    zero draft tokens in these probes (`Mean acceptance length: 1.00`,
+    `Accepted throughput: 0.00 tokens/s`), so these are diagnostic only.
+  - `/home/ubuntu/logs/dsv4-a100-tp4-dspark-tq.log`: TP4 with DSpark and
+    TurboQuant loaded target + draft and reached health. No exact benchmark was
+    run.
+  - `/home/ubuntu/logs/dsv4-a100-tp4-tps.log`: TP4 with DSpark/TurboQuant
+    reached health. It reported 28.88 GiB consumed per GPU, 0.80 GiB peak
+    activation, 1.89 GiB CUDA graph memory, and 32.13 GiB KV cache. Interval
+    logs showed single-request generation around 5.6 and 7.2 tok/s, then
+    8-request generation around 34.4, 36.0, and 29.1 tok/s. DSpark again
+    accepted zero draft tokens in the recorded probe.
+- Current measured conclusion: superseded by the 2026-08-08 exact 90.835 TP2
+  and 110.218 TP4 baseline. The older 30-36 tok/s interval probes mixed
+  warmup/concurrency effects and are diagnostic history, not the headline.
+- Raw artifacts: `/home/ubuntu/logs/dsv4-a100-*.log`, `/tmp/dsv4-*.log`,
+  `benchmarks/kernels/benchmark_dsv4_moe_a100.py`, and exact TP2 logs under
+  `perf/results/2026-08-07/dsv4-a100-fused-v1-tp2/` (kernel JSONL at
+  `kernel/stage1.jsonl`).
+
+## 2026-07-29 - ROCm Long-Context Concurrency Baseline
+
+- Status: retained baseline
+- Scope: DeepSeek V4 Flash 0731, TP2 on 2x MI300X, 100k input tokens, 2k output
+  tokens, concurrency sweep 1-64, prefix caching enabled with a 99,984-token
+  common prefix.
+- Baseline/change: split ROCm GGUF MoE dispatch thresholds for W1 and W2 based
+  on measured crossovers.
+- Correctness: every request produced exactly 2,000 tokens from exactly 100,000
+  input token IDs and reported exactly 99,984 cached prompt tokens; 32-request
+  factual quality gate passed 32/32.
+- Final exact sweep:
+
+| Concurrency | Wall s | Aggregate tok/s | Decode-window tok/s | Per-request tok/s | TTFT p50/p95 s |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 47.71 | 41.92 | 42.13 | 41.92 | 0.235 / 0.235 |
+| 2 | 57.31 | 69.79 | 70.08 | 34.90 | 0.341 / 0.440 |
+| 4 | 77.55 | 103.16 | 103.48 | 25.79 | 0.502 / 0.506 |
+| 8 | 120.45 | 132.84 | 133.09 | 16.61 | 0.731 / 0.742 |
+| 16 | 175.87 | 181.95 | 182.18 | 11.37 | 0.888 / 1.085 |
+| 32 | 350.50 | 182.59 | 182.71 | 5.71 | 1.441 / 1.803 |
+| 64 | 533.06 | 240.12 | 240.24 | 3.75 | 2.450 / 2.930 |
+
+- Decision: retained as the first ROCm long-context baseline.
+- Raw artifacts: `/tmp/longctx_baseline_128.{json,log}`,
+  `/tmp/longctx_moesplit_128.{json,log}`,
+  `/tmp/longctx_final_shared_2000.{json,log}`.
+
+## 2026-07-29 - ROCm Q2_K Routed MoE Tile Pass
+
+- Status: retained
+- Scope: routed Q2_K expert kernels for DSV4/GLM-style TP2 serving shapes on
+  MI300X.
+- Hypothesis: routed Q2_K expert kernels dominated steady decode and the 4x128
+  tile carried too much register/LDS pressure.
+- Change: switch ROCm Q2_K MMQ tile from 4 routed rows x 128 output rows to
+  4 x 64, then adjust dispatch thresholds.
+- Kernel results:
+
+| TP2 MoE shape | 4x128 us | 4x64 us | Speedup |
+| --- | ---: | ---: | ---: |
+| w13, 64 model tokens | 1201.7 | 851.7 | 1.41x |
+| w2, 512 routed rows | 603.8 | 431.2 | 1.40x |
+| w13, 512 verification tokens | 4995.4 | 3490.1 | 1.43x |
+| w2, 4096 routed verification rows | 2517.9 | 1818.7 | 1.38x |
+
+- End-to-end: 64-request exact 100k/2k improved from 240.12 to 325.01
+  aggregate tok/s (+35.3%); wall time 533.06 s to 393.84 s.
+- Correctness: matrix/vector parity passed; largest observed BF16 absolute
+  difference was 0.25.
+- Decision: retained.
+- Raw artifacts: `/tmp/longctx_q2_y64_2000.json`,
+  `/tmp/longctx_q2_y64_128.json`.
+
+## 2026-07-29 - ROCm Q2/Q8 Final Kernel Pass
+
+- Status: retained
+- Scope: ROCm routed Q2_K MoE plus Q8_0 attention/dense projections.
+- Change: Q2_K routed-expert tile moved from 4x64 to 4x32 with two-span Q8
+  activation staging; Q8_0 matrix kernel added shape-adaptive 64/128 output-row
+  tiles.
+- Q2_K kernel results:
+
+| TP2 MoE shape | Previous 4x64 us | Final us | Speedup |
+| --- | ---: | ---: | ---: |
+| w13, 64 model tokens | 884.506 | 797.335 | 1.109x |
+| w2, 512 routed rows | 449.354 | 422.494 | 1.064x |
+| w13, 512 verification tokens | 3037.452 | 2778.504 | 1.093x |
+| w2, 4096 routed rows | 1592.988 | 1479.758 | 1.077x |
+
+- Q8_0 projection results at batch 64:
+
+| Projection | Previous 128-row us | 64-row us | Speedup |
+| --- | ---: | ---: | ---: |
+| o_proj, 6144 x 8192 | 410.936 | 314.051 | 1.308x |
+| dense gate/up, 12288 x 6144 | 308.843 | 234.652 | 1.316x |
+| q_b_proj, 6144 x 2048 | 113.630 | 91.397 | 1.243x |
+
+- End-to-end: 64-request exact 100k/2k improved from 325.007 to 395.902
+  aggregate tok/s (+21.8%); wall time 393.838 s to 323.313 s. Relative to the
+  original 240.12 tok/s baseline, combined kernel work is +64.9%.
+- Correctness: valid repeated Q2_K test blocks had `max_abs_diff=0`; Q8_0
+  matrix/vector parity also had `max_abs_diff=0`.
+- Decision: retained. The remaining 1,000 tok/s target gap was 2.53x.
+- Raw artifact: `/tmp/longctx_q2_y32_q8_2000.json`.
+
+## 2026-07-29 - ROCm DSpark And TurboQuant Evaluation
+
+- Status: retained config guidance plus follow-up required
+- Scope: DeepSeek V4 Flash 0731 TP2, DSpark draft, TurboQuant draft KV.
+- DSpark acceptance sanity: three natural prompts x 128 output tokens produced
+  19.49% draft-token acceptance, mean accept length 2.364, and 68.63 aggregate
+  output tok/s. This was a functionality/acceptance probe, not a clean TPS
+  headline.
+- Synthetic repeated-token long-context DSpark failure was diagnosed as a bad
+  workload artifact, not a serving-stack bug. Natural prompts kept healthy
+  acceptance from 500 to 12k tokens:
+
+| Case | Prompt tokens | Draft acceptance | Mean accept len |
+| --- | ---: | ---: | ---: |
+| natural_500 | 527 | 31.8% | 3.23 |
+| natural_1500 | 1527 | 27.9% | 2.95 |
+| natural_2500 | 2527 | 32.6% | 3.28 |
+| natural_6000 | 6027 | 32.1% | 3.24 |
+| natural_12000 | 12027 | 33.5% | 3.34 |
+| shuffled_6000 | 6027 | 15.0% | 2.05 |
+
+- Valid long-context batch-64 chat workload:
+
+| Mode | Aggregate tok/s | vs baseline | Draft acceptance | Mean accept len |
+| --- | ---: | ---: | ---: | ---: |
+| no spec | 254.25 | -- | -- | -- |
+| dspark spec-3 | 285.32 | +12.2% | 56.7% | 2.70 |
+| dspark spec-4 | 252.73 | -0.6% | 47.0% | 2.88 |
+| dspark spec-7 | 194.47 | -23.5% | 29.6% | 3.07 |
+
+- Valid long-context batch-64 raw completion workload: no spec 396.56 tok/s,
+  spec-3 412.85 tok/s (+4.1%), spec-4 401.59 tok/s, spec-7 311.40 tok/s.
+- TurboQuant draft KV smoke: `turboquant_k8v4` was coherent and healthy at
+  500 prompt tokens (25.2%, mean 2.76) and 4000 prompt tokens (31.0%, mean
+  3.17). FP8-KV reference was 31.8% / 32.1%.
+- Decision: use DSpark spec-3 for batch-64 long-context serving; keep spec-7
+  only for low-batch latency. TurboQuant draft KV works but still needs batch-64
+  100k re-benchmarking.
+- Raw artifacts: `/tmp/spec_accept_dspark7_new.json`,
+  `/tmp/dspark_ctx_sweep.json`, `/tmp/dspark_cache_chunk.json`,
+  `/tmp/dspark_longctx_ab_*.json`, `/tmp/dspark_longctx_chat_*.json`,
+  `/tmp/dspark_tq_smoke.json`.
+
+## 2026-07-29 - ROCm Prefix Cache And 1M Context
+
+- Status: retained baseline/capacity finding
+- Scope: DeepSeek V4 Flash 0731 TP2 on MI300X.
+- Prefix cache verification: warm identical 12k prompt hit 11,904/12,017
+  cached tokens and improved TTFT from 12.55 s to 1.10 s (11.4x). Forked
+  prompt with same prefix also hit 11,904 cached tokens; partial overlap hit
+  5,888/6,281 cached tokens.
+- 1M context: `kv_cache_memory_bytes=50_465_865_728` works, giving 1,057,984
+  KV tokens and 1.01x maximum concurrency for 1,048,576-token requests.
+- End-to-end 1M smoke: 1,000,021 prompt tokens plus 32 greedy output tokens in
+  1,847 s, or 541.4 prefill tok/s. Output was coherent and grounded in the
+  corpus.
+- Decision: 1M is supported at batch 1 with manual KV sizing; prefill dominates
+  and DSpark is unaffordable at this length without draft KV capacity work.
+- Raw artifacts: `/tmp/apc_verify.json`, `/tmp/ctx1m_smoke.json`.
+
+## 2026-08-07 - Metal DSV4 Reference
+
+- Status: retained cross-platform reference
+- Scope: DS4 Metal backend on Apple M5 Max 128 GiB, DeepSeek V4 Flash 0731
+  hybrid GGUF, exact 1000 input / 2000 output token harness.
+- Correctness-qualified references:
+  - Concurrency 1: 33.684 aggregate output tok/s, wall 59.375 s; server decode
+    average 35.63 tok/s.
+  - Concurrency 8 original baseline: 32.821 aggregate output tok/s, wall
+    487.487 s, mean latency 485.164 s.
+  - Concurrency 8 stable retained path: 35.350 aggregate output tok/s, wall
+    452.614 s, mean latency 452.038 s; +7.70% throughput and -7.15% wall time
+    versus original c8 baseline.
+- Retained Metal change: `--mixed-prefill-quantum 2048` on top of the existing
+  native row batches.
+- Rejected Metal ideas recorded in `benchmarks/dsv4_metal_perf.md`: unsafe
+  external routed-MoE batching despite speed, count-8 routed MoE fusions,
+  alternate Q8 SIMD group counts, Q8 four-row decode due nondeterministic
+  digests, command-buffer split changes below threshold, attention-output
+  batching due digest drift, and several launch/fusion flags below noise.
+- Decision: use as a cross-platform lesson source, especially for native
+  row-batching, fused IQ2/Q2 geometry, correctness digests, and scheduler
+  effects.
+- Raw artifact: `benchmarks/dsv4_metal_perf.md`.
+
+## 2026-08-09 - A100 Output-Owned DSV4 Trace And Ownership Rejection
+
+- Status: rejected end-to-end candidate; trace retained
+- Scope: DeepSeek V4 Flash 0731 exact decode, TP2 and TP4 A100, native
+  IQ2_XXS routed gate/up, SwiGLU, Q2_K down, and shared Q8_0 expert.
+- Baseline/change: compared the stable exact profile baseline (TP2 92.022
+  tok/s, TP4 112.573 tok/s, 1.223x) with the output-owned hidden-channel
+  implementation. The candidate keeps MoE and projection outputs local and
+  gathers only at the final decoder boundary.
+- Correctness: real `dsv4-2` and `dsv4-4` profiles reached health and completed
+  the exact-token harness. Kernel microbenchmarks passed BF16 tolerances.
+- Exact result: TP2 79.683 tok/s, TP4 97.904 tok/s, 1.229x. This misses the
+  minimum TP4 gate of 119.525 tok/s for this candidate and regresses both
+  absolute throughputs, so it is not retained as the default.
+- Trace finding: arithmetic generally shrinks at TP4, but 85 replicated mHC
+  transitions remain about 19 us urgent plus 13 us deferred at both TP sizes.
+  The direct MoE boundary was about 72.1 us/layer at TP2 and 51.2 us/layer at
+  TP4 (1.408x); its standalone shared-Q8 publication regressed from 10.36 us
+  to 12.48 us. Final BF16 gather was only about 5 us and was not the cause.
+  The first captured replay contained startup outliers and was excluded from
+  steady-state collective conclusions.
+- Decision: reject the end-to-end ownership wiring. Retain the trace as proof
+  that replicated mHC and per-layer synchronization, rather than the final
+  gather, are the scaling limit.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-output-owned-e2e/` and
+  `perf/results/2026-08-09/dsv4-a100-output-owned-trace/`.
+
+## 2026-08-09 - A100 Channel-Residual mHC Schedules
+
+- Status: rejected diagnostics; production candidates removed
+- Hypothesis: channel-owning the four residual streams by hidden dimension
+  would distribute mHC projection work if all 24 projection partials and the
+  residual norm used one compact exchange, followed by one BF16 input-norm
+  exchange.
+- Correctness: the full-input reduce-owned path stayed within 0.0625 BF16 max
+  absolute error over eight chained transitions at TP2 and TP4.
+- Result:
+
+| Schedule | TP2 us/transition | TP4 us/transition | TP2/TP4 |
+| --- | ---: | ---: | ---: |
+| Existing three-stage channel-owned | 32.59 | 32.60 | 1.000x |
+| Two-exchange monolithic candidate | 26.43 | 25.22 | 1.048x |
+| Replicated residual control | 24.19 | 24.58 | 0.984x |
+
+- Decision: reject. Combining all projections saves launch/synchronization
+  overhead, but the compact exchanges and fixed control work remain latency
+  bound and the candidate is still slower than replicated residual state.
+  Channel-sharding residual state is not a valid foundation for decode.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-channel-owned-mhc/` and
+  `perf/results/2026-08-09/dsv4-a100-channel-mhc-monolithic/`.
+
+## 2026-08-09 - A100 Shared-Expert Publication Experiments
+
+- Status: rejected diagnostics; public APIs removed and source diagnostics
+  compile-disabled
+- Hypothesis: remove the separate shared-Q8 publication kernel from the
+  output-owned MoE boundary either by publishing from shared gate/up or by
+  staging peer Q8 shards once inside output-owned down.
+- Correctness: every retained measurement had zero max absolute error against
+  the assembled-publication output for eager and captured graphs.
+- Results below exclude the common standalone shared-W1 cost where the
+  candidate still uses it:
+
+| Output-owned boundary | TP2 us | TP4 us | TP2/TP4 |
+| --- | ---: | ---: | ---: |
+| Existing assembled publication, contaminated control | 48.88 | 34.58 | 1.413x |
+| Shared-W1 cooperative publish fusion | 72.57 | 48.35 | 1.501x |
+| Cooperative direct peer consumption | 59.64 | not retained | -- |
+| Non-cooperative direct peer consumption | 50.54 | 40.29 | 1.254x |
+| Restored assembled publication control | 47.64 | 33.47 | 1.423x |
+
+- Decision: reject all three. Holding the shared GEMV cooperative grid through
+  publication loses occupancy; making down cooperative pays residency and end
+  barriers; direct peer reads make TP4 worse. The assembled local publication
+  remains the fastest tested contract. The direct-read experiment had also
+  increased every retained down-kernel CTA's shared state; restoring the
+  original state recovered the control to 47.64 us at TP2 and 33.47 us at
+  TP4, with zero error on every rank. The isolated boundary still scales only
+  1.423x and therefore cannot satisfy the end-to-end 1.5x gate by itself.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-fused-shared-publication/`, including
+  `cleanup-tp2.log` and `cleanup-tp4.log`.
+
+## 2026-08-09 - A100 TP2 Lifecycle Crash Root Cause (NaN -> OOV token 129280)
+
+- Status: root cause found and fixed; requalification in progress
+- Symptom: canonical 1K/2K request died ~7 output tokens into decode with an
+  illegal CUDA memory access on both TP ranks. HANDOFF.md blamed a DSV4
+  aux-stream ownership race; that theory is REJECTED.
+- Evidence chain:
+  - Per-path overlap switches (`VLLM_DSV4_OVERLAP_INDEXER`,
+    `VLLM_DSV4_OVERLAP_MLA_COMPRESSOR`, `VLLM_DSV4_OVERLAP_INDEXER_INNER` in
+    `vllm/models/deepseek_v4/attention.py`) showed EITHER inner-overlap side
+    stream alone crashes (v23 compressor-only, v24 indexer-only), so the
+    stream config only shifted timing/allocator layout.
+  - Kernel Xid records: every crash was an MMU FAULT_PDE VIRT_READ at an
+    identical VA on both ranks, low bits always `...a60000`.
+  - `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1` + cuda-gdb named the faulting
+    kernel: `dsv4_router::bf16_hash_router`
+    (`csrc/quixicore/serving/dsv4_router_ampere.cuh`), grid 8 (verify batch
+    padded to capture size), block/token 0, faulting on the weight-row read
+    seeded by `tid2eid[token_id * 6 + warp]` with a garbage token id.
+  - A device-side guard + debug slot in the router recorded the value:
+    `token_id == 129280 == vocab_size` (tid2eid/embedding/lm-head all have
+    exactly 129280 rows), every step, both ranks, token_index 0 (bonus slot).
+  - Step probes traced it to `last_sampled_tokens`: at onset (all 5 drafts
+    rejected) the rejection sampler itself emitted 129280 as the recovery
+    sample; `combine_sampled_and_draft_tokens` then wrote it into
+    `input_ids[0]`, poisoning every subsequent step (self-sustaining).
+  - Offline repro (`rejection_sample` with a NaN target-logits row, greedy
+    temp=0, vocab=129280) reproduced `sampled=[129280]` exactly.
+- Root cause: `argmax_combine` in
+  `csrc/quixicore/serving/v2_sample_kernels.cuh` used a negated comparison
+  (`!(v > ov || ...)`) that lets a NaN candidate replace the running best;
+  masked -inf tail lanes of the last vocab block then win with the lowest
+  masked index = 129280. A NaN target-logits row from the model forward
+  triggers it. Whether the resulting wild `weight + expert*8192` read faulted
+  depended on what the allocator placed after the 2 MiB gate weight, which is
+  why serializing streams (v21/v22) "fixed" it: layout luck, not ordering.
+  Those runs were silently quality-poisoned instead.
+- Fixes (retained):
+  - `v2_sample_kernels.cuh`: positive-form `argmax_combine` (NaN never wins),
+    NaN-sanitized loads and in-vocab-only candidates in
+    `v2_block_argmax_8192`, `v2_block_max_sumexp_8192`, `v2_gumbel_sample_k`.
+  - Same NaN sanitize in the Triton fallbacks
+    (`vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py`).
+  - `bf16_hash_router` bounds-guards token ids (OOB treated as padding) and
+    records the first offender in a debug slot
+    (`quixicore_ops.dsv4_hash_router_debug`), defense in depth.
+  - Offline verification: NaN/-inf/garbage rows now sample token 0, no OOV in
+    any scenario (`scratchpad/repro_rejection_oov.py` run pre/post fix).
+- Open follow-ups:
+  - WHY the target forward produces a NaN logits row at all (onset ~35 output
+    tokens into the canonical run) is a separate open bug; with the sampler
+    now NaN-robust it degrades to sampling token 0 instead of crashing.
+  - Diagnostic switches (`VLLM_DSV4_OVERLAP_*`, `VLLM_DSV4_HASH_ROUTER_DEBUG`
+    probes in `vllm/v1/worker/gpu/model_runner.py` and
+    `rejection_sampler.py`) to be removed/quarantined after requalification.
+  - Port the `v2_sample_kernels.cuh` fix to the ROCm copy
+    (`csrc/quixicore/tm_rocm/qc_rocm_sample.cu`) and QuixiCore-CUDA.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-tp2-kv-capacity/control/` (v23-v33 logs),
+  `perf/results/2026-08-09/dsv4-a100-tp2-kv-capacity/coredumps/`.
+- Requalification (clean server v33, full overlap, no debug env, one server
+  lifecycle, all exact): 1K/2K 168.0 and 168.7 tok/s; 12K cold/hot 89.0/93.3;
+  128K cold/hot 37.1/38.2; post-128K 1K/2K continuation 111.8. Spec acceptance
+  length ~3.5-3.7. Baseline promoted in `perf/baseline_status.md`. Regression
+  test added: `tests/kernels/test_rejection_sample_nan.py` (40 cases).
+
+## 2026-08-09 - A100 Quant Strategy: Hybrid Serving + Profile Split
+
+- Status: accepted; profiles updated, baselines measured
+- Decision (user): datacenter GPUs serve the Q4K-tail hybrid
+  (`Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown`, 90.9 GiB);
+  IQ2_XXS is the MacBook-footprint quant. `dsv4-2` and `dsv4-4` now default
+  to `Q4K-tail`; new `dsv4-4-mxfp4` keeps the MXFP4 build; new `dsv4-8`
+  (MXFP4-only, TP8 first, TP4xDP2 to be benchmarked). `registry.py` gained
+  per-quant `quant_overrides` (the 19 GiB TP2 KV budget stays with IQ2_XXS;
+  hybrid starts at a provisional 14 GiB pending the same qualification).
+- Hybrid runs the same fused native path for its 55 IQ2_XXS/Q2_K layers;
+  layers 37-42 (Q4_K) take the generic MMVQ/MMQ route per layer.
+- Exact-token results (concurrency 1 unless noted, all `exact: true`):
+
+| Config | 1K/2K c1 | 12K cold | c8 1K/500 agg |
+| --- | ---: | ---: | ---: |
+| TP2 hybrid (14 GiB KV) | 168.5 / 168.0 | 89.2 | 185.5 |
+| TP4 hybrid | 174.2 (first run 135.9, warm-up) | 150.7 | 416.4 |
+| TP4 MXFP4 (pre-fused kernels) | 32.3 / 32.1 | 28.7 | 22.0 |
+
+- Hybrid TP2 matches the IQ2_XXS baseline (168 tok/s) exactly: the +12%
+  weight bytes cost nothing measurable at decode, so the quality upgrade is
+  free at TP2. Same-artifact TP scaling (hybrid TP4/TP2): 1.03x at batch-1
+  short-context (latency-bound: tiny all-reduce payloads and fixed per-step
+  costs dominate), 1.69x at 12K, 2.24x at concurrency 8. The >=1.5x gate is
+  the right check for the throughput regimes, not batch-1 short-context.
+- TP4 MXFP4 at 22-32 tok/s with healthy acceptance (~3.5) exposed that A100
+  had no fused MXFP4 expert path (generic MMVQ only; c8 slower than c1).
+  Fixed the same day - next entry.
+- Also fixed: drafter dummy-propose during profile_run crashed under
+  FULL_DECODE_ONLY (TQ attention asserted on missing metadata;
+  `attention.py` now zeroes the output for metadata-less profile runs).
+- Raw artifacts: `perf/results/2026-08-09/dsv4-a100-hybrid-baseline/`,
+  `perf/results/2026-08-09/dsv4-a100-tp4-baseline/`.
+
+## 2026-08-09 - A100 Fused MXFP4 MoE Decode Path
+
+- Status: implemented; correctness passed; serving measurement in progress
+- Hypothesis: MXFP4 experts on A100 fell through to the generic MMVQ route
+  (fp32 intermediates, separate gate/up/SwiGLU/down launches), producing the
+  32 tok/s TP4 decode above. Porting the tuned IQ2_XXS/Q2_K pipeline shape
+  (Q8_1-staged activation, fused gate/up + SwiGLU + route-weight + Q8_1
+  emission, weighted down consuming the Q8_1 mid) to MXFP4 should recover
+  most of the gap; MXFP4's table-based e2m1 decode is far cheaper than
+  IQ2_XXS codebook decode.
+- Implementation: `csrc/quixicore/quant/dsv4_mxfp4_moe_ampere.cuh`
+  (`mxfp4_gate_up_swiglu_q8_1_decode`, `mxfp4_down_sum`,
+  `repack_mxfp4_experts`), ops `ggml_dsv4_moe_a8_mxfp4` /
+  `ggml_dsv4_repack_mxfp4`, dispatch in `gguf/fused_moe.py` for
+  qweight 39/39 decode widths (tokens <= 8, top_k 6/8), env gates
+  `VLLM_GGUF_DSV4_AMPERE_MXFP4` / `VLLM_GGUF_DSV4_REPACK_MXFP4`.
+  The SoA repack is wired but NOT enabled at load: the fused path only
+  covers decode, and prefill's generic MMQ kernels still read the raw
+  17-byte AoS blocks. Raw-layout loads in the fused kernels until the
+  repack-aware coverage is complete.
+- Correctness: `tests/kernels/test_dsv4_mxfp4_moe.py` - fused vs fp32
+  dequant reference over random MXFP4 experts, tokens {1,4,8} x
+  intermediate {64,512}, max relative deviation < 3%; 6/6 passed. Also
+  caught a real padded-input-stride bug (Q8_1 rows are 512-padded) before
+  serving.
+- Measured (`dsv4-4-mxfp4`, exact-token harness, all `exact: true`, coherent
+  greedy output on smoke):
+
+| Stage | generic (before) | fused (after) | gain |
+| --- | ---: | ---: | ---: |
+| 1K/2K c1 | 32.3 / 32.1 | 111.3 / 111.3 | 3.4x |
+| 12K cold c1 | 28.7 | 75.0 | 2.6x |
+| c8 1K/500 agg | 22.0 | 27.1 | 1.2x |
+
+- Decision: retain. Decode widths (tokens <= 8) now run the fused path; the
+  c8 regime still falls to the generic MMQ route (verify batches of
+  8 reqs x 6 tokens exceed the gate), which is the remaining gap vs the
+  hybrid's 416 tok/s c8.
+- Next (not started): widen the fused path or add MXFP4 MMQ tiles for
+  verify/prefill widths; enable the SoA repack once every consumer reads the
+  split layout; revisit `dsv4-8` TP8 vs TP4xDP2 with these kernels.
+- Follow-up survey of the tuned `~/QuixiCore/QuixiCore-XPU` NVFP4/MXFP4
+  kernels (user pointer):
+  - Ported the shared-activation pair-dot (`nvfp4_row_dot_pair` pattern:
+    stage the Q8_1 activation block in registers once, dot gate and up
+    against it). Correctness unchanged (6/6), throughput neutral at decode
+    (111.0 vs 111.3 tok/s -- weight-bandwidth-bound, activation blocks were
+    already L1-resident). Retained: strictly fewer L1 accesses, no cost.
+  - The AMD/XPU byte-permute e2m1 table expand does NOT port directly:
+    CUDA's `__byte_perm` takes 4-bit nibble selectors, not per-byte
+    selectors, and the selector repack erodes the win. Scalar table loop
+    retained (comment in `dsv4_mxfp4_moe_ampere.cuh`).
+  - XPU stores FP4 scales as separate planes (ModelOpt layout), confirming
+    the SoA repack direction for the wide-batch phase; its single-kernel
+    whole-expert fusion (gate/up -> local memory SwiGLU -> down with fp32
+    atomic accumulation, no mid quantization) is the candidate shape for the
+    c8/verify-width path.
+- Raw artifacts:
+  `perf/results/2026-08-09/dsv4-a100-tp4-baseline/mxfp4-fused-*.json`,
+  `server-mxfp4-fused-v3.log`.
+
+## 2026-08-10 - Hybrid TP2 KV Qualification, MXFP4 Wide Gate, dsv4-8
+
+- Status: accepted; profiles finalized, baselines promoted
+- Hybrid TP2 KV budget: the provisional 14 GiB budget CRASHED at 128K cold
+  (worker killed silently ~3 min into prefill; no Xid, no CUDA OOM string --
+  long-prefill workspace exhaustion at the memory edge, the same failure mode
+  that rejected the 20/21 GiB XXS candidates). 13 GiB
+  (`kv_cache_memory_bytes=13958643712`) passed the full lifecycle, all exact:
+
+| Stage | tok/s |
+| --- | ---: |
+| 1K/2K r1 / r2 | 168.7 / 168.4 |
+| 12K cold / hot | 92.0 / 88.8 |
+| 128K cold / hot | 65.4 / 64.4 |
+| post-128K 1K/2K | 94.5 |
+
+  (128K decode at 65 tok/s vs the 37 measured on XXS the prior evening; the
+  XXS number likely included first-run JIT of the long-context kernels. The
+  post-128K continuation dip recurs on hybrid: 94.5 vs 168.)
+- MXFP4 fused-route width: raised the dispatch cap from tokens<=8 to an env
+  limit (`VLLM_GGUF_DSV4_MXFP4_ROWS`, default 64; op cap 256). Correctness
+  extended to width 48 (8/8 pass). DSV4 routing is near-uncorrelated, so the
+  per-route warp-GEMV keeps beating the MMQ tiles across verify widths:
+
+| dsv4-4-mxfp4 | gate 8 | gate 64 |
+| --- | ---: | ---: |
+| c8 1K/500 agg | 27.1 | 98.6 (3.6x) |
+| 1K/2K c1 | 111.3 | 112.1 |
+| 12K cold | 75.0 | 74.2 |
+
+  Remaining c8 gap vs hybrid's 416 is prefill (chunked 1024-token batches
+  still take generic MMQ) -- future MXFP4 prefill tiles.
+- dsv4-8 (MXFP4, 8 GPUs): TP8 measured 167.6 c1 / 117.4 @12K / 148.2 c8
+  agg, all exact = 1.50x / 1.58x / 1.50x over dsv4-4-mxfp4 -- meets the
+  >=1.5x TP gate in every regime. TP4 x DP2 FAILS TO INITIALIZE: DSV4's
+  router padding mask is not DP-padding aware
+  (`topk_softplus_sqrt_kernels.cu:782` "is_padding size mismatch, expected
+  4096" during the DP0/DP1 dummy run -- forward runs at the
+  num_tokens_across_dp padded width, mask arrives unpadded). Profile
+  finalized as TP8; DP enablement recorded as an open item, and DP2's
+  theoretical c8 advantage stays unmeasured until that bug is fixed.
+- Raw artifacts: `perf/results/2026-08-10/dsv4-a100-hybrid-qual/` (incl. the
+  failed 14 GiB `qual-128k-cold.json` and both server logs),
+  `perf/results/2026-08-10/dsv4-a100-mxfp4-wide/`,
+  `perf/results/2026-08-10/dsv4-a100-tp8/`.
+
+## 2026-08-10 - DP Enablement + Total-Throughput Matrix
+
+- Status: accepted; DP-padding fixed, matrix measured, layout winners
+  encoded in profiles via per-quant overrides
+- DP fix: under data parallelism the naive dispatch/combine path all-gathers
+  hidden states AND router logits across ranks
+  (`moe_runner._maybe_dispatch`), so the router runs on a batch wider than
+  the local padded batch. The forward-context `is_padding` mask describes
+  only the local batch; slicing it to the gathered width mislabels other
+  ranks' real tokens as padding (and a shorter mask tripped the
+  `topk_softplus_sqrt` size check, which is what blocked DP engine init).
+  Fix: `_get_padding_mask` in both router modules now returns the mask only
+  when its width matches the requested token count exactly, else None
+  (compute every row). Correct under DP at the cost of not skipping padding
+  rows in gathered batches. TP4xDP2 now boots, serves exact, and produces
+  coherent output.
+- Throughput matrix (exact-token harness, 1K in; c8 = aggregate over 8
+  streams x 500 out; c1 = 2K out. Methodology note: matrix c1 runs execute
+  after c8 with the same source, so their prefill is APC-warm --
+  within-matrix comparisons are consistent, cross-table ones are not):
+
+| Cell | c8 agg | c1 |
+| --- | ---: | ---: |
+| hybrid TP2 (2 GPU, baseline table) | 185.5 | 168.5 |
+| hybrid TP2xDP2 (4 GPU) | 275.6 | 188.3 |
+| hybrid TP4 (4 GPU, baseline table) | 416.4 | 174.2 |
+| hybrid TP8 | 354.5 | 329.5 |
+| hybrid TP4xDP2 (8 GPU) | **567.9** | 247.1 |
+| hybrid TP2xDP4 (8 GPU) | INIT FAILS | - |
+| mxfp4 TP4 (baseline table) | 98.6 | 112.1 |
+| mxfp4 TP8 | 148.2 | 167.6 |
+| mxfp4 TP4xDP2 | 110.1 | 111.1 |
+| mxfp4 TP2 shards | do not fit 80 GB | - |
+
+- Findings:
+  - **8-GPU total-throughput champion: hybrid TP4xDP2 at 567.9 tok/s c8**
+    (1.36x hybrid TP4; each replica keeps the fused-path intermediate=512).
+  - **Single-stream champion: hybrid TP8 at 329.5 tok/s c1** (~2x TP4;
+    11.4 GiB weights/rank), despite losing its fused IQ2 path -- at TP8 the
+    per-rank intermediate is 256 and the fused kernels require 512/1024,
+    which also explains TP8 losing c8 to TP4 (354.5 vs 416.4). Extending
+    the fused IQ2 path to intermediate=256 would lift both TP8 cells.
+  - 4-GPU: TP4 beats TP2xDP2 in both metrics for hybrid.
+  - MXFP4 keeps TP8 (148.2/167.6 vs 110/111 on TP4xDP2).
+  - hybrid TP2xDP4 crashes in the DP4 dummy run (illegal access, distinct
+    from the fixed mask bug; `dsv4-a100-matrix/server-hybrid-tp2dp4.log`).
+    Not competitive with TP4xDP2 by construction, so left unfixed and
+    marked illegal in the profile note.
+  - Anomaly worth a follow-up: a TP2 replica under dsv4-4/8 profile
+    settings measured 188.3 c1 vs dsv4-2's 168.5 -- suspect
+    FULL_DECODE_ONLY vs PIECEWISE graph mode; try FULL_DECODE_ONLY on
+    dsv4-2.
+- Profile encoding: `dsv4-8` a100 now carries
+  `quant_overrides: {Q4K-tail: {tensor_parallel_size: 4,
+  data_parallel_size: 2}}` -- MXFP4 default stays TP8. `dsv4-4` stays TP4.
+  Tests assert both layouts (36 profile tests).
+- Raw artifacts: `perf/results/2026-08-10/dsv4-a100-matrix/`.
+
+## 2026-08-10 - Fused IQ2 at TP8, Concurrency Curves, APC Methodology
+
+- Status: accepted; fused path extended, methodology corrected, hot
+  steady-state numbers recorded, layout winners confirmed
+- Fused IQ2 at intermediate=256 (TP8 shard): the earlier "hybrid TP8 lost
+  its fused path" finding was root-caused by coredump to
+  `q2_k_down_sum_repacked` -- the launcher's else-branch silently ran the
+  512 instantiation for any unlisted shard, reading 2x past every row
+  (illegal access at first boot with the gate relaxed). Fixed: explicit
+  256 instantiation with an idle-lane guard (16 subblocks over a 32-lane
+  warp), the static_assert generalized, and the custom-allreduce-owned
+  pending-down path pinned to its validated 512/1024 shapes. Boots, serves
+  exact, coherent output.
+- Harness: `--concurrency` now accepts {1,2,4,8} (was {1,8}).
+- METHODOLOGY: aggregate tok/s conflates prefill amortization with decode
+  throughput. Back-to-back identical runs measured 320 -> 680 tok/s at TP8
+  c4 purely from APC state (second run's prefill is a cache hit), and a
+  capture-64 experiment that shrank the KV pool looked like a kernel
+  regression because it evicted APC between stages. Standard going forward:
+  run each point twice, report the second (APC-hot steady state, decode
+  dominated), and label cold numbers as such.
+- Hot steady-state (hybrid, 1K in / 500 out per stream, aggregate tok/s):
+
+| Config | GPUs | hot c4 | hot c8 |
+| --- | ---: | ---: | ---: |
+| TP4 (`dsv4-4`) | 4 | 518.7 | 416.7 |
+| TP8 (fused-256, capture 32) | 8 | 679.8 | 205.4 |
+| TP4xDP2 | 8 | 281.6 | **926.1** |
+
+- The structure: the engine-level sweet spot is a verify batch that fits
+  CUDA graph capture (per-engine concurrency 4 -> 24 tokens <= capture 32).
+  At per-engine c8 the 48-token verify batches run eager and every config
+  cliffs (TP8 679 -> 205, TP4 519 -> 417). TP4xDP2 wins total throughput at
+  c8 because each replica sits at its sweet spot: **926.1 tok/s aggregate**,
+  the highest measured on this hardware. TP8 remains the latency/low-
+  concurrency choice (best c1-c4).
+- capture-64 alone did NOT recover TP8's c8 (438 mixed-state; the capture
+  sizes list tops out below the 48-token verify width) and its larger
+  graphs shrink the KV pool. Follow-up: extend `cudagraph_capture_sizes`
+  to include 48 (and re-derive the KV budget) -- if TP8's c8 then exceeds
+  926, revisit the hybrid layout choice.
+- Profile state (final): `dsv4-8` MXFP4 -> TP8; `dsv4-8 --quant Q4K-tail`
+  -> TP4xDP2 (unchanged from the matrix decision, now confirmed with clean
+  hot data); capture stays 32.
+- Raw artifacts: `perf/results/2026-08-10/dsv4-a100-matrix/` (conc sweeps,
+  hot pairs, `core256_*` coredump analysis logs).
+
+## 2026-08-10 - TP8 c8 Cliff Root Cause: Graph Capture Width (FIXED)
+
+- Status: accepted; `dsv4-8` a100 now ships `max_cudagraph_capture_size: 64`
+- The user challenged the 205 tok/s TP8 hot c8 as a probable bug. Correct:
+  the c8 verify batch is 8 reqs x 6 spec tokens = 48 tokens, and the
+  capture-size list topped out at 32, so every decode step ran EAGER. With
+  max 64 the derived list is [1,2,4,8,16,24,32,40,48,56,64]; 48 is
+  captured and the cliff disappears. The earlier capture-64 experiment had
+  been wrongly dismissed: its numbers were confounded by APC eviction from
+  the larger graph memory (the hot-pair methodology now catches this).
+- Hot steady-state deltas from capture 32 -> 64 (1K/500, aggregate):
+
+| Config | hot c8 (cap 32) | hot c8 (cap 64) | hot c4 (cap 64) |
+| --- | ---: | ---: | ---: |
+| hybrid TP8 | 205.4 | **465.5** (2.3x) | 691.0 (unchanged) |
+| hybrid TP4xDP2 | 926.1 | 925.7 / 858.4 (holds) | - |
+| mxfp4 TP8 | 148.2 | **275.1** (1.9x) | - |
+
+- Residual TP8-vs-DP2 gap at c8 (465 vs ~900): the 48-wide verify crosses
+  the >=256 routed-row wide-layout threshold (288 rows) in the fused IQ2
+  W1 route, and DP2 carries twice the aggregate KV/APC. Isolating the
+  wide-layout cost (a c6 probe sits under the threshold but above capture
+  32) is the next step if TP8 is to challenge DP2's crown.
+- Layout decisions unchanged and now clean: `dsv4-8` MXFP4 -> TP8,
+  Q4K-tail -> TP4xDP2 (925.7/858.4 hot c8, box record).
+- Raw artifacts: `perf/results/2026-08-10/dsv4-a100-matrix/tp8-cap64-*`,
+  `dp2-cap64-*`, `mxfp4-tp8-cap64-*`.
+
+## 2026-08-10 - Gap Investigation, Final Profile Structure
+
+- Status: accepted; profiles renamed and finalized per user direction
+- TP8-vs-DP2 gap investigation (hybrid, hot c8 465-606 vs 858-926):
+  - The wide-layout hypothesis is EXONERATED: a c6 probe (216 routed rows,
+    4-wide layout, capture-40 graphs) measured 385.9 hot -- BELOW c8's
+    606.3 (288 rows, 8-wide). No cliff at the 256-row threshold; the 8-wide
+    layout is fine. The `VLLM_GGUF_DSV4_W1_WIDE_ROWS` runtime threshold
+    (mirrored C++/Python) stays as an A/B tool.
+  - Two honest residual factors: (a) per-engine width economics -- one
+    48-token verify step on TP8's small shards yields less than 2x the
+    throughput of two 24-token steps on TP4 shards; (b) run variance:
+    +/-30% boot-to-boot on identical configs (APC block-overlap from
+    preceding stages; spec-decode acceptance lengths swing 2.6-6.0 across
+    measurement windows at temp=0 purely from text predictability).
+    Every DP2 sample (858-926) still beat every TP8 sample (205-606), so
+    the hybrid throughput ordering stands.
+- mxfp4 8-GPU layout settled with hot pairs at capture 64: TP4xDP2 measured
+  271.2 / 117.6 (unstable, best-case ties TP8) vs TP8's 217.7 / 275.1 and
+  167.6 c1 (vs 111). TP8 wins for MXFP4: its decode is weight-bandwidth
+  bound (TP8 halves per-rank bytes) and its c8 limiter is prefill, which DP
+  does not relieve per engine.
+- Final DSV4 A100 profile structure (user direction):
+  `dsv4-hybrid-2` (TP2, 13 GiB KV), `dsv4-hybrid-4` (TP4),
+  `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8, capture 64). The hybrid-on-8
+  quant override was REMOVED per the 8-GPUs-get-the-quality-quant policy;
+  the box throughput record (hybrid TP4xDP2, ~858-926 tok/s hot c8 agg)
+  is therefore intentionally unserved and documented here for one-line
+  resurrection (dsv4-mxfp4-8 --quant Q4K-tail with tp4/dp2).
+- Housekeeping: the case-colliding root `handoff.md` moved to
+  `perf/dsv4_a100_kernel_history.md` with an obsolescence header (its
+  serving numbers predate the sampler fix); `HANDOFF.md` is the sole
+  resume document.
+- Raw artifacts: `perf/results/2026-08-10/dsv4-a100-matrix/tp8-probe-*`,
+  `mxfp4-dp2-cap64-*`.
+
+## 2026-08-10 - dsv4-hybrid-8 Profile Added and Accepted
+
+- Status: accepted (user decision, reversing the earlier hybrid-on-8
+  exclusion after the throughput data)
+- Final A100 dsv4 set: dsv4-hybrid-2 (TP2), dsv4-hybrid-4 (TP4),
+  dsv4-hybrid-8 (TP4 x DP2, capture 64 -- the throughput tier),
+  dsv4-mxfp4-4 (TP4), dsv4-mxfp4-8 (TP8, capture 64 -- the quality/latency
+  tier). All five: DSpark k=5 + TurboQuant draft KV + 1M max_model_len from
+  the GGUF (test-enforced).
+- dsv4-hybrid-8 acceptance run on the named profile: hot c8 aggregate
+  921.8 tok/s (cold 752.3), exact -- reproduces the 858-926 record band.
+- Long-context caveat: only dsv4-hybrid-2 has the explicit 128K
+  cold/hot/post lifecycle qualification; the 4/8-GPU profiles are measured
+  at 1K-12K and configured for 1M. Their 128K lifecycle pass is an open
+  item.
+- Raw artifacts:
+  `perf/results/2026-08-10/dsv4-a100-matrix/dsv4-hybrid-8-accept-*`.
+
+## 2026-08-10 - 128K Lifecycle Qualification: hybrid-4/8, mxfp4-4/8 (ALL PASS)
+
+- Status: accepted; all five A100 dsv4 profiles are now 128K-lifecycle
+  qualified (dsv4-hybrid-2 was qualified earlier the same day).
+- Method: canonical single-lifecycle sequence per profile without restart
+  (1K/2K x2, 12K cold/hot, 128K cold/hot, post-128K 1K/2K continuation),
+  exact-token harness, concurrency 1, 8-token warmup. Phase 1 ran
+  dsv4-hybrid-4 (GPUs 0-3) and dsv4-mxfp4-4 (GPUs 4-7) concurrently on a
+  split box (minor cross-contention possible; hybrid-4 r1 128.1 vs r2 161.8
+  suggests warm-in effects); phases 2-3 ran the 8-GPU profiles alone.
+- Every stage on every profile: rc=0, `exact: true`. Zero preemptions in
+  server logs. hybrid-8 KV planner: 8,125,613 logical tokens.
+
+| Stage (c1 tok/s) | hybrid-4 (TP4) | hybrid-8 (TP4xDP2) | mxfp4-4 (TP4) | mxfp4-8 (TP8) |
+| --- | ---: | ---: | ---: | ---: |
+| 1K/2K r1 / r2 | 128.1 / 161.8 | 39.9 / 40.0 | 110.8 / 110.8 | 164.9 / 164.5 |
+| 12K cold / hot | 152.6 / 155.2 | 26.9 / 37.3 | 76.6 / 75.5 | 117.1 / 116.5 |
+| 128K cold / hot | 94.8 / 98.3 | 3.0 / 26.4 | 55.7 / 57.2 | 80.4 / 81.5 |
+| post-128K 1K/2K | 171.4 | 40.0 | 110.5 | 165.0 |
+
+- hybrid-8 c1 numbers are the known DP2 characteristic, not a defect: at
+  concurrency 1 only one replica works while every step pays DP
+  coordination (~40 tok/s ceiling). The 128K-cold 3.0 is DP round-robin
+  defeating the warmup APC -- the timed request lands on the replica that
+  did NOT serve the warmup, so the full 128K prefill falls inside the
+  timed window. Prefix-affinity DP routing is the recorded fix if c1
+  long-context ever matters on this tier; its service point is c8
+  aggregate (921.8 hot, accepted 2026-08-10).
+- post-128K dip is TP2-only: hybrid-4 continued at 171.4 (its fresh-server
+  band) and mxfp4-8 at 165.0 (matches its 1K/2K 164.9) after the 1M-scale
+  context, while dsv4-hybrid-2 dips 168->94.5. Supports the KV-pool
+  occupancy theory scaling away with per-rank KV headroom.
+- mxfp4-8 (TP8) has clean long-context economics: 128K hot holds 81.5
+  (49% of its 1K/2K rate, vs hybrid-4 holding 61%).
+- Raw artifacts: `perf/results/2026-08-10/dsv4-lifecycle-qual/`
+  (per-stage JSON + server logs); driver script preserved as
+  `lifecycle_qual_par.sh` in the session scratchpad (single-box phase
+  ordering: split-4s, then each 8-GPU profile alone).
+
+## 2026-08-10 - MXFP4 Tensor-Core Grouped MoE Tiles (wide batch / prefill)
+
+- Status: accepted (dsv4-mxfp4-4 and dsv4-mxfp4-8 both validated e2e)
+- Baseline: mxfp4-4 lifecycle numbers (same day): 110.8 c1, 76.6/75.5 @12K,
+  ~99-118 c8 -- 50% of hybrid-4 at 12K and ~25% at c8 when activated-byte
+  parity predicts ~59%. Kernel-level cause: the wide MXFP4 route ran the
+  dp4a grouped tile `moe_mxfp4` at MOE_X=4 columns, re-streaming every
+  expert's full weights per 4 routed rows (cost linear in tokens).
+- Change: new grouped tensor-core tile `moe_mxfp4_mmq_v2`
+  (csrc/quixicore/quant/dsv4_mxfp4_mmq_ampere.cuh): 128 expert rows x 64
+  routed columns, K in 256-value iterations, int8 mma.sync. e2m1 nibbles
+  decode through the fused path's 2x int8 table into exactly the dense
+  Q8_0 MMQ v2 shared layout (0.5 folded into the e8m0 scale), so
+  vec_dot_q8_0_q8_1_mma runs unmodified; only the loader, the
+  sorted_token_ids gather, and the scatter write-back are new. Reads raw
+  AoS or the SoA repack (repack still off). Dispatch: ggml_moe_a8 case 39,
+  env VLLM_GGUF_MXFP4_MMQ_V2 (default on) -- the env also widens
+  ggml_moe_get_block_size(39) to 64 so moe_align metadata matches; K not a
+  multiple of 256 falls back to a 64-wide dp4a instantiation.
+- Latent bug found and fixed in shared moe_q (moe.cuh): the activation
+  scale load indexed token_offs[threadIdx.y] into a per-thread array of
+  mmq_x/nwarps entries -- only correct when mmq_x == nwarps, which every
+  existing instantiation happened to satisfy. Generalized to the real
+  per-column loop (behavior-identical for square tiles, required for the
+  64/8 fallback). Caught by the K=288 fallback test (rel error 2.4e6).
+- Correctness: tests/kernels/test_dsv4_mxfp4_moe.py extended with
+  ggml_moe_a8 vs fp32-dequant reference through real moe_align metadata:
+  W1 shapes, W2 shapes (top_k=1), row-tail clamp, K%256!=0 fallback --
+  16/16 pass, rel < 0.02.
+- Kernel microbench (A100, E=256, top_k=6, TP4 shard: W1 1024xK4096 +
+  W2 4096xK512, ms for the pair):
+
+| routed tokens | dp4a (old) | mma tile (new) | speedup |
+| ---: | ---: | ---: | ---: |
+| 128 | 43.2 | 4.9 | 8.8x |
+| 512 | 124.5 | 5.6 | 22x |
+| 1024 | 236.4 | 6.4 | 37x |
+| 2048 | 459.2 | 8.0 | 57x |
+
+  (old is linear in tokens; new is weight-stream flat)
+- E2e dsv4-mxfp4-4 (exact harness, spec decode, all `exact: true`):
+
+| stage | before | after | delta |
+| --- | ---: | ---: | ---: |
+| 1K/2K c1 | 110.8 | 129.2 / 126.1 | +15% |
+| 12K cold / hot | 76.6 / 75.5 | 110.6 / 115.8 | +44% / +53% |
+| 1K/2K c8 agg | ~99-118 | 208.4 / 200.3 | ~2x |
+
+  12K now holds 88% of the c1 rate (hybrid-4 holds ~95%); c8 at 208 is
+  now within the activated-byte ratio of hybrid TP4's 417-606 band.
+- E2e dsv4-mxfp4-8 (TP8, capture 64, all `exact: true`):
+
+| stage | before | after | delta |
+| --- | ---: | ---: | ---: |
+| 1K/2K c1 | 164.9 / 164.5 | 182.8 / 183.3 | +11% |
+| 12K cold / hot | 117.1 / 116.5 | 161.1 / 163.3 | +39% |
+| 1K/2K c8 agg | 217.7 / 275.1 | 302.6 / 328.3 | +19-39% |
+
+  TP8 12K now holds 88% of c1 (matches TP4's post-tile ratio); the c8
+  gain confirms prefill was the TP8 c8 limiter after the capture-64 fix.
+- Open levers recorded: fused SwiGLU+Q8_1 wide epilogue (QuixiCore-XPU
+  glu_quant is the precedent; wide route still runs act + requant as
+  separate elementwise steps), permuted expert-contiguous segments instead
+  of 64-padded alignment for verify widths (XPU grouped_qgemm precedent),
+  cp.async staging with the SoA repack, fused-vs-tile crossover sweep for
+  the decode gate (VLLM_GGUF_DSV4_MXFP4_ROWS still 64).
+- Raw artifacts: `perf/results/2026-08-10/dsv4-mxfp4-mmqv2/` (+ `-tp8/`),
+  microbench script in session scratchpad `bench_mxfp4_mmq.py`.
+
+## 2026-08-10 - Attention Reduce NaN-Guard Hardening (XPU review port)
+
+- Status: accepted (behavior-neutral hardening)
+- The QuixiCore-XPU merge_attn_states port names "the empty-partition guard
+  whose absence caused NaNs in the CUDA lineage of this op". Audit of our
+  merge sites: all four paged_attn_v2 reducers and the MLA online-softmax
+  loops already guard empty partitions correctly (exact NEG_INF skip,
+  all-empty -> 0, guarded sink), and NEG_INF constants agree between MLA
+  writers and the shared reducers (-FLT_MAX both). The one gap: a NaN
+  partial stat passes `mp == NEG_INF` and poisons the head's output (fmaxf
+  drops NaN from the global max, but the NaN re-enters via expf).
+- Change: all six weight-guard sites upgraded to `!(mp > NEG_INF)` --
+  identical for every finite/empty input, degrades a NaN partial to
+  "empty" instead of NaN output. Same philosophy as the sampler-side NaN
+  sanitize. Relevant to the open NaN-origin item (task: rare all-NaN
+  logits rows): if attention was the amplifier, this contains it.
+- Rebuilt _quixicore_C, import smoke passed.
+
+## 2026-08-10 - Segmented MoE + Fused SwiGLU Epilogue (XPU ideas 1+2)
+
+- Status: accepted, default on (VLLM_GGUF_DSV4_MXFP4_SEG=0 reverts to the
+  moe_align MMQ route)
+- Design (from the XPU grouped_qgemm/glu_quant code review): device-side
+  route grouping (histogram/prefix/scatter, no host sync, no sorted+padded
+  metadata), STATIC worst-case grid (ceil(M/J)+E column tiles) with a
+  per-block prefix-table walk -- CUDA-graph-capture-safe with varying
+  routing; W1 tile epilogue fuses SwiGLU + route weight + Q8_1 emission
+  (gate row r and up row I+r paired inside one 128-row tile; C spilled to
+  the dead weight-staging smem), eliminating the [routes, 2I] half
+  intermediate and the separate act + quantize passes; W2 reads the fused
+  Q8_1 mid; a deterministic per-token reduce replaces atomic accumulation.
+  J template {16, 64}: 16 below VLLM_GGUF_DSV4_SEG_J16_ROWS=1536 routed
+  rows (quarter the masked-tail mma waste), 64 for prefill.
+- Files: csrc/quixicore/quant/dsv4_mxfp4_seg_ampere.cuh, op
+  ggml_dsv4_moe_a8_mxfp4_seg (gguf_kernel.cu), dispatch in
+  gguf/fused_moe.py ahead of the moe_align machinery. Iteration recorded:
+  per-block thread-0 serial table build cost ~10-15% at wide M; moved to
+  the prefix kernel with cooperative smem loads.
+- Correctness: 4 new tests (J16 x2, J64, invalid-route drop) vs fp32
+  dequant reference -- 20/20 file total.
+- Kernel microbench (op TOTAL incl. quantize/perm/reduce, vs the mmq
+  GEMM-pair-only times which exclude ~0.5-2 ms of align/act/quant/reduce):
+
+| routed tokens | mmq GEMMs only | seg op total |
+| ---: | ---: | ---: |
+| 48 | - | 2.55 ms |
+| 128 | 4.87 ms | 3.59 ms |
+| 512 | 5.56 ms | 6.02 ms |
+| 1024 | 6.36 ms | 6.89 ms |
+| 2048 | 7.97 ms | 8.50 ms |
+
+  (adding the mmq route's external passes makes seg the winner at every
+  width: ~-33% at 128, ~-12% at 2048)
+- E2e dsv4-mxfp4-4 (exact, spec decode): c1 125.1/127.5 (par vs 129/126),
+  12K 112.1/115.0 (vs 110.6/115.8), c8 cold 276.9 (vs 208.4, +33%), c8
+  hot 204.3 (vs 200.3, par). Reading per the APC-hot methodology: the win
+  lands exactly where prefill executes (cold c8, cold 12K); hot stages
+  have cached prefixes so the wide path barely runs. Never worse; plus
+  capture safety, determinism, and less metadata. Retained.
+- E2e dsv4-mxfp4-8 (TP8, I=256 shapes, all exact): c1 184.2/186.2 (par vs
+  182.8/183.3), 12K 162.4/159.5 (par vs 161.1/163.3), c8 cold 356.2 (vs
+  302.6, +18%), c8 hot 694.8 (vs 328.3). CAVEAT on the hot number: +112%
+  exceeds anything the seg path can cause at hot c8 (verify batches ride
+  the unchanged fused path; hot prefixes are APC-cached) -- treat it as a
+  favorable acceptance/APC window inside the documented +/-30%+ variance,
+  not a kernel claim. The defensible wins are the cold-c8 pair: TP4 +33%,
+  TP8 +18%, both where prefill actually executes.
+- Raw: `perf/results/2026-08-10/dsv4-mxfp4-seg/` (+ `-tp8/`).
+
+## Historical Notes
+
+- `perf_worklog.md` contains prior GLM-5.2 performance and correctness
+  investigation history.
+- `benchmarks/dsv4_metal_perf.md` contains DeepSeek V4 Flash 0731 Metal
+  throughput history and should be studied when translating wins across
+  platforms.

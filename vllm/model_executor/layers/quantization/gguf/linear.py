@@ -71,6 +71,75 @@ def _cublas_min_batch(rows: int) -> int:
 
 _q8_0_scratch: dict[tuple[torch.device, int, int, torch.dtype], torch.Tensor] = {}
 
+_DSV4_ALIGNED_Q8_SUFFIXES = (
+    ".attn.fused_wqa_wkv",
+    ".attn.wq_b",
+    ".attn.indexer.wq_b",
+    ".attn.wo_b",
+    ".ffn.shared_experts.down_proj",
+)
+
+_DSV4_OUTPUT_OWNED_SUFFIXES = (
+    ".attn.wo_b",
+    ".ffn.shared_experts.down_proj",
+)
+
+
+def _dsv4_output_owned_enabled(layer: torch.nn.Module) -> bool:
+    prefix = getattr(layer, "prefix", "")
+    channel_owned = os.environ.get("VLLM_DSV4_CHANNEL_OWNED", "0").lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    moe_owned = (
+        os.environ.get("VLLM_DSV4_TP_OWNERSHIP", "0").lower()
+        in {"1", "true", "on", "yes"}
+        and prefix.endswith(".ffn.shared_experts.down_proj")
+    )
+    return (
+        (channel_owned or moe_owned)
+        and getattr(layer, "tp_size", 1) in (2, 4, 8)
+        and getattr(layer, "output_size", None) == 4096
+        and prefix.endswith(_DSV4_OUTPUT_OWNED_SUFFIXES)
+    )
+
+
+def _dsv4_aligned_q8_enabled(layer: torch.nn.Module) -> bool:
+    if os.environ.get("VLLM_DSV4_ALIGNED_Q8", "0").lower() in (
+        "0",
+        "false",
+        "off",
+        "no",
+    ):
+        return False
+    if not current_platform.is_cuda():
+        return False
+    if torch.cuda.get_device_capability(layer.qweight.device) != (8, 0):
+        return False
+    prefix = getattr(layer, "prefix", "")
+    return prefix.endswith(_DSV4_ALIGNED_Q8_SUFFIXES)
+
+
+def _dsv4_aligned_q8_rows(tokens: int, rows: int, cols: int) -> int:
+    override = os.environ.get("VLLM_DSV4_ALIGNED_Q8_ROWS")
+    if override:
+        return int(override)
+    if tokens >= 8:
+        return 2 if rows <= 1536 else 4
+    if tokens > 1:
+        return 4 if rows >= 8192 and cols <= 1024 else 2
+    if rows <= 1536:
+        return 1
+    if rows >= 8192 and cols <= 1024:
+        return 4
+    if rows == 4096 and cols == 2048:
+        return 1
+    if rows == 4096 and cols == 4096:
+        return 4
+    return 2
+
 
 def _q8_0_dequant_scratch(
     qweight: torch.Tensor, rows: int, cols: int, dtype: torch.dtype
@@ -187,9 +256,15 @@ class GGUFLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        del input_size, output_size
         self.params_dtype = params_dtype
         output_size_per_partition = sum(output_partition_sizes)
+        output_owned = _dsv4_output_owned_enabled(layer)
+        if output_owned:
+            # RowParallelLinear normally stores [full H, K/TP]. Output
+            # ownership rotates that byte-neutral partition to [H/TP, full K].
+            output_size_per_partition = output_size // layer.tp_size
+            input_size_per_partition = input_size
+            layer._dsv4_output_owned = True
         fallback_weight_loader = extra_weight_attrs.pop("weight_loader", None)
         weight_loader = _resolve_gguf_weight_loader(layer, fallback_weight_loader)
         assert weight_loader is not None
@@ -208,6 +283,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 "shard_id_map": {},
                 "tp_rank": layer.tp_rank,
                 "tp_size": layer.tp_size,
+                "dsv4_output_owned": output_owned,
             },
         )
         set_weight_attrs(qweight, extra_weight_attrs)
@@ -242,6 +318,20 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._create_dsv4_aligned_q8_weight(layer)
+
+    def _create_dsv4_aligned_q8_weight(self, layer: torch.nn.Module) -> None:
+        if not _dsv4_aligned_q8_enabled(layer):
+            return
+        fallback_type = layer.qweight_type.weight_type
+        shard_types = list(layer.qweight_type.shard_weight_type.values())
+        weight_types = shard_types or [fallback_type]
+        if not weight_types or any(
+            weight_type != int(WeightType.Q8_0) for weight_type in weight_types
+        ):
+            return
+        aligned = ops.ggml_dsv4_repack_q8_0_aligned(layer.qweight)
+        layer.register_buffer("_dsv4_q8_aligned", aligned, persistent=False)
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_qweight(layer)
@@ -310,6 +400,21 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
+        aligned = getattr(layer, "_dsv4_q8_aligned", None)
+        if aligned is not None and x.shape[0] <= 8:
+            rows = layer.qweight.shape[0]
+            cols = layer.qweight.shape[1] // 34 * 32
+            out = ops.ggml_dsv4_mul_mat_vec_aligned_q8_0(
+                aligned,
+                x,
+                None,
+                rows,
+                _dsv4_aligned_q8_rows(x.shape[0], rows, cols),
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out
+
         shard_id = layer.qweight.shard_id
         if shard_id:
             shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
@@ -340,6 +445,55 @@ class GGUFLinearMethod(LinearMethodBase):
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
             out = fused_mul_mat_gguf_op(x, qweight, qweight_type)
+        if bias is not None:
+            out.add_(bias)
+        return out
+
+    def apply_prequant(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        quant_input: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        aligned = getattr(layer, "_dsv4_q8_aligned", None)
+        if aligned is not None and x.shape[0] <= 8:
+            rows = layer.qweight.shape[0]
+            cols = layer.qweight.shape[1] // 34 * 32
+            out = ops.ggml_dsv4_mul_mat_vec_aligned_q8_0(
+                aligned,
+                x,
+                quant_input,
+                rows,
+                _dsv4_aligned_q8_rows(x.shape[0], rows, cols),
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out
+
+        shard_id = layer.qweight.shard_id
+        fallback_wtype = layer.qweight_type.weight_type
+        if shard_id:
+            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_weight_types = [
+                layer.qweight_type.shard_weight_type.get(idx, fallback_wtype)
+                for idx in shard_id
+            ]
+        else:
+            shard_weight_types = [fallback_wtype]
+        if x.shape[0] > 64 or any(
+            weight_type != int(WeightType.Q8_0)
+            for weight_type in shard_weight_types
+        ):
+            return self.apply(layer, x, bias)
+
+        out = ops.ggml_mul_mat_vec_prequant_a8(
+            layer.qweight,
+            x,
+            quant_input,
+            int(WeightType.Q8_0),
+            layer.qweight.shape[0],
+        )
         if bias is not None:
             out.add_(bias)
         return out

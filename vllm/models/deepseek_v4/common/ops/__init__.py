@@ -12,6 +12,7 @@ from .fused_indexer_q import MXFP4_BLOCK_SIZE, fused_indexer_q_rope_quant
 from .fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
 from .fused_mtp_input_rmsnorm import fused_mtp_input_rmsnorm, mtp_shared_head_rmsnorm
 from .fused_qk_rmsnorm import fused_q_kv_rmsnorm
+from .projection import dsv4_ampere_projection_gemv_impl
 from .save_partial_states import save_partial_states
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "fused_inv_rope_fp8_quant",
     "fused_mtp_input_rmsnorm",
     "fused_q_kv_rmsnorm",
+    "dsv4_ampere_projection_gemv_impl",
     "mtp_shared_head_rmsnorm",
     "quantize_and_insert_k_cache",
     "save_partial_states",

@@ -120,23 +120,24 @@ def test_deepseek_mla_tuple_planner_keeps_mixed_turboquant_cache() -> None:
 def test_padded_turboquant_view_fits_its_backing_storage() -> None:
     num_blocks = 2
     page_size = 1024 * 1152
+    # The aligned slot size is platform-dependent (Metal pads k8v4 to 108
+    # bytes, CUDA packs it to 100); derive it so the invariant under test --
+    # the padded view fits its backing storage with a page-sized stride --
+    # holds everywhere.
+    shape = TurboQuantAttentionBackend.get_kv_cache_shape(
+        num_blocks, 512, 16, 64, "turboquant_k8v4"
+    )
+    slot_size = shape[-1]
     spec = TQFullAttentionSpec(
         block_size=512,
         num_kv_heads=16,
         head_size=64,
         head_size_v=64,
         dtype=torch.uint8,
-        tq_slot_size=108,
+        tq_slot_size=slot_size,
         tq_cache_dtype="turboquant_k8v4",
         page_size_padded=page_size,
         indexes_kv_by_block_stride=True,
-    )
-    shape = TurboQuantAttentionBackend.get_kv_cache_shape(
-        num_blocks,
-        spec.block_size,
-        spec.num_kv_heads,
-        spec.head_size,
-        spec.tq_cache_dtype,
     )
     raw = torch.empty(num_blocks * page_size, dtype=torch.int8)
 
@@ -149,7 +150,7 @@ def test_padded_turboquant_view_fits_its_backing_storage() -> None:
         packing=None,
     )
 
-    assert cache.shape == (num_blocks, spec.block_size, 16, 108)
+    assert cache.shape == (num_blocks, spec.block_size, 16, slot_size)
     assert cache.stride(0) == page_size
 
 

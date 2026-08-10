@@ -371,25 +371,104 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                                  // split view is read in place). Reads the two source
                                  // buffers directly instead of a per-layer torch.cat;
                                  // values and order are identical.
-                                 const bf16* q_pe2 = nullptr, int pe_stride = 0) {
+                                 const bf16* q_pe2 = nullptr, int pe_stride = 0,
+                                 int page_stride_bytes = 0,
+                                 int scale_block_offset_bytes = 0,
+                                 int scale_slot_stride_bytes = 0,
+                                 int total_partitions = 0,
+                                 int partition_offset = 0,
+                                 bool indices_are_slots = false,
+                                 bool persistent_partitions = false,
+                                 // Optional second sparse source. DSV4 owns a
+                                 // sliding-window list and an indexer-selected
+                                 // list; launching them as separate grids adds
+                                 // a serialized graph node at every layer. A
+                                 // combined grid selects the source from z and
+                                 // writes both into the same partial workspace.
+                                 const uint8_t* second_data_cache = nullptr,
+                                 const uint8_t* second_scale_cache = nullptr,
+                                 const int* second_block_table = nullptr,
+                                 const int* second_context_lens = nullptr,
+                                 const int* second_indices = nullptr,
+                                 const int* second_topk_length = nullptr,
+                                 int second_max_topk = 0,
+                                 int second_block_size = 0,
+                                 int second_bt_stride = 0,
+                                 int second_num_partitions = 0,
+                                 int second_partition_size = 0,
+                                 float second_kv_scale = 1.0f,
+                                 int second_page_stride_bytes = 0,
+                                 int second_scale_block_offset_bytes = 0,
+                                 int second_scale_slot_stride_bytes = 0,
+                                 int second_partition_offset = 0,
+                                 bool second_indices_are_slots = false,
+                                 int primary_launched_partitions = 0,
+                                 int second_launched_partitions = 0,
+                                 int num_cache_blocks = 0,
+                                 int second_num_cache_blocks = 0) {
     constexpr int NOPE = NFP8, VPL = VW / 32, QPL = QW / 32;
     constexpr int SLOT_BYTES = NFP8 + 2 * (QW - NFP8);
     static_assert(QW % 32 == 0 && VW % 32 == 0 && VW <= QW, "bad MLA geometry");
     constexpr float MLA_NEG_INF = -3.4028234663852886e38f;
     const int head = blockIdx.x, batch = blockIdx.y, lane = threadIdx.x;
-    const int part = PART ? blockIdx.z : 0;
-    const int len = SPARSE ? topk_length[batch] : context_lens[batch];
-    // Balance the split by the request's ACTUAL length, not the fixed
-    // partition_size: with j_beg = part * partition_size every context
-    // shorter than partition_size lands entirely in partition 0 and the
-    // other P-1 warps exit -- at short contexts that is one warp per
-    // (head, token) again, exactly what the partition axis was added to
-    // avoid. ceil(len / num_partitions) keeps all P partitions busy at
-    // every length; the reduce is boundary-agnostic.
-    const int part_span =
-        PART ? (len + num_partitions - 1) / num_partitions : len;
-    const int j_beg = PART ? part * part_span : 0;
-    const int j_end = PART ? min(len, j_beg + part_span) : len;
+    const bool use_second =
+        PART && second_data_cache != nullptr &&
+        int(blockIdx.z) >= primary_launched_partitions;
+    const uint8_t* source_data_cache =
+        use_second ? second_data_cache : data_cache;
+    const uint8_t* source_scale_cache =
+        use_second ? second_scale_cache : scale_cache;
+    const int* source_block_table =
+        use_second ? second_block_table : block_table;
+    const int* source_context_lens =
+        use_second ? second_context_lens : context_lens;
+    const int* source_indices = use_second ? second_indices : indices;
+    const int* source_topk_length =
+        use_second ? second_topk_length : topk_length;
+    const int source_max_topk = use_second ? second_max_topk : max_topk;
+    const int source_block_size =
+        use_second ? second_block_size : block_size;
+    const int source_bt_stride = use_second ? second_bt_stride : bt_stride;
+    const int source_num_partitions =
+        use_second ? second_num_partitions : num_partitions;
+    const float source_kv_scale = use_second ? second_kv_scale : kv_scale;
+    const int source_page_stride_bytes =
+        use_second ? second_page_stride_bytes : page_stride_bytes;
+    const int source_scale_block_offset_bytes =
+        use_second ? second_scale_block_offset_bytes
+                   : scale_block_offset_bytes;
+    const int source_scale_slot_stride_bytes =
+        use_second ? second_scale_slot_stride_bytes
+                   : scale_slot_stride_bytes;
+    const int source_partition_offset =
+        use_second ? second_partition_offset : partition_offset;
+    const bool source_indices_are_slots =
+        use_second ? second_indices_are_slots : indices_are_slots;
+    const int source_num_cache_blocks =
+        use_second ? second_num_cache_blocks : num_cache_blocks;
+    const int source_launched_partitions = use_second
+        ? second_launched_partitions
+        : (primary_launched_partitions > 0
+               ? primary_launched_partitions
+               : int(gridDim.z));
+    const int source_grid_part =
+        PART ? int(blockIdx.z) - (use_second ? primary_launched_partitions : 0)
+             : 0;
+    const int raw_len = SPARSE ? source_topk_length[batch]
+                               : source_context_lens[batch];
+    // Sparse metadata lives in fixed-width graph buffers and is rewritten on
+    // every replay. Never let a stale/racing length walk beyond that buffer.
+    const int len = SPARSE ? min(max(raw_len, 0), source_max_topk)
+                           : max(raw_len, 0);
+    const int first_part = PART ? source_grid_part : 0;
+    const int part_limit =
+        PART ? (persistent_partitions ? min(source_num_partitions, len)
+                                      : source_num_partitions)
+             : 1;
+    const int part_step =
+        PART ? (persistent_partitions ? source_launched_partitions
+                                      : source_num_partitions)
+             : 1;
     const int64_t q_base = (int64_t(batch) * num_heads + head) * QW;
     const bool splitq = (q_pe2 != nullptr);
     const int64_t qn_base = (int64_t(head) * gridDim.y + batch) * VW;
@@ -402,11 +481,32 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     // QW/128 coalesced 128-byte rounds, and dims [0, VW) land exactly in the
     // full rounds while the tail round is rope-only score work.
     constexpr bool VECFP8 = (NFP8 == QW) && (QW % 4 == 0) && (VW % 128 == 0);
+    constexpr bool VECDSV4 =
+        (QW == 512) && (VW == 512) && (NFP8 == 448) && (SMODE == 0);
     constexpr int VR = VW / 128;              // full 4-byte rounds (V dims)
     constexpr int TAIL = (QW - VW) / 64;      // 2-byte tail rounds (rope dims)
 
-    float qv[QPL], acc[VPL];
-    if constexpr (VECFP8) {
+    float qv[QPL];
+    if constexpr (VECDSV4) {
+        #pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const bf16* src = &q[q_base + 4 * lane + 128 * i];
+            const uint2 qw = *reinterpret_cast<const uint2*>(src);
+            const bf16* qb = reinterpret_cast<const bf16*>(&qw);
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) qv[4 * i + k] = float(qb[k]);
+        }
+        const uint32_t q_tail = *reinterpret_cast<const uint32_t*>(
+            &q[q_base + 384 + 2 * lane]);
+        const uint32_t q_rope = *reinterpret_cast<const uint32_t*>(
+            &q[q_base + 448 + 2 * lane]);
+        const bf16* qt = reinterpret_cast<const bf16*>(&q_tail);
+        const bf16* qr = reinterpret_cast<const bf16*>(&q_rope);
+        qv[12] = float(qt[0]);
+        qv[13] = float(qt[1]);
+        qv[14] = float(qr[0]);
+        qv[15] = float(qr[1]);
+    } else if constexpr (VECFP8) {
         #pragma unroll
         for (int i = 0; i < VR; i++) {
             const bf16* src = splitq ? &q[qn_base + 4 * lane + 128 * i]
@@ -434,41 +534,109 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                                  : q[q_base + d]);
         }
     }
+    for (int part = first_part; part < part_limit; part += part_step) {
+    // Balance the split by the request's ACTUAL length, not the fixed
+    // partition_size. When the launch is persistent, each resident warp walks
+    // multiple logical partitions and partitions beyond len never execute.
+    const int part_span = PART
+        ? (len + source_num_partitions - 1) / source_num_partitions
+        : len;
+    const int j_beg = PART ? part * part_span : 0;
+    const int j_end = PART ? min(len, j_beg + part_span) : len;
+    float acc[VPL];
     #pragma unroll
     for (int i = 0; i < VPL; i++) acc[i] = 0.0f;
     float m = MLA_NEG_INF, l = 0.0f;
 
     for (int j = j_beg; j < j_end; j++) {
-        const int t = SPARSE ? indices[batch * max_topk + j] : j;
+        const int t = SPARSE ? source_indices[batch * source_max_topk + j] : j;
         if (SPARSE && t < 0) continue;
-        const int col = t / block_size, slot = t - col * block_size;
-        // A sparse index list is caller-supplied and can be ragged or stale
-        // (padding, a profiling pass, a request shorter than max_topk). Guard the
-        // block-table read as well as its contents; without this an index past
-        // the request's table walks off the end and then dereferences the cache
-        // with a garbage block id.
-        if (col < 0 || col >= bt_stride) continue;
-        const int block = block_table[batch * bt_stride + col];
-        if (block < 0) continue;
-        const int64_t dslot = int64_t(block) * block_size + slot;
-        const int64_t dbase = dslot * SLOT_BYTES, sbase = dslot * (NFP8 / 64);
-        const bf16* rope = reinterpret_cast<const bf16*>(data_cache + dbase + NOPE);
+        int block, slot;
+        int64_t dslot;
+        if (source_indices_are_slots) {
+            dslot = int64_t(t);
+            block = int(dslot / source_block_size);
+            slot = int(dslot - int64_t(block) * source_block_size);
+            if (source_num_cache_blocks > 0 && block >= source_num_cache_blocks)
+                continue;
+        } else {
+            const int col = t / source_block_size;
+            slot = t - col * source_block_size;
+            // A sparse index list is caller-supplied and can be ragged or stale
+            // (padding, a profiling pass, a request shorter than max_topk).
+            // Guard the block-table read as well as its contents.
+            if (col < 0 || col >= source_bt_stride) continue;
+            block = source_block_table[batch * source_bt_stride + col];
+            if (block < 0 ||
+                (source_num_cache_blocks > 0 && block >= source_num_cache_blocks))
+                continue;
+            dslot = int64_t(block) * source_block_size + slot;
+        }
+        const bool packed_page = source_page_stride_bytes > 0;
+        const int64_t dbase = packed_page
+            ? int64_t(block) * source_page_stride_bytes +
+                  int64_t(slot) * SLOT_BYTES
+            : dslot * SLOT_BYTES;
+        const int64_t sbase = packed_page
+            ? int64_t(block) * source_page_stride_bytes +
+                  source_scale_block_offset_bytes +
+                  int64_t(slot) * source_scale_slot_stride_bytes
+            : dslot * (NFP8 / 64);
+        const bf16* rope = reinterpret_cast<const bf16*>(
+            source_data_cache + dbase + NOPE);
 
         float lat[QPL], partial = 0.0f;
-        if constexpr (VECFP8) {
+        if constexpr (VECDSV4) {
+            #pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                const uint32_t w = *reinterpret_cast<const uint32_t*>(
+                    source_data_cache + dbase + 4 * lane + 128 * i);
+                int e = 0;
+                if ((lane & 15) == 0)
+                    e = int(source_scale_cache[sbase + 2 * i + (lane >> 4)]);
+                e = __shfl_sync(0xffffffffu, e, (lane >> 4) * 16);
+                const float block_scale = exp2f(float(e - 127));
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float dq =
+                        tmq::e4m3_decode(uint8_t(w >> (8 * k))) * block_scale;
+                    lat[4 * i + k] = dq;
+                    partial += qv[4 * i + k] * dq;
+                }
+            }
+            const uint16_t tail = *reinterpret_cast<const uint16_t*>(
+                source_data_cache + dbase + 384 + 2 * lane);
+            int tail_e = lane == 0 ? int(source_scale_cache[sbase + 6]) : 0;
+            tail_e = __shfl_sync(0xffffffffu, tail_e, 0);
+            const float tail_scale = exp2f(float(tail_e - 127));
+            #pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const float dq =
+                    tmq::e4m3_decode(uint8_t(tail >> (8 * k))) * tail_scale;
+                lat[12 + k] = dq;
+                partial += qv[12 + k] * dq;
+            }
+            const uint32_t rope_word = *reinterpret_cast<const uint32_t*>(
+                source_data_cache + dbase + 448 + 4 * lane);
+            const bf16* rope_values =
+                reinterpret_cast<const bf16*>(&rope_word);
+            lat[14] = float(rope_values[0]);
+            lat[15] = float(rope_values[1]);
+            partial += qv[14] * lat[14] + qv[15] * lat[15];
+        } else if constexpr (VECFP8) {
             #pragma unroll
             for (int i = 0; i < VR; i++) {
                 const uint32_t w = *reinterpret_cast<const uint32_t*>(
-                    data_cache + dbase + 4 * lane + 128 * i);
+                    source_data_cache + dbase + 4 * lane + 128 * i);
                 #pragma unroll
                 for (int k = 0; k < 4; k++) {
                     const int d = 4 * lane + 128 * i + k;
                     float dq = tmq::e4m3_decode(uint8_t(w >> (8 * k)));
                     if (SMODE == 0) {
-                        const int e = int(scale_cache[sbase + d / 64]);
+                        const int e = int(source_scale_cache[sbase + d / 64]);
                         dq *= exp2f(float(e - 127));
                     } else {
-                        dq *= kv_scale;
+                        dq *= source_kv_scale;
                     }
                     lat[4 * i + k] = dq;
                     partial += qv[4 * i + k] * dq;
@@ -477,16 +645,16 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
             #pragma unroll
             for (int i = 0; i < TAIL; i++) {
                 const uint16_t w = *reinterpret_cast<const uint16_t*>(
-                    data_cache + dbase + VW + 2 * lane + 64 * i);
+                    source_data_cache + dbase + VW + 2 * lane + 64 * i);
                 #pragma unroll
                 for (int k = 0; k < 2; k++) {
                     const int d = VW + 2 * lane + 64 * i + k;
                     float dq = tmq::e4m3_decode(uint8_t(w >> (8 * k)));
                     if (SMODE == 0) {
-                        const int e = int(scale_cache[sbase + d / 64]);
+                        const int e = int(source_scale_cache[sbase + d / 64]);
                         dq *= exp2f(float(e - 127));
                     } else {
-                        dq *= kv_scale;
+                        dq *= source_kv_scale;
                     }
                     lat[4 * VR + 2 * i + k] = dq;
                     partial += qv[4 * VR + 2 * i + k] * dq;
@@ -497,12 +665,13 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
             for (int i = 0; i < QPL; i++) {
                 const int d = lane + 32 * i;
                 if (d < NOPE) {
-                    const float dq = tmq::e4m3_decode(data_cache[dbase + d]);
+                    const float dq =
+                        tmq::e4m3_decode(source_data_cache[dbase + d]);
                     if (SMODE == 0) {
-                        const int e = int(scale_cache[sbase + d / 64]);
+                        const int e = int(source_scale_cache[sbase + d / 64]);
                         lat[i] = dq * exp2f(float(e - 127));
                     } else {
-                        lat[i] = dq * kv_scale;
+                        lat[i] = dq * source_kv_scale;
                     }
                 } else {
                     lat[i] = float(rope[d - NOPE]);
@@ -520,7 +689,11 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         m = nm;
     }
     if (PART) {
-        const int64_t stat = (int64_t(batch) * num_heads + head) * num_partitions + part;
+        const int reduce_partitions =
+            total_partitions > 0 ? total_partitions : num_partitions;
+        const int64_t stat = (int64_t(batch) * num_heads + head) *
+                                 reduce_partitions +
+                             source_partition_offset + part;
         // Empty partitions write only their skip sentinel: the reduce never
         // reads tmp_out for a partition whose max_logit is NEG_INF, and at
         // short sparse contexts most partitions are empty -- zero-filling
@@ -530,10 +703,25 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                 max_logits[stat] = MLA_NEG_INF;
                 exp_sums[stat] = 0.0f;
             }
-            return;
+            continue;
         }
         const int64_t ob = stat * VW;
-        if constexpr (VECFP8) {
+        if constexpr (VECDSV4) {
+            #pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                float4 v;
+                v.x = acc[4 * i] / l;
+                v.y = acc[4 * i + 1] / l;
+                v.z = acc[4 * i + 2] / l;
+                v.w = acc[4 * i + 3] / l;
+                *reinterpret_cast<float4*>(
+                    &tmp_out[ob + 4 * lane + 128 * i]) = v;
+            }
+            *reinterpret_cast<float2*>(&tmp_out[ob + 384 + 2 * lane]) =
+                make_float2(acc[12] / l, acc[13] / l);
+            *reinterpret_cast<float2*>(&tmp_out[ob + 448 + 2 * lane]) =
+                make_float2(acc[14] / l, acc[15] / l);
+        } else if constexpr (VECFP8) {
             // acc[4i+k] holds dim 4*lane + 128*i + k; store float4 to the
             // canonical layout so the unchanged reduce kernel reads it as-is.
             #pragma unroll
@@ -554,7 +742,31 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         }
     } else {
         const int64_t out_base = (int64_t(batch) * num_heads + head) * VW;
-        if constexpr (VECFP8) {
+        if constexpr (VECDSV4) {
+            #pragma unroll
+            for (int i = 0; i < 3; ++i) {
+                bf16 v[4];
+                #pragma unroll
+                for (int k = 0; k < 4; ++k)
+                    v[k] = (l == 0.0f) ? bf16(0.0f)
+                                       : bf16(acc[4 * i + k] / l);
+                *reinterpret_cast<uint2*>(
+                    &out[out_base + 4 * lane + 128 * i]) =
+                    *reinterpret_cast<const uint2*>(v);
+            }
+            bf16 tail[2], rope_out[2];
+            #pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                tail[k] = (l == 0.0f) ? bf16(0.0f)
+                                      : bf16(acc[12 + k] / l);
+                rope_out[k] = (l == 0.0f) ? bf16(0.0f)
+                                          : bf16(acc[14 + k] / l);
+            }
+            *reinterpret_cast<uint32_t*>(&out[out_base + 384 + 2 * lane]) =
+                *reinterpret_cast<const uint32_t*>(tail);
+            *reinterpret_cast<uint32_t*>(&out[out_base + 448 + 2 * lane]) =
+                *reinterpret_cast<const uint32_t*>(rope_out);
+        } else if constexpr (VECFP8) {
             #pragma unroll
             for (int i = 0; i < VR; i++) {
                 bf16 v[4];
@@ -570,6 +782,7 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
                 out[out_base + lane + 32 * i] =
                     (l == 0.0f) ? bf16(0.0f) : bf16(acc[i] / l);
         }
+    }
     }
 }
 
@@ -609,4 +822,3 @@ __global__ void sparse_topk_tlen(const int* __restrict__ idx,
 }
 
 }  // namespace tms
-

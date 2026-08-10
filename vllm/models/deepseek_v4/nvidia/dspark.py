@@ -236,11 +236,32 @@ def _insert_context_kv(
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
+    tq_impl = getattr(attn, "_tq_impl", None)
     dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
+        (n_ctx, 1 if tq_impl is not None else attn.n_local_heads, attn.head_dim),
         dtype=kv.dtype,
         device=kv.device,
     )
+    if tq_impl is not None:
+        transform_slots = attn._tq_transform_slots[:n_ctx]
+        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+            dummy_q[:, :1],
+            kv,
+            kv.view(n_ctx, 1, attn.head_dim),
+            transform_slots,
+            positions,
+            cos_sin_cache,
+            attn.eps,
+            1,
+        )
+        tq_impl.do_kv_cache_update(
+            attn,
+            kv,
+            kv,
+            swa_cache,
+            slot_mapping,
+        )
+        return
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)

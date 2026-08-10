@@ -3,8 +3,8 @@
 """What accelerators this machine actually has.
 
 Deliberately does not import torch or vllm: the profile picker runs before any
-engine exists and must stay instant. amdsmi and pynvml both answer in well
-under a second and neither initializes a CUDA/HIP context, and the Apple probe
+engine exists and must stay instant. amdsmi, pynvml and nvidia-smi all answer
+in well under a second and none initializes a CUDA/HIP context; the Apple probe
 is two sysctl reads.
 """
 
@@ -66,7 +66,7 @@ def _probe_amd() -> tuple[str, int] | None:
             amdsmi.amdsmi_shut_down()
 
 
-def _probe_nvidia() -> tuple[str, int] | None:
+def _probe_nvidia_nvml() -> tuple[str, int] | None:
     try:
         import pynvml
     except ImportError:
@@ -85,6 +85,33 @@ def _probe_nvidia() -> tuple[str, int] | None:
     finally:
         with contextlib.suppress(Exception):
             pynvml.nvmlShutdown()
+
+
+def _probe_nvidia_smi() -> tuple[str, int] | None:
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    names = [line.strip() for line in out.stdout.splitlines() if line.strip()]
+    if not names:
+        return None
+    return names[0], len(names)
+
+
+def _probe_nvidia() -> tuple[str, int] | None:
+    return _probe_nvidia_nvml() or _probe_nvidia_smi()
 
 
 def _sysctl(name: str) -> str | None:

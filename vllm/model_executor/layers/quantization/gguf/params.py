@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
@@ -151,6 +153,31 @@ def _gguf_embedding_weight_type_loader(
     _store_gguf_weight_type(param, loaded_weight)
 
 
+def _use_dsv4_channel_owned_w2(
+    layer: RoutedExperts,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+) -> bool:
+    """Select the byte-neutral DSV4 W2 output-row partition.
+
+    This layout is intentionally model-specific.  Applying an output-row
+    partition to another GGUF MoE would silently change its TP contract.
+    """
+    return (
+        shard_id == "w2"
+        and loaded_weight.ndim == 3
+        and (
+            os.getenv("VLLM_DSV4_CHANNEL_OWNED", "0").lower()
+            in {"1", "true", "on", "yes"}
+            or os.getenv("VLLM_DSV4_TP_OWNERSHIP", "0").lower()
+            in {"1", "true", "on", "yes"}
+        )
+        and getattr(layer, "hidden_size", None) == 4096
+        and getattr(layer.moe_config, "intermediate_size", None) == 2048
+        and loaded_weight.shape[1:] == (4096, 672)
+    )
+
+
 def _materialize_gguf_moe_param(
     layer: RoutedExperts,
     param: Parameter | UninitializedParameter,
@@ -161,7 +188,12 @@ def _materialize_gguf_moe_param(
     if not is_uninitialized and param.data.numel() != 0:
         return
 
-    shard_dim = {"w1": 0, "w2": 1, "w3": 0}[shard_id]
+    output_stationary_w2 = _use_dsv4_channel_owned_w2(
+        layer, loaded_weight, shard_id
+    )
+    shard_dim = (
+        0 if output_stationary_w2 else {"w1": 0, "w2": 1, "w3": 0}[shard_id]
+    )
     if getattr(param, "is_transposed", False):
         shard_dim = int(not shard_dim)
 
@@ -197,6 +229,17 @@ def _gguf_moe_weight_loader(
     return_success: bool = False,
 ) -> bool | None:
     _materialize_gguf_moe_param(layer, param, loaded_weight, shard_id)
+    output_stationary_w2 = _use_dsv4_channel_owned_w2(
+        layer, loaded_weight, shard_id
+    )
+    if output_stationary_w2:
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+        rows = loaded_weight.shape[1] // tp_size
+        loaded_weight = loaded_weight.narrow(1, tp_rank * rows, rows)
+        param.data.copy_(loaded_weight.to(device=param.device))
+        layer._dsv4_w2_output_sharded = True
+        return True if return_success else None
     if loaded_weight.ndim == 3 and loaded_weight.device.type == "cpu":
         # Stacked all-expert tensor. The base loader TP-narrows it, and a
         # strided host-to-device copy of that narrow falls off torch's fast
@@ -261,10 +304,11 @@ class _GGUFParamLoadMixin:
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank, tp_size = self._get_tp_rank_and_size()
         if tp_size > 1 and loaded_weight.ndim >= 2:
-            shard_size = loaded_weight.shape[1] // tp_size
+            shard_dim = 0 if getattr(self, "dsv4_output_owned", False) else 1
+            shard_size = loaded_weight.shape[shard_dim] // tp_size
             if shard_size > 0:
                 loaded_weight = loaded_weight.narrow(
-                    1, tp_rank * shard_size, shard_size
+                    shard_dim, tp_rank * shard_size, shard_size
                 )
         self._store(loaded_weight)
 
@@ -379,6 +423,8 @@ def _materialize_gguf_weight_parameter(
     qweight.data_container = list(raw_param.data_container)
     qweight.shard_id = list(raw_param.shard_id)
     qweight.shard_id_map = dict(raw_param.shard_id_map)
+    if hasattr(raw_param, "dsv4_output_owned"):
+        qweight.dsv4_output_owned = raw_param.dsv4_output_owned
     if hasattr(raw_param, "ignore_warning"):
         qweight.ignore_warning = raw_param.ignore_warning
     layer.register_parameter(param_name, qweight)

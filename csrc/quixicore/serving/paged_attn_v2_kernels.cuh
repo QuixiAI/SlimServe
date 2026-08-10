@@ -194,7 +194,10 @@ __global__ void paged_attention_reduce(
     float gden = 0.0f;
     for (int p = 0; p < num_partitions; p++) {
         const float mp = max_logits[base + p];
-        if (mp == NEG_INF) continue;
+        // !(mp > NEG_INF) skips empty partitions AND degrades a NaN partial
+        // stat to "empty" instead of poisoning the head (fmaxf already drops
+        // NaN from gm, so without this the NaN re-enters via expf).
+        if (!(mp > NEG_INF)) continue;
         gden += exp_sums[base + p] * expf(mp - gm);
     }
     const float inv = 1.0f / (gden + 1e-6f);
@@ -204,7 +207,7 @@ __global__ void paged_attention_reduce(
     for (int i = 0; i < VPL; i++) acc[i] = 0.0f;
     for (int p = 0; p < num_partitions; p++) {
         const float mp = max_logits[base + p];
-        if (mp == NEG_INF) continue;
+        if (!(mp > NEG_INF)) continue;
         const float r = exp_sums[base + p] * expf(mp - gm);
         const int64_t ob = (base + p) * D;
         #pragma unroll
@@ -216,9 +219,303 @@ __global__ void paged_attention_reduce(
         out[out_base + lane + 32 * i] = (gm == NEG_INF) ? T(0) : T(acc[i] * inv);
 }
 
+// Decode-specialized reducer for a large partition axis. The original reducer
+// intentionally uses one warp, which leaves Ampere almost idle when DSV4's
+// short split-K partitions produce O(100) partials per head.
+template <typename T, int D, int WARPS>
+__global__ void paged_attention_reduce_multiwarp(
+        const float* tmp_out, const float* max_logits, const float* exp_sums,
+        T* out, int num_heads, int num_partitions) {
+    static_assert(D % 32 == 0, "D must be a multiple of a warp");
+    constexpr int VPL = D / 32;
+    const int head = blockIdx.x, batch = blockIdx.y;
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int thread = threadIdx.x;
+    const int64_t base = (int64_t(batch) * num_heads + head) * num_partitions;
+
+    extern __shared__ float partition_weights[];
+    __shared__ float warp_max[WARPS];
+    __shared__ float warp_den[WARPS];
+    __shared__ float warp_out[WARPS][D];
+
+    float local_max = NEG_INF;
+    for (int p = thread; p < num_partitions; p += WARPS * 32) {
+        local_max = fmaxf(local_max, max_logits[base + p]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(
+            local_max, __shfl_down_sync(0xffffffffu, local_max, offset));
+    }
+    if (lane == 0) {
+        warp_max[warp] = local_max;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_max[lane] : NEG_INF;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = fmaxf(
+                value, __shfl_down_sync(0xffffffffu, value, offset));
+        }
+        if (lane == 0) {
+            warp_max[0] = value;
+        }
+    }
+    __syncthreads();
+    const float global_max = warp_max[0];
+
+    float local_den = 0.0f;
+    for (int p = thread; p < num_partitions; p += WARPS * 32) {
+        const float partition_max = max_logits[base + p];
+        const float weight = !(partition_max > NEG_INF)
+            ? 0.0f
+            : exp_sums[base + p] * expf(partition_max - global_max);
+        partition_weights[p] = weight;
+        local_den += weight;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_den += __shfl_down_sync(0xffffffffu, local_den, offset);
+    }
+    if (lane == 0) {
+        warp_den[warp] = local_den;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_den[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) {
+            warp_den[0] = value;
+        }
+    }
+    __syncthreads();
+
+    float accum[VPL];
+#pragma unroll
+    for (int i = 0; i < VPL; ++i) {
+        accum[i] = 0.0f;
+    }
+    for (int p = warp; p < num_partitions; p += WARPS) {
+        const float weight = partition_weights[p];
+        if (weight == 0.0f) {
+            continue;
+        }
+        const int64_t partition_base = (base + p) * D;
+#pragma unroll
+        for (int i = 0; i < VPL; ++i) {
+            accum[i] += tmp_out[partition_base + lane + 32 * i] * weight;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < VPL; ++i) {
+        warp_out[warp][lane + 32 * i] = accum[i];
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        const float inverse = 1.0f / (warp_den[0] + 1e-6f);
+        const int64_t output_base = (int64_t(batch) * num_heads + head) * D;
+#pragma unroll
+        for (int i = 0; i < VPL; ++i) {
+            float value = 0.0f;
+#pragma unroll
+            for (int source_warp = 0; source_warp < WARPS; ++source_warp) {
+                value += warp_out[source_warp][lane + 32 * i];
+            }
+            out[output_base + lane + 32 * i] =
+                global_max == NEG_INF ? T(0) : T(value * inverse);
+        }
+    }
+}
+
+// DSV4 decode owns exactly one thread per MLA value channel. Partition weights
+// are computed once by the block, then every partial output element is read and
+// accumulated exactly once. This avoids the multi-warp reducer's replicated
+// 512-channel accumulators and shared-memory cross-warp epilogue.
+template <typename T, int D>
+__global__ __launch_bounds__(D, 2) void paged_attention_reduce_channels(
+        const float* tmp_out, const float* max_logits, const float* exp_sums,
+        T* out, int num_heads, int num_partitions) {
+    static_assert(D == 512, "channel reducer is specialized for DSV4 MLA");
+    constexpr int WARPS = D / 32;
+    const int head = blockIdx.x, batch = blockIdx.y;
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5, lane = thread & 31;
+    const int64_t base = (int64_t(batch) * num_heads + head) * num_partitions;
+
+    extern __shared__ float partition_weights[];
+    __shared__ float warp_stats[WARPS];
+
+    float local_max = NEG_INF;
+    for (int p = thread; p < num_partitions; p += D) {
+        local_max = fmaxf(local_max, max_logits[base + p]);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_max = fmaxf(
+            local_max, __shfl_down_sync(0xffffffffu, local_max, offset));
+    }
+    if (lane == 0) warp_stats[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_stats[lane] : NEG_INF;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value = fmaxf(
+                value, __shfl_down_sync(0xffffffffu, value, offset));
+        }
+        if (lane == 0) warp_stats[0] = value;
+    }
+    __syncthreads();
+    const float global_max = warp_stats[0];
+
+    float local_den = 0.0f;
+    for (int p = thread; p < num_partitions; p += D) {
+        const float partition_max = max_logits[base + p];
+        const float weight = !(partition_max > NEG_INF)
+            ? 0.0f
+            : exp_sums[base + p] * expf(partition_max - global_max);
+        partition_weights[p] = weight;
+        local_den += weight;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        local_den += __shfl_down_sync(0xffffffffu, local_den, offset);
+    }
+    if (lane == 0) warp_stats[warp] = local_den;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_stats[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        }
+        if (lane == 0) warp_stats[0] = value;
+    }
+    __syncthreads();
+
+    float value = 0.0f;
+    for (int p = 0; p < num_partitions; ++p) {
+        value += tmp_out[(base + p) * D + thread] * partition_weights[p];
+    }
+    const int64_t output_base = (int64_t(batch) * num_heads + head) * D;
+    out[output_base + thread] = global_max == NEG_INF
+        ? T(0)
+        : T(value / (warp_stats[0] + 1e-6f));
+}
+
+// DSV4 keeps fixed-width CUDA-graph buffers for each sparse source. At short
+// contexts the ratio-128 source can expose 1024 logical partition slots while
+// only a few contain tokens. Preserve the canonical slot/order mapping, but
+// visit only the active prefix of each source in the value reduction.
+template <typename T, int D>
+__global__ __launch_bounds__(D, 2) void dsv4_attention_reduce_active_channels(
+        const float* tmp_out, const float* max_logits, const float* exp_sums,
+        const int* main_lengths, const int* extra_lengths, const float* sink,
+        T* out,
+        int num_heads, int main_partitions, int extra_partitions,
+        int total_partitions) {
+    static_assert(D == 512, "active channel reducer is specialized for DSV4 MLA");
+    constexpr int WARPS = D / 32;
+    const int head = blockIdx.x, batch = blockIdx.y;
+    const int thread = threadIdx.x;
+    const int warp = thread >> 5, lane = thread & 31;
+    const int64_t base =
+        (int64_t(batch) * num_heads + head) * total_partitions;
+    const int main_active = min(main_partitions, max(main_lengths[batch], 0));
+    const int extra_active = min(extra_partitions, max(extra_lengths[batch], 0));
+    const int extra_begin = main_partitions;
+    const int extra_end = extra_begin + extra_active;
+    const int sink_owner = (main_partitions + extra_partitions) % D;
+
+    extern __shared__ float partition_weights[];
+    __shared__ float warp_stats[WARPS];
+
+    float local_max = NEG_INF;
+    for (int p = thread; p < main_active; p += D)
+        local_max = fmaxf(local_max, max_logits[base + p]);
+    int p = thread;
+    if (p < extra_begin)
+        p += ((extra_begin - p + D - 1) / D) * D;
+    for (; p < extra_end; p += D)
+        local_max = fmaxf(local_max, max_logits[base + p]);
+    if (sink != nullptr) local_max = fmaxf(local_max, sink[head]);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(
+            local_max, __shfl_down_sync(0xffffffffu, local_max, offset));
+    if (lane == 0) warp_stats[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_stats[lane] : NEG_INF;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value = fmaxf(
+                value, __shfl_down_sync(0xffffffffu, value, offset));
+        if (lane == 0) warp_stats[0] = value;
+    }
+    __syncthreads();
+    const float global_max = warp_stats[0];
+
+    float local_den = 0.0f;
+    for (int partition = thread; partition < main_active; partition += D) {
+        const float partition_max = max_logits[base + partition];
+        const float weight = !(partition_max > NEG_INF)
+            ? 0.0f
+            : exp_sums[base + partition] * expf(partition_max - global_max);
+        partition_weights[partition] = weight;
+        local_den += weight;
+    }
+    p = thread;
+    if (p < extra_begin)
+        p += ((extra_begin - p + D - 1) / D) * D;
+    for (; p < extra_end; p += D) {
+        const float partition_max = max_logits[base + p];
+        const float weight = !(partition_max > NEG_INF)
+            ? 0.0f
+            : exp_sums[base + p] * expf(partition_max - global_max);
+        partition_weights[p] = weight;
+        local_den += weight;
+    }
+    if (sink != nullptr && thread == sink_owner) {
+        const float sink_logit = sink[head];
+        if (!(isinf(sink_logit) && sink_logit < 0.0f))
+            local_den += expf(sink_logit - global_max);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_den += __shfl_down_sync(0xffffffffu, local_den, offset);
+    if (lane == 0) warp_stats[warp] = local_den;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < WARPS ? warp_stats[lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down_sync(0xffffffffu, value, offset);
+        if (lane == 0) warp_stats[0] = value;
+    }
+    __syncthreads();
+
+    float value = 0.0f;
+    for (int partition = 0; partition < main_active; ++partition)
+        value += tmp_out[(base + partition) * D + thread] *
+                 partition_weights[partition];
+    for (int partition = extra_begin; partition < extra_end; ++partition)
+        value += tmp_out[(base + partition) * D + thread] *
+                 partition_weights[partition];
+    const int64_t output_base = (int64_t(batch) * num_heads + head) * D;
+    out[output_base + thread] = global_max == NEG_INF
+        ? T(0)
+        : T(value / (warp_stats[0] + 1e-6f));
+}
+
 // explicit D=512 reduce instantiation (MLA reuses it)
 template __global__ void paged_attention_reduce<__nv_bfloat16, 512>(
     const float*, const float*, const float*, __nv_bfloat16*, int, int);
 
 }  // namespace tms
-

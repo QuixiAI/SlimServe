@@ -111,6 +111,7 @@ class SharedExperts(torch.nn.Module):
     def maybe_sync_shared_experts_stream(
         self,
         shared_experts_input: torch.Tensor,
+        prequant_input: torch.Tensor | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -123,6 +124,8 @@ class SharedExperts(torch.nn.Module):
             # NOTE: We don't need shared_output.record_stream(current_stream())
             # because we synch the streams before using shared_output.
             shared_experts_input.record_stream(self._stream)
+            if prequant_input is not None:
+                prequant_input.record_stream(self._stream)
 
             # Mark sync start point for the aux stream since we will
             # run in parallel with router/gate.
@@ -131,12 +134,18 @@ class SharedExperts(torch.nn.Module):
     def _run_in_aux_stream(
         self,
         shared_experts_input: torch.Tensor,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # TODO: assert that maybe_sync_shared_experts_stream has been called.
 
         # Run shared experts in parallel on a separate stream.
         with torch.cuda.stream(self._stream):
-            output = self._layer(shared_experts_input)
+            if prequant_input is None:
+                output = self._layer(shared_experts_input)
+            else:
+                output = self._layer(
+                    shared_experts_input, prequant_input=prequant_input
+                )
         current_stream().wait_stream(self._stream)
 
         return output
@@ -156,6 +165,7 @@ class SharedExperts(torch.nn.Module):
         self,
         shared_experts_input: torch.Tensor,
         order: SharedExpertsOrder,
+        prequant_input: torch.Tensor | None = None,
     ):
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
@@ -166,9 +176,14 @@ class SharedExperts(torch.nn.Module):
 
         if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
-                shared_experts_input
+                shared_experts_input, prequant_input
             )
         else:
-            self._output[self._output_idx] = self._layer(shared_experts_input)
+            if prequant_input is None:
+                self._output[self._output_idx] = self._layer(shared_experts_input)
+            else:
+                self._output[self._output_idx] = self._layer(
+                    shared_experts_input, prequant_input=prequant_input
+                )
 
         assert self._output[self._output_idx] is not None

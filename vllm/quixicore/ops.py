@@ -10,8 +10,6 @@ functional on Ampere while the native kernel is written.
 Stub inventory (TODO(quixicore-cuda), tracked for native implementation):
 - ``fp8_mqa_logits``: DSA indexer prefill logits. DeepGEMM provides this on
   sm90+; on sm80 we fall back to the pure-torch reference.
-- ``fp8_paged_mqa_logits``: DSA indexer decode logits against the paged fp8
-  K cache. Same fallback situation.
 - GGUF MoE grouped GEMM with sm80-tuned tiles: not a stub here — the in-tree
   ``torch.ops._C.ggml_moe_a8`` builds for CUDA with upstream (untuned) tiles;
   an Ampere-tuned QuixiCore kernel is a later perf project.
@@ -62,6 +60,129 @@ class quixicore_ops:
         except ImportError as e:
             logger.debug("QuixiCore-CUDA extension unavailable: %s", e)
             return False
+
+    # ------------------------------------------------------------------
+    # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def dsv4_router_gemm(
+        x: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        return _qc().dsv4_router_gemm(x, weight)
+
+    @staticmethod
+    def dsv4_hash_router(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        input_ids: torch.Tensor,
+        tid2eid: torch.Tensor,
+        routed_scaling_factor: float,
+        is_padding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _qc().dsv4_hash_router(
+            x,
+            weight,
+            input_ids,
+            tid2eid,
+            routed_scaling_factor,
+            is_padding,
+        )
+
+    @staticmethod
+    def dsv4_hash_router_debug() -> torch.Tensor:
+        """{flag, token_index, raw_id_lo32, raw_id_hi32}; clears the slot."""
+        return _qc().dsv4_hash_router_debug()
+
+    @staticmethod
+    def dsv4_projection_gemv(
+        x: torch.Tensor, weight: torch.Tensor, bf16_output: bool = False
+    ) -> torch.Tensor:
+        return _qc().dsv4_projection_gemv(x, weight, bf16_output)
+
+    @staticmethod
+    def dsv4_mhc_pre(
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        pre_eps: float,
+        sinkhorn_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _qc().dsv4_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+
+    @staticmethod
+    def dsv4_mhc_fused_post_pre(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        pre_eps: float,
+        sinkhorn_eps: float,
+        post_multiplier: float,
+        sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return _qc().dsv4_mhc_fused_post_pre(
+            x,
+            residual,
+            post_mix,
+            comb_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
+        )
+
+    @staticmethod
+    def dsv4_mhc_post(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+    ) -> torch.Tensor:
+        return _qc().dsv4_mhc_post(x, residual, post_mix, comb_mix)
+
+    @staticmethod
+    def dsv4_hc_head(
+        residual: torch.Tensor,
+        fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        rms_eps: float,
+        hc_eps: float,
+    ) -> torch.Tensor:
+        return _qc().dsv4_hc_head(
+            residual, fn, hc_scale, hc_base, rms_eps, hc_eps
+        )
 
     # ------------------------------------------------------------------
     # Sparse MLA decode (the AITER `mla_decode_fwd` counterpart on sm80)
@@ -200,6 +321,51 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_decode_fp8_sparse_dsv4(
+        q: torch.Tensor,
+        main_cache: torch.Tensor,
+        main_block_table: torch.Tensor,
+        main_indices: torch.Tensor,
+        main_topk_length: torch.Tensor,
+        main_indices_are_slots: bool,
+        extra_cache: torch.Tensor,
+        extra_block_table: torch.Tensor,
+        extra_indices: torch.Tensor,
+        extra_topk_length: torch.Tensor,
+        extra_indices_are_slots: bool,
+        sink: torch.Tensor | None,
+        main_block_size: int,
+        extra_block_size: int,
+        sm_scale: float,
+        partition_size: int = 0,
+    ) -> torch.Tensor:
+        """DeepSeek-V4 native sparse MLA over packed fp8_ds_mla pages.
+
+        Each cache token is read in-place from the 584-byte DSV4 layout
+        (576B data + 8B UE8M0 scales). The two sources are merged by the
+        QuixiCore online-softmax reducer, so SWA and compressed sparse cache
+        can be combined without materializing a bf16 KV workspace.
+        """
+        return _qc().mla_decode_fp8_sparse_dsv4(
+            q,
+            main_cache,
+            main_block_table,
+            main_indices,
+            main_topk_length,
+            main_indices_are_slots,
+            extra_cache,
+            extra_block_table,
+            extra_indices,
+            extra_topk_length,
+            extra_indices_are_slots,
+            sink,
+            main_block_size,
+            extra_block_size,
+            sm_scale,
+            partition_size,
+        )
+
+    @staticmethod
     def mla_decode_fp8_sparse_glm_splitq(
         q_nope: torch.Tensor,
         q_pe: torch.Tensor,
@@ -249,6 +415,18 @@ class quixicore_ops:
         `indices` is [rows, topk] int32; returns [rows] int32.
         """
         return _qc().sparse_topk_tlen(indices)
+
+    @staticmethod
+    def fill_short_context_topk_indices(
+        output: torch.Tensor,
+        positions: torch.Tensor,
+        topk: int,
+        compress_ratio: int,
+    ) -> None:
+        """Select every compressed candidate, padding each row with ``-1``."""
+        _qc().fill_short_context_topk_indices(
+            output, positions, topk, compress_ratio
+        )
 
     @staticmethod
     def mla_decode_fp8_sparse_glm(
@@ -1100,10 +1278,8 @@ class quixicore_ops:
         _qc().v2_flatten_sampled(flat_sampled, sampled, num_sampled, cu_num_logits)
 
     # ------------------------------------------------------------------
-    # Stubs: kernels QuixiCore-CUDA does not implement yet.
-    # Each delegates to the in-tree pure-torch reference so the path works
-    # (slowly) on sm80 today and can be swapped for the native kernel
-    # without touching callers.
+    # Prefill still has a reference fallback. Decode uses the native Ampere
+    # paged scorer below; its fallback is only for extension compatibility.
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1144,15 +1320,22 @@ class quixicore_ops:
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
         max_model_len: int,
+        token_shard_rank: int = 0,
+        token_shard_world_size: int = 1,
+        trivial_topk: int = 0,
     ) -> torch.Tensor:
-        """DSA indexer decode logits over the paged fp8 K cache.
-
-        TODO(quixicore-cuda): native sm80 kernel. Until then: pure-torch
-        reference.
-        """
+        """DSA indexer decode logits over the paged fp8 K cache on sm80."""
         if hasattr(_qc(), "fp8_paged_mqa_logits"):
             return _qc().fp8_paged_mqa_logits(
-                q, kv_cache, weights, context_lens, block_tables, max_model_len
+                q,
+                kv_cache,
+                weights,
+                context_lens,
+                block_tables,
+                max_model_len,
+                token_shard_rank,
+                token_shard_world_size,
+                trivial_topk,
             )
         from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
             fp8_paged_mqa_logits_torch,
@@ -1161,6 +1344,31 @@ class quixicore_ops:
         return fp8_paged_mqa_logits_torch(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
+
+    @staticmethod
+    def indexer_pack_tp_candidates(
+        logits: torch.Tensor,
+        indices: torch.Tensor,
+        token_shard_rank: int,
+        token_shard_world_size: int,
+    ) -> torch.Tensor:
+        return _qc().indexer_pack_tp_candidates(
+            logits, indices, token_shard_rank, token_shard_world_size
+        )
+
+    @staticmethod
+    def indexer_unpack_tp_scores(
+        packed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _qc().indexer_unpack_tp_scores(packed)
+
+    @staticmethod
+    def indexer_resolve_tp_candidates(
+        packed: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        _qc().indexer_resolve_tp_candidates(packed, positions, output)
 
     # ------------------------------------------------------------------
     # ROCm sparse-MLA indexer index arithmetic (no CUDA counterpart)

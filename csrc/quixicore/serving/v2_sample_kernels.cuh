@@ -189,7 +189,13 @@ __device__ __forceinline__ int warp_bfly_sum_i32(int v) {
 // lowest index. Order-independent, so any tree works.
 template <typename VT>
 __device__ __forceinline__ void argmax_combine(VT& v, int& i, VT ov, int oi) {
-    if (!(v > ov || (v == ov && i < oi))) { v = ov; i = oi; }
+    // Positive form so a NaN candidate never replaces the current best. The
+    // old negated form (!(v > ov || ...)) let NaN logits take over the
+    // reduction; combined with masked -inf tail lanes the block argmax then
+    // returned an out-of-vocab index (observed as token 129280 == vocab_size,
+    // which poisoned last_sampled_tokens/input_ids and crashed the DSV4 hash
+    // router). NaN rows now degrade like all--inf rows instead.
+    if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
 }
 
 template <typename VT>
@@ -257,12 +263,15 @@ __global__ void v2_gumbel_sample_k(
     }
 
     VT best = VT(V2S_NEG_INF);
-    int best_g = 0x7fffffff;
+    int best_g = block_idx * 1024;  // never a sentinel: all--inf/NaN rows resolve to the block base
     const T* row = logits + token_idx * logits_stride;
     for (int j = tid; j < 1024; j += blockDim.x) {
         const int g = block_idx * 1024 + j;
         const bool in_range = g < V;
         float v = in_range ? to_f32(row[g]) : V2S_NEG_INF;
+        // NaN logits sanitize to -inf so they can never win the argmax and
+        // out-of-range lanes are never candidates (see argmax_combine).
+        if (v != v) v = V2S_NEG_INF;
         if (APPLY_TEMP && temp != 0.0f) v = tt_div(v, temp);
         if (HAS_PROCESSED && in_range && is_valid_req)
             processed_logits[req_state_idx * pl_stride + col * V + g] = v;
@@ -275,7 +284,7 @@ __global__ void v2_gumbel_sample_k(
                 noise = VT(tt_gumbel32(uint64_t(gumbel_seed), uint64_t(uint32_t(g))));
             vv = in_range ? vv + noise : VT(V2S_NEG_INF);
         }
-        argmax_combine(best, best_g, vv, g);
+        if (in_range) argmax_combine(best, best_g, vv, g);
     }
     warp_bfly_argmax(best, best_g);
 
@@ -748,7 +757,7 @@ __global__ void v2_resample_k(
         (!is_bonus && !HAS_DRAFT) ? int64_t(draft_sampled[rtok + 1]) : 0;
 
     VT best = VT(V2S_NEG_INF);
-    int best_g = 0x7fffffff;
+    int best_g = block_idx * 1024;  // never a sentinel: all--inf/NaN rows resolve to the block base
     for (int j = threadIdx.x; j < 1024; j += 32) {
         const int g = block_idx * 1024 + j;
         const bool in_range = g < V;
@@ -964,7 +973,10 @@ __device__ __forceinline__ void v2_block_max_sumexp_8192(
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const int j = base + rep * 512 + t * 4 + k;
-            m = fmaxf(m, j < V ? row[j] : V2S_NEG_INF);
+            // NaN sanitizes to -inf (fmaxf already suppresses NaN for the max,
+            // but the sumexp accumulation below must not see NaN either).
+            float x = j < V ? row[j] : V2S_NEG_INF;
+            m = fmaxf(m, x != x ? V2S_NEG_INF : x);
         }
     const float gmax = block128_max(m);
     float acc = 0.0f;
@@ -973,7 +985,8 @@ __device__ __forceinline__ void v2_block_max_sumexp_8192(
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
             const int j = base + rep * 512 + t * 4 + k;
-            const float x = j < V ? row[j] : V2S_NEG_INF;
+            float x = j < V ? row[j] : V2S_NEG_INF;
+            if (x != x) x = V2S_NEG_INF;
             acc += tt_exp(x - gmax);
         }
     const float total = block128_triton_sum(acc);
@@ -987,10 +1000,16 @@ __device__ __forceinline__ void v2_block_argmax_8192(
         VT& out_val, int& out_idx) {
     const int t = threadIdx.x;
     VT best = VT(V2S_NEG_INF);
-    int best_j = 0x7fffffff;
+    int best_j = base;  // never a sentinel: all--inf/NaN rows resolve to the block base
     for (int j = base + t; j < base + 8192; j += blockDim.x) {
-        const VT v = VT(j < V ? row[j] : V2S_NEG_INF);
-        argmax_combine(best, best_j, v, j);
+        // Only in-vocab lanes are candidates (an out-of-vocab index must never
+        // win the reduction), and NaN sanitizes to -inf so a NaN row degrades
+        // to the lowest in-vocab index instead of an out-of-vocab token id.
+        if (j < V) {
+            float x = row[j];
+            const VT v = VT(x != x ? V2S_NEG_INF : x);
+            argmax_combine(best, best_j, v, j);
+        }
     }
     warp_bfly_argmax(best, best_j);
     __shared__ VT s_v[32];
@@ -1086,7 +1105,7 @@ __global__ void v2_insert_resampled_k(
     if (temp == 0.0f && !is_bonus) return;
 
     VT best = VT(V2S_NEG_INF);
-    int best_i = 0x7fffffff;
+    int best_i = 0;  // never a sentinel: all--inf/NaN local maxima resolve to block 0
     for (int b = lane; b < resample_num_blocks; b += 32) {
         const VT v = rl_max[int64_t(req_idx) * rlm_stride + b];
         argmax_combine(best, best_i, v, b);

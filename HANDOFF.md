@@ -1,581 +1,303 @@
-# Kimi K3 GGUF on MI300X — handoff
+# DeepSeek V4 0731 A100 Handoff
 
-<!-- markdownlint-disable MD013 -->
+Updated: 2026-08-09 19:10 UTC
 
-Updated: 2026-08-06 UTC
+## Read First
 
-## Resume here
+Work in `/home/ubuntu/SlimServe`. Read these before changing code or interpreting
+performance:
 
-Kimi K3 serves correctly on this box. **TP8 now beats TP6 at c8.** The
-regression was the IQ2_XXS `w13` vector kernel expanding every route over the
-full 6144 output rows even though expert parallelism makes 7/8 of the routes
-non-local. The working-tree change adds an EP-aware, token-major kernel that
-loops over the 16 routes inside each workgroup.
+- `AGENTS.md`
+- `perf/perf.md`
+- `perf/baseline_status.md`
+- `perf/optimization_status.md` (see the "A100 TP2 Lifecycle Crash Root Cause"
+  entry for the full debugging record of the crash below)
+- `slimserve/profiles.json`, especially the dsv4-{hybrid,mxfp4}-{2,4,8} family
+- `perf/dsv4_a100_kernel_history.md` for the longer TP2/TP4 kernel and
+  ownership history (moved from the old root `handoff.md`; its serving
+  tok/s numbers predate the sampler fix and are obsolete)
 
-### Verified state
+The worktree is intentionally very dirty and contains user and prior-agent work.
+Do not reset, clean, checkout, or overwrite it. SlimServe downloads missing model
+artifacts itself. Use the real profile, not an invented vLLM command.
 
-Measured at 1k in / 2k out, `--ignore-eos`, each run gated on the model
-answering a known question first. Both coherence-checked 3/3 on arithmetic,
-geography and general knowledge.
+## Objective
 
-| profile | topology | c1 tok/s | c8 tok/s | TPOT c1 / c8 |
-| --- | --- | --- | --- | --- |
-| `k3-6` | TP6, tensor-parallel MoE | **34.0** | 120.4 | 28.74 / 62.85 ms |
-| `k3-8` before fix | TP8, expert-parallel MoE | 31.1 | 94.8 | 31.45 / 80.98 ms |
-| `k3-8` now | TP8, EP token-major `w13` | not rerun | **124.6** | not rerun / **60.78 ms** |
+Finish the native DeepSeek V4 Flash 0731 Ampere A100 path, including DSpark,
+TurboQuant, APC, long-context capacity, and TP2/TP4 performance. The routed MoE
+production path must remain fused native IQ2_XXS gate/up + SwiGLU + Q2_K down +
+weighted reduce. No dequant production fallback.
 
-`k3-8` is now the fastest measured c8 profile: 3.5% more throughput and 3.3%
-lower TPOT than TP6. Its c1 result has not been rerun on this build, so retain
-the TP6 c1 number for latency comparisons. For reference, at the start of this
-work TP6 managed 6.30 tok/s single stream and crashed outright at concurrency 8.
+## Status: TP2 lifecycle crash SOLVED (2026-08-09 evening)
 
-### How to run anything
+The "illegal CUDA memory access after ~7 decode tokens" that blocked TP2 is
+fixed. The earlier aux-stream ownership theory was WRONG; serializing streams
+only appeared to help because it changed allocator layout. Real chain:
+
+1. A NaN target-logits row reached the rejection sampler.
+2. `argmax_combine` in `csrc/quixicore/serving/v2_sample_kernels.cuh` used a
+   negated comparison that let NaN replace the running best; the masked -inf
+   tail lanes of the last vocab block then won with the lowest masked index,
+   emitting token id 129280 == vocab_size as a "sampled" token.
+3. 129280 entered `last_sampled_tokens`, was combined into `input_ids[0]`
+   every step (self-sustaining poisoning; drafts degenerated, all rejected).
+4. `dsv4_router::bf16_hash_router` dereferenced `tid2eid[129280*6]` (table,
+   embedding, and lm head all have exactly 129280 rows) → garbage expert →
+   wild weight-row read → MMU FAULT_PDE. Fault-vs-silent depended on what the
+   allocator placed after the 2 MiB gate weight, hence the illusion that
+   stream serialization "fixed" it. Serialized runs were silently
+   quality-poisoned instead (all drafts rejected ≈ no spec gain).
+
+Fixes, all retained and offline-verified
+(`repro_rejection_oov.py` in the session scratchpad; NaN/-inf/garbage rows now
+sample token 0, never an out-of-vocab id):
+
+- `csrc/quixicore/serving/v2_sample_kernels.cuh`: positive-form
+  `argmax_combine`, NaN-sanitized loads, in-vocab-only candidates, and
+  sentinel-free reduction inits (`best_* = 0x7fffffff` could leak as a token
+  id / wild index when every candidate was skipped). Ported to
+  `/home/ubuntu/QuixiCore/QuixiCore-CUDA/kernels/serving/v2_sample_kernels.cuh`
+  (the ROCm build includes the same header, nothing separate to port).
+- Same NaN sanitize in the Triton fallbacks
+  (`vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py`).
+- `csrc/quixicore/serving/dsv4_router_ampere.cuh`: `bf16_hash_router` bounds-
+  guards token ids (OOB → treated as padding) and records the first offender
+  in a device slot readable via `quixicore_ops.dsv4_hash_router_debug()`
+  (readout gated by `VLLM_DSV4_HASH_ROUTER_DEBUG=1` in the V2 runner).
+- Rebuild: `cmake --build build/temp.linux-x86_64-cpython-312 --target
+  _quixicore_C -j$(nproc)` then copy the `.so` into `vllm/`.
+
+## Requalified numbers (clean server v33, full overlap, no debug env)
+
+Canonical exact harness, TP2, `dsv4-2`, 19 GiB KV, PIECEWISE graphs, DSpark on:
+
+| Run | tok/s | exact |
+| --- | ---: | --- |
+| 1K/2K run 1 | 168.0 | yes |
+| 1K/2K run 2 | 168.7 | yes |
+| 12K cold | 89.0 | yes |
+| 12K hot | 93.3 | yes |
+| 128K cold | 37.1 | yes |
+| 128K hot | 38.2 | yes |
+| post-128K 1K/2K continuation | 111.8 | yes |
+
+Whole sequence ran against one server without restart (full lifecycle incl.
+APC reuse). The post-128K continuation at 111.8 vs fresh-server 168 is noted
+in `perf/baseline_status.md` as unexplained (suspect KV pool occupancy).
+
+Previous "best" numbers (82.4 no-aux, 106.7 inner-serial) were poisoned runs
+and are obsolete. Mean spec acceptance length is now ~3.5-3.7 (was ~1 while
+poisoned). Raw JSONs: `perf/results/2026-08-09/dsv4-a100-tp2-kv-capacity/
+control/clean-v33-*.json` (plus `sentinelfix-v32-*`, probe-era logs, and GPU
+coredumps under `../coredumps/`).
+
+The attention inner-overlap diagnostic switches
+(`VLLM_DSV4_OVERLAP_INDEXER`, `VLLM_DSV4_OVERLAP_MLA_COMPRESSOR`,
+`VLLM_DSV4_OVERLAP_INDEXER_INNER`, plus the pre-existing
+`VLLM_DSV4_INNER_ATTENTION_OVERLAP` and `VLLM_DSV4_AUX_STREAMS`) remain,
+default-on/no behavior change. The `VLLM_DSV4_MLA_DEBUG_SYNC` /
+`VLLM_DSV4_ATTENTION_DEBUG_SYNC` host-sync diagnostics were removed.
+
+## Quant strategy and profiles (2026-08-09 late)
+
+Per user direction: A100 serves the **Q4K-tail hybrid** (Q4_K experts on
+layers 37-42, IQ2_XXS/Q2_K elsewhere, 90.9 GiB); IQ2_XXS is the MacBook
+quant. Profile changes (see `perf/optimization_status.md` for measurements):
+
+- `dsv4-2` / `dsv4-4`: default quant now `Q4K-tail`. `registry.py` supports
+  per-quant `quant_overrides`; the qualified 19 GiB TP2 KV budget stays with
+  IQ2_XXS, hybrid runs a provisional 14 GiB (needs the 128K lifecycle
+  qualification pass).
+- New `dsv4-4-mxfp4` (MXFP4 on 4 GPUs) and `dsv4-8` (MXFP4-only TP8;
+  TP4xDP2 is the alternative to benchmark).
+- Hybrid baselines (exact): TP2 168.5 c1 / 185.5 c8; TP4 174.2 c1 /
+  150.7 @12K / 416.4 c8. Hybrid TP4/TP2 scaling: 1.03x batch-1, 1.69x @12K,
+  2.24x @c8.
+- A100 MXFP4 experts had no fused path (32 tok/s TP4 c1). New fused decode
+  kernels in `csrc/quixicore/quant/dsv4_mxfp4_moe_ampere.cuh` + op
+  `ggml_dsv4_moe_a8_mxfp4` (correctness-tested in
+  `tests/kernels/test_dsv4_mxfp4_moe.py`) lift `dsv4-4-mxfp4` to
+  111.3 tok/s c1 (3.4x) and 75.0 @12K (2.6x); c8 stays at 27.1 because
+  verify batches wider than 8 tokens still take the generic MMQ route -
+  widening the fused path / MXFP4 MMQ tiles is the next kernel task, then
+  `dsv4-8` TP8 vs TP4xDP2.
+
+## 2026-08-10 completion pass
+
+Everything from the quant-strategy discussion is implemented, tested, and
+profiled (`perf/optimization_status.md` 2026-08-10 entry, baselines promoted
+in `perf/baseline_status.md`):
+
+- Hybrid TP2 KV budget qualified at **13 GiB** through the full 128K
+  lifecycle (14 GiB crashed at 128K cold prefill; profile + tests updated).
+- MXFP4 fused route widened to verify batches
+  (`VLLM_GGUF_DSV4_MXFP4_ROWS`, default 64): c8 27.1 -> 98.6 agg, c1/12K
+  unchanged. Remaining MXFP4 gap vs hybrid is prefill (generic MMQ tiles).
+- `dsv4-8` finalized as **TP8**: 167.6 c1 / 117.4 @12K / 148.2 c8 agg =
+  1.50-1.58x over `dsv4-4-mxfp4` (meets the >=1.5x gate). TP4xDP2 fails to
+  initialize: DSV4's router `is_padding` mask is not DP-padding aware
+  (`csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu:782`); DP
+  enablement is an open item and its c8 comparison is unmeasured until then.
+
+## 2026-08-10 DP enablement + throughput matrix
+
+- DSV4 DP-padding FIXED: `_get_padding_mask` in both fused-topk router
+  modules now hands out the mask only at exact width match (DP's naive
+  dispatch all-gathers hidden+logits across ranks; the local mask cannot
+  describe the gathered batch). TP4xDP2 boots and serves exact.
+- Full {mxfp4, hybrid} x {TP4, TP2xDP2, TP8, TP4xDP2, TP2xDP4} matrix
+  measured (table in `perf/optimization_status.md`). Winners encoded in
+  profiles via `quant_overrides`:
+  - 8-GPU total throughput: **hybrid TP4xDP2, 567.9 tok/s c8 agg**
+    (`dsv4-8 --quant Q4K-tail`).
+  - Single stream: **hybrid TP8, 329.5 tok/s c1** — despite losing the
+    fused IQ2 path at per-rank intermediate=256; extending the fused
+    kernels to 256 would lift TP8 further (open kernel item).
+  - MXFP4 stays TP8 on `dsv4-8`; `dsv4-4` stays TP4.
+  - mxfp4 TP2-shards don't fit 80 GB; hybrid TP2xDP4 fails engine init
+    (illegal access in the DP4 dummy run, distinct from the fixed bug) and
+    is marked illegal pending investigation.
+- Follow-ups queued: dsv4-2 with FULL_DECODE_ONLY graphs (+12% c1
+  suspected), TP2xDP4 init crash, MXFP4 prefill tiles.
+
+## 2026-08-10 late: fused-256, concurrency curves, hot methodology
+
+- Fused IQ2 at the TP8 shard (intermediate=256) is DONE: the silent
+  512-instantiation fallback in `launch_q2_k_down_sum_repacked_topk` was
+  the crash; explicit 256 branch + idle-lane guard added, CA-owned
+  pending-down pinned to 512/1024. Harness accepts c{1,2,4,8}.
+- MEASUREMENT RULE (learned the hard way): report APC-hot steady state
+  (second of two identical runs); cold-vs-hot differs by >2x and KV-pool
+  size changes (e.g. capture 64) masquerade as kernel regressions by
+  evicting APC.
+- Hot steady state (hybrid): TP4 519 c4 / 417 c8; TP8 680 c4 / 205 c8;
+  TP4xDP2 282 c4 / **926 c8** (best on the box).
+- CLIFF FIXED (user-prompted): the per-engine c8 collapse was 48-token
+  verify batches running eager past capture 32. `dsv4-8` a100 now ships
+  `max_cudagraph_capture_size: 64` (list gains 40/48/56/64): hybrid TP8
+  hot c8 205 -> 465 (2.3x), mxfp4 TP8 148 -> 275 (1.9x), TP4xDP2 holds
+  ~858-926, c4 unchanged. Residual TP8-vs-DP2 gap = the >=256 routed-row
+  wide-layout switch (288 rows at c8) + DP2's doubled aggregate KV; a c6
+  probe isolates the former if TP8 is to challenge 926.
+
+## Open items
+
+1. **NaN origin (open bug):** one v31-era run showed an entirely-NaN logits
+   tensor at the first post-prefill verify. Current evidence says NaNs were
+   downstream of the token-129280 poisoning (OOB embedding-row read produces
+   garbage activations), and clean v32/v33 runs show zero NaN/OOV incidents —
+   but the v31 warmup all-NaN is not fully explained. If quality issues or
+   token-0 samples appear, re-run with `VLLM_DSV4_HASH_ROUTER_DEBUG=1` and a
+   logits NaN probe in `RejectionSampler.__call__`.
+2. **CPU APC offload:** unchanged from before — do not enable
+   `kv_offloading_size` yet (implementation was removed in `81e7c5927`);
+   restore only the needed pieces after the GPU baseline is promoted.
+3. **MXFP4 prefill tiles: DONE 2026-08-10.** `moe_mxfp4_mmq_v2`
+   (csrc/quixicore/quant/dsv4_mxfp4_mmq_ampere.cuh, int8 mma.sync 128x64
+   tiles via the mmq_v2 machinery, env VLLM_GGUF_MXFP4_MMQ_V2 default on,
+   alignment block for type 39 widened to 64): kernel 8.8-57x vs dp4a;
+   e2e mxfp4-4 12K 76.6->110.6/115.8, c8 ~110->208/200; mxfp4-8 12K
+   117->161/163, c8 275->302/328, all exact. Also fixed a latent moe_q
+   bug (activation-scale gather only correct when mmq_x == nwarps).
+   Remaining levers recorded in the notebook: cp.async + SoA repack,
+   decode-gate crossover sweep. (Fused SwiGLU epilogue and permuted
+   segments: DONE, see item 7.) QuixiCore-CUDA port DONE: commit
+   ef725219, kernels/quant/mxfp4_moe_ampere.cuh + standalone harness
+   (fused decode + mma tile + segmented pipeline, all PASS on A100).
+4. **TP2 post-128K dip** (168 -> 94.5 after a 1M-scale context): TP2-only —
+   TP4/TP8 hold their fresh-server band post-128K, supporting KV-pool
+   occupancy as the cause. Diagnose via KV-pool state, not kernels.
+5. **DP prefix-affinity routing:** DP round-robin defeats APC for repeated
+   long prefixes at low concurrency (hybrid-8 128K cold 3.0 tok/s c1).
+   Only matters if c1 long-context on the throughput tier ever matters.
+6. **dsv4-hybrid-2 FULL_DECODE_ONLY graphs:** suspected +12% c1; unmeasured.
+7. **QuixiCore-XPU code-review ideas: IMPLEMENTED 2026-08-10.**
+   - Segmented MoE + fused SwiGLU+Q8_1 epilogue: DONE
+     (dsv4_mxfp4_seg_ampere.cuh, op ggml_dsv4_moe_a8_mxfp4_seg, env
+     VLLM_GGUF_DSV4_MXFP4_SEG default on, J16 threshold env
+     VLLM_GGUF_DSV4_SEG_J16_ROWS=1536). Cold-c8: mxfp4-4 +33%, mxfp4-8
+     +18%; decode stages par; capture-safe static grids, deterministic
+     reduce. Notebook has the full entry.
+   - NaN-guard audit: DONE -- six paged_attn_v2 reducer guard sites
+     upgraded to `!(mp > NEG_INF)` (NaN partial degrades to empty).
+   - Still open (smaller): apply the same seg design to the IQ2/Q2_K
+     hybrid moe_q tiles; test-discipline ports (oracle-from-stored-codes,
+     memcmp cache contracts, bit-equal RoPE tails, worst_excess<=0).
+   - Cross-platform contract watch (XPU-side bugs, do not port): XPU
+     mqa_logits folds kv_scale inside the relu (our indexer_paged_logits
+     placement is authoritative); XPU turboquant v2 rotated-key centroids
+     look sigma-mismatched (our k8v4 unaffected); XPU all_reduce
+     >=-acceptance rendezvous breaks at uint32 generation wrap (our !=
+     design is immune).
+
+## Canonical reproducer / harness
 
 ```bash
-source /home/hotaisle/SlimServe/.venv/bin/activate   # never system python/pip
+PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-2 \
+  --serve --host 127.0.0.1 --port 8012 -y
+
+PYTHONPATH=. .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
+  --model /home/ubuntu/models/antirez-deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --served-model-name DeepSeek-V4-Flash \
+  --source /home/ubuntu/ds4/tests/long_context_story_prompt.txt \
+  --url http://127.0.0.1:8012/v1/completions \
+  --concurrency 1 --input-tokens 1000 --output-tokens 2000 \
+  --warmup-output-tokens 8 --timeout 900
 ```
 
-Serving and one-shot chat:
-
-```bash
-slimserve k3-8                 # interactive
-slimserve k3-8 --serve         # OpenAI endpoint
-slimserve k3-8 -p "2 + 2?"     # one shot
-slimserve --list               # legal profiles
-```
-
-Benchmarks and the coherence check live in the session scratchpad
-(`/tmp/claude-1000/.../scratchpad/`), not in the repo:
-
-- `bench_k3.py <profile>` — throughput sweep. `CONC=1,8` picks concurrencies;
-  `BACKEND=HIP_MLA` forces an attention backend. **It refuses to report numbers
-  until the model answers a known question**, which is the single most important
-  guard here — see below.
-- `coherence.py` — three known-answer questions against a profile.
-  `PROFILE=` and `BACKEND=` env overrides.
-
-### The rule that matters most
-
-**`--ignore-eos` throughput cannot detect a broken model.** It generates a fixed
-token count whatever the content, so a model emitting `!!!!!!!!` benchmarks at
-full speed. This cost two iterations of reported "gains" on a broken build
-before it was caught. The harness now gates on a correct answer; keep that gate,
-and never report a number from a run that skipped it.
-
-## Why TP8 used to lose to TP6 — attributed
-
-Matched 120-second `rocprofv3` traces of rank 0 account for 17.90 ms of the
-18.13 ms c8 TPOT gap (62.85 → 80.98 ms). The residual is 0.23 ms, well within
-run noise. The profiled runs themselves were slower, so use the original
-coherence-gated numbers above for throughput and the matched traces only for
-kernel attribution.
-
-### What is measured
-
-| component | cost per decode step | how |
-| --- | --- | --- |
-| TP8 IQ2_XXS `w13` MoE vec | 37.87 ms | rank-0 kernel trace, 92 calls/step |
-| TP6 IQ2_XXS `w13` MoE vec | 16.66 ms | matched trace, 92 calls/step |
-| TP8 Q2_K `w2` MoE vec | 6.48 ms | rank-0 kernel trace, 92 calls/step |
-| TP6 Q2_K `w2` MoE vec | 9.79 ms | matched trace, 92 calls/step |
-| EP8 collectives | 10.08 ms | 8-GPU torchrun, 93 layers |
-| TP6 collectives | 10.63 ms | same |
-| **net traced MoE penalty** | **17.90 ms** | vs **18.13 ms** end to end |
-
-### The governing fact
-
-`moe_vec_q` launches one output-row workgroup for every `(token, route)` pair.
-For eight tokens and top-k 16, TP8 launches 6144 × 128 = 786,432 workgroups per
-MoE layer. Only about 1/8 of routes are local, so 688,128 workgroups read a `-1`
-expert id, write zero, and return. TP6 tensor-shards `w13` to 1024 rows and all
-routes are valid, so it launches only 1024 × 128 = 131,072 useful workgroups.
-
-This geometry makes TP8 `w13` 230.59 µs/call slower: 21.21 ms over 92 MoE
-layers. TP8's `w2` is 35.99 µs/call faster, recovering 3.31 ms. The net 17.90
-ms is the regression. This is not an extra-launch or collective problem: the
-MoE call counts match; it is excessive work inside the same `w13` calls.
-
-The fix plan is `docs/tp8-performance-plan.md`. Keep `w2` on its current path;
-it already wins on TP8. Change only the EP `w13` geometry: launch over tokens,
-loop over top-k routes inside each workgroup, and skip non-local experts. The
-new kernel writes zeros for skipped routes without launching a separate
-workgroup for every route and output row.
-
-That fix is implemented in the current working tree. At the exact live shape,
-the route-major op took 406.89 µs and the token-major op 112.23 µs (3.63×), with
-bit-identical output. The unchanged end-to-end harness passed its Paris gate and
-measured 124.62 tok/s / 60.78 ms TPOT at c8, up from 94.8 / 80.98. The separate
-three-question evaluation passed 3/3 (`4`, `Paris`, `The Pacific Ocean`).
-
-### Dead ends — do not retry
-
-Each was tested end to end with a number:
-
-| idea | result |
-| --- | --- |
-| Hand-written HIP peer-to-peer all-to-all | EP8 collectives 10.08 ms vs TP6 10.63 ms — not the differentiator |
-| `use_sequence_parallel_moe` at dp1 (drop the `dp > 1` gate) | TPOT 31.45 → 82.15 ms at c1. The gate is doing real work |
-| `VLLM_GGUF_MOE_VEC_W2=0` (force MMQ tile for w2) | 31.14 → 28.88 tok/s at c1. The ROCm 128-row default is correct |
-| Repack `w2` transposed for a finer MoE split | 384 vs 512 units/rank is 3–7%. Not worth a requantization |
-| Pad intermediate 3072 → 4096 for tensor-parallel MoE at TP8 | Per-rank work becomes 512, identical to TP6, and work is not what costs |
-| Vectorized (`dwordx4`) loads in the MLA kernel | Both layouts move 18 cache lines/row; instruction count is not the limit |
-
-### Working profiler recipe
-
-The original registration failure came from mixing PyTorch's bundled,
-unversioned rocprofiler SDK/register libraries with the system ROCm 7.2.4
-profiler. The working setup is:
-
-1. Build two empty shared-library shims whose SONAMEs are the unversioned names
-   PyTorch requests and whose `NEEDED` entries point to the system
-   `librocprofiler-sdk.so.1` and `librocprofiler-register.so.0`.
-2. Preload the register shim before the SDK shim, set `ROCP_TOOL_ATTACH=1`, and
-   start the benchmark normally. This loads
-   `/opt/rocm/lib/librocprofiler-sdk-attach.so` before HSA initialization.
-3. With Yama `ptrace_scope=1`, have each worker call
-   `prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY)` at startup. A temporary
-   `sitecustomize.py` on `PYTHONPATH` is sufficient.
-4. After CUDA/HIP initialization, identify rank 0 and attach:
-
-   ```bash
-   rocprofv3 --attach <rank-0-pid> --attach-duration-msec 120000 \
-     --kernel-trace --output-format csv --output-directory <trace-dir>
-   ```
-
-Attaching before `torch.cuda.init()` returned no trace; direct launch reproduced
-the registration error. The successful TP8 trace has 7,096,093 dispatches over
-120.111 seconds; the matched TP6 trace has 7,963,792 over 119.285 seconds.
-Synthetic MoE microbenchmarks remain unsuitable because random routing changes
-which experts' weights are touched.
-
-## What changed in this work
-
-Uncommitted current working tree:
-
-- Attribute the entire TP8 regression with matched rank-0 kernel traces.
-- Add the EP token-major IQ2_XXS `w13` kernel and route only EP `w13` calls to it.
-- Add a mixed local/non-local expert correctness test to the existing GGUF
-  vector test file.
-- Validate 3/3 coherence and c8 at 124.62 tok/s / 60.78 ms TPOT.
-
-Validation run:
-
-- Focused EP kernel test: 1 passed.
-- `tests/model_executor/test_kimi_k3_ep.py`: 11 passed.
-- Selected pre-commit hooks: all passed, including Ruff, mypy, clang-format,
-  markdownlint, SPDX, and configuration checks.
-- The full `test_gguf_vec_writes_all_outputs.py` run was 8 passed / 7 failed in
-  its older dequant-reference cases. Those cases feed arbitrary bytes to quant
-  formats and produce pathological scales; the new EP test passes. Do not claim
-  the whole file is green.
-
-Committed, newest first:
-
-- `9d70023` phase 0 needs a profiler, not microbenchmarks
-- `a70bf06` a measured plan for making TP8 beat TP6 → `docs/tp8-performance-plan.md`
-- `e9fba4a` K3 decode is latency-bound, so more GPUs cannot shorten a step
-- `da84a78` the TP8 padding fix would buy nothing
-- `edef4b9` **k3-8 means TP8** (was DP4×TP2; that profile is dropped)
-- `ffb2e82` **TP8 works, with the experts kept whole** (expert parallelism)
-- `298acb4` prove the TP8 MoE break; fix a test that could not fail
-- `3fce38c` withdraw the TP8 profile (later restored correctly)
-- `bd3967b` **drop the GGUF output pre-fill from the decode matmul** (~20%/call)
-- `911d145` **MLA: 4 KV tokens per iteration, and a measured split count**
-- `839f10f` **a HIP MLA decode kernel** — head count as a grid dimension
-- `fd760db` let a backend decline a head count instead of asserting
-- `98adf79` cap `max_num_seqs` to the KDA state slots
-- `9474c1c` **delete `enforce_eager`** from the fork entirely
-- `d9fd45a` stop serving K3 eager
-
-### The HIP MLA decode kernel
-
-`csrc/quixicore/rocm/mla_decode_kernels.cuh` + `csrc/quixicore/tm_rocm/qc_rocm_mla.cu`,
-exposed as `HIP_MLA` in `vllm/v1/attention/backends/mla/hip_mla.py`, first in
-ROCm's MLA priority list.
-
-Why it exists: AITER's gfx942 MLA decode ships as pre-assembled code objects
-with the query head count baked in, so only multiples and divisors of 16 run.
-TP8 gives 12 heads per rank. This kernel takes the head count as a grid
-dimension, so any TP size that divides K3's 96 heads works.
-
-Performance: **parity with AITER's hand-written assembly** at 16 heads per rank
-(32.46 vs 32.81/33.27 tok/s at c1, 90.67 vs 91.70/91.81 at c4) — it ties where
-AITER works and runs the shapes AITER cannot. Validated against a float64
-reference at 12/16/48 heads, shuffled block tables, split-K, and the 960-token
-page K3's hybrid cache uses (`tests/kernels/test_mla_decode_gfx942.py`).
-
-Design notes worth keeping: no MFMA (at 12 heads it is ~23 FLOP/byte against a
-~246 balance point, and the 16-wide tile is what makes head counts rigid); no
-branch on the nope/rope split (k_pe is rotated at insert, so the score runs over
-all 576 lanes and the accumulate stops at 512); `max_seq_len` comes from the
-metadata builder, never `seq_lens.max()`, which would sync the decode path and
-break graph capture.
-
-## Environment traps
-
-These each cost real time. All are load-bearing.
-
-**Header edits do not trigger a rebuild.** The ROCm build tracks no header
-dependencies. Editing only a `.cuh` leaves ninja with "no work to do" and the
-build still exits 0, shipping the previous binary. `touch`ing the `.cu` is *not*
-enough — it recompiles against the stale hipified header in the build tree.
-Delete both, rebuild, and grep the regenerated header for a token unique to your
-edit:
-
-```bash
-cd build/temp.linux-x86_64-cpython-312
-rm -f CMakeFiles/_quixicore_C.dir/csrc/quixicore/tm_rocm/qc_rocm_mla.hip.o \
-      csrc/quixicore/rocm/mla_decode_kernels.cuh
-ninja _quixicore_C
-grep -c <your-token> csrc/quixicore/rocm/mla_decode_kernels.cuh
-```
-
-**Install a rebuilt `.so` with `mv`, not `cp`**, when a server may have it
-mapped — `cp` writes in place and can crash the running process.
-
-**Eager microbenchmarks lie about launch-bound kernels.** The serving path is
-`cudagraph_mode: FULL_DECODE_ONLY`, so measure inside a `torch.cuda.CUDAGraph`.
-K3's KDA kernels measured 78 µs eager and 4.1 µs in-graph — a 19× error that
-pointed at the wrong target. If eager and in-graph differ wildly, the kernel is
-launch-bound and its eager number is meaningless.
-
-**Never `pkill -f <pattern>` or kill the output of a bare `pgrep -f`.** Each
-Bash tool call runs in a wrapper shell whose command line contains the command
-text, so the pattern matches the caller and kills it (exit 144). The same breaks
-wait-loops: `while pgrep -f "bench_x.py"` never exits because the heredoc that
-created the script is still on the spawning wrapper's command line. Collect PIDs,
-verify none is a `shell-snapshots/snapshot-bash-*.sh` wrapper, then kill by PID.
-
-**Killing a benchmark driver does not free the GPUs.** `slimserve.server.Server`
-spawns `vllm serve` as a child that survives, holding all eight cards at 97%, so
-the next run dies with "Free memory on device cuda:N (0.79/191.98 GiB)". After
-stopping a run, check `rocm-smi --showmemuse` and kill surviving `api_server` /
-`VLLM::*` PIDs explicitly.
-
-**Auditing kernel output coverage.** To prove a kernel writes its whole output
-(the prerequisite for deleting a defensive `fill_`), recompile that entry
-point's fill as `quiet_NaN()` and look for survivors. Two weaker versions both
-returned false "clean" results and shipped a broken model: testing entry point A
-while B's zero-fill was still compiled in (the fill zeroed the buffer, so the
-result measured the fill); and poisoning a tensor, freeing it, and hoping the
-caching allocator returned the same block. Also use **zeroed weights** — random
-bytes decode to NaN K-quant scales and produce NaN *outputs* indistinguishable
-from unwritten memory.
-
-## Why TP8 needs expert parallelism
-
-`k3-8` sets `enable_expert_parallel`. This is not optional and not a leftover.
-
-Tensor-sharding the MoE splits each expert's `w2` along its **packed byte**
-axis. Traced from a live TP8 load (`VLLM_TRACE_MOE_SHARD` in
-`_gguf_moe_weight_loader`), expert 0:
-
-```text
-w1  src=(896, 3072, 924)   dst=(896, 768, 924)
-w2  src=(896, 3584, 1008)  dst=(896, 3584, 126)
-w3  src=(896, 3072, 924)   dst=(896, 768, 924)
-```
-
-`_materialize_gguf_moe_param` divides that byte axis by `tp_size`: 1008 / 8 =
-126, against a Q2_K `type_size` of 84 — **1.5 blocks**, so every rank starts
-decoding mid-block and the model emits `!!!!!!!!`. TP2/4/6 give 6/3/2 whole
-blocks, which is why only TP8 broke. `w1`/`w3` split dim 1 in *elements* and
-leave their byte axis whole, so they are safe at any size.
-
-Beware: `create_weights` sets `input_dim: 1` on w2, which describes the logical
-layout, not the packed one. Reading that attribute alone suggests the split is
-safe. It is not — trace it.
-
-Expert parallelism sidesteps this entirely: each rank holds 112 of the 896
-experts whole, so no quant block is ever cut.
-
-## TP6 baseline status
-
-**Working end to end.** SlimServe loads the 858 GB
-`Kimi-K3-IQ2_XXS-Q2_K.gguf` with the BF16 vision projector on six MI300X
-GPUs, profiles the model, allocates the hybrid cache, renders K3's native XTML
-chat format, and generates coherent text and vision responses.
-
-The final TP6 validation completed with exit code 0. Greedy outputs included:
-
-```text
-2 + 2       -> 4
-capital of France -> Paris.
-```
-
-The raw offline output includes K3's `<think>` and `<response>` XTML framing;
-the semantic corruption seen earlier is gone.
-
-A sequential three-user-turn multimodal validation also completed with all five
-requested images, preserved assistant history, and exit code 0. The model
-correctly identified both landscapes, the weathered bench scene, the family of
-five, and three people running.
-
-The numbers in this section predate the MMQ expert-id fix, so they describe a
-TP6 whose prefill was dropping every expert above 255. See the re-run recorded
-under "A second, independent defect" above for current behaviour.
-
-The source changes and this handoff are published together for human review.
-
-## Tested invocation
-
-The fork's global cache default is FP8 for GLM, so K3 must explicitly request
-the native cache dtype with `kv_cache_dtype="auto"`. `HSA_XNACK=1` is also
-required for this load.
-
-```bash
-cd /home/hotaisle/SlimServe
-HSA_XNACK=1 \
-VLLM_USE_V1=1 \
-VLLM_ROCM_USE_AITER=1 \
-VLLM_GGUF_MMPROJ=/home/hotaisle/models/antirez-kimi-k3-gguf/mmproj-BF16.gguf \
-ROCR_VISIBLE_DEVICES=0,1,2,3,4,5 \
-.venv/bin/python -u -c '
-from vllm import LLM, SamplingParams
-
-model = "/home/hotaisle/models/antirez-kimi-k3-gguf/Kimi-K3-IQ2_XXS-Q2_K.gguf"
-llm = LLM(
-    model=model,
-    tensor_parallel_size=6,
-    max_model_len=4096,
-    max_num_batched_tokens=4096,
-    gpu_memory_utilization=0.95,
-    block_size=64,
-    compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
-    mm_encoder_tp_mode="data",
-    kv_cache_dtype="auto",
-)
-conversations = [
-    [{"role": "user", "content": "What is 2 + 2? Reply with only the answer."}],
-    [{"role": "user", "content": "What is the capital of France? Reply briefly."}],
-]
-outputs = llm.chat(
-    conversations,
-    sampling_params=SamplingParams(max_tokens=64, temperature=0),
-)
-for output in outputs:
-    print(output.outputs[0].text)
-'
-```
-
-Observed final-run facts:
-
-- weight load: about 156–160 seconds per rank;
-- model memory: 142.23 GiB per rank;
-- native/BF16 hybrid cache: 12.48 GiB;
-- cache capacity: 258,560 tokens;
-- reported concurrency: 63.12 requests at 4,096 tokens;
-- two prompts: about 18 input tokens/s and 10–11 output tokens/s combined;
-- process exit: 0 (with the existing shared-memory shutdown warning).
-
-## Three-turn, five-image validation
-
-The five source images were downloaded and decoded with PIL before the model
-run:
-
-1. `https://huggingface.co/datasets/patrickvonplaten/random_img/resolve/main/yosemite.png`
-2. `https://picsum.photos/seed/picsum/200/300`
-3. `https://picsum.photos/id/32/512/512`
-4. `https://www.wolframcloud.com/obj/resourcesystem/images/a0e/a0ee3983-46c6-4c92-b85d-059044639928/6af8cfb971db031b.png`
-5. `https://s3.amazonaws.com/cms.ipressroom.com/338/files/201808/5b894ee1a138352221103195_A680%7Ejogging-edit/A680%7Ejogging-edit_hero.jpg`
-
-Their visual-token counts were 1,820, 88, 361, 1,386, and 375 (4,030 total),
-so this test used `max_model_len=8192` with
-`max_num_batched_tokens=4096`. It made three sequential greedy `LLM.chat`
-calls with `chat_template_content_format="openai"` and `thinking=False`,
-appending each generated assistant reply before the next user message:
-
-- turn 1: images 1–2, compare the landscapes;
-- turn 2: images 3–4, describe the subjects and identify the family;
-- turn 3: image 5, count and describe the people and recall the family image.
-
-Observed results:
-
-- Turn 1: 2,000 prompt tokens, 74 output tokens, `stop`; Yosemite river valley
-  versus snowy mountain.
-- Turn 2: 3,898 prompt tokens, 45 output tokens, `stop`; weathered wall/bench
-  and a family of five in the second new image.
-- Turn 3: 4,391 prompt tokens, 39 output tokens, `stop`; three people running
-  and correct recall of the preceding turn's family image.
-
-The corrected run took about 14.2, 9.8, and 9.7 seconds for the three requests
-after model initialization. It used the MIOpen vision patch-embedding fallback
-and completed without a vision-kernel failure.
-
-## TP6 and AITER's custom all-reduce
-
-At world size 6, AITER's custom all-reduce reproducibly illegal-addresses on a
-`[5, 7168]` BF16 collective. The communicator change disables only that AITER
-collective for world size 6; the working run uses the normal vLLM/PyNCCL path
-while retaining AITER MLA and MoE kernels.
-
-## Root semantic defects
-
-### 1. The chunk KDA prefill kernel is wrong on gfx942
-
-The AMD chunked KDA path produced numerically unrelated results on MI300X:
-
-```text
-chunk vs direct recurrence: corr 0.1567
-chunk max output:           0.04736
-reference max output:       0.0008507
-```
-
-The generic fused recurrent KDA kernel agrees with a direct mathematical
-recurrence:
-
-```text
-output max error: 9.31e-10
-state max error:  1.19e-7
-correlation:      1.0
-```
-
-On ROCm gfx942, prefill now materializes K3's gate and beta and uses the
-verified recurrent kernel. Other platforms retain the chunk path. The generic
-kernel's state-index stride was also fixed so one expanded cache index can be
-reused across every token in a packed prompt. Packed decode separately matches
-the direct recurrence exactly for output and within `2.98e-8` for state.
-
-### 2. Latent MoE normalized TP partials before reducing them
-
-Each TP rank computes a partial 3,584-wide routed-expert result. The old runner
-applied K3's RMSNorm and latent up-projection to each partial, then all-reduced
-the full-width outputs. The released reference first sums the latent partials
-and only then normalizes. RMSNorm is nonlinear, so these are not equivalent.
-
-`KimiRoutedOutputTransform` now marks that it requires a reduced input, and the
-MoE runner reduces routed and shared partials before applying that transform.
-A focused six-part oracle has `new_max_error = 0.0`; the former order differs
-from the reference by `4.118` on the same test values.
-
-### 3. vLLM rejected K3's native chat renderer
-
-K3 renders XTML inside `TikTokenTokenizer.apply_chat_template`; it does not
-ship a Jinja template. vLLM rejected chat before calling the override. The
-GGUF tokenizer now exposes a non-empty sentinel template so resolution reaches
-the native renderer. Its 102-token test prompt matches the released tokenizer
-exactly.
-
-### 4. The mmproj Q/K rows were in llama.cpp's split 2D-RoPE layout
-
-The first real-image run was mechanically stable but described every photo as
-a repeated floral strip. Image preprocessing was bit-identical to the released
-K3 processor, and the patch embedding and projector tensors were bit-identical
-to safetensors. The fused `v.blk.N.attn_qkv.weight` tensors isolated the fault:
-llama.cpp had permuted Q and K from K3's native interleaved 2D-RoPE order into
-its split `[x | y]` order, while the loader treated them as pure renames.
-
-The adapter now restores native interleaved Q/K rows while leaving V unchanged.
-All 27 corrected fused QKV tensors are bit-identical to the released K3
-safetensors; block 0's pre-fix maximum error was `2.34375`, and its post-fix
-error is `0.0`. The full three-turn image run above then produced the expected
-semantics.
-
-### 5. The GGUF MoE kernel was handed AITER's residency mask under EP
-
-`RoutedExperts.expert_map` returns AITER's 0/1 `expert_mask` instead of the
-global-to-local map whenever AITER's fused MoE is enabled. The GGUF kernel
-indexes its local expert stack with that tensor, so under EP every routed token
-went to local expert 0 or 1. `global_to_local_expert_map` now returns the real
-map unconditionally. See "The bug that caused the incoherence" above for the
-oracle numbers.
-
-### 6. The MMQ tile kernel refused expert ids above 255
-
-Inherited from upstream's GGUF MoE kernel. Kimi has 896 experts, so 71% of them
-were silently zeroed in every prefill-width MoE call that saw global ids -- the
-TP6 configuration. See "A second, independent defect" above.
-
-## Other required working-tree fixes
-
-- `vllm/models/kimi_k3/common/mm_preprocess.py`: build preprocessing from the
-  mmproj instead of decoding the 858 GB text GGUF as JSON.
-- `vllm/model_executor/model_loader/gguf_adapters/kimi_k3.py`: map all text and
-  vision weights, restore native vision Q/K row order, and derive unquantized
-  fused attention parents.
-- `vllm/model_executor/models/registry.py`: register
-  `KimiLinearForCausalLM`.
-- `vllm/model_executor/layers/mla.py`: carry and apply K3's MLA output gate.
-- `vllm/model_executor/layers/vocab_parallel_embedding.py`: pad the
-  163,840-token vocabulary to a size divisible by TP6.
-- `vllm/models/kimi_k3/amd/linear.py`: use GGUF methods for quantized latent
-  projections and declare the nonlinear pre-reduction requirement.
-- `vllm/models/kimi_k3/amd/model.py`: keep the BF16 vision tower/projector
-  outside GGUF text quantization.
-- `vllm/model_executor/layers/quantization/gguf/fused_moe.py`: pass K3's SITU
-  beta 4.0 and linear beta 25.0 into GGUF MoE activation.
-- `vllm/v1/attention/backends/gdn_attn.py`: resolve the generic GDN prefill
-  backend without importing a removed Qwen module.
-- `vllm/distributed/device_communicators/cuda_communicator.py`: avoid the
-  broken AITER custom all-reduce at world size 6.
-- `vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py`: use the
-  verified recurrent KDA prefill on gfx942.
-- `vllm/third_party/flash_linear_attention/ops/fused_recurrent.py`: honor the
-  token stride in continuous-batching state-index maps.
-- `vllm/model_executor/layers/fused_moe/runner/moe_runner.py`: reduce latent-MoE
-  partials before nonlinear output transforms.
-- `vllm/transformers_utils/gguf_kimi_k3.py`: allow vLLM chat resolution to
-  invoke K3's native XTML renderer.
-
-## Verified model data
-
-- All operative GGUF config fields and both layer lists match the released
-  `config.json`: 93 layers, 69 KDA + 24 MLA, 896 experts, top-16, 96 heads.
-- GGUF and released tokenizers produce identical IDs on text, code, CJK,
-  whitespace, emoji, special tokens, and the final native chat prompt.
-- All 2,736 text tensors map, including 276 expert stacks; all 168 mmproj
-  tensors map.
-- The fused image processor matches the released processor exactly on all five
-  validation images, including resized grids and every normalized pixel value.
-- All 27 vision QKV tensors match safetensors exactly after split-to-interleaved
-  row restoration.
-- Representative BF16/F32 attention and config tensors are bit-identical to
-  safetensors. Representative Q8 dequantized weights correlate above 0.999985.
-- SITU kernels agree with their high-precision oracle.
-- The attention-residual Triton kernel agrees with the PyTorch reference.
-- KDA gate preprocessing agrees with direct PyTorch (`1.83e-4` maximum gate
-  error on values with mean magnitude about 99.5; beta error `1.19e-7`).
-
-## Files and checkpoint facts
-
-```text
-/home/hotaisle/models/antirez-kimi-k3-gguf/
-  Kimi-K3-IQ2_XXS-Q2_K.gguf
-  mmproj-BF16.gguf
-  mmproj-F16.gguf
-  mmproj-F32.gguf
-
-/home/hotaisle/models/Kimi-K3/
-  config.json
-  tiktoken.model
-  model-00001-of-000096.safetensors ... model-00096-of-000096.safetensors
-```
-
-The served GGUF has the published erroneous `kimi-k3.vision = false` header
-byte patched to true. The file still omits K3 metadata for SITU beta, SITU
-linear beta, and attention-residual block size; the config parser warns and
-uses the released values. The BF16 mmproj is preferred because the source
-vision weights are BF16.
-
-## Remaining caveats
-
-- The run emits a pre-existing missing `lora_hf_hub_resolver` plugin error but
-  continues with the available plugins.
-- Shutdown warns about one leaked shared-memory object; the validated process
-  still exits 0.
-- The vision patch embedding falls back to MIOpen because this AITER build has
-  no Triton `conv2d`. The three-turn/five-image test completed on this fallback,
-  but upstream describes the MIOpen path as intermittently failing under load.
-- K3's GGUF-native chat output is XTML-framed in offline `LLM.chat`. Confirm the
-  desired reasoning/content parser settings when exposing the OpenAI endpoint.
-- Full mypy was not run. Final ruff/compile/diff checks are recorded at handoff
-  time after the last source change.
-- The MMQ expert-id fix lives in a `.cuh`, so a fresh clone must rebuild the
-  stable-ABI extension before it takes effect; a stale `_C_stable_libtorch`
-  silently reinstates the 255-expert ceiling.
-- Both fixes affect any GGUF MoE checkpoint with more than 256 experts, not
-  only Kimi K3. DeepSeek-V4 (256 experts) sits exactly at the old boundary and
-  was unaffected; GLM-5.2 has 160.
-- No duplicate-work/PR checks were run because no PR to upstream was proposed
-  or opened. A human must review every changed line and run the relevant tests
-  before submitting anything upstream.
+Add `--repeat-source` for input lengths beyond ~30K tokens.
+
+## Current Profile And Capacity
+
+Unchanged: `dsv4-2` resolves to the IQ2_XXS artifact on 2x A100 with
+`kv_cache_memory_bytes=20401094656` (19 GiB/worker), `max_model_len=1048576`,
+APC on, native `fp8_ds_mla` target KV, native TurboQuant `turboquant_k8v4`
+draft KV, DSpark k=5, PIECEWISE graphs (capture 32), async mHC. The planner
+reports 3,646,636 logical KV tokens (~3.48 full 1M contexts).
+
+No SlimServe server was left running; GPUs are idle.
+
+## 2026-08-10 final: profile structure settled
+
+DSV4 A100 profiles are now `dsv4-hybrid-2` (TP2, 13 GiB KV, 128K-qualified),
+`dsv4-hybrid-4` (TP4), `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8,
+capture 64). mxfp4-8 layout settled by hot pairs: TP8 (167.6 c1 / 275 c8)
+beats TP4xDP2 (111 c1 / 118-271 unstable). The hybrid TP4xDP2 box record
+(~858-926 tok/s hot c8) is intentionally unserved (quality-quant policy);
+resurrect via mxfp4-8 --quant Q4K-tail + tp4/dp2 if ever wanted. The wide-
+layout threshold was exonerated by a c6 probe; residual TP8-vs-DP2 hybrid
+gap is per-engine width economics + measurement variance (acceptance
+lengths swing 2.6-6.0 by text window). Old root `handoff.md` lives at
+`perf/dsv4_a100_kernel_history.md` (obsolete serving numbers, valid kernel
+history).
+
+## 2026-08-10 final profile set (user-confirmed)
+
+A100 dsv4 profiles: `dsv4-hybrid-2` (TP2, 13 GiB KV, 128K-qualified),
+`dsv4-hybrid-4` (TP4), `dsv4-hybrid-8` (TP4 x DP2, capture 64 -- throughput
+tier, accepted at 921.8 tok/s hot c8 on the named profile),
+`dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8, capture 64 -- quality/latency
+tier). All five run DSpark k=5 + TurboQuant draft KV + 1M max_model_len
+(test-enforced).
+
+## 2026-08-10: 128K lifecycle qualification — ALL FIVE PROFILES PASS
+
+Full single-lifecycle sequence (1K/2K x2, 12K cold/hot, 128K cold/hot,
+post-128K continuation; exact-token, c1, every stage `exact: true`, zero
+preemptions):
+
+| Stage (tok/s) | hybrid-4 | hybrid-8 | mxfp4-4 | mxfp4-8 |
+| --- | ---: | ---: | ---: | ---: |
+| 1K/2K r1 / r2 | 128.1 / 161.8 | 39.9 / 40.0 | 110.8 / 110.8 | 164.9 / 164.5 |
+| 12K cold / hot | 152.6 / 155.2 | 26.9 / 37.3 | 76.6 / 75.5 | 117.1 / 116.5 |
+| 128K cold / hot | 94.8 / 98.3 | 3.0 / 26.4 | 55.7 / 57.2 | 80.4 / 81.5 |
+| post-128K | 171.4 | 40.0 | 110.5 | 165.0 |
+
+hybrid-8's c1 numbers are the DP2 characteristic (~40 ceiling: one active
+replica + per-step DP coordination; 128K cold 3.0 = round-robin sending the
+timed request to the un-warmed replica → full prefill in the timed window).
+Its service point is c8 (921.8 hot). Post-128K dip is TP2-only. Details:
+`perf/baseline_status.md` (qualified table) and `perf/optimization_status.md`
+(2026-08-10 lifecycle entry). Raw:
+`perf/results/2026-08-10/dsv4-lifecycle-qual/`. GPUs left idle, no servers
+running.

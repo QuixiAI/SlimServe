@@ -23,6 +23,8 @@
 
 #pragma once
 
+#include <cstdlib>
+
 // llama.cpp's MMVQ_PARAMETERS_GCN row, the one gfx942 selects.
 static constexpr __host__ __device__ int mmvq_nwarps(int ncols_dst) {
   return ncols_dst <= 4 ? 2 : 1;
@@ -48,7 +50,8 @@ static constexpr __host__ __device__ int mmvq_rows_per_block(int ncols_dst,
 }
 
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst, bool small_k>
+          vec_dot_q_cuda_t vec_dot_q_cuda, int ncols_dst, bool small_k,
+          int rows_override = 0>
 static __global__ void mul_mat_vec_q(const void* __restrict__ vx,
                                      const void* __restrict__ vy,
                                      scalar_t* __restrict__ dst,
@@ -56,7 +59,9 @@ static __global__ void mul_mat_vec_q(const void* __restrict__ vx,
                                      const int nvecs) {
   constexpr int nwarps = mmvq_nwarps(ncols_dst);
   constexpr int rows_per_cuda_block =
-      mmvq_rows_per_block(ncols_dst, small_k, nwarps);
+      rows_override > 0
+          ? rows_override
+          : mmvq_rows_per_block(ncols_dst, small_k, nwarps);
 
   const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
   const int row0 = rows_per_cuda_block * blockIdx.x;
@@ -151,24 +156,57 @@ static bool mmvq_use_small_k(int ncols, int ncols_dst) {
   return nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 }
 
-#define VLLM_MMVQ_LAUNCH(NCOLS, SMALL_K, QK, QI, BLOCK_T, VDR, VECDOT)         \
+static int mmvq_ampere_decode_rows() {
+#ifdef USE_ROCM
+  return 1;
+#else
+  static const int rows = [] {
+    const char* value = std::getenv("VLLM_GGUF_MMVQ_DECODE_ROWS");
+    if (value == nullptr) return 2;
+    const int requested = std::atoi(value);
+    return requested >= 4 ? 4 : requested >= 2 ? 2 : 1;
+  }();
+  return rows;
+#endif
+}
+
+#define VLLM_MMVQ_LAUNCH_ROWS(                                                 \
+    NCOLS, SMALL_K, ROWS, QK, QI, BLOCK_T, VDR, VECDOT)                        \
   do {                                                                         \
     constexpr int nw = mmvq_nwarps(NCOLS);                                     \
-    constexpr int rpb = mmvq_rows_per_block(NCOLS, SMALL_K, nw);               \
+    constexpr int rpb_default =                                                \
+        mmvq_rows_per_block(NCOLS, SMALL_K, nw);                                \
+    constexpr int rpb = (ROWS) > 0 ? (ROWS) : rpb_default;                     \
     const dim3 block_nums((nrows + rpb - 1) / rpb,                             \
                           (nvecs + (NCOLS) - 1) / (NCOLS), 1);                 \
-    const dim3 block_dims(WARP_SIZE, nw, 1);                              \
-    mul_mat_vec_q<scalar_t, QK, QI, BLOCK_T, VDR, VECDOT, NCOLS, SMALL_K>      \
+    const dim3 block_dims(WARP_SIZE, nw, 1);                                    \
+    mul_mat_vec_q<scalar_t, QK, QI, BLOCK_T, VDR, VECDOT, NCOLS, SMALL_K,      \
+                  ROWS>                                                        \
         <<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, ncols, nrows,     \
                                                 nvecs);                        \
   } while (0)
+
+#define VLLM_MMVQ_LAUNCH(NCOLS, SMALL_K, QK, QI, BLOCK_T, VDR, VECDOT)         \
+  VLLM_MMVQ_LAUNCH_ROWS(                                                       \
+      NCOLS, SMALL_K, 0, QK, QI, BLOCK_T, VDR, VECDOT)
 
 #define VLLM_MMVQ_LAUNCH_SK(NCOLS, QK, QI, BLOCK_T, VDR, VECDOT)               \
   do {                                                                         \
     if ((NCOLS) == 1 && mmvq_use_small_k<QK, QI, VDR>(ncols, NCOLS)) {         \
       VLLM_MMVQ_LAUNCH(NCOLS, true, QK, QI, BLOCK_T, VDR, VECDOT);             \
     } else {                                                                   \
-      VLLM_MMVQ_LAUNCH(NCOLS, false, QK, QI, BLOCK_T, VDR, VECDOT);            \
+      const int decode_rows = mmvq_ampere_decode_rows();                       \
+      /* DSV4 decode emits thousands of one-row CTAs. Compile measured row   */ \
+      /* tiles independently from the ROCm/GLM batch geometry. */              \
+      if (decode_rows == 4) {                                                  \
+        VLLM_MMVQ_LAUNCH_ROWS(                                                 \
+            NCOLS, false, 4, QK, QI, BLOCK_T, VDR, VECDOT);                    \
+      } else if (decode_rows == 2) {                                           \
+        VLLM_MMVQ_LAUNCH_ROWS(                                                 \
+            NCOLS, false, 2, QK, QI, BLOCK_T, VDR, VECDOT);                    \
+      } else {                                                                 \
+        VLLM_MMVQ_LAUNCH(NCOLS, false, QK, QI, BLOCK_T, VDR, VECDOT);          \
+      }                                                                        \
     }                                                                          \
   } while (0)
 

@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
@@ -27,6 +28,7 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_q_kv_rmsnorm,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
@@ -38,7 +40,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -48,6 +50,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
+from vllm.quixicore import quixicore_ops
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
@@ -66,6 +69,27 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+_DSV4_INNER_ATTENTION_OVERLAP = os.getenv(
+    "VLLM_DSV4_INNER_ATTENTION_OVERLAP", "1"
+).lower() not in {"0", "false", "off", "no"}
+# Diagnostic sub-switches for bisecting the inner-overlap side streams. Each
+# gates one side-stream path independently; all are AND'ed with the master
+# _DSV4_INNER_ATTENTION_OVERLAP switch. A disabled path still runs — serially
+# on the current stream.
+#   OVERLAP_INDEXER: full indexer on aux_stream_list[0] in attention_impl.
+#   OVERLAP_MLA_COMPRESSOR: MLA C128 compressor on aux_stream_list[1] (or [0]
+#     in the compressor-only branch).
+#   OVERLAP_INDEXER_INNER: indexer's nested compressor on aux_stream_list[2].
+_DSV4_OVERLAP_INDEXER = os.getenv(
+    "VLLM_DSV4_OVERLAP_INDEXER", "1"
+).lower() not in {"0", "false", "off", "no"}
+_DSV4_OVERLAP_MLA_COMPRESSOR = os.getenv(
+    "VLLM_DSV4_OVERLAP_MLA_COMPRESSOR", "1"
+).lower() not in {"0", "false", "off", "no"}
+_DSV4_OVERLAP_INDEXER_INNER = os.getenv(
+    "VLLM_DSV4_OVERLAP_INDEXER_INNER", "1"
+).lower() not in {"0", "false", "off", "no"}
 
 
 @triton.jit
@@ -101,6 +125,15 @@ def _resolve_dsv4_kv_cache_dtype(
     token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.
     """
     if use_fp8_ds_mla_layout:
+        if kv_cache_dtype.startswith("turboquant_"):
+            # The Ampere draft path has a model-specific 512-wide TQ store and
+            # decode implementation. Other platforms retain their established
+            # DSV4 cache path until their native codec is wired independently.
+            if current_platform.is_cuda() and current_platform.is_device_capability(
+                (8, 0)
+            ):
+                return kv_cache_dtype, torch.uint8
+            return kv_cache_dtype, torch.bfloat16
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
         assert kv_cache_dtype.startswith("fp8"), (
             f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
@@ -295,6 +328,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
+        projection_mode = os.getenv("VLLM_DSV4_PROJECTION_GEMV", "all").lower()
+        self._use_ampere_projection_gemv = (
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and projection_mode not in {"0", "false", "off", "no"}
+        )
+        self._use_ampere_compressor_gemv = (
+            self._use_ampere_projection_gemv and projection_mode != "index"
+        )
         # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
         # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
         # before post-GEMM starts.
@@ -320,6 +362,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
         )
+        self._tq_impl = None
+        if (
+            self.kv_cache_dtype.startswith("turboquant_")
+            and self.kv_cache_torch_dtype == torch.uint8
+        ):
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantAttentionImpl,
+            )
+
+            self._tq_impl = TurboQuantAttentionImpl(
+                num_heads=self.n_local_heads,
+                head_size=self.head_dim,
+                scale=self.scale,
+                num_kv_heads=1,
+                sliding_window=self.window_size,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            transform_capacity = max(
+                self.max_num_batched_tokens,
+                vllm_config.compilation_config.max_cudagraph_capture_size or 0,
+            )
+            self.register_buffer(
+                "_tq_transform_slots",
+                torch.arange(
+                    transform_capacity,
+                    dtype=torch.int64,
+                    device=current_platform.device_type,
+                ),
+                persistent=False,
+            )
 
         # Register with compilation context for metadata lookup.
         compilation_config = vllm_config.compilation_config
@@ -348,6 +420,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
@@ -362,7 +435,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # graph; the metadata-dependent rest (q up-proj + kv-insert, indexer,
         # compressor, MLA attention) runs in the eager break.
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
+            self.attn_gemm_parallel_execute(hidden_states, prequant_input)
         )
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
@@ -391,7 +464,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
 
-    def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
+    def attn_gemm_parallel_execute(
+        self,
+        hidden_states: torch.Tensor,
+        prequant_input: torch.Tensor | None = None,
+    ) -> tuple[Any, ...]:
+        ownership_enabled = os.getenv("VLLM_DSV4_TP_OWNERSHIP", "0").lower() in {
+            "1",
+            "true",
+            "on",
+            "yes",
+        }
+        if (
+            ownership_enabled
+            and hidden_states.shape
+            == (1, 4096 // get_tensor_model_parallel_world_size())
+            and prequant_input is not None
+        ):
+            communicator = get_tp_group().device_communicator
+            ca_comm = (
+                getattr(communicator, "ca_comm", None)
+                if communicator is not None
+                else None
+            )
+            aligned_q8 = getattr(self.fused_wqa_wkv, "_dsv4_q8_aligned", None)
+            if ca_comm is None or aligned_q8 is None:
+                raise RuntimeError(
+                    "DSV4 TP ownership requires native attention projections"
+                )
+            compressor_weight = (
+                self.compressor.fused_wkv_wgate.weight
+                if self.compressor is not None
+                else None
+            )
+            indexer_weight = (
+                self.indexer.weights_proj.weight if self.indexer is not None else None
+            )
+            indexer_compressor_weight = (
+                self.indexer.compressor.fused_wkv_wgate.weight
+                if self.indexer is not None
+                else None
+            )
+            qr_kv, kv_score, indexer_weights, indexer_kv_score = (
+                ca_comm.dsv4_owned_attention_projections(
+                    hidden_states,
+                    prequant_input,
+                    aligned_q8,
+                    compressor_weight,
+                    indexer_weight,
+                    indexer_compressor_weight,
+                )
+            )
+            return (
+                qr_kv,
+                kv_score if self.compressor is not None else None,
+                indexer_kv_score if self.indexer is not None else None,
+                indexer_weights if self.indexer is not None else None,
+            )
+
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
             assert len(aux_streams) >= 3
@@ -402,7 +532,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
-
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type for mypy.
             compressor = self.compressor
@@ -412,9 +541,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     return torch.mm(
                         hidden_states, compressor.fused_wkv_wgate.weight.T
                     ).float()
+                weight = compressor.fused_wkv_wgate.weight
+                if (
+                    self._use_ampere_compressor_gemv
+                    and hidden_states.shape[0] <= 4
+                    and hidden_states.dtype == torch.bfloat16
+                    and weight.dtype == torch.bfloat16
+                ):
+                    return torch.ops.vllm.dsv4_ampere_projection_gemv(
+                        hidden_states, weight, False
+                    )
                 return torch.mm(
                     hidden_states,
-                    compressor.fused_wkv_wgate.weight.T,
+                    weight.T,
                     out_dtype=torch.float32,
                 )
 
@@ -424,9 +563,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             indexer = self.indexer
 
             def indexer_weights_proj() -> torch.Tensor:
-                # ReplicatedLinear returns (output, bias); bias is None.
-                weights, _ = indexer.weights_proj(hidden_states)
-                return weights
+                weight = indexer.weights_proj.weight
+                if (
+                    self._use_ampere_projection_gemv
+                    and hidden_states.shape[0] <= 8
+                    and hidden_states.dtype == torch.bfloat16
+                    and weight.dtype == torch.bfloat16
+                ):
+                    return torch.ops.vllm.dsv4_ampere_projection_gemv(
+                        hidden_states, weight, True
+                    )
+                result = indexer.weights_proj(hidden_states)
+                return result if isinstance(result, torch.Tensor) else result[0]
 
             def indexer_compressor_kv_score() -> torch.Tensor:
                 if current_platform.is_metal():
@@ -434,9 +582,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         hidden_states,
                         indexer.compressor.fused_wkv_wgate.weight.T,
                     ).float()
+                weight = indexer.compressor.fused_wkv_wgate.weight
+                if (
+                    self._use_ampere_compressor_gemv
+                    and hidden_states.shape[0] <= 8
+                    and hidden_states.dtype == torch.bfloat16
+                    and weight.dtype == torch.bfloat16
+                ):
+                    return torch.ops.vllm.dsv4_ampere_projection_gemv(
+                        hidden_states, weight, False
+                    )
                 return torch.mm(
                     hidden_states,
-                    indexer.compressor.fused_wkv_wgate.weight.T,
+                    weight.T,
                     out_dtype=torch.float32,
                 )
 
@@ -445,6 +603,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         def fused_wqa_wkv() -> torch.Tensor:
             # MergedColumnParallelLinear returns (output, bias); bias is None.
+            quant_method = getattr(self.fused_wqa_wkv, "quant_method", None)
+            apply_prequant = getattr(quant_method, "apply_prequant", None)
+            if prequant_input is not None and apply_prequant is not None:
+                return apply_prequant(self.fused_wqa_wkv, hidden_states, prequant_input)
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
@@ -454,8 +616,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+            # A PIECEWISE eager break follows this projection group. Ending a
+            # graph segment with work launched on auxiliary streams is illegal
+            # even though the default stream waits on their events. Capture the
+            # projections serially; eager execution keeps the normal overlap.
+            and not torch.cuda.is_current_stream_capturing(),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -495,28 +661,48 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
+            def indexer_fn() -> torch.Tensor:
+                return indexer(
+                    hidden_states,
+                    qr,
+                    indexer_kv_score,
+                    indexer_weights,
+                    positions,
+                    self.indexer_rotary_emb,
+                )
+
+            def compressor_fn() -> None:
+                compressor(kv_score, positions, self.rotary_emb)
+
+            overlap_ok = aux_streams is not None and _DSV4_INNER_ATTENTION_OVERLAP
+            idx_par = overlap_ok and _DSV4_OVERLAP_INDEXER
+            comp_par = overlap_ok and _DSV4_OVERLAP_MLA_COMPRESSOR
             q, _ = execute_in_parallel(
                 wq_b_kv_insert,
                 [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
-                    ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    indexer_fn if idx_par else None,
+                    compressor_fn if comp_par else None,
                 ],
                 self.ln_events[0],
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=idx_par or comp_par,
             )
+            # Paths excluded from the parallel group run serially on the
+            # current stream, after the join so cache writes still precede
+            # forward_mqa / downstream consumers.
+            if not idx_par:
+                indexer_fn()
+            if not comp_par:
+                compressor_fn()
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
+                self.aux_stream_list[0]
+                if self.aux_stream_list is not None
+                and _DSV4_INNER_ATTENTION_OVERLAP
+                and _DSV4_OVERLAP_MLA_COMPRESSOR
+                else None
             )
             compressor = self.compressor
 
@@ -537,9 +723,31 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
-        # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
-        self.forward_mqa(q, kv, positions, out)
+        if self._tq_impl is not None:
+            if not isinstance(attn_metadata, dict):
+                # Profile/dummy run without attention metadata (e.g. the
+                # drafter's dummy propose during memory profiling under FULL
+                # cudagraph modes). There is no cache to read or write; zero
+                # the pre-allocated output so downstream sees finite values,
+                # mirroring the profile-run fallback in
+                # _fused_qnorm_rope_kv_insert.
+                out.zero_()
+                return
+            tq_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+            assert tq_metadata is not None
+            self._tq_impl.forward(
+                self,
+                q,
+                kv,
+                kv,
+                self.swa_cache_layer.kv_cache,
+                tq_metadata,
+                output=out,
+            )
+        else:
+            # MLA attention writes into the pre-allocated `out` buffer
+            # ([num_tokens, padded_heads, head_dim]).
+            self.forward_mqa(q, kv, positions, out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -573,6 +781,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         assert positions.dtype == torch.int64
         cos_sin_cache = self.rotary_emb.cos_sin_cache
         cache_dtype = swa_kv_cache.dtype
+
+        if self._tq_impl is not None:
+            # Reuse the fused BF16 full-row kernel as an in-place Q-norm/RoPE
+            # and KV-RoPE transform. A block size of one plus contiguous slots
+            # makes each KV row alias its own input row; the KV warp reads the
+            # full row before publishing the transformed values.
+            num_tokens = q.shape[0]
+            transform_slots = self._tq_transform_slots[:num_tokens]
+            torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
+                q,
+                kv,
+                kv.view(num_tokens, 1, self.head_dim),
+                transform_slots,
+                positions,
+                cos_sin_cache,
+                self.eps,
+                1,
+            )
+            self._tq_impl.do_kv_cache_update(
+                self,
+                kv,
+                kv,
+                swa_kv_cache,
+                swa_metadata.slot_mapping,
+            )
+            return q
 
         # kv is unchanged; attention reads kv solely via swa_kv_cache.
         if cache_dtype == torch.uint8:
@@ -716,7 +950,21 @@ class DeepseekV4Indexer(nn.Module):
         self.quant_config = quant_config
         # self.indexer_cfg = config.attn_module_list_cfg[0]["attn_index"]
         self.topk_tokens = config.index_topk
-        self.n_head = config.index_n_heads  # 64
+        self.n_head = config.index_n_heads  # 64, global head count
+        tp_size = get_tensor_model_parallel_world_size()
+        head_sharding_enabled = os.getenv(
+            "VLLM_DSV4_HEAD_SHARDED_INDEXER", "0"
+        ).lower() in {"1", "true", "on", "yes"}
+        self.tp_head_sharded = (
+            head_sharding_enabled
+            and current_platform.is_cuda()
+            and not current_platform.has_device_capability(90)
+            and tp_size > 1
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        self.local_n_head = (
+            self.n_head // tp_size if self.tp_head_sharded else self.n_head
+        )
         self.head_dim = config.index_head_dim  # 128
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
@@ -727,15 +975,15 @@ class DeepseekV4Indexer(nn.Module):
             "MXFP4" if self.use_fp4_kv else "FP8",
         )
 
-        # no tensor parallel, just replicated
-        self.wq_b = ReplicatedLinear(
+        linear_cls = ColumnParallelLinear if self.tp_head_sharded else ReplicatedLinear
+        self.wq_b = linear_cls(
             self.q_lora_rank,
             self.head_dim * self.n_head,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.weights_proj = ReplicatedLinear(
+        self.weights_proj = linear_cls(
             hidden_size,
             self.n_head,
             bias=False,
@@ -797,6 +1045,7 @@ class DeepseekV4Indexer(nn.Module):
             self.topk_indices_buffer,
             skip_k_cache_insert=True,
             use_fp4_cache=self.use_fp4_kv,
+            tp_head_sharded=self.tp_head_sharded,
         )
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
@@ -831,7 +1080,14 @@ class DeepseekV4Indexer(nn.Module):
                     + indexer_metadata.num_prefill_tokens
                 )
                 if num_tokens > 0:
-                    if current_platform.is_metal():
+                    if quixicore_ops.has("fill_short_context_topk_indices"):
+                        quixicore_ops.fill_short_context_topk_indices(
+                            self.topk_indices_buffer,
+                            positions[:num_tokens],
+                            self.topk_tokens,
+                            self.compress_ratio,
+                        )
+                    elif current_platform.is_metal():
                         offsets = torch.arange(
                             self.topk_tokens,
                             device=positions.device,
@@ -859,9 +1115,9 @@ class DeepseekV4Indexer(nn.Module):
                 return self.topk_indices_buffer
 
         def wq_b_and_q_quant():
-            # ReplicatedLinear returns (output, bias); bias is None.
+            # Both linear variants return (output, bias); bias is None.
             q, _ = self.wq_b(qr)
-            q = q.view(-1, self.n_head, self.head_dim)
+            q = q.view(-1, self.local_n_head, self.head_dim)
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
@@ -879,6 +1135,13 @@ class DeepseekV4Indexer(nn.Module):
             lambda: compressor(compressed_kv_score, positions, rotary_emb),
             self.ln_events[0],
             self.ln_events[1],
-            self.aux_stream,
+            self.aux_stream
+            if _DSV4_INNER_ATTENTION_OVERLAP and _DSV4_OVERLAP_INDEXER_INNER
+            else None,
         )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        return self.indexer_op(
+            hidden_states,
+            q_quant,
+            k,
+            weights,
+        )

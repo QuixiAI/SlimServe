@@ -1569,6 +1569,7 @@ def group_and_unify_kv_cache_specs(
     grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
         dict
     )
+    auxiliary_specs: dict[str, KVCacheSpec] = {}
     # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
     # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
     # be fragile with only block_size and sliding_window as keys, but fine for now.
@@ -1577,6 +1578,8 @@ def group_and_unify_kv_cache_specs(
             grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
+        else:
+            auxiliary_specs[name] = spec
 
     assert len(mla_specs) > 0
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
@@ -1588,7 +1591,14 @@ def group_and_unify_kv_cache_specs(
         assert uniform_spec is not None
         swa_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    auxiliary_uniform_specs: list[UniformTypeKVCacheSpecs] = []
+    if auxiliary_specs:
+        auxiliary_uniform_spec = UniformTypeKVCacheSpecs.from_specs(auxiliary_specs)
+        if auxiliary_uniform_spec is None:
+            return None
+        auxiliary_uniform_specs.append(auxiliary_uniform_spec)
+
+    return [mla_uniform_spec, *swa_uniform_specs, *auxiliary_uniform_specs]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1666,7 +1676,15 @@ def _get_kv_cache_groups_uniform_groups(
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
-    swa_mla_specs = grouped_specs[1:]
+    swa_mla_specs = [
+        spec
+        for spec in grouped_specs[1:]
+        if all(
+            isinstance(layer_spec, SlidingWindowMLASpec)
+            for layer_spec in spec.kv_cache_specs.values()
+        )
+    ]
+    auxiliary_specs = [spec for spec in grouped_specs[1:] if spec not in swa_mla_specs]
     assert all(
         isinstance(spec, SlidingWindowMLASpec)
         for group in swa_mla_specs
@@ -1682,10 +1700,24 @@ def _get_kv_cache_groups_uniform_groups(
 
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             layers_per_size[layer_spec.page_size_bytes].append(layer_name)
-        # NOTE(yifan): for now, inside a UniformKV group, each page_size should
-        # have the same number of layers. This also means we don't need to pad layers
-        # inside a partial-full layer tuple.
-        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
+        # When every page-size bucket has the same number of layers, tuple them
+        # so differently-sized pages share packed blocks. DeepSeek-V4 Flash 0731
+        # has a valid uneven tail (43 sparse-layout SWA layers + 3 plain fp8
+        # SWA layers), so split those buckets into independent cache groups.
+        if len(set(len(layers) for layers in layers_per_size.values())) != 1:
+            for layers in layers_per_size.values():
+                group_layer_specs = {
+                    name: sm_spec.kv_cache_specs[name] for name in layers
+                }
+                sub_sm_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
+                assert sub_sm_spec is not None
+                swa_mla_groups.append(
+                    KVCacheGroupSpec(
+                        layer_names=layers,
+                        kv_cache_spec=sub_sm_spec,
+                    )
+                )
+            continue
         num_layers_per_size = len(next(iter(layers_per_size.values())))
 
         # Split layers inside each UniformKV group for aligned #(layers).
@@ -1710,7 +1742,15 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
-    return [full_mla_group, *swa_mla_groups]
+    auxiliary_groups = [
+        KVCacheGroupSpec(
+            layer_names=list(spec.kv_cache_specs),
+            kv_cache_spec=spec,
+        )
+        for spec in auxiliary_specs
+    ]
+
+    return [full_mla_group, *swa_mla_groups, *auxiliary_groups]
 
 
 def _annotate_eagle_groups_deepseek_v4(
