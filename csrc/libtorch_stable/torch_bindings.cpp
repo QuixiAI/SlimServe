@@ -668,6 +668,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit) "
       "-> Tensor");
 
+  ops.def(
+      "ggml_dsv4_moe_a8_iq2_seg(Tensor X, Tensor W1, Tensor W2, "
+      "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
+      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit) "
+      "-> Tensor");
+
 #ifndef USE_ROCM
   ops.def(
       "ggml_dsv4_rms_norm_q8_1(Tensor X, Tensor weight, float epsilon) "
@@ -869,6 +875,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_dsv4_moe_a8_mxfp4", TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4));
   ops.impl("ggml_dsv4_moe_a8_mxfp4_seg",
            TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4_seg));
+  ops.impl("ggml_dsv4_moe_a8_iq2_seg", TORCH_BOX(&ggml_dsv4_moe_a8_iq2_seg));
 #ifndef USE_ROCM
   ops.impl("ggml_dsv4_rms_norm_q8_1",
            TORCH_BOX(&ggml_dsv4_rms_norm_q8_1));

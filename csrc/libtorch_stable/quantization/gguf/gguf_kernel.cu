@@ -25,6 +25,7 @@
   #include "../../../quixicore/quant/dsv4_mxfp4_moe_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_mxfp4_mmq_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_mxfp4_seg_ampere.cuh"
+  #include "../../../quixicore/quant/dsv4_hybrid_seg_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_shared_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_o_proj_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_q8_ampere.cuh"
@@ -1729,6 +1730,89 @@ torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
             (const scalar_t*)X.data_ptr(), (void*)quant_x.mutable_data_ptr(),
             (int)col, (int)tokens, stream);
         slimserve::dsv4_ampere::launch_moe_mxfp4_seg<scalar_t>(
+            (const void*)quant_x.data_ptr(), (const void*)W1.data_ptr(),
+            (const void*)W2.data_ptr(), (void*)quant_mid.mutable_data_ptr(),
+            (scalar_t*)w2out.mutable_data_ptr(),
+            (scalar_t*)out.mutable_data_ptr(), (const int*)topk_ids.data_ptr(),
+            (const float*)topk_weights.data_ptr(), meta_ptr, W1.stride(0),
+            W2.stride(0), (int)col, (int)(padded_x / 32), (int)intermediate,
+            (int)out_row, (int)tokens, (int)top_k, experts,
+            (float)swiglu_limit, use_j16, stream);
+      });
+  return out;
+#endif
+}
+
+// Segmented wide pipeline for the hybrid (IQ2_XXS gate/up, Q2_K down)
+// expert pair. Both weights must be in their load-time repacked layouts
+// (paired IQ2 planes; three-plane Q2_K) -- the production A100 state.
+torch::stable::Tensor ggml_dsv4_moe_a8_iq2_seg(
+    torch::stable::Tensor X,   // [tokens, hidden]
+    torch::stable::Tensor W1,  // [experts, 2 * intermediate, iq2 packed]
+    torch::stable::Tensor W2,  // [experts, out_row, q2k packed]
+    torch::stable::Tensor topk_weights, torch::stable::Tensor topk_ids,
+    int64_t intermediate, int64_t out_row, int64_t top_k, int64_t tokens,
+    double swiglu_limit) {
+#ifdef USE_ROCM
+  STD_TORCH_CHECK(false, "ggml_dsv4_moe_a8_iq2_seg is a CUDA-only path");
+#else
+  STD_TORCH_CHECK(X.dim() == 2, "iq2_seg: X must be 2D");
+  STD_TORCH_CHECK(W1.dim() == 3 && W2.dim() == 3,
+                  "iq2_seg: W1/W2 must be 3D expert tensors");
+  STD_TORCH_CHECK(topk_weights.scalar_type() ==
+                          torch::headeronly::ScalarType::Float &&
+                      topk_weights.is_contiguous(),
+                  "iq2_seg: topk_weights must be contiguous float32");
+  STD_TORCH_CHECK(topk_ids.scalar_type() ==
+                          torch::headeronly::ScalarType::Int &&
+                      topk_ids.is_contiguous(),
+                  "iq2_seg: topk_ids must be contiguous int32");
+  STD_TORCH_CHECK(W1.size(1) == 2 * intermediate,
+                  "iq2_seg: W1 must combine gate/up rows");
+  STD_TORCH_CHECK(W2.size(1) == out_row, "iq2_seg: W2 rows mismatch");
+  STD_TORCH_CHECK(W1.size(0) == W2.size(0) &&
+                      W1.size(0) <= slimserve::dsv4_ampere::SEG_MAX_EXPERTS,
+                  "iq2_seg: expert count invalid");
+  const int64_t col = X.sizes()[1];
+  STD_TORCH_CHECK(col % 256 == 0 && intermediate % 256 == 0 &&
+                      out_row % 128 == 0,
+                  "iq2_seg: unsupported shape");
+
+  const int64_t padded_x = (col + 512 - 1) / 512 * 512;
+  const int64_t routes = tokens * top_k;
+  const int experts = (int)W1.size(0);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  auto out = torch::stable::empty({tokens, out_row}, X.scalar_type(),
+                                  std::nullopt, X.device());
+  auto quant_x = torch::stable::empty({tokens, padded_x / 32 * 9},
+                                      torch::headeronly::ScalarType::Int,
+                                      std::nullopt, X.device());
+  auto quant_mid = torch::stable::empty(
+      {routes, intermediate / 32 * 9}, torch::headeronly::ScalarType::Int,
+      std::nullopt, X.device());
+  auto meta = torch::stable::empty(
+      {slimserve::dsv4_ampere::seg_meta_ints(experts, (int)routes)},
+      torch::headeronly::ScalarType::Int, std::nullopt, X.device());
+  auto w2out = torch::stable::empty({routes, out_row}, X.scalar_type(),
+                                    std::nullopt, X.device());
+
+  static const int j16_rows = [] {
+    const char* s = std::getenv("VLLM_GGUF_DSV4_SEG_J16_ROWS");
+    return s ? std::atoi(s) : 1536;
+  }();
+  const bool use_j16 = routes < j16_rows;
+
+  int* meta_ptr = (int*)meta.mutable_data_ptr();
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_dsv4_moe_a8_iq2_seg", [&] {
+        quantize_row_q8_1_cuda<scalar_t>(
+            (const scalar_t*)X.data_ptr(), (void*)quant_x.mutable_data_ptr(),
+            (int)col, (int)tokens, stream);
+        slimserve::dsv4_ampere::launch_moe_iq2_seg<scalar_t>(
             (const void*)quant_x.data_ptr(), (const void*)W1.data_ptr(),
             (const void*)W2.data_ptr(), (void*)quant_mid.mutable_data_ptr(),
             (scalar_t*)w2out.mutable_data_ptr(),
