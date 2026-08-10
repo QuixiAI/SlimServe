@@ -164,7 +164,7 @@ def test_moe_a8_mxfp4_row_tail(tokens=70):
     _moe_a8_vs_reference(tokens, 6, 256, 96, 16, 5)
 
 
-def _seg_vs_reference(tokens, drop_routes=0, seed=7):
+def _seg_vs_reference(tokens, drop_routes=0, seed=7, repacked=False):
     """Full segmented MoE (perm build + fused-SwiGLU W1 + W2 + reduce) vs the
     fp32 dequant reference. tokens*top_k < 1536 exercises the J=16 tile,
     larger the J=64 tile."""
@@ -184,10 +184,15 @@ def _seg_vs_reference(tokens, drop_routes=0, seed=7):
         flat[drop] = -1
     topk_weights = torch.rand(tokens, top_k, device=device) + 0.25
 
+    if repacked:
+        w1_in = ops.ggml_dsv4_repack_mxfp4(w1_raw, hidden)
+        w2_in = ops.ggml_dsv4_repack_mxfp4(w2_raw, intermediate)
+    else:
+        w1_in, w2_in = w1_raw, w2_raw
     out = ops.ggml_dsv4_moe_a8_mxfp4_seg(
         x,
-        w1_raw,
-        w2_raw,
+        w1_in,
+        w2_in,
         topk_weights.float().contiguous(),
         topk_ids.contiguous(),
         intermediate,
@@ -195,6 +200,8 @@ def _seg_vs_reference(tokens, drop_routes=0, seed=7):
         top_k,
         tokens,
         0.0,
+        repacked,
+        repacked,
     )
 
     xf = x.to(torch.float32)
@@ -222,6 +229,12 @@ def _seg_vs_reference(tokens, drop_routes=0, seed=7):
 @pytest.mark.parametrize("tokens", [65, 128])
 def test_seg_mxfp4_moe_j16(tokens):
     _seg_vs_reference(tokens)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("tokens", [65, 300])
+def test_seg_mxfp4_moe_repacked(tokens):
+    _seg_vs_reference(tokens, repacked=True)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")

@@ -724,7 +724,8 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,
                                   torch::stable::Tensor expert_ids,
                                   torch::stable::Tensor num_tokens_post_padded,
                                   int64_t type, int64_t row, int64_t top_k,
-                                  int64_t tokens);
+                                  int64_t tokens,
+                                  bool mxfp4_repacked = false);
 
 torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
                                       torch::stable::Tensor W,
@@ -785,7 +786,8 @@ torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4_seg(
     torch::stable::Tensor X, torch::stable::Tensor W1,
     torch::stable::Tensor W2, torch::stable::Tensor topk_weights,
     torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
-    int64_t top_k, int64_t tokens, double swiglu_limit);
+    int64_t top_k, int64_t tokens, double swiglu_limit,
+    bool w1_repacked = false, bool w2_repacked = false);
 
 torch::stable::Tensor ggml_dsv4_moe_a8_iq2_seg(
     torch::stable::Tensor X, torch::stable::Tensor W1,

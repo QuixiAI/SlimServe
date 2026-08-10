@@ -438,7 +438,8 @@ inline void launch_moe_mxfp4_seg(
     const int64_t w2_stride_bytes, const int hidden,
     const int input_token_blocks, const int intermediate, const int out_row,
     const int tokens, const int top_k, const int experts,
-    const float swiglu_limit, const bool use_j16, cudaStream_t stream) {
+    const float swiglu_limit, const bool use_j16, const bool w1_repacked,
+    const bool w2_repacked, cudaStream_t stream) {
   const int routes = tokens * top_k;
   int* rows_per_expert = meta;
   int* cursors = meta + experts;
@@ -459,21 +460,29 @@ inline void launch_moe_mxfp4_seg(
   const auto in = static_cast<const block_q8_1*>(quant_x);
   const auto mid_blocks = static_cast<block_q8_1*>(mid);
   const dim3 block(32, MXMMQ_NWARPS);
-#define LAUNCH_SEG(J)                                                        \
+#define LAUNCH_SEG(J, R1, R2)                                                \
   do {                                                                       \
     const dim3 g1(intermediate / 64, seg_col_tiles(routes, experts, J));     \
-    moe_mxfp4_seg_w1<J, false><<<g1, block, 0, stream>>>(                    \
+    moe_mxfp4_seg_w1<J, R1><<<g1, block, 0, stream>>>(                       \
         w1, in, mid_blocks, perm_ids, rowseg, tseg, route_weights,           \
         w1_stride_bytes, hidden, input_token_blocks, intermediate, experts,  \
         top_k, swiglu_limit);                                                \
     const dim3 g2((out_row + MXMMQ_I - 1) / MXMMQ_I,                         \
                   seg_col_tiles(routes, experts, J));                        \
-    moe_mxfp4_seg_w2<scalar_t, J, false><<<g2, block, 0, stream>>>(          \
+    moe_mxfp4_seg_w2<scalar_t, J, R2><<<g2, block, 0, stream>>>(             \
         w2, mid_blocks, w2out, perm_ids, rowseg, tseg, w2_stride_bytes,      \
         intermediate, out_row, experts);                                     \
   } while (0)
-  if (use_j16) LAUNCH_SEG(16);
-  else LAUNCH_SEG(64);
+#define LAUNCH_SEG_J(J)                                                      \
+  do {                                                                       \
+    if (w1_repacked && w2_repacked) LAUNCH_SEG(J, true, true);               \
+    else if (w1_repacked) LAUNCH_SEG(J, true, false);                        \
+    else if (w2_repacked) LAUNCH_SEG(J, false, true);                        \
+    else LAUNCH_SEG(J, false, false);                                        \
+  } while (0)
+  if (use_j16) LAUNCH_SEG_J(16);
+  else LAUNCH_SEG_J(64);
+#undef LAUNCH_SEG_J
 #undef LAUNCH_SEG
   seg_reduce<scalar_t><<<tokens, 256, 0, stream>>>(w2out, topk_ids, out,
                                                    out_row, top_k, experts);

@@ -257,6 +257,8 @@ def _fused_moe_gguf(
                 top_k,
                 num_tokens,
                 0.0 if swiglu_limit is None else swiglu_limit,
+                w1_repacked,
+                w2_repacked,
             )
         # ggml_moe_a8_vec has no weight reuse across tokens -- it reloads the
         # expert row for every (token, k) pair -- so its cost is linear in rows
@@ -281,6 +283,10 @@ def _fused_moe_gguf(
             not mmq_ok
             or num_tokens <= _moe_vec_row_limit(32, "VLLM_GGUF_MOE_VEC_W1", 8)
         )
+        # The MMVQ kernels read raw 17-byte MXFP4 blocks; repacked expert
+        # stacks must stay on the repack-aware tile/fused routes.
+        if qweight_type == 39 and w1_repacked:
+            w1_vec = False
         # On A100 the w2 crossover sits below any batch this serves: forcing the
         # MMQ tile kernel measured neutral at 8 routed rows and +2.9% / +6.7% at
         # 32 / 64 (GLM-5.2 Q2_K, TP8, CUDA graphs), so vec never wins for w2.
@@ -289,6 +295,8 @@ def _fused_moe_gguf(
         w2_vec = vec_ok and (
             not mmq_ok or w2_rows <= _moe_vec_row_limit(128, "VLLM_GGUF_MOE_VEC_W2", 0)
         )
+        if qweight_type2 == 39 and w2_repacked:
+            w2_vec = False
         dsv4_fused_native = (
             qweight_type == 16
             and qweight_type2 == 10
@@ -536,6 +544,7 @@ def _fused_moe_gguf(
                 N,
                 top_k,
                 num_tokens,
+                mxfp4_repacked=(qweight_type == 39 and w1_repacked),
             )
         out = act(out)
         if w2_vec:
@@ -553,6 +562,7 @@ def _fused_moe_gguf(
                 w2.shape[1],
                 1,
                 w2_rows,
+                mxfp4_repacked=(qweight_type2 == 39 and w2_repacked),
             )
         out = out.reshape(num_tokens, top_k, w2.shape[1])
         if current_platform.is_metal():
@@ -761,6 +771,33 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         # runs the generic MMQ/MMVQ kernels, which read raw 17-byte blocks.
         # The SoA repack (ggml_dsv4_repack_mxfp4) is wired but must wait until
         # every consumer understands the split layout.
+        if (
+            layer.w13_qweight_type.weight_type == 39
+            and layer.w2_qweight_type.weight_type == 39
+            and _use_dsv4_ampere_mxfp4_repack()
+            and layer.hidden_size % 256 == 0
+            and layer.intermediate_size_per_partition % 256 == 0
+        ):
+            # Byte-neutral AoS(17) -> SoA(scales | aligned codes) split.
+            # Measured 2.0x on the fused per-route GEMV at verify widths
+            # (bit-identical outputs) and enables aligned tile loads.
+            replace_parameter(
+                layer,
+                "w13_qweight",
+                ops.ggml_dsv4_repack_mxfp4(layer.w13_qweight, layer.hidden_size),
+                prefer_copy=True,
+            )
+            replace_parameter(
+                layer,
+                "w2_qweight",
+                ops.ggml_dsv4_repack_mxfp4(
+                    layer.w2_qweight, layer.intermediate_size_per_partition
+                ),
+                prefer_copy=True,
+            )
+            layer._dsv4_w1_repacked = True
+            layer._dsv4_w2_repacked = True
+            return
         if (
             not _use_dsv4_ampere_fused()
             or layer.w13_qweight_type.weight_type != 16

@@ -618,7 +618,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_moe_a8(Tensor X, Tensor W, "
       "Tensor sorted_token_ids, Tensor expert_ids, Tensor "
       "num_tokens_post_padded, "
-      "int type, SymInt row, SymInt top_k, SymInt tokens) -> Tensor");
+      "int type, SymInt row, SymInt top_k, SymInt tokens, "
+      "bool mxfp4_repacked=False) -> Tensor");
 
   ops.def(
       "ggml_moe_a8_vec(Tensor X, Tensor W, "
@@ -665,8 +666,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "ggml_dsv4_moe_a8_mxfp4_seg(Tensor X, Tensor W1, Tensor W2, "
       "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
-      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit) "
-      "-> Tensor");
+      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit, "
+      "bool w1_repacked=False, bool w2_repacked=False) -> Tensor");
 
   ops.def(
       "ggml_dsv4_moe_a8_iq2_seg(Tensor X, Tensor W1, Tensor W2, "
