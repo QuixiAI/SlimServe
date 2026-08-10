@@ -17,7 +17,7 @@ from slimserve.registry import Plan
 
 # Settings the offline LLM class does not take as keyword arguments; they are
 # server-side concepts and get dropped when building an in-process engine.
-_SERVE_ONLY = frozenset({"served_model_name"})
+_SERVE_ONLY = frozenset({"served_model_name", "default_chat_template_kwargs"})
 
 
 def apply_env(plan: Plan) -> None:

@@ -487,6 +487,19 @@ def test_engine_kwargs_drop_server_only_settings():
     assert kwargs["model"].endswith(".gguf")
 
 
+def test_thinking_default_is_a_serve_only_json_flag():
+    plan = resolve("dsv4-q4ktail-4", "a100", 8, None)
+    plan = replace(
+        plan,
+        engine={**plan.engine, "default_chat_template_kwargs": {"thinking": True}},
+    )
+    argv = serve_argv(plan, "127.0.0.1", 8000)
+    assert (
+        argv[argv.index("--default-chat-template-kwargs") + 1] == '{"thinking": true}'
+    )
+    assert "default_chat_template_kwargs" not in engine_kwargs(plan)
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
