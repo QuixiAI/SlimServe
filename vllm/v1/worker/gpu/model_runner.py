@@ -1140,17 +1140,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if pending is not None:
             host, event, step, rows = pending
             if event.query():
-                count = int(host.item())
+                mask = host.bool()
+                count = int(mask.sum().item())
                 if count > 0:
+                    idxs = mask.nonzero().flatten().tolist()[:12]
                     logger.error(
                         "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
-                        "(reported at step %d)",
-                        count, rows, step, self._nan_watch_step)
+                        "(reported at step %d) rows=%s",
+                        count, rows, step, self._nan_watch_step, idxs)
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
-            nan_rows = torch.isnan(logits).any(dim=-1).sum()
-            host = torch.empty((), dtype=nan_rows.dtype, pin_memory=True)
-            host.copy_(nan_rows, non_blocking=True)
+            nan_mask = torch.isnan(logits).any(dim=-1)
+            host = torch.empty(
+                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True
+            )
+            host.copy_(nan_mask, non_blocking=True)
             event = torch.cuda.Event()
             event.record()
             self._nan_watch_pending = (
