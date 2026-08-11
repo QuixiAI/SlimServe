@@ -57,8 +57,20 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     max_smem_per_block = device_prop->sharedMemPerBlockOptin;
   }
 
+  // Diagnostic dispatch override for the NaN-row hunt: rows above the
+  // threshold take FilteredTopK, at or below it the persistent cooperative
+  // kernel. Default 32 is the production heuristic; 0 forces FilteredTopK
+  // for every batch, a huge value forces the persistent kernel for every
+  // batch.
+  static const uint32_t filtered_min_rows = [] {
+    const char* value = std::getenv("VLLM_DSV4_FILTERED_TOPK_MIN_ROWS");
+    return value == nullptr
+               ? 32u
+               : static_cast<uint32_t>(std::max(0L, std::atol(value)));
+  }();
+
   if constexpr (NGPU == 1) {
-    if (num_rows > 32 && max_smem_per_block >= 128 * 1024) {
+    if (num_rows > filtered_min_rows && max_smem_per_block >= 128 * 1024) {
     cudaError_t status =
         vllm::FilteredTopKRaggedTransform<float, int32_t, TopK>(
             logits.const_data_ptr<float>(), output.mutable_data_ptr<int32_t>(),
