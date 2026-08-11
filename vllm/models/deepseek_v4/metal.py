@@ -62,6 +62,7 @@ class DeepseekV4MetalAttention(DeepseekV4Attention):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None = None,
+        prequant_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # vLLM's memory-profile pass has no attention metadata or allocated KV
         # pages.  CUDA/ROCm reserve workspace inside their sparse op; Metal has
@@ -69,7 +70,9 @@ class DeepseekV4MetalAttention(DeepseekV4Attention):
         # worker budget unified memory from actual allocations.
         if get_forward_context().attn_metadata is None:
             return torch.zeros_like(hidden_states)
-        return super().forward(positions, hidden_states, llama_4_scaling)
+        return super().forward(
+            positions, hidden_states, llama_4_scaling, prequant_input
+        )
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         # The DSV4 A projection is eight independent matrices.  GGUF stores

@@ -965,6 +965,7 @@ decision, and raw artifact locations.
   (128K decode at 65 tok/s vs the 37 measured on XXS the prior evening; the
   XXS number likely included first-run JIT of the long-context kernels. The
   post-128K continuation dip recurs on hybrid: 94.5 vs 168.)
+
 - MXFP4 fused-route width: raised the dispatch cap from tokens<=8 to an env
   limit (`VLLM_GGUF_DSV4_MXFP4_ROWS`, default 64; op cap 256). Correctness
   extended to width 48 (8/8 pass). DSV4 routing is near-uncorrelated, so the
@@ -978,6 +979,7 @@ decision, and raw artifact locations.
 
   Remaining c8 gap vs hybrid's 416 is prefill (chunked 1024-token batches
   still take generic MMQ) -- future MXFP4 prefill tiles.
+
 - dsv4-8 (MXFP4, 8 GPUs): TP8 measured 167.6 c1 / 117.4 @12K / 148.2 c8
   agg, all exact = 1.50x / 1.58x / 1.50x over dsv4-4-mxfp4 -- meets the
   >=1.5x TP gate in every regime. TP4 x DP2 FAILS TO INITIALIZE: DSV4's
@@ -1258,6 +1260,7 @@ decision, and raw artifact locations.
 | 2048 | 459.2 | 8.0 | 57x |
 
   (old is linear in tokens; new is weight-stream flat)
+
 - E2e dsv4-mxfp4-4 (exact harness, spec decode, all `exact: true`):
 
 | stage | before | after | delta |
@@ -1268,6 +1271,7 @@ decision, and raw artifact locations.
 
   12K now holds 88% of the c1 rate (hybrid-4 holds ~95%); c8 at 208 is
   now within the activated-byte ratio of hybrid TP4's 417-606 band.
+
 - E2e dsv4-mxfp4-8 (TP8, capture 64, all `exact: true`):
 
 | stage | before | after | delta |
@@ -1278,6 +1282,7 @@ decision, and raw artifact locations.
 
   TP8 12K now holds 88% of c1 (matches TP4's post-tile ratio); the c8
   gain confirms prefill was the TP8 c8 limiter after the capture-64 fix.
+
 - Open levers recorded: fused SwiGLU+Q8_1 wide epilogue (QuixiCore-XPU
   glu_quant is the precedent; wide route still runs act + requant as
   separate elementwise steps), permuted expert-contiguous segments instead
@@ -1340,6 +1345,7 @@ decision, and raw artifact locations.
 
   (adding the mmq route's external passes makes seg the winner at every
   width: ~-33% at 128, ~-12% at 2048)
+
 - E2e dsv4-mxfp4-4 (exact, spec decode): c1 125.1/127.5 (par vs 129/126),
   12K 112.1/115.0 (vs 110.6/115.8), c8 cold 276.9 (vs 208.4, +33%), c8
   hot 204.3 (vs 200.3, par). Reading per the APC-hot methodology: the win
@@ -1560,7 +1566,7 @@ decision, and raw artifact locations.
   throughput history and should be studied when translating wins across
   platforms.
 
-## 2026-08-10 - Naming note: dsv4-hybrid-* is now dsv4-q4ktail-*
+## 2026-08-10 - Naming note: dsv4-hybrid-*is now dsv4-q4ktail-*
 
 Entries above reference the profile ids in force when each run was made
 (dsv4-2 -> dsv4-hybrid-N -> dsv4-q4ktail-N for the Q4K-tail artifact).
@@ -1850,3 +1856,78 @@ appears FULL-graph-gated; trace with per-request NaN row logging once
 (a) is understood. (c) The ROCm-parity buffer-persistence work in
 QuixiCoreMLASparseMetadataBuilder is the condition for re-enabling
 FULL graphs, followed by a clean 6-boot tripwire campaign.
+## 2026-08-10 - Metal dsv4-xxs-1 256K Resize, Path Repairs, Indexer Blocker
+
+- Status: profile resized and partially validated; four retained fixes; one
+  retained diagnostic gate; long context blocked on a missing Metal kernel
+  family. Not a performance change; no throughput claims.
+- Baseline: the Metal profile served max_model_len 3072 with a fixed 1 GiB KV
+  pool, tuned for the exact 1k-in/2k-out matrix (33.684 tok/s c1, 35.350 c8
+  in perf/baseline_status.md). Real (agentic) use needs 256K context, and the
+  benchmark-shaped cap had hidden that most of the long-context path had never
+  executed on Metal.
+- Change (profile): metal override of dsv4-xxs-1 now sets max_model_len
+  262144 and kv_cache_memory_bytes 17179869184 (16 GiB). Planner verifies
+  2,225,562 logical KV tokens (~8.5x one full 256K request; ~7.7 KB per
+  logical token all-in for the 43-layer fp8_ds_mla target cache plus indexer
+  and 3-layer TurboQuant draft cache). Weights 80.8 + 6.5 GiB plus the pool
+  is ~103 GiB against the ~115 GiB working set of the 128 GiB M5 Max.
+- Found and fixed (all latent breakage from the A100 prequant/sampler work
+  landing without the Metal path being re-exercised; current main crashed on
+  the FIRST request at any context):
+  1. DeepseekV4MetalAttention.forward lacked the new prequant_input
+     parameter (vllm/models/deepseek_v4/metal.py) -- accepts and forwards.
+  2. attn_gemm_parallel_execute called torch.cuda.is_current_stream_capturing
+     unconditionally (attention.py multi-stream enable) -- raises on MPS
+     builds; guarded with current_platform.is_metal() so ROCm (HIP torch.cuda,
+     real graph capture) keeps exact behavior.
+  3. DeepseekV4TurboQuantDraftAttention.forward (amd/dspark_turboquant.py)
+     had the same stale signature -- accepts and ignores, per the module's
+     existing del pattern.
+  4. rejection_sample's MPS branch was greedy-only; any temperature > 0 fell
+     through to a nonexistent Triton kernel. Added a torch implementation of
+     full rejection sampling (ratio accept, residual-mass resample, bonus
+     token; sample-and-match when draft logits are absent), following the
+     gumbel_sample MPS precedent (torch randomness; no Philox seed parity).
+     Consequence: Metal spec decode only ever worked for greedy harness
+     traffic; a default-temperature client always crashed.
+- Diagnostic gate (retained until measured): turboquant_attn.py's new
+  _MAX_SLIDING_WINDOW_KV_SPLITS clamp (32 -> 16 on sliding-window layers) is
+  gated off on Metal; the QuixiCore Metal decode kernel is only validated at
+  32 splits, and the clamp landed with the A100 work between the last-good
+  Metal commit (209265933) and now. Untested as the spec-hang cause; see open
+  items.
+- Correctness result (no-spec, fresh boot, port 8077): cold default-temp
+  smoke returned exactly the requested string after 1651 s (one-time cold MPS
+  pipeline compile; ~28 min); warm greedy '42' in 28 s; warm temp-0.7 in
+  172 s. All with correct content and token counts.
+- Long-context result: a ~25K-token needle prompt crashed the engine inside
+  its FIRST 2048-token prefill chunk (prompt_tokens_total never advanced):
+  fused_indexer_q_rope_quant launches a Triton kernel, and Metal has no
+  Triton. The Triton call predates the A100 work -- the sparse-MLA indexer
+  chain (fused_indexer_q_rope_quant, _fill_short_context_topk_indices, the
+  compressor's indexer-cache insert ordering, and indexer_op fp8 scoring +
+  topk) has NEVER had a Metal implementation. The old 3072 cap kept every
+  request below the indexer engagement length, which is why the 1k/2k
+  baseline never saw it. This is the blocker for 256K on Metal: port the
+  indexer chain from the ROCm reference into csrc/quixicore metal serving.
+- Open item (spec decode): with fixes 1-4, the first spec verify step stalled
+  >= 35 min at 13 prompt + 1 generated tokens, main thread blocked in
+  .cpu() -> MPSStream sync -> MTLCommandBuffer waitUntilCompleted (native
+  stack in raw artifacts). The subsequent no-spec run showed cold compile
+  alone is ~28 min, so the stall may have been cold compile of target plus
+  drafter pipelines rather than a true deadlock. Re-test spec decode with the
+  32-split gate in place and a >= 60 min first-request budget before
+  concluding deadlock. Note: vLLM retitles processes (VLLM::APIServer /
+  VLLM::EngineCore); kill by port owner, not by "slimserve" pattern, or a
+  zombie API server holds the port with a dead engine.
+- Decision: retain the profile sizing and fixes 1-4; retain the splits gate
+  as a documented diagnostic; do not claim 256K serving until the indexer
+  chain runs on Metal and the spec path is re-validated. Next commands:
+  port fused_indexer_q_rope_quant + indexer_op to the Metal QuixiCore
+  serving lib (reference: ROCm path + csrc/quixicore/tm_rocm), then
+  `slimserve dsv4-xxs-1 --serve -y` and rerun the staged validation with the
+  25K needle and a genuine 200K+ request.
+- Raw artifacts: perf/results/2026-08-10/dsv4-metal-256k-real-use/
+  (serve logs 1-6, no-spec log, native stack sample of the stalled step,
+  staged validation transcript).
