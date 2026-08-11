@@ -2,37 +2,28 @@
 
 Updated: 2026-08-10 22:20 UTC
 
-## URGENT open item: silent output degeneration under load (NaN-class race)
+## Degeneration incident: storms RESOLVED, rare seed open (2026-08-11)
 
-Production dsv4-q4ktail-4 instances can silently degenerate under sustained
-DSpark c16+ verify load at TP4 with FULL_DECODE_ONLY capture-64 graphs: one
-NaN-class step emits token 0, the BOS self-sustains at temp 0, and the
-instance keeps returning exact token counts that decode to almost no text
-until restart. Acceptance pegs at ~6.0 (drafter predicts the loop), so
-throughput records taken in this state are inflated garbage - yesterday's
-c16-c64 deployed-sweep rows are retracted. The trigger is a timing-sensitive
-race: it reproduced on both GPU quartets and under both custom-allreduce and
-NCCL (flipping either flips which config loses), so the earlier custom-AR
-attribution is disproven. TP2/PIECEWISE and no-spec runs stayed clean.
-Full trigger matrix, retractions, and suspect list: the INCIDENT entry at
-the end of `perf/optimization_status.md`. Protections in place: harness
-chars-per-token guard, fresh-region benchmark protocol, and
-`slimserve-canary.timer` (5-min long-prompt probe that auto-restarts a
-degenerate daemon). Next discriminators: PIECEWISE at TP4 with spec,
-turboquant->auto draft KV, aux-stream overlaps off, zero freed KV blocks as
-a diagnostic. MITIGATED 2026-08-11: all four A100 dsv4 tiers now serve PIECEWISE
-capture-32 (FULL_DECODE_ONLY stormed 2/6 controlled boots; PIECEWISE
-0/6; every storm ever observed was a FULL boot; ~12% solo-c11 cost,
-less under dual load). Root cause still open: rare positionally
-deterministic NaN events at decode+prefill mixed batches (last verify
-row, both graph modes) plus a FULL-gated contagion step. See the
-2026-08-11 notebook entries for the campaign data, the tripwires
-(VLLM_NAN_WATCH / VLLM_DSV4_TOPK_VALIDATE), and the next reproducer.
-Do not re-enable FULL graphs on the sparse-MLA backend until the
-QuixiCoreMLASparseMetadataBuilder buffer-persistence TODO is done and
-a 6-boot tripwire campaign is clean.
-Related latent bug: VLLM_DSV4_DEFER_TP_REDUCE=0 collapses acceptance to
-1.11 - the drafter consumes deferred-path state unconditionally.
+The silent BOS-loop degeneration that poisoned the 08-10 deployment is
+root-caused and fixed for its catastrophic form: the QuixiCore
+sparse-MLA builder computed bt_per_token lazily inside the first
+layer's forward, which under FULL_DECODE_ONLY capture baked a
+capture-pool address into every layer's kernels while replay rebuilt
+metadata around it (the builder's own TODO had warned FULL graphs
+needed ROCm-parity buffer persistence). The fix computes it in build()
+into a persistent buffer. Validation: 0 storms in 8 FULL-graph boots vs
+2/6 pre-fix; FULL capture-64 is restored on all four A100 dsv4 tiers.
+
+Still open at reduced priority: a rare sub-critical NaN seed
+(single-token quality blips, ~0-3 events per boot in ACTIVE phases,
+none in dormant phases; births at layer-0 input on <=8-row batches;
+both graph modes; every kernel exonerated in isolation). Detection is
+permanent (VLLM_NAN_WATCH on both daemons, canary as backstop). When
+daemon logs show NAN_WATCH events, run
+perf/diagnostics/dsv4-nan/campaign_env2.sh - attribution arms are
+useless in a dormant phase. Full narrative and tooling:
+perf/optimization_status.md incident entries and
+perf/diagnostics/dsv4-nan/README.md.
 
 ## Read First
 
