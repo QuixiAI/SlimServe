@@ -952,6 +952,91 @@ def rejection_sample(
                 sampled_cpu.to(target_logits.device),
                 num_sampled_cpu.to(target_logits.device),
             )
+        # General temperatures. MPS does not expose Triton's stateless Philox
+        # primitive; like the gumbel_sample torch fallback, this preserves
+        # rejection-sampling semantics while per-request seed parity remains a
+        # native CUDA/HIP property. Draft token i of a request rides at
+        # draft_sampled[start + i + 1] and verifies against target row
+        # start + i, matching the greedy loop above.
+        assert synthetic_conditional_rates is None, (
+            "Synthetic acceptance rates are not supported on MPS."
+        )
+        target = target_logits[:, :vocab_size].float()
+        cu_logits = cu_num_logits.cpu().tolist()
+        draft_ids = draft_sampled.cpu().tolist()
+        temps = active_temperatures.cpu().tolist()
+        state_indices = req_indices.cpu().tolist()
+        sampled_cpu = torch.full(
+            (num_reqs, num_speculative_steps + 1),
+            -1,
+            dtype=torch.int64,
+        )
+        num_sampled_cpu = torch.empty(num_reqs, dtype=torch.int32)
+        for req_idx in range(num_reqs):
+            start = cu_logits[req_idx]
+            end = cu_logits[req_idx + 1]
+            num_draft = end - start - 1
+            temp = temps[req_idx]
+            if temp == 0:
+                target_row_ids = target[start:end].argmax(dim=-1).cpu().tolist()
+                accepted = 0
+                while (
+                    accepted < num_draft
+                    and draft_ids[start + accepted + 1] == target_row_ids[accepted]
+                ):
+                    sampled_cpu[req_idx, accepted] = draft_ids[start + accepted + 1]
+                    accepted += 1
+                sampled_cpu[req_idx, accepted] = target_row_ids[accepted]
+                num_sampled_cpu[req_idx] = accepted + 1
+                continue
+            probs = torch.softmax(target[start:end] / temp, dim=-1).cpu()
+            draft_probs = None
+            if has_draft_logits and num_draft > 0:
+                assert draft_logits is not None
+                draft_probs = torch.softmax(
+                    draft_logits[
+                        state_indices[req_idx], :num_draft, :vocab_size
+                    ].float()
+                    / temp,
+                    dim=-1,
+                ).cpu()
+            accepted = 0
+            emitted = None
+            while accepted < num_draft:
+                token = draft_ids[start + accepted + 1]
+                if draft_probs is None:
+                    # No draft distribution: sample the target row and accept
+                    # on match (lossless token-equality verification).
+                    target_token = int(torch.multinomial(probs[accepted], 1))
+                    if target_token != token:
+                        emitted = target_token
+                        break
+                else:
+                    p_token = float(probs[accepted, token])
+                    q_token = float(draft_probs[accepted, token])
+                    ratio = 1.0 if q_token <= 0.0 else min(1.0, p_token / q_token)
+                    if float(torch.rand(1)) >= ratio:
+                        residual = (probs[accepted] - draft_probs[accepted]).clamp_(
+                            min=0
+                        )
+                        residual_mass = float(residual.sum())
+                        if residual_mass <= 0.0:
+                            emitted = int(probs[accepted].argmax())
+                        else:
+                            emitted = int(torch.multinomial(residual, 1))
+                        break
+                sampled_cpu[req_idx, accepted] = token
+                accepted += 1
+            if emitted is None:
+                # Every draft token accepted: bonus token from the target
+                # distribution at the last position.
+                emitted = int(torch.multinomial(probs[num_draft], 1))
+            sampled_cpu[req_idx, accepted] = emitted
+            num_sampled_cpu[req_idx] = accepted + 1
+        return (
+            sampled_cpu.to(target_logits.device),
+            num_sampled_cpu.to(target_logits.device),
+        )
 
     # Compute the per-vocab-block logits stats, such as target argmax
     # (for greedy requests), and target max + softmax exponential

@@ -684,11 +684,11 @@
       "platform_overrides": {
         "metal": {
           "engine": {
-            "max_model_len": 3072,
+            "max_model_len": 262144,
             "max_num_seqs": 32,
             "max_num_batched_tokens": 2048,
             "gpu_memory_utilization": null,
-            "kv_cache_memory_bytes": 1073741824,
+            "kv_cache_memory_bytes": 17179869184,
             "kv_cache_dtype": "fp8_ds_mla",
             "attention_config": null,
             "tokenizer_mode": "deepseek_v4",
@@ -704,8 +704,9 @@
             "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-            "The fixed 1 GiB hybrid KV pool holds one complete 1,000-input/2,000-output request while keeping the IQ2_XXS target and drafter resident. Higher API concurrency drains in scheduler waves instead of paging model weights.",
-            "max_model_len is 3072 because this profile is tuned and measured for the exact 1k-in/2k-out serving matrix."
+            "The fixed 16 GiB hybrid KV pool is sized to hold one full 262,144-token request (target fp8_ds_mla across 43 layers plus the 3-layer TurboQuant draft cache, ~9 GiB) with margin for concurrent shorter sessions. Weights (80.8 GiB target + 6.5 GiB drafter) plus this pool total ~103 GiB, inside the ~115 GiB Metal working set of a 128 GiB machine. Higher API concurrency drains in scheduler waves instead of paging model weights.",
+            "max_model_len is 262144 for real (agentic) use. The earlier 3072/1 GiB configuration existed only to pin the 1k-in/2k-out benchmark matrix; throughput numbers in perf/baseline_status.md were measured under that config and predate this sizing.",
+            "Long-context status (2026-08-10): the KV pool is planner-verified at 2,225,562 logical tokens, and short-prompt serving is validated end to end at temperatures 0/0.7/default with --no-spec. Prompts past the first 2048-token prefill chunk crash: the sparse-MLA indexer pipeline (fused_indexer_q_rope_quant, short-context topk fill, indexer scoring/topk) is Triton/CUDA-only and has no Metal implementation yet -- the old 3072 cap simply kept every request below the indexer's engagement length. Port the indexer chain from the ROCm reference before calling 256k served. The DSpark spec path additionally stalled in its first verify step and needs a re-test with the restored 32-split TurboQuant geometry and a cold-compile-sized patience budget; see perf/optimization_status.md 2026-08-10 Metal entry."
           ]
         }
       }
