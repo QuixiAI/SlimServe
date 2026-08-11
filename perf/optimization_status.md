@@ -1816,3 +1816,37 @@ decode_len anchoring + zeroed pad lengths + pad_value=0), all no-ops
 for the workloads this box actually runs. Next reproducer: one
 long-prefill request submitted mid-decode of one spec request, dual
 tripwires armed - the minimal decode+prefill mix.
+
+### 2026-08-11 - Campaign verdict and production mitigation
+
+PIECEWISE arm: 0 storms / 6 boots (rare seam events on 5 of 6 boots,
+0-16 NaN lines, zero top-k violations, zero degeneration). FULL arm:
+2 storms / 6 boots. Honest statistics: 2/6 vs 0/6 alone is Fisher
+p~0.23 - not significant by itself. Pooled with the full incident
+record (every storm across the 08-10/08-11 investigation was a
+FULL_DECODE_ONLY boot, ~10+ storms across ~20 such boots; zero storms
+in any PIECEWISE or TP2 boot ever), the direction is strong, and the
+QuixiCore sparse-MLA builder's own TODO independently says FULL graphs
+need buffer-persistence work this backend never received.
+
+Clean-run throughput cost of the mitigation (solo c11): 463.1 -> 409.1
+(-12%). Under production dual-instance c16 load the cost is smaller:
+A 530-534 / B 488-490 tok/s, healthy acceptance 4.35-4.45, both
+instances clean, zero NaN events on fresh boots.
+
+MITIGATION APPLIED: all four A100 dsv4 tiers (q4ktail-4/8, mxfp4-4/8)
+now serve PIECEWISE capture-32 (profile notes reference this entry).
+The capture-64 c8 gains recorded on 2026-08-10 (UPDATE 3) are
+deliberately given back until the race is fixed. Both daemons
+restarted on the mitigated profile and verified.
+
+OPEN root-cause work (P0, task #4): (a) the rare seam NaN events -
+positionally deterministic (last verify row at decode+prefill mixed
+batches, rows=[5] of 7) - occur under BOTH graph modes and remain
+unexplained; reproduce with one long prefill submitted mid-decode of
+one spec request, tripwires armed, then bisect attention-out vs
+MoE-out. (b) The storm contagion (1 row -> 54/56 rows in two steps)
+appears FULL-graph-gated; trace with per-request NaN row logging once
+(a) is understood. (c) The ROCm-parity buffer-persistence work in
+QuixiCoreMLASparseMetadataBuilder is the condition for re-enabling
+FULL graphs, followed by a clean 6-boot tripwire campaign.
