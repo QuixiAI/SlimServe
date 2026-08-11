@@ -1734,3 +1734,35 @@ per boot) for powered per-boot statistics: storm rate, and whether
 TOPK_VALIDATE violations precede NAN_WATCH events inside storm boots.
 Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` plus
 `/var/log/SlimServe/ss-camp*.log`.
+
+### 2026-08-11 - Campaign results, FULL arm (6 boots, production config)
+
+| boot | degenerate reqs | NaN lines | top-k violations |
+| ---: | ---: | ---: | ---: |
+| 1 | 0 | 0 | 0 |
+| 2 | 0 | 8 | 0 |
+| 3 | 0 | 8 | 0 |
+| 4 | 22/22 | 1348 | 0 |
+| 5 | 22/22 | 1344 | 0 |
+| 6 | 0 | 4 | 0 |
+
+Storm rate 2/6. Two decisive facts:
+
+1. ZERO top-k violations in 6 boots INCLUDING both storms: every decode
+   top-k index stayed within [-1, seq_len). The corruption does not enter
+   through out-of-range indexer indices. The NaN arises in the value
+   path - attention gather/reduction over cache contents, MoE, or the
+   mHC/Q8 pipeline - consistent with reading unwritten pool memory
+   (split-K partials or unwritten KV slots), which is also the only
+   mechanism found so far that naturally produces a per-boot lottery.
+2. Storm onset is CONTAGION: both storms ignite from a 1-row event and
+   spread to 54/56 rows within two steps. A NaN crosses requests almost
+   instantly, implicating shared state: APC-shared prefix blocks (the
+   trigger loads use overlapping windows), the KV block pool, or a
+   step-global buffer. Clean boots show the identical warmup-phase burst
+   (1/8 at step 6, 6/14 at step 7 - byte-identical on camp2 and camp4)
+   and recover, so the warmup burst alone does not decide the storm.
+
+Next instruments: per-row request-id logging on NaN events (to trace the
+contagion path), and a NaN probe at attention-output vs MoE-output to
+bisect the layer pipeline. PIECEWISE arm in flight.

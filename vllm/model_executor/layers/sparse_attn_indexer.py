@@ -878,6 +878,10 @@ def _topk_validate(
                            "checked every step (diagnostic mode)")
     if not state["enabled"]:
         return
+    # Event.query() and pinned-host copies are illegal during stream capture;
+    # the DSpark full graphs capture this indexer path.
+    if torch.cuda.is_current_stream_capturing():
+        return
     state["step"] += 1
     pending = state["pending"]
     if pending is not None:
