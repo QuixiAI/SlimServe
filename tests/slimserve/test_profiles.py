@@ -595,19 +595,26 @@ def test_dsv4_hybrid_8_is_the_tp4_dp2_throughput_tier():
     assert plan.quant.name == "Q4K-tail"
     assert plan.engine["tensor_parallel_size"] == 4
     assert plan.engine["data_parallel_size"] == 2
+    # PIECEWISE capture-32 is the 2026-08-11 degeneration mitigation;
+    # see the profile note and the incident entries in the perf notebook.
+    assert plan.engine["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
     capture = plan.engine["compilation_config"]["max_cudagraph_capture_size"]
-    assert capture == 64
+    assert capture == 32
 
 
-def test_dsv4_mxfp4_8_is_tp8_with_wide_capture():
-    """Eight-GPU MXFP4 serves TP8; graph capture 64 keeps the 48-token c8
-    verify batches on CUDA graphs (2026-08-10: capture 32 halved c8)."""
+def test_dsv4_mxfp4_8_is_tp8_with_piecewise_capture():
+    """Eight-GPU MXFP4 serves TP8. PIECEWISE capture-32 is the 2026-08-11
+    degeneration mitigation (FULL_DECODE_ONLY boots storm into silent
+    NaN/BOS-loop output under DSpark c11+ load; see the perf notebook
+    incident entries). The 2026-08-10 capture-64 c8 win is deliberately
+    given back until the race is fixed."""
     mxfp4 = resolve("dsv4-mxfp4-8", "a100", 8, None)
     assert mxfp4.quant.name == "MXFP4"
     assert mxfp4.engine["tensor_parallel_size"] == 8
     assert "data_parallel_size" not in mxfp4.engine
+    assert mxfp4.engine["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
     capture = mxfp4.engine["compilation_config"]["max_cudagraph_capture_size"]
-    assert capture == 64
+    assert capture == 32
 
 
 def test_dsv4_2_a100_kv_budget_is_per_quant():

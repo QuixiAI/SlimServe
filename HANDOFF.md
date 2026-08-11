@@ -20,8 +20,17 @@ chars-per-token guard, fresh-region benchmark protocol, and
 `slimserve-canary.timer` (5-min long-prompt probe that auto-restarts a
 degenerate daemon). Next discriminators: PIECEWISE at TP4 with spec,
 turboquant->auto draft KV, aux-stream overlaps off, zero freed KV blocks as
-a diagnostic. Do not chase new performance on this family until this is
-root-caused; benchmark numbers taken without the guard are not trustworthy.
+a diagnostic. MITIGATED 2026-08-11: all four A100 dsv4 tiers now serve PIECEWISE
+capture-32 (FULL_DECODE_ONLY stormed 2/6 controlled boots; PIECEWISE
+0/6; every storm ever observed was a FULL boot; ~12% solo-c11 cost,
+less under dual load). Root cause still open: rare positionally
+deterministic NaN events at decode+prefill mixed batches (last verify
+row, both graph modes) plus a FULL-gated contagion step. See the
+2026-08-11 notebook entries for the campaign data, the tripwires
+(VLLM_NAN_WATCH / VLLM_DSV4_TOPK_VALIDATE), and the next reproducer.
+Do not re-enable FULL graphs on the sparse-MLA backend until the
+QuixiCoreMLASparseMetadataBuilder buffer-persistence TODO is done and
+a 6-boot tripwire campaign is clean.
 Related latent bug: VLLM_DSV4_DEFER_TP_REDUCE=0 collapses acceptance to
 1.11 - the drafter consumes deferred-path state unconditionally.
 

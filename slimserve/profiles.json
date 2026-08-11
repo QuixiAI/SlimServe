@@ -806,7 +806,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "PIECEWISE",
+          "max_cudagraph_capture_size": 32
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -822,8 +823,8 @@
           "engine": {
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "cudagraph_mode": "PIECEWISE",
+              "max_cudagraph_capture_size": 32
             }
           },
           "env": {
@@ -837,7 +838,8 @@
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "PIECEWISE capture-32 is a correctness mitigation (2026-08-11): FULL_DECODE_ONLY capture-64 boots storm into silent NaN/BOS-loop degeneration under DSpark c11+ verify load (2/6 controlled boots; every storm of the 08-10/08-11 incident was a FULL-graph boot; PIECEWISE 0/6 and TP2-PIECEWISE never stormed). The QuixiCore sparse-MLA builder's own TODO says FULL graphs need ROCm-parity buffer persistence first. Costs ~12% at c11 (463->409 tok/s). Restore FULL only after the race is fixed and a 6-boot campaign with the tripwires (VLLM_NAN_WATCH, VLLM_DSV4_TOPK_VALIDATE) is clean; see perf/optimization_status.md incident entries."
       ]
     },
     "dsv4-q4ktail-8": {
@@ -858,7 +860,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "PIECEWISE",
+          "max_cudagraph_capture_size": 32
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -872,8 +875,8 @@
           "engine": {
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "cudagraph_mode": "PIECEWISE",
+              "max_cudagraph_capture_size": 32
             }
           },
           "env": {
@@ -888,7 +891,8 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "PIECEWISE capture-32 is a correctness mitigation (2026-08-11): FULL_DECODE_ONLY capture-64 boots storm into silent NaN/BOS-loop degeneration under DSpark c11+ verify load (2/6 controlled boots; every storm of the 08-10/08-11 incident was a FULL-graph boot; PIECEWISE 0/6 and TP2-PIECEWISE never stormed). The QuixiCore sparse-MLA builder's own TODO says FULL graphs need ROCm-parity buffer persistence first. Costs ~12% at c11 (463->409 tok/s). Restore FULL only after the race is fixed and a 6-boot campaign with the tripwires (VLLM_NAN_WATCH, VLLM_DSV4_TOPK_VALIDATE) is clean; see perf/optimization_status.md incident entries."
       ]
     },
     "dsv4-mxfp4-4": {
@@ -909,7 +913,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "PIECEWISE",
+          "max_cudagraph_capture_size": 32
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -925,8 +930,8 @@
           "engine": {
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "cudagraph_mode": "PIECEWISE",
+              "max_cudagraph_capture_size": 32
             }
           },
           "env": {
@@ -958,7 +963,8 @@
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "PIECEWISE capture-32 is a correctness mitigation (2026-08-11): FULL_DECODE_ONLY capture-64 boots storm into silent NaN/BOS-loop degeneration under DSpark c11+ verify load (2/6 controlled boots; every storm of the 08-10/08-11 incident was a FULL-graph boot; PIECEWISE 0/6 and TP2-PIECEWISE never stormed). The QuixiCore sparse-MLA builder's own TODO says FULL graphs need ROCm-parity buffer persistence first. Costs ~12% at c11 (463->409 tok/s). Restore FULL only after the race is fixed and a 6-boot campaign with the tripwires (VLLM_NAN_WATCH, VLLM_DSV4_TOPK_VALIDATE) is clean; see perf/optimization_status.md incident entries."
       ]
     },
     "dsv4-mxfp4-8": {
@@ -978,7 +984,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "PIECEWISE",
+          "max_cudagraph_capture_size": 32
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -994,8 +1001,8 @@
           "engine": {
             "gpu_memory_utilization": 0.78,
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "cudagraph_mode": "PIECEWISE",
+              "max_cudagraph_capture_size": 32
             }
           },
           "env": {
@@ -1010,7 +1017,8 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "PIECEWISE capture-32 is a correctness mitigation (2026-08-11): FULL_DECODE_ONLY capture-64 boots storm into silent NaN/BOS-loop degeneration under DSpark c11+ verify load (2/6 controlled boots; every storm of the 08-10/08-11 incident was a FULL-graph boot; PIECEWISE 0/6 and TP2-PIECEWISE never stormed). The QuixiCore sparse-MLA builder's own TODO says FULL graphs need ROCm-parity buffer persistence first. Costs ~12% at c11 (463->409 tok/s). Restore FULL only after the race is fixed and a 6-boot campaign with the tripwires (VLLM_NAN_WATCH, VLLM_DSV4_TOPK_VALIDATE) is clean; see perf/optimization_status.md incident entries."
       ]
     },
     "dsv4-q4k-8": {
