@@ -2038,3 +2038,24 @@ FULL graphs, followed by a clean 6-boot tripwire campaign.
   spec acceptance-length measurement + the timestamp-poisoned
   spec_decode_num_drafts_created counter, smart_resize dynamic-aspect
   preprocessing, TurboQuant draft KV, ATEM tool-call parser.
+
+### 2026-08-11 - Mixed-batch reproducer: negative on one boot
+
+Two phases against one PIECEWISE boot with all three tripwires plus the
+new per-layer birth probe (VLLM_NAN_WATCH_LAYERS): (1) one continuous
+spec-decode stream + 160 sequential 24K-token chunked prefills (the
+exact 6+1 batch shape of the historical rows=[5] events); (2) four
+staggered spec-decode streams + 115 more prefills (7-35-row shapes).
+~70 minutes, zero NaN events, zero top-k violations, no degeneration.
+
+Interpretation is deliberately weak: this is ONE boot of a bug whose
+expression is decided per boot - the same trap that killed six theories.
+The mixed-batch shape hypothesis is unproven, not disproven. Rather than
+burn more boots on the rare-event hunt in isolation, the 8-boot
+FULL-graph validation campaign for the bt_per_token persistence fix
+(commit 0a3163da6) doubles as the rare-event sampler: every boot runs
+the birth-layer probe, so any event that fires during validation names
+its layer for free. Success criterion: 0/8 storms (pre-fix FULL stormed
+2/6) keeps FULL graphs on the table for restoration; any storm sends
+the campaign logs - now with per-layer birth data - into the next
+analysis round.
