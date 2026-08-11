@@ -49,9 +49,12 @@ def test_every_profile_uses_dspark_with_turboquant():
                 assert "speculative_config" not in engine_kwargs(plan)
                 continue
             config = engine_kwargs(plan)["speculative_config"]
-            assert config["method"] == "dspark"
-            assert config["attention_backend"] == "TURBOQUANT"
-            assert config["kv_cache_dtype"] == "turboquant_k8v4"
+            source = registry._registry()["sources"][entry["source"]]
+            registered = source["speculator"]["engine"]["method"]
+            assert config["method"] == registered
+            if registered == "dspark":
+                assert config["attention_backend"] == "TURBOQUANT"
+                assert config["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
@@ -261,7 +264,12 @@ def test_kimi_needs_the_native_kv_dtype():
 
 def test_registry_contains_only_the_supported_model_artifacts():
     data = registry._registry()
-    assert set(data["sources"]) == {"glm52-vision", "kimi-k3", "dsv4-flash"}
+    assert set(data["sources"]) == {
+        "glm52-vision",
+        "kimi-k3",
+        "dsv4-flash",
+        "muse-glimmer",
+    }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
     deepseek = data["sources"]["dsv4-flash"]
@@ -397,9 +405,10 @@ def test_deepseek_metal_is_runnable_while_glm_stays_gated():
 
 def test_deepseek_metal_uses_measured_dspark_turboquant_settings():
     plan = resolve("dsv4-xxs-1", "metal", 1, "IQ2_XXS", 128 * GB)
-    assert plan.engine["max_model_len"] == 3072
+    # 256K metal resize (2026-08-11 Metal-side commit).
+    assert plan.engine["max_model_len"] == 262144
     assert plan.engine["max_num_seqs"] == 32
-    assert plan.engine["kv_cache_memory_bytes"] == 1 * GB
+    assert plan.engine["kv_cache_memory_bytes"] == 16 * GB
     assert plan.engine["kv_cache_dtype"] == "fp8_ds_mla"
     speculative = engine_kwargs(plan)["speculative_config"]
     assert speculative["method"] == "dspark"
@@ -503,7 +512,10 @@ def test_every_profile_serves_thinking_and_tool_calling_by_default():
         assert kwargs["thinking"] is True, plan.profile_id
         assert kwargs["enable_thinking"] is True, plan.profile_id
         assert engine["reasoning_parser"], plan.profile_id
-        assert engine["tool_call_parser"], plan.profile_id
+        # Muse-Glimmer has no tool parser in this fork; auto tool choice
+        # stays enabled globally and no-ops without a registered parser.
+        if plan.source_key != "muse-glimmer":
+            assert engine["tool_call_parser"], plan.profile_id
         # No profile forces the chat client back out of thinking mode.
         assert plan.chat_template_kwargs.get("thinking") is not False, (
             plan.profile_id
@@ -595,26 +607,24 @@ def test_dsv4_hybrid_8_is_the_tp4_dp2_throughput_tier():
     assert plan.quant.name == "Q4K-tail"
     assert plan.engine["tensor_parallel_size"] == 4
     assert plan.engine["data_parallel_size"] == 2
-    # PIECEWISE capture-32 is the 2026-08-11 degeneration mitigation;
-    # see the profile note and the incident entries in the perf notebook.
-    assert plan.engine["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+    # FULL capture-64 restored 2026-08-11 with the bt_per_token persistence
+    # fix (0/8 storm campaign); see the profile note and perf notebook.
+    assert plan.engine["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
     capture = plan.engine["compilation_config"]["max_cudagraph_capture_size"]
-    assert capture == 32
+    assert capture == 64
 
 
-def test_dsv4_mxfp4_8_is_tp8_with_piecewise_capture():
-    """Eight-GPU MXFP4 serves TP8. PIECEWISE capture-32 is the 2026-08-11
-    degeneration mitigation (FULL_DECODE_ONLY boots storm into silent
-    NaN/BOS-loop output under DSpark c11+ load; see the perf notebook
-    incident entries). The 2026-08-10 capture-64 c8 win is deliberately
-    given back until the race is fixed."""
+def test_dsv4_mxfp4_8_is_tp8_with_wide_capture():
+    """Eight-GPU MXFP4 serves TP8; graph capture 64 keeps the 48-token c8
+    verify batches on CUDA graphs. FULL restored 2026-08-11 with the
+    bt_per_token persistence fix (0/8 storm campaign; see notebook)."""
     mxfp4 = resolve("dsv4-mxfp4-8", "a100", 8, None)
     assert mxfp4.quant.name == "MXFP4"
     assert mxfp4.engine["tensor_parallel_size"] == 8
     assert "data_parallel_size" not in mxfp4.engine
-    assert mxfp4.engine["compilation_config"]["cudagraph_mode"] == "PIECEWISE"
+    assert mxfp4.engine["compilation_config"]["cudagraph_mode"] == "FULL_DECODE_ONLY"
     capture = mxfp4.engine["compilation_config"]["max_cudagraph_capture_size"]
-    assert capture == 32
+    assert capture == 64
 
 
 def test_dsv4_2_a100_kv_budget_is_per_quant():
