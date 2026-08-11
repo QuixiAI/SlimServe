@@ -85,6 +85,14 @@ def apply_temperature(
         quixicore_ops.v2_apply_temperature(logits, expanded_idx_mapping, temperature)
         return
 
+    if logits.device.type == "mps":
+        # Torch fallback, matching the kernel: greedy rows (temperature 0)
+        # divide by 1 and are resolved by argmax downstream.
+        temps = temperature[expanded_idx_mapping.to(torch.long)].to(logits.dtype)
+        temps = torch.where(temps == 0, torch.ones_like(temps), temps)
+        logits.div_(temps.unsqueeze(1))
+        return
+
     BLOCK_SIZE = 8192
     num_blocks = cdiv(vocab_size, BLOCK_SIZE)
     _temperature_kernel[(num_tokens, num_blocks)](

@@ -1452,6 +1452,7 @@ decision, and raw artifact locations.
   collapse, quantified); the tiles win 1.3-2.0x at prefill-chunk widths.
   Gate set to 768: prefill chunks ride the tiles, decode/verify widths
   keep the fused route.
+
 - E2e note (gate was 32 during the run, i.e. seg over-applied): c1/12K/c8
   par with the capture-64 baseline; c1 cold 202.6 (acc 4.06). The c8
   cross-boot comparison is acceptance-confounded in BOTH directions
@@ -1522,6 +1523,7 @@ decision, and raw artifact locations.
   (+43%), 12K 76->139 (+83%), 128K 56->90 (+61%), c8 ~110->250-320
   (~2.5x). c1 now sits within ~2% of q4ktail-4's r2 (158 vs 162) despite
   1.7x the activated bytes.
+
 - Multi-wide GEMV re-ranked: with aligned loads the fused path runs
   ~1.01 ms at 48 tokens; route dedup's remaining ceiling is ~1.67x at
   verify widths (~0.6 ms floor). Still the next fused-path lever, after
@@ -1634,6 +1636,7 @@ interacting with full-decode graph replay and the async aux streams
   overlapping sonnet windows.
 
 ### Valid capacity data (healthy acceptance 3.9-4.6, both instances under
+
 ### simultaneous load, per-instance cells)
 
 | conc | per-instance tok/s (valid cells) | est. healthy box total |
@@ -1931,3 +1934,107 @@ FULL graphs, followed by a clean 6-boot tripwire campaign.
 - Raw artifacts: perf/results/2026-08-10/dsv4-metal-256k-real-use/
   (serve logs 1-6, no-spec log, native stack sample of the stalled step,
   staged validation transcript).
+
+## 2026-08-10 - Muse-Glimmer-30B: New Model Family Bring-Up On Metal (muse-kdyn-1)
+
+- Status: text serving VALIDATED end to end on Metal with DFlash speculation
+  and the muse reasoning parser; vision executes end to end but produces
+  spatially/chromatically scrambled descriptions (in progress); profile
+  registered; two Metal gaps closed on the way.
+- Scope: meta-models/Muse-Glimmer-30B-GGUF (kquant-dynamic default,
+  kquant-17gb alternative, mmproj vision tower, DFlash drafter). Arch was in
+  NO local stack (fork, upstream vLLM, mainline llama.cpp). References used:
+  transformers commit fe95f5423d (merged 2026-08-10) and llama.cpp PR 26841
+  (fetched as ~/llama.cpp branch muse-pr; llama-completion built in
+  build-muse/ and used as the working reference).
+- New support written (all in this repo):
+  - Config/tokenizer: gguf_muse_glimmer.py builders (text+vision+dflash),
+    parser dispatch by `dflash.expert_count` presence, llama4 (GPT-4o)
+    pretokenizer split, MuseGlimmerConfig.
+  - Models: muse_glimmer.py (dense 52L, GQA 32/2, QK-norm with GGUF-baked
+    qk_scale 3.87, sigmoid-gated attention, sandwich norms with
+    post_norm_eps 1e-8, [local x3, global] pattern, RoPE theta 500k
+    INTERLEAVED (llama.cpp NORM type; the conversion un-permutes HF Q/K) on
+    local layers only, NoPE globals, scale-then-softcap logits, and the
+    WEIGHTLESS EMBEDDING RMSNORM from llama.cpp muse-glimmer.cpp:74 -- the
+    final root cause of degenerate output; raw embedding RMS is ~0.06);
+    muse_glimmer_dflash.py (stock DFlashQwen3 shape + torch-native context-KV
+    precompute for MPS + shared target embed/lm_head); vision tower +
+    3-linear projector + single-tile 896 processor in muse_glimmer.py.
+  - Loader: MuseGlimmerGGUFAdapter (+dflash variant) with explicit name
+    maps; embedding table dequantized to fp16 at load (~2.7 GiB) because
+    Metal has no generic GGUF dequant kernel (binding the vendored
+    dequant_gather shader is the follow-up).
+  - Reasoning parser `muse_glimmer` for the Harmony-like
+    `<|start|>assistant to=self<|message|>` format.
+- Metal gaps closed:
+  - Sliding-window attention wired: the vendored paged_attn_v2 shader
+    already had `window` support; the binding hardcoded 0. Extended
+    qc_metal_serving.mm + ops.py + metal_attn.py (kernel window on decode,
+    banded mask + window-clamped gather on SDPA; gather also stops reading
+    hybrid-manager-freed blocks)._quixicore_C rebuilt.
+  - METAL_ATTN added to AttentionBackendEnum (first plain-Attention model on
+    this backend).
+  - apply_temperature torch fallback for MPS (sampler stage DSV4 never hit).
+  - Multimodal pin_memory disabled under MPS at the reduce_data choke point
+    (pin_memory() raises storage-device mismatch on the MPS backend).
+  - Profile guards: kv_cache_dtype MUST be "auto" (fork default fp8_e4m3
+    has no Metal path); gpu_memory_utilization null at base level breaks
+    slimserve arg rendering (removed).
+- Debug method that found the embedding-norm root cause: tokenize parity
+  (identical ids), Q5_K/Q6_K/Q4_K qgemv parity vs numpy dequant (cos=1.0,
+  kernels exonerated), layer-0 tensor-sum parity vs llama-eval-callback
+  (matched), then graph diff exposed `embd_norm`. Offline greedy now
+  produces 'The capital of France is Paris. ...'.
+- Serving validation (port 8078, spec on): cold 'muse glimmer ok' (21 s incl
+  first compile), warm greedy '42' 7 s, temp-0.7 runs (reply consumed by
+  reasoning channel under small max_tokens -- parser behavior, not a bug).
+  Image request: 1092 prompt tokens (68 text + 1024 image, single-tile
+  geometry as designed), completes without crash.
+- OPEN (vision correctness): red-bg/blue-circle test image is described with
+  wrong hues/shape ('blue, green, yellow irregular shape'). Numerics are
+  alive (pixel channels correct into the tower, outputs position-varying,
+  projected std 1.02 vs text 0.06 -- rebalanced by the embedding norm).
+  Suspect patch-embed weight axis order or the 2x2 merge/position-embed
+  geometry vs llama.cpp's clip implementation. Next: diff tower layer-0
+  against llama.cpp mtmd on the same image; test BGR/axis-flip hypotheses.
+- OPEN (minor): spec_decode_num_drafts_created metric emits a unix
+  timestamp; drafter acceptance-length not yet measured; temp-0.7 needs a
+  larger-budget clean check; dynamic-aspect (smart_resize) preprocessing
+  still single-tile square; TurboQuant draft KV not configured.
+- Perf snapshot (not tuned): warm greedy short reply ~7 s wall including
+  ~50-token reasoning channel. No exact-token benchmark run yet; README
+  reference for this box: 26.6 tok/s no-spec / 50.2 with DFlash (llama.cpp/
+  ExecuTorch measurements).
+- Raw artifacts: scratchpad muse-serve.log, muse_probe.py, muse_variants.py,
+  muse_layer0.py, muse_qparity.py, muse_vision_probe.py, muse_mm_gen.py;
+  llama.cpp reference at ~/llama.cpp (branch muse-pr, build-muse/bin).
+
+## 2026-08-10 - Muse-Glimmer Vision Root-Caused And VALIDATED (muse-kdyn-1)
+
+- Status: text AND image serving validated end to end through the OpenAI API
+  on Metal with DFlash speculation and the muse reasoning parser. The
+  registered profile is live.
+- Vision root cause (via llama.cpp PR 26841's clip implementation,
+  tools/mtmd/models/muse-glimmer.cpp + clip.cpp set_input): the tower is NOT
+  a plain ViT. It uses (a) 2D RoPE theta 10000 on every layer -- first half
+  of head_dim rotated by 1-indexed width position, second half by height,
+  GPT-J interleaved pairs per half; (b) sparse block-diagonal WINDOW
+  attention over 32x32-patch windows with every 4th (1-based) and the last
+  layer global; (c) window-order permutation around the block stack; and
+  (d) a channel-outer pixel shuffle: the 6144 projector input is
+  [c0s0..c0s3, c1s0..] (spatial fastest), the transpose of the naive
+  per-patch concat. Before these, solid red and green were both described
+  as "olive-brown"; after, red/green/blue solids are named correctly and
+  the red-bg/blue-circle image is described as "A blue oval sits on a red
+  background" (oval, correctly: the single-tile square resize stretches the
+  4:3 test image; llama.cpp's aspect-preserving smart_resize is the noted
+  follow-up).
+- Server validation (staged, port 8078): cold 'muse glimmer ok' 22 s
+  (first-compile inclusive), warm greedy '42' 7 s, image reply 21 s at 1092
+  prompt tokens (68 text + 1024 image). No engine errors across the run.
+- Remaining open items (unchanged from previous entry): exact-token
+  performance benchmark (README reference for this box: 26.6/50.2 tok/s),
+  spec acceptance-length measurement + the timestamp-poisoned
+  spec_decode_num_drafts_created counter, smart_resize dynamic-aspect
+  preprocessing, TurboQuant draft KV, ATEM tool-call parser.

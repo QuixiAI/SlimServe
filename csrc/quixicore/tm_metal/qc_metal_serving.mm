@@ -207,7 +207,8 @@ at::Tensor mla_decode_fp8_sparse(const at::Tensor& q, const at::Tensor& kv_data,
 at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                            const at::Tensor& value_cache,
                            const at::Tensor& block_table,
-                           const at::Tensor& context_lens, double scale) {
+                           const at::Tensor& context_lens, double scale,
+                           int64_t window) {
   check_mps(q, "q");
   check_mps(key_cache, "key_cache");
   check_mps(value_cache, "value_cache");
@@ -237,7 +238,8 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                                num_kv_heads, head_size, block_size,
                                block_table_stride, static_cast<float>(scale),
                                /*alibi_slopes=*/q, /*use_alibi=*/0,
-                               /*block_mask=*/q, /*use_mask=*/0, /*window=*/0,
+                               /*block_mask=*/q, /*use_mask=*/0,
+                               /*window=*/static_cast<int>(window),
                                /*mask_heads=*/0, activation_type_name(q));
   });
   return out;
@@ -651,10 +653,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("sm_scale"), pybind11::arg("partition_size") = 0);
 
   m.def("paged_attention", &paged_attention,
-        "Dense/GQA paged attention decode over the block-table KV cache",
+        "Dense/GQA paged attention decode over the block-table KV cache. "
+        "window > 0 limits each query to the last `window` positions.",
         pybind11::arg("q"), pybind11::arg("key_cache"),
         pybind11::arg("value_cache"), pybind11::arg("block_table"),
-        pybind11::arg("context_lens"), pybind11::arg("scale"));
+        pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("window") = 0);
 
   m.def("deepseek_v4_qnorm_rope_kv_insert", &deepseek_v4_qnorm_rope_kv_insert,
         "DeepSeek-V4 Q norm/RoPE plus packed FP8 KV insert", pybind11::arg("q"),

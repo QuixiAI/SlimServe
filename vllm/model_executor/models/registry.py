@@ -96,6 +96,7 @@ _TEXT_GENERATION_MODELS = {
         "vllm.models.inkling",
         "InklingForConditionalGeneration",
     ),
+    "MuseGlimmerForCausalLM": ("muse_glimmer", "MuseGlimmerForCausalLM"),
     # transformers's mpt class has lower case
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
@@ -234,6 +235,10 @@ _MULTIMODAL_MODELS = {
         "Gemma4UnifiedForConditionalGeneration",
     ),
     "Glm5vForConditionalGeneration": ("glm5v", "Glm5vForConditionalGeneration"),
+    "MuseGlimmerForConditionalGeneration": (
+        "muse_glimmer",
+        "MuseGlimmerForConditionalGeneration",
+    ),
     "GraniteSpeechForConditionalGeneration": (
         "granite_speech",
         "GraniteSpeechForConditionalGeneration",
@@ -380,6 +385,10 @@ _MULTIMODAL_MODELS = {
 
 _SPECULATIVE_DECODING_MODELS = {
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    "DFlashMuseGlimmerDraftModel": (
+        "muse_glimmer_dflash",
+        "MuseGlimmerDFlashDraftModel",
+    ),
     "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
     "DFlashLagunaForCausalLM": ("laguna_dflash", "DFlashLagunaForCausalLM"),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
