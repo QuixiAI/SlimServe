@@ -1766,3 +1766,53 @@ Storm rate 2/6. Two decisive facts:
 Next instruments: per-row request-id logging on NaN events (to trace the
 contagion path), and a NaN probe at attention-output vs MoE-output to
 bisect the layer pipeline. PIECEWISE arm in flight.
+
+### 2026-08-11 - Row-index fingerprints: the seam pattern
+
+With NaN row indices logged, the rare events stop looking random:
+`1/7 rows=[5]` at step 6 AND at step 545 (same boot, pw2), followed once
+by `6/14 rows=[0-5]` (the first request's entire verify window one step
+later). A 7-row decode batch is a request seam - one request with 6
+spec-verify rows plus one with a single row - i.e. mixed decode_lens,
+the `requires_padding` pack_seq_triton path in sparse_attn_indexer. The
+FP8 branch packs Q with NO pad_value (the MXFP4 branch was given
+pad_byte=0 precisely "so padded slots dequantize to 0 and can't produce
+NaN/Inf in the logits kernel" - the FP8 branch kept the assumption that
+"downstream context_lens masks stale slots"). Uninitialized fp8 pad
+bytes can encode NaN, and whether the recycled allocator memory behind
+the pad slots is hostile is decided per boot - the first mechanism
+found that produces BOTH the positional determinism (last row at a
+seam) and the boot lottery. PIECEWISE boots show the same rare seam
+events without storms so far; the storm-contagion step remains to be
+traced (APC-shared blocks / pool reuse suspected).
+
+Next concrete reproducer: two staggered requests forming the 6+1 batch
+shape, with seq_lens / packed-Q / unpacked-index instrumentation at the
+seam; and give the FP8 pack a pad_value=0 like the FP4 branch, then
+re-run the FULL-arm campaign as the fix candidate.
+
+### 2026-08-11 - Seam theory corrected
+
+Three corrections from direct testing:
+
+1. torch's fp8e4m3fn cast SATURATES +-inf to +-448 (verified on device),
+   so pack_seq_triton's default -inf pad is not a NaN generator via the
+   torch cast.
+2. More decisively: Triton on sm80 cannot compile _pack_seq_kernel for
+   fp8e4m3 AT ALL ("type fp8e4nv not supported in this architecture") -
+   the requires_padding decode path would crash the server if it ever
+   executed, and it never has. That path is dead code on A100 serving:
+   decode batches are always uniform next_n; short requests route
+   through the prefill chunks instead.
+3. Therefore the 7-row NaN batches (rows=[5] fingerprint) are
+   decode+PREFILL mixes: one spec request's 6 verify rows plus a
+   prefilling request's final chunk row. The suspect surface moves to
+   the decode/prefill interaction inside sparse_attn_indexer - the
+   shared topk_indices_buffer and gather workspace partitioning - or
+   the mixed-batch handling in the sparse MLA forward itself.
+
+The two seam fixes landed anyway as prophylactics (per-request
+decode_len anchoring + zeroed pad lengths + pad_value=0), all no-ops
+for the workloads this box actually runs. Next reproducer: one
+long-prefill request submitted mid-decode of one spec request, dual
+tripwires armed - the minimal decode+prefill mix.
