@@ -601,8 +601,13 @@ def sparse_attn_indexer(
                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
                 )
             else:
+                # pad_value=0 for the FP8 path too: the default leaves pad
+                # slots as recycled allocator bytes, and fp8 bit patterns
+                # 0x7f/0xff decode to NaN. "Downstream masks stale slots"
+                # only holds when every consumer masks; zero pads make the
+                # question moot (matching the MXFP4 branch above).
                 padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
+                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
                 )
                 padded_q_scale = None
         else:

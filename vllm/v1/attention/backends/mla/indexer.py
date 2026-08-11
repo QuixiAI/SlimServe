@@ -870,17 +870,34 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             requires_padding = min_decode_len != max_decode_len
             if use_native and next_n > 1:
                 assert self.decode_seq_lens_buffer.dim() == 1
-                # (B, max_decode_len): token j attends to
-                # L - max_decode_len + j + 1 KV tokens.
+                # (B, max_decode_len): token j of request b attends to
+                # L_b - decode_len_b + j + 1 KV tokens. pack_seq_triton packs
+                # each request's real tokens left-aligned at j=0, so the
+                # per-request decode_len - NOT max_decode_len - anchors the
+                # first position. With max_decode_len here, a request with
+                # decode_len < next_n in a mixed batch had every real
+                # position's context understated by (max_decode_len -
+                # decode_len), e.g. by 5 for a 1-token request at k=5.
                 seq_lens_buffer = self.decode_seq_lens_buffer[
                     : num_decodes * max_decode_len
                 ].view(num_decodes, max_decode_len)
                 seq_lens_buffer[:] = (
                     seq_lens.unsqueeze(1)
-                    - max_decode_len
+                    - decode_lens.unsqueeze(1)
                     + 1
                     + self.offsets_buffer[:max_decode_len]
                 )
+                if requires_padding:
+                    # Pad slots (j >= decode_len_b) would otherwise carry
+                    # lengths beyond L_b and scan past the request's last
+                    # allocated block. Zero them so the logits and top-k
+                    # kernels skip pad rows outright instead of scoring
+                    # stale memory that unpack later discards.
+                    seq_lens_buffer.masked_fill_(
+                        self.offsets_buffer[:max_decode_len].unsqueeze(0)
+                        >= decode_lens.unsqueeze(1),
+                        0,
+                    )
                 seq_lens = seq_lens_buffer
             return seq_lens, block_table, decode_lens, num_decodes, requires_padding
 
