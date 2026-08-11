@@ -2059,3 +2059,30 @@ its layer for free. Success criterion: 0/8 storms (pre-fix FULL stormed
 2/6) keeps FULL graphs on the table for restoration; any storm sends
 the campaign logs - now with per-layer birth data - into the next
 analysis round.
+
+### 2026-08-11 - Birth attribution: layer 0 input; kernel exonerations
+
+Intra-layer probes (vfix boots 1-3, two independent boots pre-refinement
+plus one with phase slots) place the NaN at LAYER 0'S ATTENTION INPUT
+(slot 100) with attention and MoE outputs clean - the attention guards
+and Q8 quantization launder NaN to zeros while the residual stream
+carries it to the head. Births are exclusively at <=8-row steps
+(rows=[5] of 7, 1/8); the 11-35-row sightings are carry-forward.
+The <=8-token gate exactly matches _norm_with_prequant's fused
+ggml_dsv4_rms_norm_q8_1 path.
+
+Hostile unit tests then EXONERATED each isolated component of the
+layer-0 input chain on this GPU: dsv4_mhc_pre (70 cases x 3 outputs,
+NaN/inf/huge pools, zero/tiny rows), ggml_dsv4_rms_norm_q8_1 (192
+hostile-pool cases, T=1-8), plus persistent_topk and FilteredTopK
+earlier (5,760 rows each). torch.index_select bounds-asserts, so a
+stray -1 token id cannot silently junk-read the GGUF embedding. The
+birth is therefore in INTEGRATION - graph replay, TP collectives, or
+the aligned-Q8/prequant interplay - not in any kernel in isolation.
+
+Method upgrade: the step-6 warmup event fires on most boots, so short
+runs (300 output tokens) make single boots informative at ~4 min/boot.
+Queued arms (3 boots each): baseline env, ALIGNED_Q8=0,
+PREQUANT_ATTN=0, AUX_STREAMS=0. Note the prior "env-less boots show
+zero events" observation is VOID - those boots predate the V2-runner
+tripwire hook; no instrumented env-less boot exists yet.
