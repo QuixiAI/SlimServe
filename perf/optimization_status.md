@@ -2086,3 +2086,17 @@ Queued arms (3 boots each): baseline env, ALIGNED_Q8=0,
 PREQUANT_ATTN=0, AUX_STREAMS=0. Note the prior "env-less boots show
 zero events" observation is VOID - those boots predate the V2-runner
 tripwire hook; no instrumented env-less boot exists yet.
+
+### 2026-08-11 - vfix campaign verdict: 8 boots, 0 storms
+
+FULL_DECODE_ONLY capture-64 WITH the bt_per_token persistence fix
+(commit 0a3163da6): 8 boots, identical trigger protocol to the pre-fix
+campaign, ZERO storms (pre-fix: 2/6). Fisher p~0.17 alone; combined
+with the fix being mechanism-directed at the builder's documented
+persistence gap, the storm path is plausibly closed. Rare seed events
+persist unchanged (~2 per boot, 5 of 8 boots, always <=8-row births,
+zero top-k violations) - consistent with the fix addressing storm
+amplification, not the seed. The documented bar for restoring FULL
+graphs (persistence work + clean 6-boot campaign) is met; restoration
+decision deferred until the env arms attribute the seed, since the
+same boots serve both purposes.
