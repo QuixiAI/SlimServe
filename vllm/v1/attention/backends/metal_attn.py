@@ -174,10 +174,8 @@ class MetalAttentionImpl(AttentionImpl):
             raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi has no Metal attention path.")
-        if sliding_window is not None:
-            raise NotImplementedError(
-                "Sliding-window attention is not wired on Metal yet."
-            )
+        # Sliding windows ride the paged-attention kernel's `window` argument
+        # on the decode path and a banded mask on the SDPA fallback.
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
                 f"Metal attention is decoder-only, got {attn_type}."
@@ -244,6 +242,7 @@ class MetalAttentionImpl(AttentionImpl):
                         attn_metadata.block_table,
                         attn_metadata.seq_lens_gpu,
                         self.scale,
+                        self.sliding_window or 0,
                     )
                 )
                 return output
@@ -277,8 +276,17 @@ class MetalAttentionImpl(AttentionImpl):
             seq_len = int(seq_lens[req])
 
             num_req_blocks = (seq_len + block_size - 1) // block_size
+            query_len_req = end - begin
+            # Sliding window: no query row in this request sees a key before
+            # kv_start, so blocks before it are never gathered. With the
+            # hybrid KV manager those blocks may already be freed; reading
+            # them would be stale, not just wasteful.
+            kv_start = 0
+            if self.sliding_window is not None:
+                kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
+            first_block = kv_start // block_size
             blocks = (
-                metadata.block_table[req, :num_req_blocks]
+                metadata.block_table[req, first_block:num_req_blocks]
                 .to(torch.long)
                 # The profile run allocates a small dummy cache whose block
                 # table can point past it. That output is discarded; a real
@@ -286,11 +294,13 @@ class MetalAttentionImpl(AttentionImpl):
                 .clamp_(0, num_blocks - 1)
             )
             seq_len = min(seq_len, num_req_blocks * block_size)
+            row_start = kv_start - first_block * block_size
+            row_end = seq_len - first_block * block_size
 
             keys = key_cache.index_select(0, blocks)
-            keys = keys.reshape(-1, num_kv_heads, head_size)[:seq_len]
+            keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
             values = value_cache.index_select(0, blocks)
-            values = values.reshape(-1, num_kv_heads, head_size)[:seq_len]
+            values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
 
             if self.num_queries_per_kv > 1:
                 keys = keys.repeat_interleave(self.num_queries_per_kv, dim=1)
@@ -300,12 +310,18 @@ class MetalAttentionImpl(AttentionImpl):
             mask = None
             if metadata.causal and query_len > 1:
                 # Query j sits at absolute position seq_len - query_len + j and
-                # may attend every key at or before it.
+                # may attend every key at or before it, back at most
+                # `sliding_window - 1` positions.
                 query_pos = torch.arange(
                     seq_len - query_len, seq_len, device=query.device
                 )
-                key_pos = torch.arange(seq_len, device=query.device)
-                mask = (key_pos[None, :] <= query_pos[:, None])[None]
+                key_pos = torch.arange(kv_start, seq_len, device=query.device)
+                mask = key_pos[None, :] <= query_pos[:, None]
+                if self.sliding_window is not None:
+                    mask &= key_pos[None, :] > (
+                        query_pos[:, None] - self.sliding_window
+                    )
+                mask = mask[None]
 
             attended = F.scaled_dot_product_attention(
                 query[begin:end].transpose(0, 1),

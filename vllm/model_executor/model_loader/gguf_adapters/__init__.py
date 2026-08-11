@@ -15,6 +15,7 @@ from .dflash import DFlashGGUFAdapter
 from .glm_dsa import GlmDsaGGUFAdapter
 from .kimi_k3 import KimiK3GGUFAdapter
 from .kimi_k3_dspark import KimiK3DSparkGGUFAdapter
+from .muse_glimmer import MuseGlimmerDFlashGGUFAdapter, MuseGlimmerGGUFAdapter
 
 __all__ = [
     "BaseGGUFWeightsAdapter",
@@ -24,4 +25,6 @@ __all__ = [
     "GlmDsaGGUFAdapter",
     "KimiK3GGUFAdapter",
     "KimiK3DSparkGGUFAdapter",
+    "MuseGlimmerDFlashGGUFAdapter",
+    "MuseGlimmerGGUFAdapter",
 ]

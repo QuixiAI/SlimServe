@@ -241,7 +241,8 @@ def _show(plan: Plan) -> None:
         print(f"  {key:<9} {value}")
     if plan.speculative:
         spec = plan.source["speculator"]
-        print(f"  spec      DSpark k={spec['engine']['num_speculative_tokens']}")
+        method = spec["engine"].get("method", "dspark")
+        print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:
