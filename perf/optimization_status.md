@@ -2100,3 +2100,31 @@ amplification, not the seed. The documented bar for restoring FULL
 graphs (persistence work + clean 6-boot campaign) is met; restoration
 decision deferred until the env arms attribute the seed, since the
 same boots serve both purposes.
+
+### 2026-08-11 - FULL graphs restored to production; seed campaign phase-blocked
+
+Env attribution campaigns: the short-run pilot (base arm only, 1 event
+in 3 boots) showed the 300-token protocol is underpowered; the focused
+full-length campaign (4 boots baseline vs 4 boots VLLM_DSV4_ALIGNED_Q8=0,
+interleaved) ran 8/8 boots with ZERO events in either arm - the box
+entered a dormant phase mid-investigation (the same hours-scale drift
+seen throughout). Uninformative by design rather than misleading; the
+runbook in perf/diagnostics/dsv4-nan/README.md says to fire
+campaign_env2.sh when production NAN_WATCH shows events again.
+
+Production decision: the documented restoration bar (bt_per_token
+persistence fix + clean multi-boot FULL campaign) is met - 0/8 storms
+vs 2/6 pre-fix. All four A100 dsv4 tiers are back on FULL_DECODE_ONLY
+capture-64 (+12% c11 over PIECEWISE); both daemons restarted and
+NAN_WATCH stays on permanently, with the canary as the last line.
+The rare sub-critical seed (single-token quality blips, both graph
+modes, layer-0-input births at <=8-row batches, all kernels exonerated
+in isolation) remains OPEN at reduced priority now that storms are
+closed and detection is standing.
+
+Cross-stream test repairs (Metal session collisions on main): muse-glimmer
+added to the supported-sources set; dsv4 metal 256K resize reflected
+(max_model_len 262144, 16 GiB KV); the dspark/TQ invariant now reads
+each source's registered speculator method (muse uses DFlash k=16);
+tool_call_parser required for all families except muse-glimmer, which
+has no tool parser in this fork (auto tool choice no-ops without one).
