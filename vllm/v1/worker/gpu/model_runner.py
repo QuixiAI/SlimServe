@@ -1148,6 +1148,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
                         "(reported at step %d) rows=%s",
                         count, rows, step, self._nan_watch_step, idxs)
+                    from vllm.model_executor.layers import nan_probe
+                    layers = nan_probe.snapshot()
+                    if layers is not None:
+                        logger.error(
+                            "NAN_WATCH_LAYERS: cumulative per-layer NaN "
+                            "counts (slot, count): %s — birth layer is the "
+                            "minimum slot", layers[:16])
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
             nan_mask = torch.isnan(logits).any(dim=-1)

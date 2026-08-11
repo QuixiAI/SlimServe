@@ -20,6 +20,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers import nan_probe
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -1283,6 +1284,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
+            if nan_probe.enabled():
+                nan_probe.probe(
+                    idx,
+                    *(hidden_states if isinstance(hidden_states, tuple)
+                      else (hidden_states,)),
+                    residual,
+                )
             if (idx + 1) in self.aux_hidden_state_layers:
                 # On the unfused (aiter) path the layer already applied hc_post,
                 # so hidden_states is the reconstructed stream; on the fused

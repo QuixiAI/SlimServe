@@ -162,6 +162,14 @@ class QuixiCoreMLASparseMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
+        # Per-token block-table gather, ROCm-parity persistence: computed in
+        # build() into a persistent buffer instead of lazily inside the first
+        # layer's forward. Lazy in-forward compute allocated the gather output
+        # per step, which under FULL-graph capture baked a capture-pool
+        # address into every layer's kernels while replay-time metadata was
+        # rebuilt around it — the buffer-persistence gap the old TODO warned
+        # about. Allocated on first build (block-table width is per-boot).
+        self.bt_per_token_buffer: torch.Tensor | None = None
 
     def build(
         self,
@@ -186,9 +194,26 @@ class QuixiCoreMLASparseMetadataBuilder(
         )
         self.req_id_per_token_buffer[req_id_per_token.shape[0] :].fill_(0)
 
-        # TODO(quixicore-cuda): spec-decode uniform-batch handling and the
-        # CUDA-graph capture path need the same buffer-persistence treatment
-        # as the ROCm builder before FULL_DECODE_ONLY graphs are enabled.
+        block_table = common_attn_metadata.block_table_tensor
+        if (
+            self.bt_per_token_buffer is None
+            or self.bt_per_token_buffer.shape[1] != block_table.shape[1]
+        ):
+            self.bt_per_token_buffer = torch.zeros(
+                (
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    block_table.shape[1],
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        torch.index_select(
+            block_table.to(torch.int32),
+            0,
+            self.req_id_per_token_buffer[:num_tokens],
+            out=self.bt_per_token_buffer[:num_tokens],
+        )
+
         return QuixiCoreMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -204,6 +229,7 @@ class QuixiCoreMLASparseMetadataBuilder(
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
+            bt_per_token=self.bt_per_token_buffer[:num_tokens],
         )
 
 
