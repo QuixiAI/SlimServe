@@ -1011,6 +1011,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not fused_norm:
             x, prequant_input = self._norm_with_prequant(x, self.attn_norm)
+        # Intra-layer birth attribution for the NaN hunt (layers 0-2 only,
+        # where the per-layer probe located the birth). Slot scheme:
+        # 100 + 4*layer + phase; phase 0 = attention input (post-mHC+norm),
+        # 1 = attention output, 2 = MoE input, 3 = MoE output.
+        _probe_intra = nan_probe.enabled() and self._layer_index in (0, 1, 2)
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 0, x)
         x = self.attn(
             positions,
             x,
@@ -1019,6 +1026,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 prequant_input if self._ampere_prequant_attention else None
             ),
         )
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 1, x)
 
         transition = self._fused_post_pre_with_optional_reduce(
             x,
@@ -1043,11 +1052,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         prequant_input = transition[4] if fused_norm else None
         if not fused_norm:
             x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 2, x)
         x = self.ffn(
             x,
             input_ids,
             prequant_input=(prequant_input if self._ampere_prequant_moe else None),
         )
+        if _probe_intra:
+            nan_probe.probe(
+                100 + 4 * self._layer_index + 3,
+                *(x if isinstance(x, tuple) else (x,)),
+            )
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(

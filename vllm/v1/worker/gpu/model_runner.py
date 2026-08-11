@@ -1152,9 +1152,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     layers = nan_probe.snapshot()
                     if layers is not None:
                         logger.error(
-                            "NAN_WATCH_LAYERS: cumulative per-layer NaN "
-                            "counts (slot, count): %s — birth layer is the "
-                            "minimum slot", layers[:16])
+                            "NAN_WATCH_LAYERS: cumulative NaN counts "
+                            "(slot, count): %s — slots 0-60 are layer "
+                            "outputs (birth = min); slots 100+4L+p are "
+                            "intra-layer for L in 0-2 (p: 0=attn-in, "
+                            "1=attn-out, 2=moe-in, 3=moe-out)",
+                            [x for x in layers if x[0] >= 100]
+                            + layers[:8])
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
             nan_mask = torch.isnan(logits).any(dim=-1)
