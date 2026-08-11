@@ -1668,3 +1668,69 @@ estimates. c1 per instance (NCCL boot, fresh text): 137.0 at acc 3.12 and
 Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` (51 files:
 every benchmark JSON incl. degenerate runs, server logs for the manual
 TP4/TP2/no-spec/defer-off boots).
+
+## 2026-08-11 - Degeneration race: overnight bisection session 2
+
+### Conclusions that DIED tonight (each looked solid on 1-2 boots)
+
+1. "Custom allreduce is the culprit" - disproven yesterday (B stormed on
+   NCCL), reconfirmed dead tonight.
+2. "GPU 6 hardware fault" - {0,1,2,6} stormed while {0,1,2,7} was clean,
+   twice, and GPU 6 sits on the PCI address that logged an Xid 13 warp
+   exception during the 08-10 01:33 crash. But after a full driver+fabric
+   reload the same {0,1,2,6} cell was clean AND instance A stormed on
+   {0,1,2,3}. ECC/row-remap/NVLink counters clean throughout.
+3. "Driver reload fixed it" - A stormed minutes after the reload.
+4. "The eager fallback above capture-64 is the trigger" - NaN events
+   occur at c10 (60 rows, graphed) and c11 (66 rows, eager) alike.
+5. "persistent_topk (<=32-row dispatch) is the source" - forced-arm test
+   INVERTED it: force-persistent boot clean (8 NaN lines), force-Filtered
+   boot stormed (4,038 lines, 11/11 degenerate). But a later force-Filtered
+   boot was clean and an aux-overlap-off boot stormed, so single-boot arm
+   comparisons are worthless (see 7).
+6. "Aux-stream overlap race" - VLLM_DSV4_INNER_ATTENTION_OVERLAP=0
+   stormed.
+7. THE ACTUAL INVARIANT SO FAR: whether a boot storms is decided at (or
+   near) boot time - a boot lottery - and persists for that boot's
+   lifetime. Configuration changes appeared causal only because each arm
+   was sampled once. Storms never appeared at c1-c8 across ~50 runs; they
+   appear on roughly half of boots under c11+ spec verify load. The
+   original quartet-migration pattern was the same lottery sampled through
+   daemon restarts.
+
+### What survived scrutiny
+
+- The failure chain: NaN logits row -> sampler guard emits token 0 -> BOS
+  self-sustains at temp 0 -> request poisoned; poisoned requests recur as
+  NaN rows in later batches; instance-wide collapse follows.
+- DSpark speculation (next_n>1) is required; no-spec and TP2/PIECEWISE
+  cells never stormed (limited n, but consistent).
+- Kernel-level A/B: both persistent_topk and FilteredTopK pass a hostile
+  unit test (5,760 rows, NaN/inf/3e38-poisoned tails beyond each row's
+  length, lengths 513-3100, rows 1-96) - the top-k selection logic is
+  sound against uninitialized-tail input in isolation.
+- Serving-side rare NaN events (1-3 per boot) cluster at SMALL batches
+  (7-11 rows, ramp/drain) even on clean boots.
+
+### Instruments now landed (all default-off, env-gated)
+
+- VLLM_NAN_WATCH=1: async per-step NaN-row tripwire on target logits in
+  both model runners (V2 `vllm/v1/worker/gpu/model_runner.py` is the one
+  serving actually uses). One small reduction per step, detection lags one
+  step, no hot-path sync.
+- VLLM_DSV4_TOPK_VALIDATE=1: same pattern at the corruption source -
+  decode top-k indices checked against per-row seq_lens in
+  sparse_attn_indexer; an out-of-range index means sparse attention will
+  gather garbage KV.
+- VLLM_DSV4_FILTERED_TOPK_MIN_ROWS: env-tunable dispatch threshold in
+  csrc/libtorch_stable/topk.cu (default 32 = production heuristic; 0
+  forces FilteredTopK, huge forces persistent) for forced-arm testing.
+- Both production daemons run with VLLM_NAN_WATCH=1 permanently.
+
+### In flight
+
+Six-boot campaign (production config, dual tripwires, 2x c11 trigger runs
+per boot) for powered per-boot statistics: storm rate, and whether
+TOPK_VALIDATE violations precede NAN_WATCH events inside storm boots.
+Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` plus
+`/var/log/SlimServe/ss-camp*.log`.
