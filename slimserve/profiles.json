@@ -1163,7 +1163,8 @@
         "Vision: 50-block CLIP tower at 896 px, patch 14, 2x2 spatial merge into 6656-dim tokens, loaded from the published mmproj GGUF.",
         "DFlash speculation is on by default: the drafter proposes one 16-token block per call against target layers [2, 14, 26, 38, 50].",
         "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
-        "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path."
+        "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
+        "Performance note (2026-08-11): after the mixed-shard weight-copy fix, no-spec decode measures 12.8 tok/s and DFlash speculation 9.8 tok/s (k=16; k=5 is worse at 7.3 despite equal acceptance). Speculation is net-negative until the small-M GGUF matmul path is fixed -- use --no-spec for best single-stream throughput today. llama.cpp reference on this box: 26.6/50.2."
       ]
     }
   }

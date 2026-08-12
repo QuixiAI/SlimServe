@@ -463,6 +463,14 @@ class quixicore_ops:
             return False
 
     @staticmethod
+    def rms_norm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Single-dispatch bf16 RMSNorm over a contiguous [rows, D] input."""
+        return _qc().rms_norm(x, weight, eps)
+
     def paged_attention(
         q: torch.Tensor,
         key_cache: torch.Tensor,

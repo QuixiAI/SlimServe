@@ -93,11 +93,12 @@ def _dsv4_output_owned_enabled(layer: torch.nn.Module) -> bool:
         "on",
         "yes",
     }
-    moe_owned = (
-        os.environ.get("VLLM_DSV4_TP_OWNERSHIP", "0").lower()
-        in {"1", "true", "on", "yes"}
-        and prefix.endswith(".ffn.shared_experts.down_proj")
-    )
+    moe_owned = os.environ.get("VLLM_DSV4_TP_OWNERSHIP", "0").lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    } and prefix.endswith(".ffn.shared_experts.down_proj")
     return (
         (channel_owned or moe_owned)
         and getattr(layer, "tp_size", 1) in (2, 4, 8)
@@ -173,6 +174,13 @@ def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
     override = os.environ.get("VLLM_GGUF_MMVQ_MAX_BATCH")
     if override:
         return int(override)
+    if current_platform.is_metal():
+        # The Metal qgemv_mm variants are weight-stationary up to 17 rows in
+        # a single dispatch (the speculative-verify width k+1). Beyond that
+        # the host decomposes into multiple full-weight passes, which loses
+        # to the flat-in-M fragment GEMM, so prefill-sized batches route
+        # there instead.
+        return 17
     if not current_platform.is_rocm():
         return 8 if rows > 5120 else 16
     if rows >= 32768:
@@ -429,17 +437,32 @@ class GGUFLinearMethod(LinearMethodBase):
                 if bias is not None:
                     out.add_(bias)
                 return out
-            result = []
-            for idx in shard_id:
-                start, end, offset = layer.qweight.shard_offset_map[idx]
-                qweight_type = layer.qweight_type.shard_weight_type.get(
-                    idx, fallback_wtype
-                )
-                result.append(
-                    fused_mul_mat_gguf_op(
-                        x, qweight[start:end, :offset].contiguous(), qweight_type
+            # Mixed shard quant types cannot ride one fused matmul. Slicing
+            # the padded merged buffer per call would copy the quantized
+            # bytes on EVERY forward (measured 447 us for a 17.5 MB QKV on
+            # Metal, ~8x the matvec itself), so materialize the contiguous
+            # per-shard views once and release the padded buffer: it is
+            # never read again on this path, keeping the swap net-zero in
+            # memory rather than a persistent duplicate.
+            shards = getattr(layer, "_gguf_hetero_shards", None)
+            if shards is None:
+                shards = []
+                for idx in shard_id:
+                    start, end, offset = layer.qweight.shard_offset_map[idx]
+                    qweight_type = layer.qweight_type.shard_weight_type.get(
+                        idx, fallback_wtype
                     )
-                )
+                    shards.append(
+                        (qweight[start:end, :offset].contiguous(), qweight_type)
+                    )
+                layer._gguf_hetero_shards = shards
+                # Keep the parameter object (the shard maps and attribute
+                # checks ride on it); drop only its storage.
+                layer.qweight.data = layer.qweight.data.new_empty(0)
+            result = [
+                fused_mul_mat_gguf_op(x, shard_weight, shard_type)
+                for shard_weight, shard_type in shards
+            ]
             out = torch.cat(result, axis=1)
         else:
             qweight = layer.qweight
@@ -482,8 +505,7 @@ class GGUFLinearMethod(LinearMethodBase):
         else:
             shard_weight_types = [fallback_wtype]
         if x.shape[0] > 64 or any(
-            weight_type != int(WeightType.Q8_0)
-            for weight_type in shard_weight_types
+            weight_type != int(WeightType.Q8_0) for weight_type in shard_weight_types
         ):
             return self.apply(layer, x, bias)
 

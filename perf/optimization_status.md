@@ -2246,3 +2246,132 @@ FASTER with it off: clean-run c11 means 458.1 (aux-off, n=4) vs 426.7
 (aux-on, n=12) - the overlap was a net loss at seam widths anyway.
 Open root-cause thread: extend overlap_repro.py with TP + drafter
 interleave; the no-spec legacy-runner whole-batch NaN storm.
+## 2026-08-11 - Muse-Glimmer Optimization Pass 1: +75% no-spec decode
+
+- Status: two retained fixes, one retained tuning decision, bottlenecks for
+  the next pass measured and named.
+- Method: 256-token greedy decode via the API (78-token prompt, 3 runs after
+  a warmup, wall-clock over exact completion_tokens; harness and raw runs in
+  perf/results/2026-08-11/muse-optimization-pass-1/). In-process layer-chain
+  and per-op timings with torch.mps.synchronize fences.
+- Baseline (pre-pass): spec-on 7.65 tok/s, no-spec 7.34 tok/s. Speculation
+  was a wash. Reference for this box (llama.cpp/ExecuTorch, model card):
+  26.6 no-spec / 50.2 with DFlash.
+- Profiling: a decode step spent 104.8 ms of its 137 ms inside the 52-layer
+  matvec chain. Per-op timing pinned the anomaly: qkv_proj took 447 us for
+  ~17.5 MB of weights (39 GB/s) while every homogeneous projection ran at
+  ~430-450 GB/s.
+- Fix 1 (retained): GGUFLinearMethod.apply sliced the padded merged buffer
+  with .contiguous() on EVERY call for mixed-quant-type merged layers --
+  a per-forward device copy of the quantized bytes. Muse hits this on 24/52
+  QKV layers (Q5_K+Q6_K) and 31/52 gate_up layers (~6.3 GB of copies per
+  step). Now the contiguous per-shard views are materialized once and the
+  padded buffer's storage is released (net-zero memory; the parameter object
+  and shard maps are kept). qkv_proj 447 -> 88 us; mixed gate_up back to
+  ~433 GB/s. DSV4/GLM are unaffected (homogeneous or dsv4-aligned paths).
+- Fix 2 (retained): single-dispatch bf16 RMSNorm bound from the vendored
+  QuixiCore Metal kernels (rms_norm / rms_norm_dyn) and wired via
+  RMSNorm.forward_mps (~20 us/call, max_abs_err 0 vs native fp32 reference
+  at D=6656 and D=128). Also retained: fused paged-attention batch expansion
+  for uniform multi-query decode (spec verify 17 rows, draft 16), replacing
+  the per-request SDPA gather loop (+3.5% alone).
+- Result: no-spec 7.34 -> 12.78 tok/s (+74%, step 137 -> 78 ms); spec-on
+  7.65 -> 9.76 tok/s (+28%).
+- Tuning decision: k stays 16. DFlash acceptance measures 1.68 accepted per
+  draft (73% pos-0, decaying to 6% by pos-4; mean 2.68 tokens per step).
+  k=5 was tried and is WORSE (7.3 tok/s at identical acceptance), matching
+  the measured small-M anomaly in the GGUF matmul path (a 16-row chain is
+  slower than a 17-row chain: 293 vs 258 ms). Speculation is currently
+  net-negative vs no-spec (9.76 vs 12.78); the profile notes recommend
+  --no-spec for single-stream throughput until the small-M path is fixed.
+- Next bottlenecks (measured, in order):
+  1. Small-M (2..32 rows) GGUF matmul: a 17-row layer chain costs 2.46x a
+     1-row chain when the incremental cost should be near-zero at weight
+     bandwidth. This is what keeps DFlash net-negative; llama.cpp turns the
+     same drafter into +89%.
+  2. The remaining 1-row chain gap: ~78 ms step vs 37.6 ms reference =
+     per-op dispatch spread across ~10 ops/layer plus ~20-30 ms engine
+     overhead. Candidates: k-quant fused qkv/up-gate kernels (the vendored
+     fused variants are q4_0-only today), rope+qk-norm fusion, sampler path.
+- Raw artifacts: perf/results/2026-08-11/muse-optimization-pass-1/.
+
+## 2026-08-11 - qgemv_mm: Weight-Stationary Small-M GGUF Matmul For Metal
+
+- Status: kernel family retained (verified at kernel and chain level); the
+  speculative path remains net-negative end to end -- the residual cost is
+  now host-side, named below.
+- Hypothesis: the small-M band (2..32 rows -- speculative verify k+1=17,
+  draft blocks 16, small decode batches) was served by a per-row qgemv
+  (linear in M: weights re-read per row) or a fragment GEMM measured
+  4-5x off weight bandwidth (flat ~99 GB/s). A weight-stationary multi-row
+  GEMV should hold the vec kernel's ~450 GB/s across the band.
+- Change: `qgemv_mm<FMT, T, M>` in the vendored qgemv.metal -- same
+  block-major walk and lane geometry as qgemv, each dequantized 8-wide span
+  held in two float4 registers and applied to all M rows via two vec4 X
+  loads per row (the first scalar-load version scaled poorly: load-issue
+  bound, and M=32 spilled registers -- instantiations cap at M=17).
+  Instantiated for q4_0/q8_0/q4_K/q5_K/q6_K x half/bf16 x M in
+  {2,4,8,16,17}; the binding greedily decomposes larger batches and the
+  routing (`_mmvq_batch_limit`) sends M<=17 to the vec route on Metal
+  (32 was tried and regressed prefill: decomposed multi-pass loses to the
+  flat GEMM above the single-dispatch band).
+- Kernel result (real muse weights, M=17 vs the prior per-row loop):
+  o_proj Q4_K 656 -> 169 us; gate Q5_K 839 -> 186 us; down_proj Q6_K
+  3978 -> 1059 us. Beats the fragment GEMM at every M in the band. Parity
+  vs the GEMM kernel < 2e-2 relative across M including the decomposition
+  path (M=33).
+- End-to-end (256-token greedy, back-to-back same-session): no-spec
+  11.8-12.3 tok/s (yesterday's 12.78 was measured on a quieter machine;
+  runs now drift within triplets, ambient load ~3.6), spec-on k=16
+  8.6-9.2 tok/s with acceptance 1.87/draft (2.87 tokens/step).
+- Analysis: with verify matmuls now ~2x cheaper, the spec step still costs
+  ~320 ms against ~85 ms plain decode. The model-side delta accounts for
+  under half of it; the remainder is host-side spec machinery -- the MPS
+  torch rejection sampler (per-request loops + .cpu() syncs), the
+  torch-native DFlash context-KV precompute (per-layer eager ops each
+  step), and proposer bookkeeping. Speculation stays net-negative on Metal
+  until that path is addressed; the profile note stands (--no-spec for
+  single-stream throughput).
+- Next: (1) batch the MPS rejection sampler to one device pass + one sync
+  per step; (2) fuse the dflash context-KV precompute (the vendored
+  qk_norm_rope kernel family is a candidate); (3) engine-side step
+  overhead (~20-30 ms) shared with no-spec.
+- Raw artifacts: perf/results/2026-08-11/muse-qgemv-mm/.
+
+## 2026-08-11 - muse_step: The Whole Decode Forward In One Command Buffer
+
+- Status: retained. Greedy generations are byte-identical between the fused
+  and eager paths (the strongest available end-to-end parity check for a
+  deterministic decode); no-spec decode 12.0 -> 14.4 tok/s in matched
+  ambient conditions, 7.34 -> 14.4 (+96%) across the whole optimization arc.
+- The deep fix identified by profiling: kernels were at bandwidth but the
+  step spent ~40 ms in per-op Python/ATen/torch-MPS dispatch across ~1,800
+  eager ops, plus engine overhead. This is the llama.cpp / CUDA-graph
+  execution model brought to the Metal path: `muse_step_run` encodes all 52
+  decoder layers (~900 dispatches: rms norms, GGUF matvecs, QK-norm,
+  interleaved rope, KV scatter, windowed paged attention, sigmoid gate,
+  SwiGLU, residual adds) into ONE command buffer from a C++ loop in
+  qc_metal_serving.mm. Weights and scratch register once
+  (muse_step_init/muse_step_layer); each step passes only hidden rows,
+  positions, and the two KV-group metadata sets (SWA and full-attention
+  block tables / seq lens / slot mappings).
+- New glue kernels (csrc/quixicore/metal/kernels/serving_glue/muse_step.metal,
+  a SlimServe addition beside the vendored tree): muse_rope_qk (interleaved,
+  in place), muse_kv_store (paged scatter), muse_sigmoid_mul, muse_silu_mul,
+  muse_add_inplace. Kernel names export namespaced (mittens::*) -- the
+  encoder resolves them so.
+- Python side: MuseGlimmerModel lazily registers on the first eligible step
+  and takes the fused path only for pure single-token decode with no aux
+  captures (spec-off); everything else -- prefill, mixed batches,
+  speculative verify, vision -- keeps the eager path. Any registration
+  failure logs once and permanently falls back.
+- Where the remaining time is: step ~70 ms vs the ~43 ms weight-bandwidth
+  floor. The forward is now ~48-55 ms; the rest is engine-side per-step
+  overhead (scheduler/sampler Python), now the largest single line item.
+- Next, in order: (1) extend muse_step to M=17 with aux-hidden capture and
+  an on-device greedy rejection kernel -- that is what finally makes DFlash
+  net-positive (the qgemv_mm groundwork already holds the verify matmuls at
+  bandwidth); (2) engine step overhead; (3) last kernel margins vs
+  llama.cpp (26.6 no-spec reference).
+- Raw artifacts: perf/results/2026-08-11/muse-fused-step/ (parity harness
+  and runs).
