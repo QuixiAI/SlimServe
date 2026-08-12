@@ -22,6 +22,14 @@ Two defects, two resolutions:
    loss at seam widths). Production acceptance: both daemons under
    dual c16 load, zero NaN events, zero degeneration, 546-561 tok/s.
 
+KNOWN BROKEN - --no-spec on DSV4 A100 (2026-08-12): storms with
+whole-batch NaN under any concurrent load (3/3 boots; c1 clean;
+independent of runner, graph mode, aux streams - the V2-default fix
+made these clean single-variable tests). Production unaffected (DSpark
+mandatory). Do not use --no-spec for DSV4 perf diagnosis until the
+concurrent no-spec decode path is fixed; characterization and next
+bisection steps are in the notebook.
+
 Open research (not production-affecting): the underlying concurrency
 race inside the overlap resists isolation (20k-iteration standalone
 repro clean; needs TP4/drafter/allocator context) - harness and
