@@ -1273,7 +1273,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            if nan_probe.enabled():
+                # Slot 98: raw embedding output, before the hc-stream expand
+                # and hc_pre. NaN here means the corruption precedes all
+                # layer math (scribbled allocation / embedding path).
+                nan_probe.probe(98, hidden_states)
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            if nan_probe.enabled():
+                # Slot 99: after the hc expand (fresh repeat allocation).
+                nan_probe.probe(99, hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
