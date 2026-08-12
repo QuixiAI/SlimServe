@@ -2,28 +2,35 @@
 
 Updated: 2026-08-10 22:20 UTC
 
-## Degeneration incident: storms RESOLVED, rare seed open (2026-08-11)
+## Degeneration incident: RESOLVED (storms fixed, seed removed from production)
 
-The silent BOS-loop degeneration that poisoned the 08-10 deployment is
-root-caused and fixed for its catastrophic form: the QuixiCore
-sparse-MLA builder computed bt_per_token lazily inside the first
-layer's forward, which under FULL_DECODE_ONLY capture baked a
-capture-pool address into every layer's kernels while replay rebuilt
-metadata around it (the builder's own TODO had warned FULL graphs
-needed ROCm-parity buffer persistence). The fix computes it in build()
-into a persistent buffer. Validation: 0 storms in 8 FULL-graph boots vs
-2/6 pre-fix; FULL capture-64 is restored on all four A100 dsv4 tiers.
+Two defects, two resolutions:
 
-Still open at reduced priority: a rare sub-critical NaN seed
-(single-token quality blips, ~0-3 events per boot in ACTIVE phases,
-none in dormant phases; births at layer-0 input on <=8-row batches;
-both graph modes; every kernel exonerated in isolation). Detection is
-permanent (VLLM_NAN_WATCH on both daemons, canary as backstop). When
-daemon logs show NAN_WATCH events, run
-perf/diagnostics/dsv4-nan/campaign_env2.sh - attribution arms are
-useless in a dormant phase. Full narrative and tooling:
-perf/optimization_status.md incident entries and
-perf/diagnostics/dsv4-nan/README.md.
+1. STORMS (instance-wide BOS-loop collapse): root-caused to the
+   sparse-MLA builder's lazy bt_per_token gather under FULL-graph
+   capture; fixed with ROCm-parity build-time persistence; 0 storms in
+   8 validation boots (pre-fix 2/6) and across ~40 campaign boots
+   since. FULL capture-64 serves in production.
+2. RARE SEED (single-token NaN blips): mechanism-localized by a
+   complete elimination matrix to the multi-stream attention
+   projection overlap - the ONLY component whose removal silences it
+   (aux-off 5 boots/~10 runs silent in active phases; every other arm
+   fires: collectives, mHC schedules, all graph modes, ALIGNED_Q8,
+   exact math on real weights, every kernel in isolation).
+   VLLM_DSV4_AUX_STREAMS=0 is set on all five A100 dsv4 tiers - and
+   measured FASTER (458 vs 427 tok/s clean c11; the overlap was a net
+   loss at seam widths). Production acceptance: both daemons under
+   dual c16 load, zero NaN events, zero degeneration, 546-561 tok/s.
+
+Open research (not production-affecting): the underlying concurrency
+race inside the overlap resists isolation (20k-iteration standalone
+repro clean; needs TP4/drafter/allocator context) - harness and
+runbook in perf/diagnostics/dsv4-nan/. Separate thread: the legacy
+(non-spec) model runner produced one whole-batch NaN storm boot;
+investigate before any no-spec production use. Standing protections:
+VLLM_NAN_WATCH on both daemons, slimserve-canary auto-restart, harness
+chars-per-token guard. Do not re-enable aux streams on A100 dsv4
+without a clean multi-boot campaign in an ACTIVE phase.
 
 ## Read First
 
