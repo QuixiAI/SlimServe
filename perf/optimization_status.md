@@ -2182,3 +2182,22 @@ machinery: the attention aux streams (VLLM_DSV4_AUX_STREAMS, default
 on, three streams driving attn_gemm_parallel_execute overlap) - never
 isolated with full-length instrumented runs. Aux on/off campaign in
 flight (4 interleaved rounds).
+
+### 2026-08-12 - record_stream fix is not the seed; graphs arm running
+
+vfx2 (fixed helpers, aux on) fired with the identical fingerprint
+(rows=[5], normal input id 343, slots 98/99 clean, 100 NaN). The
+multi-stream record_stream repair stands as a genuine hazard-class fix
+but is NOT the seed mechanism, and the aux on/off 2-2 split is demoted
+to lottery-suspect (n=2 per arm).
+
+Revised leading theory: under FULL graphs everything shares the
+capture-time graph memory pool, and BOTH observed birth sites (the
+hc_pre/norm window at layer 0, and inside layer-2 attention at slot
+109 - present in two independent captures) would follow from ONE
+missing cross-stream event edge during capture letting the pool alias
+two live buffers. Replay then scribbles at a pool-layout-fixed offset:
+the boot lottery IS the capture-time pool layout, and record_stream is
+irrelevant inside graph pools. Every seed event observed with step
+data sits on a replayed decode step (6, ~540). Discriminator running:
+FULL vs NONE (all-eager) interleaved, 3 rounds, active phase.
