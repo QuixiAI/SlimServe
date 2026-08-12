@@ -2128,3 +2128,29 @@ added to the supported-sources set; dsv4 metal 256K resize reflected
 each source's registered speculator method (muse uses DFlash k=16);
 tool_call_parser required for all families except muse-glimmer, which
 has no tool parser in this fork (auto tool choice no-ops without one).
+
+### 2026-08-12 - Seed attribution: active-phase arms + id evidence
+
+Three-arm discriminator during an active phase (3 boots each,
+interleaved, full-length runs): async-mHC baseline 6 events, monolithic
+mHC schedule 6, NCCL-only collectives 2. All arms fire - the mHC
+async-split machinery and the custom allreduce are BOTH exonerated as
+required components of the seed.
+
+Input-id probe evidence (first captured birth with ids): the birth
+row's input token is a NORMAL id (4042) in a batch of normal ids -
+the OOV/zero-embedding theory is dead; the NaN is computed, not fed.
+One step later the poisoned request's whole verify window carries
+input ids [0,0,0,0,0,0]: the sampler guard emitted token 0, the
+drafter drafted BOS five deep - the within-request contagion loop
+observed directly. And rows=[5] holds across batch sizes 7, 8, AND 11:
+a fixed memory offset, not a shape tail - consistent with a scribbled
+allocation (cross-stream caching-allocator hazard) at a per-boot-fixed
+address, which would also explain the boot lottery and why every
+kernel is clean in isolation.
+
+In flight: loop-until-capture with the full probe suite (input ids,
+slot 98 = raw embedding output, slot 99 = post-hc-expand, slot 100+ =
+intra-layer). Slot 98 lit => corruption precedes all layer math
+(allocator/scribbler hunt); 98 dark + 100 lit => born in hc_pre/norm
+under real weights (offline repro with dumped weights).
