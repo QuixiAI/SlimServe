@@ -2396,3 +2396,24 @@ persistence fix addressed for the spec-shaped path). Discriminator in
 flight: identical no-spec boot with cudagraph_mode NONE. Clean =>
 FULL-graph replay of the 1-token decode path has its own capture
 hazard; storming => no-spec batch dynamics themselves.
+
+### 2026-08-12 - No-spec storm characterized: concurrency-dependent, config-independent
+
+Discriminator ladder for the no-spec storm, all on the fixed V2-default
+runner: FULL graphs stormed (16,096 lines), graphs NONE stormed HARDER
+(24,116 lines, 11/11 from run 1), single-request c1 CLEAN (long and
+short prompts, zero events, coherent output). Verdict: the no-spec
+storm requires concurrent load - the chunked-prefill + 1-token-decode
+mixed batches at c11 - and is otherwise independent of runner (V1/V2),
+graph mode (FULL/NONE), and aux streams (fired with aux off). 3/3
+no-spec boots stormed; contagion is 1 row -> whole batch within 2
+steps, so the cross-request channel also exists without speculation.
+
+Production exposure: NONE (profiles mandate DSpark; the spec-shaped
+path is clean under the same loads). Operational consequence: --no-spec
+is NOT usable for DSV4 A100 perf diagnosis until this is fixed - its
+output degenerates under any concurrent benchmark. The next bisection
+steps when this thread is picked up: minimal concurrency (c2/c3),
+prefill-only vs decode-only mixes, and the indexer's no-spec decode
+branch (next_n=1) vs the spec-shaped flattening branch - the largest
+code fork between the two configurations.
