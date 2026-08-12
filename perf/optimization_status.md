@@ -2201,3 +2201,22 @@ the boot lottery IS the capture-time pool layout, and record_stream is
 irrelevant inside graph pools. Every seed event observed with step
 data sits on a replayed decode step (6, ~540). Discriminator running:
 FULL vs NONE (all-eager) interleaved, 3 rounds, active phase.
+
+### 2026-08-12 - Graphs eliminated; aux-off at 3/3 silent
+
+gnone1 (cudagraph_mode NONE, fully eager target) fired with the
+standard fingerprint: CUDA graphs are NOT required - the graph-pool
+aliasing theory dies alongside its predecessors. Note the drafter kept
+its own FULL graphs in that boot (dspark captures independently), and
+spec decode itself remains never-seed-tested, as does ALIGNED_Q8 in an
+active phase - the final arms campaign covers exactly those two plus
+baseline, interleaved.
+
+The straggling aux campaign delivered auxoff3 silent: aux-off is now
+3/3 silent vs unfixed aux-on 2/2 firing. Since vfx2 showed the
+record_stream (returned-tensors) repair does not stop the seed, if
+aux-off genuinely suppresses it the channel is aux-stream-adjacent but
+in another direction (inputs, or the shared workspace manager regions
+consumed from both main and aux streams). Aux-off also stands as a
+candidate production mitigation at the cost of the attention-overlap
+perf if the final arms leave the mechanism unresolved.
