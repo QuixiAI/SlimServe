@@ -69,6 +69,12 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "DeepseekV2ForCausalLM",
+        # DSV4 is V2-validated end to end (production serves it on V2 with
+        # DSpark). Before this entry, spec-off configs fell through to the V1
+        # runner, so --no-spec silently swapped the execution engine — the
+        # confound in the 2026-08-12 NaN investigation. Runner choice must be
+        # a property of the model, not of the speculative config.
+        "DeepseekV4ForCausalLM",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
