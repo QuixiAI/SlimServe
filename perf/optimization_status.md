@@ -2375,3 +2375,24 @@ interleave; the no-spec legacy-runner whole-batch NaN storm.
   llama.cpp (26.6 no-spec reference).
 - Raw artifacts: perf/results/2026-08-11/muse-fused-step/ (parity harness
   and runs).
+
+### 2026-08-12 - No-spec storms on V2 too: graph-replayed pure decode implicated
+
+The V2-runner-default fix for DSV4 (DeepseekV4ForCausalLM added to
+DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - previously spec-off configs
+silently fell through to the V1 runner, the confound in the earlier
+no-spec arm) enabled the first clean single-variable no-spec test:
+V2 runner, aux-off, FULL capture-64, no speculation. IT STORMED -
+16,096 NaN lines, runs 0/11 -> 8/11 -> 11/11 degenerate, whole-batch
+steady-state signature. So the no-spec storm is NOT the V1 runner and
+NOT the aux streams.
+
+Geometry explains why production (spec-on) is clean while no-spec
+storms: with DSpark k=5 at c11, decode steps are 66 tokens > capture-64
+-> EAGER; without spec they are 11 tokens -> FULL GRAPH REPLAY. The
+no-spec flag silently moves pure decode onto replayed graphs - the same
+regime the original storm incident implicated (and the bt_per_token
+persistence fix addressed for the spec-shaped path). Discriminator in
+flight: identical no-spec boot with cudagraph_mode NONE. Clean =>
+FULL-graph replay of the 1-token decode path has its own capture
+hazard; storming => no-spec batch dynamics themselves.
