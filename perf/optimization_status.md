@@ -2154,3 +2154,31 @@ slot 98 = raw embedding output, slot 99 = post-hc-expand, slot 100+ =
 intra-layer). Slot 98 lit => corruption precedes all layer math
 (allocator/scribbler hunt); 98 dark + 100 lit => born in hc_pre/norm
 under real weights (offline repro with dumped weights).
+
+### 2026-08-12 - Full-probe capture: the values are innocent
+
+Loop-until-capture landed a birth on its first run with the complete
+suite. Verdict chain:
+
+- Slot 98 (raw embedding output): CLEAN. Slot 99 (post hc-expand):
+  CLEAN. Slot 100 (attention input, after hc_pre + norm): NaN, row 5,
+  input id 989 (normal token).
+- Offline exact replay of that batch - REAL layer-0 hc weights
+  extracted from the GGUF (fp16 fn, scale [2.077, 0.0195, 0.238],
+  base range -30.1..9.9), REAL embedding rows of the exact captured
+  ids, REAL config (sinkhorn_iterations=20, eps=1e-6) - is
+  BIT-IDENTICAL to the fp32 torch reference: maxdiff 0.0, zero NaN.
+- Also exonerated offline: the fp16-fn template (630 outputs), the
+  poisoned-allocator regime for the op's internal buffers (210 calls),
+  20-iteration/1e-6 sinkhorn (216 outputs).
+
+Conclusion: the deterministic math on the true inputs is clean, so the
+serving buffer feeding hc_pre did not hold the true values at compute
+time - a CONCURRENT WRITER modifies a main-stream tensor in the window
+between adjacent kernels (slot-99 probe read clean; hc_pre/norm's
+input or output was then scribbled before slot-100's read). Every arm
+tested so far (async/mono mHC, custom-AR/NCCL) shared one async
+machinery: the attention aux streams (VLLM_DSV4_AUX_STREAMS, default
+on, three streams driving attn_gemm_parallel_execute overlap) - never
+isolated with full-length instrumented runs. Aux on/off campaign in
+flight (4 interleaved rounds).
