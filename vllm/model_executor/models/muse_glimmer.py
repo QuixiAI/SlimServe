@@ -288,6 +288,136 @@ class MuseGlimmerModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    _fused_ready: bool | None = None
+
+    def _init_fused_step(self) -> bool:
+        """Register weights and geometry for the single-command-buffer step.
+
+        Returns False (and disables the path) when the layout is not the
+        expected all-GGUF Metal configuration.
+        """
+        from vllm.quixicore.ops import _qc
+
+        cfg = self.config
+        try:
+            qc = _qc()
+            first_local = next(
+                layer for layer in self.layers if layer.self_attn.is_local
+            )
+            first_full = next(
+                layer for layer in self.layers if not layer.self_attn.is_local
+            )
+            self._fused_local_name = first_local.self_attn.attn.layer_name
+            self._fused_full_name = first_full.self_attn.attn.layer_name
+
+            def shards(module, count):
+                cached = getattr(module, "_gguf_hetero_shards", None)
+                if cached is not None:
+                    return [w for w, _ in cached], [int(t) for _, t in cached]
+                qw = module.qweight
+                fallback = module.qweight_type.weight_type
+                ws, ts = [], []
+                for idx in qw.shard_id:
+                    start, end, offset = qw.shard_offset_map[idx]
+                    ws.append(qw[start:end, :offset].contiguous())
+                    ts.append(
+                        int(module.qweight_type.shard_weight_type.get(idx, fallback))
+                    )
+                assert len(ws) == count
+                return ws, ts
+
+            qc.muse_step_init(
+                num_layers=len(self.layers),
+                hidden=cfg.hidden_size,
+                heads=cfg.num_attention_heads,
+                kv_heads=cfg.num_key_value_heads,
+                head_dim=cfg.head_dim,
+                inter=cfg.intermediate_size,
+                window=cfg.sliding_window,
+                theta=cfg.rope_theta,
+                eps=cfg.rms_norm_eps,
+                post_eps=getattr(cfg, "post_norm_eps", 1e-8),
+                max_rows=17,
+                ref=self.norm.weight.data,
+            )
+            for i, layer in enumerate(self.layers):
+                attn = layer.self_attn
+                qkv_w, qkv_t = shards(attn.qkv_proj, 3)
+                gu_w, gu_t = shards(layer.mlp.gate_up_proj, 2)
+                kv_cache = attn.attn.kv_cache
+                if isinstance(kv_cache, (list, tuple)):
+                    kv_cache = kv_cache[0]
+                qc.muse_step_layer(
+                    i,
+                    attn.is_local,
+                    qkv_w,
+                    qkv_t,
+                    attn.gate_proj.qweight,
+                    int(attn.gate_proj.qweight_type.weight_type),
+                    attn.o_proj.qweight,
+                    int(attn.o_proj.qweight_type.weight_type),
+                    gu_w,
+                    gu_t,
+                    layer.mlp.down_proj.qweight,
+                    int(layer.mlp.down_proj.qweight_type.weight_type),
+                    layer.input_layernorm.weight.data,
+                    attn.q_norm.weight.data,
+                    attn.k_norm.weight.data,
+                    layer.post_attention_layernorm.weight.data,
+                    layer.pre_feedforward_layernorm.weight.data,
+                    layer.post_feedforward_layernorm.weight.data,
+                    kv_cache,
+                )
+            return True
+        except Exception:
+            logger.exception(
+                "muse fused decode step unavailable; staying on the eager path"
+            )
+            return False
+
+    def _maybe_fused_decode(
+        self, hidden_states: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Single-command-buffer decode for pure single-token steps."""
+        if self.aux_hidden_state_layers:
+            return None  # the spec target must return per-layer captures
+        if hidden_states.device.type != "mps":
+            return None
+        from vllm.forward_context import get_forward_context
+        from vllm.quixicore import quixicore_ops
+
+        metadata = get_forward_context().attn_metadata
+        if not isinstance(metadata, dict):
+            return None
+        if self._fused_ready is None:
+            self._fused_ready = quixicore_ops.is_available() and self._init_fused_step()
+        if not self._fused_ready:
+            return None
+        local = metadata.get(self._fused_local_name)
+        full = metadata.get(self._fused_full_name)
+        if local is None or full is None:
+            return None
+        if (
+            local.max_query_len != 1
+            or local.num_actual_tokens != local.num_reqs
+            or hidden_states.shape[0] != local.num_actual_tokens
+        ):
+            return None
+        from vllm.quixicore.ops import _qc
+
+        x = hidden_states.contiguous()
+        _qc().muse_step_run(
+            x,
+            positions.to(torch.int32),
+            local.block_table,
+            local.seq_lens_gpu,
+            local.slot_mapping.to(torch.long),
+            full.block_table,
+            full.seq_lens_gpu,
+            full.slot_mapping.to(torch.long),
+        )
+        return x
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -308,6 +438,11 @@ class MuseGlimmerModel(nn.Module):
             None,
             self.config.rms_norm_eps,
         ).to(hidden_states.dtype)
+
+        fused = self._maybe_fused_decode(hidden_states, positions)
+        if fused is not None:
+            return self.norm(fused)
+
         aux_hidden_states = [hidden_states] if 0 in self.aux_hidden_state_layers else []
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states = layer(positions, hidden_states)

@@ -190,6 +190,24 @@ class MetalAttentionImpl(AttentionImpl):
             and self.head_size in _PAGED_HEAD_SIZES
         )
 
+    # Largest uniform query length routed through the fused kernel by batch
+    # expansion. Sized for speculative decoding (DFlash verify is k+1 = 17
+    # queries per request, the draft block 16); long prefill stays on the
+    # matmul-based SDPA path, where each key is read once instead of once
+    # per query row.
+    _EXPAND_MAX_QUERY_LEN = 32
+
+    def _expanded_decode_applies(
+        self, metadata: MetalAttentionMetadata, num_tokens: int
+    ) -> bool:
+        q_len = metadata.max_query_len
+        return (
+            metadata.causal
+            and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
+            and num_tokens == metadata.num_reqs * q_len
+            and self.head_size in _PAGED_HEAD_SIZES
+        )
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -241,6 +259,41 @@ class MetalAttentionImpl(AttentionImpl):
                         value_cache,
                         attn_metadata.block_table,
                         attn_metadata.seq_lens_gpu,
+                        self.scale,
+                        self.sliding_window or 0,
+                    )
+                )
+                return output
+
+        if self._expanded_decode_applies(attn_metadata, num_tokens):
+            from vllm.quixicore import quixicore_ops
+
+            if quixicore_ops.is_available():
+                # Uniform multi-query causal decode (speculative verify and
+                # DFlash draft blocks): expand each request into q_len
+                # pseudo-requests sharing its block table. Query token t of a
+                # request sees seq_len - q_len + t + 1 positions, so causal
+                # semantics -- and the sliding window, which the kernel clamps
+                # per pseudo-request -- are exact. One dispatch replaces the
+                # per-request SDPA gather loop.
+                q_len = attn_metadata.max_query_len
+                seq_lens = attn_metadata.seq_lens_gpu
+                steps = torch.arange(
+                    1 - q_len, 1, device=seq_lens.device, dtype=seq_lens.dtype
+                )
+                expanded_seq_lens = (
+                    seq_lens.unsqueeze(1) + steps.unsqueeze(0)
+                ).flatten()
+                expanded_block_table = attn_metadata.block_table.repeat_interleave(
+                    q_len, dim=0
+                )
+                out.copy_(
+                    quixicore_ops.paged_attention(
+                        query[:num_tokens].contiguous(),
+                        key_cache,
+                        value_cache,
+                        expanded_block_table,
+                        expanded_seq_lens,
                         self.scale,
                         self.sliding_window or 0,
                     )
