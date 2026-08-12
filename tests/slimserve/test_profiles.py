@@ -244,6 +244,10 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
+        # Seed mitigation 2026-08-12: the multi-stream attention overlap is
+        # the only component whose removal silences the rare NaN seed, and
+        # it measured faster off. See the profile note and perf notebook.
+        "VLLM_DSV4_AUX_STREAMS": "0",
     }
 
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
@@ -253,6 +257,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
+        "VLLM_DSV4_AUX_STREAMS": "0",
     }
 
 

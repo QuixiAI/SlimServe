@@ -2220,3 +2220,29 @@ in another direction (inputs, or the shared workspace manager regions
 consumed from both main and aux streams). Aux-off also stands as a
 candidate production mitigation at the cost of the attention-overlap
 perf if the final arms leave the mechanism unresolved.
+
+### 2026-08-12 - Seed endgame: overlap disabled, faster AND silent
+
+Final arms (active phase, baseline firing every round): no-spec is
+CONFOUNDED (routes through the legacy model runner entirely - and
+produced whole-batch NaN storms, a separate expression to investigate
+on that runner) and ALIGNED_Q8=0 FIRES (6 events) - exonerated. The
+elimination matrix is complete: the ONLY component whose removal
+silences the seed is the multi-stream attention projection overlap
+(VLLM_DSV4_AUX_STREAMS=0: 3/3 boots silent in active phases).
+
+Structure finally explains the fingerprints: the overlap enables at
+<=VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD (1024) tokens AND not during
+capture - under FULL graphs, pure decode steps replay captured SERIAL
+projections while mixed decode+prefill seam steps run EAGERLY with the
+overlap live; those eager seam steps are exactly where every FULL-mode
+birth sat. The race itself resists isolation: the GEMV op is canary-
+clean in isolation, and a 20k-iteration standalone execute_in_parallel
+repro with the real ops never fired - TP4 collectives/drafter/allocator
+churn are needed, so root cause remains open at the concurrency level.
+
+DEPLOYED: VLLM_DSV4_AUX_STREAMS=0 on all five A100 dsv4 tiers. Measured
+FASTER with it off: clean-run c11 means 458.1 (aux-off, n=4) vs 426.7
+(aux-on, n=12) - the overlap was a net loss at seam widths anyway.
+Open root-cause thread: extend overlap_repro.py with TP + drafter
+interleave; the no-spec legacy-runner whole-batch NaN storm.
