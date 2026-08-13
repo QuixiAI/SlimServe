@@ -10,6 +10,8 @@ from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
     ConversationMessage,
+    adapt_custom_tool_calls_for_chat_template,
+    adapt_custom_tools_for_chat_template,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
@@ -358,6 +360,17 @@ class OnlineRenderer:
                 ),
             ),
         )
+
+        if isinstance(request, ResponsesRequest) and any(
+            tool.get("type") == "custom" for tool in (tool_dicts or [])
+        ):
+            # Keep the Responses representation generic until rendering. Most
+            # model templates understand function-shaped tools. The parser's
+            # model-format adapter restores raw custom-tool semantics at the
+            # generated payload boundary.
+            tool_dicts = adapt_custom_tools_for_chat_template(tool_dicts)
+            messages = adapt_custom_tool_calls_for_chat_template(messages)
+            default_template_kwargs["tools"] = tool_dicts
 
         tok_params = request.build_tok_params(self.model_config)
         chat_params = request.build_chat_params(
