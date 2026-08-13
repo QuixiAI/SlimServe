@@ -2614,3 +2614,42 @@ ml/es workspace init (-inf/0) kept as defense in depth. tmp remains
 torch::empty by design - the guard makes unwritten vectors
 unreachable. no-spec serving is UNBROKEN by this fix (the 3 clean
 validation runs were no-spec).
+
+## 2026-08-13 - c1 latency floor diagnosed (task #27): structural, not kernel-bound
+
+Torch profile of steady c1 spec decode on the production q4ktail-4
+config (fixed kernel, ~5K context, 140 tok/s). Per ~31ms spec cycle
+(6-token verify, acceptance ~3.4 -> ~4.4 tok/cycle):
+
+- Target verify step wall (execute_6 annotations): ~19.3 ms
+- Pure kernel time inside the whole cycle: ~11.7 ms (19,887 launches
+  over 16 steps; graph-replayed, so launch count is not the cost)
+- => ~7-9 ms idle INSIDE the target step (breakable-graph eager
+  sections around sparse attention + Python between segments), and
+  ~11.7 ms of drafter + sampling + CPU orchestration between target
+  steps.
+
+Kernel breakdown per step (top): IQ2 gate_up+SwiGLU 1.28ms, MLA sparse
+decode 1.06ms, aligned-Q8 GEMVs 1.33ms, drafter Q8/Q2K GEMVs ~0.9ms,
+grouped-Q8 0.59ms, Q2K down 0.53ms, mHC 0.79ms, indexer 0.45ms,
+custom-AR 0.35ms, long tail ~3.4ms (incl. 145x quantize_q8_1 of ~2.3us).
+
+CONCLUSIONS:
+1. TP2 ~ TP4 parity is now explained: the ~21ms fixed part of the
+   cycle (drafter, orchestration, eager-break idle) does not shrink
+   with TP; only the ~10ms kernel part does. Doubling ranks moves the
+   cycle from ~34 to ~31ms - exactly the observed parity. This is not
+   a defective-collective problem; it is Amdahl on fixed overhead.
+2. Ranked c1 levers: (a) intra-step idle - fewer/cheaper eager breaks
+   around sparse attention (largest, hardest: needs sparse-attn graph
+   capture support); (b) drafter cycle cost (5 draft forwards -> the
+   Q2K/Q8 GEMV drafter is ~1ms GPU but carries CPU orchestration);
+   (c) kernel tail consolidation (marginal).
+3. Task #26 re-scoped by data: the Q4_K tail (moe_vec_q block_q4_K)
+   is only ~0.26 ms/step at c1 (~2.6% of kernel time) - fused Q4_K
+   tiles are NOT a c1 lever. Their value is c8/prefill width and the
+   quality-tier unlock; rank accordingly.
+4. Task #28 (cp.async on seg tiles) is likewise a prefill/c8 lever;
+   no c1 effect expected.
+
+Raw trace: scratchpad prof-c1/ (4 ranks); server log prof-server.log.
