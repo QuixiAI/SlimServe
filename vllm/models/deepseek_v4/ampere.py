@@ -425,7 +425,7 @@ def _ampere_decode_debug(
             slots = blocks.long() * extra_block_size + (
                 valid_idx % extra_block_size)
         slots = slots.clamp(0, flat.shape[0] - 1)
-        rows_b = flat[slots][:, :512]
+        rows_b = flat[slots][:, :448]
         nan_mask = (rows_b == 0x7F) | (rows_b == 0xFF)
         toks = int(nan_mask.any(dim=-1).sum())
         return (f"nan_bytes={int(nan_mask.sum())} "

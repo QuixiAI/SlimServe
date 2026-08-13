@@ -2509,3 +2509,18 @@ Production exposure check still holds: spec-mode serving with aux-off
 has zero NAN_WATCH events across days of load - the spec-shaped
 schedule evidently avoids the triggering write pattern (to be
 explained by the same fix). All diagnostics env-gated, default off.
+
+### 2026-08-13 - RETRACTION: the fp8-NaN-content conviction was a census bug
+
+The offline replay of the captured "bad" token runs CLEAN through the
+real compress kernel, and inspection shows why: the fp8 payload of a
+cached token is bytes [0:448]; bytes 448..575 hold the bf16 rope pair,
+where 0x7F/0xFF single bytes are ordinary bf16 encoding bytes. Every
+census in this hunt scanned [:512], counting 64 bf16 bytes per token -
+expected false-positive rate ~40% of tokens, which is exactly the ~30%
+"corruption" measured. The "compressed KV cache contains NaN" claim and
+the compressor-write conviction are RETRACTED. What still stands,
+measured with valid instruments: decode attention output NaN with clean
+query, healthy extents, correct request mapping, and clean state-cache
+gather. Corrected-census boot (448-byte window on both probes) in
+flight to establish the real KV content status.
