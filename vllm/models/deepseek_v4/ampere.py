@@ -368,6 +368,7 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             extra_indices=extra_indices, extra_bt=extra_bt,
             extra_cache=extra_cache, extra_block_size=extra_block_size,
             extra_indices_are_slots=extra_indices_are_slots,
+            swa_indices=swa_indices,
         )
         output.copy_(out)
 
@@ -379,6 +380,7 @@ def _ampere_decode_debug(
     attn, out, q, swa_lens, extra_lens, swa_metadata, swa_only,
     extra_indices=None, extra_bt=None, extra_cache=None,
     extra_block_size=None, extra_indices_are_slots=True,
+    swa_indices=None,
 ) -> None:
     """Diagnostic (VLLM_DSV4_ATTN_SPLIT_DEBUG=1, shared gate): for NaN rows
     leaving the native DSV4 two-source decode (mla_decode_fp8_sparse_dsv4),
@@ -415,21 +417,33 @@ def _ampere_decode_debug(
         valid_idx = row_idx[row_idx >= 0].long()
         if valid_idx.numel() == 0:
             return "empty"
-        cache_b = extra_cache.view(torch.uint8)
-        entry = cache_b.shape[-1]
-        flat = cache_b.reshape(-1, entry)
+        cache_b = extra_cache.view(torch.uint8).reshape(-1)
+        bs_tokens = 64
+        block_bytes = bs_tokens * 584  # 64*576 data + 64*8 scales
+        n_slots = cache_b.numel() // block_bytes * bs_tokens
         if extra_indices_are_slots:
             slots = valid_idx
         else:
             blocks = extra_bt[r][(valid_idx // extra_block_size)]
             slots = blocks.long() * extra_block_size + (
                 valid_idx % extra_block_size)
-        slots = slots.clamp(0, flat.shape[0] - 1)
-        rows_b = flat[slots][:, :448]
-        nan_mask = (rows_b == 0x7F) | (rows_b == 0xFF)
-        toks = int(nan_mask.any(dim=-1).sum())
-        return (f"nan_bytes={int(nan_mask.sum())} "
-                f"toks_with_nan={toks}/{int(valid_idx.numel())}")
+        slots = slots.clamp(0, max(n_slots - 1, 0))
+        return _token_census(cache_b, slots, bs_tokens, block_bytes)
+
+    def swa_census(r):
+        """576-stride fp8 census over the row's SWA window entries."""
+        if swa_indices is None:
+            return "?"
+        cache_b = attn.swa_cache_layer.kv_cache.view(torch.uint8).reshape(-1)
+        bs_tokens = 64
+        block_bytes = bs_tokens * 584
+        n_slots = cache_b.numel() // block_bytes * bs_tokens
+        row_idx = swa_indices[r]
+        vi = row_idx[(row_idx >= 0)].long()
+        if vi.numel() == 0:
+            return "empty"
+        vi = vi.clamp(0, max(n_slots - 1, 0))
+        return _token_census(cache_b, vi, bs_tokens, block_bytes)
 
     def rep(r):
         iv = (int(is_valid[r]) if is_valid is not None
@@ -441,7 +455,7 @@ def _ampere_decode_debug(
                and req_ids.numel() > r else "?")
         return (f"row{r}: req={rid}(n_dec={num_decodes}) valid={iv} "
                 f"swa_len={sl} extra_len={el} q_nan={bool(q_nan[r])} "
-                f"kv[{census(r)}]")
+                f"kv[{census(r)}] swa[{swa_census(r)}]")
 
     from vllm.logger import init_logger
     init_logger(__name__).error(
@@ -450,3 +464,21 @@ def _ampere_decode_debug(
         state["dumps"], getattr(attn, "prefix", "?"), swa_only, out.shape[0],
         rows[:6], " | ".join(rep(r) for r in rows[:4]),
         rep(clean[0]) if clean else "none")
+
+
+def _token_census(cache_b, slots, bs_tokens, block_bytes):
+    """Full-entry census: fp8 payload NaN bytes, rope bf16 isnan, scale max."""
+    base = (slots // bs_tokens) * block_bytes + (slots % bs_tokens) * 576
+    offs = torch.arange(576, device=cache_b.device)
+    rows_b = cache_b[base[:, None] + offs[None, :]]
+    fp8 = rows_b[:, :448]
+    fp8_nan = ((fp8 == 0x7F) | (fp8 == 0xFF)).any(dim=-1)
+    rope = rows_b[:, 448:576].contiguous().view(torch.bfloat16)
+    rope_nan = torch.isnan(rope.float()).any(dim=-1)
+    scale_base = ((slots // bs_tokens) * block_bytes + bs_tokens * 576
+                  + (slots % bs_tokens) * 8)
+    soffs = torch.arange(8, device=cache_b.device)
+    scales = cache_b[scale_base[:, None] + soffs[None, :]][:, :7]
+    return (f"fp8nan_toks={int(fp8_nan.sum())}/{int(slots.numel())} "
+            f"ROPEnan_toks={int(rope_nan.sum())} "
+            f"scale_max={int(scales.max())}")
