@@ -452,6 +452,7 @@ class DeepseekCompressor(nn.Module):
         _compressor_write_debug_pre(
             self, positions, k_cache_metadata, num_actual,
             state_cache=state_cache, state_metadata=state_metadata,
+            kv_in=kv, score_in=score,
         )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
@@ -489,7 +490,8 @@ _COMPRESSOR_WRITE_DEBUG_STATE: dict = {}
 
 def _compressor_write_debug_pre(compressor, positions, k_cache_metadata,
                                 num_actual, state_cache=None,
-                                state_metadata=None) -> None:
+                                state_metadata=None, kv_in=None,
+                                score_in=None) -> None:
     """Half 1 of the write-site probe (VLLM_DSV4_COMPRESS_DEBUG=1): before
     the store, snapshot which compressed slots THIS chunk is due to write
     (boundary positions with a valid slot)."""
@@ -499,14 +501,27 @@ def _compressor_write_debug_pre(compressor, positions, k_cache_metadata,
         state["on"] = os.getenv(
             "VLLM_DSV4_COMPRESS_DEBUG", "0").lower() in ("1", "true", "on")
         state["dumps"] = 0
-    if not state["on"] or state["dumps"] >= 10:
+    if not state["on"] or state["dumps"] >= 40:
         return
     if compressor.compress_ratio != 4 or compressor.head_dim != 512:
+        return
+    if "layers.2." not in getattr(compressor, "prefix", ""):
         return
     pos = positions[:num_actual]
     slots = k_cache_metadata.slot_mapping[:num_actual]
     due = ((pos + 1) % compressor.compress_ratio == 0) & (slots >= 0)
-    state["pending"] = (slots[due].clone(), pos[due].clone())
+    in_nan = -1
+    if kv_in is not None:
+        k_nan = torch.isnan(kv_in[:num_actual].float()).any(dim=-1)
+        s_nan = torch.isnan(score_in[:num_actual].float()).any(dim=-1)
+        in_nan = int((k_nan | s_nan).sum())
+    # The store kernel's first early-exit is state_slot < 0: such due tokens
+    # are silently SKIPPED and their compressed slot never written.
+    st_neg = -1
+    if state_metadata is not None:
+        st_slots_all = state_metadata.slot_mapping[:num_actual]
+        st_neg = int((st_slots_all[due] < 0).sum())
+    state["pending"] = (slots[due].clone(), pos[due].clone(), in_nan, st_neg)
 
     # Reader-side state gather census: mimic the compress kernel's block-table
     # addressing for each due token's 8-position history and census the fp32
@@ -580,32 +595,36 @@ def _compressor_write_debug_post(compressor, positions, k_cache_metadata,
     fp8 payloads for NaN encodings. Clean readback + dirty later reads means
     slots are being SKIPPED (mapping) rather than written with garbage."""
     state = _COMPRESSOR_WRITE_DEBUG_STATE
-    if not state.get("on") or state["dumps"] >= 10:
+    if not state.get("on") or state["dumps"] >= 40:
         return
     if compressor.compress_ratio != 4 or compressor.head_dim != 512:
         return
     pending = state.pop("pending", None)
     if pending is None:
         return
-    slots, pos = pending
+    slots, pos, in_nan, st_neg = pending
     if slots.numel() == 0:
         return
-    cache_b = kv_cache.view(torch.uint8)
-    entry = cache_b.shape[-1]
-    flat = cache_b.reshape(-1, entry)
-    safe = slots.long().clamp(0, flat.shape[0] - 1)
-    rows = flat[safe][:, :448]
+    cache_b = kv_cache.view(torch.uint8).reshape(-1)
+    bs_tokens = 64
+    block_bytes = bs_tokens * 584  # 64*576 data + 64*8 scales
+    n_slots = cache_b.numel() // block_bytes * bs_tokens
+    safe = slots.long().clamp(0, max(n_slots - 1, 0))
+    base = (safe // bs_tokens) * block_bytes + (safe % bs_tokens) * 576
+    offs = torch.arange(448, device=cache_b.device)
+    rows = cache_b[base[:, None] + offs[None, :]]
     nan_mask = (rows == 0x7F) | (rows == 0xFF)
     bad = int(nan_mask.any(dim=-1).sum())
-    if bad or state["dumps"] < 3:
+    if True:
         state["dumps"] += 1
         from vllm.logger import init_logger
         init_logger(__name__).error(
             "COMPRESS_WRITE_DEBUG dump %d: layer=%s wrote %d slots this "
-            "chunk (pos %d..%d) readback_nan_toks=%d/%d nan_bytes=%d",
+            "chunk (pos %d..%d) readback_nan_toks=%d/%d nan_bytes=%d "
+            "input_nan_tokens=%s due_with_negative_STATE_slot=%s",
             state["dumps"], getattr(compressor, "prefix", "?"),
             int(slots.numel()), int(pos.min()), int(pos.max()),
-            bad, int(slots.numel()), int(nan_mask.sum()))
+            bad, int(slots.numel()), int(nan_mask.sum()), in_nan, st_neg)
         if bad and not state.get("captured"):
             capture = state.pop("capture_ctx", None)
             if capture is not None:

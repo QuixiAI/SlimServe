@@ -1658,8 +1658,19 @@ static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
 
     auto opts = q.options().dtype(torch::kFloat);
     auto tmp = torch::empty({B, H, total_p, 512}, opts);
-    auto ml = torch::empty({B, H, total_p}, opts);
-    auto es = torch::empty({B, H, total_p}, opts);
+    // ml/es MUST be initialized, not torch::empty: the reducer's per-row
+    // active count is min(partitions, length-in-TOKENS), so it reads every
+    // partial slot for real rows, while the persistent writer can skip
+    // partials it balanced away. An unwritten torch::empty slot then feeds
+    // the merge with recycled allocator bytes: small stale floats are
+    // harmless (exp -> 0), large ones silently corrupt the softmax merge,
+    // and inf/NaN patterns surface as NaN attention output. -inf/0 makes an
+    // unwritten slot an authentic empty partial, which the reducer's
+    // !(mp > NEG_INF) guard already skips. (Root cause of the 2026-08
+    // DSV4 NaN-seed/degeneration incident.)
+    auto ml = torch::full({B, H, total_p},
+                          -std::numeric_limits<float>::infinity(), opts);
+    auto es = torch::zeros({B, H, total_p}, opts);
     launch_mla_decode_fp8_sparse_dsv4_merged(
         q, main_cache, main_bt, main_indices, main_topk_length,
         main_indices_are_slots, int(main_block_size), main_p,

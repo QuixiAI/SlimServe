@@ -2524,3 +2524,43 @@ measured with valid instruments: decode attention output NaN with clean
 query, healthy extents, correct request mapping, and clean state-cache
 gather. Corrected-census boot (448-byte window on both probes) in
 flight to establish the real KV content status.
+
+### 2026-08-13 - Hunt state: kernel convicted, mechanism still internal
+
+Where the elimination stands after the full-entry audits (all with
+TRUE cache addressing - two earlier census instruments were themselves
+buggy and their convictions retracted: the 512-vs-448 window and the
+584-vs-576 stride):
+
+CLEAN, verified at the moment of NaN birth: query; top-k fp8 payloads;
+SWA fp8 payloads; rope bf16 halves (isnan-proper); UE8M0 scales (max
+122); extents; request mapping; state-cache gather; compressor writes
+(every chunk, every size, immediate readback); the software e4m3
+encoder (2.5M-value sweep); state slot mappings (no skips). Control
+rows with identical input profiles compute finite outputs in the same
+launch where neighbors go NaN.
+
+DISPROVEN fix candidate: ml/es split-partial workspace was torch::empty
+while the reducer reads min(partitions, token-length) slots per row =
+all of them; initializing ml=-inf / es=0 (kept - correct hygiene, the
+reducer guard treats unwritten slots as authentic empties) did NOT
+stop the deterministic storm: 11/11 degenerate, 4,860 NaN lines.
+
+CONVICTED but not yet dissected: quixicore_ops.mla_decode_fp8_sparse
+_dsv4 (csrc/quixicore/tm_cuda/tm_cuda_serving.cu + mla_decode_fp8_v +
+dsv4_attention_reduce_active_channels in paged_attn_v2_kernels.cuh)
+produces NaN attention output from fully-audited-clean inputs with
+initialized workspace, per-row nondeterministically, only under the
+concurrent no-spec batch geometry (13/13 boots) and rarely under spec
+(the production seed). Next step is mechanical: capture one NaN row's
+complete op inputs (q row, both index lists + lens, the ~378
+referenced 584B cache entries), replay py_mla_decode_fp8_sparse_dsv4
+offline, dump tmp/ml/es to find which partial goes NaN, and bisect the
+persistent writer kernel at that partition. The capture hook pattern
+is already in ampere.py (_ampere_decode_debug); extend it to torch.save
+on first detection like the compressor capture did.
+
+Production posture unchanged and safe: spec + aux-off serving is clean
+under load (the seed needs the geometry production avoids at width;
+NAN_WATCH + canary standing). The no-spec flag stays documented as
+broken until this kernel bug is fixed.
