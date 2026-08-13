@@ -534,10 +534,7 @@ def test_every_profile_serves_thinking_and_tool_calling_by_default():
         assert kwargs["thinking"] is True, plan.profile_id
         assert kwargs["enable_thinking"] is True, plan.profile_id
         assert engine["reasoning_parser"], plan.profile_id
-        # Muse-Glimmer has no tool parser in this fork; auto tool choice
-        # stays enabled globally and no-ops without a registered parser.
-        if plan.source_key != "muse-glimmer":
-            assert engine["tool_call_parser"], plan.profile_id
+        assert engine["tool_call_parser"], plan.profile_id
         # No profile forces the chat client back out of thinking mode.
         assert plan.chat_template_kwargs.get("thinking") is not False, plan.profile_id
 

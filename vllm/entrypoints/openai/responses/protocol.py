@@ -324,13 +324,21 @@ class ResponsesRequest(OpenAIBaseModel):
             reasoning_effort=reasoning_effort,
         )
 
-        # When reasoning is requested, activate thinking for models whose
-        # chat templates require explicit opt-in (e.g., Gemma4 defaults
-        # enable_thinking to false). For templates that don't declare the
-        # variable, resolve_chat_template_kwargs filters it out harmlessly.
+        # Normalize common template controls. Some model templates use boolean
+        # ``enable_thinking``/``thinking`` switches; others (including
+        # Muse-Glimmer) render a ``reasoning_strength`` instruction. Set all
+        # three from the standard Responses reasoning effort unless the caller
+        # explicitly supplied that individual control. Templates filter out
+        # variables they do not declare.
         user_kwargs = self.chat_template_kwargs or {}
-        if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
-            extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+        if reasoning_effort is not None:
+            reasoning_enabled = reasoning_effort != "none"
+            if "enable_thinking" not in user_kwargs:
+                extra_kwargs["enable_thinking"] = reasoning_enabled
+            if "thinking" not in user_kwargs:
+                extra_kwargs["thinking"] = reasoning_enabled
+            if "reasoning_strength" not in user_kwargs:
+                extra_kwargs["reasoning_strength"] = reasoning_effort
 
         return ChatParams(
             chat_template=default_template,

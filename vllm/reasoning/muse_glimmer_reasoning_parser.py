@@ -64,6 +64,15 @@ def _parse(text: str) -> tuple[str | None, str | None]:
     return reasoning, content
 
 
+def _parse_streaming(text: str) -> tuple[str | None, str | None]:
+    # Generation starts after a bare ``<|start|>assistant``. Recipient text
+    # arrives before <|message|>, so it is not safe to treat an unframed
+    # prefix such as `` to=math_exp`` as assistant content while streaming.
+    if "<|message|>" not in text:
+        return None, None
+    return _parse(text)
+
+
 class MuseGlimmerReasoningParser(ReasoningParser):
     def __init__(self, tokenizer: PreTrainedTokenizerBase, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)
@@ -113,13 +122,30 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
     ) -> "DeltaMessage | None":
         # Reparse-and-diff: robust against markers splitting across deltas.
-        prev_reasoning, prev_content = _parse(previous_text)
-        cur_reasoning, cur_content = _parse(current_text)
+        prev_reasoning, prev_content = _parse_streaming(previous_text)
+        cur_reasoning, cur_content = _parse_streaming(current_text)
         delta_reasoning = (cur_reasoning or "")[len(prev_reasoning or "") :]
         delta_content = (cur_content or "")[len(prev_content or "") :]
         if not delta_reasoning and not delta_content:
             return None
         return DeltaMessage(
-            reasoning_content=delta_reasoning or None,
+            reasoning=delta_reasoning or None,
             content=delta_content or None,
         )
+
+    def get_streaming_fallback_content(
+        self,
+        text: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> str | None:
+        del request
+        # Preserve plain-text continuations that genuinely have no Muse turn
+        # framing. Framed self-recipient text remains reasoning and must not be
+        # promoted if generation stops before its closing token.
+        stripped = text.lstrip()
+        if stripped.startswith("to=") or stripped.startswith("<|start|>assistant"):
+            return None
+        reasoning, content = _parse(text)
+        if reasoning is None and content == text:
+            return text or None
+        return None
