@@ -604,6 +604,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 swa_only=swa_only,
                 output=output[:num_decode_tokens],
             )
+        _attn_split_debug(
+            self, q, output, num_decode_tokens, num_prefills, num_decodes
+        )
 
     def _forward_decode(
         self,
@@ -784,3 +787,42 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
+
+
+_ATTN_SPLIT_DEBUG_STATE: dict = {}
+
+
+def _attn_split_debug(
+    attn, q, output, num_decode_tokens, num_prefills, num_decodes
+) -> None:
+    """Diagnostic (VLLM_DSV4_ATTN_SPLIT_DEBUG=1): after the real A100 sparse
+    attention (rocm.py forward_mqa), report which SEGMENT of the output holds
+    NaN — decode rows ([:num_decode_tokens], rocm_sparse_attn_decode) or
+    prefill-chunk rows ([num_decode_tokens:], _forward_prefill) — plus query
+    health, per attention layer. Syncs; diagnostic boots only.
+    """
+    state = _ATTN_SPLIT_DEBUG_STATE
+    if "on" not in state:
+        state["on"] = os.getenv(
+            "VLLM_DSV4_ATTN_SPLIT_DEBUG", "0").lower() in ("1", "true", "on")
+        state["dumps"] = 0
+    if not state["on"] or state["dumps"] >= 8:
+        return
+    flat = output.float().reshape(output.shape[0], -1)
+    nan_rows = torch.isnan(flat).any(dim=-1)
+    if not bool(nan_rows.any()):
+        return
+    state["dumps"] += 1
+    rows = nan_rows.nonzero().flatten().tolist()
+    q_nan_rows = torch.isnan(
+        q.float().reshape(q.shape[0], -1)).any(dim=-1).nonzero().flatten().tolist()
+    dec = [r for r in rows if r < num_decode_tokens]
+    pre = [r for r in rows if r >= num_decode_tokens]
+    from vllm.logger import init_logger
+    init_logger(__name__).error(
+        "ATTN_SPLIT_DEBUG dump %d: layer=%s compress_ratio=%s tokens=%d "
+        "(decode=%d prefill_reqs=%d) q_nan_rows=%s | NAN decode_rows=%s "
+        "prefill_rows=%s",
+        state["dumps"], getattr(attn, "prefix", "?"),
+        getattr(attn, "compress_ratio", "?"), output.shape[0],
+        num_decode_tokens, num_prefills, q_nan_rows[:8], dec[:8], pre[:8])

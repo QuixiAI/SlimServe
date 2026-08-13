@@ -84,7 +84,13 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         from vllm.model_executor.layers.quantization.gguf import ops
 
         num_tokens = o.shape[0]
-        if num_tokens <= 32:
+        # Diagnostic dial for the NaN hunt: the fused decode o_proj runs at
+        # num_tokens <= this threshold (default 32 = production heuristic);
+        # 0 forces the grouped MMQ path for every size.
+        if not hasattr(self, "_o_proj_fused_max_tokens"):
+            self._o_proj_fused_max_tokens = int(
+                os.getenv("VLLM_DSV4_O_PROJ_FUSED_MAX_TOKENS", "32"))
+        if num_tokens <= self._o_proj_fused_max_tokens:
             z, quant_z = ops.ggml_dsv4_o_proj_q8_0(
                 qweight,
                 o.contiguous(),

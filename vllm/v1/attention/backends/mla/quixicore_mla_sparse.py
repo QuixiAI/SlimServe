@@ -381,6 +381,10 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 k_scale,
                 partition_size=256,
             )
+            _sparse_nan_debug(
+                out, splitq[0].transpose(0, 1), kv_c_and_k_pe_cache, bt, idx,
+                tlen, attn_metadata,
+            )
             return out, None
 
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
@@ -394,4 +398,62 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             k_scale,
             partition_size=256,
         )
+        _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                          attn_metadata)
         return out, None
+
+
+_SPARSE_NAN_DEBUG_STATE: dict = {}
+
+
+def _sparse_nan_debug(out, q, kv_cache, bt, idx, tlen, attn_metadata) -> None:
+    """Diagnostic (VLLM_DSV4_SPARSE_NAN_DEBUG=1): when a NaN row leaves the
+    sparse decode kernel, dump that row's inputs — query health, top-k index
+    census, effective length, and a byte-level census of the fp8 KV entries
+    it gathered (0x7F/0xFF encode NaN in e4m3) — with a clean row as control.
+    Syncs; diagnostic boots only.
+    """
+    state = _SPARSE_NAN_DEBUG_STATE
+    if "on" not in state:
+        import os
+        state["on"] = os.getenv(
+            "VLLM_DSV4_SPARSE_NAN_DEBUG", "0").lower() in ("1", "true", "on")
+        state["dumps"] = 0
+    if not state["on"] or state["dumps"] >= 6:
+        return
+    nan_rows = torch.isnan(out.float().reshape(out.shape[0], -1)).any(dim=-1)
+    if not bool(nan_rows.any()):
+        return
+    state["dumps"] += 1
+    rows = nan_rows.nonzero().flatten().tolist()
+    clean_rows = (~nan_rows).nonzero().flatten().tolist()
+    control = clean_rows[0] if clean_rows else None
+    blk = attn_metadata.block_size
+    kv_bytes = kv_cache.view(torch.uint8)
+    entry = kv_bytes.shape[-1]
+
+    def row_report(r: int) -> str:
+        q_nan = bool(torch.isnan(q[r].float()).any())
+        row_idx = idx[r]
+        valid = row_idx[row_idx >= 0]
+        t = int(tlen[r]) if tlen.numel() > r else -1
+        if valid.numel() == 0:
+            return (f"row {r}: q_nan={q_nan} tlen={t} no valid indices")
+        blocks = bt[r][(valid // blk).long()]
+        flat = blocks.long() * blk + (valid % blk).long()
+        gathered = kv_bytes.reshape(-1, entry)[flat]
+        fp8_part = gathered[:, :512]
+        nan_bytes = ((fp8_part == 0x7F) | (fp8_part == 0xFF)).sum().item()
+        per_tok = ((fp8_part == 0x7F) | (fp8_part == 0xFF)).any(dim=-1)
+        bad_tokens = int(per_tok.sum())
+        worst = valid[per_tok.nonzero().flatten()[:8]].tolist() if bad_tokens else []
+        return (f"row {r}: q_nan={q_nan} tlen={t} n_idx={int(valid.numel())} "
+                f"idx_max={int(valid.max())} nan_bytes={nan_bytes} "
+                f"tokens_with_nan_bytes={bad_tokens}/{int(valid.numel())} "
+                f"first_bad_positions={worst}")
+
+    reports = [row_report(r) for r in rows[:3]]
+    ctl = row_report(control) if control is not None else "no clean row"
+    logger.error(
+        "SPARSE_NAN_DEBUG dump %d: batch=%d nan_rows=%s | %s | CONTROL %s",
+        state["dumps"], out.shape[0], rows[:8], " | ".join(reports), ctl)
