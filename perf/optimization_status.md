@@ -2417,3 +2417,37 @@ steps when this thread is picked up: minimal concurrency (c2/c3),
 prefill-only vs decode-only mixes, and the indexer's no-spec decode
 branch (next_n=1) vs the spec-shaped flattening branch - the largest
 code fork between the two configurations.
+
+### 2026-08-13 - BREAKTHROUGH: both bugs born in the first sparse-attention layer
+
+The probe-liveness diagnostic boot (deterministic no-spec c11 storm)
+delivered clean per-layer dumps and a surgical fingerprint: slots 0, 1
+and 100-108 ABSENT (layers 0-1 fully clean; layer-2's attention INPUT
+clean), slot 109 = LAYER-2 ATTENTION OUTPUT is the birth site (~100
+deterministic events), cascading 110 -> layer outputs 2..9. Re-reading
+the earlier spec-mode captures with this key: cap1's fresh birth was
+also (109,1) - the (100..108, 7) chain there was carry-through of
+already-poisoned rows re-entering the net, which I had misread as a
+layer-0 birth (min-slot logic breaks once poisoned requests recirculate).
+
+ONE BIRTH SITE FOR BOTH BUGS: layer 2 is the first compress_ratio=4
+layer (ratios [0,0,4,128,4,...]) - the first C4A sparse-attention layer
+with an indexer and sparse MLA over the compressed KV cache. The rare
+spec seed and the deterministic no-spec storm are the same defect
+class: sparse attention producing NaN from clean inputs, rare under
+spec-shaped batches, deterministic under no-spec concurrent
+chunked-prefill/decode mixes. Top-k indices are always IN RANGE
+(validator zero across every storm); prime suspects are therefore
+in-range-but-unwritten reads: fp8 KV bytes 0x7F/0xFF decode to NaN, so
+a topk index (or compressed-slot mapping, ratio-4 bookkeeping) pointing
+at an allocated-but-not-yet-written compressed KV slot yields exactly
+this signature. The batch-shape dependence (decode_threshold 1 vs 6)
+changes which rows sit in mixed batches while prefill chunks are still
+writing compressed slots.
+
+Next bisection (deterministic 10-min repro): instrument layer-2's
+indexer decode path to compare each row's topk_indices against the
+request's WRITTEN compressed length (not max seq len), and dump the
+sparse MLA gather inputs for the first NaN row; then the ratio-4
+insert/readback boundary (indexer_k_quant_and_cache vs
+cp_gather_indexer_k_quant_cache) for off-by-one-chunk lag.
