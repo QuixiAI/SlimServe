@@ -2564,3 +2564,53 @@ Production posture unchanged and safe: spec + aux-off serving is clean
 under load (the seed needs the geometry production avoids at width;
 NAN_WATCH + canary standing). The no-spec flag stays documented as
 broken until this kernel bug is fixed.
+
+### 2026-08-13 - ROOT CAUSE FOUND AND FIXED: 0*NaN in the split-K reduce
+
+The whole incident family - the rare production seed, the BOS-loop
+storms, and the deterministic no-spec degeneration - reduces to one
+IEEE trap in the DSV4 sparse decode's split-K reduction
+(csrc/quixicore/serving/paged_attn_v2_kernels.cuh,
+dsv4_attention_reduce_active_channels):
+
+  value += tmp_out[partition] * weight;
+
+The persistent writer (mla_decode_fp8_v) publishes finite ml/es stats
+for balanced-away EMPTY partitions but never stores their 512-float
+tmp vector; tmp was torch::empty. weight is exactly 0 for those
+partitions - which looks like a correct no-op - but IEEE 0*NaN = NaN
+and 0*inf = NaN, so whenever the recycled allocator bytes behind an
+unwritten tmp vector decoded to NaN/inf, one empty partition poisoned
+the row.
+
+Proof chain: partials census (ml_bad=0, es_bad=0, tmp_bad~150 on
+storm-shaped calls); sentinel fill of tmp mapped exactly one
+unwritten partition per (batch,head) inside "written" stats AND
+stopped the storm (deg 0/11, 0 NaN lines - first clean boot of that
+config in 14); the one-line reducer guard (skip !(w > 0)) alone, no
+sentinel, no debug: 3 full-length trigger runs, deg 0/11 each,
+0 NaN lines.
+
+Every mystery of the incident collapses into this mechanism:
+- Boot/phase lottery = recycled allocator content behind unwritten
+  partials.
+- Batch-geometry gating = partition counts and tmp reuse patterns
+  (spec c11 verify widths vs no-spec 1-token decode).
+- Graph-mode correlation (FULL storms) = graph pools changing what the
+  allocator recycles - correlation, not causation.
+- Per-row nondeterminism and clean-input convictions = the poison
+  entered through a buffer no input audit covered.
+- The aux-off "3/3 silent" = phase luck and/or allocation-pattern
+  shifts; the mHC/collective/runner theories were all epiphenomena.
+- The earlier reducer NaN-guards (!(mp > NEG_INF)) helped only when
+  the garbage happened to make ml NaN; finite ml with garbage tmp
+  sailed through.
+
+Fixes landed: the w>0 guard in dsv4_attention_reduce_active_channels;
+same hardening in the three sibling reducers (one-warp, WARPS-wide,
+and the plain template - one skipped only ml=-inf, one tested
+weight==0.0f exactly which passes NaN weights, one was unguarded);
+ml/es workspace init (-inf/0) kept as defense in depth. tmp remains
+torch::empty by design - the guard makes unwritten vectors
+unreachable. no-spec serving is UNBROKEN by this fix (the 3 clean
+validation runs were no-spec).

@@ -209,6 +209,10 @@ __global__ void paged_attention_reduce(
         const float mp = max_logits[base + p];
         if (!(mp > NEG_INF)) continue;
         const float r = exp_sums[base + p] * expf(mp - gm);
+        // r must be strictly positive before touching tmp: a partition with
+        // finite stats but zero mass can have an unwritten tmp vector, and
+        // IEEE 0*NaN = NaN (see dsv4_attention_reduce_active_channels).
+        if (!(r > 0.0f)) continue;
         const int64_t ob = (base + p) * D;
         #pragma unroll
         for (int i = 0; i < VPL; i++) acc[i] += tmp_out[ob + lane + 32 * i] * r;
@@ -302,7 +306,9 @@ __global__ void paged_attention_reduce_multiwarp(
     }
     for (int p = warp; p < num_partitions; p += WARPS) {
         const float weight = partition_weights[p];
-        if (weight == 0.0f) {
+        // !(w > 0) rather than w == 0: also skips NaN weights, and keeps
+        // unwritten tmp vectors of zero-mass partitions untouched.
+        if (!(weight > 0.0f)) {
             continue;
         }
         const int64_t partition_base = (base + p) * D;
@@ -401,7 +407,11 @@ __global__ __launch_bounds__(D, 2) void paged_attention_reduce_channels(
 
     float value = 0.0f;
     for (int p = 0; p < num_partitions; ++p) {
-        value += tmp_out[(base + p) * D + thread] * partition_weights[p];
+        const float w = partition_weights[p];
+        // Skip zero-mass partitions: their tmp vector may be unwritten and
+        // IEEE 0*NaN = NaN (see dsv4_attention_reduce_active_channels).
+        if (!(w > 0.0f)) continue;
+        value += tmp_out[(base + p) * D + thread] * w;
     }
     const int64_t output_base = (int64_t(batch) * num_heads + head) * D;
     out[output_base + thread] = global_max == NEG_INF
@@ -502,12 +512,25 @@ __global__ __launch_bounds__(D, 2) void dsv4_attention_reduce_active_channels(
     __syncthreads();
 
     float value = 0.0f;
-    for (int partition = 0; partition < main_active; ++partition)
-        value += tmp_out[(base + partition) * D + thread] *
-                 partition_weights[partition];
-    for (int partition = extra_begin; partition < extra_end; ++partition)
-        value += tmp_out[(base + partition) * D + thread] *
-                 partition_weights[partition];
+    // Zero-weight partitions MUST be skipped, not multiplied: the persistent
+    // writer publishes finite ml/es for balanced-away empty partitions but
+    // never stores their 512-float tmp vector, so tmp holds whatever the
+    // allocator recycled. weight==0 looks like a correct no-op, but IEEE
+    // 0*NaN = NaN and 0*inf = NaN, so one unwritten partial poisons the
+    // whole row whenever the recycled bytes decode to NaN/inf — the root
+    // cause of the 2026-08 DSV4 degeneration incident (rare under spec
+    // batch geometry, deterministic under no-spec concurrency). The w > 0
+    // test also skips NaN weights (NaN > 0 is false).
+    for (int partition = 0; partition < main_active; ++partition) {
+        const float w = partition_weights[partition];
+        if (w > 0.0f)
+            value += tmp_out[(base + partition) * D + thread] * w;
+    }
+    for (int partition = extra_begin; partition < extra_end; ++partition) {
+        const float w = partition_weights[partition];
+        if (w > 0.0f)
+            value += tmp_out[(base + partition) * D + thread] * w;
+    }
     const int64_t output_base = (int64_t(batch) * num_heads + head) * D;
     out[output_base + thread] = global_max == NEG_INF
         ? T(0)

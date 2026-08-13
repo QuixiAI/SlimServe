@@ -1657,7 +1657,16 @@ static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
     }
 
     auto opts = q.options().dtype(torch::kFloat);
-    auto tmp = torch::empty({B, H, total_p, 512}, opts);
+    // Sentinel diagnostic (VLLM_DSV4_MLA_TMP_SENTINEL=1): fill the value
+    // partials with a finite marker to map exactly which dims the writer
+    // leaves unwritten while still writing finite ml/es (the reducer then
+    // consumes whatever is here - the NaN mechanism under investigation).
+    static const bool tmp_sentinel =
+        std::getenv("VLLM_DSV4_MLA_TMP_SENTINEL") != nullptr &&
+        std::getenv("VLLM_DSV4_MLA_TMP_SENTINEL")[0] == '1';
+    auto tmp = tmp_sentinel
+                   ? torch::full({B, H, total_p, 512}, 12345.0f, opts)
+                   : torch::empty({B, H, total_p, 512}, opts);
     // ml/es MUST be initialized, not torch::empty: the reducer's per-row
     // active count is min(partitions, length-in-TOKENS), so it reads every
     // partial slot for real rows, while the persistent writer can skip
@@ -1677,6 +1686,47 @@ static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
         extra_cache, extra_bt, extra_indices, extra_topk_length,
         extra_indices_are_slots, int(extra_block_size), extra_p, scale, ps,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>());
+    // Diagnostic (VLLM_DSV4_MLA_DEBUG_PARTIALS=1): census the split
+    // partials between the writer and the reducer. Syncs; offline replay
+    // and debug boots only.
+    static const bool debug_partials =
+        std::getenv("VLLM_DSV4_MLA_DEBUG_PARTIALS") != nullptr &&
+        std::getenv("VLLM_DSV4_MLA_DEBUG_PARTIALS")[0] == '1';
+    if (debug_partials) {
+        auto ml_bad = (torch::isnan(ml) | torch::isinf(ml)).sum().item<int64_t>();
+        auto es_bad = (torch::isnan(es) | torch::isinf(es)).sum().item<int64_t>();
+        auto tmp_bad =
+            (torch::isnan(tmp) | torch::isinf(tmp)).sum().item<int64_t>();
+        int64_t sentinel_left = 0;
+        if (tmp_sentinel) {
+            auto written_parts = torch::isfinite(ml) &
+                                 (ml > -std::numeric_limits<float>::infinity());
+            auto sent = (tmp == 12345.0f);
+            // sentinel retained inside partitions whose ml says "written"
+            sentinel_left =
+                (sent & written_parts.unsqueeze(-1)).sum().item<int64_t>();
+        }
+        if (ml_bad || es_bad || tmp_bad || sentinel_left) {
+            auto ml_rows = (torch::isnan(ml) | torch::isinf(ml))
+                               .any(-1).any(-1).nonzero().flatten();
+            auto per_part = (torch::isnan(tmp) | torch::isinf(tmp))
+                                .any(-1).sum({0, 1});
+            printf("MLA_DEBUG_PARTIALS: B=%d H=%d main_p=%d extra_p=%d "
+                   "ml_bad=%ld es_bad=%ld tmp_bad=%ld sentinel_in_written=%ld "
+                   "first_bad_batch=%ld\n",
+                   B, H, main_p, extra_p, long(ml_bad), long(es_bad),
+                   long(tmp_bad), long(sentinel_left),
+                   ml_rows.numel() ? long(ml_rows[0].item<int64_t>()) : -1);
+            auto pp = per_part.cpu();
+            printf("MLA_DEBUG_PARTIALS per-partition tmp bad-head counts:");
+            for (int p = 0; p < total_p; p++)
+                if (pp[p].item<int64_t>())
+                    printf(" p%d=%ld", p, long(pp[p].item<int64_t>()));
+            printf(" (main 0..%d, extra %d..%d)\n", main_p - 1, main_p,
+                   total_p - 1);
+            fflush(stdout);
+        }
+    }
     dsv4_attention_reduce_active_channels<__nv_bfloat16, 512>
         <<<dim3(H, B), 512, total_p * sizeof(float), stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
