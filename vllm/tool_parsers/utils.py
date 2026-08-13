@@ -11,8 +11,10 @@ from typing import Any, TypeAlias
 
 import partial_json_parser
 from openai.types.responses import (
+    CustomTool,
     FunctionTool,
     NamespaceTool,
+    ToolChoiceCustom,
     ToolChoiceFunction,
 )
 from openai.types.responses.tool import Tool as ResponsesTool
@@ -33,6 +35,10 @@ from vllm.logger import init_logger
 Tool: TypeAlias = ChatCompletionToolsParam | ResponsesTool
 
 logger = init_logger(__name__)
+
+NamedToolChoice: TypeAlias = (
+    ToolChoiceFunction | ToolChoiceCustom | ChatCompletionNamedToolChoiceParam
+)
 
 
 def safe_literal_eval(text: str):
@@ -200,6 +206,26 @@ def iter_response_function_tool_info(
     ]
 
 
+def is_responses_custom_tool(tool: Tool) -> bool:
+    """Return whether *tool* is a Responses API raw-input custom tool."""
+    return isinstance(tool, CustomTool)
+
+
+def responses_custom_tool_names(tools: list[Tool] | None) -> frozenset[str]:
+    if not tools:
+        return frozenset()
+    return frozenset(tool.name for tool in tools if is_responses_custom_tool(tool))
+
+
+def named_tool_choice_name(tool_choice: object) -> str | None:
+    """Return the selected tool name for Chat or Responses named choices."""
+    if isinstance(tool_choice, ToolChoiceFunction | ToolChoiceCustom):
+        return tool_choice.name
+    if isinstance(tool_choice, ChatCompletionNamedToolChoiceParam):
+        return tool_choice.function.name
+    return None
+
+
 def iter_response_function_tool_dicts(
     tools: list[ResponsesTool],
 ) -> list[dict[str, Any]]:
@@ -276,6 +302,8 @@ def find_tool_properties(
     if not tools:
         return {}
     for tool in tools:
+        if is_responses_custom_tool(tool):
+            continue
         if isinstance(tool, (FunctionTool, NamespaceTool)):
             for name, params in iter_response_function_tool_info(tool):
                 if name == tool_name:
@@ -297,6 +325,10 @@ def find_tool_name(
     if not tools:
         return False
     for tool in tools:
+        if is_responses_custom_tool(tool):
+            if tool.name == tool_name:
+                return True
+            continue
         if isinstance(tool, (FunctionTool, NamespaceTool)):
             for name, _ in iter_response_function_tool_info(tool):
                 if name == tool_name:
@@ -378,7 +410,7 @@ def _get_json_schema_from_tools(
 
 
 def get_json_schema_from_tools(
-    tool_choice: str | ToolChoiceFunction | ChatCompletionNamedToolChoiceParam,
+    tool_choice: str | NamedToolChoice,
     tools: list[Tool] | None,
 ) -> str | dict | None:
     # tool_choice: "none"
@@ -400,6 +432,10 @@ def get_json_schema_from_tools(
         if tool_name not in responses_tool_map:
             raise ValueError(f"Tool '{tool_name}' has not been passed in `tools`.")
         return responses_tool_map[tool_name]
+    # Raw custom-tool input is constrained inside a model-native structural
+    # envelope, not by the whole-response JSON-schema path.
+    if isinstance(tool_choice, ToolChoiceCustom):
+        return None
     # tool_choice: Forced Function (ChatCompletion)
     if (not isinstance(tool_choice, str)) and isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam

@@ -8,17 +8,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from functools import cached_property
 
-from openai.types.responses import ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
 
 from vllm.entrypoints.chat_utils import (
     get_tool_call_id_type,
     make_tool_call_id,
 )
-from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionNamedToolChoiceParam,
-    ChatCompletionRequest,
-)
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
@@ -37,6 +33,7 @@ from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
 )
+from vllm.tool_parsers.utils import named_tool_choice_name
 
 logger = init_logger(__name__)
 
@@ -394,12 +391,8 @@ class DelegatingParser(Parser):
     def _get_function_name(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> str:
-        if request.tool_choice and isinstance(request.tool_choice, ToolChoiceFunction):
-            return request.tool_choice.name
-        if request.tool_choice and isinstance(
-            request.tool_choice, ChatCompletionNamedToolChoiceParam
-        ):
-            return request.tool_choice.function.name
+        if name := named_tool_choice_name(request.tool_choice):
+            return name
         raise ValueError("Invalid tool_choice for function name extraction.")
 
     def _make_tool_call_id(self, function_name: str) -> str | None:
@@ -431,10 +424,7 @@ class DelegatingParser(Parser):
             return [], content
 
         supports_required_and_named = tool_parser.supports_required_and_named
-        is_named_tool_choice = request.tool_choice and isinstance(
-            request.tool_choice,
-            (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
-        )
+        is_named_tool_choice = named_tool_choice_name(request.tool_choice) is not None
         is_required_tool_choice = request.tool_choice == "required"
         is_auto_tool_choice = enable_auto_tools and (
             request.tool_choice == "auto"
@@ -532,10 +522,7 @@ class DelegatingParser(Parser):
         need_tool_calling = (
             request.tool_choice == "auto"
             or request.tool_choice == "required"
-            or isinstance(
-                request.tool_choice,
-                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
-            )
+            or named_tool_choice_name(request.tool_choice) is not None
         )
         if not need_tool_calling:
             return request
@@ -680,11 +667,7 @@ class DelegatingParser(Parser):
 
         if (
             supports_required_and_named
-            and request.tool_choice
-            and isinstance(
-                request.tool_choice,
-                (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam),
-            )
+            and named_tool_choice_name(request.tool_choice) is not None
         ):
             delta_message, function_name_returned = extract_named_tool_call_streaming(
                 delta_text=delta_text,
