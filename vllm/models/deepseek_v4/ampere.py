@@ -465,6 +465,62 @@ def _ampere_decode_debug(
         rows[:6], " | ".join(rep(r) for r in rows[:4]),
         rep(clean[0]) if clean else "none")
 
+    # One-shot full-input capture for offline kernel replay.
+    if not state.get("captured") and extra_indices is not None:
+        cap_path = os.getenv("VLLM_DSV4_DECODE_CAPTURE", "")
+        if cap_path:
+            r = rows[0]
+
+            def entries_for(cache, slots):
+                cache_b = cache.view(torch.uint8).reshape(-1)
+                bs_tokens = 64
+                block_bytes = bs_tokens * 584
+                n_slots = cache_b.numel() // block_bytes * bs_tokens
+                sl = slots.long().clamp(0, max(n_slots - 1, 0))
+                dbase = (sl // bs_tokens) * block_bytes + (sl % bs_tokens) * 576
+                doffs = torch.arange(576, device=cache_b.device)
+                data = cache_b[dbase[:, None] + doffs[None, :]]
+                sbase = ((sl // bs_tokens) * block_bytes + bs_tokens * 576
+                         + (sl % bs_tokens) * 8)
+                soffs = torch.arange(8, device=cache_b.device)
+                scales = cache_b[sbase[:, None] + soffs[None, :]]
+                return data.cpu(), scales.cpu()
+
+            swa_row = swa_indices[r]
+            swa_valid = swa_row[swa_row >= 0]
+            swa_data, swa_scales = entries_for(
+                attn.swa_cache_layer.kv_cache, swa_valid)
+            ex_row = extra_indices[r]
+            ex_valid = ex_row[ex_row >= 0]
+            if extra_indices_are_slots:
+                ex_slots = ex_valid.long()
+            else:
+                blocks = extra_bt[r][(ex_valid // extra_block_size).long()]
+                ex_slots = blocks.long() * extra_block_size + (
+                    ex_valid % extra_block_size).long()
+            ex_data, ex_scales = entries_for(extra_cache, ex_slots)
+            torch.save({
+                "q_row": q[r].detach().cpu(),
+                "swa_indices": swa_row.cpu(),
+                "swa_len": int(swa_lens[r]),
+                "extra_indices": ex_row.cpu(),
+                "extra_len": int(extra_lens[r]) if extra_lens is not None else 0,
+                "extra_indices_are_slots": bool(extra_indices_are_slots),
+                "extra_slots_resolved": ex_slots.cpu(),
+                "swa_data": swa_data, "swa_scales": swa_scales,
+                "extra_data": ex_data, "extra_scales": ex_scales,
+                "attn_sink": attn.attn_sink.detach().cpu(),
+                "scale": float(attn.scale),
+                "swa_block_size": int(swa_metadata.block_size),
+                "extra_block_size": int(extra_block_size or 0),
+                "out_row": out[r].detach().cpu(),
+                "layer": getattr(attn, "prefix", "?"),
+            }, cap_path)
+            state["captured"] = True
+            init_logger(__name__).error(
+                "AMPERE_DECODE_DEBUG: captured full op inputs for row %d "
+                "to %s", r, cap_path)
+
 
 def _token_census(cache_b, slots, bs_tokens, block_bytes):
     """Full-entry census: fp8 payload NaN bytes, rope bf16 isnan, scale max."""
