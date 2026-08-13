@@ -64,8 +64,14 @@ def probe(slot: int, *tensors: torch.Tensor | None) -> None:
 
 def snapshot() -> list[tuple[int, int]] | None:
     """(slot, count) pairs for every slot that has seen NaN. Syncs; call
-    only from an error handler."""
+    only from an error handler. Logs the never-allocated case loudly: it
+    means no probe() ran in this process, i.e. the probed model code did
+    not execute here — itself a diagnostic result."""
     if _BUF is None:
+        logger.error(
+            "NAN_PROBE snapshot: buffer never allocated in this process "
+            "(enabled=%s) — the probed model-forward code did not run here",
+            _ENABLED)
         return None
     host = _BUF.cpu()
     return [(i, int(c)) for i, c in enumerate(host.tolist()) if c]
