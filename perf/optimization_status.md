@@ -2451,3 +2451,32 @@ request's WRITTEN compressed length (not max seq len), and dump the
 sparse MLA gather inputs for the first NaN row; then the ratio-4
 insert/readback boundary (indexer_k_quant_and_cache vs
 cp_gather_indexer_k_quant_cache) for off-by-one-chunk lag.
+
+### 2026-08-13 - Retractions and re-aim: probes were on dead code
+
+Three corrections from the o_proj arm and a code-path audit:
+
+1. Fused o_proj EXONERATED: forcing the grouped MMQ path for all sizes
+   (new diagnostic dial VLLM_DSV4_O_PROJ_FUSED_MAX_TOKENS=0) still
+   storms (4,864 lines, 11/11 both runs). The <=32-gate geometry match
+   was coincidence. (Also found: the VLLM_DSV4_NATIVE_Q8_O_PROJ=0
+   fallback is bit-rotted on GGUF - crashes on .weight; unusable as a
+   kill switch.)
+2. RETRACTED: "sparse MLA core is clean". The KV byte-census probe sat
+   in vllm/v1/attention/backends/mla/quixicore_mla_sparse.py, which is
+   NOT the DSV4 A100 path. The real path is
+   vllm/models/deepseek_v4/amd/rocm.py: forward_mqa ->
+   rocm_sparse_attn_decode (merged SWA+sparse) and _forward_prefill.
+3. RETRACTED (attribution): the bt_per_token persistence fix lives in
+   that same unused builder - almost certainly a NO-OP for DSV4
+   serving. The 0/8 vfix campaign result was phase luck, and the
+   FULL-graph restoration decision now rests only on empirical
+   cleanliness (0/8 + production NAN_WATCH clean since), not on a
+   mechanism fix. The FULL-vs-PIECEWISE storm split (2/6 vs 0/6,
+   p~0.23) may itself have been lottery.
+
+New probe on the REAL path (VLLM_DSV4_ATTN_SPLIT_DEBUG=1): after
+rocm.py forward_mqa, per layer, report whether NaN rows live in the
+decode segment (rocm_sparse_attn_decode) or the prefill-chunk segment
+(_forward_prefill), plus query health. Boot in flight on the
+deterministic no-spec repro.
