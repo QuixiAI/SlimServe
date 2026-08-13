@@ -144,6 +144,16 @@ def _probe_apple() -> Machine | None:
         memory = int(raw) if raw else 0
     except ValueError:
         memory = 0
+    if memory <= 0:
+        # Sandboxed macOS processes may be denied access to sysctl even though
+        # POSIX sysconf remains available. SlimServe's profile gate must not
+        # turn that probe failure into a fictitious zero-memory Mac.
+        try:
+            pages = int(os.sysconf("SC_PHYS_PAGES"))
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            memory = pages * page_size
+        except (OSError, ValueError, TypeError):
+            memory = 0
     return Machine(platform="metal", device_name=chip, count=1, memory_bytes=memory)
 
 
