@@ -2,43 +2,33 @@
 
 Updated: 2026-08-10 22:20 UTC
 
-## Degeneration incident: RESOLVED (storms fixed, seed removed from production)
+## Degeneration incident: ROOT-CAUSED AND FIXED (2026-08-13)
 
-Two defects, two resolutions:
+The entire 2026-08 incident family - the rare NaN seed, the BOS-loop
+storms, and the deterministic no-spec degeneration - was ONE defect:
+IEEE 0*NaN in the DSV4 sparse decode's split-K reduce
+(csrc/quixicore/serving/paged_attn_v2_kernels.cuh). The persistent
+writer publishes finite ml/es for balanced-away empty partitions but
+never stores their tmp value vectors (torch::empty); the reducer
+multiplied those unwritten vectors by a mathematically-zero weight,
+and 0*NaN = NaN carried recycled allocator bytes into live attention
+outputs. Boot/phase lottery = recycled pool content; geometry gating
+= partition counts; the FULL-graph and aux-stream correlations were
+allocation-pattern epiphenomena. Fix: skip !(weight > 0) partitions
+(mathematically identical, garbage-proof), hardened in all four
+reducers; ml/es workspace init kept as defense in depth (ceba09670).
 
-1. STORMS (instance-wide BOS-loop collapse): root-caused to the
-   sparse-MLA builder's lazy bt_per_token gather under FULL-graph
-   capture; fixed with ROCm-parity build-time persistence; 0 storms in
-   8 validation boots (pre-fix 2/6) and across ~40 campaign boots
-   since. FULL capture-64 serves in production.
-2. RARE SEED (single-token NaN blips): mechanism-localized by a
-   complete elimination matrix to the multi-stream attention
-   projection overlap - the ONLY component whose removal silences it
-   (aux-off 5 boots/~10 runs silent in active phases; every other arm
-   fires: collectives, mHC schedules, all graph modes, ALIGNED_Q8,
-   exact math on real weights, every kernel in isolation).
-   VLLM_DSV4_AUX_STREAMS=0 is set on all five A100 dsv4 tiers - and
-   measured FASTER (458 vs 427 tok/s clean c11; the overlap was a net
-   loss at seam widths). Production acceptance: both daemons under
-   dual c16 load, zero NaN events, zero degeneration, 546-561 tok/s.
-
-KNOWN BROKEN - --no-spec on DSV4 A100 (2026-08-12): storms with
-whole-batch NaN under any concurrent load (3/3 boots; c1 clean;
-independent of runner, graph mode, aux streams - the V2-default fix
-made these clean single-variable tests). Production unaffected (DSpark
-mandatory). Do not use --no-spec for DSV4 perf diagnosis until the
-concurrent no-spec decode path is fixed; characterization and next
-bisection steps are in the notebook.
-
-Open research (not production-affecting): the underlying concurrency
-race inside the overlap resists isolation (20k-iteration standalone
-repro clean; needs TP4/drafter/allocator context) - harness and
-runbook in perf/diagnostics/dsv4-nan/. Separate thread: the legacy
-(non-spec) model runner produced one whole-batch NaN storm boot;
-investigate before any no-spec production use. Standing protections:
-VLLM_NAN_WATCH on both daemons, slimserve-canary auto-restart, harness
-chars-per-token guard. Do not re-enable aux streams on A100 dsv4
-without a clean multi-boot campaign in an ACTIVE phase.
+Validation: the 13/13-storming no-spec repro ran clean (3 full
+trigger runs, 0 NaN); production (spec, both daemons) redeployed on
+the fixed kernel - dual c16 acceptance clean, 544-570 tok/s, zero NaN
+events. --no-spec is UNBROKEN. Aux streams remain off on A100 purely
+for performance (458 vs 427 c11 - the overlap was a net loss); it is
+no longer a correctness mitigation. NAN_WATCH stays on both daemons
+and the canary stays armed as regression tripwires. The full
+investigation record - including every dead theory and both
+instrument-bug retractions - is in perf/optimization_status.md;
+diagnostics live in perf/diagnostics/dsv4-nan/ plus env-gated probes
+(VLLM_DSV4_MLA_DEBUG_PARTIALS, VLLM_DSV4_MLA_TMP_SENTINEL).
 
 ## Read First
 
