@@ -363,4 +363,90 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             self.scale,
             _mla_partition_size(q.shape[1]),
         )
+        _ampere_decode_debug(
+            self, out, q, swa_lens, extra_lens, swa_metadata, swa_only,
+            extra_indices=extra_indices, extra_bt=extra_bt,
+            extra_cache=extra_cache, extra_block_size=extra_block_size,
+            extra_indices_are_slots=extra_indices_are_slots,
+        )
         output.copy_(out)
+
+
+_AMPERE_DECODE_DEBUG_STATE: dict = {}
+
+
+def _ampere_decode_debug(
+    attn, out, q, swa_lens, extra_lens, swa_metadata, swa_only,
+    extra_indices=None, extra_bt=None, extra_cache=None,
+    extra_block_size=None, extra_indices_are_slots=True,
+) -> None:
+    """Diagnostic (VLLM_DSV4_ATTN_SPLIT_DEBUG=1, shared gate): for NaN rows
+    leaving the native DSV4 two-source decode (mla_decode_fp8_sparse_dsv4),
+    dump per-row source extents — swa_len, extra(topk)_len, is_valid — with a
+    clean-row control. swa_len==0 AND extra_len==0 means the merged reduction
+    had zero contributions: 0/0 -> NaN from perfectly clean inputs."""
+    state = _AMPERE_DECODE_DEBUG_STATE
+    if "on" not in state:
+        state["on"] = os.getenv(
+            "VLLM_DSV4_ATTN_SPLIT_DEBUG", "0").lower() in ("1", "true", "on")
+        state["dumps"] = 0
+    if not state["on"] or state["dumps"] >= 6:
+        return
+    flat = out.float().reshape(out.shape[0], -1)
+    nan_rows = torch.isnan(flat).any(dim=-1)
+    if not bool(nan_rows.any()):
+        return
+    state["dumps"] += 1
+    rows = nan_rows.nonzero().flatten().tolist()
+    clean = (~nan_rows).nonzero().flatten().tolist()
+    is_valid = swa_metadata.is_valid_token
+    q_nan = torch.isnan(
+        q.float().reshape(q.shape[0], -1)).any(dim=-1)
+
+    req_ids = swa_metadata.token_to_req_indices
+    num_decodes = swa_metadata.num_decodes
+
+    def census(r):
+        """fp8-NaN byte census over the extra (topk) entries row r gathers."""
+        if (extra_indices is None or extra_cache is None
+                or extra_indices.shape[1] == 0):
+            return "no-extra"
+        row_idx = extra_indices[r]
+        valid_idx = row_idx[row_idx >= 0].long()
+        if valid_idx.numel() == 0:
+            return "empty"
+        cache_b = extra_cache.view(torch.uint8)
+        entry = cache_b.shape[-1]
+        flat = cache_b.reshape(-1, entry)
+        if extra_indices_are_slots:
+            slots = valid_idx
+        else:
+            blocks = extra_bt[r][(valid_idx // extra_block_size)]
+            slots = blocks.long() * extra_block_size + (
+                valid_idx % extra_block_size)
+        slots = slots.clamp(0, flat.shape[0] - 1)
+        rows_b = flat[slots][:, :512]
+        nan_mask = (rows_b == 0x7F) | (rows_b == 0xFF)
+        toks = int(nan_mask.any(dim=-1).sum())
+        return (f"nan_bytes={int(nan_mask.sum())} "
+                f"toks_with_nan={toks}/{int(valid_idx.numel())}")
+
+    def rep(r):
+        iv = (int(is_valid[r]) if is_valid is not None
+              and is_valid.numel() > r else "?")
+        sl = int(swa_lens[r]) if swa_lens.numel() > r else "?"
+        el = (int(extra_lens[r]) if extra_lens is not None
+              and extra_lens.numel() > r else "?")
+        rid = (int(req_ids[r]) if req_ids is not None
+               and req_ids.numel() > r else "?")
+        return (f"row{r}: req={rid}(n_dec={num_decodes}) valid={iv} "
+                f"swa_len={sl} extra_len={el} q_nan={bool(q_nan[r])} "
+                f"kv[{census(r)}]")
+
+    from vllm.logger import init_logger
+    init_logger(__name__).error(
+        "AMPERE_DECODE_DEBUG dump %d: layer=%s swa_only=%s rows=%d nan=%s "
+        "| %s | CONTROL %s",
+        state["dumps"], getattr(attn, "prefix", "?"), swa_only, out.shape[0],
+        rows[:6], " | ".join(rep(r) for r in rows[:4]),
+        rep(clean[0]) if clean else "none")

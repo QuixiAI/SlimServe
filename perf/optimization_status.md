@@ -2480,3 +2480,32 @@ rocm.py forward_mqa, per layer, report whether NaN rows live in the
 decode segment (rocm_sparse_attn_decode) or the prefill-chunk segment
 (_forward_prefill), plus query health. Boot in flight on the
 deterministic no-spec repro.
+
+### 2026-08-13 - MECHANISM PROVEN: compressed KV cache holds NaN-coded fp8
+
+Census on the real decode (mla_decode_fp8_sparse_dsv4 inputs, NaN rows
+vs controls): request mapping correct (req ids sane vs num_decodes),
+extents healthy (swa 128, topk 250), query clean at the first poisoned
+layer - and the fp8 payloads of the gathered compressed-cache entries
+contain NaN encodings (0x7F/0xFF) in ~30% of selected tokens
+(80/250, 67/250, 73/250, 76/250 across dumps; layers 2, 4, 38). The
+ratio-128 layer (extra_len=7) gathers clean; its q was already
+poisoned (carry-through). The attention kernel is exonerated: it
+faithfully attends over a corrupted compressed (ratio-4) cache.
+
+Root cause is therefore ONE hop away, in the compressed-cache WRITE
+path (the MLA compressor / its cache insert) under chunked prefill:
+~30% of a 1000-token request's 250 compressed groups holding garbage
+suggests whole chunks' compressed writes missing or mis-slotted (an
+offset relative to chunk start vs sequence start, or partial-group
+handling at chunk boundaries). The boot lottery falls out naturally:
+unwritten slots hold recycled allocator bytes, and whether those
+decode to fp8-NaN varies per boot. Next: extend the census to dump the
+bad POSITION histogram (contiguous range => chunk-offset bug;
+scattered => partial-group bug), then read the compressor's slot
+computation in the cache insert.
+
+Production exposure check still holds: spec-mode serving with aux-off
+has zero NAN_WATCH events across days of load - the spec-shaped
+schedule evidently avoids the triggering write pattern (to be
+explained by the same fix). All diagnostics env-gated, default off.
