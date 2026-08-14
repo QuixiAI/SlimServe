@@ -22,6 +22,7 @@
 #ifndef USE_ROCM
   #include "mmq_v2/mmq_v2.cuh"
   #include "../../../quixicore/quant/dsv4_moe_ampere.cuh"
+  #include "../../../quixicore/quant/dsv4_q4k_moe_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_mxfp4_moe_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_mxfp4_mmq_ampere.cuh"
   #include "../../../quixicore/quant/dsv4_mxfp4_seg_ampere.cuh"
@@ -1565,6 +1566,107 @@ torch::stable::Tensor ggml_dsv4_repack_mxfp4(torch::stable::Tensor W,
       W.data_ptr(), output.mutable_data_ptr(), experts, nblocks, W.stride(0),
       get_current_cuda_stream());
   return output;
+#endif
+}
+
+torch::stable::Tensor ggml_dsv4_moe_a8_q4k(
+    torch::stable::Tensor X,   // [tokens, hidden]
+    torch::stable::Tensor W1,  // [experts, 2 * intermediate, packed Q4_K]
+    torch::stable::Tensor W2,  // [experts, out_row, packed Q4_K]
+    torch::stable::Tensor topk_weights, torch::stable::Tensor topk_ids,
+    int64_t intermediate, int64_t out_row, int64_t top_k, int64_t tokens,
+    double swiglu_limit,
+    const std::optional<torch::stable::Tensor>& quant_input) {
+#ifdef USE_ROCM
+  STD_TORCH_CHECK(false, "ggml_dsv4_moe_a8_q4k is a CUDA-only fast path");
+#else
+  STD_TORCH_CHECK(X.dim() == 2 && X.size(0) == tokens,
+                  "ggml_dsv4_moe_a8_q4k: X must be [tokens, hidden]");
+  STD_TORCH_CHECK(W1.dim() == 3 && W2.dim() == 3,
+                  "ggml_dsv4_moe_a8_q4k: W1/W2 must be 3D expert tensors");
+  STD_TORCH_CHECK(
+      topk_weights.scalar_type() == torch::headeronly::ScalarType::Float &&
+          topk_weights.is_contiguous() && topk_weights.size(0) == tokens &&
+          topk_weights.size(1) == top_k,
+      "ggml_dsv4_moe_a8_q4k: topk_weights must be contiguous float32");
+  STD_TORCH_CHECK(
+      topk_ids.scalar_type() == torch::headeronly::ScalarType::Int &&
+          topk_ids.is_contiguous(),
+      "ggml_dsv4_moe_a8_q4k: topk_ids must be contiguous int32");
+  STD_TORCH_CHECK(top_k == 6 || top_k == 8,
+                  "ggml_dsv4_moe_a8_q4k: top_k must be 6 or 8");
+  STD_TORCH_CHECK(W1.size(1) == 2 * intermediate,
+                  "ggml_dsv4_moe_a8_q4k: W1 must combine gate/up rows");
+  STD_TORCH_CHECK(W2.size(1) == out_row,
+                  "ggml_dsv4_moe_a8_q4k: W2 output rows mismatch");
+  STD_TORCH_CHECK(W1.size(0) == W2.size(0),
+                  "ggml_dsv4_moe_a8_q4k: expert count mismatch");
+
+  const int64_t hidden = X.size(1);
+  STD_TORCH_CHECK(hidden % QK_K == 0 && intermediate % QK_K == 0,
+                  "ggml_dsv4_moe_a8_q4k: hidden and intermediate must be "
+                  "Q4_K superblock aligned");
+  STD_TORCH_CHECK(
+      W1.size(2) == hidden / QK_K * int64_t(sizeof(block_q4_K)),
+      "ggml_dsv4_moe_a8_q4k: W1 packed width does not match hidden");
+  STD_TORCH_CHECK(
+      W2.size(2) == intermediate / QK_K * int64_t(sizeof(block_q4_K)),
+      "ggml_dsv4_moe_a8_q4k: W2 packed width does not match intermediate");
+
+  const int64_t padded_x = (hidden + 511) / 512 * 512;
+  const int64_t routed_rows = tokens * top_k;
+  const int experts = static_cast<int>(W1.size(0));
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  cudaStream_t stream = get_current_cuda_stream();
+
+  torch::stable::Tensor quant_x = quant_input
+      ? *quant_input
+      : torch::stable::empty(
+            {tokens, padded_x / QK8_1 * 9},
+            torch::headeronly::ScalarType::Int, std::nullopt, X.device());
+  STD_TORCH_CHECK(
+      quant_x.scalar_type() == torch::headeronly::ScalarType::Int &&
+          quant_x.dim() == 2 && quant_x.size(0) == tokens &&
+          quant_x.size(1) == padded_x / QK8_1 * 9 && quant_x.is_contiguous(),
+      "ggml_dsv4_moe_a8_q4k: invalid packed Q8_1 input");
+  if (!quant_input) {
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        X.scalar_type(), "ggml_dsv4_moe_a8_q4k_x", [&] {
+          quantize_row_q8_1_cuda<scalar_t>(
+              static_cast<const scalar_t*>(X.const_data_ptr()),
+              quant_x.mutable_data_ptr(), static_cast<int>(hidden),
+              static_cast<int>(tokens), stream);
+        });
+  }
+
+  // Compact Q8_1 intermediate: the decode producer and down consumer agree
+  // on intermediate / QK8_1 blocks per route (no 512 padding).
+  auto quant_mid = torch::stable::empty(
+      {routed_rows, intermediate / QK8_1 * 9},
+      torch::headeronly::ScalarType::Int, std::nullopt, X.device());
+  auto out = torch::stable::empty({tokens, out_row}, X.scalar_type(),
+                                  std::nullopt, X.device());
+
+  slimserve::dsv4_ampere::launch_q4_k_gate_up_swiglu_q8_1_decode(
+      W1.const_data_ptr(), quant_x.const_data_ptr(),
+      quant_mid.mutable_data_ptr(),
+      reinterpret_cast<const int*>(topk_ids.const_data_ptr()),
+      reinterpret_cast<const float*>(topk_weights.const_data_ptr()),
+      W1.stride(0), static_cast<int>(hidden), static_cast<int>(intermediate),
+      static_cast<int>(tokens), static_cast<int>(top_k), experts,
+      static_cast<float>(swiglu_limit), stream);
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      X.scalar_type(), "ggml_dsv4_moe_a8_q4k_down", [&] {
+        slimserve::dsv4_ampere::launch_q4_k_down_weighted_sum<scalar_t>(
+            W2.const_data_ptr(), quant_mid.const_data_ptr(),
+            reinterpret_cast<const int*>(topk_ids.const_data_ptr()),
+            static_cast<scalar_t*>(out.mutable_data_ptr()), W2.stride(0),
+            static_cast<int>(intermediate), static_cast<int>(out_row),
+            static_cast<int>(tokens), static_cast<int>(top_k), experts,
+            stream);
+      });
+  return out;
 #endif
 }
 

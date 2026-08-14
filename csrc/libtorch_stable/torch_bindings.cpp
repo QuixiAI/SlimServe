@@ -657,6 +657,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_dsv4_repack_mxfp4(Tensor W, SymInt values_per_row) -> Tensor");
 
   ops.def(
+      "ggml_dsv4_moe_a8_q4k(Tensor X, Tensor W1, Tensor W2, "
+      "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
+      "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit, "
+      "Tensor? quant_input=None) -> Tensor");
+
+  ops.def(
       "ggml_dsv4_moe_a8_mxfp4(Tensor X, Tensor W1, Tensor W2, "
       "Tensor topk_weights, Tensor topk_ids, SymInt intermediate, "
       "SymInt out_row, SymInt top_k, SymInt tokens, float swiglu_limit, "
@@ -873,6 +879,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_dsv4_repack_iq2_xxs",
            TORCH_BOX(&ggml_dsv4_repack_iq2_xxs));
   ops.impl("ggml_dsv4_repack_mxfp4", TORCH_BOX(&ggml_dsv4_repack_mxfp4));
+  ops.impl("ggml_dsv4_moe_a8_q4k", TORCH_BOX(&ggml_dsv4_moe_a8_q4k));
   ops.impl("ggml_dsv4_moe_a8_mxfp4", TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4));
   ops.impl("ggml_dsv4_moe_a8_mxfp4_seg",
            TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4_seg));

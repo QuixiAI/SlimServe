@@ -774,6 +774,13 @@ torch::stable::Tensor ggml_dsv4_repack_iq2_xxs(torch::stable::Tensor W1,
 torch::stable::Tensor ggml_dsv4_repack_mxfp4(torch::stable::Tensor W,
                                              int64_t values_per_row);
 
+torch::stable::Tensor ggml_dsv4_moe_a8_q4k(
+    torch::stable::Tensor X, torch::stable::Tensor W1,
+    torch::stable::Tensor W2, torch::stable::Tensor topk_weights,
+    torch::stable::Tensor topk_ids, int64_t intermediate, int64_t out_row,
+    int64_t top_k, int64_t tokens, double swiglu_limit,
+    const std::optional<torch::stable::Tensor>& quant_input = std::nullopt);
+
 torch::stable::Tensor ggml_dsv4_moe_a8_mxfp4(
     torch::stable::Tensor X, torch::stable::Tensor W1,
     torch::stable::Tensor W2, torch::stable::Tensor topk_weights,

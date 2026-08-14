@@ -40,6 +40,34 @@ namespace slimserve::dsv4_ampere {
 
 constexpr int SEG_MAX_EXPERTS = 256;
 
+// ------------------------------------------------------------- cp.async
+// The y gathers stream through cp.async so the next span's global loads
+// overlap the current span's mma (these CTAs run at 1-2 per SM; there is no
+// cross-warp surplus to hide gather latency otherwise). block_q8_1's 36-byte
+// stride defeats 16-byte alignment, so qs words move at int granularity;
+// sizes below 16 require the .ca (L1-allocating) variant. Pre-sm80 falls
+// back to a synchronous copy with no-op fences, preserving semantics.
+__device__ __forceinline__ void seg_cp_async4(void* smem, const void* glob) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s),
+               "l"(glob));
+#else
+  *static_cast<int*>(smem) = *static_cast<const int*>(glob);
+#endif
+}
+__device__ __forceinline__ void seg_cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N>
+__device__ __forceinline__ void seg_cp_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
+
 // ------------------------------------------------------------ perm metadata
 // rows_per_expert/cursors must be zeroed before the histogram (launcher does
 // a cudaMemsetAsync). Invalid expert ids (<0 or >=experts) are skipped, so
@@ -120,28 +148,34 @@ __device__ __forceinline__ bool seg_locate(
 }
 
 // Gather one 128-value activation span for the tile's J columns, reading
-// token activations through perm_ids (route -> token). Pad columns zeroed.
+// token activations through perm_ids (route -> token). qs words stream via
+// cp.async; the four per-block scales convert half->float in registers after
+// the async issues. Pad columns keep stale qs and zero scales (the mma
+// multiplies by the zero scale; the operands are integers, so stale bytes
+// cannot poison the sum). Caller owns seg_cp_commit/seg_cp_wait and the
+// __syncthreads before the mma reads the tile.
 template <int J>
 __device__ __forceinline__ void seg_load_y_tokens(
     const block_q8_1* __restrict__ y, int* __restrict__ tile_y,
     const int* __restrict__ token_routes, const int ncols, const int q8b0,
     const int blocks_per_col_y, const int top_k) {
   const int tid = threadIdx.y * 32 + threadIdx.x;
-  for (int l = tid; l < J * MXMMQ_Y_STRIDE; l += MXMMQ_NTHREADS) {
-    const int c = l / MXMMQ_Y_STRIDE;
-    const int m = l % MXMMQ_Y_STRIDE;
-    if (c >= ncols) {
-      if (m < 4) tile_y[l] = 0;
-      continue;
-    }
+  for (int l = tid; l < J * 32; l += MXMMQ_NTHREADS) {
+    const int c = l >> 5;
+    const int qi = l & 31;
+    if (c >= ncols) continue;
     const block_q8_1* col =
         y + int64_t(token_routes[c] / top_k) * blocks_per_col_y + q8b0;
-    if (m < 4) {
-      tile_y[l] = __float_as_int(__low2float(col[m].ds));
-    } else {
-      const int qi = m - 4;
-      tile_y[l] = reinterpret_cast<const int*>(col[qi / 8].qs)[qi % 8];
-    }
+    seg_cp_async4(&tile_y[c * MXMMQ_Y_STRIDE + 4 + qi],
+                  reinterpret_cast<const int*>(col[qi >> 3].qs) + (qi & 7));
+  }
+  for (int l = tid; l < J * 4; l += MXMMQ_NTHREADS) {
+    const int c = l >> 2;
+    const int m = l & 3;
+    const block_q8_1* col =
+        y + int64_t(token_routes[c] / top_k) * blocks_per_col_y + q8b0;
+    tile_y[c * MXMMQ_Y_STRIDE + m] =
+        c < ncols ? __float_as_int(__low2float(col[m].ds)) : 0;
   }
 }
 
@@ -152,21 +186,22 @@ __device__ __forceinline__ void seg_load_y_mid(
     const int* __restrict__ token_routes, const int ncols, const int q8b0,
     const int blocks_per_col_y) {
   const int tid = threadIdx.y * 32 + threadIdx.x;
-  for (int l = tid; l < J * MXMMQ_Y_STRIDE; l += MXMMQ_NTHREADS) {
-    const int c = l / MXMMQ_Y_STRIDE;
-    const int m = l % MXMMQ_Y_STRIDE;
-    if (c >= ncols) {
-      if (m < 4) tile_y[l] = 0;
-      continue;
-    }
+  for (int l = tid; l < J * 32; l += MXMMQ_NTHREADS) {
+    const int c = l >> 5;
+    const int qi = l & 31;
+    if (c >= ncols) continue;
     const block_q8_1* col =
         mid + int64_t(token_routes[c]) * blocks_per_col_y + q8b0;
-    if (m < 4) {
-      tile_y[l] = __float_as_int(__low2float(col[m].ds));
-    } else {
-      const int qi = m - 4;
-      tile_y[l] = reinterpret_cast<const int*>(col[qi / 8].qs)[qi % 8];
-    }
+    seg_cp_async4(&tile_y[c * MXMMQ_Y_STRIDE + 4 + qi],
+                  reinterpret_cast<const int*>(col[qi >> 3].qs) + (qi & 7));
+  }
+  for (int l = tid; l < J * 4; l += MXMMQ_NTHREADS) {
+    const int c = l >> 2;
+    const int m = l & 3;
+    const block_q8_1* col =
+        mid + int64_t(token_routes[c]) * blocks_per_col_y + q8b0;
+    tile_y[c * MXMMQ_Y_STRIDE + m] =
+        c < ncols ? __float_as_int(__low2float(col[m].ds)) : 0;
   }
 }
 
@@ -224,9 +259,14 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_mxfp4_seg_w1(
     const int experts, const int top_k, const float swiglu_limit) {
   using namespace vllm_mmq_v2;
 
-  __shared__ int token_routes[J];
-  __shared__ __align__(16) int tile_y[J * MXMMQ_Y_STRIDE];
-  __shared__ __align__(16) int tile_x[MXMMQ_I * MXMMQ_X_STRIDE];
+  // Dynamic smem: the double-buffered y tile pushes J=64 past the 48 KiB
+  // static limit. Layout: routes | y0 | y1 | x (every offset is int-counted
+  // and 16-byte aligned for J in {16, 64}).
+  extern __shared__ int seg_w1_smem[];
+  int* token_routes = seg_w1_smem;
+  int* tile_y0 = token_routes + J;
+  int* tile_y1 = tile_y0 + J * MXMMQ_Y_STRIDE;
+  int* tile_x = tile_y1 + J * MXMMQ_Y_STRIDE;
   static_assert(2 * (SEG_MAX_EXPERTS + 1) <= MXMMQ_I * MXMMQ_X_STRIDE,
                 "seg tables borrow the weight-staging tile");
 
@@ -250,18 +290,34 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_mxfp4_seg_w1(
 
   float sum[J * MXMMQ_I / MXMMQ_NTHREADS] = {0.0f};
 
+  // Software pipeline: span s of superblock kb0 lives in tile_y[s&1]; the
+  // next span's cp.async group is always in flight while the current mma
+  // runs, and the x decode's global loads overlap the pending y group.
+  // seg_cp_wait<1> retires exactly the oldest of the two pending groups.
+  seg_load_y_tokens<J>(input, tile_y0, token_routes, ncols, 0,
+                       input_token_blocks, top_k);
+  seg_cp_commit();
   for (int kb0 = 0; kb0 < blocks_per_row; kb0 += MXMMQ_BLOCKS_PER_ITER) {
     seg_load_x_w1<REPACKED>(expert_base, tile_x, nblocks, blocks_per_row, kb0,
                             g0, intermediate);
-    seg_load_y_tokens<J>(input, tile_y, token_routes, ncols, kb0,
+    seg_load_y_tokens<J>(input, tile_y1, token_routes, ncols, kb0 + 4,
                          input_token_blocks, top_k);
+    seg_cp_commit();
+    seg_cp_wait<1>();
     __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 0);
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y0, sum, 0);
     __syncthreads();
-    seg_load_y_tokens<J>(input, tile_y, token_routes, ncols, kb0 + 4,
-                         input_token_blocks, top_k);
+    if (kb0 + MXMMQ_BLOCKS_PER_ITER < blocks_per_row) {
+      seg_load_y_tokens<J>(input, tile_y0, token_routes, ncols,
+                           kb0 + MXMMQ_BLOCKS_PER_ITER, input_token_blocks,
+                           top_k);
+      seg_cp_commit();
+      seg_cp_wait<1>();
+    } else {
+      seg_cp_wait<0>();
+    }
     __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 32);
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y1, sum, 32);
     __syncthreads();
   }
 
@@ -337,9 +393,11 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_mxfp4_seg_w2(
     const int out_row, const int experts) {
   using namespace vllm_mmq_v2;
 
-  __shared__ int token_routes[J];
-  __shared__ __align__(16) int tile_y[J * MXMMQ_Y_STRIDE];
-  __shared__ __align__(16) int tile_x[MXMMQ_I * MXMMQ_X_STRIDE];
+  extern __shared__ int seg_w2_smem[];
+  int* token_routes = seg_w2_smem;
+  int* tile_y0 = token_routes + J;
+  int* tile_y1 = tile_y0 + J * MXMMQ_Y_STRIDE;
+  int* tile_x = tile_y1 + J * MXMMQ_Y_STRIDE;
   static_assert(2 * (SEG_MAX_EXPERTS + 1) <= MXMMQ_I * MXMMQ_X_STRIDE,
                 "seg tables borrow the weight-staging tile");
 
@@ -363,17 +421,28 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_mxfp4_seg_w2(
 
   float sum[J * MXMMQ_I / MXMMQ_NTHREADS] = {0.0f};
 
+  seg_load_y_mid<J>(mid, tile_y0, token_routes, ncols, 0, blocks_per_row);
+  seg_cp_commit();
   for (int kb0 = 0; kb0 < blocks_per_row; kb0 += MXMMQ_BLOCKS_PER_ITER) {
     mxmmq_load_x<REPACKED, false>(expert_base, tile_x, nblocks,
                                   blocks_per_row, kb0, row_x0, out_row - 1);
-    seg_load_y_mid<J>(mid, tile_y, token_routes, ncols, kb0, blocks_per_row);
-    __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 0);
-    __syncthreads();
-    seg_load_y_mid<J>(mid, tile_y, token_routes, ncols, kb0 + 4,
+    seg_load_y_mid<J>(mid, tile_y1, token_routes, ncols, kb0 + 4,
                       blocks_per_row);
+    seg_cp_commit();
+    seg_cp_wait<1>();
     __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 32);
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y0, sum, 0);
+    __syncthreads();
+    if (kb0 + MXMMQ_BLOCKS_PER_ITER < blocks_per_row) {
+      seg_load_y_mid<J>(mid, tile_y0, token_routes, ncols,
+                        kb0 + MXMMQ_BLOCKS_PER_ITER, blocks_per_row);
+      seg_cp_commit();
+      seg_cp_wait<1>();
+    } else {
+      seg_cp_wait<0>();
+    }
+    __syncthreads();
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y1, sum, 32);
     __syncthreads();
   }
 
@@ -424,6 +493,23 @@ inline int seg_col_tiles(const int routes, const int experts, const int J) {
   return (routes + J - 1) / J + experts;
 }
 
+// routes | y0 | y1 | x, int-counted (double-buffered y for the cp.async
+// pipeline; J=64 exceeds the 48 KiB static limit, hence dynamic smem +
+// opt-in below).
+inline int seg_smem_bytes(const int J, const int x_stride) {
+  return (J + 2 * J * MXMMQ_Y_STRIDE + MXMMQ_I * x_stride) *
+         (int)sizeof(int);
+}
+
+template <typename KernelT>
+inline void seg_maybe_opt_in_smem(KernelT kernel, const int smem) {
+  if (smem > 48 * 1024) {
+    // Idempotent and cheap; per-device/per-J bookkeeping not worth it.
+    cudaFuncSetAttribute((const void*)kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  }
+}
+
 // meta scratch layout (ints): rows_per_expert[E] | cursors[E] |
 // rowseg[E+1] | tseg[E+1] | perm_ids[routes].
 inline int64_t seg_meta_ints(const int experts, const int routes) {
@@ -462,14 +548,17 @@ inline void launch_moe_mxfp4_seg(
   const dim3 block(32, MXMMQ_NWARPS);
 #define LAUNCH_SEG(J, R1, R2)                                                \
   do {                                                                       \
+    const int smem = seg_smem_bytes(J, MXMMQ_X_STRIDE);                      \
     const dim3 g1(intermediate / 64, seg_col_tiles(routes, experts, J));     \
-    moe_mxfp4_seg_w1<J, R1><<<g1, block, 0, stream>>>(                       \
+    seg_maybe_opt_in_smem(moe_mxfp4_seg_w1<J, R1>, smem);                    \
+    moe_mxfp4_seg_w1<J, R1><<<g1, block, smem, stream>>>(                    \
         w1, in, mid_blocks, perm_ids, rowseg, tseg, route_weights,           \
         w1_stride_bytes, hidden, input_token_blocks, intermediate, experts,  \
         top_k, swiglu_limit);                                                \
     const dim3 g2((out_row + MXMMQ_I - 1) / MXMMQ_I,                         \
                   seg_col_tiles(routes, experts, J));                        \
-    moe_mxfp4_seg_w2<scalar_t, J, R2><<<g2, block, 0, stream>>>(             \
+    seg_maybe_opt_in_smem(moe_mxfp4_seg_w2<scalar_t, J, R2>, smem);          \
+    moe_mxfp4_seg_w2<scalar_t, J, R2><<<g2, block, smem, stream>>>(          \
         w2, mid_blocks, w2out, perm_ids, rowseg, tseg, w2_stride_bytes,      \
         intermediate, out_row, experts);                                     \
   } while (0)

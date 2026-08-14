@@ -2653,3 +2653,60 @@ CONCLUSIONS:
    no c1 effect expected.
 
 Raw trace: scratchpad prof-c1/ (4 ranks); server log prof-server.log.
+
+## 2026-08-14 - Fused Q4_K (12,12) decode pair + cp.async seg pipelining: implemented, validated
+
+Two kernel deliverables landed together (e2e arms running, results to
+follow):
+
+1. Fused Q4_K MoE decode pair (csrc/quixicore/quant/dsv4_q4k_moe_ampere.cuh,
+   op ggml_dsv4_moe_a8_q4k): warp-per-row gate/up GEMV on raw block_q4_K
+   with fused SwiGLU + route weight + Q8_1 emission, plus a Q8xQ4_K down
+   weighted sum -- the tail layers' 7-launch generic route (vec w1, SwiGLU,
+   requant, 4x moe_align, MMQ w2, weighted moe_sum) becomes 2 launches.
+   Dispatch: (qweight_type, qweight_type2) == (12,12), decode widths
+   (VLLM_GGUF_DSV4_Q4K_ROWS, default 64), kill switch
+   VLLM_GGUF_DSV4_AMPERE_Q4K.
+2. cp.async double-buffered y tiles in all four seg kernels (IQ2 W1, Q2K
+   W2, MXFP4 W1/W2): span-parity double buffer, 4-byte cp.async.ca for the
+   qs payload (36-byte block_q8_1 stride defeats 16B alignment), scale
+   halves converted after the async issues, weight-decode global loads
+   overlapping the in-flight y group. J=64 tiles moved to dynamic smem
+   (57.6-61.7 KB, opt-in attribute); occupancy 3->2 CTAs/SM at J=64,
+   accepted pending e2e numbers.
+
+VALIDATION (the interesting part -- two instrument lessons):
+
+- cp.async change: BIT-EXACT vs the pre-change build (same inputs, 6
+  cases: iq2/mxfp4 seg x 8/96/1024 tokens). This is the right criterion:
+  the change moves bytes differently but performs identical arithmetic in
+  identical order. Pad columns keep stale qs under an exactly-zero scale
+  (integer operands, cannot poison -- deliberately checked against the
+  0*NaN incident class).
+- Q4_K parity vs fp64 dequant reference: first two harness attempts
+  FAILED for instrument reasons, not kernel reasons:
+  (a) reference dequantized with the fp32 Q8_1 scale, but quantize_q8_1
+      STORES the scale as fp16 -- every consumer sees the fp16-rounded
+      scale; (b) even with (a) fixed, recomputing v in fp64 flips
+      round(v/scale) by +-1 near .5 boundaries (fp32 kernel vs fp64 ref
+      differ ~1e-6; each flip perturbs a whole 4096-wide output row by
+      ~1e-3 of mean, and flips stack).
+  Proof of kernel correctness: single-route lstsq decomposition of the
+  fused-vs-reference diff = exactly 7 mid deltas, all +-1.0 quanta, all at
+  v/scale frac ~= .5000-.5019. The proven generic MMVQ path shows the
+  same-magnitude deviation vs the reference (bulk 0.29) -- the reference
+  is the outlier through the quant cliff, not the kernels. Final metric:
+  mean relative error (flip floor ~1.5e-3 vs O(1) for a wrong kernel);
+  PARITY_PASS 21/21 across inter {256,512,1024}, tokens {1..64}, masked
+  experts.
+
+Lesson recorded: parity through a quantization cliff can never be
+elementwise-tight for a reference computed in different precision; use
+bit-exact A/B when arithmetic is unchanged, flip-decomposition + mean-rel
+when it is not. (Same family as the fp8-census false convictions from the
+degeneration incident: validate the instrument before believing it.)
+
+Baseline for the arms (segon, pre-Q4K/pre-cpasync build, same boot
+conditions, post reduce-fix): 12k-cold 144.5, 12k-hot 150.2, 12k-c4
+234.7, 1k2k-c8 359.2 tok/s, all exact. Raw: perf/results/2026-08-14/
+{gate768-pair,q4k-arms}/.
