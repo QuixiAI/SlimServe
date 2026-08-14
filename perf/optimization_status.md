@@ -2710,3 +2710,47 @@ Baseline for the arms (segon, pre-Q4K/pre-cpasync build, same boot
 conditions, post reduce-fix): 12k-cold 144.5, 12k-hot 150.2, 12k-c4
 234.7, 1k2k-c8 359.2 tok/s, all exact. Raw: perf/results/2026-08-14/
 {gate768-pair,q4k-arms}/.
+
+## 2026-08-14 - Q4_K fused + cp.async + gate-768: e2e verdicts (tasks #26/#28 closed)
+
+Three-arm matrix on dsv4-q4ktail-4 (fresh boots, exact harness, same
+prompts; baseline = segon arm from the same day, pre-change build). Raw:
+perf/results/2026-08-14/{gate768-pair,q4k-arms}/.
+
+tok/s (12k-cold / 12k-hot / 12k-c4 / 1k2k-c8 / 1k2k-c1):
+- segon baseline: 144.5 / 150.2 / 234.7 / 359.2 /  --
+- segoff (Q4K off):  148.1 / 150.3 / 234.2 / 324.0 / 119.7
+- cpasync (Q4K off): 148.8 / 145.3 / 235.2 / 326.4 / 110.1
+- q4kfull (default): 149.7 / 151.3 / 233.4 / 310.2 / 163.3
+
+THE ACCEPTANCE TRAP, AGAIN: raw TPS says q4kfull c1 is +48%. Step-rate
+normalization (tps / (1 + accepted/draft)) says otherwise:
+- c1 steps/s: segoff 47.7, cpasync 47.6, q4kfull 47.5  -> IDENTICAL.
+- c8 steps/s: baseline 105.9, segoff 100.1, cpasync 98.0, q4kfull 97.2
+  -> ~6-8% cross-boot band, no arm effect beyond it.
+All response sha256s differ across arms (slightly different numerics ->
+divergent greedy text -> incomparable acceptance). Every apparent e2e TPS
+delta in this matrix is acceptance/content variance. Rule reaffirmed: no
+e2e speedup claim without step-rate normalization and matched outputs.
+
+VERDICTS:
+1. Fused Q4_K (#26): e2e step-rate NEUTRAL at c1 and c8. This is the
+   c1-diagnosis prediction (2026-08-13) confirmed from the other side:
+   decode is fixed-overhead bound, so removing 5 launches + moe_align
+   from 6 tail layers vanishes into the idle window. Kept enabled:
+   correctness proven, 2 launches < 7, zero cost anywhere, and the win
+   materializes when eager-break idle shrinks (sparse-attn graph capture)
+   or on tiers with more Q4_K layers.
+2. cp.async double-buffering (#28a): kernel-level seg tile time
+   1024 tokens 15.48 -> 12.73 ms (-18%), 2048: 19.38 -> 14.35 (-26%) --
+   exactly the widths production seg serves (prefill chunks above the
+   gate). Narrow widths regress (48: 3.84->4.52) but sit behind the
+   768 gate and never run seg in production. E2e prefill neutral (MoE
+   seg is a small slice of 12k prefill time). Bit-exact vs pre-change.
+3. Gate-768 e2e pair (#28b): segon vs segoff identical at 12k
+   (150.2/234.7 vs 150.3/234.2) -> the gate is e2e-neutral on this
+   workload; post-cp.async kernel crossover still brackets 768 (fused
+   wins <=512, seg wins >=1024). Gate retained at 768.
+
+Production: both daemons restarted onto the committed build (A during
+arms teardown, B explicitly); canary + NAN_WATCH active.
