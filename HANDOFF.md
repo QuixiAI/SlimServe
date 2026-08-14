@@ -359,3 +359,24 @@ dsv4-2 -> the mi300x side of dsv4-q4ktail-2, dsv4-4 -> the mi300x side of
 dsv4-mxfp4-4, dsv4-8 -> dsv4-q4k-8, glm52-2/4/8 -> glm52-q2k-*,
 glm52-mac -> glm52-xxs-1, k3-6/8 -> k3-xxs-*. Merged-config parity with the
 old profiles was verified per (profile, platform) before the switch.
+
+## 2026-08-14: Q4_K fused pair + cp.async seg pipelining (tasks #26/#28 closed)
+
+- Fused Q4_K (12,12) decode pair serving the tail layers
+  (dsv4_q4k_moe_ampere.cuh, op ggml_dsv4_moe_a8_q4k, 2 launches replace 7):
+  parity-proven (flip-decomposition methodology, see notebook), e2e
+  step-rate NEUTRAL — the c1 fixed-overhead floor absorbs it; the win is
+  banked for when sparse-attn graph capture shrinks the eager-break idle.
+- cp.async double-buffered y tiles in all four seg kernels: bit-exact,
+  kernel-level -18%/-26% at 1024/2048-token widths, e2e neutral; gate-768
+  confirmed correctly placed post-change.
+- Both ported to QuixiCore-CUDA (3e34ceea) with test harnesses.
+- MEASUREMENT RULES hardened: steps/s = tps/(1+accepted/draft) before any
+  e2e claim (q4kfull's +48% raw c1 was pure acceptance variance);
+  bit-exact A/B for data-path-only changes; mean-rel + lstsq flip
+  decomposition through quant cliffs (elementwise bounds cannot pass).
+- Production: both daemons on the committed build (fused Q4_K active),
+  canary + NAN_WATCH clean.
+- Next perf lever, in order of expected value: sparse-attention graph
+  capture to reclaim ~9ms/step eager-break idle (the c1 prize), drafter
+  cycle cost, kernel-tail consolidation.
