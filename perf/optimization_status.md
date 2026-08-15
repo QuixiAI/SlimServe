@@ -2828,3 +2828,15 @@ GPU. Candidates: spec-decode output round trip that async scheduling
 does not actually pipeline at bs=1 (worker starving 14% + engine idle
 85% is consistent with lockstep), TP broadcast rendezvous, api-proc zmq
 hop on the critical path.
+
+CORRECTION (2026-08-15, same day): the "c8 steps (9.6 ms) faster than c1
+steps (21 ms)" claim above was arithmetic error - steps/s = tps/(1+acc)
+gives PER-REQUEST step rate; at c8 all 8 requests advance in one engine
+step, so engine cycles are ~77 ms at c8 (slower, as expected for more
+work). What stands: c1 cycle = 21.05 ms, INVARIANT across kernel + CPU
+changes. Revised model: with async scheduling the worker's CPU prep for
+step N+1 overlaps step N's GPU, so the c1 critical path = verify GPU +
+rejection sync + 5 sequential drafter launches + D2H/H2D + engine
+turnaround; the metadata build sat in the overlapped region (hence
+neutral). Decomposition requires GPU-timeline gap analysis, not
+occupancy shares -> torch trace of a steady c1 window.
