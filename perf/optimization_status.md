@@ -2840,3 +2840,35 @@ rejection sync + 5 sequential drafter launches + D2H/H2D + engine
 turnaround; the metadata build sat in the overlapped region (hence
 neutral). Decomposition requires GPU-timeline gap analysis, not
 occupancy shares -> torch trace of a steady c1 window.
+
+## 2026-08-15 - RESOLUTION: c1 is GPU-BOUND (98% busy); host is fully overlapped
+
+Fresh torch trace, steady c1 decode window (111.8 ms, rank1): GPU busy
+109.4/111.8 ms = 98%, idle 2.4 ms, no gap class over 100 us worth
+reporting. The serialized-round-trip theory is DEAD, and the 08-13
+"~40% idle" decomposition was an artifact of dividing kernels by
+annotation count. With async scheduling, ALL host work (metadata build,
+sampler python, drafter orchestration) overlaps GPU execution - which is
+why removing 5.6 ms of metadata Python and 5 launches/layer changed
+nothing: c1 throughput is purely GPU work per cycle.
+
+GPU budget per window (per-cycle scale by ~1/3.5): IQ2 gate_up+SwiGLU
+13.0 ms (top), MLA sparse decode 11.0, aligned-Q8 GEMVs 13.5 (945x,
+dense projections), DRAFTER Q8_0 GEMVs 9.0 (238x) + bf16 s16816gemm 3.5
+(131x), grouped-Q8 6.0, Q2K down 5.4, indexer 4.6, mHC 8.0, custom-AR
+3.6, quantize_q8_1 3.35 (1431 launches), reduce 2.7, topk 2.6, fused
+Q4_K 2.4 (30x, active).
+
+tok/s roadmap is therefore GPU-work reduction, ranked:
+1. DRAFTER cost (~12 ms/window ~= a fifth of GPU time on the 0.5B
+   drafter at TP4 with per-layer AR): candidates - drafter TP1
+   (replicated, no AR), fewer drafter layers on the critical path,
+   revisit k.
+2. IQ2 gate_up decode (13 ms, biggest single): revisit qwarp8 /
+   cooperative variants at this exact geometry, or W1 tensor-core at
+   verify width.
+3. MLA sparse decode 11 ms: partition/launch tuning at 6-token verify.
+4. quantize_q8_1: 1431 tiny launches/window - batching/fusing into
+   producers.
+Steady-meta stays available (harmless, host-side); its value returns if
+host ever re-enters the critical path (e.g. much faster kernels).
