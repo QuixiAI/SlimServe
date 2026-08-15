@@ -162,6 +162,14 @@ class QuixiCoreMLASparseMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
+        # Per-token block-table gather, ROCm-parity persistence: computed in
+        # build() into a persistent buffer instead of lazily inside the first
+        # layer's forward. Lazy in-forward compute allocated the gather output
+        # per step, which under FULL-graph capture baked a capture-pool
+        # address into every layer's kernels while replay-time metadata was
+        # rebuilt around it — the buffer-persistence gap the old TODO warned
+        # about. Allocated on first build (block-table width is per-boot).
+        self.bt_per_token_buffer: torch.Tensor | None = None
 
     def build(
         self,
@@ -186,9 +194,26 @@ class QuixiCoreMLASparseMetadataBuilder(
         )
         self.req_id_per_token_buffer[req_id_per_token.shape[0] :].fill_(0)
 
-        # TODO(quixicore-cuda): spec-decode uniform-batch handling and the
-        # CUDA-graph capture path need the same buffer-persistence treatment
-        # as the ROCm builder before FULL_DECODE_ONLY graphs are enabled.
+        block_table = common_attn_metadata.block_table_tensor
+        if (
+            self.bt_per_token_buffer is None
+            or self.bt_per_token_buffer.shape[1] != block_table.shape[1]
+        ):
+            self.bt_per_token_buffer = torch.zeros(
+                (
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    block_table.shape[1],
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        torch.index_select(
+            block_table.to(torch.int32),
+            0,
+            self.req_id_per_token_buffer[:num_tokens],
+            out=self.bt_per_token_buffer[:num_tokens],
+        )
+
         return QuixiCoreMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -204,6 +229,7 @@ class QuixiCoreMLASparseMetadataBuilder(
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
+            bt_per_token=self.bt_per_token_buffer[:num_tokens],
         )
 
 
@@ -355,6 +381,10 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 k_scale,
                 partition_size=256,
             )
+            _sparse_nan_debug(
+                out, splitq[0].transpose(0, 1), kv_c_and_k_pe_cache, bt, idx,
+                tlen, attn_metadata,
+            )
             return out, None
 
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
@@ -368,4 +398,62 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             k_scale,
             partition_size=256,
         )
+        _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                          attn_metadata)
         return out, None
+
+
+_SPARSE_NAN_DEBUG_STATE: dict = {}
+
+
+def _sparse_nan_debug(out, q, kv_cache, bt, idx, tlen, attn_metadata) -> None:
+    """Diagnostic (VLLM_DSV4_SPARSE_NAN_DEBUG=1): when a NaN row leaves the
+    sparse decode kernel, dump that row's inputs — query health, top-k index
+    census, effective length, and a byte-level census of the fp8 KV entries
+    it gathered (0x7F/0xFF encode NaN in e4m3) — with a clean row as control.
+    Syncs; diagnostic boots only.
+    """
+    state = _SPARSE_NAN_DEBUG_STATE
+    if "on" not in state:
+        import os
+        state["on"] = os.getenv(
+            "VLLM_DSV4_SPARSE_NAN_DEBUG", "0").lower() in ("1", "true", "on")
+        state["dumps"] = 0
+    if not state["on"] or state["dumps"] >= 6:
+        return
+    nan_rows = torch.isnan(out.float().reshape(out.shape[0], -1)).any(dim=-1)
+    if not bool(nan_rows.any()):
+        return
+    state["dumps"] += 1
+    rows = nan_rows.nonzero().flatten().tolist()
+    clean_rows = (~nan_rows).nonzero().flatten().tolist()
+    control = clean_rows[0] if clean_rows else None
+    blk = attn_metadata.block_size
+    kv_bytes = kv_cache.view(torch.uint8)
+    entry = kv_bytes.shape[-1]
+
+    def row_report(r: int) -> str:
+        q_nan = bool(torch.isnan(q[r].float()).any())
+        row_idx = idx[r]
+        valid = row_idx[row_idx >= 0]
+        t = int(tlen[r]) if tlen.numel() > r else -1
+        if valid.numel() == 0:
+            return (f"row {r}: q_nan={q_nan} tlen={t} no valid indices")
+        blocks = bt[r][(valid // blk).long()]
+        flat = blocks.long() * blk + (valid % blk).long()
+        gathered = kv_bytes.reshape(-1, entry)[flat]
+        fp8_part = gathered[:, :512]
+        nan_bytes = ((fp8_part == 0x7F) | (fp8_part == 0xFF)).sum().item()
+        per_tok = ((fp8_part == 0x7F) | (fp8_part == 0xFF)).any(dim=-1)
+        bad_tokens = int(per_tok.sum())
+        worst = valid[per_tok.nonzero().flatten()[:8]].tolist() if bad_tokens else []
+        return (f"row {r}: q_nan={q_nan} tlen={t} n_idx={int(valid.numel())} "
+                f"idx_max={int(valid.max())} nan_bytes={nan_bytes} "
+                f"tokens_with_nan_bytes={bad_tokens}/{int(valid.numel())} "
+                f"first_bad_positions={worst}")
+
+    reports = [row_report(r) for r in rows[:3]]
+    ctl = row_report(control) if control is not None else "no clean row"
+    logger.error(
+        "SPARSE_NAN_DEBUG dump %d: batch=%d nan_rows=%s | %s | CONTROL %s",
+        state["dumps"], out.shape[0], rows[:8], " | ".join(reports), ctl)

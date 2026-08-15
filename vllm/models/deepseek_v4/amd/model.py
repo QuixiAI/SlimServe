@@ -20,6 +20,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from vllm.model_executor.layers import nan_probe
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
@@ -1010,6 +1011,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if not fused_norm:
             x, prequant_input = self._norm_with_prequant(x, self.attn_norm)
+        # Intra-layer birth attribution for the NaN hunt (layers 0-2 only,
+        # where the per-layer probe located the birth). Slot scheme:
+        # 100 + 4*layer + phase; phase 0 = attention input (post-mHC+norm),
+        # 1 = attention output, 2 = MoE input, 3 = MoE output.
+        _probe_intra = nan_probe.enabled() and self._layer_index in (0, 1, 2)
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 0, x)
         x = self.attn(
             positions,
             x,
@@ -1018,6 +1026,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 prequant_input if self._ampere_prequant_attention else None
             ),
         )
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 1, x)
 
         transition = self._fused_post_pre_with_optional_reduce(
             x,
@@ -1042,11 +1052,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         prequant_input = transition[4] if fused_norm else None
         if not fused_norm:
             x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
+        if _probe_intra:
+            nan_probe.probe(100 + 4 * self._layer_index + 2, x)
         x = self.ffn(
             x,
             input_ids,
             prequant_input=(prequant_input if self._ampere_prequant_moe else None),
         )
+        if _probe_intra:
+            nan_probe.probe(
+                100 + 4 * self._layer_index + 3,
+                *(x if isinstance(x, tuple) else (x,)),
+            )
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(
@@ -1256,7 +1273,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
+            if nan_probe.enabled():
+                # Slot 98: raw embedding output, before the hc-stream expand
+                # and hc_pre. NaN here means the corruption precedes all
+                # layer math (scribbled allocation / embedding path).
+                nan_probe.probe(98, hidden_states)
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            if nan_probe.enabled():
+                # Slot 99: after the hc expand (fresh repeat allocation).
+                nan_probe.probe(99, hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
@@ -1283,6 +1308,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
+            if nan_probe.enabled():
+                nan_probe.probe(
+                    idx,
+                    *(hidden_states if isinstance(hidden_states, tuple)
+                      else (hidden_states,)),
+                    residual,
+                )
             if (idx + 1) in self.aux_hidden_state_layers:
                 # On the unfused (aiter) path the layer already applied hc_post,
                 # so hidden_states is the reconstructed stream; on the fused

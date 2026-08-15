@@ -601,8 +601,13 @@ def sparse_attn_indexer(
                     q_scale[:num_decode_tokens], decode_lens, pad_value=0
                 )
             else:
+                # pad_value=0 for the FP8 path too: the default leaves pad
+                # slots as recycled allocator bytes, and fp8 bit patterns
+                # 0x7f/0xff decode to NaN. "Downstream masks stale slots"
+                # only holds when every consumer masks; zero pads make the
+                # question moot (matching the MXFP4 branch above).
                 padded_q_quant_decode_tokens = pack_seq_triton(
-                    q_quant[:num_decode_tokens], decode_lens
+                    q_quant[:num_decode_tokens], decode_lens, pad_value=0
                 )
                 padded_q_scale = None
         else:
@@ -848,7 +853,62 @@ def sparse_attn_indexer(
                 topk_indices
             )
 
+        _topk_validate(topk_indices, topk_seq_lens, num_rows)
+
     return topk_indices_buffer
+
+
+_TOPK_VALIDATE_STATE: dict = {}
+
+
+def _topk_validate(
+    topk_indices: torch.Tensor, topk_seq_lens: torch.Tensor, num_rows: int
+) -> None:
+    """Diagnostic tripwire (VLLM_DSV4_TOPK_VALIDATE=1) at the corruption
+    source: a decode top-k index must lie in [-1, seq_len) for its row. An
+    out-of-range index sends sparse attention to garbage KV positions, which
+    surfaces ~61 layers later as a NaN logits row. Same async pattern as the
+    runner's NAN_WATCH: queue one small reduction per step, read the prior
+    step's result, no hot-path sync.
+    """
+    state = _TOPK_VALIDATE_STATE
+    if "enabled" not in state:
+        state["enabled"] = os.getenv("VLLM_DSV4_TOPK_VALIDATE", "0").lower() in (
+            "1", "true", "on", "yes",
+        )
+        state["step"] = 0
+        state["pending"] = None
+        if state["enabled"]:
+            logger.warning("TOPK_VALIDATE enabled: decode top-k indices "
+                           "checked every step (diagnostic mode)")
+    if not state["enabled"]:
+        return
+    # Event.query() and pinned-host copies are illegal during stream capture;
+    # the DSpark full graphs capture this indexer path.
+    if torch.cuda.is_current_stream_capturing():
+        return
+    state["step"] += 1
+    pending = state["pending"]
+    if pending is not None:
+        host, event, step, rows = pending
+        if event.query():
+            bad = int(host.item())
+            if bad > 0:
+                logger.error(
+                    "TOPK_VALIDATE: %d out-of-range top-k indices at step %d "
+                    "(%d rows; reported at step %d)",
+                    bad, step, rows, state["step"])
+            state["pending"] = None
+    if state["pending"] is None:
+        lens = topk_seq_lens.reshape(-1)[: topk_indices.shape[0]]
+        bad = (
+            (topk_indices >= lens.unsqueeze(1)) | (topk_indices < -1)
+        ).sum()
+        host = torch.empty((), dtype=bad.dtype, pin_memory=True)
+        host.copy_(bad, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        state["pending"] = (host, event, state["step"], num_rows)
 
 
 def sparse_attn_indexer_fake(

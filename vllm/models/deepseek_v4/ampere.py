@@ -84,7 +84,13 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         from vllm.model_executor.layers.quantization.gguf import ops
 
         num_tokens = o.shape[0]
-        if num_tokens <= 32:
+        # Diagnostic dial for the NaN hunt: the fused decode o_proj runs at
+        # num_tokens <= this threshold (default 32 = production heuristic);
+        # 0 forces the grouped MMQ path for every size.
+        if not hasattr(self, "_o_proj_fused_max_tokens"):
+            self._o_proj_fused_max_tokens = int(
+                os.getenv("VLLM_DSV4_O_PROJ_FUSED_MAX_TOKENS", "32"))
+        if num_tokens <= self._o_proj_fused_max_tokens:
             z, quant_z = ops.ggml_dsv4_o_proj_q8_0(
                 qweight,
                 o.contiguous(),
@@ -357,4 +363,178 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
             self.scale,
             _mla_partition_size(q.shape[1]),
         )
+        _ampere_decode_debug(
+            self, out, q, swa_lens, extra_lens, swa_metadata, swa_only,
+            extra_indices=extra_indices, extra_bt=extra_bt,
+            extra_cache=extra_cache, extra_block_size=extra_block_size,
+            extra_indices_are_slots=extra_indices_are_slots,
+            swa_indices=swa_indices,
+        )
         output.copy_(out)
+
+
+_AMPERE_DECODE_DEBUG_STATE: dict = {}
+
+
+def _ampere_decode_debug(
+    attn, out, q, swa_lens, extra_lens, swa_metadata, swa_only,
+    extra_indices=None, extra_bt=None, extra_cache=None,
+    extra_block_size=None, extra_indices_are_slots=True,
+    swa_indices=None,
+) -> None:
+    """Diagnostic (VLLM_DSV4_ATTN_SPLIT_DEBUG=1, shared gate): for NaN rows
+    leaving the native DSV4 two-source decode (mla_decode_fp8_sparse_dsv4),
+    dump per-row source extents — swa_len, extra(topk)_len, is_valid — with a
+    clean-row control. swa_len==0 AND extra_len==0 means the merged reduction
+    had zero contributions: 0/0 -> NaN from perfectly clean inputs."""
+    state = _AMPERE_DECODE_DEBUG_STATE
+    if "on" not in state:
+        state["on"] = os.getenv(
+            "VLLM_DSV4_ATTN_SPLIT_DEBUG", "0").lower() in ("1", "true", "on")
+        state["dumps"] = 0
+    if not state["on"] or state["dumps"] >= 6:
+        return
+    flat = out.float().reshape(out.shape[0], -1)
+    nan_rows = torch.isnan(flat).any(dim=-1)
+    if not bool(nan_rows.any()):
+        return
+    state["dumps"] += 1
+    rows = nan_rows.nonzero().flatten().tolist()
+    clean = (~nan_rows).nonzero().flatten().tolist()
+    is_valid = swa_metadata.is_valid_token
+    q_nan = torch.isnan(
+        q.float().reshape(q.shape[0], -1)).any(dim=-1)
+
+    req_ids = swa_metadata.token_to_req_indices
+    num_decodes = swa_metadata.num_decodes
+
+    def census(r):
+        """fp8-NaN byte census over the extra (topk) entries row r gathers."""
+        if (extra_indices is None or extra_cache is None
+                or extra_indices.shape[1] == 0):
+            return "no-extra"
+        row_idx = extra_indices[r]
+        valid_idx = row_idx[row_idx >= 0].long()
+        if valid_idx.numel() == 0:
+            return "empty"
+        cache_b = extra_cache.view(torch.uint8).reshape(-1)
+        bs_tokens = 64
+        block_bytes = bs_tokens * 584  # 64*576 data + 64*8 scales
+        n_slots = cache_b.numel() // block_bytes * bs_tokens
+        if extra_indices_are_slots:
+            slots = valid_idx
+        else:
+            blocks = extra_bt[r][(valid_idx // extra_block_size)]
+            slots = blocks.long() * extra_block_size + (
+                valid_idx % extra_block_size)
+        slots = slots.clamp(0, max(n_slots - 1, 0))
+        return _token_census(cache_b, slots, bs_tokens, block_bytes)
+
+    def swa_census(r):
+        """576-stride fp8 census over the row's SWA window entries."""
+        if swa_indices is None:
+            return "?"
+        cache_b = attn.swa_cache_layer.kv_cache.view(torch.uint8).reshape(-1)
+        bs_tokens = 64
+        block_bytes = bs_tokens * 584
+        n_slots = cache_b.numel() // block_bytes * bs_tokens
+        row_idx = swa_indices[r]
+        vi = row_idx[(row_idx >= 0)].long()
+        if vi.numel() == 0:
+            return "empty"
+        vi = vi.clamp(0, max(n_slots - 1, 0))
+        return _token_census(cache_b, vi, bs_tokens, block_bytes)
+
+    def rep(r):
+        iv = (int(is_valid[r]) if is_valid is not None
+              and is_valid.numel() > r else "?")
+        sl = int(swa_lens[r]) if swa_lens.numel() > r else "?"
+        el = (int(extra_lens[r]) if extra_lens is not None
+              and extra_lens.numel() > r else "?")
+        rid = (int(req_ids[r]) if req_ids is not None
+               and req_ids.numel() > r else "?")
+        return (f"row{r}: req={rid}(n_dec={num_decodes}) valid={iv} "
+                f"swa_len={sl} extra_len={el} q_nan={bool(q_nan[r])} "
+                f"kv[{census(r)}] swa[{swa_census(r)}]")
+
+    from vllm.logger import init_logger
+    init_logger(__name__).error(
+        "AMPERE_DECODE_DEBUG dump %d: layer=%s swa_only=%s rows=%d nan=%s "
+        "| %s | CONTROL %s",
+        state["dumps"], getattr(attn, "prefix", "?"), swa_only, out.shape[0],
+        rows[:6], " | ".join(rep(r) for r in rows[:4]),
+        rep(clean[0]) if clean else "none")
+
+    # One-shot full-input capture for offline kernel replay.
+    if not state.get("captured") and extra_indices is not None:
+        cap_path = os.getenv("VLLM_DSV4_DECODE_CAPTURE", "")
+        if cap_path:
+            r = rows[0]
+
+            def entries_for(cache, slots):
+                cache_b = cache.view(torch.uint8).reshape(-1)
+                bs_tokens = 64
+                block_bytes = bs_tokens * 584
+                n_slots = cache_b.numel() // block_bytes * bs_tokens
+                sl = slots.long().clamp(0, max(n_slots - 1, 0))
+                dbase = (sl // bs_tokens) * block_bytes + (sl % bs_tokens) * 576
+                doffs = torch.arange(576, device=cache_b.device)
+                data = cache_b[dbase[:, None] + doffs[None, :]]
+                sbase = ((sl // bs_tokens) * block_bytes + bs_tokens * 576
+                         + (sl % bs_tokens) * 8)
+                soffs = torch.arange(8, device=cache_b.device)
+                scales = cache_b[sbase[:, None] + soffs[None, :]]
+                return data.cpu(), scales.cpu()
+
+            swa_row = swa_indices[r]
+            swa_valid = swa_row[swa_row >= 0]
+            swa_data, swa_scales = entries_for(
+                attn.swa_cache_layer.kv_cache, swa_valid)
+            ex_row = extra_indices[r]
+            ex_valid = ex_row[ex_row >= 0]
+            if extra_indices_are_slots:
+                ex_slots = ex_valid.long()
+            else:
+                blocks = extra_bt[r][(ex_valid // extra_block_size).long()]
+                ex_slots = blocks.long() * extra_block_size + (
+                    ex_valid % extra_block_size).long()
+            ex_data, ex_scales = entries_for(extra_cache, ex_slots)
+            torch.save({
+                "q_row": q[r].detach().cpu(),
+                "swa_indices": swa_row.cpu(),
+                "swa_len": int(swa_lens[r]),
+                "extra_indices": ex_row.cpu(),
+                "extra_len": int(extra_lens[r]) if extra_lens is not None else 0,
+                "extra_indices_are_slots": bool(extra_indices_are_slots),
+                "extra_slots_resolved": ex_slots.cpu(),
+                "swa_data": swa_data, "swa_scales": swa_scales,
+                "extra_data": ex_data, "extra_scales": ex_scales,
+                "attn_sink": attn.attn_sink.detach().cpu(),
+                "scale": float(attn.scale),
+                "swa_block_size": int(swa_metadata.block_size),
+                "extra_block_size": int(extra_block_size or 0),
+                "out_row": out[r].detach().cpu(),
+                "layer": getattr(attn, "prefix", "?"),
+            }, cap_path)
+            state["captured"] = True
+            init_logger(__name__).error(
+                "AMPERE_DECODE_DEBUG: captured full op inputs for row %d "
+                "to %s", r, cap_path)
+
+
+def _token_census(cache_b, slots, bs_tokens, block_bytes):
+    """Full-entry census: fp8 payload NaN bytes, rope bf16 isnan, scale max."""
+    base = (slots // bs_tokens) * block_bytes + (slots % bs_tokens) * 576
+    offs = torch.arange(576, device=cache_b.device)
+    rows_b = cache_b[base[:, None] + offs[None, :]]
+    fp8 = rows_b[:, :448]
+    fp8_nan = ((fp8 == 0x7F) | (fp8 == 0xFF)).any(dim=-1)
+    rope = rows_b[:, 448:576].contiguous().view(torch.bfloat16)
+    rope_nan = torch.isnan(rope.float()).any(dim=-1)
+    scale_base = ((slots // bs_tokens) * block_bytes + bs_tokens * 576
+                  + (slots % bs_tokens) * 8)
+    soffs = torch.arange(8, device=cache_b.device)
+    scales = cache_b[scale_base[:, None] + soffs[None, :]][:, :7]
+    return (f"fp8nan_toks={int(fp8_nan.sum())}/{int(slots.numel())} "
+            f"ROPEnan_toks={int(rope_nan.sum())} "
+            f"scale_max={int(scales.max())}")

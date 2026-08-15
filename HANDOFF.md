@@ -1,6 +1,34 @@
 # DeepSeek V4 0731 A100 Handoff
 
-Updated: 2026-08-09 19:10 UTC
+Updated: 2026-08-10 22:20 UTC
+
+## Degeneration incident: ROOT-CAUSED AND FIXED (2026-08-13)
+
+The entire 2026-08 incident family - the rare NaN seed, the BOS-loop
+storms, and the deterministic no-spec degeneration - was ONE defect:
+IEEE 0*NaN in the DSV4 sparse decode's split-K reduce
+(csrc/quixicore/serving/paged_attn_v2_kernels.cuh). The persistent
+writer publishes finite ml/es for balanced-away empty partitions but
+never stores their tmp value vectors (torch::empty); the reducer
+multiplied those unwritten vectors by a mathematically-zero weight,
+and 0*NaN = NaN carried recycled allocator bytes into live attention
+outputs. Boot/phase lottery = recycled pool content; geometry gating
+= partition counts; the FULL-graph and aux-stream correlations were
+allocation-pattern epiphenomena. Fix: skip !(weight > 0) partitions
+(mathematically identical, garbage-proof), hardened in all four
+reducers; ml/es workspace init kept as defense in depth (ceba09670).
+
+Validation: the 13/13-storming no-spec repro ran clean (3 full
+trigger runs, 0 NaN); production (spec, both daemons) redeployed on
+the fixed kernel - dual c16 acceptance clean, 544-570 tok/s, zero NaN
+events. --no-spec is UNBROKEN. Aux streams remain off on A100 purely
+for performance (458 vs 427 c11 - the overlap was a net loss); it is
+no longer a correctness mitigation. NAN_WATCH stays on both daemons
+and the canary stays armed as regression tripwires. The full
+investigation record - including every dead theory and both
+instrument-bug retractions - is in perf/optimization_status.md;
+diagnostics live in perf/diagnostics/dsv4-nan/ plus env-gated probes
+(VLLM_DSV4_MLA_DEBUG_PARTIALS, VLLM_DSV4_MLA_TMP_SENTINEL).
 
 ## Read First
 
@@ -331,3 +359,24 @@ dsv4-2 -> the mi300x side of dsv4-q4ktail-2, dsv4-4 -> the mi300x side of
 dsv4-mxfp4-4, dsv4-8 -> dsv4-q4k-8, glm52-2/4/8 -> glm52-q2k-*,
 glm52-mac -> glm52-xxs-1, k3-6/8 -> k3-xxs-*. Merged-config parity with the
 old profiles was verified per (profile, platform) before the switch.
+
+## 2026-08-14: Q4_K fused pair + cp.async seg pipelining (tasks #26/#28 closed)
+
+- Fused Q4_K (12,12) decode pair serving the tail layers
+  (dsv4_q4k_moe_ampere.cuh, op ggml_dsv4_moe_a8_q4k, 2 launches replace 7):
+  parity-proven (flip-decomposition methodology, see notebook), e2e
+  step-rate NEUTRAL — the c1 fixed-overhead floor absorbs it; the win is
+  banked for when sparse-attn graph capture shrinks the eager-break idle.
+- cp.async double-buffered y tiles in all four seg kernels: bit-exact,
+  kernel-level -18%/-26% at 1024/2048-token widths, e2e neutral; gate-768
+  confirmed correctly placed post-change.
+- Both ported to QuixiCore-CUDA (3e34ceea) with test harnesses.
+- MEASUREMENT RULES hardened: steps/s = tps/(1+accepted/draft) before any
+  e2e claim (q4kfull's +48% raw c1 was pure acceptance variance);
+  bit-exact A/B for data-path-only changes; mean-rel + lstsq flip
+  decomposition through quant cliffs (elementwise bounds cannot pass).
+- Production: both daemons on the committed build (fused Q4_K active),
+  canary + NAN_WATCH clean.
+- Next perf lever, in order of expected value: sparse-attention graph
+  capture to reclaim ~9ms/step eager-break idle (the c1 prize), drafter
+  cycle cost, kernel-tail consolidation.

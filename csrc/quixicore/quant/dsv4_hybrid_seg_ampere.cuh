@@ -93,9 +93,11 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_iq2_seg_w1(
     const int experts, const int top_k, const float swiglu_limit) {
   using namespace vllm_mmq_v2;
 
-  __shared__ int token_routes[J];
-  __shared__ __align__(16) int tile_y[J * MXMMQ_Y_STRIDE];
-  __shared__ __align__(16) int tile_x[MXMMQ_I * MXMMQ_X_STRIDE];
+  extern __shared__ int iq2_w1_smem[];
+  int* token_routes = iq2_w1_smem;
+  int* tile_y0 = token_routes + J;
+  int* tile_y1 = tile_y0 + J * MXMMQ_Y_STRIDE;
+  int* tile_x = tile_y1 + J * MXMMQ_Y_STRIDE;
 
   int expert, slot0, ncols;
   if (!seg_locate<J>(g_rowseg, g_tseg, experts, blockIdx.y, tile_x, expert,
@@ -116,19 +118,33 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_iq2_seg_w1(
 
   float sum[J * MXMMQ_I / MXMMQ_NTHREADS] = {0.0f};
 
+  // cp.async pipeline (see moe_mxfp4_seg_w1): span parity picks the buffer,
+  // the next y group is in flight during each mma, and the IQ2 decode's
+  // global loads overlap the pending group.
+  seg_load_y_tokens<J>(input, tile_y0, token_routes, ncols, 0,
+                       input_token_blocks, top_k);
+  seg_cp_commit();
   for (int sb = 0; sb < blocks_per_row; ++sb) {
     const int kb0 = sb * 8;
     seg_load_x_w1_iq2(expert_base, tile_x, blocks_per_row, sb, g0,
                       intermediate);
-    seg_load_y_tokens<J>(input, tile_y, token_routes, ncols, kb0,
+    seg_load_y_tokens<J>(input, tile_y1, token_routes, ncols, kb0 + 4,
                          input_token_blocks, top_k);
+    seg_cp_commit();
+    seg_cp_wait<1>();
     __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 0);
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y0, sum, 0);
     __syncthreads();
-    seg_load_y_tokens<J>(input, tile_y, token_routes, ncols, kb0 + 4,
-                         input_token_blocks, top_k);
+    if (sb + 1 < blocks_per_row) {
+      seg_load_y_tokens<J>(input, tile_y0, token_routes, ncols, kb0 + 8,
+                           input_token_blocks, top_k);
+      seg_cp_commit();
+      seg_cp_wait<1>();
+    } else {
+      seg_cp_wait<0>();
+    }
     __syncthreads();
-    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y, sum, 32);
+    vec_dot_q8_0_q8_1_mma<J>(tile_x, tile_y1, sum, 32);
     __syncthreads();
   }
 
@@ -309,8 +325,9 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_q2k_seg_w2(
 
   extern __shared__ int q2k_smem[];
   int* token_routes = q2k_smem;
-  int* tile_y = token_routes + J;
-  int* tile_x = tile_y + J * MXMMQ_Y_STRIDE;
+  int* tile_y0 = token_routes + J;
+  int* tile_y1 = tile_y0 + J * MXMMQ_Y_STRIDE;
+  int* tile_x = tile_y1 + J * MXMMQ_Y_STRIDE;
 
   int expert, slot0, ncols;
   if (!seg_locate<J>(g_rowseg, g_tseg, experts, blockIdx.y, tile_x, expert,
@@ -331,19 +348,30 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_q2k_seg_w2(
 
   float sum[J * MXMMQ_I / MXMMQ_NTHREADS] = {0.0f};
 
+  seg_load_y_mid<J>(mid, tile_y0, token_routes, ncols, 0,
+                    mid_blocks_per_route);
+  seg_cp_commit();
   for (int sb = 0; sb < intermediate / 256; ++sb) {
     const int kb0 = sb * 8;
     seg_load_x_w2_q2k(expert_base, tile_x, out_row, intermediate, sb,
                       row_x0);
-    seg_load_y_mid<J>(mid, tile_y, token_routes, ncols, kb0,
+    seg_load_y_mid<J>(mid, tile_y1, token_routes, ncols, kb0 + 4,
                       mid_blocks_per_route);
+    seg_cp_commit();
+    seg_cp_wait<1>();
     __syncthreads();
-    vec_dot_q2k_q8_1_mma<J>(tile_x, tile_y, sum, 0);
+    vec_dot_q2k_q8_1_mma<J>(tile_x, tile_y0, sum, 0);
     __syncthreads();
-    seg_load_y_mid<J>(mid, tile_y, token_routes, ncols, kb0 + 4,
-                      mid_blocks_per_route);
+    if (sb + 1 < intermediate / 256) {
+      seg_load_y_mid<J>(mid, tile_y0, token_routes, ncols, kb0 + 8,
+                        mid_blocks_per_route);
+      seg_cp_commit();
+      seg_cp_wait<1>();
+    } else {
+      seg_cp_wait<0>();
+    }
     __syncthreads();
-    vec_dot_q2k_q8_1_mma<J>(tile_x, tile_y, sum, 32);
+    vec_dot_q2k_q8_1_mma<J>(tile_x, tile_y1, sum, 32);
     __syncthreads();
   }
 
@@ -370,7 +398,7 @@ __global__ __launch_bounds__(MXMMQ_NTHREADS, 1) void moe_q2k_seg_w2(
 
 // ------------------------------------------------------------------ launch
 inline int q2k_w2_smem_bytes(const int J) {
-  return (J + J * MXMMQ_Y_STRIDE + MXMMQ_I * Q2K_X_STRIDE) * (int)sizeof(int);
+  return seg_smem_bytes(J, Q2K_X_STRIDE);
 }
 
 template <typename scalar_t>
@@ -404,18 +432,15 @@ inline void launch_moe_iq2_seg(
   const dim3 block(32, MXMMQ_NWARPS);
 #define LAUNCH_IQ2_SEG(J)                                                    \
   do {                                                                       \
+    const int w1_smem = seg_smem_bytes(J, MXMMQ_X_STRIDE);                   \
     const dim3 g1(intermediate / 64, seg_col_tiles(routes, experts, J));     \
-    moe_iq2_seg_w1<J><<<g1, block, 0, stream>>>(                             \
+    seg_maybe_opt_in_smem(moe_iq2_seg_w1<J>, w1_smem);                       \
+    moe_iq2_seg_w1<J><<<g1, block, w1_smem, stream>>>(                       \
         w1, in, mid_blocks, perm_ids, rowseg, tseg, route_weights,           \
         w1_stride_bytes, hidden, input_token_blocks, intermediate, experts,  \
         top_k, swiglu_limit);                                                \
     const int smem = q2k_w2_smem_bytes(J);                                   \
-    if (smem > 48 * 1024) {                                                  \
-      /* Idempotent and cheap; per-device/per-J bookkeeping not worth it. */ \
-      cudaFuncSetAttribute((const void*)moe_q2k_seg_w2<scalar_t, J>,         \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize,      \
-                           smem);                                            \
-    }                                                                        \
+    seg_maybe_opt_in_smem(moe_q2k_seg_w2<scalar_t, J>, smem);                \
     const dim3 g2((out_row + MXMMQ_I - 1) / MXMMQ_I,                         \
                   seg_col_tiles(routes, experts, J));                        \
     moe_q2k_seg_w2<scalar_t, J><<<g2, block, smem, stream>>>(                \

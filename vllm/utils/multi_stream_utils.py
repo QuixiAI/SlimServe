@@ -17,6 +17,36 @@ class EventType(Enum):
     Attention = 1
 
 
+def _record_result_to_current_stream(result: Any) -> Any:
+    """Tell the caching allocator that the current (main) stream uses the
+    tensors an aux-stream callable returned.
+
+    Tensors allocated inside an aux callable are tagged to the aux stream.
+    The event join orders COMPUTE correctly, but without record_stream the
+    allocator frees such a block as soon as the AUX timeline passes its last
+    aux-side use — which can be long before the main stream's consumption.
+    A subsequent aux-stream allocation then reuses the block while the main
+    stream still reads it, and whatever the new aux kernel writes lands
+    inside a live main-stream tensor: rare, timing-dependent, at a
+    per-boot-fixed offset. (Root cause of the DSV4 NaN-seed incident; see
+    perf/optimization_status.md.)
+    """
+    current = torch.cuda.current_stream()
+
+    def _record(item: Any) -> None:
+        if isinstance(item, torch.Tensor) and item.is_cuda:
+            item.record_stream(current)
+        elif isinstance(item, (tuple, list)):
+            for sub in item:
+                _record(sub)
+        elif isinstance(item, dict):
+            for sub in item.values():
+                _record(sub)
+
+    _record(result)
+    return result
+
+
 def maybe_execute_in_parallel(
     fn0: Callable[[], Any],
     fn1: Callable[[], Any],
@@ -52,6 +82,7 @@ def maybe_execute_in_parallel(
             result1 = fn1()
             event1.record()
         event1.wait()
+        _record_result_to_current_stream(result1)
     else:
         result0 = fn0()
         result1 = fn1()
@@ -124,5 +155,8 @@ def execute_in_parallel(
 
     for ev in pending:
         ev.wait()
+    for result in aux_results:
+        if result is not None:
+            _record_result_to_current_stream(result)
 
     return default_result, aux_results

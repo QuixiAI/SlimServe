@@ -406,6 +406,37 @@ def ggml_dsv4_repack_mxfp4(W: torch.Tensor, values_per_row: int) -> torch.Tensor
     return torch.ops._C.ggml_dsv4_repack_mxfp4(W, values_per_row)
 
 
+def ggml_dsv4_moe_a8_q4k(
+    X: torch.Tensor,
+    W1: torch.Tensor,
+    W2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    intermediate: int,
+    out_row: int,
+    top_k: int,
+    tokens: int,
+    swiglu_limit: float,
+    quant_input: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if _is_metal():
+        raise NotImplementedError("DSV4 Q4_K fused MoE is CUDA-only")
+    _load_stable_libtorch()
+    return torch.ops._C.ggml_dsv4_moe_a8_q4k(
+        X,
+        W1,
+        W2,
+        topk_weights,
+        topk_ids,
+        intermediate,
+        out_row,
+        top_k,
+        tokens,
+        swiglu_limit,
+        quant_input,
+    )
+
+
 def ggml_dsv4_moe_a8_mxfp4(
     X: torch.Tensor,
     W1: torch.Tensor,

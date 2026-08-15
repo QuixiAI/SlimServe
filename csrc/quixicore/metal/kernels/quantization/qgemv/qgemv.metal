@@ -41,6 +41,66 @@ kernel void qgemv(
     if (lane == 0) D[row] = T(acc);
 }
 
+// Weight-stationary multi-row GEMV:  D (M,N) = X (M,K) @ dequantize(W)^T.
+// Same block-major walk and lane geometry as qgemv, but each dequantized
+// 8-wide weight span is applied to all M activation rows from registers, so
+// the weight bytes -- the memory-bound term at decode -- are read once for
+// the whole row block instead of once per row. M is a compile-time template
+// parameter so the accumulator array unrolls into registers. Serves the
+// small-M band (speculative verify/draft blocks, batched decode) where the
+// per-row qgemv is linear in M and the fragment-path GEMM is ~4-5x off
+// weight bandwidth.
+template<typename FMT, typename T, int M>
+kernel void qgemv_mm(
+    device   T*     D  [[buffer(0)]],   // (M, N) output
+    device   uchar* Wq [[buffer(1)]],   // (N, K/block_k) packed weight blocks
+    device   T*     X  [[buffer(2)]],   // (M, K) activation rows
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const int row = tgid.x;
+    const int bpr = K / FMT::block_k;
+    device const uchar* row_base = Wq + (uint)(row * bpr) * FMT::block_bytes;
+
+    constexpr int CPL = 8;
+    constexpr int LPB = FMT::block_k / CPL;
+    constexpr int BPI = 32 / LPB;
+    const int b_off = (int)lane / LPB;
+    const int col0  = ((int)lane % LPB) * CPL;
+
+    using T4 = metal::vec<T, 4>;
+    float acc[M];
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < M; ++m) acc[m] = 0.0f;
+
+    for (int kb = b_off; kb < bpr; kb += BPI) {
+        device const uchar* base = row_base + (uint)kb * FMT::block_bytes;
+        const int x_base = kb * FMT::block_k + col0;
+        half w[8];
+        tk_dequant8<FMT>(base, col0, w);
+        // The span stays in two float4 registers across all M rows, and X
+        // rides two vec4 loads per row: the load-issue rate, not weight
+        // bandwidth, is what bounds this loop as M grows.
+        const float4 w_lo = float4(float(w[0]), float(w[1]),
+                                   float(w[2]), float(w[3]));
+        const float4 w_hi = float4(float(w[4]), float(w[5]),
+                                   float(w[6]), float(w[7]));
+        #pragma clang loop unroll(full)
+        for (int m = 0; m < M; ++m) {
+            device const T4* xv =
+                (device const T4*)(X + (long)m * K + x_base);
+            acc[m] += metal::dot(w_lo, float4(xv[0]))
+                    + metal::dot(w_hi, float4(xv[1]));
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (int m = 0; m < M; ++m) {
+        const float r = metal::simd_sum(acc[m]);
+        if (lane == 0) D[(long)m * N + row] = T(r);
+    }
+}
+
 // Device-selected grouped GEMV for GGUF MoE weights. One dispatch consumes
 // the complete routing table and avoids synchronizing every expert id back to
 // the host. Wq is [experts, N, packed-K], X is [tokens, K], and D is emitted
@@ -1202,6 +1262,32 @@ instantiate_qdequant("qdequant_iq2_xs", iq2_xs);
 instantiate_qdequant("qdequant_iq3_xxs", iq3_xxs);
 instantiate_qdequant("qdequant_iq1_s", iq1_s);
 instantiate_qdequant("qdequant_tq2_0", tq2_0);
+
+#define instantiate_qgemv_mm(name, FMT, T, MROWS)                            \
+   template [[host_name(name)]] [[kernel]]                                   \
+   void qgemv_mm<FMT, T, MROWS>(                                             \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],              \
+     device T* X [[buffer(2)]],                                              \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     uint3 tgid [[threadgroup_position_in_grid]],                            \
+     uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_qgemv_mm_rows(name, FMT, T)                              \
+    instantiate_qgemv_mm(name "_2",  FMT, T, 2);                             \
+    instantiate_qgemv_mm(name "_4",  FMT, T, 4);                             \
+    instantiate_qgemv_mm(name "_8",  FMT, T, 8);                             \
+    instantiate_qgemv_mm(name "_16", FMT, T, 16);                            \
+    instantiate_qgemv_mm(name "_17", FMT, T, 17);
+
+#define instantiate_qgemv_mm_format(name, FMT)                               \
+    instantiate_qgemv_mm_rows(name, FMT, half);                              \
+    instantiate_qgemv_mm_rows(name "_bfloat16", FMT, bf16);
+
+instantiate_qgemv_mm_format("qgemv_mm_q4_0", q4_0);
+instantiate_qgemv_mm_format("qgemv_mm_q8_0", q8_0);
+instantiate_qgemv_mm_format("qgemv_mm_q4_K", q4_K);
+instantiate_qgemv_mm_format("qgemv_mm_q5_K", q5_K);
+instantiate_qgemv_mm_format("qgemv_mm_q6_K", q6_K);
 
 #define instantiate_qgemv_format(name, FMT)                                  \
     instantiate_qgemv(name, FMT, half);                                      \

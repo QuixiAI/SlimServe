@@ -51,6 +51,21 @@ SAMPLE_FPS = 2.0
 TEMPORAL_MERGE_KERNEL_SIZE = 4
 TIMESTAMP_MODE = "hh:mm:ss.fff"
 
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O split, which `tokenizer.ggml.pre`
+# names as "gpt-4o" or "llama4". The canonical tokenizer.json form, which the
+# HF tokenizers regex engine accepts directly.
+LLAMA4_PRETOKENIZER_REGEX = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 split, which `tokenizer.ggml.pre`
 # names as "glm4".
 GLM4_PRETOKENIZER_REGEX = (

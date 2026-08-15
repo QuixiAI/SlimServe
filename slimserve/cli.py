@@ -56,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
         help="model name the OpenAI endpoint reports (default: the profile's)",
     )
     parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help=argparse.SUPPRESS,  # now the default for every profile; kept as a no-op
+    )
+    parser.add_argument(
         "--cache", help="model directory (default $SLIMSERVE_CACHE or ~/models)"
     )
     parser.add_argument(
@@ -236,7 +241,8 @@ def _show(plan: Plan) -> None:
         print(f"  {key:<9} {value}")
     if plan.speculative:
         spec = plan.source["speculator"]
-        print(f"  spec      DSpark k={spec['engine']['num_speculative_tokens']}")
+        method = spec["engine"].get("method", "dspark")
+        print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:
@@ -333,6 +339,14 @@ def main(argv: list[str] | None = None) -> int:
         plan = replace(
             plan,
             engine={**plan.engine, "served_model_name": args.served_model_name},
+        )
+    if args.thinking:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "default_chat_template_kwargs": {"thinking": True},
+            },
         )
     if args.torch_profile_dir:
         profile_dir = Path(args.torch_profile_dir).expanduser().resolve()

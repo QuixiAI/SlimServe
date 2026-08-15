@@ -93,6 +93,42 @@ class RMSNorm(CustomOp):
                 self.variance_size_override,
             )
 
+    def forward_mps(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Single-dispatch QuixiCore Metal kernel. The eager native path
+        # decomposes into ~five MPS ops per call, which dominates the
+        # non-matvec dispatch budget of small decode steps.
+        from vllm.quixicore import quixicore_ops
+
+        if (
+            not quixicore_ops.is_available()
+            or not self.has_weight
+            or x.dtype != torch.bfloat16
+            or self.weight.dtype != torch.bfloat16
+            or self.variance_size_override is not None
+            or x.shape[-1] % 4 != 0
+        ):
+            return self.forward_native(x, residual)
+
+        hidden = x.shape[-1]
+        if residual is not None:
+            residual = residual + x
+            out = quixicore_ops.rms_norm(
+                residual.reshape(-1, hidden).contiguous(),
+                self.weight.data,
+                self.variance_epsilon,
+            ).view(x.shape)
+            return out, residual
+        out = quixicore_ops.rms_norm(
+            x.reshape(-1, hidden).contiguous(),
+            self.weight.data,
+            self.variance_epsilon,
+        )
+        return out.view(x.shape)
+
     def forward_cuda(
         self,
         x: torch.Tensor,

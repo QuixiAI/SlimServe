@@ -266,6 +266,28 @@ harness, c1, spec decode on, every stage `exact: true`, zero preemptions):
 - Raw artifacts: `perf/results/2026-08-10/dsv4-lifecycle-qual/`,
   `perf/results/2026-08-10/dsv4-a100-matrix/`.
 
+### 2026-08-10 evening correction: deployed q4ktail-4 capacity + degeneration incident
+
+The deployed-instance concurrency sweep recorded in
+`perf/optimization_status.md` earlier today (c16 732.4 / c32 925.3 /
+c64 1023.8) is retracted as a capacity claim: those rows ran with
+acceptance 5.70-5.88 (k=5 ceiling 6.0), which matches the silent
+BOS-loop degeneration discovered the same evening -- the server emitted
+special-token loops the drafter predicts perfectly -- compounded by a
+same-source prompt confound. The c1-c8 rows (acceptance 3.53-4.24)
+remain plausible.
+
+Valid replacement band, measured on fresh disjoint text with healthy
+acceptance (3.9-4.6), both daemons under simultaneous load, summing
+per-instance valid cells across equivalent runs: c16 ~1050-1150,
+c32 ~1300-1370, c64 ~1400-1550 aggregate tok/s for the box (two TP4
+instances). No single row yet has both instances simultaneously healthy
+end to end; treat these as banded estimates until the degeneration race
+is fixed. Trigger matrix, retractions, harness degeneration guard, and
+the slimserve-canary auto-restart are documented in the incident entry
+in `perf/optimization_status.md`. TP8-tier numbers share the same
+spec+full-graph machinery and inherit the same risk caveat.
+
 UPDATE 12 (2026-08-11, post step-tape): Baseline row UNCHANGED — matrix
 off1-2000 15.06-15.14 tok/s | wall 132.1-132.8 | sha 3a325666be45 |
 step ~292 ms; 8-tok sha 5d4697585c6e. The Batch 4 S1b native step tape
@@ -637,3 +659,39 @@ the race (boot-level bisect in the cleanup entry). Root-cause fix is
 queued follow-up work. Artifacts:
 perf/results/2026-08-14/cleanup_gate/ (*_ship.json, walls_ship.log,
 boot_*.log).
+
+## UPDATE 28 (2026-08-14): origin/main merged — 256K profile becomes the serving config; anchors re-pinned
+
+- Merged origin/main (A100 Q4_K fused MoE + split-K NaN fix + Muse-Glimmer
+  Metal + the Metal DSV4 256K profile resize) into the M1 Ultra campaign
+  branch; metallib and extension rebuilt from merged sources, all six kernel
+  oracles pass.
+- MERGE IS BIT-EXACT, proven by config A/B: with the profile pinned back to
+  the campaign's 3072/1.5 GiB benchmark sizing, the merged code reproduces
+  every pre-merge anchor exactly — 8-tok db2846cf721b 7/10/2, off1-2000
+  3fc700d9818b 1496/2535/507 at 65.52 s, 2500x64 dd5c1c87fe60 51/70/14 at
+  3.490 s.
+- The shipping profile keeps main's intended 262144/16 GiB sizing (with the
+  campaign's fp16 dtype and 2176 batched-token reserve). Under it the
+  off1-2000 trajectory legitimately changes past the indexer engagement
+  length and the anchor re-pins:
+  - 8-tok: db2846cf721b 7/10/2 (unchanged).
+  - off1-2000: **7ce993786ba1 1538/2320/464, wall 63.2-63.5 s = 31.6 tok/s
+    end-to-end (2000/(wall-prefill) ~= 33 tok/s decode-only)** — faster than
+    the 3072-config 65.5 s and back at the campaign-best whole-wall band.
+    chars_per_token 4.76, dumped completion coherent.
+  - 2500x64: dd5c1c87fe60 (text bit-exact with pre-merge even under 256K;
+    counters shift to 52/65/13), wall 3.57 s, no wedge after full boot ramp.
+- Prefill walls under the shipping config: 512 1.94-2.63 (jittery,
+  fixed-overhead dominated) | 1000 3.09/323.3 | 2048 5.55-5.71 (best fresh
+  cursor 5.552 = 368.9 tok/s, within noise of UPDATE 26's 5.512/371.6) |
+  3000 9.56.
+- Boot-ramp protocol NOTE hardened: a primer plus a 1000-token/8-tok request
+  is NOT sufficient ramp before a multi-chunk prefill — one A/B boot wedged
+  on 2500 after exactly that. The full ramp (primer, 8-tok, one long decode
+  request) preceded every clean multi-chunk request this session, matching
+  the cleanup-gate sequence.
+- ds4 bars (same box): prefill 277 -> 369 tok/s (133%); decode 21.1 -> 31.6
+  end-to-end (150%).
+- Raw artifacts: perf/results/2026-08-14/merge_gate/ (boot_final.log,
+  boot_ship.log, ship_*.json, gate_*.json, walls.log, completions_2000/).
