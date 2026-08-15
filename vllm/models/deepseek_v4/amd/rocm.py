@@ -412,31 +412,55 @@ class DeepseekV4ROCMAiterMLASparseMetadataBuilder(DeepseekV4FlashMLAMetadataBuil
             fast_build=fast_build,
         )
 
-        ragged_indices = None
-        ragged_indptr = None
-        dense_decode = base.c128a_global_decode_topk_indices
-        decode_lens = base.c128a_decode_topk_lens
-        if dense_decode is not None and decode_lens is not None:
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                dense_decode.reshape(dense_decode.shape[0], -1),
-                decode_lens,
-            )
-            assert self.c128a_decode_topk_ragged_indices_buffer is not None
-            assert self.c128a_decode_topk_ragged_indptr_buffer is not None
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.c128a_decode_topk_ragged_indices_buffer,
-                self.c128a_decode_topk_ragged_indptr_buffer,
-                dense_decode.shape[0],
-                self.c128a_max_compressed,
-            )
+        ragged_indices, ragged_indptr = self._update_c128a_ragged(
+            base.c128a_global_decode_topk_indices,
+            base.c128a_decode_topk_lens,
+        )
 
         return DeepseekV4ROCMAiterMLASparseMetadata(
             **vars(base),
             c128a_decode_topk_ragged_indices=ragged_indices,
             c128a_decode_topk_ragged_indptr=ragged_indptr,
         )
+
+
+
+    def _update_c128a_ragged(
+        self,
+        dense_decode: torch.Tensor | None,
+        decode_lens: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Repack decode topk into the persistent ragged buffers (device work
+        shared by build() and steady_decode_update(); the returned views are
+        deterministic slices of those buffers)."""
+        if dense_decode is None or decode_lens is None:
+            return None, None
+        ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+            dense_decode.reshape(dense_decode.shape[0], -1),
+            decode_lens,
+        )
+        assert self.c128a_decode_topk_ragged_indices_buffer is not None
+        assert self.c128a_decode_topk_ragged_indptr_buffer is not None
+        return _copy_ragged_to_graph_buffers(
+            ragged_indices,
+            ragged_indptr,
+            self.c128a_decode_topk_ragged_indices_buffer,
+            self.c128a_decode_topk_ragged_indptr_buffer,
+            dense_decode.shape[0],
+            self.c128a_max_compressed,
+        )
+
+    def steady_decode_update(
+        self,
+        metadata: "DeepseekV4ROCMAiterMLASparseMetadata",
+        common_attn_metadata: "CommonAttentionMetadata",
+    ) -> "DeepseekV4ROCMAiterMLASparseMetadata":
+        super().steady_decode_update(metadata, common_attn_metadata)
+        self._update_c128a_ragged(
+            metadata.c128a_global_decode_topk_indices,
+            metadata.c128a_decode_topk_lens,
+        )
+        return metadata
 
 
 class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
@@ -470,33 +494,49 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
             fast_build=fast_build,
         )
 
-        ragged_indices = None
-        ragged_indptr = None
-        if (
-            base.num_decode_tokens > 0
-            and base.decode_swa_indices is not None
-            and base.decode_swa_lens is not None
-        ):
-            ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
-                base.decode_swa_indices.reshape(base.num_decode_tokens, -1),
-                base.decode_swa_lens,
-            )
-            ragged_indices, ragged_indptr = _copy_ragged_to_graph_buffers(
-                ragged_indices,
-                ragged_indptr,
-                self.decode_swa_ragged_indices_buffer,
-                self.decode_swa_ragged_indptr_buffer,
-                base.num_decode_tokens,
-                # Actual dense width for this build: window_size (causal) or
-                # noncausal_index_width (DSpark non-causal draft).
-                base.decode_swa_indices.shape[-1],
-            )
+        ragged_indices, ragged_indptr = self._update_swa_ragged(base)
 
         return DeepseekV4ROCMAiterSparseSWAMetadata(
             **vars(base),
             decode_swa_ragged_indices=ragged_indices,
             decode_swa_ragged_indptr=ragged_indptr,
         )
+
+    def _update_swa_ragged(
+        self, metadata: DeepseekSparseSWAMetadata
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Repack decode SWA indices into the persistent ragged buffers
+        (device work shared by build() and steady_decode_update())."""
+        if (
+            metadata.num_decode_tokens <= 0
+            or metadata.decode_swa_indices is None
+            or metadata.decode_swa_lens is None
+        ):
+            return None, None
+        ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+            metadata.decode_swa_indices.reshape(metadata.num_decode_tokens, -1),
+            metadata.decode_swa_lens,
+        )
+        return _copy_ragged_to_graph_buffers(
+            ragged_indices,
+            ragged_indptr,
+            self.decode_swa_ragged_indices_buffer,
+            self.decode_swa_ragged_indptr_buffer,
+            metadata.num_decode_tokens,
+            # Actual dense width for this build: window_size (causal) or
+            # noncausal_index_width (DSpark non-causal draft).
+            metadata.decode_swa_indices.shape[-1],
+        )
+
+    def steady_decode_update(
+        self,
+        metadata: "DeepseekV4ROCMAiterSparseSWAMetadata",
+        common_attn_metadata: "CommonAttentionMetadata",
+    ) -> "DeepseekV4ROCMAiterSparseSWAMetadata":
+        super().steady_decode_update(metadata, common_attn_metadata)
+        self._update_swa_ragged(metadata)
+        return metadata
+
 
 
 class DeepseekV4ROCMAiterMLASparseBackend(DeepseekV4FlashMLABackend):

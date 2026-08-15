@@ -169,7 +169,26 @@ class DefaultModelState(ModelState):
                 mm_features=self.encoder_cache.mm_features,
                 sliding_window=self.model_config.get_sliding_window(),
             )
+        # Steady uniform-decode metadata reuse (profile-driven, 2026-08-15:
+        # the per-step Python/dispatch rebuild costs ~5.6 ms/step at c1 while
+        # the FULL decode graph only reads the builders' persistent device
+        # buffers). Opt-in until soak-validated.
+        steady_cache = None
+        if cudagraph_mode == CUDAGraphMode.FULL and not for_capture:
+            enabled = getattr(self, "_steady_meta_enabled", None)
+            if enabled is None:
+                import os
+                enabled = os.getenv(
+                    "VLLM_STEADY_DECODE_META", "0"
+                ).lower() in ("1", "true", "on", "yes")
+                self._steady_meta_enabled = enabled
+            if enabled:
+                steady_cache = getattr(self, "_steady_meta_cache", None)
+                if steady_cache is None:
+                    steady_cache = {"sig": None}
+                    self._steady_meta_cache = steady_cache
         attn_metadata = build_attn_metadata(
+            steady_cache=steady_cache,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
