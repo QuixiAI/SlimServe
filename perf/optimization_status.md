@@ -2754,3 +2754,45 @@ VERDICTS:
 
 Production: both daemons restarted onto the committed build (A during
 arms teardown, B explicitly); canary + NAN_WATCH active.
+
+## 2026-08-15 - c1 host-side budget (py-spy on live production) + steady-decode metadata reuse
+
+Correction to the 08-13 eager-break theory: decode runs FULL graphs (boot
+logs: "Capturing CUDA graphs (FULL) 8/8" target AND drafter) - attention is
+INSIDE the graph. Async scheduling is already enabled (AsyncScheduler
+frames live in the engine). The fixed ~21 ms/cycle at c1 decomposes
+(py-spy 100 Hz, 40 s on production A worker TP0 + engine):
+
+worker: 23.9% target attn metadata build (~5.0 ms/cycle), 20.4% waiting on
+output copy_event, 16.3% sampler/rejection (~3.4 ms, incl. 1.6% our
+NAN_WATCH), 15.1% drafter python (~3.2 ms; incl. ~0.8 ms EAGER context-KV
+insert through Python GEMV dispatch), 14.1% starving on next input, 2.4%
+input prep. Engine: 85% idle (not the bottleneck). Worker CPU ~13.7
+ms/cycle vs GPU ~11.7 ms, imperfectly overlapped -> 47.5 steps/s.
+
+Metadata build detail: 55% torch-op dispatch (hundreds of tiny ops), 25%
+python object churn, 18% Triton launch overhead. Builders per step: rocm
+SWA subclass (ragged repack), FlashMLA/c128a subclass (ragged repack),
+sparse_swa base (3 device ops + 30-field dataclass), indexer, plus
+CommonAttentionMetadata construction per KV group. KEY INSIGHT: at FULL-
+graph decode the replayed graph reads only the builders' persistent device
+buffers - the Python metadata objects are only consumed at capture and by
+eager/prefill steps, so a steady uniform-decode step only needs the
+builders' device kernels re-run.
+
+IMPLEMENTED (env VLLM_STEADY_DECODE_META, default off):
+build_attn_metadata caches per-group (CommonAttentionMetadata, [(builder,
+metadata, layers, supports)]) keyed on (num_reqs, num_tokens,
+max_query_len) for all-decode FULL steps; on hit it refreshes drifting CPU
+scalars (max_seq_len) and calls builder.steady_decode_update() -- device
+work only -- implemented for DeepseekSparseSWAMetadataBuilder (+ rocm
+ragged subclass) and DeepseekV4FlashMLAMetadataBuilder (+ rocm ragged
+subclass); the indexer group full-rebuilds against the cached common
+metadata (safe fallback). All cached tensor fields are views over
+persistent buffers the runner refreshes each step; correctness gate =
+exact harness + degeneration guard. A/B window running.
+
+Remaining c1 roadmap by measured size: (1) this change (~5 ms class);
+(2) sampler/rejection path 3.4 ms; (3) drafter python 3.2 ms (eager
+context-KV insert -> capture; draft-loop consolidation); (4) full
+CPU/GPU overlap (ceiling ~85 steps/s = +80%).
