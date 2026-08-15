@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import (
         DeepseekSparseSWAMetadata,
     )
+    from vllm.v1.attention.backends.turboquant_attn import TurboQuantMetadata
 
 from vllm.config import (
     CacheConfig,
@@ -49,7 +50,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
-from vllm.platforms import current_platform
 from vllm.quixicore import quixicore_ops
 from vllm.triton_utils import tl, triton
 from vllm.utils.multi_stream_utils import (
@@ -81,9 +81,12 @@ _DSV4_INNER_ATTENTION_OVERLAP = os.getenv(
 #   OVERLAP_MLA_COMPRESSOR: MLA C128 compressor on aux_stream_list[1] (or [0]
 #     in the compressor-only branch).
 #   OVERLAP_INDEXER_INNER: indexer's nested compressor on aux_stream_list[2].
-_DSV4_OVERLAP_INDEXER = os.getenv(
-    "VLLM_DSV4_OVERLAP_INDEXER", "1"
-).lower() not in {"0", "false", "off", "no"}
+_DSV4_OVERLAP_INDEXER = os.getenv("VLLM_DSV4_OVERLAP_INDEXER", "1").lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
 _DSV4_OVERLAP_MLA_COMPRESSOR = os.getenv(
     "VLLM_DSV4_OVERLAP_MLA_COMPRESSOR", "1"
 ).lower() not in {"0", "false", "off", "no"}
@@ -628,7 +631,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # graph segment with work launched on auxiliary streams is illegal
             # even though the default stream waits on their events. Capture the
             # projections serially; eager execution keeps the normal overlap.
-            and not torch.cuda.is_current_stream_capturing(),
+            # Metal has no graph capture, and its torch build has no
+            # torch.cuda, so it is always the eager case.
+            and (
+                current_platform.is_metal()
+                or not torch.cuda.is_current_stream_capturing()
+            ),
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -740,7 +748,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 # _fused_qnorm_rope_kv_insert.
                 out.zero_()
                 return
-            tq_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+            tq_metadata = cast(
+                "TurboQuantMetadata", attn_metadata.get(self.swa_cache_layer.prefix)
+            )
             assert tq_metadata is not None
             self._tq_impl.forward(
                 self,

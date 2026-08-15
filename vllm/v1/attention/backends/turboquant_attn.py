@@ -267,7 +267,9 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
         spec_window = getattr(self.kv_cache_spec, "sliding_window", None)
-        if spec_window:
+        if spec_window and not _is_metal_platform():
+            # The QuixiCore Metal decode kernel is validated only at the
+            # configured split count; keep its geometry unchanged there.
             max_num_splits = min(
                 max_num_splits,
                 _MAX_SLIDING_WINDOW_KV_SPLITS,
@@ -473,7 +475,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
-        if self.sliding_window:
+        if self.sliding_window and not _is_metal_platform():
+            # Mirrors the builder-side gate: the QuixiCore Metal decode kernel
+            # is validated only at the configured split count.
             self.max_num_kv_splits = min(
                 self.max_num_kv_splits,
                 _MAX_SLIDING_WINDOW_KV_SPLITS,

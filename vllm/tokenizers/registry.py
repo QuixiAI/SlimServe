@@ -224,6 +224,16 @@ def get_tokenizer(
             # tokenizer class itself is vendored from the release rather than
             # reimplemented, so the pre-tokenizer split stays identical.
             tok = build_kimi_k3_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) in ("muse-glimmer", "dflash"):
+            from vllm.transformers_utils.gguf_muse_glimmer import (
+                build_muse_glimmer_tokenizer_from_gguf,
+            )
+
+            # `tokenizer.ggml.pre` is "llama4"; the GLM4 split the generic
+            # builder applies would shift ids around digits and whitespace.
+            # The DeepSeek dflash drafter carries no vocabulary, so any
+            # `dflash` file reaching tokenizer construction is Muse-Glimmer's.
+            tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
         else:
             from vllm.transformers_utils.gguf_native import (
                 build_tokenizer_from_gguf,

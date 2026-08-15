@@ -6040,6 +6040,28 @@ void launch_qgemv_mb(E& e, typename E::out_t d, typename E::in_t wq,
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// Weight-stationary multi-row GEMV over M activation rows. M must be one of
+// the instantiated row counts (2/4/8/16/17/32); hosts decompose other
+// batches. Reads the quantized weights once for the whole row block.
+template <class E>
+void launch_qgemv_mm(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int m_rows,
+                     const std::string& fmt,
+                     const std::string& type_name = "float16") {
+  std::string name = "qgemv_mm_" + fmt;
+  if (type_name == "bfloat16") {
+    name += "_bfloat16";
+  }
+  name += "_" + std::to_string(m_rows);
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // Device-selected GGUF MoE GEMV. Grid y is the flattened (token, route)
 // dimension, allowing every selected expert to be evaluated without a host
 // copy of topk_ids or a command-buffer split per expert.

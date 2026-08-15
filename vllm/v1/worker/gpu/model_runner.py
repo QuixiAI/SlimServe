@@ -1120,6 +1120,86 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         return block_tables, slot_mappings
 
+    def _nan_watch(
+        self,
+        logits: torch.Tensor | None,
+        input_batch: "InputBatch | None" = None,
+    ) -> None:
+        """Diagnostic tripwire (VLLM_NAN_WATCH=1): report NaN logits rows.
+
+        The DSV4 degeneration race surfaces as a NaN logits row that the
+        sampler guard silently converts to token 0, after which the BOS loop
+        self-sustains and hides the original event. This makes the first NaN
+        loud without a device sync on the hot path: each step queues a
+        non-blocking copy of the NaN row count and reads the previous step's
+        result, so detection lags one step but costs one small reduction.
+        """
+        enabled = getattr(self, "_nan_watch_enabled", None)
+        if enabled is None:
+            enabled = os.getenv("VLLM_NAN_WATCH", "0").lower() in (
+                "1", "true", "on", "yes",
+            )
+            self._nan_watch_enabled = enabled
+            self._nan_watch_step = 0
+            self._nan_watch_pending: tuple | None = None
+            if enabled:
+                logger.warning("NAN_WATCH enabled: logits rows checked "
+                               "every step (diagnostic mode)")
+        if not enabled or logits is None:
+            return
+        self._nan_watch_step += 1
+        pending = self._nan_watch_pending
+        if pending is not None:
+            host, event, step, rows, ids_host = pending
+            if event.query():
+                mask = host.bool()
+                count = int(mask.sum().item())
+                if count > 0:
+                    idxs = mask.nonzero().flatten().tolist()[:12]
+                    ids = ids_host.tolist() if ids_host is not None else None
+                    nan_ids = (
+                        [ids[i] for i in idxs if i < len(ids)]
+                        if ids is not None else None
+                    )
+                    logger.error(
+                        "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
+                        "(reported at step %d) rows=%s nan_row_input_ids=%s "
+                        "all_ids=%s",
+                        count, rows, step, self._nan_watch_step, idxs,
+                        nan_ids, ids[:16] if ids is not None else None)
+                    from vllm.model_executor.layers import nan_probe
+                    layers = nan_probe.snapshot()
+                    if layers is not None:
+                        logger.error(
+                            "NAN_WATCH_LAYERS: cumulative NaN counts "
+                            "(slot, count): %s — slots 0-60 are layer "
+                            "outputs (birth = min); slots 100+4L+p are "
+                            "intra-layer for L in 0-2 (p: 0=attn-in, "
+                            "1=attn-out, 2=moe-in, 3=moe-out)",
+                            [x for x in layers if x[0] >= 100]
+                            + layers[:8])
+                self._nan_watch_pending = None
+        if self._nan_watch_pending is None:
+            nan_mask = torch.isnan(logits).any(dim=-1)
+            host = torch.empty(
+                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True
+            )
+            host.copy_(nan_mask, non_blocking=True)
+            ids_host = None
+            if input_batch is not None:
+                # Input token id per logits row: the id whose embedding fed
+                # the forward that produced this row (for the bonus row this
+                # is the drafter's deepest draft token).
+                row_ids = input_batch.input_ids[input_batch.logits_indices]
+                ids_host = torch.empty(
+                    row_ids.shape, dtype=row_ids.dtype, pin_memory=True
+                )
+                ids_host.copy_(row_ids, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._nan_watch_pending = (
+                host, event, self._nan_watch_step, logits.shape[0], ids_host)
+
     def sample(
         self,
         hidden_states: torch.Tensor,
@@ -1128,6 +1208,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        self._nan_watch(logits, input_batch)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None

@@ -352,6 +352,70 @@
           }
         }
       }
+    },
+    "muse-glimmer": {
+      "title": "Muse-Glimmer-30B",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "repo": "meta-models/Muse-Glimmer-30B-GGUF",
+      "base_url": "https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/resolve/main",
+      "local_dir": "Muse-Glimmer-30B-GGUF",
+      "shared": [
+        {
+          "path": "mmproj-kquant.gguf",
+          "bytes": 1400328928
+        }
+      ],
+      "shared_note": "The mmproj vision tower is discovered by globbing mmproj* next to the text GGUF, so both live in the repo root of the local dir.",
+      "quants": {
+        "kquant-dynamic": {
+          "title": "K-quant dynamic (per-layer mixed)",
+          "bytes": 19653957984,
+          "summary": "The larger of the two published k-quant builds; per-layer mixed precision. Default.",
+          "min_gpus": {},
+          "min_memory_bytes": {
+            "metal": 68719476736
+          },
+          "files": [
+            {
+              "path": "muse-glimmer-30B-kquant-dynamic.gguf",
+              "bytes": 19653957984
+            }
+          ]
+        },
+        "kquant-17gb": {
+          "title": "K-quant 17GB (uniform Q4_K_M)",
+          "bytes": 16756681056,
+          "summary": "Smaller uniform build for tighter memory; same tokenizer and mmproj.",
+          "min_gpus": {},
+          "min_memory_bytes": {
+            "metal": 68719476736
+          },
+          "files": [
+            {
+              "path": "muse-glimmer-30B-kquant-17gb.gguf",
+              "bytes": 16756681056
+            }
+          ]
+        }
+      },
+      "speculator": {
+        "repo": "meta-models/Muse-Glimmer-30B-GGUF",
+        "base_url": "https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/resolve/main",
+        "local_dir": "Muse-Glimmer-30B-GGUF",
+        "file": {
+          "path": "dflash-kquant.gguf",
+          "bytes": 1631205312
+        },
+        "engine": {
+          "method": "dflash",
+          "num_speculative_tokens": 16,
+          "quantization": "gguf"
+        },
+        "note": "Published DFlash drafter: 5 layers reading target layers [2, 14, 26, 38, 50], block size 16 (one non-autoregressive block per call). Draft KV uses the default fp16 cache; a TurboQuant draft cache is future work."
+      }
     }
   },
   "platforms": {
@@ -598,9 +662,6 @@
         "VLLM_ROCM_USE_AITER": "1",
         "HSA_XNACK": "1"
       },
-      "chat_template_kwargs": {
-        "thinking": false
-      },
       "notes": [
         "The Kimi verifier keeps its native hybrid cache at auto. The replicated DSpark backbone uses a separate TurboQuant compressed cache on every rank.",
         "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
@@ -641,9 +702,6 @@
       "env": {
         "VLLM_ROCM_USE_AITER": "1",
         "HSA_XNACK": "1"
-      },
-      "chat_template_kwargs": {
-        "thinking": false
       },
       "notes": [
         "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
@@ -691,11 +749,11 @@
         "metal": {
           "engine": {
             "dtype": "float16",
-            "max_model_len": 3072,
+            "max_model_len": 262144,
             "max_num_seqs": 32,
             "max_num_batched_tokens": 2176,
             "gpu_memory_utilization": null,
-            "kv_cache_memory_bytes": 1610612736,
+            "kv_cache_memory_bytes": 17179869184,
             "kv_cache_dtype": "fp8_ds_mla",
             "attention_config": null,
             "tokenizer_mode": "deepseek_v4",
@@ -711,9 +769,10 @@
             "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-            "The fixed 1.5 GiB hybrid KV pool holds one complete 1,000-input/2,000-output request plus a full single-chunk 2048-token prefill while keeping the IQ2_XXS target and drafter resident. Higher API concurrency drains in scheduler waves instead of paging model weights.",
-            "max_model_len is 3072 because this profile is tuned and measured for the exact 1k-in/2k-out serving matrix.",
-            "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk)."
+            "The fixed 16 GiB hybrid KV pool is sized to hold one full 262,144-token request (target fp8_ds_mla across 43 layers plus the 3-layer TurboQuant draft cache, ~9 GiB) with margin for concurrent shorter sessions. Weights (80.8 GiB target + 6.5 GiB drafter) plus this pool total ~103 GiB, inside the ~115 GiB Metal working set of a 128 GiB machine. Higher API concurrency drains in scheduler waves instead of paging model weights.",
+            "max_model_len is 262144 for real (agentic) use. The 1k-in/2k-out benchmark matrix in perf/baseline_status.md is re-gated under this sizing (see the M1 Ultra campaign entries).",
+            "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk).",
+            "Long-context status (2026-08-14): the sparse-MLA indexer chain (fused indexer Q rope/quant, prefill top-k, scoring) now has a native Metal implementation, and multi-chunk prefill plus the DSpark verify path are validated at the benchmark matrix on an M1 Ultra. A boot must serve one short decode request before its first multi-chunk prefill (boot-ramp; see vllm/platforms/metal_compat.py). Full 262,144-token serving still needs a dedicated long-context validation pass."
           ]
         }
       }
@@ -759,7 +818,8 @@
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async"
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "quant_overrides": {
             "IQ2_XXS": {
@@ -794,7 +854,8 @@
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
       ]
     },
     "dsv4-q4ktail-4": {
@@ -814,7 +875,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "max_cudagraph_capture_size": 64
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -836,7 +898,8 @@
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async"
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -845,7 +908,9 @@
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
       ]
     },
     "dsv4-q4ktail-8": {
@@ -866,7 +931,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "max_cudagraph_capture_size": 64
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -886,7 +952,8 @@
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async"
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "note": "A100 only (the measured platform). Two TP4 replicas keep each engine's verify batches at the graph-covered sweet spot; capture 64 covers the per-replica c8 width. Requires the 2026-08-10 DP-padding router fix."
         }
@@ -896,7 +963,9 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
       ]
     },
     "dsv4-mxfp4-4": {
@@ -917,7 +986,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "max_cudagraph_capture_size": 64
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -939,7 +1009,8 @@
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async"
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         },
@@ -966,7 +1037,9 @@
         "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
       ]
     },
     "dsv4-mxfp4-8": {
@@ -986,7 +1059,8 @@
           "sparse_mla_force_mqa": true
         },
         "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "max_cudagraph_capture_size": 64
         },
         "trust_remote_code": true,
         "reasoning_parser": "deepseek_v4",
@@ -1008,7 +1082,8 @@
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async"
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
         }
@@ -1018,7 +1093,9 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
       ]
     },
     "dsv4-q4k-8": {
@@ -1054,6 +1131,42 @@
         "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
         "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
         "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+      ]
+    },
+    "muse-kdyn-1": {
+      "title": "Muse-Glimmer-30B on one Mac",
+      "source": "muse-glimmer",
+      "gpus": 1,
+      "platforms": [
+        "metal"
+      ],
+      "default_quant": "kquant-dynamic",
+      "summary": "Vision-language 28B dense model on a single Apple Silicon machine, sized by unified memory. Full 131072-token context; both published k-quants fit a 64 GB Mac.",
+      "engine": {
+        "tensor_parallel_size": 1,
+        "max_model_len": 131072,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 2048,
+        "kv_cache_memory_bytes": 12884901888,
+        "compilation_config": {
+          "cudagraph_mode": "NONE"
+        },
+        "enable_prefix_caching": true,
+        "enable_chunked_prefill": true,
+        "trust_remote_code": true,
+        "served_model_name": "Muse-Glimmer-30B",
+        "reasoning_parser": "muse_glimmer",
+        "kv_cache_dtype": "auto"
+      },
+      "speculative": true,
+      "env": {},
+      "notes": [
+        "Interleaved attention: 3 sliding-window (2048) layers per 1 global layer across 52 layers, GQA 32/2, final logit softcapping 20. The hybrid KV manager caps SWA layers at the window, so the 12 GiB pool covers multiple full-context requests on the 13 global layers.",
+        "Vision: 50-block CLIP tower at 896 px, patch 14, 2x2 spatial merge into 6656-dim tokens, loaded from the published mmproj GGUF.",
+        "DFlash speculation is on by default: the drafter proposes one 16-token block per call against target layers [2, 14, 26, 38, 50].",
+        "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
+        "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
+        "Performance note (2026-08-11): after the mixed-shard weight-copy fix, no-spec decode measures 12.8 tok/s and DFlash speculation 9.8 tok/s (k=16; k=5 is worse at 7.3 despite equal acceptance). Speculation is net-negative until the small-M GGUF matmul path is fixed -- use --no-spec for best single-stream throughput today. llama.cpp reference on this box: 26.6/50.2."
       ]
     }
   }

@@ -265,7 +265,8 @@ at::Tensor mla_decode_fp8_sparse(const at::Tensor& q, const at::Tensor& kv_data,
 at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                            const at::Tensor& value_cache,
                            const at::Tensor& block_table,
-                           const at::Tensor& context_lens, double scale) {
+                           const at::Tensor& context_lens, double scale,
+                           int64_t window) {
   check_mps(q, "q");
   check_mps(key_cache, "key_cache");
   check_mps(value_cache, "value_cache");
@@ -295,8 +296,280 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                                num_kv_heads, head_size, block_size,
                                block_table_stride, static_cast<float>(scale),
                                /*alibi_slopes=*/q, /*use_alibi=*/0,
-                               /*block_mask=*/q, /*use_mask=*/0, /*window=*/0,
+                               /*block_mask=*/q, /*use_mask=*/0,
+                               /*window=*/static_cast<int>(window),
                                /*mask_heads=*/0, activation_type_name(q));
+  });
+  return out;
+}
+
+// ---- Muse-Glimmer fused decode step --------------------------------------
+//
+// The deep fix for eager-mode dispatch overhead: the whole 52-layer dense
+// decode forward is encoded into ONE command buffer from a C++ loop, so the
+// per-op Python/ATen/torch-MPS cost (measured ~40 ms of an ~80 ms step)
+// collapses to microseconds of encoding. Weights and scratch are registered
+// once; each step passes only the tensors that change (hidden rows,
+// positions, block tables, sequence lengths, slot mappings).
+
+const char* ggml_type_to_format(int64_t quant_type);
+
+namespace muse_step {
+
+struct Proj {
+  at::Tensor w;
+  int type = 0;
+  int rows = 0;
+};
+
+struct Layer {
+  bool is_local = false;
+  std::vector<Proj> qkv;  // q, k, v
+  Proj gate, o, down;
+  std::vector<Proj> gate_up;  // gate, up
+  at::Tensor norm1, qn, kn, post_attn, norm2, post_ffn;
+  at::Tensor kv_cache;  // (2, blocks, block_size, kv_heads, head_dim)
+};
+
+struct State {
+  bool ready = false;
+  int hidden = 0, heads = 0, kv_heads = 0, head_dim = 0, inter = 0;
+  int window = 0, max_rows = 0;
+  float theta = 0.f, eps = 0.f, post_eps = 0.f, scale = 0.f;
+  std::vector<Layer> layers;
+  at::Tensor h, q, k, v, attn_out, gate_out, o_out, g_out, u_out, mlp_mid;
+};
+
+State g;
+
+void emit_matvec(TorchEncoder& e, const Proj& p, const at::Tensor& x,
+                 const at::Tensor& out, int m) {
+  const int K = static_cast<int>(x.size(-1));
+  const std::string fmt = ggml_type_to_format(p.type);
+  if (m == 1) {
+    tk::launch_qgemv(e, out, p.w, x, p.rows, K, fmt, "bfloat16");
+  } else {
+    tk::launch_qgemv_mm(e, out, p.w, x, p.rows, K, m, fmt, "bfloat16");
+  }
+}
+
+void emit_rms(TorchEncoder& e, const at::Tensor& x, const at::Tensor& w,
+              const at::Tensor& o, int rows, int d, float eps) {
+  tk::launch_rms_norm_dyn(e, x, w, o, static_cast<uint32_t>(rows), d, eps);
+}
+
+void emit_elemwise(TorchEncoder& e, const std::string& name, int n4) {
+  e.pipeline(name);
+  e.dispatch((n4 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+}  // namespace muse_step
+
+void muse_step_init(int64_t num_layers, int64_t hidden, int64_t heads,
+                    int64_t kv_heads, int64_t head_dim, int64_t inter,
+                    int64_t window, double theta, double eps, double post_eps,
+                    int64_t max_rows, const at::Tensor& ref) {
+  using namespace muse_step;
+  g = State{};
+  g.hidden = static_cast<int>(hidden);
+  g.heads = static_cast<int>(heads);
+  g.kv_heads = static_cast<int>(kv_heads);
+  g.head_dim = static_cast<int>(head_dim);
+  g.inter = static_cast<int>(inter);
+  g.window = static_cast<int>(window);
+  g.max_rows = static_cast<int>(max_rows);
+  g.theta = static_cast<float>(theta);
+  g.eps = static_cast<float>(eps);
+  g.post_eps = static_cast<float>(post_eps);
+  g.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  g.layers.resize(static_cast<size_t>(num_layers));
+  const auto opt = ref.options();
+  const int64_t m = max_rows;
+  g.h = at::empty({m, hidden}, opt);
+  g.q = at::empty({m, heads * head_dim}, opt);
+  g.k = at::empty({m, kv_heads * head_dim}, opt);
+  g.v = at::empty({m, kv_heads * head_dim}, opt);
+  g.attn_out = at::empty({m, heads * head_dim}, opt);
+  g.gate_out = at::empty({m, heads * head_dim}, opt);
+  g.o_out = at::empty({m, hidden}, opt);
+  g.g_out = at::empty({m, inter}, opt);
+  g.u_out = at::empty({m, inter}, opt);
+  g.mlp_mid = at::empty({m, inter}, opt);
+}
+
+void muse_step_layer(
+    int64_t idx, bool is_local, const std::vector<at::Tensor>& qkv_w,
+    const std::vector<int64_t>& qkv_t, const at::Tensor& gate_w, int64_t gate_t,
+    const at::Tensor& o_w, int64_t o_t, const std::vector<at::Tensor>& gu_w,
+    const std::vector<int64_t>& gu_t, const at::Tensor& down_w, int64_t down_t,
+    const at::Tensor& norm1, const at::Tensor& qn, const at::Tensor& kn,
+    const at::Tensor& post_attn, const at::Tensor& norm2,
+    const at::Tensor& post_ffn, const at::Tensor& kv_cache) {
+  using namespace muse_step;
+  TORCH_CHECK(idx >= 0 && idx < (int64_t)g.layers.size(), "bad layer idx");
+  TORCH_CHECK(qkv_w.size() == 3 && qkv_t.size() == 3, "qkv wants 3 shards");
+  TORCH_CHECK(gu_w.size() == 2 && gu_t.size() == 2, "gate_up wants 2 shards");
+  Layer& L = g.layers[static_cast<size_t>(idx)];
+  L.is_local = is_local;
+  const int hd = g.head_dim;
+  L.qkv = {{qkv_w[0], (int)qkv_t[0], g.heads * hd},
+           {qkv_w[1], (int)qkv_t[1], g.kv_heads * hd},
+           {qkv_w[2], (int)qkv_t[2], g.kv_heads * hd}};
+  L.gate = {gate_w, (int)gate_t, g.heads * hd};
+  L.o = {o_w, (int)o_t, g.hidden};
+  L.gate_up = {{gu_w[0], (int)gu_t[0], g.inter},
+               {gu_w[1], (int)gu_t[1], g.inter}};
+  L.down = {down_w, (int)down_t, g.hidden};
+  L.norm1 = norm1;
+  L.qn = qn;
+  L.kn = kn;
+  L.post_attn = post_attn;
+  L.norm2 = norm2;
+  L.post_ffn = post_ffn;
+  L.kv_cache = kv_cache;
+  if (idx == (int64_t)g.layers.size() - 1) {
+    g.ready = true;
+  }
+}
+
+void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
+                   const at::Tensor& bt_local, const at::Tensor& sl_local,
+                   const at::Tensor& slot_local, const at::Tensor& bt_full,
+                   const at::Tensor& sl_full, const at::Tensor& slot_full) {
+  using namespace muse_step;
+  TORCH_CHECK(g.ready, "muse_step not initialized");
+  const int m = static_cast<int>(x.size(0));
+  TORCH_CHECK(m >= 1 && m <= g.max_rows, "row count out of range");
+  TORCH_CHECK(x.is_contiguous() && x.scalar_type() == at::kBFloat16,
+              "x must be contiguous bf16");
+  const int hidden = g.hidden;
+  const int hd = g.head_dim;
+  const int n4_hidden = m * hidden / 4;
+  const int n4_attn = m * g.heads * hd / 4;
+  const int n4_inter = m * g.inter / 4;
+
+  encode("muse_step", [&](TorchEncoder& e) {
+    for (const Layer& L : g.layers) {
+      const at::Tensor& bt = L.is_local ? bt_local : bt_full;
+      const at::Tensor& sl = L.is_local ? sl_local : sl_full;
+      const at::Tensor& slots = L.is_local ? slot_local : slot_full;
+      const int window = L.is_local ? g.window : 0;
+
+      // h = rms(x, norm1)
+      emit_rms(e, x, L.norm1, g.h, m, hidden, g.eps);
+      // q/k/v projections
+      emit_matvec(e, L.qkv[0], g.h, g.q, m);
+      emit_matvec(e, L.qkv[1], g.h, g.k, m);
+      emit_matvec(e, L.qkv[2], g.h, g.v, m);
+      // per-head QK-RMSNorm (in place)
+      emit_rms(e, g.q, L.qn, g.q, m * g.heads, hd, g.eps);
+      emit_rms(e, g.k, L.kn, g.k, m * g.kv_heads, hd, g.eps);
+      // interleaved rope on local layers
+      if (L.is_local) {
+        e.pipeline("mittens::muse_rope_qk");
+        e.out(g.q, 0);
+        e.in(positions, 1);
+        e.bytes(hd, 2);
+        e.bytes(g.heads, 3);
+        e.bytes(g.theta, 4);
+        e.dispatch(m * g.heads, 1, 1, 32, 1, 1);
+        e.pipeline("mittens::muse_rope_qk");
+        e.out(g.k, 0);
+        e.in(positions, 1);
+        e.bytes(hd, 2);
+        e.bytes(g.kv_heads, 3);
+        e.bytes(g.theta, 4);
+        e.dispatch(m * g.kv_heads, 1, 1, 32, 1, 1);
+      }
+      // write K/V into the paged cache
+      {
+        const long half = L.kv_cache.numel() / 2;
+        e.pipeline("mittens::muse_kv_store");
+        e.out(L.kv_cache, 0);
+        e.in(g.k, 1);
+        e.in(g.v, 2);
+        e.in(slots, 3);
+        e.bytes(static_cast<int>(L.kv_cache.size(2)), 4);
+        e.bytes(g.kv_heads, 5);
+        e.bytes(hd, 6);
+        e.bytes(half, 7);
+        e.bytes(m, 8);
+        const int total4 = m * g.kv_heads * hd / 4;
+        e.dispatch((total4 + 255) / 256, 1, 1, 256, 1, 1);
+      }
+      // paged attention over the cache
+      tk::launch_paged_attention(
+          e, g.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
+          g.attn_out, m, g.heads, g.kv_heads, hd,
+          static_cast<int>(L.kv_cache.size(2)), static_cast<int>(bt.stride(0)),
+          g.scale,
+          /*alibi=*/g.q, /*use_alibi=*/0, /*mask=*/g.q, /*use_mask=*/0, window,
+          /*mask_heads=*/0, "bfloat16");
+      // gated output: attn_out *= sigmoid(gate_proj(h)); then o_proj
+      emit_matvec(e, L.gate, g.h, g.gate_out, m);
+      e.pipeline("mittens::muse_sigmoid_mul");
+      e.out(g.attn_out, 0);
+      e.in(g.gate_out, 1);
+      e.bytes(n4_attn, 2);
+      e.dispatch((n4_attn + 255) / 256, 1, 1, 256, 1, 1);
+      emit_matvec(e, L.o, g.attn_out, g.o_out, m);
+      // post-attention norm (tighter eps) + residual add
+      emit_rms(e, g.o_out, L.post_attn, g.o_out, m, hidden, g.post_eps);
+      e.pipeline("mittens::muse_add_inplace");
+      e.out(x, 0);
+      e.in(g.o_out, 1);
+      e.bytes(n4_hidden, 2);
+      e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
+      // MLP half
+      emit_rms(e, x, L.norm2, g.h, m, hidden, g.eps);
+      emit_matvec(e, L.gate_up[0], g.h, g.g_out, m);
+      emit_matvec(e, L.gate_up[1], g.h, g.u_out, m);
+      e.pipeline("mittens::muse_silu_mul");
+      e.out(g.mlp_mid, 0);
+      e.in(g.g_out, 1);
+      e.in(g.u_out, 2);
+      e.bytes(n4_inter, 3);
+      e.dispatch((n4_inter + 255) / 256, 1, 1, 256, 1, 1);
+      emit_matvec(e, L.down, g.mlp_mid, g.o_out, m);
+      emit_rms(e, g.o_out, L.post_ffn, g.o_out, m, hidden, g.post_eps);
+      e.pipeline("mittens::muse_add_inplace");
+      e.out(x, 0);
+      e.in(g.o_out, 1);
+      e.bytes(n4_hidden, 2);
+      e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
+    }
+  });
+}
+
+// ---- RMSNorm -------------------------------------------------------------
+//
+// One dispatch per norm call. The eager torch-native RMSNorm decomposes into
+// ~five MPS ops; with six norms per Muse-Glimmer layer that dominates the
+// non-matvec dispatch budget of a decode step.
+
+// bf16 contiguous fast path (Muse-Glimmer): fixed-D single-dispatch kernels.
+// The bound rms_norm below routes here when the preconditions hold.
+at::Tensor rms_norm_bf16_contig(const at::Tensor& x, const at::Tensor& weight,
+                                double eps) {
+  check_mps(x, "x");
+  check_mps(weight, "weight");
+  TORCH_CHECK(
+      x.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
+      "rms_norm(metal) is bf16-only");
+  TORCH_CHECK(x.dim() == 2 && x.is_contiguous(),
+              "rms_norm(metal) wants a contiguous [rows, D] input");
+  const int D = static_cast<int>(x.size(1));
+  TORCH_CHECK(weight.numel() == D, "weight/D mismatch");
+  TORCH_CHECK(D % 4 == 0, "rms_norm(metal) needs D % 4 == 0");
+  const auto M = static_cast<uint32_t>(x.size(0));
+  at::Tensor out = at::empty_like(x);
+  const bool fixed = D == 256 || D == 512 || D == 768 || D == 1024;
+  encode("qc_rms_norm", [&](TorchEncoder& e) {
+    if (fixed) {
+      tk::launch_rms_norm(e, x, weight, out, M, D, static_cast<float>(eps));
+    } else {
+      tk::launch_rms_norm_dyn(e, x, weight, out, M, D, static_cast<float>(eps));
+    }
   });
   return out;
 }
@@ -1076,16 +1349,41 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
     return out;
   }
 
+  // Multi-row blocks ride the weight-stationary qgemv_mm variants so the
+  // quantized bytes are read once per block instead of once per row.
+  // Instantiated row counts, largest-first; 17 is the speculative-verify
+  // width (k+1) and gets a single dispatch.
+  static const int kMMRows[] = {17, 16, 8, 4, 2};
+  const bool has_mm = (fmt == "q4_0" || fmt == "q8_0" || fmt == "q4_K" ||
+                       fmt == "q5_K" || fmt == "q6_K") &&
+                      type_name != "float32" &&
+                      // Same q8_0-small carve-out as mb: keep the "_small"
+                      // batch-1 summation order for K <= 512 fp16.
+                      !(K <= 512 && fmt == "q8_0" && type_name == "float16");
   encode("qc_mmvq_loop", [&](TorchEncoder& e) {
-    // QuixiCore's qgemv shader is intentionally batch-1: its grid is N and
-    // the input/output pointers name one row.  vLLM sends decode batches up
-    // to max_num_seqs here, so bind each row's storage offset and enqueue all
-    // rows into the same command encoder.  The previous single launch only
-    // initialized out[0] and returned garbage for requests 1..M-1.
-    for (int b = 0; b < batch; ++b) {
-      const at::Tensor x_row = x.select(0, b);
-      const at::Tensor out_row = out.select(0, b);
-      tk::launch_qgemv(e, out_row, w, x_row, N, K, fmt, type_name);
+    int b = 0;
+    while (b < batch) {
+      const int rem = batch - b;
+      int chunk = 1;
+      if (has_mm) {
+        for (int s : kMMRows) {
+          if (s <= rem) {
+            chunk = s;
+            break;
+          }
+        }
+      }
+      if (chunk > 1) {
+        const at::Tensor x_rows = x.narrow(0, b, chunk);
+        const at::Tensor out_rows = out.narrow(0, b, chunk);
+        tk::launch_qgemv_mm(e, out_rows, w, x_rows, N, K, chunk, fmt,
+                            type_name);
+      } else {
+        const at::Tensor x_row = x.select(0, b);
+        const at::Tensor out_row = out.select(0, b);
+        tk::launch_qgemv(e, out_row, w, x_row, N, K, fmt, type_name);
+      }
+      b += chunk;
     }
   });
   return out;
@@ -2040,6 +2338,14 @@ at::Tensor dsv4_o_inv_rope(const at::Tensor& o, const at::Tensor& positions,
 // per engine step. Kernels in kernels/serving/rms_norm/rms_norm.metal.
 at::Tensor rms_norm(const at::Tensor& x, const at::Tensor& weight,
                     double epsilon) {
+  // Muse-Glimmer's bf16 contiguous inputs keep their dedicated fixed-D
+  // kernels (exact main-branch numerics); everything else - including the
+  // DSV4 fp16 strided q/k splits - takes the path below.
+  if (x.scalar_type() == at::kBFloat16 &&
+      weight.scalar_type() == at::kBFloat16 && x.dim() == 2 &&
+      x.is_contiguous() && weight.numel() == x.size(1) && x.size(1) % 4 == 0) {
+    return rms_norm_bf16_contig(x, weight, epsilon);
+  }
   check_mps_strided(x, "x");  // prefill q/k splits pass strided views
   check_mps(weight, "weight");
   TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
@@ -2406,11 +2712,31 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("topk_length"), pybind11::arg("block_size"),
         pybind11::arg("sm_scale"), pybind11::arg("partition_size") = 0);
 
+  m.def("muse_step_init", &muse_step_init,
+        "Register geometry and allocate scratch for the fused decode step",
+        pybind11::arg("num_layers"), pybind11::arg("hidden"),
+        pybind11::arg("heads"), pybind11::arg("kv_heads"),
+        pybind11::arg("head_dim"), pybind11::arg("inter"),
+        pybind11::arg("window"), pybind11::arg("theta"), pybind11::arg("eps"),
+        pybind11::arg("post_eps"), pybind11::arg("max_rows"),
+        pybind11::arg("ref"));
+  m.def("muse_step_layer", &muse_step_layer,
+        "Register one decoder layer's weights for the fused decode step");
+  m.def("muse_step_run", &muse_step_run,
+        "Encode the whole decoder stack for one decode step into a single "
+        "command buffer; x is updated in place",
+        pybind11::arg("x"), pybind11::arg("positions"),
+        pybind11::arg("bt_local"), pybind11::arg("sl_local"),
+        pybind11::arg("slot_local"), pybind11::arg("bt_full"),
+        pybind11::arg("sl_full"), pybind11::arg("slot_full"));
+
   m.def("paged_attention", &paged_attention,
-        "Dense/GQA paged attention decode over the block-table KV cache",
+        "Dense/GQA paged attention decode over the block-table KV cache. "
+        "window > 0 limits each query to the last `window` positions.",
         pybind11::arg("q"), pybind11::arg("key_cache"),
         pybind11::arg("value_cache"), pybind11::arg("block_table"),
-        pybind11::arg("context_lens"), pybind11::arg("scale"));
+        pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("window") = 0);
 
   m.def("deepseek_v4_qnorm_rope_kv_insert", &deepseek_v4_qnorm_rope_kv_insert,
         "DeepSeek-V4 Q norm/RoPE plus packed FP8 KV insert", pybind11::arg("q"),

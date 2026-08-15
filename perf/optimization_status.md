@@ -965,6 +965,7 @@ decision, and raw artifact locations.
   (128K decode at 65 tok/s vs the 37 measured on XXS the prior evening; the
   XXS number likely included first-run JIT of the long-context kernels. The
   post-128K continuation dip recurs on hybrid: 94.5 vs 168.)
+
 - MXFP4 fused-route width: raised the dispatch cap from tokens<=8 to an env
   limit (`VLLM_GGUF_DSV4_MXFP4_ROWS`, default 64; op cap 256). Correctness
   extended to width 48 (8/8 pass). DSV4 routing is near-uncorrelated, so the
@@ -978,6 +979,7 @@ decision, and raw artifact locations.
 
   Remaining c8 gap vs hybrid's 416 is prefill (chunked 1024-token batches
   still take generic MMQ) -- future MXFP4 prefill tiles.
+
 - dsv4-8 (MXFP4, 8 GPUs): TP8 measured 167.6 c1 / 117.4 @12K / 148.2 c8
   agg, all exact = 1.50x / 1.58x / 1.50x over dsv4-4-mxfp4 -- meets the
   >=1.5x TP gate in every regime. TP4 x DP2 FAILS TO INITIALIZE: DSV4's
@@ -1258,6 +1260,7 @@ decision, and raw artifact locations.
 | 2048 | 459.2 | 8.0 | 57x |
 
   (old is linear in tokens; new is weight-stream flat)
+
 - E2e dsv4-mxfp4-4 (exact harness, spec decode, all `exact: true`):
 
 | stage | before | after | delta |
@@ -1268,6 +1271,7 @@ decision, and raw artifact locations.
 
   12K now holds 88% of the c1 rate (hybrid-4 holds ~95%); c8 at 208 is
   now within the activated-byte ratio of hybrid TP4's 417-606 band.
+
 - E2e dsv4-mxfp4-8 (TP8, capture 64, all `exact: true`):
 
 | stage | before | after | delta |
@@ -1278,6 +1282,7 @@ decision, and raw artifact locations.
 
   TP8 12K now holds 88% of c1 (matches TP4's post-tile ratio); the c8
   gain confirms prefill was the TP8 c8 limiter after the capture-64 fix.
+
 - Open levers recorded: fused SwiGLU+Q8_1 wide epilogue (QuixiCore-XPU
   glu_quant is the precedent; wide route still runs act + requant as
   separate elementwise steps), permuted expert-contiguous segments instead
@@ -1340,6 +1345,7 @@ decision, and raw artifact locations.
 
   (adding the mmq route's external passes makes seg the winner at every
   width: ~-33% at 128, ~-12% at 2048)
+
 - E2e dsv4-mxfp4-4 (exact, spec decode): c1 125.1/127.5 (par vs 129/126),
   12K 112.1/115.0 (vs 110.6/115.8), c8 cold 276.9 (vs 208.4, +33%), c8
   hot 204.3 (vs 200.3, par). Reading per the APC-hot methodology: the win
@@ -1446,6 +1452,7 @@ decision, and raw artifact locations.
   collapse, quantified); the tiles win 1.3-2.0x at prefill-chunk widths.
   Gate set to 768: prefill chunks ride the tiles, decode/verify widths
   keep the fused route.
+
 - E2e note (gate was 32 during the run, i.e. seg over-applied): c1/12K/c8
   par with the capture-64 baseline; c1 cold 202.6 (acc 4.06). The c8
   cross-boot comparison is acceptance-confounded in BOTH directions
@@ -1516,12 +1523,42 @@ decision, and raw artifact locations.
   (+43%), 12K 76->139 (+83%), 128K 56->90 (+61%), c8 ~110->250-320
   (~2.5x). c1 now sits within ~2% of q4ktail-4's r2 (158 vs 162) despite
   1.7x the activated bytes.
+
 - Multi-wide GEMV re-ranked: with aligned loads the fused path runs
   ~1.01 ms at 48 tokens; route dedup's remaining ceiling is ~1.67x at
   verify widths (~0.6 ms floor). Still the next fused-path lever, after
   the cheaper wins are exhausted.
 - Raw: `perf/results/2026-08-10/dsv4-mxfp4-repack/`, benches
   `bench_mxfp4_repack.py` / `bench_seg_repack.py` in session scratchpad.
+
+## 2026-08-10 - Deployed dsv4-q4ktail-4 concurrency sweep (production daemon)
+
+- Setup: the slimserve-a systemd instance (GPUs 0-3, port 27830, ctx
+  262144, served name DeepSeek-v4-Flash-0731, DSpark k=5 + TurboQuant),
+  ~/.local/SlimServe-env runtime, instance B idle on GPUs 4-7. Exact
+  1000-in/2000-out, 8-token warmup, single run per level, all exact.
+
+| conc | agg tok/s | per-req tok/s | acc len | mean latency |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 175.7 | 175.7 | 3.53 | 11.4s |
+| 2 | 216.1 | 108.0 | 3.75 | 16.7s |
+| 4 | 292.7 | 73.2 | 3.63 | 25.9s |
+| 8 | 372.4 | 46.5 | 4.24 | 27.7s |
+| 16 | 732.4 | 45.8 | 5.72 | 39.9s |
+| 32 | 925.3 | 28.9 | 5.88 | 65.6s |
+| 64 | 1023.8 | 16.0 | 5.70 | 115.8s |
+
+- 1023.8 aggregate on one TP4 instance exceeds the 8-GPU TP4xDP2 hot-c8
+  record (921.8) -- more concurrent sequences per engine beats a second
+  engine at these widths. Acceptance climbs with concurrency (deeper
+  same-source windows at higher c inflate the c16+ cells somewhat; the
+  cross-level shape is still informative). c16 doubling c8 despite
+  96-token verify batches exceeding capture 64 says eager verify at high
+  occupancy is launch-amortized, consistent with the capture-neutral
+  mxfp4-4 finding.
+- The box now serves two such instances; aggregate ceiling with both
+  loaded is a future measurement (host CPU contention unknown).
+- Raw: `perf/results/2026-08-10/deployed-q4ktail-4-sweep/`.
 
 ## Historical Notes
 
@@ -1531,7 +1568,7 @@ decision, and raw artifact locations.
   throughput history and should be studied when translating wins across
   platforms.
 
-## 2026-08-10 - Naming note: dsv4-hybrid-* is now dsv4-q4ktail-*
+## 2026-08-10 - Naming note: dsv4-hybrid-*is now dsv4-q4ktail-*
 
 Entries above reference the profile ids in force when each run was made
 (dsv4-2 -> dsv4-hybrid-N -> dsv4-q4ktail-N for the Q4K-tail artifact).
@@ -1539,6 +1576,1184 @@ Entries above reference the profile ids in force when each run was made
 build is a mix) and broke the tag -> registry-quant mapping; q4ktail names
 the distinguishing feature (layers 37-42 experts in Q4_K). Configs are
 unchanged -- ids only.
+
+## 2026-08-10 - INCIDENT: silent output degeneration under load (NaN-class), production dsv4-q4ktail-4
+
+### Discovery
+
+While measuring the dual-instance aggregate ceiling, instance A reported
+acceptance 5.98 (k=5 ceiling is 6.0) on brand-new text while instance B
+reported 3.7-4.3 on adjacent regions. Cross-swapping prompt regions showed
+the anomaly follows the instance, not the content. Direct probing showed the
+"fast" instance emits token 0 (`<|begin_of_sentence|>`) in an endless loop:
+2000-token completions with exact usage counts that decode to almost no
+visible text. The drafter predicts the loop perfectly, which is why
+acceptance pegs at ~6.0 and throughput inflates. The instance stays poisoned
+for every subsequent request (fresh prompts, short prompts after ~28 tokens)
+until process restart. `exact: true` does not catch it: token counts are
+honored; only the text is garbage.
+
+### Trigger matrix (all cells: exact 1K/2K c16 loads on fresh disjoint text)
+
+| GPUs | allreduce | graphs | spec | boots x runs | result |
+| --- | --- | --- | --- | --- | --- |
+| 0-3 (TP4) | custom | FULL cap64 | DSpark k=5 | 4 boots | degenerate by run 2, every boot |
+| 0-3 (TP4) | NCCL | FULL cap64 | DSpark k=5 | 2 boots, 7 runs (incl. clean c1+c16+c32+c64 sweep) | clean |
+| 0-3 (TP4) | custom | FULL cap64 | none | 1 boot, 2 runs | clean text |
+| 0-3 (TP4) | custom, VLLM_DSV4_DEFER_TP_REDUCE=0 | FULL cap64 | DSpark k=5 | 1 boot, 3 runs | text clean, but acceptance collapses to 1.11 (~150 tok/s) - separate latent bug |
+| 0-1 / 2-3 (TP2 pairs) | custom | PIECEWISE cap32 | DSpark k=5 | 1 boot each, 2 runs each | clean |
+| 4-7 (TP4) | custom | FULL cap64 | DSpark k=5 | 3 boots, ~10 runs | clean |
+| 4-7 (TP4) | NCCL | FULL cap64 | DSpark k=5 | 1 boot | degenerate at run 2 |
+
+The last row disproves the custom-allreduce attribution the earlier rows
+suggested (a profile mitigation was applied and then reverted the same
+evening). The failure is a timing-sensitive race: flipping either the
+allreduce implementation or the GPU quartet flips which configuration loses
+the race. Every degenerate cell shares: TP4 + FULL_DECODE_ONLY capture-64 +
+DSpark speculation + sustained c16+ verify load. TP2/PIECEWISE and no-spec
+never degenerated (few runs; not proof). Hardware checked clean: zero ECC,
+zero row-remap, no fresh Xids (GPU2/PCI 06:1B logged an Xid 13 warp
+exception at 01:33 during earlier kernel dev; correlation with the first
+failing quartet may be coincidence given the 4-7 NCCL failure).
+
+Suspected mechanism: one NaN-class step emits token 0 via the sampler's NaN
+guard; a BOS token in context self-sustains at temperature 0; the poisoned
+sequence's KV blocks return to the pool unzeroed and the instance never
+recovers, implying a pool/graph-replay reuse path that lets stale garbage
+reach live sequences. The prime suspects are the spec-decode verify path
+interacting with full-decode graph replay and the async aux streams
+(indexer/MLA compressor overlap), not the reduce collectives themselves.
+
+### Retractions and corrections
+
+- Yesterday's deployed-sweep c16/c32/c64 rows (732.4 / 925.3 / 1023.8,
+  acceptance 5.72-5.88) are retracted as capacity claims: acceptance within
+  2% of the degenerate signature says those runs were substantially
+  BOS-degenerate, on top of the sonnet.txt same-source confound. c1-c8 rows
+  (acceptance 3.53-4.24) remain plausible.
+- Same-source confound quantified separately: single-instance c32 on fresh
+  diverse text = 666.6 tok/s at acceptance 4.52 vs 925.3 at 5.88 on
+  overlapping sonnet windows.
+
+### Valid capacity data (healthy acceptance 3.9-4.6, both instances under
+
+### simultaneous load, per-instance cells)
+
+| conc | per-instance tok/s (valid cells) | est. healthy box total |
+| ---: | --- | ---: |
+| 16 | 477-566 (B/cAR), 534-582 (A/NCCL) | ~1050-1150 |
+| 32 | 635-686 | ~1300-1370 |
+| 64 | 684-788 | ~1400-1550 |
+
+No single sweep row yet has both instances simultaneously healthy end-to-end
+(each sweep had one instance degenerate); the box totals are sums of valid
+per-instance cells from different runs under equivalent contention, labeled
+estimates. c1 per instance (NCCL boot, fresh text): 137.0 at acc 3.12 and
+201.2 at acc 4.56 - content-dependent acceptance dominates c1 variance.
+
+### Hardening landed
+
+- `benchmarks/benchmark_dsv4_exact.py` now records per-request
+  `chars_per_token` and hard-fails a run when any response decodes below
+  0.5 chars/token, so a degenerate server can no longer post a record.
+- Benchmark protocol: every run draws a never-served disjoint token region
+  (window overlap and repeat-request caching both inflate acceptance).
+- `slimserve-canary.timer` (5 min): long-prompt 60-token probe against both
+  daemons; restarts an instance whose output decodes below 60 chars. The
+  first (short-prompt) canary version missed partial degeneration - poisoned
+  instances still emit ~28 good tokens on short prompts.
+
+### Open (top priority, blocks perf work on this profile family)
+
+1. Root-cause the race. Next discriminators: FULL->PIECEWISE graphs at TP4
+   with spec (many runs); spec with turboquant draft KV -> auto draft KV;
+   aux-stream overlaps disabled; zero freed KV blocks as a diagnostic.
+2. The defer-off acceptance collapse (1.11) says the drafter consumes
+   deferred-path state unconditionally; fix the fallback.
+3. TP8 tiers use the same spec+full-graph machinery across all 8 GPUs;
+   treat their qualification numbers as exposed to the same risk until the
+   race is fixed.
+
+Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` (51 files:
+every benchmark JSON incl. degenerate runs, server logs for the manual
+TP4/TP2/no-spec/defer-off boots).
+
+## 2026-08-11 - Degeneration race: overnight bisection session 2
+
+### Conclusions that DIED tonight (each looked solid on 1-2 boots)
+
+1. "Custom allreduce is the culprit" - disproven yesterday (B stormed on
+   NCCL), reconfirmed dead tonight.
+2. "GPU 6 hardware fault" - {0,1,2,6} stormed while {0,1,2,7} was clean,
+   twice, and GPU 6 sits on the PCI address that logged an Xid 13 warp
+   exception during the 08-10 01:33 crash. But after a full driver+fabric
+   reload the same {0,1,2,6} cell was clean AND instance A stormed on
+   {0,1,2,3}. ECC/row-remap/NVLink counters clean throughout.
+3. "Driver reload fixed it" - A stormed minutes after the reload.
+4. "The eager fallback above capture-64 is the trigger" - NaN events
+   occur at c10 (60 rows, graphed) and c11 (66 rows, eager) alike.
+5. "persistent_topk (<=32-row dispatch) is the source" - forced-arm test
+   INVERTED it: force-persistent boot clean (8 NaN lines), force-Filtered
+   boot stormed (4,038 lines, 11/11 degenerate). But a later force-Filtered
+   boot was clean and an aux-overlap-off boot stormed, so single-boot arm
+   comparisons are worthless (see 7).
+6. "Aux-stream overlap race" - VLLM_DSV4_INNER_ATTENTION_OVERLAP=0
+   stormed.
+7. THE ACTUAL INVARIANT SO FAR: whether a boot storms is decided at (or
+   near) boot time - a boot lottery - and persists for that boot's
+   lifetime. Configuration changes appeared causal only because each arm
+   was sampled once. Storms never appeared at c1-c8 across ~50 runs; they
+   appear on roughly half of boots under c11+ spec verify load. The
+   original quartet-migration pattern was the same lottery sampled through
+   daemon restarts.
+
+### What survived scrutiny
+
+- The failure chain: NaN logits row -> sampler guard emits token 0 -> BOS
+  self-sustains at temp 0 -> request poisoned; poisoned requests recur as
+  NaN rows in later batches; instance-wide collapse follows.
+- DSpark speculation (next_n>1) is required; no-spec and TP2/PIECEWISE
+  cells never stormed (limited n, but consistent).
+- Kernel-level A/B: both persistent_topk and FilteredTopK pass a hostile
+  unit test (5,760 rows, NaN/inf/3e38-poisoned tails beyond each row's
+  length, lengths 513-3100, rows 1-96) - the top-k selection logic is
+  sound against uninitialized-tail input in isolation.
+- Serving-side rare NaN events (1-3 per boot) cluster at SMALL batches
+  (7-11 rows, ramp/drain) even on clean boots.
+
+### Instruments now landed (all default-off, env-gated)
+
+- VLLM_NAN_WATCH=1: async per-step NaN-row tripwire on target logits in
+  both model runners (V2 `vllm/v1/worker/gpu/model_runner.py` is the one
+  serving actually uses). One small reduction per step, detection lags one
+  step, no hot-path sync.
+- VLLM_DSV4_TOPK_VALIDATE=1: same pattern at the corruption source -
+  decode top-k indices checked against per-row seq_lens in
+  sparse_attn_indexer; an out-of-range index means sparse attention will
+  gather garbage KV.
+- VLLM_DSV4_FILTERED_TOPK_MIN_ROWS: env-tunable dispatch threshold in
+  csrc/libtorch_stable/topk.cu (default 32 = production heuristic; 0
+  forces FilteredTopK, huge forces persistent) for forced-arm testing.
+- Both production daemons run with VLLM_NAN_WATCH=1 permanently.
+
+### In flight
+
+Six-boot campaign (production config, dual tripwires, 2x c11 trigger runs
+per boot) for powered per-boot statistics: storm rate, and whether
+TOPK_VALIDATE violations precede NAN_WATCH events inside storm boots.
+Raw: `perf/results/2026-08-10/dsv4-degeneration-incident/` plus
+`/var/log/SlimServe/ss-camp*.log`.
+
+### 2026-08-11 - Campaign results, FULL arm (6 boots, production config)
+
+| boot | degenerate reqs | NaN lines | top-k violations |
+| ---: | ---: | ---: | ---: |
+| 1 | 0 | 0 | 0 |
+| 2 | 0 | 8 | 0 |
+| 3 | 0 | 8 | 0 |
+| 4 | 22/22 | 1348 | 0 |
+| 5 | 22/22 | 1344 | 0 |
+| 6 | 0 | 4 | 0 |
+
+Storm rate 2/6. Two decisive facts:
+
+1. ZERO top-k violations in 6 boots INCLUDING both storms: every decode
+   top-k index stayed within [-1, seq_len). The corruption does not enter
+   through out-of-range indexer indices. The NaN arises in the value
+   path - attention gather/reduction over cache contents, MoE, or the
+   mHC/Q8 pipeline - consistent with reading unwritten pool memory
+   (split-K partials or unwritten KV slots), which is also the only
+   mechanism found so far that naturally produces a per-boot lottery.
+2. Storm onset is CONTAGION: both storms ignite from a 1-row event and
+   spread to 54/56 rows within two steps. A NaN crosses requests almost
+   instantly, implicating shared state: APC-shared prefix blocks (the
+   trigger loads use overlapping windows), the KV block pool, or a
+   step-global buffer. Clean boots show the identical warmup-phase burst
+   (1/8 at step 6, 6/14 at step 7 - byte-identical on camp2 and camp4)
+   and recover, so the warmup burst alone does not decide the storm.
+
+Next instruments: per-row request-id logging on NaN events (to trace the
+contagion path), and a NaN probe at attention-output vs MoE-output to
+bisect the layer pipeline. PIECEWISE arm in flight.
+
+### 2026-08-11 - Row-index fingerprints: the seam pattern
+
+With NaN row indices logged, the rare events stop looking random:
+`1/7 rows=[5]` at step 6 AND at step 545 (same boot, pw2), followed once
+by `6/14 rows=[0-5]` (the first request's entire verify window one step
+later). A 7-row decode batch is a request seam - one request with 6
+spec-verify rows plus one with a single row - i.e. mixed decode_lens,
+the `requires_padding` pack_seq_triton path in sparse_attn_indexer. The
+FP8 branch packs Q with NO pad_value (the MXFP4 branch was given
+pad_byte=0 precisely "so padded slots dequantize to 0 and can't produce
+NaN/Inf in the logits kernel" - the FP8 branch kept the assumption that
+"downstream context_lens masks stale slots"). Uninitialized fp8 pad
+bytes can encode NaN, and whether the recycled allocator memory behind
+the pad slots is hostile is decided per boot - the first mechanism
+found that produces BOTH the positional determinism (last row at a
+seam) and the boot lottery. PIECEWISE boots show the same rare seam
+events without storms so far; the storm-contagion step remains to be
+traced (APC-shared blocks / pool reuse suspected).
+
+Next concrete reproducer: two staggered requests forming the 6+1 batch
+shape, with seq_lens / packed-Q / unpacked-index instrumentation at the
+seam; and give the FP8 pack a pad_value=0 like the FP4 branch, then
+re-run the FULL-arm campaign as the fix candidate.
+
+### 2026-08-11 - Seam theory corrected
+
+Three corrections from direct testing:
+
+1. torch's fp8e4m3fn cast SATURATES +-inf to +-448 (verified on device),
+   so pack_seq_triton's default -inf pad is not a NaN generator via the
+   torch cast.
+2. More decisively: Triton on sm80 cannot compile _pack_seq_kernel for
+   fp8e4m3 AT ALL ("type fp8e4nv not supported in this architecture") -
+   the requires_padding decode path would crash the server if it ever
+   executed, and it never has. That path is dead code on A100 serving:
+   decode batches are always uniform next_n; short requests route
+   through the prefill chunks instead.
+3. Therefore the 7-row NaN batches (rows=[5] fingerprint) are
+   decode+PREFILL mixes: one spec request's 6 verify rows plus a
+   prefilling request's final chunk row. The suspect surface moves to
+   the decode/prefill interaction inside sparse_attn_indexer - the
+   shared topk_indices_buffer and gather workspace partitioning - or
+   the mixed-batch handling in the sparse MLA forward itself.
+
+The two seam fixes landed anyway as prophylactics (per-request
+decode_len anchoring + zeroed pad lengths + pad_value=0), all no-ops
+for the workloads this box actually runs. Next reproducer: one
+long-prefill request submitted mid-decode of one spec request, dual
+tripwires armed - the minimal decode+prefill mix.
+
+### 2026-08-11 - Campaign verdict and production mitigation
+
+PIECEWISE arm: 0 storms / 6 boots (rare seam events on 5 of 6 boots,
+0-16 NaN lines, zero top-k violations, zero degeneration). FULL arm:
+2 storms / 6 boots. Honest statistics: 2/6 vs 0/6 alone is Fisher
+p~0.23 - not significant by itself. Pooled with the full incident
+record (every storm across the 08-10/08-11 investigation was a
+FULL_DECODE_ONLY boot, ~10+ storms across ~20 such boots; zero storms
+in any PIECEWISE or TP2 boot ever), the direction is strong, and the
+QuixiCore sparse-MLA builder's own TODO independently says FULL graphs
+need buffer-persistence work this backend never received.
+
+Clean-run throughput cost of the mitigation (solo c11): 463.1 -> 409.1
+(-12%). Under production dual-instance c16 load the cost is smaller:
+A 530-534 / B 488-490 tok/s, healthy acceptance 4.35-4.45, both
+instances clean, zero NaN events on fresh boots.
+
+MITIGATION APPLIED: all four A100 dsv4 tiers (q4ktail-4/8, mxfp4-4/8)
+now serve PIECEWISE capture-32 (profile notes reference this entry).
+The capture-64 c8 gains recorded on 2026-08-10 (UPDATE 3) are
+deliberately given back until the race is fixed. Both daemons
+restarted on the mitigated profile and verified.
+
+OPEN root-cause work (P0, task #4): (a) the rare seam NaN events -
+positionally deterministic (last verify row at decode+prefill mixed
+batches, rows=[5] of 7) - occur under BOTH graph modes and remain
+unexplained; reproduce with one long prefill submitted mid-decode of
+one spec request, tripwires armed, then bisect attention-out vs
+MoE-out. (b) The storm contagion (1 row -> 54/56 rows in two steps)
+appears FULL-graph-gated; trace with per-request NaN row logging once
+(a) is understood. (c) The ROCm-parity buffer-persistence work in
+QuixiCoreMLASparseMetadataBuilder is the condition for re-enabling
+FULL graphs, followed by a clean 6-boot tripwire campaign.
+## 2026-08-10 - Metal dsv4-xxs-1 256K Resize, Path Repairs, Indexer Blocker
+
+- Status: profile resized and partially validated; four retained fixes; one
+  retained diagnostic gate; long context blocked on a missing Metal kernel
+  family. Not a performance change; no throughput claims.
+- Baseline: the Metal profile served max_model_len 3072 with a fixed 1 GiB KV
+  pool, tuned for the exact 1k-in/2k-out matrix (33.684 tok/s c1, 35.350 c8
+  in perf/baseline_status.md). Real (agentic) use needs 256K context, and the
+  benchmark-shaped cap had hidden that most of the long-context path had never
+  executed on Metal.
+- Change (profile): metal override of dsv4-xxs-1 now sets max_model_len
+  262144 and kv_cache_memory_bytes 17179869184 (16 GiB). Planner verifies
+  2,225,562 logical KV tokens (~8.5x one full 256K request; ~7.7 KB per
+  logical token all-in for the 43-layer fp8_ds_mla target cache plus indexer
+  and 3-layer TurboQuant draft cache). Weights 80.8 + 6.5 GiB plus the pool
+  is ~103 GiB against the ~115 GiB working set of the 128 GiB M5 Max.
+- Found and fixed (all latent breakage from the A100 prequant/sampler work
+  landing without the Metal path being re-exercised; current main crashed on
+  the FIRST request at any context):
+  1. DeepseekV4MetalAttention.forward lacked the new prequant_input
+     parameter (vllm/models/deepseek_v4/metal.py) -- accepts and forwards.
+  2. attn_gemm_parallel_execute called torch.cuda.is_current_stream_capturing
+     unconditionally (attention.py multi-stream enable) -- raises on MPS
+     builds; guarded with current_platform.is_metal() so ROCm (HIP torch.cuda,
+     real graph capture) keeps exact behavior.
+  3. DeepseekV4TurboQuantDraftAttention.forward (amd/dspark_turboquant.py)
+     had the same stale signature -- accepts and ignores, per the module's
+     existing del pattern.
+  4. rejection_sample's MPS branch was greedy-only; any temperature > 0 fell
+     through to a nonexistent Triton kernel. Added a torch implementation of
+     full rejection sampling (ratio accept, residual-mass resample, bonus
+     token; sample-and-match when draft logits are absent), following the
+     gumbel_sample MPS precedent (torch randomness; no Philox seed parity).
+     Consequence: Metal spec decode only ever worked for greedy harness
+     traffic; a default-temperature client always crashed.
+- Diagnostic gate (retained until measured): turboquant_attn.py's new
+  _MAX_SLIDING_WINDOW_KV_SPLITS clamp (32 -> 16 on sliding-window layers) is
+  gated off on Metal; the QuixiCore Metal decode kernel is only validated at
+  32 splits, and the clamp landed with the A100 work between the last-good
+  Metal commit (209265933) and now. Untested as the spec-hang cause; see open
+  items.
+- Correctness result (no-spec, fresh boot, port 8077): cold default-temp
+  smoke returned exactly the requested string after 1651 s (one-time cold MPS
+  pipeline compile; ~28 min); warm greedy '42' in 28 s; warm temp-0.7 in
+  172 s. All with correct content and token counts.
+- Long-context result: a ~25K-token needle prompt crashed the engine inside
+  its FIRST 2048-token prefill chunk (prompt_tokens_total never advanced):
+  fused_indexer_q_rope_quant launches a Triton kernel, and Metal has no
+  Triton. The Triton call predates the A100 work -- the sparse-MLA indexer
+  chain (fused_indexer_q_rope_quant, _fill_short_context_topk_indices, the
+  compressor's indexer-cache insert ordering, and indexer_op fp8 scoring +
+  topk) has NEVER had a Metal implementation. The old 3072 cap kept every
+  request below the indexer engagement length, which is why the 1k/2k
+  baseline never saw it. This is the blocker for 256K on Metal: port the
+  indexer chain from the ROCm reference into csrc/quixicore metal serving.
+- Open item (spec decode): with fixes 1-4, the first spec verify step stalled
+  >= 35 min at 13 prompt + 1 generated tokens, main thread blocked in
+  .cpu() -> MPSStream sync -> MTLCommandBuffer waitUntilCompleted (native
+  stack in raw artifacts). The subsequent no-spec run showed cold compile
+  alone is ~28 min, so the stall may have been cold compile of target plus
+  drafter pipelines rather than a true deadlock. Re-test spec decode with the
+  32-split gate in place and a >= 60 min first-request budget before
+  concluding deadlock. Note: vLLM retitles processes (VLLM::APIServer /
+  VLLM::EngineCore); kill by port owner, not by "slimserve" pattern, or a
+  zombie API server holds the port with a dead engine.
+- Decision: retain the profile sizing and fixes 1-4; retain the splits gate
+  as a documented diagnostic; do not claim 256K serving until the indexer
+  chain runs on Metal and the spec path is re-validated. Next commands:
+  port fused_indexer_q_rope_quant + indexer_op to the Metal QuixiCore
+  serving lib (reference: ROCm path + csrc/quixicore/tm_rocm), then
+  `slimserve dsv4-xxs-1 --serve -y` and rerun the staged validation with the
+  25K needle and a genuine 200K+ request.
+- Raw artifacts: perf/results/2026-08-10/dsv4-metal-256k-real-use/
+  (serve logs 1-6, no-spec log, native stack sample of the stalled step,
+  staged validation transcript).
+
+## 2026-08-10 - Muse-Glimmer-30B: New Model Family Bring-Up On Metal (muse-kdyn-1)
+
+- Status: text serving VALIDATED end to end on Metal with DFlash speculation
+  and the muse reasoning parser; vision executes end to end but produces
+  spatially/chromatically scrambled descriptions (in progress); profile
+  registered; two Metal gaps closed on the way.
+- Scope: meta-models/Muse-Glimmer-30B-GGUF (kquant-dynamic default,
+  kquant-17gb alternative, mmproj vision tower, DFlash drafter). Arch was in
+  NO local stack (fork, upstream vLLM, mainline llama.cpp). References used:
+  transformers commit fe95f5423d (merged 2026-08-10) and llama.cpp PR 26841
+  (fetched as ~/llama.cpp branch muse-pr; llama-completion built in
+  build-muse/ and used as the working reference).
+- New support written (all in this repo):
+  - Config/tokenizer: gguf_muse_glimmer.py builders (text+vision+dflash),
+    parser dispatch by `dflash.expert_count` presence, llama4 (GPT-4o)
+    pretokenizer split, MuseGlimmerConfig.
+  - Models: muse_glimmer.py (dense 52L, GQA 32/2, QK-norm with GGUF-baked
+    qk_scale 3.87, sigmoid-gated attention, sandwich norms with
+    post_norm_eps 1e-8, [local x3, global] pattern, RoPE theta 500k
+    INTERLEAVED (llama.cpp NORM type; the conversion un-permutes HF Q/K) on
+    local layers only, NoPE globals, scale-then-softcap logits, and the
+    WEIGHTLESS EMBEDDING RMSNORM from llama.cpp muse-glimmer.cpp:74 -- the
+    final root cause of degenerate output; raw embedding RMS is ~0.06);
+    muse_glimmer_dflash.py (stock DFlashQwen3 shape + torch-native context-KV
+    precompute for MPS + shared target embed/lm_head); vision tower +
+    3-linear projector + single-tile 896 processor in muse_glimmer.py.
+  - Loader: MuseGlimmerGGUFAdapter (+dflash variant) with explicit name
+    maps; embedding table dequantized to fp16 at load (~2.7 GiB) because
+    Metal has no generic GGUF dequant kernel (binding the vendored
+    dequant_gather shader is the follow-up).
+  - Reasoning parser `muse_glimmer` for the Harmony-like
+    `<|start|>assistant to=self<|message|>` format.
+- Metal gaps closed:
+  - Sliding-window attention wired: the vendored paged_attn_v2 shader
+    already had `window` support; the binding hardcoded 0. Extended
+    qc_metal_serving.mm + ops.py + metal_attn.py (kernel window on decode,
+    banded mask + window-clamped gather on SDPA; gather also stops reading
+    hybrid-manager-freed blocks)._quixicore_C rebuilt.
+  - METAL_ATTN added to AttentionBackendEnum (first plain-Attention model on
+    this backend).
+  - apply_temperature torch fallback for MPS (sampler stage DSV4 never hit).
+  - Multimodal pin_memory disabled under MPS at the reduce_data choke point
+    (pin_memory() raises storage-device mismatch on the MPS backend).
+  - Profile guards: kv_cache_dtype MUST be "auto" (fork default fp8_e4m3
+    has no Metal path); gpu_memory_utilization null at base level breaks
+    slimserve arg rendering (removed).
+- Debug method that found the embedding-norm root cause: tokenize parity
+  (identical ids), Q5_K/Q6_K/Q4_K qgemv parity vs numpy dequant (cos=1.0,
+  kernels exonerated), layer-0 tensor-sum parity vs llama-eval-callback
+  (matched), then graph diff exposed `embd_norm`. Offline greedy now
+  produces 'The capital of France is Paris. ...'.
+- Serving validation (port 8078, spec on): cold 'muse glimmer ok' (21 s incl
+  first compile), warm greedy '42' 7 s, temp-0.7 runs (reply consumed by
+  reasoning channel under small max_tokens -- parser behavior, not a bug).
+  Image request: 1092 prompt tokens (68 text + 1024 image, single-tile
+  geometry as designed), completes without crash.
+- OPEN (vision correctness): red-bg/blue-circle test image is described with
+  wrong hues/shape ('blue, green, yellow irregular shape'). Numerics are
+  alive (pixel channels correct into the tower, outputs position-varying,
+  projected std 1.02 vs text 0.06 -- rebalanced by the embedding norm).
+  Suspect patch-embed weight axis order or the 2x2 merge/position-embed
+  geometry vs llama.cpp's clip implementation. Next: diff tower layer-0
+  against llama.cpp mtmd on the same image; test BGR/axis-flip hypotheses.
+- OPEN (minor): spec_decode_num_drafts_created metric emits a unix
+  timestamp; drafter acceptance-length not yet measured; temp-0.7 needs a
+  larger-budget clean check; dynamic-aspect (smart_resize) preprocessing
+  still single-tile square; TurboQuant draft KV not configured.
+- Perf snapshot (not tuned): warm greedy short reply ~7 s wall including
+  ~50-token reasoning channel. No exact-token benchmark run yet; README
+  reference for this box: 26.6 tok/s no-spec / 50.2 with DFlash (llama.cpp/
+  ExecuTorch measurements).
+- Raw artifacts: scratchpad muse-serve.log, muse_probe.py, muse_variants.py,
+  muse_layer0.py, muse_qparity.py, muse_vision_probe.py, muse_mm_gen.py;
+  llama.cpp reference at ~/llama.cpp (branch muse-pr, build-muse/bin).
+
+## 2026-08-10 - Muse-Glimmer Vision Root-Caused And VALIDATED (muse-kdyn-1)
+
+- Status: text AND image serving validated end to end through the OpenAI API
+  on Metal with DFlash speculation and the muse reasoning parser. The
+  registered profile is live.
+- Vision root cause (via llama.cpp PR 26841's clip implementation,
+  tools/mtmd/models/muse-glimmer.cpp + clip.cpp set_input): the tower is NOT
+  a plain ViT. It uses (a) 2D RoPE theta 10000 on every layer -- first half
+  of head_dim rotated by 1-indexed width position, second half by height,
+  GPT-J interleaved pairs per half; (b) sparse block-diagonal WINDOW
+  attention over 32x32-patch windows with every 4th (1-based) and the last
+  layer global; (c) window-order permutation around the block stack; and
+  (d) a channel-outer pixel shuffle: the 6144 projector input is
+  [c0s0..c0s3, c1s0..] (spatial fastest), the transpose of the naive
+  per-patch concat. Before these, solid red and green were both described
+  as "olive-brown"; after, red/green/blue solids are named correctly and
+  the red-bg/blue-circle image is described as "A blue oval sits on a red
+  background" (oval, correctly: the single-tile square resize stretches the
+  4:3 test image; llama.cpp's aspect-preserving smart_resize is the noted
+  follow-up).
+- Server validation (staged, port 8078): cold 'muse glimmer ok' 22 s
+  (first-compile inclusive), warm greedy '42' 7 s, image reply 21 s at 1092
+  prompt tokens (68 text + 1024 image). No engine errors across the run.
+- Remaining open items (unchanged from previous entry): exact-token
+  performance benchmark (README reference for this box: 26.6/50.2 tok/s),
+  spec acceptance-length measurement + the timestamp-poisoned
+  spec_decode_num_drafts_created counter, smart_resize dynamic-aspect
+  preprocessing, TurboQuant draft KV, ATEM tool-call parser.
+
+### 2026-08-11 - Mixed-batch reproducer: negative on one boot
+
+Two phases against one PIECEWISE boot with all three tripwires plus the
+new per-layer birth probe (VLLM_NAN_WATCH_LAYERS): (1) one continuous
+spec-decode stream + 160 sequential 24K-token chunked prefills (the
+exact 6+1 batch shape of the historical rows=[5] events); (2) four
+staggered spec-decode streams + 115 more prefills (7-35-row shapes).
+~70 minutes, zero NaN events, zero top-k violations, no degeneration.
+
+Interpretation is deliberately weak: this is ONE boot of a bug whose
+expression is decided per boot - the same trap that killed six theories.
+The mixed-batch shape hypothesis is unproven, not disproven. Rather than
+burn more boots on the rare-event hunt in isolation, the 8-boot
+FULL-graph validation campaign for the bt_per_token persistence fix
+(commit 0a3163da6) doubles as the rare-event sampler: every boot runs
+the birth-layer probe, so any event that fires during validation names
+its layer for free. Success criterion: 0/8 storms (pre-fix FULL stormed
+2/6) keeps FULL graphs on the table for restoration; any storm sends
+the campaign logs - now with per-layer birth data - into the next
+analysis round.
+
+### 2026-08-11 - Birth attribution: layer 0 input; kernel exonerations
+
+Intra-layer probes (vfix boots 1-3, two independent boots pre-refinement
+plus one with phase slots) place the NaN at LAYER 0'S ATTENTION INPUT
+(slot 100) with attention and MoE outputs clean - the attention guards
+and Q8 quantization launder NaN to zeros while the residual stream
+carries it to the head. Births are exclusively at <=8-row steps
+(rows=[5] of 7, 1/8); the 11-35-row sightings are carry-forward.
+The <=8-token gate exactly matches _norm_with_prequant's fused
+ggml_dsv4_rms_norm_q8_1 path.
+
+Hostile unit tests then EXONERATED each isolated component of the
+layer-0 input chain on this GPU: dsv4_mhc_pre (70 cases x 3 outputs,
+NaN/inf/huge pools, zero/tiny rows), ggml_dsv4_rms_norm_q8_1 (192
+hostile-pool cases, T=1-8), plus persistent_topk and FilteredTopK
+earlier (5,760 rows each). torch.index_select bounds-asserts, so a
+stray -1 token id cannot silently junk-read the GGUF embedding. The
+birth is therefore in INTEGRATION - graph replay, TP collectives, or
+the aligned-Q8/prequant interplay - not in any kernel in isolation.
+
+Method upgrade: the step-6 warmup event fires on most boots, so short
+runs (300 output tokens) make single boots informative at ~4 min/boot.
+Queued arms (3 boots each): baseline env, ALIGNED_Q8=0,
+PREQUANT_ATTN=0, AUX_STREAMS=0. Note the prior "env-less boots show
+zero events" observation is VOID - those boots predate the V2-runner
+tripwire hook; no instrumented env-less boot exists yet.
+
+### 2026-08-11 - vfix campaign verdict: 8 boots, 0 storms
+
+FULL_DECODE_ONLY capture-64 WITH the bt_per_token persistence fix
+(commit 0a3163da6): 8 boots, identical trigger protocol to the pre-fix
+campaign, ZERO storms (pre-fix: 2/6). Fisher p~0.17 alone; combined
+with the fix being mechanism-directed at the builder's documented
+persistence gap, the storm path is plausibly closed. Rare seed events
+persist unchanged (~2 per boot, 5 of 8 boots, always <=8-row births,
+zero top-k violations) - consistent with the fix addressing storm
+amplification, not the seed. The documented bar for restoring FULL
+graphs (persistence work + clean 6-boot campaign) is met; restoration
+decision deferred until the env arms attribute the seed, since the
+same boots serve both purposes.
+
+### 2026-08-11 - FULL graphs restored to production; seed campaign phase-blocked
+
+Env attribution campaigns: the short-run pilot (base arm only, 1 event
+in 3 boots) showed the 300-token protocol is underpowered; the focused
+full-length campaign (4 boots baseline vs 4 boots VLLM_DSV4_ALIGNED_Q8=0,
+interleaved) ran 8/8 boots with ZERO events in either arm - the box
+entered a dormant phase mid-investigation (the same hours-scale drift
+seen throughout). Uninformative by design rather than misleading; the
+runbook in perf/diagnostics/dsv4-nan/README.md says to fire
+campaign_env2.sh when production NAN_WATCH shows events again.
+
+Production decision: the documented restoration bar (bt_per_token
+persistence fix + clean multi-boot FULL campaign) is met - 0/8 storms
+vs 2/6 pre-fix. All four A100 dsv4 tiers are back on FULL_DECODE_ONLY
+capture-64 (+12% c11 over PIECEWISE); both daemons restarted and
+NAN_WATCH stays on permanently, with the canary as the last line.
+The rare sub-critical seed (single-token quality blips, both graph
+modes, layer-0-input births at <=8-row batches, all kernels exonerated
+in isolation) remains OPEN at reduced priority now that storms are
+closed and detection is standing.
+
+Cross-stream test repairs (Metal session collisions on main): muse-glimmer
+added to the supported-sources set; dsv4 metal 256K resize reflected
+(max_model_len 262144, 16 GiB KV); the dspark/TQ invariant now reads
+each source's registered speculator method (muse uses DFlash k=16);
+tool_call_parser required for all families except muse-glimmer, which
+has no tool parser in this fork (auto tool choice no-ops without one).
+
+### 2026-08-12 - Seed attribution: active-phase arms + id evidence
+
+Three-arm discriminator during an active phase (3 boots each,
+interleaved, full-length runs): async-mHC baseline 6 events, monolithic
+mHC schedule 6, NCCL-only collectives 2. All arms fire - the mHC
+async-split machinery and the custom allreduce are BOTH exonerated as
+required components of the seed.
+
+Input-id probe evidence (first captured birth with ids): the birth
+row's input token is a NORMAL id (4042) in a batch of normal ids -
+the OOV/zero-embedding theory is dead; the NaN is computed, not fed.
+One step later the poisoned request's whole verify window carries
+input ids [0,0,0,0,0,0]: the sampler guard emitted token 0, the
+drafter drafted BOS five deep - the within-request contagion loop
+observed directly. And rows=[5] holds across batch sizes 7, 8, AND 11:
+a fixed memory offset, not a shape tail - consistent with a scribbled
+allocation (cross-stream caching-allocator hazard) at a per-boot-fixed
+address, which would also explain the boot lottery and why every
+kernel is clean in isolation.
+
+In flight: loop-until-capture with the full probe suite (input ids,
+slot 98 = raw embedding output, slot 99 = post-hc-expand, slot 100+ =
+intra-layer). Slot 98 lit => corruption precedes all layer math
+(allocator/scribbler hunt); 98 dark + 100 lit => born in hc_pre/norm
+under real weights (offline repro with dumped weights).
+
+### 2026-08-12 - Full-probe capture: the values are innocent
+
+Loop-until-capture landed a birth on its first run with the complete
+suite. Verdict chain:
+
+- Slot 98 (raw embedding output): CLEAN. Slot 99 (post hc-expand):
+  CLEAN. Slot 100 (attention input, after hc_pre + norm): NaN, row 5,
+  input id 989 (normal token).
+- Offline exact replay of that batch - REAL layer-0 hc weights
+  extracted from the GGUF (fp16 fn, scale [2.077, 0.0195, 0.238],
+  base range -30.1..9.9), REAL embedding rows of the exact captured
+  ids, REAL config (sinkhorn_iterations=20, eps=1e-6) - is
+  BIT-IDENTICAL to the fp32 torch reference: maxdiff 0.0, zero NaN.
+- Also exonerated offline: the fp16-fn template (630 outputs), the
+  poisoned-allocator regime for the op's internal buffers (210 calls),
+  20-iteration/1e-6 sinkhorn (216 outputs).
+
+Conclusion: the deterministic math on the true inputs is clean, so the
+serving buffer feeding hc_pre did not hold the true values at compute
+time - a CONCURRENT WRITER modifies a main-stream tensor in the window
+between adjacent kernels (slot-99 probe read clean; hc_pre/norm's
+input or output was then scribbled before slot-100's read). Every arm
+tested so far (async/mono mHC, custom-AR/NCCL) shared one async
+machinery: the attention aux streams (VLLM_DSV4_AUX_STREAMS, default
+on, three streams driving attn_gemm_parallel_execute overlap) - never
+isolated with full-length instrumented runs. Aux on/off campaign in
+flight (4 interleaved rounds).
+
+### 2026-08-12 - record_stream fix is not the seed; graphs arm running
+
+vfx2 (fixed helpers, aux on) fired with the identical fingerprint
+(rows=[5], normal input id 343, slots 98/99 clean, 100 NaN). The
+multi-stream record_stream repair stands as a genuine hazard-class fix
+but is NOT the seed mechanism, and the aux on/off 2-2 split is demoted
+to lottery-suspect (n=2 per arm).
+
+Revised leading theory: under FULL graphs everything shares the
+capture-time graph memory pool, and BOTH observed birth sites (the
+hc_pre/norm window at layer 0, and inside layer-2 attention at slot
+109 - present in two independent captures) would follow from ONE
+missing cross-stream event edge during capture letting the pool alias
+two live buffers. Replay then scribbles at a pool-layout-fixed offset:
+the boot lottery IS the capture-time pool layout, and record_stream is
+irrelevant inside graph pools. Every seed event observed with step
+data sits on a replayed decode step (6, ~540). Discriminator running:
+FULL vs NONE (all-eager) interleaved, 3 rounds, active phase.
+
+### 2026-08-12 - Graphs eliminated; aux-off at 3/3 silent
+
+gnone1 (cudagraph_mode NONE, fully eager target) fired with the
+standard fingerprint: CUDA graphs are NOT required - the graph-pool
+aliasing theory dies alongside its predecessors. Note the drafter kept
+its own FULL graphs in that boot (dspark captures independently), and
+spec decode itself remains never-seed-tested, as does ALIGNED_Q8 in an
+active phase - the final arms campaign covers exactly those two plus
+baseline, interleaved.
+
+The straggling aux campaign delivered auxoff3 silent: aux-off is now
+3/3 silent vs unfixed aux-on 2/2 firing. Since vfx2 showed the
+record_stream (returned-tensors) repair does not stop the seed, if
+aux-off genuinely suppresses it the channel is aux-stream-adjacent but
+in another direction (inputs, or the shared workspace manager regions
+consumed from both main and aux streams). Aux-off also stands as a
+candidate production mitigation at the cost of the attention-overlap
+perf if the final arms leave the mechanism unresolved.
+
+### 2026-08-12 - Seed endgame: overlap disabled, faster AND silent
+
+Final arms (active phase, baseline firing every round): no-spec is
+CONFOUNDED (routes through the legacy model runner entirely - and
+produced whole-batch NaN storms, a separate expression to investigate
+on that runner) and ALIGNED_Q8=0 FIRES (6 events) - exonerated. The
+elimination matrix is complete: the ONLY component whose removal
+silences the seed is the multi-stream attention projection overlap
+(VLLM_DSV4_AUX_STREAMS=0: 3/3 boots silent in active phases).
+
+Structure finally explains the fingerprints: the overlap enables at
+<=VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD (1024) tokens AND not during
+capture - under FULL graphs, pure decode steps replay captured SERIAL
+projections while mixed decode+prefill seam steps run EAGERLY with the
+overlap live; those eager seam steps are exactly where every FULL-mode
+birth sat. The race itself resists isolation: the GEMV op is canary-
+clean in isolation, and a 20k-iteration standalone execute_in_parallel
+repro with the real ops never fired - TP4 collectives/drafter/allocator
+churn are needed, so root cause remains open at the concurrency level.
+
+DEPLOYED: VLLM_DSV4_AUX_STREAMS=0 on all five A100 dsv4 tiers. Measured
+FASTER with it off: clean-run c11 means 458.1 (aux-off, n=4) vs 426.7
+(aux-on, n=12) - the overlap was a net loss at seam widths anyway.
+Open root-cause thread: extend overlap_repro.py with TP + drafter
+interleave; the no-spec legacy-runner whole-batch NaN storm.
+## 2026-08-11 - Muse-Glimmer Optimization Pass 1: +75% no-spec decode
+
+- Status: two retained fixes, one retained tuning decision, bottlenecks for
+  the next pass measured and named.
+- Method: 256-token greedy decode via the API (78-token prompt, 3 runs after
+  a warmup, wall-clock over exact completion_tokens; harness and raw runs in
+  perf/results/2026-08-11/muse-optimization-pass-1/). In-process layer-chain
+  and per-op timings with torch.mps.synchronize fences.
+- Baseline (pre-pass): spec-on 7.65 tok/s, no-spec 7.34 tok/s. Speculation
+  was a wash. Reference for this box (llama.cpp/ExecuTorch, model card):
+  26.6 no-spec / 50.2 with DFlash.
+- Profiling: a decode step spent 104.8 ms of its 137 ms inside the 52-layer
+  matvec chain. Per-op timing pinned the anomaly: qkv_proj took 447 us for
+  ~17.5 MB of weights (39 GB/s) while every homogeneous projection ran at
+  ~430-450 GB/s.
+- Fix 1 (retained): GGUFLinearMethod.apply sliced the padded merged buffer
+  with .contiguous() on EVERY call for mixed-quant-type merged layers --
+  a per-forward device copy of the quantized bytes. Muse hits this on 24/52
+  QKV layers (Q5_K+Q6_K) and 31/52 gate_up layers (~6.3 GB of copies per
+  step). Now the contiguous per-shard views are materialized once and the
+  padded buffer's storage is released (net-zero memory; the parameter object
+  and shard maps are kept). qkv_proj 447 -> 88 us; mixed gate_up back to
+  ~433 GB/s. DSV4/GLM are unaffected (homogeneous or dsv4-aligned paths).
+- Fix 2 (retained): single-dispatch bf16 RMSNorm bound from the vendored
+  QuixiCore Metal kernels (rms_norm / rms_norm_dyn) and wired via
+  RMSNorm.forward_mps (~20 us/call, max_abs_err 0 vs native fp32 reference
+  at D=6656 and D=128). Also retained: fused paged-attention batch expansion
+  for uniform multi-query decode (spec verify 17 rows, draft 16), replacing
+  the per-request SDPA gather loop (+3.5% alone).
+- Result: no-spec 7.34 -> 12.78 tok/s (+74%, step 137 -> 78 ms); spec-on
+  7.65 -> 9.76 tok/s (+28%).
+- Tuning decision: k stays 16. DFlash acceptance measures 1.68 accepted per
+  draft (73% pos-0, decaying to 6% by pos-4; mean 2.68 tokens per step).
+  k=5 was tried and is WORSE (7.3 tok/s at identical acceptance), matching
+  the measured small-M anomaly in the GGUF matmul path (a 16-row chain is
+  slower than a 17-row chain: 293 vs 258 ms). Speculation is currently
+  net-negative vs no-spec (9.76 vs 12.78); the profile notes recommend
+  --no-spec for single-stream throughput until the small-M path is fixed.
+- Next bottlenecks (measured, in order):
+  1. Small-M (2..32 rows) GGUF matmul: a 17-row layer chain costs 2.46x a
+     1-row chain when the incremental cost should be near-zero at weight
+     bandwidth. This is what keeps DFlash net-negative; llama.cpp turns the
+     same drafter into +89%.
+  2. The remaining 1-row chain gap: ~78 ms step vs 37.6 ms reference =
+     per-op dispatch spread across ~10 ops/layer plus ~20-30 ms engine
+     overhead. Candidates: k-quant fused qkv/up-gate kernels (the vendored
+     fused variants are q4_0-only today), rope+qk-norm fusion, sampler path.
+- Raw artifacts: perf/results/2026-08-11/muse-optimization-pass-1/.
+
+## 2026-08-11 - qgemv_mm: Weight-Stationary Small-M GGUF Matmul For Metal
+
+- Status: kernel family retained (verified at kernel and chain level); the
+  speculative path remains net-negative end to end -- the residual cost is
+  now host-side, named below.
+- Hypothesis: the small-M band (2..32 rows -- speculative verify k+1=17,
+  draft blocks 16, small decode batches) was served by a per-row qgemv
+  (linear in M: weights re-read per row) or a fragment GEMM measured
+  4-5x off weight bandwidth (flat ~99 GB/s). A weight-stationary multi-row
+  GEMV should hold the vec kernel's ~450 GB/s across the band.
+- Change: `qgemv_mm<FMT, T, M>` in the vendored qgemv.metal -- same
+  block-major walk and lane geometry as qgemv, each dequantized 8-wide span
+  held in two float4 registers and applied to all M rows via two vec4 X
+  loads per row (the first scalar-load version scaled poorly: load-issue
+  bound, and M=32 spilled registers -- instantiations cap at M=17).
+  Instantiated for q4_0/q8_0/q4_K/q5_K/q6_K x half/bf16 x M in
+  {2,4,8,16,17}; the binding greedily decomposes larger batches and the
+  routing (`_mmvq_batch_limit`) sends M<=17 to the vec route on Metal
+  (32 was tried and regressed prefill: decomposed multi-pass loses to the
+  flat GEMM above the single-dispatch band).
+- Kernel result (real muse weights, M=17 vs the prior per-row loop):
+  o_proj Q4_K 656 -> 169 us; gate Q5_K 839 -> 186 us; down_proj Q6_K
+  3978 -> 1059 us. Beats the fragment GEMM at every M in the band. Parity
+  vs the GEMM kernel < 2e-2 relative across M including the decomposition
+  path (M=33).
+- End-to-end (256-token greedy, back-to-back same-session): no-spec
+  11.8-12.3 tok/s (yesterday's 12.78 was measured on a quieter machine;
+  runs now drift within triplets, ambient load ~3.6), spec-on k=16
+  8.6-9.2 tok/s with acceptance 1.87/draft (2.87 tokens/step).
+- Analysis: with verify matmuls now ~2x cheaper, the spec step still costs
+  ~320 ms against ~85 ms plain decode. The model-side delta accounts for
+  under half of it; the remainder is host-side spec machinery -- the MPS
+  torch rejection sampler (per-request loops + .cpu() syncs), the
+  torch-native DFlash context-KV precompute (per-layer eager ops each
+  step), and proposer bookkeeping. Speculation stays net-negative on Metal
+  until that path is addressed; the profile note stands (--no-spec for
+  single-stream throughput).
+- Next: (1) batch the MPS rejection sampler to one device pass + one sync
+  per step; (2) fuse the dflash context-KV precompute (the vendored
+  qk_norm_rope kernel family is a candidate); (3) engine-side step
+  overhead (~20-30 ms) shared with no-spec.
+- Raw artifacts: perf/results/2026-08-11/muse-qgemv-mm/.
+
+## 2026-08-11 - muse_step: The Whole Decode Forward In One Command Buffer
+
+- Status: retained. Greedy generations are byte-identical between the fused
+  and eager paths (the strongest available end-to-end parity check for a
+  deterministic decode); no-spec decode 12.0 -> 14.4 tok/s in matched
+  ambient conditions, 7.34 -> 14.4 (+96%) across the whole optimization arc.
+- The deep fix identified by profiling: kernels were at bandwidth but the
+  step spent ~40 ms in per-op Python/ATen/torch-MPS dispatch across ~1,800
+  eager ops, plus engine overhead. This is the llama.cpp / CUDA-graph
+  execution model brought to the Metal path: `muse_step_run` encodes all 52
+  decoder layers (~900 dispatches: rms norms, GGUF matvecs, QK-norm,
+  interleaved rope, KV scatter, windowed paged attention, sigmoid gate,
+  SwiGLU, residual adds) into ONE command buffer from a C++ loop in
+  qc_metal_serving.mm. Weights and scratch register once
+  (muse_step_init/muse_step_layer); each step passes only hidden rows,
+  positions, and the two KV-group metadata sets (SWA and full-attention
+  block tables / seq lens / slot mappings).
+- New glue kernels (csrc/quixicore/metal/kernels/serving_glue/muse_step.metal,
+  a SlimServe addition beside the vendored tree): muse_rope_qk (interleaved,
+  in place), muse_kv_store (paged scatter), muse_sigmoid_mul, muse_silu_mul,
+  muse_add_inplace. Kernel names export namespaced (mittens::*) -- the
+  encoder resolves them so.
+- Python side: MuseGlimmerModel lazily registers on the first eligible step
+  and takes the fused path only for pure single-token decode with no aux
+  captures (spec-off); everything else -- prefill, mixed batches,
+  speculative verify, vision -- keeps the eager path. Any registration
+  failure logs once and permanently falls back.
+- Where the remaining time is: step ~70 ms vs the ~43 ms weight-bandwidth
+  floor. The forward is now ~48-55 ms; the rest is engine-side per-step
+  overhead (scheduler/sampler Python), now the largest single line item.
+- Next, in order: (1) extend muse_step to M=17 with aux-hidden capture and
+  an on-device greedy rejection kernel -- that is what finally makes DFlash
+  net-positive (the qgemv_mm groundwork already holds the verify matmuls at
+  bandwidth); (2) engine step overhead; (3) last kernel margins vs
+  llama.cpp (26.6 no-spec reference).
+- Raw artifacts: perf/results/2026-08-11/muse-fused-step/ (parity harness
+  and runs).
+
+### 2026-08-12 - No-spec storms on V2 too: graph-replayed pure decode implicated
+
+The V2-runner-default fix for DSV4 (DeepseekV4ForCausalLM added to
+DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES - previously spec-off configs
+silently fell through to the V1 runner, the confound in the earlier
+no-spec arm) enabled the first clean single-variable no-spec test:
+V2 runner, aux-off, FULL capture-64, no speculation. IT STORMED -
+16,096 NaN lines, runs 0/11 -> 8/11 -> 11/11 degenerate, whole-batch
+steady-state signature. So the no-spec storm is NOT the V1 runner and
+NOT the aux streams.
+
+Geometry explains why production (spec-on) is clean while no-spec
+storms: with DSpark k=5 at c11, decode steps are 66 tokens > capture-64
+-> EAGER; without spec they are 11 tokens -> FULL GRAPH REPLAY. The
+no-spec flag silently moves pure decode onto replayed graphs - the same
+regime the original storm incident implicated (and the bt_per_token
+persistence fix addressed for the spec-shaped path). Discriminator in
+flight: identical no-spec boot with cudagraph_mode NONE. Clean =>
+FULL-graph replay of the 1-token decode path has its own capture
+hazard; storming => no-spec batch dynamics themselves.
+
+### 2026-08-12 - No-spec storm characterized: concurrency-dependent, config-independent
+
+Discriminator ladder for the no-spec storm, all on the fixed V2-default
+runner: FULL graphs stormed (16,096 lines), graphs NONE stormed HARDER
+(24,116 lines, 11/11 from run 1), single-request c1 CLEAN (long and
+short prompts, zero events, coherent output). Verdict: the no-spec
+storm requires concurrent load - the chunked-prefill + 1-token-decode
+mixed batches at c11 - and is otherwise independent of runner (V1/V2),
+graph mode (FULL/NONE), and aux streams (fired with aux off). 3/3
+no-spec boots stormed; contagion is 1 row -> whole batch within 2
+steps, so the cross-request channel also exists without speculation.
+
+Production exposure: NONE (profiles mandate DSpark; the spec-shaped
+path is clean under the same loads). Operational consequence: --no-spec
+is NOT usable for DSV4 A100 perf diagnosis until this is fixed - its
+output degenerates under any concurrent benchmark. The next bisection
+steps when this thread is picked up: minimal concurrency (c2/c3),
+prefill-only vs decode-only mixes, and the indexer's no-spec decode
+branch (next_n=1) vs the spec-shaped flattening branch - the largest
+code fork between the two configurations.
+
+### 2026-08-13 - BREAKTHROUGH: both bugs born in the first sparse-attention layer
+
+The probe-liveness diagnostic boot (deterministic no-spec c11 storm)
+delivered clean per-layer dumps and a surgical fingerprint: slots 0, 1
+and 100-108 ABSENT (layers 0-1 fully clean; layer-2's attention INPUT
+clean), slot 109 = LAYER-2 ATTENTION OUTPUT is the birth site (~100
+deterministic events), cascading 110 -> layer outputs 2..9. Re-reading
+the earlier spec-mode captures with this key: cap1's fresh birth was
+also (109,1) - the (100..108, 7) chain there was carry-through of
+already-poisoned rows re-entering the net, which I had misread as a
+layer-0 birth (min-slot logic breaks once poisoned requests recirculate).
+
+ONE BIRTH SITE FOR BOTH BUGS: layer 2 is the first compress_ratio=4
+layer (ratios [0,0,4,128,4,...]) - the first C4A sparse-attention layer
+with an indexer and sparse MLA over the compressed KV cache. The rare
+spec seed and the deterministic no-spec storm are the same defect
+class: sparse attention producing NaN from clean inputs, rare under
+spec-shaped batches, deterministic under no-spec concurrent
+chunked-prefill/decode mixes. Top-k indices are always IN RANGE
+(validator zero across every storm); prime suspects are therefore
+in-range-but-unwritten reads: fp8 KV bytes 0x7F/0xFF decode to NaN, so
+a topk index (or compressed-slot mapping, ratio-4 bookkeeping) pointing
+at an allocated-but-not-yet-written compressed KV slot yields exactly
+this signature. The batch-shape dependence (decode_threshold 1 vs 6)
+changes which rows sit in mixed batches while prefill chunks are still
+writing compressed slots.
+
+Next bisection (deterministic 10-min repro): instrument layer-2's
+indexer decode path to compare each row's topk_indices against the
+request's WRITTEN compressed length (not max seq len), and dump the
+sparse MLA gather inputs for the first NaN row; then the ratio-4
+insert/readback boundary (indexer_k_quant_and_cache vs
+cp_gather_indexer_k_quant_cache) for off-by-one-chunk lag.
+
+### 2026-08-13 - Retractions and re-aim: probes were on dead code
+
+Three corrections from the o_proj arm and a code-path audit:
+
+1. Fused o_proj EXONERATED: forcing the grouped MMQ path for all sizes
+   (new diagnostic dial VLLM_DSV4_O_PROJ_FUSED_MAX_TOKENS=0) still
+   storms (4,864 lines, 11/11 both runs). The <=32-gate geometry match
+   was coincidence. (Also found: the VLLM_DSV4_NATIVE_Q8_O_PROJ=0
+   fallback is bit-rotted on GGUF - crashes on .weight; unusable as a
+   kill switch.)
+2. RETRACTED: "sparse MLA core is clean". The KV byte-census probe sat
+   in vllm/v1/attention/backends/mla/quixicore_mla_sparse.py, which is
+   NOT the DSV4 A100 path. The real path is
+   vllm/models/deepseek_v4/amd/rocm.py: forward_mqa ->
+   rocm_sparse_attn_decode (merged SWA+sparse) and _forward_prefill.
+3. RETRACTED (attribution): the bt_per_token persistence fix lives in
+   that same unused builder - almost certainly a NO-OP for DSV4
+   serving. The 0/8 vfix campaign result was phase luck, and the
+   FULL-graph restoration decision now rests only on empirical
+   cleanliness (0/8 + production NAN_WATCH clean since), not on a
+   mechanism fix. The FULL-vs-PIECEWISE storm split (2/6 vs 0/6,
+   p~0.23) may itself have been lottery.
+
+New probe on the REAL path (VLLM_DSV4_ATTN_SPLIT_DEBUG=1): after
+rocm.py forward_mqa, per layer, report whether NaN rows live in the
+decode segment (rocm_sparse_attn_decode) or the prefill-chunk segment
+(_forward_prefill), plus query health. Boot in flight on the
+deterministic no-spec repro.
+
+### 2026-08-13 - MECHANISM PROVEN: compressed KV cache holds NaN-coded fp8
+
+Census on the real decode (mla_decode_fp8_sparse_dsv4 inputs, NaN rows
+vs controls): request mapping correct (req ids sane vs num_decodes),
+extents healthy (swa 128, topk 250), query clean at the first poisoned
+layer - and the fp8 payloads of the gathered compressed-cache entries
+contain NaN encodings (0x7F/0xFF) in ~30% of selected tokens
+(80/250, 67/250, 73/250, 76/250 across dumps; layers 2, 4, 38). The
+ratio-128 layer (extra_len=7) gathers clean; its q was already
+poisoned (carry-through). The attention kernel is exonerated: it
+faithfully attends over a corrupted compressed (ratio-4) cache.
+
+Root cause is therefore ONE hop away, in the compressed-cache WRITE
+path (the MLA compressor / its cache insert) under chunked prefill:
+~30% of a 1000-token request's 250 compressed groups holding garbage
+suggests whole chunks' compressed writes missing or mis-slotted (an
+offset relative to chunk start vs sequence start, or partial-group
+handling at chunk boundaries). The boot lottery falls out naturally:
+unwritten slots hold recycled allocator bytes, and whether those
+decode to fp8-NaN varies per boot. Next: extend the census to dump the
+bad POSITION histogram (contiguous range => chunk-offset bug;
+scattered => partial-group bug), then read the compressor's slot
+computation in the cache insert.
+
+Production exposure check still holds: spec-mode serving with aux-off
+has zero NAN_WATCH events across days of load - the spec-shaped
+schedule evidently avoids the triggering write pattern (to be
+explained by the same fix). All diagnostics env-gated, default off.
+
+### 2026-08-13 - RETRACTION: the fp8-NaN-content conviction was a census bug
+
+The offline replay of the captured "bad" token runs CLEAN through the
+real compress kernel, and inspection shows why: the fp8 payload of a
+cached token is bytes [0:448]; bytes 448..575 hold the bf16 rope pair,
+where 0x7F/0xFF single bytes are ordinary bf16 encoding bytes. Every
+census in this hunt scanned [:512], counting 64 bf16 bytes per token -
+expected false-positive rate ~40% of tokens, which is exactly the ~30%
+"corruption" measured. The "compressed KV cache contains NaN" claim and
+the compressor-write conviction are RETRACTED. What still stands,
+measured with valid instruments: decode attention output NaN with clean
+query, healthy extents, correct request mapping, and clean state-cache
+gather. Corrected-census boot (448-byte window on both probes) in
+flight to establish the real KV content status.
+
+### 2026-08-13 - Hunt state: kernel convicted, mechanism still internal
+
+Where the elimination stands after the full-entry audits (all with
+TRUE cache addressing - two earlier census instruments were themselves
+buggy and their convictions retracted: the 512-vs-448 window and the
+584-vs-576 stride):
+
+CLEAN, verified at the moment of NaN birth: query; top-k fp8 payloads;
+SWA fp8 payloads; rope bf16 halves (isnan-proper); UE8M0 scales (max
+122); extents; request mapping; state-cache gather; compressor writes
+(every chunk, every size, immediate readback); the software e4m3
+encoder (2.5M-value sweep); state slot mappings (no skips). Control
+rows with identical input profiles compute finite outputs in the same
+launch where neighbors go NaN.
+
+DISPROVEN fix candidate: ml/es split-partial workspace was torch::empty
+while the reducer reads min(partitions, token-length) slots per row =
+all of them; initializing ml=-inf / es=0 (kept - correct hygiene, the
+reducer guard treats unwritten slots as authentic empties) did NOT
+stop the deterministic storm: 11/11 degenerate, 4,860 NaN lines.
+
+CONVICTED but not yet dissected: quixicore_ops.mla_decode_fp8_sparse
+_dsv4 (csrc/quixicore/tm_cuda/tm_cuda_serving.cu + mla_decode_fp8_v +
+dsv4_attention_reduce_active_channels in paged_attn_v2_kernels.cuh)
+produces NaN attention output from fully-audited-clean inputs with
+initialized workspace, per-row nondeterministically, only under the
+concurrent no-spec batch geometry (13/13 boots) and rarely under spec
+(the production seed). Next step is mechanical: capture one NaN row's
+complete op inputs (q row, both index lists + lens, the ~378
+referenced 584B cache entries), replay py_mla_decode_fp8_sparse_dsv4
+offline, dump tmp/ml/es to find which partial goes NaN, and bisect the
+persistent writer kernel at that partition. The capture hook pattern
+is already in ampere.py (_ampere_decode_debug); extend it to torch.save
+on first detection like the compressor capture did.
+
+Production posture unchanged and safe: spec + aux-off serving is clean
+under load (the seed needs the geometry production avoids at width;
+NAN_WATCH + canary standing). The no-spec flag stays documented as
+broken until this kernel bug is fixed.
+
+### 2026-08-13 - ROOT CAUSE FOUND AND FIXED: 0*NaN in the split-K reduce
+
+The whole incident family - the rare production seed, the BOS-loop
+storms, and the deterministic no-spec degeneration - reduces to one
+IEEE trap in the DSV4 sparse decode's split-K reduction
+(csrc/quixicore/serving/paged_attn_v2_kernels.cuh,
+dsv4_attention_reduce_active_channels):
+
+  value += tmp_out[partition] * weight;
+
+The persistent writer (mla_decode_fp8_v) publishes finite ml/es stats
+for balanced-away EMPTY partitions but never stores their 512-float
+tmp vector; tmp was torch::empty. weight is exactly 0 for those
+partitions - which looks like a correct no-op - but IEEE 0*NaN = NaN
+and 0*inf = NaN, so whenever the recycled allocator bytes behind an
+unwritten tmp vector decoded to NaN/inf, one empty partition poisoned
+the row.
+
+Proof chain: partials census (ml_bad=0, es_bad=0, tmp_bad~150 on
+storm-shaped calls); sentinel fill of tmp mapped exactly one
+unwritten partition per (batch,head) inside "written" stats AND
+stopped the storm (deg 0/11, 0 NaN lines - first clean boot of that
+config in 14); the one-line reducer guard (skip !(w > 0)) alone, no
+sentinel, no debug: 3 full-length trigger runs, deg 0/11 each,
+0 NaN lines.
+
+Every mystery of the incident collapses into this mechanism:
+- Boot/phase lottery = recycled allocator content behind unwritten
+  partials.
+- Batch-geometry gating = partition counts and tmp reuse patterns
+  (spec c11 verify widths vs no-spec 1-token decode).
+- Graph-mode correlation (FULL storms) = graph pools changing what the
+  allocator recycles - correlation, not causation.
+- Per-row nondeterminism and clean-input convictions = the poison
+  entered through a buffer no input audit covered.
+- The aux-off "3/3 silent" = phase luck and/or allocation-pattern
+  shifts; the mHC/collective/runner theories were all epiphenomena.
+- The earlier reducer NaN-guards (!(mp > NEG_INF)) helped only when
+  the garbage happened to make ml NaN; finite ml with garbage tmp
+  sailed through.
+
+Fixes landed: the w>0 guard in dsv4_attention_reduce_active_channels;
+same hardening in the three sibling reducers (one-warp, WARPS-wide,
+and the plain template - one skipped only ml=-inf, one tested
+weight==0.0f exactly which passes NaN weights, one was unguarded);
+ml/es workspace init (-inf/0) kept as defense in depth. tmp remains
+torch::empty by design - the guard makes unwritten vectors
+unreachable. no-spec serving is UNBROKEN by this fix (the 3 clean
+validation runs were no-spec).
+
+## 2026-08-13 - c1 latency floor diagnosed (task #27): structural, not kernel-bound
+
+Torch profile of steady c1 spec decode on the production q4ktail-4
+config (fixed kernel, ~5K context, 140 tok/s). Per ~31ms spec cycle
+(6-token verify, acceptance ~3.4 -> ~4.4 tok/cycle):
+
+- Target verify step wall (execute_6 annotations): ~19.3 ms
+- Pure kernel time inside the whole cycle: ~11.7 ms (19,887 launches
+  over 16 steps; graph-replayed, so launch count is not the cost)
+- => ~7-9 ms idle INSIDE the target step (breakable-graph eager
+  sections around sparse attention + Python between segments), and
+  ~11.7 ms of drafter + sampling + CPU orchestration between target
+  steps.
+
+Kernel breakdown per step (top): IQ2 gate_up+SwiGLU 1.28ms, MLA sparse
+decode 1.06ms, aligned-Q8 GEMVs 1.33ms, drafter Q8/Q2K GEMVs ~0.9ms,
+grouped-Q8 0.59ms, Q2K down 0.53ms, mHC 0.79ms, indexer 0.45ms,
+custom-AR 0.35ms, long tail ~3.4ms (incl. 145x quantize_q8_1 of ~2.3us).
+
+CONCLUSIONS:
+1. TP2 ~ TP4 parity is now explained: the ~21ms fixed part of the
+   cycle (drafter, orchestration, eager-break idle) does not shrink
+   with TP; only the ~10ms kernel part does. Doubling ranks moves the
+   cycle from ~34 to ~31ms - exactly the observed parity. This is not
+   a defective-collective problem; it is Amdahl on fixed overhead.
+2. Ranked c1 levers: (a) intra-step idle - fewer/cheaper eager breaks
+   around sparse attention (largest, hardest: needs sparse-attn graph
+   capture support); (b) drafter cycle cost (5 draft forwards -> the
+   Q2K/Q8 GEMV drafter is ~1ms GPU but carries CPU orchestration);
+   (c) kernel tail consolidation (marginal).
+3. Task #26 re-scoped by data: the Q4_K tail (moe_vec_q block_q4_K)
+   is only ~0.26 ms/step at c1 (~2.6% of kernel time) - fused Q4_K
+   tiles are NOT a c1 lever. Their value is c8/prefill width and the
+   quality-tier unlock; rank accordingly.
+4. Task #28 (cp.async on seg tiles) is likewise a prefill/c8 lever;
+   no c1 effect expected.
+
+Raw trace: scratchpad prof-c1/ (4 ranks); server log prof-server.log.
+
+## 2026-08-14 - Fused Q4_K (12,12) decode pair + cp.async seg pipelining: implemented, validated
+
+Two kernel deliverables landed together (e2e arms running, results to
+follow):
+
+1. Fused Q4_K MoE decode pair (csrc/quixicore/quant/dsv4_q4k_moe_ampere.cuh,
+   op ggml_dsv4_moe_a8_q4k): warp-per-row gate/up GEMV on raw block_q4_K
+   with fused SwiGLU + route weight + Q8_1 emission, plus a Q8xQ4_K down
+   weighted sum -- the tail layers' 7-launch generic route (vec w1, SwiGLU,
+   requant, 4x moe_align, MMQ w2, weighted moe_sum) becomes 2 launches.
+   Dispatch: (qweight_type, qweight_type2) == (12,12), decode widths
+   (VLLM_GGUF_DSV4_Q4K_ROWS, default 64), kill switch
+   VLLM_GGUF_DSV4_AMPERE_Q4K.
+2. cp.async double-buffered y tiles in all four seg kernels (IQ2 W1, Q2K
+   W2, MXFP4 W1/W2): span-parity double buffer, 4-byte cp.async.ca for the
+   qs payload (36-byte block_q8_1 stride defeats 16B alignment), scale
+   halves converted after the async issues, weight-decode global loads
+   overlapping the in-flight y group. J=64 tiles moved to dynamic smem
+   (57.6-61.7 KB, opt-in attribute); occupancy 3->2 CTAs/SM at J=64,
+   accepted pending e2e numbers.
+
+VALIDATION (the interesting part -- two instrument lessons):
+
+- cp.async change: BIT-EXACT vs the pre-change build (same inputs, 6
+  cases: iq2/mxfp4 seg x 8/96/1024 tokens). This is the right criterion:
+  the change moves bytes differently but performs identical arithmetic in
+  identical order. Pad columns keep stale qs under an exactly-zero scale
+  (integer operands, cannot poison -- deliberately checked against the
+  0*NaN incident class).
+- Q4_K parity vs fp64 dequant reference: first two harness attempts
+  FAILED for instrument reasons, not kernel reasons:
+  (a) reference dequantized with the fp32 Q8_1 scale, but quantize_q8_1
+      STORES the scale as fp16 -- every consumer sees the fp16-rounded
+      scale; (b) even with (a) fixed, recomputing v in fp64 flips
+      round(v/scale) by +-1 near .5 boundaries (fp32 kernel vs fp64 ref
+      differ ~1e-6; each flip perturbs a whole 4096-wide output row by
+      ~1e-3 of mean, and flips stack).
+  Proof of kernel correctness: single-route lstsq decomposition of the
+  fused-vs-reference diff = exactly 7 mid deltas, all +-1.0 quanta, all at
+  v/scale frac ~= .5000-.5019. The proven generic MMVQ path shows the
+  same-magnitude deviation vs the reference (bulk 0.29) -- the reference
+  is the outlier through the quant cliff, not the kernels. Final metric:
+  mean relative error (flip floor ~1.5e-3 vs O(1) for a wrong kernel);
+  PARITY_PASS 21/21 across inter {256,512,1024}, tokens {1..64}, masked
+  experts.
+
+Lesson recorded: parity through a quantization cliff can never be
+elementwise-tight for a reference computed in different precision; use
+bit-exact A/B when arithmetic is unchanged, flip-decomposition + mean-rel
+when it is not. (Same family as the fp8-census false convictions from the
+degeneration incident: validate the instrument before believing it.)
+
+Baseline for the arms (segon, pre-Q4K/pre-cpasync build, same boot
+conditions, post reduce-fix): 12k-cold 144.5, 12k-hot 150.2, 12k-c4
+234.7, 1k2k-c8 359.2 tok/s, all exact. Raw: perf/results/2026-08-14/
+{gate768-pair,q4k-arms}/.
+
+## 2026-08-14 - Q4_K fused + cp.async + gate-768: e2e verdicts (tasks #26/#28 closed)
+
+Three-arm matrix on dsv4-q4ktail-4 (fresh boots, exact harness, same
+prompts; baseline = segon arm from the same day, pre-change build). Raw:
+perf/results/2026-08-14/{gate768-pair,q4k-arms}/.
+
+tok/s (12k-cold / 12k-hot / 12k-c4 / 1k2k-c8 / 1k2k-c1):
+- segon baseline: 144.5 / 150.2 / 234.7 / 359.2 /  --
+- segoff (Q4K off):  148.1 / 150.3 / 234.2 / 324.0 / 119.7
+- cpasync (Q4K off): 148.8 / 145.3 / 235.2 / 326.4 / 110.1
+- q4kfull (default): 149.7 / 151.3 / 233.4 / 310.2 / 163.3
+
+THE ACCEPTANCE TRAP, AGAIN: raw TPS says q4kfull c1 is +48%. Step-rate
+normalization (tps / (1 + accepted/draft)) says otherwise:
+- c1 steps/s: segoff 47.7, cpasync 47.6, q4kfull 47.5  -> IDENTICAL.
+- c8 steps/s: baseline 105.9, segoff 100.1, cpasync 98.0, q4kfull 97.2
+  -> ~6-8% cross-boot band, no arm effect beyond it.
+All response sha256s differ across arms (slightly different numerics ->
+divergent greedy text -> incomparable acceptance). Every apparent e2e TPS
+delta in this matrix is acceptance/content variance. Rule reaffirmed: no
+e2e speedup claim without step-rate normalization and matched outputs.
+
+VERDICTS:
+1. Fused Q4_K (#26): e2e step-rate NEUTRAL at c1 and c8. This is the
+   c1-diagnosis prediction (2026-08-13) confirmed from the other side:
+   decode is fixed-overhead bound, so removing 5 launches + moe_align
+   from 6 tail layers vanishes into the idle window. Kept enabled:
+   correctness proven, 2 launches < 7, zero cost anywhere, and the win
+   materializes when eager-break idle shrinks (sparse-attn graph capture)
+   or on tiers with more Q4_K layers.
+2. cp.async double-buffering (#28a): kernel-level seg tile time
+   1024 tokens 15.48 -> 12.73 ms (-18%), 2048: 19.38 -> 14.35 (-26%) --
+   exactly the widths production seg serves (prefill chunks above the
+   gate). Narrow widths regress (48: 3.84->4.52) but sit behind the
+   768 gate and never run seg in production. E2e prefill neutral (MoE
+   seg is a small slice of 12k prefill time). Bit-exact vs pre-change.
+3. Gate-768 e2e pair (#28b): segon vs segoff identical at 12k
+   (150.2/234.7 vs 150.3/234.2) -> the gate is e2e-neutral on this
+   workload; post-cp.async kernel crossover still brackets 768 (fused
+   wins <=512, seg wins >=1024). Gate retained at 768.
+
+Production: both daemons restarted onto the committed build (A during
+arms teardown, B explicitly); canary + NAN_WATCH active.
 
 ## 2026-08-10 - Metal M1 Ultra bring-up: dsv4-xxs-1 crashes fixed; decode is launch-bound at ~0.1 tok/s
 
@@ -5602,3 +6817,60 @@ CLOSED and unregressed.
 - Decision: retained. Tree is PR-ready pending the user's commit request.
 - Raw artifacts: perf/results/2026-08-14/cleanup_gate/ — boot_tape2.log,
   boot_final.log, *_final.json, walls_final.log.
+
+## 2026-08-14 — MERGE: origin/main into metal-m1ultra-campaign (PR #2 conflict resolution)
+
+- Baseline: UPDATE 27 anchors (8-tok db2846cf721b 7/10/2; off1-2000
+  3fc700d9818b 1496/2535/507 @65.5 s; 2500x64 dd5c1c87fe60 51/70/14 @3.53 s)
+  on the pre-merge tree at 3072/1.5 GiB.
+- Incoming (origin/main since a323b9931): A100 Q4_K fused (12,12) MoE decode
+  pair + cp.async (Metal-excluded by platform gate), the DSV4 degeneration
+  root-cause fix (0*NaN split-K partials; CUDA-side, plus in-repo NaN
+  diagnostics), Muse-Glimmer-30B Metal (new kernel families + qgemv_mm
+  multi-row GEMVs + bf16 rms_norm + fused muse_step), and the Metal DSV4
+  256K profile resize (c5ea36ff4).
+- Semantic resolutions (all in commit b77cc7381):
+  1. qc_mmvq host dispatch: campaign mb fast path keeps precedence for its
+     gated envelope (batch 2-8, q8_0/q2_K/iq2_xxs/q6_K, with the q8_0-small
+     summation-order carve-out); Muse-Glimmer's {17,16,8,4,2} qgemv_mm
+     row-block walk is the general path and degenerates to the batch-1 loop
+     for non-mm formats. The carve-out is extended to the mm walk so the
+     pinned numerics cannot shift.
+  2. rms_norm: both implementations kept; the single binding dispatches
+     bf16+contiguous+D%4==0 inputs to Muse's fixed-D kernels (exact
+     main-branch numerics) and everything else — including the DSV4 fp16
+     strided q/k splits — to the campaign w32/strided variants. Duplicate
+     m.def and Python wrapper removed; unlabeled Muse encodes labeled
+     (muse_step, qc_rms_norm) for the CB census.
+  3. compressor.py: main's env-gated NaN write-site debug hooks composed
+     around the comp_full_compress phase bracket (frozen structure kept; the
+     hooks early-return on a dict flag when VLLM_DSV4_COMPRESS_DEBUG is
+     unset).
+  4. tk_launch.h: launch_qgemv_mb and launch_qgemv_mm both retained.
+  5. dsv4-xxs-1 metal profile: main's 262144/16 GiB with the campaign's
+     fp16 dtype + 2176 reserve; stale long-context note rewritten (the Metal
+     indexer chain exists on this branch; boot-ramp caveat documented).
+  6. Harness: --dump-completions + chars_per_token both kept. Notebooks
+     merged chronologically. metallib (12.52 MB) and extension rebuilt from
+     merged sources.
+- Correctness: all six kernel oracles pass (moe_mm 36, compress front c128
+  6, prefill FA, indexer topk, moe_soa, moe_sum6 — bitwise where promised).
+  Config A/B proves the code merge is BIT-EXACT: pinned back to 3072/1.5 GiB,
+  all three pre-merge serving anchors reproduce exactly (shas + counters +
+  walls). Under the shipping 256K config only the long-decode off1-2000
+  trajectory shifts (expected: indexer-engaged region, config-dependent);
+  new anchor 7ce993786ba1 1538/2320/464.
+- Throughput: off1-2000 whole-wall improves 65.5 -> 63.2-63.5 s
+  (30.5 -> 31.6 tok/s end-to-end); 2048-token prefill 5.55-5.71 s
+  (358.9-368.9 tok/s), within noise of UPDATE 26; 512 walls jittery
+  (1.94-2.63 s) and not an anchor.
+- Incident during gating: one A/B boot WEDGED on its first multi-chunk
+  prefill after a primer + 1000-token/8-tok ramp only — the known
+  async-output race. The full ramp (primer, 8-tok, long decode) never
+  wedged, across three other boots. Ramp protocol note hardened in
+  UPDATE 28 and the profile notes.
+- Decision: RETAINED. Merge commit b77cc7381 amended with these records;
+  branch pushed to the PR. QuixiCore-Metal PR #3 is unaffected (the
+  Muse-Glimmer additions to the shared files are the other campaign's port
+  to make).
+- Raw artifacts: perf/results/2026-08-14/merge_gate/.

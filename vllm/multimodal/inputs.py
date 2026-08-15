@@ -290,8 +290,6 @@ A dictionary containing nested tensors which have been batched via
 """
 
 
-
-
 @dataclass
 class MultiModalFeatureSpec:
     """
@@ -448,6 +446,11 @@ class BaseMultiModalField(ABC):
             device = "cpu"
         if pin_memory and self.keep_on_cpu:
             pin_memory = False
+        # Pinning is a CUDA/ROCm H2D staging optimization. Under the MPS
+        # backend Tensor.pin_memory() routes through the MPS allocator and
+        # raises a storage-device mismatch; unified memory needs no staging.
+        if pin_memory and torch.backends.mps.is_available():
+            pin_memory = False
 
         batch = [elem.data for elem in elems]
         out = self._reduce_data(batch, pin_memory=pin_memory)
@@ -478,6 +481,11 @@ class MultiModalBatchedField(BaseMultiModalField):
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
+            # Pinning stages CPU tensors for async H2D copies; a tensor that
+            # already lives on the device (e.g. MPS unified memory) cannot be
+            # pinned and needs no staging.
+            if batch[0].device.type != "cpu":
+                pin_memory = False
             if len(batch) == 1:
                 # An optimization when `batch` contains only one tensor:
                 # - produce exactly same result as `torch.stack(batch)`
@@ -534,6 +542,11 @@ class MultiModalFlatField(BaseMultiModalField):
     ) -> NestedTensors:
         if len(batch) > 0 and is_list_of(batch, torch.Tensor, check="all"):
             batch = cast(list[torch.Tensor], batch)
+            # Pinning stages CPU tensors for async H2D copies; a tensor that
+            # already lives on the device (e.g. MPS unified memory) cannot be
+            # pinned and needs no staging.
+            if batch[0].device.type != "cpu":
+                pin_memory = False
             if len(batch) == 1:
                 # An optimization when `batch` contains only one tensor:
                 # - produce exactly same result as `torch.concat(batch)`

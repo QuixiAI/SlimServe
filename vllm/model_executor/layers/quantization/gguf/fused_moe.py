@@ -61,6 +61,23 @@ def _use_dsv4_ampere_q2k_repack() -> bool:
     return value.lower() not in {"0", "false", "off", "no"}
 
 
+def _use_dsv4_ampere_q4k() -> bool:
+    """Fused Q4_K gate/up+SwiGLU+Q8 and Q8xQ4_K weighted down for the hybrid
+    artifact's Q4_K tail layers (37-42) at decode widths."""
+    value = os.environ.get("VLLM_GGUF_DSV4_AMPERE_Q4K", "1")
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+def _dsv4_q4k_row_limit() -> int:
+    """Widest batch the fused Q4_K route takes; wider batches keep the
+    generic MMQ tile route, which amortizes expert reload across rows."""
+    value = os.environ.get("VLLM_GGUF_DSV4_Q4K_ROWS", "64")
+    try:
+        return max(0, min(256, int(value)))
+    except ValueError:
+        return 64
+
+
 def _use_dsv4_ampere_mxfp4() -> bool:
     """Fused MXFP4 gate/up+SwiGLU+Q8 and Q8xMXFP4 down for decode widths."""
     value = os.environ.get("VLLM_GGUF_DSV4_AMPERE_MXFP4", "1")
@@ -262,6 +279,39 @@ def _fused_moe_gguf(
         global_num_experts = expert_map.shape[0] if expert_map is not None else E
         local_topk_ids = expert_map[topk_ids] if expert_map is not None else topk_ids
         top_k = topk_ids.shape[1]
+        # Q4_K experts (the hybrid artifact's tail layers), decode widths:
+        # fused gate/up+SwiGLU+Q8_1 with a weighted Q8xQ4_K down sum (see
+        # dsv4_q4k_moe_ampere.cuh). Replaces moe_vec w1 + SwiGLU + requant +
+        # four moe_align launches + MMQ w2 + weighted moe_sum with two
+        # launches. Prefill and wider batches keep the generic route below.
+        if (
+            qweight_type == 12
+            and qweight_type2 == 12
+            and activation_enum == MoEActivation.SILU
+            and activation_situ_beta is None
+            and activation_situ_linear_beta is None
+            and not current_platform.is_rocm()
+            and not current_platform.is_metal()
+            and not defer_down
+            and _use_dsv4_ampere_q4k()
+            and num_tokens <= _dsv4_q4k_row_limit()
+            and top_k in (6, 8)
+            and x.shape[1] % 256 == 0
+            and (N // 2) % 256 == 0
+        ):
+            return ops.ggml_dsv4_moe_a8_q4k(
+                x,
+                w1,
+                w2,
+                topk_weights.contiguous(),
+                local_topk_ids.contiguous(),
+                N // 2,
+                w2.shape[1],
+                top_k,
+                num_tokens,
+                0.0 if swiglu_limit is None else swiglu_limit,
+                quant_input,
+            )
         # MXFP4 experts, decode widths: fused gate/up+SwiGLU+Q8_1 with a
         # weighted Q8xMXFP4 down accumulation (see dsv4_mxfp4_moe_ampere.cuh).
         # Prefill and wider batches keep the generic MMQ/MMVQ route below.

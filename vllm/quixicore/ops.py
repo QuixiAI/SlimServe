@@ -66,9 +66,7 @@ class quixicore_ops:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def dsv4_router_gemm(
-        x: torch.Tensor, weight: torch.Tensor
-    ) -> torch.Tensor:
+    def dsv4_router_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return _qc().dsv4_router_gemm(x, weight)
 
     @staticmethod
@@ -180,15 +178,18 @@ class quixicore_ops:
         rms_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
-        return _qc().dsv4_hc_head(
-            residual, fn, hc_scale, hc_base, rms_eps, hc_eps
-        )
+        return _qc().dsv4_hc_head(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
 
     @staticmethod
     def rms_norm(
         x: torch.Tensor, weight: torch.Tensor, epsilon: float
     ) -> torch.Tensor:
-        """Weighted RMS norm with vllm ir.ops.rms_norm numerics (Metal)."""
+        """Weighted RMS norm with vllm ir.ops.rms_norm numerics (Metal).
+
+        bf16 contiguous [rows, D] inputs ride the single-dispatch fixed-D
+        kernels (Muse-Glimmer path); fp16 and strided inputs take the
+        w32/strided variants.
+        """
         return _qc().rms_norm(x, weight, epsilon)
 
     @staticmethod
@@ -669,9 +670,7 @@ class quixicore_ops:
         compress_ratio: int,
     ) -> None:
         """Select every compressed candidate, padding each row with ``-1``."""
-        _qc().fill_short_context_topk_indices(
-            output, positions, topk, compress_ratio
-        )
+        _qc().fill_short_context_topk_indices(output, positions, topk, compress_ratio)
 
     @staticmethod
     def mla_decode_fp8_sparse_glm(
@@ -713,7 +712,6 @@ class quixicore_ops:
         except ImportError:
             return False
 
-    @staticmethod
     def paged_attention(
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -721,15 +719,18 @@ class quixicore_ops:
         block_table: torch.Tensor,
         context_lens: torch.Tensor,
         scale: float,
+        window: int = 0,
     ) -> torch.Tensor:
         """Dense/GQA paged decode (Metal build).
 
         `key_cache`/`value_cache` are the two contiguous halves of the KV
         cache, each [num_blocks, block_size, kv_heads, head_size]. The GQA head
-        ratio is resolved inside the kernel. Returns [batch, heads, head_size].
+        ratio is resolved inside the kernel. `window > 0` restricts each query
+        to the last `window` positions (sliding-window attention). Returns
+        [batch, heads, head_size].
         """
         return _qc().paged_attention(
-            q, key_cache, value_cache, block_table, context_lens, scale
+            q, key_cache, value_cache, block_table, context_lens, scale, window
         )
 
     # ------------------------------------------------------------------

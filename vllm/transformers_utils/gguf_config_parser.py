@@ -45,11 +45,31 @@ class GGUFConfigParser(ConfigParserBase):
 
             config = build_kimi_k3_dspark_config_from_gguf(str(model))
         elif architecture == "dflash":
-            from vllm.transformers_utils.gguf_dflash import (
-                build_dflash_config_from_gguf,
+            # Two published drafters share the `dflash` architecture string:
+            # the DeepSeek-V4 0731 DSpark drafter (MoE, MLA-shaped, carries
+            # `dflash.expert_count`) and the Muse-Glimmer drafter (dense GQA,
+            # no expert keys). Route on that schema difference.
+            from vllm.transformers_utils.gguf_utils import gguf_reader
+
+            reader = gguf_reader(str(model))
+            if "dflash.expert_count" in reader.fields:
+                from vllm.transformers_utils.gguf_dflash import (
+                    build_dflash_config_from_gguf,
+                )
+
+                config = build_dflash_config_from_gguf(str(model))
+            else:
+                from vllm.transformers_utils.gguf_muse_glimmer import (
+                    build_muse_glimmer_dflash_config_from_gguf,
+                )
+
+                config = build_muse_glimmer_dflash_config_from_gguf(str(model))
+        elif architecture == "muse-glimmer":
+            from vllm.transformers_utils.gguf_muse_glimmer import (
+                build_muse_glimmer_config_from_gguf,
             )
 
-            config = build_dflash_config_from_gguf(str(model))
+            config = build_muse_glimmer_config_from_gguf(str(model))
         elif architecture == "kimi-k3":
             from vllm.transformers_utils.gguf_kimi_k3 import (
                 build_kimi_k3_config_from_gguf,
