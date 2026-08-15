@@ -2872,3 +2872,20 @@ tok/s roadmap is therefore GPU-work reduction, ranked:
    producers.
 Steady-meta stays available (harmless, host-side); its value returns if
 host ever re-enters the critical path (e.g. much faster kernels).
+
+## 2026-08-15 - kernel-dial sweep: qwarp8 WINS (+2.7% c1 step rate), DEPLOYED
+
+With c1 proven GPU-bound, swept the existing IQ2/Q2K kernel dials at c1
+(fresh boots, exact harness, steps/s = the acceptance-free metric):
+- VLLM_DSV4_W1_QWARP8=1: 48.8 / 48.8 steps/s  <- +2.7% vs 47.5 baseline,
+  consistent across both runs, exact=true. First step-rate movement of
+  the session: the 256-thread 8-lane-per-row IQ2 W1 decode variant beats
+  the 1024-thread default at the current config (aux-off, capture-64).
+- VLLM_DSV4_W1_COOPERATIVE=1: 47.7 / 47.6 (neutral)
+- VLLM_DSV4_Q2_DOWN_ROWS=4: 47.4 / 47.8 (neutral)
+Encoded VLLM_DSV4_W1_QWARP8=1 in dsv4-q4ktail-4 and dsv4-q4ktail-8 (same
+TP4-shard kernel geometry); q4ktail-2 (1024-row shard) left default
+pending its own measurement. Tests updated (58 pass). Both daemons
+restarted onto it. The qwarp8 dial only affects the tokens<=8 decode
+route, so c8+/prefill are untouched by construction.
+Raw: perf/results/2026-08-15/kdial-sweep/.

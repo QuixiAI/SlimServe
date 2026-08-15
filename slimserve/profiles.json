@@ -897,7 +897,8 @@
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
-            "VLLM_DSV4_AUX_STREAMS": "0"
+            "VLLM_DSV4_AUX_STREAMS": "0",
+            "VLLM_DSV4_W1_QWARP8": "1"
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -951,7 +952,8 @@
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
-            "VLLM_DSV4_AUX_STREAMS": "0"
+            "VLLM_DSV4_AUX_STREAMS": "0",
+            "VLLM_DSV4_W1_QWARP8": "1"
           },
           "note": "A100 only (the measured platform). Two TP4 replicas keep each engine's verify batches at the graph-covered sweet spot; capture 64 covers the per-replica c8 width. Requires the 2026-08-10 DP-padding router fix."
         }
