@@ -880,6 +880,78 @@ def _insert_resampled_kernel(
     )
 
 
+def _mps_greedy_verify(
+    target_logits: torch.Tensor,
+    draft_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_reqs: int,
+    num_speculative_steps: int,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Greedy draft verification as dense tensor ops with no host syncs.
+
+    Per request: accept draft tokens while each matches the target argmax at
+    the preceding position, then append the target token at the first
+    mismatch (or the bonus token when every draft was accepted). The
+    leading-accept run length is a float32 cumprod of the 0/1 match mask,
+    exact for 0/1 values; int64 cumprod is not reliable on MPS.
+    """
+    device = target_logits.device
+    num_logits = target_logits.shape[0]
+    slots = num_speculative_steps + 1
+    target_ids = target_logits[:, :vocab_size].argmax(dim=-1)
+    draft_ids = draft_sampled.to(torch.int64)
+
+    from vllm.v1.worker.gpu.input_batch import mps_segment_ids
+
+    cu = cu_num_logits.to(torch.int64)
+    seg_id = mps_segment_ids(cu, num_reqs, num_logits)
+    local_pos = (
+        torch.arange(num_logits, dtype=torch.int64, device=device)
+        - cu[:-1].index_select(0, seg_id)
+    )
+
+    # Dense [num_reqs, slots] grids; every segment holds <= slots logits.
+    # Distinct fill values keep unfilled cells from ever matching each other.
+    flat = seg_id * slots + local_pos
+    tgt_grid = torch.full(
+        (num_reqs * slots,), -1, dtype=torch.int64, device=device
+    )
+    drf_grid = torch.full(
+        (num_reqs * slots,), -2, dtype=torch.int64, device=device
+    )
+    tgt_grid[flat] = target_ids
+    drf_grid[flat] = draft_ids
+    tgt_grid = tgt_grid.view(num_reqs, slots)
+    drf_grid = drf_grid.view(num_reqs, slots)
+
+    lens = cu[1:] - cu[:-1]
+    steps = torch.arange(num_speculative_steps, device=device)
+    valid = steps.unsqueeze(0) < (lens - 1).unsqueeze(1)
+    matches = (drf_grid[:, 1:] == tgt_grid[:, :-1]) & valid
+    accepted = (
+        matches.to(torch.float32).cumprod(dim=1).sum(dim=1).to(torch.int64)
+    )
+
+    cols = torch.arange(slots, device=device).unsqueeze(0)
+    acc = accepted.unsqueeze(1)
+    draft_next = torch.cat(
+        [
+            drf_grid[:, 1:],
+            torch.full((num_reqs, 1), -1, dtype=torch.int64, device=device),
+        ],
+        dim=1,
+    )
+    bonus = tgt_grid.gather(1, acc)
+    sampled = torch.where(
+        cols < acc,
+        draft_next,
+        torch.where(cols == acc, bonus, drf_grid.new_full((), -1)),
+    )
+    num_sampled = (accepted + 1).to(torch.int32)
+    return sampled, num_sampled
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
@@ -906,6 +978,7 @@ def rejection_sample(
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
     use_block_verification: bool = False,
+    all_greedy: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
@@ -923,34 +996,19 @@ def rejection_sample(
         vocab_size = min(vocab_size, draft_logits.size(-1))
 
     if target_logits.device.type == "mps":
-        req_indices = idx_mapping.to(torch.int64)
-        active_temperatures = temperature[req_indices]
-        if bool((active_temperatures == 0).all().cpu()):
-            target_ids = target_logits[:, :vocab_size].argmax(dim=-1).cpu().tolist()
-            draft_ids = draft_sampled.cpu().tolist()
-            cu_logits = cu_num_logits.cpu().tolist()
-            sampled_cpu = torch.full(
-                (num_reqs, num_speculative_steps + 1),
-                -1,
-                dtype=torch.int64,
-            )
-            num_sampled_cpu = torch.empty(num_reqs, dtype=torch.int32)
-            for req_idx in range(num_reqs):
-                start = cu_logits[req_idx]
-                end = cu_logits[req_idx + 1]
-                num_draft = end - start - 1
-                accepted = 0
-                while (
-                    accepted < num_draft
-                    and draft_ids[start + accepted + 1] == target_ids[start + accepted]
-                ):
-                    sampled_cpu[req_idx, accepted] = draft_ids[start + accepted + 1]
-                    accepted += 1
-                sampled_cpu[req_idx, accepted] = target_ids[start + accepted]
-                num_sampled_cpu[req_idx] = accepted + 1
-            return (
-                sampled_cpu.to(target_logits.device),
-                num_sampled_cpu.to(target_logits.device),
+        if all_greedy is None:
+            # Legacy fallback for callers without CPU-side sampling state.
+            req_indices = idx_mapping.to(torch.int64)
+            active_temperatures = temperature[req_indices]
+            all_greedy = bool((active_temperatures == 0).all().cpu())
+        if all_greedy:
+            return _mps_greedy_verify(
+                target_logits,
+                draft_sampled,
+                cu_num_logits,
+                num_reqs,
+                num_speculative_steps,
+                vocab_size,
             )
 
     # Compute the per-vocab-block logits stats, such as target argmax

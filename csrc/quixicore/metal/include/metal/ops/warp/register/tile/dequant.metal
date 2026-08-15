@@ -665,6 +665,30 @@ METAL_FUNC void tk_dequant8(device const uchar* base, int col0, thread half* w) 
     for (int i = 0; i < 8; ++i) w[i] = FMT::dequant(base, col0 + i);
 }
 
+// iq2_xxs 8-span specialization: with the 8-aligned col0 guaranteed above,
+// the grid word, sign byte, and scale of the span are fetched once instead
+// of per element. The per-element arithmetic keeps the struct decoder's
+// expressions and association exactly, so values are unchanged.
+template<>
+METAL_FUNC void tk_dequant8<iq2_xxs>(device const uchar* base, int col0,
+                                     thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const ushort* qs = (device const ushort*)(base + 2);
+    const int ib32 = col0 >> 5, sub = (col0 & 31) >> 3;
+    device const ushort* q2 = qs + 4 * ib32;
+    const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+    const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+    const ulong grid = iq2xxs_grid[(aux_g >> (8 * sub)) & 0xff];
+    const uchar signs = ksigns_iq2xs[(aux_s >> (7 * sub)) & 127];
+    const half dl = d * (0.5h + half((aux_s >> 28) & 0xf)) * 0.25h;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const uint gv = (uint)((grid >> (8 * i)) & 0xffUL);
+        const half sgn = (signs & kmask_iq2xs[i]) ? -1.0h : 1.0h;
+        w[i] = dl * half(gv) * sgn;
+    }
+}
+
 // FP32 companion used by kernels whose public contract requires dequantization
 // and all following scale/epilogue arithmetic to happen before the output dtype
 // is rounded.  The generic implementation widens the format's native decoder;

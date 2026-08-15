@@ -87,6 +87,24 @@ Use the exact-token harness for comparable throughput:
 Repeat at concurrency 8 unless the experiment is explicitly a single-request
 latency probe. Store full logs under `perf/results/`.
 
+## Profilers (Metal)
+
+Two opt-in instruments ship with the Metal serving path; both are inert
+unless enabled and add no cost when off.
+
+- `VLLM_QC_PHASE_PROF=1` — sync-bracketed step-phase split (target forward /
+  sample / drafter propose) from `vllm/v1/worker/metal_phaseprof.py`. Dumps
+  to `/tmp/phaseprof_<pid>.txt`. The brackets serialize the pipeline, so
+  absolute step time is inflated; trust the split, not the totals, and use
+  xctrace (`metal-gpu-intervals` + encoder-label join) for per-kernel
+  attribution.
+- `VLLM_SYNCPROF=1` — sync-point census from
+  `vllm/v1/worker/metal_syncprof.py`: wraps the host-blocking torch entry
+  points (`item`/`tolist`/`cpu`/`synchronize`/`AsyncOutput.get_output`) with
+  call-site attribution, plus an optional command-buffer census. Dumps to
+  `/tmp/syncprof_<pid>.txt` on an interval (`VLLM_SYNCPROF_INTERVAL`,
+  default 30 s); `VLLM_SYNCPROF_TARGETS` subsets the wrapped names.
+
 ## Notebook Format
 
 Each notebook entry should use this shape:

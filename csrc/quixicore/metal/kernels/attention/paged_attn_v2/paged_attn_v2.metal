@@ -527,6 +527,20 @@ template [[host_name("paged_attention_reduce_bfloat16_512")]]
     constant int &has_sink [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]);
+// float16 twin for the split-K sparse MLA serving path, which writes the
+// fp16 attention output buffer directly.
+template [[host_name("paged_attention_reduce_float16_512")]]
+[[kernel]] void paged_attention_reduce<half, 512>(
+    device const float *tmp_out [[buffer(0)]],
+    device const float *max_logits [[buffer(1)]],
+    device const float *exp_sums [[buffer(2)]],
+    device half *out [[buffer(3)]],
+    constant int &num_heads [[buffer(4)]],
+    constant int &num_partitions [[buffer(5)]],
+    device const float *sinks [[buffer(6)]],
+    constant int &has_sink [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]);
 instantiate_paged_v2_fp8(e4m3, 0, float32, float, 64)
 instantiate_paged_v2_fp8(e4m3, 0, float32, float, 128)
 instantiate_paged_v2_fp8(e4m3, 0, float16, half, 64)

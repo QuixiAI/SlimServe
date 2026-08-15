@@ -75,11 +75,16 @@ def get_compressed_slot_mapping(
     from vllm.platforms import current_platform
 
     if current_platform.is_metal():
-        query_lens = torch.diff(query_start_loc[: num_reqs + 1]).to(torch.long)
-        req_ids = torch.repeat_interleave(
-            torch.arange(num_reqs, device=query_start_loc.device), query_lens
-        )[:num_tokens]
+        # repeat_interleave with tensor repeats syncs on MPS (the output size
+        # is read back to the host). searchsorted over the cumulative starts
+        # yields the same per-token request ids fully device-side: token t in
+        # [qsl[r], qsl[r+1]) -> r.
+        qsl = query_start_loc[: num_reqs + 1]
+        query_lens = torch.diff(qsl).to(torch.long)
         token_ids = torch.arange(num_tokens, device=query_start_loc.device)
+        req_ids = (
+            torch.searchsorted(qsl.to(token_ids.dtype), token_ids, right=True) - 1
+        ).clamp_(min=0, max=num_reqs - 1)
         local = token_ids - query_start_loc.index_select(0, req_ids).to(torch.long)
         start = seq_lens.index_select(0, req_ids).to(
             torch.long

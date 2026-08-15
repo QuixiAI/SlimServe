@@ -10,6 +10,33 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 
+def _metal_swiglu(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    clamp_limit: float | None,
+    oai_form: bool,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> bool:
+    """One-dispatch Metal SwiGLU mirroring the eager chain bitwise (MPS
+    silu/sigmoid are fp32-internal Metal precise ops).
+    Returns False when shapes fall outside the kernel."""
+    if not (
+        input.dim() == 2
+        and input.is_contiguous()
+        and output.is_contiguous()
+        and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and output.dtype == input.dtype
+    ):
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not (quixicore_ops.is_available() and quixicore_ops.has("qc_swiglu")):
+        return False
+    quixicore_ops.qc_swiglu(input, output, clamp_limit, oai_form, alpha, beta)
+    return True
+
+
 class MoEActivation(Enum):
     """Activation functions for MoE layers."""
 
@@ -166,7 +193,15 @@ def apply_moe_activation(
 
     if current_platform.is_metal():
         if activation == MoEActivation.SILU:
+            if _metal_swiglu(output, input, clamp_limit, oai_form=False):
+                return output
             gate, up = input.chunk(2, dim=-1)
+            if clamp_limit is not None:
+                # Mirror silu_and_mul_with_clamp (and the ds4 reference
+                # matvec_*_mid_worker): gate clamped from above only, up
+                # clamped to +/-limit.
+                gate = torch.clamp(gate, max=clamp_limit)
+                up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
             output.copy_(F.silu(gate) * up)
         elif activation == MoEActivation.GELU:
             gate, up = input.chunk(2, dim=-1)
@@ -176,6 +211,11 @@ def apply_moe_activation(
             output.copy_(F.gelu(gate, approximate="tanh") * up)
         elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
             assert clamp_limit is not None
+            if _metal_swiglu(
+                output, input, clamp_limit, oai_form=True, alpha=alpha,
+                beta=beta,
+            ):
+                return output
             gate, up = input.chunk(2, dim=-1)
             gate = torch.clamp(gate, max=clamp_limit)
             up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)

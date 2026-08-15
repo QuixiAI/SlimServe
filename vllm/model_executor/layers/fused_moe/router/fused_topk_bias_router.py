@@ -127,6 +127,60 @@ def _topk_softplus_sqrt_torch(
     return topk_weights, topk_indices
 
 
+def _metal_router_topk(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    e_score_correction_bias: torch.Tensor | None,
+    input_tokens: torch.Tensor | None,
+    hash_indices_table: torch.Tensor | None,
+    routed_scaling_factor: float,
+) -> bool:
+    """Single-dispatch Metal route for the sqrtsoftplus router; returns
+    False when shapes/dtypes fall outside the kernel."""
+    if not (
+        gating_output.dtype == torch.float32
+        and gating_output.is_contiguous()
+        and gating_output.shape[-1] <= 1024
+        and topk_weights.shape[-1] <= 8
+        and topk_indices.dtype == torch.int32
+    ):
+        return False
+    if hash_indices_table is not None and (
+        input_tokens is None
+        or hash_indices_table.dtype != torch.int32
+        or not hash_indices_table.is_contiguous()
+        or input_tokens.dtype != torch.int32
+        or not input_tokens.is_contiguous()
+        or hash_indices_table.shape[-1] != topk_weights.shape[-1]
+    ):
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not (
+        quixicore_ops.is_available() and quixicore_ops.has("dsv4_router_topk")
+    ):
+        return False
+    # No Metal softplus formula matches MPS aten::softplus bitwise, so
+    # torch's softplus runs eagerly (one dispatch) and the kernel does
+    # everything after it with per-op bitwise mirroring.
+    scores_in = F.softplus(gating_output.float())
+    quixicore_ops.dsv4_router_topk(
+        scores_in,
+        topk_weights,
+        topk_indices,
+        renormalize,
+        routed_scaling_factor,
+        bias=(
+            None if hash_indices_table is not None else e_score_correction_bias
+        ),
+        hash_table=hash_indices_table,
+        input_ids=input_tokens,
+    )
+    return True
+
+
 def vllm_topk_softplus_sqrt(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -139,6 +193,18 @@ def vllm_topk_softplus_sqrt(
     routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, ...]:
     from vllm.platforms import current_platform
+
+    if current_platform.is_metal() and _metal_router_topk(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        renormalize,
+        e_score_correction_bias,
+        input_tokens,
+        hash_indices_table,
+        routed_scaling_factor,
+    ):
+        return topk_weights, topk_indices
 
     if current_platform.is_xpu() or current_platform.is_metal():
         return _topk_softplus_sqrt_torch(

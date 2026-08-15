@@ -136,6 +136,21 @@ class SiluAndMul(CustomOp):
         ):
             self.op = torch.ops._C.silu_and_mul
 
+    def forward_mps(self, x: torch.Tensor) -> torch.Tensor:
+        # One-dispatch fused silu(gate)*up, bitwise vs forward_native on
+        # MPS (silu is fp32-internal).
+        from vllm.model_executor.layers.fused_moe.activation import (
+            _metal_swiglu,
+        )
+
+        if x.dim() == 2:
+            out = torch.empty(
+                (x.shape[0], x.shape[1] // 2), dtype=x.dtype, device=x.device
+            )
+            if _metal_swiglu(out, x, None, oai_form=False):
+                return out
+        return self.forward_native(x)
+
     @staticmethod
     def forward_native(x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
@@ -238,6 +253,28 @@ class SiluAndMulWithClamp(CustomOp):
             self.op = torch.ops._C.silu_and_mul_with_clamp
         elif current_platform.is_cpu():
             self._forward_method = self.forward_native
+
+    def forward_mps(self, x: torch.Tensor) -> torch.Tensor:
+        # One-dispatch fused clamp + gate*sigmoid(alpha*gate)*(up+beta),
+        # bitwise vs forward_native on MPS (sigmoid is fp32-internal).
+        from vllm.model_executor.layers.fused_moe.activation import (
+            _metal_swiglu,
+        )
+
+        if x.dim() == 2:
+            out = torch.empty(
+                (x.shape[0], x.shape[1] // 2), dtype=x.dtype, device=x.device
+            )
+            if _metal_swiglu(
+                out,
+                x,
+                self.swiglu_limit,
+                oai_form=True,
+                alpha=self.alpha,
+                beta=self.beta,
+            ):
+                return out
+        return self.forward_native(x)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2

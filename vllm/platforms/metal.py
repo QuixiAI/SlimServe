@@ -190,6 +190,16 @@ class MetalPlatform(Platform):
         )
 
     @classmethod
+    def get_default_ir_op_priority(cls, vllm_config: "VllmConfig"):
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        # Prefer the QuixiCore Metal kernels where registered (rms_norm);
+        # each impl's supports_args/supported gate falls back to native.
+        return IrOpPriorityConfig.with_default(
+            ["native"], rms_norm=["quixicore_metal", "native"]
+        )
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",
@@ -231,7 +241,12 @@ class MetalPlatform(Platform):
                 f"{parallel_config.tensor_parallel_size}."
             )
 
-        vllm_config.scheduler_config.async_scheduling = False
+        # Async scheduling was force-disabled during Metal bring-up. The
+        # step is sync-free now and dspark speculation is on the config
+        # layer's async whitelist, but async scheduling is not yet
+        # gate-proven on Metal; VLLM_METAL_ASYNC_SCHED=1 opts in.
+        if os.environ.get("VLLM_METAL_ASYNC_SCHED", "0") != "1":
+            vllm_config.scheduler_config.async_scheduling = False
 
         # No CUDA graphs here. Forcing capture off is what keeps the shared GPU
         # runner off its torch.cuda.graph and Stream paths.

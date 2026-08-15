@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """What has to be replaced to run the V1 GPU path on PyTorch-MPS.
 
-Three unrelated problems, all of which surface as something other than a clean
+Four unrelated problems, all of which surface as something other than a clean
 failure, which is why they are collected and documented here rather than
 patched at their call sites:
 
@@ -13,6 +13,25 @@ patched at their call sites:
    the CPU one needs a C++ toolchain we do not require at runtime.
 3. A non-blocking host-to-device copy is not ordered against dependent MPS
    work. This one is the dangerous one -- see below.
+4. Shared CUDA/ROCm serving code gates multi-stream and graph-registration
+   work on ``torch.cuda.is_current_stream_capturing()``. On an MPS-only build
+   that is a dummy stub that raises when called. Metal has no graph capture,
+   so the truthful answer is a constant ``False``.
+
+Known open issue, deliberately NOT patched here: a boot's first multi-chunk
+(> max_num_batched_tokens) prefill wedges deterministically unless a
+single-chunk request with real decode steps ran first (the boot-ramp ops
+protocol in perf/prefill_handoff.md). Replacing the async-output event wait
+with a stream drain moved the park without fixing it and produced a GPU
+command-buffer timeout variant on one boot -- evidence in
+perf/optimization_status.md (cleanup-phase entry). Fix attempts must prove
+themselves against the primer -> multi-chunk-direct repro before landing.
+
+The race is timing-sensitive on the host side as well: stripping the
+phaseprof brackets and marshalling-memo conditionals from
+vllm/models/deepseek_v4/{compressor,metal}.py made even RAMPED multi-chunk
+requests park at completion (boot-level bisect, cleanup-phase entry), so
+those code paths keep their structure until the event path is fixed.
 
 Applied once, from the platform's check_and_update_config.
 """
@@ -73,6 +92,12 @@ def _patch_cpu_gpu_buffer_blocking() -> None:
     read a stale buffer and index out of bounds -- a wrong-answer or crash bug
     that appears only under load. Pinned memory is unavailable here anyway, so
     making these copies synchronous costs nothing real.
+
+    (This does not contradict the deliberate ``non_blocking=True`` copies in
+    ``vllm/v1/worker/gpu/buffer_utils.py``: those are safe because torch MPS
+    stages pageable sources synchronously on the CPU either way -- the flag
+    only skips the stream drain -- while the hazard here is device-side reads
+    of a buffer the staging has not populated yet.)
     """
     from vllm.v1.utils import CpuGpuBuffer
 
@@ -108,8 +133,10 @@ def apply_compat_patches() -> None:
 
     _patch_cpu_gpu_buffer_blocking()
 
+    torch.cuda.is_current_stream_capturing = lambda: False
+
     _APPLIED = True
     logger.info(
         "Applied Metal compat patches (dynamo off, torch slot mapping, "
-        "blocking host copies)"
+        "blocking host copies, stream-capture check stubbed False)"
     )
