@@ -2796,3 +2796,35 @@ Remaining c1 roadmap by measured size: (1) this change (~5 ms class);
 (2) sampler/rejection path 3.4 ms; (3) drafter python 3.2 ms (eager
 context-KV insert -> capture; draft-loop consolidation); (4) full
 CPU/GPU overlap (ceiling ~85 steps/s = +80%).
+
+## 2026-08-15 - steady-meta A/B result + THE c1 finding
+
+A/B (fresh boots, exact harness): metaoff c1 47.5 steps/s, metaon c1 47.5
+steps/s (both runs each); c8 104.1 vs 103.8. Exact=true everywhere incl.
+metaon c8 (the fast path engages at uniform c8 verify) -> the change is
+SAFE but not yet the constraint. Left available, default off.
+
+THE FINDING (this is the important one): c1 steps take 21.05 ms while c8
+steps take 9.6 ms - on the same boot, same machinery, with 8x the
+per-step work. And c1's 47.5 steps/s has been INVARIANT across every
+change this session (Q4_K fused, cp.async, 5.6 ms of metadata Python
+removed). Conclusion: the c1 critical path is a fixed ~21 ms serialized
+round trip in the output -> engine -> schedule -> input chain that (a)
+does not scale with batch work, (b) is fully hidden at c8, (c) shadows
+all worker-side compute at c1 (removing 5+ ms of worker CPU changed
+nothing because it sat inside the shadow). py-spy occupancy shares are
+NOT critical-path attribution - the invariance test is.
+
+Ruled out: HTTP/client (harness is stream=False), shm SpinCondition
+quantization (busy-spins for 1 s before idling; 21 ms gaps stay in spin
+mode), async scheduling absence (AsyncScheduler active, dspark
+placeholders in use).
+
+NEXT (highest-value tok/s lever, ~2x c1 if closed): timestamp one cycle
+end-to-end across engine and worker (dequeue -> schedule -> shm
+broadcast -> worker input wait -> launch -> copy_event -> get_output ->
+engine receive) to locate the ~11 ms that is neither worker compute nor
+GPU. Candidates: spec-decode output round trip that async scheduling
+does not actually pipeline at bs=1 (worker starving 14% + engine idle
+85% is consistent with lockstep), TP broadcast rendezvous, api-proc zmq
+hop on the critical path.
