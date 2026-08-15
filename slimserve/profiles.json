@@ -690,11 +690,12 @@
       "platform_overrides": {
         "metal": {
           "engine": {
+            "dtype": "float16",
             "max_model_len": 3072,
             "max_num_seqs": 32,
-            "max_num_batched_tokens": 2048,
+            "max_num_batched_tokens": 2176,
             "gpu_memory_utilization": null,
-            "kv_cache_memory_bytes": 1073741824,
+            "kv_cache_memory_bytes": 1610612736,
             "kv_cache_dtype": "fp8_ds_mla",
             "attention_config": null,
             "tokenizer_mode": "deepseek_v4",
@@ -710,8 +711,9 @@
             "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-            "The fixed 1 GiB hybrid KV pool holds one complete 1,000-input/2,000-output request while keeping the IQ2_XXS target and drafter resident. Higher API concurrency drains in scheduler waves instead of paging model weights.",
-            "max_model_len is 3072 because this profile is tuned and measured for the exact 1k-in/2k-out serving matrix."
+            "The fixed 1.5 GiB hybrid KV pool holds one complete 1,000-input/2,000-output request plus a full single-chunk 2048-token prefill while keeping the IQ2_XXS target and drafter resident. Higher API concurrency drains in scheduler waves instead of paging model weights.",
+            "max_model_len is 3072 because this profile is tuned and measured for the exact 1k-in/2k-out serving matrix.",
+            "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk)."
           ]
         }
       }

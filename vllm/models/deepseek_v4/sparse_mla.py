@@ -42,7 +42,7 @@ class DeepseekV4FlashMLABackend(AttentionBackend):
     sparse-MLA capability flags.
     """
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "fp8_ds_mla",

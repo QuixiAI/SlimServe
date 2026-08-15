@@ -261,6 +261,7 @@ def gumbel_sample(
     output_processed_logits: torch.Tensor | None = None,
     output_processed_logits_col: torch.Tensor | None = None,
     use_fp64: bool = False,
+    all_greedy: bool | None = None,
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -280,12 +281,20 @@ def gumbel_sample(
 
         greedy = row_temperatures == 0
         greedy_sampled = processed.argmax(dim=-1)
-        if bool(greedy.all().cpu()):
+        if all_greedy:
+            # The caller determined all-greedy from CPU-side sampling state,
+            # so no device readback is needed to skip the noise path.
             sampled = greedy_sampled
         else:
             # MPS does not expose Triton's stateless Philox primitive. This
             # path preserves sampling semantics; explicit per-request seed
             # parity remains provided by the native CUDA/HIP kernels.
+            # Without an all_greedy hint the noise runs unconditionally and
+            # the per-row select keeps greedy rows exact — a few extra
+            # launches instead of a queue-draining device read. Note the
+            # unconditional exponential_() advances the global RNG stream
+            # even on all-greedy batches; callers that need RNG-stream
+            # parity with the gated path must pass all_greedy.
             gumbel = -torch.empty_like(processed).exponential_().log()
             random_sampled = (processed + gumbel).argmax(dim=-1)
             sampled = torch.where(greedy, greedy_sampled, random_sampled)
@@ -294,15 +303,10 @@ def gumbel_sample(
             if output_processed_logits_col is None:
                 output_processed_logits.copy_(processed)
             else:
-                cols = output_processed_logits_col
-                if cols.ndim == 0:
-                    output_processed_logits[req_indices, int(cols.cpu())].copy_(
-                        processed
-                    )
-                else:
-                    output_processed_logits[req_indices, cols.to(torch.int64)].copy_(
-                        processed
-                    )
+                # A 0-dim column index broadcasts against req_indices, so the
+                # scalar and per-token cases share one sync-free expression.
+                cols = output_processed_logits_col.to(torch.int64)
+                output_processed_logits[req_indices, cols].copy_(processed)
         return sampled.to(torch.int64)
 
     BLOCK_SIZE = 1024

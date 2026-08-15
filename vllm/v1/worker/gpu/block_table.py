@@ -267,21 +267,23 @@ class BlockTables:
         positions: torch.Tensor,
         num_tokens_padded: int,
         out: torch.Tensor | None = None,
+        num_tokens: int | None = None,
     ) -> torch.Tensor:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
         if self.device.type == "mps":
+            from vllm.v1.worker.gpu.input_batch import mps_segment_ids
+
             slot_mappings.fill_(PAD_SLOT_ID)
-            actual_num_tokens = int(query_start_loc[num_reqs].cpu())
+            actual_num_tokens = (
+                num_tokens
+                if num_tokens is not None
+                else int(query_start_loc[num_reqs].cpu())
+            )
             if actual_num_tokens:
-                query_lens = (
-                    query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
-                )
-                batch_indices = torch.repeat_interleave(
-                    torch.arange(num_reqs, device=self.device),
-                    query_lens.to(torch.int64),
-                )
+                qsl = query_start_loc[: num_reqs + 1].to(torch.int64)
+                batch_indices = mps_segment_ids(qsl, num_reqs, actual_num_tokens)
                 req_indices = idx_mapping.to(torch.int64)[batch_indices]
                 token_positions = positions[:actual_num_tokens]
                 for group_id, (block_table, block_size) in enumerate(

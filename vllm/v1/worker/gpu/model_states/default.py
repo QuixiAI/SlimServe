@@ -188,5 +188,8 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            num_computed_tokens_cpu=torch.from_numpy(
+                input_batch.num_computed_tokens_np[:num_reqs]
+            ),
         )
         return attn_metadata

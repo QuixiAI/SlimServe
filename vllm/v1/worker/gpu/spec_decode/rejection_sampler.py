@@ -174,6 +174,12 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            all_greedy=bool(
+                np.all(
+                    self.sampler.sampling_states.temperature.np[idx_mapping_np]
+                    == 0.0
+                )
+            ),
         )
         return processed_logits, sampled, num_sampled
 

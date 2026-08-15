@@ -1539,3 +1539,4066 @@ Entries above reference the profile ids in force when each run was made
 build is a mix) and broke the tag -> registry-quant mapping; q4ktail names
 the distinguishing feature (layers 37-42 experts in Q4_K). Configs are
 unchanged -- ids only.
+
+## 2026-08-10 - Metal M1 Ultra bring-up: dsv4-xxs-1 crashes fixed; decode is launch-bound at ~0.1 tok/s
+
+- Hardware: Apple M1 Ultra, 128 GiB unified (first non-M5-Max Metal machine).
+  Fresh environment: Xcode 26.3 + Metal Toolchain 17C7003j, Python 3.12 venv,
+  editable metal build (`vllm 0.1.dev19310+ga323b9931.metal`).
+- Two crashes blocked all generation on the profile; both were Metal falling
+  behind recent shared-stack changes, both fixed in-tree:
+  1. `DeepseekV4MetalAttention.forward()` lacked the `prequant_input` kwarg the
+     decoder now always passes (added by the MXFP4 repack work). Signature
+     matched to base in `vllm/models/deepseek_v4/metal.py`; value is provably
+     always None on Metal (gate requires CUDA SM 8.x).
+  2. Shared attention code calls `torch.cuda.is_current_stream_capturing()`,
+     a raising stub on MPS builds. Stubbed to constant False in
+     `vllm/platforms/metal_compat.py` (Metal has no graph capture); documented
+     as compat problem #4.
+- Correctness after fixes: profile serves and answers correctly (counting,
+  primes, haiku all exact at temperature 0, `deepseek_v4` parser splitting
+  clean). No engine errors across ~8 requests.
+- Throughput is broken-level slow and is NOT the drafter: profile path
+  ~0.1 tok/s; spec-decode-disabled A/B (same engine args otherwise) 0.06-0.4
+  tok/s. Interval logger and exact request timing agree (21 tokens / 331 s
+  warm).
+- Attribution (py-spy 30 s @50 Hz + macOS `sample` during decode, raw in
+  `perf/results/2026-08-10/metal-m1ultra-bringup/`):
+  - 77% of engine wall in `_to_list` event-sync (waiting for the GPU queue to
+    drain); the sync sequence itself is 0.3 ms/call idle, so this is real
+    queued work.
+  - The queue is thousands of tiny torch-MPS glue ops per step (add/mul/to/
+    einsum/getitem + MPSGraph encode, some recompiles), i.e. launch overhead,
+    ~95% CPU while decoding. Metal has no CUDA-graph equivalent, so nothing
+    amortizes per-step dispatch.
+  - Exonerated by microbenchmark/inspection: mhc torch reference (0.32 ms/layer
+    pre, 0.07 post = ~25 ms/token total), `_to_list` mechanism, drafter (A/B),
+    MoE (QuixiCore vec path engaged, no slow-fallback warning), hc_head.
+- Note: `kernel_config` initializes `moe_backend='aiter', linear_backend='aiter'`
+  on Metal — wrong-platform default worth auditing, though MoE demonstrably
+  routes to QuixiCore.
+- Reference target on file: ds4 backend, M5 Max, c1 33.68 aggregate tok/s
+  (`perf/baseline_status.md` Metal). ds4 not yet built/measured on this M1
+  Ultra; that comparison run is the next baseline step.
+- Open: reconcile the profiles.json "Measured on M5 Max" note with the current
+  tree's launch-bound behavior (candidate regressions: mHC CustomOp glue,
+  Model Runner V2 staging, repack-era plumbing). Next levers: per-step op
+  census, fuse/trim glue between QuixiCore kernels, port mhc + step glue into
+  the metallib, investigate MPSGraph executable caching.
+
+## 2026-08-10 - CORRECTION: no Metal regression; the vLLM Metal path was never throughput-measured
+
+- The bring-up entry above speculated a regression window ("reconcile the
+  'Measured on M5 Max' note"). Tested and refuted: commit 209265933 (Aug 7
+  Metal restore, pre-repack) serves dsv4-1 on the M1 Ultra at the same
+  ~0.1-0.6 tok/s as HEAD. There is no regression to bisect.
+- `benchmarks/dsv4_metal_perf.md` is explicit on what was validated for the
+  in-tree vLLM Metal worker: a correctness screen (HTTP 200, one speculative
+  round of five draft tokens) plus kernel-level microbenches. The 33.68/35.63
+  tok/s c1 figures are the Historical DS4 baselines (`./ds4-server --metal`),
+  a different engine. The profiles.json "Measured on M5 Max" note covers
+  memory sizing and configuration, not end-to-end TPS.
+- Additional M1 Ultra datum: MPS bf16 runs at ~half fp16 rate here (7.28 ms
+  vs 15.07 ms for a 4096^2 matmul; 73 vs 117 us for tiny ops) - M1-family has
+  no native bf16. A real tax on this machine, but ~2x, not the ~300x gap.
+- Standing conclusion: making the vLLM Metal path competitive with ds4 is
+  first-time optimization work (per-step dispatch overhead dominates), not a
+  revert. ds4 is now built at ~/ds4 on this machine; measuring it locally with
+  the same GGUF is the next baseline step before optimization begins.
+
+## 2026-08-10 - M1 Ultra: ds4 vs SlimServe c1 comparison (campaign baseline)
+
+Fixed workload per `benchmarks/dsv4_metal_perf.md` (1,000 exact input tokens
+from `perf/perf.md`, greedy, c1), harness `benchmarks/benchmark_dsv4_exact.py`,
+same 86,720,111,488-byte 0731 IQ2XXS-w2Q2K GGUF, Mac Studio M1 Ultra 128 GiB,
+macOS 15.7.2.
+
+- ds4 (`~/ds4`, `./ds4-server --metal --ctx 3008 --tokens 2000`, port 18080):
+  - run 1 (offset 1): 21.08 agg tok/s, 488 completion tokens, wall 23.15 s
+  - run 2 (offset 64): 20.51 agg tok/s, 438 completion tokens, wall 21.36 s
+  - decode-only avg from ds4 server accounting: 24.79 tok/s; prefill ~3.4 s
+  - deviations: ds4 has no `ignore_eos` (stops at natural EOS, not 2000) and
+    no `/metrics`; harness gained `--metrics-url none` for this. Prompt
+    accounting exact via `--prompt-overhead 9` (ds4 counts 9 wrapper tokens).
+  - caveat: a stale idle vLLM server (~81 GiB) was resident during both runs;
+    chunk rates were steady (23.5-24.2 tok/s), so thrash unlikely, but the
+    number should be re-verified with clean memory before fine-grained claims.
+- SlimServe (`slimserve dsv4-xxs-1 --serve`, V2 model runner, DSpark +
+  TurboQuant k8v4 active, worktree a323b9931 + two Metal crash fixes):
+  - exact 1000-in/8-out c1: 0.0099 agg tok/s (808.9 s wall), exact=true,
+    10 draft tokens / 7 accepted. Deviation: 8 output tokens instead of 2000
+    because 2000 would take ~5 h at current speed.
+  - interval-log steady-state estimate ~0.1 tok/s decode (diagnostic only).
+  - prefill is healthy (~100 tok/s interval estimate).
+- Gap: ~200-2000x. Raw artifacts: `perf/results/2026-08-10/ds4-m1ultra-c1/`,
+  `perf/results/2026-08-10/slimserve-m1ultra-c1/`.
+
+Diagnosis (code-level, V2 runner path confirmed from server log): per decode
+step SlimServe issues ~10k-14k torch-MPS launches with ~20 host syncs, vs
+ds4's ~700 fused dispatches in 3 command buffers with 1 sync and a 4-byte
+readback. Largest clusters: mHC torch reference ~3.3k ops/step (Metal kernels
+not bound), per-layer slot-table rebuilds ~1.9k ops/step, C128 compressor
+early-out wrongly gated on `is_cuda()` (runs full 128-wide gather every step),
+CPU-side greedy verify pulling full logits, DSpark Markov head 5 syncs/step,
+bf16 (~2x on M1). Fix batches planned: (1) overhead removal with zero numeric
+change, (2) fp16 dtype, (3) bind existing metallib kernels + Metal mHC port.
+
+Campaign plan of record: `perf/metal_m1ultra_campaign.md` (batches, file:line
+targets, measurement protocol, correctness references). Independent audit and
+amended plan: `perf/metal_m1ultra_campaign_v2.md`.
+
+## 2026-08-10 - Batch 1 gate: sha PASS, throughput unchanged; the sync wall was not the binding constraint
+
+- Change under test: campaign v1 Batch 1, all 6 items (C128 early-out on
+  Metal, per-forward slot-table cache, TurboQuant constant caching, GPU greedy
+  rejection-verify, gumbel sync removal, step-prep tensorization via
+  `mps_segment_ids` scatter+cumsum). Worktree-only, zero-numeric-change class.
+- Gate (exact harness, c1, 1000-in/8-out, offset 1, warmup 1, server booted
+  20:47 after all edits): `response_sha256`
+  `db2846cf721bf30ebbe83219fe64bac2c7fb68aa36ebb7294e34ed0fa6ad935b` — exact
+  match to the reference. 2 spec rounds, 10 drafted / 7 accepted, identical to
+  baseline. Correctness: PASS.
+- Throughput: 0.009610 agg tok/s, wall 832.5 s (baseline 0.009890 / 808.9 s).
+  Delta -2.8%, noise. The Batch-1 hypothesis (removing the 77% sampler-sync
+  wall moves 0.1 -> 1-3 tok/s) is REJECTED.
+- Why, measured: a 5 s macOS `sample` of the EngineCore mid-decode put 99.94%
+  of main-thread samples inside `-[MTLCommandQueue commandBuffer]`'s
+  semaphore wait via MPSGraph commitAndContinue — the queue's in-flight
+  command-buffer limit. The GPU is saturated executing the per-step op storm;
+  the removed host syncs were waiting on real queued work (the bring-up entry
+  already measured the sync mechanism at 0.3 ms idle). Removing waits does
+  not shrink work; the wall moved from event-sync to CB-allocation
+  backpressure.
+- Decision: RETAIN the Batch-1 changes (correct hygiene, bit-identical, and
+  they remove Python latency that matters once the queue thins), but the
+  throughput recovery is reassigned to launch-count reduction: kernel
+  bindings, the mHC Metal port, and the native step tape (campaign v2
+  Batches 3-4).
+- Caveats: single gate run; the 1-token warmup compiles prefill graphs but
+  not the spec-decode step graphs, so some first-run MPSGraph compilation
+  landed inside the measured window; a warm re-run was killed mid-flight when
+  the serving session's teardown took the server down. fp16 (Batch 2) will
+  take cold+warm pairs on a fresh server.
+- Artifacts: `perf/results/2026-08-10/slimserve-m1ultra-c1-batch1/`
+  (`gate_8tok_recovered.json` — result JSON recovered from the executing
+  session's transcript; the aborted re-run's stderr alongside). Engine sample:
+  session scratchpad `enginecore_sample.txt`.
+
+## 2026-08-10 - Batch 1 (overhead removal) verdict: correct, speed-neutral;
+## real bottleneck is GPU kernel time
+
+- Baseline: 8-token exact gate 809 s (0.0099 tok/s), sha db2846cf7...
+- Change: all Batch-1 items from perf/metal_m1ultra_campaign.md (C128
+  compressor gate, slot-table pass-cache, TurboQuant constant cache, GPU
+  greedy verify, gumbel sync removal, tensorized MPS step-prep). Unit
+  harness on MPS vs loop references: 16/16 pass (artifact dir).
+- Correctness: PASS — identical sha db2846cf7..., exact=true, 10 draft/7
+  accepted (unchanged).
+- Throughput: 832.5 s — NO CHANGE. Sync/launch-overhead hypothesis
+  falsified at current speeds.
+- New evidence: native `sample` of EngineCore during decode shows 78% of
+  wall blocked in `[AGXG13XFamilyCommandQueue commandBuffer]` semaphore —
+  Metal queue saturated with committed GPU work. One step (6-token verify
+  block) costs minutes of REAL GPU time. Prime suspect: a metallib kernel
+  class that is pathologically slow on M1-family (never timed off M5 Max),
+  ggml_moe_a8_vec first. See campaign doc "Revised next step".
+- Decision: keep Batch 1 (numeric-neutral, protected by unit harness,
+  removes overhead that matters post-fix). Next action: isolate per-kernel
+  GPU time on M1 (microbench), not more glue work.
+- Artifacts: perf/results/2026-08-10/batch1-overhead-removal/
+
+## 2026-08-10 - Batch 2 (fp16) + MoE kernel exoneration: eater is NOT dtype,
+## NOT the GGUF kernels
+
+- Baseline: bf16 ~104 s/token (832.5 s / 8-token gate, Batch-1 worktree).
+- Hypothesis: M1 has no hardware bf16; `dtype float16` halves torch-MPS glue
+  cost -> up to ~2x end-to-end.
+- Changes: `profiles.json` dsv4-xxs-1 metal engine `dtype: float16`;
+  `sparse_mla.py` supported_dtypes += fp16; `mhc/torch.py` dtype-boundary fixes
+  (assert widened to bf16|fp16, outputs follow input dtype — internal math was
+  already fp32, bf16 serving bit-identical); `metal.py` casts q/kv to bf16 at
+  the two bf16-typed Metal binding call sites (qnorm_rope_kv_insert,
+  sparse_attention; decode q/kv are KB-scale, casts are no-ops under bf16).
+- Crash found & fixed: first fp16 boot died at `mhc_pre_torch` bf16 assert on
+  the first request. Full Metal-path sweep: compressor state cache pinned fp32
+  by design (safe), TurboQuant ops dtype-parametric (safe), ggml ops accept
+  half/bf16 and convert to half internally (the GEMV path never was
+  bf16-bound).
+- Correctness: 4-token greedy probe returns plausible text (":\n1. **").
+  sha-level gate deferred until per-token cost is sane; bf16 reference TEXT was
+  never dumped, so token-level fp16-vs-bf16 comparison will use the new
+  `--dump-completions` output going forward.
+- Throughput: warm 4-token probe 441.9 s (~110 s/token) vs bf16 ~104 s/token
+  -> NO CHANGE. Hypothesis REJECTED as the bottleneck fix; the eater is
+  dtype-independent.
+- Companion measurement (isolated, idle GPU, synthetic weight bytes, real
+  shapes): `ggml_moe_a8_vec` on M1 Ultra — m=1 gate/up 0.215 ms + down
+  0.103 ms; m=6 1.032 + 0.501 ms. All-43-layer MoE ~14 ms (m=1) / ~66 ms (m=6)
+  per pass. MoE kernels EXONERATED: >99.9% of step time is outside the GGUF
+  kernels (torch-MPS ops, attention/compressor/mHC glue, or a CPU fallback).
+- Decision: keep fp16 config + dtype-boundary patches (correct, neutral, and
+  the glue win becomes real once the eater dies). Next: per-op GPU census of a
+  live decode via `PYTORCH_MPS_LOG_PROFILE_INFO=31` (validated: prints ranked
+  per-op Total GPU(ms) + CPU-fallback table at process exit) — census boot in
+  progress, results in `perf/results/2026-08-10/mps-op-census/`.
+- Artifacts: `perf/results/2026-08-10/slimserve-m1ultra-c1-batch2/`
+  (probe JSONs + timings, fp16 server log),
+  `perf/results/2026-08-10/kernel-microbench-m1ultra/` (script + results).
+
+## 2026-08-10 - ROOT CAUSE FOUND: Metal working-set oversubscription ->
+## VM-compressor thrash (~110 s/token explained)
+
+- Method: elimination + direct observation. Isolated microbenches on idle GPU
+  cleared every kernel class: `ggml_moe_a8_vec` m=6 gate/up 1.03 ms + down
+  0.50 ms (~66 ms/pass all layers); `deepseek_v4_sparse_attention` worst case
+  0.64 ms (~27 ms/pass); dense q8_0 GEMVs 0.1-0.8 ms, lm_head m=6 4.5 ms.
+  MPS per-op census stream (PYTORCH_MPS_LOG_PROFILE_INFO): no CPU fallbacks;
+  aten stream dominated by tiny fp32 mHC sinkhorn ops ([6,4,4] etc.), ~10k
+  launches/pass ~= 1 s. Total accounted GPU work: < 2 s/verify pass. Observed:
+  ~270 s/spec round.
+- Direct evidence: at IDLE with the server healthy — Pages free 71 MB;
+  compressor holding 5.08M pages (~77 GiB uncompressed) of EngineCore's
+  buffers; EngineCore RSS 6.9 GiB; `footprint -p` = 95 GB phys, ALL
+  IOAccelerator, no CPU-side copy. "Model loading took 93.49 GiB"
+  (weights+drafter Metal buffers) vs 72.5 GiB GGUF file = +21 GiB load
+  expansion. Demand (weights + KV 1 GiB + TurboQuant draft KV + MPSGraph pools
+  + activations) exceeds the M1 Ultra recommendedMaxWorkingSetSize (~96 GiB on
+  128 GiB), so Metal's residency manager cycles weight buffers through the VM
+  compressor on every command buffer. Each token touches all weights ->
+  perpetual decompress/recompress at ~1 GB/s effective -> ~90-110 s/token.
+  Matches warm==cold, dtype-independence, Batch-1 null result, and both
+  `commandBuffer` semaphore samples. ds4 fits under the ceiling; that is the
+  entire gap.
+- Fix lanes: (a) shave the +21 GiB load expansion (find what the Metal GGUF
+  load path allocates beyond packed tensor bytes — aligned-Q8 repack copies,
+  allocator slack, dequantized embeds are the suspects) until demand sits
+  comfortably under ~92 GiB; (b) `sudo sysctl iogpu.wired_limit_mb=115000`
+  (raises the ceiling to ~112 GiB) as the instant proof/unblock — requires
+  operator sudo, not persistent across reboot by default.
+- Decision: treat footprint as THE current optimization target. Kernel-side
+  batches (3-6) are unblocked but pointless until residency is sane.
+- Artifacts: `perf/results/2026-08-10/kernel-microbench-m1ultra/`
+  (attn_microbench.py + results in session scratchpad, copied alongside),
+  `perf/results/2026-08-10/mps-op-census/server_census.log` (streamed op
+  census; summary lost to hard kill), vm_stat/footprint snapshots in this
+  entry.
+
+## 2026-08-10 - RESIDENCY FIX LANDED: 110 s/token -> 1.41 s/token (78x)
+
+- Baseline: fp16 server, warm 4-token probe 441.9 s (~110 s/token); vm_stat
+  during decode showed pure rotation (compressions ~215 MB/s ~= decompressions
+  ~208 MB/s, compressor pool GREW while decoding — never converges).
+- Change (both Metal-only):
+  1. `gguf_weight_utils.py`: windowed `madvise(MADV_DONTNEED)` over consumed
+     GGUF file ranges during load (2 GiB window, `VLLM_GGUF_MADVISE=0` to
+     disable) so the mmap's page cache stops evicting freshly written Metal
+     weight buffers.
+  2. `metal_worker.py::_make_weights_resident`: post-load GPU-side sweep
+     touching every MPS weight buffer once (skips lazy GGUF placeholders)
+     while nothing competes for memory.
+- Boot evidence: load 93.49 GiB / 43.1 s (unchanged); sweep touched 91.84 GiB
+  in 65.7 s (one-time repair); post-boot compressor 0.5 GiB (was 70 GiB),
+  anonymous 98.6 GiB resident, 19.8 GiB free. Residency HELD through decode
+  (compressor still 0.5 GiB after probes).
+- Throughput: 16-token probes cold 21.7 s / warm 22.6 s -> 1.41 s/token
+  (0.71 tok/s agg with 13-token prompt), vs 110 s/token before: ~78x.
+  Text coherent ("Memory access pattern... Coalesced memory access").
+- Now in the launch-overhead regime the campaign v1/v2 docs assumed all
+  along: ~1.4 s/step of torch-MPS glue + ~10k tiny launches. Batches 3-6
+  (bind kernels, mHC port, native step tape, spec economics) now apply as
+  designed, and every measurement loop is ~50x cheaper.
+- 8-token exact gate (cold+warm, --dump-completions) running; fp16 sha will
+  differ from the bf16 reference legitimately — dumped text becomes the fp16
+  reference for subsequent zero-numeric-change batches.
+- Artifacts: `perf/results/2026-08-10/residency-fix/` (server log, gates,
+  completions, probe timings in session scratchpad `fixed_probe_*.json`).
+
+## 2026-08-10 - Post-residency 8-token exact gates: sha-EXACT vs bf16
+## reference, 0.7248 tok/s (75x over the recorded baseline)
+
+- Gate (cold+warm, c1, 1000-in/8-out, offset 1, warmup 1): both runs
+  aggregate 0.7248 / 0.7244 tok/s, wall 11.0 s, exact=true, 2 drafts /
+  10 draft tokens / 7 accepted — identical spec pattern to the bf16 runs.
+- Correctness: sha db2846cf721b... == the ORIGINAL bf16 reference. fp16
+  serving is bit-identical on this gate (greedy argmaxes unmoved over 8
+  tokens); the dumped completions in
+  `perf/results/2026-08-10/residency-fix/completions_{cold,warm}` are the
+  standing reference texts.
+- vs baselines: 0.0099 (bf16, thrashing) -> 0.7248 tok/s. ds4 bar: 21.08 agg
+  (24.79 decode-only). Remaining gap ~29x, now living in torch-MPS glue +
+  ~10k launches/step — the territory Batches 3-6 were designed for.
+- Batch 2 (fp16): CLOSED, kept. Residency fix: CLOSED, kept (madvise loader
+  window + boot resident sweep + vm_stat watch).
+- Next: per-op census on the fast server (graceful shutdown for summary
+  flush this time) to rank the 1.4 s/step, then Batch 3 wave 1 binding in
+  measured priority order.
+- Artifacts: `perf/results/2026-08-10/residency-fix/gate_8tok_{cold,warm}.json`
+
+## 2026-08-10 - Session handoff state (post-residency-fix)
+
+- Box state: a census server (PYTORCH_MPS_LOG_PROFILE_INFO=31, fp16, all
+  fixes) was booting at handoff — log
+  `perf/results/2026-08-10/mps-op-census/server_census2.log`. Next step when
+  picking up: wait /health, run one 8-token gate, then SIGTERM (NOT -9) the
+  EngineCore so the MPS profiler flushes its ranked per-op Total GPU(ms)
+  table + CPU-fallback report at exit; that ranking sets Batch-3 binding
+  order. If the server is unwanted, plain `kill` both pids.
+- Worktree (all uncommitted, building on the other session's Batch-1 edits):
+  `gguf_weight_utils.py` (madvise window), `metal_worker.py` (resident
+  sweep), `mhc/torch.py` + `metal.py` + `sparse_mla.py` (fp16 dtype
+  boundaries), `profiles.json` (dtype float16), `benchmark_dsv4_exact.py`
+  (--dump-completions).
+- Standing references: fp16 8-token gate sha db2846cf721b... == bf16
+  reference; completions dumped under
+  `perf/results/2026-08-10/residency-fix/completions_{cold,warm}`.
+- Current recorded baseline: 0.7248 tok/s c1 8-token gate. Bar: ds4 21.08
+  agg / 24.79 decode-only (ds4+DSpark still unmeasured — Batch 7).
+
+## 2026-08-10 - [SUPERSEDED - root cause was wrong, see the SIGSEGV entry
+## below] Resident sweep boot death, first (incorrect) diagnosis
+
+- Symptom: census2 boot (PYTORCH_MPS_LOG_PROFILE_INFO=31) died during
+  `_make_weights_resident` with no Python traceback — EngineCore vanished,
+  APIServer reported "Failed core proc(s): {}". Load itself was healthy:
+  93.49 GiB in 45.3 s (madvise loader working; pages NOT compressed).
+- Root cause (read straight off the profiler op stream): MPS materializes a
+  same-size transient `aten::copy_identity` for every uint8-view `.sum()`
+  the sweep issues. The sweep queued all ~700 touches into the stream with a
+  single synchronize at the end; the log ends with EIGHT consecutive
+  Byte[1107296256] (1.03 GiB, per-layer fused gate/up experts) copies queued
+  back-to-back before any sum retired — ~8 GiB of in-flight transients on
+  top of 93 GiB of weights, and the OS memory-killed the process.
+- Why the first boot survived: its sweep was repairing compressed pages at
+  ~0.44 GB/s, so slow reads throttled the queue naturally. A HEALTHY boot
+  (pages resident, madvise effective) queues fast enough to self-destruct.
+  Not a profiler artifact — the profiler just made the op stream visible.
+- Fix (`metal_worker.py::_make_weights_resident`): `torch.mps.synchronize()`
+  after every >= 2 GiB of touched bytes, capping in-flight transients at
+  ~one large tensor. Full-read touch semantics unchanged.
+- Evidence: `perf/results/2026-08-10/mps-op-census/server_census2.log`
+  (lines ~2100-2130 for the copy pileup, line 2031 for the healthy load).
+- Status: fix landed; census3 boot validating it (log `server_census3.log`).
+
+## 2026-08-10 - Census boot deaths root-caused for real: SIGSEGV in torch
+## MPS reduction dispatch on GiB-scale sums under the profiler
+
+- The sync-window fix from the previous entry changed NOTHING: census3 died
+  with the identical op-stream signature at the identical position. Two
+  deterministic deaths at the same op is not a timing-dependent memory kill.
+- Ground truth from macOS crash reports
+  (`~/Library/Logs/DiagnosticReports/python3.12-2026-08-10-22{21,30}*.ips`,
+  one per census boot): EXC_BAD_ACCESS / SIGSEGV, KERN_INVALID_ADDRESS at
+  0x5c8 — a nil-object ivar dereference in
+  `-[AGXG13XFamilyComputeContext setComputePipelineState:]`, called from
+  `at::native::reduction_dispatch_mps` inside `aten::sum` — i.e., torch's
+  MPS reduction got a nil compute pipeline state for the sweep's 1.03 GiB
+  uint8 sum (the per-layer fused gate/up expert tensor).
+- Size- and profiler-dependent: smaller sums (2-17 MB) in the same stream
+  succeeded; the very same GiB-scale sums succeeded in the unprofiled
+  residency-fix boot. Only PYTORCH_MPS_LOG_PROFILE_INFO=31 + GiB-scale
+  reduction crashes. Upstream torch MPS bug; not worth chasing internally.
+- Fix (`metal_worker.py::_make_weights_resident`): sweep in 128 MiB slices
+  of the flat uint8 view instead of one whole-tensor sum. Same full-read
+  touch semantics, chunk size safe on every dispatch path, boot no longer
+  cares whether a profiler is attached. Kept the 2 GiB sync window (the
+  transient copies per sum are real, just not the killer).
+- The 8x Byte[1107296256] copy_identity lines before death were a red
+  herring: most plausibly chunked sub-launches of one big op logged with the
+  full tensor label, not eight queued layer copies.
+- Status: census4 boot validates next.
+
+## 2026-08-10 - CENSUS HARVESTED: ~20k launches per engine step, sinkhorn
+## loop is 54% of them. Batch-3 order is now data-set: mHC port first
+
+- Census4 boot (chunked sweep + profiler): healthy, sweep 91.84 GiB/75.1 s,
+  8-token gate sha-EXACT (db2846cf721b...) at 11.55 s wall — profiler
+  overhead only ~5%. SIGTERM flushed the ranked tables (135 graphs, 121
+  kernels, zero CPU fallbacks; copies: 3114 totaling 132 GiB, dominated by
+  load H2D + sweep transients).
+- The table's per-op GPU(ms) columns are command-buffer-attributed (tiny ops
+  "cost" ~150 ms because they inherit the whole CB) — useless for absolute
+  cost, so the ranking below is launch-count-based, which is the right
+  currency anyway in a launch-overhead-bound regime.
+- Op-stream segmentation of the gate window (split on argmax[1,129280], one
+  per sampled token): ONE ENGINE STEP = 19,991 launches = verify pass 18,528
+  + drafter pass 1,447 + 16 sampler ops. At ~4.2 s/step (0.72 tok/s x ~3
+  tok/step) that is ~210 us/launch — the step is pure launch overhead; GPU
+  compute is milliseconds (microbench: <2 s accountable, mostly <100 ms).
+- Verify-pass breakdown (launches): sinkhorn [6,4,4] row/col normalize loop
+  10,062 (43 layers x ~39 iters x 2 norms x 3 ops: sum, add-eps, div);
+  fp32 RMS chains at widths 512/4096/16384 ~2,580; copy_identity ~2,280
+  (incl. BF16[1048576,32] KV-page copies x168, Float[6,4096] x217); casts
+  712; mHC gates (sigmoid/add/mul [6,4]) ~520. Drafter pass mirrors it:
+  702/1,447 = 48% sinkhorn.
+- DECISION (reorders Batch 3): wave 2 (Metal mHC port) is the top lever, not
+  wave 1. A single fused per-layer sinkhorn kernel (43 launches vs 10,062)
+  removes 54% of step launches; fused mHC pre/post (gates + RMS chains)
+  removes another ~3-4k. Remaining ~5k glue is Batch-4 step-tape territory.
+- Launch math to the bar: 20k -> ~200 launches/step at 210 us = ~0.05-0.1
+  s/step = ~30-60 tok/s potential — the fuse-everything strategy is the
+  right shape; sinkhorn fusion is step one.
+- Artifacts: `perf/results/2026-08-10/mps-op-census/census4_ranked_table.txt`
+  (flushed profiler tables), `census4_segment.py` (segmentation analysis),
+  `server_census4.log` (full stream), `gate_census4.json` (sha-exact gate).
+
+## 2026-08-10 - Batch 3 wave 2 IMPLEMENTED: Metal mHC kernels (fused
+## sinkhorn), parity clean, serving gate pending
+
+- What landed: `csrc/quixicore/metal/kernels/serving/dsv4_mhc/dsv4_mhc.metal`
+  (new MSL: dsv4_mhc_pre / dsv4_mhc_fused_post_pre / dsv4_mhc_post /
+  dsv4_hc_head, fp16+bf16 instantiations), host glue + pybind in
+  `qc_metal_serving.mm` (same op names/signatures as the Ampere build, so
+  `quixicore_ops.has()` lights up unchanged), and `forward_mps` overrides in
+  `vllm/model_executor/layers/mhc.py` gated by `_use_quixicore_mhc_metal`
+  (tokens <= 32, hc_mult 4, fp16/bf16; VLLM_METAL_MHC=0 kill switch;
+  T > 32 keeps the batched-MPSGraph torch path for prefill).
+- Design: port of mhc_ampere.cuh reshaped for decode widths -- one
+  threadgroup (256 threads, 8 simdgroups) per token; 3 fn rows per
+  simdgroup; whole ~39-iteration Sinkhorn in registers on lanes 0..15 via
+  XOR shuffles (rows = XOR 1/2, cols = XOR 4/8); round-to-activation-dtype
+  of the mixed residual between post and pre matches the torch
+  decomposition exactly. Replaces ~230 aten launches per fused call with 1.
+- Build: manual xcrun metal (flags from cmake/metal.cmake) + manual clang++
+  of qc_metal_serving.mm; artifacts installed at vllm/quixicore_metal.metallib
+  + vllm/_quixicore_C.cpython-312-darwin.so (backups in session scratchpad).
+- Parity (random DSV4 shapes, T in {1,6,8}, fp16+bf16, repeat=20): fp32
+  gates/comb agree to 1e-6..1e-5; activation-dtype outputs to one ulp of
+  fp16/bf16 (reduction-order noise). Isolated timing: 86 fused calls 30.2 ms
+  (kernel) vs 66.6 ms (torch decomposition) -- understates the serving win,
+  where the ~10k removed launches contend with the step's CPU encode thread.
+- Expectation from census: verify pass 18,528 -> ~8k launches (sinkhorn
+  10,062 + ~500 gate glue removed); drafter 1,447 -> ~750.
+- Next: boot dsv4-xxs-1, 8-token gate. sha may legitimately differ from
+  db2846cf721b... (reduction order); if so, compare decoded text/tokens and
+  judge semantically, then re-baseline.
+
+## 2026-08-10 - mHC kernel first serving gates: sha-EXACT, but timing was
+## thrash-contaminated; sweep hardened with verification loop
+
+- First boot with the Metal mHC kernels (server_mhc1.log): both 8-token
+  gates sha-EXACT (db2846cf721b... == the standing reference) with the
+  identical spec pattern (2 drafts / 10 draft tokens / 7 accepted). The
+  kernels are BIT-IDENTICAL to the torch path on this gate — no
+  re-baselining needed.
+- But wall 91.4 s cold / 73.3 s warm vs 11.55 s baseline: NOT the kernels.
+  vm_stat showed ~50-60 GiB in the VM compressor with active rotation
+  (~2.4 GB/s) during decode; `top` attributed only ~1 GiB of it to
+  processes — compressed MTLBuffer pages are charged to the GPU subsystem,
+  invisible to per-process accounting (footprint/RSS/CMPRS all miss them).
+  Killing the server drained the pool 60 GiB -> 11 MB instantly, proving
+  ownership. The EngineCore main thread sampled as blocked in
+  MPSEvent::synchronize — GPU-side decompression stalls, zero CPU suspects.
+- Lesson (second thrash incident): a boot on a dirty box can complete the
+  resident sweep and STILL end up half-compressed before serving; sweep
+  wall time is not a reliable health signal (census4's 75 s sweep -> healthy
+  gate; mhc1's 40.7 s sweep -> sick gate). Only the global vm_stat
+  compressor occupancy tells the truth.
+- Hardening (metal_worker.py): `_compressor_bytes()` (vm_stat parse);
+  `_make_weights_resident` now verifies occupancy after each pass and
+  repeats up to 3x until < 4 GiB or non-converging (with explicit
+  warnings); `compile_or_warm_up_model` re-checks after warmup/KV-alloc and
+  re-sweeps if the pool grew. Serving can no longer start silently
+  half-compressed.
+- Next: clean-box boot + gate = the real mHC kernel A/B (baseline 0.7248
+  tok/s, 11.55 s wall).
+
+## 2026-08-10 - mHC kernel clean-box gates + the bimodal step discovery
+
+- Clean-box boot with verified residency (hardened sweep caught 50.75 GiB
+  still compressed after pass 1 ON A CLEAN BOX — the load itself
+  oversubscribes transiently; pass 2 drained to 160 MB. The old single-pass
+  sweep was never sufficient; earlier healthy boots were luck).
+- 8-token gates: sha-EXACT, cold 15.82 s (first-request pipeline builds),
+  warm 10.36 s / 0.7723 tok/s vs baseline 11.0 s / 0.7248 — only +6.6%,
+  far under the launch math. Longer runs were WORSE: 64-token exact gate
+  0.176 tok/s (364 s), 64-token short-prompt probe 0.267 tok/s.
+- Streaming per-token timing (48-token request) explains everything: step
+  times are BIMODAL — healthy steps at a flat ~2.7 s/step, interrupted by
+  10-35 s "sick" steps in bursts. vm_stat during sick bursts: compressor
+  refilling at GB/s (42 -> 57 GiB in 6 s mid-decode), then self-draining to
+  ~350 MB at idle. EngineCore phys_footprint stable at 99 GB (peak == 99):
+  no allocator growth; the OS transiently compresses ~half the wired-ish
+  weight pages under decode-induced pressure episodes, then lets them back.
+- Read on the mHC kernels themselves: healthy-step time 2.7 s vs the
+  baseline's ~4.2 s/step (1.41 s/token x ~2.67 tok/step) = ~1.55x real
+  per-step win, consistent with removing 10.8k of 20k launches. The
+  episodes are the dominant remaining cost and are likely INDEPENDENT of
+  the kernels (baseline was only ever gated on 8-token runs — short enough
+  to fit inside one healthy window; its long-request behavior was never
+  measured).
+- ds4 does not suffer this: its weights are file-backed mmap, droppable for
+  free; ours are anonymous MTLBuffer pages that must go through the
+  compressor. Structural fix candidates: MTLResidencySet pinning
+  (macOS 15+), reducing transient allocation spikes, or wired-limit tuning.
+- In flight: A/B reboot with VLLM_METAL_MHC=0, same 48-token stream + gate
+  protocol, to attribute episodes and confirm the healthy-step delta.
+- Artifacts: perf/results/2026-08-10/mhc-metal-kernel/ (gate2_8tok_{cold,warm},
+  gate2_64tok.json, server_mhc2.log, scratchpad stream_timing.log).
+
+## 2026-08-10/11 - A/B verdict: mHC kernels sha-exact but step-neutral; the
+## step is SYNC-bound, not launch-bound. Episodes are environmental.
+
+- Identical protocol on two clean verified-resident boots (48-token stream,
+  per-chunk timing): kernels ON = healthy 2.65-2.78 s/step, total 272.6 s;
+  kernels OFF (VLLM_METAL_MHC=0) = healthy 2.66-2.94 s/step, total 260.9 s.
+  Compression episodes (10-41 s steps in bursts) occur in BOTH.
+- Conclusion 1: the episodes are a box/VM phenomenon, not the kernels.
+- Conclusion 2 (the big one): removing ~10.8k of ~20k launches/step did NOT
+  change healthy-step time. The launch-overhead model (210 us/launch) is
+  FALSIFIED — aten launches encode asynchronously behind the real
+  bottleneck. The earlier decode-time `sample` of the EngineCore showed the
+  main thread parked in THPEvent_synchronize -> MPSEvent::synchronize: the
+  step is bounded by CPU<->GPU SYNC POINTS (command-buffer commit +
+  wait roundtrips), exactly the structure ds4 beats with 2-3 command
+  buffers and exactly 1 wait per token. This is Batch 4's thesis, now
+  measured. GPU compute per pass is ~0.1-0.3 s (microbench), so ~2.4 s of
+  every 2.7 s step is sync/latency air.
+- mHC kernel disposition: KEEP (sha-exact db2846cf721b... on all gates,
+  cuts ~10.8k launches and the associated CPU encode load, prerequisite for
+  a lean step tape) — but the throughput claim is "neutral today, enabling
+  later," not a win now. Batch-3 wave-1 generic binding is DEPRIORITIZED:
+  more launch removal cannot pay until the syncs are gone.
+- NEW PRIORITY ORDER: (1) find and eliminate per-step sync points (Batch 4
+  wave 0), (2) episode mitigation (transient-spike source or
+  MTLResidencySet pinning), (3) step tape proper.
+- Artifacts: gate_baseline_ab.json, server_baseline_ab.log,
+  scratchpad/stream_timing{,_baseline}.log.
+
+## 2026-08-11 - Session handoff (post-mHC-port, post-A/B, sync hunt open)
+
+- Box state: NO server running. Compressor clean. Last event: a diagnostic
+  boot with the sync profiler (VLLM_SYNCPROF=1 + PYTHONPATH usercustomize
+  wrap of mps.synchronize/Event.synchronize/item/tolist/numpy) booted
+  healthy, then the EngineCore died SILENTLY while idle ~15 s after boot —
+  no traceback, no crash report, no jetsam log. UNRESOLVED. Suspect the
+  usercustomize wrappers (Tensor.item/tolist wrap in some background
+  thread, or signal registration); next session: bisect by enabling one
+  wrapper class at a time, or instrument inside the runner instead.
+- Proven this session: (1) census: ~20k launches/step, sinkhorn 54%;
+  (2) Metal mHC kernels landed sha-EXACT (db2846cf721b...), remove ~10.8k
+  launches/step — but A/B (VLLM_METAL_MHC=0) shows healthy-step time
+  UNCHANGED at ~2.7 s: the step is SYNC-bound (main thread parks in
+  MPSEvent::synchronize; GPU compute ~0.3 s). Launch count is NOT the lever
+  until syncs die. (3) Step times are bimodal: ~2.7 s healthy + 10-41 s
+  compression-storm episodes in BOTH configs (environmental; ds4 immune via
+  file-backed mmap weights; candidate fix MTLResidencySet pinning).
+  (4) Sweep hardened: multi-pass + vm_stat verification + post-warmup
+  recheck (metal_worker.py); single-pass sweeps were silently insufficient.
+- Standing numbers: 8-tok gate warm 0.7723 tok/s (mHC on, clean box);
+  64-tok gate 0.176 tok/s (episode-dominated); ds4 bar 21.08/24.79.
+- Priority order (data-driven): (1) find+kill per-step syncs [Batch 4 wave
+  0, task #12], (2) episode mitigation (spike source or MTLResidencySet),
+  (3) step tape [#5]. Wave-1 generic binding [#3] deprioritized.
+- Uncommitted worktree adds this session: dsv4_mhc.metal (new),
+  qc_metal_serving.mm (mHC glue+pybind), mhc.py (forward_mps x4 + metal
+  gate), metal_worker.py (chunked+verified sweep), gguf_weight_utils.py
+  (madvise, prior), rebuilt vllm/quixicore_metal.metallib +
+  vllm/_quixicore_C.so (manual build cmds in the 23:0x entries; backups in
+  scratchpad). Rebuild recipe: xcrun metal per cmake/metal.cmake flags;
+  clang++ cmd in transcript (or rerun full editable build).
+- Artifacts: perf/results/2026-08-10/{mps-op-census,mhc-metal-kernel}/;
+  stream timing logs in session scratchpad (copy out if needed —
+  scratchpad is session-scoped).
+
+## 2026-08-11 - Sync hunt landed: step is COMMAND-BUFFER-SUBMISSION-bound (task #12)
+
+- Baseline going in: healthy decode step ~2.7 s (A/B-proven sync-bound);
+  open question was WHERE the wait goes. Prior profiler attempt killed the
+  EngineCore silently.
+- Silent-death mystery RESOLVED: torch.Event is an immutable C type in
+  torch 2.13; the old usercustomize `_wrap(torch.Event, ...)` raised
+  TypeError into a blanket except, aborting the install BEFORE the SIGUSR2
+  handler registration. Default disposition of unhandled SIGUSR2 is silent
+  process termination — no traceback, no .ips, no jetsam. The harvest
+  signal itself killed the engine. Lesson: never gate a signal handler
+  registration behind fallible setup; better, avoid signals entirely.
+- New instrument (kept, opt-in): vllm/v1/worker/metal_syncprof.py, armed
+  via VLLM_SYNCPROF=1 from MetalWorker.init_device — worker-process-only,
+  no signals, daemon-thread dumps to /tmp/syncprof_<pid>.txt every
+  VLLM_SYNCPROF_INTERVAL s (+ cumulative CB CSV, see below). Wraps
+  mps.synchronize, Tensor.item/tolist/numpy/cpu/nonzero/__bool__,
+  mps.Event.*, AsyncOutput.get_output, GPUModelRunner.execute_model.
+- Static sweep (subagent, full v2 runner path): exactly ONE legitimate
+  per-step python sync — AsyncOutput.get_output -> copy_event.synchronize
+  (async_utils.py:56). DSpark propose loop and sampler are sync-free by
+  construction (CPU numpy mirrors). Latent hazards noted: logprobs
+  requests add 3 blocking .cpu() per step (outputs.py:65-67);
+  turboquant_attn.py:378 would sync per request×layer if causal ever
+  arrives as a tensor.
+- Measured (64-tok gate, syncprof on, sha 77612826a079... MATCHES prior
+  boot exactly — deterministic, profiler is correctness-neutral):
+  wall 418.7 s; get_output TOTAL 358.0 s / 26 calls; execute_model TOTAL
+  88.4 s / 28 calls (~1.6 s/step CPU-side python encode in decode tail);
+  ALL other python syncs sum to <0.02 s. No hidden syncs.
+- sample(1) during pure decode (10 s window, all threads): main thread
+  78% parked in THPEvent_synchronize->MPSEvent::synchronize, 22% python;
+  every worker/gloo/zmq thread idle; BUT DispatchQueue
+  com.Metal.CommandQueue busy 364/382 samples inside
+  -[_MTLCommandQueue _submitAvailableCommandBuffers], ~92% of that in
+  mach_msg2_internal (driver round-trips). VERDICT: the GPU timeline is
+  paced by command-buffer submission — a stream of tiny CBs each paying a
+  fixed driver/scheduling round-trip, GPU idle between them. Explains the
+  mHC A/B neutrality: cost is per-CB, not per-launch.
+- Next instrument (built, awaiting measurement): CB census in
+  qc_metal_serving.mm — swizzles the concrete MTLCommandQueue class's
+  commandBuffer factories (via objc runtime), counts creations and
+  accumulates GPUEndTime-GPUStartTime in completion handlers; pybind
+  cb_census_install/cb_census_read; syncprof dumps cumulative rows to
+  /tmp/syncprof_cb_<pid>.csv. Standalone smoke: 200 fp16 2048^2 matmuls ->
+  28 CBs, 0.186 s GPU busy (light-memory adaptive commit ≈ 7 ops/CB).
+  Target numbers: CBs per decode step + GPU busy fraction of the 2.7 s.
+- Decision pending those numbers: if CBs/step is O(thousands) and GPU busy
+  fraction ~10%, the native step tape (Batch 4, 2-3 CBs/step) is the
+  centerpiece with ~9x healthy-step headroom, and torch-side commit-policy
+  tuning is the interim lever.
+- Artifacts: perf/results/2026-08-11/syncprof-inrunner/ (server.log,
+  dump_pre/mid/post/final.txt, sample_decode.txt, gate64_stdout.txt).
+
+## 2026-08-11 - STORM KILLED: MTLResidencySet weight pinning, 64-tok gate 0.10 -> 4.38 tok/s (36x)
+
+- Baseline: 64-tok gate 0.10-0.18 tok/s (wall 364-631 s), compressor
+  sawtooth 1->46->1 GiB cycling continuously, GPU ~100% "busy" = fault
+  stalls (CB census windows with 0 new CBs at 100% busy for tens of s).
+- Root-cause chain, each theory measured and the wrong ones killed:
+  (1) NOT allocator bloat: syncprof gauges show driver_allocated FLAT at
+  97.77 GiB, current 94.6 GiB, across the whole request.
+  (2) NOT working-set infeasibility: recommended_max_memory=120 GiB
+  (iogpu.wired_limit_mb=122880 already raised on this box), we are 22 GiB
+  under.
+  (3) Remaining and consistent with all data: torch MPS buffers are
+  pageable anonymous memory; MPS only declares residency per command
+  buffer, so between touches macOS proactively compresses the "idle"
+  weight pages in tens-of-GiB waves (heap-granular), and the GPU stalls
+  faulting them back mid-kernel. WHAM events (1.6->46 GiB compressed in
+  <10 s) hit at step starts AND mid-execution (t=736 window: 0 new CBs,
+  +60 GiB compressed).
+- Fix: residency_pin() in qc_metal_serving.mm — MTLResidencySet
+  (macOS 15+), heap-granular dedupe ([buf heap] when heap-backed),
+  commit + requestResidency + addResidencySet on torch's command queue;
+  called from MetalWorker._pin_weights_resident() after the resident
+  sweep; VLLM_METAL_RESIDENCY=0 kill switch. Boot log: "Pinned 114 Metal
+  allocations (93.73 GiB)".
+- Result (same boot, syncprof+census on): 64-tok gate 4.3774 tok/s,
+  wall 14.6 s, sha 77612826a079a171 EXACT (matches storm-era runs
+  bit-for-bit). Compressor FLAT at 0.10 GiB through serving. 36x.
+  Even "healthy" 2.7 s steps of the A/B era were fault-crippled: true
+  step is ~0.6 s wall at ~2.67 tok/step.
+- New step decomposition (dump4, per step): execute_model ~0.49 s CPU
+  python encode + get_output ~0.38 s GPU wait, GPU pipelining behind the
+  encode; serving-window GPU busy 97-100% (real compute now). The step is
+  now ~half encode-bound, half GPU-compute-bound.
+- Consequences: (a) launch/encode reduction is a first-class lever again
+  — re-run the mHC A/B (VLLM_METAL_MHC=0) now that faults are gone;
+  (b) Batch 4 step tape attacks the 0.49 s encode; (c) Batch 5 kernel
+  quality attacks the 0.38 s GPU side; (d) gap to ds4 bar now 4.8x
+  (4.38 vs 21.08 agg), was 27x.
+- Open follow-ups: KV pool (1 GiB) and future allocations are NOT pinned;
+  pin-after-KV-alloc if traces ever show KV pages compressing. Re-baseline
+  on a clean no-syncprof boot before recording in baseline_status.
+- Artifacts: perf/results/2026-08-11/syncprof-inrunner/ (gate64_pinned.txt,
+  cb4_post.csv, dump4_post.txt, server4.log).
+
+## 2026-08-11 - Clean-boot baselines recorded; 2000-tok matrix BLOCKED by Metal sparse-indexer gap
+
+- Clean boot (no profiler), pinning on: 8-tok cold 1.5084 / warm 1.5301
+  (wall 5.3/5.2 s, sha db2846cf...), 64-tok 4.4010 / 4.3996 (wall 14.5 s
+  both, sha 77612826...). Reproducible, compressor flat, cold==warm.
+  baseline_status.md M1 Ultra section updated; all storm-era numbers
+  superseded.
+- 2000-tok matrix run: EngineCore FATAL at ~60-90 generated tokens
+  (~1,025 total context). Root cause (server.log:201-310): once
+  indexer_metadata.max_seq_len // compress_ratio > topk_tokens the DSA
+  sparse indexer leaves the short-context fast path and calls
+  fused_indexer_q_rope_quant (common/ops/fused_indexer_q.py:479), whose
+  dispatch ladder is cutedsl -> xpu -> TRITON GRID LAUNCH; on Metal the
+  kernel object is a plain function -> TypeError 'function' object is not
+  subscriptable -> EngineDeadError. NOT a pinning regression: latent
+  never-exercised path (short 8/64-tok gates stay under threshold).
+- Additional gap discovered while reading the gate: the short-context
+  branch SKIPS the MLA compressor on Metal ("if not
+  current_platform.is_metal(): compressor(...)"), so the indexer k-cache
+  is never built on Metal — the long-context path needs cache-from-token-0
+  (or a backfill) besides the q-side op.
+- Assets already present for the port: metallib has
+  indexer_k_quant_and_cache / indexer_k_gather / indexer_clone_bytes
+  (serving/indexer/indexer.metal) and mla_decode_fp8_sparse{,_partition,
+  _two_cache_packed} consumers; short-context has a quixicore_ops hook
+  precedent (fill_short_context_topk_indices). Missing: q rope+fp8-quant
+  (crash site), index score vs cached k, topk selection
+  (SparseAttnIndexer has no forward_mps; forward_native delegates to the
+  Triton-heavy CUDA path).
+- Open question for the port: how did the M5 Max matrix numbers (33.68
+  agg) survive >1024 context — different quixicore build with indexer
+  kernels, different topk/compress config, or pre-DSA code path? Check
+  benchmarks/dsv4_metal_perf.md provenance before re-implementing from
+  scratch.
+- Task #14 tracks the port. #13 (storms) CLOSED as fixed+validated.
+- Artifacts: perf/results/2026-08-11/residency-baseline/ (server.log with
+  full traceback, gate8/64 outputs, vmstat_2000tok.csv).
+
+## 2026-08-11 - mHC A/B re-run on the pinned box: kernels are a 10.5% regression, default flipped OFF
+
+- Baseline: clean pinned boot, mHC ON (kernels active): 8-tok warm 1.5301,
+  64-tok 4.4010/4.3996 (sha 77612826...).
+- Experiment: identical boot with VLLM_METAL_MHC=0 (torch decomposition):
+  8-tok 1.4877 (sha db2846cf... IDENTICAL to mHC-on), 64-tok
+  4.8615/4.8637 (sha ef51bb4f...).
+- Verdict: with fault stalls eliminated, the mHC kernels COST 10.5% on the
+  64-tok gate and are noise-level at 8-tok. The ~10.8k removed launches do
+  not pay for the per-call python wrapper overhead (contiguous()/float()
+  copies x 43 layers x pre/post per microstep) and/or kernel-vs-MPSGraph
+  time at decode shapes. The storm-era "A/B-neutral" result is explained:
+  fault stalls masked everything.
+- Sha note, stated precisely: 8-tok outputs are bit-identical across
+  configs; 64-tok trajectories diverge (op-level parity was verified at
+  landing — this is ULP-level logit difference flipping a greedy choice
+  past token 8, not evidence of wrongness). Standing 64-tok sha is
+  config-specific: ef51bb4f... (mHC off, new default) vs 77612826...
+  (mHC on).
+- Decision: default flipped to OFF in mhc.py (_has_quixicore_mhc_metal;
+  VLLM_METAL_MHC=1 re-enables). Kernels + tests retained for the step-tape
+  era where dispatch cost structure changes. Task #4 outcome downgraded
+  from "enabling win" to "quarantined, documented".
+- New standing numbers (pinned, mHC off): 8-tok ~1.49-1.53, 64-tok 4.86.
+  Gap to ds4 21.08 agg: 4.3x.
+- Artifacts: perf/results/2026-08-11/mhc-ab-pinned/ (server_mhc_off.log,
+  gate8/64_mhc_off*.txt); mHC-on numbers in residency-baseline/.
+
+## 2026-08-11 - Task #14 LANDED: Metal long-context sparse indexer — 1k/2k matrix UNBLOCKED, 2000-tok 7.84/7.94 tok/s
+
+- Baseline/blocker: any request crossing 2048 total context (index_topk 512
+  x compress_ratio 4) left the indexer short-context fast path and died in
+  fused_indexer_q_rope_quant's Triton fallback (TypeError: 'function' object
+  is not subscriptable -> EngineDeadError). Additionally the Metal consumer
+  silently truncated attention to the first 2048 tokens (dense-prefix
+  "sparse" MLA), and the indexer K cache was never built on Metal.
+- Key discovery (Explore agent map): the M5-era "packed sparse MLA" was
+  NEVER top-k — it is a dense prefix over compressed KV, numerically equal
+  to top-k only below 2048 tokens. There was no Metal top-k producer to
+  adapt; one had to be built.
+- Implementation (4 pieces, torch-first, sync-free by construction — no
+  .item()/nonzero/boolean compaction anywhere on the hot path):
+  1. Q side: _fused_indexer_q_rope_quant_metal (fused_indexer_q.py) —
+     torch mirror of the Triton kernel (GPT-J rope on last 64 dims,
+     bf16-roundtrip before absmax, UE8M0 q_scale). Metal convention: Q
+     returned as value/q_scale in model dtype (no fp8 storage), q_scale
+     folded into weights exactly as CUDA. Verified: reconstruction exact.
+  2. K side: compressor enabled for head_dim=128 on Metal (guard removed in
+     attention.py short path + fused_compress_quant_cache.py). Torch
+     gather/softmax/RMSNorm tail feeds NEW Metal kernel
+     dsv4_indexer_kv_insert (indexer.metal + tk_launch.h + qc_metal_serving
+     .mm + ops.py): rope at compressed anchor (pos//4)*4, e4m3 quant,
+     per-slot 132B records [128 codes][f32 pow2 scale] — Metal-native
+     layout, NOT the CUDA page-segregated one; only Metal reads it.
+     Verified bit-exact vs a half-away-rounding oracle (tk_e4m3_encode
+     convention, same as production 512 cache); -1 slots skip.
+  3. Producer: metal_sparse_attn_indexer (NEW vllm/models/deepseek_v4/
+     metal_indexer.py), called from Indexer.forward on Metal instead of
+     SparseAttnIndexer. Uniform relu-weighted MQA logits + topk in torch:
+     decode via per-token expanded block_table/seq_lens (the MPS flatten
+     path), prefill via chunk cu_seq_lens/token_to_seq/ks/ke with row
+     rebase. e4m3 decode via 256-entry LUT gather. fp32 scores (fp16 dots
+     can overflow at e4m3 full scale: 128 x 448 x 448).
+  4. Consumer: metal.py forward_mqa gains a topk branch (gate mirrors the
+     producer: max_seq_len // ratio > buffer width): request-local topk ->
+     global compressed slots via block_table gather; dense-prefix path and
+     its pass_cache untouched for short context.
+- Bugs found and fixed en route: (a) Metal fast-math exp2 is approximate at
+  integer inputs — corrupted the stored pow2 scale AND pushed exact e4m3
+  ties over the midpoint; fixed by building 2^e from float bit pattern.
+  (b) indexer cache tensor is alignment-padded (stride(0) > bs*132) —
+  view(-1,132) crashed; reader now gathers via [block, offset] indexing.
+- Correctness evidence: 8-tok sha db2846cf... and 64-tok sha ef51bb4f...
+  UNCHANGED (short-path attention math untouched; compressor now also runs
+  there). 2000-tok gate completes and is DETERMINISTIC across runs (sha
+  5e01c4830b27e5ff twice). Needle retrieval through a 2366-token prompt
+  (long-context PREFILL path) answered exactly, coherent text after.
+  Kernel unit tests: scales exact pow2, codes 128/128 vs convention
+  oracle, LUT round-trip 1.5% rel err, -1 skip clean.
+- Throughput: 1k-in/2k-out matrix 7.841 cold / 7.939 warm tok/s aggregate
+  (wall ~252-255 s). Short gates: 8-tok 1.41-1.46 (was 1.51), 64-tok 4.47
+  (was 4.86) — ~8% cost from the compressor now running every step, the
+  price of building the K cache; recoverable by fusing the compressor tail
+  (gather/softmax/norm is ~15 torch dispatches x 21 layers).
+- State: 8-tok sha still db2846cf... AFTER long runs. Compressor pages
+  ~85k (~1.3 GiB) after long runs vs ~7k at boot — transients, weights are
+  pinned; WATCH item = pin KV pool + post-boot allocations if this grows.
+- Scaling caveats (documented, not blocking at max_model_len 3072): decode
+  gather is fixed-width max_seq_len//4 per token; prefill scores chunk 128
+  rows x n_k fp32. Native fused kernel (metallib masked_topk family) is
+  the perf pass when 12K/128K matrices arrive.
+- Artifacts: perf/results/2026-08-11/indexer-port/ (server.log with the
+  view() crash, server2.log, gate8/64/2000*.txt, gate8_post.txt).
+
+## 2026-08-11 - Task #5 profiling verdict: the wall is KERNELS, not dispatch.
+## Verify-width GEMV re-reads weights M times; step tape demoted to 2nd
+
+- Baseline going in: 1k/2k matrix 7.94 tok/s; plan of record said Batch 4
+  (native step tape) attacks a 0.49 s/step python-encode wall.
+- Instruments: syncprof + CB census on a full 2000-tok gate (sha
+  5e01c4830b27e5ff EXACT under profiling — overhead ~0), /usr/bin/sample of
+  the EngineCore in both regimes, and an xctrace Metal System Trace
+  (12 s attach) during long-regime decode with per-encoder GPU intervals.
+- Step decomposition (long regime, per engine step of ~2.7 tok):
+  wall 0.54 s = get_output 0.31 s (GPU wait) + execute_model 0.21 s
+  (python encode, fully overlapped with GPU); ~126 CBs/step; GPU compute
+  channel occupied 91.4% of wall, serial, gaps only ~1 s per 12.9 s.
+- THE HISTOGRAM (17,872 compute encoders over 12.86 s):
+  * <10 us encoders: 8,890 of them = 0.3% of GPU time. The tiny-op storm
+    (sinkhorn, RMS glue, casts) is GPU-CHEAP. Launch overhead is NOT the wall.
+  * 1-5 ms encoders: 4,240 = 91.1% of GPU time (~177/microstep ~= 43
+    layers x ~4 heavy matvecs + lm head). Top band uniformly ~4.95 ms.
+- Microbench at exact serving shapes (synthetic packed weights, this box):
+  * M=1 dense mmvq is HEALTHY: lm_head 738 GB/s, o_b 535, q_b 438 (roofline).
+  * M=6 (verify width) is LINEAR in M: the host loops the batch-1 qgemv per
+    row (qc_metal_serving.mm ggml_mul_mat_vec_a8), so weights re-read 6x:
+    lm_head 4.52 ms (the ~5 ms trace encoders), q_b 0.31, o_b 0.35,
+    o_a 8-call loop 0.87 ms/layer at 41 GB/s.
+  * MoE vec: gate|up IQ2_XXS top6 M=6 1.03 ms + down Q2_K 0.49 ms per layer
+    at 150-200 GB/s effective (per-(token,expert) weight re-read by design).
+  * mmq (padded M=32 GEMM) at M=6: lm_head 2.43 ms — better but still 6x off.
+- Arithmetic: dense ~2.2 ms + MoE ~1.5 ms per layer x 43 + lm 4.5 ms ~=
+  0.2 s per verify microstep ~= the measured GPU busy. Bandwidth roofline
+  for the same traffic is ~0.02-0.04 s. Kernels are ~5-10x off roofline
+  BECAUSE of M-times weight re-reads + latency-bound small mats.
+- mHC A/B mystery RESOLVED by the same data: the fused kernel added ~90 ms
+  GPU (0.35 ms x ~260 calls) to replace a tiny-op stream that costs ~8 ms
+  GPU per step. Per-launch GPU cost is ~2-5 us; per-CB theory dead.
+- DECISION (reorders the campaign): Batch 5 kernel work is the wall; the
+  step tape buys <=10% while GPU busy is 91% and returns AFTER kernels thin
+  the GPU step. Wave 1: qgemv_mb — multi-batch weight-stationary GEMV
+  (M<=8, one weight read for all M rows, per-row walk order IDENTICAL to
+  the existing kernels so shas stay bit-exact; q8_0 gets a specialized mb
+  mirroring qgemv_q8_0_fast's walk). Route ggml_mul_mat_vec_a8 through it
+  for 2<=M<=8. Expected: lm_head 4.5->~0.9, dense layer sum 2.2->~0.6,
+  verify microstep ~220->~120 ms. Wave 2: MoE route/align grouped-mb (GLM
+  Ampere precedent). Wave 3: attention/compressor fusion; tape thereafter.
+- Artifacts: perf/results/2026-08-11/steptape-prof/ (gate2000_syncprof.txt
+  sha-exact 7.938 tok/s, dump_*/cb_*.csv, sample_short/long.txt,
+  mst_long.trace + mst_gpu_intervals.xml + parse one-liners in session
+  transcript, gate1600_mst.txt).
+
+## 2026-08-11 - Batch 5 wave 1 LANDED: qgemv_mb weight-stationary small-M
+## GEMV — matrix 7.94 -> 9.18 tok/s (+15.6%); numerics-change protocol adopted
+
+- Baseline: 1k/2k matrix 7.939 tok/s (sha 5e01c483), 64-tok 4.47 (ef51bb4f),
+  8-tok 1.41-1.46 (db2846cf). Profiling entry above: M=6 verify re-reads
+  every dense weight 6x through the looped batch-1 qgemv.
+- Change: qgemv_mb<FMT,T,M> in qgemv.metal — one simdgroup per output row,
+  each weight block decoded once and accumulated into M compile-time
+  register accumulators (a runtime-M acc array spills and measured ZERO win
+  — templated M2..M8 host_names qgemv_<fmt>_mb<M>[_bfloat16]); specialized
+  qgemv_q8_0_mb<M> twin mirroring qgemv_q8_0_fast's walk; launch_qgemv_mb
+  in tk_launch.h; host route in ggml_mul_mat_vec_a8 for 2<=M<=8 over
+  {q8_0, q2_K, iq2_xxs, q6_K} (K<=512 q8_0 fp16 excluded: that batch-1
+  route uses the generic-walk "_small" kernel).
+- Microbench (M=6, serving shapes): q_a 0.157->0.051, kv 0.106->0.032,
+  q_b 0.314->0.194, o_a-loop 0.872->0.272, o_b 0.352->0.184, shexp
+  0.357->0.155, lm_head 4.524->2.809 ms. Dense layer sum 2.16->0.89 ms.
+  Remaining plateau ~200 GB/s = fp32-convert ALU bound (next waves).
+- BIT-EXACTNESS SAGA, recorded for the next wave: (1) the first exactness
+  test used random scale bytes -> all-inf outputs -> inf arithmetic masked
+  order differences ("OK" was vacuous). Finite-scale test: q2_K/iq2_xxs/
+  q6_K generic-template mb are BIT-IDENTICAL to the loop; q8_0 fp16
+  specialized twin differs on ~2-8 rows/4096 by 1 ULP. (2) Cause: fast-math
+  codegen — the compiled batch-1 fast kernel's association is not the
+  source order; a source-identical twin cannot reproduce it reliably
+  (#pragma clang fp reassociate(off) on the mb loop changed nothing).
+- DECISION — numerics-change protocol (per campaign Batch-2 policy), now
+  standing for all kernel waves: accept ULP-level op changes when
+  (a) op parity <=1 ULP on finite oracle, (b) 8-tok sha unchanged,
+  (c) trajectory deterministic across runs, (d) decoded text semantically
+  sound, (e) acceptance length not degraded, (f) MATRIX throughput is the
+  accept/reject metric (short gates are trajectory-noise).
+- Validation: 8-tok 1.4524 sha db2846cf UNCHANGED. 64-tok flips to
+  trajectory 77612826 (deterministic twice, 3.92/3.94) — the same alternate
+  trajectory the mHC-on config landed on; short-horizon TPS is
+  acceptance-path noise, and part of the old "mHC 10.5% regression" was
+  likely THIS trajectory cost, not kernel cost. MATRIX: 9.1771 and 9.1492
+  tok/s, sha 5a662b7a2d4417a5 BOTH runs (deterministic), wall 251.9->218
+  s. Acceptance during matrix: mean length 5.4-6.0 of 6, 88-100% draft
+  acceptance. Text dumps coherent perf.md continuations. Compressor flat
+  0.3 GiB.
+- New standing baselines: matrix 9.15-9.18 (sha 5a662b7a), 64-tok 3.92-3.94
+  (sha 77612826), 8-tok 1.45 (sha db2846cf). Gap to ds4 21.08: 2.30x.
+- Next waves: 2A iq2_xxs/q2_K 8-span tk_dequant8 specializations (hoist
+  grid/sign/scale fetches; MoE vec is 1.5 ms/layer at 150-200 GB/s);
+  2B lm_head small-M (still 2.8 ms; argcat/greedy path kills it fully);
+  then fp16-ALU math in mb kernels (protocol above applies).
+- Artifacts: perf/results/2026-08-11/qgemv-mb/ (gate8/64_a/64_b/2000/
+  2000_b.txt, comp64_a/comp2000 dumps, server.log server2.log);
+  scratchpad test_qgemv_mb.py (order test), test_qgemv_mb_finite.py
+  (finite oracle), bench_kernels.py.
+
+## 2026-08-11 - Batch 5 wave 2A: iq2_xxs 8-span decode (bit-identical, ~5%
+## MoE-local); 2-5 ms GPU band still unattributed — signpost trace in flight
+
+- Change: tk_dequant8<iq2_xxs> 8-span specialization in dequant.metal (grid
+  word, sign byte, and dl fetched once per aligned span instead of per
+  element; per-element arithmetic and association unchanged). Discovery: the
+  vendored tree ALREADY specializes q2_K/q3_K/iq4_xs/iq4_nl — only iq2_xxs
+  was missing, which is why Q2_K MoE ran 204 GB/s vs IQ2_XXS 152.
+- Correctness: decode outputs BIT-IDENTICAL to the previous metallib
+  (captured-reference compare over moe/mmvq x {m1, m6} x {iq2_xxs, q2_K});
+  8-tok gate sha db2846cf EXACT; matrix gate 9.1146 tok/s sha 5a662b7a
+  EXACT (bit-equal trajectory to wave 1, as predicted). No re-baseline.
+- Throughput: MoE gate|up M=6 1.028 -> 0.979 ms (~5% local only — kernel is
+  mixed ALU/latency-bound past decode). Matrix unchanged within noise
+  (9.11 vs 9.15-9.18; trace attach overlapped this run).
+- Post-wave-1 GPU histogram (12.56 s Metal System Trace, long regime):
+  occupancy 92.6%; 2-5 ms encoders now 74.1% of GPU time (2,614 = ~127 per
+  step ~= ~3/layer, uniform top ~4.65 ms); 0.2-1 ms band 17.8% (3,327 ~=
+  the census's per-step KV-page copies, ~168/step at ~64 MB); tiny ops
+  still 0.8%.
+- Eliminated as the 2-5 ms band by direct microbench at serving shapes:
+  sparse_attention (0.63 ms at M=6, topk512+swa128), indexer producer
+  torch branch (0.43 ms at M=6, width 768), all wave-1 dense matvecs
+  (<1 ms), MoE gate|up (0.98). lm_head M=6 (2.81) accounts for only ~1 of
+  ~127. Remaining suspects: compressor torch tail, KV-cache functional
+  clone prepass, drafter TurboQuant path, MPSGraph fp16 matmul shapes.
+- Next: PYTORCH_MPS_TRACE_SIGNPOSTS=1 boot + xctrace os_signpost capture
+  to attribute the band by op name, then target the top entry.
+- Artifacts: perf/results/2026-08-11/qgemv-mb/ (gate8_w2a.txt,
+  gate2000_w2a.txt, mst_w1.trace + mst_w1_intervals.xml, server3.log);
+  scratchpad capture_decode_ref.py (bitwise decode reference harness),
+  bench_hotband.py, parse_gpu_intervals.py.
+
+## 2026-08-11 - Glue census (PYTORCH_MPS_LOG_PROFILE_INFO=31, 1k-in/1200-out):
+## THE unexplained ~420 ms/step is dominated by FUNCTIONAL CACHE-CLONE COPIES
+
+- Instrument: census boot, 1200-tok gate crossing the 2048 boundary
+  (916/1430 draft tokens accepted, ~213 engine steps + prefill), SIGTERM
+  flush. Ranked table: perf/results/2026-08-11/glue-census/ranked_table.txt
+  (GPU(ms) columns are CB-attributed => use counts/sizes, not ms).
+- HEADLINE: MPS-to-MPS copies 84,359 totaling 55.04 GiB in one 1200-token
+  run. Top rows: copy_identity Byte[134217728] x1280 (128 MiB CACHE CLONES,
+  ~6 per engine step = ~768 MiB/step of pure cache cloning);
+  copy_identity Half[5,64,512] x26,975 and Half[5,8,1024] x14,562
+  (~127 and ~68 per step, spec/drafter buffers); copy_identity
+  Byte[6,550,4] x638. Also visible per step: sum_reduction Long[4] x3394,
+  mHC fn projections mm f32[.,16384]x[16384,24], sqr Float[.,4096] x480.
+- Interpretation: the functional cache-update prepass (see
+  indexer_clone_bytes comment in indexer.metal) and/or the MPS
+  non-in-place cache-update contract clones whole KV-cache-sized buffers
+  (128 MiB) ~6x per step. This is the bulk of the ~420 ms/step of GPU time
+  that is NOT our kernels (kernels microbench to ~140 ms/step vs ~560 ms
+  step): the 2-5 ms encoder band is batched-aten encoders (MPS packs many
+  eager ops per encoder — the census-era "tiny ops are cheap" reading was
+  an artifact of that batching).
+- Also landed this cycle: encoder labels in qc_metal_serving.mm encode()
+  (every quixicore op names its encoder qc_*; trace-visible; perf-neutral:
+  matrix 9.1468 sha 5a662b7a exact on the labeled boot).
+- NEXT (highest value, in order): (1) find and kill the 128 MiB per-step
+  cache clones (grep clone/copy_ in sparse_mla.py/metal.py/gpu worker MPS
+  cache-update path; goal: true in-place updates); (2) kill the
+  Half[5,64,512]/Half[5,8,1024] per-step copy storms (drafter/spec
+  buffers); (3) then mHC/RMS/router glue via bindings + layer tape.
+- Artifacts: perf/results/2026-08-11/glue-census/ (server.log, gate1200.txt,
+  ranked_table.txt); labeled-trace/ (mst_lbl.trace, lbl_intervals.xml,
+  gate2000.txt 9.1468 sha-exact).
+
+## 2026-08-11 Serving-only census correction: the glue is mHC, not cache clones
+
+- Commit: working tree (post qgemv_mb + iq2_xxs 8-span)
+- Baseline: matrix 2000-tok 9.15-9.18 tok/s sha 5a662b7a (mHC eager)
+- Method: the mode-31 census log contains one live line per op run
+  (`aten::<op>:MPS:<dtype>[shape] (id=Kxx, run=N)`). Splitting by log line
+  number against boot markers turns the boot-contaminated summary table into
+  a serving-only census. Tool: perf/results/2026-08-11/tools/serving_census.py
+  (args: server.log, API-startup line, summary-block line, step count).
+- CORRECTION of the previous entry's headline: the copy_identity
+  Byte[134217728] x1280 "cache clones" are 100% BOOT-TIME. All 638 live runs
+  sit before the "Resident sweep touched" log line: they are the resident
+  sweep's 128 MiB (chunk_elems = 128 << 20) uint8 slice sums in
+  metal_worker._sweep_pass_once, whose comment already documents the
+  same-size transient copy. Zero occur during serving. The "~6/step" claim
+  was arithmetic on a boot artifact; retracted.
+- Serving-only truth (1200-tok run, ~214 steps, 6.07M serving ops =
+  ~28,400 ops/step): the top families are all mHC eager glue.
+  - Sinkhorn storm: sum_reduction/add-scalar/div triplets on Float[6,4,4] at
+    2298.7/step each (col) + 2183.8/step (row) = hc_sinkhorn_iters=20
+    iterations x ~115 mhc_pre calls/step, ~117 tiny ops per call; plus
+    Float[5,4,4] drafter twins at 161.5/step.
+  - Per-call glue: mm f32[6,16384]x[16384,24] 114.9/step, sqr/sum/rsqrt on
+    [6,16384], casts and copy_identity on [6,4096]/[6,4,4096]/[6,512].
+  - Estimated 17k of 28.4k ops/step are mHC-family.
+- Also identified: copy_identity BFloat16[1048576,32] x282/step is the
+  persistent [2048,4,4096] mHC residual buffer (1048576x32 = 2048x16384)
+  written per layer per forward - 6-row writes, bandwidth-trivial, a launch
+  count problem for the tape era, not a copy-size problem.
+- Decision: attack mHC glue first (fused kernels already exist, task #4).
+
+## 2026-08-11 Fused Metal mHC LANDED as default (paired 7-offset A/B)
+
+- Commit: working tree; change = vllm/model_executor/layers/mhc.py default
+  VLLM_METAL_MHC flips "0" -> "1" (kernels from task #4, already in the
+  installed metallib; no rebuild).
+- Baseline: eager mHC, matrix off1-2000 9.16 tok/s sha 5a662b7a, step 498 ms.
+- Hypothesis: replacing ~17k eager mHC ops/step with 2 fused dispatches per
+  layer cuts step time; the prior "10.5% regression" rejection was a single
+  64-token trajectory draw, not mechanism.
+- Correctness: 8-tok sha UNCHANGED (db2846cf); matrix deterministic (2 runs,
+  sha 3f64cc30 both, tps 7.777/7.795); dumped completion text coherent
+  (perf.md continuation); op parity ULP-validated in the task #4 entry.
+- Measured (1000-in, paired by prompt offset, mhc0 vs mhc1):
+  step ms (wall - ~5.5s prefill)/drafts: off1 498->457, off2 488->449,
+  off3 488->450, off4 488->449, off5 489->448, off6 488->448, off7 488->449.
+  7/7 pairings, -39 ms (-8.0%).
+  acc/draft: 3.68->2.63, 2.56->3.11, 3.33->1.82, 3.06->1.70, 1.89->3.03,
+  2.98->3.32, 2.57->2.57. Mean d = -0.27, sd 1.05, t = -0.68: trajectory
+  lottery, not significant, swings +-1.5 both directions.
+  Offset-7 control: near-identical trajectories (281 drafts both, 723 vs 721
+  accepted) -> pure mechanism visible: 7.01 -> 7.60 tps (+8.4%).
+  Mean tps across the 7 offsets: 7.58 (eager) -> 7.67 (fused).
+- PROTOCOL REFINEMENT (standing): when a change flips the decode trajectory,
+  judge on (a) paired step-time across >=3 prompt offsets (mechanism) and
+  (b) mean matrix tps across offsets (expected value). A single-offset matrix
+  number moves +-20% on acceptance luck alone and cannot accept/reject a
+  kernel change by itself.
+- Decision: RETAINED (default ON). Tracked off1 matrix number becomes 7.78
+  sha 3f64cc30 - lower than 9.16 by acceptance draw on the new trajectory,
+  while mechanism improved 8%. VLLM_METAL_MHC=0 restores eager.
+- Artifacts: perf/results/2026-08-11/mhc-ab/ (gate8*, gate2000_a/b,
+  gate1000_off{2..7}[_mhc0|_mhc1].txt, dump_off2/, server*.log,
+  gate*_default.txt = post-flip confirmation).
+
+## 2026-08-11 Post-mHC GPU trace: glue still ~300 of ~415 ms GPU/step
+
+- Method: 12 s Metal System Trace attach mid-matrix on the fused-mHC default
+  build; encoder-level gpu-intervals + CB-label grouping (labels are
+  CB-granular: a CB inherits its first labeled encoder's name, so a "qc_x"
+  row can carry unrelated batched-aten encoders committed in the same CB).
+  New tool: perf/results/2026-08-11/tools/parse_gpu_fmtlabels.py (qc_ token
+  from formatted-label; metal-object-label is empty in this table).
+- Occupancy 92.3%; ~415 ms GPU per 449 ms step. Encoder histogram: 74% of
+  GPU time in 2879 encoders of 2-5 ms (~103/step), 22% in 200-1000 us.
+- CB-label split: qc_dsv4_mhc_post 31% (n~44/step, avg 2.9 ms),
+  qc_deepseek_v4_kv_insert 30% (n~39/step, avg 3.2 ms), qc_moe_vec 16.6%
+  (88/step, avg 782 us ~= microbench: nearly pure kernel),
+  qc_indexer_kv_insert 10.8% (20/step, avg 2.2 ms), qc_mmvq_mb 5.2%,
+  truly-unlabeled tiny CBs only 3.3%.
+- Reading: the microsecond-scale insert/mhc kernels cannot cost 3 ms; their
+  CBs are carrying the batched-aten glue that follows them in the layer.
+  Our kernels remain ~140 ms/step; ~300 ms/step is still aten/MPSGraph
+  encoders. Post-mHC serving census (counts) queued to name the remaining
+  families; the durable fix is fewer/larger encoders (task #5 step tape).
+
+## 2026-08-11 Compressor index-math hoist LANDED (bitwise-exact)
+
+- Commit: working tree; change = fused_compress_quant_cache.py Metal branch
+  memoizes the layer-invariant index products (valid/source blocks/offsets/
+  gather dims/score mask/output slots/anchor pos) on the forward context,
+  keyed by metadata identity; 43 layer calls per forward now compute them
+  once. Python-only.
+- Correctness: bitwise-exact by construction and by gate: 8-tok sha
+  db2846cf UNCHANGED, matrix sha 3f64cc30 UNCHANGED with identical
+  1448/551 accept/draft trajectory.
+- Measured: matrix off1 7.836 tok/s (was 7.777-7.795), step ~453 ms (was
+  456-457). ~650 Long[6]-family dispatches removed bought only ~4 ms:
+  those scalar-index kernels cost ~6 us each inside batched encoders.
+  CALIBRATION for future estimates: tiny elementwise [6]-ops ~5-8 us;
+  the mid-band [200-1000 us] encoders (22% of GPU) and 2-5 ms encoder
+  spans (74%) are where the step actually lives.
+- Decision: RETAINED (free, exact). Artifacts:
+  perf/results/2026-08-11/hoist/ + census-postmhc/server_hoist.log.
+
+## 2026-08-11 Native Metal RMS norm LANDED (ir-op impl + platform priority)
+
+- Commit: working tree. New: kernels/serving/rms_norm/rms_norm.metal
+  (qc_rms_norm_{float16,bfloat16}: one 256-thread TG per row, fp32
+  square-sum, final multiply in weight dtype, mirrors ir.ops.rms_norm),
+  rms_norm host op in qc_metal_serving.mm (strided x accepted at prefill;
+  contiguous()d), quixicore_ops.rms_norm, vllm/kernels/quixicore_metal_ops.py
+  registering impl "quixicore_metal" for ir.ops.rms_norm, and
+  MetalPlatform.get_default_ir_op_priority -> rms_norm=
+  ["quixicore_metal", "native"]. Boot log confirms the priority.
+  Also fixed: dsv4_mhc_pre / fused_post_pre encoder labels were
+  "qc_check_mhc_f32" (copy-paste); now qc_dsv4_mhc_pre / _fused_post_pre.
+- Bug found by first boot: check_mps asserts contiguity, prefill passes
+  strided q/k split views -> EngineDeadError "x must be contiguous";
+  switched to check_mps_strided + explicit contiguous().
+- Parity: bitwise-equal to the eager decomposition in 418/480 randomized
+  shape/scale cases; the rest are 1-ulp scattered (reduction order).
+  Standard ULP protocol.
+- Gates: 8-tok sha db2846cf UNCHANGED. Matrix off1: 9.440/9.343 tok/s,
+  sha c4303b1f both runs (deterministic), 1546/458 = 3.38 acc/draft,
+  step (211.9-5.5)/458 = 450 ms (was 453). Text coherent (300-tok dump).
+- HONEST SPLIT per the trajectory-lottery protocol: mechanism win is
+  ~3 ms/step (453 -> 450); the 7.84 -> 9.44 tracked-number jump is an
+  acceptance-lottery HIGH draw (off1 draws so far: 3.68 / 2.63 / 3.38
+  acc/draft across the three retained trajectories). Do not attribute
+  the TPS delta to this kernel.
+- Decision: RETAINED (mechanism-positive, op-count -1,400/step, and the
+  RMS route is a prerequisite for the step-tape era anyway).
+- Artifacts: perf/results/2026-08-11/rmsnorm/ (server*.log, gate8*,
+  gate2000_b/c, gate300_dump.txt, dump/).
+
+## 2026-08-11 Wave 3b LANDED: fp32-weight RMS coverage + fused indexer-Q
+## RoPE/quant. Matrix 11.0 tok/s, gap under 2x.
+
+- Commit: working tree. Three changes gated together after individual
+  validation:
+  1. qc_rms_norm_w32_{float16,bfloat16}: fp32-weight RMS variant
+     (y = T(float(x) * rrms * w_f32)) for GGUF F32 norm weights; ir-op
+     supports_args widened. Solo-gated first: matrix 9.408, SAME trajectory
+     c4303b1f (run B killed early by operator error - superseded here).
+  2. fused_q_kv_rmsnorm Metal branch routed to the same kernel (the
+     [6,1024] q-lora + [6,512] kv norms were a hand-rolled eager fallback,
+     not ir.ops; found by census after the ir-op route missed them).
+  3. dsv4_indexer_q_rope_quant kernel (serving/indexer/indexer.metal, one
+     simdgroup per head): replaces the ~20-dispatch eager torch mirror
+     _fused_indexer_q_rope_quant_metal per layer call. Parity work found a
+     REAL defect in the eager reference: torch.exp2 on MPS is approximate
+     even at integer inputs (exp2(-8) = 0.0039062495... != 2^-8), so every
+     eager q_scale was slightly off a power of two. The kernel builds 2^e
+     exactly from the float bit pattern - same technique and rationale as
+     dsv4_indexer_kv_insert's documented exp2 note - matching CUDA
+     semantics. Weight-fold mul chain pinned with #pragma clang fp
+     reassociate(off) (fast-math reorder was 1 ulp off torch's per-op
+     rounding).
+- Gates: 8-tok sha db2846cf UNCHANGED (short context: top-k width covers
+  all candidates, so indexer ulps cannot select differently). Matrix
+  11.00/11.02 tok/s, sha 5c528aaf BOTH runs (deterministic), 1605/395 =
+  4.06 acc/draft, step (181.8-5.5)/395 = 446 ms (was 450). Text coherent.
+- Split per protocol: mechanism -4 ms/step; the 9.4 -> 11.0 jump is
+  mostly the acceptance draw (3.38 -> 4.06). The exact-power-of-two scale
+  is a semantic fix, so this trajectory shift is bug-fix-adjacent rather
+  than pure lottery, but per-offset spread should still be assumed +-1.5.
+- Off1 acceptance draws across retained trajectories: 3.68 / 2.63 / 3.38
+  / 4.06.
+- Decision: RETAINED (all three).
+- Artifacts: perf/results/2026-08-11/rmsnorm/gate*_w32* (solo w32),
+  perf/results/2026-08-11/wave3b/ (server.log, gate8, gate2000_a/b,
+  gate300 + dump/).
+
+## 2026-08-11 o-side inverse RoPE kernel LANDED (bitwise-exact)
+
+- Commit: working tree. dsv4_o_inv_rope (serving/indexer/indexer.metal,
+  one simdgroup per head, strided input / contiguous [T, H*D] output) +
+  host op + route in DeepseekV4MetalAttention._o_proj. Mirrors
+  DeepseekScalingRotaryEmbedding.forward_native(inverse=True) with
+  explicit per-op rounding in the promoted dtype (fp32 cache -> fp32
+  temps, fp16 cache -> fp16 temps; reassociate/contract off). Replaces
+  ~13 MPS dispatches per layer (~560/step).
+- Parity: bitwise-exact vs the eager reference, 50/50 randomized trials
+  across both cache dtypes (the per-op rounding discipline is why).
+- Gates: 8-tok sha db2846cf UNCHANGED, matrix sha 5c528aaf UNCHANGED
+  (same 1605/395 trajectory): 11.077 tok/s, step (180.6-5.5)/395 =
+  443 ms (was 446).
+- Decision: RETAINED. Artifacts: perf/results/2026-08-11/oinvrope/.
+
+## 2026-08-11 Step-phase profiling: attention interior named as the wall
+
+- Method: new env-gated sync-bracketed phase profiler
+  (vllm/v1/worker/metal_phaseprof.py, VLLM_QC_PHASE_PROF=1; dumps
+  /tmp/phaseprof_<pid>.txt at exit). Wraps step phases in
+  gpu/model_runner.py, layer sub-blocks in amd/model.py
+  _forward_unfused_post_pre (the Metal layer path — NOT nvidia/model.py,
+  NOT the fused variant; two false starts before finding it), and
+  attention seams in attention.py. Sync-bracketing serializes CPU encode
+  with GPU, so ABSOLUTE ms are inflated (~0.3 ms/entry + exposed CPU);
+  the SPLIT is the signal. Diagnostic stays in-tree, default off.
+- Step split (400-tok run): target_forward 94.1%, drafter_propose 4.9%
+  (28 ms — the 7 GB drafter is cheap, one dflash forward), sampler 1.0%.
+- Layer split: attn 8.69 ms/call, ffn 5.17, mhc 3x0.58, norm 2x0.28
+  (46 layer-forwards/step).
+- Attention interior (21 indexer layers): indexer 3.24 ms, compressor
+  3.03, wq_b+qnorm/rope/insert 2.72; all layers: o_proj 0.96, mqa 0.87,
+  input gemms 0.58, qkv_norm 0.34. Aux-stream overlap is OFF on Metal
+  (serial fallbacks fire).
+- Reconciliation across instruments (92% GPU occupancy, ~4.4k
+  serving aten ops/step post-waves, kernels ~150-180 ms/step microbenched,
+  2-5 ms encoder band invariant to tiny-op removal): the residual
+  ~220 ms/step is dependency-chained dispatch latency — mid-size eager
+  ops (gathers, bmm, softmax, topk, casts at [6,64,~700] shapes) cost
+  ~50 us effective each inside batched encoders. Encoder consolidation
+  alone would not remove it; collapsing whole eager blocks into single
+  kernels does.
+- Next kernel targets in order: (1) indexer producer (gather + fp8-LUT
+  decode + score einsums + masked topk -> one kernel), (2) compressor
+  Metal-branch tail (state gather + softmax-weighted sum -> one kernel;
+  index math already hoisted), (3) MoE router + shexp gate glue.
+- Artifacts: perf/results/2026-08-11/phaseprof/ (server*.log, gate*,
+  phase dumps inline in task logs).
+
+## 2026-08-11 Decode top-k producer kernel LANDED (trajectory-preserving)
+
+- Commit: working tree. dsv4_indexer_topk_decode
+  (serving/indexer/indexer.metal): one 256-thread TG per decode token
+  collapses the whole eager decode producer in metal_indexer.py — paged
+  gather, e4m3 LUT decode, relu-weighted MQA logits, candidate masking,
+  and a full bitonic top-512-of-1024 sort — into ONE dispatch (was ~20
+  mid-size MPS dispatches per step on the long-context path). Host op in
+  qc_metal_serving.mm; route via _native_topk_decode with the eager
+  branch preserved as fallback. Tie order is deterministic
+  (logit desc, index asc) vs torch.topk's impl-defined order.
+- Baseline: matrix off1 10.998-11.077 sha 5c528aaf, step ~443 ms.
+- Hypothesis: removing ~20 chained dispatches from the decode critical
+  path is worth a few ms/step; risk of trajectory flip via tie order.
+- Correctness: randomized parity harness (20 trials x 6 tokens,
+  boundary-ulp tolerant set compare): 0/120 mismatches, all rows fully
+  written. 8-tok gate sha db2846cf UNCHANGED.
+- Result: matrix x2 — 11.146 / 11.144 tok/s, BOTH sha 5c528aaf
+  (identical to the pre-producer baseline trajectory: same 1605/395
+  accept/draft tape — the kernel is trajectory-preserving in practice,
+  no lottery event). Step (179.44-5.5)/395 = 440.4 ms and
+  (179.47-5.5)/395 = 440.4 ms (was 443). A third pre-restart run on the
+  same build agreed (10.988, same sha; first-run-after-boot wall).
+- Decision: RETAINED. Tracked matrix best 11.14-11.15; gap to ds4 21.08
+  now 1.89x. Step ~440 ms.
+- Artifacts: perf/results/2026-08-11/idxtopk/ (gate8.txt, gate2000_a/b,
+  server.log); parity harness in session scratchpad test_indexer_topk.py.
+
+## 2026-08-11 Fused indexer compressor tail LANDED (-45 ms/step, byte-exact)
+
+- Commit: working tree. dsv4_indexer_compress_insert
+  (serving/indexer/indexer.metal): one simdgroup per token collapses the
+  whole eager Metal-branch compressor tail in
+  fused_compress_quant_cache.py — state gather (8-row ratio-4 overlap
+  history), per-dim softmax over history, weighted-sum compress, RMSNorm
+  (fp32 weight), GPT-J RoPE at the compressed anchor, exact-2^e e4m3
+  quant, 132-byte record insert — into ONE dispatch. Head=128 only; the
+  head=512 c128 path keeps the eager+memo tail (fires ~5% of decode
+  steps). Route also hoists the per-call host marshalling the old insert
+  op paid (cos/sin bf16 split, fp32 weight) into a data_ptr-keyed cache.
+  Eager tail was ~14 mid-size dispatches x 21 indexer layers per step,
+  plus ~6 host-op conversion dispatches.
+- Numerics: mirrors torch per op — precise::exp / precise::divide,
+  sequential history-order sums, reassociation/contraction off, and the
+  same power-of-2 mean division. Byte-exact vs the eager tail + proven
+  insert op on 52/52 randomized trials (magnitudes swept 1e-3..1e3,
+  invalid-history/skip-token edges included; harness
+  test_compress_insert.py in session scratchpad).
+- Baseline: matrix off1 11.144-11.146 sha 5c528aaf det x2, step 440 ms.
+- Result: 8-tok sha db2846cf UNCHANGED (1.487 tok/s). Matrix x2:
+  12.387 / 12.400 tok/s, BOTH sha 5c528aaf — deterministic, same output
+  trajectory. Step (161.46-5.5)/394 = 395.8 and (161.30-5.5)/394 =
+  395.4 ms: -45 ms/step, the largest single-kernel step win of the
+  campaign (fused mHC was -39).
+- Note: accept/draft counters shifted 1605/395 -> 1607/394 with an
+  IDENTICAL output sha and deterministic repeats; implies 2001
+  accepted+bonus for a 2000-token request, so this looks like end-of-
+  request counter bookkeeping (final round truncated at max_tokens), not
+  a trajectory change. Text dump not re-diffed since sha matches.
+- Decision: RETAINED. Tracked matrix 12.39-12.40; gap to ds4 21.08 now
+  1.70x. Step ~395 ms.
+- Artifacts: perf/results/2026-08-11/compressfuse/ (server.log, gate8,
+  gate2000_a/b).
+
+## 2026-08-11 Fused MoE router kernel LANDED (bitwise via split boundary)
+
+- Commit: working tree. dsv4_router_topk
+  (serving/dsv4_router/dsv4_router.metal): one simdgroup per token
+  collapses the eager _topk_softplus_sqrt_torch chain (sqrt, +bias,
+  top-6-of-256 select, gather, renorm, x1.5 scale — ~10 dispatches per
+  MoE layer, ~40 layers/step) into one dispatch. Selection by packed
+  sortable (choice, ~idx) keys, 2-stage simd_max (no 64-bit overload);
+  deterministic tie order (choice desc, idx asc). Hash-MoE layers (3)
+  do the tid2eid lookup in-kernel. Routes via _metal_router_topk in
+  fused_topk_bias_router.py; eager fallback preserved.
+- The split-boundary finding (important precedent): MPS transcendentals
+  match NO Metal formula bitwise — softplus probed at 8191 ulp vs
+  fast-math and 14 ulp vs precise log(1+exp); sigmoid similarly 2-4 ulp
+  off every candidate. Bitwise fusion is achieved by leaving torch's
+  softplus as the ONE eager op and fusing everything after it
+  (pre_softplus=1): sqrt/add/divide/mul are correctly rounded and
+  mirror exactly. Two further Metal-numerics findings baked into the
+  kernel: (1) MPS sums a contiguous K-wide reduce as a PAIRWISE TREE
+  (((w0+w1)+(w2+w3))+(w4+w5)) — sequential is 2 ulp off; (2) fast-math
+  folds divide(w,denom)*scale into a reciprocal multiply unless the
+  block is pinned with reassociate/contract off.
+- Parity: 0/320 rows off (bitwise incl. renorm) across biased + hash
+  variants; ids identical. Harness test_router_topk.py / test_router_pre
+  in session scratchpad. In-kernel softplus modes kept behind
+  VLLM_QC_ROUTER_SOFTPLUS_MODE for lottery-gated experiments.
+- Baseline: matrix 12.387-12.400 sha 5c528aaf, step 395.4 ms.
+- Result: 8-tok sha db2846cf UNCHANGED (wall 5.13 vs 5.38 — the router
+  fires at every length). Matrix x2: 12.601 / 12.597, BOTH sha
+  5c528aaf, counters identical. Step (158.72-5.5)/394 = 388.9 and
+  389.0 ms: -6.5 ms/step.
+- Decision: RETAINED. Tracked matrix 12.60; gap 1.67x. Step ~389 ms.
+- Artifacts: perf/results/2026-08-11/routerfuse/.
+
+## 2026-08-11 MoE finalize weighted-sum kernel LANDED (bitwise)
+
+- Commit: working tree. qc_moe_weighted_sum
+  (serving/moe_finalize/moe_finalize.metal, fp16+bf16): one 256-thread
+  TG per token collapses the eager Metal finalize in _fused_moe_gguf —
+  (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1) + copy_ (~5
+  dispatches x ~40 MoE layers/step) — into one dispatch, reusing the
+  existing quixicore_ops.moe_weighted_sum wrapper (CUDA had this op;
+  Metal now does too). Numerics note: MPS reduces the STRIDED [T,K,D]
+  dim=1 sum SEQUENTIALLY (the contiguous K-wide sum uses a pairwise
+  tree — opposite orders, both probed; see the router entry).
+- Parity: 30/30 trials bitwise (fp16+bf16, T in {1,6,16}, magnitudes
+  1e-2..1e2; harness test_moe_wsum.py in session scratchpad).
+- Baseline: matrix 12.60 sha 5c528aaf, step 389 ms.
+- Result: 8-tok sha db2846cf UNCHANGED. Matrix x2: 12.741 / 12.552,
+  BOTH sha 5c528aaf, counters identical. Step 384.4 / 390.5 ms (mean
+  ~387 vs 389 — the pair spread is wider than today's other gates;
+  the win is real but smaller than the ~200-dispatch count suggested,
+  i.e. these ops sat partly off the critical dependency chain).
+- Decision: RETAINED (bitwise, deterministic, no regression; -200
+  dispatches/step).
+- Artifacts: perf/results/2026-08-11/moesum/.
+
+## 2026-08-11 SwiGLU clamp fidelity FIX (Metal routed experts) — RETAINED
+
+- Commit: working tree, fused_moe/activation.py. The Metal SILU branch of
+  apply_moe_activation IGNORED clamp_limit — routed experts ran
+  silu(gate)*up unclamped while CUDA (silu_and_mul_with_clamp), the
+  Triton path, and the ds4 reference (matvec_*_mid_worker: gate
+  clamped from above, up to +/-limit) all clamp. DSV4-Flash 0731 ships
+  deepseek4.swiglu_clamp_exp = 10.0 on ALL 43 layers (read from the
+  GGUF), and the shared-expert path (SiluAndMulWithClamp) already
+  clamped — so Metal's routed experts were semantically wrong whenever
+  |pre-act| > 10.
+- Fix: clamp gate (max) and up (+/-) before silu in the Metal branch,
+  mirroring silu_and_mul_with_clamp exactly.
+- Gates: 8-tok sha db2846cf UNCHANGED (clamp never binds in the first
+  ~1008 positions). Matrix: the clamp BINDS — trajectory flips to sha
+  4c173e70, deterministic x2 (10.610 / 10.560 tok/s, counters 1527/473
+  identical), text coherent (dump inspected). Step time
+  (188.50-5.5)/473 = 386.9 and 388.8 ms — mechanism UNCHANGED vs the
+  387-389 pre-fix band; the tracked-TPS drop 12.6 -> 10.6 is entirely
+  the acceptance-draw re-roll (3.23/draft vs 4.06; historical off1
+  draws 2.63-4.06). Per protocol this is a bug-fix trajectory change
+  (like the exp2 fix): retained on correctness, judged on step time.
+- The matrix trajectory RE-BASELINES to sha 4c173e70 (1527/473).
+- Artifacts: perf/results/2026-08-11/clampfix/ (gate8, gate2000_b,
+  gate2000_a2, dump/completion_0.txt).
+
+## 2026-08-11 Fused SwiGLU act kernels LANDED (bitwise) + probe method
+
+- Commit: working tree. NEW on-device transcendental probe
+  (serving/probe/qc_probe.metal + qc_probe_unary/qc_probe_binary host
+  ops, DIAGNOSTIC ONLY): identifies which Metal formula an MPS aten op
+  lowers to by bitwise compare on-device. Findings that unlock fusion
+  everywhere: MPS exp/log/tanh/log2/exp2 == metal::precise::* BITWISE;
+  sigmoid == precise::divide(1, 1+precise::exp(-x)); silu == the
+  DIVISION form precise::divide(x, 1+exp(-x)) (NOT x*sigmoid(x));
+  fp16/bf16 unary transcendentals are fp32-internal rounded once;
+  elementwise binary mul/add round in the storage dtype. (Earlier CPU
+  probes failed only because CPU libm != Metal precise intrinsics.
+  softplus remains a dedicated MPS approximation matching nothing —
+  the router's split boundary stays.)
+- qc_swiglu (serving/swiglu/qc_swiglu.metal, fp16/bf16/fp32): one
+  dispatch for both act forms — silu(clamp?(gate))*clamp?(up)
+  (apply_moe_activation SILU) and gate*sigmoid(alpha*gate)*(up+beta)
+  (SiluAndMulWithClamp / SWIGLUOAI_UNINTERLEAVE). Routes:
+  apply_moe_activation Metal branch, SiluAndMul.forward_metal,
+  SiluAndMulWithClamp.forward_metal; eager fallbacks preserved.
+  Replaces ~10 dispatches/MoE layer (routed act + shexp act).
+- Parity: 108/108 bitwise (3 forms x 3 dtypes x 12 trials, clamp-
+  binding magnitudes included; harness test_swiglu.py in scratchpad).
+- Baseline: matrix sha 4c173e70 (clamp-fix trajectory), 10.56-10.61,
+  step 386.9-388.8 ms.
+- Result: 8-tok sha db2846cf UNCHANGED. Matrix x2: 10.615 / 10.650,
+  BOTH sha 4c173e70, counters identical. Step 386.7 / 385.4 ms.
+- HONESTY NOTE / model update: ~480 dispatches removed for only
+  ~-1.5 ms. Today's glue landings show sharply decaying returns
+  (compressor tail -45, router -6.5, finalize -2, acts -1.5) — the
+  50 us/dispatch chain model no longer describes the residual. The
+  glue era is over; the remaining ~385 ms is real kernel/GPU time or
+  CPU-side encode. Next: fresh phaseprof + census on THIS build, then
+  kernel-time work (#6: MoE vec M=6, attention, lm_head vs ds4
+  matvecs).
+- Decision: RETAINED (bitwise, deterministic, simpler serving path).
+- Artifacts: perf/results/2026-08-11/swiglufuse/.
+
+## 2026-08-11 — Kernel-time pivot: fresh phase map, per-op bench, ds4 bar (M1 Ultra, dsv4-xxs-1)
+
+- Baseline: matrix sha 4c173e70, 10.56-10.65 tok/s, step ~385-389 ms.
+- Instrumentation fix: EngineCore exits via os._exit — atexit NEVER fires
+  in the server, so phaseprof dumps were lost regardless of kill order
+  (the morning dumps came from offline scripts). metal_phaseprof.py now
+  rewrites /tmp/phaseprof_<pid>.txt every 32 phase closes.
+- Fresh phase map (this build, 185 steps, 1000/800 off1, sync-bracketed
+  ~0.4 ms/bracket tax; run 7.50 tok/s@1600 + 7.17@800, bracketed step
+  ~597-656 ms vs ~385 clean): layer_ffn 46x3.77 = 173 ms/step;
+  attn_compressor 21x3.00 = 63; attn_wqb_insert 21x2.69 = 56; oproj 43x
+  0.88 = 38; mqa 43x0.83 = 36; gemms 23; indexer 16 (was 68 pre-fusion);
+  qkv_norm 14; layer_mhc 138x0.54 = 74 (sync-tax heavy); drafter 34;
+  sample 5.5. Buckets now ~add up to the step — the morning's
+  "unexplained residual" was the since-removed glue + sync double-count.
+  Artifacts: perf/results/2026-08-11/phaseprof2/ (phaseprof_23229_
+  current_build.txt, phaseprof4_run800.json, phaseprof3_run1600.json).
+- Per-op microbench (tools/bench_kernels.py, server down): M=1 kernels
+  healthy (lm_head Q8_0 734 GB/s, q_b 441, o_b 459); EVERY M=6 path
+  collapses to 140-200 GB/s w-once: q_b 0.201 ms (177), o_b 0.247 (144),
+  lm_head 2.808 (200), moe gate|up IQ2_XXS 0.975 ms/layer (160), moe
+  down Q2_K 0.488 (203). MoE M=6 = 1.46 ms/layer x43 = 63 ms/step.
+- ds4 bar re-measured on THIS machine/GGUF (ds4-bench, ctx 1024, 256
+  gen, DS4_METAL_GPU_BUSY_PROFILE): decode 25.53 tok/s (25.88 steady),
+  prefill 277; GPU busy 12.2 ms/cb x ~2.75 cbs/token = ~33.6 ms
+  GPU/token at ~87% busy.
+- THE FINDING: our M=1 microbench aggregate (~13.7 dense + 12.2 MoE +
+  0.8 lm_head + attention ~ 33 ms) is AT PARITY with ds4's 33.6 ms
+  GPU/token. The entire remaining gap is M=6 scaling: MoE 5.2x for 6x
+  slots (expert dedup at random routing saves only ~7% — the kernel is
+  decode-ALU/latency bound, not weight-BW bound), dense mb 2.5-3.7x.
+- Root causes (read qgemv.metal vs ds4 metal/moe.metal): our qgemv_moe =
+  one simdgroup per (row, slot): activations re-loaded from cache per
+  row, IQ2_XXS grid/sign lookups from constant address space (divergent
+  indexed constant loads serialize on Apple GPUs), metadata re-read per
+  8-span. ds4/llama.cpp shape: NSG simdgroups/TG, nr0=4 rows/simdgroup,
+  yl[32] activations in registers reused across rows, grid+signs staged
+  in threadgroup memory, one 8B metadata read per 32-group per row.
+  qgemv_q8_0_mb (dense M=6) is weight-stationary already but issues 48
+  scalar half x-loads + 48 mults per 8-weight span (vectorizable, d*qs
+  hoistable — both bit-safe).
+- Plan: (1) ds4-shaped multi-row MoE kernel for IQ2_XXS + Q2_K (lottery
+  roll — lane-to-weight mapping changes simd_sum partials); (2) q8_0 mb
+  x-load vectorization + decode hoist (bit-safe); judged per protocol on
+  step time + mean TPS.
+
+## 2026-08-11 — Multi-row MoE GEMV kernels (iq2_xxs + q2_K), ds4-shaped
+
+- Baseline: matrix sha 4c173e70, 10.56-10.65, step ~385-389 ms; MoE M=6
+  microbench gate|up IQ2_XXS 0.969 ms/layer, down Q2_K 0.483 ms/layer.
+- Hypothesis: the one-simdgroup-per-(row,slot) qgemv_moe is decode-ALU/
+  latency bound (constant-space codebook gathers, zero activation reuse);
+  the ds4/llama.cpp shape (NSG=2 simdgroups/TG, NR0=4 rows/simdgroup,
+  yl[32] register reuse across rows, tg-staged grid+signs for iq2_xxs,
+  q2_K integer-mask FMA folding) recovers most of the loss.
+- Kernels: qgemv_moe_mr_iq2_xxs + qgemv_moe_mr_q2_K in qgemv.metal
+  (half+bf16, NSG=2, NR0=4); launch_qgemv_moe_mr; host route in
+  ggml_moe_a8_vec for fmt iq2_xxs/q2_K when K%256==0, kill-switch
+  VLLM_QC_MOE_MR=0.
+- Microbench (serving shapes, finite-scale random weights):
+  gate|up M=6 0.969 -> 0.598 ms (-38%, 260 GB/s); M=1 0.188 -> 0.177.
+  down slots=36 0.483 -> 0.309 ms (-36%, 321 GB/s).
+  Projected step: -0.545 ms/layer x43 = ~-23 ms (385 -> ~362).
+- Numerics: fp32 chain (ds4 form) replaces the old half-rounded decode;
+  reduction order differs -> trajectory-lottery roll. fp64 reference
+  check (gguf.quants.dequantize, 64 rows): max_rel 4.3e-4 (iq2_xxs) /
+  4.5e-4 (q2_K), IDENTICAL error class to the old kernels (both at the
+  fp16-input noise floor); kernel-vs-kernel occasional 1-3% rel on
+  cancellation-heavy rows only. Half4 y-load vectorization: bitwise
+  no-op on values, no speed change (confirms ALU-bound, not load-bound).
+- REJECTED side experiment: hoisting d*float(qs[i]) + half4 x loads in
+  qgemv_q8_0_mb (dense M=6): broke the bitwise-vs-batch-1 gate and
+  bought only 8-13% (q_b 0.201->0.176, lm_head 2.808->2.488). Reverted.
+  FINDING while gating: the EXISTING q8_0 mb kernel is NOT strictly
+  bitwise vs the looped batch-1 kernel today (0.03-0.1% of rows differ
+  at last-bit scale; compiler drift since the kernel comment was
+  written). The current baseline trajectory already contains this.
+- Build hazard logged: piping xcrun metal output through `head` can
+  SIGPIPE-kill the build AFTER exit-0 from head — the metallib silently
+  keeps its old bytes. Redirect to a log file instead, and always check
+  the target's mtime.
+- Serving gates: pending (8-tok determinism + matrix x2 + step verdict).
+- Artifacts: perf/results/2026-08-11/moemr/.
+- GATES (multi-row MoE kernels): 8-tok deterministic x2, sha
+  5d4697585c6e (rolled from db2846cf as expected), wall 4.19/4.30 s
+  (was 4.94-5.13). Matrix off1-2000 x2: 12.662 / 12.650 tok/s, BOTH
+  sha 3a325666be45, counters 1566/2170/434 identical; text coherent
+  (narrative prose, dump_a/completion_0.txt). Step (157.96-5.5)/434 =
+  351.3 ms vs 385-389 baseline = -35 ms (-9.1%), better than the -23
+  projection. NOTE: the 12.66 headline also carries an above-median
+  acceptance draw (2000/434 = 4.61 vs 3.23 prior); the mechanism gain
+  is the step time. Decision: RETAINED. New trajectory baseline: sha
+  3a325666, step ~351 ms.
+- Artifacts: perf/results/2026-08-11/moemr/ (gate8_a/b.json,
+  matrix_a/b.json, dump_a/, dump_b/).
+
+## 2026-08-11 — c128_boundary never set on Metal: 41 redundant full compresses per step
+
+- Baseline: matrix sha 3a325666, 12.65-12.66, step ~351 ms.
+- Instrumentation: comp_save_partial / comp_full_compress sub-brackets in
+  compressor.forward + attn_wqb_insert_c/_swa coverage brackets in
+  attention.py (phaseprof5, 182 steps, mr build). Fresh split:
+  layer_ffn 46x2.68 = 123 ms/step (was 173 — mr kernels confirmed in
+  serving); comp_full_compress 62 calls/step x 2.51 = 156 ms/step
+  bracketed; comp_save_partial 62x0.33 = 20; attn_wqb_insert_c (20
+  compressor-only layers, includes in-bracket compressor) 148;
+  attn_compressor 68; drafter 33; mhc 73. Artifact:
+  perf/results/2026-08-11/moemr/phaseprof5_subbrackets.txt.
+- THE FIND: comp_full_compress count == comp_save_partial count (62/step
+  = 41 MLA-512 + 21 indexer-128) — the compressor's cr==128 early-return
+  (compressor.py:385-392, `state_metadata.c128_boundary is False`) NEVER
+  fires. Root cause: the v1 gpu-worker metadata path
+  (worker/gpu/attn_utils.py build_attn_metadata) never passes
+  _num_computed_tokens_cpu into CommonAttentionMetadata, so
+  _get_c128_boundary returns None (None is not False -> no skip). The 41
+  512-head full compresses recompute IDENTICAL cache records every step
+  (idempotent overwrites of complete 128-blocks) — pure waste except on
+  the ~5% of steps where a request crosses a 128-token boundary
+  (start%128 + qlen >= 128).
+- Fix: thread num_computed_tokens_cpu (InputBatch.num_computed_tokens_np,
+  exact CPU-side scheduler state, NO sync) through build_attn_metadata
+  into _num_computed_tokens_cpu; wired at the default model-state call
+  site only (drafter/other call sites unchanged: flag stays None there,
+  behavior as before).
+- Correctness gate (STRICT): because the skipped work is idempotent
+  recompute, the fix must be BIT-EXACT — 8-tok sha must stay 5d469758
+  and matrix sha must stay 3a325666 with identical counters. A changed
+  sha = bug, not lottery.
+- Gates: pending.
+- GATES (c128_boundary fix): 8-tok sha 5d469758 UNCHANGED (bit-exact,
+  wall 4.12 s). Matrix x2: 14.660 / 14.626 tok/s, BOTH sha 3a325666
+  UNCHANGED, counters 1566/2170/434 identical to the pre-fix runs —
+  the strict bit-exactness gate held exactly as the idempotency
+  analysis predicted. Step (136.4-5.5)/434 = 301.6 and 302.4 ms, down
+  from 351 (-50 ms, -14%). Decision: RETAINED. This was a pure waste
+  bug (redundant idempotent recompute), not an optimization trade.
+- Step history today: 540 -> 498 -> 385 -> 351 -> ~302 ms. Matrix
+  12.66 -> 14.66 on the same trajectory/draw.
+- Artifacts: perf/results/2026-08-11/moemr/c128_gate8.json,
+  c128_matrix_a/b.json.
+
+## 2026-08-11 — Bit-exact MoE follow-ups: geometry sweep, strided save_partial, fused SwiGLU epilogue
+
+- Baseline: matrix sha 3a325666, 14.63-14.66, step ~302 ms.
+- All three changes are BIT-EXACT by construction (per-row lane mapping
+  is geometry-invariant; strided views read identical values; the fused
+  epilogue rounds accumulators to T with the same *0.25 store expression
+  then mirrors the qc_swiglu form-0 chain). Gate = sha identity.
+- (1) Geometry sweep (VLLM_QC_MOE_MR_GEO, microbench, all bitwise-
+  verified): gate|up flat (2x4 0.612 / 4x4 0.598 / 1x2 0.748); q2_K down
+  best at 4x8 (0.313 -> 0.275, -12%). Wired q2_K default to 4x8.
+- (2) save_partial_states strided input: kernel takes in_stride; the
+  kv/score halves of the fused GEMM output bind as views (encoder honors
+  storage_offset) — kills 2 .contiguous() copies x ~62 calls/step.
+  Unit test: strided == packed bitwise.
+- SERVING GATE (1)+(2): 8-tok sha 5d469758 IDENTICAL, matrix sha
+  3a325666 IDENTICAL, drafts 434 — correctness holds. Speed: 14.52
+  (step 304.8) vs 14.63-14.66 (301.6-302.4) — ~1% SLOWER. Suspect: q2_K
+  4x8 loses its isolated-microbench edge under serving concurrency
+  (4608 threadgroups vs 18432 = less overlap headroom). Isolation
+  pending (VLLM_QC_MOE_MR_GEO=24 boot) after the fused-act gate.
+- (3) Fused SwiGLU epilogue (qgemv_moe_mr_iq2_xxs_swiglu, NSG=2 NPAIR=2:
+  2 gate rows + their 2 up rows per simdgroup): emits the activated
+  (slots, 2048) tensor directly; removes the qc_swiglu dispatch + the
+  (slots, 4096) intermediate round-trip per layer. Unit: BITWISE vs
+  two-step; kernel alone 0.627 vs 0.600 (pair rows 2048 apart cost
+  locality) — net win must come from the removed dispatch+traffic.
+  Route: fused_moe.py use_fused_act (Metal, IQ2_XXS, SILU, no EP;
+  kill-switch VLLM_QC_MOE_FUSED_ACT=0). Serving gate: pending.
+- SERVING VERDICT (bit-exact batch): four configs measured 301.6-304.8
+  ms across boots (pre-batch 301.6/302.4; g48+strided 304.8; +fused act
+  302.6; forced 2x4 +strided+fused act 304.6) — the differences are
+  INSIDE boot-to-boot variance (+-1.5 ms). Decision: RETAIN the whole
+  batch (bit-exact, fewer dispatches, no copies; g48 stays the q2_K
+  default on microbench evidence); treat serving effect as neutral.
+  METHOD NOTE: single matrix runs resolve ~+-1.5 ms at best — reserve
+  serving gates for >5-10 ms effects; microbench + dispatch-count argue
+  the small ones.
+- Artifacts: perf/results/2026-08-11/moemr/geo_gate8.json,
+  geo_matrix.json, fusedact_*.json, geo24_matrix.json.
+
+## 2026-08-11 — IN FLIGHT at compaction: head=512 cr=4 compressor front kernel
+
+- Post-c128 phaseprof (perf/results/2026-08-11/moemr/ via task output;
+  182 steps): comp_full_compress still 43 calls/step = 21 fused indexer
+  (cheap) + 21 cr=4/head=512 layers running the ~12-op EAGER chain every
+  step (legitimately — a 6-token step always crosses a 4-boundary) + ~1
+  cr=128 boundary hit. The cr=128 skip works. The 21 eager cr=4/512
+  compressors are the biggest remaining block (~2-3 ms/call bracketed,
+  est 30-50 ms/step real).
+- Landed (UNTESTED — parity not yet run): dsv4_compress_front kernel
+  (indexer.metal): gather 8-row overlap history from the 2048-wide fp32
+  state rows (h>=4 reads +512 head), per-dim softmax (sequential sums,
+  precise exp/divide), weighted sum, RMS (per-lane sequential 16-dim ss
+  + simd_sum, rsqrt(divide(ss,512)+eps)), bf16 rows out; dims processed
+  in 4-wide chunks of the lane's contiguous 16-dim span (register
+  bound). The native deepseek_v4_kv_insert (existing, unchanged)
+  consumes the rows — RoPE@selected_pos + e4m3 + 584-byte record.
+  Launcher launch_dsv4_compress_front; host op + pybind
+  dsv4_compress_front; ops.py wrapper; route _metal_compress_front_512
+  in fused_compress_quant_cache.py (before the eager memo block, its
+  own small memo for output_slots/selected_pos; eager tail preserved as
+  fallback). Kernel + ext BUILT AND INSTALLED.
+- NEXT: run scratchpad/test_compress_front.py (byte-exact target; if
+  rows mismatch, suspect the 512-wide mean reduction order — probe at
+  [T,512] with the qc_probe method and adjust the lane/ss structure),
+  then sha-identity serving gates (5d469758 / 3a325666 / drafts 434)
+  + step time (expect ~302 -> ~270 or better).
+
+### RESOLVED same day: compress front is correct but serving-neutral — PARKED default-off
+
+- Offline parity: byte-exact 24/24 rows across 12 trials (boundary +
+  non-boundary positions, invalid-slot skip). Kernel math verified.
+- Serving gates: 8-tok sha IDENTICAL (5d469758). Matrix sha CHANGED
+  (abaa1c24, counters 1557/2220/444), deterministic x2 (A==B byte-equal,
+  walls 140.765/140.773).
+- Root cause of the sha change (in-serving verify mode,
+  VLLM_QC_COMPRESS_FRONT=2, 300-tok run): 245 mismatching rows over the
+  whole run, EVERY one nz=1/512 — a single bf16 element per rare row,
+  one rounding step apart; rrms and the other 511 dims byte-identical.
+  Metal precise::exp + sequential 8-term reduce vs MPSGraph softmax
+  disagree by 1 ULP on rare inputs that sit on a bf16 rounding boundary.
+  ULP-equivalent, NOT bit-exact: this is a trajectory-lottery roll, not
+  an identity change. Text coherent; hits occur in prefill AND decode.
+- Throughput verdict: matrix step (140.77-5.5)/444 = 304.7 ms vs
+  baseline 301.8-301.9 — NO WIN (wrong side of the +-1.5 ms floor).
+  The post-c128 map's "30-50 ms/step eager compressor" was a
+  sync-attribution artifact: phaseprof7 (front ON) vs phaseprof5 shows
+  comp_full_compress 155.6 -> 88.7 ms/fwd sync-inflated and
+  target_forward 635 -> 563, but real async step time is unchanged —
+  the eager MPS compress ops were pipelined off the critical path.
+- DECISION: park default OFF (VLLM_QC_COMPRESS_FRONT, default 0). A
+  lottery roll with no step-time win does not get to re-baseline the
+  shas. Kernel + route + verify mode retained (clearly quarantined in
+  fused_compress_quant_cache.py) for the native-step-tape era, where
+  dispatch count is the point. Front-off confirmation matrix: sha
+  3a325666 / 1566/2170/434 / wall 136.54 -> step 301.9 — baseline
+  restored, and the rebuilt metallib/ext carry ZERO drift.
+- METHOD LESSON (important): sync-bracket phaseprof time is
+  attribution, not critical path. Before fusing a bucket, demand
+  evidence the bucket is ON the critical path (GPU-busy measurement or
+  a serving A/B with the ops stubbed), not just a large bracket share.
+- Artifacts: perf/results/2026-08-11/moemr/front_gate8_a,
+  front_matrix_{a,b}, frontoff_matrix, phaseprof7_front_run800.txt;
+  verify log /tmp/qc_serve_verify.log (245 hits); parity harness
+  scratchpad/test_compress_front.py (24/24).
+
+## 2026-08-11 — THE WALL IS CPU ENCODE, NOT KERNELS: GPU busy 49% at steady decode
+
+- Baseline: matrix 14.63-14.66 tok/s, step ~302 ms, sha 3a325666,
+  drafts 434, draw 4.61.
+- Measurements (all on the front-off build, same profile):
+  - GPU device utilization during steady decode: mean 49.1% (ioreg
+    IOAccelerator "Device Utilization %", 120 samples at 2 Hz across the
+    decode window of an 800-tok run; idle reads 0, so the metric is live).
+    ds4 runs 87% busy on the same machine.
+  - cb_census (command-buffer swizzle, VLLM_SYNCPROF=1): ~61 command
+    buffers per decode step (10999 over 181 steps); per-buffer GPU busy
+    sums to MORE than wall (67.5 s vs ~63 s active), i.e. torch's MPS
+    queue and the second stream overlap — per-buffer sums cannot give
+    idle fraction, ioreg can.
+  - syncprof per-step: execute_model (CPU encode of the target forward)
+    85.0 ms/call; AsyncOutput.get_output (engine blocked on the step
+    event) 238.5 ms/call; wave-0 sync kills all still dead (.item/.numpy
+    totals are microseconds).
+  - pysample (new in-process 200 Hz Python sampler, py-spy needs root on
+    macOS): vllm/v1/worker/metal_pysampler.py, VLLM_PYSAMPROF=1, dumps
+    /tmp/pysample_<pid>.txt. Steady-state MainThread: get_output wait
+    ~156 ms/step; forward+sampler Python encode spread over dozens of
+    sub-ms sites (einsum o_proj/mhc, router, compress eager chain,
+    module __call__ overhead) — no single dominant Python site.
+- Arithmetic: GPU work ~0.49 x 288 ~= 141 ms/step = 24 ms/token-slot at
+  M=6 — BETTER than ds4's 33.6 ms/token. The kernels have won; the step
+  loses ~150 ms/step to Python/dispatch pacing (GPU starves while
+  Python encodes the next chunk). Driving busy to ~90% at current
+  kernel time gives step ~160 ms -> ~29 tok/s agg -> beats the bar.
+- RED HERRINGS KILLED (method lesson: boot-lifetime per-call averages
+  lie; use miss-probes and steady-state windows):
+  - drafter_propose "32.6 ms/call": 3 one-time ~2 s stalls at first
+    drafter use (Hadamard .to(mps) behind a deep warmup queue,
+    VLLM_TQ_HADAMARD_DEBUG=1 probe: exactly 3 misses, D=512, layers
+    43-45). Steady drafter ~1.6 ms/step. functools.cache works.
+  - copy_to_uva/apply_staged_writes 3.35 s: per-request add_requests
+    stalls, not per-step.
+- DECISION: Batch 4 native step tape (task #5) is promoted from
+  fallback to main line. Stage A: exact op census of one steady decode
+  step. Stage B: C++ step encoder replaying the census through our own
+  command buffers; compress-front (parked today) rejoins there.
+- Artifacts: perf/results/2026-08-11/moemr/{pysample1_run800.txt,
+  syncprof1_run800x2.txt}; probe env VLLM_TQ_HADAMARD_DEBUG in
+  turboquant_attn.py (kept, env-gated).
+
+## 2026-08-11 — Drain-kill batch: every per-step MPS pipeline drain found and removed (+0.5 tok/s, bit-exact)
+
+- Baseline: matrix 14.63-14.66, step ~302 ms, sha 3a325666/434 drafts.
+- Method: one-step torch.profiler op census (VLLM_QC_OP_CENSUS=<n> in
+  MetalWorker, chrome trace + enclosing-frame analysis). Iterated:
+  census -> kill the biggest blocking op -> census. The drain is
+  CONSERVED: killing one blocking H2D just moves the full-stream wait
+  to the next blocking op, so single fixes measure ZERO until the last
+  drain on the step path is gone (sampler fix alone: 303.2, no change).
+- Drains found (all every-step, all in the v2 gpu worker glue):
+  1. sampler.apply_staged_writes: unconditional 5x copy_to_uva of
+     never-changing [32] arrays; on Metal "UVA" is a plain MPS tensor
+     and pageable-H2D copy_ is COMMIT_AND_WAIT (17.4 ms drain measured).
+     Fix: gate on scheduled_new_reqs (model_runner.add_requests) +
+     non_blocking=True in UvaBufferPool.copy_to_uva.
+  2. async_copy_to_gpu mps branch: blocking out.copy_(x). Fix:
+     non_blocking=True (staging memcpy is synchronous CPU-side either
+     way; source lifetime safe).
+  3. StagedWriteTensor.apply_write mps branch: torch.tensor(...,
+     device="mps") blocking H2D via block_tables.apply_staged_writes.
+     Fix: CPU tensor + .to(device, non_blocking=True).
+  4. get_compressed_slot_mapping metal branch: repeat_interleave with
+     tensor repeats syncs on MPS (reads output size back; 8-10 ms/step
+     across indexer/sparse_mla builders + internal .item). Fix:
+     torch.searchsorted over query_start_loc (device-side, same
+     req_ids; bit-exact by construction).
+- Post-fix census: NO aten op > 300 us in a steady decode step; all
+  remaining .item()s are CPU tensors (microseconds).
+- Gates: 8-tok sha 5d469758 IDENTICAL; matrix sha 3a325666 IDENTICAL,
+  counters 1566/2170/434 IDENTICAL (bit-exact family, no re-baseline).
+- Throughput: matrix walls 132.08/132.57 -> step 291.6-292.8 ms
+  (from 301.9-303.2), 15.09-15.14 tok/s (from 14.63-14.66). GPU busy
+  unchanged at 49.5% (the fixes removed blocked CPU time; GPU idle is
+  now pure encode pacing).
+- Artifacts: perf/results/2026-08-11/moemr/{opcensus1_step40.txt,
+  opcensus2_step40_stacks.txt, opcensus2_step40_trace.json,
+  opcensus3_fix2_trace.json, opcensus4_fix3_trace.json,
+  drainfix_matrix_{a,b}, stagefix_matrix_a}.
+
+## 2026-08-11 — Async scheduling on Metal: NEUTRAL at c1 (kept env-gated off)
+
+- Discovery: vllm/platforms/metal.py force-disabled async_scheduling
+  since bring-up; the config layer whitelists dspark. Gated behind
+  VLLM_METAL_ASYNC_SCHED=1. Needs kv_cache_memory_bytes >= ~1.36 GiB
+  for lookahead slots; profile raised 1.0 -> 1.5 GiB (trajectory
+  verified unaffected by KV size: same shas).
+- Result: 8-tok + matrix shas IDENTICAL, step 291.9 ms — exactly the
+  sync-scheduler number. At c1 with speculation the next step's input
+  is the previous step's accepted tokens: nothing to overlap across
+  steps. May matter at c8; revisit there.
+
+## 2026-08-11 — compress-front retest under the drain-free regime: still neutral, stays parked
+
+- With all drains dead, VLLM_QC_COMPRESS_FRONT=1 matrix: sha abaa1c24
+  (known ULP-fork family, deterministic, drafts 444), step 294.2 ms vs
+  291.6-292.8 off. The eager compressor chain encodes on the second
+  stream (maybe_execute_in_parallel) and overlaps the main stream, so
+  its op-count reduction buys no wall time in either regime.
+- WHERE THE CAMPAIGN STANDS: syncs dead, drains dead, kernels at ds4
+  parity (GPU ~145 ms/step = 24 ms/token-slot at M=6), async sched
+  neutral at c1. Step 292 = ~85 ms forward encode (Python/torch op
+  pacing) + GPU 145 with bubbles + ~35 ms sampler/drafter Python +
+  bookkeeping. The ONLY remaining lever of size is Batch 4: the native
+  C++ step tape (encode the whole 43-layer forward, then the
+  sampler/drafter chain, from C++ through our own encoder). Target:
+  step ~160-180 -> 25-28 tok/s -> beats ds4 (21.08 bar / 25.53 decode).
+
+## 2026-08-11 — Batch 4 S1a: step-tape GEMM bricks built, parity-proven, installed
+
+- Design for the whole tape recorded in perf/metal_m1ultra_campaign_v2.md
+  ("Batch 4 Stage 1 design"). This entry lands the first bricks.
+- decode_linear: added float16 instantiation + 4-wide vectorized inner
+  loop (scalar fp16 loads were issue-bound: 6x4096x2048 went 225.7 ->
+  87.7 us/call wall vs torch.mm 78.9 — GPU parity, our wall includes
+  a bigger per-call Python overhead that the tape eliminates).
+- NEW decode_linear_bh kernel (wq_b-style bmm: in[H,B,K] @ weight
+  [H,N,K]^T per head, weight pre-transposed once at load): 8x6x4096x1024
+  at 290 us/call wall vs torch.bmm 204 (BW floor ~105). Good enough for
+  S1b; tuning ideas noted: 2-4 out-channels per simdgroup sharing the
+  input vector in registers (MoE-mr shape), 2-iteration unroll.
+- Host ops qc_decode_linear / qc_decode_linear_bh (+ ops.py wrappers,
+  pybind). Launcher launch_decode_linear_bh in tk_launch.h.
+- Parity: rel error vs float64 CPU reference at torch's own error level
+  on all tape shapes (6x4096x{256,512,1024,2048}, 6x1024x4096,
+  8x6x4096x{512,1024}); NOT bitwise vs torch (reduction order) — when
+  these replace torch ops inside the tape, the serving gate is the
+  trajectory-lottery (deterministic x2 + step time), not sha identity.
+- Both artifacts REBUILT AND INSTALLED (metallib strings-check 12 hits
+  for decode_linear_bh; ext exit 0). decode_linear was previously
+  vendored-but-unused, so no serving path is affected until the tape
+  consumes it; next boot's 8-tok gate re-confirms 5d469758.
+- Harness: scratchpad/test_decode_linear.py.
+- NEXT (S1b, per the design doc): qc_tape_register_layer + qc_step_forward
+  skeleton in qc_metal_serving.mm — start with the uniform layer body
+  (norms, gguf gemvs, qk-norm+rope+insert, wq_b via decode_linear_bh,
+  mqa, o_proj via decode_linear, router+moe, mhc, adds) behind
+  VLLM_QC_STEP_TAPE=1 with per-layer Python fallback; indexer/compressor
+  layers run hybrid until S1c. The wq_b weight needs a one-time load
+  transform to [H,N,K]; keep logits/lm_head on the torch path in S1 so
+  the 8-tok sha gate stays 5d469758.
+
+## 2026-08-11 — Batch 4 S1b: native step tape LANDED, bit-exact, serving-NEUTRAL so far (investigation open)
+
+- WHAT LANDED: qc_tape_register_layer / qc_tape_layer_forward in
+  qc_metal_serving.mm — one C++ call per decoder layer replaces the
+  Python/torch encode of the full layer body for the 22 non-indexer
+  layers (20 c128 + 2 swa-only, incl. hash-routed layers 0/1): mhc_pre
+  -> rms_norm -> wqa_wkv gemv -> kv_score mm -> qk rmsnorm -> wq_b gemv
+  -> qnorm/rope/kv-insert -> save_partial_states -> sparse MQA ->
+  o_inv_rope -> wo_a einsum(bmm) -> wo_b gemv -> mhc_post -> mhc_pre ->
+  rms_norm -> router linear -> shared experts (gemv+qc_swiglu+gemv) ->
+  softplus+dsv4_router_topk (bias or hash) -> moe swiglu vec -> down vec
+  -> moe_weighted_sum -> add -> mhc_post. Same host ops + same aten ops
+  in the same order/dtypes as the Python sites (op-identical stage; the
+  decode_linear GEMM swaps are NOT in yet — those are lottery-class).
+  Driver: vllm/models/deepseek_v4/metal_tape.py (lazy registration at
+  first step, per-call fallback: no metadata dict / T>8 / c128 boundary
+  step / indexer layers). Hook: metal_worker.load_model, env
+  VLLM_QC_STEP_TAPE {0=off,1=on,2=verify}. forward_mqa's slot-table
+  builders extracted to module functions (build_swa_tables /
+  build_comp_tables / build_comp_none — pure code motion) shared by
+  forward_mqa and the tape.
+- BUG FOUND BY VERIFY MODE (and the fix): sharing one canonical layer's
+  per-step slot tables mis-slotted layer 0's KV insert — vLLM's KV group
+  unification SPLITS identical cache specs into multiple groups (uneven
+  page-size tails), so slot_mapping/block_table are per-GROUP, not
+  per-step. Verify: 21/22 layers bit-exact, layer 0 nz~67%/max~0.8
+  every step; python-replica bisect all-OK (used the layer's own
+  metadata) + offline synthetic parity all-OK pinned it to serving
+  metadata identity. Fix: per-layer step tensors fetched from each
+  layer's OWN metadata objects, memoized in forward_mqa's pass cache
+  with forward_mqa's exact keys. After fix: 300-token verify run, 0
+  mismatches across every taped layer-step.
+- GATES (mode 1, tape live): 8-tok sha 5d4697585c6e IDENTICAL; matrix
+  off1-2000 sha 3a325666be45 IDENTICAL, 15.14 tok/s, wall 132.09 s
+  (baseline 15.06-15.14 / 132.1-132.8) -> step ~291.7 ms. CORRECT BUT
+  PERF-NEUTRAL.
+- THE SURPRISE: ioreg GPU busy during the tape matrix run = 95.9% avg
+  (257 samples @2Hz, whole run) vs 49.5% pre-tape at the SAME wall and
+  step time. Two candidate worlds: (A) true GPU execution per step is
+  ~280 ms and the pre-tape 49.5% under-read due to command-buffer
+  fragmentation (=> kernels are NOT at parity with ds4; 280/6 = 47
+  ms/token-slot vs ds4 33.6; the campaign lever goes back to GPU work /
+  cb structure); (B) the C++ host-op encode chain costs ~as much as the
+  Python it replaced (the interpreter was never the wall) and the 96%
+  reading is a large-cb artifact. Pre-tape syncprof cb-census (800x2
+  run) showed gpu_busy 146.5s/368 steps ~= 400 ms/step under
+  serialization — consistent with World A once encoder-level overlap is
+  accounted for. IN PROGRESS: pysamprof run with tape live to see where
+  engine-core CPU time goes now.
+- Artifacts: scratchpad boot_tape_verify{,2,3,4}.log, boot_tape_live.log,
+  busy_tape1.txt, tape1_matrix/, test_tape_layer.py (offline parity:
+  tape==replica==deterministic, both registry slots, incl. repeat-style
+  4-identical-stream input). To be copied into perf/results/2026-08-11/.
+
+## 2026-08-11 — S1b VERDICT: the step is GPU-EXECUTION-BOUND; "kernels are done" was a metric artifact. CAMPAIGN MAP REVISED.
+
+- pysamprof (200 Hz in-process, tape mode 1, 800-token run, no sync
+  distortion): during decode the engine MainThread spends ~32 s (~200
+  ms/step) WAITING in core.step -> sample_tokens get_output — i.e. on
+  GPU completion + drafter + sampling — while forward-encode frames all
+  but vanish (visible decode-time forward rows sum to ~1-2 s across the
+  21 python c4 layers; the einsum/forward_native rows are prefill-only,
+  T=1000 > the mhc kernel's 32-token gate). The tape DID collapse the
+  wrapped encode. Artifact: perf/results/2026-08-11/tape/
+  pysample_tape_run800.txt.
+- ioreg GPU busy, DECODE-ONLY window (40 samples @2 Hz mid-run):
+  **98.6%** (busy_decode_only.txt). Whole-run avg 95.9%.
+- Conclusion: with encode out of the way the GPU is saturated and the
+  wall did not move -> step ~292 ms ~= GPU execution time per step.
+  The pre-tape "49.5% busy => GPU work 145 ms/step => kernels done"
+  inference was WRONG — the utilization counter under-reads when the
+  work arrives as many small command buffers with scheduling gaps.
+  METHOD LESSON: ioreg Device Utilization is only comparable within one
+  command-buffer regime; saturate the encode path before believing it.
+- REVISED MAP: step 292 ms ~= ~280 ms GPU execution (target forward +
+  5 sequential DSpark draft iterations + verify sampler chain) with
+  encode fully overlapped. Beating ds4 needs GPU work per step down
+  toward ~200 ms. Levers, ranked: (1) per-kernel GPU-time census
+  (encoder labels are already in place -> xctrace Metal System Trace,
+  or per-phase cb-census) then attack the top kernel families (MoE vec
+  kernels, sparse attention, mhc 4x/layer, gguf gemvs); (2) Batch 6
+  speculation economics — the drafter's 5 sequential small forwards are
+  GPU-serial dead weight if acceptance doesn't pay for them; (3) tape
+  S1c/S2 only matter again after GPU time drops back under the encode
+  floor.
+- DECISION on the tape: VLLM_QC_STEP_TAPE stays DEFAULT OFF (0) —
+  bit-exact (sha-identity gates passed) but serving-neutral today. It
+  is the substrate that made this diagnosis possible and becomes useful
+  again the moment GPU time is cut. Verify mode (=2) is the layer-level
+  correctness harness. NOTE: the metal.py slot-table builder extraction
+  is on the default path (pure code motion, verbatim); mode-1 gates
+  exercised it sha-identically; the default-off path re-gate rides the
+  next baseline boot.
+- 500-token spot check with tape live: 13.40 agg tok/s (500-token runs
+  have a larger prefill share; not a matrix row).
+
+## 2026-08-11 — Batch 8 opening: offline GPU kernel-family census at M=6
+
+- Method: scratchpad gpu_census.py (copied to perf/results/2026-08-11/
+  tape/) — each family timed offline at exact decode shapes, synthetic
+  weights, 100 GPU-synced iters, x calls/step. Serialized wall per call;
+  ranks families, does not reconstruct overlap.
+- Target-forward families (ms/step): moe swiglu vec 26.1 (0.606/call,
+  36 rows, ~257 GB/s vs down vec's ~397 — headroom), mhc_pre 19.2
+  (0.223/call x86 — 20 Sinkhorn iters, 6 threadgroups, latency/barrier
+  bound, NOT bandwidth), moe down vec 10.7, sparse_attn c4-topk512 9.5,
+  wo_b gemv 7.7, wo_a fp16 bmm 7.6, wq_b gemv 5.0, shared gate_up 3.9,
+  sparse_attn c128 3.1, qnorm_rope_insert 3.1, kv_score mm 2.4, the
+  rest <2 each. SUM = 112.6 ms/step.
+- Measured GPU per step ~280 (98.6% busy x 292) => ~170 ms/step is
+  OUTSIDE these families: indexer family (21 layers), compressor eager
+  tails (21x), lm_head/logits gemv, embedding/hc_head, verify sampler
+  chain (gumbel+rejection), and the DSpark drafter's 5 SEQUENTIAL draft
+  iterations (3-layer forward + lm_head + sample each). The drafter is
+  the largest unmeasured block and is pure GPU-serial latency.
+- NEXT (ranked): (1) close the attribution gap — xctrace Metal System
+  Trace on a tape-live decode (encoder labels in place) OR a drafter
+  A/B (VLLM block size / drafter-off run) to size the drafter share
+  directly; (2) moe swiglu vec kernel bandwidth (26 -> ~17 ms at down-vec
+  efficiency); (3) mhc_pre restructure (simdgroup-only sinkhorn, no
+  threadgroup barriers; 4x4 per token fits one simdgroup) — 19 -> ~5 ms
+  class; (4) Batch 6 speculation economics with real drafter GPU cost.
+
+## 2026-08-11 — Batch 8: --no-spec A/B sizes the drafter share; dark mass is INSIDE the target forward
+
+- Hypothesis: the ~170 ms/step unattributed by the offline census is
+  mostly the DSpark drafter's 5 sequential iterations.
+- Method (DIAGNOSTIC, no sha gate): `slimserve dsv4-xxs-1 --serve
+  --no-spec -y`, exact harness off1 2000-token matrix point. Artifacts:
+  perf/results/2026-08-11/tape/{nospec_matrix.json, busy_nospec.txt,
+  boot_nospec.log}.
+- Result: wall 490.69 s / 2000 tok => 4.08 agg tok/s; no-spec step =
+  (490.69-5.5)/2000 = **242.6 ms** for ONE token (target M=1 forward +
+  simple sampling). Decode-only ioreg busy **97.6%** (40 samples @2 Hz)
+  — the target forward ALONE saturates the GPU.
+- Drafter+verify UPPER BOUND: 292 − 242.6 = **49.4 ms/step (<=17%)** —
+  and that bound still contains the M=1→M=6 target-forward delta, so
+  the true drafter share is smaller (~10 ms per draft iteration at
+  most, incl. verify sampler chain). HYPOTHESIS REJECTED: the drafter
+  is NOT the dark mass.
+- Speculation economics (settles most of Batch 6): speculation is a
+  **3.70x** throughput multiplier (15.06 vs 4.08 tok/s); 49.4 GPU-ms
+  buys 3.61 extra tokens/step. Turning it off or shrinking it is dead.
+  The only open Batch-6 lever is whether MORE drafts pay (block size
+  >5) — cheap iterations + draw 4.61 near block 5 ceiling suggests
+  trying block 6-7 AFTER the target forward is cut.
+- REVISED ATTACK MAP: dark mass ~= 242.6*0.976 ~= 237 ms GPU at M=1 vs
+  ~100-112 ms census-known families => **~125-135 ms/step inside the
+  target forward is unattributed**: indexer family (21x
+  dsv4_indexer_topk_decode + q-proj/insert), compressor eager tails
+  (21x), lm_head gemv, eager glue.
+- NEXT: VLLM_QC_PHASE_PROF=1 serving run (sync-bracketed phase splits
+  already in place: target_forward/sample_and_reject/drafter_propose +
+  attn_indexer/attn_compressor/attn_mqa/attn_gemms/attn_oproj +
+  comp_save_partial/comp_full_compress). Tape must stay OFF so python
+  brackets execute. Split is the diagnostic; absolute time inflated by
+  the syncs.
+
+## 2026-08-11 — Batch 8: phaseprof run and the sync-artifact calibration
+
+- Method (DIAGNOSTIC): VLLM_QC_PHASE_PROF=1 serving boot, tape OFF, 500-token
+  exact-harness pass (7.81 agg tok/s — step inflated to ~625 ms by the
+  bracket syncs; split-only diagnostic). Artifacts: perf/results/
+  2026-08-11/tape/{phaseprof_500.txt, phaseprof_500.json}.
+- Raw split per step (116 target_forward calls): layer_attn 387,
+  layer_ffn 143.6, comp_full_compress 111.7 (2.60/call x43),
+  attn_wqb_insert_c 102.4, layer_mhc 80.4, attn_compressor 70.1,
+  attn_wqb_insert 57.1, attn_oproj 39.8, attn_mqa 36.7, drafter_propose
+  33.7, attn_indexer 27.0, sample_and_reject 5.6 ms.
+- Bracket-count forensics: comp_save_partial 62/step (21 C4A-MLA + 20
+  C128A-MLA + 21 indexer) and comp_full_compress 43/step = the 42 cr=4
+  compressors + ~1 c128 boundary hit => the c128 boundary skip WORKS on
+  Metal. The every-step compress load is the 42 cr=4 compressors.
+- CALIBRATION FINDING: the phaseprof absolutes are NOT trustworthy.
+  fused_compress_quant_cache.py already contains a single-dispatch
+  head=512 front (dsv4_compress_front, VLLM_QC_COMPRESS_FRONT, parked
+  OFF earlier today): ULP-equivalent, and end-to-end NEUTRAL (matrix A/B
+  304.7 vs 301.8 ms/step). Physics agrees: the eager tail moves ~400 KB
+  /call => true GPU cost ~0.3 ms, not the bracketed 2.6 ms. The
+  sync-bracketed profiler serializes per-launch latencies the async
+  pipeline hides; comp_full_compress's 112 ms is ~95% artifact. The
+  indexer head=128 front (dsv4_indexer_compress_insert) is ungated and
+  already live in serving.
+- HONEST LEDGER at M=6: census families ~113 + compress ~8 + indexer
+  ~10-15 + drafter ~35 + sampler/lm_head ~8 => ~180 ms explainable vs
+  292 ms step. ~110 ms/step remains attributable only to (a) hundreds
+  of tiny eager MPS glue ops at 20-100 us GPU each, or (b) cb-boundary
+  scheduling tax. ioreg busy (97.6-98.6%) cannot distinguish these —
+  cb-window-based counter.
+- NEXT: xctrace Metal System Trace (xctrace 26.0 present) attached to a
+  clean-boot EngineCore during steady decode: per-encoder GPU times and
+  real inter-dispatch gaps settle (a) vs (b) definitively.
+
+## 2026-08-11 — Batch 8 CLOSED ATTRIBUTION: xctrace Metal System Trace — the step is a SERIAL OCCUPANCY problem
+
+- Method: clean boot (no profilers), off1-2000 exact run; 8 s xctrace
+  'Metal System Trace' attach mid-decode; export metal-gpu-intervals
+  (per-encoder GPU exec; NOTE the export has TWO duration-typed cols —
+  col2 = true exec, later col = CPU->GPU queue latency; first-col-only
+  parsing is required, initial mis-parse inflated everything to queue
+  spans). Artifacts: perf/results/2026-08-11/xctrace/ (trace parse
+  script, gz'd gpu-intervals export, matrix json).
+- GATE: the same run IS a clean-boot baseline re-gate: 15.12 agg tok/s,
+  wall 132.27 s, sha 3a325666be45 IDENTICAL (also re-gates the metal.py
+  slot-table code motion on the default path — note closed).
+- HEADLINE NUMBERS (29 steps in window):
+  * union GPU-exec coverage 97.2% of wall -> TRUE GPU IDLE 2.8%/step.
+    Step 292 ms ~= 284 ms of genuine kernel execution. There is NO
+    dispatch-gap/cb-scheduling tax to reclaim (40 cbs/step, 296
+    encoder-intervals/step, CPU commits ~1.5 steps ahead: 130-220 ms
+    creation->completion queue latency).
+  * ~2895 MPSGraph eager ops/step (mps-hw-intervals count; exec time
+    not separable there — durations include queue) + ~750 qc kernels.
+  * Encoder-region split per step: attention-region groups (sparse_attn
+    + inserts + save_partial + eager compressor/indexer glue) ~170 ms;
+    MoE+mHC groups ~60-85 ms; drafter ~35 ms; sampler ~6 ms.
+- WHY census said 112.6: the offline census pipelines 100 independent
+  iterations -> kernels overlap 2-3x and hide occupancy bubbles. The
+  serving step is ONE dependency chain: the same kernels serial at T=6
+  shapes leave the 64-core GPU mostly empty per-kernel. Serial glue
+  micro-bench (glue_serial.py): 8-14 us/op dependent-chain floor.
+- THE CALIBRATION THAT SETS STRATEGY: ds4 runs the FULL DSV4 forward in
+  ~39 ms (25.53 tok/s decode, no speculation) vs our no-spec forward
+  242.6 ms — 6x — using few big fused kernels per layer. Our deficit is
+  kernel granularity (3650 tiny serial ops/step), not algorithm.
+- TARGET ARITHMETIC: beat ds4 25.53 decode => step <= ~180 ms at draw
+  4.61. Attack, ranked by recoverable serial ms: (1) fuse attention-
+  region eager tails into existing single-dispatch kernels — compress
+  front512 ON (built, ULP-verified, its 301.8-vs-304.7 "neutral" A/B is
+  a real ~3 ms win under the corrected map), then tape-stage-2 fusion
+  of the remaining glue; (2) mhc_pre simdgroup Sinkhorn rewrite (86
+  calls/step, latency-bound); (3) moe swiglu vec bandwidth (26->17
+  amortized); (4) drafter tape/block economics (~35 ms block).
+
+## 2026-08-12 — Batch 9 wave 1: mhc_pre split kernel (LANDED), fused-mhc + wo_a swaps (REJECTED)
+
+- Context: xctrace verdict — the step is serial GPU execution; attack =
+  fewer/bigger/wider kernels. Three candidates measured offline first.
+- REJECTED: fused mhc post+pre on Metal (dsv4_mhc_fused_post_pre was
+  fully wired, only the use_fused_mhc gate blocked it). Offline: BIT-
+  EXACT vs the post->pre pair (5 trials, all four outputs), but SLOWER:
+  0.570 vs 0.503 ms sync-serial — the fused projection pays 5 loads per
+  element per simdgroup (x + 4 residual streams) vs 1, eating the
+  dispatch saving. No code change kept. Artifact: scratchpad
+  test_fused_mhc.py (copied to perf/results/2026-08-12/batch9/).
+- REJECTED: wo_a einsum -> qc_decode_linear_bh swap. Offline at
+  [6,8,4096]x[8,1024,4096]: 0.569 vs 0.486 ms sync-serial, 0.308 vs
+  0.174 amortized — MPS bmm wins this shape. Artifact: test_woa_swap.py.
+- LANDED: dsv4_mhc_pre SPLIT kernel (dots + finalize).
+  * Diagnosis: monolith runs `tokens` threadgroups (6 at M=6) on a
+    64-core GPU — latency-starved; 0.223 ms/call amortized, ~0.3-0.45
+    serial; 86 calls/step ~= 26-31 ms/step.
+  * Design: dots pass = one simdgroup per (token, fn-row|sqsum) job
+    (25 x tokens tgs) with loads batched 8 strides ahead; fma chain
+    kept strictly sequential in the monolith's per-lane stride-32
+    order; finalize pass = monolith phase 2+3 verbatim reading the
+    scratch. BITWISE-IDENTICAL to the monolith (4 trials x 12 tensors,
+    incl. T=1), so the serving sha-identity expectation holds.
+  * Measured offline: 0.046 ms/call amortized (was 0.223, 4.8x);
+    sync-serial 0.300 (sync-roundtrip floor). Projected ~15 ms/step
+    amortized, 20-30 ms serial across 86 calls.
+  * Files: dsv4_mhc.metal (mhc_pre_dots_body/mhc_pre_finalize_body +
+    instantiations), qc_metal_serving.mm dsv4_mhc_pre host (split
+    default, VLLM_QC_MHC_SPLIT=0 legacy fallback). The step tape
+    inherits (shared host fn). Metallib + extension rebuilt.
+- ALSO LANDED: VLLM_QC_COMPRESS_FRONT default 0 -> 1 (fused front512
+  compressor). ULP-class (rare 1/512 bf16 rounding); re-judged a real
+  ~1% win under the corrected serial map.
+- GATES pending this boot: 8-tok sanity; off1-2000 matrix x2
+  (deterministic), coherence read, step time. sha may differ from
+  3a325666be45 ONLY via front512 ULPs; VLLM_QC_COMPRESS_FRONT=0 boot
+  isolates the bit-exact mhc split if bisection is needed.
+
+## 2026-08-12 — Batch 9 wave 1 GATES PASSED: NEW BASELINE 15.83-15.86 tok/s
+
+- Boot: default env (mhc split ON, compress front512 ON). All gates:
+  * 8-tok: sha 5d4697585c6e IDENTICAL to baseline, 1.95 tps (in band).
+  * off1-2000 x2: sha abaa1c24b187 BOTH runs (deterministic), text
+    fully coherent (1574-word narrative, read start+end).
+  * 15.83 / 15.86 agg tok/s, wall 126.35 / 126.12 s (was 15.06-15.14 /
+    132.1-132.8). Counters 1557/2220/444 -> draw 4.505 (was 4.61 —
+    per-trajectory acceptance variance, 70.1% vs 72.2% per-token).
+  * STEP: (126.35-5.5)/444 = 272.2 ms (was 292.1) — -20 ms/step, -6.8%,
+    matching the mhc-split projection (15-30 serial band).
+- sha drift vs 3a325666be45 comes from front512 ULPs only (the mhc
+  split is bitwise-identical offline and the 8-tok sha held).
+- DECISION: RETAIN both. New matrix row: off1-2000 15.83-15.86 tok/s,
+  wall ~126.2, sha abaa1c24b187, step ~272 ms, draw 4.505.
+- Artifacts: perf/results/2026-08-12/batch9/ (b9_matrix{1,2}.json,
+  b9_8tok.json, b9_run1 completion, offline tests).
+- NEXT: fresh xctrace on this baseline to re-rank remaining regions
+  with true exec durations (server hot; corrected parser in hand).
+
+## 2026-08-12 — Batch 9 wave 2: swiglu decode experiment (REJECTED), mhc_post widened (LANDED, gate pending)
+
+- REJECTED: iq2_xxs codebook decode via single ulong load + register
+  shifts (replacing 8 threadgroup byte-loads). Bit-exact vs the
+  plain+qc_swiglu anchor (parity harness fixed: reference must use
+  oai_form=False; random-byte scale halves must be pinned finite or
+  NaN-payload diffs create false mismatches), but 9% SLOWER: 0.661 vs
+  0.606-0.608 ms/call amortized. Apple threadgroup byte loads are
+  cheap; the serial shift chain is not. Reverted to stock. LESSON: ds4
+  uses the identical LUT decode — iq2_xxs decode is near its practical
+  ceiling on this hardware; the swiglu family's ~26 ms/step is mostly
+  irreducible expert-weight traffic (~155 MB/call at M=6).
+- Also skipped: swiglu geometry variants (the 2026-08-11 sweep already
+  showed iq2_xxs geometry-flat) and save_partial widening (payload is
+  ~1 KB/token; launch-latency bound, not occupancy).
+- LANDED: dsv4_mhc_post grid widened (tokens,1) -> (tokens,8); the
+  elementwise H-walk slices across tgid.y via threadgroups_per_grid —
+  bit-exact partition. 0.009 ms/call amortized. 86 calls/step; a few
+  ms/step serial expected.
+- Artifacts: perf/results/2026-08-12/batch9/test_swiglu_decode.py.
+- GATE (this boot): everything vs the abaa1c24b187 baseline is
+  bit-exact => sha-IDENTITY expected on 8-tok AND off1-2000.
+- NEXT (wave 3, attention glue fold — bit-exact class, ranked):
+  (1) deepseek_v4_qnorm_rope_kv_insert accepts fp16 q/kv and casts to
+  bf16 in-kernel — removes 2 casts + 2 contiguous x43/step;
+  (2) sparse_attention writes into o_padded directly — removes 43
+  [6,64,512] copy kernels/step; (3) audit kind-0 split/narrow/cast
+  marshalling for further folds. Then: drafter tape (S2) and the
+  remaining eager compressor/indexer glue.
+
+## 2026-08-12 — Batch 9 wave 2 GATE PASSED: mhc_post widening retained, 15.93 tok/s
+
+- Boot: default env (mhc split + front512 + widened mhc_post). Note the
+  first boot attempt died on "Address already in use" (the wave-1
+  server was still up and holding wave-1 binaries); killed and
+  rebooted so the wave-2 metallib/ext actually loaded.
+- Gates (sha-IDENTITY class, both PASSED):
+  * 8-tok: sha 5d4697585c6e IDENTICAL. 4.518 s wall (in band).
+  * off1-2000: sha abaa1c24b187 IDENTICAL, counters 1557/2220/444
+    IDENTICAL (bit-exact confirmed end-to-end).
+  * 15.93 agg tok/s, wall 125.58 s (was 15.83-15.86 / 126.12-126.35).
+  * STEP: (125.575-5.5)/444 = 270.4 ms (was 271.7-272.2) — about
+    -1.5 ms/step, consistent with the widened elementwise walk saving
+    a fraction of the 86 mhc_post calls' serial time.
+- DECISION: RETAIN. Baseline row moves to 15.93 / 125.58 / 270.4 ms
+  (single run; sha + counters identical so run-to-run variance is the
+  only uncertainty on the throughput figure).
+- Artifacts: perf/results/2026-08-12/batch9/b9w2/w2_2000.json.
+
+## 2026-08-12 — Batch 9 wave 3: attention glue folds (LANDED offline, live gate pending)
+
+- BASELINE: 15.93 tok/s / 270.4 ms/step (UPDATE 14). HYPOTHESIS: the
+  attention region's per-layer eager glue — 2 fp16->bf16 cast kernels
+  (q, kv) before qnorm_rope_kv_insert and 1 bf16->fp16 copy_ kernel
+  after sparse_attention, x43 layers = ~129 narrow kernels/step — is
+  pure serial launch/occupancy overhead foldable into the adjacent
+  custom kernels with bit-exact rounding.
+- CHANGE 1 (fp16-input qnorm/kv-insert): mla_q_norm_rope templated on
+  input type; new mla_q_norm_rope_half_512 rounds each load
+  half->float(exact)->bf16(RNE) before use — bit-identical to the
+  eager .to(bfloat16) it replaces. New mla_kv_insert_fp8_packed_half
+  twin additionally takes src_stride (buffer 8) and reads kv as a
+  row-strided view, so the fused-projection slice binds with NO eager
+  copy at all. Host op accepts fp16 q/kv (bf16 path unchanged);
+  metal.py passes q/kv straight through. -86 kernels/step.
+- CHANGE 2 (sparse_attention direct write): two-cache kernel templated
+  on output type; the _out_half variant stores half(float(bf16(v))) —
+  replicating the bf16-store + copy_ cast chain bit-for-bit. Host op
+  takes optional out; metal.py passes the serving buffer when
+  contiguous/shape/dtype-compatible, else falls back to copy_.
+  -43 copy kernels/step.
+- OFFLINE CORRECTNESS (both ALL PASS, bitwise int16/byte compare):
+  * test_qnorm_insert_half.py: q out bitwise, cache bytes, contiguous
+    + strided fp16 kv vs the cast path.
+  * test_sparse_attn_out.py: fp16 direct vs copy_ chain, bf16 direct
+    vs allocated result (caches populated via the gated insert op to
+    avoid NaN-payload false diffs).
+- Files: mla.metal (templates + 2 new instantiations), tk_launch.h
+  (half_input/half_out flags, _half launcher), qc_metal_serving.mm
+  (dtype dispatch, optional out, pybind arg), ops.py (out passthrough),
+  metal.py (casts dropped, direct write). Metallib + ext rebuilt.
+- LIVE GATE (this boot): everything is bit-exact class => sha-IDENTITY
+  required: 8-tok 5d4697585c6e, off1-2000 abaa1c24b187. Bisect plan if
+  drift: revert metal.py direct-write first (python-only), then the
+  metal.py cast drop.
+
+## 2026-08-12 — Batch 9 wave 3 GATE PASSED: 15.98 tok/s, 269.6 ms/step
+
+- Gates (sha-IDENTITY, both PASSED): 8-tok 5d4697585c6e IDENTICAL
+  (wall 4.34 s); off1-2000 abaa1c24b187 IDENTICAL, 444 drafts,
+  15.98 tok/s, wall 125.19 s -> step (125.189-5.5)/444 = 269.6 ms
+  (was 270.4).
+- Yield: ~0.9 ms/step for ~129 removed kernels => the narrow-glue
+  serial cost is ~7 us/kernel amortized, HALF the 15-25 us estimate.
+  CALIBRATION for the queue: pure kernel-count folds pay ~7 us each;
+  prioritize folds that also remove real memory traffic or widen
+  occupancy, and bundle small folds to amortize boot-gate cycles.
+- DECISION: RETAIN (free, bit-exact, fewer moving parts).
+- Artifacts: perf/results/2026-08-12/batch9/b9w2/w3_2000.json,
+  test_qnorm_insert_half.py, test_sparse_attn_out.py.
+- NEXT (wave 3b, same class, BUNDLE with wave 4): compressor prologue
+  — drop the Metal .float() after the kv_score mm (fp16->fp32->bf16
+  double-round == fp16->bf16 single-round, bit-exact), half-input
+  dsv4_save_partial_states twin, memoized bf16 ape constant
+  (~88 kernels/step => expect ~0.6 ms). Then wave 4: attack the two
+  big blocks — drafter (~35 ms/step) and the ~90 ms MPSGraph eager
+  mass — guided by a fresh xctrace on this baseline.
+
+## 2026-08-12 — Batch 9 wave 3b: compressor prologue cast folds (offline PASS, gate pending)
+
+- TARGET: per step, the compressor prologue ran .float() after the
+  kv_score mm (22 kind-0 + ~42 indexer cr=4 layers), then 2x .to(bf16)
+  on the split halves, plus an ape.to(bf16).contiguous() of a CONSTANT
+  every call — roughly 190-260 cast kernels/step at ~7 us each.
+- CHANGE: dsv4_save_partial_states templated on input type; the _half
+  twin reads the raw fp16 kv_score halves (row-strided) and rounds to
+  bf16 in-register. fp16->fp32(.float(), exact)->bf16(RNE) == single
+  fp16->bf16 RNE, so dropping BOTH eager casts is bit-exact. Both
+  Metal .float() branches removed (compressor_kv_score +
+  indexer_compressor_kv_score; sole consumer of kv/score is
+  save_partial_states — verified: everything downstream reads
+  state_cache). ape: memoized bf16 constant on the compressor
+  (self._ape_bf16, built once after weight load).
+- OFFLINE: test_save_partial_half.py ALL PASS — state cache bitwise
+  (fp32 int32 compare) for both the W=512/cr=128 main shape and the
+  W=128/cr=4 indexer shape, strided fp16 halves vs the replicated old
+  .float()+.to(bf16) chain.
+- Files: mla.metal (template + _half instantiation), tk_launch.h
+  (half_input flag), qc_metal_serving.mm (dtype dispatch), 
+  save_partial_states.py (fp16 passthrough + ape guard), compressor.py
+  (ape memoization), attention.py (both .float() drops).
+- GATE (boot in flight): sha-IDENTITY — 8-tok 5d4697585c6e, off1-2000
+  abaa1c24b187. Bisect if drift: restore the .float()s (python-only)
+  first, then ape memo.
+
+## 2026-08-12 — Batch 9 wave 3b GATE PASSED (bit-exact), throughput NEUTRAL
+
+- Gates: 8-tok sha 5d4697585c6e IDENTICAL (wall 3.94 s); off1-2000 sha
+  abaa1c24b187 IDENTICAL, 444 drafts, x2 runs: 15.91 / 15.99 tok/s,
+  wall 125.74 / 125.10 s -> step 270.8 / 269.4 ms (wave-3 boot: 269.6).
+- VERDICT: bit-exactness confirmed; throughput neutral within the
+  ~±0.7 ms/step run noise. The ~190-260 removed cast kernels paid less
+  than the noise floor. RETAINED (strictly less work, simpler path).
+- CALIBRATION (important): kernel-count glue folds are now EXHAUSTED as
+  a throughput path — waves 2+3+3b combined bought ~2.5 ms/step of the
+  94 needed. The remaining mass is real GPU execution time in fewer,
+  heavier places. Next instrument: VLLM_QC_OP_CENSUS=1 (new diagnostic,
+  vllm/v1/worker/metal_opcensus.py — TorchDispatchMode aten-op counter,
+  dump /tmp/opcensus_<pid>.txt) to rank the ~2900 MPSGraph ops/step by
+  count+shape; combine with per-op traffic arithmetic to find the ones
+  carrying tens of us each (mm/einsum/index/copy families), then fuse
+  THOSE into qc kernels or eliminate structurally.
+- Artifacts: perf/results/2026-08-12/batch9/test_save_partial_half.py.
+
+## 2026-08-12 — Batch 9: op-census instrument note (lesson)
+
+- Wrote a new TorchDispatchMode aten counter before checking the repo:
+  VLLM_QC_OP_CENSUS ALREADY EXISTS in vllm/v1/worker/metal_worker.py
+  (Batch 4 Stage A) — VLLM_QC_OP_CENSUS=<n> one-shot-profiles the n-th
+  execute_model with torch.profiler (counts + shapes + stacks, no
+  permanent overhead) to /tmp/opcensus_<pid>.txt. The duplicate was
+  deleted; the dispatch-mode variant also (a) broke lazy-param init if
+  installed early and (b) cost ~40x wall overhead when installed late.
+  LESSON (repeat of the standing rule): search the worker/ diagnostics
+  before building an instrument.
+- Census run: VLLM_QC_OP_CENSUS=40 boot, 500-token decode, read step-40
+  table to rank MPSGraph/aten fusion targets by CPU-side count+shape.
+
+## 2026-08-12 — Batch 9: aten-op census CLOSES the MPSGraph attribution
+
+- Instrument: VLLM_QC_OP_CENSUS=40 (existing metal_worker.py one-shot
+  torch.profiler), 500-tok run, step-40 capture + chrome trace with
+  python stacks (perf/results/2026-08-12/batch9/opcensus_step40.*).
+- THE NUMBER: ~2,800 kernel-launching aten ops/step, of which ~1,950
+  (67%) are COPIES/CASTS: copy_ 906, _to_copy 523, clone 290,
+  contiguous 223. Real math is only ~285 (mm 62, bmm 46, linear 74,
+  einsum 46, index_select 57) ≈ 5-6 ms GPU. Plus arange 94 + where 95
+  + fill_ 97 (step-constant table rebuilds).
+- STACK ATTRIBUTION (per step): OUR OWN HOST-OP MARSHALLING dominates —
+  qnorm_rope_kv_insert host 430 (positions/slots/cos-sin per call x43),
+  qc rms_norm wrapper 285 (a real clone per call — callers pass strided
+  x, host does x.contiguous()), kv_insert host 210, fused_qk_rmsnorm
+  184, save_partial host 124, gate_linear 92, _o_proj 86 (CONSTANT
+  weight-slice clones), indexer forward 126 (arange/where/copy),
+  scaling_rope 48, compress hosts 84.
+- CPU side note: total step CPU dispatch ~79 ms < 270 ms GPU (CPU runs
+  ahead; GPU remains the wall). Yield estimate for killing ~1,600 of
+  these: ~7 us serial each => ~10-13 ms/step.
+
+## 2026-08-12 — Batch 9 wave 4A: marshalling memos (gate in flight)
+
+- LANDED (bit-exact class, identical values — conversions done once
+  instead of per layer):
+  1. C++ cos_sin_bf16_halves() memo keyed by cache data_ptr (weights
+     are lifetime-constant) in qnorm_rope_kv_insert, kv_insert,
+     indexer_kv_insert hosts — kills ~6 eager kernels/call.
+  2. Per-step positions->int32 / slots->int64 memos on the per-step
+     metadata objects: metal.py _fused_qnorm_rope_kv_insert
+     (swa_metadata) and compressor.py save_partial prologue
+     (state_metadata, Metal branch only; compress path keeps original
+     dtypes).
+- Offline: all three parity suites re-run ALL PASS on this build.
+- GATE: sha-IDENTITY (8-tok 5d4697585c6e, off1-2000 abaa1c24b187).
+- NEXT (wave 4B queue, from the census, in order): (1) strided-input
+  qc_rms_norm variant (row-stride param) — kills 285 clone ops (the
+  single biggest remaining cluster); (2) _o_proj: memoize the wo_a
+  qweight group .contiguous() slices at first use (86 ops, constant
+  data); (3) fused_qk_rmsnorm.py:58 casts (184); (4) indexer
+  attention.py:1089 arange/where/fill step-tables -> pass_cache memo
+  (~230); (5) gate_linear.py:184 cast (92); (6) kv_insert host callers
+  (drafter/speculator side) positions memo (210); (7)
+  deepseek_scaling_rope forward_native clones (48).
+
+## 2026-08-12 — Batch 9 wave 4A GATES PASSED: 31.5 tok/s — ds4 BAR BEATEN
+
+- Gates: 8-tok sha 5d4697585c6e IDENTICAL; off1-2000 sha abaa1c24b187
+  IDENTICAL x2 (deterministic), 444 drafts, text coherent.
+- **31.46 / 31.52 tok/s, wall 63.57 / 63.45 s -> step (63.45-5.5)/444
+  = 130.5-130.8 ms** (was 269.4-270.8). A 2.07x step-time cut from the
+  marshalling memos alone.
+- **ds4+DSpark bar: 25.53 decode / 25.88 steady tok/s. BEATEN by +23%
+  (31.5 vs 25.53); step 130.8 ms is far under the <=176 ms bar.**
+- MECHANISM (hypothesis, not yet bisected): the win is wildly larger
+  than the ~7 us/kernel fold calibration (waves 2-3b: ~400 kernels ->
+  ~3 ms; wave 4A: ~700 kernels -> ~139 ms). The changed variable is
+  TRANSIENT ALLOCATIONS: the per-call cos/sin cast+slice chains and
+  positions/slots conversions allocated ~1,000 fresh MPS buffers per
+  step. Metal hazard-tracks per-heap, so transient buffers from shared
+  heaps create FALSE cross-kernel dependencies that serialize
+  otherwise-independent kernels; removing the churn lets the same
+  kernels overlap. This also reconciles Batch 8's "solid GPU execution,
+  2.8% idle" trace: busy-but-serialized at low occupancy.
+  TO VERIFY (optional): revert cos_sin_bf16_halves only (env or edit)
+  and re-measure; and/or xctrace this build — union coverage should now
+  show deep overlap vs the old serial wall.
+- Wave-4A content (all bit-exact): C++ cos_sin_bf16_halves memo (3
+  insert hosts), per-step positions/slots memos (metal.py qnorm site,
+  compressor.py save_partial site), _o_proj constant weight-group memo
+  (probably in this boot — landed 1 s after EngineCore start, before
+  module import; harmless either way, bit-exact).
+- STAGED, NOT YET ACTIVE: qc_rms_norm strided-input kernel variants
+  (rms_norm.metal edited, metallib NOT rebuilt, host not switched) —
+  next wave can wire + gate them; fused_qk_rmsnorm weight-.float()
+  memo and the rest of the wave-4B queue remain available if more
+  headroom is wanted.
+- Artifacts: perf/results/2026-08-12/batch9/b9w2/w4a_2000_run{1,2}.json.
+
+## 2026-08-12 — Batch 9: wave-3-baseline xctrace (backfill) + parser gotcha
+
+- Backfilled record: an 8 s Metal System Trace was taken on the wave-3
+  baseline (269.6 ms/step) before the census. Result: union-exec 97.5%
+  busy, rows are CB-level slices (~228/step) with &-joined encoder
+  labels — per-kernel attribution is NOT recoverable from this export
+  (re-confirms the Batch 8 finding). Its by-region split is CB-soup;
+  do not use it for ranking. Artifacts:
+  perf/results/2026-08-12/xctrace/decode3_gpu.xml.gz + parse3.py.
+- PARSER GOTCHA (cost one wasted parse): two parser generations exist.
+  parse_trace.py (older, also copied into some scratchpads) takes the
+  LAST duration-typed column = queue latency -> absurd 100 s/call
+  rows. parse3.py takes the FIRST duration child only (true exec) and
+  is the one that matches perf/results/2026-08-11/xctrace/. Use
+  parse3.py; it is now archived alongside the 08-11 artifacts.
+- POST-4A NOTE: this trace predates wave 4A. Under the
+  allocation-churn mechanism, "97.5% busy" on THIS trace now reads as
+  busy-but-falsely-serialized; a fresh trace on the 130.8 ms baseline
+  should show the same kernels with deep overlap (worth capturing when
+  next profiling).
+
+## 2026-08-12 — BATCH 9 RETROSPECTIVE: what worked vs what didn't (292 -> 130.8 ms/step)
+
+Campaign closed: ds4 bar (25.53 decode tok/s / step <= 176 ms) beaten
+at 31.46-31.52 tok/s / 130.5-130.8 ms. One-place summary for future
+sessions; details in the entries above.
+
+WORKED (retained, in landed order):
+- mhc_pre split kernel: 6 -> 150 threadgroups + 8-ahead load batching;
+  bitwise-identical; -20 ms/step. The single biggest CLASSIC win.
+- VLLM_QC_COMPRESS_FRONT=1 (front512): ULP-class, ~1%.
+- mhc_post grid widening (tokens,1)->(tokens,8): -1.5 ms/step.
+- fp16-input qnorm/kv-insert + sparse-attn direct write (in-kernel RNE
+  bf16 rounding; strided kv bind): -129 glue kernels, -0.9 ms/step.
+- save_partial fp16 twin + .float() drops + ape memo: bit-exact,
+  throughput-neutral (still correct to keep: strictly less work).
+- **Wave 4A marshalling memos (cos/sin per-weight, positions/slots
+  per-step, o_proj weight groups): -139 ms/step, 2.07x.** The champion
+  by 50x over everything else combined. Mechanism hypothesis:
+  ~1,000 transient MPS buffer allocations/step created per-heap false
+  hazards that serialized independent kernels; the memos removed the
+  churn, unlocking overlap. NOT the kernel-count saving it was
+  designed as.
+
+DIDN'T WORK (measured and rejected — do not redo):
+- Fused mhc post+pre wiring (forward_mps exists, bit-exact, SLOWER).
+- wo_a via qc_decode_linear_bh (MPS bmm wins).
+- iq2_xxs ulong-shift codebook decode (9% slower; Apple threadgroup
+  byte loads are cheap; ds4 uses the identical LUT decode — that
+  decode is at its ceiling).
+- swiglu geometry variants, save_partial widening (launch-bound).
+- Raising/lowering spec block size (wash/loss; 5 near-optimal).
+- Removing speculation (3.70x multiplier; never remove).
+
+INSTRUMENT LESSONS (hard-won, reusable):
+- Sync-bracketed phaseprof absolutes are ~95% inflated for tiny-op
+  regions; only the split is structural.
+- xctrace metal-gpu-intervals: FIRST duration column only (second is
+  queue latency); labels via fmt attr; CB-level rows cannot rank
+  kernels. mps-hw-intervals durations include queue time; counts real.
+- VLLM_QC_OP_CENSUS=<n> (metal_worker.py, pre-existing) is the op
+  ranking tool: one-shot torch.profiler at step n, counts+shapes+
+  stacks + chrome trace. The chrome trace's python stacks attribute
+  every aten op to its call site — this is what found the marshalling.
+- TorchDispatchMode censusing: breaks lazy-param init if installed
+  early, ~40x overhead if installed late. Don't.
+- Kernel-COUNT folds pay only ~7 us each; ALLOCATION-count folds can
+  pay 100x that. When hunting: rank by transient allocations, not by
+  kernel count. (aten::empty 1,647/step is the tell to watch.)
+
+REMAINING HEADROOM (if the campaign reopens), ranked:
+1. Re-census on the 130.8 ms baseline — the op mix has shifted;
+   remaining copy/cast clusters: qc rms_norm x.contiguous() clones
+   (285/step; strided kernel variants STAGED in rms_norm.metal,
+   metallib not yet rebuilt, host not switched), fused_qk_rmsnorm
+   weight-.float() (184/step), indexer arange/where/fill step tables
+   (~230/step), kv_insert-site positions (drafter path, 210/step),
+   scaling_rope clones (48/step), gate_linear out-cast (92/step,
+   ULP-class: out_dtype mm skips fp16 rounding — lottery gate).
+2. Fresh xctrace to confirm the overlap picture and find the new wall.
+3. Drafter block (~20-25 ms/step, mostly its own 7 GB weight traffic;
+   fusion upside small unless the census says otherwise post-4A).
+4. Batch 6 leftover: spec block size re-tune at the new step time
+   (economics shifted: cheaper steps favor longer blocks).
+
+## 2026-08-12 — Batch 9 follow-up: fresh xctrace on the 130.8 ms baseline
+
+- Setup: hot wave-4A server (sha-verified 5d4697585c6e on 8-tok), off1-2000
+  running, 8 s Metal System Trace attached mid-decode. Run under attach:
+  31.16 tok/s, wall 64.18 s, sha abaa1c24b187 (attach overhead ~1%,
+  sha gate holds). step under attach = (64.18-5.5)/444 = 132.2 ms.
+- Parse (parse3.py, step_ms=132.2): rows 14,270, window 8,459 ms
+  (~64 steps), union-exec 93.2% busy.
+- MECHANISM REFINEMENT: pre-4A trace was 97.5% busy at 269.6 ms/step;
+  post-4A is 93.2% busy at 132.2 ms/step. Busy fraction barely moved
+  while step time halved => wave 4A did NOT primarily "unlock overlap"
+  — it REMOVED ~135 ms/step of real GPU execution. The transient
+  marshalling ops (cos/sin cast+split chains over the whole
+  [positions,64] table per insert call, etc.) were themselves the GPU
+  work, not just hazard-serialization glue. The "false hazard" story
+  is at most secondary. The bisect (next entry) attributes which memo
+  carried it.
+- NEW WALL (by-region, CB-soup caveat as always — directional only):
+  attention-region 99.9 ms/step (66 rows/step), moe 8.0, mps-only
+  7.4 (148 rows/step — the old dark mass, now small), drafter 6.0,
+  mhc 1.5. Attention-region CBs (insert/save_partial/compress/sparse/
+  indexer interleaved with MPS ops) are where the next 100 ms lives.
+- Consequence for ranking: "remove transient allocations" stays the
+  right lens ONLY where the transient op touches big tensors or runs
+  hundreds of times; tiny-tensor churn (pos/slots int casts) should be
+  worth little GPU time. Prediction registered before the bisect:
+  COSSIN memo carried the win; POS/WOA are small.
+- Artifacts: perf/results/2026-08-12/xctrace/decode4_gpu.xml.gz,
+  decode4_run.json, parse3.py output in this entry.
+
+## 2026-08-12 — Batch 9 follow-up: 4A BISECT — the cos_sin memo IS the win
+
+- Method: env kill-switches added to the three wave-4A memo sites
+  (VLLM_QC_MEMO_POS gates the per-step positions/slots memos in
+  metal.py + compressor.py incl. the ape memo; VLLM_QC_MEMO_WOA gates
+  the o_proj weight-group memo; VLLM_QC_MEMO_COSSIN gates the C++
+  cos_sin_bf16_halves memo — all default ON, all bit-exact when off
+  because the hosts do their own .to() marshalling). Ext rebuilt once;
+  one boot per leg; off1-2000 exact gate each. Kill-switches retained
+  as documented diagnostics (same pattern as VLLM_QC_MHC_SPLIT).
+- Leg 1 (POS=0, cossin+woa on): sha 5d4697585c6e / abaa1c24b187 both
+  hold; 31.41 tok/s, wall 63.68, step 131.0 ms. POS memos ~= 0 ms.
+- Leg 2 (COSSIN=0, pos+woa on): shas hold; 15.76 tok/s, wall 126.89,
+  step 273.4 ms — FULL regression to the pre-4A wall (269.6).
+- Leg 3 (WOA=0) SKIPPED: bounded ~0 by arithmetic — leg 2 with WOA on
+  regressed the whole way, and leg 1 with WOA on sits at baseline. Not
+  worth a 10-min boot to resolve <=3 ms. (Slices of a contiguous 2-D
+  qweight were already no-op contiguous(); memo only skips checks.)
+- VERDICT: cos_sin_bf16_halves carries ~all of the -139 ms/step. The
+  reverted per-call chain is cos_sin_cache[3072,64].to(bf16)
+  .contiguous() + two slice-.contiguous() — 3 transient buffers +
+  ~3 kernels per insert-host call (qnorm_rope_kv_insert, kv_insert,
+  indexer_kv_insert), every layer, every step.
+- MECHANISM, sharpened by the arithmetic: per-call cost cannot be
+  kernel time (~1.5k ops/step x 7 us ~= 10 ms) nor bandwidth
+  (~1.2 MB/call ~= 1.5 ms/step at DRAM rate). The remaining
+  explanation, consistent with BOTH traces being ~93-97% "busy": the
+  metal-gpu-intervals rows are CB-level, so intra-CB hazard stalls
+  count as exec time. ~1,300+ transient MPS allocations/step created
+  false cross-kernel hazards (per-heap tracking) that stalled resident
+  CBs ~140 ms/step while "busy". Removing the churn removed the
+  stalls. Corollary unchanged: rank targets by transient allocations,
+  BUT weight them by proximity to the serialized attention-region CBs
+  — the cos_sin transients sat between every insert/attention kernel.
+- Note: fused_qk weight-.float() memo (wave 4B item) was edited into
+  the tree ~5 min into the leg-2 boot; even if that boot imported it,
+  its effect (~184 tiny casts) is <=1 ms against a 139 ms signal —
+  conclusions unaffected. Python edits now held between boots.
+- Artifacts: perf/results/2026-08-12/bisect4a/{pos0,cossin0}_{8tok,2000}.json.
+
+## 2026-08-12 — Batch 9 wave 4B round 1: strided rms_norm + qk weight memo GATED
+
+- Baseline: UPDATE 17 (130.5-130.8 ms/step, 31.46-31.52 tok/s).
+- Change 1: qc_rms_norm strided-input kernel variants wired end to end
+  (rms_norm.metal *_strided_* instantiations from the staged edit;
+  metallib rebuilt; host rms_norm in qc_metal_serving.mm binds 2-D
+  non-contiguous unit-inner-stride x directly with ulong row stride at
+  buffer(5) instead of x.contiguous() — kills the ~285 clones/step at
+  the fused_qk_rmsnorm qr/kv split-half call sites).
+- Change 2: fused_qk_rmsnorm.py memoizes the fp32 norm-weight copies
+  on the weight tensors (fp16->fp32 widening exact; kills ~184
+  casts/step).
+- Correctness: offline bitwise parity test_rms_norm_strided.py
+  ALL-PASS (fp16/bf16 x w32/same-dtype x D in {1536,512,192,256} x
+  T in {1,6,37} x front/back offsets, packed determinism, 3-D
+  fallback). Serving: 8-tok sha 5d4697585c6e, off1-2000 sha
+  abaa1c24b187 — IDENTITY, deterministic x2.
+- Throughput: 31.60 / 31.58 tok/s, wall 63.28 / 63.33 s, step
+  130.1 / 130.3 ms (vs 130.5-130.8). About -0.5 ms/step.
+- Decision: RETAIN (strictly less work, bit-exact). Mechanism note:
+  ~470 transient ops/step removed bought only ~0.5 ms — vs cos_sin's
+  ~1,300 transients buying 139 ms. Confirms the bisect's sharpened
+  rule: transient allocations are catastrophic only when they
+  interleave the hazard-critical insert/attention CB chain; the
+  qk-norm clones lived outside it. Remaining 4B queue re-ranked by
+  the upcoming post-4B census, not by raw counts.
+- Artifacts: perf/results/2026-08-12/b9w4b/w4b_{8tok,2000,2000_r2}.json,
+  test_rms_norm_strided.py alongside the batch9 parity suite.
+
+## 2026-08-12 — Batch 9 wave 4B round 2 (in flight): census-guided churn kills
+
+- Post-4B-round-1 census (VLLM_QC_OP_CENSUS=40 on the ctx-131072 boot,
+  step-40 decode capture; /tmp/opcensus_93018.{txt,json}): aten::empty
+  1,519/step, _to_copy 359/step. Chrome-trace python-stack attribution
+  of the 359 real cast-copies (script inline, top sites):
+  92 fused_qk_rmsnorm, 46 gate_linear out-cast (ULP-class, parked),
+  21 each indexer_compress_insert / attention.py:1089 short-topk fill /
+  compress_front / kv_insert (host-internal .to()s attributed to the
+  wrapper frames), 12 each get_compressed_slot_mapping /
+  _compute_swa_indices_torch / scaling_rope (drafter), 11 each
+  input_batch post_update / dflash speculator, 9 dspark_turboquant.
+- LESSON (fused_qk 92): the attribute memo from round 1 NEVER ENGAGED —
+  the caller passes `self.q_norm.weight.data`, and `.data` mints a new
+  Tensor object per access, so tensor-attribute memos silently miss.
+  Replaced with a module-level data_ptr()-keyed dict (_W32_CACHE).
+  Check .data at the call site before choosing a memo home.
+- Round 2 edits (all bit-exact index-dtype/weight-cast memos, pending
+  one gate boot): (1) front512 forward-level memo now stores
+  int32 positions / int64 output+state slots, feeding BOTH
+  dsv4_compress_front and deepseek_v4_kv_insert (host .to()s become
+  no-ops); (2) indexer short-topk fill (attention.py) runs once per
+  step instead of per indexer layer — all 21 layers share one buffer
+  and the fill is layer-invariant (native fill op is CUDA-only; Metal
+  ran the eager arange+div+where+copy chain 21x); (3)
+  _metal_indexer_compress_insert gained the same forward-level index
+  memo; (4) fused_qk _W32_CACHE as above.
+- Sites audited clean (no edits needed): sparse_attention inputs (pass
+  cache already emits int32-contiguous; attn_sink is fp32; q already
+  bf16-contiguous from the fused qnorm host).
+- Expected: kills ~155 of 359 _to_copy/step + ~80 aranges/wheres, most
+  sitting inside the compress/insert CB chain. Per the sharpened
+  mechanism rule the payoff is uncertain (could be 1 ms, could be
+  more) — gate decides.
+
+## 2026-08-12 — FINDING: 128K completions request wedges the Metal frontend (2x reproducible)
+
+- Setup: dsv4-xxs-1 --ctx 131072 boot (KV planner 139,769 tokens — the
+  request fits), exact harness 128000-in/2000-out, --repeat-source.
+  1K and 12K requests on the same boot worked normally.
+- Symptom, twice in a row: client sends the ~512 KB completions POST;
+  APIServer event loop stays alive (/v1/models responds; uvtimers
+  fire) but the completions path never progresses — engine shows
+  Running: 0, Waiting: 0 forever, and after the wedge even a TINY
+  completions request never returns. EngineCore idle at its input
+  queue. Killing the client does not unwedge. Only a reboot recovers.
+- RULED OUT: tokenizer speed (offline: DSV4 tokenizer encodes the
+  561 KB text in 0.17 s, decode 0.02 s); client-side deadlock (the
+  first "harness rayon hang" read was wrong — the client was simply
+  awaiting its executor future while the server sat wedged); KV
+  capacity (planner 139,769 >= 130,000).
+- Status: OPEN BUG, needs its own session — likely in the APIServer
+  frontend (input processor / async submission) for very long
+  prompts. NEXT PROBE RECORDED HERE: on a fresh boot, bisect prompt
+  length 12K -> 32K -> 64K -> 128K to find the wedge boundary; watch
+  the APIServer with py-spy/sample DURING submission; suspect points:
+  frontend detokenizer setup, request-payload handling, or a length-
+  dependent path in input_processor.
+- Harness gotcha for the record: --repeat-source tiles to
+  ceil(count/len) repeats and leaves max_start ~0, so long tiled runs
+  must use --prompt-offset 0.
+
+## 2026-08-12 — 128K wedge LOCALIZED + first prefill phase split
+
+- DEBUG-boot forensics: the 128K request DOES reach the scheduler
+  (Running: 1) — the "frontend wedge" attribution in the earlier entry
+  was WRONG. EngineCore's main thread sits inside aten::bmm ->
+  MPSGraph encodeToCommandBuffer -> GPURegionRuntime::evaluateOps,
+  progressing but catastrophically slowly (<1 prefill chunk in 15 min;
+  repeated sample() shows successive bmm encodes eating ~all time).
+  Poisoning of later requests = the engine loop never yields.
+- BOUNDARY EXPLAINED: >65,536 input tokens flips
+  max_seq_len // compress_ratio(128) past index_topk (512), activating
+  the long-context Lightning-indexer path for the first time — 12K/32K
+  never left the short path. The pathological bmm appears only in this
+  regime.
+- KEY CLUE: on a VLLM_QC_PHASE_PROF=1 boot (torch.mps.synchronize
+  around every phase), THE SAME 128K request prefills normally
+  (8 chunks / 16K tokens in 240 s ~= 68 tok/s). Frequent syncs
+  eliminate the pathology => an MPSGraph encode-queue/JIT behavior
+  (unbounded encoding-ahead or per-shape re-specialization), not a
+  logic bug. Tokenizer exonerated earlier (0.25 s @ 152K tokens).
+  MITIGATION DIRECTION: periodic torch.mps.synchronize() during
+  long-context prefill (e.g., per chunk or per N layers) on the
+  >64K-token path — cheap, bounded, and lets 128K serve while the
+  real MPSGraph interaction is chased later. NOT YET IMPLEMENTED.
+- FIRST PREFILL PHASE SPLIT (phaseprof, 128K prefill chunks of 2048;
+  absolutes inflated by sync bracketing — the SPLIT is the signal):
+  target_forward 26.3 s/chunk-step: layer_ffn 13.0 s, layer_attn
+  12.8 s; leaves: attn_wqb_insert_c 348 ms/call (!!), 
+  comp_full_compress 112 ms/call, attn_mqa 59 ms/call. Reading:
+  prefill spends ~half in MoE FFN (likely GEMV-shaped kernels at
+  M=2048 — needs the GLM52-style grouped GEMM treatment) and ~30% in
+  the insert/compress chain (348 ms/call wqb_insert_c is wildly out
+  of line and probably the same MPSGraph pathology in miniature).
+  This is the roadmap for a future prefill batch: ~74 tok/s today,
+  plausibly hundreds with grouped-GEMM MoE + insert-chain fixes.
+- 128K completion sha pending (phaseprof run in flight, ~30 min);
+  a clean-boot 128K row attempt follows — if it re-wedges without
+  syncs, that confirms the mitigation is required for the row.
+
+## 2026-08-12 — SESSION CLOSE: 128K e2e proof, sync mitigation landed, MACHINE NEEDS RESTART
+
+- 128K END-TO-END PROOF: under the phaseprof boot (sync-bracketed) the
+  full 128000-in/100-out request COMPLETED: sha 27748c3cfae29d26,
+  exact:true, wall 2190.8 s (~59 tok/s prefill under profiling).
+  The long-context path is functionally correct end to end; artifacts
+  perf/results/2026-08-12/prefill128k/{pp_128k.json,
+  phaseprof_128k_prefill.txt} (final split, 53 chunks: layer_attn
+  18.6%, layer_ffn 13.9%, comp_full_compress 9.8% at 134 ms/call,
+  attn_wqb_insert_c 9.4% at 399 ms/call, attn_indexer 136 ms/call).
+- MITIGATION LANDED (metal_indexer.py, default ON, kill-switch
+  VLLM_QC_LONGCTX_SYNC=0): one torch.mps.synchronize() per long-path
+  producer call, prefill branch only. Scoped so 1K/12K/32K short-path
+  behavior is untouched (the producer is long-path-only and the sync
+  sits in its prefill branch). NOT YET GATED end-to-end because of the
+  machine event below; the phaseprof run validates the mechanism
+  (dense syncs -> pathology gone).
+- MACHINE EVENT (~13:45 onward): first-request GPU command-buffer
+  timeouts (kIOGPUCommandBufferCallbackErrorTimeout) on THREE
+  consecutive boots — two ctx-131072 AND one production ctx-3072 boot
+  whose exact build+config had gated clean five times earlier today.
+  Memory verified 97% free before each boot; no kernel AGX faults in
+  log show; uptime 50 days. Diagnosis: AGX/Metal driver state
+  degraded by the day's churn (10x 93-GiB pin/unpin cycles, one hard
+  MPSGraph wedge, kill -9 mid-encode, a 36-min encode marathon).
+  Everything code-side is sha-gated up to the 12:26 boot
+  (12K/32K rows + round-2 gates). ACTION REQUIRED: restart the
+  machine, then re-gate with the standard 8-tok + off1-2000 pair; the
+  128K cold/hot rows are next (expect ~30 min prefill; keep
+  VLLM_QC_LONGCTX_SYNC=1).
+- Server state at session close: ALL SERVERS DOWN deliberately (a
+  post-timeout engine is poisoned; booting fresh pre-restart just
+  reproduces the timeout).
+
+## 2026-08-12 — Post-restart: OOM root cause = iogpu.wired_limit_mb reset (user restarted the machine)
+
+- The machine restart cleared the AGX degradation, and the first
+  post-restart boot (dsv4-xxs-1 prod, boot_prod2.log) came up healthy in
+  142 s with the normal "Pinned 114 Metal allocations (93.73 GiB)".
+- The first request then died with kIOGPUCommandBufferCallbackError
+  **OutOfMemory** ("Insufficient Memory") — a DIFFERENT error class from
+  yesterday's Timeout wedges. Root cause: `iogpu.wired_limit_mb` is a
+  sysctl and DOES NOT SURVIVE REBOOT; it read 0 (default ceiling
+  ~96 GiB) while the campaign requires 122880 (120 GiB) to hold the
+  93.73 GiB pinned set + KV + MPSGraph pools + transients.
+- The poisoned server was killed (memory released instantly, 98% free).
+  BLOCKED on operator sudo: `sudo sysctl iogpu.wired_limit_mb=122880`,
+  then re-run the UPDATE 18a post-restart checklist (8-tok
+  5d4697585c6e, off1-2000 abaa1c24b187 @ ~130-131.6 ms, then
+  --ctx 131072 for the 128K rows).
+- Ops rule recorded (memory + here): after ANY machine restart, verify
+  `sysctl iogpu.wired_limit_mb` = 122880 before booting the profile.
+- Artifacts: perf/results/2026-08-12/postrestart/boot_prod2.log (OOM at
+  first request; sysctl output in session transcript).
+
+## 2026-08-12 — Post-restart forensics: sysctl OOM, big-first-request timeout + primer rule, trajectory re-roll (RE-BASELINED)
+
+- Three failure classes untangled after the machine restart, on a tree
+  with ZERO code changes since the last clean gates:
+  1. `iogpu.wired_limit_mb` reset -> first-request CB **OutOfMemory**
+     (prior entry). Fixed by re-running the sysctl.
+  2. With the limit correct, a boot whose FIRST request is the
+     1000-token harness prompt dies with CB **Timeout**, reproducibly
+     (prod3, prod4, prod7 — prod7 after a perfectly clean predecessor,
+     killing the cross-boot-contamination theory). A tiny primer
+     request first (5-token prompt, 8 tokens out) makes the same boot
+     fully healthy (prod6, prod8 — prod8 even after a CB-errored
+     predecessor). OPS RULE: after boot, ALWAYS send a tiny primer
+     before any big request. A first-request timeout poisons the
+     engine; reboot. Yesterday's "AGX driver degradation" diagnosis is
+     now uncertain — those boots were also all big-first; the restart
+     may have been unnecessary. Mechanism unpinned (first-request
+     MPSGraph compile storm at prefill widths is the suspect).
+  3. Exonerated by direct test: the metal_indexer.py LONGCTX sync
+     (env leg + it runs fine in all clean gates), the machine itself
+     (ds4 served 24 tok in 2 s mid-crisis), the build artifacts
+     (metallib has all kernels; mr route trace-verified: 3,390/3,390
+     MoE encoder intervals are qc_moe_vec_mr).
+- **Trajectory re-roll**: the restart moved some ULP-class numerics
+  input (mechanism unknown; all kernels/routes verified live). 8-tok
+  landed back on the historical majority text (sha db2846cf721b, spec
+  2/10/7); matrix rolled to a NEW trajectory. Per the lottery
+  protocol (deterministic x3 across 2 boots, coherent text, mechanism
+  intact) this RE-BASELINES:
+  - 8-tok: sha db2846cf721b, 2.4-2.5 tps, deterministic x2 boots.
+  - off1-2000: **30.92-31.00 tok/s, wall 64.52-64.69, sha
+    a936de0fa7c7, counters 1537/2320/464, draw 4.31, step
+    127.2-127.6 ms** (prod6 + prod8 x2).
+  - MECHANISM: step 127.2-127.6 vs yesterday's 130.0-131.6 — slightly
+    better; headline tok/s lower purely via the draw (4.31 vs 4.505).
+- 128K/prefill work DEPRIORITIZED by user direction: decode speed is
+  the sole focus; prefill gets its own campaign later.
+- Artifacts: perf/results/2026-08-12/postrestart/ (boot logs prod2-8,
+  regate_*.json, mrcheck/ trace, ds4_probe*, dump_matrix_a/).
+
+## 2026-08-13 — Wave 5 round 1: transient-output ring — NEUTRAL; churn vein CLOSED
+
+- Baseline: off1-2000 30.92-31.00 tok/s, step 127.2-127.6 ms, shas
+  db2846cf/a936de0f (UPDATE 19).
+- Census at 127 ms (opcensus_127ms.{txt,json}, chrome-trace stack
+  attribution): ~2,400 transient allocations/step, nearly all per-call
+  OUTPUT tensors in our own host ops — mhc_pre 368, rms_norm 285,
+  dense gemv 234, qk-norm 184, mhc_post 184, o_proj clone chain 172,
+  router 138, moe outs ~140. No 4A-style marshalling cluster remains.
+- Change: ring_out()/ring_out_like() in qc_metal_serving.mm — per-(op
+  tag, shape, dtype) ring of 4 reused output tensors (stable buffer
+  identities; ds4 slab discipline), <=8 MB tensors only (prefill sizes
+  keep the caching allocator), VLLM_QC_OUT_RING=0 kill switch. 15 hot
+  sites converted (~1,300 allocs/step removed). Offline: ring cycles
+  4 slots, values byte-equal, kill switch verified. Ext rebuilt.
+- Gates: 8-tok sha db2846cf IDENTICAL (2/10/7); matrix x2 sha a936de0f
+  IDENTICAL, counters 1537/2320/464 IDENTICAL. Bit-exact class holds.
+- Throughput: 128.3/128.5 ms/step vs 127.2-127.6 baseline — NEUTRAL
+  (inside the +-1.5 ms boot floor; wrong-side trend not resolvable
+  without more boots, not worth them per the >5-10 ms gate rule).
+- DECISION: RETAINED default-on (strictly fewer allocations, bit-exact,
+  documented kill switch — 4B-round-2 precedent). **CONCLUSION: the
+  transient-churn vein at 1K decode is CLOSED.** The 4A win was the
+  specific insert-chain marshalling, not allocation count. The
+  remaining ~40 ms to the ds4-efficiency tier (~80-90 ms step) is real
+  kernel/bandwidth work: SoA repack (IQ2_XXS/Q2_K planes), split-K
+  sparse-MLA decode, sum6 down fold, then spec block re-tune.
+- Artifacts: perf/results/2026-08-12/postrestart/{opcensus_127ms.*,
+  ring_8tok.json, ring_2000_a/b.json, boot_ring.log}.
+
+## 2026-08-13 — Wave 5 round 2: SoA repack of MoE quants — Q2_K RETAINED (~-1 ms), IQ2_XXS measured NEGATIVE on Metal
+
+- Baseline: off1-2000 step 127.2-127.6 ms (UPDATE 19; ring boot
+  128.3-128.5), shas db2846cf/a936de0f, counters 1537/2320/464.
+- Hypothesis (retrospective §9 row 2, A100 precedent 2.0x GEMV/+26% c1):
+  load-time byte-neutral SoA planes for the 66/84-byte AoS expert
+  superblocks lift the MoE mr kernels (260-320 GB/s) toward 400+,
+  worth 10-25 ms of the ~39 ms/step MoE share.
+- Implementation (all bit-exact class, offline bitwise oracle
+  tests/kernels/test_metal_moe_soa.py with FINITE random scales):
+  - `qgemv_moe_mr_{iq2_xxs,q2_K}` + swiglu twin templated on `bool SOA`
+    with `_soa` host_names (AoS text untouched); launcher/host/pybind
+    thread a `soa` flag; tape carries w13_soa/w2_soa.
+  - Load-time repack in GGUFMoEMethod.process_weights_after_loading
+    (Metal branch): torch permutation chunked over experts,
+    replace_parameter(prefer_copy=True) copy-back (never both stacks
+    live), VLLM_QC_MOE_SOA=0 kill switch. Repack must SYNC + empty_cache
+    per layer: the first boot left 72 GiB of async permutation draining
+    into later phases (31 s bleed) and allocator churn.
+- Iteration history (each step offline-bitwise PASS before serving):
+  1. Per-row planes, ulong-load + shift extraction: q2_K fp16 FAILED
+     bitwise by 1 elt/1152 (fp-CONTRACTION flip from divergent load
+     shapes — new failure mode for the do-not-redo list: bit-exactness
+     requires pinning the fp codegen, not just the arithmetic text;
+     bf16 masked it via coarser rounding). Fixed by keeping the AoS
+     load SHAPES (uchar/ushort/half) and changing only plane bases.
+  2. Serving with both formats repacked: 131.3-132.0 ms — REGRESSION.
+     Isolated A/B at serving shapes: q2_K SoA 0.912x (WIN), iq2 swiglu
+     SoA 1.02x (loss; ulong variant of the known ulong-shift negative).
+  3. iq2 with AoS-shaped loads from aligned planes: still 1.015-1.025x.
+     iq2 with the A100 paired gate/up layout (half2 scales + shared
+     16B code stream): 1.039-1.043x — WORSE. Verdict: Apple's LSU does
+     not penalize the AoS layout's unaligned narrow loads, and the
+     block scale rides free in the code stream; the A100 iq2 layout
+     win does NOT transfer. IQ2_XXS stays AoS (hardware-measured
+     divergence from the ROCm/A100 reference, per CLAUDE.md rule).
+  4. Q2_K DOES transfer: its AoS forces three interleaved unaligned
+     streams (sc bytes / qs ushorts / d+dmin halfs at 84B stride);
+     per-expert [qs | scales | dm] planes measured 0.903-0.912x at
+     verify (36-row) and drafter (6-row) shapes.
+- Gates (q2_K-only config, main 43 layers + drafter 3 MoE layers
+  repacked): 8-tok sha db2846cf IDENTICAL (2/10/7); matrix x2 sha
+  a936de0f IDENTICAL, counters 1537/2320/464 IDENTICAL.
+- Throughput: **126.8-127.1 ms/step** (walls 64.34/64.47) vs 127.2-127.6
+  same-trajectory baseline — at the floor edge; claim is "at worst
+  neutral, likely ~0.5-1 ms" (isolated q2_K -10% predicts ~-1.0 ms).
+  Boot cost: +16 s load-time repack (synchronous).
+- DECISION: RETAINED default-on (VLLM_QC_MOE_SOA=0 reverts). iq2 paired
+  repack + `_soa` kernels + bitwise test retained quarantined/disabled
+  as the documented negative. DO-NOT-REDO: iq2_xxs SoA/pairing on
+  Apple GPUs (2-4% slower, three layouts tried); divergent load shapes
+  inside a bit-exact template (contraction flips).
+- Open observation: both-formats serving regressed +4 ms where isolated
+  predicted +0.7 — d-plane separate-stream latency amplifies in the
+  serial 43-layer chain; another instance of "isolated microbench
+  underestimates serial-chain latency costs."
+- Next avenue (retrospective §9): split-K sparse-MLA decode (partition
+  kernels already in the metallib; host stub at qc_metal_serving.mm
+  rejects partition_size != 0), then sum6 down fold, spec block re-tune.
+- Artifacts: perf/results/2026-08-13/soa/ (boot_soa.log both-formats,
+  boot_soa_q2k.log final, gate_8tok*.log, gate_2000_*.log x4,
+  tests/kernels/test_metal_moe_soa.py).
+
+## 2026-08-13 — Wave 6: split-K sparse-MLA decode — RETAINED (-4.2 ms/step, 127.4 -> 123.3)
+
+- Baseline: UPDATE 20 band 126.8-127.6 ms/step (q2_K SoA in), shas
+  db2846cf (8-tok 2/10/7) / a936de0f (matrix 1537/2320/464).
+- Hypothesis (retrospective §9 row 3, ds4 precedent: 12 KV splits):
+  the fused two-cache decode kernel launches B*H simdgroups; with
+  H=64 query heads that is 384 at verify (B=6) on 64 cores (~24
+  resident SGs each) — a latency-bound serial walk over up to 640
+  candidates with idle parallelism. Partitioning the candidate list
+  and merging with the paged-v2 LSE reduce should cut the serial
+  chain 5-10 ms at 1K ctx.
+- Implementation (ULP/lottery class — cross-partition LSE merge
+  reassociates softmax):
+  - `mla_decode_fp8_sparse_two_cache_packed_partition` (mla.metal):
+    grid (H,B,P), walks j in [part*psize, min(total,+psize)) over the
+    virtual [compressed ++ swa] concat, identical per-slot decode to
+    the fused kernel, online softmax, stores normalized partials +
+    max_logit + exp_sum. NO sink in the partition kernel — the reduce
+    applies it exactly once.
+  - `paged_attention_reduce_float16_512` instantiation
+    (paged_attn_v2.metal) for the fp16 serving out buffer; launcher in
+    tk_launch.h; host policy in deepseek_v4_sparse_attention
+    (qc_metal_serving.mm): P = ceil(target/(B*H)) clamped to [1,16]
+    and to total_width; P<=1 falls through to the fused kernel.
+    `VLLM_QC_MLA_SPLITK=0` kills; `VLLM_QC_MLA_SPLITK_TG` target SGs,
+    default 768 => P=2 at verify (384 units), P=12 at B=1.
+  - Partials in ring_out bufs (mla2_tmp/ml/es) — no per-step allocs.
+- LIVENESS LESSON (new gate rule): first boot used target 128 assuming
+  H=16; units=384 >= 128 gave P=1 everywhere, the fused kernel ran,
+  and the matrix sha stayed IDENTICAL — which for a ULP-class change
+  means "not engaged", not "pass". Config check: H=64 (43 layers,
+  256 experts/6 routed, head_dim 512). Fixed default to 768. After
+  that the matrix sha rolled as expected (4d18b4fa).
+- Offline A/B (scratchpad splitk_ab.py, synthetic 584B caches, NaN
+  encodings masked, seam + -1 skips exercised): bf16 max rel 7e-3,
+  half max rel 3.9e-3, no NaNs. (Half path skips the fused kernel's
+  bf16 round-trip in the reduce — accepted, ULP class.)
+- Gates: determinism x2 at off1 matrix (sha 4d18b4fa twice, walls
+  78.89/78.92, counters 1409/2955/591 identical); coherent text
+  (--dump-completions, dump768_off1); 8-tok sha db2846cf UNCHANGED
+  2/10/7 (2-draft trajectory survived the perturbation, x2 boots).
+- Throughput: paired 7-offset sweep, both configs same builds, OFF =
+  `VLLM_QC_MLA_SPLITK=0` boot. step ms / draw / tok/s (2000/wall):
+
+  | off | OFF (fused) | ON (split-K 768) |
+  | --- | --- | --- |
+  | 1 | 126.8-127.1 / 4.31 / 31.0 | 124.2 / 3.38 / 25.4 |
+  | 2 | 127.7 / 4.57 / 32.6 | 123.0 / 4.65 / 34.3 |
+  | 3 | 127.1 / 4.23 / 30.5 | 122.6 / 4.11 / 30.7 |
+  | 5 | 126.8 / 4.26 / 30.8 | 123.4 / 3.60 / 27.0 |
+  | 7 | 127.7 / 3.72 / 27.0 | 123.1 / 4.59 / 33.8 |
+  | 11 | 127.5 / 4.00 / 28.9 | 123.1 / 5.42 / 39.3 |
+  | 13 | 128.3 / 3.80 / 27.4 | 123.4 / 4.54 / 33.4 |
+  | mean | 127.4 / 4.13 / 29.7 | **123.3** / 4.33 / 32.0 |
+
+  Step wins at ALL 7 paired offsets (-2.8 to -4.9 ms). The off1 draw
+  collapse (4.31 -> 3.38) that looked like acceptance damage was
+  offset lottery: OFF itself drew 3.72-4.00 at offsets 7-13 and ON
+  drew 4.54-5.42 at the same offsets; means favor ON. No mechanism
+  for systematic acceptance change (drafter untouched; per-flip
+  direction symmetric). METHOD NOTE: single-offset draw/tok-s is NOT
+  evidence for ULP-class changes — pair the step ms and take means
+  across >=5 offsets before reading acceptance.
+- DECISION: RETAINED default-on (VLLM_QC_MLA_SPLITK=0 reverts,
+  VLLM_QC_MLA_SPLITK_TG tunes). Step 127.4 -> 123.3 ms mean (-3.3%).
+  Re-baselined as UPDATE 21. TG=1536 (P=4 verify) untried — cheap
+  boot-env sweep candidate for a later idle slot.
+- Next avenue (retrospective §9): sum6 down fold (row 4), then spec
+  block re-tune at the new economics (row 5), gate_linear fold (row 6).
+- Artifacts: perf/results/2026-08-13/splitk/ (boot_splitk.log target-128
+  liveness lesson, boot_splitk768.log, boot_off.log, boot_on_final.log,
+  gate768_2000_{a,b,off2,off3,off5,off7,off11,off13}.log,
+  gateoff_2000_off{2,3,5,7,11,13}.log, gate768_8tok_{a,final}.log,
+  dump768_off1/ coherence sample, scratchpad splitk_ab.py).
+
+## 2026-08-13 — Wave 7: sum6 down fold — RETAINED bit-exact, ~neutral step (-0 to -0.7 ms)
+
+- Baseline: UPDATE 21 band 122.6-124.2 ms/step (split-K in), matrix sha
+  4d18b4fa 1409/2955/591, 8-tok db2846cf 2/10/7.
+- Hypothesis (retrospective §9 row 4, ds4 T3.2): the routed-MoE tail is
+  three dispatches per layer with a (T*6, 4096) fp16 round-trip (down
+  GEMV -> qc_moe_weighted_sum -> feeds the shared add); folding the
+  weighted slot-sum into the down kernel's epilogue deletes ~90
+  dispatches/step + the intermediate traffic, worth 3-6 ms on ds4.
+- Implementation (bit-exact class, PASSED):
+  - `qgemv_moe_mr_q2_K_sum` (qgemv.metal): threadgroup column per TOKEN;
+    loops the topk slots; per slot the byte-identical q2_K dot walk on
+    activation row X[token*topk+k]; rounds each expert's simd_sum result
+    to the activation dtype (the old intermediate-store rounding, T(0)
+    for expert < 0); then qc_moe_weighted_sum's exact sequential fp32
+    reduce (`#pragma clang fp reassociate(off) contract(off)`,
+    slot-ascending) and one store T(acc). Instantiated 2x4 + g48 (the
+    production geometry), AoS + SoA, fp16 + bf16.
+  - Launcher `launch_qgemv_moe_mr_q2k_sum` (fp16 -> 4x8, bf16 -> 2x4);
+    host op `ggml_moe_a8_vec_sum` (q2_K only, writes caller's
+    (tokens, N) out buffer, i.e. out_hidden_states — no ring, no
+    intermediate); wrappers in quixicore/ops.py + gguf/ops.py; fold gate
+    in _fused_moe_gguf's Metal branch (VLLM_QC_MOE_SUM6, default on;
+    requires q2_K w2, no expert_map, top_k <= 8, contiguous out) with a
+    `logger.info_once` liveness breadcrumb; tape path folded identically.
+- Bitwise oracle tests/kernels/test_metal_moe_sum6.py: 8/8 PASS
+  (3x6 + 36x6 tokens, fp16 + bf16, AoS + SoA, -1 expert exercised) —
+  the enclosing slot loop did NOT move fp-contraction choices; the fold
+  is bit-identical to down-vec + qc_moe_weighted_sum.
+- Serving gates (bit-exact class): 8-tok sha db2846cf IDENTICAL 2/10/7;
+  off1 matrix sha 4d18b4fa + counters 1409/2955/591 IDENTICAL on two
+  boots; off3 matrix sha ce1bab26 IDENTICAL to the split-K boot's off3.
+  LIVENESS POSITIVE: "sum-folded q2_K down GEMV active" breadcrumb in
+  the boot log (H=64 lesson applied — identical shas only count with
+  engagement proven).
+- Throughput: off1 123.49/123.82 ms (two boots) vs 124.2 baseline;
+  off3 122.63 vs 122.63. Verdict: at worst neutral, likely ~0.5 ms at
+  off1 — the encoder-count reduction does not shorten this step's
+  critical path (same lesson as the wave-5 output ring: the M1 Ultra
+  decode step is not dispatch-latency-bound at this granularity).
+  ds4's 3-6 ms did not transfer; their fold likely rode a
+  dispatch-bound baseline.
+- DECISION: RETAINED default-on (VLLM_QC_MOE_SUM6=0 reverts): strictly
+  less work, less traffic, bit-exact, no regression. Baseline rows
+  UNCHANGED (shas identical — no re-baseline needed).
+- Next avenue (retrospective §9): spec block re-tune at the new
+  economics (row 5, trajectory class), then gate_linear out-cast fold
+  (row 6).
+- Artifacts: perf/results/2026-08-13/sum6/ (boot logs a/b, gate_8tok_a,
+  gate_2000_{a,b,off3}.log), tests/kernels/test_metal_moe_sum6.py.
+
+## 2026-08-13 — Wave 8: spec block re-tune — k=5 CONFIRMED OPTIMAL (k=6 measured -1.3 tok/s; k<5 forbidden by DSpark)
+
+- Baseline: UPDATE 21/21a — block 5, step 122.6-124.2 ms, 7-offset mean
+  32.0 tok/s (per-offset table in the wave 6 entry).
+- Hypothesis (retrospective §9 row 5): the step got ~2.3x cheaper since
+  the block size was set (292 -> ~123 ms), so the draft/verify economics
+  may favor a bigger block (draw means 4.1-4.3 of max 6 suggested the
+  cap binds on good trajectories).
+- Method: num_speculative_tokens via the dsv4-xxs-1 metal
+  speculative_overrides (spreads over the shared drafter engine dict;
+  display line "spec DSpark k=" reads the raw dict and is cosmetic —
+  verify via the booted process args). Trajectory class: paired mean
+  tok/s across the same 7 offsets.
+- k=6 sweep (perf/results/2026-08-13/spec6/): step / draw / tok/s
+  off1 140.4/3.45/23.0, off2 137.5/5.13/33.8, off3 137.1/4.32/29.0,
+  off5 138.3/3.80/25.6, off7 136.7/4.89/32.6, off11 137.2/6.10/39.6,
+  off13 137.9/4.76/31.5. Means: step 137.9 (+14.6), draw 4.64 (+0.31),
+  tok/s 30.7 (-1.3). Wins only off11 (+0.3); loses the other six.
+- k=4: boot REJECTED by SpeculativeConfig validation — "DSpark requires
+  num_speculative_tokens >= dspark_block_size (5); smaller values
+  produce incorrect output." The floor is architectural, not a tuning
+  choice.
+- k=7 not measured: step extrapolates to ~152.5 ms (fit below), needs
+  mean draw >= 5.35 to break even; the k=6 marginal (+0.31) puts
+  draw(7) near 4.9. Clearly negative.
+- DECISION: k=5 stands (profile override removed; restore boot verified
+  sha 4d18b4fa, step 123.77 ms). Avenue CLOSED.
+- ROOFLINE FINDING (new, load-bearing): step(k) fits
+  ~35.7 ms + 14.6 ms per verify position at 1K ctx — ~88 of the ~123 ms
+  step scales linearly with verify rows. Consistent with the MoE vec
+  kernels having NO weight reuse across tokens (each (token,expert) row
+  reloads the expert slice; noted in fused_moe.py). CANDIDATE AVENUE:
+  expert-grouped verify MoE (gather the 42 (token,expert) pairs by
+  expert, load each distinct expert once — the A100 route/align
+  precedent). Expected bound: distinct experts per verify step /
+  (tokens*topk), likely a 1.2-1.7x reduction of the dominant MoE share,
+  not 6x. Needs a census of distinct-expert counts per step first.
+- Artifacts: perf/results/2026-08-13/spec6/ (boot_k6.log,
+  gate_k6_off{1,2,3,5,7,11,13}.log), spec4/ (boot_k4.log validation
+  failure, boot_k5_restore.log, gate_k5_restore_off1.log).
+
+## 2026-08-13 — Wave 9: re-profile at 123 ms — MoE side is the biggest bucket; grouped-expert bound ~10-11 ms
+
+- Motivation: waves 5-8 exhausted the retrospective's dispatch/latency
+  avenues (ring neutral, sum6 neutral, split-K -4 ms, k=5 confirmed);
+  the k=6 sweep fit step(k) ~ 35.7 + 14.6 ms/verify-row. Before row 6
+  (gate_linear fold, est. stale post-sum6) — measure where the slope
+  lives.
+- Instruments (one boot, VLLM_QC_PHASE_PROF=1 + new
+  VLLM_QC_MOE_IDS_CENSUS=<n> in gguf/fused_moe.py — env-gated
+  diagnostic, logs distinct/total expert ids every n-th MoE call):
+  perf/results/2026-08-13/reprofile/.
+- Phaseprof (sync-bracketed; step inflated 123.8 -> 341 ms by ~688
+  bracket syncs/step ~ 0.32 ms each — the SPLIT is the signal, and
+  even it is tax-distorted for small ops):
+  - layer_ffn 2.11 ms/call x 46 calls/step (43 target + 3 drafter):
+    the LARGEST single bucket, ~1.8 ms/layer after leaf tax
+    correction (~80 ms/step serialized; real overlap brings the whole
+    step to 123, so treat as ~50+ ms real share).
+  - Attention side is FRAGMENTED: oproj 0.46, wqb_insert_c 0.88,
+    indexer 0.80, mqa 0.35, compressor 0.44, full_compress 0.28
+    ms/call corrected — ~90 ms/step serialized in aggregate but no
+    single dominant op.
+  - drafter_propose 30.5 ms/call sync-inflated (5 forwards + 3 MoE
+    layers bracketed within); sample_and_reject ~5.2 corrected.
+- Expert-ids census (verify shape (6,6), 36 slots): 25-30 distinct,
+  mean ~27.4 -> an expert-grouped path that loads each distinct expert
+  once saves (36-27.4)/36 = 24% of routed-MoE weight traffic.
+- Updated roofline: routed MoE streams ~8.2 GB of the 22.5 GB step
+  (36 slots x ~5.3 MB/expert [w13 iq2_xxs 3.24 MB + w2 q2_K 2.06 MB]
+  x 43 layers) ~ 8 ms/row of the 14.6 ms/row slope at 172 GB/s
+  effective. Grouped bound: ~2.0 GB/step ~ 10-11 ms. The mr kernels
+  already run 260-320 GB/s isolated (SoA wave), so BYTES, not
+  bandwidth, is the lever.
+- xctrace NOT reusable for per-kernel ranking here (Batch 9 backfill
+  finding: CB-level slices, &-joined encoder labels).
+- DECISION: next implementation avenue = expert-grouped routed-MoE
+  verify path (wave 10; GLM 5.2 Ampere route/align precedent).
+  KEY ENABLER proven by the sum6 oracle: an enclosing slot loop
+  around the pinned dot-walk text preserves bit-exactness on this
+  compiler — a grouped kernel looping an expert's slots (mean ~1.3,
+  max ~4) with the identical per-slot walk can be BIT-EXACT class.
+  Scope note: grouping by expert conflicts with sum6's by-token down
+  fold — if grouped-down wins its ~4.5 ms bound, reverting sum6
+  (measured ~neutral) is acceptable. gate_linear fold (row 6)
+  DEPRIORITIZED: ~86 tiny dispatches, and sum6 measured ~90 deleted
+  dispatches as ~neutral; expected value near zero.
+- Artifacts: perf/results/2026-08-13/reprofile/ (boot_prof.log with
+  census lines, gate_prof_off1.log, phaseprof_39973.txt copied in).
+
+## 2026-08-13 — Wave 10: expert-grouped w13 verify kernel — MEASURED NEGATIVE (123 -> 230 ms), RETIRED opt-in
+
+- Baseline: UPDATE 21/21a, step 122.6-124.2 ms, shas 4d18b4fa/db2846cf.
+- Hypothesis (wave 9 census): 36 verify slots hit only ~27 distinct
+  experts, so dedup'ing duplicate expert weight reads in the w13 swiglu
+  kernel should save ~24% of the dominant MoE stream (~6 ms at w13's
+  61% share).
+- Implementation: `qgemv_moe_mr_iq2_xxs_swiglu_grp` (AoS twin): slot
+  columns scan the id list; chunk head (pos % 2 == 0) owns a pair of
+  same-expert slots, decodes each weight block once, applies to both
+  slots' yl registers; identical per-slot arithmetic text + epilogue.
+  Host gate in ggml_moe_a8_vec_swiglu (VLLM_QC_MOE_GROUP), grid
+  unchanged. Oracle tests/kernels/test_metal_moe_group.py: 8/8 bitwise
+  PASS (heavy/sparse/single duplication, fp16+bf16, clamp, -1 slots).
+- INCIDENT (engine wedge): first serving attempt hung the frontend —
+  prefill also routes through ggml_moe_a8_vec_swiglu, and the O(slots)
+  ownership scan at 6000 prefill slots is quadratic-catastrophic
+  (2.3M threadgroups x 24 KB scans). Symptoms: primer fine, 1000-token
+  request never registered (Running: 0, interval logs stop), curl
+  probe times out. Fixed with a <= 64-slot host gate; killed + rebooted
+  per the poisoned-engine rule. LESSON: any per-threadgroup scan of the
+  slot list must be bounded before it meets prefill widths.
+- Serving result (decode-gated, bit-exact confirmed: 8-tok db2846cf
+  2/10/7; off1 sha 4d18b4fa drafts 591; off3 sha ce1bab26 drafts 487
+  ALL IDENTICAL — liveness proven by the PSO name switch):
+  **off1 229.9 ms, off3 232.1 ms — a ~2x step REGRESSION.**
+- Post-mortem (two compounding mechanisms):
+  1. Pair-owner threadgroups run 2x serial inner work; in a
+     latency-bound kernel the per-wave time is set by the slowest tg,
+     so waves containing pair-owners run ~2x — the freed non-owner
+     slots don't shorten the critical path. Plus yl2/sumf2 register
+     pressure cuts occupancy and latency hiding.
+  2. The duplicate reads it saves were already being served by the
+     shared L2/SLC: all 36 slot columns are co-resident, so same-expert
+     tiles hit cache, not DRAM. The census counted LOGICAL duplicate
+     bytes; the HARDWARE had already dedup'ed them.
+- DECISION: RETIRED to opt-in (VLLM_QC_MOE_GROUP=1; default OFF).
+  Kernel + oracle kept as the documented negative. Baseline restored
+  and verified (off1 124.6 ms, sha 4d18b4fa).
+- DO-NOT-REDO: software cross-threadgroup weight dedup on Apple GPUs —
+  the cache hierarchy already provides it; serializing a latency-bound
+  kernel to save cached bytes is a pure loss. Any future grouped-MoE
+  idea must RAISE parallelism or cut DRAM bytes the cache can't
+  (it can't at these working-set sizes).
+- Artifacts: perf/results/2026-08-13/group/ (boot_grp.log wedge,
+  boot_grp2.log, gate2_* regression gates, boot_restore.log,
+  gate_restore_off1.log), tests/kernels/test_metal_moe_group.py.
+
+## 2026-08-13 — Wave 11: MoE kernel geometry sweeps — DEFAULTS CONFIRMED OPTIMAL, no change
+
+- Motivation: in-situ step bandwidth ~183 GB/s vs 260-320 isolated; the
+  swiglu (w13) kernel had never had a geometry sweep (fixed 2x2) and
+  the q2_K down g48 choice predated the SoA repack.
+- Method: added swiglu instantiations g24/g42/g44/g12/g14 + launcher
+  env VLLM_QC_MOE_SWIGLU_GEO (mirrors VLLM_QC_MOE_MR_GEO; geometry is
+  bit-exact — per-pair walk unchanged). Isolated microbench at serving
+  shapes (T=6, topk=6, 36 slots, E=64; scratchpad geo_bench.py).
+- swiglu (w13 iq2_xxs, N=3072, K=4096): 2x2 default 0.458 ms WINS;
+  g42 0.480, g12 0.506, g24 0.532, g44 0.659, g14 0.794. At 36 x 3.24
+  MB per iter that is ~255 GB/s — near the iq2 LUT-decode ceiling.
+- down (w2 q2_K SoA, N=4096, K=1536): g48 default 0.218 ms WINS
+  (g28 0.219 tied, g44 0.233, g24 0.235, g22 0.256, g12 0.257).
+  ~340 GB/s — the SoA planes run excellently; the pre-SoA g48 choice
+  transfers.
+- DECISION: no serving change; variants + env retained for future
+  sweeps. Ceiling implication: the two dominant MoE kernels are at
+  their format bandwidth ceilings ISOLATED (w13 ~21 ms/step + down
+  ~9.4 ms/step at those speeds); any remaining MoE-side loss is
+  interleaving, not kernel geometry. Next unmeasured territory: the
+  attention-side dense streams (wqb_insert_c, indexer, compressor,
+  oproj — the fragmented ~40+ ms of the phase split).
+- Artifacts: scratchpad geo_bench.py; numbers above (isolated, idle
+  server co-resident).
+
+## 2026-08-13 — Wave 12: CEILING ANALYSIS — plateau 122.6-124.2 ms is measured and defensible
+
+- Question: where do the ~40 ms between the current step (~123.3 mean)
+  and the pure-bandwidth floor live, and is any of it recoverable?
+- MEASUREMENT 1 — GGUF stream census (real tensor shapes, blk.1/blk.2):
+  routed MoE = 7.08 MB/expert (gate+up iq2_xxs 4.33 + down q2_K 2.75)
+  x 36 slots x 43 layers = **10.96 GB/step**; dense/attn streams
+  (attn_kv 2.23 + q_a 4.46 + q_b 35.65 + out_a 35.65 + out_b 35.65 Q8;
+  compressor 16.8 + indexer 21.5 F16 on c128 layers; shared exps 26.7
+  + router 2.1) ~ **8.3 GB/step**; drafter ~2.5-3 GB; total ~22 GB ✓
+  matches the old 22.5 GB roofline. NOTE: wo_a (attn_output_a) runs as
+  Q8 per-group fused_mul_mat_gguf in the python route — the dense
+  einsum is only the unquantized fallback (and the default-off tape);
+  no hidden fp16 stream.
+- MEASUREMENT 2 — cb_census under VLLM_SYNCPROF=1 (off1 matrix window,
+  step 124.10 in-band => instrument ~free): 19,653 CBs / 591 steps =
+  **33 CBs/step**; **gpu_busy 90.4 s vs wall 78.8 s** — busy exceeds
+  wall, i.e. CBs overlap and the GPU is SATURATED. There is no idle-gap
+  chunk; the loss is inside execution.
+- MEASUREMENT 3 — split-K TG=1536 probe (P=4 at verify, ULP class,
+  trajectory rolled): off1 123.28 (-0.7), off3 123.77 (+1.2) — wash
+  inside the boot floor. Default 768 stands.
+  (perf/results/2026-08-13/splitk1536/)
+- FLOOR DECOMPOSITION (at measured isolated kernel speeds): routed MoE
+  ~39 ms (w13 26 @255 GB/s + down 12.5 @340) + dense/attn ~21-24 +
+  drafter ~20-25 (k=5 architecture floor) + walk/sample/host ~10-15
+  = **~82-90 ms** — the retrospective's target tier IS the bandwidth
+  floor. The 35-40 ms gap = serial TIME-MULTIPLEXING: latency-bound
+  phases (attention walk, small chain ops, drafter fixed costs) idle
+  the memory system while bandwidth-bound streams wait their turn in
+  the dependency chain.
+- LEVERS MEASURED ~ZERO OR CLOSED THIS SESSION: output ring (0), q2_K
+  SoA (-0.5), split-K (-4.2, RETAINED), sum6 fold (-0.5, RETAINED),
+  spec block (arch floor k=5), expert-grouped w13 (-107 REGRESSION,
+  retired), kernel geometry (both optima confirmed), TG sweep (wash),
+  step tape (already-proven neutral), gate_linear fold (deprioritized,
+  ~86 tiny dispatches ~ 0 by the sum6 lesson).
+- VERDICT: **122.6-124.2 ms/step (~32 tok/s 7-offset mean) is the
+  measured plateau of this architecture on M1 Ultra** — GPU saturated,
+  dominant kernels at format bandwidth ceilings, all latency levers
+  measured. Beating it requires filling latency windows with weight
+  traffic, e.g. a second Metal queue prefetching the next dense/expert
+  streams into SLC during the attention walk (novel on Apple,
+  medium-risk project, bounded by SLC size ~48 MB and the ~35-40 ms
+  multiplexing gap) — or model-level changes (smaller quant, different
+  drafter) that are out of scope.
+- Artifacts: perf/results/2026-08-13/reprofile/ (boot_syncprof.log,
+  gate_syncprof_off1.log, syncprof numbers above), splitk1536/,
+  GGUF census inline above.
+
+## 2026-08-13 — Wave 13: two-queue premise probe — VALIDATED (stream rides free; walk SPEEDS UP under load)
+
+- Question (the wave-12 ceiling-breaker's premise): can a second Metal
+  queue stream weight bytes during a latency-bound kernel without
+  slowing it?
+- Probe (standalone, perf/results/2026-08-13/twoqueue_probe.mm): queue 1
+  runs a 384-simdgroup serial pointer-chase over 256 MB (sparse-MLA
+  walk proxy); queue 2 blits 1 GB copies continuously. M1 Ultra:
+  - walk solo 251.7 ms; stream solo 684 GB/s (r+w, near HW peak);
+  - CONCURRENT: stream sustains **243 GB/s** while the walk runs
+    **-9.7% FASTER than solo** (227.3 ms).
+- Two findings:
+  1. Latency-bound phases leave enormous memory bandwidth idle and a
+     second queue can claim it at zero (negative!) cost to the
+     latency-critical work.
+  2. The walk speedup under concurrent load is a DVFS tell: solo
+     latency phases likely run at reduced clocks; keeping the memory
+     system busy pins them. The serving step's ~40 ms of latency-bound
+     time may be paying a clock tax today.
+- PROJECT JUSTIFIED (wave 14): second command queue in the extension +
+  a read-only `warm` kernel (strided uint4 loads, discard) + per-layer
+  prefetch of the FFN-side weights (shared experts 26.7 MB + router)
+  during the attention window, SLC-capacity ~48 MB per window. Bound
+  ~4-7 ms/step from SLC hits + unknown DVFS bonus. Bit-exact by
+  construction (semantically inert reads). Env VLLM_QC_PREFETCH,
+  default off until gated.
+
+## 2026-08-13 — Wave 14: second-queue weight prefetch — RETIRED (A: +2.5 ms, B: neutral); campaign at measured plateau
+
+- Premise (wave 13 probe, validated standalone): a second Metal queue
+  streams ~240 GB/s while a latency-bound walk runs 9.7% FASTER.
+- Implementation: `qc_prefetch_warm` kernel (read-only strided uint4
+  warm, serving/prefetch/prefetch.metal), `prefetch_warm(tensors)` host
+  op on a lazy second MTLCommandQueue (fire-and-forget, semantically
+  inert), python hook in the decoder layer forward
+  (VLLM_QC_PREFETCH=1 opt-in, amd/model.py).
+- Probe A — per-layer shexp+router warm (43 CBs/step): off1 126.62,
+  off3 125.11 vs 124.6/122.6 baseline = **+2.5 ms REGRESSION**.
+  Two mechanisms: (1) ~43 extra CB commits/step of HOST time on the
+  critical encode path (~50 us each); (2) fire-and-forget cannot be
+  AIMED — with ~33 CBs/step in flight the GPU executes ~a step behind
+  the encode point, so warms land at uncontrolled GPU-times, sometimes
+  inside bandwidth-saturated phases.
+- Probe B — ONE warm CB per forward (first layer streams its 1.1 GB
+  routed w13 stack): off1 124.49, off3 122.62 = **EXACTLY NEUTRAL**.
+  The standalone DVFS speedup does not transfer: serving's step keeps
+  the GPU busy enough that clocks are already held; a 4.5 ms background
+  burst neither pins nor steals measurably.
+- Shas identical in every configuration (8-tok db2846cf, off1
+  4d18b4fa, off3 ce1bab26) — the op is inert as designed.
+- DECISION: RETIRED to opt-in probe (VLLM_QC_PREFETCH, default off;
+  kernel + op + hook retained as documented instrumentation).
+  DO-NOT-REDO: host-timed fire-and-forget prefetch on this stack — the
+  encode-to-execute lag makes GPU-time aiming impossible from the host;
+  aiming would need GPU-side sequencing (e.g., encoding warms INTO the
+  main queue between phases, which then pays main-queue bandwidth), and
+  the sum6/ring lessons already price main-queue insertions at ~0 gain.
+- CAMPAIGN STATE: with waves 5-14 measured (three retained wins:
+  split-K -4.2 ms, q2_K SoA, sum6; the rest closed/negative), the
+  decode plateau **122.6-124.2 ms/step, ~32 tok/s 7-offset mean**
+  stands as the measured ceiling of this architecture on M1 Ultra
+  (wave 12 analysis). Remaining frontiers need direction changes:
+  prefill campaign (parked), model-level changes (quant/drafter, out
+  of scope), or the great cleanup (queued for after the campaign).
+- Artifacts: perf/results/2026-08-13/prefetch/ (boot_pf.log,
+  gate_8tok.log, gate_2000_off{1,3}.log probe A, boot_pfB.log,
+  gateB_2000_off{1,3}.log probe B).
+
+## 2026-08-13 — SESSION CAPSTONE (waves 6-14): decode campaign closed at the measured plateau
+
+- LADDER: 127.2-127.6 (UPDATE 19) -> 126.8-127.6 (q2_K SoA, U20) ->
+  **122.6-124.2 ms/step (split-K, U21) — ~32 tok/s 7-offset mean**.
+  ds4 bar 25.53 beaten by ~25%. All gates standing: 8-tok db2846cf
+  2/10/7; off1 matrix 4d18b4fa 1409/2955/591 (walls 78.5-79.2).
+- RETAINED (default on): split-K sparse MLA (-4.2 ms, VLLM_QC_MLA_SPLITK,
+  TG default 768; 1536 measured wash), sum6 down fold (bit-exact,
+  VLLM_QC_MOE_SUM6), q2_K SoA planes (VLLM_QC_MOE_SOA), plus all prior
+  waves (memos, ring, MR kernels, fused act).
+- CLOSED/CONFIRMED: spec block k=5 (k=6 -1.3 tok/s; k<5 invalid),
+  kernel geometries (swiglu 2x2, down g48 — both at format ceilings,
+  255/340 GB/s isolated), TG sweep, gate_linear fold (deprioritized
+  ~0 EV per the sum6 dispatch lesson).
+- RETIRED NEGATIVES (opt-in quarantined, oracles retained):
+  expert-grouped w13 (VLLM_QC_MOE_GROUP=1: bit-exact, 2x REGRESSION —
+  SLC already dedups; wedged prefill pre-gate), second-queue prefetch
+  (VLLM_QC_PREFETCH=1: probe A +2.5 ms host CB cost, probe B neutral —
+  fire-and-forget cannot be aimed at GPU-time windows).
+- KEY MEASUREMENTS BANKED: GPU SATURATED at 123 ms (cb_census busy
+  90.4 s > wall 78.8 s; 33 CBs/step overlapping); step(k) ~ 35.7 +
+  14.6 ms/verify-row; stream census MoE 10.96 GB + dense/attn 8.3 GB +
+  drafter ~2.5-3 GB = ~22 GB/step; expert overlap 25-30 distinct/36
+  slots; two-queue premise real standalone (243 GB/s free stream, walk
+  -9.7%) but untransferable via host timing; bandwidth floor of the
+  current streams ~82-90 ms = the retrospective's target tier.
+- VERDICT: 122.6-124.2 ms is the measured, defensible decode ceiling
+  of this architecture (quant + DSpark k=5 + serial 43-layer chain) on
+  M1 Ultra. Breaking it requires GPU-side phase-sequenced prefetch,
+  model-level changes, or restructuring — all out of decode-campaign
+  scope.
+- NEXT CAMPAIGN (biggest measured gap): PREFILL — 74 tok/s linear
+  (13.5 ms/token) vs ds4 277 on this box; flat-tile physics supports a
+  ~500+ tok/s class ceiling (~86 GB per 2048-token chunk). The decode
+  wave-10 wedge confirmed prefill still routes MoE through the
+  PER-SLOT vec kernels (6000 slots at 1000 tokens) — the exact
+  "re-streams expert weights per small row group" pathology the A100
+  flat tile fixed for 8.8-57x. Avenue list: retrospective §7.2 + §8
+  tail (llama.cpp mul_mm_id two-phase gather -> per-expert 64x32
+  simdgroup-matrix tiles, dequant-in-swizzle, early-exit on token
+  count; two-regime crossover so the tile NEVER leaks into decode;
+  then insert-chain fusion incl. the 399 ms/call attn_wqb_insert_c
+  prefill outlier, mask block-skip FA, MPSGraph encode-queue fix to
+  retire VLLM_QC_LONGCTX_SYNC).
+
+## 2026-08-13 — PREFILL WAVE 1 BASELINE: short-ctx prefill split on the post-wave build
+
+- Method: three probes, no code changes. (A) clean-boot streaming-TTFT
+  walls at 512/1000/2048/3000 input tokens, disjoint source offsets so
+  APC never prefix-hits; (B) xctrace Metal System Trace attached
+  mid-3000-token prefill on the same clean boot (12 s window); (C)
+  VLLM_QC_PHASE_PROF=1 boot, phaseprof dump snapshot-diff around a
+  single 2048-token request (primer excluded by the diff).
+- (A) WALLS: 512 -> 6.506 s (12.71 ms/tok), 1000 -> 12.335 (12.34),
+  2048 -> 25.911 (12.65), 3000 -> 38.670 (12.89). 77.6-81.1 tok/s,
+  FLAT across lengths — zero chunk amortization; slightly better than
+  the 74 tok/s UPDATE-18 row (post-wave shared kernels).
+- (B) XCTRACE GROUND TRUTH: metal-gpu-state-intervals Active 12507.6
+  ms vs Idle 10.2 ms over the window = GPU 99.9% BUSY. Prefill is
+  kernel-execution-bound, NOT host/encode-bound (unlike the >64K
+  MPSGraph pathology). ~4.6 CBs in flight (encoder spans overlap
+  x4.59); single encoders up to 330 ms. Encoder labels confirm the
+  chunk-width MoE still runs qc_moe_vec_mr_swiglu + qc_moe_vec_mr_sum.
+- (C) PHASEPROF SPLIT (28.39 s bracketed vs 25.9 clean = +10% sync
+  inflation; layer-level rows partition target_forward cleanly):
+  layer_ffn 12.26 s (43.2%), layer_attn 12.21 s (43.0%), layer_mhc
+  3.44 s (12.1%), layer_norm 0.10 s.
+- ATTN decomposition (insert_c bracket WRAPS wq_b+kv_insert AND the
+  parallel compressor; comp_full_compress nests inside): the
+  insert/compress complex is ~10 s of the 12.2; attn_mqa (the actual
+  attention math) only 1.85 s, oproj 0.96, indexer 0.60. The 128K
+  split's shape does NOT transfer to short ctx.
+- FFN physics check: decode kernel ceilings (swiglu 0.458 + down
+  0.218 ms at 36 slots) scaled by slot count x341 = 232 ms/layer =
+  10.0 s/43 layers — matches the bracket ⇒ routed per-slot vec work
+  is ~10 s of layer_ffn (rest shexp qc_mmq + router). Flat-tile
+  bounds: weights-once 453 MB/layer = ~0.75 ms @600 GB/s; FLOPs ~464
+  GFLOP/layer ⇒ ~2-2.5 s/chunk at realistic simdgroup-matmul rates ⇒
+  ~5x on routed MoE alone (prefill ~78 -> ~125+ tok/s from wave 1).
+- ROADMAP (short-ctx, measured): wave 1 flat MoE tile (43%), wave 2
+  insert/compress chain (35%), wave 3 mhc (12%).
+- Call-path fact: fused_moe.py sets mmq_ok=False unconditionally on
+  Metal — every width takes the vec kernels; the tile branches on
+  num_tokens at that site. Two-regime crossover to be measured; tile
+  must never engage at decode widths (gates: 8-tok db2846cf, off1
+  4d18b4fa must stay bit-identical).
+- Artifacts: perf/results/2026-08-13/prefill_baseline/ (walls_a.log,
+  prefill.trace + exported XMLs, pp_after_primer.txt, pp_after_2048.txt,
+  pp2048_resp.json, boot_phaseprof.log).
+
+## 2026-08-13 — PREFILL WAVE 1 v1: tiled w13 iq2_xxs MoE GEMM (llama.cpp mul_mm_id port) — RETAINED, +27-31% prefill
+
+**Context:** dsv4-xxs-1 on M1 Ultra, uncommitted worktree (decode plateau
+build + this change). New files/edits: csrc/quixicore/metal/kernels/moe/
+moe_mm_id/moe_mm_id.metal (qc_moe_mm_map0_{2,4,6,8} + qc_moe_mm_id_iq2_xxs),
+tk_launch.h launchers, ggml_moe_mm_id host op + pybind (qc_metal_serving.mm),
+python wrappers (vllm/quixicore/ops.py, gguf/ops.py), dispatch gate in
+gguf/fused_moe.py (VLLM_QC_MOE_PREFILL_MM default 1, VLLM_QC_MOE_MM_MIN_TOKENS
+default 32 = llama.cpp's GEMV/GEMM crossover).
+
+**Hypothesis:** the chunk-width per-slot GEMV (qc_moe_vec_mr_swiglu) has zero
+weight reuse across tokens; a 64x32 simdgroup-MMA tile over per-expert row
+groups (llama.cpp kernel_mul_mm_id, the shape ds4 ships for this quant on this
+hardware) removes ~4-5 s of the ~6.7 s w13 term per 2048-token chunk.
+
+**Design (as landed):** two-phase — map0 (1 TG, one thread per expert, dense
+per-expert slot lists + counts) then 64x32 tiles / 128 threads / 4 simdgroups,
+16-value iq2_xxs dequant granules into an 8x8-swizzled half A-tile, half2x4
+vector B staging, fp32 accumulate, fp32 staging tile, scatter through the ids
+list into the vec kernels' flat (token, slot) row order; existing act() and
+sum6 down path unchanged. iq2 grid/sign tables staged to threadgroup memory
+(16512 B total; note llama.cpp/ds4 do NOT stage in their GEMM path — A/B
+later). Over-dispatch accepted for v1: grid (tokens/32, N/64, E) with tpe
+early-exit; at E=256/2048 tokens that is ~32x empty-TG launch (ds4's map0
+work-queue kills this — v2 item).
+
+**CORRECTION vs handoff:** serving E is 256, not 64 (w13 [256, 4096, 1056]).
+First boot's gate silently missed on the E<=64 guard: off1-2000 reproduced the
+vec sha 4d18b4fac460 exactly with wall 78.8 s — an accidental full reversion
+proof. Kernel sids[] resized 64->256 (map0 is one TG of E<=256 threads,
+llama.cpp runs DSV3 E=256 the same way).
+
+**Correctness:** oracle tests/kernels/test_metal_moe_mm.py 20/20 — mm-vs-vec
+norm-relative max err ~5e-4 (gate 1e-2; the tile path rounds dequantized
+weights to fp16 before the MMA like llama.cpp, the GEMV keeps them fp32, so
+bitwise identity is impossible by design), determinism x2 bitwise, E in
+{8, 64, 256} incl. concentrated routing. Serving: 8-tok off1 sha
+db2846cf721b BIT-IDENTICAL (2/10/7) with the mm path live at prefill (greedy
+top-1 survives the ULP-level prefill change); off1-2000 determinism x2 (sha
+0adffb58c16a both runs, counters 1597/2035/407), coherent text (dumped),
+decode step (wall-5.5)/drafts = 123.3-124.1 ms — inside the 122.6-124.2
+plateau; VLLM_QC_MOE_PREFILL_MM=0 boot reproduces 4d18b4fac460 /
+1409/2955/591 / 78.5 s EXACTLY (reversion sentinel).
+
+**Data (streaming-TTFT walls, disjoint offsets, same probe as baseline —
+perf/results/2026-08-13/prefill_mm_v1/):**
+- 512:  6.506 -> 5.156 s   (78.7 -> 99.3 tok/s)
+- 1000: 12.335 -> 9.550 s  (81.1 -> 104.7 tok/s)
+- 2048: 25.911 -> 20.108 s (79.0 -> 101.9 tok/s)  [projection was ~21-22 s]
+- 3000: 38.670 -> 29.520 s (77.6 -> 101.6 tok/s)
+Still FLAT across sizes (~9.6-10.1 ms/tok): w2 GEMV, insert/compress, mhc
+remain linear terms. off1-2000 harness wall 78.8 -> 56.0 s.
+
+**Decision:** RETAINED, default on. Next (research-ranked, ds4-verified):
+v2a tile w2 q2_K (SoA planes) via the same kernel + b_per_slot mode; v2b
+pair+SwiGLU fusion (shared B tile, dual accumulators, route-weight in the
+epilogue -> f16 mid, kills the [slots,4096] round trip); v2c map0 work queue
+(exact dispatch); then wave 2 insert/compress (ds4: chunk-wide compressor
+GEMMs + fused norm/rope + single mixed-FA pass with cached mask).
+
+## 2026-08-13 — PREFILL WAVE 1 v2a: tiled w2 q2_K down GEMM (SoA planes) — RETAINED, cumulative +43%
+
+**Context:** same build as v1 plus qc_moe_mm_id_q2_K[_soa] (templated twin in
+moe_mm_id.metal), fmt-dispatched ggml_moe_mm_id host op (soa arg), down
+branch in fused_moe.py (VLLM_QC_MOE_PREFILL_MM_W2 default 1) with the
+existing bit-matching moe_weighted_sum finalize. Decode stays on sum6.
+
+**Hypothesis:** w2 GEMV is ~3.2 s/2048-chunk; the same 64x32 tile with a
+q2_K dequant hook (B row = slot id — llama.cpp ne11==ne20 down semantics,
+so map0 output is reused unchanged) removes ~2 s.
+
+**Correctness:** oracle extended to 36/36 (q2_K AoS + SoA, E {8,256},
+rel err ~7e-4, AoS/SoA byte-identical decode, determinism x2). Serving:
+8-tok sha db2846cf721b UNCHANGED (2/10/7); off1-2000 determinism x2 (sha
+ce6c5a586087, counters 1577/2115/423), coherent text, step 122.9-123.5 ms
+(plateau holds).
+
+**Data (same probe, perf/results/2026-08-13/prefill_mm_v1/walls_v2a.log):**
+- 512:  5.156 -> 4.822 s (106.2 tok/s)
+- 1000: 9.550 -> 8.654 s (115.6 tok/s)
+- 2048: 20.108 -> 18.187 s (112.6 tok/s; baseline 25.911, cumulative +43%)
+- 3000: 29.520 -> 26.521 s (113.1 tok/s)
+
+**Decision:** RETAINED, default on. Two map0 runs per layer (w13 + w2) —
+fold into one when the pair+SwiGLU fusion lands. Remaining 2048-chunk wall
+~18.2 s: insert/compress ~10 s is now dominant -> wave 2 next; MoE residue
+(shexp qc_mmq round trip, act pass, 32x empty-TG over-dispatch) follows.
+
+## 2026-08-13 — PREFILL WAVE 2a: native cr=128 compressor front — RETAINED, 2048 TTFT 18.2 -> 11.2 s (cumulative 2.3x)
+
+**Context:** same build as wave-1 v2a plus dsv4_compress_front_c128
+(indexer.metal), launcher PSO switch on compress_ratio (tk_launch.h), host
+shape check widened to cr=128 [kv 512 | score 512] rows, python gate in
+_metal_compress_front_512 accepts ratio-128 no-overlap,
+_front512_reference gained overlap= (history = ratio when off).
+
+**Diagnosis (xctrace, one 2048-token prefill on the v2a build):** phaseprof
+had MIS-ATTRIBUTED the wave-2 targets — its syncs drain queued work into
+whatever bracket they land in (comp_full_compress "47.5 ms/call" was
+backlog; the native c4 front + indexer kernels are ~20 ms TOTAL). Encoder-
+level GPU truth: 18 s GPU = 9.6 s UNLABELED torch-MPS encoders + 4.0 s
+labeled FFN chain + 1.6 s sparse attention + ~2 s other labeled. Of the
+unlabeled: ~19 encoders x ~323 ms = the cr=128 compressor layers' EAGER
+tail — the (tokens, 128, 512) gather+softmax chain computed for ALL 2048
+tokens then discarded for all but the ~16 boundary rows (the native front
+gate required compress_ratio == 4). NEVER trust phaseprof phase totals for
+attribution; xctrace encoder intervals are the ground truth.
+
+**Fix:** one 128-thread threadgroup per token, non-boundary tokens exit,
+history row offsets staged cooperatively, three-pass torch-rounding-mirror
+softmax (recomputed exp == materialized rounding), sequential sums, RMS via
+per-sg simd_sum + sequential 4-way combine, bf16 rows into the existing
+deepseek_v4_kv_insert.
+
+**Correctness:** oracle tests/kernels/test_metal_compress_front_c128.py —
+BITWISE identical to _front512_reference for cr=4 (regression) and cr=128
+(clamped history, invalid slots, 129-token span), determinism x2. Serving:
+8-tok sha db2846cf721b UNCHANGED; off1-2000 sha EXACTLY the v2a sha
+ce6c5a586087 (bit-exact swap proven end-to-end), determinism x2 (identical
+counters 1584/2095/419 and walls 55.44/55.45 s across runs).
+
+**Data (probe, perf/results/2026-08-13/prefill_mm_v1/walls_c128.log):**
+- 512:  4.822 -> 3.183 s (160.8 tok/s)
+- 1000: 8.654 -> 5.207 s (192.0 tok/s)
+- 2048: 18.187 -> 11.176 s (183.2 tok/s; baseline 25.911 => 2.32x cumulative)
+- 3000: 26.521 -> 16.080 s (186.6 tok/s)
+Side effect: off1-2000 harness wall 57.7 -> 55.4 s and step
+(wall-5.5)/drafts 123.5 -> 119.2 ms — the front also deletes the ~330 ms
+decode stall at every 128-boundary crossing (the old "plateau" contained
+those stalls).
+
+**Decision:** RETAINED, default on (rides the existing
+VLLM_QC_COMPRESS_FRONT switch; =0 reverts to eager, =2 verifies on live
+inputs). ds4 target 277 tok/s; we are at 183. Next: re-trace for the new
+encoder-level split (candidates: remaining unlabeled eager — c128 indexer
+tail ~7 ms/layer/chunk, mhc region ~5.4 ms/layer; FFN block 29.5 ms/layer
+incl. shexp qc_mmq round trip; map0 work queue; pair+SwiGLU fusion).
+
+## 2026-08-13 — PREFILL WAVE 3: native mhc at prefill widths — RETAINED, 2048 TTFT 11.2 -> 8.27 s (248 tok/s, 3.13x cumulative)
+
+**Context:** python-only — _QUIXICORE_MHC_METAL_MAX_TOKENS 32 -> 2048
+(env-tunable VLLM_QC_MHC_METAL_MAX_TOKENS), engaging the existing
+qc_dsv4_mhc_pre_dots/pre_fin/post/fused_post_pre/hc_head kernels at chunk
+width. No kernel changes.
+
+**Diagnosis (wave-2a re-trace):** with the c128 front landed, the biggest
+remaining bucket was "CC & qc_rms_norm" 2.95 s / 125 encoders — the mhc
+EAGER torch chain at prefill (~34 ms/layer-chunk of tiny MPS ops). The
+32-token cap assumed "batched MPSGraph wins at prefill widths"; the
+split-dots kernels scale by threadgroup count ((tokens, 25) grid) and the
+assumption was never re-measured at chunk width.
+
+**Correctness:** 8-tok off1 sha db2846cf721b UNCHANGED (greedy top-1
+robust); off1-2000 sha rolled (mhc numerics differ from eager by design —
+same class as the decode A/B) to ec0cc6c5908e, determinism x2 (identical
+counters 1520/2410/482, walls 63.079/63.074), coherent text, step
+(wall-5.5)/drafts = 119.5 ms (matches the 119.2 post-c128 level).
+REVERSION SENTINEL: VLLM_QC_MHC_METAL_MAX_TOKENS=32 boot reproduces the
+c128-build sha ce6c5a586087 / 1584/2095/419 EXACTLY.
+
+**Data (probe, walls_mhcwide.log):**
+- 512:  3.183 -> 2.376 s (215.5 tok/s)
+- 1000: 5.207 -> 4.009 s (249.4 tok/s)
+- 2048: 11.176 -> 8.270 s (247.6 tok/s; baseline 25.911 => 3.13x)
+- 3000: 16.080 -> 12.096 s (248.0 tok/s)
+
+**Decision:** RETAINED, default 2048. ds4 target 277 tok/s; gap ~11%.
+Remaining 2048-chunk split (pre-mhc trace, mhc removed): FFN block ~4.2 s
+(50%), attention insert/indexer chain ~2.6 s, misc ~1. Next: v2b
+pair+SwiGLU fused w13 tile (ds4 moe.metal:8246 precedent; halves mid
+traffic, kills the act pass), v2c map0 work queue (32x empty-TG
+over-dispatch at E=256), shexp qc_mmq transpose round trip.
+
+## 2026-08-13 — PREFILL WAVE 1 v2b/v2c: fused pair+SwiGLU (NEUTRAL, opt-in) + map0 work queue (RETAINED) — 2048 at 8.10 s / 253 tok/s
+
+**v2b (fused pair+SwiGLU tile, qc_moe_mm_id_iq2_xxs_swiglu):** dual A
+streams (gate rows r, up rows r+inter), shared B tile, dual accumulators,
+epilogue reproduces the qc_swiglu oai_form-0 rounding points exactly
+(half-round accumulators, half clamp at DSV4's limit 10.0, precise fp32
+silu, half multiply) — oracle BITWISE vs tile+qc_swiglu (clamp on/off).
+MEASURED NEUTRAL-TO-NEGATIVE on walls (2048: 8.52/8.69 s fused vs
+8.27-8.39 unfused across boots; dual streams double accumulator pressure
+without ds4's dispatch regime). Default OFF; opt-in
+VLLM_QC_MOE_PREFILL_MM_FUSED_ACT=1. NOTE: first fused attempt silently
+missed the gate because DSV4 Flash ships swiglu_limit=10.0 on all 43
+layers — the clamp form is mandatory for engagement.
+
+**v2c (map0 tile work queue, ds4 moe.metal:7669 shape):** map0 serial-
+prefixes per-expert ceil(count/32) and emits (expert<<16 | slot) items +
+count; all three tile kernels consume the queue (grid (cap, N-tiles, 1),
+cap = slots/32 + E, extras exit on wcount) instead of the 3D grid that
+over-dispatched ~32x empty TGs at E=256. tokens < 65536 host-checked for
+the 16-bit pack. Scheduling-only: serving BIT-IDENTICAL (8-tok
+db2846cf721b; off1-2000 ec0cc6c5908e with identical counters
+1520/2410/482 and wall 63.07 s = the pre-queue build exactly).
+
+**Data (walls_v2c.log):** 512 2.378 s (215.3) | 1000 3.788 (264.0) |
+2048 8.096 (253.0) | 3000 11.721 (256.0). Baseline 25.911 at 2048 =>
+3.20x cumulative; ds4 target 277 => 91%.
+
+**Decision:** queue RETAINED default-on (it also restores headroom to
+re-A/B the fused pair under the new dispatch regime — untested pairing).
+Remaining split est.: FFN ~3.9 s, attention insert/indexer chain ~2.6 s,
+misc ~1. Next candidates: re-A/B fused pair on top of queue; attention
+chain (wq_b qc_mmq shapes, indexer topk at prefill width, fused
+rope+insert per ds4); shexp qc_mmq transpose round trip
+(qc_metal_serving.mm:1349).
+
+## 2026-08-13 — PREFILL: fused pair re-A/B over work queue (REJECTED, stays opt-in)
+
+The v2c decision flagged fused-pair x work-queue as an untested pairing.
+Booted the current build with VLLM_QC_MOE_PREFILL_MM_FUSED_ACT=1 (all
+else default; breadcrumb "w13, fused SwiGLU" confirmed in
+boot_fusedq.log) and re-ran the walls probe on the fresh boot.
+
+**Data (walls_fusedq.log vs walls_v2c.log, same protocol):**
+512 2.455 s vs 2.378 | 1000 3.972 vs 3.788 | 2048 8.433 vs 8.096 |
+3000 11.961 vs 11.721. Fused is +0.24-0.34 s slower at every width —
+same direction as the pre-queue A/B (8.52-8.69 vs 8.27-8.39). The queue
+narrows the gap slightly but does not flip it; the dual A-stream's
+doubled accumulator/threadgroup pressure (28800 B vs 16512 B) costs more
+than the saved mid write + act pass on M1 Ultra.
+
+**Decision:** REJECTED for default; kernel retained opt-in behind
+VLLM_QC_MOE_PREFILL_MM_FUSED_ACT=1 (oracle-bitwise, may pay off on
+different silicon). Default env unchanged. Next: attention insert/
+indexer chain (~2.6 s), shexp qc_mmq transpose round trip
+(qc_metal_serving.mm:1349), c128 indexer eager tail.
+
+## 2026-08-13 — PREFILL v3a: iq2_xxs dual-half 64-slot tile + occupancy fix (RETAINED) — 2048 at 7.76 s / 264 tok/s
+
+**Diagnosis chain (microbenched at serving shapes, T=1920/E=256/topk=6):**
+w13 tile GEMM 45.3 ms (8.5 TFLOPS, 41% peak), w2 23.3 ms. Three hypotheses
+tested in sequence:
+1. Tile-count/B-dequant waste (508 padded 32-tiles vs 256 64-tiles):
+   dual-half 64-slot kernel sharing one A dequant -> only 45.3->42.5 ms.
+   NOT dequant-bound.
+2. Padded-slot MMA waste (16256 vs 11520 slots): per-simdgroup dead-block
+   cull (skip mb loads + MMAs for 8-slot blocks past the live count) ->
+   42.5->41.4 ms. NOT MMA-bound either. (Concentrated-routing control was
+   confounded: tiles64 256/180 and padded slots 16384/11520 have the same
+   1.42 ratio at uniform routing.)
+3. Per-tile FIXED cost ~167 us regardless of live slots => barrier-bound at
+   1 threadgroup/core (18.6 KB threadgroup memory > 16 KB co-residency
+   threshold). Aliased the fp32 epilogue staging (sc) onto the dead sa|sb
+   backing -> 10.4 KB -> 3 TGs/core: 41.4 -> **34.4 ms** (11.2 TFLOPS).
+
+**q2_K counter-result:** the same treatments REGRESS q2_K (w64 SoA
+25.2->29.0; base aliasing SoA 25.2->29.9, AoS 23.3->25.5 — higher
+occupancy thrashes its scattered 84-byte block reads). Base q2_K kernel
+reverted to its original form byte-for-byte; host gates w64 to iq2_xxs
+only. w2 serving stays on the proven 32-wide SoA base (25.3 ms).
+
+**Ship shape:** map0 emits a second 64-slot queue (work64/wcount64,
+buffers 6/7); qc_moe_mm_id_iq2_xxs_w64 consumes it (dual 32-slot B halves
+per A dequant, per-half MMA sequence instruction-identical to the 32-wide
+kernel, dead-block cull, 10.4 KB aliased threadgroup memory). q2_K w64
+twins exist but are not dispatched (kept for other-silicon A/B).
+VLLM_QC_MOE_MM_W64=0 reverts to the 32-wide kernels.
+
+**Gates:** oracle 40/40 + c128 6/6; w64-vs-w32 subprocess sha BIT-IDENTICAL;
+serving 8-tok db2846cf721b 2/10/7 identical; off1-2000 ec0cc6c5908e
+1520/2410/482 identical (wall 63.74 vs 63.07 — step within boot floor;
+decode never takes the mm path).
+
+**Data (walls_v3a.log vs walls_v2c.log):** 512 2.266 s (225.9) vs 2.378 |
+1000 3.646 (274.3) vs 3.788 | 2048 7.764 (263.8) vs 8.096 | 3000 11.158
+(268.9) vs 11.721. ds4 target 277 => 95% at 2048, 99% at 1000.
+
+**Decision:** RETAINED default-on. Remaining 2048 split (fresh xctrace,
+this session): FFN CBs ~3.7 s (now ~3.2), attention CBs ~2.65 s
+(indexer-layer attn 76 ms vs 43 non-indexer — intrinsic width, sparse
+layers attend raw KV; compressors all sub-ms by microbench), mhc-only CBs
+0.53 s (o_proj qc_mmq ~9.5 ms + mhc_pre 1.84 ms x2/layer), shexp 0.23 s,
+rms 0.17 s. Next: mhc_pre dots threadgroup staging (1.84 ms -> target
+<0.5, bit-exact possible), attention chain (wq_b qc_mmq ~14 ms + sparse
+attention), w2 SoA bound investigation. NOTE: indexer top-k at >2048 ctx
+is fully eager python (metal_indexer.py chunked einsum+topk) — native
+kernel needed before any long-context claim; decode-topk kernel is the
+template (per-token [ks,ke) window + idx-ks rebase = its exact semantics).
+
+## 2026-08-13 — PREFILL v3b: mhc_pre dots threadgroup staging (RETAINED, bit-exact)
+
+The split dots pass re-reads the token's [4,4096] residual from device
+once per (row|sqsum) job — 25x redundant traffic at chunk widths.
+dsv4_mhc_pre_dots_tg_* stages the residual through 8 KB of threadgroup
+memory one H-stream at a time; each simdgroup keeps the monolith's row
+set {sg, sg+8, sg+16} (+ sqsum on sg 0), per-lane fma order and simd_sum
+tree unchanged => scratch BIT-IDENTICAL (subprocess sha pair verified).
+Host dispatches it at tokens >= 64 && hidden <= 4096; decode keeps the
+dots pass (occupancy). VLLM_QC_MHC_DOTS_TG=0 reverts.
+Measured (T=1920): dsv4_mhc_pre 1.847 -> 1.149 ms (residual traffic
+gone; the remaining ~1.1 ms is the shared 1.5 MB fn table re-read per
+token TG out of SLC). ~60 ms of 2048 wall across 86 calls/step. Serving
+sha gate batched with the next wave (bit-exact by construction).
+
+## 2026-08-13 — PREFILL v4a: staged sparse-attention prefill twin (RETAINED, bit-exact) + two REJECTED FA restructures
+
+Prefill attention runs mla_decode_fp8_sparse_two_cache_packed — one
+simdgroup per (head, token) with a serial online-softmax candidate walk.
+Microbench at T=1920: 53.7 ms/layer at cw=512+sw=128 (sparse layers),
+20.6 ms at cw=16+sw=128 (cr=128 layers) — together ~1.6 s of the 2048
+wall, at ~2.4 TFLOPS effective (11% of fp32 peak).
+
+**v4a (RETAINED):** mla_prefill_fp8_sparse_two_cache_packed — 256-thread
+threadgroup per (16-head group, token); candidate slots staged through
+threadgroup memory as the decode kernel's exact fp32 materialization
+(8 slots x 512, 16 KB), per-row walk keeps the decode kernel's order,
+lane mapping, simd_sum tree, online update => BIT-IDENTICAL (subprocess
+sha pair). 51.8/20.2 ms vs 53.7/20.6 — ~50 ms of wall. Host gates at
+batch >= 64, heads % 16 == 0; VLLM_QC_MLA_PREFILL_FA=0 reverts.
+
+**REJECTED experiments (documented so nobody retries them blind):**
+1. Tile-level softmax over the staged slots (score 8 candidates, one
+   max/exp/acc batch): 286 ms with runtime loop bounds (sc8/beta arrays
+   spilled), 223 ms fully unrolled at ROWS=1 — 4x SLOWER than the naive
+   walk. The staged designs pay ~126 threadgroup barriers per pass at
+   only 2 TGs/core; the decode-shape walk has ZERO barriers.
+2. Barrier-free dual-candidate walk (two slots per iteration, merged
+   2-tile online update, 2x memory-level parallelism): 57.2/22.1 ms —
+   NEUTRAL-to-worse vs the decode kernel.
+Conclusion: the op is ALU/latency-floor-bound in this scalar form at
+~52 ms; only a simdgroup-MMA FA (heads-as-M score tiles + P.V matmul,
+fp16 operand staging — ds4's mixed-FA shape, flash_attn.metal:139/:208)
+plausibly moves it. That is a full kernel project; parked as the top
+remaining candidate (~1.6 s pool, expect 2x+).
+
+Gate: bit-exact by construction; serving shas batched with v3b below.
+
+## 2026-08-13 — PREFILL v5: dense-causal MMA FA (RETAINED) — 2048 at 6.58 s / 311 tok/s — **BEATS ds4 (277) at 112%**
+
+**What:** mla_prefill_fa_mma + mla_prefill_dequant_slots. On single-request
+prefill steps the compressed table is a shared causal prefix and the SWA
+table is a band over the raw-position axis (verified against
+build_comp_tables/build_swa_tables), so attention runs as a tiled
+simdgroup-MMA FA instead of the decode-shape scalar walk:
+- Pass 1: decode the two axes' 584-B fp8 slots once into contiguous half
+  [n, 512] scratches (fp8 x exp2-scale and bf16 rope are exactly
+  representable in half at serving scales).
+- Pass 2: per (8-token q-tile x head, 128 threads/4 sgs): S tile [8x32]
+  via MMA with the k-dim split across simdgroups (K^T loaded transposed
+  straight from the scratch — no K/V staging), TG-wide partial reduce +
+  per-row online stats -> half P tile, O kept in register frags per
+  128-dim V slice with diagonal-matrix-MMA alpha rescale (ggml
+  flash_attn trick; ds4 ships ggml FA at dk576/dv512). ~13 KB TG mem,
+  2 barriers/block.
+- Python (metal.py forward_mqa): eligibility from CPU-side metadata only
+  (num_decode_tokens==0, num_prefills==1, dense branch) — no mid-encode
+  syncs; axis tables memoized per step/layer in the pass cache.
+
+**Microbench (T=1920):** 16.3 ms vs 52 ms decode-walk at sparse-layer
+shapes (3.2x). Oracle: determinism x2, rel dev 4.5e-3 vs the decode
+kernel on random caches (P-half rounding class — standard f16 FA, ds4
+does the same).
+
+**ULP gate (all pass):**
+- off1-2000 determinism x2: sha 3fc700d9818b, counters 1496/2535/507,
+  walls 66.52/66.42 — text coherent (completions dump kept).
+- Paired decode step: (66.42-5.5)/507 = 120.2 ms vs (63.74-5.5)/482 =
+  120.8 — unchanged (wall delta is the new token trajectory's extra
+  draft steps, not per-step cost).
+- 8-tok sha UNCHANGED: db2846cf721b 2/10/7 (early greedy decisions
+  robust to the ULP perturbation).
+- Reversion sentinel: VLLM_QC_MLA_PREFILL_FA_MMA=0 boot reproduces the
+  pre-v5 baseline BIT-EXACTLY (ec0cc6c5908e 1520/2410/482, wall 63.74).
+
+**Data (walls_v5.log vs walls_v4a.log):** 512 2.136 s (239.7) vs 2.354 |
+1000 3.289 (304.0) vs 3.778 | 2048 6.584 (311.1) vs 7.679 | 3000 9.855
+(304.4) vs 11.147. Campaign total at 2048: 25.911 -> 6.584 s = **3.94x**;
+ds4 277 tok/s target: **311.1 = 112%. BEATEN.**
+
+**New serving baseline (FA on, all defaults):** off1-2000 sha
+3fc700d9818b counters 1496/2535/507; 8-tok db2846cf721b 2/10/7.
+Limitations recorded: FA covers single-request prefill steps only
+(multi-request/mixed steps fall back to the decode walk — extend via
+query_start_loc runs if concurrent-prefill thruput matters); long-context
+(>2048 ctx) topk path still uses v4a + the eager python indexer top-k.
+
+## 2026-08-13 — PREFILL v6: single-chunk scheduling (RETAINED, config) — 2048 at 5.97 s / 343 tok/s (124% of ds4)
+
+xctrace on the v5 build showed 464 ms of the 2048 wall in TWO scheduler
+step boundaries: the spec-decode slot reservation (32 seqs x 4 draft
+slots) capped scheduled tokens at 2048-128=1920, splitting a 2048-token
+prompt into a 1920 chunk + an inefficient 128-token tail chunk.
+profiles.json metal override: max_num_batched_tokens 2048 -> 2176, so
+max_num_scheduled_tokens = 2048 (boot-log confirmed) and the benchmark
+prompt prefills in ONE chunk.
+
+**Data (walls_v6.log vs walls_v5.log):** 512 2.101 (243.7) vs 2.136 |
+1000 3.166 (315.9) vs 3.289 | 2048 5.967 (343.2) vs 6.584 | 3000 9.819
+(305.5) vs 9.855. Campaign at 2048: 25.911 -> 5.967 s = 4.34x; ds4 277
+=> **343.2 = 124%**.
+
+**Gates:** 1000-token prompts were single-chunk under BOTH configs, so
+the serving baselines must be bit-identical — and are: off1-2000
+3fc700d9818b 1496/2535/507 (paired step (65.61-5.5)/507 = 118.6 ms),
+8-tok db2846cf721b 2/10/7. Decode unaffected.
+
+## 2026-08-14 — PREFILL: fused pair occupancy rebuild (still REJECTED, stays opt-in)
+
+Applied the v3a occupancy lesson to qc_moe_mm_id_iq2_xxs_swiglu (aliased
+backing 28.2 -> 12.2 KB => 2 TGs/core, dead-block cull, two-pass
+epilogue; still BITWISE vs tile+qc_swiglu — oracle passes). Microbench
+at serving shapes: fused 41.1 ms vs unfused w64 pair 34.4 + ~0.3 act.
+The 32-queue fused instance count (508x16) with dual A streams loses to
+the w64 plain kernel's A-side sharing (256x64 at 3 TGs/core); B-side
+sharing is not the scarce resource for iq2. Improvements kept (the
+opt-in kernel is now much closer than its 8.5-s-walls-era self), default
+stays OFF.
+
+## 2026-08-14 — PREFILL v7: native prefill indexer top-k (RETAINED, robustness) — final session state 2048 at 5.94 s / 344.6 tok/s
+
+**What:** dsv4_indexer_topk_prefill — the decode top-k kernel with the
+block-table row taken from each token's request (tok_req via
+searchsorted(cu_seq_lens, cu_seqlen_ks)) and per-token cand = ke - ks;
+replaces metal_indexer.py's eager prefill chain (full-width e4m3 LUT
+gather + chunked fp32 einsum/topk per 128 rows per layer) that fired
+whenever a prefill chunk saw ctx > 2048. One dispatch per chunk per
+layer. VLLM_QC_INDEXER_TOPK_PREFILL=0 reverts to the eager chain.
+
+**Oracle (tests/kernels/test_metal_indexer_topk_prefill.py):** 200/200
+rows EXACT match (order included) vs the eager reference on a synthetic
+2-request chunk; determinism x2. Engagement proven by xctrace (13
+qc_dsv4_indexer_topk_prefill encoders during a 3000-token prefill).
+
+**Walls (walls_v7.log):** 2048 5.943 s (344.6) | 3000 9.901 (303.0) —
+3000 NEUTRAL vs v6 (the eager chain's cost was small/overlapped);
+retained for robustness (no eager python attention-critical path at long
+context) and as the base for future long-context work.
+
+**Gates:** off1-2000 BIT-IDENTICAL (3fc700d9818b, 507 drafts, step
+(66.15-5.5)/507 = 119.6 ms — the path cannot fire at <= 2048-ctx
+prefill); NEW long-context anchor: 2500-in/64-out offset-0 sha
+dd5c1c87fe60 x2 identical. Full oracle sweep on the final build: 40
+mm + 6 compressor + FA + topk-prefill all pass.
+
+**Session-final scoreboard (dsv4-xxs-1, M1 Ultra):** 2048-token prefill
+25.911 s (77.6 tok/s session start) -> **5.943 s / 344.6 tok/s = 4.36x;
+ds4 (antirez) 277 tok/s BEATEN at 124%**. Decode step 119-120 ms
+(campaign start 122.6-124.2). 1000: 317.4 | 3000: 303.0 | 512: 235.5.
+
+## 2026-08-14 — PREFILL v8a: w13/w2 kernel-floor ablations (CLOSED w13; two REJECTED restructures)
+
+Session-4 continuation. Microbench baseline re-confirmed (T=1920 serving
+shapes): w13 iq2_xxs w64 34.38 ms (11.25 TFLOPS ~53% of MMA peak), w2
+q2_K SoA 25.33 / AoS 23.34.
+
+Ablation split of w13 (dequant stubbed, then A-stores stubbed):
+dequant 2.7 ms (8%) | A-tile scalar stores 3.8 ms (11%) | MMA+loads+
+barriers+B-stage floor 27.9 ms (81%; pure-MMA theoretical ~18.6 ms at
+issued MACs). Two REJECTED attempts, both reverted byte-for-byte:
+- Row-major A staging + transposed simdgroup_loads (would vectorize the
+  16 scalar stores): 34.4 -> 40.0 ms. Transposed simdgroup_load on M1
+  costs far more than the swizzled scalar stores it replaces (+9.4 ms
+  over the 3.8 saved). Every staging layout routes a transpose through
+  somewhere; the scalar-store scatter is the cheapest place.
+- `if (nmb_a + nmb_b > 0)` guard on the w64 ma loads: 34.4 -> 39.1 ms.
+  A uniform branch around simdgroup_loads in the unrolled ik loop breaks
+  the compiler's load/MMA pipelining. (The shipped nmb branches around
+  mb/MMA survive because they amortize over 2x MMA work.)
+VERDICT: w13 is ~10-15% above its structural floor at this design;
+further gains need a different algorithm, not tuning. CLOSED.
+
+w2 q2_K ablation: dequant 5.8 ms SoA / 3.8 AoS of 25.3/23.3; floors
+identical at 19.5 ms — the whole SoA/AoS delta is dequant load traffic.
+Padding (41% at tiles32=508 vs ideal 360): in-kernel cull REJECTED
+(+1.2 ms on the live path, branch cost > tail savings at 8 MMAs/ik).
+
+## 2026-08-14 — PREFILL v9: q2_K dequant load-shaping (RETAINED, bit-exact class)
+
+Change (moe_mm_id.metal, both 32-wide q2_K variants + w64 twins):
+(1) per-block d/dmin/scale/qs pointers cached across the block's 8
+k-steps behind a uniform `il < 2` reload (was 8x redundant device
+loads); (2) the 16 per-value qs byte loads collapsed to four uchar4
+loads (16-byte alignment holds in both layouts: AoS 84*blk+16, SoA
+64*blk). Same bytes, same float math and order.
+Correctness: oracle 40/40 (mm-vs-vec + determinism x2, all formats/
+layouts). Measured: w2 SoA 25.33 -> 24.16 ms (-4.6%); AoS 23.34 ->
+23.62 (noise; serving uses SoA). w64 q2_K twin retested under the new
+dequant via diagnostic env VLLM_QC_MOE_MM_W64_Q2K=1: 29.0 -> 24.9 ms,
+still loses to the 32-wide 24.16 — stays parked. AoS now beats SoA at
+uniform routing (23.5 vs 24.0) but SoA is shared with the closed decode
+GEMV path — not touched.
+
+## 2026-08-14 — PREFILL v10: qgemm wide-tile + transposed store for large-M q8_0 (RETAINED, bit-exact)
+
+Discovery: the `ggml_mul_mat_a8` host wrapper wraps every qc_mmq GEMM in
+aten fluff — convert/transpose/pad on input, narrow/transpose/convert/
+contiguous on output. At wq_b prefill shape (N=32768, K=1024, M=2048,
+output 134 MB) the fluff alone is ~21.9 ms vs a ~14 ms kernel. The
+32x32-tile qgemm also re-reads X N/32=1024x and W M/32=64x.
+
+Change: new `qgemm_wide_t_q8_0` (qgemm.metal) — 64x64 tile (2 warps x
+32 cols, BK=32 unchanged) halves both traffic streams, and the kernel
+stores D transposed as [M, N] row-major (per-lane scalar scatter, once
+per kernel) so the host output transpose pass disappears. Host
+(qc_metal_serving.mm ggml_mul_mat_a8): routes q8_0 && rows >= 1024 &&
+N % 64 == 0; skips the zero-pad copy when M == rows (all callers);
+first-dispatch stderr breadcrumb for liveness. VLLM_QC_MMQ_WIDE=0
+reverts. Per-output-element FMA order identical to qgemm (same BK, same
+mma_AB decomposition) => bit-exact by construction.
+
+Microbench (M=2048): wq_b op 31.0 -> 9.37 ms (3.3x, beats even the old
+kernel-only 14 ms), out_a 11.4 -> 9.50, out_b 11.1 -> 10.13. Oracle:
+wide-vs-narrow BIT-IDENTICAL + fp32 reference sane; full sweep passes
+(moe 40/40, FA det, topk 200/200, compressor 6/6).
+
+Serving gates (boot_v8, fresh boot): 8-tok sha db2846cf721b identical;
+off1-2000 sha 3fc700d9818b counters 1496/2535/507 identical (1000-token
+prefill stays below the M>=1024 gate — narrow-path re-gate); long-ctx
+anchor 2500-in offset-0 sha dd5c1c87fe60 identical AND breadcrumb fired
+(wide path crossed in-situ, bit-exact). Decode step (65.67-5.5)/507 =
+118.7 ms — unregressed.
+
+Walls (fresh disjoint id-windows, streaming TTFT, v8 vs v7):
+512 2.001 s/255.9 (was 2.174/235.5) | 1000 3.189/313.6 (3.150/317.4,
+noise — 1000 < wide gate) | **2048 5.543/369.5 (was 5.943/344.6)** |
+3000 9.692/309.5 (was 9.901/303.0). ds4 277 => **133% at 2048**.
+Artifacts: perf/results/2026-08-14/prefill_ext_v1/.
+
+## 2026-08-14 — PREFILL v11 ATTRIBUTION: 2048-chunk prefill is GPU-BOUND at ~130 ms/layer (+ xctrace retention gotcha)
+
+METHOD WARNING (new): a 10-s `xctrace record --attach` of the prefill
+retained only the LAST ~2.2 s of Metal intervals (windowed retention) —
+an initial read of "2.84 s Active GPU over the whole probe = 50% idle"
+was WRONG; the 2.84 s of interval-sum sits inside a 2.18-s retained
+span (>100% = overlapping channels). Always check the first interval
+timestamp against the probe window before concluding idleness.
+
+Corrected read: mid-prefill the CBs chain back-to-back (no gaps at
+1-ms granularity), repeating unit ~130 ms/layer x 43 ~= 5.5 s ~= wall.
+2048-chunk prefill is GPU-BOUND. Phaseprof/syncprof diff (profiled
+boot, TTFT 6.145 inflated by forced syncs) agrees per-phase with kernel
+GPU times: layer_ffn 70.9 ms/call, attn_oproj 19.5 (== the two wide
+qgemms), attn_mqa 14.7 (FA chain), attn_wqb_insert ~12-13. Server
+metrics: whole wall inside engine prefill (queue+HTTP ~2 ms).
+
+The wall-vs-size fit (marginal ~2.3 ms/tok, ~+0.8 s apparent fixed at
+small n) is the per-layer HOST floor (~15-25 ms/layer python+aten
+dispatch, per chunk regardless of n) showing through when per-layer GPU
+work shrinks below it — fully hidden under GPU at 2048, ~40% of the
+wall at 512. Host-side de-fluffing would lift small-prompt TTFT but not
+the 2048 headline. Remaining 2048 pools (GPU): FFN mm ~60 ms/layer
+(w13 34.4 CLOSED near floor, w2 24.2 near floor), qc_mmq ~30 (oproj
+19.6 at ~65% of MMA-theoretical, wq_b 9.4), FA chain ~16, mhc/norms/
+inserts/compress ~15.
+
+## 2026-08-14 — PREFILL v12: qgemm wide-gate refinement (PENDING serving re-gate) + BM128 REJECT + BOX WEDGE (machine restart required)
+
+Kernel/host follow-ups to v10:
+- BM=128 wide_t twin (4 warps, 128 threads): microbench -0.5..-0.9
+  ms/layer, oracle bit-identical — but REMOVED. See wedge note; the
+  128-thread dispatch against a register-heavy PSO is the prime suspect
+  class for undefined behavior when the PSO thread cap lands below the
+  dispatch width. If reintroduced, assert
+  maxTotalThreadsPerThreadgroup >= 128 at PSO build.
+- Wide-gate refinement (RETAINED in code, serving re-gate PENDING):
+  q8_0 wide now fires at rows >= 1024 OR (rows >= 512 && N >= 8192).
+  Measured crossover: wq_b N=32768 at M=1000: 4.49 (wide) vs 6.05 ms
+  (narrow); out_b N=4096 K=8192 regresses below 1024 rows (5.55 vs
+  5.30) hence the N-conditional tier. This gives 1000-token prompts and
+  3000-prompt second chunks the full v10 win.
+- v9-boot gates that DID pass on this build before the wedge: 8-tok
+  db2846cf721b identical; off1-2000 3fc700d9818b 1496/2535/507
+  identical, step (65.53-5.5)/507 = 118.4 ms unregressed; breadcrumb
+  fired at rows=1000 (new tier crossed bit-exactly in-situ).
+
+**BOX WEDGE (blocks the remaining anchor + wall gates):** starting
+~11:52 (immediately after a 10-s `xctrace --attach` session on the v8
+server), every boot wedges: the engine main thread parks forever in
+torch Event.synchronize (async-output copy_event; stock PyTorch, not a
+qc kernel) — an MPS event that never signals. Reproduced across 5
+fresh boots. Bisect evidence that the BUILD is NOT the cause:
+- single-chunk 2048 prefill runs at full speed (5.86 s) on the same
+  boot where the two-chunk 2500 wedges;
+- wedges with VLLM_QC_MMQ_WIDE=0 (whole wave-10 path off);
+- wedges with VLLM_QC_MLA_PREFILL_FA=0 + VLLM_QC_INDEXER_TOPK_PREFILL=0
+  (all chunk-2-specific session kernels off);
+- the identical build ran the 2500 anchor cleanly at 11:36 (v8 boot,
+  sha dd5c1c87fe60), pre-xctrace.
+This matches the documented post-Instruments CB/event poisoning
+(perf notes + ops hygiene): **machine restart required.** After
+restart: boot, re-run long-ctx anchor (expect dd5c1c87fe60) and walls
+512/1000/2048/3000 (expect >= 369.5 tok/s at 2048; 1000/3000 should
+improve over v10 via the wide-gate tier).
+Also: benchmark_dsv4_exact.py client can deadlock in the HF tokenizer
+before sending any request (main thread in future.result, rayon pool
+idle); the server-side /tokenize + /detokenize + ids-window repro in
+perf/results/2026-08-14/prefill_ext_v1/ scripts is the workaround.
+
+## 2026-08-14 — PREFILL v12 RE-GATE (COMPLETE, post-restart): 2048 at 5.522 s / 370.9 tok/s (134%); WEDGE ROOT CAUSE REVISED to first-multi-chunk ordering
+
+Machine restarted by the user; sysctl iogpu.wired_limit_mb=122880
+re-set and verified pre-boot. The benchmark client was avoided
+entirely: gates ran through the server-side /tokenize + /detokenize
+reimplementation of the exact harness (scratchpad gate.py — identical
+prompt construction: encode(source, add_special_tokens=False), repeat+
+truncate, decode window, re-encode check, warmup then timed request,
+sha256 of choices[0].text).
+
+**All gates PASS bit-exact on boot_v12b** (primer -> 8-tok ->
+off1-2000 -> 2500 anchor):
+- 8-tok: sha db2846cf721b IDENTICAL, counters 7 accepted / 10 drafted
+  / 2 drafts IDENTICAL. The machine restart did NOT roll the ULP
+  trajectory.
+- off1-2000: sha 3fc700d9818b IDENTICAL, 1496/2535/507 IDENTICAL,
+  wall 65.79 s => step (65.79-5.5)/507 ~= 118.9 ms — decode
+  unregressed.
+- long-ctx anchor 2500-in/64-out offset-0: sha dd5c1c87fe60 IDENTICAL,
+  51/70/14, timed run 3.541 s (pre-wedge: 3.542). Two-chunk prefill
+  bit-exact on the v12 build.
+- Breadcrumb "[quixicore] qgemm_wide_t_q8_0 active" fired (liveness).
+
+Walls (fresh disjoint id-window streaming-TTFT probes, scratchpad
+probe.py, cursors phase-distinct mod L=1085, none reused):
+512 2.110 & 2.175 (242.7/235.4) | 1000 3.094 (323.2) | **2048 5.522
+(370.9)** | 3000 9.736 & 9.639 (308.1/311.2). vs v10: 1000 +3% — the
+v12 tier fires at rows=1000 as designed; 2048 confirmed (new best,
+134% of ds4's 277); 3000 flat (predicted ~55 ms chunk-2 win within
+noise); 512 -5..-8% — below-tier code path is byte-identical to v10,
+attribute to boot-level host-floor variance, not v12.
+
+**WEDGE ROOT CAUSE REVISED — supersedes the v12 entry's xctrace-
+poisoning conclusion.** Post-restart evidence (2/2 deterministic):
+- boot_v12 (fresh restart, fresh boot): primer(4 tok) -> 2500 direct
+  => WEDGE. Engine main thread parks 100% of samples in
+  THPEvent_synchronize -> MPSEvent::synchronize (the async-output
+  copy_event; async scheduling is enabled per boot log). ALL other
+  threads idle-parked, GPU idle, NO CB error in stderr, NO GPU fault/
+  reset/timeout in the kernel log (log show, wedge window). The event
+  simply never signals.
+- boot_v12b (same build, same box): primer -> 1000/8 -> 1000/2000 ->
+  2500 => CLEAN and bit-exact (all shas above).
+- boot_v12c (same build, same box): primer -> 2500 direct => WEDGE
+  again, same MPSEvent::synchronize signature.
+Conclusion: the wedge is a deterministic FIRST-MULTI-CHUNK-REQUEST
+initialization/ordering failure in the async-output cross-stream
+event path (AsyncOutput in vllm/v1/worker/gpu/async_utils.py:
+copy_stream.wait_stream(main_stream) + copy_event.record(copy_stream)
+— a signal lost or never committed when the boot's first multi-chunk
+prefill hits this machinery cold), NOT xctrace-attach poisoning, NOT
+the v9/v10/v12 kernels (bit-exact once ramped), and the 08-14 machine
+restart was NOT required by GPU-driver state (the same wedge
+reproduces on the restarted box). The pre-restart 5-boot bisect is
+thereby explained: those boots wedged or not according to request
+ORDER, and the kill-switch results (wedges with MMQ_WIDE=0, FA=0,
+TOPK=0) were all consistent with an order effect that no kernel
+switch touches. What the xctrace attach actually correlated with is
+that post-attach boots jumped straight to 2500 repro attempts.
+OPEN (not yet bisected): the minimal protective request (does 8-tok
+alone suffice? does a single-chunk 2048 with 8 decode steps? pre-
+restart notes suggest a 2048-then-2500 boot still wedged, so decode-
+step count may matter — treat the full ramp as the protocol until
+bisected). Root-cause fix in async_utils/metal_compat is CLEANUP-
+PHASE work; for now this is an OPS PROTOCOL, not a code change.
+
+**BOOT PROTOCOL (extended)**: after "Application startup complete":
+(1) tiny primer (4-5 tok in, 8 out); (2) a ~1000-token single-chunk
+request with real decode (the 8-tok gate qualifies) BEFORE any
+multi-chunk (>2176-token) prefill. Boots that skip (2) wedge
+deterministically on their first multi-chunk request and the boot is
+then lost (engine parks forever; kill + reboot).
+
+Artifacts: perf/results/2026-08-14/prefill_ext_v1/ — boot_v12.log
+(wedge #1), boot_v12b.log (clean gates), boot_v12c.log (wedge #2),
+8tok_v12b_run1.json, off1_2000_v12b_run1.json, longctx_v12b_run1.json.
+Campaign standing: **2048-token prefill 5.522 s = 370.9 tok/s = 134%
+of ds4 (277)**; campaign total 25.911 -> 5.522 s (4.69x). Decode
+CLOSED and unregressed.
+
+## 2026-08-14 — CLEANUP PHASE: wave-1 de-slop of the prefill/decode campaign tree (RETAINED, bit-exact) + wedge timing-race bisect
+
+- Status: retained
+- Scope: entire uncommitted campaign tree (Metal kernels, tk_launch.h,
+  qc_metal_serving.mm, vLLM python, tests, docs) on dsv4-xxs-1 / M1 Ultra.
+  Zero-numeric-change class: the full gate suite must stay bit-exact.
+- Baseline: UPDATE 26 gates — 8-tok sha db2846cf721b (7/10/2), off1-2000 sha
+  3fc700d9818b (1496/2535/507, step ~118.4-118.9 ms), 2500 anchor sha
+  dd5c1c87fe60, walls 512 ~2.0-2.2 | 1000 ~3.1 | 2048 <=5.55 (>=369 tok/s)
+  | 3000 ~9.6-9.75.
+- Hypothesis: the +13.8k/-0.7k-line campaign tree can be reduced to the
+  production serving path (dead experiments, bisect switches, probe/census
+  tooling and geometry sweeps removed) with bit-identical serving output.
+- Change (wave 1):
+  - Deleted retired experiments end-to-end: prefetch + probe kernel dirs,
+    metal_pysampler, fused MoE pair+SwiGLU tile, q2_K w64 twins, expert-
+    grouped qgemv twin, decode_linear bricks (kernel file reverted to HEAD),
+    iq2 SoA qgemv family + template SoA axes, ~28 geometry-sweep PSOs,
+    tape bisect trio, op/ids census, mode-2 compress verify. amd/model.py
+    reverted byte-identical to HEAD.
+  - Env switches 37 -> 12: bit-exact kill switches deleted with their dead
+    branches; ULP reversion sentinels kept (MLA_PREFILL_FA_MMA, MLA_SPLITK);
+    production/ops switches kept. Router ABI simplified to pre-softplus-only
+    through kernel -> launcher -> wrapper -> pybind -> python.
+  - Structure: MmqPlan policy struct in qc_metal_serving.mm, serving-MoE
+    launcher grouping in tk_launch.h, segment-id dedupe onto
+    mps_segment_ids, forward_metal -> forward_mps framework dispatch,
+    breadcrumbs collapsed to one info_once. Fixed a real latent bug: const
+    char* pointer-vs-"q2_K" comparison in the .mm tape (found via
+    -Wstring-compare).
+  - Comment hygiene across kernels + python (wave refs/dates/measured-ms
+    figures out; constraint comments kept or added). Tests got SPDX headers,
+    optional-pytest guards (pytest absent in venv), and real pass/fail
+    gates (FA rel 2e-2, indexer mismatch/setdiff).
+- Correctness: all 6 kernel oracles pass (moe_mm 36/36, compress_front 6/6
+  bitwise, FA det + rel 4.5e-3, indexer topk exact, soa 2/2, sum6 8/8
+  bitwise). Metallib 12.64 -> 12.19 MB; retired PSOs verified absent.
+- WEDGE BISECT (the one non-trivial finding): the fully-cleaned build
+  wedged the RAMPED 2500 anchor 2/2 (engine parks in THPEvent_synchronize
+  -> MPSEvent::synchronize at request COMPLETION, after full decode), while
+  the pre-cleanup build on the same machine-boot ran it clean/bit-exact.
+  Boot-level bisect (each: drain, boot, primer, 8-tok ramp, 2500):
+  cleaned native+gguf/router python CLEAN -> + cleaned worker CLEAN ->
+  + cleaned model files WEDGED -> pre-cleanup attention.py alone WEDGED ->
+  pre-cleanup {compressor.py, metal.py} CLEAN (2x 2500 bit-exact).
+  Their cleaned deltas were semantically inert (phaseprof with-brackets,
+  marshalling-memo conditionals with identical branch values), so the
+  conclusion is a PRE-EXISTING host-timing race in the async-output
+  completion-event path (same family as the first-multi-chunk boot wedge):
+  microsecond-level per-layer host overhead flips it. DECISION: keep the
+  pre-cleanup structure of compressor.py/metal.py (phaseprof brackets +
+  _QC_MEMO_POS/_QC_MEMO_WOA conditionals), trimmed to comment-only changes
+  (AST-identical to pre-cleanup, verified). Both files and
+  vllm/platforms/metal_compat.py now document the retention reason. An
+  event-stub fix attempt (copy_event.synchronize -> mps.synchronize) moved
+  the park and produced a CB-timeout variant; reverted. Root-cause fix on
+  the event path is follow-up campaign work, not cleanup work.
+- Results (ship tree, fresh ramped boot, boot_ship.log): 8-tok sha
+  db2846cf721b 7/10/2 BIT-EXACT; off1-2000 sha 3fc700d9818b 1496/2535/507
+  BIT-EXACT (67.3 s vs 65.5 s earlier same-day boot — run band); 2500
+  anchor sha dd5c1c87fe60 BIT-EXACT 3.544 s, no wedge; walls 512
+  2.206-2.250 | 1000 3.136 | 2048 5.550 s = 369.0 tok/s (meets the >=369
+  gate) | 3000 9.647 s. Note: earlier boots today (post machine restart
+  ~13:11) measured ~3-5% slower walls for BOTH pre-cleanup and cleaned
+  builds (A/B: 2048 5.758 vs 5.786-5.800) — machine-boot variance, not a
+  code effect; the ship boot recovered to gate band. UPDATE 26 baseline
+  stands unchanged.
+- Decision: retained. Wave-2 (deferred, recommend separate PR): .mm helper
+  dedupes (moe_check_inputs/clamp_args/resolve_out/bind_mhc_scalars,
+  indexer-topk twin merge) and kernel template dedups (moe_mm_id format
+  axis ~360 lines, qgemv q2_K branch-hoist, mla METAL_FUNCs, rms_norm w32
+  template, mhc finalize extraction, paged_attn reduce macro) — each needs
+  its own oracle + gate pass.
+- Raw artifacts: perf/results/2026-08-14/cleanup_gate/ — boot_cleanup{1..5},
+  boot_ab_precleanup, boot_t1, boot_h2, boot_h1a, boot_single_attn,
+  boot_compmetal, boot_ship logs; 8tok/off1_2000/2500 gate JSONs
+  (*_ship.json = final), walls_ship.log.
+
+## 2026-08-14 — CLEANUP REVIEW PASS: three-reviewer audit fixes (RETAINED, bit-exact) + tape known-issue surfaced
+
+- Status: retained
+- Scope: same tree as the CLEANUP PHASE entry above; second-pass audit by
+  three independent reviewers (native host / Metal kernels / Python).
+- Baseline: the CLEANUP PHASE ship gates above.
+- Change:
+  - Deleted the dead `qc_moe_mm_id_iq2_xxs` kernel (165 lines; the host
+    selects the `_w64` twin unconditionally, nothing could dispatch it).
+  - dsv4_mhc.metal: removed the orphaned ARGS_PRE macro and collapsed the
+    always-true FUSED template parameter (only <T, true> was instantiated).
+  - mla.metal: dropped the unused `lane` builtin from mla_prefill_fa_mma.
+  - metal_tape.py: removed the stale "not repacked" structural checks that
+    made the tape self-disable on the production SoA layout (the loader
+    repacks q2_K unconditionally; the C++ tape supports w2_soa).
+  - qc_metal_serving.mm nits: 32->16 head-group comment, header inline-
+    kernel list, cr=4/cr=128 docstring, py::arg names on the two unnamed
+    defs, g_-prefixed local renamed, unordered_map-as-set -> unordered_set,
+    cb_census_install latches only on success, stand-in-buffer comment.
+  - Comment/whitespace hygiene: stale line-number refs in metal_tape.py,
+    phaseprof docstring covers the compressor brackets, mhc.py wave jargon,
+    duplicate AoS note in qgemv.metal, stray blank lines.
+- Correctness: metallib + extension rebuilt (12.19 -> 12.18 MB; dead PSO
+  verified absent, all live PSOs present); all six kernel oracles re-passed
+  identically. STEP_TAPE=2 boot: tape registers again (22 layers, zero
+  structural-check failures) and the 8-tok gate stays BIT-EXACT under
+  verify mode.
+- KNOWN ISSUE SURFACED (documented in metal_tape.py, not fixed here): with
+  the tape registering again, mode-2 verify reports per-layer bitwise
+  mismatches on the production routes (max_abs_diff 1.5e-3 .. 7.6). The
+  tape last verified bitwise on 2026-08-11; the serving routes have since
+  evolved (SoA repack, sum-folded down, memos) and the tape's hard-coded
+  body was never re-validated — its per-op bisect scaffolding was deleted
+  in this cleanup. Serving is unaffected (mode 0 default; mode 2 returns
+  the Python result). Re-validating the tape body route-by-route is
+  follow-up work; do not trust mode 1 until then.
+- Results (final boot, boot_final.log): 8-tok db2846cf721b 7/10/2
+  BIT-EXACT | off1-2000 3fc700d9818b 1496/2535/507 BIT-EXACT, 65.5 s |
+  2500 dd5c1c87fe60 BIT-EXACT 3.532 s, no wedge | walls 512 2.218 |
+  1000 3.102/322.4 | **2048 5.512/371.6** (matches the UPDATE 26 baseline
+  5.522/370.9 within noise) | 3000 9.649.
+- Decision: retained. Tree is PR-ready pending the user's commit request.
+- Raw artifacts: perf/results/2026-08-14/cleanup_gate/ — boot_tape2.log,
+  boot_final.log, *_final.json, walls_final.log.

@@ -524,7 +524,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         """
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
-
             # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
             # in-kernel butterfly fusion and trivial inverse for continuation.
             H = _build_hadamard(D, str(device))
@@ -746,9 +745,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         if current_platform.is_metal():
             from vllm.quixicore.ops import quixicore_ops
+            from vllm.v1.attention.ops.turboquant_native import (
+                metal_ones,
+                metal_scaled_centroids,
+            )
 
-            centroids = (layer._tq_centroids * self.head_size**0.5).contiguous()
-            signs = torch.ones(self.head_size, dtype=torch.float32, device=key.device)
+            centroids = metal_scaled_centroids(layer._tq_centroids, self.head_size)
+            signs = metal_ones(self.head_size, key.device)
             quixicore_ops.turboquant_encode_metal(
                 key,
                 value,
