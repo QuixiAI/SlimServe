@@ -7042,3 +7042,42 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   response text stored in the artifact for future divergence-point diffs.
 - Decision: merge RETAINED, PR #2 updated. Raw:
   perf/results/2026-08-17/remerge_gate/.
+
+## 2026-08-17 — CodeRabbit review response (QuixiCore-Metal PR #3 findings applied to both repos)
+
+- Status: retained (correctness/hardening, no perf-path change)
+- Scope: 8 findings from the CodeRabbit review of QuixiCore-Metal PR #3,
+  verified against both trees and applied to metal-m1ultra-campaign (PR #2)
+  and dsv4-m1ultra-serving-port (QuixiCore-Metal PR #3). Kernel files stay
+  byte-identical across repos.
+- NUMERICS-AFFECTING (1): mla fp8 insert scale. Measured on M1 Ultra with
+  the production flags (-std=metal3.1 -O2): metal::exp2 at negative integer
+  inputs is 2 ulps LOW (exp2(-1) = 0x3EFFFFFE); non-negative integers are
+  exact. All three insert kernels (mla_kv_insert_fp8 + the two packed
+  serving twins) now build 2^-e from the float bit pattern, matching the
+  indexer kernels and the exact fp32 reference. Cached e4m3 codes change
+  only for tokens with block amax > 448 (exponent > 0); the stored scale
+  byte derivation is bit-identical in the reachable exponent range.
+  ANCHOR IMPACT: the three pinned anchors (8-tok db2846cf721b, off1-2000
+  7ce993786ba1, 2500x64 e973493bef44) must be re-gated on the next boot;
+  any flip attributable to an outlier-amax token is expected and should be
+  re-pinned, not investigated as a regression.
+- FOLLOW-UP (not applied): the nine decode-side exp2((float)(e-127)) sites
+  in mla.metal are 2 ulps low for every typical (negative-exponent) scale —
+  same defect class, but fixing them shifts every dequantized cache value
+  and belongs in its own trajectory-lottery pass.
+- Numerics-neutral hardening: N-divisibility guards for the multi-row MoE
+  GEMV hosts (ggml_moe_a8_vec falls back to the one-row route, swiglu/sum
+  TORCH_CHECK — tail simdgroups of the ceil-div grid read weight rows past
+  a non-multiple N; all DSV4 dims divide), nc/ns %32 check in
+  deepseek_v4_prefill_fa (enforces the _pad_slots contract), launcher
+  contract comments in tk_launch.h (router <=1024/<=8, compress cr==4,
+  prefill pad contract), moe_mm_id AoS alignment comment corrected (4-byte,
+  not 16), rms_norm 256-thread dispatch contract documented, save_partial
+  bf16 score+ape add documented as Triton-parity-required (CodeRabbit's
+  widen-to-float suggestion REJECTED — it would break bit parity).
+- Validation: full metallib clean (86 sources, 0 errors); extension built
+  from the worktree; kernel suites pass: prefill FA oracle, 36 tiled-GEMM
+  checks, SoA/AoS + sum6 bit-identical, compress-front c128 bitwise,
+  indexer top-k. exp2 probe artifact + build/test logs:
+  perf/results/2026-08-17/coderabbit_fixes/.

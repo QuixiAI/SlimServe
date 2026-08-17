@@ -3065,6 +3065,10 @@ void launch_dsv4_indexer_kv_insert(E& e, typename E::in_t kv,
   e.dispatch(num_tokens, 1, 1, 32, 1, 1);
 }
 
+// Contract: compress_ratio == 4 — host-checked. The kernel gathers
+// history = 2*compress_ratio rows into HISTORY_MAX (8) stack arrays; a
+// larger ratio would write past them. The cr=128 no-overlap layers use
+// dsv4_compress_front_c128, not this kernel.
 template <class E>
 void launch_dsv4_indexer_compress_insert(
     E& e, typename E::in_t state_cache, typename E::in_t cos,
@@ -3103,6 +3107,9 @@ void launch_dsv4_indexer_compress_insert(
 // + RMSNorm, bf16 rows out (deepseek_v4_kv_insert consumes them). cr=4
 // overlap layers use the one-simdgroup-per-token kernel; cr=128 no-overlap
 // layers use the 128-thread threadgroup twin (staged history offsets).
+// Contract: compress_ratio must be 4 or 128 — host-checked. The cr=4 kernel
+// holds its 2*ratio-row history in fixed-size stack arrays (sized for
+// ratio 4); any other ratio must not route to it.
 template <class E>
 void launch_dsv4_compress_front(E& e, typename E::in_t state_cache,
                                 typename E::in_t positions,
@@ -3367,6 +3374,10 @@ void launch_mla_prefill_fp8_sparse_two_cache_packed(
 // Dense-causal prefill FA support (see mla.metal): slot-list fp8 dequant
 // into a contiguous half [n, 512] scratch, and the 8-token x 1-head MMA
 // FA over pre-decoded compressed + SWA axes.
+// Contract: `slots`/`out` rows must be pre-padded with -1 slots to a
+// 32-row multiple plus one spare block (SlimServe metal.py _pad_slots) —
+// the FA MMA consumer loads full 8x8 tail fragments from this scratch.
+// -1-slot rows are zero-filled.
 template <class E>
 void launch_mla_prefill_dequant_slots(E& e, typename E::in_t cache,
                                       typename E::in_t slots,
@@ -3381,6 +3392,10 @@ void launch_mla_prefill_dequant_slots(E& e, typename E::in_t cache,
   e.dispatch(n, 1, 1, 32, 1, 1);
 }
 
+// Contract: nc/ns are the kc/ks scratch row counts and must be 32-row
+// multiples with at least one spare block past every per-token length
+// (host-checked) — tail K/V fragment loads read complete 8x8 tiles before
+// jn masks the scores. See mla_prefill_fa_mma in mla.metal.
 template <class E>
 void launch_mla_prefill_fa_mma(E& e, typename E::in_t q, typename E::in_t kc,
                                typename E::in_t ks, typename E::in_t lens_c,
@@ -6088,6 +6103,10 @@ void launch_qgemv_moe(E& e, typename E::out_t d, typename E::in_t wq,
 // launch_qgemv_moe; only the grid changes. soa selects the SoA-plane twins
 // (load-time repack in gguf/fused_moe.py; bit-exact, same buffer ABI — plane
 // offsets derive from N/K).
+// Contract: N must be a multiple of nsg*nr0 (8, or 32 for the fp16 q2_K 4x8
+// geometry) — host-checked. The ceil-div grid otherwise walks weight rows
+// past N before the store guards run; non-multiple N belongs on the one-row
+// launch_qgemv_moe route.
 template <class E>
 void launch_qgemv_moe_mr(E& e, typename E::out_t d, typename E::in_t wq,
                          typename E::in_t x, typename E::in_t topk_ids, int N,
@@ -6140,6 +6159,8 @@ void launch_qc_swiglu(E& e, typename E::in_t x, typename E::out_t y, int n_out,
 // Multi-row iq2_xxs MoE GEMV with the fused SwiGLU epilogue: emits the
 // activated (tokens*topk, N/2) tensor directly. NSG=2, NPAIR=2 (2 gate +
 // 2 up rows per simdgroup).
+// Contract: N/2 must be a multiple of kNsg*kNpair (4) — host-checked; tail
+// simdgroups would otherwise walk gate/up rows past N.
 template <class E>
 void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d,
                                 typename E::in_t wq, typename E::in_t x,
@@ -6177,6 +6198,10 @@ void launch_qc_moe_weighted_sum(E& e, typename E::in_t x, typename E::in_t w,
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
+// Contract: num_experts <= 1024 and topk <= 8 — host-checked. The kernel's
+// per-lane score/key arrays hold ceil(num_experts/32) <= MAX_PER_LANE (32)
+// entries and the top-k window/renorm buffers hold MAX_K (8); larger values
+// would index past those fixed local arrays.
 template <class E>
 void launch_dsv4_router_topk(E& e, typename E::in_t gating,
                              typename E::in_t bias, typename E::in_t hash_table,
@@ -6205,6 +6230,8 @@ void launch_dsv4_router_topk(E& e, typename E::in_t gating,
 // kernel loops the topk slots and applies the qc_moe_weighted_sum reduce in
 // its epilogue. Geometry mirrors the q2_K branch of launch_qgemv_moe_mr
 // (fp16 -> 4x8, bf16 -> 2x4); only those two shapes are instantiated.
+// Contract: N must be a multiple of nsg*nr0 (32 for fp16, 8 for bf16) —
+// host-checked, same tail-row rationale as launch_qgemv_moe_mr.
 template <class E>
 void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d,
                                  typename E::in_t wq, typename E::in_t x,
