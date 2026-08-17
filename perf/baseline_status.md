@@ -727,3 +727,34 @@ boot_*.log).
 - Raw artifacts: perf/results/2026-08-17/remerge_gate/
   (boot_2500check.log, ab_premerge_2500.json with full response text for
   future divergence-point analysis).
+
+## UPDATE 30 (2026-08-17): all three anchors re-pinned after the fp8 scale exactness fixes (insert 29de4e993 + decode da05ace06)
+
+- Cause is KNOWN and code-attributable, so this flip is NOT suspect under
+  the UPDATE 29 rule: the decode-side fix changes every dequantized fp8 KV
+  value by ~2 ulps of scale on every step (fast-math exp2 was 2 ulps low at
+  negative integer inputs; see the 2026-08-17 notebook entries). The
+  strongest evidence is the 8-tok anchor itself flipping — short-context
+  trajectories stayed bit-stable through every prior environmental re-roll.
+- Gate (shipping 256K config dsv4-xxs-1, full ramp primer -> 8-tok ->
+  off1-2000 -> 2500x64, fresh boot, server-side /tokenize gate driver):
+  - 8-tok RE-PINNED: sha 573db39598e7ff4ca0818aef7fff6a1bd719c33439c2028f
+    646a5011b5aca27e, counters 5/15/3, wall 1.69-1.72 s. Deterministic 2/2.
+  - off1-2000 RE-PINNED: sha bb83cc3054a3698f1134f773831e4557050b6a02de0a
+    1a9aac5460512882b944, counters 1581/2115/423, walls 57.26-57.35 s
+    (34.9 tok/s agg). Deterministic 2/2.
+  - 2500x64 RE-PINNED: sha f75e1d41ac3df6fa95e5e59cc2667c6cbaa47c617b2cf2
+    2417fbe68c4d64479d, counters 43/105/21, walls 4.49-4.71 s.
+    Deterministic 3/3.
+- Decode health judged on step ms, not wall: off1-2000 step
+  (57.3 - 5.5)/423 ~= 122.5 ms vs UPDATE 29's ~123.7 ms — unchanged
+  (-1%, within boot variance). The off1-2000 wall gain (63 -> 57.3 s) and
+  the 2500x64 wall increase (3.53 -> 4.49 s; 21 draft steps vs 12) are
+  both acceptance-mix effects of the new trajectories, not kernel changes.
+  Over the 2000-token sample acceptance IMPROVED (3.74 vs 3.31 accepted
+  per draft).
+- Retired shas: db2846cf721b (8-tok), 7ce993786ba1 (off1-2000),
+  e973493bef44 (2500x64).
+- Raw artifacts: perf/results/2026-08-17/decode_exact_gate/
+  (boot.log, 8tok.json, off1-2000.json, 2500x64.json with full response
+  text).

@@ -7114,6 +7114,15 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
 - Validation: metallib incremental rebuild clean; all six Metal kernel
   suites pass against the new metallib (prefill FA oracle, tiled-GEMM,
   SoA/AoS, sum6, compress-front c128, indexer top-k).
-- ANCHOR IMPACT: combined with the insert fix above, one boot-level re-gate
-  covers both commits; all three anchors are expected to flip (decode
-  scales shift every cached value) and are re-pinned, not investigated.
+- ANCHOR RE-GATE (DONE, same day): one fresh ramped boot covering both
+  commits; all three anchors flipped as predicted and are RE-PINNED in
+  baseline_status UPDATE 30 (8-tok 573db39598e7 5/15/3; off1-2000
+  bb83cc3054a3 1581/2115/423 @ 57.3 s; 2500x64 f75e1d41ac3d 43/105/21 @
+  4.49-4.71 s; every anchor deterministic across repeat runs). Step time
+  unchanged (~122.5 vs ~123.7 ms); wall shifts are acceptance-mix effects
+  of the new trajectories. Raw: perf/results/2026-08-17/decode_exact_gate/.
+- CodeRabbit follow-through: per-thread replies posted on all 8 PR #3
+  findings; 7 threads confirmed resolved by the bot (including the
+  save_partial widen suggestion, acknowledged incorrect for this contract),
+  the qgemv mr-geometry thread pending its follow-up verification. The
+  decode commit's own review pass produced no actionable comments.
