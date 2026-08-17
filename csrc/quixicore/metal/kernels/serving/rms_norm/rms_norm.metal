@@ -18,6 +18,12 @@ constant constexpr int THREADS = 256;
 constant constexpr int SIMDGROUPS = THREADS / 32;
 }  // namespace qc_rms
 
+// Contract: dispatch exactly THREADS (256) threads per threadgroup — the
+// SlimServe qc_metal_serving.mm site does. The cross-simdgroup reduction sums all
+// SIMDGROUPS shm slots unconditionally, and each slot is written only by a
+// simdgroup that actually runs; a smaller dispatch would read uninitialized
+// threadgroup memory. (With 256 threads, small D just contributes zeros.)
+
 template <typename T>
 inline void rms_norm_body(device const T* x, device const T* w, device T* y,
                           uint D, float eps, uint token, uint tid, uint sg,
