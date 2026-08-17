@@ -7081,3 +7081,39 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   checks, SoA/AoS + sum6 bit-identical, compress-front c128 bitwise,
   indexer top-k. exp2 probe artifact + build/test logs:
   perf/results/2026-08-17/coderabbit_fixes/.
+
+## 2026-08-17 — Decode-side UE8M0 scale exactness pass (mla.metal, both repos)
+
+- Status: retained (correctness; every-step numerics change, anchors re-gated)
+- Change: the nine decode-side `metal::exp2((float)(e - 127))` sites in
+  mla.metal (fp8 KV dequant in the decode, swa/compressed, prefill-dequant,
+  and mma paths) now reconstruct the scale exactly via a shared helper
+  `mla_ue8m0_scale(e)` = `as_type<float>((uint)e << 23)` — the scale byte IS
+  the biased exponent, so the exact power of two is the float with exponent
+  field e and zero mantissa. Closes the FOLLOW-UP recorded in the entry
+  above: fast-math exp2 is 2 ulps low at negative integer inputs, i.e. for
+  every typical scale (block amax < 448), so decode was scaling every
+  dequantized cache value 2 ulps below what the insert kernels intended.
+- Domain safety: reachable scale bytes from both the old and clamped-new
+  encoders are ~[105, 253]; the bit-pattern form is exact for e in [1, 254]
+  (no denormal/inf/zero cases).
+- Repo-wide exp2 sweep (classification, no further code change):
+  - FA-family softmax exp2 (attn_causal/multiwarp/varlen/q/bwd/fwd):
+    real-valued arguments, inherent fast-math regime, out of scope.
+  - indexer_k_quant_and_cache (indexer.metal:45, ue8m0 branch): stores the
+    float scale it actually used (self-consistent, no encode/decode
+    mismatch) and is NOT launched by the SlimServe serving host layer.
+  - qgemv_mxfp8 (qgemv.metal:1085): half-precision result rounds the 2-ulp
+    float error back to the exact power of two; not launched by the serving
+    host layer.
+  - act_quant:142 / quant_rt:294 / add_norm:344 encode-side
+    exp2(ceil(log2(...))): self-consistent float scales, not launched by
+    the serving host layer. If any of these ever feeds a byte-exponent
+    extraction, the 2-ulps-low value has exponent field e-1 (factor-2
+    decode error) — re-audit before putting them on a serving path.
+- Validation: metallib incremental rebuild clean; all six Metal kernel
+  suites pass against the new metallib (prefill FA oracle, tiled-GEMM,
+  SoA/AoS, sum6, compress-front c128, indexer top-k).
+- ANCHOR IMPACT: combined with the insert fix above, one boot-level re-gate
+  covers both commits; all three anchors are expected to flip (decode
+  scales shift every cached value) and are re-pinned, not investigated.

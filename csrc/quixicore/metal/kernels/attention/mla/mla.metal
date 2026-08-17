@@ -16,6 +16,15 @@ template <> inline bf16 mla_val_bf16(device const half *p, long i) {
     return bf16(float(p[i]));
 }
 
+// Exact 2^(e-127) from a UE8M0 scale byte: a float with exponent field e and
+// zero mantissa. Fast-math metal::exp2 is ~2 ulps low at negative integer
+// inputs (measured on M1 Ultra at -O2; see the insert kernels below), which
+// would scale every dequantized cache value below what the encoder used.
+// Valid for e in [1, 254]; the insert kernels only emit ~[105, 253].
+inline float mla_ue8m0_scale(int e) {
+    return as_type<float>((uint)e << 23);
+}
+
 // The half instantiation reads the fp16 kv_score GEMM output directly
 // (bit-exact: see mla_val_bf16 above).
 template <typename T>
@@ -699,7 +708,7 @@ kernel void mla_decode_fp8(device const bf16 *q            [[buffer(0)]],   // (
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -769,7 +778,7 @@ kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -853,7 +862,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
             if (d < NOPE) {
                 const int e = (int)compressed[base + DATA_BYTES + d / 64];
                 lat[i] = float(tk_e4m3_decode(compressed[base + d])) *
-                         metal::exp2((float)(e - 127));
+                         mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -883,7 +892,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
             if (d < NOPE) {
                 const int e = (int)swa[base + DATA_BYTES + d / 64];
                 lat[i] = float(tk_e4m3_decode(swa[base + d])) *
-                         metal::exp2((float)(e - 127));
+                         mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -946,7 +955,7 @@ kernel void mla_prefill_dequant_slots(
         if (d < NOPE) {
             const int e = (int)cache[base + DATA_BYTES + d / 64];
             v = float(tk_e4m3_decode(cache[base + d])) *
-                metal::exp2((float)(e - 127));
+                mla_ue8m0_scale(e);
         } else {
             v = float(rope[d - NOPE]);
         }
@@ -1318,7 +1327,7 @@ kernel void mla_prefill_fp8_sparse_two_cache_packed(
                                 const int e =
                                     (int)cache[base + DATA_BYTES + d / 64];
                                 v = float(tk_e4m3_decode(cache[base + d])) *
-                                    metal::exp2((float)(e - 127));
+                                    mla_ue8m0_scale(e);
                             } else {
                                 v = float(rope[d - NOPE]);
                             }
@@ -1508,7 +1517,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed_partition(
             if (d < NOPE) {
                 const int e = (int)cache[base + DATA_BYTES + d / 64];
                 lat[i] = float(tk_e4m3_decode(cache[base + d])) *
-                         metal::exp2((float)(e - 127));
+                         mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -1591,7 +1600,7 @@ kernel void mla_decode_fp8_partition(
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -1669,7 +1678,7 @@ kernel void mla_decode_fp8_sparse_partition(
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
