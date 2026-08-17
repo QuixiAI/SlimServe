@@ -258,6 +258,9 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
         "VLLM_DSV4_AUX_STREAMS": "0",
+        # qwarp8 IQ2 W1 decode variant: +2.7% c1 step rate on the TP4 shard
+        # (2026-08-15 dial sweep, exact-verified both runs).
+        "VLLM_DSV4_W1_QWARP8": "1",
     }
 
 

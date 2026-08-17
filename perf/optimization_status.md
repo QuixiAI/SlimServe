@@ -6874,3 +6874,171 @@ CLOSED and unregressed.
   Muse-Glimmer additions to the shared files are the other campaign's port
   to make).
 - Raw artifacts: perf/results/2026-08-14/merge_gate/.
+
+## 2026-08-15 - c1 host-side budget (py-spy on live production) + steady-decode metadata reuse
+
+Correction to the 08-13 eager-break theory: decode runs FULL graphs (boot
+logs: "Capturing CUDA graphs (FULL) 8/8" target AND drafter) - attention is
+INSIDE the graph. Async scheduling is already enabled (AsyncScheduler
+frames live in the engine). The fixed ~21 ms/cycle at c1 decomposes
+(py-spy 100 Hz, 40 s on production A worker TP0 + engine):
+
+worker: 23.9% target attn metadata build (~5.0 ms/cycle), 20.4% waiting on
+output copy_event, 16.3% sampler/rejection (~3.4 ms, incl. 1.6% our
+NAN_WATCH), 15.1% drafter python (~3.2 ms; incl. ~0.8 ms EAGER context-KV
+insert through Python GEMV dispatch), 14.1% starving on next input, 2.4%
+input prep. Engine: 85% idle (not the bottleneck). Worker CPU ~13.7
+ms/cycle vs GPU ~11.7 ms, imperfectly overlapped -> 47.5 steps/s.
+
+Metadata build detail: 55% torch-op dispatch (hundreds of tiny ops), 25%
+python object churn, 18% Triton launch overhead. Builders per step: rocm
+SWA subclass (ragged repack), FlashMLA/c128a subclass (ragged repack),
+sparse_swa base (3 device ops + 30-field dataclass), indexer, plus
+CommonAttentionMetadata construction per KV group. KEY INSIGHT: at FULL-
+graph decode the replayed graph reads only the builders' persistent device
+buffers - the Python metadata objects are only consumed at capture and by
+eager/prefill steps, so a steady uniform-decode step only needs the
+builders' device kernels re-run.
+
+IMPLEMENTED (env VLLM_STEADY_DECODE_META, default off):
+build_attn_metadata caches per-group (CommonAttentionMetadata, [(builder,
+metadata, layers, supports)]) keyed on (num_reqs, num_tokens,
+max_query_len) for all-decode FULL steps; on hit it refreshes drifting CPU
+scalars (max_seq_len) and calls builder.steady_decode_update() -- device
+work only -- implemented for DeepseekSparseSWAMetadataBuilder (+ rocm
+ragged subclass) and DeepseekV4FlashMLAMetadataBuilder (+ rocm ragged
+subclass); the indexer group full-rebuilds against the cached common
+metadata (safe fallback). All cached tensor fields are views over
+persistent buffers the runner refreshes each step; correctness gate =
+exact harness + degeneration guard. A/B window running.
+
+Remaining c1 roadmap by measured size: (1) this change (~5 ms class);
+(2) sampler/rejection path 3.4 ms; (3) drafter python 3.2 ms (eager
+context-KV insert -> capture; draft-loop consolidation); (4) full
+CPU/GPU overlap (ceiling ~85 steps/s = +80%).
+
+## 2026-08-15 - steady-meta A/B result + THE c1 finding
+
+A/B (fresh boots, exact harness): metaoff c1 47.5 steps/s, metaon c1 47.5
+steps/s (both runs each); c8 104.1 vs 103.8. Exact=true everywhere incl.
+metaon c8 (the fast path engages at uniform c8 verify) -> the change is
+SAFE but not yet the constraint. Left available, default off.
+
+THE FINDING (this is the important one): c1 steps take 21.05 ms while c8
+steps take 9.6 ms - on the same boot, same machinery, with 8x the
+per-step work. And c1's 47.5 steps/s has been INVARIANT across every
+change this session (Q4_K fused, cp.async, 5.6 ms of metadata Python
+removed). Conclusion: the c1 critical path is a fixed ~21 ms serialized
+round trip in the output -> engine -> schedule -> input chain that (a)
+does not scale with batch work, (b) is fully hidden at c8, (c) shadows
+all worker-side compute at c1 (removing 5+ ms of worker CPU changed
+nothing because it sat inside the shadow). py-spy occupancy shares are
+NOT critical-path attribution - the invariance test is.
+
+Ruled out: HTTP/client (harness is stream=False), shm SpinCondition
+quantization (busy-spins for 1 s before idling; 21 ms gaps stay in spin
+mode), async scheduling absence (AsyncScheduler active, dspark
+placeholders in use).
+
+NEXT (highest-value tok/s lever, ~2x c1 if closed): timestamp one cycle
+end-to-end across engine and worker (dequeue -> schedule -> shm
+broadcast -> worker input wait -> launch -> copy_event -> get_output ->
+engine receive) to locate the ~11 ms that is neither worker compute nor
+GPU. Candidates: spec-decode output round trip that async scheduling
+does not actually pipeline at bs=1 (worker starving 14% + engine idle
+85% is consistent with lockstep), TP broadcast rendezvous, api-proc zmq
+hop on the critical path.
+
+CORRECTION (2026-08-15, same day): the "c8 steps (9.6 ms) faster than c1
+steps (21 ms)" claim above was arithmetic error - steps/s = tps/(1+acc)
+gives PER-REQUEST step rate; at c8 all 8 requests advance in one engine
+step, so engine cycles are ~77 ms at c8 (slower, as expected for more
+work). What stands: c1 cycle = 21.05 ms, INVARIANT across kernel + CPU
+changes. Revised model: with async scheduling the worker's CPU prep for
+step N+1 overlaps step N's GPU, so the c1 critical path = verify GPU +
+rejection sync + 5 sequential drafter launches + D2H/H2D + engine
+turnaround; the metadata build sat in the overlapped region (hence
+neutral). Decomposition requires GPU-timeline gap analysis, not
+occupancy shares -> torch trace of a steady c1 window.
+
+## 2026-08-15 - RESOLUTION: c1 is GPU-BOUND (98% busy); host is fully overlapped
+
+Fresh torch trace, steady c1 decode window (111.8 ms, rank1): GPU busy
+109.4/111.8 ms = 98%, idle 2.4 ms, no gap class over 100 us worth
+reporting. The serialized-round-trip theory is DEAD, and the 08-13
+"~40% idle" decomposition was an artifact of dividing kernels by
+annotation count. With async scheduling, ALL host work (metadata build,
+sampler python, drafter orchestration) overlaps GPU execution - which is
+why removing 5.6 ms of metadata Python and 5 launches/layer changed
+nothing: c1 throughput is purely GPU work per cycle.
+
+GPU budget per window (per-cycle scale by ~1/3.5): IQ2 gate_up+SwiGLU
+13.0 ms (top), MLA sparse decode 11.0, aligned-Q8 GEMVs 13.5 (945x,
+dense projections), DRAFTER Q8_0 GEMVs 9.0 (238x) + bf16 s16816gemm 3.5
+(131x), grouped-Q8 6.0, Q2K down 5.4, indexer 4.6, mHC 8.0, custom-AR
+3.6, quantize_q8_1 3.35 (1431 launches), reduce 2.7, topk 2.6, fused
+Q4_K 2.4 (30x, active).
+
+tok/s roadmap is therefore GPU-work reduction, ranked:
+1. DRAFTER cost (~12 ms/window ~= a fifth of GPU time on the 0.5B
+   drafter at TP4 with per-layer AR): candidates - drafter TP1
+   (replicated, no AR), fewer drafter layers on the critical path,
+   revisit k.
+2. IQ2 gate_up decode (13 ms, biggest single): revisit qwarp8 /
+   cooperative variants at this exact geometry, or W1 tensor-core at
+   verify width.
+3. MLA sparse decode 11 ms: partition/launch tuning at 6-token verify.
+4. quantize_q8_1: 1431 tiny launches/window - batching/fusing into
+   producers.
+Steady-meta stays available (harmless, host-side); its value returns if
+host ever re-enters the critical path (e.g. much faster kernels).
+
+## 2026-08-15 - kernel-dial sweep: qwarp8 WINS (+2.7% c1 step rate), DEPLOYED
+
+With c1 proven GPU-bound, swept the existing IQ2/Q2K kernel dials at c1
+(fresh boots, exact harness, steps/s = the acceptance-free metric):
+- VLLM_DSV4_W1_QWARP8=1: 48.8 / 48.8 steps/s  <- +2.7% vs 47.5 baseline,
+  consistent across both runs, exact=true. First step-rate movement of
+  the session: the 256-thread 8-lane-per-row IQ2 W1 decode variant beats
+  the 1024-thread default at the current config (aux-off, capture-64).
+- VLLM_DSV4_W1_COOPERATIVE=1: 47.7 / 47.6 (neutral)
+- VLLM_DSV4_Q2_DOWN_ROWS=4: 47.4 / 47.8 (neutral)
+Encoded VLLM_DSV4_W1_QWARP8=1 in dsv4-q4ktail-4 and dsv4-q4ktail-8 (same
+TP4-shard kernel geometry); q4ktail-2 (1024-row shard) left default
+pending its own measurement. Tests updated (58 pass). Both daemons
+restarted onto it. The qwarp8 dial only affects the tokens<=8 decode
+route, so c8+/prefill are untouched by construction.
+Raw: perf/results/2026-08-15/kdial-sweep/.
+
+## 2026-08-17 — MERGE 2: origin/main (steady-decode meta + qwarp8) into the campaign branch; A/B-exonerated; 2500 anchor re-pinned
+
+- Status: retained (merge commit, author auroter)
+- Scope: second origin/main merge into metal-m1ultra-campaign for SlimServe
+  PR #2 (5 commits: VLLM_STEADY_DECODE_META attention-metadata reuse for
+  A100 FULL-graph decode, VLLM_DSV4_W1_QWARP8 IQ2 W1 dial, rocm.py, notebook
+  entries, profile-test additions).
+- Conflicts (2): build_attn_metadata signature — union of our
+  num_computed_tokens_cpu and main's steady_cache kwargs, both live in the
+  auto-merged body; notebook — ours-then-theirs chronological append.
+- Metal-inertness audit of every merged hunk: steady path triple-gated
+  (CUDAGraphMode.FULL + env opt-in + decode-only; Metal forces
+  cudagraph_mode NONE so steady_cache is always None and the eligibility
+  expression short-circuits); sparse_swa decode-SWA block is an exact
+  extract-method refactor (verified hunk-by-hunk); sparse_mla/default.py
+  additive; qwarp8 reader lives in dsv4_moe_ampere.cuh (not in the Metal
+  build); profiles.json delta is two A100 env additions only.
+- Gate result: 8-tok (db2846cf721b 7/10/2) and off1-2000 (7ce993786ba1
+  1538/2320/464, 62.93-63.09 s) BIT-EXACT. 2500x64 diverged to
+  e973493bef44 51/60/12 @ ~3.53 s (pinned: dd5c1c87fe60 52/65/13 @ 3.57).
+- Divergence investigation, in order: (1) prefix-cache hypothesis killed —
+  fresh boot + exact ramp reproduces e973; (2) merge-code hypothesis killed
+  by boot-level A/B — the four Metal-relevant merged python files restored
+  to eb5f8d08e give the SAME e973 on a fresh ramped boot while both short
+  anchors stay bit-exact; (3) machine-restart re-roll excluded (kern.boottime
+  Aug 14 13:12 predates the 08-15 pinning); (4) venv delta excluded (only
+  pytest/pluggy/iniconfig added, not imported by the server).
+- Conclusion: environmental trajectory re-roll on the >2048 sparse path
+  (precedent: 2026-08-12 re-roll entry). Anchor re-pinned at e973493bef44;
+  response text stored in the artifact for future divergence-point diffs.
+- Decision: merge RETAINED, PR #2 updated. Raw:
+  perf/results/2026-08-17/remerge_gate/.
