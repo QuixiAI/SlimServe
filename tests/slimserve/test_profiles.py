@@ -277,6 +277,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
+        "qwen38-27b",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]

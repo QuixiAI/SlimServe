@@ -7088,3 +7088,54 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   protocol stay until a soak on the fixed path proves them unnecessary
   (documented in metal_compat.py). CUDA/ROCm path byte-identical.
 - Raw: perf/results/2026-08-17/wedge_fix/ (boot_fix1..5 logs).
+
+## 2026-08-17 — Qwen3.8-27B Metal bring-up: scoped, registry landed, download started (CAMPAIGN OPEN)
+
+- Goal (user request): measure how the M1 Ultra Metal kernel stack serves
+  Qwen3.8-27B.
+- What Qwen3.8-27B is (HF Qwen/Qwen3.8-27B config.json, fetched):
+  architecture Qwen3_5ForConditionalGeneration (model_type qwen3_5 — the
+  3.8 release reuses the 3.5-series architecture), dense 27B VL hybrid:
+  64 text layers = 16 x (3 x Gated-DeltaNet linear_attention + 1
+  full_attention), hidden 5120, gated attention 24Q/4KV head_dim 256 with
+  attn_output_gate, vocab 248320, native 262144 context. GGUFs at
+  ggml-org/Qwen3.8-27B-GGUF: Q4_K_M 17.7 GiB, Q8_0 26.6 GiB, separate
+  mmproj vision tower, and an mtp-* MTP drafter (Qwen3_5MTP).
+- Landed this session (branch qwen38-bringup): source `qwen38-27b`
+  (Q4_K_M + Q8_0 + mmproj shared + MTP speculator declaration) and profile
+  `qwen38-1` (metal, 32768 bring-up context, 8 GiB KV pool, reasoning
+  parser qwen3, tool parser qwen3_xml, prefix caching off, speculation
+  off) in slimserve/profiles.json; test allowlist updated; 48/48 profile
+  tests pass; `slimserve qwen38-1 --dry-run` resolves;
+  `--download-only -y` fetching into ~/models/Qwen3.8-27B-GGUF/.
+- GAP ANALYSIS — why it does not serve yet (all verified in-tree):
+  1. Model class missing: the registry's qwen3_5 row is DANGLING (module
+     stripped from this fork). Upstream chain to vendor: qwen3_5.py (732
+     lines) -> qwen3_next.py (~32 KB) + qwen3_vl.py (~117 KB, vision) +
+     qwen2_moe.py (MLP dep) + transformers_utils/configs/{qwen3_5,
+     qwen3_5_moe}.py. Interfaces have drifted in this fork; expect real
+     adaptation, not copy-paste. Text-only first (muse_glimmer precedent:
+     text GGUF + separate mmproj).
+  2. GDN compute is Triton-only: qwen_gdn_linear_attn.py (already in-tree
+     from the Kimi K3 A100/MI300X work) calls
+     vllm.third_party.flash_linear_attention chunk/recurrent ops,
+     causal_conv1d Triton kernels, and optional AITER Triton — none run on
+     Metal. Bring-up needs torch-native MPS fallbacks (correct first),
+     then Metal kernels (fast; the actual point of the campaign).
+     Reference implementations: kimi_gdn/qwen_gdn layers + fla ops for
+     algorithm, QuixiCore-Metal for kernel idioms.
+  3. Hybrid state cache: gdn_attn.py backend + mamba_hybrid model states
+     exist in-tree (K3) but are unproven on Metal; metadata builders may
+     also carry Triton assumptions.
+  4. GGUF weight mapping: this fork's loader needs qwen3_5 tensor-name
+     mappings for the llama.cpp Qwen3.8 arch (mmproj + MTP files must be
+     ignored by the text loader).
+- MILESTONE PLAN: (M1) vendor + adapt the model chain, torch-native GDN
+  fallback, first greedy tokens vs HF reference; (M2) exact-harness
+  baseline + notebook entry (expect slow); (M3) Metal GDN kernels
+  (chunked delta rule prefill, recurrent decode step, conv1d) in
+  csrc/quixicore/metal, oracle-tested, then e2e; (M4) MMVQ/dense GEMV
+  reuse for the FFN/attention projections (Muse qgemv_mm precedent),
+  llama.cpp bar on the same box; (M5) 262144 context + MTP speculation.
+- The dsv4 campaign anchors are untouched by any of this (profile-only
+  changes on a separate branch).
