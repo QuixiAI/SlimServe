@@ -1028,6 +1028,11 @@ at::Tensor deepseek_v4_prefill_fa(
                   ks.scalar_type() == at::kHalf && ks.dim() == 2 &&
                   ks.size(1) == 512 && ks.is_contiguous(),
               "kc/ks must be contiguous half [n, 512]");
+  // The FA tail loads complete 8x8 fragments; the dequant scratches must be
+  // padded to 32-row multiples (metal.py _pad_slots adds the -1 padding).
+  TORCH_CHECK(kc.size(0) % 32 == 0 && ks.size(0) % 32 == 0,
+              "kc/ks rows must be padded to a multiple of 32, got ",
+              kc.size(0), " and ", ks.size(0));
   const int T = static_cast<int>(q_in.size(0));
   const int heads = static_cast<int>(q_in.size(1));
   auto q = q_in.contiguous();
@@ -1436,8 +1441,14 @@ at::Tensor ggml_moe_a8_vec(const at::Tensor& x, const at::Tensor& w,
   }
   // Multi-row kernel (see qgemv_moe_mr_*): ULP-level output changes vs the
   // one-simdgroup-per-row kernel, which stays the route for every other
-  // format and for K % 256 != 0.
-  if ((fmt == "iq2_xxs" || fmt == "q2_K") && K % 256 == 0) {
+  // format and for K % 256 != 0. The mr grid ceil-divides N over nsg*nr0
+  // rows per threadgroup, and tail simdgroups read weight rows past N
+  // before the store guards run — so a non-multiple N (never the case for
+  // the DSV4 dims) also stays on the safe one-row route.
+  const int mr_rows =
+      (fmt == "q2_K" && x.scalar_type() != at::kBFloat16) ? 32 : 8;
+  if ((fmt == "iq2_xxs" || fmt == "q2_K") && K % 256 == 0 &&
+      N % mr_rows == 0) {
     encode("qc_moe_vec_mr", [&](TorchEncoder& e) {
       tk::launch_qgemv_moe_mr(e, out, w, input, topk_ids, N, K, num_tokens,
                               topk, fmt, activation_type_name(input), soa);
@@ -1469,6 +1480,10 @@ at::Tensor ggml_moe_a8_vec_swiglu(const at::Tensor& x, const at::Tensor& w,
   TORCH_CHECK(x.dim() == 2 && x.size(0) == tokens,
               "MoE input must be [tokens, K]");
   TORCH_CHECK(row % 2 == 0, "gate|up row count must be even");
+  // The mr swiglu grid ceil-divides N/2 over 4 gate/up pairs per
+  // threadgroup; tail simdgroups would read weight rows past N otherwise.
+  TORCH_CHECK(row % 8 == 0,
+              "multi-row swiglu kernel needs N divisible by 8, got ", row);
   TORCH_CHECK(x.size(1) % 256 == 0, "iq2_xxs needs K % 256 == 0");
   TORCH_CHECK(x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16,
               "Metal GGUF MoE supports float16/bfloat16 activations");
@@ -1542,6 +1557,11 @@ at::Tensor ggml_moe_a8_vec_sum(const at::Tensor& x, const at::Tensor& w,
   const int topk = static_cast<int>(top_k);
   const int N = static_cast<int>(row);
   const int K = static_cast<int>(x.size(1));
+  // Tail simdgroups of the mr grid read weight rows past a non-multiple N
+  // before the store guards run; there is no one-row fallback here.
+  const int sum_rows = x.scalar_type() != at::kBFloat16 ? 32 : 8;
+  TORCH_CHECK(N % sum_rows == 0, "sum-folded q2_K kernel needs N divisible "
+              "by ", sum_rows, ", got ", N);
   auto topk_ids = topk_ids_in.to(at::kInt).contiguous();
   auto topk_w = topk_w_in.scalar_type() == at::kFloat
                     ? topk_w_in.contiguous()

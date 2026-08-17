@@ -7139,3 +7139,77 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   llama.cpp bar on the same box; (M5) 262144 context + MTP speculation.
 - The dsv4 campaign anchors are untouched by any of this (profile-only
   changes on a separate branch).
+## 2026-08-17 — CodeRabbit review response (QuixiCore-Metal PR #3 findings applied to both repos)
+
+- Status: retained (correctness/hardening, no perf-path change)
+- Scope: 8 findings from the CodeRabbit review of QuixiCore-Metal PR #3,
+  verified against both trees and applied to metal-m1ultra-campaign (PR #2)
+  and dsv4-m1ultra-serving-port (QuixiCore-Metal PR #3). Kernel files stay
+  byte-identical across repos.
+- NUMERICS-AFFECTING (1): mla fp8 insert scale. Measured on M1 Ultra with
+  the production flags (-std=metal3.1 -O2): metal::exp2 at negative integer
+  inputs is 2 ulps LOW (exp2(-1) = 0x3EFFFFFE); non-negative integers are
+  exact. All three insert kernels (mla_kv_insert_fp8 + the two packed
+  serving twins) now build 2^-e from the float bit pattern, matching the
+  indexer kernels and the exact fp32 reference. Cached e4m3 codes change
+  only for tokens with block amax > 448 (exponent > 0); the stored scale
+  byte derivation is bit-identical in the reachable exponent range.
+  ANCHOR IMPACT: the three pinned anchors (8-tok db2846cf721b, off1-2000
+  7ce993786ba1, 2500x64 e973493bef44) must be re-gated on the next boot;
+  any flip attributable to an outlier-amax token is expected and should be
+  re-pinned, not investigated as a regression.
+- FOLLOW-UP (not applied): the nine decode-side exp2((float)(e-127)) sites
+  in mla.metal are 2 ulps low for every typical (negative-exponent) scale —
+  same defect class, but fixing them shifts every dequantized cache value
+  and belongs in its own trajectory-lottery pass.
+- Numerics-neutral hardening: N-divisibility guards for the multi-row MoE
+  GEMV hosts (ggml_moe_a8_vec falls back to the one-row route, swiglu/sum
+  TORCH_CHECK — tail simdgroups of the ceil-div grid read weight rows past
+  a non-multiple N; all DSV4 dims divide), nc/ns %32 check in
+  deepseek_v4_prefill_fa (enforces the _pad_slots contract), launcher
+  contract comments in tk_launch.h (router <=1024/<=8, compress cr==4,
+  prefill pad contract), moe_mm_id AoS alignment comment corrected (4-byte,
+  not 16), rms_norm 256-thread dispatch contract documented, save_partial
+  bf16 score+ape add documented as Triton-parity-required (CodeRabbit's
+  widen-to-float suggestion REJECTED — it would break bit parity).
+- Validation: full metallib clean (86 sources, 0 errors); extension built
+  from the worktree; kernel suites pass: prefill FA oracle, 36 tiled-GEMM
+  checks, SoA/AoS + sum6 bit-identical, compress-front c128 bitwise,
+  indexer top-k. exp2 probe artifact + build/test logs:
+  perf/results/2026-08-17/coderabbit_fixes/.
+
+## 2026-08-17 — Decode-side UE8M0 scale exactness pass (mla.metal, both repos)
+
+- Status: retained (correctness; every-step numerics change, anchors re-gated)
+- Change: the nine decode-side `metal::exp2((float)(e - 127))` sites in
+  mla.metal (fp8 KV dequant in the decode, swa/compressed, prefill-dequant,
+  and mma paths) now reconstruct the scale exactly via a shared helper
+  `mla_ue8m0_scale(e)` = `as_type<float>((uint)e << 23)` — the scale byte IS
+  the biased exponent, so the exact power of two is the float with exponent
+  field e and zero mantissa. Closes the FOLLOW-UP recorded in the entry
+  above: fast-math exp2 is 2 ulps low at negative integer inputs, i.e. for
+  every typical scale (block amax < 448), so decode was scaling every
+  dequantized cache value 2 ulps below what the insert kernels intended.
+- Domain safety: reachable scale bytes from both the old and clamped-new
+  encoders are ~[105, 253]; the bit-pattern form is exact for e in [1, 254]
+  (no denormal/inf/zero cases).
+- Repo-wide exp2 sweep (classification, no further code change):
+  - FA-family softmax exp2 (attn_causal/multiwarp/varlen/q/bwd/fwd):
+    real-valued arguments, inherent fast-math regime, out of scope.
+  - indexer_k_quant_and_cache (indexer.metal:45, ue8m0 branch): stores the
+    float scale it actually used (self-consistent, no encode/decode
+    mismatch) and is NOT launched by the SlimServe serving host layer.
+  - qgemv_mxfp8 (qgemv.metal:1085): half-precision result rounds the 2-ulp
+    float error back to the exact power of two; not launched by the serving
+    host layer.
+  - act_quant:142 / quant_rt:294 / add_norm:344 encode-side
+    exp2(ceil(log2(...))): self-consistent float scales, not launched by
+    the serving host layer. If any of these ever feeds a byte-exponent
+    extraction, the 2-ulps-low value has exponent field e-1 (factor-2
+    decode error) — re-audit before putting them on a serving path.
+- Validation: metallib incremental rebuild clean; all six Metal kernel
+  suites pass against the new metallib (prefill FA oracle, tiled-GEMM,
+  SoA/AoS, sum6, compress-front c128, indexer top-k).
+- ANCHOR IMPACT: combined with the insert fix above, one boot-level re-gate
+  covers both commits; all three anchors are expected to flip (decode
+  scales shift every cached value) and are re-pinned, not investigated.
