@@ -237,6 +237,31 @@ class DeepseekV4FlashMLAMetadataBuilder(
             c128a_prefill_topk_indices=c128a_fields.get("c128a_prefill_topk_indices"),
         )
 
+    def steady_decode_update(
+        self,
+        metadata: DeepseekV4FlashMLAMetadata,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> DeepseekV4FlashMLAMetadata:
+        """Repeat only the device-side decode work for a steady uniform-decode
+        step (see attn_utils.build_attn_metadata): compressed slot mapping and
+        C128A topk metadata write the same persistent buffers the cached
+        metadata's fields view; CPU scalars that drift are refreshed."""
+        cm = common_attn_metadata
+        if self.compress_ratio > 1:
+            get_compressed_slot_mapping(
+                cm.num_actual_tokens,
+                cm.query_start_loc,
+                cm.seq_lens,
+                cm.block_table_tensor.clamp_(min=0),
+                int(self.kv_cache_spec.storage_block_size),
+                self.compress_ratio,
+                out=self.compressed_slot_mapping_buffer,
+            )
+        if self.compress_ratio == 128:
+            self._build_c128a_metadata(cm, metadata.req_id_per_token)
+        metadata.max_seq_len = cm.max_seq_len
+        return metadata
+
     def _build_c128a_metadata(
         self,
         cm: CommonAttentionMetadata,

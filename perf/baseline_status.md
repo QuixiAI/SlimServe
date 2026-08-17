@@ -695,3 +695,35 @@ boot_*.log).
   end-to-end (150%).
 - Raw artifacts: perf/results/2026-08-14/merge_gate/ (boot_final.log,
   boot_ship.log, ship_*.json, gate_*.json, walls.log, completions_2000/).
+
+## UPDATE 29 (2026-08-17): second origin/main merge — code exonerated by A/B; 2500 anchor re-pinned after an environmental trajectory re-roll
+
+- Merged origin/main again (5 commits: steady uniform-decode metadata reuse
+  VLLM_STEADY_DECODE_META, qwarp8 IQ2 W1 A100 dial, notebook/rocm updates).
+  Two conflicts (build_attn_metadata signature union, notebook append order);
+  every Metal-relevant hunk verified inert (steady path requires FULL
+  CUDA-graph mode + opt-in env, never true on Metal; sparse_swa change is a
+  character-identical extract-method refactor; sparse_mla/default.py additive
+  or gated). Profile tests 48/48. Merge commit author auroter.
+- Gate (shipping 256K config, full ramp, fresh boots):
+  - 8-tok: sha db2846cf721b, 7/10/2 — BIT-EXACT, unchanged since pinning.
+  - off1-2000: sha 7ce993786ba1, 1538/2320/464, walls 62.93-63.09 s
+    (31.8 tok/s end-to-end) — BIT-EXACT vs UPDATE 28, slightly faster wall.
+  - 2500x64: sha e973493bef44 51/60/12 @ 3.53-3.54 s vs pinned dd5c1c87fe60
+    52/65/13 @ 3.57 s — DIVERGED, stable across three fresh runs on two
+    boots (plus prefix-cached reruns, same sha).
+- A/B EXONERATION of the merge: restored the only four Metal-relevant merged
+  python files (attn_utils, sparse_swa, sparse_mla, model_states/default) to
+  the pre-merge tree (eb5f8d08e) on a fresh ramped boot — 8-tok and
+  off1-2000 reproduce bit-exact AND the 2500 gives the SAME new sha
+  e973493bef44. The merge code cannot be the cause; the >2048 sparse-path
+  trajectory re-rolled environmentally on this box some time after the
+  08-15 pinning (same machine boot — uptime since Aug 14 13:12 — so not a
+  restart re-roll; precedent: the 08-12 re-roll entry). Short-context
+  serving remains bit-stable across days.
+- RE-PINNED long-ctx anchor: 2500-in/64-out offset-0 sha e973493bef44,
+  counters 51/60/12, ~3.53 s. dd5c1c87fe60 is retired with this
+  explanation; treat any FUTURE flip as suspect until A/B'd the same way.
+- Raw artifacts: perf/results/2026-08-17/remerge_gate/
+  (boot_2500check.log, ab_premerge_2500.json with full response text for
+  future divergence-point analysis).

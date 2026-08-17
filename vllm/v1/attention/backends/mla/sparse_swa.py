@@ -564,85 +564,15 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         is_valid_token.copy_(slot_mapping >= 0)
 
         non_causal = not common_attn_metadata.causal
-        decode_swa_indices = self.decode_swa_indices
-        if num_decode_tokens > 0:
-            self.decode_swa_lens[num_decode_tokens:] = 0
-            if non_causal:
-                assert self.is_dspark, (
-                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
-                    "speculation mode, but causal=False was set without DSpark."
-                )
-                if self.decode_swa_indices_noncausal is None:
-                    self.decode_swa_indices_noncausal = torch.zeros(
-                        self._max_tokens,
-                        1,
-                        self.noncausal_index_width,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                decode_swa_indices = self.decode_swa_indices_noncausal
-                if current_platform.is_metal():
-                    _compute_swa_indices_torch(
-                        decode_swa_indices[:num_decode_tokens],
-                        self.decode_swa_lens[:num_decode_tokens],
-                        query_start_loc,
-                        seq_lens,
-                        token_to_req_indices,
-                        is_valid_token,
-                        block_table,
-                        self.block_size,
-                        token_offset=0,
-                        window_size=self.window_size,
-                        noncausal=True,
-                    )
-                else:
-                    _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
-                        decode_swa_indices,
-                        decode_swa_indices.stride(0),
-                        self.decode_swa_lens,
-                        self.window_size,
-                        self.noncausal_index_width,
-                        query_start_loc,
-                        seq_lens,
-                        token_to_req_indices,
-                        is_valid_token,
-                        block_table,
-                        block_table.stride(0),
-                        self.block_size,
-                        token_offset=0,
-                        TRITON_BLOCK_SIZE=1024,
-                    )
-            else:
-                if current_platform.is_metal():
-                    _compute_swa_indices_torch(
-                        decode_swa_indices[:num_decode_tokens],
-                        self.decode_swa_lens[:num_decode_tokens],
-                        query_start_loc,
-                        seq_lens,
-                        token_to_req_indices,
-                        is_valid_token,
-                        block_table,
-                        self.block_size,
-                        token_offset=0,
-                        window_size=self.window_size,
-                    )
-                else:
-                    _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
-                        decode_swa_indices,
-                        decode_swa_indices.stride(0),
-                        self.decode_swa_lens,
-                        self.window_size,
-                        query_start_loc,
-                        seq_lens,
-                        token_to_req_indices,
-                        is_valid_token,
-                        block_table,
-                        block_table.stride(0),
-                        self.block_size,
-                        token_offset=0,
-                        TRITON_BLOCK_SIZE=1024,
-                    )
-
+        decode_swa_indices = self._compute_decode_swa(
+            num_decode_tokens,
+            non_causal,
+            query_start_loc,
+            seq_lens,
+            token_to_req_indices,
+            is_valid_token,
+            block_table,
+        )
         # Prefill SWA indices live in paged coordinates. `token_offset` lets
         # the kernel read is_valid_token / token_to_req_indices at absolute
         # prefill positions while writing output starting at index 0.
@@ -764,6 +694,129 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             # that already go through the same stub.
             out[layer_type] = get_mla_metadata()[0]
         return out
+
+    def _compute_decode_swa(
+        self,
+        num_decode_tokens: int,
+        non_causal: bool,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        token_to_req_indices: torch.Tensor,
+        is_valid_token: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode-side SWA index/length computation (device work only).
+
+        Shared by build() and steady_decode_update(): everything here reads
+        live persistent buffers and writes fixed output buffers, so it is the
+        exact per-step work a steady uniform-decode step must repeat.
+        """
+        decode_swa_indices = self.decode_swa_indices
+        if num_decode_tokens == 0:
+            return decode_swa_indices
+        self.decode_swa_lens[num_decode_tokens:] = 0
+        if non_causal:
+            assert self.is_dspark, (
+                "Non-causal DeepseekV4 SWA is only supported for the DSpark "
+                "speculation mode, but causal=False was set without DSpark."
+            )
+            if self.decode_swa_indices_noncausal is None:
+                self.decode_swa_indices_noncausal = torch.zeros(
+                    self._max_tokens,
+                    1,
+                    self.noncausal_index_width,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            decode_swa_indices = self.decode_swa_indices_noncausal
+            if current_platform.is_metal():
+                _compute_swa_indices_torch(
+                    decode_swa_indices[:num_decode_tokens],
+                    self.decode_swa_lens[:num_decode_tokens],
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    self.block_size,
+                    token_offset=0,
+                    window_size=self.window_size,
+                    noncausal=True,
+                )
+            else:
+                _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
+                    decode_swa_indices,
+                    decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    self.noncausal_index_width,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    token_offset=0,
+                    TRITON_BLOCK_SIZE=1024,
+                )
+        else:
+            if current_platform.is_metal():
+                _compute_swa_indices_torch(
+                    decode_swa_indices[:num_decode_tokens],
+                    self.decode_swa_lens[:num_decode_tokens],
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    self.block_size,
+                    token_offset=0,
+                    window_size=self.window_size,
+                )
+            else:
+                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+                    decode_swa_indices,
+                    decode_swa_indices.stride(0),
+                    self.decode_swa_lens,
+                    self.window_size,
+                    query_start_loc,
+                    seq_lens,
+                    token_to_req_indices,
+                    is_valid_token,
+                    block_table,
+                    block_table.stride(0),
+                    self.block_size,
+                    token_offset=0,
+                    TRITON_BLOCK_SIZE=1024,
+                )
+        return decode_swa_indices
+
+    def steady_decode_update(
+        self,
+        metadata: "DeepseekSparseSWAMetadata",
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> "DeepseekSparseSWAMetadata":
+        """Repeat only the device-side decode work for a steady uniform-decode
+        step whose shape signature is unchanged.
+
+        Every tensor field of the cached metadata is a view over persistent
+        buffers whose content the runner refreshes each step; the FULL decode
+        graph reads those buffers, not the Python object. CPU scalar fields
+        are either descriptor constants (num_*) or refreshed here.
+        """
+        cm = common_attn_metadata
+        metadata.is_valid_token.copy_(cm.slot_mapping >= 0)
+        self._compute_decode_swa(
+            metadata.num_decode_tokens,
+            not cm.causal,
+            cm.query_start_loc,
+            cm.seq_lens,
+            metadata.token_to_req_indices,
+            metadata.is_valid_token,
+            cm.block_table_tensor,
+        )
+        return metadata
 
     def _build_deepseek_v4_metadata(
         self,

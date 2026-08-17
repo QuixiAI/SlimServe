@@ -521,7 +521,39 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
+    steady_cache: dict | None = None,
 ) -> dict[str, Any]:
+    # Steady uniform-decode fast path: when the previous step had an
+    # identical shape signature and every builder either supports
+    # steady_decode_update() or is rebuilt in place, skip the Python object
+    # reconstruction entirely. At FULL-graph decode the replayed graph reads
+    # only the persistent device buffers the builders write; the cached
+    # metadata objects stay content-live because all their tensor fields are
+    # views over those buffers (CPU scalars that drift are refreshed).
+    steady_eligible = (
+        steady_cache is not None
+        and not for_cudagraph_capture
+        and causal is True
+        and dcp_local_seq_lens is None
+        and mm_req_doc_ranges is None
+        and model_specific_attn_metadata is None
+        and not bool(is_prefilling[:num_reqs].any())
+    )
+    steady_sig = (num_reqs, num_tokens, max_query_len) if steady_eligible else None
+    if steady_eligible and steady_cache.get("sig") == steady_sig:
+        for cm, items in steady_cache["groups"]:
+            cm.max_seq_len = max_seq_len
+            for builder, meta, layer_names, supports in items:
+                if supports:
+                    builder.steady_decode_update(meta, cm)
+                else:
+                    rebuilt = builder.build(
+                        common_prefix_len=0, common_attn_metadata=cm
+                    )
+                    for layer_name in layer_names:
+                        steady_cache["attn_metadata"][layer_name] = rebuilt
+        return steady_cache["attn_metadata"]
+
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
@@ -529,6 +561,7 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    steady_groups: list = []
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -572,6 +605,8 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
+        if steady_sig is not None:
+            steady_groups.append((common_attn_metadata, []))
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
             if for_cudagraph_capture:
@@ -594,6 +629,21 @@ def build_attn_metadata(
                 )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+            if steady_sig is not None:
+                steady_groups[-1][1].append(
+                    (
+                        attn_metadata_builder,
+                        metadata,
+                        list(attn_group.layer_names),
+                        hasattr(attn_metadata_builder, "steady_decode_update"),
+                    )
+                )
+    if steady_sig is not None:
+        steady_cache["sig"] = steady_sig
+        steady_cache["attn_metadata"] = attn_metadata
+        steady_cache["groups"] = steady_groups
+    elif steady_cache is not None:
+        steady_cache["sig"] = None
     return attn_metadata
 
 
