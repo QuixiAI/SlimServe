@@ -434,9 +434,10 @@ static inline void mm_dequant16_q2_K(device const uchar *sc_p,
                                      float dmin, short il,
                                      thread half4x4 &reg) {
   const uchar sc8 = sc_p[il];
-  // 16-byte-aligned in both layouts (AoS: 84*blk + 16; SoA: 64*blk), so the
-  // 16 per-value byte loads collapse to four uchar4 loads. Same bytes, same
-  // float math and order — bit-identical outputs.
+  // 4-byte-aligned in both layouts (AoS: 84*blk + 16; SoA: 64*blk), which is
+  // enough for uchar4, so the 16 per-value byte loads collapse to four uchar4
+  // loads. Same bytes, same float math and order — bit-identical outputs.
+  // Do not widen past uchar4: the AoS base is not 16-byte aligned.
   device const uchar4 *q4 =
       (device const uchar4 *)(qs_p + 32 * (il / 8) + 16 * (il & 1));
   const uchar4 qv0 = q4[0], qv1 = q4[1], qv2 = q4[2], qv3 = q4[3];
