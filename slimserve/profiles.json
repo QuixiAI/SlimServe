@@ -416,6 +416,67 @@
         },
         "note": "Published DFlash drafter: 5 layers reading target layers [2, 14, 26, 38, 50], block size 16 (one non-autoregressive block per call). Draft KV uses the default fp16 cache; a TurboQuant draft cache is future work."
       }
+    },
+    "qwen38-27b": {
+      "title": "Qwen3.8-27B",
+      "modalities": ["text", "image"],
+      "repo": "ggml-org/Qwen3.8-27B-GGUF",
+      "base_url": "https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main",
+      "local_dir": "Qwen3.8-27B-GGUF",
+      "shared": [
+        {
+          "path": "mmproj-Qwen3.8-27B-Q8_0.gguf",
+          "bytes": 629247008
+        }
+      ],
+      "shared_note": "The mmproj vision tower is discovered by globbing mmproj* next to the text GGUF; text-only serving ignores it.",
+      "quants": {
+        "Q4_K_M": {
+          "title": "Q4_K_M",
+          "bytes": 18973870432,
+          "summary": "Uniform k-quant build; the practical single-machine default.",
+          "min_gpus": {},
+          "min_memory_bytes": {
+            "metal": 68719476736
+          },
+          "files": [
+            {
+              "path": "Qwen3.8-27B-Q4_K_M.gguf",
+              "bytes": 18973870432
+            }
+          ]
+        },
+        "Q8_0": {
+          "title": "Q8_0",
+          "bytes": 28595763552,
+          "summary": "Near-lossless 8-bit build for quality comparisons.",
+          "min_gpus": {},
+          "min_memory_bytes": {
+            "metal": 68719476736
+          },
+          "files": [
+            {
+              "path": "Qwen3.8-27B-Q8_0.gguf",
+              "bytes": 28595763552
+            }
+          ]
+        }
+      },
+      "speculator": {
+        "repo": "ggml-org/Qwen3.8-27B-GGUF",
+        "base_url": "https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/resolve/main",
+        "local_dir": "Qwen3.8-27B-GGUF",
+        "file": {
+          "path": "mtp-Qwen3.8-27B-Q8_0.gguf",
+          "bytes": 3164006688
+        },
+        "engine": {
+          "method": "qwen3_5_mtp",
+          "num_speculative_tokens": 2,
+          "quantization": "gguf"
+        },
+        "note": "Published MTP drafter for the 3.8 series (Qwen3_5MTP). Declared for download; profiles keep speculation off until the base model serves on Metal."
+      }
     }
   },
   "platforms": {
@@ -1169,6 +1230,40 @@
         "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
         "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
         "Performance note (2026-08-11): after the mixed-shard weight-copy fix, no-spec decode measures 12.8 tok/s and DFlash speculation 9.8 tok/s (k=16; k=5 is worse at 7.3 despite equal acceptance). Speculation is net-negative until the small-M GGUF matmul path is fixed -- use --no-spec for best single-stream throughput today. llama.cpp reference on this box: 26.6/50.2."
+      ]
+    },
+    "qwen38-1": {
+      "title": "Qwen3.8-27B on one Mac",
+      "source": "qwen38-27b",
+      "gpus": 1,
+      "platforms": ["metal"],
+      "default_quant": "Q4_K_M",
+      "summary": "Dense 27B hybrid (Gated DeltaNet + gated attention, Qwen3.5-series architecture) on a single Apple Silicon machine. BRING-UP IN PROGRESS: not yet serving on Metal.",
+      "engine": {
+        "tensor_parallel_size": 1,
+        "max_model_len": 32768,
+        "max_num_seqs": 16,
+        "max_num_batched_tokens": 2048,
+        "kv_cache_memory_bytes": 8589934592,
+        "compilation_config": {
+          "cudagraph_mode": "NONE"
+        },
+        "enable_prefix_caching": false,
+        "enable_chunked_prefill": true,
+        "trust_remote_code": true,
+        "served_model_name": "Qwen3.8-27B",
+        "reasoning_parser": "qwen3",
+        "tool_call_parser": "qwen3_xml",
+        "kv_cache_dtype": "auto"
+      },
+      "speculative": false,
+      "env": {},
+      "notes": [
+        "Architecture (config.json): Qwen3_5ForConditionalGeneration, 64 text layers as 16 x (3 linear_attention + 1 full_attention), hidden 5120, gated attention 24Q/4KV head_dim 256 with attn_output_gate, Gated DeltaNet linear layers, vocab 248320, native 262144 context. Vision tower ships as a separate mmproj GGUF; text-only serving first.",
+        "BRING-UP STATUS (2026-08-17): this fork's registry pointed at a qwen3_5 module that was stripped from the tree; the model class must be restored from upstream vLLM. The Gated DeltaNet compute path (flash-linear-attention chunk/recurrent ops, causal_conv1d) is Triton-only and needs torch-native MPS fallbacks before first tokens, then Metal kernels for real throughput. The hybrid attention/state KV manager (mamba_hybrid model states, gdn_attn backend) exists in-tree from the Kimi K3 work but is unproven on Metal.",
+        "max_model_len 32768 and an 8 GiB KV pool are conservative bring-up sizing; the model's native 262144 context is future work after the GDN path is proven.",
+        "enable_prefix_caching off for bring-up: hybrid linear-attention state is not block-sharable like paged KV; revisit once serving is correct.",
+        "The published mtp-Qwen3.8-27B GGUFs are an MTP drafter (Qwen3_5MTP upstream); speculation is future work after the base model serves."
       ]
     }
   }
