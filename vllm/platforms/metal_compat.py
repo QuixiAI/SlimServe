@@ -18,20 +18,29 @@ patched at their call sites:
    that is a dummy stub that raises when called. Metal has no graph capture,
    so the truthful answer is a constant ``False``.
 
-Known open issue, deliberately NOT patched here: a boot's first multi-chunk
-(> max_num_batched_tokens) prefill wedges deterministically unless a
-single-chunk request with real decode steps ran first (the boot-ramp ops
-protocol in perf/prefill_handoff.md). Replacing the async-output event wait
-with a stream drain moved the park without fixing it and produced a GPU
-command-buffer timeout variant on one boot -- evidence in
-perf/optimization_status.md (cleanup-phase entry). Fix attempts must prove
-themselves against the primer -> multi-chunk-direct repro before landing.
+The async-output completion-event wedge (a boot's first multi-chunk prefill
+parking the engine forever in MPSEvent::synchronize -- GPU idle, signal
+never delivered) is addressed structurally in
+vllm/v1/worker/gpu/async_utils.py: on Metal the AsyncOutput classes no
+longer run the CUDA cross-stream choreography (torch.Stream(mps) always
+returns the single stream 0, so set_stream/wait_stream/generic-Event
+record were pure risk with no overlap to buy) and instead record a native
+torch.mps.Event on the one real stream; VLLM_QC_ASYNC_OUT_DRAIN=1 swaps
+that event for a full torch.mps.synchronize() drain as an ops fallback.
+History and validation evidence: perf/optimization_status.md (2026-08-14
+boot_v12 bisect, cleanup-phase bisect, 2026-08-17 fix entry). The earlier
+naive attempt -- swapping only the host-side wait for a drain while
+leaving wait_stream's GPU-side wait encoded -- moved the park and produced
+a command-buffer-timeout variant; the structural fix removes the GPU-side
+wait as well.
 
-The race is timing-sensitive on the host side as well: stripping the
-phaseprof brackets and marshalling-memo conditionals from
+The race was timing-sensitive on the host side: stripping the phaseprof
+brackets and marshalling-memo conditionals from
 vllm/models/deepseek_v4/{compressor,metal}.py made even RAMPED multi-chunk
-requests park at completion (boot-level bisect, cleanup-phase entry), so
-those code paths keep their structure until the event path is fixed.
+requests park at completion (boot-level bisect, cleanup-phase entry).
+Those code paths keep their structure until a soak on the fixed event path
+proves the retention unnecessary; the boot-ramp ops protocol likewise
+stays recommended until then.
 
 Applied once, from the platform's check_and_update_config.
 """

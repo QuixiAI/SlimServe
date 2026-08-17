@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import functools
+import os
 
 import numpy as np
 import torch
@@ -8,6 +10,37 @@ import torch
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+
+@functools.cache
+def _is_metal_platform() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_metal()
+
+
+# Ops kill-switch: =1 replaces the Metal completion event below with a full
+# torch.mps.synchronize() in get_output(). Costs the drafter-tail overlap
+# (~3-4% decode throughput measured on dsv4-xxs-1) but removes the event
+# from the completion path entirely if the parked-event wedge ever recurs.
+_METAL_DRAIN = os.environ.get("VLLM_QC_ASYNC_OUT_DRAIN", "0") == "1"
+
+
+def _metal_completion_event():
+    """Completion marker for the single MPS stream.
+
+    None when the drain kill-switch is armed; otherwise a native
+    torch.mps.Event recorded on the current (only) stream. Deliberately NOT
+    the generic torch.Event()/torch.Stream() machinery: MPS exposes exactly
+    one stream (torch.Stream(mps) always returns stream_id 0), and the
+    cross-"stream" record/wait_stream/set_stream choreography the CUDA path
+    uses has parked the engine forever in MPSEvent::synchronize on
+    timing-sensitive boots — GPU idle, signal never delivered (see
+    vllm/platforms/metal_compat.py for the incident history).
+    """
+    if _METAL_DRAIN:
+        return None
+    return torch.mps.Event()
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -27,11 +60,22 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.Event()
+        # On Metal this is a native torch.mps.Event on the one real stream
+        # and the copy_stream/main_stream handles are unused — see
+        # _metal_completion_event for why the generic path is unsafe there.
+        self._on_metal = _is_metal_platform()
+        self.copy_event = (
+            _metal_completion_event() if self._on_metal else torch.Event()
+        )
         self._has_fault: torch.Tensor | None = None
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        with (
+            contextlib.nullcontext()
+            if self._on_metal
+            else stream(copy_stream, main_stream)
+        ):
+            if not self._on_metal:
+                copy_stream.wait_stream(main_stream)
 
             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
@@ -50,10 +94,17 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(copy_stream)
+            if self._on_metal:
+                if self.copy_event is not None:
+                    self.copy_event.record()
+            else:
+                self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        if self.copy_event is None:
+            torch.mps.synchronize()
+        else:
+            self.copy_event.synchronize()
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -98,20 +149,36 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         self.pooler_output = pooler_output
         self.is_valid = is_valid
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.Event()
+        # Native mps event on Metal — see _metal_completion_event.
+        self._on_metal = _is_metal_platform()
+        self.copy_event = (
+            _metal_completion_event() if self._on_metal else torch.Event()
+        )
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        with (
+            contextlib.nullcontext()
+            if self._on_metal
+            else stream(copy_stream, main_stream)
+        ):
+            if not self._on_metal:
+                copy_stream.wait_stream(main_stream)
             self.pooler_output_cpu = self.pooler_output.to("cpu", non_blocking=True)
             if self.is_valid is not None:
                 self.is_valid_cpu = self.is_valid.to("cpu", non_blocking=True)
             else:
                 self.is_valid_cpu = None
-            self.copy_event.record(copy_stream)
+            if self._on_metal:
+                if self.copy_event is not None:
+                    self.copy_event.record()
+            else:
+                self.copy_event.record(copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
-        self.copy_event.synchronize()
+        if self.copy_event is None:
+            torch.mps.synchronize()
+        else:
+            self.copy_event.synchronize()
         if self.is_valid_cpu is not None:
             is_valid_cpu = self.is_valid_cpu.tolist()
             for i, is_valid in enumerate(is_valid_cpu):
