@@ -502,7 +502,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            # Grammar-aware DSpark advances a CPU matcher between sequential
+            # samples, which cannot execute inside a captured CUDA graph.
+            need_eager=is_profile or self.draft_grammar is not None,
         )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs

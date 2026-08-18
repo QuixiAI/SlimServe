@@ -34,13 +34,6 @@ class StructuredOutputsWorker:
         if not grammar_req_ids:
             return
 
-        # Asynchronously copy the bitmask to GPU.
-        current_stream = torch.accelerator.current_stream(self.device)
-        with stream(self.copy_stream, current_stream):
-            bitmask = async_copy_to_gpu(
-                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
-            )
-
         # Construct bitmask -> logits mapping
         mapping: list[int] = []
         req_ids = input_batch.req_ids
@@ -51,6 +44,30 @@ class StructuredOutputsWorker:
             logits_start_idx = cu_num_logits[req_idx]
             logits_end_idx = cu_num_logits[req_idx + 1]
             mapping.extend(range(logits_start_idx, logits_end_idx))
+
+        self.apply_grammar_bitmask_rows(logits, mapping, grammar_bitmask)
+
+    def apply_grammar_bitmask_rows(
+        self,
+        logits: torch.Tensor,
+        mapping: list[int],
+        grammar_bitmask: np.ndarray,
+        target_token_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Apply packed target-vocabulary masks to selected logits rows.
+
+        ``target_token_ids`` maps columns of a reduced draft vocabulary to
+        target token IDs. It is omitted for ordinary target-vocabulary logits.
+        """
+        if not mapping:
+            return
+
+        # Asynchronously copy the bitmask to GPU.
+        current_stream = torch.accelerator.current_stream(self.device)
+        with stream(self.copy_stream, current_stream):
+            bitmask = async_copy_to_gpu(
+                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
+            )
 
         # Asynchronously copy the mapping to GPU.
         with stream(self.copy_stream, current_stream):
@@ -73,7 +90,15 @@ class StructuredOutputsWorker:
         vocab_size = logits.shape[-1]
         from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
-        if logits.device.type == "mps":
+        if target_token_ids is not None:
+            target_token_ids = target_token_ids.to(logits.device, dtype=torch.int64)
+            masks = bitmask[:num_masks]
+            words = masks[:, target_token_ids // 32]
+            allowed = ((words >> (target_token_ids % 32)) & 1).bool()
+            selected = logits.index_select(0, logits_indices.to(torch.int64))
+            selected.masked_fill_(~allowed, float("-inf"))
+            logits.index_copy_(0, logits_indices.to(torch.int64), selected)
+        elif logits.device.type == "mps":
             masks = bitmask[:num_masks]
             bit_indices = torch.arange(vocab_size, device=logits.device)
             words = masks[:, bit_indices // 32]
