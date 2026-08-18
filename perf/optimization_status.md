@@ -9930,3 +9930,47 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   the native event type and pass alongside the full kernel suite; the
   M1 Ultra anchor/wedge validation is recorded in the entry above and
   was performed on PR #3's variant, whose event mechanism is identical.
+
+## 2026-08-17 — Grammar-aware DSpark for Responses custom tools on Metal
+
+- Status: implementation retained; post-tokenizer-fix end-to-end rerun pending.
+- Scope: `dsv4-xxs-1` on an Apple M1 Ultra with the 0731 DSV4 verifier,
+  matching DSpark k=5 drafter, TurboQuant draft KV, and the Responses
+  `apply_patch` custom tool using the Codex Lark grammar.
+- Baseline: target-token structured decoding was active, but DSpark sampled
+  every speculative token without the grammar mask. Mirroring the grammar by
+  blindly advancing every verified token then failed at the reasoning/DSML
+  boundary (`worker grammar rejected verified tokens [30]`).
+- Change: use scheduler `GrammarOutput` rows as the authoritative boundary,
+  maintain separate verified and speculative matchers, constrain each
+  sequential DSpark sample (including reduced Qwen-style draft vocabularies),
+  recover matcher rollback drift, and disable grammar-aware drafting per
+  request on mirror disagreement while leaving target enforcement active.
+  CPU matcher advancement forces the draft pass eager rather than capturing
+  it in a device graph.
+- Live correctness result before the tokenizer repair: the 93.57 GiB model
+  loaded and pinned 93.73 GiB; grammar-aware DSpark reached mean acceptance
+  6.00 with observed 80-100% draft-token acceptance. The original third-token
+  mirror crash was gone and the emitted prefix decoded exactly as the DSV4
+  DSML `apply_patch` envelope. Generation then stalled inside permissive
+  `filename: /(.+)/` by repeatedly selecting target token 0 (BOS).
+- Tokenizer root cause and offline fix: DSV4 exposes 1,283
+  `AddedToken(..., special=True)` entries at real target IDs, while
+  `TokenizerInfo.from_huggingface(..., vocab_size=129280)` reported zero
+  special IDs because the wrapper remapped the inferred added-token range.
+  The XGrammar backend now rebuilds its already-decoded vocabulary with every
+  in-range added special token empty. The real tokenizer probe changed the
+  recognized non-stop special count from 0 to 1,282, rejected BOS token 0
+  from `.+`, and kept ordinary filename tokens 30 (`<`) and 223 (space)
+  available.
+- Validation: focused grammar/DSpark/Metal tests pass (13 passed, 4
+  MPS-only cases skipped on the test runner); custom-tool, DSV4 parser, and
+  profile regressions pass (151 passed); Ruff and diff checks pass. The server
+  was stopped at the user's request and was not restarted, so the complete
+  post-fix `apply_patch` call remains an explicit follow-up rather than a
+  claimed pass.
+- Decision: retain the general scheduler-mask and tokenizer-metadata fixes.
+  Do not add DSML literals or DeepSeek token IDs to the inference core; model
+  envelope syntax remains owned by structural-tag adapters and tokenizer/chat
+  formatting. Raw server logs are local under
+  `/private/tmp/dsv4-grammar-server-*.log`.
