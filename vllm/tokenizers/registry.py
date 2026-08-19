@@ -224,15 +224,44 @@ def get_tokenizer(
             # tokenizer class itself is vendored from the release rather than
             # reimplemented, so the pre-tokenizer split stays identical.
             tok = build_kimi_k3_tokenizer_from_gguf(str(tokenizer_name))
-        elif gguf_architecture(str(tokenizer_name)) in ("muse-glimmer", "dflash"):
+        elif gguf_architecture(str(tokenizer_name)) == "qwen35":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                build_qwen35_tokenizer_from_gguf,
+            )
+
+            # `tokenizer.ggml.pre` is "qwen35"; the GLM4 split the generic
+            # builder applies differs on contraction case, digit grouping
+            # and marks.
+            tok = build_qwen35_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) == "dflash":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                is_dflash2_gguf,
+            )
+
+            # Three drafter families share the `dflash` architecture. The
+            # DeepSeek DSpark drafter carries no vocabulary, so of the
+            # files that can reach tokenizer construction, DFlash 2 ones
+            # carry the selector metadata (and a full qwen35 tokenizer);
+            # the rest are Muse-Glimmer's (llama4 pre).
+            if is_dflash2_gguf(str(tokenizer_name)):
+                from vllm.transformers_utils.gguf_qwen35 import (
+                    build_qwen35_tokenizer_from_gguf,
+                )
+
+                tok = build_qwen35_tokenizer_from_gguf(str(tokenizer_name))
+            else:
+                from vllm.transformers_utils.gguf_muse_glimmer import (
+                    build_muse_glimmer_tokenizer_from_gguf,
+                )
+
+                tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) == "muse-glimmer":
             from vllm.transformers_utils.gguf_muse_glimmer import (
                 build_muse_glimmer_tokenizer_from_gguf,
             )
 
             # `tokenizer.ggml.pre` is "llama4"; the GLM4 split the generic
             # builder applies would shift ids around digits and whitespace.
-            # The DeepSeek dflash drafter carries no vocabulary, so any
-            # `dflash` file reaching tokenizer construction is Muse-Glimmer's.
             tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
         else:
             from vllm.transformers_utils.gguf_native import (

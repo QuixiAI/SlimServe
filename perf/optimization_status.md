@@ -2498,7 +2498,7 @@ faithfully attends over a corrupted compressed (ratio-4) cache.
 Root cause is therefore ONE hop away, in the compressed-cache WRITE
 path (the MLA compressor / its cache insert) under chunked prefill:
 ~30% of a 1000-token request's 250 compressed groups holding garbage
-suggests whole chunks' compressed writes missing or mis-slotted (an
+suggests whole chunks' compressed writes missing or wrongly slotted (an
 offset relative to chunk start vs sequence start, or partial-group
 handling at chunk boundaries). The boot lottery falls out naturally:
 unwritten slots hold recycled allocator bytes, and whether those
@@ -4154,3 +4154,632 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   most of the model (on dynamic, gate/up are Q5_K with no native
   operand) plus ~15% fewer bytes/step. Download + bench in progress
   (--quant kquant-17gb).
+
+## 2026-08-19 (1) - NEW CAMPAIGN KICKOFF: Qwen3.8-27B + DFlash 2 on Metal
+
+- User mandate (2026-08-19): support a new SlimServe profile on Metal --
+  Qwen3.8-27B (unsloth UD-Q2_K_XL GGUF + mmproj-F16 vision tower)
+  speculated by the DFlash 2 drafter released 2026-08-18 by Inco AI
+  (z-lab/Qwen3.8-27B-DFlash2-GGUF, Q4_K_M). Prior Muse campaign state
+  is committed and pushed at `ad8e8e937`.
+- Artifacts (sizes from the HF tree API, hashes from the file pages):
+  - unsloth/Qwen3.8-27B-GGUF `Qwen3.8-27B-UD-Q2_K_XL.gguf`
+    10,676,423,744 B, sha256
+    46151b52a5cad673d90a00222103254864326c251130b8fc4381d6f34386b3c8
+  - unsloth/Qwen3.8-27B-GGUF `mmproj-F16.gguf` 927,607,488 B
+  - z-lab/Qwen3.8-27B-DFlash2-GGUF `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+    1,143,006,752 B, sha256
+    18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594
+- TARGET MODEL IS NOT MUSE-SHAPED: unsloth config.json says
+  Qwen3_5ForConditionalGeneration (model_type qwen3_5) -- 64 text
+  layers in a 3:1 hybrid (48 linear_attention gated-deltanet layers,
+  conv kernel 4, 16 K-heads/48 V-heads at 128 dim; 16 full_attention
+  layers, GQA 24/4, head_dim 256, partial rotary 0.25, MROPE
+  interleaved [11,11,10]), hidden 5120, vocab 248320, 262k ctx, native
+  MTP head (1 layer, unused by us), and a qwen3_5_vision tower (27
+  blocks, hidden 1152, patch 16, merge 2x2, out 5120). The linear
+  attention layers are the big Metal support question, not the drafter.
+- Drafter (incoai/Qwen3.8-27B-DFlash2 config.json): DFlash2DraftModel,
+  qwen3-classed, 5 layers, SWA 2048, heads 32/8 at 128 dim, hidden
+  5120, reads target_layer_ids [5, 19, 33, 47, 61]; dflash_config:
+  block_size 8, conv_kernel_size 2 (two-tap dynamic, group 16),
+  selector_rank 256, selector_top_k 16, mask_token_id 248070.
+- DFlash 2 = DFlash + two additions (blog, 2026-08-18): (a) a path
+  selector -- keep top-16 candidates per position, score adjacent pairs
+  S_t(a,b) = U_t(b) + <A(a) o H(h_t), B(b)> (low-rank bilinear, 256-d,
+  ~2M params, +0.6% cycle), then one greedy/sampled walk from the last
+  verified token; (b) two-tap dynamic depthwise convolutions before and
+  after every attention/MLP sublayer (k_t0*x_t + k_t1*x_{t-1}, base
+  kernel + per-16-channel content correction, first position taps the
+  last verified token) to kill suffix decay (+3% params, +0.7% cycle).
+  Rejection sampling is unchanged -- output provably identical.
+- Vendor numbers for THIS pairing (model card): mean acceptance 4.80 at
+  block 8 (GSM8K 5.46 / MATH-500 5.28 / HumanEval 4.39), 2.7-3.4x over
+  autoregressive at batch 1 in SGLang. Upstream vLLM launches it as
+  method "dflash" + num_speculative_tokens 7 -- DFlash2-ness comes from
+  the drafter's architecture, not a new method string. llama.cpp
+  support is an unmerged PR (master has DFlash 1 only, incl. spec-type
+  auto-detect #26814 and backend sampling #26958); oMLX also runs it
+  (blog demo on an M5 Max).
+- Next: map fork support surface (qwen3_5 target incl. gated-deltanet
+  linear attention on Metal, vision tower loading, dflash worker
+  changes for selector+conv), register the profile + sources, start the
+  ~12.7 GB download through SlimServe.
+
+## 2026-08-19 (2) - Support-Surface Map + Profile Registered (gated); Downloads Running
+
+- Fork scout (very thorough, full detail in HANDOFF.md): the slimserve
+  launcher needs ZERO code changes -- profiles.json is the only input,
+  the speculator engine block passes through verbatim to
+  SpeculativeConfig, and nothing in slimserve/ validates the method
+  string (vLLM does: pydantic Literal + extra="forbid" at
+  vllm/config/speculative.py:60-76, so keep method "dflash" like
+  upstream does for DFlash 2). The DFlash runtime is reusable end to
+  end: DFlashSpeculator's one-block layout (1 + k query rows),
+  prepare_dflash_inputs (Triton + native Metal op), embed/lm_head
+  sharing, rejection sampler. qwen3_dflash.py is the drafter base to
+  subclass (Muse precedent: override only precompute_and_store_context_kv
+  and get_top_tokens for Metal).
+- NOT reusable / absent: the fork's models dir is trimmed to 25 files --
+  no qwen3_5, no VL tower for it (registry entries for qwen3_vl etc. are
+  dead names). qwen3.py::Qwen3ForCausalLM is dense text-only. The GGUF
+  config parser and weight-adapter dispatch both hard-raise on unknown
+  general.architecture strings; the drafter dispatch is a two-way probe
+  on dflash.expert_count that needs a third branch for DFlash 2. The
+  fused Metal dflash_sample_greedy is gated m in [9,17]; block 8 = 8
+  rows falls outside it -- and DFlash 2 needs top-16 + path walk, not
+  argmax, so draft sampling is new work regardless (eager first).
+- THE BIG LIFT: 48 gated-deltanet linear-attention layers on Metal
+  (recurrent fp32 state + short causal conv, conv kernel 4). No Metal
+  kernel exists. References: upstream vLLM qwen3_next GDN Triton
+  kernels, llama.cpp qwen3.5 (tensor naming + CPU/Metal reference), our
+  hybrid KV manager from the Muse SWA/global split. Full-attention
+  layers (16) reuse the Metal GQA path but need head_dim 256 + partial
+  RoPE 0.25 + interleaved MRoPE checked against kernel support.
+- Registered (uncommitted): sources["qwen38-27b"] + gated
+  profiles["qwen38-q2kxl-1"] ("in-progress" -- the CLI refuses to serve
+  until the path is real; live validation therefore skips it). Engine:
+  reasoning_parser qwen3, tool_call_parser qwen3_xml (NEEDS LIVE
+  VALIDATION -- picked as the Qwen3.5-era XML format parser),
+  enable_prefix_caching false (recurrent state), num_speculative_tokens
+  7, kv_cache_dtype auto. tests/slimserve/test_profiles.py updated: 48
+  pass (source-set pin + modalities + the thinking/tool-calling default
+  gate, which is what forced the tool_call_parser choice).
+- Downloads running in the background via
+  slimserve.fetch.ensure(plan, assume_yes=True) called from Python (the
+  status gate blocks even --dry-run for in-progress profiles; using the
+  fetch module keeps SlimServe the download owner). 12.7 GB total to
+  ~/models/Qwen3.8-27B-GGUF and ~/models/Qwen3.8-27B-DFlash2-GGUF.
+- Next: GGUF ground truth (dump general.architecture + full metadata of
+  both files; the config-parser and adapter branches key off it), then
+  target text model (gated deltanet on Metal is the critical path),
+  vision tower, drafter class with convs+selector, speculator top-16
+  path-walk extension. Staged plan with file:line anchors in HANDOFF.md.
+
+## 2026-08-19 (3) - GGUF Ground Truth + DFlash 2 Reference Implementation Extracted
+
+- GGUF arch strings confirmed WITHOUT waiting for downloads (HF API
+  ?expand[]=gguf): target = "qwen35" (llama.cpp's exact arch name),
+  drafter = "dflash" -- the SAME string as the Muse and DSV4 drafters.
+  The fork's two-way drafter probe (dflash.expert_count) becomes
+  three-way; the DFlash 2 discriminator is `dflash.selector_rank` (or
+  the selector_hidden.weight tensor -- llama.cpp gates on the tensor).
+- llama.cpp DFlash 2 reference FETCHED: PR #27342 ("spec : add DFlash2
+  support (local convolution + candidate selector)"), single commit
+  5ecbe1ac1 on recent master, now at branch `dflash2-pr` in ~/llama.cpp.
+  Master also has arch LLM_ARCH_QWEN35 -- a working CPU/Metal reference
+  for the hybrid target (recurrent-state model list, rs_rollback).
+- Extracted drafter spec (llama-arch + src/models/dflash.cpp):
+  - Metadata keys: dflash.block_size / conv_kernel_size / conv_group_size
+    / selector_rank / selector_top_k.
+  - Tensors: per layer `blk.N.attn_conv_base` {n_embd, kernel=2, 2},
+    `blk.N.attn_conv_proj` {n_embd, 2*kernel*n_groups}, same pair for
+    ffn_conv; top-level `selector_predecessor` {rank, n_vocab} (A, a
+    token-embedding table), `selector_successor` {rank, n_vocab} (B),
+    `selector_hidden` {n_embd, rank} (H). n_groups = n_embd /
+    conv_group_size = 5120/16 = 320.
+  - Conv placement per layer: dynamic = conv_proj @ normed_hidden,
+    computed ONCE per sublayer pair; side 0 applied to the sublayer
+    INPUT (pre-attn on noise_norm, pre-ffn on cur), side 1 to the
+    sublayer OUTPUT, same dynamic. Conv math: for tap t in {0,1}:
+    out += (base[:,t,side] + repeat_per_group(coeff[group,t,side])) *
+    shift_block_local(x, t) -- shift zero-pads at block row 0, which IS
+    the anchor/verified token in the 1+N layout, so position 1's tap-1
+    naturally reads the last verified token (blog fig. 4).
+  - Selector graph (post-sampling, per block): candidates =
+    top_k(logits, 16); unary U = logits gathered at candidates; gate =
+    selector_hidden @ hidden per position; for pos >= 1: A =
+    get_rows(selector_predecessor, pos==1 ? anchor_id :
+    prev candidates), scores[a,b] = <A(a) * gate_pos, B(b)> + U_pos[b]
+    -> 16x16 matrix; graph packs [candidate_ids(f32), scores(256)] per
+    position into a lattice row (padded to n_embd) returned instead of
+    logits ("DFlash2 never consumes raw logits").
+  - Host walk: predecessor := 0 (pos-1 matrix rows are identical --
+    repeated across the anchor); per pos: greedy argmax over
+    scores[predecessor, :] at T=0, else softmax((s - max)/T) sample,
+    KEEPING the 16-way distribution per position for lossless rejection
+    sampling downstream.
+- vLLM mapping decided: keep method "dflash" (upstream does); the
+  selector walk replaces get_top_tokens/argmax in DFlashSpeculator when
+  the drafter config carries selector_rank; convs live inside the new
+  drafter model class (DFlashQwen3 base + 2 conv-proj GEMMs and 4
+  two-tap conv applications per layer, all block-local elementwise --
+  Metal-friendly, no new kernel needed for correctness, fusion later).
+- Also confirmed: the fork ALREADY vendors the full upstream GDN stack
+  (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py --
+  "Inference-only Qwen3-Next/Qwen3.5", plus fla ops under
+  vllm/third_party/flash_linear_attention) but it is Triton/CUDA-bound;
+  Metal needs torch-native MPS or Metal-kernel equivalents of
+  chunk_gated_delta_rule / causal_conv1d / fused recurrent decode. The
+  layer/topology code is reusable as the algorithm reference in-tree.
+
+## 2026-08-19 (4) - Target Text-Model Chain Vendored + Fetch Resume Bug Fixed
+
+- Vendored (dense-trimmed, agent-executed, verified): models/qwen3_next.py
+  (837 -> 610 lines, MoE/EPLB/sequence-parallel dropped, MLP inlined,
+  CUDA-only fused_qk_rmsnorm_rope_gate dropped -- eager split+QK-norm+RoPE
+  kept) and models/qwen3_5.py (742 -> 400, dense text-only;
+  ForConditionalGeneration deferred to the Muse vision pattern), plus
+  configs/qwen3_5.py (upstream, MoE-free) and a thin configs/qwen3_next.py
+  re-export (transformers 5.14.1 ships Qwen3NextConfig) -- the fork's
+  configs/__init__.py had DANGLING registrations for all of these, now
+  healed. Registry: +Qwen3_5ForCausalLM, dead Moe multimodal entry
+  removed. Import + registry resolution verified on this machine (hybrid,
+  inner-state); ruff clean.
+- mamba_mixer2.py did NOT exist in the fork (GDN layer hard-imports
+  mamba_v2_sharded_weight_loader from it). Vendored a minimal module with
+  just that function; the FULL GDN module chain now imports on Metal
+  (Triton placeholder engages at import; runtime kernels remain the
+  campaign's critical path).
+- Runtime landmines logged for the GDN stage: QwenGatedDeltaNetAttention
+  picks forward_cuda on Metal (only xpu/cpu/rocm special-cased);
+  torch.ops.vllm.qwen_gdn_attention_core + RMSNormGated device pick will
+  need a Metal dispatch; v1/attention/backends/gdn_attn.py imports but
+  its kernels are CUDA.
+- FETCH RESUME BUG (slimserve/fetch.py): a short read (server closed the
+  stream at 9.83 of 10.7 GB) hit the `done != bytes` branch which
+  UNLINKED the .part before raising -- 9.8 GB discarded, restart from
+  zero. Fixed: keep the .part on short read (transport failure, not
+  corruption; the next attempt resumes via Range); the sha256-mismatch
+  branch still deletes. Download relaunched with a 20-retry wrapper
+  (scratchpad/fetch_qwen38.py).
+
+## 2026-08-19 (5) - GGUF Parsers Landed: Drafter Config + Tokenizer Verified Against The File
+
+- Drafter + mmproj side-fetched ahead of the 10.7 GB model (both dumped;
+  full ground truth in perf/qwen38_metal_design.md). Deltas vs the HF
+  configs worth remembering: mmproj image_size is 768 (HF vision config
+  implied bigger), projector `qwen3vl_merger`; drafter target_layers are
+  1-BASED [6,20,34,48,62] in GGUF, `dflash.attention.causal = False`
+  EXPLICIT (all 5 layers non-causal despite an all-True SWA pattern +
+  window 2048 -- the fork's per-layer causal table must obey the
+  override), block_size 8 COUNTS the anchor row (7 drafted), selector
+  A/B tables are Q4_K-quantized {256, 248320}, conv bases F32.
+- Landed: vllm/transformers_utils/gguf_qwen35.py
+  (build_qwen35_config_from_gguf for the target -- UNVERIFIED until the
+  model file completes; build_qwen38_dflash2_config_from_gguf +
+  build_qwen35_tokenizer_from_gguf + is_dflash2_gguf -- VERIFIED against
+  the drafter file: config fields all correct, tokenizer roundtrip OK
+  with the qwen35 pre split vendored from llama-vocab.cpp into
+  gguf_native.QWEN35_PRETOKENIZER_REGEX). gguf_config_parser.py: qwen35
+  branch + three-way dflash probe (expert_count -> DSV4, selector_rank
+  -> DFlash 2, else Muse). tokenizers/registry.py: qwen35 branch + the
+  dflash branch now discriminates DFlash 2 (which carries a full qwen35
+  tokenizer) from Muse instead of hard-assuming Muse.
+- Bug found while testing: transformers Qwen3Config NULLS sliding_window
+  unless use_sliding_window=True -- pinned after construction. (Muse
+  avoided this by using its own config class.)
+- Next: drafter model class (DFlash2QwenDraftModel = DFlashQwen3 base +
+  4 conv applications/2 dynamic projections per layer + selector head),
+  drafter GGUF weight adapter, speculator selector walk; then the target
+  side (weight adapter + GDN Metal runtime).
+
+## 2026-08-19 (6) - DFlash 2 Drafter Model Class + GGUF Adapter Landed (unit-verified)
+
+- vllm/model_executor/models/qwen3_dflash2.py: DFlash2QwenDecoderLayer
+  (two-tap dynamic conv around every attn/MLP sublayer; one coefficient
+  projection per sublayer pair reused for both sides; block-local shift
+  zero-padded at the anchor row; non-divisible token counts treated as
+  one block for profiling runs), DFlash2QwenModel (layers swapped via a
+  new decoder_layer_cls hook on DFlashQwen3Model -- 2-line base change;
+  Metal-native context-KV precompute BORROWED from the Muse drafter --
+  the method is model-agnostic), DFlash2QwenDraftModel (shared
+  embed/lm_head contract like Muse; selector A/B embeddings + H gate;
+  select_draft_path implements the greedy walk WITHOUT materializing the
+  16x16 lattice -- only the realized predecessor's score row is computed,
+  7 batched steps of (n_blocks, 16) work). Registered as
+  DFlash2QwenDraftModel -> qwen3_dflash2.
+- UNIT-VERIFIED: conv math exact (0.0 max err) against a naive per-token
+  per-tap reference on both sides; selector walk token-identical to a
+  manual step-by-step reference; import + registry resolution clean.
+- gguf_adapters/qwen3_dflash2.py: extends the Muse drafter adapter
+  (backbone schema is identical); adds conv + selector name mappings and
+  dequantizes the Q4_K conv projections and selector tables at load
+  (plain fp16 modules; ~270 MB total). Loader dispatch extended with the
+  selector_rank probe. NAME-MAP COMPLETENESS VERIFIED against the real
+  file: 81/81 tensors mapped, zero unmapped, zero spurious entries.
+- Temperature>0 selector sampling (keeping per-position 16-way
+  distributions for lossless rejection) is deliberately deferred; the
+  serving bench path is greedy.
+- REMAINING drafter-side: speculator wiring (call select_draft_path
+  instead of top-1 argmax when the drafter has a selector; plumb anchor
+  token ids; respect causal=False non-causal attention on Metal), then
+  an end-to-end drafter load test -- blocked on the target model
+  existing, since the drafter shares its embed/lm_head.
+
+## 2026-08-19 (7) - All Artifacts Local + Target Ground Truth; Registry Byte Bug; Quant-Matrix Finding
+
+- CORRECTION to (1): the model file's true size is 9,828,981,664 B and
+  its sha256 is fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0
+  (LFS oid, confirmed via content-length AND the paths-info API). The
+  10,676,423,744 B + 46151b52... recorded at kickoff came from
+  small-model WebFetch summaries of the HF tree/blob pages and were
+  WRONG; the drafter and mmproj rows were right. Lesson: registry
+  bytes/sha come from `curl -I` content-length or the paths-info API
+  verbatim, never from a summarized page. The wrong byte count caused
+  every completed download to be rejected as a short read (the stream
+  "ended early" at exactly the true size). profiles.json corrected
+  (+ sha256 now recorded for the model file); fetch._download grew an
+  already-complete-.part fast path (validate + rename, no network), and
+  the finalize tail is factored into _finalize.
+- FETCH COMPLETE, all three artifacts sha/size-validated in ~/models.
+  Target config builder + qwen35 tokenizer VERIFIED against the model
+  file: 64 layers (48 linear, 16 full at idxs 3,7,...,63), heads 24/4 at
+  256, MRoPE sections [11,11,10] interleaved partial 0.25, GDN dims
+  16K/48V at 128 conv 4, vocab 248320, MTP layer (block_count 65)
+  excluded. Tokenizer roundtrip OK.
+- Target tensor ground truth (866 tensors; design doc updated): full
+  layers ship SPLIT q/k/v with the output gate FUSED INSIDE attn_q
+  (width 12288 = 24*256*2); linear layers ship FUSED attn_qkv (10240)
+  + attn_gate; pre-FFN norm is `post_attention_norm`; blk.64 = MTP,
+  skip.
+- THE QUANT-MATRIX FINDING: UD-Q2_K_XL spreads 15 tensor types incl.
+  NINE i-quant formats (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
+  IQ4_XS + Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) across attn/ffn/ssm
+  projections. Muse Metal kernels cover K-quants only; DSV4 Metal adds
+  IQ2_XXS/Q2_K. Bring-up: load-time dequant for unsupported formats
+  (correctness first), then native Metal decode per format ranked by
+  bytes/step; llama.cpp ggml-metal (serves this exact artifact) is the
+  porting reference. This materially widens the kernel workstream vs
+  Muse.
+
+## 2026-08-20 (8) - Target GGUF Adapter Landed; Metal Kernel Audit; A_log Trap Caught
+
+- Metal quant-kernel audit (design doc updated): qgemv covers q8_0, q2_K
+  q3_K, q4_K, q5_K, q6_K, iq1_s, iq2_xxs, iq2_xs, iq3_xxs, iq4_xs,
+  iq4_nl; qgemm (M>1) covers the same MINUS iq2_xs and iq1_s. The
+  artifact's formats missing from EITHER path: IQ1_S, IQ1_M, IQ2_XS,
+  IQ2_S, IQ3_S = 179 tensors, 3.6 GiB quantized -> 22.3 GiB fp16 at
+  load-time dequant (bring-up plan; model resident ~28 GiB vs 9.2).
+  Native decode for those five formats is REQUIRED for the perf target
+  (fp16 layers triple bytes/step); llama.cpp ggml-metal is the port
+  reference.
+- gguf_adapters/qwen35.py landed + loader dispatch: layer-type-aware
+  name map (split q/k/v full layers with the gate fused inside attn_q --
+  passes through, the vendored attention declares the doubled q shard;
+  fused attn_qkv -> in_proj_qkv / attn_gate -> in_proj_z on GDN layers,
+  a 1:1 match with the vendored stacking mapper), MTP block unmapped
+  (iterator skips), conv1d reshaped (dim, kernel) -> (dim, 1, kernel),
+  embed table dequantized (Q2_K). VERIFIED against the file: 851/851
+  non-MTP tensors mapped bidirectionally, 15 MTP skipped.
+- A_LOG TRAP CAUGHT BEFORE IT SHIPPED: GGUF `ssm_a` stores the no-scan
+  form -exp(A_log) (llama.cpp multiplies it in directly:
+  "gate = alpha_softplus * ssm_a"); the vLLM fla kernels compute
+  -exp(A_log) themselves (fused_gdn_prefill_post_conv.py:136). The
+  adapter converts A_log = log(-ssm_a). Silent-garbage class of bug;
+  ground-truth discipline paid for itself.
+- First engine load test RUNNING (no-spec, max_model_len 8192): expect
+  weight loading to complete and the profiling forward to crash inside
+  the GDN Triton ops -- the crash site defines the next work item (the
+  torch-native MPS GDN runtime).
+
+## 2026-08-20 (9) - First Engine Bring-Up Arc: Four Blockers Fixed In Sequence
+
+Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
+
+1. slimserve engine_kwargs leaked `tool_call_parser` (an api_server
+   flag) into EngineArgs -- added to _SERVE_ONLY (serve_argv still
+   passes it to the server).
+2. Spawned EngineCore re-imports the launcher script: load scripts need
+   a __main__ guard (scratchpad script fixed; not a repo bug).
+3. MetalPlatform had no current_device() -- the GDN layer's RMSNormGated
+   init calls current_platform.current_device() (only CUDA implemented
+   it). Added classmethod returning "mps" to vllm/platforms/metal.py.
+4. GGUF quant config demands all shards of a fused module agree on
+   quantized-vs-skipped (is_layer_skipped_gguf): per-tensor dequant of
+   attn_qkv (IQ2_S) left in_proj_z quantized inside in_proj_qkvz.
+   Adapter now expands the dequant set to whole fused groups.
+5. The vendored qwen3_5 stacked mapper sends in_proj_qkv in with a
+   TUPLE shard id (0,1,2) -- the fused-module-from-checkpoint loader
+   path cannot split quantized bytes (GGUFUninitializedWeightTypeParameter
+   has no output_dim). Fix: GGUF quantizes each output row independently
+   and the reader hands data as (rows, bytes_per_row), so the adapter
+   row-slices attn_qkv into q/k/v (2048/2048/6144 rows) and emits
+   per-shard names in_proj_{q,k,v}_shard mapped to scalar shard ids --
+   suffix chosen to avoid the mapper's substring collisions
+   (".in_proj_q" would corrupt ".in_proj_qkvz" names). Muse's mixed-type
+   merged QKV (q4/q4/q6) is the precedent that scalar-shard GGUF merged
+   loading works.
+
+## 2026-08-20 (10) - WEIGHTS LOAD END TO END; GDN Torch-Native MPS Core In Flight
+
+- After the (9) fixes the load test progressed through model
+  construction AND full weight loading: 1250 tensors in ~70 s (row-split
+  qkv shards + 179 dequantized i-quant tensors + embed table). The
+  profiling forward then hit the predicted wall: GDN
+  _warmup_prefill_kernels -> fused_post_conv_prep -> Triton placeholder
+  (qwen_gdn_linear_attn.py:1033; CustomOp routes Metal to forward_mps
+  which defaults to forward_native = the fla Triton path).
+- Extracted the COMPLETE recurrence semantics from the in-tree Triton
+  sources (fused_recurrent.py:122-175, fused_sigmoid_gating.py:125-135,
+  call site :1610): per v-head fp32 state S[V=128,K=128], kv-head =
+  hv // 3; per token: l2norm(q,k) (eps 1e-6 inside sqrt), q *=
+  head_k_dim**-0.5, g = -exp(A_log)*softplus(a+dt_bias), S *= exp(g),
+  delta = (v - S@k) * sigmoid(b), S += outer(delta, k), o = S@q. Conv:
+  depthwise kernel-4 causal + SiLU over packed qkv (10240 dims), state
+  (slots, dim, 3) via is_conv_state_dim_first.
+- Agent task in flight: forward_mps + _forward_core_mps in
+  qwen_gdn_linear_attn.py (torch-native, fp32 state, varlen prefill +
+  decode, spec masks NotImplemented for now), verified against a
+  line-by-line numpy transcription of the Triton kernel before touching
+  the engine, then drive the load test to ENGINE UP or the next
+  non-GDN blocker.
+
+## 2026-08-20 (11) - llama.cpp Parity Oracle: Stale-Binary Detour, Clean Rebuild Running
+
+- Started the llama.cpp reference lane (parity oracle + perf bar for
+  this exact UD-Q2_K_XL artifact). First run failed: "missing tensor
+  blk.64.ssm_conv1d.weight" -- the server treated the MTP block as a
+  recurrent layer (printed n_layer 65, no nextn). Static analysis of
+  master's qwen35.cpp showed correct logic (nextn read before the
+  recurrent-layer fallback, guard i < n_layer()); the contradiction
+  resolved as a STALE BINARY: build/bin/llama-server was from April
+  (predating the July nextn/MTP handling; the arch itself is older, so
+  it loaded far enough to fail late), and `cmake --build` in the stale
+  dir exited 0 while rebuilding nothing. Clean out-of-source rebuild
+  (build-qwen38, Metal on) running. Lesson: verify the binary carries a
+  known-new string before trusting a reference measurement from a
+  prebuilt tree (`strings | grep` the assert text).
+- Also confirmed while scoping post-GDN risks: interleaved MRoPE is
+  pure torch (mrope_interleaved.py uses forward_native -- MPS-safe),
+  runner mrope plumbing exists in v1/worker/gpu (model_states/default,
+  mm/rope), MambaSpec hybrid state allocation is handled in the
+  worker's attn_utils, and metal_attn carries a per-metadata `causal`
+  flag (Muse-era) so the DFlash 2 drafter's all-non-causal attention
+  has a route.
+
+## 2026-08-20 (12) - llama.cpp Reference Baseline CAPTURED (this artifact, this box)
+
+- Clean build-qwen38 (master ece963f41, Metal; the env's custom-LLVM
+  LDFLAGS/CPPFLAGS must be unset -- they poison the dylib link with
+  missing C++ ABI symbols). Serves UD-Q2_K_XL correctly (MTP block
+  handled; n_layer 64).
+- PLAIN DECODE BAR: 35.67 / 35.37 / 33.55 tok/s (256-token greedy essay
+  prompt, matched positions; the familiar thermal decline), code prompt
+  34.35. Prefill 38.1 tok/s on the 11-token prompt (not meaningful).
+- Greedy output IDENTICAL across 3 runs -- llama.cpp is a deterministic
+  parity oracle for this artifact. The model thinks in <think> blocks on
+  the code prompt (chat-template-free /completion).
+- Raw JSON + server log: perf/results/2026-08-20/qwen38-llamacpp-ref/.
+- Campaign math: DFlash 2 vendor multiplier 2.7-3.4x over plain =>
+  llama.cpp-level step time + working DFlash 2 implies ~90-120 tok/s
+  spec on this box. Our plain bar to beat first: 35.67.
+
+## 2026-08-20 (13) - GDN MPS Core LANDED (verified 1.4e-6); IQ Tile Routing Gap Fixed
+
+- Agent-implemented torch-native GDN path in qwen_gdn_linear_attn.py
+  (+343 lines, no other files): Metal dispatch branch, forward_mps
+  (both qkvz layouts), _forward_core_mps (batched decode across all
+  sequences/heads incl. NULL-slot masking matching the Triton skip
+  semantics; per-sequence varlen prefill scan with initial-state load +
+  final-state scatter; spec masks NotImplementedError until the DFlash 2
+  wiring; fp32 state), plus pure conv/scan helpers. VERIFIED against a
+  line-by-line numpy port of the Triton kernels on CPU AND MPS: decode
+  T=1, varlen [5,9,3] and T<width edge cases, with/without initial
+  state, toy and real (16/48/128/128, dim-10240 conv) shapes -- max abs
+  err 1.4e-6 (gate 1e-4), conv state writebacks bit-exact.
+- Engine then advanced to the third GDN layer's out_proj and exposed a
+  GENERAL GGUF-Metal routing gap: MMQ_QUANT_TYPES lists only IQ2_XXS
+  (true for CUDA MMQ) so IQ3_XXS/IQ4_XS/IQ2_XS/IQ1_S at M > mmvq_safe
+  fell through to ggml_dequantize = NotImplementedError on Metal --
+  but qgemm.metal HAS tiles for all of them (iq1_s, iq2_xxs, iq2_xs,
+  iq3_xxs, iq4_xs, iq4_nl). Fix: METAL_MMQ_QUANT_TYPES in gguf/utils.py
+  + platform-aware pick in _fused_mul_mat_gguf. NUMERICALLY VERIFIED on
+  MPS with real tensors from the artifact (M=64 vs gguf-py dequant
+  ground truth): all five formats correct, max rel-to-mean err 0.3-1.5%
+  = fp16 accumulation noise.
+- Load-time dequant list SHRINKS to the formats with no Metal kernel at
+  all: {IQ1_M, IQ2_S, IQ3_S} = 125 tensors, 2.65 -> 14.65 GiB fp16
+  (+12 GiB; model resident ~21 GiB vs the previous plan's ~28).
+- Load test rerunning.
+
+## 2026-08-20 (14) - FIRST END-TO-END TOKENS (garbage); Bisect: Matmuls Exonerated
+
+- ENGINE UP + GENERATED through the full SlimServe-owned path: load,
+  profiling, KV/state allocation, prefill, 8 decode steps. Output is
+  garbage ('g:...0...arks' + CJK/byte soup) -- a correctness hunt, with
+  llama.cpp as the oracle (same artifact, deterministic).
+- Facts so far: tokenizer EXONERATED (prompt ids byte-identical to
+  llama.cpp /tokenize); step-0 top-5 is alien ('g','n','c','ch','3' vs
+  oracle ':',' speed',' as'), so PREFILL compute is wrong, not decode.
+  ssm_a EXONERATED (values all negative, magnitudes e^-5.5..e^-1 --
+  confirmed no-scan form; A_log = log(-ssm_a) correct). Full-attn
+  q|gate interleave MATCHES llama.cpp (per-head [q(256)|gate(256)],
+  view offsets in qwen35.cpp:273-297 == vendored chunk(dim=-1)).
+- Quantized matmuls EXONERATED at engine-realistic sizes: routed real
+  artifact tensors through _fused_mul_mat_gguf (the real router incl.
+  the muse sm-band 9..32) at M in {1,2,8,11,17}: ALL formats rel err
+  0.2-1.3% (fp16 accumulation). Latent gap found: M>=33 with quantized
+  N%32!=0 falls to the unimplemented Metal dequant (real modules there
+  are fused past N%32 -- in_proj_ba is 96 rows -- so not the garbage
+  source; logged as a routing TODO).
+- Next discriminator running: 1-token prompt ("Paris") -- position 0
+  makes RoPE identity and the GDN scan single-step, splitting
+  weights/norm-layout bugs from position/mask/scan bugs.
+
+## 2026-08-20 (15) - Discriminator: Pos-0 Plausible, Length Breaks It; Parity Hunt Launched
+
+- 1-token prompt "Paris": our top-5 ['-', '-P', '', '-Pro', '－'] --
+  PLAUSIBLE continuations (oracle: [',', ' ', ' (', ' -', "'t"]; note
+  ' -' appears in the oracle's own top-5). 11-token prompt: letter soup
+  (top-1 'g'). Decode from either degrades into byte soup within
+  ~2 steps.
+- Reading: weights, layouts, norms-as-weights, matmuls, tokenizer all
+  approximately right (a hard layout bug would not produce
+  "Paris-Provence"-style continuations). The failure grows with
+  SEQUENCE structure: prefill scan/conv over length, state writeback at
+  the prefill->decode boundary (ONETOK decode step 1 is already
+  garbage), or pos>0 attention/rope on the 16 full layers.
+- Checked: MRoPE with 1-D text positions bypasses the section logic
+  entirely (mrope.py forward_native) = standard partial NEOX rope over
+  64 dims, matching llama.cpp text semantics structurally.
+- Agent launched: layer-by-layer parity vs llama.cpp eval-callback on
+  the fixed 11-token prompt (env-gated per-layer dumps on our side;
+  cosine-per-position; drill into the first diverging layer's stages).
+  Top suspect flagged for it: the residual/norm WIRING order
+  (post_attention_norm as sandwich vs pre-norm placement) -- exactly the
+  class of bug that is invisible at pos-0-dominated single-token
+  forwards and catastrophic with length.
+
+## 2026-08-20 (16) - Housekeeping While Parity Hunt Runs: Regression Green, M>=33 Gap Closed
+
+- Regression sweep over the shared-file edits (tokenizer registry
+  reorder, dflash discriminators, METAL_MMQ routing, metal.py
+  current_device, qwen3_dflash decoder_layer_cls hook): 48 profile
+  tests pass; registry resolves all four model classes (Muse x2,
+  DFlash2, Qwen3_5). Full Muse serving smoke deferred to the pre-commit
+  gate (needs the GPU the parity hunt is using).
+- The M>=33 latent gap from (14) is closed: on Metal, quantized shapes
+  the tile cannot take (N % 32 != 0) past the vector-kernel batch limit
+  now chunk rows through ggml_mul_mat_vec_a8 instead of falling into
+  the unimplemented dequant. Verified on the raw 48-row Q8_0 tensor at
+  M in {33, 64, 100}: rel err 0.16-0.23%.
+
+## 2026-08-20 (17) - PARITY FOUND: Two Load-Convention Bugs; ESSAY Step-0 Now Matches Oracle Exactly
+
+- Method: llama.cpp eval-callback (build-qwen38, -ngl 99) on the fixed
+  11-token ESSAY prompt vs env-gated per-layer dumps from our engine
+  (VLLM_QWEN38_DEBUG_DUMP hooks in vendored qwen3_5.py; scratchpad
+  compare_forward.py samples llama.cpp's printed head/tail values +
+  full-tensor sums per node).
+- FIRST DIVERGENCE: layer 0 `attn_norm` (the very first RMSNorm).
+  cos 0.9994 but magnitude ~1.95x. Cause: llama.cpp's converter folds
+  +1 into every `*norm.weight` except `linear_attn.norm.weight`
+  (~/llama.cpp/conversion/qwen.py:394), and our vendored model uses
+  GemmaRMSNorm (x_hat * (1 + w)) -- we were computing x_hat * (w_hf + 2)
+  on every input/post-attn/q/k/final norm. GGUF norm means measured
+  ~0.97/1.23/1.94 (= HF + 1). FIX: `_degemma_gguf_norms` in
+  vllm/model_executor/models/qwen3_5.py subtracts 1 at load when
+  quantization == "gguf" (adapters untouched per constraints).
+- SECOND BUG (code-proven, then confirmed by parity): the converter's
+  `_LinearAttentionVReorderBase` stores every per-V-head GDN tensor
+  (qkv V rows, z/b/a rows, A_log, dt_bias, conv1d V channels, out_proj
+  COLUMNS) in ggml tiled-broadcast order -- q/k -> v pairing becomes
+  i_k = i_hv % 16, not HF's i_hv // 3. Our MPS scan used
+  repeat_interleave (HF grouped). Layout is self-consistent (out_proj
+  cols are quantized Q3K/Q4K/IQ* so un-permuting at load is
+  infeasible), so the FIX flips the expansion to tile semantics:
+  cfg.gdn_tiled_v_head_layout in gguf_qwen35.py; tiled_gqa branch in
+  _gdn_recurrent_scan_native (qwen_gdn_linear_attn.py), both MPS call
+  sites (decode + prefill). Explains the pos-0-plausible /
+  wrong-at-length signature: at t=0 the mispairing only swaps
+  similar-magnitude q.k scalars; the recurrent state then compounds it.
+- RESULT: layer-by-layer parity across ALL 64 layers, cos >= 0.9997 at
+  every attn_in/attn_out/l_out reference point (was cos ~0.1-0.5 from
+  layer 0). ESSAY step-0 top-5: [':' -1.04, ' speed' -2.04, ' as'
+  -2.79, ' completeness' -3.11, ' (' -3.48] vs oracle [':' -1.01,
+  ' speed' -2.07, ' as' -2.78, ' completeness' -3.14, ' (' -3.49].
+  CUDA/ROCm FLA kernels still assume HF grouped order -- flagged in
+  the module comment; must be wired before any non-Metal GGUF serving.
+- Diagnostics to remove later: the _Qwen38DumpState block in
+  qwen3_5.py (env-gated, zero-cost when VLLM_QWEN38_DEBUG_DUMP unset).
+  Raw logs: scratchpad llamacpp_eval_11tok.log, dump/our_forward*.npz,
+  probe_dump*.log.
+
+## 2026-08-20 (18) - ROOT CAUSES FOUND AND FIXED: Converter Conventions, Not Our Math
+
+- The parity hunt (llama.cpp eval-callback vs env-gated per-layer dumps,
+  11-token prompt) put first divergence at LAYER 0's attn_norm: cos
+  0.9994 but magnitude x1.95 -- and exposed TWO llama.cpp GGUF-CONVERTER
+  conventions our path did not undo:
+  1. NORM +1 FOLD (conversion/qwen.py:394): every *norm.weight except
+     linear_attn.norm carries +1 so ggml's plain RMS_NORM*w reproduces
+     HF's zero-centered Gemma-style norms. Our GemmaRMSNorm re-adds +1
+     at runtime -> effectively x_hat*(w_hf+2) on all 64 layers. Fix:
+     _degemma_gguf_norms subtracts 1.0 at load (gguf sources only).
+  2. GDN TILED V-HEAD ORDER (conversion/qwen.py:446-609): when
+     K-heads != V-heads the converter stores every per-V-head GDN tensor
+     in tiled-broadcast order -- GGUF v-head j pairs with k-head j % 16,
+     not HF's j // 3. Our scan used repeat_interleave (HF/Triton
+     convention) -> every v-head read the WRONG q/k head. Self-consistent
+     layout otherwise, so pos-0 stayed plausible while the recurrent
+     state scrambled with length -- the exact discriminator signature.
+     Fix: cfg.gdn_tiled_v_head_layout=True + tiled_gqa flag in the MPS
+     scan (un-permuting at load is infeasible: out_proj columns are
+     quantized). NOTE for any future CUDA run of this GGUF: the FLA
+     Triton kernels still assume grouped order.
+- VERIFIED: all 64 layers cos >= 0.9997 vs llama.cpp at every reference
+  point (was 0.1-0.5 from layer 0); ESSAY step-0 top-5 matches the
+  oracle within 0.04 nats across all five; greedy decode coherent and
+  oracle-matching (":\n\n1.  **Completeness"). 48 profile tests pass.
+- Diagnostics to remove before commit: _Qwen38DumpState in qwen3_5.py
+  (env-gated, zero-cost unset). Raw artifacts: scratchpad
+  llamacpp_eval_11tok.log, dump/our_forward*.npz, compare_forward.py.
+- Parity + first-tok/s bench running (pre-staged script; 3 greedy
+  256-token repeats + prefix-match vs the oracle).
+
+## 2026-08-20 (19) - FIRST MEASURED BASELINE: 2.5 tok/s plain, 504-char Greedy Parity
+
+- Greedy parity vs llama.cpp: the first 504 CHARACTERS (~120 tokens) of
+  the 256-token essay continuation are byte-identical before the
+  trajectories fork -- expected with 125 tensors dequantized to fp16 vs
+  llama.cpp's native i-quant reads (Muse precedent: greedy forks from fp
+  accumulation order alone). Output quality identical by inspection.
+  Correctness milestone COMPLETE for plain text decode.
+- FIRST TPS: 2.52 / 2.51 / 2.47 tok/s (3x greedy 256, in-process,
+  max_model_len 8192). llama.cpp bar: 35.67. Gap analysis per the
+  perf.md discipline: ~400 ms/step vs a ~46 ms bandwidth floor at the
+  CURRENT bloated residency (21 GiB: quantized 5.6 + fp16 dequants) --
+  i.e. ~8.7x dispatch/python-bound (the sequential GDN scan runs 48
+  layers x per-token python steps), on top of a 2.3x bytes penalty from
+  the IQ1_M/IQ2_S/IQ3_S fp16 dequants (native decode would put the
+  floor near 9.2 GiB/step ~ 20 ms). Raw:
+  perf/results/2026-08-20/qwen38-first-e2e/.
+- Roadmap from here (order per the always-on-spec mandate): (1) GDN
+  spec-state rollback in the MPS scan + drafter e2e + acceptance vs
+  vendor 4.80; (2) GDN decode dispatch-cost attack (fold the per-layer
+  step into fewer ops / a Metal kernel; muse_step-style fusion is the
+  precedent); (3) native IQ1_M/IQ2_S/IQ3_S Metal decode (llama.cpp
+  ggml-metal port) to reclaim the bytes; (4) head_dim-256 paged fast
+  path. Spec at vendor acceptance 4.8 multiplies whatever step time we
+  reach.
+
+## 2026-08-20 (20) - POLICY: Greedy Is Banned Stack-Wide (user directive)
+
+- User directive (emphatic): greedy/temperature-0 is not a supported
+  configuration anywhere in this stack -- he had already removed the
+  greedy flag deliberately, and validation/bench work MUST use the
+  model's shipped sampling defaults (this GGUF: general.sampling temp
+  1.0 / top_p 0.95 / top_k 20), seeded for repeatability. Saved to
+  auto-memory (no-greedy-benchmarks); this repo's opinionated stances
+  are the spec, the same way spec-always-on is.
+- Purged the greedy defaults found in the stack: slimserve/chat.py
+  Session.temperature 0.0 -> None (no override; /temp now rejects 0),
+  smoke.py's temperature=0.0 pin -> seeded, no sampling override
+  (stream.py chat_completion omits sampling params unless given). 57
+  slimserve tests pass.
+- Method corrections: layer-level parity (cosine on activations) needs
+  no sampling and stays the correctness instrument. Cross-run and
+  spec-vs-plain comparisons use SEEDED sampling -- this fork's rejection
+  sampler keys gumbel by (seed, position) precisely so seeded spec ==
+  seeded plain. The greedy-generated llama.cpp oracle files and the
+  greedy 2.5 tok/s baseline in (19) are SUPERSEDED as protocol; the
+  step-time attribution stands (sampling does not change bytes/step),
+  and the re-baseline at shipped defaults folds into the spec agent's
+  measurements.
+- Spec agent redirected mid-flight: sampled selector walk (softmax over
+  16 kept candidates per position, distributions retained for lossless
+  rejection sampling, per llama.cpp PR #27342's host walk) is PROMOTED
+  from deferred to the main deliverable, wired into the probabilistic
+  draft_logits path; acceptance measured at shipped defaults (vendor
+  4.80 was measured there).

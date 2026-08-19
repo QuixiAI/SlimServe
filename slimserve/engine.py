@@ -22,6 +22,9 @@ _SERVE_ONLY = frozenset(
         "served_model_name",
         "default_chat_template_kwargs",
         "enable_auto_tool_choice",
+        # An api_server flag, not an EngineArgs field; serve_argv reads
+        # plan.engine directly so serving still gets it.
+        "tool_call_parser",
     }
 )
 

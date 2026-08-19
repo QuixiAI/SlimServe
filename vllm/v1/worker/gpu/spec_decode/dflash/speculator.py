@@ -298,6 +298,20 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if self.draft_logits is None and hasattr(self.model, "select_draft_path"):
+            # DFlash 2: greedy path-selector walk over the top-k candidates
+            # per position instead of independent per-position argmax. The
+            # anchor (bonus) token id sits at each block's first input row.
+            # Probabilistic draft sampling (draft_logits set) stays on the
+            # plain gumbel path below -- correct output either way, the
+            # selector only improves acceptance.
+            anchor_ids = self.input_buffers.input_ids[
+                : num_reqs * self.num_query_per_req : self.num_query_per_req
+            ]
+            self.draft_tokens[:num_reqs] = self.model.select_draft_path(
+                sample_hidden_states, anchor_ids
+            )
+            return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(

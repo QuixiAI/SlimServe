@@ -175,7 +175,9 @@ def _request(
             plan.engine.get("served_model_name", "model"),
             messages,
             max_tokens=max_tokens,
-            temperature=0.0,
+            # No sampling overrides: the model's shipped defaults apply.
+            # Seeded for repeatable smoke answers; greedy is never used.
+            seed=42,
             chat_template_kwargs=plan.chat_template_kwargs or None,
             timeout=timeout,
         )
