@@ -44,12 +44,16 @@ def _quixicore_disabled() -> bool:
 
 @cache
 def _use_native_dflash_inputs() -> bool:
-    """Prefer the native DFlash input-prep kernel over the Triton one."""
+    """Prefer the native DFlash input-prep kernel over the Triton one.
+
+    On Metal this replaces the per-request Python fallback loop (two
+    GPU->CPU syncs + ~25 small dispatches per propose) with one dispatch.
+    """
     if _quixicore_disabled():
         return False
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda_alike():
+    if not (current_platform.is_cuda_alike() or current_platform.is_metal()):
         return False
     from vllm.quixicore import quixicore_ops
 
@@ -688,7 +692,7 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    if input_buffers.input_ids.device.type == "mps":
+    if input_buffers.input_ids.device.type == "mps" and not _use_native_dflash_inputs():
         query_locs = input_batch.query_start_loc_np[: num_reqs + 1].tolist()
         req_indices = input_batch.idx_mapping_np.tolist()
         sampled_counts = num_sampled.cpu().tolist()

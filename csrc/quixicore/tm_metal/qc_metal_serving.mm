@@ -245,6 +245,47 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
   return out;
 }
 
+// Multi-query verify attention (bench-first): the m expanded rows share
+// each K/V read via cooperative tiles. Same partition/reduce math as the
+// v2 kernels; per-row causal boundary and window applied in-kernel.
+at::Tensor paged_attention_verify(const at::Tensor& q,
+                                  const at::Tensor& key_cache,
+                                  const at::Tensor& value_cache,
+                                  const at::Tensor& block_table,
+                                  const at::Tensor& context_lens, double scale,
+                                  int64_t window) {
+  check_mps(q, "q");
+  check_mps(key_cache, "key_cache");
+  const int m = static_cast<int>(q.size(0));
+  const int num_heads = static_cast<int>(q.size(1));
+  const int head_size = static_cast<int>(q.size(2));
+  const int block_size = static_cast<int>(key_cache.size(1));
+  const int num_kv_heads = static_cast<int>(key_cache.size(2));
+  const int bt_stride = static_cast<int>(block_table.stride(0));
+  TORCH_CHECK(head_size == 128 && m >= 1 && m <= 32,
+              "quixicore(metal): paged_attention_verify wants D=128, m<=32");
+  constexpr int kPartitionSize = 512;
+  const int ctx_hint = static_cast<int>(context_lens.max().item<int64_t>());
+  const int num_partitions =
+      std::max(1, (ctx_hint + kPartitionSize - 1) / kPartitionSize);
+  auto opt = q.options().dtype(at::kFloat);
+  auto tmp = at::empty({m, num_heads, num_partitions, head_size}, opt);
+  auto mlog = at::empty({m, num_heads, num_partitions}, opt);
+  auto esum = at::empty({m, num_heads, num_partitions}, opt);
+  auto out = at::empty_like(q);
+  encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_verify(
+        e, q, key_cache, value_cache, block_table, context_lens, tmp, mlog,
+        esum, m, num_heads, num_kv_heads, head_size, block_size, bt_stride,
+        static_cast<float>(scale), num_partitions, kPartitionSize,
+        static_cast<int>(window), activation_type_name(q));
+    tk::launch_paged_attention_reduce(
+        e, tmp, mlog, esum, out, m, num_heads, head_size, num_partitions,
+        /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
+  });
+  return out;
+}
+
 // ---- Muse-Glimmer fused decode step --------------------------------------
 //
 // The deep fix for eager-mode dispatch overhead: the whole 52-layer dense
@@ -280,6 +321,15 @@ struct State {
   float theta = 0.f, eps = 0.f, post_eps = 0.f, scale = 0.f;
   std::vector<Layer> layers;
   at::Tensor h, q, k, v, attn_out, gate_out, o_out, g_out, u_out, mlp_mid;
+  at::Tensor mq_tmp, mq_mlog, mq_esum;
+  // Rotating split-K partial buffers: independent matmuls (q/k/v/gate,
+  // gate/up) would otherwise serialize on a shared buffer's write-write
+  // hazard in Metal's tracker.
+  std::array<at::Tensor, 4> gemm_partials;
+  int gemm_partials_idx = 0;
+  // Rotating (K_max, 32) half scratch for the deep-K transpose-first route.
+  std::array<at::Tensor, 2> xpose;
+  int xpose_idx = 0;
 };
 
 State g;
@@ -288,8 +338,41 @@ void emit_matvec(TorchEncoder& e, const Proj& p, const at::Tensor& x,
                  const at::Tensor& out, int m) {
   const int K = static_cast<int>(x.size(-1));
   const std::string fmt = ggml_type_to_format(p.type);
+  const bool sm_fmt = fmt == "q4_0" || fmt == "q8_0" || fmt == "q4_K" ||
+                      fmt == "q5_K" || fmt == "q6_K";
   if (m == 1) {
     tk::launch_qgemv(e, out, p.w, x, p.rows, K, fmt, "bfloat16");
+  } else if (m >= 9 && sm_fmt && p.rows % 16 == 0 && K % 32 == 0) {
+    // verify band: weight-streaming split-K MMA. One contiguous transpose
+    // pass puts X in the (K, 32) half layout every variant stages
+    // contiguously; the paired-plane kernels take q4_K/q5_K, BK=64 takes
+    // q6_K, and the BK=32 kernel covers the rest / unaligned K.
+    const at::Tensor& partials = g.gemm_partials[g.gemm_partials_idx];
+    g.gemm_partials_idx = (g.gemm_partials_idx + 1) % 4;
+    const at::Tensor& xp = g.xpose[g.xpose_idx];
+    g.xpose_idx = (g.xpose_idx + 1) % 2;
+    int variant = 9;
+    if (K % 64 == 0) {
+      const bool kquant = fmt == "q4_K" || fmt == "q5_K" || fmt == "q6_K";
+      if (kquant && p.rows % 32 == 0) {
+        // mirror the eager route (quixicore/ops.py): tensor-ops kernels,
+        // per-shape 15/16/17 selection (the rested-A/B winner)
+        if (p.rows % 64 == 0 && p.rows >= 16384) {
+          variant = 16;
+        } else if (fmt == "q5_K" && p.rows < 16384 && K % 128 == 0) {
+          variant = 17;
+        } else {
+          variant = 15;
+        }
+      } else if (fmt == "q4_K" || fmt == "q5_K") {
+        variant = (p.rows > 8192 || K > 8192) ? 12 : 11;
+      } else if (fmt == "q6_K") {
+        variant = 10;
+      }
+    }
+    tk::launch_muse_xpose32(e, xp, x, K, m);
+    tk::launch_qgemm_sm(e, partials, p.w, xp, p.rows, K, variant, fmt);
+    tk::launch_qgemm_sm_reduce_rm(e, out, partials, p.rows, m);
   } else {
     tk::launch_qgemv_mm(e, out, p.w, x, p.rows, K, m, fmt, "bfloat16");
   }
@@ -337,6 +420,20 @@ void muse_step_init(int64_t num_layers, int64_t hidden, int64_t heads,
   g.g_out = at::empty({m, inter}, opt);
   g.u_out = at::empty({m, inter}, opt);
   g.mlp_mid = at::empty({m, inter}, opt);
+  const int64_t max_n =
+      std::max<int64_t>(inter, std::max<int64_t>(heads * head_dim, hidden));
+  for (auto& buf : g.gemm_partials) {
+    buf = at::empty({4, max_n, 32}, opt.dtype(at::kFloat));
+  }
+  const int64_t max_k = std::max<int64_t>(inter, hidden);
+  for (auto& buf : g.xpose) {
+    buf = at::empty({max_k, 32}, opt.dtype(at::kHalf));
+  }
+  // multi-query attention partials for long-context global layers
+  // (P_max 64 partitions x 512 = 32k ctx; ~18 MB at m=17)
+  g.mq_tmp = at::empty({m, heads, 64, head_dim}, opt.dtype(at::kFloat));
+  g.mq_mlog = at::empty({m, heads, 64}, opt.dtype(at::kFloat));
+  g.mq_esum = at::empty({m, heads, 64}, opt.dtype(at::kFloat));
 }
 
 void muse_step_layer(
@@ -374,10 +471,13 @@ void muse_step_layer(
   }
 }
 
-void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
-                   const at::Tensor& bt_local, const at::Tensor& sl_local,
-                   const at::Tensor& slot_local, const at::Tensor& bt_full,
-                   const at::Tensor& sl_full, const at::Tensor& slot_full) {
+void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
+                        const at::Tensor& bt_local, const at::Tensor& sl_local,
+                        const at::Tensor& slot_local, const at::Tensor& bt_full,
+                        const at::Tensor& sl_full, const at::Tensor& slot_full,
+                        const at::Tensor* aux_out,
+                        const std::vector<int64_t>& aux_layers, int ctx_len,
+                        bool rows_are_one_request) {
   using namespace muse_step;
   TORCH_CHECK(g.ready, "muse_step not initialized");
   const int m = static_cast<int>(x.size(0));
@@ -391,7 +491,19 @@ void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
   const int n4_inter = m * g.inter / 4;
 
   encode([&](TorchEncoder& e) {
-    for (const Layer& L : g.layers) {
+    size_t aux_j = 0;
+    for (size_t li = 0; li < g.layers.size(); ++li) {
+      const Layer& L = g.layers[li];
+      // snapshot the residual stream entering this layer for the drafter
+      if (aux_out != nullptr && aux_j < aux_layers.size() &&
+          (int64_t)li == aux_layers[aux_j]) {
+        e.pipeline("mittens::muse_copy");
+        e.out(aux_out->select(0, (int64_t)aux_j), 0);
+        e.in(x, 1);
+        e.bytes(n4_hidden, 2);
+        e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
+        aux_j++;
+      }
       const at::Tensor& bt = L.is_local ? bt_local : bt_full;
       const at::Tensor& sl = L.is_local ? sl_local : sl_full;
       const at::Tensor& slots = L.is_local ? slot_local : slot_full;
@@ -439,14 +551,50 @@ void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
         const int total4 = m * g.kv_heads * hd / 4;
         e.dispatch((total4 + 255) / 256, 1, 1, 256, 1, 1);
       }
-      // paged attention over the cache
-      tk::launch_paged_attention(
-          e, g.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
-          g.attn_out, m, g.heads, g.kv_heads, hd,
-          static_cast<int>(L.kv_cache.size(2)), static_cast<int>(bt.stride(0)),
-          g.scale,
-          /*alibi=*/g.q, /*use_alibi=*/0, /*mask=*/g.q, /*use_mask=*/0, window,
-          /*mask_heads=*/0, "bfloat16");
+      // paged attention over the cache. Global layers at length use the
+      // multi-query kernel: one shared K/V pass for the m rows (3.9x per
+      // layer at 9.9k ctx) with the per-row causal boundary in-kernel.
+      constexpr int kMqPartition = 512;
+      const int mq_parts = (ctx_len + kMqPartition - 1) / kMqPartition;
+      // verify blocks (rows_are_one_request): the MQ kernel shares one
+      // request's KV pass across the m rows. Decode batches (independent
+      // requests, 1 query each): the partition/reduce pair splits each
+      // row's long scan across chunk-parallel threadgroups instead.
+      const bool use_mq = rows_are_one_request && !L.is_local && m > 1 &&
+                          ctx_len > 1024 && mq_parts <= 64;
+      const bool use_part = !rows_are_one_request && !L.is_local &&
+                            ctx_len > 2048 && mq_parts <= 64;
+      if (use_part) {
+        tk::launch_paged_attention_partition(
+            e, g.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
+            g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads, g.kv_heads, hd,
+            static_cast<int>(L.kv_cache.size(2)),
+            static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
+            /*window=*/0, /*softcap=*/0.0f, "bfloat16");
+        tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
+                                          g.attn_out, m, g.heads, hd, mq_parts,
+                                          /*sinks=*/g.q,
+                                          /*has_sink=*/0, "bfloat16");
+      } else if (use_mq) {
+        tk::launch_paged_attention_verify(
+            e, g.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt,
+            sl.narrow(0, m - 1, 1), g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads,
+            g.kv_heads, hd, static_cast<int>(L.kv_cache.size(2)),
+            static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
+            /*window=*/0, "bfloat16");
+        tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
+                                          g.attn_out, m, g.heads, hd, mq_parts,
+                                          /*sinks=*/g.q,
+                                          /*has_sink=*/0, "bfloat16");
+      } else {
+        tk::launch_paged_attention(
+            e, g.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
+            g.attn_out, m, g.heads, g.kv_heads, hd,
+            static_cast<int>(L.kv_cache.size(2)),
+            static_cast<int>(bt.stride(0)), g.scale,
+            /*alibi=*/g.q, /*use_alibi=*/0, /*mask=*/g.q, /*use_mask=*/0,
+            window, /*mask_heads=*/0, "bfloat16");
+      }
       // gated output: attn_out *= sigmoid(gate_proj(h)); then o_proj
       emit_matvec(e, L.gate, g.h, g.gate_out, m);
       e.pipeline("mittens::muse_sigmoid_mul");
@@ -481,6 +629,298 @@ void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
       e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
     }
   });
+}
+
+// ---- fused DFlash drafter step (gated; VLLM_MUSE_FUSED_DRAFTER) ------------
+// Same emit style as muse_step, specialized to the drafter: 5 layers, no
+// attention gate, standard pre-norm residuals (no sandwich norms), NeoX
+// rope, all-SWA attention that is BIDIRECTIONAL within the query block
+// (the caller passes per-row seq_lens of base + m for every row).
+namespace dflash_step {
+
+struct Layer {
+  std::array<muse_step::Proj, 3> qkv;
+  muse_step::Proj o;
+  std::array<muse_step::Proj, 2> gate_up;
+  muse_step::Proj down;
+  at::Tensor norm1, qn, kn, norm2;
+  at::Tensor kv_cache;
+};
+
+struct State {
+  int hidden = 0, heads = 0, kv_heads = 0, head_dim = 0, inter = 0;
+  int window = 0, max_rows = 0;
+  float theta = 0.f, eps = 0.f, scale = 0.f;
+  bool ready = false;
+  std::vector<Layer> layers;
+  at::Tensor h, mlp_h, q, k, v, attn_out, o_out, g_out, u_out, mlp_mid;
+};
+
+State d;
+
+}  // namespace dflash_step
+
+void dflash_step_init(int64_t num_layers, int64_t hidden, int64_t heads,
+                      int64_t kv_heads, int64_t head_dim, int64_t inter,
+                      int64_t window, double theta, double eps,
+                      int64_t max_rows, const at::Tensor& ref) {
+  using namespace dflash_step;
+  d = State{};
+  d.hidden = static_cast<int>(hidden);
+  d.heads = static_cast<int>(heads);
+  d.kv_heads = static_cast<int>(kv_heads);
+  d.head_dim = static_cast<int>(head_dim);
+  d.inter = static_cast<int>(inter);
+  d.window = static_cast<int>(window);
+  d.max_rows = static_cast<int>(max_rows);
+  d.theta = static_cast<float>(theta);
+  d.eps = static_cast<float>(eps);
+  d.scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  d.layers.resize(static_cast<size_t>(num_layers));
+  const auto opt = ref.options();
+  const int64_t m = max_rows;
+  d.h = at::empty({m, hidden}, opt);
+  d.mlp_h = at::empty({m, hidden}, opt);
+  d.q = at::empty({m, heads * head_dim}, opt);
+  d.k = at::empty({m, kv_heads * head_dim}, opt);
+  d.v = at::empty({m, kv_heads * head_dim}, opt);
+  d.attn_out = at::empty({m, heads * head_dim}, opt);
+  d.o_out = at::empty({m, hidden}, opt);
+  d.g_out = at::empty({m, inter}, opt);
+  d.u_out = at::empty({m, inter}, opt);
+  d.mlp_mid = at::empty({m, inter}, opt);
+}
+
+void dflash_step_layer(int64_t idx, const std::vector<at::Tensor>& qkv_w,
+                       const std::vector<int64_t>& qkv_t, const at::Tensor& o_w,
+                       int64_t o_t, const std::vector<at::Tensor>& gu_w,
+                       const std::vector<int64_t>& gu_t,
+                       const at::Tensor& down_w, int64_t down_t,
+                       const at::Tensor& norm1, const at::Tensor& qn,
+                       const at::Tensor& kn, const at::Tensor& norm2,
+                       const at::Tensor& kv_cache) {
+  using namespace dflash_step;
+  TORCH_CHECK(idx >= 0 && idx < (int64_t)d.layers.size(), "bad layer idx");
+  TORCH_CHECK(qkv_w.size() == 3 && qkv_t.size() == 3, "qkv wants 3 shards");
+  TORCH_CHECK(gu_w.size() == 2 && gu_t.size() == 2, "gate_up wants 2 shards");
+  Layer& L = d.layers[static_cast<size_t>(idx)];
+  const int hd = d.head_dim;
+  L.qkv = {{{qkv_w[0], (int)qkv_t[0], d.heads * hd},
+            {qkv_w[1], (int)qkv_t[1], d.kv_heads * hd},
+            {qkv_w[2], (int)qkv_t[2], d.kv_heads * hd}}};
+  L.o = {o_w, (int)o_t, d.hidden};
+  L.gate_up = {
+      {{gu_w[0], (int)gu_t[0], d.inter}, {gu_w[1], (int)gu_t[1], d.inter}}};
+  L.down = {down_w, (int)down_t, d.hidden};
+  L.norm1 = norm1;
+  L.qn = qn;
+  L.kn = kn;
+  L.norm2 = norm2;
+  L.kv_cache = kv_cache;
+  if (idx == (int64_t)d.layers.size() - 1) {
+    d.ready = true;
+  }
+}
+
+void dflash_step_run(const at::Tensor& x, const at::Tensor& positions,
+                     const at::Tensor& bt, const at::Tensor& sl,
+                     const at::Tensor& slots) {
+  using namespace dflash_step;
+  using muse_step::emit_matvec;
+  using muse_step::emit_rms;
+  TORCH_CHECK(d.ready, "dflash_step not initialized");
+  const int m = static_cast<int>(x.size(0));
+  TORCH_CHECK(m >= 1 && m <= d.max_rows, "row count out of range");
+  TORCH_CHECK(x.is_contiguous() && x.scalar_type() == at::kBFloat16,
+              "x must be contiguous bf16");
+  const int hidden = d.hidden;
+  const int hd = d.head_dim;
+  const int n4_hidden = m * hidden / 4;
+  const int n4_inter = m * d.inter / 4;
+
+  encode([&](TorchEncoder& e) {
+    for (size_t li = 0; li < d.layers.size(); ++li) {
+      const Layer& L = d.layers[li];
+      emit_rms(e, x, L.norm1, d.h, m, hidden, d.eps);
+      emit_matvec(e, L.qkv[0], d.h, d.q, m);
+      emit_matvec(e, L.qkv[1], d.h, d.k, m);
+      emit_matvec(e, L.qkv[2], d.h, d.v, m);
+      emit_rms(e, d.q, L.qn, d.q, m * d.heads, hd, d.eps);
+      emit_rms(e, d.k, L.kn, d.k, m * d.kv_heads, hd, d.eps);
+      e.pipeline("mittens::muse_rope_qk_neox");
+      e.out(d.q, 0);
+      e.in(positions, 1);
+      e.bytes(hd, 2);
+      e.bytes(d.heads, 3);
+      e.bytes(d.theta, 4);
+      e.dispatch(m * d.heads, 1, 1, 32, 1, 1);
+      e.pipeline("mittens::muse_rope_qk_neox");
+      e.out(d.k, 0);
+      e.in(positions, 1);
+      e.bytes(hd, 2);
+      e.bytes(d.kv_heads, 3);
+      e.bytes(d.theta, 4);
+      e.dispatch(m * d.kv_heads, 1, 1, 32, 1, 1);
+      {
+        const long half = L.kv_cache.numel() / 2;
+        e.pipeline("mittens::muse_kv_store");
+        e.out(L.kv_cache, 0);
+        e.in(d.k, 1);
+        e.in(d.v, 2);
+        e.in(slots, 3);
+        e.bytes(static_cast<int>(L.kv_cache.size(2)), 4);
+        e.bytes(d.kv_heads, 5);
+        e.bytes(hd, 6);
+        e.bytes(half, 7);
+        e.bytes(m, 8);
+        const int total4 = m * d.kv_heads * hd / 4;
+        e.dispatch((total4 + 255) / 256, 1, 1, 256, 1, 1);
+      }
+      tk::launch_paged_attention(
+          e, d.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
+          d.attn_out, m, d.heads, d.kv_heads, hd,
+          static_cast<int>(L.kv_cache.size(2)), static_cast<int>(bt.stride(0)),
+          d.scale,
+          /*alibi=*/d.q, /*use_alibi=*/0, /*mask=*/d.q, /*use_mask=*/0,
+          d.window, /*mask_heads=*/0, "bfloat16");
+      emit_matvec(e, L.o, d.attn_out, d.o_out, m);
+      e.pipeline("mittens::muse_add_inplace");
+      e.out(x, 0);
+      e.in(d.o_out, 1);
+      e.bytes(n4_hidden, 2);
+      e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
+      emit_rms(e, x, L.norm2, d.mlp_h, m, hidden, d.eps);
+      emit_matvec(e, L.gate_up[0], d.mlp_h, d.g_out, m);
+      emit_matvec(e, L.gate_up[1], d.mlp_h, d.u_out, m);
+      e.pipeline("mittens::muse_silu_mul");
+      e.out(d.mlp_mid, 0);
+      e.in(d.g_out, 1);
+      e.in(d.u_out, 2);
+      e.bytes(n4_inter, 3);
+      e.dispatch((n4_inter + 255) / 256, 1, 1, 256, 1, 1);
+      emit_matvec(e, L.down, d.mlp_mid, d.o_out, m);
+      e.pipeline("mittens::muse_add_inplace");
+      e.out(x, 0);
+      e.in(d.o_out, 1);
+      e.bytes(n4_hidden, 2);
+      e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
+    }
+  });
+}
+
+// Fused greedy draft sampling: one command buffer runs the shared lm_head
+// GEMM (weight-streaming sm route) and a row-wise argmax. Softcap and
+// logit scale are argmax-invariant and skipped; greedy only.
+at::Tensor dflash_sample_greedy(const at::Tensor& hidden,
+                                const at::Tensor& lm_w, int64_t lm_type,
+                                int64_t vocab_rows) {
+  check_mps(hidden, "hidden");
+  check_mps(lm_w, "lm_w");
+  const int m = static_cast<int>(hidden.size(0));
+  const int K = static_cast<int>(hidden.size(1));
+  const int N = static_cast<int>(vocab_rows);
+  TORCH_CHECK(hidden.scalar_type() == at::kBFloat16 && hidden.is_contiguous(),
+              "quixicore(metal): dflash_sample_greedy wants contiguous bf16");
+  TORCH_CHECK(m >= 9 && m <= 17 && N % 64 == 0 && K % 64 == 0,
+              "quixicore(metal): dflash_sample_greedy m 9..17, N%64, K%64");
+  const std::string fmt = ggml_type_to_format(lm_type);
+  auto opt = hidden.options();
+  auto xp = at::empty({K, 32}, opt.dtype(at::kHalf));
+  auto partials = at::empty({4, N, 32}, opt.dtype(at::kFloat));
+  auto logits = at::empty({m, N}, opt);
+  auto tokens = at::empty({m}, opt.dtype(at::kLong));
+  const int variant = 16;  // wide-N 8-warp tensor kernel
+  encode([&](TorchEncoder& e) {
+    tk::launch_muse_xpose32(e, xp, hidden, K, m);
+    tk::launch_qgemm_sm(e, partials, lm_w, xp, N, K, variant, fmt);
+    tk::launch_qgemm_sm_reduce_rm(e, logits, partials, N, m);
+    e.pipeline("mittens::muse_argmax");
+    e.out(tokens, 0);
+    e.in(logits, 1);
+    e.bytes(N, 2);
+    e.dispatch(m, 1, 1, 256, 1, 1);
+  });
+  return tokens;
+}
+
+void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
+                   const at::Tensor& bt_local, const at::Tensor& sl_local,
+                   const at::Tensor& slot_local, const at::Tensor& bt_full,
+                   const at::Tensor& sl_full, const at::Tensor& slot_full,
+                   int64_t ctx_len) {
+  muse_step_run_impl(x, positions, bt_local, sl_local, slot_local, bt_full,
+                     sl_full, slot_full, nullptr, {}, static_cast<int>(ctx_len),
+                     /*rows_are_one_request=*/false);
+}
+
+// Verify-step variant: also snapshots the residual stream entering each
+// layer listed in aux_layers (ascending) into aux_out[j] for the DFlash
+// drafter. aux_out is (len(aux_layers), rows, hidden) bf16.
+void muse_step_run_aux(const at::Tensor& x, const at::Tensor& positions,
+                       const at::Tensor& bt_local, const at::Tensor& sl_local,
+                       const at::Tensor& slot_local, const at::Tensor& bt_full,
+                       const at::Tensor& sl_full, const at::Tensor& slot_full,
+                       const at::Tensor& aux_out,
+                       const std::vector<int64_t>& aux_layers,
+                       int64_t ctx_len) {
+  using namespace muse_step;
+  check_mps(aux_out, "aux_out");
+  TORCH_CHECK(aux_out.scalar_type() == at::kBFloat16 && aux_out.dim() == 3 &&
+                  aux_out.size(0) == (int64_t)aux_layers.size() &&
+                  aux_out.size(1) == x.size(0) && aux_out.size(2) == g.hidden,
+              "aux_out must be (n_aux, rows, hidden) bf16");
+  for (size_t j = 1; j < aux_layers.size(); ++j) {
+    TORCH_CHECK(aux_layers[j] > aux_layers[j - 1] && aux_layers[j] >= 0 &&
+                    aux_layers[j] < (int64_t)g.layers.size(),
+                "aux_layers must be ascending in-range layer indices");
+  }
+  muse_step_run_impl(x, positions, bt_local, sl_local, slot_local, bt_full,
+                     sl_full, slot_full, &aux_out, aux_layers,
+                     static_cast<int>(ctx_len),
+                     /*rows_are_one_request=*/true);
+}
+
+// Standalone rm-variant probe: row-major bf16 in/out, fresh partials per
+// call (mirrors how the fused step would behave with per-op buffers).
+at::Tensor ggml_mul_mat_sm_rm_pre(const at::Tensor& w, const at::Tensor& x,
+                                  int64_t quant_type, int64_t row) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(-1));
+  const int M = static_cast<int>(x.size(0));
+  const std::string fmt = ggml_type_to_format(quant_type);
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous() && M <= 32,
+              "sm_rm_pre wants contiguous (M<=32, K) bf16");
+  auto partials = at::empty({4, N, 32}, x.options().dtype(at::kFloat));
+  auto out = at::empty({M, N}, x.options());
+  encode([&](TorchEncoder& e) {
+    tk::launch_qgemm_sm_rm(e, partials, w, x, N, K, M, fmt);
+    tk::launch_qgemm_sm_reduce_rm(e, out, partials, N, M);
+  });
+  return out;
+}
+
+// Bench probe: qgemm_sm structure with raw half weights (no dequant ALU).
+at::Tensor ggml_mul_mat_sm_f16probe(const at::Tensor& w, const at::Tensor& x,
+                                    int64_t row) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(0));
+  auto partials = at::empty({4, N, 32}, x.options().dtype(at::kFloat));
+  auto out = at::empty({N, 32}, x.options());
+  encode([&](TorchEncoder& e) {
+    e.pipeline("qgemm_sm_r8sk4_f16_raw");
+    e.out(partials, 0);
+    e.in(w, 1);
+    e.in(x, 2);
+    e.bytes(N, 3);
+    e.bytes(K, 4);
+    e.dispatch(1, N / 16, 4, 64, 1, 1);
+    tk::launch_qgemm_sm_reduce(e, out, partials, N, 4);
+  });
+  return out;
 }
 
 // ---- RMSNorm -------------------------------------------------------------
@@ -926,6 +1366,271 @@ at::Tensor ggml_mul_mat_a8(const at::Tensor& w, const at::Tensor& x,
       .contiguous();
 }
 
+// Small-M weight-streaming MMA GEMM: every warp computes all (padded-to-32)
+// columns for its own 16 weight rows, so no streamed weight byte feeds idle
+// padding lanes. The verify/draft band (2..32 rows) routes here.
+at::Tensor ggml_mul_mat_sm(const at::Tensor& w, const at::Tensor& x,
+                           int64_t quant_type, int64_t row, int64_t n_warps) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(-1));
+  const int output_rows = static_cast<int>(x.size(0));
+  const std::string fmt = ggml_type_to_format(quant_type);
+  constexpr int kMPad = 32;
+
+  TORCH_CHECK(output_rows <= kMPad,
+              "quixicore(metal): qgemm_sm covers <= 32 rows, got ",
+              output_rows);
+  TORCH_CHECK((n_warps >= 2 && n_warps <= 17) || n_warps == 31,
+              "quixicore(metal): unknown qgemm_sm variant ", n_warps);
+  TORCH_CHECK(N % tk::qgemm_sm_tg_rows(static_cast<int>(n_warps)) == 0,
+              "quixicore(metal): qgemm_sm needs N % ",
+              tk::qgemm_sm_tg_rows(static_cast<int>(n_warps)),
+              " == 0, got N=", N);
+  TORCH_CHECK(K % 32 == 0,
+              "quixicore(metal): qgemm_sm needs K % 32 == 0, got K=", K);
+  TORCH_CHECK(fmt == "q4_0" || fmt == "q8_0" || fmt == "q4_K" ||
+                  fmt == "q5_K" || fmt == "q6_K",
+              "quixicore(metal): qgemm_sm unsupported format ", fmt);
+
+  auto input = x.to(at::kHalf).transpose(0, 1).contiguous();
+  auto input_padded = at::zeros({K, kMPad}, x.options().dtype(at::kHalf));
+  input_padded.narrow(1, 0, output_rows).copy_(input);
+  auto output_padded = at::empty({N, kMPad}, x.options().dtype(at::kHalf));
+
+  const int variant = static_cast<int>(n_warps);
+  const int split_k = tk::qgemm_sm_split_k(variant);
+  if (variant == 31) {
+    // split-K=1 tensor kernel: one float slice + SK=1 reduce (the cast)
+    auto partials = at::empty({1, N, kMPad}, x.options().dtype(at::kFloat));
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, partials, w, input_padded, N, K, variant, fmt);
+      tk::launch_qgemm_sm_reduce(e, output_padded, partials, N, 1);
+    });
+  } else if (split_k == 1) {
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, output_padded, w, input_padded, N, K, variant,
+                          fmt);
+    });
+  } else {
+    auto partials =
+        at::empty({split_k, N, kMPad}, x.options().dtype(at::kFloat));
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, partials, w, input_padded, N, K, variant, fmt);
+      tk::launch_qgemm_sm_reduce(e, output_padded, partials, N, split_k);
+    });
+  }
+  return output_padded.narrow(1, 0, output_rows)
+      .transpose(0, 1)
+      .to(x.scalar_type())
+      .contiguous();
+}
+
+// uint4-native q4_K GEMM: weights repacked to tile-major packed uint4 with
+// per-32-group scale/min half planes (see qgemm_sm_u4 kernel notes). X is
+// (32, K) half row-major (M rows used, rest zero-padded). Returns (N, 32)
+// half; deterministic split-K reduce.
+at::Tensor ggml_mul_mat_sm_u4(const at::Tensor& wu, const at::Tensor& x,
+                              const at::Tensor& sc, const at::Tensor& mn,
+                              int64_t row) {
+  check_mps(wu, "wu");
+  check_mps(x, "x");
+  check_mps(sc, "sc");
+  check_mps(mn, "mn");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(1));
+  TORCH_CHECK(
+      x.scalar_type() == at::kHalf && x.size(0) == 32 && x.is_contiguous(),
+      "quixicore(metal): qgemm_sm_u4 wants contiguous (32, K) half X");
+  TORCH_CHECK(N % 64 == 0 && K % 128 == 0,
+              "quixicore(metal): qgemm_sm_u4 needs N % 64 == 0, K % 128 == 0");
+  // every partials element is written by the scatter store (coop capacity
+  // x threads == tile size, all elements valid -- parity-verified), so no
+  // zero-fill is needed
+  auto xs = at::empty({K / 32, 32}, x.options());
+  auto partials = at::empty({4, N, 32}, x.options().dtype(at::kFloat));
+  auto out = at::empty({N, 32}, x.options());
+  encode([&](TorchEncoder& e) {
+    tk::launch_qgemm_sm_u4_xsum(e, xs, x, K);
+    tk::launch_qgemm_sm_u4(e, partials, wu, x, sc, mn, xs, N, K);
+    tk::launch_qgemm_sm_reduce(e, out, partials, N, 4);
+  });
+  return out;
+}
+
+// Glue-free u4: takes the original (M, K) bf16 activations, returns
+// (M, N) bf16 via the transposed-store reduce. No pad/cast/transpose ops
+// on either side.
+at::Tensor ggml_mul_mat_sm_u4_rm(const at::Tensor& wu, const at::Tensor& x,
+                                 const at::Tensor& sc, const at::Tensor& mn,
+                                 int64_t row) {
+  check_mps(wu, "wu");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(1));
+  const int M = static_cast<int>(x.size(0));
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.is_contiguous(),
+              "quixicore(metal): qgemm_sm_u4b wants contiguous (M, K) bf16");
+  TORCH_CHECK(M <= 32 && N % 64 == 0 && K % 128 == 0,
+              "quixicore(metal): qgemm_sm_u4b needs M <= 32, N % 64 == 0, "
+              "K % 128 == 0");
+  auto xs = at::empty({K / 32, 32}, x.options().dtype(at::kHalf));
+  auto partials = at::empty({4, N, 32}, x.options().dtype(at::kFloat));
+  auto out = at::empty({M, N}, x.options());
+  encode([&](TorchEncoder& e) {
+    tk::launch_qgemm_sm_u4b_xsum(e, xs, x, K, M);
+    tk::launch_qgemm_sm_u4b(e, partials, wu, x, sc, mn, xs, N, K, M);
+    tk::launch_qgemm_sm_reduce_rm(e, out, partials, N, M);
+  });
+  return out;
+}
+
+// int8-native q6_K GEMM: (K, N) row-major int8 weights (the -32 folded at
+// repack) + (K/16, N) half scale plane. X is (32, K) half row-major.
+at::Tensor ggml_mul_mat_sm_u8(const at::Tensor& wq8, const at::Tensor& x,
+                              const at::Tensor& sc, int64_t row) {
+  check_mps(wq8, "wq8");
+  check_mps(x, "x");
+  check_mps(sc, "sc");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(1));
+  TORCH_CHECK(
+      x.scalar_type() == at::kHalf && x.size(0) == 32 && x.is_contiguous(),
+      "quixicore(metal): qgemm_sm_u8 wants contiguous (32, K) half X");
+  TORCH_CHECK(N % 64 == 0 && K % 64 == 0,
+              "quixicore(metal): qgemm_sm_u8 needs N % 64 == 0, K % 64 == 0");
+  auto partials = at::empty({4, N, 32}, x.options().dtype(at::kFloat));
+  auto out = at::empty({N, 32}, x.options());
+  encode([&](TorchEncoder& e) {
+    tk::launch_qgemm_sm_u8(e, partials, wq8, x, sc, N, K);
+    tk::launch_qgemm_sm_reduce(e, out, partials, N, 4);
+  });
+  return out;
+}
+
+// Native DFlash input prep: one dispatch replaces the MPS Python loop
+// (two GPU->CPU syncs + ~25 small ops per propose). Mirrors the Triton
+// kernel; argument order matches the python-side native call exactly.
+void prepare_dflash_inputs(
+    const at::Tensor& input_ids, const at::Tensor& positions,
+    const at::Tensor& query_start_loc, const at::Tensor& seq_lens,
+    const at::Tensor& query_slot_mapping, const at::Tensor& context_positions,
+    const at::Tensor& context_slot_mapping, const at::Tensor& sample_indices,
+    const at::Tensor& sample_pos, const at::Tensor& sample_idx_mapping,
+    const at::Tensor& target_positions, const at::Tensor& target_qsl,
+    const at::Tensor& idx_mapping, const at::Tensor& last_sampled,
+    const at::Tensor& next_prefill_tokens, const at::Tensor& num_sampled,
+    const at::Tensor& num_rejected, const at::Tensor& block_table,
+    int64_t bt_stride, int64_t parallel_drafting_token_id, int64_t block_size,
+    int64_t num_query_per_req, int64_t num_speculative_steps,
+    int64_t max_num_reqs, int64_t max_num_tokens, int64_t max_model_len,
+    bool sample_from_anchor, int64_t pad_slot_id, int64_t num_reqs,
+    int64_t max_tokens_per_req) {
+  TORCH_CHECK(input_ids.scalar_type() == at::kInt &&
+                  query_start_loc.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt &&
+                  sample_idx_mapping.scalar_type() == at::kInt &&
+                  idx_mapping.scalar_type() == at::kInt &&
+                  next_prefill_tokens.scalar_type() == at::kInt &&
+                  num_sampled.scalar_type() == at::kInt &&
+                  num_rejected.scalar_type() == at::kInt &&
+                  block_table.scalar_type() == at::kInt,
+              "quixicore(metal): prepare_dflash_inputs int32 dtype mismatch");
+  TORCH_CHECK(positions.scalar_type() == at::kLong &&
+                  query_slot_mapping.scalar_type() == at::kLong &&
+                  context_positions.scalar_type() == at::kLong &&
+                  context_slot_mapping.scalar_type() == at::kLong &&
+                  sample_indices.scalar_type() == at::kLong &&
+                  sample_pos.scalar_type() == at::kLong &&
+                  target_positions.scalar_type() == at::kLong &&
+                  last_sampled.scalar_type() == at::kLong,
+              "quixicore(metal): prepare_dflash_inputs int64 dtype mismatch");
+  const int grid_x = static_cast<int>((max_tokens_per_req + 255) / 256);
+  encode([&](TorchEncoder& e) {
+    e.pipeline("mittens::prepare_dflash_inputs");
+    e.out(input_ids, 0);
+    e.out(positions, 1);
+    e.out(query_start_loc, 2);
+    e.out(seq_lens, 3);
+    e.out(query_slot_mapping, 4);
+    e.out(context_positions, 5);
+    e.out(context_slot_mapping, 6);
+    e.out(sample_indices, 7);
+    e.out(sample_pos, 8);
+    e.out(sample_idx_mapping, 9);
+    e.in(target_positions, 10);
+    e.in(target_qsl, 11);
+    e.in(idx_mapping, 12);
+    e.in(last_sampled, 13);
+    e.in(next_prefill_tokens, 14);
+    e.in(num_sampled, 15);
+    e.in(num_rejected, 16);
+    e.in(block_table, 17);
+    const int v_bt = static_cast<int>(bt_stride);
+    const int v_pdt = static_cast<int>(parallel_drafting_token_id);
+    const int v_bs = static_cast<int>(block_size);
+    const int v_nq = static_cast<int>(num_query_per_req);
+    const int v_ns = static_cast<int>(num_speculative_steps);
+    const int v_mr = static_cast<int>(max_num_reqs);
+    const int v_mt = static_cast<int>(max_num_tokens);
+    const int v_ml = static_cast<int>(max_model_len);
+    const int v_sa = sample_from_anchor ? 1 : 0;
+    const int v_ps = static_cast<int>(pad_slot_id);
+    const int v_nr = static_cast<int>(num_reqs);
+    e.bytes(v_bt, 18);
+    e.bytes(v_pdt, 19);
+    e.bytes(v_bs, 20);
+    e.bytes(v_nq, 21);
+    e.bytes(v_ns, 22);
+    e.bytes(v_mr, 23);
+    e.bytes(v_mt, 24);
+    e.bytes(v_ml, 25);
+    e.bytes(v_sa, 26);
+    e.bytes(v_ps, 27);
+    e.bytes(v_nr, 28);
+    e.dispatch(grid_x, static_cast<int>(num_reqs), 1, 256, 1, 1);
+  });
+}
+
+// Layout-native qgemm_sm: X already (K, 32) half, D returned (N, 32) half.
+// No transpose/pad/cast glue -- the shape the fused muse_step verify uses,
+// and the honest way to benchmark the kernel itself.
+at::Tensor ggml_mul_mat_sm_pre(const at::Tensor& w, const at::Tensor& x,
+                               int64_t quant_type, int64_t row,
+                               int64_t n_warps) {
+  check_mps(w, "w");
+  check_mps(x, "x");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(x.size(0));
+  const std::string fmt = ggml_type_to_format(quant_type);
+  TORCH_CHECK(
+      x.scalar_type() == at::kHalf && x.size(1) == 32 && x.is_contiguous(),
+      "quixicore(metal): qgemm_sm_pre wants contiguous (K, 32) half");
+  auto out = at::empty({N, 32}, x.options());
+  const int variant = static_cast<int>(n_warps);
+  const int split_k = tk::qgemm_sm_split_k(variant);
+  if (variant == 31) {
+    // split-K=1 tensor kernel: one float slice + SK=1 reduce (the cast)
+    auto partials = at::empty({1, N, 32}, x.options().dtype(at::kFloat));
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, partials, w, x, N, K, variant, fmt);
+      tk::launch_qgemm_sm_reduce(e, out, partials, N, 1);
+    });
+  } else if (split_k == 1) {
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, out, w, x, N, K, variant, fmt);
+    });
+  } else {
+    auto partials = at::empty({split_k, N, 32}, x.options().dtype(at::kFloat));
+    encode([&](TorchEncoder& e) {
+      tk::launch_qgemm_sm(e, partials, w, x, N, K, variant, fmt);
+      tk::launch_qgemm_sm_reduce(e, out, partials, N, split_k);
+    });
+  }
+  return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -952,13 +1657,48 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("ref"));
   m.def("muse_step_layer", &muse_step_layer,
         "Register one decoder layer's weights for the fused decode step");
+  m.def(
+      "dflash_step_debug",
+      []() {
+        using namespace dflash_step;
+        return std::vector<at::Tensor>{d.h,        d.q,     d.k,     d.v,
+                                       d.attn_out, d.o_out, d.g_out, d.u_out,
+                                       d.mlp_mid,  d.mlp_h};
+      },
+      "fused drafter scratch buffers (values from the LAST emitted layer)");
+  m.def("paged_attention_verify", &paged_attention_verify,
+        "multi-query verify attention: m rows share each K/V read",
+        pybind11::arg("q"), pybind11::arg("key_cache"),
+        pybind11::arg("value_cache"), pybind11::arg("block_table"),
+        pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("window"));
+  m.def("dflash_sample_greedy", &dflash_sample_greedy,
+        "fused greedy draft sampling: shared lm_head GEMM + row argmax",
+        pybind11::arg("hidden"), pybind11::arg("lm_w"),
+        pybind11::arg("lm_type"), pybind11::arg("vocab_rows"));
+  m.def("dflash_step_init", &dflash_step_init,
+        "register fused DFlash drafter geometry and scratch");
+  m.def("dflash_step_layer", &dflash_step_layer,
+        "register one fused DFlash drafter layer");
+  m.def("dflash_step_run", &dflash_step_run,
+        "single-command-buffer DFlash drafter forward (block-bidirectional)");
+  m.def("muse_step_run_aux", &muse_step_run_aux,
+        "Fused verify step: muse_step_run plus residual-stream snapshots "
+        "entering each aux layer (for the DFlash drafter)",
+        pybind11::arg("x"), pybind11::arg("positions"),
+        pybind11::arg("bt_local"), pybind11::arg("sl_local"),
+        pybind11::arg("slot_local"), pybind11::arg("bt_full"),
+        pybind11::arg("sl_full"), pybind11::arg("slot_full"),
+        pybind11::arg("aux_out"), pybind11::arg("aux_layers"),
+        pybind11::arg("ctx_len") = 0);
   m.def("muse_step_run", &muse_step_run,
         "Encode the whole decoder stack for one decode step into a single "
         "command buffer; x is updated in place",
         pybind11::arg("x"), pybind11::arg("positions"),
         pybind11::arg("bt_local"), pybind11::arg("sl_local"),
         pybind11::arg("slot_local"), pybind11::arg("bt_full"),
-        pybind11::arg("sl_full"), pybind11::arg("slot_full"));
+        pybind11::arg("sl_full"), pybind11::arg("slot_full"),
+        pybind11::arg("ctx_len") = 0);
 
   m.def("rms_norm", &rms_norm,
         "Single-dispatch bf16 RMSNorm over contiguous [rows, D]",
@@ -1028,4 +1768,37 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("ggml_mul_mat_a8", &ggml_mul_mat_a8,
         "GGUF weight-only GEMM over raw quantized blocks", pybind11::arg("w"),
         pybind11::arg("x"), pybind11::arg("quant_type"), pybind11::arg("row"));
+
+  m.def("ggml_mul_mat_sm", &ggml_mul_mat_sm,
+        "GGUF small-M weight-streaming MMA GEMM (verify/draft band)",
+        pybind11::arg("w"), pybind11::arg("x"), pybind11::arg("quant_type"),
+        pybind11::arg("row"), pybind11::arg("n_warps") = 4);
+
+  m.def("ggml_mul_mat_sm_f16probe", &ggml_mul_mat_sm_f16probe,
+        "structure probe: sm tile flow over raw half weights",
+        pybind11::arg("w"), pybind11::arg("x"), pybind11::arg("row"));
+  m.def("ggml_mul_mat_sm_rm_pre", &ggml_mul_mat_sm_rm_pre,
+        "row-major bf16 qgemm_sm_rm probe (fused-step layout)",
+        pybind11::arg("w"), pybind11::arg("x"), pybind11::arg("quant_type"),
+        pybind11::arg("row"));
+  m.def("ggml_mul_mat_sm_pre", &ggml_mul_mat_sm_pre,
+        "qgemm_sm without layout glue: X (K,32) half in, D (N,32) half out",
+        pybind11::arg("w"), pybind11::arg("x"), pybind11::arg("quant_type"),
+        pybind11::arg("row"), pybind11::arg("n_warps") = 4);
+  m.def("ggml_mul_mat_sm_u4", &ggml_mul_mat_sm_u4,
+        "uint4-native q4_K GEMM: tile-major packed weights + scale/min "
+        "planes, X (32,K) half row-major, D (N,32) half out",
+        pybind11::arg("wu"), pybind11::arg("x"), pybind11::arg("sc"),
+        pybind11::arg("mn"), pybind11::arg("row"));
+  m.def("prepare_dflash_inputs", &prepare_dflash_inputs,
+        "native DFlash input prep (one dispatch, no host syncs)");
+  m.def("ggml_mul_mat_sm_u4_rm", &ggml_mul_mat_sm_u4_rm,
+        "glue-free uint4-native q4_K GEMM: X (M,K) bf16 in, (M,N) bf16 out",
+        pybind11::arg("wu"), pybind11::arg("x"), pybind11::arg("sc"),
+        pybind11::arg("mn"), pybind11::arg("row"));
+  m.def("ggml_mul_mat_sm_u8", &ggml_mul_mat_sm_u8,
+        "int8-native q6_K GEMM: (K,N) int8 weights + (K/16,N) scale plane, "
+        "X (32,K) half row-major, D (N,32) half out",
+        pybind11::arg("wq8"), pybind11::arg("x"), pybind11::arg("sc"),
+        pybind11::arg("row"));
 }

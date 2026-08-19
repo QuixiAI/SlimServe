@@ -966,6 +966,7 @@ METAL_FUNC void tk_dequant8_f32<mxfp4>(device const uchar* base, int col0,
     }
 }
 
+
 template<>
 METAL_FUNC void tk_dequant8<q4_K>(device const uchar* base, int col0, thread half* w) {
     const half d    = ((device const half*)base)[0];
@@ -983,9 +984,14 @@ METAL_FUNC void tk_dequant8<q4_K>(device const uchar* base, int col0, thread hal
     }
     const half dl = d * half(sc), ml = dmin * half(m);
     device const uchar* q = qs + chunk * 32 + (hi ? pos - 32 : pos);
+    // one 8-byte register load instead of 8 device byte loads (q is 4-aligned:
+    // 144-byte blocks, 8-aligned span offsets)
+    const packed_uint2 qw = *(device const packed_uint2*)q;
     #pragma clang loop unroll(full)
-    for (int i = 0; i < 8; ++i)
-        w[i] = dl * half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - ml;
+    for (int i = 0; i < 8; ++i) {
+        const uint b = ((i < 4 ? qw.x : qw.y) >> (8 * (i & 3))) & 0xFFu;
+        w[i] = dl * half(hi ? (b >> 4) : (b & 0x0Fu)) - ml;
+    }
 }
 
 template<>
@@ -1003,12 +1009,18 @@ METAL_FUNC void tk_dequant8<q5_K>(device const uchar* base, int col0, thread hal
         mn = (sca[is + 4] >> 4)   | ((sca[is]     >> 6) << 4);
     }
     const half dl = d * half(sc), ml = dmin * half(mn);
-    const uchar hmask = uchar(1u << is);
+    const uint hmask = 1u << is;
     device const uchar* q = qs + chunk * 32 + l0;
     device const uchar* h = qh + l0;
+    // two 8-byte register loads instead of 16 device byte loads (176-byte
+    // blocks and 8-aligned span offsets keep both streams 4-aligned)
+    const packed_uint2 qw = *(device const packed_uint2*)q;
+    const packed_uint2 hw = *(device const packed_uint2*)h;
     #pragma clang loop unroll(full)
     for (int i = 0; i < 8; ++i) {
-        const int q5 = (sub ? (q[i] >> 4) : (q[i] & 0x0F)) + ((h[i] & hmask) ? 16 : 0);
+        const uint qb = ((i < 4 ? qw.x : qw.y) >> (8 * (i & 3))) & 0xFFu;
+        const uint hb = ((i < 4 ? hw.x : hw.y) >> (8 * (i & 3))) & 0xFFu;
+        const int q5 = int(sub ? (qb >> 4) : (qb & 0x0Fu)) + ((hb & hmask) ? 16 : 0);
         w[i] = dl * half(q5) - ml;
     }
 }
@@ -1025,10 +1037,16 @@ METAL_FUNC void tk_dequant8<q6_K>(device const uchar* base, int col0, thread hal
     device const uchar* h = qh + chunk * 32 + l0;
     const int hshift = 2 * group;
     const bool hi = (group & 2) != 0;
+    // register loads instead of 16 device byte loads; packed_ushort4 because
+    // the 210-byte q6_K block stride leaves only 2-byte alignment
+    const packed_ushort4 qw = *(device const packed_ushort4*)q;
+    const packed_ushort4 hw = *(device const packed_ushort4*)h;
     #pragma clang loop unroll(full)
     for (int i = 0; i < 8; ++i) {
-        const int nib = hi ? (q[i] >> 4) : (q[i] & 0x0F);
-        const int qv  = (nib | (((h[i] >> hshift) & 3) << 4)) - 32;
+        const uint qb = (uint(qw[i >> 1]) >> (8 * (i & 1))) & 0xFFu;
+        const uint hb = (uint(hw[i >> 1]) >> (8 * (i & 1))) & 0xFFu;
+        const int nib = int(hi ? (qb >> 4) : (qb & 0x0Fu));
+        const int qv  = (nib | int(((hb >> hshift) & 3u) << 4)) - 32;
         w[i] = dsc * half(qv);
     }
 }

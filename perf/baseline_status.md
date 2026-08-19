@@ -204,3 +204,58 @@ is fixed. Trigger matrix, retractions, harness degeneration guard, and
 the slimserve-canary auto-restart are documented in the incident entry
 in `perf/optimization_status.md`. TP8-tier numbers share the same
 spec+full-graph machinery and inherit the same risk caveat.
+
+## Muse-Glimmer-30B (Metal, M5 Max 128 GB)
+
+### Speculative Serving Baseline - 2026-08-14
+
+- Profile: `muse-kdyn-1` (kquant-dynamic GGUF, DFlash k=16, spec always on).
+- Workload: 256-token greedy essay bench (`muse_bench.py`), port 8078,
+  warmup + 3 runs; first-run number is the matched-position comparison
+  point (chassis declines thermally across a triplet).
+- Verify GEMMs route to tensor-ops kernels (`qgemm_sm_t`, variant 14) on
+  the M5 GPU neural accelerators; metallib at `-std=metal4.0`.
+
+| Metric | Value |
+| --- | ---: |
+| Spec-on decode (run 1/2/3) | 16.26 / 16.05 / 14.59 tok/s |
+| Plain fused decode (2026-08-13 ref) | 14.4 tok/s |
+| Acceptance | 1.73/draft (unchanged) |
+| llama.cpp same box (plain/spec best) | 26.75 / 30.8 tok/s |
+
+Spec-on now beats plain decode; the stale `--no-spec` advice was removed
+from `slimserve/profiles.json`. Raw artifacts:
+`perf/results/2026-08-14/tensor-mma/` and
+`perf/results/2026-08-14/qgemm-sm-profile/`.
+
+### Superseding Speculative Serving Baseline - 2026-08-15 (rested protocol)
+
+- Profile: `muse-kdyn-1`, fused verify default ON, tensor-ops kernel route.
+- Protocol: 45-min idle chassis, serve, 120 s settle, 3x256-token greedy
+  essay bench. This protocol replaces ad-hoc thermal states for all route
+  comparisons.
+
+| Metric | Value |
+| --- | ---: |
+| Spec-on decode (run 1/2/3) | 19.94 / 20.14 / 19.74 tok/s |
+| Same-protocol eager route reference | 17.81 / 17.56 / 17.58 tok/s |
+| Acceptance | 1.73/draft (unchanged) |
+
+Raw: `perf/results/2026-08-15/plain-step-decomp/e2e_fused_cool.txt` and
+`e2e_legacy_cool.txt`. Serving-side ceiling remains ~50-62 tok/s with the
+current drafter (see `perf/drafter_requirements.md` for the 100 tok/s
+drafter gate).
+
+### Long-Context Arm Added - 2026-08-15 (rested protocol, final build)
+
+| Metric | Value |
+| --- | ---: |
+| Short-ctx decode (run 1/2/3) | 19.97 / 19.97 / 19.86 tok/s |
+| 10k-ctx cached decode (run 2/3) | 10.97 / 11.00 tok/s |
+| Acceptance (mixed workload) | 1.66/draft |
+
+Long-context numbers reflect CORRECT global-layer attention (the eager
+window-clamp bug is fixed) plus the multi-query verify kernel inside the
+fused encoder. Bench discipline: decode from cached-prompt repeat runs
+only; long arms use this 10k form until a natural-document corpus arm
+lands. Raw: perf/results/2026-08-15/plain-step-decomp/e2e_final_rested.txt.

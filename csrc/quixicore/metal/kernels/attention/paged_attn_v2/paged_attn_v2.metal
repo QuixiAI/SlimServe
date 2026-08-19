@@ -106,6 +106,147 @@ kernel void paged_attention_partition(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multi-query verify partition: the speculative verify block's m rows (the
+// expanded pseudo-requests) COOPERATE in one threadgroup per (head,
+// partition). K/V stream from device ONCE per tile into threadgroup memory
+// (vs once per row in the expansion path -- the measured 17x re-read), then
+// each simdgroup runs its own row's online softmax over the staged tile with
+// its per-row causal boundary (row i sees ctx_len - m + i + 1) and window.
+// Partials layout matches paged_attention_partition, so the existing reduce
+// merges them unchanged (rows act as B). Grid: (H, 1, P), threads m*32.
+// ---------------------------------------------------------------------------
+
+template <typename T, int D>
+kernel void paged_attention_verify(
+    device const T *q [[buffer(0)]],          // (m, H, D)
+    device const T *key_cache [[buffer(1)]],
+    device const T *value_cache [[buffer(2)]],
+    device const int *block_table [[buffer(3)]],   // (1, S) -- one request
+    device const int *context_lens [[buffer(4)]],  // (1): base + m
+    device float *tmp_out [[buffer(5)]],      // (m, H, P, D)
+    device float *max_logits [[buffer(6)]],   // (m, H, P)
+    device float *exp_sums [[buffer(7)]],     // (m, H, P)
+    constant int &block_size [[buffer(8)]],
+    constant int &block_table_stride [[buffer(9)]],
+    constant float &scale [[buffer(10)]],
+    constant int &num_heads [[buffer(11)]],
+    constant int &num_kv_heads [[buffer(12)]],
+    constant int &num_partitions [[buffer(13)]],
+    constant int &partition_size [[buffer(14)]],
+    constant int &window [[buffer(15)]],
+    constant int &m_rows [[buffer(16)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+    constexpr int TILE = 16;  // keys staged per round (== KV block size)
+
+    const int head = (int)tgid.x;
+    const int part = (int)tgid.z;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int ctx_len = context_lens[0];      // base + m
+    const int row = (int)warp;                // this simdgroup's query row
+    // row's causal end within the sequence, and its window start
+    const int row_end = ctx_len - m_rows + row + 1;
+    const int row_start = (window > 0) ? max(0, row_end - window) : 0;
+
+    const int start = part * partition_size;
+    const int end = min(start + partition_size, ctx_len);
+
+    threadgroup T kt[TILE][D];
+    threadgroup T vt[TILE][D];
+
+    const long q_base = ((long)row * num_heads + head) * D;
+    const long stat_idx = ((long)row * num_heads + head) * num_partitions + part;
+    const long out_base = stat_idx * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[q_base + d]);
+        acc[i] = 0.0f;
+    }
+
+    float mx = NEG_INF, l = 0.0f;
+    const int threads = m_rows * 32;
+    for (int t0 = start; t0 < end; t0 += TILE) {
+        const int tile_n = min(TILE, end - t0);
+        // cooperative stage: all warps load this tile once
+        for (int e = (int)tid; e < tile_n * D; e += threads) {
+            const int tt = e / D;
+            const int d = e % D;
+            const int tok = t0 + tt;
+            const int block_col = tok / block_size;
+            const int slot = tok - block_col * block_size;
+            const int block = block_table[block_col];
+            if (block >= 0) {
+                const long cb =
+                    (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+                kt[tt][d] = key_cache[cb + d];
+                vt[tt][d] = value_cache[cb + d];
+            } else {
+                kt[tt][d] = T(0);
+                vt[tt][d] = T(0);
+            }
+        }
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        for (int tt = 0; tt < tile_n; ++tt) {
+            const int tok = t0 + tt;
+            if (tok >= row_start && tok < row_end) {
+                float partial = 0.0f;
+                for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                    const int d = (int)lane + 32 * i;
+                    partial += qv[i] * float(kt[tt][d]);
+                }
+                const float score = simd_sum(partial) * scale;
+                const float new_m = max(mx, score);
+                const float alpha = l == 0.0f ? 0.0f : exp(mx - new_m);
+                const float beta = exp(score - new_m);
+                for (int i = 0; i < VALUES_PER_LANE; ++i) {
+                    const int d = (int)lane + 32 * i;
+                    acc[i] = acc[i] * alpha + beta * float(vt[tt][d]);
+                }
+                l = l * alpha + beta;
+                mx = new_m;
+            }
+        }
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0) {
+        max_logits[stat_idx] = l == 0.0f ? NEG_INF : mx;
+        exp_sums[stat_idx] = l;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+    }
+}
+
+#define instantiate_paged_attention_verify(name, T, D)                        \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void paged_attention_verify<T, D>(                                         \
+     device const T *q [[buffer(0)]], device const T *key_cache [[buffer(1)]], \
+     device const T *value_cache [[buffer(2)]],                               \
+     device const int *block_table [[buffer(3)]],                             \
+     device const int *context_lens [[buffer(4)]],                            \
+     device float *tmp_out [[buffer(5)]], device float *max_logits [[buffer(6)]], \
+     device float *exp_sums [[buffer(7)]], constant int &block_size [[buffer(8)]], \
+     constant int &block_table_stride [[buffer(9)]],                          \
+     constant float &scale [[buffer(10)]], constant int &num_heads [[buffer(11)]], \
+     constant int &num_kv_heads [[buffer(12)]],                               \
+     constant int &num_partitions [[buffer(13)]],                             \
+     constant int &partition_size [[buffer(14)]],                             \
+     constant int &window [[buffer(15)]], constant int &m_rows [[buffer(16)]], \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     uint tid [[thread_index_in_threadgroup]],                                \
+     uint warp [[simdgroup_index_in_threadgroup]],                            \
+     uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_paged_attention_verify("paged_attention_verify_bfloat16_128", bf16, 128);
+
 // fp8 partition: identical online-softmax, but the caches hold uint8 (e4m3/e5m2) codes
 // dequantized on read with per-head k_scale/v_scale. tmp_out/max_logits/exp_sums stay fp32
 // so the existing (format-agnostic) reduce kernel merges the partitions unchanged.

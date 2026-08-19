@@ -303,6 +303,57 @@ inline std::string fftconv_kernel_name(int S) {
 inline std::string qgemm_kernel_name(const std::string& fmt) {
   return "qgemm_" + fmt;
 }
+// variant: 4 = 4 warps x 16 rows, 2 = 2 warps x 16 rows, 8 = 2 warps x 8
+// rows, 9 = 2 warps x 8 rows with split-K 4 (float partials + reduce pass).
+// 21..27 are BENCH-ONLY stage ablations of the 4-warp paired kernel
+// (qgemm_sm_p4a1..a7): per-stage measurement, parity intentionally broken.
+inline std::string qgemm_sm_kernel_name(const std::string& fmt, int variant) {
+  if (variant >= 21 && variant <= 27) {
+    return "qgemm_sm_p4a" + std::to_string(variant - 20) + "_" + fmt;
+  }
+  if (variant >= 28 && variant <= 30) {
+    return "qgemm_sm_t2w8a" + std::to_string(variant - 27) + "_" + fmt;
+  }
+  if (variant == 31) {
+    return "qgemm_sm_t2w8s1_" + fmt;
+  }
+  return (variant == 17   ? "qgemm_sm_t4_"
+          : variant == 16 ? "qgemm_sm_t2w8_"
+          : variant == 15 ? "qgemm_sm_t2_"
+          : variant == 14 ? "qgemm_sm_t_"
+          : variant == 13 ? "qgemm_sm_p8_"
+          : variant == 12 ? "qgemm_sm_p4_"
+          : variant == 11 ? "qgemm_sm_p_"
+          : variant == 10 ? "qgemm_sm_bk64_"
+          : variant == 9  ? "qgemm_sm_r8sk4_"
+          : variant == 8  ? "qgemm_sm_r8_"
+          : variant == 2  ? "qgemm_sm_w2_"
+                          : "qgemm_sm_") +
+         fmt;
+}
+inline int qgemm_sm_tg_threads(int variant) {
+  if (variant == 12 || variant == 14 || variant == 15 || variant == 17)
+    return 128;
+  if (variant == 13 || variant == 16) return 256;
+  if (variant >= 28 && variant <= 31) return 256;
+  if (variant >= 21 && variant <= 27) return 128;
+  return (variant == 4 ? 4 : 2) * 32;
+}
+inline int qgemm_sm_tg_rows(int variant) {
+  if (variant == 12 || variant == 14 || variant == 15 || variant == 17)
+    return 32;
+  if (variant == 13 || variant == 16) return 64;
+  if (variant >= 28 && variant <= 31) return 64;
+  if (variant >= 21 && variant <= 27) return 32;
+  return (variant == 8 || variant == 9 || variant == 10 || variant == 11)
+             ? 16
+             : (variant == 2 ? 32 : 64);
+}
+inline int qgemm_sm_split_k(int variant) {
+  return ((variant >= 9 && variant <= 17) || (variant >= 21 && variant <= 30))
+             ? 4
+             : 1;
+}
 inline std::string qgemv_kernel_name(const std::string& fmt) {
   return "qgemv_" + fmt;
 }
@@ -4246,6 +4297,40 @@ void launch_paged_attention_partition(
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 
+// Multi-query verify partition: the m expanded rows cooperate per (head,
+// partition) threadgroup, staging each K/V tile once. Partial layout matches
+// paged_attention_partition with batch == m, so the same reduce merges.
+template <class E>
+void launch_paged_attention_verify(
+    E& e, typename E::in_t q, typename E::in_t key_cache,
+    typename E::in_t value_cache, typename E::in_t block_table,
+    typename E::in_t context_lens, typename E::out_t tmp_out,
+    typename E::out_t max_logits, typename E::out_t exp_sums, int m_rows,
+    int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int num_partitions, int partition_size,
+    int window, const std::string& type_name) {
+  e.pipeline("paged_attention_verify_" + type_name + "_" +
+             std::to_string(head_size));
+  e.in(q, 0);
+  e.in(key_cache, 1);
+  e.in(value_cache, 2);
+  e.in(block_table, 3);
+  e.in(context_lens, 4);
+  e.out(tmp_out, 5);
+  e.out(max_logits, 6);
+  e.out(exp_sums, 7);
+  e.bytes(block_size, 8);
+  e.bytes(block_table_stride, 9);
+  e.bytes(scale, 10);
+  e.bytes(num_heads, 11);
+  e.bytes(num_kv_heads, 12);
+  e.bytes(num_partitions, 13);
+  e.bytes(partition_size, 14);
+  e.bytes(window, 15);
+  e.bytes(m_rows, 16);
+  e.dispatch(num_heads, 1, num_partitions, m_rows * 32, 1, 1);
+}
+
 // Cascade prefix partition: a shared CONTIGUOUS prefix KV (prefix_k/prefix_v
 // (prefix_len,H_KV,D)), emits (m,l,o) partials in the same layout as
 // paged_attention_partition. Reduce is reused.
@@ -5442,6 +5527,148 @@ void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq,
   e.bytes(M, 5);
   const int tile_m = fmt == "mxfp8" ? 64 : 32;
   e.dispatch(M / tile_m, N / 32, 1, 64, 1, 1);
+}
+
+// ----- qgemm_sm: small-M weight-streaming MMA GEMM. D@0 (N,32 half) Wq@1
+//        X@2 (K,32 half, host-padded) ; N@3 K@4 ; grid (1, N/tg_rows, 1),
+//        tg_threads threads. Every warp computes all 32 columns for its own
+//        row slice. -----
+template <class E>
+void launch_qgemm_sm(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int variant,
+                     const std::string& fmt) {
+  e.pipeline(qgemm_sm_kernel_name(fmt, variant));
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.dispatch(1, N / qgemm_sm_tg_rows(variant), qgemm_sm_split_k(variant),
+             qgemm_sm_tg_threads(variant), 1, 1);
+}
+
+// ----- qgemm_sm_rm: row-major bf16 X variant for the fused verify step.
+//        P@0 (4,N,32 float partials) Wq@1 X@2 (M,K bf16) ; N@3 K@4 M@5 ;
+//        grid (1, N/16, 4), 64 threads. Fold with qgemm_sm_reduce_rm. -----
+template <class E>
+void launch_qgemm_sm_rm(E& e, typename E::out_t p, typename E::in_t wq,
+                        typename E::in_t x, int N, int K, int M,
+                        const std::string& fmt) {
+  e.pipeline("qgemm_sm_rm_" + fmt);
+  e.out(p, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.bytes(M, 5);
+  e.dispatch(1, N / 16, 4, 64, 1, 1);
+}
+
+// ----- muse_xpose32: (m,K) bf16 -> (K,32) half transpose+pad. out@0 x@1 ;
+//        K@2 m@3 ; grid ceil(K*32/256), 256 threads. -----
+template <class E>
+void launch_muse_xpose32(E& e, typename E::out_t out, typename E::in_t x, int K,
+                         int m) {
+  e.pipeline("mittens::muse_xpose32");
+  e.out(out, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.bytes(m, 3);
+  e.dispatch((K * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- qgemm_sm_reduce_rm: fold rm partials into bf16 (M,N). D@0 P@1 ;
+//        N@2 M@3 ; grid ceil(M*N/256), 256 threads. -----
+// uint4-native q4_K route: xsum precomputes per-group X column sums (the
+// rank-1 min-term), then one dispatch covers the whole GEMM.
+template <class E>
+void launch_qgemm_sm_u4_xsum(E& e, typename E::out_t xs, typename E::in_t x,
+                             int K) {
+  e.pipeline("mittens::qgemm_sm_u4_xsum");
+  e.out(xs, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.dispatch((K / 32 * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_u4(E& e, typename E::out_t p, typename E::in_t wu,
+                        typename E::in_t x, typename E::in_t sc,
+                        typename E::in_t mn, typename E::in_t xs, int N,
+                        int K) {
+  e.pipeline("mittens::qgemm_sm_u4");
+  e.out(p, 0);
+  e.in(wu, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.in(mn, 4);
+  e.in(xs, 5);
+  e.bytes(N, 6);
+  e.bytes(K, 7);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+// glue-free u4: (M, K) bf16 X straight in, reduce_rm emits (M, N) bf16
+template <class E>
+void launch_qgemm_sm_u4b_xsum(E& e, typename E::out_t xs, typename E::in_t x,
+                              int K, int M) {
+  e.pipeline("mittens::qgemm_sm_u4b_xsum");
+  e.out(xs, 0);
+  e.in(x, 1);
+  e.bytes(K, 2);
+  e.bytes(M, 3);
+  e.dispatch((K / 32 * 32 + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_u4b(E& e, typename E::out_t p, typename E::in_t wu,
+                         typename E::in_t x, typename E::in_t sc,
+                         typename E::in_t mn, typename E::in_t xs, int N, int K,
+                         int M) {
+  e.pipeline("mittens::qgemm_sm_u4b");
+  e.out(p, 0);
+  e.in(wu, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.in(mn, 4);
+  e.in(xs, 5);
+  e.bytes(N, 6);
+  e.bytes(K, 7);
+  e.bytes(M, 8);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+// int8-native q6_K route (no min-term; -32 folded into the repack)
+template <class E>
+void launch_qgemm_sm_u8(E& e, typename E::out_t p, typename E::in_t wq8,
+                        typename E::in_t x, typename E::in_t sc, int N, int K) {
+  e.pipeline("mittens::qgemm_sm_u8");
+  e.out(p, 0);
+  e.in(wq8, 1);
+  e.in(x, 2);
+  e.in(sc, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.dispatch(1, N / 64, 4, 128, 1, 1);
+}
+template <class E>
+void launch_qgemm_sm_reduce_rm(E& e, typename E::out_t d, typename E::in_t p,
+                               int N, int M) {
+  e.pipeline("mittens::qgemm_sm_reduce_rm");
+  e.out(d, 0);
+  e.in(p, 1);
+  e.bytes(N, 2);
+  e.bytes(M, 3);
+  e.dispatch((M * N + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- qgemm_sm_reduce: fold split-K float partials (SK,N,32) into half
+//        (N,32). D@0 P@1 ; N@2 SK@3 ; grid ceil(N*32/256), 256 threads. -----
+template <class E>
+void launch_qgemm_sm_reduce(E& e, typename E::out_t d, typename E::in_t p,
+                            int N, int split_k) {
+  e.pipeline("mittens::qgemm_sm_reduce");
+  e.out(d, 0);
+  e.in(p, 1);
+  e.bytes(N, 2);
+  e.bytes(split_k, 3);
+  e.dispatch((N * 32 + 255) / 256, 1, 1, 256, 1, 1);
 }
 
 // ----- qgemm_actorder: GPTQ act-order, in-kernel g_idx gather. D@0 Wq@1 X@2

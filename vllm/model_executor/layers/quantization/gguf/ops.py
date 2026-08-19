@@ -105,9 +105,7 @@ def ggml_mul_mat_vec_prequant_a8(
     if _is_metal():
         raise NotImplementedError("prequantized GGUF GEMV is CUDA-only")
     _load_stable_libtorch()
-    return torch.ops._C.ggml_mul_mat_vec_prequant_a8(
-        W, X, quant_X, quant_type, row
-    )
+    return torch.ops._C.ggml_mul_mat_vec_prequant_a8(W, X, quant_X, quant_type, row)
 
 
 def ggml_dsv4_repack_q8_0_aligned(W: torch.Tensor) -> torch.Tensor:
@@ -141,6 +139,37 @@ def ggml_mul_mat_a8(
         return quixicore_ops.ggml_mul_mat_a8(W, X, quant_type, row)
     _load_stable_libtorch()
     return torch.ops._C.ggml_mul_mat_a8(W, X, quant_type, row)
+
+
+def ggml_mul_mat_sm(
+    W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
+) -> torch.Tensor:
+    """Metal-only small-M MMA GEMM for the speculative verify band."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_mul_mat_sm(W, X, quant_type, row)
+
+
+def muse_u4_repack(
+    qweight: torch.Tensor, n_rows: int, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load-time q4_K -> uint4-native repack (Metal tensor-unit operand)."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.muse_u4_repack(qweight, n_rows, k)
+
+
+def ggml_mul_mat_sm_u4(
+    wu: torch.Tensor,
+    sc: torch.Tensor,
+    mn: torch.Tensor,
+    x: torch.Tensor,
+    row: int,
+) -> torch.Tensor:
+    """Metal-only uint4-native q4_K GEMM for the verify band (M 9..32)."""
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_mul_mat_sm_u4(wu, sc, mn, x, row)
 
 
 def ggml_moe_a8(
@@ -311,9 +340,7 @@ def ggml_dsv4_moe_down_output_owned(
     )
 
 
-def ggml_dsv4_repack_q2_k(
-    W2: torch.Tensor, intermediate: int
-) -> torch.Tensor:
+def ggml_dsv4_repack_q2_k(W2: torch.Tensor, intermediate: int) -> torch.Tensor:
     if _is_metal():
         raise NotImplementedError("DSV4 Q2_K Ampere repack is CUDA-only")
     _load_stable_libtorch()
@@ -471,9 +498,7 @@ def ggml_dsv4_shared_gate_up_swiglu(
     if _is_metal():
         raise NotImplementedError("DSV4 shared-expert Ampere fusion is CUDA-only")
     _load_stable_libtorch()
-    return torch.ops._C.ggml_dsv4_shared_gate_up_swiglu(
-        W, X, swiglu_limit, quant_input
-    )
+    return torch.ops._C.ggml_dsv4_shared_gate_up_swiglu(W, X, swiglu_limit, quant_input)
 
 
 def ggml_dsv4_shared_gate_up_swiglu_q8_1(
@@ -492,7 +517,7 @@ def ggml_dsv4_shared_gate_up_swiglu_q8_1(
 
 def ggml_dsv4_o_proj_q8_0(
     W: torch.Tensor,
-    O: torch.Tensor,
+    o: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     local_groups: int,
@@ -502,7 +527,7 @@ def ggml_dsv4_o_proj_q8_0(
         raise NotImplementedError("DSV4 native Q8 o_proj is CUDA-only")
     _load_stable_libtorch()
     return torch.ops._C.ggml_dsv4_o_proj_q8_0(
-        W, O, positions, cos_sin_cache, local_groups, rope_dim
+        W, o, positions, cos_sin_cache, local_groups, rope_dim
     )
 
 
