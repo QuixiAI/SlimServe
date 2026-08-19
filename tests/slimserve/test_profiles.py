@@ -59,17 +59,28 @@ def test_every_profile_uses_dspark_with_turboquant():
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     plan = resolve("dsv4-q4ktail-2", "a100", 2, "IQ2_XXS")
-    monkeypatch.setattr(cli.hardware, "detect", Mock(return_value=Mock(
-        known=True,
-        platform="a100",
-        count=2,
-        memory_bytes=0,
-        device_name="A100",
-    )))
+    monkeypatch.setattr(
+        cli.hardware,
+        "detect",
+        Mock(
+            return_value=Mock(
+                known=True,
+                platform="a100",
+                count=2,
+                memory_bytes=0,
+                device_name="A100",
+            )
+        ),
+    )
     monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=plan))
     monkeypatch.setattr(cli.fetch, "ensure", Mock())
     seen = []
-    monkeypatch.setattr(cli, "_chat", lambda resolved, *_args: seen.append(resolved) or 0)
+
+    def _capture_chat(resolved, *_args):
+        seen.append(resolved)
+        return 0
+
+    monkeypatch.setattr(cli, "_chat", _capture_chat)
 
     assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
     assert len(seen) == 1
@@ -91,6 +102,8 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
+    assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
 
 
 def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
@@ -105,7 +118,9 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
 
     assert set(compatible) == expected
     assert {"k3-xxs-6", "k3-xxs-8"}.issubset(compatible)
-    assert {"dsv4-xxs-1", "dsv4-q4ktail-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(compatible)
+    assert {"dsv4-xxs-1", "dsv4-q4ktail-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(
+        compatible
+    )
 
 
 def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
@@ -277,6 +292,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
+        "qwen38-27b",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -507,9 +523,7 @@ def test_engine_kwargs_drop_server_only_settings():
 def _all_plans():
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
-            yield resolve(
-                profile_id, platform, 8, None, memory_bytes=512 * 1024**3
-            )
+            yield resolve(profile_id, platform, 8, None, memory_bytes=512 * 1024**3)
 
 
 def test_every_profile_serves_thinking_and_tool_calling_by_default():
@@ -525,9 +539,7 @@ def test_every_profile_serves_thinking_and_tool_calling_by_default():
         if plan.source_key != "muse-glimmer":
             assert engine["tool_call_parser"], plan.profile_id
         # No profile forces the chat client back out of thinking mode.
-        assert plan.chat_template_kwargs.get("thinking") is not False, (
-            plan.profile_id
-        )
+        assert plan.chat_template_kwargs.get("thinking") is not False, plan.profile_id
 
 
 def test_thinking_and_tool_defaults_are_serve_only():

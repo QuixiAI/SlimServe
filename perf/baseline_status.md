@@ -259,3 +259,38 @@ window-clamp bug is fixed) plus the multi-query verify kernel inside the
 fused encoder. Bench discipline: decode from cached-prompt repeat runs
 only; long arms use this 10k form until a natural-document corpus arm
 lands. Raw: perf/results/2026-08-15/plain-step-decomp/e2e_final_rested.txt.
+
+## Qwen3.8-27B (qwen38-q2kxl-1, Metal M5 Max) - campaign started 2026-08-19
+
+### llama.cpp Reference Bar - 2026-08-20 (build-qwen38, master ece963f41)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode (run 1/2/3, matched positions) | 35.67 / 35.37 / 33.55 tok/s |
+| Plain decode, code prompt | 34.35 tok/s |
+| Greedy determinism (3 runs) | identical |
+
+SlimServe serving path is under construction (profile gated
+in-progress); no SlimServe baseline yet. Vendor DFlash 2 numbers for
+this pairing: mean acceptance 4.80 at block 8, 2.7-3.4x over plain at
+batch 1 => the spec target implied by the llama.cpp step time is
+~90-120 tok/s. Raw: perf/results/2026-08-20/qwen38-llamacpp-ref/.
+
+### First SlimServe Baseline - 2026-08-20 (plain decode, bring-up build)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode (run 1/2/3) | 2.52 / 2.51 / 2.47 tok/s |
+| Greedy parity vs llama.cpp | 504 chars identical, then forks (fp16 dequant numerics) |
+| Layer parity vs llama.cpp | all 64 layers cos >= 0.9997 |
+
+Known-attributed gap vs the 35.67 llama.cpp bar: sequential-python GDN
+scan (dispatch-bound ~8.7x) + fp16 dequant bytes (2.3x). Raw:
+perf/results/2026-08-20/qwen38-first-e2e/.
+
+NOTE 2026-08-20: the "plain decode 2.52/2.51/2.47" row above was measured
+at temperature 0, which is not a served configuration (greedy is banned
+stack-wide -- user directive; see notebook (20)). Step-time attribution
+stands; the protocol going forward is the model's shipped sampling
+defaults (temp 1.0 / top_p 0.95 / top_k 20), seeded. Re-baseline lands
+with the speculation measurements.

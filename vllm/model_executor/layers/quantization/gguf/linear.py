@@ -29,6 +29,7 @@ from .params import (
 from .utils import (
     DEQUANT_TYPES,
     IMATRIX_QUANT_TYPES,
+    METAL_MMQ_QUANT_TYPES,
     MMQ_QUANT_TYPES,
     MMVQ_QUANT_TYPES,
     UNQUANTIZED_TYPES,
@@ -239,8 +240,25 @@ def _fused_mul_mat_gguf(
             qweight, qweight_type, weight.shape[0], weight.shape[1], weight
         )
         y = x @ weight.T
-    elif qweight_type in MMQ_QUANT_TYPES and _mmq_shape_ok(x, qweight):
+    elif qweight_type in (
+        METAL_MMQ_QUANT_TYPES if current_platform.is_metal() else MMQ_QUANT_TYPES
+    ) and _mmq_shape_ok(x, qweight):
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
+    elif (
+        current_platform.is_metal()
+        and qweight_type in MMVQ_QUANT_TYPES
+        and mmvq_safe > 0
+    ):
+        # Tile-ineligible shape (N % 32 != 0) past the vector-kernel batch
+        # limit: chunk rows through the vector kernel. Metal has no runtime
+        # dequant, so this is the correctness fallback for odd-N quantized
+        # layers; no module in the current profiles hits it on the hot path.
+        y = torch.cat(
+            [
+                ops.ggml_mul_mat_vec_a8(qweight, xc, qweight_type, qweight.shape[0])
+                for xc in x.split(mmvq_safe)
+            ]
+        )
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
