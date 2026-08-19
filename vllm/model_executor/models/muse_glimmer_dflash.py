@@ -33,6 +33,157 @@ logger = init_logger(__name__)
 
 
 class MuseGlimmerDFlashModel(DFlashQwen3Model):
+    _fused_ready: bool | None = None
+
+    def _init_fused_step(self) -> bool:
+        """Register geometry + weights for the fused single-command-buffer
+        drafter forward (dflash_step in the Metal extension)."""
+        try:
+            import os
+
+            from vllm.quixicore.ops import _qc
+
+            qc = _qc()
+            cfg = self.config
+            heads = cfg.num_attention_heads
+            head_dim = getattr(cfg, "head_dim", cfg.hidden_size // heads)
+            dflash_cfg = getattr(cfg, "dflash_config", {}) or {}
+            window = dflash_cfg.get("swa_window_size") or getattr(
+                cfg, "sliding_window", 0
+            )
+            if not window:
+                return False
+
+            def shards(module, count):
+                # Mixed-type merged layers (the drafter QKV: q4/q4/q6)
+                # materialize per-shard views on first forward and release
+                # the merged buffer; reuse those views if present.
+                hetero = getattr(module, "_gguf_hetero_shards", None)
+                if hetero is not None:
+                    ws = [w for w, _ in hetero]
+                    ts = [int(t) for _, t in hetero]
+                    assert len(ws) == count
+                    return ws, ts
+                qw = module.qweight
+                fallback = int(module.qweight_type.weight_type)
+                if not getattr(qw, "shard_offset_map", None):
+                    return [qw], [fallback]
+                ws, ts = [], []
+                for idx in qw.shard_id:
+                    start, end, offset = qw.shard_offset_map[idx]
+                    ws.append(qw[start:end, :offset].contiguous())
+                    ts.append(
+                        int(module.qweight_type.shard_weight_type.get(idx, fallback))
+                    )
+                assert len(ws) == count
+                return ws, ts
+
+            trunc = int(os.environ.get("DFLASH_FUSED_TRUNC", "0")) or len(self.layers)
+            qc.dflash_step_init(
+                min(trunc, len(self.layers)),
+                cfg.hidden_size,
+                heads,
+                cfg.num_key_value_heads,
+                head_dim,
+                cfg.intermediate_size,
+                window,
+                cfg.rope_theta,
+                cfg.rms_norm_eps,
+                17,
+                self.norm.weight.data,
+            )
+            for i, layer in enumerate(self.layers):
+                if i >= trunc:
+                    break
+                attn = layer.self_attn
+                qkv_w, qkv_t = shards(attn.qkv_proj, 3)
+                gu_w, gu_t = shards(layer.mlp.gate_up_proj, 2)
+                kv_cache = attn.attn.kv_cache
+                if isinstance(kv_cache, (list, tuple)):
+                    kv_cache = kv_cache[0]
+                qc.dflash_step_layer(
+                    i,
+                    qkv_w,
+                    qkv_t,
+                    attn.o_proj.qweight,
+                    int(attn.o_proj.qweight_type.weight_type),
+                    gu_w,
+                    gu_t,
+                    layer.mlp.down_proj.qweight,
+                    int(layer.mlp.down_proj.qweight_type.weight_type),
+                    layer.input_layernorm.weight.data,
+                    attn.q_norm.weight.data,
+                    attn.k_norm.weight.data,
+                    layer.post_attention_layernorm.weight.data,
+                    kv_cache,
+                )
+            return True
+        except Exception:
+            logger.exception("fused dflash drafter step unavailable; staying on eager")
+            return False
+
+    def _maybe_fused_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Single-command-buffer drafter forward for the block-denoise shape
+        (one request, whole block queried at once, BIDIRECTIONAL within the
+        block: every expanded row attends to the full base + m sequence).
+        Gated OFF by default until the rested A/B passes."""
+        import os
+
+        if os.environ.get("VLLM_MUSE_FUSED_DRAFTER", "0") != "1":
+            return None
+        if positions.device.type != "mps":
+            return None
+        from vllm.forward_context import get_forward_context
+        from vllm.quixicore import quixicore_ops
+
+        metadata = get_forward_context().attn_metadata
+        if not isinstance(metadata, dict):
+            return None
+        if self._fused_ready is None:
+            self._fused_ready = quixicore_ops.is_available() and self._init_fused_step()
+        if not self._fused_ready:
+            return None
+        meta = metadata.get(self.layers[0].self_attn.attn.layer_name)
+        if meta is None:
+            return None
+        m = meta.num_actual_tokens
+        if not (meta.num_reqs == 1 and meta.max_query_len == m and m <= 17):
+            return None
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+        if input_embeds.shape[0] != m or input_embeds.dtype != torch.bfloat16:
+            return None
+        from vllm.quixicore.ops import _qc
+
+        x = input_embeds.contiguous()
+        pos = positions.to(torch.int32)
+        bt = meta.block_table[:1].expand(m, -1)
+        # This fork's DFlash runs SWA layers CAUSAL (qwen3_dflash.py:59; the
+        # published config sets no dflash_config.causal override), so the
+        # expansion is the target verify's exact per-row causal construction:
+        # row i sees base + i + 1. (`+ steps` also materializes the tensor;
+        # the kernel reads seq_lens as a contiguous int32 array.)
+        steps = torch.arange(m, dtype=torch.int32, device=x.device)
+        sl = (meta.seq_lens_gpu[:1] - (m - 1)).expand(m) + steps
+        _qc().dflash_step_run(x, pos, bt, sl, meta.slot_mapping.to(torch.long))
+        return self.norm(x)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        input_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        fused = self._maybe_fused_forward(input_ids, positions, input_embeds)
+        if fused is not None:
+            return fused
+        return super().forward(input_ids, positions, input_embeds)
+
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
@@ -94,6 +245,34 @@ class MuseGlimmerDFlashModel(DFlashQwen3Model):
 
 
 class MuseGlimmerDFlashDraftModel(DFlashQwen3ForCausalLM):
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Greedy draft sampling in one command buffer (shared lm_head GEMM
+        + row argmax; softcap/scale are argmax-invariant). Enabled via
+        speculative_config.use_local_argmax_reduction; falls back to the
+        compute_logits path off-Metal or off-shape."""
+        lm = self.lm_head
+        qw = getattr(lm, "qweight", None)
+        m = hidden_states.shape[0]
+        if (
+            hidden_states.device.type == "mps"
+            and qw is not None
+            and 9 <= m <= 17
+            and qw.shape[0] % 64 == 0
+        ):
+            try:
+                from vllm.quixicore.ops import _qc
+
+                return _qc().dflash_sample_greedy(
+                    hidden_states.contiguous(),
+                    qw,
+                    int(lm.qweight_type.weight_type),
+                    qw.shape[0],
+                )
+            except Exception:
+                logger.exception("fused greedy sampling failed; eager fallback")
+        logits = self.compute_logits(hidden_states)
+        return logits.argmax(dim=-1)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -127,10 +306,29 @@ class MuseGlimmerDFlashDraftModel(DFlashQwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(self.config.draft_vocab_size)
         self.draft_id_to_target_id = None
 
+    @staticmethod
+    def _remap_published(name: str) -> str:
+        """Map the published safetensors names (bare, `encoder.*`) onto the
+        module tree. The GGUF adapter already emits HF-style names, which
+        pass through unchanged."""
+        if name.startswith("model."):
+            return name
+        if name.startswith("encoder.fc."):
+            return "model.fc." + name[len("encoder.fc.") :]
+        if name.startswith("encoder.output_norm_enc."):
+            return "model.hidden_norm." + name[len("encoder.output_norm_enc.") :]
+        if name.startswith("layers."):
+            return "model." + name
+        if name == "norm.weight":
+            return "model.norm.weight"
+        return name
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        # Names are already HF-style from the GGUF adapter; no re-prefixing.
+        # Names are already HF-style from the GGUF adapter; the published
+        # safetensors assistant needs the remap above.
         model_weights = {}
         for name, loaded_weight in weights:
+            name = self._remap_published(name)
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
@@ -145,5 +343,8 @@ class MuseGlimmerDFlashDraftModel(DFlashQwen3ForCausalLM):
         )
         loaded.add("lm_head.weight")
         loaded.add("model.embed_tokens.weight")
+        # Filled from the target's embedding during sharing setup, like the
+        # two above (absent from both drafter artifacts).
+        loaded.add("model.mask_embedding")
         self.model._build_fused_kv_buffers()
         return loaded

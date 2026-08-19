@@ -20,8 +20,16 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_model_config = speculative_config.draft_model_config
     # Select an attention backend that supports the drafter's attention: mixing
     # a non-causal layer onto a causal-only backend would fail.
+    # The drafter's artifact format is independent of the target's: a GGUF
+    # target with a safetensors drafter (e.g. the published bf16 assistant)
+    # must not inherit load_format=gguf.
+    draft_is_gguf = str(draft_model_config.model).endswith(".gguf")
+    load_config = vllm_config.load_config
+    if not draft_is_gguf and getattr(load_config, "load_format", None) == "gguf":
+        load_config = replace(load_config, load_format="auto")
     draft_vllm_config = replace(
         vllm_config,
+        load_config=load_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),

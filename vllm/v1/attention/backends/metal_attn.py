@@ -201,12 +201,21 @@ class MetalAttentionImpl(AttentionImpl):
         self, metadata: MetalAttentionMetadata, num_tokens: int
     ) -> bool:
         q_len = metadata.max_query_len
-        return (
+        if not (
             metadata.causal
             and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
             and num_tokens == metadata.num_reqs * q_len
             and self.head_size in _PAGED_HEAD_SIZES
-        )
+        ):
+            return False
+        # Cached-prompt A/B at 1734-token context: expansion 16.1 tok/s vs
+        # SDPA gather 14.55 -- expansion wins at least through ~2k. The
+        # knob exists for larger-context research (the per-row KV re-read
+        # grows linearly and must cross over somewhere).
+        import os
+
+        ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
+        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
 
     def forward(
         self,
@@ -287,6 +296,34 @@ class MetalAttentionImpl(AttentionImpl):
                 expanded_block_table = attn_metadata.block_table.repeat_interleave(
                     q_len, dim=0
                 )
+                # Global (unwindowed) layers at length: the multi-query
+                # kernel shares each K/V read across the m rows (measured
+                # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
+                # expansion path (scan capped by the window -- a wash).
+                use_mq = (
+                    self.sliding_window is None
+                    and attn_metadata.num_reqs == 1
+                    and int(seq_lens.max().item()) > 1024
+                )
+                if use_mq:
+                    if not getattr(self, "_mq_logged", False):
+                        self._mq_logged = True
+                        logger.info(
+                            "multi-query verify attention engaged (ctx=%d)",
+                            int(seq_lens.max().item()),
+                        )
+                    out.copy_(
+                        quixicore_ops.paged_attention_verify(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            seq_lens,
+                            self.scale,
+                            0,
+                        )
+                    )
+                    return output
                 out.copy_(
                     quixicore_ops.paged_attention(
                         query[:num_tokens].contiguous(),

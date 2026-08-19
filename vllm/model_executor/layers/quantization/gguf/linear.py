@@ -192,6 +192,28 @@ def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
     return 16
 
 
+_SM_QUANT_TYPES = (
+    WeightType.Q4_0,
+    WeightType.Q8_0,
+    WeightType.Q4_K,
+    WeightType.Q5_K,
+    WeightType.Q6_K,
+)
+
+
+def _sm_route_ok(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> bool:
+    """Metal speculative-verify band: the weight-streaming MMA GEMM beats the
+    multi-row GEMV from ~8 rows up (measured on muse shapes at M=17: 1.5x on
+    Q4_K/Q6_K, 1.1x on Q5_K) and stays flat through the padded width of 32."""
+    if not current_platform.is_metal():
+        return False
+    if not (9 <= x.shape[0] <= 32):
+        return False
+    if qweight_type not in _SM_QUANT_TYPES:
+        return False
+    return qweight.shape[0] % 16 == 0 and x.shape[1] % 32 == 0
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -203,7 +225,9 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    if _sm_route_ok(x, qweight, qweight_type):
+        y = ops.ggml_mul_mat_sm(qweight, x, qweight_type, qweight.shape[0])
+    elif x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     elif (
         qweight_type == WeightType.Q8_0
@@ -327,6 +351,42 @@ class GGUFLinearMethod(LinearMethodBase):
             )
         self._create_padded_weight_param(layer)
         self._create_dsv4_aligned_q8_weight(layer)
+        self._create_muse_u4_weight(layer)
+
+    def _create_muse_u4_weight(self, layer: torch.nn.Module) -> None:
+        """Load-time uint4-native repack for single-shard Q4_K layers (Metal).
+
+        The M5 tensor units read packed uint4 operands directly; the repack
+        (tile-major quants + per-32-group scale/min planes) lets the verify
+        band skip dequant staging entirely -- measured -15% over the staged
+        tensor kernel on ffn_down under matched conditions. The original
+        qweight stays for the GEMV (M<9) and prefill routes, so this is a
+        bounded load-time duplicate (~75 MB/layer on muse down), not a lazy
+        cache.
+        """
+        if not current_platform.is_metal():
+            return
+        # Default ON: part of the route that won the same-protocol rested
+        # A/B (2026-08-15). VLLM_MUSE_U4=0 disables for A/B.
+        if os.environ.get("VLLM_MUSE_U4", "1").lower() in ("0", "false"):
+            return
+        fallback_type = layer.qweight_type.weight_type
+        shard_types = list(layer.qweight_type.shard_weight_type.values())
+        weight_types = shard_types or [fallback_type]
+        if len(weight_types) != 1 or weight_types[0] != int(WeightType.Q4_K):
+            return
+        qweight = layer.qweight
+        if getattr(qweight, "shard_offset_map", None):
+            return
+        n_rows = qweight.shape[0]
+        k = qweight.shape[1] // 144 * 256
+        if n_rows % 64 != 0 or k % 128 != 0:
+            return
+        wu, sc, mn = ops.muse_u4_repack(qweight.data, n_rows, k)
+        device = qweight.device
+        layer.register_buffer("_muse_u4_wu", wu.to(device), persistent=False)
+        layer.register_buffer("_muse_u4_sc", sc.to(device), persistent=False)
+        layer.register_buffer("_muse_u4_mn", mn.to(device), persistent=False)
 
     def _create_dsv4_aligned_q8_weight(self, layer: torch.nn.Module) -> None:
         if not _dsv4_aligned_q8_enabled(layer):
@@ -407,6 +467,15 @@ class GGUFLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
+
+        u4 = getattr(layer, "_muse_u4_wu", None)
+        if u4 is not None and 9 <= x.shape[0] <= 32:
+            out = ops.ggml_mul_mat_sm_u4(
+                u4, layer._muse_u4_sc, layer._muse_u4_mn, x, layer.qweight.shape[0]
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out
 
         aligned = getattr(layer, "_dsv4_q8_aligned", None)
         if aligned is not None and x.shape[0] <= 8:
