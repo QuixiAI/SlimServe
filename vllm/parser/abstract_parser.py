@@ -418,7 +418,7 @@ class DelegatingParser(Parser):
             return [], content
 
         if request.tool_choice == "none":
-            if self._engine_based:
+            if self._engine_based or tool_parser.handles_tool_choice_none:
                 result = self.extract_tool_calls(content or "", request=request)
                 return [], result.content
             return [], content
@@ -647,10 +647,11 @@ class DelegatingParser(Parser):
         supports_required_and_named = self._tool_parser.supports_required_and_named
 
         if request.tool_choice == "none":
-            if self._engine_based:
+            if self._engine_based or self._tool_parser.handles_tool_choice_none:
                 # Engine-backed parsers route content extraction through
-                # extract_tool_calls_streaming, so run the full pipeline
-                # and strip tool_calls after.
+                # extract_tool_calls_streaming. Some token-based parsers also
+                # own model-native channel framing. Run either full pipeline
+                # and strip tool_calls after so "none" never re-enables calls.
                 delta_message = self.extract_tool_calls_streaming(
                     previous_text,
                     current_text,

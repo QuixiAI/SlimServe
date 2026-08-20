@@ -22,6 +22,7 @@ from vllm.entrypoints.openai.responses.utils import (
     construct_tool_dicts,
 )
 from vllm.parser.parser_manager import ParserManager
+from vllm.renderers.online_renderer import _adapt_responses_custom_tool_rendering
 from vllm.tool_parsers.muse_glimmer_tool_parser import MuseGlimmerToolParser
 from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
 
@@ -514,6 +515,73 @@ def test_muse_custom_continuation_stays_function_shaped_for_chat_template():
         "arguments": {"input": RAW_PATCH},
     }
     assert messages[1]["tool_call_id"] == "call_1"
+
+
+def test_custom_continuation_adapts_history_when_tool_choice_is_none():
+    request = _apply_patch_request(tool_choice="none")
+    messages = construct_chat_messages_with_tool_call(
+        [
+            ResponseCustomToolCall(
+                type="custom_tool_call",
+                id="item_1",
+                call_id="call_1",
+                name="apply_patch",
+                input=RAW_PATCH,
+            ),
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": "Done!",
+            },
+        ]
+    )
+    tool_dicts = construct_tool_dicts(request.tools, request.tool_choice)
+    assert tool_dicts is None
+
+    adapted_messages, adapted_tools = _adapt_responses_custom_tool_rendering(
+        request,
+        messages,
+        tool_dicts,
+    )
+
+    assert adapted_tools is None
+    call = adapted_messages[0]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"] == {
+        "name": "apply_patch",
+        "arguments": {"input": RAW_PATCH},
+    }
+
+
+def test_muse_tool_choice_none_strips_continuation_envelopes():
+    request = _apply_patch_request(tool_choice="none", stream=True)
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="muse_glimmer",
+        reasoning_parser_name="muse_glimmer",
+        enable_auto_tools=True,
+    )
+    assert parser_cls is not None
+    parser = parser_cls(_DummyTokenizer(), request.tools)
+    output = (
+        "We applied patch. Done.<|eom|>"
+        "<|start|>assistant to=user<|message|>"
+        "Patch applied successfully.<|eot|>"
+    )
+
+    delta = parser.parse_delta(
+        delta_text=output,
+        delta_token_ids=[2],
+        request=request,
+        # A continuation prompt already contains completed assistant segments,
+        # so the unified parser starts in its post-reasoning/tool phase.
+        prompt_token_ids=[1, 2],
+        finished=True,
+    )
+
+    assert delta is not None
+    assert delta.tool_calls == []
+    assert delta.content == "We applied patch. Done.Patch applied successfully."
+    assert "<|" not in delta.content
 
 
 def test_muse_adjust_request_keeps_atem_markers_visible():

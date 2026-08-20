@@ -49,6 +49,19 @@ from vllm.utils.mistral import mt as _mt
 logger = init_logger(__name__)
 
 
+def _adapt_responses_custom_tool_rendering(
+    request: Any,
+    messages: list[dict[str, Any]],
+    tool_dicts: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+    if not isinstance(request, ResponsesRequest):
+        return messages, tool_dicts
+    messages = adapt_custom_tool_calls_for_chat_template(messages)
+    if any(tool.get("type") == "custom" for tool in (tool_dicts or [])):
+        tool_dicts = adapt_custom_tools_for_chat_template(tool_dicts)
+    return messages, tool_dicts
+
+
 class OnlineRenderer:
     def __init__(
         self,
@@ -361,16 +374,22 @@ class OnlineRenderer:
             ),
         )
 
-        if isinstance(request, ResponsesRequest) and any(
-            tool.get("type") == "custom" for tool in (tool_dicts or [])
-        ):
-            # Keep the Responses representation generic until rendering. Most
-            # model templates understand function-shaped tools. The parser's
-            # model-format adapter restores raw custom-tool semantics at the
-            # generated payload boundary.
-            tool_dicts = adapt_custom_tools_for_chat_template(tool_dicts)
-            messages = adapt_custom_tool_calls_for_chat_template(messages)
-            default_template_kwargs["tools"] = tool_dicts
+        if isinstance(request, ResponsesRequest):
+            # A continuation may disable tools while retaining an earlier
+            # Responses custom-tool call in its history. Adapt history
+            # independently of the current tool definitions so templates that
+            # expect ``tool_call.function`` can render tool_choice="none".
+            messages, tool_dicts = _adapt_responses_custom_tool_rendering(
+                request,
+                messages,
+                tool_dicts,
+            )
+            if tool_dicts is not None:
+                # Keep the Responses representation generic until rendering.
+                # Most model templates understand function-shaped tools. The
+                # parser's model-format adapter restores raw custom-tool
+                # semantics at the generated payload boundary.
+                default_template_kwargs["tools"] = tool_dicts
 
         tok_params = request.build_tok_params(self.model_config)
         chat_params = request.build_chat_params(
