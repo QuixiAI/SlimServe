@@ -364,7 +364,7 @@
       "local_dir": "Muse-Glimmer-30B-GGUF",
       "shared": [
         {
-          "path": "mmproj-kquant.gguf",
+          "path": "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf",
           "bytes": 1400328928
         }
       ],
@@ -372,7 +372,7 @@
       "quants": {
         "kquant-dynamic": {
           "title": "K-quant dynamic (per-layer mixed)",
-          "bytes": 19653957984,
+          "bytes": 19653960832,
           "summary": "The larger of the two published k-quant builds; per-layer mixed precision. Default.",
           "min_gpus": {},
           "min_memory_bytes": {
@@ -380,14 +380,14 @@
           },
           "files": [
             {
-              "path": "muse-glimmer-30B-kquant-dynamic.gguf",
-              "bytes": 19653957984
+              "path": "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf",
+              "bytes": 19653960832
             }
           ]
         },
         "kquant-17gb": {
           "title": "K-quant 17GB (uniform Q4_K_M)",
-          "bytes": 16756681056,
+          "bytes": 16756683904,
           "summary": "Smaller uniform build for tighter memory; same tokenizer and mmproj.",
           "min_gpus": {},
           "min_memory_bytes": {
@@ -395,8 +395,8 @@
           },
           "files": [
             {
-              "path": "muse-glimmer-30B-kquant-17gb.gguf",
-              "bytes": 16756681056
+              "path": "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
+              "bytes": 16756683904
             }
           ]
         }
@@ -406,8 +406,8 @@
         "base_url": "https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/resolve/main",
         "local_dir": "Muse-Glimmer-30B-GGUF",
         "file": {
-          "path": "dflash-kquant.gguf",
-          "bytes": 1631205312
+          "path": "dflash-Muse-Glimmer-30B-Q4_K_M.gguf",
+          "bytes": 1631208128
         },
         "engine": {
           "method": "dflash",
