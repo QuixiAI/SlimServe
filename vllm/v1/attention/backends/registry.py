@@ -63,7 +63,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
     QUIXICORE_MLA_SPARSE = (
         "vllm.v1.attention.backends.mla.quixicore_mla_sparse.QuixiCoreMLASparseBackend"
     )
-    XPU_MLA_SPARSE = "vllm.v1.attention.backends.mla.xpu_mla_sparse.XPUMLASparseBackend"
+    XPU_MLA_SPARSE_DSV4 = "vllm.models.deepseek_v4.xpu.DeepseekV4XPUMLASparseBackend"
     TORCH_SDPA = ""  # this tag is only used for ViT
     FLASHINFER = "vllm.v1.attention.backends.flashinfer.FlashInferBackend"
     FLASHINFER_MLA = (

@@ -1,35 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# Copyright 2025 The vLLM team.
-# Copyright 2025 The Qwen Team.
-# Copyright 2025 The HuggingFace Inc. team.
-# All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights.
 
-Vendored from upstream vLLM ``qwen3_5.py`` and trimmed to the dense
-text-only chain for this fork: ``Qwen3_5DecoderLayer``, ``Qwen3_5Model``,
-``Qwen3_5ForCausalLMBase``, and ``Qwen3_5ForCausalLM`` are kept. The MoE
-classes (``Qwen3_5MoeForCausalLM`` and friends) and the multimodal
-``Qwen3_5ForConditionalGeneration`` stack are removed; see the notes at the
-bottom of this file.
+Ported from the lazarus vLLM fork onto the SlimServe base.
+
+SlimServe pruned the Qwen VL stack (qwen3_vl / qwen2_5_vl / qwen2_vl), so the
+`*ForConditionalGeneration` classes here are TEXT-ONLY adaptations: they keep
+the checkpoint architecture name and weight layout (model.language_model.*,
+lm_head.*) but do not instantiate the vision tower; `model.visual.*` weights
+are skipped at load time. Multimodal (image/video) inputs are NOT supported.
 """
 
 from collections.abc import Iterable
@@ -37,13 +16,18 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm as Qwen3_5RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    QwenGatedDeltaNetAttention,
+)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -56,13 +40,16 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
+from vllm.transformers_utils.configs.qwen3_5_moe import (
+    Qwen3_5MoeTextConfig,
+)
 
 from .interfaces import (
     HasInnerState,
     IsHybrid,
+    MixtureOfExperts,
     SupportsEagle3,
     SupportsLoRA,
-    SupportsMRoPE,
     SupportsPP,
 )
 from .qwen3_next import (
@@ -70,6 +57,9 @@ from .qwen3_next import (
     Qwen3NextDecoderLayer,
     Qwen3NextMLP,
     Qwen3NextModel,
+    Qwen3NextSparseMoeBlock,
+    QwenNextMixtureOfExperts,
+    _is_shared_expert_fse_compatible,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -80,6 +70,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 # llama.cpp's GGUF converter (conversion/qwen.py) folds +1 into every
 # `*norm.weight` except `linear_attn.norm.weight`, so that plain ggml
@@ -229,14 +221,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.layer_idx = extract_layer_index(prefix)
 
         if self.layer_type == "linear_attention":
-            # NOTE(slimserve): deferred import, same reason as in
-            # Qwen3NextDecoderLayer: the GDN stack currently fails to import
-            # because vllm.model_executor.layers.mamba.mamba_mixer2
-            # (mamba_v2_sharded_weight_loader) is missing in this fork.
-            from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-                QwenGatedDeltaNetAttention,
-            )
-
             self.linear_attn = QwenGatedDeltaNetAttention(
                 config=config,
                 vllm_config=vllm_config,
@@ -254,11 +238,14 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         else:
             raise ValueError(f"Invalid layer_type {self.layer_type}")
 
-        # NOTE: Determine the MLP type based on the model type.
-        # Qwen3.5 uses a dense MLP on every layer; Qwen3.5-MoE
-        # (model_type == "qwen3_5_moe_text") uses sparse MoE blocks upstream
-        # and is intentionally not vendored in this dense-only fork.
-        if config.model_type == "qwen3_5_text":
+        # NOTE: Determine the MLP type based on the model type
+        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
+        if config.model_type == "qwen3_5_moe_text":
+            self.mlp = Qwen3NextSparseMoeBlock(
+                vllm_config=vllm_config,
+                prefix=f"{prefix}.mlp",
+            )
+        elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen3NextMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -267,10 +254,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            raise ValueError(
-                f"Invalid model_type {config.model_type} "
-                "(only dense qwen3_5_text is supported in this fork)"
-            )
+            raise ValueError(f"Invalid model_type {config.model_type}")
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -316,20 +300,19 @@ class Qwen3_5Model(Qwen3NextModel):
             ".in_proj_z": (".in_proj_qkvz", 3),
             ".in_proj_b": (".in_proj_ba", 0),
             ".in_proj_a": (".in_proj_ba", 1),
-            # Per-shard q/k/v names for sources that cannot split a fused
-            # tensor (GGUF: quantized bytes split only on row boundaries,
-            # so the adapter slices and emits these). The `_shard` suffix
-            # keeps them from substring-matching ".in_proj_qkv(z)" above.
-            ".in_proj_q_shard": (".in_proj_qkvz", 0),
-            ".in_proj_k_shard": (".in_proj_qkvz", 1),
-            ".in_proj_v_shard": (".in_proj_qkvz", 2),
         }
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super(Qwen3NextModel, self).__init__()
 
-        config: Qwen3_5TextConfig = vllm_config.model_config.hf_text_config
+        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = (
+            vllm_config.model_config.hf_text_config
+        )
+        parallel_config = vllm_config.parallel_config
+
+        eplb_config = parallel_config.eplb_config
+        self.num_redundant_experts = eplb_config.num_redundant_experts
 
         self.config = config
         self.quant_config = vllm_config.quant_config
@@ -367,17 +350,27 @@ class Qwen3_5Model(Qwen3NextModel):
             self._qwen38_dump = _Qwen38DumpState(_QWEN38_DUMP_DIR, self)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        mapper = self.hf_to_vllm_mapper
+        # FSE must match construction (Qwen3NextSparseMoeBlock): reroute the
+        # shared expert into the extra fused slot only when AITER FSE is both
+        # requested and compatible with the quant spec.
+        is_fse = rocm_aiter_ops.is_fusion_moe_shared_experts_enabled() and (
+            _is_shared_expert_fse_compatible(self.quant_config)
+        )
+        if is_fse:
+            num_routed = self.config.num_experts
+            mapper = mapper | WeightsMapper(
+                orig_to_new_substr={"mlp.shared_expert.": f"mlp.experts.{num_routed}."}
+            )
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class Qwen3_5ForCausalLMBase(
     nn.Module,
     HasInnerState,
-    IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
-    SupportsMRoPE,
     SupportsPP,
 ):
     packed_modules_mapping = {
@@ -391,18 +384,6 @@ class Qwen3_5ForCausalLMBase(
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
-    # Maps PEFT embed/lm_head LoRA targets onto vLLM embedding wrappers.
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-
-    # Some community text-only checkpoints keep the extraneous
-    # `model.language_model.` prefix inherited from the VL training stack.
-    # Strip it so both prefixed and clean checkpoints load correctly.
-    hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."},
-    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
@@ -426,14 +407,15 @@ class Qwen3_5ForCausalLMBase(
         )
 
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=self.quant_config,
-                prefix=maybe_prefix(prefix, "lm_head"),
-            )
             if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "lm_head"),
+                )
         else:
             self.lm_head = PPMissingLayer()
 
@@ -465,6 +447,135 @@ class Qwen3_5ForCausalLMBase(
         )
 
         return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.logits_processor(self.lm_head, hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.model_config.quantization == "gguf":
+            weights = _degemma_gguf_norms(weights)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["mtp."],
+        )
+        return loader.load_weights(weights)
+
+
+class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
+    pass
+
+
+class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # set MoE hyperparameters
+        self.set_moe_parameters()
+
+
+########################################################
+# Qwen3_5-Dense (text-only wrapper over the VL checkpoint layout)
+########################################################
+
+
+class Qwen3_5ForConditionalGeneration(
+    nn.Module,
+    HasInnerState,
+    IsHybrid,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+):
+    """Text-only adaptation of the Qwen3.5 checkpoint architecture.
+
+    The upstream (lazarus) implementation wraps Qwen3VLForConditionalGeneration
+    and instantiates a vision tower; SlimServe has no Qwen VL stack, so this
+    class serves the language model only. `model.visual.*` and `mtp.*`
+    checkpoint weights are skipped.
+    """
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
+
+    # Checkpoint layout: model.language_model.*, model.visual.*, lm_head.*
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.visual.": "visual.",
+            "lm_head.": "language_model.lm_head.",
+            "model.language_model.": "language_model.model.",
+        }
+    )
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+
+        self.config = config
+        self.model_config = vllm_config.model_config
+        self.quant_config = vllm_config.quant_config
+
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None and not multimodal_config.language_model_only:
+            logger.warning_once(
+                "Qwen3_5ForConditionalGeneration on SlimServe is text-only: "
+                "the vision tower is not instantiated and image/video inputs "
+                "are not supported. `model.visual.*` weights are skipped."
+            )
+
+        self.language_model = Qwen3_5ForCausalLM(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
+        )
+
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    def get_language_model(self) -> nn.Module:
+        return self.language_model
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.language_model.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+
+        hidden_states = self.language_model.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+
+        return hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            # "visual." is the post-mapper name of "model.visual.".
+            skip_prefixes=["mtp.", "visual.", "model.visual."],
+        )
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -500,43 +611,88 @@ class Qwen3_5ForCausalLMBase(
         )
 
     @classmethod
-    def get_mamba_state_copy_func(
-        cls,
-    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+    def get_mamba_state_copy_func(cls) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        if self.model_config.quantization == "gguf":
-            weights = _degemma_gguf_norms(weights)
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=["mtp."],
+########################################################
+# Qwen3_5-MoE
+########################################################
+
+
+class Qwen3_5_MoeMixtureOfExperts(MixtureOfExperts):
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for layer in self.language_model.model.layers:
+            if isinstance(layer.mlp, Qwen3NextSparseMoeBlock):
+                moe = layer.mlp
+                moe.n_local_physical_experts = num_local_physical_experts
+                moe.n_physical_experts = num_physical_experts
+                moe.n_redundant_experts = self.num_redundant_experts
+                moe.experts.update_expert_map()
+
+    def set_moe_parameters(self):
+        self.moe_layers = []
+        example_moe = None
+        for layer in self.language_model.model.layers:
+            if isinstance(layer, Qwen3_5DecoderLayer) and isinstance(
+                layer.mlp, Qwen3NextSparseMoeBlock
+            ):
+                example_moe = layer.mlp
+                self.moe_layers.append(layer.mlp.experts)
+
+        if example_moe is None:
+            raise RuntimeError(
+                "No Qwen3_5 layer found in the language_model.model.layers."
+            )
+
+        # Set MoE hyperparameters
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = 1
+        self.num_shared_experts = 0
+        self.num_logical_experts = example_moe.n_logical_experts
+        self.num_physical_experts = example_moe.n_physical_experts
+        self.num_local_physical_experts = example_moe.n_local_physical_experts
+        self.num_routed_experts = example_moe.n_routed_experts
+        self.num_redundant_experts = example_moe.n_redundant_experts
+
+
+class Qwen3_5MoeForConditionalGeneration(
+    Qwen3_5ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
+):
+    # For MoE LoRA weights loading
+    is_3d_moe_weight: bool = True
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
+        nn.Module.__init__(self)
+        config = vllm_config.model_config.hf_config
+
+        self.config = config
+        self.model_config = vllm_config.model_config
+        self.quant_config = vllm_config.quant_config
+
+        multimodal_config = vllm_config.model_config.multimodal_config
+        if multimodal_config is not None and not multimodal_config.language_model_only:
+            logger.warning_once(
+                "Qwen3_5MoeForConditionalGeneration on SlimServe is text-only: "
+                "the vision tower is not instantiated and image/video inputs "
+                "are not supported. `model.visual.*` weights are skipped."
+            )
+
+        self.language_model = Qwen3_5MoeForCausalLM(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
-    def get_mrope_input_positions(
-        self,
-        input_tokens: list[int],
-        mm_features: list[object],
-    ) -> tuple[torch.Tensor, int]:
-        positions = torch.arange(len(input_tokens), dtype=torch.long)
-        return positions.unsqueeze(0).expand(3, -1), 0
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
 
-
-class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
-
-
-# NOTE(slimserve): upstream defines Qwen3_5MoeForCausalLM,
-# Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration, and the
-# associated Qwen3VL-based ProcessingInfo/MultiModalProcessor classes here.
-# The MoE classes are out of scope for this dense-only fork. The multimodal
-# Qwen3_5ForConditionalGeneration (vision tower + language model) is
-# intentionally deferred: the vision half will be built separately on this
-# fork's Muse-Glimmer pattern.
+        # set MoE hyperparameters
+        self.set_moe_parameters()

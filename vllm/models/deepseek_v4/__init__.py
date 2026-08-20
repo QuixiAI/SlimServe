@@ -24,16 +24,20 @@ def _is_cuda_ampere() -> bool:
 # are kept type-compatible via ``# type: ignore[assignment]``. A100 takes the
 # AMD-family implementation because the Hopper/Blackwell NVIDIA DSv4 attention
 # classes require sparse-MLA kernels that do not support sm80.
-if current_platform.is_rocm() or current_platform.is_metal() or _is_cuda_ampere():
+# Intel XPU also takes the AMD-family (GGUF-native) implementation, with its
+# sparse-MLA boundary in deepseek_v4/xpu.py; the upstream FP8-checkpoint XPU
+# model tree was removed with the vllm-xpu-kernels dependency it needed.
+if (
+    current_platform.is_rocm()
+    or current_platform.is_metal()
+    or current_platform.is_xpu()
+    or _is_cuda_ampere()
+):
     from .amd.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,
     )
     from .amd.model import DeepseekV4ForCausalLM
     from .amd.mtp import DeepSeekV4MTP
-elif current_platform.is_xpu():
-    from .xpu.dspark import DSparkDeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
-    from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
 else:
     from .nvidia.dspark import (  # type: ignore[assignment]
         DSparkDeepseekV4ForCausalLM,

@@ -93,10 +93,27 @@ def metal_platform_plugin() -> str | None:
     return None
 
 
+def xpu_platform_plugin() -> str | None:
+    logger.debug("Checking if XPU platform is available.")
+    try:
+        # torch.xpu is present in every torch build; is_available() is what
+        # tells an Intel GPU host from the rest without importing vLLM.
+        import torch
+
+        if torch.xpu.is_available() and torch.xpu.device_count() > 0:
+            logger.debug("Confirmed XPU platform is available.")
+            return "vllm.platforms.xpu.XPUPlatform"
+        logger.debug("XPU platform is not available: no Intel GPU visible.")
+    except Exception as e:
+        logger.debug("Exception happens when checking XPU platform: %s", str(e))
+    return None
+
+
 builtin_platform_plugins = {
     "rocm": rocm_platform_plugin,
     "cuda": cuda_platform_plugin,
     "metal": metal_platform_plugin,
+    "xpu": xpu_platform_plugin,
 }
 
 

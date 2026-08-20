@@ -157,9 +157,15 @@ class DeepseekSparseSWABackend(AttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekSparseSWAMetadataBuilder"]:
-        if current_platform.is_rocm() or (
-            current_platform.is_cuda()
-            and not current_platform.has_device_capability(89)
+        # The ROCm-family (Triton) sparse-MLA decode also serves Ampere and
+        # Intel XPU; its ragged SWA index buffers come from this builder.
+        if (
+            current_platform.is_rocm()
+            or current_platform.is_xpu()
+            or (
+                current_platform.is_cuda()
+                and not current_platform.has_device_capability(89)
+            )
         ):
             from vllm.models.deepseek_v4.amd.rocm import (
                 DeepseekV4ROCMAiterSparseSWAMetadataBuilder,

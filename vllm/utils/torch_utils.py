@@ -723,6 +723,11 @@ def weak_ref_tensor(tensor: Any) -> Any:
     This ignores 0-size tensors as those don't allocate any memory.
     """
     if isinstance(tensor, torch.Tensor) and tensor.numel() > 0:
+        if tensor.device.type == "xpu":
+            # QuixiCore-XPU binding; no vllm._C on this platform.
+            import vllm._quixicore_C as qc
+
+            return qc.weak_ref_tensor(tensor)
         return torch.ops._C.weak_ref_tensor(tensor)
     else:
         return tensor
@@ -764,7 +769,11 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
 
     if current_platform.is_xpu():
         assert cpu_tensor.is_pinned(), "CPU tensor must be pinned"
-        return torch.ops._C.get_xpu_view_from_cpu_tensor(cpu_tensor)
+        # QuixiCore-XPU binding (csrc/quixicore/tm_xpu): the vllm-xpu-kernels
+        # _C op of the same name is not built in this fork.
+        import vllm._quixicore_C as qc
+
+        return qc.get_xpu_view_from_cpu_tensor(cpu_tensor)
     elif current_platform.is_cuda_alike():
         return torch.ops._C.get_cuda_view_from_cpu_tensor(cpu_tensor)
     else:
@@ -777,6 +786,11 @@ def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tens
 # Helper function used in testing.
 def _is_torch_equal_or_newer(torch_version: str, target: str) -> bool:
     return version.parse(torch_version) >= version.parse(target)
+
+
+def supports_xpu_graph() -> bool:
+    """XPU graph capture needs torch >= 2.11.0.dev (torch.xpu.XPUGraph)."""
+    return is_torch_equal_or_newer("2.11.0.dev")
 
 
 def is_torch_equal_or_newer(target: str) -> bool:

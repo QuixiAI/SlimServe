@@ -2891,6 +2891,7 @@ pending its own measurement. Tests updated (58 pass). Both daemons
 restarted onto it. The qwarp8 dial only affects the tokens<=8 decode
 route, so c8+/prefill are untouched by construction.
 Raw: perf/results/2026-08-15/kdial-sweep/.
+
 ## 2026-08-12 - DFlash Spec Gap: Reference Measurements Localize the Wall
 
 - Question: model card advertises 250 tok/s spec on RTX 5090 (74.9 no-spec,
@@ -4783,3 +4784,269 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   from deferred to the main deliverable, wired into the probabilistic
   draft_logits path; acceptance measured at shipped defaults (vendor
   4.80 was measured there).
+
+## 2026-08-18 - Intel Arc Pro B70 (QuadB70): b70 platform + SYCL kernel infrastructure vendored
+
+New host: 4x Intel Arc Pro B70 (32 GiB each, 128 GiB total; xpu-smi
+device name "Intel(R) Arc(TM) Pro B70 Graphics"; Level Zero 1.28.6,
+intel-opencl-icd 26.27). No oneAPI compiler and no torch+xpu in the venv
+yet, so this entry is infrastructure only - NO kernel has been compiled
+or run on this box.
+
+Profile/registry:
+- slimserve/hardware.py: `_probe_intel_xpu()` (parses `xpu-smi discovery`,
+  no torch import), classifies "Arc ... B70" -> platform `b70`, honors
+  ZE_AFFINITY_MASK. Detects `Machine(platform='b70', count=4)` here.
+- slimserve/profiles.json: platform `b70`; IQ2_XXS `min_gpus.b70 = 4`;
+  profile `dsv4-xxs-b70-4` = TP4 IQ2_XXS, `speculative: false` (86.7 GB
+  weights over 4x32 GiB leaves ~10 GiB/GPU; the 6.5 GiB DSpark drafter +
+  TurboQuant draft cache does not fit next to a usable context), fp8 KV,
+  block 256, max_model_len 65536, max_num_seqs 16, gpu_mem_util 0.92,
+  cudagraph NONE. All sizing provisional until first boot.
+
+SYCL infrastructure (mirrors the Metal precedent cmake/metal.cmake):
+- csrc/quixicore/xpu/: QuixiCore-XPU include/, src/{backend,runtime,
+  dispatch}, kernels/ vendored from local commit 47d0055efb46
+  (2026-08-15), README.md documents provenance and layout.
+- csrc/quixicore/tm_xpu/qc_xpu_ext.sycl: pybind11 binding (upstream
+  tk_xpu_ext.sycl, module name via TORCH_EXTENSION_NAME) built as
+  vllm._quixicore_C; queue = c10::xpu::getCurrentXPUStream().queue().
+- cmake/xpu.cmake: requires -fsycl (icpx as CMAKE_CXX_COMPILER); builds
+  the vendored tree as ONE SHARED libquixicore_xpu_ops.so (a static
+  archive does not self-register SYCL device images -> submit segfault,
+  per upstream bindings/pytorch/README.md), links the binding to it with
+  $ORIGIN rpath, copies the .so beside the extension and into vllm/.
+  Flags kept verbatim: -fp-model=precise -foffload-fp32-prec-div
+  -foffload-fp32-prec-sqrt (bit-exact codec contract). Optional oneDNN
+  vendor variants, optional AoT via VLLM_XPU_SYCL_TARGETS=bmg.
+- CMakeLists.txt: `VLLM_TARGET_DEVICE=xpu` includes cmake/xpu.cmake and
+  returns before the CUDA/HIP machinery. setup.py: passes
+  -DCMAKE_CXX_COMPILER=icpx for xpu, adds _quixicore_C to the xpu ext
+  list, copies libquixicore_xpu_ops.so like the metallib.
+
+What upstream gives the DSV4 path today (from the survey; correctness-first
+GEMV only): gguf_gemv with IQ2_XXS / Q2_K / Q8_0 decoders + iq tables,
+moe_route/moe_permute/grouped_qgemm (fmt w16/int4/nvfp4 only - NO GGUF
+grouped MoE yet), mqa_logits (fp8 DSA indexer on XMX tiles), dsv4_hc_post
+(pre/comb missing), turboquant codec, paged KV write, rms_norm/glu.
+Missing for serving: sparse-MLA decode, IQ2_XXS+Q2_K grouped MoE GEMM,
+hc pre/comb. Those are the kernel projects once the toolchain builds.
+Known upstream hazard to fix when the GGUF path goes live: gguf_gemv's
+lazy device-table upload does a host `.wait()` on first use and is not
+thread-safe (breaks graph capture / concurrent streams).
+
+Same day, later: toolchain landed and the SYCL build is verified on device.
+- ~/SlimServe/.venv (uv): torch 2.15.0.dev20260815+xpu (nightly xpu index;
+  bundles intel-sycl-rt 2026.1.0, oneCCL, triton-xpu); torch.xpu sees 4x B70.
+- apt (Intel oneAPI repo): intel-oneapi-compiler-dpcpp-cpp 2026.1.0-235
+  (icpx 2026.1.1.20260724), intel-oneapi-dnnl-devel 2026.0.2.
+- cmake -DVLLM_TARGET_DEVICE=xpu -DCMAKE_CXX_COMPILER=icpx: 80 SYCL TUs +
+  binding build clean (oneDNN vendor variants ON, Level Zero IPC ON).
+- FINDING 1 (fixed in cmake/xpu.cmake): two SYCL runtimes in one process
+  segfault at the first XPU allocation. libtorch_xpu resolves the wheel's
+  .venv/lib/libsycl.so.9 by RUNPATH; our .so found /opt/intel's copy via
+  setvars' LD_LIBRARY_PATH. Fix: DT_RPATH (--disable-new-dtags) on both
+  libquixicore_xpu_ops.so and _quixicore_C pointing at torch's runtime dir
+  (+ $ORIGIN, + oneDNN dir), so LD_LIBRARY_PATH cannot override it.
+- FINDING 2 (environment rule, not ours): with `source setvars.sh` active,
+  bare torch (`torch.randn(4, device="xpu")`) segfaults - bundled 2026.1.0
+  runtime vs system 2026.1.1 UR loader. setvars is build-time only; the
+  serving env must be clean. requirements/xpu.txt documents it.
+- Smoke (clean env, extension loaded straight from build/xpu): device_count
+  4; silu 1.5e-2 / gelu 7.8e-3 / rms_norm 4.6e-2 (bf16, 4096-wide rows) /
+  dense_gemm 1.6e-2 (f16, K=256) max-abs vs torch.xpu fp32 refs = storage
+  epsilon; XPUGraph constructs. `attention` returned NaN with my guessed
+  argument order (scale passed as bool) - not a verified op yet.
+- setup.py: requirements/xpu.txt added, xpu in the requirements branch.
+- `VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation` succeeds
+  after one unrelated portability fix (csrc/spinloop.cpp included
+  <mwaitxintrin.h> directly, which clang/icpx reject; now <x86intrin.h>).
+  Post-install: CUDA `triton` 3.7.1 (transitive) shadowed triton-xpu 3.8.0 -
+  re-pinned; documented in requirements/xpu.txt.
+- Clean-env `import vllm._quixicore_C` -> device_count 4; quixicore_ops
+  .is_available() True; silu parity again at epsilon. 52 slimserve tests pass.
+- `slimserve dsv4-xxs-b70-4 --dry-run` resolves (GGUF symlinked from the HF
+  cache into ~/models/antirez-deepseek-v4-gguf/, 86,720,111,488 bytes = registry).
+- `--serve -y` -> "Failed to infer device type" (vllm/config/device.py): this
+  fork ships cuda/rocm/metal platforms only; the vLLM XPU platform, worker,
+  model runner, and attention backend were removed with the CPU tree.
+NEXT WALL (a project, not a fix): port an XPU platform the way metal.py /
+metal_compat.py was done - platform + worker/model runner on torch.xpu, an
+attention backend routing DSV4 sparse MLA to QuixiCore-XPU kernels (which
+still need writing: sparse-MLA decode, IQ2_XXS+Q2_K grouped MoE, hc
+pre/comb), XCCL/oneCCL for TP4 collectives (torch nightly bundles oneccl).
+Serving-kernel entries go here per kernel with baseline/hypothesis/result.
+
+## 2026-08-18 - XPU platform port: SlimServe serves on Intel Arc Pro B70 (small model); DSV4 path plumbed, boot VRAM-blocked
+
+Scope: full vLLM XPU platform for this fork (the upstream one was removed
+in 75b5e0f60 with its vllm-xpu-kernels dependency), modeled on the Metal
+port and on the sibling XPU vLLM tree on this host (/home/lazarus/vllm,
+snapshot 046fdfdba: per-worker ZE_AFFINITY_MASK, oneCCL env, queue-lifetime
+rules). No vllm-xpu-kernels: kernels are QuixiCore-XPU SYCL + Triton-XPU +
+torch.
+
+Landed (all new files unless noted):
+- vllm/platforms/xpu.py (+ registration in platforms/__init__.py): xccl
+  dist backend, TRITON_ATTN/TRITON_MLA/TURBOQUANT selection (DSV4 layers
+  self-select), graphs+inductor off for bring-up (VLLM_XPU_ENABLE_XPU_GRAPH
+  opt-in), env: FI_TCP_IFACE=lo, CCL_ZE_IPC_EXCHANGE=sockets,
+  CCL_ATL_TRANSPORT=ofi, CCL_TOPO_FABRIC_VERTEX_CONNECTION_CHECK=0,
+  TORCH_FR_BUFFER_SIZE=0, UCX_MEMTYPE_CACHE=n, spawn, shutdown_timeout 5;
+  get_current_memory_usage = memory_allocated (no empty_cache: device-wide
+  queue walks fault in urQueueRelease).
+  FINDING 3: torch's pip oneCCL (libccl.so.2, 2022.1) is a plugin loader
+  that dlopen()s libccl.so.1 by soname from <venv>/lib, which is not on
+  the dlopen path -> "oneCCL could not be initialized! Could not load any
+  plugin". ensure_xpu_runtime_env() prepends <venv>/lib to LD_LIBRARY_PATH
+  in the parent before workers spawn. (CCL_PLUGIN=... does not work: the
+  legacy lib has no onecclPluginCall entry.)
+- vllm/platforms/xpu_affinity.py + multiproc_executor hook + envs
+  VLLM_XPU_PER_WORKER_AFFINITY=1: single-device ZE_AFFINITY_MASK per TP
+  worker (host-RAM mirroring fix, +18% tok/s in the sibling tree).
+- vllm/platforms/xpu_c_ops.py: torch.ops._C on XPU for rms_norm (QuixiCore
+  SYCL when bf16), fused_add_rms_norm, silu_and_mul, mul_and_silu, gelu*,
+  rotary_embedding (torch), top_k_per_row_prefill/decode (torch; CUDA
+  contract incl. local prefill indices and 1D/2D decode seq_lens) - all
+  parity-tested; registered in parent and (via import_kernels) in workers.
+- vllm/v1/worker/xpu_worker.py, xpu_model_runner.py: device_index=0 when
+  pinned, CCL_* env, no warmup all-reduce, no empty_cache; torch.cuda
+  aliases as distinct functools.partials (Dynamo handler-dup assert),
+  Event without blocking=, synchronize = current-stream wait, XPUGraph
+  aliases + current-stream capture ctx (unused until graphs are enabled);
+  compile_or_warm_up_model skips the CUDA kernel_warmup (imports fp8-quant
+  _C ops at call time).
+- vllm/utils/mem_utils.py: no empty_cache in memory_profiling on XPU.
+- vllm/utils/torch_utils.py: supports_xpu_graph; UVA view ->
+  vllm._quixicore_C.get_xpu_view_from_cpu_tensor (new binding).
+- Guarded vllm_xpu_kernels imports (xpu_moe.py, fa_utils.py, mamba_ssm.py).
+- csrc/spinloop.cpp: <mwaitxintrin.h> -> <x86intrin.h> (icpx build).
+DSV4 on XPU (plumbed, unbooted):
+- deepseek_v4/__init__.py + amd/model.py: XPU takes the AMD-family GGUF
+  model with vllm/models/deepseek_v4/xpu.py (DeepseekV4XPUAttention over
+  the ROCm-family Triton sparse-MLA path; backend XPU_MLA_SPARSE_DSV4;
+  _fused_qnorm_rope_kv_insert -> the recovered upstream Triton kernel
+  common/ops/triton_qnorm_rope_kv_insert.py writing the fp8_ds_mla layout).
+  The dead upstream FP8-checkpoint tree deepseek_v4/xpu/ was removed.
+- GGUF: gguf/ops.py routes XPU to the QuixiCore-XPU binding
+  (ggml_mul_mat_vec_a8, ggml_moe_a8_vec, ggml_dequantize[_into]);
+  ggml_mul_mat_a8 = dequant + oneDNN matmul; fused_moe.py takes the vec
+  route (mmq_ok False on metal/xpu; CUDA-only fused paths behind
+  _ampere_native_platform()). New SYCL kernels
+  csrc/quixicore/xpu/kernels/quantization/gguf_gemv/.../gguf_routed.sycl.cpp
+  (Q8_0/Q2_K/IQ2_XXS routed GEMV + dequant): dequant bit-exact vs gguf-py,
+  GEMV/MoE rel err 2-3e-3 (bf16). Perf (correctness-first): 88 GB/s on the
+  1-token x 6-expert IQ2_XXS gate/up shape; small dense shapes latency-bound
+  (0.03-0.06 ms). Ported back to ~/QuixiCore/QuixiCore-XPU (uncommitted).
+- Indexer: torch.ops.vllm.xpu_fp8_mqa_logits / xpu_fp8_paged_mqa_logits
+  registered over the torch references (v1/attention/ops/xpu_mla_sparse.py);
+  MHC forward_xpu -> torch reference; kernel_warmup skipped.
+- Standalone XPU checks of the DSV4 Triton kernels pass: fp8 UE8M0 cache
+  insert/gather round trip (nope rel 4e-2, rope exact), qnorm+rope+insert
+  vs torch (8e-3), _rocm_sparse_attn_decode_triton vs torch reference
+  (8e-3 abs on |o|<=3.2).
+Measured (raw: perf/results/2026-08-18/xpu-bringup/, scratch logs):
+- Qwen2.5-0.5B bf16 eager, gpu_memory_utilization 0.08 (the 4 GPUs are
+  otherwise held by another tenant's TP4 server at ~28 GB each):
+  TP1 170.6 tok/s c4 (256 tok/1.50 s); TP2 over XCCL 123.8 tok/s c4;
+  Qwen2.5-1.5B TP4 107.0 tok/s c4. Greedy outputs coherent and identical
+  across TP1/TP2. This is a platform smoke, not a baseline (tiny model,
+  eager, no graphs, first-JIT included).
+BLOCKER for the dsv4-xxs-b70-4 boot: ~4-5 GiB free per B70 while
+/home/lazarus's Qwen3.5 TP4 server holds ~28 GiB each; the 86.7 GB IQ2_XXS
+target needs ~21 GiB/GPU. Level Zero drops the device on OOM, so no
+"try and see" against a shared card. Next: free the GPUs, then
+  slimserve dsv4-xxs-b70-4 --serve -y (expect first-boot findings in the
+  prefill Triton kernels / indexer torch fallbacks / MoE vec path), record
+  boot + exact-token harness numbers, then the kernel program: GGUF repack +
+  grouped tile GEMM (prefill), SYCL sparse-MLA decode, native mqa_logits,
+  XPU graphs (current-stream capture + lazy sync bindings).
+
+## 2026-08-18 - FIRST LIGHT: dsv4-xxs-b70-4 serves DeepSeek-V4-Flash IQ2_XXS on 4x Arc Pro B70; c1 = 4.9 tok/s
+
+The other tenant's server (user-level systemd unit vllm-realigned.service,
+Qwen3.5 NVFP4 TP4) was stopped on the user's instruction (unit left
+`enabled`; only `systemctl --user stop`). Boots 1-4 (perf/results/2026-08-18/
+dsv4-b70-boot{1..4}/serve.log): each boot loads 22.73 GiB/GPU in ~56-71 s
+and passes the profile run; the fixes between boots were all "one more
+CUDA-only name" in the decode path:
+- boot1: torch.ops._C.silu_and_mul_with_clamp (MoE SwiGLU) -> added
+  silu_and_mul_with_clamp / swigluoai_and_mul / situ_and_mul XPU ops.
+- boot2: torch.cuda.is_current_stream_capturing in attn_gemm_parallel_execute
+  -> aliased (plus is_available/device_count/current_device/empty_cache-noop).
+- boot3: the SWA cache builder returned the generic metadata (no ragged
+  buffers) while the ROCm-family decode expects them -> sparse_swa.py picks
+  DeepseekV4ROCMAiterSparseSWAMetadataBuilder on XPU too.
+- boot4: healthy. GPU KV cache 155,151 tokens (4.3 GiB/GPU), max concurrency
+  2.37x at 65,536. Correctness probe: "What is 17*23?" -> reasoning
+  "17*20=340, 17*3=51, total 391" -> content "391" (greedy).
+c1 (exact-count, non-stream, 256 completion tokens, ignore_eos, 16-token
+prompt): 52.04 s -> 4.92 tok/s; engine interval log agrees (4.9-5.0 tok/s).
+Streaming variant: TTFT 0.32 s at 16 tok, ~4.6-4.9 tok/s decode.
+This is the correctness-first bring-up configuration: eager (no XPU graphs,
+no inductor), oneCCL over TCP-loopback OFI, torch-reference indexer logits
+with a host sync per request per layer, mHC torch reference, GGUF routed
+GEMV at 88 GB/s (correctness-first SYCL), dequant+oneDNN for prefill GEMMs.
+The sibling tree's data says the first two are the big-ticket items (device
+82% idle at ~1100 kernels/token; graphs alone 36.9 -> 67 tok/s there).
+Kernel survey of /home/alex/port-staging/lazarus (vllm-xpu-kernels csrc,
+the vllm fork, sonar/): no GGUF/IQ2 code anywhere; transferable patterns
+recorded in perf/xpu_kernel_survey.md (subgroup-per-row / 8 rows per WG /
+16 B loads / per-K stride choice, SLM codebook, int8 dot + per-block scale,
+cooperative scale broadcast, DPAS grouped-GEMM graft with tile_k = group,
+capturable P2P all-reduce with fixed rank order, out= variants for graph
+capture, `-fsycl-id-queries-range=size_t` 8x regression).
+NEXT (ranked): (1) py-spy/host-vs-device budget at c1 to confirm the
+host-bound hypothesis; (2) native mqa_logits (QuixiCore-XPU XMX kernel
+exists) to remove the per-layer host syncs; (3) XPU graphs
+(current-stream capture + lazy sync bindings; ops need out= variants);
+(4) GGUF GEMV roofline probe (read-only variant) then occupancy/SLM-codebook
+work; (5) grouped GGUF GEMM for prefill on the SYCL-TLA mainloop.
+
+## 2026-08-18 - XPU graphs ON: dsv4-xxs-b70-4 baseline (graphs, breakable capture)
+
+- Status: retained (baseline for the B70 optimization loop)
+- Scope: dsv4-xxs-b70-4, DeepSeek-V4-Flash IQ2_XXS, TP4 on 4x Arc Pro B70,
+  torch 2.15.0.dev20260815+xpu, icpx 2026.1.1, oneDNN 2026.0.2, L0 1.28.6,
+  driver intel-opencl-icd 26.27; working tree (uncommitted) 2026-08-18.
+- Baseline (before): eager, 4.9 tok/s c1 (previous entry). Eager is not a
+  serving mode in this fork; it was a bring-up crutch and is gone: the XPU
+  platform now raises if torch lacks XPUGraph instead of falling back.
+- Change: XPU graphs through the breakable capture (profile:
+  cudagraph_mode PIECEWISE, capture sizes 1/2/4/8/16, VLLM_USE_BREAKABLE_
+  CUDAGRAPH auto-enabled for DSV4). Ported from the sibling XPU tree:
+  eager_break_during_capture_tensor_output + add_eager_tensor_output for
+  oneCCL collectives (not capturable into SYCL command graphs) with the
+  parallel_state all_reduce/reduce_scatter/all_gather wrappers; XPU segment
+  replay = current-stream wait, graph.replay(), graph.synchronize() with the
+  torch.xpu/torch.accelerator/Dynamo XpuInterface synchronize names rebound
+  lazily to a current-stream wait (device-wide sync = UR queue fault; early
+  rebinding deadlocks oneCCL init); torch.cuda.CUDAGraph -> the QuixiCore-XPU
+  binding's XPUGraph (at::xpu::XPUGraph + capture-stream synchronize),
+  torch.cuda.graph -> current-stream capture ctx, torch.accelerator.empty_cache
+  no-op on XPU; new binding op weak_ref_tensor; three vllm-xpu-kernels-only
+  branches guarded (fused indexer q rope, deepseek scaling rope, xpu sampler).
+  Capture: 5 sizes in 4 s, 0.86 GiB/GPU. FULL modes are wrong here: the
+  eager_break wrapper records ops into FULL graphs, and oneCCL/host-sync ops
+  cannot be recorded.
+- Correctness: greedy "17*23" -> "391" with sane reasoning under replay;
+  exact harness exact:true at c8 (c1 run reported 991 prompt tokens with
+  --prompt-overhead 9 -> use --prompt-overhead 0 with this tokenizer/template).
+- Results (benchmarks/benchmark_dsv4_exact.py, 1000 in / 2000 out,
+  benchmarks/sonnet.txt --repeat-source, warmup 8):
+  | workload | tok/s | notes |
+  | c1 16-tok prompt, 256 out | 11.15 | 22.97 s (was 4.9 eager) |
+  | c1 1K/2K | 7.27 | 275.0 s wall, prompt 991 |
+  | c8 1K/2K aggregate | 27.14 | 589.5 s wall, exact:true, 3.4 tok/s/stream |
+  Context sensitivity (11.2 at 16 tok vs 7.3 at 1K) points at the torch
+  indexer logits (paged decode reference: per-request .item() + per-block
+  torch loop each layer) as the next host-side cost.
+- Decision: retained as baseline. TP scaling gate not yet applicable (no
+  TP1/TP2 B70 profile fits the model).
+- Raw artifacts: perf/results/2026-08-18/dsv4-b70-boot7-graphs/{serve.log,
+  exact_c1.json,exact_c8.json,*.err}; boots 5-6 = capture-path fixes.
+- Next (perf.md loop): (1) c1 host/device budget (py-spy on the worker +
+  the graph-break count log) to name the bottleneck; (2) native mqa_logits
+  (QuixiCore-XPU XMX kernel) for prefill + a paged decode variant, removing
+  the per-layer host syncs; (3) GGUF GEMV roofline probe (read-only variant)
+  then occupancy/SLM-codebook work; (4) capturable collectives.

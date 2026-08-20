@@ -253,7 +253,8 @@
           "summary": "Smallest. IQ2_XXS gate/up experts with Q2_K down. On Metal, measured grouped vector MoE is faster than the padded per-expert tile alternative; ROCm and Ampere use native grouped tile paths (A100 pairs gate/up, SwiGLU, and Q8_1 emission before native Q2_K down).",
           "min_gpus": {
             "mi300x": 1,
-            "a100": 2
+            "a100": 2,
+            "b70": 4
           },
           "min_memory_bytes": {
             "metal": 137438953472
@@ -499,6 +500,15 @@
         "Metal caps a single MTLBuffer well below total memory -- 80.6 GiB of 128 GiB on an M5 Max. The GGUF loader avoids a file-sized buffer by materializing tensors as separate MPS allocations.",
         "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
+      ]
+    },
+    "b70": {
+      "title": "Intel Arc Pro B70",
+      "vram_bytes": 34242101248,
+      "gate": "gpus",
+      "status": "supported",
+      "notes": [
+        "32 GiB per card (32656 MiB reported by xpu-smi). Four cards give 128 GiB, which fits the 80.8 GiB IQ2_XXS target plus KV but not the 6.5 GiB DSpark drafter and its draft cache alongside a usable context, so the B70 DSV4 profile serves without speculative decoding."
       ]
     }
   },
@@ -1258,6 +1268,54 @@
         "DFlash 2 speculation is on by default: the drafter proposes one 8-token block per call against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. Vendor mean acceptance 4.80; rejection sampling keeps output identical to plain decode.",
         "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
         "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
+      ]
+    },
+    "dsv4-xxs-b70-4": {
+      "title": "DeepSeek-V4-Flash IQ2_XXS on 4 Intel Arc Pro B70",
+      "source": "dsv4-flash",
+      "gpus": 4,
+      "platforms": [
+        "b70"
+      ],
+      "default_quant": "IQ2_XXS",
+      "summary": "Text only. IQ2_XXS at TP4 across four 32 GiB B70 cards. No DSpark drafter: the target alone nearly fills VRAM, so speculative decoding is off by design.",
+      "engine": {
+        "tensor_parallel_size": 4,
+        "kv_cache_dtype": "fp8",
+        "block_size": 256,
+        "max_num_seqs": 16,
+        "max_model_len": 65536,
+        "gpu_memory_utilization": 0.92,
+        "enable_prefix_caching": true,
+        "attention_config": {
+          "sparse_mla_force_mqa": true
+        },
+        "compilation_config": {
+          "cudagraph_mode": "PIECEWISE",
+          "cudagraph_capture_sizes": [
+            1,
+            2,
+            4,
+            8,
+            16
+          ]
+        },
+        "trust_remote_code": true,
+        "reasoning_parser": "deepseek_v4",
+        "tool_call_parser": "deepseek_v4",
+        "served_model_name": "DeepSeek-V4-Flash"
+      },
+      "speculative": false,
+      "env": {
+        "VLLM_USE_BREAKABLE_CUDAGRAPH": "1"
+      },
+      "notes": [
+        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+        "sparse_mla_force_mqa is required, or short prompts take a dense forward the sparse backend does not implement.",
+        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+        "speculative is false on purpose: 86.7 GB of IQ2_XXS weights split over 4 x 32 GiB leaves ~10 GiB per card for KV, workspace, and graphs; the 6.5 GiB DSpark drafter plus its TurboQuant draft cache does not fit next to a usable context.",
+        "max_model_len 65536, max_num_seqs 16, and gpu_memory_utilization 0.92 are provisional first-boot sizing for the ~10 GiB/GPU headroom; qualify KV headroom and re-tune per perf/perf.md before recording a baseline.",
+        "PIECEWISE XPU graphs through the breakable capture (VLLM_USE_BREAKABLE_CUDAGRAPH=1, auto-enabled for DSV4): oneCCL collectives are not capturable into SYCL command graphs and the indexer/attention eager-break ops host-sync, so they run as eager segments between graph segments; FULL modes would record them into the graph. Capture sizes cover max_num_seqs 16."
       ]
     }
   }

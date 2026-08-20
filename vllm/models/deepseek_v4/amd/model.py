@@ -69,6 +69,10 @@ if current_platform.is_metal():
     from vllm.models.deepseek_v4.metal import (
         DeepseekV4MetalAttention as DeepseekV4PlatformAttention,
     )
+elif current_platform.is_xpu():
+    from vllm.models.deepseek_v4.xpu import (
+        DeepseekV4XPUAttention as DeepseekV4PlatformAttention,
+    )
 elif current_platform.is_cuda():
     from vllm.models.deepseek_v4.ampere import (
         DeepseekV4AmpereMLAAttention as DeepseekV4PlatformAttention,
@@ -1018,6 +1022,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         _probe_intra = nan_probe.enabled() and self._layer_index in (0, 1, 2)
         if _probe_intra:
             nan_probe.probe(100 + 4 * self._layer_index + 0, x)
+        nan_probe.det_probe(f"L{self._layer_index}.attn_in", x)
         x = self.attn(
             positions,
             x,
@@ -1028,6 +1033,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         if _probe_intra:
             nan_probe.probe(100 + 4 * self._layer_index + 1, x)
+        nan_probe.det_probe(f"L{self._layer_index}.attn_out", x)
 
         transition = self._fused_post_pre_with_optional_reduce(
             x,
@@ -1054,6 +1060,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
         if _probe_intra:
             nan_probe.probe(100 + 4 * self._layer_index + 2, x)
+        nan_probe.det_probe(f"L{self._layer_index}.ffn_in", x, residual)
         x = self.ffn(
             x,
             input_ids,
@@ -1064,6 +1071,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                 100 + 4 * self._layer_index + 3,
                 *(x if isinstance(x, tuple) else (x,)),
             )
+        nan_probe.det_probe(
+            f"L{self._layer_index}.ffn_out", *(x if isinstance(x, tuple) else (x,))
+        )
         return x, residual, post_mix, res_mix
 
     def _forward_unfused_post_pre(
@@ -1078,10 +1088,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
         residual = x
+        li = self._layer_index
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
+        nan_probe.det_probe(f"L{li}.hc_pre_attn", x, post, comb)
         x, prequant_input = self._norm_with_prequant(x, self.attn_norm)
+        nan_probe.det_probe(f"L{li}.attn_in", x)
         x = self.attn(
             positions,
             x,
@@ -1090,19 +1103,27 @@ class DeepseekV4DecoderLayer(nn.Module):
                 prequant_input if self._ampere_prequant_attention else None
             ),
         )
+        nan_probe.det_probe(f"L{li}.attn_out", x)
+        nan_probe.det_probe(f"L{li}.post_comb_res_after_attn", post, comb, residual)
+        nan_probe.det_probe(f"L{li}.hc_post_in", x, residual, post, comb)
         x = self.hc_post(x, residual, post, comb)
+        nan_probe.det_probe(f"L{li}.hc_post_attn", x)
+        nan_probe.det_probe(f"L{li}.hc_post_attn_again", x)
 
         residual = x
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
         x, prequant_input = self._norm_with_prequant(x, self.ffn_norm)
+        nan_probe.det_probe(f"L{li}.ffn_in", x)
         x = self.ffn(
             x,
             input_ids,
             prequant_input=(prequant_input if self._ampere_prequant_moe else None),
         )
+        nan_probe.det_probe(f"L{li}.ffn_out", x)
         x = self.hc_post(x, residual, post, comb)
+        nan_probe.det_probe(f"L{li}.hc_post_ffn", x)
         return x, None, None, None
 
     def forward(
@@ -1268,6 +1289,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        nan_probe.det_step()
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1278,6 +1300,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # and hc_pre. NaN here means the corruption precedes all
                 # layer math (scribbled allocation / embedding path).
                 nan_probe.probe(98, hidden_states)
+            nan_probe.det_probe("embed", hidden_states, input_ids.float(), positions.float())
             hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
             if nan_probe.enabled():
                 # Slot 99: after the hc expand (fresh repeat allocation).

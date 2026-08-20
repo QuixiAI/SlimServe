@@ -75,3 +75,55 @@ def snapshot() -> list[tuple[int, int]] | None:
         return None
     host = _BUF.cpu()
     return [(i, int(c)) for i, c in enumerate(host.tolist()) if c]
+
+
+# ---------------------------------------------------------------------------
+# Determinism probe (VLLM_DET_PROBE=/path, diagnostic only). Appends one line
+# per (step, slot) with an fp64 checksum of the probed tensors to that file
+# from every rank (rank in the line). Host-syncs on every probe: never on in
+# production; used to bisect run-to-run nondeterminism (XPU bring-up
+# 2026-08-18) by diffing two identical requests layer by layer.
+_DET_PATH = os.getenv("VLLM_DET_PROBE", "")
+_DET_STEP = 0
+
+
+def det_step() -> None:
+    global _DET_STEP
+    _DET_STEP += 1
+
+
+def det_probe(tag: str, *tensors: torch.Tensor | None) -> None:
+    if not _DET_PATH:
+        return
+    if torch.xpu.is_available() and torch.xpu.is_current_stream_capturing():
+        return  # host sync inside a graph capture is illegal
+    dump = os.getenv("VLLM_DET_DUMP", "")
+    if dump and tag.startswith(dump):
+        try:
+            import torch.distributed as dist
+
+            r = dist.get_rank() if dist.is_initialized() else 0
+        except Exception:
+            r = 0
+        torch.save(
+            [None if t is None else t.detach().cpu() for t in tensors],
+            f"{_DET_PATH}.dump.{tag}.step{_DET_STEP}.rank{r}.pt",
+        )
+    parts = []
+    for t in tensors:
+        if t is None:
+            continue
+        tf = t.detach().float()
+        # fp32: Arc has no fp64 (UR_RESULT_ERROR_UNSUPPORTED_FEATURE).
+        flat = tf.reshape(-1)
+        w = torch.arange(1, flat.numel() + 1, device=flat.device, dtype=torch.float32)
+        w = (w % 977) / 977.0  # position hash: catches permutations/mislocated rows
+        parts.append(f"{flat.sum().item():.4f}/{flat.abs().sum().item():.4f}/{(flat * w).sum().item():.4f}")
+    try:
+        import torch.distributed as dist
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except Exception:
+        rank = 0
+    with open(f"{_DET_PATH}.rank{rank}", "a") as f:
+        f.write(f"{_DET_STEP} {tag} {' '.join(parts)}\n")

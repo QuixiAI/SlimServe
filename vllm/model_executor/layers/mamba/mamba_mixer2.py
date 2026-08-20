@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sharded weight loading for mamba-v2-family projections.
-
-Vendored from upstream vLLM's ``mamba_mixer2.py``. The fork keeps only
-``mamba_v2_sharded_weight_loader`` -- the piece the gated-deltanet layers
-(``mamba/gdn``) import; upstream's ``MambaMixer2`` layer itself serves
-model families this fork does not carry.
+"""Shim for the SlimServe base: the full MambaMixer2 layer was pruned, but
+qwen_gdn_linear_attn.py imports mamba_v2_sharded_weight_loader from here.
+Only that loader (verbatim from the lazarus/upstream mamba_mixer2.py) is kept.
 """
 
 import torch
@@ -61,9 +58,7 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries

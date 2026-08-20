@@ -118,6 +118,7 @@ from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
 )
 from vllm.model_executor.kernels.linear.nvfp4.emulation import (
     EmulationNvFp4LinearKernel,
+    EmulationNvFp4W4A16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.fbgemm import (
     FbgemmNvFp4LinearKernel,
@@ -134,6 +135,9 @@ from vllm.model_executor.kernels.linear.nvfp4.humming import (
 )
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.nvfp4.xpu import (
+    XPUNvFp4W4A16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
@@ -296,6 +300,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         XPUFp8BlockScaledMMKernel,
     },
     "xpu_woq": {
+        XPUNvFp4W4A16LinearKernel,
         XPUW8A16FP8LinearKernel,
     },
 }
@@ -459,6 +464,10 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
         HummingNvFp4LinearKernel,
     ],
     PlatformEnum.ROCM: [
+        EmulationNvFp4LinearKernel,
+    ],
+    PlatformEnum.XPU: [
+        XPUNvFp4W4A16LinearKernel,
         EmulationNvFp4LinearKernel,
     ],
 }
@@ -1088,6 +1097,8 @@ __all__ = [
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
+    "EmulationNvFp4W4A16LinearKernel",
+    "XPUNvFp4W4A16LinearKernel",
     "FbgemmNvFp4LinearKernel",
     "FlashInferCuteDslNvFp4LinearKernel",
     "FlashInferB12xNvFp4LinearKernel",

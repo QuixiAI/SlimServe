@@ -33,7 +33,9 @@ def _qc():
     import vllm._quixicore_C as qc
 
     # The Metal build ships its kernels as a separate metallib beside the
-    # extension; CUDA and ROCm link theirs in. Point it at the file once, here,
+    # extension; CUDA and ROCm link theirs in; XPU links a shared
+    # libquixicore_xpu_ops.so beside the extension via $ORIGIN, so it needs no
+    # setup here. Point it at the file once, here,
     # rather than from the first kernel call: loading a metallib mid-decode,
     # against in-flight MPS work, is a documented way to deadlock.
     if hasattr(qc, "_set_library"):

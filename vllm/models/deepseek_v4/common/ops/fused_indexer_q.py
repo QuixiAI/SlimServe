@@ -389,7 +389,9 @@ def fused_indexer_q_rope_quant(
                 index_q_scale,
                 index_weights_out,
             )
-        elif current_platform.is_xpu():
+        elif current_platform.is_xpu() and hasattr(
+            torch.ops.vllm, "xpu_deepseek_fused_indexer_q_rope_mxfp4"
+        ):
             torch.ops.vllm.xpu_deepseek_fused_indexer_q_rope_mxfp4(
                 index_q,
                 positions,
@@ -461,7 +463,11 @@ def fused_indexer_q_rope_quant(
             index_q_fp8,
             index_weights_out,
         )
-    elif current_platform.is_xpu():
+    elif current_platform.is_xpu() and hasattr(
+        torch.ops.vllm, "xpu_deepseek_fused_indexer_q_rope_fp8"
+    ):
+        # vllm-xpu-kernels SYCL op when that package is present; this fork's
+        # XPU build takes the platform-neutral Triton kernel below.
         torch.ops.vllm.xpu_deepseek_fused_indexer_q_rope_fp8(
             index_q,
             positions,

@@ -30,6 +30,20 @@ def _is_metal() -> bool:
 
 
 @cache
+def _is_xpu() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu()
+
+
+def _xpu_qc():
+    """The QuixiCore-XPU binding (SYCL GGUF kernels; csrc/quixicore/tm_xpu)."""
+    from vllm.quixicore.ops import _qc
+
+    return _qc()
+
+
+@cache
 def _load_stable_libtorch() -> None:
     """Importing the stable-ABI extension puts ggml_* into torch.ops._C."""
     import vllm._C_stable_libtorch  # noqa: F401
@@ -49,6 +63,8 @@ def ggml_dequantize(
             "dequant-then-dense route is unavailable; the embedding and "
             "kv_b_proj callers still need one."
         )
+    if _is_xpu():
+        return _xpu_qc().ggml_dequantize(W, quant_type, m, n, dtype)
     _load_stable_libtorch()
     return torch.ops._C.ggml_dequantize(W, quant_type, m, n, dtype)
 
@@ -64,6 +80,9 @@ def ggml_dequantize_into(
         raise NotImplementedError(
             "quixicore(metal): no generic GGUF dequant kernel yet."
         )
+    if _is_xpu():
+        _xpu_qc().ggml_dequantize_into(W, quant_type, m, n, out)
+        return
     _load_stable_libtorch()
     torch.ops._C.ggml_dequantize_into(W, quant_type, m, n, out)
 
@@ -71,7 +90,7 @@ def ggml_dequantize_into(
 def ggml_mul_mat_vec_a8(
     W: torch.Tensor, X: torch.Tensor, quant_type: int, row: int
 ) -> torch.Tensor:
-    if _is_metal():
+    if _is_metal() or _is_xpu():
         from vllm.quixicore import quixicore_ops
 
         return quixicore_ops.ggml_mul_mat_vec_a8(W, X, quant_type, row)
@@ -137,6 +156,17 @@ def ggml_mul_mat_a8(
         from vllm.quixicore import quixicore_ops
 
         return quixicore_ops.ggml_mul_mat_a8(W, X, quant_type, row)
+    if _is_xpu():
+        # No GGUF tile GEMM on XPU yet: dequantize the block rows to the
+        # activation dtype and let oneDNN do the GEMM. Correct, memory-heavy
+        # (a full [row, K] scratch); the native tile GEMM is a tracked kernel
+        # project (perf notebook 2026-08-18).
+        import gguf
+
+        block_size, type_size = gguf.GGML_QUANT_SIZES[quant_type]
+        cols = W.shape[1] // type_size * block_size
+        weight = _xpu_qc().ggml_dequantize(W, quant_type, row, cols, X.dtype)
+        return X @ weight.T
     _load_stable_libtorch()
     return torch.ops._C.ggml_mul_mat_a8(W, X, quant_type, row)
 
@@ -184,9 +214,9 @@ def ggml_moe_a8(
     tokens: int,
     mxfp4_repacked: bool = False,
 ) -> torch.Tensor:
-    if _is_metal():
+    if _is_metal() or _is_xpu():
         raise NotImplementedError(
-            "quixicore(metal): no grouped GEMM over GGUF-quantized experts; "
+            "quixicore(metal/xpu): no grouped GEMM over GGUF-quantized experts; "
             "the MoE layer takes the per-expert loop instead."
         )
     _load_stable_libtorch()
@@ -214,10 +244,11 @@ def ggml_moe_a8_vec(
     tokens: int,
     expert_parallel: bool = False,
 ) -> torch.Tensor:
-    if _is_metal():
+    if _is_metal() or _is_xpu():
         if expert_parallel:
             raise NotImplementedError(
-                "Metal exposes one device and does not support expert parallelism."
+                "quixicore(metal/xpu): the routed GGUF GEMV takes local expert "
+                "ids only; expert parallelism is not supported here."
             )
         from vllm.quixicore import quixicore_ops
 

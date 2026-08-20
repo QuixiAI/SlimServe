@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.platforms.xpu_affinity import xpu_worker_affinity_env
 from vllm.tracing import instrument, maybe_init_worker_tracer
 from vllm.utils import numa_utils
 from vllm.utils.network_utils import (
@@ -176,8 +177,11 @@ class MultiprocExecutor(Executor):
             for local_rank in range(self.local_world_size):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
-                with cpu_omp_manager.configure_omp_envs(
-                    rank=global_rank, local_rank=local_rank
+                with (
+                    cpu_omp_manager.configure_omp_envs(
+                        rank=global_rank, local_rank=local_rank
+                    ),
+                    xpu_worker_affinity_env(local_rank, self.vllm_config),
                 ):
                     unready_worker_handle = WorkerProc.make_worker_process(
                         vllm_config=self.vllm_config,

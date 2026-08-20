@@ -1,0 +1,558 @@
+// SlimServe build of the QuixiCore XPU <-> PyTorch binding (vllm._quixicore_C).
+// Kept as an unmodified-as-possible copy of QuixiCore-XPU/bindings/pytorch/
+// tk_xpu_ext.sycl; the module name comes from TORCH_EXTENSION_NAME.
+//
+// QuixiCore XPU <-> PyTorch binding (co-equal with the C++ core, mirroring the
+// Metal backend's PyTorch binding). Each op takes torch.xpu tensors, pulls the
+// SYCL queue straight off the tensor's current XPU stream, and calls the same
+// quixicore::xpu::ops ABI on the tensor's USM data pointers. No data copies.
+//
+// Built with torch.utils.cpp_extension.SyclExtension (icpx -fsycl), linked
+// against the prebuilt libquixicore_xpu_ops.
+
+#include <torch/extension.h>
+
+#include <ATen/xpu/XPUGraph.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+#include <cstdint>
+#include <optional>
+#include <string>
+
+#include "quixicore/xpu/ops.hpp"
+#include "quixicore/xpu/runtime.hpp"
+
+namespace qx = quixicore::xpu;
+
+namespace {
+
+qx::DType dtype_of(const torch::Tensor& t) {
+  switch (t.scalar_type()) {
+    case torch::kFloat32: return qx::DType::f32;
+    case torch::kFloat16: return qx::DType::f16;
+    case torch::kBFloat16: return qx::DType::bf16;
+    default: TORCH_CHECK(false, "quixicore-xpu: unsupported dtype ", t.scalar_type());
+  }
+  return qx::DType::f32;
+}
+
+sycl::queue& queue_of(const torch::Tensor& t) {
+  return c10::xpu::getCurrentXPUStream(t.device().index()).queue();
+}
+
+void check(const torch::Tensor& t) {
+  TORCH_CHECK(t.is_xpu(), "quixicore-xpu: tensor must be on an XPU device");
+  TORCH_CHECK(t.is_contiguous(), "quixicore-xpu: tensor must be contiguous");
+}
+
+void check_same_device(
+    const torch::Tensor& reference, const torch::Tensor& tensor,
+    const char* name) {
+  TORCH_CHECK(
+      reference.device() == tensor.device(), "quixicore-xpu: ", name,
+      " must be on ", reference.device(), ", got ", tensor.device());
+}
+
+// rows = product of all dims except the last; dim = last dim.
+std::pair<int64_t, int64_t> row_shape(const torch::Tensor& t) {
+  TORCH_CHECK(t.dim() > 0 && t.size(-1) > 0,
+              "quixicore-xpu: tensor must have a nonempty last dimension");
+  const int64_t d = t.size(-1);
+  return {t.numel() / d, d};
+}
+
+class XpuGraph {
+ public:
+  explicit XpuGraph(bool keep_graph = false) : graph_(keep_graph) {}
+
+  void capture_begin(const py::object& pool) {
+    const auto capture_stream = c10::xpu::getCurrentXPUStream();
+    c10::MempoolId_t pool_id{0, 0};
+    if (!pool.is_none()) {
+      const auto values = py::cast<py::tuple>(pool);
+      TORCH_CHECK(values.size() == 2,
+                  "XPU graph pool handle must have two values");
+      const auto first = values[0].cast<std::int64_t>();
+      const auto second = values[1].cast<std::int64_t>();
+      TORCH_CHECK(first >= 0 && second >= 0,
+                  "XPU graph pool values must be non-negative");
+      pool_id = {static_cast<std::uint64_t>(first),
+                 static_cast<std::uint64_t>(second)};
+    }
+    graph_.capture_begin(pool_id);
+    capture_stream_ = capture_stream;
+  }
+
+  void capture_end() { graph_.capture_end(); }
+  void instantiate() { graph_.instantiate(); }
+  void replay() { graph_.replay(); }
+  void reset() {
+    graph_.reset();
+    capture_stream_.reset();
+  }
+
+  void synchronize() {
+    TORCH_CHECK(capture_stream_.has_value(),
+                "XPU graph has no capture stream");
+    capture_stream_->synchronize();
+  }
+
+  void enable_debug_mode() { graph_.enable_debug_mode(); }
+  void debug_dump(const std::string& path) { graph_.debug_dump(path); }
+
+  py::tuple pool() const {
+    const auto pool_id = graph_.pool();
+    return py::make_tuple(pool_id.first, pool_id.second);
+  }
+
+ private:
+  at::xpu::XPUGraph graph_;
+  std::optional<c10::xpu::XPUStream> capture_stream_;
+};
+
+void synchronize_current_stream() {
+  c10::xpu::getCurrentXPUStream().synchronize();
+}
+
+torch::Tensor gelu(torch::Tensor x, bool tanh) {
+  check(x);
+  auto out = torch::empty_like(x);
+  qx::ops::gelu(queue_of(x), x.data_ptr(), out.data_ptr(), x.numel(), dtype_of(x),
+                tanh ? qx::ops::GeluApprox::tanh : qx::ops::GeluApprox::erf,
+                qx::Variant::best, false);
+  return out;
+}
+
+torch::Tensor gelu_backward(
+    torch::Tensor grad_out, torch::Tensor x, bool tanh) {
+  check(grad_out);
+  check(x);
+  check_same_device(x, grad_out, "GELU output gradient");
+  TORCH_CHECK(grad_out.sizes() == x.sizes() &&
+                  grad_out.scalar_type() == x.scalar_type(),
+              "quixicore-xpu: GELU gradient and input must match");
+  auto grad_in = torch::empty_like(x);
+  qx::ops::gelu_backward(
+      queue_of(x), grad_out.data_ptr(), x.data_ptr(), grad_in.data_ptr(),
+      x.numel(), dtype_of(x),
+      tanh ? qx::ops::GeluApprox::tanh : qx::ops::GeluApprox::erf,
+      qx::Variant::sycl, false);
+  return grad_in;
+}
+
+torch::Tensor silu(torch::Tensor x) {
+  check(x);
+  auto out = torch::empty_like(x);
+  qx::ops::silu(queue_of(x), x.data_ptr(), out.data_ptr(), x.numel(),
+                dtype_of(x), qx::Variant::sycl, false);
+  return out;
+}
+
+torch::Tensor softmax(torch::Tensor x) {
+  check(x);
+  auto out = torch::empty_like(x);
+  auto [rows, dim] = row_shape(x);
+  qx::ops::softmax(queue_of(x), x.data_ptr(), out.data_ptr(), rows, dim, dtype_of(x),
+                   qx::Variant::best, false);
+  return out;
+}
+
+torch::Tensor rms_norm(torch::Tensor x, torch::Tensor weight, double eps) {
+  check(x); check(weight);
+  auto out = torch::empty_like(x);
+  auto [rows, dim] = row_shape(x);
+  qx::ops::rms_norm(queue_of(x), x.data_ptr(), weight.data_ptr(), out.data_ptr(),
+                    rows, dim, static_cast<float>(eps), dtype_of(x),
+                    qx::Variant::best, false);
+  return out;
+}
+
+torch::Tensor fused_add_rms_norm(
+    torch::Tensor x, torch::Tensor residual, torch::Tensor weight,
+    double eps) {
+  check(x);
+  check(residual);
+  check(weight);
+  TORCH_CHECK(x.scalar_type() == residual.scalar_type() &&
+                  x.scalar_type() == weight.scalar_type(),
+              "quixicore-xpu: fused RMSNorm dtypes must match");
+  check_same_device(x, residual, "residual");
+  check_same_device(x, weight, "weight");
+  TORCH_CHECK(x.sizes() == residual.sizes(),
+              "quixicore-xpu: residual shape must match x");
+  auto [rows, dim] = row_shape(x);
+  TORCH_CHECK(weight.numel() == dim,
+              "quixicore-xpu: RMSNorm weight shape mismatch");
+  auto out = torch::empty_like(x);
+  qx::ops::fused_add_rms_norm(
+      queue_of(x), x.data_ptr(), residual.data_ptr(), weight.data_ptr(),
+      out.data_ptr(), rows, dim, static_cast<float>(eps), dtype_of(x),
+      qx::Variant::sycl, false);
+  return out;
+}
+
+torch::Tensor layernorm(torch::Tensor x, torch::Tensor weight, torch::Tensor bias, double eps) {
+  check(x); check(weight); check(bias);
+  auto out = torch::empty_like(x);
+  auto [rows, dim] = row_shape(x);
+  qx::ops::layernorm(queue_of(x), x.data_ptr(), weight.data_ptr(), bias.data_ptr(),
+                     out.data_ptr(), rows, dim, static_cast<float>(eps), dtype_of(x),
+                     qx::Variant::best, false);
+  return out;
+}
+
+torch::Tensor dense_gemm(torch::Tensor a, torch::Tensor b) {
+  check(a); check(b);
+  const int64_t M = a.size(0), K = a.size(1), N = b.size(1);
+  TORCH_CHECK(b.size(0) == K, "quixicore-xpu: gemm K mismatch");
+  auto c = torch::empty({M, N}, a.options());
+  qx::ops::dense_gemm(queue_of(a), a.data_ptr(), b.data_ptr(), c.data_ptr(), M, N, K,
+                      dtype_of(a), qx::Variant::best, false);
+  return c;
+}
+
+// Q [H, Sq, D], K/V [Hkv, Sk, D] -> O [H, Sq, D].
+torch::Tensor attention(torch::Tensor Q, torch::Tensor K, torch::Tensor V, bool causal) {
+  check(Q); check(K); check(V);
+  const int64_t H = Q.size(0), Sq = Q.size(1), D = Q.size(2);
+  const int64_t Hkv = K.size(0), Sk = K.size(1);
+  auto O = torch::empty_like(Q);
+  qx::ops::attention(queue_of(Q), Q.data_ptr(), K.data_ptr(), V.data_ptr(), O.data_ptr(),
+                     H, Hkv, Sq, Sk, D, causal, dtype_of(Q),
+                     qx::Variant::sycl, false);
+  return O;
+}
+
+torch::Tensor argmax(torch::Tensor logits) {
+  check(logits);
+  auto [rows, vocab] = row_shape(logits);
+  auto out = torch::empty({rows}, logits.options().dtype(torch::kInt32));
+  qx::ops::argmax(queue_of(logits), logits.data_ptr(), out.data_ptr<int32_t>(), rows, vocab,
+                  dtype_of(logits), qx::Variant::sycl, false);
+  return out;
+}
+
+torch::Tensor nvfp4_gemm(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor block_scales,
+    double global_scale) {
+  check(x);
+  check(weight);
+  check(block_scales);
+  check_same_device(x, weight, "weight");
+  check_same_device(x, block_scales, "block scales");
+  TORCH_CHECK(weight.dim() == 2 && weight.scalar_type() == torch::kUInt8,
+              "quixicore-xpu: NVFP4 weight must be uint8 [N,K/2]");
+  TORCH_CHECK(block_scales.dim() == 2 && block_scales.element_size() == 1,
+              "quixicore-xpu: NVFP4 scales must be byte [N,K/16]");
+  const auto [M, K] = row_shape(x);
+  const int64_t N = weight.size(0);
+  TORCH_CHECK(weight.size(1) == K / 2,
+              "quixicore-xpu: NVFP4 weight must be byte [N,K/2]");
+  TORCH_CHECK(block_scales.size(0) == N &&
+                  block_scales.size(1) == K / 16,
+              "quixicore-xpu: NVFP4 scales must be byte [N,K/16]");
+  TORCH_CHECK(K % 32 == 0,
+              "quixicore-xpu: NVFP4 K must be a multiple of 32");
+  auto sizes = x.sizes().vec();
+  sizes.back() = N;
+  auto out = torch::empty(sizes, x.options());
+  qx::ops::nvfp4_gemm(
+      queue_of(x), weight.data_ptr(), block_scales.data_ptr(),
+      static_cast<float>(global_scale), x.data_ptr(), out.data_ptr(), M, N,
+      K, dtype_of(x), qx::Variant::sycl, false);
+  return out;
+}
+
+torch::Tensor fp8_gemm_w8a16(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor weight_scale,
+    int64_t kind, bool per_channel) {
+  check(x);
+  check(weight);
+  check(weight_scale);
+  check_same_device(x, weight, "weight");
+  check_same_device(x, weight_scale, "weight scale");
+  TORCH_CHECK(kind == 0 || kind == 1,
+              "quixicore-xpu: FP8 kind must be 0 (e4m3) or 1 (e5m2)");
+  TORCH_CHECK(weight.dim() == 2 &&
+                  weight.scalar_type() == torch::kUInt8,
+              "quixicore-xpu: FP8 weight must be a uint8 view [N,K]");
+  const auto [M, K] = row_shape(x);
+  const int64_t N = weight.size(0);
+  TORCH_CHECK(weight.size(1) == K,
+              "quixicore-xpu: FP8 weight must be a uint8 view [N,K]");
+  TORCH_CHECK(weight_scale.scalar_type() == torch::kFloat32 &&
+                  weight_scale.numel() == (per_channel ? N : 1),
+              "quixicore-xpu: FP8 scale must be float32 [N] or [1]");
+  TORCH_CHECK(K % 16 == 0,
+              "quixicore-xpu: W8A16 K must be a multiple of 16");
+  auto sizes = x.sizes().vec();
+  sizes.back() = N;
+  auto out = torch::empty(sizes, x.options());
+  qx::ops::fp8_gemm_w8a16(
+      queue_of(x), x.data_ptr(), weight.data_ptr(),
+      weight_scale.data_ptr<float>(), out.data_ptr(), M, N, K,
+      kind == 1 ? qx::ops::Fp8Kind::e5m2 : qx::ops::Fp8Kind::e4m3,
+      per_channel, dtype_of(x), qx::Variant::best, false);
+  return out;
+}
+
+torch::Tensor nvfp4_moe(
+    torch::Tensor hidden, torch::Tensor topk_ids,
+    torch::Tensor topk_weights, torch::Tensor w13,
+    torch::Tensor w13_scales, torch::Tensor w13_global_scales,
+    torch::Tensor w2, torch::Tensor w2_scales,
+    torch::Tensor w2_global_scales,
+    std::optional<torch::Tensor> split_scratch, bool split,
+    bool multiply_router_weight) {
+  check(hidden);
+  check(topk_ids);
+  check(topk_weights);
+  check(w13);
+  check(w13_scales);
+  check(w13_global_scales);
+  check(w2);
+  check(w2_scales);
+  check(w2_global_scales);
+  check_same_device(hidden, topk_ids, "topk ids");
+  check_same_device(hidden, topk_weights, "router weights");
+  check_same_device(hidden, w13, "w13");
+  check_same_device(hidden, w13_scales, "w13 scales");
+  check_same_device(hidden, w13_global_scales, "w13 global scales");
+  check_same_device(hidden, w2, "w2");
+  check_same_device(hidden, w2_scales, "w2 scales");
+  check_same_device(hidden, w2_global_scales, "w2 global scales");
+  TORCH_CHECK(hidden.dim() == 2,
+              "quixicore-xpu: hidden must be [M,K]");
+  TORCH_CHECK(topk_ids.dim() == 2 &&
+                  topk_ids.scalar_type() == torch::kInt32,
+              "quixicore-xpu: topk ids must be int32 [M,top_k]");
+  TORCH_CHECK(topk_weights.scalar_type() == torch::kFloat32 &&
+                  topk_weights.sizes() == topk_ids.sizes(),
+              "quixicore-xpu: router weights must be float32 [M,top_k]");
+  TORCH_CHECK(w13.dim() == 3 &&
+                  w13.scalar_type() == torch::kUInt8 &&
+                  w13.size(1) % 2 == 0,
+              "quixicore-xpu: w13 must be byte [E,2I,K/2]");
+  TORCH_CHECK(w2.dim() == 3 && w2.scalar_type() == torch::kUInt8,
+              "quixicore-xpu: w2 must be byte [E,K,I/2]");
+  TORCH_CHECK(w13_scales.dim() == 3 &&
+                  w13_scales.element_size() == 1,
+              "quixicore-xpu: w13 scales must be byte [E,2I,K/16]");
+  TORCH_CHECK(w2_scales.dim() == 3 && w2_scales.element_size() == 1,
+              "quixicore-xpu: w2 scales must be byte [E,K,I/16]");
+  TORCH_CHECK(w13_global_scales.scalar_type() == torch::kFloat32 &&
+                  w2_global_scales.scalar_type() == torch::kFloat32,
+              "quixicore-xpu: NVFP4 global scales must be float32");
+
+  const auto [M, K] = row_shape(hidden);
+  const int64_t E = w13.size(0);
+  const int64_t top_k = topk_ids.size(1);
+  const int64_t I = w13.size(1) / 2;
+  TORCH_CHECK(M > 0 && E > 0 && top_k > 0 && I > 0,
+              "quixicore-xpu: NVFP4 MoE dimensions must be nonzero");
+  TORCH_CHECK(topk_ids.size(0) == M,
+              "quixicore-xpu: topk ids must be int32 [M,top_k]");
+  TORCH_CHECK(w13.size(2) == K / 2,
+              "quixicore-xpu: w13 must be byte [E,2I,K/2]");
+  TORCH_CHECK(w2.size(0) == E && w2.size(1) == K &&
+                  w2.size(2) == I / 2,
+              "quixicore-xpu: w2 must be byte [E,K,I/2]");
+  TORCH_CHECK(w13_scales.size(0) == E &&
+                  w13_scales.size(1) == 2 * I &&
+                  w13_scales.size(2) == K / 16,
+              "quixicore-xpu: w13 scales must be byte [E,2I,K/16]");
+  TORCH_CHECK(w2_scales.size(0) == E && w2_scales.size(1) == K &&
+                  w2_scales.size(2) == I / 16,
+              "quixicore-xpu: w2 scales must be byte [E,K,I/16]");
+  TORCH_CHECK(w13_global_scales.numel() == E &&
+                  w2_global_scales.numel() == E,
+              "quixicore-xpu: NVFP4 global scales must contain E values");
+  TORCH_CHECK(K % 32 == 0 && I % 32 == 0,
+              "quixicore-xpu: NVFP4 MoE K/I must be multiples of 32");
+
+  auto output = torch::empty({M, K}, hidden.options().dtype(torch::kFloat32));
+  torch::Tensor scratch;
+  if (split) {
+    if (split_scratch.has_value()) {
+      scratch = *split_scratch;
+      check(scratch);
+      check_same_device(hidden, scratch, "split scratch");
+      TORCH_CHECK(scratch.scalar_type() == torch::kFloat32 &&
+                      scratch.dim() == 2 &&
+                      scratch.size(0) == M * top_k &&
+                      scratch.size(1) == 2 * I,
+                  "quixicore-xpu: split scratch must be float32 "
+                  "[M*top_k,2I]");
+    } else {
+      const auto stream = c10::xpu::getCurrentXPUStream(
+          hidden.device().index());
+      TORCH_CHECK(
+          !stream.is_capturing(),
+          "quixicore-xpu: graph-captured split MoE requires caller-owned "
+          "persistent scratch [M*top_k,2I]");
+      scratch = torch::empty(
+          {M * top_k, 2 * I},
+          hidden.options().dtype(torch::kFloat32));
+    }
+    qx::ops::nvfp4_moe_split(
+        queue_of(hidden), hidden.data_ptr(), topk_ids.data_ptr<int>(),
+        topk_weights.data_ptr<float>(), w13.data_ptr(),
+        w13_scales.data_ptr(), w13_global_scales.data_ptr<float>(),
+        w2.data_ptr(), w2_scales.data_ptr(),
+        w2_global_scales.data_ptr<float>(), scratch.data_ptr<float>(),
+        output.data_ptr<float>(), M, E, top_k, K, I, dtype_of(hidden),
+        multiply_router_weight, qx::Variant::sycl, false);
+  } else {
+    qx::ops::nvfp4_moe_fused(
+        queue_of(hidden), hidden.data_ptr(), topk_ids.data_ptr<int>(),
+        topk_weights.data_ptr<float>(), w13.data_ptr(),
+        w13_scales.data_ptr(), w13_global_scales.data_ptr<float>(),
+        w2.data_ptr(), w2_scales.data_ptr(),
+        w2_global_scales.data_ptr<float>(), output.data_ptr<float>(), M, E,
+        top_k, K, I, dtype_of(hidden), multiply_router_weight,
+        qx::Variant::sycl, false);
+  }
+  return output;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> qwen_gdn_decode(
+    torch::Tensor projected_qkvz, torch::Tensor projected_ba,
+    torch::Tensor conv_state, torch::Tensor ssm_state,
+    torch::Tensor conv_weight, torch::Tensor conv_bias,
+    torch::Tensor A_log, torch::Tensor dt_bias,
+    torch::Tensor state_indices) {
+  check(projected_qkvz);
+  check(projected_ba);
+  check(conv_state);
+  check(ssm_state);
+  check(conv_weight);
+  check(conv_bias);
+  check(A_log);
+  check(dt_bias);
+  check(state_indices);
+  check_same_device(projected_qkvz, projected_ba, "projected ba");
+  check_same_device(projected_qkvz, conv_state, "convolution state");
+  check_same_device(projected_qkvz, ssm_state, "SSM state");
+  check_same_device(projected_qkvz, conv_weight, "convolution weight");
+  check_same_device(projected_qkvz, conv_bias, "convolution bias");
+  check_same_device(projected_qkvz, A_log, "A_log");
+  check_same_device(projected_qkvz, dt_bias, "dt bias");
+  check_same_device(projected_qkvz, state_indices, "state indices");
+  TORCH_CHECK(projected_qkvz.dim() == 2 &&
+                  projected_qkvz.size(0) > 0 &&
+                  projected_qkvz.size(1) == 12288,
+              "quixicore-xpu: projected qkvz must be [B,12288]");
+  const int64_t batch = projected_qkvz.size(0);
+  TORCH_CHECK(projected_ba.dim() == 2 && projected_ba.size(0) == batch &&
+                  projected_ba.size(1) == 64,
+              "quixicore-xpu: projected ba must be [B,64]");
+  TORCH_CHECK(projected_ba.scalar_type() ==
+                      projected_qkvz.scalar_type() &&
+                  conv_state.scalar_type() ==
+                      projected_qkvz.scalar_type() &&
+                  conv_weight.scalar_type() ==
+                      projected_qkvz.scalar_type() &&
+                  conv_bias.scalar_type() == projected_qkvz.scalar_type(),
+              "quixicore-xpu: GDN activations, convolution state, weight, "
+              "and bias dtypes must match");
+  TORCH_CHECK(state_indices.scalar_type() == torch::kInt32 &&
+                  state_indices.dim() == 1 &&
+                  state_indices.size(0) == batch,
+              "quixicore-xpu: state indices must be int32 [B]");
+  TORCH_CHECK(A_log.scalar_type() == torch::kFloat32 &&
+                  A_log.dim() == 1 && A_log.size(0) == 32,
+              "quixicore-xpu: A_log must be float32 [32]");
+  TORCH_CHECK(dt_bias.dim() == 1 && dt_bias.size(0) == 32,
+              "quixicore-xpu: dt bias must be [32]");
+  TORCH_CHECK(conv_weight.dim() == 2 && conv_weight.size(0) == 8192 &&
+                  conv_weight.size(1) == 4,
+              "quixicore-xpu: convolution weight must be [8192,4]");
+  TORCH_CHECK(conv_bias.dim() == 1 && conv_bias.size(0) == 8192,
+              "quixicore-xpu: convolution bias must be [8192]");
+  TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.size(1) == 32 &&
+                  ssm_state.size(2) == 128 && ssm_state.size(3) == 128,
+              "quixicore-xpu: SSM state must be [slots,32,128,128]");
+  bool conv_dim_first = false;
+  TORCH_CHECK(conv_state.dim() == 3,
+              "quixicore-xpu: conv state must be 3D");
+  if (conv_state.size(1) == 8192 && conv_state.size(2) == 3) {
+    conv_dim_first = true;
+  } else {
+    TORCH_CHECK(conv_state.size(1) == 3 && conv_state.size(2) == 8192,
+                "quixicore-xpu: conv state shape is invalid");
+  }
+  TORCH_CHECK(conv_state.size(0) == ssm_state.size(0),
+              "quixicore-xpu: convolution and SSM state slots must match");
+  (void)dtype_of(projected_qkvz);
+  (void)dtype_of(ssm_state);
+  (void)dtype_of(dt_bias);
+  auto mixed_qkv = torch::empty({batch, 8192}, projected_qkvz.options());
+  auto core = torch::empty({batch, 32, 128}, projected_qkvz.options());
+  auto z = torch::empty({batch, 32, 128}, projected_qkvz.options());
+  qx::ops::qwen_gdn_decode(
+      queue_of(projected_qkvz), projected_qkvz.data_ptr(),
+      projected_ba.data_ptr(), conv_state.data_ptr(), ssm_state.data_ptr(),
+      conv_weight.data_ptr(), conv_bias.data_ptr(), A_log.data_ptr<float>(),
+      dt_bias.data_ptr(), state_indices.data_ptr<int>(), mixed_qkv.data_ptr(),
+      core.data_ptr(), z.data_ptr(), batch, ssm_state.size(0),
+      conv_dim_first, dtype_of(projected_qkvz), dtype_of(ssm_state),
+      dtype_of(dt_bias), qx::Variant::sycl, false);
+  return {core, z};
+}
+
+int64_t device_count() { return static_cast<int64_t>(qx::gpu_devices().size()); }
+
+}  // namespace
+
+// SlimServe additions (qc_xpu_slimserve.sycl): GGUF ops for the DSV4 path.
+void register_slimserve_ops(pybind11::module_& m);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  register_slimserve_ops(m);
+  m.doc() = "QuixiCore XPU kernels for PyTorch (torch.xpu)";
+  py::class_<XpuGraph>(m, "XPUGraph")
+      .def(py::init<bool>(), py::arg("keep_graph") = false)
+      .def("capture_begin", &XpuGraph::capture_begin,
+           py::arg("pool") = py::none())
+      .def("capture_end", &XpuGraph::capture_end)
+      .def("instantiate", &XpuGraph::instantiate)
+      .def("replay", &XpuGraph::replay)
+      .def("synchronize", &XpuGraph::synchronize)
+      .def("reset", &XpuGraph::reset)
+      .def("pool", &XpuGraph::pool)
+      .def("enable_debug_mode", &XpuGraph::enable_debug_mode)
+      .def("debug_dump", &XpuGraph::debug_dump);
+  m.def("synchronize_current_stream", &synchronize_current_stream);
+  m.def("gelu", &gelu, py::arg("x"), py::arg("tanh") = false);
+  m.def("gelu_backward", &gelu_backward, py::arg("grad_out"),
+        py::arg("x"), py::arg("tanh") = false);
+  m.def("silu", &silu, py::arg("x"));
+  m.def("softmax", &softmax, py::arg("x"));
+  m.def("rms_norm", &rms_norm, py::arg("x"), py::arg("weight"), py::arg("eps") = 1e-6);
+  m.def("fused_add_rms_norm", &fused_add_rms_norm, py::arg("x"),
+        py::arg("residual"), py::arg("weight"), py::arg("eps") = 1e-6);
+  m.def("layernorm", &layernorm, py::arg("x"), py::arg("weight"), py::arg("bias"), py::arg("eps") = 1e-5);
+  m.def("dense_gemm", &dense_gemm, py::arg("a"), py::arg("b"));
+  m.def("attention", &attention, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false);
+  m.def("argmax", &argmax, py::arg("logits"));
+  m.def("nvfp4_gemm", &nvfp4_gemm, py::arg("x"), py::arg("weight"),
+        py::arg("block_scales"), py::arg("global_scale"));
+  m.def("fp8_gemm_w8a16", &fp8_gemm_w8a16, py::arg("x"),
+        py::arg("weight"), py::arg("weight_scale"), py::arg("kind") = 0,
+        py::arg("per_channel") = false);
+  m.def("nvfp4_moe", &nvfp4_moe, py::arg("hidden"),
+        py::arg("topk_ids"), py::arg("topk_weights"), py::arg("w13"),
+        py::arg("w13_scales"), py::arg("w13_global_scales"),
+        py::arg("w2"), py::arg("w2_scales"),
+        py::arg("w2_global_scales"),
+        py::arg("split_scratch") = std::nullopt,
+        py::arg("split") = true,
+        py::arg("multiply_router_weight") = true);
+  m.def("qwen_gdn_decode", &qwen_gdn_decode,
+        py::arg("projected_qkvz"), py::arg("projected_ba"),
+        py::arg("conv_state"), py::arg("ssm_state"),
+        py::arg("conv_weight"), py::arg("conv_bias"), py::arg("A_log"),
+        py::arg("dt_bias"), py::arg("state_indices"));
+  m.def("device_count", &device_count);
+}

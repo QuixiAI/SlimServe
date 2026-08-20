@@ -487,6 +487,7 @@ def test_deepseek_profiles_cover_all_supported_tensor_parallel_sizes():
         ],
         "dsv4-mxfp4-8": [("a100", 8, 8, "MXFP4")],
         "dsv4-q4k-8": [("mi300x", 8, 8, "Q4_K")],
+        "dsv4-xxs-b70-4": [("b70", 4, 4, "IQ2_XXS")],
     }
 
     assert {
@@ -586,7 +587,8 @@ def test_streaming_filter_never_emits_half_a_control_token(deltas, expected):
 def test_profiles_use_their_validated_graph_mode():
     """Graph mode is per-platform evidence: DSpark/TurboQuant DSV4 runs eager
     on MI300X/Metal, while the A100 profiles qualified PIECEWISE capture
-    (128K lifecycle, perf/optimization_status.md)."""
+    (128K lifecycle) and B70 qualified PIECEWISE via XPU breakable capture
+    (perf/optimization_status.md)."""
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
             engine = resolve(
@@ -597,7 +599,7 @@ def test_profiles_use_their_validated_graph_mode():
                 _big_enough(profile_id, platform),
             ).engine
             cudagraph_mode = engine.get("compilation_config", {}).get("cudagraph_mode")
-            if profile_id.startswith("dsv4-") and platform == "a100":
+            if profile_id.startswith("dsv4-") and platform in ("a100", "b70"):
                 assert cudagraph_mode in ("PIECEWISE", "FULL_DECODE_ONLY"), profile_id
             elif (
                 profile_id.startswith("dsv4-")
@@ -693,3 +695,13 @@ def test_dsv4_flash_artifacts_are_0731_and_checksum_pinned():
             if name not in pending_pin:
                 sha = entry.get("sha256")
                 assert sha and len(sha) == 64, f"{name} missing sha256 pin"
+
+
+def test_b70_dsv4_profile_is_tp4_without_a_drafter():
+    plan = resolve("dsv4-xxs-b70-4", "b70", 4, None)
+    assert plan.quant.title.startswith("IQ2XXS")
+    assert plan.engine["tensor_parallel_size"] == 4
+    assert plan.speculative is False
+    assert "speculative_config" not in engine_kwargs(plan)
+    with pytest.raises(ProfileError):
+        resolve("dsv4-xxs-b70-4", "b70", 2, None)

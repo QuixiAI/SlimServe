@@ -14,12 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Qwen3.5 model configuration.
-
-Vendored from upstream vLLM ``transformers_utils/configs/qwen3_5.py``
-(dense Qwen3.5; the Qwen3.5-MoE config lives in a separate upstream file
-that is intentionally not vendored in this fork).
-"""
+"""Qwen3.5 model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -195,4 +190,4 @@ class Qwen3_5Config(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
 
 
-__all__ = ["Qwen3_5Config", "Qwen3_5TextConfig", "Qwen3_5VisionConfig"]
+__all__ = ["Qwen3_5Config", "Qwen3_5TextConfig"]

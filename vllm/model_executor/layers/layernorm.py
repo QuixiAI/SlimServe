@@ -183,6 +183,8 @@ class GemmaRMSNorm(CustomOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        # (1 + w) in the activation dtype, built lazily on XPU (see forward_xpu).
+        self._fused_weight_cache: torch.Tensor | None = None
 
     def forward_native(
         self,
@@ -201,6 +203,36 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_native(x, residual)
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # The xpu_kernels rms_norm / fused_add_rms_norm impls require
+        # weight.dtype == x.dtype; the fp32 (1 + w) built by forward_native
+        # therefore falls back to the ~11-kernel ATen decomposition on every
+        # call. Cache (1 + w) in the activation dtype once so the single SYCL
+        # kernel is selected. Numerics: (1 + w) is rounded to bf16/fp16 once
+        # (rel. 2^-9), and the kernel multiplies after rounding x rather than
+        # before -- both within one output-ulp of the fp32 reference. Opt-in
+        # (VLLM_XPU_GEMMA_NORM_FUSED).
+        if not envs.VLLM_XPU_GEMMA_NORM_FUSED or x.dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            return self.forward_native(x, residual)
+        w = self._fused_weight_cache
+        if w is None or w.dtype != x.dtype or w.device != x.device:
+            w = (self.weight.data.float() + 1.0).to(dtype=x.dtype, device=x.device)
+            self._fused_weight_cache = w
+        if residual is None:
+            if not x.is_contiguous():
+                x = x.contiguous()
+            return ir.ops.rms_norm(x, w, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm.maybe_inplace(
+            x, residual, w, self.variance_epsilon
+        )
 
 
 # --8<-- [start:rms_norm_gated]

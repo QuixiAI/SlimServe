@@ -127,7 +127,31 @@ def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
 
 
-def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+def _maybe_breakable_tensor_output(
+    fn: Callable[..., torch.Tensor], *args: Any
+) -> torch.Tensor:
+    """XPU: oneCCL collectives cannot be captured into a SYCL command graph,
+    so under the breakable capture each one becomes an eager segment whose
+    output keeps a stable address (see BreakableCUDAGraphCapture.
+    add_eager_tensor_output). Elsewhere (NCCL/RCCL) collectives capture."""
+    if not envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
+        return fn(*args)
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_xpu():
+        return fn(*args)
+    wrapper = getattr(fn, "_breakable_cudagraph_wrapper", None)
+    if wrapper is None:
+        from vllm.compilation.breakable_cudagraph import (
+            eager_break_during_capture_tensor_output,
+        )
+
+        wrapper = eager_break_during_capture_tensor_output(fn)
+        fn.__dict__["_breakable_cudagraph_wrapper"] = wrapper
+    return wrapper(*args)
+
+
+def _all_reduce_impl(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -135,11 +159,15 @@ def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return group._all_reduce_out_place(tensor)
 
 
+def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    return _maybe_breakable_tensor_output(_all_reduce_impl, tensor, group_name)
+
+
 def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
-def reduce_scatter(
+def _reduce_scatter_impl(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -147,6 +175,14 @@ def reduce_scatter(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._reduce_scatter_out_place(tensor, dim)
+
+
+def reduce_scatter(
+    tensor: torch.Tensor, dim: int, world_size: int, group_name: str
+) -> torch.Tensor:
+    return _maybe_breakable_tensor_output(
+        _reduce_scatter_impl, tensor, dim, world_size, group_name
+    )
 
 
 def reduce_scatter_fake(
@@ -157,7 +193,7 @@ def reduce_scatter_fake(
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
-def all_gather(
+def _all_gather_impl(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
     assert group_name in _groups, f"Group {group_name} is not found."
@@ -165,6 +201,14 @@ def all_gather(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._all_gather_out_place(tensor, dim)
+
+
+def all_gather(
+    tensor: torch.Tensor, dim: int, world_size: int, group_name: str
+) -> torch.Tensor:
+    return _maybe_breakable_tensor_output(
+        _all_gather_impl, tensor, dim, world_size, group_name
+    )
 
 
 def all_gather_fake(

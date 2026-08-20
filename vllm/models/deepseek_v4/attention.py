@@ -43,6 +43,7 @@ from vllm.config import (
 )
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers import nan_probe
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -441,6 +442,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.attn_gemm_parallel_execute(hidden_states, prequant_input)
         )
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+        nan_probe.det_probe("A.qr_kv_raw", qr, kv, kv_score, indexer_kv_score, indexer_weights)
         qr, kv = fused_q_kv_rmsnorm(
             qr,
             kv,
@@ -448,6 +450,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_norm.weight.data,
             self.eps,
         )
+        nan_probe.det_probe("A.qr_kv_norm", qr, kv)
 
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
@@ -463,9 +466,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        nan_probe.det_probe("A.mqa_out", o, self.topk_indices_buffer)
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
-        return self._o_proj(o, positions)
+        result = self._o_proj(o, positions)
+        nan_probe.det_probe("A.o_proj", result)
+        return result
 
     def attn_gemm_parallel_execute(
         self,
@@ -757,6 +763,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         else:
             # MLA attention writes into the pre-allocated `out` buffer
             # ([num_tokens, padded_heads, head_dim]).
+            nan_probe.det_probe("A.q_roped", q, kv)
             self.forward_mqa(q, kv, positions, out)
 
     def _fused_qnorm_rope_kv_insert(

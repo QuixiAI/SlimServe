@@ -289,7 +289,13 @@ if TYPE_CHECKING:
     VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: bool = True
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
+    VLLM_XPU_PER_WORKER_AFFINITY: bool = True
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_NVFP4_LINEAR_PREFILL_DPAS: bool = False
+    VLLM_NVFP4_DPAS_ROWS_CACHE: bool = False
+    VLLM_NVFP4_DPAS_ROWS_FULL: bool = False
+    VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE: bool = False
+    VLLM_XPU_GEMMA_NORM_FUSED: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1948,6 +1954,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(
         os.getenv("VLLM_NIXL_EP_MAX_NUM_RANKS", "32")
     ),
+    # Spawn each XPU TP worker with a single-device ZE_AFFINITY_MASK so its
+    # Level Zero context is single-device (VRAM is otherwise mirrored in host
+    # RAM through dma-buf sharing; see vllm/platforms/xpu_affinity.py).
+    "VLLM_XPU_PER_WORKER_AFFINITY": lambda: bool(
+        int(os.getenv("VLLM_XPU_PER_WORKER_AFFINITY", "1"))
+    ),
     # Whether enable XPU graph on Intel GPU
     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
@@ -1955,6 +1967,42 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # Route dense NVFP4 W4A16 linears (attn qkv/o, GDN in/out proj, shared
+    # expert, lm_head) through the SYCL-TLA DPAS grouped GEMM at prefill
+    # (M > VLLM_NVFP4_LINEAR_NATIVE_M_MAX) instead of dequant->oneDNN emulation.
+    # A single-group grouped GEMM (num_experts=1) feeds XMX/DPAS and avoids
+    # materializing the whole bf16 weight each forward. Decode keeps the native
+    # GEMV; disabled by default (emulation unchanged) until A/B'd in a window.
+    "VLLM_NVFP4_LINEAR_PREFILL_DPAS": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_PREFILL_DPAS", "0"))
+    ),
+    # NVFP4 DPAS grouped-GEMM prefill builds a 1-element int32 rows_per_expert
+    # tensor per dense-linear call. `torch.tensor([m], device=dev)` stages the
+    # scalar host->device: on the XPU backend each is a blocking bytes=4
+    # Memcpy M2D. ROWS_CACHE memoizes the tensor per (m, device) so the H2D
+    # happens once; ROWS_FULL builds it on device via torch.full (device-side
+    # fill kernel) to avoid the H2D entirely. Both default off.
+    "VLLM_NVFP4_DPAS_ROWS_CACHE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_CACHE", "0"))
+    ),
+    "VLLM_NVFP4_DPAS_ROWS_FULL": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_DPAS_ROWS_FULL", "0"))
+    ),
+    # NVFP4 DPAS grouped-GEMM prefill folds the per-tensor weight_global_scale
+    # onto the bf16 kernel output. Default epilogue upcasts to fp32, scales,
+    # then downcasts; BF16_SCALE keeps the multiply in bf16, dropping the fp32
+    # round-trip at the cost of scalar-scale precision. Default off.
+    "VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_LINEAR_DPAS_BF16_SCALE", "0"))
+    ),
+    # GemmaRMSNorm on XPU: the fused SYCL rms_norm / fused_add_rms_norm kernels
+    # are only selected when weight.dtype == x.dtype, but forward_native builds
+    # an fp32 (1 + w) every call, so each norm decomposes into ~11 eager ATen
+    # kernels. With this on, GemmaRMSNorm.forward_xpu caches (1 + w) in the
+    # activation dtype once and calls the fused kernels. Default off.
+    "VLLM_XPU_GEMMA_NORM_FUSED": lambda: bool(
+        int(os.getenv("VLLM_XPU_GEMMA_NORM_FUSED", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(

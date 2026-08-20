@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class Machine:
-    platform: str | None  # "mi300x", "a100", "metal", or None when unrecognized
+    platform: str | None  # "mi300x", "a100", "b70", "metal", or None when unrecognized
     device_name: str
     count: int  # visible devices, after the *_VISIBLE_DEVICES masks
     memory_bytes: int = 0  # unified memory; 0 on the discrete-GPU platforms
@@ -33,6 +33,7 @@ _VISIBLE_VARS = (
     "ROCR_VISIBLE_DEVICES",
     "HIP_VISIBLE_DEVICES",
     "CUDA_VISIBLE_DEVICES",
+    "ZE_AFFINITY_MASK",
 )
 
 
@@ -129,6 +130,30 @@ def _sysctl(name: str) -> str | None:
     return value or None
 
 
+def _probe_intel_xpu() -> tuple[str, int] | None:
+    """Intel discrete GPUs via xpu-smi (no torch, no SYCL context)."""
+    try:
+        out = subprocess.run(
+            ["xpu-smi", "discovery"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    names = [
+        line.split("Device Name:", 1)[1].split("|")[0].strip()
+        for line in out.stdout.splitlines()
+        if "Device Name:" in line
+    ]
+    if not names:
+        return None
+    return names[0], len(names)
+
+
 def _probe_apple() -> Machine | None:
     """Apple Silicon: one GPU, and unified memory is the number that matters.
 
@@ -153,6 +178,8 @@ def _classify(device_name: str) -> str | None:
         return "mi300x"
     if "a100" in lowered:
         return "a100"
+    if "b70" in lowered and "arc" in lowered:
+        return "b70"
     return None
 
 
@@ -160,7 +187,7 @@ def detect() -> Machine:
     apple = _probe_apple()
     if apple is not None:
         return apple
-    probed = _probe_amd() or _probe_nvidia()
+    probed = _probe_amd() or _probe_nvidia() or _probe_intel_xpu()
     if probed is None:
         return Machine(platform=None, device_name="none detected", count=0)
     device_name, count = probed

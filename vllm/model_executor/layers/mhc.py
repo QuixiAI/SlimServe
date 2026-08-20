@@ -261,7 +261,10 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops._xpu_C.mhc_pre(
+        # No vllm-xpu-kernels here; the torch reference is the XPU path until
+        # a QuixiCore-XPU mHC kernel lands (dsv4_hc_post exists upstream;
+        # pre/comb do not yet).
+        return self.forward_native(
             residual,
             fn,
             hc_scale,
@@ -271,6 +274,9 @@ class MHCPreOp(CustomOp):
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            n_splits,
+            norm_weight,
+            norm_eps,
         )
 
 
@@ -357,12 +363,7 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops._xpu_C.mhc_post(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-        )
+        return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
 
 
 # --8<-- [start:hc_head]
@@ -503,11 +504,9 @@ class HCHeadOp(CustomOp):
         hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
         num_tokens = hs_flat.shape[0]
 
-        out = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
-        )
-        torch.ops._xpu_C.hc_head_fused(
-            hs_flat, hc_fn, hc_scale, hc_base, out, rms_norm_eps, hc_eps
+        del num_tokens
+        out = mhc_kernels.hc_head_fused_torch(
+            hs_flat, hc_fn, hc_scale, hc_base, rms_norm_eps, hc_eps
         )
         return out.view(*outer_shape, hidden_size)
 
@@ -725,7 +724,7 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        return torch.ops._xpu_C.mhc_fused_post_pre(
+        return self.forward_native(
             x,
             residual,
             post_layer_mix,
@@ -738,4 +737,8 @@ class MHCFusedPostPreOp(CustomOp):
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            n_splits,
+            tile_n,
+            norm_weight,
+            norm_eps,
         )

@@ -294,3 +294,17 @@ stack-wide -- user directive; see notebook (20)). Step-time attribution
 stands; the protocol going forward is the model's shipped sampling
 defaults (temp 1.0 / top_p 0.95 / top_k 20), seeded. Re-baseline lands
 with the speculation measurements.
+
+### Intel Arc Pro B70 (QuadB70) - dsv4-xxs-b70-4 first baseline 2026-08-18
+
+XPU platform port (see optimization_status 2026-08-18 entries). Exact-token
+harness, TP4, XPU graphs (breakable capture), no drafter (VRAM), fp8_ds_mla KV,
+65,536 max_model_len, KV 4.3 GiB/GPU (155k tokens):
+
+| Profile | 1K/2K c1 | c8 agg | 16-tok/256 c1 |
+| --- | ---: | ---: | ---: |
+| `dsv4-xxs-b70-4` (TP4, IQ2_XXS) | 7.27 | 27.14 | 11.15 |
+
+Bring-up configuration: torch-reference indexer logits, torch mHC, correctness-
+first GGUF routed GEMV (88 GB/s), dequant+oneDNN prefill GEMMs, oneCCL eager
+collectives as graph breaks. Every one of those is a tracked kernel project.

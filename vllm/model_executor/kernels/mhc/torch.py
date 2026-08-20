@@ -60,7 +60,22 @@ def mhc_pre_torch(
     fn_flat = fn
 
     x = residual_flat.view(num_tokens, hc_mult * hidden_size).to(torch.float32)
-    mixes = torch.matmul(x, fn_flat.t())
+    if x.device.type == "xpu":
+        # oneDNN's fp32 GEMM for this tall-skinny shape ([T, 16384] x
+        # [16384, 12]) splits K with a nondeterministic accumulation order
+        # (measured 2026-08-18: K >= 4096 non-reproducible, K <= 2048
+        # reproducible at every M). Reduce over fixed 2048-wide K chunks in
+        # program order so the residual-stream mix is bit-reproducible;
+        # native SYCL mhc_pre replaces this (perf notebook).
+        fn32 = fn_flat.to(torch.float32)
+        k_total = x.shape[1]
+        chunk = 2048
+        mixes = None
+        for k0 in range(0, k_total, chunk):
+            part = torch.matmul(x[:, k0 : k0 + chunk], fn32[:, k0 : k0 + chunk].t())
+            mixes = part if mixes is None else mixes + part
+    else:
+        mixes = torch.matmul(x, fn_flat.t())
     sqrsum = x.square().sum(dim=-1, keepdim=True)
     mixes = mixes * torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
 
@@ -97,11 +112,14 @@ def mhc_post_torch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
-    mixed_residual = torch.einsum(
-        "...ij,...ih->...jh",
-        comb_res_mix.to(torch.float32),
-        residual.to(torch.float32),
-    )
+    # out[..., j, h] = sum_i comb[..., i, j] * residual[..., i, h] + post[..., j] * x[..., h]
+    # Written as a broadcast product + fixed-order sum over the (4-wide) stream
+    # axis rather than an einsum/bmm: bit-reproducible on every backend and no
+    # library kernel selection in the residual-stream path (XPU determinism
+    # bisection, perf notebook 2026-08-18).
+    comb = comb_res_mix.to(torch.float32)  # [..., i, j]
+    res = residual.to(torch.float32)  # [..., i, h]
+    mixed_residual = (comb.unsqueeze(-1) * res.unsqueeze(-2)).sum(dim=-3)  # [..., j, h]
     post_term = post_layer_mix.to(torch.float32) * x.unsqueeze(-2).to(torch.float32)
     return (mixed_residual + post_term).to(residual.dtype)
 
