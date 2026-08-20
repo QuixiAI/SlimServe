@@ -584,6 +584,56 @@ def test_muse_tool_choice_none_strips_continuation_envelopes():
     assert "<|" not in delta.content
 
 
+def test_muse_tool_choice_none_strips_split_continuation_envelopes():
+    request = _apply_patch_request(tool_choice="none", stream=True)
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="muse_glimmer",
+        reasoning_parser_name="muse_glimmer",
+        enable_auto_tools=True,
+    )
+    assert parser_cls is not None
+    cases = [
+        (
+            (
+                "We applied patch. Done.<|eom|>"
+                "<|start|>assistant to=user<|message|>"
+                "Patch applied successfully.<|eot|>"
+            ),
+            "We applied patch. Done.Patch applied successfully.",
+        ),
+        (
+            (
+                " to=self<|message|>Check the result.<|eom|>"
+                "<|start|>assistant to=user<|message|>"
+                "Patch applied successfully.<|eot|>"
+            ),
+            "Patch applied successfully.",
+        ),
+    ]
+
+    for output, expected in cases:
+        for chunk_size in range(1, len(output) + 1):
+            parser = parser_cls(_DummyTokenizer(), request.tools)
+            content: list[str] = []
+            for offset in range(0, len(output), chunk_size):
+                chunk = output[offset : offset + chunk_size]
+                delta = parser.parse_delta(
+                    delta_text=chunk,
+                    delta_token_ids=[3],
+                    request=request,
+                    prompt_token_ids=[1, 2] if offset == 0 else None,
+                    finished=offset + len(chunk) == len(output),
+                )
+                if delta is not None:
+                    assert delta.tool_calls == []
+                    if delta.content:
+                        content.append(delta.content)
+
+            streamed = "".join(content)
+            assert streamed == expected, (chunk_size, streamed)
+            assert "<|" not in streamed
+
+
 def test_muse_adjust_request_keeps_atem_markers_visible():
     request = _apply_patch_request()
     parser = MuseGlimmerToolParser(_DummyTokenizer(), request.tools)

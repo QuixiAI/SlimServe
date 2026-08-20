@@ -102,6 +102,20 @@ _UNFRAMED_CONTROL_RE = re.compile(
     r"|<\|message\|>"
 )
 
+_ASSISTANT_START = "<|start|>assistant"
+_MESSAGE_START = "<|message|>"
+_SEGMENT_ENDS = ("<|eom|>", "<|eot|>")
+_STREAM_CONTROL_MARKERS = (
+    _ASSISTANT_START,
+    _MESSAGE_START,
+    *_SEGMENT_ENDS,
+    "<|begin_of_text|>",
+    "<|end_of_text|>",
+    ATEM_CALLS_START,
+    ATEM_CALLS_END,
+)
+_RECIPIENT_PREFIXES = (" to=", "to=")
+
 
 def _atem_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
     return [
@@ -218,7 +232,13 @@ class MuseGlimmerToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         self._sent_tool_call_count = 0
-        self._sent_content_len = 0
+        # Streaming content is consumed monotonically from raw deltas. Do not
+        # index into a repeatedly filtered version of cumulative text: when a
+        # split protocol marker becomes complete, that filtered text can
+        # shrink retroactively and corrupt the content cursor.
+        self._content_pending = ""
+        self._content_visible = True
+        self._content_expects_header = True
 
     def get_structural_tag(
         self,
@@ -329,40 +349,94 @@ class MuseGlimmerToolParser(ToolParser):
             content=self._content_without_calls(model_output),
         )
 
-    def _content_delta(
-        self,
-        current_text: str,
-        request: ChatCompletionRequest | ResponsesRequest,
-    ) -> str | None:
-        tool_names = {
-            getattr(tool, "name", None)
-            or getattr(getattr(tool, "function", None), "name", None)
-            for tool in request.tools or []
-        }
-        tool_names.discard(None)
-        protected_markers = [
-            ATEM_CALLS_START,
-            "<|start|>assistant",
-            "<|message|>",
-            "<|eom|>",
-            "<|eot|>",
-            " to=self<|message|>",
-            " to=user<|message|>",
-            *(f" to={name}<|message|>" for name in tool_names),
-            *(f"to={name}<|message|>" for name in tool_names),
-        ]
-        overlap = max(
-            partial_tag_overlap(current_text, marker) for marker in protected_markers
-        )
-        safe_text = (
-            current_text[: len(current_text) - overlap] if overlap else current_text
-        )
-        visible = self._content_without_calls(safe_text) or ""
-        if len(visible) <= self._sent_content_len:
+    def _consume_expected_recipient(self) -> bool | None:
+        """Consume a recipient header, or report that it is incomplete.
+
+        ``True`` means a complete header was consumed, ``False`` means the
+        pending text is ordinary visible content, and ``None`` means more raw
+        input is required before making that decision.
+        """
+        pending = self._content_pending
+        for prefix in _RECIPIENT_PREFIXES:
+            if pending.startswith(prefix):
+                message_at = pending.find(_MESSAGE_START, len(prefix))
+                if message_at < 0:
+                    return None
+                recipient = pending[len(prefix) : message_at].strip()
+                self._content_visible = recipient in ("", "user")
+                self._content_expects_header = False
+                self._content_pending = pending[message_at + len(_MESSAGE_START) :]
+                return True
+            if len(pending) < len(prefix) and prefix.startswith(pending):
+                return None
+
+        # Hold split control markers until their complete spelling is known.
+        # Complete markers are handled by the main scanner below.
+        if any(
+            len(pending) < len(marker) and marker.startswith(pending)
+            for marker in _STREAM_CONTROL_MARKERS
+        ):
             return None
-        delta = visible[self._sent_content_len :]
-        self._sent_content_len = len(visible)
-        return delta or None
+
+        self._content_visible = True
+        self._content_expects_header = False
+        return False
+
+    def _content_delta(self, delta_text: str) -> str | None:
+        """Return stable visible content from one raw Muse stream delta."""
+        self._content_pending += delta_text
+        visible: list[str] = []
+
+        while self._content_pending:
+            if self._content_expects_header:
+                consumed = self._consume_expected_recipient()
+                if consumed is None:
+                    break
+                if consumed:
+                    continue
+
+            matches = [
+                (index, marker)
+                for marker in _STREAM_CONTROL_MARKERS
+                if (index := self._content_pending.find(marker)) >= 0
+            ]
+            if not matches:
+                overlap = max(
+                    partial_tag_overlap(self._content_pending, marker)
+                    for marker in _STREAM_CONTROL_MARKERS
+                )
+                sendable = len(self._content_pending) - overlap
+                if sendable:
+                    if self._content_visible:
+                        visible.append(self._content_pending[:sendable])
+                    self._content_pending = self._content_pending[sendable:]
+                break
+
+            marker_at, marker = min(matches, key=lambda item: item[0])
+            if marker_at:
+                if self._content_visible:
+                    visible.append(self._content_pending[:marker_at])
+                self._content_pending = self._content_pending[marker_at:]
+                continue
+
+            self._content_pending = self._content_pending[len(marker) :]
+            if marker == _ASSISTANT_START:
+                self._content_visible = False
+                self._content_expects_header = True
+            elif marker == _MESSAGE_START:
+                self._content_visible = True
+                self._content_expects_header = False
+            elif marker in _SEGMENT_ENDS:
+                self._content_visible = True
+                self._content_expects_header = True
+            elif marker == ATEM_CALLS_START:
+                self._content_visible = False
+                self._content_expects_header = False
+            elif marker == ATEM_CALLS_END:
+                # A tool recipient remains hidden through its closing EOT.
+                self._content_visible = False
+
+        return "".join(visible) or None
 
     def extract_tool_calls_streaming(
         self,
@@ -374,10 +448,9 @@ class MuseGlimmerToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> DeltaMessage | None:
-        del previous_text, delta_text, previous_token_ids, current_token_ids
-        del delta_token_ids
+        del previous_text, previous_token_ids, current_token_ids, delta_token_ids
 
-        content = self._content_delta(current_text, request)
+        content = self._content_delta(delta_text)
         calls = self._calls(current_text, request)
         if len(calls) <= self._sent_tool_call_count:
             return DeltaMessage(content=content) if content else None

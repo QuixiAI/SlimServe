@@ -250,7 +250,7 @@ def main() -> None:
     )
     parser.add_argument("--model", default="Muse-Glimmer-30B")
     parser.add_argument("--max-output-tokens", type=int, default=512)
-    parser.add_argument("--continuation-tokens", type=int, default=32)
+    parser.add_argument("--continuation-tokens", type=int, default=256)
     parser.add_argument(
         "--skip-continuation",
         action="store_true",
