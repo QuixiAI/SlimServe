@@ -62,6 +62,10 @@ class ToolParser:
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None
     engine_based_streaming: bool = False
+    # Some model formats use their tool parser to remove recipient/channel
+    # framing even when tool calls are disabled. The unified parser still
+    # discards any parsed calls for tool_choice="none".
+    handles_tool_choice_none: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

@@ -198,6 +198,15 @@ async def stream_continuation(
             content = event.end.captured_text or content
     if not content:
         raise RuntimeError("continuation did not produce assistant text")
+    leaked_markers = (
+        "<|start|>",
+        "<|message|>",
+        "<|eom|>",
+        "<|eot|>",
+        "<atem:",
+    )
+    if any(marker in content for marker in leaked_markers):
+        raise RuntimeError(f"continuation leaked Muse protocol framing: {content!r}")
     if not content.endswith("\n"):
         print()
 

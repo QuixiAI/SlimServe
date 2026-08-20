@@ -91,6 +91,16 @@ _RECIPIENT_CALL_RE = re.compile(
     + r"(?:<\|eom\|>|<\|eot\|>)?",
     re.DOTALL,
 )
+_ASSISTANT_SEGMENT_RE = re.compile(
+    r"(?:<\|start\|>assistant)?(?P<recipient> to=[^<]*)?<\|message\|>"
+    r"(?P<body>.*?)(?:<\|eom\|>|<\|eot\|>|\Z)",
+    re.DOTALL,
+)
+_UNFRAMED_CONTROL_RE = re.compile(
+    r"<\|(?:eom|eot|begin_of_text|end_of_text)\|>"
+    r"|<\|start\|>assistant(?: to=user)?"
+    r"|<\|message\|>"
+)
 
 
 def _atem_tool_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
@@ -203,11 +213,12 @@ def _apply_muse_glimmer_custom_tool_format(
 class MuseGlimmerToolParser(ToolParser):
     supports_required_and_named = False
     structural_tag_model = "muse_glimmer"
+    handles_tool_choice_none = True
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         self._sent_tool_call_count = 0
-        self._sent_content_idx = 0
+        self._sent_content_len = 0
 
     def get_structural_tag(
         self,
@@ -283,10 +294,28 @@ class MuseGlimmerToolParser(ToolParser):
         ]
 
     @staticmethod
-    def _content_without_calls(text: str) -> str | None:
+    def _visible_assistant_content(text: str) -> str | None:
+        """Return user-directed bodies without Muse protocol delimiters."""
+        content: list[str] = []
+        cursor = 0
+        for match in _ASSISTANT_SEGMENT_RE.finditer(text):
+            prefix = _UNFRAMED_CONTROL_RE.sub("", text[cursor : match.start()])
+            if prefix:
+                content.append(prefix)
+            recipient = (match.group("recipient") or "").strip()
+            if recipient in ("", "to=user"):
+                content.append(match.group("body"))
+            cursor = match.end()
+        suffix = _UNFRAMED_CONTROL_RE.sub("", text[cursor:])
+        if suffix:
+            content.append(suffix)
+        return "".join(content) or None
+
+    @classmethod
+    def _content_without_calls(cls, text: str) -> str | None:
         text = _RECIPIENT_CALL_RE.sub("", text)
         text = _CALLS_RE.sub("", text)
-        return text or None
+        return cls._visible_assistant_content(text)
 
     def extract_tool_calls(
         self,
@@ -297,9 +326,7 @@ class MuseGlimmerToolParser(ToolParser):
         return ExtractedToolCallInformation(
             tools_called=bool(calls),
             tool_calls=calls,
-            content=self._content_without_calls(model_output)
-            if calls
-            else model_output,
+            content=self._content_without_calls(model_output),
         )
 
     def _content_delta(
@@ -313,39 +340,28 @@ class MuseGlimmerToolParser(ToolParser):
             for tool in request.tools or []
         }
         tool_names.discard(None)
-        candidate_starts = [
-            index
-            for name in tool_names
-            for marker in (
-                f" to={name}<|message|>",
-                f"to={name}<|message|>",
-                f"<|start|>assistant to={name}<|message|>",
-            )
-            if (index := current_text.find(marker)) >= 0
+        protected_markers = [
+            ATEM_CALLS_START,
+            "<|start|>assistant",
+            "<|message|>",
+            "<|eom|>",
+            "<|eot|>",
+            " to=self<|message|>",
+            " to=user<|message|>",
+            *(f" to={name}<|message|>" for name in tool_names),
+            *(f"to={name}<|message|>" for name in tool_names),
         ]
-        for name in tool_names:
-            recipient = f" to={name}"
-            if current_text.startswith(recipient):
-                suffix = current_text[len(recipient) :]
-                if "<|message|>".startswith(suffix):
-                    candidate_starts.append(0)
-        atem_index = current_text.find(ATEM_CALLS_START)
-        if atem_index >= 0:
-            candidate_starts.append(atem_index)
-        if candidate_starts:
-            sendable = min(candidate_starts)
-        else:
-            overlap = max(
-                partial_tag_overlap(current_text, ATEM_CALLS_START),
-                partial_tag_overlap(current_text, "<|start|>assistant to="),
-                partial_tag_overlap(current_text, " to="),
-                partial_tag_overlap(current_text, "to="),
-            )
-            sendable = len(current_text) - overlap
-        if sendable <= self._sent_content_idx:
+        overlap = max(
+            partial_tag_overlap(current_text, marker) for marker in protected_markers
+        )
+        safe_text = (
+            current_text[: len(current_text) - overlap] if overlap else current_text
+        )
+        visible = self._content_without_calls(safe_text) or ""
+        if len(visible) <= self._sent_content_len:
             return None
-        delta = current_text[self._sent_content_idx : sendable]
-        self._sent_content_idx = sendable
+        delta = visible[self._sent_content_len :]
+        self._sent_content_len = len(visible)
         return delta or None
 
     def extract_tool_calls_streaming(
