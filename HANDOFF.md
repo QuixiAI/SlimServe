@@ -109,6 +109,38 @@ only overrides the two Metal-hostile methods -- do the same);
 contract but is text-only dense -- the LANGUAGE-MODEL half of the target
 does NOT exist for qwen3_5.
 
+STATUS ROLL-UP (2026-08-20 evening -- supersedes the staged plan below
+where they disagree; notebook (19)-(26) has the evidence):
+
+- DONE since the 39efaa7d9 commit: GDN spec-state rollback (verified
+  9.5e-7 incl. cross-call resume); sampled selector walk ENGAGED
+  (sparse 16-way distributions -> draft_logits); DFlash 2 e2e UP --
+  essay acceptance 2.71/0.244 BEATS the llama.cpp dflash2-pr oracle
+  (2.51/0.219) on the same GGUFs+settings (vendor 4.80 is a GSM8K
+  number; acceptance is task-domain-dependent, bench arms must match);
+  VISION landed (tower parity ~1e-3 vs llama-mtmd-cli, real-image e2e
+  smoke); native IQ decode for IQ2_S/IQ3_S/IQ1_M (_DEQUANT_TYPES empty,
+  residency ~12 GiB); muse regression gate CLOSED (byte-identical
+  seeded output; smokes must use PROFILE-EXACT kwargs).
+- Numbers (OLD metallib, V2 runner, seeded shipped defaults): plain
+  6.4 tok/s (V1: 2.5), spec 3.9-4.1. SPEC < PLAIN = bug per policy,
+  attributed: 8-position python GDN verify scan + CPU rejection
+  fallback -> the fusion workstream's first target.
+- THE ONE OPEN BUG: V2-on-Metal boot-lottery decode corruption
+  (prefill exact; some boots clean, others collapse ~token 20 =
+  first-KV-block append; explains repetition/"!"-floods/rejection-NaN
+  alike -- new IQ kernels exonerated at fp16+bf16). Hunt agent running
+  with the block-append staged-write hypothesis ranked first; fix bar
+  >= 6 clean boots + muse smoke.
+- Also open: MPS seed-keyed sampling (spec-vs-plain seeded identity
+  untestable; gumbel/rejection fallbacks unkeyed); MPS rejection
+  fallback lacks _sanitize_nan parity; V2 must be forced via
+  VLLM_USE_V2_MODEL_RUNNER=1 for the hybrid target (make it the
+  default once the corruption is fixed); stray-token quirk at temp 1.0
+  in both text+vision answers (tracked, unattributed).
+- Ops gotchas: rm-then-cp + codesign -f -s - for metallib/.so
+  refreshes; regression smokes use profile-exact engine kwargs.
+
 STAGED PLAN (updated 2026-08-20: TEXT CORRECTNESS ACHIEVED):
 
 1. ~~GGUF ground truth~~ DONE (notebook (3), (5), (7)).

@@ -431,6 +431,9 @@ instantiate_qdequant("qdequant_iq2_xxs", iq2_xxs);
 instantiate_qdequant("qdequant_iq2_xs", iq2_xs);
 instantiate_qdequant("qdequant_iq3_xxs", iq3_xxs);
 instantiate_qdequant("qdequant_iq1_s", iq1_s);
+instantiate_qdequant("qdequant_iq2_s", iq2_s);
+instantiate_qdequant("qdequant_iq3_s", iq3_s);
+instantiate_qdequant("qdequant_iq1_m", iq1_m);
 instantiate_qdequant("qdequant_tq2_0", tq2_0);
 
 #define instantiate_qgemv_mm(name, FMT, T, MROWS)                            \
@@ -490,6 +493,9 @@ instantiate_qgemv_format("qgemv_iq2_xxs", iq2_xxs);
 instantiate_qgemv_format("qgemv_iq2_xs", iq2_xs);
 instantiate_qgemv_format("qgemv_iq3_xxs", iq3_xxs);
 instantiate_qgemv_format("qgemv_iq1_s", iq1_s);
+instantiate_qgemv_format("qgemv_iq2_s", iq2_s);
+instantiate_qgemv_format("qgemv_iq3_s", iq3_s);
+instantiate_qgemv_format("qgemv_iq1_m", iq1_m);
 instantiate_qgemv_format("qgemv_q4_1", q4_1);
 instantiate_qgemv_format("qgemv_q5_0", q5_0);
 instantiate_qgemv_format("qgemv_q5_1", q5_1);

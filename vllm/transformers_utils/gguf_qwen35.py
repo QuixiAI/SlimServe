@@ -56,6 +56,68 @@ def _vocab_size(reader: Any) -> int:
     return int(_field(reader, f"{ARCH}.vocab_size"))
 
 
+def _vision_config_from_mmproj(gguf_path: str) -> Any | None:
+    """Build the Qwen3.5 vision config from the mmproj beside the target.
+
+    Keys verified against the real dump (perf/qwen38_metal_design.md,
+    "Vision: mmproj-F16.gguf"): 27 blocks, hidden 1152, 16 heads, ffn 4304
+    (gelu, no gate), patch 16, temporal 2, spatial merge 2, LayerNorm eps
+    1e-6, position table 2304 (48x48 at image_size 768), projection 5120,
+    image mean/std 0.5, `is_deepstack_layers` all-false.
+    """
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5VisionConfig
+    from vllm.transformers_utils.gguf_native import find_mmproj
+
+    mmproj = find_mmproj(gguf_path)
+    if mmproj is None:
+        logger.warning(
+            "No mmproj GGUF found beside %s; Qwen3.5 loads text-only.",
+            gguf_path,
+        )
+        return None
+    m = gguf_reader(str(mmproj))
+    projector = str(_field(m, "clip.projector_type", ""))
+    if projector != "qwen3vl_merger":
+        raise ValueError(
+            f"mmproj {mmproj.name} has projector_type {projector!r}, "
+            "expected 'qwen3vl_merger'"
+        )
+    c = lambda k, d=None: _field(m, f"clip.vision.{k}", d)  # noqa: E731
+    deepstack = c("is_deepstack_layers")
+    if deepstack is not None and any(bool(v) for v in deepstack):
+        raise ValueError(
+            f"mmproj {mmproj.name} carries deepstack layers; the vendored "
+            "tower has no deepstack path"
+        )
+    # Read the actual position count from the tensor so a different export
+    # stays consistent (the muse builder does the same).
+    num_positions = 2304
+    for tensor in m.tensors:
+        if tensor.name == "v.position_embd.weight":
+            num_positions = int(tensor.shape[-1])
+            break
+    image_size = int(c("image_size", 768))
+    return Qwen3_5VisionConfig(
+        depth=int(c("block_count")),
+        hidden_size=int(c("embedding_length")),
+        hidden_act="gelu_pytorch_tanh",
+        intermediate_size=int(c("feed_forward_length")),
+        num_heads=int(c("attention.head_count")),
+        in_channels=3,
+        patch_size=int(c("patch_size")),
+        spatial_merge_size=int(c("spatial_merge_size", 2)),
+        temporal_patch_size=int(c("temporal_patch_size", 2)),
+        out_hidden_size=int(c("projection_dim")),
+        num_position_embeddings=num_positions,
+        # Extra facts the class has no named params for; PretrainedConfig
+        # keeps unknown kwargs as attributes.
+        layer_norm_eps=round(float(c("attention.layer_norm_epsilon", 1e-6)), 12),
+        image_size=image_size,
+        image_mean=[float(v) for v in c("image_mean", [0.5, 0.5, 0.5])],
+        image_std=[float(v) for v in c("image_std", [0.5, 0.5, 0.5])],
+    )
+
+
 @cache
 def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     """The Qwen3.8-27B text backbone: 64 layers, 3:1 hybrid interleave.
@@ -67,8 +129,10 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
     MTP block(s) beyond the main stack; those are excluded from
     `num_hidden_layers` and never loaded -- DFlash 2 replaces MTP here.
 
-    Vision: the mmproj tower (`qwen3vl_merger`) is intentionally deferred;
-    this builder emits the text-only architecture until the tower lands.
+    Vision: when an mmproj (`qwen3vl_merger`) sits beside the text GGUF the
+    builder emits the composite Qwen3_5Config (text_config + vision_config,
+    architectures ["Qwen3_5ForConditionalGeneration"]); without one it
+    emits the bare text config exactly as before.
     """
     from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 
@@ -153,7 +217,34 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
         nextn,
         sections,
     )
-    return cfg
+
+    vision = _vision_config_from_mmproj(gguf_path)
+    if vision is None:
+        return cfg
+
+    from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config
+
+    # NOTE: Qwen3_5Config.__init__ only accepts dict/None sub-configs (an
+    # instance falls through both branches), so the built objects are
+    # attached after construction.
+    composite = Qwen3_5Config(
+        image_token_id=248056,
+        video_token_id=248057,
+        vision_start_token_id=248053,
+        vision_end_token_id=248054,
+        tie_word_embeddings=False,
+    )
+    composite.text_config = cfg
+    composite.vision_config = vision
+    composite.architectures = ["Qwen3_5ForConditionalGeneration"]
+    logger.info(
+        "Found qwen3vl_merger mmproj: emitting the composite Qwen3_5Config "
+        "(%d vision blocks, hidden %d, out %d)",
+        vision.depth,
+        vision.hidden_size,
+        vision.out_hidden_size,
+    )
+    return composite
 
 
 @cache

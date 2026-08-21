@@ -954,10 +954,14 @@ def rejection_sample(
             )
         # General temperatures. MPS does not expose Triton's stateless Philox
         # primitive; like the gumbel_sample torch fallback, this preserves
-        # rejection-sampling semantics while per-request seed parity remains a
-        # native CUDA/HIP property. Draft token i of a request rides at
+        # rejection-sampling semantics. Every random draw comes from a CPU
+        # generator seeded from (per-request seed, first verify position), so
+        # same-seed repeats are reproducible -- the draw order inside each
+        # request's loop is deterministic. Draft token i of a request rides at
         # draft_sampled[start + i + 1] and verifies against target row
         # start + i, matching the greedy loop above.
+        from vllm.v1.worker.gpu.sample.gumbel import mix64_int
+
         assert synthetic_conditional_rates is None, (
             "Synthetic acceptance rates are not supported on MPS."
         )
@@ -966,6 +970,8 @@ def rejection_sample(
         draft_ids = draft_sampled.cpu().tolist()
         temps = active_temperatures.cpu().tolist()
         state_indices = req_indices.cpu().tolist()
+        seeds_cpu = seed.cpu().tolist()
+        pos_cpu = pos.cpu().tolist()
         sampled_cpu = torch.full(
             (num_reqs, num_speculative_steps + 1),
             -1,
@@ -989,6 +995,11 @@ def rejection_sample(
                 sampled_cpu[req_idx, accepted] = target_row_ids[accepted]
                 num_sampled_cpu[req_idx] = accepted + 1
                 continue
+            g = torch.Generator()
+            g.manual_seed(
+                mix64_int(seeds_cpu[state_indices[req_idx]], pos_cpu[start])
+                & ((1 << 63) - 1)
+            )
             probs = torch.softmax(target[start:end] / temp, dim=-1).cpu()
             draft_probs = None
             if has_draft_logits and num_draft > 0:

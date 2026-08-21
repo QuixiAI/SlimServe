@@ -373,6 +373,10 @@ _MULTIMODAL_MODELS = {
     # is removed: vllm/model_executor/models/qwen3_5.py is vendored dense
     # text-only in this fork and does not define that class, so a registry
     # entry would fail at lazy inspection.
+    "Qwen3_5ForConditionalGeneration": (
+        "qwen3_5_vision",
+        "Qwen3_5ForConditionalGeneration",
+    ),
     # [Encoder-decoder]
     "CohereAsrForConditionalGeneration": (
         "cohere_asr",
