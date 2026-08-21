@@ -25,6 +25,7 @@ shared with the target through the generic dflash proposer, the same
 contract as the Muse and Laguna drafters.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -46,6 +47,19 @@ from .qwen3_dflash import (
 from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
+
+# Env-gated diagnostic dump for the recall@k replay (set
+# QWEN38_DFLASH_DUMP=<dir> to record per-propose drafter candidates).
+_DUMP_DIR = os.environ.get("QWEN38_DFLASH_DUMP")
+_DUMP_STEP = [0]
+
+
+def _dump_draft_record(record: dict) -> None:
+    if _DUMP_DIR is None:
+        return
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    torch.save(record, os.path.join(_DUMP_DIR, f"draft_{_DUMP_STEP[0]:05d}.pt"))
+    _DUMP_STEP[0] += 1
 
 
 def _apply_two_tap_conv(
@@ -232,6 +246,9 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
         # Shared with the target through the generic dflash proposer.
         self.has_own_embed_tokens = False
         self.has_own_lm_head = False
+        # Vocabulary is shared with the target verbatim; no d2t mapping
+        # (compute_logits reads this, and this __init__ bypasses the parent).
+        self.draft_id_to_target_id = None
 
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
@@ -315,6 +332,98 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
             chosen.append(tok)
             prev = self.selector_predecessor(tok)
         return torch.stack(chosen, dim=1)  # (n_blocks, steps)
+
+    @torch.inference_mode()
+    def select_draft_path_sampled(
+        self,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        temperature: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sampled selector walk (llama.cpp PR #27342 host walk, dflash2).
+
+        Per position the walk scores the top-k candidates
+        ``S(a, b) = U(b) + <A(a) * H(h), B(b)>`` against the realized
+        predecessor, forms ``q = softmax(S / T)`` over the k candidates,
+        samples the successor from ``q``, and KEEPS the k-way distribution:
+        the candidate ids' rows of ``draft_logits`` receive ``S / T``
+        (everything else -inf), so ``softmax(draft_logits)`` reproduces
+        ``q`` exactly and rejection sampling stays lossless. This mirrors
+        the gumbel draft path's contract of storing temperature-applied
+        logits (spec_decode/speculator.py::sample_draft).
+
+        Requests with temperature <= 0 take the greedy argmax walk (the
+        rejection sampler verifies those by token equality and ignores
+        ``draft_logits``).
+
+        The categorical draw uses device gumbel-max noise. On MPS this is
+        unkeyed (no stateless Philox primitive), matching the platform's
+        target-sampling fallback; per-request seed parity remains a native
+        CUDA/HIP property. Draft noise does not affect the output
+        distribution after rejection sampling.
+
+        Args:
+            hidden_states: (n_blocks * steps, hidden) drafter output for the
+                MASK rows only, block-major (the speculator's sample rows).
+            anchor_token_ids: (n_blocks,) last verified token per request.
+            temperature: (max_num_reqs,) per-request-state temperatures.
+            idx_mapping: (n_blocks,) request-state row per block.
+            draft_logits: (max_num_reqs, steps, vocab) fp32; the blocks'
+                rows are rewritten in place.
+
+        Returns:
+            (n_blocks, steps) sampled draft token ids.
+        """
+        n_blocks = anchor_token_ids.shape[0]
+        tokens, hidden = hidden_states.shape
+        assert tokens % n_blocks == 0, (tokens, n_blocks)
+        steps = tokens // n_blocks
+
+        logits = self.compute_logits(hidden_states)
+        logits = logits[:, : self.config.vocab_size]
+        top_vals, top_ids = logits.topk(self.selector_top_k, dim=-1)
+        top_vals = top_vals.view(n_blocks, steps, -1)
+        top_ids = top_ids.view(n_blocks, steps, -1)
+
+        gate = self.selector_hidden(hidden_states).view(n_blocks, steps, -1)
+
+        req_rows = idx_mapping.to(torch.long)
+        temps = temperature[req_rows].to(torch.float32)  # (n_blocks,)
+        greedy = temps <= 0
+        safe_t = torch.where(greedy, torch.ones_like(temps), temps)
+
+        # Sparse k-way distributions: candidate ids carry S/T, rest -inf.
+        draft_logits[req_rows] = float("-inf")
+
+        chosen = []
+        prev = self.selector_predecessor(anchor_token_ids)  # (n_blocks, rank)
+        for pos in range(steps):
+            succ = self.selector_successor(top_ids[:, pos])  # (nb, k, rank)
+            cond = (prev * gate[:, pos]).unsqueeze(-1)  # (nb, rank, 1)
+            scores = torch.bmm(succ.to(cond.dtype), cond).squeeze(-1)  # (nb, k)
+            scores = scores + top_vals[:, pos].to(scores.dtype)
+            scaled = scores.to(torch.float32) / safe_t.unsqueeze(-1)
+            draft_logits[req_rows.unsqueeze(1), pos, top_ids[:, pos]] = scaled
+
+            gumbel = -torch.empty_like(scaled).exponential_().log()
+            perturbed = torch.where(greedy.unsqueeze(-1), scaled, scaled + gumbel)
+            idx = perturbed.argmax(dim=-1)  # (nb,)
+            tok = top_ids[:, pos].gather(1, idx.unsqueeze(-1)).squeeze(-1)
+            chosen.append(tok)
+            prev = self.selector_predecessor(tok)
+        chosen_t = torch.stack(chosen, dim=1)  # (n_blocks, steps)
+        _dump_draft_record(
+            {
+                "anchor_ids": anchor_token_ids.cpu(),
+                "top_ids": top_ids.cpu(),
+                "top_vals": top_vals.float().cpu(),
+                "chosen": chosen_t.cpu(),
+                "temps": temps.cpu(),
+            }
+        )
+        return chosen_t
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         # Names are already HF-style from the GGUF adapter.

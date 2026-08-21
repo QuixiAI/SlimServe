@@ -387,9 +387,30 @@ class MetalAttentionImpl(AttentionImpl):
             row_start = kv_start - first_block * block_size
             row_end = seq_len - first_block * block_size
 
-            keys = key_cache.index_select(0, blocks)
+            page_elems = block_size * num_kv_heads * head_size
+            if key_cache.stride(0) == 2 * page_elems:
+                # Hybrid attention/mamba models restride this cache to
+                # blocks-first physical storage (attn_utils
+                # _update_hybrid_attention_mamba_layout) so block i shares
+                # bytes across layers: each block holds its K page then its
+                # V page. key_cache is then an interleaved strided view, and
+                # MPS index_select on a non-contiguous source takes a ~20x
+                # slower gather path (measured 1.3 ms vs 0.08 ms per 64
+                # blocks). Gathering whole (K, V) pages through a contiguous
+                # blocks-first view of the same storage is bit-identical and
+                # fast.
+                pages_view = key_cache.as_strided(
+                    (num_blocks, 2, block_size, num_kv_heads, head_size),
+                    (2 * page_elems, page_elems, *key_cache.stride()[1:]),
+                    key_cache.storage_offset(),
+                )
+                pages = pages_view.index_select(0, blocks)
+                keys = pages[:, 0]
+                values = pages[:, 1]
+            else:
+                keys = key_cache.index_select(0, blocks)
+                values = value_cache.index_select(0, blocks)
             keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
-            values = value_cache.index_select(0, blocks)
             values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
 
             if self.num_queries_per_kv > 1:

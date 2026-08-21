@@ -294,3 +294,20 @@ stack-wide -- user directive; see notebook (20)). Step-time attribution
 stands; the protocol going forward is the model's shipped sampling
 defaults (temp 1.0 / top_p 0.95 / top_k 20), seeded. Re-baseline lands
 with the speculation measurements.
+
+### Correctness-Complete Build - 2026-08-20 evening (V2 runner, native IQ, layout fix)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode, essay (run 1/2/3) | 15.26 / 14.98 / 14.82 tok/s |
+| Plain decode, GSM8K-style | 14.44 / 14.00 / 13.43 tok/s |
+| Spec decode, essay | 4.06 / 3.80 / 3.50 tok/s (OPEN BUG: < plain) |
+| Spec decode, GSM8K-style | 9.45 / 7.97 / 8.65 tok/s (OPEN BUG: < plain) |
+| Spec acceptance, essay (Prometheus, notebook 25) | 2.71 mean / 0.244 draft rate (beats llama.cpp dflash2-pr 2.51/0.219) |
+| Corruption gauntlet | 7/7 clean boots, 24/24 same-seed pairs identical |
+| Layer parity vs llama.cpp | all 64 layers cos >= 0.9997 |
+
+Sampling: shipped defaults (temp 1.0 / top_p 0.95 / top_k 20), seed 42,
+in-process V2 runner, max_model_len 8192. llama.cpp plain bar: 35.67.
+Raw: perf/results/2026-08-20/qwen38-consolidated/. The 2.5 tok/s row
+above is superseded.

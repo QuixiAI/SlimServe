@@ -298,19 +298,34 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        if self.draft_logits is None and hasattr(self.model, "select_draft_path"):
-            # DFlash 2: greedy path-selector walk over the top-k candidates
-            # per position instead of independent per-position argmax. The
+        if hasattr(self.model, "select_draft_path"):
+            # DFlash 2: path-selector walk over the top-k candidates per
+            # position instead of independent per-position argmax. The
             # anchor (bonus) token id sits at each block's first input row.
-            # Probabilistic draft sampling (draft_logits set) stays on the
-            # plain gumbel path below -- correct output either way, the
-            # selector only improves acceptance.
             anchor_ids = self.input_buffers.input_ids[
                 : num_reqs * self.num_query_per_req : self.num_query_per_req
             ]
-            self.draft_tokens[:num_reqs] = self.model.select_draft_path(
-                sample_hidden_states, anchor_ids
-            )
+            if self.draft_logits is not None and hasattr(
+                self.model, "select_draft_path_sampled"
+            ):
+                # Serving path (draft_sample_method='probabilistic'): the
+                # sampled walk (llama.cpp PR #27342 host walk) draws each
+                # successor from softmax(scores/T) over the top-k and writes
+                # the sparse k-way distribution into draft_logits so
+                # rejection sampling stays lossless at any temperature.
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path_sampled(
+                    sample_hidden_states,
+                    anchor_ids,
+                    self.temperature,
+                    self.idx_mapping[:num_reqs],
+                    self.draft_logits,
+                )
+            else:
+                # Greedy argmax walk (draft_sample_method='greedy'):
+                # verification is token-equality only.
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path(
+                    sample_hidden_states, anchor_ids
+                )
             return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
@@ -498,6 +513,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=self.num_query_per_req,
             causal=self._group_causal,
         )
+        if not getattr(self, "_causal_logged", False):
+            self._causal_logged = True
+            per_layer = {
+                name: getattr(meta, "causal", "<no causal attr>")
+                for name, meta in (draft_attn_metadata or {}).items()
+            }
+            logger.info(
+                "DFlash draft attention causal flags: group_causal=%s, "
+                "per-layer metadata: %s",
+                self._group_causal,
+                per_layer,
+            )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
             self.kv_cache_config,

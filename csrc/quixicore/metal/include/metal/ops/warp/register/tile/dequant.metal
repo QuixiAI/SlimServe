@@ -165,6 +165,82 @@ struct iq1_s {
     }
 };
 
+// ---- iq2_s : E8-lattice 2.5625 bpw. { half d; uint8 qs[64]; uint8 qh[8]; uint8 scales[8]; }
+//   = 82 bytes, 256 weights. qs[0..31] = low 8 bits of the grid indices (4 per block-of-32),
+//   qs[32..63] = EXPLICIT sign bytes (one per group of 8, no ksigns codebook); qh adds 2 high
+//   index bits per group (10-bit iq2s_grid, 1024 entries); 4-bit per-half scale as iq2_xs.
+//   (ggml-quants dequantize_row_iq2_s.) ----
+struct iq2_s {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 82;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs     = base + 2;    // 32 index bytes
+        device const uchar* signs  = base + 34;   // 32 sign bytes
+        device const uchar* qh     = base + 66;   // 8 bytes: 2 high bits x 4 groups
+        device const uchar* scales = base + 74;   // 8 bytes
+        const int ib32 = col >> 5, p = col & 31, g = p >> 3, elem = p & 7;
+        const uint gi = (uint)qs[4 * ib32 + g] | (((uint)qh[ib32] << (8 - 2 * g)) & 0x300u);
+        const int sc = (scales[ib32] >> (4 * (g >> 1))) & 0xF;
+        const half dl = d * (0.5h + half(sc)) * 0.25h;
+        const uint gv = (uint)((iq2s_grid[gi] >> (8 * elem)) & 0xffUL);
+        const half sgn = (signs[4 * ib32 + g] & kmask_iq2xs[elem]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq3_s : 3.4375 bpw. { half d; uint8 qs[64]; uint8 qh[8]; uint8 signs[32]; uint8 scales[4]; }
+//   = 110 bytes, 256 weights. 8 grid-index bytes per block-of-32 (iq3s_grid, 512 uint32 entries of
+//   4 magnitudes); the 9th index bit comes from qh (bit m of qh[ib32] for index byte m); explicit
+//   sign bytes (one per group of 8); 4-bit scale per PAIR of blocks-of-32, dl = d*(1+2*sc).
+//   (ggml-quants dequantize_row_iq3_s.) ----
+struct iq3_s {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 110;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs     = base + 2;    // 64 index bytes
+        device const uchar* qh     = base + 66;   // 8 bytes: 1 high bit x 8 index bytes
+        device const uchar* signs  = base + 74;   // 32 sign bytes
+        device const uchar* scales = base + 106;  // 4 bytes
+        const int ib32 = col >> 5, p = col & 31, l = p >> 3, j = p & 7;
+        const int m = 2 * l + (j >> 2);           // which of the 8 index bytes of this block-of-32
+        const uint gi = (uint)qs[8 * ib32 + m] | (((uint)qh[ib32] << (8 - m)) & 256u);
+        const int sc = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xF;
+        const half dl = d * half(1 + 2 * sc);
+        const uint gv = (iq3s_grid[gi] >> (8 * (j & 3))) & 0xffu;
+        const half sgn = (signs[4 * ib32 + l] & kmask_iq2xs[j]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq1_m : 1.75 bpw. { uint8 qs[32]; uint8 qh[16]; uint8 scales[8]; } = 56 bytes, 256 weights.
+//   NO standalone d: the fp16 super-scale is reassembled from the top 4 bits of the four 16-bit
+//   scale words. 3-bit sub-scales (one per half-of-32); per-group-of-8 grid high bits + delta-sign
+//   bit packed as qh nibbles; iq1s_grid_gpu nibble grid (value = dl*(nib-1 ± IQ1M_DELTA)).
+//   (ggml-quants dequantize_row_iq1_m / gguf-py IQ1_M.) ----
+struct iq1_m {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 56;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar*  qs = base;
+        device const uchar*  qh = base + 32;
+        device const ushort* sc = (device const ushort*)(base + 48);
+        const ushort su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                          ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const half d = as_type<half>(su);
+        const int ib32 = col >> 5, p = col & 31, g = p >> 3, j = p & 7;
+        const int ssh = 6 * (ib32 & 1) + 3 * (g >> 1);      // 3-bit sub-scale shift
+        const half dl = d * half(2 * ((sc[ib32 >> 1] >> ssh) & 7) + 1);
+        const uint h = ((uint)qh[2 * ib32 + (g >> 1)] >> (4 * (g & 1))) & 0xFu;
+        const uint gi = (uint)qs[4 * ib32 + g] | ((h & 7u) << 8);
+        const half ml = dl * ((h & 8u) ? half(-1.0h - IQ1M_DELTA) : half(-1.0h + IQ1M_DELTA));
+        const uint b = (iq1s_grid_gpu[gi] >> (8 * (j & 3))) & 0xffu;
+        const uint nib = (j >= 4) ? (b >> 4) : (b & 0xFu);
+        return dl * half(nib) + ml;
+    }
+};
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;

@@ -1234,8 +1234,14 @@ const char* ggml_type_to_format(int64_t quant_type) {
       return "iq1_s";
     case 20:
       return "iq4_nl";
+    case 21:
+      return "iq3_s";
+    case 22:
+      return "iq2_s";
     case 23:
       return "iq4_xs";
+    case 29:
+      return "iq1_m";
     case 39:
       return "mxfp4";
     default:

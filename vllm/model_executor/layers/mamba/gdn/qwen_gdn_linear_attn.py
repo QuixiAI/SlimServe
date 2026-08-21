@@ -1720,6 +1720,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        if _GDN_MPS_DEBUG:
+            _gdn_mps_debug_dump(self.prefix, attn_metadata, attn_metadata_raw)
+
         if attn_metadata.spec_sequence_masks is not None:
             return self._forward_core_mps_spec(
                 mixed_qkv=mixed_qkv,
@@ -1786,6 +1789,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # columns (the slot may be wider when spec decode is configured).
             conv_width = conv_weights.size(-1) - 1
             x_d = mixed_qkv[:num_decodes].to(torch.float32).unsqueeze(-1)
+            if _GDN_STATE_PROBE:
+                x_nan = int(torch.isnan(x_d).sum().item())
+                x_max = float(x_d.abs().max().item())
+                _sprobe_check_and_record(
+                    self.prefix,
+                    conv_state,
+                    ssm_state,
+                    [int(s) for s in idx_d[valid_d].tolist()],
+                    conv_width,
+                    "dec-pre",
+                    extras=f" in_nan={x_nan} in_absmax={x_max:.3e}",
+                )
             conv_init_d = conv_state[idx_d, :, :conv_width].to(torch.float32)
             conv_out_d, conv_final_d = _causal_conv1d_native(
                 x_d, conv_init_d, conv_weights, conv_bias, self.activation
@@ -1805,6 +1820,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 tiled_gqa=self.tiled_v_head_layout,
             )
             ssm_state[idx_d] = ssm_final_d.to(ssm_state.dtype)
+            if _GDN_STATE_PROBE:
+                o_nan = int(torch.isnan(o_d).sum().item())
+                _sprobe_check_and_record(
+                    self.prefix,
+                    conv_state,
+                    ssm_state,
+                    [int(s) for s in idx_d[valid_d].tolist()],
+                    conv_width,
+                    "dec-post",
+                    extras=f" out_nan={o_nan}",
+                )
             o_d = torch.where(valid_d.view(-1, 1, 1, 1), o_d, torch.zeros_like(o_d))
             core_attn_out[:num_decodes] = o_d.squeeze(1).to(core_attn_out.dtype)
 
@@ -1833,6 +1859,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
                 conv_width = conv_weights.size(-1) - 1
                 x_i = mixed_qkv[start:end].to(torch.float32).T.unsqueeze(0)
+                if _GDN_STATE_PROBE:
+                    _sprobe_check_and_record(
+                        self.prefix,
+                        conv_state,
+                        ssm_state,
+                        [slot],
+                        conv_width,
+                        "pre-pre",
+                        extras=(
+                            f" has_init={bool(has_init_cpu[i])} "
+                            f"seq_len={seq_len} in_nan="
+                            f"{int(torch.isnan(x_i).sum().item())}"
+                        ),
+                    )
                 if bool(has_init_cpu[i]):
                     conv_init = (
                         conv_state[slot, :, :conv_width].to(torch.float32).unsqueeze(0)
@@ -1867,6 +1907,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     tiled_gqa=self.tiled_v_head_layout,
                 )
                 ssm_state[slot] = ssm_final_i[0].to(ssm_state.dtype)
+                if _GDN_STATE_PROBE:
+                    _sprobe_check_and_record(
+                        self.prefix,
+                        conv_state,
+                        ssm_state,
+                        [slot],
+                        conv_width,
+                        "pre-post",
+                        extras=f" out_nan={int(torch.isnan(o_i).sum().item())}",
+                    )
                 core_attn_out[start:end] = o_i[0].to(core_attn_out.dtype)
 
     def _forward_core_mps_spec(
@@ -2089,6 +2139,107 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out[:num_actual_tokens].index_copy_(
             0, non_spec_token_indx, out_non_spec.to(core_attn_out.dtype)
         )
+
+
+import os as _os  # noqa: E402
+
+# Env-gated diagnostic (QWEN38_GDN_DEBUG=1): per step, dump the GDN
+# metadata this layer received plus one full-attention layer's metadata
+# (block table shape / occupancy / seq_lens) from the same forward context.
+_GDN_MPS_DEBUG = _os.environ.get("QWEN38_GDN_DEBUG") == "1"
+_GDN_DEBUG_STATE: dict = {"first_prefix": None, "calls": 0}
+
+# Env-gated diagnostic (QWEN38_STATE_PROBE=1): write-vs-readback checksums of
+# the persistent conv/ssm state, per layer per step. Any mismatch between the
+# state read at step N+1 and the state written at step N means an external
+# clobber or a lost/reordered write. Also reports NaN/absmax of the layer's
+# inputs so corruption arriving from upstream layers is distinguishable from
+# corruption born in this layer's state. Diagnostic only: syncs every step.
+_GDN_STATE_PROBE = _os.environ.get("QWEN38_STATE_PROBE") == "1"
+# prefix -> slot -> (conv_sum, ssm_sum, step_tag)
+_SPROBE_STORE: dict = {}
+_SPROBE_STEP: dict = {"n": 0, "first_prefix": None}
+
+
+def _sprobe_sums(conv_state, ssm_state, slot, conv_width):
+    c = conv_state[slot, :, :conv_width].to(torch.float32)
+    s = ssm_state[slot].to(torch.float32)
+    return (
+        float(c.sum().item()),
+        float(s.sum().item()),
+        int(torch.isnan(c).sum().item()) + int(torch.isnan(s).sum().item()),
+        float(s.abs().max().item()),
+    )
+
+
+def _sprobe_check_and_record(
+    prefix, conv_state, ssm_state, slots, conv_width, phase, extras=""
+) -> None:
+    """Compare the current state of `slots` against the last recorded write."""
+    st = _SPROBE_STEP
+    if st["first_prefix"] is None:
+        st["first_prefix"] = prefix
+    if prefix == st["first_prefix"] and phase.endswith("pre"):
+        st["n"] += 1
+    layer_store = _SPROBE_STORE.setdefault(prefix, {})
+    for slot in slots:
+        cur = _sprobe_sums(conv_state, ssm_state, slot, conv_width)
+        prev = layer_store.get(slot)
+        if phase.endswith("pre") and prev is not None:
+            dc = abs(cur[0] - prev[0])
+            ds = abs(cur[1] - prev[1])
+            if dc > 1e-3 or ds > 1e-3 or cur[2] != prev[2]:
+                print(
+                    f"[SPROBE step {st['n']}] {prefix} slot {slot} CLOBBER "
+                    f"{phase}: conv {prev[0]:.6f}->{cur[0]:.6f} "
+                    f"ssm {prev[1]:.6f}->{cur[1]:.6f} nan {prev[2]}->{cur[2]} "
+                    f"(written at {prev[3]}){extras}",
+                    flush=True,
+                )
+        if cur[2] or cur[3] > 1e4:
+            print(
+                f"[SPROBE step {st['n']}] {prefix} slot {slot} ANOMALY {phase}: "
+                f"nan={cur[2]} ssm_absmax={cur[3]:.3e}{extras}",
+                flush=True,
+            )
+        if phase.endswith("post"):
+            layer_store[slot] = (cur[0], cur[1], cur[2], f"{phase}@{st['n']}")
+
+
+def _gdn_mps_debug_dump(prefix, attn_metadata, attn_metadata_raw) -> None:
+    st = _GDN_DEBUG_STATE
+    if st["first_prefix"] is None:
+        st["first_prefix"] = prefix
+    if prefix != st["first_prefix"] or st["calls"] >= 60:
+        return
+    st["calls"] += 1
+    idx = attn_metadata.non_spec_state_indices_tensor
+    idx_head = idx[:4].cpu().tolist() if idx is not None else None
+    line = (
+        f"[GDN-DBG step {st['calls']}] {prefix}: dec={attn_metadata.num_decodes} "
+        f"pre={attn_metadata.num_prefills} spec={attn_metadata.num_spec_decodes} "
+        f"slots={idx_head}"
+    )
+    for key, meta in attn_metadata_raw.items():
+        if isinstance(meta, GDNAttentionMetadata) or meta is attn_metadata:
+            continue
+        bt = getattr(meta, "block_table", None)
+        if bt is None:
+            bt = getattr(meta, "block_table_tensor", None)
+        sl = getattr(meta, "seq_lens_cpu", None)
+        if sl is None:
+            sl = getattr(meta, "seq_lens", None)
+        bt_desc = None
+        if bt is not None:
+            row0 = bt[0]
+            bt_desc = (
+                f"shape={tuple(bt.shape)} row0_nonzero="
+                f"{int((row0 != 0).sum())} row0_head={row0[:6].cpu().tolist()}"
+            )
+        sl_desc = sl[:4].cpu().tolist() if sl is not None else None
+        line += f" | {key}: bt {bt_desc} seq_lens={sl_desc}"
+        break
+    print(line, flush=True)
 
 
 def _causal_conv1d_native(
