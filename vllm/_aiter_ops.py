@@ -683,6 +683,7 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
     As: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
+    split_k: int = -1,
 ) -> torch.Tensor:
     from aiter import gemm_a8w8_blockscale_bpreshuffle_asm
 
@@ -690,7 +691,7 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_impl(
     # activation scale in transposed layout -- same values, column-major.
     As_t = As.transpose(0, 1).contiguous().view(*As.shape)
     out = torch.empty(A.shape[0], B.shape[0], dtype=output_dtype, device=A.device)
-    gemm_a8w8_blockscale_bpreshuffle_asm(A, B, out, As_t, Bs)
+    gemm_a8w8_blockscale_bpreshuffle_asm(A, B, out, As_t, Bs, splitK=split_k)
     return out
 
 
@@ -700,6 +701,7 @@ def _rocm_aiter_gemm_a8w8_blockscale_bpreshuffle_fake(
     As: torch.Tensor,
     Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
+    split_k: int = -1,
 ) -> torch.Tensor:
     return torch.empty(A.shape[0], B.shape[0], dtype=output_dtype, device=A.device)
 
@@ -2173,9 +2175,10 @@ class rocm_aiter_ops:
         As: torch.Tensor,
         Bs: torch.Tensor,
         output_dtype: torch.dtype = torch.bfloat16,
+        split_k: int = -1,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_gemm_a8w8_blockscale_bpreshuffle(
-            A, B, As, Bs, output_dtype
+            A, B, As, Bs, output_dtype, split_k
         )
 
     @staticmethod
