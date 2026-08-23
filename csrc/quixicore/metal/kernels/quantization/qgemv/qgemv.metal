@@ -883,6 +883,11 @@ kernel void qgemv_mb(
         tk_dequant8<FMT>(base, col0, w);
         #pragma clang loop unroll(full)
         for (int m = 0; m < M; ++m) {
+            // Bit-compat with the compiled batch-1 kernel requires the exact
+            // same FMA chain per row; fast-math reassociation across the
+            // unrolled m/i nest changes rounding on scattered rows (same
+            // guard as qgemv_q8_0_mb_fast).
+            #pragma clang fp reassociate(off)
             device const T* xm = X + (long)m * K + x_base;
             #pragma clang loop unroll(full)
             for (int i = 0; i < 8; ++i) acc[m] += float(w[i]) * float(xm[i]);

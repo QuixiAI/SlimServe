@@ -247,6 +247,10 @@ kernel void dsv4_indexer_compress_insert(
     if (kvslot < 0) { return; }
 
     const int history = 2 * compress_ratio;
+    // The host contract pins compress_ratio so history fits the fixed-size
+    // register arrays; a violating runtime value must fail safely instead
+    // of writing past vals/scs.
+    if (history > HISTORY_MAX) { return; }
     const int req = token_to_req[token];
     const int d0 = (int)laneId * PER_LANE;
 
@@ -776,6 +780,9 @@ kernel void dsv4_compress_front(
     if (sslot < 0 || ((pos + 1) % compress_ratio) != 0) { return; }
 
     const int history = 2 * compress_ratio;
+    // Same guard as dsv4_indexer_compress_insert: fail safely on a
+    // contract-violating compress_ratio instead of overrunning rowp/okh.
+    if (history > HISTORY_MAX) { return; }
     const int req = token_to_req[token];
     const int d0 = (int)laneId * PER_LANE;
 

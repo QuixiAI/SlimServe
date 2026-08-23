@@ -90,7 +90,15 @@ def get_compressed_slot_mapping(
             torch.long
         ) - query_lens.index_select(0, req_ids)
         positions = start + local
-        valid = torch.remainder(positions + 1, compress_ratio) == 0
+        # num_tokens can include cudagraph padding beyond qsl[-1]; the
+        # searchsorted clamp maps those tokens onto the last request, and a
+        # negative position clamps to block column 0 — both would write a
+        # real slot for a token that must stay -1.
+        valid = (
+            (token_ids < qsl[-1])
+            & (positions >= 0)
+            & (torch.remainder(positions + 1, compress_ratio) == 0)
+        )
         compressed_pos = torch.div(positions, compress_ratio, rounding_mode="floor")
         block_col = torch.div(compressed_pos, block_size, rounding_mode="floor").clamp(
             min=0, max=block_table.shape[1] - 1

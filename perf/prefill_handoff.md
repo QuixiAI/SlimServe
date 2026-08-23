@@ -198,13 +198,16 @@ error, no kernel-log GPU fault). Park site: async-output copy_event
 wait_stream/record; async scheduling is on by default). Full evidence:
 optimization_status "v12 RE-GATE" entry.
 
-**BOOT PROTOCOL (mandatory, extended):** after startup: (1) tiny
-primer (4-5 tok in, 8 out); (2) a ~1000-token single-chunk request
-WITH decode steps (the 8-tok gate qualifies) BEFORE any multi-chunk
-(>2176-token) prefill. Skipping (2) wedges the boot deterministically
-on its first multi-chunk request (engine parks forever; kill+reboot).
-Minimal protective request not yet bisected; root-cause fix in
-async_utils/metal_compat is cleanup-phase work.
+**BOOT PROTOCOL (SUPERSEDED — historical):** the ramp below is no
+longer required. The root cause is fixed: on MPS the async-output copy
+and its completion event now stay on the producing stream
+(vllm/v1/worker/gpu/async_utils.py; regression test
+tests/kernels/test_metal_async_output.py), so a cold boot's first
+multi-chunk prefill no longer parks. Kept for the record: after
+startup: (1) tiny primer (4-5 tok in, 8 out); (2) a ~1000-token
+single-chunk request WITH decode steps (the 8-tok gate qualifies)
+BEFORE any multi-chunk (>2176-token) prefill. Skipping (2) wedged the
+boot deterministically on its first multi-chunk request.
 
 Gate tooling (the harness client can still deadlock in HF tokenizers):
 server-side reimplementation lives in the session scratchpad as

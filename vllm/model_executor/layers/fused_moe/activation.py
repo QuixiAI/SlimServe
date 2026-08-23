@@ -12,7 +12,7 @@ from vllm.platforms import current_platform
 
 def _metal_swiglu(
     output: torch.Tensor,
-    input: torch.Tensor,
+    x: torch.Tensor,
     clamp_limit: float | None,
     oai_form: bool,
     alpha: float = 1.0,
@@ -22,11 +22,11 @@ def _metal_swiglu(
     silu/sigmoid are fp32-internal Metal precise ops).
     Returns False when shapes fall outside the kernel."""
     if not (
-        input.dim() == 2
-        and input.is_contiguous()
+        x.dim() == 2
+        and x.is_contiguous()
         and output.is_contiguous()
-        and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and output.dtype == input.dtype
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and output.dtype == x.dtype
         # The native OAI kernel is bitwise-proven only for DSV4's defaults.
         # Non-default scalars change the eager MPS rounding points, so keep
         # those models on the reference chain until the kernel mirrors them.
@@ -37,7 +37,7 @@ def _metal_swiglu(
 
     if not (quixicore_ops.is_available() and quixicore_ops.has("qc_swiglu")):
         return False
-    quixicore_ops.qc_swiglu(input, output, clamp_limit, oai_form, alpha, beta)
+    quixicore_ops.qc_swiglu(x, output, clamp_limit, oai_form, alpha, beta)
     return True
 
 

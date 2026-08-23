@@ -48,7 +48,11 @@ def _qc_mm_min_tokens() -> int:
     """Token threshold where the Metal tiled MoE GEMM replaces the GEMV for
     w13 (llama.cpp's exact GEMV/GEMM crossover: n_tokens >= 32). The decode
     verify batch is 6 tokens, so the tile never engages at decode."""
-    return int(os.environ.get("VLLM_QC_MOE_MM_MIN_TOKENS", "32"))
+    value = os.environ.get("VLLM_QC_MOE_MM_MIN_TOKENS", "32")
+    try:
+        return int(value)
+    except ValueError:
+        return 32
 
 
 def _metal_q2k_sum_rows_supported(rows: int, dtype: torch.dtype) -> bool:

@@ -2987,7 +2987,9 @@ void launch_mla_q_norm_rope(E& e, typename E::in_t q, typename E::in_t cos,
                             int norm_mode, float eps, int head_dim,
                             bool half_input = false) {
   // half_input selects the fp16-load variant (rounds to bf16 in-register;
-  // only instantiated for head_dim 512 — the DSV4 serving shape).
+  // only instantiated for head_dim 512 — the DSV4 serving shape). Contract:
+  // half_input requires head_dim == 512 or the pipeline lookup fails; the
+  // sole caller passes the literal 512 and TORCH_CHECK-gates q's last dim.
   e.pipeline(half_input ? "mla_q_norm_rope_half_" + std::to_string(head_dim)
                         : mla_q_norm_rope_kernel_name(head_dim));
   e.in(q, 0);
@@ -3388,6 +3390,10 @@ void launch_mla_decode_fp8_sparse_two_cache_packed(
 // group instead of once per head. Outputs bit-identical to the fused
 // decode kernel above.
 template <class E>
+// Contract: num_heads % 16 == 0 (the kernel hard-wires 16 heads per
+// 256-thread threadgroup and the grid below truncates num_heads / 16).
+// The sole caller in qc_metal_serving.mm routes non-conforming head
+// counts to the per-head prefill path instead.
 void launch_mla_prefill_fp8_sparse_two_cache_packed(
     E& e, typename E::in_t q, typename E::in_t compressed,
     typename E::in_t compressed_idx, typename E::in_t compressed_len,
