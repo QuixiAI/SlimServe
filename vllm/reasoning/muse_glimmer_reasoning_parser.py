@@ -44,11 +44,18 @@ def _is_partial_header(text: str) -> bool:
     if "<|message|>" in text:
         return False
     stripped = text.lstrip()
-    return (
+    if (
         "<|message|>".startswith(stripped)
         or "to=".startswith(stripped)
         or stripped.startswith("to=")
-    )
+        or "<|start|>assistant".startswith(stripped)
+    ):
+        return True
+    assistant = "<|start|>assistant"
+    if stripped.startswith(assistant):
+        recipient = stripped[len(assistant) :].lstrip()
+        return "to=".startswith(recipient) or recipient.startswith("to=")
+    return False
 
 
 def _parse(text: str) -> tuple[str | None, str | None]:
@@ -82,6 +89,7 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         vocab = self.vocab
         self.eom_token_id = vocab.get("<|eom|>")
         self.message_token_id = vocab.get("<|message|>")
+        self._streamed_content = False
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # The serving parser calls this once with the complete rendered prompt.
@@ -150,7 +158,28 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         delta_content = (cur_content or "")[len(prev_content or "") :]
         if not delta_reasoning and not delta_content:
             return None
+        if delta_content:
+            self._streamed_content = True
         return DeltaMessage(
-            reasoning_content=delta_reasoning or None,
+            reasoning=delta_reasoning or None,
             content=delta_content or None,
         )
+
+    def get_streaming_fallback_content(
+        self,
+        text: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> str | None:
+        del request
+        if getattr(self, "_streamed_content", False):
+            return None
+        # Preserve plain-text continuations that genuinely have no Muse turn
+        # framing. Framed self-recipient text remains reasoning and must not be
+        # promoted if generation stops before its closing token.
+        stripped = text.lstrip()
+        if stripped.startswith("to=") or stripped.startswith("<|start|>assistant"):
+            return None
+        reasoning, content = _parse(text)
+        if reasoning is None and content == text:
+            return text or None
+        return None

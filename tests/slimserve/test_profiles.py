@@ -307,6 +307,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
     deepseek = data["sources"]["dsv4-flash"]
+    muse = data["sources"]["muse-glimmer"]
     assert set(glm["quants"]) == {
         "IQ2_XXS",
         "Q2_K",
@@ -359,6 +360,27 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
         "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
         "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+    }
+
+    assert [entry["path"] for entry in muse["shared"]] == [
+        "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"
+    ]
+    assert {
+        name: (quant["bytes"], quant["files"][0]["path"])
+        for name, quant in muse["quants"].items()
+    } == {
+        "kquant-dynamic": (
+            19653960832,
+            "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf",
+        ),
+        "kquant-17gb": (
+            16756683904,
+            "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
+        ),
+    }
+    assert muse["speculator"]["file"] == {
+        "path": "dflash-Muse-Glimmer-30B-Q4_K_M.gguf",
+        "bytes": 1631208128,
     }
 
 
@@ -544,10 +566,7 @@ def test_every_profile_serves_thinking_and_tool_calling_by_default():
         assert kwargs["thinking"] is True, plan.profile_id
         assert kwargs["enable_thinking"] is True, plan.profile_id
         assert engine["reasoning_parser"], plan.profile_id
-        # Muse-Glimmer has no tool parser in this fork; auto tool choice
-        # stays enabled globally and no-ops without a registered parser.
-        if plan.source_key != "muse-glimmer":
-            assert engine["tool_call_parser"], plan.profile_id
+        assert engine["tool_call_parser"], plan.profile_id
         # No profile forces the chat client back out of thinking mode.
         assert plan.chat_template_kwargs.get("thinking") is not False, plan.profile_id
 

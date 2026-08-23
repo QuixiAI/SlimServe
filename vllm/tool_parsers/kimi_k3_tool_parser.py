@@ -35,10 +35,23 @@ import json
 from collections.abc import Sequence
 
 import regex as re
-from openai.types.responses import ToolChoiceFunction
+from openai.types.responses import CustomTool
+from xgrammar import StructuralTag
+from xgrammar.openai_tool_call_schema import (
+    BuiltinToolParam,
+    FunctionToolParam,
+)
+from xgrammar.structural_tag import (
+    AnyTextFormat,
+    ConstStringFormat,
+    RegexFormat,
+    SequenceFormat,
+    TagFormat,
+    TagsWithSeparatorFormat,
+    TriggeredTagsFormat,
+)
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.engine.protocol import (
@@ -54,11 +67,137 @@ from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import Tool, ToolParser
+from vllm.tool_parsers.structural_tag_registry import (
+    SimplifiedToolChoice,
+    custom_tool_as_function_schema,
+    get_custom_tool_input_format,
+    register_custom_tool_format,
+    register_vllm_structural_tag,
+    replace_custom_tool_payloads,
+)
+from vllm.tool_parsers.utils import (
+    named_tool_choice_name,
+    responses_custom_tool_names,
+)
 
 logger = init_logger(__name__)
 
 _O, _C, _S = r"<\|open\|>", r"<\|close\|>", r"<\|sep\|>"
 _TEXT_UNTIL_SEP = r"(?:(?!" + _S + r").)*?"
+
+_TOOLS_OPEN = "<|open|>tools<|sep|>"
+_TOOLS_CLOSE = "<|close|>tools<|sep|>"
+_CALL_PREFIX = '<|open|>call tool="'
+_CALL_INDEX_PREFIX = '" index="'
+_CALL_HEADER_END = '"<|sep|>'
+_CALL_CLOSE = "<|close|>call<|sep|>"
+_CUSTOM_ARGUMENT_OPEN = '<|open|>argument key="input" type="string"<|sep|>'
+_CUSTOM_ARGUMENT_CLOSE = "<|close|>argument<|sep|>"
+
+
+def _escape_xtml_attr(value: str) -> str:
+    return value.replace("&", "&amp;").replace('"', "&quot;")
+
+
+def _kimi_k3_call_tags(tools: list[FunctionToolParam]) -> list[TagFormat]:
+    """Build the K3 XTML call envelopes.
+
+    Function arguments remain broadly constrained in this first format
+    adapter. Responses custom tools replace that content below so only their
+    raw ``input`` body receives the requested grammar.
+    """
+    return [
+        TagFormat(
+            begin=(
+                _CALL_PREFIX
+                + _escape_xtml_attr(tool.function.name)
+                + _CALL_INDEX_PREFIX
+            ),
+            content=SequenceFormat(
+                elements=[
+                    RegexFormat(pattern=r"[0-9]+"),
+                    ConstStringFormat(value=_CALL_HEADER_END),
+                    AnyTextFormat(excludes=[_CALL_CLOSE]),
+                ]
+            ),
+            end=_CALL_CLOSE,
+        )
+        for tool in tools
+    ]
+
+
+@register_vllm_structural_tag("kimi_k3")
+def get_kimi_k3_structural_tag(
+    tools: list[FunctionToolParam],
+    builtin_tools: list[BuiltinToolParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag:
+    """Constrain K3's XTML envelope while leaving its leading channels free."""
+    del builtin_tools, reasoning
+
+    call_tags = _kimi_k3_call_tags(tools)
+    tools_tag = TagFormat(
+        begin=_TOOLS_OPEN,
+        content=TagsWithSeparatorFormat(
+            tags=call_tags,
+            separator="",
+            at_least_one=True,
+            stop_after_first=tool_choice == "forced",
+        ),
+        end=_TOOLS_CLOSE,
+    )
+    if tool_choice == "auto":
+        output_format = TriggeredTagsFormat(
+            triggers=[_TOOLS_OPEN],
+            tags=[tools_tag],
+        )
+    else:
+        # The generation prompt may currently be in K3's think or response
+        # channel. Preserve those native prefixes and require the tools channel
+        # once the model closes them.
+        output_format = SequenceFormat(
+            elements=[
+                AnyTextFormat(excludes=[_TOOLS_OPEN]),
+                tools_tag,
+            ]
+        )
+    return StructuralTag(format=output_format)
+
+
+@register_custom_tool_format(
+    "kimi_k3",
+    as_function_tool=custom_tool_as_function_schema,
+)
+def _apply_kimi_k3_custom_tool_format(
+    structural_tag: StructuralTag,
+    custom_tools: dict[str, CustomTool],
+) -> None:
+    """Constrain only a custom tool's raw XTML ``input`` argument body."""
+
+    def match_tool_name(tag: TagFormat) -> str | None:
+        begin = tag.begin
+        if not isinstance(begin, str) or not begin.startswith(_CALL_PREFIX):
+            return None
+        escaped_name = begin[len(_CALL_PREFIX) :].split(_CALL_INDEX_PREFIX, 1)[0]
+        return escaped_name.replace("&quot;", '"').replace("&amp;", "&")
+
+    def make_content(custom_tool: CustomTool) -> SequenceFormat:
+        return SequenceFormat(
+            elements=[
+                RegexFormat(pattern=r"[0-9]+"),
+                ConstStringFormat(value=_CALL_HEADER_END + _CUSTOM_ARGUMENT_OPEN),
+                get_custom_tool_input_format(custom_tool),
+                ConstStringFormat(value=_CUSTOM_ARGUMENT_CLOSE),
+            ]
+        )
+
+    replace_custom_tool_payloads(
+        structural_tag,
+        custom_tools,
+        match_tool_name=match_tool_name,
+        make_content=make_content,
+    )
 
 
 def _partial_tag_overlap(text: str, tag: str) -> int:
@@ -147,10 +286,7 @@ class KimiK3ToolParser(ToolParser):
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
-        named = isinstance(
-            request.tool_choice,
-            (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
-        )
+        named = named_tool_choice_name(request.tool_choice) is not None
         structured_outputs = getattr(request, "structured_outputs", None)
         has_structural_tag = (
             structured_outputs is not None
@@ -206,7 +342,12 @@ class KimiK3ToolParser(ToolParser):
             for m in self._attr_re.finditer(s)
         }
 
-    def _decode_call(self, attrs: str, body: str) -> ToolCall | None:
+    def _decode_call(
+        self,
+        attrs: str,
+        body: str,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ToolCall | None:
         """Decode one ``call`` block into a :class:`ToolCall`.
 
         ``attrs`` is the text between ``<|open|>call `` and ``<|sep|>`` (carries
@@ -233,6 +374,17 @@ class KimiK3ToolParser(ToolParser):
                     arguments[key] = raw_value
         if not tool_name:
             return None
+        if tool_name in responses_custom_tool_names(request.tools):
+            # XTML represents the custom payload as a synthetic string
+            # argument. Responses exposes that body's value directly, without
+            # the function-call JSON object used by Chat Completions.
+            raw_input = arguments.get("input", "")
+            if not isinstance(raw_input, str):
+                raw_input = json.dumps(raw_input, ensure_ascii=False)
+            return ToolCall(
+                type="function",
+                function=FunctionCall(name=tool_name, arguments=raw_input),
+            )
         return ToolCall(
             type="function",
             function=FunctionCall(
@@ -309,7 +461,9 @@ class KimiK3ToolParser(ToolParser):
         return content or None
 
     def extract_tool_calls(
-        self, model_output: str, request: ChatCompletionRequest
+        self,
+        model_output: str,
+        request: ChatCompletionRequest | ResponsesRequest,
     ) -> ExtractedToolCallInformation:
         m_open = self._tools_open_re.search(model_output)
         if m_open is None:
@@ -332,7 +486,7 @@ class KimiK3ToolParser(ToolParser):
             tool_calls = [
                 tc
                 for m in self._call_re.finditer(section)
-                if (tc := self._decode_call(m["attrs"], m["body"])) is not None
+                if (tc := self._decode_call(m["attrs"], m["body"], request)) is not None
             ]
             if not tool_calls:
                 return ExtractedToolCallInformation(
@@ -359,7 +513,7 @@ class KimiK3ToolParser(ToolParser):
         previous_token_ids: Sequence[int],
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
-        request: ChatCompletionRequest,
+        request: ChatCompletionRequest | ResponsesRequest,
     ) -> DeltaMessage | None:
         # Conservative streaming: stream unwrapped response-channel text, then
         # buffer tool calls and emit each call once its block closes.
@@ -374,7 +528,7 @@ class KimiK3ToolParser(ToolParser):
         calls = [
             tc
             for m in self._call_re.finditer(section)
-            if (tc := self._decode_call(m["attrs"], m["body"])) is not None
+            if (tc := self._decode_call(m["attrs"], m["body"], request)) is not None
         ]
         if len(calls) <= self._sent_tool_call_count:
             return DeltaMessage(content=content) if content else None

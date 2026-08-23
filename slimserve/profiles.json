@@ -364,7 +364,7 @@
       "local_dir": "Muse-Glimmer-30B-GGUF",
       "shared": [
         {
-          "path": "mmproj-kquant.gguf",
+          "path": "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf",
           "bytes": 1400328928
         }
       ],
@@ -372,7 +372,7 @@
       "quants": {
         "kquant-dynamic": {
           "title": "K-quant dynamic (per-layer mixed)",
-          "bytes": 19653957984,
+          "bytes": 19653960832,
           "summary": "The larger of the two published k-quant builds; per-layer mixed precision. Default.",
           "min_gpus": {},
           "min_memory_bytes": {
@@ -380,14 +380,14 @@
           },
           "files": [
             {
-              "path": "muse-glimmer-30B-kquant-dynamic.gguf",
-              "bytes": 19653957984
+              "path": "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf",
+              "bytes": 19653960832
             }
           ]
         },
         "kquant-17gb": {
           "title": "K-quant 17GB (uniform Q4_K_M)",
-          "bytes": 16756681056,
+          "bytes": 16756683904,
           "summary": "Smaller uniform build for tighter memory; same tokenizer and mmproj.",
           "min_gpus": {},
           "min_memory_bytes": {
@@ -395,8 +395,8 @@
           },
           "files": [
             {
-              "path": "muse-glimmer-30B-kquant-17gb.gguf",
-              "bytes": 16756681056
+              "path": "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
+              "bytes": 16756683904
             }
           ]
         }
@@ -406,8 +406,8 @@
         "base_url": "https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF/resolve/main",
         "local_dir": "Muse-Glimmer-30B-GGUF",
         "file": {
-          "path": "dflash-kquant.gguf",
-          "bytes": 1631205312
+          "path": "dflash-Muse-Glimmer-30B-Q4_K_M.gguf",
+          "bytes": 1631208128
         },
         "engine": {
           "method": "dflash",
@@ -1208,6 +1208,7 @@
         "trust_remote_code": true,
         "served_model_name": "Muse-Glimmer-30B",
         "reasoning_parser": "muse_glimmer",
+        "tool_call_parser": "muse_glimmer",
         "kv_cache_dtype": "auto"
       },
       "speculative": true,
@@ -1217,6 +1218,7 @@
         "Vision: 50-block CLIP tower at 896 px, patch 14, 2x2 spatial merge into 6656-dim tokens, loaded from the published mmproj GGUF.",
         "DFlash speculation is on by default: the drafter proposes one 16-token block per call against target layers [2, 14, 26, 38, 50].",
         "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
+        "tool_call_parser must be muse_glimmer: tool calls use the model's native ATEM recipient/invoke/parameter envelope, including Responses custom-tool payloads.",
         "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
         "Performance note (2026-08-15): DFlash speculation (always on) measures 19.9-20.1 tok/s rested on the 256-token greedy essay bench (fused verify step + tensor-ops kernels on the M5 GPU neural accelerators), ahead of plain fused decode (14.4-16.4); long-context (10k, cached decode) 11.0. Acceptance ~1.73/draft. See perf/baseline_status.md. llama.cpp reference on this box: 26.75 plain / 30.8 spec; vendor ExecuTorch 26.6/50.2."
       ]
