@@ -50,18 +50,17 @@ def _front512_reference(
     history_offsets = torch.arange(
         history, device=positions_a.device, dtype=positions_a.dtype
     )
-    source_pos = (
-        positions_a.unsqueeze(1) - history + 1 + history_offsets.unsqueeze(0)
-    )
+    source_pos = positions_a.unsqueeze(1) - history + 1 + history_offsets.unsqueeze(0)
     source_valid = source_pos >= 0
     safe_pos = source_pos.clamp_min(0)
     req_block_table = block_table.index_select(0, req)
-    source_block_col = torch.div(
-        safe_pos, block_size, rounding_mode="floor"
-    ).clamp(max=req_block_table.shape[1] - 1)
-    source_blocks = req_block_table.gather(
-        1, source_block_col.to(torch.long)
-    ).to(torch.long)
+    # No max clamp: the caller sizes the block table to cover every valid
+    # source position, so an out-of-range column is a test bug, not a case
+    # to paper over.
+    source_block_col = torch.div(safe_pos, block_size, rounding_mode="floor")
+    source_blocks = req_block_table.gather(1, source_block_col.to(torch.long)).to(
+        torch.long
+    )
     source_offsets = torch.remainder(safe_pos, block_size).to(torch.long)
     head_offsets = (history_offsets >= compress_ratio).to(torch.long) * head_dim
     dims = torch.arange(head_dim, device=positions_a.device, dtype=torch.long)
@@ -87,12 +86,19 @@ def _case(compress_ratio: int, overlap: bool, tokens: int, seed: int):
     state_width = 1024 if overlap else 512
     row_width = 2 * state_width
     block_size = 4 if compress_ratio == 4 else 8
-    history = compress_ratio * (2 if overlap else 1)
 
-    # One request whose positions run far enough for full history plus a
-    # clamped prefix; block table maps position blocks 1:1 with a jumbled
-    # physical order to exercise the indirection.
-    max_pos = tokens + history + 16
+    # Tokens at consecutive positions ending on/around compress boundaries,
+    # including early positions (clamped history) and some invalid slots.
+    positions = torch.arange(tokens, dtype=torch.int64)
+    positions = positions * (compress_ratio // 2 if compress_ratio == 4 else 32)
+    positions = positions + compress_ratio - 1  # many boundary hits
+
+    # One request; block table maps position blocks 1:1 with a jumbled
+    # physical order to exercise the indirection. Size the table from the
+    # actual generated positions so every source lookup has a real entry —
+    # an undersized table plus a clamped reference silently collapses
+    # distinct positions onto the last block and can hide page-table bugs.
+    max_pos = int(positions.max().item()) + 16
     n_cols = (max_pos + block_size - 1) // block_size + 1
     perm = torch.randperm(n_cols, dtype=torch.int32)
     block_table = perm.unsqueeze(0).contiguous().to(DEV)
@@ -100,12 +106,6 @@ def _case(compress_ratio: int, overlap: bool, tokens: int, seed: int):
     state_cache = (
         torch.randn(n_blocks, block_size, row_width, dtype=torch.float32) * 0.5
     ).to(DEV)
-
-    # Tokens at consecutive positions ending on/around compress boundaries,
-    # including early positions (clamped history) and some invalid slots.
-    positions = torch.arange(tokens, dtype=torch.int64)
-    positions = positions * (compress_ratio // 2 if compress_ratio == 4 else 32)
-    positions = positions + compress_ratio - 1  # many boundary hits
     state_slots = torch.where(
         torch.arange(tokens) % 7 == 3,
         torch.tensor(-1, dtype=torch.int64),
@@ -173,8 +173,10 @@ def _case(compress_ratio: int, overlap: bool, tokens: int, seed: int):
     tag = f"cr={compress_ratio} tokens={tokens} valid={len(idx)}"
     level = "BITWISE" if bitwise else ("tol" if tol_ok else "FAIL")
     return [
-        (f"front {tag}: {level} (max err {max_err:.2e} / scale {scale:.2f})",
-         bitwise or tol_ok),
+        (
+            f"front {tag}: {level} (max err {max_err:.2e} / scale {scale:.2f})",
+            bitwise or tol_ok,
+        ),
         (f"determinism x2 {tag}", det),
     ]
 

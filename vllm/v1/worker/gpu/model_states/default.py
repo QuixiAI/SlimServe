@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -178,15 +179,28 @@ class DefaultModelState(ModelState):
             enabled = getattr(self, "_steady_meta_enabled", None)
             if enabled is None:
                 import os
-                enabled = os.getenv(
-                    "VLLM_STEADY_DECODE_META", "0"
-                ).lower() in ("1", "true", "on", "yes")
+
+                enabled = os.getenv("VLLM_STEADY_DECODE_META", "0").lower() in (
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                )
                 self._steady_meta_enabled = enabled
             if enabled:
                 steady_cache = getattr(self, "_steady_meta_cache", None)
                 if steady_cache is None:
                     steady_cache = {"sig": None}
                     self._steady_meta_cache = steady_cache
+        # input_batch.num_computed_tokens_np holds one entry per real request;
+        # with FULL cudagraphs num_reqs is the padded count, and slicing a
+        # shorter array does not add the padded rows. Metadata consumers index
+        # by padded request id, so fill the padded tail explicitly.
+        num_computed_tokens_cpu = input_batch.num_computed_tokens_np[:num_reqs]
+        if num_computed_tokens_cpu.shape[0] < num_reqs:
+            padded_nct = np.zeros(num_reqs, dtype=num_computed_tokens_cpu.dtype)
+            padded_nct[: num_computed_tokens_cpu.shape[0]] = num_computed_tokens_cpu
+            num_computed_tokens_cpu = padded_nct
         attn_metadata = build_attn_metadata(
             steady_cache=steady_cache,
             attn_groups=attn_groups,
@@ -207,8 +221,6 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
-            num_computed_tokens_cpu=torch.from_numpy(
-                input_batch.num_computed_tokens_np[:num_reqs]
-            ),
+            num_computed_tokens_cpu=torch.from_numpy(num_computed_tokens_cpu),
         )
         return attn_metadata

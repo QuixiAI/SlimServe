@@ -2144,7 +2144,11 @@ at::Tensor ggml_moe_mm_id(const at::Tensor& x, const at::Tensor& w,
   auto wcount = at::empty({1}, topk_ids.options());
   auto work64 = at::empty({work_cap64}, topk_ids.options());
   auto wcount64 = at::empty({1}, topk_ids.options());
-  auto out = at::empty({tokens * top_k, (int64_t)N}, x.options());
+  // Zero-filled, not empty: map0 drops negative router ids, so their slot
+  // rows appear in no expert's ids list and neither tile kernel writes
+  // them. The vec kernels this route replaces write T(0) for expert < 0;
+  // a pooled empty allocation would surface those rows as stale memory.
+  auto out = at::zeros({tokens * top_k, (int64_t)N}, x.options());
   // Dual-half 64-slot tiles amortize one weight-dequant pass over two slot
   // halves (per-slot bit-identical to the 32-wide kernels). iq2_xxs only:
   // the q2_K twin is slower on the SoA layout (optimization_status

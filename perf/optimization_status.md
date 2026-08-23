@@ -9614,3 +9614,66 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   requirement, but continue to label full 262,144-token end-to-end serving as
   pending until the exact profile completes correctness and throughput gates.
 - Raw artifacts: `perf/results/2026-08-23/pr2-review-fixes/`.
+
+## 2026-08-23 - PR #2 Review Resolution (CodeRabbit, 15 findings)
+
+- Scope: every finding from the PR #2 review verified against 2a1c5710f
+  and fixed, documented, or skipped with a reason. No performance-path
+  behavior change except where a finding was itself a perf defect.
+- Fixed (correctness):
+  - moe_mm_id tile route: output allocation is now zero-filled
+    (qc_metal_serving.mm ggml_moe_mm_id), matching the vec kernels'
+    T(0) contract for negative router ids; both tile kernels scatter
+    only rows named by ids, so dropped slots previously surfaced pooled
+    stale memory. Unreachable on today's guarded route (expert_map is
+    None), fixed as contract hardening.
+  - compressor_utils Metal slot mapping: padded tokens (num_tokens >
+    qsl[-1] under FULL cudagraphs) and negative positions are masked to
+    -1 instead of receiving a real slot via the searchsorted clamp.
+  - model_states/default.py: num_computed_tokens_cpu is explicitly
+    padded to num_reqs_after_padding (zeros) instead of slicing a
+    shorter per-request array.
+  - qgemv_mb: reassociate(off) pragma in the m-nest, same guard and
+    reason as qgemv_q8_0_mb_fast (cross-m hoisting broke row
+    bit-identity with the looped batch-1 kernel).
+  - indexer.metal: dsv4_indexer_compress_insert and dsv4_compress_front
+    early-return when 2 * compress_ratio > HISTORY_MAX (8) instead of
+    overrunning fixed-size arrays; the c128 kernel is compile-time
+    sized and needed no guard.
+  - test_metal_compress_front_c128: block table sized from the actual
+    generated positions; reference max-clamp removed. The stricter
+    oracle passes -- the native kernel's page walk was already correct.
+- Fixed (performance):
+  - input_batch post_update MPS: the scratch-cell full-matrix
+    copy-out/copy-back (2x max_num_reqs x max_model_len per decode
+    step) replaced by an in-place masked scatter that redirects masked
+    lanes to flat cell 0 rewriting its own gathered value. New test
+    tests/v1/worker/test_post_update_mps.py pins bit-exact behavior
+    including no stray writes.
+  - rejection_sample non-vectorized MPS path: honors the callers'
+    all_greedy hint; the blocking temperature sync now runs only for
+    legacy callers passing None.
+- Fixed (robustness/lint): guarded int() env parses
+  (VLLM_QC_MHC_METAL_MAX_TOKENS, VLLM_QC_MOE_MM_MIN_TOKENS,
+  VLLM_QC_STEP_TAPE with warn), RUF022 __all__ sort, A002 rename.
+- Documented instead of code change:
+  - mla sparse two-cache prefill launcher: num_heads % 16 contract
+    comment; the sole call site already routes non-conforming counts to
+    the per-head path (batch >= 64 && heads % 16 == 0).
+  - launch_mla_q_norm_rope half-input: head_dim == 512 contract
+    comment; sole caller passes the literal and TORCH_CHECK-gates q.
+- Skipped with reason:
+  - Cold-boot multi-chunk guard (profiles.json finding): root cause was
+    already fixed in 2a1c5710f (MPS async-output copy + event on the
+    producing stream, regression test test_metal_async_output.py). The
+    reviewer read the stale prefill_handoff.md protocol; that section
+    is now marked SUPERSEDED. A boot-ramp workaround was prototyped and
+    deliberately dropped rather than shipping a guard for a fixed race.
+- Validation: metallib + _quixicore_C rebuilt from the branch
+  (build dir ~/.local/scratch/pr2-build, only pre-existing maps.metal
+  warnings); tests/kernels + new post_update test: 21 passed /
+  103 CUDA-gated skips on the M5 Max; ruff 0.16.1 clean on all touched
+  python. Residual: the M1 Ultra perf numbers were not re-measured
+  here; the only hot-path changes are the post_update rewrite (strictly
+  less work) and the zero-filled mm_id output (one fill per prefill
+  call, ~1% of a chunk step, flagged for the next M1 Ultra bench pass).
