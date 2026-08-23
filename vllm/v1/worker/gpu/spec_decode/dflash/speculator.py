@@ -313,12 +313,17 @@ class DFlashSpeculator(DraftModelSpeculator):
                 # successor from softmax(scores/T) over the top-k and writes
                 # the sparse k-way distribution into draft_logits so
                 # rejection sampling stays lossless at any temperature.
+                req_idx = self.idx_mapping[:num_reqs].to(torch.long)
                 self.draft_tokens[:num_reqs] = self.model.select_draft_path_sampled(
                     sample_hidden_states,
                     anchor_ids,
                     self.temperature,
                     self.idx_mapping[:num_reqs],
                     self.draft_logits,
+                    seeds=self.seeds[req_idx],
+                    positions=self.sample_pos[:num_sample].view(
+                        num_reqs, self.num_speculative_steps
+                    ),
                 )
             else:
                 # Greedy argmax walk (draft_sample_method='greedy'):

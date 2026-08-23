@@ -3820,6 +3820,31 @@ void launch_kv_cache_gather(
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
+// ----- Hybrid-safe range gather. Cache block stride is explicit and 64-bit,
+// so interleaved K/V pages beyond 2^31 elements remain addressable. -----
+template <class E>
+void launch_kv_cache_gather_range(
+    E& e, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::out_t key_out, typename E::out_t value_out,
+    typename E::in_t block_table, int token_start, int num_tokens,
+    int num_blocks, int block_size, int num_heads, int head_size,
+    int64_t cache_block_stride, const std::string& type_name) {
+  e.pipeline("kv_cache_gather_range_" + type_name);
+  e.in(key_cache, 0);
+  e.in(value_cache, 1);
+  e.out(key_out, 2);
+  e.out(value_out, 3);
+  e.in(block_table, 4);
+  e.bytes(token_start, 5);
+  e.bytes(num_tokens, 6);
+  e.bytes(num_blocks, 7);
+  e.bytes(block_size, 8);
+  e.bytes(num_heads, 9);
+  e.bytes(head_size, 10);
+  e.bytes(cache_block_stride, 11);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
 // ----- fp8 KV gather + upconvert: uchar caches@0,1 -> bf16 out@2,3 ;
 // block_table@4 cu_seq_lens@5
 //        k_scale@6 v_scale@7 (per-kv_head) ; scalars num_tokens@8..head_size@13
