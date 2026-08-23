@@ -24,6 +24,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -243,6 +244,51 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                                /*mask_heads=*/0, activation_type_name(q));
   });
   return out;
+}
+
+std::tuple<at::Tensor, at::Tensor> kv_cache_gather_range(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table_in, int64_t token_start, int64_t num_tokens) {
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  check_mps(block_table_in, "block_table");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.sizes() == key_cache.sizes(),
+              "KV caches must both be [blocks, block_size, heads, dim]");
+  TORCH_CHECK(key_cache.scalar_type() == value_cache.scalar_type(),
+              "key/value cache dtype mismatch");
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
+  TORCH_CHECK(block_table_in.dim() == 1, "block_table must be one request row");
+  TORCH_CHECK(token_start >= 0 && num_tokens >= 0,
+              "token range must be non-negative");
+
+  const int nblocks = static_cast<int>(key_cache.size(0));
+  const int block_size = static_cast<int>(key_cache.size(1));
+  const int heads = static_cast<int>(key_cache.size(2));
+  const int head_size = static_cast<int>(key_cache.size(3));
+  const int start = static_cast<int>(token_start);
+  const int count = static_cast<int>(num_tokens);
+  TORCH_CHECK(count == 0 || (start + count + block_size - 1) / block_size <=
+                                block_table_in.numel(),
+              "token range exceeds block table");
+
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  auto key_out = at::empty({count, heads, head_size}, key_cache.options());
+  auto value_out = at::empty_like(key_out);
+  if (count == 0) return {key_out, value_out};
+
+  const int64_t cache_block_stride = key_cache.stride(0);
+  encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_gather_range(
+        e, key_cache, value_cache, key_out, value_out, block_table, start,
+        count, nblocks, block_size, heads, head_size, cache_block_stride,
+        activation_type_name(key_cache));
+  });
+  return {key_out, value_out};
 }
 
 // Multi-query verify attention (bench-first): the m expanded rows share
@@ -1234,8 +1280,14 @@ const char* ggml_type_to_format(int64_t quant_type) {
       return "iq1_s";
     case 20:
       return "iq4_nl";
+    case 21:
+      return "iq3_s";
+    case 22:
+      return "iq2_s";
     case 23:
       return "iq4_xs";
+    case 29:
+      return "iq1_m";
     case 39:
       return "mxfp4";
     default:
@@ -1262,9 +1314,19 @@ at::Tensor ggml_mul_mat_vec_a8(const at::Tensor& w, const at::Tensor& x,
   // Instantiated row counts, largest-first; 17 is the speculative-verify
   // width (k+1) and gets a single dispatch.
   static const int kMMRows[] = {17, 16, 8, 4, 2};
-  const bool has_mm = (fmt == "q4_0" || fmt == "q8_0" || fmt == "q4_K" ||
-                       fmt == "q5_K" || fmt == "q6_K") &&
-                      type_name != "float32";
+  static const char* const kMMFormats[] = {
+      "q4_0",   "q8_0",  "q4_K",    "q5_K",  "q6_K",
+      "q2_K",   "q3_K",  "iq1_s",   "iq1_m", "iq2_xxs",
+      "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "iq4_xs"};
+  bool has_mm = false;
+  if (type_name != "float32") {
+    for (const char* f : kMMFormats) {
+      if (fmt == f) {
+        has_mm = true;
+        break;
+      }
+    }
+  }
   encode([&](TorchEncoder& e) {
     const int batch = static_cast<int>(x.size(0));
     int b = 0;
@@ -1631,6 +1693,373 @@ at::Tensor ggml_mul_mat_sm_pre(const at::Tensor& w, const at::Tensor& x,
   return out;
 }
 
+// DFlash 2 dynamic block-local two-tap convolution.  One dispatch replaces
+// repeat_interleave + roll + clone/zero + the elementwise multiply/add chain.
+at::Tensor dflash2_two_tap_conv(const at::Tensor& x, const at::Tensor& coeffs,
+                                const at::Tensor& base, int64_t side,
+                                int64_t block_size, int64_t group_size) {
+  check_mps(x, "x");
+  check_mps(coeffs, "coeffs");
+  check_mps(base, "base");
+  TORCH_CHECK(x.dim() == 2,
+              "quixicore(metal): dflash2 conv x must be (tokens, hidden)");
+  TORCH_CHECK(
+      coeffs.dim() == 4 && coeffs.size(1) == 2 && coeffs.size(2) == 2 &&
+          coeffs.size(0) == x.size(0),
+      "quixicore(metal): dflash2 coeffs must be (tokens, 2, 2, groups)");
+  TORCH_CHECK(base.dim() == 3 && base.size(0) == 2 && base.size(1) == 2 &&
+                  base.size(2) == x.size(1),
+              "quixicore(metal): dflash2 base must be (2, 2, hidden)");
+  TORCH_CHECK(x.scalar_type() == coeffs.scalar_type() &&
+                  x.scalar_type() == base.scalar_type(),
+              "quixicore(metal): dflash2 x/coeffs/base dtype mismatch");
+  TORCH_CHECK(side == 0 || side == 1,
+              "quixicore(metal): dflash2 side must be 0 or 1");
+  TORCH_CHECK(group_size > 0 && x.size(1) % group_size == 0,
+              "quixicore(metal): dflash2 hidden must divide by group_size");
+
+  const int tokens = static_cast<int>(x.size(0));
+  const int hidden = static_cast<int>(x.size(1));
+  const int groups = static_cast<int>(coeffs.size(3));
+  TORCH_CHECK(groups * group_size == hidden,
+              "quixicore(metal): dflash2 group geometry mismatch");
+  auto out = at::empty_like(x);
+  if (tokens == 0) return out;
+  const int bs = block_size > 0 && tokens % block_size == 0
+                     ? static_cast<int>(block_size)
+                     : tokens;
+  const int gs = static_cast<int>(group_size);
+  const int sd = static_cast<int>(side);
+  const int total = tokens * hidden;
+  const std::string act = activation_type_name(x);
+  encode([&](TorchEncoder& e) {
+    e.pipeline("dflash2_two_tap_conv_" + act);
+    e.in(x, 0);
+    e.in(coeffs, 1);
+    e.in(base, 2);
+    e.out(out, 3);
+    e.bytes(tokens, 4);
+    e.bytes(hidden, 5);
+    e.bytes(groups, 6);
+    e.bytes(gs, 7);
+    e.bytes(bs, 8);
+    e.bytes(sd, 9);
+    e.dispatch((total + 255) / 256, 1, 1, 256, 1, 1);
+  });
+  return out;
+}
+
+std::tuple<at::Tensor, at::Tensor> qwen38_rejection_sample(
+    const at::Tensor& target, const std::optional<at::Tensor>& draft,
+    const at::Tensor& draft_sampled, const at::Tensor& cu,
+    const at::Tensor& pos, const at::Tensor& idx_mapping,
+    const at::Tensor& temperature, const at::Tensor& seeds,
+    int64_t num_speculative_steps, int64_t vocab_size) {
+  check_mps(target, "target");
+  check_mps(draft_sampled, "draft_sampled");
+  check_mps(cu, "cu");
+  check_mps(pos, "pos");
+  check_mps(idx_mapping, "idx_mapping");
+  check_mps(temperature, "temperature");
+  check_mps(seeds, "seeds");
+  TORCH_CHECK(target.dim() == 2 && target.scalar_type() == at::kFloat,
+              "quixicore(metal): fused rejection target must be fp32 (L,V)");
+  TORCH_CHECK(draft_sampled.scalar_type() == at::kInt &&
+                  cu.scalar_type() == at::kInt &&
+                  idx_mapping.scalar_type() == at::kInt,
+              "quixicore(metal): fused rejection ids/cu/mapping must be int32");
+  TORCH_CHECK(
+      pos.scalar_type() == at::kLong && seeds.scalar_type() == at::kLong,
+      "quixicore(metal): fused rejection pos/seeds must be int64");
+  TORCH_CHECK(temperature.scalar_type() == at::kFloat,
+              "quixicore(metal): fused rejection temperature must be fp32");
+  TORCH_CHECK(num_speculative_steps >= 1 && num_speculative_steps <= 16,
+              "quixicore(metal): fused rejection supports 1..16 steps");
+  TORCH_CHECK(vocab_size > 0 && vocab_size <= target.size(1),
+              "quixicore(metal): fused rejection invalid vocab size");
+  const bool has_draft = draft.has_value();
+  if (has_draft) {
+    check_mps(*draft, "draft");
+    TORCH_CHECK(draft->dim() == 3 && draft->scalar_type() == at::kFloat &&
+                    draft->size(1) >= num_speculative_steps &&
+                    draft->size(2) >= vocab_size,
+                "quixicore(metal): fused rejection draft must be fp32 "
+                "(states, >=steps, >=vocab)");
+  }
+  const int requests = static_cast<int>(cu.numel() - 1);
+  TORCH_CHECK(requests >= 0 && idx_mapping.numel() >= requests,
+              "quixicore(metal): fused rejection request metadata mismatch");
+  auto sampled = at::empty({requests, num_speculative_steps + 1},
+                           target.options().dtype(at::kLong));
+  auto num_sampled = at::empty({requests}, target.options().dtype(at::kInt));
+  if (requests == 0) return {sampled, num_sampled};
+  const int steps = static_cast<int>(num_speculative_steps);
+  const int vocab = static_cast<int>(vocab_size);
+  const long target_stride = static_cast<long>(target.stride(0));
+  const long draft_stride0 =
+      has_draft ? static_cast<long>(draft->stride(0)) : 0;
+  const long draft_stride1 =
+      has_draft ? static_cast<long>(draft->stride(1)) : 0;
+  const int has_draft_i = has_draft ? 1 : 0;
+  encode([&](TorchEncoder& e) {
+    e.pipeline("mittens::qwen38_rejection_sample");
+    e.out(sampled, 0);
+    e.out(num_sampled, 1);
+    e.in(target, 2);
+    e.in(has_draft ? *draft : target, 3);
+    e.in(draft_sampled, 4);
+    e.in(cu, 5);
+    e.in(pos, 6);
+    e.in(idx_mapping, 7);
+    e.in(temperature, 8);
+    e.in(seeds, 9);
+    e.bytes(requests, 10);
+    e.bytes(steps, 11);
+    e.bytes(vocab, 12);
+    e.bytes(target_stride, 13);
+    e.bytes(draft_stride0, 14);
+    e.bytes(draft_stride1, 15);
+    e.bytes(has_draft_i, 16);
+    e.dispatch(requests, 1, 1, 256, 1, 1);
+  });
+  return {sampled, num_sampled};
+}
+
+// ---- Qwen3.5 fused GDN decode / verify step -------------------------------
+//
+// Two dispatches per layer (conv window update + delta-rule scan) replacing
+// the per-position torch-native MPS loop. Kernel contract and layout notes in
+// kernels/serving_glue/gdn_step.metal; the torch path in
+// qwen_gdn_linear_attn.py stays the oracle and the fallback.
+
+void qwen_gdn_step(const at::Tensor& x, const at::Tensor& a,
+                   const at::Tensor& b, const at::Tensor& conv_state,
+                   const at::Tensor& ssm_state, const at::Tensor& conv_weight,
+                   const std::optional<at::Tensor>& conv_bias,
+                   const at::Tensor& A_log, const at::Tensor& dt_bias,
+                   const at::Tensor& token_map, const at::Tensor& conv_slot,
+                   const at::Tensor& resume_slot, const at::Tensor& store_slots,
+                   const std::optional<at::Tensor>& num_accepted,
+                   const at::Tensor& out, int64_t num_seqs, int64_t S,
+                   int64_t num_k_heads, bool tiled, bool act_silu,
+                   double scale) {
+  check_mps_strided(x, "x");
+  check_mps_strided(a, "a");
+  check_mps_strided(b, "b");
+  check_mps_strided(conv_state, "conv_state");
+  check_mps_strided(ssm_state, "ssm_state");
+  check_mps(conv_weight, "conv_weight");
+  check_mps(A_log, "A_log");
+  check_mps(dt_bias, "dt_bias");
+  check_mps(token_map, "token_map");
+  check_mps(conv_slot, "conv_slot");
+  check_mps(resume_slot, "resume_slot");
+  check_mps_strided(store_slots, "store_slots");
+  check_mps_strided(out, "out");
+
+  TORCH_CHECK(x.dim() == 2 && x.stride(1) == 1,
+              "quixicore(metal): qwen_gdn_step x must be (tokens, conv_dim) "
+              "with unit inner stride");
+  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && a.stride(1) == 1 &&
+                  b.stride(1) == 1 && a.stride(0) == b.stride(0),
+              "quixicore(metal): qwen_gdn_step a/b must be (tokens, Hv) views "
+              "with unit inner stride and a common row stride");
+  TORCH_CHECK(
+      conv_state.dim() == 3,
+      "quixicore(metal): conv_state must be a (slots, conv_dim, L) view");
+  TORCH_CHECK(ssm_state.dim() == 4 && ssm_state.scalar_type() == at::kFloat &&
+                  ssm_state.stride(3) == 1 &&
+                  ssm_state.stride(2) == ssm_state.size(3) &&
+                  ssm_state.stride(1) == ssm_state.size(2) * ssm_state.size(3),
+              "quixicore(metal): ssm_state must be fp32 (slots, Hv, Dv, Dk) "
+              "with a contiguous per-slot block");
+  TORCH_CHECK(
+      out.dim() == 3 && out.stride(2) == 1 && out.stride(1) == out.size(2),
+      "quixicore(metal): out must be (tokens, Hv, Dv) rows");
+  TORCH_CHECK(conv_weight.dim() == 2 && conv_weight.scalar_type() == at::kFloat,
+              "quixicore(metal): conv_weight must be fp32 (conv_dim, width)");
+  TORCH_CHECK(
+      A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat,
+      "quixicore(metal): A_log/dt_bias must be fp32");
+  TORCH_CHECK(token_map.scalar_type() == at::kInt &&
+                  conv_slot.scalar_type() == at::kInt &&
+                  resume_slot.scalar_type() == at::kInt &&
+                  store_slots.scalar_type() == at::kInt,
+              "quixicore(metal): qwen_gdn_step index tensors must be int32");
+  TORCH_CHECK(x.scalar_type() == a.scalar_type() &&
+                  x.scalar_type() == b.scalar_type() &&
+                  x.scalar_type() == out.scalar_type(),
+              "quixicore(metal): x/a/b/out must share the activation dtype");
+
+  const int conv_dim = static_cast<int>(x.size(1));
+  const int width = static_cast<int>(conv_weight.size(1));
+  const int Hv = static_cast<int>(ssm_state.size(1));
+  const int Dv = static_cast<int>(ssm_state.size(2));
+  const int Dk = static_cast<int>(ssm_state.size(3));
+  const int Hk = static_cast<int>(num_k_heads);
+  const int N = static_cast<int>(num_seqs);
+  const int Sv = static_cast<int>(S);
+  TORCH_CHECK(Dk == 128,
+              "quixicore(metal): qwen_gdn_step wants head_k_dim 128");
+  TORCH_CHECK(width >= 2 && width <= 4,
+              "quixicore(metal): qwen_gdn_step wants conv width in [2, 4]");
+  TORCH_CHECK(Sv >= 1 && Sv <= 16,
+              "quixicore(metal): qwen_gdn_step wants 1 <= S <= 16");
+  TORCH_CHECK(Dv % 8 == 0,
+              "quixicore(metal): head_v_dim must be a multiple of 8");
+  TORCH_CHECK(conv_dim == 2 * Hk * Dk + Hv * Dv,
+              "quixicore(metal): conv_dim mismatch: ", conv_dim, " vs ",
+              2 * Hk * Dk + Hv * Dv);
+  TORCH_CHECK(conv_state.size(1) == conv_dim,
+              "quixicore(metal): conv_state channel dim mismatch");
+  TORCH_CHECK(conv_state.size(2) >= width - 1 + Sv - 1,
+              "quixicore(metal): conv_state too narrow for S=", Sv);
+  TORCH_CHECK(token_map.numel() >= static_cast<int64_t>(N) * Sv,
+              "quixicore(metal): token_map too short");
+  TORCH_CHECK(conv_slot.numel() >= N && resume_slot.numel() >= N,
+              "quixicore(metal): slot tensors too short");
+  TORCH_CHECK(store_slots.dim() == 2 && store_slots.size(0) >= N &&
+                  store_slots.size(1) >= Sv && store_slots.stride(1) == 1,
+              "quixicore(metal): store_slots must be (N, >= S) rows");
+  TORCH_CHECK(a.size(1) >= Hv && b.size(1) >= Hv,
+              "quixicore(metal): a/b narrower than Hv");
+  const bool has_bias = conv_bias.has_value();
+  if (has_bias) check_mps(*conv_bias, "conv_bias");
+  const bool use_acc = num_accepted.has_value();
+  if (use_acc) {
+    check_mps(*num_accepted, "num_accepted");
+    TORCH_CHECK(num_accepted->scalar_type() == at::kInt,
+                "quixicore(metal): num_accepted must be int32");
+  }
+  if (N == 0) return;
+
+  const std::string act = activation_type_name(x);
+  const std::string cs = activation_type_name(conv_state);
+  TORCH_CHECK(cs == act || cs == "float32",
+              "quixicore(metal): conv_state dtype must match x or be fp32");
+
+  auto conved = at::empty({N, Sv, conv_dim}, x.options().dtype(at::kFloat));
+
+  const long x_rs = static_cast<long>(x.stride(0));
+  const long cs_slot = static_cast<long>(conv_state.stride(0));
+  const long cs_chan = static_cast<long>(conv_state.stride(1));
+  const long cs_col = static_cast<long>(conv_state.stride(2));
+  const long ab_rs = static_cast<long>(a.stride(0));
+  const long st_slot = static_cast<long>(ssm_state.stride(0));
+  const long ss_rs = static_cast<long>(store_slots.stride(0));
+  const long out_rs = static_cast<long>(out.stride(0));
+  const int v_has_bias = has_bias ? 1 : 0;
+  const int v_act = act_silu ? 1 : 0;
+  const int v_use_acc = use_acc ? 1 : 0;
+  const int v_tiled = tiled ? 1 : 0;
+  const float v_scale = static_cast<float>(scale);
+  const int conv_grid = (conv_dim + 255) / 256;
+  const int scan_grid = Dv / 8;
+
+  encode([&](TorchEncoder& e) {
+    e.pipeline("qwen_gdn_conv_step_" + act + "_cs" + cs);
+    e.in(x, 0);
+    e.out(conv_state, 1);
+    e.in(conv_weight, 2);
+    e.in(has_bias ? *conv_bias : conv_weight, 3);
+    e.out(conved, 4);
+    e.in(token_map, 5);
+    e.in(conv_slot, 6);
+    e.in(use_acc ? *num_accepted : conv_slot, 7);
+    e.bytes(conv_dim, 8);
+    e.bytes(width, 9);
+    e.bytes(Sv, 10);
+    e.bytes(x_rs, 11);
+    e.bytes(cs_slot, 12);
+    e.bytes(cs_chan, 13);
+    e.bytes(cs_col, 14);
+    e.bytes(v_has_bias, 15);
+    e.bytes(v_act, 16);
+    e.bytes(v_use_acc, 17);
+    e.dispatch(conv_grid, N, 1, 256, 1, 1);
+
+    e.pipeline("qwen_gdn_scan_step_" + act);
+    e.in(conved, 0);
+    e.in(a, 1);
+    e.in(b, 2);
+    e.in(A_log, 3);
+    e.in(dt_bias, 4);
+    e.out(ssm_state, 5);
+    e.in(token_map, 6);
+    e.in(resume_slot, 7);
+    e.in(store_slots, 8);
+    e.out(out, 9);
+    e.bytes(Sv, 10);
+    e.bytes(Hk, 11);
+    e.bytes(Hv, 12);
+    e.bytes(Dv, 13);
+    e.bytes(conv_dim, 14);
+    e.bytes(v_tiled, 15);
+    e.bytes(ab_rs, 16);
+    e.bytes(st_slot, 17);
+    e.bytes(ss_rs, 18);
+    e.bytes(out_rs, 19);
+    e.bytes(v_scale, 20);
+    e.dispatch(scan_grid, Hv, N, 256, 1, 1);
+  });
+}
+
+// Gated RMS norm over the GDN core output (RMSNormGated norm_before_gate +
+// silu gate), one simdgroup per (token, head) row.
+at::Tensor qwen_gdn_gated_norm(const at::Tensor& x, const at::Tensor& z,
+                               const at::Tensor& w, double eps) {
+  check_mps(x, "x");
+  check_mps_strided(z, "z");
+  check_mps(w, "w");
+  TORCH_CHECK(x.dim() == 3 && z.dim() == 3 && x.sizes() == z.sizes(),
+              "quixicore(metal): gated_norm wants x/z as (tokens, Hv, D)");
+  const int tokens = static_cast<int>(x.size(0));
+  const int Hv = static_cast<int>(x.size(1));
+  const int D = static_cast<int>(x.size(2));
+  TORCH_CHECK(D % 4 == 0 && D >= 4, "quixicore(metal): gated_norm D % 4 == 0");
+  TORCH_CHECK(z.stride(2) == 1 && z.stride(1) == D,
+              "quixicore(metal): gated_norm z must be head-contiguous");
+  TORCH_CHECK(w.scalar_type() == at::kFloat && w.numel() == D,
+              "quixicore(metal): gated_norm weight must be fp32 (D)");
+  TORCH_CHECK(x.scalar_type() == z.scalar_type(),
+              "quixicore(metal): gated_norm x/z dtype mismatch");
+  auto out = at::empty_like(x);
+  const int rows = tokens * Hv;
+  if (rows == 0) return out;
+  const long z_ts = static_cast<long>(z.stride(0));
+  const float v_eps = static_cast<float>(eps);
+  const std::string act = activation_type_name(x);
+  encode([&](TorchEncoder& e) {
+    e.pipeline("qwen_gdn_gated_norm_" + act);
+    e.in(x, 0);
+    e.in(z, 1);
+    e.in(w, 2);
+    e.out(out, 3);
+    e.bytes(rows, 4);
+    e.bytes(Hv, 5);
+    e.bytes(D, 6);
+    e.bytes(z_ts, 7);
+    e.bytes(v_eps, 8);
+    e.dispatch((rows + 7) / 8, 1, 1, 256, 1, 1);
+  });
+  return out;
+}
+
+// Full-tensor dequant to fp16 through the same tk_dequant8 span decoders the
+// GEMV/GEMM kernels use (decoder verification and load-time dequant).
+at::Tensor ggml_dequantize_fp16(const at::Tensor& w, int64_t quant_type,
+                                int64_t row, int64_t k) {
+  check_mps(w, "w");
+  const int N = static_cast<int>(row);
+  const int K = static_cast<int>(k);
+  TORCH_CHECK(K % 8 == 0, "quixicore(metal): dequant wants K % 8 == 0");
+  const std::string fmt = ggml_type_to_format(quant_type);
+  auto out = at::empty({N, K}, w.options().dtype(at::kHalf));
+  encode(
+      [&](TorchEncoder& e) { tk::launch_qdequant_fp16(e, out, w, N, K, fmt); });
+  return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1712,6 +2141,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("context_lens"), pybind11::arg("scale"),
         pybind11::arg("window") = 0);
 
+  m.def("kv_cache_gather_range", &kv_cache_gather_range,
+        "64-bit range gather from a strided dense/GQA paged KV cache",
+        pybind11::arg("key_cache"), pybind11::arg("value_cache"),
+        pybind11::arg("block_table"), pybind11::arg("token_start"),
+        pybind11::arg("num_tokens"));
+
   m.def("deepseek_v4_qnorm_rope_kv_insert", &deepseek_v4_qnorm_rope_kv_insert,
         "DeepSeek-V4 Q norm/RoPE plus packed FP8 KV insert", pybind11::arg("q"),
         pybind11::arg("kv"), pybind11::arg("kv_cache"),
@@ -1790,6 +2225,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "planes, X (32,K) half row-major, D (N,32) half out",
         pybind11::arg("wu"), pybind11::arg("x"), pybind11::arg("sc"),
         pybind11::arg("mn"), pybind11::arg("row"));
+  m.def("qwen_gdn_step", &qwen_gdn_step,
+        "Fused Qwen3.5 GDN decode/verify step: conv window update + gated "
+        "delta-rule scan over S positions per sequence, fp32 state in place.",
+        py::arg("x"), py::arg("a"), py::arg("b"), py::arg("conv_state"),
+        py::arg("ssm_state"), py::arg("conv_weight"), py::arg("conv_bias"),
+        py::arg("A_log"), py::arg("dt_bias"), py::arg("token_map"),
+        py::arg("conv_slot"), py::arg("resume_slot"), py::arg("store_slots"),
+        py::arg("num_accepted"), py::arg("out"), py::arg("num_seqs"),
+        py::arg("S"), py::arg("num_k_heads"), py::arg("tiled"),
+        py::arg("act_silu"), py::arg("scale"));
+  m.def("qwen_gdn_gated_norm", &qwen_gdn_gated_norm,
+        "Gated RMS norm (norm_before_gate, silu) over (tokens, Hv, D) GDN "
+        "core output; z is the qkvz view.",
+        py::arg("x"), py::arg("z"), py::arg("w"), py::arg("eps"));
+  m.def("dflash2_two_tap_conv", &dflash2_two_tap_conv,
+        "DFlash 2 block-local dynamic two-tap convolution.", py::arg("x"),
+        py::arg("coeffs"), py::arg("base"), py::arg("side"),
+        py::arg("block_size"), py::arg("group_size"));
+  m.def("qwen38_rejection_sample", &qwen38_rejection_sample,
+        "Single-dispatch lossless probabilistic rejection sampler on Metal.",
+        py::arg("target"), py::arg("draft"), py::arg("draft_sampled"),
+        py::arg("cu"), py::arg("pos"), py::arg("idx_mapping"),
+        py::arg("temperature"), py::arg("seeds"),
+        py::arg("num_speculative_steps"), py::arg("vocab_size"));
+  m.def("ggml_dequantize_fp16", &ggml_dequantize_fp16,
+        "Dequantize a GGUF tensor to fp16 (N, K) via the tk_dequant8 decoders.",
+        py::arg("w"), py::arg("quant_type"), py::arg("row"), py::arg("k"));
   m.def("prepare_dflash_inputs", &prepare_dflash_inputs,
         "native DFlash input prep (one dispatch, no host syncs)");
   m.def("ggml_mul_mat_sm_u4_rm", &ggml_mul_mat_sm_u4_rm,

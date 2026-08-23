@@ -60,6 +60,10 @@ class _DummyTokenizer:
     def encode(self, text, add_special_tokens=False):
         return [ord(char) for char in text]
 
+    def decode(self, token_ids):
+        special = {1: "<|message|>", 2: "<|eom|>"}
+        return "".join(special.get(token_id, chr(token_id)) for token_id in token_ids)
+
 
 def _apply_patch_request(
     *,

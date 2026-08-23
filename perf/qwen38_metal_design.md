@@ -269,3 +269,42 @@ verify step: 8 positions x 48 layers x (48h x 128 x 128 fp32) ~ 12 MB/req
 of state traffic -- noise next to the weight pass. Implement AFTER plain
 decode reaches greedy parity; the current spec-mask NotImplementedError
 is the guard.
+
+## Fused GDN decode step (design, pre-implementation)
+
+Measured: plain decode ~400 ms/step vs a ~46 ms bandwidth floor at current
+residency (notebook (19)) -- dispatch/python-bound. Structure of one decode
+step today: 64 layers x (norm, in_proj_qkvz GEMV, in_proj_ba GEMV, conv
+update ~4 small ops, scan step ~8 small ops incl. fp32 state read/write,
+gated norm, out_proj GEMV, residual) + 16 full-attn layers' attention +
+final norm + lm_head ~= 1000+ host dispatches/step plus engine overhead.
+The Muse campaign killed the same disease with muse_step: one Metal
+command buffer emitting the whole forward via a host-side emit chain
+(qc_metal_serving.mm), reusing the eager kernels' variant tables.
+
+Plan (after spec correctness lands, since the fused step must reproduce
+the spec paths too):
+
+1. Persistent GPU-resident GDN state: fp32 ssm state (48h x 128 x 128 per
+   layer per slot) and conv tail (10240 x 3) already live in the mamba
+   cache tensors -- the fused step reads/writes them in place; no new
+   allocation.
+2. New kernels needed (small, all elementwise/GEMV-class):
+   qwen_gdn_step (conv-tap update + l2norm + gating + single-token delta
+   rule + gated RMS norm, one dispatch per layer covering all 48 heads;
+   fp32 accumulate) and a fused residual/norm site. The GEMVs reuse the
+   existing qgemv/qgemm_sm routes via the emit chain like muse_step's
+   emit_matvec.
+3. Full-attention layers: reuse the muse fused-step attention site;
+   head_dim 256 needs the paged fast path extended (currently 64/128) or
+   the SDPA site -- measure first, the 16 layers may be minor at decode.
+4. Step ledger targets: quantized bytes/step ~9.2 GiB post-native-IQ
+   (~20 ms at stream rate) + GDN state traffic ~0.6 GiB (~1.3 ms) +
+   dispatch (goal: one command buffer, <1 ms host) => plain decode
+   ceiling ~30-40 tok/s, matching llama.cpp's 35.67 which serves the
+   same bytes with the same hardware.
+5. Order of perf work: (a) fused GDN step emit chain (the 8.7x), (b)
+   native IQ1_M/IQ2_S/IQ3_S decode (the 2.3x bytes), (c) head_dim-256
+   paged attention, (d) spec verify-band tuning (M=8 falls below the
+   muse sm-band's 9-row floor; either extend qgemm_sm variants to M=8
+   or pad).

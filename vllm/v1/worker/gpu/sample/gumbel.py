@@ -105,6 +105,61 @@ def apply_temperature(
     )
 
 
+# splitmix64 constants as signed int64 (torch integer arithmetic wraps mod
+# 2**64, so the bit patterns match the unsigned reference).
+_SM64_GAMMA = 0x9E3779B97F4A7C15 - (1 << 64)
+_SM64_M1 = 0xBF58476D1CE4E5B9 - (1 << 64)
+_SM64_M2 = 0x94D049BB133111EB - (1 << 64)
+
+
+def _lshr64(z: torch.Tensor, k: int) -> torch.Tensor:
+    """Logical (zero-fill) right shift for int64 tensors."""
+    return (z >> k) & ((1 << (64 - k)) - 1)
+
+
+def _splitmix64(x: torch.Tensor) -> torch.Tensor:
+    z = x + _SM64_GAMMA
+    z = (z ^ _lshr64(z, 30)) * _SM64_M1
+    z = (z ^ _lshr64(z, 27)) * _SM64_M2
+    return z ^ _lshr64(z, 31)
+
+
+def mix64_int(a: int, b: int) -> int:
+    """Python-int splitmix64 mix of two 64-bit values (for CPU generators)."""
+    mask = (1 << 64) - 1
+
+    def mix(x: int) -> int:
+        x = (x + 0x9E3779B97F4A7C15) & mask
+        x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & mask
+        return x ^ (x >> 31)
+
+    return mix(mix(a & mask) ^ (b & mask))
+
+
+def stateless_uniform_2d(
+    seed: torch.Tensor,  # [rows] int64
+    pos: torch.Tensor,  # [rows] int64
+    n: int,
+) -> torch.Tensor:
+    """Deterministic uniforms in (0, 1), keyed by (seed, pos, column).
+
+    Counter-based replacement for Triton's stateless Philox on devices
+    without Triton (MPS): same (seed, pos) always yields the same row of
+    noise, so per-request seeded sampling is reproducible across repeats
+    and boots. Not bit-identical to the CUDA/Triton Philox stream, which
+    no correctness gate requires; determinism and independence are what
+    matter here.
+    """
+    row_key = _splitmix64(_splitmix64(seed.to(torch.int64)) ^ pos.to(torch.int64))
+    idx = torch.arange(n, dtype=torch.int64, device=seed.device)
+    z = _splitmix64(row_key.unsqueeze(1) + idx.unsqueeze(0) * _SM64_GAMMA)
+    # Top 24 bits -> [0, 1), then clamp away exact zero (matching the
+    # includes_zero=False contract of tl_rand32).
+    u = _lshr64(z, 40).to(torch.float32) * (1.0 / (1 << 24))
+    return u.clamp_(min=1.0 / (1 << 24))
+
+
 @triton.jit
 def tl_rand64(seed, offset, includes_zero: tl.constexpr):
     lo, hi, _, _ = tl.randint4x(seed, offset)
@@ -291,10 +346,19 @@ def gumbel_sample(
         if bool(greedy.all().cpu()):
             sampled = greedy_sampled
         else:
-            # MPS does not expose Triton's stateless Philox primitive. This
-            # path preserves sampling semantics; explicit per-request seed
-            # parity remains provided by the native CUDA/HIP kernels.
-            gumbel = -torch.empty_like(processed).exponential_().log()
+            # Stateless (seed, pos)-keyed Gumbel noise, mirroring the Triton
+            # kernel's semantics (splitmix64 counter stream instead of Philox
+            # -- deterministic per request, not bit-identical to CUDA). The
+            # previous torch fallback drew from the unseeded global RNG,
+            # which silently ignored per-request seeds: same-seed repeats
+            # diverged at the first position with sampling entropy.
+            row_seeds = seed[req_indices]
+            row_pos = pos.to(torch.int64)
+            u = stateless_uniform_2d(row_seeds, row_pos, vocab_size)
+            # Same tail trick as the Triton kernel: -log(-log1p(-u)) keeps
+            # the argmax-deciding large-noise tail in fp32's well-resolved
+            # region near u -> 0.
+            gumbel = -torch.log(-torch.log1p(-u))
             random_sampled = (processed + gumbel).argmax(dim=-1)
             sampled = torch.where(greedy, greedy_sampled, random_sampled)
 
