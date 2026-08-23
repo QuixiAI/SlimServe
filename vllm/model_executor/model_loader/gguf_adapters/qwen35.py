@@ -30,6 +30,7 @@ perf/qwen38_metal_design.md):
 from collections.abc import Iterable
 
 import gguf
+import regex as re
 import torch
 
 from vllm.config import ModelConfig
@@ -41,11 +42,12 @@ from .default import GGUFWeightsAdapter
 
 logger = init_logger(__name__)
 
-# Formats with no Metal kernel at all (neither qgemv nor the qgemm tile).
-# Dequantized to fp16 at load until native decode lands per format. IQ1_S,
-# IQ2_XS, IQ3_XXS and IQ4_XS stay quantized: qgemm.metal carries tiles for
-# them, routed via METAL_MMQ_QUANT_TYPES.
-_DEQUANT_TYPES = frozenset({"IQ1_M", "IQ2_S", "IQ3_S"})
+# Formats with no Metal kernel at all (neither qgemv nor the qgemm tile),
+# dequantized to fp16 at load. Empty since IQ2_S/IQ3_S/IQ1_M landed native
+# Metal decode (dequant.metal + qgemv/qgemm instantiations, routed via
+# MMVQ_QUANT_TYPES / METAL_MMQ_QUANT_TYPES); every GGUF format in this model
+# now stays quantized. Only embed_tokens still dequantizes (see below).
+_DEQUANT_TYPES: frozenset[str] = frozenset()
 
 _COMMON_BLK_RENAMES = {
     "attn_norm.weight": "input_layernorm.weight",
@@ -82,6 +84,40 @@ _TOP_RENAMES = {
     "output.weight": "lm_head.weight",
 }
 
+# --- mmproj (vision tower, qwen3vl_merger) -------------------------------
+# GGUF names verified against the real mmproj-F16 dump (334 tensors, see
+# perf/qwen38_metal_design.md). Module names land under the
+# Qwen3_5ForConditionalGeneration tree (models/qwen3_5_vision.py).
+
+_V_BLK_RE = re.compile(r"^v\.blk\.(\d+)\.(.+?)\.(weight|bias)$")
+
+_VISION_BLK_RENAMES = {
+    "ln1": "norm1",
+    "ln2": "norm2",
+    "attn_qkv": "attn.qkv",
+    "attn_out": "attn.proj",
+    "ffn_up": "mlp.linear_fc1",
+    "ffn_down": "mlp.linear_fc2",
+}
+
+_VISION_TOP_RENAMES = {
+    "v.patch_embd.bias": "visual.patch_embed.proj.bias",
+    "v.position_embd.weight": "visual.pos_embed.weight",
+    # llama.cpp's conversion maps `visual.merger.norm` to V_POST_NORM: the
+    # GGUF's post_ln IS the merger's pre-shuffle LayerNorm.
+    "v.post_ln.weight": "visual.merger.norm.weight",
+    "v.post_ln.bias": "visual.merger.norm.bias",
+    "mm.0.weight": "visual.merger.linear_fc1.weight",
+    "mm.0.bias": "visual.merger.linear_fc1.bias",
+    "mm.2.weight": "visual.merger.linear_fc2.weight",
+    "mm.2.bias": "visual.merger.linear_fc2.bias",
+}
+
+# The two temporal conv taps (still images duplicate the frame, so the
+# taps are summed by construction); reassembled into the [out, C, T, P, P]
+# Conv3d layout flattened for the Linear patch embed.
+_PATCH_EMBD_TAPS = ("v.patch_embd.weight", "v.patch_embd.weight.1")
+
 
 class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     """The qwen35 hybrid target GGUF (dense Qwen3.5 family)."""
@@ -95,7 +131,14 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         text_config = (
             config.get_text_config() if hasattr(config, "get_text_config") else config
         )
-        name_map = dict(_TOP_RENAMES)
+        # When the mmproj was found the config is the composite
+        # Qwen3_5ForConditionalGeneration; the text half lives under
+        # `language_model.` (Muse-Glimmer pattern).
+        multimodal = getattr(config, "vision_config", None) is not None
+        prefix = "language_model." if multimodal else ""
+        name_map: dict[str, str] = {}
+        for gguf_name, hf_name in _TOP_RENAMES.items():
+            name_map[gguf_name] = prefix + hf_name
         for idx, layer_type in enumerate(text_config.layer_types):
             per_layer = dict(_COMMON_BLK_RENAMES)
             if layer_type == "full_attention":
@@ -103,7 +146,9 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             else:
                 per_layer.update(_LINEAR_ATTN_BLK_RENAMES)
             for gguf_part, hf_part in per_layer.items():
-                name_map[f"blk.{idx}.{gguf_part}"] = f"model.layers.{idx}.{hf_part}"
+                name_map[f"blk.{idx}.{gguf_part}"] = (
+                    f"{prefix}model.layers.{idx}.{hf_part}"
+                )
         # blk.{num_hidden_layers}.* (the MTP/NextN block) stays unmapped on
         # purpose: the weight iterator skips tensors absent from the map.
         return name_map
@@ -207,6 +252,61 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                 yield from split_qkv(name, weight)
                 continue
             yield name, weight
+
+        if getattr(model_config.hf_config, "vision_config", None) is not None:
+            yield from self._vision_weights()
+
+    def _vision_weights(self) -> Iterable[tuple[str, torch.Tensor]]:
+        """Stream the mmproj tower dequantized to torch dtypes.
+
+        The file is all F16/F32; the tower runs as plain unquantized
+        modules (the Muse-Glimmer `_vision_weights` pattern). Every tensor
+        must map; unmapped names hard-raise.
+        """
+        from vllm.transformers_utils.gguf_native import find_mmproj
+
+        assert self.load_spec is not None
+        mmproj = find_mmproj(self.load_spec.weights_source[0])
+        if mmproj is None:
+            raise RuntimeError(
+                "vision_config is set but no mmproj*.gguf was found beside "
+                f"{self.load_spec.weights_source[0]}"
+            )
+        logger.info("Loading Qwen3.5 vision tower from %s", mmproj.name)
+        taps: dict[str, torch.Tensor] = {}
+        count = 0
+        for tensor in gguf_reader(str(mmproj)).tensors:
+            value = torch.from_numpy(
+                gguf.quants.dequantize(tensor.data, tensor.tensor_type)
+            )
+            count += 1
+            if tensor.name in _PATCH_EMBD_TAPS:
+                taps[tensor.name] = value
+                continue
+            match = _V_BLK_RE.match(tensor.name)
+            if match:
+                idx, part, suffix = match.groups()
+                if part not in _VISION_BLK_RENAMES:
+                    raise RuntimeError(f"unmapped mmproj tensor {tensor.name}")
+                hf = f"visual.blocks.{idx}.{_VISION_BLK_RENAMES[part]}.{suffix}"
+            elif tensor.name in _VISION_TOP_RENAMES:
+                hf = _VISION_TOP_RENAMES[tensor.name]
+            else:
+                raise RuntimeError(f"unmapped mmproj tensor {tensor.name}")
+            yield hf, value
+        if set(taps) != set(_PATCH_EMBD_TAPS):
+            raise RuntimeError(
+                f"mmproj patch-embed taps incomplete: found {sorted(taps)}"
+            )
+        # [out, C, P, P] per tap -> [out, C, T, P, P] -> flattened Linear
+        # rows [C, T, P, P] (llama.cpp conversion/qwen3vl.py splits the HF
+        # Conv3d weight at dim 2, so stacking at dim 2 restores it).
+        fused = torch.stack([taps[name] for name in _PATCH_EMBD_TAPS], dim=2)
+        yield (
+            "visual.patch_embed.proj.weight",
+            fused.reshape(fused.shape[0], -1),
+        )
+        logger.info("Loaded %d vision tensors from mmproj", count)
 
     def transform_weight(self, hf_name: str, weight: torch.Tensor) -> torch.Tensor:
         if hf_name.endswith("linear_attn.conv1d.weight") and weight.dim() == 2:

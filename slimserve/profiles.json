@@ -463,10 +463,10 @@
         },
         "engine": {
           "method": "dflash",
-          "num_speculative_tokens": 7,
+          "num_speculative_tokens": 3,
           "quantization": "gguf"
         },
-        "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; upstream vLLM launches it as method dflash with num_speculative_tokens 7."
+        "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], trained with block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; the Metal profile uses the first 3 draft positions because its M=4 verify kernel is faster on both retained text arms than verifying all 7 drafts."
       }
     }
   },
@@ -1230,9 +1230,6 @@
       "platforms": [
         "metal"
       ],
-      "status": "in-progress",
-      "status_reason": "Qwen3.5-family hybrid attention has no Metal path yet",
-      "status_detail": "Qwen3.8-27B interleaves 48 gated-deltanet linear-attention layers with 16 full-attention layers (qwen3_5 architecture); this fork has neither the qwen3_5 model classes nor Metal kernels for the linear-attention state update, and the DFlash 2 drafter needs the new selector and convolution modules. The CLI keeps this profile gated until the serving path is exercised end to end.",
       "default_quant": "q2kxl",
       "summary": "Vision-language 27B hybrid-attention model on a single Apple Silicon machine, sized by unified memory. Unsloth dynamic Q2_K_XL fits a 48 GB Mac with a 12 GiB KV pool.",
       "engine": {
@@ -1253,11 +1250,13 @@
         "kv_cache_dtype": "auto"
       },
       "speculative": true,
-      "env": {},
+      "env": {
+        "VLLM_USE_V2_MODEL_RUNNER": "1"
+      },
       "notes": [
         "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
         "Vision: qwen3_5_vision tower, 27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens, loaded from the published mmproj-F16 GGUF.",
-        "DFlash 2 speculation is on by default: the drafter proposes one 8-token block per call against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. Vendor mean acceptance 4.80; rejection sampling keeps output identical to plain decode.",
+        "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
         "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
         "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
       ]

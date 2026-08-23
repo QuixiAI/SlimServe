@@ -493,6 +493,19 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def kv_cache_gather_range(
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        token_start: int,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a logical token range with 64-bit hybrid-cache offsets."""
+        return _qc().kv_cache_gather_range(
+            key_cache, value_cache, block_table, token_start, num_tokens
+        )
+
+    @staticmethod
     def paged_attention_verify(
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -988,6 +1001,35 @@ class quixicore_ops:
         _qc().prepare_dflash_inputs(*args, **kwargs)
 
     @staticmethod
+    def dflash2_two_tap_conv(
+        x: torch.Tensor,
+        coeffs: torch.Tensor,
+        base: torch.Tensor,
+        side: int,
+        block_size: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Block-local dynamic two-tap convolution for DFlash 2 (Metal)."""
+        return _qc().dflash2_two_tap_conv(x, coeffs, base, side, block_size, group_size)
+
+    @staticmethod
+    def qwen_gdn_gated_norm(
+        x: torch.Tensor, z: torch.Tensor, w: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        """Fused RMSNormGated (norm_before_gate, silu) for the GDN output (Metal)."""
+        return _qc().qwen_gdn_gated_norm(x, z, w, eps)
+
+    @staticmethod
+    def qwen_gdn_step(*args, **kwargs) -> None:
+        """Fused Qwen3.5 GDN decode/verify step (Metal).
+
+        Conv window update + gated delta-rule scan over S positions per
+        sequence with per-position state stores; replaces the torch-native
+        MPS loop in qwen_gdn_linear_attn.py (which remains the oracle).
+        """
+        _qc().qwen_gdn_step(*args, **kwargs)
+
+    @staticmethod
     def mla_decode_bf16_sparse_glm(
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -1239,6 +1281,33 @@ class quixicore_ops:
             seed,
             pos,
             vocab_num_blocks,
+        )
+
+    @staticmethod
+    def qwen38_rejection_sample(
+        target_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        pos: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_speculative_steps: int,
+        vocab_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-dispatch lossless rejection sampler for Metal."""
+        return _qc().qwen38_rejection_sample(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            temperature,
+            seeds,
+            num_speculative_steps,
+            vocab_size,
         )
 
     @staticmethod

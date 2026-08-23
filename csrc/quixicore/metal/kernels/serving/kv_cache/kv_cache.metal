@@ -101,6 +101,56 @@ kernel void kv_cache_gather(device const T *key_cache [[buffer(0)]],
     }
 }
 
+// Gather one contiguous logical token range from a single request. Unlike
+// kv_cache_gather above, cache_block_stride is explicit: hybrid attention /
+// recurrent models interleave each block's K and V pages in one allocation,
+// so successive K (or V) blocks are separated by two pages. All cache address
+// arithmetic is 64-bit because a large Metal cache can cross 2^31 elements;
+// MPS index_select silently wraps there.
+template <typename T>
+kernel void kv_cache_gather_range(
+    device const T *key_cache [[buffer(0)]],
+    device const T *value_cache [[buffer(1)]],
+    device T *key_out [[buffer(2)]],
+    device T *value_out [[buffer(3)]],
+    device const int *block_table [[buffer(4)]],
+    constant int &token_start [[buffer(5)]],
+    constant int &num_tokens [[buffer(6)]],
+    constant int &num_blocks [[buffer(7)]],
+    constant int &block_size [[buffer(8)]],
+    constant int &num_heads [[buffer(9)]],
+    constant int &head_size [[buffer(10)]],
+    constant long &cache_block_stride [[buffer(11)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    if ((int)token >= num_tokens) {
+        return;
+    }
+
+    const int logical_token = token_start + (int)token;
+    const int table_col = logical_token / block_size;
+    const int block_offset = logical_token - table_col * block_size;
+    const int block = block_table[table_col];
+    const int row_elems = num_heads * head_size;
+    const long out_base = (long)token * row_elems;
+
+    if (block < 0 || block >= num_blocks) {
+        for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+            key_out[out_base + i] = T(0);
+            value_out[out_base + i] = T(0);
+        }
+        return;
+    }
+
+    const long cache_base =
+        (long)block * cache_block_stride + (long)block_offset * row_elems;
+    for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+        key_out[out_base + i] = key_cache[cache_base + i];
+        value_out[out_base + i] = value_cache[cache_base + i];
+    }
+}
+
 template <typename T>
 kernel void kv_cache_clone(device const T *key_cache [[buffer(0)]],
                            device const T *value_cache [[buffer(1)]],
@@ -1120,6 +1170,23 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
                      uint token [[threadgroup_position_in_grid]],             \
                      uint tid [[thread_position_in_threadgroup]],             \
                      uint tptg [[threads_per_threadgroup]]);                  \
+  template [[host_name("kv_cache_gather_range_" #type_name)]] [[kernel]] void \
+  kv_cache_gather_range<T>(                                                   \
+      device const T *key_cache [[buffer(0)]],                                \
+      device const T *value_cache [[buffer(1)]],                              \
+      device T *key_out [[buffer(2)]],                                        \
+      device T *value_out [[buffer(3)]],                                      \
+      device const int *block_table [[buffer(4)]],                            \
+      constant int &token_start [[buffer(5)]],                                \
+      constant int &num_tokens [[buffer(6)]],                                 \
+      constant int &num_blocks [[buffer(7)]],                                 \
+      constant int &block_size [[buffer(8)]],                                 \
+      constant int &num_heads [[buffer(9)]],                                  \
+      constant int &head_size [[buffer(10)]],                                 \
+      constant long &cache_block_stride [[buffer(11)]],                       \
+      uint token [[threadgroup_position_in_grid]],                            \
+      uint tid [[thread_position_in_threadgroup]],                            \
+      uint tptg [[threads_per_threadgroup]]);                                 \
   template [[host_name("kv_cache_clone_" #type_name)]] [[kernel]] void       \
   kv_cache_clone<T>(device const T *key_cache [[buffer(0)]],                  \
                     device const T *value_cache [[buffer(1)]],                \

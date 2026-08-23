@@ -305,7 +305,16 @@ class MambaHybridModelState(DefaultModelState):
             # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
             # kernel skips them rather than scattering with a host-side gather.
             n = idx_mapping.shape[0]
-            if n:
+            if n and self.device.type == "mps":
+                # Torch-native fallback (no Triton on Metal), mirroring
+                # _scatter_num_accepted_kernel.
+                valid = idx_mapping >= 0
+                self.num_accepted_tokens_gpu[idx_mapping[valid].to(torch.long)] = (
+                    torch.clamp(num_sampled[:n][valid], min=1).to(
+                        self.num_accepted_tokens_gpu.dtype
+                    )
+                )
+            elif n:
                 _scatter_num_accepted_kernel[(n,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
                 )

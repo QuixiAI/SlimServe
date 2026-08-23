@@ -165,6 +165,82 @@ struct iq1_s {
     }
 };
 
+// ---- iq2_s : E8-lattice 2.5625 bpw. { half d; uint8 qs[64]; uint8 qh[8]; uint8 scales[8]; }
+//   = 82 bytes, 256 weights. qs[0..31] = low 8 bits of the grid indices (4 per block-of-32),
+//   qs[32..63] = EXPLICIT sign bytes (one per group of 8, no ksigns codebook); qh adds 2 high
+//   index bits per group (10-bit iq2s_grid, 1024 entries); 4-bit per-half scale as iq2_xs.
+//   (ggml-quants dequantize_row_iq2_s.) ----
+struct iq2_s {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 82;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs     = base + 2;    // 32 index bytes
+        device const uchar* signs  = base + 34;   // 32 sign bytes
+        device const uchar* qh     = base + 66;   // 8 bytes: 2 high bits x 4 groups
+        device const uchar* scales = base + 74;   // 8 bytes
+        const int ib32 = col >> 5, p = col & 31, g = p >> 3, elem = p & 7;
+        const uint gi = (uint)qs[4 * ib32 + g] | (((uint)qh[ib32] << (8 - 2 * g)) & 0x300u);
+        const int sc = (scales[ib32] >> (4 * (g >> 1))) & 0xF;
+        const half dl = d * (0.5h + half(sc)) * 0.25h;
+        const uint gv = (uint)((iq2s_grid[gi] >> (8 * elem)) & 0xffUL);
+        const half sgn = (signs[4 * ib32 + g] & kmask_iq2xs[elem]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq3_s : 3.4375 bpw. { half d; uint8 qs[64]; uint8 qh[8]; uint8 signs[32]; uint8 scales[4]; }
+//   = 110 bytes, 256 weights. 8 grid-index bytes per block-of-32 (iq3s_grid, 512 uint32 entries of
+//   4 magnitudes); the 9th index bit comes from qh (bit m of qh[ib32] for index byte m); explicit
+//   sign bytes (one per group of 8); 4-bit scale per PAIR of blocks-of-32, dl = d*(1+2*sc).
+//   (ggml-quants dequantize_row_iq3_s.) ----
+struct iq3_s {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 110;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs     = base + 2;    // 64 index bytes
+        device const uchar* qh     = base + 66;   // 8 bytes: 1 high bit x 8 index bytes
+        device const uchar* signs  = base + 74;   // 32 sign bytes
+        device const uchar* scales = base + 106;  // 4 bytes
+        const int ib32 = col >> 5, p = col & 31, l = p >> 3, j = p & 7;
+        const int m = 2 * l + (j >> 2);           // which of the 8 index bytes of this block-of-32
+        const uint gi = (uint)qs[8 * ib32 + m] | (((uint)qh[ib32] << (8 - m)) & 256u);
+        const int sc = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xF;
+        const half dl = d * half(1 + 2 * sc);
+        const uint gv = (iq3s_grid[gi] >> (8 * (j & 3))) & 0xffu;
+        const half sgn = (signs[4 * ib32 + l] & kmask_iq2xs[j]) ? -1.0h : 1.0h;
+        return dl * half(gv) * sgn;
+    }
+};
+
+// ---- iq1_m : 1.75 bpw. { uint8 qs[32]; uint8 qh[16]; uint8 scales[8]; } = 56 bytes, 256 weights.
+//   NO standalone d: the fp16 super-scale is reassembled from the top 4 bits of the four 16-bit
+//   scale words. 3-bit sub-scales (one per half-of-32); per-group-of-8 grid high bits + delta-sign
+//   bit packed as qh nibbles; iq1s_grid_gpu nibble grid (value = dl*(nib-1 ± IQ1M_DELTA)).
+//   (ggml-quants dequantize_row_iq1_m / gguf-py IQ1_M.) ----
+struct iq1_m {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 56;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar*  qs = base;
+        device const uchar*  qh = base + 32;
+        device const ushort* sc = (device const ushort*)(base + 48);
+        const ushort su = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                          ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+        const half d = as_type<half>(su);
+        const int ib32 = col >> 5, p = col & 31, g = p >> 3, j = p & 7;
+        const int ssh = 6 * (ib32 & 1) + 3 * (g >> 1);      // 3-bit sub-scale shift
+        const half dl = d * half(2 * ((sc[ib32 >> 1] >> ssh) & 7) + 1);
+        const uint h = ((uint)qh[2 * ib32 + (g >> 1)] >> (4 * (g & 1))) & 0xFu;
+        const uint gi = (uint)qs[4 * ib32 + g] | ((h & 7u) << 8);
+        const half ml = dl * ((h & 8u) ? half(-1.0h - IQ1M_DELTA) : half(-1.0h + IQ1M_DELTA));
+        const uint b = (iq1s_grid_gpu[gi] >> (8 * (j & 3))) & 0xffu;
+        const uint nib = (j >= 4) ? (b >> 4) : (b & 0xFu);
+        return dl * half(nib) + ml;
+    }
+};
+
 // ---- q8_0 : { half d; int8 qs[32]; }  — 34 bytes, 32 weights/block, value = d * q ----
 struct q8_0 {
     constant static constexpr const int block_k     = 32;
@@ -1137,6 +1213,141 @@ METAL_FUNC void tk_dequant8<kU4>(device const uchar* base, int col0, thread half
     #pragma clang loop unroll(full)
     for (int i = 0; i < 8; ++i)
         w[i] = s * (half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - zp);
+}
+
+// ---- 8-wide i-quant span decoders. The generic tk_dequant8 calls the scalar
+// FMT::dequant once per element, re-reading the block header, recomputing the
+// sub-scale and re-walking the codebook eight times; every i-quant packs a
+// span of 8 into one (or two) codebook entries plus one sign byte, so the span
+// is decoded with a single header read, one scale and one lookup. Products
+// are formed in fp32 and rounded to half once (at or below the scalar
+// decoders' error against the fp32 reference). ----
+template<>
+METAL_FUNC void tk_dequant8<iq1_s>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const uchar* qs = base + 2;
+    device const ushort* qh = (device const ushort*)(base + 34);
+    const int ib32 = col0 >> 5, p = col0 & 31, il = p >> 4, hi8 = (p >> 3) & 1;
+    device const uchar* qsp = qs + 4 * ib32 + 2 * il;
+    const ushort qhv = qh[ib32];
+    const float dl = float(d) * float(2 * ((qhv >> 12) & 7) + 1);
+    const float ml = dl * ((qhv & 0x8000) ? (-1.0f - IQ1S_DELTA) : (-1.0f + IQ1S_DELTA));
+    const uint h = (uint)(qhv >> (6 * il));
+    const uint gi = hi8 == 0 ? (qsp[0] | ((h << 8) & 0x700)) : (qsp[1] | ((h << 5) & 0x700));
+    const uint g = iq1s_grid_gpu[gi];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 4; ++i) {
+        const uint b = (g >> (8 * i)) & 0xff;
+        w[i]     = half(dl * float(b & 0xF) + ml);
+        w[4 + i] = half(dl * float(b >> 4) + ml);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq2_xxs>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const ushort* qs = (device const ushort*)(base + 2);
+    const int ib32 = col0 >> 5, p = col0 & 31, sub = p >> 3;
+    device const ushort* q2 = qs + 4 * ib32;
+    const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+    const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+    const uint g = (aux_g >> (8 * sub)) & 0xff;
+    const ulong gv8 = iq2xxs_grid[g];
+    const uchar signs = ksigns_iq2xs[(aux_s >> (7 * sub)) & 127];
+    const float dl = float(d) * (0.5f + float((aux_s >> 28) & 0xf)) * 0.25f;
+    #pragma clang loop unroll(full)
+    for (int e = 0; e < 8; ++e) {
+        const uint gv = (uint)((gv8 >> (8 * e)) & 0xffUL);
+        const float sgn = (signs & kmask_iq2xs[e]) ? -1.0f : 1.0f;
+        w[e] = half(dl * float(gv) * sgn);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq2_xs>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const ushort* qs = (device const ushort*)(base + 2);
+    device const uchar* scales = base + 66;
+    const int ib32 = col0 >> 5, p = col0 & 31, il = p >> 4, sub2 = (p & 15) >> 3;
+    const ushort idx16 = qs[4 * ib32 + 2 * il + sub2];
+    const ulong gv8 = iq2xs_grid[idx16 & 511];
+    const uchar signs = ksigns_iq2xs[idx16 >> 9];
+    const int sc = (scales[ib32] >> (4 * il)) & 0xF;
+    const float dl = float(d) * (0.5f + float(sc)) * 0.25f;
+    #pragma clang loop unroll(full)
+    for (int e = 0; e < 8; ++e) {
+        const uint gv = (uint)((gv8 >> (8 * e)) & 0xffUL);
+        const float sgn = (signs & kmask_iq2xs[e]) ? -1.0f : 1.0f;
+        w[e] = half(dl * float(gv) * sgn);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq2_s>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const uchar* qs     = base + 2;
+    device const uchar* signs  = base + 34;
+    device const uchar* qh     = base + 66;
+    device const uchar* scales = base + 74;
+    const int ib32 = col0 >> 5, p = col0 & 31, g = p >> 3;
+    const uint gi = (uint)qs[4 * ib32 + g] | (((uint)qh[ib32] << (8 - 2 * g)) & 0x300u);
+    const int sc = (scales[ib32] >> (4 * (g >> 1))) & 0xF;
+    const float dl = float(d) * (0.5f + float(sc)) * 0.25f;
+    const ulong gv8 = iq2s_grid[gi];
+    const uchar sb = signs[4 * ib32 + g];
+    #pragma clang loop unroll(full)
+    for (int e = 0; e < 8; ++e) {
+        const uint gv = (uint)((gv8 >> (8 * e)) & 0xffUL);
+        const float sgn = (sb & kmask_iq2xs[e]) ? -1.0f : 1.0f;
+        w[e] = half(dl * float(gv) * sgn);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq3_xxs>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const uchar* qs = base + 2;
+    const int ib32 = col0 >> 5, p = col0 & 31, il = p >> 4, r0 = (p & 15) >> 2;
+    device const uchar* q3 = qs + 8 * ib32;
+    device const ushort* gas = (device const ushort*)(qs + 64) + 2 * ib32;
+    const uint aux32 = (uint)gas[0] | ((uint)gas[1] << 16);
+    const uint g0 = iq3xxs_grid[q3[4 * il + r0]];
+    const uint g1 = iq3xxs_grid[q3[4 * il + r0 + 1]];
+    const uchar signs = ksigns_iq2xs[(aux32 >> (14 * il + 7 * (r0 >> 1))) & 127];
+    const float dl = float(d) * (0.5f + float(aux32 >> 28)) * 0.5f;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 4; ++i) {
+        const float s0 = (signs & kmask_iq2xs[i]) ? -1.0f : 1.0f;
+        const float s1 = (signs & kmask_iq2xs[4 + i]) ? -1.0f : 1.0f;
+        w[i]     = half(dl * float((g0 >> (8 * i)) & 0xff) * s0);
+        w[4 + i] = half(dl * float((g1 >> (8 * i)) & 0xff) * s1);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq3_s>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    device const uchar* qs     = base + 2;
+    device const uchar* qh     = base + 66;
+    device const uchar* signs  = base + 74;
+    device const uchar* scales = base + 106;
+    const int ib32 = col0 >> 5, p = col0 & 31, l = p >> 3;
+    const int m0 = 2 * l;
+    const uint qhb = (uint)qh[ib32];
+    const uint gi0 = (uint)qs[8 * ib32 + m0] | ((qhb << (8 - m0)) & 256u);
+    const uint gi1 = (uint)qs[8 * ib32 + m0 + 1] | ((qhb << (8 - m0 - 1)) & 256u);
+    const int sc = (scales[ib32 >> 1] >> (4 * (ib32 & 1))) & 0xF;
+    const float dl = float(d) * float(1 + 2 * sc);
+    const uint g0 = iq3s_grid[gi0];
+    const uint g1 = iq3s_grid[gi1];
+    const uchar sb = signs[4 * ib32 + l];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 4; ++i) {
+        const float s0 = (sb & kmask_iq2xs[i]) ? -1.0f : 1.0f;
+        const float s1 = (sb & kmask_iq2xs[4 + i]) ? -1.0f : 1.0f;
+        w[i]     = half(dl * float((g0 >> (8 * i)) & 0xffu) * s0);
+        w[4 + i] = half(dl * float((g1 >> (8 * i)) & 0xffu) * s1);
+    }
 }
 
 template<>
