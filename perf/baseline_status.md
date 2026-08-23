@@ -174,6 +174,15 @@ baseline, not a completed optimization target. Raw results are in
   degrade, extend pinning to the KV pool and post-boot allocations.
 - Source notes: `perf/optimization_status.md` 2026-08-11 entries
   (esp. "Task #14 LANDED"), `perf/metal_m1ultra_campaign_v2.md`.
+Live-smoke regression note (2026-08-23; not a replacement baseline): the exact
+registered `dsv4-xxs-1` profile reached health after loading 93.63 GiB, but its
+first tiny text request ran at about 0.1 generation tok/s and had accepted 0
+of 5 drafted tokens after several minutes. The request was terminated after
+about 12 minutes. Until that first-step/verify regression is fixed and the
+exact workload is repeated, the 33.684 tok/s row above is a historical
+correctness-qualified comparison point, not evidence that today's registered
+profile is healthy. Raw log:
+`perf/results/2026-08-23/qwen38-kv-gather/smoke-all/dsv4-xxs-1.log`.
 
 ### Ampere A100 TP2
 
@@ -758,3 +767,136 @@ boot_*.log).
 - Raw artifacts: perf/results/2026-08-17/decode_exact_gate/
   (boot.log, 8tok.json, off1-2000.json, 2500x64.json with full response
   text).
+## Muse-Glimmer-30B (Metal, M5 Max 128 GB)
+
+### Speculative Serving Baseline - 2026-08-14
+
+- Profile: `muse-kdyn-1` (kquant-dynamic GGUF, DFlash k=16, spec always on).
+- Workload: 256-token greedy essay bench (`muse_bench.py`), port 8078,
+  warmup + 3 runs; first-run number is the matched-position comparison
+  point (chassis declines thermally across a triplet).
+- Verify GEMMs route to tensor-ops kernels (`qgemm_sm_t`, variant 14) on
+  the M5 GPU neural accelerators; metallib at `-std=metal4.0`.
+
+| Metric | Value |
+| --- | ---: |
+| Spec-on decode (run 1/2/3) | 16.26 / 16.05 / 14.59 tok/s |
+| Plain fused decode (2026-08-13 ref) | 14.4 tok/s |
+| Acceptance | 1.73/draft (unchanged) |
+| llama.cpp same box (plain/spec best) | 26.75 / 30.8 tok/s |
+
+Spec-on now beats plain decode; the stale `--no-spec` advice was removed
+from `slimserve/profiles.json`. Raw artifacts:
+`perf/results/2026-08-14/tensor-mma/` and
+`perf/results/2026-08-14/qgemm-sm-profile/`.
+
+### Superseding Speculative Serving Baseline - 2026-08-15 (rested protocol)
+
+- Profile: `muse-kdyn-1`, fused verify default ON, tensor-ops kernel route.
+- Protocol: 45-min idle chassis, serve, 120 s settle, 3x256-token greedy
+  essay bench. This protocol replaces ad-hoc thermal states for all route
+  comparisons.
+
+| Metric | Value |
+| --- | ---: |
+| Spec-on decode (run 1/2/3) | 19.94 / 20.14 / 19.74 tok/s |
+| Same-protocol eager route reference | 17.81 / 17.56 / 17.58 tok/s |
+| Acceptance | 1.73/draft (unchanged) |
+
+Raw: `perf/results/2026-08-15/plain-step-decomp/e2e_fused_cool.txt` and
+`e2e_legacy_cool.txt`. Serving-side ceiling remains ~50-62 tok/s with the
+current drafter (see `perf/drafter_requirements.md` for the 100 tok/s
+drafter gate).
+
+### Long-Context Arm Added - 2026-08-15 (rested protocol, final build)
+
+| Metric | Value |
+| --- | ---: |
+| Short-ctx decode (run 1/2/3) | 19.97 / 19.97 / 19.86 tok/s |
+| 10k-ctx cached decode (run 2/3) | 10.97 / 11.00 tok/s |
+| Acceptance (mixed workload) | 1.66/draft |
+
+Long-context numbers reflect CORRECT global-layer attention (the eager
+window-clamp bug is fixed) plus the multi-query verify kernel inside the
+fused encoder. Bench discipline: decode from cached-prompt repeat runs
+only; long arms use this 10k form until a natural-document corpus arm
+lands. Raw: perf/results/2026-08-15/plain-step-decomp/e2e_final_rested.txt.
+
+## Qwen3.8-27B (qwen38-q2kxl-1, Metal M5 Max) - campaign started 2026-08-19
+
+### llama.cpp Reference Bar - 2026-08-20 (build-qwen38, master ece963f41)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode (run 1/2/3, matched positions) | 35.67 / 35.37 / 33.55 tok/s |
+| Plain decode, code prompt | 34.35 tok/s |
+| Greedy determinism (3 runs) | identical |
+
+SlimServe serving path is under construction (profile gated
+in-progress); no SlimServe baseline yet. Vendor DFlash 2 numbers for
+this pairing: mean acceptance 4.80 at block 8, 2.7-3.4x over plain at
+batch 1 => the spec target implied by the llama.cpp step time is
+~90-120 tok/s. Raw: perf/results/2026-08-20/qwen38-llamacpp-ref/.
+
+### First SlimServe Baseline - 2026-08-20 (plain decode, bring-up build)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode (run 1/2/3) | 2.52 / 2.51 / 2.47 tok/s |
+| Greedy parity vs llama.cpp | 504 chars identical, then forks (fp16 dequant numerics) |
+| Layer parity vs llama.cpp | all 64 layers cos >= 0.9997 |
+
+Known-attributed gap vs the 35.67 llama.cpp bar: sequential-python GDN
+scan (dispatch-bound ~8.7x) + fp16 dequant bytes (2.3x). Raw:
+perf/results/2026-08-20/qwen38-first-e2e/.
+
+NOTE 2026-08-20: the "plain decode 2.52/2.51/2.47" row above was measured
+at temperature 0, which is not a served configuration (greedy is banned
+stack-wide -- user directive; see notebook (20)). Step-time attribution
+stands; the protocol going forward is the model's shipped sampling
+defaults (temp 1.0 / top_p 0.95 / top_k 20), seeded. Re-baseline lands
+with the speculation measurements.
+
+### Correctness-Complete Build - 2026-08-20 evening (V2 runner, native IQ, layout fix)
+
+| Metric | Value |
+| --- | ---: |
+| Plain decode, essay (run 1/2/3) | 15.26 / 14.98 / 14.82 tok/s |
+| Plain decode, GSM8K-style | 14.44 / 14.00 / 13.43 tok/s |
+| Spec decode, essay | 4.06 / 3.80 / 3.50 tok/s (OPEN BUG: < plain) |
+| Spec decode, GSM8K-style | 9.45 / 7.97 / 8.65 tok/s (OPEN BUG: < plain) |
+| Spec acceptance, essay (Prometheus, notebook 25) | 2.71 mean / 0.244 draft rate (beats llama.cpp dflash2-pr 2.51/0.219) |
+| Corruption gauntlet | 7/7 clean boots, 24/24 same-seed pairs identical |
+| Layer parity vs llama.cpp | all 64 layers cos >= 0.9997 |
+
+Sampling: shipped defaults (temp 1.0 / top_p 0.95 / top_k 20), seed 42,
+in-process V2 runner, max_model_len 8192. llama.cpp plain bar: 35.67.
+Raw: perf/results/2026-08-20/qwen38-consolidated/. The 2.5 tok/s row
+above is superseded.
+
+### Supported SlimServe Baseline - 2026-08-23 (fused Metal stack, DFlash k=3)
+
+| Metric | Value |
+| --- | ---: |
+| Plain essay, 3x256 | 16.99 / 17.14 / 17.17 tok/s |
+| Spec essay, 3x256 | 23.27 / 23.74 / 23.06 tok/s |
+| Plain GSM8K-style, 3x256 | 16.77 / 16.86 / 16.81 tok/s |
+| Spec GSM8K-style, 3x256 | 34.33 / 35.25 / 34.78 tok/s |
+| Exact server, spec (128 in / 256 out, c1) | 18.646 tok/s |
+| Exact server, plain (128 in / 256 out, c1) | 15.913 tok/s |
+| Exact server spec advantage | 17.2% |
+
+Sampling is the shipped configuration (temperature 1.0, top-p 0.95, top-k
+20), seeded 42; greedy is not used. Offline rows use the V2 runner at
+max_model_len 8192 for matched short-context comparison. The exact-server pair
+uses the registered profile unchanged: 131072 max length, 12 GiB KV pool,
+DFlash 2 k=3, OpenAI completion endpoint, 8-token warmup. Both server arms
+honored exact token counts and produced healthy text. The real SlimServe server
+also passed text and deterministic image requests.
+
+Correctness: all 64 target layers remain cosine >=0.9997 against the llama.cpp
+activation oracle; fused GDN exhaustive suite 147/147; the 64-bit hybrid KV
+gather is exact before and beyond 2^31 source elements; 20 repeated speculative
+requests stay finite and token-stable across the former corruption window;
+final focused suite 17 passed and SlimServe suite 58 passed/1 skipped. Raw:
+`perf/results/2026-08-23/qwen38-kv-gather/`.

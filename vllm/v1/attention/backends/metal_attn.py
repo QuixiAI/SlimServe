@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.quixicore import quixicore_ops
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -169,6 +170,7 @@ class MetalAttentionImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.use_native_range_gather = quixicore_ops.has("kv_cache_gather_range")
 
         if sinks is not None:
             raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
@@ -201,12 +203,21 @@ class MetalAttentionImpl(AttentionImpl):
         self, metadata: MetalAttentionMetadata, num_tokens: int
     ) -> bool:
         q_len = metadata.max_query_len
-        return (
+        if not (
             metadata.causal
             and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
             and num_tokens == metadata.num_reqs * q_len
             and self.head_size in _PAGED_HEAD_SIZES
-        )
+        ):
+            return False
+        # Cached-prompt A/B at 1734-token context: expansion 16.1 tok/s vs
+        # SDPA gather 14.55 -- expansion wins at least through ~2k. The
+        # knob exists for larger-context research (the per-row KV re-read
+        # grows linearly and must cross over somewhere).
+        import os
+
+        ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
+        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
 
     def forward(
         self,
@@ -287,6 +298,34 @@ class MetalAttentionImpl(AttentionImpl):
                 expanded_block_table = attn_metadata.block_table.repeat_interleave(
                     q_len, dim=0
                 )
+                # Global (unwindowed) layers at length: the multi-query
+                # kernel shares each K/V read across the m rows (measured
+                # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
+                # expansion path (scan capped by the window -- a wash).
+                use_mq = (
+                    self.sliding_window is None
+                    and attn_metadata.num_reqs == 1
+                    and int(seq_lens.max().item()) > 1024
+                )
+                if use_mq:
+                    if not getattr(self, "_mq_logged", False):
+                        self._mq_logged = True
+                        logger.info(
+                            "multi-query verify attention engaged (ctx=%d)",
+                            int(seq_lens.max().item()),
+                        )
+                    out.copy_(
+                        quixicore_ops.paged_attention_verify(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            seq_lens,
+                            self.scale,
+                            0,
+                        )
+                    )
+                    return output
                 out.copy_(
                     quixicore_ops.paged_attention(
                         query[:num_tokens].contiguous(),
@@ -337,23 +376,49 @@ class MetalAttentionImpl(AttentionImpl):
             kv_start = 0
             if self.sliding_window is not None:
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
-            first_block = kv_start // block_size
-            blocks = (
-                metadata.block_table[req, first_block:num_req_blocks]
-                .to(torch.long)
-                # The profile run allocates a small dummy cache whose block
-                # table can point past it. That output is discarded; a real
-                # run never clamps.
-                .clamp_(0, num_blocks - 1)
-            )
             seq_len = min(seq_len, num_req_blocks * block_size)
-            row_start = kv_start - first_block * block_size
-            row_end = seq_len - first_block * block_size
 
-            keys = key_cache.index_select(0, blocks)
-            keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
-            values = value_cache.index_select(0, blocks)
-            values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+            if self.use_native_range_gather:
+                # MPS index_select uses signed 32-bit element offsets for this
+                # strided source. A hybrid cache page beyond 2^31 elements is
+                # therefore read from the wrong address. The native gather
+                # carries the physical block stride and all cache arithmetic
+                # in 64 bits; it also avoids materializing unused rows in the
+                # first/last page of a sliding-window request.
+                keys, values = quixicore_ops.kv_cache_gather_range(
+                    key_cache,
+                    value_cache,
+                    metadata.block_table[req],
+                    kv_start,
+                    seq_len - kv_start,
+                )
+            else:
+                first_block = kv_start // block_size
+                blocks = (
+                    metadata.block_table[req, first_block:num_req_blocks]
+                    .to(torch.long)
+                    # The profile run allocates a small dummy cache whose block
+                    # table can point past it. That output is discarded; a real
+                    # run never clamps.
+                    .clamp_(0, num_blocks - 1)
+                )
+                row_start = kv_start - first_block * block_size
+                row_end = seq_len - first_block * block_size
+                page_elems = block_size * num_kv_heads * head_size
+                if key_cache.stride(0) == 2 * page_elems:
+                    pages_view = key_cache.as_strided(
+                        (num_blocks, 2, block_size, num_kv_heads, head_size),
+                        (2 * page_elems, page_elems, *key_cache.stride()[1:]),
+                        key_cache.storage_offset(),
+                    )
+                    pages = pages_view.index_select(0, blocks)
+                    keys = pages[:, 0]
+                    values = pages[:, 1]
+                else:
+                    keys = key_cache.index_select(0, blocks)
+                    values = value_cache.index_select(0, blocks)
+                keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+                values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
 
             if self.num_queries_per_kv > 1:
                 keys = keys.repeat_interleave(self.num_queries_per_kv, dim=1)

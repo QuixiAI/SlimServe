@@ -85,10 +85,28 @@ DEQUANT_TYPES = (
 MMVQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | MXFP4_QUANT_TYPES
 )
-# IQ2_XXS is the only imatrix quant with a tile kernel. The rest of
-# IMATRIX_QUANT_TYPES stays vector-only, so it is listed on its own rather than
-# folding the whole set in.
+# IQ2_XXS is the only imatrix quant with a CUDA/HIP tile kernel. The rest of
+# IMATRIX_QUANT_TYPES stays vector-only there, so it is listed on its own
+# rather than folding the whole set in.
 MMQ_IMATRIX_QUANT_TYPES = {WeightType.IQ2_XXS}
 MMQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | MXFP4_QUANT_TYPES | MMQ_IMATRIX_QUANT_TYPES
+)
+# The Metal tile GEMM (qgemm.metal) decodes the full GGUF imatrix set
+# (dequant.metal tile decoders + qgemm/qgemm_frag instantiations).
+METAL_MMQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES
+    | KQUANT_TYPES
+    | MXFP4_QUANT_TYPES
+    | {
+        WeightType.IQ1_S,
+        WeightType.IQ1_M,
+        WeightType.IQ2_XXS,
+        WeightType.IQ2_XS,
+        WeightType.IQ2_S,
+        WeightType.IQ3_XXS,
+        WeightType.IQ3_S,
+        WeightType.IQ4_XS,
+        WeightType.IQ4_NL,
+    }
 )

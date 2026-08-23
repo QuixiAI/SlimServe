@@ -44,12 +44,16 @@ def _quixicore_disabled() -> bool:
 
 @cache
 def _use_native_dflash_inputs() -> bool:
-    """Prefer the native DFlash input-prep kernel over the Triton one."""
+    """Prefer the native DFlash input-prep kernel over the Triton one.
+
+    On Metal this replaces the per-request Python fallback loop (two
+    GPU->CPU syncs + ~25 small dispatches per propose) with one dispatch.
+    """
     if _quixicore_disabled():
         return False
     from vllm.platforms import current_platform
 
-    if not current_platform.is_cuda_alike():
+    if not (current_platform.is_cuda_alike() or current_platform.is_metal()):
         return False
     from vllm.quixicore import quixicore_ops
 
@@ -294,6 +298,40 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if hasattr(self.model, "select_draft_path"):
+            # DFlash 2: path-selector walk over the top-k candidates per
+            # position instead of independent per-position argmax. The
+            # anchor (bonus) token id sits at each block's first input row.
+            anchor_ids = self.input_buffers.input_ids[
+                : num_reqs * self.num_query_per_req : self.num_query_per_req
+            ]
+            if self.draft_logits is not None and hasattr(
+                self.model, "select_draft_path_sampled"
+            ):
+                # Serving path (draft_sample_method='probabilistic'): the
+                # sampled walk (llama.cpp PR #27342 host walk) draws each
+                # successor from softmax(scores/T) over the top-k and writes
+                # the sparse k-way distribution into draft_logits so
+                # rejection sampling stays lossless at any temperature.
+                req_idx = self.idx_mapping[:num_reqs].to(torch.long)
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path_sampled(
+                    sample_hidden_states,
+                    anchor_ids,
+                    self.temperature,
+                    self.idx_mapping[:num_reqs],
+                    self.draft_logits,
+                    seeds=self.seeds[req_idx],
+                    positions=self.sample_pos[:num_sample].view(
+                        num_reqs, self.num_speculative_steps
+                    ),
+                )
+            else:
+                # Greedy argmax walk (draft_sample_method='greedy'):
+                # verification is token-equality only.
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path(
+                    sample_hidden_states, anchor_ids
+                )
+            return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -480,6 +518,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=self.num_query_per_req,
             causal=self._group_causal,
         )
+        if not getattr(self, "_causal_logged", False):
+            self._causal_logged = True
+            per_layer = {
+                name: getattr(meta, "causal", "<no causal attr>")
+                for name, meta in (draft_attn_metadata or {}).items()
+            }
+            logger.info(
+                "DFlash draft attention causal flags: group_causal=%s, "
+                "per-layer metadata: %s",
+                self._group_causal,
+                per_layer,
+            )
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
             self.kv_cache_config,
@@ -688,7 +738,7 @@ def prepare_dflash_inputs(
     # per-request query length, not the total token count across the batch.
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
-    if input_buffers.input_ids.device.type == "mps":
+    if input_buffers.input_ids.device.type == "mps" and not _use_native_dflash_inputs():
         # Tensorized: num_sampled/num_rejected are GPU-only verify outputs, so
         # any loop control on them would drain the queue. Query rows are
         # contiguous ([req * num_query_per_req, ...)), so dense [R, Q] grids
@@ -707,9 +757,7 @@ def prepare_dflash_inputs(
         # Context section, per target token.
         seg = mps_segment_ids(qsl, num_reqs, num_target_tokens)
         ctx_pos = input_batch.positions[:num_target_tokens].to(torch.int64)
-        context_positions[:num_target_tokens].copy_(
-            ctx_pos.to(context_positions.dtype)
-        )
+        context_positions[:num_target_tokens].copy_(ctx_pos.to(context_positions.dtype))
         ctx_block = (ctx_pos // block_size).clamp(max=bt_stride - 1)
         ctx_block_ids = block_table_flat.index_select(
             0, seg * bt_stride + ctx_block
@@ -722,9 +770,9 @@ def prepare_dflash_inputs(
 
         # Per-request query grid.
         valid_ctx_end = qsl[1:] - num_rejected.to(torch.int64)
-        last_valid_pos = input_batch.positions.index_select(
-            0, valid_ctx_end - 1
-        ).to(torch.int64)
+        last_valid_pos = input_batch.positions.index_select(0, valid_ctx_end - 1).to(
+            torch.int64
+        )
         bonus_token = torch.where(
             num_sampled.to(torch.int64) > 0,
             last_sampled.reshape(-1).index_select(0, idx).to(torch.int64),
@@ -769,9 +817,7 @@ def prepare_dflash_inputs(
         )
         input_buffers.query_start_loc[num_reqs:].fill_(num_query_tokens)
         input_buffers.seq_lens[:num_reqs].copy_(
-            (last_valid_pos + 1 + num_query_per_req).to(
-                input_buffers.seq_lens.dtype
-            )
+            (last_valid_pos + 1 + num_query_per_req).to(input_buffers.seq_lens.dtype)
         )
         input_buffers.seq_lens[num_reqs:].zero_()
 
@@ -780,19 +826,16 @@ def prepare_dflash_inputs(
         sample_offset = 0 if sample_from_anchor else 1
         assert num_query_per_req - sample_offset == num_speculative_steps
         num_samples = num_reqs * num_speculative_steps
-        sample_idx_grid = (
-            (query_starts[:num_reqs] + sample_offset).unsqueeze(1)
-            + offsets[:num_speculative_steps]
-        )
+        sample_idx_grid = (query_starts[:num_reqs] + sample_offset).unsqueeze(
+            1
+        ) + offsets[:num_speculative_steps]
         sample_indices[:num_samples].copy_(
             sample_idx_grid.reshape(-1).to(sample_indices.dtype)
         )
         sampled_pos = query_pos[:, sample_offset:]
         if sample_from_anchor:
             sampled_pos = sampled_pos + 1
-        sample_pos[:num_samples].copy_(
-            sampled_pos.reshape(-1).to(sample_pos.dtype)
-        )
+        sample_pos[:num_samples].copy_(sampled_pos.reshape(-1).to(sample_pos.dtype))
         sample_idx_mapping[:num_samples].copy_(
             idx.unsqueeze(1)
             .expand(num_reqs, num_speculative_steps)

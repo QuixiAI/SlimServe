@@ -85,6 +85,18 @@ def _qwen3_arg_converter(raw_args: str, partial: bool) -> str:
     return json.dumps(params, ensure_ascii=False)
 
 
+def _qwen3_custom_input(raw_args: str, partial: bool) -> str:
+    """Extract the raw value of a custom tool's synthetic input parameter."""
+    for match in _PARAM_RE.finditer(raw_args):
+        if match.group(1).strip() == "input":
+            return _trim_wrapping_newlines(match.group(2))
+    if partial:
+        match = _PARTIAL_PARAM_RE.search(raw_args)
+        if match and match.group(1).strip() == "input":
+            return _trim_wrapping_newlines(match.group(2))
+    return ""
+
+
 @functools.cache
 def qwen3_config(
     thinking: bool = True,
@@ -192,6 +204,7 @@ def qwen3_config(
             ),
         },
         arg_converter=_qwen3_arg_converter,
+        custom_tool_arg_converter=_qwen3_custom_input,
         stream_arg_deltas=True,
         strip_trailing_reasoning_whitespace=False,
         tool_args_json=False,

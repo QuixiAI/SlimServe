@@ -14,6 +14,9 @@ from openai.types.responses import (
     ResponseCodeInterpreterCallInterpretingEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
+    ResponseCustomToolCall,
+    ResponseCustomToolCallInputDeltaEvent,
+    ResponseCustomToolCallInputDoneEvent,
     ResponseFunctionToolCall,
     ResponseInputItemParam,
     ResponseMcpCallArgumentsDeltaEvent,
@@ -321,13 +324,21 @@ class ResponsesRequest(OpenAIBaseModel):
             reasoning_effort=reasoning_effort,
         )
 
-        # When reasoning is requested, activate thinking for models whose
-        # chat templates require explicit opt-in (e.g., Gemma4 defaults
-        # enable_thinking to false). For templates that don't declare the
-        # variable, resolve_chat_template_kwargs filters it out harmlessly.
+        # Normalize common template controls. Some model templates use boolean
+        # ``enable_thinking``/``thinking`` switches; others (including
+        # Muse-Glimmer) render a ``reasoning_strength`` instruction. Set all
+        # three from the standard Responses reasoning effort unless the caller
+        # explicitly supplied that individual control. Templates filter out
+        # variables they do not declare.
         user_kwargs = self.chat_template_kwargs or {}
-        if reasoning_effort is not None and "enable_thinking" not in user_kwargs:
-            extra_kwargs["enable_thinking"] = reasoning_effort != "none"
+        if reasoning_effort is not None:
+            reasoning_enabled = reasoning_effort != "none"
+            if "enable_thinking" not in user_kwargs:
+                extra_kwargs["enable_thinking"] = reasoning_enabled
+            if "thinking" not in user_kwargs:
+                extra_kwargs["thinking"] = reasoning_enabled
+            if "reasoning_strength" not in user_kwargs:
+                extra_kwargs["reasoning_strength"] = reasoning_effort
 
         return ChatParams(
             chat_template=default_template,
@@ -537,6 +548,16 @@ class ResponsesRequest(OpenAIBaseModel):
                     )
                     processed_input.append(item)
 
+            elif item_type == "custom_tool_call":
+                try:
+                    processed_input.append(ResponseCustomToolCall(**item))
+                except ValidationError:
+                    logger.debug(
+                        "Failed to parse custom_tool_call to "
+                        "ResponseCustomToolCall, leaving for Pydantic validation"
+                    )
+                    processed_input.append(item)
+
             elif item_type == "reasoning":
                 if "id" not in item:
                     item = {**item, "id": f"rs_{random_uuid()}"}
@@ -598,9 +619,9 @@ class ResponsesRequest(OpenAIBaseModel):
         tools = data.get("tools")
         tool_choice = data.get("tool_choice", "auto")
         has_tools = tools is not None and len(tools) > 0
-        is_named_tool_choice = (
-            isinstance(tool_choice, dict) and tool_choice.get("type") == "function"
-        )
+        is_named_tool_choice = isinstance(tool_choice, dict) and tool_choice.get(
+            "type"
+        ) in ("function", "custom")
 
         if not has_tools:
             if tool_choice in ("auto", "none"):
@@ -612,7 +633,7 @@ class ResponsesRequest(OpenAIBaseModel):
                 )
             elif is_named_tool_choice:
                 raise VLLMValidationError(
-                    "Tool choice 'function' not found in 'tools' parameter.",
+                    "Named tool choice not found in 'tools' parameter.",
                     parameter="tool_choice",
                 )
         elif is_named_tool_choice and tools is not None:
@@ -632,7 +653,7 @@ class ResponsesRequest(OpenAIBaseModel):
                     tool_names.add(getattr(tool, "name", None))
             if not tool_name or tool_name not in tool_names:
                 raise VLLMValidationError(
-                    "Tool choice 'function' not found in 'tools' parameter.",
+                    "Named tool choice not found in 'tools' parameter.",
                     parameter="tool_choice",
                 )
 
@@ -866,4 +887,6 @@ StreamingResponsesResponse: TypeAlias = (
     | ResponseMcpCallArgumentsDoneEvent
     | ResponseMcpCallInProgressEvent
     | ResponseMcpCallCompletedEvent
+    | ResponseCustomToolCallInputDeltaEvent
+    | ResponseCustomToolCallInputDoneEvent
 )

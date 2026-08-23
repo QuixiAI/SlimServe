@@ -1859,6 +1859,7 @@ appears FULL-graph-gated; trace with per-request NaN row logging once
 (a) is understood. (c) The ROCm-parity buffer-persistence work in
 QuixiCoreMLASparseMetadataBuilder is the condition for re-enabling
 FULL graphs, followed by a clean 6-boot tripwire campaign.
+
 ## 2026-08-10 - Metal dsv4-xxs-1 256K Resize, Path Repairs, Indexer Blocker
 
 - Status: profile resized and partially validated; four retained fixes; one
@@ -2246,6 +2247,7 @@ FASTER with it off: clean-run c11 means 458.1 (aux-off, n=4) vs 426.7
 (aux-on, n=12) - the overlap was a net loss at seam widths anyway.
 Open root-cause thread: extend overlap_repro.py with TP + drafter
 interleave; the no-spec legacy-runner whole-batch NaN storm.
+
 ## 2026-08-11 - Muse-Glimmer Optimization Pass 1: +75% no-spec decode
 
 - Status: two retained fixes, one retained tuning decision, bottlenecks for
@@ -2496,7 +2498,7 @@ faithfully attends over a corrupted compressed (ratio-4) cache.
 Root cause is therefore ONE hop away, in the compressed-cache WRITE
 path (the MLA compressor / its cache insert) under chunked prefill:
 ~30% of a 1000-token request's 250 compressed groups holding garbage
-suggests whole chunks' compressed writes missing or mis-slotted (an
+suggests whole chunks' compressed writes missing or wrongly slotted (an
 offset relative to chunk start vs sequence start, or partial-group
 handling at chunk boundaries). The boot lottery falls out naturally:
 unwritten slots hold recycled allocator bytes, and whether those
@@ -7126,3 +7128,2447 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   save_partial widen suggestion, acknowledged incorrect for this contract),
   the qgemv mr-geometry thread pending its follow-up verification. The
   decode commit's own review pass produced no actionable comments.
+## 2026-08-12 - DFlash Spec Gap: Reference Measurements Localize the Wall
+
+- Question: model card advertises 250 tok/s spec on RTX 5090 (74.9 no-spec,
+  3.1x multiplier); our Metal spec path measures ~9.8 tok/s against 14.4
+  plain. Where is the loss: acceptance wiring, verify cost, or engine
+  overhead?
+- Method: llama.cpp muse-pr branch (build b10412) as reference on the same
+  M5 Max, same GGUF pair, same 256-token greedy essay prompt, via
+  llama-server (llama-cli on this branch is an interactive chat UI that
+  ignores -no-cnv and cannot batch-bench; a 12h "hang" was it REPL-looping).
+- Pitfall worth remembering: with a local -md file, llama.cpp defaults
+  --spec-type to none (sidecar type inference only runs for HF downloads);
+  the server silently serves plain decode with the drafter loaded. Explicit
+  --spec-type draft-dflash is required. First "reference" numbers were
+  plain decode in disguise (26.75 tok/s, no draft stats).
+- Acceptance verdict: reference mean acceptance 3.08-3.14 tok/step at block
+  16 on our prompt (0.148/drafted token) vs our 2.7-2.9. Our drafter wiring
+  is CORRECT; ~10-15% quality gap only. The card's ~3.3 is their prompt mix.
+- Throughput verdict: reference llama.cpp spec is NET NEGATIVE on M5 Max at
+  block 16: 15.7 tok/s vs 26.75 plain. Sweep: nmax16 15.7, nmax8 14.0 (non-
+  monotonic dip mirrors our 16-vs-17-row kernel anomaly), nmax4 29.5,
+  default 30.8 (+15% best case, mean len 2.27).
+- Root cause pinned by llama-batched-bench (no spec plumbing): batch-M
+  decode step cost on their Metal stack is 36.3 ms at M=1 but 179 ms at
+  M=17 (4.9x); M=8 117 ms, M=16 182 ms. The 196 ms spec step = 179 verify +
+  ~15 drafter. The verify wall lives in the reference too; the 5090's
+  3.1x comes from tensor cores making batch-17 verify ~= batch-1
+  (14.1 ms/step vs 13.4).
+- Physics on this machine: 19.6 GB weights / 460 GB/s = 43 ms BW floor;
+  batch-17 verify FLOPs ~1 TFLOP / ~14 TFLOPS fp16 simd = ~70 ms compute
+  bound. The card's own Apple row (26.6 -> 50.2, 1.8x) implies a ~66 ms
+  spec step -- exactly the simd compute roofline. 50 tok/s on M5 Max is
+  therefore demonstrated-achievable with a verify GEMM at the compute
+  bound; neural-accelerator/simdgroup_matrix tiles could push toward the
+  BW-floor ceiling (~3.1/50ms ~ 60 tok/s). "Half a 5090" is out of reach
+  no-spec (BW ratio is 0.26) but ~quarter of 233 is the honest target.
+- Decision: acceptance is not the work item. The work item is the M=17
+  verify step cost in muse_step: simdgroup_matrix fp16-fragment GEMM over
+  dequantized Q4K/Q5K/Q6K tiles (Marlin lessons per
+  csrc/quixicore/a100_glm52_design.md), fused aux-hidden capture, and the
+  on-device greedy rejection kernel to evict the MPS sampler host syncs.
+  Target: verify step <= 90 ms first (spec ~32 tok/s at mean 2.9), then
+  chase the 66 ms reference-implied roofline.
+- Raw artifacts: perf/results/2026-08-12/llamacpp-dflash-reference/
+  (config sweep, batched-bench M-curve, acceptance run, sweep script).
+
+## 2026-08-13 - qgemm_sm: Weight-Streaming Split-K MMA GEMM For The Verify Band
+
+- Status: retained; routed for M in [9, 32] on Metal. Spec-on end-to-end
+  8.6-9.2 -> 11.05-11.79 tok/s (+28%), acceptance unchanged (1.70/draft,
+  2.70 tok/step, from live server metrics), sample generations coherent.
+  Spec step ~252 ms (was ~320) vs ~70 ms fused plain decode: still
+  net-negative until the host-side spec machinery is fused.
+- Hypothesis: with reference llama.cpp also 4.9x off bandwidth at batch 17,
+  the M=17 verify matmul needs simdgroup_matrix (MMA) with a shape that
+  wastes no weight streaming on padding, high threadgroup counts, and
+  load/math overlap -- not just the existing qgemm tile (2 warps splitting
+  32 columns: half the tg idles on padding at M=17, ~99 GB/s flat).
+- Kernel: qgemm_sm<FMT, N_WARPS, RPW, SPLIT_K> in
+  csrc/quixicore/metal/kernels/quantization/qgemm_sm/. Every warp computes
+  all 32 (padded) columns for its own RPW weight rows; W dequants into
+  warp-private shared slices; X K-tiles double-buffered; both staged one
+  K-step ahead of the mma (single threadgroup_barrier per 32-wide K step).
+  Split-K (grid.z) writes float partials folded by a deterministic reduce
+  kernel -- no atomics, greedy verify stays bit-reproducible.
+- Iteration ladder on real muse weights, M=17 (us; bw floor = one weight
+  pass at 460 GB/s): naive 4x16 tile ~= old qgemm (o_proj 264 vs 243);
+  +pipeline+8-row warps (r8) beat qgemv_mm 23-26%; +split-K 4 (r8sk4):
+  o_proj Q6_K 148 (vec 281, floor 48.6), gate Q5_K 163 (vec 181, floor
+  40.7), down Q4_K 671 (vec 990, floor 162). Parity <= 2.5e-3 vs host
+  dequant fp32 matmul for all variants; still 3-4x off the bandwidth floor
+  (per-step dequant+staging issue cost does not fully hide yet).
+- Occupancy was the v1 killer: 16-row warps gave 104 threadgroups (~10% of
+  thread capacity) with 624 serialized barrier steps. 8-row warps + split-K
+  4 raise it to ~1664 threadgroups on the down projection.
+- Routing: _sm_route_ok in gguf/linear.py sends M in [9, 32] (N % 16 == 0,
+  K % 32 == 0, q4_0/q8_0/q4_K/q5_K/q6_K) to ggml_mul_mat_sm variant 9
+  (r8sk4); qgemv_mm keeps M <= 8, the flat GEMM keeps prefill. The glue
+  binding converts/transposes/pads (measured 15-40 us/call); the fused
+  muse_step consumer will use the layout-native ggml_mul_mat_sm_pre.
+- Next: (1) extend muse_step to M=17 fused verify with aux-hidden capture
+  consuming qgemm_sm_pre directly; (2) on-device greedy rejection kernel;
+  (3) fuse the DFlash proposer context-KV precompute -- together these
+  target the ~150 ms/step host machinery, the last term keeping spec below
+  plain decode.
+- Raw artifacts: perf/results/2026-08-13/qgemm-sm/.
+
+## 2026-08-13 - Fused M=17 Verify: Built, Correct, Not Yet Faster (Kept Gated)
+
+- Status: implemented and correctness-validated; default remains the eager
+  verify path (VLLM_MUSE_FUSED_VERIFY=1 enables the fused one) because the
+  eager path is 20 ms/step faster at current kernel speeds. Recorded as a
+  partial negative so the next agent does not re-derive it.
+- What was built: muse_step_run_aux extends the single-command-buffer step
+  to the k+1 verify shape -- qgemm_sm_rm (row-major bf16 X staged with a
+  transposing cooperative load, bf16 transposed-store reduce), residual
+  snapshots entering aux layers {2,14,26,38,50} via a muse_copy kernel,
+  and attention as batch expansion: row i becomes a virtual decode request
+  with seq_len base+i+1 over a stride-0 expanded block table (causality
+  and sliding window from the existing kernel's clamps; zero new attention
+  code). Acceptance identical to eager (643/6048 accepted/drafted on the
+  bench workload, bit-stable across runs) and generations coherent.
+- Iteration ladder (target forward at m=17, in-process, mps.synchronize):
+  first cut 306.8 ms -> 199.7 ms via (a) vectorized ushort4 staging (the
+  scalar 16-iteration transpose loop was 2.25x on K=19968), (b) four
+  rotating split-K partial buffers (a single shared buffer serializes
+  independent q/k/v/gate matmuls through Metal's hazard tracker), (c) a
+  deep-K (>8192) route that pays one contiguous muse_xpose32 pass and uses
+  the contiguous-staging kernel instead of scattered 64B tile reads.
+- Why eager still wins (180.4 ms): at M=17 the eager path's per-op dispatch
+  cost pipelines behind 300-1500 us kernel executions (CPU encodes ahead of
+  the GPU), so encoder fusion buys little until the kernels approach the
+  bandwidth floor. The muse_step M=1 win (dispatch-bound, 1800 ops over
+  ~70 ms) does not transfer to the verify shape at current kernel speeds.
+- CORRECTED step decomposition at k=16 (revises the 08-11 estimate of
+  "~150 ms host machinery"): 252 ms/step = 180 ms target layers forward +
+  ~70 ms everything else (lm_head ~8, DFlash drafter, MPS rejection
+  sampler, engine). The verify GEMM wall -- 3-4x off the 43 ms/pass weight
+  bandwidth floor -- is the dominant term and the priority lever. Spec goes
+  net-positive vs the 14.4 tok/s fused plain decode at step < 200 ms; the
+  card-implied 66 ms verify puts the same acceptance at ~40+ tok/s.
+- BK=64 experiment (variant 10): bit-identical outputs; Q6_K o_proj 247 ->
+  156 us (-37%, expensive dequant amortizes fewer barriers) but Q4_K down
+  667 -> 810 and Q5_K gate_up 683 -> 803 regress. Routed per-format
+  (Q6_K -> BK64) in quixicore/ops.py; e2e effect within run variance.
+- End state: spec-on 11.2-11.5 tok/s, plain fused decode 14.4. Next, in
+  order: (1) drive the verify GEMM toward <= 2x floor (M_PAD=24, per-row
+  simdgroup-coalesced dequant at wider BK, mma_ABt col-layout staging, RPW
+  sweeps -- measure each on gate_up/down); (2) re-test fused-vs-eager
+  verify and flip the default when fused wins; (3) the ~70 ms non-forward
+  tail (on-device greedy rejection, drafter fusion, lm_head route).
+- Raw artifacts: perf/results/2026-08-13/fused-verify/.
+
+## 2026-08-13 - Verify GEMM Roofline: Dequant-ALU-Bound, Paired-Plane Decode Is The Fix
+
+- Goal reset (user): 100+ tok/s single-stream on M5 Max. Budget: one weight
+  pass is ~43 ms at the ~460 GB/s measured stream rate -> ~23 steps/s, so
+  100 tok/s needs BOTH a floor-speed verify step AND ~4.5-5 accepted
+  tokens/step (tree/multi-candidate drafting on top of DFlash; M is nearly
+  free once verify is flat in M). Neither alone suffices: floor-speed at
+  today's 2.87 acceptance is ~66 tok/s.
+- Discriminating probe: qgemm_sm structure with a bench-only f16_raw format
+  (raw half weights, no dequant ALU, 4x the bytes) runs the down shape at
+  770 us = 1.33x its own bandwidth floor (~345 GB/s sustained). The q4_K
+  kernel on the same shape: 662-820 us = 4-5x ITS floor -- slower in
+  absolute time than a kernel streaming 4x the bytes. Verdict: the tile
+  flow (staging, barriers, split-K, occupancy) is healthy; the kernels are
+  DEQUANT-ALU-BOUND. ~445 us of critical-path decode per down matmul =
+  ~5 scalar ops/weight at ~1 op/cycle/lane, no vectorization.
+- Rejected fix (measured): vectorizing the decoder's device byte loads
+  (packed_uint2 / packed_ushort4 in the tk_dequant8 k-quant half
+  specializations -- kept, they are strictly cleaner) moved r8sk4 only
+  2-4%: the byte loads were already L1-hot. Also note the half-path span
+  decoders DO exist (dequant.metal ~line 990) -- do not re-derive the
+  missing-specialization theory; scales already unpack once per span.
+- THE PLANNED FIX -- paired-plane decode at BK=64 (Marlin lesson, Metal
+  form): in q4_K/q5_K a quant byte's two nibbles feed cols pos and pos+32,
+  which land in the SAME BK=64 tile. Split whole byte-runs with two vector
+  ops (qw & 0x0F0F0F0F, (qw >> 4) & 0x0F0F0F0F), convert uchar4->half4 in
+  hardware, one half4 fma per 4 weights: ~14 ops per 16 weights vs ~96
+  today. st tiles swizzle at 16-byte granularity, so each 8-half span is
+  one swizzle unit: compute the swizzled base once, write two half4s.
+  q6_K pairs at BK=128 (nibble planes 64 apart) -- keep it on the current
+  BK=64 span path first (already its best: 145-156 us on o_proj).
+  Projection: down 662 -> ~300-350 us (~2x floor), full-step verify
+  matmuls ~150 -> ~80-90 ms, spec ~17-18 tok/s before fused-verify and
+  tree-spec multiply further.
+- Sequence to 100 tok/s: (1) paired-plane BK=64 kernels; (2) re-flip the
+  fused verify default when it wins (encoder overhead matters again as
+  kernels shrink) + on-device rejection to trim the ~70 ms tail; (3) tree
+  speculation (multi-candidate DFlash blocks, tree-mask verify at M~32-48)
+  to lift accepted tokens/step toward 4.5+; (4) chase the last kernel
+  margin toward the 43 ms floor.
+- Raw artifacts: perf/results/2026-08-13/qgemm-sm/ (f16 probe numbers in
+  the session log; microbench_vectorized_loads.txt).
+
+## 2026-08-14 - Paired-Plane Decode Landed; The Wall Is Now Multi-Factor
+
+- Status: qgemm_sm_p kernels (paired-plane q4_K/q5_K at BK=64, 2/4/8-warp
+  variants) retained, parity exact vs host dequant (rel == the span path's,
+  bit-identical across warp counts). Shape-aware route: 2-warp for narrow
+  shapes (gate 296 -> 217 us), 4-warp for big ones (gate_up 681 -> 643,
+  down 710 -> 665). End-to-end effect ~5-8 ms/step -- real but small; bench
+  triplets now show thermal decline (11.2 -> 9.0 tok/s run 1 -> 3), so
+  sub-10 ms effects are unmeasurable e2e on this chassis without matched
+  ambient discipline.
+- Key correction to yesterday's roofline verdict: dequant ALU was A wall,
+  not THE wall. With decode at ~2.4 ops/weight the big shapes sat flat --
+  the f16_raw probe had hidden an X-restaging amplification term: every
+  16-row threadgroup re-stages the full X K-slice, ~2*M_PAD*N*K/rows_per_tg
+  bytes = ~532 MB of L2 traffic per big matmul vs 75 MB of weights. Wider
+  tiles (4-warp) captured part of the predicted saving on gate_up, less on
+  down; p8 regresses (threadgroup-memory residency). Best kernels now sit
+  at 3.2-4.1x the weight-bandwidth floor and the remaining gap is a SUM of
+  ~100 us-scale terms: residual X staging, MMA issue + fragment loads,
+  barrier latency, weight streaming.
+- Conclusion for the next session: incremental single-factor edits are
+  exhausted. Breaking 2x floor wants a coherent redesign in one step --
+  M_PAD=24 (verify needs 17; cuts X traffic and MMA work 25%), 4-warp
+  paired tiles, possibly X persistent in registers across a multi-row-block
+  N-walk (X is only 226 KB at K=6656 as half) -- plus an offline Xcode/Metal
+  counter profile of qgemm_sm_p4 on the down shape to replace inference
+  with measurement before writing it. The e2e chain (forward 180 ms of the
+  252 ms step) still points every saved matmul-ms directly at throughput.
+- The 100 tok/s ledger is unchanged: floor-speed verify (~43 ms) AND ~4.5-5
+  accepted tokens/step (tree drafting) are both required; kernel work is
+  the current critical path, tree speculation is unstarted and is the
+  larger single multiplier (2.87 -> ~4.5 tokens/step).
+- Raw artifacts: perf/results/2026-08-14/ (paired kernel microbenches in
+  session log; e2e triplet in muse_bench output).
+
+## 2026-08-14 (2) - Ablation Profile: The Wall Is MMA Execution; M5 Tensor Ops Are 9x Faster
+
+- Method (replaces inference-from-deltas): stage-ablation variants of the
+  production qgemm_sm_p4 kernel (host variants 21..27, BENCH-ONLY, keep-alive
+  tails defeat DCE) -- each removes exactly one stage. Round-robin
+  min-of-rounds timing cancels thermal drift. Script + raw JSON:
+  perf/results/2026-08-14/qgemm-sm-profile/.
+- Down shape (q4_K, N=6656, K=19968, 74.8 MB, floor 163 us), full p4 =
+  634 us (3.90x floor). Exposed per-stage costs (delta vs full):
+  MMA issue **290 us**; weight stream+decode 52; dequant ALU 25; X
+  re-staging 21; tg-barrier 18; fragment loads 14. Staging-only (no MMA,
+  a3) = 331 us = 2.04x floor; pure weight-stream (a5) = 223 us = 1.37x
+  floor; f16_raw structural probe 748 us (4x bytes, consistent w/ 08-13).
+- VERDICT: yesterday's "sum of ~100 us-scale memory terms" theory is wrong.
+  The dominant wall is executing the MMA itself on the classic simdgroup
+  path. All memory-system terms combined leave the kernel at 2.04x floor
+  even with MMA free.
+- Standalone matrix-pipe rate probe (probe.metal/probe.mm in same dir;
+  Metal 4, -std=metal4.0, macOS 26.5 toolchain): chained
+  simdgroup_multiply_accumulate at the exact production tile shape
+  (A 32x64 half, B 64xM_PAD half, fp32 acc, 78-step K-walk, 832 tgs) vs
+  mpp::tensor_ops::matmul2d (M5 GPU neural accelerators), whole-down-matmul
+  equivalents:
+    simdgroup  M_PAD 24/32/48: 952 / 1327 / 2019 us (6.3-6.7 TFLOPS)
+    tensor_ops M_PAD 24/32/48: 149 /  153 /  269 us (43-55 TFLOPS)
+  Notes: (a) tensor ops are ~9x the chained-simdgroup rate at M_PAD=32 and
+  land BELOW the 331 us staging floor -> MMA moves off the critical path
+  entirely; (b) M_PAD 24 vs 32 is FREE on the tensor units (no M_PAD=24
+  redesign needed); (c) M_PAD=48 costs only +76% -- the tree-speculation
+  verify shape stays near one weight pass, confirming the "M nearly free"
+  premise of the 100 tok/s ledger on this hardware; (d) exposed MMA in the
+  production kernel (290 us) is smaller than the standalone chained rate
+  (1327 us) because 4 warps x 4 accumulator chains overlap with staging and
+  cross-tg parallelism -- exposed vs standalone differ, both conclusions
+  hold.
+- Decision: redesign qgemm_sm around tensor_ops::matmul2d -- keep the
+  measured-cheap paired-plane dequant staging and double-buffered pipeline,
+  swap the per-warp simdgroup MMA for one cooperative 32x64 @ 64x32
+  matmul2d per K-step (execution_simdgroups<4>, multiply_accumulate into a
+  float cooperative_tensor, cT.store to the same split-K float partials ->
+  deterministic reduce unchanged). Projection: down 634 -> ~350-400 us
+  (staging-bound), then attack staging terms next (X traffic halves again
+  at 64 rows/tg if occupancy allows). Requires bumping the metallib to
+  -std=metal4.0 (from 3.1) -- validate all existing kernels + serving path
+  after the bump.
+
+## 2026-08-14 (3) - Tensor-Ops Verify GEMM Landed: Spec Beats Plain For The First Time
+
+- Change: qgemm_sm_t (variant 14) -- the qgemm_sm_p staging pipeline
+  (paired-plane dequant q4_K/q5_K, span dequant q6_K, BK=64, double-buffered,
+  one barrier/step) with the per-warp simdgroup MMA replaced by one
+  cooperative 32x64 @ 64x32 mpp::tensor_ops::matmul2d per K-step
+  (execution_simdgroups<4>, multiply_accumulate into a float
+  cooperative_tensor, cT.store to the same (4, N, 32) float partials;
+  deterministic split-K reduce unchanged, so greedy verify stays
+  bit-reproducible). Metallib bumped -std=metal3.1 -> metal4.0 (all 81
+  kernel sources compile unchanged). Route: Q4_K/Q5_K/Q6_K with K%64==0
+  and N%32==0 -> 14 in quixicore/ops.py; simdgroup variants remain as
+  fallback for uncovered shapes.
+- Microbench (M=17, matched hot-chassis conditions, parity rel identical
+  to the simdgroup path per format):
+    o_proj Q6_K 6656x4096:  465 -> 152 us (9.6x -> 3.1x floor)
+    gate   Q5_K 4096x6656:  186 -> 132 us (4.6x -> 3.2x)
+    down   Q4_K 6656x19968: 829 -> 422 us (5.1x -> 2.6x)
+  The predicted staging-bound regime arrived: MMA (~153 us standalone on
+  the down shape) is off the critical path; remaining gap to floor is the
+  staging terms the ablation profile measured (a3 = 2.04x floor).
+- E2E through the real profile (muse-kdyn-1, port 8078, 256-token greedy
+  essay triplet): **16.26 / 16.05 / 14.59 tok/s** spec-on, vs 11.2-11.5
+  before and 14.4 plain fused decode. Acceptance 647/373 = 1.73/draft --
+  unchanged. Generations coherent. SPEC NOW BEATS PLAIN: removed the stale
+  --no-spec note from slimserve/profiles.json (handoff step 5) and added
+  the muse baseline snapshot to perf/baseline_status.md.
+- Not done / next: (1) fused verify (muse_step_run_aux) still uses the
+  2-warp simdgroup qgemm_sm_rm -- it did NOT get faster and eager
+  widened its lead; port tensor-ops MMA into the rm kernel before
+  re-testing the fused flip. (2) staging terms are now the wall (X
+  re-staging + stream pattern); 64-row tiles / X-persistent designs are
+  the next kernel iteration, informed by the ablation numbers. (3) tree
+  speculation: rate probe shows M_PAD=48 costs only +76% on the tensor
+  units (M nearly free) -- the largest remaining multiplier is unblocked.
+- Raw artifacts: perf/results/2026-08-14/tensor-mma/ (e2e + microbench),
+  perf/results/2026-08-14/qgemm-sm-profile/ (ablation + rate probe).
+
+## 2026-08-15 - Plain-Step Decomposition: GEMVs Exonerated, The Gap Is Glue + Host
+
+- Question (user): are we doing something fundamentally wrong, e.g. serving
+  a dequantized model? AUDIT: no -- decode routes M=1 to native quantized
+  GEMV, M 9..32 to the sm kernels; dequant-then-dense only serves
+  prefill-size batches. Weights stream as GGUF blocks; per-step bytes match
+  the file (17.96 GB blk + 0.92 GB lm_head = 18.9 GB -> 38.6 ms floor at
+  460 GB/s). llama.cpp on this box does 26.75 tok/s plain = 37.4 ms/step =
+  AT the floor: the reference proves the hardware can saturate.
+- M=1 GEMV kernel-vs-floor microbench (all 8 per-layer shapes + lm_head,
+  round-robin min-of-rounds; perf/results/2026-08-15/plain-step-decomp/):
+  ffn_gate 0.98x, ffn_up 0.96x, ffn_down 1.03x, lm_head 0.88x (the big
+  shapes BEAT the 460 GB/s measured-stream number, i.e. effective BW is
+  ~500+); o_proj 1.23x, q 1.44x, attn_gate 1.56x; k/v 6-7x but only 3 us
+  floor each (per-op dispatch; the fused step amortizes). Step GEMV total:
+  42.7 ms vs 38.6 floor = 1.10x. THE GEMV KERNELS ARE NOT THE PROBLEM.
+- In-process plain-decode split (no spec, sync-instrumented; uninstrumented
+  ground truth 61.1 ms/step = 16.37 tok/s): layers_fwd 49.6 ms (min 46.4),
+  compute_logits 2.1, sampler 2.0, execute_model residue 2.4, engine
+  residue ~5-7. Non-GEMV forward (attention + norms + rope + gating +
+  residual glue) ~= 49.6 - ~41 = ~8-9 ms. Serving through the API stack
+  adds ~10 ms/step more (14.4 vs 16.4 tok/s same workload).
+- Revised gap ledger to llama.cpp's 37.4 ms: ~4 ms GEMV stragglers
+  (q/attn_gate/o_proj at 1.2-1.6x) + ~8-9 ms attention/glue + ~4 ms
+  logits/sampler + ~7-9 ms host/engine (+~10 ms serving stack when through
+  the API). The base step, not speculation, is the fundamental deficit;
+  spec multipliers match llama.cpp's (1.12x vs 1.15x) on top of a 1.8x
+  slower base.
+- Attack order (plain step 61 -> ~45 ms target, serving stack included):
+  (1) attention/glue inside the fused step (~8-9 ms; profile the fused
+  command buffer per-op next), (2) host+engine residue (~7-9 ms; async
+  scheduling / overlap encode with GPU), (3) serving-stack ~10 ms
+  (API-path overhead), (4) GEMV stragglers (~4 ms; q/attn_gate/o_proj
+  staging patterns). Then the same fixes carry to the verify step and the
+  spec/tree roadmap multiplies from a healthy base.
+- Raw artifacts: perf/results/2026-08-15/plain-step-decomp/.
+
+## 2026-08-15 (2) - Verify/Drafter Split Measured; Device-X Tensor Kernel (v15) Landed
+
+- Fresh verify-step decomposition with the tensor kernels (in-process,
+  spec-on, 16.4 tok/s, ~153 ms/step at 2.51 tok/step; harness
+  perf/results/2026-08-15/plain-step-decomp/verify_step_timing.py):
+  target forward M=17 **119 ms** (was 180.4 pre-tensor-kernels), drafter
+  propose 23.7 (= model fwd 12.6 + sample_draft 5.9 + prep glue ~5.2),
+  compute_logits 4.8, rejection sampler 3.3, true engine residue ~10.
+  NOTE the drafter runs OUTSIDE execute_model in this fork's loop --
+  execute_model residue appears negative if you forget that.
+  Drafter weights are 1.6 GB -> ~3.5 ms floor; its forward at 12.6 ms is
+  3.6x off (dispatch-bound; it never got the muse_step fusion treatment).
+- qgemm_sm_t2 (variant 15): device-X flavor of the tensor-op kernel -- X
+  (<= ~426 KB, L2-resident) is handed to matmul2d as a device tensor slice
+  per K-step instead of being staged to threadgroup memory. Halves
+  threadgroup memory to 8 KB (occupancy up), drops the X-stage work and
+  half the barrier pressure. Microbench (matched conditions, parity rel
+  identical to v14): o_proj 181->174 us, attn_gate 150->89.5 (-40%),
+  ffn_gate 415->353 (1.78x floor), ffn_down 423->370 (2.28x). Routed as
+  the default for Q4_K/Q5_K/Q6_K (ops.py variant 15); pitfall paid: the
+  ggml_mul_mat_sm TORCH_CHECK variant ceiling must be bumped with every
+  new variant (first serve crashed 500 on "unknown variant 15").
+- E2E (muse-kdyn-1, 256-token greedy triplet, 60 s cool-down): **17.84 /
+  15.21 / 13.61 tok/s** -- run-1 matched-position vs yesterday's 16.26 =
+  +9.7%. Acceptance 637/390 = 1.63/draft (healthy band; greedy token
+  trajectories shift slightly because the device-B operand path changes
+  fp accumulation order inside matmul2d). Generations coherent.
+- 100 tok/s ledger position: 100 tok/s at ~4.75 tok/step (tree) needs a
+  ~48 ms step. Measured step budget today: target fwd 119 (matmul floor
+  36.6 + attn/glue ~20), drafter 23.7 (floor ~4), logits+rejection 8,
+  engine ~10. Every leg has measured headroom; the two structural jobs
+  are (a) verify matmuls from ~2.3x -> ~1.2x floor (uint4b-native
+  matmul2d operands are the endgame -- the API takes half x uint4b
+  directly; needs load-time byte-neutral repack + per-32-group scale
+  correction), (b) drafter fusion (muse_step treatment for the DFlash
+  block: 23.7 -> ~8), then (c) engine/serving residue (~10 in-process,
+  +~10 through the API server), then (d) tree spec multiplies from the
+  healthy base.
+- Raw artifacts: perf/results/2026-08-15/plain-step-decomp/ (v15 bench,
+  e2e triplet, both step decompositions).
+
+## 2026-08-15 (3) - uint4-Native matmul2d Validated At 1.19x Floor; w8 Routed For Wide Shapes
+
+- 8-warp device-X variant (qgemm_sm_t2w8, variant 16): wins only on the
+  widest shapes (ffn_gate 420 -> 384 us, 1.93x floor); regresses on
+  attn_gate/ffn_down. Routed for N >= 16384 (ffn_gate/up), v15 elsewhere.
+  E2E triplet after route: 16.87 / 16.48 / 14.99 (flatter than the v15
+  triplet, run-1 within thermal noise of the 17.84 record; acceptance
+  identical 637/390).
+- THE DECISION RESULT -- uint4-native matmul2d probe (probe2.metal/.mm,
+  archived in perf/results/2026-08-15/plain-step-decomp/): down shape
+  (N=6656, K=19968), B operand = packed uint4b weights tile-major
+  ([n_tile=64][K][64] contiguous; packed formats forbid strided tensors,
+  data_handle_type is device uchar*), A = row-major X^T (the serving
+  layout -- the muse_xpose32 transpose disappears), per-32-group scale
+  correction via multiply-mode into a tmp cooperative_tensor then
+  per-element sc[n,g] fma into the main accumulator (n-coordinates
+  precomputed once via get_multidimensional_index):
+    u4_raw (no scaling)      196.9 us = 1.21x floor
+    u4_scaled (q4_K scheme)  193.7 us = 1.19x floor   <-- TARGET HIT
+    u4_k256 (overhead curve) 176.5 us = 1.09x
+  vs v15 q4_K down = 370 us. Per-group scaling costs ~nothing; 156
+  op.run calls per tg at tilek=32 cost ~20 us total. The min-term
+  (dmin*m_g rank-1 correction from per-group X column sums) is not in the
+  probe; it is a (N x K/32) @ (K/32 x M) side GEMM, ~1/32 the flops.
+- Format coverage decision: q4_K -> uint4 native (4.56 bpw, -43% on down);
+  q6_K -> int8 native (+26% bytes but current kernels are 3.6-4x off
+  floor: o_proj projected ~71 vs 174 us); q5_K int8 is a WASH on
+  ffn_gate/up (+50% bytes eats the efficiency win) -- the q5_K stream
+  needs the staged path improved instead (BK=128 GEMV-style contiguous
+  runs; the M=1 GEMV kernels prove the layout streams at 0.96x floor when
+  access is row-sequential).
+- Next session implementation order: (1) load-time repack for q4_K/q6_K
+  (tile-major native arrays + scale/min planes; byte-neutral +1-26%, NO
+  lazy caches -- load-time replacement per CLAUDE.md); (2) qgemm_sm_u4
+  kernel per the probe (include the min-term side GEMM); (3) BK=128
+  staged path for q5_K; (4) then drafter fusion (leg 2).
+- Raw artifacts: perf/results/2026-08-15/plain-step-decomp/ (v16 bench,
+  e2e triplet, probe2 sources + output).
+
+## 2026-08-15 (4) - uint4-Native q4_K Path SHIPPED: 18.26 tok/s, Thermally Flat
+
+- Implemented end-to-end from the probe spec: qgemm_sm_u4 kernel
+  (tile-major packed uint4 B operand streamed by matmul2d itself, tilek=32
+  multiply into a tmp cooperative tensor, cMain += sc[g,n]*tmp -
+  mn[g,n]*xs[g,m]; scatter store into the m-contiguous (4,N,32) partials;
+  qgemm_sm_u4_xsum precomputes the rank-1 min-term X column sums;
+  deterministic reduce unchanged). Host op ggml_mul_mat_sm_u4 (X (32,K)
+  half row-major -- NO transpose glue). Load-time repack
+  (quixicore_ops.muse_u4_repack, exact integer nibble extraction, numpy,
+  repack self-check rel 0.0): GGUFLinearMethod._create_muse_u4_weight
+  registers wu/sc/mn buffers for single-shard Q4_K layers on Metal
+  (muse: the 52 ffn_down layers, ~75 MB/layer bounded load-time
+  duplicate; original qweight retained for GEMV/prefill routes; kill
+  switch VLLM_MUSE_U4=0); apply() routes M 9..32 to the u4 op.
+- Kernel parity on real repacked down weights: rel 1.0-1.4e-3 (same band
+  as every staged kernel), FIRST TRY -- nibble order low-first, C coop
+  coordinate idx[0]=n confirmed. Matched-condition round-robin: u4 315.4
+  us (1.75x its 181 us floor incl. scale planes) vs v15 372.1 (2.29x) =
+  -15.3%. (Bare-probe 194 us remains the kernel-only bound; the op adds
+  xsum + reduce + encode + min-term streams.)
+- E2E (muse-kdyn-1, 256-token greedy triplet, 120 s cool-down):
+  **18.26 / 18.17 / 17.81 tok/s** -- new record AND thermally flat
+  (-2.5% run1->run3 vs -20% for the ALU-heavy staged path: the tensor
+  units + no dequant ALU draw less power per token). Acceptance 644/380 =
+  1.69/draft; coherent greedy output. Progression: 8.6 -> 11.2 -> 16.26
+  -> 17.84 -> 18.26.
+- Pitfalls paid: at::zeros on the partials cost ~0 (scatter store covers
+  every element; capacity*threads == tile exactly) -- use at::empty; the
+  gguf linear.py `ops` symbol is the gguf shim, not quixicore_ops -- new
+  entries need both layers; tk_launch.h gives each launcher its own
+  template<class E> line -- inserting between them detaches one.
+- Next: extend the native-operand route to q6_K (int8 repack: o_proj + q
+  projections, projected ~-60%), then the q5_K staged BK=128 path, then
+  drafter fusion (leg 2). The u4 op itself still has ~120 us of
+  non-GEMM overhead (xsum/reduce/encode) worth folding away.
+- Raw artifacts: perf/results/2026-08-15/plain-step-decomp/ (u4 parity
+  script + matched bench + e2e triplet).
+
+## 2026-08-15 (5) - q6_K int8-Native: Measured NEGATIVE, Not Routed
+
+- Built qgemm_sm_u8 (int8-native q6_K, -32 folded into load-time repack,
+  no min-term, per-16-group scale correction, tilek=16) + host op
+  ggml_mul_mat_sm_u8 + exact repack (self-check rel 0.0, kernel parity
+  2.5e-4). Tried both strided (K, N) row-major and u4-style tile-major B
+  layouts.
+- Matched round-robin on o_proj (Q6_K N=6656 K=4096): u8 259-262 us vs
+  v15 224 us -> v15 WINS by ~15%. Both sit at ~4x the 67 us floor: the
+  muse q6_K shapes are all small-K, where fixed costs (encode, reduce,
+  dispatch latency, only 104 tgs/slice of parallelism) dominate and the
+  tilek=16 run count adds overhead without a stream win. The u4 win came
+  from big-K down (156 32-k groups amortize everything); q6_K has no such
+  shape here.
+- DECISION: u8 NOT routed (kernel + repack retained as bench-only
+  artifacts; no serving-path change). The q6_K/small-K lever is fixed-cost
+  reduction (fold reduce into the GEMM kernel, split_k tuning, or the
+  fused-verify encoder), not operand format.
+- Artifacts: perf/results/2026-08-15/plain-step-decomp/u8_*.
+
+## 2026-08-15 (6) - u4_rm (bf16-in, glue-free) NEGATIVE; Kernel Micro-Arcs Exhausted
+
+- Built qgemm_sm_u4b/_xsum + ggml_mul_mat_sm_u4_rm: original (M, K) bf16
+  X straight in (dynamic m extent), (M, N) bf16 out via reduce_rm --
+  intended to delete the per-call pad/cast glue. Parity 2.1e-3 (bf16 A
+  products; acceptable band) but 431 vs 269 us for u4-with-glue: the
+  dynamic-extent A (m=17 < descriptor m=32) forces matmul2d's
+  edge-checked slow path on every run. NOT routed; kernels retained
+  bench-only. Lesson: keep A extents static at the descriptor shape and
+  pad on the host; the pad/cast glue is cheaper than the op's edge path.
+- Also note wrapper-inclusive u4 measured 269 us in this (cooler) round
+  vs 315-322 in hotter rounds -- the glue overhead estimate (~120 us) was
+  inflated by thermal drift; treat ~270 us as the current down cost.
+- Kernel-side quick wins are now exhausted. The remaining legs to 100
+  tok/s are the structural builds, in this order: (1) drafter fusion
+  (23.7 -> ~8 ms/step), (2) q5_K staged BK=128 (gate/up ~10 ms/step),
+  (3) small-shape fixed-cost reduction / fused-verify with tensor rm
+  kernels, (4) tree speculation (the ~1.7x tokens/step multiplier).
+  Serving state: u4 route live, 18.26/18.17/17.81 tok/s validated.
+
+## 2026-08-15 (7) - Native DFlash Input Prep on Metal (Token-Identical); Thermal Wall Reached
+
+- Ported the Triton _prepare_dflash_inputs_kernel to Metal
+  (csrc/quixicore/metal/kernels/serving_glue/dflash_prepare.metal + host op
+  prepare_dflash_inputs in qc_metal_serving.mm, arg order mirrors the
+  python native call; dtypes pinned int32/int64 per buffer with hard
+  TORCH_CHECK guards). Gate `_use_native_dflash_inputs` now allows
+  Metal, and the
+  MPS Python fallback loop (two GPU->CPU .cpu() syncs + ~25 small
+  dispatches per propose) is skipped when native is available.
+  VLLM_QC_DISABLE_NATIVE=1 still forces the fallback for A/B.
+- Correctness: greedy sky-blue probe TOKEN-IDENTICAL to the fallback path;
+  acceptance 697/407 = 1.71/draft (healthy); serving clean.
+- Performance: e2e 17.80 / 17.83 / 17.71 -- flat but on a heat-soaked
+  chassis (in-process decomposition shows target_fwd inflated to 127.7 ms
+  vs 119-123 earlier today: pure thermal drift). Instrumented propose glue
+  4.2 vs 5.2 ms, but sync-instrumentation recreates the serialization the
+  native path removes, so the honest effect is bounded by e2e noise
+  (<= ~0.5 tok/s today). Keep it: it deletes real syncs/dispatches whose
+  value compounds as the step shrinks, and it is the DSpark/DFlash-common
+  path.
+- THERMAL WALL: after ~6 h of sustained kernel/bench load every
+  measurement is drifting (18.26 cool -> 17.8 plateau hot). Further
+  microbench accept/reject decisions today would be noise-driven. Next
+  session (cool chassis): re-baseline the triplet, then q5_K staged BK=128
+  (gate/up), small-shape fixed-cost fold, drafter model-forward fusion,
+  tree spec.
+- Artifacts: perf/results/2026-08-15/plain-step-decomp/ (e2e_native_prep,
+  verify_step_native_prep).
+
+## 2026-08-15 (8) - BK=128 q5_K Kernel: Narrow Shapes -31%, Routed
+
+- qgemm_sm_t4_q5_K (variant 17): BK=128 device-X tensor kernel with a
+  dedicated q5_K paired-plane loader (16 contiguous qs bytes per lane per
+  step vs 8 at BK=64; halved K-steps and barriers). host_name required --
+  plain mittens-namespace kernels are not reachable by bare pipeline name
+  (pitfall re-paid).
+- Matched round-robin, parity identical per shape: attn_gate (N=4096)
+  240 -> 165.8 us (5.9x -> 4.1x floor, -31%); ffn_gate (N=19968) v16
+  378.5 vs v17 403.6 -- wide shapes keep the 8-warp BK=64 kernel.
+  Interpretation: at low threadgroup counts the barrier/step count
+  dominates; at high counts the wide tiles already amortize it.
+- Route: Q5_K narrow (N < 16384, K % 128 == 0) -> 17; wide N -> 16; else
+  15. Saves ~74 us x 52 layers ~= 3.9 ms/step (attn_gate).
+- E2E on the heat-soaked chassis: 17.86 / 17.37 / 17.14 -- the same
+  ~17.8-17.9 hot plateau as the two previous configs; a ~4 ms/step effect
+  is below today's thermal noise. Kernel-level matched evidence is the
+  decision basis; acceptance 644/380 = 1.69 and coherence unchanged.
+- Artifacts: perf/results/2026-08-15/plain-step-decomp/ (v17_bench,
+  e2e_v17).
+
+## 2026-08-15 (9) - CRITICAL: Tree-Speculation Multiplier Measured -- 100 tok/s Ledger Revised
+
+- Offline tree-acceptance study (tree_acceptance_study.py + results in
+  perf/results/2026-08-15/plain-step-decomp/): logged the drafter's top-8
+  candidates at every block position across 3 diverse greedy prompts
+  (234 verify steps), replayed against the true continuations, computed
+  tokens/step for full product-tree topologies. Alignment advances by the
+  REAL linear emission (each logged block is conditioned on the real
+  acceptance boundary); the numbers are therefore tight UPPER bounds on
+  real tree acceptance.
+- Results: linear k=1 sanity = 2.46 tok/step (matches production 2.5-2.7).
+  Buildable <=48-node trees: < ~3.0. A 498-node tree: 3.09. A physically
+  impossible 611,668-node tree: 3.47. The projected 4.5-4.75 is
+  UNREACHABLE with this drafter: per-position acceptance decays 0.77 /
+  0.50 / 0.19 / 0.11 -- beyond position ~3 the drafter has no signal, and
+  no verification topology recovers information the proposals do not
+  carry. (Consistent external evidence: llama.cpp's best spec config on
+  this box is +15%, and its Apple-row card ceiling was ~50 tok/s.)
+- REVISED CEILING: with tokens/step capped at ~2.7 (linear) to ~3.0
+  (cheap tree), 100 tok/s would need a 27-30 ms step -- BELOW the 38.6 ms
+  weight-pass floor. Physically impossible with this model+drafter
+  artifact. Best reachable with everything else perfect: ~48-55 ms step
+  x 2.7-3.0 tok/step = **~50-62 tok/s**.
+- Path to an actual 100 requires a better DRAFTER ARTIFACT (training-side:
+  deeper-position DFlash conditioning, larger drafter, or DSpark-style
+  confidence truncation trading depth for width) -- outside the serving
+  stack's control. The serving-side roadmap (drafter fusion, wide-q5_K,
+  fixed costs, attn/glue, engine) remains valid toward the ~50-62 ceiling.
+- Tree spec at <=48 nodes is still worth ~+10-20% AFTER the step
+  approaches the floor (at a 50 ms step, 2.7 -> 3.0 = +5 tok/s for ~+15%
+  step cost -- marginal; re-evaluate when the step is floor-bound).
+
+## 2026-08-15 (10) - Wide-q5_K Wall Hunt: Partials Machinery Implicated; split1 Store Bug Open
+
+- t2w8 ablations (variants 28-30: W-stage off / MMA+device-X off / dequant
+  raw) on ffn_gate: ALL slower than the full kernel (383 -> 408-410) --
+  no single stage dominates the wide shape's 1.93x floor. What every
+  variant shares: the split-K partials machinery (~10 MB write + ~10 MB
+  reduce re-read + reduce kernel ~= 60+ us on a 383 us matmul) and the
+  launch structure. Prime suspect for the wide-shape fixed cost.
+- Variant 31 (qgemm_sm_t2w8s1: SPLIT_K=1, direct half scatter store, no
+  partials/reduce): timing suggestive (-43% in-process vs an inflated
+  same-run baseline -- NOT trustworthy today) but PARITY FAILS (rel
+  ~0.7-0.9) with an unresolved cooperative-tensor coordinate mapping in
+  the manual scatter store (both index orders wrong; cT.store on the same
+  cT is correct, so the accumulator itself is fine). NOT ROUTED --
+  bench-only. Debug on a sane chassis: dump get_multidimensional_index
+  pairs for the execution_simdgroups<8> destination layout, or use
+  cT.store into a (N,32) float scratch + separate cast pass as the
+  correctness-first fallback.
+- Thermal state is now unusable for accept/reject decisions (v16
+  measuring 716 us vs its true ~380; v15 down 737 vs ~370). Stopping
+  measurement-driven work per the matched-conditions discipline.
+- Artifacts: perf/results/2026-08-15/plain-step-decomp/
+  (q5k_wide_ablation, v31_bench*).
+
+## 2026-08-15 (11) - split-K=1 Kernel Fixed + Routed (Measured Shapes Only); Cool Re-Validation Pending
+
+- v31 parity bug ROOT-CAUSED with a coordinate-dump probe (probe3 in the
+  scratchpad, output in session log): for execution_simdgroups<8> the
+  destination cooperative tensor's element slots are HALF invalid and some
+  valid slots hold cross-simdgroup PARTIAL sums that only combine inside
+  cT.store -- manual element readout is layout-unsafe (the 4-simdgroup u4
+  config merely happened to have a complete-element layout). PITFALL for
+  all future coop-tensor code: never scatter cT[i] manually; only
+  cT.store() is layout-safe.
+- Fix: v31 stores one float slice via cT.store (z=0) and the host folds it
+  with the existing reduce at SK=1 (a float->half cast). Still deletes 3/4
+  of partials traffic + 3/4 of reduce reads vs split-K=4.
+- Parity: 3.4-8.9e-04 on ffn_gate / ffn_down / o_proj. Hot-chassis MATCHED
+  round-robin (valid relatively): ffn_gate +43%, ffn_down +33% (also beats
+  the u4 layer intercept head-to-head), o_proj +44%.
+- ROUTE LESSON (regression caught): a first universal route (all N%64==0)
+  sent v31 to UNMEASURED narrow shapes (merged QKV N=4608 -> 72
+  threadgroups, attn_gate N=4096 -> 64) where split-K=1 loses too much
+  parallelism; e2e dropped to ~13-14. Corrected to measured shapes only
+  (N >= 6656: down/gate/up/o_proj); narrow Q5_K keeps v17, rest v15. The
+  u4 layer intercept is now opt-in (VLLM_MUSE_U4=1) -- superseded by v31
+  on its own shape.
+- E2E today is UNRESOLVABLE: the chassis is in deep thermal recovery
+  (ascending triplets 13.7 -> 15.3 across a bench; each 20 GB model load
+  re-saturates it). The 18.26 record and this route MUST be re-validated
+  on a cool chassis before further e2e claims; if cool e2e regresses,
+  the previous route is the 15/16/17 selection in git history.
+- Artifacts: perf/results/2026-08-15/plain-step-decomp/ (v31_parity_final,
+  e2e_v31, e2e_v31b).
+
+## 2026-08-15 (12) - Rested-Chassis Protocol: v31 Route Reads 16.05 Flat; Same-Protocol A/B Running
+
+- New protocol: background job rests the chassis 45 min truly idle, then
+  serves, settles 120 s, and runs the triplet (script archived in the
+  session scratchpad; results e2e_v31_cool.txt). v31 route: **16.05 /
+  16.08 / 16.09** -- perfectly flat (+-0.04!) but BELOW the 18.26/18.17/
+  17.81 the u4-route config recorded midday yesterday under a different
+  thermal prehistory.
+- METHODOLOGY HOLE EXPOSED: hot-chassis matched round-robin wins do not
+  automatically extrapolate to cool conditions -- under throttle, fixed
+  costs (partials traffic, reduce dispatches) inflate disproportionately,
+  so a fixed-cost-deleting kernel (v31) looks better hot than it may be
+  cool. Absolute cross-day comparisons also depend on thermal prehistory
+  (45-min overnight rest != midday 120-s cool-down).
+- Discriminator IN FLIGHT: identical rest protocol with the legacy route
+  (VLLM_SM_ROUTE=legacy env gate added to quixicore/ops.py + VLLM_MUSE_U4=1
+  restores the u4 intercept) -- same 45-min rest, same settle, same bench.
+  The pair decides the route on same-protocol evidence; whichever loses is
+  kept behind the env gate for future A/Bs.
+- Acceptance unchanged throughout (651/375 = 1.74/draft).
+
+## 2026-08-15 (13) - Same-Protocol A/B DECIDES: Legacy Route Wins, v31 Reverted To Opt-In
+
+- Identical 45-min-rest protocol, both routes: legacy (15/16/17 + u4
+  intercept) **17.81 / 17.56 / 17.58** vs split-K=1 route (v31 on
+  N >= 6656) 16.05 / 16.08 / 16.09. Legacy wins +9.6%. Acceptance
+  identical (1.69-1.74/draft).
+- v31 is therefore an E2E NEGATIVE despite sweeping hot-matched
+  microbenches (+33-44%): (a) throttle inflates exactly the fixed costs
+  (partials traffic, reduce dispatch) that v31 deletes, so hot-matched
+  comparisons overweight them; (b) split-K=1 quarters per-matmul
+  threadgroup parallelism, which plausibly degrades inter-op overlap in
+  the real step -- isolated microbenches cannot see either effect.
+- ROUTE DECISION: default reverted to the 15/16/17 selection with the u4
+  intercept ON (the A/B winner); v31 kept behind VLLM_SM_ROUTE=split1.
+  METHODOLOGY RULE going forward: hot-matched microbenches select
+  CANDIDATES; route flips require the same-protocol rested A/B
+  (scratchpad cool_bench scripts; 45-min idle + 120 s settle + triplet).
+- NEW CANONICAL BASELINE (rested protocol, winning route): **17.81 /
+  17.56 / 17.58 tok/s**. The midday 18.26 remains the observed best
+  (different thermal prehistory); use the rested protocol for all future
+  route comparisons.
+- Raw: e2e_v31_cool.txt, e2e_legacy_cool.txt.
+
+## 2026-08-15 (14) - Forward Attribution: MLP 51% / Attention 32% / Glue 17%
+
+- Class-level sync attribution of the M=17 verify forward (35 steps,
+  fwd_attribution.py; shares meaningful, absolutes sync-inflated):
+  MLP 51%, attention 32%, norms/gating/embed/glue residue 17%.
+- Against measured kernel costs (~80-85 ms of matmuls in the rested
+  state), the forward carries roughly ~35-45 ms/step of NON-matmul work:
+  paged attention at M=17, rope, q/k norms, 4 layernorms x 52 layers,
+  residual/gating glue -- hundreds of small dispatches.
+- Implication: the parked fused verify (muse_step_run_aux, one command
+  buffer) is the right next arc -- it was abandoned at 199.7 vs eager
+  180.4 ONLY because its matmuls used the old 2-warp simdgroup
+  qgemm_sm_rm. Port plan: replace launch_qgemm_sm_rm inside the fused
+  step with muse_xpose32 (already present for the deep-K route) +
+  launch_qgemm_sm at the production variants (15/16/17) + the existing
+  reduce_rm fold. Accept gate: rested 45-min A/B, VLLM_MUSE_FUSED_VERIFY
+  on vs off.
+- Raw: fwd_attribution_results.txt.
+
+## 2026-08-15 (15) - FUSED VERIFY RE-FLIPPED: Tensor Kernels Inside The Fused Step Win
+
+- The port was one function: emit_matvec in the fused muse_step already
+  did xpose32 + launch_qgemm_sm + reduce_rm -- it was pinned to the old
+  variant table (9-12). Updated to mirror the eager route (15/16/17, the
+  rested-A/B winner) for k-quants with N % 32 == 0.
+- Matched in-process fused-vs-eager (muse_verify_timing.py, back-to-back
+  same process): fused target forward M=17 **95.6 ms** (min 93.8) vs
+  eager **110.4** (min 107.0) -- fused wins by 14.8 ms/step (-13%),
+  exactly the re-flip the 08-13 entry predicted once kernels got fast
+  enough for encoder overhead to matter again. In-process rates during
+  the run: 18.5-18.6 tok/s.
+- Default flipped ON (VLLM_MUSE_FUSED_VERIFY=0 reverts). Rested-protocol
+  e2e confirmation (45-min idle + settle + triplet + acceptance +
+  coherence) launched in background; gate vs the canonical rested
+  baseline 17.81/17.56/17.58.
+- The forward attribution (entry 14) explains the win: ~35-45 ms of the
+  eager forward is non-matmul dispatch/glue that the single command
+  buffer absorbs.
+
+## 2026-08-15 (16) - Fused Verify CONFIRMED E2E: 20.1 tok/s Rested, New Canonical Baseline
+
+- Rested-protocol e2e with the fused verify default ON: **19.94 / 20.14 /
+  19.74 tok/s** vs the same-protocol eager baseline 17.81/17.56/17.58 =
+  **+13%**, matching the in-process forward delta (95.6 vs 110.4 ms)
+  almost exactly. Acceptance 649/375 = 1.73/draft (unchanged); coherent
+  greedy output. THIS IS THE NEW CANONICAL RESTED BASELINE.
+- Campaign progression (spec-on): 8.6 -> 11.2 -> 16.26 -> 17.84 -> 18.26
+  (observed best, midday) -> canonical rested 17.81 -> **20.14** with the
+  fused verify. 2.34x over campaign start; +24% today alone.
+- Step ledger position (rested): step ~= 127 ms = fused forward ~96 +
+  drafter ~21 + logits/rejection ~8 + engine ~8-10. Remaining measured
+  legs: drafter fusion (~15 ms; same emit_matvec/fused-step treatment now
+  proven twice), sample_draft glue (~3), engine residue, wide-q5_K stream
+  inside the fused forward, then the on-device rejection + drafter
+  proposer fusion the 08-13 plan named. Ceiling unchanged: ~50-62 tok/s
+  serving-side; 100 remains gated on a drafter artifact meeting
+  perf/drafter_requirements.md.
+- Raw: e2e_fused_cool.txt.
+
+## 2026-08-15 (17) - lm_head v31 Candidate: Wash (+1.8%); Cheap Candidates Exhausted
+
+- Matched bench of the shared lm_head (Q5_K, N=202048, streamed TWICE per
+  step: target compute_logits M=17 + drafter sample_draft M=16, ~8.5 ms
+  combined): v16 3430 us (1.71x floor) vs v31 3367 (1.68x) -- +1.8%,
+  within noise. The wide head is stream-bound; the split-K partials cost
+  amortizes over N=202048. No route change. Also confirmed: greedy
+  drafting already takes the fast path (draft_logits is
+  probabilistic-only), so sample_draft's remaining ~2 ms is glue.
+- With this, the sub-session-sized candidates are exhausted. The next
+  item of size is the drafter-forward fusion (bespoke emit-chain against
+  DFlashQwen3Model incl. the plain-torch context-KV precompute;
+  architecture notes in HANDOFF next-steps) -- a fresh-session arc.
+- Session-final state: canonical rested baseline **19.94 / 20.14 / 19.74
+  tok/s** (fused verify default, tensor kernel route). Campaign 8.6 ->
+  20.14 (2.34x). Serving ceiling ~50-62 with the current drafter; the
+  100 tok/s gate is the drafter artifact per perf/drafter_requirements.md.
+
+## 2026-08-15 (18) - bf16 Drafter Measured: Quantization Is NOT The Collapse; Gate Confirmed
+
+- Hypothesis tested: the drafter's positional acceptance collapse might be
+  Q4_K quantization noise (deep positions have thin logit margins).
+  Downloaded the published bf16 original
+  (meta-models/Muse-Glimmer-30B-assistant, 5.1 GB -- SAME 5-layer
+  architecture per its config) and ran the acceptance harness
+  (DRAFTER=bf16 switch added).
+- RESULT: statistically identical to the quantized drafter. Linear 2.52
+  (vs 2.46), buildable trees ~3.0-3.1 (vs ~3.0), impossible 611k-node
+  tree 3.46 (vs 3.47). **The collapse is architectural/training-depth,
+  not precision.** No published artifact reopens the 100 tok/s path; the
+  gate is a NEW drafter training effort per perf/drafter_requirements.md
+  (memo stands, now with the precision variable eliminated).
+- Infrastructure landed en route (keep -- it is the candidate-drafter test
+  rig): (a) drafter load_format independence (a GGUF target no longer
+  forces load_format=gguf onto a safetensors drafter; dflash/utils.py);
+  (b) published-name remap in MuseGlimmerDFlashDraftModel.load_weights
+  (encoder.fc -> model.fc, encoder.output_norm_enc -> model.hidden_norm,
+  bare layers./norm. -> model.*); (c) model.mask_embedding marked as
+  shared-loaded; (d) local config.json patches needed for the published
+  checkpoint (documented in drafter_requirements.md): model_type -> qwen3,
+  architectures -> DFlashMuseGlimmerDraftModel, vocab_size 202048,
+  dflash_config.swa_window_size 2048.
+- Search also confirmed: the muse-glimmer collection ships exactly ONE
+  drafter architecture (GGUF quant + this bf16 original); no deeper
+  variant exists publicly.
+
+## 2026-08-15 (19) - Post-Fused-Verify Step Ledger (current shipped state)
+
+- In-process split with the fused verify active (verify_step_timing.py +
+  drafter_ctx_kv wrap; sync-instrumented): target fwd M=17 **97.0 ms**
+  (was 119-127 eager -- fused win confirmed in-harness), drafter propose
+  20.0 (= model fwd 11.3 [floor 3.5] + sample_draft 4.9 [shared lm_head
+  ~3.4 + glue] + ctx-KV precompute 2.3 [plain-torch, ~35 small ops] +
+  prep glue 1.5), compute_logits 4.1, rejection 4.1, engine residue ~31
+  instrumented (~8-10 true). 18.6 tok/s instrumented in-process.
+- Remaining serving items by measured size: drafter forward fusion
+  (~8 ms, the bespoke DFlashQwen3 emit-chain -- the one remaining
+  multi-hour arc), engine residue (~8-10), sample_draft/ctx-KV glue
+  (~3-4 combined, high effort-to-win ratio), wide-q5_K stream inside the
+  fused forward. Note: the two shared-lm_head passes (target 4.1 +
+  drafter 3.4) cannot be batched -- they sit on opposite sides of the
+  rejection dependency.
+- The step is now ~127 ms rested (20.14 tok/s). All remaining serving
+  work compounds toward the measured ~50-62 ceiling; the 100 gate remains
+  the retrained drafter (requirements + test rig in
+  perf/drafter_requirements.md, precision variable eliminated).
+
+## 2026-08-15 (20) - Fused Drafter Step: Foundation Built (Inert), Splice Specified
+
+- Built and verified (compiles, binds, importable; NOTHING calls it yet --
+  serving unaffected): `dflash_step` namespace in qc_metal_serving.mm
+  (init/layer/run mirroring muse_step, specialized: 5 layers, no
+  attention gate, standard pre-norm residuals, all-SWA window 2048) plus
+  a `muse_rope_qk_neox` kernel (half-split pairing; the drafter keeps
+  NeoX while the target is interleaved -- muse_glimmer.py:155).
+- Remaining splice (the risk-bearing part, for a fresh session):
+  (a) registration in MuseGlimmerDFlashModel (walk self.layers; use the
+  same shards() helper pattern as muse_glimmer.py ~line 320 for
+  qkv_proj/gate_up_proj; kv_cache from attn.attn.kv_cache);
+  (b) block-BIDIRECTIONAL attention metadata: per-row seq_len = base + m
+  for EVERY row (the drafter denoises the whole block; contrast the
+  verify path's causal base + i + 1), stride-0 expanded block table +
+  slots exactly as `_maybe_fused_decode` builds them (read its metadata
+  construction below line 395 of muse_glimmer.py first);
+  (c) gated forward override (VLLM_MUSE_FUSED_DRAFTER=1, default OFF,
+  try/except -> eager fallback like the target's pattern), splicing after
+  the input assembly (embeds + fc encoder stay in torch initially);
+  (d) validation gate: drafter outputs bit-comparable vs eager (token-
+  identical greedy e2e), then propose timing (expect model fwd 11.3 ->
+  ~5-6 ms), then the rested A/B.
+- Expected win when landed: ~5-6 ms/step (~+1 tok/s at the current step).
+
+## 2026-08-15 (21) - Fused Drafter Spliced End-To-End; Engages Cleanly; Proposals WRONG (Gated Off)
+
+- The Python splice landed: _init_fused_step registration (incl. reusing
+  _gguf_hetero_shards for the mixed-type QKV -- the merged buffer is
+  RELEASED after warmup's eager forwards, a dim-1 IndexError otherwise),
+  _maybe_fused_forward (bidirectional block: bt/sl expanded with
+  seq_lens_gpu[:1] AS-IS for every row -- no per-row causal steps), gated
+  VLLM_MUSE_FUSED_DRAFTER=1 with try/except eager fallback.
+- With the gate ON: the fused path ENGAGES (zero fallbacks), serving is
+  healthy, and greedy output is character-identical (the rejection
+  invariant guarantees correctness regardless of drafter quality) -- but
+  acceptance CRATERS to 1/58 vs ~2.5 expected on the probe: the fused
+  drafter forward computes wrong proposals. DEFAULT REMAINS OFF; the tree
+  is healthy.
+- Debug plan (fresh session): activation-diff rig -- run eager and fused
+  drafter forwards on identical inputs (the muse_verify_timing pattern),
+  compare per-layer outputs. Suspects in order: (1) rope convention
+  (kernel muse_rope_qk_neox implements half-split (j, j+half); check
+  attn0.rotary_emb.is_neox_style at runtime -- qwen3_dflash.py:497 reads
+  it, and an interleaved A/B is a one-line pipeline swap); (2) attention
+  expansion semantics for the non-causal block (seq_len = base + m per
+  row); (3) q/k norm eps or application shape; (4) kv_store slot layout
+  vs the drafter cache group. NOTE the drafter GGUF has no
+  attention_sink_bias tensor (ruled out).
+- Infrastructure state: dflash_step (init/layer/run) + muse_rope_qk_neox
+  compiled and bound; splice complete; ONLY the numerical bug remains
+  between here and the ~5-6 ms/step win.
+
+- A/B addendum: swapping the fused drafter to INTERLEAVED rope produces
+  the identical 1/58 crater -- rope convention is ruled out as the sole
+  bug. Remaining suspects for the activation-diff rig: attention
+  expansion semantics for the non-causal block, q/k-norm application, kv
+  slot layout, and the input-embed path (mask embedding substitution
+  ordering). Kernel reverted to neox (the drafter's documented style).
+
+## 2026-08-15 (22) - FUSED DRAFTER FIXED AND VALIDATED: The Bug Was Causal Semantics
+
+- The activation-diff rig (fused_drafter_diff.py, iterated through 14
+  output snapshots) localized and fixed the fused drafter in three moves:
+  (1) STRIDE-0 SEQ_LENS: the kernel reads seq_lens as a contiguous int32
+  array; a bare .expand(m) passed one element and rows 1+ read garbage
+  (row-0-perfect/rest-garbage signature). (2) THE REAL SEMANTICS BUG:
+  this fork's DFlash runs SWA layers CAUSAL (qwen3_dflash.py:59 -- no
+  dflash_config.causal override in the published config), NOT
+  block-bidirectional as llama.cpp's global non-causal suggested; the
+  expansion is the target verify's exact per-row causal construction
+  (base + i + 1). (3) A rig artifact (_fused_ready is an INSTANCE attr;
+  class-level reset silently reused 1-layer registrations) manufactured a
+  fake layer-1 divergence -- worth remembering for future monkeypatch
+  rigs.
+- End state: every layer matches eager at quantization precision
+  (7-11e-3), full 5-layer forward rel 6.99e-03. Production under the
+  gate: token-identical greedy, acceptance 695/392 = 1.77/draft (normal),
+  zero fallbacks, warm-chassis bench 19.53/19.12/19.32 (suggestive +1
+  vs the ~18.5 warm state).
+- Rested A/B vs the canonical 19.94/20.14/19.74 running in background;
+  flip the default on a win. Additional fixes landed en route: fused-
+  verify m-gate (m in {3,5,6,7} would hit missing qgemv_mm pipelines --
+  LATENT PRODUCTION CRASH exposed by the fused-verify default flip, now
+  guarded), and the debug-buffer mlp_h split in dflash_step.
+- Artifacts: fused_drafter_diff.py + out1..14 in
+  perf/results/2026-08-15/plain-step-decomp/.
+
+## 2026-08-15 (23) - Fused Drafter Rested A/B: WASH; Default Stays OFF
+
+- Rested protocol, fused drafter ON: 19.87 / 19.73 / 19.68 vs canonical
+  OFF 19.94 / 20.14 / 19.74 -- within protocol noise, acceptance
+  identical (1.74/draft). No flip.
+- Why no win: the drafter is only 5 layers -- its ~11.3 ms forward is
+  mostly kernel time (~7 ms of matmuls at ~2x floor) + attention, not the
+  dispatch storm that made the 52-layer target fusion worth 15 ms. The
+  fused chain also pays one muse_xpose32 per matmul.
+- The path RETAINS value as infrastructure: (a) parity-exact fused
+  drafter forward, token-identical in production, behind
+  VLLM_MUSE_FUSED_DRAFTER=1; (b) the platform for fusing MORE of propose
+  (ctx-KV precompute + draft sampling into the same command buffer),
+  where the real remaining drafter overhead lives (~8 ms of
+  sample+ctx+glue); (c) re-test the flip when the step shrinks further
+  and dispatch fraction grows.
+- Session tally on the fused-drafter arc: 1 semantics discovery (fork
+  DFlash SWA layers are CAUSAL), 1 latent production crash fixed (fused
+  verify m-gate), 1 kernel-ABI rule confirmed (contiguous seq_lens), all
+  documented.
+
+## 2026-08-15 (24) - Fused Greedy Draft Sampling: Correct, Neutral, Config-Gated
+
+- Built dflash_sample_greedy (one command buffer: shared-lm_head GEMM via
+  the wide-N tensor kernel + new muse_argmax row-reduce kernel;
+  softcap/logit-scale argmax-invariant and skipped) + get_top_tokens on
+  MuseGlimmerDFlashDraftModel, integrating through the EXISTING
+  use_local_argmax_reduction speculator hook -- zero propose
+  restructuring. Engages cleanly (init log), token-stream and acceptance
+  unchanged.
+- Measured (sync-instrumented in-process): drafter_sample 5.17 vs 4.93 ms
+  baseline -- NEUTRAL; the lm_head GEMM dominates both paths and the op
+  saves only ~2 small dispatches (<= ~1 ms un-synced, below the rested
+  protocol's noise floor at the current step size). Per methodology: NOT
+  enabled in the profile; available via
+  speculative_config.use_local_argmax_reduction for when the step
+  shrinks.
+- Drafter ledger after today: model-forward fusion (wash), sample fusion
+  (neutral), prep glue (done), ctx-KV (2.3 ms, unfused -- fold into the
+  fused drafter chain when that path gets re-tested). The drafter's
+  remaining recoverable at current step size is small; the big open items
+  are ENGINE RESIDUE (~8-10 ms in-process + the API-server gap) and the
+  WIDE-q5_K STREAM (gate/up/lm_head at 1.7-1.9x floor, ~12+ ms/step).
+
+## 2026-08-15 (25) - Engine Residue Decomposed: The Loop Is Free; The Ledger Fully Closes
+
+- Engine-side wraps (pure-CPU timing): sched_schedule 0.04 ms,
+  sched_update 0.03, runner_add_requests 2.75, worker_sample_tokens
+  30.49. The step accounts EXACTLY: execute_model 105.0 (= fused target
+  fwd 98.0 + logits 4.15 + glue ~3) + sample_tokens 30.5 (= drafter
+  propose 20.0 + rejection 4.15 + sampling/bookkeeping ~6) + scheduler
+  ~0.1 = 135.6 vs measured wall 136.3 ms/step. THE "ENGINE RESIDUE" WAS
+  AN ACCOUNTING ARTIFACT -- the drafter runs inside sample_tokens,
+  outside execute_model; the engine loop itself is free.
+- Fully-closed step ledger (in-process instrumented; rested e2e ~127 ms):
+  target forward 98 (floor 38.6 -- the gap is the wide-q5_K stream +
+  attention inside the fused step), drafter 20 (worked to its practical
+  floor today), logits 4.2, rejection 4.2, sampling glue ~6,
+  add_requests 2.8.
+- Strategic read: tail+drafter perfected saves ~25 ms -> ~110 ms step ->
+  ~25 tok/s. The dominant remaining lever is the TARGET FORWARD's ~60 ms
+  gap to floor, which is (a) the wide-q5_K stream (gate/up ~40 ms at
+  1.9x floor; no native operand exists for 5-bit -- open kernel
+  research), and (b) attention + residual glue (~20 ms). This is where
+  all future serving sessions should aim first.
+
+## 2026-08-15 (26) - CONTEXT SCALING MEASURED: The Bench Prompt Was Hiding The Real Bottleneck
+
+- Decode throughput vs context length (192-token greedy, thermal-checked
+  with a short-ctx rerun): FUSED verify 20.25 tok/s @ 78-token prompt ->
+  **8.15 @ 1734** (short-again 20.05 confirms non-thermal). EAGER verify:
+  14.36 -> 7.27 -- BOTH paths crater ~2.5x at only 1.7k context. This
+  model's mission is long-context agentic work (131k max); the 78-token
+  essay bench has been masking the dominant production bottleneck.
+- Mechanism: step grows ~+200 ms at 1.7k ctx. The verify attention's
+  per-virtual-row KV re-read (17 rows x ctx x 52 layers ~= 6.1 GB) only
+  accounts for ~13 ms of that -- the paged attention kernel's per-row
+  scan is ~15x off bandwidth at length (latency-bound serial K-walk).
+  Proper multi-query attention at this shape should cost ~1-2 ms.
+- PRIORITY REORDER (supersedes entry 25's ordering): the #1 serving item
+  is now a MULTI-QUERY VERIFY ATTENTION kernel -- one shared KV pass for
+  all 17 query rows with the per-row causal boundary applied in-kernel
+  (and the drafter's block equivalently). Worth 2-3x at production
+  context lengths, far more than the wide-q5_K stream's ~10%. Applies to
+  BOTH the fused and eager paths (both measured equally afflicted; no
+  config-level mitigation exists).
+- Bench methodology fix required: add a long-context arm (>= 2k prompt)
+  to the standard bench so this class of regression is visible; the
+  short-prompt triplet alone is not representative of the product
+  workload.
+
+## 2026-08-15 (27) - CORRECTION to (26): The "Context Crater" Was Prefill Contamination
+
+- Entry (26)'s 20.25 -> 8.15 finding conflated PREFILL with decode: the
+  single-shot API bench divides completion tokens by a wall that includes
+  processing the 1734-token prompt. With the prompt prefix-CACHED
+  (run 2+), long-context decode measures **16.10 / 16.11 tok/s** on the
+  expansion path vs 14.55 on the SDPA-gather path -- the expansion route
+  WINS at 1.7k context, and the true decode penalty vs short context is
+  ~20% (20.25 -> 16.1 at ~330 -> ~1900 ctx; +35 ms/step, consistent with
+  the linear KV re-read + kernel factor).
+- Consequences: (a) the multi-query verify attention kernel drops from
+  measured-#1 back to a LARGE-context item (the linear re-read still
+  crosses over somewhere past ~2k -- measure at 8k/32k before building);
+  (b) the VLLM_EXPAND_CTX_MAX threshold knob is retained defaulting to
+  no-op (backend + fused gate), ready for that measurement; (c) the m-gate
+  crash fix from this arc remains valid and shipped.
+- METHODOLOGY RULE (added to the bench discipline): single-request API
+  benches measure decode ONLY from cached-prompt repeat runs (or subtract
+  prefill via usage timings). Run-1 of any new prompt is a
+  prefill+decode composite. Entry (26)'s bench-arm recommendation stands,
+  with this correction applied.
+- Prefill observation for the record: 1734 tokens prefilled in ~13-16 s
+  (~110-130 tok/s) -- slow, a separate workstream if prefill latency ever
+  matters for the product.
+
+## 2026-08-15 (28) - 8k-Context A/B: Both Attention Routes Converge; Degradation Source Is SHARED And Unidentified
+
+- Cached-prompt decode at 9871-token context: EXPANSION 9.08/8.88 tok/s
+  vs SDPA-gather 9.14/9.19 -- a wash. Context scaling of decode
+  (cached): ~330 ctx -> 20.25, ~1.9k -> 16.1, ~9.9k -> ~9.1.
+- The multi-query/17x-re-read theory is DEAD as the primary mechanism:
+  SDPA reads each key once yet degrades identically. The shared +167
+  ms/step at 10k is NOT the KV bytes either (9871 x 4 KB x 52 layers
+  ~= 2 GB/step ~= 4.5 ms at stream rate). Something both paths pay
+  scales with context: candidates for the next in-process long-ctx
+  decomposition -- (a) the paged/SDPA attention KERNEL time itself
+  (per-key latency far off stream rate in both), (b) drafter-side
+  context work (its 5-layer attention + any per-step context-length
+  machinery), (c) per-step host prep proportional to blocks
+  (block-table/expansion tensor builds at 617 blocks), (d) KV-cache
+  locality (2 GB working set vs SLC).
+- NEXT MEASUREMENT (bounded): the verify_step_timing harness with an
+  ~8k cached prompt -- the existing per-stage wraps will attribute the
+  +167 ms directly. Do this BEFORE building any attention kernel; the
+  fix follows the attribution.
+- The VLLM_EXPAND_CTX_MAX knob stays no-op by default (paths equivalent
+  at every measured length).
+
+## 2026-08-15 (29) - Long-Context Attribution: It IS The Attention Kernels (Precisely, Now)
+
+- In-process decomposition at 9871-token cached context: target fwd M=17
+  **207.8 ms** (vs 98.0 short: +110), drafter fwd 20.9 (vs 11.2: +10),
+  ALL other stages flat (logits 4.2, rejection 3.1, ctx-KV 2.5, sample
+  5.1, add_requests 2.8, scheduler ~0.07). The entire long-context loss
+  is the two forwards' ATTENTION; matmuls do not scale with ctx.
+- Per-layer arithmetic at 9.9k: ~2.1 ms of attention per target layer vs
+  a ~87 us KV-stream floor (40 MB/layer; window-clamped local layers
+  lower the average) -- the per-row scan is ~25x off stream rate. The
+  SDPA gather pays an equivalent price differently (2+ GB of index_select
+  gather per step), which is why (28) measured a wash.
+- THE BUILD SPEC (next session-scale arc, now fully evidence-backed): a
+  flash-decode-style VERIFY ATTENTION kernel -- per (kv_head, KV-chunk)
+  threadgroup streams K/V once, scores all 17 query rows (x4 GQA heads)
+  per chunk with online softmax and per-row causal boundary + window
+  clamp, partials reduced across chunks. Floor ~4.5 ms total at 10k ctx
+  vs ~110 today; also fixes the drafter (same kernel, 5 layers).
+  Applies to both eager (backend route) and fused (launch swap) paths.
+- Bench-arm note: the repetitive 8k filler prompt drops acceptance to
+  2.06 tok/step (drafter sees degenerate text) -- long-ctx bench arms
+  should use natural long documents, not repeated filler.
+
+## 2026-08-15 (30) - Multi-Query Verify Attention: KERNEL PROVEN; E2E Composition Open
+
+- BUILT AND VALIDATED at kernel level: paged_attention_verify (m rows
+  cooperate per (head, partition) threadgroup; K/V tiles staged once per
+  tg instead of once per row; per-row causal boundary + window in-kernel;
+  partial layout shared with the v2 reduce). Parity EXACT vs the
+  expansion kernel and SDPA at every tested config. Timing per layer
+  (M=17, D=128, GQA 32/8): ctx 330: 666 vs 208 us (expansion wins short);
+  1.9k: 695 vs 847 (+1.2x); **9.9k global: 1661 vs 6460 (+3.9x)**; 9.9k
+  windowed: wash (expansion keeps SWA layers). Routed: eager backend
+  sends global-layer verify to the MQ kernel at ctx > 1024; the fused
+  verify hands off to eager past VLLM_FUSED_VERIFY_CTX_MAX (default
+  3072) since its encoder does not yet call the new kernel.
+- E2E at 9.9k cached: 8.95 vs 9.08 baseline -- NEUTRAL so far. Either the
+  route is not engaging as intended (verify with a branch log) or the
+  ~60 ms/step attention win on 13 global layers is offset by eager-mode
+  overheads at a ~300 ms step (fused encoder loss ~15 ms + eager glue).
+  NEXT: in-process attribution at 10k with fused OFF + a one-shot
+  engagement log; if engaged-and-offset, plumb the MQ kernel INTO the
+  fused encoder (pass ctx_len; swap the attention launch for global
+  layers) to keep both wins.
+- Also observed: short-ctx cached decode 22.24 tok/s (best single
+  observation of the campaign; protocol-uncomparable to the 20.14
+  canonical -- noted, not claimed).
+- Artifacts: verify_attn_parity.py + outputs.
+
+## 2026-08-15 (31) - EAGER LONG-CONTEXT CORRECTNESS BUG FOUND AND FIXED (via the MQ route debug)
+
+- Chasing the MQ route's non-engagement exposed a REAL quality bug:
+  vLLM's Attention() falls back to cache_config.sliding_window when
+  per_layer_sliding_window is None, so ALL 52 muse layers -- including
+  the 13 global NoPE layers -- carried window=2048 in the eager path
+  (confirmed: per-impl logging showed window=2048 on every instance).
+  Beyond 2048 context, eager mode silently clamped the model's
+  long-range attention. The fused path always registered window=0 for
+  globals and was correct -- which also means the entire pre-fused era of
+  this campaign served DEGRADED outputs beyond 2k context in eager mode.
+- Fix: MuseGlimmerAttention forces attn.impl.sliding_window = None for
+  global layers post-construction (muse_glimmer.py, with the mechanism
+  documented). Validation at 9.9k ctx (eager): acceptance recovered
+  2.06 -> 2.78 tok/step on the same prompt (wrong attention had been
+  suppressing target/draft agreement), throughput 7.92 -> 10.19 despite
+  correct global layers costing MORE than wrongly-clamped ones -- the MQ
+  kernel (now engaging, confirmed by log) is what makes correct
+  affordable (13 x 1.66 ms vs 13 x 6.46 expansion).
+- Fused remains the default at all contexts (it was always correct and
+  is still fastest); the VLLM_FUSED_VERIFY_CTX_MAX handoff reverts to
+  no-op. THE REMAINING ITEM: plumb paged_attention_verify into the fused
+  encoder's global-layer attention site (ctx_len arg + launch swap +
+  partials scratch) -- projected fused fwd at 10k: 207.8 -> ~145 ms.
+- Product note for the record: any deployment that ran EAGER (pre-today
+  default) beyond 2048 context served silently degraded long-range
+  attention. The fix is in; short-context behavior is unchanged.
+
+## 2026-08-15 (32) - MQ Kernel Plumbed Into The Fused Encoder: Long-Context Fused Forward -32 ms
+
+- ctx_len threaded through muse_step_run/_aux (host-known from the fused
+  gate); global layers at ctx > 1024 (and <= 32k partials cap) launch
+  paged_attention_verify + reduce inside the same command buffer, using
+  preallocated MQ partials scratch in the fused State (~18 MB).
+- Validation at 9.9k ctx (in-process): fused target fwd **207.8 -> 176.0
+  ms**; tok/step 2.78 (identical to the corrected eager -- acceptance
+  parity confirms the fused MQ math end to end); in-process 12.47 tok/s
+  vs 8.03 at the same point this morning (+55% net of the day's
+  long-context work: window-fix quality + MQ kernel). E2E under a
+  heat-soaked chassis: 10k cached 9.42/9.22 vs 9.08/8.88 (+4%; absolutes
+  compressed by throttle -- short-ctx reads 16 vs its 22 best in the same
+  state). Rested capstone (short triplet + 10k cached arm) launched in
+  background.
+- The long-context serving stack is now: correct global-layer attention
+  everywhere, MQ-shared KV reads in both eager and fused paths, and the
+  fused encoder default at every context. Remaining long-ctx headroom:
+  the M=1 plain-decode scan at length (partition/reduce kernels exist --
+  same plumbing pattern), and SWA-layer staging (window-capped, smaller).
+
+## 2026-08-15 (33) - Decode/Verify Distinction In The Fused Attention Site + Partitioned Decode At Length
+
+- Caught a latent bug in the just-landed MQ plumbing before it could
+  bite: the fused attention site could not distinguish a VERIFY block
+  (m rows = one request's queries -- MQ kernel valid) from a DECODE batch
+  (m rows = independent requests -- the MQ kernel would read only block
+  table row 0: WRONG for concurrent requests at long context). run_impl
+  now takes rows_are_one_request (run_aux -> true, run -> false) and the
+  MQ kernel is gated to verify blocks only.
+- Bonus from the same distinction: decode batches (including m=1 plain
+  decode) at ctx > 2048 now use the EXISTING partition/reduce kernels on
+  global layers (chunk-parallel scan instead of one serial walk per
+  (head,row)) -- the flash-decoding path the fused encoder never had.
+  Single-request bench semantics unchanged (verify blocks dominate);
+  concurrent long-context serving gets correct + faster attention.
+- Validation deferred until the rested capstone releases the machine
+  (its rest phase must not be contaminated); then: short smoke +
+  acceptance + a 10k cached check.
+
+## 2026-08-15 (34) - RESTED CAPSTONE: Final Configuration Validated On Both Arms
+
+- Rested protocol, final build (fused verify + MQ global-layer attention +
+  window-clamp fix + decode/verify distinction + partitioned decode):
+  short **19.97 / 19.97 / 19.86** (== canonical 19.94/20.14/19.74 -- no
+  regression from the entire long-context arc); 10k cached decode
+  **10.97 / 11.00** vs 9.08/8.88 pre-fix (**+21%** at production
+  context, AND the outputs are now correct -- the pre-fix eager numbers
+  carried clamped global attention). Acceptance 1.66/draft mixed ✓.
+- Day's final tally (16 hours of continuous campaign): short-ctx
+  16.26 -> 20.14 canonical (+24%); 10k-ctx 8.9 -> 11.0 (+21%) with a
+  silent quality bug fixed; six kernel generations; five correctness
+  bugs found and fixed; 34 notebook entries; three methodology rules;
+  two standing decision documents (drafter_requirements.md gating the
+  100 tok/s target; the serving roadmap items with evidence).
+
+## 2026-08-15 (35) - Drafter Training Feasibility Spike: Pipeline Proven, Timeline Measured
+
+- Built and measured the two halves of the retraining pipeline (the gate
+  to 100 tok/s), without starting any training run:
+  capture 232 tok/s (aux payload 66.6 KB/token -> streaming pipeline
+  mandatory, no disk shards); trainable reference module loads all 58
+  published bf16 tensors cleanly and trains at 545 tok/s (5L) / 468
+  tok/s (9L target depth) on MPS with loss decreasing.
+- Combined local pipeline ~155 tok/s -> 100M tokens ~= 7.5 days
+  machine-dedicated; 300M ~= 22 (optimizable ~2/3). Rented node remains
+  the fast lane. Plan updated with measured numbers
+  (perf/drafter_training_plan.md addendum); tooling in
+  perf/drafter_training/.
+- The go/no-go now has: measured requirement (E >= 4.0 on the harness),
+  measured diagnosis (depth-wise conditioning, precision ruled out),
+  measured pipeline rates, working tooling, and a one-command start.
+  Decision remains with the user.
+
+## 2026-08-15 (36) - Streaming Trainer Complete: The 100 tok/s Path Is One Approved Command Away
+
+- stream_train.py: the full teacher->student streaming pipeline with the
+  REAL DFlash objective (teacher top-K CE, per-position weights on the
+  measured collapse zone), smoke-validated: 40 steps, loss 11.05 -> 9.70
+  monotone; combined pipeline **124 tok/s measured** (100M tokens ~= 9.3
+  local days). No training run started -- the smoke is minutes and
+  validates only that the objective optimizes.
+- Session-final state of the 100 tok/s question: requirement measured,
+  cause diagnosed, plan costed, pipeline BUILT and smoke-validated,
+  checkpoint gate ready. The remaining step is a human decision with a
+  measured price tag: ~9-28 local machine-days or ~1 rented-node week.
+  Serving stack: 19.97/19.97/19.86 short / 10.97-11.00 @10k, capstone-
+  validated, correct at all context lengths.
+
+## 2026-08-15 (37) - TIME-BOXED TRAINING PILOT RUNNING (3h wall limit; NOT the full run)
+
+- Completed the last run-glue: streaming FineWeb-Edu corpus loader (2.15
+  GB shard downloaded, 726k docs ~= 1B tokens), checkpoint/resume every
+  100 steps, wall-clock limit, and export_checkpoint.py (trainer state ->
+  servable safetensors dir with published naming + patched config,
+  directly scoreable by the E-gate harness via the fork's safetensors
+  drafter loading).
+- PILOT LAUNCHED: 3-hour wall limit, 9-layer student, real corpus.
+  Early health: loss descending on real data (8.80 -> 8.14 by step 80,
+  continuing the smoke curve), ~146 tok/s pipeline, checkpoints landing.
+  WHAT IT SHOWS: the full loop (train -> checkpoint -> export -> E-gate)
+  works end to end, plus a real loss-slope data point. WHAT IT CANNOT
+  SHOW: acceptance movement -- ~1.6M tokens is ~1.6% of the smallest
+  planned run; E-gate on the pilot checkpoint is expected ~= baseline
+  and validates PLUMBING only.
+- The FULL run (9-28 local days or a rented week) remains gated on the
+  user's go/no-go; the pilot is inside the session's normal multi-hour
+  experiment envelope and is checkpoint-resumable into a full run if
+  approved -- zero work wasted either way.
+
+## 2026-08-15 (38) - Pilot Closed Out: Full Pipeline EXECUTED End To End; E-Gate At Baseline As Predicted
+
+- The 3h pilot died with a session restart at ~step 730 but checkpointed
+  at step 700 (~540k tokens). Loss on real FineWeb: 11.05 -> ~6.2, still
+  descending. SUSTAINED pipeline rate ~47-58 tok/s (vs 124-146 early:
+  thermal decay affects training too) -- local full-run timelines revise
+  to ~2-4 machine-weeks for 100-300M tokens; the rented-node path is
+  unchanged (~1 week).
+- Checkpoint exported (102 tensors, 9L, 8.8 GB safetensors + patched
+  config incl. layer_types x9) and E-GATED through the real serving
+  stack: **linear E = 2.40 vs published baseline 2.46/2.52 -- at
+  baseline, exactly as predicted for 0.5% of a real run's tokens.** The
+  important validation: depth extension + 3h of training did NOT damage
+  the published behavior; the fine-tune path is stable. Every step of
+  the 100 tok/s pipeline has now been EXECUTED at small scale.
+- Config recipe for candidates gains one item: layer_types must match
+  the extended depth (harness recipe updated in practice; exporter
+  should write it -- noted for the run glue).
+- THE REMAINING STEP toward 100 tok/s is only scale: resume from
+  perf/drafter_training/ckpt/latest.pt with the same command and
+  ~2-4 local machine-weeks (or ~1 rented week), gating checkpoints on
+  E >= 4.0. Go/no-go remains with the user.
+
+## 2026-08-15 (39) - SCOPE RESET (user): Inference Engine And Kernels Only; Beat llama.cpp
+
+- User direction, verbatim intent: we are writing an inference engine and
+  custom kernels to serve Meta's published Muse-Glimmer + DFlash drafter
+  AS-IS in SlimServe; the goal is to EXCEED llama.cpp's performance. No
+  drafter training -- the vendor's own numbers (M5 Max: 26.6 plain /
+  50.2 spec via ExecuTorch, SAME 5-layer drafter) prove ~50 tok/s is
+  reachable with this artifact; our measured ~2.7 tokens/step matches
+  the ecosystem, so the entire gap is STEP TIME (kernels + engine).
+  The drafter-training workstream is closed; its 35 GB of artifacts
+  removed (scripts + notebook history retained as record).
+- Reference bar: llama.cpp on this box 26.75 plain / 30.8 spec (our
+  measurement; predates llama.cpp PR 26842); ExecuTorch 26.6 / 50.2
+  (vendor). Us: 20.14 spec / ~16 plain fused. Beat 30.8 first, then
+  chase 50.2. Step math: 30.8 needs ~88 ms/step (we are at ~127);
+  50.2 needs ~53 ms.
+- Lessons pulled from llama.cpp PRs (user-provided): PR 26842 ships
+  GPU argmax draft sampling for the greedy path (in-graph ggml_argmax,
+  token-ids-only readback) -- the same design as our
+  dflash_sample_greedy/get_top_tokens; now ENABLED in the muse profile
+  (use_local_argmax_reduction: true). PR 26841 is the model-support PR.
+- VENDOR BENCH CONFIG: the published numbers use the K-Quant-17GB
+  UNIFORM Q4_K_M artifact, not the 19.7 GB dynamic quant our profile
+  defaults to. Uniform Q4_K means the uint4-native tensor kernel covers
+  most of the model (on dynamic, gate/up are Q5_K with no native
+  operand) plus ~15% fewer bytes/step. Download + bench in progress
+  (--quant kquant-17gb).
+
+## 2026-08-19 (1) - NEW CAMPAIGN KICKOFF: Qwen3.8-27B + DFlash 2 on Metal
+
+- User mandate (2026-08-19): support a new SlimServe profile on Metal --
+  Qwen3.8-27B (unsloth UD-Q2_K_XL GGUF + mmproj-F16 vision tower)
+  speculated by the DFlash 2 drafter released 2026-08-18 by Inco AI
+  (z-lab/Qwen3.8-27B-DFlash2-GGUF, Q4_K_M). Prior Muse campaign state
+  is committed and pushed at `ad8e8e937`.
+- Artifacts (sizes from the HF tree API, hashes from the file pages):
+  - unsloth/Qwen3.8-27B-GGUF `Qwen3.8-27B-UD-Q2_K_XL.gguf`
+    10,676,423,744 B, sha256
+    46151b52a5cad673d90a00222103254864326c251130b8fc4381d6f34386b3c8
+  - unsloth/Qwen3.8-27B-GGUF `mmproj-F16.gguf` 927,607,488 B
+  - z-lab/Qwen3.8-27B-DFlash2-GGUF `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`
+    1,143,006,752 B, sha256
+    18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594
+- TARGET MODEL IS NOT MUSE-SHAPED: unsloth config.json says
+  Qwen3_5ForConditionalGeneration (model_type qwen3_5) -- 64 text
+  layers in a 3:1 hybrid (48 linear_attention gated-deltanet layers,
+  conv kernel 4, 16 K-heads/48 V-heads at 128 dim; 16 full_attention
+  layers, GQA 24/4, head_dim 256, partial rotary 0.25, MROPE
+  interleaved [11,11,10]), hidden 5120, vocab 248320, 262k ctx, native
+  MTP head (1 layer, unused by us), and a qwen3_5_vision tower (27
+  blocks, hidden 1152, patch 16, merge 2x2, out 5120). The linear
+  attention layers are the big Metal support question, not the drafter.
+- Drafter (incoai/Qwen3.8-27B-DFlash2 config.json): DFlash2DraftModel,
+  qwen3-classed, 5 layers, SWA 2048, heads 32/8 at 128 dim, hidden
+  5120, reads target_layer_ids [5, 19, 33, 47, 61]; dflash_config:
+  block_size 8, conv_kernel_size 2 (two-tap dynamic, group 16),
+  selector_rank 256, selector_top_k 16, mask_token_id 248070.
+- DFlash 2 = DFlash + two additions (blog, 2026-08-18): (a) a path
+  selector -- keep top-16 candidates per position, score adjacent pairs
+  S_t(a,b) = U_t(b) + <A(a) o H(h_t), B(b)> (low-rank bilinear, 256-d,
+  ~2M params, +0.6% cycle), then one greedy/sampled walk from the last
+  verified token; (b) two-tap dynamic depthwise convolutions before and
+  after every attention/MLP sublayer (k_t0*x_t + k_t1*x_{t-1}, base
+  kernel + per-16-channel content correction, first position taps the
+  last verified token) to kill suffix decay (+3% params, +0.7% cycle).
+  Rejection sampling is unchanged -- output provably identical.
+- Vendor numbers for THIS pairing (model card): mean acceptance 4.80 at
+  block 8 (GSM8K 5.46 / MATH-500 5.28 / HumanEval 4.39), 2.7-3.4x over
+  autoregressive at batch 1 in SGLang. Upstream vLLM launches it as
+  method "dflash" + num_speculative_tokens 7 -- DFlash2-ness comes from
+  the drafter's architecture, not a new method string. llama.cpp
+  support is an unmerged PR (master has DFlash 1 only, incl. spec-type
+  auto-detect #26814 and backend sampling #26958); oMLX also runs it
+  (blog demo on an M5 Max).
+- Next: map fork support surface (qwen3_5 target incl. gated-deltanet
+  linear attention on Metal, vision tower loading, dflash worker
+  changes for selector+conv), register the profile + sources, start the
+  ~12.7 GB download through SlimServe.
+
+## 2026-08-19 (2) - Support-Surface Map + Profile Registered (gated); Downloads Running
+
+- Fork scout (very thorough, full detail in HANDOFF.md): the slimserve
+  launcher needs ZERO code changes -- profiles.json is the only input,
+  the speculator engine block passes through verbatim to
+  SpeculativeConfig, and nothing in slimserve/ validates the method
+  string (vLLM does: pydantic Literal + extra="forbid" at
+  vllm/config/speculative.py:60-76, so keep method "dflash" like
+  upstream does for DFlash 2). The DFlash runtime is reusable end to
+  end: DFlashSpeculator's one-block layout (1 + k query rows),
+  prepare_dflash_inputs (Triton + native Metal op), embed/lm_head
+  sharing, rejection sampler. qwen3_dflash.py is the drafter base to
+  subclass (Muse precedent: override only precompute_and_store_context_kv
+  and get_top_tokens for Metal).
+- NOT reusable / absent: the fork's models dir is trimmed to 25 files --
+  no qwen3_5, no VL tower for it (registry entries for qwen3_vl etc. are
+  dead names). qwen3.py::Qwen3ForCausalLM is dense text-only. The GGUF
+  config parser and weight-adapter dispatch both hard-raise on unknown
+  general.architecture strings; the drafter dispatch is a two-way probe
+  on dflash.expert_count that needs a third branch for DFlash 2. The
+  fused Metal dflash_sample_greedy is gated m in [9,17]; block 8 = 8
+  rows falls outside it -- and DFlash 2 needs top-16 + path walk, not
+  argmax, so draft sampling is new work regardless (eager first).
+- THE BIG LIFT: 48 gated-deltanet linear-attention layers on Metal
+  (recurrent fp32 state + short causal conv, conv kernel 4). No Metal
+  kernel exists. References: upstream vLLM qwen3_next GDN Triton
+  kernels, llama.cpp qwen3.5 (tensor naming + CPU/Metal reference), our
+  hybrid KV manager from the Muse SWA/global split. Full-attention
+  layers (16) reuse the Metal GQA path but need head_dim 256 + partial
+  RoPE 0.25 + interleaved MRoPE checked against kernel support.
+- Registered (uncommitted): sources["qwen38-27b"] + gated
+  profiles["qwen38-q2kxl-1"] ("in-progress" -- the CLI refuses to serve
+  until the path is real; live validation therefore skips it). Engine:
+  reasoning_parser qwen3, tool_call_parser qwen3_xml (NEEDS LIVE
+  VALIDATION -- picked as the Qwen3.5-era XML format parser),
+  enable_prefix_caching false (recurrent state), num_speculative_tokens
+  7, kv_cache_dtype auto. tests/slimserve/test_profiles.py updated: 48
+  pass (source-set pin + modalities + the thinking/tool-calling default
+  gate, which is what forced the tool_call_parser choice).
+- Downloads running in the background via
+  slimserve.fetch.ensure(plan, assume_yes=True) called from Python (the
+  status gate blocks even --dry-run for in-progress profiles; using the
+  fetch module keeps SlimServe the download owner). 12.7 GB total to
+  ~/models/Qwen3.8-27B-GGUF and ~/models/Qwen3.8-27B-DFlash2-GGUF.
+- Next: GGUF ground truth (dump general.architecture + full metadata of
+  both files; the config-parser and adapter branches key off it), then
+  target text model (gated deltanet on Metal is the critical path),
+  vision tower, drafter class with convs+selector, speculator top-16
+  path-walk extension. Staged plan with file:line anchors in HANDOFF.md.
+
+## 2026-08-19 (3) - GGUF Ground Truth + DFlash 2 Reference Implementation Extracted
+
+- GGUF arch strings confirmed WITHOUT waiting for downloads (HF API
+  ?expand[]=gguf): target = "qwen35" (llama.cpp's exact arch name),
+  drafter = "dflash" -- the SAME string as the Muse and DSV4 drafters.
+  The fork's two-way drafter probe (dflash.expert_count) becomes
+  three-way; the DFlash 2 discriminator is `dflash.selector_rank` (or
+  the selector_hidden.weight tensor -- llama.cpp gates on the tensor).
+- llama.cpp DFlash 2 reference FETCHED: PR #27342 ("spec : add DFlash2
+  support (local convolution + candidate selector)"), single commit
+  5ecbe1ac1 on recent master, now at branch `dflash2-pr` in ~/llama.cpp.
+  Master also has arch LLM_ARCH_QWEN35 -- a working CPU/Metal reference
+  for the hybrid target (recurrent-state model list, rs_rollback).
+- Extracted drafter spec (llama-arch + src/models/dflash.cpp):
+  - Metadata keys: dflash.block_size / conv_kernel_size / conv_group_size
+    / selector_rank / selector_top_k.
+  - Tensors: per layer `blk.N.attn_conv_base` {n_embd, kernel=2, 2},
+    `blk.N.attn_conv_proj` {n_embd, 2*kernel*n_groups}, same pair for
+    ffn_conv; top-level `selector_predecessor` {rank, n_vocab} (A, a
+    token-embedding table), `selector_successor` {rank, n_vocab} (B),
+    `selector_hidden` {n_embd, rank} (H). n_groups = n_embd /
+    conv_group_size = 5120/16 = 320.
+  - Conv placement per layer: dynamic = conv_proj @ normed_hidden,
+    computed ONCE per sublayer pair; side 0 applied to the sublayer
+    INPUT (pre-attn on noise_norm, pre-ffn on cur), side 1 to the
+    sublayer OUTPUT, same dynamic. Conv math: for tap t in {0,1}:
+    out += (base[:,t,side] + repeat_per_group(coeff[group,t,side])) *
+    shift_block_local(x, t) -- shift zero-pads at block row 0, which IS
+    the anchor/verified token in the 1+N layout, so position 1's tap-1
+    naturally reads the last verified token (blog fig. 4).
+  - Selector graph (post-sampling, per block): candidates =
+    top_k(logits, 16); unary U = logits gathered at candidates; gate =
+    selector_hidden @ hidden per position; for pos >= 1: A =
+    get_rows(selector_predecessor, pos==1 ? anchor_id :
+    prev candidates), scores[a,b] = <A(a) * gate_pos, B(b)> + U_pos[b]
+    -> 16x16 matrix; graph packs [candidate_ids(f32), scores(256)] per
+    position into a lattice row (padded to n_embd) returned instead of
+    logits ("DFlash2 never consumes raw logits").
+  - Host walk: predecessor := 0 (pos-1 matrix rows are identical --
+    repeated across the anchor); per pos: greedy argmax over
+    scores[predecessor, :] at T=0, else softmax((s - max)/T) sample,
+    KEEPING the 16-way distribution per position for lossless rejection
+    sampling downstream.
+- vLLM mapping decided: keep method "dflash" (upstream does); the
+  selector walk replaces get_top_tokens/argmax in DFlashSpeculator when
+  the drafter config carries selector_rank; convs live inside the new
+  drafter model class (DFlashQwen3 base + 2 conv-proj GEMMs and 4
+  two-tap conv applications per layer, all block-local elementwise --
+  Metal-friendly, no new kernel needed for correctness, fusion later).
+- Also confirmed: the fork ALREADY vendors the full upstream GDN stack
+  (vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py --
+  "Inference-only Qwen3-Next/Qwen3.5", plus fla ops under
+  vllm/third_party/flash_linear_attention) but it is Triton/CUDA-bound;
+  Metal needs torch-native MPS or Metal-kernel equivalents of
+  chunk_gated_delta_rule / causal_conv1d / fused recurrent decode. The
+  layer/topology code is reusable as the algorithm reference in-tree.
+
+## 2026-08-19 (4) - Target Text-Model Chain Vendored + Fetch Resume Bug Fixed
+
+- Vendored (dense-trimmed, agent-executed, verified): models/qwen3_next.py
+  (837 -> 610 lines, MoE/EPLB/sequence-parallel dropped, MLP inlined,
+  CUDA-only fused_qk_rmsnorm_rope_gate dropped -- eager split+QK-norm+RoPE
+  kept) and models/qwen3_5.py (742 -> 400, dense text-only;
+  ForConditionalGeneration deferred to the Muse vision pattern), plus
+  configs/qwen3_5.py (upstream, MoE-free) and a thin configs/qwen3_next.py
+  re-export (transformers 5.14.1 ships Qwen3NextConfig) -- the fork's
+  configs/__init__.py had DANGLING registrations for all of these, now
+  healed. Registry: +Qwen3_5ForCausalLM, dead Moe multimodal entry
+  removed. Import + registry resolution verified on this machine (hybrid,
+  inner-state); ruff clean.
+- mamba_mixer2.py did NOT exist in the fork (GDN layer hard-imports
+  mamba_v2_sharded_weight_loader from it). Vendored a minimal module with
+  just that function; the FULL GDN module chain now imports on Metal
+  (Triton placeholder engages at import; runtime kernels remain the
+  campaign's critical path).
+- Runtime landmines logged for the GDN stage: QwenGatedDeltaNetAttention
+  picks forward_cuda on Metal (only xpu/cpu/rocm special-cased);
+  torch.ops.vllm.qwen_gdn_attention_core + RMSNormGated device pick will
+  need a Metal dispatch; v1/attention/backends/gdn_attn.py imports but
+  its kernels are CUDA.
+- FETCH RESUME BUG (slimserve/fetch.py): a short read (server closed the
+  stream at 9.83 of 10.7 GB) hit the `done != bytes` branch which
+  UNLINKED the .part before raising -- 9.8 GB discarded, restart from
+  zero. Fixed: keep the .part on short read (transport failure, not
+  corruption; the next attempt resumes via Range); the sha256-mismatch
+  branch still deletes. Download relaunched with a 20-retry wrapper
+  (scratchpad/fetch_qwen38.py).
+
+## 2026-08-19 (5) - GGUF Parsers Landed: Drafter Config + Tokenizer Verified Against The File
+
+- Drafter + mmproj side-fetched ahead of the 10.7 GB model (both dumped;
+  full ground truth in perf/qwen38_metal_design.md). Deltas vs the HF
+  configs worth remembering: mmproj image_size is 768 (HF vision config
+  implied bigger), projector `qwen3vl_merger`; drafter target_layers are
+  1-BASED [6,20,34,48,62] in GGUF, `dflash.attention.causal = False`
+  EXPLICIT (all 5 layers non-causal despite an all-True SWA pattern +
+  window 2048 -- the fork's per-layer causal table must obey the
+  override), block_size 8 COUNTS the anchor row (7 drafted), selector
+  A/B tables are Q4_K-quantized {256, 248320}, conv bases F32.
+- Landed: vllm/transformers_utils/gguf_qwen35.py
+  (build_qwen35_config_from_gguf for the target -- UNVERIFIED until the
+  model file completes; build_qwen38_dflash2_config_from_gguf +
+  build_qwen35_tokenizer_from_gguf + is_dflash2_gguf -- VERIFIED against
+  the drafter file: config fields all correct, tokenizer roundtrip OK
+  with the qwen35 pre split vendored from llama-vocab.cpp into
+  gguf_native.QWEN35_PRETOKENIZER_REGEX). gguf_config_parser.py: qwen35
+  branch + three-way dflash probe (expert_count -> DSV4, selector_rank
+  -> DFlash 2, else Muse). tokenizers/registry.py: qwen35 branch + the
+  dflash branch now discriminates DFlash 2 (which carries a full qwen35
+  tokenizer) from Muse instead of hard-assuming Muse.
+- Bug found while testing: transformers Qwen3Config NULLS sliding_window
+  unless use_sliding_window=True -- pinned after construction. (Muse
+  avoided this by using its own config class.)
+- Next: drafter model class (DFlash2QwenDraftModel = DFlashQwen3 base +
+  4 conv applications/2 dynamic projections per layer + selector head),
+  drafter GGUF weight adapter, speculator selector walk; then the target
+  side (weight adapter + GDN Metal runtime).
+
+## 2026-08-19 (6) - DFlash 2 Drafter Model Class + GGUF Adapter Landed (unit-verified)
+
+- vllm/model_executor/models/qwen3_dflash2.py: DFlash2QwenDecoderLayer
+  (two-tap dynamic conv around every attn/MLP sublayer; one coefficient
+  projection per sublayer pair reused for both sides; block-local shift
+  zero-padded at the anchor row; non-divisible token counts treated as
+  one block for profiling runs), DFlash2QwenModel (layers swapped via a
+  new decoder_layer_cls hook on DFlashQwen3Model -- 2-line base change;
+  Metal-native context-KV precompute BORROWED from the Muse drafter --
+  the method is model-agnostic), DFlash2QwenDraftModel (shared
+  embed/lm_head contract like Muse; selector A/B embeddings + H gate;
+  select_draft_path implements the greedy walk WITHOUT materializing the
+  16x16 lattice -- only the realized predecessor's score row is computed,
+  7 batched steps of (n_blocks, 16) work). Registered as
+  DFlash2QwenDraftModel -> qwen3_dflash2.
+- UNIT-VERIFIED: conv math exact (0.0 max err) against a naive per-token
+  per-tap reference on both sides; selector walk token-identical to a
+  manual step-by-step reference; import + registry resolution clean.
+- gguf_adapters/qwen3_dflash2.py: extends the Muse drafter adapter
+  (backbone schema is identical); adds conv + selector name mappings and
+  dequantizes the Q4_K conv projections and selector tables at load
+  (plain fp16 modules; ~270 MB total). Loader dispatch extended with the
+  selector_rank probe. NAME-MAP COMPLETENESS VERIFIED against the real
+  file: 81/81 tensors mapped, zero unmapped, zero spurious entries.
+- Temperature>0 selector sampling (keeping per-position 16-way
+  distributions for lossless rejection) is deliberately deferred; the
+  serving bench path is greedy.
+- REMAINING drafter-side: speculator wiring (call select_draft_path
+  instead of top-1 argmax when the drafter has a selector; plumb anchor
+  token ids; respect causal=False non-causal attention on Metal), then
+  an end-to-end drafter load test -- blocked on the target model
+  existing, since the drafter shares its embed/lm_head.
+
+## 2026-08-19 (7) - All Artifacts Local + Target Ground Truth; Registry Byte Bug; Quant-Matrix Finding
+
+- CORRECTION to (1): the model file's true size is 9,828,981,664 B and
+  its sha256 is fd4730dd8aad070517978752b63d530aeb1740d2283cab9fa24f1e404032ddb0
+  (LFS oid, confirmed via content-length AND the paths-info API). The
+  10,676,423,744 B + 46151b52... recorded at kickoff came from
+  small-model WebFetch summaries of the HF tree/blob pages and were
+  WRONG; the drafter and mmproj rows were right. Lesson: registry
+  bytes/sha come from `curl -I` content-length or the paths-info API
+  verbatim, never from a summarized page. The wrong byte count caused
+  every completed download to be rejected as a short read (the stream
+  "ended early" at exactly the true size). profiles.json corrected
+  (+ sha256 now recorded for the model file); fetch._download grew an
+  already-complete-.part fast path (validate + rename, no network), and
+  the finalize tail is factored into _finalize.
+- FETCH COMPLETE, all three artifacts sha/size-validated in ~/models.
+  Target config builder + qwen35 tokenizer VERIFIED against the model
+  file: 64 layers (48 linear, 16 full at idxs 3,7,...,63), heads 24/4 at
+  256, MRoPE sections [11,11,10] interleaved partial 0.25, GDN dims
+  16K/48V at 128 conv 4, vocab 248320, MTP layer (block_count 65)
+  excluded. Tokenizer roundtrip OK.
+- Target tensor ground truth (866 tensors; design doc updated): full
+  layers ship SPLIT q/k/v with the output gate FUSED INSIDE attn_q
+  (width 12288 = 24*256*2); linear layers ship FUSED attn_qkv (10240)
+  + attn_gate; pre-FFN norm is `post_attention_norm`; blk.64 = MTP,
+  skip.
+- THE QUANT-MATRIX FINDING: UD-Q2_K_XL spreads 15 tensor types incl.
+  NINE i-quant formats (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
+  IQ4_XS + Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K) across attn/ffn/ssm
+  projections. Muse Metal kernels cover K-quants only; DSV4 Metal adds
+  IQ2_XXS/Q2_K. Bring-up: load-time dequant for unsupported formats
+  (correctness first), then native Metal decode per format ranked by
+  bytes/step; llama.cpp ggml-metal (serves this exact artifact) is the
+  porting reference. This materially widens the kernel workstream vs
+  Muse.
+
+## 2026-08-20 (8) - Target GGUF Adapter Landed; Metal Kernel Audit; A_log Trap Caught
+
+- Metal quant-kernel audit (design doc updated): qgemv covers q8_0, q2_K
+  q3_K, q4_K, q5_K, q6_K, iq1_s, iq2_xxs, iq2_xs, iq3_xxs, iq4_xs,
+  iq4_nl; qgemm (M>1) covers the same MINUS iq2_xs and iq1_s. The
+  artifact's formats missing from EITHER path: IQ1_S, IQ1_M, IQ2_XS,
+  IQ2_S, IQ3_S = 179 tensors, 3.6 GiB quantized -> 22.3 GiB fp16 at
+  load-time dequant (bring-up plan; model resident ~28 GiB vs 9.2).
+  Native decode for those five formats is REQUIRED for the perf target
+  (fp16 layers triple bytes/step); llama.cpp ggml-metal is the port
+  reference.
+- gguf_adapters/qwen35.py landed + loader dispatch: layer-type-aware
+  name map (split q/k/v full layers with the gate fused inside attn_q --
+  passes through, the vendored attention declares the doubled q shard;
+  fused attn_qkv -> in_proj_qkv / attn_gate -> in_proj_z on GDN layers,
+  a 1:1 match with the vendored stacking mapper), MTP block unmapped
+  (iterator skips), conv1d reshaped (dim, kernel) -> (dim, 1, kernel),
+  embed table dequantized (Q2_K). VERIFIED against the file: 851/851
+  non-MTP tensors mapped bidirectionally, 15 MTP skipped.
+- A_LOG TRAP CAUGHT BEFORE IT SHIPPED: GGUF `ssm_a` stores the no-scan
+  form -exp(A_log) (llama.cpp multiplies it in directly:
+  "gate = alpha_softplus * ssm_a"); the vLLM fla kernels compute
+  -exp(A_log) themselves (fused_gdn_prefill_post_conv.py:136). The
+  adapter converts A_log = log(-ssm_a). Silent-garbage class of bug;
+  ground-truth discipline paid for itself.
+- First engine load test RUNNING (no-spec, max_model_len 8192): expect
+  weight loading to complete and the profiling forward to crash inside
+  the GDN Triton ops -- the crash site defines the next work item (the
+  torch-native MPS GDN runtime).
+
+## 2026-08-20 (9) - First Engine Bring-Up Arc: Four Blockers Fixed In Sequence
+
+Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
+
+1. slimserve engine_kwargs leaked `tool_call_parser` (an api_server
+   flag) into EngineArgs -- added to _SERVE_ONLY (serve_argv still
+   passes it to the server).
+2. Spawned EngineCore re-imports the launcher script: load scripts need
+   a __main__ guard (scratchpad script fixed; not a repo bug).
+3. MetalPlatform had no current_device() -- the GDN layer's RMSNormGated
+   init calls current_platform.current_device() (only CUDA implemented
+   it). Added classmethod returning "mps" to vllm/platforms/metal.py.
+4. GGUF quant config demands all shards of a fused module agree on
+   quantized-vs-skipped (is_layer_skipped_gguf): per-tensor dequant of
+   attn_qkv (IQ2_S) left in_proj_z quantized inside in_proj_qkvz.
+   Adapter now expands the dequant set to whole fused groups.
+5. The vendored qwen3_5 stacked mapper sends in_proj_qkv in with a
+   TUPLE shard id (0,1,2) -- the fused-module-from-checkpoint loader
+   path cannot split quantized bytes (GGUFUninitializedWeightTypeParameter
+   has no output_dim). Fix: GGUF quantizes each output row independently
+   and the reader hands data as (rows, bytes_per_row), so the adapter
+   row-slices attn_qkv into q/k/v (2048/2048/6144 rows) and emits
+   per-shard names in_proj_{q,k,v}_shard mapped to scalar shard ids --
+   suffix chosen to avoid the mapper's substring collisions
+   (".in_proj_q" would corrupt ".in_proj_qkvz" names). Muse's mixed-type
+   merged QKV (q4/q4/q6) is the precedent that scalar-shard GGUF merged
+   loading works.
+
+## 2026-08-20 (10) - WEIGHTS LOAD END TO END; GDN Torch-Native MPS Core In Flight
+
+- After the (9) fixes the load test progressed through model
+  construction AND full weight loading: 1250 tensors in ~70 s (row-split
+  qkv shards + 179 dequantized i-quant tensors + embed table). The
+  profiling forward then hit the predicted wall: GDN
+  _warmup_prefill_kernels -> fused_post_conv_prep -> Triton placeholder
+  (qwen_gdn_linear_attn.py:1033; CustomOp routes Metal to forward_mps
+  which defaults to forward_native = the fla Triton path).
+- Extracted the COMPLETE recurrence semantics from the in-tree Triton
+  sources (fused_recurrent.py:122-175, fused_sigmoid_gating.py:125-135,
+  call site :1610): per v-head fp32 state S[V=128,K=128], kv-head =
+  hv // 3; per token: l2norm(q,k) (eps 1e-6 inside sqrt), q *=
+  head_k_dim**-0.5, g = -exp(A_log)*softplus(a+dt_bias), S *= exp(g),
+  delta = (v - S@k) * sigmoid(b), S += outer(delta, k), o = S@q. Conv:
+  depthwise kernel-4 causal + SiLU over packed qkv (10240 dims), state
+  (slots, dim, 3) via is_conv_state_dim_first.
+- Agent task in flight: forward_mps + _forward_core_mps in
+  qwen_gdn_linear_attn.py (torch-native, fp32 state, varlen prefill +
+  decode, spec masks NotImplemented for now), verified against a
+  line-by-line numpy transcription of the Triton kernel before touching
+  the engine, then drive the load test to ENGINE UP or the next
+  non-GDN blocker.
+
+## 2026-08-20 (11) - llama.cpp Parity Oracle: Stale-Binary Detour, Clean Rebuild Running
+
+- Started the llama.cpp reference lane (parity oracle + perf bar for
+  this exact UD-Q2_K_XL artifact). First run failed: "missing tensor
+  blk.64.ssm_conv1d.weight" -- the server treated the MTP block as a
+  recurrent layer (printed n_layer 65, no nextn). Static analysis of
+  master's qwen35.cpp showed correct logic (nextn read before the
+  recurrent-layer fallback, guard i < n_layer()); the contradiction
+  resolved as a STALE BINARY: build/bin/llama-server was from April
+  (predating the July nextn/MTP handling; the arch itself is older, so
+  it loaded far enough to fail late), and `cmake --build` in the stale
+  dir exited 0 while rebuilding nothing. Clean out-of-source rebuild
+  (build-qwen38, Metal on) running. Lesson: verify the binary carries a
+  known-new string before trusting a reference measurement from a
+  prebuilt tree (`strings | grep` the assert text).
+- Also confirmed while scoping post-GDN risks: interleaved MRoPE is
+  pure torch (mrope_interleaved.py uses forward_native -- MPS-safe),
+  runner mrope plumbing exists in v1/worker/gpu (model_states/default,
+  mm/rope), MambaSpec hybrid state allocation is handled in the
+  worker's attn_utils, and metal_attn carries a per-metadata `causal`
+  flag (Muse-era) so the DFlash 2 drafter's all-non-causal attention
+  has a route.
+
+## 2026-08-20 (12) - llama.cpp Reference Baseline CAPTURED (this artifact, this box)
+
+- Clean build-qwen38 (master ece963f41, Metal; the env's custom-LLVM
+  LDFLAGS/CPPFLAGS must be unset -- they poison the dylib link with
+  missing C++ ABI symbols). Serves UD-Q2_K_XL correctly (MTP block
+  handled; n_layer 64).
+- PLAIN DECODE BAR: 35.67 / 35.37 / 33.55 tok/s (256-token greedy essay
+  prompt, matched positions; the familiar thermal decline), code prompt
+  34.35. Prefill 38.1 tok/s on the 11-token prompt (not meaningful).
+- Greedy output IDENTICAL across 3 runs -- llama.cpp is a deterministic
+  parity oracle for this artifact. The model thinks in <think> blocks on
+  the code prompt (chat-template-free /completion).
+- Raw JSON + server log: perf/results/2026-08-20/qwen38-llamacpp-ref/.
+- Campaign math: DFlash 2 vendor multiplier 2.7-3.4x over plain =>
+  llama.cpp-level step time + working DFlash 2 implies ~90-120 tok/s
+  spec on this box. Our plain bar to beat first: 35.67.
+
+## 2026-08-20 (13) - GDN MPS Core LANDED (verified 1.4e-6); IQ Tile Routing Gap Fixed
+
+- Agent-implemented torch-native GDN path in qwen_gdn_linear_attn.py
+  (+343 lines, no other files): Metal dispatch branch, forward_mps
+  (both qkvz layouts), _forward_core_mps (batched decode across all
+  sequences/heads incl. NULL-slot masking matching the Triton skip
+  semantics; per-sequence varlen prefill scan with initial-state load +
+  final-state scatter; spec masks NotImplementedError until the DFlash 2
+  wiring; fp32 state), plus pure conv/scan helpers. VERIFIED against a
+  line-by-line numpy port of the Triton kernels on CPU AND MPS: decode
+  T=1, varlen [5,9,3] and T<width edge cases, with/without initial
+  state, toy and real (16/48/128/128, dim-10240 conv) shapes -- max abs
+  err 1.4e-6 (gate 1e-4), conv state writebacks bit-exact.
+- Engine then advanced to the third GDN layer's out_proj and exposed a
+  GENERAL GGUF-Metal routing gap: MMQ_QUANT_TYPES lists only IQ2_XXS
+  (true for CUDA MMQ) so IQ3_XXS/IQ4_XS/IQ2_XS/IQ1_S at M > mmvq_safe
+  fell through to ggml_dequantize = NotImplementedError on Metal --
+  but qgemm.metal HAS tiles for all of them (iq1_s, iq2_xxs, iq2_xs,
+  iq3_xxs, iq4_xs, iq4_nl). Fix: METAL_MMQ_QUANT_TYPES in gguf/utils.py
+  + platform-aware pick in _fused_mul_mat_gguf. NUMERICALLY VERIFIED on
+  MPS with real tensors from the artifact (M=64 vs gguf-py dequant
+  ground truth): all five formats correct, max rel-to-mean err 0.3-1.5%
+  = fp16 accumulation noise.
+- Load-time dequant list SHRINKS to the formats with no Metal kernel at
+  all: {IQ1_M, IQ2_S, IQ3_S} = 125 tensors, 2.65 -> 14.65 GiB fp16
+  (+12 GiB; model resident ~21 GiB vs the previous plan's ~28).
+- Load test rerunning.
+
+## 2026-08-20 (14) - FIRST END-TO-END TOKENS (garbage); Bisect: Matmuls Exonerated
+
+- ENGINE UP + GENERATED through the full SlimServe-owned path: load,
+  profiling, KV/state allocation, prefill, 8 decode steps. Output is
+  garbage ('g:...0...arks' + CJK/byte soup) -- a correctness hunt, with
+  llama.cpp as the oracle (same artifact, deterministic).
+- Facts so far: tokenizer EXONERATED (prompt ids byte-identical to
+  llama.cpp /tokenize); step-0 top-5 is alien ('g','n','c','ch','3' vs
+  oracle ':',' speed',' as'), so PREFILL compute is wrong, not decode.
+  ssm_a EXONERATED (values all negative, magnitudes e^-5.5..e^-1 --
+  confirmed no-scan form; A_log = log(-ssm_a) correct). Full-attn
+  q|gate interleave MATCHES llama.cpp (per-head [q(256)|gate(256)],
+  view offsets in qwen35.cpp:273-297 == vendored chunk(dim=-1)).
+- Quantized matmuls EXONERATED at engine-realistic sizes: routed real
+  artifact tensors through _fused_mul_mat_gguf (the real router incl.
+  the muse sm-band 9..32) at M in {1,2,8,11,17}: ALL formats rel err
+  0.2-1.3% (fp16 accumulation). Latent gap found: M>=33 with quantized
+  N%32!=0 falls to the unimplemented Metal dequant (real modules there
+  are fused past N%32 -- in_proj_ba is 96 rows -- so not the garbage
+  source; logged as a routing TODO).
+- Next discriminator running: 1-token prompt ("Paris") -- position 0
+  makes RoPE identity and the GDN scan single-step, splitting
+  weights/norm-layout bugs from position/mask/scan bugs.
+
+## 2026-08-20 (15) - Discriminator: Pos-0 Plausible, Length Breaks It; Parity Hunt Launched
+
+- 1-token prompt "Paris": our top-5 ['-', '-P', '', '-Pro', '－'] --
+  PLAUSIBLE continuations (oracle: [',', ' ', ' (', ' -', "'t"]; note
+  ' -' appears in the oracle's own top-5). 11-token prompt: letter soup
+  (top-1 'g'). Decode from either degrades into byte soup within
+  ~2 steps.
+- Reading: weights, layouts, norms-as-weights, matmuls, tokenizer all
+  approximately right (a hard layout bug would not produce
+  "Paris-Provence"-style continuations). The failure grows with
+  SEQUENCE structure: prefill scan/conv over length, state writeback at
+  the prefill->decode boundary (ONETOK decode step 1 is already
+  garbage), or pos>0 attention/rope on the 16 full layers.
+- Checked: MRoPE with 1-D text positions bypasses the section logic
+  entirely (mrope.py forward_native) = standard partial NEOX rope over
+  64 dims, matching llama.cpp text semantics structurally.
+- Agent launched: layer-by-layer parity vs llama.cpp eval-callback on
+  the fixed 11-token prompt (env-gated per-layer dumps on our side;
+  cosine-per-position; drill into the first diverging layer's stages).
+  Top suspect flagged for it: the residual/norm WIRING order
+  (post_attention_norm as sandwich vs pre-norm placement) -- exactly the
+  class of bug that is invisible at pos-0-dominated single-token
+  forwards and catastrophic with length.
+
+## 2026-08-20 (16) - Housekeeping While Parity Hunt Runs: Regression Green, M>=33 Gap Closed
+
+- Regression sweep over the shared-file edits (tokenizer registry
+  reorder, dflash discriminators, METAL_MMQ routing, metal.py
+  current_device, qwen3_dflash decoder_layer_cls hook): 48 profile
+  tests pass; registry resolves all four model classes (Muse x2,
+  DFlash2, Qwen3_5). Full Muse serving smoke deferred to the pre-commit
+  gate (needs the GPU the parity hunt is using).
+- The M>=33 latent gap from (14) is closed: on Metal, quantized shapes
+  the tile cannot take (N % 32 != 0) past the vector-kernel batch limit
+  now chunk rows through ggml_mul_mat_vec_a8 instead of falling into
+  the unimplemented dequant. Verified on the raw 48-row Q8_0 tensor at
+  M in {33, 64, 100}: rel err 0.16-0.23%.
+
+## 2026-08-20 (17) - PARITY FOUND: Two Load-Convention Bugs; ESSAY Step-0 Now Matches Oracle Exactly
+
+- Method: llama.cpp eval-callback (build-qwen38, -ngl 99) on the fixed
+  11-token ESSAY prompt vs env-gated per-layer dumps from our engine
+  (VLLM_QWEN38_DEBUG_DUMP hooks in vendored qwen3_5.py; scratchpad
+  compare_forward.py samples llama.cpp's printed head/tail values +
+  full-tensor sums per node).
+- FIRST DIVERGENCE: layer 0 `attn_norm` (the very first RMSNorm).
+  cos 0.9994 but magnitude ~1.95x. Cause: llama.cpp's converter folds
+  +1 into every `*norm.weight` except `linear_attn.norm.weight`
+  (~/llama.cpp/conversion/qwen.py:394), and our vendored model uses
+  GemmaRMSNorm (x_hat * (1 + w)) -- we were computing x_hat * (w_hf + 2)
+  on every input/post-attn/q/k/final norm. GGUF norm means measured
+  ~0.97/1.23/1.94 (= HF + 1). FIX: `_degemma_gguf_norms` in
+  vllm/model_executor/models/qwen3_5.py subtracts 1 at load when
+  quantization == "gguf" (adapters untouched per constraints).
+- SECOND BUG (code-proven, then confirmed by parity): the converter's
+  `_LinearAttentionVReorderBase` stores every per-V-head GDN tensor
+  (qkv V rows, z/b/a rows, A_log, dt_bias, conv1d V channels, out_proj
+  COLUMNS) in ggml tiled-broadcast order -- q/k -> v pairing becomes
+  i_k = i_hv % 16, not HF's i_hv // 3. Our MPS scan used
+  repeat_interleave (HF grouped). Layout is self-consistent (out_proj
+  cols are quantized Q3K/Q4K/IQ* so un-permuting at load is
+  infeasible), so the FIX flips the expansion to tile semantics:
+  cfg.gdn_tiled_v_head_layout in gguf_qwen35.py; tiled_gqa branch in
+  _gdn_recurrent_scan_native (qwen_gdn_linear_attn.py), both MPS call
+  sites (decode + prefill). Explains the pos-0-plausible /
+  wrong-at-length signature: at t=0 the mispairing only swaps
+  similar-magnitude q.k scalars; the recurrent state then compounds it.
+- RESULT: layer-by-layer parity across ALL 64 layers, cos >= 0.9997 at
+  every attn_in/attn_out/l_out reference point (was cos ~0.1-0.5 from
+  layer 0). ESSAY step-0 top-5: [':' -1.04, ' speed' -2.04, ' as'
+  -2.79, ' completeness' -3.11, ' (' -3.48] vs oracle [':' -1.01,
+  ' speed' -2.07, ' as' -2.78, ' completeness' -3.14, ' (' -3.49].
+  CUDA/ROCm FLA kernels still assume HF grouped order -- flagged in
+  the module comment; must be wired before any non-Metal GGUF serving.
+- Diagnostics to remove later: the _Qwen38DumpState block in
+  qwen3_5.py (env-gated, zero-cost when VLLM_QWEN38_DEBUG_DUMP unset).
+  Raw logs: scratchpad llamacpp_eval_11tok.log, dump/our_forward*.npz,
+  probe_dump*.log.
+
+## 2026-08-20 (18) - ROOT CAUSES FOUND AND FIXED: Converter Conventions, Not Our Math
+
+- The parity hunt (llama.cpp eval-callback vs env-gated per-layer dumps,
+  11-token prompt) put first divergence at LAYER 0's attn_norm: cos
+  0.9994 but magnitude x1.95 -- and exposed TWO llama.cpp GGUF-CONVERTER
+  conventions our path did not undo:
+  1. NORM +1 FOLD (conversion/qwen.py:394): every *norm.weight except
+     linear_attn.norm carries +1 so ggml's plain RMS_NORM*w reproduces
+     HF's zero-centered Gemma-style norms. Our GemmaRMSNorm re-adds +1
+     at runtime -> effectively x_hat*(w_hf+2) on all 64 layers. Fix:
+     _degemma_gguf_norms subtracts 1.0 at load (gguf sources only).
+  2. GDN TILED V-HEAD ORDER (conversion/qwen.py:446-609): when
+     K-heads != V-heads the converter stores every per-V-head GDN tensor
+     in tiled-broadcast order -- GGUF v-head j pairs with k-head j % 16,
+     not HF's j // 3. Our scan used repeat_interleave (HF/Triton
+     convention) -> every v-head read the WRONG q/k head. Self-consistent
+     layout otherwise, so pos-0 stayed plausible while the recurrent
+     state scrambled with length -- the exact discriminator signature.
+     Fix: cfg.gdn_tiled_v_head_layout=True + tiled_gqa flag in the MPS
+     scan (un-permuting at load is infeasible: out_proj columns are
+     quantized). NOTE for any future CUDA run of this GGUF: the FLA
+     Triton kernels still assume grouped order.
+- VERIFIED: all 64 layers cos >= 0.9997 vs llama.cpp at every reference
+  point (was 0.1-0.5 from layer 0); ESSAY step-0 top-5 matches the
+  oracle within 0.04 nats across all five; greedy decode coherent and
+  oracle-matching (":\n\n1.  **Completeness"). 48 profile tests pass.
+- Diagnostics to remove before commit: _Qwen38DumpState in qwen3_5.py
+  (env-gated, zero-cost unset). Raw artifacts: scratchpad
+  llamacpp_eval_11tok.log, dump/our_forward*.npz, compare_forward.py.
+- Parity + first-tok/s bench running (pre-staged script; 3 greedy
+  256-token repeats + prefix-match vs the oracle).
+
+## 2026-08-20 (19) - FIRST MEASURED BASELINE: 2.5 tok/s plain, 504-char Greedy Parity
+
+- Greedy parity vs llama.cpp: the first 504 CHARACTERS (~120 tokens) of
+  the 256-token essay continuation are byte-identical before the
+  trajectories fork -- expected with 125 tensors dequantized to fp16 vs
+  llama.cpp's native i-quant reads (Muse precedent: greedy forks from fp
+  accumulation order alone). Output quality identical by inspection.
+  Correctness milestone COMPLETE for plain text decode.
+- FIRST TPS: 2.52 / 2.51 / 2.47 tok/s (3x greedy 256, in-process,
+  max_model_len 8192). llama.cpp bar: 35.67. Gap analysis per the
+  perf.md discipline: ~400 ms/step vs a ~46 ms bandwidth floor at the
+  CURRENT bloated residency (21 GiB: quantized 5.6 + fp16 dequants) --
+  i.e. ~8.7x dispatch/python-bound (the sequential GDN scan runs 48
+  layers x per-token python steps), on top of a 2.3x bytes penalty from
+  the IQ1_M/IQ2_S/IQ3_S fp16 dequants (native decode would put the
+  floor near 9.2 GiB/step ~ 20 ms). Raw:
+  perf/results/2026-08-20/qwen38-first-e2e/.
+- Roadmap from here (order per the always-on-spec mandate): (1) GDN
+  spec-state rollback in the MPS scan + drafter e2e + acceptance vs
+  vendor 4.80; (2) GDN decode dispatch-cost attack (fold the per-layer
+  step into fewer ops / a Metal kernel; muse_step-style fusion is the
+  precedent); (3) native IQ1_M/IQ2_S/IQ3_S Metal decode (llama.cpp
+  ggml-metal port) to reclaim the bytes; (4) head_dim-256 paged fast
+  path. Spec at vendor acceptance 4.8 multiplies whatever step time we
+  reach.
+
+## 2026-08-20 (20) - POLICY: Greedy Is Banned Stack-Wide (user directive)
+
+- User directive (emphatic): greedy/temperature-0 is not a supported
+  configuration anywhere in this stack -- he had already removed the
+  greedy flag deliberately, and validation/bench work MUST use the
+  model's shipped sampling defaults (this GGUF: general.sampling temp
+  1.0 / top_p 0.95 / top_k 20), seeded for repeatability. Saved to
+  auto-memory (no-greedy-benchmarks); this repo's opinionated stances
+  are the spec, the same way spec-always-on is.
+- Purged the greedy defaults found in the stack: slimserve/chat.py
+  Session.temperature 0.0 -> None (no override; /temp now rejects 0),
+  smoke.py's temperature=0.0 pin -> seeded, no sampling override
+  (stream.py chat_completion omits sampling params unless given). 57
+  slimserve tests pass.
+- Method corrections: layer-level parity (cosine on activations) needs
+  no sampling and stays the correctness instrument. Cross-run and
+  spec-vs-plain comparisons use SEEDED sampling -- this fork's rejection
+  sampler keys gumbel by (seed, position) precisely so seeded spec ==
+  seeded plain. The greedy-generated llama.cpp oracle files and the
+  greedy 2.5 tok/s baseline in (19) are SUPERSEDED as protocol; the
+  step-time attribution stands (sampling does not change bytes/step),
+  and the re-baseline at shipped defaults folds into the spec agent's
+  measurements.
+- Spec agent redirected mid-flight: sampled selector walk (softmax over
+  16 kept candidates per position, distributions retained for lossless
+  rejection sampling, per llama.cpp PR #27342's host walk) is PROMOTED
+  from deferred to the main deliverable, wired into the probabilistic
+  draft_logits path; acceptance measured at shipped defaults (vendor
+  4.80 was measured there).
+
+## 2026-08-20 (21) - SPEC ACCEPTANCE ROOT CAUSE: Task-Domain Dependence; We BEAT The Reference
+
+- Built the llama.cpp dflash2-pr oracle (worktree ~/llama.cpp-dflash2,
+  clean-env build) and ran the SAME two GGUFs through their DFlash 2
+  spec pipeline at OUR settings (temp 1.0 / top_p 0.95 / top_k 20,
+  seed 42, --spec-draft-n-max 7):
+  - Essay prompt (our bench prompt): draft acceptance 0.219 (119/544),
+    mean 2.51 tokens/step -- WORSE than our 3.20. Deterministic across
+    3 seeded runs. (Their tok/s not comparable: -v verbose logging.)
+  - GSM8K-style prompt, same settings: acceptance 0.555, ~4.74
+    tokens/step -- the vendor band (4.80 GSM8K, README 5.13-5.39
+    GSM8K).
+- VERDICT: the 3.20-vs-4.80 gap is dominated by TASK DOMAIN, not an
+  implementation bug. Vendor/README acceptance numbers are GSM8K
+  (low-entropy math); a temp-1.0 essay is a high-entropy task where the
+  REFERENCE implementation itself gets 2.5 tokens/step. Our stack beats
+  the reference on the same task (3.20 vs 2.51) -- consistent with our
+  selector-assisted greedy walk vs llama.cpp's sampled walk, or
+  numerics. Acceptance comparisons MUST be domain-matched from now on;
+  the bench suite needs a GSM8K-style arm for acceptance and an essay
+  arm for step-time.
+- Raw: scratchpad llamacpp_spec_oracle.log + task outputs; oracle
+  server on :8092 (left up for the agent's domain-matched run).
+- Remaining spec work (unchanged): sampled selector walk with kept
+  distributions (correct rejection-sampling math at T>0), recall@k
+  replay as drafter-forward health check, our-engine GSM8K acceptance
+  to confirm >= the oracle's 0.555/4.74.
+
+## 2026-08-20 (22) - VISION LANDED: Tower Parity ~1e-3 vs llama.cpp, Real Image Through The Real Engine
+
+- Agent-delivered vision side: qwen3_5_vision.py (742 lines: tower,
+  processor stack, Qwen3_5ForConditionalGeneration with the mamba/hybrid
+  interface trio + get_language_model for DFlash sharing), composite
+  config flip in gguf_qwen35.py (text-only fallback intact), adapter
+  _vision_weights (334/334 mmproj tensors, taps fused), registry entry.
+- VERIFIED: tower output vs llama.cpp llama-mtmd-cli embeddings dump:
+  token-0 values agree elementwise to ~1e-3, mean identical -- parity
+  grade. Engine smoke with a real 768x512 image: shapes/colors question
+  answered correctly ("red rectangle, yellow triangle, blue circle");
+  text path intact on the multimodal engine; 48 profile tests pass.
+- Notable implementation facts (full detail in the agent report):
+  patch-embed = two GGUF conv taps stacked (llama.cpp conversion splits
+  HF Conv3d), align-corners bilinear pos-embed interpolation in
+  merge order, ggml VISION rope == HF rotate-half verified, v.post_ln
+  is the MERGER norm, merger GELU exact-erf vs ggml tanh-approx
+  (deliberate, within F16 noise), smart-resize bounds 4096..589824 px.
+  Fork-specific processor fixes: _hf_processor_applies_updates=False +
+  passthrough _call_hf_processor for the mm-only/profiling path.
+- Open items from the smoke: a stray token ("Dinner") appears in BOTH
+  text and vision answers at temp 1.0 -- text-side sampling/quant quirk,
+  tracked separately; spec+image combined path unexercised.
+
+## 2026-08-20 (23) - Muse "Regression" Root-Caused: My Smoke's Override, Not Any Commit
+
+- The muse in-process failure (mm profiling: "0 prompt placeholders for
+  1 image item") reproduced IDENTICALLY at the live tree, at the qwen38
+  commit, AND at the fully-validated muse commit ad8e8e937 -- then
+  VANISHED at ad8e8e937 with profile-exact engine kwargs. Culprit: my
+  smoke script's max_model_len=8192 override; muse's profiling dummy
+  builds an image prompt whose placeholder region does not survive the
+  clamp. No commit broke anything. LESSON (gate method): regression
+  smokes run with PROFILE-EXACT engine kwargs, no overrides.
+- Also while bisecting: the stash's lone "autostash" entry dates to
+  Aug 7 (parent fccfe105a, DSpark-TurboQuant era) -- a stale rebase
+  leftover predating both campaigns, superseded by later commits. Left
+  in place; safe to drop.
+- Live-tree profile-exact muse smoke running to formally close the
+  shared-file regression gate.
+
+- GATE CLOSED: live-tree profile-exact muse smoke passes; seeded output
+  byte-identical to the ad8e8e937 baseline run (same head text) -- the
+  campaign's shared-file edits are numerically invisible to Muse.
+
+## 2026-08-20 (24) - NATIVE IQ DECODE COMPLETE: All Three Formats, _DEQUANT_TYPES Empty
+
+- Agent-delivered Metal decode for IQ2_S (82 B/block), IQ3_S (110 B),
+  IQ1_M (56 B, fused fp16 scale in the scale-word top nibbles; reuses
+  iq1s_grid with the -1+-delta form; IQ1M_DELTA=0.125 per current
+  llama.cpp AND gguf-py -- not the historical 0.0625). Grids ported
+  script-generated from ggml-common.h; math from ggml-quants.c
+  dequantize rows, cross-checked vs gguf-py.
+- VERIFIED on real artifact tensors through the real router at M in
+  {1,2,8,11,17,33,64}: rel err 0.20-0.36% ALL cells (gate 2%); the
+  10-format regression matrix unchanged (0.09-1.34%). Microbench
+  (contended GPU, reported not tuned): GEMV M=1 at 182-290 GB/s --
+  in-family with neighbors.
+- _DEQUANT_TYPES IS NOW EMPTY: every quantized format on this artifact
+  decodes natively on Metal (GEMV + tile GEMM). Only the Q2_K embed
+  table still dequantizes (separate name-based clause; needs the
+  dequant-gather kernel eventually). Model residency drops ~21 -> ~12
+  GiB (9.2 quantized + fp16 embed); the plain-decode bandwidth term
+  shrinks accordingly -- re-measure tok/s in the consolidation bench.
+- GGML id gotcha recorded: IQ3_S=21 precedes IQ2_S=22. Operational
+  gotcha: cp over a mapped .so inode -> macOS "Code Signature Invalid"
+  SIGKILL on dlopen; use rm-then-cp + codesign -f -s -. (Applies to
+  every metallib/.so refresh on this box.)
+
+## 2026-08-20 (25) - SPEC E2E COMPLETE AND ORACLE-BEATING; Two Substrate Bugs Exposed
+
+- GDN spec rollback DONE (verified 9.5e-7 vs numpy kernel ports incl.
+  resume-after-acceptance for every A in {1..8}, NULL slots, both GQA
+  layouts; conv slots bit-exact). Sampled selector walk DONE and ENGAGED
+  (sparse 16-way distributions into draft_logits; unit err 5.1e-8).
+  DFlash 2 fully up: drafter load, shared embed/lm_head, fc combine,
+  non-causal metal attention (bool False confirmed at the metadata),
+  native input prep, selector, rejection sampling, rollback per step.
+- MEASURED (essay, seeded shipped defaults, OLD metallib, V2 runner):
+  spec 4.02/4.12/3.62 tok/s, acceptance 2.71 mean / 0.244 draft rate
+  (per-position 0.72/0.42/0.25/0.15/0.08/0.05/0.04) -- BEATS the
+  llama.cpp oracle (2.51 / 0.219) on the same GGUFs+settings. Plain V2
+  6.40/6.43 tok/s (V1 was 2.5 -- the V2 runner alone is 2.6x).
+- SPEC < PLAIN on V2 (3.9 vs 6.4): a bug per spec-always-fastest;
+  attributed to the 8-position python GDN scan per verify step + CPU
+  rejection fallback -- the fusion workstream targets exactly this.
+- SUBSTRATE BUG 1 -- V2-on-Metal decode intermittently corrupt
+  (boot-dependent; prefill EXACT vs V1 at depth 0-32; some boots decode
+  48/48 identical, others collapse to repetition by ~20; async/steady-
+  meta/GDN-slots/block-tables/rope ruled out). Suspected MPS ordering
+  race in V2 buffer machinery (V1's CpuGpuBuffer got metal_compat
+  patches; V2's UVA pools assume CUDA depth-2 concurrency). NOTE: Muse
+  serves on V2 clean -- the corruption is qwen38-specific (hybrid state
+  machinery is the differential). Taints/depresses ALL V2 measurements
+  incl. acceptance above.
+- SUBSTRATE BUG 2 -- NEW-METALLIB REGRESSION: with the 08:43 metallib +
+  empty _DEQUANT_TYPES, spec NaN-crashes (rejection multinomial, 3/3)
+  and plain GSM8K floods "!"; plain essay TF clean. OLD build ran 256-tok
+  spec fine. Suspect: the new IQ kernels' BF16 activation variants --
+  the kernel verification ran fp16 x only. Testing standalone now.
+- Seeded spec-vs-plain identity NOT testable on Metal yet: MPS
+  gumbel/rejection fallbacks use unkeyed noise (native CUDA/HIP-only
+  seed parity) -- porting seed-keyed sampling to Metal is a follow-up.
+  Also: MPS rejection fallback lacks the Triton _sanitize_nan parity.
+- V2 spec runs require VLLM_USE_V2_MODEL_RUNNER=1 (hybrid target
+  defaults V1; V1 spec path crashes on torch.cuda.Stream).
+
+## 2026-08-20 (26) - New Kernels Exonerated (bf16 too); Corruption Unified Under One Hunt
+
+- Standalone router test of the three new IQ kernels PLUS IQ4_XS/Q4_K
+  controls at BOTH fp16 and bf16 activations, M in {1,4,8,17,64}: zero
+  NaN/inf anywhere; bf16 errors 1.5-5% across ALL formats including the
+  old ones (bf16 precision band, not breakage). The new-metallib NaN
+  crash is NOT the kernels' math.
+- Unifying theory: substrate bugs 1 and 2 are ONE bug -- the V2-on-Metal
+  boot-lottery decode corruption; the metallib swap merely shifts
+  dispatch timing (more native kernels = different race window).
+  Corrupt activations explain repetition collapse, "!" floods, AND NaN
+  probabilities in the rejection multinomial.
+- Sharpened hypothesis from the collapse signature: ~token 20 of decode
+  after an 11-token prompt = the FIRST NEW KV BLOCK append (block 16).
+  The V2 buffer layer already carries Metal-aware blocking in _h2d and
+  UvaBuffer (Muse-era); the staged-write/block-append path and the UVA
+  round-robin depth are the unpatched suspects. Agent launched with
+  discriminating tests (collapse-point-vs-prompt-length tracking,
+  max_concurrency=1, paranoid-sync bisect); fix bar: >= 6 consecutive
+  clean boots + Muse-V2 smoke unregressed.
+
+## 2026-08-20 (27) - Sleep Root Cause (ops) + DIVERGE@0 Evidence: Stale-GDN-State Hypothesis Promoted
+
+- OPS ROOT CAUSE of today's agent stalls and stop-start verification:
+  the MACHINE WAS SLEEPING (explicit in the last agent cut; the earlier
+  "500" stalls match the pattern). Sleep now blocked machine-wide
+  (adrafinil hold, lid-closed incl.) for long background runs -- add
+  this to the campaign ops checklist alongside rm-then-cp+codesign.
+- Verification speedups applied: gauntlet boots 3-in-parallel; probe
+  boots folded into the sample; post-gauntlet validation moves to a
+  persistent-server pattern (no more 2.5-min boot per measurement).
+- CRITICAL EVIDENCE before my collapse probe was stopped: same-seed
+  pair on the FIXED build, plen=2 -> DIVERGE@0 (second same-prompt
+  request in one engine splits at the FIRST decode token). Muse is
+  byte-identical seeded cross-boot on this machine => not generic MPS
+  sampler nondeterminism; the differential is RECURRENT STATE SLOTS.
+  Promoted hypothesis: stale GDN state -- torch.empty-allocated
+  conv/ssm caches ("boot lottery" = zero pages by luck) and/or missing
+  slot reinit on sequence start (has_initial_state=False must zero, not
+  read). Handed to the hunt agent with a one-line discriminator
+  (zero-fill at alloc + on sequence start) and instructions to
+  re-evidence or revert its staged-write fix.
+
+## 2026-08-20 (28) - ROOT CAUSE OF THE V2 CORRUPTION: Shared Block Pool vs K/V-First Cache Layout
+
+- Machine slept ~10 h (09:40 -> 19:34; the 2 h hold expired). Session
+  scratchpad AND agent transcripts were wiped, so the hunt agent's
+  gauntlet evidence is lost and the agent cannot be resumed. Its FIX
+  survived in the worktree (attn_utils.py). Sleep hold re-armed 4 h;
+  all future run evidence goes under perf/results, not the scratchpad.
+- THE BUG (attn_utils.py, agent-authored docstring is exact): hybrid
+  models allocate attention blocks and mamba state pages from ONE block-id
+  pool, so block i must map to the same bytes in every layer's view. The
+  Metal attention backend's K/V-FIRST layout (2, num_blocks, ...) stores
+  all K pages before all V pages => attention block i's K half sits at
+  byte offset i*page/2 = INSIDE mamba page i//2. Every KV-cache write
+  clobbers some GDN layer's conv/ssm state. Explains EVERYTHING: the
+  boot lottery (which blocks the allocator hands out), collapse at the
+  first new KV block (notebook (26)'s geometry), within-boot drift, the
+  second-request DIVERGE@0 (clobbered slots, NOT a reinit bug), NaN in
+  the rejection multinomial, and Muse's immunity (no mamba pages). The
+  new metallib only shifted timing.
+- THE FIX: _update_hybrid_attention_mamba_layout -- restride K/V-first
+  attention views to blocks-first in place (as_strided_, no data move),
+  mirroring upstream's V1-runner function that the V2 runner lacked.
+  Verified by the agent in one instrumented boot; my correction in (27)
+  (torch.empty / slot-reinit theory) is RETRACTED -- allocation is zeros
+  and the "stale state" was the clobber.
+- Gauntlet restarted by me: 3 parallel boots x 4 prompt lengths x
+  same-seed pairs (catches first-gen collapse AND second-request
+  contamination). Env-gated diagnostics left by the agent
+  (QWEN38_STATE_PROBE in model_runner.py/metal_attn.py) to be removed
+  before commit.
+
+## 2026-08-20 (29) - Gauntlet: 3/3 Clean + Cross-Boot Identical; Muse Clean; Seed-Keyed MPS Sampling Confirmed
+
+- Gauntlet boots 1-3 (fixed build, 3 parallel, 4 prompt lengths x
+  same-seed pairs): ALL 12 pairs IDENTICAL, every BOOT_VERDICT CLEAN, and
+  the outputs are identical ACROSS the three boots. Coherent on every
+  arm (the GSM8K arm reasons in thinking style). With the hunt agent's
+  instrumented boot: 4 clean. Boots 4-6 first attempt VOID (init OOM at
+  util 0.2 alongside Muse -- not corruption); rerunning at 0.3.
+- Muse profile-exact smoke on the final tree: ENGINE UP, coherent,
+  exit 0. Its seed-42 text differs from this morning's because the MPS
+  Gumbel path changed (below) -- expected, not a regression.
+- gumbel.py (+72, agent-authored): stateless splitmix64 (seed, pos,
+  column)-keyed Gumbel noise for MPS, replacing an unseeded global-RNG
+  fallback that silently ignored per-request seeds. This retroactively
+  explains the spec agent's "SEED_STABLE False plain-vs-plain" and
+  makes seeded repeatability real on Metal (the gauntlet's IDENTICAL
+  pairs are the proof). The spec-vs-plain seeded identity gate is now
+  testable -- queued for the spec bench.
+- Hunt diagnostics (QWEN38_STATE_PROBE hunks in model_runner.py and
+  metal_attn.py) removed; imports verified.
+- GAUNTLET COMPLETE: boots 4-6 CLEAN, 0 diverges => 7/7 clean boots
+  (6 mine + the agent's instrumented one), 24/24 same-seed pairs
+  identical, cross-boot identical, Muse unregressed. The shared-pool
+  K/V-first layout fix is VERIFIED. Consolidated bench (plain then spec,
+  sequential, essay + GSM8K arms, seeded shipped defaults) running;
+  raw logs -> perf/results/2026-08-20/qwen38-consolidated/.
+
+## 2026-08-20 (30) - Consolidated Bench Exposed A 3x Regression; Root-Caused To MPS Strided Gather
+
+- Consolidated bench (new metallib + layout fix, seeded shipped defaults,
+  in-process, util 0.45): PLAIN essay 2.57/2.20/2.08, gsm8k
+  1.99/2.00/2.01 (seed-stable, coherent); SPEC essay 1.08/1.02/0.89,
+  gsm8k 2.64/2.13/1.90 (coherent; NOT seed-stable -- the rejection
+  path's draws are still unkeyed; get_metrics() returned no spec
+  counters in-process, acceptance to be read from Prometheus in the
+  server-based bench). Versus this morning's 6.4 plain / 4.0 spec: a
+  ~3x REGRESSION. Treated as evidence per perf.md.
+- Bisect: (1) metallib exonerated -- Q4_K GEMV identical on old vs new
+  build (187.6 vs 182.6 us; both only ~95 GB/s on the 5120x6144
+  ssm_out shape = a pre-existing 4.7x-off-floor kernel tuning item,
+  logged); new build faster on IQ3_XXS (54 vs 82 us). (2) Thermal
+  exonerated -- rested rerun after idle: 2.49/1.85/2.03. (3) ROOT CAUSE:
+  the blocks-first restride makes kv_cache[0]/[1] non-contiguous
+  interleaved views, and MPS index_select on a non-contiguous source
+  takes a slow gather path: microbench 1.32-1.41 ms vs 0.07-0.08 ms per
+  64-block gather (~20x), x16 layers x K,V per step, scaling with pool
+  size. head_dim 256 keeps qwen38 on the SDPA route (paged fast path is
+  64/128 only), so every decode step paid it. Writes unaffected
+  (0.06 ms both).
+- FIX (metal_attn.py SDPA read site): when the cache is blocks-first
+  (stride(0) < stride(1)), gather whole (K,V) pages from the contiguous
+  transpose(0,1) view and split -- 0.08 ms, bit-identical (verified
+  torch.equal). Non-hybrid models (Muse) never restride and keep the
+  original path. Re-bench running.
+
+## 2026-08-20 (31) - PLAIN DECODE 15.0 tok/s (6x today's start); Gather Fix Verified
+
+- First patch attempt referenced the parent kv_cache out of scope
+  (NameError in EngineCore); fixed by reconstructing the blocks-first
+  pages view from key_cache's own storage via as_strided (gate:
+  key_cache.stride(0) == 2 * page_elems). Standalone equality vs the
+  strided gathers: K and V bit-identical.
+- PLAIN (seeded shipped defaults, in-process, util 0.45, same build):
+  essay 15.26 / 14.98 / 14.82 tok/s, gsm8k 14.44 / 14.00 / 13.43.
+  Seed-stable; text identical to the 2.2 tok/s run (correctness
+  unchanged). That is 2.3x above this morning's 6.4 -- the native IQ
+  kernels' byte savings (22 GiB of fp16 dequant traffic gone) were
+  MASKED by the strided-gather penalty until now. Progression today:
+  2.5 (V1) -> 6.4 (V2) -> 2.2 (layout fix, strided gather) -> 15.0.
+  llama.cpp bar: 35.67. Raw: perf/results/2026-08-20/qwen38-consolidated/.
+- Spec bench rerunning on the same build.
+- SPEC (same build): essay 4.06 / 3.80 / 3.50 tok/s, gsm8k 9.45 / 7.97 /
+  8.65. Coherent; not seed-stable (rejection path's draws unkeyed --
+  open item). SPEC < PLAIN on both arms = OPEN BUG per spec-always-
+  fastest (never a documented config). Attribution (unchanged, now the
+  dominant item): the verify step pushes 8 positions through the
+  per-position python GDN scan x 48 layers (~8x plain's scan cost) +
+  python drafter forward + CPU-loop rejection fallback. The fused GDN
+  step (design in perf/qwen38_metal_design.md) is the fix and starts
+  next. Profile stays gated in-progress until spec is net-positive.
+- Interval SpecDecoding metrics did not surface in this in-process run;
+  acceptance for the record comes from the spec agent's Prometheus
+  counters (essay 2.71/0.244, notebook (25)) and gets re-read in the
+  server-based bench once fusion lands.
+
+## 2026-08-22 - Spec Seed Determinism on Metal: All Draws Keyed
+
+- Two days' gap (fused-GDN agent lost to a DNS outage before writing
+  anything; resumed today with the machine held awake).
+- Root cause of spec's seed instability: the MPS rejection fallback
+  (rejection_sampler_utils.py) already built a seeded generator keyed by
+  (seed, first verify position) but NEVER PASSED IT -- torch.rand(1) for
+  the accept test and every torch.multinomial (target sample, residual
+  recovery, bonus) drew from the global RNG. All five sites now use the
+  generator. Also fixed a latent temperature bug there: draft_logits
+  arrive temperature-applied (speculator output_processed_logits
+  contract; the Triton path reads them as-is) and the fallback divided
+  by temp again -- a no-op at the shipped temp 1.0, wrong elsewhere.
+- The selector walk's categorical draw (qwen3_dflash2.py) used device
+  exponential_ noise; it now takes (seeds, positions) from the
+  speculator (self.seeds[idx_mapping], sample_pos view) and draws
+  Gumbel noise from the stateless (seed, pos, column)-keyed uniforms,
+  falling back to the device RNG only when unkeyed. Unit check: same
+  seed => identical tokens AND identical sparse distributions;
+  different seed => differs; 16 finite candidates per position.
+- E2E seeded spec repeatability check deferred until the fused-GDN
+  agent releases the GPU (its benches must not be contended).
+- Durable tests added (the agents' scratchpad harnesses were lost in the
+  Aug 20 wipe): tests/model_executor/test_qwen3_dflash2.py (conv vs
+  naive reference both sides; greedy walk vs manual walk; sampled walk
+  seed-keyed + sparse k-way contract) and test_qwen35_gguf.py
+  (skip-guarded on the artifacts: target/drafter config fields, both
+  adapters' bidirectional name-map completeness, qwen35 tokenizer pinned
+  to the llama.cpp-verified prompt ids). 8 pass locally. The GDN
+  scan-vs-Triton-port oracle gets re-derived into tests/ once the fused
+  agent releases qwen_gdn_linear_attn.py.
+
+## 2026-08-22 (32) - Fused GDN Decode/Verify and Gated Norm Verified
+
+- BASELINE: fe960935f plain essay ~15 tok/s; spec essay 3.5-4.1 and
+  GSM8K 8.0-9.5. The verify path ran the GDN recurrent scan as eight
+  Python/MPS position steps in each of 48 target layers.
+- HYPOTHESIS: fuse convolution-window update plus the gated delta-rule
+  scan across all positions and heads, retaining fp32 recurrent state
+  and the exact per-position store/resume rollback contract. Fuse the
+  following RMSNormGated operation separately.
+- IMPLEMENTED: `qwen_gdn_step` uses two Metal dispatches per layer
+  (convolution then scan) for decode and verify; routing retains the
+  torch-native oracle behind `VLLM_QWEN38_FUSED_GDN=0`.
+  `qwen_gdn_gated_norm` removes the decomposed gated norm graph.
+- CORRECTNESS: the exhaustive synthetic harness passed all 147 decode,
+  verify, fp32/bf16/fp16, tiled/grouped, null-slot, and fp32-conv-state
+  cases. Uniform, ragged, null-position, null-sequence, mixed, and
+  mixed-ragged plan parity all passed. Gated norm passed all 12 dtype /
+  shape cases. Durable real-geometry Metal tests now cover decode,
+  speculative rollback, null slots, strided inputs, and gated norm.
+- MEASURED (seeded shipped sampling; uncontended raw runs): fused plain
+  essay 16.97/16.81/16.86 tok/s and GSM8K 16.57/16.58/16.54; with
+  fused gated norm, essay 18.19/18.24/17.17 and GSM8K
+  16.77/16.85/17.06. A later hot run was 16.15-16.40 essay, so retain
+  the fusion but do not promote 18.24 as a stable baseline.
+- DECISION: RETAIN. It closes the dominant recurrent-state correctness
+  and launch-count problem, but speculation was still only ~7 tok/s
+  essay / 13-15 GSM8K immediately after this change, so more of the
+  M=8 verify path still needed work.
+- RAW: `perf/results/2026-08-22/qwen38-fused-gdn/verify_gdn_step_fresh.log`,
+  `verify_spec_plans_fresh.log`, `verify_gated_norm_fresh.log`,
+  `bench_plain_fused.log`, `bench_plain_fused_norm.log`,
+  `bench_plain_hot.log`, and `bench_spec_fused.log`.
+
+## 2026-08-22 (33) - Quantized Verify-Band GEMM + Vectorized MPS Rejection
+
+- BASELINE/HYPOTHESIS: after GDN fusion, the 8/17-row target verify band
+  still dispatched repeated GEMVs for the target's IQ/Q2_K weights and
+  rejection sampling still performed request/token CPU work. Enable the
+  existing quantized MM band for every serving format whose new span
+  decoder was verified, then keep rejection sampling batched on MPS.
+- IMPLEMENTED: qgemv routing now admits q2_K, q3_K, IQ1_S/M, IQ2_XXS/XS/S,
+  IQ3_XXS/S, and IQ4_XS to the M={2,4,8,16,17} MM kernels. The MPS
+  sampler performs batched acceptance, prefix counting, residual/bonus
+  emission, and deterministic (seed, position)-keyed draws without host
+  round trips. Full-vocabulary Gumbel emission was replaced by one keyed
+  uniform plus inverse-CDF sampling.
+- CORRECTNESS: real GGUF tensor comparisons at M=8 and M=17 had maximum
+  relative error 0.2674% across the sampled serving formats/shapes; the
+  new eight-wide IQ decoder differs from the scalar decoder only by
+  rounding (<0.1% relative). Rejection Monte Carlo passed its target
+  marginal, theoretical acceptance-rate, deterministic batch-vs-single,
+  and greedy-chain checks. A durable 8192-request test checks the emitted
+  target marginal and `sum(min(p,q))` acceptance.
+- MEASURED: MM routing moved spec to essay
+  16.10/14.18/12.20 tok/s and GSM8K 30.40/31.19/33.91. Vectorized
+  rejection plus keyed draws produced essay 15.60/15.14/15.03 and GSM8K
+  36.66/36.49/36.06, with both arms seed-stable. The MM microbench shows
+  2.4-5.0x lower M=8 time than eight GEMVs on the sampled model tensors.
+- DECISION: RETAIN, but the hard gate remains OPEN: essay spec is still
+  slightly below the contemporaneous 16.15-16.40 plain run even though
+  GSM8K spec is >2x plain. Prompt-domain acceptance cannot excuse a
+  slower supported arm under the spec-always-fastest rule.
+- RAW: `perf/results/2026-08-22/qwen38-fused-gdn/mm_iq_bench.log`,
+  `iq8_dequant_exact.log`, `rejection_mc_cdf.log`,
+  `bench_spec_fused_mm.log`, and `bench_spec_fused_mm_vec.log`.
+
+## 2026-08-22 (34) - Fused DFlash 2 Convolution; Final TPS Blocked by Power
+
+- BASELINE/HYPOTHESIS: one proposal executes 20 two-tap convolution
+  sides (two sides in each of two sublayers across five drafter layers).
+  Each side was a decomposed repeat_interleave + roll + clone/zero +
+  elementwise graph. Collapse it to one block-local Metal dispatch.
+- IMPLEMENTED: `dflash2_two_tap_conv_{float32,float16,bfloat16}` computes
+  both taps directly from compact per-group coefficients, zeros the
+  predecessor at every eight-row block boundary, and preserves the
+  activation-dtype rounding boundaries. The route has the kill switch
+  `VLLM_QWEN38_FUSED_DFLASH2_CONV=0`.
+- CORRECTNESS: both sides pass the torch reference at the real
+  (3 blocks, 5120 hidden, 320 groups, BF16) geometry; differences are
+  bounded to one BF16 ULP (relative <1%). The combined durable model /
+  GGUF / GDN suite passes 14/14 after the deployed metallib rebuild.
+- MEASURED: at the real 8x5120 proposal geometry, an alternating
+  same-process microbench measured 0.0245 ms fused vs 0.1387 ms
+  decomposed, 5.65x faster. This is a relative kernel result only.
+- BLOCKER/DECISION: RETAIN pending powered end-to-end A/B. The Mac fell
+  to 1% battery on a 20 W charger; model memory discovery regressed from
+  ~20 s to 129.56 s and a phase probe reported only 1.28 tok/s. Those
+  figures are power-throttling evidence, explicitly INVALID as a
+  baseline. Re-run plain/spec, convolution on/off, text/image, and the
+  real SlimServe server only after adequate high-wattage power is
+  restored. Do not un-gate the profile yet.
+- RAW: `perf/results/2026-08-22/qwen38-fused-gdn/dflash2_conv_microbench.log`,
+  `power_blocker.log`, and `spec_profile_top_cdf.log` (invalid absolute
+  profile retained only as power evidence).
+
+## 2026-08-23 (35) - Hybrid KV Gather Fixed Beyond the 32-Bit Offset Boundary
+
+- Status: retained.
+- Scope: `qwen38-q2kxl-1`, Metal hybrid full-attention KV read path.
+- Baseline: a 20-request repeated speculative run was correct for requests
+  0-13, emitted only token 0 / `!` for requests 14-17, then recovered after
+  the allocator wrapped. The first target logits of the bad requests were
+  already all NaN; fused GDN and fused rejection kill switches did not alter
+  the failure.
+- Root cause: stage-finite hooks localized the first nonfinite value to layer
+  19's full-attention output. Its physical block was 1271. Qwen's aligned
+  attention page is 832x4x256 = 851,968 elements and K pages have a physical
+  stride of 2x that value, so this block is beyond a signed 32-bit element
+  offset. A standalone 5.05 GiB interleaved-cache reproducer proved scalar
+  reads correct at blocks 1186/1271/1580 while MPS `index_select` on the
+  strided pages view returned wrong/zero data at 1271/1580.
+- Change: added `kv_cache_gather_range` in `kv_cache.metal`, its common
+  launcher and pybind/wrapper, and routed Metal SDPA reads through it. The
+  kernel receives the physical cache block stride explicitly and performs all
+  address arithmetic in 64 bits. It gathers only the live logical token range;
+  the existing Python gather remains the fallback.
+- Correctness: direct large-cache gathers are exact at blocks 1186, 1271, and
+  1580. The opt-in durable >2^31-element test passes. A 20x64-token reference-
+  sampler speculative run stayed finite, coherent, and token-identical across
+  every request, including the old failure window and allocator wrap.
+- Decision: retain. This was a silent correctness failure in the owned cache
+  layer, not a model, sampler, or GDN problem.
+- Raw artifacts: `perf/results/2026-08-23/qwen38-kv-gather/run_summary.json`;
+  reproducer and long-run scripts remain under
+  `perf/results/2026-08-22/qwen38-fused-gdn/`.
+
+## 2026-08-23 (36) - Powered Fusion A/B and Metal Draft Depth Sweep
+
+- Status: retained.
+- Scope: fused DFlash convolution, fused rejection, and DFlash 2 verify depth
+  on the M5 Max; shipped sampling defaults, seed 42, AC power.
+- Baseline: at the trained/upstream depth k=7, fresh powered medians were
+  16.18 tok/s essay and 38.04 GSM8K-style versus plain 17.14 and 16.81. The
+  essay hard gate remained open. Low-perturbation timing measured 101.33 ms
+  target plus 23.61 ms `sample_tokens` per step; the latter already includes
+  the nested 15.96 ms proposal.
+- Fusion A/B: fused DFlash convolution medians were 16.42/38.12 versus the
+  decomposed path's 15.75/36.22 (essay/GSM8K). Balanced same-process rejection
+  A/B kept identical seeded text and measured fused medians 15.641/38.207
+  versus reference 15.511/37.713. Both native paths are retained.
+- Hypothesis: essay accepts only about two tokens per step, so verifying all
+  seven trained suffix positions wastes more target bandwidth than it earns.
+  Metal's quantized MM routes naturally cover total verify widths M=2,4,8;
+  therefore sweep draft depths k=1,3,7 without changing sampling semantics.
+- Results: k=1 reached 20.86 tok/s (1.56 tokens/step, target/tail 58.82/12.99
+  ms); k=3 reached 23.22 (2.10 tokens/step, 70.19/16.42 ms); k=7 reached
+  15.86 (2.03 tokens/step, 101.33/23.61 ms). A full 3x256-token k=3 run was
+  essay 23.27/23.74/23.06 and GSM8K 34.33/35.25/34.78, all seed-stable. The
+  matched plain runs were essay 16.99/17.14/17.17 and GSM8K
+  16.77/16.86/16.81.
+- Decision: set the registered Metal profile to k=3. It clears the always-on
+  speculation gate by 35.8% on the essay medians and 106.9% on GSM8K while
+  preserving lossless rejection sampling. The drafter remains trained at
+  block 8; serving intentionally evaluates its first three suffix positions.
+- Raw artifacts: `perf/results/2026-08-23/qwen38-kv-gather/run_summary.json`
+  and the A/B/depth scripts under
+  `perf/results/2026-08-22/qwen38-fused-gdn/`.
+
+## 2026-08-23 (37) - Qwen3.8 Profile Promoted and Exact Server Path Validated
+
+- Status: retained; profile supported.
+- Scope: exact `slimserve qwen38-q2kxl-1 --serve` path, text and image, plus
+  exact-token spec/plain comparison.
+- Change: the profile now registers DFlash k=3, exports
+  `VLLM_USE_V2_MODEL_RUNNER=1`, and no longer carries the stale "no Metal
+  path" status gate. The live-smoke validator now compares each executable
+  plan with its registered speculator; DSpark plans still additionally require
+  TurboQuant attention and draft KV, while registered DFlash plans are no
+  longer rejected before load. The exact-token harness gained explicit
+  temperature/top-p/top-k/seed controls so this profile is never benchmarked
+  greedily.
+- Server correctness: the exact profile (131072 max length, 12 GiB KV pool)
+  reached health in 15.09 s. The chat endpoint answered the text check with 4
+  and the deterministic solid-red image check with Red. Reasoning parser,
+  qwen3_xml tool parser, chat template, vision tower, and DFlash were all on
+  the real API-server route.
+- Exact-token result: 128 input + 256 output tokens, concurrency 1, 8-token
+  warmup, temperature 1/top-p .95/top-k 20/seed 42. Spec k=3 produced exactly
+  256 tokens at 18.646 tok/s with 111 accepted of 432 drafted tokens across
+  144 draft steps (1.77 emitted tokens/step); plain produced exactly 256 at
+  15.913 tok/s. Spec wins by 17.2%; both responses had healthy visible-text
+  density (>2.6 chars/token).
+- Validation: final native build succeeded; deployed symbols include the
+  gather, GDN, convolution, and rejection ops. Focused suite including the
+  large offset case: 17 passed. SlimServe suite: 58 passed, 1 skipped. Final
+  metallib SHA-256 is
+  `539035eb15dea29152e11503fc1ee08676d5dfe08b9ef4cc241283092e887d4c`.
+- Raw artifacts: `perf/results/2026-08-23/qwen38-kv-gather/exact_spec.json`,
+  `exact_plain.json`, `run_summary.json`, `smoke.json`, and
+  `smoke/qwen38-q2kxl-1.log`.
+
+## 2026-08-23 (38) - Current-Machine Live Matrix: Muse Fixed, DSV4 Regressed
+
+- Status: Qwen and Muse pass their registered live arms; the complete matrix
+  remains failed on an independent DSV4 Metal performance regression.
+- Scope: registry discovery found all three compatible profiles on the M5 Max:
+  `dsv4-xxs-1`, `muse-kdyn-1`, and `qwen38-q2kxl-1`. Every run used its
+  registered target, drafter, KV configuration, and modalities.
+- Muse root cause: the reasoning parser's initial prompt-state check treated a
+  historical `<|message|>` as proof that the new assistant turn had already
+  left reasoning. That bypassed the parser and exposed the generated
+  ` to=self<|message|>` header as content. The header also arrives split as
+  `" to"` then `"=self<|message|>..."`, which the old partial-header guard did
+  not hold.
+- Muse change/correctness: a rendered prompt ending in the newest bare
+  `<|start|>assistant` now begins a fresh reasoning phase, recipient headers
+  accept the real optional leading space, and split `to=` prefixes are held
+  until parseable. Raw SSE now puts the self body only in
+  `reasoning_content`, never exposes the control header, and emits the final
+  answer in `content`. Registered text and solid-red image requests passed
+  with DFlash k=16; load was 18.09 s and requests took 4.81/9.20 s. The parser
+  plus SlimServe suite is 62 passed, 1 skipped.
+- DSV4 evidence: `dsv4-xxs-1` loaded its 93.63 GiB target+DSpark stack and
+  reached API health, but the first tiny text request was still running after
+  about 12 minutes. Interval diagnostics reported only 0.1 generation tok/s;
+  after the first draft there were 0 accepted of 5. This is orders of
+  magnitude below the 33.684 tok/s correctness-qualified Metal baseline, so
+  the run was terminated and is a hard profile failure, not a smoke pass.
+- Decision: retain the Muse parser fix and Qwen profile promotion. Do not call
+  the current-machine matrix green until DSV4's first-step/verify regression
+  is isolated and the exact registered profile completes the real request.
+- Raw artifacts:
+  `perf/results/2026-08-23/qwen38-kv-gather/smoke-muse-final.json`,
+  `smoke-muse-final/muse-kdyn-1.log`, and
+  `smoke-all/dsv4-xxs-1.log`.

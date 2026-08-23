@@ -9,6 +9,7 @@ from functools import cached_property
 from typing import Any
 
 from openai.types.responses import (
+    CustomTool,
     ResponseFormatTextJSONSchemaConfig,
     ResponseTextConfig,
 )
@@ -61,6 +62,10 @@ class ToolParser:
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None
     engine_based_streaming: bool = False
+    # Some model formats use their tool parser to remove recipient/channel
+    # framing even when tool calls are disabled. The unified parser still
+    # discards any parsed calls for tool_choice="none".
+    handles_tool_choice_none: bool = False
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -83,10 +88,12 @@ class ToolParser:
 
         self.model_tokenizer = tokenizer
         if tools:
-            self.tools: list[ChatCompletionToolsParam | FunctionTool] = [
+            self.tools: list[ChatCompletionToolsParam | FunctionTool | CustomTool] = [
                 tool
                 for tool in tools
-                if isinstance(tool, (ChatCompletionToolsParam, FunctionTool))
+                if isinstance(
+                    tool, ChatCompletionToolsParam | FunctionTool | CustomTool
+                )
             ]
         else:
             self.tools = []
@@ -173,7 +180,13 @@ class ToolParser:
     ):
         if self.structural_tag_model is None:
             return None
-        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING:
+        has_custom_tools = bool(request.tools) and any(
+            isinstance(tool, CustomTool) for tool in request.tools
+        )
+        # A custom tool's grammar constrains only its raw input inside the
+        # model-native envelope. It cannot fall back to whole-response JSON
+        # guidance when optional strict function calling is disabled.
+        if not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING and not has_custom_tools:
             return None
         from vllm.tool_parsers.structural_tag_registry import get_model_structural_tag
 
