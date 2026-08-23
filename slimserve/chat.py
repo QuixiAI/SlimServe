@@ -74,7 +74,9 @@ class Session:
     model: str
     system: str = ""
     max_tokens: int = 2048
-    temperature: float = 0.0
+    # None = no override: the model's shipped sampling defaults apply.
+    # Greedy is not a supported configuration in this stack.
+    temperature: float | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
     pending_images: list[str] = field(default_factory=list)
     last_stats: str = ""
@@ -254,15 +256,17 @@ def _set_tokens(session: Session, argument: str) -> None:
 
 def _set_temp(session: Session, argument: str) -> None:
     if not argument:
-        print(session.temperature)
+        print(
+            session.temperature if session.temperature is not None else "model default"
+        )
         return
     try:
         value = float(argument)
     except ValueError:
         term.fail(f"/temp wants a number, got {argument!r}")
         return
-    if not 0.0 <= value <= 2.0:
-        term.fail("/temp must be between 0 and 2")
+    if not 0.0 < value <= 2.0:
+        term.fail("/temp must be in (0, 2]; greedy is not served")
         return
     session.temperature = value
     print(value)

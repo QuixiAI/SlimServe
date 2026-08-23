@@ -1,382 +1,225 @@
-# DeepSeek V4 0731 A100 Handoff
+# Qwen3.8-27B + DFlash 2 Metal Serving Handoff
 
-Updated: 2026-08-10 22:20 UTC
+Updated: 2026-08-23 00:58 (M5 Max MacBook Pro, 128 GB, ~460 GB/s measured
+stream). Written so a fresh agent can take over cold. Read this, then
+`perf/optimization_status.md` entries (19) onward, then
+`perf/qwen38_metal_design.md` (every verified tensor map + mechanism).
 
-## Degeneration incident: ROOT-CAUSED AND FIXED (2026-08-13)
+## Mission and hard rules
 
-The entire 2026-08 incident family - the rare NaN seed, the BOS-loop
-storms, and the deterministic no-spec degeneration - was ONE defect:
-IEEE 0*NaN in the DSV4 sparse decode's split-K reduce
-(csrc/quixicore/serving/paged_attn_v2_kernels.cuh). The persistent
-writer publishes finite ml/es for balanced-away empty partitions but
-never stores their tmp value vectors (torch::empty); the reducer
-multiplied those unwritten vectors by a mathematically-zero weight,
-and 0*NaN = NaN carried recycled allocator bytes into live attention
-outputs. Boot/phase lottery = recycled pool content; geometry gating
-= partition counts; the FULL-graph and aux-stream correlations were
-allocation-pattern epiphenomena. Fix: skip !(weight > 0) partitions
-(mathematically identical, garbage-proof), hardened in all four
-reducers; ml/es workspace init kept as defense in depth (ceba09670).
+- Serve profile `qwen38-q2kxl-1` on Metal: Qwen3.8-27B (unsloth UD-Q2_K_XL
+  GGUF, 64-layer hybrid: 48 gated-deltanet linear-attention layers + 16
+  full-attention layers, head_dim 256, interleaved MRoPE; plus the
+  mmproj-F16 `qwen3vl_merger` vision tower) speculated by the Inco AI
+  DFlash 2 drafter (z-lab Q4_K_M GGUF, block 8, top-16 path selector,
+  two-tap convs).
+- Bars: llama.cpp plain decode on this box/artifact = **35.67 tok/s**.
+  Vendor DFlash 2 acceptance 4.80 is a GSM8K number; the llama.cpp
+  dflash2-pr branch on the SAME GGUFs/settings gets 2.51 tok/step on our
+  essay prompt and 4.74 on a GSM8K-style prompt (task-domain dependence;
+  compare acceptance only on matched arms).
+- **Speculation is always on and must be net-positive** (memory
+  `spec-always-fastest`); slower-than-plain spec is a BUG, never a
+  documented config. This gate is now closed: registered DFlash k=3 beats
+  plain on both retained prompt arms and the matched exact-server workload.
+- **Greedy / temperature 0 is banned stack-wide** (memory
+  `no-greedy-benchmarks`; the user removed the flag on purpose). Validation
+  and benches use the model's shipped sampling defaults from the GGUF
+  (`general.sampling`: temp 1.0 / top_p 0.95 / top_k 20), seeded (42).
+  Layer-level parity (cosine on activations) needs no sampling and stays
+  the correctness instrument.
+- Commit authorship: Eric Hartford sole author, no assistance trailers
+  (the repo's signoff hook adds his Signed-off-by). Commit with
+  `env SKIP=markdownlint-cli2 git commit ...` (the notebook's pre-existing
+  line lengths fail markdownlint; its auto-fix also corrupts `+ ~15`-style
+  lines and `_foo` identifiers -- never let it run on perf/).
 
-Validation: the 13/13-storming no-spec repro ran clean (3 full
-trigger runs, 0 NaN); production (spec, both daemons) redeployed on
-the fixed kernel - dual c16 acceptance clean, 544-570 tok/s, zero NaN
-events. --no-spec is UNBROKEN. Aux streams remain off on A100 purely
-for performance (458 vs 427 c11 - the overlap was a net loss); it is
-no longer a correctness mitigation. NAN_WATCH stays on both daemons
-and the canary stays armed as regression tripwires. The full
-investigation record - including every dead theory and both
-instrument-bug retractions - is in perf/optimization_status.md;
-diagnostics live in perf/diagnostics/dsv4-nan/ plus env-gated probes
-(VLLM_DSV4_MLA_DEBUG_PARTIALS, VLLM_DSV4_MLA_TMP_SENTINEL).
+## State of the tree
 
-## Read First
+Committed on `main` (pushed): `fe960935f` "vision, DFlash 2 spec e2e,
+native IQ decode, hybrid-pool layout fix (15 tok/s plain)" on top of
+`39efaa7d9` (correct plain decode, layer parity). Prior campaigns: Muse
+`ad8e8e937` (20.1 tok/s spec, Metal), DSV4 A100 `bad7cfd46` (A100 box).
 
-Work in `/home/ubuntu/SlimServe`. Read these before changing code or interpreting
-performance:
+UNCOMMITTED in the worktree is one tested optimization stack (preserve all
+of it; do not treat the native pieces as abandoned experiments):
 
-- `AGENTS.md`
-- `perf/perf.md`
-- `perf/baseline_status.md`
-- `perf/optimization_status.md` (see the "A100 TP2 Lifecycle Crash Root Cause"
-  entry for the full debugging record of the crash below)
-- `slimserve/profiles.json`, especially the dsv4-{hybrid,mxfp4}-{2,4,8} family
-- `perf/dsv4_a100_kernel_history.md` for the longer TP2/TP4 kernel and
-  ownership history (moved from the old root `handoff.md`; its serving
-  tok/s numbers predate the sampler fix and are obsolete)
+1. **Fused target GDN, complete and routed.**
+   `csrc/quixicore/metal/kernels/serving_glue/gdn_step.metal`, the binding
+   in `qc_metal_serving.mm`, `vllm/quixicore/ops.py`, and
+   `qwen_gdn_linear_attn.py` implement decode and multi-position verify
+   (convolution + recurrent scan, fp32 state in place, exact store/resume /
+   rollback slots) plus a fused gated RMS norm. The torch-native oracle
+   remains intact. Kill switch: `VLLM_QWEN38_FUSED_GDN=0`.
+   Correctness: 147/147 exhaustive cases, all uniform/ragged/null/mixed
+   plan cases, all gated-norm cases. Durable real-geometry tests are in
+   `tests/model_executor/test_qwen_gdn_metal.py`.
+2. **Verify-band quant MM, complete and routed.**
+   `dequant.metal`, `qgemv.metal`, and the binding admit the target's
+   Q2_K/Q3_K/IQ1/IQ2/IQ3/IQ4_XS formats to M={2,4,8,16,17} MM instead of
+   repeated GEMV. Real-GGUF M=8/17 error <=0.2674%; sampled M=8 kernels
+   are 2.4-5.0x faster than eight GEMVs. The eight-wide IQ decoder's
+   difference from the scalar decoder is rounding-only (<0.1%).
+3. **Seeded/vectorized MPS rejection, complete and routed.**
+   `rejection_sampler_utils.py`, `qwen3_dflash2.py`, and `speculator.py`
+   key all selector/accept/residual/bonus draws by (seed, position), remove
+   the draft-logit double temperature divide, and batch rejection fully on
+   MPS. Full-vocabulary Gumbel emission is now one keyed uniform plus CDF
+   inverse sampling. Monte Carlo passes; the clean spec bench is seed-stable.
+4. **Fused DFlash 2 convolution, built and routed.**
+   `csrc/quixicore/metal/kernels/serving_glue/dflash2_conv.metal` replaces
+   each repeat_interleave/roll/clone/elementwise graph with one dispatch.
+   Both sides pass the torch reference at real 5120-hidden / 320-group BF16
+   geometry; a same-process real-geometry microbench is 5.65x faster.
+   Kill switch: `VLLM_QWEN38_FUSED_DFLASH2_CONV=0`. Powered end-to-end A/B
+   retained it: fused essay/GSM medians 16.42/38.12 versus 15.75/36.22.
+5. **64-bit hybrid KV gather, complete and routed.** MPS `index_select`
+   silently wrapped signed 32-bit element offsets on Qwen's interleaved,
+   strided K/V source. Requests crossing physical block 1271 therefore fed
+   bad K/V into layer 19 and produced all-NaN target logits. The native
+   `kv_cache_gather_range` carries the physical block stride and address math
+   in 64 bits, gathers only live rows, and is exact at blocks 1186/1271/1580.
+   A 20x64-token repeated run remains finite and seed-identical through the
+   old failure window and allocator wrap.
+6. **Profile/tests/build.** `qwen38-q2kxl-1` is supported, registers DFlash
+   k=3, and exports `VLLM_USE_V2_MODEL_RUNNER=1`. The real server passed text
+   and image. The final focused suite (including the 5 GiB >2^31-offset case)
+   is 17/17; `tests/slimserve` is 58 passed/1 skipped. Final metallib SHA-256:
+   `539035eb15dea29152e11503fc1ee08676d5dfe08b9ef4cc241283092e887d4c`;
+   deployed extension SHA-256:
+   `ede784f0d4ecf7a5111fc55374987661ea3bcc4c48602189c0a009cb88c4efdb`.
+7. **Shared live validation.** Registry discovery finds `dsv4-xxs-1`,
+   `muse-kdyn-1`, and Qwen on this machine. Qwen passes text+image. Muse now
+   passes text+image after fixing its parser's new-turn state and the real
+   split `" to"` / `"=self<|message|>"` streamed header; raw SSE cleanly
+   separates `reasoning_content` and final `content`. The combined parser and
+   SlimServe suite is 62 passed/1 skipped. The complete matrix is not green:
+   DSV4 reached health but its first request ran at about 0.1 tok/s with 0/5
+   drafted tokens accepted and was terminated after about 12 minutes.
 
-The worktree is intentionally very dirty and contains user and prior-agent work.
-Do not reset, clean, checkout, or overwrite it. SlimServe downloads missing model
-artifacts itself. Use the real profile, not an invented vLLM command.
+**CURRENT STATUS:** no correctness or profile gate is blocking Qwen serving.
+The old 20 W power blocker is closed; the retained numbers below were captured
+on AC power after the charger change. Qwen's remaining gap is performance
+versus the 35.67 tok/s llama.cpp plain reference, not production-path
+correctness. Separately, the current-machine profile matrix is blocked by the
+DSV4 Metal regression described below; do not present that shared matrix as a
+pass.
 
-## Objective
+## Measured numbers (seeded shipped defaults, V2 runner, in-process)
 
-Finish the native DeepSeek V4 Flash 0731 Ampere A100 path, including DSpark,
-TurboQuant, APC, long-context capacity, and TP2/TP4 performance. The routed MoE
-production path must remain fused native IQ2_XXS gate/up + SwiGLU + Q2_K down +
-weighted reduce. No dequant production fallback.
-
-## Status: TP2 lifecycle crash SOLVED (2026-08-09 evening)
-
-The "illegal CUDA memory access after ~7 decode tokens" that blocked TP2 is
-fixed. The earlier aux-stream ownership theory was WRONG; serializing streams
-only appeared to help because it changed allocator layout. Real chain:
-
-1. A NaN target-logits row reached the rejection sampler.
-2. `argmax_combine` in `csrc/quixicore/serving/v2_sample_kernels.cuh` used a
-   negated comparison that let NaN replace the running best; the masked -inf
-   tail lanes of the last vocab block then won with the lowest masked index,
-   emitting token id 129280 == vocab_size as a "sampled" token.
-3. 129280 entered `last_sampled_tokens`, was combined into `input_ids[0]`
-   every step (self-sustaining poisoning; drafts degenerated, all rejected).
-4. `dsv4_router::bf16_hash_router` dereferenced `tid2eid[129280*6]` (table,
-   embedding, and lm head all have exactly 129280 rows) → garbage expert →
-   wild weight-row read → MMU FAULT_PDE. Fault-vs-silent depended on what the
-   allocator placed after the 2 MiB gate weight, hence the illusion that
-   stream serialization "fixed" it. Serialized runs were silently
-   quality-poisoned instead (all drafts rejected ≈ no spec gain).
-
-Fixes, all retained and offline-verified
-(`repro_rejection_oov.py` in the session scratchpad; NaN/-inf/garbage rows now
-sample token 0, never an out-of-vocab id):
-
-- `csrc/quixicore/serving/v2_sample_kernels.cuh`: positive-form
-  `argmax_combine`, NaN-sanitized loads, in-vocab-only candidates, and
-  sentinel-free reduction inits (`best_* = 0x7fffffff` could leak as a token
-  id / wild index when every candidate was skipped). Ported to
-  `/home/ubuntu/QuixiCore/QuixiCore-CUDA/kernels/serving/v2_sample_kernels.cuh`
-  (the ROCm build includes the same header, nothing separate to port).
-- Same NaN sanitize in the Triton fallbacks
-  (`vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py`).
-- `csrc/quixicore/serving/dsv4_router_ampere.cuh`: `bf16_hash_router` bounds-
-  guards token ids (OOB → treated as padding) and records the first offender
-  in a device slot readable via `quixicore_ops.dsv4_hash_router_debug()`
-  (readout gated by `VLLM_DSV4_HASH_ROUTER_DEBUG=1` in the V2 runner).
-- Rebuild: `cmake --build build/temp.linux-x86_64-cpython-312 --target
-  _quixicore_C -j$(nproc)` then copy the `.so` into `vllm/`.
-
-## Requalified numbers (clean server v33, full overlap, no debug env)
-
-Canonical exact harness, TP2, `dsv4-2`, 19 GiB KV, PIECEWISE graphs, DSpark on:
-
-| Run | tok/s | exact |
-| --- | ---: | --- |
-| 1K/2K run 1 | 168.0 | yes |
-| 1K/2K run 2 | 168.7 | yes |
-| 12K cold | 89.0 | yes |
-| 12K hot | 93.3 | yes |
-| 128K cold | 37.1 | yes |
-| 128K hot | 38.2 | yes |
-| post-128K 1K/2K continuation | 111.8 | yes |
-
-Whole sequence ran against one server without restart (full lifecycle incl.
-APC reuse). The post-128K continuation at 111.8 vs fresh-server 168 is noted
-in `perf/baseline_status.md` as unexplained (suspect KV pool occupancy).
-
-Previous "best" numbers (82.4 no-aux, 106.7 inner-serial) were poisoned runs
-and are obsolete. Mean spec acceptance length is now ~3.5-3.7 (was ~1 while
-poisoned). Raw JSONs: `perf/results/2026-08-09/dsv4-a100-tp2-kv-capacity/
-control/clean-v33-*.json` (plus `sentinelfix-v32-*`, probe-era logs, and GPU
-coredumps under `../coredumps/`).
-
-The attention inner-overlap diagnostic switches
-(`VLLM_DSV4_OVERLAP_INDEXER`, `VLLM_DSV4_OVERLAP_MLA_COMPRESSOR`,
-`VLLM_DSV4_OVERLAP_INDEXER_INNER`, plus the pre-existing
-`VLLM_DSV4_INNER_ATTENTION_OVERLAP` and `VLLM_DSV4_AUX_STREAMS`) remain,
-default-on/no behavior change. The `VLLM_DSV4_MLA_DEBUG_SYNC` /
-`VLLM_DSV4_ATTENTION_DEBUG_SYNC` host-sync diagnostics were removed.
-
-## Quant strategy and profiles (2026-08-09 late)
-
-Per user direction: A100 serves the **Q4K-tail hybrid** (Q4_K experts on
-layers 37-42, IQ2_XXS/Q2_K elsewhere, 90.9 GiB); IQ2_XXS is the MacBook
-quant. Profile changes (see `perf/optimization_status.md` for measurements):
-
-- `dsv4-2` / `dsv4-4`: default quant now `Q4K-tail`. `registry.py` supports
-  per-quant `quant_overrides`; the qualified 19 GiB TP2 KV budget stays with
-  IQ2_XXS, hybrid runs a provisional 14 GiB (needs the 128K lifecycle
-  qualification pass).
-- New `dsv4-4-mxfp4` (MXFP4 on 4 GPUs) and `dsv4-8` (MXFP4-only TP8;
-  TP4xDP2 is the alternative to benchmark).
-- Hybrid baselines (exact): TP2 168.5 c1 / 185.5 c8; TP4 174.2 c1 /
-  150.7 @12K / 416.4 c8. Hybrid TP4/TP2 scaling: 1.03x batch-1, 1.69x @12K,
-  2.24x @c8.
-- A100 MXFP4 experts had no fused path (32 tok/s TP4 c1). New fused decode
-  kernels in `csrc/quixicore/quant/dsv4_mxfp4_moe_ampere.cuh` + op
-  `ggml_dsv4_moe_a8_mxfp4` (correctness-tested in
-  `tests/kernels/test_dsv4_mxfp4_moe.py`) lift `dsv4-4-mxfp4` to
-  111.3 tok/s c1 (3.4x) and 75.0 @12K (2.6x); c8 stays at 27.1 because
-  verify batches wider than 8 tokens still take the generic MMQ route -
-  widening the fused path / MXFP4 MMQ tiles is the next kernel task, then
-  `dsv4-8` TP8 vs TP4xDP2.
-
-## 2026-08-10 completion pass
-
-Everything from the quant-strategy discussion is implemented, tested, and
-profiled (`perf/optimization_status.md` 2026-08-10 entry, baselines promoted
-in `perf/baseline_status.md`):
-
-- Hybrid TP2 KV budget qualified at **13 GiB** through the full 128K
-  lifecycle (14 GiB crashed at 128K cold prefill; profile + tests updated).
-- MXFP4 fused route widened to verify batches
-  (`VLLM_GGUF_DSV4_MXFP4_ROWS`, default 64): c8 27.1 -> 98.6 agg, c1/12K
-  unchanged. Remaining MXFP4 gap vs hybrid is prefill (generic MMQ tiles).
-- `dsv4-8` finalized as **TP8**: 167.6 c1 / 117.4 @12K / 148.2 c8 agg =
-  1.50-1.58x over `dsv4-4-mxfp4` (meets the >=1.5x gate). TP4xDP2 fails to
-  initialize: DSV4's router `is_padding` mask is not DP-padding aware
-  (`csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu:782`); DP
-  enablement is an open item and its c8 comparison is unmeasured until then.
-
-## 2026-08-10 DP enablement + throughput matrix
-
-- DSV4 DP-padding FIXED: `_get_padding_mask` in both fused-topk router
-  modules now hands out the mask only at exact width match (DP's naive
-  dispatch all-gathers hidden+logits across ranks; the local mask cannot
-  describe the gathered batch). TP4xDP2 boots and serves exact.
-- Full {mxfp4, hybrid} x {TP4, TP2xDP2, TP8, TP4xDP2, TP2xDP4} matrix
-  measured (table in `perf/optimization_status.md`). Winners encoded in
-  profiles via `quant_overrides`:
-  - 8-GPU total throughput: **hybrid TP4xDP2, 567.9 tok/s c8 agg**
-    (`dsv4-8 --quant Q4K-tail`).
-  - Single stream: **hybrid TP8, 329.5 tok/s c1** — despite losing the
-    fused IQ2 path at per-rank intermediate=256; extending the fused
-    kernels to 256 would lift TP8 further (open kernel item).
-  - MXFP4 stays TP8 on `dsv4-8`; `dsv4-4` stays TP4.
-  - mxfp4 TP2-shards don't fit 80 GB; hybrid TP2xDP4 fails engine init
-    (illegal access in the DP4 dummy run, distinct from the fixed bug) and
-    is marked illegal pending investigation.
-- Follow-ups queued: dsv4-q4ktail-2 with FULL_DECODE_ONLY graphs (+12% c1
-  suspected), TP2xDP4 init crash, MXFP4 prefill tiles.
-
-## 2026-08-10 late: fused-256, concurrency curves, hot methodology
-
-- Fused IQ2 at the TP8 shard (intermediate=256) is DONE: the silent
-  512-instantiation fallback in `launch_q2_k_down_sum_repacked_topk` was
-  the crash; explicit 256 branch + idle-lane guard added, CA-owned
-  pending-down pinned to 512/1024. Harness accepts c{1,2,4,8}.
-- MEASUREMENT RULE (learned the hard way): report APC-hot steady state
-  (second of two identical runs); cold-vs-hot differs by >2x and KV-pool
-  size changes (e.g. capture 64) masquerade as kernel regressions by
-  evicting APC.
-- Hot steady state (hybrid): TP4 519 c4 / 417 c8; TP8 680 c4 / 205 c8;
-  TP4xDP2 282 c4 / **926 c8** (best on the box).
-- CLIFF FIXED (user-prompted): the per-engine c8 collapse was 48-token
-  verify batches running eager past capture 32. `dsv4-8` a100 now ships
-  `max_cudagraph_capture_size: 64` (list gains 40/48/56/64): hybrid TP8
-  hot c8 205 -> 465 (2.3x), mxfp4 TP8 148 -> 275 (1.9x), TP4xDP2 holds
-  ~858-926, c4 unchanged. Residual TP8-vs-DP2 gap = the >=256 routed-row
-  wide-layout switch (288 rows at c8) + DP2's doubled aggregate KV; a c6
-  probe isolates the former if TP8 is to challenge 926.
-
-## Open items
-
-1. **NaN origin (open bug):** one v31-era run showed an entirely-NaN logits
-   tensor at the first post-prefill verify. Current evidence says NaNs were
-   downstream of the token-129280 poisoning (OOB embedding-row read produces
-   garbage activations), and clean v32/v33 runs show zero NaN/OOV incidents —
-   but the v31 warmup all-NaN is not fully explained. If quality issues or
-   token-0 samples appear, re-run with `VLLM_DSV4_HASH_ROUTER_DEBUG=1` and a
-   logits NaN probe in `RejectionSampler.__call__`.
-2. **CPU APC offload:** unchanged from before — do not enable
-   `kv_offloading_size` yet (implementation was removed in `81e7c5927`);
-   restore only the needed pieces after the GPU baseline is promoted.
-3. **MXFP4 prefill tiles: DONE 2026-08-10.** `moe_mxfp4_mmq_v2`
-   (csrc/quixicore/quant/dsv4_mxfp4_mmq_ampere.cuh, int8 mma.sync 128x64
-   tiles via the mmq_v2 machinery, env VLLM_GGUF_MXFP4_MMQ_V2 default on,
-   alignment block for type 39 widened to 64): kernel 8.8-57x vs dp4a;
-   e2e mxfp4-4 12K 76.6->110.6/115.8, c8 ~110->208/200; mxfp4-8 12K
-   117->161/163, c8 275->302/328, all exact. Also fixed a latent moe_q
-   bug (activation-scale gather only correct when mmq_x == nwarps).
-   Remaining levers recorded in the notebook: cp.async + SoA repack,
-   decode-gate crossover sweep. (Fused SwiGLU epilogue and permuted
-   segments: DONE, see item 7.) QuixiCore-CUDA port DONE: commit
-   e866bf16, kernels/quant/mxfp4_moe_ampere.cuh + standalone harness
-   (fused decode + mma tile + segmented pipeline, all PASS on A100).
-4. **TP2 post-128K dip** (168 -> 94.5 after a 1M-scale context): TP2-only —
-   TP4/TP8 hold their fresh-server band post-128K, supporting KV-pool
-   occupancy as the cause. Diagnose via KV-pool state, not kernels.
-5. **DP prefix-affinity routing:** DP round-robin defeats APC for repeated
-   long prefixes at low concurrency (hybrid-8 128K cold 3.0 tok/s c1).
-   Only matters if c1 long-context on the throughput tier ever matters.
-6. **dsv4-q4ktail-2 FULL_DECODE_ONLY graphs:** suspected +12% c1; unmeasured.
-7. **QuixiCore-XPU code-review ideas: IMPLEMENTED 2026-08-10.**
-   - Segmented MoE + fused SwiGLU+Q8_1 epilogue: DONE
-     (dsv4_mxfp4_seg_ampere.cuh, op ggml_dsv4_moe_a8_mxfp4_seg, env
-     VLLM_GGUF_DSV4_MXFP4_SEG default on, J16 threshold env
-     VLLM_GGUF_DSV4_SEG_J16_ROWS=1536). Cold-c8: mxfp4-4 +33%, mxfp4-8
-     +18%; decode stages par; capture-safe static grids, deterministic
-     reduce. Notebook has the full entry.
-   - NaN-guard audit: DONE -- six paged_attn_v2 reducer guard sites
-     upgraded to `!(mp > NEG_INF)` (NaN partial degrades to empty).
-   - Hybrid IQ2/Q2_K seg tiles: DONE 2026-08-10
-     (dsv4_hybrid_seg_ampere.cuh, op ggml_dsv4_moe_a8_iq2_seg, measured
-     crossover gate VLLM_GGUF_DSV4_IQ2_SEG_TOKENS=768 -- fused 8-wide
-     pipeline keeps <768 tokens, tiles win 1.3-2x at prefill widths).
-     dsv4-q4ktail-4 also ships capture 64 (hot c8 into the 500-750 band;
-     mechanism = the TP8 eager-verify fix). Still open (smaller):
-     test-discipline ports (oracle-from-stored-codes, memcmp cache
-     contracts, bit-equal RoPE tails, worst_excess<=0); gate-768 e2e pair
-     on the next qualification pass.
-   - MXFP4 SoA repack + cp.async tile staging: the tile/seg loaders read
-     raw unaligned 17-byte AoS; the byte-neutral repack is wired
-     (ggml_dsv4_repack_mxfp4, REPACKED templates exist in every wide
-     consumer now) but load-time enablement + flag threading through
-     ggml_moe_a8 case 39 / the seg op is not. Expected 10-30% on the
-     tile kernels; microbench before e2e.
-   - Q4_K kernel family for A100 (the (12,12) pair): one effort, two
-     beneficiaries -- accelerates q4ktail's 6 tail layers AND unlocks a
-     dsv4-q4k-8 a100 quality tier (expected ~10-15% under MXFP4 speed at
-     better quality). Quality can be evaluated today unoptimized via
-     `dsv4-mxfp4-4 --quant Q4_K`. Verify-width tile routing for MXFP4
-     was measured and REJECTED (fused GEMV wins below ~72 tokens).
-   - Cross-platform contract watch (XPU-side bugs, do not port): XPU
-     mqa_logits folds kv_scale inside the relu (our indexer_paged_logits
-     placement is authoritative); XPU turboquant v2 rotated-key centroids
-     look sigma-mismatched (our k8v4 unaffected); XPU all_reduce
-     >=-acceptance rendezvous breaks at uint32 generation wrap (our !=
-     design is immune).
-
-## Canonical reproducer / harness
-
-```bash
-PYTHONPATH=. .venv/bin/python -m slimserve.cli dsv4-q4ktail-2 \
-  --serve --host 127.0.0.1 --port 8012 -y
-
-PYTHONPATH=. .venv/bin/python benchmarks/benchmark_dsv4_exact.py \
-  --model /home/ubuntu/models/antirez-deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
-  --served-model-name DeepSeek-V4-Flash \
-  --source /home/ubuntu/ds4/tests/long_context_story_prompt.txt \
-  --url http://127.0.0.1:8012/v1/completions \
-  --concurrency 1 --input-tokens 1000 --output-tokens 2000 \
-  --warmup-output-tokens 8 --timeout 900
-```
-
-Add `--repeat-source` for input lengths beyond ~30K tokens.
-
-## Current Profile And Capacity
-
-Unchanged: `dsv4-2` resolves to the IQ2_XXS artifact on 2x A100 with
-`kv_cache_memory_bytes=20401094656` (19 GiB/worker), `max_model_len=1048576`,
-APC on, native `fp8_ds_mla` target KV, native TurboQuant `turboquant_k8v4`
-draft KV, DSpark k=5, PIECEWISE graphs (capture 32), async mHC. The planner
-reports 3,646,636 logical KV tokens (~3.48 full 1M contexts).
-
-No SlimServe server was left running; GPUs are idle.
-
-## 2026-08-10 final: profile structure settled
-
-DSV4 A100 profiles are now `dsv4-q4ktail-2` (TP2, 13 GiB KV, 128K-qualified),
-`dsv4-q4ktail-4` (TP4), `dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8,
-capture 64). mxfp4-8 layout settled by hot pairs: TP8 (167.6 c1 / 275 c8)
-beats TP4xDP2 (111 c1 / 118-271 unstable). The hybrid TP4xDP2 box record
-(~858-926 tok/s hot c8) is intentionally unserved (quality-quant policy);
-resurrect via mxfp4-8 --quant Q4K-tail + tp4/dp2 if ever wanted. The wide-
-layout threshold was exonerated by a c6 probe; residual TP8-vs-DP2 hybrid
-gap is per-engine width economics + measurement variance (acceptance
-lengths swing 2.6-6.0 by text window). Old root `handoff.md` lives at
-`perf/dsv4_a100_kernel_history.md` (obsolete serving numbers, valid kernel
-history).
-
-## 2026-08-10 final profile set (user-confirmed)
-
-A100 dsv4 profiles: `dsv4-q4ktail-2` (TP2, 13 GiB KV, 128K-qualified),
-`dsv4-q4ktail-4` (TP4), `dsv4-q4ktail-8` (TP4 x DP2, capture 64 -- throughput
-tier, accepted at 921.8 tok/s hot c8 on the named profile),
-`dsv4-mxfp4-4` (TP4), `dsv4-mxfp4-8` (TP8, capture 64 -- quality/latency
-tier). All five run DSpark k=5 + TurboQuant draft KV + 1M max_model_len
-(test-enforced).
-
-## 2026-08-10: 128K lifecycle qualification — ALL FIVE PROFILES PASS
-
-Full single-lifecycle sequence (1K/2K x2, 12K cold/hot, 128K cold/hot,
-post-128K continuation; exact-token, c1, every stage `exact: true`, zero
-preemptions):
-
-| Stage (tok/s) | hybrid-4 | hybrid-8 | mxfp4-4 | mxfp4-8 |
+| Build | Plain essay | Plain GSM8K | Spec essay | Spec GSM8K |
 | --- | ---: | ---: | ---: | ---: |
-| 1K/2K r1 / r2 | 128.1 / 161.8 | 39.9 / 40.0 | 110.8 / 110.8 | 164.9 / 164.5 |
-| 12K cold / hot | 152.6 / 155.2 | 26.9 / 37.3 | 76.6 / 75.5 | 117.1 / 116.5 |
-| 128K cold / hot | 94.8 / 98.3 | 3.0 / 26.4 | 55.7 / 57.2 | 80.4 / 81.5 |
-| post-128K | 171.4 | 40.0 | 110.5 | 165.0 |
+| campaign start (V1) | 2.5 | -- | -- | -- |
+| V2 runner, fp16 dequants | 6.4 | -- | 4.0 | -- |
+| + layout fix (strided gather penalty) | 2.2 | 2.0 | 1.0 | 2.2 |
+| **fe960935f** (+ gather fix, native IQ) | **15.0** | **14.0** | 3.5-4.1 | 8.0-9.5 |
+| + fused GDN/MM/vector rejection (pre-conv) | 16.15-16.40 | 15.81-16.11 | **15.03-15.60** | **36.06-36.66** |
+| + powered stack, k=7 | 16.99-17.17 | 16.77-16.86 | 16.05-16.35 | 36.82-38.19 |
+| **supported profile, k=3** | **16.99-17.17** | **16.77-16.86** | **23.06-23.74** | **34.33-35.25** |
 
-hybrid-8's c1 numbers are the DP2 characteristic (~40 ceiling: one active
-replica + per-step DP coordination; 128K cold 3.0 = round-robin sending the
-timed request to the un-warmed replica → full prefill in the timed window).
-Its service point is c8 (921.8 hot). Post-128K dip is TP2-only. Details:
-`perf/baseline_status.md` (qualified table) and `perf/optimization_status.md`
-(2026-08-10 lifecycle entry). Raw:
-`perf/results/2026-08-10/dsv4-lifecycle-qual/`. GPUs left idle, no servers
-running.
+Acceptance (Prometheus counters, essay, notebook (25)): 2.71 tokens/step,
+0.244 draft rate -- beats the llama.cpp dflash2-pr branch (2.51/0.219).
+Correctness: all 64 layers cos >= 0.9997 vs llama.cpp eval-callback;
+corruption gauntlet 7/7 clean boots, 24/24 same-seed pairs identical;
+fused GDN exhaustive harness 147/147 plus all plan shapes; rejection Monte
+Carlo PASS; current focused durable suite 17/17; vision tower ~1e-3 vs
+llama-mtmd-cli; real SlimServe text and image requests pass; Muse-Glimmer was
+unregressed by a fresh profile-exact text+image smoke after its reasoning
+parser repair.
 
-## 2026-08-10: unified profile naming
+The old 8-position x 48-layer Python GDN inversion and the >2^31 hybrid-cache
+corruption are closed. At k=3, M=4 verification is a better Metal operating
+point than the trained/upstream k=7/M=8 width: essay median rises from 16.18 to
+23.27 tok/s while GSM remains 34.78. The exact registered server produced 128
+input + 256 output tokens at 18.646 tok/s spec versus 15.913 plain (+17.2%).
 
-Profile ids now follow `<model>-<quant>-<gpus>` on every platform; a profile
-lists exactly the platforms it is validated on and refuses elsewhere. Quant
-tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K.
-Renames: dsv4-1 -> dsv4-xxs-1 (mi300x+metal; absorbed dsv4-mac, whose stale
-pre-split Metal config was dropped in favor of the measured M5 Max one),
-dsv4-2 -> the mi300x side of dsv4-q4ktail-2, dsv4-4 -> the mi300x side of
-dsv4-mxfp4-4, dsv4-8 -> dsv4-q4k-8, glm52-2/4/8 -> glm52-q2k-*,
-glm52-mac -> glm52-xxs-1, k3-6/8 -> k3-xxs-*. Merged-config parity with the
-old profiles was verified per (profile, platform) before the switch.
+## Open bugs / items, ranked
 
-## 2026-08-14: Q4_K fused pair + cp.async seg pipelining (tasks #26/#28 closed)
+1. Remaining perf versus llama.cpp: Q4_K GEMV measures only ~95 GB/s on the
+   5120x6144
+   ssm_out shape (4.7x off floor, pre-existing); head_dim-256 paged
+   attention fast path (the 16 full layers run SDPA; paged path is
+   64/128 only); selector walk and the other five-layer drafter graphs.
+   The k=3 top ledger is target 70.19 ms and inclusive sample/propose tail
+   16.42 ms per step, so target bandwidth is again the primary wall.
+2. Fix the DSV4 Metal profile regression exposed by the attempted complete
+   live-smoke matrix. `dsv4-xxs-1` loaded 93.63 GiB and reached health, then
+   spent about 12 minutes on the first tiny request at ~0.1 tok/s; the first
+   draft had 0/5 accepted. This is grossly inconsistent with its historical
+   33.684 tok/s baseline and must be isolated at first-step/verify granularity.
+   Qwen and Muse both pass their registered text+image arms, but the full
+   three-profile matrix remains failed until DSV4 completes.
+3. Cosmetics/hygiene: env-gated diagnostics remain in
+   `models/qwen3_5.py` (`_Qwen38DumpState`, layer-parity instrument) and
+   `qwen3_dflash2.py` (`QWEN38_DFLASH_DUMP` recall@k dump) -- zero-cost
+   unset; remove at campaign close. Stale `autostash` entry in `git
+   stash` is from Aug 7 (DSV4 era), safe to drop. A stray token quirk
+   appeared in sampled answers at temp 1.0 (both text and vision) --
+   unattributed, low priority.
 
-- Fused Q4_K (12,12) decode pair serving the tail layers
-  (dsv4_q4k_moe_ampere.cuh, op ggml_dsv4_moe_a8_q4k, 2 launches replace 7):
-  parity-proven (flip-decomposition methodology, see notebook), e2e
-  step-rate NEUTRAL — the c1 fixed-overhead floor absorbs it; the win is
-  banked for when sparse-attn graph capture shrinks the eager-break idle.
-- cp.async double-buffered y tiles in all four seg kernels: bit-exact,
-  kernel-level -18%/-26% at 1024/2048-token widths, e2e neutral; gate-768
-  confirmed correctly placed post-change.
-- Both ported to QuixiCore-CUDA (3e34ceea) with test harnesses.
-- MEASUREMENT RULES hardened: steps/s = tps/(1+accepted/draft) before any
-  e2e claim (q4kfull's +48% raw c1 was pure acceptance variance);
-  bit-exact A/B for data-path-only changes; mean-rel + lstsq flip
-  decomposition through quant cliffs (elementwise bounds cannot pass).
-- Production: both daemons on the committed build (fused Q4_K active),
-  canary + NAN_WATCH clean.
-- Next perf lever, in order of expected value: sparse-attention graph
-  capture to reclaim ~9ms/step eager-break idle (the c1 prize), drafter
-  cycle cost, kernel-tail consolidation.
+## Scripts and raw artifacts
+
+Durable copies are under `perf/results/2026-08-22/qwen38-fused-gdn/`:
+`consolidated_bench.py {plain|spec}` (essay + GSM8K arms, 3 seeded repeats,
+prints BENCH_JSON), `collapse_probe.py`, `spec_profile.py`, and
+`spec_profile_top.py`. Patterns: in-process `vllm.LLM(**engine_kwargs)`
+from `slimserve.registry.resolve("qwen38-q2kxl-1","metal",1,None,2**37)`,
+`__main__` guard (EngineCore spawns), `SamplingParams(temperature=1.0,
+top_p=0.95, top_k=20, seed=42)`, `max_model_len` 8192 +
+`gpu_memory_utilization` 0.45-0.6 for qwen38 (Muse smokes must use
+PROFILE-EXACT kwargs -- a max_model_len override breaks its image
+profiling).
+
+Final raw data is under `perf/results/2026-08-23/qwen38-kv-gather/`:
+`run_summary.json`, `exact_spec.json`, `exact_plain.json`, `smoke.json`, and
+the real-server log. Shared-profile evidence is in `smoke-muse-final.json`,
+`smoke-muse-final/muse-kdyn-1.log`, and `smoke-all/dsv4-xxs-1.log`. The exact
+server harness command uses
+`benchmarks/benchmark_dsv4_exact.py` with explicit `--temperature 1.0
+--top-p 0.95 --top-k 20 --seed 42`; never rely on that harness's legacy greedy
+default for Qwen.
+
+## Ops gotchas (each cost real time)
+
+- The Mac SLEEPS and kills background runs/agents: hold it awake
+  (`mcp adrafinil keep_awake`, lid-closed included) for any long run.
+- A 20 W charger at 1% battery throttles this workload catastrophically.
+  Require a high-wattage supply and battery reserve before any baseline or
+  phase-profile run; check `pmset -g batt` and the charger wattage first.
+- Refreshing `vllm/quixicore_metal.metallib` / `_quixicore_C...so`: rm-then-cp
+  + `codesign -f -s - <so>`; cp over the mapped inode SIGKILLs on dlopen.
+- llama.cpp builds: `env -u LDFLAGS -u CPPFLAGS` (a custom-LLVM env poisons
+  links); `~/llama.cpp/build-qwen38` (master, plain oracle),
+  `~/llama.cpp-dflash2/build` (PR #27342 spec oracle); check a binary is
+  fresh before trusting it (`strings ... | grep` a known-new symbol).
+- Registry bytes/sha come from `curl -I` / the HF paths-info API, never
+  from summarized pages (a wrong byte count masqueraded as a broken
+  download for an hour).
+- Regression smokes use profile-exact engine kwargs.
+
+## Reference facts (verified; full maps in perf/qwen38_metal_design.md)
+
+- GGUF arch strings: target `qwen35`, drafter `dflash` (three-way probe:
+  `dflash.expert_count` -> DSV4 DSpark, `dflash.selector_rank` -> DFlash
+  2, neither -> Muse) across config parser, tokenizer registry, loader.
+- llama.cpp converter conventions undone at load: +1 fold in every norm
+  weight except `linear_attn.norm` (we use GemmaRMSNorm -> subtract 1),
+  GDN per-V-head tensors in TILED order (pairing i_k = i_hv % 16, cfg
+  `gdn_tiled_v_head_layout`; the FLA Triton kernels still assume grouped
+  if this GGUF ever runs on CUDA), `ssm_a` stored as -exp(A_log)
+  (A_log = log(-ssm_a)), conv1d (dim,kernel)->(dim,1,kernel), MTP block
+  `blk.64.*` unmapped, fused `attn_qkv` row-split into q/k/v shards
+  (GGUF quantizes per output row), full-attn gate fused inside `attn_q`
+  (per-head [q|gate], matches the vendored split).
+- Hybrid shared block pool: attention views are restrided blocks-first
+  (attn_utils `_update_hybrid_attention_mamba_layout`); metal_attn's SDPA
+  path uses the native 64-bit range gather. Do not restore MPS `index_select`
+  on the strided pages view: beyond 2^31 elements it silently reads the wrong
+  address, even though its small-cache microbench is fast.
+- Quant formats: all native on Metal (qgemv + qgemm tiles incl. IQ1_S,
+  IQ1_M, IQ2_XS, IQ2_S, IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL);
+  `_DEQUANT_TYPES` is empty; only the Q2_K embed table dequantizes.
+- Drafter: 5 layers all NON-causal (`dflash.attention.causal=False`),
+  block 8 counts the anchor (7 drafted), target layers [5,19,33,47,61]
+  0-based, selector A/B tables {248320,256} Q4_K dequantized at load. The
+  registered Metal serving depth is deliberately k=3 after the powered sweep.

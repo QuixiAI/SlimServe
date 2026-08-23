@@ -83,8 +83,16 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
         part.unlink()
         have = 0
 
-    headers = {"Range": f"bytes={have}-"} if have else {}
     label = Path(entry["path"]).name
+    if have == entry["bytes"]:
+        # A fully-downloaded .part (e.g. the registry byte count was fixed
+        # after the fact); skip the network and go straight to validation.
+        done = have
+        term.progress(f"{label}: {term.human_bytes(done)} complete", done=True)
+        _finalize(part, dest, entry, done)
+        return
+
+    headers = {"Range": f"bytes={have}-"} if have else {}
     with requests.get(
         entry["url"], headers=headers, stream=True, timeout=60
     ) as response:
@@ -104,9 +112,15 @@ def _download(entry: dict[str, Any], dest: Path) -> None:
                     f"/{term.human_bytes(entry['bytes'])} ({pct:.1f}%)"
                 )
     term.progress(f"{label}: {term.human_bytes(done)} complete", done=True)
+    _finalize(part, dest, entry, done)
 
+
+def _finalize(part: Path, dest: Path, entry: dict[str, Any], done: int) -> None:
+    label = Path(entry["path"]).name
     if done != entry["bytes"]:
-        part.unlink(missing_ok=True)
+        # Keep the .part: a short read is a transport failure, not corrupt
+        # data, and the next attempt resumes it with a Range request instead
+        # of refetching multi-GB files from zero.
         raise RuntimeError(f"{label}: got {done} bytes, registry says {entry['bytes']}")
     expected_hash = entry.get("sha256")
     if expected_hash is not None:

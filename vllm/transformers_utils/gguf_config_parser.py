@@ -45,10 +45,11 @@ class GGUFConfigParser(ConfigParserBase):
 
             config = build_kimi_k3_dspark_config_from_gguf(str(model))
         elif architecture == "dflash":
-            # Two published drafters share the `dflash` architecture string:
+            # Three published drafters share the `dflash` architecture string:
             # the DeepSeek-V4 0731 DSpark drafter (MoE, MLA-shaped, carries
-            # `dflash.expert_count`) and the Muse-Glimmer drafter (dense GQA,
-            # no expert keys). Route on that schema difference.
+            # `dflash.expert_count`), the DFlash 2 drafter (carries
+            # `dflash.selector_rank`), and the Muse-Glimmer drafter (dense
+            # GQA, neither key). Route on those schema differences.
             from vllm.transformers_utils.gguf_utils import gguf_reader
 
             reader = gguf_reader(str(model))
@@ -58,6 +59,12 @@ class GGUFConfigParser(ConfigParserBase):
                 )
 
                 config = build_dflash_config_from_gguf(str(model))
+            elif "dflash.selector_rank" in reader.fields:
+                from vllm.transformers_utils.gguf_qwen35 import (
+                    build_qwen38_dflash2_config_from_gguf,
+                )
+
+                config = build_qwen38_dflash2_config_from_gguf(str(model))
             else:
                 from vllm.transformers_utils.gguf_muse_glimmer import (
                     build_muse_glimmer_dflash_config_from_gguf,
@@ -76,6 +83,12 @@ class GGUFConfigParser(ConfigParserBase):
             )
 
             config = build_kimi_k3_config_from_gguf(str(model))
+        elif architecture == "qwen35":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                build_qwen35_config_from_gguf,
+            )
+
+            config = build_qwen35_config_from_gguf(str(model))
         elif architecture == "glm-dsa":
             config = build_config_from_gguf(str(model))
         else:

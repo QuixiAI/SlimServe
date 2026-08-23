@@ -31,6 +31,21 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 MAX_CHUNK_BYTES = 2**30  # 1GB
 _FP32_BYTES = 4
 
+# Env-gated diagnostic dump for the recall@k replay (set
+# QWEN38_DFLASH_DUMP=<dir> to record per-verify target top-32 logits).
+import os as _os  # noqa: E402
+
+_DUMP_DIR = _os.environ.get("QWEN38_DFLASH_DUMP")
+_DUMP_STEP = [0]
+
+
+def _dump_verify_record(record: dict) -> None:
+    if _DUMP_DIR is None:
+        return
+    _os.makedirs(_DUMP_DIR, exist_ok=True)
+    torch.save(record, _os.path.join(_DUMP_DIR, f"verify_{_DUMP_STEP[0]:05d}.pt"))
+    _DUMP_STEP[0] += 1
+
 
 def _iter_request_chunks(
     cu_num_logits: np.ndarray, max_chunk_logits: int
@@ -176,8 +191,7 @@ class RejectionSampler:
             use_block_verification=self.use_block_verification,
             all_greedy=bool(
                 np.all(
-                    self.sampler.sampling_states.temperature.np[idx_mapping_np]
-                    == 0.0
+                    self.sampler.sampling_states.temperature.np[idx_mapping_np] == 0.0
                 )
             ),
         )
@@ -264,6 +278,20 @@ class RejectionSampler:
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
+        if _DUMP_DIR is not None:
+            top_vals32, top_ids32 = logits.float().topk(32, dim=-1)
+            _dump_verify_record(
+                {
+                    "draft_sampled": draft_sampled.cpu(),
+                    "pos": pos.cpu(),
+                    "cu_num_logits": input_batch.cu_num_logits[
+                        : input_batch.num_reqs + 1
+                    ].cpu(),
+                    "target_top_ids": top_ids32.cpu(),
+                    "target_top_vals": top_vals32.cpu(),
+                }
+            )
+
         max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
             logits,

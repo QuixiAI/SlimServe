@@ -66,20 +66,29 @@ def chat_completion(
     messages: list[dict[str, Any]],
     *,
     max_tokens: int,
-    temperature: float,
+    temperature: float | None = None,
+    seed: int | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     timeout: float = 600.0,
 ) -> Iterator[str]:
-    """Yield content deltas from a streaming chat completion."""
+    """Yield content deltas from a streaming chat completion.
+
+    Sampling parameters are omitted from the request unless given, so the
+    server's (i.e. the model's shipped) defaults apply. Greedy decoding is
+    never used in this stack; pass `seed` when a run must be repeatable.
+    """
     import requests
 
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "stream": True,
     }
+    if temperature is not None:
+        body["temperature"] = temperature
+    if seed is not None:
+        body["seed"] = seed
     if chat_template_kwargs:
         body["chat_template_kwargs"] = chat_template_kwargs
 

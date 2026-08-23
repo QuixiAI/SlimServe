@@ -13,6 +13,8 @@ from openai.types.chat.chat_completion_message_tool_call_param import (
     Function as FunctionCallTool,
 )
 from openai.types.responses import (
+    CustomTool,
+    ResponseCustomToolCall,
     ResponseFunctionToolCall,
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -20,6 +22,9 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
+from openai.types.responses.response_custom_tool_call_output_item import (
+    ResponseCustomToolCallOutputItem,
+)
 from openai.types.responses.response_function_tool_call_output_item import (
     ResponseFunctionToolCallOutputItem,
 )
@@ -30,7 +35,10 @@ from openai.types.responses.response_reasoning_item import (
 from openai.types.responses.tool import Tool
 
 from vllm import envs
-from vllm.entrypoints.chat_utils import make_tool_call_id
+from vllm.entrypoints.chat_utils import (
+    ResponsesCustomToolCallParam,
+    make_tool_call_id,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionMessageParam
 from vllm.entrypoints.openai.engine.protocol import FunctionCall
 from vllm.entrypoints.openai.responses.protocol import ResponseInputOutputItem
@@ -40,6 +48,7 @@ from vllm.tool_parsers.utils import (
     flat_namespace_tool_name,
     iter_response_function_tool_dicts,
     resolve_responses_tool_call_name,
+    responses_custom_tool_names,
 )
 from vllm.utils import random_uuid
 
@@ -55,6 +64,7 @@ def build_response_output_items(
 ) -> list[ResponseOutputItem]:
     outputs: list[ResponseOutputItem] = []
     tool_call_name_map = build_responses_tool_call_name_map(tools)
+    custom_tool_names = responses_custom_tool_names(tools)
 
     if reasoning:
         outputs.append(
@@ -92,18 +102,30 @@ def build_response_output_items(
             call_name = resolve_responses_tool_call_name(
                 tool_call.name, tool_call_name_map=tool_call_name_map
             )
-            outputs.append(
-                ResponseFunctionToolCall(
-                    id=f"fc_{random_uuid()}",
-                    call_id=tool_call.id
-                    or make_tool_call_id(func_name=tool_call.name, idx=idx),
-                    type="function_call",
-                    status="completed",
-                    name=call_name.name,
-                    namespace=call_name.namespace,
-                    arguments=tool_call.arguments,
+            if tool_call.name in custom_tool_names:
+                outputs.append(
+                    ResponseCustomToolCall(
+                        id=f"ctc_{random_uuid()}",
+                        call_id=tool_call.id
+                        or make_tool_call_id(func_name=tool_call.name, idx=idx),
+                        type="custom_tool_call",
+                        name=tool_call.name,
+                        input=tool_call.arguments,
+                    )
                 )
-            )
+            else:
+                outputs.append(
+                    ResponseFunctionToolCall(
+                        id=f"fc_{random_uuid()}",
+                        call_id=tool_call.id
+                        or make_tool_call_id(func_name=tool_call.name, idx=idx),
+                        type="function_call",
+                        status="completed",
+                        name=call_name.name,
+                        namespace=call_name.namespace,
+                        arguments=tool_call.arguments,
+                    )
+                )
 
     return outputs
 
@@ -189,6 +211,10 @@ def construct_input_messages(
                             "content": content.text,
                         }
                     )
+            elif isinstance(output_item, ResponseCustomToolCall):
+                messages.append(
+                    _construct_message_from_response_item(output_item)  # type: ignore[arg-type]
+                )
 
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
@@ -267,6 +293,22 @@ def _construct_message_from_response_item(
             role="assistant",
             tool_calls=[tool_call],
         )
+    elif isinstance(item, ResponseCustomToolCall):
+        tool_call = ResponsesCustomToolCallParam(
+            id=item.call_id,
+            type="custom",
+            name=item.name,
+            input=item.input,
+        )
+        if prev_assistant_msg:
+            tool_calls = prev_assistant_msg.get("tool_calls")
+            if isinstance(tool_calls, list):
+                tool_calls.append(tool_call)
+                return None
+            if tool_calls is None:
+                prev_assistant_msg["tool_calls"] = [tool_call]
+                return None
+        return {"role": "assistant", "tool_calls": [tool_call]}  # type: ignore[return-value]
     elif isinstance(item, ResponseReasoningItem):
         reasoning = ""
         if item.encrypted_content:
@@ -302,7 +344,9 @@ def _construct_message_from_response_item(
             "role": "assistant",
             "content": output_text,
         }
-    elif isinstance(item, ResponseFunctionToolCallOutputItem):
+    elif isinstance(
+        item, ResponseFunctionToolCallOutputItem | ResponseCustomToolCallOutputItem
+    ):
         return ChatCompletionToolMessageParam(
             role="tool",
             content=item.output,
@@ -310,6 +354,12 @@ def _construct_message_from_response_item(
         )
     elif isinstance(item, dict) and item.get("type") == "function_call_output":
         # Append the function call output as a tool message.
+        return ChatCompletionToolMessageParam(
+            role="tool",
+            content=item.get("output"),
+            tool_call_id=item.get("call_id"),
+        )
+    elif isinstance(item, dict) and item.get("type") == "custom_tool_call_output":
         return ChatCompletionToolMessageParam(
             role="tool",
             content=item.get("output"),
@@ -335,7 +385,7 @@ def _construct_message_from_response_item(
 def extract_function_tool_names(tools: list[Tool]) -> frozenset[str]:
     names = []
     for tool in tools:
-        if tool.type == "function":
+        if tool.type in ("function", "custom"):
             names.append(tool.name)
         elif tool.type == "namespace":
             names.extend(
@@ -382,8 +432,15 @@ def construct_tool_dicts(
     if not tools or (tool_choice == "none"):
         tool_dicts = None
     else:
-        tool_dicts = [
-            convert_tool_responses_to_completions_format(tool)
-            for tool in iter_response_function_tool_dicts(tools)
-        ]
+        tool_dicts = []
+        for tool in tools:
+            if isinstance(tool, CustomTool):
+                # Preserve the Responses declaration. Model-specific renderers
+                # adapt raw-input custom tools to their native call syntax.
+                tool_dicts.append(tool.model_dump(mode="json", exclude_none=True))
+                continue
+            tool_dicts.extend(
+                convert_tool_responses_to_completions_format(function_tool)
+                for function_tool in iter_response_function_tool_dicts([tool])
+            )
     return tool_dicts

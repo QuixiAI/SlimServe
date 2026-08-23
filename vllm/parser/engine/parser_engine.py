@@ -32,6 +32,7 @@ from vllm.tool_parsers.utils import (
     extract_types_from_schema,
     find_tool_name,
     find_tool_properties,
+    is_responses_custom_tool,
 )
 
 if TYPE_CHECKING:
@@ -125,6 +126,7 @@ class ParserEngine(Parser):
         self._suppress_tool_calls: bool = False
 
         self._arg_converter = parser_engine_config.arg_converter
+        self._custom_tool_arg_converter = parser_engine_config.custom_tool_arg_converter
         self._arg_structural_chars = parser_engine_config.arg_structural_chars
         self._stream_arg_deltas = parser_engine_config.stream_arg_deltas
         self._strip_trailing_reasoning_ws = (
@@ -929,7 +931,32 @@ class ParserEngine(Parser):
 
     # ── Arg conversion helpers ─────────────────────────────────────────
 
+    def _convert_slot_args(self, idx: int, partial: bool) -> str:
+        """Convert one slot's native argument body to its API representation."""
+        if self._slot_is_custom_tool(idx):
+            converter = self._custom_tool_arg_converter
+            if converter is None:
+                raise ValueError(
+                    f"{self.parser_engine_config.name} does not define a "
+                    "Responses custom-tool argument converter."
+                )
+            return converter(self._tool_slots[idx].args, partial)
+        converter = self._arg_converter
+        assert converter is not None
+        return converter(self._tool_slots[idx].args, partial)
+
+    def _slot_is_custom_tool(self, idx: int) -> bool:
+        if not self._tools or idx >= len(self._tool_slots):
+            return False
+        name = self._tool_slots[idx].name
+        return any(
+            is_responses_custom_tool(tool) and tool.name == name for tool in self._tools
+        )
+
     def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
+        if self._slot_is_custom_tool(idx):
+            return self._compute_custom_arg_delta(idx)
+
         converter = self._arg_converter
         if converter is None:
             return raw_delta
@@ -943,7 +970,7 @@ class ParserEngine(Parser):
 
         slot = self._tool_slots[idx]
         try:
-            current_json = converter(slot.args, True)
+            current_json = self._convert_slot_args(idx, True)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (streaming): %s", slot.args[:80])
             return None
@@ -972,14 +999,34 @@ class ParserEngine(Parser):
             return diff
         return None
 
+    def _compute_custom_arg_delta(self, idx: int) -> str | None:
+        try:
+            current = self._convert_slot_args(idx, True)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            logger.debug(
+                "custom arg converter failed (streaming): %s",
+                self._tool_slots[idx].args[:80],
+            )
+            return None
+
+        slot = self._tool_slots[idx]
+        previous = slot.streamed_json
+        if current.startswith(previous) and len(current) > len(previous):
+            slot.streamed_json = current
+            return current[len(previous) :]
+        return None
+
     def _flush_arg_converter(self, idx: int) -> str | None:
+        if self._slot_is_custom_tool(idx):
+            return self._flush_custom_arg_converter(idx)
+
         converter = self._arg_converter
         if converter is None:
             return None
 
         slot = self._tool_slots[idx]
         try:
-            final_json = converter(slot.args, False)
+            final_json = self._convert_slot_args(idx, False)
         except (json.JSONDecodeError, ValueError, TypeError):
             logger.debug("arg converter failed (flush): %s", slot.args[:80])
             return None
@@ -994,6 +1041,23 @@ class ParserEngine(Parser):
             diff = final_json[len(prev) :]
             slot.streamed_json = final_json
             return diff
+        return None
+
+    def _flush_custom_arg_converter(self, idx: int) -> str | None:
+        try:
+            current = self._convert_slot_args(idx, False)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            logger.debug(
+                "custom arg converter failed (flush): %s",
+                self._tool_slots[idx].args[:80],
+            )
+            return None
+
+        slot = self._tool_slots[idx]
+        previous = slot.streamed_json
+        if current.startswith(previous) and len(current) > len(previous):
+            slot.streamed_json = current
+            return current[len(previous) :]
         return None
 
     _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
@@ -1031,7 +1095,7 @@ class ParserEngine(Parser):
                 converter = self._arg_converter
                 if converter is not None:
                     try:
-                        args_json = converter(raw_body, False)
+                        args_json = self._convert_slot_args(idx, False)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         logger.debug(
                             "arg converter failed (extract): %s", raw_body[:80]

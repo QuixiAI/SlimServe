@@ -32,6 +32,7 @@ from vllm.parser.deepseek_v4 import (
     DSML_TOOL_START,
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _dsml_custom_input,
     _unwrap_wrapper_args,
     deepseek_v4_config,
 )
@@ -165,6 +166,71 @@ class TestArgConverter:
         assert result["n"] == "42"
         assert isinstance(result["n"], str)
 
+    def test_custom_input_preserves_raw_text(self):
+        raw = self._raw(("input", "true", 'print("hello")\nprint("world")'))
+        assert _dsml_custom_input(raw, partial=False) == (
+            'print("hello")\nprint("world")'
+        )
+
+    def test_partial_custom_input(self):
+        raw = f"<{_PARAM_OPEN.format(name='input', is_str='true')}4 +"
+        assert _dsml_custom_input(raw, partial=True) == "4 +"
+
+    def test_custom_input_converter_is_declared_by_format(self):
+        assert deepseek_v4_config().custom_tool_arg_converter is _dsml_custom_input
+
+
+class TestCustomToolParsing:
+    def _request(self):
+        from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+        return ResponsesRequest.model_validate(
+            {
+                "model": "DeepSeek-V4-Flash",
+                "input": "Use the math tool.",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "math_exp",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": 'start: INT " + " INT\n%import common.INT',
+                        },
+                    }
+                ],
+                "tool_choice": "required",
+            }
+        )
+
+    def test_non_streaming_raw_input(self, mock_tokenizer):
+        request = self._request()
+        parser = DeepSeekV4Parser(mock_tokenizer, request.tools)
+        text = _tool_calls(_invoke("math_exp", ("input", "true", "4 + 4")))
+
+        _, content, tool_calls = parser.parse(text, request)
+
+        assert content is None
+        assert tool_calls is not None
+        assert tool_calls[0].name == "math_exp"
+        assert tool_calls[0].arguments == "4 + 4"
+
+    def test_streaming_raw_input(self, mock_tokenizer):
+        request = self._request()
+        parser = DeepSeekV4Parser(mock_tokenizer, request.tools)
+        chunks = [
+            DSML_TOOL_START,
+            f"{DSML_INVOKE_PREFIX}math_exp{DSML_INVOKE_NAME_END}\n",
+            f"<{_PARAM_OPEN.format(name='input', is_str='true')}",
+            "4 + ",
+            f"4{_PARAM_CLOSE}\n{DSML_INVOKE_END}",
+            DSML_TOOL_END,
+        ]
+        deltas = simulate_tool_streaming(parser, request, chunks)
+
+        assert collect_function_name(deltas) == "math_exp"
+        assert collect_tool_arguments(deltas) == "4 + 4"
+
 
 # ── Bare </think> absorption and duplicate <think> absorption ─────────
 
@@ -217,8 +283,10 @@ class TestMissingInvokeEnd:
         parser = DeepSeekV4Parser(mock_tokenizer)
         chunks = [
             DSML_TOOL_START,
-            f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
-            f"{_param('location', 'true', 'NYC')}\n",
+            (
+                f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n"
+                f"{_param('location', 'true', 'NYC')}\n"
+            ),
             DSML_TOOL_END,
             "Done.",
         ]

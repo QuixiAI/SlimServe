@@ -78,6 +78,11 @@ class MetalPlatform(Platform):
     supported_quantization: list[str] = ["gguf"]
 
     @classmethod
+    def current_device(cls) -> str:
+        """Apple exposes exactly one GPU; parameters init on it directly."""
+        return "mps"
+
+    @classmethod
     def is_available(cls) -> bool:
         mps = getattr(torch.backends, "mps", None)
         return bool(mps and mps.is_built() and mps.is_available())

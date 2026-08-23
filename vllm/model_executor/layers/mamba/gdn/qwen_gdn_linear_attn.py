@@ -371,6 +371,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        # llama.cpp-converted GGUFs store every per-V-head GDN tensor in ggml
+        # tiled-broadcast order (see build_qwen35_config_from_gguf); the q/k
+        # heads must then be expanded with tile semantics (i_k = i_hv % H)
+        # instead of HF's repeat_interleave (i_k = i_hv // (HV // H)).
+        # Currently honored by the MPS core; the CUDA/ROCm FLA kernels assume
+        # the HF grouped layout.
+        self.tiled_v_head_layout = bool(
+            getattr(config, "gdn_tiled_v_head_layout", False)
+        )
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -382,6 +391,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._forward_method = self.forward_cpu
         elif current_platform.is_rocm():
             self._forward_method = self.forward_hip
+        elif current_platform.is_metal():
+            self._forward_method = self.forward_mps
         else:
             self._forward_method = self.forward_cuda
 
@@ -782,6 +793,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         by the compilation pass when fuse_norm_quant is enabled.
         """
         z_shape_og = z.shape
+        if (
+            core_attn_out.dim() == 3
+            and z.dim() == 3
+            and self._fused_gdn_norm_ok(core_attn_out, z)
+        ):
+            # Fused RMSNormGated (norm_before_gate + silu) in one Metal
+            # dispatch straight off the (tokens, Hv, D) views; verified
+            # against forward_native (the oracle; same kill-switch as the
+            # fused GDN step).
+            from vllm.quixicore.ops import quixicore_ops
+
+            core_attn_out = quixicore_ops.qwen_gdn_gated_norm(
+                core_attn_out.contiguous(),
+                z,
+                self._fused_gdn_norm_weight(),
+                self.norm.eps,
+            )
+            output, _ = self.out_proj(core_attn_out.flatten(-2))
+            return output
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
@@ -789,6 +819,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         output, _ = self.out_proj(core_attn_out)
         return output
+
+    def _fused_gdn_norm_ok(self, x: torch.Tensor, z: torch.Tensor) -> bool:
+        ok = self.__dict__.get("_fused_gdn_norm_flag")
+        if ok is None:
+            norm = self.norm
+            ok = (
+                self._fused_gdn_enabled()
+                and _FUSED_GDN_NORM_ENV
+                and norm.group_size is None
+                and norm.norm_before_gate
+                and norm.activation in ("silu", "swish")
+                and norm.bias is None
+                and self.head_v_dim % 4 == 0
+            )
+            self.__dict__["_fused_gdn_norm_flag"] = ok
+        return (
+            ok
+            and x.dtype == z.dtype
+            and z.stride(-1) == 1
+            and z.stride(-2) == z.shape[-1]
+        )
+
+    def _fused_gdn_norm_weight(self) -> torch.Tensor:
+        w = self.__dict__.get("_fused_gdn_norm_w")
+        if w is None:
+            w = self.norm.weight.detach().to(torch.float32).contiguous()
+            self.__dict__["_fused_gdn_norm_w"] = w
+        return w
 
     def forward_hip(
         self,
@@ -984,6 +1042,55 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         out, _ = self.out_proj(core_attn_out)
         return out
+
+    def forward_mps(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apple Metal forward: torch-native conv1d + gated delta rule scan.
+
+        Mirrors forward_cuda's projection glue, but runs the core directly
+        with torch-native MPS ops (no Triton kernels exist on Metal).
+        """
+        num_tokens = hidden_states.size(0)
+
+        # ============================================================
+        # Part 1: Input Projection
+        # ============================================================
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+
+        if self.gqa_interleaved_layout:
+            # Qwen3-Next: unpack the interleaved GQA layout
+            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+                mixed_qkvz, ba
+            )
+            query, key, value = map(
+                lambda x: rearrange(x, "l p d -> l (p d)"), (query, key, value)
+            )
+            mixed_qkv = torch.cat((query, key, value), dim=-1)
+        else:
+            # Qwen3.5: weights are already in [q, k, v, z] and [b, a] order
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            z_size = self.value_dim // self.tp_size
+            mixed_qkv, z = mixed_qkvz.split([qkv_size, z_size], dim=-1)
+            z = z.reshape(z.size(0), -1, self.head_v_dim)
+            b, a = self.split_ba(ba)
+
+        # ============================================================
+        # Part 2: Core Attention (torch-native)
+        # ============================================================
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        self._forward_core_mps(mixed_qkv, b, a, core_attn_out)
+
+        # ============================================================
+        # Part 3: Output Projection
+        # ============================================================
+        return self._output_projection(core_attn_out, z)
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         """Warm up GDN prefill kernels during V1 profiling.
@@ -1614,6 +1721,1103 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             use_qk_l2norm_in_kernel=True,
         )
         return
+
+    def _split_conved_qkv_mps(
+        self, tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split conved (N, T, conv_dim) tokens into per-head q/k/v tensors.
+
+        Returns q, k of shape (N, T, H, head_k_dim) and v of shape
+        (N, T, HV, head_v_dim).
+        """
+        key_dim = self.key_dim // self.tp_size
+        value_dim = self.value_dim // self.tp_size
+        q, k, v = torch.split(tokens, [key_dim, key_dim, value_dim], dim=-1)
+        q = q.reshape(*tokens.shape[:2], -1, self.head_k_dim)
+        k = k.reshape(*tokens.shape[:2], -1, self.head_k_dim)
+        v = v.reshape(*tokens.shape[:2], -1, self.head_v_dim)
+        return q, k, v
+
+    def _forward_core_mps(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+    ):
+        """Torch-native core for Apple Metal (MPS).
+
+        Mirrors ``_forward_core`` semantics (causal_conv1d +
+        fused_recurrent/chunk gated delta rule Triton kernels) with plain
+        torch ops: fp32 state and math, in-place per-slot conv/SSM cache
+        updates. Decode sequences (T=1) run as one batched recurrent step;
+        each prefill sequence runs a token scan with per-token work batched
+        across all heads.
+        """
+        forward_context = get_forward_context()
+        attn_metadata_raw = forward_context.attn_metadata
+
+        if attn_metadata_raw is None:
+            # V1 profiling run. There is no Triton autotuner to warm up on
+            # MPS and no persistent state to touch; the zero-filled
+            # core_attn_out is the expected output.
+            return
+
+        assert isinstance(attn_metadata_raw, dict)
+        attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
+        assert isinstance(attn_metadata, GDNAttentionMetadata)
+
+        if _GDN_MPS_DEBUG:
+            _gdn_mps_debug_dump(self.prefix, attn_metadata, attn_metadata_raw)
+
+        if attn_metadata.spec_sequence_masks is not None:
+            return self._forward_core_mps_spec(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
+
+        num_decodes = attn_metadata.num_decodes
+        num_prefills = attn_metadata.num_prefills
+        num_seqs = num_decodes + num_prefills
+        if num_seqs == 0:
+            return
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        self_kv_cache = self.kv_cache
+        # conv_state must be (..., dim, width-1) for the conv math below.
+        # DS layout stores it that way directly; SD layout needs a transpose.
+        conv_state = (
+            self_kv_cache[0]
+            if is_conv_state_dim_first()
+            else self_kv_cache[0].transpose(-1, -2)
+        )
+        ssm_state = self_kv_cache[1]
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        scale = self.head_k_dim**-0.5
+        fused = num_decodes > 0 and self._fused_gdn_enabled()
+        if fused:
+            # Fused Metal step (kernels/serving_glue/gdn_step.metal): conv
+            # window update + delta-rule scan for all decode sequences and
+            # heads in two dispatches, fp32 state in place. Verified against
+            # the torch path below (the oracle; VLLM_QWEN38_FUSED_GDN=0
+            # restores it).
+            plan = _fused_gdn_decode_plan(attn_metadata, num_decodes)
+            self._fused_gdn_step(
+                x=mixed_qkv,
+                a=a,
+                b=b,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                out=core_attn_out,
+                num_seqs=num_decodes,
+                seq_len=1,
+                token_map=plan[0],
+                conv_slot=plan[1],
+                resume_slot=plan[1],
+                store_slots=plan[2],
+                num_accepted=None,
+            )
+            if num_prefills == 0:
+                return
+
+        state_indices = attn_metadata.non_spec_state_indices_tensor[  # type: ignore[index]
+            :num_seqs
+        ].to(torch.long)
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        ).to(torch.float32)
+        conv_bias = (
+            self.conv1d.bias.to(torch.float32) if self.conv1d.bias is not None else None
+        )
+
+        # Gating terms for all tokens at once (fp32), matching
+        # fused_sigmoid_gating_delta_rule_update / fused_post_conv_prep:
+        # g = -exp(A_log) * softplus(a + dt_bias), beta = sigmoid(b).
+        g_all = -self.A_log.to(torch.float32).exp() * nn.functional.softplus(
+            a.to(torch.float32) + self.dt_bias.to(torch.float32),
+            beta=1.0,
+            threshold=20.0,
+        )
+        beta_all = torch.sigmoid(b.to(torch.float32))
+
+        # 1. Decode sequences (single token each, batch-first order):
+        # one fully batched conv update + recurrent step.
+        if num_decodes > 0 and not fused:
+            idx_d = state_indices[:num_decodes]
+            # NULL_BLOCK_ID=0 marks padded entries; route their reads and
+            # writes to the null block (slot 0) and zero their outputs,
+            # matching the Triton kernels' skip semantics.
+            valid_d = idx_d > 0
+            idx_d = torch.where(valid_d, idx_d, torch.zeros_like(idx_d))
+
+            # Non-spec semantics use only the first width-1 conv-state
+            # columns (the slot may be wider when spec decode is configured).
+            conv_width = conv_weights.size(-1) - 1
+            x_d = mixed_qkv[:num_decodes].to(torch.float32).unsqueeze(-1)
+            if _GDN_STATE_PROBE:
+                x_nan = int(torch.isnan(x_d).sum().item())
+                x_max = float(x_d.abs().max().item())
+                _sprobe_check_and_record(
+                    self.prefix,
+                    conv_state,
+                    ssm_state,
+                    [int(s) for s in idx_d[valid_d].tolist()],
+                    conv_width,
+                    "dec-pre",
+                    extras=f" in_nan={x_nan} in_absmax={x_max:.3e}",
+                )
+            conv_init_d = conv_state[idx_d, :, :conv_width].to(torch.float32)
+            conv_out_d, conv_final_d = _causal_conv1d_native(
+                x_d, conv_init_d, conv_weights, conv_bias, self.activation
+            )
+            conv_state[idx_d, :, :conv_width] = conv_final_d.to(conv_state.dtype)
+
+            q_d, k_d, v_d = self._split_conved_qkv_mps(conv_out_d.transpose(1, 2))
+            ssm_init_d = ssm_state[idx_d].to(torch.float32)
+            o_d, ssm_final_d = _gdn_recurrent_scan_native(
+                q_d,
+                k_d,
+                v_d,
+                g_all[:num_decodes].unsqueeze(1),
+                beta_all[:num_decodes].unsqueeze(1),
+                scale,
+                ssm_init_d,
+                tiled_gqa=self.tiled_v_head_layout,
+            )
+            ssm_state[idx_d] = ssm_final_d.to(ssm_state.dtype)
+            if _GDN_STATE_PROBE:
+                o_nan = int(torch.isnan(o_d).sum().item())
+                _sprobe_check_and_record(
+                    self.prefix,
+                    conv_state,
+                    ssm_state,
+                    [int(s) for s in idx_d[valid_d].tolist()],
+                    conv_width,
+                    "dec-post",
+                    extras=f" out_nan={o_nan}",
+                )
+            o_d = torch.where(valid_d.view(-1, 1, 1, 1), o_d, torch.zeros_like(o_d))
+            core_attn_out[:num_decodes] = o_d.squeeze(1).to(core_attn_out.dtype)
+
+        # 2. Prefill sequences (varlen): per-sequence scan.
+        if num_prefills > 0:
+            qsl_cpu = attn_metadata.non_spec_query_start_loc[  # type: ignore[index]
+                : num_seqs + 1
+            ].cpu()
+            has_initial_state = attn_metadata.has_initial_state
+            has_init_cpu = (
+                has_initial_state[:num_seqs].cpu()
+                if has_initial_state is not None
+                else torch.ones(num_seqs, dtype=torch.bool)
+            )
+            idx_cpu = state_indices.cpu()
+            for i in range(num_decodes, num_seqs):
+                start = int(qsl_cpu[i])
+                end = int(qsl_cpu[i + 1])
+                seq_len = end - start
+                if seq_len <= 0:
+                    continue
+                slot = int(idx_cpu[i])
+                if slot <= 0:
+                    # NULL_BLOCK_ID: padded sequence, nothing to compute.
+                    continue
+
+                conv_width = conv_weights.size(-1) - 1
+                x_i = mixed_qkv[start:end].to(torch.float32).T.unsqueeze(0)
+                if _GDN_STATE_PROBE:
+                    _sprobe_check_and_record(
+                        self.prefix,
+                        conv_state,
+                        ssm_state,
+                        [slot],
+                        conv_width,
+                        "pre-pre",
+                        extras=(
+                            f" has_init={bool(has_init_cpu[i])} "
+                            f"seq_len={seq_len} in_nan="
+                            f"{int(torch.isnan(x_i).sum().item())}"
+                        ),
+                    )
+                if bool(has_init_cpu[i]):
+                    conv_init = (
+                        conv_state[slot, :, :conv_width].to(torch.float32).unsqueeze(0)
+                    )
+                    ssm_init = ssm_state[slot].to(torch.float32).unsqueeze(0)
+                else:
+                    conv_init = torch.zeros(
+                        (1, conv_state.shape[1], conv_width),
+                        dtype=torch.float32,
+                        device=x_i.device,
+                    )
+                    ssm_init = torch.zeros(
+                        (1, *ssm_state.shape[1:]),
+                        dtype=torch.float32,
+                        device=x_i.device,
+                    )
+
+                conv_out_i, conv_final_i = _causal_conv1d_native(
+                    x_i, conv_init, conv_weights, conv_bias, self.activation
+                )
+                conv_state[slot, :, :conv_width] = conv_final_i[0].to(conv_state.dtype)
+
+                q_i, k_i, v_i = self._split_conved_qkv_mps(conv_out_i.transpose(1, 2))
+                o_i, ssm_final_i = _gdn_recurrent_scan_native(
+                    q_i,
+                    k_i,
+                    v_i,
+                    g_all[start:end].unsqueeze(0),
+                    beta_all[start:end].unsqueeze(0),
+                    scale,
+                    ssm_init,
+                    tiled_gqa=self.tiled_v_head_layout,
+                )
+                ssm_state[slot] = ssm_final_i[0].to(ssm_state.dtype)
+                if _GDN_STATE_PROBE:
+                    _sprobe_check_and_record(
+                        self.prefix,
+                        conv_state,
+                        ssm_state,
+                        [slot],
+                        conv_width,
+                        "pre-post",
+                        extras=f" out_nan={int(torch.isnan(o_i).sum().item())}",
+                    )
+                core_attn_out[start:end] = o_i[0].to(core_attn_out.dtype)
+
+    def _fused_gdn_enabled(self) -> bool:
+        """Fused Metal GDN step available for this layer's geometry?
+
+        Kill-switch: VLLM_QWEN38_FUSED_GDN=0 keeps the torch-native path
+        (the verification oracle).
+        """
+        ok = self.__dict__.get("_fused_gdn_ok")
+        if ok is None:
+            ok = (
+                _FUSED_GDN_ENV
+                and self.head_k_dim == 128
+                and self.head_v_dim % 8 == 0
+                and self.conv_kernel_size <= 4
+                and self.num_spec + 1 <= 16
+                and _fused_gdn_available()
+            )
+            self.__dict__["_fused_gdn_ok"] = ok
+            if ok:
+                logger.info_once(
+                    "Qwen GDN: fused Metal decode/verify step engaged "
+                    "(VLLM_QWEN38_FUSED_GDN=0 restores the torch-native path)."
+                )
+        return ok
+
+    def _fused_gdn_consts(self):
+        consts = self.__dict__.get("_fused_gdn_const_cache")
+        if consts is None:
+            w = self.conv1d.weight
+            conv_weight = w.view(w.size(0), w.size(-1)).to(torch.float32).contiguous()
+            conv_bias = (
+                self.conv1d.bias.to(torch.float32).contiguous()
+                if self.conv1d.bias is not None
+                else None
+            )
+            A_log = self.A_log.detach().to(torch.float32).contiguous()
+            dt_bias = self.dt_bias.detach().to(torch.float32).contiguous()
+            consts = (conv_weight, conv_bias, A_log, dt_bias)
+            self.__dict__["_fused_gdn_const_cache"] = consts
+        return consts
+
+    def _fused_gdn_step(
+        self,
+        x: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        out: torch.Tensor,
+        num_seqs: int,
+        seq_len: int,
+        token_map: torch.Tensor,
+        conv_slot: torch.Tensor,
+        resume_slot: torch.Tensor,
+        store_slots: torch.Tensor,
+        num_accepted: torch.Tensor | None,
+    ) -> None:
+        from vllm.quixicore.ops import quixicore_ops
+
+        conv_weight, conv_bias, A_log, dt_bias = self._fused_gdn_consts()
+        quixicore_ops.qwen_gdn_step(
+            x,
+            a,
+            b,
+            conv_state,
+            ssm_state,
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            token_map,
+            conv_slot,
+            resume_slot,
+            store_slots,
+            num_accepted,
+            out,
+            num_seqs,
+            seq_len,
+            self.num_k_heads // self.tp_size,
+            self.tiled_v_head_layout,
+            self.activation is not None,
+            self.head_k_dim**-0.5,
+        )
+
+    def _forward_core_mps_spec(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ):
+        """Spec-decode MPS core: verify-step forward with state rollback.
+
+        Mirrors the spec branches of ``_forward_core`` (sections 1.1/2.1
+        there): spec tokens run ``_gdn_spec_state_step_native`` (per-position
+        SSM state stores + rolling conv window, resuming from the last
+        accepted position), while non-spec sequences in the same batch run
+        the ordinary per-sequence prefill scan on their gathered token
+        stream (the metadata builder reclassifies non-spec decodes as
+        prefills whenever spec decodes are present).
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        self_kv_cache = self.kv_cache
+        # conv_state must be (..., dim, width-1+num_spec) for the conv math.
+        conv_state = (
+            self_kv_cache[0]
+            if is_conv_state_dim_first()
+            else self_kv_cache[0].transpose(-1, -2)
+        )
+        ssm_state = self_kv_cache[1]
+
+        mixed_qkv = mixed_qkv[:num_actual_tokens]
+        b = b[:num_actual_tokens]
+        a = a[:num_actual_tokens]
+
+        # num_decodes and num_spec_decodes are mutually exclusive (builder
+        # invariant): mixed batches only carry prefills alongside spec.
+        assert attn_metadata.num_decodes == 0
+        mixed = attn_metadata.num_prefills > 0
+
+        fused_spec = self._fused_gdn_enabled()
+        if fused_spec:
+            # Fused Metal verify step (kernels/serving_glue/gdn_step.metal):
+            # the per-position loop (T <= block) runs inside the kernel with
+            # the rollback contract (resume from slot[num_accepted-1], running
+            # state stored to slot[t] after every position, NULL slots
+            # skipped). Group plans are built once per step and cached on the
+            # metadata; the torch path below is the oracle
+            # (VLLM_QWEN38_FUSED_GDN=0).
+            for plan in _fused_gdn_spec_plans(attn_metadata, self.num_spec):
+                self._fused_gdn_step(
+                    x=mixed_qkv,
+                    a=a,
+                    b=b,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    out=core_attn_out,
+                    num_seqs=plan[0],
+                    seq_len=plan[1],
+                    token_map=plan[2],
+                    conv_slot=plan[3],
+                    resume_slot=plan[4],
+                    store_slots=plan[5],
+                    num_accepted=plan[6],
+                )
+            if not mixed:
+                return
+
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        ).to(torch.float32)
+        conv_bias = (
+            self.conv1d.bias.to(torch.float32) if self.conv1d.bias is not None else None
+        )
+
+        g_all = -self.A_log.to(torch.float32).exp() * nn.functional.softplus(
+            a.to(torch.float32) + self.dt_bias.to(torch.float32),
+            beta=1.0,
+            threshold=20.0,
+        )
+        beta_all = torch.sigmoid(b.to(torch.float32))
+        scale = self.head_k_dim**-0.5
+
+        if mixed:
+            spec_token_indx = attn_metadata.spec_token_indx.to(torch.long)  # type: ignore[union-attr]
+            non_spec_token_indx = attn_metadata.non_spec_token_indx.to(  # type: ignore[union-attr]
+                torch.long
+            )
+
+        if not fused_spec:
+            self._forward_core_mps_spec_torch(
+                mixed_qkv,
+                g_all,
+                beta_all,
+                conv_state,
+                ssm_state,
+                conv_weights,
+                conv_bias,
+                scale,
+                core_attn_out,
+                attn_metadata,
+                mixed,
+                spec_token_indx if mixed else None,
+            )
+            if not mixed:
+                return
+
+        # 2. Non-spec sequences (prefills, incl. reclassified decodes):
+        # per-sequence scan over the gathered non-spec token stream.
+        qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+        g_non_spec = g_all.index_select(0, non_spec_token_indx)
+        beta_non_spec = beta_all.index_select(0, non_spec_token_indx)
+        num_prefills = attn_metadata.num_prefills
+        assert attn_metadata.non_spec_query_start_loc is not None
+        qsl_cpu = attn_metadata.non_spec_query_start_loc[: num_prefills + 1].cpu()
+        has_initial_state = attn_metadata.has_initial_state
+        has_init_cpu = (
+            has_initial_state[:num_prefills].cpu()
+            if has_initial_state is not None
+            else torch.ones(num_prefills, dtype=torch.bool)
+        )
+        assert attn_metadata.non_spec_state_indices_tensor is not None
+        idx_cpu = attn_metadata.non_spec_state_indices_tensor[:num_prefills].cpu()
+        out_non_spec = torch.zeros(
+            (qkv_non_spec.size(0), *core_attn_out.shape[1:]),
+            dtype=torch.float32,
+            device=core_attn_out.device,
+        )
+        for i in range(num_prefills):
+            start = int(qsl_cpu[i])
+            end = int(qsl_cpu[i + 1])
+            seq_len = end - start
+            if seq_len <= 0:
+                continue
+            slot = int(idx_cpu[i])
+            if slot <= 0:
+                # NULL_BLOCK_ID: padded sequence, nothing to compute.
+                continue
+
+            x_i = qkv_non_spec[start:end].to(torch.float32).T.unsqueeze(0)
+            if bool(has_init_cpu[i]):
+                conv_init = (
+                    conv_state[slot, :, : conv_weights.size(-1) - 1]
+                    .to(torch.float32)
+                    .unsqueeze(0)
+                )
+                ssm_init = ssm_state[slot].to(torch.float32).unsqueeze(0)
+            else:
+                conv_init = torch.zeros(
+                    (1, conv_state.shape[1], conv_weights.size(-1) - 1),
+                    dtype=torch.float32,
+                    device=x_i.device,
+                )
+                ssm_init = torch.zeros(
+                    (1, *ssm_state.shape[1:]),
+                    dtype=torch.float32,
+                    device=x_i.device,
+                )
+
+            conv_out_i, conv_final_i = _causal_conv1d_native(
+                x_i, conv_init, conv_weights, conv_bias, self.activation
+            )
+            conv_state[slot, :, : conv_weights.size(-1) - 1] = conv_final_i[0].to(
+                conv_state.dtype
+            )
+
+            q_i, k_i, v_i = self._split_conved_qkv_mps(conv_out_i.transpose(1, 2))
+            o_i, ssm_final_i = _gdn_recurrent_scan_native(
+                q_i,
+                k_i,
+                v_i,
+                g_non_spec[start:end].unsqueeze(0),
+                beta_non_spec[start:end].unsqueeze(0),
+                scale,
+                ssm_init,
+                tiled_gqa=self.tiled_v_head_layout,
+            )
+            ssm_state[slot] = ssm_final_i[0].to(ssm_state.dtype)
+            out_non_spec[start:end] = o_i[0]
+
+        core_attn_out[:num_actual_tokens].index_copy_(
+            0, non_spec_token_indx, out_non_spec.to(core_attn_out.dtype)
+        )
+
+    def _forward_core_mps_spec_torch(
+        self,
+        mixed_qkv: torch.Tensor,
+        g_all: torch.Tensor,
+        beta_all: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_bias: torch.Tensor | None,
+        scale: float,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        mixed: bool,
+        spec_token_indx: torch.Tensor | None,
+    ) -> None:
+        """Torch-native spec verify core (the fused kernel's oracle).
+
+        Spec tokens run ``_gdn_spec_state_step_native`` grouped by query
+        length; outputs land in ``core_attn_out`` through ``spec_token_indx``
+        when the batch also carries prefills.
+        """
+        num_spec_decodes = attn_metadata.num_spec_decodes
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        spec_state_indices = attn_metadata.spec_state_indices_tensor
+        assert spec_state_indices is not None
+        spec_state_indices = spec_state_indices[:num_spec_decodes].to(torch.long)
+        num_accepted = attn_metadata.num_accepted_tokens
+        assert num_accepted is not None
+        num_accepted = num_accepted[:num_spec_decodes].to(
+            device=spec_state_indices.device, dtype=torch.long
+        )
+        assert attn_metadata.spec_query_start_loc is not None
+        spec_qsl_cpu = attn_metadata.spec_query_start_loc[: num_spec_decodes + 1].cpu()
+
+        if mixed:
+            assert spec_token_indx is not None
+            qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
+            g_spec = g_all.index_select(0, spec_token_indx)
+            beta_spec = beta_all.index_select(0, spec_token_indx)
+        else:
+            qkv_spec = mixed_qkv
+            g_spec = g_all
+            beta_spec = beta_all
+
+        # Spec sequences, grouped by query length so the common
+        # uniform-block case runs one batched conv + scan.
+        seq_lens_cpu = (spec_qsl_cpu[1:] - spec_qsl_cpu[:-1]).tolist()
+        starts_cpu = spec_qsl_cpu[:-1].tolist()
+        accepted_cpu = num_accepted.cpu().tolist()
+        slots_cpu = spec_state_indices.cpu()
+        num_spec_tokens = int(spec_qsl_cpu[-1])
+        out_spec = torch.zeros(
+            (num_spec_tokens, *core_attn_out.shape[1:]),
+            dtype=torch.float32,
+            device=core_attn_out.device,
+        )
+
+        groups: dict[int, list[int]] = {}
+        for i in range(num_spec_decodes):
+            s = int(seq_lens_cpu[i])
+            if s <= 0:
+                continue
+            if int(slots_cpu[i, 0]) <= 0 or int(slots_cpu[i, accepted_cpu[i] - 1]) <= 0:
+                # NULL_BLOCK_ID conv/resume slot: padded entry, both Triton
+                # kernels return without touching state or output.
+                continue
+            groups.setdefault(s, []).append(i)
+
+        for s, idx_list in groups.items():
+            sel = torch.tensor(
+                idx_list, dtype=torch.long, device=spec_state_indices.device
+            )
+            tok_idx = torch.tensor(
+                [starts_cpu[i] + t for i in idx_list for t in range(s)],
+                dtype=torch.long,
+                device=qkv_spec.device,
+            )
+            num_g = len(idx_list)
+            x_g = qkv_spec.index_select(0, tok_idx).view(num_g, s, -1)
+            g_g = g_spec.index_select(0, tok_idx).view(num_g, s, -1)
+            beta_g = beta_spec.index_select(0, tok_idx).view(num_g, s, -1)
+
+            o_g = _gdn_spec_state_step_native(
+                x=x_g,
+                g=g_g,
+                beta=beta_g,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                slot_rows=spec_state_indices.index_select(0, sel),
+                num_accepted=num_accepted.index_select(0, sel),
+                conv_weights=conv_weights,
+                conv_bias=conv_bias,
+                activation=self.activation,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                scale=scale,
+                tiled_gqa=self.tiled_v_head_layout,
+            )
+            out_spec.index_copy_(0, tok_idx, o_g.reshape(-1, *o_g.shape[2:]))
+
+        if mixed:
+            assert spec_token_indx is not None
+            core_attn_out[:num_actual_tokens].index_copy_(
+                0,
+                spec_token_indx[:num_spec_tokens],
+                out_spec.to(core_attn_out.dtype),
+            )
+        else:
+            core_attn_out[:num_spec_tokens] = out_spec.to(core_attn_out.dtype)
+
+
+import os as _os  # noqa: E402
+
+# Env-gated diagnostic (QWEN38_GDN_DEBUG=1): per step, dump the GDN
+# metadata this layer received plus one full-attention layer's metadata
+# (block table shape / occupancy / seq_lens) from the same forward context.
+_GDN_MPS_DEBUG = _os.environ.get("QWEN38_GDN_DEBUG") == "1"
+_GDN_DEBUG_STATE: dict = {"first_prefix": None, "calls": 0}
+
+# Env-gated diagnostic (QWEN38_STATE_PROBE=1): write-vs-readback checksums of
+# the persistent conv/ssm state, per layer per step. Any mismatch between the
+# state read at step N+1 and the state written at step N means an external
+# clobber or a lost/reordered write. Also reports NaN/absmax of the layer's
+# inputs so corruption arriving from upstream layers is distinguishable from
+# corruption born in this layer's state. Diagnostic only: syncs every step.
+_GDN_STATE_PROBE = _os.environ.get("QWEN38_STATE_PROBE") == "1"
+
+# Fused Metal GDN step (kernels/serving_glue/gdn_step.metal). Default on;
+# VLLM_QWEN38_FUSED_GDN=0 keeps the torch-native oracle path.
+_FUSED_GDN_ENV = _os.environ.get("VLLM_QWEN38_FUSED_GDN", "1") != "0"
+# Fused gated RMS norm on the GDN output (same kernel file); separately
+# switchable for A/B.
+_FUSED_GDN_NORM_ENV = _os.environ.get("VLLM_QWEN38_FUSED_GDN_NORM", "1") != "0"
+_FUSED_GDN_AVAILABLE: bool | None = None
+_FUSED_GDN_ARANGE: dict = {}
+
+
+def _fused_gdn_available() -> bool:
+    global _FUSED_GDN_AVAILABLE
+    if _FUSED_GDN_AVAILABLE is None:
+        ok = False
+        if current_platform.is_metal():
+            try:
+                from vllm.quixicore.ops import _qc
+
+                ok = hasattr(_qc(), "qwen_gdn_step")
+            except ImportError:
+                ok = False
+        _FUSED_GDN_AVAILABLE = ok
+    return _FUSED_GDN_AVAILABLE
+
+
+def _fused_gdn_arange(n: int, device: torch.device) -> torch.Tensor:
+    key = (n, str(device))
+    t = _FUSED_GDN_ARANGE.get(key)
+    if t is None:
+        t = torch.arange(n, dtype=torch.int32, device=device)
+        _FUSED_GDN_ARANGE[key] = t
+    return t
+
+
+def _fused_gdn_decode_plan(attn_metadata: GDNAttentionMetadata, num_decodes: int):
+    """Per-step decode index tensors (shared by all GDN layers of the step)."""
+    plan = getattr(attn_metadata, "_mps_fused_decode_plan", None)
+    if plan is None:
+        idx = attn_metadata.non_spec_state_indices_tensor[:num_decodes]  # type: ignore[index]
+        idx = idx.to(torch.int32).contiguous()
+        plan = (_fused_gdn_arange(num_decodes, idx.device), idx, idx.view(-1, 1))
+        attn_metadata._mps_fused_decode_plan = plan  # type: ignore[attr-defined]
+    return plan
+
+
+def _fused_gdn_spec_plans(attn_metadata: GDNAttentionMetadata, num_spec: int):
+    """Per-step spec group plans: (N, S, token_map, conv_slot, resume_slot,
+    store_slots, num_accepted) per query-length group.
+
+    NULL semantics follow the Triton kernels / torch oracle: a sequence whose
+    conv slot (row[0]) or resume slot (row[num_accepted-1]) is NULL is
+    skipped entirely (zero output); per-position NULL store slots are
+    skipped by the kernel. The uniform full-block case needs no host sync.
+    """
+    plans = getattr(attn_metadata, "_mps_fused_spec_plans", None)
+    if plans is not None:
+        return plans
+    n = attn_metadata.num_spec_decodes
+    slots = attn_metadata.spec_state_indices_tensor[:n]  # type: ignore[index]
+    device = slots.device
+    slots = slots.to(torch.int32)
+    accepted = attn_metadata.num_accepted_tokens[:n].to(  # type: ignore[index]
+        device=device, dtype=torch.int32
+    )
+    resume = slots.gather(1, (accepted - 1).clamp_min(0).to(torch.long).view(-1, 1))
+    resume = resume.view(-1)
+    conv_slot = slots[:, 0]
+    valid = (conv_slot > 0) & (resume > 0)
+    zero = torch.zeros_like(conv_slot)
+    conv_slot = torch.where(valid, conv_slot, zero).contiguous()
+    resume = torch.where(valid, resume, zero).contiguous()
+    mixed = attn_metadata.num_prefills > 0
+    spec_token_indx = attn_metadata.spec_token_indx
+    block = num_spec + 1
+    plans = []
+    if attn_metadata.num_spec_decode_tokens == n * block:
+        # Uniform full blocks: sequence i owns spec rows [i*block, (i+1)*block).
+        token_map = _fused_gdn_arange(n * block, device)
+        if mixed:
+            token_map = spec_token_indx[: n * block].to(torch.int32).contiguous()  # type: ignore[index]
+        plans.append((n, block, token_map, conv_slot, resume, slots, accepted))
+    else:
+        qsl = attn_metadata.spec_query_start_loc[: n + 1].cpu().tolist()  # type: ignore[index]
+        groups: dict[int, list[int]] = {}
+        for i in range(n):
+            s = qsl[i + 1] - qsl[i]
+            if s > 0:
+                groups.setdefault(s, []).append(i)
+        for s, idx_list in groups.items():
+            sel = torch.tensor(idx_list, dtype=torch.long, device=device)
+            tok = torch.tensor(
+                [qsl[i] + t for i in idx_list for t in range(s)],
+                dtype=torch.long,
+                device=device,
+            )
+            token_map = (
+                (
+                    spec_token_indx[tok] if mixed else tok  # type: ignore[index]
+                )
+                .to(torch.int32)
+                .contiguous()
+            )
+            plans.append(
+                (
+                    len(idx_list),
+                    s,
+                    token_map,
+                    conv_slot[sel].contiguous(),
+                    resume[sel].contiguous(),
+                    slots[sel].contiguous(),
+                    accepted[sel].contiguous(),
+                )
+            )
+    attn_metadata._mps_fused_spec_plans = plans  # type: ignore[attr-defined]
+    return plans
+
+
+# prefix -> slot -> (conv_sum, ssm_sum, step_tag)
+_SPROBE_STORE: dict = {}
+_SPROBE_STEP: dict = {"n": 0, "first_prefix": None}
+
+
+def _sprobe_sums(conv_state, ssm_state, slot, conv_width):
+    c = conv_state[slot, :, :conv_width].to(torch.float32)
+    s = ssm_state[slot].to(torch.float32)
+    return (
+        float(c.sum().item()),
+        float(s.sum().item()),
+        int(torch.isnan(c).sum().item()) + int(torch.isnan(s).sum().item()),
+        float(s.abs().max().item()),
+    )
+
+
+def _sprobe_check_and_record(
+    prefix, conv_state, ssm_state, slots, conv_width, phase, extras=""
+) -> None:
+    """Compare the current state of `slots` against the last recorded write."""
+    st = _SPROBE_STEP
+    if st["first_prefix"] is None:
+        st["first_prefix"] = prefix
+    if prefix == st["first_prefix"] and phase.endswith("pre"):
+        st["n"] += 1
+    layer_store = _SPROBE_STORE.setdefault(prefix, {})
+    for slot in slots:
+        cur = _sprobe_sums(conv_state, ssm_state, slot, conv_width)
+        prev = layer_store.get(slot)
+        if phase.endswith("pre") and prev is not None:
+            dc = abs(cur[0] - prev[0])
+            ds = abs(cur[1] - prev[1])
+            if dc > 1e-3 or ds > 1e-3 or cur[2] != prev[2]:
+                print(
+                    f"[SPROBE step {st['n']}] {prefix} slot {slot} CLOBBER "
+                    f"{phase}: conv {prev[0]:.6f}->{cur[0]:.6f} "
+                    f"ssm {prev[1]:.6f}->{cur[1]:.6f} nan {prev[2]}->{cur[2]} "
+                    f"(written at {prev[3]}){extras}",
+                    flush=True,
+                )
+        if cur[2] or cur[3] > 1e4:
+            print(
+                f"[SPROBE step {st['n']}] {prefix} slot {slot} ANOMALY {phase}: "
+                f"nan={cur[2]} ssm_absmax={cur[3]:.3e}{extras}",
+                flush=True,
+            )
+        if phase.endswith("post"):
+            layer_store[slot] = (cur[0], cur[1], cur[2], f"{phase}@{st['n']}")
+
+
+def _gdn_mps_debug_dump(prefix, attn_metadata, attn_metadata_raw) -> None:
+    st = _GDN_DEBUG_STATE
+    if st["first_prefix"] is None:
+        st["first_prefix"] = prefix
+    if prefix != st["first_prefix"] or st["calls"] >= 60:
+        return
+    st["calls"] += 1
+    idx = attn_metadata.non_spec_state_indices_tensor
+    idx_head = idx[:4].cpu().tolist() if idx is not None else None
+    line = (
+        f"[GDN-DBG step {st['calls']}] {prefix}: dec={attn_metadata.num_decodes} "
+        f"pre={attn_metadata.num_prefills} spec={attn_metadata.num_spec_decodes} "
+        f"slots={idx_head}"
+    )
+    for key, meta in attn_metadata_raw.items():
+        if isinstance(meta, GDNAttentionMetadata) or meta is attn_metadata:
+            continue
+        bt = getattr(meta, "block_table", None)
+        if bt is None:
+            bt = getattr(meta, "block_table_tensor", None)
+        sl = getattr(meta, "seq_lens_cpu", None)
+        if sl is None:
+            sl = getattr(meta, "seq_lens", None)
+        bt_desc = None
+        if bt is not None:
+            row0 = bt[0]
+            bt_desc = (
+                f"shape={tuple(bt.shape)} row0_nonzero="
+                f"{int((row0 != 0).sum())} row0_head={row0[:6].cpu().tolist()}"
+            )
+        sl_desc = sl[:4].cpu().tolist() if sl is not None else None
+        line += f" | {key}: bt {bt_desc} seq_lens={sl_desc}"
+        break
+    print(line, flush=True)
+
+
+def _causal_conv1d_native(
+    x: torch.Tensor,
+    initial_state: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    activation: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch-native causal depthwise conv1d with persistent state (fp32).
+
+    Matches the semantics of ``causal_conv1d_fn`` / ``causal_conv1d_update``
+    (vllm/model_executor/layers/mamba/ops/causal_conv1d.py): the state holds
+    the last ``width - 1`` inputs in chronological order (newest last) and
+
+        out[:, :, t] = act(bias + sum_w weight[:, w] * padded[:, :, t + w])
+
+    with ``padded = cat([initial_state, x], dim=-1)``.
+
+    Args:
+        x: (N, dim, T) fp32 inputs.
+        initial_state: (N, dim, width - 1) fp32 prior inputs (zeros when a
+            sequence has no initial state).
+        weight: (dim, width) fp32.
+        bias: (dim,) fp32 or None.
+        activation: None or "silu"/"swish".
+
+    Returns:
+        out: (N, dim, T) fp32, final_state: (N, dim, width - 1) fp32.
+    """
+    width = weight.size(-1)
+    seq_len = x.size(-1)
+    padded = torch.cat([initial_state, x], dim=-1)
+    out = torch.zeros_like(x)
+    for w in range(width):
+        out += weight[:, w : w + 1] * padded[..., w : w + seq_len]
+    if bias is not None:
+        out += bias[:, None]
+    if activation is not None:
+        out = nn.functional.silu(out)
+    return out, padded[..., seq_len:]
+
+
+def _gdn_recurrent_scan_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    tiled_gqa: bool = False,
+    output_all_states: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch-native gated delta rule recurrence (fp32).
+
+    Port of ``fused_recurrent_gated_delta_rule_fwd_kernel``
+    (vllm/third_party/flash_linear_attention/ops/fused_recurrent.py) with
+    ``USE_QK_L2NORM_IN_KERNEL=True`` semantics; the sequential loop is over
+    tokens only, batched across sequences and heads.
+
+    Args:
+        q, k: (N, T, H, K) shared q/k heads (head hv uses h = hv // (HV//H)).
+        v: (N, T, HV, V).
+        g: (N, T, HV) fp32 log-decay.
+        beta: (N, T, HV) fp32 write strength.
+        scale: query scale (head_k_dim ** -0.5).
+        initial_state: (N, HV, V, K) fp32; not mutated.
+        output_all_states: when True, the second return value is the running
+            state after EVERY position, shape (N, T, HV, V, K) — the
+            per-position stores required by spec decoding
+            (INPLACE_FINAL_STATE in the Triton kernel).
+
+    Returns:
+        o: (N, T, HV, V) fp32, final_state: (N, HV, V, K) fp32
+        (or (N, T, HV, V, K) fp32 when ``output_all_states``).
+    """
+    num_seqs, seq_len, num_k_heads, _ = q.shape
+    num_v_heads = v.shape[2]
+    rep = num_v_heads // num_k_heads
+
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    v = v.to(torch.float32)
+
+    # Per-head l2norm along K, then query scaling (b_q/b_k normalization
+    # followed by b_q *= scale in the Triton kernel).
+    q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6) * scale
+    k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
+
+    # Expand shared q/k heads to v-head granularity.
+    if tiled_gqa:
+        # ggml tiled broadcast (llama.cpp-converted GGUF weights, where the
+        # per-V-head tensors are stored v-outer/k-inner): i_h = i_hv % H.
+        q = q.repeat(1, 1, rep, 1)
+        k = k.repeat(1, 1, rep, 1)
+    else:
+        # HF grouped layout: i_h = i_hv // (HV // H).
+        q = q.repeat_interleave(rep, dim=2)
+        k = k.repeat_interleave(rep, dim=2)
+
+    decay = g.exp()
+
+    state = initial_state.to(torch.float32).clone()  # (N, HV, V, K)
+    o = torch.empty(
+        (num_seqs, seq_len, num_v_heads, v.shape[3]),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    all_states: list[torch.Tensor] | None = [] if output_all_states else None
+    for t in range(seq_len):
+        k_t = k[:, t]  # (N, HV, K)
+        state = state * decay[:, t, :, None, None]
+        # Delta rule: v_t -= S @ k_t; v_t *= beta_t; S += v_t ⊗ k_t.
+        v_t = v[:, t] - torch.einsum("nhvk,nhk->nhv", state, k_t)
+        v_t = v_t * beta[:, t, :, None]
+        state = state + v_t.unsqueeze(-1) * k_t.unsqueeze(-2)
+        o[:, t] = torch.einsum("nhvk,nhk->nhv", state, q[:, t])
+        if all_states is not None:
+            all_states.append(state)
+    if all_states is not None:
+        return o, torch.stack(all_states, dim=1)  # (N, T, HV, V, K)
+    return o, state
+
+
+def _gdn_spec_state_step_native(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    conv_state: torch.Tensor,
+    ssm_state: torch.Tensor,
+    slot_rows: torch.Tensor,
+    num_accepted: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    activation: str | None,
+    num_k_heads: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    scale: float,
+    tiled_gqa: bool,
+) -> torch.Tensor:
+    """One spec-decode (multi-query) GDN step with state rollback (fp32).
+
+    Torch-native port of the Triton spec-decoding pair:
+
+    - ``causal_conv1d_update`` with ``IS_SPEC_DECODING`` (ops/causal_conv1d.py):
+      the conv slot ``slot_rows[i, 0]`` holds a rolling window; with
+      ``off = num_accepted[i] - 1`` the initial window is
+      ``state[:, off : off + width - 1]`` and after the step the slot is
+      rewritten (from column 0) as
+      ``[state[:, off + 1 : off + width - 1], x_i]`` — rejected draft inputs
+      from the previous step are thereby dropped.
+    - ``fused_recurrent_gated_delta_rule_fwd_kernel`` with
+      ``IS_SPEC_DECODING + INPLACE_FINAL_STATE`` (ops/fused_recurrent.py):
+      the SSM state resumes from slot ``slot_rows[i, num_accepted[i] - 1]``
+      and the running state after EVERY position t is stored to slot
+      ``slot_rows[i, t]``; slots <= 0 (NULL_BLOCK_ID) skip the store.
+
+    All sequences in the batch must share the same query length ``s`` (the
+    caller groups by length) and must have valid (> 0) conv and resume
+    slots; per-position NULL slots are still honored on store.
+
+    Args:
+        x: (G, s, conv_dim) pre-conv spec tokens (chronological).
+        g, beta: (G, s, HV) fp32 gating terms.
+        conv_state: (num_slots, conv_dim, L) mutated in place,
+            L >= width - 1 + s - 1.
+        ssm_state: (num_slots, HV, V, K) mutated in place.
+        slot_rows: (G, >= s) long per-position state slots.
+        num_accepted: (G,) long accepted-token counts from the previous step.
+        conv_weights: (conv_dim, width) fp32; conv_bias: (conv_dim,) or None.
+
+    Returns:
+        o: (G, s, HV, V) fp32 core attention outputs.
+    """
+    num_groups, s, conv_dim = x.shape
+    width = conv_weights.size(-1)
+    device = x.device
+
+    x_t = x.to(torch.float32).transpose(1, 2)  # (G, conv_dim, s)
+    conv_slots = slot_rows[:, 0]
+    state_rows = conv_state[conv_slots].to(torch.float32)  # (G, conv_dim, L)
+    off = (num_accepted - 1).view(-1, 1, 1)
+
+    # Initial conv window: state[:, off : off + width - 1].
+    win_idx = off + torch.arange(width - 1, device=device).view(1, 1, -1)
+    conv_init = state_rows.gather(-1, win_idx.expand(num_groups, conv_dim, -1))
+    conv_out, _ = _causal_conv1d_native(
+        x_t, conv_init, conv_weights, conv_bias, activation
+    )
+
+    # Rolled conv state: [state[:, off+1 : off+width-1], x] from column 0.
+    if width > 2:
+        carry_idx = off + 1 + torch.arange(width - 2, device=device).view(1, 1, -1)
+        carry = state_rows.gather(-1, carry_idx.expand(num_groups, conv_dim, -1))
+        new_state = torch.cat([carry, x_t], dim=-1)
+    else:
+        new_state = x_t
+    conv_state[conv_slots, :, : width - 2 + s] = new_state.to(conv_state.dtype)
+
+    # Recurrent scan resuming from the last accepted position's SSM slot.
+    key_dim = num_k_heads * head_k_dim
+    tokens = conv_out.transpose(1, 2)  # (G, s, conv_dim)
+    q_g, k_g, v_g = torch.split(
+        tokens, [key_dim, key_dim, conv_dim - 2 * key_dim], dim=-1
+    )
+    q_g = q_g.reshape(num_groups, s, -1, head_k_dim)
+    k_g = k_g.reshape(num_groups, s, -1, head_k_dim)
+    v_g = v_g.reshape(num_groups, s, -1, head_v_dim)
+
+    resume_slots = slot_rows.gather(1, (num_accepted - 1).view(-1, 1)).squeeze(1)
+    ssm_init = ssm_state[resume_slots].to(torch.float32)
+    o_g, states_all = _gdn_recurrent_scan_native(
+        q_g,
+        k_g,
+        v_g,
+        g.to(torch.float32),
+        beta.to(torch.float32),
+        scale,
+        ssm_init,
+        tiled_gqa=tiled_gqa,
+        output_all_states=True,
+    )
+
+    # Store the running state after every position to its slot; NULL slots
+    # (<= 0) are skipped, matching the Triton kernel.
+    pos_slots = slot_rows[:, :s].reshape(-1)
+    valid = pos_slots > 0
+    if bool(valid.any()):
+        flat_states = states_all.reshape(-1, *states_all.shape[2:])
+        ssm_state[pos_slots[valid]] = flat_states[valid].to(ssm_state.dtype)
+    return o_g
 
 
 def qwen_gdn_attention_core(

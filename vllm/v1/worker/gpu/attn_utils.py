@@ -262,7 +262,7 @@ def _reshape_kv_cache(
     kv_cache_config: "KVCacheConfig | None" = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
-    has_attn = False
+    has_attn, has_mamba = False, False
 
     layer_packing: dict[str, tuple[int, int]] = {}
     if kv_cache_config is not None:
@@ -350,6 +350,7 @@ def _reshape_kv_cache(
                 )
 
             elif isinstance(kv_cache_spec, MambaSpec):
+                has_mamba = True
                 page_size_bytes = kv_cache_spec.page_size_bytes
                 # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
                 # int8 page view per layer; the layer's bind_kv_cache unpacks
@@ -363,6 +364,15 @@ def _reshape_kv_cache(
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
                 )
+
+    if has_attn and has_mamba:
+        # Hybrid attention/mamba models share one allocation per block-id
+        # space: attention block i and mamba block i must address the same
+        # bytes. K/V-first backend layouts break that invariant; restride
+        # them to blocks-first physical storage.
+        _update_hybrid_attention_mamba_layout(
+            attn_groups, kv_caches, kernel_block_sizes, cache_dtype
+        )
 
     if has_attn and kv_cache_config is not None:
         _align_mixed_attention_kv_cache_views(
@@ -378,6 +388,58 @@ def _reshape_kv_cache(
         kv_caches[layer_name] = kv_caches[target_layer_name]
 
     return kv_caches
+
+
+def _update_hybrid_attention_mamba_layout(
+    attn_groups: Iterable[AttentionGroup],
+    kv_caches: dict[str, Any],
+    kernel_block_sizes: list[int],
+    cache_dtype: str,
+) -> None:
+    """Restride K/V-first attention views to blocks-first physical storage.
+
+    Hybrid attention/mamba models hand out block IDs from one unified pool,
+    and each shared allocation must map block i to the same byte range in
+    every layer's view. A K/V-first layout such as ``(2, num_blocks, ...)``
+    stores all K pages before all V pages, so attention block i's K half
+    lands at byte offset ``i * page_size / 2`` -- inside mamba page
+    ``i // 2`` -- and every KV-cache write silently corrupts some mamba
+    layer's conv/ssm state (observed as GDN state corruption on Metal, whose
+    backend is K/V-first). Swapping the two outer strides interleaves each
+    block's K and V halves into one contiguous page without moving data,
+    exactly mirroring GPUModelRunnerV1._update_hybrid_attention_mamba_layout.
+    """
+    for group in attn_groups:
+        kv_cache_spec = group.kv_cache_spec
+        if not isinstance(kv_cache_spec, AttentionSpec):
+            continue
+        if group.kv_cache_group_id >= len(kernel_block_sizes):
+            continue
+        block_dim = group.backend.get_kv_cache_block_dim(
+            kernel_block_sizes[group.kv_cache_group_id],
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=(
+                getattr(kv_cache_spec, "tq_cache_dtype", "") or cache_dtype
+            ),
+        )
+        # block_dim 0 means (num_blocks, 2, ...): pages already contiguous.
+        if block_dim == 0:
+            continue
+        assert block_dim == 1, (
+            f"Unsupported KV cache block dim {block_dim} for hybrid "
+            f"attention/mamba layout ({group.backend.__name__})"
+        )
+        for layer_name in group.layer_names:
+            if layer_name not in kv_caches:
+                # Cross-layer-shared views alias their target after this pass.
+                continue
+            kv_cache = kv_caches[layer_name]
+            hidden_size = kv_cache.shape[2:].numel()
+            kv_cache.as_strided_(
+                size=kv_cache.shape,
+                stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
+            )
 
 
 def _align_mixed_attention_kv_cache_views(
@@ -530,18 +592,23 @@ def build_attn_metadata(
     # only the persistent device buffers the builders write; the cached
     # metadata objects stay content-live because all their tensor fields are
     # views over those buffers (CPU scalars that drift are refreshed).
-    steady_eligible = (
+    # `steady` is the cache narrowed to the eligible case (None otherwise), so
+    # the type checker follows the Optional through the blocks below.
+    steady: dict[str, Any] | None = None
+    if (
         steady_cache is not None
+        and is_prefilling is not None
         and not for_cudagraph_capture
         and causal is True
         and dcp_local_seq_lens is None
         and mm_req_doc_ranges is None
         and model_specific_attn_metadata is None
         and not bool(is_prefilling[:num_reqs].any())
-    )
-    steady_sig = (num_reqs, num_tokens, max_query_len) if steady_eligible else None
-    if steady_eligible and steady_cache.get("sig") == steady_sig:
-        for cm, items in steady_cache["groups"]:
+    ):
+        steady = steady_cache
+    steady_sig = (num_reqs, num_tokens, max_query_len) if steady is not None else None
+    if steady is not None and steady.get("sig") == steady_sig:
+        for cm, items in steady["groups"]:
             cm.max_seq_len = max_seq_len
             for builder, meta, layer_names, supports in items:
                 if supports:
@@ -551,8 +618,8 @@ def build_attn_metadata(
                         common_prefix_len=0, common_attn_metadata=cm
                     )
                     for layer_name in layer_names:
-                        steady_cache["attn_metadata"][layer_name] = rebuilt
-        return steady_cache["attn_metadata"]
+                        steady["attn_metadata"][layer_name] = rebuilt
+        return steady["attn_metadata"]
 
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -638,10 +705,10 @@ def build_attn_metadata(
                         hasattr(attn_metadata_builder, "steady_decode_update"),
                     )
                 )
-    if steady_sig is not None:
-        steady_cache["sig"] = steady_sig
-        steady_cache["attn_metadata"] = attn_metadata
-        steady_cache["groups"] = steady_groups
+    if steady is not None:
+        steady["sig"] = steady_sig
+        steady["attn_metadata"] = attn_metadata
+        steady["groups"] = steady_groups
     elif steady_cache is not None:
         steady_cache["sig"] = None
     return attn_metadata

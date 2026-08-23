@@ -53,7 +53,9 @@ set(VLLM_METALLIB "${CMAKE_CURRENT_BINARY_DIR}/quixicore_metal.metallib")
 add_custom_command(
   OUTPUT ${VLLM_METALLIB}
   COMMAND ${XCRUN_EXECUTABLE} metal
-          -std=metal3.1 -O2
+          # metal4.0 for mpp::tensor_ops (M5 GPU neural accelerators) in
+          # qgemm_sm_t; the pre-existing kernels compile unchanged under it
+          -std=metal4.0 -O2
           -I ${QUIXICORE_METAL_INCLUDE}
           # No .metal currently includes from kernels/common -- only the host
           # header does -- but upstream's build passes it, so keep it here too
