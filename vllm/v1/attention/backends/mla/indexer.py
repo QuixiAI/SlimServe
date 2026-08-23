@@ -230,6 +230,10 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     cu_seq_lens: torch.Tensor
     token_to_seq: torch.Tensor
     total_seq_lens: int
+    # Maximum compressed candidate width of any request in this chunk.  This
+    # is CPU scheduling metadata, so native backends can size work to the
+    # active request window without synchronizing a device tensor.
+    max_seq_len: int
     token_start: int
     token_end: int
     num_reqs: int
@@ -1165,6 +1169,7 @@ def build_prefill_chunk_metadata(
     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
         return None
+    max_seq_len = int(compressed_seq_lens_cpu[start_idx:end_idx].max().item())
 
     num_reqs = end_idx - start_idx
     device = block_table.device
@@ -1245,6 +1250,7 @@ def build_prefill_chunk_metadata(
         cu_seq_lens=cu_seq_lens,
         token_to_seq=token_to_seq,
         total_seq_lens=total_seq_lens,
+        max_seq_len=max_seq_len,
         block_table=block_table[start_idx:end_idx],
         token_start=token_start,
         token_end=token_end,

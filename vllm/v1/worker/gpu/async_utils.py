@@ -30,8 +30,17 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = torch.Event()
         self._has_fault: torch.Tensor | None = None
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        # MPS cannot reliably cold-start this cross-stream hand-off.  In
+        # particular, the first request whose prefill spans multiple engine
+        # steps can leave the copy-stream event permanently unsignalled.  The
+        # output is only a few scalars, so keep its copy and completion event
+        # on the producing stream on MPS.  CUDA/ROCm retain the independent
+        # copy stream used to overlap this transfer with proposal work.
+        copy_on_main_stream = sampler_output.sampled_token_ids.device.type == "mps"
+        output_stream = main_stream if copy_on_main_stream else copy_stream
+        with stream(output_stream, main_stream):
+            if not copy_on_main_stream:
+                output_stream.wait_stream(main_stream)
 
             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
@@ -50,7 +59,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(copy_stream)
+            self.copy_event.record(output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
@@ -100,14 +109,17 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.Event()
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        copy_on_main_stream = self.pooler_output.device.type == "mps"
+        output_stream = main_stream if copy_on_main_stream else copy_stream
+        with stream(output_stream, main_stream):
+            if not copy_on_main_stream:
+                output_stream.wait_stream(main_stream)
             self.pooler_output_cpu = self.pooler_output.to("cpu", non_blocking=True)
             if self.is_valid is not None:
                 self.is_valid_cpu = self.is_valid.to("cpu", non_blocking=True)
             else:
                 self.is_valid_cpu = None
-            self.copy_event.record(copy_stream)
+            self.copy_event.record(output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         pooler_output = list(self.pooler_output_cpu.unbind(dim=0))

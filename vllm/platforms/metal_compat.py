@@ -18,20 +18,11 @@ patched at their call sites:
    that is a dummy stub that raises when called. Metal has no graph capture,
    so the truthful answer is a constant ``False``.
 
-Known open issue, deliberately NOT patched here: a boot's first multi-chunk
-(> max_num_batched_tokens) prefill wedges deterministically unless a
-single-chunk request with real decode steps ran first (the boot-ramp ops
-protocol in perf/prefill_handoff.md). Replacing the async-output event wait
-with a stream drain moved the park without fixing it and produced a GPU
-command-buffer timeout variant on one boot -- evidence in
-perf/optimization_status.md (cleanup-phase entry). Fix attempts must prove
-themselves against the primer -> multi-chunk-direct repro before landing.
-
-The race is timing-sensitive on the host side as well: stripping the
-phaseprof brackets and marshalling-memo conditionals from
-vllm/models/deepseek_v4/{compressor,metal}.py made even RAMPED multi-chunk
-requests park at completion (boot-level bisect, cleanup-phase entry), so
-those code paths keep their structure until the event path is fixed.
+The async-output path must not hand output copies from the main MPS stream to
+a second stream.  A cold cross-stream wait could lose its completion signal
+on the first multi-chunk request.  ``gpu/async_utils.py`` therefore records
+the tiny output copy and event on the producing stream on MPS; CUDA and ROCm
+retain their overlapping copy-stream path.
 
 Applied once, from the platform's check_and_update_config.
 """
@@ -111,8 +102,8 @@ def _patch_cpu_gpu_buffer_blocking() -> None:
             return self.cpu.copy_(self.gpu, non_blocking=False)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=False)
 
-    CpuGpuBuffer.copy_to_gpu = copy_to_gpu
-    CpuGpuBuffer.copy_to_cpu = copy_to_cpu
+    CpuGpuBuffer.copy_to_gpu = copy_to_gpu  # type: ignore[method-assign]
+    CpuGpuBuffer.copy_to_cpu = copy_to_cpu  # type: ignore[method-assign]
 
 
 def apply_compat_patches() -> None:
@@ -129,11 +120,15 @@ def apply_compat_patches() -> None:
 
     from vllm.v1.worker.block_table import BlockTable
 
-    BlockTable.compute_slot_mapping = _metal_compute_slot_mapping
+    BlockTable.compute_slot_mapping = (  # type: ignore[method-assign]
+        _metal_compute_slot_mapping
+    )
 
     _patch_cpu_gpu_buffer_blocking()
 
-    torch.cuda.is_current_stream_capturing = lambda: False
+    torch.cuda.is_current_stream_capturing = (  # type: ignore[method-assign]
+        lambda: False
+    )
 
     _APPLIED = True
     logger.info(

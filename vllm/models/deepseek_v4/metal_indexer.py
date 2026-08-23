@@ -23,6 +23,7 @@ casts); decode-by-LUT is exact.
 """
 
 import os
+from typing import Any, cast
 
 import torch
 
@@ -36,9 +37,11 @@ from vllm.forward_context import get_forward_context
 # optimization_status).
 _LONGCTX_PREFILL_SYNC = os.environ.get("VLLM_QC_LONGCTX_SYNC", "1") != "0"
 
-# Rows per score chunk: bounds the [rows, 64 heads, n_k] fp32 intermediate
-# (25 MB at the profile's 768-candidate width).
+# Rows and candidates per fallback score tile: together they bound the fp32
+# intermediate to 32 MiB instead of scaling it to the configured context
+# length (which would be about 2 GiB at 128 rows x 64 heads x 65,536 keys).
 _SCORE_ROW_CHUNK = 128
+_SCORE_K_CHUNK = 1024
 
 _E4M3_LUT: dict[str, torch.Tensor] = {}
 
@@ -86,6 +89,47 @@ def _score_and_select(
     return idx.masked_fill(vals == float("-inf"), -1)
 
 
+def _score_and_select_streaming(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k_vals: torch.Tensor,
+    k_scale: torch.Tensor,
+    lo: torch.Tensor | None,
+    hi: torch.Tensor,
+    k_eff: int,
+) -> torch.Tensor:
+    """Candidate-tiled fallback with O(rows * heads * 1024) score memory."""
+    rows = q.shape[0]
+    n_k = k_vals.shape[-2]
+    best_vals = torch.full(
+        (rows, k_eff), float("-inf"), dtype=torch.float32, device=q.device
+    )
+    best_idx = torch.full((rows, k_eff), -1, dtype=torch.long, device=q.device)
+
+    for k0 in range(0, n_k, _SCORE_K_CHUNK):
+        k1 = min(k0 + _SCORE_K_CHUNK, n_k)
+        tile_vals = k_vals[k0:k1]
+        tile_scale = k_scale[k0:k1]
+        col = torch.arange(k0, k1, device=q.device)
+        scores = torch.einsum("thd,kd->thk", q.float(), tile_vals)
+        logits = torch.einsum("thk,th->tk", torch.relu(scores), weights)
+        logits *= tile_scale[None, :]
+        invalid = col[None, :] >= hi[:, None]
+        if lo is not None:
+            invalid |= col[None, :] < lo[:, None]
+        logits.masked_fill_(invalid, float("-inf"))
+
+        tile_k = min(k_eff, k1 - k0)
+        vals, idx = torch.topk(logits, tile_k, dim=-1)
+        idx += k0
+        merged_vals = torch.cat((best_vals, vals), dim=1)
+        merged_idx = torch.cat((best_idx, idx), dim=1)
+        best_vals, keep = torch.topk(merged_vals, k_eff, dim=-1)
+        best_idx = merged_idx.gather(1, keep)
+
+    return best_idx.masked_fill(best_vals == float("-inf"), -1)
+
+
 def _gather_k(
     kv_cache: torch.Tensor,  # [num_blocks, block_size, 132] uint8 (may be
     # block-stride padded for alignment — index, never view(-1))
@@ -95,12 +139,7 @@ def _gather_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = kv_cache[blocks, offs]  # [..., 132] contiguous gather
     k_vals = lut[rows[..., :128].to(torch.long)]
-    k_scale = (
-        rows[..., 128:]
-        .contiguous()
-        .view(torch.float32)
-        .reshape(rows.shape[:-1])
-    )
+    k_scale = rows[..., 128:].contiguous().view(torch.float32).reshape(rows.shape[:-1])
     return k_vals, k_scale
 
 
@@ -119,8 +158,7 @@ def _native_topk_decode(
     deterministic (logit desc, index asc) tie order and the exact e4m3-LUT
     decode. Returns False when shapes/dtypes fall outside the kernel."""
     if not (
-        width <= 1024
-        and q.dtype in (torch.float16, torch.bfloat16)
+        q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[1] == 64
         and q.shape[2] == 128
         and kv_cache.shape[-1] == 132
@@ -133,8 +171,7 @@ def _native_topk_decode(
     from vllm.quixicore.ops import quixicore_ops
 
     if not (
-        quixicore_ops.is_available()
-        and quixicore_ops.has("dsv4_indexer_topk_decode")
+        quixicore_ops.is_available() and quixicore_ops.has("dsv4_indexer_topk_decode")
     ):
         return False
     quixicore_ops.dsv4_indexer_topk_decode(
@@ -151,7 +188,6 @@ def _native_topk_decode(
 
 
 def _native_topk_prefill(
-    indexer,
     q: torch.Tensor,
     weights: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -159,7 +195,6 @@ def _native_topk_prefill(
     buf: torch.Tensor,
     t0: int,
     n_q: int,
-    n_k: int,
     topk: int,
 ) -> bool:
     """Single-dispatch prefill producer: the decode top-k kernel with the
@@ -182,21 +217,19 @@ def _native_topk_prefill(
     from vllm.quixicore.ops import quixicore_ops
 
     if not (
-        quixicore_ops.is_available()
-        and quixicore_ops.has("dsv4_indexer_topk_prefill")
+        quixicore_ops.is_available() and quixicore_ops.has("dsv4_indexer_topk_prefill")
     ):
         return False
-    max_cand = indexer.max_model_len  # already divided by compress_ratio
-    if max_cand > 1024:
-        return False
+    # This is exact CPU scheduler metadata for prefill requests.  Do not gate
+    # on the profile's configured maximum: that disabled the native path for
+    # every request when a 262K context was configured.
+    max_cand = chunk.max_seq_len
     ks = chunk.cu_seqlen_ks[:n_q]
     ke = chunk.cu_seqlen_ke[:n_q]
     cu = chunk.cu_seq_lens
-    tok_req = (
-        torch.searchsorted(cu, ks, right=True).to(torch.int32) - 1
-    ).contiguous()
+    tok_req = (torch.searchsorted(cu, ks, right=True).to(torch.int32) - 1).contiguous()
     cand = (ke - ks).to(torch.int32).contiguous()
-    k_eff = min(topk, n_k)
+    k_eff = min(topk, max_cand)
     quixicore_ops.dsv4_indexer_topk_prefill(
         q[t0 : t0 + n_q].contiguous(),
         weights[t0 : t0 + n_q].float().contiguous(),
@@ -205,7 +238,7 @@ def _native_topk_prefill(
         tok_req,
         cand,
         buf.narrow(0, t0, n_q),
-        min(1024, max_cand),
+        max_cand,
         k_eff,
     )
     return True
@@ -221,7 +254,7 @@ def metal_sparse_attn_indexer(
     attn_metadata = get_forward_context().attn_metadata
     if not isinstance(attn_metadata, dict):
         return buf
-    md = attn_metadata[indexer.k_cache.prefix]
+    md = cast(Any, attn_metadata[indexer.k_cache.prefix])
     kv_cache = indexer.k_cache.kv_cache
     block_size = kv_cache.shape[1]
     lut = _e4m3_lut(q.device)
@@ -270,16 +303,22 @@ def metal_sparse_attn_indexer(
             if n_q <= 0 or n_k <= 0:
                 continue
             if _native_topk_prefill(
-                indexer, q, weights, kv_cache, chunk, buf, t0, n_q, n_k, topk,
+                q,
+                weights,
+                kv_cache,
+                chunk,
+                buf,
+                t0,
+                n_q,
+                topk,
             ):
                 continue
             # Concatenated per-request K rows, exactly the reference layout:
             # rows [cu[r], cu[r+1]) belong to chunk-relative request r.
             req_of_row = chunk.token_to_seq[:n_k].to(torch.long)
             cu = chunk.cu_seq_lens.to(torch.long)
-            local_j = (
-                torch.arange(n_k, device=q.device)
-                - cu.index_select(0, req_of_row)
+            local_j = torch.arange(n_k, device=q.device) - cu.index_select(
+                0, req_of_row
             )
             bt = chunk.block_table.to(torch.long)
             cols = torch.div(local_j, block_size, rounding_mode="floor").clamp(
@@ -296,7 +335,7 @@ def metal_sparse_attn_indexer(
             k_eff = min(topk, n_k)
             for s in range(0, n_q, _SCORE_ROW_CHUNK):
                 e = min(s + _SCORE_ROW_CHUNK, n_q)
-                idx = _score_and_select(
+                idx = _score_and_select_streaming(
                     q[t0 + s : t0 + e],
                     weights[t0 + s : t0 + e],
                     k_vals,

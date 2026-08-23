@@ -526,11 +526,15 @@ instantiate_dsv4_o_inv_rope(bfloat16_csf32, bf16, float);
 //   column indices, -1 where fewer candidates exist, rest of the row -1.
 // One threadgroup per token: q and w staged in threadgroup memory, one
 // simdgroup per candidate (two heads per lane, K broadcast via shuffles),
-// then a full 1024-wide bitonic sort (logit desc, index asc on ties) and a
-// direct topk_indices_buffer row write.
+// then a 1024-wide bitonic sort (logit desc, index asc on ties) and a direct
+// topk_indices_buffer row write.  Windows wider than 1024 are streamed in
+// 512-candidate tiles: the best 512 survive in the first half of the sort
+// scratch and merge with the next tile in the second half.  Scratch therefore
+// stays fixed-size through the profile's 65,536-candidate maximum.
 // e4m3 NaN codes (0x7f/0xff) decode to 0 like the torch LUT (stale slots).
 // ---------------------------------------------------------------------------
 constant constexpr int IDXTK_WIDTH = 1024;   // sort width (>= max candidates)
+constant constexpr int IDXTK_KEEP = 512;
 // The DSV4 indexer geometry is hard-wired (host-checked: q is
 // [tokens, 64, 128] at the wrapper).
 constant constexpr int IDXTK_H = 64;
@@ -538,6 +542,56 @@ constant constexpr int IDXTK_D = 128;
 
 METAL_FUNC float idxtk_decode(uchar v) {
     return ((v & 0x7F) == 0x7F) ? 0.0f : float(tk_e4m3_decode(v));
+}
+
+METAL_FUNC void idxtk_sort(threadgroup float *keys, threadgroup int *vals,
+                           uint tid) {
+    for (int k = 2; k <= IDXTK_WIDTH; k <<= 1) {
+        for (int jj = k >> 1; jj > 0; jj >>= 1) {
+            for (int i = tid; i < IDXTK_WIDTH; i += 256) {
+                const int ixj = i ^ jj;
+                if (ixj > i) {
+                    const bool desc = ((i & k) == 0);
+                    const float ka = keys[i], kb = keys[ixj];
+                    const int va = vals[i], vb = vals[ixj];
+                    const bool in_order =
+                        (ka > kb) || (ka == kb && va < vb);
+                    if (in_order != desc) {
+                        keys[i] = kb; keys[ixj] = ka;
+                        vals[i] = vb; vals[ixj] = va;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+template <typename T>
+METAL_FUNC float idxtk_score_candidate(
+        device const uchar *kv_cache, device const int *bt_row, int j,
+        int block_size, long kv_block_stride, uint lane,
+        threadgroup half *q_s, threadgroup float *w_s) {
+    const long base =
+        (long)bt_row[j / block_size] * kv_block_stride +
+        (long)(j % block_size) * 132;
+    device const uchar *code = kv_cache + base;
+    const int h0 = lane, h1 = lane + 32;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (int dg = 0; dg < IDXTK_D; dg += 32) {
+        const float mine = idxtk_decode(code[dg + lane]);
+        for (int i = 0; i < 32; ++i) {
+            const float kd = metal::simd_broadcast(mine, (ushort)i);
+            const int d = dg + i;
+            acc0 += float(q_s[h0 * IDXTK_D + d]) * kd;
+            acc1 += float(q_s[h1 * IDXTK_D + d]) * kd;
+        }
+    }
+    float part = w_s[h0] * metal::max(acc0, 0.0f) +
+                 w_s[h1] * metal::max(acc1, 0.0f);
+    part = metal::simd_sum(part);
+    const float k_scale = *((device const float *)(code + IDXTK_D));
+    return part * k_scale;
 }
 
 template <typename T>
@@ -566,32 +620,15 @@ METAL_FUNC void dsv4_indexer_topk_decode_body(
     if (tid < IDXTK_H) { w_s[tid] = w[(long)token * IDXTK_H + tid]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // One simdgroup per candidate; lane owns heads (lane, lane+32).
+    // One simdgroup per candidate; lane owns heads (lane, lane+32).  The
+    // first pass fills the complete sort scratch.
     device const int *bt_row = block_table + (long)bt_row_idx * bt_stride;
     for (int j = sg; j < IDXTK_WIDTH; j += 8) {
         float logit = -INFINITY;
         if (j < n_cand) {
-            const long base =
-                (long)bt_row[j / block_size] * kv_block_stride +
-                (long)(j % block_size) * 132;
-            device const uchar *code = kv_cache + base;
-            const int h0 = lane, h1 = lane + 32;
-            float acc0 = 0.0f, acc1 = 0.0f;
-            for (int dg = 0; dg < IDXTK_D; dg += 32) {
-                const float mine = idxtk_decode(code[dg + lane]);
-                for (int i = 0; i < 32; ++i) {
-                    const float kd = metal::simd_broadcast(mine, (ushort)i);
-                    const int d = dg + i;
-                    acc0 += float(q_s[h0 * IDXTK_D + d]) * kd;
-                    acc1 += float(q_s[h1 * IDXTK_D + d]) * kd;
-                }
-            }
-            float part = w_s[h0] * metal::max(acc0, 0.0f) +
-                         w_s[h1] * metal::max(acc1, 0.0f);
-            part = metal::simd_sum(part);
-            const float k_scale =
-                *((device const float *)(code + IDXTK_D));
-            logit = part * k_scale;
+            logit = idxtk_score_candidate<T>(
+                kv_cache, bt_row, j, block_size, kv_block_stride, lane,
+                q_s, w_s);
         }
         if (lane == 0) {
             keys[j] = logit;
@@ -600,25 +637,27 @@ METAL_FUNC void dsv4_indexer_topk_decode_body(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Bitonic sort, logit descending, index ascending on ties.
-    for (int k = 2; k <= IDXTK_WIDTH; k <<= 1) {
-        for (int jj = k >> 1; jj > 0; jj >>= 1) {
-            for (int i = tid; i < IDXTK_WIDTH; i += 256) {
-                const int ixj = i ^ jj;
-                if (ixj > i) {
-                    const bool desc = ((i & k) == 0);
-                    const float ka = keys[i], kb = keys[ixj];
-                    const int va = vals[i], vb = vals[ixj];
-                    // "a before b" in descending order with idx tiebreak.
-                    const bool in_order = (ka > kb) || (ka == kb && va < vb);
-                    if (in_order != desc) {
-                        keys[i] = kb; keys[ixj] = ka;
-                        vals[i] = vb; vals[ixj] = va;
-                    }
-                }
+    idxtk_sort(keys, vals, tid);
+
+    // Merge each remaining 512-column tile with the retained best 512.
+    // The loop bound is the active request width supplied by CPU scheduler
+    // metadata, never the profile's configured maximum for a short request.
+    for (int base = IDXTK_WIDTH; base < width; base += IDXTK_KEEP) {
+        for (int off = sg; off < IDXTK_KEEP; off += 8) {
+            const int j = base + off;
+            float logit = -INFINITY;
+            if (j < n_cand) {
+                logit = idxtk_score_candidate<T>(
+                    kv_cache, bt_row, j, block_size, kv_block_stride, lane,
+                    q_s, w_s);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                keys[IDXTK_KEEP + off] = logit;
+                vals[IDXTK_KEEP + off] = j;
+            }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        idxtk_sort(keys, vals, tid);
     }
 
     device int *out_row = out + (long)token * out_stride;

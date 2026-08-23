@@ -27,6 +27,10 @@ def _metal_swiglu(
         and output.is_contiguous()
         and input.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and output.dtype == input.dtype
+        # The native OAI kernel is bitwise-proven only for DSV4's defaults.
+        # Non-default scalars change the eager MPS rounding points, so keep
+        # those models on the reference chain until the kernel mirrors them.
+        and (not oai_form or (alpha == 1.0 and beta == 0.0))
     ):
         return False
     from vllm.quixicore.ops import quixicore_ops
@@ -212,7 +216,11 @@ def apply_moe_activation(
         elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
             assert clamp_limit is not None
             if _metal_swiglu(
-                output, input, clamp_limit, oai_form=True, alpha=alpha,
+                output,
+                input,
+                clamp_limit,
+                oai_form=True,
+                alpha=alpha,
                 beta=beta,
             ):
                 return output
