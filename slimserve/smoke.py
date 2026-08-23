@@ -123,15 +123,17 @@ def resolve_profiles(
 
 
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
-    """Require the resolved, executable plan to use DSpark and TurboQuant."""
+    """Require the executable plan to match its registered speculator."""
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
-    required = {
-        "method": "dspark",
-        "attention_backend": "TURBOQUANT",
-        "kv_cache_dtype": "turboquant_k8v4",
-    }
+    registered = plan.source["speculator"]["engine"]
+    required = dict(registered)
+    if registered.get("method") == "dspark":
+        required.update(
+            attention_backend="TURBOQUANT",
+            kv_cache_dtype="turboquant_k8v4",
+        )
     mismatches = {
         key: speculative.get(key)
         for key, expected in required.items()
@@ -249,9 +251,10 @@ def run_profile(
         "quant": plan.quant.name,
         "gpus": plan.gpus,
         "modalities": plan.source["modalities"],
-        "dspark_tokens": speculative["num_speculative_tokens"],
-        "draft_attention_backend": speculative["attention_backend"],
-        "draft_kv_cache_dtype": speculative["kv_cache_dtype"],
+        "speculative_method": speculative["method"],
+        "speculative_tokens": speculative["num_speculative_tokens"],
+        "draft_attention_backend": speculative.get("attention_backend"),
+        "draft_kv_cache_dtype": speculative.get("kv_cache_dtype"),
         "load_seconds": loaded - started,
         "text": text_result,
         "image": image_result,

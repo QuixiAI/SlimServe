@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.quixicore import quixicore_ops
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -169,6 +170,7 @@ class MetalAttentionImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.use_native_range_gather = quixicore_ops.has("kv_cache_gather_range")
 
         if sinks is not None:
             raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
@@ -374,44 +376,49 @@ class MetalAttentionImpl(AttentionImpl):
             kv_start = 0
             if self.sliding_window is not None:
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
-            first_block = kv_start // block_size
-            blocks = (
-                metadata.block_table[req, first_block:num_req_blocks]
-                .to(torch.long)
-                # The profile run allocates a small dummy cache whose block
-                # table can point past it. That output is discarded; a real
-                # run never clamps.
-                .clamp_(0, num_blocks - 1)
-            )
             seq_len = min(seq_len, num_req_blocks * block_size)
-            row_start = kv_start - first_block * block_size
-            row_end = seq_len - first_block * block_size
 
-            page_elems = block_size * num_kv_heads * head_size
-            if key_cache.stride(0) == 2 * page_elems:
-                # Hybrid attention/mamba models restride this cache to
-                # blocks-first physical storage (attn_utils
-                # _update_hybrid_attention_mamba_layout) so block i shares
-                # bytes across layers: each block holds its K page then its
-                # V page. key_cache is then an interleaved strided view, and
-                # MPS index_select on a non-contiguous source takes a ~20x
-                # slower gather path (measured 1.3 ms vs 0.08 ms per 64
-                # blocks). Gathering whole (K, V) pages through a contiguous
-                # blocks-first view of the same storage is bit-identical and
-                # fast.
-                pages_view = key_cache.as_strided(
-                    (num_blocks, 2, block_size, num_kv_heads, head_size),
-                    (2 * page_elems, page_elems, *key_cache.stride()[1:]),
-                    key_cache.storage_offset(),
+            if self.use_native_range_gather:
+                # MPS index_select uses signed 32-bit element offsets for this
+                # strided source. A hybrid cache page beyond 2^31 elements is
+                # therefore read from the wrong address. The native gather
+                # carries the physical block stride and all cache arithmetic
+                # in 64 bits; it also avoids materializing unused rows in the
+                # first/last page of a sliding-window request.
+                keys, values = quixicore_ops.kv_cache_gather_range(
+                    key_cache,
+                    value_cache,
+                    metadata.block_table[req],
+                    kv_start,
+                    seq_len - kv_start,
                 )
-                pages = pages_view.index_select(0, blocks)
-                keys = pages[:, 0]
-                values = pages[:, 1]
             else:
-                keys = key_cache.index_select(0, blocks)
-                values = value_cache.index_select(0, blocks)
-            keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
-            values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+                first_block = kv_start // block_size
+                blocks = (
+                    metadata.block_table[req, first_block:num_req_blocks]
+                    .to(torch.long)
+                    # The profile run allocates a small dummy cache whose block
+                    # table can point past it. That output is discarded; a real
+                    # run never clamps.
+                    .clamp_(0, num_blocks - 1)
+                )
+                row_start = kv_start - first_block * block_size
+                row_end = seq_len - first_block * block_size
+                page_elems = block_size * num_kv_heads * head_size
+                if key_cache.stride(0) == 2 * page_elems:
+                    pages_view = key_cache.as_strided(
+                        (num_blocks, 2, block_size, num_kv_heads, head_size),
+                        (2 * page_elems, page_elems, *key_cache.stride()[1:]),
+                        key_cache.storage_offset(),
+                    )
+                    pages = pages_view.index_select(0, blocks)
+                    keys = pages[:, 0]
+                    values = pages[:, 1]
+                else:
+                    keys = key_cache.index_select(0, blocks)
+                    values = value_cache.index_select(0, blocks)
+                keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+                values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
 
             if self.num_queries_per_kv > 1:
                 keys = keys.repeat_interleave(self.num_queries_per_kv, dim=1)

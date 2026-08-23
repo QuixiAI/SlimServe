@@ -106,6 +106,16 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
 
 
+def test_qwen38_uses_measured_metal_speculation_settings():
+    plan = resolve("qwen38-q2kxl-1", "metal", 1, None, 2**37)
+    speculative = validate_acceleration(plan)
+
+    assert speculative["method"] == "dflash"
+    assert speculative["num_speculative_tokens"] == 3
+    assert speculative["quantization"] == "gguf"
+    assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
 def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     machine = Machine("mi300x", "AMD Instinct MI300X", 8)
     expected = {

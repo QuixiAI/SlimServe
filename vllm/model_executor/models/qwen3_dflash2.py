@@ -52,6 +52,8 @@ logger = init_logger(__name__)
 # QWEN38_DFLASH_DUMP=<dir> to record per-propose drafter candidates).
 _DUMP_DIR = os.environ.get("QWEN38_DFLASH_DUMP")
 _DUMP_STEP = [0]
+_FUSED_CONV = os.environ.get("VLLM_QWEN38_FUSED_DFLASH2_CONV", "1") != "0"
+_FUSED_CONV_AVAILABLE: bool | None = None
 
 
 def _dump_draft_record(record: dict) -> None:
@@ -81,6 +83,26 @@ def _apply_two_tap_conv(
     # dummy runs, parity harnesses) is treated as a single block: the shift
     # semantics stay well-defined and the shapes stay legal.
     bs = block_size if block_size and tokens % block_size == 0 else tokens
+    global _FUSED_CONV_AVAILABLE
+    if (
+        _FUSED_CONV
+        and x.device.type == "mps"
+        and x.is_contiguous()
+        and coeffs.is_contiguous()
+        and base.is_contiguous()
+        and x.dtype == coeffs.dtype == base.dtype
+    ):
+        if _FUSED_CONV_AVAILABLE is None:
+            from vllm.quixicore.ops import _qc
+
+            _FUSED_CONV_AVAILABLE = hasattr(_qc(), "dflash2_two_tap_conv")
+        if _FUSED_CONV_AVAILABLE:
+            from vllm.quixicore.ops import quixicore_ops
+
+            return quixicore_ops.dflash2_two_tap_conv(
+                x, coeffs, base, side, bs, group_size
+            )
+
     dyn = coeffs[:, side].repeat_interleave(group_size, dim=-1)  # (T, 2, hidden)
 
     out = (base[side, 0] + dyn[:, 0]) * x
@@ -301,7 +323,7 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
         A-table embedding, never its hidden state. Returns
         (n_blocks, steps) selected draft token ids.
 
-        Greedy only (the serving path is greedy): scores for position t are
+        Greedy reference path: scores for position t are
         S(a, b) = U_t(b) + <A(a) * H(h_t), B(b)> and only the realized
         predecessor's row is computed, so the walk is `steps` small batched
         steps. Temperature sampling with kept 16-way distributions is the
@@ -341,8 +363,16 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
         temperature: torch.Tensor,
         idx_mapping: torch.Tensor,
         draft_logits: torch.Tensor,
+        seeds: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Sampled selector walk (llama.cpp PR #27342 host walk, dflash2).
+
+        ``seeds`` ((n_blocks,) per-request seeds) and ``positions``
+        ((n_blocks, steps) absolute positions of the drafted tokens) key the
+        categorical draws through the stateless (seed, pos) uniforms, so
+        same-seed repeats reproduce on Metal; without them the draw falls
+        back to the device RNG.
 
         Per position the walk scores the top-k candidates
         ``S(a, b) = U(b) + <A(a) * H(h), B(b)>`` against the realized
@@ -358,11 +388,11 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
         rejection sampler verifies those by token equality and ignores
         ``draft_logits``).
 
-        The categorical draw uses device gumbel-max noise. On MPS this is
-        unkeyed (no stateless Philox primitive), matching the platform's
-        target-sampling fallback; per-request seed parity remains a native
-        CUDA/HIP property. Draft noise does not affect the output
-        distribution after rejection sampling.
+        The categorical draw uses Gumbel-max noise. On Metal it is keyed by
+        (request seed, absolute draft position, candidate column) through the
+        stateless splitmix64 stream, so same-seed requests reproduce across
+        repeats and boots. Draft noise does not affect the output distribution
+        after rejection sampling.
 
         Args:
             hidden_states: (n_blocks * steps, hidden) drafter output for the
@@ -407,7 +437,13 @@ class DFlash2QwenDraftModel(DFlashQwen3ForCausalLM):
             scaled = scores.to(torch.float32) / safe_t.unsqueeze(-1)
             draft_logits[req_rows.unsqueeze(1), pos, top_ids[:, pos]] = scaled
 
-            gumbel = -torch.empty_like(scaled).exponential_().log()
+            if seeds is not None and positions is not None:
+                from vllm.v1.worker.gpu.sample.gumbel import stateless_uniform_2d
+
+                u = stateless_uniform_2d(seeds, positions[:, pos], scaled.shape[-1])
+                gumbel = -torch.log(-torch.log(u)).to(scaled.dtype)
+            else:
+                gumbel = -torch.empty_like(scaled).exponential_().log()
             perturbed = torch.where(greedy.unsqueeze(-1), scaled, scaled + gumbel)
             idx = perturbed.argmax(dim=-1)  # (nb,)
             tok = top_ids[:, pos].gather(1, idx.unsqueeze(-1)).squeeze(-1)

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -880,6 +882,167 @@ def _insert_resampled_kernel(
     )
 
 
+# MPS rejection sampling: batched all-GPU path (default) vs the per-request
+# CPU-loop fallback (VLLM_MPS_REJECTION_VEC=0), kept for bisecting.
+_MPS_REJECTION_VECTORIZED = os.environ.get("VLLM_MPS_REJECTION_VEC", "1") != "0"
+_MPS_REJECTION_FUSED = os.environ.get("VLLM_MPS_FUSED_REJECTION", "1") != "0"
+# Key-space separators so the verify draws never alias the plain sampler's
+# (seed, pos)-keyed Gumbel stream at the same position.
+_MPS_ACCEPT_KEY = 1 << 40
+_MPS_EMIT_KEY = 1 << 41
+
+
+def _rejection_sample_mps(
+    target_logits: torch.Tensor,  # [num_logits, V] processed (temperature,
+    #                               top-k/p applied) fp32 logits
+    draft_logits: torch.Tensor | None,  # [max_num_reqs, steps, V] temperature-
+    #                                     applied draft logits (-inf = 0 mass)
+    draft_sampled: torch.Tensor,  # [num_logits]
+    cu_num_logits: torch.Tensor,  # [num_reqs + 1]
+    pos: torch.Tensor,  # [num_logits]
+    idx_mapping: torch.Tensor,  # [num_reqs]
+    temperature: torch.Tensor,  # [max_num_reqs]
+    seed: torch.Tensor,  # [max_num_reqs]
+    num_speculative_steps: int,
+    vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched rejection sampling on MPS with no host round trips.
+
+    Same contract as the Triton kernels: target rows are the processed
+    logits (temperature and top-k/top-p already applied), ``draft_logits``
+    hold the drafter's temperature-applied logits, both are consumed as-is
+    (the retired CPU fallback re-divided both by T). Per request r with rows
+    [start, end) and ``nd = end - start - 1`` draft tokens, draft token i
+    sits at ``draft_sampled[start + i + 1]`` and verifies against target row
+    ``start + i``: accept with probability min(1, p(tok) / q(tok)); the
+    first rejection emits from norm(max(p - q, 0)) (argmax p when that
+    residual is empty); all accepted emits the bonus from row ``end - 1``.
+    Greedy requests (T == 0) verify by argmax equality. Every random draw is
+    (seed, pos)-keyed through the same splitmix64 stream the MPS Gumbel
+    sampler uses, so seeded repeats are reproducible.
+    """
+    from vllm.v1.worker.gpu.sample.gumbel import stateless_uniform_2d
+
+    if (
+        _MPS_REJECTION_FUSED
+        and target_logits.dtype == torch.float32
+        and draft_sampled.dtype == torch.int32
+        and cu_num_logits.dtype == torch.int32
+        and pos.dtype == torch.int64
+        and idx_mapping.dtype == torch.int32
+        and temperature.dtype == torch.float32
+        and seed.dtype == torch.int64
+        and num_speculative_steps <= 16
+        and (draft_logits is None or draft_logits.dtype == torch.float32)
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        if quixicore_ops.has("qwen38_rejection_sample"):
+            return quixicore_ops.qwen38_rejection_sample(
+                target_logits,
+                draft_logits,
+                draft_sampled,
+                cu_num_logits,
+                pos,
+                idx_mapping,
+                temperature,
+                seed,
+                num_speculative_steps,
+                vocab_size,
+            )
+
+    device = target_logits.device
+    num_reqs = cu_num_logits.shape[0] - 1
+    num_logits = target_logits.shape[0]
+    steps = num_speculative_steps
+    cols = steps + 1
+
+    target = target_logits[:, :vocab_size]
+    target = torch.where(
+        torch.isnan(target), torch.full_like(target, -torch.inf), target
+    )
+    target_lse = torch.logsumexp(target, dim=-1)  # (L,)
+    target_argmax = target.argmax(dim=-1)  # (L,)
+
+    cu = cu_num_logits.to(torch.int64)
+    starts = cu[:-1]
+    nd = cu[1:] - starts - 1  # (R,) draft tokens per request
+    j = torch.arange(cols, device=device, dtype=torch.int64)
+    rows = starts.unsqueeze(1) + j.unsqueeze(0)  # (R, cols)
+    rows_c = rows.clamp(max=num_logits - 1)
+    valid = j.unsqueeze(0) < nd.unsqueeze(1)  # (R, cols) draft position i < nd
+    tok = draft_sampled.to(torch.int64)[(rows + 1).clamp(max=num_logits - 1)]
+    tok = torch.where(valid, tok, torch.zeros_like(tok))
+
+    state = idx_mapping.to(torch.int64)  # (R,)
+    temps = temperature[state].to(torch.float32)
+    greedy = temps == 0
+    seeds = seed[state].to(torch.int64)
+    pos0 = pos.to(torch.int64)[starts]
+
+    # log p(tok) at the verifying row; log q(tok) from the draft distribution.
+    logp = target[rows_c, tok] - target_lse[rows_c]  # (R, cols)
+    if draft_logits is not None:
+        dl = draft_logits[:, :, :vocab_size]
+        jd = j.clamp(max=steps - 1)
+        d_rows = dl[state.unsqueeze(1), jd.unsqueeze(0)]  # (R, cols, V)
+        d_lse = torch.logsumexp(d_rows, dim=-1)
+        logq = d_rows.gather(2, tok.unsqueeze(-1)).squeeze(-1) - d_lse
+        # q(tok) == 0 (log -inf) accepts unconditionally, as the reference.
+        ratio = torch.exp(torch.clamp(logp - logq, max=0.0))
+        ratio = torch.where(torch.isnan(ratio), torch.ones_like(ratio), ratio)
+    else:
+        # One-hot draft (q(tok) = 1): accept iff a target draw equals tok.
+        # Realized with the keyed Gumbel draw below; here ratio = p(tok) is
+        # the exact acceptance probability of that test.
+        ratio = torch.exp(logp)
+        d_rows = None
+
+    u = stateless_uniform_2d(seeds, pos0 ^ _MPS_ACCEPT_KEY, cols)  # (R, cols)
+    accept_sampled = u < ratio
+    accept_greedy = tok == target_argmax[rows_c]
+    accept = torch.where(greedy.unsqueeze(1), accept_greedy, accept_sampled) & valid
+    n_acc = torch.cumprod(accept.to(torch.int64), dim=1).sum(dim=1)  # (R,)
+    all_acc = n_acc == nd
+    emit_row = (starts + n_acc).clamp(max=num_logits - 1)  # bonus or rejected row
+
+    p_emit = torch.softmax(target[emit_row], dim=-1)  # (R, V)
+    if d_rows is not None:
+        q_emit = torch.softmax(
+            d_rows[torch.arange(num_reqs, device=device), n_acc.clamp(max=steps - 1)],
+            dim=-1,
+        )
+        residual = torch.clamp(p_emit - q_emit, min=0.0)
+    else:
+        # Rejected one-hot draft: the target draw conditioned on != tok.
+        tok_emit = tok.gather(1, n_acc.clamp(max=cols - 1).unsqueeze(1))
+        residual = p_emit.scatter(1, tok_emit, 0.0)
+    dist = torch.where(all_acc.unsqueeze(1), p_emit, residual)
+    mass = dist.sum(dim=-1)
+    # One keyed scalar draw plus a CDF scan is materially cheaper on MPS than
+    # constructing a keyed Gumbel field over the full vocabulary.  ``u`` is
+    # strictly inside (0, 1), so counting CDF entries below ``u * mass`` is
+    # the usual inverse-CDF categorical sample.  The mass-zero fallback below
+    # remains identical to the prior Gumbel-max path.
+    u_emit = stateless_uniform_2d(seeds, pos0 ^ _MPS_EMIT_KEY, 1).squeeze(1)
+    cutoff = u_emit * mass
+    drawn = (dist.cumsum(dim=-1) < cutoff.unsqueeze(1)).sum(dim=-1)
+    drawn = drawn.clamp_max(vocab_size - 1)
+    emitted = torch.where(mass > 0, drawn, p_emit.argmax(dim=-1))
+    emitted = torch.where(greedy, target_argmax[emit_row], emitted)
+
+    sampled = torch.where(
+        j.unsqueeze(0) < n_acc.unsqueeze(1),
+        tok,
+        torch.where(
+            j.unsqueeze(0) == n_acc.unsqueeze(1),
+            emitted.unsqueeze(1).expand(-1, cols),
+            torch.full_like(tok, -1),
+        ),
+    )
+    return sampled, (n_acc + 1).to(torch.int32)
+
+
 def rejection_sample(
     # [num_logits, V]
     target_logits: torch.Tensor,
@@ -923,6 +1086,22 @@ def rejection_sample(
         vocab_size = min(vocab_size, draft_logits.size(-1))
 
     if target_logits.device.type == "mps":
+        if _MPS_REJECTION_VECTORIZED:
+            assert synthetic_conditional_rates is None, (
+                "Synthetic acceptance rates are not supported on MPS."
+            )
+            return _rejection_sample_mps(
+                target_logits,
+                draft_logits,
+                draft_sampled,
+                cu_num_logits,
+                pos,
+                idx_mapping,
+                temperature,
+                seed,
+                num_speculative_steps,
+                vocab_size,
+            )
         req_indices = idx_mapping.to(torch.int64)
         active_temperatures = temperature[req_indices]
         if bool((active_temperatures == 0).all().cpu()):
@@ -1004,11 +1183,13 @@ def rejection_sample(
             draft_probs = None
             if has_draft_logits and num_draft > 0:
                 assert draft_logits is not None
+                # draft_logits are already temperature-applied (the speculator's
+                # output_processed_logits contract, same as the Triton path
+                # reads them); only the target row is divided by temp above.
                 draft_probs = torch.softmax(
                     draft_logits[
                         state_indices[req_idx], :num_draft, :vocab_size
-                    ].float()
-                    / temp,
+                    ].float(),
                     dim=-1,
                 ).cpu()
             accepted = 0
@@ -1018,7 +1199,9 @@ def rejection_sample(
                 if draft_probs is None:
                     # No draft distribution: sample the target row and accept
                     # on match (lossless token-equality verification).
-                    target_token = int(torch.multinomial(probs[accepted], 1))
+                    target_token = int(
+                        torch.multinomial(probs[accepted], 1, generator=g)
+                    )
                     if target_token != token:
                         emitted = target_token
                         break
@@ -1026,7 +1209,7 @@ def rejection_sample(
                     p_token = float(probs[accepted, token])
                     q_token = float(draft_probs[accepted, token])
                     ratio = 1.0 if q_token <= 0.0 else min(1.0, p_token / q_token)
-                    if float(torch.rand(1)) >= ratio:
+                    if float(torch.rand(1, generator=g)) >= ratio:
                         residual = (probs[accepted] - draft_probs[accepted]).clamp_(
                             min=0
                         )
@@ -1034,14 +1217,14 @@ def rejection_sample(
                         if residual_mass <= 0.0:
                             emitted = int(probs[accepted].argmax())
                         else:
-                            emitted = int(torch.multinomial(residual, 1))
+                            emitted = int(torch.multinomial(residual, 1, generator=g))
                         break
                 sampled_cpu[req_idx, accepted] = token
                 accepted += 1
             if emitted is None:
                 # Every draft token accepted: bonus token from the target
                 # distribution at the last position.
-                emitted = int(torch.multinomial(probs[num_draft], 1))
+                emitted = int(torch.multinomial(probs[num_draft], 1, generator=g))
             sampled_cpu[req_idx, accepted] = emitted
             num_sampled_cpu[req_idx] = accepted + 1
         return (

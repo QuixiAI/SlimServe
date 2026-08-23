@@ -92,6 +92,16 @@ baseline, not a completed optimization target. Raw results are in
 - Retained setting: `--mixed-prefill-quantum 2048`.
 - Source notes: `benchmarks/dsv4_metal_perf.md`.
 
+Live-smoke regression note (2026-08-23; not a replacement baseline): the exact
+registered `dsv4-xxs-1` profile reached health after loading 93.63 GiB, but its
+first tiny text request ran at about 0.1 generation tok/s and had accepted 0
+of 5 drafted tokens after several minutes. The request was terminated after
+about 12 minutes. Until that first-step/verify regression is fixed and the
+exact workload is repeated, the 33.684 tok/s row above is a historical
+correctness-qualified comparison point, not evidence that today's registered
+profile is healthy. Raw log:
+`perf/results/2026-08-23/qwen38-kv-gather/smoke-all/dsv4-xxs-1.log`.
+
 ### Ampere A100 TP2
 
 - Status: exact-token baseline promoted 2026-08-09 after the NaN/OOV sampler
@@ -311,3 +321,30 @@ Sampling: shipped defaults (temp 1.0 / top_p 0.95 / top_k 20), seed 42,
 in-process V2 runner, max_model_len 8192. llama.cpp plain bar: 35.67.
 Raw: perf/results/2026-08-20/qwen38-consolidated/. The 2.5 tok/s row
 above is superseded.
+
+### Supported SlimServe Baseline - 2026-08-23 (fused Metal stack, DFlash k=3)
+
+| Metric | Value |
+| --- | ---: |
+| Plain essay, 3x256 | 16.99 / 17.14 / 17.17 tok/s |
+| Spec essay, 3x256 | 23.27 / 23.74 / 23.06 tok/s |
+| Plain GSM8K-style, 3x256 | 16.77 / 16.86 / 16.81 tok/s |
+| Spec GSM8K-style, 3x256 | 34.33 / 35.25 / 34.78 tok/s |
+| Exact server, spec (128 in / 256 out, c1) | 18.646 tok/s |
+| Exact server, plain (128 in / 256 out, c1) | 15.913 tok/s |
+| Exact server spec advantage | 17.2% |
+
+Sampling is the shipped configuration (temperature 1.0, top-p 0.95, top-k
+20), seeded 42; greedy is not used. Offline rows use the V2 runner at
+max_model_len 8192 for matched short-context comparison. The exact-server pair
+uses the registered profile unchanged: 131072 max length, 12 GiB KV pool,
+DFlash 2 k=3, OpenAI completion endpoint, 8-token warmup. Both server arms
+honored exact token counts and produced healthy text. The real SlimServe server
+also passed text and deterministic image requests.
+
+Correctness: all 64 target layers remain cosine >=0.9997 against the llama.cpp
+activation oracle; fused GDN exhaustive suite 147/147; the 64-bit hybrid KV
+gather is exact before and beyond 2^31 source elements; 20 repeated speculative
+requests stay finite and token-stable across the former corruption window;
+final focused suite 17 passed and SlimServe suite 58 passed/1 skipped. Raw:
+`perf/results/2026-08-23/qwen38-kv-gather/`.

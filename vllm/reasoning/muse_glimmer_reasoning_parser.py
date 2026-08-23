@@ -33,10 +33,22 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 _SEGMENT_RE = re.compile(
-    r"(?:<\|start\|>assistant)?(?P<recipient> to=[^<]*)?<\|message\|>"
+    r"(?:<\|start\|>assistant)?(?: ?(?P<recipient>to=[^<]*))?<\|message\|>"
     r"(?P<body>.*?)(?:<\|eom\|>|<\|eot\|>|$)",
     re.DOTALL,
 )
+
+
+def _is_partial_header(text: str) -> bool:
+    """True while a streamed control header is not yet parseable."""
+    if "<|message|>" in text:
+        return False
+    stripped = text.lstrip()
+    return (
+        "<|message|>".startswith(stripped)
+        or "to=".startswith(stripped)
+        or stripped.startswith("to=")
+    )
 
 
 def _parse(text: str) -> tuple[str | None, str | None]:
@@ -72,10 +84,19 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         self.message_token_id = vocab.get("<|message|>")
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        # Reasoning is over once a non-self <|message|> body has begun: either
-        # an <|eom|> closed the self segment, or the first segment was not
-        # self-directed at all.
+        # The serving parser calls this once with the complete rendered prompt.
+        # A new turn ends in a bare assistant start marker, after historical
+        # message/eom markers; that means reasoning has not started, not that a
+        # historical segment already ended the new turn's reasoning phase.
         ids = list(input_ids)
+        if ids:
+            text = self.model_tokenizer.decode(ids)
+            if text.rfind("<|start|>assistant") > text.rfind("<|message|>"):
+                return False
+
+        # During generation reasoning is over once a non-self <|message|> body
+        # has begun: either an <|eom|> closed the self segment, or the first
+        # generated segment was not self-directed at all.
         if self.eom_token_id is not None and self.eom_token_id in ids:
             return True
         if self.message_token_id is None or self.message_token_id not in ids:
@@ -113,7 +134,17 @@ class MuseGlimmerReasoningParser(ReasoningParser):
         delta_token_ids: Sequence[int],
     ) -> "DeltaMessage | None":
         # Reparse-and-diff: robust against markers splitting across deltas.
-        prev_reasoning, prev_content = _parse(previous_text)
+        # Do not expose a recipient/header fragment as user-visible content
+        # before the message delimiter arrives.
+        if _is_partial_header(current_text):
+            return None
+        # A held prefix was never emitted. If it turns out to be ordinary
+        # text (for example, "t" followed by "today"), diff from an empty
+        # previous result so the buffered prefix is not lost.
+        if _is_partial_header(previous_text):
+            prev_reasoning, prev_content = None, None
+        else:
+            prev_reasoning, prev_content = _parse(previous_text)
         cur_reasoning, cur_content = _parse(current_text)
         delta_reasoning = (cur_reasoning or "")[len(prev_reasoning or "") :]
         delta_content = (cur_content or "")[len(prev_content or "") :]
