@@ -9572,3 +9572,45 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `perf/results/2026-08-23/qwen38-kv-gather/smoke-muse-final.json`,
   `smoke-muse-final/muse-kdyn-1.log`, and
   `smoke-all/dsv4-xxs-1.log`.
+
+## 2026-08-23 (39) - PR 2 Metal Correctness Review Fixes
+
+- Status: retained implementation; registered-profile re-gate pending.
+- Scope: `dsv4-xxs-1` MPS output ordering and sparse-indexer top-k, generic
+  Metal OAI SwiGLU, and generic Metal GGUF Q2_K MoE down projection.
+- Baseline: a cold first multi-chunk request could park forever on an
+  async-output copy-stream event; the 262K profile disabled native prefill
+  top-k for every request and its eager fallback could allocate a
+  `[128,64,65536]` fp32 score tensor (2 GiB); non-default OAI SwiGLU differed
+  from eager by up to 0.0078125 fp16 / 0.0625 bf16; and output widths not
+  divisible by 32 fp16 or 8 bf16 reached a native Q2_K kernel that rejects
+  them.
+- Hypothesis: the MPS hang is the cold cross-stream producer/copy event
+  hand-off isolated in the earlier boot bisect. Keeping the tiny D2H output
+  copy and completion event on the producer stream removes that dependency.
+  A fixed-size hierarchical top-k can stream the active request window
+  without a context-sized score allocation.
+- Change: MPS async outputs now copy and record on the main producing stream
+  while CUDA/ROCm retain the copy stream. Prefill metadata carries the CPU
+  maximum active compressed sequence length. The Metal indexer sorts the
+  first 1,024 candidates, retains 512, and merges subsequent 512-candidate
+  tiles in the same fixed scratch; the fallback scores 1,024 candidate tiles
+  at a time. Decode uses the same streaming native kernel. Non-default OAI
+  alpha/beta values use eager MPS, and the folded Q2_K down route checks its
+  dtype-specific output-row alignment before dispatch (including step tape).
+- Correctness: the Metal 4.0 metallib and ObjC++ extension build. The native
+  indexer matches eager exactly at width 1,537 and returns the exact stable
+  tie order at the shipping width 65,536. All eight Metal kernel oracle files
+  pass; the new async-output, SwiGLU, dispatch-guard, and tiled-fallback tests
+  pass; the combined focused suite is 38 passed. The SlimServe suite is 59
+  passed, 1 skipped. Ruff, clang-format, SPDX, and Python 3.10 mypy hooks pass
+  on the changed files. The final metallib SHA-256 is
+  `9835f8c8b38445385cef6f8aaf388a8a32ef072a6f79304caccb1f95bcf448da`.
+- Results: no throughput result is claimed. The full registered profile needs
+  `iogpu.wired_limit_mb=122880`; it currently reads 0 and the non-interactive
+  runner cannot satisfy the sudo password prompt. In addition, the independent
+  DSV4 0.1 tok/s regression in entry (38) remains outside these four fixes.
+- Decision: retain the four correctness fixes. Remove the obsolete boot-ramp
+  requirement, but continue to label full 262,144-token end-to-end serving as
+  pending until the exact profile completes correctness and throughput gates.
+- Raw artifacts: `perf/results/2026-08-23/pr2-review-fixes/`.

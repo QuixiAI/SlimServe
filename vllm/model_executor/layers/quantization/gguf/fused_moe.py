@@ -34,6 +34,7 @@ from .params import (
 )
 from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 
+
 def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     override = os.environ.get(env)
     if override:
@@ -48,6 +49,15 @@ def _qc_mm_min_tokens() -> int:
     w13 (llama.cpp's exact GEMV/GEMM crossover: n_tokens >= 32). The decode
     verify batch is 6 tokens, so the tile never engages at decode."""
     return int(os.environ.get("VLLM_QC_MOE_MM_MIN_TOKENS", "32"))
+
+
+def _metal_q2k_sum_rows_supported(rows: int, dtype: torch.dtype) -> bool:
+    """The folded kernel has no output-row tail; its unfused parent does."""
+    if dtype == torch.float16:
+        return rows % 32 == 0
+    if dtype == torch.bfloat16:
+        return rows % 8 == 0
+    return False
 
 
 def _use_dsv4_ampere_fused() -> bool:
@@ -170,12 +180,9 @@ def _qc_metal_soa_repack(
     for e0 in range(0, experts, chunk):
         blk = qweight[e0 : e0 + chunk].view(-1, rows, blocks, block_bytes)
         parts = [
-            blk[..., off : off + size].reshape(blk.shape[0], -1)
-            for off, size in planes
+            blk[..., off : off + size].reshape(blk.shape[0], -1) for off, size in planes
         ]
-        out[e0 : e0 + chunk].view(blk.shape[0], -1).copy_(
-            torch.cat(parts, dim=1)
-        )
+        out[e0 : e0 + chunk].view(blk.shape[0], -1).copy_(torch.cat(parts, dim=1))
     return out
 
 
@@ -201,9 +208,7 @@ def _metal_weighted_sum(
         return False
     from vllm.quixicore import quixicore_ops
 
-    if not (
-        quixicore_ops.is_available() and quixicore_ops.has("moe_weighted_sum")
-    ):
+    if not (quixicore_ops.is_available() and quixicore_ops.has("moe_weighted_sum")):
         return False
     quixicore_ops.moe_weighted_sum(out, topk_weights, out_hidden)
     return True
@@ -592,9 +597,7 @@ def _fused_moe_gguf(
                 tensor_model_parallel_all_gather,
             )
 
-            full_quant_mid = tensor_model_parallel_all_gather(
-                local_quant_mid, dim=-1
-            )
+            full_quant_mid = tensor_model_parallel_all_gather(local_quant_mid, dim=-1)
             local_output = ops.ggml_dsv4_moe_down_output_owned(
                 w2,
                 full_quant_mid,
@@ -604,9 +607,9 @@ def _fused_moe_gguf(
             )
             partial_output = x.new_zeros(x.shape)
             row_start = get_tensor_model_parallel_rank() * local_output.shape[1]
-            partial_output[
-                :, row_start : row_start + local_output.shape[1]
-            ].copy_(local_output)
+            partial_output[:, row_start : row_start + local_output.shape[1]].copy_(
+                local_output
+            )
             return partial_output
 
         if (
@@ -757,9 +760,7 @@ def _fused_moe_gguf(
             if not _metal_weighted_sum(
                 slots, topk_weights.contiguous(), out_hidden_states
             ):
-                reduced = (
-                    slots.float() * topk_weights.unsqueeze(-1)
-                ).sum(dim=1)
+                reduced = (slots.float() * topk_weights.unsqueeze(-1)).sum(dim=1)
                 out_hidden_states.copy_(reduced.to(out_hidden_states.dtype))
             return out_hidden_states
         # Metal q2_K decode: fold the down GEMV, the (tokens, topk, N)
@@ -775,6 +776,7 @@ def _fused_moe_gguf(
             and out_hidden_states.is_contiguous()
             and out_hidden_states.dtype == out.dtype
             and out_hidden_states.shape == (num_tokens, w2.shape[1])
+            and _metal_q2k_sum_rows_supported(w2.shape[1], out.dtype)
         )
         if use_sum6:
             ops.ggml_moe_a8_vec_sum(
@@ -1012,9 +1014,7 @@ class GGUFMoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         layer._dsv4_w1_repacked = False
         layer._dsv4_w2_repacked = False
-        layer._dsv4_w2_output_sharded = getattr(
-            layer, "_dsv4_w2_output_sharded", False
-        )
+        layer._dsv4_w2_output_sharded = getattr(layer, "_dsv4_w2_output_sharded", False)
         if current_platform.is_metal():
             # Load-time SoA repack for the Metal multi-row Q2_K MoE kernel:
             # per-expert [qs | scales | d,dmin] planes turn the 84-byte AoS
@@ -1096,23 +1096,15 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             repacked_w1 = ops.ggml_dsv4_repack_iq2_xxs(
                 layer.w13_qweight, layer.hidden_size
             )
-            replace_parameter(
-                layer, "w13_qweight", repacked_w1, prefer_copy=True
-            )
+            replace_parameter(layer, "w13_qweight", repacked_w1, prefer_copy=True)
             layer._dsv4_w1_repacked = True
         if _use_dsv4_ampere_q2k_repack():
             packed_block_bytes = 84
-            w2_intermediate = (
-                layer.w2_qweight.shape[2] // packed_block_bytes * 256
-            )
-            repacked_w2 = ops.ggml_dsv4_repack_q2_k(
-                layer.w2_qweight, w2_intermediate
-            )
+            w2_intermediate = layer.w2_qweight.shape[2] // packed_block_bytes * 256
+            repacked_w2 = ops.ggml_dsv4_repack_q2_k(layer.w2_qweight, w2_intermediate)
             # Both layouts are byte-neutral. Copy back into the original
             # allocations so raw and repacked expert stacks never coexist.
-            replace_parameter(
-                layer, "w2_qweight", repacked_w2, prefer_copy=True
-            )
+            replace_parameter(layer, "w2_qweight", repacked_w2, prefer_copy=True)
             layer._dsv4_w2_repacked = True
 
     def apply(

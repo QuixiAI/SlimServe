@@ -2707,8 +2707,10 @@ void dsv4_indexer_topk_decode(const at::Tensor& q, const at::Tensor& weights,
   TORCH_CHECK(cand.scalar_type() == at::kInt, "cand must be int32");
   TORCH_CHECK(out.scalar_type() == at::kInt, "out must be int32");
   TORCH_CHECK(out.stride(1) == 1, "out rows must be dense");
-  TORCH_CHECK(width >= 1 && width <= 1024, "width must be in [1, 1024], got ",
-              width);
+  TORCH_CHECK(width >= 1 && width <= block_table.size(1) * kv_cache.size(1),
+              "width exceeds the block-table candidate capacity: ", width);
+  TORCH_CHECK(width <= 1024 || k_eff <= 512,
+              "streaming top-k supports at most 512 outputs, got ", k_eff);
   const auto tokens = q.size(0);
   TORCH_CHECK(k_eff <= out.size(1), "k_eff exceeds buffer width");
   TORCH_CHECK(tokens <= out.size(0), "more tokens than buffer rows");
@@ -2766,8 +2768,10 @@ void dsv4_indexer_topk_prefill(const at::Tensor& q, const at::Tensor& weights,
   TORCH_CHECK(cand.scalar_type() == at::kInt, "cand must be int32");
   TORCH_CHECK(out.scalar_type() == at::kInt, "out must be int32");
   TORCH_CHECK(out.stride(1) == 1, "out rows must be dense");
-  TORCH_CHECK(width >= 1 && width <= 1024, "width must be in [1, 1024], got ",
-              width);
+  TORCH_CHECK(width >= 1 && width <= block_table.size(1) * kv_cache.size(1),
+              "width exceeds the block-table candidate capacity: ", width);
+  TORCH_CHECK(width <= 1024 || k_eff <= 512,
+              "streaming top-k supports at most 512 outputs, got ", k_eff);
   const auto tokens = q.size(0);
   TORCH_CHECK(tok_req.numel() == tokens, "tok_req must have one entry/token");
   TORCH_CHECK(k_eff <= out.size(1), "k_eff exceeds buffer width");
@@ -3183,7 +3187,11 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
   // gguf/fused_moe.py): one kernel instead of down vec + reshape +
   // weighted sum. Shapes outside the folded kernel take the unfused chain.
   at::Tensor fused;
-  if (std::string(ggml_type_to_format(L.w2_qt)) == "q2_K" && L.top_k <= 8) {
+  const bool tape_sum_dtype =
+      h.scalar_type() == at::kHalf || h.scalar_type() == at::kBFloat16;
+  const int tape_sum_rows = h.scalar_type() == at::kBFloat16 ? 8 : 32;
+  if (std::string(ggml_type_to_format(L.w2_qt)) == "q2_K" && tape_sum_dtype &&
+      L.top_k <= 8 && L.w2_row % tape_sum_rows == 0) {
     fused = at::empty_like(h);
     ggml_moe_a8_vec_sum(mo, L.w2_qw, topk_ids, topk_w, L.top_k, L.w2_qt,
                         L.w2_row, T, fused, L.w2_soa);

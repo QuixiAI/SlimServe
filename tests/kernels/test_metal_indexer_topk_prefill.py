@@ -66,16 +66,20 @@ def main() -> None:
 
     buf = torch.full((T, TOPK), -1, dtype=torch.int32, device=DEV)
     quixicore_ops.dsv4_indexer_topk_prefill(
-        q, weights, cache, bt, tok_req, cand, buf, 1024, k_eff)
+        q, weights, cache, bt, tok_req, cand, buf, 1024, k_eff
+    )
     buf2 = torch.full((T, TOPK), -1, dtype=torch.int32, device=DEV)
     quixicore_ops.dsv4_indexer_topk_prefill(
-        q, weights, cache, bt, tok_req, cand, buf2, 1024, k_eff)
+        q, weights, cache, bt, tok_req, cand, buf2, 1024, k_eff
+    )
     torch.mps.synchronize()
     det = torch.equal(buf, buf2)
     print("determinism:", det)
 
     # eager reference (metal_indexer chain semantics, request-local columns)
-    lut = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+    lut = (
+        torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+    )
     lut = torch.nan_to_num(lut, nan=0.0).to(DEV)
     mism = 0
     setdiff = 0
@@ -99,7 +103,7 @@ def main() -> None:
             mism += 1
             setdiff += len(set(ref.tolist()) ^ set(got[got >= 0].tolist())) // 2
         # pads beyond n candidates must be -1
-        assert (buf[t, min(k_eff, n):] == -1).all().item()
+        assert (buf[t, min(k_eff, n) :] == -1).all().item()
     print(
         f"rows compared {T}, exact-order mismatches {mism}, "
         f"set-membership diffs {setdiff}"
@@ -111,6 +115,67 @@ def main() -> None:
         failed.append(f"mismatches={mism} setdiff={setdiff}")
     if failed:
         raise SystemExit(f"ORACLE MISMATCH: {failed}")
+
+    # Cross the fixed-scratch boundary.  This exercises the native 512-way
+    # streaming merge used for real request windows above 1,024 candidates.
+    width = 1537
+    rows = 2
+    blocks_per_req = (width + BS - 1) // BS
+    cache2 = torch.randint(0, 255, (blocks_per_req, BS, 132), dtype=torch.uint8)
+    cache2[..., :128] &= 0x7E
+    scales2 = torch.rand(blocks_per_req, BS, 1, dtype=torch.float32) * 0.5 + 0.5
+    cache2[..., 128:132] = scales2.view(torch.uint8).reshape(blocks_per_req, BS, 4)
+    cache2 = cache2.to(DEV)
+    bt2 = torch.arange(blocks_per_req, dtype=torch.int32, device=DEV)[None, :]
+    q2 = torch.randn(rows, H, D, dtype=torch.float16, device=DEV) * 0.3
+    w2 = torch.rand(rows, H, dtype=torch.float32, device=DEV) + 0.1
+    cand2 = torch.tensor([width, width - 19], dtype=torch.int32, device=DEV)
+    req2 = torch.zeros(rows, dtype=torch.int32, device=DEV)
+    got2 = torch.full((rows, TOPK), -1, dtype=torch.int32, device=DEV)
+    quixicore_ops.dsv4_indexer_topk_prefill(
+        q2, w2, cache2, bt2, req2, cand2, got2, width, TOPK
+    )
+    torch.mps.synchronize()
+    lut2 = (
+        torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).to(torch.float32)
+    )
+    lut2 = torch.nan_to_num(lut2, nan=0.0).to(DEV)
+    for t, n in enumerate((width, width - 19)):
+        j = torch.arange(n, device=DEV)
+        packed = cache2[bt2[0, j // BS].long(), j % BS]
+        kval = lut2[packed[..., :128].long()]
+        kscale = packed[..., 128:].contiguous().view(torch.float32).reshape(n)
+        score = torch.einsum("hd,kd->hk", q2[t].float(), kval)
+        logits = torch.einsum("hk,h->k", torch.relu(score), w2[t]) * kscale
+        ref = torch.topk(logits, TOPK).indices.cpu()
+        assert torch.equal(got2[t].long().cpu(), ref)
+    print("streaming native width 1537: exact")
+
+    # Exercise the shipping profile's full compressed maximum without a
+    # width-sized score tensor.  Zero queries make every score tie, so the
+    # deterministic secondary key gives a cheap exact oracle [0, 512).
+    max_width = 65536
+    max_blocks = max_width // BS
+    cache3 = torch.zeros((max_blocks, BS, 132), dtype=torch.uint8)
+    scales3 = torch.ones((max_blocks, BS, 1), dtype=torch.float32)
+    cache3[..., 128:132] = scales3.view(torch.uint8).reshape(max_blocks, BS, 4)
+    cache3 = cache3.to(DEV)
+    bt3 = torch.arange(max_blocks, dtype=torch.int32, device=DEV)[None, :]
+    got3 = torch.full((1, TOPK), -1, dtype=torch.int32, device=DEV)
+    quixicore_ops.dsv4_indexer_topk_prefill(
+        torch.zeros((1, H, D), dtype=torch.float16, device=DEV),
+        torch.ones((1, H), dtype=torch.float32, device=DEV),
+        cache3,
+        bt3,
+        torch.zeros(1, dtype=torch.int32, device=DEV),
+        torch.tensor([max_width], dtype=torch.int32, device=DEV),
+        got3,
+        max_width,
+        TOPK,
+    )
+    torch.mps.synchronize()
+    assert torch.equal(got3[0].cpu(), torch.arange(TOPK, dtype=torch.int32))
+    print("streaming native width 65536: exact deterministic tie order")
     print("prefill indexer top-k oracle passed")
 
 
