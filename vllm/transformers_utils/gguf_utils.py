@@ -304,8 +304,8 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
     projector_type_field = reader.get_field(Keys.Clip.PROJECTOR_TYPE)
     if projector_type_field:
         try:
-            projector_type = bytes(projector_type_field.parts[-1]).decode("utf-8")
-        except (AttributeError, UnicodeDecodeError) as e:
+            projector_type = str(projector_type_field.contents())
+        except (AttributeError, TypeError, ValueError) as e:
             logger.warning("Failed to decode projector type from GGUF: %s", e)
 
     # Map GGUF field constants to SiglipVisionConfig parameters.
@@ -331,8 +331,10 @@ def extract_vision_config_from_gguf(mmproj_path: str) -> "SiglipVisionConfig | N
                 gguf_key,
             )
             return None
-        # Extract scalar value from GGUF field and convert to target type
-        config_params[param_name] = dtype(field.parts[-1])
+        # ``GGUFReader.parts`` stores scalar fields as one-element ndarrays;
+        # its public ``contents`` accessor returns the decoded Python scalar
+        # and works for both live and metadata-cached readers.
+        config_params[param_name] = dtype(field.contents())
 
     # Apply model-specific parameters based on projector type
     if projector_type == VisionProjectorType.GEMMA3:

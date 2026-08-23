@@ -43,6 +43,7 @@ def architecture(monkeypatch):
         ("glm-dsa", "glm45", "glm47"),
         ("deepseek4", "deepseek_v4", "deepseek_v4"),
         ("kimi-k3", "kimi_k3", "kimi_k3"),
+        ("muse-glimmer", "muse_glimmer", "muse_glimmer"),
     ],
 )
 def test_each_architecture_selects_its_own_parsers(architecture, arch, reasoning, tool):

@@ -62,6 +62,18 @@ _PARTIAL_PARAM_RE = re.compile(
 )
 
 
+def _dsml_custom_input(raw_args: str, partial: bool) -> str:
+    """Extract the raw value of the POC custom tool's sole input parameter."""
+    match = _PARAM_RE.search(raw_args)
+    if match and match.group(1) == "input" and match.group(2) == "true":
+        return match.group(3)
+    if partial:
+        match = _PARTIAL_PARAM_RE.search(raw_args)
+        if match and match.group(1) == "input" and match.group(2) == "true":
+            return match.group(3)
+    return ""
+
+
 def _dsml_arg_converter(raw_args: str, partial: bool) -> str:
     params: dict[str, object] = {}
 
@@ -203,6 +215,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
         },
         arg_converter=_dsml_arg_converter,
+        custom_tool_arg_converter=_dsml_custom_input,
         arg_structural_chars=frozenset(">"),
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
@@ -227,11 +240,12 @@ class DeepSeekV4Parser(ParserEngine):
             parser_engine_config=deepseek_v4_config(thinking=thinking),
             **kwargs,
         )
-        self._arg_converter = self._convert_args
 
-    def _convert_args(self, raw_args: str, partial: bool) -> str:
-        result = _dsml_arg_converter(raw_args, partial)
+    def _convert_slot_args(self, idx: int, partial: bool) -> str:
+        result = super()._convert_slot_args(idx, partial)
+        if self._slot_is_custom_tool(idx):
+            return result
+        slot = self._tool_slots[idx]
         if not self._tools:
             return result
-        func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
-        return _unwrap_wrapper_args(result, self._tools, func_name)
+        return _unwrap_wrapper_args(result, self._tools, slot.name)

@@ -110,20 +110,69 @@ def to_json(value: Any) -> str:
         return json.dumps(value, ensure_ascii=True)
 
 
+def _custom_tool_as_dsml_schema(tool):
+    """Present a Responses raw-input tool through DeepSeek's DSML format."""
+    description = tool.get("description") or ""
+    raw_input_note = (
+        "Pass the complete raw custom-tool input in the single `input` string "
+        "parameter. Do not JSON-encode or otherwise wrap its value."
+    )
+    if description:
+        description += "\n\n"
+    description += raw_input_note
+
+    input_format = tool.get("format")
+    if isinstance(input_format, dict) and input_format.get("type") == "grammar":
+        syntax = input_format.get("syntax", "grammar")
+        definition = input_format.get("definition")
+        if isinstance(definition, str):
+            description += (
+                f"\nThe raw input must match this {syntax} grammar:\n"
+                f"{definition}"
+            )
+
+    return {
+        "name": tool["name"],
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": {"input": {"type": "string"}},
+            "required": ["input"],
+            "additionalProperties": False,
+        },
+    }
+
+
 def tools_from_openai_format(tools):
-    """Extract function definitions from OpenAI-format tool list."""
-    return [tool["function"] for tool in tools]
+    """Convert tool declarations to the schemas DeepSeek sees in its prompt."""
+    result = []
+    for tool in tools:
+        if tool.get("type") == "custom":
+            result.append(_custom_tool_as_dsml_schema(tool))
+        else:
+            result.append(tool["function"])
+    return result
 
 
 def tool_calls_from_openai_format(tool_calls):
     """Convert OpenAI-format tool calls to internal format."""
-    return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
-    ]
+    result = []
+    for tool_call in tool_calls:
+        if tool_call.get("type") == "custom":
+            result.append(
+                {
+                    "name": tool_call["name"],
+                    "arguments": {"input": tool_call["input"]},
+                }
+            )
+        else:
+            result.append(
+                {
+                    "name": tool_call["function"]["name"],
+                    "arguments": tool_call["function"]["arguments"],
+                }
+            )
+    return result
 
 
 def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:

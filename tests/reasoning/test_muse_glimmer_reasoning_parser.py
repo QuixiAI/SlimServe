@@ -37,10 +37,10 @@ def test_muse_streaming_parser_holds_partial_recipient_header():
 
     assert partial is None
     assert reasoning is not None
-    assert reasoning.reasoning_content == "reason"
+    assert reasoning.reasoning == "reason"
     assert reasoning.content is None
     assert content is not None
-    assert content.reasoning_content is None
+    assert content.reasoning is None
     assert content.content == "4"
 
 
@@ -52,7 +52,7 @@ def test_muse_streaming_parser_restores_disambiguated_plain_prefix():
 
     assert held is None
     assert plain is not None
-    assert plain.reasoning_content is None
+    assert plain.reasoning is None
     assert plain.content == "today"
 
 
