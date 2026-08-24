@@ -96,7 +96,7 @@ for each model family.
 | --- | --- |
 | AMD MI300X (2–8 GPUs) | Apple Metal for GLM-5.2-Vision |
 | NVIDIA A100 (4–8 GPUs) | RTX 3090 / 4090 / 5090, RTX PRO 6000 |
-| [Apple Metal](#apple-silicon) (DeepSeek-V4, 128 GiB+) | NVIDIA DGX Spark, multi-node |
+| [Apple Metal](#apple-silicon) (DeepSeek-V4 128 GiB+; Muse-Glimmer 64 GiB+; Qwen3.8 48 GiB+) | NVIDIA DGX Spark, multi-node |
 
 ### Models
 
@@ -148,7 +148,8 @@ Profile ids follow one scheme everywhere: `<model>-<quant>-<gpus>`. A
 profile exists for exactly the platforms it is validated on — if it is
 listed for your platform it works there, and it refuses to resolve anywhere
 else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `q4ktail` = Q4K-tail, `mxfp4` =
-MXFP4, `q4k` = Q4_K, `q2k` = Q2_K.
+MXFP4, `q4k` = Q4_K, `q2k` = Q2_K, `kdyn` = K-quant dynamic (per-layer
+mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
 
 | Profile | Model | GPUs | Runs on | Draft cache |
 | --- | --- | ---: | --- | --- |
@@ -164,6 +165,8 @@ MXFP4, `q4k` = Q4_K, `q2k` = Q2_K.
 | `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
 | `k3-xxs-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
 | `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
+| `muse-kdyn-1` | Muse-Glimmer-30B | 1 | Apple Silicon | DFlash |
+| `qwen38-q2kxl-1` | Qwen3.8-27B | 1 | Apple Silicon | DFlash 2 |
 | `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
 
 † The GLM Apple Silicon variant is described but not yet runnable. DeepSeek-V4
@@ -171,7 +174,10 @@ is measured and supported; see [Apple Silicon](#apple-silicon).
 
 GLM takes `--quant IQ2_XXS|Q2_K|Q4_K` (Q4_K needs 4+ GPUs). DeepSeek-V4-Flash
 takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
-larger ones need 4 GPUs. Kimi K3 has one published quant. `slimserve --list`
+larger ones need 4 GPUs. Kimi K3 has one published quant. Muse-Glimmer takes
+`--quant kquant-dynamic|kquant-17gb`; Qwen3.8-27B has one published quant
+(Unsloth dynamic Q2_K_XL). Both are vision models served with their DFlash
+block-diffusion drafters. `slimserve --list`
 shows every profile and why any of them will not run here;
 `slimserve <profile> --dry-run` prints the resolved settings without loading
 anything.
@@ -511,17 +517,23 @@ the ceiling, so `k3-xxs-6` is the configuration a stale build degrades.
 
 ## Apple Silicon
 
-DeepSeek-V4-Flash runs through the in-tree PyTorch-MPS worker and the vendored
+Three models run through the in-tree PyTorch-MPS worker and the vendored
 QuixiCore Metal kernels. The supported `dsv4-xxs-1` path includes the packed sparse
 MLA target cache, hybrid cache allocation, GGUF i-quant/k-quant projections,
-the matching 0731 DSpark drafter, and a `turboquant_k8v4` draft cache. GLM's
-separate sparse-MLA/vision path remains individually gated in the CLI.
+the matching 0731 DSpark drafter, and a `turboquant_k8v4` draft cache.
+`muse-kdyn-1` (Muse-Glimmer-30B, 64 GiB+) and `qwen38-q2kxl-1` (Qwen3.8-27B,
+48 GiB+) serve text and vision with their DFlash block-diffusion drafters —
+Qwen3.8's hybrid GDN/attention layers share one Metal cache pool with the
+DFlash 2 path-selector drafter. GLM's separate sparse-MLA/vision path remains
+individually gated in the CLI.
 
 ```console
 $ slimserve --list
 Profiles (Apple M5 Max, 128 GiB unified):
-  ! glm52-xxs-1 GLM-5.2-Vision on one Mac — not validated on Metal
-    dsv4-xxs-1  DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon
+  ! glm52-xxs-1    GLM-5.2-Vision on one Mac — not validated on Metal
+    dsv4-xxs-1     DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon
+    muse-kdyn-1    Muse-Glimmer-30B on one Mac
+    qwen38-q2kxl-1 Qwen3.8-27B on one Mac
 ```
 
 **A Mac is gated by memory, not by card count.** Apple exposes one GPU per
@@ -529,12 +541,14 @@ machine and weights, KV, and activations share one unified pool. Quants carry
 `min_memory_bytes` alongside `min_gpus`, and the registry uses the memory gate
 on Metal:
 
-| Mac | DeepSeek-V4-Flash | GLM-5.2-Vision |
-| --- | --- | --- |
-| 128 GB | `IQ2_XXS`, `Q4K-tail` | — |
-| 192 GB | + `MXFP4`, `Q4_K` | — |
-| 256 GB | all four | `IQ2_XXS` |
-| 512 GB | all four | + `Q2_K`, `Q4_K` |
+| Mac | DeepSeek-V4-Flash | Muse-Glimmer-30B | Qwen3.8-27B | GLM-5.2-Vision |
+| --- | --- | --- | --- | --- |
+| 48 GB | — | — | `Q2_K_XL` | — |
+| 64 GB | — | both K-quants | `Q2_K_XL` | — |
+| 128 GB | `IQ2_XXS`, `Q4K-tail` | both K-quants | `Q2_K_XL` | — |
+| 192 GB | + `MXFP4`, `Q4_K` | both K-quants | `Q2_K_XL` | — |
+| 256 GB | all four | both K-quants | `Q2_K_XL` | `IQ2_XXS` |
+| 512 GB | all four | both K-quants | `Q2_K_XL` | + `Q2_K`, `Q4_K` |
 
 Kimi K3 is deliberately absent: at 800 GiB it does not fit the largest Mac ever
 built, so no Metal row claims it.
