@@ -62,6 +62,19 @@ def _e4m3_lut(device: torch.device) -> torch.Tensor:
     return lut
 
 
+def _topk_desc_stable(
+    logits: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k with the native kernels' documented (logit desc, index asc)
+    tie order. torch.topk's tie order is unspecified and empirically
+    differs between backends and between the full and streaming eager
+    paths; ties are reachable in production (relu zeroes, stale e4m3
+    slots decode to 0), so the fallbacks must break them the same way
+    the kernel does."""
+    vals, idx = torch.sort(logits, dim=-1, descending=True, stable=True)
+    return vals[..., :k], idx[..., :k]
+
+
 def _score_and_select(
     q: torch.Tensor,  # [rows, H, 128] model dtype (value / q_scale)
     weights: torch.Tensor,  # [rows, H] fp32 (q_scale folded)
@@ -85,7 +98,7 @@ def _score_and_select(
     if lo is not None:
         invalid |= col[None, :] < lo[:, None]
     logits = logits.masked_fill(invalid, float("-inf"))
-    vals, idx = torch.topk(logits, k_eff, dim=-1)
+    vals, idx = _topk_desc_stable(logits, k_eff)
     return idx.masked_fill(vals == float("-inf"), -1)
 
 
@@ -120,11 +133,14 @@ def _score_and_select_streaming(
         logits.masked_fill_(invalid, float("-inf"))
 
         tile_k = min(k_eff, k1 - k0)
-        vals, idx = torch.topk(logits, tile_k, dim=-1)
+        vals, idx = _topk_desc_stable(logits, tile_k)
         idx += k0
+        # Retained survivors precede the new tile positionally and always
+        # carry smaller global indices (tiles ascend), so the stable merge
+        # preserves (logit desc, index asc) globally by induction.
         merged_vals = torch.cat((best_vals, vals), dim=1)
         merged_idx = torch.cat((best_idx, idx), dim=1)
-        best_vals, keep = torch.topk(merged_vals, k_eff, dim=-1)
+        best_vals, keep = _topk_desc_stable(merged_vals, k_eff)
         best_idx = merged_idx.gather(1, keep)
 
     return best_idx.masked_fill(best_vals == float("-inf"), -1)
@@ -167,6 +183,11 @@ def _native_topk_decode(
         and buf.dtype == torch.int32
         and buf.stride(1) == 1
     ):
+        return False
+    if width > 1024 and k_eff > 512:
+        # The streaming kernel keeps at most 512 survivors between tiles;
+        # the native op TORCH_CHECKs this and would raise out of the forward
+        # pass. Checkpoints with index_topk > 512 fall back to eager.
         return False
     from vllm.quixicore.ops import quixicore_ops
 
@@ -230,6 +251,11 @@ def _native_topk_prefill(
     tok_req = (torch.searchsorted(cu, ks, right=True).to(torch.int32) - 1).contiguous()
     cand = (ke - ks).to(torch.int32).contiguous()
     k_eff = min(topk, max_cand)
+    if max_cand > 1024 and k_eff > 512:
+        # Same capacity contract as the decode wrapper: the streaming merge
+        # holds 512 survivors, so wider top-k on a >1024 window must take
+        # the eager fallback instead of tripping the op's TORCH_CHECK.
+        return False
     quixicore_ops.dsv4_indexer_topk_prefill(
         q[t0 : t0 + n_q].contiguous(),
         weights[t0 : t0 + n_q].float().contiguous(),

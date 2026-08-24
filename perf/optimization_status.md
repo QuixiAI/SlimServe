@@ -9677,3 +9677,83 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   here; the only hot-path changes are the post_update rewrite (strictly
   less work) and the zero-filled mm_id output (one fill per prefill
   call, ~1% of a chunk step, flagged for the next M1 Ultra bench pass).
+
+## 2026-08-24 - Independent PR #2 Review: 5 Fixes, 2 Doc Corrections
+
+- Context: a clean-slate multi-angle review of the two branch-authored
+  commits (10 finder angles, ~60 candidates, 22 deduped mechanisms,
+  adversarial verification: 13 confirmed / 4 plausible / 2 refuted).
+  This entry records the fixes taken now; the rest are open items below.
+- Fixed (correctness/availability):
+  - metal_indexer.py native wrappers now return False (eager fallback)
+    when width > 1024 and k_eff > 512 instead of tripping the native
+    op's TORCH_CHECK mid-serve. Only checkpoints with index_topk > 512
+    are affected; the shipping DSV4 profile sits at exactly 512.
+  - Both eager fallbacks (_score_and_select and the streaming variant)
+    now break ties with the native kernels' documented (logit desc,
+    index asc) order via a stable descending sort; torch.topk tie order
+    is unspecified and empirically diverged between the two fallbacks
+    on all-equal logits. New tie tests (full-tie plateau with exact
+    expected indices, plus strict-winners-over-plateau parity) in
+    test_metal_dispatch_guards.py; the prior parity test used
+    continuous random floats and could never see a tie.
+- Fixed (performance):
+  - Baseline: streaming top-k merge loop bounded by dispatch-uniform
+    `width` (batch-wide max seq len / ratio). Hypothesis: a short
+    decode in a batch with one 262K request pays ~126 merge iterations
+    of 1024-wide bitonic sort over pure -INFINITY tiles, per token per
+    indexer layer. Change: bound by per-token n_cand (threadgroup-
+    uniform; one token per threadgroup). Correctness: bit-identical by
+    construction (skipped tiles staged only -INFINITY keys); the
+    indexer topk oracle passes unchanged on the new metallib. Measured
+    throughput: not re-measured here (M5 Max, no M1 Ultra harness);
+    flagged for the next M1 Ultra mixed-batch decode bench. Decision:
+    retained.
+  - ggml_moe_mm_id output reverted at::zeros -> at::empty. The zeros
+    fill (previous entry) defended a negative-router-id case both
+    Python callers make unreachable (expert_map is None gates both mm
+    routes); measured cost of the defense: ~107 MB zero-store per call,
+    ~8.6 GB per 2176-token chunk step across layers. The contract is
+    now documented on both sides (host comment + fused_moe.py route
+    comment). Decision: contract over fill.
+- Removed: the two HISTORY_MAX early-return guards from the ratio-4
+  indexer kernels (previous entry listed them as correctness). The host
+  TORCH_CHECKs pin compress_ratio == 4 for those pipelines (ratio 128
+  routes to the c128 kernel), so the guards were unreachable — and a
+  trip would have silently skipped the KV write (stale compressed KV),
+  the opposite of fail-safe. Contract comments replace them.
+- Doc corrections:
+  - The 2026-08-23 entry's metallib SHA 9835f8c8... matched the
+    metallib committed in 2a1c5710f (verified via git show | shasum):
+    accurate when written, stale after the review-fix rebuild. The
+    metallib now committed hashes to
+    12848d6aa57d15c2c631fba93cd56bfdc0cb7b8243e8e807f4f41c52ac818baa.
+  - prefill_handoff.md boot-protocol annotation softened: the async-
+    output fix is unit-tested (poisoned stub stream) but the doc's own
+    mandated proof (cold boot, primer -> multi-chunk DIRECT) has not
+    been re-run, so the ramp remains the ops protocol per its item 7.
+    profiles.json note updated to match, and its 65,536-candidate
+    oracle claim scoped to what the all-zero-query block actually
+    exercises (tie ordering + streaming loop, not scoring).
+- Open items from the review (not addressed in this batch):
+  1. DraftTokensHandler (spec_decode/utils.py) and structured_outputs
+     keep the exact cross-stream copy+event+synchronize shape the
+     async-output fix removed; reachable on Metal via the first
+     structured-output request. Fix like async_utils, ideally by having
+     model_runner hand out the main stream on Metal so the 'mps' string
+     test lives in one place.
+  2. Producer-side padding in model_runner for num_computed_tokens_np,
+     is_prefilling_np, and prompt_lens (the consumer-side pad in
+     model_states/default.py covers only one of three; RSWA/flash-attn
+     under FULL graphs still hits a non-broadcastable copy_).
+  3. Decode eager fallback memory is still unbounded ([num_decode,
+     width, 128] fp32 gathers at width up to 65,536) and the module
+     comment overclaims; the prefill fallback's tile loop also
+     multiplies dispatches ~13x against its single bounded synchronize.
+  4. _score_and_select_streaming supports only the 2-D k_vals layout
+     (no dim()-branch); an env_int() helper for the remaining bare
+     int() env parses (_moe_vec_row_limit); indexer oracle cannot
+     generate e4m3 NaN codes (0x7F/0xFF unreachable under &= 0x7E);
+     q2_K sum-rows rule duplicated in three places.
+- Raw artifacts: perf/results/2026-08-24/pr2-independent-review/ on
+  this box (M5 Max; review transcript and test logs).
