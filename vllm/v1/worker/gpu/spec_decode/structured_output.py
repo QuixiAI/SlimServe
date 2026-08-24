@@ -47,21 +47,61 @@ class DraftGrammarBatch:
         self.advancements = [0] * len(rows)
         self.enabled = [True] * len(rows)
 
+    def _reject(self, index: int, reason: str) -> None:
+        request_id = self.request_ids[index]
+        if self.on_reject is not None:
+            self.on_reject(request_id, reason)
+        else:
+            logger.warning(
+                "Disabling draft grammar for request %s: %s", request_id, reason
+            )
+        self.enabled[index] = False
+
     def apply(
         self,
         logits: torch.Tensor,
         target_token_ids: torch.Tensor | None = None,
+        target_token_ids_cpu: np.ndarray | None = None,
     ) -> None:
-        active = [index for index, enabled in enumerate(self.enabled) if enabled]
+        # A matcher that terminated mid-block (the payload completed on an
+        # earlier draft step) must not be filled again: xgrammar raises a
+        # native RuntimeError from fill_next_token_bitmask on a terminated
+        # matcher. The remaining draft slots for that row go unconstrained;
+        # the target's own enforcement still verifies them.
+        active = [
+            index
+            for index, enabled in enumerate(self.enabled)
+            if enabled and not self.grammars[index].is_terminated()
+        ]
         if not active:
             return
         for index in active:
             grammar = self.grammars[index]
             grammar.fill_bitmask(self.bitmask, index)
-        rows = [self.rows[index] for index in active]
         bitmask = self.bitmask.numpy()
-        if len(active) != len(self.rows):
-            bitmask = bitmask[active]
+        # A grammar state whose allowed set is disjoint from the draft
+        # vocabulary would mask the row to all -inf; downstream that argmaxes
+        # to token 0 (BOS) and the -inf draft logits make the rejection
+        # sampler's NaN guard force-accept it into the constrained payload.
+        # Leave such rows unmasked and stop constraining them instead — the
+        # unconstrained draft is then verified (and rejected) by the target.
+        supported: list[int] = []
+        for index in active:
+            row = bitmask[index]
+            if target_token_ids_cpu is not None:
+                words = row[target_token_ids_cpu >> 5]
+                any_allowed = bool(np.any((words >> (target_token_ids_cpu & 31)) & 1))
+            else:
+                any_allowed = bool(np.any(row != 0))
+            if any_allowed:
+                supported.append(index)
+            else:
+                self._reject(index, "grammar admits no token in the draft vocabulary")
+        if not supported:
+            return
+        rows = [self.rows[index] for index in supported]
+        if len(supported) != len(self.rows):
+            bitmask = bitmask[supported]
         self.worker.apply_grammar_bitmask_rows(
             logits,
             rows,
@@ -79,17 +119,14 @@ class DraftGrammarBatch:
         ):
             if not self.enabled[index]:
                 continue
+            if grammar.is_terminated():
+                # The payload completed on an earlier draft step; later
+                # draft slots are unconstrained and must not be pushed into
+                # the terminated matcher. rollback() still unwinds the
+                # counted advancements, including the terminating token.
+                continue
             if not grammar.accept_tokens(request_id, [token]):
-                reason = f"draft matcher rejected its masked token {token}"
-                if self.on_reject is not None:
-                    self.on_reject(request_id, reason)
-                else:
-                    logger.warning(
-                        "Disabling draft grammar for request %s: %s",
-                        request_id,
-                        reason,
-                    )
-                self.enabled[index] = False
+                self._reject(index, f"draft matcher rejected its masked token {token}")
                 continue
             self.advancements[index] += 1
 
@@ -116,10 +153,12 @@ class DraftStructuredOutputState:
         vllm_config: VllmConfig,
         worker: StructuredOutputsWorker,
     ) -> None:
-        self.manager = StructuredOutputManager(vllm_config)
-        # Drafting occurs in the worker's synchronous request-admission path;
-        # completing compilation here avoids a first-token race with drafting.
-        self.manager._use_async_grammar_compilation = False
+        self.vllm_config = vllm_config
+        # Built lazily on the first structured request: every DSpark rank
+        # constructs this state at load, and an eager manager would pay a
+        # per-rank tokenizer load plus backend construction even on
+        # deployments that never see a structured request.
+        self.manager: StructuredOutputManager | None = None
         self.worker = worker
         self.requests: dict[str, Request] = {}
         # Verified target tokens and speculative proposals must not share one
@@ -131,28 +170,53 @@ class DraftStructuredOutputState:
         self.draft_active: set[str] = set()
         self.draft_disabled: set[str] = set()
 
+    def _ensure_manager(self) -> StructuredOutputManager:
+        if self.manager is None:
+            manager = StructuredOutputManager(self.vllm_config)
+            # Drafting occurs in the worker's synchronous request-admission
+            # path; completing compilation there avoids a first-token race
+            # with drafting.
+            manager._use_async_grammar_compilation = False
+            self.manager = manager
+        return self.manager
+
     def add_request(self, data: NewRequestData) -> None:
         sampling_params = data.sampling_params
         if sampling_params is None or sampling_params.structured_outputs is None:
             return
-        request = Request(
-            request_id=data.req_id,
-            prompt_token_ids=data.prompt_token_ids,
-            sampling_params=sampling_params,
-            pooling_params=data.pooling_params,
-        )
-        self.manager.grammar_init(request)
-        structured = request.structured_output_request
-        assert structured is not None
-        grammar = structured.grammar
-        if isinstance(grammar, Exception):
-            raise grammar
-        if not isinstance(grammar, StructuredOutputGrammar):
-            raise RuntimeError(f"grammar for request {data.req_id} is not ready")
-        self.requests[data.req_id] = request
-        draft_grammar = self.manager._create_grammar(request)
-        self.draft_grammars[data.req_id] = draft_grammar
-        self.verified_tokens[data.req_id] = []
+        # A worker mirror must never turn a per-request grammar problem into
+        # an engine-wide failure: the scheduler's own enforcement stands
+        # regardless, so on any admission error this request simply drafts
+        # unconstrained.
+        try:
+            manager = self._ensure_manager()
+            request = Request(
+                request_id=data.req_id,
+                prompt_token_ids=data.prompt_token_ids,
+                sampling_params=sampling_params,
+                pooling_params=data.pooling_params,
+            )
+            manager.grammar_init(request)
+            structured = request.structured_output_request
+            assert structured is not None
+            grammar = structured.grammar
+            if isinstance(grammar, Exception):
+                raise grammar
+            if not isinstance(grammar, StructuredOutputGrammar):
+                raise RuntimeError(f"grammar for request {data.req_id} is not ready")
+            self.requests[data.req_id] = request
+            draft_grammar = manager._create_grammar(request)
+            self.draft_grammars[data.req_id] = draft_grammar
+            self.verified_tokens[data.req_id] = []
+        except Exception as error:
+            self.remove_request(data.req_id)
+            logger.warning(
+                "Grammar mirror init failed for request %s; speculative "
+                "drafting runs unconstrained (target enforcement is "
+                "unaffected): %s",
+                data.req_id,
+                error,
+            )
 
     def remove_request(self, req_id: str) -> None:
         self.requests.pop(req_id, None)
@@ -193,7 +257,10 @@ class DraftStructuredOutputState:
         # this request's drafts and leave validation to the scheduler.
         grammar.reset()
         history = [*self.verified_tokens[req_id], *tokens]
-        if not history or grammar.accept_tokens(req_id, history):
+        # history is never empty here (tokens is non-empty by the caller's
+        # construction); a failed replay must disable, not pass silently —
+        # returning True on an unaccepted token would desync the mirror.
+        if grammar.accept_tokens(req_id, history):
             return True
         self._disable(
             req_id,
@@ -235,7 +302,7 @@ class DraftStructuredOutputState:
     def _mask_rows_by_request(
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict[str, tuple[np.ndarray, np.ndarray | None]]:
         if grammar_output is None:
             return {}
 
@@ -243,16 +310,23 @@ class DraftStructuredOutputState:
             req_id: index for index, req_id in enumerate(input_batch.req_ids)
         }
         cu_num_logits = input_batch.cu_num_logits_np
-        rows_by_request: dict[str, np.ndarray] = {}
+        apply_rows = getattr(grammar_output, "apply_rows", None)
+        rows_by_request: dict[str, tuple[np.ndarray, np.ndarray | None]] = {}
         offset = 0
         for req_id in grammar_output.structured_output_request_ids:
             req_index = req_id_to_index.get(req_id)
             if req_index is None:
                 continue
             num_rows = int(cu_num_logits[req_index + 1] - cu_num_logits[req_index])
-            rows_by_request[req_id] = grammar_output.grammar_bitmask[
-                offset : offset + num_rows
-            ]
+            request_flags = (
+                apply_rows[offset : offset + num_rows]
+                if apply_rows is not None
+                else None
+            )
+            rows_by_request[req_id] = (
+                grammar_output.grammar_bitmask[offset : offset + num_rows],
+                request_flags,
+            )
             offset += num_rows
         return rows_by_request
 
@@ -263,6 +337,12 @@ class DraftStructuredOutputState:
         num_sampled: torch.Tensor,
         grammar_output: GrammarOutput | None,
     ) -> None:
+        # Nothing to mirror without structured requests. This early-out is
+        # load-bearing: the .cpu() calls below are host-blocking device
+        # syncs sitting between the async-output copy and the drafter, and
+        # they must not tax plain-text serving.
+        if not self.requests:
+            return
         mask_rows = self._mask_rows_by_request(input_batch, grammar_output)
         counts = num_sampled.cpu().tolist()
         rows = sampled_token_ids.cpu().tolist()
@@ -271,10 +351,10 @@ class DraftStructuredOutputState:
             if request is None or count <= 0:
                 continue
             new_tokens = row[:count]
-            request.append_output_token_ids(new_tokens)
-            request_masks = mask_rows.get(req_id)
-            if request_masks is None:
+            request_entry = mask_rows.get(req_id)
+            if request_entry is None:
                 continue
+            request_masks, request_flags = request_entry
 
             if count > len(request_masks):
                 self._disable(
@@ -284,11 +364,23 @@ class DraftStructuredOutputState:
                 )
                 continue
 
-            grammar_tokens = [
-                token
-                for token, mask in zip(new_tokens, request_masks[:count])
-                if not self._is_unconstrained(mask)
-            ]
+            if request_flags is not None:
+                # Authoritative per-row constrained flags from the
+                # scheduler: a genuinely permissive grammar state can fill
+                # an all-ones mask that is bit-identical to the
+                # unrestricted sentinel, so the sentinel sniff below is
+                # only a fallback for producers that predate the flags.
+                grammar_tokens = [
+                    token
+                    for token, constrained in zip(new_tokens, request_flags[:count])
+                    if constrained
+                ]
+            else:
+                grammar_tokens = [
+                    token
+                    for token, mask in zip(new_tokens, request_masks[:count])
+                    if not self._is_unconstrained(mask)
+                ]
             if not grammar_tokens or req_id in self.draft_disabled:
                 continue
             if not self._accept_verified(req_id, grammar_tokens):
@@ -316,6 +408,7 @@ class DraftStructuredOutputState:
             grammars.append(grammar)
         if not rows:
             return None
+        assert self.manager is not None  # rows exist only after add_request
         return DraftGrammarBatch(
             self.manager,
             self.worker,
@@ -331,4 +424,10 @@ class DraftStructuredOutputState:
         self.verified_tokens.clear()
         self.draft_active.clear()
         self.draft_disabled.clear()
-        self.manager.clear_backend()
+        if self.manager is not None:
+            self.manager.clear_backend()
+            for executor_name in ("executor", "executor_for_fillmask"):
+                executor = getattr(self.manager, executor_name, None)
+                if executor is not None:
+                    executor.shutdown(wait=False)
+            self.manager = None
