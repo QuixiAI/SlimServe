@@ -59,7 +59,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
-from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+from vllm.v1.worker.gpu.async_utils import (
+    AsyncOutput,
+    AsyncPoolingOutput,
+    make_output_copy_stream,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
@@ -157,7 +161,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        self.output_copy_stream = torch.Stream(self.device)
+        self.output_copy_stream = make_output_copy_stream(self.device)
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -1137,14 +1141,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         enabled = getattr(self, "_nan_watch_enabled", None)
         if enabled is None:
             enabled = os.getenv("VLLM_NAN_WATCH", "0").lower() in (
-                "1", "true", "on", "yes",
+                "1",
+                "true",
+                "on",
+                "yes",
             )
             self._nan_watch_enabled = enabled
             self._nan_watch_step = 0
             self._nan_watch_pending: tuple | None = None
             if enabled:
-                logger.warning("NAN_WATCH enabled: logits rows checked "
-                               "every step (diagnostic mode)")
+                logger.warning(
+                    "NAN_WATCH enabled: logits rows checked "
+                    "every step (diagnostic mode)"
+                )
         if not enabled or logits is None:
             return
         self._nan_watch_step += 1
@@ -1159,15 +1168,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ids = ids_host.tolist() if ids_host is not None else None
                     nan_ids = (
                         [ids[i] for i in idxs if i < len(ids)]
-                        if ids is not None else None
+                        if ids is not None
+                        else None
                     )
                     logger.error(
                         "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
                         "(reported at step %d) rows=%s nan_row_input_ids=%s "
                         "all_ids=%s",
-                        count, rows, step, self._nan_watch_step, idxs,
-                        nan_ids, ids[:16] if ids is not None else None)
+                        count,
+                        rows,
+                        step,
+                        self._nan_watch_step,
+                        idxs,
+                        nan_ids,
+                        ids[:16] if ids is not None else None,
+                    )
                     from vllm.model_executor.layers import nan_probe
+
                     layers = nan_probe.snapshot()
                     if layers is not None:
                         logger.error(
@@ -1176,14 +1193,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             "outputs (birth = min); slots 100+4L+p are "
                             "intra-layer for L in 0-2 (p: 0=attn-in, "
                             "1=attn-out, 2=moe-in, 3=moe-out)",
-                            [x for x in layers if x[0] >= 100]
-                            + layers[:8])
+                            [x for x in layers if x[0] >= 100] + layers[:8],
+                        )
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
             nan_mask = torch.isnan(logits).any(dim=-1)
-            host = torch.empty(
-                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True
-            )
+            host = torch.empty(nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True)
             host.copy_(nan_mask, non_blocking=True)
             ids_host = None
             if input_batch is not None:
@@ -1198,7 +1213,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             event = torch.cuda.Event()
             event.record()
             self._nan_watch_pending = (
-                host, event, self._nan_watch_step, logits.shape[0], ids_host)
+                host,
+                event,
+                self._nan_watch_step,
+                logits.shape[0],
+                ids_host,
+            )
 
     def sample(
         self,

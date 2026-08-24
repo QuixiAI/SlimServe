@@ -79,3 +79,29 @@ def test_streaming_indexer_fallback_tie_order() -> None:
         q2.abs(), weights, k_flat, k_scale, lo, hi, topk
     )
     assert torch.equal(streamed2, full2)
+
+
+def test_streaming_indexer_fallback_per_row_layout() -> None:
+    """The decode fallback supplies per-row K ([rows, n_k, 128] with a
+    [rows, n_k] scale) — both pre-gathered and via the k_provider tile
+    fetch — and must match the full path exactly, tie plateaus included."""
+    torch.manual_seed(7)
+    rows, heads, dim, keys, topk = 4, 2, 4, 2500, 17
+    q = torch.randn(rows, heads, dim, dtype=torch.float16)
+    weights = torch.rand(rows, heads, dtype=torch.float32)
+    k_vals = torch.randn(rows, keys, dim, dtype=torch.float32)
+    k_vals[:, 1200:] = 0.0  # tie plateau spanning multiple tiles
+    k_scale = torch.rand(rows, keys, dtype=torch.float32)
+    hi = torch.tensor([keys, 1500, 700, keys])
+
+    full = _score_and_select(q, weights, k_vals, k_scale, None, hi, topk)
+    streamed = _score_and_select_streaming(q, weights, k_vals, k_scale, None, hi, topk)
+    assert torch.equal(streamed, full)
+
+    def provider(k0: int, k1: int):
+        return k_vals[:, k0:k1], k_scale[:, k0:k1]
+
+    provided = _score_and_select_streaming(
+        q, weights, None, None, None, hi, topk, n_k=keys, k_provider=provider
+    )
+    assert torch.equal(provided, full)
