@@ -4,7 +4,12 @@ import numpy as np
 import torch
 
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np, make_output_copy_stream
+from vllm.v1.worker.gpu.async_utils import (
+    async_copy_to_np,
+    make_completion_event,
+    make_output_copy_stream,
+    sync_completion_event,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -15,8 +20,9 @@ class DraftTokensHandler:
         # this handler had the same cross-stream copy+event shape whose cold
         # hand-off loses the completion signal on Metal.
         self.copy_stream = make_output_copy_stream(device)
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.Event()
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
+        # native mps event (or drain sentinel) on Metal.
+        self.copy_event = make_completion_event()
 
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
@@ -48,14 +54,17 @@ class DraftTokensHandler:
                 # caching allocator may reuse its memory before the async
                 # copy executes.
                 draft_tokens.record_stream(self.copy_stream)
-            self.copy_event.record()
+            if self.copy_event is not None:
+                # Argless record lands on the current stream: copy_stream
+                # inside the cross-stream block, the single stream on Metal.
+                self.copy_event.record()
         finally:
             if cross_stream:
                 torch.accelerator.set_stream(current_stream)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:
-            self.copy_event.synchronize()
+            sync_completion_event(self.copy_event)
             draft_token_ids = self.draft_tokens_np.tolist()
         else:
             # This case only happens when async scheduling is disabled.

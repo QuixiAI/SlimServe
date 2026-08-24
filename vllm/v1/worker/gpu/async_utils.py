@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import functools
+import os
 
 import numpy as np
 import torch
@@ -14,17 +16,70 @@ def make_output_copy_stream(device: torch.device | str | None) -> torch.Stream:
     """Stream for output and side-channel copies that would otherwise
     overlap with compute on a second stream.
 
-    On MPS this returns the CURRENT (producing) stream: a cold cross-
-    stream event hand-off can lose its completion signal (the first-
-    multi-chunk-prefill park; perf/prefill_handoff.md), so every Metal
-    copy path stays on the producing stream. This helper is the single
-    place that platform decision lives — consumers compare their copy
-    stream against the main stream instead of testing device types.
-    CUDA/ROCm get a dedicated stream to overlap the transfer."""
+    On MPS this returns the CURRENT (producing) stream — which is the only
+    stream that exists: torch.Stream(mps) always returns stream_id 0, so a
+    dedicated copy stream buys no overlap there, and the cross-stream
+    choreography has parked the engine (see make_completion_event). This
+    helper is the single place that platform decision lives — consumers
+    compare their copy stream against the main stream instead of testing
+    device types. CUDA/ROCm get a dedicated stream to overlap the
+    transfer."""
     dev = torch.device(device) if device is not None else None
     if dev is not None and dev.type == "mps":
         return torch.accelerator.current_stream(dev)
     return torch.Stream(device)
+
+
+@functools.cache
+def _is_metal_platform() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_metal()
+
+
+# Ops kill-switch: =1 replaces the Metal completion event below with a full
+# torch.mps.synchronize() in the output wait. Costs the drafter-tail overlap
+# (~3-4% decode throughput measured on dsv4-xxs-1) but removes the event
+# from the completion path entirely if the parked-event wedge ever recurs.
+_METAL_DRAIN = os.environ.get("VLLM_QC_ASYNC_OUT_DRAIN", "0") == "1"
+
+
+def make_completion_event():
+    """Completion marker for an output copy.
+
+    On Metal: a native torch.mps.Event, or None when the drain kill-switch
+    is armed. Deliberately NOT the generic torch.Event() machinery: MPS
+    exposes exactly one stream (torch.Stream(mps) always returns
+    stream_id 0), and the generic cross-"stream" record/wait_stream
+    choreography has parked the engine forever in MPSEvent::synchronize on
+    timing-sensitive cold boots — GPU idle, signal never delivered
+    (vllm/platforms/metal_compat.py has the incident history). Elsewhere: a
+    generic torch.Event for the dedicated copy stream."""
+    if _is_metal_platform():
+        return None if _METAL_DRAIN else torch.mps.Event()
+    return torch.Event()
+
+
+def record_completion_event(event, output_stream: torch.Stream) -> None:
+    """Record a make_completion_event marker on the copy's stream.
+
+    The native MPS event records argless on the current (only) stream;
+    the generic event records on the handed output stream; None (drain
+    mode) records nothing — sync_completion_event drains instead."""
+    if event is None:
+        return
+    if _is_metal_platform():
+        event.record()
+    else:
+        event.record(output_stream)
+
+
+def sync_completion_event(event) -> None:
+    """Wait for a make_completion_event marker (None = drain the stream)."""
+    if event is None:
+        torch.mps.synchronize()
+    else:
+        event.synchronize()
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -43,18 +98,23 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.Event()
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
+        # a native mps event (or drain sentinel) on Metal — see
+        # make_completion_event for why the generic machinery is unsafe there.
+        self.copy_event = make_completion_event()
         self._has_fault: torch.Tensor | None = None
 
         # On MPS, make_output_copy_stream hands out the producing stream
-        # (cold cross-stream event hand-offs can lose the completion
-        # signal), so the copy and its event land on the main stream with
-        # no cross-stream wait. CUDA/ROCm arrive with a dedicated copy
-        # stream and retain the overlap.
+        # (the only one that exists), so the copies enqueue with no stream
+        # switching at all. CUDA/ROCm arrive with a dedicated copy stream
+        # and retain the overlap.
         copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
-        with stream(output_stream, main_stream):
+        with (
+            contextlib.nullcontext()
+            if copy_on_main_stream
+            else stream(output_stream, main_stream)
+        ):
             if not copy_on_main_stream:
                 output_stream.wait_stream(main_stream)
 
@@ -75,10 +135,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(output_stream)
+            record_completion_event(self.copy_event, output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        sync_completion_event(self.copy_event)
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -122,14 +182,19 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
         self.is_valid = is_valid
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.Event()
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock;
+        # native mps event (or drain sentinel) on Metal.
+        self.copy_event = make_completion_event()
 
         # Same single-place platform decision as AsyncOutput: on MPS the
         # handed copy stream IS the main stream (make_output_copy_stream).
         copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
-        with stream(output_stream, main_stream):
+        with (
+            contextlib.nullcontext()
+            if copy_on_main_stream
+            else stream(output_stream, main_stream)
+        ):
             if not copy_on_main_stream:
                 output_stream.wait_stream(main_stream)
             self.pooler_output_cpu = self.pooler_output.to("cpu", non_blocking=True)
@@ -137,11 +202,11 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
                 self.is_valid_cpu = self.is_valid.to("cpu", non_blocking=True)
             else:
                 self.is_valid_cpu = None
-            self.copy_event.record(output_stream)
+            record_completion_event(self.copy_event, output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         pooler_output = list(self.pooler_output_cpu.unbind(dim=0))
-        self.copy_event.synchronize()
+        sync_completion_event(self.copy_event)
         if self.is_valid_cpu is not None:
             is_valid_cpu = self.is_valid_cpu.tolist()
             for i, is_valid in enumerate(is_valid_cpu):
