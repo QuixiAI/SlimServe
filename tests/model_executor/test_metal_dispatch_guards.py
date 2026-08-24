@@ -44,3 +44,38 @@ def test_streaming_indexer_fallback_matches_full_selection() -> None:
     full = _score_and_select(q, weights, k_vals, k_scale, lo, hi, topk)
     streamed = _score_and_select_streaming(q, weights, k_vals, k_scale, lo, hi, topk)
     assert torch.equal(streamed, full)
+
+
+def test_streaming_indexer_fallback_tie_order() -> None:
+    """Ties are reachable in production (relu zeroes any candidate whose
+    head dots are all <= 0; stale e4m3 slots decode to 0), and torch.topk's
+    tie order is unspecified — both fallbacks must break ties the way the
+    native kernel documents: (logit desc, index asc)."""
+    rows, heads, dim, keys, topk = 3, 2, 4, 3000, 17
+    # All-zero queries make every candidate logit exactly 0.0: a full-width
+    # tie. The deterministic order selects the first topk valid columns.
+    q = torch.zeros(rows, heads, dim, dtype=torch.float16)
+    weights = torch.ones(rows, heads, dtype=torch.float32)
+    k_vals = torch.randn(keys, dim, dtype=torch.float32)
+    k_scale = torch.ones(keys, dtype=torch.float32)
+    lo = torch.tensor([0, 233, 1027])
+    hi = torch.tensor([keys, 1900, keys])
+
+    full = _score_and_select(q, weights, k_vals, k_scale, lo, hi, topk)
+    streamed = _score_and_select_streaming(q, weights, k_vals, k_scale, lo, hi, topk)
+    expected = torch.stack(
+        [torch.arange(int(start), int(start) + topk) for start in lo]
+    )
+    assert torch.equal(full, expected)
+    assert torch.equal(streamed, expected)
+
+    # Partial ties: a handful of strict winners above a tied plateau.
+    q2 = torch.randn(rows, heads, dim, dtype=torch.float16)
+    k_flat = torch.zeros(keys, dim, dtype=torch.float32)
+    k_flat[100] = 1.0
+    k_flat[2500] = 1.0
+    full2 = _score_and_select(q2.abs(), weights, k_flat, k_scale, lo, hi, topk)
+    streamed2 = _score_and_select_streaming(
+        q2.abs(), weights, k_flat, k_scale, lo, hi, topk
+    )
+    assert torch.equal(streamed2, full2)

@@ -246,11 +246,12 @@ kernel void dsv4_indexer_compress_insert(
     const long kvslot = kv_slots[token];
     if (kvslot < 0) { return; }
 
+    // Host contract (TORCH_CHECK in qc_metal_serving.mm): compress_ratio
+    // == 4 for this pipeline, so history == HISTORY_MAX exactly and the
+    // fixed-size register arrays below cannot overrun. An in-kernel guard
+    // would not fail safely — skipping the write leaves stale compressed
+    // KV — so the contract is enforced loudly on the host instead.
     const int history = 2 * compress_ratio;
-    // The host contract pins compress_ratio so history fits the fixed-size
-    // register arrays; a violating runtime value must fail safely instead
-    // of writing past vals/scs.
-    if (history > HISTORY_MAX) { return; }
     const int req = token_to_req[token];
     const int d0 = (int)laneId * PER_LANE;
 
@@ -644,9 +645,13 @@ METAL_FUNC void dsv4_indexer_topk_decode_body(
     idxtk_sort(keys, vals, tid);
 
     // Merge each remaining 512-column tile with the retained best 512.
-    // The loop bound is the active request width supplied by CPU scheduler
-    // metadata, never the profile's configured maximum for a short request.
-    for (int base = IDXTK_WIDTH; base < width; base += IDXTK_KEEP) {
+    // Bounded by this token's own candidate count, not the dispatch-uniform
+    // `width` (the batch-wide maximum): a short decode sharing a batch with
+    // a long-context request must not pay the long request's merge
+    // schedule. n_cand is threadgroup-uniform (one token per threadgroup),
+    // and the skipped tiles would have staged only -INFINITY keys, so the
+    // survivors are bit-identical.
+    for (int base = IDXTK_WIDTH; base < n_cand; base += IDXTK_KEEP) {
         for (int off = sg; off < IDXTK_KEEP; off += 8) {
             const int j = base + off;
             float logit = -INFINITY;
@@ -779,10 +784,11 @@ kernel void dsv4_compress_front(
     const int pos = positions[token];
     if (sslot < 0 || ((pos + 1) % compress_ratio) != 0) { return; }
 
+    // Host contract (TORCH_CHECK in qc_metal_serving.mm): this pipeline
+    // serves compress_ratio == 4 only (ratio 128 routes to the c128
+    // kernel), so history == HISTORY_MAX exactly; see the matching note in
+    // dsv4_indexer_compress_insert for why there is no in-kernel guard.
     const int history = 2 * compress_ratio;
-    // Same guard as dsv4_indexer_compress_insert: fail safely on a
-    // contract-violating compress_ratio instead of overrunning rowp/okh.
-    if (history > HISTORY_MAX) { return; }
     const int req = token_to_req[token];
     const int d0 = (int)laneId * PER_LANE;
 

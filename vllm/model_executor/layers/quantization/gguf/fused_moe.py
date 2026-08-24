@@ -665,6 +665,9 @@ def _fused_moe_gguf(
         # output is the same flat (token, slot) row order, so act() and the
         # down path are unchanged. No fused pair+SwiGLU tile: measured
         # negative twice (optimization_status 2026-08-13/14).
+        # ggml_moe_mm_id contract: every routed id must be >= 0 (its output
+        # rows for dropped ids would be stale pooled memory). Negative ids
+        # only arise via expert_map, so both mm routes require it be None.
         use_mm_w1 = (
             current_platform.is_metal()
             and qweight_type == 16  # IQ2_XXS

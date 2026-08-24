@@ -3392,8 +3392,9 @@ void launch_mla_decode_fp8_sparse_two_cache_packed(
 template <class E>
 // Contract: num_heads % 16 == 0 (the kernel hard-wires 16 heads per
 // 256-thread threadgroup and the grid below truncates num_heads / 16).
-// The sole caller in qc_metal_serving.mm routes non-conforming head
-// counts to the per-head prefill path instead.
+// The sole caller in qc_metal_serving.mm gates on batch >= 64 &&
+// heads % 16 == 0; non-conforming shapes fall through to the fused
+// decode-kernel walk below that branch.
 void launch_mla_prefill_fp8_sparse_two_cache_packed(
     E& e, typename E::in_t q, typename E::in_t compressed,
     typename E::in_t compressed_idx, typename E::in_t compressed_len,
