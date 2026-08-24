@@ -119,6 +119,9 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.structured_output import (
+    DraftStructuredOutputState,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -256,6 +259,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
+        self.draft_structured_output_state: DraftStructuredOutputState | None = None
         self.cudagraph_manager: ModelCudaGraphManager | None = None
 
         # LoRA-related workers.
@@ -370,6 +374,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 vocab_size=self.vocab_size,
                 device=self.device,
             )
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_dspark()
+            ):
+                self.draft_structured_output_state = DraftStructuredOutputState(
+                    self.vllm_config,
+                    self.structured_outputs_worker,
+                )
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
@@ -800,6 +812,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        if self.draft_structured_output_state is not None:
+            self.draft_structured_output_state.remove_request(req_id)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -863,6 +877,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
                 )
+                if self.draft_structured_output_state is not None:
+                    self.draft_structured_output_state.add_request(new_req_data)
 
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
@@ -1640,6 +1656,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+        draft_grammar = None
+        if self.draft_structured_output_state is not None:
+            self.draft_structured_output_state.advance_verified(
+                input_batch,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                grammar_output,
+            )
+            draft_grammar = self.draft_structured_output_state.begin_draft(input_batch)
+
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1650,21 +1676,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with _qc_phase("drafter_propose"):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    mm_inputs=mm_inputs,
-                )
+            self.speculator.draft_grammar = draft_grammar
+            try:
+                with _qc_phase("drafter_propose"):
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        mm_inputs=mm_inputs,
+                    )
+            finally:
+                if draft_grammar is not None:
+                    draft_grammar.rollback()
+                self.speculator.draft_grammar = None
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
@@ -1754,6 +1786,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if self.draft_structured_output_state is not None:
+            self.draft_structured_output_state.shutdown()
+            self.draft_structured_output_state = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
         if hasattr(self, "attn_groups"):

@@ -127,6 +127,9 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.draft_logits: torch.Tensor | None = None
+        # Set transiently by the model runner for structured-output requests.
+        # DSpark consumes it between each sequential Markov sample.
+        self.draft_grammar = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             self.draft_logits = torch.zeros(
                 self.max_num_reqs,
