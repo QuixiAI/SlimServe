@@ -725,8 +725,24 @@ class Qwen3_5ForConditionalGeneration(
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
         for name, weight in weights:
+            # The HF safetensors checkpoint nests both towers under `model.`
+            # (`model.visual.*`, `model.language_model.*`) and ships the MTP
+            # head beside them. The GGUF path feeds the vision tower in
+            # already stripped, from a separate mmproj file; normalize to that
+            # stripped form so one loader serves both sources.
+            if name.startswith("model.visual."):
+                name = name[len("model.") :]
+            elif name.startswith("mtp."):
+                # Multi-token-prediction head: a speculator loaded separately,
+                # not part of the target graph.
+                continue
             if name.startswith("visual."):
                 param = params_dict[name]
+                # patch_embed.proj is a Conv3d in the HF checkpoint
+                # ([hidden, C, T, P, P]) and a Linear here; the GGUF ships it
+                # already flattened. Same values, same [C, T, P, P] row order.
+                if weight.shape != param.shape:
+                    weight = weight.reshape(param.shape)
                 param.data.copy_(weight.to(param.dtype))
                 loaded.add(name)
             elif name.startswith("language_model."):
