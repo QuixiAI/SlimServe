@@ -162,12 +162,12 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns False if the parser failed to advance.
         """
 
-        if self.ll_tokenizer.eos_token in tokens:
-            if self.ll_matcher.is_stopped() and not self.terminated:
-                self.rollback_lag = 1
-            self.terminated = True
-
+        eos_in_tokens = self.ll_tokenizer.eos_token in tokens
         if self.ll_matcher.is_stopped():
+            if eos_in_tokens:
+                if not self.terminated:
+                    self.rollback_lag = 1
+                self.terminated = True
             return True
 
         # TODO - Add jump decoding support in the future:
@@ -181,6 +181,12 @@ class GuidanceGrammar(StructuredOutputGrammar):
 
         self.check_error()
 
+        # Terminated only when the tokens were actually consumed: a REJECTED
+        # speculative EOS must not leave the grammar marked terminated, or
+        # the request is permanently excluded from further drafting with no
+        # advancement to roll the state back.
+        if r and eos_in_tokens:
+            self.terminated = True
         return r
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -217,8 +223,14 @@ class GuidanceGrammar(StructuredOutputGrammar):
         return self.terminated
 
     def reset(self):
-        # This method may be not needed anymore? TODO
+        # Full reset: the worker-side draft mirror uses reset() for rollback
+        # -drift recovery and then replays verified history, so the Python-
+        # side termination bookkeeping must reset along with ll_matcher —
+        # stale terminated/rollback_lag would make the next rollback
+        # under-roll by one and desync every subsequent draft mask.
         self.ll_matcher.reset()
+        self.terminated = False
+        self.rollback_lag = 0
 
 
 def serialize_guidance_grammar(

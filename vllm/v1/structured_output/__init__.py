@@ -55,6 +55,9 @@ class StructuredOutputManager:
         )
 
         self._grammar_bitmask: torch.Tensor | None = None
+        # Per-row record of whether _fill_bitmasks wrote a real grammar mask
+        # (vs. the unrestricted sentinel); same row indexing as the bitmask.
+        self._apply_rows: npt.NDArray[np.bool_] | None = None
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
 
         max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
@@ -195,8 +198,17 @@ class StructuredOutputManager:
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
     ) -> None:
         assert self._grammar_bitmask is not None
+        assert self._apply_rows is not None
         for grammar, index, apply_bitmask in batch:
-            if apply_bitmask and not grammar.is_terminated():
+            filled = apply_bitmask and not grammar.is_terminated()
+            # Authoritative per-row record of whether a real grammar mask
+            # was written: a permissive grammar state can legitimately fill
+            # an all-ones mask that is bit-identical to the unrestricted
+            # sentinel below, so consumers must not sniff the mask bits.
+            # Distinct indices per row make this thread-safe under the
+            # fill-mask executor.
+            self._apply_rows[index] = filled
+            if filled:
                 grammar.fill_bitmask(self._grammar_bitmask, index)
             else:
                 # Note that for thinking support, we will need to
@@ -214,7 +226,7 @@ class StructuredOutputManager:
         requests: dict[str, "Request"],
         structured_output_request_ids: list[str],
         scheduled_spec_decode_tokens: dict[str, list[int]],
-    ) -> "npt.NDArray[np.int32] | None":
+    ) -> "tuple[npt.NDArray[np.int32], npt.NDArray[np.bool_]] | None":
         # Prepare the structured output bitmask for this batch.
         if not structured_output_request_ids:
             return None
@@ -232,6 +244,9 @@ class StructuredOutputManager:
             self._grammar_bitmask = self.backend.allocate_token_bitmask(
                 max_batch_size * (1 + max_num_spec_tokens)
             )
+            self._apply_rows = torch.zeros(
+                self._grammar_bitmask.shape[0], dtype=torch.bool
+            ).numpy()
 
         # Generate a batched bitmask for all structured output requests.
         # When speculative decoding is enabled, we need to include multiple
@@ -356,7 +371,10 @@ class StructuredOutputManager:
         # After finishing with the xgrammar operations, we convert to
         # np.ndarray, because that is much more efficient for serialization
         # and deserialization when sending this to the GPU workers.
-        return bitmask_tensor.numpy()
+        assert self._apply_rows is not None
+        # Copied because the backing buffer is reused on the next step.
+        apply_rows = self._apply_rows[:cumulative_index].copy()
+        return bitmask_tensor.numpy(), apply_rows
 
     def should_fill_bitmask(self, request: "Request") -> bool:
         # NOTE (Hanchen) if enable_in_reasoning is True, it means that

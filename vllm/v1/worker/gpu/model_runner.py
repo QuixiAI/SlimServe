@@ -1676,7 +1676,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            self.speculator.draft_grammar = draft_grammar
             try:
                 with _qc_phase("drafter_propose"):
                     draft_tokens = self.speculator.propose(
@@ -1692,11 +1691,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.sampler.sampling_states.temperature.gpu,
                         self.sampler.sampling_states.seeds.gpu,
                         mm_inputs=mm_inputs,
+                        draft_grammar=draft_grammar,
                     )
             finally:
                 if draft_grammar is not None:
                     draft_grammar.rollback()
-                self.speculator.draft_grammar = None
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:

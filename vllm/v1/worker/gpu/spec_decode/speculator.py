@@ -62,6 +62,7 @@ class BaseSpeculator(ABC):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        draft_grammar=None,
     ) -> torch.Tensor:
         pass
 
@@ -127,8 +128,9 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.draft_logits: torch.Tensor | None = None
-        # Set transiently by the model runner for structured-output requests.
-        # DSpark consumes it between each sequential Markov sample.
+        # Bound per propose() call from its draft_grammar parameter; internal
+        # plumbing between propose, _generate_draft (eager gating), and the
+        # DSpark sequential sampler. Never mutated from outside.
         self.draft_grammar = None
         if self.speculative_config.draft_sample_method == "probabilistic":
             self.draft_logits = torch.zeros(

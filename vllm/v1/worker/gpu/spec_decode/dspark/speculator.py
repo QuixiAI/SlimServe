@@ -25,6 +25,7 @@ backbone forward AND the sequential Markov sampling.
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -71,6 +72,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._draft_target_ids: torch.Tensor | None = None
+        self._draft_target_ids_cpu: np.ndarray | None = None
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
 
@@ -86,6 +88,12 @@ class DSparkSpeculator(DFlashSpeculator):
         d2t = getattr(model, "draft_id_to_target_id", None)
         if d2t is not None:
             self._draft_target_ids = torch.arange(d2t.shape[0], device=d2t.device) + d2t
+            # CPU copy for the grammar batch's draft-vocab support check
+            # (does the mask admit any draft-vocab token at all); computed
+            # once at load so the per-step check stays sync-free.
+            self._draft_target_ids_cpu = (
+                self._draft_target_ids.cpu().numpy().astype(np.int64)
+            )
         if self.draft_logits is not None and self._draft_target_ids is not None:
             self._d2t_scatter_index = self._draft_target_ids
             # -inf once; the per-step scatter overwrites the draft->target
@@ -132,9 +140,16 @@ class DSparkSpeculator(DFlashSpeculator):
                     logits_i = buf
                 target_ids_for_mask = None
             if self.draft_grammar is not None:
+                # target_token_ids_cpu restricts the empty-support check to
+                # the draft vocabulary in BOTH branches: the probabilistic
+                # scatter buffer is -inf outside the draft-vocab columns, so
+                # a grammar admitting only non-draft tokens would still
+                # produce a dead row even though the full-target-space mask
+                # itself is non-empty.
                 self.draft_grammar.apply(
                     logits_i,
                     target_token_ids=target_ids_for_mask,
+                    target_token_ids_cpu=self._draft_target_ids_cpu,
                 )
             if self.draft_logits is not None:
                 # sample_pos is the predicted token's position Q; the target
