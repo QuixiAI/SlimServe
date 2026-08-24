@@ -63,7 +63,13 @@ def async_copy_to_gpu(
         out = torch.empty_like(x, device=device)
 
     if out.device.type == "mps":
-        return out.copy_(x)
+        # non_blocking: torch MPS stages pageable sources into a shared
+        # buffer synchronously on the CPU either way; the flag only decides
+        # whether the stream is drained afterwards (COMMIT_AND_WAIT). A
+        # blocking H2D here is a full pipeline drain at the start of every
+        # step; the source is safe to mutate as soon
+        # as copy_ returns because the staging memcpy has already happened.
+        return out.copy_(x, non_blocking=True)
 
     # pin_memory() is no-op if the memory is already pinned.
     pinned = x.pin_memory()
@@ -114,7 +120,11 @@ class UvaBufferPool:
         n = len(x)
         dst[:n] = x
         if buf.is_metal:
-            buf.uva[:n].copy_(buf.cpu[:n])
+            # non_blocking: MPS commits the staging blit without draining the
+            # stream (COMMIT vs COMMIT_AND_WAIT). buf.cpu outlives the copy by
+            # construction: the pool round-robins max_concurrency buffers, so
+            # this slot is not rewritten until the in-flight window has passed.
+            buf.uva[:n].copy_(buf.cpu[:n], non_blocking=True)
         return buf.uva[:n]
 
     def copy_to_gpu(
@@ -216,8 +226,12 @@ class StagedWriteTensor:
             return
 
         if self.device.type == "mps":
-            contents = torch.tensor(
-                self._staged_write_contents, dtype=self.dtype, device=self.device
+            # Materialize on CPU, then a non-blocking H2D: torch.tensor(...,
+            # device="mps") is a blocking copy that drains the whole stream
+            # mid-step. The staging memcpy happens before .to() returns, so
+            # the temporary's lifetime is not an issue.
+            contents = torch.tensor(self._staged_write_contents, dtype=self.dtype).to(
+                self.device, non_blocking=True
             )
             content_start = 0
             for index, start, content_end in zip(

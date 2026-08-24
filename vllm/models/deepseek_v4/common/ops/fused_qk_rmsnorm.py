@@ -5,6 +5,11 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+# fp32 copies of the (load-time-constant) norm weights, keyed by data_ptr —
+# weights are permanent for the server lifetime, so this never grows past
+# two entries per attention layer.
+_W32_CACHE: dict[int, torch.Tensor] = {}
+
 
 @triton.jit
 def _fused_q_kv_rmsnorm_kernel(
@@ -78,9 +83,33 @@ def fused_q_kv_rmsnorm(
         return qr_out, kv_out
 
     if current_platform.is_metal():
+        # Native single-dispatch path: qc_rms_norm_w32_* computes
+        # T(float(x) * rrms * w_f32), the same fp32-multiply formula as the
+        # eager oracle below (parity to reduction-order ulps).
+        if qr.dtype in (torch.float16, torch.bfloat16):
+            from vllm.quixicore.ops import quixicore_ops
+
+            if quixicore_ops.is_available() and quixicore_ops.has("rms_norm"):
+                # The fp32 weight copies are step-constant; cache them keyed
+                # by storage (fp16 -> fp32 widening is exact) instead of
+                # casting per call. Keyed on data_ptr because callers pass
+                # `.weight.data`, a fresh Tensor object every access.
+                qw = _W32_CACHE.get(q_weight.data_ptr())
+                if qw is None:
+                    qw = q_weight.float().contiguous()
+                    _W32_CACHE[q_weight.data_ptr()] = qw
+                kw = _W32_CACHE.get(kv_weight.data_ptr())
+                if kw is None:
+                    kw = kv_weight.float().contiguous()
+                    _W32_CACHE[kv_weight.data_ptr()] = kw
+                return (
+                    quixicore_ops.rms_norm(qr, qw, eps),
+                    quixicore_ops.rms_norm(kv, kw, eps),
+                )
+
         # Triton has no Metal target. Preserve the kernel's fp32 reduction and
-        # single output cast so this is also a correctness oracle for a future
-        # fused MSL implementation.
+        # single output cast so this is also a correctness oracle for the
+        # fused MSL implementation above.
         def rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
             x_fp32 = x.float()
             rrms = torch.rsqrt(x_fp32.square().mean(dim=-1, keepdim=True) + eps)

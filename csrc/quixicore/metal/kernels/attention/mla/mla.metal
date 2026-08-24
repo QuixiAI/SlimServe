@@ -4,9 +4,33 @@
 using namespace metal;
 using namespace mittens;
 
+// Value-typed bf16 loads: the half specialization rounds
+// half->float(exact)->bf16(RNE), bit-identical to an eager .to(bfloat16)
+// cast kernel — the fp16 serving path binds fp16 tensors directly and the
+// math sees the same values the cast-then-load pipeline produced.
+template <typename T> inline bf16 mla_val_bf16(device const T *p, long i);
+template <> inline bf16 mla_val_bf16(device const bf16 *p, long i) {
+    return p[i];
+}
+template <> inline bf16 mla_val_bf16(device const half *p, long i) {
+    return bf16(float(p[i]));
+}
+
+// Exact 2^(e-127) from a UE8M0 scale byte: a float with exponent field e and
+// zero mantissa. Fast-math metal::exp2 is ~2 ulps low at negative integer
+// inputs (measured on M1 Ultra at -O2; see the insert kernels below), which
+// would scale every dequantized cache value below what the encoder used.
+// Valid for e in [1, 254]; the insert kernels only emit ~[105, 253].
+inline float mla_ue8m0_scale(int e) {
+    return as_type<float>((uint)e << 23);
+}
+
+// The half instantiation reads the fp16 kv_score GEMM output directly
+// (bit-exact: see mla_val_bf16 above).
+template <typename T>
 kernel void dsv4_save_partial_states(
-        device const bf16 *kv [[buffer(0)]],
-        device const bf16 *score [[buffer(1)]],
+        device const T *kv [[buffer(0)]],
+        device const T *score [[buffer(1)]],
         device const bf16 *ape [[buffer(2)]],
         device const int *positions [[buffer(3)]],
         device float *state_cache [[buffer(4)]],
@@ -18,6 +42,7 @@ kernel void dsv4_save_partial_states(
         constant int &token_stride [[buffer(10)]],
         constant int &state_width [[buffer(11)]],
         constant int &compress_ratio [[buffer(12)]],
+        constant int &in_stride [[buffer(13)]],
         uint token [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]]) {
     if (int(token) >= num_tokens) { return; }
@@ -26,14 +51,42 @@ kernel void dsv4_save_partial_states(
     const long block = slot / block_size;
     const long offset = slot - block * block_size;
     const long cache_base = block * block_stride + offset * token_stride;
-    const long input_base = long(token) * head_size;
+    // in_stride lets kv/score bind as row-strided views of the fused
+    // kv_score GEMM output (no eager .contiguous() copies); values are
+    // identical to the packed layout.
+    const long input_base = long(token) * in_stride;
     const long ape_base = long(positions[token] % compress_ratio) * head_size;
+    // score+ape adds in bf16 by design: the Triton reference
+    // (_save_partial_states_kernel) also adds the bf16 loads before the fp32
+    // store, so widening the operands here would break bit parity with it.
     for (int dim = int(tid); dim < head_size; dim += 256) {
-        state_cache[cache_base + dim] = kv[input_base + dim];
+        state_cache[cache_base + dim] = mla_val_bf16(kv, input_base + dim);
         state_cache[cache_base + state_width + dim] =
-            score[input_base + dim] + ape[ape_base + dim];
+            mla_val_bf16(score, input_base + dim) + ape[ape_base + dim];
     }
 }
+
+#define instantiate_dsv4_save_partial_states(T, NAME)                          \
+  template [[host_name(NAME)]] [[kernel]] void dsv4_save_partial_states<T>(    \
+      device const T *kv [[buffer(0)]],                                        \
+      device const T *score [[buffer(1)]],                                     \
+      device const bf16 *ape [[buffer(2)]],                                    \
+      device const int *positions [[buffer(3)]],                               \
+      device float *state_cache [[buffer(4)]],                                 \
+      device const long *slot_mapping [[buffer(5)]],                           \
+      constant int &num_tokens [[buffer(6)]],                                  \
+      constant int &head_size [[buffer(7)]],                                   \
+      constant int &block_size [[buffer(8)]],                                  \
+      constant int &block_stride [[buffer(9)]],                                \
+      constant int &token_stride [[buffer(10)]],                               \
+      constant int &state_width [[buffer(11)]],                                \
+      constant int &compress_ratio [[buffer(12)]],                             \
+      constant int &in_stride [[buffer(13)]],                                  \
+      uint token [[threadgroup_position_in_grid]],                             \
+      uint tid [[thread_position_in_threadgroup]]);
+
+instantiate_dsv4_save_partial_states(bf16, "dsv4_save_partial_states");
+instantiate_dsv4_save_partial_states(half, "dsv4_save_partial_states_half");
 
 // ---------------------------------------------------------------------------
 // DeepSeek Multi-head Latent Attention (MLA) — preprocessing kernels.
@@ -53,9 +106,21 @@ kernel void dsv4_save_partial_states(
 // cos/sin are separate (max_pos, rope_dim/2) bf16 tables (the ThunderMittens RoPE
 // convention), indexed by positions[token]. Golden: rmsnorm_no_weight +
 // apply_rope_gptj_last_k in vLLM's test_fused_deepseek_v4_qnorm_rope_kv_insert.
+//
+// The half instantiations read fp16 activations directly, rounding
+// half->float(exact)->bf16(RNE) at load (bit-exact vs a cast-then-load
+// pipeline; same contract as mla_val_bf16).
 // ---------------------------------------------------------------------------
-template <int D>
-kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
+template <typename T> inline float mla_load_bf16(device const T *p, long i);
+template <> inline float mla_load_bf16(device const bf16 *p, long i) {
+    return float(p[i]);
+}
+template <> inline float mla_load_bf16(device const half *p, long i) {
+    return float(bf16(float(p[i])));
+}
+
+template <int D, typename QT>
+kernel void mla_q_norm_rope(device const QT  *q          [[buffer(0)]],
                             device const bf16 *cosb        [[buffer(1)]],
                             device const bf16 *sinb        [[buffer(2)]],
                             device const int  *positions   [[buffer(3)]],
@@ -65,7 +130,7 @@ kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
                             constant int &rope_dim         [[buffer(7)]],
                             constant int &norm_mode        [[buffer(8)]],   // 0 none,1 rms,2 rms+w
                             constant float &eps            [[buffer(9)]],
-                            device const bf16 *norm_weight [[buffer(10)]],  // (D,), read iff mode 2
+                            device const QT  *norm_weight [[buffer(10)]],  // (D,), read iff mode 2
                             uint3 blockIdx [[threadgroup_position_in_grid]],
                             uint  laneId   [[thread_index_in_simdgroup]]) {
     static_assert(D % 64 == 0, "mla_q_norm_rope needs head_dim divisible by 64");
@@ -80,7 +145,7 @@ kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
     float rms = 1.0f;
     if (norm_mode != 0) {
         float ss = 0.0f;
-        for (int k = 0; k < PER_LANE; ++k) { const float v = float(q[base + k]); ss += v * v; }
+        for (int k = 0; k < PER_LANE; ++k) { const float v = mla_load_bf16(q, base + k); ss += v * v; }
         ss = simd_sum(ss);
         rms = metal::rsqrt(ss / (float)D + eps);
     }
@@ -89,11 +154,11 @@ kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
     const long csbase = (long)pos * rope_half;
     for (int k = 0; k < PER_LANE; k += 2) {
         const int g0 = (int)laneId * PER_LANE + k;   // even global index (start of a pair)
-        float v0 = float(q[base + k]) * rms;
-        float v1 = float(q[base + k + 1]) * rms;
+        float v0 = mla_load_bf16(q, base + k) * rms;
+        float v1 = mla_load_bf16(q, base + k + 1) * rms;
         if (norm_mode == 2) {
-            v0 *= float(norm_weight[wbase + k]);
-            v1 *= float(norm_weight[wbase + k + 1]);
+            v0 *= mla_load_bf16(norm_weight, wbase + k);
+            v1 *= mla_load_bf16(norm_weight, wbase + k + 1);
         }
         if (g0 >= nope_dim) {
             const int p = (g0 - nope_dim) / 2;       // rope pair index
@@ -108,9 +173,9 @@ kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
     }
 }
 
-#define instantiate_mla_q_norm_rope(DVAL)                                      \
-  template [[host_name("mla_q_norm_rope_" #DVAL)]] [[kernel]] void             \
-  mla_q_norm_rope<DVAL>(device const bf16 *q [[buffer(0)]],                    \
+#define instantiate_mla_q_norm_rope_t(DVAL, QT, NAME)                          \
+  template [[host_name(NAME)]] [[kernel]] void                                 \
+  mla_q_norm_rope<DVAL, QT>(device const QT *q [[buffer(0)]],                  \
                         device const bf16 *cosb [[buffer(1)]],                 \
                         device const bf16 *sinb [[buffer(2)]],                 \
                         device const int  *positions [[buffer(3)]],            \
@@ -120,14 +185,21 @@ kernel void mla_q_norm_rope(device const bf16 *q          [[buffer(0)]],
                         constant int &rope_dim [[buffer(7)]],                  \
                         constant int &norm_mode [[buffer(8)]],                 \
                         constant float &eps [[buffer(9)]],                     \
-                        device const bf16 *norm_weight [[buffer(10)]],         \
+                        device const QT *norm_weight [[buffer(10)]],           \
                         uint3 blockIdx [[threadgroup_position_in_grid]],       \
                         uint  laneId   [[thread_index_in_simdgroup]]);
+#define instantiate_mla_q_norm_rope(DVAL)                                      \
+  instantiate_mla_q_norm_rope_t(DVAL, bf16, "mla_q_norm_rope_" #DVAL)
 
 instantiate_mla_q_norm_rope(128);
 instantiate_mla_q_norm_rope(192);
 instantiate_mla_q_norm_rope(256);
 instantiate_mla_q_norm_rope(512);
+// fp16-input variant used by fp16 serving (rounds to bf16 in-register).
+// Only D=512 exists for half input (the DSV4 serving shape); the launcher
+// builds the name from the runtime head_dim, so a half input with any other
+// head_dim is a PSO-not-found at dispatch.
+instantiate_mla_q_norm_rope_t(512, half, "mla_q_norm_rope_half_512");
 
 // ---------------------------------------------------------------------------
 // P2: mla_kv_insert — classic bf16 latent KV-insert (concat_and_cache_mla). One warp per token
@@ -252,15 +324,19 @@ kernel void mla_kv_insert_fp8(device const bf16 *kv          [[buffer(0)]],   //
     amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
     amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
     const float exponent = metal::ceil(metal::log2(metal::max(amax, 1e-4f) / FP8_MAX));
-    const float inv_scale = metal::exp2(-exponent);
+    // Fast-math exp2 lands ~2 ulps low at negative integer inputs (measured on
+    // M1 Ultra; see the indexer compress kernels), which shifts e4m3 rounding
+    // ties vs the exact fp32 reference. Build 2^-e from the float bit pattern
+    // and derive the stored scale byte from the same clamped ei.
+    const int ei = metal::clamp((int)exponent, -126, 126);
+    const float inv_scale = as_type<float>((uint)((127 - ei) << 23));
 
     if ((int)laneId < NOPE_LANES) {
         for (int k = 0; k < PER_LANE; ++k) {
             data_cache[dst_data + laneId * PER_LANE + k] = tk_e4m3_encode(v[k] * inv_scale);
         }
         if ((laneId & 3) == 0) {   // first lane of each 4-lane (64-elem) block writes its scale byte
-            const int e = metal::clamp((int)exponent + 127, 0, 255);
-            scale_cache[dst_scale + laneId / 4] = (uchar)e;
+            scale_cache[dst_scale + laneId / 4] = (uchar)(ei + 127);
         }
     } else {
         // RoPE dims [448,512): this lane holds a 16-wide contiguous slice (8 pairs).
@@ -315,7 +391,10 @@ kernel void mla_kv_insert_fp8_packed(
     amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
     const float exponent = metal::ceil(
         metal::log2(metal::max(amax, 1e-4f) / FP8_MAX));
-    const float inv_scale = metal::exp2(-exponent);
+    // Exact 2^-e from the bit pattern — fast-math exp2 is ~2 ulps low at
+    // negative integer inputs (see mla_kv_insert_fp8 / indexer kernels).
+    const int ei = metal::clamp((int)exponent, -126, 126);
+    const float inv_scale = as_type<float>((uint)((127 - ei) << 23));
 
     if ((int)laneId < NOPE_LANES) {
         for (int k = 0; k < PER_LANE; ++k) {
@@ -323,8 +402,76 @@ kernel void mla_kv_insert_fp8_packed(
                 tk_e4m3_encode(v[k] * inv_scale);
         }
         if ((laneId & 3) == 0) {
-            const int e = metal::clamp((int)exponent + 127, 0, 255);
-            kv_cache[base + DATA_BYTES + laneId / 4] = (uchar)e;
+            kv_cache[base + DATA_BYTES + laneId / 4] = (uchar)(ei + 127);
+        }
+    } else {
+        const int rl = ((int)laneId - NOPE_LANES) * PER_LANE;
+        device bf16 *rope_out = (device bf16 *)(kv_cache + base + NOPE);
+        for (int j = 0; j < PER_LANE; j += 2) {
+            const int p = (rl + j) / 2;
+            const float c = float(cosb[(long)pos * 32 + p]);
+            const float s = float(sinb[(long)pos * 32 + p]);
+            rope_out[rl + j] = bf16(v[j] * c - v[j + 1] * s);
+            rope_out[rl + j + 1] = bf16(v[j] * s + v[j + 1] * c);
+        }
+    }
+    if (laneId == 0) { kv_cache[base + DATA_BYTES + 7] = 0; }
+}
+
+// fp16-input twin of mla_kv_insert_fp8_packed. Two deltas only: each
+// element is rounded half->bf16 (RNE) at load (bit-exact, see
+// mla_load_bf16), and src_stride lets kv bind as a row-strided view of
+// the fused projection output (no eager .contiguous()).
+kernel void mla_kv_insert_fp8_packed_half(
+        device const half *kv           [[buffer(0)]],
+        device const bf16 *cosb         [[buffer(1)]],
+        device const bf16 *sinb         [[buffer(2)]],
+        device const int  *positions    [[buffer(3)]],
+        device const long *slot_mapping [[buffer(4)]],
+        device uchar      *kv_cache     [[buffer(5)]],
+        constant int &block_size        [[buffer(6)]],
+        constant int &cache_block_stride [[buffer(7)]],
+        constant int &src_stride        [[buffer(8)]],
+        uint3 blockIdx [[threadgroup_position_in_grid]],
+        uint laneId [[thread_index_in_simdgroup]]) {
+    constexpr int NOPE = 448, PER_LANE = 16;
+    constexpr int NOPE_LANES = NOPE / PER_LANE;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    constexpr float FP8_MAX = 448.0f;
+    const int token = blockIdx.x;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long base = (slot / block_size) * (long)cache_block_stride +
+                      (slot % block_size) * SLOT_BYTES;
+    const int pos = positions[token];
+    const long kbase = (long)token * src_stride + (long)laneId * PER_LANE;
+
+    float v[PER_LANE];
+    for (int k = 0; k < PER_LANE; ++k) { v[k] = mla_load_bf16(kv, kbase + k); }
+
+    // amax reduces over a 4-lane group only (xor-1 + xor-2): 4 lanes x
+    // PER_LANE dims = one 64-dim fp8 scale group; the (laneId & 3) == 0
+    // lane below writes that group's exponent byte.
+    float amax = 0.0f;
+    for (int k = 0; k < PER_LANE; ++k) {
+        amax = metal::max(amax, metal::fabs(v[k]));
+    }
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 1));
+    amax = metal::max(amax, metal::simd_shuffle_xor(amax, 2));
+    const float exponent = metal::ceil(
+        metal::log2(metal::max(amax, 1e-4f) / FP8_MAX));
+    // Exact 2^-e from the bit pattern — fast-math exp2 is ~2 ulps low at
+    // negative integer inputs (see mla_kv_insert_fp8 / indexer kernels).
+    const int ei = metal::clamp((int)exponent, -126, 126);
+    const float inv_scale = as_type<float>((uint)((127 - ei) << 23));
+
+    if ((int)laneId < NOPE_LANES) {
+        for (int k = 0; k < PER_LANE; ++k) {
+            kv_cache[base + laneId * PER_LANE + k] =
+                tk_e4m3_encode(v[k] * inv_scale);
+        }
+        if ((laneId & 3) == 0) {
+            kv_cache[base + DATA_BYTES + laneId / 4] = (uchar)(ei + 127);
         }
     } else {
         const int rl = ((int)laneId - NOPE_LANES) * PER_LANE;
@@ -561,7 +708,7 @@ kernel void mla_decode_fp8(device const bf16 *q            [[buffer(0)]],   // (
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -631,7 +778,7 @@ kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -656,6 +803,17 @@ kernel void mla_decode_fp8_sparse(device const bf16 *q            [[buffer(0)]],
 // sliding-window cache. The vLLM metadata builder supplies physical slot ids
 // for both lists, so this kernel can consume both cache allocations without a
 // gather/copy workspace and merge them in one exact online softmax.
+//
+// The half-output instantiation writes the fp16 serving buffer directly:
+// each element is rounded float->bf16(RNE) first, then widened/converted
+// to half exactly as a bf16-store + cast-copy chain would.
+template <typename T> inline T mla_store_bf16(float v);
+template <> inline bf16 mla_store_bf16<bf16>(float v) { return bf16(v); }
+template <> inline half mla_store_bf16<half>(float v) {
+    return half(float(bf16(v)));
+}
+
+template <typename OT>
 kernel void mla_decode_fp8_sparse_two_cache_packed(
         device const bf16 *q             [[buffer(0)]],
         device const uchar *compressed   [[buffer(1)]],
@@ -665,7 +823,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
         device const int *swa_idx        [[buffer(5)]],
         device const int *swa_len        [[buffer(6)]],
         device const float *sinks        [[buffer(7)]],
-        device bf16 *out                 [[buffer(8)]],
+        device OT *out                   [[buffer(8)]],
         constant int &num_heads          [[buffer(9)]],
         constant int &compressed_width   [[buffer(10)]],
         constant int &swa_width          [[buffer(11)]],
@@ -704,7 +862,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
             if (d < NOPE) {
                 const int e = (int)compressed[base + DATA_BYTES + d / 64];
                 lat[i] = float(tk_e4m3_decode(compressed[base + d])) *
-                         metal::exp2((float)(e - 127));
+                         mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -734,7 +892,7 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
             if (d < NOPE) {
                 const int e = (int)swa[base + DATA_BYTES + d / 64];
                 lat[i] = float(tk_e4m3_decode(swa[base + d])) *
-                         metal::exp2((float)(e - 127));
+                         mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -762,7 +920,628 @@ kernel void mla_decode_fp8_sparse_two_cache_packed(
     const long out_base = ((long)batch * num_heads + head) * LATENT;
     for (int i = 0; i < VPL; ++i) {
         out[out_base + lane + 32 * i] =
-            l == 0.0f ? bf16(0) : bf16(acc[i] / l);
+            l == 0.0f ? mla_store_bf16<OT>(0.0f) : mla_store_bf16<OT>(acc[i] / l);
+    }
+}
+
+// Dense-causal prefill FA support: decode a list of 584-byte fp8 cache
+// slots into a contiguous half [n, 512] scratch (the decode kernels' exact
+// fp32 materialization rounded to half — fp8 values scale-multiplied are
+// exactly representable in half at serving scales, bf16 rope -> half is
+// exact in range). One simdgroup per slot; -1 slots write zeros.
+kernel void mla_prefill_dequant_slots(
+        device const uchar *cache   [[buffer(0)]],
+        device const int *slots     [[buffer(1)]],  // (n)
+        device half *out            [[buffer(2)]],  // (n, 512)
+        constant int &block_size    [[buffer(3)]],
+        constant long &block_stride [[buffer(4)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    const int j = (int)tgid.x;
+    const int slot = slots[j];
+    device half *dst = out + (long)j * LATENT;
+    if (slot < 0) {
+        for (int i = 0; i < VPL; ++i) { dst[lane + 32 * i] = half(0.0f); }
+        return;
+    }
+    const long base = (slot / block_size) * block_stride +
+                      (slot % block_size) * SLOT_BYTES;
+    device const bf16 *rope = (device const bf16 *)(cache + base + NOPE);
+    for (int i = 0; i < VPL; ++i) {
+        const int d = lane + 32 * i;
+        float v;
+        if (d < NOPE) {
+            const int e = (int)cache[base + DATA_BYTES + d / 64];
+            v = float(tk_e4m3_decode(cache[base + d])) *
+                mla_ue8m0_scale(e);
+        } else {
+            v = float(rope[d - NOPE]);
+        }
+        dst[d] = half(v);
+    }
+}
+
+// Dense-causal prefill FA (simdgroup-MMA): one threadgroup = 8 query
+// tokens x 1 head over a single request slice. Phase A walks the shared
+// compressed-candidate prefix with per-row causal lens; phase B walks the
+// SWA band axis with per-row [lo, hi) masks; both axes are pre-decoded
+// half [n, 512] scratches (K == V == the 512 latent). Per 32-column
+// block: the 4 simdgroups each accumulate an S partial over their 128-dim
+// k slice via MMA (K^T loaded transposed straight from the scratch, no
+// staging), a TG-wide reduce + per-row online-softmax stats produce a
+// half P tile and per-row alphas, then each simdgroup rescales its
+// register O slice with a diagonal-matrix MMA (ggml flash_attn trick)
+// and accumulates P.V over its 128-dim V slice. ULP class vs the decode
+// walk (P rounds to half; block-level reassociation).
+//
+// Contract: tail 32-column blocks still load full 8x8 K/V fragments before
+// jn masks the scores, so kc/ks must be padded to a 32-row multiple plus a
+// spare block (the SlimServe host pads the dequant slot lists with -1 —
+// metal.py _pad_slots — and deepseek_v4_prefill_fa checks nc/ns % 32). The dequant
+// kernel zero-fills -1-slot rows, and every score a padded row produces is
+// masked (jn) before the softmax.
+template <typename OT>
+kernel void mla_prefill_fa_mma(
+        device const bf16 *q       [[buffer(0)]],   // (T, H, 512) slice
+        device const half *kc      [[buffer(1)]],   // (nc, 512)
+        device const half *ks      [[buffer(2)]],   // (ns, 512)
+        device const int *lens_c   [[buffer(3)]],   // (T) causal cols in kc
+        device const int *lo_s     [[buffer(4)]],   // (T) band start in ks
+        device const int *hi_s     [[buffer(5)]],   // (T) band end in ks
+        device const float *sinks  [[buffer(6)]],   // (H)
+        device OT *out             [[buffer(7)]],   // (T, H, 512)
+        constant int &T            [[buffer(8)]],
+        constant int &num_heads    [[buffer(9)]],
+        constant int &nc           [[buffer(10)]],
+        constant int &ns           [[buffer(11)]],
+        constant float &scale      [[buffer(12)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint tiitg [[thread_index_in_threadgroup]],
+        uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int QT = 8;    // query tokens per threadgroup
+    constexpr int C = 32;    // columns per block
+    constexpr int DK = 512;
+    constexpr int NSG = 4;   // simdgroups; each owns a 128-dim slice
+    constexpr int SLICE = DK / NSG;  // 128
+
+    const int t0 = (int)tgid.x * QT;
+    const int h = (int)tgid.y;
+
+    threadgroup half sq[QT * DK];          // 8 KB staged queries
+    threadgroup float sS[NSG * QT * C];    // 4 KB score partials
+    threadgroup half sP[QT * C];           // 512 B probability tile
+    threadgroup float sAlpha[QT];
+    threadgroup float sM[QT];
+    threadgroup float sL[QT];
+    threadgroup float sDiag[8 * 8];        // 256 B diagonal for rescale
+
+    // Stage queries (half; bf16 -> half is exact in range).
+    for (int idx = (int)tiitg; idx < QT * DK; idx += 128) {
+        const int r = idx / DK, d = idx % DK;
+        const int t = t0 + r;
+        sq[idx] = t < T
+                      ? half(float(q[((long)t * num_heads + h) * DK + d]))
+                      : half(0.0f);
+    }
+    if (tiitg < QT) {
+        sM[tiitg] = -3.4028234663852886e38f;
+        sL[tiitg] = 0.0f;
+    }
+    if (tiitg < 64) { sDiag[tiitg] = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // O slice accumulator: [QT x SLICE] fp32 = 16 8x8 frags.
+    simdgroup_float8x8 O[SLICE / 8];
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < SLICE / 8; ++i) {
+        O[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    }
+
+    // Tile-wide column ranges. Causal lens are monotonic within the slice.
+    const int t_last = metal::min(t0 + QT - 1, T - 1);
+    const int cmax = metal::min(lens_c[t_last], nc);
+    const int s_lo = metal::max(lo_s[t0], 0);
+    const int s_hi = metal::min(hi_s[t_last], ns);
+
+    for (int phase = 0; phase < 2; ++phase) {
+        device const half *kv = phase == 0 ? kc : ks;
+        const int c_begin = phase == 0 ? 0 : s_lo;
+        const int c_end = phase == 0 ? cmax : s_hi;
+        for (int jb = c_begin; jb < c_end; jb += C) {
+            const int jn = metal::min(c_end - jb, C);
+
+            // --- S partial over this simdgroup's 128-dim k slice ---
+            {
+                simdgroup_float8x8 Sf[C / 8];
+                #pragma clang loop unroll(full)
+                for (short cfr = 0; cfr < C / 8; ++cfr) {
+                    Sf[cfr] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+                }
+                simdgroup_half8x8 qa;
+                simdgroup_half8x8 kb;
+                const int d0 = (int)sgitg * SLICE;
+                #pragma clang loop unroll(full)
+                for (short kk = 0; kk < SLICE / 8; ++kk) {
+                    simdgroup_load(qa, sq + d0 + kk * 8, DK, 0, false);
+                    #pragma clang loop unroll(full)
+                    for (short cfr = 0; cfr < C / 8; ++cfr) {
+                        // transposed load: K^T tile from row-major kv
+                        simdgroup_load(
+                            kb, kv + (long)(jb + cfr * 8) * DK + d0 + kk * 8,
+                            DK, 0, true);
+                        simdgroup_multiply_accumulate(Sf[cfr], qa, kb,
+                                                      Sf[cfr]);
+                    }
+                }
+                threadgroup float *dst = sS + (int)sgitg * QT * C;
+                #pragma clang loop unroll(full)
+                for (short cfr = 0; cfr < C / 8; ++cfr) {
+                    simdgroup_store(Sf[cfr], dst + cfr * 8, C, 0, false);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- reduce partials, mask, per-row online stats, P tile ---
+            for (int idx = (int)tiitg; idx < QT * C; idx += 128) {
+                const int r = idx / C, c = idx % C;
+                const int t = t0 + r;
+                float v = sS[idx] + sS[QT * C + idx] + sS[2 * QT * C + idx] +
+                          sS[3 * QT * C + idx];
+                v *= scale;
+                const int col = jb + c;
+                bool ok = (t < T) && (c < jn);
+                if (phase == 0) {
+                    ok = ok && col < lens_c[t];
+                } else {
+                    ok = ok && col >= lo_s[t] && col < hi_s[t];
+                }
+                sS[idx] = ok ? v : -3.4028234663852886e38f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tiitg < QT) {
+                const int r = (int)tiitg;
+                float tm = -3.4028234663852886e38f;
+                for (int c = 0; c < C; ++c) {
+                    tm = max(tm, sS[r * C + c]);
+                }
+                float alpha = 1.0f;
+                if (tm == -3.4028234663852886e38f) {
+                    // no live columns: P row zero, O unchanged
+                    for (int c = 0; c < C; ++c) {
+                        sP[r * C + c] = half(0.0f);
+                    }
+                } else {
+                    const float new_m = max(sM[r], tm);
+                    alpha = sL[r] == 0.0f ? 0.0f : exp(sM[r] - new_m);
+                    float bsum = 0.0f;
+                    for (int c = 0; c < C; ++c) {
+                        const float sc = sS[r * C + c];
+                        const float b =
+                            sc == -3.4028234663852886e38f ? 0.0f
+                                                          : exp(sc - new_m);
+                        sP[r * C + c] = half(b);
+                        bsum += b;
+                    }
+                    sL[r] = sL[r] * alpha + bsum;
+                    sM[r] = new_m;
+                }
+                sDiag[r * 8 + r] = alpha;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // --- O rescale (diagonal MMA) + P.V accumulate ---
+            {
+                simdgroup_float8x8 Df;
+                simdgroup_load(Df, sDiag, 8, 0, false);
+                const simdgroup_float8x8 Z =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+                #pragma clang loop unroll(full)
+                for (short o = 0; o < SLICE / 8; ++o) {
+                    simdgroup_float8x8 t2;
+                    simdgroup_multiply_accumulate(t2, Df, O[o], Z);
+                    O[o] = t2;
+                }
+                simdgroup_half8x8 pf;
+                simdgroup_half8x8 vf;
+                const int d0 = (int)sgitg * SLICE;
+                #pragma clang loop unroll(full)
+                for (short cfr = 0; cfr < C / 8; ++cfr) {
+                    simdgroup_load(pf, sP + cfr * 8, C, 0, false);
+                    #pragma clang loop unroll(full)
+                    for (short o = 0; o < SLICE / 8; ++o) {
+                        simdgroup_load(
+                            vf, kv + (long)(jb + cfr * 8) * DK + d0 + o * 8,
+                            DK, 0, false);
+                        simdgroup_multiply_accumulate(O[o], pf, vf, O[o]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Sink fold + final 1/l normalization as one diagonal MMA.
+    if (tiitg < QT) {
+        const int r = (int)tiitg;
+        float mr = sM[r], lr = sL[r];
+        const float sink = sinks[h];
+        float alpha = 1.0f;
+        if (isfinite(sink)) {
+            const float new_m = max(mr, sink);
+            alpha = lr == 0.0f ? 0.0f : exp(mr - new_m);
+            lr = lr * alpha + exp(sink - new_m);
+        }
+        sDiag[r * 8 + r] = lr == 0.0f ? 0.0f : alpha / lr;
+        sL[r] = lr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        simdgroup_float8x8 Df;
+        simdgroup_load(Df, sDiag, 8, 0, false);
+        const simdgroup_float8x8 Z =
+            make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+        #pragma clang loop unroll(full)
+        for (short o = 0; o < SLICE / 8; ++o) {
+            simdgroup_float8x8 t2;
+            simdgroup_multiply_accumulate(t2, Df, O[o], Z);
+            O[o] = t2;
+        }
+    }
+
+    // Write out through the shared staging (sS reused as [QT x SLICE]
+    // f32, 4 KB): the four simdgroups take turns staging their V-dim
+    // slice, then all 128 threads copy that slice's rows out.
+    threadgroup float *sO = sS;
+    for (short sl = 0; sl < NSG; ++sl) {
+        if ((short)sgitg == sl) {
+            #pragma clang loop unroll(full)
+            for (short o = 0; o < SLICE / 8; ++o) {
+                simdgroup_store(O[o], sO + o * 8, SLICE, 0, false);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = (int)tiitg; idx < QT * SLICE; idx += 128) {
+            const int r = idx / SLICE, d = idx % SLICE;
+            const int t = t0 + r;
+            if (t < T) {
+                out[((long)t * num_heads + h) * DK + sl * SLICE + d] =
+                    mla_store_bf16<OT>(sO[idx]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+#define instantiate_mla_prefill_fa_mma(OT, NAME)                              \
+  template [[host_name(NAME)]] [[kernel]] void mla_prefill_fa_mma<OT>(         \
+      device const bf16 *q [[buffer(0)]],                                      \
+      device const half *kc [[buffer(1)]],                                     \
+      device const half *ks [[buffer(2)]],                                     \
+      device const int *lens_c [[buffer(3)]],                                  \
+      device const int *lo_s [[buffer(4)]],                                    \
+      device const int *hi_s [[buffer(5)]],                                    \
+      device const float *sinks [[buffer(6)]],                                 \
+      device OT *out [[buffer(7)]],                                            \
+      constant int &T [[buffer(8)]],                                           \
+      constant int &num_heads [[buffer(9)]],                                   \
+      constant int &nc [[buffer(10)]],                                         \
+      constant int &ns [[buffer(11)]],                                         \
+      constant float &scale [[buffer(12)]],                                    \
+      uint3 tgid [[threadgroup_position_in_grid]],                             \
+      uint tiitg [[thread_index_in_threadgroup]],                              \
+      uint sgitg [[simdgroup_index_in_threadgroup]]);
+
+instantiate_mla_prefill_fa_mma(bf16, "mla_prefill_fa_mma");
+instantiate_mla_prefill_fa_mma(half, "mla_prefill_fa_mma_out_half");
+
+// Prefill-width twin of mla_decode_fp8_sparse_two_cache_packed. The decode
+// kernel gives every (head, token) simdgroup its own serial candidate walk,
+// so at chunk widths each 584-byte slot is re-read and fp8-decoded once
+// per head. Here one 256-thread threadgroup owns 16 heads of one token:
+// candidate slots are staged through threadgroup memory as the SAME fp32
+// values the decode kernel materializes (8 slots x 512, 16 KB), then each
+// simdgroup walks the staged tile for its two heads with the decode
+// kernel's exact per-candidate order, lane-dim mapping (lane + 32*i),
+// simd_sum tree, and online-softmax update — outputs are BIT-IDENTICAL to
+// the fused decode kernel, per-token dequant drops 32x per threadgroup.
+template <typename OT>
+kernel void mla_prefill_fp8_sparse_two_cache_packed(
+        device const bf16 *q             [[buffer(0)]],
+        device const uchar *compressed   [[buffer(1)]],
+        device const int *compressed_idx [[buffer(2)]],
+        device const int *compressed_len [[buffer(3)]],
+        device const uchar *swa          [[buffer(4)]],
+        device const int *swa_idx        [[buffer(5)]],
+        device const int *swa_len        [[buffer(6)]],
+        device const float *sinks        [[buffer(7)]],
+        device OT *out                   [[buffer(8)]],
+        constant int &num_heads          [[buffer(9)]],
+        constant int &compressed_width   [[buffer(10)]],
+        constant int &swa_width          [[buffer(11)]],
+        constant float &scale            [[buffer(12)]],
+        constant int &compressed_block_size [[buffer(13)]],
+        constant int &compressed_block_stride [[buffer(14)]],
+        constant int &swa_block_size [[buffer(15)]],
+        constant int &swa_block_stride [[buffer(16)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint tiitg   [[thread_index_in_threadgroup]],
+        uint sgitg   [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    constexpr int TILE = 8;      // staged slots per round
+    constexpr int ROWS = 2;      // heads per simdgroup
+    const int batch = (int)tgid.y;
+    // head0 assumes exactly 256 threads / 8 simdgroups per threadgroup
+    // (the launcher's fixed dispatch shape: grid.x = heads/16).
+    const int head0 = (int)tgid.x * 16 + (int)sgitg * ROWS;
+
+    threadgroup float sres[TILE][LATENT];  // 16 KB
+
+    float qv[ROWS][VPL], acc[ROWS][VPL];
+    float m[ROWS], l[ROWS];
+    for (int r = 0; r < ROWS; ++r) {
+        const long q_base = ((long)batch * num_heads + head0 + r) * LATENT;
+        for (int i = 0; i < VPL; ++i) {
+            qv[r][i] = float(q[q_base + lane + 32 * i]);
+            acc[r][i] = 0.0f;
+        }
+        m[r] = -3.4028234663852886e38f;
+        l[r] = 0.0f;
+    }
+
+    // Both cache walks share the staging loop; PASS 0 = compressed list,
+    // PASS 1 = SWA list, in the decode kernel's order. Each staged slot is
+    // the decode kernel's exact fp32 materialization, and each row's
+    // per-candidate walk keeps its order, lane-dim mapping, simd_sum tree
+    // and online-softmax update — outputs BIT-IDENTICAL to the decode
+    // kernel, with the fp8 decode shared across 16 heads instead of run
+    // per head. No tile-level softmax / dual-candidate variants: both
+    // measured slower (optimization_status 2026-08-13).
+    for (int pass = 0; pass < 2; ++pass) {
+        device const uchar *cache = pass == 0 ? compressed : swa;
+        device const int *idx = pass == 0 ? compressed_idx : swa_idx;
+        const int width = pass == 0 ? compressed_width : swa_width;
+        const int count = pass == 0 ? compressed_len[batch] : swa_len[batch];
+        const int bsize = pass == 0 ? compressed_block_size : swa_block_size;
+        const long bstride =
+            pass == 0 ? compressed_block_stride : swa_block_stride;
+        for (int j0 = 0; j0 < count; j0 += TILE) {
+            const int jn = metal::min(count - j0, TILE);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            {
+                const int js = (int)tiitg / 32;        // staged slot 0..7
+                const int d0 = ((int)tiitg % 32) * 16; // 16 dims per thread
+                if (js < jn) {
+                    const int slot = idx[batch * width + j0 + js];
+                    if (slot >= 0) {
+                        const long base = (slot / bsize) * bstride +
+                                          (slot % bsize) * SLOT_BYTES;
+                        device const bf16 *rope =
+                            (device const bf16 *)(cache + base + NOPE);
+                        for (int d = d0; d < d0 + 16; ++d) {
+                            float v;
+                            if (d < NOPE) {
+                                const int e =
+                                    (int)cache[base + DATA_BYTES + d / 64];
+                                v = float(tk_e4m3_decode(cache[base + d])) *
+                                    mla_ue8m0_scale(e);
+                            } else {
+                                v = float(rope[d - NOPE]);
+                            }
+                            sres[js][d] = v;
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (int js = 0; js < jn; ++js) {
+                const int slot = idx[batch * width + j0 + js];
+                if (slot < 0) { continue; }
+                threadgroup const float *kv = sres[js];
+                for (int r = 0; r < ROWS; ++r) {
+                    float partial = 0.0f;
+                    float lat[VPL];
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < VPL; ++i) {
+                        lat[i] = kv[lane + 32 * i];
+                        partial += qv[r][i] * lat[i];
+                    }
+                    const float score = simd_sum(partial) * scale;
+                    const float new_m = max(m[r], score);
+                    const float alpha =
+                        l[r] == 0.0f ? 0.0f : exp(m[r] - new_m);
+                    const float beta = exp(score - new_m);
+                    #pragma clang loop unroll(full)
+                    for (int i = 0; i < VPL; ++i) {
+                        acc[r][i] = acc[r][i] * alpha + beta * lat[i];
+                    }
+                    l[r] = l[r] * alpha + beta;
+                    m[r] = new_m;
+                }
+            }
+        }
+    }
+
+    for (int r = 0; r < ROWS; ++r) {
+        const float sink = sinks[head0 + r];
+        if (isfinite(sink)) {
+            const float new_m = max(m[r], sink);
+            const float alpha = l[r] == 0.0f ? 0.0f : exp(m[r] - new_m);
+            l[r] = l[r] * alpha + exp(sink - new_m);
+            for (int i = 0; i < VPL; ++i) { acc[r][i] *= alpha; }
+        }
+        const long out_base = ((long)batch * num_heads + head0 + r) * LATENT;
+        for (int i = 0; i < VPL; ++i) {
+            out[out_base + lane + 32 * i] =
+                l[r] == 0.0f ? mla_store_bf16<OT>(0.0f)
+                             : mla_store_bf16<OT>(acc[r][i] / l[r]);
+        }
+    }
+}
+
+#define instantiate_mla_prefill_fp8_sparse_two_cache_packed(OT, NAME)          \
+  template [[host_name(NAME)]] [[kernel]] void                                 \
+  mla_prefill_fp8_sparse_two_cache_packed<OT>(                                 \
+      device const bf16 *q [[buffer(0)]],                                      \
+      device const uchar *compressed [[buffer(1)]],                            \
+      device const int *compressed_idx [[buffer(2)]],                          \
+      device const int *compressed_len [[buffer(3)]],                          \
+      device const uchar *swa [[buffer(4)]],                                   \
+      device const int *swa_idx [[buffer(5)]],                                 \
+      device const int *swa_len [[buffer(6)]],                                 \
+      device const float *sinks [[buffer(7)]],                                 \
+      device OT *out [[buffer(8)]],                                            \
+      constant int &num_heads [[buffer(9)]],                                   \
+      constant int &compressed_width [[buffer(10)]],                           \
+      constant int &swa_width [[buffer(11)]],                                  \
+      constant float &scale [[buffer(12)]],                                    \
+      constant int &compressed_block_size [[buffer(13)]],                      \
+      constant int &compressed_block_stride [[buffer(14)]],                    \
+      constant int &swa_block_size [[buffer(15)]],                             \
+      constant int &swa_block_stride [[buffer(16)]],                           \
+      uint3 tgid [[threadgroup_position_in_grid]],                             \
+      uint tiitg   [[thread_index_in_threadgroup]],                            \
+      uint sgitg   [[simdgroup_index_in_threadgroup]],                         \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_mla_prefill_fp8_sparse_two_cache_packed(
+    bf16, "mla_prefill_fp8_sparse_two_cache_packed");
+instantiate_mla_prefill_fp8_sparse_two_cache_packed(
+    half, "mla_prefill_fp8_sparse_two_cache_packed_out_half");
+
+#define instantiate_mla_decode_fp8_sparse_two_cache_packed(OT, NAME)           \
+  template [[host_name(NAME)]] [[kernel]] void                                 \
+  mla_decode_fp8_sparse_two_cache_packed<OT>(                                  \
+      device const bf16 *q [[buffer(0)]],                                      \
+      device const uchar *compressed [[buffer(1)]],                            \
+      device const int *compressed_idx [[buffer(2)]],                          \
+      device const int *compressed_len [[buffer(3)]],                          \
+      device const uchar *swa [[buffer(4)]],                                   \
+      device const int *swa_idx [[buffer(5)]],                                 \
+      device const int *swa_len [[buffer(6)]],                                 \
+      device const float *sinks [[buffer(7)]],                                 \
+      device OT *out [[buffer(8)]],                                            \
+      constant int &num_heads [[buffer(9)]],                                   \
+      constant int &compressed_width [[buffer(10)]],                           \
+      constant int &swa_width [[buffer(11)]],                                  \
+      constant float &scale [[buffer(12)]],                                    \
+      constant int &compressed_block_size [[buffer(13)]],                      \
+      constant int &compressed_block_stride [[buffer(14)]],                    \
+      constant int &swa_block_size [[buffer(15)]],                             \
+      constant int &swa_block_stride [[buffer(16)]],                           \
+      uint3 tgid [[threadgroup_position_in_grid]],                             \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_mla_decode_fp8_sparse_two_cache_packed(
+    bf16, "mla_decode_fp8_sparse_two_cache_packed");
+instantiate_mla_decode_fp8_sparse_two_cache_packed(
+    half, "mla_decode_fp8_sparse_two_cache_packed_out_half");
+
+// Split-K twin of the serving two-cache sparse decode (VLLM_QC_MLA_SPLITK):
+// grid gains a partition axis (H, B, P); partition p walks slice
+// [p*partition_size, ...) of the VIRTUAL concatenation
+// [compressed candidates ++ SWA candidates] with the same per-slot decode
+// and online softmax, emitting paged-v2 partials (normalized acc, max
+// logit, exp sum) for paged_attention_reduce<*, 512>. The attention sink
+// is NOT applied here — the reduce owns it, exactly once per (batch,
+// head). ULP class vs the fused kernel: the cross-partition LSE merge
+// reassociates the softmax sum.
+kernel void mla_decode_fp8_sparse_two_cache_packed_partition(
+        device const bf16 *q             [[buffer(0)]],
+        device const uchar *compressed   [[buffer(1)]],
+        device const int *compressed_idx [[buffer(2)]],
+        device const int *compressed_len [[buffer(3)]],
+        device const uchar *swa          [[buffer(4)]],
+        device const int *swa_idx        [[buffer(5)]],
+        device const int *swa_len        [[buffer(6)]],
+        device float *tmp_out            [[buffer(7)]],   // (B, H, P, 512)
+        device float *max_logits         [[buffer(8)]],   // (B, H, P)
+        device float *exp_sums           [[buffer(9)]],   // (B, H, P)
+        constant int &num_heads          [[buffer(10)]],
+        constant int &compressed_width   [[buffer(11)]],
+        constant int &swa_width          [[buffer(12)]],
+        constant float &scale            [[buffer(13)]],
+        constant int &compressed_block_size [[buffer(14)]],
+        constant int &compressed_block_stride [[buffer(15)]],
+        constant int &swa_block_size [[buffer(16)]],
+        constant int &swa_block_stride [[buffer(17)]],
+        constant int &num_partitions [[buffer(18)]],
+        constant int &partition_size [[buffer(19)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int LATENT = 512, NOPE = 448, VPL = LATENT / 32;
+    constexpr int SLOT_BYTES = 584, DATA_BYTES = 576;
+    constexpr float MLA_NEG_INF = -3.4028234663852886e38f;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const long q_base = ((long)batch * num_heads + head) * LATENT;
+
+    float qv[VPL], acc[VPL];
+    for (int i = 0; i < VPL; ++i) {
+        qv[i] = float(q[q_base + lane + 32 * i]);
+        acc[i] = 0.0f;
+    }
+    float m = MLA_NEG_INF, l = 0.0f;
+
+    const int clen = compressed_len[batch];
+    const int total = clen + swa_len[batch];
+    const int j_beg = part * partition_size;
+    const int j_end = metal::min(total, j_beg + partition_size);
+    for (int j = j_beg; j < j_end; ++j) {
+        int slot;
+        device const uchar *cache;
+        int bs;
+        long bstride;
+        if (j < clen) {
+            slot = compressed_idx[batch * compressed_width + j];
+            cache = compressed;
+            bs = compressed_block_size;
+            bstride = compressed_block_stride;
+        } else {
+            slot = swa_idx[batch * swa_width + (j - clen)];
+            cache = swa;
+            bs = swa_block_size;
+            bstride = swa_block_stride;
+        }
+        if (slot < 0) { continue; }
+        const long base = (slot / bs) * bstride + (slot % bs) * SLOT_BYTES;
+        device const bf16 *rope = (device const bf16 *)(cache + base + NOPE);
+        float lat[VPL], partial = 0.0f;
+        for (int i = 0; i < VPL; ++i) {
+            const int d = lane + 32 * i;
+            if (d < NOPE) {
+                const int e = (int)cache[base + DATA_BYTES + d / 64];
+                lat[i] = float(tk_e4m3_decode(cache[base + d])) *
+                         mla_ue8m0_scale(e);
+            } else {
+                lat[i] = float(rope[d - NOPE]);
+            }
+            partial += qv[i] * lat[i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VPL; ++i) {
+            acc[i] = acc[i] * alpha + beta * lat[i];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    const long stat = ((long)batch * num_heads + head) * num_partitions + part;
+    const long ob = stat * LATENT;
+    for (int i = 0; i < VPL; ++i) {
+        tmp_out[ob + lane + 32 * i] = l == 0.0f ? 0.0f : acc[i] / l;
+    }
+    if (lane == 0) {
+        max_logits[stat] = l == 0.0f ? MLA_NEG_INF : m;
+        exp_sums[stat] = l;
     }
 }
 
@@ -821,7 +1600,7 @@ kernel void mla_decode_fp8_partition(
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }
@@ -899,7 +1678,7 @@ kernel void mla_decode_fp8_sparse_partition(
             if (d < NOPE) {
                 const uchar code = data_cache[dbase + d];
                 const int e = (int)scale_cache[sbase + d / 64];
-                lat[i] = float(tk_e4m3_decode(code)) * metal::exp2((float)(e - 127));
+                lat[i] = float(tk_e4m3_decode(code)) * mla_ue8m0_scale(e);
             } else {
                 lat[i] = float(rope[d - NOPE]);
             }

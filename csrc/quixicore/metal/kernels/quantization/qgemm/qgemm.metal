@@ -94,6 +94,90 @@ instantiate_qgemm("qgemm_mxfp6_e3m2", mxfp6_e3m2, 2, 16);
 instantiate_qgemm("qgemm_mxfp6_e2m3", mxfp6_e2m3, 2, 16);
 instantiate_qgemm("qgemm_hqq", hqq, 2, 16);
 
+// Wide-tile prefill variant with transposed store: BN=64 x BM=64 per
+// threadgroup (2 warps x 32 cols), same BK=32 k-loop as qgemm. Halves both
+// the per-N-block X re-reads and the per-M-block W re-reads vs the 32x32
+// tile, and emits D as (M, N) row-major (the caller's natural
+// [tokens, features] layout), removing the host-side output
+// transpose+contiguous pass. Accumulator values and fp32->half conversion
+// match qgemm's store exactly => per-element bit-identical to qgemm output.
+// Requires q8_0, N % 64 == 0, M % 64 == 0 (host pads).
+template<typename FMT, int N_WARPS, int BM_PER_WARP, int BN>
+kernel void qgemm_wide_t(
+    device   half*  Dt [[buffer(0)]],   // (M, N) row-major output (= D^T)
+    device   uchar* Wq [[buffer(1)]],
+    device   half*  X  [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    const constant int &M [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]],
+    uint  warp [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    using G = group<N_WARPS>;
+    constexpr const int BK = 32;
+
+    using gl_h = gl<half, 1, 1, -1, -1>;
+    gl_h gl_x(X, nullptr, nullptr, K, M);
+
+    threadgroup st<half, BN, BK> sW;
+    rt<half, BN, BK> w_reg;
+    rt<half, BK, BM_PER_WARP> x_reg;
+    rt<float, BN, BM_PER_WARP> d_reg;
+    zero(d_reg);
+
+    const int by = tgid.y;
+    const int bx = tgid.x;
+    const int col_block = bx * N_WARPS + (int)warp;
+
+    for (int kb = 0; kb < K / BK; kb++) {
+        dequant_into_shared<FMT, BN, BK>(sW, Wq, N, K, by, kb, G::GROUP_THREADS, tid);
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        load(w_reg, sW, lane);
+        load(x_reg, gl_x, {0, 0, kb, col_block}, lane);
+        mma_AB(d_reg, w_reg, x_reg, d_reg);
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    }
+
+    // Row-layout lane mapping (matches meta::store's row-register-tile path);
+    // element pair (r, c0), (r, c0+1) of D lands at Dt[c0*N + r], Dt[(c0+1)*N + r].
+    const short qid = (short)(lane / 4);
+    const short simd_y = (qid & 4) + ((short)lane / 2) % 4;
+    const short simd_x = (qid & 2) * 2 + ((short)lane % 2) * 2;
+    const int n0 = by * BN;
+    const int m0 = col_block * BM_PER_WARP;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < BN / 8; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < BM_PER_WARP / 8; j++) {
+            const int r  = n0 + simd_y + i * 8;
+            const int c0 = m0 + simd_x + j * 8;
+            Dt[(ulong)c0 * (ulong)N + (ulong)r] =
+                (half)d_reg.tiles[i][j].data.thread_elements()[0];
+            Dt[(ulong)(c0 + 1) * (ulong)N + (ulong)r] =
+                (half)d_reg.tiles[i][j].data.thread_elements()[1];
+        }
+    }
+}
+
+#define instantiate_qgemm_wide_t(name, FMT, NW, BMPW, BN)                     \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemm_wide_t<FMT, NW, BMPW, BN>(                                      \
+     device half* Dt [[buffer(0)]], device uchar* Wq [[buffer(1)]], device half* X [[buffer(2)]], \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     const constant int &M [[buffer(5)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]],                            \
+     uint tid [[thread_index_in_threadgroup]],                               \
+     uint warp [[simdgroup_index_in_threadgroup]],                           \
+     uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemm_wide_t("qgemm_wide_t_q8_0", q8_0, 2, 32, 64);
+// Thread-cap constraint: an instantiation whose thread count exceeds the
+// built PSO's maxTotalThreadsPerThreadgroup is undefined behavior on this
+// driver (manifests as a never-signalling MPSEvent, not a validation
+// error). Check the cap at PSO build before adding a wider twin such as
+// BM=128 / 4 warps (see optimization_status 2026-08-14 v12).
+
 // ---- qgemm_frag: dequant-direct-to-fragment (Marlin zero-shuffle). Single simdgroup per
 // (32x32) output tile; the weight block is dequantized straight into the register fragment
 // (dequant_into_register) — no threadgroup tile, no barrier. -----

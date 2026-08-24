@@ -8,6 +8,7 @@ Weight loading, ``execute_model`` and the KV plumbing are inherited.
 """
 
 import gc
+import os
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, cast
 
@@ -31,6 +32,10 @@ logger = init_logger(__name__)
 class MetalWorker(Worker):
     def init_device(self):
         assert self.device_config.device_type == "mps"
+
+        from vllm.v1.worker.metal_syncprof import install as install_syncprof
+
+        install_syncprof()
 
         self.device = torch.device("mps")
         current_platform.check_if_supports_dtype(self.model_config.dtype)
@@ -107,6 +112,164 @@ class MetalWorker(Worker):
             if gc_was_enabled:
                 gc.enable()
         gc.freeze()
+        if not load_dummy_weights:
+            self._make_weights_resident()
+            self._pin_weights_resident()
+            if os.environ.get("VLLM_QC_STEP_TAPE", "0") != "0":
+                from vllm.models.deepseek_v4.metal_tape import (
+                    maybe_install_tape,
+                )
+
+                maybe_install_tape(self.model_runner.model)
+
+    @staticmethod
+    def _compressor_bytes() -> int:
+        """Physical bytes currently held by the macOS VM compressor.
+
+        MTLBuffer pages that get compressed are attributed to the GPU
+        subsystem, not this process, so per-process accounting misses them;
+        vm_stat's global counter is the only reliable residency signal.
+        """
+        import re
+        import subprocess
+
+        try:
+            out = subprocess.run(
+                ["vm_stat"], capture_output=True, text=True, timeout=10
+            ).stdout
+            m = re.search(r"page size of (\d+)", out)
+            page = int(m.group(1)) if m else 16384
+            m = re.search(r"Pages occupied by compressor:\s+(\d+)", out)
+            return int(m.group(1)) * page if m else 0
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return 0
+
+    def _make_weights_resident(self) -> None:
+        """Touch every MPS weight buffer once on the GPU.
+
+        Load-time page-cache pressure can push freshly written weight buffers
+        into the VM compressor; serving then decompresses on every touch at
+        a tiny fraction of memory bandwidth. One GPU-side read promotes
+        everything resident while nothing competes for memory — paid once at
+        boot instead of every token.
+
+        A single pass is not always enough: on a dirty box the sweep itself
+        can rotate earlier tensors back out while repairing later ones.
+        Verify against the global compressor occupancy and repeat until it
+        drains or stops improving.
+        """
+        threshold = 4 << 30
+        occupancy = 0
+        for sweep_pass in range(3):
+            self._sweep_pass_once()
+            previous = occupancy
+            occupancy = self._compressor_bytes()
+            if occupancy < threshold:
+                return
+            logger.warning(
+                "VM compressor still holds %.2f GiB after resident sweep "
+                "pass %d; weights are not fully resident",
+                occupancy / 2**30,
+                sweep_pass + 1,
+            )
+            if sweep_pass > 0 and previous and occupancy > previous * 0.9:
+                logger.warning(
+                    "Resident sweep is not converging (%.2f -> %.2f GiB); "
+                    "total memory demand likely exceeds RAM. Serving will "
+                    "thrash the compressor.",
+                    previous / 2**30,
+                    occupancy / 2**30,
+                )
+                return
+
+    def _weight_tensors(self) -> list:
+        import itertools
+
+        modules = [self.model_runner.model]
+        speculator = getattr(self.model_runner, "speculator", None)
+        spec_model = getattr(speculator, "model", None)
+        if spec_model is not None:
+            modules.append(spec_model)
+        return [
+            t
+            for module in modules
+            for t in itertools.chain(module.parameters(), module.buffers())
+            if not torch.nn.parameter.is_lazy(t) and t.device.type == "mps"
+        ]
+
+    def _pin_weights_resident(self) -> None:
+        """Pin weight allocations into an MTLResidencySet (macOS 15+).
+
+        The resident sweep only decompresses; the pages stay pageable and
+        macOS re-compresses them in tens-of-GiB waves during serving while
+        the GPU stalls faulting them back. Pinning makes the weight heaps
+        permanently GPU-resident so the compressor never takes them.
+        ``VLLM_METAL_RESIDENCY=0`` disables.
+        """
+        if os.environ.get("VLLM_METAL_RESIDENCY", "1") != "1":
+            logger.info("Metal residency pinning disabled by env")
+            return
+        try:
+            from vllm import _quixicore_C as qc
+        except ImportError as e:
+            logger.warning("Metal residency pinning unavailable: %s", e)
+            return
+        if not hasattr(qc, "residency_pin"):
+            logger.warning(
+                "Metal residency pinning unavailable: extension predates "
+                "residency_pin"
+            )
+            return
+        added, nbytes = qc.residency_pin(self._weight_tensors())
+        if added:
+            logger.info(
+                "Pinned %d Metal allocations (%.2f GiB) into the weight "
+                "residency set",
+                added,
+                nbytes / 2**30,
+            )
+        else:
+            logger.warning(
+                "Metal residency pinning added no allocations "
+                "(pre-macOS 15, or no MPS weights?)"
+            )
+
+    def _sweep_pass_once(self) -> None:
+        import time
+
+        start = time.perf_counter()
+        total_bytes = 0
+        # Torch's MPS reduction dispatch SIGSEGVs (nil compute pipeline state
+        # in reduction_dispatch_mps) on GiB-scale uint8 sums when
+        # PYTORCH_MPS_LOG_PROFILE_INFO is enabled, so sweep in slices small
+        # enough for every dispatch path. Each sum also materializes a
+        # same-size transient copy; the periodic synchronize keeps those from
+        # accumulating in one command stream.
+        chunk_elems = 128 << 20
+        sync_window = 2 << 30
+        unsynced_bytes = 0
+        for t in self._weight_tensors():
+            nbytes = t.numel() * t.element_size()
+            total_bytes += nbytes
+            try:
+                flat = t.detach().view(-1).view(torch.uint8)
+            except RuntimeError:
+                flat = None
+            if flat is None:
+                t.detach().sum()
+            else:
+                for off in range(0, flat.numel(), chunk_elems):
+                    flat[off : off + chunk_elems].sum()
+            unsynced_bytes += nbytes
+            if unsynced_bytes >= sync_window:
+                torch.mps.synchronize()
+                unsynced_bytes = 0
+        torch.mps.synchronize()
+        logger.info(
+            "Resident sweep touched %.2f GiB of MPS weights in %.2f s",
+            total_bytes / 2**30,
+            time.perf_counter() - start,
+        )
 
     def compile_or_warm_up_model(self):
         # kernel_warmup() eagerly imports CUDA-only JIT kernels (deep_gemm,
@@ -120,10 +283,19 @@ class MetalWorker(Worker):
         gpu_worker.kernel_warmup = lambda worker: None
         gpu_worker.warmup_kernels = lambda *args, **kwargs: None
         try:
-            return super().compile_or_warm_up_model()
+            result = super().compile_or_warm_up_model()
         finally:
             gpu_worker.kernel_warmup = original
             gpu_worker.warmup_kernels = original_v2
+        # Warmup and KV-cache allocation run after the resident sweep and can
+        # push weights back into the VM compressor on a tight box; re-verify
+        # so serving never starts on a half-compressed model.
+        if self._compressor_bytes() > (4 << 30):
+            logger.warning(
+                "VM compressor grew during warmup; re-running resident sweep"
+            )
+            self._make_weights_resident()
+        return result
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

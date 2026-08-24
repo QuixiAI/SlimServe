@@ -29,10 +29,26 @@ def save_partial_states(
     if current_platform.is_metal():
         from vllm.quixicore.ops import quixicore_ops
 
+        # kv/score are the two halves of the fused kv_score GEMM output;
+        # the host op binds the row-strided views directly (bit-identical
+        # values, no per-call .contiguous() copies). fp16 halves pass
+        # straight through — the kernel rounds to bf16 in-register, a
+        # single RNE rounding bit-identical to an eager
+        # .float()+.to(bfloat16) chain. Other dtypes convert here.
+        kv_v = kv[:num_actual]
+        score_v = score[:num_actual]
+        if kv_v.dtype not in (torch.bfloat16, torch.float16):
+            kv_v = kv_v.to(torch.bfloat16)
+        if score_v.dtype != kv_v.dtype:
+            score_v = score_v.to(kv_v.dtype)
+        if ape.dtype != torch.bfloat16 or not ape.is_contiguous():
+            # One-time conversions only: the compressor passes a memoized
+            # bf16 ape on Metal.
+            ape = ape.to(torch.bfloat16).contiguous()
         quixicore_ops.deepseek_v4_save_partial_states(
-            kv[:num_actual].to(torch.bfloat16).contiguous(),
-            score[:num_actual].to(torch.bfloat16).contiguous(),
-            ape.to(torch.bfloat16).contiguous(),
+            kv_v,
+            score_v,
+            ape,
             positions,
             state_cache,
             slot_mapping,

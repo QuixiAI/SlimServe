@@ -38,6 +38,231 @@ def _use_software_e4m3_store(tensor: torch.Tensor) -> bool:
     return major * 10 + minor < 89
 
 
+# Layer-invariant marshalled tensors for the fused Metal compressor kernel
+# (split bf16 cos/sin halves, fp32 norm weight), keyed by source data_ptr so
+# each is converted once per process instead of once per layer call.
+_METAL_COMPRESS_CONSTS: dict[tuple, tuple] = {}
+
+
+def _metal_indexer_compress_insert(
+    state_cache: torch.Tensor,
+    num_actual: int,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    state_width: int,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_metadata: Any,
+    compress_ratio: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+) -> bool:
+    """Single-dispatch route for the head=128 ratio-4 overlap compressor
+    tail (gather + softmax + RMS + RoPE + quant + insert). Returns False
+    when shapes fall outside the kernel so the eager tail runs instead."""
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not (
+        compress_ratio == 4
+        and state_width == 256
+        and state_cache.dtype == torch.float32
+        and state_cache.shape[-1] == 512
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.shape[-1] == 132
+        and block_table.dtype == torch.int32
+        and cos_sin_cache.dim() == 2
+        and cos_sin_cache.shape[1] == 64
+    ):
+        return False
+    if not (
+        quixicore_ops.is_available()
+        and quixicore_ops.has("dsv4_indexer_compress_insert")
+    ):
+        return False
+    key = (cos_sin_cache.data_ptr(), rms_norm_weight.data_ptr())
+    consts = _METAL_COMPRESS_CONSTS.get(key)
+    if consts is None:
+        cs = cos_sin_cache.to(torch.bfloat16)
+        consts = (
+            cs[:, :32].contiguous(),
+            cs[:, 32:].contiguous(),
+            rms_norm_weight.float().contiguous(),
+        )
+        _METAL_COMPRESS_CONSTS[key] = consts
+    cos, sin, w32 = consts
+    # The host wants int32 positions/t2r and int64 slots; the narrowed index
+    # tensors are forward-level (layer-invariant), so convert once per step
+    # instead of per layer call (index dtype conversion — bit-exact).
+    memo_store = None
+    memo_key = (
+        "idx_insert",
+        compress_ratio,
+        num_actual,
+        positions.data_ptr(),
+        slot_mapping.data_ptr(),
+        id(k_cache_metadata),
+    )
+    try:
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context()
+        memo_store = ctx.__dict__.setdefault("_qc_metal_compress_memo", {})
+    except (ImportError, AssertionError, AttributeError):
+        pass
+    memo = memo_store.get(memo_key) if memo_store is not None else None
+    if memo is None:
+        memo = (
+            positions[:num_actual].to(torch.int32).contiguous(),
+            slot_mapping[:num_actual].to(torch.int64).contiguous(),
+            token_to_req_indices[:num_actual].to(torch.int32).contiguous(),
+            k_cache_metadata.slot_mapping[:num_actual]
+            .to(torch.int64)
+            .contiguous(),
+        )
+        if memo_store is not None:
+            memo_store[memo_key] = memo
+    idx_pos32, idx_sslots64, idx_t2r32, idx_kvslots64 = memo
+    quixicore_ops.dsv4_indexer_compress_insert(
+        state_cache,
+        idx_pos32,
+        idx_sslots64,
+        idx_t2r32,
+        block_table,
+        idx_kvslots64,
+        w32,
+        cos,
+        sin,
+        kv_cache,
+        block_size,
+        state_width,
+        compress_ratio,
+        rms_norm_eps,
+    )
+    return True
+
+
+def _metal_compress_front_512(
+    state_cache: torch.Tensor,
+    num_actual: int,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    state_width: int,
+    cos_sin_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    k_cache_metadata: Any,
+    compress_ratio: int,
+    overlap: bool,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+) -> bool:
+    """Single-dispatch front for the head=512 compressors (gather + softmax
+    + RMS); the existing native deepseek_v4_kv_insert consumes the bf16
+    rows. Covers the ratio-4 overlap layers and the ratio-128 no-overlap
+    layers (only boundary rows need compressing; the eager tail computes
+    the full gather chain for every row). Returns False outside the
+    kernels' shapes so the eager tail runs instead."""
+    from vllm.quixicore.ops import quixicore_ops
+
+    ratio4 = (
+        compress_ratio == 4
+        and overlap
+        and state_width == 1024
+        and state_cache.shape[-1] == 2048
+    )
+    ratio128 = (
+        compress_ratio == 128
+        and not overlap
+        and state_width == 512
+        and state_cache.shape[-1] == 1024
+    )
+    if not (
+        (ratio4 or ratio128)
+        and state_cache.dtype == torch.float32
+        and kv_cache.dtype == torch.uint8
+        and block_table.dtype == torch.int32
+    ):
+        return False
+    if not (
+        quixicore_ops.is_available() and quixicore_ops.has("dsv4_compress_front")
+    ):
+        return False
+
+    key = ("front512_w", rms_norm_weight.data_ptr())
+    consts = _METAL_COMPRESS_CONSTS.get(key)
+    if consts is None:
+        consts = (rms_norm_weight.float().contiguous(),)
+        _METAL_COMPRESS_CONSTS[key] = consts
+    (w32,) = consts
+
+    # output_slots/selected_pos are forward-level (layer-invariant);
+    # memoize them like the eager tail's index products.
+    memo_store = None
+    memo_key = (
+        "front512",
+        compress_ratio,
+        num_actual,
+        positions.data_ptr(),
+        slot_mapping.data_ptr(),
+        id(k_cache_metadata),
+    )
+    try:
+        from vllm.forward_context import get_forward_context
+
+        ctx = get_forward_context()
+        memo_store = ctx.__dict__.setdefault("_qc_metal_compress_memo", {})
+    except (ImportError, AssertionError, AttributeError):
+        pass
+    memo = memo_store.get(memo_key) if memo_store is not None else None
+    if memo is None:
+        positions_a = positions[:num_actual]
+        valid = (slot_mapping[:num_actual] >= 0) & (
+            torch.remainder(positions_a + 1, compress_ratio) == 0
+        )
+        output_slots = torch.where(
+            valid, k_cache_metadata.slot_mapping[:num_actual], -1
+        )
+        # The compress_front/kv_insert hosts want int32 positions / int64
+        # slots; convert once in this forward-level memo instead of per
+        # layer call (index dtype conversion — bit-exact).
+        memo = (
+            positions_a.to(torch.int32).contiguous(),
+            output_slots.to(torch.int64).contiguous(),
+            slot_mapping[:num_actual].to(torch.int64).contiguous(),
+        )
+        if memo_store is not None:
+            memo_store[memo_key] = memo
+    selected_pos, output_slots, state_slots64 = memo
+
+    normed = quixicore_ops.dsv4_compress_front(
+        state_cache,
+        selected_pos,
+        state_slots64,
+        token_to_req_indices[:num_actual],
+        block_table,
+        w32,
+        num_actual,
+        block_size,
+        state_width,
+        compress_ratio,
+        rms_norm_eps,
+    )
+    quixicore_ops.deepseek_v4_kv_insert(
+        normed,
+        kv_cache,
+        output_slots,
+        selected_pos,
+        cos_sin_cache,
+        kv_cache.shape[1],
+    )
+    return True
+
+
 def compress_norm_rope_store_triton(
     state_cache: torch.Tensor,
     num_actual: int,
@@ -72,54 +297,157 @@ def compress_norm_rope_store_triton(
     if current_platform.is_metal():
         if num_actual == 0:
             return
-        if head_dim != 512 or use_fp4_cache:
+        if head_dim not in (512, 128) or use_fp4_cache:
             raise NotImplementedError(
-                "Metal's DeepSeek compressor currently supports the 512-wide "
-                "attention cache; the indexer bypasses compression while all "
-                "candidates fit inside index_topk."
+                "Metal's DeepSeek compressor supports the 512-wide attention "
+                "cache and the 128-wide FP8 indexer cache."
             )
         from vllm.quixicore.ops import quixicore_ops
 
-        positions = positions[:num_actual]
-        valid = (slot_mapping[:num_actual] >= 0) & (
-            torch.remainder(positions + 1, compress_ratio) == 0
+        if head_dim == 128 and _metal_indexer_compress_insert(
+            state_cache=state_cache,
+            num_actual=num_actual,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            block_size=block_size,
+            state_width=state_width,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            k_cache_metadata=k_cache_metadata,
+            compress_ratio=compress_ratio,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+        ):
+            return
+        if head_dim == 512 and _metal_compress_front_512(
+            state_cache=state_cache,
+            num_actual=num_actual,
+            token_to_req_indices=token_to_req_indices,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            block_table=block_table,
+            block_size=block_size,
+            state_width=state_width,
+            cos_sin_cache=cos_sin_cache,
+            kv_cache=kv_cache,
+            k_cache_metadata=k_cache_metadata,
+            compress_ratio=compress_ratio,
+            overlap=overlap,
+            rms_norm_weight=rms_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+        ):
+            return
+
+        # The index arithmetic below depends only on forward-level metadata
+        # (positions/slot_mapping/block_table/k_cache_metadata), not on the
+        # layer, but this op is called once per layer — memoize the products
+        # on the forward context and let every layer with matching metadata
+        # reuse them.
+        memo_store = None
+        memo_key = (
+            head_dim,
+            compress_ratio,
+            overlap,
+            block_size,
+            state_width,
+            num_actual,
+            positions.data_ptr(),
+            slot_mapping.data_ptr(),
+            block_table.data_ptr(),
+            token_to_req_indices.data_ptr(),
+            id(k_cache_metadata),
         )
-        selected_pos = positions
-        req = token_to_req_indices[:num_actual].to(torch.long)
-        history = compress_ratio * (2 if overlap else 1)
-        history_offsets = torch.arange(
-            history, device=positions.device, dtype=positions.dtype
-        )
-        source_pos = (
-            selected_pos.unsqueeze(1) - history + 1 + history_offsets.unsqueeze(0)
-        )
-        source_valid = source_pos >= 0
-        safe_pos = source_pos.clamp_min(0)
-        req_block_table = block_table.index_select(0, req)
-        source_block_col = torch.div(safe_pos, block_size, rounding_mode="floor").clamp(
-            max=req_block_table.shape[1] - 1
-        )
-        source_blocks = req_block_table.gather(1, source_block_col.to(torch.long))
-        source_offsets = torch.remainder(safe_pos, block_size)
-        rows = state_cache[source_blocks.to(torch.long), source_offsets.to(torch.long)]
-        head_offsets = (history_offsets >= compress_ratio).to(torch.long) * head_dim
-        dims = torch.arange(head_dim, device=positions.device, dtype=torch.long)
-        gather_dims = head_offsets.view(1, history, 1) + dims.view(1, 1, -1)
-        gather_dims = gather_dims.expand(rows.shape[0], -1, -1)
+        try:
+            from vllm.forward_context import get_forward_context
+
+            ctx = get_forward_context()
+            memo_store = ctx.__dict__.setdefault("_qc_metal_compress_memo", {})
+        except (ImportError, AssertionError, AttributeError):
+            pass
+        memo = memo_store.get(memo_key) if memo_store is not None else None
+        if memo is None:
+            positions_a = positions[:num_actual]
+            valid = (slot_mapping[:num_actual] >= 0) & (
+                torch.remainder(positions_a + 1, compress_ratio) == 0
+            )
+            selected_pos = positions_a
+            req = token_to_req_indices[:num_actual].to(torch.long)
+            history = compress_ratio * (2 if overlap else 1)
+            history_offsets = torch.arange(
+                history, device=positions_a.device, dtype=positions_a.dtype
+            )
+            source_pos = (
+                selected_pos.unsqueeze(1) - history + 1 + history_offsets.unsqueeze(0)
+            )
+            source_valid = source_pos >= 0
+            safe_pos = source_pos.clamp_min(0)
+            req_block_table = block_table.index_select(0, req)
+            source_block_col = torch.div(
+                safe_pos, block_size, rounding_mode="floor"
+            ).clamp(max=req_block_table.shape[1] - 1)
+            source_blocks = req_block_table.gather(
+                1, source_block_col.to(torch.long)
+            ).to(torch.long)
+            source_offsets = torch.remainder(safe_pos, block_size).to(torch.long)
+            head_offsets = (history_offsets >= compress_ratio).to(torch.long) * head_dim
+            dims = torch.arange(head_dim, device=positions_a.device, dtype=torch.long)
+            gather_dims = head_offsets.view(1, history, 1) + dims.view(1, 1, -1)
+            gather_dims = gather_dims.expand(num_actual, -1, -1)
+            score_mask = ~source_valid.unsqueeze(-1)
+            output_slots = torch.where(
+                valid,
+                k_cache_metadata.slot_mapping[:num_actual],
+                -1,
+            )
+            anchor_pos = (
+                torch.div(selected_pos, compress_ratio, rounding_mode="floor")
+                * compress_ratio
+            )
+            memo = (
+                selected_pos,
+                source_blocks,
+                source_offsets,
+                gather_dims,
+                score_mask,
+                output_slots,
+                anchor_pos,
+            )
+            if memo_store is not None:
+                memo_store[memo_key] = memo
+        (
+            selected_pos,
+            source_blocks,
+            source_offsets,
+            gather_dims,
+            score_mask,
+            output_slots,
+            anchor_pos,
+        ) = memo
+        rows = state_cache[source_blocks, source_offsets]
         values = rows.gather(2, gather_dims)
         scores = rows.gather(2, gather_dims + state_width)
-        scores = scores.masked_fill(~source_valid.unsqueeze(-1), -float("inf"))
+        scores = scores.masked_fill(score_mask, -float("inf"))
         compressed = (values * torch.softmax(scores, dim=1)).sum(dim=1)
         compressed_fp32 = compressed.float()
         rrms = torch.rsqrt(
             compressed_fp32.square().mean(dim=-1, keepdim=True) + rms_norm_eps
         )
         normed = (compressed_fp32 * rrms * rms_norm_weight.float()).to(torch.bfloat16)
-        output_slots = torch.where(
-            valid,
-            k_cache_metadata.slot_mapping[:num_actual],
-            -1,
-        )
+        if head_dim == 128:
+            # Indexer K cache. RoPE anchors at the compressed position
+            # (pos // ratio) * ratio, matching the CUDA indexer kernel; the
+            # Metal kernel takes the anchor pre-floored (memoized above).
+            quixicore_ops.deepseek_v4_indexer_kv_insert(
+                normed,
+                kv_cache,
+                output_slots,
+                anchor_pos,
+                cos_sin_cache,
+                kv_cache.shape[1],
+            )
+            return
         quixicore_ops.deepseek_v4_kv_insert(
             normed,
             kv_cache,

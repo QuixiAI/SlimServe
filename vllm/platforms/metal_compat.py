@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """What has to be replaced to run the V1 GPU path on PyTorch-MPS.
 
-Three unrelated problems, all of which surface as something other than a clean
+Four unrelated problems, all of which surface as something other than a clean
 failure, which is why they are collected and documented here rather than
 patched at their call sites:
 
@@ -13,6 +13,16 @@ patched at their call sites:
    the CPU one needs a C++ toolchain we do not require at runtime.
 3. A non-blocking host-to-device copy is not ordered against dependent MPS
    work. This one is the dangerous one -- see below.
+4. Shared CUDA/ROCm serving code gates multi-stream and graph-registration
+   work on ``torch.cuda.is_current_stream_capturing()``. On an MPS-only build
+   that is a dummy stub that raises when called. Metal has no graph capture,
+   so the truthful answer is a constant ``False``.
+
+The async-output path must not hand output copies from the main MPS stream to
+a second stream.  A cold cross-stream wait could lose its completion signal
+on the first multi-chunk request.  ``gpu/async_utils.py`` therefore records
+the tiny output copy and event on the producing stream on MPS; CUDA and ROCm
+retain their overlapping copy-stream path.
 
 Applied once, from the platform's check_and_update_config.
 """
@@ -73,6 +83,12 @@ def _patch_cpu_gpu_buffer_blocking() -> None:
     read a stale buffer and index out of bounds -- a wrong-answer or crash bug
     that appears only under load. Pinned memory is unavailable here anyway, so
     making these copies synchronous costs nothing real.
+
+    (This does not contradict the deliberate ``non_blocking=True`` copies in
+    ``vllm/v1/worker/gpu/buffer_utils.py``: those are safe because torch MPS
+    stages pageable sources synchronously on the CPU either way -- the flag
+    only skips the stream drain -- while the hazard here is device-side reads
+    of a buffer the staging has not populated yet.)
     """
     from vllm.v1.utils import CpuGpuBuffer
 
@@ -86,8 +102,8 @@ def _patch_cpu_gpu_buffer_blocking() -> None:
             return self.cpu.copy_(self.gpu, non_blocking=False)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=False)
 
-    CpuGpuBuffer.copy_to_gpu = copy_to_gpu
-    CpuGpuBuffer.copy_to_cpu = copy_to_cpu
+    CpuGpuBuffer.copy_to_gpu = copy_to_gpu  # type: ignore[method-assign]
+    CpuGpuBuffer.copy_to_cpu = copy_to_cpu  # type: ignore[method-assign]
 
 
 def apply_compat_patches() -> None:
@@ -104,12 +120,18 @@ def apply_compat_patches() -> None:
 
     from vllm.v1.worker.block_table import BlockTable
 
-    BlockTable.compute_slot_mapping = _metal_compute_slot_mapping
+    BlockTable.compute_slot_mapping = (  # type: ignore[method-assign]
+        _metal_compute_slot_mapping
+    )
 
     _patch_cpu_gpu_buffer_blocking()
+
+    torch.cuda.is_current_stream_capturing = (  # type: ignore[method-assign]
+        lambda: False
+    )
 
     _APPLIED = True
     logger.info(
         "Applied Metal compat patches (dynamo off, torch slot mapping, "
-        "blocking host copies)"
+        "blocking host copies, stream-capture check stubbed False)"
     )

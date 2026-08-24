@@ -59,7 +59,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
-from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
+from vllm.v1.worker.gpu.async_utils import (
+    AsyncOutput,
+    AsyncPoolingOutput,
+    make_output_copy_stream,
+)
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
     get_kv_cache_spec,
@@ -119,6 +123,7 @@ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
@@ -156,7 +161,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
-        self.output_copy_stream = torch.Stream(self.device)
+        self.output_copy_stream = make_output_copy_stream(self.device)
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -862,8 +867,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
-        if self.sampler is not None:
-            self.sampler.apply_staged_writes()
+            # Sampler params only change when requests are added; the states'
+            # copy_to_uva is a blocking pageable H2D on MPS (full stream
+            # drain), so re-applying identical arrays every step serializes
+            # the async pipeline.
+            if self.sampler is not None:
+                self.sampler.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -988,6 +997,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.all_token_ids.gpu,
                 self.req_states.prefill_len.gpu,
                 self.req_states.num_computed_tokens.gpu,
+                num_tokens=num_tokens,
             )
 
         # Prepare positions and seq_lens.
@@ -997,6 +1007,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.num_computed_tokens.gpu,
             self.input_buffers.positions,
             self.input_buffers.seq_lens,
+            num_tokens=num_tokens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
@@ -1100,6 +1111,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
+            num_tokens=input_batch.num_tokens,
         )
         return block_tables, slot_mappings
 
@@ -1129,14 +1141,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         enabled = getattr(self, "_nan_watch_enabled", None)
         if enabled is None:
             enabled = os.getenv("VLLM_NAN_WATCH", "0").lower() in (
-                "1", "true", "on", "yes",
+                "1",
+                "true",
+                "on",
+                "yes",
             )
             self._nan_watch_enabled = enabled
             self._nan_watch_step = 0
             self._nan_watch_pending: tuple | None = None
             if enabled:
-                logger.warning("NAN_WATCH enabled: logits rows checked "
-                               "every step (diagnostic mode)")
+                logger.warning(
+                    "NAN_WATCH enabled: logits rows checked "
+                    "every step (diagnostic mode)"
+                )
         if not enabled or logits is None:
             return
         self._nan_watch_step += 1
@@ -1151,15 +1168,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ids = ids_host.tolist() if ids_host is not None else None
                     nan_ids = (
                         [ids[i] for i in idxs if i < len(ids)]
-                        if ids is not None else None
+                        if ids is not None
+                        else None
                     )
                     logger.error(
                         "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
                         "(reported at step %d) rows=%s nan_row_input_ids=%s "
                         "all_ids=%s",
-                        count, rows, step, self._nan_watch_step, idxs,
-                        nan_ids, ids[:16] if ids is not None else None)
+                        count,
+                        rows,
+                        step,
+                        self._nan_watch_step,
+                        idxs,
+                        nan_ids,
+                        ids[:16] if ids is not None else None,
+                    )
                     from vllm.model_executor.layers import nan_probe
+
                     layers = nan_probe.snapshot()
                     if layers is not None:
                         logger.error(
@@ -1168,14 +1193,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             "outputs (birth = min); slots 100+4L+p are "
                             "intra-layer for L in 0-2 (p: 0=attn-in, "
                             "1=attn-out, 2=moe-in, 3=moe-out)",
-                            [x for x in layers if x[0] >= 100]
-                            + layers[:8])
+                            [x for x in layers if x[0] >= 100] + layers[:8],
+                        )
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
             nan_mask = torch.isnan(logits).any(dim=-1)
-            host = torch.empty(
-                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True
-            )
+            host = torch.empty(nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True)
             host.copy_(nan_mask, non_blocking=True)
             ids_host = None
             if input_batch is not None:
@@ -1190,7 +1213,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             event = torch.cuda.Event()
             event.record()
             self._nan_watch_pending = (
-                host, event, self._nan_watch_step, logits.shape[0], ids_host)
+                host,
+                event,
+                self._nan_watch_step,
+                logits.shape[0],
+                ids_host,
+            )
 
     def sample(
         self,
@@ -1467,12 +1495,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    with _qc_phase("target_forward"):
+                        model_output = self.cudagraph_manager.run_pw_graph(
+                            self.model, model_inputs
+                        )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    with _qc_phase("target_forward"):
+                        model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1544,9 +1574,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        with _qc_phase("sample_and_reject"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1619,20 +1650,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-            )
+            with _qc_phase("drafter_propose"):
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:

@@ -308,6 +308,81 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _fused_indexer_q_rope_quant_metal(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    softmax_scale: float,
+    head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch mirror of _fused_indexer_q_rope_quant_kernel for Metal.
+
+    Numerics follow the Triton kernel (GPT-J interleaved RoPE on the LAST
+    rope_dim dims, fp32->bf16->fp32 roundtrip on the rotated half before the
+    absmax, q_scale = 2^ceil(log2(max(amax, 1e-4) / 448))), with one
+    Metal-only convention change: MPS has no fp8 arithmetic, so Q is returned
+    in the input dtype holding value / q_scale (the exact pre-rounding fp8
+    kernel input) instead of e4m3 bytes. q_scale is folded into the returned
+    weights exactly as on CUDA, so the downstream score math is unchanged.
+    The only Metal consumer is metal_sparse_attn_indexer, which dots this Q
+    against the LUT-decoded e4m3 K cache.
+    """
+    num_tokens, num_heads, head_dim = index_q.shape
+    assert positions.shape[0] == num_tokens
+    half_rot = cos_sin_cache.shape[-1] // 2
+    rot_dim = 2 * half_rot
+    nope_dim = head_dim - rot_dim
+
+    # Native single-dispatch path (mirrored numerics; replaces the eager
+    # decomposition below).
+    if (
+        num_heads % 8 == 0
+        and half_rot <= 32
+        and index_q.dtype in (torch.float16, torch.bfloat16)
+        and positions.dtype == torch.int64
+        and (
+            cos_sin_cache.dtype == torch.float32
+            or cos_sin_cache.dtype == index_q.dtype
+        )
+    ):
+        from vllm.quixicore.ops import quixicore_ops
+
+        if quixicore_ops.is_available() and quixicore_ops.has(
+            "dsv4_indexer_q_rope_quant"
+        ):
+            return quixicore_ops.dsv4_indexer_q_rope_quant(
+                index_q.contiguous(),
+                positions,
+                cos_sin_cache,
+                index_weights.float(),
+                softmax_scale,
+                head_scale,
+            )
+
+    cs = cos_sin_cache.index_select(0, positions.to(torch.long)).float()
+    cos = cs[:, :half_rot].view(num_tokens, 1, half_rot)
+    sin = cs[:, half_rot:].view(num_tokens, 1, half_rot)
+
+    q = index_q.float()
+    nope = q[..., :nope_dim]
+    rot = q[..., nope_dim:].reshape(num_tokens, num_heads, half_rot, 2)
+    x_even = rot[..., 0]
+    x_odd = rot[..., 1]
+    r_even = (x_even * cos - x_odd * sin).to(torch.bfloat16).float()
+    r_odd = (x_odd * cos + x_even * sin).to(torch.bfloat16).float()
+    roped = torch.stack((r_even, r_odd), dim=-1).reshape(
+        num_tokens, num_heads, rot_dim
+    )
+    full = torch.cat((nope, roped), dim=-1)
+
+    amax = full.abs().amax(dim=-1).clamp_min(1e-4)
+    q_scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    q_out = (full / q_scale.unsqueeze(-1)).to(index_q.dtype)
+    weights_out = index_weights.float() * q_scale * softmax_scale * head_scale
+    return q_out, weights_out
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -353,6 +428,17 @@ def fused_indexer_q_rope_quant(
     num_tokens = positions.shape[0]
     num_index_q_heads = index_q.shape[1]
     index_q_head_dim = index_q.shape[2]
+
+    if current_platform.is_metal():
+        assert not use_fp4, "MXFP4 indexer Q is not supported on Metal"
+        return _fused_indexer_q_rope_quant_metal(
+            positions,
+            index_q,
+            index_q_cos_sin_cache,
+            index_weights,
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+        )
 
     index_weights_out = torch.empty_like(index_weights, dtype=torch.float32)
 
