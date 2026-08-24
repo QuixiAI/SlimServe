@@ -1069,6 +1069,7 @@ def rejection_sample(
     synthetic_conditional_rates: torch.Tensor | None = None,
     use_fp64: bool = False,
     use_block_verification: bool = False,
+    all_greedy: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
@@ -1104,7 +1105,12 @@ def rejection_sample(
             )
         req_indices = idx_mapping.to(torch.int64)
         active_temperatures = temperature[req_indices]
-        if bool((active_temperatures == 0).all().cpu()):
+        # Callers that already know the batch's greedy status pass it via
+        # all_greedy; the device read below drains the MPS queue, so only
+        # legacy callers (all_greedy=None) should ever pay for it.
+        if all_greedy is None:
+            all_greedy = bool((active_temperatures == 0).all().cpu())
+        if all_greedy:
             target_ids = target_logits[:, :vocab_size].argmax(dim=-1).cpu().tolist()
             draft_ids = draft_sampled.cpu().tolist()
             cu_logits = cu_num_logits.cpu().tolist()

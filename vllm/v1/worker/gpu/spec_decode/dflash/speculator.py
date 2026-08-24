@@ -739,80 +739,114 @@ def prepare_dflash_inputs(
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
     if input_buffers.input_ids.device.type == "mps" and not _use_native_dflash_inputs():
-        query_locs = input_batch.query_start_loc_np[: num_reqs + 1].tolist()
-        req_indices = input_batch.idx_mapping_np.tolist()
-        sampled_counts = num_sampled.cpu().tolist()
-        rejected_counts = num_rejected.cpu().tolist()
+        # Tensorized: num_sampled/num_rejected are GPU-only verify outputs, so
+        # any loop control on them would drain the queue. Query rows are
+        # contiguous ([req * num_query_per_req, ...)), so dense [R, Q] grids
+        # write straight into the flat buffers with no scatter tricks.
+        from vllm.v1.worker.gpu.input_batch import mps_segment_ids
+
+        device = input_buffers.input_ids.device
+        num_target_tokens = input_batch.num_tokens
+        idx = input_batch.idx_mapping.to(torch.int64)
+        qsl = input_batch.query_start_loc[: num_reqs + 1].to(torch.int64)
         query_slot_mapping.fill_(PAD_SLOT_ID)
         context_slot_mapping.fill_(PAD_SLOT_ID)
+        bt_stride = block_table.shape[1]
+        block_table_flat = block_table.view(-1)
 
-        for req_idx, req_state_idx in enumerate(req_indices):
-            ctx_start = query_locs[req_idx]
-            ctx_end = query_locs[req_idx + 1]
-            valid_ctx_end = ctx_end - rejected_counts[req_idx]
-            bonus_token = (
-                last_sampled[req_state_idx]
-                if sampled_counts[req_idx] > 0
-                else next_prefill_tokens[req_state_idx]
+        # Context section, per target token.
+        seg = mps_segment_ids(qsl, num_reqs, num_target_tokens)
+        ctx_pos = input_batch.positions[:num_target_tokens].to(torch.int64)
+        context_positions[:num_target_tokens].copy_(ctx_pos.to(context_positions.dtype))
+        ctx_block = (ctx_pos // block_size).clamp(max=bt_stride - 1)
+        ctx_block_ids = block_table_flat.index_select(
+            0, seg * bt_stride + ctx_block
+        ).to(torch.int64)
+        context_slot_mapping[:num_target_tokens].copy_(
+            (ctx_block_ids * block_size + ctx_pos % block_size).to(
+                context_slot_mapping.dtype
             )
-            last_valid_pos = input_batch.positions[valid_ctx_end - 1]
-            query_base = req_idx * num_query_per_req
+        )
 
-            ctx_pos = input_batch.positions[ctx_start:ctx_end]
-            context_positions[ctx_start:ctx_end].copy_(ctx_pos)
-            ctx_block_indices = (ctx_pos // block_size).to(torch.int64)
-            ctx_block_ids = block_table[req_idx, ctx_block_indices].to(torch.int64)
-            context_slot_mapping[ctx_start:ctx_end] = (
-                ctx_block_ids * block_size + ctx_pos % block_size
+        # Per-request query grid.
+        valid_ctx_end = qsl[1:] - num_rejected.to(torch.int64)
+        last_valid_pos = input_batch.positions.index_select(0, valid_ctx_end - 1).to(
+            torch.int64
+        )
+        bonus_token = torch.where(
+            num_sampled.to(torch.int64) > 0,
+            last_sampled.reshape(-1).index_select(0, idx).to(torch.int64),
+            next_prefill_tokens.reshape(-1).index_select(0, idx).to(torch.int64),
+        )
+        offsets = torch.arange(num_query_per_req, dtype=torch.int64, device=device)
+        query_pos = last_valid_pos.unsqueeze(1) + 1 + offsets
+        num_query_tokens = num_reqs * num_query_per_req
+        input_ids_grid = torch.where(
+            offsets == 0,
+            bonus_token.unsqueeze(1),
+            torch.full_like(query_pos, parallel_drafting_token_id),
+        )
+        input_buffers.input_ids[:num_query_tokens].copy_(
+            input_ids_grid.reshape(-1).to(input_buffers.input_ids.dtype)
+        )
+        input_buffers.positions[:num_query_tokens].copy_(
+            query_pos.clamp(max=max_model_len - 1)
+            .reshape(-1)
+            .to(input_buffers.positions.dtype)
+        )
+        rows = (
+            torch.arange(num_reqs, dtype=torch.int64, device=device).unsqueeze(1)
+            * bt_stride
+        )
+        query_block = (query_pos // block_size).clamp(max=bt_stride - 1)
+        query_block_ids = block_table_flat.index_select(
+            0, (rows + query_block).reshape(-1)
+        ).to(torch.int64)
+        query_slot_mapping[:num_query_tokens].copy_(
+            (query_block_ids * block_size + query_pos.reshape(-1) % block_size).to(
+                query_slot_mapping.dtype
             )
+        )
 
-            query_offsets = torch.arange(
-                num_query_per_req,
-                dtype=input_buffers.positions.dtype,
-                device=input_buffers.positions.device,
-            )
-            query_pos = last_valid_pos + 1 + query_offsets
-            query_end = query_base + num_query_per_req
-            input_buffers.input_ids[query_base] = bonus_token
-            if num_query_per_req > 1:
-                input_buffers.input_ids[query_base + 1 : query_end].fill_(
-                    parallel_drafting_token_id
-                )
-            input_buffers.positions[query_base:query_end].copy_(
-                query_pos.clamp_max(max_model_len - 1)
-            )
-            query_block_indices = (query_pos // block_size).to(torch.int64)
-            query_block_ids = block_table[req_idx, query_block_indices].to(torch.int64)
-            query_slot_mapping[query_base:query_end] = (
-                query_block_ids * block_size + query_pos % block_size
-            )
-            input_buffers.query_start_loc[req_idx] = query_base
-            input_buffers.seq_lens[req_idx] = last_valid_pos + 1 + num_query_per_req
-
-            sample_offset = 0 if sample_from_anchor else 1
-            sample_count = num_query_per_req - sample_offset
-            sample_start = req_idx * num_speculative_steps
-            sample_end = sample_start + sample_count
-            sample_indices[sample_start:sample_end] = torch.arange(
-                query_base + sample_offset,
-                query_end,
-                dtype=sample_indices.dtype,
-                device=sample_indices.device,
-            )
-            sampled_pos = query_pos[sample_offset:]
-            if sample_from_anchor:
-                sampled_pos = sampled_pos + 1
-            sample_pos[sample_start:sample_end].copy_(sampled_pos)
-            sample_idx_mapping[sample_start:sample_end].fill_(req_state_idx)
-
-        last_query_end = num_reqs * num_query_per_req
-        input_buffers.query_start_loc[num_reqs:].fill_(last_query_end)
+        query_starts = (
+            torch.arange(num_reqs + 1, dtype=torch.int64, device=device)
+            * num_query_per_req
+        )
+        input_buffers.query_start_loc[: num_reqs + 1].copy_(
+            query_starts.to(input_buffers.query_start_loc.dtype)
+        )
+        input_buffers.query_start_loc[num_reqs:].fill_(num_query_tokens)
+        input_buffers.seq_lens[:num_reqs].copy_(
+            (last_valid_pos + 1 + num_query_per_req).to(input_buffers.seq_lens.dtype)
+        )
         input_buffers.seq_lens[num_reqs:].zero_()
-        pad_sample_start = num_reqs * num_speculative_steps
-        sample_indices[pad_sample_start:].zero_()
-        sample_pos[pad_sample_start:].zero_()
-        sample_idx_mapping[pad_sample_start:].fill_(-1)
-        query_slot_mapping[last_query_end:].fill_(PAD_SLOT_ID)
+
+        # Sample bookkeeping. Both layouts yield exactly
+        # num_speculative_steps samples per request.
+        sample_offset = 0 if sample_from_anchor else 1
+        assert num_query_per_req - sample_offset == num_speculative_steps
+        num_samples = num_reqs * num_speculative_steps
+        sample_idx_grid = (query_starts[:num_reqs] + sample_offset).unsqueeze(
+            1
+        ) + offsets[:num_speculative_steps]
+        sample_indices[:num_samples].copy_(
+            sample_idx_grid.reshape(-1).to(sample_indices.dtype)
+        )
+        sampled_pos = query_pos[:, sample_offset:]
+        if sample_from_anchor:
+            sampled_pos = sampled_pos + 1
+        sample_pos[:num_samples].copy_(sampled_pos.reshape(-1).to(sample_pos.dtype))
+        sample_idx_mapping[:num_samples].copy_(
+            idx.unsqueeze(1)
+            .expand(num_reqs, num_speculative_steps)
+            .reshape(-1)
+            .to(sample_idx_mapping.dtype)
+        )
+
+        sample_indices[num_samples:].zero_()
+        sample_pos[num_samples:].zero_()
+        sample_idx_mapping[num_samples:].fill_(-1)
+        query_slot_mapping[num_query_tokens:].fill_(PAD_SLOT_ID)
         return
     if _use_native_dflash_inputs():
         from vllm.quixicore import quixicore_ops

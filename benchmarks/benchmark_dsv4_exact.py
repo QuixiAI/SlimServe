@@ -36,7 +36,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--url", default="http://127.0.0.1:8000/v1/completions")
     parser.add_argument(
         "--metrics-url",
-        help="Prometheus endpoint; defaults to /metrics on the completion host",
+        help="Prometheus endpoint; defaults to /metrics on the completion host. "
+        "Pass 'none' for servers without metrics; spec-decode counters are "
+        "then reported as zero and the draft-token gate is skipped",
     )
 
     def _concurrency(value: str) -> int:
@@ -81,6 +83,13 @@ def parse_args() -> argparse.Namespace:
         help="Prime each prompt before timing; set to 0 to measure cold serving",
     )
     parser.add_argument("--timeout", type=float, default=14400.0)
+    parser.add_argument(
+        "--dump-completions",
+        default=None,
+        help="Directory to write each completion's raw text; used to compare "
+        "outputs token-for-token across deliberate numeric changes where the "
+        "sha alone cannot say how close a mismatch is.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +101,8 @@ SPEC_METRICS = {
 
 
 def metric_counters(url: str, served_model_name: str) -> dict[str, float]:
+    if url == "none":
+        return dict.fromkeys(SPEC_METRICS, 0.0)
     with urllib.request.urlopen(url, timeout=30) as response:
         body = response.read().decode("utf-8")
     counters = dict.fromkeys(SPEC_METRICS, 0.0)
@@ -244,8 +255,11 @@ def main() -> None:
     completion_counts: list[int] = []
     latencies: list[float] = []
     response_sha256: list[str] = []
+    dump_dir = Path(args.dump_completions) if args.dump_completions else None
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
     chars_per_token: list[float] = []
-    for result in results:
+    for index, result in enumerate(results):
         response = result["response"]
         assert isinstance(response, dict)
         usage = response.get("usage")
@@ -267,6 +281,8 @@ def main() -> None:
         chars_per_token.append(
             len(choice["text"]) / completion_tokens if completion_tokens else 0.0
         )
+        if dump_dir is not None:
+            (dump_dir / f"completion_{index}.txt").write_text(choice["text"])
 
     summary = {
         "model": str(Path(args.model).resolve()),
@@ -295,7 +311,11 @@ def main() -> None:
     print(json.dumps(summary, indent=2, sort_keys=True))
     if not summary["exact"]:
         raise SystemExit("server did not honor the exact benchmark token counts")
-    if not args.allow_no_spec and summary["spec_decode_draft_tokens"] <= 0:
+    if (
+        args.metrics_url != "none"
+        and not args.allow_no_spec
+        and summary["spec_decode_draft_tokens"] <= 0
+    ):
         raise SystemExit("server produced no speculative draft tokens")
     # A degenerate server (NaN logits -> special-token loop) still returns the
     # exact token counts, but the tokens decode to almost no visible text.

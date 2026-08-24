@@ -2984,8 +2984,14 @@ void launch_mla_q_norm_rope(E& e, typename E::in_t q, typename E::in_t cos,
                             typename E::in_t sin, typename E::in_t positions,
                             typename E::in_t norm_weight, typename E::out_t out,
                             int M, int num_heads, int nope_dim, int rope_dim,
-                            int norm_mode, float eps, int head_dim) {
-  e.pipeline(mla_q_norm_rope_kernel_name(head_dim));
+                            int norm_mode, float eps, int head_dim,
+                            bool half_input = false) {
+  // half_input selects the fp16-load variant (rounds to bf16 in-register;
+  // only instantiated for head_dim 512 — the DSV4 serving shape). Contract:
+  // half_input requires head_dim == 512 or the pipeline lookup fails; the
+  // sole caller passes the literal 512 and TORCH_CHECK-gates q's last dim.
+  e.pipeline(half_input ? "mla_q_norm_rope_half_" + std::to_string(head_dim)
+                        : mla_q_norm_rope_kernel_name(head_dim));
   e.in(q, 0);
   e.in(cos, 1);
   e.in(sin, 2);
@@ -3070,14 +3076,131 @@ void launch_mla_kv_insert_fp8_packed(E& e, typename E::in_t kv,
   e.dispatch(num_tokens, 1, 1, 32, 1, 1);
 }
 
+// fp16-input twin: rounds each element half->bf16 in-register and reads kv as
+// a row-strided view (src_stride in elements), replacing the eager
+// cast+contiguous kernels of the fp16 serving path.
+template <class E>
+void launch_mla_kv_insert_fp8_packed_half(
+    E& e, typename E::in_t kv, typename E::in_t cos, typename E::in_t sin,
+    typename E::in_t positions, typename E::in_t slot_mapping,
+    typename E::out_t kv_cache, int num_tokens, int block_size,
+    int cache_block_stride, int src_stride) {
+  e.pipeline("mla_kv_insert_fp8_packed_half");
+  e.in(kv, 0);
+  e.in(cos, 1);
+  e.in(sin, 2);
+  e.in(positions, 3);
+  e.in(slot_mapping, 4);
+  e.out(kv_cache, 5);
+  e.bytes(block_size, 6);
+  e.bytes(cache_block_stride, 7);
+  e.bytes(src_stride, 8);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_dsv4_indexer_kv_insert(E& e, typename E::in_t kv,
+                                   typename E::in_t cos, typename E::in_t sin,
+                                   typename E::in_t positions,
+                                   typename E::in_t slot_mapping,
+                                   typename E::out_t kv_cache, int num_tokens,
+                                   int block_size, int cache_block_stride) {
+  e.pipeline("dsv4_indexer_kv_insert");
+  e.in(kv, 0);
+  e.in(cos, 1);
+  e.in(sin, 2);
+  e.in(positions, 3);
+  e.in(slot_mapping, 4);
+  e.out(kv_cache, 5);
+  e.bytes(block_size, 6);
+  e.bytes(cache_block_stride, 7);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// Contract: compress_ratio == 4 — host-checked. The kernel gathers
+// history = 2*compress_ratio rows into HISTORY_MAX (8) stack arrays; a
+// larger ratio would write past them. The cr=128 no-overlap layers use
+// dsv4_compress_front_c128, not this kernel.
+template <class E>
+void launch_dsv4_indexer_compress_insert(
+    E& e, typename E::in_t state_cache, typename E::in_t cos,
+    typename E::in_t sin, typename E::in_t positions,
+    typename E::in_t state_slots, typename E::in_t token_to_req,
+    typename E::in_t block_table, typename E::in_t rms_w,
+    typename E::in_t kv_slots, typename E::out_t kv_cache, int num_tokens,
+    int state_block_size, int state_stride0, int state_stride1, int state_width,
+    int compress_ratio, int bt_stride, int bt_cols, int kv_block_size,
+    int kv_block_stride, float eps) {
+  e.pipeline("dsv4_indexer_compress_insert");
+  e.in(state_cache, 0);
+  e.in(cos, 1);
+  e.in(sin, 2);
+  e.in(positions, 3);
+  e.in(state_slots, 4);
+  e.in(token_to_req, 5);
+  e.in(block_table, 6);
+  e.in(rms_w, 7);
+  e.in(kv_slots, 8);
+  e.out(kv_cache, 9);
+  e.bytes(state_block_size, 10);
+  e.bytes(state_stride0, 11);
+  e.bytes(state_stride1, 12);
+  e.bytes(state_width, 13);
+  e.bytes(compress_ratio, 14);
+  e.bytes(bt_stride, 15);
+  e.bytes(bt_cols, 16);
+  e.bytes(kv_block_size, 17);
+  e.bytes(kv_block_stride, 18);
+  e.bytes(eps, 19);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// Fused head=512 compressor front: gather + softmax + weighted sum
+// + RMSNorm, bf16 rows out (deepseek_v4_kv_insert consumes them). cr=4
+// overlap layers use the one-simdgroup-per-token kernel; cr=128 no-overlap
+// layers use the 128-thread threadgroup twin (staged history offsets).
+// Contract: compress_ratio must be 4 or 128 — host-checked. The cr=4 kernel
+// holds its 2*ratio-row history in fixed-size stack arrays (sized for
+// ratio 4); any other ratio must not route to it.
+template <class E>
+void launch_dsv4_compress_front(
+    E& e, typename E::in_t state_cache, typename E::in_t positions,
+    typename E::in_t state_slots, typename E::in_t token_to_req,
+    typename E::in_t block_table, typename E::in_t rms_w, typename E::out_t out,
+    int tokens, int state_block_size, int state_stride0, int state_stride1,
+    int state_width, int compress_ratio, int bt_stride, int bt_cols,
+    float eps) {
+  const bool c128 = compress_ratio == 128;
+  e.pipeline(c128 ? "dsv4_compress_front_c128" : "dsv4_compress_front");
+  e.in(state_cache, 0);
+  e.in(positions, 1);
+  e.in(state_slots, 2);
+  e.in(token_to_req, 3);
+  e.in(block_table, 4);
+  e.in(rms_w, 5);
+  e.out(out, 6);
+  e.bytes(state_block_size, 7);
+  e.bytes(state_stride0, 8);
+  e.bytes(state_stride1, 9);
+  e.bytes(state_width, 10);
+  e.bytes(compress_ratio, 11);
+  e.bytes(bt_stride, 12);
+  e.bytes(bt_cols, 13);
+  e.bytes(eps, 14);
+  e.dispatch(tokens, 1, 1, c128 ? 128 : 32, 1, 1);
+}
+
 template <class E>
 void launch_dsv4_save_partial_states(
     E& e, typename E::in_t kv, typename E::in_t score, typename E::in_t ape,
     typename E::in_t positions, typename E::out_t state_cache,
     typename E::in_t slot_mapping, int num_tokens, int head_size,
     int block_size, int block_stride, int token_stride, int state_width,
-    int compress_ratio) {
-  e.pipeline("dsv4_save_partial_states");
+    int compress_ratio, int in_stride, bool half_input = false) {
+  // half_input reads the fp16 kv_score GEMM output directly (rounds each
+  // element to bf16 in-register).
+  e.pipeline(half_input ? "dsv4_save_partial_states_half"
+                        : "dsv4_save_partial_states");
   e.in(kv, 0);
   e.in(score, 1);
   e.in(ape, 2);
@@ -3091,6 +3214,7 @@ void launch_dsv4_save_partial_states(
   e.bytes(token_stride, 10);
   e.bytes(state_width, 11);
   e.bytes(compress_ratio, 12);
+  e.bytes(in_stride, 13);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
@@ -3235,8 +3359,11 @@ void launch_mla_decode_fp8_sparse_two_cache_packed(
     typename E::in_t sinks, typename E::out_t out, int batch, int num_heads,
     int compressed_width, int swa_width, int compressed_block_size,
     int compressed_block_stride, int swa_block_size, int swa_block_stride,
-    float scale) {
-  e.pipeline("mla_decode_fp8_sparse_two_cache_packed");
+    float scale, bool half_out = false) {
+  // half_out writes the fp16 serving buffer directly (rounds each element
+  // through bf16 first, matching the bf16-store + cast-copy chain).
+  e.pipeline(half_out ? "mla_decode_fp8_sparse_two_cache_packed_out_half"
+                      : "mla_decode_fp8_sparse_two_cache_packed");
   e.in(q, 0);
   e.in(compressed, 1);
   e.in(compressed_idx, 2);
@@ -3255,6 +3382,133 @@ void launch_mla_decode_fp8_sparse_two_cache_packed(
   e.bytes(swa_block_size, 15);
   e.bytes(swa_block_stride, 16);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// Prefill-width twin: one 256-thread threadgroup per (16-head group, token)
+// stages candidate slots through threadgroup memory (fp32, the decode
+// kernel's exact materialization) so the fp8 decode runs once per token
+// group instead of once per head. Outputs bit-identical to the fused
+// decode kernel above.
+template <class E>
+// Contract: num_heads % 16 == 0 (the kernel hard-wires 16 heads per
+// 256-thread threadgroup and the grid below truncates num_heads / 16).
+// The sole caller in qc_metal_serving.mm gates on batch >= 64 &&
+// heads % 16 == 0; non-conforming shapes fall through to the fused
+// decode-kernel walk below that branch.
+void launch_mla_prefill_fp8_sparse_two_cache_packed(
+    E& e, typename E::in_t q, typename E::in_t compressed,
+    typename E::in_t compressed_idx, typename E::in_t compressed_len,
+    typename E::in_t swa, typename E::in_t swa_idx, typename E::in_t swa_len,
+    typename E::in_t sinks, typename E::out_t out, int batch, int num_heads,
+    int compressed_width, int swa_width, int compressed_block_size,
+    int compressed_block_stride, int swa_block_size, int swa_block_stride,
+    float scale, bool half_out = false) {
+  e.pipeline(half_out ? "mla_prefill_fp8_sparse_two_cache_packed_out_half"
+                      : "mla_prefill_fp8_sparse_two_cache_packed");
+  e.in(q, 0);
+  e.in(compressed, 1);
+  e.in(compressed_idx, 2);
+  e.in(compressed_len, 3);
+  e.in(swa, 4);
+  e.in(swa_idx, 5);
+  e.in(swa_len, 6);
+  e.in(sinks, 7);
+  e.out(out, 8);
+  e.bytes(num_heads, 9);
+  e.bytes(compressed_width, 10);
+  e.bytes(swa_width, 11);
+  e.bytes(scale, 12);
+  e.bytes(compressed_block_size, 13);
+  e.bytes(compressed_block_stride, 14);
+  e.bytes(swa_block_size, 15);
+  e.bytes(swa_block_stride, 16);
+  e.dispatch(num_heads / 16, batch, 1, 256, 1, 1);
+}
+
+// Dense-causal prefill FA support (see mla.metal): slot-list fp8 dequant
+// into a contiguous half [n, 512] scratch, and the 8-token x 1-head MMA
+// FA over pre-decoded compressed + SWA axes.
+// Contract: `slots`/`out` rows must be pre-padded with -1 slots to a
+// 32-row multiple plus one spare block (SlimServe metal.py _pad_slots) —
+// the FA MMA consumer loads full 8x8 tail fragments from this scratch.
+// -1-slot rows are zero-filled.
+template <class E>
+void launch_mla_prefill_dequant_slots(E& e, typename E::in_t cache,
+                                      typename E::in_t slots,
+                                      typename E::out_t out, int n,
+                                      int block_size, long block_stride) {
+  e.pipeline("mla_prefill_dequant_slots");
+  e.in(cache, 0);
+  e.in(slots, 1);
+  e.out(out, 2);
+  e.bytes(block_size, 3);
+  e.bytes(block_stride, 4);
+  e.dispatch(n, 1, 1, 32, 1, 1);
+}
+
+// Contract: nc/ns are the kc/ks scratch row counts and must be 32-row
+// multiples with at least one spare block past every per-token length
+// (host-checked) — tail K/V fragment loads read complete 8x8 tiles before
+// jn masks the scores. See mla_prefill_fa_mma in mla.metal.
+template <class E>
+void launch_mla_prefill_fa_mma(E& e, typename E::in_t q, typename E::in_t kc,
+                               typename E::in_t ks, typename E::in_t lens_c,
+                               typename E::in_t lo_s, typename E::in_t hi_s,
+                               typename E::in_t sinks, typename E::out_t out,
+                               int T, int num_heads, int nc, int ns,
+                               float scale, bool half_out) {
+  e.pipeline(half_out ? "mla_prefill_fa_mma_out_half" : "mla_prefill_fa_mma");
+  e.in(q, 0);
+  e.in(kc, 1);
+  e.in(ks, 2);
+  e.in(lens_c, 3);
+  e.in(lo_s, 4);
+  e.in(hi_s, 5);
+  e.in(sinks, 6);
+  e.out(out, 7);
+  e.bytes(T, 8);
+  e.bytes(num_heads, 9);
+  e.bytes(nc, 10);
+  e.bytes(ns, 11);
+  e.bytes(scale, 12);
+  e.dispatch((T + 7) / 8, num_heads, 1, 128, 1, 1);
+}
+
+// Split-K twin of the two-cache serving decode: partitions the virtual
+// [compressed ++ swa] candidate list; partials combined by
+// launch_paged_attention_reduce (which applies the sink). Grid (H, B, P).
+template <class E>
+void launch_mla_decode_fp8_sparse_two_cache_packed_partition(
+    E& e, typename E::in_t q, typename E::in_t compressed,
+    typename E::in_t compressed_idx, typename E::in_t compressed_len,
+    typename E::in_t swa, typename E::in_t swa_idx, typename E::in_t swa_len,
+    typename E::out_t tmp_out, typename E::out_t max_logits,
+    typename E::out_t exp_sums, int batch, int num_heads, int compressed_width,
+    int swa_width, int compressed_block_size, int compressed_block_stride,
+    int swa_block_size, int swa_block_stride, float scale, int num_partitions,
+    int partition_size) {
+  e.pipeline("mla_decode_fp8_sparse_two_cache_packed_partition");
+  e.in(q, 0);
+  e.in(compressed, 1);
+  e.in(compressed_idx, 2);
+  e.in(compressed_len, 3);
+  e.in(swa, 4);
+  e.in(swa_idx, 5);
+  e.in(swa_len, 6);
+  e.out(tmp_out, 7);
+  e.out(max_logits, 8);
+  e.out(exp_sums, 9);
+  e.bytes(num_heads, 10);
+  e.bytes(compressed_width, 11);
+  e.bytes(swa_width, 12);
+  e.bytes(scale, 13);
+  e.bytes(compressed_block_size, 14);
+  e.bytes(compressed_block_stride, 15);
+  e.bytes(swa_block_size, 16);
+  e.bytes(swa_block_stride, 17);
+  e.bytes(num_partitions, 18);
+  e.bytes(partition_size, 19);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 
 // ----- MLA fp8 decode, PARTITIONED (P4a-v2/P4b-v2): paged-v2-style partials,
@@ -5554,6 +5808,24 @@ void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq,
   e.dispatch(M / tile_m, N / 32, 1, 64, 1, 1);
 }
 
+// ----- qgemm_wide_t (large-M q8_0, transposed store): Dt@0 (M,N row-major)
+//        Wq@1 X@2(K,M) ; N@3 K@4 M@5 ; grid (M/64, N/64, 1), 64 threads.
+//        64x64 tile halves X and W re-read traffic vs qgemm's 32x32; the
+//        (M,N) output removes the host transpose pass. Requires q8_0,
+//        M % 64 == 0, N % 64 == 0. Per-element bit-identical to qgemm. -----
+template <class E>
+void launch_qgemm_wide_t(E& e, typename E::out_t dt, typename E::in_t wq,
+                         typename E::in_t x, int N, int K, int M) {
+  e.pipeline("qgemm_wide_t_q8_0");
+  e.out(dt, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.bytes(M, 5);
+  e.dispatch(M / 64, N / 64, 1, 64, 1, 1);
+}
+
 // ----- qgemm_sm: small-M weight-streaming MMA GEMM. D@0 (N,32 half) Wq@1
 //        X@2 (K,32 half, host-padded) ; N@3 K@4 ; grid (1, N/tg_rows, 1),
 //        tg_threads threads. Every warp computes all 32 columns for its own
@@ -6018,6 +6290,26 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq,
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// Multi-batch weight-stationary GEMV (2 <= M <= 8): one simdgroup per output
+// row, weight blocks decoded once and applied to all M activation rows.
+// X is (M, K) row-major, D is (M, N) row-major. M selects a compile-time
+// instantiation (qgemv_<fmt>_mb<M>[_bfloat16]) so accumulators stay in
+// registers.
+template <class E>
+void launch_qgemv_mb(E& e, typename E::out_t d, typename E::in_t wq,
+                     typename E::in_t x, int N, int K, int M,
+                     const std::string& fmt, const std::string& type_name) {
+  std::string name = qgemv_kernel_name(fmt) + "_mb" + std::to_string(M);
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.bytes(N, 3);
+  e.bytes(K, 4);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // Weight-stationary multi-row GEMV over M activation rows. M must be one of
 // the instantiated row counts (2/4/8/16/17/32); hosts decompose other
 // batches. Reads the quantized weights once for the whole row block.
@@ -6059,6 +6351,225 @@ void launch_qgemv_moe(E& e, typename E::out_t d, typename E::in_t wq,
   e.bytes(K, 5);
   e.bytes(topk, 6);
   e.dispatch(N, tokens * topk, 1, 32, 1, 1);
+}
+
+// Multi-row MoE GEMV (iq2_xxs and q2_K): NSG=2 simdgroups x NR0=4 rows per
+// threadgroup, threadgroup-staged codebooks for iq2_xxs. Same buffer ABI as
+// launch_qgemv_moe; only the grid changes. soa selects the SoA-plane twins
+// (load-time repack in gguf/fused_moe.py; bit-exact, same buffer ABI — plane
+// offsets derive from N/K).
+// Contract: N must be a multiple of nsg*nr0 (8, or 32 for the fp16 q2_K 4x8
+// geometry) — host-checked. The ceil-div grid otherwise walks weight rows
+// past N before the store guards run; non-multiple N belongs on the one-row
+// launch_qgemv_moe route.
+template <class E>
+void launch_qgemv_moe_mr(E& e, typename E::out_t d, typename E::in_t wq,
+                         typename E::in_t x, typename E::in_t topk_ids, int N,
+                         int K, int tokens, int topk, const std::string& fmt,
+                         const std::string& type_name, bool soa = false) {
+  // Per-format geometry (all geometries are bit-exact — per-row arithmetic
+  // is geometry-invariant): iq2_xxs gate|up keeps 2x4; fp16 q2_K down uses
+  // 4x8 (smaller K -> fewer, fatter threadgroups win); bf16 always uses the
+  // default 2x4 instantiation.
+  int nsg = 2, nr0 = 4;
+  std::string name = "qgemv_" + fmt + "_moe_mr";
+  if (type_name != "bfloat16" && fmt == "q2_K") {
+    nsg = 4;
+    nr0 = 8;
+    name += "_g48";
+  }
+  if (soa) name += "_soa";
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(topk_ids, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.bytes(topk, 6);
+  e.dispatch((N + nsg * nr0 - 1) / (nsg * nr0), tokens * topk, 1, 32 * nsg, 1,
+             1);
+}
+
+// ---- serving MoE: fused activation, router, finalize ----------------
+
+template <class E>
+void launch_qc_swiglu(E& e, typename E::in_t x, typename E::out_t y, int n_out,
+                      int has_clamp, float limit, int oai_form, float alpha,
+                      float beta, int total, const std::string& type_name) {
+  e.pipeline("qc_swiglu_" + type_name);
+  e.in(x, 0);
+  e.out(y, 1);
+  e.bytes(n_out, 2);
+  e.bytes(has_clamp, 3);
+  e.bytes(limit, 4);
+  e.bytes(oai_form, 5);
+  e.bytes(alpha, 6);
+  e.bytes(beta, 7);
+  e.bytes(total, 8);
+  e.dispatch((total + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// Multi-row iq2_xxs MoE GEMV with the fused SwiGLU epilogue: emits the
+// activated (tokens*topk, N/2) tensor directly. NSG=2, NPAIR=2 (2 gate +
+// 2 up rows per simdgroup).
+// Contract: N/2 must be a multiple of kNsg*kNpair (4) — host-checked; tail
+// simdgroups would otherwise walk gate/up rows past N.
+template <class E>
+void launch_qgemv_moe_mr_swiglu(E& e, typename E::out_t d, typename E::in_t wq,
+                                typename E::in_t x, typename E::in_t topk_ids,
+                                int N, int K, int tokens, int topk,
+                                int has_clamp, float limit,
+                                const std::string& type_name) {
+  constexpr int kNsg = 2, kNpair = 2;
+  std::string name = "qgemv_iq2_xxs_moe_mr_swiglu";
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(topk_ids, 3);
+  e.bytes(N, 4);
+  e.bytes(K, 5);
+  e.bytes(topk, 6);
+  e.bytes(has_clamp, 7);
+  e.bytes(limit, 8);
+  const int nh = N / 2;
+  e.dispatch((nh + kNsg * kNpair - 1) / (kNsg * kNpair), tokens * topk, 1,
+             32 * kNsg, 1, 1);
+}
+
+template <class E>
+void launch_qc_moe_weighted_sum(E& e, typename E::in_t x, typename E::in_t w,
+                                typename E::out_t y, int num_tokens, int topk,
+                                int dim, const std::string& type_name) {
+  e.pipeline("qc_moe_weighted_sum_" + type_name);
+  e.in(x, 0);
+  e.in(w, 1);
+  e.out(y, 2);
+  e.bytes(topk, 3);
+  e.bytes(dim, 4);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+// Contract: num_experts <= 1024 and topk <= 8 — host-checked. The kernel's
+// per-lane score/key arrays hold ceil(num_experts/32) <= MAX_PER_LANE (32)
+// entries and the top-k window/renorm buffers hold MAX_K (8); larger values
+// would index past those fixed local arrays.
+template <class E>
+void launch_dsv4_router_topk(E& e, typename E::in_t gating,
+                             typename E::in_t bias, typename E::in_t hash_table,
+                             typename E::in_t input_ids,
+                             typename E::out_t out_w, typename E::out_t out_ids,
+                             int num_tokens, int num_experts, int topk,
+                             int has_bias, int has_hash, int renorm,
+                             float scaling) {
+  e.pipeline("dsv4_router_topk");
+  e.in(gating, 0);
+  e.in(bias, 1);
+  e.in(hash_table, 2);
+  e.in(input_ids, 3);
+  e.out(out_w, 4);
+  e.out(out_ids, 5);
+  e.bytes(num_experts, 6);
+  e.bytes(topk, 7);
+  e.bytes(has_bias, 8);
+  e.bytes(has_hash, 9);
+  e.bytes(renorm, 10);
+  e.bytes(scaling, 11);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+// Sum-folded Q2_K MoE GEMV (qgemv_moe_mr_q2_K_sum): D is (tokens, N); the
+// kernel loops the topk slots and applies the qc_moe_weighted_sum reduce in
+// its epilogue. Geometry mirrors the q2_K branch of launch_qgemv_moe_mr
+// (fp16 -> 4x8, bf16 -> 2x4); only those two shapes are instantiated.
+// Contract: N must be a multiple of nsg*nr0 (32 for fp16, 8 for bf16) —
+// host-checked, same tail-row rationale as launch_qgemv_moe_mr.
+template <class E>
+void launch_qgemv_moe_mr_q2k_sum(E& e, typename E::out_t d, typename E::in_t wq,
+                                 typename E::in_t x, typename E::in_t topk_ids,
+                                 typename E::in_t topk_w, int N, int K,
+                                 int tokens, int topk,
+                                 const std::string& type_name,
+                                 bool soa = false) {
+  int nsg = 2, nr0 = 4;
+  std::string name = "qgemv_q2_K_moe_mr_sum";
+  if (type_name != "bfloat16") {
+    nsg = 4;
+    nr0 = 8;
+    name += "_g48";
+  }
+  if (soa) name += "_soa";
+  if (type_name == "bfloat16") name += "_bfloat16";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(topk_ids, 3);
+  e.in(topk_w, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.bytes(topk, 7);
+  e.dispatch((N + nsg * nr0 - 1) / (nsg * nr0), tokens, 1, 32 * nsg, 1, 1);
+}
+
+// Tiled MoE GEMM, phase 1 (qc_moe_mm_map0_<topk>): one threadgroup, one
+// thread per expert; builds the dense per-expert slot lists ids (E, tokens)
+// and counts tpe (E) consumed by the phase-2 tile kernel. E <= 256
+// host-checked; topk in {2, 4, 6, 8}.
+template <class E>
+void launch_moe_mm_map0(E& e, typename E::in_t topk_ids, typename E::out_t tpe,
+                        typename E::out_t ids, typename E::out_t work,
+                        typename E::out_t wcount, typename E::out_t work64,
+                        typename E::out_t wcount64, int tokens, int topk,
+                        int n_experts) {
+  e.pipeline("qc_moe_mm_map0_" + std::to_string(topk));
+  e.in(topk_ids, 0);
+  e.out(tpe, 1);
+  e.out(ids, 2);
+  e.bytes(tokens, 3);
+  e.out(work, 4);
+  e.out(wcount, 5);
+  e.out(work64, 6);
+  e.out(wcount64, 7);
+  e.dispatch(1, 1, 1, n_experts, 1, 1);
+}
+
+// Tiled MoE GEMM, phase 2 (qc_moe_mm_id_*): 64x32 output tiles, 128
+// threads / 4 simdgroups per threadgroup, 8x8 simdgroup MMA; D is
+// (tokens*topk, N) in flat (token, slot) row order. Threadgroups whose slot
+// tile is past tpe[expert] exit immediately (grid over-dispatch accepted).
+template <class E>
+void launch_moe_mm_id(E& e, typename E::out_t d, typename E::in_t wq,
+                      typename E::in_t x, typename E::in_t tpe,
+                      typename E::in_t ids, typename E::in_t work,
+                      typename E::in_t wcount, int work_cap, int N, int K,
+                      int tokens, int topk, const std::string& fmt, bool soa,
+                      bool w64) {
+  // iq2_xxs = w13 (X is (tokens, K), B row = id/topk); q2_K = down (X is
+  // (tokens*topk, K) per-slot, B row = id). SoA twin reads the resident
+  // SoA plane layout; iq2_xxs has no SoA twin.
+  // grid.x walks the map0 work queue (padded to work_cap; extras exit).
+  // w64 selects the dual-half kernels consuming the 64-slot queue (per-slot
+  // bit-identical, one A dequant per two 32-slot halves).
+  std::string name = "qc_moe_mm_id_" + fmt;
+  if (soa) name += "_soa";
+  if (w64) name += "_w64";
+  e.pipeline(name);
+  e.out(d, 0);
+  e.in(wq, 1);
+  e.in(x, 2);
+  e.in(tpe, 3);
+  e.in(ids, 4);
+  e.bytes(N, 5);
+  e.bytes(K, 6);
+  e.bytes(tokens, 7);
+  e.bytes(topk, 8);
+  e.in(work, 9);
+  e.in(wcount, 10);
+  e.dispatch(work_cap, N / 64, 1, 128, 1, 1);
 }
 
 // ----- fused packed-Q4_0 decode GEMVs (batch-1), fp32 activation + output.

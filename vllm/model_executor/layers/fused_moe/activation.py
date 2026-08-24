@@ -10,6 +10,37 @@ import torch.nn.functional as F
 from vllm.platforms import current_platform
 
 
+def _metal_swiglu(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    clamp_limit: float | None,
+    oai_form: bool,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+) -> bool:
+    """One-dispatch Metal SwiGLU mirroring the eager chain bitwise (MPS
+    silu/sigmoid are fp32-internal Metal precise ops).
+    Returns False when shapes fall outside the kernel."""
+    if not (
+        x.dim() == 2
+        and x.is_contiguous()
+        and output.is_contiguous()
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and output.dtype == x.dtype
+        # The native OAI kernel is bitwise-proven only for DSV4's defaults.
+        # Non-default scalars change the eager MPS rounding points, so keep
+        # those models on the reference chain until the kernel mirrors them.
+        and (not oai_form or (alpha == 1.0 and beta == 0.0))
+    ):
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    if not (quixicore_ops.is_available() and quixicore_ops.has("qc_swiglu")):
+        return False
+    quixicore_ops.qc_swiglu(x, output, clamp_limit, oai_form, alpha, beta)
+    return True
+
+
 class MoEActivation(Enum):
     """Activation functions for MoE layers."""
 
@@ -166,7 +197,15 @@ def apply_moe_activation(
 
     if current_platform.is_metal():
         if activation == MoEActivation.SILU:
+            if _metal_swiglu(output, input, clamp_limit, oai_form=False):
+                return output
             gate, up = input.chunk(2, dim=-1)
+            if clamp_limit is not None:
+                # Mirror silu_and_mul_with_clamp (and the ds4 reference
+                # matvec_*_mid_worker): gate clamped from above only, up
+                # clamped to +/-limit.
+                gate = torch.clamp(gate, max=clamp_limit)
+                up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)
             output.copy_(F.silu(gate) * up)
         elif activation == MoEActivation.GELU:
             gate, up = input.chunk(2, dim=-1)
@@ -176,6 +215,15 @@ def apply_moe_activation(
             output.copy_(F.gelu(gate, approximate="tanh") * up)
         elif activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
             assert clamp_limit is not None
+            if _metal_swiglu(
+                output,
+                input,
+                clamp_limit,
+                oai_form=True,
+                alpha=alpha,
+                beta=beta,
+            ):
+                return output
             gate, up = input.chunk(2, dim=-1)
             gate = torch.clamp(gate, max=clamp_limit)
             up = torch.clamp(up, min=-clamp_limit, max=clamp_limit)

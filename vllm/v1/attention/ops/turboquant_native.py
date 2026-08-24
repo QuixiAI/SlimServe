@@ -19,6 +19,54 @@ from vllm.quixicore.ops import quixicore_ops
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
 
+# Read-only constants the Metal launch path would otherwise rebuild on every
+# call. Centroid entries keep a strong reference to the source tensor so a
+# recycled id() can never alias a different tensor. Two contracts: the
+# source centroids must never be mutated in place (the cache would keep
+# serving the stale scaled copy), and callers must treat every returned
+# tensor as an immutable shared alias. Entries live for the process
+# lifetime — fine for one long-lived server, a leak across model reloads.
+_metal_scaled_centroids_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_metal_const_cache: dict[tuple, torch.Tensor] = {}
+
+
+def metal_scaled_centroids(centroids: torch.Tensor, head_size: int) -> torch.Tensor:
+    entry = _metal_scaled_centroids_cache.get(id(centroids))
+    if entry is None or entry[0] is not centroids:
+        entry = (centroids, (centroids * head_size**0.5).contiguous())
+        _metal_scaled_centroids_cache[id(centroids)] = entry
+    return entry[1]
+
+
+def metal_ones(size: int, device: torch.device) -> torch.Tensor:
+    key = ("ones", size, str(device))
+    t = _metal_const_cache.get(key)
+    if t is None:
+        t = torch.ones(size, dtype=torch.float32, device=device)
+        _metal_const_cache[key] = t
+    return t
+
+
+def metal_arange(width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = ("arange", width, str(device), dtype)
+    t = _metal_const_cache.get(key)
+    if t is None:
+        t = torch.arange(width, device=device, dtype=dtype)
+        _metal_const_cache[key] = t
+    return t
+
+
+def metal_neg_inf_sinks(num_heads: int, device: torch.device) -> torch.Tensor:
+    key = ("sinks", num_heads, str(device))
+    t = _metal_const_cache.get(key)
+    if t is None:
+        t = torch.full(
+            (num_heads,), -float("inf"), dtype=torch.float32, device=device
+        )
+        _metal_const_cache[key] = t
+    return t
+
+
 @cache
 def native_turboquant_available() -> bool:
     from vllm.platforms import current_platform
@@ -186,7 +234,7 @@ def native_turboquant_decode_attention(
         width = (
             sliding_window if sliding_window > 0 else block_table.shape[1] * block_size
         )
-        positions = torch.arange(width, device=query.device, dtype=seq_lens.dtype)
+        positions = metal_arange(width, query.device, seq_lens.dtype)
         visible = seq_lens.clamp(max=width)
         logical = (seq_lens - visible).unsqueeze(1) + positions.unsqueeze(0)
         valid = positions.unsqueeze(0) < visible.unsqueeze(1)
@@ -195,17 +243,12 @@ def native_turboquant_decode_attention(
         blocks = block_table.gather(1, block_col.to(torch.long))
         slots = blocks * block_size + torch.remainder(logical, block_size)
         slots = torch.where(valid, slots, -1).to(torch.int32).contiguous()
-        metal_centroids = (centroids * D**0.5).contiguous()
-        signs = torch.ones(D, dtype=torch.float32, device=query.device)
+        metal_centroids = metal_scaled_centroids(centroids, D)
+        signs = metal_ones(D, query.device)
         metal_sinks = (
             sinks
             if sinks is not None
-            else torch.full(
-                (query.shape[1],),
-                -float("inf"),
-                dtype=torch.float32,
-                device=query.device,
-            )
+            else metal_neg_inf_sinks(query.shape[1], query.device)
         )
         return quixicore_ops.turboquant_attention_metal(
             query,

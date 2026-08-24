@@ -582,6 +582,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
+    num_computed_tokens_cpu: torch.Tensor | None = None,
     steady_cache: dict | None = None,
 ) -> dict[str, Any]:
     # Steady uniform-decode fast path: when the previous step had an
@@ -609,6 +610,12 @@ def build_attn_metadata(
     if steady is not None and steady.get("sig") == steady_sig:
         for cm, items in steady["groups"]:
             cm.max_seq_len = max_seq_len
+            # Computed-token counts advance every decode step; the cached
+            # tensor is a view of the producer's persistent buffer today,
+            # but refresh explicitly so a producer change cannot leave the
+            # steady path reading first-step values.
+            if num_computed_tokens_cpu is not None:
+                cm._num_computed_tokens_cpu = num_computed_tokens_cpu
             for builder, meta, layer_names, supports in items:
                 if supports:
                     builder.steady_decode_update(meta, cm)
@@ -664,6 +671,10 @@ def build_attn_metadata(
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            # Exact per-request computed-token counts (CPU, no sync). The
+            # DSV4 compressor's c128_boundary skip needs this; leaving it
+            # None forces the full compress every step.
+            _num_computed_tokens_cpu=num_computed_tokens_cpu,
             **common_attn_metadata_extra_kwargs,
         )
 

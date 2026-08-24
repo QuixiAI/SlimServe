@@ -541,9 +541,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             def compressor_kv_score() -> torch.Tensor:
                 if current_platform.is_metal():
+                    # No eager .float(): the only consumer is
+                    # save_partial_states, whose fp16-input kernel rounds to
+                    # bf16 in-register (fp16->fp32->bf16 == fp16->bf16, both
+                    # single RNE roundings — bit-exact).
                     return torch.mm(
                         hidden_states, compressor.fused_wkv_wgate.weight.T
-                    ).float()
+                    )
                 weight = compressor.fused_wkv_wgate.weight
                 if (
                     self._use_ampere_compressor_gemv
@@ -581,10 +585,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
             def indexer_compressor_kv_score() -> torch.Tensor:
                 if current_platform.is_metal():
+                    # No eager .float() — same single-rounding argument as
+                    # compressor_kv_score above (sole consumer is
+                    # save_partial_states' fp16-input kernel).
                     return torch.mm(
                         hidden_states,
                         indexer.compressor.fused_wkv_wgate.weight.T,
-                    ).float()
+                    )
                 weight = indexer.compressor.fused_wkv_wgate.weight
                 if (
                     self._use_ampere_compressor_gemv
@@ -1082,8 +1089,7 @@ class DeepseekV4Indexer(nn.Module):
             if indexer_metadata.max_seq_len // self.compress_ratio <= self.topk_tokens:
                 # candidates num smaller than topk, every candidate is selected
                 # but we still need to build k cache
-                if not current_platform.is_metal():
-                    compressor(compressed_kv_score, positions, rotary_emb)
+                compressor(compressed_kv_score, positions, rotary_emb)
                 assert self.topk_indices_buffer is not None
                 num_tokens = (
                     indexer_metadata.num_decode_tokens
@@ -1098,21 +1104,38 @@ class DeepseekV4Indexer(nn.Module):
                             self.compress_ratio,
                         )
                     elif current_platform.is_metal():
-                        offsets = torch.arange(
+                        # The fill depends only on positions/topk/ratio and
+                        # every indexer layer shares one buffer, so the
+                        # eager chain (arange+div+where+copy per layer) is
+                        # identical across layers — run it once per step.
+                        ctx = get_forward_context()
+                        memo = ctx.__dict__.setdefault(
+                            "_qc_metal_compress_memo", {}
+                        )
+                        fill_key = (
+                            "short_topk_fill",
+                            positions.data_ptr(),
+                            num_tokens,
                             self.topk_tokens,
-                            device=positions.device,
-                            dtype=torch.int32,
-                        )
-                        lengths = torch.div(
-                            positions[:num_tokens] + 1,
                             self.compress_ratio,
-                            rounding_mode="floor",
-                        ).to(torch.int32)
-                        self.topk_indices_buffer[:num_tokens] = torch.where(
-                            offsets.unsqueeze(0) < lengths.unsqueeze(1),
-                            offsets.unsqueeze(0),
-                            -1,
                         )
+                        if fill_key not in memo:
+                            offsets = torch.arange(
+                                self.topk_tokens,
+                                device=positions.device,
+                                dtype=torch.int32,
+                            )
+                            lengths = torch.div(
+                                positions[:num_tokens] + 1,
+                                self.compress_ratio,
+                                rounding_mode="floor",
+                            ).to(torch.int32)
+                            self.topk_indices_buffer[:num_tokens] = torch.where(
+                                offsets.unsqueeze(0) < lengths.unsqueeze(1),
+                                offsets.unsqueeze(0),
+                                -1,
+                            )
+                            memo[fill_key] = True
                     else:
                         _fill_short_context_topk_indices[(num_tokens,)](
                             self.topk_indices_buffer,
@@ -1149,6 +1172,15 @@ class DeepseekV4Indexer(nn.Module):
             if _DSV4_INNER_ATTENTION_OVERLAP and _DSV4_OVERLAP_INDEXER_INNER
             else None,
         )
+        if current_platform.is_metal():
+            # The CUDA logits/top-k kernels behind SparseAttnIndexer do not
+            # exist on Metal; the torch producer consumes the K cache the
+            # compressor just wrote.
+            from vllm.models.deepseek_v4.metal_indexer import (
+                metal_sparse_attn_indexer,
+            )
+
+            return metal_sparse_attn_indexer(self, q_quant, weights)
         return self.indexer_op(
             hidden_states,
             q_quant,

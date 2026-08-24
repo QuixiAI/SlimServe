@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
 
@@ -35,6 +36,14 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowMLASpec,
 )
+
+# Marshalling-memo kill switch (default on; =0 restores per-call
+# marshalling — the save_partial host converts dtypes itself, so values are
+# bit-exact either way). The guarded branch and the phaseprof brackets below
+# are retained as-is: removing them (together with the memo conditionals in
+# metal.py) shifts per-layer host timing enough to flip the async-output
+# completion race documented in vllm/platforms/metal_compat.py.
+_QC_MEMO_POS = os.environ.get("VLLM_QC_MEMO_POS", "1") != "0"
 
 
 def _prefer_two_stage_compressor() -> bool:
@@ -144,7 +153,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             num_decode_tokens=num_decode_tokens,
             c128_boundary=(
                 _get_c128_boundary(common_attn_metadata)
-                if self.block_size == 8
+                if self.block_size == 8 or current_platform.is_metal()
                 else None
             ),
         )
@@ -367,22 +376,53 @@ class DeepseekCompressor(nn.Module):
         # GEMM; state_cache from this kernel) but neither emits/waits on PDL
         # grid dependency primitives, so launch_pdl=True caused a
         # read-after-write race and non-deterministic output.
-        save_partial_states(
-            kv=kv,
-            score=score,
-            ape=self.ape,
-            positions=positions,
-            state_cache=state_cache,
-            slot_mapping=slot_mapping,
-            block_size=block_size,
-            state_width=state_width,
-            compress_ratio=self.compress_ratio,
-            pdl_kwargs=pdl_kwargs,
-        )
+        from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
-        # full graph cannot branch on per-step CPU metadata after capture
+        ape = self.ape
+        if current_platform.is_metal() and _QC_MEMO_POS:
+            # Memoize the bf16 copy of the constant APE table once (after
+            # weight load) instead of casting it every call.
+            ape_bf16 = getattr(self, "_ape_bf16", None)
+            if ape_bf16 is None:
+                ape_bf16 = self.ape.data.to(torch.bfloat16).contiguous()
+                self._ape_bf16 = ape_bf16
+            ape = ape_bf16
+            # Per-step marshalling memo (shared by every compressor layer via
+            # the per-step metadata object): the save_partial host op wants
+            # int32 positions and int64 slots; convert once, not per layer.
+            # Only the save_partial call sees the converted tensors — the
+            # compress path below keeps the original dtypes.
+            pos32 = getattr(state_metadata, "_qc_pos32", None)
+            if pos32 is None or state_metadata._qc_pos32_src is not positions:
+                pos32 = positions.to(torch.int32).contiguous()
+                state_metadata._qc_pos32 = pos32
+                state_metadata._qc_pos32_src = positions
+            slots64 = getattr(state_metadata, "_qc_slots64", None)
+            if slots64 is None:
+                slots64 = slot_mapping.to(torch.int64).contiguous()
+                state_metadata._qc_slots64 = slots64
+            sp_positions, sp_slots = pos32, slots64
+        else:
+            sp_positions, sp_slots = positions, slot_mapping
+
+        with _qc_phase("comp_save_partial"):
+            save_partial_states(
+                kv=kv,
+                score=score,
+                ape=ape,
+                positions=sp_positions,
+                state_cache=state_cache,
+                slot_mapping=sp_slots,
+                block_size=block_size,
+                state_width=state_width,
+                compress_ratio=self.compress_ratio,
+                pdl_kwargs=pdl_kwargs,
+            )
+
+        # full graph cannot branch on per-step CPU metadata after capture.
+        # Metal has no graph capture, so the same skip is always branch-safe.
         if (
-            current_platform.is_cuda()
+            (current_platform.is_cuda() or current_platform.is_metal())
             and self.head_dim == 512
             and self.compress_ratio == 128
             and forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
@@ -454,31 +494,32 @@ class DeepseekCompressor(nn.Module):
             state_cache=state_cache, state_metadata=state_metadata,
             kv_in=kv, score_in=score,
         )
-        compress_norm_rope_store_fn(
-            state_cache=state_cache,
-            num_actual=num_actual,
-            token_to_req_indices=token_to_req_indices,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            block_table=block_table,
-            block_size=block_size,
-            state_width=state_width,
-            cos_sin_cache=cos_sin_cache,
-            kv_cache=kv_cache,
-            k_cache_metadata=k_cache_metadata,
-            pdl_kwargs=pdl_kwargs,
-            head_dim=self.head_dim,
-            rope_head_dim=self.rope_head_dim,
-            compress_ratio=self.compress_ratio,
-            overlap=self.overlap,
-            use_fp4_cache=self.use_fp4_cache,
-            rms_norm_weight=self.norm.weight,
-            rms_norm_eps=self.rms_norm_eps,
-            quant_block=self._quant_block,
-            token_stride=self._token_stride,
-            scale_dim=self._scale_dim,
-            **extra_kwargs,
-        )
+        with _qc_phase("comp_full_compress"):
+            compress_norm_rope_store_fn(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                k_cache_metadata=k_cache_metadata,
+                pdl_kwargs=pdl_kwargs,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                use_fp4_cache=self.use_fp4_cache,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+                quant_block=self._quant_block,
+                token_stride=self._token_stride,
+                scale_dim=self._scale_dim,
+                **extra_kwargs,
+            )
         _compressor_write_debug_post(
             self, positions, k_cache_metadata, kv_cache, num_actual
         )

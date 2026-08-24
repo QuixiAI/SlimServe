@@ -10,6 +10,23 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
+def make_output_copy_stream(device: torch.device | str | None) -> torch.Stream:
+    """Stream for output and side-channel copies that would otherwise
+    overlap with compute on a second stream.
+
+    On MPS this returns the CURRENT (producing) stream: a cold cross-
+    stream event hand-off can lose its completion signal (the first-
+    multi-chunk-prefill park; perf/prefill_handoff.md), so every Metal
+    copy path stays on the producing stream. This helper is the single
+    place that platform decision lives — consumers compare their copy
+    stream against the main stream instead of testing device types.
+    CUDA/ROCm get a dedicated stream to overlap the transfer."""
+    dev = torch.device(device) if device is not None else None
+    if dev is not None and dev.type == "mps":
+        return torch.accelerator.current_stream(dev)
+    return torch.Stream(device)
+
+
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -30,8 +47,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = torch.Event()
         self._has_fault: torch.Tensor | None = None
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        # On MPS, make_output_copy_stream hands out the producing stream
+        # (cold cross-stream event hand-offs can lose the completion
+        # signal), so the copy and its event land on the main stream with
+        # no cross-stream wait. CUDA/ROCm arrive with a dedicated copy
+        # stream and retain the overlap.
+        copy_on_main_stream = copy_stream == main_stream
+        output_stream = main_stream if copy_on_main_stream else copy_stream
+        with stream(output_stream, main_stream):
+            if not copy_on_main_stream:
+                output_stream.wait_stream(main_stream)
 
             self.sampled_token_ids = async_copy_to_np(sampler_output.sampled_token_ids)
             self.logprobs_tensors: LogprobsTensors | None = None
@@ -50,7 +75,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
-            self.copy_event.record(copy_stream)
+            self.copy_event.record(output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         self.copy_event.synchronize()
@@ -100,14 +125,19 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.Event()
 
-        with stream(copy_stream, main_stream):
-            copy_stream.wait_stream(main_stream)
+        # Same single-place platform decision as AsyncOutput: on MPS the
+        # handed copy stream IS the main stream (make_output_copy_stream).
+        copy_on_main_stream = copy_stream == main_stream
+        output_stream = main_stream if copy_on_main_stream else copy_stream
+        with stream(output_stream, main_stream):
+            if not copy_on_main_stream:
+                output_stream.wait_stream(main_stream)
             self.pooler_output_cpu = self.pooler_output.to("cpu", non_blocking=True)
             if self.is_valid is not None:
                 self.is_valid_cpu = self.is_valid.to("cpu", non_blocking=True)
             else:
                 self.is_valid_cpu = None
-            self.copy_event.record(copy_stream)
+            self.copy_event.record(output_stream)
 
     def get_output(self) -> ModelRunnerOutput:
         pooler_output = list(self.pooler_output_cpu.unbind(dim=0))

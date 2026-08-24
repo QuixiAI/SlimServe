@@ -213,6 +213,7 @@ def ggml_moe_a8_vec(
     row: int,
     tokens: int,
     expert_parallel: bool = False,
+    soa: bool = False,
 ) -> torch.Tensor:
     if _is_metal():
         if expert_parallel:
@@ -229,7 +230,10 @@ def ggml_moe_a8_vec(
             quant_type,
             row,
             tokens,
+            soa=soa,
         )
+    if soa:
+        raise NotImplementedError("The SoA MoE expert repack is Metal-only.")
     _load_stable_libtorch()
     op = torch.ops._C.ggml_moe_a8_vec
     schema = str(op.default._schema)
@@ -240,6 +244,74 @@ def ggml_moe_a8_vec(
             "loaded ggml_moe_a8_vec extension does not support expert_parallel"
         )
     return op(X, W, topk_ids, top_k, quant_type, row, tokens)
+
+
+def ggml_moe_a8_vec_swiglu(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+    clamp_limit: float | None = None,
+) -> torch.Tensor:
+    """Metal-only: iq2_xxs MoE GEMV with the SwiGLU epilogue fused in
+    (bit-exact vs ggml_moe_a8_vec + the qc_swiglu SILU form)."""
+    if not _is_metal():
+        raise NotImplementedError("ggml_moe_a8_vec_swiglu is Metal-only.")
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_moe_a8_vec_swiglu(
+        X, W, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+    )
+
+
+def ggml_moe_a8_vec_sum(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+    out: torch.Tensor,
+    soa: bool = False,
+) -> torch.Tensor:
+    """Metal-only: q2_K MoE down GEMV with the weighted expert-slot sum
+    folded into the epilogue, writing (tokens, row) into `out` directly
+    (replaces down vec + reshape + moe_weighted_sum)."""
+    if not _is_metal():
+        raise NotImplementedError("ggml_moe_a8_vec_sum is Metal-only.")
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_moe_a8_vec_sum(
+        X, W, topk_ids, topk_weights, top_k, quant_type, row, tokens, out, soa
+    )
+
+
+def ggml_moe_mm_id(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: int,
+    tokens: int,
+    soa: bool = False,
+) -> torch.Tensor:
+    """Metal-only: MoE tiled GEMM for prefill widths (llama.cpp mul_mm_id
+    port). iq2_xxs = w13 over (tokens, K); q2_K = down over the per-slot
+    (tokens*top_k, K). Flat (token, slot) row order matches the vec
+    kernels, so act() and the finalize consume the result unchanged."""
+    if not _is_metal():
+        raise NotImplementedError("ggml_moe_mm_id is Metal-only.")
+    from vllm.quixicore import quixicore_ops
+
+    return quixicore_ops.ggml_moe_mm_id(
+        X, W, topk_ids, top_k, quant_type, row, tokens, soa=soa
+    )
 
 
 def ggml_dsv4_moe_a8(

@@ -239,5 +239,8 @@ class Sampler:
                 pos,
                 apply_temperature=False,
                 use_fp64=self.use_fp64_gumbel,
+                all_greedy=bool(
+                    np.all(self.sampling_states.temperature.np[idx_mapping_np] == 0.0)
+                ),
             )
         return sampled, processed_logits

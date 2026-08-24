@@ -180,6 +180,216 @@ class quixicore_ops:
     ) -> torch.Tensor:
         return _qc().dsv4_hc_head(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
 
+    @staticmethod
+    def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
+        """Weighted RMS norm with vllm ir.ops.rms_norm numerics (Metal).
+
+        bf16 contiguous [rows, D] inputs ride the single-dispatch fixed-D
+        kernels (Muse-Glimmer path); fp16 and strided inputs take the
+        w32/strided variants.
+        """
+        return _qc().rms_norm(x, weight, epsilon)
+
+    @staticmethod
+    def dsv4_indexer_q_rope_quant(
+        index_q: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        index_weights: torch.Tensor,
+        softmax_scale: float,
+        head_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Indexer Q RoPE + fp8-domain quantize; q_scale folded into weights."""
+        return _qc().dsv4_indexer_q_rope_quant(
+            index_q,
+            positions,
+            cos_sin_cache,
+            index_weights,
+            softmax_scale,
+            head_scale,
+        )
+
+    @staticmethod
+    def dsv4_o_inv_rope(
+        o: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inverse GPT-J RoPE on attention output, flattened [T, H*D]."""
+        return _qc().dsv4_o_inv_rope(o, positions, cos_sin_cache)
+
+    @staticmethod
+    def dsv4_indexer_topk_decode(
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cand: torch.Tensor,
+        out: torch.Tensor,
+        width: int,
+        k_eff: int,
+    ) -> None:
+        """Decode-path indexer logits + top-k written into `out` rows."""
+        _qc().dsv4_indexer_topk_decode(
+            q, weights, kv_cache, block_table, cand, out, width, k_eff
+        )
+
+    @staticmethod
+    def qc_swiglu(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        clamp_limit: float | None = None,
+        oai_form: bool = False,
+        alpha: float = 1.0,
+        beta: float = 0.0,
+    ) -> None:
+        """Fused SwiGLU (Metal): silu(clamp?(gate))*clamp?(up) or the OAI
+        gate*sigmoid(alpha*gate)*(up+beta) form, into preallocated y."""
+        _qc().qc_swiglu(x, y, clamp_limit, oai_form, alpha, beta)
+
+    @staticmethod
+    def dsv4_router_topk(
+        gating: torch.Tensor,
+        out_w: torch.Tensor,
+        out_ids: torch.Tensor,
+        renormalize: bool,
+        scaling: float,
+        bias: torch.Tensor | None = None,
+        hash_table: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Fused MoE router top-k (sqrt + select + renorm + scale) written
+        into the preallocated out_w/out_ids. `gating` must already hold
+        softplus(logits) — the bitwise-safe route; no Metal softplus
+        formula matches MPS aten::softplus."""
+        _qc().dsv4_router_topk(
+            gating,
+            out_w,
+            out_ids,
+            renormalize,
+            scaling,
+            bias,
+            hash_table,
+            input_ids,
+        )
+
+    @staticmethod
+    def dsv4_indexer_topk_prefill(
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        tok_req: torch.Tensor,
+        cand: torch.Tensor,
+        out: torch.Tensor,
+        width: int,
+        k_eff: int,
+    ) -> None:
+        """Prefill indexer top-k: per-request block-table rows, request-local
+        candidate windows (decode kernel's ULP class vs the eager chain)."""
+        _qc().dsv4_indexer_topk_prefill(
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            tok_req,
+            cand,
+            out,
+            width,
+            k_eff,
+        )
+
+    @staticmethod
+    def dsv4_indexer_compress_insert(
+        state_cache: torch.Tensor,
+        positions: torch.Tensor,
+        state_slots: torch.Tensor,
+        token_to_req: torch.Tensor,
+        block_table: torch.Tensor,
+        kv_slots: torch.Tensor,
+        rms_weight: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        kv_cache: torch.Tensor,
+        state_block_size: int,
+        state_width: int,
+        compress_ratio: int,
+        eps: float,
+    ) -> None:
+        """Fused indexer compressor tail: gather + softmax compress + RMS +
+        RoPE + e4m3 quant + cache insert in one dispatch."""
+        _qc().dsv4_indexer_compress_insert(
+            state_cache,
+            positions,
+            state_slots,
+            token_to_req,
+            block_table,
+            kv_slots,
+            rms_weight,
+            cos,
+            sin,
+            kv_cache,
+            state_block_size,
+            state_width,
+            compress_ratio,
+            eps,
+        )
+
+    @staticmethod
+    def dsv4_compress_front(
+        state_cache: torch.Tensor,
+        positions: torch.Tensor,
+        state_slots: torch.Tensor,
+        token_to_req: torch.Tensor,
+        block_table: torch.Tensor,
+        rms_weight: torch.Tensor,
+        num_tokens: int,
+        state_block_size: int,
+        state_width: int,
+        compress_ratio: int,
+        eps: float,
+    ) -> torch.Tensor:
+        """Fused head=512 cr=4 compressor front: gather + softmax compress
+        + RMSNorm; returns bf16 rows for deepseek_v4_kv_insert."""
+        return _qc().dsv4_compress_front(
+            state_cache,
+            positions,
+            state_slots,
+            token_to_req,
+            block_table,
+            rms_weight,
+            num_tokens,
+            state_block_size,
+            state_width,
+            compress_ratio,
+            eps,
+        )
+
+    # ------------------------------------------------------------------
+    # native step tape (see metal_tape.py for the driver)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def qc_tape_register_layer(idx: int, tensors: dict, scalars: dict) -> None:
+        """Register one decoder layer's persistent tensors for the tape."""
+        _qc().qc_tape_register_layer(idx, tensors, scalars)
+
+    @staticmethod
+    def qc_tape_layer_forward(
+        idx: int,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        step: dict,
+        insert_block_size: int,
+    ) -> torch.Tensor:
+        """Run one registered decoder layer body natively (C++ encode). The
+        step dict carries THIS layer's slot tables/mappings (per-layer: KV
+        group unification can split identical specs into distinct groups)."""
+        return _qc().qc_tape_layer_forward(
+            idx, x, positions, input_ids, step, insert_block_size
+        )
+
     # ------------------------------------------------------------------
     # Sparse MLA decode (the AITER `mla_decode_fwd` counterpart on sm80)
     # ------------------------------------------------------------------
@@ -292,6 +502,53 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def deepseek_v4_indexer_kv_insert(
+        kv: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        """RoPE + e4m3 quant + insert for the V4 indexer K cache (132B slots).
+
+        ``positions`` must already hold the compressed RoPE anchors
+        ((pos // ratio) * ratio).
+        """
+        _qc().deepseek_v4_indexer_kv_insert(
+            kv,
+            kv_cache,
+            slot_mapping,
+            positions,
+            cos_sin_cache,
+            block_size,
+        )
+
+    @staticmethod
+    def deepseek_v4_prefill_dequant(
+        cache: torch.Tensor, slots: torch.Tensor
+    ) -> torch.Tensor:
+        """Decode fp8 cache slots into a contiguous half [n, 512] scratch."""
+        return _qc().deepseek_v4_prefill_dequant(cache, slots)
+
+    @staticmethod
+    def deepseek_v4_prefill_fa(
+        q: torch.Tensor,
+        kc: torch.Tensor,
+        ks: torch.Tensor,
+        lens_c: torch.Tensor,
+        lo_s: torch.Tensor,
+        hi_s: torch.Tensor,
+        sinks: torch.Tensor,
+        scale: float,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dense-causal prefill MMA FA over pre-decoded half axes."""
+        return _qc().deepseek_v4_prefill_fa(
+            q, kc, ks, lens_c, lo_s, hi_s, sinks, scale, out
+        )
+
+    @staticmethod
     def deepseek_v4_sparse_attention(
         q: torch.Tensor,
         compressed_cache: torch.Tensor,
@@ -302,6 +559,7 @@ class quixicore_ops:
         swa_lens: torch.Tensor,
         sinks: torch.Tensor,
         scale: float,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run two-cache packed sparse MLA attention on Metal."""
         return _qc().deepseek_v4_sparse_attention(
@@ -314,6 +572,7 @@ class quixicore_ops:
             swa_lens,
             sinks,
             scale,
+            out,
         )
 
     @staticmethod
@@ -462,15 +721,6 @@ class quixicore_ops:
         except ImportError:
             return False
 
-    @staticmethod
-    def rms_norm(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-    ) -> torch.Tensor:
-        """Single-dispatch bf16 RMSNorm over a contiguous [rows, D] input."""
-        return _qc().rms_norm(x, weight, eps)
-
     def paged_attention(
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -550,9 +800,66 @@ class quixicore_ops:
         quant_type: int,
         row: int,
         tokens: int,
+        soa: bool = False,
     ) -> torch.Tensor:
         """Device-selected GGUF MoE GEMV on Metal."""
-        return _qc().ggml_moe_a8_vec(x, w, topk_ids, top_k, quant_type, row, tokens)
+        return _qc().ggml_moe_a8_vec(
+            x, w, topk_ids, top_k, quant_type, row, tokens, soa
+        )
+
+    @staticmethod
+    def ggml_moe_a8_vec_swiglu(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        quant_type: int,
+        row: int,
+        tokens: int,
+        clamp_limit: float | None = None,
+    ) -> torch.Tensor:
+        """iq2_xxs MoE GEMV with the SwiGLU epilogue fused (bit-exact vs
+        ggml_moe_a8_vec followed by qc_swiglu form 0)."""
+        return _qc().ggml_moe_a8_vec_swiglu(
+            x, w, topk_ids, top_k, quant_type, row, tokens, clamp_limit
+        )
+
+    @staticmethod
+    def ggml_moe_a8_vec_sum(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_w: torch.Tensor,
+        top_k: int,
+        quant_type: int,
+        row: int,
+        tokens: int,
+        out: torch.Tensor,
+        soa: bool = False,
+    ) -> torch.Tensor:
+        """q2_K MoE down GEMV with the weighted expert-slot sum folded into
+        the epilogue; writes (tokens, row) into `out` (no per-slot
+        intermediate, no separate weighted-sum dispatch)."""
+        return _qc().ggml_moe_a8_vec_sum(
+            x, w, topk_ids, topk_w, top_k, quant_type, row, tokens, out, soa
+        )
+
+    @staticmethod
+    def ggml_moe_mm_id(
+        x: torch.Tensor,
+        w: torch.Tensor,
+        topk_ids: torch.Tensor,
+        top_k: int,
+        quant_type: int,
+        row: int,
+        tokens: int,
+        soa: bool = False,
+    ) -> torch.Tensor:
+        """MoE tiled GEMM for prefill widths (two-phase map0 + 64x32
+        simdgroup MMA): iq2_xxs w13 over (tokens, K) or q2_K down over the
+        per-slot (tokens*top_k, K); returns (tokens*top_k, row) in the vec
+        kernels' flat (token, slot) row order."""
+        return _qc().ggml_moe_mm_id(x, w, topk_ids, top_k, quant_type, row, tokens, soa)
 
     @staticmethod
     def ggml_mul_mat_a8(

@@ -4,14 +4,17 @@ import numpy as np
 import torch
 
 from vllm.v1.outputs import DraftTokenIds
-from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.async_utils import async_copy_to_np, make_output_copy_stream
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
 class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device
-        self.copy_stream = torch.Stream(device)
+        # On MPS this is the producing stream (see make_output_copy_stream):
+        # this handler had the same cross-stream copy+event shape whose cold
+        # hand-off loses the completion signal on Metal.
+        self.copy_stream = make_output_copy_stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.Event()
 
@@ -33,17 +36,22 @@ class DraftTokensHandler:
         # For spec decoding + structured outputs, we must transfer the
         # draft tokens back to the scheduler for grammar validation.
         current_stream = torch.accelerator.current_stream(self.device)
-        self.copy_stream.wait_stream(current_stream)
-        torch.accelerator.set_stream(self.copy_stream)
+        cross_stream = self.copy_stream != current_stream
+        if cross_stream:
+            self.copy_stream.wait_stream(current_stream)
+            torch.accelerator.set_stream(self.copy_stream)
         try:
             self.draft_tokens_np = async_copy_to_np(draft_tokens)
-            # draft_tokens is a temporary allocation on the main stream and read here on
-            # copy_stream; without record_stream, the caching allocator may reuse its
-            # memory before the async copy executes.
-            draft_tokens.record_stream(self.copy_stream)
+            if cross_stream:
+                # draft_tokens is a temporary allocation on the main stream
+                # and read here on copy_stream; without record_stream, the
+                # caching allocator may reuse its memory before the async
+                # copy executes.
+                draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
         finally:
-            torch.accelerator.set_stream(current_stream)
+            if cross_stream:
+                torch.accelerator.set_stream(current_stream)
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:

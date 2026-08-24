@@ -800,9 +800,10 @@
       "platform_overrides": {
         "metal": {
           "engine": {
+            "dtype": "float16",
             "max_model_len": 262144,
             "max_num_seqs": 32,
-            "max_num_batched_tokens": 2048,
+            "max_num_batched_tokens": 2176,
             "gpu_memory_utilization": null,
             "kv_cache_memory_bytes": 17179869184,
             "kv_cache_dtype": "fp8_ds_mla",
@@ -821,8 +822,9 @@
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
             "The fixed 16 GiB hybrid KV pool is sized to hold one full 262,144-token request (target fp8_ds_mla across 43 layers plus the 3-layer TurboQuant draft cache, ~9 GiB) with margin for concurrent shorter sessions. Weights (80.8 GiB target + 6.5 GiB drafter) plus this pool total ~103 GiB, inside the ~115 GiB Metal working set of a 128 GiB machine. Higher API concurrency drains in scheduler waves instead of paging model weights.",
-            "max_model_len is 262144 for real (agentic) use. The earlier 3072/1 GiB configuration existed only to pin the 1k-in/2k-out benchmark matrix; throughput numbers in perf/baseline_status.md were measured under that config and predate this sizing.",
-            "Long-context status (2026-08-10): the KV pool is planner-verified at 2,225,562 logical tokens, and short-prompt serving is validated end to end at temperatures 0/0.7/default with --no-spec. Prompts past the first 2048-token prefill chunk crash: the sparse-MLA indexer pipeline (fused_indexer_q_rope_quant, short-context topk fill, indexer scoring/topk) is Triton/CUDA-only and has no Metal implementation yet -- the old 3072 cap simply kept every request below the indexer's engagement length. Port the indexer chain from the ROCm reference before calling 256k served. The DSpark spec path additionally stalled in its first verify step and needs a re-test with the restored 32-split TurboQuant geometry and a cold-compile-sized patience budget; see perf/optimization_status.md 2026-08-10 Metal entry."
+            "max_model_len is 262144 for real (agentic) use. The 1k-in/2k-out benchmark matrix in perf/baseline_status.md is re-gated under this sizing (see the M1 Ultra campaign entries).",
+            "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk).",
+            "Long-context status (2026-08-23): the sparse-MLA indexer chain (fused indexer Q rope/quant, prefill top-k, scoring) has a native Metal implementation. Async output copies and their completion event stay on the producing MPS stream (unit-tested), which is believed to remove the cold cross-stream event ordering failure; the deterministic cold-boot wedge repro (primer then a direct multi-chunk prefill) has not been re-run, so the boot-ramp protocol in perf/prefill_handoff.md remains the ops guidance until it is. Prefill top-k sizes native work from the active request window and streams windows above 1,024 candidates with fixed scratch; the 65,536-candidate native oracle matches the eager chain on tie ordering and the streaming loop (its all-zero-query block does not exercise scoring). Full 262,144-token end-to-end serving still needs a dedicated long-context validation pass."
           ]
         }
       }
