@@ -9854,3 +9854,79 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   changes are off the native serving path, and the stream change is
   behavior-neutral on CUDA (same dedicated stream) — flagged for the
   next M1 Ultra pass alongside the n_cand merge-loop item.
+
+## 2026-08-17 — Async-output completion-event wedge: structural Metal fix (native mps event, no cross-stream choreography)
+
+- Status: retained (separate PR; user-requested follow-up to the campaign)
+- The defect, from the accumulated evidence (boot_v12/v12c py-spy 2/2,
+  08-15 merge-gate wedge, cleanup-phase host-timing bisect): the engine
+  parks forever in THPEvent_synchronize -> MPSEvent::synchronize on
+  AsyncOutput.copy_event, GPU idle, no CB error — the signal is lost. The
+  machinery it rides is fictional on Metal: torch.Stream(mps) ALWAYS
+  returns stream_id 0 (probed, torch 2.13), so async_utils'
+  set_stream + copy_stream.wait_stream(main_stream) + generic
+  torch.Event().record(copy_stream) is a cross-stream dance on one stream
+  — zero overlap bought, and a completion path routed through an event
+  observed to never fire on timing-sensitive boots.
+- Fix (vllm/v1/worker/gpu/async_utils.py): on Metal, AsyncOutput and
+  AsyncPoolingOutput skip the stream context, wait_stream, and generic
+  Event entirely; the same non-blocking D2H copies enqueue on the only
+  stream and completion is a native torch.mps.Event recorded there
+  (record() on current stream, no stream juggling). get_output() waits on
+  that event. Ops kill-switch VLLM_QC_ASYNC_OUT_DRAIN=1 replaces the event
+  with a full torch.mps.synchronize() drain.
+- Why not just drain: measured. The drain-only variant lost the drafter
+  tail overlap — off1-2000 wall 65.26 s / 30.6 tok/s vs 62.93-63.09 s
+  baseline (-3.7%). The native-event build restores it: 62.53 s /
+  32.0 tok/s (best wall of the day). The 08-15 CB-timeout drain variant is
+  also explained: it swapped only the host wait and left wait_stream's
+  GPU-side encodeWaitForEvent in place; this fix removes both.
+- Honesty note on reproduction: the wedge did NOT reproduce today on the
+  UNFIXED build (2/2 clean cold triggers: no-primer 2500-direct and
+  primer+2500-direct) — the host-timing race has drifted out of its
+  trigger window on this box (the same environmental drift that re-rolled
+  the 2500 trajectory, see UPDATE 29). The fix therefore rests on the
+  structural argument plus the prior deterministic evidence, not on a
+  live repro-kill. By construction the parked-event failure mode cannot
+  occur: there is no cross-stream event to lose.
+- Validation (5 boots, fixed build): (1) drain variant: cold 2500 direct
+  clean + all anchors bit-exact; (2) native event, standard ramp: 8-tok
+  db2846cf721b 7/10/2, off1-2000 7ce993786ba1 1538/2320/464 @ 62.53 s
+  (32.0 tok/s), 2500 e973493bef44 51/60/12 @ 3.37 s — ALL bit-exact vs
+  UPDATE 29 anchors; (3) boot_v12 wedge protocol (primer -> 2500 direct)
+  clean; (4) 08-15 wedge protocol (primer -> 8-tok -> 2500) clean;
+  (5) VLLM_QC_ASYNC_OUT_DRAIN=1 boot serves bit-exact (8-tok + 2500).
+- Kept: compressor/metal.py phaseprof/memo structure and the boot-ramp ops
+  protocol stay until a soak on the fixed path proves them unnecessary
+  (documented in metal_compat.py). CUDA/ROCm path byte-identical.
+- Raw: perf/results/2026-08-17/wedge_fix/ (boot_fix1..5 logs).
+
+## 2026-08-24 - PR #3 Rebase: Native MPS Completion Event Merged With Stream Helper
+
+- Context: PR #3 (async-output wedge structural fix, entry above) was
+  authored against the pre-review campaign branch; PR #2 later landed
+  make_output_copy_stream + stream-equality logic and extended coverage
+  to DraftTokensHandler and StructuredOutputsWorker. This rebase merges
+  the two designs rather than picking one.
+- Kept from PR #2: make_output_copy_stream as the single platform
+  decision point (producing stream on MPS — the only stream that
+  exists), the equality-based on-main detection in the copy classes,
+  and the DraftTokensHandler / StructuredOutputsWorker coverage.
+- Adopted from PR #3: the completion marker itself. Generic
+  torch.Event() is replaced by make_completion_event() — a native
+  torch.mps.Event on Metal (argless record on the one real stream) or
+  None under the VLLM_QC_ASYNC_OUT_DRAIN=1 kill-switch, which
+  sync_completion_event turns into a full torch.mps.synchronize().
+  PR #2's version still recorded a generic torch.Event on the producing
+  stream; PR #3's M1 Ultra evidence identifies the generic event
+  machinery itself as the loss point and measured the native event at
+  32.0 tok/s vs 30.6 for the drain (both bit-exact), so the native
+  event is the default and the drain the fallback. DraftTokensHandler
+  uses the same marker (its generic event synchronize was the last one
+  left on the Metal completion path).
+- On-main-stream copies now run under contextlib.nullcontext instead of
+  a redundant same-stream set_stream pair (PR #3's shape).
+- Validation here (M5 Max): async-output regression tests updated for
+  the native event type and pass alongside the full kernel suite; the
+  M1 Ultra anchor/wedge validation is recorded in the entry above and
+  was performed on PR #3's variant, whose event mechanism is identical.
