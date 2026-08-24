@@ -37,7 +37,9 @@ independent TP4 instances for isolation, at roughly the 4× row each.</sub>
 
 <sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
 responses, temperature 0, DSpark speculative decoding with TurboQuant draft
-KV. 1M-token context is available on 4+ GPUs.</sub>
+KV. 1M-token context is available on 4+ GPUs. Temperature 0 was the method of
+record for these historical numbers; current benchmarking uses each model's
+shipped sampling defaults, seeded.</sub>
 <!-- markdownlint-enable MD033 -->
 
 ---
@@ -100,10 +102,15 @@ for each model family.
 
 ### Models
 
-Three architectures: [GLM-5.2-Vision][glm] and [Kimi K3](#also-supported-kimi-k3-vision)
-with vision, [DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only)
-text-only. GLM-5.2-Vision is what the tuning targets; the others reuse its
-kernels. The [profile table](#quick-start) below has the GPU counts.
+Five architectures: [GLM-5.2-Vision][glm], [Kimi K3](#also-supported-kimi-k3-vision),
+[Muse-Glimmer-30B](#also-supported-muse-glimmer-30b-vision-apple-silicon), and
+[Qwen3.8-27B](#also-supported-qwen38-27b-vision-apple-silicon) with vision,
+[DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only) text-only.
+GLM-5.2-Vision is what the ROCm/CUDA tuning targets, and DeepSeek-V4 and
+Kimi K3 reuse its kernels; Muse-Glimmer and Qwen3.8 are served by the
+Metal stack with their own kernel work (fused gated-DeltaNet step, DFlash 2
+drafter kernels, hybrid cache pool). The [profile table](#quick-start) below
+has the GPU counts.
 
 This is not general-purpose vLLM. Support for models, accelerators and
 quantization paths outside the ones above has been deleted so the rest can be
@@ -118,6 +125,11 @@ What the specialization buys:
 - TurboQuant compressed KV for the draft model (sliding-window support added here)
 - AITER sparse-MLA (DSA) attention with a working 1M-token path
 - ~154 s cold start on a 244 GiB model (even faster load time than llama.cpp)
+- A vendored QuixiCore Metal kernel library (native MPS serving for three
+  model families: packed sparse-MLA caches, GGUF i-quant/k-quant GEMV/GEMM,
+  fused gated-DeltaNet decode, tensor-ops speculative verify)
+- DFlash / DFlash 2 block-diffusion drafters on Metal (path-selector
+  drafting with per-step dynamic convolutions)
 
 [antirez]: https://huggingface.co/antirez
 [ds4]: https://github.com/antirez/ds4
@@ -274,8 +286,7 @@ curl -s http://localhost:8000/v1/chat/completions \
         {"type": "text", "text": "What is happening in this image? Name the two Pokemon and read the interface text."}
       ]
     }],
-    "max_tokens": 2048,
-    "temperature": 0
+    "max_tokens": 2048
   }' | jq -r '.choices[0].message.content'
 ```
 <!-- markdownlint-enable MD013 -->
@@ -323,8 +334,24 @@ curl -s http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model": "GLM-5.2-Vision",
        "messages": [{"role": "user", "content": "Explain speculative decoding."}],
-       "max_tokens": 512, "temperature": 0}' | jq -r '.choices[0].message.content'
+       "max_tokens": 512}' | jq -r '.choices[0].message.content'
 ```
+
+### Structured output and custom tools
+
+Structured outputs are grammar-enforced through XGrammar: JSON-schema
+constrained responses on the OpenAI endpoints, and Responses API custom
+tools whose payloads are constrained by Lark grammars — the model cannot
+emit an argument that fails the tool's grammar. See
+[`examples/responses_apply_patch.py`](examples/responses_apply_patch.py)
+for a custom `apply_patch` tool with a Codex-style grammar.
+
+Speculative decoding honors the grammars too: with DSpark, every
+sequential draft sample is masked by the request's grammar state, so
+constrained requests keep their draft acceptance instead of paying
+rejection on every speculative token. Grammar-aware drafting degrades
+per-request to unconstrained drafting on any mismatch; target-side
+enforcement always stands.
 
 ---
 
@@ -515,6 +542,46 @@ the ceiling, so `k3-xxs-6` is the configuration a stale build degrades.
 
 ---
 
+## Also supported: Muse-Glimmer-30B (vision, Apple Silicon)
+
+A 30B vision model served natively on one Mac (64 GiB+) through the
+PyTorch-MPS worker and the vendored QuixiCore Metal kernels, with a DFlash
+block-diffusion drafter (16 draft tokens per block) verified by fused
+tensor-ops kernels.
+
+```bash
+slimserve muse-kdyn-1
+```
+
+Two published quants from `meta-models/Muse-Glimmer-30B-GGUF`:
+`--quant kquant-dynamic` (per-layer mixed, the default) and
+`--quant kquant-17gb` (uniform Q4_K_M). Measured 20.1 tok/s single-request
+decode on an M5 Max with speculation on (exact-token harness, shipped
+sampling defaults, seeded).
+
+## Also supported: Qwen3.8-27B (vision, Apple Silicon)
+
+The smallest-Mac entry point (48 GiB+): a 64-layer hybrid with 48
+gated-DeltaNet linear-attention layers and 16 full-attention layers
+(GQA 24/4, head_dim 256) over a 248,320-token vocabulary, plus a
+qwen3vl-merger vision tower. The linear-attention state and the attention
+KV share one hybrid Metal cache pool.
+
+```bash
+slimserve qwen38-q2kxl-1
+```
+
+One published quant: `unsloth/Qwen3.8-27B-GGUF` UD-Q2_K_XL with its F16
+vision projector. The drafter is the Inco AI DFlash 2 block-diffusion model
+(`z-lab/Qwen3.8-27B-DFlash2-GGUF`): a path selector scores top-16 candidate
+continuations with per-step two-tap dynamic convolutions; the profile runs
+3 draft tokens per block. On an M5 Max (exact-token harness, shipped
+sampling defaults, seeded): ~17 tok/s plain, 23.1–23.7 tok/s with
+speculation on essay-style prompts, and 34.3–35.3 tok/s on GSM8K-style
+prompts, where acceptance is high. The `qwen3_5` architecture also loads
+the HF safetensors checkpoint (`Qwen/Qwen3.8-27B`) directly, alongside the
+GGUF path.
+
 ## Apple Silicon
 
 Three models run through the in-tree PyTorch-MPS worker and the vendored
@@ -685,7 +752,9 @@ See [Parallelism: TP vs DP vs EP](#parallelism-tp-vs-dp-vs-ep) for why
 ### Concurrency scaling — 2×MI300X, Q2_K, 100k in / 2k out
 
 Shared 100k-token prefix (prefix-cached), unique per-request question, exactly
-2,000 output tokens each, DSpark spec-3 + TurboQuant draft KV, temperature 0:
+2,000 output tokens each, DSpark spec-3 + TurboQuant draft KV, temperature 0
+(the historical method for this table; current runs use the model's shipped
+sampling defaults, seeded):
 
 #### 2× MI300X
 
@@ -815,6 +884,21 @@ Prefix caching gives an **11.4× TTFT speedup** on a warm 12k-token prompt
 (12.55 s → 1.10 s) and hits at 16-token granularity, so partially-overlapping
 prompts still benefit.
 
+### Apple Silicon — M5 Max, single request
+
+Exact-token harness, each model's shipped sampling defaults, seeded:
+
+| Model | Plain decode | Speculative |
+| --- | ---: | ---: |
+| Muse-Glimmer-30B (`muse-kdyn-1`) | — | **20.1** tok/s |
+| Qwen3.8-27B (`qwen38-q2kxl-1`), essay prompts | 17.0 | **23.1–23.7** tok/s |
+| Qwen3.8-27B, GSM8K-style prompts | — | **34.3–35.3** tok/s |
+
+Speculation is always on in the shipped profiles; the plain row is the
+diagnostic reference. DeepSeek-V4 on Metal is under re-validation and its
+number is deliberately absent (the historical 33.7 tok/s was measured under
+a since-changed profile geometry; see `perf/baseline_status.md`).
+
 ### Benchmarking caveat
 
 Do **not** benchmark with synthetic repeated-token prompts (`[1000] * N`). On
@@ -826,10 +910,19 @@ text with per-request unique suffixes.
 
 ## Requirements
 
+One of:
+
 - 2–8 AMD MI300X (gfx942), ROCm with AITER
+- 4–8 NVIDIA A100, CUDA
+- An Apple Silicon Mac (48 GiB+ unified memory; see
+  [Apple Silicon](#apple-silicon) for the per-model gates)
+
+Plus:
+
 - Python 3.12 via `uv`; all commands go through `.venv/bin/python`
-- Model weights and the `mmproj` vision tower under `~/models/GLM-5.2-Vision-GGUF/`
-- The DSpark draft checkpoint, downloaded automatically on first run
+- Model weights under `~/models/` (or `$SLIMSERVE_CACHE`) — `slimserve`
+  downloads or resumes everything a profile needs, including vision
+  projectors and draft checkpoints, on first run
 
 ## Building
 
@@ -839,6 +932,11 @@ uv pip install -r requirements/lint.txt
 uv pip install -e . --torch-backend=auto     # C++/HIP changes
 VLLM_USE_PRECOMPILED=1 uv pip install -e .   # Python-only changes
 ```
+
+On Apple Silicon the same `uv pip install -e .` builds the `_quixicore_C`
+extension and compiles the QuixiCore Metal kernel library
+(`vllm/quixicore_metal.metallib`) with the system Metal toolchain; no ROCm
+or CUDA components are required.
 
 The ROCm base image pins the exact tested AITER revision and applies
 SlimServe's dependency patches before building its wheel. For a source-tree
