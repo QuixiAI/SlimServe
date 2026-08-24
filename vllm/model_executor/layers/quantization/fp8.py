@@ -92,6 +92,29 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = init_logger(__name__)
 
 
+# Multimodal checkpoints nest the towers under `model.` (`model.language_model.*`,
+# `model.visual.*`), while the vLLM wrapper registers them the other way round
+# (`language_model.model.*`, `visual.*`). `is_layer_skipped` matches prefixes
+# exactly, so without this every exclusion silently misses and layers the
+# checkpoint deliberately left in bf16 -- lm_head, conv1d, the GDN in_proj_ba --
+# get quantized anyway, which produces degenerate output rather than an error.
+_MULTIMODAL_PREFIX_REMAP = (
+    ("model.language_model.", "language_model.model."),
+    ("model.visual.", "visual."),
+)
+
+
+def _remap_multimodal_prefixes(ignored_layers: list[str] | None) -> list[str] | None:
+    if not ignored_layers:
+        return ignored_layers
+    out = list(ignored_layers)
+    for name in ignored_layers:
+        for hf_prefix, vllm_prefix in _MULTIMODAL_PREFIX_REMAP:
+            if name.startswith(hf_prefix):
+                out.append(vllm_prefix + name[len(hf_prefix) :])
+    return out
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -164,6 +187,7 @@ class Fp8Config(QuantizationConfig):
             ignored_layers = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
             )
+        ignored_layers = _remap_multimodal_prefixes(ignored_layers)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
