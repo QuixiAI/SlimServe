@@ -610,6 +610,12 @@ def build_attn_metadata(
     if steady is not None and steady.get("sig") == steady_sig:
         for cm, items in steady["groups"]:
             cm.max_seq_len = max_seq_len
+            # Computed-token counts advance every decode step; the cached
+            # tensor is a view of the producer's persistent buffer today,
+            # but refresh explicitly so a producer change cannot leave the
+            # steady path reading first-step values.
+            if num_computed_tokens_cpu is not None:
+                cm._num_computed_tokens_cpu = num_computed_tokens_cpu
             for builder, meta, layer_names, supports in items:
                 if supports:
                     builder.steady_decode_update(meta, cm)

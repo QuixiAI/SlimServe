@@ -10,6 +10,23 @@ from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunner
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
+def make_output_copy_stream(device: torch.device | str | None) -> torch.Stream:
+    """Stream for output and side-channel copies that would otherwise
+    overlap with compute on a second stream.
+
+    On MPS this returns the CURRENT (producing) stream: a cold cross-
+    stream event hand-off can lose its completion signal (the first-
+    multi-chunk-prefill park; perf/prefill_handoff.md), so every Metal
+    copy path stays on the producing stream. This helper is the single
+    place that platform decision lives — consumers compare their copy
+    stream against the main stream instead of testing device types.
+    CUDA/ROCm get a dedicated stream to overlap the transfer."""
+    dev = torch.device(device) if device is not None else None
+    if dev is not None and dev.type == "mps":
+        return torch.accelerator.current_stream(dev)
+    return torch.Stream(device)
+
+
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -30,13 +47,12 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.copy_event = torch.Event()
         self._has_fault: torch.Tensor | None = None
 
-        # MPS cannot reliably cold-start this cross-stream hand-off.  In
-        # particular, the first request whose prefill spans multiple engine
-        # steps can leave the copy-stream event permanently unsignalled.  The
-        # output is only a few scalars, so keep its copy and completion event
-        # on the producing stream on MPS.  CUDA/ROCm retain the independent
-        # copy stream used to overlap this transfer with proposal work.
-        copy_on_main_stream = sampler_output.sampled_token_ids.device.type == "mps"
+        # On MPS, make_output_copy_stream hands out the producing stream
+        # (cold cross-stream event hand-offs can lose the completion
+        # signal), so the copy and its event land on the main stream with
+        # no cross-stream wait. CUDA/ROCm arrive with a dedicated copy
+        # stream and retain the overlap.
+        copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
         with stream(output_stream, main_stream):
             if not copy_on_main_stream:
@@ -109,7 +125,9 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.Event()
 
-        copy_on_main_stream = self.pooler_output.device.type == "mps"
+        # Same single-place platform decision as AsyncOutput: on MPS the
+        # handed copy stream IS the main stream (make_output_copy_stream).
+        copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
         with stream(output_stream, main_stream):
             if not copy_on_main_stream:

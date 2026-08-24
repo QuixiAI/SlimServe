@@ -5,7 +5,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.gpu.async_utils import stream
+from vllm.v1.worker.gpu.async_utils import make_output_copy_stream, stream
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -19,7 +19,10 @@ class StructuredOutputsWorker:
             (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device
         )
         self.device = device
-        self.copy_stream = torch.Stream(device)
+        # On MPS this is the producing stream (make_output_copy_stream):
+        # the bitmask/mapping staging otherwise cold-starts a cross-stream
+        # hand-off on the first structured-output request mid-serve.
+        self.copy_stream = make_output_copy_stream(device)
 
     def apply_grammar_bitmask(
         self,
@@ -62,7 +65,8 @@ class StructuredOutputsWorker:
             )
 
         # Ensure all async copies are complete before launching the kernel.
-        current_stream.wait_stream(self.copy_stream)
+        if self.copy_stream != current_stream:
+            current_stream.wait_stream(self.copy_stream)
 
         num_masks = bitmask.shape[0]
         assert num_masks == len(mapping)
@@ -100,7 +104,8 @@ class StructuredOutputsWorker:
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
-        self.copy_stream.wait_stream(current_stream)
+        if self.copy_stream != current_stream:
+            self.copy_stream.wait_stream(current_stream)
 
 
 # Adapted from

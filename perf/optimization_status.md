@@ -9757,3 +9757,46 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
      q2_K sum-rows rule duplicated in three places.
 - Raw artifacts: perf/results/2026-08-24/pr2-independent-review/ on
   this box (M5 Max; review transcript and test logs).
+
+## 2026-08-24 - PR #2 Follow-Ups: Streams, Padding, Bounded Fallbacks
+
+- Context: the open items from the independent review plus CodeRabbit's
+  two findings on e28ea0afa, all python-side (metallib unchanged).
+- Cross-stream hand-offs (open item 1): the Metal platform decision now
+  lives in one place — async_utils.make_output_copy_stream returns the
+  producing stream on MPS and a dedicated stream elsewhere. AsyncOutput
+  and AsyncPoolingOutput detect on-main by stream equality (no device-
+  type strings in shared worker code); DraftTokensHandler and
+  StructuredOutputsWorker — the two structural twins of the fixed
+  async-output race — take the helper and guard their cross-stream
+  waits, so a first structured-output request on Metal no longer
+  cold-starts the hand-off shape that parked. The regression test now
+  pins the helper contract and covers the pooling twin.
+- Padded metadata (open item 2 + CodeRabbit): prepare_attn stages
+  num_computed_tokens_cpu and is_prefilling through persistent padded
+  buffers (allocated once; zero/False tails), the flash_attn RSWA
+  consumer copies the real entries and zeroes the padded tail (fixes
+  the non-broadcastable copy_ for all three model states at the single
+  consumption point), and the steady-decode cache hit refreshes
+  _num_computed_tokens_cpu explicitly so first-step values can never be
+  replayed even if the producer's view pattern changes.
+- Bounded decode fallback (open item 3): the eager decode path now
+  routes through _score_and_select_streaming with a k_provider that
+  gathers the indexer cache per 1024-candidate tile — the previous
+  full-width gather materialized [num_decode, width, 128] fp32
+  (multi-GiB at width 65,536); each tile stays <= 16 MiB. The streaming
+  selector is layout-agnostic ([n_k, 128] and [rows, n_k, 128]),
+  closing CodeRabbit's 3-D hazard, with pre-gathered and provider
+  parity tests including tie plateaus. The prefill synchronize moved
+  inside the row-chunk loop so the candidate-tile dispatch
+  multiplication stays bounded by the sync it was written for.
+- Small items: _moe_vec_row_limit env parse guarded; the indexer topk
+  oracle now plants 0x7F/0xFF e4m3 NaN codes in both blocks, proving
+  the kernel's stale-slot guard against the eager LUT instead of
+  sanitizing the codes out of reach.
+- Validation: 25 passed / 103 CUDA-gated skips (tests/kernels +
+  post_update + dispatch guards) on the M5 Max; ruff clean; imports
+  clean. No throughput claims: the decode-fallback and sync-bracket
+  changes are off the native serving path, and the stream change is
+  behavior-neutral on CUDA (same dedicated stream) — flagged for the
+  next M1 Ultra pass alongside the n_cand merge-loop item.

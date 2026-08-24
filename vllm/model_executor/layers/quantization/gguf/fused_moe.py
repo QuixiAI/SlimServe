@@ -38,7 +38,10 @@ from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
 def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
     override = os.environ.get(env)
     if override:
-        return int(override)
+        try:
+            return int(override)
+        except ValueError:
+            pass
     if not current_platform.is_rocm():
         return cuda_default
     return default

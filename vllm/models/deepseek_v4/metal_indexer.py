@@ -38,8 +38,11 @@ from vllm.forward_context import get_forward_context
 _LONGCTX_PREFILL_SYNC = os.environ.get("VLLM_QC_LONGCTX_SYNC", "1") != "0"
 
 # Rows and candidates per fallback score tile: together they bound the fp32
-# intermediate to 32 MiB instead of scaling it to the configured context
-# length (which would be about 2 GiB at 128 rows x 64 heads x 65,536 keys).
+# intermediates of both eager fallbacks (prefill row-chunks the queries;
+# decode additionally tiles the cache gather through the streaming
+# selector's k_provider) instead of scaling them to the configured context
+# length (about 2 GiB of scores at 128 rows x 64 heads x 65,536 keys, and
+# a multi-GiB decode gather at 32 tokens x 65,536 keys x 128 dims).
 _SCORE_ROW_CHUNK = 128
 _SCORE_K_CHUNK = 1024
 
@@ -105,15 +108,31 @@ def _score_and_select(
 def _score_and_select_streaming(
     q: torch.Tensor,
     weights: torch.Tensor,
-    k_vals: torch.Tensor,
-    k_scale: torch.Tensor,
+    k_vals: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
     lo: torch.Tensor | None,
     hi: torch.Tensor,
     k_eff: int,
+    *,
+    n_k: int | None = None,
+    k_provider=None,
 ) -> torch.Tensor:
-    """Candidate-tiled fallback with O(rows * heads * 1024) score memory."""
+    """Candidate-tiled fallback with O(rows * heads * 1024) score memory.
+
+    Serves both K layouts of _score_and_select: shared [n_k, 128] and
+    per-row [rows, n_k, 128] (tiles slice the candidate axis in either).
+    With ``k_provider``, k_vals/k_scale are None and each tile is fetched
+    as ``k_provider(k0, k1) -> (tile_vals, tile_scale)`` with ``n_k``
+    bounding the candidate axis — this keeps the decode fallback's cache
+    gather tiled instead of materializing [rows, width, 128] up front."""
     rows = q.shape[0]
-    n_k = k_vals.shape[-2]
+    all_vals: torch.Tensor | None = None
+    all_scale: torch.Tensor | None = None
+    if k_provider is None:
+        assert k_vals is not None and k_scale is not None
+        all_vals, all_scale = k_vals, k_scale
+        n_k = all_vals.shape[-2]
+    assert n_k is not None
     best_vals = torch.full(
         (rows, k_eff), float("-inf"), dtype=torch.float32, device=q.device
     )
@@ -121,12 +140,18 @@ def _score_and_select_streaming(
 
     for k0 in range(0, n_k, _SCORE_K_CHUNK):
         k1 = min(k0 + _SCORE_K_CHUNK, n_k)
-        tile_vals = k_vals[k0:k1]
-        tile_scale = k_scale[k0:k1]
+        if all_vals is not None and all_scale is not None:
+            tile_vals = all_vals[..., k0:k1, :]
+            tile_scale = all_scale[..., k0:k1]
+        else:
+            tile_vals, tile_scale = k_provider(k0, k1)
         col = torch.arange(k0, k1, device=q.device)
-        scores = torch.einsum("thd,kd->thk", q.float(), tile_vals)
+        if tile_vals.dim() == 2:
+            scores = torch.einsum("thd,kd->thk", q.float(), tile_vals)
+        else:
+            scores = torch.einsum("thd,tkd->thk", q.float(), tile_vals)
         logits = torch.einsum("thk,th->tk", torch.relu(scores), weights)
-        logits *= tile_scale[None, :]
+        logits *= tile_scale if tile_scale.dim() == 2 else tile_scale[None, :]
         invalid = col[None, :] >= hi[:, None]
         if lo is not None:
             invalid |= col[None, :] < lo[:, None]
@@ -300,24 +325,33 @@ def metal_sparse_attn_indexer(
         if not native:
             # The Metal builder path expands decode metadata per token
             # (block_table row and compressed candidate count per decode
-            # token).
+            # token). The cache gather is tiled through the streaming
+            # selector: a full-width gather would materialize
+            # [num_decode, width, 128] fp32 (multi-GiB at the 262K
+            # profile's width of 65,536); each tile stays <= 16 MiB.
             cand = dec.seq_lens.reshape(-1)[:num_decode].to(torch.long)
             bt = dec.block_table[:num_decode].to(torch.long)
-            j = torch.arange(width, device=q.device)
-            cols = torch.div(j, block_size, rounding_mode="floor").clamp(
-                max=max(bt.shape[1] - 1, 0)
-            )
-            blocks = bt.gather(1, cols.unsqueeze(0).expand(num_decode, width))
-            offs = torch.remainder(j, block_size).unsqueeze(0)
-            k_vals, k_scale = _gather_k(kv_cache, blocks, offs, lut)
-            idx = _score_and_select(
+            max_col = max(bt.shape[1] - 1, 0)
+
+            def _decode_tile(k0: int, k1: int):
+                j = torch.arange(k0, k1, device=q.device)
+                cols = torch.div(j, block_size, rounding_mode="floor").clamp(
+                    max=max_col
+                )
+                blocks = bt.gather(1, cols.unsqueeze(0).expand(num_decode, k1 - k0))
+                offs = torch.remainder(j, block_size).unsqueeze(0)
+                return _gather_k(kv_cache, blocks, offs, lut)
+
+            idx = _score_and_select_streaming(
                 q[:num_decode],
                 weights[:num_decode],
-                k_vals,
-                k_scale,
+                None,
+                None,
                 None,
                 cand,
                 k_eff,
+                n_k=width,
+                k_provider=_decode_tile,
             )
             buf[:num_decode, :k_eff] = idx.to(buf.dtype)
 
@@ -374,7 +408,11 @@ def metal_sparse_attn_indexer(
                 # positions; -1 pads must stay -1.
                 idx = torch.where(idx >= 0, idx - ks[s:e, None], idx)
                 buf[t0 + s : t0 + e, :k_eff] = idx.to(buf.dtype)
-        if _LONGCTX_PREFILL_SYNC:
-            torch.mps.synchronize()
+                # Per row-chunk, not per producer call: the candidate-tile
+                # loop inside the streaming selector multiplies dispatches
+                # by ceil(n_k / 1024), so a single trailing synchronize no
+                # longer bounds the MPSGraph encode queue it was added for.
+                if _LONGCTX_PREFILL_SYNC:
+                    torch.mps.synchronize()
 
     return buf

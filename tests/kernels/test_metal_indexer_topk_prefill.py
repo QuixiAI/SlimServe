@@ -43,6 +43,12 @@ def main() -> None:
     n_blocks = 8
     cache = torch.randint(0, 255, (n_blocks, BS, 132), dtype=torch.uint8)
     cache[..., :128] &= 0x7E
+    # Plant the two e4m3 NaN encodings the writer never emits (0x7F/0xFF,
+    # unreachable through the &= 0x7E sanitize): the kernel's stale-slot
+    # guard and the eager LUT must both decode them as 0.0, and the oracle
+    # must prove that parity rather than avoid it.
+    cache[0, ::3, 5] = 0x7F
+    cache[1, 1::4, 77] = 0xFF
     scales = (torch.rand(n_blocks, BS, 1) * 0.5 + 0.5).to(torch.float32)
     cache[..., 128:132] = scales.view(torch.uint8).reshape(n_blocks, BS, 4)
     cache = cache.to(DEV)
@@ -123,6 +129,9 @@ def main() -> None:
     blocks_per_req = (width + BS - 1) // BS
     cache2 = torch.randint(0, 255, (blocks_per_req, BS, 132), dtype=torch.uint8)
     cache2[..., :128] &= 0x7E
+    # Same NaN-code coverage as the first oracle block.
+    cache2[0, ::5, 11] = 0x7F
+    cache2[2, 2::7, 100] = 0xFF
     scales2 = torch.rand(blocks_per_req, BS, 1, dtype=torch.float32) * 0.5 + 0.5
     cache2[..., 128:132] = scales2.view(torch.uint8).reshape(blocks_per_req, BS, 4)
     cache2 = cache2.to(DEV)
