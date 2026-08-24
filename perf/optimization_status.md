@@ -9573,6 +9573,60 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `smoke-muse-final/muse-kdyn-1.log`, and
   `smoke-all/dsv4-xxs-1.log`.
 
+## 2026-08-23 - DSV4 Metal Regression: Reproduced On Good Power; Bisect In Progress
+
+- Context: the takeover session committed the full optimization stack as
+  7bffa6b07 (fused GDN decode+verify, verify-band quant MM admission,
+  seeded/vectorized MPS rejection, fused DFlash2 conv, 64-bit hybrid KV
+  gather, profile SUPPORTED with DFlash k=3; spec now BEATS plain --
+  gate closed; HANDOFF.md 00:58 has the full inventory).
+- The one open blocker: dsv4-xxs-1 at ~0.1 tok/s (historical 33.68).
+  REPRODUCED on 100% battery (not the 20W-charger brownout): fresh
+  server, seeded request, generation 0.0 tok/s, acceptance 0%.
+  CORRECTED READ: the "0/5 accepted" from the matrix log was ONE
+  5-token draft cycle -- statistically empty; the real symptom is the
+  ~300x slowdown. Process sample during the stuck request: threads
+  parked in __psynch_cvwait at ~15% CPU -- the engine WAITS on
+  something (giant MPS command buffer or per-step materialization),
+  not spinning in Python.
+- Bisect design: point 1 = fe960935f python + HEAD binaries (isolates
+  the takeover's python-side changes from its kernels in one boot).
+  First attempt was lost to a Claude Code process exit mid-boot;
+  re-running.
+
+## 2026-08-23 - DSV4 Metal Crawl: Two Hypotheses Killed, Baseline Provenance Suspect
+
+- Bisect point 1 verdict (fe960935f python + HEAD binaries, clean machine,
+  95% memory free at boot): STILL CRAWLS. First request wedged the engine
+  inside a single step for 6+ minutes; native sample shows the main thread
+  in .cpu() -> MPSStream::synchronize (same signature as the Aug 10 entry),
+  GPU Device Utilization ~26% -- a launch-bound trickle, not a hung buffer
+  and not shader compile (MTLCompilerService idle). NOTE: an earlier
+  180 s-capped curl against this server never reached the engine (empty
+  reply, no POST in the log); only the untimed re-send produced the
+  verdict. Timed curls must confirm arrival in the server log.
+- Hypothesis A (takeover verify-band MM admission broadening: kMMFormats
+  extended to q2_K/iq2_xxs et al in ggml_mul_mat_vec_a8) -- REFUTED.
+  Reverted the format list to the pre-extension five (diagnostic, in
+  csrc/quixicore/tm_metal/qc_metal_serving.mm), rebuilt _quixicore_C,
+  booted the registry profile via slimserve: prompt 1.6 tok/s,
+  generation 0.1 tok/s. Same crawl. Also: PREFILL itself crawls, so the
+  defect is in the target forward path, not spec verify.
+- Hypothesis B (cold MPS pipeline compile, ~28 min per the Aug 10 entry)
+  -- REFUTED for this symptom: MTLCompilerService burns no CPU during
+  the crawl and the same metallib had been booted repeatedly today.
+- Baseline provenance finding: the 33.684 tok/s row was measured under
+  max_model_len 3072 + 1 GiB KV (pre-Aug-10 geometry). The Aug 10 entry
+  resized the metal profile to 262144 + 16 GiB fp8_ds_mla and recorded
+  only slow post-resize points (warm '42' in 28 s; warm temp-0.7 in
+  172 s). No healthy post-resize throughput measurement exists in the
+  notebook. The "campaign regression" framing is unproven; the crawl may
+  predate both Qwen and Muse campaigns.
+- In flight: geometry A/B -- HEAD stack, profile-exact args except
+  max_model_len 3072 + kv_cache_memory_bytes 1 GiB (port 8000). Fast =>
+  the 256K resize config is the root cause (then bisect the knob);
+  slow => era-exact ad8e8e937 build is next.
+
 ## 2026-08-23 (39) - PR 2 Metal Correctness Review Fixes
 
 - Status: retained implementation; registered-profile re-gate pending.
