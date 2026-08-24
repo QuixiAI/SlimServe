@@ -9974,3 +9974,68 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   envelope syntax remains owned by structural-tag adapters and tokenizer/chat
   formatting. Raw server logs are local under
   `/private/tmp/dsv4-grammar-server-*.log`.
+  CORRECTION (2026-08-24): that artifact location is volatile and violates
+  the notebook rules (perf/results/ + never /private/tmp for evidence);
+  the logs are presumed lost to reboot. This entry also records no
+  measured throughput despite the change adding a per-step sync and
+  forced-eager drafting; both costs are addressed in the 2026-08-24
+  review-fix entry below and a tok/s gate on the serving box remains
+  open.
+
+## 2026-08-24 - Grammar-Aware DSpark Review Fixes (PR #4 Follow-Up)
+
+- Context: independent multi-angle review of the merged PR #4 (10 finder
+  angles, ~50 candidates, 20 deduped mechanisms; 7 confirmed / 1
+  plausible / 4 refuted, plus 1 sweep finding). All confirmed findings
+  fixed or explicitly deferred below.
+- Fixed (crash): DraftGrammarBatch no longer fills a matcher that
+  terminated mid-draft-block (xgrammar raises a native RuntimeError from
+  fill_next_token_bitmask on a terminated matcher — reproduced on
+  xgrammar 0.2.3 by the reviewer); apply() skips terminated rows and
+  advance() stops pushing tokens into them while keeping the terminating
+  advancement counted for rollback.
+- Fixed (silent corruption): a grammar state admitting no token inside
+  the draft vocabulary previously masked the row to all -inf; the argmax
+  then picked target token 0 (BOS) and the -inf draft logits made the
+  rejection sampler's NaN guard force-accept it into the constrained
+  payload. apply() now checks per-row support against the draft
+  vocabulary (CPU-side, sync-free via a load-time id copy) and leaves
+  unsupported rows unmasked + disabled; the probabilistic branch passes
+  the draft-vocab restriction too, since its scatter buffer is -inf
+  outside draft columns even under a full-target-space mask.
+- Fixed (hot path): advance_verified early-returns when no structured
+  requests exist — its two .cpu() syncs sat between the async-output
+  copy and propose() on every step of every DSpark deployment.
+- Fixed (robustness): worker-side grammar admission failures are
+  contained to the one request (unconstrained drafting, warning) instead
+  of raising out of add_requests; the empty-history replay dead-guard in
+  _accept_verified no longer converts a failed replay into silent
+  success; the StructuredOutputManager mirror is built lazily on the
+  first structured request (was: per-rank tokenizer load + executors at
+  model load for every DSpark deployment) and shutdown() closes its
+  executors; draft_grammar is threaded through propose() as a parameter
+  instead of transient attribute smuggling.
+- Fixed (sentinel ambiguity): the scheduler now ships authoritative
+  per-row constrained flags (GrammarOutput.apply_rows, recorded in
+  _fill_bitmasks) — a permissive grammar state fills an all-ones mask
+  bit-identical to the unrestricted sentinel, so the worker mirror's
+  sniff misclassified those rows and self-disabled; the sniff remains
+  only as a fallback for producers without the field.
+- Fixed (guidance backend): reset() clears terminated/rollback_lag (the
+  same latent bug PR #4 fixed for xgrammar), and a REJECTED speculative
+  EOS no longer marks the grammar terminated.
+- Deferred (design follow-ups, recorded): preemption/re-add rebuilds the
+  mirror at position 0 (needs scheduler-side state or the apply_rows
+  channel extended to carry resume history; today it degrades to
+  disabled drafting, outputs stay correct); need_eager granularity (one
+  structured request forces the whole draft batch — and via the DP
+  min-mode all-reduce, every replica — out of graph replay); off-thread
+  mirror grammar compilation; special-token repair at the tokenizer
+  wrapper (guidance backend still unrepaired).
+- Validation: 16 draft-grammar/xgrammar tests pass (5 new: terminated
+  mid-block, empty-support full and reduced vocab, early-out no-sync
+  sentinel, contained admission failure, apply_rows-over-sniff);
+  tests/v1 suite passes; ruff clean. Throughput not re-measured here
+  (M5 Max); the dsv4 profiles' tok/s gate on the serving box remains
+  the open validation item, now without the unconditional per-step
+  sync.

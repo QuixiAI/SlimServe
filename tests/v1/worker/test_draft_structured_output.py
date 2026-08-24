@@ -243,10 +243,14 @@ def test_dspark_chooses_grammar_valid_reduced_vocab_token() -> None:
     speculator.draft_logits = None
     speculator.draft_tokens = torch.zeros((1, 1), dtype=torch.int64)
     speculator._draft_target_ids = torch.tensor([2, 5, 7])
+    speculator._draft_target_ids_cpu = np.array([2, 5, 7], dtype=np.int64)
     speculator.draft_grammar = MagicMock()
 
-    def allow_only_target_five(logits, target_token_ids=None) -> None:
+    def allow_only_target_five(
+        logits, target_token_ids=None, target_token_ids_cpu=None
+    ) -> None:
         assert target_token_ids.tolist() == [2, 5, 7]
+        assert target_token_ids_cpu.tolist() == [2, 5, 7]
         logits[:, target_token_ids != 5] = float("-inf")
 
     speculator.draft_grammar.apply.side_effect = allow_only_target_five
@@ -310,8 +314,10 @@ def test_verified_tokens_follow_authoritative_mask_rows() -> None:
         grammar_output=grammar_output,
     )
 
-    assert constrained.output == [99, 12]
-    assert reasoning.output == [20, 21]
+    # The mirror keeps no request token history of its own (grammar state is
+    # the only per-request state): nothing is appended to the Request.
+    assert constrained.output == []
+    assert reasoning.output == []
     assert constrained_grammar.position == 1
     assert reasoning_grammar.position == 0
     assert state.draft_grammars["constrained"].position == 1
@@ -399,3 +405,200 @@ def test_draft_matcher_recovers_from_rollback_drift() -> None:
 
     assert draft_grammar.position == 2
     assert state.verified_tokens["request"] == [12]
+
+
+def test_draft_grammar_batch_skips_terminated_matcher_mid_block() -> None:
+    """A payload that completes on an earlier draft step must not be filled
+    again: the real xgrammar matcher raises a native RuntimeError from
+    fill_next_token_bitmask once terminated (the _Grammar fixture mirrors
+    that by indexing past its allowed positions)."""
+    grammar = _Grammar([{1}])
+    batch = DraftGrammarBatch(
+        SimpleNamespace(backend=_Backend()),
+        _MaskingWorker(),
+        rows=[0],
+        request_ids=["request"],
+        grammars=[grammar],
+    )
+
+    logits = torch.zeros((1, 8))
+    batch.apply(logits)
+    batch.advance(torch.tensor([1]))
+    assert grammar.is_terminated()
+    assert batch.advancements == [0 + 1]
+
+    # Next draft step: must not fill the terminated matcher, must leave the
+    # row unconstrained, and must not push tokens into the matcher.
+    next_logits = torch.zeros((1, 8))
+    batch.apply(next_logits)
+    assert torch.isfinite(next_logits).all()
+    batch.advance(torch.tensor([5]))
+    assert batch.advancements == [1]
+
+    batch.rollback()
+    assert grammar.position == 0
+
+
+def test_draft_grammar_batch_disables_empty_support_rows() -> None:
+    """A grammar state admitting no token (or none inside a reduced draft
+    vocabulary) must leave the row unmasked and stop constraining it — an
+    all -inf row would argmax to BOS and the -inf draft logits force-accept
+    it through the rejection sampler's NaN guard."""
+    empty = _Grammar([set(), {1}])
+    rejected: list[tuple[str, str]] = []
+    batch = DraftGrammarBatch(
+        SimpleNamespace(backend=_Backend()),
+        _MaskingWorker(),
+        rows=[0],
+        request_ids=["request"],
+        grammars=[empty],
+        on_reject=lambda req_id, reason: rejected.append((req_id, reason)),
+    )
+    logits = torch.zeros((1, 8))
+    batch.apply(logits)
+    assert torch.isfinite(logits).all()
+    assert batch.enabled == [False]
+    assert rejected and "no token in the draft vocabulary" in rejected[0][1]
+
+    # Reduced vocabulary: the grammar allows target token 5, but the draft
+    # vocabulary only reaches target ids 0..3 — same dead-row hazard.
+    disjoint = _Grammar([{5}])
+    rejected.clear()
+    batch2 = DraftGrammarBatch(
+        SimpleNamespace(backend=_Backend()),
+        _MaskingWorker(),
+        rows=[0],
+        request_ids=["request"],
+        grammars=[disjoint],
+        on_reject=lambda req_id, reason: rejected.append((req_id, reason)),
+    )
+    logits2 = torch.zeros((1, 4))
+    batch2.apply(
+        logits2,
+        target_token_ids_cpu=np.array([0, 1, 2, 3], dtype=np.int64),
+    )
+    assert torch.isfinite(logits2).all()
+    assert batch2.enabled == [False]
+
+    # Same grammar with the token inside the draft vocabulary masks normally.
+    in_vocab = _Grammar([{2}])
+    batch3 = DraftGrammarBatch(
+        SimpleNamespace(backend=_Backend()),
+        _MaskingWorker(),
+        rows=[0],
+        request_ids=["request"],
+        grammars=[in_vocab],
+    )
+    logits3 = torch.zeros((1, 4))
+    batch3.apply(
+        logits3,
+        target_token_ids=torch.tensor([0, 1, 2, 3]),
+        target_token_ids_cpu=np.array([0, 1, 2, 3], dtype=np.int64),
+    )
+    assert torch.isfinite(logits3[0]).nonzero().flatten().tolist() == [2]
+
+
+class _NoSync:
+    """Sentinel standing in for a GPU tensor: any device sync is a failure."""
+
+    def cpu(self):
+        raise AssertionError(
+            "advance_verified must not sync without structured requests"
+        )
+
+
+def test_advance_verified_early_out_without_structured_requests() -> None:
+    state = object.__new__(DraftStructuredOutputState)
+    state.requests = {}
+    input_batch = SimpleNamespace(req_ids=["plain"], cu_num_logits_np=None)
+    state.advance_verified(
+        input_batch,
+        sampled_token_ids=_NoSync(),
+        num_sampled=_NoSync(),
+        grammar_output=None,
+    )
+
+
+def test_add_request_failure_is_contained() -> None:
+    """A worker-side grammar failure must degrade that one request to
+    unconstrained drafting, never raise out of the admission path."""
+    state = object.__new__(DraftStructuredOutputState)
+    state.requests = {}
+    state.draft_grammars = {}
+    state.verified_tokens = {}
+    state.draft_active = set()
+    state.draft_disabled = set()
+
+    def boom() -> None:
+        raise RuntimeError("grammar compile failed")
+
+    state._ensure_manager = boom
+    data = SimpleNamespace(
+        req_id="request",
+        prompt_token_ids=[1, 2],
+        sampling_params=SimpleNamespace(structured_outputs=object()),
+        pooling_params=None,
+    )
+    state.add_request(data)
+    assert state.requests == {}
+    assert "request" not in state.draft_grammars
+
+
+def test_apply_rows_flags_override_sentinel_sniff() -> None:
+    """A permissive grammar state can fill an all-ones mask bit-identical to
+    the unrestricted sentinel; the scheduler's authoritative apply_rows
+    flags must decide, not the mask bits."""
+    permissive_grammar = _Grammar([set(range(8))])
+    request = _MirrorRequest("request", permissive_grammar)
+    state = object.__new__(DraftStructuredOutputState)
+    state.manager = SimpleNamespace(backend=_Backend())
+    state.worker = _MaskingWorker()
+    state.requests = {"request": request}
+    state.draft_grammars = {"request": _Grammar([set(range(8))])}
+    state.verified_tokens = {"request": []}
+    state.draft_active = set()
+    state.draft_disabled = set()
+    input_batch = SimpleNamespace(
+        req_ids=["request"],
+        cu_num_logits_np=np.array([0, 1], dtype=np.int32),
+    )
+
+    # The mask row is all ones (permissive fill == sentinel bytes), but the
+    # scheduler says the row WAS constrained: the mirror must advance.
+    state.advance_verified(
+        input_batch,
+        sampled_token_ids=torch.tensor([[3]]),
+        num_sampled=torch.tensor([1]),
+        grammar_output=GrammarOutput(
+            ["request"],
+            np.array([[-1]], dtype=np.int32),
+            apply_rows=np.array([True]),
+        ),
+    )
+    assert permissive_grammar.position == 1
+    assert state.draft_active == {"request"}
+
+    # And an explicit False flag keeps a sentinel row unconstrained even
+    # for producers that fill real bytes there.
+    state2 = object.__new__(DraftStructuredOutputState)
+    grammar2 = _Grammar([{3}])
+    request2 = _MirrorRequest("request", grammar2)
+    state2.manager = SimpleNamespace(backend=_Backend())
+    state2.worker = _MaskingWorker()
+    state2.requests = {"request": request2}
+    state2.draft_grammars = {"request": _Grammar([{3}])}
+    state2.verified_tokens = {"request": []}
+    state2.draft_active = set()
+    state2.draft_disabled = set()
+    state2.advance_verified(
+        input_batch,
+        sampled_token_ids=torch.tensor([[99]]),
+        num_sampled=torch.tensor([1]),
+        grammar_output=GrammarOutput(
+            ["request"],
+            np.array([[0]], dtype=np.int32),
+            apply_rows=np.array([False]),
+        ),
+    )
+    assert grammar2.position == 0
+    assert state2.draft_active == set()

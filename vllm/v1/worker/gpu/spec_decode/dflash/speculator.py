@@ -397,7 +397,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
+        draft_grammar=None,
     ) -> torch.Tensor:
+        # Bound for this call only; refreshed (including back to None) on
+        # every propose, so no stale batch can leak into the next step.
+        # Consumed by _generate_draft (eager gating) and _sample_sequential.
+        self.draft_grammar = draft_grammar
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
