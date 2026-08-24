@@ -18,11 +18,31 @@ patched at their call sites:
    that is a dummy stub that raises when called. Metal has no graph capture,
    so the truthful answer is a constant ``False``.
 
-The async-output path must not hand output copies from the main MPS stream to
-a second stream.  A cold cross-stream wait could lose its completion signal
-on the first multi-chunk request.  ``gpu/async_utils.py`` therefore records
-the tiny output copy and event on the producing stream on MPS; CUDA and ROCm
-retain their overlapping copy-stream path.
+The async-output completion-event wedge (a boot's first multi-chunk prefill
+parking the engine forever in MPSEvent::synchronize -- GPU idle, signal
+never delivered) is addressed structurally in
+``gpu/async_utils.py``: torch.Stream(mps) always returns the single
+stream 0, so the CUDA cross-stream choreography (set_stream, wait_stream,
+generic torch.Event record) was pure risk with no overlap to buy. On Metal
+the copy paths (AsyncOutput, AsyncPoolingOutput, DraftTokensHandler)
+enqueue on the producing stream via make_output_copy_stream and record a
+native torch.mps.Event there via make_completion_event;
+VLLM_QC_ASYNC_OUT_DRAIN=1 swaps that event for a full
+torch.mps.synchronize() drain as an ops fallback. History and validation:
+perf/optimization_status.md (2026-08-14 boot_v12 bisect, cleanup-phase
+bisect, 2026-08-17 fix entry -- five M1 Ultra boots, both wedge trigger
+protocols clean, all anchors bit-exact). The earlier naive attempt --
+swapping only the host-side wait for a drain while leaving wait_stream's
+GPU-side wait encoded -- moved the park and produced a
+command-buffer-timeout variant; the structural fix removes both.
+
+The race was timing-sensitive on the host side: stripping the phaseprof
+brackets and marshalling-memo conditionals from
+vllm/models/deepseek_v4/{compressor,metal}.py made even RAMPED multi-chunk
+requests park at completion (boot-level bisect, cleanup-phase entry).
+Those code paths keep their structure until a soak on the fixed event path
+proves the retention unnecessary; the boot-ramp ops protocol likewise
+stays recommended until then.
 
 Applied once, from the platform's check_and_update_config.
 """
