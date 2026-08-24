@@ -33,6 +33,20 @@ def test_make_output_copy_stream_is_producing_stream_on_mps() -> None:
     )
 
 
+def test_make_completion_event_is_native_mps_event() -> None:
+    """The generic torch.Event machinery is the observed signal-loss point
+    on Metal (MPSEvent::synchronize park); the completion marker must be
+    the native torch.mps.Event unless the drain kill-switch is armed."""
+    from vllm.v1.worker.gpu.async_utils import _METAL_DRAIN, make_completion_event
+
+    event = make_completion_event()
+    if _METAL_DRAIN:
+        assert event is None
+    else:
+        assert isinstance(event, torch.mps.Event)
+        assert not isinstance(event, torch.Event)
+
+
 def test_metal_async_output_stays_on_producer_stream() -> None:
     from vllm.v1.outputs import ModelRunnerOutput
     from vllm.v1.worker.gpu.async_utils import AsyncOutput, make_output_copy_stream
