@@ -38,6 +38,12 @@ behavior:
 
 ## Agent Operating Discipline
 
+- Never store anything that must survive a crash or reboot under `/private/tmp`
+  or other system temp directories — machine deaths wipe them. Durable working
+  state (worktrees, benchmark logs, handoff notes, fix branches) belongs in
+  `~/.local/scratch` (create it if needed) or inside the repo's git-ignored
+  areas such as `perf/results/`.
+
 - Read the repo before deciding. Start from `AGENTS.md`, `perf/perf.md`,
   `perf/baseline_status.md`, `perf/optimization_status.md`, the relevant
   profile in `slimserve/profiles.json`, and the local implementation paths for
