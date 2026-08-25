@@ -1537,7 +1537,7 @@ boot**.log).
   aa448847, needle exact. Raw: perf/results/2026-08-25/
   {anchor_regate_audit, audit_regate}/.
 - MERGE RE-GATE (UPDATE 55, 2026-08-25): origin/main's 55 parallel
-  commits merged (dde1d7cf5), metallib + .so rebuilt from the merged
+  commits merged (b59af307c), metallib + .so rebuilt from the merged
   sources. DSV4 anchors: 8tok 573db39598e7 and off1-2000 bb83cc3054a3
   BIT-EXACT (26th consecutive); **2500x64 RE-PINNED to 73f41acf8ca0**
   (42/110/22, deterministic 2/2, wall 4.60-4.65 s, response coherent) —
