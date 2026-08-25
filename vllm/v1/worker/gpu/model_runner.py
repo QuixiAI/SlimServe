@@ -1213,8 +1213,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
+            # Metal has no pinned host allocator and no torch.cuda; the
+            # native mps event polls through the same .query() protocol.
+            on_mps = logits.device.type == "mps"
             nan_mask = torch.isnan(logits).any(dim=-1)
-            host = torch.empty(nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True)
+            host = torch.empty(
+                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=not on_mps
+            )
             host.copy_(nan_mask, non_blocking=True)
             ids_host = None
             if input_batch is not None:
@@ -1223,10 +1228,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # is the drafter's deepest draft token).
                 row_ids = input_batch.input_ids[input_batch.logits_indices]
                 ids_host = torch.empty(
-                    row_ids.shape, dtype=row_ids.dtype, pin_memory=True
+                    row_ids.shape, dtype=row_ids.dtype, pin_memory=not on_mps
                 )
                 ids_host.copy_(row_ids, non_blocking=True)
-            event = torch.cuda.Event()
+            event = torch.mps.Event() if on_mps else torch.cuda.Event()
             event.record()
             self._nan_watch_pending = (
                 host,
