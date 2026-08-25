@@ -374,6 +374,16 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             not current_platform.is_fp8_fnuz()
             and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
+        # The plain blockscale GEMM is 1.8-2.1x SLOWER than bf16 on gfx942 for
+        # these shapes; the preshuffled asm kernel is 1.1-1.8x FASTER. Same block
+        # scales, only the weight layout changes, so this is a pure kernel swap.
+        # The asm kernel needs a 16x16-shuffled B, hence the load-time transform.
+        self.use_bpreshuffle = (
+            not self.use_triton
+            and current_platform.is_fp8_fnuz()
+            and n % 16 == 0
+            and k % 128 == 0
+        )
 
     @classmethod
     def is_supported(cls, compute_capability=None):
@@ -421,6 +431,10 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 Bs = Bs.to(torch.float32)
 
         out_dtype = self.config.out_dtype
+        if self.use_bpreshuffle:
+            return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                A, B, As, Bs, output_dtype=out_dtype
+            )
         if self.use_triton:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:
@@ -428,4 +442,15 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         return gemm_a8w8_blockscale_op(
             A, B, As, Bs, list(self.weight_group_shape), output_dtype=out_dtype
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if not self.use_bpreshuffle:
+            return
+        params = self._get_layer_params(layer)
+        replace_parameter(
+            layer,
+            params.WEIGHT,
+            rocm_aiter_ops.shuffle_weight(params.weight.data, layout=(16, 16)),
         )
