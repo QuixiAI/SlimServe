@@ -31,6 +31,23 @@ _op_steps = 0
 _dump_registered = False
 _closes = 0
 _DUMP_EVERY = 32
+_PROF_DIR: str | None = None
+
+
+def _prof_path(name: str) -> str:
+    """A file path inside a private, unpredictable per-process directory.
+
+    /tmp names keyed on the pid are symlink-attackable (open(..., "w")
+    follows links, letting a local user redirect the truncate+write);
+    mkdtemp gives 0700 and an unguessable suffix.
+    """
+    global _PROF_DIR
+    if _PROF_DIR is None:
+        import tempfile
+
+        _PROF_DIR = tempfile.mkdtemp(prefix="qc_phaseprof_")
+        print(f"[phaseprof] writing dumps under {_PROF_DIR}")
+    return os.path.join(_PROF_DIR, name)
 
 
 def enabled() -> bool:
@@ -120,7 +137,7 @@ def _dump_pyprof() -> None:
     import io
     import pstats
 
-    path = f"/tmp/pyprof_{os.getpid()}.txt"
+    path = _prof_path(f"pyprof_{os.getpid()}.txt")
     buf = io.StringIO()
     st = pstats.Stats(_pyprof, stream=buf)
     # _pyprof_steps counts execute_model and sample_tokens brackets
@@ -193,7 +210,7 @@ def _census_mode():
 
 
 def _dump_census() -> None:
-    path = f"/tmp/opcensus_{os.getpid()}.txt"
+    path = _prof_path(f"opcensus_{os.getpid()}.txt")
     total = sum(_op_counts.values())
     # _op_steps counts execute_model and sample_tokens brackets separately;
     # a serving step closes both, so divide by the bracket-pair count.

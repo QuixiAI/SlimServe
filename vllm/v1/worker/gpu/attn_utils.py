@@ -605,7 +605,6 @@ def build_attn_metadata(
     )
     steady_eligible = (
         steady_cache is not None
-        and is_prefilling is not None
         and not for_cudagraph_capture
         and causal is True
         and dcp_local_seq_lens is None

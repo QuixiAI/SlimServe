@@ -1486,6 +1486,10 @@
             "mamba_cache_dtype": "float32",
             "language_model_only": true
           },
+          "speculative_overrides": {
+            "attention_backend": "TURBOQUANT",
+            "kv_cache_dtype": "turboquant_k8v4"
+          },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
             "VLLM_SSM_CONV_STATE_LAYOUT": "DS",

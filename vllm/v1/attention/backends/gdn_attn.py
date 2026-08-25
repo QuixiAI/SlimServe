@@ -282,7 +282,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert spec_sequence_masks_cpu is not None
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
-
             # Use CPU tensors to avoid CPU-GPU sync
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
             num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
@@ -638,6 +637,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # GDN layer of this step rebuilds it — the memo's scope is one
         # step across the 48 layers, not the metadata object's lifetime.
         metadata._mps_spec_cache = None
+        # Same lifetime rule for the fused GDN step's spec plans: they bake
+        # copied slot ids and accepted counts, so the verify kernel must
+        # rebuild them from the refreshed tensors above. (The fused decode
+        # plan needs no invalidation here: this path is all-spec.)
+        metadata._mps_fused_spec_plans = None
         return metadata
 
     def build_for_cudagraph_capture(

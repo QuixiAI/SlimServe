@@ -1,4 +1,4 @@
-# HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-19; N1+N2+N3 COMPLETE — bring-up, exact baseline, first GEMV kernels; N3 `_mb` twins open)
+# HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 
 ## Mission
 

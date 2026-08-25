@@ -1194,7 +1194,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return _zeros()
 
         if attn_metadata.spec_sequence_masks is not None:
-            if self._metal_gdn_enabled():
+            # The Metal spec route additionally needs gdn_recur_spec +
+            # gdn_fused_prepare; a build with plain gdn_recur only still
+            # enables the non-spec Metal path, so gate on the capability
+            # rather than raising inside _forward_core_metal_spec.
+            if self._metal_gdn_enabled() and (
+                self._metal_gdn.spec and self._metal_gdn.fused_prep
+            ):
                 normed = self._forward_core_metal_spec(mixed_qkv, ba, z, attn_metadata)
             else:
                 # The in-place native core carries its own spec-verify route

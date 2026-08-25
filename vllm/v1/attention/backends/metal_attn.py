@@ -568,12 +568,16 @@ class MetalAttentionImpl(AttentionImpl):
                             "multi-query verify attention engaged (ctx=%d)",
                             int(seq_lens.max().item()),
                         )
+                    # Page-local caches: key_cache/value_cache are strided
+                    # views the verify kernel's contiguity contract rejects;
+                    # the kernel-facing pair (dense_kv and its offset view)
+                    # is contiguous under the doubled block table.
                     out.copy_(
                         quixicore_ops.paged_attention_verify(
                             query[:num_tokens].contiguous(),
-                            key_cache,
-                            value_cache,
-                            attn_metadata.block_table,
+                            kc_kernel,
+                            vc_kernel,
+                            kernel_block_table,
                             seq_lens,
                             self.scale,
                             0,
@@ -730,9 +734,7 @@ class MetalAttentionImpl(AttentionImpl):
                     # discarded; a real run never clamps.
                     .clamp_(0, num_blocks - 1)
                 )
-                row_start = (
-                    0 if bound_mode else kv_start - first_block * block_size
-                )
+                row_start = 0 if bound_mode else kv_start - first_block * block_size
                 row_end = seq_len - first_block * block_size
 
                 if dense_kv is not None:
@@ -742,9 +744,7 @@ class MetalAttentionImpl(AttentionImpl):
                     keys = key_cache.index_select(0, blocks)
                     values = value_cache.index_select(0, blocks)
                 keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
-                values = values.reshape(-1, num_kv_heads, head_size)[
-                    row_start:row_end
-                ]
+                values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
 
             if self.num_queries_per_kv > 1:
                 keys = keys.repeat_interleave(self.num_queries_per_kv, dim=1)
