@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
@@ -141,12 +142,15 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 self.weight_quant_key = STRATEGY_TO_WEIGHT_QUANT_KEY[self.strategy]
                 self.linear_kernel.config.weight_quant_key = self.weight_quant_key
 
-            # Canonicalize to (K, N) for the kernel.
-            replace_parameter(layer, "weight", layer.weight.t())
-            # Preserve the dim tags dropped by the transpose so layout-aware
-            # kernels see (K, N).
-            layer.weight.input_dim = 0
-            layer.weight.output_dim = 1
+            if not current_platform.is_metal():
+                # Canonicalize to (K, N) for the kernel. Metal keeps the
+                # checkpoint's row-major (N, K): its GEMV host binding
+                # asserts contiguity and reads rows.
+                replace_parameter(layer, "weight", layer.weight.t())
+                # Preserve the dim tags dropped by the transpose so
+                # layout-aware kernels see (K, N).
+                layer.weight.input_dim = 0
+                layer.weight.output_dim = 1
 
         self.linear_kernel.process_weights_after_loading(layer)
 

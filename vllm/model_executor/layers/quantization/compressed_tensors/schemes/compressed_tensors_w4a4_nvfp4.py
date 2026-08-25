@@ -13,11 +13,15 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    wrap_fp8_byteview_loader,
+)
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -69,16 +73,23 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
-        # Per Group Weight Scale
+        # Per Group Weight Scale. Metal stores the E4M3 bytes as uint8 (no
+        # fp8 dtype on torch-MPS) and byte-views the incoming fp8 shards.
+        if current_platform.is_metal():
+            scale_dtype = torch.uint8
+            scale_loader = wrap_fp8_byteview_loader(weight_loader)
+        else:
+            scale_dtype = torch.float8_e4m3fn
+            scale_loader = weight_loader
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition // self.group_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=scale_dtype,
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=scale_loader,
         )
 
         layer.register_parameter("weight_scale", weight_scale)
