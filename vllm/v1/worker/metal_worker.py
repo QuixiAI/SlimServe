@@ -28,6 +28,15 @@ from vllm.v1.worker.workspace import init_workspace_manager
 
 logger = init_logger(__name__)
 
+# Headroom kept outside the KV pool for activations, sampling, kernel scratch
+# and allocator fragmentation, as a fraction of the Metal working set and as
+# an absolute floor. See `_fit_kv_pool_to_working_set` for the measurements.
+_KV_RESERVE_FRAC = 0.04
+_KV_RESERVE_MIN_BYTES = 4 << 30
+# Below this a pool cannot hold a useful request, so refuse instead of
+# booting into a geometry that will fail on the first prompt.
+_KV_POOL_FLOOR_BYTES = 1 << 29
+
 
 class MetalWorker(Worker):
     def init_device(self):
@@ -130,8 +139,9 @@ class MetalWorker(Worker):
         subsystem, not this process, so per-process accounting misses them;
         vm_stat's global counter is the only reliable residency signal.
         """
-        import re
         import subprocess
+
+        import regex as re
 
         try:
             out = subprocess.run(
@@ -216,15 +226,13 @@ class MetalWorker(Worker):
             return
         if not hasattr(qc, "residency_pin"):
             logger.warning(
-                "Metal residency pinning unavailable: extension predates "
-                "residency_pin"
+                "Metal residency pinning unavailable: extension predates residency_pin"
             )
             return
         added, nbytes = qc.residency_pin(self._weight_tensors())
         if added:
             logger.info(
-                "Pinned %d Metal allocations (%.2f GiB) into the weight "
-                "residency set",
+                "Pinned %d Metal allocations (%.2f GiB) into the weight residency set",
                 added,
                 nbytes / 2**30,
             )
@@ -297,6 +305,59 @@ class MetalWorker(Worker):
             self._make_weights_resident()
         return result
 
+    def _fit_kv_pool_to_working_set(self, requested_bytes: int) -> int:
+        """Largest KV pool that stays resident, given what is already held.
+
+        Metal's ``recommendedMaxWorkingSetSize`` is not enforced by failing
+        allocations. A pool that pushes weights plus KV past it allocates
+        fine, and the driver then pages: since ``_pin_weights_resident`` pins
+        the weight heaps, the KV pool is what gets evicted, so decode reads
+        non-resident pages and returns token soup while the request still
+        answers HTTP 200. There is no OOM to catch, which is why the pool has
+        to be sized against the working set up front.
+
+        Residency is measured, not declared: GGUF weights land anywhere from
+        1.07x to 2x their file bytes once the Metal path is done with them,
+        so a profile cannot compute this from artifact sizes.
+        """
+        free_bytes, total_bytes = torch.accelerator.get_memory_info(self.device)
+        resident_bytes = total_bytes - free_bytes
+        # Activations, sampling, kernel scratch and allocator fragmentation
+        # all live outside the pool. Measured on an M5 Max serving
+        # DeepSeek-V4-Flash IQ2_XXS (93.57 GiB resident, 107.52 GiB working
+        # set): 4.9 GiB of headroom decoded at 26 tok/s, 1.9 GiB crawled at
+        # 3.6 tok/s, and overrunning the working set produced token soup.
+        reserve_bytes = max(_KV_RESERVE_MIN_BYTES, int(total_bytes * _KV_RESERVE_FRAC))
+        budget_bytes = total_bytes - resident_bytes - reserve_bytes
+
+        if budget_bytes < _KV_POOL_FLOOR_BYTES:
+            raise RuntimeError(
+                "No unified memory left for the KV cache: weights and runtime "
+                f"hold {resident_bytes / 2**30:.2f} GiB of the "
+                f"{total_bytes / 2**30:.2f} GiB Metal working set, leaving "
+                f"{max(budget_bytes, 0) / 2**30:.2f} GiB after the "
+                f"{reserve_bytes / 2**30:.2f} GiB activation reserve. Serve a "
+                "smaller quant, drop the draft model, or use a machine with "
+                "more unified memory."
+            )
+
+        if requested_bytes <= budget_bytes:
+            return requested_bytes
+
+        logger.warning(
+            "Requested %.2f GiB KV pool does not fit this machine; using "
+            "%.2f GiB. Weights and runtime hold %.2f GiB of the %.2f GiB "
+            "Metal working set and %.2f GiB is reserved for activations. An "
+            "oversized pool on unified memory is not an OOM: the driver "
+            "evicts KV pages and decode silently degrades into garbage.",
+            requested_bytes / 2**30,
+            budget_bytes / 2**30,
+            resident_bytes / 2**30,
+            total_bytes / 2**30,
+            reserve_bytes / 2**30,
+        )
+        return budget_bytes
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """KV-cache budget, from unified memory rather than a device pool.
@@ -306,12 +367,14 @@ class MetalWorker(Worker):
         warmup, then budget against what Metal will let the GPU hold.
         """
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            granted = self._fit_kv_pool_to_working_set(kv_cache_memory_bytes)
+            self.cache_config.kv_cache_memory_bytes = granted
             logger.info(
                 "Using %.2f GiB fixed Metal KV-cache budget; skipping the "
                 "memory-profiling dummy forward",
-                kv_cache_memory_bytes / 2**30,
+                granted / 2**30,
             )
-            return kv_cache_memory_bytes
+            return granted
 
         self.model_runner.profile_run()
 
@@ -334,4 +397,7 @@ class MetalWorker(Worker):
             util,
             in_use / 2**30,
         )
-        return available
+        # Utilization is a fraction of the working set, so this path cannot
+        # overrun it by construction -- but at utilization near 1.0 it leaves
+        # no room for activations, which the same reserve covers.
+        return self._fit_kv_pool_to_working_set(available)

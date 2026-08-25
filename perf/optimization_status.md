@@ -10976,3 +10976,112 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `alpha-0`, `a_softplus-0`, `beta-0`, `gate-0`, `final_output-0`) to find
   which step first diverges. Their sums are already extracted; our side needs
   hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
+
+## 2026-08-25 - Metal Profile Validation Sweep: 2 PASS, 1 blocked, DSV4 registry geometry FAILS on 128 GiB
+
+- Scope: every registry profile compatible with this machine (M5 Max,
+  128 GiB), each with its registered drafter, via the real server path
+  (`slimserve <profile> --serve`) and seeded shipped-defaults requests
+  (seed 42, no sampling overrides). Vision profiles got text + image
+  requests (synthetic red-bordered rectangle + blue ellipse PNG).
+  Harness: perf/results/2026-08-25/profile-validation/validate_profile.py.
+- glm52-xxs-1: BLOCKED by the registry, correctly -- IQ2_XXS needs
+  256 GiB unified memory (this box has 128) and the profile is also
+  status-gated (Metal sparse-MLA unvalidated). Not substituted.
+- qwen38-q2kxl-1: PASS text+image. Health 19-21 s warm. Text: coherent
+  Jupiter-moons answer, 221 tokens in 5.8 s, DFlash 2 acceptance 43.7%
+  (mean len 2.31). Image: vision path healthy without torchvision (PIL
+  fallback); shipped thinking mode deliberates at length on the shapes
+  image (2048 tokens still thinking, grounded pixel-arithmetic
+  reasoning, no loop); offline smoke shows the completed answer path.
+- muse-kdyn-1: PASS text+image. Artifacts fetched by slimserve.fetch
+  (registry-exact sizes; the Aug-10 local copies were a different
+  revision). Health 32 s. Text coherent; image answer describes the
+  shapes exactly, finish=stop, 264 tokens in 23.6 s. DFlash acceptance
+  mean len 2.4-3.0.
+- dsv4-xxs-1: FAIL at registry geometry. Server reached health (537 s
+  cold) and returned 200s, but output is multilingual token soup at
+  1.1 tok/s with 0/55 draft tokens accepted. This is the pending
+  close-out from 2026-08-24 (registry.log's resp1 was an EngineCore
+  500; small-geometry smoke was healthy).
+- Bisect (offline probes, ctx 3072 fixed, only kv_cache_memory_bytes
+  varied; seeded, same prompt; raw in ~/.local/scratch/dsv4-geom/):
+  1 GiB 29.9 tok/s coherent; 4 GiB 30.8 coherent (head byte-identical);
+  8 GiB 27.3 coherent; 9 GiB 26.2 coherent; 12 GiB 3.6 tok/s COHERENT
+  but crawling; 16 GiB 1.9 tok/s GIBBERISH. Context length is
+  exonerated (all probes at 3072; the 262144 resize never entered).
+- Mechanism: weights+drafter stack is 93.6 GiB;
+  torch.mps.recommended_max_memory() = 107.52 GiB on this box.
+  93.6+9 = 102.6 fits (fast, correct); +12 = 105.6 approaches the limit
+  (driver paging, 7x slowdown, still correct); +16 = 109.6 exceeds it
+  (non-resident reads return garbage rather than faulting). Classic
+  working-set eviction: perf degrades before correctness.
+- Not an int32/uint32 offset bug: 4 GiB (2^32 bytes) and 9 GiB pools
+  are clean, so 32-bit byte/element offset theories are all ruled out.
+  Branch exonerated too: metal-decode-sync-removal's small-geometry
+  output matches the 08-24 main-stack smoke.
+- Decision: dsv4-xxs-1's Metal override (16 GiB KV) does not fit a
+  128 GiB machine alongside 93.6 GiB of weights. Options for the fix
+  owner: size the Metal KV pool from
+  recommended_max_memory - weights - margin (8 GiB here keeps ~300K
+  fp8_ds_mla tokens and measured 27 tok/s), and/or add a boot-time
+  guard refusing geometries whose planned residency exceeds the
+  device working set -- today it serves garbage with HTTP 200.
+- Raw: perf/results/2026-08-25/profile-validation/ (server/engine logs,
+  raw request JSON per profile) and ~/.local/scratch/dsv4-geom/probe_*.
+
+## 2026-08-25 - FIXED: Metal KV pools are fitted to the device working set
+
+- Baseline: the validation sweep earlier today. dsv4-xxs-1 at its
+  registry geometry served multilingual token soup at 1.1 tok/s with 0%
+  draft acceptance while returning HTTP 200; the KV-pool bisect showed
+  <=9 GiB coherent at 26-31 tok/s, 12 GiB coherent at 3.6, 16 GiB
+  garbage.
+- Hypothesis: the profile's fixed pool is honoured verbatim, and on
+  unified memory an oversized pool is not an OOM. Since
+  `_pin_weights_resident` pins the weight heaps, the KV pool is what the
+  driver evicts, so decode reads non-resident pages and returns garbage
+  with no error to catch.
+- Change (vllm/v1/worker/metal_worker.py): new
+  `_fit_kv_pool_to_working_set`, applied on both budget paths in
+  `determine_available_memory`. It measures residency from
+  `torch.accelerator.get_memory_info` (which on Metal reports against
+  `recommendedMaxWorkingSetSize`), keeps back max(4 GiB, 4% of the
+  working set) for activations/scratch/fragmentation, grants the smaller
+  of the request and that budget, and raises when under 0.5 GiB would
+  remain instead of booting a doomed geometry. The granted value is
+  written back to `cache_config.kv_cache_memory_bytes` so the log line
+  and the KV allocator agree. Only the Metal worker changed; the CUDA
+  path is untouched, since a discrete GPU answers an oversized pool with
+  a real OOM.
+- Why residency is measured, not declared: DSV4 IQ2_XXS is 87.3 GiB of
+  files but loads to 93.57 GiB, and Muse's Q4_K_XL is 18.3 GiB of files
+  at 42.66 GiB resident (1.07x to 2.0x). No profile can compute this
+  from artifact sizes, which is exactly how the 16 GiB figure was
+  derived wrongly.
+- Correctness/measurement, all through `slimserve <profile> --serve`
+  with registered drafters and seeded shipped defaults:
+  - dsv4-xxs-1: PASS. Clamp fired -- "Requested 16.00 GiB KV pool does
+    not fit this machine; using 6.52 GiB" (96.70 GiB resident of the
+    107.52 GiB working set, 4.30 GiB reserved). 880,117 KV tokens, 3.36x
+    concurrency at 262,144 per request. Coherent Jupiter-moons answer,
+    256 tokens in 10.84 s = 23.6 tok/s, spec accepting (mean length
+    1.51). Was 1.1 tok/s of garbage.
+  - qwen38-q2kxl-1: unchanged. 12 GiB granted exactly, no clamp, text
+    output byte-identical to the pre-fix run.
+  - muse-kdyn-1: unchanged. 12 GiB granted exactly, no clamp, image
+    answer identical, finish=stop.
+- Also corrected: the dsv4-xxs-1 Metal profile note in profiles.json
+  contained the bad arithmetic in prose (artifact bytes vs a guessed
+  ~115 GiB working set). It now states the pool is a ceiling the worker
+  fits to the machine, and records the real figures.
+- Tests: tests/v1/worker/test_metal_kv_pool_fit.py (8 cases: exact grant
+  when it fits, the DSV4 clamp, refusal when nothing useful fits, the
+  floor boundary, reserve scaling on a 512 GiB machine, and that the fit
+  never inflates a request). Suite: 45 passed / 103 skipped. Ruff clean.
+- Decision: RETAINED. Remaining follow-up: the 6.52 GiB grant is the
+  safe floor, not a tuned figure -- the bisect showed 8-9 GiB pools
+  decoding at 26-27 tok/s on this box, so the 4 GiB reserve could be
+  revisited with a measured activation peak for DSV4.
+- Raw: perf/results/2026-08-25/profile-validation/ (post-fix server logs
+  and per-request JSON) and ~/.local/scratch/dsv4-geom/probe_*.
