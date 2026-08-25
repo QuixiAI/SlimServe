@@ -26,7 +26,8 @@ def _big_enough(profile_id: str, platform: str) -> int:
         return 0
     entry = registry.describe(profile_id)
     source = registry._registry()["sources"][entry["source"]]
-    return source["quants"][entry["default_quant"]]["min_memory_bytes"][platform]
+    default_quant = registry.variant(profile_id, platform)["default_quant"]
+    return source["quants"][default_quant]["min_memory_bytes"][platform]
 
 
 def test_every_profile_resolves_on_a_platform_it_claims():
@@ -733,3 +734,52 @@ def test_dsv4_flash_artifacts_are_0731_and_checksum_pinned():
             if name not in pending_pin:
                 sha = entry.get("sha256")
                 assert sha and len(sha) == 64, f"{name} missing sha256 pin"
+
+
+def test_a_profile_is_one_config_per_platform():
+    """A profile is model x quant x platform x config.
+
+    The id a user types carries no platform because the CLI detects it, so
+    every id stores one record per platform and each record states its own
+    platform. Nothing may span platforms: that is what the retired
+    `platform_overrides` block used to paper over, and it let a config tuned
+    for one platform silently stand in for another.
+    """
+    for profile_id, entry in registry._registry()["profiles"].items():
+        variants = entry.get("variants")
+        assert variants, f"{profile_id} has no per-platform records"
+        assert "platforms" not in entry, (
+            f"{profile_id} carries a platforms list; platform belongs to the "
+            "record, not the profile"
+        )
+        assert "platform_overrides" not in entry, (
+            f"{profile_id} uses platform_overrides; give each platform its "
+            "own record instead"
+        )
+        for platform, record in variants.items():
+            assert record.get("platform") == platform, (
+                f"{profile_id}/{platform} does not state its own platform"
+            )
+            assert "engine" in record and record["engine"], (
+                f"{profile_id}/{platform} has no engine settings"
+            )
+            assert "default_quant" in record, (
+                f"{profile_id}/{platform} has no default quant"
+            )
+
+
+def test_no_profile_carries_another_platforms_environment():
+    """A ROCm switch on an a100 or Metal record is a config that leaked."""
+    marker = {
+        "mi300x": ("ROCM", "AITER", "HIP_"),
+        "a100": ("CUDA_",),
+    }
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry["variants"].items():
+            for key in record.get("env") or {}:
+                for owner, tokens in marker.items():
+                    if owner == platform:
+                        continue
+                    assert not any(tok in key for tok in tokens), (
+                        f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
+                    )
