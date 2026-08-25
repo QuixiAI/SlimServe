@@ -10179,3 +10179,33 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Cumulative: essay 24.4 -> 25.7 (+5%), gsm8k 39.4 -> 41.0 (+4%),
   outputs byte-identical throughout. 42 kernel/worker tests pass.
 - Raw: ~/.local/scratch/qwen38-rebaseline/ (cprofile*.log, bench logs).
+
+## 2026-08-25 - Drain-Peeling Rounds 3-4: GDN Build Masks + MRoPE Position Prep
+
+- Round 3 (gdn_attn.build, ran once per KV-cache group x10/step): every
+  device-side boolean-mask index (block_table gathers, num_accepted
+  filter, has_initial_state filter, cumsum inputs) lowered to nonzero()
+  on MPS. Row indices are now computed host-side from the CPU mask
+  (sync-free) and applied via index_select. essay 25.7 -> 26.5,
+  gsm8k 41.0 -> 42.4.
+- Round 4 (mm/rope._prepare_positions_native): int(qsl[-1]) read a
+  device scalar and repeat_interleave without output_size synced to
+  size its output — both once per step, and after rounds 1-3 they
+  gated the whole pipeline. The caller now passes
+  input_batch.num_tokens (python int) and output_size. essay 26.5 ->
+  27.5-29.2, gsm8k -> 43.4-43.8.
+- Cumulative from the 24.4/39.4 re-baseline: essay ~28.4 (+16%),
+  gsm8k ~43.6 (+11%); outputs byte-identical at every round; 42
+  kernel/worker tests pass each round.
+- Post-round profile: no python function above ~3 ms/step remains
+  (arange 3.3, .cpu 2.7, sdpa launch 2.2). The single event wait is
+  39.6 ms/step = the GPU pipeline itself; step ~69 ms = 40 GPU-bound +
+  29 CPU tail. Further CPU peeling is diminishing; the ~7 ms/step gap
+  to the llama.cpp bar now lives on the GPU side (MLP IQ-format GEMVs,
+  GDN core, SDPA+gather attention) and in serving-path overlap.
+- IQ1_S correction to the M-band theory: its M=1 and M=4 times are
+  EQUAL (0.14-0.29 ms) — the base per-span decode (one iq1s_grid
+  constant-memory lookup per 8-span, BPI=1 so almost no ILP across
+  blocks) is latency-bound, not the M scaling. The kernel fix is more
+  in-flight blocks per lane / more rows per simdgroup, not accumulator
+  work.
