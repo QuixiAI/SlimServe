@@ -2059,6 +2059,9 @@ at::Tensor ggml_moe_a8_vec_sum(const at::Tensor& x, const at::Tensor& w,
   const int K = static_cast<int>(x.size(1));
   // Tail simdgroups of the mr grid read weight rows past a non-multiple N
   // before the store guards run; there is no one-row fallback here.
+  // Rule triplicated by necessity: gguf/fused_moe.py's
+  // _metal_q2k_sum_rows_supported routes around this check, and the native
+  // step tape below mirrors it — change all three together.
   const int sum_rows = x.scalar_type() != at::kBFloat16 ? 32 : 8;
   TORCH_CHECK(N % sum_rows == 0,
               "sum-folded q2_K kernel needs N divisible "
@@ -3193,8 +3196,10 @@ at::Tensor qc_tape_layer_forward(int64_t idx, const at::Tensor& x,
       ggml_moe_a8_vec_swiglu(h, L.w13_qw, topk_ids, L.top_k, L.w13_qt,
                              L.w13_row, T, L.swiglu_limit, L.w13_soa);
   // Sum-folded down projection (mirrors the Python route in
-  // gguf/fused_moe.py): one kernel instead of down vec + reshape +
-  // weighted sum. Shapes outside the folded kernel take the unfused chain.
+  // gguf/fused_moe.py _metal_q2k_sum_rows_supported; the sum-folded op's
+  // TORCH_CHECK above is the safety authority — change all three
+  // together). One kernel instead of down vec + reshape + weighted sum.
+  // Shapes outside the folded kernel take the unfused chain.
   at::Tensor fused;
   const bool tape_sum_dtype =
       h.scalar_type() == at::kHalf || h.scalar_type() == at::kBFloat16;

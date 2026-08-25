@@ -59,7 +59,12 @@ def _qc_mm_min_tokens() -> int:
 
 
 def _metal_q2k_sum_rows_supported(rows: int, dtype: torch.dtype) -> bool:
-    """The folded kernel has no output-row tail; its unfused parent does."""
+    """The folded kernel has no output-row tail; its unfused parent does.
+
+    This rule lives in three places that must change together: this route
+    guard, the TORCH_CHECK in qc_metal_serving.mm's sum-folded q2_K op
+    (the safety authority), and the native step tape's admission mirror
+    in the same file."""
     if dtype == torch.float16:
         return rows % 32 == 0
     if dtype == torch.bfloat16:
