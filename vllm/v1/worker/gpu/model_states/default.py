@@ -117,6 +117,7 @@ class DefaultModelState(ModelState):
             input_batch.query_start_loc,
             req_states.prefill_len.gpu,
             req_states.num_computed_tokens.gpu,
+            num_tokens=input_batch.num_tokens,
         )
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}
