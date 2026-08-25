@@ -277,7 +277,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
-        "qwen38-27b",
+        "qwen38-27b-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -373,6 +373,15 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
 
 
 GB = 1 << 30
+
+
+def test_nvfp4_directory_entry_resolves_to_the_model_dir():
+    """The NVFP4 quant is an HF-format directory checkpoint: --model must be
+    the folder, not files[0], and unknown entry modes must refuse loudly."""
+    plan = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert plan.entry_file == plan.model_dir
+    with pytest.raises(ProfileError, match="entry mode"):
+        registry._validated_entry("dir")
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():

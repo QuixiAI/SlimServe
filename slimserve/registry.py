@@ -103,6 +103,9 @@ class Quant:
     min_gpus: dict[str, int]
     min_memory_bytes: dict[str, int]
     assembly: dict[str, Any] | None
+    # "directory" for HF-format checkpoints (safetensors + config.json),
+    # where the engine's --model is the folder rather than files[0].
+    entry: str | None = None
 
     def requirement(self, platform: str) -> int | None:
         """The gating figure for this platform: GPU count or bytes of memory."""
@@ -144,6 +147,8 @@ class Plan:
     @property
     def entry_file(self) -> Path:
         """The path handed to the engine as --model."""
+        if self.quant.entry == "directory":
+            return self.model_dir
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
         return self.model_dir / self.quant.files[0]["path"]
@@ -172,7 +177,18 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         min_gpus=raw["min_gpus"],
         min_memory_bytes=raw.get("min_memory_bytes") or {},
         assembly=raw.get("assembly"),
+        entry=_validated_entry(raw.get("entry")),
     )
+
+
+def _validated_entry(entry: Any) -> str | None:
+    # A typo'd value would otherwise silently fall through to the
+    # files[0] path and surface as a confusing engine load error.
+    if entry not in (None, "directory"):
+        raise ProfileError(
+            f"unknown quant entry mode {entry!r} (expected \"directory\")"
+        )
+    return entry
 
 
 def describe(profile_id: str) -> dict[str, Any]:
