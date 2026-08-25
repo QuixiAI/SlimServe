@@ -25,6 +25,7 @@ backbone forward AND the sequential Markov sampling.
 
 from typing import Any
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -70,6 +71,8 @@ class DSparkSpeculator(DFlashSpeculator):
         )
 
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
+        self._draft_target_ids: torch.Tensor | None = None
+        self._draft_target_ids_cpu: np.ndarray | None = None
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
 
@@ -82,11 +85,17 @@ class DSparkSpeculator(DFlashSpeculator):
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
-        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
-            d2t = model.draft_id_to_target_id
-            self._d2t_scatter_index = (
-                torch.arange(d2t.shape[0], device=d2t.device) + d2t
+        d2t = getattr(model, "draft_id_to_target_id", None)
+        if d2t is not None:
+            self._draft_target_ids = torch.arange(d2t.shape[0], device=d2t.device) + d2t
+            # CPU copy for the grammar batch's draft-vocab support check
+            # (does the mask admit any draft-vocab token at all); computed
+            # once at load so the per-step check stays sync-free.
+            self._draft_target_ids_cpu = (
+                self._draft_target_ids.cpu().numpy().astype(np.int64)
             )
+        if self.draft_logits is not None and self._draft_target_ids is not None:
+            self._d2t_scatter_index = self._draft_target_ids
             # -inf once; the per-step scatter overwrites the draft->target
             # columns. Kept separate from draft_logits to avoid aliasing.
             self._draft_scatter_buf = torch.full(
@@ -120,6 +129,7 @@ class DSparkSpeculator(DFlashSpeculator):
             markov_embed = self.model.markov_embed(prev)
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
+            target_ids_for_mask = self._draft_target_ids
             if self.draft_logits is not None:
                 # Probabilistic: sample in target vocab (a reduced draft vocab is
                 # scattered into its target columns; full vocab is already there).
@@ -128,6 +138,20 @@ class DSparkSpeculator(DFlashSpeculator):
                     buf = self._draft_scatter_buf[:num_reqs]
                     buf.index_copy_(1, self._d2t_scatter_index, logits_i.to(buf.dtype))
                     logits_i = buf
+                target_ids_for_mask = None
+            if self.draft_grammar is not None:
+                # target_token_ids_cpu restricts the empty-support check to
+                # the draft vocabulary in BOTH branches: the probabilistic
+                # scatter buffer is -inf outside the draft-vocab columns, so
+                # a grammar admitting only non-draft tokens would still
+                # produce a dead row even though the full-target-space mask
+                # itself is non-empty.
+                self.draft_grammar.apply(
+                    logits_i,
+                    target_token_ids=target_ids_for_mask,
+                    target_token_ids_cpu=self._draft_target_ids_cpu,
+                )
+            if self.draft_logits is not None:
                 # sample_pos is the predicted token's position Q; the target
                 # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
                 draft_sampled_i = gumbel_sample(
@@ -146,6 +170,8 @@ class DSparkSpeculator(DFlashSpeculator):
                     logits_i.argmax(dim=-1)
                 )
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            if self.draft_grammar is not None:
+                self.draft_grammar.advance(draft_sampled_i)
             prev = draft_sampled_i
 
     def _generate_draft(

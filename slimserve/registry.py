@@ -72,11 +72,13 @@ def profile_blocked(profile_id: str, platform: str) -> str | None:
     if blocked:
         return blocked
     profile = describe(profile_id)
-    override = (profile.get("platform_overrides") or {}).get(platform) or {}
-    status = override.get("status", profile.get("status", "supported"))
+    if platform not in profile["platforms"]:
+        return None
+    record = profile["variants"][platform]
+    status = record.get("status", profile.get("status", "supported"))
     if status == "supported":
         return None
-    return override.get(
+    return record.get(
         "status_reason", profile.get("status_reason", "not supported yet")
     )
 
@@ -84,9 +86,9 @@ def profile_blocked(profile_id: str, platform: str) -> str | None:
 def profile_blocked_detail(profile_id: str, platform: str) -> str:
     """Long-form explanation for a profile-specific serving gate."""
     profile = describe(profile_id)
-    override = (profile.get("platform_overrides") or {}).get(platform) or {}
+    record = profile["variants"].get(platform) or {}
     return (
-        override.get("status_detail")
+        record.get("status_detail")
         or profile.get("status_detail")
         or profile_blocked(profile_id, platform)
         or ""
@@ -103,9 +105,6 @@ class Quant:
     min_gpus: dict[str, int]
     min_memory_bytes: dict[str, int]
     assembly: dict[str, Any] | None
-    # "directory" for HF-format checkpoints (safetensors + config.json),
-    # where the engine's --model is the folder rather than files[0].
-    entry: str | None = None
 
     def requirement(self, platform: str) -> int | None:
         """The gating figure for this platform: GPU count or bytes of memory."""
@@ -139,6 +138,13 @@ class Plan:
     speculative_overrides: dict[str, Any]
     chat_template_kwargs: dict[str, Any]
     notes: list[str] = field(default_factory=list)
+    # Variant-level drafter when platforms diverge; falls back to the
+    # source-level speculator.
+    variant_speculator: dict[str, Any] | None = None
+
+    @property
+    def speculator(self) -> dict[str, Any] | None:
+        return self.variant_speculator or self.source.get("speculator")
 
     @property
     def model_dir(self) -> Path:
@@ -147,7 +153,9 @@ class Plan:
     @property
     def entry_file(self) -> Path:
         """The path handed to the engine as --model."""
-        if self.quant.entry == "directory":
+        if self.source.get("format") == "safetensors":
+            # A safetensors checkpoint is a directory of shards plus config
+            # and tokenizer files; the engine takes the directory itself.
             return self.model_dir
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
@@ -177,28 +185,36 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         min_gpus=raw["min_gpus"],
         min_memory_bytes=raw.get("min_memory_bytes") or {},
         assembly=raw.get("assembly"),
-        entry=_validated_entry(raw.get("entry")),
     )
 
 
-def _validated_entry(entry: Any) -> str | None:
-    # A typo'd value would otherwise silently fall through to the
-    # files[0] path and surface as a confusing engine load error.
-    if entry not in (None, "directory"):
-        raise ProfileError(
-            f"unknown quant entry mode {entry!r} (expected \"directory\")"
-        )
-    return entry
-
-
 def describe(profile_id: str) -> dict[str, Any]:
-    """The raw registry entry, for listing without resolving a platform."""
+    """The registry entry, for listing without resolving a platform.
+
+    A profile is model x quant x platform x config, so the stored entry holds
+    one record per platform under `variants`. The id a user types carries no
+    platform -- the CLI detects it -- so this returns the shared fields plus
+    the platform list, and `variant()` returns the record for one platform.
+    """
     profiles = _registry()["profiles"]
     if profile_id not in profiles:
         raise ProfileError(
             f"unknown profile {profile_id!r}; available: {', '.join(profiles)}"
         )
-    return profiles[profile_id]
+    entry = profiles[profile_id]
+    return {**entry, "platforms": list(entry["variants"])}
+
+
+def variant(profile_id: str, platform: str) -> dict[str, Any]:
+    """The record for one platform, or an error naming the ones that exist."""
+    entry = describe(profile_id)
+    record = entry["variants"].get(platform)
+    if record is None:
+        raise ProfileError(
+            f"{profile_id} is not supported on {platform_title(platform)}; "
+            f"it runs on {', '.join(platform_title(p) for p in entry['platforms'])}"
+        )
+    return record
 
 
 def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Quant]:
@@ -214,31 +230,22 @@ def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Qu
 
 
 def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
-    """Apply a platform's overrides over the profile's base settings."""
-    override = (profile.get("platform_overrides") or {}).get(platform)
-    engine = dict(profile["engine"])
-    env = dict(profile.get("env") or {})
-    notes = list(profile.get("notes") or [])
-    speculative_overrides = dict(profile.get("speculative_overrides") or {})
-    default_quant = profile["default_quant"]
-    if override:
-        for key, value in (override.get("engine") or {}).items():
-            if value is None:
-                engine.pop(key, None)
-            else:
-                engine[key] = value
-        if "env" in override:
-            env = dict(override["env"])
-        if "notes" in override:
-            notes = list(override["notes"])
-        speculative_overrides.update(override.get("speculative_overrides") or {})
-        default_quant = override.get("default_quant", default_quant)
+    """The platform's own settings.
+
+    Kept as a function because callers read it as one shape; there is nothing
+    left to merge now that each platform has its own record.
+    """
+    record = profile["variants"][platform]
     return {
-        "engine": engine,
-        "env": env,
-        "notes": notes,
-        "default_quant": default_quant,
-        "speculative_overrides": speculative_overrides,
+        "engine": dict(record["engine"]),
+        "env": dict(record.get("env") or {}),
+        "notes": list(record.get("notes") or []),
+        "default_quant": record["default_quant"],
+        "speculative_overrides": dict(record.get("speculative_overrides") or {}),
+        # A variant may carry its own drafter when platforms diverge (e.g.
+        # qwen38-nvfp4-1: the MI300X variant reuses the checkpoint's MTP
+        # head, the Metal variant serves the measured DFlash2 drafter).
+        "speculator": record.get("speculator"),
     }
 
 
@@ -313,11 +320,7 @@ def resolve(
     # Quant-specific engine/env adjustments (e.g. a KV byte budget measured
     # for one artifact does not transfer to a larger one). Applied after the
     # platform merge so they win over both base and platform settings.
-    quant_override = (
-        ((profile.get("platform_overrides") or {}).get(platform) or {})
-        .get("quant_overrides", {})
-        .get(name)
-    )
+    quant_override = profile["variants"][platform].get("quant_overrides", {}).get(name)
     if quant_override:
         for key, value in (quant_override.get("engine") or {}).items():
             if value is None:
@@ -347,6 +350,7 @@ def resolve(
         speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
+        variant_speculator=merged["speculator"],
     )
 
 
@@ -368,7 +372,7 @@ def _suggest(profile_id: str, platform: str, minimum: int) -> str:
     for other, entry in _registry()["profiles"].items():
         if (
             entry["source"] == source
-            and platform in entry["platforms"]
+            and platform in entry["variants"]
             and entry["gpus"] >= minimum
         ):
             return other
@@ -398,7 +402,7 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "role": "shared",
             }
         )
-    spec = plan.source.get("speculator") if plan.speculative else None
+    spec = plan.speculator if plan.speculative else None
     if spec and (entry := spec.get("file")):
         wanted.append(
             {

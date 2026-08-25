@@ -78,6 +78,13 @@ class MetalPlatform(Platform):
     supported_quantization: list[str] = ["gguf", "compressed-tensors"]
 
     @classmethod
+    def current_device(cls) -> torch.device:
+        """Apple exposes exactly one GPU; parameters init on it directly.
+        Metal-only helper (no Platform-base counterpart); used by the GDN
+        serving path and weight loading."""
+        return torch.device("mps")
+
+    @classmethod
     def is_available(cls) -> bool:
         mps = getattr(torch.backends, "mps", None)
         return bool(mps and mps.is_built() and mps.is_available())
@@ -88,12 +95,6 @@ class MetalPlatform(Platform):
         # and embeddings in bf16, and the vendored kernels are written against
         # that. fp16 stays available for the quantized GEMV path.
         return [torch.bfloat16, torch.float16, torch.float32]
-
-    @classmethod
-    def current_device(cls) -> torch.device:
-        # Metal-only helper (no Platform-base counterpart): MPS exposes a
-        # single device. Used by the GDN serving path.
-        return torch.device("mps")
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

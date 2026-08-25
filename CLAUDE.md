@@ -32,11 +32,33 @@ behavior:
 
 ## SlimServe Orientation
 
-- SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth for supported models, quants, engine args, environment, and platform overrides.
+- SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth
+  for supported models, quants, engine args, and environment.
+- A profile is **model x quant x platform x config**. Platform is part of a
+  profile's identity, not a list it ranges over: a config tuned for MI300X is
+  not the same profile as one tuned for A100, even for the same model and
+  quant. MI300X and Metal each need their own.
+- The id a user types carries no platform (`slimserve dsv4-q4ktail-2`) because
+  the CLI already detects the machine. Each id therefore stores one record per
+  platform under `variants`, and every record states its own `platform`.
+  `registry.describe(id)` gives the shared fields plus the platform list;
+  `registry.variant(id, platform)` gives one platform's config.
+- Never widen a profile to a platform it was not tuned and validated on, and
+  never reach for a `platform_overrides`-style escape hatch to make one record
+  serve two platforms -- that mechanism existed, it let an A100 config stand in
+  for MI300X, and it has been retired. Add the platform's own record instead.
+  Two tests enforce this: `test_a_profile_is_one_config_per_platform` and
+  `test_no_profile_carries_another_platforms_environment`.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
 - Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
 
 ## Agent Operating Discipline
+
+- Never store anything that must survive a crash or reboot under `/private/tmp`
+  or other system temp directories — machine deaths wipe them. Durable working
+  state (worktrees, benchmark logs, handoff notes, fix branches) belongs in
+  `~/.local/scratch` (create it if needed) or inside the repo's git-ignored
+  areas such as `perf/results/`.
 
 - Read the repo before deciding. Start from `AGENTS.md`, `perf/perf.md`,
   `perf/baseline_status.md`, `perf/optimization_status.md`, the relevant
@@ -66,6 +88,11 @@ behavior:
   readiness, or final performance without the corresponding evidence.
 - Preserve user and prior-agent changes. The worktree may be dirty; understand
   nearby edits and build on them rather than reverting unrelated work.
+- Always merge. When a pull, rebase, or merge collides with local dirty state,
+  semantically merge both sides — never resolve a conflict by picking one
+  side wholesale. Parallel implementations of the same file must be unified
+  so every platform's validated path keeps working, and the losing copy's
+  functional changes must be grafted into the survivor, not discarded.
 - Finish the loop: implement, build, smoke, run the real profile or explain the
   concrete blocker, update the performance notebook, and leave the next command
   obvious.

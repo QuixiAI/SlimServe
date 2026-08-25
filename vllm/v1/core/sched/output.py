@@ -283,3 +283,10 @@ class GrammarOutput:
     structured_output_request_ids: list[str]
     # Bitmask ordered as structured_output_request_ids.
     grammar_bitmask: "npt.NDArray[np.int32]"
+    # Per-row flags, same order as grammar_bitmask rows: True where the row
+    # holds a real grammar mask, False where the scheduler wrote the
+    # unrestricted sentinel (reasoning rows, terminated grammars). A
+    # permissive grammar state can fill a mask bit-identical to the
+    # sentinel, so consumers must use these flags rather than sniff the
+    # mask bits. None only for producers that predate the field.
+    apply_rows: "npt.NDArray[np.bool_] | None" = None

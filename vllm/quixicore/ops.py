@@ -855,6 +855,39 @@ class quixicore_ops:
             max_context,
         )
 
+    @staticmethod
+    def kv_cache_gather_range(
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        token_start: int,
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather a logical token range with 64-bit hybrid-cache offsets."""
+        return _qc().kv_cache_gather_range(
+            key_cache, value_cache, block_table, token_start, num_tokens
+        )
+
+    @staticmethod
+    def paged_attention_verify(
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_lens: torch.Tensor,
+        scale: float,
+        window: int = 0,
+    ) -> torch.Tensor:
+        """Multi-query verify attention: the m rows of a speculative verify
+        block cooperate per (head, partition) threadgroup so each K/V tile
+        streams from device once (vs once per row in the expansion path).
+        Per-row causal boundary (row i sees ctx - m + i + 1) and window are
+        applied in-kernel. Measured 3.9x over expansion at 9.9k global ctx,
+        parity exact. `q` is [m, heads, head_size]; one request."""
+        return _qc().paged_attention_verify(
+            q, key_cache, value_cache, block_table, context_lens, scale, window
+        )
+
     # ------------------------------------------------------------------
     # GGUF quantized matmul (Metal build only)
     #
@@ -979,6 +1012,111 @@ class quixicore_ops:
         instead of returning an uninitialized tail.
         """
         return _qc().ggml_mul_mat_a8(w, x, quant_type, row)
+
+    @staticmethod
+    def ggml_mul_mat_sm(
+        w: torch.Tensor, x: torch.Tensor, quant_type: int, row: int
+    ) -> torch.Tensor:
+        """Small-M weight-streaming MMA GEMM (the speculative verify band).
+
+        Every warp computes all (padded-to-32) columns for its own row slice,
+        so no streamed weight byte feeds idle padding. K-quants take the
+        tensor-ops variant (M5 neural accelerators; matmul2d at 55 vs 6.4
+        TFLOPS chained simdgroup on these tiles -- measured o_proj -67%,
+        gate -29%, down -49%, parity identical); the simdgroup paths remain
+        for shapes/formats the tensor kernel does not cover.
+        """
+        variant = 9
+        if x.shape[-1] % 64 == 0:
+            if quant_type in (12, 13, 14) and row % 32 == 0:
+                # Default: the per-shape 15/16/17 selection -- it won the
+                # same-protocol rested A/B (17.81/17.56/17.58 vs 16.05
+                # flat for the split-K=1 route, 2026-08-15). The split-K=1
+                # kernel (v31) swept HOT-matched microbenches (+33-44%)
+                # but regresses e2e cool: throttle overweights the fixed
+                # costs it deletes, and its lower per-kernel parallelism
+                # hurts inter-op overlap that isolated benches cannot see.
+                # VLLM_SM_ROUTE=split1 opts back in for future A/Bs.
+                import os
+
+                split1 = os.environ.get("VLLM_SM_ROUTE") == "split1"
+                if split1 and row % 64 == 0 and row >= 6656:
+                    variant = 31
+                elif row % 64 == 0 and row >= 16384:
+                    variant = 16
+                elif quant_type == 13 and row < 16384 and x.shape[-1] % 128 == 0:
+                    variant = 17  # BK=128: attn_gate 240 -> 166 us
+                else:
+                    variant = 15
+            elif quant_type in (12, 13):  # paired-plane BK=64 simdgroup
+                big = row > 8192 or x.shape[-1] > 8192
+                variant = 12 if big else 11
+            elif quant_type == 14:  # Q6_K: span path at BK=64
+                variant = 10
+        return _qc().ggml_mul_mat_sm(w, x, quant_type, row, variant)
+
+    @staticmethod
+    def muse_u4_repack(
+        qweight: torch.Tensor, n_rows: int, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Load-time repack of q4_K blocks to the uint4-native layout.
+
+        Returns (wu, sc, mn): wu is tile-major packed uint4
+        ([n_tile=64][K][64], two values per byte, low element in the low
+        nibble -- the layout matmul2d's packed B operand wants), sc/mn are
+        (K/32, N) half planes of d*sc6 and dmin*m6. Byte-parity with q4_K
+        +1.3%; exact integer repack (no float roundtrip of the quants).
+        Runs on CPU numpy at load time.
+        """
+        import numpy as np
+
+        raw = qweight.cpu().numpy().reshape(n_rows, -1, 144)
+        nblk = raw.shape[1]
+        d = raw[..., 0:2].copy().view("<f2").astype(np.float32)[..., 0]
+        dmin = raw[..., 2:4].copy().view("<f2").astype(np.float32)[..., 0]
+        sb = raw[..., 4:16].astype(np.uint16)
+        sc6 = np.zeros((n_rows, nblk, 8), np.uint16)
+        m6 = np.zeros((n_rows, nblk, 8), np.uint16)
+        for j in range(4):
+            sc6[..., j] = sb[..., j] & 63
+            m6[..., j] = sb[..., j + 4] & 63
+        for j in range(4, 8):
+            sc6[..., j] = (sb[..., j + 4] & 0x0F) | ((sb[..., j - 4] >> 6) << 4)
+            m6[..., j] = (sb[..., j + 4] >> 4) | ((sb[..., j] >> 6) << 4)
+        scp = (d[..., None] * sc6).reshape(n_rows, nblk * 8)
+        mnp = (dmin[..., None] * m6).reshape(n_rows, nblk * 8)
+        qs = raw[..., 16:144]
+        q = np.zeros((n_rows, nblk, 8, 32), np.uint8)
+        for j in range(8):
+            b = qs[:, :, (j >> 1) * 32 : ((j >> 1) + 1) * 32]
+            q[:, :, j, :] = (b & 0x0F) if j % 2 == 0 else (b >> 4)
+        q = q.reshape(n_rows, k)
+        wt = q.reshape(n_rows // 64, 64, k).transpose(0, 2, 1)
+        packed = (wt[..., 0::2] | (wt[..., 1::2] << 4)).astype(np.uint8)
+        wu = torch.from_numpy(np.ascontiguousarray(packed).reshape(-1))
+        sc = torch.from_numpy(np.ascontiguousarray(scp.T).astype(np.float16))
+        mn = torch.from_numpy(np.ascontiguousarray(mnp.T).astype(np.float16))
+        return wu, sc, mn
+
+    @staticmethod
+    def ggml_mul_mat_sm_u4(
+        wu: torch.Tensor,
+        sc: torch.Tensor,
+        mn: torch.Tensor,
+        x: torch.Tensor,
+        row: int,
+    ) -> torch.Tensor:
+        """uint4-native q4_K GEMM for the verify band (M 9..32).
+
+        matmul2d streams the packed device operand itself; measured 315 vs
+        372 us for the staged tensor kernel on the down shape under matched
+        thermal conditions, parity in the same 1e-3 band.
+        """
+        m, k = x.shape
+        x32 = torch.zeros(32, k, dtype=torch.float16, device=x.device)
+        x32[:m] = x.to(torch.float16)
+        out = _qc().ggml_mul_mat_sm_u4(wu, x32.contiguous(), sc, mn, row)
+        return out.narrow(1, 0, m).t().to(x.dtype).contiguous()
 
     @staticmethod
     def indexer_metadata(
@@ -1310,6 +1448,35 @@ class quixicore_ops:
         _qc().prepare_dflash_inputs(*args, **kwargs)
 
     @staticmethod
+    def dflash2_two_tap_conv(
+        x: torch.Tensor,
+        coeffs: torch.Tensor,
+        base: torch.Tensor,
+        side: int,
+        block_size: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Block-local dynamic two-tap convolution for DFlash 2 (Metal)."""
+        return _qc().dflash2_two_tap_conv(x, coeffs, base, side, block_size, group_size)
+
+    @staticmethod
+    def qwen_gdn_gated_norm(
+        x: torch.Tensor, z: torch.Tensor, w: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        """Fused RMSNormGated (norm_before_gate, silu) for the GDN output (Metal)."""
+        return _qc().qwen_gdn_gated_norm(x, z, w, eps)
+
+    @staticmethod
+    def qwen_gdn_step(*args, **kwargs) -> None:
+        """Fused Qwen3.5 GDN decode/verify step (Metal).
+
+        Conv window update + gated delta-rule scan over S positions per
+        sequence with per-position state stores; replaces the torch-native
+        MPS loop in qwen_gdn_linear_attn.py (which remains the oracle).
+        """
+        _qc().qwen_gdn_step(*args, **kwargs)
+
+    @staticmethod
     def mla_decode_bf16_sparse_glm(
         q: torch.Tensor,
         kv: torch.Tensor,
@@ -1561,6 +1728,33 @@ class quixicore_ops:
             seed,
             pos,
             vocab_num_blocks,
+        )
+
+    @staticmethod
+    def qwen38_rejection_sample(
+        target_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        pos: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_speculative_steps: int,
+        vocab_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-dispatch lossless rejection sampler for Metal."""
+        return _qc().qwen38_rejection_sample(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            temperature,
+            seeds,
+            num_speculative_steps,
+            vocab_size,
         )
 
     @staticmethod

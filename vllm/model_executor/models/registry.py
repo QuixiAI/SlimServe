@@ -101,11 +101,7 @@ _TEXT_GENERATION_MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
-    # Text-only serving of the Qwen3.5-VL arch string: the vision stack is
-    # not vendored in this fork; visual.* weights are skipped at load, and the
-    # Qwen3.8 GGUF ships its vision tower as a separate mmproj file that is
-    # never loaded.
-    "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
     "TeleChat3ForCausalLM": ("llama", "LlamaForCausalLM"),
 }
 
@@ -374,6 +370,11 @@ _MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
     ),
+    "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+    "Qwen3_5MoeForConditionalGeneration": (
+        "qwen3_5",
+        "Qwen3_5MoeForConditionalGeneration",
+    ),
     # [Encoder-decoder]
     "CohereAsrForConditionalGeneration": (
         "cohere_asr",
@@ -386,8 +387,12 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
+    "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
+    "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    # HF-safetensors and GGUF-built spellings of the same published drafter.
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+    "DFlash2QwenDraftModel": ("qwen3_dflash2", "DFlash2QwenDraftModel"),
     "DFlashMuseGlimmerDraftModel": (
         "muse_glimmer_dflash",
         "MuseGlimmerDFlashDraftModel",

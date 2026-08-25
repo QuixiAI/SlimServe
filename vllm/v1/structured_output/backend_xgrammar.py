@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +32,52 @@ else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
 logger = init_logger(__name__)
+
+
+def _mark_added_special_tokens(
+    tokenizer_info: xgr.TokenizerInfo,
+    tokenizer: Any,
+) -> xgr.TokenizerInfo:
+    """Repair special-token metadata lost by wrapped HF tokenizers.
+
+    XGrammar represents special tokens as empty entries in ``decoded_vocab``.
+    Some tokenizer wrappers expose an inflated or remapped added-token range,
+    so ``TokenizerInfo.from_huggingface`` can leave real control-token IDs as
+    ordinary text. A permissive regex may then admit BOS, padding, or protocol
+    tokens into a structured payload.
+
+    Rebuilding from XGrammar's already-decoded bytes avoids reapplying the
+    tokenizer-specific byte-level transformation. This is tokenizer-agnostic:
+    any in-vocabulary ``AddedToken(..., special=True)`` is repaired, while
+    tokenizers whose metadata is already correct return unchanged.
+    """
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None)
+    if not isinstance(added_tokens, Mapping):
+        return tokenizer_info
+
+    special_token_ids = [
+        token_id
+        for token_id, token in added_tokens.items()
+        if isinstance(token_id, int)
+        and 0 <= token_id < tokenizer_info.vocab_size
+        and bool(getattr(token, "special", False))
+    ]
+    if not special_token_ids:
+        return tokenizer_info
+
+    decoded_vocab = list(tokenizer_info.decoded_vocab)
+    if not any(decoded_vocab[token_id] for token_id in special_token_ids):
+        return tokenizer_info
+    for token_id in special_token_ids:
+        decoded_vocab[token_id] = b""
+
+    return xgr.TokenizerInfo(
+        decoded_vocab,
+        vocab_type=xgr.VocabType.RAW,
+        vocab_size=tokenizer_info.vocab_size,
+        stop_token_ids=tokenizer_info.stop_token_ids,
+        add_prefix_space=tokenizer_info.add_prefix_space,
+    )
 
 
 @dataclass
@@ -62,6 +109,10 @@ class XgrammarBackend(StructuredOutputBackend):
             tokenizer_info = xgr.TokenizerInfo.from_huggingface(
                 self.tokenizer,
                 vocab_size=self.vocab_size,
+            )
+            tokenizer_info = _mark_added_special_tokens(
+                tokenizer_info,
+                self.tokenizer,
             )
         self.compiler = xgr.GrammarCompiler(
             tokenizer_info,
@@ -202,6 +253,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def reset(self):
         self.num_processed_tokens = 0
         self.matcher.reset()
+        self._is_terminated = False
 
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc

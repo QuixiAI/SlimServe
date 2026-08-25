@@ -1169,6 +1169,11 @@ kernel void qgemv_mb(
         tk_dequant8<FMT>(base, col0, w);
         #pragma clang loop unroll(full)
         for (int m = 0; m < M; ++m) {
+            // Bit-compat with the compiled batch-1 kernel requires the exact
+            // same FMA chain per row; fast-math reassociation across the
+            // unrolled m/i nest changes rounding on scattered rows (same
+            // guard as qgemv_q8_0_mb_fast).
+            #pragma clang fp reassociate(off)
             device const T* xm = X + (long)m * K + x_base;
             #pragma clang loop unroll(full)
             for (int i = 0; i < 8; ++i) acc[m] += float(w[i]) * float(xm[i]);
@@ -2141,6 +2146,9 @@ instantiate_qdequant("qdequant_iq2_xxs", iq2_xxs);
 instantiate_qdequant("qdequant_iq2_xs", iq2_xs);
 instantiate_qdequant("qdequant_iq3_xxs", iq3_xxs);
 instantiate_qdequant("qdequant_iq1_s", iq1_s);
+instantiate_qdequant("qdequant_iq2_s", iq2_s);
+instantiate_qdequant("qdequant_iq3_s", iq3_s);
+instantiate_qdequant("qdequant_iq1_m", iq1_m);
 instantiate_qdequant("qdequant_tq2_0", tq2_0);
 
 #define instantiate_qgemv_mm(name, FMT, T, MROWS)                            \
@@ -2168,6 +2176,20 @@ instantiate_qgemv_mm_format("qgemv_mm_q8_0", q8_0);
 instantiate_qgemv_mm_format("qgemv_mm_q4_K", q4_K);
 instantiate_qgemv_mm_format("qgemv_mm_q5_K", q5_K);
 instantiate_qgemv_mm_format("qgemv_mm_q6_K", q6_K);
+// Qwen3.8 UD-Q2_K_XL verify band: the i-quant / K-quant formats that carry
+// the MLP and GDN projections. Their single-row qgemv is dequant-ALU-bound,
+// so the weight-stationary row block amortizes the decode over M rows
+// instead of re-running it (and re-streaming the bytes) once per row.
+instantiate_qgemv_mm_format("qgemv_mm_q2_K", q2_K);
+instantiate_qgemv_mm_format("qgemv_mm_q3_K", q3_K);
+instantiate_qgemv_mm_format("qgemv_mm_iq1_s", iq1_s);
+instantiate_qgemv_mm_format("qgemv_mm_iq1_m", iq1_m);
+instantiate_qgemv_mm_format("qgemv_mm_iq2_xxs", iq2_xxs);
+instantiate_qgemv_mm_format("qgemv_mm_iq2_xs", iq2_xs);
+instantiate_qgemv_mm_format("qgemv_mm_iq2_s", iq2_s);
+instantiate_qgemv_mm_format("qgemv_mm_iq3_xxs", iq3_xxs);
+instantiate_qgemv_mm_format("qgemv_mm_iq3_s", iq3_s);
+instantiate_qgemv_mm_format("qgemv_mm_iq4_xs", iq4_xs);
 
 // NR-layout q4_K batch twin (see qgemv_q4k_nr_mb): grid.y carries the
 // column-pair index, so one instantiation per dtype serves every even
@@ -2330,6 +2352,9 @@ instantiate_qgemv_format("qgemv_iq2_xxs", iq2_xxs);
 instantiate_qgemv_format("qgemv_iq2_xs", iq2_xs);
 instantiate_qgemv_format("qgemv_iq3_xxs", iq3_xxs);
 instantiate_qgemv_format("qgemv_iq1_s", iq1_s);
+instantiate_qgemv_format("qgemv_iq2_s", iq2_s);
+instantiate_qgemv_format("qgemv_iq3_s", iq3_s);
+instantiate_qgemv_format("qgemv_iq1_m", iq1_m);
 instantiate_qgemv_format("qgemv_q4_1", q4_1);
 instantiate_qgemv_format("qgemv_q5_0", q5_0);
 instantiate_qgemv_format("qgemv_q5_1", q5_1);

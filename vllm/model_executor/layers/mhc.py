@@ -89,13 +89,21 @@ def _has_quixicore_mhc_metal() -> bool:
 
 
 HAS_QUIXICORE_MHC_METAL = _has_quixicore_mhc_metal()
+
+
 # The Metal kernels re-read `fn` per token (one threadgroup per token) and
 # scale by threadgroup count, so the cap defaults to the full prefill
 # quantum. VLLM_QC_MHC_METAL_MAX_TOKENS overrides (32 restores decode-only
 # behavior).
-_QUIXICORE_MHC_METAL_MAX_TOKENS = int(
-    os.environ.get("VLLM_QC_MHC_METAL_MAX_TOKENS", "2048")
-)
+def _mhc_metal_max_tokens() -> int:
+    value = os.environ.get("VLLM_QC_MHC_METAL_MAX_TOKENS", "2048")
+    try:
+        return int(value)
+    except ValueError:
+        return 2048
+
+
+_QUIXICORE_MHC_METAL_MAX_TOKENS = _mhc_metal_max_tokens()
 
 
 def _use_quixicore_mhc_metal(tensor: torch.Tensor) -> bool:
@@ -103,8 +111,7 @@ def _use_quixicore_mhc_metal(tensor: torch.Tensor) -> bool:
         HAS_QUIXICORE_MHC_METAL
         and tensor.dtype in (torch.float16, torch.bfloat16)
         and tensor.shape[-2] == 4
-        and tensor.numel() // (4 * tensor.shape[-1])
-        <= _QUIXICORE_MHC_METAL_MAX_TOKENS
+        and tensor.numel() // (4 * tensor.shape[-1]) <= _QUIXICORE_MHC_METAL_MAX_TOKENS
     )
 
 

@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
         "Pass 'none' for servers without metrics; spec-decode counters are "
         "then reported as zero and the draft-token gate is skipped",
     )
+
     def _concurrency(value: str) -> int:
         parsed = int(value)
         if not 1 <= parsed <= 128:
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=_concurrency, required=True)
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--allow-no-spec",
+        action="store_true",
+        help="permit a plain-decoding server with no speculative draft metrics",
+    )
     parser.add_argument(
         "--prompt-offset",
         type=int,
@@ -140,14 +150,25 @@ def exact_prompts(
 
 
 def request_completion(
-    url: str, served_model_name: str, prompt: str, output_tokens: int, timeout: float
+    url: str,
+    served_model_name: str,
+    prompt: str,
+    output_tokens: int,
+    timeout: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    seed: int | None,
 ) -> dict[str, object]:
     body = json.dumps(
         {
             "model": served_model_name,
             "prompt": prompt,
             "max_tokens": output_tokens,
-            "temperature": 0,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "seed": seed,
             "stream": False,
             # vLLM honors this extension. DS4 may ignore it until its server
             # adapter exposes the same benchmark control.
@@ -192,6 +213,10 @@ def main() -> None:
                     prompt,
                     args.warmup_output_tokens,
                     args.timeout,
+                    args.temperature,
+                    args.top_p,
+                    args.top_k,
+                    args.seed,
                 )
                 for prompt in prompts
             ]
@@ -212,6 +237,10 @@ def main() -> None:
                 prompt,
                 args.output_tokens,
                 args.timeout,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.seed,
             )
             for prompt in prompts
         ]
@@ -261,6 +290,10 @@ def main() -> None:
         "concurrency": args.concurrency,
         "requested_input_tokens": args.input_tokens,
         "requested_output_tokens": args.output_tokens,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "seed": args.seed,
         "prompt_offset": args.prompt_offset,
         "warmup_output_tokens": args.warmup_output_tokens,
         "prompt_tokens": prompt_counts,
@@ -278,8 +311,12 @@ def main() -> None:
     print(json.dumps(summary, indent=2, sort_keys=True))
     if not summary["exact"]:
         raise SystemExit("server did not honor the exact benchmark token counts")
-    if args.metrics_url != "none" and summary["spec_decode_draft_tokens"] <= 0:
-        raise SystemExit("server produced no DSpark draft tokens")
+    if (
+        args.metrics_url != "none"
+        and not args.allow_no_spec
+        and summary["spec_decode_draft_tokens"] <= 0
+    ):
+        raise SystemExit("server produced no speculative draft tokens")
     # A degenerate server (NaN logits -> special-token loop) still returns the
     # exact token counts, but the tokens decode to almost no visible text.
     # Healthy prose/code sits well above 1 char/token; the BOS loop is ~0.
