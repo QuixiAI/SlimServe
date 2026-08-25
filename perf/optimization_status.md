@@ -10238,3 +10238,31 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   at every round. llama.cpp essay bar 35.67: remaining gap ~20%, held
   by the ~40 ms GPU pipeline (attention SDPA loop + MLP GEMVs) and the
   serial loop's single output wait.
+
+## 2026-08-25 - head_dim-256 Paged Decode: Correct, Measured, REJECTED (under-occupancy)
+
+- Baseline: essay 27.7-29.5 / gsm8k 44.5-44.7 on the SDPA+gather path.
+- Change: threaded an explicit 64-bit kv_block_stride through the plain
+  paged_attention kernel (kv_cache.metal), its instantiation macro,
+  launch_paged_attention, the host op (strided checks per the
+  kv_cache_gather_range precedent), and both Muse step-tape call sites
+  (contiguous there: stride == block_size*H*D, addresses bit-identical
+  by algebra). Added D=256 instantiations and routed qwen38 decode +
+  expanded verify through it; the mq verify path stays guarded off for
+  256 (the v2 verify kernel is not stride-threaded).
+- Correctness: PASS — seeded trajectories byte-identical to the SDPA
+  path on both arms.
+- Measured: essay 24.6-25.4 / gsm8k 38.7-39.4 — a ~15% REGRESSION.
+- Root cause: the plain kernel runs one simdgroup per (head, batch) and
+  walks the context serially; at decode widths (24 GQA heads x batch
+  <= 4 = ~96 simdgroups) it under-occupies the GPU, while the matmul
+  SDPA path parallelizes over the context axis.
+- Decision: REJECTED for routing; the stride plumbing, strided host
+  checks, and D=256 instantiations are RETAINED (correct, bit-neutral
+  for existing 64/128 users, and prerequisites for the follow-up).
+  Follow-up: route through paged_attention_partition + reduce (splits
+  the context axis; the same under-occupancy argument says it should
+  win) after threading the stride there too.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_v2.log
+  (regression), spec_reverted_check.log (restoration: essay 27.6-29.3,
+  gsm8k 44.2-44.5).

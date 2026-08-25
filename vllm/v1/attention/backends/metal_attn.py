@@ -41,12 +41,16 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Head sizes the fused paged decode kernel is instantiated for. Anything else
-# is correct on the SDPA path, just slower. head_dim 256 (Qwen3.8) has D=256
-# instantiations staged in paged_attn_v2.metal, but the hybrid pool's
-# blocks-first cache is a strided view and the paged family still assumes a
-# contiguous cache; it joins this tuple when the explicit block stride is
-# threaded through the plain/gqa_staged/partition/verify kernels (see the
-# kv_cache_gather_range precedent).
+# is correct on the SDPA path, just slower. The decode kernel walks the
+# cache's stride(0) explicitly, so the hybrid pool's blocks-first strided
+# K/V views (Qwen3.8, head_dim 256) are addressed correctly — but D=256
+# stays OFF this tuple: routed and measured 2026-08-25, trajectories
+# identical yet ~15% slower end-to-end. One simdgroup per (head, batch)
+# gives ~96 simdgroups at decode widths (GQA 24 heads, batch <= 4) — the
+# serial context walk under-occupies the GPU where the matmul SDPA path
+# parallelizes over context. Re-attempt via the partitioned
+# (paged_attention_partition + reduce) route, which splits the context
+# axis for occupancy.
 _PAGED_HEAD_SIZES = (64, 128)
 
 
@@ -328,6 +332,10 @@ class MetalAttentionImpl(AttentionImpl):
                 use_mq = (
                     self.sliding_window is None
                     and attn_metadata.num_reqs == 1
+                    # The verify kernel does not walk strided caches yet;
+                    # head_dim 256 implies the hybrid pool's strided views,
+                    # so it stays on the expansion path (which does).
+                    and self.head_size != 256
                     and int(seq_lens.max().item()) > 1024
                 )
                 if use_mq:
