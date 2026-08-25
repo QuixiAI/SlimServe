@@ -10100,8 +10100,8 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   merge, so campaign python (strided q/kv rms_norm splits) hit a host op
   without the strided variants. The metallib is tracked and was current;
   the .so was three campaigns old. Same failure class the K3 README
-  section documents for _C_stable_libtorch. Rule: rebuild _quixicore_C
-  from HEAD csrc (ninja _quixicore_C; rm-cp-codesign) after ANY merge
+  section documents for _C_stable_libtorch. Rule: rebuild_quixicore_C
+  from HEAD csrc (ninja_quixicore_C; rm-cp-codesign) after ANY merge
   that touches csrc/quixicore, before booting a Metal profile.
 - Historical note: the 33.684 tok/s comparison point remains a
   pre-resize, pre-campaign artifact; the campaign's own M1 Ultra numbers
@@ -10689,6 +10689,159 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `process_weights_after_loading` is the correct home for all of them, which
   is where the muse-u4, dsv4-aligned-q8 and padded-merge transforms already
   live -- this one was the outlier.
+
+## 2026-08-25 - Qwen3.8 Decode Drain-Peeling: Two Sync Removals (+5%), Chain Mapped
+
+- Method: cProfile with print_callers over the seeded offline spec bench;
+  fix the top drain, re-bench (seed-stable outputs required byte-
+  identical each round), re-profile. Three rounds converged the step's
+  hidden syncs into one architecturally-honest wait.
+- Fix 1 (mamba_hybrid.postprocess_state): boolean-mask indexing
+  (idx_mapping[valid]) lowers to nonzero() on MPS and drained the whole
+  device queue — measured 42 ms/step of self-time, half the decode wall.
+  Replaced with the sentinel-redirect scatter (post_update pattern):
+  int-index gather + where + scatter, sync-free. essay 23.0-24.7 ->
+  24.6-25.0.
+- Fix 2 (metal_attn build): seq_lens_cpu was m.seq_lens.to("cpu") per
+  build (~24 builds/step; the FIRST absorbed the previous GPU step,
+  ~40 ms). With serial scheduling the scheduler has already consumed the
+  prior step's acceptance, so seq_lens_cpu_upper_bound (committed +
+  scheduled) is EXACT; build now uses it and keeps the synced copy only
+  under async scheduling, where the bound can overshoot and would attend
+  stale KV. essay -> 25.5-25.9, gsm8k -> 40.7-41.0.
+- Endpoint of the chain: the remaining per-step wait is ONE
+  copy_event.synchronize (39 ms/step) in output consumption — the serial
+  engine loop cannot schedule step N+1 before N's sampled tokens reach
+  the host. Tried async_scheduling=True in the offline bench: within
+  noise (essay 25.5-27.2), the offline path does not meaningfully
+  overlap. Remaining structure per ~76 ms step: ~37 ms serial CPU
+  (execute_model encode 28 — of which gdn_attn.build x10/step ~10 ms
+  and a 49/step torch.arange storm — plus drafter 3) + ~39 ms GPU tail.
+- Next levers, in order: (1) CPU-encode shrink — dedupe the x10
+  per-group gdn_attn.build (shared per-step products), kill the arange
+  storm, batch the 929/step tiny .to()s; (2) GPU kernel fronts (MLP
+  IQ formats, GDN core) as previously surveyed; (3) server-path overlap
+  measurement (the server's async output thread may already hide part
+  of the 39 ms wait that the offline loop exposes).
+- Cumulative: essay 24.4 -> 25.7 (+5%), gsm8k 39.4 -> 41.0 (+4%),
+  outputs byte-identical throughout. 42 kernel/worker tests pass.
+- Raw: ~/.local/scratch/qwen38-rebaseline/ (cprofile*.log, bench logs).
+
+## 2026-08-25 - Drain-Peeling Rounds 3-4: GDN Build Masks + MRoPE Position Prep
+
+- Round 3 (gdn_attn.build, ran once per KV-cache group x10/step): every
+  device-side boolean-mask index (block_table gathers, num_accepted
+  filter, has_initial_state filter, cumsum inputs) lowered to nonzero()
+  on MPS. Row indices are now computed host-side from the CPU mask
+  (sync-free) and applied via index_select. essay 25.7 -> 26.5,
+  gsm8k 41.0 -> 42.4.
+- Round 4 (mm/rope._prepare_positions_native): int(qsl[-1]) read a
+  device scalar and repeat_interleave without output_size synced to
+  size its output — both once per step, and after rounds 1-3 they
+  gated the whole pipeline. The caller now passes
+  input_batch.num_tokens (python int) and output_size. essay 26.5 ->
+  27.5-29.2, gsm8k -> 43.4-43.8.
+- Cumulative from the 24.4/39.4 re-baseline: essay ~28.4 (+16%),
+  gsm8k ~43.6 (+11%); outputs byte-identical at every round; 42
+  kernel/worker tests pass each round.
+- Post-round profile: no python function above ~3 ms/step remains
+  (arange 3.3, .cpu 2.7, sdpa launch 2.2). The single event wait is
+  39.6 ms/step = the GPU pipeline itself; step ~69 ms = 40 GPU-bound +
+  29 CPU tail. Further CPU peeling is diminishing; the ~7 ms/step gap
+  to the llama.cpp bar now lives on the GPU side (MLP IQ-format GEMVs,
+  GDN core, SDPA+gather attention) and in serving-path overlap.
+- IQ1_S correction to the M-band theory: its M=1 and M=4 times are
+  EQUAL (0.14-0.29 ms) — the base per-span decode (one iq1s_grid
+  constant-memory lookup per 8-span, BPI=1 so almost no ILP across
+  blocks) is latency-bound, not the M scaling. The kernel fix is more
+  in-flight blocks per lane / more rows per simdgroup, not accumulator
+  work.
+
+## 2026-08-25 - head_dim-256 Paged Attention: Groundwork Staged, Hybrid Stride Mapped
+
+- Goal: move qwen38's 16 attention layers off the per-request SDPA+gather
+  python loop onto the fused paged kernels (the roadmap's item 4).
+- Staged (inert until routed): D=256 instantiations for the
+  paged_attn_v2 partition kernels (fp16/bf16/fp32; VALUES_PER_LANE=8,
+  16 KB threadgroup tiles) and paged_attention_verify fp16-256, plus
+  the verify host gate widened to D in {128, 256}.
+- Blocker found by the first routed bench: the paged family assumes a
+  CONTIGUOUS cache, and qwen38's hybrid pool serves blocks-first
+  STRIDED K/V views (stride(0) = 2x page) — the host op refused with
+  'key_cache must be contiguous'. The python gate is reverted to
+  (64, 128) with the roadmap note so nothing routes there yet.
+- The fix is mapped and precedented (kv_cache_gather_range): thread an
+  explicit 64-bit kv_block_stride through the family and replace
+  cache_base = ((block*block_size + slot)*H + h)*D with
+  block*kv_block_stride + ((slot*H + h)*D at every addressing site.
+  Sites: kv_cache.metal plain paged_attention + paged_attention_gqa_staged
+  (instantiation macros ~1216+), paged_attn_v2.metal partition/verify/
+  fp8-partition (3 loops), launchers launch_paged_attention{,_gqa_staged,
+  _partition,_verify} in tk_launch.h, and the host ops' check_mps ->
+  check_mps_strided + row-contiguity checks. First task of the next
+  kernel session.
+- Session cumulative (four sync removals, groundwork inert): essay
+  24.4 -> 27.7-29.5, gsm8k 39.4 -> 44.5-44.7; outputs byte-identical
+  at every round. llama.cpp essay bar 35.67: remaining gap ~20%, held
+  by the ~40 ms GPU pipeline (attention SDPA loop + MLP GEMVs) and the
+  serial loop's single output wait.
+
+## 2026-08-25 - head_dim-256 Paged Decode: Correct, Measured, REJECTED (under-occupancy)
+
+- Baseline: essay 27.7-29.5 / gsm8k 44.5-44.7 on the SDPA+gather path.
+- Change: threaded an explicit 64-bit kv_block_stride through the plain
+  paged_attention kernel (kv_cache.metal), its instantiation macro,
+  launch_paged_attention, the host op (strided checks per the
+  kv_cache_gather_range precedent), and both Muse step-tape call sites
+  (contiguous there: stride == block_size*H*D, addresses bit-identical
+  by algebra). Added D=256 instantiations and routed qwen38 decode +
+  expanded verify through it; the mq verify path stays guarded off for
+  256 (the v2 verify kernel is not stride-threaded).
+- Correctness: PASS — seeded trajectories byte-identical to the SDPA
+  path on both arms.
+- Measured: essay 24.6-25.4 / gsm8k 38.7-39.4 — a ~15% REGRESSION.
+- Root cause: the plain kernel runs one simdgroup per (head, batch) and
+  walks the context serially; at decode widths (24 GQA heads x batch
+  <= 4 = ~96 simdgroups) it under-occupies the GPU, while the matmul
+  SDPA path parallelizes over the context axis.
+- Decision: REJECTED for routing; the stride plumbing, strided host
+  checks, and D=256 instantiations are RETAINED (correct, bit-neutral
+  for existing 64/128 users, and prerequisites for the follow-up).
+  Follow-up: route through paged_attention_partition + reduce (splits
+  the context axis; the same under-occupancy argument says it should
+  win) after threading the stride there too.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_v2.log
+  (regression), spec_reverted_check.log (restoration: essay 27.6-29.3,
+  gsm8k 44.2-44.5).
+
+## 2026-08-25 - Lazy torchvision: vendored smart_resize, video-only lazy imports
+
+- Problem: main's unified Qwen3.5 vision stack (qwen3_5.py -> qwen3_vl.py
+  -> qwen2_vl.py) imported transformers' smart_resize / VideoMetadata at
+  module scope; those transformers modules import torchvision at module
+  scope, making torchvision a hard dependency of TEXT-ONLY serving (boot
+  failed with ModuleNotFoundError after the PR #10 conflict merge).
+- Change: image-path smart_resize in qwen2_vl.py and qwen3_vl.py now
+  comes from the in-tree torchvision-free copy
+  (vllm/transformers_utils/processors/qwen3_5_gguf.py, same math as the
+  HF original); the video smart_resize and VideoMetadata imports in
+  qwen3_vl.py are lazy in-function, so video requests require
+  torchvision at runtime but nothing else does. The processors package
+  **init** is already lazy (**getattr**), so minimax_m3.py's eager
+  torchvision import only loads when that model's processor is used.
+- Posture: torchvision UNINSTALLED on this box. transformers falls back
+  to Qwen2VLImageProcessorPil (with a warning) for actual image
+  requests.
+- Correctness: text bench heads byte-identical to the with-torchvision
+  run; image-request smoke without torchvision PASSES end to end (model
+  correctly describes a synthetic red-bordered rectangle + blue ellipse
+  via the PIL fallback). pytest tests/kernels tests/v1/worker: 37
+  passed / 103 skipped. Ruff clean.
+- Measured: essay 27.8-28.9 / gsm8k 43.3-43.7 (vs 27.8-29.0 / 44.2-44.7
+  with torchvision installed; identical outputs, timing delta within
+  the day-to-day band).
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_lazytv2.log,
+  image_smoke_no_tv.log (+ image_smoke_no_tv.py harness).
 
 ## 2026-08-25 - GGUF value-head permutation: HYPOTHESIS TESTED AND REFUTED
 

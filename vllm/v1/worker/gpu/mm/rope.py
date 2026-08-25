@@ -113,13 +113,18 @@ class RopeState:
         query_start_loc: torch.Tensor,
         prefill_lens: torch.Tensor,
         num_computed_tokens: torch.Tensor,
+        num_tokens: int | None = None,
     ) -> None:
         num_reqs = idx_mapping.shape[0]
         if self.device.type == "mps":
             # Torch-native fallback (no Triton on Metal), mirroring
             # _prepare_rope_positions_kernel token for token.
             return self._prepare_positions_native(
-                idx_mapping, query_start_loc, prefill_lens, num_computed_tokens
+                idx_mapping,
+                query_start_loc,
+                prefill_lens,
+                num_computed_tokens,
+                num_tokens,
             )
         _prepare_rope_positions_kernel[(num_reqs,)](
             self.positions,
@@ -142,6 +147,7 @@ class RopeState:
         query_start_loc: torch.Tensor,
         prefill_lens: torch.Tensor,
         num_computed_tokens: torch.Tensor,
+        num_tokens: int | None = None,
     ) -> None:
         """Torch port of ``_prepare_rope_positions_kernel`` for MPS.
 
@@ -153,13 +159,17 @@ class RopeState:
         device = self.positions.device
         qsl = query_start_loc[: num_reqs + 1].to(torch.long)
         query_lens = qsl[1:] - qsl[:-1]
-        total = int(qsl[-1])
+        # int(qsl[-1]) is a device read (queue drain); the caller already
+        # knows the scheduled token count as a python int.
+        total = num_tokens if num_tokens is not None else int(qsl[-1])
         if total == 0:
             return
 
         req_state = idx_mapping.to(torch.long)
+        # output_size keeps repeat_interleave from syncing to size its
+        # output on MPS.
         tok_req = torch.repeat_interleave(
-            torch.arange(num_reqs, device=device), query_lens
+            torch.arange(num_reqs, device=device), query_lens, output_size=total
         )
         tok_state = req_state[tok_req]
         tok_off = torch.arange(total, device=device) - qsl[:-1][tok_req]

@@ -35,19 +35,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BatchFeature, ProcessorMixin
 from transformers.models.qwen2_vl import Qwen2VLImageProcessor
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import (
-    smart_resize as image_smart_resize,
-)
 from transformers.models.qwen3_vl import Qwen3VLProcessor, Qwen3VLVideoProcessor
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLConfig,
     Qwen3VLVisionConfig,
 )
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
-    smart_resize as video_smart_resize,
-)
-from transformers.video_utils import VideoMetadata
 
+# VideoMetadata and the smart_resize helpers are imported lazily at their
+# use sites: their transformers modules import torchvision at module
+# scope, and torchvision must only load when multimodal processing
+# actually runs (it is absent from text-only serving environments).
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.multimodal import (
@@ -909,13 +906,24 @@ class Qwen3VLProcessingInfo(Qwen2VLProcessingInfo):
 
         if do_resize:
             if is_video:
-                smart_resize = video_smart_resize
+                # Video sizing stays on the transformers helper (lazy: its
+                # module imports torchvision); video requests require
+                # torchvision at runtime.
+                from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+                    smart_resize,
+                )
+
                 extra_kwargs = {
                     "num_frames": num_frames,
                     "temporal_factor": temporal_patch_size,
                 }
             else:
-                smart_resize = image_smart_resize
+                # In-tree vendored copy (same math, no torchvision): startup
+                # profiling reaches this in text-only serving.
+                from vllm.transformers_utils.processors.qwen3_5_gguf import (
+                    smart_resize,
+                )
+
                 extra_kwargs = {}
 
             resized_height, resized_width = smart_resize(
@@ -1308,6 +1316,8 @@ class Qwen3VLMultiModalProcessor(BaseMultiModalProcessor[Qwen3VLProcessingInfo])
                     video_mm_kwargs["do_sample_frames"] = metadata.get(
                         "do_sample_frames", False
                     )
+
+                from transformers.video_utils import VideoMetadata
 
                 metadata = VideoMetadata(
                     **{k: metadata[k] for k in metadata if k != "do_sample_frames"}

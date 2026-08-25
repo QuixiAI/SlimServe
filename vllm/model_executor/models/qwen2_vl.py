@@ -40,7 +40,6 @@ from transformers.models.qwen2_vl.configuration_qwen2_vl import (
     Qwen2VLConfig,
     Qwen2VLVisionConfig,
 )
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -84,6 +83,11 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.sequence import IntermediateTensors
+
+# smart_resize comes from the in-tree vendored copy: the transformers
+# original lives in a module that imports torchvision at module scope,
+# and startup profiling calls smart_resize even in text-only serving.
+from vllm.transformers_utils.processors.qwen3_5_gguf import smart_resize
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers

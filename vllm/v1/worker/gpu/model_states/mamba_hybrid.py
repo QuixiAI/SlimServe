@@ -307,13 +307,26 @@ class MambaHybridModelState(DefaultModelState):
             n = idx_mapping.shape[0]
             if n and self.device.type == "mps":
                 # Torch-native fallback (no Triton on Metal), mirroring
-                # _scatter_num_accepted_kernel.
-                valid = idx_mapping >= 0
-                self.num_accepted_tokens_gpu[idx_mapping[valid].to(torch.long)] = (
-                    torch.clamp(num_sampled[:n][valid], min=1).to(
-                        self.num_accepted_tokens_gpu.dtype
-                    )
+                # _scatter_num_accepted_kernel. Sync-free by construction:
+                # boolean-mask indexing (idx_mapping[valid]) lowers to
+                # nonzero() on MPS, which drains the whole device queue —
+                # measured 42 ms/step, half the decode wall. Sentinel rows
+                # are redirected to slot 0 with an ADDITIVE update of zero:
+                # a valid row targeting the same slot contributes
+                # (vals - cur) so the slot lands exactly on vals, and
+                # integer scatter_add is deterministic under duplicate
+                # indices (a plain indexed assignment is not — a sentinel
+                # colliding with a genuine request state 0 could win the
+                # write race and leave the slot stale).
+                idx = idx_mapping.to(torch.long)
+                valid = idx >= 0
+                safe = torch.where(valid, idx, torch.zeros_like(idx))
+                vals = torch.clamp(num_sampled[:n], min=1).to(
+                    self.num_accepted_tokens_gpu.dtype
                 )
+                cur = self.num_accepted_tokens_gpu[safe]
+                delta = torch.where(valid, vals - cur, torch.zeros_like(cur))
+                self.num_accepted_tokens_gpu.scatter_add_(0, safe, delta)
             elif n:
                 _scatter_num_accepted_kernel[(n,)](
                     idx_mapping, num_sampled, self.num_accepted_tokens_gpu
