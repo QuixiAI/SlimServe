@@ -10813,3 +10813,32 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_v2.log
   (regression), spec_reverted_check.log (restoration: essay 27.6-29.3,
   gsm8k 44.2-44.5).
+
+## 2026-08-25 - Lazy torchvision: vendored smart_resize, video-only lazy imports
+
+- Problem: main's unified Qwen3.5 vision stack (qwen3_5.py -> qwen3_vl.py
+  -> qwen2_vl.py) imported transformers' smart_resize / VideoMetadata at
+  module scope; those transformers modules import torchvision at module
+  scope, making torchvision a hard dependency of TEXT-ONLY serving (boot
+  failed with ModuleNotFoundError after the PR #10 conflict merge).
+- Change: image-path smart_resize in qwen2_vl.py and qwen3_vl.py now
+  comes from the in-tree torchvision-free copy
+  (vllm/transformers_utils/processors/qwen3_5_gguf.py, same math as the
+  HF original); the video smart_resize and VideoMetadata imports in
+  qwen3_vl.py are lazy in-function, so video requests require
+  torchvision at runtime but nothing else does. The processors package
+  __init__ is already lazy (__getattr__), so minimax_m3.py's eager
+  torchvision import only loads when that model's processor is used.
+- Posture: torchvision UNINSTALLED on this box. transformers falls back
+  to Qwen2VLImageProcessorPil (with a warning) for actual image
+  requests.
+- Correctness: text bench heads byte-identical to the with-torchvision
+  run; image-request smoke without torchvision PASSES end to end (model
+  correctly describes a synthetic red-bordered rectangle + blue ellipse
+  via the PIL fallback). pytest tests/kernels tests/v1/worker: 37
+  passed / 103 skipped. Ruff clean.
+- Measured: essay 27.8-28.9 / gsm8k 43.3-43.7 (vs 27.8-29.0 / 44.2-44.7
+  with torchvision installed; identical outputs, timing delta within
+  the day-to-day band).
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_lazytv2.log,
+  image_smoke_no_tv.log (+ image_smoke_no_tv.py harness).
