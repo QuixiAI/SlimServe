@@ -120,6 +120,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
+from vllm.v1.worker.metal_phaseprof import wrap as _qc_phase_wrap
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
@@ -1137,14 +1138,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         enabled = getattr(self, "_nan_watch_enabled", None)
         if enabled is None:
             enabled = os.getenv("VLLM_NAN_WATCH", "0").lower() in (
-                "1", "true", "on", "yes",
+                "1",
+                "true",
+                "on",
+                "yes",
             )
             self._nan_watch_enabled = enabled
             self._nan_watch_step = 0
             self._nan_watch_pending: tuple | None = None
             if enabled:
-                logger.warning("NAN_WATCH enabled: logits rows checked "
-                               "every step (diagnostic mode)")
+                logger.warning(
+                    "NAN_WATCH enabled: logits rows checked "
+                    "every step (diagnostic mode)"
+                )
         if not enabled or logits is None:
             return
         self._nan_watch_step += 1
@@ -1159,15 +1165,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     ids = ids_host.tolist() if ids_host is not None else None
                     nan_ids = (
                         [ids[i] for i in idxs if i < len(ids)]
-                        if ids is not None else None
+                        if ids is not None
+                        else None
                     )
                     logger.error(
                         "NAN_WATCH: %d/%d NaN logits row(s) at step %d "
                         "(reported at step %d) rows=%s nan_row_input_ids=%s "
                         "all_ids=%s",
-                        count, rows, step, self._nan_watch_step, idxs,
-                        nan_ids, ids[:16] if ids is not None else None)
+                        count,
+                        rows,
+                        step,
+                        self._nan_watch_step,
+                        idxs,
+                        nan_ids,
+                        ids[:16] if ids is not None else None,
+                    )
                     from vllm.model_executor.layers import nan_probe
+
                     layers = nan_probe.snapshot()
                     if layers is not None:
                         logger.error(
@@ -1176,14 +1190,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             "outputs (birth = min); slots 100+4L+p are "
                             "intra-layer for L in 0-2 (p: 0=attn-in, "
                             "1=attn-out, 2=moe-in, 3=moe-out)",
-                            [x for x in layers if x[0] >= 100]
-                            + layers[:8])
+                            [x for x in layers if x[0] >= 100] + layers[:8],
+                        )
                 self._nan_watch_pending = None
         if self._nan_watch_pending is None:
             nan_mask = torch.isnan(logits).any(dim=-1)
-            host = torch.empty(
-                nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True
-            )
+            host = torch.empty(nan_mask.shape, dtype=nan_mask.dtype, pin_memory=True)
             host.copy_(nan_mask, non_blocking=True)
             ids_host = None
             if input_batch is not None:
@@ -1198,7 +1210,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             event = torch.cuda.Event()
             event.record()
             self._nan_watch_pending = (
-                host, event, self._nan_watch_step, logits.shape[0], ids_host)
+                host,
+                event,
+                self._nan_watch_step,
+                logits.shape[0],
+                ids_host,
+            )
 
     def sample(
         self,
@@ -1267,6 +1284,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @_qc_phase_wrap("execute_model")
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1507,6 +1525,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
         )
 
         if not self.is_last_pp_rank:
@@ -1516,6 +1535,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     @step_eplb_after()
+    @_qc_phase_wrap("sample_tokens")
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
@@ -1529,6 +1549,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        num_spec_tokens_to_schedule = (
+            self.execute_model_state.num_spec_tokens_to_schedule
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1597,8 +1620,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
         )
 
+        # Dynamic SD (num_speculative_tokens_per_batch_size): the scheduler
+        # computed zero draft slots for the next step at this batch size, so
+        # the drafter forward is skipped entirely and the scheduler must see
+        # zero drafts rather than stale ones. On this (sync-scheduler) path
+        # only K == 0 gates; intermediate K values are not trimmed.
+        skip_drafting = self.speculator is not None and num_spec_tokens_to_schedule == 0
+
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        if (
+            self.speculator is not None
+            and not skip_drafting
+            and self.speculator.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1620,7 +1654,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and not skip_drafting:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1650,9 +1684,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            scheduled_draft_tokens = self.req_states.draft_tokens[
+                input_batch.idx_mapping
+            ]
+            if skip_drafting:
+                # Zero-width view: the handler reports zero drafts per request,
+                # so the scheduler runs the next step as pure decode.
+                scheduled_draft_tokens = scheduled_draft_tokens[:, :0]
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                scheduled_draft_tokens,
             )
 
         # Post-step KV connector related operations.
@@ -1791,6 +1832,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_spec_tokens_to_schedule: int
 
 
 def sort_batch_req_ids(

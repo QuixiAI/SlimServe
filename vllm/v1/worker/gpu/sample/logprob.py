@@ -109,6 +109,14 @@ def compute_token_logprobs(
 
         quixicore_ops.v2_topk_log_softmax(logprobs, logits, token_ids)
         return logprobs
+    if logits.device.type == "mps":
+        # Torch fallback, matching the kernel: stable per-row logsumexp,
+        # logprobs emitted only at token_ids. Materializes one fp32 row per
+        # request (~1 MB at this vocab), acceptable at Metal batch sizes.
+        x = logits.float()
+        lse = torch.logsumexp(x, dim=-1, keepdim=True)
+        logprobs.copy_(x.gather(1, token_ids) - lse)
+        return logprobs
     # Cap the kernel's per-iteration width so very large num_logprobs requests
     # stream the gather in bounded-size chunks, avoiding excessive mem use.
     topk_block_size = min(next_power_of_2(num_logprobs), _MAX_TOPK_BLOCK)
@@ -210,6 +218,10 @@ def compute_topk_scores(
         from vllm.quixicore import quixicore_ops
 
         quixicore_ops.v2_ranks(token_ranks, logits, sampled_token_ids)
+    elif logits.device.type == "mps":
+        # Torch fallback, matching the kernel: rank = #logits >= sampled's.
+        sampled_logits = logits.gather(1, sampled_token_ids.to(torch.int64).view(-1, 1))
+        token_ranks.copy_((logits >= sampled_logits).sum(dim=-1))
     else:
         _ranks_kernel[(batch_size,)](
             token_ranks,

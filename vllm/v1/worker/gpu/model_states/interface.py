@@ -35,6 +35,17 @@ class ModelSpecificAttnMetadata:
     ) -> dict[str, Any]:
         return {}
 
+    def steady_signature(self) -> Any | None:
+        """Hashable token when this metadata is compatible with the
+        steady uniform-decode fast path in build_attn_metadata, else None.
+
+        None (the default) keeps model-specific metadata ineligible — the
+        pre-existing behavior. A non-None value is folded into the steady
+        shape signature, so any change in the model-specific regime (e.g.
+        draft length, spec/non-spec mix) forces a full rebuild.
+        """
+        return None
+
 
 class ModelState(ABC):
     def __init__(
