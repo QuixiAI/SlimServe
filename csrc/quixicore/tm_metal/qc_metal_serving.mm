@@ -1254,13 +1254,18 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
 
   bool any_attn = false;
   int attn_mult = 0;
+  int64_t n_attn_layers = 0;
   for (int l = 0; l < cap; ++l) {
     if (g.layers[l].is_gdn) continue;
     any_attn = true;
+    ++n_attn_layers;
     if (attn_mult == 0) attn_mult = g.layers[l].block_mult;
     TORCH_CHECK(g.layers[l].block_mult == attn_mult,
                 "all attention layers must share one block layout");
   }
+  TORCH_CHECK(static_cast<int64_t>(attn_group.size()) >= n_attn_layers,
+              "attn_group must carry one KV-group index per attention layer "
+              "within cap");
 
   encode("muse_q38_step", [&](TorchEncoder& e) {
     // Residual ping-pong: each fused add-norm reads *rcur and writes the
@@ -4716,9 +4721,14 @@ gdn_fused_prepare(const at::Tensor& qkvz, const at::Tensor& ba,
                     accepted.is_contiguous() && accepted.numel() >= R,
                 "num_accepted must be contiguous i32 [R]");
     // The speculative window (shifted old history + every new token) must
-    // fit in the state row for the longest request.
-    TORCH_CHECK(state_cols >= kernel_size - 1,
-                "spec conv needs kernel-1+num_spec state columns");
+    // fit in the state row for the longest request: the kernel writes
+    // kernel-1 + run-1 columns per channel. Both spec callers (muse cap and
+    // _forward_core_mps_spec) build uniform runs, so tokens/R bounds the
+    // longest run without a device read of cu_seqlens.
+    const int64_t max_run = (static_cast<int64_t>(tokens) + R - 1) / R;
+    TORCH_CHECK(state_cols >= kernel_size - 1 + max_run - 1,
+                "spec conv needs kernel-1+num_spec state columns (rows have ",
+                state_cols, ", longest run ", max_run, ")");
   } else {
     // The kernel only dereferences num_accepted in spec mode; bind a
     // persistent 1-element dummy so the pipeline's buffer table is complete.

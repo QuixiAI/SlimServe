@@ -68,18 +68,21 @@ def causal_conv1d_update_native(
         return x
     idx = conv_state_indices[valid].long()
 
-    state = conv_state[idx].float()  # [n, dim, state_len]
-    xt = x[valid].to(conv_state.dtype).float()  # [n, dim]
-    window = torch.cat([state, xt.unsqueeze(-1)], dim=-1)  # [n, dim, state_len+1]
-
+    # With speculation configured the pool carries width-1+num_spec columns
+    # per channel; the non-spec ring is the FRONT width-1 columns (the tail
+    # is spec-verify scratch), so read and write only that ring.
     width = weight.size(1)
+    state = conv_state[idx, :, : width - 1].float()  # [n, dim, width-1]
+    xt = x[valid].to(conv_state.dtype).float()  # [n, dim]
+    window = torch.cat([state, xt.unsqueeze(-1)], dim=-1)  # [n, dim, width]
+
     out = torch.einsum("ndw,dw->nd", window[..., -width:], weight.float())
     if bias is not None:
         out = out + bias.float()
     if activation in ("silu", "swish"):
         out = F.silu(out)
 
-    conv_state[idx] = window[..., 1:].to(conv_state.dtype)
+    conv_state[idx, :, : width - 1] = window[..., 1:].to(conv_state.dtype)
     result = x.clone()
     result[valid] = out.to(x.dtype)
     return result
@@ -119,7 +122,8 @@ def causal_conv1d_fn_native(
             continue
         xi = x[:, s:e].to(conv_states.dtype).float()  # [dim, T]
         if bool(has_initial_state[i]) and cache_idx > 0:
-            prev = conv_states[cache_idx].float()  # [dim, state_len]
+            # Front width-1 columns only: spec-configured pools are wider.
+            prev = conv_states[cache_idx, :, :state_len].float()  # [dim, state_len]
         else:
             prev = torch.zeros(dim, state_len, dtype=torch.float32, device=x.device)
         full = torch.cat([prev, xi], dim=-1)  # [dim, state_len + T]
@@ -128,7 +132,9 @@ def causal_conv1d_fn_native(
             yi = F.silu(yi)
         out[:, s:e] = yi.to(x.dtype)
         if cache_idx > 0:
-            conv_states[cache_idx] = full[:, -state_len:].to(conv_states.dtype)
+            conv_states[cache_idx, :, :state_len] = full[:, -state_len:].to(
+                conv_states.dtype
+            )
     return out
 
 

@@ -239,7 +239,14 @@ def native_turboquant_decode_attention(
 
     B, Hq, D = query.shape
     if current_platform.is_metal():
-        if _TQ_SPLITK_ENABLED and D == 256 and sliding_window <= 0:
+        if (
+            _TQ_SPLITK_ENABLED
+            and D == 256
+            and sliding_window <= 0
+            # availability gates only the monolithic op; an .so without the
+            # split-K entry must fall back to it rather than AttributeError
+            and quixicore_ops.has("turboquant_attention_splitk_metal")
+        ):
             metal_centroids = metal_scaled_centroids(centroids, D)
             metal_signs = metal_ones(D, query.device)
             metal_sinks = (

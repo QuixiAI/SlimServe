@@ -363,12 +363,18 @@ def test_registry_contains_only_the_supported_model_artifacts():
         for entry in quant["files"]
     } == {
         "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
-        "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
-        "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
-        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+        (
+            "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
+            "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+        ),
     }
 
     assert [entry["path"] for entry in muse["shared"]] == [
@@ -446,6 +452,19 @@ def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
     assert metal.speculator["repo"] == "z-lab/Qwen3.8-27B-DFlash2"
     mi300x = resolve("qwen38-nvfp4-1", "mi300x", 1, None)
     assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
+
+
+def test_tq_profile_pins_both_drafter_turboquant_fields():
+    """The -tq drafter must pin attention_backend AND kv_cache_dtype
+    together: unset, the drafter inherits the engine-global turboquant_k8v4
+    dtype but keeps metal_attn, whose 5-dim cache shape cannot view the
+    TQ-sized page (boot reshape failure documented in the profile notes)."""
+    from slimserve.engine import _speculative_config
+
+    plan = resolve("qwen38-nvfp4-1-tq", "metal", 1, "NVFP4", 128 * GB)
+    cfg = _speculative_config(plan)
+    assert cfg["attention_backend"] == "TURBOQUANT"
+    assert cfg["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():

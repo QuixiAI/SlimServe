@@ -70,8 +70,21 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
             "at roughly half the speed."
         )
         return None
+    # Older flashinfer releases predate the deterministic kwarg _topk
+    # passes; treat them as unavailable rather than TypeError at serve time.
+    import inspect
+
     from flashinfer import top_k
 
+    try:
+        if "deterministic" not in inspect.signature(top_k).parameters:
+            logger.info_once(
+                "flashinfer top_k lacks the deterministic kwarg; the DFlash2 "
+                "selector uses torch.topk."
+            )
+            return None
+    except (TypeError, ValueError):
+        return None
     return top_k
 
 
