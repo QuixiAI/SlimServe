@@ -10142,3 +10142,40 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   path is at ~41 ms/token effective. Both fronts together plausibly
   close it; neither alone does.
 - Raw: ~/.local/scratch/qwen38-rebaseline/spec_profile_head.log.
+
+## 2026-08-25 - Qwen3.8 Decode Drain-Peeling: Two Sync Removals (+5%), Chain Mapped
+
+- Method: cProfile with print_callers over the seeded offline spec bench;
+  fix the top drain, re-bench (seed-stable outputs required byte-
+  identical each round), re-profile. Three rounds converged the step's
+  hidden syncs into one architecturally-honest wait.
+- Fix 1 (mamba_hybrid.postprocess_state): boolean-mask indexing
+  (idx_mapping[valid]) lowers to nonzero() on MPS and drained the whole
+  device queue — measured 42 ms/step of self-time, half the decode wall.
+  Replaced with the sentinel-redirect scatter (post_update pattern):
+  int-index gather + where + scatter, sync-free. essay 23.0-24.7 ->
+  24.6-25.0.
+- Fix 2 (metal_attn build): seq_lens_cpu was m.seq_lens.to("cpu") per
+  build (~24 builds/step; the FIRST absorbed the previous GPU step,
+  ~40 ms). With serial scheduling the scheduler has already consumed the
+  prior step's acceptance, so seq_lens_cpu_upper_bound (committed +
+  scheduled) is EXACT; build now uses it and keeps the synced copy only
+  under async scheduling, where the bound can overshoot and would attend
+  stale KV. essay -> 25.5-25.9, gsm8k -> 40.7-41.0.
+- Endpoint of the chain: the remaining per-step wait is ONE
+  copy_event.synchronize (39 ms/step) in output consumption — the serial
+  engine loop cannot schedule step N+1 before N's sampled tokens reach
+  the host. Tried async_scheduling=True in the offline bench: within
+  noise (essay 25.5-27.2), the offline path does not meaningfully
+  overlap. Remaining structure per ~76 ms step: ~37 ms serial CPU
+  (execute_model encode 28 — of which gdn_attn.build x10/step ~10 ms
+  and a 49/step torch.arange storm — plus drafter 3) + ~39 ms GPU tail.
+- Next levers, in order: (1) CPU-encode shrink — dedupe the x10
+  per-group gdn_attn.build (shared per-step products), kill the arange
+  storm, batch the 929/step tiny .to()s; (2) GPU kernel fronts (MLP
+  IQ formats, GDN core) as previously surveyed; (3) server-path overlap
+  measurement (the server's async output thread may already hide part
+  of the 39 ms wait that the offline loop exposes).
+- Cumulative: essay 24.4 -> 25.7 (+5%), gsm8k 39.4 -> 41.0 (+4%),
+  outputs byte-identical throughout. 42 kernel/worker tests pass.
+- Raw: ~/.local/scratch/qwen38-rebaseline/ (cprofile*.log, bench logs).

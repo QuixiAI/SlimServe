@@ -122,6 +122,18 @@ class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetad
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = vllm_config.cache_config.block_size
+        # With serial (non-async) scheduling the scheduler has consumed the
+        # previous step's acceptance before scheduling this one, so the
+        # CPU-side seq_lens_cpu_upper_bound (committed + scheduled) is
+        # EXACT and the device seq_lens need never be pulled to the host.
+        # That pull was the step's hidden pipeline drain: it waited out the
+        # whole previous GPU step (~40 ms) inside build(). Under async
+        # scheduling the upper bound can overshoot (it assumes full draft
+        # acceptance), and an overshot length would attend stale KV rows,
+        # so the synced copy stays for that mode.
+        self._exact_cpu_seq_lens = not bool(
+            vllm_config.scheduler_config.async_scheduling
+        )
 
     def build(
         self,
@@ -131,12 +143,18 @@ class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetad
     ) -> MetalAttentionMetadata:
         m = common_attn_metadata
         causal = m.causal if isinstance(m.causal, bool) else True
+        if self._exact_cpu_seq_lens and m.seq_lens_cpu_upper_bound is not None:
+            seq_lens_cpu = m.seq_lens_cpu_upper_bound[: m.num_reqs].to(
+                dtype=torch.int32
+            )
+        else:
+            seq_lens_cpu = m.seq_lens.to("cpu", dtype=torch.int32)
         return MetalAttentionMetadata(
             num_actual_tokens=m.num_actual_tokens,
             num_reqs=m.num_reqs,
             max_query_len=m.max_query_len,
             query_start_loc_cpu=m.query_start_loc_cpu.to(dtype=torch.int32),
-            seq_lens_cpu=m.seq_lens.to("cpu", dtype=torch.int32),
+            seq_lens_cpu=seq_lens_cpu,
             block_table=m.block_table_tensor.to(torch.int32),
             seq_lens_gpu=m.seq_lens.to(torch.int32),
             slot_mapping=m.slot_mapping,
