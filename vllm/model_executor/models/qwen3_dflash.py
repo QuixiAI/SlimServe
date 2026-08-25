@@ -56,10 +56,13 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
-    """``dflash_config.causal`` overrides all layers; else only SWA layers causal."""
+    """Resolve explicit causality before falling back to legacy layer defaults."""
+    is_causal = getattr(config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
     override = (getattr(config, "dflash_config", None) or {}).get("causal")
     if override is not None:
-        return override
+        return bool(override)
     layer_types = getattr(config, "layer_types", None)
     return bool(layer_types) and layer_types[layer_idx] == _SLIDING_ATTENTION
 
@@ -350,6 +353,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={"midlayer.": "layers.0."},
         orig_to_new_stacked={
@@ -406,7 +411,7 @@ class DFlashQwen3Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     config=self.config,
                     layer_idx=layer_idx,
@@ -492,6 +497,7 @@ class DFlashQwen3Model(nn.Module):
         self._build_context_kv_buffers(layers_attn, has_bias)
 
         # RoPE parameters
+        self._rope_module = attn0.rotary_emb
         self._rope_head_size = attn0.rotary_emb.head_size
         self._rope_cos_sin_cache = attn0.rotary_emb.cos_sin_cache
         self._rope_is_neox = attn0.rotary_emb.is_neox_style
@@ -520,6 +526,20 @@ class DFlashQwen3Model(nn.Module):
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
 
+    @staticmethod
+    def _rms_norm_mps(
+        x: torch.Tensor, weight: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        """ir.ops.rms_norm reference numerics for the Metal stack, where the
+        CUDA custom op does not exist. Norms over the last dim; the weight
+        broadcasts, which is what selects the per-layer K-norm row for the
+        grouped [L, N, nkv, hd] case (weight viewed [L, 1, 1, hd])."""
+        orig_dtype = x.dtype
+        xf = x.to(torch.float32)
+        variance = xf.pow(2).mean(dim=-1, keepdim=True)
+        xf = xf * torch.rsqrt(variance + eps)
+        return (xf.to(weight.dtype) * weight).to(orig_dtype)
+
     def _project_context_kv(
         self,
         context_states: torch.Tensor,
@@ -528,13 +548,18 @@ class DFlashQwen3Model(nn.Module):
         num_kv_heads: int,
         head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        normed_context_states = torch.empty_like(context_states)
-        ops.rms_norm(
-            normed_context_states,
-            context_states,
-            self._hidden_norm_weight,
-            self._rms_norm_eps,
-        )
+        if context_states.device.type == "mps":
+            normed_context_states = self._rms_norm_mps(
+                context_states, self._hidden_norm_weight, self._rms_norm_eps
+            )
+        else:
+            normed_context_states = torch.empty_like(context_states)
+            ops.rms_norm(
+                normed_context_states,
+                context_states,
+                self._hidden_norm_weight,
+                self._rms_norm_eps,
+            )
         if self._context_qkv_projections is None:
             assert self._fused_kv_weight is not None
             all_kv_flat = F.linear(
@@ -563,6 +588,13 @@ class DFlashQwen3Model(nn.Module):
     def _normalize_context_k(self, all_k: torch.Tensor) -> torch.Tensor:
         # --- Grouped RMSNorm K across all layers ([L, num_ctx, nkv, hd]) ---
         # The weight is selected per layer by the outermost (layer) index.
+        if all_k.device.type == "mps":
+            num_layers = self._k_norm_weights.shape[0]
+            return self._rms_norm_mps(
+                all_k,
+                self._k_norm_weights.view(num_layers, 1, 1, -1),
+                self._rms_norm_eps,
+            )
         all_k_normed = torch.empty_like(all_k)
         ops.rms_norm(
             all_k_normed,
@@ -611,17 +643,25 @@ class DFlashQwen3Model(nn.Module):
         # In-place RoPE: pass K as the "query" arg with key=None.
         all_k_flat = all_k_normed.view(L * num_ctx, kv)
         positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-        ops.rotary_embedding(
-            positions_repeated,
-            all_k_flat,
-            None,
-            self._rope_head_size,
-            cos_sin_cache,
-            self._rope_is_neox,
-        )
+        if all_k_flat.device.type == "mps":
+            # The fused in-place CUDA RoPE op does not exist on the Metal
+            # stack; the module's torch-native path (same math) returns the
+            # rotated tensor instead.
+            all_k_flat, _ = self._rope_module.forward_native(
+                positions_repeated, all_k_flat
+            )
+        else:
+            cos_sin_cache = self._rope_cos_sin_cache
+            if cos_sin_cache.dtype != all_k_flat.dtype:
+                cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
+            ops.rotary_embedding(
+                positions_repeated,
+                all_k_flat,
+                None,
+                self._rope_head_size,
+                cos_sin_cache,
+                self._rope_is_neox,
+            )
 
         if context_slot_mapping is None:
             return
@@ -691,6 +731,8 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.draft_model_config = vllm_config.speculative_config.draft_model_config
@@ -700,7 +742,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             start_layer_id=target_layer_num,
