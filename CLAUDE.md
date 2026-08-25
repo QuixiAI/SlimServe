@@ -32,7 +32,23 @@ behavior:
 
 ## SlimServe Orientation
 
-- SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth for supported models, quants, engine args, environment, and platform overrides.
+- SlimServe is profile-driven. `slimserve/profiles.json` is the source of truth
+  for supported models, quants, engine args, and environment.
+- A profile is **model x quant x platform x config**. Platform is part of a
+  profile's identity, not a list it ranges over: a config tuned for MI300X is
+  not the same profile as one tuned for A100, even for the same model and
+  quant. MI300X and Metal each need their own.
+- The id a user types carries no platform (`slimserve dsv4-q4ktail-2`) because
+  the CLI already detects the machine. Each id therefore stores one record per
+  platform under `variants`, and every record states its own `platform`.
+  `registry.describe(id)` gives the shared fields plus the platform list;
+  `registry.variant(id, platform)` gives one platform's config.
+- Never widen a profile to a platform it was not tuned and validated on, and
+  never reach for a `platform_overrides`-style escape hatch to make one record
+  serve two platforms -- that mechanism existed, it let an A100 config stand in
+  for MI300X, and it has been retired. Add the platform's own record instead.
+  Two tests enforce this: `test_a_profile_is_one_config_per_platform` and
+  `test_no_profile_carries_another_platforms_environment`.
 - Missing model files are not a blocker. Run `slimserve <profile> ... -y`; `slimserve.fetch` downloads or resumes required files into `$SLIMSERVE_CACHE` or `~/models`.
 - Do not hand-build unsupported serving commands when a profile exists. Use `slimserve <profile> --dry-run` to inspect and `slimserve <profile> --serve` to run.
 

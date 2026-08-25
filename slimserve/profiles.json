@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K, q2kxl=UD-Q2_K_XL, nvfp4=NVFP4.",
+  "comment": "A profile is model x quant x platform x config. The id a user types carries no platform -- the CLI detects it -- so each id holds one record per platform under `variants`, and every record states its own platform. Ids follow <model>-<quant>-<gpus>. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K, q2kxl=UD-Q2_K_XL, nvfp4=NVFP4.",
   "sources": {
     "glm52-vision": {
       "title": "GLM-5.2-Vision",
@@ -587,85 +587,104 @@
       "title": "GLM-5.2-Vision on 2 GPUs",
       "source": "glm52-vision",
       "gpus": 2,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "Q2_K",
       "summary": "The tuned configuration. Leaves six GPUs free for other work.",
-      "engine": {
-        "tensor_parallel_size": 2,
-        "max_model_len": 524288,
-        "max_num_seqs": 32,
-        "max_num_batched_tokens": 16384,
-        "kv_cache_memory_bytes": 50465865728,
-        "block_size": 64,
-        "enable_prefix_caching": true,
-        "enable_chunked_prefill": true,
-        "limit_mm_per_prompt": {
-          "vision_chunk": 1
-        },
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "glm45",
-        "tool_call_parser": "glm47",
-        "served_model_name": "GLM-5.2-Vision"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "Q2_K",
+          "engine": {
+            "tensor_parallel_size": 2,
+            "max_model_len": 524288,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 16384,
+            "kv_cache_memory_bytes": 50465865728,
+            "block_size": 64,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          }
+        }
       }
     },
     "glm52-q2k-4": {
       "title": "GLM-5.2-Vision on 4 GPUs",
       "source": "glm52-vision",
       "gpus": 4,
-      "platforms": [
-        "mi300x",
-        "a100"
-      ],
-      "default_quant": "Q2_K",
       "summary": "Weights shard far enough to reach the full 1M-token ceiling with room for a much larger KV pool.",
-      "engine": {
-        "tensor_parallel_size": 4,
-        "max_model_len": 1048576,
-        "max_num_seqs": 32,
-        "max_num_batched_tokens": 16384,
-        "kv_cache_memory_bytes": 96636764160,
-        "block_size": 64,
-        "enable_prefix_caching": true,
-        "enable_chunked_prefill": true,
-        "limit_mm_per_prompt": {
-          "vision_chunk": 1
-        },
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "glm45",
-        "tool_call_parser": "glm47",
-        "served_model_name": "GLM-5.2-Vision"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
-        "a100": {
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "Q2_K",
           "engine": {
+            "tensor_parallel_size": 4,
+            "max_model_len": 1048576,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 16384,
+            "kv_cache_memory_bytes": 96636764160,
+            "block_size": 64,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          }
+        },
+        "a100": {
+          "platform": "a100",
+          "default_quant": "Q2_K",
+          "engine": {
+            "tensor_parallel_size": 4,
             "max_model_len": 4096,
             "max_num_seqs": 64,
-            "kv_cache_memory_bytes": null,
+            "max_num_batched_tokens": 16384,
+            "block_size": 64,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision",
             "gpu_memory_utilization": 0.92
           },
-          "env": {},
           "note": "80 GB cards: the MI300X KV byte table does not apply, so size the pool by utilization. Q2_K weights leave roughly 58 GB across four cards, which is why the ceiling is 4096 rather than 1M."
         }
       }
@@ -674,48 +693,65 @@
       "title": "GLM-5.2-Vision on 8 GPUs",
       "source": "glm52-vision",
       "gpus": 8,
-      "platforms": [
-        "mi300x",
-        "a100"
-      ],
-      "default_quant": "Q2_K",
       "summary": "Highest aggregate throughput, and the only profile with room for Q4_K plus a large KV pool.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "max_model_len": 1048576,
-        "max_num_seqs": 32,
-        "max_num_batched_tokens": 16384,
-        "kv_cache_memory_bytes": 128849018880,
-        "block_size": 64,
-        "enable_prefix_caching": true,
-        "enable_chunked_prefill": true,
-        "limit_mm_per_prompt": {
-          "vision_chunk": 1
-        },
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "glm45",
-        "tool_call_parser": "glm47",
-        "served_model_name": "GLM-5.2-Vision"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
-        "a100": {
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "Q2_K",
           "engine": {
+            "tensor_parallel_size": 8,
+            "max_model_len": 1048576,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 16384,
+            "kv_cache_memory_bytes": 128849018880,
+            "block_size": 64,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          }
+        },
+        "a100": {
+          "platform": "a100",
+          "default_quant": "Q2_K",
+          "engine": {
+            "tensor_parallel_size": 8,
             "max_model_len": 4096,
             "max_num_seqs": 64,
-            "kv_cache_memory_bytes": null,
+            "max_num_batched_tokens": 16384,
+            "block_size": 64,
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision",
             "gpu_memory_utilization": 0.92
-          },
-          "env": {}
+          }
         }
       }
     },
@@ -723,180 +759,189 @@
       "title": "GLM-5.2-Vision on one Mac",
       "source": "glm52-vision",
       "gpus": 1,
-      "platforms": [
-        "metal"
-      ],
+      "summary": "Single Apple Silicon machine, sized by unified memory rather than card count. Needs 256 GB for IQ2_XXS and 512 GB for Q2_K or Q4_K.",
+      "speculative": true,
       "status": "in-progress",
       "status_reason": "GLM-shaped sparse MLA has not been validated on Metal",
       "status_detail": "DeepSeek-V4 now has a measured Metal path, but the separate GLM-shaped sparse-MLA and vision path remains unvalidated. The CLI keeps this profile gated until that model is exercised end to end.",
-      "default_quant": "IQ2_XXS",
-      "summary": "Single Apple Silicon machine, sized by unified memory rather than card count. Needs 256 GB for IQ2_XXS and 512 GB for Q2_K or Q4_K.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "max_model_len": 32768,
-        "max_num_seqs": 4,
-        "max_num_batched_tokens": 2048,
-        "gpu_memory_utilization": 0.85,
-        "block_size": 64,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "enable_prefix_caching": true,
-        "enable_chunked_prefill": true,
-        "limit_mm_per_prompt": {
-          "vision_chunk": 1
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "glm45",
-        "tool_call_parser": "glm47",
-        "served_model_name": "GLM-5.2-Vision"
-      },
-      "speculative": true,
-      "env": {},
-      "notes": [
-        "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
-        "Metal has no CUDA-graph equivalent, so graph capture is disabled through compilation_config.",
-        "max_num_seqs is deliberately small. Batched serving is the weakest part of every Metal engine surveyed -- ds4 still runs attention and routed experts per session -- so concurrency here is a guess, not a tested ceiling.",
-        "DSpark is enabled, with TurboQuant attention and a turboquant_k8v4 draft KV cache.",
-        "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold."
-      ]
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "IQ2_XXS",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 32768,
+            "max_num_seqs": 4,
+            "max_num_batched_tokens": 2048,
+            "gpu_memory_utilization": 0.85,
+            "block_size": 64,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "limit_mm_per_prompt": {
+              "vision_chunk": 1
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "glm45",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.2-Vision"
+          },
+          "notes": [
+            "Not yet runnable: this model serves through sparse MLA, and the Metal sparse-MLA kernels do not exist yet. These engine settings are starting points chosen to fit the memory budget, not measured configurations -- unlike every other profile in this file.",
+            "Metal has no CUDA-graph equivalent, so graph capture is disabled through compilation_config.",
+            "max_num_seqs is deliberately small. Batched serving is the weakest part of every Metal engine surveyed -- ds4 still runs attention and routed experts per session -- so concurrency here is a guess, not a tested ceiling.",
+            "DSpark is enabled, with TurboQuant attention and a turboquant_k8v4 draft KV cache.",
+            "Q2_K and Q4_K need a 512 GB Mac Studio. IQ2_XXS is the only quant a 256 GB machine can hold."
+          ]
+        }
+      }
     },
     "k3-xxs-6": {
       "title": "Kimi K3 on 6 GPUs",
       "source": "kimi-k3",
       "gpus": 6,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "IQ2_XXS-Q2_K",
       "summary": "Tensor parallel across six cards; TP4 does not fit. Two GPUs stay free, and this remains the measured low-concurrency reference while k3-xxs-8 has the highest measured throughput at concurrency 8.",
-      "engine": {
-        "tensor_parallel_size": 6,
-        "max_model_len": 8192,
-        "max_num_seqs": 64,
-        "max_num_batched_tokens": 4096,
-        "gpu_memory_utilization": 0.95,
-        "block_size": 64,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "mm_encoder_tp_mode": "data",
-        "kv_cache_dtype": "auto",
-        "reasoning_parser": "kimi_k3",
-        "tool_call_parser": "kimi_k3",
-        "served_model_name": "Kimi-K3"
-      },
       "speculative": true,
-      "speculative_overrides": {
-        "replicate_draft_backbone": true
-      },
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1",
-        "HSA_XNACK": "1"
-      },
-      "notes": [
-        "The Kimi verifier keeps its native hybrid cache at auto. The replicated DSpark backbone uses a separate TurboQuant compressed cache on every rank.",
-        "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
-        "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
-        "HSA_XNACK=1 is required for this load.",
-        "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
-      ]
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "IQ2_XXS-Q2_K",
+          "engine": {
+            "tensor_parallel_size": 6,
+            "max_model_len": 8192,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 4096,
+            "gpu_memory_utilization": 0.95,
+            "block_size": 64,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "mm_encoder_tp_mode": "data",
+            "kv_cache_dtype": "auto",
+            "reasoning_parser": "kimi_k3",
+            "tool_call_parser": "kimi_k3",
+            "served_model_name": "Kimi-K3"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1",
+            "HSA_XNACK": "1"
+          },
+          "notes": [
+            "The Kimi verifier keeps its native hybrid cache at auto. The replicated DSpark backbone uses a separate TurboQuant compressed cache on every rank.",
+            "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
+            "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
+            "HSA_XNACK=1 is required for this load.",
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+          ],
+          "speculative_overrides": {
+            "replicate_draft_backbone": true
+          }
+        }
+      }
     },
     "k3-xxs-8": {
       "title": "Kimi K3 on 8 GPUs",
       "source": "kimi-k3",
       "gpus": 8,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "IQ2_XXS-Q2_K",
       "summary": "All eight cards on every request: attention tensor-parallel at 12 heads per rank, experts held whole and split 112-per-rank. Expert parallelism is required -- tensor-sharding the experts slices GGUF quant blocks at TP8.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "enable_expert_parallel": true,
-        "enable_ep_weight_filter": true,
-        "all2all_backend": "allgather_reducescatter",
-        "max_model_len": 8192,
-        "max_num_seqs": 64,
-        "max_num_batched_tokens": 4096,
-        "gpu_memory_utilization": 0.95,
-        "block_size": 64,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "mm_encoder_tp_mode": "data",
-        "kv_cache_dtype": "auto",
-        "reasoning_parser": "kimi_k3",
-        "tool_call_parser": "kimi_k3",
-        "served_model_name": "Kimi-K3"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1",
-        "HSA_XNACK": "1"
-      },
-      "notes": [
-        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
-        "HSA_XNACK=1 is required for this load.",
-        "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
-        "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
-      ]
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "IQ2_XXS-Q2_K",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "enable_expert_parallel": true,
+            "enable_ep_weight_filter": true,
+            "all2all_backend": "allgather_reducescatter",
+            "max_model_len": 8192,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 4096,
+            "gpu_memory_utilization": 0.95,
+            "block_size": 64,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "mm_encoder_tp_mode": "data",
+            "kv_cache_dtype": "auto",
+            "reasoning_parser": "kimi_k3",
+            "tool_call_parser": "kimi_k3",
+            "served_model_name": "Kimi-K3"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1",
+            "HSA_XNACK": "1"
+          },
+          "notes": [
+            "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
+            "HSA_XNACK=1 is required for this load.",
+            "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+          ]
+        }
+      }
     },
     "dsv4-xxs-1": {
       "title": "DeepSeek-V4-Flash IQ2_XXS on 1 GPU / Apple Silicon",
       "source": "dsv4-flash",
       "gpus": 1,
-      "platforms": [
-        "mi300x",
-        "metal"
-      ],
-      "default_quant": "IQ2_XXS",
       "summary": "Text only. The smallest 0731 target and its matching DSpark drafter run on one MI300X or a 128 GiB Apple Silicon machine.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "block_size": 256,
-        "max_num_seqs": 64,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-      ],
-      "platform_overrides": {
-        "metal": {
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "IQ2_XXS",
           "engine": {
+            "tensor_parallel_size": 1,
+            "block_size": 256,
+            "max_num_seqs": 64,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+          ]
+        },
+        "metal": {
+          "platform": "metal",
+          "default_quant": "IQ2_XXS",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "block_size": 256,
+            "max_num_seqs": 32,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
             "dtype": "float16",
             "max_model_len": 262144,
-            "max_num_seqs": 32,
             "max_num_batched_tokens": 2176,
-            "gpu_memory_utilization": null,
             "kv_cache_memory_bytes": 17179869184,
             "kv_cache_dtype": "fp8_ds_mla",
-            "attention_config": null,
             "tokenizer_mode": "deepseek_v4",
             "disable_custom_all_reduce": true,
             "enable_prefix_caching": true,
             "enable_chunked_prefill": true
           },
-          "speculative_overrides": {
-            "disable_draft_cudagraphs": true
-          },
-          "env": {},
           "notes": [
             "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
@@ -905,7 +950,10 @@
             "max_model_len is 262144 for real (agentic) use. The 1k-in/2k-out benchmark matrix in perf/baseline_status.md is re-gated under this sizing (see the M1 Ultra campaign entries).",
             "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk).",
             "Long-context status (2026-08-23): the sparse-MLA indexer chain (fused indexer Q rope/quant, prefill top-k, scoring) has a native Metal implementation. Async output copies and their completion event stay on the producing MPS stream (unit-tested), which is believed to remove the cold cross-stream event ordering failure; the deterministic cold-boot wedge repro (primer then a direct multi-chunk prefill) has not been re-run, so the boot-ramp protocol in perf/prefill_handoff.md remains the ops guidance until it is. Prefill top-k sizes native work from the active request window and streams windows above 1,024 candidates with fixed scratch; the 65,536-candidate native oracle matches the eager chain on tie ordering and the streaming loop (its all-zero-query block does not exercise scoring). Full 262,144-token end-to-end serving still needs a dedicated long-context validation pass."
-          ]
+          ],
+          "speculative_overrides": {
+            "disable_draft_cudagraphs": true
+          }
         }
       }
     },
@@ -913,46 +961,70 @@
       "title": "DeepSeek-V4-Flash Q4K-tail on 2 GPUs",
       "source": "dsv4-flash",
       "gpus": 2,
-      "platforms": [
-        "mi300x",
-        "a100"
-      ],
-      "default_quant": "Q4K-tail",
       "summary": "Text only. Serves the Q4K-tail hybrid (Q4_K experts on the last six layers, IQ2_XXS/Q2_K elsewhere) as the quality choice for datacenter GPUs; IQ2_XXS remains selectable for the smallest footprint.",
-      "engine": {
-        "tensor_parallel_size": 2,
-        "kv_cache_dtype": "fp8",
-        "block_size": 256,
-        "enable_prefix_caching": true,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
-        "a100": {
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "Q4K-tail",
           "engine": {
-            "kv_cache_memory_bytes": 13958643712,
+            "tensor_parallel_size": 2,
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "max_num_seqs": 64
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+          ]
+        },
+        "a100": {
+          "platform": "a100",
+          "default_quant": "Q4K-tail",
+          "engine": {
+            "tensor_parallel_size": 2,
+            "kv_cache_dtype": "fp8",
+            "block_size": 256,
+            "enable_prefix_caching": true,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
             "compilation_config": {
               "cudagraph_mode": "PIECEWISE",
               "max_cudagraph_capture_size": 32
-            }
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "kv_cache_memory_bytes": 13958643712
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+          ],
           "quant_overrides": {
             "IQ2_XXS": {
               "engine": {
@@ -961,72 +1033,35 @@
             }
           },
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. KV byte budgets are per quant: 19 GiB for IQ2_XXS (qualified 2026-08-09 with ~1 GiB allocator headroom after graph capture and long-prefill workspace growth) and a provisional 14 GiB for the ~5 GiB/GPU heavier Q4K-tail default, pending the same qualification."
-        },
-        "mi300x": {
-          "engine": {
-            "max_num_seqs": 64,
-            "compilation_config": {
-              "cudagraph_mode": "NONE"
-            },
-            "kv_cache_dtype": null,
-            "enable_prefix_caching": null
-          },
-          "env": {
-            "VLLM_ROCM_USE_AITER": "1"
-          },
-          "notes": [
-            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-          ]
         }
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
-      ]
+      }
     },
     "dsv4-q4ktail-4": {
       "title": "DeepSeek-V4-Flash Q4K-tail on 4 GPUs",
       "source": "dsv4-flash",
       "gpus": 4,
-      "platforms": [
-        "a100"
-      ],
-      "default_quant": "Q4K-tail",
       "summary": "Text only. Serves the Q4K-tail hybrid at TP4 (beats TP2 x DP2 in every measured regime); use dsv4-mxfp4-4 for the MXFP4 expert build.",
-      "engine": {
-        "tensor_parallel_size": 4,
-        "kv_cache_dtype": "fp8",
-        "block_size": 256,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 64
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
+      "variants": {
         "a100": {
+          "platform": "a100",
+          "default_quant": "Q4K-tail",
           "engine": {
-            "gpu_memory_utilization": 0.78,
+            "tensor_parallel_size": 4,
+            "kv_cache_dtype": "fp8",
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
               "max_cudagraph_capture_size": 64
-            }
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "gpu_memory_utilization": 0.78
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1034,54 +1069,45 @@
             "VLLM_DSV4_AUX_STREAMS": "0",
             "VLLM_DSV4_W1_QWARP8": "1"
           },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+          ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
-      ]
+      }
     },
     "dsv4-q4ktail-8": {
       "title": "DeepSeek-V4-Flash Q4K-tail on 8 GPUs",
       "source": "dsv4-flash",
       "gpus": 8,
-      "platforms": [
-        "a100"
-      ],
-      "default_quant": "Q4K-tail",
       "summary": "Text only. The throughput tier: Q4K-tail hybrid as TP4 x DP2, the measured box record (~858-926 tok/s hot c8 aggregate, 3.1x dsv4-mxfp4-8). Single-stream latency is a TP4 replica's; use dsv4-mxfp4-8 for the quality/latency tier.",
-      "engine": {
-        "tensor_parallel_size": 4,
-        "data_parallel_size": 2,
-        "kv_cache_dtype": "fp8",
-        "block_size": 256,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 64
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
       "speculative": true,
-      "env": {},
-      "platform_overrides": {
+      "variants": {
         "a100": {
+          "platform": "a100",
+          "default_quant": "Q4K-tail",
           "engine": {
-            "gpu_memory_utilization": 0.78,
+            "tensor_parallel_size": 4,
+            "data_parallel_size": 2,
+            "kv_cache_dtype": "fp8",
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
               "max_cudagraph_capture_size": 64
-            }
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "gpu_memory_utilization": 0.78
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1089,72 +1115,160 @@
             "VLLM_DSV4_AUX_STREAMS": "0",
             "VLLM_DSV4_W1_QWARP8": "1"
           },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+          ],
           "note": "A100 only (the measured platform). Two TP4 replicas keep each engine's verify batches at the graph-covered sweet spot; capture 64 covers the per-replica c8 width. Requires the 2026-08-10 DP-padding router fix."
         }
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
-      ]
+      }
     },
     "dsv4-mxfp4-4": {
       "title": "DeepSeek-V4-Flash MXFP4 on 4 GPUs",
       "source": "dsv4-flash",
       "gpus": 4,
-      "platforms": [
-        "mi300x",
-        "a100"
-      ],
-      "default_quant": "MXFP4",
       "summary": "Text only. The MXFP4 expert build at TP4 (the only 4-GPU layout that fits); the tuned path on ROCm. Use dsv4-q4ktail-4 for the hybrid.",
-      "engine": {
-        "tensor_parallel_size": 4,
-        "kv_cache_dtype": "fp8",
-        "block_size": 256,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 64
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
-        "a100": {
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "MXFP4",
           "engine": {
-            "gpu_memory_utilization": 0.78,
+            "tensor_parallel_size": 4,
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "max_num_seqs": 64
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+          ]
+        },
+        "a100": {
+          "platform": "a100",
+          "default_quant": "MXFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "kv_cache_dtype": "fp8",
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
               "max_cudagraph_capture_size": 64
-            }
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "gpu_memory_utilization": 0.78
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+          ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
-        },
-        "mi300x": {
+        }
+      }
+    },
+    "dsv4-mxfp4-8": {
+      "title": "DeepSeek-V4-Flash MXFP4 on 8 GPUs",
+      "source": "dsv4-flash",
+      "gpus": 8,
+      "summary": "Text only. Eight-GPU MXFP4 serving as TP8 (measured: 167.6 c1 / 275 hot c8 agg; TP4 x DP2 measured worse and unstable for this quant). Graph capture 64 keeps the 48-token c8 verify batches on CUDA graphs.",
+      "speculative": true,
+      "variants": {
+        "a100": {
+          "platform": "a100",
+          "default_quant": "MXFP4",
           "engine": {
+            "tensor_parallel_size": 8,
+            "kv_cache_dtype": "fp8",
+            "block_size": 256,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash",
+            "gpu_memory_utilization": 0.78
+          },
+          "env": {
+            "VLLM_DSV4_ALIGNED_Q8": "1",
+            "VLLM_DSV4_MHC_SCHEDULE": "async",
+            "VLLM_DSV4_AUX_STREAMS": "0"
+          },
+          "notes": [
+            "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
+            "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
+            "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
+            "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+          ],
+          "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
+        }
+      }
+    },
+    "dsv4-q4k-8": {
+      "title": "DeepSeek-V4-Flash Q4_K on 8 GPUs",
+      "source": "dsv4-flash",
+      "gpus": 8,
+      "summary": "Text only. Eight-way tensor parallelism with the highest-quality 0731 Q4_K target by default.",
+      "speculative": true,
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "Q4_K",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "block_size": 256,
             "max_num_seqs": 64,
+            "attention_config": {
+              "sparse_mla_force_mqa": true
+            },
             "compilation_config": {
               "cudagraph_mode": "NONE"
             },
-            "kv_cache_dtype": null
+            "trust_remote_code": true,
+            "reasoning_parser": "deepseek_v4",
+            "tool_call_parser": "deepseek_v4",
+            "served_model_name": "DeepSeek-V4-Flash"
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1166,223 +1280,129 @@
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
           ]
         }
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
-      ]
-    },
-    "dsv4-mxfp4-8": {
-      "title": "DeepSeek-V4-Flash MXFP4 on 8 GPUs",
-      "source": "dsv4-flash",
-      "gpus": 8,
-      "platforms": [
-        "a100"
-      ],
-      "default_quant": "MXFP4",
-      "summary": "Text only. Eight-GPU MXFP4 serving as TP8 (measured: 167.6 c1 / 275 hot c8 agg; TP4 x DP2 measured worse and unstable for this quant). Graph capture 64 keeps the 48-token c8 verify batches on CUDA graphs.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "kv_cache_dtype": "fp8",
-        "block_size": 256,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 64
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "platform_overrides": {
-        "a100": {
-          "engine": {
-            "gpu_memory_utilization": 0.78,
-            "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
-            }
-          },
-          "env": {
-            "VLLM_DSV4_ALIGNED_Q8": "1",
-            "VLLM_DSV4_MHC_SCHEDULE": "async",
-            "VLLM_DSV4_AUX_STREAMS": "0"
-          },
-          "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
-        }
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-        "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-        "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
-      ]
-    },
-    "dsv4-q4k-8": {
-      "title": "DeepSeek-V4-Flash Q4_K on 8 GPUs",
-      "source": "dsv4-flash",
-      "gpus": 8,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "Q4_K",
-      "summary": "Text only. Eight-way tensor parallelism with the highest-quality 0731 Q4_K target by default.",
-      "engine": {
-        "tensor_parallel_size": 8,
-        "block_size": 256,
-        "max_num_seqs": 64,
-        "attention_config": {
-          "sparse_mla_force_mqa": true
-        },
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "trust_remote_code": true,
-        "reasoning_parser": "deepseek_v4",
-        "tool_call_parser": "deepseek_v4",
-        "served_model_name": "DeepSeek-V4-Flash"
-      },
-      "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
-        "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
-        "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-        "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
-      ]
+      }
     },
     "qwen38-nvfp4-1": {
       "title": "Qwen3.8-27B NVFP4 on 1 GPU",
       "source": "qwen38-27b-nvfp4",
       "gpus": 1,
-      "platforms": [
-        "mi300x"
-      ],
-      "default_quant": "NVFP4",
       "summary": "Vision-language 27B hybrid (gated-deltanet linear attention, 1-in-4 full attention) on a single MI300X. 23 GiB of weights leave most of the card for KV and linear-attention state.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "max_model_len": 262144,
-        "max_num_seqs": 64,
-        "gpu_memory_utilization": 0.9,
-        "kv_cache_dtype": "auto",
-        "linear_backend": "auto",
-        "kernel_config": {
-          "linear_backend": "auto"
-        },
-        "compilation_config": {
-          "cudagraph_mode": "FULL_DECODE_ONLY",
-          "max_cudagraph_capture_size": 64
-        },
-        "reasoning_parser": "qwen3",
-        "tool_call_parser": "qwen3_xml",
-        "served_model_name": "Qwen3.8-27B"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_ROCM_USE_AITER": "1"
-      },
-      "notes": [
-        "NVFP4 MLP weights decode through the ROCm emulation NVFP4 linear kernel (gfx942 has no FP4 hardware); the FP8 tensors use the native MI300X FP8 path. A native gfx942 NVFP4 decode kernel is an open optimization, not a blocker.",
-        "linear_backend must be auto, not this fork's aiter default: the aiter filter leaves no NVFP4 kernel at all, and the aiter FP8 scaled-mm kernels refuse this model's untuned GEMM shapes (e.g. the 16384x5120 GDN qkvz projection). Auto keeps aiter where its tuned configs exist and falls back elsewhere; tuning the Qwen3.8 FP8 shapes in aiter is the follow-up optimization. Both the top-level flag and kernel_config.linear_backend must be set: the top-level flag defaults to aiter and overwrites the kernel_config value whenever it is not auto.",
-        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for its GLM target, and the hybrid GDN/full-attention cache has only been validated at auto here.",
-        "FULL_DECODE_ONLY graph capture (size 64) is qualified for this hybrid GDN + MTP path and is a measured 1.4x at c1: unlike Kimi's KDA, the qwen GDN decode captures cleanly on ROCm. Capture 64 covers the c8 spec verify width.",
-        "NVFP4 layers run the vendored QuixiCore HIP kernels (RocmNativeNvFp4LinearKernel): decode-width calls (M<=4, the c1 spec-verify size) read the packed E2M1 weight directly through the q8 dp4a GEMV (measured 1.3-1.8x per layer), wider batches use a load-time-dequantized bf16 copy through hipBLASLt (~22 GiB extra weights memory) until the MFMA packed MMQ exists. VLLM_NVFP4_TRITON_GEMM=0 falls back to the emulation kernel, whose own load-time cache is controlled by VLLM_NVFP4_EMULATION_CACHE_WEIGHTS.",
-        "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
-        "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout."
-      ]
+      "variants": {
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 64,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-27B"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1"
+          },
+          "notes": [
+            "NVFP4 MLP weights decode through the ROCm emulation NVFP4 linear kernel (gfx942 has no FP4 hardware); the FP8 tensors use the native MI300X FP8 path. A native gfx942 NVFP4 decode kernel is an open optimization, not a blocker.",
+            "linear_backend must be auto, not this fork's aiter default: the aiter filter leaves no NVFP4 kernel at all, and the aiter FP8 scaled-mm kernels refuse this model's untuned GEMM shapes (e.g. the 16384x5120 GDN qkvz projection). Auto keeps aiter where its tuned configs exist and falls back elsewhere; tuning the Qwen3.8 FP8 shapes in aiter is the follow-up optimization. Both the top-level flag and kernel_config.linear_backend must be set: the top-level flag defaults to aiter and overwrites the kernel_config value whenever it is not auto.",
+            "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for its GLM target, and the hybrid GDN/full-attention cache has only been validated at auto here.",
+            "FULL_DECODE_ONLY graph capture (size 64) is qualified for this hybrid GDN + MTP path and is a measured 1.4x at c1: unlike Kimi's KDA, the qwen GDN decode captures cleanly on ROCm. Capture 64 covers the c8 spec verify width.",
+            "NVFP4 layers run the vendored QuixiCore HIP kernels (RocmNativeNvFp4LinearKernel): decode-width calls (M<=4, the c1 spec-verify size) read the packed E2M1 weight directly through the q8 dp4a GEMV (measured 1.3-1.8x per layer), wider batches use a load-time-dequantized bf16 copy through hipBLASLt (~22 GiB extra weights memory) until the MFMA packed MMQ exists. VLLM_NVFP4_TRITON_GEMM=0 falls back to the emulation kernel, whose own load-time cache is controlled by VLLM_NVFP4_EMULATION_CACHE_WEIGHTS.",
+            "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
+            "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout."
+          ]
+        }
+      }
     },
     "muse-kdyn-1": {
       "title": "Muse-Glimmer-30B on one Mac",
       "source": "muse-glimmer",
       "gpus": 1,
-      "platforms": [
-        "metal"
-      ],
-      "default_quant": "kquant-dynamic",
       "summary": "Vision-language 28B dense model on a single Apple Silicon machine, sized by unified memory. Full 131072-token context; both published k-quants fit a 64 GB Mac.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "max_model_len": 131072,
-        "max_num_seqs": 16,
-        "max_num_batched_tokens": 2048,
-        "kv_cache_memory_bytes": 12884901888,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "enable_prefix_caching": true,
-        "enable_chunked_prefill": true,
-        "trust_remote_code": true,
-        "served_model_name": "Muse-Glimmer-30B",
-        "reasoning_parser": "muse_glimmer",
-        "tool_call_parser": "muse_glimmer",
-        "kv_cache_dtype": "auto"
-      },
       "speculative": true,
-      "env": {},
-      "notes": [
-        "Interleaved attention: 3 sliding-window (2048) layers per 1 global layer across 52 layers, GQA 32/2, final logit softcapping 20. The hybrid KV manager caps SWA layers at the window, so the 12 GiB pool covers multiple full-context requests on the 13 global layers.",
-        "Vision: 50-block CLIP tower at 896 px, patch 14, 2x2 spatial merge into 6656-dim tokens, loaded from the published mmproj GGUF.",
-        "DFlash speculation is on by default: the drafter proposes one 16-token block per call against target layers [2, 14, 26, 38, 50].",
-        "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
-        "tool_call_parser must be muse_glimmer: tool calls use the model's native ATEM recipient/invoke/parameter envelope, including Responses custom-tool payloads.",
-        "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
-        "Performance note (2026-08-15): DFlash speculation (always on) measures 19.9-20.1 tok/s rested on the 256-token greedy essay bench (fused verify step + tensor-ops kernels on the M5 GPU neural accelerators), ahead of plain fused decode (14.4-16.4); long-context (10k, cached decode) 11.0. Acceptance ~1.73/draft. See perf/baseline_status.md. llama.cpp reference on this box: 26.75 plain / 30.8 spec; vendor ExecuTorch 26.6/50.2."
-      ]
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "kquant-dynamic",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 131072,
+            "max_num_seqs": 16,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 12884901888,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "served_model_name": "Muse-Glimmer-30B",
+            "reasoning_parser": "muse_glimmer",
+            "tool_call_parser": "muse_glimmer",
+            "kv_cache_dtype": "auto"
+          },
+          "notes": [
+            "Interleaved attention: 3 sliding-window (2048) layers per 1 global layer across 52 layers, GQA 32/2, final logit softcapping 20. The hybrid KV manager caps SWA layers at the window, so the 12 GiB pool covers multiple full-context requests on the 13 global layers.",
+            "Vision: 50-block CLIP tower at 896 px, patch 14, 2x2 spatial merge into 6656-dim tokens, loaded from the published mmproj GGUF.",
+            "DFlash speculation is on by default: the drafter proposes one 16-token block per call against target layers [2, 14, 26, 38, 50].",
+            "reasoning_parser must be muse_glimmer: replies use '<|start|>assistant to=self<|message|>...' self-segments, and the fork's glm45 default would classify the whole reply as reasoning, leaving content null.",
+            "tool_call_parser must be muse_glimmer: tool calls use the model's native ATEM recipient/invoke/parameter envelope, including Responses custom-tool payloads.",
+            "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal dense/GQA backend has no fp8 KV path.",
+            "Performance note (2026-08-15): DFlash speculation (always on) measures 19.9-20.1 tok/s rested on the 256-token greedy essay bench (fused verify step + tensor-ops kernels on the M5 GPU neural accelerators), ahead of plain fused decode (14.4-16.4); long-context (10k, cached decode) 11.0. Acceptance ~1.73/draft. See perf/baseline_status.md. llama.cpp reference on this box: 26.75 plain / 30.8 spec; vendor ExecuTorch 26.6/50.2."
+          ]
+        }
+      }
     },
     "qwen38-q2kxl-1": {
       "title": "Qwen3.8-27B on one Mac",
       "source": "qwen38-27b",
       "gpus": 1,
-      "platforms": [
-        "metal"
-      ],
-      "default_quant": "q2kxl",
       "summary": "Vision-language 27B hybrid-attention model on a single Apple Silicon machine, sized by unified memory. Unsloth dynamic Q2_K_XL fits a 48 GB Mac with a 12 GiB KV pool.",
-      "engine": {
-        "tensor_parallel_size": 1,
-        "max_model_len": 131072,
-        "max_num_seqs": 16,
-        "max_num_batched_tokens": 2048,
-        "kv_cache_memory_bytes": 12884901888,
-        "compilation_config": {
-          "cudagraph_mode": "NONE"
-        },
-        "enable_prefix_caching": false,
-        "enable_chunked_prefill": true,
-        "trust_remote_code": true,
-        "served_model_name": "Qwen3.8-27B",
-        "reasoning_parser": "qwen3",
-        "tool_call_parser": "qwen3_xml",
-        "kv_cache_dtype": "auto"
-      },
       "speculative": true,
-      "env": {
-        "VLLM_USE_V2_MODEL_RUNNER": "1"
-      },
-      "notes": [
-        "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
-        "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
-        "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
-        "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
-        "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
-      ]
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "q2kxl",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 131072,
+            "max_num_seqs": 16,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 12884901888,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": false,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "served_model_name": "Qwen3.8-27B",
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "kv_cache_dtype": "auto"
+          },
+          "env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1"
+          },
+          "notes": [
+            "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
+            "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
+            "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
+            "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
+            "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
+          ]
+        }
+      }
     }
   }
 }
