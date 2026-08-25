@@ -10209,3 +10209,32 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   blocks) is latency-bound, not the M scaling. The kernel fix is more
   in-flight blocks per lane / more rows per simdgroup, not accumulator
   work.
+
+## 2026-08-25 - head_dim-256 Paged Attention: Groundwork Staged, Hybrid Stride Mapped
+
+- Goal: move qwen38's 16 attention layers off the per-request SDPA+gather
+  python loop onto the fused paged kernels (the roadmap's item 4).
+- Staged (inert until routed): D=256 instantiations for the
+  paged_attn_v2 partition kernels (fp16/bf16/fp32; VALUES_PER_LANE=8,
+  16 KB threadgroup tiles) and paged_attention_verify fp16-256, plus
+  the verify host gate widened to D in {128, 256}.
+- Blocker found by the first routed bench: the paged family assumes a
+  CONTIGUOUS cache, and qwen38's hybrid pool serves blocks-first
+  STRIDED K/V views (stride(0) = 2x page) — the host op refused with
+  'key_cache must be contiguous'. The python gate is reverted to
+  (64, 128) with the roadmap note so nothing routes there yet.
+- The fix is mapped and precedented (kv_cache_gather_range): thread an
+  explicit 64-bit kv_block_stride through the family and replace
+  cache_base = ((block*block_size + slot)*H + h)*D with
+  block*kv_block_stride + ((slot*H + h)*D at every addressing site.
+  Sites: kv_cache.metal plain paged_attention + paged_attention_gqa_staged
+  (instantiation macros ~1216+), paged_attn_v2.metal partition/verify/
+  fp8-partition (3 loops), launchers launch_paged_attention{,_gqa_staged,
+  _partition,_verify} in tk_launch.h, and the host ops' check_mps ->
+  check_mps_strided + row-contiguity checks. First task of the next
+  kernel session.
+- Session cumulative (four sync removals, groundwork inert): essay
+  24.4 -> 27.7-29.5, gsm8k 39.4 -> 44.5-44.7; outputs byte-identical
+  at every round. llama.cpp essay bar 35.67: remaining gap ~20%, held
+  by the ~40 ms GPU pipeline (attention SDPA loop + MLP GEMVs) and the
+  serial loop's single output wait.
