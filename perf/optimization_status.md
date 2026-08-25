@@ -10976,3 +10976,44 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `alpha-0`, `a_softplus-0`, `beta-0`, `gate-0`, `final_output-0`) to find
   which step first diverges. Their sums are already extracted; our side needs
   hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
+
+## 2026-08-25 - FIX: DFlash drafter wrote K/V in the wrong cache layout
+
+- Status: RESOLVED. DFlash2 speculation now passes the full profile smoke on
+  MI300X (text and image, k=3).
+- Found by finally exercising the registered speculator: every GGUF run
+  earlier in the session used `--no-spec`, because the drafter artifact's
+  pinned checksum had drifted and `slimserve.fetch` (correctly) refused it.
+  With the artifact re-blessed, the speculator ran for the first time and
+  died at startup:
+  `value tensor of shape [80, 8, 128] cannot be broadcast to indexing result
+  of shape [80, 256]`, from `precompute_and_store_context_kv`.
+- ROOT CAUSE: two KV cache layouts exist and they are not interchangeable.
+  - split  `(2, num_blocks, block_size, num_kv_heads, head_size)` -- leading
+    K/V planes; what the Metal path this drafter was written against uses.
+  - packed `(num_blocks, num_kv_heads, block_size, 2 * head_size)` -- K and V
+    interleaved in the content dim; what TRITON_ATTN (the backend actually
+    selected here) and ROCM_AITER_FA use.
+  The drafter hardcoded the split form, so `kv_cache[0]` indexed BLOCK 0 as
+  though it were the K plane. The trailing dim of the result, 256, is exactly
+  `2 * head_size` for this drafter's 128-wide heads -- which is what the error
+  was reporting.
+- Note the failure mode: the shapes stayed plausible. This surfaced as a
+  broadcast error only because 8 kv heads x 128 does not divide into
+  2 x 128. With arithmetic that happened to line up it would have silently
+  written K and V into the wrong place, degrading draft acceptance without
+  ever raising -- the same class of silent-wrongness as the GGUF dispatch
+  switch that had no `default:`.
+- FIX: `_store_kv_at_slots` in `models/muse_glimmer_dflash.py` detects the
+  layout and writes accordingly; module-level, because two drafter classes
+  share this path (`DFlash2QwenModel` does not inherit from
+  `MuseGlimmerDFlashModel`). An unrecognized layout RAISES rather than
+  guessing which axis holds K/V.
+- Verified: both layouts round-trip in a unit check (including the advanced
+  indexing rule that puts the gathered dim first when the index tensors are
+  separated by a slice), and the real profile smoke passes:
+  "What is 2 + 2?" -> "4", red image -> "Red", dflash k=3, load 122.3 s.
+  Raw: perf/results/2026-08-25/gguf-spec3/.
+- Unrelated to the GDN value-head fix; it was simply hidden behind it, since
+  nothing could reach the drafter while the model itself was producing
+  garbage.
