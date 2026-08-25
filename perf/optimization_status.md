@@ -11148,3 +11148,62 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   qwen38-nvfp4-1 (safetensors, MTP k=2) and qwen38-q2kxl-1 (GGUF, DFlash2
   k=3, run under a temporary mi300x widening that is reverted after each
   run -- the profile still lists only `metal`).
+
+## 2026-08-25 - Tuned the Metal KV reserve: 4 GiB -> 7 GiB (measured, not guessed)
+
+- Baseline: the fit shipped with a 4 GiB reserve floor, and its notebook
+  entry suggested the reserve was conservative because the earlier
+  KV-pool bisect showed 8-9 GiB pools decoding at 26-27 tok/s. That
+  bisect used ONE sequence. It understated memory demand badly.
+- Method: new harness
+  `perf/results/2026-08-25/kv-reserve-tuning/measure_activation_peak.py`
+  boots a profile at its registered geometry, stresses it at its OWN
+  configured batch width (max_num_seqs concurrent requests whose prompts
+  each exceed max_num_batched_tokens, so chunked prefill runs full-width
+  while decode carries max sequences), and samples device residency at
+  20 Hz throughout. Peak is reported against residency right after KV
+  allocation, which is exactly what the reserve must cover.
+  Two traps found while building it: the engine runs in a separate
+  EngineCore process by default, so the parent measured 0.0 GiB
+  residency (fixed with VLLM_ENABLE_V1_MULTIPROCESSING=0 plus a hard
+  failure when the baseline is implausibly small); and activation peak
+  is set by per-step batch width, not total prompt tokens, so the first
+  oversized-prompt version just ran 11 minutes for the same answer.
+- Measurements (M5 Max, 107.52 GiB working set):
+  | profile | pool | transient peak | peak resident | spare | tok/s |
+  |---|---|---|---|---|---|
+  | qwen38-q2kxl-1 (16 seqs x 2048) | 12.00 | 0.085 | 41.23 | 66.29 | - |
+  | dsv4-xxs-1 (32 seqs x 2176) | 6.52 | 5.411 | 106.64 | 0.88 | 22.17 |
+  | dsv4-xxs-1 | 4.00 | 6.411 | 105.13 | 2.39 | 22.62 |
+  | dsv4-xxs-1 (tuned) | 3.82 | 6.411 | 104.94 | 2.58 | 22.68 |
+- Finding, which REVERSES the earlier suggestion: DSV4's transient peak
+  under its own registered batch width is 5.4-6.4 GiB -- larger than the
+  4 GiB reserve. The 6.52 GiB grant survived only because post-KV
+  residency lands ~2 GiB below the naive weights+pool prediction, and it
+  came within 0.88 GiB of the working set at peak. The reserve was too
+  small in the dangerous direction, not too large.
+  Qwen3.8's transient is 0.085 GiB by contrast: the gap is architectural
+  (43 layers, sparse-MLA indexer scratch, 32 seqs, drafter), not a
+  batch-width scaling law, which is why the reserve stays a flat floor
+  anchored on the heaviest profile instead of a fitted formula.
+- The KV pool is not the transient: 90,560 prompt tokens commit only
+  ~0.67 GiB at DSV4's 7,954 bytes/token, and the transient peak is the
+  same 6.411 GiB at a 4.00 GiB pool as at 3.82 GiB. Total peak residency
+  grows ~0.6 GiB per GiB of pool (measured slope over two points).
+- Change: _KV_RESERVE_MIN_BYTES 4 GiB -> 7 GiB, chosen so a stressed
+  engine keeps ~2.5 GiB of the working set spare.
+- Result on dsv4-xxs-1: grant 6.52 -> 3.82 GiB, KV capacity 880,117 ->
+  515,461 tokens (still 1.97x the profile's 262,144 max_model_len),
+  peak residency 106.64 -> 104.94 GiB, spare 0.88 -> 2.58 GiB. Stress
+  throughput 22.17 -> 22.68 tok/s and server-path single-request output
+  byte-identical: the safety costs no measurable throughput.
+- Correctness: server path through `slimserve dsv4-xxs-1 --serve` with
+  the registered DSpark drafter and seeded shipped defaults returns the
+  same coherent answer as before the tune. Suite 45 passed / 103
+  skipped; ruff clean.
+- Decision: RETAINED. Follow-up if DSV4 ever needs more KV: the reserve
+  is dominated by sparse-MLA indexer and prefill scratch, so lowering
+  max_num_batched_tokens or max_num_seqs would free reserve directly --
+  measure before trading it.
+- Raw: perf/results/2026-08-25/kv-reserve-tuning/ (harness, peak-*.json,
+  logs) and perf/results/2026-08-25/profile-validation/.
