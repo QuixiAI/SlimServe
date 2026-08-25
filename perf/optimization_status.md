@@ -10109,3 +10109,36 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   artifacts); era-consistent 7bffa6b07 and fe960935f builds were
   constructed during the false-alarm bisect and confirmed the behavior
   was build-independent before the ring was identified.
+
+## 2026-08-25 - Qwen3.8 Spec-Step Attribution + M=4 Band Survey (campaign scoping)
+
+- Phase attribution (spec_profile.py, synchronized timers -- relative
+  shares only, sync overhead inflates many-call rows; profiled 12.6
+  tok/s vs 24.4 unprofiled): target forward 136 ms/step (82%), inside
+  it MLP x64 43.3 ms, GDN x48 39.9 ms, full-attn x16 16.1 ms,
+  remainder (prep/metadata/logits/python) ~37 ms; sampling 17.2 ms
+  (rejection kernel itself only 3.6); drafter 12.1 ms.
+- Dead ends closed this session: tk_dequant8 8-span specializations
+  exist for ALL serving formats (q2_K/q4_K/q5_K/q6_K, iq1_s, iq2_xs,
+  iq2_s, iq2_xxs, iq3_xxs, iq3_s -- I re-derived q4_K before finding
+  the existing one at dequant.metal:1071); the dequant layer is not
+  the M-band bottleneck.
+- M=4 verify-band GEMV survey (the width qwen38 actually runs;
+  fp16 activations, 30-iter sync bench, effective GB/s = MB/ms):
+  Q4_K ssm_out 316; IQ3_S qkv 255; IQ2_S down 202; IQ2_XS down 189;
+  IQ1_S gate/up 59-125 (high run-to-run variance, worst offender).
+  FFN GEMVs at these rates total ~27 ms/step across 64 layers vs a
+  ~9 ms stream-rate floor -- the largest single kernel-side win
+  (~18 ms of a ~80 ms real step, i.e. 24.4 -> ~29-30 tok/s if fully
+  reclaimed) is a multi-row-aware IQ-format path for the M=2..4 band
+  (per-lane M-accumulator scaling in qgemv_mm is the structural
+  limit; the Muse tensor-ops verify kernels are the local precedent).
+- Comparable second front: the ~37 ms/step execute_model remainder
+  (python/dispatch; sync-inflated, needs an unsynchronized profile to
+  size honestly) -- the metal_tape native step-tape (stage-1, bit-exact
+  contract) exists for DSV4 as the precedent for collapsing per-layer
+  python dispatch.
+- llama.cpp bar restated: 35.67 tok/s plain = ~28 ms/token; our spec
+  path is at ~41 ms/token effective. Both fronts together plausibly
+  close it; neither alone does.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_profile_head.log.
