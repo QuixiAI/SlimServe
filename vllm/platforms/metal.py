@@ -75,7 +75,7 @@ class MetalPlatform(Platform):
     # Neither inductor backend applies: there is no MPS backend, and the CPU
     # one needs a toolchain we do not require at runtime.
     simple_compile_backend: str = "eager"
-    supported_quantization: list[str] = ["gguf"]
+    supported_quantization: list[str] = ["gguf", "compressed-tensors"]
 
     @classmethod
     def is_available(cls) -> bool:
@@ -88,6 +88,12 @@ class MetalPlatform(Platform):
         # and embeddings in bf16, and the vendored kernels are written against
         # that. fp16 stays available for the quantized GEMV path.
         return [torch.bfloat16, torch.float16, torch.float32]
+
+    @classmethod
+    def current_device(cls) -> torch.device:
+        # Metal-only helper (no Platform-base counterpart): MPS exposes a
+        # single device. Used by the GDN serving path.
+        return torch.device("mps")
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -263,6 +269,16 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
         if model_config is not None:
             model_config.disable_cascade_attn = True
+
+        # The fork-wide kernel backend default is AITER (ROCm). It cannot be
+        # meant here, and the linear/MoE selectors treat any non-"auto" value
+        # as an explicit filter that would exclude the Metal kernels.
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if kernel_config is not None:
+            if kernel_config.linear_backend == "aiter":
+                kernel_config.linear_backend = "auto"
+            if kernel_config.moe_backend == "aiter":
+                kernel_config.moe_backend = "auto"
 
         cache_config = vllm_config.cache_config
         if not getattr(cache_config, "user_specified_block_size", False):
