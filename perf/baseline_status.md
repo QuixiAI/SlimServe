@@ -758,3 +758,771 @@ boot_*.log).
 - Raw artifacts: perf/results/2026-08-17/decode_exact_gate/
   (boot.log, 8tok.json, off1-2000.json, 2500x64.json with full response
   text).
+
+## Qwen3.8-27B — Metal M1 Ultra (qwen38-1), M2 baseline pinned 2026-08-17
+
+- Status: first exact-token baseline for the bring-up path — GGUF Q4_K_M
+  through the forced-V2 runner on torch-MPS GDN fallbacks (NO Metal GDN
+  kernels yet; this is the floor M3 attacks, pinned so the kernel win is
+  measurable). Worktree b1ee83671 + uncommitted M1 implementation.
+- Profile: `qwen38-1` (V2 forced, kv pool 16 GiB, max_num_seqs 8,
+  max_model_len 32768, no drafter, prefix caching off). Wired limit 122880.
+- Harness: `benchmarks/benchmark_dsv4_exact.py --metrics-url none`,
+  prompt overhead 0 (verified: no BOS/wrapper), source = perf-docs concat
+  (25,368 tokens). All runs `exact: true`.
+
+| workload | tok/s (aggregate) |
+| --- | ---: |
+| c1 1000 in / 256 out (x3, warmed boot) | 2.425–2.433 |
+| c1 1000 in / 256 out (fresh boot 6) | 2.368 |
+| c4 1000 in / 256 out (x2) | 5.387–5.389 |
+| c8 1000 in / 256 out (x2) | 6.554–6.558 |
+| c1 2500 in / 64 out (x3) | 1.110–1.115 |
+
+- Derived (two-workload solve): pure c1 decode ~2.80 tok/s, prefill
+  ~72 tok/s.
+- Determinism: c1 completion sha 7c766419 identical across all four runs
+  including the fresh boot. c4/c8 repeats fork at documented near-ties.
+- Cross-engine bars, same box, sequential: llama.cpp d8df12e Metal on the
+  IDENTICAL GGUF — pp1000 252.2 / pp2500 250.9 / tg256 21.03 tok/s;
+  batched-bench 1000/256 B=1/4/8: 20.90 / 35.00 / 40.54 agg. MLX bf16:
+  prompt 221, generation 10.85 tok/s (55.5 GB peak). llama.cpp = 7.5x our
+  pure decode, 3.5x our prefill on the same weights.
+- First-request-after-boot wobble (2/2 boots): the first forward after a
+  fresh boot flips near-ties (<=0.5 nats observed); prime every boot with
+  a throwaway request before determinism-sensitive runs. Open root-cause
+  item, tracked for M3.
+- Raw: perf/results/2026-08-17/qwen38_m2_baseline/. Notebook: UPDATE 5 in
+  the Qwen3.8 bring-up entry of perf/optimization_status.md.
+
+## Qwen3.8-27B — Metal M1 Ultra, M3 kernel baseline pinned 2026-08-17
+
+- Change vs the M2 floor: the five gdn.metal kernels serve the GDN mixer
+  (VLLM_METAL_GDN kill switch; fp32 chain; state_stride kernel param for
+  the page-packed pools). Oracle 25/25 vs the torch fallbacks; c1
+  completion sha 7c766419 identical to the fallback canonical.
+
+| workload | tok/s (M2 floor) | tok/s (M3 kernels) |
+| --- | ---: | ---: |
+| c1 1000/256 | 2.43 | 7.205–7.211 |
+| c4 1000/256 | 5.39 | 11.42–11.44 |
+| c8 1000/256 | 6.56 | 11.86–11.90 |
+| c1 2500/64 | 1.11 | 2.80–2.81 |
+
+- Derived: pure c1 decode 8.73 tok/s (3.1x), prefill 161 tok/s (2.2x);
+  42% / 64% of llama.cpp's same-GGUF 20.9 / 252.
+- Parity re-gated (llama.cpp same GGUF): unchanged from the M1 gate
+  within near-ties. Watch items and the one-shot first-6-chunk transient
+  are in notebook UPDATE 7.
+- Raw: perf/results/2026-08-17/qwen38_m3_kernels/.
+
+## Qwen3.8-27B — Metal M1 Ultra, M4 baseline pinned 2026-08-18 (norm kernel + KV page-layout fix)
+
+- Changes vs M3: gdn_gated_rmsnorm wired into serving, and the hybrid
+  KV page-layout collision fixed (MetalAttentionBackend stride order
+  (1,0,2,3,4) = page-local [num_blocks, 2, block, H, D]; dense-view
+  addressing for the paged kernel and all cache reads/writes). The fix
+  closed three correctness watch items (first-multi-chunk '!' transient,
+  first-request wobble, 2500x64 intra-boot sha re-roll) — root cause and
+  hunt in notebook UPDATE 8.
+
+| workload | M3 kernels | M4 norm+layout |
+| --- | ---: | ---: |
+| c1 1000/256 | 7.21 | 8.748–8.749 |
+| c4 1000/256 | 11.43 | 15.789 |
+| c8 1000/256 | 11.88 | 16.521 |
+| c1 2500/64 | 2.81 | 3.032–3.037 |
+
+- Derived: pure c1 decode 11.06 tok/s (+27% vs M3), prefill ~164 tok/s;
+  53% / 65% of llama.cpp same-GGUF 20.9 / 252. c8/c1 scaling 1.89x
+  (llama.cpp: 1.9x). c1 step 90.4 ms (llama.cpp whole model 47.6 ms).
+- Canonical greedy shas (temperature 0, exact harness prompts):
+  c1 1000x256 = 2e4defe1 (norm-kernel canonical, preserved bit-exact
+  across the layout fix); c1 2500x64 = f687018e (3/3 bit-stable).
+  First request on a fresh boot is now bit-identical to warm repeats
+  (max |dlogprob| 0.000000, 2/2 boots) — priming stays protocol until a
+  longer soak says otherwise.
+- DSV4 exposure: none (python-only change; MLA/TurboQuant backends
+  untouched; no metallib rebuild).
+- Raw: perf/results/2026-08-18/qwen38_m4_layoutfix/. Notebook: UPDATE 8.
+
+## Qwen3.8-27B — Metal M1 Ultra, M4b baseline pinned 2026-08-18 (Q4_K mmvq kernel)
+
+- Change vs M4: qgemv_q4k_nr — llama.cpp-layout q4_K decode GEMV
+  (2 rows/simdgroup, 2 simdgroups/threadgroup, 4 blocks in flight,
+  factored scales, no per-element half rounding), routed for q4_K
+  batch-1 GEMVs; VLLM_QC_Q4K_NR=0 kill switch. metallib + .so rebuilt;
+  DSV4 anchors re-gated ALL BIT-EXACT (anchor_regate_q4k_metallib/).
+  Census that found it: UPDATE 9; kernel gate: UPDATE 10.
+
+| workload | M4 norm+layout | M4b q4_K kernel |
+| --- | ---: | ---: |
+| c1 1000/256 | 8.749 | 11.197 (2/2) |
+| c4 1000/256 | 15.789 | 15.674 (flat; mm path) |
+| c8 1000/256 | 16.521 | 16.513 (flat; mm path) |
+| c1 2500/64 | 3.037 | 3.238–3.261 (3/3) |
+
+- Derived: pure c1 decode ~15.3 tok/s (+38% vs M4) = 73% of llama.cpp
+  same-GGUF 20.9; c1 step ~65.5 ms (llama.cpp whole model 47.6) =
+  35.1 ms idealized GEMV + ~31 ms non-GEMV (census closes to
+  measurement). Prefill unchanged (~164 tok/s; M>17 GEMM path untouched).
+- Canonical greedy shas: c1 1000x256 = 36ed113a (2/2; fork-gap verified
+  vs 2e4defe1 — exact tie at pos 32 nudged 0.125 nats, pre-fork max
+  0.168 nats); c1 2500x64 = 268721b3 (3/3). ramp 1000x32 = 0f9506fc
+  (unchanged). Kill-switch boot reproduces 2e4defe1 bit-exact.
+- Known flat spots: c4/c8 ride qgemv_mm (BPI=1 walk) — next lever;
+  c8/c1 ratio now 1.47x pending that work.
+- Raw: perf/results/2026-08-18/qwen38_q4k_gate/. Notebook: UPDATE 10.
+
+## Qwen3.8-27B — Metal M1 Ultra, M4c baseline pinned 2026-08-18 (Q4_K batch mmvq kernel)
+
+- Change vs M4b: qgemv_q4k_nr_mb — grid-split column-pair batch twin of
+  the NR kernel (grid.y = M/2, batch-1 register budget per threadgroup,
+  bit-identical per row to looped batch-1), routed for q4_K qgemv_mm
+  chunks M in {2,4,8}; VLLM_QC_Q4K_NR_MM=0 kill switch (VLLM_QC_Q4K_NR=0
+  still kills all NR routes). metallib + .so rebuilt; DSV4 anchors
+  re-gated ALL BIT-EXACT (anchor_regate_q4k_mb/). Investigation +
+  gate: UPDATE 11.
+
+| workload | M4b | M4c batch kernel |
+| --- | ---: | ---: |
+| c1 1000/256 | 11.197 | 11.168 (sha 36ed113a bit-exact) |
+| c4 1000/256 | 15.674 | 16.596-16.609 (+5.9%) |
+| c8 1000/256 | 16.513 | 17.414-17.421 (+5.5%) |
+| c1 2500/64 | 3.238-3.261 | 3.270 (sha 268721b3 bit-exact) |
+
+- Batch q4_K microbench (serving route, GB/s gate_up/down): M=2
+  247/188 -> 414/382; M=4 171/138 -> 217/211; M=8 91/81 -> 111/112.
+  Idealized all-GEMV step at M=8: 204.5 -> 181.1 ms. Batch decode is
+  now ALU-bound per column (UPDATE 11 cost model), and the q8_0/q6_K
+  batch paths carry the same M=8 collapse (qkvz 107, attn.o 58 GB/s) —
+  that plus non-GEMV are the open levers.
+- Canonical shas unchanged: c1 36ed113a, 2500x64 268721b3, ramp
+  0f9506fc. c4/c8 request-0 shas are tie-carriers (composition
+  sensitive in both worlds) — NOT anchors; kill-switch boot reproduces
+  old-baseline throughput (15.772/16.450) and the non-tie c4 request-1
+  sha fbe69266 bit-exact.
+- c8/c1 ratio 1.56x (was 1.47x). llama.cpp bars unchanged (c1 20.9).
+- Raw: perf/results/2026-08-18/qwen38_q4k_mb_gate/. Notebook: UPDATE 11.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N2 baseline pinned 2026-08-19 (bring-up dequant path, pre-kernel)
+
+- First exact-token baseline of `qwen38-nvfp4-1` (unsloth NVFP4
+  compressed-tensors checkpoint, mixed FP8+NVFP4, served W4A16/W8A16).
+  Path under measurement: N1 bring-up — weights dequantized once to
+  bf16 at load (~40 GB resident), every linear a plain F.linear; NO
+  QuixiCore GEMV kernels on the CT path yet. Boot ~35 s page-cached.
+  Bring-up record: UPDATE 13; this snapshot: UPDATE 14.
+
+| workload | Q4_K M4c (bar) | NVFP4 N2 bring-up |
+| --- | ---: | ---: |
+| c1 1000/256 | 11.168 | 7.02 / 6.99 / 7.02 (sha 8c58a4c6, 3/3 bit-stable) |
+| c4 1000/256 | 16.596-16.609 | 14.370 / 14.356 |
+| c8 1000/256 | 17.414-17.421 | 15.933 / 15.993 |
+| c1 2500/64 | 3.270 | 2.552 / 2.550 / 2.556 (sha d0e07ddd, 3/3 bit-stable) |
+
+- Canonical NVFP4 greedy shas: c1 1000x256 = 8c58a4c6 (3/3), c1
+  2500x64 = d0e07ddd (3/3). c4/c8 request-0 shas are tie-carriers as
+  in the Q4_K world (c4 run 2 flipped: 8c58a4c6 -> 8a969e98) — NOT
+  anchors. c8 sha 6cad1354 was 2/2 but inherits the same caveat.
+- Read: c1 at 63% of Q4_K (bf16-materialized reads ~40 GB/tok vs
+  16.5), while c4/c8 already at 87%/92% (aten bf16 GEMM batches well).
+  The kernel campaign's c1 target: 19.1 GB/tok real quantized reads
+  put the GEMV floor at ~27 ms + ~31 ms non-GEMV ⇒ ~17 tok/s cap;
+  every point between 7.02 and that cap is N3/N4 work.
+- Prefill (2500x64): ~130 tok/s prefill-equivalent — N4 lever, noted
+  not tuned.
+- Raw: perf/results/2026-08-19/n2_nvfp4_baseline/. Notebook: UPDATE 14.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N3 baseline pinned 2026-08-19 (first CT GEMV kernels)
+
+- Change vs N2: two new QuixiCore Metal GEMV kernels routed for M==1
+  decode on the compressed-tensors path — `qgemv_fp8ch` (planar e4m3
+  [N,K] × bf16 X, per-row scale epilogue; covers attn qkvo, GDN
+  qkvz/out, mlp 56–63, lm_head) and `qgemv_nvfp4_planar` v6
+  (packed-nibble [N,K/2] + e4m3 group scales [N,K/16]; select-free
+  bit-pattern E2M1 decode, 2^14 rebias folded into the group-scale
+  multiply; covers mlp 0–55). Kill switches: VLLM_QC_FP8CH=0,
+  VLLM_QC_NVFP4=0. metallib + .so rebuilt. Variant study, serving
+  gates, and the ops incident: UPDATE 15.
+
+| workload | N2 bring-up | N3 GEMV kernels |
+| --- | ---: | ---: |
+| c1 1000/256 | 7.02 | 10.10 / 10.14 (sha 2e567ea7, 2/2) |
+| c4 1000/256 | 14.37 | 14.38 (unchanged by design) |
+| c8 1000/256 | 15.96 | 16.02 (unchanged by design) |
+| c1 2500/64 | 2.55 | 2.82 / 2.83 (sha 95adbd97) |
+
+- c1 +44% over N2; now 90% of the Q4_K M4c bar (11.168). Ramp-32
+  indicative 14.50 tok/s.
+- Correctness: float64 oracles ALL PASS for both kernels (maxrel
+  3.8–5.7e-3, fp32-tree + bf16-rounding class; bit-stable across
+  repeat calls; batch call == looped batch-1 bit-exact). Kill-switch
+  boot (both routes off) reproduces the N2 canonicals BIT-EXACT
+  through all new plumbing: c1 7.033 sha 8c58a4c6, 2500x64 d0e07ddd.
+- M==1 gate is deliberate: routing the M≤8 batch loop through the
+  GEMVs measured BELOW dense bf16 GEMM (c4 14.37→13.00, c8
+  15.93→14.00 — the batch-1 loop re-reads weights M times); gating to
+  M==1 recovered c4/c8. Weight-stationary `_mb` twins (q4_K UPDATE 11
+  grid.y column-pair pattern) are the open c4/c8 lever.
+- Clean-box microbench (GB/s): fp8ch qkv 471 / o 461 / gdn.qkvz 573 /
+  gdn.out 479 / gate_up 615 / down 527 / lm_head 650 — idealized FP8
+  side 19.4 ms vs 15.1 ms roofline; nvfp4_planar gate_up 426 / down
+  447 — idealized NVFP4 side 19.5 ms vs 12.0 ms roofline. Combined
+  idealized all-GEMV step 38.9 ms vs the ~27 ms roofline target;
+  at 10.1 tok/s the step is ~99 ms, so non-GEMV (~31 ms class) plus
+  GEMV shortfall are the next c1 levers (N3 geometry work + N4 #16).
+- DSV4 exposure: metallib/.so rebuilt twice. Anchors re-gated ALL
+  BIT-EXACT after the fp8ch build
+  (perf/results/2026-08-19/anchor_regate_fp8ch/: 573db39598e7 5/15/3,
+  bb83cc3054a3 1581/2115/423 57.3s, f75e1d41ac3d 43/105/21) and again
+  ALL BIT-EXACT on the final nvfp4_planar build
+  (perf/results/2026-08-19/anchor_regate_nvfp4_final/, 2/2 + 2/2 +
+  3/3 deterministic).
+- Raw: perf/results/2026-08-19/n3a_fp8ch_gate/ and
+  n3b_nvfp4_gate/. Notebook: UPDATE 15.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N3b baseline pinned 2026-08-19 (mb batch twins)
+
+- Change vs N3: `qgemv_fp8ch_mb` + `qgemv_nvfp4_planar_mb` — grid-split
+  column-pair batch twins (grid.y = M/2, batch-1 register budget,
+  weights decoded once per pair, rows bit-identical to looped batch-1
+  by construction and by oracle). Routed for even M: NVFP4 M<=8, FP8
+  M<=4 (at 8 bits the M/2 re-reads reach dense-bf16 parity by M=8 —
+  measured crossover). Kill switches VLLM_QC_NVFP4_MB /
+  VLLM_QC_FP8CH_MB. metallib + .so rebuilt; DSV4 anchors re-gated
+  (anchor_regate_ct_mb/).
+
+| workload | N3 GEMV kernels | N3b mb twins |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.10 / 10.14 | 10.024 / 10.049 (sha 2e567ea7 bit-exact) |
+| c4 1000/256 | 14.38 | 15.638 / 15.636 (+8.8%) |
+| c8 1000/256 | 16.02 | 16.889 / 16.876 (+5.4%) |
+| c1 2500/64 | 2.82 / 2.83 | 2.853 / 2.858 (sha 95adbd97 bit-exact) |
+
+- Canonical shas unchanged (c1 2e567ea7, 2500x64 95adbd97). c4/c8
+  request-0 shas remain tie-carriers; the c4 carrier rolled dense ->
+  GEMV numerics (8c58a4c6 -> 467b35c3), stable 2/2. Null-check boot
+  (both MB switches off) reproduces N3 exactly (10.023 / 14.354 /
+  15.89, c1 sha 2e567ea7).
+- vs Q4_K M4c bar: c1 90% (10.05/11.17), c4 94% (15.64/16.60), c8 97%
+  (16.89/17.42). Remaining c1 levers: fp8ch decode-trick port +
+  geometry (idealized all-GEMV 38.9 ms vs 27 ms roofline), then the
+  ~31 ms non-GEMV class (N4 #16).
+- Raw: perf/results/2026-08-19/n3c_mb_gate/. Notebook: UPDATE 16.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N3d baseline pinned 2026-08-19 (fp8ch v6-decode port; c8 passes the Q4_K bar)
+
+- Change vs N3b: `qgemv_fp8ch`/`_mb` decode is now the select-free v6
+  bit-pattern form (two half2 patterns per uint of 4 e4m3 bytes =
+  value/2^8 exactly, subnormal-safe; 2^8 folded into the per-row scale
+  epilogue; vec4 X staging) — microbench qkv 471->687, o 461->759,
+  lm_head 650->732 GB/s (DRAM-honest), idealized FP8-GEMV step 19.4 ->
+  13.0 ms. Routing: `_GEMV_MB_MAX_ROWS` (fp8ch) 4 -> 8 — the cheap
+  decode moves the mb-vs-dense crossover (M=8 qkv 0.285 vs 0.455 ms).
+  metallib rebuilt (.so unchanged); DSV4 anchors re-gated ALL
+  BIT-EXACT (anchor_regate_v6port/).
+
+| workload | N3b mb twins | N3d v6-decode port |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.024 / 10.049 | 10.357 / 10.338 (+2.9%, sha 467b35c3 2/2 — ROLLED, see note) |
+| c4 1000/256 | 15.638 / 15.636 | 16.309 / 16.259 (+4.1%, sha 467b35c3 HELD) |
+| c8 1000/256 | 16.889 / 16.876 | 17.538 / 17.543 (+3.9%) |
+| c1 2500/64 | 2.853 / 2.858 | 2.849 / 2.858 (sha 95adbd97 HELD bit-exact) |
+
+- CANONICAL SHA CHANGE: c1 1000x256 = **467b35c3** (was 2e567ea7).
+  Per-element decode is provably exact (float64 envelope unchanged);
+  the roll is summation-order rounding — the straight-line decode
+  lets fast-math reassociate the FMA chain the old select chain
+  blocked. Deterministic 2/2; 2500x64 held bit-exact (64 steps, no
+  tie hit); c4 held. Full attribution in UPDATE 18.
+- vs Q4_K M4c bar: c1 92.7% (10.35/11.17), c4 98.1% (16.28/16.60),
+  **c8 100.7% (17.54/17.42) — first bar crossed**. Remaining base-
+  decode levers: nvfp4_planar geometry (529/452 GB/s vs the ~732
+  DRAM-honest ceiling), then the ~31 ms non-GEMV class (N4 #16).
+- Raw: perf/results/2026-08-19/n3d_v6port_gate/. Notebook: UPDATE 18.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N3e baseline pinned 2026-08-19 (nvfp4 v7 vectorized decode; c4+c8 past the Q4_K bar)
+
+- Change vs N3d: `qgemv_nvfp4_planar`/`_mb` decode is half2-vectorized
+  (four bit-pattern constructs per uint decode all 8 nibbles, no byte
+  extraction, ~2.5 ops/value) and the group scale uses the select-free
+  e4m3 pattern with one 2^22 fold. Microbench gate_up 529->631, down
+  452->662 GB/s; idealized NVFP4 step 17.3->13.1 ms; **all-GEMV
+  idealized ~26.1 ms = AT the ~27 ms campaign target**. No host
+  change; nvfp4 mb bound stays 8. metallib rebuilt; DSV4 anchors
+  re-gated ALL BIT-EXACT (anchor_regate_nvfp4v7/).
+
+| workload | N3d | N3e v7 decode |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.357 / 10.338 | 10.706 / 10.685 (+3.3%, sha fa58598b 2/2 — rolled as PREDICTED) |
+| c4 1000/256 | 16.309 / 16.259 | 16.992 / 16.972 (+4.2%) |
+| c8 1000/256 | 17.538 / 17.543 | 18.252 / 18.245 (+4.0%) |
+| c1 2500/64 | 2.849 / 2.858 | 2.907 / 2.905 (sha 95adbd97 HELD bit-exact, +1.9%) |
+
+- CANONICAL c1 sha: **fa58598b** (roll predicted in advance — same
+  fast-math-reassociation class as N3d, attribution in UPDATE 19;
+  2500x64 held bit-exact for the third consecutive build). c4/c8
+  request-0 tie-carriers now vary per run — composition-sensitive,
+  NOT anchors.
+- vs Q4_K M4c bar: **c1 95.8% (10.70/11.17), c4 102.3% (16.98/16.60)
+  CROSSED, c8 104.8% (18.25/17.42) CROSSED**. GEMV side is at target;
+  the c1 gap is the ~31 ms non-GEMV class -> N4 census next
+  (UPDATE 9 methodology on the current build).
+- Raw: perf/results/2026-08-19/n3e_nvfp4v7_gate/. Notebook: UPDATE 19.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N4a baseline pinned 2026-08-19 (paged-attention D=256 split-K; c4 112% / c8 122% of the Q4_K bar)
+
+- Change vs N3e: head-256 full-attn decode leaves the SDPA gather
+  fallback for the split-K partition/reduce paged-attention pair
+  (paged_attn_v2 @256; one serial-dispatch encoder; occupancy target
+  1536, P<=64; new `max_context` op arg sizes partitions host-side).
+  Crossover-routed (measured): batch >= 2 OR max_context >= 2048 ->
+  kernel; batch-1 short context keeps SDPA (the kernel's fixed
+  per-call cost loses there — c1 9.45/10.02 in rounds 1/2). Kill
+  switch VLLM_QC_PA256=0; tuning VLLM_QC_PA256_SPLITK. metallib +
+  .so rebuilt; DSV4 anchors ALL BIT-EXACT (anchor_regate_pa256/).
+
+| workload | N3e | N4a split-K attn |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.706 / 10.685 | 10.717 / 10.726 (sha fa58598b BIT-EXACT — SDPA route unchanged) |
+| c4 1000/256 | 16.992 / 16.972 | 18.541 / 18.546 (+9.1%) |
+| c8 1000/256 | 18.252 / 18.245 | 21.263 / 21.258 (+16.5%) |
+| c1 2500/64 | 2.907 / 2.905 | 2.914 / 2.915 (kernel route, sha aedef4ec 2/2) |
+
+- vs Q4_K M4c bar: c1 96.0% (10.72/11.17), **c4 111.7% (18.54/16.60)
+  CROSSED, c8 122.1% (21.26/17.42) CROSSED**. ctx-32k decode step
+  drops from unusable (SDPA gather) to 10.4 ms/call x16.
+- Census (UPDATE 20): host exonerated (execute_model overlapped,
+  0 sync kills, 19 cb/step, GPU p50 95); phase split mlp 33.5 /
+  gdn 25.3 / full_attn 17.5 / glue 23.7. Remaining c1 levers by
+  share: mlp glue (SwiGLU fusion), norms/residual glue, gdn
+  non-GEMV multi-row recurrence — then N5 DFlash 2 (verify path =
+  the expanded kernel route, already lit up by this change).
+- Raw: perf/results/2026-08-19/n4{a,b,c}_pa256* + qwen38_n4_census/.
+  Notebook: UPDATE 20.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N4b baseline pinned 2026-08-19 (fused add+RMSNorm)
+
+- Change vs N4a: the 128-per-step residual seams run the new
+  `add_rms_norm` fused kernel (one dispatch, bit-identical to the
+  eager add + rms_norm chain — oracle-proven and sha-proven). Kill
+  switch VLLM_QC_ADDNORM. SwiGLU hypothesis closed: already fused
+  (qc_swiglu). metallib + .so rebuilt; DSV4 anchors ALL BIT-EXACT
+  (anchor_regate_addnorm/).
+
+| workload | N4a | N4b add+norm |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.717 / 10.726 | 10.711 / 10.703 (sha fa58598b BIT-EXACT) |
+| c4 1000/256 | 18.541 / 18.546 | 18.795 / 18.874 (+1.5%) |
+| c8 1000/256 | 21.263 / 21.258 | 21.430 / 21.418 (+0.8%) |
+| c1 2500/64 | 2.914 / 2.915 | 2.945 / 2.940 (sha aedef4ec BIT-EXACT, +1.1%) |
+
+- vs Q4_K M4c bar: c1 95.9% (10.71/11.17), c4 113.4%, c8 123.0%.
+- CANONICAL: c1 sha fa58598b, 2500x64 sha aedef4ec (both held).
+- Remaining c1 gap is gdn non-GEMV + residual per-op overhead; the
+  structural answer is the Muse one-command-buffer step loop
+  (precedent: ~40 ms of an ~80 ms step was per-op host cost). Next
+  campaign order: N5 DFlash 2, then re-rank.
+- Raw: perf/results/2026-08-19/n4d_addnorm_gate/. Notebook: UPDATE 21.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N4c baseline pinned 2026-08-20 (GDN dispatch fusion; c1 98.4% of the Q4_K bar)
+
+- Change vs N4b: the 48 GDN layers' decode chain drops from 12 to 3
+  non-GEMV dispatches each (~430 fewer per step): `gdn_fused_prepare`
+  (conv+silu with in-register history and state update, q/k l2norm,
+  v, decay/beta — one dispatch reading the qkvz/ba projection rows
+  in place; pure-decode routed) and `gdn_gated_rmsnorm_f32` (norm
+  straight off the fp32 recurrence output, z read in place; decode
+  and prefill), plus the forward_mps container restructure (normed
+  rows go straight to out_proj). Kill switches VLLM_QC_GDN_FUSEPREP
+  / VLLM_QC_GDN_FUSENORM. Oracle 20/20 BIT-EXACT incl. conv state
+  pools. metallib + .so rebuilt; DSV4 anchors ALL BIT-EXACT
+  (anchor_regate_gdnfuse/, 8th consecutive).
+
+| workload | N4b | N4c gdn fusion |
+| --- | ---: | ---: |
+| c1 1000/256 | 10.711 / 10.703 | 11.019 / 10.968 (sha fa58598b BIT-EXACT, +2.7%) |
+| c4 1000/256 | 18.795 / 18.874 | 19.215 / 19.281 (+2.0%) |
+| c8 1000/256 | 21.430 / 21.418 | 21.683 / 21.681 (sha 467b35c3 2/2, +1.2%) |
+| c1 2500/64 | 2.945 / 2.940 | 2.967 / 2.968 (sha aedef4ec BIT-EXACT, +0.9%) |
+
+- vs Q4_K M4c bar: c1 98.4% (10.99/11.17), c4 115.7%, c8 124.5%.
+- CANONICAL: c1 sha fa58598b, 2500x64 sha aedef4ec (both held).
+- CALIBRATION: the win is ~2.4 ms/step vs the ~13 ms census-share
+  estimate — marginal dispatch cost at batch 1 is ~5 us once the
+  pipeline overlaps launches; sync-prof shares over-attribute launch
+  cost. Remaining c1 gap (1.6%) needs a TRUE GPU-time ranking
+  (xctrace Metal System Trace attach — no rebuild) before any
+  further lever; the structural Muse step-loop and N5 DFlash 2
+  re-rank after that.
+- Raw: perf/results/2026-08-20/n4e_gdnfuse_gate/ +
+  anchor_regate_gdnfuse/. Notebook: UPDATE 22.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, N5b baseline pinned 2026-08-20 (mv_ext batch GEMVs; spec c1 first passes no-spec)
+
+- Change vs N4c: batches 3..8 (odd M included) of the fp8ch and nvfp4
+  serving GEMVs route to the new mv_ext twins (`qgemv_fp8ch_mv4r`
+  R1=4, `qgemv_nvfp4_mv4r` R1=2 — NR=4 rows per simdgroup, X via
+  L1-served device vec4 loads, weights re-read ceil(M/R1) times; the
+  llama.cpp kernel_mul_mv_ext precedent). Batch 2 keeps the mb pair
+  twin, batch 1 unchanged, M > 8 dense. Kill switches
+  VLLM_QC_FP8CH_MV4R / VLLM_QC_NVFP4_MV4R. Oracle: all batch rows
+  BIT-IDENTICAL to looped batch-1. metallib + .so rebuilt; DSV4
+  anchors ALL BIT-EXACT (anchor_regate_mv4r/, 10th consecutive).
+- KEY RECALIBRATION (UPDATE 26): at M=8 the FMA work is the binding
+  cost on M1 (~2.3-3.0e12 FMA/s effective issue rate; simdgroup_matrix
+  is cooperative lane math, not a tensor core) — the "M=8 collapse"
+  was mostly physics and batch-kernel headroom is ~1.3-1.7x, not the
+  4x a weight-bound model predicted.
+
+| workload | N4c | N5b mv_ext |
+| --- | ---: | ---: |
+| c1 1000/256 | 11.019 / 10.968 | 11.064 / 11.055 (sha fa58598b BIT-EXACT) |
+| c4 1000/256 | 19.215 / 19.281 | 20.67 / 20.68 (+7.4%) |
+| c8 1000/256 | 21.683 / 21.681 | 23.749 / 23.725 (sha 467b35c3 2/2, +9.5%) |
+| c1 2500/64 | 2.967 / 2.968 | 2.977 / 2.974 (sha aedef4ec BIT-EXACT) |
+| spec c1 (df2 k=7) | 9.59 / 9.60 | 11.11 / 11.082 (sha b46e676c HELD, +15.9%) |
+| spec 2500/64 | 3.053 | 3.154 (sha ab7dde1b HELD) |
+
+- vs Q4_K M4c bar: c1 99.0% (11.06/11.17), c4 124.3%, c8 136.3%.
+- SPEC STATUS: c1 spec (11.11) now ABOVE no-spec (11.06) for the
+  first time; spec 2500x64 +5.9% over no-spec. c4/c8 spec stay well
+  below no-spec (verify M=32/64 rides dense) — spec is a c1 feature.
+  Acceptance diagnostics 3.21-3.92 tok/step (interval-class).
+- CANONICAL: c1 sha fa58598b, 2500x64 sha aedef4ec, spec c1 sha
+  b46e676c (all held).
+- Next: k-sweep 7 vs 3/5 (verify is compute-bound so k cuts verify
+  FMAs linearly; k_sweep.sh staged), then Muse single-CB loop /
+  TurboQuant KV re-rank.
+- Raw: perf/results/2026-08-20/n5b_mv4r_gate/ + anchor_regate_mv4r/.
+  Notebook: UPDATE 26.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, ADAPTIVE-SPEC baseline pinned 2026-08-21 (df2@k=3 promoted to canonical; c1 +23%)
+
+- Change vs N5b: the CANONICAL profile qwen38-nvfp4-1 is now
+  speculative: true with a batch-adaptive schedule
+  (num_speculative_tokens_per_batch_size = [[1,1,3],[2,8,0]]): DFlash2
+  drafts k=3 only when a single request is running; at batch >= 2 the
+  scheduler sets zero draft slots and the V2 runner skips the drafter
+  forward entirely (dynamic SD wired into the V2 runner + gdn_attn
+  state-indices contiguity fix — UPDATE 28). Python + profiles.json
+  only, no metallib/.so rebuild; DSV4 anchors bit-exact (11th
+  consecutive, anchor_regate_adaptive/).
+
+| workload | N5b no-spec | ADAPTIVE canonical (promoted) |
+| --- | ---: | ---: |
+| c1 1000/256 | 11.064 / 11.055 fa58598b | 13.651 / 13.62 (sha 8c58a4c6 2/2, +23.4%) |
+| c4 1000/256 | 20.67 / 20.68 | 20.104 (97.2%) |
+| c8 1000/256 | 23.749 / 23.725 | 23.275 / 23.26 (98.0%) |
+| c1 2500/64 | 2.977 / 2.974 aedef4ec | 3.229 (sha f497f4a9, +8.6%) |
+
+- vs Q4_K M4c bar: c1 122.2% (13.65/11.17), c4 120.9%, c8 133.6% —
+  every workload now clears the bar, c1 for the first time.
+- SHA SEMANTICS: c1 shas (8c58a4c6 spec / f497f4a9 spec-2500x64) are
+  the promoted-canonical bit-exactness anchors. The NO-SPEC kernel
+  anchors (c1 fa58598b, 2500x64 aedef4ec) remain the kernel-gate
+  references — reproduce them by flipping the profile to
+  speculative: false. Concurrency first-shas are composition-timeline
+  dependent under the adaptive config (UPDATE 28) — treat c4/c8 as TPS
+  gates, not sha gates.
+- Residual: c4/c8 give back ~2-3% vs no-spec (spec-engine
+  decode_query_len=4 classifies 1-token decodes as non-uniform ->
+  extend path; transitional solo-spec steps). Recorded micro-lever,
+  parked behind Muse/N6.
+- Next: Muse single-CB step loop, then N6 TurboQuant KV, N7
+  decommission gate.
+- Raw: perf/results/2026-08-21/adaptive_spec_gate/ (ad_/ad2_/pr_) +
+  anchor_regate_adaptive/. Notebook: UPDATE 28.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, GEMMA-NORM baseline pinned 2026-08-21 (fused target-layer norms; c8 passes the old no-spec)
+
+- Change vs ADAPTIVE-SPEC: the 128 per-step GemmaRMSNorm target-layer
+  norms route to new Metal kernels (gemma_rms_norm_dyn /
+  gemma_rms_norm_add_dyn — exact ir-chain semantics, UPDATE 30).
+  metallib + .so rebuilt; DSV4 anchors bit-exact (12th consecutive,
+  anchor_regate_gemmanorm/).
+
+| workload | ADAPTIVE (UPDATE 28) | GEMMA-NORM canonical |
+| --- | ---: | ---: |
+| c1 1000/256 | 13.651 / 13.62 8c58a4c6 | 13.900 / 13.912 (sha 8c58a4c6 HELD 2/2, +1.9%) |
+| c4 1000/256 | 20.104 | 20.612 / 20.657 (+2.6%) |
+| c8 1000/256 | 23.275 / 23.26 | 23.844 / 23.843 (+2.5%, ABOVE old no-spec 23.74) |
+| c1 2500/64 | 3.229 f497f4a9 | 3.248 / 3.247 (sha ROLLED to d0e07ddd 2/2, +0.6%) |
+
+- vs Q4_K M4c bar: c1 124.5%, c4 123.9%, c8 136.9% — the adaptive
+  canonical now beats BOTH the bar and the old no-spec numbers at every
+  measured workload.
+- CANONICAL ANCHOR SHAS: c1 8c58a4c6 (held), 2500x64 d0e07ddd (rolled,
+  deterministic 2/2, predicted ulp class — UPDATE 30). NO-SPEC kernel
+  anchors via speculative:false are STALE for 2500x64 after this build
+  (re-derive on next no-spec gate); c4/c8 remain TPS gates.
+- Next: CPU time profile of EngineCore during c1-spec decode (the ~115
+  ms/step host budget), then async-sched overlap vs Muse whole-step
+  encode. Raw: perf/results/2026-08-21/gemmanorm_gate/. Notebook:
+  UPDATE 30.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, SYNCFIX+ASYNC baseline pinned 2026-08-21 (queue-drain fix + async scheduling promoted)
+
+- Changes vs GEMMA-NORM: (1) postprocess_state MPS scatter made
+  sync-free (the boolean-mask index drained the whole GPU queue every
+  spec step — UPDATE 31); (2) async scheduling enabled for dflash
+  (whitelist + VLLM_METAL_ASYNC_SCHED=1 promoted into both qwen profile
+  envs — UPDATE 32). Python-only; DSV4 path untouched; every sha
+  BIT-EXACT through both gates.
+
+| workload | GEMMA-NORM | SYNCFIX+ASYNC canonical |
+| --- | ---: | ---: |
+| c1 1000/256 | 13.900 / 13.912 | 14.252 / 14.269 (sha 8c58a4c6 2/2) |
+| c4 1000/256 | 20.612 / 20.657 | 21.438 / 21.453 |
+| c8 1000/256 | 23.844 / 23.843 | 24.520 / 24.520 |
+| c1 2500/64 | 3.248 / 3.247 | 3.297 / 3.300 (sha d0e07ddd 2/2) |
+
+- vs Q4_K M4c bar: c1 127.8%, c4 129.2%, c8 140.8%. Session cumulative
+  vs the N5b no-spec start: c1 +29%, c4 +3.7%, c8 +3.3%, 2500x64 +10.7%.
+- Note: async costs ~0.7% on 2500x64 vs the sync-fix build (3.313/3.328)
+  — accepted for the c4/c8 wins; c1 flat.
+- CANONICAL ANCHOR SHAS unchanged: c1 8c58a4c6, 2500x64 d0e07ddd.
+- Next: async-mode cProfile census for the residual in-worker c1
+  serializer; then N6 TurboQuant KV. Raw:
+  perf/results/2026-08-21/{syncfix_gate, async_sched_gate}/. Notebook:
+  UPDATEs 31-32.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, SYNC-HUNT baseline pinned 2026-08-21 (bound-mode metal_attn + GDN builder index_select; c1 14.80)
+
+- Changes vs SYNCFIX+ASYNC: (1) metal_attn sync-free metadata — lazy
+  exact host lens + bound-mode draft SDPA with a GPU visibility mask
+  (UPDATE 33; spec c1 sha rolled 8c58a4c6 -> 467b35c3, predicted ulp
+  class, deterministic); (2) gdn_attn spec-branch boolean-mask indexing
+  replaced with CPU-nonzero + index_select (UPDATE 34, bit-exact);
+  (3) gdn_attn repeat_interleave -> static segment-id (UPDATE 35,
+  bit-exact, perf-NEUTRAL — confirmed 14.713/14.710 c1, 3.374/3.380
+  2500x64, 21.56/21.52 c4, 24.594/24.599 c8; kept, wait relocated).
+  All Python-only; DSV4 untouched.
+
+| workload | SYNCFIX+ASYNC | SYNC-HUNT canonical |
+| --- | ---: | ---: |
+| c1 1000/256 | 14.252 / 14.269 | 14.788 / 14.801 (sha 467b35c3 2/2) |
+| c4 1000/256 | 21.438 / 21.453 | 21.592 / 21.610 |
+| c8 1000/256 | 24.520 / 24.520 | 24.628 / 24.649 |
+| c1 2500/64 | 3.297 / 3.300 | 3.371 / 3.378 (sha d0e07ddd 2/2) |
+
+- vs Q4_K M4c bar: c1 132.5%, c4 130.1%, c8 141.5%. Session cumulative
+  vs the no-spec start: c1 +33.8%, c4 +4.5%, c8 +3.8%, 2500x64 +13.4%.
+- CANONICAL ANCHOR SHAS: c1 467b35c3, 2500x64 d0e07ddd.
+- KEY OPS FACT (recurring): any GPU-tensor op with a data-dependent
+  output shape (boolean-mask indexing, nonzero, blocking D2H .to) drains
+  the ENTIRE in-flight MPS queue. Find them with the cProfile census
+  (VLLM_QC_PYPROF=1) — sync-bracketed profilers cannot see them.
+- SYNC-HUNT PARKED (UPDATE 35): census round 4 found the relocated wait
+  (repeat_interleave), the static-shape fix gated NEUTRAL — the last
+  drain in the chain absorbs the queue tail, diminishing returns
+  confirmed. Next: N6 TurboQuant KV, then N7 decommission gate. Raw:
+  perf/results/2026-08-21/{boundmode_gate, gdnsync_gate, rilv_gate}/.
+  Notebook: UPDATEs 33-35.
+- N6 TURBOQUANT KV GATE 1 PASSED (UPDATE 36): profile qwen38-nvfp4-1-tq
+  (TURBOQUANT backend + turboquant_k8v4 on target's 16 full-attn layers
+  AND the DFlash2 drafter; GDN fp32 unchanged) is quality-gated: needle
+  exact at 4.5k multi-chunk, deterministic 2/2 (c1 0c92d6e3, 2500x64
+  4494d8e6 — profile-local pins). TPS tax vs canonical: c1 -11.3%
+  (13.12), 2500x64 -13.4% (2.93), c4 -8.7%, c8 -6.0%. KV 4096 -> 1728
+  B/token (~2.4x). CANONICAL DEFAULT UNCHANGED. Required fixing a
+  latent GQA head-mapping bug in tq_attention_combined (head % Hkv ->
+  head / (Hq/Hkv)) — the Metal TQ kernels had never been production-
+  exercised; metallib rebuilt, DSV4 anchors re-gated BIT-EXACT (13th
+  consecutive: 573db39598e7 / bb83cc3054a3 / f75e1d41ac3d). CAPACITY
+  PAYOFF (same 16 GiB budget): TQ 292,882 KV tokens / 8.94x @32k vs
+  canonical 158,038 / 4.82x — 1.85x. Raw:
+  perf/results/2026-08-21/{tq_gate, anchor_regate_tqfix}/. Notebook:
+  UPDATE 36.
+- N7 DECOMMISSION DONE (UPDATE 37): profile qwen38-1 + source
+  qwen38-27b (GGUF) RETIRED from the registry — every leg beats the
+  Q4_K bar (132.5%/130.1%/141.5%/103.3%) and canonical needle recall
+  is exact. The Q4_K bar rows above stay as the historical baseline.
+  q4_K kernels remain in QuixiCore-Metal. NVFP4 is the sole Qwen3.8
+  serving line (canonical + -df2 + -tq experimental).
+- N8 262K LONG-CTX VALIDATED on -tq via the new Metal TQ dequant
+  continuation route (UPDATEs 38-39): tq_decode_combined kernel +
+  turboquant_dequant_kv_metal binding + dequant->SDPA/KV-tiled-softmax
+  continuation (>128-token chunks; synthetic-decode retained below).
+  Ladder at --ctx 262144, needle exact at EVERY depth: 16k=111 s (was
+  406 s synthetic-decode), 65k=577 s, 131k=1492 s, 262k=4493 s at
+  259,888 prompt tokens. Prefill cost model T(C) ~= 6.4e-3*C +
+  3.9e-8*C^2 (quadratic constant 59x smaller). Short-ctx -tq re-gate:
+  c1 13.08 sha 0c92d6e3 BIT-EXACT vs UPDATE 36 pin (no continuation on
+  that leg); 2500x64 3.278/3.268 sha d0e07ddd = the CANONICAL sha, gap
+  -13.4% -> -3.0%; c4 -7.2%; c8 -2.1%. DSV4 anchors BIT-EXACT 14th
+  consecutive post metallib+.so rebuild. CANONICAL DEFAULT UNCHANGED at
+  32k (c1 decode-side TQ tax -11.6% remains). 1M parked: out of native
+  rope spec (max_position_embeddings 262144) + needs ~40 GiB KV budget.
+  Raw: perf/results/2026-08-21/{anchor_regate_dequant, tq_dequant_gate,
+  tq_longctx2}/. Notebook: UPDATEs 38-39.
+- #16b SPLIT-K TQ DECODE ATTENTION RETAINED (UPDATE 40, 2026-08-21):
+  tq_attention_splitk + tq_attention_reduce (PA256-style split-K, one
+  simdgroup per token, zero token-loop barriers, block-table direct)
+  replace the monolithic tq_attention_combined on the Metal hs256
+  decode route (VLLM_QC_TQ_SPLITK=0 kill-switch; hs64/128 stay
+  monolithic so DSV4 pins hold by construction). Kernel 12-33x;
+  effective KV bandwidth ~7 -> ~220 GB/s; TQ decode now FASTER than
+  canonical bf16 PA256 at every shape (2x at 32k ctx). -tq profile
+  pins after the change: c1 1000x256 14.688/14.685 sha 228d0bf4 2/2
+  (was 13.08/0c92d6e3; -11.6% tax now -0.8%); 2500x64 3.459/3.448
+  sha d0e07ddd 2/2 (CANONICAL sha held; +2.1% ABOVE canonical);
+  tail 2100x32 2.174/2.171 sha 1337d2f7 2/2 (new leg); c4 22.106
+  (+2.2% above canonical); c8 25.148 (+2.0% above canonical); 4.5k
+  needle exact; 16k needle exact at the 262k config (110 s wall).
+  DSV4 anchors BIT-EXACT 15th consecutive (anchor_regate_tqsk/).
+  -tq now beats canonical on 3 of 4 legs — canonical-default flip is
+  a flagged decision (quality call, not TPS). Raw:
+  perf/results/2026-08-21/{tq_splitk_bench, tq_splitk_gate,
+  tq_splitk_longctx, anchor_regate_tqsk}/. Notebook: UPDATE 40.
+- N9 ROPE QUEUE-DRAIN FIX RETAINED (UPDATE 41, 2026-08-24): the mrope
+  torch replacement's repeat_interleave (data-dependent output shape)
+  drained the whole in-flight MPS queue once per step — 65.8 ms/step,
+  64% of the host profile. Replaced with the static-shape
+  scatter+cumsum token->request map (metal_compat.py, python-only;
+  VLLM_QC_ROPE_STATIC=0 null switch validated bit-exact). NEW
+  CANONICAL BASELINE qwen38-nvfp4-1: c1 16.139 sha 467b35c3
+  BIT-EXACT (144.5% of the Q4_K bar; was 14.80) / c4 23.16 (139.5%)
+  / c8 25.62 (147.1%) / 2500x64 3.454 sha d0e07ddd BIT-EXACT. -tq:
+  c1 16.08 sha 228d0bf4 BIT-EXACT (-0.3% vs canonical); c4/c8/2500x64
+  not yet re-measured post-rope (UPDATE 40 values 22.11/25.15/3.45).
+  DSV4 8tok anchor BIT-EXACT (python change, no binary rebuild; full
+  anchor chain not required). Raw: perf/results/2026-08-24/
+  {rope_gate, anchor_leg_rope}/. Notebook: UPDATE 41.
+- OPS (UPDATE 42, 2026-08-24): tmp cleaner destroyed m2_source.txt +
+  dsv4_gate.py + build recipes; all recovered byte-exact (m2_source
+  reconstruction PROVEN by a null boot reproducing c1 467b35c3 and
+  2500x64 d0e07ddd). Stable home: perf/results/harness_assets/ — all
+  future chains must use that path. Notebook: UPDATE 42.
+- N10 STEADY-CACHE METADATA RETAINED (UPDATE 43, 2026-08-24): the
+  mamba-hybrid attn-metadata rebuild (GDN builder 8.2 ms/step, 10
+  group builds x ~30 ops) is skipped on steady uniform all-spec decode
+  steps: MambaHybridAttnMetadata.steady_signature() folds into the
+  steady shape sig, GDN steady_decode_update refreshes just
+  spec_state_indices + num_accepted (2 copies), metal/tq full-attn
+  builders rebuild from the cached CommonAttentionMetadata with
+  cm.seq_lens_cpu_upper_bound refreshed in place (the runner
+  allocates that bound fresh each step — a frozen cached view
+  silently truncated decode attention windows in gate round 2;
+  root-caused via deterministic sha roll ac33cee5, fixed, re-gated).
+  Python-only, VLLM_QC_STEADY_META=0 null switch (proven identical to
+  UPDATE 41: 16.153 sha 467b35c3). NEW CANONICAL BASELINE
+  qwen38-nvfp4-1: c1 16.334/16.346 sha 467b35c3 BIT-EXACT (146.3% of
+  the Q4_K bar; was 16.139) / c4 23.02 (-0.6%, noise — hits rare
+  under composition churn) / c8 25.57 (-0.2%, noise) / 2500x64
+  3.444/3.452 sha d0e07ddd BIT-EXACT. -tq: c1 16.216/16.210 sha
+  228d0bf4 BIT-EXACT (+0.8% vs 16.08). Canon + TQ 262k needles both
+  exact. Round-1 lesson: upstream steady eligibility deref'd
+  is_prefilling=None on this path (engine-dead crash; ramp helpers
+  must verify generated text, not HTTP success). Raw:
+  perf/results/2026-08-24/steady_gate/. Notebook: UPDATE 43.
+- N11a FUSED DFLASH2 GROUPED CONV RETAINED (UPDATE 44, 2026-08-24):
+  qc_dflash_conv kernel (serving/dflash_conv/) — one dispatch replaces
+  the ~10-op eager chain per _grouped_conv call (~200 encodes/step
+  across 4 calls x 5 drafter layers; the pad/arange/mask ops go with
+  it). Kernel parity 37/37 BIT-EXACT vs the eager chain (per-op
+  fp32-round mirror of MPS elementwise semantics), so drafts and
+  acceptance are bit-identical — the serving delta is pure host-encode
+  recovery. VLLM_QC_DFLASH_CONV=0 restores eager (null boot proven =
+  UPDATE 43: 16.337 sha 467b35c3). Metallib + .so rebuilt: DSV4
+  anchors ALL BIT-EXACT 2/2 each, 17th consecutive
+  (anchor_regate_dflashconv/). NEW CANONICAL BASELINE qwen38-nvfp4-1:
+  c1 16.428/16.438 sha 467b35c3 BIT-EXACT (+0.6%, 147.1% of the Q4_K
+  bar) / c4 23.111 / c8 25.615 / 2500x64 3.454 sha d0e07ddd BIT-EXACT;
+  needle exact. Calibration reconfirmed: the eager conv's 5-7 ms/step
+  profiler share was mostly absorbed queue-tail wait — dispatch
+  elimination recovered ~1 ms/step (~5 us marginal encode x ~200).
+  Raw: perf/results/2026-08-24/{anchor_regate_dflashconv,
+  dflash_conv_gate}/. Notebook: UPDATE 44.
+- N11b PURE-PREFILL CAUSAL SDPA BOUND RETAINED (UPDATE 45,
+  2026-08-24): all-prefill batches read the CPU bound (row-exact
+  there — the async mirror only diverges on spec-decode rows) in the
+  causal SDPA loop instead of the queue-draining seq_lens D2H (census:
+  3.43 s over 12 calls, concentrated in multi-chunk prefills — a
+  long-context TTFT tax, not leg TPS). Python-only,
+  VLLM_QC_SDPA_PREFILL_BOUND=0 null proven = UPDATE 44. Gate: DSV4
+  8tok prudence 573db39598e7 BIT-EXACT 2/2; canonical needle exact;
+  c1 16.414/16.438 sha 467b35c3 BIT-EXACT; 2500x64 3.465/3.465 sha
+  d0e07ddd BIT-EXACT (+0.3% — the predicted +2-7% missed: the 2500
+  prompt is single-chunk; the drain lives in multi-chunk prefills);
+  c4 23.106 / c8 25.60. CANONICAL BASELINE unchanged from UPDATE 44
+  numbers (c1 16.43-class); the win books as multi-chunk prefill
+  TTFT. Raw: perf/results/2026-08-24/sdpa_bound_gate/. Notebook:
+  UPDATE 45.
+- -TQ RE-MEASURE ON THE U43-U45 STACK (UPDATE 46, 2026-08-24,
+  measurement only): c1 16.182/16.240 sha 228d0bf4 BIT-EXACT (-1.2%
+  vs canonical 16.43); 2500x64 3.512/3.506 sha d0e07ddd (CANONICAL
+  sha, +1.4%); c4 23.715/23.615 (+2.4%); c8 26.053/26.090 (+1.8%);
+  needle exact. -tq now beats canonical on every leg above c1 with
+  2.4x KV capacity; the default-flip decision (quality call, k8v4
+  cos ~0.9955 floor) has fully current data. Raw:
+  perf/results/2026-08-24/tq_remeasure/. Notebook: UPDATE 46.
+- N11c DRAFT-BLOCK PAGED ATTENTION REJECTED (UPDATE 47, 2026-08-24):
+  routing the drafter's non-causal SWA blocks through the expanded
+  paged kernel lost TPS everywhere (c1 -7.7%, 2500x64 -4.1% with a
+  ULP-trajectory fork to the old 95adbd97, c4/c8 noise-down). Two
+  causes, both measured: kernel-vs-SDPA reduction order shifts the
+  DFlash 16-way candidate/path selection (acceptance 1.59 -> 1.54
+  accepted/draft), and the kernel is slower than one-request SDPA at
+  draft shapes. Default flipped to opt-in (VLLM_QC_DRAFT_BLOCK_PA=1),
+  branch quarantined as a documented diagnostic; revert cycle
+  reproduced canonical exactly (c1 16.426 sha 467b35c3, box serving).
+  KEY LESSON: drafter math is NOT reduction-order-tolerant — the
+  candidate selector amplifies ULP noise into acceptance loss; only
+  bit-exact or measured-neutral drafter changes are safe. CANONICAL
+  BASELINE unchanged (UPDATE 44 numbers). Raw:
+  perf/results/2026-08-24/draft_block_pa_gate/. Notebook: UPDATE 47.
+- N12 FUSED QK-NORM-ROPE-GATE REJECTED/PARKED (UPDATE 48, 2026-08-24):
+  qc_qk_norm_rope_gate (one dispatch replacing ~25/attn-layer) is
+  bit-exact at decode shapes but torch-MPS eager numerics are
+  SIZE-DEPENDENT — T=1000 prefill diverges by ~5 ppm single-ulp
+  elements, forking the canonical trajectory (c1 d7c66851, -1.8%
+  content-confounded; c4 +1.2% / c8 +0.7%). Not worth a full re-pin;
+  default OFF, opt-in VLLM_QC_QKROPE=1. DSV4 anchors bit-exact 18th
+  consecutive (rebuild cleared); null boot + revert cycle reproduce
+  canonical exactly (16.412/16.437 sha 467b35c3, counters replay).
+  KEY LESSON: validate kernel parity at SERVING shapes incl. prefill
+  T — per-shape bit-exactness does not transfer across sizes on MPS.
+  CANONICAL BASELINE unchanged (UPDATE 44 numbers). Raw:
+  perf/results/2026-08-24/{qkrope_gate, anchor_regate_qkrope}/.
+  Notebook: UPDATE 48.
+- N13 ONE-DISPATCH KV INSERT RETAINED (UPDATE 49, 2026-08-24):
+  kv_cache_scatter kernel bound and routed (block_mult=2 page-local
+  variant; slot<0 skipped) — 5 torch ops -> 1 dispatch per attention
+  layer (~80 encodes/step). Pure copies, bit-exact at any shape (the
+  U48 size-dependence trap cannot apply). Gate: DSV4 anchors
+  bit-exact 19th consecutive (kernel live in DSV4 drafter writes);
+  c1 16.443/16.440 sha 467b35c3 BIT-EXACT / 2500x64 3.456/3.459 sha
+  d0e07ddd BIT-EXACT / needle exact / c4 23.13 c8 25.62; TPS flat
+  within noise (retained on proven equivalence + dispatch hygiene).
+  VLLM_QC_KV_SCATTER=0 restores the torch path. CANONICAL BASELINE:
+  c1 16.44-class sha 467b35c3 (147.2% of the Q4_K bar). Raw:
+  perf/results/2026-08-24/{kvscatter_gate, anchor_regate_kvscatter}/.
+  Notebook: UPDATE 49.
+
+## Qwen3.8-27B NVFP4 — Metal M1 Ultra, MUSE SINGLE-CB baseline pinned 2026-08-24 (UPDATE 53; N14 default flip, c1 at the modeled ceiling)
+
+- Profile `qwen38-nvfp4-1` with VLLM_QC_MUSE=1 in the profile env (the
+  whole 64-layer target forward + final norm + drafter aux taps encoded
+  into ONE command buffer on eligible uniform spec-decode batches,
+  m <= 8; everything else eager bit-exactly). Kill switch VLLM_QC_MUSE=0
+  restores the UPDATE 49 canonical.
+- c1 1000x256: **17.068 / 17.142 tok/s, sha 467b35c3 BIT-EXACT with the
+  pre-muse canonical** (+4.1% over 16.44; 154.4% of the Q4_K bar).
+  c1 = the N3-era modeled bandwidth ceiling (~17 tok/s).
+- 2500x64: 3.448 / 3.459, sha aa448847 deterministic 2/2 (the one
+  re-pinned leg; TPS flat vs canonical 3.46; 30k needle EXACT).
+- c4 23.12 / c8 25.59 (m > 8 -> eager fallback; shas match the
+  canonical tie-carriers).
+- DSV4 anchors bit-exact on the final build (24th consecutive):
+  8tok 573db39598e7, off1-2000 bb83cc3054a3, 2500x64 f75e1d41ac3d.
+- Null boot (VLLM_QC_MUSE unset pre-flip build): c1 16.419 sha 467b35c3.
+- Raw: perf/results/2026-08-24/{muse_shadow_gate, anchor_regate_muse_p2}/.
+- AUDIT REBUILD RE-GATE (UPDATE 54, 2026-08-25): pre-PR audit cleanup
+  (dead muse_silu_mul_rows kernel deleted, NANPROBE harness removed,
+  steady-cache conv_slots invalidation, host-side validation added);
+  metallib + .so rebuilt. ALL PINS BIT-EXACT: DSV4 anchors 2/2 x3 (25th
+  consecutive), c1 17.117/17.142 sha 467b35c3, 2500x64 3.453/3.434 sha
+  aa448847, needle exact. Raw: perf/results/2026-08-25/
+  {anchor_regate_audit, audit_regate}/.
