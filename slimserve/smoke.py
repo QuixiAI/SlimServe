@@ -123,15 +123,22 @@ def resolve_profiles(
 
 
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
-    """Require the resolved, executable plan to use DSpark and TurboQuant."""
+    """Require the resolved plan to match its registered speculator exactly.
+
+    Every profile registers a drafter (DSpark with a TurboQuant draft KV, a
+    DFlash block drafter, or a checkpoint's own MTP head); the resolved
+    executable configuration must carry every registered engine setting.
+    """
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
-    required = {
-        "method": "dspark",
-        "attention_backend": "TURBOQUANT",
-        "kv_cache_dtype": "turboquant_k8v4",
-    }
+    registered = plan.source["speculator"]["engine"]
+    required = dict(registered)
+    if registered.get("method") == "dspark":
+        required.update(
+            attention_backend="TURBOQUANT",
+            kv_cache_dtype="turboquant_k8v4",
+        )
     mismatches = {
         key: speculative.get(key)
         for key, expected in required.items()
@@ -175,7 +182,9 @@ def _request(
             plan.engine.get("served_model_name", "model"),
             messages,
             max_tokens=max_tokens,
-            temperature=0.0,
+            # No sampling overrides: the model's shipped defaults apply.
+            # Seeded for repeatable smoke answers; greedy is never used.
+            seed=42,
             chat_template_kwargs=plan.chat_template_kwargs or None,
             timeout=timeout,
         )
@@ -247,9 +256,10 @@ def run_profile(
         "quant": plan.quant.name,
         "gpus": plan.gpus,
         "modalities": plan.source["modalities"],
-        "dspark_tokens": speculative["num_speculative_tokens"],
-        "draft_attention_backend": speculative["attention_backend"],
-        "draft_kv_cache_dtype": speculative["kv_cache_dtype"],
+        "speculative_method": speculative.get("method"),
+        "speculative_tokens": speculative["num_speculative_tokens"],
+        "draft_attention_backend": speculative.get("attention_backend"),
+        "draft_kv_cache_dtype": speculative.get("kv_cache_dtype"),
         "load_seconds": loaded - started,
         "text": text_result,
         "image": image_result,

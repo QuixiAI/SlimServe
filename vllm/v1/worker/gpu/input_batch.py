@@ -249,9 +249,7 @@ def _prepare_prefill_inputs_kernel(
         tl.store(next_prefill_tokens_ptr + req_state_idx, next_token)
 
 
-def mps_segment_ids(
-    cu: torch.Tensor, num_segments: int, total: int
-) -> torch.Tensor:
+def mps_segment_ids(cu: torch.Tensor, num_segments: int, total: int) -> torch.Tensor:
     """Row id per element for CSR-style int64 boundaries, with no host syncs.
 
     Marks each interior segment start with scatter_add and prefix-sums the
@@ -304,9 +302,7 @@ def prepare_prefill_inputs(
         local = token_arange - qsl[:-1].index_select(0, seg)
         row_state = idx.index_select(0, seg)
         row_capacity = all_token_ids.shape[1]
-        src_col = (computed.index_select(0, seg) + local).clamp(
-            max=row_capacity - 1
-        )
+        src_col = (computed.index_select(0, seg) + local).clamp(max=row_capacity - 1)
         tokens = all_token_ids.view(-1).index_select(
             0, row_state * row_capacity + src_col
         )
@@ -327,12 +323,8 @@ def prepare_prefill_inputs(
             0, idx * row_capacity + next_pos.clamp(max=row_capacity - 1)
         )
         num_states = next_prefill_tokens.shape[0]
-        next_dst = torch.where(
-            has_next, idx, torch.full_like(idx, num_states)
-        )
-        next_padded = torch.cat(
-            [next_prefill_tokens, next_prefill_tokens.new_zeros(1)]
-        )
+        next_dst = torch.where(has_next, idx, torch.full_like(idx, num_states))
+        next_padded = torch.cat([next_prefill_tokens, next_prefill_tokens.new_zeros(1)])
         next_padded[next_dst] = next_tokens.to(next_padded.dtype)
         next_prefill_tokens.copy_(next_padded[:num_states])
         return
@@ -421,10 +413,9 @@ def prepare_pos_seq_lens(
             num_tokens = int(qsl[num_reqs].cpu())
         if num_tokens:
             seg = mps_segment_ids(qsl, num_reqs, num_tokens)
-            local = (
-                torch.arange(num_tokens, dtype=torch.int64, device=device)
-                - qsl[:-1].index_select(0, seg)
-            )
+            local = torch.arange(num_tokens, dtype=torch.int64, device=device) - qsl[
+                :-1
+            ].index_select(0, seg)
             pos[:num_tokens].copy_(
                 (computed.index_select(0, seg) + local).to(pos.dtype)
             )
@@ -546,10 +537,9 @@ def combine_sampled_and_draft_tokens(
         qsl = query_start_loc[: num_reqs + 1].to(torch.int64)
 
         seg = mps_segment_ids(cu, num_reqs, num_logits)
-        local = (
-            torch.arange(num_logits, dtype=torch.int64, device=device)
-            - cu[:-1].index_select(0, seg)
-        )
+        local = torch.arange(num_logits, dtype=torch.int64, device=device) - cu[
+            :-1
+        ].index_select(0, seg)
         nl_req = cu[1:] - cu[:-1]
         input_start_req = qsl[1:] - nl_req
         torch.add(input_start_req.index_select(0, seg), local, out=logits_indices)
@@ -787,17 +777,23 @@ def post_update(
         write_mask = (cols < counts.unsqueeze(1)) & valid_req.unsqueeze(1)
         old_total = total_len.index_select(0, safe_idx).to(torch.int64)
 
-        scratch = max_reqs * row_capacity
-        flat_dst = (
-            safe_idx.unsqueeze(1) * row_capacity + old_total.unsqueeze(1) + cols
+        flat = all_token_ids.view(-1)
+        flat_dst = safe_idx.unsqueeze(1) * row_capacity + old_total.unsqueeze(1) + cols
+        # In-place masked scatter. Masked lanes are redirected to flat cell 0
+        # and write back that cell's current value, so the write is a no-op
+        # there and no full-matrix scratch copy is needed. Cell 0 holds
+        # request 0's first prompt token, which no valid write can target
+        # (old_total >= 1 for any live request), and every masked lane
+        # writes the identical gathered value, so the duplicate writes are
+        # benign.
+        flat_dst = torch.where(write_mask, flat_dst, torch.zeros_like(flat_dst))
+        cur_vals = flat.index_select(0, flat_dst.view(-1))
+        new_vals = torch.where(
+            write_mask.view(-1),
+            sampled_tokens.to(flat.dtype).view(-1),
+            cur_vals,
         )
-        flat_dst = torch.where(
-            write_mask, flat_dst, torch.full_like(flat_dst, scratch)
-        )
-        padded = all_token_ids.new_zeros(scratch + 1)
-        padded[:scratch] = all_token_ids.view(-1)
-        padded[flat_dst.view(-1)] = sampled_tokens.to(padded.dtype).view(-1)
-        all_token_ids.view(-1).copy_(padded[:scratch])
+        flat[flat_dst.view(-1)] = new_vals
 
         gather_pos = (counts - 1).clamp(min=0).unsqueeze(1)
         last_tok = sampled_tokens.gather(1, gather_pos).squeeze(1)
@@ -831,12 +827,8 @@ def post_update(
             query_lens = qsl[1:] - qsl[:-1]
         else:
             query_lens = torch.zeros(num_reqs, dtype=torch.int64, device=device)
-        delta = (query_lens - num_rejected.to(torch.int64)) * valid_req.to(
-            torch.int64
-        )
-        num_computed_tokens.index_add_(
-            0, safe_idx, delta.to(num_computed_tokens.dtype)
-        )
+        delta = (query_lens - num_rejected.to(torch.int64)) * valid_req.to(torch.int64)
+        num_computed_tokens.index_add_(0, safe_idx, delta.to(num_computed_tokens.dtype))
         return
     if _use_native("post_update"):
         from vllm.quixicore import quixicore_ops
@@ -954,9 +946,7 @@ def expand_idx_mapping(
         seg = mps_segment_ids(cu, num_reqs, total_num_logits)
         expanded_idx_mapping = idx_mapping.index_select(0, seg)
         expanded_local_pos = (
-            torch.arange(
-                total_num_logits, dtype=torch.int64, device=idx_mapping.device
-            )
+            torch.arange(total_num_logits, dtype=torch.int64, device=idx_mapping.device)
             - cu[:-1].index_select(0, seg)
         ).to(torch.int32)
         return expanded_idx_mapping, expanded_local_pos

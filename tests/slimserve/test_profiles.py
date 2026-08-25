@@ -26,7 +26,8 @@ def _big_enough(profile_id: str, platform: str) -> int:
         return 0
     entry = registry.describe(profile_id)
     source = registry._registry()["sources"][entry["source"]]
-    return source["quants"][entry["default_quant"]]["min_memory_bytes"][platform]
+    default_quant = registry.variant(profile_id, platform)["default_quant"]
+    return source["quants"][default_quant]["min_memory_bytes"][platform]
 
 
 def test_every_profile_resolves_on_a_platform_it_claims():
@@ -49,8 +50,9 @@ def test_every_profile_uses_dspark_with_turboquant():
                 assert "speculative_config" not in engine_kwargs(plan)
                 continue
             config = engine_kwargs(plan)["speculative_config"]
-            source = registry._registry()["sources"][entry["source"]]
-            registered = source["speculator"]["engine"]["method"]
+            # The variant may override the source drafter (qwen38-nvfp4-1:
+            # MTP on MI300X, DFlash2 on Metal).
+            registered = plan.speculator["engine"]["method"]
             assert config["method"] == registered
             if registered == "dspark":
                 assert config["attention_backend"] == "TURBOQUANT"
@@ -59,17 +61,28 @@ def test_every_profile_uses_dspark_with_turboquant():
 
 def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     plan = resolve("dsv4-q4ktail-2", "a100", 2, "IQ2_XXS")
-    monkeypatch.setattr(cli.hardware, "detect", Mock(return_value=Mock(
-        known=True,
-        platform="a100",
-        count=2,
-        memory_bytes=0,
-        device_name="A100",
-    )))
+    monkeypatch.setattr(
+        cli.hardware,
+        "detect",
+        Mock(
+            return_value=Mock(
+                known=True,
+                platform="a100",
+                count=2,
+                memory_bytes=0,
+                device_name="A100",
+            )
+        ),
+    )
     monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=plan))
     monkeypatch.setattr(cli.fetch, "ensure", Mock())
     seen = []
-    monkeypatch.setattr(cli, "_chat", lambda resolved, *_args: seen.append(resolved) or 0)
+
+    def _capture_chat(resolved, *_args):
+        seen.append(resolved)
+        return 0
+
+    monkeypatch.setattr(cli, "_chat", _capture_chat)
 
     assert cli.main(["dsv4-q4ktail-2", "--quant", "IQ2_XXS", "--no-spec"]) == 0
     assert len(seen) == 1
@@ -91,6 +104,19 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
+    assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-27b-nvfp4"]["modalities"] == ["text", "image"]
+
+
+def test_qwen38_uses_measured_metal_speculation_settings():
+    plan = resolve("qwen38-q2kxl-1", "metal", 1, None, 2**37)
+    speculative = validate_acceleration(plan)
+
+    assert speculative["method"] == "dflash"
+    assert speculative["num_speculative_tokens"] == 3
+    assert speculative["quantization"] == "gguf"
+    assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
 def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
@@ -105,7 +131,9 @@ def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
 
     assert set(compatible) == expected
     assert {"k3-xxs-6", "k3-xxs-8"}.issubset(compatible)
-    assert {"dsv4-xxs-1", "dsv4-q4ktail-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(compatible)
+    assert {"dsv4-xxs-1", "dsv4-q4ktail-2", "dsv4-mxfp4-4", "dsv4-q4k-8"}.issubset(
+        compatible
+    )
 
 
 def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
@@ -113,6 +141,11 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
     for profile_id in compatible_profile_ids(machine):
         plan = resolve(profile_id, "mi300x", 8, None)
         speculative = validate_acceleration(plan)
+        if profile_id == "qwen38-nvfp4-1":
+            # The checkpoint ships its own MTP head; there is no separate
+            # DSpark artifact or TurboQuant draft cache to require.
+            assert speculative["method"] == "qwen3_5_mtp"
+            continue
         assert speculative["method"] == "dspark"
         assert speculative["attention_backend"] == "TURBOQUANT"
         assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
@@ -277,11 +310,13 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "kimi-k3",
         "dsv4-flash",
         "muse-glimmer",
+        "qwen38-27b",
         "qwen38-27b-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
     deepseek = data["sources"]["dsv4-flash"]
+    muse = data["sources"]["muse-glimmer"]
     assert set(glm["quants"]) == {
         "IQ2_XXS",
         "Q2_K",
@@ -336,6 +371,27 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
     }
 
+    assert [entry["path"] for entry in muse["shared"]] == [
+        "mmproj-Muse-Glimmer-30B-Q4_K_M.gguf"
+    ]
+    assert {
+        name: (quant["bytes"], quant["files"][0]["path"])
+        for name, quant in muse["quants"].items()
+    } == {
+        "kquant-dynamic": (
+            19653960832,
+            "Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf",
+        ),
+        "kquant-17gb": (
+            16756683904,
+            "Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf",
+        ),
+    }
+    assert muse["speculator"]["file"] == {
+        "path": "dflash-Muse-Glimmer-30B-Q4_K_M.gguf",
+        "bytes": 1631208128,
+    }
+
 
 def test_kimi_uses_the_registered_q8_dspark_gguf():
     plans = [
@@ -376,12 +432,20 @@ GB = 1 << 30
 
 
 def test_nvfp4_directory_entry_resolves_to_the_model_dir():
-    """The NVFP4 quant is an HF-format directory checkpoint: --model must be
-    the folder, not files[0], and unknown entry modes must refuse loudly."""
+    """The NVFP4 quant is an HF-format directory checkpoint (source format
+    safetensors): --model must be the folder, not files[0]."""
     plan = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
     assert plan.entry_file == plan.model_dir
-    with pytest.raises(ProfileError, match="entry mode"):
-        registry._validated_entry("dir")
+
+
+def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
+    """MI300X reuses the checkpoint's own MTP head; Metal serves the DFlash2
+    drafter that measured +23% at c1 (variant-level speculator override)."""
+    metal = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert metal.speculator["engine"]["method"] == "dflash"
+    assert metal.speculator["repo"] == "z-lab/Qwen3.8-27B-DFlash2"
+    mi300x = resolve("qwen38-nvfp4-1", "mi300x", 1, None)
+    assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():
@@ -517,9 +581,7 @@ def test_engine_kwargs_drop_server_only_settings():
 def _all_plans():
     for profile_id in registry.profile_ids():
         for platform in registry.describe(profile_id)["platforms"]:
-            yield resolve(
-                profile_id, platform, 8, None, memory_bytes=512 * 1024**3
-            )
+            yield resolve(profile_id, platform, 8, None, memory_bytes=512 * 1024**3)
 
 
 def test_every_profile_serves_thinking_and_tool_calling_by_default():
@@ -530,14 +592,9 @@ def test_every_profile_serves_thinking_and_tool_calling_by_default():
         assert kwargs["thinking"] is True, plan.profile_id
         assert kwargs["enable_thinking"] is True, plan.profile_id
         assert engine["reasoning_parser"], plan.profile_id
-        # Muse-Glimmer has no tool parser in this fork; auto tool choice
-        # stays enabled globally and no-ops without a registered parser.
-        if plan.source_key != "muse-glimmer":
-            assert engine["tool_call_parser"], plan.profile_id
+        assert engine["tool_call_parser"], plan.profile_id
         # No profile forces the chat client back out of thinking mode.
-        assert plan.chat_template_kwargs.get("thinking") is not False, (
-            plan.profile_id
-        )
+        assert plan.chat_template_kwargs.get("thinking") is not False, plan.profile_id
 
 
 def test_thinking_and_tool_defaults_are_serve_only():
@@ -603,6 +660,10 @@ def test_profiles_use_their_validated_graph_mode():
                 or platform == "metal"
             ):
                 assert cudagraph_mode == "NONE", (profile_id, platform)
+            elif profile_id == "qwen38-nvfp4-1":
+                # Qualified 2026-08-18: FULL_DECODE_ONLY capture 64 measured
+                # 1.4x at c1 on the hybrid GDN + MTP decode.
+                assert cudagraph_mode == "FULL_DECODE_ONLY", profile_id
             else:
                 assert cudagraph_mode not in (None, "NONE"), profile_id
 
@@ -691,3 +752,52 @@ def test_dsv4_flash_artifacts_are_0731_and_checksum_pinned():
             if name not in pending_pin:
                 sha = entry.get("sha256")
                 assert sha and len(sha) == 64, f"{name} missing sha256 pin"
+
+
+def test_a_profile_is_one_config_per_platform():
+    """A profile is model x quant x platform x config.
+
+    The id a user types carries no platform because the CLI detects it, so
+    every id stores one record per platform and each record states its own
+    platform. Nothing may span platforms: that is what the retired
+    `platform_overrides` block used to paper over, and it let a config tuned
+    for one platform silently stand in for another.
+    """
+    for profile_id, entry in registry._registry()["profiles"].items():
+        variants = entry.get("variants")
+        assert variants, f"{profile_id} has no per-platform records"
+        assert "platforms" not in entry, (
+            f"{profile_id} carries a platforms list; platform belongs to the "
+            "record, not the profile"
+        )
+        assert "platform_overrides" not in entry, (
+            f"{profile_id} uses platform_overrides; give each platform its "
+            "own record instead"
+        )
+        for platform, record in variants.items():
+            assert record.get("platform") == platform, (
+                f"{profile_id}/{platform} does not state its own platform"
+            )
+            assert "engine" in record and record["engine"], (
+                f"{profile_id}/{platform} has no engine settings"
+            )
+            assert "default_quant" in record, (
+                f"{profile_id}/{platform} has no default quant"
+            )
+
+
+def test_no_profile_carries_another_platforms_environment():
+    """A ROCm switch on an a100 or Metal record is a config that leaked."""
+    marker = {
+        "mi300x": ("ROCM", "AITER", "HIP_"),
+        "a100": ("CUDA_",),
+    }
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry["variants"].items():
+            for key in record.get("env") or {}:
+                for owner, tokens in marker.items():
+                    if owner == platform:
+                        continue
+                    assert not any(tok in key for tok in tokens), (
+                        f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
+                    )

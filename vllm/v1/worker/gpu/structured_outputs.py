@@ -5,7 +5,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.gpu.async_utils import stream
+from vllm.v1.worker.gpu.async_utils import make_output_copy_stream, stream
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
@@ -19,7 +19,10 @@ class StructuredOutputsWorker:
             (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device
         )
         self.device = device
-        self.copy_stream = torch.Stream(device)
+        # On MPS this is the producing stream (make_output_copy_stream):
+        # the bitmask/mapping staging otherwise cold-starts a cross-stream
+        # hand-off on the first structured-output request mid-serve.
+        self.copy_stream = make_output_copy_stream(device)
 
     def apply_grammar_bitmask(
         self,
@@ -31,13 +34,6 @@ class StructuredOutputsWorker:
         if not grammar_req_ids:
             return
 
-        # Asynchronously copy the bitmask to GPU.
-        current_stream = torch.accelerator.current_stream(self.device)
-        with stream(self.copy_stream, current_stream):
-            bitmask = async_copy_to_gpu(
-                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
-            )
-
         # Construct bitmask -> logits mapping
         mapping: list[int] = []
         req_ids = input_batch.req_ids
@@ -48,6 +44,30 @@ class StructuredOutputsWorker:
             logits_start_idx = cu_num_logits[req_idx]
             logits_end_idx = cu_num_logits[req_idx + 1]
             mapping.extend(range(logits_start_idx, logits_end_idx))
+
+        self.apply_grammar_bitmask_rows(logits, mapping, grammar_bitmask)
+
+    def apply_grammar_bitmask_rows(
+        self,
+        logits: torch.Tensor,
+        mapping: list[int],
+        grammar_bitmask: np.ndarray,
+        target_token_ids: torch.Tensor | None = None,
+    ) -> None:
+        """Apply packed target-vocabulary masks to selected logits rows.
+
+        ``target_token_ids`` maps columns of a reduced draft vocabulary to
+        target token IDs. It is omitted for ordinary target-vocabulary logits.
+        """
+        if not mapping:
+            return
+
+        # Asynchronously copy the bitmask to GPU.
+        current_stream = torch.accelerator.current_stream(self.device)
+        with stream(self.copy_stream, current_stream):
+            bitmask = async_copy_to_gpu(
+                grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
+            )
 
         # Asynchronously copy the mapping to GPU.
         with stream(self.copy_stream, current_stream):
@@ -62,14 +82,23 @@ class StructuredOutputsWorker:
             )
 
         # Ensure all async copies are complete before launching the kernel.
-        current_stream.wait_stream(self.copy_stream)
+        if self.copy_stream != current_stream:
+            current_stream.wait_stream(self.copy_stream)
 
         num_masks = bitmask.shape[0]
         assert num_masks == len(mapping)
         vocab_size = logits.shape[-1]
         from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
-        if logits.device.type == "mps":
+        if target_token_ids is not None:
+            target_token_ids = target_token_ids.to(logits.device, dtype=torch.int64)
+            masks = bitmask[:num_masks]
+            words = masks[:, target_token_ids // 32]
+            allowed = ((words >> (target_token_ids % 32)) & 1).bool()
+            selected = logits.index_select(0, logits_indices.to(torch.int64))
+            selected.masked_fill_(~allowed, float("-inf"))
+            logits.index_copy_(0, logits_indices.to(torch.int64), selected)
+        elif logits.device.type == "mps":
             masks = bitmask[:num_masks]
             bit_indices = torch.arange(vocab_size, device=logits.device)
             words = masks[:, bit_indices // 32]
@@ -100,7 +129,8 @@ class StructuredOutputsWorker:
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
-        self.copy_stream.wait_stream(current_stream)
+        if self.copy_stream != current_stream:
+            self.copy_stream.wait_stream(current_stream)
 
 
 # Adapted from

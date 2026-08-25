@@ -21,18 +21,20 @@ patched at their call sites:
 The async-output completion-event wedge (a boot's first multi-chunk prefill
 parking the engine forever in MPSEvent::synchronize -- GPU idle, signal
 never delivered) is addressed structurally in
-vllm/v1/worker/gpu/async_utils.py: on Metal the AsyncOutput classes no
-longer run the CUDA cross-stream choreography (torch.Stream(mps) always
-returns the single stream 0, so set_stream/wait_stream/generic-Event
-record were pure risk with no overlap to buy) and instead record a native
-torch.mps.Event on the one real stream; VLLM_QC_ASYNC_OUT_DRAIN=1 swaps
-that event for a full torch.mps.synchronize() drain as an ops fallback.
-History and validation evidence: perf/optimization_status.md (2026-08-14
-boot_v12 bisect, cleanup-phase bisect, 2026-08-17 fix entry). The earlier
-naive attempt -- swapping only the host-side wait for a drain while
-leaving wait_stream's GPU-side wait encoded -- moved the park and produced
-a command-buffer-timeout variant; the structural fix removes the GPU-side
-wait as well.
+``gpu/async_utils.py``: torch.Stream(mps) always returns the single
+stream 0, so the CUDA cross-stream choreography (set_stream, wait_stream,
+generic torch.Event record) was pure risk with no overlap to buy. On Metal
+the copy paths (AsyncOutput, AsyncPoolingOutput, DraftTokensHandler)
+enqueue on the producing stream via make_output_copy_stream and record a
+native torch.mps.Event there via make_completion_event;
+VLLM_QC_ASYNC_OUT_DRAIN=1 swaps that event for a full
+torch.mps.synchronize() drain as an ops fallback. History and validation:
+perf/optimization_status.md (2026-08-14 boot_v12 bisect, cleanup-phase
+bisect, 2026-08-17 fix entry -- five M1 Ultra boots, both wedge trigger
+protocols clean, all anchors bit-exact). The earlier naive attempt --
+swapping only the host-side wait for a drain while leaving wait_stream's
+GPU-side wait encoded -- moved the park and produced a
+command-buffer-timeout variant; the structural fix removes both.
 
 The race was timing-sensitive on the host side: stripping the phaseprof
 brackets and marshalling-memo conditionals from
@@ -190,8 +192,8 @@ def _patch_cpu_gpu_buffer_blocking() -> None:
             return self.cpu.copy_(self.gpu, non_blocking=False)
         return self.cpu[:n].copy_(self.gpu[:n], non_blocking=False)
 
-    CpuGpuBuffer.copy_to_gpu = copy_to_gpu
-    CpuGpuBuffer.copy_to_cpu = copy_to_cpu
+    CpuGpuBuffer.copy_to_gpu = copy_to_gpu  # type: ignore[method-assign]
+    CpuGpuBuffer.copy_to_cpu = copy_to_cpu  # type: ignore[method-assign]
 
 
 def apply_compat_patches() -> None:
@@ -208,7 +210,9 @@ def apply_compat_patches() -> None:
 
     from vllm.v1.worker.block_table import BlockTable
 
-    BlockTable.compute_slot_mapping = _metal_compute_slot_mapping
+    BlockTable.compute_slot_mapping = (  # type: ignore[method-assign]
+        _metal_compute_slot_mapping
+    )
 
     from vllm.v1.worker.gpu.mm.rope import RopeState
 
@@ -243,7 +247,9 @@ def apply_compat_patches() -> None:
 
     _patch_cpu_gpu_buffer_blocking()
 
-    torch.cuda.is_current_stream_capturing = lambda: False
+    torch.cuda.is_current_stream_capturing = (  # type: ignore[method-assign]
+        lambda: False
+    )
 
     _APPLIED = True
     logger.info(

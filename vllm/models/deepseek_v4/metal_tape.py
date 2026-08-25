@@ -46,7 +46,20 @@ from vllm.quixicore.ops import quixicore_ops
 
 logger = init_logger(__name__)
 
-_MODE = int(os.environ.get("VLLM_QC_STEP_TAPE", "0") or "0")
+
+def _tape_mode() -> int:
+    # metal_worker.py enables the tape for any value other than "0", then
+    # imports this module; a non-numeric value like "on" must degrade to
+    # off instead of raising during load_model.
+    raw = os.environ.get("VLLM_QC_STEP_TAPE", "0") or "0"
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("qc-tape: invalid VLLM_QC_STEP_TAPE=%r; tape off", raw)
+        return 0
+
+
+_MODE = _tape_mode()
 _MAX_TAPE_TOKENS = 8  # gguf/linear.py mmvq ceiling for rows > 5120
 _GGUF_Q8_0 = 8
 _GGUF_Q2_K = 10
@@ -163,7 +176,7 @@ def _register_layer(layer, idx: int) -> bool:
         tensors["ape_bf16"] = compressor.ape.to(torch.bfloat16).contiguous()
         tensors["state_cache"] = state_cache
         tensors["comp_kv_cache"] = attn.kv_cache
-        state_block_size = int(state_md.block_size)
+        state_block_size = int(state_md.block_size)  # type: ignore[attr-defined]
         state_width = state_cache.shape[-1] // 2
         compress_ratio = int(compressor.compress_ratio)
 
@@ -260,8 +273,7 @@ def _layer_step_tensors(layer, ctx, positions, num_tokens):
             return None
         width = min(
             attn.topk_indices_buffer.shape[1],
-            (attn.max_model_len + attn.compress_ratio - 1)
-            // attn.compress_ratio,
+            (attn.max_model_len + attn.compress_ratio - 1) // attn.compress_ratio,
         )
         comp_key = (
             "comp",
@@ -310,19 +322,11 @@ def _wrap_layer(layer, idx: int):
         x, positions, input_ids, post_mix=None, res_mix=None, residual=None
     ):
         if layer._qc_tape_disabled:
-            return orig_forward(
-                x, positions, input_ids, post_mix, res_mix, residual
-            )
+            return orig_forward(x, positions, input_ids, post_mix, res_mix, residual)
         ctx = get_forward_context()
         md = ctx.attn_metadata
-        if (
-            not isinstance(md, dict)
-            or x.shape[0] > _MAX_TAPE_TOKENS
-            or x.dim() != 3
-        ):
-            return orig_forward(
-                x, positions, input_ids, post_mix, res_mix, residual
-            )
+        if not isinstance(md, dict) or x.shape[0] > _MAX_TAPE_TOKENS or x.dim() != 3:
+            return orig_forward(x, positions, input_ids, post_mix, res_mix, residual)
         if not layer._qc_tape_registered:
             if not _register_layer(layer, idx):
                 layer._qc_tape_disabled = True
@@ -332,41 +336,31 @@ def _wrap_layer(layer, idx: int):
             layer._qc_tape_registered = True
         step_res = _layer_step_tensors(layer, ctx, positions, x.shape[0])
         if step_res is None:
-            return orig_forward(
-                x, positions, input_ids, post_mix, res_mix, residual
-            )
+            return orig_forward(x, positions, input_ids, post_mix, res_mix, residual)
         step, insert_block, boundary = step_res
         if kind == 0 and boundary:
             # c128 compress tail runs this step; Python owns it.
-            return orig_forward(
-                x, positions, input_ids, post_mix, res_mix, residual
-            )
+            return orig_forward(x, positions, input_ids, post_mix, res_mix, residual)
         if _MODE == 2:
-            out = orig_forward(
-                x, positions, input_ids, post_mix, res_mix, residual
-            )
+            out = orig_forward(x, positions, input_ids, post_mix, res_mix, residual)
             tape_x = quixicore_ops.qc_tape_layer_forward(
                 idx, x, positions, input_ids, step, insert_block
             )
             ref = out[0]
             # int16 views: MPS has no eq kernel for uint16; the bit pattern
             # comparison is identical either way.
-            same = torch.equal(
-                ref.view(torch.int16), tape_x.view(torch.int16)
-            )
+            same = torch.equal(ref.view(torch.int16), tape_x.view(torch.int16))
             if not same:
-                diff = (
-                    (ref.float() - tape_x.float()).abs().max().item()
-                )
-                nz = (
-                    (ref.view(torch.int16) != tape_x.view(torch.int16))
-                    .sum()
-                    .item()
-                )
+                diff = (ref.float() - tape_x.float()).abs().max().item()
+                nz = (ref.view(torch.int16) != tape_x.view(torch.int16)).sum().item()
                 logger.warning(
                     "qc-tape verify MISMATCH layer=%d kind=%d nz=%d/%d "
                     "max_abs_diff=%.3e",
-                    idx, kind, nz, ref.numel(), diff,
+                    idx,
+                    kind,
+                    nz,
+                    ref.numel(),
+                    diff,
                 )
             return out
         tape_x = quixicore_ops.qc_tape_layer_forward(

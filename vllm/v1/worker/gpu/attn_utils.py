@@ -262,7 +262,7 @@ def _reshape_kv_cache(
     kv_cache_config: "KVCacheConfig | None" = None,
 ) -> dict[str, Any]:
     kv_caches: dict[str, Any] = {}
-    has_attn = False
+    has_attn, has_mamba = False, False
 
     layer_packing: dict[str, tuple[int, int]] = {}
     if kv_cache_config is not None:
@@ -350,6 +350,7 @@ def _reshape_kv_cache(
                 )
 
             elif isinstance(kv_cache_spec, MambaSpec):
+                has_mamba = True
                 page_size_bytes = kv_cache_spec.page_size_bytes
                 # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
                 # int8 page view per layer; the layer's bind_kv_cache unpacks
@@ -363,6 +364,15 @@ def _reshape_kv_cache(
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
                 )
+
+    if has_attn and has_mamba:
+        # Hybrid attention/mamba models share one allocation per block-id
+        # space: attention block i and mamba block i must address the same
+        # bytes. K/V-first backend layouts break that invariant; restride
+        # them to blocks-first physical storage.
+        _update_hybrid_attention_mamba_layout(
+            attn_groups, kv_caches, kernel_block_sizes, cache_dtype
+        )
 
     if has_attn and kv_cache_config is not None:
         _align_mixed_attention_kv_cache_views(
@@ -378,6 +388,58 @@ def _reshape_kv_cache(
         kv_caches[layer_name] = kv_caches[target_layer_name]
 
     return kv_caches
+
+
+def _update_hybrid_attention_mamba_layout(
+    attn_groups: Iterable[AttentionGroup],
+    kv_caches: dict[str, Any],
+    kernel_block_sizes: list[int],
+    cache_dtype: str,
+) -> None:
+    """Restride K/V-first attention views to blocks-first physical storage.
+
+    Hybrid attention/mamba models hand out block IDs from one unified pool,
+    and each shared allocation must map block i to the same byte range in
+    every layer's view. A K/V-first layout such as ``(2, num_blocks, ...)``
+    stores all K pages before all V pages, so attention block i's K half
+    lands at byte offset ``i * page_size / 2`` -- inside mamba page
+    ``i // 2`` -- and every KV-cache write silently corrupts some mamba
+    layer's conv/ssm state (observed as GDN state corruption on Metal, whose
+    backend is K/V-first). Swapping the two outer strides interleaves each
+    block's K and V halves into one contiguous page without moving data,
+    exactly mirroring GPUModelRunnerV1._update_hybrid_attention_mamba_layout.
+    """
+    for group in attn_groups:
+        kv_cache_spec = group.kv_cache_spec
+        if not isinstance(kv_cache_spec, AttentionSpec):
+            continue
+        if group.kv_cache_group_id >= len(kernel_block_sizes):
+            continue
+        block_dim = group.backend.get_kv_cache_block_dim(
+            kernel_block_sizes[group.kv_cache_group_id],
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+            cache_dtype_str=(
+                getattr(kv_cache_spec, "tq_cache_dtype", "") or cache_dtype
+            ),
+        )
+        # block_dim 0 means (num_blocks, 2, ...): pages already contiguous.
+        if block_dim == 0:
+            continue
+        assert block_dim == 1, (
+            f"Unsupported KV cache block dim {block_dim} for hybrid "
+            f"attention/mamba layout ({group.backend.__name__})"
+        )
+        for layer_name in group.layer_names:
+            if layer_name not in kv_caches:
+                # Cross-layer-shared views alias their target after this pass.
+                continue
+            kv_cache = kv_caches[layer_name]
+            hidden_size = kv_cache.shape[2:].numel()
+            kv_cache.as_strided_(
+                size=kv_cache.shape,
+                stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
+            )
 
 
 def _align_mixed_attention_kv_cache_views(
@@ -543,6 +605,7 @@ def build_attn_metadata(
     )
     steady_eligible = (
         steady_cache is not None
+        and is_prefilling is not None
         and not for_cudagraph_capture
         and causal is True
         and dcp_local_seq_lens is None
@@ -582,6 +645,12 @@ def build_attn_metadata(
                 cm.seq_lens_cpu_upper_bound.copy_(
                     seq_lens_cpu_upper_bound[: cm.num_reqs]
                 )
+            # Computed-token counts advance every decode step; the cached
+            # tensor may be a view of the producer's persistent buffer, but
+            # refresh explicitly so a producer change cannot leave the
+            # steady path reading first-step values.
+            if num_computed_tokens_cpu is not None:
+                cm._num_computed_tokens_cpu = num_computed_tokens_cpu
             for builder, meta, layer_names, supports in items:
                 extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(

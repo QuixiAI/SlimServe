@@ -66,6 +66,20 @@ LLAMA4_PRETOKENIZER_REGEX = (
     r"|\s+"
 )
 
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN35 split, which `tokenizer.ggml.pre`
+# names as "qwen35": the qwen2 split with case-insensitive contractions,
+# per-digit number splitting (\p{N}, not \p{N}{1,3}), and marks (\p{M})
+# grouped with letters.
+QWEN35_PRETOKENIZER_REGEX = (
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
+    r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # llama.cpp's LLAMA_VOCAB_PRE_TYPE_CHATGLM4 split, which `tokenizer.ggml.pre`
 # names as "glm4".
 GLM4_PRETOKENIZER_REGEX = (

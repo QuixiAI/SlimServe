@@ -75,6 +75,12 @@ class ParserEngineConfig:
 
     arg_converter: Callable[[str, bool], str] | None = None
 
+    # Extract the public raw-input value for Responses custom tools. Model
+    # formats that wrap arguments in XML/JSON provide this next to their
+    # ordinary function-argument converter; the parser engine stays agnostic
+    # to the concrete envelope.
+    custom_tool_arg_converter: Callable[[str, bool], str] | None = None
+
     stream_arg_deltas: bool = True
 
     tool_args_json: bool = True

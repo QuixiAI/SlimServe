@@ -174,6 +174,14 @@ class MuseGlimmerAttention(nn.Module):
             per_layer_sliding_window=(config.sliding_window if self.is_local else None),
             prefix=f"{prefix}.attn",
         )
+        if not self.is_local:
+            # Attention() falls back to cache_config.sliding_window when the
+            # per-layer value is None, silently window-clamping the 13 global
+            # NoPE layers at ctx > window in the eager path (the fused path
+            # registers window=0 for them and was unaffected). Confirmed via
+            # per-impl logging: all 52 layers reported window=2048. Force the
+            # impl's window off for global layers.
+            self.attn.impl.sliding_window = None
 
     def forward(
         self,
@@ -377,10 +385,19 @@ class MuseGlimmerModel(nn.Module):
 
     def _maybe_fused_decode(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Single-command-buffer decode for pure single-token steps."""
-        if self.aux_hidden_state_layers:
-            return None  # the spec target must return per-layer captures
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | None:
+        """Single-command-buffer decode/verify steps.
+
+        Two shapes take the fused path:
+        - plain decode: one token per request (max_query_len == 1);
+        - speculative verify: ONE request with a contiguous k+1-token query
+          (max_query_len == num_actual_tokens <= 17). Attention runs as
+          batch expansion: row i is a virtual decode request whose seq_len
+          steps to base + i + 1, over a stride-0 view of the block table,
+          which keeps causality and the sliding window without a multi-query
+          kernel. With aux layers set, the residual stream entering each aux
+          layer is snapshotted on-device for the DFlash drafter.
+        """
         if hidden_states.device.type != "mps":
             return None
         from vllm.forward_context import get_forward_context
@@ -397,24 +414,79 @@ class MuseGlimmerModel(nn.Module):
         full = metadata.get(self._fused_full_name)
         if local is None or full is None:
             return None
-        if (
-            local.max_query_len != 1
-            or local.num_actual_tokens != local.num_reqs
-            or hidden_states.shape[0] != local.num_actual_tokens
-        ):
+        m = local.num_actual_tokens
+        if hidden_states.shape[0] != m:
             return None
+        import os
+
+        is_decode = local.max_query_len == 1 and m == local.num_reqs
+        is_verify = (
+            local.num_reqs == 1
+            and local.max_query_len == m
+            and m <= 17
+            # emit_matvec's qgemv_mm fallback is only instantiated for
+            # m in {2,4,8,16,17}; the sm kernels cover 9..17. Odd small m
+            # (3,5,6,7) would crash on a missing pipeline (hit by short
+            # prompts / partial drafts once the fused default flipped ON).
+            and (m >= 9 or m in (1, 2, 4, 8))
+            # the fused path computes global layers correctly at every
+            # context (window=0 registration) and remains fastest until the
+            # multi-query kernel is plumbed into its encoder; the handoff
+            # knob is for A/Bing that work
+            and int(local.seq_lens_gpu.max().item())
+            <= int(os.environ.get("VLLM_FUSED_VERIFY_CTX_MAX", "100000"))
+            # default ON since the tensor-ops kernel port: fused 95.6 ms vs
+            # eager 110.4 ms forward at M=17 (2026-08-15, matched
+            # in-process). VLLM_MUSE_FUSED_VERIFY=0 reverts to eager.
+            and os.environ.get("VLLM_MUSE_FUSED_VERIFY", "1") == "1"
+        )
+        if not (is_decode or is_verify):
+            return None
+        aux_ids = sorted(self.aux_hidden_state_layers)
+        if aux_ids and aux_ids[-1] >= len(self.layers):
+            return None  # capture after the last layer is not expressible here
         from vllm.quixicore.ops import _qc
 
         x = hidden_states.contiguous()
+        pos = positions.to(torch.int32)
+        ctx_len = int(full.seq_lens_gpu.max().item())
+        if is_verify and m > 1:
+            steps = torch.arange(m, dtype=torch.int32, device=x.device)
+            bt_l = local.block_table[:1].expand(m, -1)
+            sl_l = (local.seq_lens_gpu[:1] - (m - 1)).expand(m) + steps
+            bt_f = full.block_table[:1].expand(m, -1)
+            sl_f = (full.seq_lens_gpu[:1] - (m - 1)).expand(m) + steps
+        else:
+            bt_l, sl_l = local.block_table, local.seq_lens_gpu
+            bt_f, sl_f = full.block_table, full.seq_lens_gpu
+        if aux_ids:
+            aux_out = torch.empty(
+                len(aux_ids), m, x.shape[-1], dtype=x.dtype, device=x.device
+            )
+            _qc().muse_step_run_aux(
+                x,
+                pos,
+                bt_l,
+                sl_l,
+                local.slot_mapping.to(torch.long),
+                bt_f,
+                sl_f,
+                full.slot_mapping.to(torch.long),
+                aux_out,
+                aux_ids,
+                ctx_len,
+            )
+            return x, list(aux_out.unbind(0))
         _qc().muse_step_run(
             x,
-            positions.to(torch.int32),
-            local.block_table,
-            local.seq_lens_gpu,
+            pos,
+            bt_l,
+            sl_l,
             local.slot_mapping.to(torch.long),
-            full.block_table,
-            full.seq_lens_gpu,
+            bt_f,
+            sl_f,
             full.slot_mapping.to(torch.long),
+            ctx_len,
         )
         return x
 
@@ -441,6 +513,9 @@ class MuseGlimmerModel(nn.Module):
 
         fused = self._maybe_fused_decode(hidden_states, positions)
         if fused is not None:
+            if isinstance(fused, tuple):
+                fused_h, fused_aux = fused
+                return self.norm(fused_h), fused_aux
             return self.norm(fused)
 
         aux_hidden_states = [hidden_states] if 0 in self.aux_hidden_state_layers else []

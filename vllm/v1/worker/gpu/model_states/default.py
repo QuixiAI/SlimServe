@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -116,6 +117,7 @@ class DefaultModelState(ModelState):
             input_batch.query_start_loc,
             req_states.prefill_len.gpu,
             req_states.num_computed_tokens.gpu,
+            num_tokens=input_batch.num_tokens,
         )
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}
@@ -178,15 +180,35 @@ class DefaultModelState(ModelState):
             enabled = getattr(self, "_steady_meta_enabled", None)
             if enabled is None:
                 import os
-                enabled = os.getenv(
-                    "VLLM_STEADY_DECODE_META", "0"
-                ).lower() in ("1", "true", "on", "yes")
+
+                enabled = os.getenv("VLLM_STEADY_DECODE_META", "0").lower() in (
+                    "1",
+                    "true",
+                    "on",
+                    "yes",
+                )
                 self._steady_meta_enabled = enabled
             if enabled:
                 steady_cache = getattr(self, "_steady_meta_cache", None)
                 if steady_cache is None:
                     steady_cache = {"sig": None}
                     self._steady_meta_cache = steady_cache
+        # InputBatch per-request arrays hold one entry per real request; with
+        # FULL cudagraphs num_reqs is the padded count and metadata consumers
+        # index by padded request id, so stage them through persistent
+        # padded buffers (zero/False tails) instead of slicing short. The
+        # buffers are allocated once — this path is decode-latency sensitive.
+        real_reqs = input_batch.num_reqs
+        padded_nct = getattr(self, "_padded_num_computed_tokens_np", None)
+        if padded_nct is None or padded_nct.shape[0] < num_reqs:
+            padded_nct = np.zeros(self.max_num_reqs, dtype=np.int32)
+            self._padded_num_computed_tokens_np = padded_nct
+            self._padded_is_prefilling_np = np.zeros(self.max_num_reqs, dtype=bool)
+        padded_pref = self._padded_is_prefilling_np
+        padded_nct[:real_reqs] = input_batch.num_computed_tokens_np[:real_reqs]
+        padded_nct[real_reqs:num_reqs] = 0
+        padded_pref[:real_reqs] = input_batch.is_prefilling_np[:real_reqs]
+        padded_pref[real_reqs:num_reqs] = False
         attn_metadata = build_attn_metadata(
             steady_cache=steady_cache,
             attn_groups=attn_groups,
@@ -203,12 +225,10 @@ class DefaultModelState(ModelState):
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             positions=input_batch.positions,
-            is_prefilling=torch.from_numpy(input_batch.is_prefilling_np),
+            is_prefilling=torch.from_numpy(padded_pref[:num_reqs]),
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
-            num_computed_tokens_cpu=torch.from_numpy(
-                input_batch.num_computed_tokens_np[:num_reqs]
-            ),
+            num_computed_tokens_cpu=torch.from_numpy(padded_nct[:num_reqs]),
         )
         return attn_metadata

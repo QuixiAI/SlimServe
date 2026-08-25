@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.logger import init_logger
+from vllm.quixicore import quixicore_ops
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionImpl,
@@ -42,9 +43,12 @@ logger = init_logger(__name__)
 
 # Head sizes the fused paged decode kernel is instantiated for. Anything else
 # is correct on the SDPA path, just slower. 256 (Qwen3.8 full attn) landed
-# with the N4 census fix; VLLM_QC_PA256=0 drops it back to the SDPA gather
-# (null-check / kill switch — the kernel's online softmax rounds differently
-# than the torch-SDPA path, so shas roll when it turns on).
+# with the N4 census fix VIA THE SPLIT-K partition/reduce pair — the
+# monolithic one-simdgroup-per-head walk under-occupies at decode widths
+# (routed and measured both here and on main; ~15% slower end-to-end).
+# VLLM_QC_PA256=0 drops back to the SDPA gather (null-check / kill switch —
+# the kernel's online softmax rounds differently than the torch-SDPA path,
+# so shas roll when it turns on).
 _PAGED_HEAD_SIZES = (64, 128)
 if os.environ.get("VLLM_QC_PA256", "1") != "0":
     _PAGED_HEAD_SIZES = (64, 128, 256)
@@ -199,6 +203,18 @@ class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetad
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = vllm_config.cache_config.block_size
+        # With serial (non-async) scheduling the scheduler has consumed the
+        # previous step's acceptance before scheduling this one, so the
+        # CPU-side seq_lens_cpu_upper_bound (committed + scheduled) is
+        # EXACT and the device seq_lens need never be pulled to the host.
+        # That pull was the step's hidden pipeline drain: it waited out the
+        # whole previous GPU step (~40 ms) inside build(). Under async
+        # scheduling the upper bound can overshoot (it assumes full draft
+        # acceptance), and an overshot length would attend stale KV rows,
+        # so the synced copy stays for that mode.
+        self._exact_cpu_seq_lens = not bool(
+            vllm_config.scheduler_config.async_scheduling
+        )
 
     def build(
         self,
@@ -271,6 +287,7 @@ class MetalAttentionImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.use_native_range_gather = quixicore_ops.has("kv_cache_gather_range")
 
         if sinks is not None:
             raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
@@ -320,12 +337,21 @@ class MetalAttentionImpl(AttentionImpl):
         self, metadata: MetalAttentionMetadata, num_tokens: int
     ) -> bool:
         q_len = metadata.max_query_len
-        return (
+        if not (
             metadata.causal
             and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
             and num_tokens == metadata.num_reqs * q_len
             and self.head_size in _PAGED_HEAD_SIZES
-        )
+        ):
+            return False
+        # Cached-prompt A/B at 1734-token context: expansion 16.1 tok/s vs
+        # SDPA gather 14.55 -- expansion wins at least through ~2k. The
+        # knob exists for larger-context research (the per-row KV re-read
+        # grows linearly and must cross over somewhere).
+        import os
+
+        ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
+        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
 
     def _expanded_block_decode_applies(
         self, metadata: MetalAttentionMetadata, num_tokens: int
@@ -522,6 +548,38 @@ class MetalAttentionImpl(AttentionImpl):
                 expanded_block_table = kernel_block_table.repeat_interleave(
                     q_len, dim=0
                 )
+                # Global (unwindowed) layers at length: the multi-query
+                # kernel shares each K/V read across the m rows (measured
+                # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
+                # expansion path (scan capped by the window -- a wash).
+                use_mq = (
+                    self.sliding_window is None
+                    and attn_metadata.num_reqs == 1
+                    # The verify kernel does not walk strided caches yet;
+                    # head_dim 256 implies the hybrid pool's strided views,
+                    # so it stays on the expansion path (which does).
+                    and self.head_size != 256
+                    and int(seq_lens.max().item()) > 1024
+                )
+                if use_mq:
+                    if not getattr(self, "_mq_logged", False):
+                        self._mq_logged = True
+                        logger.info(
+                            "multi-query verify attention engaged (ctx=%d)",
+                            int(seq_lens.max().item()),
+                        )
+                    out.copy_(
+                        quixicore_ops.paged_attention_verify(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            seq_lens,
+                            self.scale,
+                            0,
+                        )
+                    )
+                    return output
                 out.copy_(
                     quixicore_ops.paged_attention(
                         query[:num_tokens].contiguous(),
@@ -636,33 +694,57 @@ class MetalAttentionImpl(AttentionImpl):
             kv_start = 0
             if self.sliding_window is not None:
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
-            first_block = kv_start // block_size
-            if bound_mode and first_block > 0:
-                # The bound may exceed the exact seq_len by up to the draft
-                # length, which can push the window start past the exact
-                # window's first block. Back off one block and start at row
-                # 0 — the GPU validity mask enforces the exact range.
-                first_block -= 1
-            blocks = (
-                metadata.block_table[req, first_block:num_req_blocks]
-                .to(torch.long)
-                # The profile run allocates a small dummy cache whose block
-                # table can point past it. That output is discarded; a real
-                # run never clamps.
-                .clamp_(0, num_blocks - 1)
-            )
             seq_len = min(seq_len, num_req_blocks * block_size)
-            row_start = 0 if bound_mode else kv_start - first_block * block_size
-            row_end = seq_len - first_block * block_size
 
-            if dense_kv is not None:
-                keys = dense_kv.index_select(0, blocks * 2)
-                values = dense_kv.index_select(0, blocks * 2 + 1)
+            if self.use_native_range_gather and not bound_mode:
+                # MPS index_select uses signed 32-bit element offsets for this
+                # strided source. A hybrid cache page beyond 2^31 elements is
+                # therefore read from the wrong address. The native gather
+                # carries the physical block stride and all cache arithmetic
+                # in 64 bits; it also avoids materializing unused rows in the
+                # first/last page of a sliding-window request. Bound mode
+                # keeps the block-window fallback below: its kv_start may
+                # exceed the exact window, which the fallback absorbs with
+                # the one-block backoff + GPU validity mask.
+                keys, values = quixicore_ops.kv_cache_gather_range(
+                    key_cache,
+                    value_cache,
+                    metadata.block_table[req],
+                    kv_start,
+                    seq_len - kv_start,
+                )
             else:
-                keys = key_cache.index_select(0, blocks)
-                values = value_cache.index_select(0, blocks)
-            keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
-            values = values.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+                first_block = kv_start // block_size
+                if bound_mode and first_block > 0:
+                    # The bound may exceed the exact seq_len by up to the
+                    # draft length, which can push the window start past the
+                    # exact window's first block. Back off one block and
+                    # start at row 0 — the GPU validity mask enforces the
+                    # exact range.
+                    first_block -= 1
+                blocks = (
+                    metadata.block_table[req, first_block:num_req_blocks]
+                    .to(torch.long)
+                    # The profile run allocates a small dummy cache whose
+                    # block table can point past it. That output is
+                    # discarded; a real run never clamps.
+                    .clamp_(0, num_blocks - 1)
+                )
+                row_start = (
+                    0 if bound_mode else kv_start - first_block * block_size
+                )
+                row_end = seq_len - first_block * block_size
+
+                if dense_kv is not None:
+                    keys = dense_kv.index_select(0, blocks * 2)
+                    values = dense_kv.index_select(0, blocks * 2 + 1)
+                else:
+                    keys = key_cache.index_select(0, blocks)
+                    values = value_cache.index_select(0, blocks)
+                keys = keys.reshape(-1, num_kv_heads, head_size)[row_start:row_end]
+                values = values.reshape(-1, num_kv_heads, head_size)[
+                    row_start:row_end
+                ]
 
             if self.num_queries_per_kv > 1:
                 keys = keys.repeat_interleave(self.num_queries_per_kv, dim=1)

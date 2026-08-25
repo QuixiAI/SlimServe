@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Minimal subset of upstream vLLM's mamba_mixer2 module.
+"""Sharded weight loading for mamba-v2-family projections.
 
-This fork does not serve Mamba-2 models, so the full MambaMixer2 layer is not
-vendored. Only `mamba_v2_sharded_weight_loader` is kept because the Qwen3.5
-Gated DeltaNet layer (mamba/gdn/qwen_gdn_linear_attn.py) uses it to shard the
-fused q|k|v conv1d weight; keeping it here preserves upstream's import path.
+Vendored from upstream vLLM's ``mamba_mixer2.py``. The fork keeps only
+``mamba_v2_sharded_weight_loader`` -- the piece the gated-deltanet layers
+(``mamba/gdn``) import; upstream's ``MambaMixer2`` layer itself serves
+model families this fork does not carry.
 """
 
 import torch

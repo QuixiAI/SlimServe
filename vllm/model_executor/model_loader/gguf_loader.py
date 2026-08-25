@@ -83,15 +83,29 @@ class GGUFModelLoader(BaseModelLoader):
             adapter_cls = KimiK3DSparkGGUFAdapter
         elif architecture == "dflash":
             # Same routing as the config parser: the DeepSeek-V4 DSpark
-            # drafter carries expert keys, the Muse-Glimmer drafter does not.
+            # drafter carries expert keys, the DFlash 2 drafter carries the
+            # selector metadata, the Muse-Glimmer drafter neither.
             from vllm.transformers_utils.gguf_utils import gguf_reader
 
-            if "dflash.expert_count" in gguf_reader(path).fields:
+            fields = gguf_reader(path).fields
+            if "dflash.expert_count" in fields:
                 adapter_cls = DFlashGGUFAdapter
+            elif "dflash.selector_rank" in fields:
+                from vllm.model_executor.model_loader.gguf_adapters import (
+                    DFlash2QwenGGUFAdapter,
+                )
+
+                adapter_cls = DFlash2QwenGGUFAdapter
             else:
                 adapter_cls = MuseGlimmerDFlashGGUFAdapter
         elif architecture == "muse-glimmer":
             adapter_cls = MuseGlimmerGGUFAdapter
+        elif architecture == "qwen35":
+            from vllm.model_executor.model_loader.gguf_adapters import (
+                Qwen35GGUFAdapter,
+            )
+
+            adapter_cls = Qwen35GGUFAdapter
         elif architecture == "kimi-k3":
             adapter_cls = KimiK3GGUFAdapter
         elif architecture == "glm-dsa":

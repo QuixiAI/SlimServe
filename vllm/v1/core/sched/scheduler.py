@@ -1578,12 +1578,15 @@ class Scheduler(SchedulerInterface):
         if not structured_output_request_ids:
             return None
 
-        bitmask = self.structured_output_manager.grammar_bitmask(
+        result = self.structured_output_manager.grammar_bitmask(
             self.requests,
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        return GrammarOutput(structured_output_request_ids, bitmask)
+        if result is None:
+            return None
+        bitmask, apply_rows = result
+        return GrammarOutput(structured_output_request_ids, bitmask, apply_rows)
 
     def update_from_output(
         self,

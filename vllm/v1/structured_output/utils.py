@@ -445,13 +445,147 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
     if not grammar_str.strip():
         raise ValueError("Grammar string cannot be empty")
 
+    common_terminals = {
+        "DIGIT": "[0-9]",
+        "HEXDIGIT": "[0-9a-fA-F]",
+        "INT": "[0-9]+",
+        "SIGNED_INT": "[-+]? [0-9]+",
+        "DECIMAL": '[0-9]+ "." [0-9]+',
+        "SIGNED_NUMBER": '[-+]? [0-9]+ ("." [0-9]+)? ([eE] [-+]? [0-9]+)?',
+        "NUMBER": '[0-9]+ ("." [0-9]+)? ([eE] [-+]? [0-9]+)?',
+        "LETTER": "[a-zA-Z]",
+        "LOWERCASE_LETTER": "[a-z]",
+        "UPPERCASE_LETTER": "[A-Z]",
+        "LCASE_LETTER": "[a-z]",
+        "UCASE_LETTER": "[A-Z]",
+        "CNAME": "[a-zA-Z_] [a-zA-Z0-9_]*",
+        "WS_INLINE": "[ \\t]+",
+        "WS": "[ \\t\\n\\r\\f]+",
+        "NEWLINE": "[\\n\\r\\f]+",
+        "CRLF": '"\\r"? "\\n"',
+        "LF": '"\\n"',
+    }
     defined_rules = set()
     referenced_rules = set()
     output_lines = []
+    imported_rules: dict[str, str] = {}
+    regex_rules: dict[str, str] = {}
+    regex_index = 0
 
     def clean_line(line: str) -> str:
         """Remove comments and whitespace from line."""
         return re.sub(r"(#|//).*$", "", line).strip()
+
+    def strip_rule_alias(text: str) -> str:
+        """Drop Lark tree-construction aliases, which don't affect matching."""
+        return re.sub(r"\s*->\s*[A-Za-z_][A-Za-z0-9_]*\s*$", "", text)
+
+    def regex_literal_to_ebnf(text: str) -> str:
+        """Convert inline Lark ``/regex/`` terminals to XGrammar EBNF.
+
+        Regex terminals may appear alongside quoted literals and rule
+        references. Scan outside quoted strings so literal slashes are not
+        treated as delimiters, then let XGrammar lower the documented
+        Rust-regex dialect to EBNF.
+        """
+        nonlocal regex_index
+
+        def convert_pattern(pattern: str, flags: str) -> str:
+            nonlocal regex_index
+            if "s" not in flags:
+                # XGrammar's regex converter lets ``.`` match line breaks,
+                # unlike Lark and the Responses custom-tool regex dialect.
+                chars: list[str] = []
+                in_class = False
+                escaped = False
+                for char in pattern:
+                    if escaped:
+                        chars.extend(("\\", char))
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == "[":
+                        in_class = True
+                        chars.append(char)
+                    elif char == "]" and in_class:
+                        in_class = False
+                        chars.append(char)
+                    elif char == "." and not in_class:
+                        chars.append("[^\\n\\r]")
+                    else:
+                        chars.append(char)
+                if escaped:
+                    chars.append("\\")
+                pattern = "".join(chars)
+            else:
+                flags = flags.replace("s", "")
+            if flags:
+                pattern = f"(?{flags}:{pattern})"
+
+            generated = str(xgr.Grammar.from_regex(pattern))
+            parsed_rules: list[tuple[str, str]] = []
+            for generated_line in generated.splitlines():
+                name, definition = generated_line.split("::=", 1)
+                parsed_rules.append((name.strip(), definition.strip()))
+
+            prefix = f"__lark_regex_{regex_index}"
+            regex_index += 1
+            names = {
+                name: prefix + name.removeprefix("root") for name, _ in parsed_rules
+            }
+            for name, definition in parsed_rules:
+                for old_name in sorted(names, key=len, reverse=True):
+                    definition = re.sub(
+                        rf"\b{re.escape(old_name)}\b",
+                        names[old_name],
+                        definition,
+                    )
+                regex_rules[names[name]] = definition
+                defined_rules.add(names[name])
+            return names["root"]
+
+        output: list[str] = []
+        index = 0
+        quote: str | None = None
+        while index < len(text):
+            char = text[index]
+            if quote is not None:
+                output.append(char)
+                if char == "\\" and index + 1 < len(text):
+                    index += 1
+                    output.append(text[index])
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {'"', "'"}:
+                quote = char
+                output.append(char)
+                index += 1
+                continue
+            if char != "/":
+                output.append(char)
+                index += 1
+                continue
+
+            end = index + 1
+            while end < len(text):
+                if text[end] == "\\" and end + 1 < len(text):
+                    end += 2
+                    continue
+                if text[end] == "/":
+                    break
+                end += 1
+            if end == len(text):
+                raise ValueError("Unterminated regex terminal")
+            pattern = text[index + 1 : end].replace(r"\/", "/")
+            index = end + 1
+            flags_start = index
+            while index < len(text) and text[index] in "ims":
+                index += 1
+            output.append(convert_pattern(pattern, text[flags_start:index]))
+
+        return "".join(output)
 
     def check_quotes(text: str, rule_name: str, line_num: int) -> None:
         """Validate quote matching in text."""
@@ -460,8 +594,9 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
 
     def extract_references(text: str) -> set[str]:
         """Extract rule references from text."""
-        # Remove quoted strings and special characters
+        # Remove literals and character classes before looking for rule names.
         text = re.sub(r'"[^"]*"', "", text)
+        text = re.sub(r"\[(?:\\.|[^\]])*\]", "", text)
         text = re.sub(r"[+*?()|\[\]{}]", " ", text)
         return set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", text))
 
@@ -470,7 +605,26 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
     first_rule = None
 
     for line_num, line in enumerate(lines, 1):
-        if not line or line.startswith("|"):
+        if not line or line.startswith("|") or line.startswith("%ignore"):
+            continue
+
+        if line.startswith("%import"):
+            match = re.fullmatch(
+                r"%import\s+common\.([A-Za-z_][A-Za-z0-9_]*)"
+                r"(?:\s*->\s*([A-Za-z_][A-Za-z0-9_]*))?",
+                line,
+            )
+            if match is None:
+                raise ValueError(f"Unsupported Lark import on line {line_num}: {line}")
+            source, alias = match.groups()
+            if source not in common_terminals:
+                supported = ", ".join(sorted(common_terminals))
+                raise ValueError(
+                    f"Unsupported common terminal {source!r} on line {line_num}. "
+                    f"Supported terminals: {supported}"
+                )
+            imported_rules[alias or source] = common_terminals[source]
+            defined_rules.add(alias or source)
             continue
 
         if ":" in line:
@@ -498,7 +652,7 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
     current_definition = []
 
     for line_num, line in enumerate(lines, 1):
-        if not line:
+        if not line or line.startswith("%ignore") or line.startswith("%import"):
             continue
 
         try:
@@ -514,7 +668,9 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
                 current_rule = name.strip().strip("?")
 
                 check_quotes(definition, f"rule '{current_rule}'", line_num)
+                definition = strip_rule_alias(definition)
                 definition = re.sub(r"'([^']*)'", r'"\1"', definition)
+                definition = regex_literal_to_ebnf(definition)
                 referenced_rules.update(extract_references(definition))
                 current_definition = [definition.strip()]
 
@@ -529,7 +685,9 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
                 check_quotes(
                     alt_def, f"alternative for rule '{current_rule}'", line_num
                 )
+                alt_def = strip_rule_alias(alt_def)
                 alt_def = re.sub(r"'([^']*)'", r'"\1"', alt_def)
+                alt_def = regex_literal_to_ebnf(alt_def)
                 referenced_rules.update(extract_references(alt_def))
                 current_definition.append(alt_def)
 
@@ -539,6 +697,13 @@ def convert_lark_to_ebnf(grammar_str: str) -> str:
     # Add final rule if exists
     if current_rule:
         output_lines.append(f"{current_rule} ::= {' | '.join(current_definition)}")
+
+    output_lines.extend(
+        f"{name} ::= {definition}" for name, definition in imported_rules.items()
+    )
+    output_lines.extend(
+        f"{name} ::= {definition}" for name, definition in regex_rules.items()
+    )
 
     # Validate all rules are defined
     undefined_rules = referenced_rules - defined_rules - {"root"}

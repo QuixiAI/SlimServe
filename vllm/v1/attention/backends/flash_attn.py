@@ -716,9 +716,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         ):
             assert self.persistent_rswa_prefix_lens is not None
             assert self.persistent_rswa_window_tensor is not None
+            # rswa_prefix_lens arrives with one entry per real request, but
+            # under FULL cudagraphs num_reqs is the padded count: copy what
+            # exists and zero the padded tail instead of a non-broadcastable
+            # copy_ from a shorter source.
             src = common_attn_metadata.rswa_prefix_lens
+            n_src = min(num_reqs, src.shape[0])
             rswa_prefix_lens = self.persistent_rswa_prefix_lens[:num_reqs]
-            rswa_prefix_lens.copy_(src[:num_reqs], non_blocking=True)
+            if n_src < num_reqs:
+                rswa_prefix_lens[n_src:].zero_()
+            rswa_prefix_lens[:n_src].copy_(src[:n_src], non_blocking=True)
             attn_metadata.rswa_prefix_lens = rswa_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
