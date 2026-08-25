@@ -14765,3 +14765,50 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   fixed above. Verdict: merged build is the new canonical baseline; the
   serving-path numerics survived a 55-commit parallel campaign merge
   bit-exactly.
+
+### UPDATE 56 (2026-08-25) — CodeRabbit review round on PR #12: 14 fixes + 2 declines
+
+- Review triggered manually (repo <10 stars). 16 inline findings; the two
+  most valuable were REAL merge regressions CodeRabbit caught that our
+  gates missed: (1) attn_utils steady-eligibility gained main's
+  `is_prefilling is not None` conjunct, which the mamba-hybrid caller
+  never passes top-level — the steady metadata cache silently never hit
+  post-merge (perf-only; U38's landed win was off). Restored our gate
+  structure. (2) the profiles variants rebuild dropped the -tq profile's
+  `speculative_overrides` (drafter TURBOQUANT backend + turboquant_k8v4
+  dtype) — the -tq boot-reshape failure its own notes document.
+  Restored + regression test.
+- Other fixes: paged_attention_verify now takes the kernel-facing
+  contiguous cache pair under page-local layouts (latent crash with
+  VLLM_QC_MUSE=0 at ctx>1024); steady_decode_update also invalidates
+  _mps_fused_spec_plans (same lifetime bug class as U54's conv_slots);
+  the Metal spec dispatch falls back to the native spec route when the
+  .so lacks gdn_recur_spec; gdn_mps_fallback conv fns slice the front
+  width-1 ring (spec-configured pools are width-1+num_spec wide);
+  turboquant splitk gated on op presence; flashinfer top_k deterministic
+  kwarg guard; drafter hub fallback carries the pinned revision;
+  muse cap validates attn_group length; spec conv state_cols guard
+  raised to kernel-1+run-1 (uniform-run bound, matches its own error
+  message); phaseprof dumps moved from predictable /tmp names to a
+  mkdtemp dir; HANDOFF header refreshed; 3 pre-existing ISC004s fixed.
+- DECLINED with reasoning (replied on the PR): dequant-once dual layout
+  (measured, gated design for the 128 GB target: packed GEMV feeds
+  decode bandwidth, dense feeds MPS prefill GEMM; =call is the
+  constrained-box escape; native quantized-GEMM prefill via qgemm_sm is
+  the recorded follow-up).
+- .so rebuilt (host-side .mm guards only; metallib untouched).
+- PREDICTIONS (in advance): DSV4 anchors BIT-EXACT vs current pins
+  (573db39598e7 / bb83cc3054a3 / 73f41acf8ca0) — changed .mm entry
+  points are off the DSV4 path. Canonical: needle EXACT, c1 sha
+  467b35c3 BIT-EXACT (TPS 17.1-17.3; steady-cache restoration is
+  value-identical metadata reuse), 2500x64 sha aa448847 BIT-EXACT,
+  c4/c8 at canonical.
+- GATE RESULTS (all predictions HIT): DSV4 anchors BIT-EXACT 2/2 x3
+  (27th consecutive: 573db39598e7 / bb83cc3054a3 / 73f41acf8ca0).
+  Canonical: needle EXACT; c1 **17.400 / 17.383 tok/s sha 467b35c3
+  BIT-EXACT** — up from the post-merge 17.26: the restored steady
+  metadata cache is live again and worth ~+0.8% at c1; 2500x64
+  3.443/3.455 sha aa448847 BIT-EXACT; c4 23.012 sha 467b35c3; c8 25.563
+  (tie-carrier 8c58a4c6, matches the merge-gate run). muse_q38
+  registered. Raw: perf/results/2026-08-25/{anchor_regate_coderabbit,
+  coderabbit_regate}/. Box left serving canonical.
