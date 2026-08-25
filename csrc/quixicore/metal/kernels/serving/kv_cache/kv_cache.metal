@@ -318,6 +318,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
                             constant int &use_mask [[buffer(14)]],             // 0 = dense
                             constant int &window [[buffer(15)]],               // >0 = sliding window
                             constant int &mask_heads [[buffer(16)]],           // 1 = per-batch, H = per-head
+                            constant ulong &kv_block_stride [[buffer(17)]],    // cache stride(0), elements
                             uint3 tgid [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -359,8 +360,12 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
             continue;
         }
 
+        // Explicit block stride: the hybrid pool serves blocks-first
+        // strided K/V views (stride(0) = 2x page); for contiguous caches
+        // this equals block_size*num_kv_heads*D — bit-identical address.
         const long cache_base =
-            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+            (long)block * (long)kv_block_stride +
+            ((long)slot * num_kv_heads + kv_head) * D;
         float partial = 0.0f;
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
@@ -1232,6 +1237,7 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
       constant int &use_mask [[buffer(14)]],                                 \
       constant int &window [[buffer(15)]],                                   \
       constant int &mask_heads [[buffer(16)]],                               \
+      constant ulong &kv_block_stride [[buffer(17)]],                        \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 
@@ -1282,6 +1288,9 @@ instantiate_paged_attention_type(float16, half, 64)
 instantiate_paged_attention_type(float16, half, 128)
 instantiate_paged_attention_type(bfloat16, bf16, 64)
 instantiate_paged_attention_type(bfloat16, bf16, 128)
+instantiate_paged_attention_type(float32, float, 256)
+instantiate_paged_attention_type(float16, half, 256)
+instantiate_paged_attention_type(bfloat16, bf16, 256)
 
 instantiate_paged_attention_staged(float32, float, 64)
 instantiate_paged_attention_staged(float32, float, 128)
