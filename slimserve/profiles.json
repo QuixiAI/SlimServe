@@ -1345,7 +1345,8 @@
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
             "kv_cache_dtype": "bfloat16",
-            "mamba_cache_dtype": "float32"
+            "mamba_cache_dtype": "float32",
+            "language_model_only": true
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -1360,7 +1361,8 @@
             "Checkpoint (N0 discovery, HANDOFF.md): compressed-tensors mixed-precision -- NVFP4 g16 (weight_packed U8 [N,K/2] + weight_scale F8_E4M3 [N,K/16] + weight_global_scale F32) on mlp layers 0-55; FP8 E4M3 per-channel (weight F8 [N,K] + weight_scale BF16 [N,1]) on attn qkvo, GDN qkv/z/out, lm_head, mlp 56-63. Input-activation quant in the checkpoint is ignored on Metal: both schemes serve as weight-only (W4A16/W8A16) against bf16 activations.",
             "model_mtp.safetensors is the model's own MTP head (bf16, mtp.* names in the weight-map index) -- excluded from the base-model load; speculation via qwen3_5_mtp is a later milestone.",
             "Engine settings inherited from the retired qwen38-1 Q4_K_M profile (same architecture, same GDN state contracts): V2 runner forced, DS conv layout, fp32 mamba cache, prefix caching off for hybrid state.",
-            "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up."
+            "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up.",
+            "language_model_only: the Metal variants serve text-only. The vision tower loads on MI300X; on Metal the multimodal processor chain would require torchvision (absent from the Metal serving env), and the campaign's pins are text-only."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -1413,7 +1415,8 @@
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
             "kv_cache_dtype": "bfloat16",
-            "mamba_cache_dtype": "float32"
+            "mamba_cache_dtype": "float32",
+            "language_model_only": true
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -1425,7 +1428,8 @@
             "Checkpoint (N0 discovery, HANDOFF.md): compressed-tensors mixed-precision -- NVFP4 g16 (weight_packed U8 [N,K/2] + weight_scale F8_E4M3 [N,K/16] + weight_global_scale F32) on mlp layers 0-55; FP8 E4M3 per-channel (weight F8 [N,K] + weight_scale BF16 [N,1]) on attn qkvo, GDN qkv/z/out, lm_head, mlp 56-63. Input-activation quant in the checkpoint is ignored on Metal: both schemes serve as weight-only (W4A16/W8A16) against bf16 activations.",
             "model_mtp.safetensors is the model's own MTP head (bf16, mtp.* names in the weight-map index) -- excluded from the base-model load; speculation via qwen3_5_mtp is a later milestone.",
             "Engine settings inherited from the retired qwen38-1 Q4_K_M profile (same architecture, same GDN state contracts): V2 runner forced, DS conv layout, fp32 mamba cache, prefix caching off for hybrid state.",
-            "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up."
+            "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up.",
+            "language_model_only: the Metal variants serve text-only. The vision tower loads on MI300X; on Metal the multimodal processor chain would require torchvision (absent from the Metal serving env), and the campaign's pins are text-only."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -1479,7 +1483,8 @@
             "tool_call_parser": "qwen3_xml",
             "attention_backend": "TURBOQUANT",
             "kv_cache_dtype": "turboquant_k8v4",
-            "mamba_cache_dtype": "float32"
+            "mamba_cache_dtype": "float32",
+            "language_model_only": true
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -1494,7 +1499,8 @@
             "Continuation prefill (>128-token chunks) runs dequant-once via tq_decode_combined + SDPA (KV-tiled fp32 online softmax past 8k context); small chunks keep the synthetic-decode kernel. The pre-UPDATE-39 synthetic-decode-for-everything route made long prefill O(ctx^2) with a ~24x-redundant constant (16k prefill 406 s vs 111 s now).",
             "LONG-CONTEXT VALIDATED 2026-08-21 (UPDATE 39): with --ctx 262144 (native max_position_embeddings, no rope scaling) the needle ladder passes EXACT at 16k/65k/131k/262k depths; the 262k leg = 259,888 prompt tokens, 75 min prefill. Prefill cost model T(C) ~= 6.4e-3*C + 3.9e-8*C^2 seconds. Canonical bf16 cannot admit a 262k request; this profile holds 292,882 KV tokens.",
             "Use case: capacity/long-context — k8v4 compresses full-attn KV 4096 -> 1728 bytes/token (~2.4x, target and drafter). Measured: 292,882 KV tokens vs canonical 158,038 under the same 16 GiB budget (1.85x; 8.94x vs 4.82x concurrency at 32k). Since UPDATE 40 this profile also wins on throughput at c4/c8/2500x64 and trails c1 by 0.8%; the canonical default is a flagged quality decision (k8v4 KV cos ~0.9955 floor vs bf16), not a TPS one.",
-            "Engine settings otherwise identical to qwen38-nvfp4-1 (adaptive DFlash2 spec, V2 runner, DS conv layout, async scheduling)."
+            "Engine settings otherwise identical to qwen38-nvfp4-1 (adaptive DFlash2 spec, V2 runner, DS conv layout, async scheduling).",
+            "language_model_only: the Metal variants serve text-only. The vision tower loads on MI300X; on Metal the multimodal processor chain would require torchvision (absent from the Metal serving env), and the campaign's pins are text-only."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",

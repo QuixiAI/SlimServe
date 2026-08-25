@@ -862,16 +862,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         return self._forward_method(hidden_states)
 
-    def _output_projection(
+    def _gated_norm(
         self,
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
     ) -> torch.Tensor:
-        """Part 3: RMSNormGated + output linear projection.
-
-        The RMSNormGated + quant sequence is eligible for fusion
-        by the compilation pass when fuse_norm_quant is enabled.
-        """
+        """RMSNormGated over the core output; returns [..., Hv*Dv] rows."""
         z_shape_og = z.shape
         if (
             core_attn_out.dim() == 3
@@ -890,14 +886,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self._fused_gdn_norm_weight(),
                 self.norm.eps,
             )
-            output, _ = self.out_proj(core_attn_out.flatten(-2))
-            return output
+            return core_attn_out.flatten(-2)
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
-        output, _ = self.out_proj(core_attn_out)
+        return core_attn_out.flatten(-2)  # ... h d -> ... (h d)
+
+    def _output_projection(
+        self,
+        core_attn_out: torch.Tensor,
+        z: torch.Tensor,
+    ) -> torch.Tensor:
+        """Part 3: RMSNormGated + output linear projection.
+
+        The RMSNormGated + quant sequence is eligible for fusion
+        by the compilation pass when fuse_norm_quant is enabled.
+        """
+        output, _ = self.out_proj(self._gated_norm(core_attn_out, z))
         return output
 
     def _fused_gdn_norm_ok(self, x: torch.Tensor, z: torch.Tensor) -> bool:
@@ -1188,15 +1194,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return _zeros()
 
         if attn_metadata.spec_sequence_masks is not None:
-            if not self._metal_gdn_enabled():
-                raise NotImplementedError(
-                    "Speculative GDN on MPS requires the Metal kernel path "
-                    "(VLLM_METAL_GDN=1); the torch fallback has no spec "
-                    "route."
+            if self._metal_gdn_enabled():
+                normed = self._forward_core_metal_spec(mixed_qkv, ba, z, attn_metadata)
+            else:
+                # The in-place native core carries its own spec-verify route
+                # (fused Metal step when eligible, torch otherwise).
+                normed = self._forward_core_native(
+                    mixed_qkv, ba, z, num_tokens, num_actual_tokens
                 )
-            normed = self._forward_core_metal_spec(mixed_qkv, ba, z, attn_metadata)
         elif self._metal_gdn_enabled():
             normed = self._forward_core_metal(mixed_qkv, ba, z, attn_metadata)
+        elif self._fused_gdn_enabled():
+            normed = self._forward_core_native(
+                mixed_qkv, ba, z, num_tokens, num_actual_tokens
+            )
         else:
             normed = self._forward_core_torch(mixed_qkv, ba, z, attn_metadata)
 
@@ -1205,6 +1216,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out = _zeros()
         out[:num_actual_tokens] = normed
         return out
+
+    def _forward_core_native(
+        self,
+        mixed_qkv: torch.Tensor,
+        ba: torch.Tensor,
+        z: torch.Tensor,
+        num_tokens: int,
+        num_actual_tokens: int,
+    ) -> torch.Tensor:
+        """Adapter onto ``_forward_core_mps_native`` (the in-place container
+        core): split ``ba``, allocate the [tokens, Hv, Dv] container, run the
+        core (fused Metal GDN step when eligible, torch scans otherwise, spec
+        verify included), then the gated norm. Returns
+        [num_actual_tokens, Hv*Dv]."""
+        b, a = self.split_ba(ba)
+        core_attn_out = torch.zeros(
+            (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
+            dtype=mixed_qkv.dtype,
+            device=mixed_qkv.device,
+        )
+        self._forward_core_mps_native(mixed_qkv, b, a, core_attn_out)
+        return self._gated_norm(
+            core_attn_out[:num_actual_tokens], z[:num_actual_tokens]
+        )
 
     def _forward_core_torch(
         self,
@@ -1494,9 +1529,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # A hard raise (not assert): the consequence is a silent OOB
             # read, so this must survive python -O.
             if int(state_indices.min().item()) < 0:
-                raise RuntimeError(
-                    "negative state index reached the Metal GDN path"
-                )
+                raise RuntimeError("negative state index reached the Metal GDN path")
             st.checked_indices = True
 
         if num_prefills > 0:
@@ -2504,14 +2537,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         v = v.reshape(*tokens.shape[:2], -1, self.head_v_dim)
         return q, k, v
 
-    def _forward_core_mps(
+    def _forward_core_mps_native(
         self,
         mixed_qkv: torch.Tensor,
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
     ):
-        """Torch-native core for Apple Metal (MPS).
+        """Torch-native core for Apple Metal (MPS), filling ``core_attn_out``
+        in place; reached through the ``_forward_core_native`` adapter when
+        the five-kernel Metal path is off.
 
         Mirrors ``_forward_core`` semantics (causal_conv1d +
         fused_recurrent/chunk gated delta rule Triton kernels) with plain
