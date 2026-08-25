@@ -412,6 +412,7 @@ kernel families and speculation economics.
   Both 12K rows reproduced bit-exactly across the round-2 build (same
   shas, two boots). Cold/hot shas differ by design (partial-block APC
   recompute changes reduction shapes).
+
 - **FINDING — prefill is the new top surface: ~74 tok/s LINEAR
   (13.5 ms/token), only ~2x decode's per-token cost.** Chunked 2048-
   token prefill should amortize weight reads to hundreds of tok/s;
@@ -641,7 +642,7 @@ two-chunk wedge is a deterministic FIRST-MULTI-CHUNK-REQUEST ordering
 effect, not xctrace poisoning and not the build — see
 optimization_status "v12 RE-GATE" entry and the boot protocol in
 perf/prefill_handoff.md STATUS UPDATE 7. Artifacts:
-perf/results/2026-08-14/prefill_ext_v1/ (*_v12b_*.json, boot_v12*.log).
+perf/results/2026-08-14/prefill_ext_v1/ (**v12b**.json, boot_v12*.log).
 
 ## UPDATE 27 (2026-08-14): cleanup phase re-gated bit-exact — UPDATE 26 stands unchanged
 
@@ -666,8 +667,8 @@ vllm/models/deepseek_v4/{compressor,metal}.py keep their phaseprof
 brackets and marshalling-memo conditionals because removing them flips
 the race (boot-level bisect in the cleanup entry). Root-cause fix is
 queued follow-up work. Artifacts:
-perf/results/2026-08-14/cleanup_gate/ (*_ship.json, walls_ship.log,
-boot_*.log).
+perf/results/2026-08-14/cleanup_gate/ (**ship.json, walls_ship.log,
+boot**.log).
 
 ## UPDATE 28 (2026-08-14): origin/main merged — 256K profile becomes the serving config; anchors re-pinned
 
@@ -767,6 +768,7 @@ boot_*.log).
 - Raw artifacts: perf/results/2026-08-17/decode_exact_gate/
   (boot.log, 8tok.json, off1-2000.json, 2500x64.json with full response
   text).
+
 ## Muse-Glimmer-30B (Metal, M5 Max 128 GB)
 
 ### Speculative Serving Baseline - 2026-08-14
@@ -900,3 +902,73 @@ gather is exact before and beyond 2^31 source elements; 20 repeated speculative
 requests stay finite and token-stable across the former corruption window;
 final focused suite 17 passed and SlimServe suite 58 passed/1 skipped. Raw:
 `perf/results/2026-08-23/qwen38-kv-gather/`.
+
+## Qwen3.8-27B NVFP4
+
+### MI300X Single-GPU Exact Baseline - 2026-08-19 (optimization pass 2)
+
+- As below, plus: fused NVFP4-QDQ+Q8_1 activation kernel and bf16 GEMV
+  epilogue (bit-identical, fewer kernels), nontemporal weight streaming, and
+  aiter-tuned FP8 GEMM configs for this model's decode shapes
+  (AiterPreshuffled kernels; lm_head stays RowWiseTorch).
+- Workload: hot server, 1,000 input tokens, exactly 2,000 output tokens.
+
+| Concurrency | Aggregate tok/s | Exact |
+| ---: | ---: | --- |
+| 1 | 170.92 / 170.99 | yes |
+| 8 | 875.71 / 912.41 | yes |
+
+Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/`
+(opt2_*/opt3_* files).
+
+### Superseded MI300X Single-GPU Exact Baseline - 2026-08-19 (native kernel)
+
+- Model: unsloth/Qwen3.8-27B-NVFP4; profile `qwen38-nvfp4-1`, TP1, 262,144
+  context, MTP spec k=2, FULL_DECODE_ONLY graphs (capture 64). Decode-width
+  NVFP4 GEMMs run the vendored QuixiCore HIP packed-E2M1 q8 GEMV
+  (csrc/quixicore/tm_rocm/qc_rocm_nvfp4.cu); wider batches use the
+  load-time-dequantized bf16 copy through hipBLASLt.
+- Workload: hot server, 1,000 input tokens, exactly 2,000 output tokens.
+
+| Concurrency | Aggregate tok/s | Exact |
+| ---: | ---: | --- |
+| 1 | 157.09 / 157.10 | yes |
+| 8 | 911.63 / 887.77 | yes |
+
+Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/`
+(native_* files). Headroom: MFMA packed MMQ for M >= 8 (retires the bf16
+copy), aiter FP8 tuned configs for this model's decode shapes, drafter graph
+coverage.
+
+### Superseded MI300X Single-GPU Exact Baseline - 2026-08-18 (tuned)
+
+- Model: unsloth/Qwen3.8-27B-NVFP4; profile `qwen38-nvfp4-1`, TP1, 262,144
+  context, MTP spec k=2, FULL_DECODE_ONLY graphs (capture 64), NVFP4
+  emulation with load-time dequant cache (bit-identical, ~22 GiB extra VRAM).
+- Workload: hot server, 1,000 input tokens, exactly 2,000 output tokens.
+
+| Concurrency | Aggregate tok/s | Exact |
+| ---: | ---: | --- |
+| 1 | 144.61 / 144.65 | yes |
+| 8 | 822.89 / 952.79 | yes |
+
+Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/`.
+
+### Superseded MI300X Single-GPU Exact Baseline - 2026-08-18 (initial)
+
+- Model: unsloth/Qwen3.8-27B-NVFP4 (compressed-tensors mixed FP8 + NVFP4
+  safetensors; vision tower bf16; built-in one-layer MTP drafter).
+- Profile: `qwen38-nvfp4-1`, TP1 on 1x MI300X, 262,144-token context,
+  kv_cache_dtype auto, linear_backend auto, CUDA graphs off, MTP spec k=2.
+- Workload: hot server, 1,000 input tokens, exactly 2,000 output tokens.
+- NVFP4 MLP weights decode through the ROCm emulation kernel (gfx942 has no
+  FP4 hardware); FP8 GEMMs run RowWiseTorch hipBLASLt (aiter shapes untuned).
+
+| Concurrency | Aggregate tok/s | Median wall s | Exact | Spec acceptance |
+| ---: | ---: | ---: | --- | ---: |
+| 1 | 30.67 / 35.73 | 65.20 / 55.97 | yes | 81% / 99.6% |
+| 8 | 230.57 / 227.20 | 60.35 / 58.52 | yes | 96.4% / 95.1% |
+
+Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-baseline/`.
+Headroom (unmeasured): native gfx942 NVFP4 decode, aiter FP8 shape tuning,
+graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.

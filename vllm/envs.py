@@ -140,6 +140,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
+    VLLM_NVFP4_EMULATION_CACHE_WEIGHTS: bool = True
+    VLLM_NVFP4_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1228,6 +1230,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # NVFP4 emulation: dequantize weights once at load time (trades VRAM for
+    # removing per-forward dequant traffic). Bit-identical either way.
+    "VLLM_NVFP4_EMULATION_CACHE_WEIGHTS": lambda: (
+        os.getenv("VLLM_NVFP4_EMULATION_CACHE_WEIGHTS", "True").lower() in ("true", "1")
+    ),
+    # ROCm NVFP4: fused triton w4a16 GEMM reading packed weights directly.
+    # Set to 0 to fall back to the emulation kernel.
+    "VLLM_NVFP4_TRITON_GEMM": lambda: (
+        os.getenv("VLLM_NVFP4_TRITON_GEMM", "True").lower() in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

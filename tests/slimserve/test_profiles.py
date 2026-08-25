@@ -104,6 +104,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-27b-nvfp4"]["modalities"] == ["text", "image"]
 
 
 def test_qwen38_uses_measured_metal_speculation_settings():
@@ -138,6 +139,11 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
     for profile_id in compatible_profile_ids(machine):
         plan = resolve(profile_id, "mi300x", 8, None)
         speculative = validate_acceleration(plan)
+        if profile_id == "qwen38-nvfp4-1":
+            # The checkpoint ships its own MTP head; there is no separate
+            # DSpark artifact or TurboQuant draft cache to require.
+            assert speculative["method"] == "qwen3_5_mtp"
+            continue
         assert speculative["method"] == "dspark"
         assert speculative["attention_backend"] == "TURBOQUANT"
         assert speculative["kv_cache_dtype"] == "turboquant_k8v4"
@@ -303,6 +309,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "dsv4-flash",
         "muse-glimmer",
         "qwen38-27b",
+        "qwen38-27b-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -634,6 +641,10 @@ def test_profiles_use_their_validated_graph_mode():
                 or platform == "metal"
             ):
                 assert cudagraph_mode == "NONE", (profile_id, platform)
+            elif profile_id == "qwen38-nvfp4-1":
+                # Qualified 2026-08-18: FULL_DECODE_ONLY capture 64 measured
+                # 1.4x at c1 on the hybrid GDN + MTP decode.
+                assert cudagraph_mode == "FULL_DECODE_ONLY", profile_id
             else:
                 assert cudagraph_mode not in (None, "NONE"), profile_id
 

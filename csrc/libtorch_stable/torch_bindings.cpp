@@ -629,7 +629,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 
   ops.def(
       "ggml_dsv4_moe_a8(Tensor X, Tensor W1, Tensor W2, "
-      "Tensor topk_weights, Tensor topk_ids, Tensor sorted_token_ids, Tensor w1_expert_ids, "
+      "Tensor topk_weights, Tensor topk_ids, Tensor sorted_token_ids, Tensor "
+      "w1_expert_ids, "
       "Tensor w2_expert_ids, Tensor num_tokens_post_padded, "
       "SymInt intermediate, SymInt out_row, SymInt top_k, "
       "SymInt tokens, float swiglu_limit, bool w1_repacked=False, "
@@ -647,14 +648,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_dsv4_moe_down_output_owned(Tensor W2, Tensor quant_mid, "
       "Tensor topk_ids, SymInt tokens, SymInt top_k) -> Tensor");
 
-  ops.def(
-      "ggml_dsv4_repack_q2_k(Tensor W2, SymInt intermediate) -> Tensor");
+  ops.def("ggml_dsv4_repack_q2_k(Tensor W2, SymInt intermediate) -> Tensor");
 
-  ops.def(
-      "ggml_dsv4_repack_iq2_xxs(Tensor W1, SymInt hidden) -> Tensor");
+  ops.def("ggml_dsv4_repack_iq2_xxs(Tensor W1, SymInt hidden) -> Tensor");
 
-  ops.def(
-      "ggml_dsv4_repack_mxfp4(Tensor W, SymInt values_per_row) -> Tensor");
+  ops.def("ggml_dsv4_repack_mxfp4(Tensor W, SymInt values_per_row) -> Tensor");
 
   ops.def(
       "ggml_dsv4_moe_a8_q4k(Tensor X, Tensor W1, Tensor W2, "
@@ -876,8 +874,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_dsv4_moe_down_output_owned",
            TORCH_BOX(&ggml_dsv4_moe_down_output_owned));
   ops.impl("ggml_dsv4_repack_q2_k", TORCH_BOX(&ggml_dsv4_repack_q2_k));
-  ops.impl("ggml_dsv4_repack_iq2_xxs",
-           TORCH_BOX(&ggml_dsv4_repack_iq2_xxs));
+  ops.impl("ggml_dsv4_repack_iq2_xxs", TORCH_BOX(&ggml_dsv4_repack_iq2_xxs));
   ops.impl("ggml_dsv4_repack_mxfp4", TORCH_BOX(&ggml_dsv4_repack_mxfp4));
   ops.impl("ggml_dsv4_moe_a8_q4k", TORCH_BOX(&ggml_dsv4_moe_a8_q4k));
   ops.impl("ggml_dsv4_moe_a8_mxfp4", TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4));
@@ -885,8 +882,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
            TORCH_BOX(&ggml_dsv4_moe_a8_mxfp4_seg));
   ops.impl("ggml_dsv4_moe_a8_iq2_seg", TORCH_BOX(&ggml_dsv4_moe_a8_iq2_seg));
 #ifndef USE_ROCM
-  ops.impl("ggml_dsv4_rms_norm_q8_1",
-           TORCH_BOX(&ggml_dsv4_rms_norm_q8_1));
+  ops.impl("ggml_dsv4_rms_norm_q8_1", TORCH_BOX(&ggml_dsv4_rms_norm_q8_1));
   ops.impl("ggml_mul_mat_vec_prequant_a8",
            TORCH_BOX(&ggml_mul_mat_vec_prequant_a8));
   ops.impl("ggml_dsv4_repack_q8_0_aligned",
@@ -1039,8 +1035,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
       "all_reduce_add_rms_norm(int fa, Tensor inp, Tensor! residual, "
       "Tensor weight, Tensor! out, float epsilon, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
+#if !defined(USE_ROCM)  // DSV4 mHC all-reduce family: Ampere-only
   custom_ar.def(
-      "all_reduce_dsv4_mhc(int fa, Tensor inp, Tensor? addend, Tensor residual, "
+      "all_reduce_dsv4_mhc(int fa, Tensor inp, Tensor? addend, Tensor "
+      "residual, "
       "Tensor post_mix, Tensor comb_mix, Tensor fn, Tensor! residual_out, "
       "Tensor! partial, Tensor scale, Tensor base, Tensor! next_post, "
       "Tensor! next_comb, Tensor! layer_input, Tensor? norm_weight, "
@@ -1058,7 +1056,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
       "float post_multiplier, int sinkhorn_repeat, float norm_eps, "
       "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
   custom_ar.def(
-      "dsv4_channel_owned_mhc(int fa, Tensor inp, Tensor? addend, Tensor residual, "
+      "dsv4_channel_owned_mhc(int fa, Tensor inp, Tensor? addend, Tensor "
+      "residual, "
       "Tensor post_mix, Tensor comb_mix, Tensor fn, Tensor! residual_out, "
       "Tensor! partial, Tensor scale, Tensor base, Tensor! next_post, "
       "Tensor! next_comb, Tensor! layer_input, Tensor norm_weight, "
@@ -1107,6 +1106,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
   custom_ar.def(
       "dsv4_owned_reduce_scatter(int fa, Tensor input, Tensor? addend, "
       "Tensor! output, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+#endif  // !defined(USE_ROCM)
   custom_ar.def(
       "dsv4_indexer_peer_topk(int fa, Tensor logits, Tensor lengths, "
       "Tensor! output, Tensor workspace, int k, int max_seq_len, "
@@ -1115,7 +1115,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_custom_ar, custom_ar) {
       "dsv4_indexer_token_merge(int fa, Tensor logits, Tensor lengths, "
       "Tensor local_indices, Tensor! output, int k, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
+#if !defined(USE_ROCM)  // DSV4 mHC all-reduce family: Ampere-only
   custom_ar.def("wait_dsv4_mhc(int fa, Tensor anchor) -> ()");
+#endif  // !defined(USE_ROCM)
   custom_ar.def("dispose(int fa) -> ()");
   custom_ar.def("meta_size() -> int");
   custom_ar.def("register_buffer(int fa, int[] ipc_tensors) -> ()");
@@ -1132,9 +1134,9 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
   custom_ar.impl("all_reduce_add_rms_norm",
                  TORCH_BOX(&all_reduce_add_rms_norm));
+#if !defined(USE_ROCM)  // DSV4 mHC all-reduce family: Ampere-only
   custom_ar.impl("all_reduce_dsv4_mhc", TORCH_BOX(&all_reduce_dsv4_mhc));
-  custom_ar.impl("dsv4_channel_owned_mhc",
-                 TORCH_BOX(&dsv4_channel_owned_mhc));
+  custom_ar.impl("dsv4_channel_owned_mhc", TORCH_BOX(&dsv4_channel_owned_mhc));
   custom_ar.impl("dsv4_channel_owned_q2_down",
                  TORCH_BOX(&dsv4_channel_owned_q2_down));
   custom_ar.impl("dsv4_owned_attention_projections",
@@ -1144,21 +1146,19 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("dsv4_owned_router", TORCH_BOX(&dsv4_owned_router));
   custom_ar.impl("dsv4_channel_owned_q2_down_pending",
                  TORCH_BOX(&dsv4_channel_owned_q2_down_pending));
-  custom_ar.impl("dsv4_channel_owned_moe",
-                 TORCH_BOX(&dsv4_channel_owned_moe));
-  custom_ar.impl("dsv4_output_owned_moe",
-                 TORCH_BOX(&dsv4_output_owned_moe));
-  custom_ar.impl("dsv4_output_owned_q8",
-                 TORCH_BOX(&dsv4_output_owned_q8));
+  custom_ar.impl("dsv4_channel_owned_moe", TORCH_BOX(&dsv4_channel_owned_moe));
+  custom_ar.impl("dsv4_output_owned_moe", TORCH_BOX(&dsv4_output_owned_moe));
+  custom_ar.impl("dsv4_output_owned_q8", TORCH_BOX(&dsv4_output_owned_q8));
   custom_ar.impl("dsv4_owned_reduce_scatter",
                  TORCH_BOX(&dsv4_owned_reduce_scatter));
-  custom_ar.impl("all_reduce_dsv4_q2_mhc",
-                 TORCH_BOX(&all_reduce_dsv4_q2_mhc));
-  custom_ar.impl("dsv4_indexer_peer_topk",
-                 TORCH_BOX(&dsv4_indexer_peer_topk));
+  custom_ar.impl("all_reduce_dsv4_q2_mhc", TORCH_BOX(&all_reduce_dsv4_q2_mhc));
+#endif  // !defined(USE_ROCM)
+  custom_ar.impl("dsv4_indexer_peer_topk", TORCH_BOX(&dsv4_indexer_peer_topk));
   custom_ar.impl("dsv4_indexer_token_merge",
                  TORCH_BOX(&dsv4_indexer_token_merge));
+#if !defined(USE_ROCM)  // DSV4 mHC all-reduce family: Ampere-only
   custom_ar.impl("wait_dsv4_mhc", TORCH_BOX(&wait_dsv4_mhc));
+#endif  // !defined(USE_ROCM)
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CPU, custom_ar) {

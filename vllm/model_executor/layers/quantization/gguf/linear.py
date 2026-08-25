@@ -368,6 +368,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {qweight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._create_hetero_shard_weights(layer)
         self._create_dsv4_aligned_q8_weight(layer)
         self._create_muse_u4_weight(layer)
 
@@ -428,6 +429,48 @@ class GGUFLinearMethod(LinearMethodBase):
 
     def _materialize_qweight_type(self, layer: torch.nn.Module) -> None:
         _materialize_gguf_weight_type_parameter(layer, "qweight_type")
+
+    def _create_hetero_shard_weights(self, layer: torch.nn.Module) -> None:
+        """Split a merged buffer whose shards carry different quant types.
+
+        Mixed shard quant types cannot ride one fused matmul, and slicing the
+        padded merged buffer per call would copy the quantized bytes on EVERY
+        forward (measured 447 us for a 17.5 MB QKV on Metal, ~8x the matvec
+        itself). So the contiguous per-shard views are materialized once and
+        the padded buffer's storage is released: it is never read again on
+        this path, keeping the swap net-zero in memory rather than a
+        persistent duplicate.
+
+        This runs at load time, NOT lazily on the first forward. Doing it in
+        `apply` freed a parameter's storage in the middle of the traced
+        graph, so AOT autograd would later try to regenerate a shard view
+        against the emptied base and die with
+        `setStorage: ... out of bounds for storage of size 0` -- which is
+        what made every compiled GGUF run of a mixed-type merged layer (for
+        example Qwen3.5 `in_proj_qkvz`, gate and qkv quantized differently)
+        fail at startup.
+        """
+        qweight = layer.qweight
+        shard_id = qweight.shard_id
+        if not shard_id or not getattr(qweight, "shard_offset_map", None):
+            return
+        shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+        fallback_wtype = layer.qweight_type.weight_type
+        shard_weight_types = [
+            layer.qweight_type.shard_weight_type.get(idx, fallback_wtype)
+            for idx in shard_id
+        ]
+        if len(set(shard_weight_types)) == 1:
+            # Homogeneous: the fused matmul reads the merged buffer directly.
+            return
+        shards = []
+        for idx, shard_type in zip(shard_id, shard_weight_types):
+            start, end, offset = qweight.shard_offset_map[idx]
+            shards.append((qweight[start:end, :offset].contiguous(), shard_type))
+        layer._gguf_hetero_shards = shards
+        # Keep the parameter object (the shard maps and attribute checks ride
+        # on it); drop only its storage.
+        layer.qweight.data = layer.qweight.data.new_empty(0)
 
     def _create_padded_weight_param(self, layer: torch.nn.Module):
         """Create padded weight parameter for GGUF MergedLinear layer."""
@@ -524,28 +567,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 if bias is not None:
                     out.add_(bias)
                 return out
-            # Mixed shard quant types cannot ride one fused matmul. Slicing
-            # the padded merged buffer per call would copy the quantized
-            # bytes on EVERY forward (measured 447 us for a 17.5 MB QKV on
-            # Metal, ~8x the matvec itself), so materialize the contiguous
-            # per-shard views once and release the padded buffer: it is
-            # never read again on this path, keeping the swap net-zero in
-            # memory rather than a persistent duplicate.
-            shards = getattr(layer, "_gguf_hetero_shards", None)
-            if shards is None:
-                shards = []
-                for idx in shard_id:
-                    start, end, offset = layer.qweight.shard_offset_map[idx]
-                    qweight_type = layer.qweight_type.shard_weight_type.get(
-                        idx, fallback_wtype
-                    )
-                    shards.append(
-                        (qweight[start:end, :offset].contiguous(), qweight_type)
-                    )
-                layer._gguf_hetero_shards = shards
-                # Keep the parameter object (the shard maps and attribute
-                # checks ride on it); drop only its storage.
-                layer.qweight.data = layer.qweight.data.new_empty(0)
+            # Mixed shard quant types cannot ride one fused matmul; the
+            # contiguous per-shard views were materialized at load time by
+            # `_create_hetero_shard_weights` (doing it here would mutate a
+            # parameter inside the traced graph -- see that method).
+            shards = layer._gguf_hetero_shards
             result = [
                 fused_mul_mat_gguf_op(x, shard_weight, shard_type)
                 for shard_weight, shard_type in shards

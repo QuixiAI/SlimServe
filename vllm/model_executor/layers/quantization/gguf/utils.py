@@ -85,13 +85,22 @@ DEQUANT_TYPES = (
 MMVQ_QUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | MXFP4_QUANT_TYPES
 )
-# IQ2_XXS is the only imatrix quant with a CUDA/HIP tile kernel. The rest of
-# IMATRIX_QUANT_TYPES stays vector-only there, so it is listed on its own
-# rather than folding the whole set in.
-MMQ_IMATRIX_QUANT_TYPES = {WeightType.IQ2_XXS}
-MMQ_QUANT_TYPES = (
-    STANDARD_QUANT_TYPES | KQUANT_TYPES | MXFP4_QUANT_TYPES | MMQ_IMATRIX_QUANT_TYPES
-)
+# Tile-kernel coverage differs between the DENSE and MoE entry points, so the
+# two get separate lists. Conflating them is what broke Qwen3.8 GGUF prefill:
+# IQ2_XXS has a tile kernel only in moe.cuh, but it was listed in the single
+# shared MMQ set, so dense layers were routed to `ggml_mul_mat_a8`, whose
+# switch has no case for it. With no `default:` there, the call returned its
+# output buffer untouched -- zeros on ROCm, uninitialised on CUDA -- silently
+# corrupting every prefill through an IQ2_XXS layer.
+#
+# Dense (mmq.cuh): standard quants, k-quants and MXFP4 only. Imatrix quants
+# stay vector-only; past the mmvq batch limit they fall through to
+# DEQUANT_TYPES, which is exact.
+MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | MXFP4_QUANT_TYPES
+# MoE (moe.cuh): the same set plus IQ2_XXS, which is the DSV4 gate/up format
+# and does have a real MoE tile kernel (`ggml_moe_iq2_xxs_q8_1_cuda`).
+MOE_MMQ_IMATRIX_QUANT_TYPES = {WeightType.IQ2_XXS}
+MOE_MMQ_QUANT_TYPES = MMQ_QUANT_TYPES | MOE_MMQ_IMATRIX_QUANT_TYPES
 # The Metal tile GEMM (qgemm.metal) decodes the full GGUF imatrix set
 # (dequant.metal tile decoders + qgemm/qgemm_frag instantiations).
 METAL_MMQ_QUANT_TYPES = (

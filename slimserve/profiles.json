@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K, q2kxl=UD-Q2_K_XL.",
+  "comment": "Profile ids follow <model>-<quant>-<gpus>. A profile lists exactly the platforms it is validated on; resolve() refuses anywhere else. Quant tags: xxs=IQ2_XXS(-Q2_K), q4ktail=Q4K-tail, mxfp4=MXFP4, q4k=Q4_K, q2k=Q2_K, q2kxl=UD-Q2_K_XL, nvfp4=NVFP4.",
   "sources": {
     "glm52-vision": {
       "title": "GLM-5.2-Vision",
@@ -353,6 +353,86 @@
         }
       }
     },
+    "qwen38-27b-nvfp4": {
+      "title": "Qwen3.8-27B",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "unsloth/Qwen3.8-27B-NVFP4",
+      "base_url": "https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4/resolve/main",
+      "local_dir": "Qwen3.8-27B-NVFP4",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower and processor configs ship in the same repo, so there is no separate projector to fetch.",
+      "speculator": {
+        "repo": "unsloth/Qwen3.8-27B-NVFP4",
+        "local_dir": "Qwen3.8-27B-NVFP4",
+        "engine": {
+          "method": "qwen3_5_mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint ships its own one-layer MTP drafter (model_mtp.safetensors, covered by the weight index), so the draft model is the target directory itself. The single MTP layer is reused across speculation steps."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (mixed FP8/NVFP4, compressed-tensors)",
+          "bytes": 23444503536,
+          "summary": "The only published quant: NVFP4 MLP weights with FP8 attention, linear-attention, lm_head and last-eight MLP layers; the vision tower stays bf16. 64 layers at 3:1 linear-to-full attention, 262144-token context.",
+          "min_gpus": {
+            "mi300x": 1
+          },
+          "files": [
+            {
+              "path": "config.json",
+              "bytes": 22564
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 214
+            },
+            {
+              "path": "model.safetensors",
+              "bytes": 22568192096,
+              "sha256": "c473512c70eace07e2256fe9fd76596ac03e3295bee7d54cfb72676416afcc05"
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 164371
+            },
+            {
+              "path": "model_mtp.safetensors",
+              "bytes": 849400392,
+              "sha256": "1d8268aa85ace093a561e3e7b63b9d390dac1cd55a90cd55b5ec509c3c9da9fe"
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 19989325,
+              "sha256": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 1047
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 9993
+            }
+          ]
+        }
+      }
+    },
     "muse-glimmer": {
       "title": "Muse-Glimmer-30B",
       "modalities": [
@@ -458,15 +538,15 @@
         "local_dir": "Qwen3.8-27B-DFlash2-GGUF",
         "file": {
           "path": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
-          "bytes": 1143006752,
-          "sha256": "18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594"
+          "bytes": 1143006816,
+          "sha256": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd"
         },
         "engine": {
           "method": "dflash",
           "num_speculative_tokens": 3,
           "quantization": "gguf"
         },
-        "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], trained with block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; the Metal profile uses the first 3 draft positions because its M=4 verify kernel is faster on both retained text arms than verifying all 7 drafts."
+        "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], trained with block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; the Metal profile uses the first 3 draft positions because its M=4 verify kernel is faster on both retained text arms than verifying all 7 drafts. Re-blessed 2026-08-25: z-lab republished the file (1,143,006,752 -> 1,143,006,816 B) to fix an off-by-one in dflash.target_layers, which are 1-based in the GGUF and converted with layer-1 at load. The old file stored [5, 19, 33, 47, 61] and therefore read target layers [4, 18, 32, 46, 60] -- one lower than intended; the new file stores [6, 20, 34, 48, 62] and reads the documented [5, 19, 33, 47, 61]. Verified by reading the republished file's metadata, not by trusting the upload: 5 blocks, block size 8, SWA 2048, 32/8 heads at 128, hidden 5120, selector rank 256 top-16, two-tap conv (group 16), mask token 248070."
       }
     }
   },
@@ -1187,6 +1267,47 @@
         "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
       ]
     },
+    "qwen38-nvfp4-1": {
+      "title": "Qwen3.8-27B NVFP4 on 1 GPU",
+      "source": "qwen38-27b-nvfp4",
+      "gpus": 1,
+      "platforms": [
+        "mi300x"
+      ],
+      "default_quant": "NVFP4",
+      "summary": "Vision-language 27B hybrid (gated-deltanet linear attention, 1-in-4 full attention) on a single MI300X. 23 GiB of weights leave most of the card for KV and linear-attention state.",
+      "engine": {
+        "tensor_parallel_size": 1,
+        "max_model_len": 262144,
+        "max_num_seqs": 64,
+        "gpu_memory_utilization": 0.9,
+        "kv_cache_dtype": "auto",
+        "linear_backend": "auto",
+        "kernel_config": {
+          "linear_backend": "auto"
+        },
+        "compilation_config": {
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "max_cudagraph_capture_size": 64
+        },
+        "reasoning_parser": "qwen3",
+        "tool_call_parser": "qwen3_xml",
+        "served_model_name": "Qwen3.8-27B"
+      },
+      "speculative": true,
+      "env": {
+        "VLLM_ROCM_USE_AITER": "1"
+      },
+      "notes": [
+        "NVFP4 MLP weights decode through the ROCm emulation NVFP4 linear kernel (gfx942 has no FP4 hardware); the FP8 tensors use the native MI300X FP8 path. A native gfx942 NVFP4 decode kernel is an open optimization, not a blocker.",
+        "linear_backend must be auto, not this fork's aiter default: the aiter filter leaves no NVFP4 kernel at all, and the aiter FP8 scaled-mm kernels refuse this model's untuned GEMM shapes (e.g. the 16384x5120 GDN qkvz projection). Auto keeps aiter where its tuned configs exist and falls back elsewhere; tuning the Qwen3.8 FP8 shapes in aiter is the follow-up optimization. Both the top-level flag and kernel_config.linear_backend must be set: the top-level flag defaults to aiter and overwrites the kernel_config value whenever it is not auto.",
+        "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for its GLM target, and the hybrid GDN/full-attention cache has only been validated at auto here.",
+        "FULL_DECODE_ONLY graph capture (size 64) is qualified for this hybrid GDN + MTP path and is a measured 1.4x at c1: unlike Kimi's KDA, the qwen GDN decode captures cleanly on ROCm. Capture 64 covers the c8 spec verify width.",
+        "NVFP4 layers run the vendored QuixiCore HIP kernels (RocmNativeNvFp4LinearKernel): decode-width calls (M<=4, the c1 spec-verify size) read the packed E2M1 weight directly through the q8 dp4a GEMV (measured 1.3-1.8x per layer), wider batches use a load-time-dequantized bf16 copy through hipBLASLt (~22 GiB extra weights memory) until the MFMA packed MMQ exists. VLLM_NVFP4_TRITON_GEMM=0 falls back to the emulation kernel, whose own load-time cache is controlled by VLLM_NVFP4_EMULATION_CACHE_WEIGHTS.",
+        "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
+        "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout."
+      ]
+    },
     "muse-kdyn-1": {
       "title": "Muse-Glimmer-30B on one Mac",
       "source": "muse-glimmer",
@@ -1257,7 +1378,7 @@
       },
       "notes": [
         "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
-        "Vision: qwen3_5_vision tower, 27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens, loaded from the published mmproj-F16 GGUF.",
+        "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
         "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
         "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
         "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."

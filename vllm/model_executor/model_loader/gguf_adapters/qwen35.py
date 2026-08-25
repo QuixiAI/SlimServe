@@ -87,7 +87,8 @@ _TOP_RENAMES = {
 # --- mmproj (vision tower, qwen3vl_merger) -------------------------------
 # GGUF names verified against the real mmproj-F16 dump (334 tensors, see
 # perf/qwen38_metal_design.md). Module names land under the
-# Qwen3_5ForConditionalGeneration tree (models/qwen3_5_vision.py).
+# Qwen3_5ForConditionalGeneration tree (models/qwen3_5.py -> qwen3_vl.py),
+# the same tree the safetensors checkpoint loads into.
 
 _V_BLK_RE = re.compile(r"^v\.blk\.(\d+)\.(.+?)\.(weight|bias)$")
 
@@ -115,8 +116,32 @@ _VISION_TOP_RENAMES = {
 
 # The two temporal conv taps (still images duplicate the frame, so the
 # taps are summed by construction); reassembled into the [out, C, T, P, P]
-# Conv3d layout flattened for the Linear patch embed.
+# Conv3d layout the HF checkpoint ships.
 _PATCH_EMBD_TAPS = ("v.patch_embd.weight", "v.patch_embd.weight.1")
+
+
+def _vision_linear_modules(depth: int) -> list[str]:
+    """Every linear in the mmproj tower, by its vLLM module path.
+
+    Listed exactly rather than by prefix: `is_layer_skipped_gguf` compares
+    a fused module's shard names against this list with the containment test
+    reversed (`shard_prefix in module_name`), so only an exact entry matches
+    for `attn.qkv`. All of these come from the F16 mmproj, never from the
+    quantized text GGUF.
+    """
+    names = [
+        "visual.patch_embed.proj",
+        "visual.merger.linear_fc1",
+        "visual.merger.linear_fc2",
+    ]
+    for idx in range(depth):
+        names += [
+            f"visual.blocks.{idx}.attn.qkv",
+            f"visual.blocks.{idx}.attn.proj",
+            f"visual.blocks.{idx}.mlp.linear_fc1",
+            f"visual.blocks.{idx}.mlp.linear_fc2",
+        ]
+    return names
 
 
 class Qwen35GGUFAdapter(GGUFWeightsAdapter):
@@ -194,6 +219,17 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             len(self._dequant_stems),
             sorted(_DEQUANT_TYPES),
         )
+        # The mmproj tower is entirely F16/F32 and is streamed by
+        # `_vision_weights` rather than through `gguf_to_hf_name_map`, so the
+        # base class's weight-type scan never sees it. Mark it unquantized
+        # explicitly: the shared vision modules take a quant_config (unlike a
+        # hand-rolled plain-Linear tower) and would otherwise be built
+        # expecting GGUF-packed weights.
+        vision_config = getattr(model_config.hf_config, "vision_config", None)
+        if vision_config is not None:
+            for name in _vision_linear_modules(int(vision_config.depth)):
+                if name not in spec.unquantized_modules:
+                    spec.unquantized_modules.append(name)
         return spec
 
     def prepare_weights(
@@ -298,14 +334,14 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             raise RuntimeError(
                 f"mmproj patch-embed taps incomplete: found {sorted(taps)}"
             )
-        # [out, C, P, P] per tap -> [out, C, T, P, P] -> flattened Linear
-        # rows [C, T, P, P] (llama.cpp conversion/qwen3vl.py splits the HF
-        # Conv3d weight at dim 2, so stacking at dim 2 restores it).
+        # [out, C, P, P] per tap -> [out, C, T, P, P], which is exactly the
+        # HF Conv3d weight llama.cpp's conversion/qwen3vl.py split at dim 2.
+        # Restoring the 5-D shape (rather than flattening) is what lets the
+        # GGUF artifact load into the same Qwen3_VisionPatchEmbed the
+        # safetensors checkpoint uses; Conv3dLayer folds it back to a matmul
+        # at runtime because kernel_size == stride.
         fused = torch.stack([taps[name] for name in _PATCH_EMBD_TAPS], dim=2)
-        yield (
-            "visual.patch_embed.proj.weight",
-            fused.reshape(fused.shape[0], -1),
-        )
+        yield "visual.patch_embed.proj.weight", fused
         logger.info("Loaded %d vision tensors from mmproj", count)
 
     def transform_weight(self, hf_name: str, weight: torch.Tensor) -> torch.Tensor:
