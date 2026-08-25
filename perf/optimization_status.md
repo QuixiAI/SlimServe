@@ -14693,7 +14693,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - The PR branch merged main's parallel Qwen3.8 campaign (vision/MoE
   qwen3_5 stack, GGUF fixes, per-platform profiles schema, fused DFlash
   drafter CB, small-M GEMMs, stride-aware paged kernel + 64-bit KV
-  gather). 32 conflicts reconciled — details in merge commit dde1d7cf5.
+  gather). 32 conflicts reconciled — details in merge commit b59af307c.
   Key integration decisions: steady-decode metadata kept OURS (main's
   version excluded the GDN hybrid) + main's num_computed_tokens_cpu
   refresh grafted; metal_attn keeps split-K D=256 + bound machinery and
