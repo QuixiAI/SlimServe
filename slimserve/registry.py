@@ -72,11 +72,13 @@ def profile_blocked(profile_id: str, platform: str) -> str | None:
     if blocked:
         return blocked
     profile = describe(profile_id)
-    override = (profile.get("platform_overrides") or {}).get(platform) or {}
-    status = override.get("status", profile.get("status", "supported"))
+    if platform not in profile["platforms"]:
+        return None
+    record = profile["variants"][platform]
+    status = record.get("status", profile.get("status", "supported"))
     if status == "supported":
         return None
-    return override.get(
+    return record.get(
         "status_reason", profile.get("status_reason", "not supported yet")
     )
 
@@ -84,9 +86,9 @@ def profile_blocked(profile_id: str, platform: str) -> str | None:
 def profile_blocked_detail(profile_id: str, platform: str) -> str:
     """Long-form explanation for a profile-specific serving gate."""
     profile = describe(profile_id)
-    override = (profile.get("platform_overrides") or {}).get(platform) or {}
+    record = profile["variants"].get(platform) or {}
     return (
-        override.get("status_detail")
+        record.get("status_detail")
         or profile.get("status_detail")
         or profile_blocked(profile_id, platform)
         or ""
@@ -180,13 +182,32 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
 
 
 def describe(profile_id: str) -> dict[str, Any]:
-    """The raw registry entry, for listing without resolving a platform."""
+    """The registry entry, for listing without resolving a platform.
+
+    A profile is model x quant x platform x config, so the stored entry holds
+    one record per platform under `variants`. The id a user types carries no
+    platform -- the CLI detects it -- so this returns the shared fields plus
+    the platform list, and `variant()` returns the record for one platform.
+    """
     profiles = _registry()["profiles"]
     if profile_id not in profiles:
         raise ProfileError(
             f"unknown profile {profile_id!r}; available: {', '.join(profiles)}"
         )
-    return profiles[profile_id]
+    entry = profiles[profile_id]
+    return {**entry, "platforms": list(entry["variants"])}
+
+
+def variant(profile_id: str, platform: str) -> dict[str, Any]:
+    """The record for one platform, or an error naming the ones that exist."""
+    entry = describe(profile_id)
+    record = entry["variants"].get(platform)
+    if record is None:
+        raise ProfileError(
+            f"{profile_id} is not supported on {platform_title(platform)}; "
+            f"it runs on {', '.join(platform_title(p) for p in entry['platforms'])}"
+        )
+    return record
 
 
 def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Quant]:
@@ -202,31 +223,18 @@ def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Qu
 
 
 def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
-    """Apply a platform's overrides over the profile's base settings."""
-    override = (profile.get("platform_overrides") or {}).get(platform)
-    engine = dict(profile["engine"])
-    env = dict(profile.get("env") or {})
-    notes = list(profile.get("notes") or [])
-    speculative_overrides = dict(profile.get("speculative_overrides") or {})
-    default_quant = profile["default_quant"]
-    if override:
-        for key, value in (override.get("engine") or {}).items():
-            if value is None:
-                engine.pop(key, None)
-            else:
-                engine[key] = value
-        if "env" in override:
-            env = dict(override["env"])
-        if "notes" in override:
-            notes = list(override["notes"])
-        speculative_overrides.update(override.get("speculative_overrides") or {})
-        default_quant = override.get("default_quant", default_quant)
+    """The platform's own settings.
+
+    Kept as a function because callers read it as one shape; there is nothing
+    left to merge now that each platform has its own record.
+    """
+    record = profile["variants"][platform]
     return {
-        "engine": engine,
-        "env": env,
-        "notes": notes,
-        "default_quant": default_quant,
-        "speculative_overrides": speculative_overrides,
+        "engine": dict(record["engine"]),
+        "env": dict(record.get("env") or {}),
+        "notes": list(record.get("notes") or []),
+        "default_quant": record["default_quant"],
+        "speculative_overrides": dict(record.get("speculative_overrides") or {}),
     }
 
 
@@ -301,11 +309,7 @@ def resolve(
     # Quant-specific engine/env adjustments (e.g. a KV byte budget measured
     # for one artifact does not transfer to a larger one). Applied after the
     # platform merge so they win over both base and platform settings.
-    quant_override = (
-        ((profile.get("platform_overrides") or {}).get(platform) or {})
-        .get("quant_overrides", {})
-        .get(name)
-    )
+    quant_override = profile["variants"][platform].get("quant_overrides", {}).get(name)
     if quant_override:
         for key, value in (quant_override.get("engine") or {}).items():
             if value is None:
@@ -356,7 +360,7 @@ def _suggest(profile_id: str, platform: str, minimum: int) -> str:
     for other, entry in _registry()["profiles"].items():
         if (
             entry["source"] == source
-            and platform in entry["platforms"]
+            and platform in entry["variants"]
             and entry["gpus"] >= minimum
         ):
             return other

@@ -11085,3 +11085,66 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   revisited with a measured activation peak for DSV4.
 - Raw: perf/results/2026-08-25/profile-validation/ (post-fix server logs
   and per-request JSON) and ~/.local/scratch/dsv4-geom/probe_*.
+
+## 2026-08-25 - FIX: DFlash drafter wrote K/V in the wrong cache layout
+
+- Status: RESOLVED. DFlash2 speculation now passes the full profile smoke on
+  MI300X (text and image, k=3).
+- Found by finally exercising the registered speculator: every GGUF run
+  earlier in the session used `--no-spec`, because the drafter artifact's
+  pinned checksum had drifted and `slimserve.fetch` (correctly) refused it.
+  With the artifact re-blessed, the speculator ran for the first time and
+  died at startup:
+  `value tensor of shape [80, 8, 128] cannot be broadcast to indexing result
+  of shape [80, 256]`, from `precompute_and_store_context_kv`.
+- ROOT CAUSE: two KV cache layouts exist and they are not interchangeable.
+  - split  `(2, num_blocks, block_size, num_kv_heads, head_size)` -- leading
+    K/V planes; what the Metal path this drafter was written against uses.
+  - packed `(num_blocks, num_kv_heads, block_size, 2 * head_size)` -- K and V
+    interleaved in the content dim; what TRITON_ATTN (the backend actually
+    selected here) and ROCM_AITER_FA use.
+  The drafter hardcoded the split form, so `kv_cache[0]` indexed BLOCK 0 as
+  though it were the K plane. The trailing dim of the result, 256, is exactly
+  `2 * head_size` for this drafter's 128-wide heads -- which is what the error
+  was reporting.
+- Note the failure mode: the shapes stayed plausible. This surfaced as a
+  broadcast error only because 8 kv heads x 128 does not divide into
+  2 x 128. With arithmetic that happened to line up it would have silently
+  written K and V into the wrong place, degrading draft acceptance without
+  ever raising -- the same class of silent-wrongness as the GGUF dispatch
+  switch that had no `default:`.
+- FIX: `_store_kv_at_slots` in `models/muse_glimmer_dflash.py` detects the
+  layout and writes accordingly; module-level, because two drafter classes
+  share this path (`DFlash2QwenModel` does not inherit from
+  `MuseGlimmerDFlashModel`). An unrecognized layout RAISES rather than
+  guessing which axis holds K/V.
+- Verified: both layouts round-trip in a unit check (including the advanced
+  indexing rule that puts the gathered dim first when the index tensors are
+  separated by a slice), and the real profile smoke passes:
+  "What is 2 + 2?" -> "4", red image -> "Red", dflash k=3, load 122.3 s.
+  Raw: perf/results/2026-08-25/gguf-spec3/.
+- Unrelated to the GDN value-head fix; it was simply hidden behind it, since
+  nothing could reach the drafter while the model itself was producing
+  garbage.
+
+## 2026-08-25 - Regression gate: NVFP4 unaffected by the day's shared-code changes
+
+- `qwen38-nvfp4-1` passes the full profile smoke after every change landed
+  today: text "2 + 2" -> "4", red image -> "Red", `qwen3_5_mtp` drafter at
+  k=2, load 174.4 s. Raw: perf/results/2026-08-25/nvfp4-regress/.
+- Four of today's changes live in code this profile also executes, so the run
+  was a gate rather than a formality:
+  - the GDN module (shared by the whole Qwen3.5 family). The safetensors
+    config carries no `gdn_tiled_v_head_layout`, so
+    `normalize_v_heads_to_grouped` is false and the reorder path is inert --
+    confirmed statically as well as by this run.
+  - the dense/MoE MMQ split in the GGUF quant lists (compressed-tensors does
+    not go through them).
+  - the csrc `default:` guards and the DSV4 mHC ROCm guard, both in the
+    rebuilt `_C_stable_libtorch` this profile loads.
+  - the DFlash drafter KV layout fix (this profile drafts with MTP, not
+    DFlash, but the module is imported).
+- Both ROCm profiles now pass as registered, nothing disabled:
+  qwen38-nvfp4-1 (safetensors, MTP k=2) and qwen38-q2kxl-1 (GGUF, DFlash2
+  k=3, run under a temporary mi300x widening that is reverted after each
+  run -- the profile still lists only `metal`).

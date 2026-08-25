@@ -32,6 +32,55 @@ from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 logger = init_logger(__name__)
 
 
+def _store_kv_at_slots(
+    kv_cache: torch.Tensor,
+    attn,
+    slot: torch.Tensor,
+    k_heads: torch.Tensor,
+    v_heads: torch.Tensor,
+) -> None:
+    """Write per-token K/V into whichever cache layout the backend uses.
+
+    Two layouts are in play and they are not interchangeable:
+
+    * split  ``(2, num_blocks, block_size, num_kv_heads, head_size)`` --
+      leading K/V planes, used by the Metal path this drafter was written
+      against.
+    * packed ``(num_blocks, num_kv_heads, block_size, 2 * head_size)`` --
+      K and V interleaved in the content dim, used by TRITON_ATTN and
+      ROCM_AITER_FA.
+
+    Assuming the split layout on a packed cache silently indexes block 0
+    as if it were the K plane; the shapes happen to stay plausible, so it
+    surfaces as a broadcast error rather than as corruption (observed:
+    value [N, 8, 128] into indexing result [N, 256], where 256 is
+    2 * head_size). Anything unrecognized raises rather than guessing.
+    """
+    head_size = k_heads.shape[-1]
+    if kv_cache.dim() == 5 and kv_cache.shape[0] == 2:
+        block_size = kv_cache.shape[2]
+        block_idx, block_off = slot // block_size, slot % block_size
+        kv_cache[0][block_idx, block_off] = k_heads.to(kv_cache.dtype)
+        kv_cache[1][block_idx, block_off] = v_heads.to(kv_cache.dtype)
+        return
+    if kv_cache.dim() == 4 and kv_cache.shape[-1] >= 2 * head_size:
+        # (num_blocks, num_kv_heads, block_size, 2 * head_size [+ scales]).
+        # Advanced indices at positions 0 and 2 are separated by a slice,
+        # so the gathered dim leads: the view is [N, num_kv_heads, ...].
+        block_size = kv_cache.shape[2]
+        block_idx, block_off = slot // block_size, slot % block_size
+        kv_cache[block_idx, :, block_off, :head_size] = k_heads.to(kv_cache.dtype)
+        kv_cache[block_idx, :, block_off, head_size : 2 * head_size] = v_heads.to(
+            kv_cache.dtype
+        )
+        return
+    raise RuntimeError(
+        "dflash drafter: unrecognized KV cache layout "
+        f"{tuple(kv_cache.shape)} for head_size={head_size}; refusing to "
+        "guess which axis holds K/V."
+    )
+
+
 class MuseGlimmerDFlashModel(DFlashQwen3Model):
     _fused_ready: bool | None = None
 
@@ -234,14 +283,10 @@ class MuseGlimmerDFlashModel(DFlashQwen3Model):
                 kv_cache = kv_cache[0]
             if kv_cache.numel() == 0:
                 continue  # profiling run: no cache allocated yet
-            block_size = kv_cache.shape[2]
             slot = slot_mapping.to(torch.long)
-            block_idx = slot // block_size
-            block_off = slot % block_size
             k_heads = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v_heads = v.reshape(-1, attn.num_kv_heads, attn.head_dim)
-            kv_cache[0][block_idx, block_off] = k_heads.to(kv_cache.dtype)
-            kv_cache[1][block_idx, block_off] = v_heads.to(kv_cache.dtype)
+            _store_kv_at_slots(kv_cache, attn, slot, k_heads, v_heads)
 
 
 class MuseGlimmerDFlashDraftModel(DFlashQwen3ForCausalLM):
