@@ -10039,3 +10039,36 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   (M5 Max); the dsv4 profiles' tok/s gate on the serving box remains
   the open validation item, now without the unconditional per-step
   sync.
+
+## 2026-08-24 - DSV4 Metal Crawl RESOLVED: Superseded Stack + Stale Extension
+
+- Verdict: the dsv4-xxs-1 crawl investigated on 2026-08-23 belongs to a
+  superseded serving stack. The M1 Ultra campaign (PR #2, merged) rewrote
+  the DSV4 Metal prefill/decode path; on current main the crawl does not
+  exist. The geometry hypothesis (256K resize) was never adjudicated on
+  the old stack and is moot on the new one.
+- Evidence, current main (M5 Max, 3072/1 GiB geometry, seeded temp 1.0 /
+  top_p 0.95, port 8000):
+  - Cold first request: 120 tokens in 9 s (~13 tok/s) with coherent
+    output.
+  - Warm request: 185 tokens in 10.58 s = 17.5 tok/s end-to-end, spec
+    ACCEPTING (mean acceptance length 2.11; 39 of 175 drafted accepted)
+    -- both the ~0.1 tok/s crawl and the 0-acceptance symptom are gone.
+- Stale-extension trap (root cause of today's first boot crashing with
+  'x must be contiguous' in quixicore rms_norm): vllm/_quixicore_C.so is
+  an untracked build artifact; the deployed copy predated the campaign
+  merge, so campaign python (strided q/kv rms_norm splits) hit a host op
+  without the strided variants. The metallib is tracked and was current;
+  the .so was three campaigns old. Same failure class the K3 README
+  section documents for _C_stable_libtorch. Rule: rebuild _quixicore_C
+  from HEAD csrc (ninja _quixicore_C; rm-cp-codesign) after ANY merge
+  that touches csrc/quixicore, before booting a Metal profile.
+- Historical note: the 33.684 tok/s comparison point remains a
+  pre-resize, pre-campaign artifact; the campaign's own M1 Ultra numbers
+  (31.6 tok/s decode e2e, 369 tok/s prefill on the registry geometry)
+  are the current reference. The M5 Max 17.5 tok/s here is a small-
+  geometry smoke, not a tuned baseline.
+- Remaining: registry-geometry (262144 / 16 GiB) confirmation on this
+  box was interrupted mid-boot (server had loaded 93.57 GiB); re-run
+  `slimserve dsv4-xxs-1 --serve -y` plus the seeded smoke to close it.
+- Raw artifacts: ~/.local/scratch/dsv4-geom/ (server logs, responses).
