@@ -41,6 +41,292 @@ kernel void qgemv(
     if (lane == 0) D[row] = T(acc);
 }
 
+// q4_K decode GEMV in the llama.cpp mul_mv layout (kernel_mul_mv_q4_K_f32
+// port: 2 rows per simdgroup, 2 simdgroups per threadgroup, 4 blocks in
+// flight on the K axis). The one-simdgroup-per-row walk above has BPI=1 for
+// 256-wide blocks -- the whole simdgroup advances through a single 144-byte
+// block per iteration -- and measured weight bandwidth collapses to 180-290
+// GB/s at the Qwen3.8 MLP shapes vs ~500+ for the BPI=8 q8_0 walk. This
+// kernel restores in-flight blocks (ib += 4), amortizes the activation loads
+// across both rows from registers (yl/yh + per-sub-block activation sums
+// loaded once per block phase), and keeps the nibbles integer inside the
+// inner product: masked-ushort accumulate into four fp32 accumulators,
+// renormalized once by 1/256 and 1/16, with the 6-bit sub-block scale/min
+// factored out per (block, row). No dequantized span is ever materialized,
+// which is what retires the register-pressure objection recorded against the
+// two-rows-per-simdgroup experiment in launch_qgemv's geometry note.
+// NUMERICS: fp32 y*nibble accumulation with factored scales has no
+// per-element half rounding, so outputs are NOT bit-identical to qgemv<q4_K>
+// (they are closer to the exact dequant-dot). The host routes only
+// N % 4 == 0 && K % 256 == 0 here: tail rows would read past the end of the
+// weight buffer, and MPS does not fault on out-of-bounds reads.
+template<typename T>
+kernel void qgemv_q4k_nr(
+    device   T*     D  [[buffer(0)]],   // (N, 1) output
+    device   uchar* Wq [[buffer(1)]],   // (N, K/256 * 144B) q4_K blocks
+    device   T*     X  [[buffer(2)]],   // (K, 1) activation vector
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const short ix = lane / 8;          // 0..3: block phase on the K axis
+    const short it = lane % 8;          // 0..7
+    const short iq = it / 4;            // 0..1: 64-col half of the low 128
+    const short ir = it % 4;            // 0..3: 8-col span within 32
+
+    const int nb = K / 256;             // q4_K blocks per row
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const ulong row_bytes = (ulong)nb * 144;
+    device const uchar* rows_base = Wq + (ulong)first_row * row_bytes;
+
+    float yl[16];                       // y at cols 64*iq + 8*ir (+0, +32)
+    float yh[16];                       // same span in the high 128 cols
+    float sumf[NR] = {0.f, 0.f};
+
+    device const T* y4 = X + ix * 256 + 64 * iq + 8 * ir;
+
+    ushort sc16[4];
+    thread const uchar* sc8 = (thread const uchar*)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = float(y4[i +   0]); sumy[0] += yl[i + 0];
+            yl[i + 8] = float(y4[i +  32]); sumy[1] += yl[i + 8];
+            yh[i + 0] = float(y4[i + 128]); sumy[2] += yh[i + 0];
+            yh[i + 8] = float(y4[i + 160]); sumy[3] += yh[i + 8];
+        }
+
+        device const uchar* blk = rows_base + (ulong)ib * 144;
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            device const uchar* b = blk + (ulong)row * row_bytes;
+            device const half*   dh = (device const half*)b;
+            device const ushort* sc = (device const ushort*)(b + 4) + iq;
+            device const ushort* q1 = (device const ushort*)(b + 16)
+                                      + 16 * iq + 4 * ir;
+            device const ushort* q2 = q1 + 32;
+
+            // All eight 6-bit (scale, min) pairs this lane needs, via the
+            // GGUF get_scale_min_k4 packing, extracted as two masked ushorts
+            // per half: sc8[0,1]/[4,5] scales, sc8[2,3]/[6,7] mins.
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * (q2[i] & 0xF000);
+            }
+            const float dall = float(dh[0]);
+            const float dmin = float(dh[1]);
+            sumf[row] +=
+                dall * ((acc1[0] + 1.f / 256.f * acc1[1]) * sc8[0] +
+                        (acc1[2] + 1.f / 256.f * acc1[3]) * sc8[1] * 1.f / 16.f +
+                        (acc2[0] + 1.f / 256.f * acc2[1]) * sc8[4] +
+                        (acc2[2] + 1.f / 256.f * acc2[3]) * sc8[5] * 1.f / 16.f) -
+                dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
+                        sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+        y4 += 4 * 256;
+    }
+
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        const float tot = metal::simd_sum(sumf[row]);
+        if (lane == 0) D[first_row + row] = T(tot);
+    }
+}
+
+// Multi-batch twin of qgemv_q4k_nr for the even 2..8-row decode/verify
+// widths: grid.y indexes COLUMN PAIRS (dispatch (N/4, M/2)), and each
+// threadgroup runs the batch-1 lane geometry, block phasing, and factored
+// scales over its two columns with the weight block's scale words and
+// nibble ushorts shared from registers. Per-(row, column) FP chain is the
+// batch-1 kernel's, so every output row is bit-identical to a looped
+// qgemv_q4k_nr launch. The generic qgemv_mm walk measured 91/81 GB/s at
+// the M=8 MLP shapes (the BPI=1 collapse), which is what kept c4/c8 flat
+// when the batch-1 kernel landed.
+//
+// WHY COLUMN PAIRS ON THE GRID -- each alternative measured at the M=8 MLP
+// shapes (see notebook UPDATE 11):
+// - All M columns in one threadgroup, column loop UNROLLED (array staging,
+//   fused scalars, literal-index macro chains, scheduling fences): 12-14
+//   GB/s at M=8, ~90 at M=4 vs 379 at M=2 -- superlinear in M, identical
+//   pipeline register footprints for M=4/8 (maxTotalThreadsPerThreadgroup
+//   384 for both), independent of the X addresses read (all columns
+//   reading row 0 reproduced it). That is instruction-cache thrash of the
+//   unrolled block-loop body, not register spill or memory divergence.
+// - All M columns, column loop ROLLED with threadgroup-memory accumulators
+//   (register arrays under a rolled loop spill to stack; the TG slots were
+//   lane-private and bank-conflict-free): only parity with the generic
+//   walk (95/88 GB/s at M=8) -- the small body works, but occupancy and
+//   the fold's TG RMW latency give back the weight-stationarity win.
+// - Sequential per-pair K sweeps inside one threadgroup: break-even (96
+//   GB/s at M=8); a sweep's weight working set does not stay
+//   cache-resident, so every sweep repays device bandwidth.
+// Splitting the pairs across grid.y instead nominally re-reads the weight
+// bytes M/2 times, but threadgroups with equal tgid.x and different
+// tgid.y are resident together, so the re-reads land in cache.
+// The scale bytes are extracted arithmetically (& 0xFF / >> 8) rather than
+// through the batch-1 kernel's `thread uchar*` view of sc16: same values
+// and FP order, no thread-address aliasing to defeat promotion.
+// Host guards match the batch-1 route (N % 4 == 0, K % 256 == 0, M even):
+// tail rows would read past the end of the weight buffer, and MPS does
+// not fault on out-of-bounds reads.
+template<typename T>
+kernel void qgemv_q4k_nr_mb(
+    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   uchar* Wq [[buffer(1)]],   // (N, K/256 * 144B) q4_K blocks
+    device   T*     X  [[buffer(2)]],   // (M, K) activations, row-major
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    constexpr ushort kmask1 = 0x3f3f;
+    constexpr ushort kmask2 = 0x0f0f;
+    constexpr ushort kmask3 = 0xc0c0;
+
+    const short ix = lane / 8;          // 0..3: block phase on the K axis
+    const short it = lane % 8;          // 0..7
+    const short iq = it / 4;            // 0..1: 64-col half of the low 128
+    const short ir = it % 4;            // 0..3: 8-col span within 32
+
+    const int nb = K / 256;             // q4_K blocks per row
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int first_col = int(tgid.y) * 2;
+    const ulong row_bytes = (ulong)nb * 144;
+    device const uchar* rows_base = Wq + (ulong)first_row * row_bytes;
+
+    float sumf[NR][2] = {};
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        // Weight registers for both rows, read once per block per pair.
+        float  dallv[NR], dminv[NR];
+        ushort sc16v[NR][4];
+        ushort q1v[NR][4], q2v[NR][4];
+        device const uchar* blk = rows_base + (ulong)ib * 144;
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            device const uchar* b = blk + (ulong)row * row_bytes;
+            device const half*   dh = (device const half*)b;
+            device const ushort* sc = (device const ushort*)(b + 4) + iq;
+            device const ushort* q1 = (device const ushort*)(b + 16)
+                                      + 16 * iq + 4 * ir;
+            dallv[row] = float(dh[0]);
+            dminv[row] = float(dh[1]);
+            sc16v[row][0] = sc[0] & kmask1;
+            sc16v[row][1] = sc[2] & kmask1;
+            sc16v[row][2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16v[row][3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                q1v[row][i] = q1[i];
+                q2v[row][i] = q1[i + 32];
+            }
+        }
+
+        // Two columns per threadgroup, register accumulators, per-column
+        // fused y stage. Per-accumulator FP order matches the batch-1
+        // kernel exactly.
+        const int ycol = ib * 256 + 64 * iq + 8 * ir;
+        #pragma clang loop unroll(full)
+        for (short mi = 0; mi < 2; ++mi) {
+            device const T* y4 = X + (long)(first_col + mi) * K + ycol;
+            // Each 8-wide span rides two vec4 loads instead of 8 scalar
+            // bf16 loads. Values and accumulate order are unchanged.
+            using T4 = metal::vec<T, 4>;
+            device const T4* yv = (device const T4*)y4;
+            const float4 ya0 = float4(yv[0]),  ya1 = float4(yv[1]);
+            const float4 yb0 = float4(yv[8]),  yb1 = float4(yv[9]);
+            const float4 yc0 = float4(yv[32]), yc1 = float4(yv[33]);
+            const float4 yd0 = float4(yv[40]), yd1 = float4(yv[41]);
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            float4 acc1[NR];
+            float4 acc2[NR];
+            #pragma clang loop unroll(full)
+            for (short row = 0; row < NR; ++row) {
+                acc1[row] = {0.f, 0.f, 0.f, 0.f};
+                acc2[row] = {0.f, 0.f, 0.f, 0.f};
+            }
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                const float yl0 = (i < 2) ? ya0[2 * i + 0] : ya1[2 * i - 4];
+                const float yl1 = (i < 2) ? ya0[2 * i + 1] : ya1[2 * i - 3];
+                const float yl8 = (i < 2) ? yb0[2 * i + 0] : yb1[2 * i - 4];
+                const float yl9 = (i < 2) ? yb0[2 * i + 1] : yb1[2 * i - 3];
+                const float yh0 = (i < 2) ? yc0[2 * i + 0] : yc1[2 * i - 4];
+                const float yh1 = (i < 2) ? yc0[2 * i + 1] : yc1[2 * i - 3];
+                const float yh8 = (i < 2) ? yd0[2 * i + 0] : yd1[2 * i - 4];
+                const float yh9 = (i < 2) ? yd0[2 * i + 1] : yd1[2 * i - 3];
+                sumy[0] += yl0; sumy[0] += yl1;
+                sumy[1] += yl8; sumy[1] += yl9;
+                sumy[2] += yh0; sumy[2] += yh1;
+                sumy[3] += yh8; sumy[3] += yh9;
+                #pragma clang loop unroll(full)
+                for (short row = 0; row < NR; ++row) {
+                    acc1[row][0] += yl0 * (q1v[row][i] & 0x000F);
+                    acc1[row][1] += yl1 * (q1v[row][i] & 0x0F00);
+                    acc1[row][2] += yl8 * (q1v[row][i] & 0x00F0);
+                    acc1[row][3] += yl9 * (q1v[row][i] & 0xF000);
+                    acc2[row][0] += yh0 * (q2v[row][i] & 0x000F);
+                    acc2[row][1] += yh1 * (q2v[row][i] & 0x0F00);
+                    acc2[row][2] += yh8 * (q2v[row][i] & 0x00F0);
+                    acc2[row][3] += yh9 * (q2v[row][i] & 0xF000);
+                }
+            }
+            #pragma clang loop unroll(full)
+            for (short row = 0; row < NR; ++row) {
+                sumf[row][mi] +=
+                    dallv[row] *
+                        ((acc1[row][0] + 1.f / 256.f * acc1[row][1]) *
+                             float(sc16v[row][0] & 0xFF) +
+                         (acc1[row][2] + 1.f / 256.f * acc1[row][3]) *
+                             float(sc16v[row][0] >> 8) * 1.f / 16.f +
+                         (acc2[row][0] + 1.f / 256.f * acc2[row][1]) *
+                             float(sc16v[row][2] & 0xFF) +
+                         (acc2[row][2] + 1.f / 256.f * acc2[row][3]) *
+                             float(sc16v[row][2] >> 8) * 1.f / 16.f) -
+                    dminv[row] *
+                        (sumy[0] * float(sc16v[row][1] & 0xFF) +
+                         sumy[1] * float(sc16v[row][1] >> 8) +
+                         sumy[2] * float(sc16v[row][3] & 0xFF) +
+                         sumy[3] * float(sc16v[row][3] >> 8));
+            }
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (short mi = 0; mi < 2; ++mi)
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            const float tot = metal::simd_sum(sumf[row][mi]);
+            if (lane == 0)
+                D[(long)(first_col + mi) * N + first_row + row] = T(tot);
+        }
+}
+
 // Weight-stationary multi-row GEMV:  D (M,N) = X (M,K) @ dequantize(W)^T.
 // Same block-major walk and lane geometry as qgemv, but each dequantized
 // 8-wide weight span is applied to all M activation rows from registers, so
@@ -959,6 +1245,600 @@ kernel void qgemv_q4_0_fast(
     if (lane == 0) D[row] = half(acc);
 }
 
+// Compressed-tensors FP8-per-channel W8A16 GEMV (Qwen3.8 NVFP4-checkpoint
+// FP8 side: attn qkvo, GDN qkv/z/out, lm_head, mlp 56-63). Unlike every GGUF
+// kernel above, the weight is NOT a block format: planar row-major e4m3
+// bytes (N, K) straight from the checkpoint, with one float scale per output
+// row in a separate buffer. Geometry is qgemv_q4k_nr's (2 simdgroups x 2
+// rows, dispatch (N/4, 1)): each lane owns 16 contiguous bytes per row per
+// iteration (one uint4 load), X is staged to registers once and shared
+// across both rows, accumulation fp32, and the per-row scale is applied
+// once in the epilogue. Decode is the select-free v6 bit-pattern form
+// (the nvfp4_planar E2M1 lesson ported to E4M3): per uint of 4 bytes, two
+// half2 patterns — even bytes ((w<<7)&0x3F803F80)|((w<<8)&0x80008000),
+// odd bytes ((w>>1)&0x3F803F80)|(w&0x80008000) — drop the e4m3 exp/mant
+// into the half field positions, giving exactly value/2^8 (bias 7 vs 15),
+// subnormals included: float(as_type<half>(..)) is a convert, not
+// arithmetic, so offline-compile FTZ cannot flush it. The 2^8 rebias is
+// folded into the per-row scale epilogue; power-of-two scaling commutes
+// with IEEE rounding at every FMA and the epilogue rounds once from the
+// same real product, so outputs are bit-identical to the tk_e4m3_decode
+// form (NaN codes 0x7F/0xFF decode to +-480 in both; checkpoint has
+// none). Host guards: N % 4 == 0, K % 16 == 0, contiguous row-major
+// weight.
+template<typename T>
+kernel void qgemv_fp8ch(
+    device   T*     D  [[buffer(0)]],   // (N, 1) output
+    device   const uchar* Wq [[buffer(1)]],   // (N, K) e4m3 bytes, row-major
+    device   const T*     X  [[buffer(2)]],   // (K, 1) activation vector
+    device   const float* WS [[buffer(3)]],   // (N,) per-channel scales
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    device const uchar* w0 = Wq + (ulong)first_row * (ulong)K;
+    device const uchar* w1 = w0 + (ulong)K;
+    float sumf[NR] = {0.f, 0.f};
+    for (int c = int(lane) * 16; c + 16 <= K; c += 32 * 16) {
+        float xs[16];
+        device const metal::vec<T, 4>* xp =
+            (device const metal::vec<T, 4>*)(X + c);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 4; ++i) {
+            const metal::vec<T, 4> xv = xp[i];
+            xs[4 * i + 0] = float(xv.x);
+            xs[4 * i + 1] = float(xv.y);
+            xs[4 * i + 2] = float(xv.z);
+            xs[4 * i + 3] = float(xv.w);
+        }
+        const uint4 a = *(device const uint4*)(w0 + c);
+        const uint4 b = *(device const uint4*)(w1 + c);
+        float r0 = 0.f, r1 = 0.f;
+        #pragma clang loop unroll(full)
+        for (short u = 0; u < 4; ++u) {
+            const uint av = a[u];
+            const uint bv = b[u];
+            // bytes j=0,2 in .x/.y of the even pair; j=1,3 in the odd pair
+            const half2 ae = as_type<half2>(((av << 7) & 0x3F803F80u) |
+                                            ((av << 8) & 0x80008000u));
+            const half2 ao = as_type<half2>(((av >> 1) & 0x3F803F80u) |
+                                            (av & 0x80008000u));
+            const half2 be = as_type<half2>(((bv << 7) & 0x3F803F80u) |
+                                            ((bv << 8) & 0x80008000u));
+            const half2 bo = as_type<half2>(((bv >> 1) & 0x3F803F80u) |
+                                            (bv & 0x80008000u));
+            r0 += xs[4 * u + 0] * float(ae.x);
+            r1 += xs[4 * u + 0] * float(be.x);
+            r0 += xs[4 * u + 1] * float(ao.x);
+            r1 += xs[4 * u + 1] * float(bo.x);
+            r0 += xs[4 * u + 2] * float(ae.y);
+            r1 += xs[4 * u + 2] * float(be.y);
+            r0 += xs[4 * u + 3] * float(ao.y);
+            r1 += xs[4 * u + 3] * float(bo.y);
+        }
+        sumf[0] += r0;
+        sumf[1] += r1;
+    }
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        const float tot = metal::simd_sum(sumf[row]);
+        // 256 = the folded 2^8 decode rebias (exact: power-of-two scale)
+        if (lane == 0)
+            D[first_row + row] = T(tot * (256.0f * WS[first_row + row]));
+    }
+}
+
+// Weight-stationary column-pair batch twin of qgemv_fp8ch (the q4_K
+// qgemv_q4k_nr_mb pattern): grid.y indexes COLUMN PAIRS (dispatch
+// (N/4, M/2)), each threadgroup runs the batch-1 lane geometry over two
+// activation columns with the e4m3 weight bytes loaded and decoded ONCE
+// per iteration. The per-(row, column) FP chain matches the batch-1
+// kernel, so every output row is bit-identical to a looped qgemv_fp8ch
+// launch. Threadgroups with equal tgid.x and different tgid.y are
+// resident together, so the nominal M/2 weight re-reads land in cache.
+// Host guards: batch-1's plus M even and X/D contiguous row-major
+// (M, K) / (M, N).
+template<typename T>
+kernel void qgemv_fp8ch_mb(
+    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   const uchar* Wq [[buffer(1)]],   // (N, K) e4m3 bytes, row-major
+    device   const T*     X  [[buffer(2)]],   // (M, K) activations, row-major
+    device   const float* WS [[buffer(3)]],   // (N,) per-channel scales
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int first_col = int(tgid.y) * 2;
+    device const uchar* w0 = Wq + (ulong)first_row * (ulong)K;
+    device const uchar* w1 = w0 + (ulong)K;
+    float sumf[NR][2] = {};
+    for (int c = int(lane) * 16; c + 16 <= K; c += 32 * 16) {
+        float xs[2][16];
+        #pragma clang loop unroll(full)
+        for (short mi = 0; mi < 2; ++mi) {
+            device const metal::vec<T, 4>* xp = (device const metal::vec<T, 4>*)
+                (X + (long)(first_col + mi) * K + c);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                const metal::vec<T, 4> xv = xp[i];
+                xs[mi][4 * i + 0] = float(xv.x);
+                xs[mi][4 * i + 1] = float(xv.y);
+                xs[mi][4 * i + 2] = float(xv.z);
+                xs[mi][4 * i + 3] = float(xv.w);
+            }
+        }
+        const uint4 a = *(device const uint4*)(w0 + c);
+        const uint4 b = *(device const uint4*)(w1 + c);
+        float r[NR][2] = {};
+        #pragma clang loop unroll(full)
+        for (short u = 0; u < 4; ++u) {
+            const uint av = a[u];
+            const uint bv = b[u];
+            // select-free decode, identical to batch-1 (bit-identity contract)
+            const half2 ae = as_type<half2>(((av << 7) & 0x3F803F80u) |
+                                            ((av << 8) & 0x80008000u));
+            const half2 ao = as_type<half2>(((av >> 1) & 0x3F803F80u) |
+                                            (av & 0x80008000u));
+            const half2 be = as_type<half2>(((bv << 7) & 0x3F803F80u) |
+                                            ((bv << 8) & 0x80008000u));
+            const half2 bo = as_type<half2>(((bv >> 1) & 0x3F803F80u) |
+                                            (bv & 0x80008000u));
+            const float w0j[4] = {float(ae.x), float(ao.x),
+                                  float(ae.y), float(ao.y)};
+            const float w1j[4] = {float(be.x), float(bo.x),
+                                  float(be.y), float(bo.y)};
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; ++j) {
+                #pragma clang loop unroll(full)
+                for (short mi = 0; mi < 2; ++mi) {
+                    r[0][mi] += xs[mi][4 * u + j] * w0j[j];
+                    r[1][mi] += xs[mi][4 * u + j] * w1j[j];
+                }
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row)
+            #pragma clang loop unroll(full)
+            for (short mi = 0; mi < 2; ++mi) sumf[row][mi] += r[row][mi];
+    }
+    #pragma clang loop unroll(full)
+    for (short mi = 0; mi < 2; ++mi)
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            const float tot = metal::simd_sum(sumf[row][mi]);
+            // 256 = the folded 2^8 decode rebias (exact: power-of-two scale)
+            if (lane == 0)
+                D[(long)(first_col + mi) * N + first_row + row] =
+                    T(tot * (256.0f * WS[first_row + row]));
+        }
+}
+
+// Compressed-tensors NVFP4 W4A16 GEMV over the checkpoint's PLANAR layout
+// (Qwen3.8 NVFP4 side: mlp gate/up/down, layers 0-55). Three separate
+// buffers, no repack: weight_packed (N, K/2) e2m1 nibble pairs (low nibble
+// = even column), weight_scale (N, K/16) raw e4m3 bytes, and the fp32
+// per-tensor global multiplier. NOT the interleaved 9-byte `nvfp4` struct
+// the generic qgemv template reads. Structure per the ggml-mxfp4 x MLX
+// fp_qmv precedent: each lane owns one 16-value group per iteration (one
+// 8-byte load), unscaled FMA tree within the group, ONE scale multiply per
+// group hoisted onto the partial sum, fp32 cross-group accumulation, and
+// the global scale applied once per output element. Row geometry matches
+// qgemv_q4k_nr (2 simdgroups x 2 rows, dispatch (N/4, 1)); X staged to
+// registers once per iteration and shared across both rows. Host guards:
+// N % 4 == 0, K % 16 == 0, contiguous row-major buffers.
+template<typename T>
+kernel void qgemv_nvfp4_planar(
+    device   T*     D  [[buffer(0)]],   // (N, 1) output
+    device   const uchar* Wq [[buffer(1)]],   // (N, K/2) packed e2m1
+    device   const T*     X  [[buffer(2)]],   // (K, 1) activation vector
+    device   const uchar* WS [[buffer(3)]],   // (N, K/16) e4m3 group scales
+    device   const float* GS [[buffer(4)]],   // (1,) global multiplier
+    const constant int &N [[buffer(5)]],
+    const constant int &K [[buffer(6)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int groups = K / 16;
+    const ulong wrow = (ulong)K / 2;
+    device const uchar* w0 = Wq + (ulong)first_row * wrow;
+    device const uchar* s0 = WS + (ulong)first_row * (ulong)groups;
+    // Select-free E2M1 decode, half2-vectorized (UPDATE 18 pattern): four
+    // half2 bit-pattern constructs per uint decode all 8 nibbles with no
+    // byte extraction — [ee][m] lands at half bits 11..9, sign at 15, and
+    // the CONVERT to fp32 is exact on subnormal halfs (no arithmetic, so
+    // offline-compile FTZ cannot flush the 0.5 code). ~2.5 int ops + 1
+    // convert + 1 FMA per value. The uniform 2^14 rebias and the group
+    // scale's own 2^8 e4m3 rebias fold into one 2^22 constant on the
+    // per-group multiply (exact: powers of two).
+    // Variants measured at the MLP shapes and rejected: tk_e2m1_decode
+    // select chain 260/323 GB/s (ALU-bound); data-dependent simd_shuffle
+    // register LUT and dynamic constant-table gathers both ~135 (dynamic
+    // indexing serializes on M1); two-groups-per-lane uint4 loads with
+    // vec4 X staging ~135 (unrolled-body register pressure, the UPDATE 11
+    // i-cache/occupancy class); per-byte scalar nibble constructs 529/452
+    // (byte extraction + 2 scalar constructs ~5.5 ops/value — UPDATE 19).
+    float sumf[NR] = {0.f, 0.f};
+    for (int g = int(lane); g < groups; g += 32) {
+        float xs[16];
+        device const metal::vec<T, 4>* xp4 =
+            (device const metal::vec<T, 4>*)(X + g * 16);
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 4; ++i) {
+            const metal::vec<T, 4> x4 = xp4[i];
+            xs[4 * i + 0] = float(x4[0]);
+            xs[4 * i + 1] = float(x4[1]);
+            xs[4 * i + 2] = float(x4[2]);
+            xs[4 * i + 3] = float(x4[3]);
+        }
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const uint2 p = *(device const uint2*)(w0 + (ulong)r * wrow + g * 8);
+            float gsum = 0.f;
+            #pragma clang loop unroll(full)
+            for (short u = 0; u < 2; ++u) {
+                const uint v = (u == 0) ? p.x : p.y;
+                const short col = 8 * u;
+                // Four half2s decode all 8 nibbles of the uint (no byte
+                // extraction): lanes are (byte0, byte2) / (byte1, byte3).
+                const half2 le = as_type<half2>(((v << 9) & 0x0E000E00u) |
+                                                ((v << 12) & 0x80008000u));
+                const half2 lo = as_type<half2>(((v << 1) & 0x0E000E00u) |
+                                                ((v << 4) & 0x80008000u));
+                const half2 he = as_type<half2>(((v << 5) & 0x0E000E00u) |
+                                                ((v << 8) & 0x80008000u));
+                const half2 ho = as_type<half2>(((v >> 3) & 0x0E000E00u) |
+                                                (v & 0x80008000u));
+                gsum += xs[col + 0] * float(le.x);
+                gsum += xs[col + 1] * float(he.x);
+                gsum += xs[col + 2] * float(lo.x);
+                gsum += xs[col + 3] * float(ho.x);
+                gsum += xs[col + 4] * float(le.y);
+                gsum += xs[col + 5] * float(he.y);
+                gsum += xs[col + 6] * float(lo.y);
+                gsum += xs[col + 7] * float(ho.y);
+            }
+            // Group scale via the UPDATE 18 select-free e4m3 pattern;
+            // 2^22 = 2^14 (E2M1 rebias) * 2^8 (E4M3 rebias), exact.
+            const uint sb = s0[(ulong)r * groups + g];
+            const half sh = as_type<half>(ushort(((sb & 0x7F) << 7) |
+                                                 ((sb & 0x80) << 8)));
+            sumf[r] += gsum * (4194304.0f * float(sh));
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < NR; ++row) {
+        const float tot = metal::simd_sum(sumf[row]);
+        if (lane == 0) D[first_row + row] = T(tot * GS[0]);
+    }
+}
+
+// Weight-stationary column-pair batch twin of qgemv_nvfp4_planar (same
+// grid.y column-pair pattern as qgemv_fp8ch_mb / qgemv_q4k_nr_mb): the
+// packed nibbles and the per-group e4m3 scale are decoded ONCE per
+// (row, group) and applied to both activation columns from registers.
+// The per-(row, column) FP chain matches the batch-1 kernel, so every
+// output row is bit-identical to a looped qgemv_nvfp4_planar launch.
+// Host guards: batch-1's plus M even and X/D contiguous row-major
+// (M, K) / (M, N).
+template<typename T>
+kernel void qgemv_nvfp4_planar_mb(
+    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   const uchar* Wq [[buffer(1)]],   // (N, K/2) packed e2m1
+    device   const T*     X  [[buffer(2)]],   // (M, K) activations, row-major
+    device   const uchar* WS [[buffer(3)]],   // (N, K/16) e4m3 group scales
+    device   const float* GS [[buffer(4)]],   // (1,) global multiplier
+    const constant int &N [[buffer(5)]],
+    const constant int &K [[buffer(6)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 2;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int first_col = int(tgid.y) * 2;
+    const int groups = K / 16;
+    const ulong wrow = (ulong)K / 2;
+    device const uchar* w0 = Wq + (ulong)first_row * wrow;
+    device const uchar* s0 = WS + (ulong)first_row * (ulong)groups;
+    float sumf[NR][2] = {};
+    for (int g = int(lane); g < groups; g += 32) {
+        float xs[2][16];
+        #pragma clang loop unroll(full)
+        for (short mi = 0; mi < 2; ++mi) {
+            device const metal::vec<T, 4>* xp4 = (device const metal::vec<T, 4>*)(
+                X + (long)(first_col + mi) * K + g * 16);
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                const metal::vec<T, 4> x4 = xp4[i];
+                xs[mi][4 * i + 0] = float(x4[0]);
+                xs[mi][4 * i + 1] = float(x4[1]);
+                xs[mi][4 * i + 2] = float(x4[2]);
+                xs[mi][4 * i + 3] = float(x4[3]);
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const uint2 p = *(device const uint2*)(w0 + (ulong)r * wrow + g * 8);
+            float gsum[2] = {0.f, 0.f};
+            #pragma clang loop unroll(full)
+            for (short u = 0; u < 2; ++u) {
+                const uint v = (u == 0) ? p.x : p.y;
+                const short col = 8 * u;
+                // identical constructs to batch-1 (bit-identity contract)
+                const half2 le = as_type<half2>(((v << 9) & 0x0E000E00u) |
+                                                ((v << 12) & 0x80008000u));
+                const half2 lo = as_type<half2>(((v << 1) & 0x0E000E00u) |
+                                                ((v << 4) & 0x80008000u));
+                const half2 he = as_type<half2>(((v << 5) & 0x0E000E00u) |
+                                                ((v << 8) & 0x80008000u));
+                const half2 ho = as_type<half2>(((v >> 3) & 0x0E000E00u) |
+                                                (v & 0x80008000u));
+                const float wj[8] = {float(le.x), float(he.x),
+                                     float(lo.x), float(ho.x),
+                                     float(le.y), float(he.y),
+                                     float(lo.y), float(ho.y)};
+                #pragma clang loop unroll(full)
+                for (short j = 0; j < 8; ++j) {
+                    #pragma clang loop unroll(full)
+                    for (short mi = 0; mi < 2; ++mi)
+                        gsum[mi] += xs[mi][col + j] * wj[j];
+                }
+            }
+            const uint sb = s0[(ulong)r * groups + g];
+            const half sh = as_type<half>(ushort(((sb & 0x7F) << 7) |
+                                                 ((sb & 0x80) << 8)));
+            const float sc = 4194304.0f * float(sh);
+            #pragma clang loop unroll(full)
+            for (short mi = 0; mi < 2; ++mi) sumf[r][mi] += gsum[mi] * sc;
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (short mi = 0; mi < 2; ++mi)
+        #pragma clang loop unroll(full)
+        for (short row = 0; row < NR; ++row) {
+            const float tot = metal::simd_sum(sumf[row][mi]);
+            if (lane == 0)
+                D[(long)(first_col + mi) * N + first_row + row] =
+                    T(tot * GS[0]);
+        }
+}
+
+// mv_ext-class batch GEMV for fp8ch (the llama.cpp kernel_mul_mv_ext
+// precedent, built there for speculative-decode batch sizes): NR=4 weight
+// rows per simdgroup x R1 activation columns per pass, weights decoded
+// ONCE per thread and applied to all R1 columns, X read per column via
+// device vec4 loads (L1-served) instead of register staging — the
+// structural dodge around the UPDATE 11 register-blowup dead end. No
+// threadgroup memory, no barriers. dispatch (N/8, ceil(M/R1)), 64
+// threads; weights re-read ceil(M/R1) times.
+// N5b variant study (clean box, qkv 12288x5120 @ M=8, GB/s counting the
+// quantized bytes once): mb column pairs 228 (the shipped route);
+// simdgroup_matrix GEMM 64x32 tiles 153-199 across five staging/layout
+// variants (the MAC phase itself is issue-bound at ~2.3e12 FMA/s — M1's
+// simdgroup_matrix is cooperative lane math, not a tensor core, so at
+// M<=8 the FMA work is the wall, not bandwidth); NR=2 x R1=8 single-pass
+// 290; NR=4 x R1=4 two-pass 381 GB/s WINNER (X loads/converts amortized
+// over 4 rows lift the FMA issue rate to ~3.0e12/s). M=4 712 GB/s
+// (+58% vs mb), lm_head M<=8 ~2x vs both mb and the dense fallback.
+// Per-(row, column) chunk partials keep the batch-1 FP chain order, so
+// every output row is bit-identical to a looped qgemv_fp8ch launch.
+// Host guards: batch-1's plus N % 8 == 0 and X/D contiguous row-major
+// (M, K) / (M, N); any M >= 1 (pad columns clamp-read, store-guarded).
+template<typename T, short R1>
+kernel void qgemv_fp8ch_mv4r(
+    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   const uchar* Wq [[buffer(1)]],   // (N, K) e4m3 bytes, row-major
+    device   const T*     X  [[buffer(2)]],   // (M, K) activations, row-major
+    device   const float* WS [[buffer(3)]],   // (N,) per-channel scales
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    const constant int &M [[buffer(6)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 4;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int col0 = int(tgid.y) * R1;
+    device const uchar* wr[NR];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r)
+        wr[r] = Wq + (ulong)(first_row + r) * (ulong)K;
+    float sumf[NR][R1];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r)
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < R1; ++j) sumf[r][j] = 0.f;
+    // pad columns clamp to the last live row; their stores are guarded
+    ulong xoff[R1];
+    #pragma clang loop unroll(full)
+    for (short j = 0; j < R1; ++j) {
+        const int col = (col0 + j < M) ? (col0 + j) : (M - 1);
+        xoff[j] = (ulong)col * (ulong)K;
+    }
+    for (int c = int(lane) * 16; c + 16 <= K; c += 32 * 16) {
+        // decode all NR rows once (select-free e4m3, UPDATE 18), laid out
+        // in the batch-1 xs order: [4u+0]=ae.x [4u+1]=ao.x [4u+2]=ae.y
+        // [4u+3]=ao.y
+        float w[NR][16];
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const uint4 a = *(device const uint4*)(wr[r] + c);
+            #pragma clang loop unroll(full)
+            for (short u = 0; u < 4; ++u) {
+                const uint av = a[u];
+                const half2 ae = as_type<half2>(((av << 7) & 0x3F803F80u) |
+                                                ((av << 8) & 0x80008000u));
+                const half2 ao = as_type<half2>(((av >> 1) & 0x3F803F80u) |
+                                                (av & 0x80008000u));
+                w[r][4 * u + 0] = float(ae.x);
+                w[r][4 * u + 1] = float(ao.x);
+                w[r][4 * u + 2] = float(ae.y);
+                w[r][4 * u + 3] = float(ao.y);
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < R1; ++j) {
+            device const metal::vec<T, 4>* xp =
+                (device const metal::vec<T, 4>*)(X + xoff[j] + c);
+            float xs[16];
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                const metal::vec<T, 4> xv = xp[i];
+                xs[4 * i + 0] = float(xv.x);
+                xs[4 * i + 1] = float(xv.y);
+                xs[4 * i + 2] = float(xv.z);
+                xs[4 * i + 3] = float(xv.w);
+            }
+            // per-chunk partials with the rows INTERLEAVED per element —
+            // the batch-1/mb chain structure. A clean per-row 16-FMA
+            // reduction lets fast-math re-tree the sum and breaks the
+            // bit-identity contract with the looped kernel (measured:
+            // nvfp4's gsum form survives, this fp8ch form only survives
+            // interleaved).
+            float rr[NR];
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < NR; ++r) rr[r] = 0.f;
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 16; ++i)
+                #pragma clang loop unroll(full)
+                for (short r = 0; r < NR; ++r) rr[r] += xs[i] * w[r][i];
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < NR; ++r) sumf[r][j] += rr[r];
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (short j = 0; j < R1; ++j)
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const float tot = metal::simd_sum(sumf[r][j]);
+            // 256 = the folded 2^8 decode rebias (exact: power-of-two scale)
+            if (lane == 0 && col0 + j < M)
+                D[(ulong)(col0 + j) * (ulong)N + first_row + r] =
+                    T(tot * (256.0f * WS[first_row + r]));
+        }
+}
+
+// mv_ext-class batch twin for the planar NVFP4 layout: NR=4 rows x R1=2
+// columns per pass (R1=2 measured best for this format — the heavier
+// per-group decode + scale hoist leaves less FMA headroom than fp8ch:
+// gate_up M=8 mv4r2 0.560 ms vs mb 0.670, M=4 0.285 vs 0.340; down M=8
+// 0.277 vs 0.367 — and R1=4 regresses on register pressure). The
+// per-(row, column) chain is the batch-1 chain (unscaled 16-FMA group
+// dot, one gsum * (2^22 * scale) per group, fp32 cross-group), so rows
+// are bit-identical to a looped qgemv_nvfp4_planar launch. Host guards:
+// batch-1's plus N % 8 == 0 and contiguous row-major X/D; any M >= 1.
+// dispatch (N/8, ceil(M/R1)), 64 threads.
+template<typename T, short R1>
+kernel void qgemv_nvfp4_mv4r(
+    device   T*     D  [[buffer(0)]],   // (M, N) output, row-major
+    device   const uchar* Wq [[buffer(1)]],   // (N, K/2) packed e2m1
+    device   const T*     X  [[buffer(2)]],   // (M, K) activations, row-major
+    device   const uchar* WS [[buffer(3)]],   // (N, K/16) e4m3 group scales
+    device   const float* GS [[buffer(4)]],   // (1,) global multiplier
+    const constant int &N [[buffer(5)]],
+    const constant int &K [[buffer(6)]],
+    const constant int &M [[buffer(7)]],
+    uint3  tgid  [[threadgroup_position_in_grid]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr short NR = 4;             // output rows per simdgroup
+    constexpr short NSG = 2;            // simdgroups per threadgroup
+    const int first_row = (int(tgid.x) * NSG + sgitg) * NR;
+    const int col0 = int(tgid.y) * R1;
+    const int groups = K / 16;
+    const ulong wrow = (ulong)K / 2;
+    device const uchar* w0 = Wq + (ulong)first_row * wrow;
+    device const uchar* s0 = WS + (ulong)first_row * (ulong)groups;
+    float sumf[NR][R1];
+    #pragma clang loop unroll(full)
+    for (short r = 0; r < NR; ++r)
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < R1; ++j) sumf[r][j] = 0.f;
+    ulong xoff[R1];
+    #pragma clang loop unroll(full)
+    for (short j = 0; j < R1; ++j) {
+        const int col = (col0 + j < M) ? (col0 + j) : (M - 1);
+        xoff[j] = (ulong)col * (ulong)K;
+    }
+    for (int g = int(lane); g < groups; g += 32) {
+        // decode all NR rows' nibbles unscaled (identical constructs to
+        // batch-1) + hoist each row's 2^22-folded group scale once
+        float w[NR][16];
+        float sc[NR];
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const uint2 p = *(device const uint2*)(w0 + (ulong)r * wrow + g * 8);
+            #pragma clang loop unroll(full)
+            for (short u = 0; u < 2; ++u) {
+                const uint v = (u == 0) ? p.x : p.y;
+                const short col = 8 * u;
+                const half2 le = as_type<half2>(((v << 9) & 0x0E000E00u) |
+                                                ((v << 12) & 0x80008000u));
+                const half2 lo = as_type<half2>(((v << 1) & 0x0E000E00u) |
+                                                ((v << 4) & 0x80008000u));
+                const half2 he = as_type<half2>(((v << 5) & 0x0E000E00u) |
+                                                ((v << 8) & 0x80008000u));
+                const half2 ho = as_type<half2>(((v >> 3) & 0x0E000E00u) |
+                                                (v & 0x80008000u));
+                w[r][col + 0] = float(le.x);
+                w[r][col + 1] = float(he.x);
+                w[r][col + 2] = float(lo.x);
+                w[r][col + 3] = float(ho.x);
+                w[r][col + 4] = float(le.y);
+                w[r][col + 5] = float(he.y);
+                w[r][col + 6] = float(lo.y);
+                w[r][col + 7] = float(ho.y);
+            }
+            const uint sb = s0[(ulong)r * groups + g];
+            const half sh = as_type<half>(ushort(((sb & 0x7F) << 7) |
+                                                 ((sb & 0x80) << 8)));
+            sc[r] = 4194304.0f * float(sh);
+        }
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < R1; ++j) {
+            device const metal::vec<T, 4>* xp4 =
+                (device const metal::vec<T, 4>*)(X + xoff[j] + g * 16);
+            float xs[16];
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < 4; ++i) {
+                const metal::vec<T, 4> x4 = xp4[i];
+                xs[4 * i + 0] = float(x4[0]);
+                xs[4 * i + 1] = float(x4[1]);
+                xs[4 * i + 2] = float(x4[2]);
+                xs[4 * i + 3] = float(x4[3]);
+            }
+            #pragma clang loop unroll(full)
+            for (short r = 0; r < NR; ++r) {
+                float gsum = 0.f;
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < 16; ++i) gsum += xs[i] * w[r][i];
+                sumf[r][j] += gsum * sc[r];
+            }
+        }
+    }
+    #pragma clang loop unroll(full)
+    for (short j = 0; j < R1; ++j)
+        #pragma clang loop unroll(full)
+        for (short r = 0; r < NR; ++r) {
+            const float tot = metal::simd_sum(sumf[r][j]);
+            if (lane == 0 && col0 + j < M)
+                D[(ulong)(col0 + j) * (ulong)N + first_row + r] =
+                    T(tot * GS[0]);
+        }
+}
+
 // Multi-batch twin of qgemv_q8_0_fast: same 8-blocks-per-iteration walk and
 // per-row FMA order (bit-identical rows to the looped fast kernel), with the
 // block decode amortized over M activation rows. M is compile-time so the
@@ -1289,6 +2169,23 @@ instantiate_qgemv_mm_format("qgemv_mm_q4_K", q4_K);
 instantiate_qgemv_mm_format("qgemv_mm_q5_K", q5_K);
 instantiate_qgemv_mm_format("qgemv_mm_q6_K", q6_K);
 
+// NR-layout q4_K batch twin (see qgemv_q4k_nr_mb): grid.y carries the
+// column-pair index, so one instantiation per dtype serves every even
+// batch width. The 16/17-row kMMRows chunks stay on qgemv_mm until the
+// odd-width remainder handling is worth it.
+#define instantiate_qgemv_q4k_nr_mb(name, T)                                 \
+   template [[host_name(name)]] [[kernel]]                                   \
+   void qgemv_q4k_nr_mb<T>(                                                  \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]],              \
+     device T* X [[buffer(2)]],                                              \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     uint3 tgid [[threadgroup_position_in_grid]],                            \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                        \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_q4k_nr_mb("qgemv_mm_q4_K_nr", half);
+instantiate_qgemv_q4k_nr_mb("qgemv_mm_q4_K_nr_bfloat16", bf16);
+
 #define instantiate_qgemv_format(name, FMT)                                  \
     instantiate_qgemv(name, FMT, half);                                      \
     instantiate_qgemv(name "_bfloat16", FMT, bf16);                         \
@@ -1318,6 +2215,108 @@ instantiate_qgemv_mb("", "qgemv_q6_K_mb", q6_K, half);
 instantiate_qgemv_mb("_bfloat16", "qgemv_q6_K_mb", q6_K, bf16);
 
 instantiate_qgemv_format("qgemv_q4_K", q4_K);
+
+// llama.cpp-layout q4_K decode GEMV (batch-1 fast path; see qgemv_q4k_nr).
+#define instantiate_qgemv_q4k_nr(name, T)                                     \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_q4k_nr<T>(                                                      \
+     device T* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device T* X [[buffer(2)]], \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_q4k_nr("qgemv_q4_K_nr", half);
+instantiate_qgemv_q4k_nr("qgemv_q4_K_nr_bfloat16", bf16);
+
+// Compressed-tensors FP8-per-channel W8A16 GEMV (planar rows + scale buffer).
+#define instantiate_qgemv_fp8ch(name, T)                                      \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_fp8ch<T>(                                                       \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const float* WS [[buffer(3)]],   \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]],\
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_fp8ch("qgemv_fp8ch", half);
+instantiate_qgemv_fp8ch("qgemv_fp8ch_bfloat16", bf16);
+
+// Column-pair batch twin (grid (N/4, M/2)); same bindings as batch-1.
+#define instantiate_qgemv_fp8ch_mb(name, T)                                   \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_fp8ch_mb<T>(                                                    \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const float* WS [[buffer(3)]],   \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]],\
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_fp8ch_mb("qgemv_fp8ch_mb", half);
+instantiate_qgemv_fp8ch_mb("qgemv_fp8ch_mb_bfloat16", bf16);
+
+// Compressed-tensors NVFP4 W4A16 GEMV over the planar checkpoint layout.
+#define instantiate_qgemv_nvfp4_planar(name, T)                               \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_nvfp4_planar<T>(                                                \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const uchar* WS [[buffer(3)]],   \
+     device const float* GS [[buffer(4)]],                                    \
+     const constant int &N [[buffer(5)]], const constant int &K [[buffer(6)]],\
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_nvfp4_planar("qgemv_nvfp4_planar", half);
+instantiate_qgemv_nvfp4_planar("qgemv_nvfp4_planar_bfloat16", bf16);
+
+// Column-pair batch twin (grid (N/4, M/2)); same bindings as batch-1.
+#define instantiate_qgemv_nvfp4_planar_mb(name, T)                            \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_nvfp4_planar_mb<T>(                                             \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const uchar* WS [[buffer(3)]],   \
+     device const float* GS [[buffer(4)]],                                    \
+     const constant int &N [[buffer(5)]], const constant int &K [[buffer(6)]],\
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_nvfp4_planar_mb("qgemv_nvfp4_planar_mb", half);
+instantiate_qgemv_nvfp4_planar_mb("qgemv_nvfp4_planar_mb_bfloat16", bf16);
+
+// mv_ext batch twin (grid (N/8, ceil(M/4))); batch-1 bindings + M @6.
+#define instantiate_qgemv_fp8ch_mv4r(name, T, R1)                             \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_fp8ch_mv4r<T, R1>(                                              \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const float* WS [[buffer(3)]],   \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]],\
+     const constant int &M [[buffer(6)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_fp8ch_mv4r("qgemv_fp8ch_mv4r", half, 4);
+instantiate_qgemv_fp8ch_mv4r("qgemv_fp8ch_mv4r_bfloat16", bf16, 4);
+
+// mv_ext batch twin (grid (N/8, ceil(M/2))); batch-1 bindings + M @7.
+#define instantiate_qgemv_nvfp4_mv4r(name, T, R1)                             \
+   template [[host_name(name)]] [[kernel]]                                    \
+   void qgemv_nvfp4_mv4r<T, R1>(                                              \
+     device T* D [[buffer(0)]], device const uchar* Wq [[buffer(1)]],         \
+     device const T* X [[buffer(2)]], device const uchar* WS [[buffer(3)]],   \
+     device const float* GS [[buffer(4)]],                                    \
+     const constant int &N [[buffer(5)]], const constant int &K [[buffer(6)]],\
+     const constant int &M [[buffer(7)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]],                             \
+     ushort sgitg [[simdgroup_index_in_threadgroup]],                         \
+     ushort lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemv_nvfp4_mv4r("qgemv_nvfp4_mv4r", half, 2);
+instantiate_qgemv_nvfp4_mv4r("qgemv_nvfp4_mv4r_bfloat16", bf16, 2);
 instantiate_qgemv_format("qgemv_kU4B8", kU4B8);
 instantiate_qgemv_format("qgemv_kU4", kU4);
 instantiate_qgemv_format("qgemv_fp8_e4m3", fp8_e4m3);
