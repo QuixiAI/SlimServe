@@ -246,6 +246,7 @@ kernel void paged_attention_verify(
      uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_paged_attention_verify("paged_attention_verify_bfloat16_128", bf16, 128);
+instantiate_paged_attention_verify("paged_attention_verify_float16_256", half, 256);
 
 // fp8 partition: identical online-softmax, but the caches hold uint8 (e4m3/e5m2) codes
 // dequantized on read with per-head k_scale/v_scale. tmp_out/max_logits/exp_sums stay fp32
@@ -649,10 +650,15 @@ kernel void cascade_prefix_partition_fp8(
 
 instantiate_paged_v2(float32, float, 64)
 instantiate_paged_v2(float32, float, 128)
+// head_dim 256 (Qwen3.8 GQA): VALUES_PER_LANE=8, kt/vt threadgroup tiles
+// 2*16*256*2B = 16 KB — inside the 32 KB budget.
+instantiate_paged_v2(float32, float, 256)
 instantiate_paged_v2(float16, half, 64)
 instantiate_paged_v2(float16, half, 128)
+instantiate_paged_v2(float16, half, 256)
 instantiate_paged_v2(bfloat16, bf16, 64)
 instantiate_paged_v2(bfloat16, bf16, 128)
+instantiate_paged_v2(bfloat16, bf16, 256)
 
 // reduce-only instantiation at D=512: consumed by mla_decode_partition (MLA latent decode
 // emits paged-v2-style partials over the 512-wide latent).

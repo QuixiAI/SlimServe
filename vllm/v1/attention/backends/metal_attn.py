@@ -41,7 +41,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Head sizes the fused paged decode kernel is instantiated for. Anything else
-# is correct on the SDPA path, just slower.
+# is correct on the SDPA path, just slower. head_dim 256 (Qwen3.8) has D=256
+# instantiations staged in paged_attn_v2.metal, but the hybrid pool's
+# blocks-first cache is a strided view and the paged family still assumes a
+# contiguous cache; it joins this tuple when the explicit block stride is
+# threaded through the plain/gqa_staged/partition/verify kernels (see the
+# kv_cache_gather_range precedent).
 _PAGED_HEAD_SIZES = (64, 128)
 
 

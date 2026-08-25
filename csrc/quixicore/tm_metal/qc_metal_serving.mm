@@ -369,8 +369,9 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
   const int block_size = static_cast<int>(key_cache.size(1));
   const int num_kv_heads = static_cast<int>(key_cache.size(2));
   const int bt_stride = static_cast<int>(block_table.stride(0));
-  TORCH_CHECK(head_size == 128 && m >= 1 && m <= 32,
-              "quixicore(metal): paged_attention_verify wants D=128, m<=32");
+  TORCH_CHECK(
+      (head_size == 128 || head_size == 256) && m >= 1 && m <= 32,
+      "quixicore(metal): paged_attention_verify wants D=128/256, m<=32");
   constexpr int kPartitionSize = 512;
   const int ctx_hint = static_cast<int>(context_lens.max().item<int64_t>());
   const int num_partitions =
