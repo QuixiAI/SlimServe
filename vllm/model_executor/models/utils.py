@@ -626,8 +626,6 @@ def _embedding_count_expression(embeddings: NestedTensors) -> str:
     return " + ".join(_embedding_count_expression(inner) for inner in embeddings)
 
 
-
-
 def _merge_multimodal_embeddings(
     inputs_embeds: torch.Tensor,
     multimodal_embeddings: NestedTensors,
@@ -942,8 +940,6 @@ def extract_layer_index(layer_name: str, num_attn_module: int = 1) -> int:
         return layer_index
 
 
-
-
 def fast_topk(
     values: torch.Tensor, topk: int, dim: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1038,8 +1034,6 @@ def process_eagle_weight(
         model.has_own_embed_tokens = True
 
 
-
-
 def scatter_output_slices(
     output: torch.Tensor,
     indices: list[int],
@@ -1054,3 +1048,8 @@ def scatter_output_slices(
         sliced = output[offset : offset + n_tok]
         dest[idx] = sliced.clone() if clone else sliced
         offset += n_tok
+
+
+def cast_overflow_tensors(tensors: torch.Tensor, offset: float = 1000) -> torch.Tensor:
+    clamp_value = torch.finfo(tensors.dtype).max - offset
+    return torch.clamp(tensors, min=-clamp_value, max=clamp_value)

@@ -1466,7 +1466,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     "csrc/quixicore/tm_rocm/qc_rocm_serving.cu"
     "csrc/quixicore/tm_rocm/qc_rocm_sample.cu"
     "csrc/quixicore/tm_rocm/qc_rocm_sparse.cu"
-    "csrc/quixicore/tm_rocm/qc_rocm_mla.cu")
+    "csrc/quixicore/tm_rocm/qc_rocm_mla.cu"
+    "csrc/quixicore/tm_rocm/qc_rocm_nvfp4.cu")
 
   define_extension_target(
     _quixicore_C

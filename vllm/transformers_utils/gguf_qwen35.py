@@ -131,8 +131,9 @@ def build_qwen35_config_from_gguf(gguf_path: str) -> Any:
 
     Vision: when an mmproj (`qwen3vl_merger`) sits beside the text GGUF the
     builder emits the composite Qwen3_5Config (text_config + vision_config,
-    architectures ["Qwen3_5ForConditionalGeneration"]); without one it
-    emits the bare text config exactly as before.
+    architectures ["Qwen3_5ForConditionalGeneration"] -- the same class the
+    safetensors checkpoint uses); without one it emits the bare text config
+    exactly as before.
     """
     from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 

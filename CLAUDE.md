@@ -72,6 +72,11 @@ behavior:
   readiness, or final performance without the corresponding evidence.
 - Preserve user and prior-agent changes. The worktree may be dirty; understand
   nearby edits and build on them rather than reverting unrelated work.
+- Always merge. When a pull, rebase, or merge collides with local dirty state,
+  semantically merge both sides — never resolve a conflict by picking one
+  side wholesale. Parallel implementations of the same file must be unified
+  so every platform's validated path keeps working, and the losing copy's
+  functional changes must be grafted into the survivor, not discarded.
 - Finish the loop: implement, build, smoke, run the real profile or explain the
   concrete blocker, update the performance notebook, and leave the next command
   obvious.
