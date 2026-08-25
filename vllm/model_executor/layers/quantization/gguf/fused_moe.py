@@ -32,7 +32,7 @@ from .params import (
     _gguf_moe_weight_loader,
     _gguf_moe_weight_type_loader,
 )
-from .utils import MMQ_QUANT_TYPES, MMVQ_QUANT_TYPES, logger
+from .utils import MMVQ_QUANT_TYPES, MOE_MMQ_QUANT_TYPES, logger
 
 
 def _moe_vec_row_limit(default: int, env: str, cuda_default: int = 64) -> int:
@@ -282,7 +282,9 @@ def _fused_moe_gguf(
     from vllm.model_executor.layers.fused_moe.fused_moe import moe_align_block_size
 
     out_hidden_states = torch.empty_like(x)
-    mmq_ok = qweight_type in MMQ_QUANT_TYPES and qweight_type2 in MMQ_QUANT_TYPES
+    mmq_ok = (
+        qweight_type in MOE_MMQ_QUANT_TYPES and qweight_type2 in MOE_MMQ_QUANT_TYPES
+    )
     vec_ok = qweight_type in MMVQ_QUANT_TYPES and qweight_type2 in MMVQ_QUANT_TYPES
     if current_platform.is_metal():
         # Metal's grouped path reads the selected raw GGUF expert blocks with

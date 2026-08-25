@@ -123,7 +123,12 @@ def resolve_profiles(
 
 
 def validate_acceleration(plan: Plan) -> dict[str, Any]:
-    """Require the executable plan to match its registered speculator."""
+    """Require the resolved plan to match its registered speculator exactly.
+
+    Every profile registers a drafter (DSpark with a TurboQuant draft KV, a
+    DFlash block drafter, or a checkpoint's own MTP head); the resolved
+    executable configuration must carry every registered engine setting.
+    """
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
@@ -251,7 +256,7 @@ def run_profile(
         "quant": plan.quant.name,
         "gpus": plan.gpus,
         "modalities": plan.source["modalities"],
-        "speculative_method": speculative["method"],
+        "speculative_method": speculative.get("method"),
         "speculative_tokens": speculative["num_speculative_tokens"],
         "draft_attention_backend": speculative.get("attention_backend"),
         "draft_kv_cache_dtype": speculative.get("kv_cache_dtype"),
