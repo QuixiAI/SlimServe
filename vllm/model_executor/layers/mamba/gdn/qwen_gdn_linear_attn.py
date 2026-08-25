@@ -71,6 +71,7 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 # import overhead.
 GDN_AITER_TRITON_AVAILABLE = rocm_aiter_ops.are_gdn_triton_kernels_available()
 
+
 if GDN_AITER_TRITON_AVAILABLE:
     from aiter.ops.triton.causal_conv1d_update_single_token import (
         fused_reshape_causal_conv1d_update_single_token as gdn_aiter_fused_reshape_causal_conv1d_update_single_token,  # noqa: E501
@@ -380,6 +381,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.tiled_v_head_layout = bool(
             getattr(config, "gdn_tiled_v_head_layout", False)
         )
+        # Which core honors the tiled layout natively decides how we serve it,
+        # and that is a property of the platform's kernels, not of the file.
+        # The MPS core threads `tiled_gqa` all the way into its scan. The
+        # CUDA/ROCm FLA kernels have no such switch and always expand q/k with
+        # repeat_interleave, so on those platforms the v-head axis must be
+        # normalized to the HF grouped order around the recurrence instead.
+        self.gdn_core_honors_tiled = current_platform.is_metal()
+        self.normalize_v_heads_to_grouped = (
+            self.tiled_v_head_layout and not self.gdn_core_honors_tiled
+        )
+        self._v_head_perms: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu
         elif current_platform.is_cpu():
@@ -776,6 +788,61 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         return query, key, value
 
+    def _tiled_grouped_perms(
+        self, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(tiled -> grouped, grouped -> tiled) index maps over the v-head axis.
+
+        ggml tiled order places value head ``hv`` under key head ``hv % H``;
+        the HF grouped order the FLA kernels assume places it under
+        ``hv // (HV // H)``.
+        """
+        cached = self._v_head_perms.get(device)
+        if cached is not None:
+            return cached
+        hv = self.num_v_heads // self.tp_size
+        h = self.num_k_heads // self.tp_size
+        rep = hv // h
+        idx = torch.arange(hv, device=device)
+        to_grouped = idx.reshape(rep, h).T.reshape(-1)
+        to_tiled = idx.reshape(h, rep).T.reshape(-1)
+        self._v_head_perms[device] = (to_grouped, to_tiled)
+        return to_grouped, to_tiled
+
+    def _regroup_v_heads(self, x: torch.Tensor, dim: int, inverse: bool = False):
+        """Reorder one v-head axis between the tiled and grouped layouts."""
+        to_grouped, to_tiled = self._tiled_grouped_perms(x.device)
+        return x.index_select(dim, to_tiled if inverse else to_grouped)
+
+    def _regroup_qkv_value_channels(self, mixed_qkv: torch.Tensor | None):
+        """Reorder just the value block of a packed [q | k | v] tensor."""
+        if mixed_qkv is None or not self.normalize_v_heads_to_grouped:
+            return mixed_qkv
+        v_off = 2 * (self.key_dim // self.tp_size)
+        hv = self.num_v_heads // self.tp_size
+        qk, v = mixed_qkv[..., :v_off], mixed_qkv[..., v_off:]
+        v = self._regroup_v_heads(
+            v.reshape(*v.shape[:-1], hv, self.head_v_dim), -2
+        ).reshape(v.shape)
+        return torch.cat([qk, v], dim=-1)
+
+    def _kernel_order(self, name: str) -> torch.Tensor:
+        """A per-v-head parameter in the order this platform's core expects.
+
+        Cached rather than written back into the parameter: rewriting weights
+        on the first forward frees/replaces storage inside the traced graph,
+        which is what broke compiled GGUF startup once already.
+        """
+        param = getattr(self, name)
+        if not self.normalize_v_heads_to_grouped:
+            return param
+        cache = self.__dict__.setdefault("_kernel_order_cache", {})
+        hit = cache.get(name)
+        if hit is None or hit.device != param.device or hit.dtype != param.dtype:
+            hit = self._regroup_v_heads(param.detach(), 0)
+            cache[name] = hit
+        return hit
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -942,7 +1009,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        return self._output_projection(core_attn_out, z)
+        out = self._output_projection(core_attn_out, z)
+        return out
 
     def forward_xpu(
         self,
@@ -1141,8 +1209,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_output=dummy_mixed_qkv,
             a=dummy_a,
             b=dummy_b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+            A_log=self._kernel_order("A_log"),
+            dt_bias=self._kernel_order("dt_bias"),
             num_k_heads=num_k_heads,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -1310,6 +1378,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata = attn_metadata_raw[self.prefix]  # type: ignore[index]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        if self.normalize_v_heads_to_grouped:
+            # Ahead of the spec/non-spec split so every view derived below
+            # inherits the grouped order (one branch aliases these tensors
+            # rather than slicing them, so reordering later would double-apply).
+            a = self._regroup_v_heads(a, -1)
+            b = self._regroup_v_heads(b, -1)
+
         if (
             self.enable_packed_recurrent_decode
             and attn_metadata.spec_sequence_masks is None
@@ -1420,6 +1495,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             mixed_qkv_non_spec = None
 
+        if self.normalize_v_heads_to_grouped:
+            # The conv is per-channel and its weights stay in the stored
+            # (tiled) order, so the value channels are reordered here: after
+            # the conv, before anything pairs value heads with key heads.
+            # `a`/`b` were already reordered above, ahead of the spec split.
+            mixed_qkv_spec = self._regroup_qkv_value_channels(mixed_qkv_spec)
+            mixed_qkv_non_spec = self._regroup_qkv_value_channels(mixed_qkv_non_spec)
+
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
         # Split mixed non-spec-decode+prefill to process independently
@@ -1460,8 +1543,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_output=conv_output_prefill,
                 a=a_prefill,
                 b=b_prefill,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
+                A_log=self._kernel_order("A_log"),
+                dt_bias=self._kernel_order("dt_bias"),
                 num_k_heads=self.num_k_heads // self.tp_size,
                 head_k_dim=self.head_k_dim,
                 head_v_dim=self.head_v_dim,
@@ -1486,10 +1569,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             core_attn_out_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
+                    A_log=self._kernel_order("A_log"),
                     a=a_spec,
                     b=b_spec,
-                    dt_bias=self.dt_bias,
+                    dt_bias=self._kernel_order("dt_bias"),
                     q=query_spec,
                     k=key_spec,
                     v=value_spec,
@@ -1513,10 +1596,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
             core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
+                A_log=self._kernel_order("A_log"),
                 a=a[:num_decode_tokens],
                 b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
+                dt_bias=self._kernel_order("dt_bias"),
                 q=query_decode,
                 k=key_decode,
                 v=value_decode,
@@ -1571,10 +1654,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
-                    A_log=self.A_log,
+                    A_log=self._kernel_order("A_log"),
                     a=a,
                     b=b,
-                    dt_bias=self.dt_bias,
+                    dt_bias=self._kernel_order("dt_bias"),
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
@@ -1605,6 +1688,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        if self.normalize_v_heads_to_grouped:
+            # Back to the stored order: `out_proj` and the `z` gate were never
+            # reordered, so the recurrence output has to meet them there.
+            core_attn_out[:num_actual_tokens] = self._regroup_v_heads(
+                core_attn_out[:num_actual_tokens], -2, inverse=True
+            )
 
     def _forward_core_decode_aiter(
         self,
@@ -1655,10 +1745,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2. Recurrent attention
         gdn_aiter_fused_rearrange_sigmoid_gated_delta_rule(
-            A_log=self.A_log,
+            A_log=self._kernel_order("A_log"),
             a=a,
             b=b,
-            dt_bias=self.dt_bias,
+            dt_bias=self._kernel_order("dt_bias"),
             qkv=mixed_qkv_non_spec,
             key_dim=self.key_dim // self.tp_size,
             value_dim=self.value_dim // self.tp_size,
@@ -1711,19 +1801,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             validate_data=False,
         )
+        # Same layout normalization the general path applies: this fast path
+        # returns before `_forward_core` reaches it, so without this the value
+        # channels stay in the stored (tiled) order while `a`/`b` and the
+        # per-head parameters have already been regrouped -- a mix that
+        # corrupts every decoded token while prefill stays correct.
+        mixed_qkv_non_spec = self._regroup_qkv_value_channels(mixed_qkv_non_spec)
+
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
             b=b,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+            A_log=self._kernel_order("A_log"),
+            dt_bias=self._kernel_order("dt_bias"),
             scale=self.head_k_dim**-0.5,
             initial_state=ssm_state,
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
         )
+        if self.normalize_v_heads_to_grouped:
+            # Back to the stored order for `out_proj` and the `z` gate.
+            core_attn_out[:num_actual_tokens] = self._regroup_v_heads(
+                core_attn_out[:num_actual_tokens], -2, inverse=True
+            )
         return
 
     def _split_conved_qkv_mps(
