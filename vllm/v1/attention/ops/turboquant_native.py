@@ -10,6 +10,7 @@ split-KV reduction exactly. Tensor preprocessing (rotation GEMM, norms)
 stays in the same cuBLAS/ATen calls the Triton launchers use.
 """
 
+import os
 from functools import cache
 from typing import Any
 
@@ -17,6 +18,15 @@ import torch
 
 from vllm.quixicore.ops import quixicore_ops
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
+
+# Split-K Metal decode route (tq_attention_splitk + tq_attention_reduce):
+# restores GPU occupancy at head 256 the same way the bf16 PA256 split-K
+# does, and reads the block table in-kernel so the per-layer B x width
+# slots-matrix build disappears. Scoped to head_size 256 (the qwen38
+# full-attn geometry) so the hs64/128 paths that the DSV4 anchors pin stay
+# on the monolithic kernel, bit-exact. VLLM_QC_TQ_SPLITK=0 restores the
+# monolithic route everywhere (null path for A/B).
+_TQ_SPLITK_ENABLED = os.environ.get("VLLM_QC_TQ_SPLITK", "1") != "0"
 
 
 # Read-only constants the Metal launch path would otherwise rebuild on every
@@ -60,9 +70,7 @@ def metal_neg_inf_sinks(num_heads: int, device: torch.device) -> torch.Tensor:
     key = ("sinks", num_heads, str(device))
     t = _metal_const_cache.get(key)
     if t is None:
-        t = torch.full(
-            (num_heads,), -float("inf"), dtype=torch.float32, device=device
-        )
+        t = torch.full((num_heads,), -float("inf"), dtype=torch.float32, device=device)
         _metal_const_cache[key] = t
     return t
 
@@ -224,12 +232,36 @@ def native_turboquant_decode_attention(
     max_num_kv_splits: int = 32,
     sliding_window: int = 0,
     sinks: torch.Tensor | None = None,
+    max_context: int = 0,
 ) -> torch.Tensor:
     """Native TQ decode; mirrors `triton_turboquant_decode_attention`."""
     from vllm.platforms import current_platform
 
     B, Hq, D = query.shape
     if current_platform.is_metal():
+        if _TQ_SPLITK_ENABLED and D == 256 and sliding_window <= 0:
+            metal_centroids = metal_scaled_centroids(centroids, D)
+            metal_signs = metal_ones(D, query.device)
+            metal_sinks = (
+                sinks
+                if sinks is not None
+                else metal_neg_inf_sinks(query.shape[1], query.device)
+            )
+            return quixicore_ops.turboquant_attention_splitk_metal(
+                query,
+                kv_cache,
+                block_table,
+                seq_lens,
+                metal_centroids,
+                metal_signs,
+                metal_sinks,
+                scale,
+                kv_cache.shape[2],
+                8 if key_fp8 else mse_bits,
+                key_fp8,
+                value_quant_bits,
+                max_context,
+            )
         block_size = kv_cache.shape[1]
         width = (
             sliding_window if sliding_window > 0 else block_table.shape[1] * block_size

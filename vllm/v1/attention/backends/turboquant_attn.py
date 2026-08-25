@@ -74,12 +74,17 @@ def _is_metal_platform() -> bool:
 
     return current_platform.is_metal()
 
+
 # Continuation prefill: for small continuation chunks (q_len ≤ threshold),
 # use the TQ decode kernel directly instead of full-dequant + flash_attn.
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
 _CONTINUATION_DECODE_THRESHOLD = 128
+# Metal continuation attention: above this KV length, use the KV-tiled
+# online-softmax path instead of masked SDPA (mask/scores materialization).
+_METAL_TILED_ATTN_MIN_SEQ = 8192
+_METAL_ATTN_KV_TILE = 4096
 _MAX_SLIDING_WINDOW_KV_SPLITS = 16
 
 
@@ -756,6 +761,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             centroids = metal_scaled_centroids(layer._tq_centroids, self.head_size)
             signs = metal_ones(self.head_size, key.device)
+            # The native encode requires contiguous inputs. K is contiguous
+            # after QK-norm/RoPE, but V arrives as a strided slice of the
+            # fused QKV projection output.
+            if not key.is_contiguous():
+                key = key.contiguous()
+            if not value.is_contiguous():
+                value = value.contiguous()
             quixicore_ops.turboquant_encode_metal(
                 key,
                 value,
@@ -927,7 +939,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # Continuation chunk: tokens already stored to TQ cache
                 # by do_kv_cache_update. Use decode kernel directly to
                 # avoid O(cached_len) full-dequant per continuation.
-                # For large continuations, fall back to _continuation_prefill.
+                # For large continuations, fall back to _continuation_prefill
+                # (on Metal via tq_decode_combined — the synthetic-decode
+                # route re-streams the full cached KV once per query row per
+                # q-head, which is O(ctx^2) with a ~24x-redundant constant
+                # over a chunked prefill).
                 cached_len = seq_len - q_len
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
                     # Fast path: treat each query as a decode request
@@ -944,6 +960,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         # DSpark's non-causal SWA is block anchored: the
                         # trailing context window plus the complete query block.
                         window += q_len
+                    synth_extra: dict[str, Any] = (
+                        {"max_context": seq_len} if _is_metal_platform() else {}
+                    )
                     out = self._decode_attention_fn(
                         query=q_seq,
                         kv_cache=kv_cache,
@@ -960,6 +979,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         PiT=PiT,
                         sliding_window=window,
                         sinks=self.sinks,
+                        **synth_extra,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -1025,6 +1045,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         window = self.sliding_window
         if any_non_causal and window:
             window += q_len
+        extra: dict[str, Any] = {}
+        if _is_metal_platform() and attn_metadata.seq_lens_cpu is not None:
+            # Host-side batch max sizes the split-K partitions (upper bound
+            # is fine; partitions past the true length early-out). No device
+            # sync — seq_lens_cpu is already on the host.
+            cpu_lens = attn_metadata.seq_lens_cpu
+            if cpu_lens.numel() >= num_reqs:
+                extra["max_context"] = int(cpu_lens[:num_reqs].max())
         return self._decode_attention_fn(
             query=query,
             kv_cache=kv_cache,
@@ -1043,6 +1071,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
             sliding_window=window,
             sinks=self.sinks,
+            **extra,
         )
 
     def _continuation_prefill(
@@ -1102,7 +1131,34 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :]
         v_cached = v_buf[:, :, :alloc_len, :]
 
-        if self._use_native_kernels:
+        if _is_metal_platform():
+            from vllm.quixicore.ops import quixicore_ops
+            from vllm.v1.attention.ops.turboquant_native import (
+                metal_arange,
+                metal_ones,
+                metal_scaled_centroids,
+            )
+
+            # Contiguous slot ids for cached positions [0, alloc_len). The
+            # kernel indexes the paged cache directly — no (q_len, ctx)
+            # slots matrix is built on this path. Rows past cached_len fall
+            # in the request's own last (allocated) block and are unread.
+            nb = alloc_len // block_size
+            blocks = block_table[0, :nb].to(torch.int32)
+            offs = metal_arange(block_size, device, torch.int32)
+            slots = (blocks.unsqueeze(1) * block_size + offs.unsqueeze(0)).reshape(-1)
+            quixicore_ops.turboquant_dequant_kv_metal(
+                kv_cache,
+                slots,
+                metal_scaled_centroids(centroids, D),
+                metal_ones(D, device),
+                k_cached,
+                v_cached,
+                8 if self.tq_config.key_fp8 else self.tq_config.key_mse_bits,
+                self.tq_config.key_fp8,
+                self.tq_config.effective_value_quant_bits,
+            )
+        elif self._use_native_kernels:
             from vllm.quixicore.ops import quixicore_ops
 
             quixicore_ops.turboquant_dequant_kv(
@@ -1151,8 +1207,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 num_warps=4,
             )
 
-        # Inverse-rotate MSE keys back to original space
-        if not self.tq_config.key_fp8:
+        # Inverse-rotate MSE keys back to original space. The Metal encode
+        # quantizes raw K (asymmetric uniform, no Pi rotation), so its keys
+        # are already in the original space regardless of mode.
+        if not self.tq_config.key_fp8 and not _is_metal_platform():
             # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
             Pi_half = layer._tq_Pi_half
             k_flat = k_cached[0, :, :cached_len, :].reshape(-1, D)
@@ -1199,6 +1257,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_k=seq_len,
                 causal=causal,
             )
+        elif (
+            _is_metal_platform()
+            and causal
+            and seq_len > _METAL_TILED_ATTN_MIN_SEQ
+            and not self.sliding_window
+            and self.sinks is None
+        ):
+            # Long-context continuation on Metal: the plain-SDPA fallback
+            # below materializes a (q_len, seq_len) mask and lets MPS SDPA
+            # materialize scores — 0.5-26 GB per layer call at 262k. The
+            # KV-tiled online-softmax path keeps peak transient bounded by
+            # the tile size.
+            return self._metal_tiled_continuation_attention(
+                query, k_full, v_full, cached_len, seq_len
+            )
         else:
             # SDPA fallback: expand KV for GQA, build causal mask
             q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
@@ -1232,6 +1305,64 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 out, query, k_full, causal=causal, mask=mask
             )
 
+    def _metal_tiled_continuation_attention(
+        self,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        k_full: torch.Tensor,  # (seq_len, Hk, D)
+        v_full: torch.Tensor,  # (seq_len, Hk, D)
+        cached_len: int,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Causal continuation attention over KV tiles. The online-softmax
+        running max/denominator are fp32; the PV product runs at the value
+        dtype and accumulates into fp32. KV tiles entirely before
+        `cached_len` are visible to every query row, so only tiles
+        overlapping the current chunk are masked; peak transient memory is
+        bounded by the tile size, not seq_len."""
+        q_len, Hq, D = query.shape
+        Hk = k_full.shape[1]
+        G = Hq // Hk
+        device = query.device
+        # (Hk, G*q_len, D) with kv-head-major grouping: q head h -> kv head
+        # h // G (vLLM GQA convention).
+        qg = query.permute(1, 0, 2).reshape(Hk, G * q_len, D)
+        rows = G * q_len
+        m = torch.full((Hk, rows, 1), float("-inf"), dtype=torch.float32, device=device)
+        denom = torch.zeros((Hk, rows, 1), dtype=torch.float32, device=device)
+        acc = torch.zeros((Hk, rows, D), dtype=torch.float32, device=device)
+        # One arange per call (not per tile); qpos/jpos slice from it.
+        pos = torch.arange(seq_len, device=device, dtype=torch.int32)
+        qpos = pos[cached_len:seq_len]  # query row r attends j <= qpos[r]
+        for s0 in range(0, seq_len, _METAL_ATTN_KV_TILE):
+            s1 = min(s0 + _METAL_ATTN_KV_TILE, seq_len)
+            k_t = k_full[s0:s1].permute(1, 2, 0)  # (Hk, D, S)
+            v_t = v_full[s0:s1].permute(1, 0, 2)  # (Hk, S, D)
+            scores = torch.bmm(qg, k_t).float() * self.scale  # (Hk, rows, S)
+            if s1 > cached_len + 1:
+                # (q_len, S) hidden-position mask, broadcast over (Hk, G).
+                hidden = pos[s0:s1].unsqueeze(0) > qpos.unsqueeze(1)
+                scores = (
+                    scores.view(Hk, G, q_len, -1)
+                    .masked_fill(hidden, float("-inf"))
+                    .view(Hk, rows, -1)
+                )
+            tile_m = scores.amax(dim=-1, keepdim=True)
+            new_m = torch.maximum(m, tile_m)
+            # -inf in both m and tile_m would make alpha NaN; unreachable
+            # because every row sees key j=0 unmasked in tile 0.
+            alpha = torch.exp(m - new_m)
+            p = torch.exp(scores - new_m)
+            acc = acc * alpha + torch.bmm(p.to(v_t.dtype), v_t).float()
+            denom = denom * alpha + p.sum(dim=-1, keepdim=True)
+            m = new_m
+        out = acc / denom
+        return (
+            out.view(Hk, G, q_len, D)
+            .permute(2, 0, 1, 3)
+            .reshape(q_len, Hq, D)
+            .to(query.dtype)
+        )
+
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
     # ------------------------------------------------------------------ #
@@ -1263,6 +1394,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 )
             )
 
+        extra: dict[str, Any] = {}
+        if (
+            _is_metal_platform()
+            and attn_metadata.seq_lens_cpu is not None
+            and attn_metadata.seq_lens_cpu.numel() >= B
+        ):
+            # Host-side batch max for split-K partition sizing (no device
+            # sync); upper bound is fine — trailing partitions early-out.
+            # A short seq_lens_cpu would UNDER-estimate the batch max
+            # (truncated partitions), so omit the key and let the callee's
+            # max_context=0 default take the conservative path instead.
+            extra["max_context"] = int(attn_metadata.seq_lens_cpu[:B].max())
         result = self._decode_attention_fn(
             query=query,
             kv_cache=kv_cache,
@@ -1284,5 +1427,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_num_kv_splits=self.max_num_kv_splits,
             sliding_window=self.sliding_window,
             sinks=self.sinks,
+            **extra,
         )
         return result
