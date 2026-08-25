@@ -181,9 +181,41 @@ class quixicore_ops:
         return _qc().dsv4_hc_head(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
 
     @staticmethod
-    def rms_norm(
+    def add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused residual add + weighted RMS norm (Metal): returns
+        (normed, summed_residual), bit-identical to the eager
+        `residual = residual + x; rms_norm(residual)` chain."""
+        return _qc().add_rms_norm(x, residual, weight, epsilon)
+
+    @staticmethod
+    def gemma_rms_norm(
         x: torch.Tensor, weight: torch.Tensor, epsilon: float
     ) -> torch.Tensor:
+        """Gemma-semantics RMS norm (Metal): y = bf16(x_hat32 * (w32 + 1)),
+        fp32 weight multiply, single final round — ir.ops.rms_norm with
+        weight = float(w) + 1. Takes the raw bf16 module weight."""
+        return _qc().gemma_rms_norm(x, weight, epsilon)
+
+    @staticmethod
+    def gemma_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gemma-semantics fused residual add + RMS norm (Metal): statistic
+        over the unrounded fp32 sum, summed residual rounded once — returns
+        (normed, summed_residual), matching ir.ops.fused_add_rms_norm with
+        weight = float(w) + 1 to reduction-order ulps."""
+        return _qc().gemma_add_rms_norm(x, residual, weight, epsilon)
+
+    @staticmethod
+    def rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
         """Weighted RMS norm with vllm ir.ops.rms_norm numerics (Metal).
 
         bf16 contiguous [rows, D] inputs ride the single-dispatch fixed-D
@@ -203,8 +235,12 @@ class quixicore_ops:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Indexer Q RoPE + fp8-domain quantize; q_scale folded into weights."""
         return _qc().dsv4_indexer_q_rope_quant(
-            index_q, positions, cos_sin_cache, index_weights,
-            softmax_scale, head_scale,
+            index_q,
+            positions,
+            cos_sin_cache,
+            index_weights,
+            softmax_scale,
+            head_scale,
         )
 
     @staticmethod
@@ -244,6 +280,75 @@ class quixicore_ops:
         """Fused SwiGLU (Metal): silu(clamp?(gate))*clamp?(up) or the OAI
         gate*sigmoid(alpha*gate)*(up+beta) form, into preallocated y."""
         _qc().qc_swiglu(x, y, clamp_limit, oai_form, alpha, beta)
+
+    @staticmethod
+    def qc_kv_cache_scatter(
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        num_heads: int,
+        head_size: int,
+        block_size: int,
+        block_mult: int,
+    ) -> None:
+        """Paged KV insert (Metal): one dispatch writes K and V rows by
+        slot; block_mult=2 for the page-local dense layout (value_cache
+        bound one block past the dense base); slot<0 rows are skipped."""
+        _qc().qc_kv_cache_scatter(
+            key,
+            value,
+            slot_mapping,
+            key_cache,
+            value_cache,
+            num_heads,
+            head_size,
+            block_size,
+            block_mult,
+        )
+
+    @staticmethod
+    def qc_qk_norm_rope_gate(
+        qkv: torch.Tensor,
+        q_w: torch.Tensor,
+        k_w: torch.Tensor,
+        cos_sin: torch.Tensor,
+        positions: torch.Tensor,
+        num_q_heads: int,
+        num_k_heads: int,
+        head_dim: int,
+        rot_dim: int,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused Qwen3-Next attention prep (Metal): gated-q split + gemma
+        QK-RMSNorm + partial NeoX RoPE + gate de-interleave, one dispatch.
+        Returns (q, gate, k) contiguous; V stays a caller-side view."""
+        return _qc().qc_qk_norm_rope_gate(
+            qkv,
+            q_w,
+            k_w,
+            cos_sin,
+            positions,
+            num_q_heads,
+            num_k_heads,
+            head_dim,
+            rot_dim,
+            eps,
+        )
+
+    @staticmethod
+    def qc_dflash_conv(
+        x: torch.Tensor,
+        delta: torch.Tensor,
+        base: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Fused DFlash2 grouped dynamic conv (Metal): block-local taps with
+        the position mask, one dispatch. delta is [tokens, taps, groups]
+        (side slices of the projection view pass without a copy); base is
+        [taps, hidden]."""
+        return _qc().qc_dflash_conv(x, delta, base, block_size)
 
     @staticmethod
     def dsv4_router_topk(
@@ -286,7 +391,14 @@ class quixicore_ops:
         """Prefill indexer top-k: per-request block-table rows, request-local
         candidate windows (decode kernel's ULP class vs the eager chain)."""
         _qc().dsv4_indexer_topk_prefill(
-            q, weights, kv_cache, block_table, tok_req, cand, out, width,
+            q,
+            weights,
+            kv_cache,
+            block_table,
+            tok_req,
+            cand,
+            out,
+            width,
             k_eff,
         )
 
@@ -720,17 +832,27 @@ class quixicore_ops:
         context_lens: torch.Tensor,
         scale: float,
         window: int = 0,
+        max_context: int = 0,
     ) -> torch.Tensor:
         """Dense/GQA paged decode (Metal build).
 
         `key_cache`/`value_cache` are the two contiguous halves of the KV
         cache, each [num_blocks, block_size, kv_heads, head_size]. The GQA head
         ratio is resolved inside the kernel. `window > 0` restricts each query
-        to the last `window` positions (sliding-window attention). Returns
+        to the last `window` positions (sliding-window attention).
+        `max_context` (host-side batch max, optional) sizes the D=256 split-K
+        partitions; 0 falls back to the block-table width bound. Returns
         [batch, heads, head_size].
         """
         return _qc().paged_attention(
-            q, key_cache, value_cache, block_table, context_lens, scale, window
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            context_lens,
+            scale,
+            window,
+            max_context,
         )
 
     # ------------------------------------------------------------------
@@ -748,6 +870,33 @@ class quixicore_ops:
     ) -> torch.Tensor:
         """Weight-only GEMV, one output row per simdgroup."""
         return _qc().ggml_mul_mat_vec_a8(w, x, quant_type, row)
+
+    @staticmethod
+    def fp8ch_mul_mat_vec(
+        w: torch.Tensor, x: torch.Tensor, w_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Compressed-tensors FP8-per-channel W8A16 GEMV.
+
+        `w` is the checkpoint's planar row-major (N, K) e4m3 bytes stored as
+        uint8, `w_scale` one float32 per output row; `x` is (M, K) in the
+        model dtype. Returns (M, N).
+        """
+        return _qc().fp8ch_mul_mat_vec(w, x, w_scale)
+
+    @staticmethod
+    def nvfp4_mul_mat_vec(
+        w: torch.Tensor,
+        x: torch.Tensor,
+        w_scale: torch.Tensor,
+        global_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compressed-tensors NVFP4 W4A16 GEMV over the planar layout.
+
+        `w` (N, K/2) packed e2m1 nibble pairs, `w_scale` (N, K/16) raw e4m3
+        bytes (both uint8), `global_scale` the fp32 per-tensor multiplier;
+        `x` is (M, K) in the model dtype. Returns (M, N).
+        """
+        return _qc().nvfp4_mul_mat_vec(w, x, w_scale, global_scale)
 
     @staticmethod
     def ggml_moe_a8_vec(
@@ -817,9 +966,7 @@ class quixicore_ops:
         simdgroup MMA): iq2_xxs w13 over (tokens, K) or q2_K down over the
         per-slot (tokens*top_k, K); returns (tokens*top_k, row) in the vec
         kernels' flat (token, slot) row order."""
-        return _qc().ggml_moe_mm_id(
-            x, w, topk_ids, top_k, quant_type, row, tokens, soa
-        )
+        return _qc().ggml_moe_mm_id(x, w, topk_ids, top_k, quant_type, row, tokens, soa)
 
     @staticmethod
     def ggml_mul_mat_a8(
@@ -1848,6 +1995,64 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def turboquant_attention_splitk_metal(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        lengths: torch.Tensor,
+        centroids: torch.Tensor,
+        signs: torch.Tensor,
+        sinks: torch.Tensor,
+        scale: float,
+        num_kv_heads: int,
+        k_bits: int,
+        k_signed: bool,
+        v_bits: int,
+        max_context: int,
+    ) -> torch.Tensor:
+        """Split-K paged TurboQuant decode attention on Metal."""
+        return _qc().turboquant_attention_splitk_metal(
+            q,
+            kv_cache,
+            block_table,
+            lengths,
+            centroids,
+            signs,
+            sinks,
+            scale,
+            num_kv_heads,
+            k_bits,
+            k_signed,
+            v_bits,
+            max_context,
+        )
+
+    @staticmethod
+    def turboquant_dequant_kv_metal(
+        kv_cache: torch.Tensor,
+        slots: torch.Tensor,
+        centroids: torch.Tensor,
+        signs: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+        k_bits: int,
+        k_signed: bool,
+        v_bits: int,
+    ) -> None:
+        """Dequant cached TurboQuant K/V into dense (1, Hk, rows, D) buffers."""
+        _qc().turboquant_dequant_kv_metal(
+            kv_cache,
+            slots,
+            centroids,
+            signs,
+            k_out,
+            v_out,
+            k_bits,
+            k_signed,
+            v_bits,
+        )
+
+    @staticmethod
     def turboquant_store_fp8(
         key: torch.Tensor,
         value: torch.Tensor,
@@ -1978,3 +2183,196 @@ class quixicore_ops:
             key_fp8,
             norm_correction,
         )
+
+    # ------------------------------------------------------------------
+    # Gated DeltaNet (Qwen3.5 GDN mixer, Metal)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def gdn_short_conv(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        state_pool: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        load_initial: bool,
+        apply_silu: bool,
+    ) -> torch.Tensor:
+        """Varlen causal short conv against the fp32 [slots, C, K-1] pool."""
+        return _qc().gdn_short_conv(
+            x,
+            weight,
+            state_pool,
+            cu_seqlens,
+            slot_mapping,
+            load_initial,
+            apply_silu,
+        )
+
+    @staticmethod
+    def gdn_qkv_prepare(
+        mixed: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        eps: float,
+        q_scale: float,
+        k_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split the post-conv q|k|v row and q/k-normalize in one dispatch."""
+        return _qc().gdn_qkv_prepare(
+            mixed,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            eps,
+            q_scale,
+            k_scale,
+        )
+
+    @staticmethod
+    def gdn_gate_beta(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """decay = exp(-exp(A_log)*softplus(a+dt_bias)), beta = sigmoid(b)."""
+        return _qc().gdn_gate_beta(a, b, A_log, dt_bias)
+
+    @staticmethod
+    def gdn_recur(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        load_initial: bool,
+    ) -> torch.Tensor:
+        """Varlen gated delta-rule scan; updates the fp32 state pool in
+        place at slot_mapping rows."""
+        return _qc().gdn_recur(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state_pool,
+            cu_seqlens,
+            slot_mapping,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            load_initial,
+        )
+
+    @staticmethod
+    def gdn_recur_spec(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        state_pool: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_table: torch.Tensor,
+        num_accepted: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ) -> torch.Tensor:
+        """Speculative-verify delta-rule scan: initial state loads from
+        slot_table[r, num_accepted[r]-1] and the state after every timestep
+        is checkpointed into slot_table[r, t]."""
+        return _qc().gdn_recur_spec(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state_pool,
+            cu_seqlens,
+            slot_table,
+            num_accepted,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        )
+
+    @staticmethod
+    def gdn_gated_rmsnorm(
+        y: torch.Tensor,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """out = rmsnorm(y) * weight * silu(z), norm-before-gate rows."""
+        return _qc().gdn_gated_rmsnorm(y, z, weight, eps)
+
+    @staticmethod
+    def gdn_fused_prepare(
+        qkvz: torch.Tensor,
+        ba: torch.Tensor,
+        conv_w: torch.Tensor,
+        conv_state_pool: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        eps: float,
+        q_scale: float,
+        k_scale: float,
+        load_initial: bool,
+        num_accepted: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused GDN decode prep: conv+silu, q/k normalize, v, decay/beta in
+        one dispatch, reading the qkvz/ba projection rows in place. Passing
+        num_accepted switches the conv into speculative-rewind mode
+        (causal_conv1d_update IS_SPEC_DECODING semantics)."""
+        return _qc().gdn_fused_prepare(
+            qkvz,
+            ba,
+            conv_w,
+            conv_state_pool,
+            cu_seqlens,
+            slot_mapping,
+            A_log,
+            dt_bias,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            eps,
+            q_scale,
+            k_scale,
+            load_initial,
+            num_accepted,
+        )
+
+    @staticmethod
+    def gdn_gated_rmsnorm_f32(
+        y: torch.Tensor,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Gated RMSNorm over fp32 recurrence output (rounded to z's dtype
+        in-register), z read in place from the strided [tokens, Hv, D]
+        projection view; returns [tokens, Hv*D] in z's dtype."""
+        return _qc().gdn_gated_rmsnorm_f32(y, z, weight, eps)

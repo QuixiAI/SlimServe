@@ -508,10 +508,16 @@ kernel void cascade_prefix_partition_fp8(
 
 instantiate_paged_v2(float32, float, 64)
 instantiate_paged_v2(float32, float, 128)
+// D=256 (Qwen3.8 full attn): the split-K pair is the ONLY viable decode
+// route at this head size — the monolithic kernel's one-simdgroup-per-head
+// walk measured 0.9 GB/s at 24 heads / batch 1 (N4 census).
+instantiate_paged_v2(float32, float, 256)
 instantiate_paged_v2(float16, half, 64)
 instantiate_paged_v2(float16, half, 128)
+instantiate_paged_v2(float16, half, 256)
 instantiate_paged_v2(bfloat16, bf16, 64)
 instantiate_paged_v2(bfloat16, bf16, 128)
+instantiate_paged_v2(bfloat16, bf16, 256)
 
 // reduce-only instantiation at D=512: consumed by mla_decode_partition (MLA latent decode
 // emits paged-v2-style partials over the 512-wide latent).
