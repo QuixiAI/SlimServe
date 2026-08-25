@@ -1536,6 +1536,19 @@ boot**.log).
   consecutive), c1 17.117/17.142 sha 467b35c3, 2500x64 3.453/3.434 sha
   aa448847, needle exact. Raw: perf/results/2026-08-25/
   {anchor_regate_audit, audit_regate}/.
+- MERGE RE-GATE (UPDATE 55, 2026-08-25): origin/main's 55 parallel
+  commits merged (dde1d7cf5), metallib + .so rebuilt from the merged
+  sources. DSV4 anchors: 8tok 573db39598e7 and off1-2000 bb83cc3054a3
+  BIT-EXACT (26th consecutive); **2500x64 RE-PINNED to 73f41acf8ca0**
+  (42/110/22, deterministic 2/2, wall 4.60-4.65 s, response coherent) —
+  attributed to main's grammar-aware DSpark drafting (7d0b41f4a,
+  09f714f37) shifting acceptance trajectories, not verified numerics.
+  Old pin f75e1d41ac3d retired. Canonical Qwen3.8 pins: see UPDATE 55 in
+  optimization_status (two boot defects fixed in the merged build first:
+  vision-wrapper torchvision requirement -> language_model_only in the
+  Metal variants; duplicate _forward_core_mps def shadowing the Metal
+  GDN dispatcher -> renamed + unified dispatch). Raw:
+  perf/results/2026-08-25/{anchor_regate_merge, merge_regate}/.
 ## Muse-Glimmer-30B (Metal, M5 Max 128 GB)
 
 ### Speculative Serving Baseline - 2026-08-14

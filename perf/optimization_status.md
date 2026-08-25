@@ -14687,3 +14687,81 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   qwen38-nvfp4-1 (safetensors, MTP k=2) and qwen38-q2kxl-1 (GGUF, DFlash2
   k=3, run under a temporary mi300x widening that is reverted after each
   run -- the profile still lists only `metal`).
+
+### UPDATE 55 (2026-08-25) — Merge origin/main (55 parallel commits) + full re-gate
+
+- The PR branch merged main's parallel Qwen3.8 campaign (vision/MoE
+  qwen3_5 stack, GGUF fixes, per-platform profiles schema, fused DFlash
+  drafter CB, small-M GEMMs, stride-aware paged kernel + 64-bit KV
+  gather). 32 conflicts reconciled — details in merge commit dde1d7cf5.
+  Key integration decisions: steady-decode metadata kept OURS (main's
+  version excluded the GDN hybrid) + main's num_computed_tokens_cpu
+  refresh grafted; metal_attn keeps split-K D=256 + bound machinery and
+  adopts main's kv_cache_gather_range on the exact path; profiles fold
+  our three Metal profiles into main's variants schema with a NEW
+  variant-level speculator override (MI300X=MTP / Metal=DFlash2);
+  both DFlash2 drafter stacks and both single-CB systems coexist.
+- Metallib + .so rebuilt from merged sources (main's tensor-ops kernels
+  needed __HAVE_TENSOR__ guards for the metal3.1 toolchain; duplicate
+  D=256 instantiations deduped; muse PA fallback passes the new
+  kv_block_stride). slimserve suite 63 passed; all merged modules import.
+- PREDICTIONS (in advance): DSV4 anchors ALL BIT-EXACT (26th; main's
+  kernel deltas are additive instantiations, a batch-kernel bit-compat
+  pragma off the anchor path, and new kernels our legs never launch).
+  Canonical c1 17.1-class sha 467b35c3 BIT-EXACT, 2500x64 3.45-class
+  sha aa448847 BIT-EXACT, needle EXACT (serving-path kernels and
+  value-critical python unchanged; merged python deltas are
+  value-identical restructures). Risk to watch: boot-time structural
+  breakage from the new profile schema / model-class routing (arch now
+  resolves to main's ConditionalGeneration wrapper), muse registration
+  on the shared trunk.
+
+- GATE ROUND 1 (post-merge build): DSV4 anchors 8tok 573db39598e7 and
+  off1-2000 bb83cc3054a3 BIT-EXACT (26th consecutive); 2500x64 ROLLED to
+  73f41acf8ca0 (42/110/22, deterministic 2/2, wall 4.60-4.65s — same
+  class as the aa448847 pin). Prediction MISSED on that leg. Attribution
+  (hypothesis, code-level): main's DSpark grammar-aware drafting commits
+  (7d0b41f4a, 09f714f37) touch vllm/v1/worker/gpu/spec_decode/, which
+  shifts acceptance trajectories without changing verified numerics —
+  response text inspected and coherent (bandwidth/FLOPs essay prose).
+  Accepted as the new pin; recorded in baseline_status.
+- GATE ROUND 1 canonical boot: DIED at processor init —
+  Qwen3VLVideoProcessor hard-requires torchvision (absent from the venv;
+  torch 2.13.0 pairs badly with a naive pip torchvision). Merged arch
+  resolution sends Qwen3.5 through main's ConditionalGeneration vision
+  wrapper, exactly the predicted risk. Fix: `language_model_only: true`
+  added to all three Metal variants' engine args (text-only serving is
+  what these profiles are; zeroes the modality limits so the vision
+  processor chain is never constructed). Suite 63 passed.
+- GATE ROUND 2: boot reached health (fix effective) but the primer 500'd:
+  TypeError in qwen_gdn_step — the merge had left BOTH campaigns'
+  `_forward_core_mps` defs in QwenGatedDeltaNetAttention. Python resolves
+  the LATER def (main's in-place `(mixed_qkv, b, a, core_attn_out)`
+  core), silently shadowing ours, so our forward_mps call bound
+  num_tokens (an int) to the tensor param. Unification: main's core
+  renamed `_forward_core_mps_native`; our dispatcher stays the single
+  entry with priority metal-five-kernel (canonical, gate-default-on) >
+  main's fused-step core (incl. its spec-verify route, via a new
+  `_forward_core_native` adapter: split_ba + container alloc + gated
+  norm) > `_forward_core_torch` oracle. `_output_projection` refactored
+  into `_gated_norm` + projection wrapper so the adapter reuses the
+  fused-norm eligibility path. NOTE for main's box: with no env set,
+  dispatch now prefers our metal path; VLLM_QWEN38_FUSED_GDN semantics
+  unchanged, VLLM_METAL_GDN=0 restores their exact pre-merge route.
+- AST sweep of all merge-touched python for the same duplicate-def
+  pattern: clean (model_runner property/setter pairs are false
+  positives). Phase-B re-gate (round 3) relaunched.
+- GATE ROUND 3 (both fixes in): ALL GREEN. Boot healthy 71 s, ramp
+  clean, muse_q38 registered (64 layers, mode=1). Needle EXACT. c1
+  1000x256 **17.260 / 17.258 tok/s sha 467b35c3 BIT-EXACT** (canonical
+  held through the merge; marginally above the 17.10-17.14 class). c1
+  2500x64 3.459 / 3.453 sha aa448847 BIT-EXACT. c4 23.129 (sha matches
+  canonical tie-carrier), c8 25.62 (tie-carrier, TPS matches 25.59
+  canonical). Raw: perf/results/2026-08-25/merge_regate/.
+- PREDICTION AUDIT: canonical legs ALL HIT (c1 sha, 2500x64 sha, needle).
+  DSV4 2/3 — the 2500x64 roll to 73f41acf8ca0 was missed; the stated
+  risk (boot-time structural breakage from schema/model-class routing)
+  materialized twice (torchvision wrapper, GDN duplicate def), both
+  fixed above. Verdict: merged build is the new canonical baseline; the
+  serving-path numerics survived a 55-commit parallel campaign merge
+  bit-exactly.
