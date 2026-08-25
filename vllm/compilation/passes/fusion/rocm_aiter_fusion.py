@@ -63,6 +63,25 @@ class AiterRMSNormQuantPattern:
     def empty_f32(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         return torch.empty(*args, dtype=torch.float32, device=self.device, **kwargs)
 
+    @staticmethod
+    def _weight_dtype_matches_input(match: pm.Match) -> bool:
+        """Refuse the fusion when the norm weight dtype differs from the input.
+
+        The aiter rmsnorm kernels read the weight in the activation dtype.
+        GemmaRMSNorm (Qwen3.5/3.8) passes a float32 ``weight + 1`` into
+        ``vllm_ir.rms_norm``; fusing that misreads the weight buffer and
+        corrupts every layer (measured 55% relative error on MI300X).
+        """
+        input_node = match.kwargs.get("input")
+        weight_node = match.kwargs.get("weight")
+        if input_node is None or weight_node is None:
+            return True
+        input_val = getattr(input_node, "meta", {}).get("val")
+        weight_val = getattr(weight_node, "meta", {}).get("val")
+        if input_val is None or weight_val is None:
+            return True
+        return input_val.dtype == weight_val.dtype
+
 
 class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
     """AITER RMSNorm + Dynamic Quantization pattern."""
@@ -114,6 +133,7 @@ class AiterRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             [self.empty(5, 16), self.empty(16)],
             pm.fwd_only,
             pm_pass,
+            extra_check=self._weight_dtype_matches_input,
         )
 
 
@@ -176,6 +196,7 @@ class AiterFusedAddRMSNormDynamicQuantPattern(AiterRMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
+            extra_check=self._weight_dtype_matches_input,
         )
 
 
@@ -232,6 +253,7 @@ class AiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             [self.empty(5, 16), self.empty(16)],
             pm.fwd_only,
             pm_pass,
+            extra_check=self._weight_dtype_matches_input,
         )
 
 
@@ -294,7 +316,14 @@ class AiterFusedAddRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             self.empty(5, 16),  # residual
         ]
 
-        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass)
+        pm.register_replacement(
+            pattern,
+            replacement,
+            inputs,
+            pm.fwd_only,
+            pm_pass,
+            extra_check=self._weight_dtype_matches_input,
+        )
 
 
 class DoubleAiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
@@ -363,6 +392,7 @@ class DoubleAiterRMSFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             [self.empty(5, 16), self.empty(16)],
             pm.fwd_only,
             pm_pass,
+            extra_check=self._weight_dtype_matches_input,
         )
 
 
@@ -449,6 +479,7 @@ class DoubleAiterRMSFp8GroupQuantViewPattern(AiterRMSNormQuantPattern):
             [self.empty(5, 16), self.empty(16)],
             trace_with_view_to_reshape,
             pm_pass,
+            extra_check=self._weight_dtype_matches_input,
         )
 
 

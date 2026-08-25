@@ -144,6 +144,10 @@ class Plan:
     @property
     def entry_file(self) -> Path:
         """The path handed to the engine as --model."""
+        if self.source.get("format") == "safetensors":
+            # A safetensors checkpoint is a directory of shards plus config
+            # and tokenizer files; the engine takes the directory itself.
+            return self.model_dir
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
         return self.model_dir / self.quant.files[0]["path"]

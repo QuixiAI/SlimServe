@@ -1,3 +1,10 @@
+// Self-contained: this header uses __dp4a and the QI*/QR* block constants
+// from ggml-common.h. It previously relied on every including TU having
+// included that header first, which custom_all_reduce.cu (DSV4 MoE) does
+// not -- on HIP that surfaced as 'use of undeclared identifier __dp4a'
+// the moment hipify regenerated that TU.
+#include "ggml-common.h"
+
 // copied and adapted from
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh and
 // https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu

@@ -2468,7 +2468,7 @@ Three corrections from the o_proj arm and a code-path audit:
    in vllm/v1/attention/backends/mla/quixicore_mla_sparse.py, which is
    NOT the DSV4 A100 path. The real path is
    vllm/models/deepseek_v4/amd/rocm.py: forward_mqa ->
-   rocm_sparse_attn_decode (merged SWA+sparse) and _forward_prefill.
+   rocm_sparse_attn_decode (merged SWA+sparse) and_forward_prefill.
 3. RETRACTED (attribution): the bt_per_token persistence fix lives in
    that same unused builder - almost certainly a NO-OP for DSV4
    serving. The 0/8 vfix campaign result was phase luck, and the
@@ -2594,6 +2594,7 @@ sentinel, no debug: 3 full-length trigger runs, deg 0/11 each,
 0 NaN lines.
 
 Every mystery of the incident collapses into this mechanism:
+
 - Boot/phase lottery = recycled allocator content behind unwritten
   partials.
 - Batch-geometry gating = partition counts and tmp reuse patterns
@@ -2637,6 +2638,7 @@ grouped-Q8 0.59ms, Q2K down 0.53ms, mHC 0.79ms, indexer 0.45ms,
 custom-AR 0.35ms, long tail ~3.4ms (incl. 145x quantize_q8_1 of ~2.3us).
 
 CONCLUSIONS:
+
 1. TP2 ~ TP4 parity is now explained: the ~21ms fixed part of the
    cycle (drafter, orchestration, eager-break idle) does not shrink
    with TP; only the ~10ms kernel part does. Doubling ranks moves the
@@ -2720,6 +2722,7 @@ prompts; baseline = segon arm from the same day, pre-change build). Raw:
 perf/results/2026-08-14/{gate768-pair,q4k-arms}/.
 
 tok/s (12k-cold / 12k-hot / 12k-c4 / 1k2k-c8 / 1k2k-c1):
+
 - segon baseline: 144.5 / 150.2 / 234.7 / 359.2 /  --
 - segoff (Q4K off):  148.1 / 150.3 / 234.2 / 324.0 / 119.7
 - cpasync (Q4K off): 148.8 / 145.3 / 235.2 / 326.4 / 110.1
@@ -2727,6 +2730,7 @@ tok/s (12k-cold / 12k-hot / 12k-c4 / 1k2k-c8 / 1k2k-c1):
 
 THE ACCEPTANCE TRAP, AGAIN: raw TPS says q4kfull c1 is +48%. Step-rate
 normalization (tps / (1 + accepted/draft)) says otherwise:
+
 - c1 steps/s: segoff 47.7, cpasync 47.6, q4kfull 47.5  -> IDENTICAL.
 - c8 steps/s: baseline 105.9, segoff 100.1, cpasync 98.0, q4kfull 97.2
   -> ~6-8% cross-boot band, no arm effect beyond it.
@@ -2736,6 +2740,7 @@ delta in this matrix is acceptance/content variance. Rule reaffirmed: no
 e2e speedup claim without step-rate normalization and matched outputs.
 
 VERDICTS:
+
 1. Fused Q4_K (#26): e2e step-rate NEUTRAL at c1 and c8. This is the
    c1-diagnosis prediction (2026-08-13) confirmed from the other side:
    decode is fixed-overhead bound, so removing 5 launches + moe_align
@@ -2901,7 +2906,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   session's transcript; the aborted re-run's stderr alongside). Engine sample:
   session scratchpad `enginecore_sample.txt`.
 
-## 2026-08-10 - Batch 1 (overhead removal) verdict: correct, speed-neutral;
+## 2026-08-10 - Batch 1 (overhead removal) verdict: correct, speed-neutral
+
 ## real bottleneck is GPU kernel time
 
 - Baseline: 8-token exact gate 809 s (0.0099 tok/s), sha db2846cf7...
@@ -2924,7 +2930,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   GPU time on M1 (microbench), not more glue work.
 - Artifacts: perf/results/2026-08-10/batch1-overhead-removal/
 
-## 2026-08-10 - Batch 2 (fp16) + MoE kernel exoneration: eater is NOT dtype,
+## 2026-08-10 - Batch 2 (fp16) + MoE kernel exoneration: eater is NOT dtype
+
 ## NOT the GGUF kernels
 
 - Baseline: bf16 ~104 s/token (832.5 s / 8-token gate, Batch-1 worktree).
@@ -2963,6 +2970,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   `perf/results/2026-08-10/kernel-microbench-m1ultra/` (script + results).
 
 ## 2026-08-10 - ROOT CAUSE FOUND: Metal working-set oversubscription ->
+
 ## VM-compressor thrash (~110 s/token explained)
 
 - Method: elimination + direct observation. Isolated microbenches on idle GPU
@@ -2979,7 +2987,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   IOAccelerator, no CPU-side copy. "Model loading took 93.49 GiB"
   (weights+drafter Metal buffers) vs 72.5 GiB GGUF file = +21 GiB load
   expansion. Demand (weights + KV 1 GiB + TurboQuant draft KV + MPSGraph pools
-  + activations) exceeds the M1 Ultra recommendedMaxWorkingSetSize (~96 GiB on
+  - activations) exceeds the M1 Ultra recommendedMaxWorkingSetSize (~96 GiB on
   128 GiB), so Metal's residency manager cycles weight buffers through the VM
   compressor on every command buffer. Each token touches all weights ->
   perpetual decompress/recompress at ~1 GB/s effective -> ~90-110 s/token.
@@ -3031,6 +3039,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   completions, probe timings in session scratchpad `fixed_probe_*.json`).
 
 ## 2026-08-10 - Post-residency 8-token exact gates: sha-EXACT vs bf16
+
 ## reference, 0.7248 tok/s (75x over the recorded baseline)
 
 - Gate (cold+warm, c1, 1000-in/8-out, offset 1, warmup 1): both runs
@@ -3072,6 +3081,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   agg / 24.79 decode-only (ds4+DSpark still unmeasured — Batch 7).
 
 ## 2026-08-10 - [SUPERSEDED - root cause was wrong, see the SIGSEGV entry
+
 ## below] Resident sweep boot death, first (incorrect) diagnosis
 
 - Symptom: census2 boot (PYTORCH_MPS_LOG_PROFILE_INFO=31) died during
@@ -3097,6 +3107,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 - Status: fix landed; census3 boot validating it (log `server_census3.log`).
 
 ## 2026-08-10 - Census boot deaths root-caused for real: SIGSEGV in torch
+
 ## MPS reduction dispatch on GiB-scale sums under the profiler
 
 - The sync-window fix from the previous entry changed NOTHING: census3 died
@@ -3125,6 +3136,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 - Status: census4 boot validates next.
 
 ## 2026-08-10 - CENSUS HARVESTED: ~20k launches per engine step, sinkhorn
+
 ## loop is 54% of them. Batch-3 order is now data-set: mHC port first
 
 - Census4 boot (chunked sweep + profiler): healthy, sweep 91.84 GiB/75.1 s,
@@ -3138,7 +3150,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   currency anyway in a launch-overhead-bound regime.
 - Op-stream segmentation of the gate window (split on argmax[1,129280], one
   per sampled token): ONE ENGINE STEP = 19,991 launches = verify pass 18,528
-  + drafter pass 1,447 + 16 sampler ops. At ~4.2 s/step (0.72 tok/s x ~3
+  - drafter pass 1,447 + 16 sampler ops. At ~4.2 s/step (0.72 tok/s x ~3
   tok/step) that is ~210 us/launch — the step is pure launch overhead; GPU
   compute is milliseconds (microbench: <2 s accountable, mostly <100 ms).
 - Verify-pass breakdown (launches): sinkhorn [6,4,4] row/col normalize loop
@@ -3159,6 +3171,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   `server_census4.log` (full stream), `gate_census4.json` (sha-exact gate).
 
 ## 2026-08-10 - Batch 3 wave 2 IMPLEMENTED: Metal mHC kernels (fused
+
 ## sinkhorn), parity clean, serving gate pending
 
 - What landed: `csrc/quixicore/metal/kernels/serving/dsv4_mhc/dsv4_mhc.metal`
@@ -3177,7 +3190,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   decomposition exactly. Replaces ~230 aten launches per fused call with 1.
 - Build: manual xcrun metal (flags from cmake/metal.cmake) + manual clang++
   of qc_metal_serving.mm; artifacts installed at vllm/quixicore_metal.metallib
-  + vllm/_quixicore_C.cpython-312-darwin.so (backups in session scratchpad).
+  - vllm/_quixicore_C.cpython-312-darwin.so (backups in session scratchpad).
 - Parity (random DSV4 shapes, T in {1,6,8}, fp16+bf16, repeat=20): fp32
   gates/comb agree to 1e-6..1e-5; activation-dtype outputs to one ulp of
   fp16/bf16 (reduction-order noise). Isolated timing: 86 fused calls 30.2 ms
@@ -3190,6 +3203,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   judge semantically, then re-baseline.
 
 ## 2026-08-10 - mHC kernel first serving gates: sha-EXACT, but timing was
+
 ## thrash-contaminated; sweep hardened with verification loop
 
 - First boot with the Metal mHC kernels (server_mhc1.log): both 8-token
@@ -3253,7 +3267,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   gate2_64tok.json, server_mhc2.log, scratchpad stream_timing.log).
 
 ## 2026-08-10/11 - A/B verdict: mHC kernels sha-exact but step-neutral; the
-## step is SYNC-bound, not launch-bound. Episodes are environmental.
+
+## step is SYNC-bound, not launch-bound. Episodes are environmental
 
 - Identical protocol on two clean verified-resident boots (48-token stream,
   per-chunk timing): kernels ON = healthy 2.65-2.78 s/step, total 272.6 s;
@@ -3333,7 +3348,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   via VLLM_SYNCPROF=1 from MetalWorker.init_device — worker-process-only,
   no signals, daemon-thread dumps to /tmp/syncprof_<pid>.txt every
   VLLM_SYNCPROF_INTERVAL s (+ cumulative CB CSV, see below). Wraps
-  mps.synchronize, Tensor.item/tolist/numpy/cpu/nonzero/__bool__,
+  mps.synchronize, Tensor.item/tolist/numpy/cpu/nonzero/**bool**,
   mps.Event.*, AsyncOutput.get_output, GPUModelRunner.execute_model.
 - Static sweep (subagent, full v2 runner path): exactly ONE legitimate
   per-step python sync — AsyncOutput.get_output -> copy_event.synchronize
@@ -3547,7 +3562,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 - Artifacts: perf/results/2026-08-11/indexer-port/ (server.log with the
   view() crash, server2.log, gate8/64/2000*.txt, gate8_post.txt).
 
-## 2026-08-11 - Task #5 profiling verdict: the wall is KERNELS, not dispatch.
+## 2026-08-11 - Task #5 profiling verdict: the wall is KERNELS, not dispatch
+
 ## Verify-width GEMV re-reads weights M times; step tape demoted to 2nd
 
 - Baseline going in: 1k/2k matrix 7.94 tok/s; plan of record said Batch 4
@@ -3561,19 +3577,19 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   (python encode, fully overlapped with GPU); ~126 CBs/step; GPU compute
   channel occupied 91.4% of wall, serial, gaps only ~1 s per 12.9 s.
 - THE HISTOGRAM (17,872 compute encoders over 12.86 s):
-  * <10 us encoders: 8,890 of them = 0.3% of GPU time. The tiny-op storm
+  - <10 us encoders: 8,890 of them = 0.3% of GPU time. The tiny-op storm
     (sinkhorn, RMS glue, casts) is GPU-CHEAP. Launch overhead is NOT the wall.
-  * 1-5 ms encoders: 4,240 = 91.1% of GPU time (~177/microstep ~= 43
+  - 1-5 ms encoders: 4,240 = 91.1% of GPU time (~177/microstep ~= 43
     layers x ~4 heavy matvecs + lm head). Top band uniformly ~4.95 ms.
 - Microbench at exact serving shapes (synthetic packed weights, this box):
-  * M=1 dense mmvq is HEALTHY: lm_head 738 GB/s, o_b 535, q_b 438 (roofline).
-  * M=6 (verify width) is LINEAR in M: the host loops the batch-1 qgemv per
+  - M=1 dense mmvq is HEALTHY: lm_head 738 GB/s, o_b 535, q_b 438 (roofline).
+  - M=6 (verify width) is LINEAR in M: the host loops the batch-1 qgemv per
     row (qc_metal_serving.mm ggml_mul_mat_vec_a8), so weights re-read 6x:
     lm_head 4.52 ms (the ~5 ms trace encoders), q_b 0.31, o_b 0.35,
     o_a 8-call loop 0.87 ms/layer at 41 GB/s.
-  * MoE vec: gate|up IQ2_XXS top6 M=6 1.03 ms + down Q2_K 0.49 ms per layer
+  - MoE vec: gate|up IQ2_XXS top6 M=6 1.03 ms + down Q2_K 0.49 ms per layer
     at 150-200 GB/s effective (per-(token,expert) weight re-read by design).
-  * mmq (padded M=32 GEMM) at M=6: lm_head 2.43 ms — better but still 6x off.
+  - mmq (padded M=32 GEMM) at M=6: lm_head 2.43 ms — better but still 6x off.
 - Arithmetic: dense ~2.2 ms + MoE ~1.5 ms per layer x 43 + lm 4.5 ms ~=
   0.2 s per verify microstep ~= the measured GPU busy. Bandwidth roofline
   for the same traffic is ~0.02-0.04 s. Kernels are ~5-10x off roofline
@@ -3596,6 +3612,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   transcript, gate1600_mst.txt).
 
 ## 2026-08-11 - Batch 5 wave 1 LANDED: qgemv_mb weight-stationary small-M
+
 ## GEMV — matrix 7.94 -> 9.18 tok/s (+15.6%); numerics-change protocol adopted
 
 - Baseline: 1k/2k matrix 7.939 tok/s (sha 5e01c483), 64-tok 4.47 (ef51bb4f),
@@ -3648,6 +3665,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   (finite oracle), bench_kernels.py.
 
 ## 2026-08-11 - Batch 5 wave 2A: iq2_xxs 8-span decode (bit-identical, ~5%
+
 ## MoE-local); 2-5 ms GPU band still unattributed — signpost trace in flight
 
 - Change: tk_dequant8<iq2_xxs> 8-span specialization in dequant.metal (grid
@@ -3680,7 +3698,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   scratchpad capture_decode_ref.py (bitwise decode reference harness),
   bench_hotband.py, parse_gpu_intervals.py.
 
-## 2026-08-11 - Glue census (PYTORCH_MPS_LOG_PROFILE_INFO=31, 1k-in/1200-out):
+## 2026-08-11 - Glue census (PYTORCH_MPS_LOG_PROFILE_INFO=31, 1k-in/1200-out)
+
 ## THE unexplained ~420 ms/step is dominated by FUNCTIONAL CACHE-CLONE COPIES
 
 - Instrument: census boot, 1200-tok gate crossing the 2048 boundary
@@ -3706,7 +3725,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   (every quixicore op names its encoder qc_*; trace-visible; perf-neutral:
   matrix 9.1468 sha 5a662b7a exact on the labeled boot).
 - NEXT (highest value, in order): (1) find and kill the 128 MiB per-step
-  cache clones (grep clone/copy_ in sparse_mla.py/metal.py/gpu worker MPS
+  cache clones (grep clone/copy_in sparse_mla.py/metal.py/gpu worker MPS
   cache-update path; goal: true in-place updates); (2) kill the
   Half[5,64,512]/Half[5,8,1024] per-step copy storms (drafter/spec
   buffers); (3) then mHC/RMS/router glue via bindings + layer tape.
@@ -3830,7 +3849,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   MetalPlatform.get_default_ir_op_priority -> rms_norm=
   ["quixicore_metal", "native"]. Boot log confirms the priority.
   Also fixed: dsv4_mhc_pre / fused_post_pre encoder labels were
-  "qc_check_mhc_f32" (copy-paste); now qc_dsv4_mhc_pre / _fused_post_pre.
+  "qc_check_mhc_f32" (copy-paste); now qc_dsv4_mhc_pre /_fused_post_pre.
 - Bug found by first boot: check_mps asserts contiguity, prefill passes
   strided q/k split views -> EngineDeadError "x must be contiguous";
   switched to check_mps_strided + explicit contiguous().
@@ -3851,12 +3870,13 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   gate2000_b/c, gate300_dump.txt, dump/).
 
 ## 2026-08-11 Wave 3b LANDED: fp32-weight RMS coverage + fused indexer-Q
-## RoPE/quant. Matrix 11.0 tok/s, gap under 2x.
+
+## RoPE/quant. Matrix 11.0 tok/s, gap under 2x
 
 - Commit: working tree. Three changes gated together after individual
   validation:
   1. qc_rms_norm_w32_{float16,bfloat16}: fp32-weight RMS variant
-     (y = T(float(x) * rrms * w_f32)) for GGUF F32 norm weights; ir-op
+     (y = T(float(x) *rrms* w_f32)) for GGUF F32 norm weights; ir-op
      supports_args widened. Solo-gated first: matrix 9.408, SAME trajectory
      c4303b1f (run B killed early by operator error - superseded here).
   2. fused_q_kv_rmsnorm Metal branch routed to the same kernel (the
@@ -4011,7 +4031,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   MoE layer, ~40 layers/step) into one dispatch. Selection by packed
   sortable (choice, ~idx) keys, 2-stage simd_max (no 64-bit overload);
   deterministic tie order (choice desc, idx asc). Hash-MoE layers (3)
-  do the tid2eid lookup in-kernel. Routes via _metal_router_topk in
+  do the tid2eid lookup in-kernel. Routes via_metal_router_topk in
   fused_topk_bias_router.py; eager fallback preserved.
 - The split-boundary finding (important precedent): MPS transcendentals
   match NO Metal formula bitwise — softplus probed at 8191 ulp vs
@@ -4040,8 +4060,8 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 
 - Commit: working tree. qc_moe_weighted_sum
   (serving/moe_finalize/moe_finalize.metal, fp16+bf16): one 256-thread
-  TG per token collapses the eager Metal finalize in _fused_moe_gguf —
-  (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1) + copy_ (~5
+  TG per token collapses the eager Metal finalize in *fused_moe_gguf —
+  (out.float() * topk_weights.unsqueeze(-1)).sum(dim=1) + copy* (~5
   dispatches x ~40 MoE layers/step) — into one dispatch, reusing the
   existing quixicore_ops.moe_weighted_sum wrapper (CUDA had this op;
   Metal now does too). Numerics note: MPS reduces the STRIDED [T,K,D]
@@ -4091,7 +4111,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   (serving/probe/qc_probe.metal + qc_probe_unary/qc_probe_binary host
   ops, DIAGNOSTIC ONLY): identifies which Metal formula an MPS aten op
   lowers to by bitwise compare on-device. Findings that unlock fusion
-  everywhere: MPS exp/log/tanh/log2/exp2 == metal::precise::* BITWISE;
+  everywhere: MPS exp/log/tanh/log2/exp2 == metal::precise::*BITWISE;
   sigmoid == precise::divide(1, 1+precise::exp(-x)); silu == the
   DIVISION form precise::divide(x, 1+exp(-x)) (NOT x*sigmoid(x));
   fp16/bf16 unary transcendentals are fp32-internal rounded once;
@@ -4126,10 +4146,10 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 ## 2026-08-11 — Kernel-time pivot: fresh phase map, per-op bench, ds4 bar (M1 Ultra, dsv4-xxs-1)
 
 - Baseline: matrix sha 4c173e70, 10.56-10.65 tok/s, step ~385-389 ms.
-- Instrumentation fix: EngineCore exits via os._exit — atexit NEVER fires
+- Instrumentation fix: EngineCore exits via os.*exit — atexit NEVER fires
   in the server, so phaseprof dumps were lost regardless of kill order
   (the morning dumps came from offline scripts). metal_phaseprof.py now
-  rewrites /tmp/phaseprof_<pid>.txt every 32 phase closes.
+  rewrites /tmp/phaseprof*<pid>.txt every 32 phase closes.
 - Fresh phase map (this build, 185 steps, 1000/800 off1, sync-bracketed
   ~0.4 ms/bracket tax; run 7.50 tok/s@1600 + 7.17@800, bracketed step
   ~597-656 ms vs ~385 clean): layer_ffn 46x3.77 = 173 ms/step;
@@ -4317,7 +4337,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   (indexer.metal): gather 8-row overlap history from the 2048-wide fp32
   state rows (h>=4 reads +512 head), per-dim softmax (sequential sums,
   precise exp/divide), weighted sum, RMS (per-lane sequential 16-dim ss
-  + simd_sum, rsqrt(divide(ss,512)+eps)), bf16 rows out; dims processed
+  - simd_sum, rsqrt(divide(ss,512)+eps)), bf16 rows out; dims processed
   in 4-wide chunks of the lane's contiguous 16-dim span (register
   bound). The native deepseek_v4_kv_insert (existing, unchanged)
   consumes the rows — RoPE@selected_pos + e4m3 + 584-byte record.
@@ -4330,7 +4350,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   rows mismatch, suspect the 512-wide mean reduction order — probe at
   [T,512] with the qc_probe method and adjust the lane/ss structure),
   then sha-identity serving gates (5d469758 / 3a325666 / drafts 434)
-  + step time (expect ~302 -> ~270 or better).
+  - step time (expect ~302 -> ~270 or better).
 
 ### RESOLVED same day: compress front is correct but serving-neutral — PARKED default-off
 
@@ -4393,7 +4413,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
     /tmp/pysample_<pid>.txt. Steady-state MainThread: get_output wait
     ~156 ms/step; forward+sampler Python encode spread over dozens of
     sub-ms sites (einsum o_proj/mhc, router, compress eager chain,
-    module __call__ overhead) — no single dominant Python site.
+    module **call** overhead) — no single dominant Python site.
 - Arithmetic: GPU work ~0.49 x 288 ~= 141 ms/step = 24 ms/token-slot at
   M=6 — BETTER than ds4's 33.6 ms/token. The kernels have won; the step
   loses ~150 ms/step to Python/dispatch pacing (GPU starves while
@@ -4427,7 +4447,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 - Drains found (all every-step, all in the v2 gpu worker glue):
   1. sampler.apply_staged_writes: unconditional 5x copy_to_uva of
      never-changing [32] arrays; on Metal "UVA" is a plain MPS tensor
-     and pageable-H2D copy_ is COMMIT_AND_WAIT (17.4 ms drain measured).
+     and pageable-H2D copy_is COMMIT_AND_WAIT (17.4 ms drain measured).
      Fix: gate on scheduled_new_reqs (model_runner.add_requests) +
      non_blocking=True in UvaBufferPool.copy_to_uva.
   2. async_copy_to_gpu mps branch: blocking out.copy_(x). Fix:
@@ -4570,7 +4590,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   tape==replica==deterministic, both registry slots, incl. repeat-style
   4-identical-stream input). To be copied into perf/results/2026-08-11/.
 
-## 2026-08-11 — S1b VERDICT: the step is GPU-EXECUTION-BOUND; "kernels are done" was a metric artifact. CAMPAIGN MAP REVISED.
+## 2026-08-11 — S1b VERDICT: the step is GPU-EXECUTION-BOUND; "kernels are done" was a metric artifact. CAMPAIGN MAP REVISED
 
 - pysamprof (200 Hz in-process, tape mode 1, 800-token run, no sync
   distortion): during decode the engine MainThread spends ~32 s (~200
@@ -4722,15 +4742,15 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   wall 132.27 s, sha 3a325666be45 IDENTICAL (also re-gates the metal.py
   slot-table code motion on the default path — note closed).
 - HEADLINE NUMBERS (29 steps in window):
-  * union GPU-exec coverage 97.2% of wall -> TRUE GPU IDLE 2.8%/step.
+  - union GPU-exec coverage 97.2% of wall -> TRUE GPU IDLE 2.8%/step.
     Step 292 ms ~= 284 ms of genuine kernel execution. There is NO
     dispatch-gap/cb-scheduling tax to reclaim (40 cbs/step, 296
     encoder-intervals/step, CPU commits ~1.5 steps ahead: 130-220 ms
     creation->completion queue latency).
-  * ~2895 MPSGraph eager ops/step (mps-hw-intervals count; exec time
+  - ~2895 MPSGraph eager ops/step (mps-hw-intervals count; exec time
     not separable there — durations include queue) + ~750 qc kernels.
-  * Encoder-region split per step: attention-region groups (sparse_attn
-    + inserts + save_partial + eager compressor/indexer glue) ~170 ms;
+  - Encoder-region split per step: attention-region groups (sparse_attn
+    - inserts + save_partial + eager compressor/indexer glue) ~170 ms;
     MoE+mHC groups ~60-85 ms; drafter ~35 ms; sampler ~6 ms.
 - WHY census said 112.6: the offline census pipelines 100 independent
   iterations -> kernels overlap 2-3x and hide occupancy bubbles. The
@@ -4765,19 +4785,19 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   [6,8,4096]x[8,1024,4096]: 0.569 vs 0.486 ms sync-serial, 0.308 vs
   0.174 amortized — MPS bmm wins this shape. Artifact: test_woa_swap.py.
 - LANDED: dsv4_mhc_pre SPLIT kernel (dots + finalize).
-  * Diagnosis: monolith runs `tokens` threadgroups (6 at M=6) on a
+  - Diagnosis: monolith runs `tokens` threadgroups (6 at M=6) on a
     64-core GPU — latency-starved; 0.223 ms/call amortized, ~0.3-0.45
     serial; 86 calls/step ~= 26-31 ms/step.
-  * Design: dots pass = one simdgroup per (token, fn-row|sqsum) job
+  - Design: dots pass = one simdgroup per (token, fn-row|sqsum) job
     (25 x tokens tgs) with loads batched 8 strides ahead; fma chain
     kept strictly sequential in the monolith's per-lane stride-32
     order; finalize pass = monolith phase 2+3 verbatim reading the
     scratch. BITWISE-IDENTICAL to the monolith (4 trials x 12 tensors,
     incl. T=1), so the serving sha-identity expectation holds.
-  * Measured offline: 0.046 ms/call amortized (was 0.223, 4.8x);
+  - Measured offline: 0.046 ms/call amortized (was 0.223, 4.8x);
     sync-serial 0.300 (sync-roundtrip floor). Projected ~15 ms/step
     amortized, 20-30 ms serial across 86 calls.
-  * Files: dsv4_mhc.metal (mhc_pre_dots_body/mhc_pre_finalize_body +
+  - Files: dsv4_mhc.metal (mhc_pre_dots_body/mhc_pre_finalize_body +
     instantiations), qc_metal_serving.mm dsv4_mhc_pre host (split
     default, VLLM_QC_MHC_SPLIT=0 legacy fallback). The step tape
     inherits (shared host fn). Metallib + extension rebuilt.
@@ -4792,13 +4812,13 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
 ## 2026-08-12 — Batch 9 wave 1 GATES PASSED: NEW BASELINE 15.83-15.86 tok/s
 
 - Boot: default env (mhc split ON, compress front512 ON). All gates:
-  * 8-tok: sha 5d4697585c6e IDENTICAL to baseline, 1.95 tps (in band).
-  * off1-2000 x2: sha abaa1c24b187 BOTH runs (deterministic), text
+  - 8-tok: sha 5d4697585c6e IDENTICAL to baseline, 1.95 tps (in band).
+  - off1-2000 x2: sha abaa1c24b187 BOTH runs (deterministic), text
     fully coherent (1574-word narrative, read start+end).
-  * 15.83 / 15.86 agg tok/s, wall 126.35 / 126.12 s (was 15.06-15.14 /
+  - 15.83 / 15.86 agg tok/s, wall 126.35 / 126.12 s (was 15.06-15.14 /
     132.1-132.8). Counters 1557/2220/444 -> draw 4.505 (was 4.61 —
     per-trajectory acceptance variance, 70.1% vs 72.2% per-token).
-  * STEP: (126.35-5.5)/444 = 272.2 ms (was 292.1) — -20 ms/step, -6.8%,
+  - STEP: (126.35-5.5)/444 = 272.2 ms (was 292.1) — -20 ms/step, -6.8%,
     matching the mhc-split projection (15-30 serial band).
 - sha drift vs 3a325666be45 comes from front512 ULPs only (the mhc
   split is bitwise-identical offline and the 8-tok sha held).
@@ -4846,11 +4866,11 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   server was still up and holding wave-1 binaries); killed and
   rebooted so the wave-2 metallib/ext actually loaded.
 - Gates (sha-IDENTITY class, both PASSED):
-  * 8-tok: sha 5d4697585c6e IDENTICAL. 4.518 s wall (in band).
-  * off1-2000: sha abaa1c24b187 IDENTICAL, counters 1557/2220/444
+  - 8-tok: sha 5d4697585c6e IDENTICAL. 4.518 s wall (in band).
+  - off1-2000: sha abaa1c24b187 IDENTICAL, counters 1557/2220/444
     IDENTICAL (bit-exact confirmed end-to-end).
-  * 15.93 agg tok/s, wall 125.58 s (was 15.83-15.86 / 126.12-126.35).
-  * STEP: (125.575-5.5)/444 = 270.4 ms (was 271.7-272.2) — about
+  - 15.93 agg tok/s, wall 125.58 s (was 15.83-15.86 / 126.12-126.35).
+  - STEP: (125.575-5.5)/444 = 270.4 ms (was 271.7-272.2) — about
     -1.5 ms/step, consistent with the widened elementwise walk saving
     a fraction of the 86 mhc_post calls' serial time.
 - DECISION: RETAIN. Baseline row moves to 15.93 / 125.58 / 270.4 ms
@@ -4875,19 +4895,19 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   copy at all. Host op accepts fp16 q/kv (bf16 path unchanged);
   metal.py passes q/kv straight through. -86 kernels/step.
 - CHANGE 2 (sparse_attention direct write): two-cache kernel templated
-  on output type; the _out_half variant stores half(float(bf16(v))) —
-  replicating the bf16-store + copy_ cast chain bit-for-bit. Host op
+  on output type; the *out_half variant stores half(float(bf16(v))) —
+  replicating the bf16-store + copy* cast chain bit-for-bit. Host op
   takes optional out; metal.py passes the serving buffer when
   contiguous/shape/dtype-compatible, else falls back to copy_.
   -43 copy kernels/step.
 - OFFLINE CORRECTNESS (both ALL PASS, bitwise int16/byte compare):
-  * test_qnorm_insert_half.py: q out bitwise, cache bytes, contiguous
-    + strided fp16 kv vs the cast path.
-  * test_sparse_attn_out.py: fp16 direct vs copy_ chain, bf16 direct
+  - test_qnorm_insert_half.py: q out bitwise, cache bytes, contiguous
+    - strided fp16 kv vs the cast path.
+  - test_sparse_attn_out.py: fp16 direct vs copy_ chain, bf16 direct
     vs allocated result (caches populated via the gated insert op to
     avoid NaN-payload false diffs).
 - Files: mla.metal (templates + 2 new instantiations), tk_launch.h
-  (half_input/half_out flags, _half launcher), qc_metal_serving.mm
+  (half_input/half_out flags,_half launcher), qc_metal_serving.mm
   (dtype dispatch, optional out, pybind arg), ops.py (out passthrough),
   metal.py (casts dropped, direct write). Metallib + ext rebuilt.
 - LIVE GATE (this boot): everything is bit-exact class => sha-IDENTITY
@@ -4923,7 +4943,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   kv_score mm (22 kind-0 + ~42 indexer cr=4 layers), then 2x .to(bf16)
   on the split halves, plus an ape.to(bf16).contiguous() of a CONSTANT
   every call — roughly 190-260 cast kernels/step at ~7 us each.
-- CHANGE: dsv4_save_partial_states templated on input type; the _half
+- CHANGE: dsv4_save_partial_states templated on input type; the_half
   twin reads the raw fp16 kv_score halves (row-strided) and rounds to
   bf16 in-register. fp16->fp32(.float(), exact)->bf16(RNE) == single
   fp16->bf16 RNE, so dropping BOTH eager casts is bit-exact. Both
@@ -4937,7 +4957,7 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   W=128/cr=4 indexer shape, strided fp16 halves vs the replicated old
   .float()+.to(bf16) chain.
 - Files: mla.metal (template + _half instantiation), tk_launch.h
-  (half_input flag), qc_metal_serving.mm (dtype dispatch), 
+  (half_input flag), qc_metal_serving.mm (dtype dispatch),
   save_partial_states.py (fp16 passthrough + ape guard), compressor.py
   (ape memoization), attention.py (both .float() drops).
 - GATE (boot in flight): sha-IDENTITY — 8-tok 5d4697585c6e, off1-2000
@@ -4983,15 +5003,15 @@ amended plan: `perf/metal_m1ultra_campaign_v2.md`.
   torch.profiler), 500-tok run, step-40 capture + chrome trace with
   python stacks (perf/results/2026-08-12/batch9/opcensus_step40.*).
 - THE NUMBER: ~2,800 kernel-launching aten ops/step, of which ~1,950
-  (67%) are COPIES/CASTS: copy_ 906, _to_copy 523, clone 290,
+  (67%) are COPIES/CASTS: copy_906,_to_copy 523, clone 290,
   contiguous 223. Real math is only ~285 (mm 62, bmm 46, linear 74,
   einsum 46, index_select 57) ≈ 5-6 ms GPU. Plus arange 94 + where 95
-  + fill_ 97 (step-constant table rebuilds).
+  - fill_ 97 (step-constant table rebuilds).
 - STACK ATTRIBUTION (per step): OUR OWN HOST-OP MARSHALLING dominates —
   qnorm_rope_kv_insert host 430 (positions/slots/cos-sin per call x43),
   qc rms_norm wrapper 285 (a real clone per call — callers pass strided
   x, host does x.contiguous()), kv_insert host 210, fused_qk_rmsnorm
-  184, save_partial host 124, gate_linear 92, _o_proj 86 (CONSTANT
+  184, save_partial host 124, gate_linear 92,_o_proj 86 (CONSTANT
   weight-slice clones), indexer forward 126 (arange/where/copy),
   scaling_rope 48, compress hosts 84.
 - CPU side note: total step CPU dispatch ~79 ms < 270 ms GPU (CPU runs
@@ -5084,6 +5104,7 @@ at 31.46-31.52 tok/s / 130.5-130.8 ms. One-place summary for future
 sessions; details in the entries above.
 
 WORKED (retained, in landed order):
+
 - mhc_pre split kernel: 6 -> 150 threadgroups + 8-ahead load batching;
   bitwise-identical; -20 ms/step. The single biggest CLASSIC win.
 - VLLM_QC_COMPRESS_FRONT=1 (front512): ULP-class, ~1%.
@@ -5101,6 +5122,7 @@ WORKED (retained, in landed order):
   designed as.
 
 DIDN'T WORK (measured and rejected — do not redo):
+
 - Fused mhc post+pre wiring (forward_mps exists, bit-exact, SLOWER).
 - wo_a via qc_decode_linear_bh (MPS bmm wins).
 - iq2_xxs ulong-shift codebook decode (9% slower; Apple threadgroup
@@ -5111,6 +5133,7 @@ DIDN'T WORK (measured and rejected — do not redo):
 - Removing speculation (3.70x multiplier; never remove).
 
 INSTRUMENT LESSONS (hard-won, reusable):
+
 - Sync-bracketed phaseprof absolutes are ~95% inflated for tiny-op
   regions; only the split is structural.
 - xctrace metal-gpu-intervals: FIRST duration column only (second is
@@ -5127,6 +5150,7 @@ INSTRUMENT LESSONS (hard-won, reusable):
   kernel count. (aten::empty 1,647/step is the tell to watch.)
 
 REMAINING HEADROOM (if the campaign reopens), ranked:
+
 1. Re-census on the 130.8 ms baseline — the op mix has shifted;
    remaining copy/cast clusters: qc rms_norm x.contiguous() clones
    (285/step; strided kernel variants STAGED in rms_norm.metal,
@@ -5215,7 +5239,7 @@ REMAINING HEADROOM (if the campaign reopens), ranked:
 
 - Baseline: UPDATE 17 (130.5-130.8 ms/step, 31.46-31.52 tok/s).
 - Change 1: qc_rms_norm strided-input kernel variants wired end to end
-  (rms_norm.metal *_strided_* instantiations from the staged edit;
+  (rms_norm.metal **strided** instantiations from the staged edit;
   metallib rebuilt; host rms_norm in qc_metal_serving.mm binds 2-D
   non-contiguous unit-inner-stride x directly with ulong row stride at
   buffer(5) instead of x.contiguous() — kills the ~285 clones/step at
@@ -5329,7 +5353,7 @@ REMAINING HEADROOM (if the campaign reopens), ranked:
 - FIRST PREFILL PHASE SPLIT (phaseprof, 128K prefill chunks of 2048;
   absolutes inflated by sync bracketing — the SPLIT is the signal):
   target_forward 26.3 s/chunk-step: layer_ffn 13.0 s, layer_attn
-  12.8 s; leaves: attn_wqb_insert_c 348 ms/call (!!), 
+  12.8 s; leaves: attn_wqb_insert_c 348 ms/call (!!),
   comp_full_compress 112 ms/call, attn_mqa 59 ms/call. Reading:
   prefill spends ~half in MoE FFN (likely GEMV-shaped kernels at
   M=2048 — needs the GLM52-style grouped GEMM treatment) and ~30% in
@@ -5626,7 +5650,7 @@ REMAINING HEADROOM (if the campaign reopens), ranked:
     host op `ggml_moe_a8_vec_sum` (q2_K only, writes caller's
     (tokens, N) out buffer, i.e. out_hidden_states — no ring, no
     intermediate); wrappers in quixicore/ops.py + gguf/ops.py; fold gate
-    in _fused_moe_gguf's Metal branch (VLLM_QC_MOE_SUM6, default on;
+    in_fused_moe_gguf's Metal branch (VLLM_QC_MOE_SUM6, default on;
     requires q2_K w2, no expert_map, top_k <= 8, contiguous out) with a
     `logger.info_once` liveness breadcrumb; tape path folded identically.
 - Bitwise oracle tests/kernels/test_metal_moe_sum6.py: 8/8 PASS
@@ -5828,7 +5852,7 @@ REMAINING HEADROOM (if the campaign reopens), ranked:
   x 36 slots x 43 layers = **10.96 GB/step**; dense/attn streams
   (attn_kv 2.23 + q_a 4.46 + q_b 35.65 + out_a 35.65 + out_b 35.65 Q8;
   compressor 16.8 + indexer 21.5 F16 on c128 layers; shared exps 26.7
-  + router 2.1) ~ **8.3 GB/step**; drafter ~2.5-3 GB; total ~22 GB ✓
+  - router 2.1) ~ **8.3 GB/step**; drafter ~2.5-3 GB; total ~22 GB ✓
   matches the old 22.5 GB roofline. NOTE: wo_a (attn_output_a) runs as
   Q8 per-group fused_mul_mat_gguf in the python route — the dense
   einsum is only the unquantized fallback (and the default-off tape);
@@ -6073,6 +6097,7 @@ plateau; VLLM_QC_MOE_PREFILL_MM=0 boot reproduces 4d18b4fac460 /
 
 **Data (streaming-TTFT walls, disjoint offsets, same probe as baseline —
 perf/results/2026-08-13/prefill_mm_v1/):**
+
 - 512:  6.506 -> 5.156 s   (78.7 -> 99.3 tok/s)
 - 1000: 12.335 -> 9.550 s  (81.1 -> 104.7 tok/s)
 - 2048: 25.911 -> 20.108 s (79.0 -> 101.9 tok/s)  [projection was ~21-22 s]
@@ -6105,6 +6130,7 @@ ce6c5a586087, counters 1577/2115/423), coherent text, step 122.9-123.5 ms
 (plateau holds).
 
 **Data (same probe, perf/results/2026-08-13/prefill_mm_v1/walls_v2a.log):**
+
 - 512:  5.156 -> 4.822 s (106.2 tok/s)
 - 1000: 9.550 -> 8.654 s (115.6 tok/s)
 - 2048: 20.108 -> 18.187 s (112.6 tok/s; baseline 25.911, cumulative +43%)
@@ -6149,6 +6175,7 @@ ce6c5a586087 (bit-exact swap proven end-to-end), determinism x2 (identical
 counters 1584/2095/419 and walls 55.44/55.45 s across runs).
 
 **Data (probe, perf/results/2026-08-13/prefill_mm_v1/walls_c128.log):**
+
 - 512:  4.822 -> 3.183 s (160.8 tok/s)
 - 1000: 8.654 -> 5.207 s (192.0 tok/s)
 - 2048: 18.187 -> 11.176 s (183.2 tok/s; baseline 25.911 => 2.32x cumulative)
@@ -6188,6 +6215,7 @@ REVERSION SENTINEL: VLLM_QC_MHC_METAL_MAX_TOKENS=32 boot reproduces the
 c128-build sha ce6c5a586087 / 1584/2095/419 EXACTLY.
 
 **Data (probe, walls_mhcwide.log):**
+
 - 512:  3.183 -> 2.376 s (215.5 tok/s)
 - 1000: 5.207 -> 4.009 s (249.4 tok/s)
 - 2048: 11.176 -> 8.270 s (247.6 tok/s; baseline 25.911 => 3.13x)
@@ -6261,6 +6289,7 @@ indexer chain (~2.6 s), shexp qc_mmq transpose round trip
 **Diagnosis chain (microbenched at serving shapes, T=1920/E=256/topk=6):**
 w13 tile GEMM 45.3 ms (8.5 TFLOPS, 41% peak), w2 23.3 ms. Three hypotheses
 tested in sequence:
+
 1. Tile-count/B-dequant waste (508 padded 32-tiles vs 256 64-tiles):
    dual-half 64-slot kernel sharing one A dequant -> only 45.3->42.5 ms.
    NOT dequant-bound.
@@ -6340,6 +6369,7 @@ sha pair). 51.8/20.2 ms vs 53.7/20.6 — ~50 ms of wall. Host gates at
 batch >= 64, heads % 16 == 0; VLLM_QC_MLA_PREFILL_FA=0 reverts.
 
 **REJECTED experiments (documented so nobody retries them blind):**
+
 1. Tile-level softmax over the staged slots (score 8 candidates, one
    max/exp/acc batch): 286 ms with runtime loop bounds (sc8/beta arrays
    spilled), 223 ms fully unrolled at ROWS=1 — 4x SLOWER than the naive
@@ -6363,6 +6393,7 @@ prefill steps the compressed table is a shared causal prefix and the SWA
 table is a band over the raw-position axis (verified against
 build_comp_tables/build_swa_tables), so attention runs as a tiled
 simdgroup-MMA FA instead of the decode-shape scalar walk:
+
 - Pass 1: decode the two axes' 584-B fp8 slots once into contiguous half
   [n, 512] scratches (fp8 x exp2-scale and bf16 rope are exactly
   representable in half at serving scales).
@@ -6383,6 +6414,7 @@ kernel on random caches (P-half rounding class — standard f16 FA, ds4
 does the same).
 
 **ULP gate (all pass):**
+
 - off1-2000 determinism x2: sha 3fc700d9818b, counters 1496/2535/507,
   walls 66.52/66.42 — text coherent (completions dump kept).
 - Paired decode step: (66.42-5.5)/507 = 120.2 ms vs (63.74-5.5)/482 =
@@ -6478,6 +6510,7 @@ Ablation split of w13 (dequant stubbed, then A-stores stubbed):
 dequant 2.7 ms (8%) | A-tile scalar stores 3.8 ms (11%) | MMA+loads+
 barriers+B-stage floor 27.9 ms (81%; pure-MMA theoretical ~18.6 ms at
 issued MACs). Two REJECTED attempts, both reverted byte-for-byte:
+
 - Row-major A staging + transposed simdgroup_loads (would vectorize the
   16 scalar stores): 34.4 -> 40.0 ms. Transposed simdgroup_load on M1
   costs far more than the swizzled scalar stores it replaces (+9.4 ms
@@ -6577,6 +6610,7 @@ inserts/compress ~15.
 ## 2026-08-14 — PREFILL v12: qgemm wide-gate refinement (PENDING serving re-gate) + BM128 REJECT + BOX WEDGE (machine restart required)
 
 Kernel/host follow-ups to v10:
+
 - BM=128 wide_t twin (4 warps, 128 threads): microbench -0.5..-0.9
   ms/layer, oracle bit-identical — but REMOVED. See wedge note; the
   128-thread dispatch against a register-heavy PSO is the prime suspect
@@ -6600,6 +6634,7 @@ server), every boot wedges: the engine main thread parks forever in
 torch Event.synchronize (async-output copy_event; stock PyTorch, not a
 qc kernel) — an MPS event that never signals. Reproduced across 5
 fresh boots. Bisect evidence that the BUILD is NOT the cause:
+
 - single-chunk 2048 prefill runs at full speed (5.86 s) on the same
   boot where the two-chunk 2500 wedges;
 - wedges with VLLM_QC_MMQ_WIDE=0 (whole wave-10 path off);
@@ -6629,6 +6664,7 @@ sha256 of choices[0].text).
 
 **All gates PASS bit-exact on boot_v12b** (primer -> 8-tok ->
 off1-2000 -> 2500 anchor):
+
 - 8-tok: sha db2846cf721b IDENTICAL, counters 7 accepted / 10 drafted
   / 2 drafts IDENTICAL. The machine restart did NOT roll the ULP
   trajectory.
@@ -6651,6 +6687,7 @@ attribute to boot-level host-floor variance, not v12.
 
 **WEDGE ROOT CAUSE REVISED — supersedes the v12 entry's xctrace-
 poisoning conclusion.** Post-restart evidence (2/2 deterministic):
+
 - boot_v12 (fresh restart, fresh boot): primer(4 tok) -> 2500 direct
   => WEDGE. Engine main thread parks 100% of samples in
   THPEvent_synchronize -> MPSEvent::synchronize (the async-output
@@ -6740,7 +6777,7 @@ CLOSED and unregressed.
   the pre-cleanup build on the same machine-boot ran it clean/bit-exact.
   Boot-level bisect (each: drain, boot, primer, 8-tok ramp, 2500):
   cleaned native+gguf/router python CLEAN -> + cleaned worker CLEAN ->
-  + cleaned model files WEDGED -> pre-cleanup attention.py alone WEDGED ->
+  - cleaned model files WEDGED -> pre-cleanup attention.py alone WEDGED ->
   pre-cleanup {compressor.py, metal.py} CLEAN (2x 2500 bit-exact).
   Their cleaned deltas were semantically inert (phaseprof with-brackets,
   marshalling-memo conditionals with identical branch values), so the
@@ -6982,6 +7019,7 @@ dense projections), DRAFTER Q8_0 GEMVs 9.0 (238x) + bf16 s16816gemm 3.5
 Q4_K 2.4 (30x, active).
 
 tok/s roadmap is therefore GPU-work reduction, ranked:
+
 1. DRAFTER cost (~12 ms/window ~= a fifth of GPU time on the 0.5B
    drafter at TP4 with per-layer AR): candidates - drafter TP1
    (replicated, no AR), fewer drafter layers on the critical path,
@@ -6999,6 +7037,7 @@ host ever re-enters the critical path (e.g. much faster kernels).
 
 With c1 proven GPU-bound, swept the existing IQ2/Q2K kernel dials at c1
 (fresh boots, exact harness, steps/s = the acceptance-free metric):
+
 - VLLM_DSV4_W1_QWARP8=1: 48.8 / 48.8 steps/s  <- +2.7% vs 47.5 baseline,
   consistent across both runs, exact=true. First step-rate movement of
   the session: the 256-thread 8-lane-per-row IQ2 W1 decode variant beats
@@ -7072,7 +7111,7 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   GEMV hosts (ggml_moe_a8_vec falls back to the one-row route, swiglu/sum
   TORCH_CHECK — tail simdgroups of the ceil-div grid read weight rows past
   a non-multiple N; all DSV4 dims divide), nc/ns %32 check in
-  deepseek_v4_prefill_fa (enforces the _pad_slots contract), launcher
+  deepseek_v4_prefill_fa (enforces the_pad_slots contract), launcher
   contract comments in tk_launch.h (router <=1024/<=8, compress cr==4,
   prefill pad contract), moe_mm_id AoS alignment comment corrected (4-byte,
   not 16), rms_norm 256-thread dispatch contract documented, save_partial
@@ -7128,6 +7167,7 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   save_partial widen suggestion, acknowledged incorrect for this contract),
   the qgemv mr-geometry thread pending its follow-up verification. The
   decode commit's own review pass produced no actionable comments.
+
 ## 2026-08-12 - DFlash Spec Gap: Reference Measurements Localize the Wall
 
 - Question: model card advertises 250 tok/s spec on RTX 5090 (74.9 no-spec,
@@ -8559,7 +8599,7 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   ForConditionalGeneration deferred to the Muse vision pattern), plus
   configs/qwen3_5.py (upstream, MoE-free) and a thin configs/qwen3_next.py
   re-export (transformers 5.14.1 ships Qwen3NextConfig) -- the fork's
-  configs/__init__.py had DANGLING registrations for all of these, now
+  configs/**init**.py had DANGLING registrations for all of these, now
   healed. Registry: +Qwen3_5ForCausalLM, dead Moe multimodal entry
   removed. Import + registry resolution verified on this machine (hybrid,
   inner-state); ruff clean.
@@ -8658,7 +8698,7 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   "ended early" at exactly the true size). profiles.json corrected
   (+ sha256 now recorded for the model file); fetch._download grew an
   already-complete-.part fast path (validate + rename, no network), and
-  the finalize tail is factored into _finalize.
+  the finalize tail is factored into_finalize.
 - FETCH COMPLETE, all three artifacts sha/size-validated in ~/models.
   Target config builder + qwen35 tokenizer VERIFIED against the model
   file: 64 layers (48 linear, 16 full at idxs 3,7,...,63), heads 24/4 at
@@ -8668,7 +8708,7 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
 - Target tensor ground truth (866 tensors; design doc updated): full
   layers ship SPLIT q/k/v with the output gate FUSED INSIDE attn_q
   (width 12288 = 24*256*2); linear layers ship FUSED attn_qkv (10240)
-  + attn_gate; pre-FFN norm is `post_attention_norm`; blk.64 = MTP,
+  - attn_gate; pre-FFN norm is `post_attention_norm`; blk.64 = MTP,
   skip.
 - THE QUANT-MATRIX FINDING: UD-Q2_K_XL spreads 15 tensor types incl.
   NINE i-quant formats (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/
@@ -8718,7 +8758,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
    flag) into EngineArgs -- added to _SERVE_ONLY (serve_argv still
    passes it to the server).
 2. Spawned EngineCore re-imports the launcher script: load scripts need
-   a __main__ guard (scratchpad script fixed; not a repo bug).
+   a **main** guard (scratchpad script fixed; not a repo bug).
 3. MetalPlatform had no current_device() -- the GDN layer's RMSNormGated
    init calls current_platform.current_device() (only CUDA implemented
    it). Added classmethod returning "mps" to vllm/platforms/metal.py.
@@ -8752,10 +8792,10 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   call site :1610): per v-head fp32 state S[V=128,K=128], kv-head =
   hv // 3; per token: l2norm(q,k) (eps 1e-6 inside sqrt), q *=
   head_k_dim**-0.5, g = -exp(A_log)*softplus(a+dt_bias), S *= exp(g),
-  delta = (v - S@k) * sigmoid(b), S += outer(delta, k), o = S@q. Conv:
+  delta = (v - S@k)* sigmoid(b), S += outer(delta, k), o = S@q. Conv:
   depthwise kernel-4 causal + SiLU over packed qkv (10240 dims), state
   (slots, dim, 3) via is_conv_state_dim_first.
-- Agent task in flight: forward_mps + _forward_core_mps in
+- Agent task in flight: forward_mps +_forward_core_mps in
   qwen_gdn_linear_attn.py (torch-native, fp32 state, varlen prefill +
   decode, spec masks NotImplemented for now), verified against a
   line-by-line numpy transcription of the Triton kernel before touching
@@ -8821,7 +8861,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   fell through to ggml_dequantize = NotImplementedError on Metal --
   but qgemm.metal HAS tiles for all of them (iq1_s, iq2_xxs, iq2_xs,
   iq3_xxs, iq4_xs, iq4_nl). Fix: METAL_MMQ_QUANT_TYPES in gguf/utils.py
-  + platform-aware pick in _fused_mul_mat_gguf. NUMERICALLY VERIFIED on
+  - platform-aware pick in _fused_mul_mat_gguf. NUMERICALLY VERIFIED on
   MPS with real tensors from the artifact (M=64 vs gguf-py dequant
   ground truth): all five formats correct, max rel-to-mean err 0.3-1.5%
   = fp16 accumulation noise.
@@ -8903,7 +8943,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   cos 0.9994 but magnitude ~1.95x. Cause: llama.cpp's converter folds
   +1 into every `*norm.weight` except `linear_attn.norm.weight`
   (~/llama.cpp/conversion/qwen.py:394), and our vendored model uses
-  GemmaRMSNorm (x_hat * (1 + w)) -- we were computing x_hat * (w_hf + 2)
+  GemmaRMSNorm (x_hat *(1 + w)) -- we were computing x_hat* (w_hf + 2)
   on every input/post-attn/q/k/final norm. GGUF norm means measured
   ~0.97/1.23/1.94 (= HF + 1). FIX: `_degemma_gguf_norms` in
   vllm/model_executor/models/qwen3_5.py subtracts 1 at load when
@@ -9067,8 +9107,8 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   merge order, ggml VISION rope == HF rotate-half verified, v.post_ln
   is the MERGER norm, merger GELU exact-erf vs ggml tanh-approx
   (deliberate, within F16 noise), smart-resize bounds 4096..589824 px.
-  Fork-specific processor fixes: _hf_processor_applies_updates=False +
-  passthrough _call_hf_processor for the mm-only/profiling path.
+  Fork-specific processor fixes:_hf_processor_applies_updates=False +
+  passthrough_call_hf_processor for the mm-only/profiling path.
 - Open items from the smoke: a stray token ("Dinner") appears in BOTH
   text and vision answers at temp 1.0 -- text-side sampling/quant quirk,
   tracked separately; spec+image combined path unexercised.
@@ -9218,8 +9258,8 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   second-request DIVERGE@0 (clobbered slots, NOT a reinit bug), NaN in
   the rejection multinomial, and Muse's immunity (no mamba pages). The
   new metallib only shifted timing.
-- THE FIX: _update_hybrid_attention_mamba_layout -- restride K/V-first
-  attention views to blocks-first in place (as_strided_, no data move),
+- THE FIX: *update_hybrid_attention_mamba_layout -- restride K/V-first
+  attention views to blocks-first in place (as_strided*, no data move),
   mirroring upstream's V1-runner function that the V2 runner lacked.
   Verified by the agent in one instrumented boot; my correction in (27)
   (torch.empty / slot-reinit theory) is RETRACTED -- allocation is zeros
@@ -9548,7 +9588,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Muse root cause: the reasoning parser's initial prompt-state check treated a
   historical `<|message|>` as proof that the new assistant turn had already
   left reasoning. That bypassed the parser and exposed the generated
-  ` to=self<|message|>` header as content. The header also arrives split as
+  `to=self<|message|>` header as content. The header also arrives split as
   `" to"` then `"=self<|message|>..."`, which the old partial-header guard did
   not hold.
 - Muse change/correctness: a rendered prompt ending in the newest bare
@@ -9608,7 +9648,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Hypothesis A (takeover verify-band MM admission broadening: kMMFormats
   extended to q2_K/iq2_xxs et al in ggml_mul_mat_vec_a8) -- REFUTED.
   Reverted the format list to the pre-extension five (diagnostic, in
-  csrc/quixicore/tm_metal/qc_metal_serving.mm), rebuilt _quixicore_C,
+  csrc/quixicore/tm_metal/qc_metal_serving.mm), rebuilt_quixicore_C,
   booted the registry profile via slimserve: prompt 1.6 tok/s,
   generation 0.1 tok/s. Same crawl. Also: PREFILL itself crawls, so the
   defect is in the target forward path, not spec verify.
@@ -9709,7 +9749,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
     legacy callers passing None.
 - Fixed (robustness/lint): guarded int() env parses
   (VLLM_QC_MHC_METAL_MAX_TOKENS, VLLM_QC_MOE_MM_MIN_TOKENS,
-  VLLM_QC_STEP_TAPE with warn), RUF022 __all__ sort, A002 rename.
+  VLLM_QC_STEP_TAPE with warn), RUF022 **all** sort, A002 rename.
 - Documented instead of code change:
   - mla sparse two-cache prefill launcher: num_heads % 16 contract
     comment; the sole call site already routes non-conforming counts to
@@ -9830,7 +9870,7 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   num_computed_tokens_cpu and is_prefilling through persistent padded
   buffers (allocated once; zero/False tails), the flash_attn RSWA
   consumer copies the real entries and zeroes the padded tail (fixes
-  the non-broadcastable copy_ for all three model states at the single
+  the non-broadcastable copy_for all three model states at the single
   consumption point), and the steady-decode cache hit refreshes
   _num_computed_tokens_cpu explicitly so first-step values can never be
   replayed even if the producer's view pattern changes.
@@ -10142,6 +10182,513 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   path is at ~41 ms/token effective. Both fronts together plausibly
   close it; neither alone does.
 - Raw: ~/.local/scratch/qwen38-rebaseline/spec_profile_head.log.
+
+## 2026-08-18 - New profile qwen38-nvfp4-1: Qwen3.8-27B NVFP4 on 1x MI300X (two correctness bugs fixed)
+
+- Status: retained; profile registered, validated, and baselined.
+- Scope: unsloth/Qwen3.8-27B-NVFP4 (Qwen3.5-family hybrid: 64 layers at 3:1
+  GDN linear attention to full attention, dense 17408 MLP, vision tower, 262k
+  context, built-in one-layer MTP drafter), single MI300X, compressed-tensors
+  mixed FP8 (attention/GDN projections/lm_head/last-8 MLP) + NVFP4 (other MLP).
+- Enablement: restored the qwen3_5 model family the fork had purged
+  (qwen3_5, qwen3_5_mtp, qwen3_next, qwen3_vl, qwen2_vl, qwen2_5_vl,
+  qwen2_moe, mamba_mixer2, fused_qk_norm_rope, conv, video_prune, configs)
+  from the local upstream checkout, re-registered the architectures, and added
+  small missing helpers (VideoPruningMethod config fields,
+  should_torch_compile_mm_encoder, get_act_and_mul_fn, cast_overflow_tensors).
+  The upstream FusedMoEFactory import is aliased to this fork's FusedMoE
+  (near-identical kwargs). SlimServe gained safetensors-directory sources
+  (source-level "format": "safetensors"; entry_file returns the model dir) and
+  smoke's acceleration check now validates against the registered speculator
+  instead of hardcoding DSpark/TurboQuant.
+- Boot blockers fixed on the way: (1) this fork defaults linear_backend=aiter,
+  which leaves no NVFP4 kernel after filtering and rejects the model's untuned
+  FP8 GEMM shapes; the profile sets linear_backend=auto (both the top-level
+  flag and kernel_config, because the top-level aiter default overwrites the
+  kernel_config value). (2) aiter's flash_attn_varlen_func unconditionally
+  imported flydsl and raised on the installed 0.1.3.1; the local aiter checkout
+  now treats FlyDSL as the optional accelerator it is and falls through to
+  CK/triton (aiter/ops/mha.py).
+- Correctness bug 1 (root-caused, fixed): the ROCm aiter norm+quant fusion
+  pass fused GemmaRMSNorm into aiter rmsnorm2d_fwd_with_dynamicquant.
+  GemmaRMSNorm passes a float32 (weight + 1) into vllm_ir.rms_norm, and the
+  aiter kernel reads the weight in the activation dtype; a unit repro measured
+  0.44 mean abs error on 0.80-mean signal (~55% relative) with an fp32 weight
+  vs 2e-5 with bf16. Every layer's input norm was corrupted, producing
+  degenerate comma/newline output. Fix: the six aiter rmsnorm-fusion patterns
+  now carry an extra_check refusing to match when the norm weight dtype
+  differs from the input dtype (vllm/compilation/passes/fusion/
+  rocm_aiter_fusion.py). GLM/DSV4/K3 keep the fusion (bf16 weights);
+  Qwen3.8 falls back to unfused norm+quant. A Gemma-aware fused kernel is a
+  future optimization.
+- Correctness bug 2 (upstream port): the GDN spec-decode path passed the full
+  a/b gating tensors into fused_sigmoid_gating_delta_rule_update instead of
+  the spec-token subset, corrupting the linear-attention state whenever spec
+  tokens were index-selected out of a mixed batch. Ported upstream vLLM
+  5af7c8dad7 ("Align Qwen GDN gates with speculative tokens") into
+  qwen_gdn_linear_attn.py. With both fixes, serving output is token-identical
+  to the HF transformers reference (greedy ' Paris', matching top-5 logits).
+- Caution recorded: torch.compile cache keys do not include fusion-pass source,
+  so a pass fix ships stale corrupted graphs until the affected
+  ~/.cache/vllm/torch_compile_cache/<hash> dirs are removed. Two debugging
+  rounds were lost to this.
+- Correctness: exact-token harness exact=true on all runs; production profile
+  answers text ("4") and image ("Red") probes correctly with thinking and
+  qwen3/qwen3_xml parsers; MTP acceptance 96-99% of drafted tokens at temp 0.
+- Results (hot server, 1000 in / exactly 2000 out, MTP spec k=2, graphs off,
+  NVFP4 via ROCm emulation kernel):
+  c1 30.7 / 35.7 tok/s; c8 aggregate 230.6 / 227.2 tok/s.
+- Decision: retain as the initial validated baseline. Known headroom, in
+  expected order of value: native gfx942 NVFP4 decode kernel (MLP weights
+  currently dequantized through the emulation path), aiter FP8 GEMM tuning for
+  this model's shapes (16384x5120, 34816x5120, 5120x17408, 10240x5120, ...),
+  CUDA graph capture for the hybrid GDN+MTP decode, Gemma-aware fused
+  norm+quant.
+- Raw artifacts: perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-baseline/
+  (c1/c8 exact-harness JSON+logs, serve boot log, smoke.json).
+
+## 2026-08-18 - qwen38-nvfp4-1 4x: graph capture + load-time NVFP4 dequant cache
+
+- Status: retained; both changes deployed in the profile.
+- Scope: qwen38-nvfp4-1, 1x MI300X, hot server, 1000 in / exactly 2000 out,
+  MTP spec k=2, exact-token harness.
+- Baseline: c1 30.7/35.7 tok/s, c8 aggregate 230.6/227.2 (2026-08-18 baseline
+  entry). c1-to-c8 scaled 6.4x near-linearly, the signature of a fixed
+  per-step cost rather than bandwidth saturation; per-step time was ~84 ms
+  against a ~5 ms weight-traffic floor.
+- Hypothesis: the fixed cost is (a) graph-less launch overhead across 64
+  hybrid layers of eager triton/aiter kernels, and (b) the NVFP4 emulation
+  path re-dequantizing ~25 GiB of bf16 MLP weights every forward (write +
+  re-read, ~50 GiB of avoidable traffic per step).
+- Change 1: FULL_DECODE_ONLY CUDA graph capture, max_cudagraph_capture_size
+  64. Unlike Kimi's KDA, the qwen GDN decode fast-path captures cleanly on
+  ROCm. Correctness probe exact; c1 35.7 -> 49.8/49.8 tok/s (+39%).
+- Change 2: NVFP4 emulation now dequantizes weights once at load and keeps
+  them resident in model dtype (EmulationNvFp4LinearKernel; env kill-switch
+  VLLM_NVFP4_EMULATION_CACHE_WEIGHTS=0). Bit-identical by construction: the
+  cached tensor is exactly the per-call dequantization result, and the
+  activation NVFP4 QDQ round trip is unchanged. Costs ~22 GiB extra weight
+  memory (7.4 GiB packed -> 29.6 GiB bf16), which the load-time memory
+  profiler accounts for automatically; the KV pool remains ample on 192 GB.
+- Results (stacked, exact=true on every run):
+  c1 144.61 / 144.65 tok/s (4.05x baseline; ~20.7 ms/step at ~3 tok/step);
+  c8 aggregate 822.89 / 952.79 tok/s (~3.9x; run spread tracks spec
+  acceptance variance across prompt offsets).
+- Caution: the traced linear-layer code changed, so the stale
+  torch_compile_cache dir for this config was deleted before measuring
+  (see compile-cache-ignores-pass-edits memory note).
+- Decision: retain both. Remaining step budget (~20.7 ms) is roughly weight
+  reads (~7 ms: 30 GiB bf16 MLP + FP8 rest), MTP drafter + sampling, and
+  residual host/eager gaps. Next headroom in expected order: a native fused
+  w4a16 NVFP4 GEMV (reads 7.4 GiB packed instead of 29.6 GiB bf16, worth
+  ~4-5 ms/step at c1, and returns the 22 GiB of VRAM), aiter FP8 tuned
+  configs for this model's decode shapes, drafter graph coverage.
+- Raw artifacts: perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/
+  (per-arm c1/c8 exact-harness JSON+logs, smoke.json).
+
+## 2026-08-19 - Native packed NVFP4 kernels (QuixiCore HIP, vendored): c1 144.6 -> 157.1
+
+- Status: retained (decode GEMV deployed); MMQ v1 written, measured, and
+  routed around pending an MFMA rewrite.
+- Scope: qwen38-nvfp4-1, 1x MI300X; new vendored HIP kernels in
+  csrc/quixicore/tm_rocm/qc_rocm_nvfp4.cu, built into the in-repo
+  _quixicore_C extension; selection via the new
+  RocmNativeNvFp4LinearKernel (vllm/model_executor/kernels/linear/nvfp4/
+  rocm_native.py), first ROCm NVFP4 candidate ahead of the emulation kernel.
+- Direction (user): keep the weights packed NVFP4 in memory and compute from
+  the 4-bit form with custom kernels vendored, modified, and built in this
+  repo, following the existing QuixiCore quant-kernel designs.
+- Design, from the CDNA3 mxfp4_gguf kernels in QuixiCore-ROCm: byte-permute
+  table lookup decodes E2M1 nibbles into an integral 2x-value table, Q8_1
+  activations feed sdot4, and NVFP4's fp8e4m3fn/group-16 scales (exact fp16
+  upcast at load) fold with 0.5x and the per-tensor global scale into one f32
+  multiplier per group. Weights get a load-time layout-only planar repack
+  (per 32-value chunk, low nibbles = values 0..15) so a permute word yields
+  four group-0 and four group-1 values, on 4-byte-aligned rows. Activations
+  keep the NVFP4 QDQ round trip before Q8, preserving w4a4 semantics.
+- Dead ends measured and removed (per-shape microbenchmarks, CUDA-graph
+  timed, gate 17408x5120 and down 5120x17408 vs resident-bf16 hipBLASLt):
+  a naive triton fused w4a16 ran 0.1-0.5x (gather/layout-bound; deleted);
+  a bf16-activation HIP GEMV won only at M=1 (its per-m fma/convert chain
+  scaled linearly); the dp4a MMQ v1 for M>8 runs 0.1-0.3x of hipBLASLt --
+  the LDS-int path cannot match MFMA on a bandwidth-rich GPU, which is why
+  the M>=8 band keeps the bf16 copy until a Marlin-style MFMA packed kernel
+  exists (tracked follow-up, csrc/quixicore/a100_glm52_design.md lessons).
+- Retained kernel (M <= 4, the c1 spec-verify width): q8 GEMV measured
+  1.80x at M=1 (25.5 vs 46.0 us) and 1.34x at M=3 (34.4 vs 46.1 us) per
+  layer, packed-weight reads only. Parity 0.5-2% relative vs the bf16
+  reference (Q8 activation quantization; greedy serving output is
+  token-identical to the previous configuration).
+- End-to-end (exact-token harness, hot, 1000 in / exactly 2000 out, MTP
+  k=2, FULL_DECODE_ONLY graphs): c1 157.09 / 157.10 tok/s (was 144.6,
+  +8.6%); c8 aggregate 911.63 / 887.77 (unchanged band; c8 verify batches
+  run the bf16 branch by design).
+- Follow-ups tracked: MFMA packed MMQ for M >= 8 (retires the bf16 copy and
+  its ~22 GiB); port the finished GEMV to QuixiCore-ROCm with a measured run
+  there (HIP ports land in that library once proven on the serving path).
+- Raw artifacts: perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/
+  (native_c1/_c8 harness JSON+logs, smoke-native.json).
+
+## 2026-08-19 - Optimization pass 2, part 1: profile-directed fusion (c1 157 -> 167)
+
+- Status: retained (fused activation chain + bf16 GEMV epilogue deployed);
+  aiter FP8 shape tuning in progress (part 2).
+- Scope: qwen38-nvfp4-1, 1x MI300X. Profile captured with the profile's
+  --torch-profile-dir hook (8 steady spec-decode iterations, c1).
+- Profile findings (per ~19 ms step): nvfp4_gemv_q8_kernel 6.0 ms (112 calls
+  @53 us, 1.6 TB/s effective); FP8 hipBLASLt GEMMs 4.4 ms total, of which
+  lm_head [248320x5120] is 3x419 us/step (verify + two MTP drafts) already at
+  ~3 TB/s (near-roofline, left alone); 288 elementwise kernels 1.4 ms (f32
+  -> bf16 casts after the GEMV among them); separate QDQ + Q8 quantize
+  kernels 1.1 ms; aiter per-token FP8 quant 0.7 ms (the norm+quant fusion
+  this model forfeits to the GemmaRMSNorm fp32-weight guard).
+- Changes (csrc/quixicore/tm_rocm/qc_rocm_nvfp4.cu):
+  1. GEMV writes bf16 directly (epilogue convert at the wave-reduce write),
+     removing 112 elementwise cast kernels per step and the f32 out buffer.
+  2. Weight and scale streams use __builtin_nontemporal_load: touched once
+     per call, they no longer evict the reused activation blocks.
+  3. New fused qdq_quantize_q8_1 kernel composes the NVFP4 activation QDQ
+     (w4a4 semantics) with the Q8_1 block quantization in one kernel,
+     replacing two kernels and the intermediate bf16 activation buffer per
+     linear call. Bit-identical to the unfused pair (verified over four
+     shapes; requires reproducing the triton path's bf16 materialization of
+     the QDQ result before the Q8 step, and an exact software E4M3FN
+     round-to-nearest-even for the group scale).
+- Microbench (CUDA-graph timed, full chain QDQ+Q8+GEMV vs bf16 hipBLASLt):
+  gate 17408x5120 M=1 25.6 us (1.79x), M=3 36.8 us (1.24x);
+  down 5120x17408 M=1 28.4 us (1.41x), M=3 35.8 us (1.19x). The old chain
+  cost ~44 us at M=3 (GEMV 34.4 + separate QDQ ~5 + Q8 ~5).
+- End-to-end (exact harness, hot): c1 166.86 / 167.07 tok/s (was 157.1,
+  +6.3%); c8 854.95 / 897.01 (unchanged band). Greedy probes correct.
+- Also fixed on the way: aiter's gemm_a8w8_bpreshuffle_tune.py hard-imported
+  FlyDSL (same too-old-version gate as mha.py); it now degrades to CK/asm
+  tuning.
+- Raw artifacts: perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/
+  (opt2_* files, qwen38-prof/ trace + kernel table in the scratch capture).
+
+## 2026-08-19 - Optimization pass 2, part 2: aiter FP8 tuned shapes (c1 167 -> 171)
+
+- Status: retained.
+- Change: ran aiter's gemm_a8w8_bpreshuffle tuner (GPU-local, CK/cktile
+  instances; FlyDSL skipped via the new version guard) over this model's five
+  FP8 decode shapes x M in {1,4,8,32,64}; results land in
+  aiter/configs/model_configs/a8w8_bpreshuffle_tuned_gemm_qwen3.8_27b.csv in
+  the owned aiter checkout and merge automatically. All 25 rows tuned with
+  errRatio 0 at 2.8-4.0 TB/s (e.g. qkvz 16384x5120 M=1: 22.2 us vs ~26 us on
+  hipBLASLt RowWiseTorch). With the shapes tuned,
+  AiterPreshuffledPerTokenFp8ScaledMMLinearKernel is selected for those
+  layers under linear_backend=auto; lm_head (248320x5120, untuned,
+  near-roofline already) stays on RowWiseTorch.
+- Trap hit and recorded: the first boot after the kernel swap loaded a stale
+  AOT-compiled graph from torch_compile_cache/torch_aot_compile/<hash> -- a
+  cache root the per-config <hash> dirs do NOT cover -- which asserted on the
+  new (transposed, preshuffled) weight parameter layout. A full
+  ~/.cache/vllm/torch_compile_cache purge and cold compile resolved it;
+  kernel-selection outcomes are not part of any compile cache key.
+- End-to-end (exact harness, hot): c1 170.92 / 170.99 tok/s (was 167.0);
+  c8 875.71 / 912.41 (unchanged band). Greedy probes correct; smoke matrix
+  re-run on the final build (smoke-opt2.json).
+- Pass 2 total: c1 157.1 -> 171.0 (+8.8%). Remaining step budget (~17.5 ms)
+  by profile: FP8 GEMMs ~3.9 ms (lm_head 1.26 ms of it), NVFP4 GEMV ~5 ms,
+  GDN+attention+norms ~2.5 ms, host/scheduler gaps ~5 ms. Next candidates in
+  value order: host-gap reduction (drafter/scheduler path), MFMA packed MMQ
+  (also removes the bf16 copy), Gemma-compatible fused norm+quant (0.7 ms of
+  per-token quant kernels), GEMV tail/occupancy tuning.
+- Raw artifacts: perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/
+  (opt3_* files).
+
+## 2026-08-25 - MERGE: origin/main into the ROCm Qwen3.5 worktree
+
+- Status: retained (merge only; no kernel or scheduling change, no perf claim).
+- Scope: `git pull` from 34fe38d2aa to 340e9d5044 collided with the
+  uncommitted MI300X Qwen3.5/NVFP4 work. Resolved as a true three-way merge
+  rather than a side-pick, using the upstream vLLM checkout at `~/vllm2`
+  (cb8104839c) as the common base for the two contested model files.
+- `qwen3_next.py`: every incoming (Metal) change was a REMOVAL working around
+  modules missing on that branch -- MoE machinery, the CUDA-gated fused
+  qk-rmsnorm-rope-gate path, and a deferred GDN import standing in for the
+  then-missing `mamba_mixer2`. All are present again in this tree, so the
+  merged file is upstream-complete plus the one fork adjustment that branch
+  needed (`FusedMoE as FusedMoEFactory`). 892 lines vs 883 upstream / 610
+  incoming; no functional change lost from either side.
+- `qwen3_5.py`: the incoming branch had seven genuine ADDITIONS, all grafted
+  onto the full upstream class set the ROCm path needs -- GGUF norm
+  de-shifting (`_degemma_gguf_norms`), the env-gated `_Qwen38DumpState`
+  activation dump, per-shard q/k/v GGUF name mapping, `SupportsMRoPE` +
+  `get_mrope_input_positions`, `embedding_modules`, the
+  `model.language_model.` prefix mapper, and `lm_head.tie_weights`. 889 lines
+  vs 716 upstream / 542 incoming.
+- ARCHITECTURE-NAME COLLISION (the one real design decision): both campaigns
+  claim `Qwen3_5ForConditionalGeneration`, but the implementations are not
+  interchangeable -- `qwen3_5_vision.py` is single-device with no
+  `quant_config` and plain `nn.Linear`, while this profile is
+  compressed-tensors NVFP4/FP8. The profile matrix splits 1:1 (safetensors ->
+  mi300x, GGUF -> metal; no profile pairs Metal with safetensors), so the GGUF
+  path now gets its own name `Qwen3_5GGUFForConditionalGeneration`, emitted by
+  `gguf_qwen35.py` (which already synthesizes its composite config) and
+  registered in `registry.py`, `models/config.py`, and
+  `v1/spec_decode/llm_base_proposer.py`. Both stacks coexist; each source
+  format reaches the implementation validated for it.
+- Verified the grafts cannot perturb this path: the composite class inherits
+  its own `hf_to_vllm_mapper` (`model.language_model.` -> `language_model.`)
+  and `get_mrope_input_positions` from `Qwen3VLForConditionalGeneration` and
+  defines its own `load_weights`, so the text-base grafts only take effect on
+  the text-only GGUF path. The restored top-level `fused_qk_norm_rope` import
+  is Metal-safe because `vllm.triton_utils` substitutes placeholders when
+  triton is absent.
+- Also merged: duplicate `qwen38-27b` source key in `profiles.json` (both
+  campaigns added one; the NVFP4 source renamed to `qwen38-27b-nvfp4`, profile
+  and source-set tests updated), `smoke.py` acceleration validation (union of
+  registered-speculator checks and the DSpark TurboQuant requirement), and
+  both notebooks (entries from both campaigns kept).
+- CORRECTNESS (real profile, this box): `slimserve.smoke --profile
+  qwen38-nvfp4-1` PASSED -- engine reached health, resolved architecture
+  `Qwen3_5ForConditionalGeneration` (+ `Qwen3_5MTP` drafter, k=2), text
+  request "2 + 2" -> "4" (1.17 s), deterministic red-image request -> "Red"
+  (0.64 s), load 263.6 s. 60/60 slimserve tests pass; all seven Qwen3.5
+  architectures lazily resolve to real classes.
+- No throughput measured here and none claimed: this is a correctness gate on
+  the merge, not a perf run. The standing anchors from the 2026-08-18 passes
+  (c1 170.9 / c8 875.7-912.4 tok/s) are unaffected by construction and were
+  not re-pinned.
+- TRAP RECORDED: the first smoke attempt died with "Free memory on device
+  cuda:0 (15.56/191.98 GiB)". The occupants were NOT this run's leftovers --
+  a long-lived `VLLM::EngineCore` (~169 GiB) and the llama.cpp oracle
+  `llama-server` (~83 GiB) deliberately left up. Correct response is to pin to
+  an idle card (`HIP_VISIBLE_DEVICES=1`, five of eight were free), not to
+  reclaim VRAM by killing another workload.
+- Raw artifacts: perf/results/2026-08-25/merge-validation/ (smoke.json,
+  smoke.log, qwen38-nvfp4-1.log).
+
+## 2026-08-25 - UNIFICATION: one Qwen3.5 vision stack, both formats
+
+- Status: retained (refactor + correctness gates; no perf claim, no anchor moved).
+- Motivation: the 2026-08-25 merge left TWO `Qwen3_5ForConditionalGeneration`
+  implementations reachable by two architecture names (upstream's in
+  `qwen3_5.py` for safetensors, the fork's `qwen3_5_vision.py` for GGUF). That
+  is a side-pick in disguise, not a merge. Redone as a real unification.
+- The fork's separate tower turned out to be a de-featured clone of code that
+  already handled its cases. Each stated reason for it is already covered
+  upstream, verified in this tree:
+  - "no triton on Metal": upstream picks
+    `triton_pos_embed_interpolate if HAS_TRITON else pos_embed_interpolate_native`.
+  - "Conv3d patch embed won't work": `Conv3dLayer.forward_native` takes
+    `_forward_mulmat` when kernel == stride, i.e. an `F.linear` over unfolded
+    patches -- exactly the fork's flat Linear.
+  - "needs raw SDPA": `MMEncoderAttention.forward_native` is `_forward_sdpa`,
+    and Metal inherits the default `TORCH_SDPA` ViT backend
+    (`platforms/metal.py` does not override `get_vit_attn_backend`).
+  - The two towers already had an IDENTICAL parameter tree (patch_embed.proj,
+    pos_embed, blocks.N.{norm1,norm2,attn.qkv,attn.proj,mlp.linear_fc*},
+    merger.{norm,linear_fc1,linear_fc2}), so the weights were interchangeable.
+- Result: one class per architecture. `qwen3_5_vision.py` deleted; the
+  `Qwen3_5GGUFForConditionalGeneration` name removed from the registry,
+  `models/config.py` and `llm_base_proposer.py`; `gguf_qwen35.py` emits the
+  standard architecture again. Format differences now live where they belong:
+  - Weights: `gguf_adapters/qwen35.py` stops flattening the fused patch-embed
+    taps and yields the 5-D `[out, C, T, P, P]` Conv3d layout directly.
+  - Preprocessing: `transformers_utils/processors/qwen3_5_gguf.py` holds the
+    synthesized image processor + processor facade (a GGUF ships no
+    `preprocessor_config.json`), selected by `Qwen3_5GGUFArtifactMixin`, which
+    BOTH the dense and MoE processing infos inherit. Previously the MoE variant
+    dodged the GGUF branch only by accident of registration.
+- TWO REAL BUGS the unification exposed (both latent inconsistencies between
+  the old parallel implementations, found only by running the GGUF arm):
+  1. The GGUF quant method would have built all 111 vision linears expecting
+     packed weights against an F16 mmproj. Vision tensors are streamed by
+     `_vision_weights` and never enter `gguf_to_hf_name_map`, so the base
+     weight-type scan never sees them; the fork's plain-`nn.Linear` tower made
+     this invisible, while the shared tower takes a `quant_config`. A prefix
+     marker is NOT enough: `is_layer_skipped_gguf` reverses its containment
+     test for fused modules (`shard_prefix in module_name`) and `qkv` maps to
+     itself, so `attn.qkv` needs an exact entry. The adapter now enumerates the
+     vision linears (`_vision_linear_modules`); verified 111 skipped with the
+     text subtree still quantized.
+  2. `get_mm_max_tokens_per_item` sizes every modality unconditionally and
+     reached for a video processor the GGUF facade has none of, ignoring
+     `get_supported_mm_limits`. Overridden on the same mixin.
+- LAYOUT CONTRACT PROVEN (CPU, scratchpad `layout_check.py`): llama.cpp's two
+  conv taps re-fuse to exactly the HF Conv3d weight; `Conv3dLayer`'s native
+  path is BIT-IDENTICAL to the fork's flat Linear (max diff 0.00e+00); the
+  synthesized processor emits `[C, T, P, P]` rows with duplicated temporal taps
+  and a consistent grid.
+- Platform numerics preserved, not homogenized: `_ACTIVATION_REGISTRY`
+  ["gelu_pytorch_tanh"] falls back to exact-erf GELU on ROCm (an existing
+  platform workaround) and stays tanh elsewhere, so each platform keeps the
+  activation it already had.
+- CORRECTNESS - safetensors arm (the arm with a standing baseline): real
+  profile `qwen38-nvfp4-1` PASSED after the unification -- text "2 + 2" -> "4"
+  (0.77 s), red image -> "Red" (0.65 s), `Qwen3_5MTP` drafter k=2, load 172.3 s.
+  60/60 slimserve tests; all seven Qwen3.5 architectures lazily resolve.
+  Raw: perf/results/2026-08-25/unified-safetensors/.
+- VISION EQUIVALENCE PROVEN (the decisive gate for this refactor, GPU,
+  scratchpad `tower_equiv.py`): the DELETED fork tower (exec'd out of git
+  history) and the shared upstream tower were loaded with the SAME real mmproj
+  weights (333 tensors streamed through the adapter) and fed the SAME pixels.
+  As shipped they differ by cosine 0.99999243 / rel 7.5e-3; aligning the block
+  MLP activation collapses that to max abs diff 8.4e-05, rel 9.6e-07, cosine
+  0.99999994 -- float32 round-off. The ENTIRE residual is the GELU policy: the
+  fork tower hardcoded `F.gelu(approximate="tanh")`, while the shared tower
+  routes `gelu_pytorch_tanh` through `_ACTIVATION_REGISTRY`, whose exact-erf
+  fallback is guarded by `current_platform.is_rocm()`. On Metal that guard is
+  false, so the tower keeps the tanh form the fork hardcoded and matches the
+  Metal-validated behaviour; on ROCm it takes the same fallback every other
+  model on this platform already takes. Structural equivalence confirmed,
+  platform numerics preserved rather than homogenized.
+- Also noted while testing: `fast_pos_embed_interpolate` selects the triton
+  kernel on `HAS_TRITON` alone, with no device check, so it raises on CPU
+  tensors when triton happens to be installed. Not on any serving path
+  (Metal has no triton; ROCm/CUDA run on device), so left alone.
+- CORRECTNESS - GGUF arm: loads correctly through the unified path (composite
+  config from mmproj metadata, processor synthesized, all 334 mmproj vision
+  tensors into the shared tower). Three further artifact-format seams were
+  found and closed on the way, all now expressed through the same `_is_gguf()`
+  predicate: modality token sizing (`get_mm_max_tokens_per_item` sized video
+  unconditionally), dummy input generation (`get_dummy_mm_data` sizes a video
+  sample even at zero videos, needing a video processor a GGUF has none of),
+  and the processor's placeholder-string surface (`image_token`/`video_token`,
+  which the shared prompt-update code reads). Generation then fails in the
+  TEXT BACKBONE, not the vision path:
+  `setStorage: sizes [6144, 1960], strides [1960, 1], storage offset 20070400
+  ... out of bounds for storage of size 0` inside AOT autograd's output-alias
+  wrapper (`gen_alias_from_base` -> `model_executor/parameter.py`).
+  ATTRIBUTION ESTABLISHED TWICE, not assumed: the same GGUF served TEXT-ONLY
+  (mmproj hidden, so the bare text config and the untouched
+  `Qwen3_5ForCausalLM` are used) reproduces the IDENTICAL error -- same sizes,
+  strides and offset, with no vision in the graph. With compilation disabled
+  (`mode=NONE`) it does not crash but emits DEGENERATE text
+  (`' is the 2_2_2_2_2...'`), and the text-only run emits the byte-identical
+  garbage -- so the text backbone is wrong on ROCm both compiled and eager,
+  again with no vision involved. The unification is exonerated; this is a pre-existing
+  gap serving this artifact on ROCm, which has only ever run on Metal. Its
+  quant mix is exotic (IQ1_S, IQ1_M, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS,
+  IQ4_XS, Q2_K...) and `_DEQUANT_TYPES` was emptied specifically because METAL
+  gained native decode for those formats.
+  Raw: perf/results/2026-08-25/unified-gguf/, textonly-probe.log.
+- Profile registry left honest: `qwen38-q2kxl-1` still lists only `metal`. It
+  was widened to mi300x temporarily for these runs and reverted each time; the
+  profile is Metal-tuned (12 GiB KV pool, 131072 ctx) and nothing here
+  qualifies it as a tuned mi300x configuration.
+- BLOCKED, NEEDS A DECISION: the registered DFlash2 drafter no longer matches
+  its pin. Registry blesses 1,143,006,752 B / sha256 18a380ef...; HuggingFace
+  now serves 1,143,006,816 B / sha256 1a25c568... (confirmed by HEAD
+  `x-linked-size` and a local sha256sum). `slimserve.fetch` correctly refuses
+  it. NOT silently re-pinned -- that would swap the drafter under every profile
+  that speculates with it. The GGUF arm therefore ran with speculation off,
+  which is orthogonal to the unification. The text GGUF and mmproj still match
+  their pins.
+- Follow-ups, in value order: (a) root-cause the GGUF text backbone on ROCm --
+  it is wrong in BOTH modes (crash under `VLLM_COMPILE`, degenerate output
+  eager), so this is a decode-correctness problem, not only a compile bug.
+  Reproducer: text-only Q2_K_XL, no mmproj, one greedy prompt. Prime suspect is
+  the exotic IQ quant mix, whose `_DEQUANT_TYPES` list was emptied because
+  METAL gained native decode for those formats -- ROCm never got that audit.
+  This is what stands between this artifact and a validated mi300x GGUF
+  profile. (b) decide whether to re-bless the drifted DFlash2 artifact.
+
+## 2026-08-25 - FIX: GGUF prefill corruption (IQ2_XXS dense dispatch)
+
+- Status: retained; correctness fix plus the guard that makes the whole class
+  of bug impossible to repeat silently.
+- Symptom (from the unification entry above): the Qwen3.8 GGUF produced
+  degenerate text on ROCm -- `' is the 2_2_2_2_2...'` -- eager, and crashed
+  under torch.compile. Text-only reproduced both, so it was never the vision
+  work.
+- Measured, did not guess. Two audits against llama.cpp's reference:
+  1. DEQUANT audit (scratchpad `dequant_audit.py`), every format in the file
+     against `gguf.quants.dequantize`: ALL CORRECT (cosine 1.000000 for 12 of
+     14, worst IQ3_S 0.999904). This FALSIFIED the standing suspicion that the
+     exotic IQ formats decode wrongly on ROCm. They do not.
+  2. MATMUL audit (`gemv_audit.py`), the path actually dispatched, per format
+     per batch: every format ~0.99998 at B=1/2/8 and exact at B=32, EXCEPT
+     `IQ2_XXS at batch 32: cosine 0.000000`.
+- ROOT CAUSE: `MMQ_IMATRIX_QUANT_TYPES = {IQ2_XXS}` claimed a DENSE tile kernel
+  that has never existed. `mmq.cuh` implements the standard quants, the
+  k-quants and MXFP4 -- no imatrix format. IQ2_XXS's only tile kernel is
+  `ggml_moe_iq2_xxs_q8_1_cuda` in `moe.cuh`, reached through a DIFFERENT entry
+  point. So `_fused_mul_mat_gguf` routed dense IQ2_XXS layers to
+  `ggml_mul_mat_a8`, whose `switch (type)` has no case 16 -- and no `default:`.
+  The call returned its output buffer untouched: zeros on ROCm (which
+  pre-fills) and UNINITIALISED memory on CUDA (which does not). 48 IQ2_XXS
+  tensors in this file, including `ffn_gate`, so every prefill past the mmvq
+  batch limit (>8 rows) was zeroed. Decode at batch 1 was fine, which is why
+  the failure looked like nonsense text rather than a crash.
+- FIX 1 (correctness): dense and MoE tile coverage are now SEPARATE lists,
+  because they genuinely differ. `MMQ_QUANT_TYPES` (dense) = standard +
+  k-quants + MXFP4. `MOE_MMQ_QUANT_TYPES` = that plus IQ2_XXS, and
+  `fused_moe.py` gates on the MoE list. Conflating them is what caused this;
+  note that naively dropping IQ2_XXS from the single shared list would have
+  silently disabled the DSV4 gate/up MoE tile kernel, which is a real kernel
+  and the flagship path. Dense imatrix quants now fall through to
+  DEQUANT_TYPES past the vector limit, which the audit shows is exact.
+- FIX 2 (the class of bug): added `default:` guards to all four value-returning
+  GGUF dispatch switches (`ggml_mul_mat_vec_a8`, `ggml_mul_mat_a8`,
+  `ggml_moe_a8`, `ggml_moe_a8_vec`). An unimplemented type now raises with the
+  type number instead of returning an untouched buffer. Verified live: calling
+  `ggml_mul_mat_a8` with type 16 raises from gguf_kernel.hip:828.
+  (`ggml_moe_get_block_size`'s `return 0` is deliberately left alone -- its
+  caller treats `<= 0` as "use the vector path", a real sentinel.)
+- Cross-check now clean: every type each python list claims has a matching C++
+  case, for MMVQ, dense MMQ, moe MMQ and moe vec.
+- VERIFIED: the matmul audit re-run shows IQ2_XXS at batch 32 going
+  0.000000 -> 1.000000, with every other format unchanged.
+
+## 2026-08-25 - FIX: ROCm build broken at HEAD (DSV4 mHC unguarded)
+
+- Status: retained; the HIP build compiles and links again.
+- Found by rebuilding: editing `gguf_kernel.cu` re-ran hipify, which
+  regenerated `custom_all_reduce.hip` and exposed a break that a stale
+  `.o` had been hiding. Nothing to do with the edit; HEAD did not build on
+  ROCm.
+- Two independent faults, both pre-existing:
+  1. `vecdotq.cuh` had NO includes at all and relied on every including TU
+     having pulled in `ggml-common.h` first (for `__dp4a` and the QI*/QR*
+     block constants). `custom_all_reduce.cu` includes it without that, so HIP
+     failed with `use of undeclared identifier '__dp4a'`. Fixed by making the
+     header self-contained; `ggml-common.h` needed a `#pragma once` first
+     (it had no guard at all and defines static **device** helpers).
+  2. The DSV4 multi-head-channel all-reduce family in `custom_all_reduce.cu`
+     (16 exported ops, ~1800 lines) uses `tms::dsv4_mhc` and
+     `vllm::dsv4_mhc_channel_owned`, which `custom_all_reduce.cuh` only
+     includes under `#if !defined(USE_ROCM)`. The header had the guard; the
+     .cu and the bindings did not. Both now carry it, so the Ampere-only
+     family compiles out on ROCm exactly as its header intends.
+- Result: `cmake --build ... --target _C_stable_libtorch` completes with 0
+  errors and links; the rebuilt .so is installed into `vllm/` and imports.
+- Worth noting for the A100 side: this only ever affected the HIP build. The
+  CUDA build still compiles the whole DSV4 mHC family unchanged.
+
+## 2026-08-25 - FIX: compiled GGUF crash (lazy shard split frees storage)
+
+- Status: retained; correctness/compile fix, distinct from the IQ2_XXS
+  dispatch bug above.
+- Symptom: every compiled GGUF run of this model died at startup with
+  `setStorage: sizes [6144, 1960], strides [1960, 1], storage offset 20070400
+  ... out of bounds for storage of size 0`, raised from AOT autograd's
+  `gen_alias_from_base` via `model_executor/parameter.py`.
+- ATTRIBUTION: the tensor is `blk.1.attn_gate.weight`, IQ3_XXS -- NOT IQ2_XXS,
+  so this was never downstream of the dispatch bug. The nonzero storage offset
+  is the tell: it is a shard VIEW into a merged padded buffer.
+- ROOT CAUSE: `GGUFLinearMethod.apply` handled mixed-quant merged layers (the
+  Qwen3.5 `in_proj_qkvz`, whose qkv and gate shards carry different GGUF
+  types) with a LAZY first-forward materialization -- slice the padded buffer
+  into contiguous per-shard views, cache them on the layer, then release the
+  padded buffer with `layer.qweight.data = ...new_empty(0)`. Under
+  torch.compile that mutation happens *during tracing*: the graph records
+  outputs aliasing the parameter, the parameter's storage is then emptied, and
+  the runtime alias regeneration finds storage size 0. Eager never noticed
+  because the cache was populated before anything read it again.
+- FIX: hoisted the split into `_create_hetero_shard_weights`, called from
+  `process_weights_after_loading` alongside the other weight transforms, so it
+  happens once at load and outside any traced graph. `apply` now only consumes
+  `layer._gguf_hetero_shards`. Same memory behaviour as before (net-zero swap,
+  not a persistent duplicate) and the same avoided per-call copy; only the
+  timing moved.
+- Generalisation worth remembering: any lazy weight transform that frees or
+  replaces parameter storage on first forward is a torch.compile landmine.
+  `process_weights_after_loading` is the correct home for all of them, which
+  is where the muse-u4, dsv4-aligned-q8 and padded-merge transforms already
+  live -- this one was the outlier.
 
 ## 2026-08-25 - Qwen3.8 Decode Drain-Peeling: Two Sync Removals (+5%), Chain Mapped
 

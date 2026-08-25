@@ -101,6 +101,7 @@ _TEXT_GENERATION_MODELS = {
     "Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
+    "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
     "TeleChat3ForCausalLM": ("llama", "LlamaForCausalLM"),
 }
 
@@ -369,13 +370,10 @@ _MULTIMODAL_MODELS = {
         "qwen3_vl_moe",
         "Qwen3VLMoeForConditionalGeneration",
     ),
-    # NOTE(slimserve): the upstream "Qwen3_5MoeForConditionalGeneration" entry
-    # is removed: vllm/model_executor/models/qwen3_5.py is vendored dense
-    # text-only in this fork and does not define that class, so a registry
-    # entry would fail at lazy inspection.
-    "Qwen3_5ForConditionalGeneration": (
-        "qwen3_5_vision",
-        "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+    "Qwen3_5MoeForConditionalGeneration": (
+        "qwen3_5",
+        "Qwen3_5MoeForConditionalGeneration",
     ),
     # [Encoder-decoder]
     "CohereAsrForConditionalGeneration": (
@@ -389,6 +387,8 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
+    "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
+    "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlash2QwenDraftModel": ("qwen3_dflash2", "DFlash2QwenDraftModel"),
     "DFlashMuseGlimmerDraftModel": (
