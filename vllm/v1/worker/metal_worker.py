@@ -32,7 +32,7 @@ logger = init_logger(__name__)
 # and allocator fragmentation, as a fraction of the Metal working set and as
 # an absolute floor. See `_fit_kv_pool_to_working_set` for the measurements.
 _KV_RESERVE_FRAC = 0.04
-_KV_RESERVE_MIN_BYTES = 4 << 30
+_KV_RESERVE_MIN_BYTES = 7 << 30
 # Below this a pool cannot hold a useful request, so refuse instead of
 # booting into a geometry that will fail on the first prompt.
 _KV_POOL_FLOOR_BYTES = 1 << 29
@@ -323,10 +323,20 @@ class MetalWorker(Worker):
         free_bytes, total_bytes = torch.accelerator.get_memory_info(self.device)
         resident_bytes = total_bytes - free_bytes
         # Activations, sampling, kernel scratch and allocator fragmentation
-        # all live outside the pool. Measured on an M5 Max serving
-        # DeepSeek-V4-Flash IQ2_XXS (93.57 GiB resident, 107.52 GiB working
-        # set): 4.9 GiB of headroom decoded at 26 tok/s, 1.9 GiB crawled at
-        # 3.6 tok/s, and overrunning the working set produced token soup.
+        # all live outside the pool, and the reserve is sized from what they
+        # actually peak at under a profile's own configured batch width --
+        # not from a single-request decode, which understates them badly.
+        # Measured on an M5 Max serving DeepSeek-V4-Flash IQ2_XXS (107.52 GiB
+        # working set) at its registered 32 seqs x 2176 batched tokens: the
+        # transient peak above the post-boot baseline is 5.4-6.4 GiB, and
+        # total peak residency grows by ~0.6 GiB per GiB of pool. A 4 GiB
+        # reserve left only 0.88 GiB of the working set spare at peak; 7 GiB
+        # leaves ~2.5 GiB and costs no measurable throughput (22.2 vs 22.6
+        # tok/s under the same stress).
+        #
+        # The floor is anchored on the heaviest profile measured, which is
+        # deliberate: it only binds on a machine where the pool would be
+        # clamped at all, and that is exactly where the headroom matters.
         reserve_bytes = max(_KV_RESERVE_MIN_BYTES, int(total_bytes * _KV_RESERVE_FRAC))
         budget_bytes = total_bytes - resident_bytes - reserve_bytes
 
