@@ -250,7 +250,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            # contiguous(): with spec decode enabled the mamba block table is
+            # [batch, num_spec + 1], so this column view is strided; the Metal
+            # GDN kernels (and the metadata contract) require a dense [batch]
+            # tensor. A zero-draft decode batch (dynamic SD, K=0) reaches
+            # this branch in a spec-enabled engine. No-spec engines have a
+            # [batch, 1] table, so this is a no-op there.
+            non_spec_state_indices_tensor = block_table_tensor[:, 0].contiguous()
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -259,6 +265,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
             query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+
+            # Sync-free row selection: indexing a GPU tensor with the CPU
+            # boolean mask forces a data-dependent host round trip on MPS
+            # that drains the whole in-flight queue (measured 71 ms/step at
+            # c1-spec). Build the index lists on CPU (free nonzero) and
+            # index_select on device — same rows in the same order, static
+            # shapes, bit-identical values.
+            spec_idx_cpu = spec_sequence_masks_cpu.nonzero(as_tuple=False).flatten()
+            non_spec_idx_cpu = (
+                (~spec_sequence_masks_cpu).nonzero(as_tuple=False).flatten()
+            )
+            spec_idx = async_tensor_h2d(
+                spec_idx_cpu, dtype=torch.long, device=query_start_loc.device
+            )
+            non_spec_idx = async_tensor_h2d(
+                non_spec_idx_cpu, dtype=torch.long, device=query_start_loc.device
+            )
 
             # Use CPU tensors to avoid CPU-GPU sync
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
@@ -298,9 +321,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     0, dtype=torch.int32, device=query_start_loc.device
                 )
                 # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
+                spec_state_indices_tensor = block_table_tensor.index_select(
+                    0, spec_idx
+                )[:, : self.num_spec + 1]
                 non_spec_state_indices_tensor = None
                 # Padded sequences are always at the back, so the first
                 # num_spec_decodes + 1 entries of query_start_loc already
@@ -309,22 +332,43 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
+                # Sync-free per-token mask (== repeat_interleave(mask,
+                # query_lens)): tensor-repeats repeat_interleave has a
+                # data-dependent output shape on MPS even with output_size,
+                # draining the queue (65 ms/step measured). Build the token ->
+                # request map with static shapes instead: scatter ones at the
+                # request starts, cumsum, gather the mask.
+                total_tokens = int(query_start_loc_cpu[-1].item())
+                seg = torch.zeros(
+                    total_tokens,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
                 )
+                # scatter_add: duplicate starts (zero-length padded requests)
+                # must accumulate so the segment id skips them, matching
+                # repeat_interleave's zero-repeat semantics; starts at
+                # total_tokens (empty tail) contribute 0 at a clamped index.
+                starts = query_start_loc[1:-1].to(torch.long)
+                seg.scatter_add_(
+                    0,
+                    starts.clamp_max(max(total_tokens - 1, 0)),
+                    (starts < total_tokens).to(torch.int64),
+                )
+                token_req = seg.cumsum(0)
+                spec_token_masks = spec_sequence_masks.index_select(0, token_req)
                 index = torch.argsort(spec_token_masks, stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
                 spec_token_indx = index[num_non_spec_tokens:]
 
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
-                non_spec_state_indices_tensor = block_table_tensor[
-                    ~spec_sequence_masks_cpu, 0
-                ]
+                spec_state_indices_tensor = block_table_tensor.index_select(
+                    0, spec_idx
+                )[:, : self.num_spec + 1]
+                # contiguous(): the column view of the index_select result is
+                # strided; the Metal GDN kernels require dense [rows].
+                non_spec_state_indices_tensor = block_table_tensor.index_select(
+                    0, non_spec_idx
+                )[:, 0].contiguous()
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -332,7 +376,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[spec_sequence_masks_cpu],
+                    query_lens.index_select(0, spec_idx),
                     dim=0,
                     out=spec_query_start_loc[1:],
                 )
@@ -342,7 +386,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     device=query_start_loc.device,
                 )
                 torch.cumsum(
-                    query_lens[~spec_sequence_masks_cpu],
+                    query_lens.index_select(0, non_spec_idx),
                     dim=0,
                     out=non_spec_query_start_loc[1:],
                 )
@@ -357,7 +401,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            num_accepted_tokens = num_accepted_tokens.index_select(0, spec_idx)
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -545,6 +589,53 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         return attn_metadata
+
+    def steady_decode_update(
+        self,
+        metadata: "GDNAttentionMetadata",
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+    ) -> "GDNAttentionMetadata":
+        """Refresh only the copied tensor fields for a steady uniform
+        all-spec decode step with an unchanged shape signature.
+
+        Eligibility (enforced by MambaHybridAttnMetadata.steady_signature +
+        the generic steady gate): every request is a spec-decode row with
+        the same draft count and no prefills — the branch of build() that
+        produces exactly two copied device tensors. Everything else in the
+        cached metadata is a shape constant, a view over a persistent
+        buffer the runner refreshes in place (query_start_loc, seq_lens),
+        or content-constant at steady (spec_sequence_masks all-true,
+        spec_token_indx arange). spec_state_indices_tensor is re-copied
+        from the live block table so a same-shape batch-composition swap
+        can never serve stale state slots.
+        """
+        cm = common_attn_metadata
+        n = metadata.num_spec_decodes
+        assert n == cm.num_reqs, (
+            f"steady GDN update expects all-spec ({n} != {cm.num_reqs})"
+        )
+        block_table_tensor = mamba_get_block_table_tensor(
+            cm.block_table_tensor,
+            cm.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        assert metadata.spec_state_indices_tensor is not None
+        metadata.spec_state_indices_tensor.copy_(
+            block_table_tensor[:n, : self.num_spec + 1]
+        )
+        if num_accepted_tokens is not None:
+            assert metadata.num_accepted_tokens is not None
+            metadata.num_accepted_tokens.copy_(num_accepted_tokens[:n])
+        # The per-step derived-tensor memo (qwen_gdn_linear_attn /
+        # muse_q38_metal) holds a COPY of spec column 0 (conv_slots), which
+        # the in-place refreshes above cannot reach. Drop it so the first
+        # GDN layer of this step rebuilds it — the memo's scope is one
+        # step across the 48 layers, not the metadata object's lifetime.
+        metadata._mps_spec_cache = None
+        return metadata
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

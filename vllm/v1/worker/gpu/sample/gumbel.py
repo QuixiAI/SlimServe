@@ -129,6 +129,54 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
 
 
 @triton.jit
+def gumbel_noised_argmax(
+    logits,
+    keys,
+    mask,
+    seed,
+    pos,
+    temp,
+    USE_FP64: tl.constexpr,
+    APPLY_TEMPERATURE: tl.constexpr = True,
+):
+    """Argmax of logits under Gumbel-max sampling, or plain argmax at temp 0.
+
+    `keys` indexes the noise, so the same token draws the same noise wherever it
+    appears; `pos` and `seed` place the draw in the request's stream, which is
+    what lets a draft and its verification agree. (Upstream also routes
+    gumbel_block_argmax through this helper; our block kernel keeps its own
+    inlined copy because it has diverged with native-kernel plumbing.)
+    """
+    if temp != 0.0 and APPLY_TEMPERATURE:
+        # Match the behavior of _temperature_kernel: if that kernel uses
+        # tl.div_rn, this must too.
+        logits = logits / temp
+
+    # fp32 is the default reduction dtype; fp64 is ~1/32-1/64x the throughput
+    # on H100/Ada/Blackwell and empirically indistinguishable for Gumbel-max.
+    if USE_FP64:
+        logits = logits.to(tl.float64)
+    if temp != 0.0:
+        gumbel_seed = tl.randint(seed, pos)
+        if USE_FP64:
+            u = tl_rand64(gumbel_seed, keys, includes_zero=False)
+            gumbel_noise = -tl.log(-tl.log(u))
+        else:
+            u = tl_rand32(gumbel_seed, keys, includes_zero=False)
+            # Draw the large-noise tail (which decides the argmax winner) from
+            # u -> 0, where fp32 has fine resolution, instead of u -> 1, where
+            # fp32 spacing is ~2**-24. The naive `-log(-log(u))` puts the winning
+            # tail at u -> 1, hard-capping the noise at ~16.6 and coarsely
+            # quantizing it; `log1p(-u)` == `log(1 - u)` keeps the tail in the
+            # well-resolved region. `1 - u` would lose precision for small u, so
+            # log1p is required.
+            gumbel_noise = -tl.log(-tldevice.log1p(-u))
+        logits = tl.where(mask, logits + gumbel_noise, float("-inf"))
+
+    return tl.max(logits, axis=0, return_indices=True)
+
+
+@triton.jit
 def gumbel_block_argmax(
     logits,
     block,

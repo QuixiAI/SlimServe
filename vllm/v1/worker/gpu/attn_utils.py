@@ -530,25 +530,73 @@ def build_attn_metadata(
     # only the persistent device buffers the builders write; the cached
     # metadata objects stay content-live because all their tensor fields are
     # views over those buffers (CPU scalars that drift are refreshed).
+    # Model-specific metadata (e.g. Mamba hybrid) participates when it
+    # reports a steady signature: the token folds into the shape signature,
+    # and on a hit each supporting builder gets the FRESH extra kwargs so it
+    # can refresh the few copied tensor fields (num_accepted, state indices)
+    # in place. Builders without steady_decode_update are rebuilt with the
+    # same kwargs the cold path would pass — correct, just not accelerated.
+    model_specific_sig = (
+        model_specific_attn_metadata.steady_signature()
+        if model_specific_attn_metadata is not None
+        else None
+    )
     steady_eligible = (
         steady_cache is not None
         and not for_cudagraph_capture
         and causal is True
         and dcp_local_seq_lens is None
         and mm_req_doc_ranges is None
-        and model_specific_attn_metadata is None
-        and not bool(is_prefilling[:num_reqs].any())
+        # All-decode guarantee: a non-None model-specific signature already
+        # certifies a uniform spec-decode batch (CPU-side checks, no device
+        # sync); the mamba-hybrid caller keeps is_prefilling inside its
+        # metadata and passes None at top level, so only consult the tensor
+        # when no model-specific metadata governs the batch.
+        and (
+            model_specific_sig is not None
+            if model_specific_attn_metadata is not None
+            else is_prefilling is not None and not bool(is_prefilling[:num_reqs].any())
+        )
     )
-    steady_sig = (num_reqs, num_tokens, max_query_len) if steady_eligible else None
+    steady_sig = (
+        (num_reqs, num_tokens, max_query_len, model_specific_sig)
+        if steady_eligible
+        else None
+    )
     if steady_eligible and steady_cache.get("sig") == steady_sig:
         for cm, items in steady_cache["groups"]:
             cm.max_seq_len = max_seq_len
+            # The runner allocates seq_lens_cpu_upper_bound fresh every step
+            # (np.zeros + from_numpy in model_runner), so the cached view is
+            # frozen at cold-build content — and builders rebuilt on hits
+            # derive the decode max_context from it. Refresh it in place.
+            # query_start_loc_cpu is frozen too but its content is fully
+            # determined by the signature (uniform all-spec decode), so it
+            # needs no refresh. seq_lens / query_start_loc / block tables /
+            # slot mappings are views over persistent buffers the runner
+            # updates in place.
+            if (
+                cm.seq_lens_cpu_upper_bound is not None
+                and seq_lens_cpu_upper_bound is not None
+            ):
+                cm.seq_lens_cpu_upper_bound.copy_(
+                    seq_lens_cpu_upper_bound[: cm.num_reqs]
+                )
             for builder, meta, layer_names, supports in items:
+                extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        builder, num_reqs
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
                 if supports:
-                    builder.steady_decode_update(meta, cm)
+                    builder.steady_decode_update(meta, cm, **extra_kwargs)
                 else:
                     rebuilt = builder.build(
-                        common_prefix_len=0, common_attn_metadata=cm
+                        common_prefix_len=0,
+                        common_attn_metadata=cm,
+                        **extra_kwargs,
                     )
                     for layer_name in layer_names:
                         steady_cache["attn_metadata"][layer_name] = rebuilt

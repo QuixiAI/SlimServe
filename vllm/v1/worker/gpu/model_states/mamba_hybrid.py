@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +37,24 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+
+    def steady_signature(self):
+        # Steady-compatible only in the uniform all-spec decode regime:
+        # every request is a spec-decode row with the same draft count.
+        # The generic eligibility already excludes prefills; the draft
+        # count folds into the signature so an adaptive-k change forces a
+        # rebuild. All checks are CPU-tensor ops — no device sync.
+        if self.num_accepted_tokens is None or (
+            self.num_decode_draft_tokens_cpu is None
+        ):
+            return None
+        d = self.num_decode_draft_tokens_cpu
+        if d.numel() == 0:
+            return None
+        first = int(d[0])
+        if first < 0 or not bool((d == first).all()):
+            return None
+        return ("mamba-spec", first)
 
     def get_extra_common_attn_kwargs(
         self,
@@ -76,8 +95,13 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # One trailing dump slot (index max_num_reqs): the MPS postprocess
+        # scatter routes -1 sentinel rows there instead of boolean-mask
+        # indexing, whose data-dependent shape forces a full GPU-queue drain
+        # per step on MPS (measured 67 ms/step at c1-spec). Every reader
+        # indexes by valid request indices, so the slot is never read.
         self.num_accepted_tokens_gpu = torch.ones(
-            self.max_num_reqs, dtype=torch.int32, device=self.device
+            self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
@@ -274,7 +298,30 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        # Steady uniform-decode metadata reuse on Metal (eager path; there is
+        # no cudagraph, so the eager consumers read the cached objects
+        # directly — every tensor field is a view over persistent buffers or
+        # refreshed in steady_decode_update). The GDN builder alone costs
+        # ~8.2 ms/step rebuilt from scratch (10 group builds, 2026-08-24
+        # post-rope census). VLLM_QC_STEADY_META=0 restores the full rebuild.
+        steady_cache = None
+        if not for_capture:
+            enabled = getattr(self, "_qc_steady_meta_enabled", None)
+            if enabled is None:
+                from vllm.platforms import current_platform
+
+                enabled = (
+                    current_platform.is_metal()
+                    and os.environ.get("VLLM_QC_STEADY_META", "1") != "0"
+                )
+                self._qc_steady_meta_enabled = enabled
+            if enabled:
+                steady_cache = getattr(self, "_qc_steady_meta_cache", None)
+                if steady_cache is None:
+                    steady_cache = {"sig": None}
+                    self._qc_steady_meta_cache = steady_cache
         return build_attn_metadata(
+            steady_cache=steady_cache,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
@@ -306,9 +353,23 @@ class MambaHybridModelState(DefaultModelState):
             # kernel skips them rather than scattering with a host-side gather.
             n = idx_mapping.shape[0]
             if n:
-                _scatter_num_accepted_kernel[(n,)](
-                    idx_mapping, num_sampled, self.num_accepted_tokens_gpu
-                )
+                if idx_mapping.device.type == "mps":
+                    # No Triton on Metal; same scatter in torch. Sync-free:
+                    # boolean-mask indexing (idx_mapping[idx_mapping >= 0])
+                    # has a data-dependent shape, which torch-MPS resolves
+                    # with a host round trip that drains the whole in-flight
+                    # GPU queue every step. Route -1 sentinel rows to the
+                    # trailing dump slot instead — static shapes, no sync,
+                    # identical values at every valid index.
+                    idx = idx_mapping.long()
+                    safe_idx = torch.where(
+                        idx >= 0, idx, torch.full_like(idx, self.max_num_reqs)
+                    )
+                    self.num_accepted_tokens_gpu[safe_idx] = num_sampled.clamp_min(1)
+                else:
+                    _scatter_num_accepted_kernel[(n,)](
+                        idx_mapping, num_sampled, self.num_accepted_tokens_gpu
+                    )
         else:
             # Fill with single value.
             self.num_accepted_tokens_gpu.index_fill_(
