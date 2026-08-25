@@ -10689,3 +10689,137 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   `process_weights_after_loading` is the correct home for all of them, which
   is where the muse-u4, dsv4-aligned-q8 and padded-merge transforms already
   live -- this one was the outlier.
+
+## 2026-08-25 - GGUF value-head permutation: HYPOTHESIS TESTED AND REFUTED
+
+- Status: REVERTED. Recorded because the measurement is real and the wrong
+  conclusion drawn from it is an easy trap to fall into twice.
+- Observation (correct): llama.cpp's conversion stores per-VALUE-head
+  quantities in a different order from unsloth's NVFP4 build of the same base
+  model. Permuting the GGUF's 48 value heads from blocked (3 groups of 16) to
+  interleaved (16 groups of 3) makes A_log, dt_bias, conv1d, in_proj_a and
+  in_proj_b match the NVFP4 tensors at cosine 1.0000 exactly, and the two
+  quantized projections at ~0.99. Without it they sit at 0.02-0.19.
+- Inference drawn (WRONG): that the module therefore wants the NVFP4/HF order,
+  so the adapter should permute. Implemented, confirmed firing on all 48
+  linear-attention layers, and it made the model WORSE.
+- A/B against the llama.cpp eval-callback reference, same 16-token prompt:
+
+  | tensor | reference | permuted | unpermuted |
+  | --- | ---: | ---: | ---: |
+  | linear_attn_out-0 (post out_proj) | 360.10 | -86.75 | 205.39 |
+  | l_out-0 | 370.98 | 1552.93 | 233.92 |
+  | result_norm | 97.93 | 3834.72 | -1338.51 |
+
+  and generation went from `' the Rhine, the Rhine,'` (repetitive but ON
+  TOPIC for a prompt about European rivers) to multilingual token soup.
+- So the GGUF's native value-head order is closer to what this module wants
+  than the NVFP4 order is. Weight-level agreement with another checkpoint is
+  NOT sufficient evidence about what the consuming module expects -- the two
+  checkpoints evidently differ in a convention the loader reconciles
+  somewhere else on the safetensors path. Do not re-derive this permutation
+  from the cosine table alone.
+- Traps worth remembering from this session's comparisons:
+  - Sums are permutation-invariant, so comparing tensor sums can never
+    distinguish head order. The eval-callback corner values can, but only if
+    the probed elements are not themselves permutation-fixed: element 0 sits
+    in the q block and the LAST value head maps to itself under this
+    permutation, so both printed corners were blind to it.
+  - llama.cpp's `attn_output-N` is the GDN core output {128, 48, 16} BEFORE
+    out_proj. The counterpart to our module-level hook is
+    `linear_attn_out-N` {5120, 16}. Comparing against the wrong one produced
+    a meaningless 592-vs-205 discrepancy.
+
+## 2026-08-25 - FIXED: GGUF generation (ggml tiled vs HF grouped value heads)
+
+- Status: RESOLVED. The Qwen3.8 GGUF now serves correctly on MI300X through
+  the real profile, chat template and compiled path.
+- ROOT CAUSE (one bug, two exposure sites). llama.cpp stores every
+  per-VALUE-head GDN tensor in ggml tiled order -- value head `hv` pairs with
+  key head `hv % H` -- and expands q/k to match with `ggml_repeat_4d`
+  (src/models/qwen35.cpp:443). Our FLA kernels expand with
+  `repeat_interleave`, i.e. the HF grouped order `hv // (HV/H)`. The module
+  already carried `tiled_v_head_layout` for exactly this, and its own comment
+  recorded the gap: "Currently honored by the MPS core; the CUDA/ROCm FLA
+  kernels assume the HF grouped layout." That is why the artifact was
+  validated on Metal and produced token soup here.
+- FIX, selected automatically by platform, not by a flag:
+  `gdn_core_honors_tiled = current_platform.is_metal()`, and
+  `normalize_v_heads_to_grouped` follows from that plus the layout flag.
+  Metal keeps its native tiled path untouched (it threads `tiled_gqa` into
+  its own scan). Everywhere else the v-head axis is normalized around the
+  recurrence: `a`/`b` ahead of the spec split (one branch aliases rather than
+  slices them, so a later reorder would double-apply), the packed value
+  channels after the conv (the conv is per-channel and its weights stay in
+  stored order), and the core output mapped back before `out_proj` and the
+  `z` gate, which are deliberately left in stored order. `A_log`/`dt_bias`
+  are served through cached reordered views rather than parameter rewrites --
+  rewriting weights on first forward frees storage inside the traced graph,
+  the same trap as the compiled-startup bug fixed earlier today.
+- SECOND EXPOSURE SITE, and the reason generation stayed broken after the
+  first fix: `_forward_core` returns early into
+  `_forward_core_decode_non_spec` for pure decode, and that `return` sits
+  BETWEEN the two reorder points. Decode therefore ran with `a`/`b` and the
+  per-head parameters regrouped while its value channels stayed tiled and its
+  output was never mapped back -- a half-applied conversion, worse than none.
+  Prefill never took that branch, which is exactly why prefill was perfect
+  and every decoded token was corrupt. The same normalization now runs inside
+  the fast path.
+- VERIFIED, real profile on MI300X, chat template, compiled path:
+  - "What is 2 + 2? Reply with only the number." -> "4"
+  - "Name three primary colors." -> "The three primary colors are **red**,
+    **blue**, and **yellow**."
+  - raw completion "The capital of France is" -> " Paris.\nThe capital of
+    Germany is Berlin.\nThe capital of Italy is Rome."
+  - decode/prefill self-consistency: 5/5 tokens identical
+    (' the Elbe.' both ways) where before they diverged at generated token 1.
+  - prefill forward matches llama.cpp elementwise through the final norm.
+  - 60/60 slimserve tests.
+- METHOD NOTES, both of which cost real time here:
+  - SUMS ARE PERMUTATION-INVARIANT. They cannot distinguish "right values,
+    wrong order", and they are useless on near-zero residuals dominated by
+    cancellation: `linear_attn_out` read 204 vs 360 while the elementwise
+    corners matched to quantization noise. That phantom sent me auditing
+    matmul kernels that were correct at every batch size. Compare corners.
+  - The decisive clue was a MISSING probe, not a wrong number: the decode
+    step printed no `conv_out`/`q_conv` while prefill printed both, which is
+    what exposed the bypassed fast path. When two paths disagree, diff which
+    code each one executes before diffing their numbers.
+
+## 2026-08-25 - GGUF: ground truth + first-divergence localization
+
+- GROUND TRUTH: llama.cpp b10154 serves this exact file correctly on this box
+  (ROCm offload, greedy): "The capital of France is" -> "The user is asking a
+  simple factual question: ..." at 63.6 tok/s. The artifact and the 2-bit
+  quant are sound; the remaining fault is in this stack.
+  (llama-cli ignores `-no-cnv` in this build; use `--no-conversation
+  --single-turn` with stdin closed or it loops emitting only prompts.)
+- Both dumps now exist for the same 16-token probe, and the token ids agree
+  exactly (760, 2250, 1379, 2894, ...), which re-confirms the tokenizer:
+  - ours: VLLM_QWEN38_DEBUG_DUMP (the fork's per-layer hook; arm it with a
+    prompt starting "The three most", >= 11 tokens), 195 tensors.
+  - reference: `llama-eval-callback`, ~2700 tensors with sums and corners.
+- DIVERGENCE LOCALIZED to the gated-deltanet block, layer 0:
+
+  | tensor | reference | ours (current) | verdict |
+  | --- | ---: | ---: | --- |
+  | model.input_embed | -9.984 | -9.969 | matches |
+  | attn_norm-0 | -743.51 | -742.76 | matches |
+  | linear_attn_out-0 | 360.10 | 205.39 | DIVERGES |
+
+  Embeddings and the first RMS norm agree to 0.1%, which independently
+  confirms both the embedding dequantization and the llama.cpp +1 norm
+  convention handling. The projection into the block is also right:
+  recomputing `attn_norm-0 @ blk.0.attn_qkv^T` offline reproduces the
+  reference `linear_attn_qkv_mixed-0` to 0.08% (-5027.2 vs -5031.1), i.e.
+  the in_proj weights and the input are correct. The error is introduced
+  between that projection and out_proj -- inside the GDN recurrence itself
+  (conv, alpha/beta/softplus/gate, delta rule), not in the weights feeding it.
+- No NaN/Inf anywhere and no layer-wise explosion; residual rms grows
+  smoothly 1.07 -> 6.63 over 64 layers. This is a wrong-but-finite
+  computation, which is why it produces fluent-looking soup.
+- Next: compare our GDN internals against the reference's per-step tensors
+  (`conv_output_silu-0`, `q_conv-0`, `k_conv-0`, `v_conv_predelta-0`,
+  `alpha-0`, `a_softplus-0`, `beta-0`, `gate-0`, `final_output-0`) to find
+  which step first diverges. Their sums are already extracted; our side needs
+  hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
