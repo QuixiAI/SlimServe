@@ -234,6 +234,15 @@ def get_tokenizer(
             # The DeepSeek dflash drafter carries no vocabulary, so any
             # `dflash` file reaching tokenizer construction is Muse-Glimmer's.
             tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) == "qwen35":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                build_qwen35_tokenizer_from_gguf,
+            )
+
+            # `tokenizer.ggml.pre` is "qwen35": the qwen2 split with
+            # combining marks folded into letters. The generic builder's
+            # split would shift ids around digits and marked scripts.
+            tok = build_qwen35_tokenizer_from_gguf(str(tokenizer_name))
         else:
             from vllm.transformers_utils.gguf_native import (
                 build_tokenizer_from_gguf,

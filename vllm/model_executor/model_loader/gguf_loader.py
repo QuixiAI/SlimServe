@@ -67,6 +67,7 @@ class GGUFModelLoader(BaseModelLoader):
             KimiK3GGUFAdapter,
             MuseGlimmerDFlashGGUFAdapter,
             MuseGlimmerGGUFAdapter,
+            Qwen35GGUFAdapter,
         )
         from vllm.transformers_utils.gguf_utils import gguf_architecture
 
@@ -95,6 +96,8 @@ class GGUFModelLoader(BaseModelLoader):
             adapter_cls = KimiK3GGUFAdapter
         elif architecture == "glm-dsa":
             adapter_cls = GlmDsaGGUFAdapter
+        elif architecture == "qwen35":
+            adapter_cls = Qwen35GGUFAdapter
         else:
             raise ValueError(f"Unsupported GGUF architecture: {architecture}")
         adapter = adapter_cls(model_config.hf_config)
