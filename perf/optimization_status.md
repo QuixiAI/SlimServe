@@ -10072,3 +10072,40 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   box was interrupted mid-boot (server had loaded 93.57 GiB); re-run
   `slimserve dsv4-xxs-1 --serve -y` plus the seeded smoke to close it.
 - Raw artifacts: ~/.local/scratch/dsv4-geom/ (server logs, responses).
+
+## 2026-08-25 - Qwen3.8 Re-Baseline Clean; MM "Regression" Was A Harness Ring Violation
+
+- Re-baseline, current main (consolidated bench, seeded shipped
+  defaults, in-process, util 0.45): SPEC essay 22.96/24.67/24.39,
+  gsm8k 38.36/39.58/39.34 — seed-stable, coherent. Versus the campaign
+  record (23.06-23.74 essay / 34.33-35.25 gsm8k): essay level, gsm8k
+  +12%. No regression across the eight merges since the campaign.
+- The mm_iq_bench harness then showed err8/err17 of 1-4 RELATIVE
+  (garbage-level) on every format's M>=2 verify-band MM — investigated
+  as a live correctness bug and REFUTED: the multi-row outputs are
+  bit-correct against a CPU gguf-dequant fp32 ground truth (Q4_K
+  ssm_out, all rows checked). The harness's per-row M=1 REFERENCE was
+  self-corrupting: it held 8-17 same-shape op outputs alive at once,
+  and qc_metal_serving.mm's transient-output ring (kOutRingDepth=4,
+  documented contract: depth must exceed simultaneous live same-shape
+  outputs) recycled slots 0-3 into calls 4-7, so ref[i] literally
+  aliased ref[i+4]. With .clone() on each held output, err returns to
+  ~1e-4 everywhere. Serving paths are unaffected (consumers encode
+  in GPU order within ring depth; the e2e re-baseline above is
+  seed-stable and coherent).
+- RULE for every future Metal microbench: any harness that keeps more
+  than 4 same-shape outputs of a quixicore op alive must .clone() them.
+  The durable mm_iq_bench.py copy is fixed accordingly.
+- Kernel-status corrections from the same session: the Q4_K GEMV
+  "95 GB/s, 4.7x off floor" tuning item (2026-08-20) is CLOSED on
+  current main — M=1 ssm_out now runs 45-49 us = ~360-390 GB/s, near
+  stream rate. tk_dequant8 has no q4_K 8-span specialization (generic
+  per-element decode; only iq2_xxs specializes) — irrelevant at M=1
+  (bandwidth-bound) but a candidate for the M>=8 verify band, which
+  still runs well off floor (M=8: 184 GB/s effective; M=17: ~86 GB/s
+  — Muse's k=16 verify width). Logged as the remaining GEMV tuning
+  item, Muse-side.
+- Raw: ~/.local/scratch/qwen38-rebaseline/ (bench logs, bisect
+  artifacts); era-consistent 7bffa6b07 and fe960935f builds were
+  constructed during the false-alarm bisect and confirmed the behavior
+  was build-independent before the ring was identified.
