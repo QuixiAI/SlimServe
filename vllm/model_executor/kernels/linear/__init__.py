@@ -135,6 +135,9 @@ from vllm.model_executor.kernels.linear.nvfp4.humming import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
+from vllm.model_executor.kernels.linear.nvfp4.metal import (
+    MetalNvFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     Fp8BlockScaledMMLinearKernel,
     FP8ScaledMMLinearKernel,
@@ -172,6 +175,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.humming import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.marlin import (
     MarlinFP8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.metal import (
+    MetalWFp8A16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -390,6 +396,9 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
     PlatformEnum.XPU: [
         XPUW8A16FP8LinearKernel,
     ],
+    PlatformEnum.METAL: [
+        MetalWFp8A16LinearKernel,
+    ],
 }
 
 # in priority/performance order (when available)
@@ -460,6 +469,9 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     ],
     PlatformEnum.ROCM: [
         EmulationNvFp4LinearKernel,
+    ],
+    PlatformEnum.METAL: [
+        MetalNvFp4LinearKernel,
     ],
 }
 
@@ -919,8 +931,9 @@ def init_nvfp4_linear_kernel(use_a16: bool = False) -> NvFp4LinearKernel:
                 reason,
             )
             force_kernel = EmulationNvFp4LinearKernel
-    elif linear_backend == "auto" and use_a16:
-        # Force a16 (Marlin) when running weight-only quantization.
+    elif linear_backend == "auto" and use_a16 and current_platform.is_cuda():
+        # Force a16 (Marlin) when running weight-only quantization. Marlin is
+        # CUDA-only; other platforms resolve a16 through their registry entry.
         force_kernel = MarlinNvFp4LinearKernel
 
     if force_kernel is not None:
