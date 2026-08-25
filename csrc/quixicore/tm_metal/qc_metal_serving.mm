@@ -272,8 +272,12 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
                            const at::Tensor& context_lens, double scale,
                            int64_t window) {
   check_mps(q, "q");
-  check_mps(key_cache, "key_cache");
-  check_mps(value_cache, "value_cache");
+  // Strided K/V accepted: the hybrid pool serves blocks-first views
+  // (stride(0) = 2x page). Rows within a block must stay contiguous and
+  // both halves must share the block stride; the kernel walks stride(0)
+  // explicitly (bit-identical addressing for contiguous caches).
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
   check_mps(block_table, "block_table");
   check_mps(context_lens, "context_lens");
   TORCH_CHECK(q.dim() == 3, "q must be [batch, heads, head_size], got ",
@@ -282,6 +286,12 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
       key_cache.dim() == 4,
       "key_cache must be [blocks, block_size, kv_heads, head_size], got ",
       key_cache.sizes());
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
 
   const int batch = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -295,14 +305,15 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
   // The kernel takes alibi/mask buffers unconditionally; neither is wired, so
   // pass q as an inert stand-in with its use flag off rather than allocate.
   encode("qc_paged_attention", [&](TorchEncoder& e) {
-    tk::launch_paged_attention(e, q, key_cache, value_cache, block_table,
-                               context_lens, out, batch, num_heads,
-                               num_kv_heads, head_size, block_size,
-                               block_table_stride, static_cast<float>(scale),
-                               /*alibi_slopes=*/q, /*use_alibi=*/0,
-                               /*block_mask=*/q, /*use_mask=*/0,
-                               /*window=*/static_cast<int>(window),
-                               /*mask_heads=*/0, activation_type_name(q));
+    tk::launch_paged_attention(
+        e, q, key_cache, value_cache, block_table, context_lens, out, batch,
+        num_heads, num_kv_heads, head_size, block_size, block_table_stride,
+        static_cast<float>(scale),
+        /*alibi_slopes=*/q, /*use_alibi=*/0,
+        /*block_mask=*/q, /*use_mask=*/0,
+        /*window=*/static_cast<int>(window),
+        /*mask_heads=*/0, static_cast<uint64_t>(key_cache.stride(0)),
+        activation_type_name(q));
   });
   return out;
 }
@@ -701,7 +712,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
             static_cast<int>(L.kv_cache.size(2)),
             static_cast<int>(bt.stride(0)), g.scale,
             /*alibi=*/g.q, /*use_alibi=*/0, /*mask=*/g.q, /*use_mask=*/0,
-            window, /*mask_heads=*/0, "bfloat16");
+            window, /*mask_heads=*/0,
+            static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)),
+            "bfloat16");
       }
       // gated output: attn_out *= sigmoid(gate_proj(h)); then o_proj
       emit_matvec(e, L.gate, g.h, g.gate_out, m);
@@ -890,7 +903,8 @@ void dflash_step_run(const at::Tensor& x, const at::Tensor& positions,
           static_cast<int>(L.kv_cache.size(2)), static_cast<int>(bt.stride(0)),
           d.scale,
           /*alibi=*/d.q, /*use_alibi=*/0, /*mask=*/d.q, /*use_mask=*/0,
-          d.window, /*mask_heads=*/0, "bfloat16");
+          d.window, /*mask_heads=*/0,
+          static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)), "bfloat16");
       emit_matvec(e, L.o, d.attn_out, d.o_out, m);
       e.pipeline("mittens::muse_add_inplace");
       e.out(x, 0);
