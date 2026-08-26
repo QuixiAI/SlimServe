@@ -663,6 +663,28 @@ def test_engine_reasoning_no_tool_batched_content_passthrough(tokenizer, request
     assert len(tool_calls) == 0
 
 
+def test_engine_reasoning_forced_native_end_transitions_to_content(
+    tokenizer, request_obj
+):
+    """A sampler-forced native </think> token must flip the stream to content."""
+    parser = Qwen3ReasoningNoToolParser(tokenizer)
+    end_token_id = parser._reasoning_parser._parser_engine._reasoning_end_token_id
+    answer_ids = tokenizer.encode("The final answer.", add_special_tokens=False)
+
+    chunks = [
+        tokenizer.encode("<think>bounded reasoning", add_special_tokens=False),
+        [end_token_id],
+        answer_ids,
+    ]
+    results = stream_chunks(parser, tokenizer, chunks, request_obj)
+    reasoning, content, _ = collect_fields(results)
+
+    assert "bounded reasoning" in reasoning
+    assert content == "The final answer."
+    assert "</think>" not in reasoning
+    assert "</think>" not in content
+
+
 def _decode_stream_deltas(tokenizer, groups):
     """Decode token-ID groups into ``(delta_text, group)`` pairs via the real
     incremental ``DecodeStream``.
