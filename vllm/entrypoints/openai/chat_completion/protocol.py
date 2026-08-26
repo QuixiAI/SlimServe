@@ -39,9 +39,10 @@ from vllm.sampling_params import (
     BeamSearchParams,
     RepetitionDetectionParams,
     RequestOutputKind,
+    RequestThinkingTokenBudget,
     SamplingParams,
     StructuredOutputsParams,
-    ThinkingTokenBudget,
+    get_effective_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 
@@ -238,7 +239,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "part of the standard OpenAI API specification."
         ),
     )
-    thinking_token_budget: ThinkingTokenBudget = None
+    thinking_token_budget: RequestThinkingTokenBudget = Field(
+        default=None,
+        description=(
+            "Maximum generated thinking tokens for this request. A "
+            "non-negative integer overrides the server default; -1 opts out "
+            "of the server cutoff."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -645,6 +653,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
 
+        thinking_token_budget = get_effective_thinking_token_budget(
+            self.thinking_token_budget,
+            max_tokens,
+            default_sampling_params,
+            self.reasoning_effort,
+        )
+
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
         stop_token_ids = self.stop_token_ids
@@ -699,7 +714,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
