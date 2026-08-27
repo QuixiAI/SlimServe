@@ -18,7 +18,12 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.kv_cache_interface import CrossAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    CrossAttentionSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -196,13 +201,18 @@ def warmup_kernels(
 
     # Compute per-request block counts for each KV cache group.
     def _warmup_block_count(num_tokens: int, spec: Any) -> int:
+        layer_spec = spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+        if isinstance(layer_spec, CircularBufferSpec):
+            # Circular caches keep one physical ring block for the request
+            # lifetime.
+            return 1
         if isinstance(spec, CrossAttentionSpec):
             num_tokens = max_encoder_len
         num_blocks = cdiv(num_tokens, spec.block_size)
-        if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+        if isinstance(layer_spec, MambaSpec) and layer_spec.mamba_cache_mode == "align":
             # Align mode reserves extra blocks beyond the token range for the
             # speculative-decode running-state snapshots.
-            num_blocks += spec.num_speculative_blocks
+            num_blocks += layer_spec.num_speculative_blocks
         return num_blocks
 
     kv_cache_specs = [g.kv_cache_spec for g in kv_cache_groups]

@@ -500,7 +500,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        positions: torch.Tensor = None,
+        positions: torch.Tensor,
         **kwargs: object,
     ):
         full_num_tokens = positions.shape[-1]

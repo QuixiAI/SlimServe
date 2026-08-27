@@ -548,6 +548,615 @@
         },
         "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], trained with block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; the Metal profile uses the first 3 draft positions because its M=4 verify kernel is faster on both retained text arms than verifying all 7 drafts. Re-blessed 2026-08-25: z-lab republished the file (1,143,006,752 -> 1,143,006,816 B) to fix an off-by-one in dflash.target_layers, which are 1-based in the GGUF and converted with layer-1 at load. The old file stored [5, 19, 33, 47, 61] and therefore read target layers [4, 18, 32, 46, 60] -- one lower than intended; the new file stores [6, 20, 34, 48, 62] and reads the documented [5, 19, 33, 47, 61]. Verified by reading the republished file's metadata, not by trusting the upload: 5 blocks, block size 8, SWA 2048, 32/8 heads at 128, hidden 5120, selector rank 256 top-16, two-tap conv (group 16), mask token 248070."
       }
+    },
+    "qwen38-flash-next-fp8": {
+      "title": "Qwen3.8-Flash-Next",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "base_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/main",
+      "local_dir": "Qwen3.8-Flash-Next-FP8",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP drafter and processor configs ship in the same repo.",
+      "speculator": {
+        "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+        "local_dir": "Qwen3.8-Flash-Next-FP8",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint ships its own one-layer MTP drafter (mtp.* tensors in the weight index, QSA attention, trained multi-step), so the draft model is the target directory itself."
+      },
+      "quants": {
+        "FP8": {
+          "title": "FP8 (block-128 MoE experts, BF16 backbone)",
+          "bytes": 185563783127,
+          "summary": "The official release: 512-expert MoE weights in block-128 FP8, everything else (GDN, QSA, hyper-connections, embeddings, vision tower) BF16, plus 47.7 GiB of FP8 n-gram embedding shards designed for host-memory offload.",
+          "min_gpus": {
+            "rtx3090": 8
+          },
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1635
+            },
+            {
+              "path": "LICENSE",
+              "bytes": 3235
+            },
+            {
+              "path": "README.md",
+              "bytes": 65041
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 72423
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00131.safetensors",
+              "bytes": 1040155912
+            },
+            {
+              "path": "model-00002-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00003-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00004-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00005-of-00131.safetensors",
+              "bytes": 1717267690
+            },
+            {
+              "path": "model-00006-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00007-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00008-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00009-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00010-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00011-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00012-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00013-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00014-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00015-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00016-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00017-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00018-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00019-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00020-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00021-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00022-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00023-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00024-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00025-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00026-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00027-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00028-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00029-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00030-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00031-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00032-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00033-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00034-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00035-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00036-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00037-of-00131.safetensors",
+              "bytes": 942343240
+            },
+            {
+              "path": "model-00038-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00039-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00040-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00041-of-00131.safetensors",
+              "bytes": 1103350296
+            },
+            {
+              "path": "model-00042-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00043-of-00131.safetensors",
+              "bytes": 1000455912
+            },
+            {
+              "path": "model-00044-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00045-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00046-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00047-of-00131.safetensors",
+              "bytes": 878065752
+            },
+            {
+              "path": "model-00048-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00049-of-00131.safetensors",
+              "bytes": 1096817160
+            },
+            {
+              "path": "model-00050-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00051-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00052-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00053-of-00131.safetensors",
+              "bytes": 1000455920
+            },
+            {
+              "path": "model-00054-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00055-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00056-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00057-of-00131.safetensors",
+              "bytes": 1103350288
+            },
+            {
+              "path": "model-00058-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00059-of-00131.safetensors",
+              "bytes": 877982872
+            },
+            {
+              "path": "model-00060-of-00131.safetensors",
+              "bytes": 1794100080
+            },
+            {
+              "path": "model-00061-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00062-of-00131.safetensors",
+              "bytes": 1832994688
+            },
+            {
+              "path": "model-00063-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00064-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00065-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00066-of-00131.safetensors",
+              "bytes": 880605240
+            },
+            {
+              "path": "model-00067-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00068-of-00131.safetensors",
+              "bytes": 1096796552
+            },
+            {
+              "path": "model-00069-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00070-of-00131.safetensors",
+              "bytes": 993907416
+            },
+            {
+              "path": "model-00071-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00072-of-00131.safetensors",
+              "bytes": 1000456024
+            },
+            {
+              "path": "model-00073-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00074-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00075-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00076-of-00131.safetensors",
+              "bytes": 1100073480
+            },
+            {
+              "path": "model-00077-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00078-of-00131.safetensors",
+              "bytes": 993984232
+            },
+            {
+              "path": "model-00079-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00080-of-00131.safetensors",
+              "bytes": 877983688
+            },
+            {
+              "path": "model-00081-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00082-of-00131.safetensors",
+              "bytes": 1096816112
+            },
+            {
+              "path": "model-00083-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00084-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00085-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00086-of-00131.safetensors",
+              "bytes": 1103350296
+            },
+            {
+              "path": "model-00087-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00088-of-00131.safetensors",
+              "bytes": 1000455920
+            },
+            {
+              "path": "model-00089-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00090-of-00131.safetensors",
+              "bytes": 997179104
+            },
+            {
+              "path": "model-00091-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00092-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00093-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00094-of-00131.safetensors",
+              "bytes": 1096796928
+            },
+            {
+              "path": "model-00095-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00096-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00097-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00098-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00099-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00100-of-00131.safetensors",
+              "bytes": 877984072
+            },
+            {
+              "path": "model-00101-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00102-of-00131.safetensors",
+              "bytes": 1096797160
+            },
+            {
+              "path": "model-00103-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00104-of-00131.safetensors",
+              "bytes": 993901144
+            },
+            {
+              "path": "model-00105-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00106-of-00131.safetensors",
+              "bytes": 1025359600
+            },
+            {
+              "path": "model-00107-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00108-of-00131.safetensors",
+              "bytes": 1062060032
+            },
+            {
+              "path": "model-00109-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00110-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00111-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00112-of-00131.safetensors",
+              "bytes": 1096797168
+            },
+            {
+              "path": "model-00113-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00114-of-00131.safetensors",
+              "bytes": 993907400
+            },
+            {
+              "path": "model-00115-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00116-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00117-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00118-of-00131.safetensors",
+              "bytes": 878004272
+            },
+            {
+              "path": "model-00119-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00120-of-00131.safetensors",
+              "bytes": 1109903856
+            },
+            {
+              "path": "model-00121-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00122-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00123-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00124-of-00131.safetensors",
+              "bytes": 891089968
+            },
+            {
+              "path": "model-00125-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00126-of-00131.safetensors",
+              "bytes": 1096795496
+            },
+            {
+              "path": "model-00127-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00128-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00129-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00130-of-00131.safetensors",
+              "bytes": 2136177320
+            },
+            {
+              "path": "model-00131-of-00131.safetensors",
+              "bytes": 1271398496
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 17410140
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -579,6 +1188,20 @@
         "Metal caps a single MTLBuffer well below total memory -- 80.6 GiB of 128 GiB on an M5 Max. The GGUF loader avoids a file-sized buffer by materializing tensors as separate MPS allocations.",
         "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
+      ]
+    },
+    "rtx3090": {
+      "title": "NVIDIA GeForce RTX 3090",
+      "compute_capability": [
+        8,
+        6
+      ],
+      "vram_bytes": 25769803776,
+      "gate": "gpus",
+      "status": "supported",
+      "notes": [
+        "GeForce driver disables GPU peer-to-peer, so every tensor-parallel collective stages through host memory. Profiles on this platform should prefer expert parallelism and host-offloaded tables over designs that add per-step all-reduces.",
+        "SM86 has no FP8 tensor cores; FP8 checkpoints serve through the Marlin W8A16 weight-only kernels."
       ]
     }
   },
@@ -1401,6 +2024,58 @@
             "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
             "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
           ]
+        }
+      }
+    },
+    "qwen38fn-fp8-8": {
+      "title": "Qwen3.8-Flash-Next FP8 on 8 GPUs",
+      "source": "qwen38-flash-next-fp8",
+      "gpus": 8,
+      "summary": "Vision-language 125B-A6B hybrid (Gated DeltaNet + Qwen Sparse Attention, 1-in-4 full attention, 4-branch gated residual) with 51B n-gram embeddings held in pinned host memory. FP8 experts run expert-parallel through Marlin W8A16 on 8x RTX 3090.",
+      "speculative": true,
+      "variants": {
+        "rtx3090": {
+          "platform": "rtx3090",
+          "default_quant": "FP8",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "enable_expert_parallel": true,
+            "max_model_len": 131072,
+            "max_num_seqs": 32,
+            "gpu_memory_utilization": 0.9,
+            "kv_cache_dtype": "auto",
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-Flash-Next",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "auto",
+              "linear_backend": "auto"
+            }
+          },
+          "env": {
+            "VLLM_QWEN4_EXP_PLE_HOST": "1",
+            "NCCL_P2P_LEVEL": "SYS",
+            "VLLM_GDN_DECODE_KERNEL": "triton"
+          },
+          "notes": [
+            "enable_expert_parallel is a correctness requirement, not a tuning choice: moe_intermediate_size is 640 and the FP8 block scales are [128, 128], so a TP shard of 80 cannot carry exact block scales. EP keeps 64 whole experts per rank (640 = 5 x 128).",
+            "moe_backend and linear_backend must be auto, not this fork's aiter defaults: AITER kernels do not exist on CUDA, and the forced-backend path raises at load ('FP8 MoE backend AITER does not support ... device cuda'). Both the top-level flags and kernel_config must be set, since a non-auto top-level flag overwrites kernel_config (same rule the qwen38-nvfp4-1 MI300X profile documents for linear_backend).",
+            "SM86 has no FP8 tensor cores and Triton FP8 MoE requires SM89+, so the experts run the Marlin W8A16 block-FP8 MoE kernels (weight-only decode to BF16 compute).",
+            "VLLM_QWEN4_EXP_PLE_HOST=1 keeps the full 47.7 GiB n-gram (PLE) table pinned in host RAM per rank and gathers the 16 rows per token (2560 bytes) from the GPU over UVA inside the forward, exactly as the model card intends ('tables prefetched from host memory'). The gather is graph-capturable, so FULL_DECODE_ONLY capture keeps working, and the TP-replicated table removes the per-step embedding all-reduce that this no-P2P platform cannot afford. Host cost: ~48 GiB pinned per rank (~382 GiB total of the 996 GiB box).",
+            "GeForce P2P is disabled, so all-reduces stage through host memory; expect collective latency, not kernel throughput, to bound TP8 decode until measured otherwise.",
+            "reasoning_parser qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML.",
+            "Speculation uses the checkpoint's own single-layer QSA MTP drafter (Qwen4ExpMTP) via method 'mtp'; there is no separate DSpark artifact for this model yet.",
+            "max_model_len is 131072, not the model's native 262144: weights take 17.6 GiB of each 24 GiB card, leaving ~2.2 GiB of KV pool at 0.9 utilization, and a single 262144-token request needs 3.52 GiB (the engine's own estimate of the fitting maximum was 161600 tokens). 128K keeps headroom for concurrent requests; YaRN to 1M is out of reach on this platform."
+          ],
+          "speculative_overrides": {
+            "index_share_for_mtp_iteration": true
+          }
         }
       }
     }

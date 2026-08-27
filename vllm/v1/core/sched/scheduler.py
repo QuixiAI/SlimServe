@@ -895,6 +895,15 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
+                    if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
+                        # Alignment clipped the placeholder rows. The split
+                        # aligns prefill chunks, but the padded tail rows are
+                        # speculative positions, not prefill tokens. A padded
+                        # request must keep all 1 + num_spec rows or the
+                        # sampler's row count stops matching its query rows,
+                        # so drop the padding instead of shortening it.
+                        num_new_tokens = 1
+                        pad_spec_decode = False
 
                 # During async KV load, no forward pass is run yet.
                 # Allocate speculative lookahead slots later to avoid
@@ -1028,6 +1037,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
+                    assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
                     ] * self.num_spec_tokens

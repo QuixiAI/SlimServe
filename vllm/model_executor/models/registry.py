@@ -102,6 +102,10 @@ _TEXT_GENERATION_MODELS = {
     "Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM"),
     "Qwen3_5ForCausalLM": ("qwen3_5", "Qwen3_5ForCausalLM"),
     "Qwen3_5MoeForCausalLM": ("qwen3_5", "Qwen3_5MoeForCausalLM"),
+    "Qwen4ExpForCausalLM": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForCausalLM",
+    ),
     "TeleChat3ForCausalLM": ("llama", "LlamaForCausalLM"),
 }
 
@@ -375,6 +379,10 @@ _MULTIMODAL_MODELS = {
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",
     ),
+    "Qwen4ExpForConditionalGeneration": (
+        "vllm.models.qwen4_exp",
+        "Qwen4ExpForConditionalGeneration",
+    ),
     # [Encoder-decoder]
     "CohereAsrForConditionalGeneration": (
         "cohere_asr",
@@ -389,6 +397,7 @@ _MULTIMODAL_MODELS = {
 _SPECULATIVE_DECODING_MODELS = {
     "Qwen3_5MTP": ("qwen3_5_mtp", "Qwen3_5MTP"),
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
+    "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlash2QwenDraftModel": ("qwen3_dflash2", "DFlash2QwenDraftModel"),
     "DFlashMuseGlimmerDraftModel": (

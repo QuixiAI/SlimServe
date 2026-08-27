@@ -443,6 +443,21 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       list(APPEND VLLM_GPU_FLAGS "-DVLLM_ENABLE_COOPERATIVE_TOPK=1")
 
     endif()
+
+    cuda_archs_loose_intersection(FUSED_GDN_DECODE_ARCHS
+      "8.0;8.6;8.9;9.0" "${CUDA_ARCHS}")
+    if(FUSED_GDN_DECODE_ARCHS)
+      set(FUSED_GDN_DECODE_SRC
+        "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${FUSED_GDN_DECODE_SRC}"
+        CUDA_ARCHS "${FUSED_GDN_DECODE_ARCHS}")
+      set_property(SOURCE ${FUSED_GDN_DECODE_SRC} APPEND PROPERTY
+        COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+      list(APPEND VLLM_STABLE_EXT_SRC "${FUSED_GDN_DECODE_SRC}")
+      message(STATUS
+        "Building fused GDN decode for archs: ${FUSED_GDN_DECODE_ARCHS}")
+    endif()
   endif()
 
   if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -1122,6 +1137,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(COOPERATIVE_TOPK_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_COOPERATIVE_TOPK=1)
+    endif()
+    if(FUSED_GDN_DECODE_ARCHS)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_FUSED_GDN_DECODE=1)
     endif()
     # Needed by CUTLASS kernels
     target_compile_definitions(_C_stable_libtorch PRIVATE
