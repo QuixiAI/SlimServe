@@ -15875,3 +15875,40 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   - NOT yet validated here: the NVFP4 profiles themselves (artifacts
     live on the M1 Ultra; this box's baseline run is the next step)
     and the M1 Ultra pin chain, which needs a re-gate on that box.
+
+## 2026-08-27 - qwen38-nvfp4-1 M5 Max baseline (merged tree, seeded shipped defaults)
+
+- First exact-token baseline of the NVFP4 profile on THIS box (M5 Max,
+  128 GiB), on the merged PR#12 x main tree (8ea670cab), through the
+  real server path (`slimserve qwen38-nvfp4-1 --serve`): canonical env
+  (muse ON, DFlash2 adaptive k=3@c1, VLLM_METAL_ASYNC_SCHED=1).
+- Sampling policy: the M1 Ultra pin chain is GREEDY; greedy is banned
+  stack-wide, so this box's pins use the model's shipped
+  generation_config defaults, seeded 42. The harness
+  (benchmarks/benchmark_dsv4_exact.py) was changed to make that the
+  DEFAULT: temperature/top_p/top_k are omitted from the request unless
+  explicitly passed (server applies shipped defaults) and seed defaults
+  to 42. It can no longer silently run greedy. Runs remain
+  deterministic and sha-pinnable under real sampling.
+- Baseline pins (aggregate output tok/s, exact-token, ignore_eos):
+  | workload | tok/s | sha |
+  | c1 1000/256 | 21.74 / 21.76 / 21.29 | 7dd1fc9874df (3/3 bit-stable) |
+  | c4 1000/256 | 45.87 | 960116e7c5cd |
+  | c8 1000/256 | 58.69 | 73d4ba12b89c |
+  | c1 2500/64 | 10.89 / 10.00 | 87383cf5a0e3 (2/2 bit-stable) |
+  Chat coherence: seeded Jupiter-moons request correct with qwen3
+  thinking + content both present.
+- OBSERVATION for the change phase: DFlash2 acceptance under real
+  sampling is very low -- 81 accepted / 522 drafted on the pinned c1
+  run (~15%), and a later interval logged 2/426 (mean acceptance length
+  1.01). The M1 Ultra +23% c1 spec win was measured under greedy;
+  under shipped sampling the 16-way selector's acceptance collapses,
+  so spec at c1 may currently be near-neutral-or-negative here. Per
+  the standing rule (spec always on, net-positive), this is the top
+  candidate for the suggested-changes phase, alongside the
+  batch>=2-drafting-off policy question.
+- Not directly comparable to the M1 Ultra pins (different box, greedy
+  vs sampling): their c1 17.10 / c4 23.12 / c8 25.59 / 2500x64 3.45.
+  This box is substantially faster at every point on the merged tree.
+- Raw: perf/results/2026-08-27/nvfp4-baseline/ (per-run JSON, server +
+  engine logs).
