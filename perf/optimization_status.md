@@ -16228,3 +16228,26 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   the dominant measurement noise at c8 (61-81 across three offsets).
 - These are the PR's shipping numbers on M5 Max. M1 Ultra re-gate of
   the schedule+throttle remains the one open cross-box gate.
+
+## 2026-08-27 - Merge main (PR #16 dynamic-k) x this branch: unified per-step k, anchors hold
+
+- main gained the 3090 campaign's second round: dynamic-k speculation
+  for the V2 runner, the registry host-RAM gate (the exact gap the
+  design review flagged), draft-write sync fixes.
+- Semantic resolutions: the two per-step-k mechanisms are unified --
+  PR12's skip_drafting (K == 0: drafter forward skipped, zero-width
+  handler drafts) composes with main's num_steps trimming (0 < K < max)
+  and un-padded fast-path handler writes; _dynamic_prev_spec_tokens
+  records the POST-throttle k (newcomer padding must match what was
+  actually drafted), and the padding consumer trusts it whenever either
+  dynamic mechanism is active.
+- The anchor gate caught two real merge bugs before push: main's runner
+  passes num_steps= into every speculator and the DFlash family did not
+  accept it (TypeError on the first drafted request -- fixed with the
+  parameter plus a fixed-block contract assert); and the bulk mypy
+  annotator had MASKED a wrong attribute name in that new assert with
+  type: ignore[attr-defined] (AttributeError at runtime -- lesson: an
+  attr-defined ignore on fresh code is a bug, not noise).
+- Gates on the merged tree: suites 125 passed / 105 skipped; c1 sonnet
+  anchor 21.74/21.55 tok/s sha 7dd1fc9874df 2/2 -- BIT-EXACT to the
+  final re-pin. No csrc changes; no Metal rebuild.
