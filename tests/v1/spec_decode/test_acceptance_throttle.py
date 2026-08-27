@@ -77,3 +77,15 @@ def test_disabled_without_env(monkeypatch):
     monkeypatch.setenv("VLLM_SD_ADAPT_MIN_RATIO", "0.5")
     t = AcceptanceThrottle.from_env()
     assert t is not None and t.min_ratio == 0.5
+
+
+def test_small_batch_exempt_from_throttle():
+    """Batch-1 verify is nearly free: drafting stays on at any acceptance."""
+    t = make()
+    for _ in range(30):
+        assert t.gate(3, batch_size=1) == 3
+        t.observe(3, 0)  # hostile content the whole time
+    # The hostile EMA still gates the next wide-batch step.
+    assert t.gate(3, batch_size=8) == 0
+    # And batch-1 keeps drafting even while wide batches are paused.
+    assert t.gate(3, batch_size=1) == 3

@@ -16022,3 +16022,34 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Box state note: the day's marathon left the box thermally soaked
   (seeded gsm8k 33.6-34.3 vs the 45 band, heads identical); the
   baseline re-pin under the new canonical waits for cooldown.
+
+## 2026-08-27 - Throttle batch exemption + FINAL RE-PIN: anchors bit-exact, hostile content now net-positive
+
+- The first re-pin caught a self-inflicted c1 regression: one break-even
+  ratio cannot serve all batch sizes. At batch 1 the verify rows ride
+  the small-M GEMV band and drafting measured +12% even at acceptance
+  1.47 (ratio 0.16), but the throttle's 0.30 threshold -- correct for
+  wide-batch dense-GEMM verify -- paused it, dropping c1 sonnets to
+  ~16.2 with rolling shas (the global EMA carried across runs).
+- Fix: AcceptanceThrottle.min_batch (default 2, VLLM_SD_ADAPT_MIN_BATCH)
+  -- batches below it are exempt from gating and do not tick the pause
+  clock; a hostile pause still applies to the next wide-batch step.
+  7 unit tests.
+- FINAL RE-PIN (cool box, 3-min gaps between legs, canonical
+  qwen38-nvfp4-1: schedule [[1,8,3]], throttle on, seeded shipped
+  defaults):
+  | leg | tok/s | sha |
+  | c1 sonnet x3 | 21.73/21.40/20.72 (21.29) | 7dd1fc9874df 3/3 -- BIT-EXACT to the original pin |
+  | c1 2500x64 x2 | 8.76/10.06 | 87383cf5a0e3 2/2 -- BIT-EXACT to the original pin |
+  | c4 sonnet | 50.73 | +10.6% vs old canonical 45.87 |
+  | c8 sonnet | 57.20 | -2.5% vs old 58.69 (noise); vs 38.2 unthrottled |
+  | c1 essay 5-off | mean 34.64 (14.9-49.6, acc 2.67) | lottery spread |
+  | c8 essay 3-off | mean 63.45 (cool-first 61.3, peak 81.2, acc 3.09) | vs 55.1 draft-off |
+- Reading: the worst-case anchors are byte-identical to the pre-change
+  baseline (min_batch keeps c1 drafting always-on, so its trajectory is
+  untouched); hostile content at c4 now WINS (+11%, warmup drafting is
+  cheap there too) and c8 hostile is noise-level vs draft-off; prose
+  batch throughput keeps the k=3 win. Within-leg thermal drift remains
+  the dominant measurement noise at c8 (61-81 across three offsets).
+- These are the PR's shipping numbers on M5 Max. M1 Ultra re-gate of
+  the schedule+throttle remains the one open cross-box gate.

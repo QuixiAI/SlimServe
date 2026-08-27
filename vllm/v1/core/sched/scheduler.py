@@ -1153,7 +1153,7 @@ class Scheduler(SchedulerInterface):
             ]
         if self.sd_accept_throttle is not None:
             num_spec_tokens_to_schedule = self.sd_accept_throttle.gate(
-                num_spec_tokens_to_schedule
+                num_spec_tokens_to_schedule, len(num_scheduled_tokens)
             )
 
         scheduled_encoder_input_stats = None
