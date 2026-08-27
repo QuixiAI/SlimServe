@@ -16294,3 +16294,22 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   turns complete with substantive content, both needles EXACT at depth
   (731942 / 447.25 MHz). Raw: multiturn_chat.py + engine-lowreason.log
   under perf/results/2026-08-27/nvfp4-baseline/.
+
+## 2026-08-27 - Post-merge long-context gates on M5 Max: GGUF multi-turn PASS, -tq 262k needle EXACT
+
+- GGUF profile (qwen38-q2kxl-1), multi-turn chat gate with the new
+  low-reasoning/preserve-thinking defaults: 6 turns to 13.6k prompt
+  tokens, every turn completing with substantive content (finish=stop
+  asserted per turn), both needles EXACT at depth. The GGUF-embedded
+  template accepts the chat kwargs without error. Turns run 30-138 s
+  (Q2K prefill re-processes history each turn; prefix caching is off on
+  this profile by design -- recurrent GDN state).
+- -tq long-context (qwen38-nvfp4-1-tq, --ctx 262144 per the UPDATE 39
+  protocol): 16k sanity leg EXACT in 28 s; full leg 254,881 prompt
+  tokens, needle at 40% depth, retrieval EXACT (code 914637), wall
+  2,251 s (~37.5 min -- half the M1 Ultra's 75 min for the same
+  protocol). KV pool on this box grants 455,706 TQ tokens (no
+  working-set clamp; weights 22 GiB). This closes the "262k needle on
+  this box" item from the merge tracking list.
+- Raw: perf/results/2026-08-27/nvfp4-baseline/ (tq_needle.py,
+  multiturn_chat.py, engine/server logs per leg).
