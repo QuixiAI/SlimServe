@@ -47,6 +47,8 @@ stays recommended until then.
 Applied once, from the platform's check_and_update_config.
 """
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -91,6 +93,74 @@ def _metal_compute_slot_mapping(self, num_reqs, query_start_loc, positions) -> N
         from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
         slot_mapping[n:] = PAD_SLOT_ID
+
+
+def _metal_prepare_rope_positions(
+    self,
+    idx_mapping,
+    query_start_loc,
+    prefill_lens,
+    num_computed_tokens,
+    num_tokens: int | None = None,
+) -> None:
+    """Torch replacement for RopeState's Triton positions kernel (M/XD-RoPE).
+
+    Per query token, per rope dim: staged prefill positions while the request
+    is still prefilling, ``orig_pos + delta`` once it is decoding. The output
+    index is the flat token index (query_start + offset within the query).
+
+    The token -> request map is built with static shapes (scatter ones at
+    the inner request starts + inclusive cumsum — the gdn_attn.py pattern):
+    ``repeat_interleave`` with tensor counts has a data-dependent output
+    shape, which torch-MPS resolves with a host round trip that drains the
+    whole in-flight GPU queue (measured ~66 ms/step at c1 spec decode on
+    M1 Ultra — the single largest host cost). ``num_tokens``
+    is supplied host-side by the patched ``prepare_inputs`` caller
+    (``input_batch.num_tokens``); the ``None`` fallback keeps the original
+    dynamic-shape path for callers that cannot provide it.
+    """
+    num_reqs = idx_mapping.shape[0]
+    device = self.positions.device
+
+    starts = query_start_loc[: num_reqs + 1].to(torch.long)
+    if num_tokens is None:
+        counts = (starts[1:] - starts[:-1]).clamp_min(0)
+        req_of_tok = torch.repeat_interleave(
+            torch.arange(num_reqs, device=device), counts
+        )
+        num_tokens = req_of_tok.shape[0]
+    else:
+        if num_tokens <= 0:
+            return
+        # scatter_add: duplicate starts (zero-length requests) must
+        # accumulate so the token->request map skips them, matching
+        # repeat_interleave's zero-repeat semantics; starts at num_tokens
+        # (empty tail requests) contribute 0 at a clamped index.
+        seg = torch.zeros(num_tokens, dtype=torch.long, device=device)
+        inner = starts[1:-1] - starts[0]
+        if inner.numel() > 0:
+            seg.scatter_add_(
+                0,
+                inner.clamp(0, num_tokens - 1),
+                (inner < num_tokens).to(torch.long),
+            )
+        req_of_tok = seg.cumsum(0)
+    # query_start_loc[0] == 0 by construction, and the result is written
+    # 0-based into self.positions[:, :num_tokens] below.
+    offsets = torch.arange(num_tokens, device=device) - starts[req_of_tok]
+
+    state = idx_mapping[req_of_tok].to(torch.long)
+    num_computed = num_computed_tokens[state].to(torch.long)
+    orig_pos = num_computed + offsets
+    is_prefill = num_computed < prefill_lens[state].to(torch.long)
+    decode_pos = orig_pos + self.prefill_delta.gpu[state].to(torch.long)
+
+    prefill_positions = self.prefill_positions.gpu
+    for dim in range(self.num_dims):
+        # Unconditional gather: orig_pos < max_model_len keeps it in bounds
+        # for decode rows too; torch.where discards the unused side.
+        staged = prefill_positions[state * self.num_dims + dim, orig_pos].to(torch.long)
+        self.positions[dim, :num_tokens] = torch.where(is_prefill, staged, decode_pos)
 
 
 def _patch_cpu_gpu_buffer_blocking() -> None:
@@ -144,6 +214,37 @@ def apply_compat_patches() -> None:
         _metal_compute_slot_mapping
     )
 
+    from vllm.v1.worker.gpu.mm.rope import RopeState
+
+    RopeState.prepare_positions = _metal_prepare_rope_positions  # type: ignore[method-assign]
+
+    # Re-point the one prepare_positions caller so it passes the host-known
+    # token count — that is what lets the rope replacement above use the
+    # static-shape token->request map instead of the queue-draining
+    # repeat_interleave. Body is the upstream prepare_inputs verbatim plus
+    # the num_tokens kwarg; the rope_state None early-return (DSV4 and
+    # every non-mrope model) is byte-identical in behavior.
+    from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+
+    # VLLM_QC_ROPE_STATIC=0 restores the dynamic repeat_interleave path
+    # (null A/B switch; passing None falls back inside the rope fn).
+    rope_static = os.environ.get("VLLM_QC_ROPE_STATIC", "1") != "0"
+
+    def _metal_prepare_model_inputs(self, input_batch, req_states):
+        if self.rope_state is None:
+            return {}
+        self.rope_state.prepare_positions(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            req_states.prefill_len.gpu,
+            req_states.num_computed_tokens.gpu,
+            num_tokens=input_batch.num_tokens if rope_static else None,
+        )
+        positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
+        return {"positions": positions}
+
+    DefaultModelState.prepare_inputs = _metal_prepare_model_inputs  # type: ignore[method-assign]
+
     _patch_cpu_gpu_buffer_blocking()
 
     torch.cuda.is_current_stream_capturing = (  # type: ignore[method-assign]
@@ -153,5 +254,6 @@ def apply_compat_patches() -> None:
     _APPLIED = True
     logger.info(
         "Applied Metal compat patches (dynamo off, torch slot mapping, "
-        "blocking host copies, stream-capture check stubbed False)"
+        "torch rope positions, blocking host copies, stream-capture check "
+        "stubbed False)"
     )

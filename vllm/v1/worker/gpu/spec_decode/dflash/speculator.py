@@ -67,7 +67,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         super().__init__(vllm_config, device)
 
         self.hidden_states = torch.zeros(
-            self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+            self.max_num_tokens,
+            self.hidden_size,
+            dtype=self.dtype,  # type: ignore[arg-type]
+            device=device,  # type: ignore[arg-type]
         )
 
         # Multimodal inputs not currently supported.
@@ -83,7 +86,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
         self.requires_non_causal = dflash_has_any_non_causal(
-            self.draft_model_config.hf_config
+            self.draft_model_config.hf_config  # type: ignore[arg-type]
         )
 
         # Whether the anchor query position is itself a prediction. DFlash default uses
@@ -235,7 +238,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Per-KV-group causal, falling back to whether the drafter is all-causal.
         self._group_causal: dict[int, bool] | bool = not self.requires_non_causal
         if hasattr(self.model, "get_draft_kv_cache_layer_names"):
-            layer_names = self.model.get_draft_kv_cache_layer_names()
+            layer_names = self.model.get_draft_kv_cache_layer_names()  # type: ignore[operator]
             name_to_gid = {
                 ln: gid
                 for gid, group in enumerate(kv_cache_config.kv_cache_groups)
@@ -249,7 +252,8 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self._group_causal = {
                     name_to_gid[name]: layer_causal
                     for name, layer_causal in zip(
-                        layer_names, self.model.get_draft_attn_causal()
+                        layer_names,
+                        self.model.get_draft_attn_causal(),  # type: ignore[operator]
                     )
                 }
 
@@ -314,7 +318,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 # the sparse k-way distribution into draft_logits so
                 # rejection sampling stays lossless at any temperature.
                 req_idx = self.idx_mapping[:num_reqs].to(torch.long)
-                self.draft_tokens[:num_reqs] = self.model.select_draft_path_sampled(
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path_sampled(  # type: ignore[operator]
                     sample_hidden_states,
                     anchor_ids,
                     self.temperature,
@@ -328,7 +332,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             else:
                 # Greedy argmax walk (draft_sample_method='greedy'):
                 # verification is token-equality only.
-                self.draft_tokens[:num_reqs] = self.model.select_draft_path(
+                self.draft_tokens[:num_reqs] = self.model.select_draft_path(  # type: ignore[operator]
                     sample_hidden_states, anchor_ids
                 )
             return
@@ -398,7 +402,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
         draft_grammar=None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
+        # DFlash drafts one fixed-size block; a partial k cannot be
+        # trimmed mid-block. The dynamic schedules that pair with DFlash
+        # only emit 0 (handled by the runner's skip) or the full k, so
+        # anything else is a scheduler/config bug -- fail loudly rather
+        # than silently verifying a mismatched width.
+        assert num_steps is None or num_steps == self.num_speculative_steps, (
+            f"DFlash drafts a fixed block of {self.num_speculative_steps}; "
+            f"the scheduler asked for num_steps={num_steps}"
+        )
         # Bound for this call only; refreshed (including back to None) on
         # every propose, so no stale batch can leak into the next step.
         # Consumed by _generate_draft (eager gating) and _sample_sequential.
@@ -407,7 +421,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
-        self.draft_max_seq_len = min(
+        self.draft_max_seq_len = min(  # type: ignore[assignment]
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
@@ -416,7 +430,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
         if aux_hidden_states:
-            hidden_states = self.model.combine_hidden_states(
+            hidden_states = self.model.combine_hidden_states(  # type: ignore[operator]
                 torch.cat(aux_hidden_states, dim=-1)
             )
         else:
@@ -434,7 +448,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
             # Since DFlash needs to build its own attention metadata, we must skip the
             # preparation in this path and run a minimal forward pass.
-            self.model.precompute_and_store_context_kv(
+            self.model.precompute_and_store_context_kv(  # type: ignore[operator]
                 self.hidden_states[:num_target_tokens],
                 self.context_positions[:num_target_tokens],
             )
@@ -493,7 +507,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
-        self.model.precompute_and_store_context_kv(
+        self.model.precompute_and_store_context_kv(  # type: ignore[operator]
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,

@@ -285,7 +285,6 @@ instantiate_qgemm_sm_p("qgemm_sm_p4_q5_K", q5_K, 4);
 instantiate_qgemm_sm_p("qgemm_sm_p8_q4_K", q4_K, 8);
 instantiate_qgemm_sm_p("qgemm_sm_p8_q5_K", q5_K, 8);
 
-#if defined(__HAVE_TENSOR__)
 // ---- tensor-ops verify GEMM (M5 GPU neural accelerators) -------------------
 // Same staging pipeline as qgemm_sm_p (paired-plane dequant for q4_K/q5_K,
 // span dequant for q6_K) with the per-warp simdgroup MMA replaced by one
@@ -371,6 +370,10 @@ struct sm_t_stager<FMT, true> {
     }
 };
 
+// The dequant helpers above are plain threadgroup-tile writers and stay
+// visible on every toolchain; only the cooperative-tensor kernel below
+// needs the metal_tensor extension.
+#if defined(__HAVE_TENSOR__)
 template<typename FMT, bool PAIRED>
 kernel void qgemm_sm_t(
     device   float* P  [[buffer(0)]],   // (4, N, 32) float partials
@@ -1099,6 +1102,7 @@ METAL_FUNC void dequant_paired_q5k_bk128(
 
 // BK=128 device-X tensor kernel for q5_K (gate/up): halves the K-steps and
 // barriers, doubles per-lane contiguous qs reads. Same split-K partials.
+#if defined(__HAVE_TENSOR__)
 [[host_name("qgemm_sm_t4_q5_K")]]
 kernel void qgemm_sm_t4_q5_K(
     device   float* P  [[buffer(0)]],   // (4, N, 32) float partials
@@ -1176,6 +1180,7 @@ kernel void qgemm_sm_t4_q5_K(
              metal::extents<int32_t, M_PAD, ROWS>());
     cT.store(tC);
 }
+#endif  // __HAVE_TENSOR__
 
 // Cooperative transposing bf16 -> half X stage for qgemm_sm_rm:
 // sX[k][m] = X[m, kb*BK + k]; rows >= M stage zeros.

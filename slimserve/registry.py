@@ -130,9 +130,9 @@ class Quant:
         # system RAM the GPU gate cannot see. Only enforced when the caller
         # provides a detected figure; 0 means unknown, not zero RAM.
         ram_minimum = self.min_host_ram_bytes.get(platform)
-        if ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum:
-            return False
-        return True
+        return not (
+            ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum
+        )
 
 
 @dataclass(frozen=True)
@@ -153,6 +153,13 @@ class Plan:
     speculative_overrides: dict[str, Any]
     chat_template_kwargs: dict[str, Any]
     notes: list[str] = field(default_factory=list)
+    # Variant-level drafter when platforms diverge; falls back to the
+    # source-level speculator.
+    variant_speculator: dict[str, Any] | None = None
+
+    @property
+    def speculator(self) -> dict[str, Any] | None:
+        return self.variant_speculator or self.source.get("speculator")
 
     @property
     def model_dir(self) -> Path:
@@ -256,6 +263,10 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
         "notes": list(record.get("notes") or []),
         "default_quant": record["default_quant"],
         "speculative_overrides": dict(record.get("speculative_overrides") or {}),
+        # A variant may carry its own drafter when platforms diverge (e.g.
+        # qwen38-nvfp4-1: the MI300X variant reuses the checkpoint's MTP
+        # head, the Metal variant serves the measured DFlash2 drafter).
+        "speculator": record.get("speculator"),
     }
 
 
@@ -368,6 +379,7 @@ def resolve(
         speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
+        variant_speculator=merged["speculator"],
     )
 
 
@@ -419,7 +431,7 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "role": "shared",
             }
         )
-    spec = plan.source.get("speculator") if plan.speculative else None
+    spec = plan.speculator if plan.speculative else None
     if spec and (entry := spec.get("file")):
         wanted.append(
             {

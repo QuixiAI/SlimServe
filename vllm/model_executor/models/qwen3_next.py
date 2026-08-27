@@ -11,6 +11,7 @@ the ROCm Qwen3.5 campaign. The fused Triton path stays CUDA-gated, so Metal
 and ROCm both keep the eager split + QK-RMSNorm + RoPE path.
 """
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -61,6 +62,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
 
 from .interfaces import (
     EagleModelMixin,
@@ -83,6 +85,30 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+# Muse single-CB decode step (N14, muse_q38_metal.py): opt-in during
+# bringup; the serve-mode flip re-pins the canonical trajectory.
+_MUSE_ENABLED = os.environ.get("VLLM_QC_MUSE", "0") in ("1", "shadow")
+
+_QC_QK_ROPE_AVAILABLE: bool | None = None
+
+
+def _qc_qk_rope_kernel_available() -> bool:
+    global _QC_QK_ROPE_AVAILABLE
+    if _QC_QK_ROPE_AVAILABLE is None:
+        try:
+            from vllm.quixicore import quixicore_ops
+
+            if quixicore_ops.is_available():
+                import vllm._quixicore_C as qc
+
+                _QC_QK_ROPE_AVAILABLE = hasattr(qc, "qc_qk_norm_rope_gate")
+            else:
+                _QC_QK_ROPE_AVAILABLE = False
+        except ImportError:
+            _QC_QK_ROPE_AVAILABLE = False
+    return _QC_QK_ROPE_AVAILABLE
+
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
@@ -336,6 +362,21 @@ class Qwen3NextAttention(nn.Module):
             and current_platform.is_cuda()
             and text_only
         )
+        # Metal twin of the fusion above (qc_qk_norm_rope_gate kernel).
+        # Rejected as a default: bit-exact at decode shapes but
+        # torch-MPS eager numerics are SIZE-DEPENDENT — large prefill
+        # tensors round the rotation chain differently (~5 ppm single-ulp
+        # diffs), so the canonical trajectory forks at prefill while the
+        # measured win was c4/c8 ~+1% and c1 ~flat-to-negative — not worth
+        # the full sha re-pin. Opt-in diagnostic: VLLM_QC_QKROPE=1.
+        self.use_fused_qk_rope_metal = (
+            self.attn_output_gate
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and current_platform.is_metal()
+            and text_only
+            and os.environ.get("VLLM_QC_QKROPE", "0") == "1"
+            and _qc_qk_rope_kernel_available()
+        )
 
     def _project_qkv_gate(
         self,
@@ -369,6 +410,38 @@ class Qwen3NextAttention(nn.Module):
                 self.head_dim,
                 self.rotary_emb.rotary_dim,
             )
+            return q, k, v, gate
+
+        if (
+            self.use_fused_qk_rope_metal
+            # bf16 only: the eager reference is the bf16-gated gemma-norm
+            # custom kernel; fp16 falls back to the native ir chain, whose
+            # numerics this kernel does not mirror (parity harness showed
+            # ulp-level diffs there).
+            and qkv.dtype is torch.bfloat16
+            and qkv.dim() == 2
+            and qkv.is_contiguous()
+            and self.q_norm.weight.dtype == qkv.dtype
+        ):
+            from vllm.quixicore import quixicore_ops
+
+            # Text-only: the three mRoPE rows are identical; the T row is
+            # exact (same argument as the CUDA fusion above).
+            pos = positions[0] if positions.ndim == 2 else positions
+            cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            q, gate, k = quixicore_ops.qc_qk_norm_rope_gate(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cache,
+                pos.contiguous(),
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+            )
+            v = qkv[:, self.q_size * 2 + self.kv_size :]
             return q, k, v, gate
 
         if self.attn_output_gate:
@@ -521,12 +594,14 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states = hidden_states[:full_num_tokens]
 
         if self.layer_type == "linear_attention":
-            hidden_states = self.linear_attn(hidden_states=hidden_states)
+            with _qc_phase("gdn_attn"):
+                hidden_states = self.linear_attn(hidden_states=hidden_states)
         elif self.layer_type == "full_attention":
-            hidden_states = self.self_attn(
-                hidden_states=hidden_states,
-                positions=positions,
-            )
+            with _qc_phase("full_attn"):
+                hidden_states = self.self_attn(
+                    hidden_states=hidden_states,
+                    positions=positions,
+                )
         else:
             raise ValueError("Invalid layer_type")
 
@@ -553,12 +628,14 @@ class Qwen3NextDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.use_attn_reduce_scatter_for_moe:
-            hidden_states = self.mlp(
-                hidden_states,
-                already_sequence_parallel=True,
-            )
+            with _qc_phase("mlp"):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    already_sequence_parallel=True,
+                )
         else:
-            hidden_states = self.mlp(hidden_states)
+            with _qc_phase("mlp"):
+                hidden_states = self.mlp(hidden_states)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -671,6 +748,25 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
+
+        # Muse single-CB decode step (N14): on eligible uniform pure-spec
+        # decode batches the whole 64-layer forward + final norm is encoded
+        # into one command buffer, including the drafter's aux hidden-state
+        # taps. VLLM_QC_MUSE=1 serves it, =shadow runs both and compares
+        # (eager serves). Trajectory re-pin accepted for this path — see
+        # csrc/quixicore/metal/muse_qwen38_design.md.
+        if (
+            _MUSE_ENABLED
+            and residual is None
+            and hidden_states.shape[0] == full_num_tokens
+            and get_pp_group().is_last_rank
+        ):
+            from vllm.model_executor.models import muse_q38_metal
+
+            muse_out = muse_q38_metal.try_step(self, hidden_states, positions)
+            if muse_out is not None:
+                return muse_out
+
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),

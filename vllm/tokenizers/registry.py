@@ -263,6 +263,15 @@ def get_tokenizer(
             # `tokenizer.ggml.pre` is "llama4"; the GLM4 split the generic
             # builder applies would shift ids around digits and whitespace.
             tok = build_muse_glimmer_tokenizer_from_gguf(str(tokenizer_name))
+        elif gguf_architecture(str(tokenizer_name)) == "qwen35":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                build_qwen35_tokenizer_from_gguf,
+            )
+
+            # `tokenizer.ggml.pre` is "qwen35": the qwen2 split with
+            # combining marks folded into letters. The generic builder's
+            # split would shift ids around digits and marked scripts.
+            tok = build_qwen35_tokenizer_from_gguf(str(tokenizer_name))
         else:
             from vllm.transformers_utils.gguf_native import (
                 build_tokenizer_from_gguf,
@@ -273,7 +282,7 @@ def get_tokenizer(
         # Wrap it the same way the HF path does: the renderer reads
         # `max_chars_per_token` / `max_token_id` / `all_special_ids`, which a
         # bare PreTrainedTokenizerFast does not expose.
-        return get_cached_tokenizer(tok)
+        return get_cached_tokenizer(tok)  # type: ignore[return-value,arg-type]
 
     if envs.VLLM_USE_FASTOKENS:
         # Process-global, idempotent patch that swaps the Rust BPE backend
@@ -316,9 +325,11 @@ def get_tokenizer(
         )
         tokenizer_cls_ = TokenizersBackend
     elif tokenizer_cls == TokenizerLike:
-        tokenizer_cls_ = TokenizerRegistry.load_tokenizer_cls(tokenizer_mode)
+        tokenizer_cls_ = TokenizerRegistry.load_tokenizer_cls(  # type: ignore[assignment]
+            tokenizer_mode
+        )
     else:
-        tokenizer_cls_ = tokenizer_cls
+        tokenizer_cls_ = tokenizer_cls  # type: ignore[assignment]
 
     if config is not None and tokenizer_cls_ is CachedHfTokenizer:
         # AutoTokenizer otherwise reloads config.json internally. Reuse the
