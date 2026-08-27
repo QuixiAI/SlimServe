@@ -552,7 +552,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
-            self.kv_caches,
+            self.kv_caches,  # type: ignore[arg-type]
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
             self.attn_groups,
@@ -624,7 +624,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
-            num_sampled_tokens=None,
+            num_sampled_tokens=None,  # type: ignore[arg-type]
             remove_lora=True,
             num_active_loras=max_loras,
         ):
@@ -1296,7 +1296,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+        return (
+            sampler_output,
+            sampler_output.num_sampled,  # type: ignore[return-value]
+            sampler_output.num_rejected,
+        )
 
     def postprocess_sampled(
         self,
@@ -1471,7 +1475,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     scheduled_encoder_inputs, input_batch, self.req_states
                 )
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
-                input_ids = None
+                input_ids = None  # type: ignore[assignment]
 
         model_inputs = {
             "input_ids": input_ids,
@@ -1809,7 +1813,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(
-            hidden_states, input_batch, self.req_states
+            hidden_states,  # type: ignore[arg-type]
+            input_batch,
+            self.req_states,
         )
 
         # Build the model runner output.

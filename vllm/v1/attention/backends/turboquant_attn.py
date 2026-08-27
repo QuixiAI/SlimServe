@@ -283,7 +283,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
 
         current_workspace_manager().get_simultaneous(
             ((max_num_reqs, num_heads, max_num_splits, head_size + 1), torch.float32),
-            ((max_num_reqs, num_heads, head_size), model_config.dtype),
+            ((max_num_reqs, num_heads, head_size), model_config.dtype),  # type: ignore[arg-type]
             ((max_num_reqs, num_heads), torch.float32),
         )
 
@@ -625,7 +625,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if not attn_metadata.is_prefill:
             # Pure decode batch — fast path
             attn_out = self._decode_attention(
-                q, kv_cache, attn_metadata, Pi, centroids, PiT, layer
+                q,
+                kv_cache,
+                attn_metadata,
+                Pi,
+                centroids,
+                PiT,
+                layer,  # type: ignore[arg-type]
             )
         elif (
             0 < attn_metadata.uniform_q_len <= _CONTINUATION_DECODE_THRESHOLD
@@ -673,7 +679,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 causal=self._slice_causal(attn_metadata.causal, 0, num_decodes),
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
-                q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
+                q[:num_decode_tokens],
+                kv_cache,
+                decode_meta,
+                Pi,
+                centroids,
+                PiT,
+                layer,  # type: ignore[arg-type]
             )
 
             # --- Prefill portion (remaining requests) ---

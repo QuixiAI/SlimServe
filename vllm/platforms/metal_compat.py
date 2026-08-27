@@ -216,7 +216,7 @@ def apply_compat_patches() -> None:
 
     from vllm.v1.worker.gpu.mm.rope import RopeState
 
-    RopeState.prepare_positions = _metal_prepare_rope_positions
+    RopeState.prepare_positions = _metal_prepare_rope_positions  # type: ignore[method-assign]
 
     # Re-point the one prepare_positions caller so it passes the host-known
     # token count — that is what lets the rope replacement above use the
@@ -243,7 +243,7 @@ def apply_compat_patches() -> None:
         positions = self.rope_state.get_positions(input_batch.num_tokens_after_padding)
         return {"positions": positions}
 
-    DefaultModelState.prepare_inputs = _metal_prepare_model_inputs
+    DefaultModelState.prepare_inputs = _metal_prepare_model_inputs  # type: ignore[method-assign]
 
     _patch_cpu_gpu_buffer_blocking()
 

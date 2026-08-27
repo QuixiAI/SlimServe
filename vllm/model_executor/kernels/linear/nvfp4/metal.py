@@ -100,24 +100,26 @@ class MetalNvFp4LinearKernel(NvFp4LinearKernel):
         # [N, K/2]) and inverted the CT divisor, so weight_global_scale is the
         # true multiplier. weight_scale holds raw E4M3 bytes as uint8 (Metal
         # cannot allocate fp8; see the scheme's create_weights).
-        n, k_half = layer.weight.shape
+        n, k_half = layer.weight.shape  # type: ignore[misc]
         if self.use_gemv and n % 4 == 0 and (k_half * 2) % 16 == 0:
             layer.nvfp4_weight = layer.weight.data
             layer.nvfp4_scale = layer.weight_scale.data
             layer.nvfp4_global = (
-                layer.weight_global_scale.data.to(torch.float32).reshape(1).contiguous()
+                layer.weight_global_scale.data.to(torch.float32)  # type: ignore[operator, union-attr]
+                .reshape(1)
+                .contiguous()
             )
-            layer.metal_nvfp4 = True
+            layer.metal_nvfp4 = True  # type: ignore[assignment]
         if not self.materialize:
             return
         dense = dequant_nvfp4(
-            layer.weight,
-            layer.weight_scale,
-            layer.weight_global_scale,
-            self.out_dtype,
+            layer.weight,  # type: ignore[arg-type]
+            layer.weight_scale,  # type: ignore[arg-type]
+            layer.weight_global_scale,  # type: ignore[arg-type]
+            self.out_dtype,  # type: ignore[arg-type]
         )
         replace_parameter(layer, "weight", dense)
-        layer.metal_ct_materialized = True
+        layer.metal_ct_materialized = True  # type: ignore[assignment]
 
     def apply_weights(
         self,
@@ -139,18 +141,21 @@ class MetalNvFp4LinearKernel(NvFp4LinearKernel):
             from vllm.quixicore import quixicore_ops
 
             out = quixicore_ops.nvfp4_mul_mat_vec(
-                layer.nvfp4_weight,
+                layer.nvfp4_weight,  # type: ignore[arg-type]
                 x_2d.contiguous(),
-                layer.nvfp4_scale,
-                layer.nvfp4_global,
+                layer.nvfp4_scale,  # type: ignore[arg-type]
+                layer.nvfp4_global,  # type: ignore[arg-type]
             )
             out = out.view(*x.shape[:-1], out.shape[-1])
             if bias is not None:
                 out = out + bias
             return out
         if getattr(layer, "metal_ct_materialized", False):
-            return F.linear(x, layer.weight, bias)
+            return F.linear(x, layer.weight, bias)  # type: ignore[arg-type]
         weight = dequant_nvfp4(
-            layer.weight, layer.weight_scale, layer.weight_global_scale, x.dtype
+            layer.weight,  # type: ignore[arg-type]
+            layer.weight_scale,  # type: ignore[arg-type]
+            layer.weight_global_scale,  # type: ignore[arg-type]
+            x.dtype,
         )
         return F.linear(x, weight, bias)

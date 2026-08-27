@@ -49,9 +49,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
+        layer.logical_widths = output_partition_sizes  # type: ignore[assignment]
+        layer.input_size_per_partition = input_size_per_partition  # type: ignore[assignment]
+        layer.output_size_per_partition = output_size_per_partition  # type: ignore[assignment]
 
         # Weight
         weight = ModelWeightParameter(
@@ -119,13 +119,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             )
 
         # Process weight global scale (CT stores as divisors, i.e. 1/scale)
-        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
+        weight_global_scale = layer.weight_global_scale.max().to(  # type: ignore[operator]
+            torch.float32
+        )
         layer.weight_global_scale = Parameter(
             1.0 / weight_global_scale, requires_grad=False
         )
 
         if not self.use_a16:
-            if torch.unique(layer.input_global_scale).numel() != 1:
+            if torch.unique(layer.input_global_scale).numel() != 1:  # type: ignore[operator]
                 logger.warning_once(
                     "In NVFP4 linear, the input global scale is different"
                     " for parallel layers (e.g. q_proj, k_proj, v_proj). This "
@@ -134,7 +136,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     " scale for fused layers."
                 )
             # Process input global scale and pre-compute alpha for W4A4 mode
-            input_global_scale_inv = layer.input_global_scale.max().to(torch.float32)
+            input_global_scale_inv = layer.input_global_scale.max().to(  # type: ignore[operator]
+                torch.float32
+            )
             layer.input_global_scale = Parameter(
                 (1.0 / input_global_scale_inv).to(torch.float32), requires_grad=False
             )

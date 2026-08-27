@@ -171,7 +171,9 @@ class MambaHybridModelState(DefaultModelState):
         if self._mamba_state_copy_funcs is None:
             mamba_groups = get_mamba_groups(kv_cache_config)
             mamba_types = {spec.mamba_type for spec in mamba_groups}
-            copy_funcs = self.model.get_mamba_state_copy_funcs(mamba_types)
+            copy_funcs = self.model.get_mamba_state_copy_funcs(  # type: ignore[operator]
+                mamba_types
+            )
             validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
             self._mamba_state_copy_funcs = copy_funcs
         copy_funcs = self._mamba_state_copy_funcs
@@ -282,7 +284,7 @@ class MambaHybridModelState(DefaultModelState):
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(

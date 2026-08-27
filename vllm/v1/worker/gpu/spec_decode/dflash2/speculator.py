@@ -277,7 +277,7 @@ class DFlash2Speculator(DFlashSpeculator):
         hidden_states = last_hidden_states[self.sample_indices[:num_sample]].view(
             num_reqs, self.num_speculative_steps, -1
         )
-        candidate_ids, unary_logits = self.model.compute_candidates(
+        candidate_ids, unary_logits = self.model.compute_candidates(  # type: ignore[operator]
             hidden_states.flatten(0, 1)
         )
         candidate_ids = candidate_ids.view(
@@ -285,7 +285,7 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
-        scores = self.model.model.candidate_selector(
+        scores = self.model.model.candidate_selector(  # type: ignore[operator,union-attr]
             candidate_ids,
             unary_logits,
             hidden_states,

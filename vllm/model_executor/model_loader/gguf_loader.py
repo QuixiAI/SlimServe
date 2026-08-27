@@ -165,7 +165,9 @@ class GGUFModelLoader(BaseModelLoader):
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         adapter = self._prepare_adapter(model_config)
-        model.load_weights(self._timed_weights(adapter, model_config))
+        model.load_weights(  # type: ignore[operator]
+            self._timed_weights(adapter, model_config)
+        )
 
     def _timed_weights(self, adapter, model_config: ModelConfig):
         """Yield weights while splitting producer time from consumer time.
@@ -203,8 +205,8 @@ class GGUFModelLoader(BaseModelLoader):
             adapter.load_spec.unquantized_modules
         )
 
-        target_device = torch.device(device_config.device)
-        with set_default_torch_dtype(model_config.dtype):
+        target_device = torch.device(device_config.device)  # type: ignore[arg-type]
+        with set_default_torch_dtype(model_config.dtype):  # type: ignore[arg-type]
             start = time.perf_counter()
             with target_device:
                 model = initialize_model(
@@ -220,7 +222,9 @@ class GGUFModelLoader(BaseModelLoader):
             if start_async_init is not None:
                 start_async_init()
             start = time.perf_counter()
-            model.load_weights(self._timed_weights(adapter, model_config))
+            model.load_weights(  # type: ignore[operator]
+                self._timed_weights(adapter, model_config)
+            )
             bootstamp(
                 f"gguf load: load_weights total {time.perf_counter() - start:.2f}s"
             )

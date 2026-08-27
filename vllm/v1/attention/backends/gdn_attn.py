@@ -233,7 +233,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes = 0
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+            num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
@@ -284,16 +284,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             # Use CPU tensors to avoid CPU-GPU sync
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
             # Exclude zero-length padded sequences from prefill count.
-            num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
+            num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
             num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
             num_decode_tokens = num_decodes
             num_prefill_tokens = (
-                non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+                int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
             )
             num_spec_decode_tokens = (
-                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+                int(query_lens_cpu.sum().item())
+                - num_prefill_tokens
+                - num_decode_tokens
             )
 
             # num_decodes and num_spec_decodes are mutually exclusive.
@@ -430,9 +432,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 prefill_state_indices = non_spec_state_indices_tensor[num_decodes:]
             else:
-                prefill_query_start_loc = non_spec_query_start_loc
-                prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
-                prefill_state_indices = non_spec_state_indices_tensor
+                prefill_query_start_loc = non_spec_query_start_loc  # type: ignore[assignment]
+                prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu  # type: ignore[assignment]
+                prefill_state_indices = non_spec_state_indices_tensor  # type: ignore[assignment]
 
             if self.gdn_prefill_backend == "cutedsl":
                 from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
@@ -475,7 +477,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
+                    non_spec_query_start_loc_cpu,  # type: ignore[arg-type]
                     device=query_start_loc.device,
                 )
             )
@@ -506,7 +508,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert spec_sequence_masks is not None
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
-                spec_state_indices_tensor, non_blocking=True
+                spec_state_indices_tensor,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
@@ -531,14 +534,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
 
             self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
-                spec_query_start_loc, non_blocking=True
+                spec_query_start_loc,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
 
             self.num_accepted_tokens[:num_spec_decodes].copy_(
-                num_accepted_tokens, non_blocking=True
+                num_accepted_tokens,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
@@ -550,7 +555,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor, non_blocking=True
+                non_spec_state_indices_tensor,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
@@ -558,7 +564,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                non_spec_query_start_loc, non_blocking=True
+                non_spec_query_start_loc,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
@@ -636,12 +643,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # the in-place refreshes above cannot reach. Drop it so the first
         # GDN layer of this step rebuilds it — the memo's scope is one
         # step across the 48 layers, not the metadata object's lifetime.
-        metadata._mps_spec_cache = None
+        metadata._mps_spec_cache = None  # type: ignore[attr-defined]
         # Same lifetime rule for the fused GDN step's spec plans: they bake
         # copied slot ids and accepted counts, so the verify kernel must
         # rebuild them from the refreshed tensors above. (The fused decode
         # plan needs no invalidation here: this path is all-spec.)
-        metadata._mps_fused_spec_plans = None
+        metadata._mps_fused_spec_plans = None  # type: ignore[attr-defined]
         return metadata
 
     def build_for_cudagraph_capture(
