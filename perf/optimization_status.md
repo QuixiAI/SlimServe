@@ -16353,6 +16353,20 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   all-thinking completion above. Suites: 167 passed / 105 skipped;
   mypy clean across all touched files (incl. PR #13's pre-existing
   debt).
+- Evidence fields (this is a correctness feature, recorded to the
+  optimization standard regardless):
+  - Baseline: V2 rejects thinking_token_budget per request (400); an
+    unbudgeted xhigh request spends all 1,500 completion tokens in
+    <think> (raw: perf/results/2026-08-27/nvfp4-baseline/
+    server-budget.log, engine-budget.log).
+  - Hypothesis: logits-seam forcing (grammar-bitmask precedent) gives
+    token-exact budgets on V2 with zero cost when unused.
+  - Correctness: 9 unit tests + live gate (budget 64 -> exactly 64;
+    16 -> 16; both finish=stop with complete answers).
+  - Throughput: inert path is a host-side numpy check per step (no
+    kernel launches when no batch row carries a budget); seeded Q2K
+    bench heads byte-identical post-change (spec_mypyclean pins).
+  - Decision: RETAINED; enforcement is a functional requirement.
 - Open from the PR review, left for the author or follow-up: map
   validation still occurs per request (the PR text claims config time),
   and template-level default reasoning_effort (our profiles' low) does

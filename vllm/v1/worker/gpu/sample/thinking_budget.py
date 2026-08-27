@@ -85,7 +85,12 @@ class ThinkingBudgetState:
         sampling_params: SamplingParams,
     ) -> None:
         budget = sampling_params.thinking_token_budget
-        if budget is None:
+        if budget is None or budget < 0:
+            # None = unset; -1 = the explicit unlimited opt-out. The chat
+            # protocol resolves -1 to None, but SamplingParams built
+            # directly (offline LLM API) can carry it here -- staging it as
+            # an active budget of -1 would force the end marker on the
+            # first in-think token.
             self.budget_np[req_idx] = -1
             # Clear the GPU active flag so a previous occupant's budget
             # cannot leak into this row's masking.

@@ -1652,6 +1652,19 @@ class VllmConfig:
                     "Please check whether your reasoning parser has implemented "
                     "the `reasoning_start_str` and `reasoning_end_str`."
                 )
+            elif self.use_v2_model_runner:
+                # Runs AFTER initialize_token_ids: the marker lists do not
+                # exist before it, so an earlier check can never fire.
+                starts = self.reasoning_config.reasoning_start_token_ids or []
+                ends = self.reasoning_config.reasoning_end_token_ids or []
+                if len(starts) != 1 or len(ends) != 1:
+                    logger.warning_once(
+                        "Model Runner V2 enforces thinking_token_budget only "
+                        "for single-token reasoning markers; this model's "
+                        "markers tokenize to multiple tokens, so the "
+                        "parameter will be rejected per request. Set "
+                        "VLLM_USE_V2_MODEL_RUNNER=0 if it is required."
+                    )
 
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
@@ -2317,18 +2330,6 @@ class VllmConfig:
             raise ValueError(
                 f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
             )
-
-        if self.reasoning_config is not None and self.reasoning_config.enabled:
-            starts = self.reasoning_config.reasoning_start_token_ids or []
-            ends = self.reasoning_config.reasoning_end_token_ids or []
-            if len(starts) != 1 or len(ends) != 1:
-                logger.warning_once(
-                    "Model Runner V2 enforces thinking_token_budget only for "
-                    "single-token reasoning markers; this model's markers "
-                    "tokenize to multiple tokens, so the parameter will be "
-                    "rejected per request. Set VLLM_USE_V2_MODEL_RUNNER=0 if "
-                    "it is required."
-                )
 
     def validate_block_size(self) -> None:
         """Validate block_size against DCP and mamba constraints.
