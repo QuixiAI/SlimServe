@@ -1560,11 +1560,23 @@ class ModelConfig:
             "top_p",
             "min_p",
             "max_new_tokens",
+            "thinking_token_budget",
         ]
         if any(p in config for p in available_params):
             diff_sampling_param = {
                 p: config.get(p) for p in available_params if config.get(p) is not None
             }
+            if "thinking_token_budget" in diff_sampling_param:
+                # Fail at boot on a malformed operator default (bad map keys,
+                # missing `medium`, bad values) instead of rejecting every
+                # request at serve time.
+                from vllm.sampling_params import (
+                    validate_thinking_token_budget_config,
+                )
+
+                validate_thinking_token_budget_config(
+                    diff_sampling_param["thinking_token_budget"]
+                )
             # Huggingface definition of max_new_tokens is equivalent
             # to vLLM's max_tokens
             if "max_new_tokens" in diff_sampling_param:
@@ -1772,7 +1784,9 @@ class ModelConfig:
         """
 
         head_dtype = _get_head_dtype(
-            config=self.hf_config, dtype=self.dtype, runner_type=self.runner_type
+            config=self.hf_config,
+            dtype=self.dtype,  # type: ignore[arg-type]
+            runner_type=self.runner_type,
         )
 
         if head_dtype not in current_platform.supported_dtypes:
@@ -1782,7 +1796,7 @@ class ModelConfig:
                 head_dtype,
                 self.dtype,
             )
-            return self.dtype
+            return self.dtype  # type: ignore[return-value]
 
         logger.debug_once("head dtype: %s", head_dtype)
         return head_dtype

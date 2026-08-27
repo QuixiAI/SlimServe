@@ -315,6 +315,11 @@ is a truncated think, not an error. A few hundred tokens is rarely enough for a
 vision or analysis request; 2048 is a safe starting point, and reasoning-heavy
 prompts want more.
 
+Operators can enforce a native thinking cutoff independently for each
+`reasoning_effort` level while leaving `max_tokens` as the request's total
+completion limit. See [Reasoning token budgets](docs/reasoning-token-budgets.md)
+for the configuration schema, precedence rules, and a Qwen3.8 example.
+
 **The split depends on the reasoning parser, and its default is GLM's.** This
 fork defaults `reasoning_parser` to `glm45`, which is right for GLM-5.2 and
 wrong for everything else: pointed at another model's output it classifies the

@@ -16313,3 +16313,98 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   this box" item from the merge tracking list.
 - Raw: perf/results/2026-08-27/nvfp4-baseline/ (tq_needle.py,
   multiturn_chat.py, engine/server logs per leg).
+
+## 2026-08-27 - V2 thinking-token budget enforcement (PR #13 extension): token-exact on the canonical profile
+
+- Motivation (user): Qwen3.8 thinks nearly endlessly even at low
+  reasoning effort -- live-demonstrated on the canonical profile: an
+  unbudgeted xhigh request spent ALL 1500 completion tokens inside
+  <think> and produced zero content. A hard cap is basic functionality.
+- PR #13's enforcement lives in the V1 sampler (host-side state holder,
+  per-step output scans); the V2 runner -- which every SlimServe profile
+  runs -- rejected the parameter with a 400. The V1 design cannot port:
+  it needs host knowledge of step N's tokens when scheduling N+1, which
+  async scheduling forbids.
+- Implementation (vllm/v1/worker/gpu/sample/thinking_budget.py):
+  GPU-resident per-slot state (remaining budget, in-think flag, active
+  mirror), admission-staged like the other sampler states; enforcement
+  rides the SAME logits seam as the grammar bitmask, applied before the
+  sampler/rejection-sampler dispatch, so one mask serves both paths --
+  a masked verify row simply rejects any draft token that is not the
+  reasoning-end marker, and a draft that closes the block naturally
+  within budget is left for rejection sampling (no special case).
+  Per-request draft consumption is computed positionally with
+  host-known span geometry (cu_num_logits_np): no device syncs, no
+  boolean-mask indexing (masked_fill_ + where -- the MPS queue-drain
+  lessons applied). Scope: single-token reasoning markers (qwen3
+  family: <think>=248068, </think>=248069); multi-token markers keep a
+  per-request rejection with an explicit message.
+- Semantics match the V1 holder after PR #13's fixes: budgets count
+  generated in-think tokens only; markers uncharged; prompt-open blocks
+  start at zero consumed; budget-0 forces immediately.
+- Tests: 9 unit tests (prompt-open, budget-0, marker accounting, spec
+  span forcing at the violating row, natural close un-forced, rejected
+  drafts uncharged, slot reuse, mixed batches). First draft had a real
+  bug the spec test caught: per-row counters instead of per-request
+  cumulative consumption never triggered mid-span forcing.
+- Live gate (canonical qwen38-nvfp4-1, V2 + DFlash2 + throttle, seeded):
+  budget 64 -> exactly 64 reasoning tokens then a complete proof
+  (finish=stop); budget 16 -> exactly 16; no budget -> the pathological
+  all-thinking completion above. Suites: 167 passed / 105 skipped;
+  mypy clean across all touched files (incl. PR #13's pre-existing
+  debt).
+- Evidence fields (this is a correctness feature, recorded to the
+  optimization standard regardless):
+  - Baseline: V2 rejects thinking_token_budget per request (400); an
+    unbudgeted xhigh request spends all 1,500 completion tokens in
+    <think> (raw: perf/results/2026-08-27/nvfp4-baseline/
+    server-budget.log, engine-budget.log).
+  - Hypothesis: logits-seam forcing (grammar-bitmask precedent) gives
+    token-exact budgets on V2 with zero cost when unused.
+  - Correctness: 9 unit tests + live gate (budget 64 -> exactly 64;
+    16 -> 16; both finish=stop with complete answers).
+  - Throughput: inert path is a host-side numpy check per step (no
+    kernel launches when no batch row carries a budget); seeded Q2K
+    bench heads byte-identical post-change (spec_mypyclean pins).
+  - Decision: RETAINED; enforcement is a functional requirement.
+- Open from the PR review, left for the author or follow-up: map
+  validation still occurs per request (the PR text claims config time),
+  and template-level default reasoning_effort (our profiles' low) does
+  not inform map level selection.
+
+## 2026-08-27 - Thinking budgets: defaults stay UNLIMITED (user decision); template-effort map selection fixed
+
+- Decision of record: no SlimServe profile bakes a thinking_token_budget
+  default. Budgets are operator-set exactly per the PR #13 design
+  (server map via --override-generation-config, per-request numeric
+  override, -1 opt-out); an earlier draft that capped every Qwen3.8
+  profile was reverted before commit.
+- Kept: when an operator DOES configure a map, level selection now
+  falls back to the server's default_chat_template_kwargs
+  reasoning_effort before the medium fallback, so a profile serving
+  low-effort by template default selects the low budget rather than
+  medium (to_sampling_params gained default_reasoning_effort, passed by
+  the chat serving layer). This closes the effort-sourcing gap from the
+  PR #13 review.
+
+## 2026-08-27 - Thinking budgets: bad server default now fails at boot (closes the last PR #13 review item)
+
+- The map/scalar validation that lived only inside
+  get_effective_thinking_token_budget (per request) is extracted to
+  validate_thinking_token_budget_config and invoked from
+  ModelConfig.get_diff_sampling_param, which every serving handler
+  constructor calls at startup (7 call sites: chat, completion,
+  responses, speech-to-text, scale-out x2, LLM entrypoint). A bad
+  operator default (unknown map keys, missing medium, bad values,
+  scalar < -1) now kills the server at boot instead of 400ing every
+  request. The per-request path re-validates via the same helper, so
+  programmatically supplied maps keep the same errors.
+- Live proof (dummy-load boot of qwen38-nvfp4-1's checkpoint):
+  {"thinking_token_budget": {"low": 100}} -> exit 1 during
+  OpenAIServingResponses init with "map must define `medium`", zero
+  startup-complete lines; control boot with {"low": 1024,
+  "medium": 4096} reaches Application startup complete.
+- Tests: 10 new config-time cases (5 bad shapes raise from
+  get_diff_sampling_param, 5 good shapes pass through); both budget
+  suites 52/52; mypy hook green. This makes the PR #13 text's
+  "rejected at config time" claim true as written.

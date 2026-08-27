@@ -266,7 +266,7 @@ class OpenAIServingChat(GenerateBaseServing):
         if self.parser_cls is not None:
             parser = self.parser_cls(
                 tokenizer,
-                request.tools,
+                request.tools,  # type: ignore[arg-type]
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
@@ -325,6 +325,9 @@ class OpenAIServingChat(GenerateBaseServing):
                 sampling_params = request.to_sampling_params(
                     max_tokens,
                     self.default_sampling_params,
+                    default_reasoning_effort=self.default_chat_template_kwargs.get(
+                        "reasoning_effort"
+                    ),
                 )
 
             self._log_inputs(
@@ -453,7 +456,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 parsers: list[Parser | None] = [
                     self.parser_cls(
                         tokenizer,
-                        request.tools,
+                        request.tools,  # type: ignore[arg-type]
                         chat_template_kwargs=chat_template_kwargs,
                         model_config=self.model_config,
                     )
