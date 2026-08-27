@@ -15954,3 +15954,45 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
     at batch 1 on M5 Max, VLLM_QC_PA256_MIN_CTX_B1=0 selects it.
 - Canonical M5 Max essay-prose reference (merged tree): c1 mean 39.6
   tok/s over 5 offsets, acceptance mean 3.14. Sonnet pins unchanged.
+
+## 2026-08-27 - RETAINED: k=3 drafting at every batch size + acceptance-adaptive throttle (c8 prose +51%)
+
+- Baseline: the batch-adaptive schedule [[1,1,3],[2,8,0]] -- drafting
+  off at batch >= 2, a boundary bracketed on the M1 Ultra (c1 win at
+  k=3, c4/c8 loss at k=7-era stack) but never probed at c2/c3 or under
+  real sampling.
+- Sweep (essay prose, offset-mean protocol, c 1000/256, M5 Max merged
+  tree; raw in perf/results/2026-08-27/nvfp4-baseline/):
+  | c | draft-off | k=3 | delta | acc mean |
+  | 2 | 33.93 | 55.72 | +64% | 3.70 |
+  | 4 | 48.48 | 63.16 | +30% | 3.72 |
+  | 8 | 55.09 | 83.28 | +51% | 3.69 |
+  Acceptance holds ~3.7 of 4 at every batch size; the old cutoff was
+  costing a third to half of batch throughput on prose. 83.3 tok/s at
+  c8 is the highest Metal serving number this repo has recorded.
+- The counter-case that forbids a naive flip: drafting-hostile content.
+  c8 sonnets (verse, acceptance 1.20): k=3 unthrottled 38.16 vs
+  draft-off 58.69 (-35%).
+- Change: AcceptanceThrottle (vllm/v1/spec_decode/dynamic/utils.py),
+  wired at the scheduler's dynamic-SD K decision and acceptance
+  accounting sites. EMA of accepted/drafted (alpha 0.1); after 8
+  observed draft calls, EMA < 0.30 pauses drafting for 96 scheduling
+  steps, then re-probes with a fresh warmup. Enabled only by
+  VLLM_SD_ADAPT_THROTTLE=1 (set in the qwen38-nvfp4 metal profiles);
+  all other platforms keep exact scheduler behavior. 6 unit tests.
+- Validation: verse c8 with throttle 52.4-63.4 across two constant
+  sets (~= draft-off, vs -35% unthrottled); prose fresh-boot first-run
+  79.0 ~= the k3-open adjacent-first 83.4. CAVEAT: the recovery-latency
+  arm (verse then prose on one server) is confounded by thermal soak --
+  eight consecutive c8 runs decline monotonically 79 -> 43 regardless
+  of arm, so live recovery validation needs a cool box and longer
+  streams. The recovery logic is unit-tested; live gate is an open
+  follow-up, as is the M1 Ultra re-gate of the new schedule.
+- Profile changes: schedule -> [[1,8,3]] + VLLM_SD_ADAPT_THROTTLE=1 on
+  the qwen38-nvfp4 metal variants, prose updated. Also:
+  qwen38-nvfp4-1-df2 retired (it was canonical minus VLLM_QC_MUSE=1 --
+  a kill-switch state, not a config; the notes say how to reproduce
+  it), and the language_model_only note corrected -- the checkpoint
+  carries the full vision tower (333 tensors) and torchvision is no
+  longer the blocker; the tower is simply unvalidated on the CT Metal
+  path.
