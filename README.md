@@ -97,7 +97,8 @@ for each model family.
 | Runs today | Coming |
 | --- | --- |
 | AMD MI300X (2–8 GPUs) | Apple Metal for GLM-5.2-Vision |
-| NVIDIA A100 (4–8 GPUs) | RTX 3090 / 4090 / 5090, RTX PRO 6000 |
+| NVIDIA A100 (4–8 GPUs) | RTX 4090 / 5090, RTX PRO 6000 |
+| NVIDIA RTX 3090 (8 GPUs, [P2P driver](docs/geforce-p2p.md)) | |
 | [Apple Metal](#apple-silicon) (DeepSeek-V4 128 GiB+; Muse-Glimmer 64 GiB+; Qwen3.8 48 GiB+) | NVIDIA DGX Spark, multi-node |
 
 ### Models
