@@ -12211,3 +12211,23 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - 213 tests green twice consecutively across qwen4_exp, profiles,
   dispatcher, and CSA planner suites. MI300X capture re-baseline remains
   deferred to that platform.
+## 2026-08-27 - Metal re-validation after the Flash-Next 3090 merge (PR #15): all green
+
+- Trigger: main merged the Qwen3.8-Flash-Next-FP8 8x3090 port (101
+  files), which reworks shared machinery on the Metal path
+  (mamba_utils.py +907 lines, gpu_model_runner.py). csrc/quixicore is
+  untouched (the new fused GDN decode kernel is _C_stable_libtorch,
+  CUDA-only), so no Metal extension rebuild.
+- Offline gate: seeded consolidated bench, heads byte-identical to the
+  post-partitioned-route baseline. essay 26.4-28.3, gsm8k 44.5-45.8 --
+  the partitioned-256 gain holds.
+- Server-path validation (registered drafters, seeded shipped
+  defaults; perf/results/2026-08-27/profile-validation/):
+  - qwen38-q2kxl-1 PASS text+image; the image request now finishes
+    thinking and answers correctly (577 tokens, finish=stop).
+  - muse-kdyn-1 PASS text+image, image finish=stop.
+  - dsv4-xxs-1 PASS text, 23.9 tok/s; KV working-set clamp fired as
+    designed (16 -> 3.82 GiB, 7 GiB reserve).
+  - glm52-xxs-1 remains registry-blocked on this 128 GiB box (needs
+    256 GiB) -- unchanged.
+- Suites: 45 passed / 104 skipped.
