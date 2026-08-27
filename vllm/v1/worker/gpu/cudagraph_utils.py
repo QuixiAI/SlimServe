@@ -40,6 +40,11 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# Batches around a dynamic-speculative k switch still carry the previous
+# k's drafts, so each query-length family captures this many batch sizes
+# beyond its scheduled range on both sides.
+_DYNAMIC_SD_RANGE_MARGIN = 4
+
 
 class AttentionState(NamedTuple):
     attn_metadata: dict[str, Any] | None
@@ -221,10 +226,35 @@ class CudaGraphManager:
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            # Each entry is (range_start, range_end, num_speculative_tokens).
-            decode_query_lens = [
-                x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
-            ]
+            if num_new_sampled_tokens_per_step >= 1:
+                # Each entry is (range_start, range_end,
+                # num_speculative_tokens). Record each query length's
+                # scheduled batch range too: a family only needs graphs for
+                # the batches its k serves (plus a margin for the steps
+                # around a k switch, where seqs still carry the previous
+                # k's drafts at the new batch size). Capturing every family
+                # at every size doubles graph memory and starves the KV
+                # pool -- measured as c32 throttling to batch 16.
+                margin = _DYNAMIC_SD_RANGE_MARGIN
+                decode_query_lens = []
+                batch_ranges = {}
+                for x in num_spec_per_batch_size:
+                    qlen = x[2] + num_new_sampled_tokens_per_step
+                    decode_query_lens.append(qlen)
+                    lo = max(1, x[0] - margin)
+                    hi = min(self.max_num_reqs, x[1] + margin)
+                    prev = batch_ranges.get(qlen)
+                    if prev is not None:
+                        lo, hi = min(lo, prev[0]), max(hi, prev[1])
+                    batch_ranges[qlen] = (lo, hi)
+                self._dynamic_batch_ranges = batch_ranges
+            else:
+                # A manager whose query length does not embed the schedule
+                # (the drafter's own decode manager runs 1 token per step;
+                # a prefill manager is token-count based): the schedule
+                # cannot change its shapes, and applying it would derive
+                # zero or negative query lengths.
+                decode_query_lens = [self.decode_query_len]
         else:
             decode_query_lens = [self.decode_query_len]
 
@@ -242,6 +272,13 @@ class CudaGraphManager:
                         rounded_num_tokens > max_decode_tokens
                         or rounded_num_tokens > max_cg_capture_size
                         or rounded_num_reqs > self.max_num_reqs
+                    ):
+                        continue
+                    batch_range = getattr(self, "_dynamic_batch_ranges", {}).get(
+                        decode_query_len
+                    )
+                    if batch_range is not None and not (
+                        batch_range[0] <= rounded_num_reqs <= batch_range[1]
                     ):
                         continue
 
@@ -281,17 +318,41 @@ class CudaGraphManager:
         if not descs_by_token_lora:
             return
 
-        all_token_counts = sorted({k[0] for k in descs_by_token_lora})
-        current_range_start = 0
-        for token_cg_size in all_token_counts:
-            for i in range(current_range_start, token_cg_size + 1):
-                for num_active_loras in self.lora_capture_cases:
-                    staging_key = (token_cg_size, num_active_loras)
-                    if staging_key in descs_by_token_lora:
-                        self._candidates[(i, num_active_loras)] = descs_by_token_lora[
-                            staging_key
-                        ]
-            current_range_start = token_cg_size + 1
+        # Stage the nearest padded-up candidate PER GRAPH FAMILY, where a
+        # family is one (uniform_token_count, cg_mode) shape. Dispatch
+        # requires an exact uniform_token_count match, so with several
+        # decode query lengths captured (a dynamic speculative schedule),
+        # mapping a token count only to the single nearest capture key can
+        # hide a compatible graph: with query lengths {3, 4}, a 60-token
+        # qlen-3 batch must pad up to the 66-token qlen-3 graph even though
+        # the 64-token qlen-4 graph is numerically nearer.
+        for num_active_loras in self.lora_capture_cases:
+            families: dict[
+                tuple[int | None, CUDAGraphMode], list[BatchExecutionDescriptor]
+            ] = defaultdict(list)
+            for (num_tokens, loras), descs in descs_by_token_lora.items():
+                if loras != num_active_loras:
+                    continue
+                for desc in descs:
+                    families[(desc.uniform_token_count, desc.cg_mode)].append(desc)
+            for descs in families.values():
+                descs.sort(key=lambda d: d.num_tokens)
+            max_tokens = max(k[0] for k in descs_by_token_lora)
+            cursors = {family: 0 for family in families}
+            for i in range(1, max_tokens + 1):
+                staged: list[BatchExecutionDescriptor] = []
+                for family, descs in families.items():
+                    cursor = cursors[family]
+                    while cursor < len(descs) and descs[cursor].num_tokens < i:
+                        cursor += 1
+                    cursors[family] = cursor
+                    if cursor < len(descs):
+                        staged.append(descs[cursor])
+                if staged:
+                    # Smallest viable pad first so dispatch prefers the
+                    # tightest graph.
+                    staged.sort(key=lambda d: d.num_tokens)
+                    self._candidates[(i, num_active_loras)] = staged
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
