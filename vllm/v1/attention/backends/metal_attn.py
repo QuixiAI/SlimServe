@@ -48,10 +48,13 @@ logger = init_logger(__name__)
 # identical yet ~15% slower end-to-end. One simdgroup per (head, batch)
 # gives ~96 simdgroups at decode widths (GQA 24 heads, batch <= 4) — the
 # serial context walk under-occupies the GPU where the matmul SDPA path
-# parallelizes over context. Re-attempt via the partitioned
-# (paged_attention_partition + reduce) route, which splits the context
-# axis for occupancy.
+# parallelizes over context.
 _PAGED_HEAD_SIZES = (64, 128)
+# Head sizes routed through the partitioned (partition + reduce) decode
+# instead: the context axis is split into 512-token slices, so occupancy no
+# longer collapses at wide heads and small batches. This is the measured
+# re-attempt the plain-kernel rejection above pointed to.
+_PARTITIONED_HEAD_SIZES = (256,)
 
 
 class MetalAttentionBackend(AttentionBackend):
@@ -216,7 +219,10 @@ class MetalAttentionImpl(AttentionImpl):
         return (
             metadata.max_query_len == 1
             and num_tokens == metadata.num_reqs
-            and self.head_size in _PAGED_HEAD_SIZES
+            and (
+                self.head_size in _PAGED_HEAD_SIZES
+                or self.head_size in _PARTITIONED_HEAD_SIZES
+            )
         )
 
     # Largest uniform query length routed through the fused kernel by batch
@@ -234,7 +240,10 @@ class MetalAttentionImpl(AttentionImpl):
             metadata.causal
             and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
             and num_tokens == metadata.num_reqs * q_len
-            and self.head_size in _PAGED_HEAD_SIZES
+            and (
+                self.head_size in _PAGED_HEAD_SIZES
+                or self.head_size in _PARTITIONED_HEAD_SIZES
+            )
         ):
             return False
         # Cached-prompt A/B at 1734-token context: expansion 16.1 tok/s vs
@@ -244,7 +253,7 @@ class MetalAttentionImpl(AttentionImpl):
         import os
 
         ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
-        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
+        return int(metadata.seq_lens_cpu.max()) <= ctx_max
 
     def forward(
         self,
@@ -290,17 +299,33 @@ class MetalAttentionImpl(AttentionImpl):
             from vllm.quixicore import quixicore_ops
 
             if quixicore_ops.is_available():
-                out.copy_(
-                    quixicore_ops.paged_attention(
-                        query[:num_tokens].contiguous(),
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table,
-                        attn_metadata.seq_lens_gpu,
-                        self.scale,
-                        self.sliding_window or 0,
+                if head_size in _PARTITIONED_HEAD_SIZES:
+                    out.copy_(
+                        quixicore_ops.paged_attention_partitioned(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            attn_metadata.seq_lens_gpu,
+                            self.scale,
+                            self.sliding_window or 0,
+                            # Host-side lengths: the device max would sync
+                            # the pipeline once per layer.
+                            int(attn_metadata.seq_lens_cpu.max()),
+                        )
                     )
-                )
+                else:
+                    out.copy_(
+                        quixicore_ops.paged_attention(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            attn_metadata.block_table,
+                            attn_metadata.seq_lens_gpu,
+                            self.scale,
+                            self.sliding_window or 0,
+                        )
+                    )
                 return output
 
         if self._expanded_decode_applies(attn_metadata, num_tokens):
@@ -329,21 +354,20 @@ class MetalAttentionImpl(AttentionImpl):
                 # kernel shares each K/V read across the m rows (measured
                 # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
                 # expansion path (scan capped by the window -- a wash).
+                # Host-side lengths for the gate and partition sizing: the
+                # device max would sync the pipeline once per layer.
+                ctx_max_host = int(attn_metadata.seq_lens_cpu.max())
                 use_mq = (
                     self.sliding_window is None
                     and attn_metadata.num_reqs == 1
-                    # The verify kernel does not walk strided caches yet;
-                    # head_dim 256 implies the hybrid pool's strided views,
-                    # so it stays on the expansion path (which does).
-                    and self.head_size != 256
-                    and int(seq_lens.max().item()) > 1024
+                    and ctx_max_host > 1024
                 )
                 if use_mq:
                     if not getattr(self, "_mq_logged", False):
                         self._mq_logged = True
                         logger.info(
                             "multi-query verify attention engaged (ctx=%d)",
-                            int(seq_lens.max().item()),
+                            ctx_max_host,
                         )
                     out.copy_(
                         quixicore_ops.paged_attention_verify(
@@ -354,6 +378,24 @@ class MetalAttentionImpl(AttentionImpl):
                             seq_lens,
                             self.scale,
                             0,
+                            ctx_max_host,
+                        )
+                    )
+                    return output
+                if head_size in _PARTITIONED_HEAD_SIZES:
+                    # Same expansion, chunk-parallel scan: the plain kernel's
+                    # one-simdgroup-per-row walk under-occupies at D=256 even
+                    # with the m expanded rows.
+                    out.copy_(
+                        quixicore_ops.paged_attention_partitioned(
+                            query[:num_tokens].contiguous(),
+                            key_cache,
+                            value_cache,
+                            expanded_block_table,
+                            expanded_seq_lens,
+                            self.scale,
+                            self.sliding_window or 0,
+                            ctx_max_host,
                         )
                     )
                     return output

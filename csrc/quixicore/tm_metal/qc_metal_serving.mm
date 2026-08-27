@@ -318,6 +318,68 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
   return out;
 }
 
+// Partitioned decode attention (vLLM v2 shape): each (head, batch) query is
+// split across ceil(max_context_len / 512) KV slices, so long contexts get
+// chunk-parallel threadgroups instead of one simdgroup's serial walk. This is
+// the occupancy fix for wide heads at decode widths: at D=256 (Qwen3.8, GQA
+// 24 heads, batch <= 4) the plain kernel's ~96 simdgroups under-occupy the
+// GPU, which is why it measured ~15% behind SDPA on 2026-08-25.
+// max_context_len comes from the host-side seq_lens copy: computing it from
+// the device tensor here would be a per-layer pipeline sync.
+at::Tensor paged_attention_partitioned(const at::Tensor& q,
+                                       const at::Tensor& key_cache,
+                                       const at::Tensor& value_cache,
+                                       const at::Tensor& block_table,
+                                       const at::Tensor& context_lens,
+                                       double scale, int64_t window,
+                                       int64_t max_context_len) {
+  check_mps(q, "q");
+  // Strided K/V accepted: the hybrid pool serves blocks-first views
+  // (stride(0) = 2x page); the kernels walk stride(0) explicitly.
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  check_mps(block_table, "block_table");
+  check_mps(context_lens, "context_lens");
+  TORCH_CHECK(q.dim() == 3, "q must be [batch, heads, head_size], got ",
+              q.sizes());
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
+  TORCH_CHECK(max_context_len >= 1, "max_context_len must be positive");
+
+  const int batch = static_cast<int>(q.size(0));
+  const int num_heads = static_cast<int>(q.size(1));
+  const int head_size = static_cast<int>(q.size(2));
+  const int block_size = static_cast<int>(key_cache.size(1));
+  const int num_kv_heads = static_cast<int>(key_cache.size(2));
+  const int block_table_stride = static_cast<int>(block_table.stride(0));
+  constexpr int kPartitionSize = 512;
+  const int num_partitions =
+      static_cast<int>((max_context_len + kPartitionSize - 1) / kPartitionSize);
+
+  auto opt = q.options().dtype(at::kFloat);
+  auto tmp = at::empty({batch, num_heads, num_partitions, head_size}, opt);
+  auto mlog = at::empty({batch, num_heads, num_partitions}, opt);
+  auto esum = at::empty({batch, num_heads, num_partitions}, opt);
+  at::Tensor out = at::empty_like(q);
+
+  encode("qc_paged_attention_partitioned", [&](TorchEncoder& e) {
+    tk::launch_paged_attention_partition(
+        e, q, key_cache, value_cache, block_table, context_lens, tmp, mlog,
+        esum, batch, num_heads, num_kv_heads, head_size, block_size,
+        block_table_stride, static_cast<float>(scale), num_partitions,
+        kPartitionSize, static_cast<int>(window), /*softcap=*/0.0f,
+        static_cast<uint64_t>(key_cache.stride(0)), activation_type_name(q));
+    tk::launch_paged_attention_reduce(
+        e, tmp, mlog, esum, out, batch, num_heads, head_size, num_partitions,
+        /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
+  });
+  return out;
+}
+
 std::tuple<at::Tensor, at::Tensor> kv_cache_gather_range(
     const at::Tensor& key_cache, const at::Tensor& value_cache,
     const at::Tensor& block_table_in, int64_t token_start, int64_t num_tokens) {
@@ -371,9 +433,18 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
                                   const at::Tensor& value_cache,
                                   const at::Tensor& block_table,
                                   const at::Tensor& context_lens, double scale,
-                                  int64_t window) {
+                                  int64_t window, int64_t max_context_len) {
   check_mps(q, "q");
-  check_mps(key_cache, "key_cache");
+  // Strided K/V accepted: the hybrid pool serves blocks-first views
+  // (stride(0) = 2x page); the kernel walks stride(0) explicitly.
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
   const int m = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
   const int head_size = static_cast<int>(q.size(2));
@@ -384,7 +455,13 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
       (head_size == 128 || head_size == 256) && m >= 1 && m <= 32,
       "quixicore(metal): paged_attention_verify wants D=128/256, m<=32");
   constexpr int kPartitionSize = 512;
-  const int ctx_hint = static_cast<int>(context_lens.max().item<int64_t>());
+  // Host-known context bound when the caller has one: the device-side max
+  // is a pipeline sync per call, which at one verify per attention layer
+  // is exactly the drain class the decode path just shed.
+  const int ctx_hint =
+      max_context_len >= 1
+          ? static_cast<int>(max_context_len)
+          : static_cast<int>(context_lens.max().item<int64_t>());
   const int num_partitions =
       std::max(1, (ctx_hint + kPartitionSize - 1) / kPartitionSize);
   auto opt = q.options().dtype(at::kFloat);
@@ -397,7 +474,8 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
         e, q, key_cache, value_cache, block_table, context_lens, tmp, mlog,
         esum, m, num_heads, num_kv_heads, head_size, block_size, bt_stride,
         static_cast<float>(scale), num_partitions, kPartitionSize,
-        static_cast<int>(window), activation_type_name(q));
+        static_cast<int>(window), static_cast<uint64_t>(key_cache.stride(0)),
+        activation_type_name(q));
     tk::launch_paged_attention_reduce(
         e, tmp, mlog, esum, out, m, num_heads, head_size, num_partitions,
         /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
@@ -689,7 +767,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
             g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads, g.kv_heads, hd,
             static_cast<int>(L.kv_cache.size(2)),
             static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
-            /*window=*/0, /*softcap=*/0.0f, "bfloat16");
+            /*window=*/0, /*softcap=*/0.0f,
+            static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)),
+            "bfloat16");
         tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
                                           g.attn_out, m, g.heads, hd, mq_parts,
                                           /*sinks=*/g.q,
@@ -700,7 +780,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
             sl.narrow(0, m - 1, 1), g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads,
             g.kv_heads, hd, static_cast<int>(L.kv_cache.size(2)),
             static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
-            /*window=*/0, "bfloat16");
+            /*window=*/0,
+            static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)),
+            "bfloat16");
         tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
                                           g.attn_out, m, g.heads, hd, mq_parts,
                                           /*sinks=*/g.q,
@@ -3922,7 +4004,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("q"), pybind11::arg("key_cache"),
         pybind11::arg("value_cache"), pybind11::arg("block_table"),
         pybind11::arg("context_lens"), pybind11::arg("scale"),
-        pybind11::arg("window"));
+        pybind11::arg("window"), pybind11::arg("max_context_len") = -1);
   m.def("dflash_sample_greedy", &dflash_sample_greedy,
         "fused greedy draft sampling: shared lm_head GEMM + row argmax",
         pybind11::arg("hidden"), pybind11::arg("lm_w"),
@@ -3951,6 +4033,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("sl_full"), pybind11::arg("slot_full"),
         pybind11::arg("ctx_len") = 0);
 
+  m.def("paged_attention_partitioned", &paged_attention_partitioned,
+        "Partitioned paged decode attention (partition + reduce), strided "
+        "caches accepted; max_context_len sizes the partition grid host-side",
+        pybind11::arg("q"), pybind11::arg("key_cache"),
+        pybind11::arg("value_cache"), pybind11::arg("block_table"),
+        pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("window"), pybind11::arg("max_context_len"));
   m.def("paged_attention", &paged_attention,
         "Dense/GQA paged attention decode over the block-table KV cache. "
         "window > 0 limits each query to the last `window` positions.",
