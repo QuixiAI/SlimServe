@@ -1,13 +1,17 @@
-# GeForce multi-GPU serving: the P2P driver requirement
+# GeForce multi-GPU serving: use the P2P driver
 
 SlimServe's tensor-parallel profiles for consumer NVIDIA cards (RTX 3090 /
-4090 / 5090, e.g. `qwen38fn-fp8-8` on 8x 3090) assume working PCIe
-peer-to-peer between GPUs. Stock NVIDIA drivers refuse P2P on GeForce
-boards, which forces every inter-GPU byte through host RAM; on a typical
-EPYC/Threadripper host the concurrent device-to-host writes collapse to a
-few GB/s aggregate, and TP throughput collapses with them.
+4090 / 5090, e.g. `qwen38fn-fp8-8` on 8x 3090) run fine on the stock
+NVIDIA driver — but if you have **two or more consumer cards and want the
+throughput they can actually deliver, install the P2P driver**. Stock
+drivers refuse P2P on GeForce boards, which forces every inter-GPU byte
+through host RAM; on a typical EPYC/Threadripper host the concurrent
+device-to-host writes collapse to a few GB/s aggregate, and TP decode is
+bounded by collective latency instead of kernel speed. Measured on
+`qwen38fn-fp8-8`, the difference is +36% single-stream and +58% at
+concurrency 8 (table below).
 
-Use **QuixiAI's patched driver**:
+The driver is **QuixiAI's patched fork**:
 
 > https://github.com/QuixiAI/open-gpu-kernel-modules
 
@@ -30,7 +34,10 @@ people miss:
 
 GeForce profiles set `NCCL_P2P_LEVEL=SYS` in their profile environment —
 NCCL's default refuses P2P for GPU pairs whose path crosses the CPU root
-complex, silently falling back to SHM. The profile env is applied by
+complex, silently falling back to SHM. The setting is harmless on a stock
+driver (it only widens which pairs *may* use P2P; with no P2P capability
+NCCL falls back to SHM as usual), so the same profile serves with or
+without the patched driver. The profile env is applied by
 `slimserve <profile> --serve`; nothing to do manually, but if you
 benchmark collectives outside SlimServe, set it yourself.
 

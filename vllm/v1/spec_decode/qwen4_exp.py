@@ -10,6 +10,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    TQFullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
@@ -112,7 +113,7 @@ class Qwen4ExpMTPProposer(EagleProposer):
         main_layers = [
             name
             for name, spec in layer_to_spec.items()
-            if type(spec) is FullAttentionSpec
+            if type(spec) in (FullAttentionSpec, TQFullAttentionSpec)
         ]
         assert len(main_layers) == 1, (
             "Qwen4Exp MTP requires exactly one main cache owner"

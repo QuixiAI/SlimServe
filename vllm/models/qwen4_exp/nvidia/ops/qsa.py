@@ -338,22 +338,26 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 other=0,
             ).to(tl.int32)
             nib = (v_raw >> ((dim_offsets[None, :] % 2) * 4)) & 0xF
+            # scale f16 | zero f16 sit at a 4-byte-aligned offset (KPS and
+            # VAL_BYTES are multiples of 4 for HEAD_DIM 256): one 32-bit
+            # load replaces four scattered byte loads per column.
             sc_base = v_base + TQ_VAL_BYTES
-            sc_lo = tl.load(v_cache_ptr + sc_base, mask=valid, other=0).to(tl.uint16)
-            sc_hi = tl.load(v_cache_ptr + sc_base + 1, mask=valid, other=0).to(
-                tl.uint16
+            sz = tl.load(
+                v_cache_ptr.to(tl.pointer_type(tl.uint32)) + (sc_base >> 2),
+                mask=valid,
+                other=0,
             )
             v_scale = (
-                (sc_lo | (sc_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            )
-            zr_lo = tl.load(v_cache_ptr + sc_base + 2, mask=valid, other=0).to(
-                tl.uint16
-            )
-            zr_hi = tl.load(v_cache_ptr + sc_base + 3, mask=valid, other=0).to(
-                tl.uint16
+                (sz & 0xFFFF)
+                .to(tl.uint16)
+                .to(tl.float16, bitcast=True)
+                .to(tl.float32)
             )
             v_zero = (
-                (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+                ((sz >> 16) & 0xFFFF)
+                .to(tl.uint16)
+                .to(tl.float16, bitcast=True)
+                .to(tl.float32)
             )
             values = (
                 v_zero[:, None] + v_scale[:, None] * nib.to(tl.float32)
@@ -974,6 +978,13 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
+    if kv_tq or kv_fp8:
+        # In-register dequant is ALU-heavy: wide tiles with 2 warps cannot
+        # hide it (measured 3.8x for TQ and 23x for arithmetic-e4m3 at 48
+        # rows on SM86). Keep narrow tiles and 4 warps for quantized KV.
+        if block_n > 16:
+            block_n, partial_warps = 16, 4
+            target_splits = max(target_splits, 8)
 
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.

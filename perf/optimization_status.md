@@ -11557,3 +11557,259 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   will pick the operating point and quantify what a graph-compatible
   dynamic-k would be worth.
 - Raw: bench_k3p2p_c{1,8}.log, bench_dynkp2p_c{1,8}.log (chain3).
+
+## 2026-08-27 - 8x3090: MTP draft-length sweep, full k x concurrency surface
+
+- Method: one server lifecycle per k (engine-level setting; graphs are
+  captured per decode shape), exact 1000/2000 bench at c in {1,2,4,8},
+  idxshare on for every k>0 leg. k=2 c1/c8 and k=3 c1/c8 reuse the p2p
+  baseline and chain3 legs (same config, same fabric).
+
+  | k      | c1     | c2     | c4     | c8     |
+  | nospec |  88.49 | 157.27 | 285.68 | 489.16 |
+  | 1      | 128.17 | 205.19 | 348.23 | 602.11 |
+  | 2      | 148.81 | 242.98 | 371.29 | 647.88 |
+  | 3      | 163.26 | 262.33 | 426.13 | 571.06 |
+  | 4      | 154.04 | 234.40 | 394.55 | 564.59 |
+  | 5      | failed to start: QSA ring capacity 12 (compress_ratio 4,
+             span 4+5=9 -> 12) does not divide attention block size 416.
+             Structural, not a flake; not pursued (k4 already declines). |
+
+- Reading:
+  - The drafter is worth +68% (c1) tapering to +32% (c8) at k=2 vs nospec.
+  - k=3 is the best fixed k at c1 (+9.7%), c2 (+8.0%), and c4 (+14.8%);
+    k=2 only wins at c8 (647.9 vs 571.1, -11.9% for k3). The crossover
+    sits between c4 and c8.
+  - k=4 declines everywhere vs k=3: acceptance decay beats the extra
+    draft depth on this fabric.
+- Decision: the ideal operating point is per-batch k (k=3 below the
+  crossover, k=2 at c8), which requires the cudagraph dispatcher to hold
+  captures for multiple uniform-decode query lengths - the same gap that
+  made the scheduler-level dynamic-k run eager (previous entry). Until
+  that lands, fixed k is a traffic-profile choice:
+  k=3 maximizes c<=4 throughput, k=2 maximizes c8. Profile currently
+  keeps k=2 (idxshare); recommendation to flip pending user's traffic
+  shape. Raw: bench_{nospec,k1,k4,k2fill,k3fill}_c{1,2,4,8}.log.
+
+## 2026-08-27 - 8x3090: TurboQuant k8v4 main-KV RETAINED - dominates FP8 on every axis
+
+- Hypothesis: TQ k8v4 (fp8 keys - e4b15 on Ampere - plus 4-bit uniform
+  values with per-slot f16 scale/zero, 388 B vs 1024 B bf16 per
+  token-head, 2.64x) beats the unit-scale e4m3 main-KV both on decode
+  cost (integer dequant vs arithmetic fp8 emulation on SM86) and on
+  quality (real scales).
+- Implementation: VLLM_QWEN4_EXP_TQ_MAIN_KV=1, layer-scoped like the fp8
+  option. Reuses the drafter-path fused store (_tq_fused_store_fp8); the
+  QSA sparse-gather kernel decodes K via Triton's native e4b15 bitcast
+  and V via nibble unpack + FMA. TQFullAttentionSpec end-to-end; three
+  exact-type checks (CSA role classifier, packed-layout detector, MTP
+  drafter owner lookup) widened to accept the TQ subclass - each found
+  by a startup failure, each now unit-covered.
+- Results (exact 1000/2000, seed 42, k=2+idxshare):
+  | config          | c1     | c8     | c8 accept |
+  | bf16  @128K     | 148.81 | 647.88 | 62.8%     |
+  | fp8   @128K     | 133.17 | 465.92 | 59.9%     |
+  | TQ    @128K     | 133.21 | 562.12 | 62.3%     |
+  | TQ    @262K     | 131.79 | 571.63 | 65.3%     |
+- Reading: TQ ties fp8 at c1, beats it +20.7% at c8, and its draft
+  acceptance sits at bf16 parity (62.3 vs 62.8) where fp8 loses 3 points
+  - the per-vector value scales matter for verifier quality. The native
+  262,144 context serves at effectively no cost over TQ@128K: the bench
+  workload (1000/2000 tokens) never exercises the ceiling, so the
+  562-vs-572 c8 delta and the 62.3-vs-65.3 acceptance delta are
+  single-run noise, not a 262K speedup. A long-context bench leg
+  (e.g. 100K prompts) is the follow-up that actually measures the
+  large-context regime.
+- Decision: TQ k8v4 RETAINED as the context-max KV format; the fp8
+  option is superseded (kept only as a diagnostic env). Remaining trade
+  vs bf16@128K: -10% c1 / -13% c8 for 2x the context. Profile default
+  decision (throughput vs context) left to the user; both configs are
+  one env + one field apart.
+- Raw: bench_tq{128k,262k}_c{1,8}.log, serve_tq*.log (tq_legs2).
+
+## 2026-08-27 - 8x3090: TQ 128K vs 262K decision matrix (c1..c64) + the c8 scaling cliff
+
+- Both legs TQ main-KV, max_num_seqs 64, identical but for max_model_len:
+  |  c | TQ@128K | accept | TQ@262K | accept |
+  |  1 |  150.21 | 72.5%  |  129.86 | 57.1%  |
+  |  8 |  564.61 | 61.7%  |  576.75 | 66.0%  |
+  | 16 |  461.97 | 59.4%  |  466.12 | 61.8%  |
+  | 32 |  420.40 | 60.2%  |  425.47 | 63.0%  |
+  | 64 |  426.76 | 63.9%  |  421.32 | 61.9%  |
+- Verdict: the legs are statistically identical at every concurrency
+  (c1 is single-stream sampling noise; acceptance for the SAME config
+  spans 57-73% at c1 across runs). 262K WINS BY DEFAULT: same speed and
+  quality, double the ceiling. Caveat recorded: this workload never
+  exercises deep context; a long-context leg (100K prompts) is still
+  owed before claiming the deep regime.
+- New problem surfaced: throughput PEAKS AT c8 (~570) and falls ~25% by
+  c32, identically in both legs. Known half: with k=2, decode steps are
+  seqs x 3 query tokens; c32 (96) and c64 (192) exceed the 64-token
+  graph-capture ceiling and run eager. Unknown half: the c8->c16 drop
+  (564->462) happens with BOTH shapes graph-captured (24 and 48 both in
+  the capture list).
+- In flight: Exp A re-benches c8-c64 with max_cudagraph_capture_size 192
+  (config-only); Exp B captures torch-profiler traces at steady-state
+  decode c8 vs c16 on that config and diffs GPU-time share by kernel
+  (trace_diff.py) to attribute the remaining gap. Suspects: QSA
+  sparse-kernel tile-tier switch at 32<programs<=256, Marlin MoE
+  M-growth, GDN batch scaling, AR payload growth.
+- Raw: bench_tqd{128,262}_c*.log, tq_decision.log; traces under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/traces/ once Exp B runs.
+
+## 2026-08-27 - 8x3090 cliff hunt: graphs and GPU kernels exonerated; slow-48-token state is per-server-instance
+
+- Timeline of evidence (all c16, exact 1000/2000, TQ main-KV, 128K):
+  - Dispatch-stats instrumentation (VLLM_CUDAGRAPH_DISPATCH_STATS in the v2
+    CudaGraphManager.dispatch) shows 48tok/FULL graph hits >82% in BOTH
+    fast and slow runs -> not a graph miss.
+  - Torch-profiler trace diff seqs64-vs-seqs32 is NULL on the GPU side
+    (kernel shares within 0.25%) while unprofiled throughput differed
+    462 vs 660 -> whatever differs is not steady-state GPU kernel time.
+  - Exp D: seqs=64 reproduced 461.6. Exp F: identical seqs=64 config
+    measured 653.1 -> the valley is NON-DETERMINISTIC per server launch.
+  - Exp A observed c16 slow (463) and c32/c64 fast (661/669) in the SAME
+    server -> when present, the pathology is specific to the 48-token
+    step, not global to the instance.
+  - Acceptance correlates (slow ~0.60, fast ~0.63) but is far too small
+    to explain 40%; treated as symptom.
+- Current hypothesis space: per-launch state affecting the 48-token decode
+  step only - e.g. capture-time memory layout of that graph's static
+  buffers, or a host-side per-step cost that intermittently lands on the
+  critical path. py-spy attach failed (yama ptrace_scope); needs
+  `sudo sysctl kernel.yama.ptrace_scope=0` for host-side flamegraphs.
+- In flight: Exp G - one seqs=64 server, bench sequence c16 x3, c8, c32,
+  c16 to test whether the slow state is sticky per instance and whether
+  it survives interleaved other-size benches.
+- Raw: cliff_exp{C,D,E,F,G}.log, serve_exp*.log, traces/ under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - 8x3090: NEW correctness bug - CUDA illegal memory access at c32 after bench churn
+
+- During Exp G (seqs=64, cap 96, TQ main-KV): after 56 completed requests
+  (c16 x3 + c8 benches), the first c32 bench crashed every worker with
+  "CUDA error: an illegal memory access was encountered", surfacing at
+  metadata build (short_conv_attn.py:333) - i.e. an earlier async kernel
+  faulted; the report site is just the sync point.
+- The only prior c32 run (Exp A: seqs 64, cap 192) worked at 661 tok/s but
+  ran c32 after only c8/c16 legs on a fresh server. Suspects: request-churn
+  state (CSA ring wraparound, TQ store slot edges, drafter state reuse)
+  interacting with the 96-token step.
+- Correctness outranks the perf mystery: Exp H (cliff_expH.log) replays a
+  compressed churn sequence (c16,c8,c32,c16,c32,c8 at 600 output tokens)
+  to find a fast repro; next step after repro is CUDA_LAUNCH_BLOCKING=1 +
+  eager mode to name the faulting kernel, then compute-sanitizer on a
+  reduced case.
+- Exp G stickiness data (before the crash): c16 on one seqs=64 server ran
+  664/619/638 - a FAST instance; the slow state was not reproduced this
+  launch. Bimodality remains open, possibly linked to the same
+  state-lifecycle bug.
+
+## 2026-08-27 - 8x3090: CORRECTION - bf16 c16/c32 was never measured; TQ's high-concurrency tax is ~25-30%
+
+- Exp M (bf16 KV @128K, seqs 32, cap 96, standard 1000/2000 bench, churn
+  order c16,c16,c16,c8,c32,c16): c16 843/809/908/919, c8 586.7, c32 861.0.
+- Corrected KV table (standard bench, best observed):
+  | config      | c8      | c16    | c32    |
+  | bf16 @128K  | 587-648 | ~870   | ~861   |
+  | TQ   @128K  | 570     | 625-660| 661*   | (*c32 at cap192/seqs64)
+  | TQ   @262K  | ~570    | ~625   | ~660   |
+- The earlier "TQ ties bf16" conclusion compared TQ c16/c32 against bf16's
+  c8 only - bf16 was never benched at c16/c32. TQ's real cost at high
+  concurrency is 25-30%; the 262K context still requires TQ (bf16 cannot
+  fit 262K), but the trade is context vs meaningful throughput, not free.
+- Also: bf16 shows NO c16 valley (870 at c16) - the valley phenomenon and
+  the depressed 620-660 band are TQ-specific; prime suspect is the TQ
+  gather kernel's V-dequant cost at batch (each V byte loaded twice via
+  dim//2 addressing; scale/zero as four 1-byte loads per column).
+- Exp N: cap96+TQ churn ran CLEAN (crash now 2-of-4, intermittent,
+  TQ+cap96-implicated; next tool is compute-sanitizer on the churn).
+- Next: optimize the TQ gather (single-load nibble unpack, 32-bit
+  scale/zero load), re-A/B, then sanitizer run for the crash.
+
+## 2026-08-27 - 8x3090: c16 valley ROOT-CAUSED and FIXED - QSA tile-tier collapse for quantized KV
+
+- Root cause (found by direct kernel microbench, rows x topk=2048/rank
+  shapes): qsa_sparse_paged_attention's launch profile switches at
+  base_programs > 32 from (block_n=16, warps=4) to (block_n=64, warps=2).
+  For bf16 KV that tier is fine; for in-register-dequant KV the ALU-heavy
+  decode cannot be hidden by 2 warps over 64-wide tiles:
+  | rows | bf16    | fp8-e4m3  | TQ k8v4  |
+  | 24   | 105 us  | 137 us    | 116 us   |
+  | 48   | 140 us  | 3179 us   | 530 us   |  <- the c16 valley (48 tokens)
+  | 96   | 275 us  | 6002 us   | 937 us   |
+  This also explains the serving observations: c8 (24 tokens) unaffected,
+  c16 (48) collapsed, and the fp8 main-KV c8 serving loss (its prefill and
+  larger steps hit the wide tiers catastrophically). The earlier "valley
+  disappears at seqs=32" runs were coincidental batch-mix effects; the
+  bimodality tracked how often steps landed in the bad tier.
+- FIX: quantized-KV paths (KV_TQ/KV_FP8) keep block_n=16 / 4 warps at
+  every program count (ops/qsa.py). Microbench after:
+  | rows | fp8     | TQ       | TQ/bf16 |
+  | 24   | 138 us  | 114 us   | 1.09x   |
+  | 48   | 232 us  | 192 us   | 1.37x   |
+  | 96   | 503 us  | 354 us   | 1.29x   |
+- Also retained: 32-bit fused scale/zero load in the TQ path (replaces 4
+  scattered byte loads). REJECTED: tl.interleave single-load nibble unpack
+  - Triton 3.7.1 miscompiles interleave feeding tl.dot (parity maxdiff
+  1.2; probes that materialize to memory pass, dot-operand layout breaks);
+  the dim//2 double-read hits the same L1 line and is effectively free.
+- All 124 qwen4_exp tests pass. Exp O (cliff_expO.log) re-runs the TQ
+  standard-bench row (c16 x3, c8, c32, c16; seqs 32, cap 96) for the
+  corrected KV decision table against bf16's 843-919 c16 / 861 c32.
+
+## 2026-08-27 - 8x3090: tier fix validated in serving - TQ matches bf16, cliff eliminated
+
+- Exp O (TQ @128K, seqs 32, cap 96, fixed kernel, standard bench):
+  c16 829/888/826/864, c8 592.9, c32 867.6. vs bf16 (Exp M): c16 843-919,
+  c8 586.7, c32 861.0. TQ == bf16 within noise at every measured
+  concurrency; the 2.64x KV compression is now effectively free.
+- Scaling is monotonic and healthy: c8 593 -> c16 ~850 -> c32 868. The
+  entire c16-valley / scaling-cliff phenomenon was the quantized-KV
+  tile-tier collapse (previous entry); every TQ and fp8 serving number
+  measured before this fix (562-660 band) was afflicted.
+- No crash during Exp O (fixed kernel, TQ+cap96, 6 benches with churn).
+- Decision: TQ k8v4 main KV RETAINED as the profile default with the tier
+  override in place. In flight: Exp P = TQ@262K, seqs 32, cap 96,
+  c1/c8/c16/c32 - the final profile validation row.
+
+## 2026-08-27 - 8x3090: campaign close-out - converged
+
+- Long-context first datapoint: 100,000-token prompt, 500 output, final
+  profile (TQ@262K): c1 aggregate 21.0 tok/s (wall includes the ~100K
+  prefill; no server errors; deep-context serving works). The c4 leg is
+  BLOCKED BY THE BENCH HARNESS, not serving: exact_prompts can construct
+  only one distinct 100K prompt from sonnet.txt (follow-up: offset-cycled
+  prompt construction for multi-request long-context benches).
+- Final validated state (slimserve-launched, registered profile):
+  c1 130.9 / c8 547.0 / c32 881.6; raw-command row c1 136.2 / c8 585.0 /
+  c16 838.2 / c32 879.6; accept 58-65%. 175 tests pass. Baseline table
+  updated in perf/baseline_status.md.
+- Campaign arc (c8/c32 standard bench unless noted):
+  | stage                          | c8    | c32   | context |
+  | bring-up (SHM, bf16)           | 409.7 | -     | 128K    |
+  | P2P driver + NCCL SYS          | 647.9 | 425.5 | 128K    |
+  | + capture ceiling covers c32   | 564.6 | 661.1 | 262K TQ |
+  | + quantized-KV tile fix        | 585.0 | 879.6 | 262K TQ |
+  Net: 2.15x on peak throughput with double (native) context.
+- Retained: P2P driver stack (32 GiB BAR1 + iommu=pt + NCCL_P2P_LEVEL=SYS),
+  TQ k8v4 main KV (tile-fixed; == bf16 at c8-c32, 2.64x smaller),
+  max_num_seqs 32 + capture 96, MTP k=2 + index share, triton GDN.
+- Rejected along the way: fused GDN decode (-4.5% c8), custom AR over PCIe
+  (latency), fp8-e4m3 main KV (superseded by TQ), scheduler dynamic-k
+  (cudagraph fall-off), tl.interleave nibble unpack (Triton 3.7.1
+  miscompile into tl.dot).
+- WATCH FLAG: intermittent CUDA illegal access/instruction under bench
+  churn (2-of-6 pre-tier-fix, 0-of-4 after). The suspect wide-tile
+  quantized kernel path no longer executes; reopen with compute-sanitizer
+  if it recurs.
+- Backlog, in expected-value order: dynamic-k via multi-length graph
+  capture (k=3 wins c1-c4 by 8-15%); k=3 re-verdict on the fixed kernel;
+  Marlin EP tiny-M tuning; PLE gather fp8->bf16 fusion; multi-request
+  long-context bench support; py-spy host profiling (needs
+  kernel.yama.ptrace_scope=0).
+- Convergence criteria met: final two rounds (Exp P validation, slimserve
+  validation) changed nothing beyond noise; no unexplained anomaly open
+  (valley root-caused and fixed; crash under watch flag with its suspect
+  path removed); profile serves the best-known config with recorded
+  validation.

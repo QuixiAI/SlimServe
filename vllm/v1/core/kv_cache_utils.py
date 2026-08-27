@@ -1660,7 +1660,10 @@ def _classify_csa_linear_specs(
     roles = _CSALinearRoles(main_kv={}, compressed={}, compressor_state={}, mamba={})
     unsupported = []
     for name, spec in kv_cache_spec.items():
-        if type(spec) is FullAttentionSpec:
+        # Exact types: MLA and circular-buffer subclasses carry different
+        # roles. TQFullAttentionSpec is a packed-layout FullAttentionSpec
+        # (Qwen4Exp TQ main KV) and owns the same main-KV role.
+        if type(spec) in (FullAttentionSpec, TQFullAttentionSpec):
             roles.main_kv[name] = spec
         elif type(spec) is MLAAttentionSpec and spec.compress_ratio > 1:
             roles.compressed[name] = spec
@@ -1920,7 +1923,7 @@ def _get_csa_linear_tensor_layout(
         member = next(iter(spec.kv_cache_specs.values()))
         if type(member) is CircularBufferSpec:
             compressor_state = spec.kv_cache_specs
-        elif type(member) is FullAttentionSpec:
+        elif type(member) in (FullAttentionSpec, TQFullAttentionSpec):
             compressed_sparse = spec.kv_cache_specs
         else:
             return None
@@ -1930,7 +1933,7 @@ def _get_csa_linear_tensor_layout(
     main_kv_names = [
         name
         for name, spec in compressed_sparse.items()
-        if type(spec) is FullAttentionSpec
+        if type(spec) in (FullAttentionSpec, TQFullAttentionSpec)
     ]
     compressed_names = [
         name
