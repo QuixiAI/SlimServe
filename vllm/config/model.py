@@ -1773,7 +1773,9 @@ class ModelConfig:
         """
 
         head_dtype = _get_head_dtype(
-            config=self.hf_config, dtype=self.dtype, runner_type=self.runner_type
+            config=self.hf_config,
+            dtype=self.dtype,  # type: ignore[arg-type]
+            runner_type=self.runner_type,
         )
 
         if head_dtype not in current_platform.supported_dtypes:
@@ -1783,7 +1785,7 @@ class ModelConfig:
                 head_dtype,
                 self.dtype,
             )
-            return self.dtype
+            return self.dtype  # type: ignore[return-value]
 
         logger.debug_once("head dtype: %s", head_dtype)
         return head_dtype

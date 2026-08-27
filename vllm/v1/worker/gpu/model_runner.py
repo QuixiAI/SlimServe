@@ -117,6 +117,10 @@ from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.thinking_budget import (
+    ThinkingBudgetState,
+    reasoning_markers_are_single_token,
+)
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -262,6 +266,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
+        self.thinking_budget_state: ThinkingBudgetState | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -375,6 +380,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
+            # Hard thinking-token budget enforcement (single-token reasoning
+            # markers only); rides the grammar-bitmask logits seam, so it is
+            # async-safe and spec-decode-correct. See thinking_budget.py.
+            reasoning_config = self.vllm_config.reasoning_config
+            if reasoning_markers_are_single_token(reasoning_config):
+                self.thinking_budget_state = ThinkingBudgetState(
+                    self.max_num_reqs, self.device, reasoning_config
+                )
+            else:
+                self.thinking_budget_state = None
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
@@ -891,6 +906,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.add_request(
                     req_index, prompt_len, new_req_data.sampling_params
                 )
+                if self.thinking_budget_state is not None:
+                    self.thinking_budget_state.add_request(
+                        req_index,
+                        new_req_data.prompt_token_ids,
+                        new_req_data.sampling_params,
+                    )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
@@ -907,6 +928,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # the async pipeline.
             if self.sampler is not None:
                 self.sampler.apply_staged_writes()
+                if self.thinking_budget_state is not None:
+                    self.thinking_budget_state.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -1282,6 +1305,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
+        if self.thinking_budget_state is not None:
+            # Same seam as the grammar bitmask: forcing the reasoning-end
+            # token on exhausted rows works for both the plain sampler and
+            # the rejection sampler (a masked verify row rejects any draft
+            # token that disagrees).
+            self.thinking_budget_state.apply_mask(logits, input_batch)
+
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
@@ -1294,6 +1324,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
+            )
+
+        if self.thinking_budget_state is not None:
+            assert sampler_output.num_sampled is not None
+            self.thinking_budget_state.update_state(
+                input_batch,
+                sampler_output.sampled_token_ids,
+                sampler_output.num_sampled,
             )
 
         return (

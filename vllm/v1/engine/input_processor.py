@@ -119,11 +119,21 @@ class InputProcessor:
                         "and/or --reasoning-config to use thinking_token_budget."
                     )
                 if self.use_v2_model_runner:
-                    raise ValueError(
-                        "thinking_token_budget is not yet supported by the V2 "
-                        "model runner. Run vLLM with VLLM_USE_V2_MODEL_RUNNER=0 "
-                        "to use thinking_token_budget."
+                    from vllm.v1.worker.gpu.sample.thinking_budget import (
+                        reasoning_markers_are_single_token,
                     )
+
+                    if not reasoning_markers_are_single_token(
+                        self.vllm_config.reasoning_config
+                    ):
+                        raise ValueError(
+                            "thinking_token_budget on the V2 model runner "
+                            "requires single-token reasoning markers; this "
+                            "model's reasoning start/end markers tokenize to "
+                            "multiple tokens. Run vLLM with "
+                            "VLLM_USE_V2_MODEL_RUNNER=0 to use "
+                            "thinking_token_budget with this model."
+                        )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS
@@ -384,7 +394,7 @@ class InputProcessor:
             mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=pooling_params,
-            arrival_time=arrival_time,
+            arrival_time=arrival_time,  # type: ignore[arg-type]
             lora_request=lora_request,
             cache_salt=decoder_inputs.get("cache_salt"),
             priority=priority,
