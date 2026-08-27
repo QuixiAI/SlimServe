@@ -16269,3 +16269,28 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   60-80-token caps is the known qwen3 thinking-mode budget behavior --
   re-verified: the same turn at 400 tokens finishes thinking and
   answers with finish=stop.
+
+## 2026-08-27 - Qwen3.8 chat defaults: reasoning_effort low + preserve_thinking pinned; multi-turn gate re-passed
+
+- User directives: default reasoning_effort to low on every Qwen3.8
+  profile, and pin preserve_thinking on. Template facts verified first:
+  the shipped chat template defaults reasoning_effort to XHIGH (the
+  source of hundreds of thinking tokens on trivial turns) and treats an
+  UNDEFINED preserve_thinking as true -- pinned explicitly so a template
+  update cannot silently flip it. Unknown kwargs are inert in jinja, so
+  applying to the Flash-Next profile is safe even though its template
+  lives on the 3090 box (kwarg support there unverified -- flagged).
+- Applied to all five qwen38* variants via
+  engine.default_chat_template_kwargs. A profile-level kwargs dict
+  replaces the registry _SERVING_DEFAULTS wholesale, so the thinking /
+  enable_thinking switches ride along (the registry test caught the
+  omission). Per-request values override everything.
+- The multi-turn gate harness was also corrected per user: intermediate
+  turns previously ran with 60-80-token caps that starved qwen3
+  thinking (empty content, finish=length). Every turn now gets a
+  1024-token budget and the gate FAILS on any turn with empty content
+  or finish != stop.
+- Gate re-run on the new defaults: 6 turns to 13.6k prompt tokens, all
+  turns complete with substantive content, both needles EXACT at depth
+  (731942 / 447.25 MHz). Raw: multiturn_chat.py + engine-lowreason.log
+  under perf/results/2026-08-27/nvfp4-baseline/.
