@@ -16313,3 +16313,47 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   this box" item from the merge tracking list.
 - Raw: perf/results/2026-08-27/nvfp4-baseline/ (tq_needle.py,
   multiturn_chat.py, engine/server logs per leg).
+
+## 2026-08-27 - V2 thinking-token budget enforcement (PR #13 extension): token-exact on the canonical profile
+
+- Motivation (user): Qwen3.8 thinks nearly endlessly even at low
+  reasoning effort -- live-demonstrated on the canonical profile: an
+  unbudgeted xhigh request spent ALL 1500 completion tokens inside
+  <think> and produced zero content. A hard cap is basic functionality.
+- PR #13's enforcement lives in the V1 sampler (host-side state holder,
+  per-step output scans); the V2 runner -- which every SlimServe profile
+  runs -- rejected the parameter with a 400. The V1 design cannot port:
+  it needs host knowledge of step N's tokens when scheduling N+1, which
+  async scheduling forbids.
+- Implementation (vllm/v1/worker/gpu/sample/thinking_budget.py):
+  GPU-resident per-slot state (remaining budget, in-think flag, active
+  mirror), admission-staged like the other sampler states; enforcement
+  rides the SAME logits seam as the grammar bitmask, applied before the
+  sampler/rejection-sampler dispatch, so one mask serves both paths --
+  a masked verify row simply rejects any draft token that is not the
+  reasoning-end marker, and a draft that closes the block naturally
+  within budget is left for rejection sampling (no special case).
+  Per-request draft consumption is computed positionally with
+  host-known span geometry (cu_num_logits_np): no device syncs, no
+  boolean-mask indexing (masked_fill_ + where -- the MPS queue-drain
+  lessons applied). Scope: single-token reasoning markers (qwen3
+  family: <think>=248068, </think>=248069); multi-token markers keep a
+  per-request rejection with an explicit message.
+- Semantics match the V1 holder after PR #13's fixes: budgets count
+  generated in-think tokens only; markers uncharged; prompt-open blocks
+  start at zero consumed; budget-0 forces immediately.
+- Tests: 9 unit tests (prompt-open, budget-0, marker accounting, spec
+  span forcing at the violating row, natural close un-forced, rejected
+  drafts uncharged, slot reuse, mixed batches). First draft had a real
+  bug the spec test caught: per-row counters instead of per-request
+  cumulative consumption never triggered mid-span forcing.
+- Live gate (canonical qwen38-nvfp4-1, V2 + DFlash2 + throttle, seeded):
+  budget 64 -> exactly 64 reasoning tokens then a complete proof
+  (finish=stop); budget 16 -> exactly 16; no budget -> the pathological
+  all-thinking completion above. Suites: 167 passed / 105 skipped;
+  mypy clean across all touched files (incl. PR #13's pre-existing
+  debt).
+- Open from the PR review, left for the author or follow-up: map
+  validation still occurs per request (the PR text claims config time),
+  and template-level default reasoning_effort (our profiles' low) does
+  not inform map level selection.
