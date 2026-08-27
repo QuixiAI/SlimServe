@@ -249,6 +249,7 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self._dynamic_prev_spec_tokens: int = self.num_spec_tokens
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -816,6 +817,7 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+                pad_spec_width = 1 + self.num_spec_tokens
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.
@@ -836,12 +838,21 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        self.num_spec_tokens > 0
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and (scheduled_running_reqs and not prefill_scheduled)
                     ):
-                        num_new_tokens = 1 + self.num_spec_tokens
+                        # With a dynamic schedule, running decode requests
+                        # carry the k drafted LAST step; pad the newcomer to
+                        # match that uniform width, not the configured max.
+                        pad_spec = (
+                            self.num_spec_tokens
+                            if self.dynamic_sd_lookup is None
+                            else self._dynamic_prev_spec_tokens
+                        )
+                        num_new_tokens = 1 + pad_spec
+                        pad_spec_width = num_new_tokens
                         if (
                             num_new_tokens > token_budget
                             or num_computed_tokens + num_new_tokens > self.max_model_len
@@ -895,7 +906,7 @@ class Scheduler(SchedulerInterface):
                     )
                     if num_new_tokens == 0:
                         break
-                    if pad_spec_decode and num_new_tokens != 1 + self.num_spec_tokens:
+                    if pad_spec_decode and num_new_tokens != pad_spec_width:
                         # Alignment clipped the placeholder rows. The split
                         # aligns prefill chunks, but the padded tail rows are
                         # speculative positions, not prefill tokens. A padded
@@ -1037,10 +1048,10 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
-                    assert num_new_tokens == 1 + self.num_spec_tokens
+                    assert num_new_tokens == pad_spec_width
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * (pad_spec_width - 1)
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1143,6 +1154,9 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            # Remembered for next step's new-decode-request padding: the
+            # drafts produced under this step's k are what get verified then.
+            self._dynamic_prev_spec_tokens = num_spec_tokens_to_schedule
 
         scheduled_encoder_input_stats = None
         if (

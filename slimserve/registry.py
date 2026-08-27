@@ -104,6 +104,7 @@ class Quant:
     files: list[dict[str, Any]]
     min_gpus: dict[str, int]
     min_memory_bytes: dict[str, int]
+    min_host_ram_bytes: dict[str, int]
     assembly: dict[str, Any] | None
 
     def requirement(self, platform: str) -> int | None:
@@ -112,12 +113,26 @@ class Quant:
             return self.min_memory_bytes.get(platform)
         return self.min_gpus.get(platform)
 
-    def allowed_on(self, platform: str, gpus: int, memory_bytes: int = 0) -> bool:
+    def allowed_on(
+        self,
+        platform: str,
+        gpus: int,
+        memory_bytes: int = 0,
+        host_ram_bytes: int = 0,
+    ) -> bool:
         minimum = self.requirement(platform)
         if minimum is None:
             return False
         have = memory_bytes if platform_gate(platform) == "memory" else gpus
-        return have >= minimum
+        if have < minimum:
+            return False
+        # Host-offload profiles (e.g. a pinned PLE table per rank) need
+        # system RAM the GPU gate cannot see. Only enforced when the caller
+        # provides a detected figure; 0 means unknown, not zero RAM.
+        ram_minimum = self.min_host_ram_bytes.get(platform)
+        if ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum:
+            return False
+        return True
 
 
 @dataclass(frozen=True)
@@ -177,6 +192,7 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         files=raw["files"],
         min_gpus=raw["min_gpus"],
         min_memory_bytes=raw.get("min_memory_bytes") or {},
+        min_host_ram_bytes=raw.get("min_host_ram_bytes") or {},
         assembly=raw.get("assembly"),
     )
 
@@ -210,7 +226,12 @@ def variant(profile_id: str, platform: str) -> dict[str, Any]:
     return record
 
 
-def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Quant]:
+def quants_for(
+    profile_id: str,
+    platform: str,
+    memory_bytes: int = 0,
+    host_ram_bytes: int = 0,
+) -> list[Quant]:
     """Every quant this profile can legally serve on this platform."""
     profile = describe(profile_id)
     source = _registry()["sources"][profile["source"]]
@@ -218,7 +239,7 @@ def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Qu
     return [
         quant
         for quant in (_quant(source, name) for name in source["quants"])
-        if quant.allowed_on(platform, gpus, memory_bytes)
+        if quant.allowed_on(platform, gpus, memory_bytes, host_ram_bytes)
     ]
 
 
@@ -253,6 +274,7 @@ def resolve(
     gpus: int,
     quant: str | None,
     memory_bytes: int = 0,
+    host_ram_bytes: int = 0,
 ) -> Plan:
     """Turn a request into a Plan, or explain why it is not legal.
 
@@ -282,6 +304,13 @@ def resolve(
             f"available: {', '.join(source['quants'])}"
         )
     chosen = _quant(source, name)
+    ram_minimum = chosen.min_host_ram_bytes.get(platform)
+    if ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum:
+        raise ProfileError(
+            f"{chosen.title} pins host-offloaded tables in system RAM and "
+            f"needs at least {human_bytes(ram_minimum)}; this machine has "
+            f"{human_bytes(host_ram_bytes)}"
+        )
     if not chosen.allowed_on(platform, needed, memory_bytes):
         minimum = chosen.requirement(platform)
         if minimum is None:

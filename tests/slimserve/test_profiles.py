@@ -784,3 +784,72 @@ def test_no_profile_carries_another_platforms_environment():
                     assert not any(tok in key for tok in tokens), (
                         f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
                     )
+
+
+def test_full_decode_graphs_cover_the_largest_speculative_batch():
+    """capture >= (k+1) * max_num_seqs, or the biggest batches run eager.
+
+    Measured on 8x3090: c32 at 425 tok/s with a 64-token capture ceiling vs
+    880 with the ceiling covering seqs x (1+k) -- and the failure is silent.
+    A note is not a guard; this is.
+    """
+    raw = registry._registry()
+    for profile_id, profile in raw["profiles"].items():
+        if not profile.get("speculative"):
+            continue
+        source = raw["sources"][profile["source"]]
+        base_k = (source.get("speculator") or {}).get("engine", {}).get(
+            "num_speculative_tokens", 0
+        )
+        for platform, record in profile["variants"].items():
+            engine = record.get("engine", {})
+            compilation = engine.get("compilation_config") or {}
+            mode = str(compilation.get("cudagraph_mode", ""))
+            if "FULL" not in mode:
+                continue
+            overrides = record.get("speculative_overrides") or {}
+            k = overrides.get("num_speculative_tokens", base_k)
+            schedule = overrides.get("num_speculative_tokens_per_batch_size")
+            if schedule:
+                k = max(k, max(entry[2] for entry in schedule))
+            max_num_seqs = engine.get("max_num_seqs")
+            capture = compilation.get("max_cudagraph_capture_size")
+            if not (k and max_num_seqs and capture):
+                continue
+            needed = (k + 1) * max_num_seqs
+            assert capture >= needed, (
+                f"{profile_id}/{platform}: max_cudagraph_capture_size "
+                f"{capture} < ({k}+1) x max_num_seqs {max_num_seqs} = "
+                f"{needed}; the largest decode batches would silently run "
+                "eager"
+            )
+
+
+def test_host_offload_profiles_declare_a_host_ram_gate():
+    """PLE-host pins ~48 GiB of system RAM per rank; the GPU gate can't see
+    that. Any variant that turns on host offload must carry a
+    min_host_ram_bytes entry for its platform, sized at least to the pinned
+    tables across the tensor-parallel ranks."""
+    raw = registry._registry()
+    # One shared /dev/shm segment across TP ranks (see
+    # Qwen4ExpHostNGramEmbedding._shared_pinned_table): the floor is one
+    # table, not one per rank.
+    ple_table_bytes = 47_700_000_000  # 47.7 GiB, model-defined
+    for profile_id, profile in raw["profiles"].items():
+        source = raw["sources"][profile["source"]]
+        for platform, record in profile["variants"].items():
+            env = record.get("env") or {}
+            if env.get("VLLM_QWEN4_EXP_PLE_HOST") != "1":
+                continue
+            floor = ple_table_bytes
+            gated = [
+                quant
+                for quant in source["quants"].values()
+                if (quant.get("min_host_ram_bytes") or {}).get(platform, 0)
+                >= floor
+            ]
+            assert gated, (
+                f"{profile_id}/{platform} enables PLE host offload "
+                f"(~{floor / 2**30:.0f} GiB pinned, shared across ranks) "
+                "but no quant declares a min_host_ram_bytes gate covering it"
+            )

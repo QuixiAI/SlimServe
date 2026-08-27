@@ -491,3 +491,51 @@ def test_qwen4_exp_ple_builder_receives_spec_decode_metadata() -> None:
     torch.testing.assert_close(
         kwargs["num_decode_draft_tokens_cpu"], num_decode_draft_tokens_cpu
     )
+
+
+def test_draft_model_view_does_not_mutate_shared_subconfigs():
+    """dataclasses.replace(vllm_config, model_config=draft_model_config)
+    re-runs __post_init__ on a view whose sub-configs are the SAME objects
+    as the serving config's. The view's runner_type is "draft", so runner
+    predicates misclassify it; before the _is_draft_model_view guards, one
+    such view downgraded the whole worker's cudagraph_mode to PIECEWISE
+    and another path would have wiped the shared dynamic-SD schedule."""
+    from dataclasses import replace
+
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.engine.arg_utils import EngineArgs
+
+    model = "/home/quixi/models/Qwen3.8-Flash-Next-FP8"
+    args = EngineArgs(
+        model=model,
+        tensor_parallel_size=8,
+        enable_expert_parallel=True,
+        max_model_len=131072,
+        max_num_seqs=32,
+        compilation_config={
+            "cudagraph_mode": "FULL_DECODE_ONLY",
+            "max_cudagraph_capture_size": 128,
+        },
+        speculative_config={
+            "model": model,
+            "method": "mtp",
+            "num_speculative_tokens": 3,
+            "index_share_for_mtp_iteration": True,
+            "num_speculative_tokens_per_batch_size": [[1, 4, 3], [5, 32, 2]],
+        },
+    )
+    cfg = args.create_engine_config()
+    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    schedule = cfg.speculative_config.num_speculative_tokens_per_batch_size
+    assert schedule is not None
+
+    draft_view = replace(
+        cfg, model_config=cfg.speculative_config.draft_model_config
+    )
+    assert draft_view._is_draft_model_view()
+    assert not cfg._is_draft_model_view()
+    # The shared sub-configs must be untouched by the view's __post_init__.
+    assert cfg.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+    assert (
+        cfg.speculative_config.num_speculative_tokens_per_batch_size == schedule
+    )
