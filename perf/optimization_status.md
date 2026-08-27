@@ -15912,3 +15912,45 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   This box is substantially faster at every point on the merged tree.
 - Raw: perf/results/2026-08-27/nvfp4-baseline/ (per-run JSON, server +
   engine logs).
+
+## 2026-08-27 - DFlash2 acceptance "collapse" on M5 Max: ROOT-CAUSED as workload content + trajectory lottery; drafter, merge, muse, box ALL exonerated
+
+- Presenting symptom: the M5 Max baseline (sonnet.txt, offset 0) showed
+  mean acceptance 1.47 (per-position 33%/10%/2%) vs the M1 Ultra
+  campaign's ~2.9-3.0 of 3 -- and spec looked barely net-positive.
+- Hypothesis chain, each killed by measurement (all runs c1 1000/256,
+  seeded shipped defaults unless noted; raw in
+  perf/results/2026-08-27/nvfp4-baseline/):
+  1. Sampling-vs-greedy discount: KILLED. Greedy diagnostic run gave
+     byte-identical acceptance counters (81/522/174).
+  2. Muse aux-tap corruption: KILLED. muse-off (-df2) 1.56 vs 1.47.
+  3. Box or merge: sonnets on the PRE-merge build also 1.53. Then essay
+     prose on pre-merge gave 3.94 -- workload identified as factor one.
+  4. Apparent merge regression on prose (3.94 pre vs 2.55-2.68 merged):
+     bisected with seven legs -- metal_attn.py, the GDN cluster, the
+     runner/spec cluster, scheduler.py, the KV-manager cluster, then
+     the halving pair (pre binaries x merged python and merged binaries
+     x pre python BOTH 2.55; only pre x pre 3.94). No component or half
+     explains it -- the signature of the TRAJECTORY LOTTERY this PR's
+     own DSV4 protocol documents (draws 2.63-4.61 on retained
+     trajectories).
+  5. Lottery CONFIRMED: prompt-offset draws on the merged build --
+     leg-G build offs {500,1200,2000,3000} = 4.00/4.00/3.23/4.00;
+     canonical (muse ON) offs {0,500,1200,2000,3000} =
+     1.93/4.00/4.00/3.32/2.44, mean 3.14, mean 39.6 tok/s (peak 48.5).
+     Offset 0 is simply a bad draw; every build draws ~4.0 elsewhere.
+- Verdict: the drafter is HEALTHY on this box and the merged tree --
+  acceptance regularly saturates the k=3 ceiling (4.00) on prose. The
+  real, standing findings:
+  - sonnet.txt is a drafting-hostile source (~1.5 acceptance by
+    content); the published sonnet-offset-0 baseline pins are
+    worst-case-content pins and remain valid AS pins, but acceptance
+    conclusions must never be drawn from them.
+  - Acceptance comparisons require the PR's own protocol: MEAN ACROSS
+    PROMPT OFFSETS, never a single draw. Both my "collapse" and the
+    apparent muse/merge deltas were single-draw artifacts.
+  - The batch-1 256 crossover finding stands (+23% no-spec c1, a
+    per-step-time effect insensitive to trajectory): kernel route wins
+    at batch 1 on M5 Max, VLLM_QC_PA256_MIN_CTX_B1=0 selects it.
+- Canonical M5 Max essay-prose reference (merged tree): c1 mean 39.6
+  tok/s over 5 offsets, acceptance mean 3.14. Sonnet pins unchanged.
