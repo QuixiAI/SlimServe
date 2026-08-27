@@ -4555,7 +4555,8 @@ void launch_paged_attention_partition(
     typename E::out_t max_logits, typename E::out_t exp_sums, int batch,
     int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    int window, float softcap, const std::string& type_name) {
+    int window, float softcap, uint64_t kv_block_stride,
+    const std::string& type_name) {
   e.pipeline(paged_attention_partition_kernel_name(type_name, head_size));
   e.in(q, 0);
   e.in(key_cache, 1);
@@ -4574,6 +4575,7 @@ void launch_paged_attention_partition(
   e.bytes(partition_size, 14);
   e.bytes(window, 15);
   e.bytes(softcap, 16);
+  e.bytes(kv_block_stride, 17);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 
@@ -4588,7 +4590,7 @@ void launch_paged_attention_verify(
     typename E::out_t max_logits, typename E::out_t exp_sums, int m_rows,
     int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    int window, const std::string& type_name) {
+    int window, uint64_t kv_block_stride, const std::string& type_name) {
   e.pipeline("paged_attention_verify_" + type_name + "_" +
              std::to_string(head_size));
   e.in(q, 0);
@@ -4608,6 +4610,7 @@ void launch_paged_attention_verify(
   e.bytes(partition_size, 14);
   e.bytes(window, 15);
   e.bytes(m_rows, 16);
+  e.bytes(kv_block_stride, 17);
   e.dispatch(num_heads, 1, num_partitions, m_rows * 32, 1, 1);
 }
 
