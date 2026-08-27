@@ -38,18 +38,26 @@ def apply_env(plan: Plan) -> None:
 def _speculative_config(plan: Plan) -> dict[str, Any] | None:
     if not plan.speculative:
         return None
-    spec = plan.source.get("speculator")
+    spec = plan.speculator
     if not spec:
         return None
     from slimserve.registry import cache_root
 
     local = cache_root() / spec["local_dir"]
+    config: dict[str, Any] = {}
     if file := spec.get("file"):
         draft = str(local / file["path"])
+    elif local.is_dir():
+        draft = str(local)
     else:
-        draft = str(local) if local.is_dir() else spec["repo"]
+        # Loading straight from the hub: carry the pinned revision so the
+        # drafter cannot drift from the validated snapshot.
+        draft = spec["repo"]
+        if revision := spec.get("revision"):
+            config["revision"] = revision
     return {
         "model": draft,
+        **config,
         **spec["engine"],
         **plan.speculative_overrides,
     }

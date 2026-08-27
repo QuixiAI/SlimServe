@@ -13,11 +13,15 @@ from vllm.model_executor.layers.fusion.quant_activation import (
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    wrap_fp8_byteview_loader,
+)
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -45,9 +49,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
+        layer.logical_widths = output_partition_sizes  # type: ignore[assignment]
+        layer.input_size_per_partition = input_size_per_partition  # type: ignore[assignment]
+        layer.output_size_per_partition = output_size_per_partition  # type: ignore[assignment]
 
         # Weight
         weight = ModelWeightParameter(
@@ -69,16 +73,23 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         )
         layer.register_parameter("weight_global_scale", weight_global_scale)
 
-        # Per Group Weight Scale
+        # Per Group Weight Scale. Metal stores the E4M3 bytes as uint8 (no
+        # fp8 dtype on torch-MPS) and byte-views the incoming fp8 shards.
+        if current_platform.is_metal():
+            scale_dtype = torch.uint8
+            scale_loader = wrap_fp8_byteview_loader(weight_loader)
+        else:
+            scale_dtype = torch.float8_e4m3fn
+            scale_loader = weight_loader
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition // self.group_size,
-                dtype=torch.float8_e4m3fn,
+                dtype=scale_dtype,
             ),
             input_dim=1,
             output_dim=0,
-            weight_loader=weight_loader,
+            weight_loader=scale_loader,
         )
 
         layer.register_parameter("weight_scale", weight_scale)
@@ -108,13 +119,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             )
 
         # Process weight global scale (CT stores as divisors, i.e. 1/scale)
-        weight_global_scale = layer.weight_global_scale.max().to(torch.float32)
+        weight_global_scale = layer.weight_global_scale.max().to(  # type: ignore[operator]
+            torch.float32
+        )
         layer.weight_global_scale = Parameter(
             1.0 / weight_global_scale, requires_grad=False
         )
 
         if not self.use_a16:
-            if torch.unique(layer.input_global_scale).numel() != 1:
+            if torch.unique(layer.input_global_scale).numel() != 1:  # type: ignore[operator]
                 logger.warning_once(
                     "In NVFP4 linear, the input global scale is different"
                     " for parallel layers (e.g. q_proj, k_proj, v_proj). This "
@@ -123,7 +136,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                     " scale for fused layers."
                 )
             # Process input global scale and pre-compute alpha for W4A4 mode
-            input_global_scale_inv = layer.input_global_scale.max().to(torch.float32)
+            input_global_scale_inv = layer.input_global_scale.max().to(  # type: ignore[operator]
+                torch.float32
+            )
             layer.input_global_scale = Parameter(
                 (1.0 / input_global_scale_inv).to(torch.float32), requires_grad=False
             )

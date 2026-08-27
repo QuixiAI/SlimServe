@@ -154,7 +154,12 @@ def _runnable(profile_id: str, machine: hardware.Machine) -> tuple[bool, str]:
     if blocked:
         return False, blocked
     if registry.platform_gate(machine.platform) == "memory":
-        if not registry.quants_for(profile_id, machine.platform, machine.memory_bytes):
+        if not registry.quants_for(
+            profile_id,
+            machine.platform,
+            machine.memory_bytes,
+            machine.host_ram_bytes,
+        ):
             return False, (
                 f"no quant fits {term.human_bytes(machine.memory_bytes)} "
                 "of unified memory"
@@ -190,9 +195,14 @@ def _pick(machine: hardware.Machine) -> str | None:
     return _choose(choices, "profile")
 
 
-def _pick_quant(profile_id: str, platform: str, memory_bytes: int = 0) -> str | None:
+def _pick_quant(
+    profile_id: str,
+    platform: str,
+    memory_bytes: int = 0,
+    host_ram_bytes: int = 0,
+) -> str | None:
     """Ask which quant, showing what the choice costs and buys."""
-    quants = registry.quants_for(profile_id, platform, memory_bytes)
+    quants = registry.quants_for(profile_id, platform, memory_bytes, host_ram_bytes)
     if len(quants) <= 1:
         return quants[0].name if quants else None
 
@@ -316,7 +326,12 @@ def main(argv: list[str] | None = None) -> int:
 
     quant = args.quant
     if quant is None and interactive:
-        quant = _pick_quant(profile_id, machine.platform, machine.memory_bytes)
+        quant = _pick_quant(
+            profile_id,
+            machine.platform,
+            machine.memory_bytes,
+            machine.host_ram_bytes,
+        )
         if quant is None:
             return 1
 
@@ -327,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
             machine.count,
             quant,
             machine.memory_bytes,
+            machine.host_ram_bytes,
         )
     except ProfileError as error:
         term.fail(str(error))

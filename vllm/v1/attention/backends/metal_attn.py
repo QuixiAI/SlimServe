@@ -16,6 +16,7 @@ the ``(num_blocks, block_size, H_kv, D)`` tensor the paged kernel consumes, with
 no per-step repacking.
 """
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -41,17 +42,47 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Head sizes the fused paged decode kernel is instantiated for. Anything else
-# is correct on the SDPA path, just slower. The decode kernel walks the
-# cache's stride(0) explicitly, so the hybrid pool's blocks-first strided
-# K/V views (Qwen3.8, head_dim 256) are addressed correctly — but D=256
-# stays OFF this tuple: routed and measured 2026-08-25, trajectories
-# identical yet ~15% slower end-to-end. One simdgroup per (head, batch)
-# gives ~96 simdgroups at decode widths (GQA 24 heads, batch <= 4) — the
-# serial context walk under-occupies the GPU where the matmul SDPA path
-# parallelizes over context. Re-attempt via the partitioned
-# (paged_attention_partition + reduce) route, which splits the context
-# axis for occupancy.
-_PAGED_HEAD_SIZES = (64, 128)
+# is correct on the SDPA path, just slower. 256 (Qwen3.8 full attn) landed
+# with the N4 census fix VIA THE SPLIT-K partition/reduce pair — the
+# monolithic one-simdgroup-per-head walk under-occupies at decode widths
+# (routed and measured both here and on main; ~15% slower end-to-end).
+# VLLM_QC_PA256=0 drops back to the SDPA gather (null-check / kill switch —
+# the kernel's online softmax rounds differently than the torch-SDPA path,
+# so shas roll when it turns on).
+_PAGED_HEAD_SIZES: tuple[int, ...] = (64, 128)
+if os.environ.get("VLLM_QC_PA256", "1") != "0":
+    _PAGED_HEAD_SIZES = (64, 128, 256)
+
+# Pure-prefill batches read the (row-exact there) CPU bound in the causal
+# SDPA loop instead of materializing seq_lens via a queue-draining D2H.
+# =0 restores the unconditional exact-lens pull.
+_SDPA_PREFILL_BOUND = os.environ.get("VLLM_QC_SDPA_PREFILL_BOUND", "1") != "0"
+# One-dispatch paged KV insert (kv_cache_scatter kernel) instead of the
+# .to + index math + two advanced-indexing scatters per attention layer.
+# Pure copies, identical destinations. =0 restores the torch path.
+_KV_SCATTER = os.environ.get("VLLM_QC_KV_SCATTER", "1") != "0"
+_KV_SCATTER_SYMBOL: bool | None = None
+
+
+def _kv_scatter_symbol() -> bool:
+    global _KV_SCATTER_SYMBOL
+    if _KV_SCATTER_SYMBOL is None:
+        try:
+            import vllm._quixicore_C as qc
+
+            _KV_SCATTER_SYMBOL = hasattr(qc, "qc_kv_cache_scatter")
+        except ImportError:
+            _KV_SCATTER_SYMBOL = False
+    return _KV_SCATTER_SYMBOL
+
+
+# Uniform non-causal block decode (DFlash draft-block attention) routed to
+# the expanded paged kernel instead of the per-request SDPA python loop.
+# REJECTED as default (UPDATE 47): kernel-vs-SDPA numerics shift the
+# 16-way candidate/path selection enough to cost acceptance (c1 -7.7%,
+# 2500x64 -4.1% + trajectory fork), and the kernel is no faster at draft
+# shapes. Kept opt-in (=1) as a diagnostic.
+_DRAFT_BLOCK_PA = os.environ.get("VLLM_QC_DRAFT_BLOCK_PA", "0") == "1"
 
 
 class MetalAttentionBackend(AttentionBackend):
@@ -89,6 +120,23 @@ class MetalAttentionBackend(AttentionBackend):
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # Physical layout [num_blocks, 2, block_size, H, D]: block b's K and V
+        # both live inside physical page b. The hybrid KV manager shares one
+        # raw tensor between attention and mamba layers under exactly that
+        # page-identity contract; the previous (default) K-first physical
+        # layout spread block b over half-pages b/2 and N/2+b/2, so a mamba
+        # state write to its own (validly allocated) page s silently
+        # overwrote attention K blocks 2s/2s+1.
+        #
+        # The layered variant is intentionally NOT provided (same tuple is
+        # returned), which keeps indexes_kv_by_block_stride() False and the
+        # packed/padded-page machinery unchanged.
+        return (1, 0, 2, 3, 4)
+
+    @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(16)]
 
@@ -113,12 +161,36 @@ class MetalAttentionMetadata:
     # CPU copies, used to slice the batch per request without a device sync
     # inside the loop.
     query_start_loc_cpu: torch.Tensor
-    seq_lens_cpu: torch.Tensor
     # Device-side, for the cache write and the fused decode.
     block_table: torch.Tensor
     seq_lens_gpu: torch.Tensor
     slot_mapping: torch.Tensor
+    # Host-side bound on the batch's longest context (>= exact), for kernel
+    # routing and split-K sizing without a device sync.
+    seq_lens_cpu_max: int = 0
+    # Per-request CPU upper bound on seq_lens (>= exact; precise for prefill
+    # rows and outside async spec decode). None when unavailable.
+    seq_lens_cpu_bound: torch.Tensor | None = None
     causal: bool = True
+    # True when every batch row is mid-prefill: the CPU bound then equals the
+    # exact lens row-for-row (the async-scheduling mirror only diverges on
+    # spec-decode rows), so the causal SDPA loop can read the bound instead
+    # of forcing the queue-draining D2H materialization below.
+    bound_exact: bool = False
+    # Exact host seq_lens, materialized LAZILY: the D2H copy blocks on every
+    # queued GPU op, so the paged decode paths and the bound-mode draft SDPA
+    # must never touch it. Only the exact (causal/prefill) SDPA loop does.
+    _seq_lens_cpu: torch.Tensor | None = None
+
+    @property
+    def seq_lens_cpu(self) -> torch.Tensor:
+        # Memo is safe only because this builder has NO steady_decode_update:
+        # the steady-reuse path in attn_utils rebuilds this metadata object
+        # every step. If in-place steady refresh is ever added here, this
+        # memo must be invalidated by it or it will freeze step-1 lens.
+        if self._seq_lens_cpu is None:
+            self._seq_lens_cpu = self.seq_lens_gpu.to("cpu")
+        return self._seq_lens_cpu
 
 
 class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetadata]):
@@ -152,22 +224,40 @@ class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetad
     ) -> MetalAttentionMetadata:
         m = common_attn_metadata
         causal = m.causal if isinstance(m.causal, bool) else True
-        if self._exact_cpu_seq_lens and m.seq_lens_cpu_upper_bound is not None:
-            seq_lens_cpu = m.seq_lens_cpu_upper_bound[: m.num_reqs].to(
-                dtype=torch.int32
-            )
+        # Sync-free host bound when the caller provides one: the eager
+        # `seq_lens.to("cpu")` blocks on the whole in-flight GPU queue (60
+        # ms/step at the draft build under async scheduling). Exact host lens
+        # are materialized lazily by the exact SDPA loop only.
+        bound = m.seq_lens_cpu_upper_bound
+        exact = None
+        if bound is not None and bound.numel() > 0:
+            bound = bound.to(dtype=torch.int32)
+            seq_lens_cpu_max = int(bound.max())
         else:
-            seq_lens_cpu = m.seq_lens.to("cpu", dtype=torch.int32)
+            exact = m.seq_lens.to("cpu", dtype=torch.int32)
+            seq_lens_cpu_max = int(exact.max()) if exact.numel() else 0
+        bound_exact = False
+        if _SDPA_PREFILL_BOUND and causal and bound is not None:
+            isp = m.is_prefilling
+            bound_exact = (
+                isp is not None
+                and isp.device.type == "cpu"
+                and isp.numel() >= m.num_reqs
+                and bool(isp[: m.num_reqs].all())
+            )
         return MetalAttentionMetadata(
             num_actual_tokens=m.num_actual_tokens,
             num_reqs=m.num_reqs,
             max_query_len=m.max_query_len,
             query_start_loc_cpu=m.query_start_loc_cpu.to(dtype=torch.int32),
-            seq_lens_cpu=seq_lens_cpu,
             block_table=m.block_table_tensor.to(torch.int32),
             seq_lens_gpu=m.seq_lens.to(torch.int32),
             slot_mapping=m.slot_mapping,
+            seq_lens_cpu_max=seq_lens_cpu_max,
+            seq_lens_cpu_bound=bound,
             causal=causal,
+            bound_exact=bound_exact,
+            _seq_lens_cpu=exact,
         )
 
 
@@ -210,6 +300,22 @@ class MetalAttentionImpl(AttentionImpl):
                 f"Metal attention is decoder-only, got {attn_type}."
             )
 
+    # D=256 batch-1 crossover (measured, UPDATE 20): the split-K kernel's
+    # per-call encoder/scheduling latency loses to the in-stream SDPA path
+    # at short context (c1 1000x256: 10.02 vs 10.74 tok/s) and reaches
+    # parity around ctx 2500 (2.93 vs 2.91); batch >= 2 amortizes the fixed
+    # cost and the kernel wins big (c4 +10%, c8 +17%). Route batch-1 short
+    # context to SDPA, everything else to the kernel.
+    _PA256_MIN_CTX_BATCH1 = int(os.environ.get("VLLM_QC_PA256_MIN_CTX_B1", "2048"))
+
+    def _pa256_route_ok(self, metadata: MetalAttentionMetadata) -> bool:
+        if self.head_size != 256:
+            return True
+        return (
+            metadata.num_reqs >= 2
+            or metadata.seq_lens_cpu_max >= self._PA256_MIN_CTX_BATCH1
+        )
+
     def _fused_decode_applies(
         self, metadata: MetalAttentionMetadata, num_tokens: int
     ) -> bool:
@@ -217,6 +323,7 @@ class MetalAttentionImpl(AttentionImpl):
             metadata.max_query_len == 1
             and num_tokens == metadata.num_reqs
             and self.head_size in _PAGED_HEAD_SIZES
+            and self._pa256_route_ok(metadata)
         )
 
     # Largest uniform query length routed through the fused kernel by batch
@@ -244,7 +351,52 @@ class MetalAttentionImpl(AttentionImpl):
         import os
 
         ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
-        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
+        return metadata.seq_lens_cpu_max <= ctx_max
+
+    def _expanded_block_decode_applies(
+        self, metadata: MetalAttentionMetadata, num_tokens: int
+    ) -> bool:
+        """Non-causal twin: DFlash draft-block attention. Every query token
+        of a request sees the same key range, so the expansion uses a flat
+        seq_len per pseudo-request (no causal step offsets)."""
+        q_len = metadata.max_query_len
+        return (
+            _DRAFT_BLOCK_PA
+            and not metadata.causal
+            and 1 < q_len <= self._EXPAND_MAX_QUERY_LEN
+            and num_tokens == metadata.num_reqs * q_len
+            and self.head_size in _PAGED_HEAD_SIZES
+        )
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Out-of-forward K/V insert (DFlash context precompute). Same
+        per-token advanced-indexing write as forward(); PAD_SLOT_ID rows are
+        clamped onto block 0, the null block, whose contents are never read
+        (no host sync on a data-dependent mask)."""
+        if self.kv_sharing_target_layer_name is not None:
+            return
+        _, num_blocks, block_size, _, _ = kv_cache.shape
+        slot = slot_mapping.to(torch.long).clamp_min(0)
+        block_idx = slot // block_size
+        block_off = slot % block_size
+        num_tokens = slot.shape[0]
+        dense = kv_cache.transpose(0, 1)
+        if dense.is_contiguous():
+            dense_kv = dense.reshape(
+                2 * num_blocks, block_size, self.num_kv_heads, self.head_size
+            )
+            dense_kv[block_idx * 2, block_off] = key[:num_tokens]
+            dense_kv[block_idx * 2 + 1, block_off] = value[:num_tokens]
+        else:
+            kv_cache[0][block_idx, block_off] = key[:num_tokens]
+            kv_cache[1][block_idx, block_off] = value[:num_tokens]
 
     def forward(
         self,
@@ -272,19 +424,88 @@ class MetalAttentionImpl(AttentionImpl):
         key_cache = kv_cache[0]
         value_cache = kv_cache[1]
 
+        # Page-local physical layout [num_blocks, 2, block_size, H, D]
+        # (get_kv_cache_stride_order): block b's K and V are dense blocks 2b
+        # and 2b+1 of the raw region. Every hot-path read and write goes
+        # through this contiguous dense view with transformed block indices —
+        # advanced indexing over the strided per-K/V views falls off the MPS
+        # fast path — and the fused kernel gets it with a doubled block table
+        # and a one-block-shifted alias for V. No repacking, all views.
+        dense = kv_cache.transpose(0, 1)
+        page_local = dense.is_contiguous()
+        dense_kv = (
+            dense.reshape(2 * num_blocks, block_size, self.num_kv_heads, head_size)
+            if page_local
+            else None
+        )
+
         # Write the new K/V into the persistent paged cache.
         #
         # Per-token advanced indexing, deliberately: index_copy_ over the
         # flattened multi-million-row view is O(cache) on MPS and stalls,
         # while this is O(num_tokens).
         if self.kv_sharing_target_layer_name is None:
-            slot = attn_metadata.slot_mapping[:num_tokens].to(torch.long)
-            block_idx = slot // block_size
-            block_off = slot % block_size
-            key_cache[block_idx, block_off] = key[:num_tokens]
-            value_cache[block_idx, block_off] = value[:num_tokens]
+            k_src = key[:num_tokens]
+            v_src = value[:num_tokens]
+            scattered = False
+            if _KV_SCATTER and k_src.is_contiguous() and v_src.is_contiguous():
+                from vllm.quixicore import quixicore_ops
+
+                if quixicore_ops.is_available() and _kv_scatter_symbol():
+                    # One dispatch replaces the .to + index math + two
+                    # advanced-indexing scatters. Pure copies, identical
+                    # destination rows (slot<0 never occurs on this path).
+                    slot = attn_metadata.slot_mapping[:num_tokens]
+                    if slot.dtype != torch.long:
+                        slot = slot.to(torch.long)
+                    slot = slot.contiguous()
+                    if dense_kv is not None:
+                        quixicore_ops.qc_kv_cache_scatter(
+                            k_src,
+                            v_src,
+                            slot,
+                            dense_kv,
+                            dense_kv[1:],
+                            self.num_kv_heads,
+                            head_size,
+                            block_size,
+                            2,
+                        )
+                    else:
+                        quixicore_ops.qc_kv_cache_scatter(
+                            k_src,
+                            v_src,
+                            slot,
+                            key_cache,
+                            value_cache,
+                            self.num_kv_heads,
+                            head_size,
+                            block_size,
+                            1,
+                        )
+                    scattered = True
+            if not scattered:
+                slot = attn_metadata.slot_mapping[:num_tokens].to(torch.long)
+                block_idx = slot // block_size
+                block_off = slot % block_size
+                if dense_kv is not None:
+                    dense_kv[block_idx * 2, block_off] = key[:num_tokens]
+                    dense_kv[block_idx * 2 + 1, block_off] = value[:num_tokens]
+                else:
+                    key_cache[block_idx, block_off] = key[:num_tokens]
+                    value_cache[block_idx, block_off] = value[:num_tokens]
 
         out = output.view(num_tokens, num_heads, head_size)
+
+        if page_local:
+            assert dense_kv is not None
+            kc_kernel = dense_kv
+            vc_kernel = dense_kv[1:]
+            kernel_block_table = attn_metadata.block_table * 2
+        else:
+            kc_kernel = key_cache
+            vc_kernel = value_cache
+            kernel_block_table = attn_metadata.block_table
 
         if self._fused_decode_applies(attn_metadata, num_tokens):
             from vllm.quixicore import quixicore_ops
@@ -293,12 +514,15 @@ class MetalAttentionImpl(AttentionImpl):
                 out.copy_(
                     quixicore_ops.paged_attention(
                         query[:num_tokens].contiguous(),
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table,
+                        kc_kernel,
+                        vc_kernel,
+                        kernel_block_table,
                         attn_metadata.seq_lens_gpu,
                         self.scale,
                         self.sliding_window or 0,
+                        # host-side batch bound, sizes the D=256 split-K
+                        # partitions without a device sync
+                        attn_metadata.seq_lens_cpu_max,
                     )
                 )
                 return output
@@ -322,56 +546,107 @@ class MetalAttentionImpl(AttentionImpl):
                 expanded_seq_lens = (
                     seq_lens.unsqueeze(1) + steps.unsqueeze(0)
                 ).flatten()
-                expanded_block_table = attn_metadata.block_table.repeat_interleave(
+                expanded_block_table = kernel_block_table.repeat_interleave(
                     q_len, dim=0
                 )
                 # Global (unwindowed) layers at length: the multi-query
                 # kernel shares each K/V read across the m rows (measured
                 # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
                 # expansion path (scan capped by the window -- a wash).
+                # Host-side lengths for the gate and partition sizing: the
+                # device max would sync the pipeline once per layer.
+                ctx_max_host = attn_metadata.seq_lens_cpu_max
                 use_mq = (
                     self.sliding_window is None
                     and attn_metadata.num_reqs == 1
-                    # The verify kernel does not walk strided caches yet;
-                    # head_dim 256 implies the hybrid pool's strided views,
-                    # so it stays on the expansion path (which does).
-                    and self.head_size != 256
-                    and int(seq_lens.max().item()) > 1024
+                    and ctx_max_host > 1024
                 )
                 if use_mq:
                     if not getattr(self, "_mq_logged", False):
                         self._mq_logged = True
                         logger.info(
                             "multi-query verify attention engaged (ctx=%d)",
-                            int(seq_lens.max().item()),
+                            ctx_max_host,
                         )
+                    # Page-local caches: key_cache/value_cache are strided
+                    # views the verify kernel's contiguity contract rejects;
+                    # the kernel-facing pair (dense_kv and its offset view)
+                    # is contiguous under the doubled block table.
                     out.copy_(
                         quixicore_ops.paged_attention_verify(
                             query[:num_tokens].contiguous(),
-                            key_cache,
-                            value_cache,
-                            attn_metadata.block_table,
+                            kc_kernel,
+                            vc_kernel,
+                            kernel_block_table,
                             seq_lens,
                             self.scale,
                             0,
+                            ctx_max_host,
                         )
                     )
                     return output
                 out.copy_(
                     quixicore_ops.paged_attention(
                         query[:num_tokens].contiguous(),
-                        key_cache,
-                        value_cache,
+                        kc_kernel,
+                        vc_kernel,
                         expanded_block_table,
                         expanded_seq_lens,
                         self.scale,
                         self.sliding_window or 0,
+                        attn_metadata.seq_lens_cpu_max,
+                    )
+                )
+                return output
+
+        if self._expanded_block_decode_applies(attn_metadata, num_tokens):
+            from vllm.quixicore import quixicore_ops
+
+            if quixicore_ops.is_available():
+                # Uniform non-causal block decode (DFlash draft blocks):
+                # every query token of a request sees the same key range
+                # [kv_start, seq_len), so each pseudo-request carries the
+                # flat seq_len. The SDPA loop anchors the sliding window at
+                # the BLOCK START (kv_start = seq_len - q_len - W + 1) while
+                # the kernel clamps per pseudo-request to
+                # [context_len - window, context_len) — widening the window
+                # by q_len - 1 makes the ranges identical. One dispatch
+                # replaces the per-request SDPA gather loop; reads exact
+                # seq_lens_gpu, so it is also sync-free where the SDPA
+                # bound-mode needed the GPU validity mask.
+                q_len = attn_metadata.max_query_len
+                seq_lens = attn_metadata.seq_lens_gpu
+                # repeat_interleave with a scalar count: static output shape
+                # and a contiguous result (reshape of an expand view is not
+                # contiguous on MPS, and the host op requires it).
+                expanded_seq_lens = seq_lens.repeat_interleave(q_len)
+                expanded_block_table = kernel_block_table.repeat_interleave(
+                    q_len, dim=0
+                )
+                window = self.sliding_window + q_len - 1 if self.sliding_window else 0
+                out.copy_(
+                    quixicore_ops.paged_attention(
+                        query[:num_tokens].contiguous(),
+                        kc_kernel,
+                        vc_kernel,
+                        expanded_block_table,
+                        expanded_seq_lens,
+                        self.scale,
+                        window,
+                        attn_metadata.seq_lens_cpu_max,
                     )
                 )
                 return output
 
         self._sdpa_forward(
-            query, out, attn_metadata, key_cache, value_cache, num_blocks, block_size
+            query,
+            out,
+            attn_metadata,
+            key_cache,
+            value_cache,
+            num_blocks,
+            block_size,
+            dense_kv=dense_kv,
         )
         return output
 
@@ -384,10 +659,28 @@ class MetalAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         num_blocks: int,
         block_size: int,
+        dense_kv: torch.Tensor | None = None,
     ) -> None:
         """Per-request attention over keys gathered from the paged cache."""
         starts = metadata.query_start_loc_cpu
-        seq_lens = metadata.seq_lens_cpu
+        # Bound mode (sync-free, non-causal draft groups only): slice by the
+        # CPU upper bound and enforce the exact key range with a GPU mask
+        # built from seq_lens_gpu — the exact host lens would require a D2H
+        # that drains the whole in-flight queue. Causal groups (target
+        # prefill SDPA) keep the exact path: their bound rows are precise, and
+        # the loop below is byte-identical to the pre-bound-mode code there.
+        bound = metadata.seq_lens_cpu_bound
+        bound_mode = not metadata.causal and bound is not None
+        if bound is not None and bound_mode:
+            seq_lens = bound
+        elif bound is not None and metadata.bound_exact:
+            # Pure-prefill batch: the bound equals the exact lens row-for-row
+            # (see bound_exact), so skip the D2H that blocks on every queued
+            # prefill chunk (~hundreds of ms per prefill event). Geometry
+            # below stays on the exact path — only the lens source changes.
+            seq_lens = bound
+        else:
+            seq_lens = metadata.seq_lens_cpu
         num_kv_heads = self.num_kv_heads
         head_size = self.head_size
 
@@ -409,13 +702,16 @@ class MetalAttentionImpl(AttentionImpl):
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
             seq_len = min(seq_len, num_req_blocks * block_size)
 
-            if self.use_native_range_gather:
+            if self.use_native_range_gather and not bound_mode:
                 # MPS index_select uses signed 32-bit element offsets for this
                 # strided source. A hybrid cache page beyond 2^31 elements is
                 # therefore read from the wrong address. The native gather
                 # carries the physical block stride and all cache arithmetic
                 # in 64 bits; it also avoids materializing unused rows in the
-                # first/last page of a sliding-window request.
+                # first/last page of a sliding-window request. Bound mode
+                # keeps the block-window fallback below: its kv_start may
+                # exceed the exact window, which the fallback absorbs with
+                # the one-block backoff + GPU validity mask.
                 keys, values = quixicore_ops.kv_cache_gather_range(
                     key_cache,
                     value_cache,
@@ -425,26 +721,27 @@ class MetalAttentionImpl(AttentionImpl):
                 )
             else:
                 first_block = kv_start // block_size
+                if bound_mode and first_block > 0:
+                    # The bound may exceed the exact seq_len by up to the
+                    # draft length, which can push the window start past the
+                    # exact window's first block. Back off one block and
+                    # start at row 0 — the GPU validity mask enforces the
+                    # exact range.
+                    first_block -= 1
                 blocks = (
                     metadata.block_table[req, first_block:num_req_blocks]
                     .to(torch.long)
-                    # The profile run allocates a small dummy cache whose block
-                    # table can point past it. That output is discarded; a real
-                    # run never clamps.
+                    # The profile run allocates a small dummy cache whose
+                    # block table can point past it. That output is
+                    # discarded; a real run never clamps.
                     .clamp_(0, num_blocks - 1)
                 )
-                row_start = kv_start - first_block * block_size
+                row_start = 0 if bound_mode else kv_start - first_block * block_size
                 row_end = seq_len - first_block * block_size
-                page_elems = block_size * num_kv_heads * head_size
-                if key_cache.stride(0) == 2 * page_elems:
-                    pages_view = key_cache.as_strided(
-                        (num_blocks, 2, block_size, num_kv_heads, head_size),
-                        (2 * page_elems, page_elems, *key_cache.stride()[1:]),
-                        key_cache.storage_offset(),
-                    )
-                    pages = pages_view.index_select(0, blocks)
-                    keys = pages[:, 0]
-                    values = pages[:, 1]
+
+                if dense_kv is not None:
+                    keys = dense_kv.index_select(0, blocks * 2)
+                    values = dense_kv.index_select(0, blocks * 2 + 1)
                 else:
                     keys = key_cache.index_select(0, blocks)
                     values = value_cache.index_select(0, blocks)
@@ -457,6 +754,22 @@ class MetalAttentionImpl(AttentionImpl):
 
             query_len = end - begin
             mask = None
+            if bound_mode:
+                # Exact key visibility from GPU seq_lens (no host sync):
+                # keys at [max(0, sl - q - window + 1), sl) are attendable,
+                # matching the exact-mode gather range bit-for-bit in
+                # semantics. True = attend.
+                sl = metadata.seq_lens_gpu[req].to(torch.long)
+                key_pos = torch.arange(
+                    first_block * block_size + row_start,
+                    first_block * block_size + row_end,
+                    device=query.device,
+                )
+                valid = key_pos < sl
+                if self.sliding_window is not None:
+                    lo = (sl - (query_len_req + self.sliding_window - 1)).clamp_min(0)
+                    valid &= key_pos >= lo
+                mask = valid[None, None, :]
             if metadata.causal and query_len > 1:
                 # Query j sits at absolute position seq_len - query_len + j and
                 # may attend every key at or before it, back at most

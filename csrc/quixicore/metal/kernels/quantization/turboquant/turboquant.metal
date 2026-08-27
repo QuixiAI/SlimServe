@@ -450,7 +450,8 @@ kernel void tq_attention_combined(
     const uint t = tid3.x;
     const int head = int(tgid.x);
     const int batch = int(tgid.y);
-    const int kvh = head % num_kv_heads;
+    // vLLM GQA convention: consecutive q heads share a kv head.
+    const int kvh = head / (num_heads / num_kv_heads);
     const int k_packed = (HEAD_SIZE * k_bits + 7) / 8;
     const int v_packed = (HEAD_SIZE * v_bits + 7) / 8;
     const int ks_off = k_packed + v_packed;
@@ -512,6 +513,269 @@ kernel void tq_attention_combined(
     const float decoded = tq_inverse_fwht_scalar<HEAD_SIZE>(
         normalized, signs, fwht_buf, t);
     out[qbase + t] = T(decoded);
+}
+
+// Dequant a contiguous run of cached tokens from the combined slot layout
+// into dense (1, Hkv, n_rows, HS) buffers — the Metal twin of the CUDA
+// turboquant_dequant_kv used by the continuation-prefill route. Decode math
+// is identical to tq_attention_combined; rows with slot < 0 are left
+// unwritten (callers read only [:cached_len]).
+template <typename T, int HEAD_SIZE>
+kernel void tq_decode_combined(
+        device const uchar *cache [[buffer(0)]],
+        device const int *slots [[buffer(1)]],       // (n_rows,), -1 skip
+        device const float *v_centroids [[buffer(2)]],
+        device const float *signs [[buffer(3)]],
+        device T *k_out [[buffer(4)]],               // (1, Hkv, n_rows, HS)
+        device T *v_out [[buffer(5)]],
+        constant int &num_kv_heads [[buffer(6)]],
+        constant int &block_size [[buffer(7)]],
+        constant int &block_stride [[buffer(8)]],
+        constant int &token_stride [[buffer(9)]],
+        constant int &head_stride [[buffer(10)]],
+        constant int &n_rows [[buffer(11)]],
+        constant int &k_bits [[buffer(12)]],
+        constant int &k_signed [[buffer(13)]],
+        constant int &v_bits [[buffer(14)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint sid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int SG_SIZE = 32;
+    constexpr int scale_groups = HEAD_SIZE / SG_SIZE;
+    const uint t = tid3.x;
+    const int row = int(tgid.x);
+    const int kvh = int(tgid.y);
+    const int slot = slots[row];
+    if (slot < 0) { return; }
+    const int block = slot / block_size;
+    const int block_offset = slot - block * block_size;
+    const int k_packed = (HEAD_SIZE * k_bits + 7) / 8;
+    const int v_packed = (HEAD_SIZE * v_bits + 7) / 8;
+    const int ks_off = k_packed + v_packed;
+    const int vs_off = ks_off + scale_groups * 2;
+    const int kz_off = vs_off + scale_groups * 2;
+    const long base = (long)block * block_stride +
+        (long)block_offset * token_stride + (long)kvh * head_stride;
+    const long out_base = ((long)kvh * n_rows + row) * HEAD_SIZE;
+
+    threadgroup float fwht_buf[HEAD_SIZE];
+
+    // K: (kq + kz) * ks
+    const float ks = float(((device const half *)(cache + base + ks_off))[sid]);
+    const float kz = float(((device const half *)(cache + base + kz_off))[sid]);
+    float kq;
+    if (k_bits == 8 && k_signed != 0) {
+        kq = float(char(cache[base + t]));
+    } else if (k_bits == 8) {
+        kq = float(cache[base + t]);
+    } else {
+        kq = float(tq_unpack_bits(cache + base, int(t), k_bits));
+    }
+    k_out[out_base + t] = T((kq + kz) * ks);
+
+    // V: centroid * scale in the FWHT domain, one inverse per token row.
+    const float vs = float(((device const half *)(cache + base + vs_off))[sid]);
+    const uint vi = tq_unpack_bits(cache + base + k_packed, int(t), v_bits);
+    const float v_rot = v_centroids[vi & ((1u << v_bits) - 1u)] * vs;
+    v_out[out_base + t] =
+        T(tq_inverse_fwht_scalar<HEAD_SIZE>(v_rot, signs, fwht_buf, t));
+}
+
+// Split-K decode attention over the combined codec: grid (H, B, P). One
+// threadgroup owns one (head, batch, partition); each SIMDGROUP walks the
+// partition's tokens with stride NSG, so the HEAD_SIZE-wide dot reduces with
+// a single simd_sum and the token loop carries NO threadgroup barriers (the
+// monolithic tq_attention_combined pays two barriers per token from one
+// threadgroup per (head, batch) — measured ~7 GB/s at the qwen38 c1 shape
+// vs ~190 GB/s for the bf16 PA256 split-K). V stays in the FWHT domain;
+// per-simdgroup partials merge once at the end into tmp/ml/es, and
+// tq_attention_reduce applies the sink, normalizes, and runs the single
+// inverse transform. Slots come straight from the block table — no host
+// slots matrix.
+template <typename T, int HEAD_SIZE>
+kernel void tq_attention_splitk(
+        device const T *q [[buffer(0)]],
+        device const uchar *cache [[buffer(1)]],
+        device const int *block_table [[buffer(2)]],
+        device const int *lengths [[buffer(3)]],
+        device const float *v_centroids [[buffer(4)]],
+        device float *tmp [[buffer(5)]],
+        device float *ml [[buffer(6)]],
+        device float *es [[buffer(7)]],
+        constant int &num_heads [[buffer(8)]],
+        constant int &num_kv_heads [[buffer(9)]],
+        constant int &bt_stride [[buffer(10)]],
+        constant int &block_size [[buffer(11)]],
+        constant int &block_stride [[buffer(12)]],
+        constant int &token_stride [[buffer(13)]],
+        constant int &head_stride [[buffer(14)]],
+        constant int &num_partitions [[buffer(15)]],
+        constant int &partition_size [[buffer(16)]],
+        constant int &k_bits [[buffer(17)]],
+        constant int &k_signed [[buffer(18)]],
+        constant int &v_bits [[buffer(19)]],
+        constant float &scale [[buffer(20)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint sid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int SG_SIZE = 32;
+    constexpr int NSG = HEAD_SIZE / SG_SIZE;   // simdgroups per threadgroup
+    constexpr int E = HEAD_SIZE / SG_SIZE;     // head elements per lane
+    const uint t = tid3.x;
+    const int head = int(tgid.x);
+    const int batch = int(tgid.y);
+    const int part = int(tgid.z);
+    const int kvh = head / (num_heads / num_kv_heads);
+    const int k_packed = (HEAD_SIZE * k_bits + 7) / 8;
+    const int v_packed = (HEAD_SIZE * v_bits + 7) / 8;
+    const int ks_off = k_packed + v_packed;
+    const int vs_off = ks_off + (HEAD_SIZE / SG_SIZE) * 2;
+    const int kz_off = vs_off + (HEAD_SIZE / SG_SIZE) * 2;
+    const long pbase =
+        ((long)batch * num_heads + head) * (long)num_partitions + part;
+    const int len = lengths[batch];
+    const int p_start = part * partition_size;
+    if (p_start >= len) {
+        if (t == 0) {
+            ml[pbase] = -3.4028234663852886e38f;
+            es[pbase] = 0.0f;
+        }
+        return;
+    }
+    const int p_end = metal::min(p_start + partition_size, len);
+    const long qbase = ((long)batch * num_heads + head) * HEAD_SIZE;
+    // an aligned E-element run never straddles a 32-element scale group
+    const int grp = (int(lane) * E) / SG_SIZE;
+    float qv[E];
+    float acc[E];
+    #pragma unroll
+    for (int e = 0; e < E; ++e) {
+        qv[e] = float(q[qbase + int(lane) * E + e]);
+        acc[e] = 0.0f;
+    }
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    const uint vmask = (1u << v_bits) - 1u;
+    for (int j = p_start + int(sid); j < p_end; j += NSG) {
+        const int phys = block_table[batch * bt_stride + j / block_size];
+        const long base = (long)phys * block_stride +
+            (long)(j - (j / block_size) * block_size) * token_stride +
+            (long)kvh * head_stride;
+        const float ks =
+            float(((device const half *)(cache + base + ks_off))[grp]);
+        const float kz =
+            float(((device const half *)(cache + base + kz_off))[grp]);
+        float dotp = 0.0f;
+        #pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const int el = int(lane) * E + e;
+            float kq;
+            if (k_bits == 8 && k_signed != 0) {
+                kq = float(char(cache[base + el]));
+            } else if (k_bits == 8) {
+                kq = float(cache[base + el]);
+            } else {
+                kq = float(tq_unpack_bits(cache + base, el, k_bits));
+            }
+            dotp += qv[e] * ((kq + kz) * ks);
+        }
+        const float score = simd_sum(dotp) * scale;
+        const float new_m = metal::max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : metal::exp(m - new_m);
+        const float beta = metal::exp(score - new_m);
+        const float vs =
+            float(((device const half *)(cache + base + vs_off))[grp]);
+        #pragma unroll
+        for (int e = 0; e < E; ++e) {
+            const int el = int(lane) * E + e;
+            const uint vi =
+                tq_unpack_bits(cache + base + k_packed, el, v_bits);
+            acc[e] = acc[e] * alpha + beta * (v_centroids[vi & vmask] * vs);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    // one online-softmax merge across the NSG simdgroups (a short partition
+    // can leave trailing simdgroups empty: l == 0 marks them)
+    threadgroup float tg_m[NSG];
+    threadgroup float tg_l[NSG];
+    threadgroup float tg_acc[HEAD_SIZE];
+    if (lane == 0) {
+        tg_m[sid] = m;
+        tg_l[sid] = l;
+    }
+    tg_acc[t] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float gm = -3.4028234663852886e38f;
+    for (int s = 0; s < NSG; ++s) {
+        if (tg_l[s] > 0.0f) { gm = metal::max(gm, tg_m[s]); }
+    }
+    float gl = 0.0f;
+    for (int s = 0; s < NSG; ++s) {
+        if (tg_l[s] > 0.0f) { gl += tg_l[s] * metal::exp(tg_m[s] - gm); }
+    }
+    const float w = (l > 0.0f) ? metal::exp(m - gm) : 0.0f;
+    for (int s = 0; s < NSG; ++s) {
+        if (int(sid) == s) {
+            #pragma unroll
+            for (int e = 0; e < E; ++e) {
+                tg_acc[int(lane) * E + e] += w * acc[e];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    tmp[pbase * HEAD_SIZE + t] = tg_acc[t];
+    if (t == 0) {
+        ml[pbase] = gm;
+        es[pbase] = gl;
+    }
+}
+
+// Merge the split-K partials, fold in the sink, normalize, and apply the one
+// inverse FWHT per output row. Grid (H, B); HEAD_SIZE threads. Empty
+// partitions carry es == 0 and are skipped (their ml is -inf).
+template <typename T, int HEAD_SIZE>
+kernel void tq_attention_reduce(
+        device const float *tmp [[buffer(0)]],
+        device const float *ml [[buffer(1)]],
+        device const float *es [[buffer(2)]],
+        device const float *sinks [[buffer(3)]],
+        device const float *signs [[buffer(4)]],
+        device T *out [[buffer(5)]],
+        constant int &num_heads [[buffer(6)]],
+        constant int &num_partitions [[buffer(7)]],
+        uint3 tgid [[threadgroup_position_in_grid]],
+        uint3 tid3 [[thread_position_in_threadgroup]],
+        uint sid [[simdgroup_index_in_threadgroup]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint t = tid3.x;
+    const int head = int(tgid.x);
+    const int batch = int(tgid.y);
+    const long pbase = ((long)batch * num_heads + head) * (long)num_partitions;
+    threadgroup float fwht_buf[HEAD_SIZE];
+    float gm = -3.4028234663852886e38f;
+    for (int p = 0; p < num_partitions; ++p) {
+        if (es[pbase + p] > 0.0f) { gm = metal::max(gm, ml[pbase + p]); }
+    }
+    const float sink = sinks[head];
+    const bool has_sink = metal::isfinite(sink);
+    if (has_sink) { gm = metal::max(gm, sink); }
+    float gl = 0.0f, accv = 0.0f;
+    for (int p = 0; p < num_partitions; ++p) {
+        const float e_p = es[pbase + p];
+        if (e_p > 0.0f) {
+            const float pw = metal::exp(ml[pbase + p] - gm);
+            gl += e_p * pw;
+            accv += tmp[(pbase + p) * HEAD_SIZE + t] * pw;
+        }
+    }
+    if (has_sink) { gl += metal::exp(sink - gm); }
+    const float normalized = gl == 0.0f ? 0.0f : accv / gl;
+    const float decoded =
+        tq_inverse_fwht_scalar<HEAD_SIZE>(normalized, signs, fwht_buf, t);
+    out[((long)batch * num_heads + head) * HEAD_SIZE + t] = T(decoded);
 }
 
 #define instantiate_tq(type_name, T, HS)                                            \
@@ -591,6 +855,60 @@ kernel void tq_attention_combined(
       constant int &slot_size [[buffer(15)]], constant int &k_bits [[buffer(16)]], \
       constant int &k_signed [[buffer(17)]], constant int &v_bits [[buffer(18)]], \
       constant float &scale [[buffer(19)]],                                    \
+      uint3 tgid [[threadgroup_position_in_grid]],                              \
+      uint3 tid3 [[thread_position_in_threadgroup]],                            \
+      uint sid [[simdgroup_index_in_threadgroup]],                              \
+      uint lane [[thread_index_in_simdgroup]]);                                 \
+  template [[host_name("tq_decode_combined_" #type_name "_hs" #HS)]]           \
+  [[kernel]] void tq_decode_combined<T, HS>(                                    \
+      device const uchar *cache [[buffer(0)]],                                  \
+      device const int *slots [[buffer(1)]],                                    \
+      device const float *v_centroids [[buffer(2)]],                            \
+      device const float *signs [[buffer(3)]],                                  \
+      device T *k_out [[buffer(4)]], device T *v_out [[buffer(5)]],             \
+      constant int &num_kv_heads [[buffer(6)]],                                 \
+      constant int &block_size [[buffer(7)]],                                   \
+      constant int &block_stride [[buffer(8)]],                                 \
+      constant int &token_stride [[buffer(9)]],                                 \
+      constant int &head_stride [[buffer(10)]],                                 \
+      constant int &n_rows [[buffer(11)]], constant int &k_bits [[buffer(12)]], \
+      constant int &k_signed [[buffer(13)]], constant int &v_bits [[buffer(14)]], \
+      uint3 tgid [[threadgroup_position_in_grid]],                              \
+      uint3 tid3 [[thread_position_in_threadgroup]],                            \
+      uint sid [[simdgroup_index_in_threadgroup]],                              \
+      uint lane [[thread_index_in_simdgroup]]);                                 \
+  template [[host_name("tq_attention_splitk_" #type_name "_hs" #HS)]]           \
+  [[kernel]] void tq_attention_splitk<T, HS>(                                   \
+      device const T *q [[buffer(0)]], device const uchar *cache [[buffer(1)]], \
+      device const int *block_table [[buffer(2)]],                              \
+      device const int *lengths [[buffer(3)]],                                  \
+      device const float *v_centroids [[buffer(4)]],                            \
+      device float *tmp [[buffer(5)]], device float *ml [[buffer(6)]],          \
+      device float *es [[buffer(7)]], constant int &num_heads [[buffer(8)]],    \
+      constant int &num_kv_heads [[buffer(9)]],                                 \
+      constant int &bt_stride [[buffer(10)]],                                   \
+      constant int &block_size [[buffer(11)]],                                  \
+      constant int &block_stride [[buffer(12)]],                                \
+      constant int &token_stride [[buffer(13)]],                                \
+      constant int &head_stride [[buffer(14)]],                                 \
+      constant int &num_partitions [[buffer(15)]],                              \
+      constant int &partition_size [[buffer(16)]],                              \
+      constant int &k_bits [[buffer(17)]],                                      \
+      constant int &k_signed [[buffer(18)]], constant int &v_bits [[buffer(19)]], \
+      constant float &scale [[buffer(20)]],                                     \
+      uint3 tgid [[threadgroup_position_in_grid]],                              \
+      uint3 tid3 [[thread_position_in_threadgroup]],                            \
+      uint sid [[simdgroup_index_in_threadgroup]],                              \
+      uint lane [[thread_index_in_simdgroup]]);                                 \
+  template [[host_name("tq_attention_reduce_" #type_name "_hs" #HS)]]           \
+  [[kernel]] void tq_attention_reduce<T, HS>(                                   \
+      device const float *tmp [[buffer(0)]],                                    \
+      device const float *ml [[buffer(1)]],                                     \
+      device const float *es [[buffer(2)]],                                     \
+      device const float *sinks [[buffer(3)]],                                  \
+      device const float *signs [[buffer(4)]],                                  \
+      device T *out [[buffer(5)]], constant int &num_heads [[buffer(6)]],       \
+      constant int &num_partitions [[buffer(7)]],                               \
       uint3 tgid [[threadgroup_position_in_grid]],                              \
       uint3 tid3 [[thread_position_in_threadgroup]],                            \
       uint sid [[simdgroup_index_in_threadgroup]],                              \

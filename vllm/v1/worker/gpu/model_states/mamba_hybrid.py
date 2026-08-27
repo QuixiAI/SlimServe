@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,12 +11,17 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFuncsByType,
     get_conv_copy_spec,
     is_conv_state_dim_first,
 )
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+    ShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -26,7 +32,10 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import (
     MambaSpecDecodeGPUContext,
+    get_mamba_group_ids,
+    get_mamba_groups,
     preprocess_mamba_align_fused_kernel,
+    validate_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -36,6 +45,24 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+
+    def steady_signature(self):
+        # Steady-compatible only in the uniform all-spec decode regime:
+        # every request is a spec-decode row with the same draft count.
+        # The generic eligibility already excludes prefills; the draft
+        # count folds into the signature so an adaptive-k change forces a
+        # rebuild. All checks are CPU-tensor ops — no device sync.
+        if self.num_accepted_tokens is None or (
+            self.num_decode_draft_tokens_cpu is None
+        ):
+            return None
+        d = self.num_decode_draft_tokens_cpu
+        if d.numel() == 0:
+            return None
+        first = int(d[0])
+        if first < 0 or not bool((d == first).all()):
+            return None
+        return ("mamba-spec", first)
 
     def get_extra_common_attn_kwargs(
         self,
@@ -51,7 +78,12 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     ) -> dict[str, Any]:
         if not isinstance(
             attn_metadata_builder,
-            (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+            (
+                Mamba2AttentionMetadataBuilder,
+                GDNAttentionMetadataBuilder,
+                ShortConvAttentionMetadataBuilder,
+                PleShortConvAttentionMetadataBuilder,
+            ),
         ):
             return {}
         return {
@@ -76,8 +108,17 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # One trailing dump slot (index max_num_reqs): the MPS postprocess
+        # readers that gather with a raw idx_mapping can carry -1 rows, and
+        # Python negative indexing lands those on the LAST slot -- which the
+        # ones-init keeps at the neutral acceptance count of 1. (The MPS
+        # postprocess scatter itself redirects sentinel rows to slot 0 with
+        # an additive delta of zero; see postprocess_state. Boolean-mask
+        # indexing is avoided throughout: its data-dependent shape forces a
+        # full GPU-queue drain per step on MPS, measured 67 ms/step at
+        # c1-spec.)
         self.num_accepted_tokens_gpu = torch.ones(
-            self.max_num_reqs, dtype=torch.int32, device=self.device
+            self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
@@ -97,6 +138,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -112,17 +154,16 @@ class MambaHybridModelState(DefaultModelState):
         self, kv_cache_config: KVCacheConfig
     ) -> tuple[list[int], MambaSpec]:
         if self._mamba_spec is None:
-            group_ids: list[int] = []
-            specs: list[MambaSpec] = []
-            for i, group in enumerate(kv_cache_config.kv_cache_groups):
-                spec = group.kv_cache_spec
-                if isinstance(spec, MambaSpec):
-                    group_ids.append(i)
-                    specs.append(spec)
-            assert specs, "no mamba layers in the model"
-            assert all(specs[0] == s for s in specs)
-            self._mamba_group_ids = group_ids
-            self._mamba_spec = specs[0]
+            mamba_groups = get_mamba_groups(kv_cache_config)
+            mamba_spec = next(iter(mamba_groups))
+            assert all(
+                spec.block_size == mamba_spec.block_size
+                and spec.num_speculative_blocks == mamba_spec.num_speculative_blocks
+                and spec.mamba_cache_mode == mamba_spec.mamba_cache_mode
+                for spec in mamba_groups
+            ), "all mamba groups must share cache scheduling parameters"
+            self._mamba_group_ids = get_mamba_group_ids(mamba_groups)
+            self._mamba_spec = mamba_spec
         return self._mamba_group_ids, self._mamba_spec
 
     def _ensure_align_ctx(
@@ -131,12 +172,23 @@ class MambaHybridModelState(DefaultModelState):
         mamba_group_ids: list[int],
         block_tables: tuple[torch.Tensor, ...],
     ) -> MambaSpecDecodeGPUContext:
+        if self._mamba_state_copy_funcs is None:
+            mamba_groups = get_mamba_groups(kv_cache_config)
+            mamba_types = {spec.mamba_type for spec in mamba_groups}
+            copy_funcs = self.model.get_mamba_state_copy_funcs(  # type: ignore[operator]
+                mamba_types
+            )
+            validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
+            self._mamba_state_copy_funcs = copy_funcs
+        copy_funcs = self._mamba_state_copy_funcs
         if self._mamba_ctx is None:
-            copy_funcs = self.model.get_mamba_state_copy_func()
-            # The fused copy kernels shift conv windows assuming the SD layout;
-            # the DS layout cannot express a >0 spec-decode shift as a single
-            # contiguous copy (mirrors get_conv_copy_spec's NotImplementedError).
-            if get_conv_copy_spec in copy_funcs and is_conv_state_dim_first():
+            # The fork's fused copy kernels shift conv windows assuming the
+            # SD layout; the DS layout cannot express a >0 spec-decode shift as
+            # one contiguous copy (mirrors get_conv_copy_spec's
+            # NotImplementedError).
+            if is_conv_state_dim_first() and any(
+                get_conv_copy_spec in funcs for funcs in copy_funcs.values()
+            ):
                 assert self.vllm_config.speculative_config is None, (
                     "DS conv state layout does not support mamba align state "
                     "copies with speculative decoding"
@@ -144,7 +196,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx = MambaSpecDecodeGPUContext.create(
                 max_num_reqs=self.max_num_reqs,
                 kv_cache_config=kv_cache_config,
-                num_state_types=len(copy_funcs),
+                copy_funcs=copy_funcs,
                 device=self.device,
                 make_buffer=lambda n, dtype: CpuGpuBuffer(
                     n, dtype=dtype, device=self.device
@@ -159,7 +211,7 @@ class MambaHybridModelState(DefaultModelState):
             ctx.initialize_from_forward_context(
                 kv_cache_config,
                 forward_context,
-                self.model.get_mamba_state_copy_func(),
+                copy_funcs,
                 [block_tables[gid] for gid in mamba_group_ids],
             )
         return ctx
@@ -236,7 +288,7 @@ class MambaHybridModelState(DefaultModelState):
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
@@ -274,7 +326,30 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        # Steady uniform-decode metadata reuse on Metal (eager path; there is
+        # no cudagraph, so the eager consumers read the cached objects
+        # directly — every tensor field is a view over persistent buffers or
+        # refreshed in steady_decode_update). The GDN builder alone costs
+        # ~8.2 ms/step rebuilt from scratch (10 group builds, 2026-08-24
+        # post-rope census). VLLM_QC_STEADY_META=0 restores the full rebuild.
+        steady_cache = None
+        if not for_capture:
+            enabled = getattr(self, "_qc_steady_meta_enabled", None)
+            if enabled is None:
+                from vllm.platforms import current_platform
+
+                enabled = (
+                    current_platform.is_metal()
+                    and os.environ.get("VLLM_QC_STEADY_META", "1") != "0"
+                )
+                self._qc_steady_meta_enabled = enabled
+            if enabled:
+                steady_cache = getattr(self, "_qc_steady_meta_cache", None)
+                if steady_cache is None:
+                    steady_cache = {"sig": None}
+                    self._qc_steady_meta_cache = steady_cache
         return build_attn_metadata(
+            steady_cache=steady_cache,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
