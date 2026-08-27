@@ -305,6 +305,27 @@ _HOST_REGISTER_PORTABLE = 0x01
 _HOST_REGISTER_MAPPED = 0x02
 
 
+_SHARED_TABLES: dict[str, tuple] = {}
+
+
+def release_shared_ple_tables() -> None:
+    """Unregister and unmap every shared table, in that order.
+
+    Test infrastructure only: production tables live for the process.
+    Any tensor still referencing a released table becomes invalid.
+    """
+    for mapped, host, _table in _SHARED_TABLES.values():
+        try:
+            torch.cuda.cudart().cudaHostUnregister(host.data_ptr())
+        except Exception:
+            pass
+        try:
+            mapped.close()
+        except Exception:
+            pass
+    _SHARED_TABLES.clear()
+
+
 def _shared_pinned_table(
     num_embeddings: int, embedding_dim: int, dtype: torch.dtype
 ) -> torch.Tensor | None:
@@ -324,6 +345,11 @@ def _shared_pinned_table(
         f"/dev/shm/slimserve_ple_{num_embeddings}x{embedding_dim}_"
         f"{str(dtype).split('.')[-1]}"
     )
+    cached = _SHARED_TABLES.get(path)
+    if cached is not None:
+        # Same-process reuse (multiple layer instances): one mapping, one
+        # registration, one storage.
+        return cached[2]
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -358,9 +384,15 @@ def _shared_pinned_table(
         path,
         nbytes / 2**30,
     )
-    # Keep the mmap object alive for the tensor's lifetime.
     table = host.view(dtype).view(num_embeddings, embedding_dim)
-    table._slimserve_ple_mmap = mapped  # type: ignore[attr-defined]
+    # Process-lifetime registry: the mapping and registration outlive every
+    # tensor sharing the storage (nn.Parameter wraps the storage without
+    # keeping the Python object alive, so per-tensor finalizers fire while
+    # the pages are still in use). Registration is released only through
+    # release_shared_ple_tables(), which tests call between cases; dropping
+    # the mmap under a live cudaHostRegister leaves dangling pinned-page
+    # state that corrupts later CUDA work in the process.
+    _SHARED_TABLES[path] = (mapped, host, table)
     return table
 
 

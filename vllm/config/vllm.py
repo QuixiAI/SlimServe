@@ -863,6 +863,25 @@ class VllmConfig:
 
         apply_recursive(self, defaults)
 
+    def _is_draft_model_view(self) -> bool:
+        """Whether this config is a draft-model view of a serving config.
+
+        Loaders build such views with ``dataclasses.replace(vllm_config,
+        model_config=draft_model_config)``. ``replace`` re-runs
+        ``__post_init__`` while every sub-config (compilation_config,
+        speculative_config, cache_config, ...) is still the SAME OBJECT as
+        the serving config's, and the view's model_config has runner_type
+        "draft", so runner predicates misclassify it. INVARIANT: any
+        __post_init__ step that MUTATES a shared sub-config must skip when
+        this returns True, or it silently rewrites the serving config
+        (a draft view once downgraded the whole worker's cudagraph_mode
+        to PIECEWISE this way).
+        """
+        return (
+            self.speculative_config is not None
+            and self.model_config is self.speculative_config.draft_model_config
+        )
+
     def _maybe_override_dynamic_sd_cudagraph_mode(self) -> None:
         speculative_config = self.speculative_config
         if (
@@ -870,12 +889,9 @@ class VllmConfig:
             or not speculative_config.uses_dynamic_speculative_decoding()
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             or self.use_v2_model_runner
-            # A draft-model view (dataclasses.replace with the draft
-            # model_config, e.g. the Qwen4Exp MTP loader) shares this
-            # compilation_config with the serving config and must never
-            # decide global graph policy: its runner_type is "draft", so
-            # every runner predicate below would misclassify it as V1.
-            or self.model_config is speculative_config.draft_model_config
+            # See _is_draft_model_view: a view must never decide global
+            # graph policy on the shared compilation_config.
+            or self._is_draft_model_view()
         ):
             return
 
@@ -894,6 +910,9 @@ class VllmConfig:
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
             or self.parallel_config.data_parallel_size <= 1
+            # See _is_draft_model_view: this method mutates the SHARED
+            # speculative_config; a view must not.
+            or self._is_draft_model_view()
         ):
             return
 

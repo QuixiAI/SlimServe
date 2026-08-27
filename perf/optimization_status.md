@@ -12185,3 +12185,29 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   are automatic and pinned by tests/v1/worker/test_cudagraph_dispatch.py.
 - Raw: dynfix.log, dynship.log, bench_dynship_* under
   perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Cleanup sweep: roaming test flake root-caused; fp8 main-KV removed; config-view invariant enforced
+
+- Roaming full-suite flake (tp1_split64 one run, PLE host-gather the
+  next): the shm-PLE tests unlinked and dropped their mmap while the
+  pages were still cudaHostRegistered - dangling pinned-page state
+  corrupted whichever CUDA test ran next. A per-tensor finalizer made it
+  a core dump instead (nn.Parameter shares storage without keeping the
+  tensor object alive, so the finalizer fired mid-use). Fix: a
+  process-lifetime registry keyed by segment path (matching production
+  semantics, deduping same-process instances onto one mapping) with an
+  explicit release_shared_ple_tables() that unregisters BEFORE unmapping;
+  tests call it in teardown. Three consecutive clean full-suite runs.
+- fp8-e4m3 main-KV path removed entirely (env, layer/impl/backend
+  acceptance, aligner branch, arithmetic e4m3 Triton decoder, kv_fp8
+  wrapper path, parity test): dominated by TQ k8v4 on speed, acceptance,
+  and compression since the tile fix.
+- Config-view invariant named and enforced: VllmConfig._is_draft_model_view
+  documents that replace()-built draft views share every sub-config with
+  the serving config and must never mutate them from __post_init__; both
+  known mutators (dynamic-SD cudagraph downgrade, dynamic-SD DP disable)
+  are guarded, and a regression test builds the real config, creates the
+  draft view, and asserts the shared cudagraph_mode and schedule survive.
+- 213 tests green twice consecutively across qwen4_exp, profiles,
+  dispatcher, and CSA planner suites. MI300X capture re-baseline remains
+  deferred to that platform.
