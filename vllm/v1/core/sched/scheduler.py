@@ -1692,6 +1692,8 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        step_draft_tokens = 0
+        step_accepted_tokens = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1747,8 +1749,8 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
-                if self.sd_accept_throttle is not None:
-                    self.sd_accept_throttle.observe(num_draft_tokens, num_accepted)
+                step_draft_tokens += num_draft_tokens
+                step_accepted_tokens += num_accepted
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1902,6 +1904,11 @@ class Scheduler(SchedulerInterface):
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
+
+        if self.sd_accept_throttle is not None and step_draft_tokens > 0:
+            # One observation per scheduling step (gate() also runs once per
+            # step): a c8 batch must not burn eight warmup calls in one step.
+            self.sd_accept_throttle.observe(step_draft_tokens, step_accepted_tokens)
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:

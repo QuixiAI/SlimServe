@@ -1400,6 +1400,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state=ssm_state,
                 state_indices=attn_metadata.non_spec_state_indices_tensor,  # type: ignore[arg-type]
                 use_qk_l2norm=True,
+                tiled_gqa=self.tiled_v_head_layout,
             )
 
         core_attn_out_prefill = None
@@ -1435,6 +1436,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     beta=beta_p.unsqueeze(0),
                     initial_state=initial_state,
                     cu_seqlens=attn_metadata.prefill_query_start_loc,  # type: ignore[arg-type]
+                    tiled_gqa=self.tiled_v_head_layout,
                 )
             )
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)

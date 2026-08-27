@@ -186,6 +186,11 @@ class AcceptanceThrottle:
         ema_alpha: float = 0.1,
         min_batch: int = 2,
     ) -> None:
+        if pause_steps <= 0:
+            raise ValueError(
+                "pause_steps must be > 0 (VLLM_SD_ADAPT_PAUSE_STEPS): a "
+                "non-positive pause would disable drafting permanently"
+            )
         self.min_batch = min_batch
         self.min_ratio = min_ratio
         self.pause_steps = pause_steps

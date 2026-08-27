@@ -669,6 +669,12 @@ def build_attn_metadata(
             # steady path reading first-step values.
             if num_computed_tokens_cpu is not None:
                 cm._num_computed_tokens_cpu = num_computed_tokens_cpu
+            # The device-side memo is a MATERIALIZED seq_lens - query_lens
+            # frozen at cold-build values (seq_lens itself is a live view the
+            # runner advances in place). Builders rebuilt on steady hits
+            # (no steady_decode_update: PLE short-conv, Flex, MiniMax) call
+            # compute_num_computed_tokens() and would read first-step values.
+            cm._num_computed_tokens_cache = None
             for builder, meta, layer_names, supports in items:
                 extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
