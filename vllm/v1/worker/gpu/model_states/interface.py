@@ -71,11 +71,11 @@ class ModelState(ABC):
         if encoder_cache is not None:
             self.encoder_cache = encoder_cache
             self.encoder_runner = EncoderRunner(
-                model=self.model,
+                model=self.model,  # type: ignore[arg-type]
                 max_num_tokens=self.max_num_tokens,
                 hidden_size=self.inputs_embeds_size,
                 encoder_cache=encoder_cache,
-                dtype=self.dtype,
+                dtype=self.dtype,  # type: ignore[arg-type]
                 device=self.device,
             )
 

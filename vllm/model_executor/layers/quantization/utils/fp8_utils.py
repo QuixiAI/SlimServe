@@ -1301,7 +1301,7 @@ def create_fp8_scale_parameter(
     """Create scale parameter based on quantization strategy."""
     dtype = scale_dtype if scale_dtype is not None else torch.float32
     if parameter_type == ChannelQuantScaleParameter:
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty((sum(output_partition_sizes), 1), dtype=dtype),
             output_dim=0,
             weight_loader=weight_loader,
@@ -1310,7 +1310,7 @@ def create_fp8_scale_parameter(
         assert block_size is not None
         block_n, block_k = block_size[0], block_size[1]
         output_size_per_partition = sum(output_partition_sizes)
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty(
                 (output_size_per_partition + block_n - 1) // block_n,
                 (input_size_per_partition + block_k - 1) // block_k,
@@ -1321,7 +1321,7 @@ def create_fp8_scale_parameter(
             weight_loader=weight_loader,
         )
     elif parameter_type == PerTensorScaleParameter:
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty(len(output_partition_sizes), dtype=dtype),
             weight_loader=weight_loader,
         )

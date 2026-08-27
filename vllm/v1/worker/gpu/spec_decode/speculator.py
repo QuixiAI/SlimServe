@@ -295,8 +295,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        logits = self.model.compute_logits(hidden_states)
+            return self.model.get_top_tokens(hidden_states)  # type: ignore[operator]
+        logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
         return logits.argmax(dim=-1)
 
     def sample_draft(
@@ -310,7 +310,7 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(

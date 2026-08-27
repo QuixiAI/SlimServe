@@ -824,6 +824,7 @@ class quixicore_ops:
         except ImportError:
             return False
 
+    @staticmethod
     def paged_attention(
         q: torch.Tensor,
         key_cache: torch.Tensor,
@@ -1127,7 +1128,7 @@ class quixicore_ops:
         for j in range(8):
             b = qs[:, :, (j >> 1) * 32 : ((j >> 1) + 1) * 32]
             q[:, :, j, :] = (b & 0x0F) if j % 2 == 0 else (b >> 4)
-        q = q.reshape(n_rows, k)
+        q = q.reshape(n_rows, k)  # type: ignore[assignment]
         wt = q.reshape(n_rows // 64, 64, k).transpose(0, 2, 1)
         packed = (wt[..., 0::2] | (wt[..., 1::2] << 4)).astype(np.uint8)
         wu = torch.from_numpy(np.ascontiguousarray(packed).reshape(-1))

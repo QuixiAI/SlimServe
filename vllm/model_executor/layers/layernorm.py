@@ -313,7 +313,9 @@ class RMSNormGated(CustomOp):
         super().__init__()
         self.eps = eps
         self.activation = activation
-        self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = nn.Parameter(
+            torch.empty(hidden_size, **factory_kwargs)  # type: ignore[arg-type]
+        )
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate

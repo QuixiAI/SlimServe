@@ -118,22 +118,24 @@ class MetalWFp8A16LinearKernel(FP8ScaledMMLinearKernel):
         # On Metal the scheme skips its (K, N) canonicalization, so weight is
         # the checkpoint's row-major uint8 [N, K] and weight_scale is fp32
         # [N, 1] — exactly the qgemv_fp8ch operand layout.
-        n, k = layer.weight.shape
+        n, k = layer.weight.shape  # type: ignore[misc]
         if self.use_gemv and n % 4 == 0 and k % 16 == 0:
             # Raw bytes + flat fp32 scale for the GEMV (kept alongside any
             # materialized dense weight; decode never touches the bf16 copy).
             layer.fp8ch_weight = layer.weight.data
-            layer.fp8ch_scale = layer.weight_scale.data.reshape(-1).contiguous()
-            layer.metal_fp8ch = True
+            layer.fp8ch_scale = layer.weight_scale.data.reshape(-1).contiguous()  # type: ignore[operator, union-attr]
+            layer.metal_fp8ch = True  # type: ignore[assignment]
         if not self.materialize:
             return
         dense = dequant_fp8_channel(
-            layer.weight, layer.weight_scale, self.config.input_dtype
+            layer.weight,  # type: ignore[arg-type]
+            layer.weight_scale,  # type: ignore[arg-type]
+            self.config.input_dtype,
         )
         replace_parameter(layer, "weight", dense)
-        layer.metal_ct_materialized = True
+        layer.metal_ct_materialized = True  # type: ignore[assignment]
 
-    def apply_weights(
+    def apply_weights(  # type: ignore[override]
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -153,15 +155,21 @@ class MetalWFp8A16LinearKernel(FP8ScaledMMLinearKernel):
             from vllm.quixicore import quixicore_ops
 
             out = quixicore_ops.fp8ch_mul_mat_vec(
-                layer.fp8ch_weight, x_2d.contiguous(), layer.fp8ch_scale
+                layer.fp8ch_weight,  # type: ignore[arg-type]
+                x_2d.contiguous(),
+                layer.fp8ch_scale,  # type: ignore[arg-type]
             )
             out = out.view(*x.shape[:-1], out.shape[-1])
             if bias is not None:
                 out = out + bias
             return out
         if getattr(layer, "metal_ct_materialized", False):
-            return F.linear(x, layer.weight, bias)
-        weight = dequant_fp8_channel(layer.weight, layer.weight_scale, x.dtype)
+            return F.linear(x, layer.weight, bias)  # type: ignore[arg-type]
+        weight = dequant_fp8_channel(
+            layer.weight,  # type: ignore[arg-type]
+            layer.weight_scale,  # type: ignore[arg-type]
+            x.dtype,
+        )
         return F.linear(x, weight, bias)
 
     def apply_scaled_mm(self, **kwargs) -> torch.Tensor:

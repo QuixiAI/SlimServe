@@ -554,7 +554,12 @@ def init_kv_cache(
         in ("longcat_flash", "longcat_flash_ngram")
         else 1
     )
-    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
+    bind_kv_cache(
+        kv_caches,
+        forward_context,
+        runner_kv_caches,  # type: ignore[arg-type]
+        num_attn_module,
+    )
     return kv_caches
 
 
@@ -769,6 +774,7 @@ def build_attn_metadata(
                     )
                 )
     if steady_sig is not None:
+        assert steady_cache is not None  # steady_sig requires steady_eligible
         steady_cache["sig"] = steady_sig
         steady_cache["attn_metadata"] = attn_metadata
         steady_cache["groups"] = steady_groups

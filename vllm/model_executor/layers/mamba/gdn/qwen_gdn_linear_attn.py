@@ -3,7 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 from einops import rearrange
@@ -349,7 +349,7 @@ class ChunkGatedDeltaRule(CustomOp):
             core_attn_out=core_attn_out,
         )
         if not output_final_state:
-            final_state = None
+            final_state = None  # type: ignore[assignment]
         return o, final_state
 
 
@@ -421,7 +421,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._forward_method = self.forward_mps
             # Metal GDN kernel gate: resolved lazily on the first core call
             # (the state pools are not bound yet here). None = unresolved.
-            self._metal_gdn: object | None = None
+            self._metal_gdn: Any = None
         else:
             self._forward_method = self.forward_cuda
 
@@ -433,7 +433,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             bias=False,
             prefix=f"{prefix}.conv1d",
         )
-        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
+        self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)  # type: ignore[operator]
 
         # projection of the input hidden states
         # Qwen3-Next and Qwen3.5 has a different qkv_proj layout,
@@ -462,7 +462,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
 
-        self.conv1d.weight.weight_loader = mamba_v2_sharded_weight_loader(
+        self.conv1d.weight.weight_loader = mamba_v2_sharded_weight_loader(  # type: ignore[union-attr]
             [
                 query_key_settings,
                 query_key_settings,
@@ -1345,8 +1345,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         )
 
         # 1. Convolution sequence transformation
@@ -1357,9 +1358,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.conv1d.bias,
                 self.activation,
                 conv_state,
-                attn_metadata.has_initial_state,
-                attn_metadata.non_spec_state_indices_tensor,
-                attn_metadata.non_spec_query_start_loc,
+                attn_metadata.has_initial_state,  # type: ignore[arg-type]
+                attn_metadata.non_spec_state_indices_tensor,  # type: ignore[arg-type]
+                attn_metadata.non_spec_query_start_loc,  # type: ignore[arg-type]
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             mixed_qkv = causal_conv1d_update_native(
@@ -1461,7 +1462,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             self._metal_gdn = state
         return state is not False
 
-    def _resolve_metal_gdn(self) -> object:
+    def _resolve_metal_gdn(self) -> Any:
         """Decide once, at the first core call (the state pools are bound by
         then), whether the five-kernel Metal GDN path can serve this layer,
         and cache the fp32 parameter copies it needs. Any failed contract
@@ -1590,7 +1591,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         head_k_dim, head_v_dim = self.head_k_dim, self.head_v_dim
 
         cu_all = attn_metadata.non_spec_query_start_loc
-        state_indices = attn_metadata.non_spec_state_indices_tensor[:num_seqs]
+        state_indices = attn_metadata.non_spec_state_indices_tensor[:num_seqs]  # type: ignore[index]
         if not st.checked_indices:
             # One-time host check: the kernels index the pools directly, so
             # a PAD_SLOT_ID (-1) entry would read out of bounds in gdn_recur.
@@ -1607,11 +1608,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # never-written pool row can hold Inf/NaN bit patterns and
             # 0 * Inf would poison the state instead of clearing it.
             keep = attn_metadata.prefill_has_initial_state
-            rows = attn_metadata.prefill_state_indices.long()
+            rows = attn_metadata.prefill_state_indices.long()  # type: ignore[union-attr]
             zero = torch.zeros((), dtype=torch.float32, device=conv_state.device)
-            conv_state[rows] = torch.where(keep[:, None, None], conv_state[rows], zero)
+            conv_state[rows] = torch.where(keep[:, None, None], conv_state[rows], zero)  # type: ignore[index]
             ssm_state[rows] = torch.where(
-                keep[:, None, None, None], ssm_state[rows], zero
+                keep[:, None, None, None],  # type: ignore[index]
+                ssm_state[rows],
+                zero,  # type: ignore[index]
             )
 
         if (
@@ -1628,7 +1631,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ba[:num_actual_tokens],
                 st.conv_w,
                 conv_state,
-                cu_all,
+                cu_all,  # type: ignore[arg-type]
                 state_indices,
                 st.A_log,
                 st.dt_bias,
@@ -1647,7 +1650,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a = a.contiguous()
             b = b.contiguous()
             conv_out = qc.gdn_short_conv(
-                x, st.conv_w, conv_state, cu_all, state_indices, True, True
+                x,
+                st.conv_w,
+                conv_state,
+                cu_all,  # type: ignore[arg-type]
+                state_indices,
+                True,
+                True,  # type: ignore[arg-type]
             )
             q, k, v = qc.gdn_qkv_prepare(
                 conv_out,
@@ -1670,7 +1679,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 decay[:num_decode_tokens],
                 beta[:num_decode_tokens],
                 ssm_state,
-                cu_all[: num_decodes + 1],
+                cu_all[: num_decodes + 1],  # type: ignore[index]
                 state_indices[:num_decodes],
                 num_k_heads,
                 num_v_heads,
@@ -1687,8 +1696,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 decay[num_decode_tokens:],
                 beta[num_decode_tokens:],
                 ssm_state,
-                attn_metadata.prefill_query_start_loc,
-                attn_metadata.prefill_state_indices,
+                attn_metadata.prefill_query_start_loc,  # type: ignore[arg-type]
+                attn_metadata.prefill_state_indices,  # type: ignore[arg-type]
                 num_k_heads,
                 num_v_heads,
                 head_k_dim,
@@ -1783,23 +1792,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
             spec_tab = attn_metadata.spec_state_indices_tensor
             accepted = attn_metadata.num_accepted_tokens
-            if accepted.dtype != torch.int32:
-                accepted = accepted.to(torch.int32)
+            if accepted.dtype != torch.int32:  # type: ignore[union-attr]
+                accepted = accepted.to(torch.int32)  # type: ignore[union-attr]
             cache = SimpleNamespace(
                 slot_table=spec_tab,
-                conv_slots=spec_tab[:, 0].contiguous(),
-                num_accepted=accepted.contiguous(),
-                spec_cu=attn_metadata.spec_query_start_loc[: num_spec_decodes + 1],
+                conv_slots=spec_tab[:, 0].contiguous(),  # type: ignore[index]
+                num_accepted=accepted.contiguous(),  # type: ignore[union-attr]
+                spec_cu=attn_metadata.spec_query_start_loc[: num_spec_decodes + 1],  # type: ignore[index]
                 spec_indx=(
-                    attn_metadata.spec_token_indx.long() if num_prefills > 0 else None
+                    attn_metadata.spec_token_indx.long() if num_prefills > 0 else None  # type: ignore[union-attr]
                 ),
                 non_spec_indx=(
-                    attn_metadata.non_spec_token_indx.long()
+                    attn_metadata.non_spec_token_indx.long()  # type: ignore[union-attr]
                     if num_prefills > 0
                     else None
                 ),
             )
-            attn_metadata._mps_spec_cache = cache
+            attn_metadata._mps_spec_cache = cache  # type: ignore[attr-defined]
 
         pure_spec = num_prefills == 0
         if pure_spec:
@@ -1850,23 +1859,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Non-spec rows (all prefills here). Fresh sequences pre-zero
             # their pool rows exactly as the non-spec path does.
             keep = attn_metadata.prefill_has_initial_state
-            rows = attn_metadata.prefill_state_indices.long()
+            rows = attn_metadata.prefill_state_indices.long()  # type: ignore[union-attr]
             zero = torch.zeros((), dtype=torch.float32, device=conv_state.device)
-            conv_state[rows] = torch.where(keep[:, None, None], conv_state[rows], zero)
+            conv_state[rows] = torch.where(keep[:, None, None], conv_state[rows], zero)  # type: ignore[index]
             ssm_state[rows] = torch.where(
-                keep[:, None, None, None], ssm_state[rows], zero
+                keep[:, None, None, None],  # type: ignore[index]
+                ssm_state[rows],
+                zero,  # type: ignore[index]
             )
 
             qkvz_ns = mixed_qkv[:num_actual_tokens].index_select(0, cache.non_spec_indx)
             ba_ns = ba[:num_actual_tokens].index_select(0, cache.non_spec_indx)
             cu_ns = attn_metadata.non_spec_query_start_loc
-            slots_ns = attn_metadata.non_spec_state_indices_tensor[:num_prefills]
+            slots_ns = attn_metadata.non_spec_state_indices_tensor[:num_prefills]  # type: ignore[index]
             qn, kn, vn, decayn, betan = qc.gdn_fused_prepare(
                 qkvz_ns,
                 ba_ns,
                 st.conv_w,
                 conv_state,
-                cu_ns,
+                cu_ns,  # type: ignore[arg-type]
                 slots_ns,
                 st.A_log,
                 st.dt_bias,
@@ -1886,7 +1897,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 decayn,
                 betan,
                 ssm_state,
-                cu_ns[: num_prefills + 1],
+                cu_ns[: num_prefills + 1],  # type: ignore[index]
                 slots_ns,
                 num_k_heads,
                 num_v_heads,
@@ -2185,8 +2196,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a = a[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         )
 
         if spec_sequence_masks is not None:
@@ -2196,10 +2208,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b_spec = b
                 mixed_qkv_non_spec = None
             else:
-                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)
-                a_spec = a.index_select(0, spec_token_indx)
-                b_spec = b.index_select(0, spec_token_indx)
-                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)
+                mixed_qkv_spec = mixed_qkv.index_select(0, spec_token_indx)  # type: ignore[arg-type]
+                a_spec = a.index_select(0, spec_token_indx)  # type: ignore[arg-type]
+                b_spec = b.index_select(0, spec_token_indx)  # type: ignore[arg-type]
+                mixed_qkv_non_spec = mixed_qkv.index_select(0, non_spec_token_indx)  # type: ignore[arg-type]
         else:
             mixed_qkv_spec = None
             mixed_qkv_non_spec = mixed_qkv
@@ -2209,7 +2221,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # spec_state_indices_tensor is always set when spec_sequence_masks is set
             assert spec_state_indices_tensor is not None
             mixed_qkv_spec = causal_conv1d_update(
-                mixed_qkv_spec,
+                mixed_qkv_spec,  # type: ignore[arg-type]
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
@@ -2237,7 +2249,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
+                query_start_loc=non_spec_query_start_loc,  # type: ignore[arg-type]
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
@@ -2279,8 +2291,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
             if spec_sequence_masks is not None:
-                a_non_spec = a.index_select(0, non_spec_token_indx)
-                b_non_spec = b.index_select(0, non_spec_token_indx)
+                a_non_spec = a.index_select(0, non_spec_token_indx)  # type: ignore[arg-type]
+                b_non_spec = b.index_select(0, non_spec_token_indx)  # type: ignore[arg-type]
             else:
                 a_non_spec = a
                 b_non_spec = b
@@ -2442,8 +2454,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 dtype=core_attn_out_non_spec.dtype,
                 device=core_attn_out_non_spec.device,
             )
-            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)
-            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
+            merged_out.index_copy_(1, spec_token_indx, core_attn_out_spec)  # type: ignore[arg-type]
+            merged_out.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)  # type: ignore[arg-type]
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
@@ -2478,8 +2490,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state = self_kv_cache[1]
 
         # 1. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         )
 
         mixed_qkv_non_spec, b, a = (
@@ -2550,8 +2563,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         )
         mixed_qkv_non_spec = causal_conv1d_update(
             mixed_qkv,
@@ -2628,8 +2642,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if is_conv_state_dim_first()
             else self.kv_cache[0].transpose(-1, -2)
         )
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         )
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
@@ -2758,7 +2773,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         layer_norm_fwd(
             x_2d,
             self.norm.weight.contiguous(),
-            self.norm.bias,
+            self.norm.bias,  # type: ignore[arg-type]
             self.norm.eps,
             z=output_gate_2d,
             out=out_2d,
@@ -2908,8 +2923,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         state_indices = attn_metadata.non_spec_state_indices_tensor[  # type: ignore[index]
             :num_seqs
         ].to(torch.long)
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         ).to(torch.float32)
         conv_bias = (
             self.conv1d.bias.to(torch.float32) if self.conv1d.bias is not None else None
@@ -3097,7 +3113,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         consts = self.__dict__.get("_fused_gdn_const_cache")
         if consts is None:
             w = self.conv1d.weight
-            conv_weight = w.view(w.size(0), w.size(-1)).to(torch.float32).contiguous()
+            conv_weight = w.view(w.size(0), w.size(-1)).to(torch.float32).contiguous()  # type: ignore[operator]
             conv_bias = (
                 self.conv1d.bias.to(torch.float32).contiguous()
                 if self.conv1d.bias is not None
@@ -3218,8 +3234,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if not mixed:
                 return
 
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        conv_weights = self.conv1d.weight.view(  # type: ignore[operator]
+            self.conv1d.weight.size(0),  # type: ignore[operator]
+            self.conv1d.weight.size(2),  # type: ignore[operator]
         ).to(torch.float32)
         conv_bias = (
             self.conv1d.bias.to(torch.float32) if self.conv1d.bias is not None else None

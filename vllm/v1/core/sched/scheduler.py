@@ -1946,7 +1946,7 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
+            batch = KVEventBatch(ts=time.time(), events=events)  # type: ignore[arg-type]
             self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
