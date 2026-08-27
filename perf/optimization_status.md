@@ -12163,3 +12163,25 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Validation in flight (dynfix.log): degenerate-schedule config that
   measured 801 with the syncing writes; expected ~846-871 (static
   parity). The real-schedule 3x3 re-verdict follows.
+
+## 2026-08-27 - Dynamic-k SHIP-GATE verdict: machinery free, schedule ships as documented option
+
+- With the sync-free draft writes, the degenerate control reached static
+  parity (dynfix c32: 842.7/833.8/846.6 vs static 831-858) - the entire
+  dynamic-k machinery is now measured at zero cost.
+- Real schedule [[1,4,3],[5,32,2]] ship-gate: c32 823.8/831.8/816.8
+  (mean 824, -2.6% vs static mean 846), c4 394.9 (+19.5% vs 330.5),
+  c32 acceptance 0.621 vs 0.644. The residual c32 gap equals the
+  tokens/step arithmetic of the acceptance delta exactly: it is schedule
+  CONTENT (k=3 drafting during ramp/drain), not implementation.
+- Per the pre-committed rule (ship as default only if c32 lands in the
+  static band): mean 824 vs band floor 831 -> ships as a DOCUMENTED
+  OPTION in the profile notes; static k=2 remains the default because
+  c32 is the profile's peak operating point. Deployments with
+  latency-shaped (low-concurrency) traffic should flip the overrides.
+- Pattern complete for future profiles: schedule in speculative_overrides
+  + capture ceiling covering (k_max+1) x max_num_seqs is all a profile
+  needs; capture, dispatch, drafting, padding, and verify-width behavior
+  are automatic and pinned by tests/v1/worker/test_cudagraph_dispatch.py.
+- Raw: dynfix.log, dynship.log, bench_dynship_* under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
