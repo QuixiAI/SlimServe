@@ -11369,6 +11369,115 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   which step first diverges. Their sums are already extracted; our side needs
   hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
 
+## 2026-08-25 - Metal Profile Validation Sweep: 2 PASS, 1 blocked, DSV4 registry geometry FAILS on 128 GiB
+
+- Scope: every registry profile compatible with this machine (M5 Max,
+  128 GiB), each with its registered drafter, via the real server path
+  (`slimserve <profile> --serve`) and seeded shipped-defaults requests
+  (seed 42, no sampling overrides). Vision profiles got text + image
+  requests (synthetic red-bordered rectangle + blue ellipse PNG).
+  Harness: perf/results/2026-08-25/profile-validation/validate_profile.py.
+- glm52-xxs-1: BLOCKED by the registry, correctly -- IQ2_XXS needs
+  256 GiB unified memory (this box has 128) and the profile is also
+  status-gated (Metal sparse-MLA unvalidated). Not substituted.
+- qwen38-q2kxl-1: PASS text+image. Health 19-21 s warm. Text: coherent
+  Jupiter-moons answer, 221 tokens in 5.8 s, DFlash 2 acceptance 43.7%
+  (mean len 2.31). Image: vision path healthy without torchvision (PIL
+  fallback); shipped thinking mode deliberates at length on the shapes
+  image (2048 tokens still thinking, grounded pixel-arithmetic
+  reasoning, no loop); offline smoke shows the completed answer path.
+- muse-kdyn-1: PASS text+image. Artifacts fetched by slimserve.fetch
+  (registry-exact sizes; the Aug-10 local copies were a different
+  revision). Health 32 s. Text coherent; image answer describes the
+  shapes exactly, finish=stop, 264 tokens in 23.6 s. DFlash acceptance
+  mean len 2.4-3.0.
+- dsv4-xxs-1: FAIL at registry geometry. Server reached health (537 s
+  cold) and returned 200s, but output is multilingual token soup at
+  1.1 tok/s with 0/55 draft tokens accepted. This is the pending
+  close-out from 2026-08-24 (registry.log's resp1 was an EngineCore
+  500; small-geometry smoke was healthy).
+- Bisect (offline probes, ctx 3072 fixed, only kv_cache_memory_bytes
+  varied; seeded, same prompt; raw in ~/.local/scratch/dsv4-geom/):
+  1 GiB 29.9 tok/s coherent; 4 GiB 30.8 coherent (head byte-identical);
+  8 GiB 27.3 coherent; 9 GiB 26.2 coherent; 12 GiB 3.6 tok/s COHERENT
+  but crawling; 16 GiB 1.9 tok/s GIBBERISH. Context length is
+  exonerated (all probes at 3072; the 262144 resize never entered).
+- Mechanism: weights+drafter stack is 93.6 GiB;
+  torch.mps.recommended_max_memory() = 107.52 GiB on this box.
+  93.6+9 = 102.6 fits (fast, correct); +12 = 105.6 approaches the limit
+  (driver paging, 7x slowdown, still correct); +16 = 109.6 exceeds it
+  (non-resident reads return garbage rather than faulting). Classic
+  working-set eviction: perf degrades before correctness.
+- Not an int32/uint32 offset bug: 4 GiB (2^32 bytes) and 9 GiB pools
+  are clean, so 32-bit byte/element offset theories are all ruled out.
+  Branch exonerated too: metal-decode-sync-removal's small-geometry
+  output matches the 08-24 main-stack smoke.
+- Decision: dsv4-xxs-1's Metal override (16 GiB KV) does not fit a
+  128 GiB machine alongside 93.6 GiB of weights. Options for the fix
+  owner: size the Metal KV pool from
+  recommended_max_memory - weights - margin (8 GiB here keeps ~300K
+  fp8_ds_mla tokens and measured 27 tok/s), and/or add a boot-time
+  guard refusing geometries whose planned residency exceeds the
+  device working set -- today it serves garbage with HTTP 200.
+- Raw: perf/results/2026-08-25/profile-validation/ (server/engine logs,
+  raw request JSON per profile) and ~/.local/scratch/dsv4-geom/probe_*.
+
+## 2026-08-25 - FIXED: Metal KV pools are fitted to the device working set
+
+- Baseline: the validation sweep earlier today. dsv4-xxs-1 at its
+  registry geometry served multilingual token soup at 1.1 tok/s with 0%
+  draft acceptance while returning HTTP 200; the KV-pool bisect showed
+  <=9 GiB coherent at 26-31 tok/s, 12 GiB coherent at 3.6, 16 GiB
+  garbage.
+- Hypothesis: the profile's fixed pool is honoured verbatim, and on
+  unified memory an oversized pool is not an OOM. Since
+  `_pin_weights_resident` pins the weight heaps, the KV pool is what the
+  driver evicts, so decode reads non-resident pages and returns garbage
+  with no error to catch.
+- Change (vllm/v1/worker/metal_worker.py): new
+  `_fit_kv_pool_to_working_set`, applied on both budget paths in
+  `determine_available_memory`. It measures residency from
+  `torch.accelerator.get_memory_info` (which on Metal reports against
+  `recommendedMaxWorkingSetSize`), keeps back max(4 GiB, 4% of the
+  working set) for activations/scratch/fragmentation, grants the smaller
+  of the request and that budget, and raises when under 0.5 GiB would
+  remain instead of booting a doomed geometry. The granted value is
+  written back to `cache_config.kv_cache_memory_bytes` so the log line
+  and the KV allocator agree. Only the Metal worker changed; the CUDA
+  path is untouched, since a discrete GPU answers an oversized pool with
+  a real OOM.
+- Why residency is measured, not declared: DSV4 IQ2_XXS is 87.3 GiB of
+  files but loads to 93.57 GiB, and Muse's Q4_K_XL is 18.3 GiB of files
+  at 42.66 GiB resident (1.07x to 2.0x). No profile can compute this
+  from artifact sizes, which is exactly how the 16 GiB figure was
+  derived wrongly.
+- Correctness/measurement, all through `slimserve <profile> --serve`
+  with registered drafters and seeded shipped defaults:
+  - dsv4-xxs-1: PASS. Clamp fired -- "Requested 16.00 GiB KV pool does
+    not fit this machine; using 6.52 GiB" (96.70 GiB resident of the
+    107.52 GiB working set, 4.30 GiB reserved). 880,117 KV tokens, 3.36x
+    concurrency at 262,144 per request. Coherent Jupiter-moons answer,
+    256 tokens in 10.84 s = 23.6 tok/s, spec accepting (mean length
+    1.51). Was 1.1 tok/s of garbage.
+  - qwen38-q2kxl-1: unchanged. 12 GiB granted exactly, no clamp, text
+    output byte-identical to the pre-fix run.
+  - muse-kdyn-1: unchanged. 12 GiB granted exactly, no clamp, image
+    answer identical, finish=stop.
+- Also corrected: the dsv4-xxs-1 Metal profile note in profiles.json
+  contained the bad arithmetic in prose (artifact bytes vs a guessed
+  ~115 GiB working set). It now states the pool is a ceiling the worker
+  fits to the machine, and records the real figures.
+- Tests: tests/v1/worker/test_metal_kv_pool_fit.py (8 cases: exact grant
+  when it fits, the DSV4 clamp, refusal when nothing useful fits, the
+  floor boundary, reserve scaling on a 512 GiB machine, and that the fit
+  never inflates a request). Suite: 45 passed / 103 skipped. Ruff clean.
+- Decision: RETAINED. Remaining follow-up: the 6.52 GiB grant is the
+  safe floor, not a tuned figure -- the bisect showed 8-9 GiB pools
+  decoding at 26-27 tok/s on this box, so the 4 GiB reserve could be
+  revisited with a measured activation peak for DSV4.
+- Raw: perf/results/2026-08-25/profile-validation/ (post-fix server logs
+  and per-request JSON) and ~/.local/scratch/dsv4-geom/probe_*.
+
 ## 2026-08-25 - FIX: DFlash drafter wrote K/V in the wrong cache layout
 
 - Status: RESOLVED. DFlash2 speculation now passes the full profile smoke on
@@ -11813,3 +11922,116 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   (valley root-caused and fixed; crash under watch flag with its suspect
   path removed); profile serves the best-known config with recorded
   validation.
+## 2026-08-25 - Tuned the Metal KV reserve: 4 GiB -> 7 GiB (measured, not guessed)
+
+- Baseline: the fit shipped with a 4 GiB reserve floor, and its notebook
+  entry suggested the reserve was conservative because the earlier
+  KV-pool bisect showed 8-9 GiB pools decoding at 26-27 tok/s. That
+  bisect used ONE sequence. It understated memory demand badly.
+- Method: new harness
+  `perf/results/2026-08-25/kv-reserve-tuning/measure_activation_peak.py`
+  boots a profile at its registered geometry, stresses it at its OWN
+  configured batch width (max_num_seqs concurrent requests whose prompts
+  each exceed max_num_batched_tokens, so chunked prefill runs full-width
+  while decode carries max sequences), and samples device residency at
+  20 Hz throughout. Peak is reported against residency right after KV
+  allocation, which is exactly what the reserve must cover.
+  Two traps found while building it: the engine runs in a separate
+  EngineCore process by default, so the parent measured 0.0 GiB
+  residency (fixed with VLLM_ENABLE_V1_MULTIPROCESSING=0 plus a hard
+  failure when the baseline is implausibly small); and activation peak
+  is set by per-step batch width, not total prompt tokens, so the first
+  oversized-prompt version just ran 11 minutes for the same answer.
+- Measurements (M5 Max, 107.52 GiB working set):
+  | profile | pool | transient peak | peak resident | spare | tok/s |
+  |---|---|---|---|---|---|
+  | qwen38-q2kxl-1 (16 seqs x 2048) | 12.00 | 0.085 | 41.23 | 66.29 | - |
+  | dsv4-xxs-1 (32 seqs x 2176) | 6.52 | 5.411 | 106.64 | 0.88 | 22.17 |
+  | dsv4-xxs-1 | 4.00 | 6.411 | 105.13 | 2.39 | 22.62 |
+  | dsv4-xxs-1 (tuned) | 3.82 | 6.411 | 104.94 | 2.58 | 22.68 |
+- Finding, which REVERSES the earlier suggestion: DSV4's transient peak
+  under its own registered batch width is 5.4-6.4 GiB -- larger than the
+  4 GiB reserve. The 6.52 GiB grant survived only because post-KV
+  residency lands ~2 GiB below the naive weights+pool prediction, and it
+  came within 0.88 GiB of the working set at peak. The reserve was too
+  small in the dangerous direction, not too large.
+  Qwen3.8's transient is 0.085 GiB by contrast: the gap is architectural
+  (43 layers, sparse-MLA indexer scratch, 32 seqs, drafter), not a
+  batch-width scaling law, which is why the reserve stays a flat floor
+  anchored on the heaviest profile instead of a fitted formula.
+- The KV pool is not the transient: 90,560 prompt tokens commit only
+  ~0.67 GiB at DSV4's 7,954 bytes/token, and the transient peak is the
+  same 6.411 GiB at a 4.00 GiB pool as at 3.82 GiB. Total peak residency
+  grows ~0.6 GiB per GiB of pool (measured slope over two points).
+- Change: _KV_RESERVE_MIN_BYTES 4 GiB -> 7 GiB, chosen so a stressed
+  engine keeps ~2.5 GiB of the working set spare.
+- Result on dsv4-xxs-1: grant 6.52 -> 3.82 GiB, KV capacity 880,117 ->
+  515,461 tokens (still 1.97x the profile's 262,144 max_model_len),
+  peak residency 106.64 -> 104.94 GiB, spare 0.88 -> 2.58 GiB. Stress
+  throughput 22.17 -> 22.68 tok/s and server-path single-request output
+  byte-identical: the safety costs no measurable throughput.
+- Correctness: server path through `slimserve dsv4-xxs-1 --serve` with
+  the registered DSpark drafter and seeded shipped defaults returns the
+  same coherent answer as before the tune. Suite 45 passed / 103
+  skipped; ruff clean.
+- Decision: RETAINED. Follow-up if DSV4 ever needs more KV: the reserve
+  is dominated by sparse-MLA indexer and prefill scratch, so lowering
+  max_num_batched_tokens or max_num_seqs would free reserve directly --
+  measure before trading it.
+- Raw: perf/results/2026-08-25/kv-reserve-tuning/ (harness, peak-*.json,
+  logs) and perf/results/2026-08-25/profile-validation/.
+
+## 2026-08-26 - RETAINED: D=256 decode via partition+reduce (+6% gsm8k, essay wash)
+
+- Baseline: qwen38-q2kxl-1 D=256 attention entirely on the SDPA gather
+  path after the 2026-08-25 plain-kernel rejection (~15% slower,
+  under-occupancy: one simdgroup per (head, batch) = ~96 simdgroups at
+  decode widths). The rejection entry named this exact follow-up.
+- Change:
+  - Threaded the explicit 64-bit kv_block_stride through
+    paged_attention_partition and paged_attention_verify
+    (paged_attn_v2.metal buffer 17, launchers, host ops), same contract
+    as the plain kernel: hybrid blocks-first strided views walk
+    stride(0), bit-identical addressing for contiguous callers (fp16
+    partition site only; the fp8 partition and cascade kernels keep
+    contiguous addressing -- their callers pass dense caches).
+  - New host op paged_attention_partitioned(q, k, v, bt, ctx, scale,
+    window, max_context_len): partition (512-token slices) + exact
+    online-softmax reduce in one encode. max_context_len comes from the
+    HOST-side seq_lens copy -- sizing from the device tensor would be a
+    per-layer pipeline drain, the class the campaign just removed.
+    paged_attention_verify grew the same defaulted arg (its internal
+    context_lens.max().item() sync now only fires for callers without a
+    host bound).
+  - metal_attn.py: _PARTITIONED_HEAD_SIZES = (256,). Decode and the
+    expanded verify path route 256 through the partitioned op; the mq
+    verify gate dropped its head_size != 256 exclusion (the kernel now
+    walks strided caches) and both gates now read seq_lens_cpu instead
+    of seq_lens_gpu.max().item() (removes a per-call device sync that
+    also fired on the 64/128 expansion path).
+  - New instantiation paged_attention_verify_bfloat16_256: qwen38's
+    full-attention layers are bf16 and the mq route engages past 1k
+    ctx; found live when the long-context smoke aborted with "kernel
+    not found in metallib". kt/vt tiles 16 KB, inside the 32 KB budget.
+- Correctness: synthetic parity vs SDPA ground truth (rel <= 3e-4)
+  across D=256 strided qwen38-shape (batch 4 + single), D=128/64
+  contiguous (also bit-vs-plain-kernel), and the m=4 verify per-row
+  causal boundaries at 1.5k ctx. Live: seeded bench seed-stable both
+  arms; 3.6k-ctx prompt engages mq on all 16 layers and summarizes
+  coherently. NOTE: outputs are numerically exact but NOT bit-identical
+  to SDPA (different reduction order); at temp 1.0 the essay trajectory
+  flips one word ("discover" -> "generate") at a sampling boundary.
+  gsm8k trajectory unchanged.
+- Measured (same-conditions A/B, box warm, 3 repeats each):
+  - partitioned: essay 26.5-28.2, gsm8k 44.95-45.00
+  - SDPA route:  essay 25.9-28.5, gsm8k 41.68-42.71
+  Essay is a wash (both runs decline across repeats -- thermal, not the
+  route); gsm8k +6.4%, from getting D=256 verify/decode off the SDPA
+  per-request gather loop. The plain-kernel failure mode does not
+  recur: short contexts are 1 partition (occupancy-neutral vs plain but
+  fused), long contexts split.
+- Decision: RETAINED. Follow-ups mapped: partitioned route for 64/128
+  at long context (currently plain-kernel); mq engage log prints once
+  per layer (16 lines) on first long request.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_part.log,
+  spec_sdpa_ab.log, longctx_mq_smoke2.log, paged_partitioned_parity.py.
