@@ -11207,3 +11207,58 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   measure before trading it.
 - Raw: perf/results/2026-08-25/kv-reserve-tuning/ (harness, peak-*.json,
   logs) and perf/results/2026-08-25/profile-validation/.
+
+## 2026-08-26 - RETAINED: D=256 decode via partition+reduce (+6% gsm8k, essay wash)
+
+- Baseline: qwen38-q2kxl-1 D=256 attention entirely on the SDPA gather
+  path after the 2026-08-25 plain-kernel rejection (~15% slower,
+  under-occupancy: one simdgroup per (head, batch) = ~96 simdgroups at
+  decode widths). The rejection entry named this exact follow-up.
+- Change:
+  - Threaded the explicit 64-bit kv_block_stride through
+    paged_attention_partition and paged_attention_verify
+    (paged_attn_v2.metal buffer 17, launchers, host ops), same contract
+    as the plain kernel: hybrid blocks-first strided views walk
+    stride(0), bit-identical addressing for contiguous callers (fp16
+    partition site only; the fp8 partition and cascade kernels keep
+    contiguous addressing -- their callers pass dense caches).
+  - New host op paged_attention_partitioned(q, k, v, bt, ctx, scale,
+    window, max_context_len): partition (512-token slices) + exact
+    online-softmax reduce in one encode. max_context_len comes from the
+    HOST-side seq_lens copy -- sizing from the device tensor would be a
+    per-layer pipeline drain, the class the campaign just removed.
+    paged_attention_verify grew the same defaulted arg (its internal
+    context_lens.max().item() sync now only fires for callers without a
+    host bound).
+  - metal_attn.py: _PARTITIONED_HEAD_SIZES = (256,). Decode and the
+    expanded verify path route 256 through the partitioned op; the mq
+    verify gate dropped its head_size != 256 exclusion (the kernel now
+    walks strided caches) and both gates now read seq_lens_cpu instead
+    of seq_lens_gpu.max().item() (removes a per-call device sync that
+    also fired on the 64/128 expansion path).
+  - New instantiation paged_attention_verify_bfloat16_256: qwen38's
+    full-attention layers are bf16 and the mq route engages past 1k
+    ctx; found live when the long-context smoke aborted with "kernel
+    not found in metallib". kt/vt tiles 16 KB, inside the 32 KB budget.
+- Correctness: synthetic parity vs SDPA ground truth (rel <= 3e-4)
+  across D=256 strided qwen38-shape (batch 4 + single), D=128/64
+  contiguous (also bit-vs-plain-kernel), and the m=4 verify per-row
+  causal boundaries at 1.5k ctx. Live: seeded bench seed-stable both
+  arms; 3.6k-ctx prompt engages mq on all 16 layers and summarizes
+  coherently. NOTE: outputs are numerically exact but NOT bit-identical
+  to SDPA (different reduction order); at temp 1.0 the essay trajectory
+  flips one word ("discover" -> "generate") at a sampling boundary.
+  gsm8k trajectory unchanged.
+- Measured (same-conditions A/B, box warm, 3 repeats each):
+  - partitioned: essay 26.5-28.2, gsm8k 44.95-45.00
+  - SDPA route:  essay 25.9-28.5, gsm8k 41.68-42.71
+  Essay is a wash (both runs decline across repeats -- thermal, not the
+  route); gsm8k +6.4%, from getting D=256 verify/decode off the SDPA
+  per-request gather loop. The plain-kernel failure mode does not
+  recur: short contexts are 1 partition (occupancy-neutral vs plain but
+  fused), long contexts split.
+- Decision: RETAINED. Follow-ups mapped: partitioned route for 64/128
+  at long context (currently plain-kernel); mq engage log prints once
+  per layer (16 lines) on first long request.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_part.log,
+  spec_sdpa_ab.log, longctx_mq_smoke2.log, paged_partitioned_parity.py.
