@@ -34,6 +34,10 @@ Budget selection follows these rules:
    uses `medium`. Every map must therefore define `medium`.
 4. A scalar server value applies to every reasoning effort.
 
+A malformed server default (unknown map keys, a map without `medium`, or
+invalid budget values) fails the server at boot when generation-config
+defaults are loaded, not on the first request.
+
 The omitted-level `medium` fallback is budget-selection policy; it does not
 rewrite the model template's own default. Clients that need the prompt-level
 effort instruction and the cutoff label to match exactly should send

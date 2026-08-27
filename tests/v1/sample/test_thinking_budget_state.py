@@ -388,3 +388,41 @@ def test_reasoning_effort_none_ignores_scalar_default_and_explicit_budget():
         is None
     )
     assert get_effective_thinking_token_budget(64, 1000, {}, "none") is None
+
+
+@pytest.mark.parametrize(
+    "bad_budget",
+    [
+        {"low": 4_096},  # missing `medium`
+        {"medium": 8_192, "turbo": 16_384},  # unknown level
+        {"medium": None},
+        {"medium": 1.5},
+        -2,
+    ],
+)
+def test_bad_budget_default_fails_at_config_time(bad_budget):
+    """A malformed operator default must fail when generation-config defaults
+    are loaded (server boot), not on the first chat request."""
+    from vllm.config.model import ModelConfig
+
+    stub = SimpleNamespace(
+        generation_config="vllm",
+        override_generation_config={"thinking_token_budget": bad_budget},
+    )
+    with pytest.raises(VLLMValidationError):
+        ModelConfig.get_diff_sampling_param(stub)
+
+
+@pytest.mark.parametrize(
+    "good_budget",
+    [{"medium": 8_192}, {"low": 1_024, "medium": 8_192, "high": 0}, 256, -1, 0],
+)
+def test_good_budget_default_passes_config_time(good_budget):
+    from vllm.config.model import ModelConfig
+
+    stub = SimpleNamespace(
+        generation_config="vllm",
+        override_generation_config={"thinking_token_budget": good_budget},
+    )
+    diff = ModelConfig.get_diff_sampling_param(stub)
+    assert diff["thinking_token_budget"] == good_budget

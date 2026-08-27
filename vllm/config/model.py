@@ -1566,6 +1566,17 @@ class ModelConfig:
             diff_sampling_param = {
                 p: config.get(p) for p in available_params if config.get(p) is not None
             }
+            if "thinking_token_budget" in diff_sampling_param:
+                # Fail at boot on a malformed operator default (bad map keys,
+                # missing `medium`, bad values) instead of rejecting every
+                # request at serve time.
+                from vllm.sampling_params import (
+                    validate_thinking_token_budget_config,
+                )
+
+                validate_thinking_token_budget_config(
+                    diff_sampling_param["thinking_token_budget"]
+                )
             # Huggingface definition of max_new_tokens is equivalent
             # to vLLM's max_tokens
             if "max_new_tokens" in diff_sampling_param:

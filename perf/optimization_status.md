@@ -16386,3 +16386,25 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   medium (to_sampling_params gained default_reasoning_effort, passed by
   the chat serving layer). This closes the effort-sourcing gap from the
   PR #13 review.
+
+## 2026-08-27 - Thinking budgets: bad server default now fails at boot (closes the last PR #13 review item)
+
+- The map/scalar validation that lived only inside
+  get_effective_thinking_token_budget (per request) is extracted to
+  validate_thinking_token_budget_config and invoked from
+  ModelConfig.get_diff_sampling_param, which every serving handler
+  constructor calls at startup (7 call sites: chat, completion,
+  responses, speech-to-text, scale-out x2, LLM entrypoint). A bad
+  operator default (unknown map keys, missing medium, bad values,
+  scalar < -1) now kills the server at boot instead of 400ing every
+  request. The per-request path re-validates via the same helper, so
+  programmatically supplied maps keep the same errors.
+- Live proof (dummy-load boot of qwen38-nvfp4-1's checkpoint):
+  {"thinking_token_budget": {"low": 100}} -> exit 1 during
+  OpenAIServingResponses init with "map must define `medium`", zero
+  startup-complete lines; control boot with {"low": 1024,
+  "medium": 4096} reaches Application startup complete.
+- Tests: 10 new config-time cases (5 bad shapes raise from
+  get_diff_sampling_param, 5 good shapes pass through); both budget
+  suites 52/52; mypy hook green. This makes the PR #13 text's
+  "rejected at config time" claim true as written.

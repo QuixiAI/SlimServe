@@ -83,6 +83,43 @@ RequestThinkingTokenBudget = Annotated[
 ]
 
 
+def validate_thinking_token_budget_config(value) -> None:
+    """Validate an operator-supplied ``thinking_token_budget`` default.
+
+    Accepts the legacy scalar or a map keyed by ``reasoning_effort``. Called
+    at CONFIG time (when generation-config defaults are loaded), so a bad
+    map fails the server at boot instead of rejecting every request.
+    """
+    if isinstance(value, dict):
+        invalid_levels = set(value) - CONFIGURABLE_REASONING_EFFORTS
+        if invalid_levels:
+            raise VLLMValidationError(
+                "`thinking_token_budget` map contains unsupported reasoning "
+                f"effort levels: {sorted(invalid_levels)}. Supported levels "
+                f"are {sorted(CONFIGURABLE_REASONING_EFFORTS)}.",
+                parameter="thinking_token_budget",
+                value=value,
+            )
+        if DEFAULT_REASONING_EFFORT not in value:
+            raise VLLMValidationError(
+                "`thinking_token_budget` map must define `medium`, which is "
+                "used when reasoning_effort is omitted or absent from the map.",
+                parameter="thinking_token_budget",
+                value=value,
+            )
+        for level_budget in value.values():
+            if level_budget is None:
+                raise VLLMValidationError(
+                    "`thinking_token_budget` map values must be non-negative "
+                    "integers or -1 for unlimited.",
+                    parameter="thinking_token_budget",
+                    value=value,
+                )
+            validate_thinking_token_budget(level_budget)
+    else:
+        validate_thinking_token_budget(value)
+
+
 def get_effective_thinking_token_budget(
     request_budget: int | None,
     max_tokens: int,
@@ -113,31 +150,9 @@ def get_effective_thinking_token_budget(
         return None
 
     if isinstance(configured_budget, dict):
-        invalid_levels = set(configured_budget) - CONFIGURABLE_REASONING_EFFORTS
-        if invalid_levels:
-            raise VLLMValidationError(
-                "`thinking_token_budget` map contains unsupported reasoning "
-                f"effort levels: {sorted(invalid_levels)}. Supported levels are "
-                f"{sorted(CONFIGURABLE_REASONING_EFFORTS)}.",
-                parameter="thinking_token_budget",
-                value=configured_budget,
-            )
-        if DEFAULT_REASONING_EFFORT not in configured_budget:
-            raise VLLMValidationError(
-                "`thinking_token_budget` map must define `medium`, which is "
-                "used when reasoning_effort is omitted or absent from the map.",
-                parameter="thinking_token_budget",
-                value=configured_budget,
-            )
-        for level, level_budget in configured_budget.items():
-            if level_budget is None:
-                raise VLLMValidationError(
-                    "`thinking_token_budget` map values must be non-negative "
-                    "integers or -1 for unlimited.",
-                    parameter="thinking_token_budget",
-                    value=configured_budget,
-                )
-            validate_thinking_token_budget(level_budget)
+        # Server defaults were validated at config time; re-validating here
+        # keeps programmatically supplied maps honest at trivial cost.
+        validate_thinking_token_budget_config(configured_budget)
 
         level = reasoning_effort or DEFAULT_REASONING_EFFORT
         configured_budget = configured_budget.get(
