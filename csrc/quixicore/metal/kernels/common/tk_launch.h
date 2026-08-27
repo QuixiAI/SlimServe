@@ -988,8 +988,8 @@ template <class E>
 void launch_gemma_rms_norm_add_dyn(E& e, typename E::in_t x,
                                    typename E::in_t residual,
                                    typename E::in_t w, typename E::out_t o,
-                                   typename E::out_t res_out, uint32_t M,
-                                   int D, float eps) {
+                                   typename E::out_t res_out, uint32_t M, int D,
+                                   float eps) {
   e.pipeline("mittens::gemma_rms_norm_add_dyn");
   e.in(x, 0);
   e.in(residual, 1);
@@ -1514,12 +1514,11 @@ void launch_gdn_fused_prepare(
     typename E::out_t conv_state_pool, typename E::in_t cu_seqlens,
     typename E::in_t slot_mapping, typename E::in_t A_log,
     typename E::in_t dt_bias, typename E::out_t q, typename E::out_t k,
-    typename E::out_t v, typename E::out_t decay, typename E::out_t beta,
-    int R, int Hk, int Hv, int Dk, int Dv, int kernel_size, int load_initial,
+    typename E::out_t v, typename E::out_t decay, typename E::out_t beta, int R,
+    int Hk, int Hv, int Dk, int Dv, int kernel_size, int load_initial,
     int qkvz_stride, int ba_stride, int conv_state_stride, float eps,
-    float q_scale, float k_scale, int state_cols,
-    typename E::in_t num_accepted, int spec_mode,
-    const std::string& type_name) {
+    float q_scale, float k_scale, int state_cols, typename E::in_t num_accepted,
+    int spec_mode, const std::string& type_name) {
   e.pipeline(gdn_fused_prepare_kernel_name(type_name, Dk, Dv));
   e.in(qkvz, 0);
   e.in(ba, 1);
@@ -1590,8 +1589,8 @@ void launch_gdn_recur_spec(E& e, typename E::in_t q, typename E::in_t k,
 //        stride z_stride@6, head stride D) weight@2 -> out@3 ; rows@4 Hv@5
 //        eps@7 ; grid (rows, 1, 1), 32 thr. -----
 template <class E>
-void launch_gdn_gated_rmsnorm_f32(E& e, typename E::in_t y,
-                                  typename E::in_t z, typename E::in_t weight,
+void launch_gdn_gated_rmsnorm_f32(E& e, typename E::in_t y, typename E::in_t z,
+                                  typename E::in_t weight,
                                   typename E::out_t out, int rows, int Hv,
                                   int dim, int z_stride, float eps,
                                   const std::string& type_name) {
@@ -4731,7 +4730,8 @@ void launch_paged_attention_partition(
     typename E::out_t max_logits, typename E::out_t exp_sums, int batch,
     int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    int window, float softcap, const std::string& type_name) {
+    int window, float softcap, uint64_t kv_block_stride,
+    const std::string& type_name) {
   e.pipeline(paged_attention_partition_kernel_name(type_name, head_size));
   e.in(q, 0);
   e.in(key_cache, 1);
@@ -4750,6 +4750,7 @@ void launch_paged_attention_partition(
   e.bytes(partition_size, 14);
   e.bytes(window, 15);
   e.bytes(softcap, 16);
+  e.bytes(kv_block_stride, 17);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 
@@ -4764,7 +4765,7 @@ void launch_paged_attention_verify(
     typename E::out_t max_logits, typename E::out_t exp_sums, int m_rows,
     int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    int window, const std::string& type_name) {
+    int window, uint64_t kv_block_stride, const std::string& type_name) {
   e.pipeline("paged_attention_verify_" + type_name + "_" +
              std::to_string(head_size));
   e.in(q, 0);
@@ -4784,6 +4785,7 @@ void launch_paged_attention_verify(
   e.bytes(partition_size, 14);
   e.bytes(window, 15);
   e.bytes(m_rows, 16);
+  e.bytes(kv_block_stride, 17);
   e.dispatch(num_heads, 1, num_partitions, m_rows * 32, 1, 1);
 }
 
@@ -6517,8 +6519,8 @@ void launch_qgemv_mb(E& e, typename E::out_t d, typename E::in_t wq,
 // Caller guards: N % 4 == 0, K % 16 == 0, contiguous inputs.
 template <class E>
 void launch_qgemv_fp8ch(E& e, typename E::out_t d, typename E::in_t wq,
-                        typename E::in_t x, typename E::in_t w_scale,
-                        int N, int K, const std::string& type_name) {
+                        typename E::in_t x, typename E::in_t w_scale, int N,
+                        int K, const std::string& type_name) {
   e.pipeline(type_name == "bfloat16" ? "qgemv_fp8ch_bfloat16" : "qgemv_fp8ch");
   e.out(d, 0);
   e.in(wq, 1);
@@ -6534,9 +6536,8 @@ void launch_qgemv_fp8ch(E& e, typename E::out_t d, typename E::in_t wq,
 // per pair. Caller guards: batch-1's plus M even.
 template <class E>
 void launch_qgemv_fp8ch_mb(E& e, typename E::out_t d, typename E::in_t wq,
-                           typename E::in_t x, typename E::in_t w_scale,
-                           int N, int K, int M,
-                           const std::string& type_name) {
+                           typename E::in_t x, typename E::in_t w_scale, int N,
+                           int K, int M, const std::string& type_name) {
   e.pipeline(type_name == "bfloat16" ? "qgemv_fp8ch_mb_bfloat16"
                                      : "qgemv_fp8ch_mb");
   e.out(d, 0);
@@ -6619,8 +6620,8 @@ void launch_qgemv_fp8ch_mv4r(E& e, typename E::out_t d, typename E::in_t wq,
 template <class E>
 void launch_qgemv_nvfp4_mv4r(E& e, typename E::out_t d, typename E::in_t wq,
                              typename E::in_t x, typename E::in_t w_scale,
-                             typename E::in_t global_scale, int N, int K,
-                             int M, const std::string& type_name) {
+                             typename E::in_t global_scale, int N, int K, int M,
+                             const std::string& type_name) {
   e.pipeline(type_name == "bfloat16" ? "qgemv_nvfp4_mv4r_bfloat16"
                                      : "qgemv_nvfp4_mv4r");
   e.out(d, 0);
@@ -6769,17 +6770,13 @@ void launch_qc_swiglu(E& e, typename E::in_t x, typename E::out_t y, int n_out,
 // per (head, token); q_out/gate_out/k_out contiguous. positions index
 // dtype selects the _i64/_i32 instantiation.
 template <class E>
-void launch_qk_norm_rope_gate(E& e, typename E::in_t qkv,
-                              typename E::in_t q_w, typename E::in_t k_w,
-                              typename E::in_t cos_sin,
-                              typename E::in_t positions,
-                              typename E::out_t q_out,
-                              typename E::out_t gate_out,
-                              typename E::out_t k_out, int num_q_heads,
-                              int num_k_heads, int head_dim, int rot_dim,
-                              float eps, int qkv_row, int tokens,
-                              const std::string& type_name,
-                              const std::string& idx_name) {
+void launch_qk_norm_rope_gate(
+    E& e, typename E::in_t qkv, typename E::in_t q_w, typename E::in_t k_w,
+    typename E::in_t cos_sin, typename E::in_t positions,
+    typename E::out_t q_out, typename E::out_t gate_out,
+    typename E::out_t k_out, int num_q_heads, int num_k_heads, int head_dim,
+    int rot_dim, float eps, int qkv_row, int tokens,
+    const std::string& type_name, const std::string& idx_name) {
   e.pipeline("qc_qk_norm_rope_gate_" + type_name + "_" + idx_name);
   e.in(qkv, 0);
   e.in(q_w, 1);
@@ -6804,8 +6801,8 @@ void launch_qk_norm_rope_gate(E& e, typename E::in_t qkv,
 // slices pass without a contiguous copy.
 template <class E>
 void launch_qc_dflash_conv(E& e, typename E::in_t x, typename E::in_t delta,
-                           typename E::in_t base, typename E::out_t out,
-                           int H, int num_groups, int group_size, int taps,
+                           typename E::in_t base, typename E::out_t out, int H,
+                           int num_groups, int group_size, int taps,
                            int block_size, int delta_row_stride, int total,
                            const std::string& type_name) {
   e.pipeline("qc_dflash_conv_" + type_name);
@@ -7417,13 +7414,15 @@ void launch_tq_attention_combined(
 //       int32 with -1 = leave row unwritten; grid (n_rows, Hkv, 1),
 //       head_size threads. -----
 template <class E>
-void launch_tq_decode_combined(
-    E& e, typename E::in_t cache, typename E::in_t slots,
-    typename E::in_t v_centroids, typename E::in_t signs,
-    typename E::out_t k_out, typename E::out_t v_out, int n_rows,
-    int num_kv_heads, int head_size, int block_size, int block_stride,
-    int token_stride, int head_stride, int k_bits, int k_signed, int v_bits,
-    const std::string& type_name) {
+void launch_tq_decode_combined(E& e, typename E::in_t cache,
+                               typename E::in_t slots,
+                               typename E::in_t v_centroids,
+                               typename E::in_t signs, typename E::out_t k_out,
+                               typename E::out_t v_out, int n_rows,
+                               int num_kv_heads, int head_size, int block_size,
+                               int block_stride, int token_stride,
+                               int head_stride, int k_bits, int k_signed,
+                               int v_bits, const std::string& type_name) {
   e.pipeline("tq_decode_combined_" + type_name + "_hs" +
              std::to_string(head_size));
   e.in(cache, 0);
@@ -7486,11 +7485,12 @@ void launch_tq_attention_splitk(
 }
 
 template <class E>
-void launch_tq_attention_reduce(
-    E& e, typename E::in_t tmp, typename E::in_t ml, typename E::in_t es,
-    typename E::in_t sinks, typename E::in_t signs, typename E::out_t out,
-    int batch, int num_heads, int head_size, int num_partitions,
-    const std::string& type_name) {
+void launch_tq_attention_reduce(E& e, typename E::in_t tmp, typename E::in_t ml,
+                                typename E::in_t es, typename E::in_t sinks,
+                                typename E::in_t signs, typename E::out_t out,
+                                int batch, int num_heads, int head_size,
+                                int num_partitions,
+                                const std::string& type_name) {
   e.pipeline("tq_attention_reduce_" + type_name + "_hs" +
              std::to_string(head_size));
   e.in(tmp, 0);

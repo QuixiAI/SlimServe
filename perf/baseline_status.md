@@ -3,6 +3,75 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## Qwen3.8-Flash-Next (qwen4_exp)
+
+### 8x RTX 3090 Final Baseline - 2026-08-27 (TQ main-KV @ native 262K)
+
+- Profile `qwen38fn-fp8-8` as registered: TP8+EP, max_model_len 262144
+  (native), TurboQuant k8v4 main QSA KV (VLLM_QWEN4_EXP_TQ_MAIN_KV=1,
+  2.64x vs bf16), max_num_seqs 32, FULL_DECODE_ONLY graphs with
+  max_cudagraph_capture_size 96, MTP k=2 + index share, triton GDN,
+  NCCL_P2P_LEVEL=SYS on the QuixiAI P2P driver (32 GiB BAR1, iommu=pt).
+- Includes the QSA quantized-KV tile-tier fix (narrow tiles + 4 warps for
+  TQ/fp8 paths); every TQ/fp8 serving number recorded before 2026-08-27
+  ~10:00 was afflicted by the wide-tile collapse and is superseded.
+- Workload: exact 1,000 input / 2,000 output tokens, temp 1.0 / top_p
+  0.95 / top_k 20, seed 42. slimserve-launched validation run:
+
+| Concurrency | Aggregate tok/s | Draft acceptance |
+| ---: | ---: | ---: |
+| 1 | 130.9-136.2 | 58.9% |
+| 8 | 547.0-585.0 | 58.1% |
+| 16 | 838.2 | 62.4% |
+| 32 | 879.6-881.6 | 64.5% |
+
+- bf16 KV @131072 measures the same within noise at c8-c32 (587/870/861)
+  and ~8% faster at c1 (148.8); it cannot fit the native 262144.
+- Campaign net: bring-up (SHM collectives, bf16, 128K, c8-limited) peaked
+  at 409.7 tok/s; the final config reaches 881.6 at c32 with double the
+  context - 2.15x, from the P2P fabric (+36-58%), the capture-size fix
+  (c32 +55%), and the quantized-KV tile fix (c16 +29%, TQ made ~free).
+- Raw: perf/results/2026-08-27/qwen38fn-3090-p2p/ (bench_expP_*,
+  bench_final_*, cliff_exp*.log chain documents the root-cause work).
+
+### 8x RTX 3090 FP8 P2P Baseline - 2026-08-27 (historical)
+
+- Same model/profile/workload as the 2026-08-26 bring-up baseline below,
+  after the collective-fabric overhaul: QuixiAI P2P driver 610.57.04,
+  32 GiB BAR1 on all GPUs (per-boot resize service), `iommu=pt`,
+  NCCL_P2P_LEVEL=SYS (24.7 GB/s all-reduce busbw vs 2.7 SHM), plus the
+  Phase-A winners pinned in the profile (triton GDN decode,
+  index_share_for_mtp_iteration, MTP k=2).
+
+| Concurrency | Aggregate tok/s | vs bring-up |
+| ---: | ---: | ---: |
+| 1 | 148.81 | +35.8% |
+| 8 | 647.88 | +58.2% |
+
+Raw results: perf/results/2026-08-27/qwen38fn-3090-p2p/. This is the
+current reference for all qwen38fn-fp8-8 comparisons; the 2026-08-26 table
+below is historical (no-P2P SHM collectives).
+
+### 8x RTX 3090 FP8 Bring-up Baseline - 2026-08-26 (historical)
+
+- Model: Qwen/Qwen3.8-Flash-Next-FP8 (block-128 FP8 experts, BF16 backbone,
+  47.7 GiB FP8 n-gram table in pinned host memory via VLLM_QWEN4_EXP_PLE_HOST).
+- Profile: `qwen38fn-fp8-8` -- TP8 + expert parallel, Marlin W8A16 MoE,
+  max_model_len 131072, FULL prefill+decode graphs, MTP k=2.
+- Workload: exact 1,000 input tokens, exact 2,000 output tokens, shipped
+  thinking-mode sampling (temp 1.0 / top_p 0.95 / top_k 20), seed 42.
+
+| Concurrency | Aggregate tok/s | Mean wall s | Exact | Draft acceptance |
+| ---: | ---: | ---: | --- | ---: |
+| 1 | 109.61 | 18.25 | yes | 54.2% |
+| 2 | 206.77 | 18.08 | yes | 73.0% |
+| 4 | 283.30 | 27.37 | yes | 67.8% |
+| 8 | 409.66 | 37.44 | yes | 62.4% |
+
+Raw results: perf/results/2026-08-26/qwen38fn-3090-bringup/. This is the
+first live baseline on this platform; the no-P2P collective ceiling has not
+yet been profiled, so treat it as a bring-up baseline, not an optimized one.
+
 ## DeepSeek V4 Flash 0731
 
 ### Ampere A100 Exact Native Baseline - 2026-08-09

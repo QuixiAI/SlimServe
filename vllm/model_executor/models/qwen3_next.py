@@ -109,6 +109,7 @@ def _qc_qk_rope_kernel_available() -> bool:
             _QC_QK_ROPE_AVAILABLE = False
     return _QC_QK_ROPE_AVAILABLE
 
+
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
@@ -572,7 +573,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
-        positions: torch.Tensor = None,
+        positions: torch.Tensor,
         **kwargs: object,
     ):
         full_num_tokens = positions.shape[-1]

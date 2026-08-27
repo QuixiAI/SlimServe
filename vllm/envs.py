@@ -142,6 +142,11 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_NVFP4_EMULATION_CACHE_WEIGHTS: bool = True
     VLLM_NVFP4_TRITON_GEMM: bool = True
+    VLLM_QWEN4_EXP_PLE_HOST: bool = False
+    VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
+    VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
+    VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -1238,8 +1243,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ROCm NVFP4: fused triton w4a16 GEMM reading packed weights directly.
     # Set to 0 to fall back to the emulation kernel.
+    "VLLM_GDN_DECODE_KERNEL": env_with_choices(
+        "VLLM_GDN_DECODE_KERNEL",
+        "cuda",
+        ["cuda", "triton"],
+        case_sensitive=False,
+    ),
+    # Keep the Qwen4Exp n-gram (PLE) embedding tables in pinned host memory and
+    # gather rows from the GPU over UVA instead of holding the tables in VRAM.
+    "VLLM_QWEN4_EXP_PLE_HOST": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_PLE_HOST", "False").lower() in ("true", "1")
+    ),
+    # Store the Qwen4Exp main QSA KV cache in FP8 (unit scale) and dequantize
+    # in the sparse-attention kernel; the indexer cache, raw-key ring and GDN
+    # state keep their own dtypes. Halves the dominant KV-slab term.
+    "VLLM_QWEN4_EXP_FP8_MAIN_KV": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_FP8_MAIN_KV", "False").lower() in ("true", "1")
+    ),
     "VLLM_NVFP4_TRITON_GEMM": lambda: (
         os.getenv("VLLM_NVFP4_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Store the Qwen4Exp main QSA KV as TurboQuant k8v4 (e4b15 keys, 4-bit
+    # uniform values with per-slot fp16 scale/zero): ~2.64x smaller than
+    # bf16, decoded in-register by the QSA gather kernel. Mutually exclusive
+    # with VLLM_QWEN4_EXP_FP8_MAIN_KV.
+    "VLLM_QWEN4_EXP_TQ_MAIN_KV": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_TQ_MAIN_KV", "False").lower() in ("true", "1")
+    ),
+    # Allow the custom allreduce on >2 PCIe-only GPUs. Requires working GPU
+    # P2P with a full-size BAR1 (e.g. the QuixiAI patched driver on GeForce);
+    # without that the P2P probe fails and the gate below still disables it.
+    "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
+        os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

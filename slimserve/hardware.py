@@ -163,6 +163,8 @@ def _classify(device_name: str) -> str | None:
         return "mi300x"
     if "a100" in lowered:
         return "a100"
+    if "3090" in lowered:
+        return "rtx3090"
     return None
 
 

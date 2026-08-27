@@ -352,14 +352,22 @@ def _reshape_kv_cache(
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
                 page_size_bytes = kv_cache_spec.page_size_bytes
-                # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                # int8 page view per layer; the layer's bind_kv_cache unpacks
-                # each block's bytes into its conv/ssm state views. Keeping
-                # one tensor per layer lets the KV connector register it
-                # without special-casing Mamba.
-                kv_caches[layer_name] = kv_raw_tensor[
-                    : num_blocks * page_size_bytes
-                ].view(num_blocks, 1, 1, page_size_bytes)
+                # Hold a single [num_blocks, 1, 1, page_size_bytes] int8 page
+                # view per layer; the layer's bind_kv_cache unpacks each
+                # block's bytes into its conv/ssm state views. Keeping one
+                # tensor per layer lets the KV connector register it without
+                # special-casing Mamba.
+                if packing is not None:
+                    # Packed slab (e.g. the CSA+linear layout): this layer's
+                    # page lives at a fixed byte offset within every block.
+                    offset, blk_stride = packing
+                    kv_caches[layer_name] = kv_raw_tensor.view(-1, blk_stride)[
+                        :, offset : offset + page_size_bytes
+                    ][:, None, None, :]
+                else:
+                    kv_caches[layer_name] = kv_raw_tensor[
+                        : num_blocks * page_size_bytes
+                    ].view(num_blocks, 1, 1, page_size_bytes)
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
@@ -625,7 +633,13 @@ def build_attn_metadata(
         if steady_eligible
         else None
     )
-    if steady_eligible and steady_cache.get("sig") == steady_sig:
+    if steady_eligible:
+        assert steady_cache is not None
+    if (
+        steady_eligible
+        and steady_cache is not None
+        and (steady_cache.get("sig") == steady_sig)
+    ):
         for cm, items in steady_cache["groups"]:
             cm.max_seq_len = max_seq_len
             # The runner allocates seq_lens_cpu_upper_bound fresh every step

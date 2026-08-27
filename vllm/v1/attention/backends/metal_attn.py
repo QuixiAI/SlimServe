@@ -49,7 +49,7 @@ logger = init_logger(__name__)
 # VLLM_QC_PA256=0 drops back to the SDPA gather (null-check / kill switch —
 # the kernel's online softmax rounds differently than the torch-SDPA path,
 # so shas roll when it turns on).
-_PAGED_HEAD_SIZES = (64, 128)
+_PAGED_HEAD_SIZES: tuple[int, ...] = (64, 128)
 if os.environ.get("VLLM_QC_PA256", "1") != "0":
     _PAGED_HEAD_SIZES = (64, 128, 256)
 
@@ -351,7 +351,7 @@ class MetalAttentionImpl(AttentionImpl):
         import os
 
         ctx_max = int(os.environ.get("VLLM_EXPAND_CTX_MAX", "100000"))
-        return int(metadata.seq_lens_gpu.max().item()) <= ctx_max
+        return metadata.seq_lens_cpu_max <= ctx_max
 
     def _expanded_block_decode_applies(
         self, metadata: MetalAttentionMetadata, num_tokens: int
@@ -498,6 +498,7 @@ class MetalAttentionImpl(AttentionImpl):
         out = output.view(num_tokens, num_heads, head_size)
 
         if page_local:
+            assert dense_kv is not None
             kc_kernel = dense_kv
             vc_kernel = dense_kv[1:]
             kernel_block_table = attn_metadata.block_table * 2
@@ -552,21 +553,20 @@ class MetalAttentionImpl(AttentionImpl):
                 # kernel shares each K/V read across the m rows (measured
                 # 3.9x at 9.9k ctx; parity exact). Windowed layers keep the
                 # expansion path (scan capped by the window -- a wash).
+                # Host-side lengths for the gate and partition sizing: the
+                # device max would sync the pipeline once per layer.
+                ctx_max_host = attn_metadata.seq_lens_cpu_max
                 use_mq = (
                     self.sliding_window is None
                     and attn_metadata.num_reqs == 1
-                    # The verify kernel does not walk strided caches yet;
-                    # head_dim 256 implies the hybrid pool's strided views,
-                    # so it stays on the expansion path (which does).
-                    and self.head_size != 256
-                    and int(seq_lens.max().item()) > 1024
+                    and ctx_max_host > 1024
                 )
                 if use_mq:
                     if not getattr(self, "_mq_logged", False):
                         self._mq_logged = True
                         logger.info(
                             "multi-query verify attention engaged (ctx=%d)",
-                            int(seq_lens.max().item()),
+                            ctx_max_host,
                         )
                     # Page-local caches: key_cache/value_cache are strided
                     # views the verify kernel's contiguity contract rejects;
@@ -581,6 +581,7 @@ class MetalAttentionImpl(AttentionImpl):
                             seq_lens,
                             self.scale,
                             0,
+                            ctx_max_host,
                         )
                     )
                     return output
@@ -668,15 +669,16 @@ class MetalAttentionImpl(AttentionImpl):
         # that drains the whole in-flight queue. Causal groups (target
         # prefill SDPA) keep the exact path: their bound rows are precise, and
         # the loop below is byte-identical to the pre-bound-mode code there.
-        bound_mode = not metadata.causal and metadata.seq_lens_cpu_bound is not None
-        if bound_mode:
-            seq_lens = metadata.seq_lens_cpu_bound
-        elif metadata.bound_exact and metadata.seq_lens_cpu_bound is not None:
+        bound = metadata.seq_lens_cpu_bound
+        bound_mode = not metadata.causal and bound is not None
+        if bound is not None and bound_mode:
+            seq_lens = bound
+        elif bound is not None and metadata.bound_exact:
             # Pure-prefill batch: the bound equals the exact lens row-for-row
             # (see bound_exact), so skip the D2H that blocks on every queued
             # prefill chunk (~hundreds of ms per prefill event). Geometry
             # below stays on the exact path — only the lens source changes.
-            seq_lens = metadata.seq_lens_cpu_bound
+            seq_lens = bound
         else:
             seq_lens = metadata.seq_lens_cpu
         num_kv_heads = self.num_kv_heads
