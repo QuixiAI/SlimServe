@@ -409,8 +409,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         # only emit 0 (handled by the runner's skip) or the full k, so
         # anything else is a scheduler/config bug -- fail loudly rather
         # than silently verifying a mismatched width.
-        assert num_steps is None or num_steps == self.num_speculative_tokens, (  # type: ignore[attr-defined]
-            f"DFlash drafts a fixed block of {self.num_speculative_tokens}; "  # type: ignore[attr-defined]
+        assert num_steps is None or num_steps == self.num_speculative_steps, (
+            f"DFlash drafts a fixed block of {self.num_speculative_steps}; "
             f"the scheduler asked for num_steps={num_steps}"
         )
         # Bound for this call only; refreshed (including back to None) on
