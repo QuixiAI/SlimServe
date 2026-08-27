@@ -63,6 +63,7 @@ class BaseSpeculator(ABC):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
         draft_grammar=None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         pass
 
