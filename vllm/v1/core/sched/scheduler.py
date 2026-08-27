@@ -58,7 +58,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    AcceptanceThrottle,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -249,6 +252,7 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.sd_accept_throttle = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -256,6 +260,10 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
+            # Acceptance-adaptive drafting (VLLM_SD_ADAPT_THROTTLE=1):
+            # pause drafting while measured acceptance says it is a net
+            # loss, re-probing periodically. See AcceptanceThrottle.
+            self.sd_accept_throttle = AcceptanceThrottle.from_env()
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -1143,6 +1151,10 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.sd_accept_throttle is not None:
+            num_spec_tokens_to_schedule = self.sd_accept_throttle.gate(
+                num_spec_tokens_to_schedule
+            )
 
         scheduled_encoder_input_stats = None
         if (
@@ -1716,6 +1728,8 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                if self.sd_accept_throttle is not None:
+                    self.sd_accept_throttle.observe(num_draft_tokens, num_accepted)
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
