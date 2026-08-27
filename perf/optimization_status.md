@@ -15996,3 +15996,29 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   carries the full vision tower (333 tensors) and torchvision is no
   longer the blocker; the tower is simply unvalidated on the CT Metal
   path.
+
+## 2026-08-27 - Hardening: mypy debt cleared (hook live again); backlog re-ranked
+
+- All 191 mypy errors across the 20 PR-touched files fixed,
+  behavior-neutral by class (int() on .item() counts, @staticmethod on
+  a statically-called proxy, one narrowing assert, Any for the Metal
+  GDN dispatcher handle, targeted type: ignore[code] for torch Module
+  attribute typing). Seeded bench heads byte-identical. Commits no
+  longer need SKIP=mypy-3.10. NOT fixed (out of scope): main-side debt
+  that rode in via the merge (qwen4_exp tree, fp8.py,
+  gpu_model_runner.py, ~400 errors) -- that is main's to clear, on
+  hardware that can test it.
+- PR backlog re-ranked after the k=3-everywhere adoption:
+  1. simdgroup GEMM for M in [9, 32] over quantized weights -- was
+     "only if c4/c8 spec matters"; c4/c8 spec now carries +30-51%, and
+     its verify (m=16/32) rides dense bf16 GEMM against materialized
+     weights. A quantized mid-M GEMM would cut the resident bf16 copy
+     and likely stack on the spec win. Kernel campaign, own gates.
+  2. Acceptance-throttle recovery-latency live gate (cool box, long
+     streams) + M1 Ultra re-gate of the new schedule.
+  3. max_num_batched_tokens revisit under spec (carried from
+     UPDATE 27).
+  4. TQ long-context validation pass at 262k under the new schedule.
+- Box state note: the day's marathon left the box thermally soaked
+  (seeded gsm8k 33.6-34.3 vs the 45 band, heads identical); the
+  baseline re-pin under the new canonical waits for cooldown.
