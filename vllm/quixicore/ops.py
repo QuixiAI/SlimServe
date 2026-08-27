@@ -743,6 +743,35 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def paged_attention_partitioned(
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_lens: torch.Tensor,
+        scale: float,
+        window: int,
+        max_context_len: int,
+    ) -> torch.Tensor:
+        """Partitioned paged decode (partition + reduce, Metal build).
+
+        Splits each (head, batch) query across ceil(max_context_len / 512)
+        KV slices for occupancy at wide head sizes and small batches, then
+        merges with an exact online-softmax reduce. `max_context_len` must
+        come from the host-side sequence lengths — computing it from the
+        device tensor would sync the pipeline once per layer."""
+        return _qc().paged_attention_partitioned(
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            context_lens,
+            scale,
+            window,
+            max_context_len,
+        )
+
+    @staticmethod
     def kv_cache_gather_range(
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -764,6 +793,7 @@ class quixicore_ops:
         context_lens: torch.Tensor,
         scale: float,
         window: int = 0,
+        max_context_len: int = -1,
     ) -> torch.Tensor:
         """Multi-query verify attention: the m rows of a speculative verify
         block cooperate per (head, partition) threadgroup so each K/V tile
@@ -772,7 +802,14 @@ class quixicore_ops:
         applied in-kernel. Measured 3.9x over expansion at 9.9k global ctx,
         parity exact. `q` is [m, heads, head_size]; one request."""
         return _qc().paged_attention_verify(
-            q, key_cache, value_cache, block_table, context_lens, scale, window
+            q,
+            key_cache,
+            value_cache,
+            block_table,
+            context_lens,
+            scale,
+            window,
+            max_context_len,
         )
 
     # ------------------------------------------------------------------
