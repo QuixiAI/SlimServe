@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import defaultdict
+import os
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import product
@@ -121,6 +122,13 @@ class CudaGraphManager:
         assert self.compilation_config is not None
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
+        # Debug: VLLM_CUDAGRAPH_DISPATCH_STATS=N logs a (num_tokens, mode)
+        # histogram every N dispatches. Diagnostic for graph-miss hunting.
+        self._dispatch_stats_every = int(
+            os.getenv("VLLM_CUDAGRAPH_DISPATCH_STATS", "0") or 0
+        )
+        self._dispatch_stats: Counter[tuple[int, str]] = Counter()
+        self._dispatch_calls = 0
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -373,6 +381,7 @@ class CudaGraphManager:
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
+        result: BatchExecutionDescriptor | None = None
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
                 if _is_compatible(
@@ -382,13 +391,26 @@ class CudaGraphManager:
                     uniform_token_count,
                     effective_loras,
                 ):
-                    return desc
-        return BatchExecutionDescriptor(
-            cg_mode=CUDAGraphMode.NONE,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            num_active_loras=effective_loras,
-        )
+                    result = desc
+                    break
+        if result is None:
+            result = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=effective_loras,
+            )
+        if self._dispatch_stats_every:
+            self._dispatch_stats[(num_tokens, str(result.cg_mode))] += 1
+            self._dispatch_calls += 1
+            if self._dispatch_calls % self._dispatch_stats_every == 0:
+                top = self._dispatch_stats.most_common(20)
+                logger.info(
+                    "cudagraph dispatch stats (last %d): %s",
+                    self._dispatch_calls,
+                    ", ".join(f"{t}tok/{m}={c}" for (t, m), c in top),
+                )
+        return result
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""

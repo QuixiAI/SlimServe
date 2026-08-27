@@ -2040,13 +2040,13 @@
           "engine": {
             "tensor_parallel_size": 8,
             "enable_expert_parallel": true,
-            "max_model_len": 131072,
+            "max_model_len": 262144,
             "max_num_seqs": 32,
             "gpu_memory_utilization": 0.9,
             "kv_cache_dtype": "auto",
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "max_cudagraph_capture_size": 96
             },
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
@@ -2061,17 +2061,20 @@
           "env": {
             "VLLM_QWEN4_EXP_PLE_HOST": "1",
             "NCCL_P2P_LEVEL": "SYS",
-            "VLLM_GDN_DECODE_KERNEL": "triton"
+            "VLLM_GDN_DECODE_KERNEL": "triton",
+            "VLLM_QWEN4_EXP_TQ_MAIN_KV": "1"
           },
           "notes": [
             "enable_expert_parallel is a correctness requirement, not a tuning choice: moe_intermediate_size is 640 and the FP8 block scales are [128, 128], so a TP shard of 80 cannot carry exact block scales. EP keeps 64 whole experts per rank (640 = 5 x 128).",
             "moe_backend and linear_backend must be auto, not this fork's aiter defaults: AITER kernels do not exist on CUDA, and the forced-backend path raises at load ('FP8 MoE backend AITER does not support ... device cuda'). Both the top-level flags and kernel_config must be set, since a non-auto top-level flag overwrites kernel_config (same rule the qwen38-nvfp4-1 MI300X profile documents for linear_backend).",
             "SM86 has no FP8 tensor cores and Triton FP8 MoE requires SM89+, so the experts run the Marlin W8A16 block-FP8 MoE kernels (weight-only decode to BF16 compute).",
             "VLLM_QWEN4_EXP_PLE_HOST=1 keeps the full 47.7 GiB n-gram (PLE) table pinned in host RAM per rank and gathers the 16 rows per token (2560 bytes) from the GPU over UVA inside the forward, exactly as the model card intends ('tables prefetched from host memory'). The gather is graph-capturable, so FULL_DECODE_ONLY capture keeps working, and the TP-replicated table removes the per-step embedding all-reduce that this no-P2P platform cannot afford. Host cost: ~48 GiB pinned per rank (~382 GiB total of the 996 GiB box).",
-            "GeForce P2P is disabled, so all-reduces stage through host memory; expect collective latency, not kernel throughput, to bound TP8 decode until measured otherwise.",
+            "Multi-GPU GeForce runs fine on the stock NVIDIA driver but leaves 36-58% of TP throughput on the table: install QuixiAI's P2P driver (github.com/QuixiAI/open-gpu-kernel-modules, see docs/geforce-p2p.md) for direct GPU-GPU DMA. Measured on this profile: c1 109.6->148.8 (+36%), c8 409.7->647.9 (+58%). NCCL_P2P_LEVEL=SYS in this env is required for P2P across root complexes and harmless on stock drivers.",
             "reasoning_parser qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML.",
             "Speculation uses the checkpoint's own single-layer QSA MTP drafter (Qwen4ExpMTP) via method 'mtp'; there is no separate DSpark artifact for this model yet.",
-            "max_model_len is 131072, not the model's native 262144: weights take 17.6 GiB of each 24 GiB card, leaving ~2.2 GiB of KV pool at 0.9 utilization, and a single 262144-token request needs 3.52 GiB (the engine's own estimate of the fitting maximum was 161600 tokens). 128K keeps headroom for concurrent requests; YaRN to 1M is out of reach on this platform."
+            "max_model_len is the model's native 262144, enabled by VLLM_QWEN4_EXP_TQ_MAIN_KV=1: the main QSA KV is stored as TurboQuant k8v4 (fp8 keys + 4-bit values, per-slot f16 scale/zero, 2.64x smaller than bf16), decoded in-register by the sparse-gather kernel. Measured cost vs bf16@131072 is within noise at c8-c32 and ~8% at c1; draft acceptance stays at bf16 parity. bf16 KV cannot fit 262144 on 24 GiB cards (weights take 17.6 GiB).",
+            "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
+            "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps."
           ],
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true
