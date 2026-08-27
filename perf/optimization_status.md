@@ -12093,3 +12093,73 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   the FULL tests/models/qwen4_exp run since the shm-PLE additions, passes
   alone and in every pairwise combination. Repro:
   pytest tests/models/qwen4_exp/ -q. Tracked, not yet root-caused.
+
+## 2026-08-27 - Dynamic-k WORKING on V2; c4 +18.6%; c32 under repetition test
+
+- After the family-staging fix, family-range clipping, and the memory
+  diagnosis (4000 allocator-OOM retries at unclipped two-family capture ->
+  0 after clipping; c32 no longer throttles to batch 16), dynamic
+  [[1,4,3],[5,32,2]] vs static k=2 on the IDENTICAL raw config
+  (TQ@262K, seqs 32, cap 128, trimmed capture list):
+  | c  | dynamic | static | delta  |
+  | 1  | 129-142 | ~131-136 (profile band) | wash  |
+  | 4  | 391.9   | 330.5  | +18.6% |
+  | 8  | 554-561 | 547-585 (profile band)  | wash  |
+  | 32 | 765.3   | 857.5  | -10.8% |
+- The c4 win is the pattern's payoff and is real (same-config control).
+  The c32 deficit decomposes into ~4% lower acceptance (59.8 vs 63.9 -
+  possibly plain sampling variance; the c8 acceptance band spans
+  58.1-66.0 across identical configs) and ~7% unattributed. Repetition
+  matrix (c32 x3 per config, dynrep/statrep) in flight before any
+  ship/no-ship call; the schedule stays OUT of the registered profile
+  until it wins or ties everywhere.
+- Pattern hardening shipped regardless (registry-relevant for future
+  profiles): per-family padded-up candidate staging, per-family batch
+  ranges clipped to the schedule (+/-4 margin), drafter-manager guard,
+  draft-view config guard, propose(num_steps), handler-width verify
+  control, scheduler prev-k padding - all pinned by
+  tests/v1/worker/test_cudagraph_dispatch.py (7 pure-Python tests incl.
+  an exhaustive batch x qlen sweep and a graph-budget bound).
+
+## 2026-08-27 - Dynamic-k c32 deficit fully attributed: machinery is free; the max-k-sized verify path costs 5%
+
+- Three-way controlled decomposition at c32 (TQ@262K, seqs 32, cap 128,
+  trimmed capture list, 3 runs each):
+  | config                                        | mean tok/s | accept |
+  | static k=2 (num_spec=2, no schedule)          | 845.7      | 0.644  |
+  | dynamic machinery, k=2 everywhere, num_spec=3 | 801.2      | 0.652  |
+  | dynamic machinery, k=2 everywhere, num_spec=2 | 871.0      | -      |
+  | dynamic schedule [[1,4,3],[5,32,2]]           | 787.8      | 0.617  |
+- Conclusions: (1) the dynamic-k machinery itself costs nothing (row 3 >=
+  static); (2) the whole step-rate deficit is the verify path being sized
+  by the CONFIG MAX k (sampler built decode_query_len=4 wide, per-seq
+  slots at 4) while steady rows are 3 tokens - a ~33% width tax on the
+  sampler stage worth ~5% of the step; (3) the residual acceptance dip
+  under the real schedule is schedule content (k=3 ramp/drain drafting).
+- Remaining engineering to make the real schedule free at c32: size the
+  verify/sampler path per step by the scheduled k instead of the config
+  maximum. Until then the schedule is a documented option (+18.6% at c4,
+  -7% at c32), not the profile default.
+- Raw: dynrep/statrep/dyndeg/dyndeg2 logs and benches under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Dynamic-k steady-state deficit ROOT-CAUSED: two synchronizing index_put_ per step
+
+- The "max-k width tax" hypothesis was wrong. GPU trace diff of the
+  num_spec=3 vs num_spec=2 degenerate configs (identical drafting) showed
+  per-step GPU time equal within 2% and kernel shares flat - but the
+  wider config fit 10% fewer steps into the capture window at LOWER GPU
+  utilization (39.6% vs 44.5% busy): the cost was host-side gap time.
+- CPU-op diff named it: aten::index_put_ at 2 calls/step x 13.8 ms in the
+  wide config vs 1 call/step x 0.056 ms in the narrow one. The draft
+  buffer write `buf[idx_mapping, :k] = drafts` plus the `-1` tail fill
+  use sliced advanced indexing, which falls onto a synchronizing path
+  when the slice does not cover the full row - each call drains the GPU
+  pipeline and erases the async-scheduling overlap.
+- FIX (model_runner.py): pad drafts to buffer width with one F.pad, then
+  a single full-row advanced-index write (the fast path); the handler
+  receives the pre-pad [reqs, k] tensor directly instead of a sliced
+  re-read of the persistent buffer.
+- Validation in flight (dynfix.log): degenerate-schedule config that
+  measured 801 with the syncing writes; expected ~846-871 (static
+  parity). The real-schedule 3x3 re-verdict follows.

@@ -1698,6 +1698,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             draft_grammar = self.draft_structured_output_state.begin_draft(input_batch)
 
+        drafted_this_step: torch.Tensor | None = None
         if self.speculator is not None:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -1729,28 +1730,39 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             finally:
                 if draft_grammar is not None:
                     draft_grammar.rollback()
-            num_drafted = draft_tokens.shape[1]
-            self.req_states.draft_tokens[
-                input_batch.idx_mapping, :num_drafted
-            ] = draft_tokens
-            if num_drafted < self.req_states.draft_tokens.shape[1]:
-                # Stale columns must not leak into a later wider step.
-                self.req_states.draft_tokens[
-                    input_batch.idx_mapping, num_drafted:
-                ] = -1
+            # The handler consumes the un-padded [reqs, k] drafts; its
+            # column count sets next step's verify length.
+            drafted_this_step = draft_tokens
+            buf_width = self.req_states.draft_tokens.shape[1]
+            if draft_tokens.shape[1] < buf_width:
+                # Pad to the buffer width BEFORE the scatter: a full-row
+                # advanced-index write stays on torch's fast non-syncing
+                # path, while a sliced one (buf[idx, :k] plus a tail fill)
+                # falls onto a synchronizing index_put_ measured at 13.8 ms
+                # per call - two of those per step erased the async overlap
+                # and was the entire dynamic-k steady-state deficit.
+                draft_tokens = torch.nn.functional.pad(
+                    draft_tokens,
+                    (0, buf_width - draft_tokens.shape[1]),
+                    value=-1,
+                )
+            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None).
             # The handed-over width is the draft count the scheduler will
-            # verify next step; slice to what was actually drafted so a
-            # dynamic-k step schedules 1 + k, not 1 + max_k.
-            width = self.req_states.draft_tokens.shape[1]
-            if self.speculator is not None and num_spec_scheduled:
-                width = min(width, num_spec_scheduled)
+            # verify next step; the speculator branch above kept the
+            # un-padded [reqs, k] tensor for exactly this (avoiding a
+            # sliced advanced-index read on the persistent buffer).
+            if drafted_this_step is not None:
+                handler_drafts = drafted_this_step
+            else:
+                handler_drafts = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
             self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping, :width],
+                input_batch, handler_drafts
             )
 
         # Post-step KV connector related operations.
