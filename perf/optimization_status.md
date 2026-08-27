@@ -16251,3 +16251,21 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Gates on the merged tree: suites 125 passed / 105 skipped; c1 sonnet
   anchor 21.74/21.55 tok/s sha 7dd1fc9874df 2/2 -- BIT-EXACT to the
   final re-pin. No csrc changes; no Metal rebuild.
+
+## 2026-08-27 - Long-context multi-turn chat gate on the post-review canonical: PASS
+
+- Gap called out by the user: the CodeRabbit round (tiled fallback,
+  steady-memo invalidation, throttle per-step observe) had been gated
+  only by unit tests + single-turn exact-token runs, while several of
+  those changes matter most under long multi-turn context.
+- Gate (perf/results/2026-08-27/nvfp4-baseline/multiturn_chat.py):
+  6-turn chat on canonical qwen38-nvfp4-1, seeded shipped defaults;
+  needle A planted at turn 1 (~3k ctx), needle B at turn 3, context
+  grown 2,955 -> 13,343 prompt tokens; retrieval asked at turn 6.
+- Result: BOTH needles EXACT at 13.3k ('731942, 447.25 MHz'); all
+  turns served without error; drafter acceptance 2.72 across the
+  conversation with the throttle live; the mq-verify 256 route engaged
+  from turn 1 onward (ctx > 1024). Intermediate turns' empty content at
+  60-80-token caps is the known qwen3 thinking-mode budget behavior --
+  re-verified: the same turn at 400 tokens finishes thinking and
+  answers with finish=stop.
