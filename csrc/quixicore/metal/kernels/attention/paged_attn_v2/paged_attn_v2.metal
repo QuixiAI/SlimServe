@@ -658,8 +658,11 @@ kernel void cascade_prefix_partition_fp8(
 
 instantiate_paged_v2(float32, float, 64)
 instantiate_paged_v2(float32, float, 128)
-// head_dim 256 (Qwen3.8 GQA): VALUES_PER_LANE=8, kt/vt threadgroup tiles
-// 2*16*256*2B = 16 KB — inside the 32 KB budget.
+// D=256 (Qwen3.8 full attn): VALUES_PER_LANE=8, kt/vt threadgroup tiles
+// 2*16*256*2B = 16 KB — inside the 32 KB budget. For decode, the split-K
+// pair is the ONLY viable route at this head size — the monolithic
+// kernel's one-simdgroup-per-head walk measured 0.9 GB/s at 24 heads /
+// batch 1 (N4 census).
 instantiate_paged_v2(float32, float, 256)
 instantiate_paged_v2(float16, half, 64)
 instantiate_paged_v2(float16, half, 128)

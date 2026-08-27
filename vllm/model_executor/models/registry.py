@@ -399,6 +399,8 @@ _SPECULATIVE_DECODING_MODELS = {
     "Qwen3_5MoeMTP": ("qwen3_5_mtp", "Qwen3_5MoeMTP"),
     "Qwen4ExpMTP": ("vllm.models.qwen4_exp", "Qwen4ExpMTP"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
+    # HF-safetensors and GGUF-built spellings of the same published drafter.
+    "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
     "DFlash2QwenDraftModel": ("qwen3_dflash2", "DFlash2QwenDraftModel"),
     "DFlashMuseGlimmerDraftModel": (
         "muse_glimmer_dflash",

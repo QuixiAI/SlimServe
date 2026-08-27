@@ -91,6 +91,12 @@ class GGUFConfigParser(ConfigParserBase):
             config = build_qwen35_config_from_gguf(str(model))
         elif architecture == "glm-dsa":
             config = build_config_from_gguf(str(model))
+        elif architecture == "qwen35":
+            from vllm.transformers_utils.gguf_qwen35 import (
+                build_qwen35_config_from_gguf,
+            )
+
+            config = build_qwen35_config_from_gguf(str(model))
         else:
             raise ValueError(f"Unsupported GGUF architecture: {architecture}")
         return config.to_dict(), config

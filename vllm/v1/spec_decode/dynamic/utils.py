@@ -146,3 +146,110 @@ def build_dynamic_sd_schedule_lookup(
         )
 
     return dense_schedule
+
+
+class AcceptanceThrottle:
+    """Pause drafting while measured acceptance says it is a net loss.
+
+    A fixed per-batch-size schedule cannot serve both content regimes: the
+    same DFlash2 drafter measured mean acceptance 3.7 (of a k=3 max 4) on
+    essay prose and 1.2 on Shakespeare verse, which at c8 is +51% with
+    drafting on prose and -35% on verse (2026-08-27 sweep,
+    perf/results/2026-08-27/nvfp4-baseline/). This throttle keeps drafting
+    on by default and reacts to the measured draft efficiency:
+
+    - ``observe()`` folds each step's (drafted, accepted) into an EMA of
+      accepted/drafted.
+    - ``gate()`` passes the scheduled K through while the EMA is healthy;
+      after ``warmup_calls`` observations, an EMA below ``min_ratio``
+      pauses drafting for ``pause_steps`` scheduling steps, then re-probes
+      (fresh warmup) so drafting recovers when the content changes.
+
+    Break-even is BATCH-DEPENDENT: at batch 1 the verify rows ride the
+    small-M GEMV band and are nearly free, so drafting measured net
+    -positive (+12%) even at ratio 0.16 on hostile verse -- batches
+    below ``min_batch`` are therefore exempt (never gated), which also
+    keeps batch-1 runs sha-deterministic. At batch >= min_batch the
+    verify rides wider GEMM and ratio 0.33 is ~one accepted token per
+    draft call, roughly break-even; prose measures ~0.90 and verse
+    ~0.07, so the 0.30 default sits in a wide gap. All knobs are
+    env-tunable and the throttle only exists when
+    VLLM_SD_ADAPT_THROTTLE=1, so platforms that have not re-gated keep
+    their exact scheduler behavior.
+    """
+
+    def __init__(
+        self,
+        min_ratio: float = 0.30,
+        pause_steps: int = 96,
+        warmup_calls: int = 8,
+        ema_alpha: float = 0.1,
+        min_batch: int = 2,
+    ) -> None:
+        if pause_steps <= 0:
+            raise ValueError(
+                "pause_steps must be > 0 (VLLM_SD_ADAPT_PAUSE_STEPS): a "
+                "non-positive pause would disable drafting permanently"
+            )
+        self.min_batch = min_batch
+        self.min_ratio = min_ratio
+        self.pause_steps = pause_steps
+        self.warmup_calls = warmup_calls
+        self.ema_alpha = ema_alpha
+        self._ema: float | None = None
+        self._calls_in_mode = 0
+        self._pause_remaining = 0
+
+    @classmethod
+    def from_env(cls) -> "AcceptanceThrottle | None":
+        import os
+
+        if os.environ.get("VLLM_SD_ADAPT_THROTTLE", "0") != "1":
+            return None
+        return cls(
+            min_ratio=float(os.environ.get("VLLM_SD_ADAPT_MIN_RATIO", "0.30")),
+            pause_steps=int(os.environ.get("VLLM_SD_ADAPT_PAUSE_STEPS", "96")),
+            warmup_calls=int(os.environ.get("VLLM_SD_ADAPT_WARMUP_CALLS", "8")),
+            min_batch=int(os.environ.get("VLLM_SD_ADAPT_MIN_BATCH", "2")),
+        )
+
+    def observe(self, num_draft_tokens: int, num_accepted_tokens: int) -> None:
+        if num_draft_tokens <= 0:
+            return
+        ratio = num_accepted_tokens / num_draft_tokens
+        if self._ema is None:
+            self._ema = ratio
+        else:
+            self._ema += self.ema_alpha * (ratio - self._ema)
+        self._calls_in_mode += 1
+
+    def gate(self, num_spec_tokens: int, batch_size: int = 0) -> int:
+        if num_spec_tokens <= 0:
+            return num_spec_tokens
+        if 0 < batch_size < self.min_batch:
+            # Small-batch verify is nearly free; drafting stays on and
+            # the pause clock does not tick (a hostile pause still
+            # applies to the next wide-batch step).
+            return num_spec_tokens
+        if self._pause_remaining > 0:
+            self._pause_remaining -= 1
+            if self._pause_remaining == 0:
+                # Re-probe: draft again with a fresh warmup so a content
+                # change can lift the pause; a still-hostile stream just
+                # pauses again after warmup_calls cheap steps.
+                self._calls_in_mode = 0
+                self._ema = None
+            return 0
+        if (
+            self._calls_in_mode >= self.warmup_calls
+            and self._ema is not None
+            and self._ema < self.min_ratio
+        ):
+            # The triggering step is the first paused step, so a pause is
+            # exactly pause_steps scheduling steps long.
+            self._pause_remaining = self.pause_steps - 1
+            if self._pause_remaining == 0:
+                self._calls_in_mode = 0
+                self._ema = None
+            return 0
+        return num_spec_tokens

@@ -89,6 +89,116 @@ kernel void rms_norm_dyn(device   bf16  *x      [[buffer(0)]],
     }
 }
 
+// Fused residual-add + dynamic-D RMSNorm for the serving decode path:
+//   res_out = bf16(x + residual)        (rounded ONCE, like the eager add)
+//   o       = bf16(float(res_out) * rrms) ... * weight per rms_norm_dyn
+// The square-sum statistic is computed from the ROUNDED sum, and the second
+// pass re-reads the chunks this thread itself wrote (same-thread device
+// ordering), so the output is bit-identical to the eager
+// `residual = residual + x; rms_norm_dyn(residual)` chain it replaces —
+// one dispatch instead of two and one less hidden-state round trip, x128
+// per decode step. Requires D % 4 == 0.
+kernel void rms_norm_add_dyn(device   bf16  *x        [[buffer(0)]],
+                             device   bf16  *residual [[buffer(1)]],
+                             device   bf16  *weight   [[buffer(2)]],
+                             device   bf16  *o        [[buffer(3)]],
+                             device   bf16  *res_out  [[buffer(4)]],
+                             constant uint  &M        [[buffer(5)]],
+                             constant float &eps      [[buffer(6)]],
+                             constant int   &D        [[buffer(7)]],
+                             uint3 blockIdx [[threadgroup_position_in_grid]],
+                             uint  laneId   [[thread_index_in_simdgroup]]) {
+    const long base = (long)blockIdx.x * D;
+    const int nchunks = D / 4;
+    float ss = 0.0f;
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const bf16_4*)(x + base))[c]);
+        const float4 rv = float4(((device const bf16_4*)(residual + base))[c]);
+        const bf16_4 s = bf16_4(xv + rv);
+        ((device bf16_4*)(res_out + base))[c] = s;
+        const float4 v = float4(s);
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = metal::simd_sum(ss);
+    const float inv = metal::rsqrt(ss / (float)D + eps);
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 v = float4(((device const bf16_4*)(res_out + base))[c]) * inv;
+        const float4 w = float4(((device const bf16_4*)(weight))[c]);
+        ((device bf16_4*)(o + base))[c] = bf16_4(v * w);
+    }
+}
+
+// Gemma-semantics dynamic-D RMSNorm (vllm GemmaRMSNorm / ir.ops.rms_norm with
+// weight = float(w) + 1): the weight multiply stays in fp32 and the output is
+// rounded ONCE — o = bf16((x32 * rrms) * (float(w) + 1)). The (1 + w) promote
+// happens in-kernel so the host passes the raw bf16 module weight. Parity vs
+// the eager ir chain holds to reduction-order ulps, same protocol as
+// rms_norm_dyn. Requires D % 4 == 0.
+kernel void gemma_rms_norm_dyn(device   bf16  *x      [[buffer(0)]],
+                               device   bf16  *weight [[buffer(1)]],
+                               device   bf16  *o      [[buffer(2)]],
+                               constant uint  &M      [[buffer(3)]],
+                               constant float &eps    [[buffer(4)]],
+                               constant int   &D      [[buffer(5)]],
+                               uint3 blockIdx [[threadgroup_position_in_grid]],
+                               uint  laneId   [[thread_index_in_simdgroup]]) {
+    const long base = (long)blockIdx.x * D;
+    const int nchunks = D / 4;
+    float ss = 0.0f;
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 v = float4(((device const bf16_4*)(x + base))[c]);
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = metal::simd_sum(ss);
+    const float inv = metal::rsqrt(ss / (float)D + eps);
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 v = float4(((device const bf16_4*)(x + base))[c]) * inv;
+        const float4 w = float4(((device const bf16_4*)(weight))[c]) + 1.0f;
+        ((device bf16_4*)(o + base))[c] = bf16_4(v * w);
+    }
+}
+
+// Gemma-semantics fused residual-add + dynamic-D RMSNorm (vllm
+// ir.ops.fused_add_rms_norm with weight = float(w) + 1):
+//   sum32   = float(x) + float(residual)      (kept UNROUNDED in fp32)
+//   res_out = bf16(sum32)                     (rounded once)
+//   o       = bf16((sum32 * rrms) * (float(w) + 1))
+// UNLIKE rms_norm_add_dyn, the square-sum statistic and the normed value use
+// the UNROUNDED fp32 sum — that is what the ir chain does (it rounds only the
+// residual output). Pass 2 recomputes the sum from x/residual in-thread
+// (deterministic fp32 add, identical value) instead of re-reading the rounded
+// res_out. Requires D % 4 == 0.
+kernel void gemma_rms_norm_add_dyn(device   bf16  *x        [[buffer(0)]],
+                                   device   bf16  *residual [[buffer(1)]],
+                                   device   bf16  *weight   [[buffer(2)]],
+                                   device   bf16  *o        [[buffer(3)]],
+                                   device   bf16  *res_out  [[buffer(4)]],
+                                   constant uint  &M        [[buffer(5)]],
+                                   constant float &eps      [[buffer(6)]],
+                                   constant int   &D        [[buffer(7)]],
+                                   uint3 blockIdx [[threadgroup_position_in_grid]],
+                                   uint  laneId   [[thread_index_in_simdgroup]]) {
+    const long base = (long)blockIdx.x * D;
+    const int nchunks = D / 4;
+    float ss = 0.0f;
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const bf16_4*)(x + base))[c]);
+        const float4 rv = float4(((device const bf16_4*)(residual + base))[c]);
+        const float4 s = xv + rv;
+        ((device bf16_4*)(res_out + base))[c] = bf16_4(s);
+        ss += s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w;
+    }
+    ss = metal::simd_sum(ss);
+    const float inv = metal::rsqrt(ss / (float)D + eps);
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const bf16_4*)(x + base))[c]);
+        const float4 rv = float4(((device const bf16_4*)(residual + base))[c]);
+        const float4 s = (xv + rv) * inv;
+        const float4 w = float4(((device const bf16_4*)(weight))[c]) + 1.0f;
+        ((device bf16_4*)(o + base))[c] = bf16_4(s * w);
+    }
+}
+
 // RMSNorm backward, dX only (dW = sum_rows dY*x*rstd is a cheap framework reduction). Per row, with
 // m = dY*W and s = sum_j m_j x_j:  dX_i = rstd*m_i - (rstd^3 * s / D) * x_i  (Liger's factorization).
 // rstd (rows,) is precomputed in the framework. One simdgroup per row; any D; T templated.

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,24 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
 
+    def steady_signature(self):
+        # Steady-compatible only in the uniform all-spec decode regime:
+        # every request is a spec-decode row with the same draft count.
+        # The generic eligibility already excludes prefills; the draft
+        # count folds into the signature so an adaptive-k change forces a
+        # rebuild. All checks are CPU-tensor ops — no device sync.
+        if self.num_accepted_tokens is None or (
+            self.num_decode_draft_tokens_cpu is None
+        ):
+            return None
+        d = self.num_decode_draft_tokens_cpu
+        if d.numel() == 0:
+            return None
+        first = int(d[0])
+        if first < 0 or not bool((d == first).all()):
+            return None
+        return ("mamba-spec", first)
+
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
@@ -89,8 +108,17 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # One trailing dump slot (index max_num_reqs): the MPS postprocess
+        # readers that gather with a raw idx_mapping can carry -1 rows, and
+        # Python negative indexing lands those on the LAST slot -- which the
+        # ones-init keeps at the neutral acceptance count of 1. (The MPS
+        # postprocess scatter itself redirects sentinel rows to slot 0 with
+        # an additive delta of zero; see postprocess_state. Boolean-mask
+        # indexing is avoided throughout: its data-dependent shape forces a
+        # full GPU-queue drain per step on MPS, measured 67 ms/step at
+        # c1-spec.)
         self.num_accepted_tokens_gpu = torch.ones(
-            self.max_num_reqs, dtype=torch.int32, device=self.device
+            self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )
         # Pre-copy "align" prefix-cache state (V2). The migration of each
         # request's mamba state across block boundaries runs as a fused GPU
@@ -147,7 +175,9 @@ class MambaHybridModelState(DefaultModelState):
         if self._mamba_state_copy_funcs is None:
             mamba_groups = get_mamba_groups(kv_cache_config)
             mamba_types = {spec.mamba_type for spec in mamba_groups}
-            copy_funcs = self.model.get_mamba_state_copy_funcs(mamba_types)
+            copy_funcs = self.model.get_mamba_state_copy_funcs(  # type: ignore[operator]
+                mamba_types
+            )
             validate_mamba_state_copy_funcs(mamba_groups, copy_funcs)
             self._mamba_state_copy_funcs = copy_funcs
         copy_funcs = self._mamba_state_copy_funcs
@@ -258,7 +288,7 @@ class MambaHybridModelState(DefaultModelState):
             # Capture with worst-case max_seq_len so the graph is valid at any replay.
             max_seq_len = self.max_model_len
         else:
-            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
 
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
@@ -296,7 +326,30 @@ class MambaHybridModelState(DefaultModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        # Steady uniform-decode metadata reuse on Metal (eager path; there is
+        # no cudagraph, so the eager consumers read the cached objects
+        # directly — every tensor field is a view over persistent buffers or
+        # refreshed in steady_decode_update). The GDN builder alone costs
+        # ~8.2 ms/step rebuilt from scratch (10 group builds, 2026-08-24
+        # post-rope census). VLLM_QC_STEADY_META=0 restores the full rebuild.
+        steady_cache = None
+        if not for_capture:
+            enabled = getattr(self, "_qc_steady_meta_enabled", None)
+            if enabled is None:
+                from vllm.platforms import current_platform
+
+                enabled = (
+                    current_platform.is_metal()
+                    and os.environ.get("VLLM_QC_STEADY_META", "1") != "0"
+                )
+                self._qc_steady_meta_enabled = enabled
+            if enabled:
+                steady_cache = getattr(self, "_qc_steady_meta_cache", None)
+                if steady_cache is None:
+                    steady_cache = {"sig": None}
+                    self._qc_steady_meta_cache = steady_cache
         return build_attn_metadata(
+            steady_cache=steady_cache,
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
