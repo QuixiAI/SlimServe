@@ -1571,6 +1571,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=(
+                scheduler_output.num_spec_tokens_to_schedule
+            ),
         )
 
         if not self.is_last_pp_rank:
@@ -1593,6 +1596,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        num_spec_scheduled = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1720,18 +1724,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.sampler.sampling_states.seeds.gpu,
                         mm_inputs=mm_inputs,
                         draft_grammar=draft_grammar,
+                        num_steps=num_spec_scheduled or None,
                     )
             finally:
                 if draft_grammar is not None:
                     draft_grammar.rollback()
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            num_drafted = draft_tokens.shape[1]
+            self.req_states.draft_tokens[
+                input_batch.idx_mapping, :num_drafted
+            ] = draft_tokens
+            if num_drafted < self.req_states.draft_tokens.shape[1]:
+                # Stale columns must not leak into a later wider step.
+                self.req_states.draft_tokens[
+                    input_batch.idx_mapping, num_drafted:
+                ] = -1
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
-            # not have a speculator (i.e. self.speculator is None)
+            # not have a speculator (i.e. self.speculator is None).
+            # The handed-over width is the draft count the scheduler will
+            # verify next step; slice to what was actually drafted so a
+            # dynamic-k step schedules 1 + k, not 1 + max_k.
+            width = self.req_states.draft_tokens.shape[1]
+            if self.speculator is not None and num_spec_scheduled:
+                width = min(width, num_spec_scheduled)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping, :width],
             )
 
         # Post-step KV connector related operations.
@@ -1873,6 +1892,9 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    # Dynamic speculative decoding: the scheduler's k for this step
+    # (0 -> use the configured maximum).
+    num_spec_tokens_to_schedule: int = 0
 
 
 def sort_batch_req_ids(

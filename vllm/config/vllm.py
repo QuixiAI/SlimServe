@@ -82,6 +82,12 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen2MoeForCausalLM",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
+        # The MTP drafter runs inside the V2 runner's speculator. Its draft
+        # VllmConfig (built by replace() with the draft model_config, which
+        # re-runs __post_init__ on shared sub-configs) must classify as V2 or
+        # dynamic-SD guards evaluate against the wrong runner and downgrade
+        # the SHARED compilation_config for the whole worker.
+        "Qwen4ExpMTP",
     }
 )
 
@@ -864,6 +870,12 @@ class VllmConfig:
             or not speculative_config.uses_dynamic_speculative_decoding()
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             or self.use_v2_model_runner
+            # A draft-model view (dataclasses.replace with the draft
+            # model_config, e.g. the Qwen4Exp MTP loader) shares this
+            # compilation_config with the serving config and must never
+            # decide global graph policy: its runner_type is "draft", so
+            # every runner predicate below would misclassify it as V1.
+            or self.model_config is speculative_config.draft_model_config
         ):
             return
 

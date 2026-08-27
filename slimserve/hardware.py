@@ -23,6 +23,7 @@ class Machine:
     device_name: str
     count: int  # visible devices, after the *_VISIBLE_DEVICES masks
     memory_bytes: int = 0  # unified memory; 0 on the discrete-GPU platforms
+    host_ram_bytes: int = 0  # system RAM; gates host-offload profiles
 
     @property
     def known(self) -> bool:
@@ -168,6 +169,18 @@ def _classify(device_name: str) -> str | None:
     return None
 
 
+def _host_ram_bytes() -> int:
+    """System RAM from /proc/meminfo; 0 when unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return 0
+
+
 def detect() -> Machine:
     apple = _probe_apple()
     if apple is not None:
@@ -179,4 +192,9 @@ def detect() -> Machine:
     limit = _visible_limit()
     if limit is not None:
         count = min(count, limit)
-    return Machine(_classify(device_name), device_name, count)
+    return Machine(
+        _classify(device_name),
+        device_name,
+        count,
+        host_ram_bytes=_host_ram_bytes(),
+    )

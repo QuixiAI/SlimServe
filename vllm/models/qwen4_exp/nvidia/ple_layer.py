@@ -11,6 +11,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.mamba.abstract import MambaBase
@@ -50,6 +51,25 @@ from vllm.v1.attention.backends.short_conv_attn import (
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..common.ple import copy_ple_embedding_shard_
+
+logger = init_logger(__name__)
+
+
+def _nonzero_tp_rank() -> bool:
+    """True on TP ranks other than 0; False when TP is uninitialized."""
+    try:
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            model_parallel_is_initialized,
+        )
+
+        return (
+            model_parallel_is_initialized()
+            and get_tensor_model_parallel_rank() != 0
+        )
+    except Exception:
+        return False
+
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -281,6 +301,69 @@ class _FullVocabShardIndices:
         self.org_vocab_end_index = vocab_size
 
 
+_HOST_REGISTER_PORTABLE = 0x01
+_HOST_REGISTER_MAPPED = 0x02
+
+
+def _shared_pinned_table(
+    num_embeddings: int, embedding_dim: int, dtype: torch.dtype
+) -> torch.Tensor | None:
+    """One /dev/shm-backed table registered into CUDA by every rank.
+
+    Returns None when the segment cannot be created or registered; the
+    caller falls back to a private pinned allocation. The file outlives the
+    mmap (deterministic name), so a restarted server remaps the same pages
+    and overwrites them during its own load; rank teardown does not unlink
+    while sibling ranks may still map it.
+    """
+    import mmap as mmap_module
+    import os
+
+    nbytes = num_embeddings * embedding_dim * dtype.itemsize
+    path = (
+        f"/dev/shm/slimserve_ple_{num_embeddings}x{embedding_dim}_"
+        f"{str(dtype).split('.')[-1]}"
+    )
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, nbytes)
+            mapped = mmap_module.mmap(fd, nbytes)
+        finally:
+            os.close(fd)
+        host = torch.frombuffer(mapped, dtype=torch.uint8)
+        rc = torch.cuda.cudart().cudaHostRegister(
+            host.data_ptr(),
+            nbytes,
+            _HOST_REGISTER_PORTABLE | _HOST_REGISTER_MAPPED,
+        )
+        if rc != 0:
+            logger.warning(
+                "PLE shared table: cudaHostRegister failed (%s); falling "
+                "back to a private pinned copy per rank",
+                rc,
+            )
+            return None
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "PLE shared table: could not map %s (%s); falling back to a "
+            "private pinned copy per rank",
+            path,
+            exc,
+        )
+        return None
+    logger.info_once(
+        "PLE table shared across ranks via %s (%.1f GiB once, instead of "
+        "per rank)",
+        path,
+        nbytes / 2**30,
+    )
+    # Keep the mmap object alive for the tensor's lifetime.
+    table = host.view(dtype).view(num_embeddings, embedding_dim)
+    table._slimserve_ple_mmap = mapped  # type: ignore[attr-defined]
+    return table
+
+
 class Qwen4ExpHostNGramEmbedding(nn.Module):
     """TP-replicated n-gram table in pinned host memory, gathered over UVA.
 
@@ -305,15 +388,24 @@ class Qwen4ExpHostNGramEmbedding(nn.Module):
         self.shard_indices = _FullVocabShardIndices(num_embeddings)
         self.weight_dtype = params_dtype
         self.row_bytes = embedding_dim * params_dtype.itemsize
-        # One pinned allocation for the whole table; loading writes shards
-        # into it directly, so the table never touches VRAM.
-        host = torch.zeros(
-            num_embeddings,
-            embedding_dim,
-            dtype=params_dtype,
-            device="cpu",
-            pin_memory=True,
-        )
+        # The table's content is identical on every TP rank, so all ranks
+        # map ONE /dev/shm segment and cudaHostRegister the same physical
+        # pages instead of pinning a private 47.7 GiB copy each: host RAM
+        # cost drops from table x TP to table x 1. Every rank still writes
+        # its shards during load - the writes are byte-identical, so the
+        # redundancy is benign and needs no cross-rank coordination.
+        host = _shared_pinned_table(num_embeddings, embedding_dim, params_dtype)
+        self.weight_is_shared = host is not None
+        if host is None:
+            # Fallback (undersized /dev/shm, registration failure): a
+            # private pinned copy per rank, the original layout.
+            host = torch.zeros(
+                num_embeddings,
+                embedding_dim,
+                dtype=params_dtype,
+                device="cpu",
+                pin_memory=True,
+            )
         self.weight = nn.Parameter(host, requires_grad=False)
         if params_dtype == torch.float8_e4m3fn:
             self.weight_scale = nn.Parameter(
@@ -589,6 +681,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                if getattr(embedding, "weight_is_shared", False) and _nonzero_tp_rank():
+                    # The table is one /dev/shm segment shared by every
+                    # rank; rank 0's writes are everyone's writes. Skipping
+                    # the copy here also skips faulting the checkpoint
+                    # pages in - the safetensors view is lazy - so the
+                    # 47.7 GiB is read from disk once, not per rank.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 copy_ple_embedding_shard_(
                     embedding.weight.data,
                     loaded_weight,

@@ -11813,3 +11813,61 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   (valley root-caused and fixed; crash under watch flag with its suspect
   path removed); profile serves the best-known config with recorded
   validation.
+
+## 2026-08-27 - Review feedback: two profile-schema guards added (both caught real issues)
+
+- Capture-coupling enforcement: new registry test asserts
+  max_cudagraph_capture_size >= (k_max+1) x max_num_seqs for every
+  speculative profile with FULL decode graphs (k_max includes dynamic
+  schedules). On its FIRST run it caught qwen38-nvfp4-1/mi300x at capture
+  64 with k=2 x seqs 64 - decode batches above 21 requests silently ran
+  eager there, the same -52% cliff class measured on rtx3090. The MI300X
+  record is raised to 192 (safety-directional: more graphs, same kernels)
+  with a note that its re-baseline is pending on that platform.
+- Host-RAM gate: schema gains per-platform min_host_ram_bytes at the quant
+  level; hardware.detect() reads MemTotal; registry.allowed_on/resolve and
+  the CLI thread it through with a plan-time error naming the shortfall.
+  qwen38fn FP8/rtx3090 gates at 448 GiB (47.7 GiB pinned PLE x TP8 +
+  staging). Enforced by a test: any variant enabling
+  VLLM_QWEN4_EXP_PLE_HOST must carry a covering gate.
+- 53 profile tests pass.
+- Follow-up accepted from the same review discussion: the PLE table is
+  TP-replicated 8x in host RAM (381.6 GiB) though its content is
+  identical per rank - a /dev/shm-shared single pinned copy (the
+  sysmem_all_reduce.py pattern) cuts the requirement to ~48 GiB + weights
+  staging; the gate then drops to ~128 GiB. NVMe-backed tables were
+  considered and rejected for the serving default: UVA zero-copy needs
+  pinned pages, and the mmap alternative puts NVMe random-read latency on
+  the layer-2 decode critical path (prefetch could hide it; backlog).
+
+## 2026-08-27 - Grossness audit (user-prompted) + PLE dedup + dynamic-k status
+
+- PLE host table now SHARED across TP ranks: one /dev/shm segment, every
+  rank mmaps + cudaHostRegisters the same pages, rank 0 alone writes the
+  shards during load (the safetensors views are lazy, so the 47.7 GiB is
+  also read from disk once, not 8x). Host requirement drops 381.6 -> 47.7
+  GiB; the profile's min_host_ram_bytes gate drops 448 -> 128 GiB.
+  Fallback to a private pinned copy when /dev/shm cannot host it. Unit
+  tests: cross-instance aliasing + gather parity + fallback.
+- Removed vllm/distributed/device_communicators/sysmem_all_reduce.py:
+  unwired, superseded by the P2P fabric; repo policy is remove-or-
+  quarantine for retired experiments.
+- Deprecation note: the fp8-e4m3 main-KV path (VLLM_QWEN4_EXP_FP8_MAIN_KV)
+  is dominated by TQ k8v4 on speed, acceptance, and compression; retained
+  one cycle as a diagnostic, candidate for deletion.
+- Systemic risk flagged: dataclasses.replace() config views re-run full
+  __post_init__ against SHARED sub-configs (today's draft-view cudagraph
+  downgrade was one instance; _maybe_disable_dynamic_sd_for_data_parallel
+  mutates shared speculative_config the same way). Needs a design fix.
+- Dynamic-k V2 status: machinery works at steady state (dispatch stats
+  show 4tok/FULL at c1 k=3, 24tok/FULL at c8 k=2, no PIECEWISE override
+  after the draft-view guard), but (a) ramp-phase partial batches (e.g.
+  57-60 tokens) miss dispatch instead of padding up, (b) a crash
+  reappeared at c32, (c) early numbers (c1 135, c8 438) suggest the k=3
+  win is smaller on TQ than the bf16 sweep promised. PARKED as
+  experimental pending those three; static k=2 remains the profile
+  setting.
+- Open flake: test_qsa_reference[tp1_split64] fails deterministically in
+  the FULL tests/models/qwen4_exp run since the shm-PLE additions, passes
+  alone and in every pairwise combination. Repro:
+  pytest tests/models/qwen4_exp/ -q. Tracked, not yet root-caused.
