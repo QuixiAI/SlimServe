@@ -1937,7 +1937,13 @@
             },
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
-            "served_model_name": "Qwen3.8-27B"
+            "served_model_name": "Qwen3.8-27B",
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1950,7 +1956,8 @@
             "NVFP4 layers run the vendored QuixiCore HIP kernels (RocmNativeNvFp4LinearKernel): decode-width calls (M<=4, the c1 spec-verify size) read the packed E2M1 weight directly through the q8 dp4a GEMV (measured 1.3-1.8x per layer), wider batches use a load-time-dequantized bf16 copy through hipBLASLt (~22 GiB extra weights memory) until the MFMA packed MMQ exists. VLLM_NVFP4_TRITON_GEMM=0 falls back to the emulation kernel, whose own load-time cache is controlled by VLLM_NVFP4_EMULATION_CACHE_WEIGHTS.",
             "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
             "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout.",
-            "max_cudagraph_capture_size raised 64->192 to satisfy the capture-coupling rule (>= (k+1) x max_num_seqs at MTP k=2, seqs 64): with 64, decode batches above 21 requests silently ran eager (measured on rtx3090 as a -52% cliff before its fix). Raise is safety-directional (more graphs, same kernels); MI300X re-baseline pending."
+            "max_cudagraph_capture_size raised 64->192 to satisfy the capture-coupling rule (>= (k+1) x max_num_seqs at MTP k=2, seqs 64): with 64, decode batches above 21 requests silently ran eager (measured on rtx3090 as a -52% cliff before its fix). Raise is safety-directional (more graphs, same kernels); MI300X re-baseline pending.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ]
         },
         "metal": {
@@ -1973,7 +1980,13 @@
             "tool_call_parser": "qwen3_xml",
             "kv_cache_dtype": "bfloat16",
             "mamba_cache_dtype": "float32",
-            "language_model_only": true
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1",
@@ -1991,7 +2004,8 @@
             "Engine settings inherited from the retired qwen38-1 Q4_K_M profile (same architecture, same GDN state contracts): V2 runner forced, DS conv layout, fp32 mamba cache, prefix caching off for hybrid state.",
             "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up.",
             "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix.",
-            "The former qwen38-nvfp4-1-df2 twin (canonical minus muse) is retired: it differed only by VLLM_QC_MUSE, which is a kill switch, not a config. Reproduce it with VLLM_QC_MUSE=0 on this profile."
+            "The former qwen38-nvfp4-1-df2 twin (canonical minus muse) is retired: it differed only by VLLM_QC_MUSE, which is a kill switch, not a config. Reproduce it with VLLM_QC_MUSE=0 on this profile.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -2041,7 +2055,13 @@
             "attention_backend": "TURBOQUANT",
             "kv_cache_dtype": "turboquant_k8v4",
             "mamba_cache_dtype": "float32",
-            "language_model_only": true
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
           },
           "speculative_overrides": {
             "attention_backend": "TURBOQUANT",
@@ -2062,7 +2082,8 @@
             "LONG-CONTEXT VALIDATED 2026-08-21 (UPDATE 39): with --ctx 262144 (native max_position_embeddings, no rope scaling) the needle ladder passes EXACT at 16k/65k/131k/262k depths; the 262k leg = 259,888 prompt tokens, 75 min prefill. Prefill cost model T(C) ~= 6.4e-3*C + 3.9e-8*C^2 seconds. Canonical bf16 cannot admit a 262k request; this profile holds 292,882 KV tokens.",
             "Use case: capacity/long-context \u2014 k8v4 compresses full-attn KV 4096 -> 1728 bytes/token (~2.4x, target and drafter). Measured: 292,882 KV tokens vs canonical 158,038 under the same 16 GiB budget (1.85x; 8.94x vs 4.82x concurrency at 32k). Since UPDATE 40 this profile also wins on throughput at c4/c8/2500x64 and trails c1 by 0.8%; the canonical default is a flagged quality decision (k8v4 KV cos ~0.9955 floor vs bf16), not a TPS one.",
             "Engine settings otherwise identical to qwen38-nvfp4-1 (adaptive DFlash2 spec, V2 runner, DS conv layout, async scheduling).",
-            "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix."
+            "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -2148,7 +2169,13 @@
             "served_model_name": "Qwen3.8-27B",
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
-            "kv_cache_dtype": "auto"
+            "kv_cache_dtype": "auto",
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            }
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1"
@@ -2158,7 +2185,8 @@
             "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
             "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
             "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
-            "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
+            "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ]
         }
       }
@@ -2192,6 +2220,12 @@
             "kernel_config": {
               "moe_backend": "auto",
               "linear_backend": "auto"
+            },
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
             }
           },
           "env": {
@@ -2212,7 +2246,8 @@
             "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
             "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps.",
             "min_host_ram_bytes gates this platform at 128 GiB system RAM: the 47.7 GiB n-gram (PLE) table is pinned ONCE in a /dev/shm segment shared by all TP ranks (not per rank), plus load staging and runtime headroom. A machine that passes the GPU gate but lacks the RAM fails at plan time instead of dying mid-load.",
-            "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range."
+            "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ],
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true
