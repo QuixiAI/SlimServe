@@ -165,10 +165,15 @@ class AcceptanceThrottle:
       pauses drafting for ``pause_steps`` scheduling steps, then re-probes
       (fresh warmup) so drafting recovers when the content changes.
 
-    Break-even intuition at k=3: ratio 0.33 is ~one accepted token per
-    draft call, roughly where verify overhead cancels the win; prose
-    measures ~0.90 and verse ~0.07, so the default threshold sits in a
-    wide gap. All knobs are env-tunable and the throttle only exists when
+    Break-even is BATCH-DEPENDENT: at batch 1 the verify rows ride the
+    small-M GEMV band and are nearly free, so drafting measured net
+    -positive (+12%) even at ratio 0.16 on hostile verse -- batches
+    below ``min_batch`` are therefore exempt (never gated), which also
+    keeps batch-1 runs sha-deterministic. At batch >= min_batch the
+    verify rides wider GEMM and ratio 0.33 is ~one accepted token per
+    draft call, roughly break-even; prose measures ~0.90 and verse
+    ~0.07, so the 0.30 default sits in a wide gap. All knobs are
+    env-tunable and the throttle only exists when
     VLLM_SD_ADAPT_THROTTLE=1, so platforms that have not re-gated keep
     their exact scheduler behavior.
     """
@@ -179,7 +184,9 @@ class AcceptanceThrottle:
         pause_steps: int = 96,
         warmup_calls: int = 8,
         ema_alpha: float = 0.1,
+        min_batch: int = 2,
     ) -> None:
+        self.min_batch = min_batch
         self.min_ratio = min_ratio
         self.pause_steps = pause_steps
         self.warmup_calls = warmup_calls
@@ -198,6 +205,7 @@ class AcceptanceThrottle:
             min_ratio=float(os.environ.get("VLLM_SD_ADAPT_MIN_RATIO", "0.30")),
             pause_steps=int(os.environ.get("VLLM_SD_ADAPT_PAUSE_STEPS", "96")),
             warmup_calls=int(os.environ.get("VLLM_SD_ADAPT_WARMUP_CALLS", "8")),
+            min_batch=int(os.environ.get("VLLM_SD_ADAPT_MIN_BATCH", "2")),
         )
 
     def observe(self, num_draft_tokens: int, num_accepted_tokens: int) -> None:
@@ -210,8 +218,13 @@ class AcceptanceThrottle:
             self._ema += self.ema_alpha * (ratio - self._ema)
         self._calls_in_mode += 1
 
-    def gate(self, num_spec_tokens: int) -> int:
+    def gate(self, num_spec_tokens: int, batch_size: int = 0) -> int:
         if num_spec_tokens <= 0:
+            return num_spec_tokens
+        if 0 < batch_size < self.min_batch:
+            # Small-batch verify is nearly free; drafting stays on and
+            # the pause clock does not tick (a hostile pause still
+            # applies to the next wide-batch step).
             return num_spec_tokens
         if self._pause_remaining > 0:
             self._pause_remaining -= 1
