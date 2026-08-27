@@ -190,26 +190,6 @@ def _expand_qsa_indices_kernel(
 
 
 @triton.jit
-def _e4m3_to_bf16(bits):
-    """Decode float8_e4m3fn bytes arithmetically (SM86 has no fp8 cvt).
-
-    value = (-1)^s * 2^(e-7) * (1 + m/8) for e > 0, subnormal m * 2^-9 for
-    e == 0, NaN for 0x7f/0xff. exp2 keeps this a handful of ALU ops.
-    """
-    b = bits.to(tl.int32, bitcast=False)
-    sign = (b >> 7) & 1
-    exp = (b >> 3) & 0xF
-    man = b & 0x7
-    normal = (8 + man).to(tl.float32) * tl.math.exp2((exp - 10).to(tl.float32))
-    subnormal = man.to(tl.float32) * 0.001953125  # 2**-9
-    value = tl.where(exp > 0, normal, subnormal)
-    value = tl.where(sign == 1, -value, value)
-    nan = (b & 0x7F) == 0x7F
-    value = tl.where(nan, float("nan"), value)
-    return value.to(tl.bfloat16)
-
-
-@triton.jit
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -245,7 +225,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    KV_FP8: tl.constexpr = False,
     KV_TQ: tl.constexpr = False,
     TQ_KPS: tl.constexpr = 0,
     TQ_VAL_BYTES: tl.constexpr = 0,
@@ -381,12 +360,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
-            if KV_FP8:
-                # The caches arrive as uint8 views of float8_e4m3fn (unit
-                # scale); decode arithmetically since SM86 lacks the fp8 cvt
-                # instruction.
-                keys = _e4m3_to_bf16(keys)
-                values = _e4m3_to_bf16(values)
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -940,10 +913,9 @@ def qsa_sparse_paged_attention(
     elif q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    kv_fp8 = not kv_tq and k_cache.dtype == torch.float8_e4m3fn
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    assert kv_tq or kv_fp8 or k_cache.dtype == torch.bfloat16
+    assert kv_tq or k_cache.dtype == torch.bfloat16
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.device == k_cache.device == v_cache.device
@@ -978,10 +950,10 @@ def qsa_sparse_paged_attention(
         block_n, target_splits, partial_warps = 64, 4, 2
     else:
         block_n, target_splits, partial_warps = 64, 1, 2
-    if kv_tq or kv_fp8:
+    if kv_tq:
         # In-register dequant is ALU-heavy: wide tiles with 2 warps cannot
-        # hide it (measured 3.8x for TQ and 23x for arithmetic-e4m3 at 48
-        # rows on SM86). Keep narrow tiles and 4 warps for quantized KV.
+        # hide it (measured 3.8x at 48 rows on SM86). Keep narrow tiles and
+        # 4 warps for quantized KV.
         if block_n > 16:
             block_n, partial_warps = 16, 4
             target_splits = max(target_splits, 8)
@@ -992,11 +964,6 @@ def qsa_sparse_paged_attention(
     num_splits = min(max_useful_splits, target_splits)
 
     # Split=1 writes output directly and compiles out all workspace accesses.
-    if kv_fp8:
-        # Triton on SM86 rejects fp8e4nv tensors outright; hand the kernel
-        # raw bytes and decode in-register.
-        k_cache = k_cache.view(torch.uint8)
-        v_cache = v_cache.view(torch.uint8)
     if num_splits == 1:
         partial_output = out
         partial_lse = out
@@ -1048,7 +1015,6 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        KV_FP8=kv_fp8,
         KV_TQ=kv_tq,
         TQ_KPS=head_dim if kv_tq else 0,
         TQ_VAL_BYTES=head_dim // 2 if kv_tq else 0,
