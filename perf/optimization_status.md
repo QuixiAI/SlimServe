@@ -16357,3 +16357,18 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   validation still occurs per request (the PR text claims config time),
   and template-level default reasoning_effort (our profiles' low) does
   not inform map level selection.
+
+## 2026-08-27 - Thinking budgets: defaults stay UNLIMITED (user decision); template-effort map selection fixed
+
+- Decision of record: no SlimServe profile bakes a thinking_token_budget
+  default. Budgets are operator-set exactly per the PR #13 design
+  (server map via --override-generation-config, per-request numeric
+  override, -1 opt-out); an earlier draft that capped every Qwen3.8
+  profile was reverted before commit.
+- Kept: when an operator DOES configure a map, level selection now
+  falls back to the server's default_chat_template_kwargs
+  reasoning_effort before the medium fallback, so a profile serving
+  low-effort by template default selects the low budget rather than
+  medium (to_sampling_params gained default_reasoning_effort, passed by
+  the chat serving layer). This closes the effort-sourcing gap from the
+  PR #13 review.

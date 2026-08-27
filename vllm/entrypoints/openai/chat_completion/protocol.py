@@ -629,6 +629,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
+        default_reasoning_effort: str | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -653,11 +654,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
 
+        # The template-level default effort (e.g. a profile serving
+        # reasoning_effort low via default_chat_template_kwargs) must select
+        # the same budget-map level the template actually renders at.
+        effective_effort = self.reasoning_effort or default_reasoning_effort
         thinking_token_budget = get_effective_thinking_token_budget(
             self.thinking_token_budget,
             max_tokens,
             default_sampling_params,
-            self.reasoning_effort,
+            effective_effort,
         )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
