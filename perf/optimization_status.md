@@ -4,6 +4,398 @@ This is the running performance notebook. Follow `perf/perf.md`: record the
 baseline, hypothesis, controlled change, correctness result, throughput result,
 decision, and raw artifact locations.
 
+## 2026-08-26 - Qwen3.8-Flash-Next 8x RTX 3090 Bring-Up (IN PROGRESS)
+
+New platform (`rtx3090`, nv3090-02: 8x GeForce RTX 3090 24 GiB, EPYC 7702,
+996 GiB host RAM) and new model (Qwen/Qwen3.8-Flash-Next-FP8, `qwen4_exp`
+arch: 48-layer GDN + QSA hybrid, 512-expert MoE, 4-branch gated residual,
+51B-parameter n-gram PLE embedding at layer 2, vision tower, 1-layer QSA MTP).
+Profile: `qwen38fn-fp8-8`.
+
+Port source: vLLM PR #53896 (upstream base 903a02192f) semantically merged
+into this fork: 33 new files taken as-is (`vllm/models/qwen4_exp/`,
+`short_conv_attn.py`, spec/config files), 17 shared files merged clean, 19
+conflicted files resolved by hand. Notable resolutions:
+
+- The upstream CSA-linear KV planner was rebuilt on this fork's packed-slab
+  allocator (`_get_kv_cache_config_packed`): the fork's "block id owns one
+  group, group layouts may overlap" contract is the same mechanism upstream
+  special-cased, so `_get_kv_cache_config_csa_linear` was dropped and the
+  dispatcher routes CSA models into the packed planner. MRV2's MambaSpec
+  reshape learned packed-slab views (offset/block_stride) for the mamba
+  members of the slab.
+- Upstream's `tokens_per_state` vocabulary maps onto this fork's
+  `MLAAttentionSpec.compress_ratio` (same meaning); `CircularBufferSpec`
+  (QSA raw-key ring, one block per request, prefix caching off) was added to
+  this fork's spec/manager registry with a K-only page size.
+- The fork's GDN stack already supported sigmoid output gating (the PR's
+  qwen_gdn/fused-kernel edits target upstream code the fork replaced), so
+  those hunks were dropped rather than grafted.
+- The fork's slot-mapping Triton kernel gained a `mapping_enabled` flag per
+  KV group: a disabled group is a circular buffer addressed at block-table
+  column 0 by `position % ring_capacity` (the fork's `positions % block_size`
+  offset math already produces the ring modulo). The quixicore native
+  slot-mapping path is bypassed when any group disables plain mapping.
+
+Hard constraints measured/verified on this platform:
+
+- `torch.cuda.can_device_access_peer` = False between all pairs (GeForce
+  P2P disabled). All TP collectives stage through host memory; expect
+  collectives, not kernels, to bound TP8 decode.
+- SM86 has no FP8 tensor cores; `supports_fp8()` gates Triton FP8 MoE off.
+  The FP8 block-128 experts therefore run Marlin W8A16 MoE (sm80 kernels).
+- `--enable-expert-parallel` is a correctness requirement:
+  moe_intermediate_size 640 / TP8 = 80 is incompatible with [128,128] block
+  scales, and the PR's scale-refine fallback computes gcd 16 < its own
+  floor of 32 and raises. EP keeps 64 whole experts per rank (640 = 5x128).
+
+PLE n-gram host offload (`VLLM_QWEN4_EXP_PLE_HOST=1`): PR #53896 holds the
+47.7 GiB FP8 n-gram table TP-sharded in VRAM (5.96 GiB/rank), which does not
+fit next to 14.06 GiB/rank of EP experts on a 24 GiB card. Implemented
+host-pinned tables gathered from the GPU over UVA by a Triton kernel
+(int->pointer cast), replicated per rank to also remove the per-step
+embedding all-reduce this no-P2P box cannot afford. Microbenchmark
+(perf/results/2026-08-26/qwen38fn-3090-bringup/uva_gather_microbench.txt):
+correct vs reference, correct across CUDA-graph replay with mutated indices,
+39.8 us for a c64-decode-shaped gather (4096 rows x 160 B), 1.95 ms for a
+16K-token prefill-chunk gather (40 MB, 21.5 GB/s effective) -- the tech
+report's design intent ("tables prefetched from host memory") at ~2% of a
+prefill chunk's budget. Host cost ~48 GiB pinned per rank (~382 GiB total).
+Follow-up optimization: one /dev/shm table shared across ranks.
+
+Weight budget per rank (EP + PLE host offload): 14.06 GiB FP8 experts +
+~3.5 GiB BF16 backbone/vision/MTP ~= 17.6 GiB of 24 GiB, leaving ~4 GiB for
+KV, GDN state, activations and graphs at 0.9 utilization. Without the PLE
+offload the model does not fit.
+
+Status: merge complete and pyflakes-clean; native build for SM86 in
+progress; profile `qwen38fn-fp8-8` registered (platform `rtx3090` added to
+hardware detection). Not yet validated: end-to-end health, correctness,
+TPS, MTP speculation on MRV2 (the PR only wired its Qwen4ExpMTPProposer
+into the V1 runner; MRV2 routes method=mtp to the generic MTPSpeculator --
+unverified against this hybrid drafter). No baseline claim is made yet.
+
+### 2026-08-26 - SGLang PR 36497 cross-reference (Qwen3.8-Flash-Next)
+
+Examined SGLang's implementation (sgl-project/sglang#36497, ~/sglang @
+73a255206f) after our port. Their PLE offload independently converges on the
+same core mechanism as ours: FP8/BF16 table pinned in host memory, Triton UVA
+gather via an int->pointer cast (`--ple-offload-embedding`, on by default for
+this model on CUDA). Differences and adoptable ideas, in priority order for
+this platform:
+
+1. Async prefetch overlap: before running decoder layer i, SGLang kicks layer
+   i+1's PLE gather on a dedicated stream (`start_prefetch` at the top of the
+   layer loop, per-batch-size capture buffers for graph mode, consume waits on
+   the stream inside the PLE layer). This is the tech report's "prefetch
+   overlaps with the computation of the first layer" realized; it would hide
+   our ~2 ms per-16K-chunk prefill gather (decode's ~40 us is already
+   negligible in-graph). Adopt during the optimization phase.
+2. In-kernel fp8->bf16 conversion in the gather (scale multiplied once after
+   the TP reduce), saving one elementwise pass over [tokens, 2560] vs our
+   gather-bytes-then-dequant.
+3. Decode-sized bitwise-exact fused kernels: single-launch 16-head n-gram
+   hash, fused gate/value broadcast, fused short-conv state advance
+   (python/sglang/kernels/ops/qwen4_ple.py) -- small decode wins.
+4. TP design difference: SGLang keeps the table TP-sharded (masked gather +
+   all-reduce, symmetric-memory output when TP>1) at 47.7 GiB host total; we
+   replicate per rank (382 GiB host) to remove the per-step all-reduce, which
+   is the right trade on this no-P2P box but theirs is the RAM-lean fallback.
+5. Reference material: JIT CUDA QSA indexer + fast_topk kernels
+   (sgl-kernel jit csrc), 2K-line QSA reference test, PLE offload parity
+   tests (test/registered/kernels/ops/embeddings/) usable for cross-checks.
+
+Deep-read addendum (after full pass over the SGLang PR):
+
+6. MTP shared sparse indices (`QSAMTPSharedSparseIndices`): the draft-extend
+   pass captures the QSA indexer's freshest per-request selection on
+   target-aligned hidden states, and the following speculative decode steps
+   reuse it -- the indexer QK projection, MQA logits and top-k vanish from
+   the decode graphs entirely (causally valid since draft positions advance
+   at most spec_num_steps within a growing row). This is what the
+   `index_share_for_mtp_iteration` knob we ported in speculative.py drives on
+   the vLLM side; worth verifying our MTP path actually exercises it, and
+   worth benchmarking on/off once spec decode is baselined.
+7. SGLang pins `page_size=64` for compressed QSA (compressed cache addressed
+   as full_slot // compress_ratio needs page-aligned full-KV pages, page a
+   multiple of the ratio) and requires page-granular prefix sharing. The
+   vLLM port encodes the same constraint through the CSA group builder
+   (block-size/prefix_match_unit % ratio validation) -- same invariant,
+   different mechanism.
+8. Their PLE offload defaults ON only for BF16 checkpoints on CUDA; the FP8
+   table path exists but is not the default. Ours defaults off and the
+   profile opts in explicitly for the FP8 checkpoint -- keep that, but note
+   their gather kernel does fp8->bf16 conversion in-kernel with the scale
+   applied once after the TP reduce.
+9. PLE per-request states (short-conv window + n-gram context) are
+   registered as MambaPool slot siblings so radix COW / offload round-trips
+   carry them; the vLLM port covers the same lifecycle through the mamba
+   align machinery and the model-state ngram context. Their
+   `ple_state_pool.py` is the reference if we see prefix-cache staleness.
+10. Their JIT CUDA `fast_topk` (block_topk 512/2048 only) and `qsa_indexer`
+    kernels are PDL-gated (SM90+); on SM86 they would fall back like our
+    cooperative-vs-persistent topk split does. Nothing to adopt for 3090.
+11. Their fused-MoE H200 tuning JSONs at N=80/160/320 are for the BF16
+    checkpoint (TP sharding of 640 without block-scale constraints); they do
+    not contradict the EP requirement for the FP8 block-quant checkpoint.
+
+### 2026-08-26 - qwen38fn-fp8-8 first live baseline (8x RTX 3090)
+
+Profile `qwen38fn-fp8-8` reached full health after five bring-up fixes, each
+recorded in the profile notes or below:
+
+1. moe/linear backend aiter defaults raise on CUDA -> profile pins auto at
+   both levels.
+2. torch.compile rejected a raw data_ptr() Triton argument -> host gather
+   wrapped as a functional vLLM custom op.
+3. Inductor "auto_functionalized was not removed" -> the op made functional
+   (returns rows) instead of mutating an out tensor.
+4. Illegal memory access, isolated with CUDA_LAUNCH_BLOCKING to the gather:
+   vLLM's cross-process torch-compile cache had baked the previous run's
+   pinned-table data_ptr() into the compiled artifact. The table is now a
+   tensor argument whose pointer is read at call time; never bake host
+   pointers into compiled graphs.
+5. KV planning needed a CSA branch in `_max_memory_usage_bytes_from_groups`
+   (packed-slab stride x summed per-group block demand), and 262144 max len
+   does not fit (3.52 GiB needed vs 2.2 GiB free at 17.6 GiB/rank weights;
+   engine's own estimate 161600) -> profile caps max_model_len at 131072.
+
+Validation: server healthy with FULL prefill+decode graph capture and the
+MTP speculator captured; text request answers correctly; image request
+answers correctly (vision tower + MRoPE + PLE host table all live).
+
+Exact-token baseline, 1000 in / 2000 out, shipped thinking-mode sampling
+(temp 1.0 / top_p 0.95 / top_k 20, seed 42), MTP k=2, PLE host offload on
+(raw JSON in perf/results/2026-08-26/qwen38fn-3090-bringup/):
+
+| Concurrency | Aggregate tok/s | Mean wall s | Draft acceptance |
+| ---: | ---: | ---: | ---: |
+| 1 | 109.61 | 18.25 | 54.2% |
+| 2 | 206.77 | 18.08 | 73.0% |
+| 4 | 283.30 | 27.37 | 67.8% |
+| 8 | 409.66 | 37.44 | 62.4% |
+
+Greedy c1 reference (harness default before the sampling flags): 142.95
+tok/s at 85.1% acceptance -- kept as an artifact only; sampled numbers are
+the baseline per the no-greedy rule.
+
+Interpretation: c2 = 1.89x c1 (near-linear), c4 = 1.37x c2, c8 = 1.45x c4.
+The TP-scaling sanity gate does not apply across concurrency, but the
+flattening past c2 points at the expected no-P2P collective ceiling and
+Marlin decode batching; profiling comes next. Follow-ups queued, in order:
+(a) SGLang-style layer-ahead PLE prefetch stream (hides the ~2 ms
+prefill-chunk gather), (b) `index_share_for_mtp_iteration` on/off
+experiment, (c) nsys decode-step breakdown to size the all-reduce share,
+(d) fp8->bf16 conversion inside the gather kernel, (e) /dev/shm-shared PLE
+table to cut host RAM 8x.
+
+### 2026-08-26 - Optimization campaign plan: throughput + context (qwen38fn-fp8-8)
+
+Grounding measurements (raw in perf/results/2026-08-26/qwen38fn-3090-bringup/):
+
+- NCCL all-reduce, 8x3090, host-staged SHM (no P2P), eager:
+  [1x2560] bf16 39.5 us; [3x2560] 49.3 us; [8x2560] 69.1 us; [16x2560]
+  90.4 us; [64x2560] 333 us; [256x2560] 825 us; [2048x2560] 6.94 ms;
+  [16384x2560] 53.5 ms. Bus bandwidth saturates at ~2.7 GB/s.
+- PCIe is Gen4 x16 per card (idle readings show gen1 downclock); the PLE UVA
+  gather sustains 21.5 GB/s per GPU on the same links, in-graph. NCCL is
+  therefore leaving ~8x interconnect on the table.
+- The model issues 2 all-reduces of [tokens, 2560] bf16 per layer (attention
+  out-proj + MoE) = 96 per forward. At c1 spec-verify (3 rows) that is
+  ~4.7 ms of a ~19 ms step (~25%); at c8 (~24 rows) ~8.6 ms of ~44 ms
+  (~20%). For long-context prefill an 8K chunk pays 96 x ~27 ms = ~2.6 s in
+  collectives alone -- collectives are the hard ceiling on prefill
+  throughput (~3K tok/s) before any kernel work matters.
+- VRAM: 17.6 GiB weights/rank + 2.2 GiB KV pool = ~181K-token slab
+  (per-64-token slab stride ~816 KiB: 12 x 64 KiB main KV + 12 x 4 KiB
+  compressed + mamba/ring overlap). Host RAM: ~500 GiB still free.
+
+Throughput ideas, ranked by measured leverage:
+
+T1. Custom UVA pinned-host all-reduce ("the PLE trick, applied to
+    collectives"). One-shot direct-read for decode sizes (each rank writes
+    its slice to a pinned /dev/shm segment, spins on flags, reads+reduces
+    the other 7 -- ~15-20 us vs NCCL's 40-50 us), chunked/pipelined for
+    prefill sizes (target 15-20 GB/s vs 2.7). Optional FP8-compressed
+    variant halves bytes (port the ROCm QuickReduce idea in
+    csrc/quickreduce to CUDA host-staging). References:
+    QuixiCore-CUDA/kernels/parallel/all_reduce, csrc/quickreduce,
+    csrc/libtorch_stable/custom_all_reduce.cu. Expected: c1 +15-20%,
+    long-prefill 3-5x. The primitive (UVA in-graph, flags, 21.5 GB/s) is
+    already production-proven here by the PLE gather.
+T2. DP2 x TP4 (+EP over all 8) profile experiment: halves the AR group and
+    hop count; vLLM supports attention-DP with expert-EP. Pure config
+    change -- run the same exact-token matrix and compare. Also worth DP4 x
+    TP2 at high concurrency.
+T3. Vendor the upstream fused GDN decode CUDA kernel
+    (csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu at PR #53896 tip,
+    sigmoid gating included) -- one launch per layer for conv+scan+norm at
+    decode across 36 GDN layers, replacing the fla triton chain. The fork
+    deleted this path when it went Metal-first; on CUDA it is a ready win.
+T4. Speculation: enable index_share_for_mtp_iteration (the QSA indexer
+    disappears from draft decode steps; SGLang ships this as
+    QSAMTPSharedSparseIndices), sweep num_speculative_tokens 2->3 (MTP is
+    multi-step trained), re-measure acceptance x cost.
+T5. PLE micro-opts: SGLang-style layer-ahead prefetch on a side stream
+    (hides the ~2 ms per-16K-chunk gather), fp8->bf16 conversion inside the
+    gather kernel, fused decode-sized ngram-hash / gate-value / short-conv
+    kernels (SGLang's qwen4_ple.py is the reference).
+T6. Marlin MoE decode tuning for EP tiny-M (64 experts/rank, ~10 hit per
+    token): moe_align overhead, M<=8 configs, and if profiling justifies
+    it, a QuixiCore-style fused route/align -> grouped W8A16 GEMM -> SwiGLU
+    -> finalize chain per the a100_glm52_design.md playbook.
+T7. nsys decode+prefill step breakdown BEFORE T1/T6 kernels are written, to
+    keep this ranking honest.
+
+Context ideas, staged:
+
+C1. FP8 KV for the 12 main QSA KV layers: halves the dominant slab term
+    (64 KiB -> 32 KiB per 64-token page) -> ~320K-token pool; restores
+    max_model_len 262144 (native) with concurrency headroom. We own the QSA
+    triton kernels (ops/qsa.py) -- add fp8 loads + dequant; the FA2 core
+    path either gains fp8 dequant or yields to our triton sparse kernel.
+    The fork's TurboQuant KV machinery is local precedent.
+C2. gpu_memory_utilization 0.90 -> 0.92-0.93 after graph-memory
+    remeasurement (+~50K tokens).
+C3. Host-resident main KV with UVA sparse gather (the flagship): QSA decode
+    reads only the top-2048 tokens per layer, so decode needs just ~24
+    MB/step from host = ~1.2 ms at the proven 21.5 GB/s -- sparse attention
+    makes host KV *viable*, which dense attention never allows. Keep the
+    compressed indexer cache, ring, and GDN state on GPU (small); page main
+    KV to pinned host pools sized by the ~500 GiB of free host RAM. Prefill
+    writes stream H2D; prefill reads gather per-layer unions (worst case
+    the whole prefix: 128K x 1 KiB x 12 layers / 21 GB/s = ~73 ms per 8K
+    chunk -- acceptable). Combined with C1 (fp8 host KV) traffic halves
+    again. End state: YaRN x4 to 1M tokens on 24 GB cards.
+C4. KV-head sharing: TP8 replicates each of the 2 KV heads across 4 ranks;
+    a /dev/shm-shared host KV pool stores each head once, cutting host KV
+    (and PLE table, same mechanism) storage 4-8x.
+
+Execution order: Phase A = T2 + T4 + T3 + T5 + C2 (cheap, config/vendor
+work, each measured against the recorded baseline). Phase B = T7 then T1
+(custom collective). Phase C = C1 (fp8 KV -> 262K native). Phase D = C3/C4
+(host KV -> 1M). Every step gets baseline / hypothesis / correctness /
+throughput / decision per perf.md.
+
+### 2026-08-26 - Rejected DP2xTP4 attention-DP experiment
+
+Hypothesis: halving the all-reduce group (TP4 within DP2) cuts the per-AR
+latency that dominates decode. Result: rejected before measurement on two
+hard grounds. (1) This vLLM revision forces sequence-parallel MoE whenever
+DP>1 x TP>1 x EP (the "naive" a2a backend was removed upstream and
+allgather_reducescatter implies SP), and the Qwen4Exp hyper-connection
+residual layout cannot shard by sequence -- the model guards against it
+explicitly ("Qwen4Exp HC does not support sequence-parallel MoE",
+perf/results/2026-08-26/qwen38fn-3090-opt/serve_dp2tp4.log). (2) Memory:
+TP4 leaves 28 GiB/rank of FP8 experts, which does not fit 24 GiB cards, so
+attention-DP variants are unreachable without a W4 expert requant.
+Decision: rejected; the collective cost is addressed head-on by the custom
+UVA all-reduce (T1) instead.
+
+### 2026-08-26 - Custom sysmem all-reduce prototyping (decision: prefill-tier only)
+
+Built and iterated a pinned-/dev/shm UVA all-reduce in Triton (one shared
+segment cudaHostRegistered in all 8 ranks, per-rank slot banks double-
+buffered by round parity, cumulative arrival counters, single publisher per
+rank, packed 8-flag word swept in one volatile vector load, device-memory
+gate for the other blocks; round index derived in-kernel from the arrival
+counter so one AR = one kernel launch; correct under CUDA-graph replay).
+Artifacts: perf/results/2026-08-26/qwen38fn-3090-opt/ (sysmem_ar_proto*.py
++ outputs). Hard-won protocol lessons recorded in the sources: the entire
+happens-before chain must be system-scope (device-scope arrivals give
+remote readers stale slots), a single shared host counter fetch-added by
+all 8 GPUs hangs this EPYC root complex (per-rank words work), and Triton
+while-loops cannot contain break.
+
+Measured (8x3090, vs NCCL from nccl_ar_microbench.txt):
+
+| payload | NCCL | one-shot | two-phase RS+AG |
+| --- | ---: | ---: | ---: |
+| 15 KB (3 tok) | 49 us | 62-76 us | - |
+| 328 KB (64 tok) | 333 us | 411 us | 420 us |
+| 1.3 MB (256 tok) | 825 us | 1475 us | 1304 us |
+| 10.5 MB (2048 tok) | 6.94 ms | 11.2 ms | 8.27 ms |
+
+NCCL env sweep (Tree/Simple/SHM_USE_CUDA_MEMCPY/NTHREADS/BUFFSIZE) never
+moved NCCL off ~2.7 GB/s busbw, so that is the SHM-transport platform
+ceiling, but its LL protocol is already near the small-payload latency
+floor: the custom one-shot cannot meaningfully beat ~40 us at decode sizes.
+The prototype's large-payload loss traces to GPU-side UVA read bandwidth
+(~4-5 GB/s from 64 persistent blocks with accumulate chains) versus the
+21.5 GB/s the PLE gather achieves with one-program-per-row parallelism.
+
+Decision: pivot T1 to a prefill-tier collective only -- structure large ARs
+as [copy-in huge-grid kernel] [1-block barrier kernel] [stripe gather+
+reduce huge-grid] [barrier] [result gather huge-grid], PLE-style massive
+parallelism in every data mover, keeping NCCL for decode-size payloads.
+Target: >15 GB/s effective -> 4-8x on the 96 x 27 ms per-8K-chunk prefill
+collective bill. Decode-side wins must come from T3/T4/T6 and from
+reducing collective count, not collective latency.
+
+### 2026-08-26 - Platform DMA asymmetry bounds host-staged collectives
+
+Aggregate concurrent-DMA microbench (8 ranks,
+perf/results/2026-08-26/qwen38fn-3090-opt/agg_dma_bench.py): H2D scales to
+105.6 GB/s aggregate (13.2/GPU) but D2H collapses to 16.5 GB/s aggregate
+(2.1/GPU) -- the EPYC root complex serializes concurrent device-to-host
+writes. Single-GPU D2H is 20-26 GB/s, so this is contention, not link
+speed.
+
+Consequences: every inter-GPU byte must transit host (no P2P), so any
+8-rank all-reduce of B bytes pays >= 7B of aggregate D2H, flooring the op
+at 7B / 16.5 GB/s. NCCL's measured 26.8 ms for an 8K-chunk AR sits within
+~35% of that wall -- NCCL is not leaving 8x on the table after all; the
+apparent 21.5 GB/s UVA headroom was read-path-only. The copy-engine
+RS+AG SysmemAllreduce built today (correct, graph-capturable,
+vllm/distributed/device_communicators/sysmem_all_reduce.py + standalone
+test) measures 0.85-0.89x NCCL at large sizes and is retained as
+infrastructure, not enabled.
+
+Revised collective plan: the only real prefill-AR lever is sending fewer
+bytes -- an FP8-compressed all-reduce (QuickReduce scheme, local precedent
+in csrc/quickreduce for ROCm) halves D2H and should combine with the
+copy-engine transport for ~2-3x on prefill collectives. Decode-size ARs
+stay NCCL (its LL protocol is at the latency floor). Campaign priority
+shifts decode-ward (fused GDN, spec knobs, MoE) and context-ward (fp8 KV),
+with fp8-AR as the follow-up collective work.
+
+### 2026-08-26 - Phase A results: fused GDN, MTP index share, MTP k sweep
+
+Paired A/B chain (each leg: fresh serve of qwen38fn-fp8-8, exact-token
+1000/2000, shipped sampling, seed 42, c1+c8; raw logs
+perf/results/2026-08-26/qwen38fn-3090-opt/bench_*.log). The harness is
+tight: the control leg reproduces the prior session baseline to 0.02%
+(409.61 vs 409.66 c8).
+
+| leg | GDN kernel | spec | c1 tok/s | c8 tok/s |
+| --- | --- | --- | ---: | ---: |
+| gdntriton (control) | triton | k=2 | 106.01 | 409.61 |
+| gdnfused | fused CUDA | k=2 | 107.64 | 391.07 |
+| idxshare | fused CUDA | k=2 + index share | 108.65 | 414.94 |
+| k3 | fused CUDA | k=3 + index share | 114.30 | 368.64 |
+
+Decisions:
+
+- Fused GDN decode kernel (vendored from PR #53896 tip with sigmoid
+  support, 16/16 unit tests pass on SM86 including pure-decode/pure-MTP/
+  mixed/prefill): REJECTED as default. Inside FULL decode graphs the launch
+  savings are already amortized and the kernel loses 4.5% at c8 (391.1 vs
+  409.6); c1 +1.5% is within sampling-trajectory noise (its slightly
+  different norm numerics shift acceptance). Kernel stays built and
+  selectable via VLLM_GDN_DECODE_KERNEL=cuda; profile pins triton. An
+  SM86-tuned variant (occupancy/tile work) is a future kernel project.
+- index_share_for_mtp_iteration: RETAINED. +6.1% at c8 vs its paired
+  baseline (414.9 vs 391.1) and above the triton control even while
+  carrying the slower fused kernel; c1 +1%. The MTP draft reuses the
+  target-aligned QSA indexer selection, deleting indexer QK/MQA/top-k from
+  draft decode steps (the mechanism SGLang ships as
+  QSAMTPSharedSparseIndices).
+- MTP k=3: split verdict -- +6.2% c1 (114.3), -11% c8 (368.6). The fork's
+  num_speculative_tokens_per_batch_size schedule captures both regimes;
+  chain 3 probes k=3 for batch<=2 and k=2 above (with FULL-graph
+  compatibility of dynamic-K the open question, since dynamic SD disables
+  spec padding).
+
 ## 2026-08-09 - Retained Merged Sparse-MLA Decode And Exact Baseline
 
 - Status: retained production improvement; tensor-parallel scaling gate still
@@ -14625,6 +15017,115 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   which step first diverges. Their sums are already extracted; our side needs
   hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
 
+## 2026-08-25 - Metal Profile Validation Sweep: 2 PASS, 1 blocked, DSV4 registry geometry FAILS on 128 GiB
+
+- Scope: every registry profile compatible with this machine (M5 Max,
+  128 GiB), each with its registered drafter, via the real server path
+  (`slimserve <profile> --serve`) and seeded shipped-defaults requests
+  (seed 42, no sampling overrides). Vision profiles got text + image
+  requests (synthetic red-bordered rectangle + blue ellipse PNG).
+  Harness: perf/results/2026-08-25/profile-validation/validate_profile.py.
+- glm52-xxs-1: BLOCKED by the registry, correctly -- IQ2_XXS needs
+  256 GiB unified memory (this box has 128) and the profile is also
+  status-gated (Metal sparse-MLA unvalidated). Not substituted.
+- qwen38-q2kxl-1: PASS text+image. Health 19-21 s warm. Text: coherent
+  Jupiter-moons answer, 221 tokens in 5.8 s, DFlash 2 acceptance 43.7%
+  (mean len 2.31). Image: vision path healthy without torchvision (PIL
+  fallback); shipped thinking mode deliberates at length on the shapes
+  image (2048 tokens still thinking, grounded pixel-arithmetic
+  reasoning, no loop); offline smoke shows the completed answer path.
+- muse-kdyn-1: PASS text+image. Artifacts fetched by slimserve.fetch
+  (registry-exact sizes; the Aug-10 local copies were a different
+  revision). Health 32 s. Text coherent; image answer describes the
+  shapes exactly, finish=stop, 264 tokens in 23.6 s. DFlash acceptance
+  mean len 2.4-3.0.
+- dsv4-xxs-1: FAIL at registry geometry. Server reached health (537 s
+  cold) and returned 200s, but output is multilingual token soup at
+  1.1 tok/s with 0/55 draft tokens accepted. This is the pending
+  close-out from 2026-08-24 (registry.log's resp1 was an EngineCore
+  500; small-geometry smoke was healthy).
+- Bisect (offline probes, ctx 3072 fixed, only kv_cache_memory_bytes
+  varied; seeded, same prompt; raw in ~/.local/scratch/dsv4-geom/):
+  1 GiB 29.9 tok/s coherent; 4 GiB 30.8 coherent (head byte-identical);
+  8 GiB 27.3 coherent; 9 GiB 26.2 coherent; 12 GiB 3.6 tok/s COHERENT
+  but crawling; 16 GiB 1.9 tok/s GIBBERISH. Context length is
+  exonerated (all probes at 3072; the 262144 resize never entered).
+- Mechanism: weights+drafter stack is 93.6 GiB;
+  torch.mps.recommended_max_memory() = 107.52 GiB on this box.
+  93.6+9 = 102.6 fits (fast, correct); +12 = 105.6 approaches the limit
+  (driver paging, 7x slowdown, still correct); +16 = 109.6 exceeds it
+  (non-resident reads return garbage rather than faulting). Classic
+  working-set eviction: perf degrades before correctness.
+- Not an int32/uint32 offset bug: 4 GiB (2^32 bytes) and 9 GiB pools
+  are clean, so 32-bit byte/element offset theories are all ruled out.
+  Branch exonerated too: metal-decode-sync-removal's small-geometry
+  output matches the 08-24 main-stack smoke.
+- Decision: dsv4-xxs-1's Metal override (16 GiB KV) does not fit a
+  128 GiB machine alongside 93.6 GiB of weights. Options for the fix
+  owner: size the Metal KV pool from
+  recommended_max_memory - weights - margin (8 GiB here keeps ~300K
+  fp8_ds_mla tokens and measured 27 tok/s), and/or add a boot-time
+  guard refusing geometries whose planned residency exceeds the
+  device working set -- today it serves garbage with HTTP 200.
+- Raw: perf/results/2026-08-25/profile-validation/ (server/engine logs,
+  raw request JSON per profile) and ~/.local/scratch/dsv4-geom/probe_*.
+
+## 2026-08-25 - FIXED: Metal KV pools are fitted to the device working set
+
+- Baseline: the validation sweep earlier today. dsv4-xxs-1 at its
+  registry geometry served multilingual token soup at 1.1 tok/s with 0%
+  draft acceptance while returning HTTP 200; the KV-pool bisect showed
+  <=9 GiB coherent at 26-31 tok/s, 12 GiB coherent at 3.6, 16 GiB
+  garbage.
+- Hypothesis: the profile's fixed pool is honoured verbatim, and on
+  unified memory an oversized pool is not an OOM. Since
+  `_pin_weights_resident` pins the weight heaps, the KV pool is what the
+  driver evicts, so decode reads non-resident pages and returns garbage
+  with no error to catch.
+- Change (vllm/v1/worker/metal_worker.py): new
+  `_fit_kv_pool_to_working_set`, applied on both budget paths in
+  `determine_available_memory`. It measures residency from
+  `torch.accelerator.get_memory_info` (which on Metal reports against
+  `recommendedMaxWorkingSetSize`), keeps back max(4 GiB, 4% of the
+  working set) for activations/scratch/fragmentation, grants the smaller
+  of the request and that budget, and raises when under 0.5 GiB would
+  remain instead of booting a doomed geometry. The granted value is
+  written back to `cache_config.kv_cache_memory_bytes` so the log line
+  and the KV allocator agree. Only the Metal worker changed; the CUDA
+  path is untouched, since a discrete GPU answers an oversized pool with
+  a real OOM.
+- Why residency is measured, not declared: DSV4 IQ2_XXS is 87.3 GiB of
+  files but loads to 93.57 GiB, and Muse's Q4_K_XL is 18.3 GiB of files
+  at 42.66 GiB resident (1.07x to 2.0x). No profile can compute this
+  from artifact sizes, which is exactly how the 16 GiB figure was
+  derived wrongly.
+- Correctness/measurement, all through `slimserve <profile> --serve`
+  with registered drafters and seeded shipped defaults:
+  - dsv4-xxs-1: PASS. Clamp fired -- "Requested 16.00 GiB KV pool does
+    not fit this machine; using 6.52 GiB" (96.70 GiB resident of the
+    107.52 GiB working set, 4.30 GiB reserved). 880,117 KV tokens, 3.36x
+    concurrency at 262,144 per request. Coherent Jupiter-moons answer,
+    256 tokens in 10.84 s = 23.6 tok/s, spec accepting (mean length
+    1.51). Was 1.1 tok/s of garbage.
+  - qwen38-q2kxl-1: unchanged. 12 GiB granted exactly, no clamp, text
+    output byte-identical to the pre-fix run.
+  - muse-kdyn-1: unchanged. 12 GiB granted exactly, no clamp, image
+    answer identical, finish=stop.
+- Also corrected: the dsv4-xxs-1 Metal profile note in profiles.json
+  contained the bad arithmetic in prose (artifact bytes vs a guessed
+  ~115 GiB working set). It now states the pool is a ceiling the worker
+  fits to the machine, and records the real figures.
+- Tests: tests/v1/worker/test_metal_kv_pool_fit.py (8 cases: exact grant
+  when it fits, the DSV4 clamp, refusal when nothing useful fits, the
+  floor boundary, reserve scaling on a 512 GiB machine, and that the fit
+  never inflates a request). Suite: 45 passed / 103 skipped. Ruff clean.
+- Decision: RETAINED. Remaining follow-up: the 6.52 GiB grant is the
+  safe floor, not a tuned figure -- the bisect showed 8-9 GiB pools
+  decoding at 26-27 tok/s on this box, so the 4 GiB reserve could be
+  revisited with a measured activation peak for DSV4.
+- Raw: perf/results/2026-08-25/profile-validation/ (post-fix server logs
+  and per-request JSON) and ~/.local/scratch/dsv4-geom/probe_*.
+
 ## 2026-08-25 - FIX: DFlash drafter wrote K/V in the wrong cache layout
 
 - Status: RESOLVED. DFlash2 speculation now passes the full profile smoke on
@@ -14812,3 +15313,565 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   (tie-carrier 8c58a4c6, matches the merge-gate run). muse_q38
   registered. Raw: perf/results/2026-08-25/{anchor_regate_coderabbit,
   coderabbit_regate}/. Box left serving canonical.
+
+## 2026-08-27 - 8x3090: P2P driver + 32 GiB BAR1 + NCCL P2P (infrastructure, supersedes SHM-era collectives)
+
+- Baseline (pre-change): NCCL SHM transport, 2.7 GB/s all-reduce busbw at
+  84 MB payloads on 8x RTX 3090 (EPYC 7702, four root complexes). Phase-A
+  serving baseline on that fabric: c1 109.61 / c8 409.66 tok/s
+  (perf/baseline_status.md).
+- Hypothesis: consumer-GPU P2P is a driver-policy limit, not hardware; the
+  QuixiAI 610.57.04 fork (tinygrad-derived BAR1-P2P force-enables) plus a
+  full-size BAR1 restores direct GPU-GPU DMA and lifts the collective
+  ceiling roughly 10x.
+- What it took (each step measured, all needed):
+  1. Patched modules installed; P2P matrix all-OK; but pairs at 0.9 GB/s ->
+     IOMMU translated mode was the cause; `iommu=pt` -> 23-26 GB/s peer
+     copies on every pair.
+  2. NCCL still hung at the FIRST collective, even 2 ranks. Root cause:
+     256 MiB BAR1 cannot hold NCCL's persistent peer mappings (copy-engine
+     transient mappings work, which is why bandwidth tests pass). BAR1 must
+     cover the framebuffer.
+  3. Firmware path to 32 GiB BAR1 on Gigabyte MZ22-G20: BIOS R43 exposes a
+     ~1.75 TB 64-bit window per root complex ("Prefetchable MMIO Above 4G
+     Size" = 2 TB/NBIO, already set); but firmware still enumerates GPUs at
+     256 MiB and neither the driver probe resize nor sysfs
+     resource1_resize can regrow the bridge windows in place (ENOSPC).
+     Fix: program the ReBAR control register directly, remove the four GPU
+     root-port subtrees, rescan, reload driver. Scripted in the driver
+     repo: open-gpu-kernel-modules/tools/resize-bar1.sh (+ systemd unit;
+     the ReBAR register resets every boot). All 8 GPUs now 32768 MiB BAR1.
+  4. NCCL then works but defaults to SHM for cross-root-complex pairs:
+     4.2 GB/s. `NCCL_P2P_LEVEL=SYS` -> 24.7 GB/s busbw, 41 us small-AR
+     latency (1x2560 bf16). 9.1x over the SHM ceiling.
+- Profile changes (qwen38fn-fp8-8/rtx3090): env += NCCL_P2P_LEVEL=SYS,
+  VLLM_GDN_DECODE_KERNEL=triton (Phase-A verdict, now pinned rather than
+  per-run).
+- Correctness: ar_bench2.py all-reduces converge (values verified by NCCL's
+  own reduction; serving correctness gate = the re-baseline bench runs).
+- Raw: perf/results/2026-08-27/qwen38fn-3090-p2p/ (bench logs), README and
+  scripts in /home/quixi/open-gpu-kernel-modules (commit a5c0fb70).
+- Decision: RETAINED (infrastructure). Serving re-baseline with P2P
+  collectives is the new reference; SHM-era numbers are historical.
+- Follow-up in flight: vLLM custom allreduce on PCIe P2P. Upstream gate
+  refuses >2 PCIe GPUs; C++ dispatch also launched NO kernel for
+  not-fully-connected topologies (silent no-op - would have produced
+  garbage if only the Python gate were lifted). Both fixed:
+  VLLM_CUSTOM_AR_ALLOW_PCIE=1 opt-in + PCIe-tuned 1stage/2stage cutover
+  (64 KiB) in csrc/custom_all_reduce.cuh. A/B pending rebuild.
+
+## 2026-08-27 - 8x3090: P2P serving re-baseline; custom-AR-over-PCIe rejected
+
+- New serving baseline on the P2P fabric (NCCL_P2P_LEVEL=SYS, triton GDN,
+  idxshare, MTP k=2, 128K): c1 148.81 (+35.8% vs SHM-era 109.61),
+  c8 647.88 (+58.2% vs 409.66). Raw:
+  perf/results/2026-08-27/qwen38fn-3090-p2p/bench_p2p_c{1,8}.log.
+- Custom allreduce over PCIe P2P (VLLM_CUSTOM_AR_ALLOW_PCIE=1):
+  - Correctness: PASS against an fp32 all-gather reference; CA is MORE
+    accurate than NCCL (single fp32 accumulate: max err 3.1e-2 vs NCCL
+    5.7e-2..1.1e-1 on 8-way bf16 sums). First parity run "failed" only
+    because it treated NCCL as ground truth.
+  - Latency (8 ranks, bf16 [t,2560]): CA wins only at t=1 (34.0 vs
+    40.3 us); loses at t=3 (74 vs 40), t=8 (159 vs 40), t=64 (393 vs 69).
+    1stage's all-peers-read-all pattern multiplies PCIe traffic; with MTP
+    k=2 decode ARs are ~3-token, squarely in the losing region.
+  - Decision: REJECTED for serving (skipped the serving leg; microbench is
+    conclusive). Code retained env-gated off: correct, opt-in, and the
+    right substrate for a future PCIe-shaped kernel (reduce-scatter tree
+    with fp32 staging). Raw: car_parity2.log (latency), rerun (fp32 ref).
+
+## 2026-08-27 - 8x3090 chain2: FP8 main-KV serving verdicts (128K parity, 262K restore, APC)
+
+- Baseline: P2P serving reference, bf16 KV @128K: c1 148.81 / c8 647.88.
+- Hypothesis: layer-scoped FP8 main QSA KV (VLLM_QWEN4_EXP_FP8_MAIN_KV=1)
+  halves the dominant KV slab, restoring the model's native 262,144 context
+  that bf16 could not fit (3.52 GiB needed vs 2.2 free at 128K-era sizing),
+  at some decode cost from the SM86 software e4m3 decode.
+- Three integration bugs found and fixed on the way (first end-to-end run of
+  the fp8 path; unit tests had covered only the kernels):
+  1. Layer gate mapped "fp8" through STR_DTYPE_TO_TORCH_DTYPE (=uint8, the
+     view dtype) and tripped its own allocation-dtype assert -> allocate
+     torch.float8_e4m3fn directly.
+  2. FlashAttentionImpl base __init__ rejects fp8 KV on SM86 -> resolved
+     structurally: Qwen4ExpQSAFlashAttentionImpl is now a standalone
+     AttentionImpl (FA contributed no kernels; cache writes use the generic
+     reshape_and_cache_flash CUDA op; vestigial FA checks deleted).
+  3. Hybrid block-size aligner computed the attention page from the global
+     cache dtype (bf16), so fp8 halved the real page and the packed GDN
+     state page (406,016 B) no longer fit a main-KV slot (204,800 B) ->
+     aligner now recomputes with the override dtype; block_size doubles,
+     page bytes stay 409,600, token capacity doubles.
+- Results (exact 1000/2000, temp 1.0/top_p 0.95/top_k 20, seed 42):
+  | config            | c1     | c8     |
+  | bf16 @128K (ref)  | 148.81 | 647.88 |
+  | fp8  @128K        | 133.17 | 465.92 |
+  | fp8  @262K        | 123.85 | 483.74 |
+  | fp8  @128K + APC  | 128.17 | 471.06 |
+- Reading: fp8 tax is ~10% c1 / ~25-28% c8 (software e4m3 decode in the QSA
+  gather kernel dominates under batch load). 262K serves correctly - the
+  native-context goal is met. APC costs ~4% on a no-reuse workload and
+  functions at both concurrencies (functional gate passed; its win needs
+  prefix-repeating traffic).
+- Decision: profile default stays bf16 @128K (throughput config). FP8 is
+  RETAINED as the context-max option (fp8 @262K), pending user choice on a
+  second profile id vs. a documented env override. Next optimization lead:
+  replace the arithmetic e4m3 decode with a 256-entry LUT or tighter
+  bit-twiddle to close the c8 gap, then re-run this A/B.
+- Raw: perf/results/2026-08-27/qwen38fn-3090-p2p/bench_fp8kv*_c{1,8}.log,
+  serve_fp8kv*.log (chain2d).
+
+## 2026-08-27 - 8x3090 chain3: MTP k=3 wins c1, loses c8; dynamic-k rejected (cudagraph fall-off)
+
+- Baseline: P2P reference (k=2 + idxshare): c1 148.81 / c8 647.88.
+- k=3 fixed: c1 163.26 (+9.7%) / c8 571.06 (-11.9%). On the P2P fabric,
+  deeper speculation now pays at low concurrency (ARs 9x cheaper than the
+  SHM era, where k=3 lost both legs); still loses under batch.
+- dynamic-k ([[1,2,3],[3,32,2]] = k3 for bs<=2, k2 for bs 3-32):
+  c1 60.88 / c8 435.34 - catastrophic, NOT a schedule-format error.
+  ROOT CAUSE: vllm/v1/core/sched/scheduler.py gates the
+  pad-decode-to-uniform-spec-size branch on `dynamic_sd_lookup is None`,
+  so with a dynamic schedule decode batches are never padded to the
+  uniform shape and FULL_DECODE_ONLY cudagraphs never match -> every
+  decode step runs eager.
+- Decision: dynamic-k REJECTED until the cudagraph dispatcher can capture
+  and dispatch multiple uniform-decode query lengths (one per scheduled
+  k). k choice stays fixed; the k sweep (nospec,1,2,3,4,5 x c 1,2,4,8)
+  will pick the operating point and quantify what a graph-compatible
+  dynamic-k would be worth.
+- Raw: bench_k3p2p_c{1,8}.log, bench_dynkp2p_c{1,8}.log (chain3).
+
+## 2026-08-27 - 8x3090: MTP draft-length sweep, full k x concurrency surface
+
+- Method: one server lifecycle per k (engine-level setting; graphs are
+  captured per decode shape), exact 1000/2000 bench at c in {1,2,4,8},
+  idxshare on for every k>0 leg. k=2 c1/c8 and k=3 c1/c8 reuse the p2p
+  baseline and chain3 legs (same config, same fabric).
+
+  | k      | c1     | c2     | c4     | c8     |
+  | nospec |  88.49 | 157.27 | 285.68 | 489.16 |
+  | 1      | 128.17 | 205.19 | 348.23 | 602.11 |
+  | 2      | 148.81 | 242.98 | 371.29 | 647.88 |
+  | 3      | 163.26 | 262.33 | 426.13 | 571.06 |
+  | 4      | 154.04 | 234.40 | 394.55 | 564.59 |
+  | 5      | failed to start: QSA ring capacity 12 (compress_ratio 4,
+             span 4+5=9 -> 12) does not divide attention block size 416.
+             Structural, not a flake; not pursued (k4 already declines). |
+
+- Reading:
+  - The drafter is worth +68% (c1) tapering to +32% (c8) at k=2 vs nospec.
+  - k=3 is the best fixed k at c1 (+9.7%), c2 (+8.0%), and c4 (+14.8%);
+    k=2 only wins at c8 (647.9 vs 571.1, -11.9% for k3). The crossover
+    sits between c4 and c8.
+  - k=4 declines everywhere vs k=3: acceptance decay beats the extra
+    draft depth on this fabric.
+- Decision: the ideal operating point is per-batch k (k=3 below the
+  crossover, k=2 at c8), which requires the cudagraph dispatcher to hold
+  captures for multiple uniform-decode query lengths - the same gap that
+  made the scheduler-level dynamic-k run eager (previous entry). Until
+  that lands, fixed k is a traffic-profile choice:
+  k=3 maximizes c<=4 throughput, k=2 maximizes c8. Profile currently
+  keeps k=2 (idxshare); recommendation to flip pending user's traffic
+  shape. Raw: bench_{nospec,k1,k4,k2fill,k3fill}_c{1,2,4,8}.log.
+
+## 2026-08-27 - 8x3090: TurboQuant k8v4 main-KV RETAINED - dominates FP8 on every axis
+
+- Hypothesis: TQ k8v4 (fp8 keys - e4b15 on Ampere - plus 4-bit uniform
+  values with per-slot f16 scale/zero, 388 B vs 1024 B bf16 per
+  token-head, 2.64x) beats the unit-scale e4m3 main-KV both on decode
+  cost (integer dequant vs arithmetic fp8 emulation on SM86) and on
+  quality (real scales).
+- Implementation: VLLM_QWEN4_EXP_TQ_MAIN_KV=1, layer-scoped like the fp8
+  option. Reuses the drafter-path fused store (_tq_fused_store_fp8); the
+  QSA sparse-gather kernel decodes K via Triton's native e4b15 bitcast
+  and V via nibble unpack + FMA. TQFullAttentionSpec end-to-end; three
+  exact-type checks (CSA role classifier, packed-layout detector, MTP
+  drafter owner lookup) widened to accept the TQ subclass - each found
+  by a startup failure, each now unit-covered.
+- Results (exact 1000/2000, seed 42, k=2+idxshare):
+  | config          | c1     | c8     | c8 accept |
+  | bf16  @128K     | 148.81 | 647.88 | 62.8%     |
+  | fp8   @128K     | 133.17 | 465.92 | 59.9%     |
+  | TQ    @128K     | 133.21 | 562.12 | 62.3%     |
+  | TQ    @262K     | 131.79 | 571.63 | 65.3%     |
+- Reading: TQ ties fp8 at c1, beats it +20.7% at c8, and its draft
+  acceptance sits at bf16 parity (62.3 vs 62.8) where fp8 loses 3 points
+  - the per-vector value scales matter for verifier quality. The native
+  262,144 context serves at effectively no cost over TQ@128K: the bench
+  workload (1000/2000 tokens) never exercises the ceiling, so the
+  562-vs-572 c8 delta and the 62.3-vs-65.3 acceptance delta are
+  single-run noise, not a 262K speedup. A long-context bench leg
+  (e.g. 100K prompts) is the follow-up that actually measures the
+  large-context regime.
+- Decision: TQ k8v4 RETAINED as the context-max KV format; the fp8
+  option is superseded (kept only as a diagnostic env). Remaining trade
+  vs bf16@128K: -10% c1 / -13% c8 for 2x the context. Profile default
+  decision (throughput vs context) left to the user; both configs are
+  one env + one field apart.
+- Raw: bench_tq{128k,262k}_c{1,8}.log, serve_tq*.log (tq_legs2).
+
+## 2026-08-27 - 8x3090: TQ 128K vs 262K decision matrix (c1..c64) + the c8 scaling cliff
+
+- Both legs TQ main-KV, max_num_seqs 64, identical but for max_model_len:
+  |  c | TQ@128K | accept | TQ@262K | accept |
+  |  1 |  150.21 | 72.5%  |  129.86 | 57.1%  |
+  |  8 |  564.61 | 61.7%  |  576.75 | 66.0%  |
+  | 16 |  461.97 | 59.4%  |  466.12 | 61.8%  |
+  | 32 |  420.40 | 60.2%  |  425.47 | 63.0%  |
+  | 64 |  426.76 | 63.9%  |  421.32 | 61.9%  |
+- Verdict: the legs are statistically identical at every concurrency
+  (c1 is single-stream sampling noise; acceptance for the SAME config
+  spans 57-73% at c1 across runs). 262K WINS BY DEFAULT: same speed and
+  quality, double the ceiling. Caveat recorded: this workload never
+  exercises deep context; a long-context leg (100K prompts) is still
+  owed before claiming the deep regime.
+- New problem surfaced: throughput PEAKS AT c8 (~570) and falls ~25% by
+  c32, identically in both legs. Known half: with k=2, decode steps are
+  seqs x 3 query tokens; c32 (96) and c64 (192) exceed the 64-token
+  graph-capture ceiling and run eager. Unknown half: the c8->c16 drop
+  (564->462) happens with BOTH shapes graph-captured (24 and 48 both in
+  the capture list).
+- In flight: Exp A re-benches c8-c64 with max_cudagraph_capture_size 192
+  (config-only); Exp B captures torch-profiler traces at steady-state
+  decode c8 vs c16 on that config and diffs GPU-time share by kernel
+  (trace_diff.py) to attribute the remaining gap. Suspects: QSA
+  sparse-kernel tile-tier switch at 32<programs<=256, Marlin MoE
+  M-growth, GDN batch scaling, AR payload growth.
+- Raw: bench_tqd{128,262}_c*.log, tq_decision.log; traces under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/traces/ once Exp B runs.
+
+## 2026-08-27 - 8x3090 cliff hunt: graphs and GPU kernels exonerated; slow-48-token state is per-server-instance
+
+- Timeline of evidence (all c16, exact 1000/2000, TQ main-KV, 128K):
+  - Dispatch-stats instrumentation (VLLM_CUDAGRAPH_DISPATCH_STATS in the v2
+    CudaGraphManager.dispatch) shows 48tok/FULL graph hits >82% in BOTH
+    fast and slow runs -> not a graph miss.
+  - Torch-profiler trace diff seqs64-vs-seqs32 is NULL on the GPU side
+    (kernel shares within 0.25%) while unprofiled throughput differed
+    462 vs 660 -> whatever differs is not steady-state GPU kernel time.
+  - Exp D: seqs=64 reproduced 461.6. Exp F: identical seqs=64 config
+    measured 653.1 -> the valley is NON-DETERMINISTIC per server launch.
+  - Exp A observed c16 slow (463) and c32/c64 fast (661/669) in the SAME
+    server -> when present, the pathology is specific to the 48-token
+    step, not global to the instance.
+  - Acceptance correlates (slow ~0.60, fast ~0.63) but is far too small
+    to explain 40%; treated as symptom.
+- Current hypothesis space: per-launch state affecting the 48-token decode
+  step only - e.g. capture-time memory layout of that graph's static
+  buffers, or a host-side per-step cost that intermittently lands on the
+  critical path. py-spy attach failed (yama ptrace_scope); needs
+  `sudo sysctl kernel.yama.ptrace_scope=0` for host-side flamegraphs.
+- In flight: Exp G - one seqs=64 server, bench sequence c16 x3, c8, c32,
+  c16 to test whether the slow state is sticky per instance and whether
+  it survives interleaved other-size benches.
+- Raw: cliff_exp{C,D,E,F,G}.log, serve_exp*.log, traces/ under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - 8x3090: NEW correctness bug - CUDA illegal memory access at c32 after bench churn
+
+- During Exp G (seqs=64, cap 96, TQ main-KV): after 56 completed requests
+  (c16 x3 + c8 benches), the first c32 bench crashed every worker with
+  "CUDA error: an illegal memory access was encountered", surfacing at
+  metadata build (short_conv_attn.py:333) - i.e. an earlier async kernel
+  faulted; the report site is just the sync point.
+- The only prior c32 run (Exp A: seqs 64, cap 192) worked at 661 tok/s but
+  ran c32 after only c8/c16 legs on a fresh server. Suspects: request-churn
+  state (CSA ring wraparound, TQ store slot edges, drafter state reuse)
+  interacting with the 96-token step.
+- Correctness outranks the perf mystery: Exp H (cliff_expH.log) replays a
+  compressed churn sequence (c16,c8,c32,c16,c32,c8 at 600 output tokens)
+  to find a fast repro; next step after repro is CUDA_LAUNCH_BLOCKING=1 +
+  eager mode to name the faulting kernel, then compute-sanitizer on a
+  reduced case.
+- Exp G stickiness data (before the crash): c16 on one seqs=64 server ran
+  664/619/638 - a FAST instance; the slow state was not reproduced this
+  launch. Bimodality remains open, possibly linked to the same
+  state-lifecycle bug.
+
+## 2026-08-27 - 8x3090: CORRECTION - bf16 c16/c32 was never measured; TQ's high-concurrency tax is ~25-30%
+
+- Exp M (bf16 KV @128K, seqs 32, cap 96, standard 1000/2000 bench, churn
+  order c16,c16,c16,c8,c32,c16): c16 843/809/908/919, c8 586.7, c32 861.0.
+- Corrected KV table (standard bench, best observed):
+  | config      | c8      | c16    | c32    |
+  | bf16 @128K  | 587-648 | ~870   | ~861   |
+  | TQ   @128K  | 570     | 625-660| 661*   | (*c32 at cap192/seqs64)
+  | TQ   @262K  | ~570    | ~625   | ~660   |
+- The earlier "TQ ties bf16" conclusion compared TQ c16/c32 against bf16's
+  c8 only - bf16 was never benched at c16/c32. TQ's real cost at high
+  concurrency is 25-30%; the 262K context still requires TQ (bf16 cannot
+  fit 262K), but the trade is context vs meaningful throughput, not free.
+- Also: bf16 shows NO c16 valley (870 at c16) - the valley phenomenon and
+  the depressed 620-660 band are TQ-specific; prime suspect is the TQ
+  gather kernel's V-dequant cost at batch (each V byte loaded twice via
+  dim//2 addressing; scale/zero as four 1-byte loads per column).
+- Exp N: cap96+TQ churn ran CLEAN (crash now 2-of-4, intermittent,
+  TQ+cap96-implicated; next tool is compute-sanitizer on the churn).
+- Next: optimize the TQ gather (single-load nibble unpack, 32-bit
+  scale/zero load), re-A/B, then sanitizer run for the crash.
+
+## 2026-08-27 - 8x3090: c16 valley ROOT-CAUSED and FIXED - QSA tile-tier collapse for quantized KV
+
+- Root cause (found by direct kernel microbench, rows x topk=2048/rank
+  shapes): qsa_sparse_paged_attention's launch profile switches at
+  base_programs > 32 from (block_n=16, warps=4) to (block_n=64, warps=2).
+  For bf16 KV that tier is fine; for in-register-dequant KV the ALU-heavy
+  decode cannot be hidden by 2 warps over 64-wide tiles:
+  | rows | bf16    | fp8-e4m3  | TQ k8v4  |
+  | 24   | 105 us  | 137 us    | 116 us   |
+  | 48   | 140 us  | 3179 us   | 530 us   |  <- the c16 valley (48 tokens)
+  | 96   | 275 us  | 6002 us   | 937 us   |
+  This also explains the serving observations: c8 (24 tokens) unaffected,
+  c16 (48) collapsed, and the fp8 main-KV c8 serving loss (its prefill and
+  larger steps hit the wide tiers catastrophically). The earlier "valley
+  disappears at seqs=32" runs were coincidental batch-mix effects; the
+  bimodality tracked how often steps landed in the bad tier.
+- FIX: quantized-KV paths (KV_TQ/KV_FP8) keep block_n=16 / 4 warps at
+  every program count (ops/qsa.py). Microbench after:
+  | rows | fp8     | TQ       | TQ/bf16 |
+  | 24   | 138 us  | 114 us   | 1.09x   |
+  | 48   | 232 us  | 192 us   | 1.37x   |
+  | 96   | 503 us  | 354 us   | 1.29x   |
+- Also retained: 32-bit fused scale/zero load in the TQ path (replaces 4
+  scattered byte loads). REJECTED: tl.interleave single-load nibble unpack
+  - Triton 3.7.1 miscompiles interleave feeding tl.dot (parity maxdiff
+  1.2; probes that materialize to memory pass, dot-operand layout breaks);
+  the dim//2 double-read hits the same L1 line and is effectively free.
+- All 124 qwen4_exp tests pass. Exp O (cliff_expO.log) re-runs the TQ
+  standard-bench row (c16 x3, c8, c32, c16; seqs 32, cap 96) for the
+  corrected KV decision table against bf16's 843-919 c16 / 861 c32.
+
+## 2026-08-27 - 8x3090: tier fix validated in serving - TQ matches bf16, cliff eliminated
+
+- Exp O (TQ @128K, seqs 32, cap 96, fixed kernel, standard bench):
+  c16 829/888/826/864, c8 592.9, c32 867.6. vs bf16 (Exp M): c16 843-919,
+  c8 586.7, c32 861.0. TQ == bf16 within noise at every measured
+  concurrency; the 2.64x KV compression is now effectively free.
+- Scaling is monotonic and healthy: c8 593 -> c16 ~850 -> c32 868. The
+  entire c16-valley / scaling-cliff phenomenon was the quantized-KV
+  tile-tier collapse (previous entry); every TQ and fp8 serving number
+  measured before this fix (562-660 band) was afflicted.
+- No crash during Exp O (fixed kernel, TQ+cap96, 6 benches with churn).
+- Decision: TQ k8v4 main KV RETAINED as the profile default with the tier
+  override in place. In flight: Exp P = TQ@262K, seqs 32, cap 96,
+  c1/c8/c16/c32 - the final profile validation row.
+
+## 2026-08-27 - 8x3090: campaign close-out - converged
+
+- Long-context first datapoint: 100,000-token prompt, 500 output, final
+  profile (TQ@262K): c1 aggregate 21.0 tok/s (wall includes the ~100K
+  prefill; no server errors; deep-context serving works). The c4 leg is
+  BLOCKED BY THE BENCH HARNESS, not serving: exact_prompts can construct
+  only one distinct 100K prompt from sonnet.txt (follow-up: offset-cycled
+  prompt construction for multi-request long-context benches).
+- Final validated state (slimserve-launched, registered profile):
+  c1 130.9 / c8 547.0 / c32 881.6; raw-command row c1 136.2 / c8 585.0 /
+  c16 838.2 / c32 879.6; accept 58-65%. 175 tests pass. Baseline table
+  updated in perf/baseline_status.md.
+- Campaign arc (c8/c32 standard bench unless noted):
+  | stage                          | c8    | c32   | context |
+  | bring-up (SHM, bf16)           | 409.7 | -     | 128K    |
+  | P2P driver + NCCL SYS          | 647.9 | 425.5 | 128K    |
+  | + capture ceiling covers c32   | 564.6 | 661.1 | 262K TQ |
+  | + quantized-KV tile fix        | 585.0 | 879.6 | 262K TQ |
+  Net: 2.15x on peak throughput with double (native) context.
+- Retained: P2P driver stack (32 GiB BAR1 + iommu=pt + NCCL_P2P_LEVEL=SYS),
+  TQ k8v4 main KV (tile-fixed; == bf16 at c8-c32, 2.64x smaller),
+  max_num_seqs 32 + capture 96, MTP k=2 + index share, triton GDN.
+- Rejected along the way: fused GDN decode (-4.5% c8), custom AR over PCIe
+  (latency), fp8-e4m3 main KV (superseded by TQ), scheduler dynamic-k
+  (cudagraph fall-off), tl.interleave nibble unpack (Triton 3.7.1
+  miscompile into tl.dot).
+- WATCH FLAG: intermittent CUDA illegal access/instruction under bench
+  churn (2-of-6 pre-tier-fix, 0-of-4 after). The suspect wide-tile
+  quantized kernel path no longer executes; reopen with compute-sanitizer
+  if it recurs.
+- Backlog, in expected-value order: dynamic-k via multi-length graph
+  capture (k=3 wins c1-c4 by 8-15%); k=3 re-verdict on the fixed kernel;
+  Marlin EP tiny-M tuning; PLE gather fp8->bf16 fusion; multi-request
+  long-context bench support; py-spy host profiling (needs
+  kernel.yama.ptrace_scope=0).
+- Convergence criteria met: final two rounds (Exp P validation, slimserve
+  validation) changed nothing beyond noise; no unexplained anomaly open
+  (valley root-caused and fixed; crash under watch flag with its suspect
+  path removed); profile serves the best-known config with recorded
+  validation.
+## 2026-08-25 - Tuned the Metal KV reserve: 4 GiB -> 7 GiB (measured, not guessed)
+
+- Baseline: the fit shipped with a 4 GiB reserve floor, and its notebook
+  entry suggested the reserve was conservative because the earlier
+  KV-pool bisect showed 8-9 GiB pools decoding at 26-27 tok/s. That
+  bisect used ONE sequence. It understated memory demand badly.
+- Method: new harness
+  `perf/results/2026-08-25/kv-reserve-tuning/measure_activation_peak.py`
+  boots a profile at its registered geometry, stresses it at its OWN
+  configured batch width (max_num_seqs concurrent requests whose prompts
+  each exceed max_num_batched_tokens, so chunked prefill runs full-width
+  while decode carries max sequences), and samples device residency at
+  20 Hz throughout. Peak is reported against residency right after KV
+  allocation, which is exactly what the reserve must cover.
+  Two traps found while building it: the engine runs in a separate
+  EngineCore process by default, so the parent measured 0.0 GiB
+  residency (fixed with VLLM_ENABLE_V1_MULTIPROCESSING=0 plus a hard
+  failure when the baseline is implausibly small); and activation peak
+  is set by per-step batch width, not total prompt tokens, so the first
+  oversized-prompt version just ran 11 minutes for the same answer.
+- Measurements (M5 Max, 107.52 GiB working set):
+  | profile | pool | transient peak | peak resident | spare | tok/s |
+  |---|---|---|---|---|---|
+  | qwen38-q2kxl-1 (16 seqs x 2048) | 12.00 | 0.085 | 41.23 | 66.29 | - |
+  | dsv4-xxs-1 (32 seqs x 2176) | 6.52 | 5.411 | 106.64 | 0.88 | 22.17 |
+  | dsv4-xxs-1 | 4.00 | 6.411 | 105.13 | 2.39 | 22.62 |
+  | dsv4-xxs-1 (tuned) | 3.82 | 6.411 | 104.94 | 2.58 | 22.68 |
+- Finding, which REVERSES the earlier suggestion: DSV4's transient peak
+  under its own registered batch width is 5.4-6.4 GiB -- larger than the
+  4 GiB reserve. The 6.52 GiB grant survived only because post-KV
+  residency lands ~2 GiB below the naive weights+pool prediction, and it
+  came within 0.88 GiB of the working set at peak. The reserve was too
+  small in the dangerous direction, not too large.
+  Qwen3.8's transient is 0.085 GiB by contrast: the gap is architectural
+  (43 layers, sparse-MLA indexer scratch, 32 seqs, drafter), not a
+  batch-width scaling law, which is why the reserve stays a flat floor
+  anchored on the heaviest profile instead of a fitted formula.
+- The KV pool is not the transient: 90,560 prompt tokens commit only
+  ~0.67 GiB at DSV4's 7,954 bytes/token, and the transient peak is the
+  same 6.411 GiB at a 4.00 GiB pool as at 3.82 GiB. Total peak residency
+  grows ~0.6 GiB per GiB of pool (measured slope over two points).
+- Change: _KV_RESERVE_MIN_BYTES 4 GiB -> 7 GiB, chosen so a stressed
+  engine keeps ~2.5 GiB of the working set spare.
+- Result on dsv4-xxs-1: grant 6.52 -> 3.82 GiB, KV capacity 880,117 ->
+  515,461 tokens (still 1.97x the profile's 262,144 max_model_len),
+  peak residency 106.64 -> 104.94 GiB, spare 0.88 -> 2.58 GiB. Stress
+  throughput 22.17 -> 22.68 tok/s and server-path single-request output
+  byte-identical: the safety costs no measurable throughput.
+- Correctness: server path through `slimserve dsv4-xxs-1 --serve` with
+  the registered DSpark drafter and seeded shipped defaults returns the
+  same coherent answer as before the tune. Suite 45 passed / 103
+  skipped; ruff clean.
+- Decision: RETAINED. Follow-up if DSV4 ever needs more KV: the reserve
+  is dominated by sparse-MLA indexer and prefill scratch, so lowering
+  max_num_batched_tokens or max_num_seqs would free reserve directly --
+  measure before trading it.
+- Raw: perf/results/2026-08-25/kv-reserve-tuning/ (harness, peak-*.json,
+  logs) and perf/results/2026-08-25/profile-validation/.
+
+## 2026-08-26 - RETAINED: D=256 decode via partition+reduce (+6% gsm8k, essay wash)
+
+- Baseline: qwen38-q2kxl-1 D=256 attention entirely on the SDPA gather
+  path after the 2026-08-25 plain-kernel rejection (~15% slower,
+  under-occupancy: one simdgroup per (head, batch) = ~96 simdgroups at
+  decode widths). The rejection entry named this exact follow-up.
+- Change:
+  - Threaded the explicit 64-bit kv_block_stride through
+    paged_attention_partition and paged_attention_verify
+    (paged_attn_v2.metal buffer 17, launchers, host ops), same contract
+    as the plain kernel: hybrid blocks-first strided views walk
+    stride(0), bit-identical addressing for contiguous callers (fp16
+    partition site only; the fp8 partition and cascade kernels keep
+    contiguous addressing -- their callers pass dense caches).
+  - New host op paged_attention_partitioned(q, k, v, bt, ctx, scale,
+    window, max_context_len): partition (512-token slices) + exact
+    online-softmax reduce in one encode. max_context_len comes from the
+    HOST-side seq_lens copy -- sizing from the device tensor would be a
+    per-layer pipeline drain, the class the campaign just removed.
+    paged_attention_verify grew the same defaulted arg (its internal
+    context_lens.max().item() sync now only fires for callers without a
+    host bound).
+  - metal_attn.py: _PARTITIONED_HEAD_SIZES = (256,). Decode and the
+    expanded verify path route 256 through the partitioned op; the mq
+    verify gate dropped its head_size != 256 exclusion (the kernel now
+    walks strided caches) and both gates now read seq_lens_cpu instead
+    of seq_lens_gpu.max().item() (removes a per-call device sync that
+    also fired on the 64/128 expansion path).
+  - New instantiation paged_attention_verify_bfloat16_256: qwen38's
+    full-attention layers are bf16 and the mq route engages past 1k
+    ctx; found live when the long-context smoke aborted with "kernel
+    not found in metallib". kt/vt tiles 16 KB, inside the 32 KB budget.
+- Correctness: synthetic parity vs SDPA ground truth (rel <= 3e-4)
+  across D=256 strided qwen38-shape (batch 4 + single), D=128/64
+  contiguous (also bit-vs-plain-kernel), and the m=4 verify per-row
+  causal boundaries at 1.5k ctx. Live: seeded bench seed-stable both
+  arms; 3.6k-ctx prompt engages mq on all 16 layers and summarizes
+  coherently. NOTE: outputs are numerically exact but NOT bit-identical
+  to SDPA (different reduction order); at temp 1.0 the essay trajectory
+  flips one word ("discover" -> "generate") at a sampling boundary.
+  gsm8k trajectory unchanged.
+- Measured (same-conditions A/B, box warm, 3 repeats each):
+  - partitioned: essay 26.5-28.2, gsm8k 44.95-45.00
+  - SDPA route:  essay 25.9-28.5, gsm8k 41.68-42.71
+  Essay is a wash (both runs decline across repeats -- thermal, not the
+  route); gsm8k +6.4%, from getting D=256 verify/decode off the SDPA
+  per-request gather loop. The plain-kernel failure mode does not
+  recur: short contexts are 1 partition (occupancy-neutral vs plain but
+  fused), long contexts split.
+- Decision: RETAINED. Follow-ups mapped: partitioned route for 64/128
+  at long context (currently plain-kernel); mq engage log prints once
+  per layer (16 lines) on first long request.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_part.log,
+  spec_sdpa_ab.log, longctx_mq_smoke2.log, paged_partitioned_parity.py.
+
+## 2026-08-27 - Metal re-validation after the Flash-Next 3090 merge (PR #15): all green
+
+- Trigger: main merged the Qwen3.8-Flash-Next-FP8 8x3090 port (101
+  files), which reworks shared machinery on the Metal path
+  (mamba_utils.py +907 lines, gpu_model_runner.py). csrc/quixicore is
+  untouched (the new fused GDN decode kernel is _C_stable_libtorch,
+  CUDA-only), so no Metal extension rebuild.
+- Offline gate: seeded consolidated bench, heads byte-identical to the
+  post-partitioned-route baseline. essay 26.4-28.3, gsm8k 44.5-45.8 --
+  the partitioned-256 gain holds.
+- Server-path validation (registered drafters, seeded shipped
+  defaults; perf/results/2026-08-27/profile-validation/):
+  - qwen38-q2kxl-1 PASS text+image; the image request now finishes
+    thinking and answers correctly (577 tokens, finish=stop).
+  - muse-kdyn-1 PASS text+image, image finish=stop.
+  - dsv4-xxs-1 PASS text, 23.9 tok/s; KV working-set clamp fired as
+    designed (16 -> 3.82 GiB, 7 GiB reserve).
+  - glm52-xxs-1 remains registry-blocked on this 128 GiB box (needs
+    256 GiB) -- unchanged.
+- Suites: 45 passed / 104 skipped.
+
+## 2026-08-27 - PR #12 x main: semantic merge of the two Metal campaigns
+
+- Scope: merged current main (Metal KV working-set fit + 7 GiB reserve,
+  partitioned-256 route, Flash-Next 3090 stack) into the NVFP4 campaign
+  branch. Five textual conflicts; the real work was the two branches'
+  convergent D=256 fixes and their different strided-cache mechanisms.
+- Resolutions of record:
+  - 256 routing: PR12's design survives in Python -- 256 rides
+    _PAGED_HEAD_SIZES under VLLM_QC_PA256 with the measured batch-1
+    ctx<2048 SDPA crossover, and the plain paged_attention op routes
+    split-K internally from the host-side max_context bound. main's
+    _PARTITIONED_HEAD_SIZES global and its Python routing are dropped;
+    main's paged_attention_partitioned op and proxy remain (harness
+    surface). The crossover constant is M1 Ultra-measured; re-verdict
+    on this box is queued for the post-baseline phase.
+  - Metadata: PR12's bound machinery survives (seq_lens_cpu_max /
+    seq_lens_cpu_bound / bound_exact / lazy exact lens). main's
+    grafts that read seq_lens_cpu.max() were re-pointed at
+    seq_lens_cpu_max -- under the lazy property they would have
+    reintroduced the per-layer D2H drain both campaigns removed.
+  - Strided caches: main's 64-bit kv_block_stride (partition + verify,
+    buffer 17) is the one mechanism in the v2 kernels; PR12's two new
+    partition call sites (split-K route, muse-q38 attn layer) now pass
+    the cache's stride(0). PR12's block_mult lives only in its NEW
+    kv_cache_scatter kernel (no collision; the page-local doubling
+    lives in the block table for attention kernels).
+  - GDN: main's CUDA fused-norm spec methods (3090 campaign) and
+    PR12's _forward_core_mps_native rename/dispatcher coexist as
+    siblings; the conflict was a same-anchor insert.
+  - mq verify at 256 (main) kept, now reading the sync-free bound;
+    main's partitioned-expansion special case deleted (redundant under
+    the op-internal routing, and it passed the raw strided views the
+    page-local layout forbids).
+- Validation on the merged build (M5 Max):
+  - Kernel parity ALL PASS (D=256 strided decode/single, D=128/64
+    contiguous vs plain kernel, m=4 verify boundaries); PR12's
+    op-internal split-K vs main's partitioned op agree to 1.2e-4.
+  - Q2K seeded bench: essay 29.3-31.1 / gsm8k 44.9-45.9, heads
+    byte-identical to the established post-partitioned trajectories --
+    best recorded on this box (PR12's scatter/fusion work now applies
+    to the Q2K path too).
+  - Suites: 109 passed / 105 skipped (includes PR12's registry tests).
+  - NOT yet validated here: the NVFP4 profiles themselves (artifacts
+    live on the M1 Ultra; this box's baseline run is the next step)
+    and the M1 Ultra pin chain, which needs a re-gate on that box.

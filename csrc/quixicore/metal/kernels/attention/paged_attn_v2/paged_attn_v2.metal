@@ -42,6 +42,7 @@ kernel void paged_attention_partition(
     constant int &partition_size [[buffer(14)]],
     constant int &window [[buffer(15)]],      // >0 = sliding window
     constant float &softcap [[buffer(16)]],   // >0 = Gemma-style logit soft-capping
+    constant ulong &kv_block_stride [[buffer(17)]],  // elements per cache block row
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -76,8 +77,8 @@ kernel void paged_attention_partition(
         if (block < 0) {
             continue;
         }
-        const long cache_base =
-            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+        const long cache_base = (long)block * (long)kv_block_stride +
+            ((long)slot * num_kv_heads + kv_head) * D;
         float partial = 0.0f;
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
@@ -136,6 +137,7 @@ kernel void paged_attention_verify(
     constant int &partition_size [[buffer(14)]],
     constant int &window [[buffer(15)]],
     constant int &m_rows [[buffer(16)]],
+    constant ulong &kv_block_stride [[buffer(17)]],  // elements per cache block row
     uint3 tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint warp [[simdgroup_index_in_threadgroup]],
@@ -182,8 +184,8 @@ kernel void paged_attention_verify(
             const int slot = tok - block_col * block_size;
             const int block = block_table[block_col];
             if (block >= 0) {
-                const long cb =
-                    (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+                const long cb = (long)block * (long)kv_block_stride +
+                    ((long)slot * num_kv_heads + kv_head) * D;
                 kt[tt][d] = key_cache[cb + d];
                 vt[tt][d] = value_cache[cb + d];
             } else {
@@ -240,6 +242,7 @@ kernel void paged_attention_verify(
      constant int &num_partitions [[buffer(13)]],                             \
      constant int &partition_size [[buffer(14)]],                             \
      constant int &window [[buffer(15)]], constant int &m_rows [[buffer(16)]], \
+     constant ulong &kv_block_stride [[buffer(17)]],                          \
      uint3 tgid [[threadgroup_position_in_grid]],                             \
      uint tid [[thread_index_in_threadgroup]],                                \
      uint warp [[simdgroup_index_in_threadgroup]],                            \
@@ -247,6 +250,10 @@ kernel void paged_attention_verify(
 
 instantiate_paged_attention_verify("paged_attention_verify_bfloat16_128", bf16, 128);
 instantiate_paged_attention_verify("paged_attention_verify_float16_256", half, 256);
+// bf16 at 256: Qwen3.8 serves its 16 full-attention layers in bf16, and the
+// mq verify route engages there past 1k context. kt/vt threadgroup tiles are
+// 2*16*256*2B = 16 KB -- inside the 32 KB budget.
+instantiate_paged_attention_verify("paged_attention_verify_bfloat16_256", bf16, 256);
 
 // fp8 partition: identical online-softmax, but the caches hold uint8 (e4m3/e5m2) codes
 // dequantized on read with per-head k_scale/v_scale. tmp_out/max_logits/exp_sums stay fp32
@@ -572,6 +579,7 @@ kernel void cascade_prefix_partition_fp8(
       constant int &partition_size [[buffer(14)]],                            \
       constant int &window [[buffer(15)]],                                    \
       constant float &softcap [[buffer(16)]],                                 \
+      constant ulong &kv_block_stride [[buffer(17)]],                         \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
   template [[host_name("paged_attention_reduce_" #type_name "_" #DVAL)]]      \

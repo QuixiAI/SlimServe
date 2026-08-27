@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
+import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -854,16 +855,57 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
 
+        # Qwen4Exp can store its main QSA KV in FP8 or TurboQuant k8v4
+        # through layer-scoped overrides (VLLM_QWEN4_EXP_FP8_MAIN_KV /
+        # VLLM_QWEN4_EXP_TQ_MAIN_KV) that never touch
+        # cache_config.cache_dtype, so the computation above sized the page
+        # for the model dtype. Recompute with the override's layout: the
+        # aligner then scales block_size up, keeping the page's byte size
+        # (the slot every packed GDN state page must fit inside) roughly
+        # unchanged while multiplying its token capacity.
+        if model_config.architecture.startswith("Qwen4Exp"):
+            if envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
+                from vllm.model_executor.layers.quantization.turboquant.config import (
+                    TurboQuantConfig,
+                )
+                from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+                tq_cfg = TurboQuantConfig.from_cache_dtype(
+                    "turboquant_k8v4", model_config.get_head_size()
+                )
+                attn_page_size_1_token = TQFullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=torch.uint8,
+                    tq_slot_size=tq_cfg.slot_size_aligned,
+                    tq_cache_dtype="turboquant_k8v4",
+                ).page_size_bytes
+            elif envs.VLLM_QWEN4_EXP_FP8_MAIN_KV:
+                attn_page_size_1_token = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=torch.float8_e4m3fn,
+                    kv_quant_mode=get_kv_quant_mode("fp8"),
+                ).page_size_bytes
+
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
             model_config.architecture,
             model_config=model_config,
         )
-        mamba_page_size = MambaSpec(
-            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
-            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
-            block_size=-1,
-        ).page_size_bytes
+        if hasattr(model_cls, "get_mamba_specs_from_config"):
+            mamba_page_size = max(
+                spec.page_size_bytes
+                for spec in model_cls.get_mamba_specs_from_config(vllm_config)
+            )
+        else:
+            mamba_page_size = MambaSpec(
+                shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+                dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+                block_size=-1,
+            ).page_size_bytes
 
         if mamba_page_size == 0:
             return

@@ -312,6 +312,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "muse-glimmer",
         "qwen38-27b",
         "qwen38-27b-nvfp4",
+        "qwen38-flash-next-fp8",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]

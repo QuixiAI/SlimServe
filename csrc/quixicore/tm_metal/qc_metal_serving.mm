@@ -324,8 +324,7 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
     int num_partitions =
         std::max(1, std::min((kSplitKTarget + units - 1) / units, 64));
     num_partitions = std::min(num_partitions, width);
-    const int partition_size =
-        (width + num_partitions - 1) / num_partitions;
+    const int partition_size = (width + num_partitions - 1) / num_partitions;
     num_partitions = (width + partition_size - 1) / partition_size;
     auto fopts = q.options().dtype(at::kFloat);
     auto tmp = ring_out("pa256_tmp",
@@ -337,15 +336,14 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
     // transition per layer is measurably cheaper than two on the c1 step.
     encode("qc_paged_attention_splitk", [&](TorchEncoder& e) {
       tk::launch_paged_attention_partition(
-          e, q, key_cache, value_cache, block_table, context_lens, tmp, ml,
-          es, batch, num_heads, num_kv_heads, head_size, block_size,
+          e, q, key_cache, value_cache, block_table, context_lens, tmp, ml, es,
+          batch, num_heads, num_kv_heads, head_size, block_size,
           block_table_stride, static_cast<float>(scale), num_partitions,
           partition_size, static_cast<int>(window), /*softcap=*/0.0f,
-          activation_type_name(q));
-      tk::launch_paged_attention_reduce(e, tmp, ml, es, out, batch, num_heads,
-                                        head_size, num_partitions,
-                                        /*sinks=*/q, /*has_sink=*/0,
-                                        activation_type_name(q));
+          static_cast<uint64_t>(key_cache.stride(0)), activation_type_name(q));
+      tk::launch_paged_attention_reduce(
+          e, tmp, ml, es, out, batch, num_heads, head_size, num_partitions,
+          /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
     });
     return out;
   }
@@ -362,6 +360,68 @@ at::Tensor paged_attention(const at::Tensor& q, const at::Tensor& key_cache,
         /*window=*/static_cast<int>(window),
         /*mask_heads=*/0, static_cast<uint64_t>(key_cache.stride(0)),
         activation_type_name(q));
+  });
+  return out;
+}
+
+// Partitioned decode attention (vLLM v2 shape): each (head, batch) query is
+// split across ceil(max_context_len / 512) KV slices, so long contexts get
+// chunk-parallel threadgroups instead of one simdgroup's serial walk. This is
+// the occupancy fix for wide heads at decode widths: at D=256 (Qwen3.8, GQA
+// 24 heads, batch <= 4) the plain kernel's ~96 simdgroups under-occupy the
+// GPU, which is why it measured ~15% behind SDPA on 2026-08-25.
+// max_context_len comes from the host-side seq_lens copy: computing it from
+// the device tensor here would be a per-layer pipeline sync.
+at::Tensor paged_attention_partitioned(const at::Tensor& q,
+                                       const at::Tensor& key_cache,
+                                       const at::Tensor& value_cache,
+                                       const at::Tensor& block_table,
+                                       const at::Tensor& context_lens,
+                                       double scale, int64_t window,
+                                       int64_t max_context_len) {
+  check_mps(q, "q");
+  // Strided K/V accepted: the hybrid pool serves blocks-first views
+  // (stride(0) = 2x page); the kernels walk stride(0) explicitly.
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  check_mps(block_table, "block_table");
+  check_mps(context_lens, "context_lens");
+  TORCH_CHECK(q.dim() == 3, "q must be [batch, heads, head_size], got ",
+              q.sizes());
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
+  TORCH_CHECK(max_context_len >= 1, "max_context_len must be positive");
+
+  const int batch = static_cast<int>(q.size(0));
+  const int num_heads = static_cast<int>(q.size(1));
+  const int head_size = static_cast<int>(q.size(2));
+  const int block_size = static_cast<int>(key_cache.size(1));
+  const int num_kv_heads = static_cast<int>(key_cache.size(2));
+  const int block_table_stride = static_cast<int>(block_table.stride(0));
+  constexpr int kPartitionSize = 512;
+  const int num_partitions =
+      static_cast<int>((max_context_len + kPartitionSize - 1) / kPartitionSize);
+
+  auto opt = q.options().dtype(at::kFloat);
+  auto tmp = at::empty({batch, num_heads, num_partitions, head_size}, opt);
+  auto mlog = at::empty({batch, num_heads, num_partitions}, opt);
+  auto esum = at::empty({batch, num_heads, num_partitions}, opt);
+  at::Tensor out = at::empty_like(q);
+
+  encode("qc_paged_attention_partitioned", [&](TorchEncoder& e) {
+    tk::launch_paged_attention_partition(
+        e, q, key_cache, value_cache, block_table, context_lens, tmp, mlog,
+        esum, batch, num_heads, num_kv_heads, head_size, block_size,
+        block_table_stride, static_cast<float>(scale), num_partitions,
+        kPartitionSize, static_cast<int>(window), /*softcap=*/0.0f,
+        static_cast<uint64_t>(key_cache.stride(0)), activation_type_name(q));
+    tk::launch_paged_attention_reduce(
+        e, tmp, mlog, esum, out, batch, num_heads, head_size, num_partitions,
+        /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
   });
   return out;
 }
@@ -419,9 +479,18 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
                                   const at::Tensor& value_cache,
                                   const at::Tensor& block_table,
                                   const at::Tensor& context_lens, double scale,
-                                  int64_t window) {
+                                  int64_t window, int64_t max_context_len) {
   check_mps(q, "q");
-  check_mps(key_cache, "key_cache");
+  // Strided K/V accepted: the hybrid pool serves blocks-first views
+  // (stride(0) = 2x page); the kernel walks stride(0) explicitly.
+  check_mps_strided(key_cache, "key_cache");
+  check_mps_strided(value_cache, "value_cache");
+  TORCH_CHECK(
+      key_cache.stride(1) == key_cache.size(2) * key_cache.size(3) &&
+          value_cache.stride(1) == value_cache.size(2) * value_cache.size(3),
+      "KV cache token rows must be contiguous");
+  TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0),
+              "key/value cache block strides must match");
   const int m = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
   const int head_size = static_cast<int>(q.size(2));
@@ -432,7 +501,13 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
       (head_size == 128 || head_size == 256) && m >= 1 && m <= 32,
       "quixicore(metal): paged_attention_verify wants D=128/256, m<=32");
   constexpr int kPartitionSize = 512;
-  const int ctx_hint = static_cast<int>(context_lens.max().item<int64_t>());
+  // Host-known context bound when the caller has one: the device-side max
+  // is a pipeline sync per call, which at one verify per attention layer
+  // is exactly the drain class the decode path just shed.
+  const int ctx_hint =
+      max_context_len >= 1
+          ? static_cast<int>(max_context_len)
+          : static_cast<int>(context_lens.max().item<int64_t>());
   const int num_partitions =
       std::max(1, (ctx_hint + kPartitionSize - 1) / kPartitionSize);
   auto opt = q.options().dtype(at::kFloat);
@@ -445,7 +520,8 @@ at::Tensor paged_attention_verify(const at::Tensor& q,
         e, q, key_cache, value_cache, block_table, context_lens, tmp, mlog,
         esum, m, num_heads, num_kv_heads, head_size, block_size, bt_stride,
         static_cast<float>(scale), num_partitions, kPartitionSize,
-        static_cast<int>(window), activation_type_name(q));
+        static_cast<int>(window), static_cast<uint64_t>(key_cache.stride(0)),
+        activation_type_name(q));
     tk::launch_paged_attention_reduce(
         e, tmp, mlog, esum, out, m, num_heads, head_size, num_partitions,
         /*sinks=*/q, /*has_sink=*/0, activation_type_name(q));
@@ -737,7 +813,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
             g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads, g.kv_heads, hd,
             static_cast<int>(L.kv_cache.size(2)),
             static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
-            /*window=*/0, /*softcap=*/0.0f, "bfloat16");
+            /*window=*/0, /*softcap=*/0.0f,
+            static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)),
+            "bfloat16");
         tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
                                           g.attn_out, m, g.heads, hd, mq_parts,
                                           /*sinks=*/g.q,
@@ -748,7 +826,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
             sl.narrow(0, m - 1, 1), g.mq_tmp, g.mq_mlog, g.mq_esum, m, g.heads,
             g.kv_heads, hd, static_cast<int>(L.kv_cache.size(2)),
             static_cast<int>(bt.stride(0)), g.scale, mq_parts, kMqPartition,
-            /*window=*/0, "bfloat16");
+            /*window=*/0,
+            static_cast<uint64_t>(L.kv_cache.select(0, 0).stride(0)),
+            "bfloat16");
         tk::launch_paged_attention_reduce(e, g.mq_tmp, g.mq_mlog, g.mq_esum,
                                           g.attn_out, m, g.heads, hd, mq_parts,
                                           /*sinks=*/g.q,
@@ -862,10 +942,10 @@ struct State {
   // (an in-place update corrupts the normed output while leaving res_out
   // correct — found the hard way in P2 shadow round 4).
   at::Tensor h, res, res2, t_hidden;
-  at::Tensor qkvz, ba_s, gnormed;      // gdn projections
+  at::Tensor qkvz, ba_s, gnormed;  // gdn projections
   at::Tensor attn_qkv, q, k, v, gate, attn_out;
   at::Tensor gu, mid;
-  at::Tensor z_view;                   // [max_rows, gHv, gDv] view into qkvz
+  at::Tensor z_view;  // [max_rows, gHv, gDv] view into qkvz
   // fp32 gdn scratch
   at::Tensor gq, gk, gv, gdecay, gbeta, gy;
   // fp32 split-K attention scratch (>= max_rows*heads*64 partitions)
@@ -935,14 +1015,14 @@ void emit_qproj(TorchEncoder& e, const QProj& p, const at::Tensor& x,
     }
   } else {
     if (m == 1) {
-      tk::launch_qgemv_nvfp4_planar(e, out, p.w, x, p.scale, p.gscale, p.N,
-                                    p.K, "bfloat16");
+      tk::launch_qgemv_nvfp4_planar(e, out, p.w, x, p.scale, p.gscale, p.N, p.K,
+                                    "bfloat16");
     } else if (m >= 3 && m <= 8) {
-      tk::launch_qgemv_nvfp4_mv4r(e, out, p.w, x, p.scale, p.gscale, p.N,
-                                  p.K, m, "bfloat16");
+      tk::launch_qgemv_nvfp4_mv4r(e, out, p.w, x, p.scale, p.gscale, p.N, p.K,
+                                  m, "bfloat16");
     } else {
-      tk::launch_qgemv_nvfp4_planar_mb(e, out, p.w, x, p.scale, p.gscale,
-                                       p.N, p.K, m, "bfloat16");
+      tk::launch_qgemv_nvfp4_planar_mb(e, out, p.w, x, p.scale, p.gscale, p.N,
+                                       p.K, m, "bfloat16");
     }
   }
 }
@@ -989,8 +1069,7 @@ void muse_q38_init(int64_t num_layers, int64_t hidden, int64_t heads,
   g.final_norm_w = final_norm_w;
   g.aux_layers.clear();
   for (int64_t a : aux_layers) {
-    TORCH_CHECK(a >= 1 && a <= num_layers, "aux layer index out of range: ",
-                a);
+    TORCH_CHECK(a >= 1 && a <= num_layers, "aux layer index out of range: ", a);
     g.aux_layers.push_back(static_cast<int>(a));
   }
   g.layers.resize(static_cast<size_t>(num_layers));
@@ -1040,8 +1119,8 @@ void muse_q38_layer_gdn(
     const at::Tensor& conv_w, const at::Tensor& A_log,
     const at::Tensor& dt_bias, const at::Tensor& gated_norm_w,
     const std::vector<at::Tensor>& out_t, int64_t out_fmt,
-    const at::Tensor& conv_state, const at::Tensor& ssm_state,
-    double prep_eps, double q_scale, double k_scale, double norm_eps,
+    const at::Tensor& conv_state, const at::Tensor& ssm_state, double prep_eps,
+    double q_scale, double k_scale, double norm_eps,
     const std::vector<at::Tensor>& gu_t, int64_t gu_fmt,
     const std::vector<at::Tensor>& down_t, int64_t down_fmt) {
   using namespace muse_q38;
@@ -1073,8 +1152,7 @@ void muse_q38_layer_gdn(
   L.gq_scale = static_cast<float>(q_scale);
   L.gk_scale = static_cast<float>(k_scale);
   L.norm_eps = static_cast<float>(norm_eps);
-  set_qproj(L.gate_up, gu_t, gu_fmt, 2 * (int64_t)g.inter, g.hidden,
-            "gate_up");
+  set_qproj(L.gate_up, gu_t, gu_fmt, 2 * (int64_t)g.inter, g.hidden, "gate_up");
   set_qproj(L.down, down_t, down_fmt, g.hidden, g.inter, "down");
 }
 
@@ -1101,8 +1179,7 @@ void muse_q38_layer_attn(
   L.vc = value_cache;
   TORCH_CHECK(block_mult == 1 || block_mult == 2, "block_mult must be 1|2");
   L.block_mult = static_cast<int>(block_mult);
-  set_qproj(L.gate_up, gu_t, gu_fmt, 2 * (int64_t)g.inter, g.hidden,
-            "gate_up");
+  set_qproj(L.gate_up, gu_t, gu_fmt, 2 * (int64_t)g.inter, g.hidden, "gate_up");
   set_qproj(L.down, down_t, down_fmt, g.hidden, g.inter, "down");
 }
 
@@ -1127,9 +1204,8 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
                   const std::vector<at::Tensor>& spec_cu,
                   const std::vector<at::Tensor>& conv_slots,
                   const std::vector<at::Tensor>& slot_table,
-                  const std::vector<at::Tensor>& num_accepted,
-                  int64_t q_len, int64_t layers_cap,
-                  const c10::optional<at::Tensor>& aux_out,
+                  const std::vector<at::Tensor>& num_accepted, int64_t q_len,
+                  int64_t layers_cap, const c10::optional<at::Tensor>& aux_out,
                   const c10::optional<at::Tensor>& debug_out,
                   int64_t debug_layer) {
   using namespace muse_q38;
@@ -1145,10 +1221,9 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
               "residual_out must match x");
   TORCH_CHECK(q_len >= 1 && m % q_len == 0, "m must be reqs*q_len");
   const int reqs = m / static_cast<int>(q_len);
-  const int cap = layers_cap <= 0
-                      ? g.num_layers
-                      : std::min<int>(static_cast<int>(layers_cap),
-                                      g.num_layers);
+  const int cap = layers_cap <= 0 ? g.num_layers
+                                  : std::min<int>(static_cast<int>(layers_cap),
+                                                  g.num_layers);
   const bool full = cap == g.num_layers;
   size_t num_gdn = 0;
   for (const Layer& L : g.layers) num_gdn += L.is_gdn ? 1 : 0;
@@ -1156,7 +1231,8 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
                   slot_table.size() == num_gdn &&
                   num_accepted.size() == num_gdn,
               "per-layer gdn metadata vectors must have one entry per GDN "
-              "layer (", num_gdn, ")");
+              "layer (",
+              num_gdn, ")");
   for (size_t i = 0; i < num_gdn; ++i) {
     TORCH_CHECK(spec_cu[i].scalar_type() == at::kInt &&
                     conv_slots[i].scalar_type() == at::kInt &&
@@ -1165,8 +1241,7 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
                 "gdn metadata must be i32");
   }
   const int num_groups = static_cast<int>(block_table.size());
-  TORCH_CHECK(num_groups >= 1 &&
-                  num_groups <= muse_q38::State::kMaxAttnGroups,
+  TORCH_CHECK(num_groups >= 1 && num_groups <= muse_q38::State::kMaxAttnGroups,
               "attention group count out of range: ", num_groups);
   TORCH_CHECK(seq_lens.size() == (size_t)num_groups &&
                   attn_slots.size() == (size_t)num_groups &&
@@ -1205,8 +1280,7 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
     width = std::max(width, 1);
     int bw = (width + g.block_size - 1) / g.block_size;
     bt_widths[gi] = std::min(
-        bw, std::min(static_cast<int>(block_table[gi].size(1)),
-                     g.max_blocks));
+        bw, std::min(static_cast<int>(block_table[gi].size(1)), g.max_blocks));
     int np = std::max(1, std::min((kSplitKTarget + units - 1) / units, 64));
     np = std::min(np, width);
     part_sizes[gi] = (width + np - 1) / np;
@@ -1317,9 +1391,8 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
         // Layer 0: the eager path calls the 1-arg gemma norm (no fused
         // add) — emit the SAME kernel for bit-identity, and initialize
         // the residual with a plain copy of x.
-        tk::launch_gemma_rms_norm_dyn(e, x, L.in_norm_w, g.h,
-                                      static_cast<uint32_t>(m), g.hidden,
-                                      g.eps);
+        tk::launch_gemma_rms_norm_dyn(
+            e, x, L.in_norm_w, g.h, static_cast<uint32_t>(m), g.hidden, g.eps);
         e.pipeline("mittens::muse_copy_rows");
         e.out(g.res, 0);
         e.in(x, 1);
@@ -1355,16 +1428,13 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
             /*ba_stride=*/static_cast<int>(g.ba_s.stride(0)),
             L.conv_state_stride, L.prep_eps, L.gq_scale, L.gk_scale,
             L.conv_state_cols, l_accepted, /*spec_mode=*/1, "bfloat16");
-        tk::launch_gdn_recur_spec(e, g.gq, g.gk, g.gv, g.gdecay, g.gbeta,
-                                  L.ssm_state, l_cu, l_table,
-                                  l_accepted, g.gy, reqs, g.gHk, g.gHv,
-                                  g.gDv, g.gDk, L.ssm_stride,
-                                  static_cast<int>(l_table.stride(0)),
-                                  "float32");
+        tk::launch_gdn_recur_spec(
+            e, g.gq, g.gk, g.gv, g.gdecay, g.gbeta, L.ssm_state, l_cu, l_table,
+            l_accepted, g.gy, reqs, g.gHk, g.gHv, g.gDv, g.gDk, L.ssm_stride,
+            static_cast<int>(l_table.stride(0)), "float32");
         tk::launch_gdn_gated_rmsnorm_f32(
             e, g.gy, g.z_view, L.gated_norm_w, g.gnormed, m * g.gHv, g.gHv,
-            g.gDv, static_cast<int>(g.qkvz.stride(0)), L.norm_eps,
-            "bfloat16");
+            g.gDv, static_cast<int>(g.qkvz.stride(0)), L.norm_eps, "bfloat16");
         if (dl) dump(3, g.gnormed, g.gHv * g.gDv);
         emit_qproj(e, L.gdn_out, g.gnormed, g.t_hidden, m);
       } else {
@@ -1372,10 +1442,10 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
         TORCH_CHECK(gi >= 0 && gi < num_groups, "bad attn group idx");
         ++attn_idx;
         emit_qproj(e, L.qkv, g.h, g.attn_qkv, m);
-        tk::launch_qk_norm_rope_gate(
-            e, g.attn_qkv, L.q_norm_w, L.k_norm_w, L.cos_sin, positions, g.q,
-            g.gate, g.k, g.heads, g.kv_heads, g.head_dim, g.rot_dim, g.eps,
-            g.qkv_n, m, "bfloat16", idx_name);
+        tk::launch_qk_norm_rope_gate(e, g.attn_qkv, L.q_norm_w, L.k_norm_w,
+                                     L.cos_sin, positions, g.q, g.gate, g.k,
+                                     g.heads, g.kv_heads, g.head_dim, g.rot_dim,
+                                     g.eps, g.qkv_n, m, "bfloat16", idx_name);
         {
           // V lanes: strided slice of the fused projection -> contiguous.
           const int width4 = g.kv_sz / 4;
@@ -1387,25 +1457,25 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
           e.bytes(m * width4, 4);
           emit_elem(e, m * width4);  // v_copy
         }
-        tk::launch_kv_cache_scatter(e, g.k, g.v, attn_slots[gi], L.kc,
-                                    L.vc, m, g.kv_heads, g.head_dim,
-                                    g.block_size, L.block_mult, "bfloat16");
+        tk::launch_kv_cache_scatter(e, g.k, g.v, attn_slots[gi], L.kc, L.vc, m,
+                                    g.kv_heads, g.head_dim, g.block_size,
+                                    L.block_mult, "bfloat16");
         if (g.head_dim == 256) {
           tk::launch_paged_attention_partition(
               e, g.q, L.kc, L.vc, exp_bt_g[gi], exp_seq_g[gi], g.pa_tmp,
               g.pa_ml, g.pa_es, m, g.heads, g.kv_heads, g.head_dim,
               g.block_size, exp_bt_stride, g.attn_scale, n_parts[gi],
-              part_sizes[gi], /*window=*/0, /*softcap=*/0.0f, "bfloat16");
-          tk::launch_paged_attention_reduce(e, g.pa_tmp, g.pa_ml, g.pa_es,
-                                            g.attn_out, m, g.heads,
-                                            g.head_dim, n_parts[gi],
-                                            /*sinks=*/g.q, /*has_sink=*/0,
-                                            "bfloat16");
+              part_sizes[gi], /*window=*/0, /*softcap=*/0.0f,
+              static_cast<uint64_t>(L.kc.stride(0)), "bfloat16");
+          tk::launch_paged_attention_reduce(
+              e, g.pa_tmp, g.pa_ml, g.pa_es, g.attn_out, m, g.heads, g.head_dim,
+              n_parts[gi],
+              /*sinks=*/g.q, /*has_sink=*/0, "bfloat16");
         } else {
           tk::launch_paged_attention(
-              e, g.q, L.kc, L.vc, exp_bt_g[gi], exp_seq_g[gi], g.attn_out,
-              m, g.heads, g.kv_heads, g.head_dim, g.block_size,
-              exp_bt_stride, g.attn_scale, /*alibi=*/g.q, /*use_alibi=*/0,
+              e, g.q, L.kc, L.vc, exp_bt_g[gi], exp_seq_g[gi], g.attn_out, m,
+              g.heads, g.kv_heads, g.head_dim, g.block_size, exp_bt_stride,
+              g.attn_scale, /*alibi=*/g.q, /*use_alibi=*/0,
               /*mask=*/g.q, /*use_mask=*/0, /*window=*/0, /*mask_heads=*/0,
               static_cast<uint64_t>(L.kc.stride(0)), "bfloat16");
         }
@@ -1446,10 +1516,9 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
 
     if (full) {
       // Final seam: fused add + final gemma norm, written straight into x.
-      tk::launch_gemma_rms_norm_add_dyn(e, g.t_hidden, *rcur,
-                                        g.final_norm_w, x, residual_out,
-                                        static_cast<uint32_t>(m), g.hidden,
-                                        g.eps);
+      tk::launch_gemma_rms_norm_add_dyn(e, g.t_hidden, *rcur, g.final_norm_w, x,
+                                        residual_out, static_cast<uint32_t>(m),
+                                        g.hidden, g.eps);
     } else {
       // Prefix-capture boundary: hand (raw layer output, residual) back so
       // the eager layers continue exactly where muse stopped.
@@ -1834,9 +1903,9 @@ at::Tensor gemma_rms_norm(const at::Tensor& x, const at::Tensor& weight,
                           double eps) {
   check_mps(x, "x");
   check_mps(weight, "weight");
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 &&
-                  weight.scalar_type() == at::kBFloat16,
-              "gemma_rms_norm(metal) is bf16-only");
+  TORCH_CHECK(
+      x.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
+      "gemma_rms_norm(metal) is bf16-only");
   TORCH_CHECK(x.dim() == 2 && x.is_contiguous(),
               "gemma_rms_norm(metal) wants contiguous [rows, D]");
   const int D = static_cast<int>(x.size(1));
@@ -2140,9 +2209,8 @@ void qc_kv_cache_scatter(const at::Tensor& key, const at::Tensor& value,
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> qc_qk_norm_rope_gate(
     const at::Tensor& qkv, const at::Tensor& q_w, const at::Tensor& k_w,
-    const at::Tensor& cos_sin, const at::Tensor& positions,
-    int64_t num_q_heads, int64_t num_k_heads, int64_t head_dim,
-    int64_t rot_dim, double eps) {
+    const at::Tensor& cos_sin, const at::Tensor& positions, int64_t num_q_heads,
+    int64_t num_k_heads, int64_t head_dim, int64_t rot_dim, double eps) {
   check_mps(qkv, "qkv");
   check_mps(q_w, "q_w");
   check_mps(k_w, "k_w");
@@ -2189,9 +2257,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qc_qk_norm_rope_gate(
     tk::launch_qk_norm_rope_gate(
         e, qkv, q_w, k_w, cos_sin, positions, q_out, gate_out, k_out,
         static_cast<int>(num_q_heads), static_cast<int>(num_k_heads),
-        static_cast<int>(D), static_cast<int>(rot_dim),
-        static_cast<float>(eps), static_cast<int>(qkv.size(1)),
-        static_cast<int>(T), activation_type_name(qkv), idx_name);
+        static_cast<int>(D), static_cast<int>(rot_dim), static_cast<float>(eps),
+        static_cast<int>(qkv.size(1)), static_cast<int>(T),
+        activation_type_name(qkv), idx_name);
   });
   return {q_out, gate_out, k_out};
 }
@@ -2234,16 +2302,14 @@ at::Tensor qc_dflash_conv(const at::Tensor& x, const at::Tensor& delta,
   }
   const int delta_row_stride = static_cast<int>(delta.stride(0));
   encode("qc_dflash_conv", [&](TorchEncoder& e) {
-    tk::launch_qc_dflash_conv(e, x, delta, base, out, H, num_groups,
-                              group_size, taps, static_cast<int>(block_size),
-                              delta_row_stride, total,
-                              activation_type_name(x));
+    tk::launch_qc_dflash_conv(e, x, delta, base, out, H, num_groups, group_size,
+                              taps, static_cast<int>(block_size),
+                              delta_row_stride, total, activation_type_name(x));
   });
   return out;
 }
 
-void moe_weighted_sum(const at::Tensor& x, const at::Tensor& w,
-                      at::Tensor& y) {
+void moe_weighted_sum(const at::Tensor& x, const at::Tensor& w, at::Tensor& y) {
   check_mps(x, "x");
   check_mps(w, "w");
   check_mps(y, "y");
@@ -2765,8 +2831,8 @@ at::Tensor turboquant_attention_splitk_metal(
   const int partition_size = (width + num_partitions - 1) / num_partitions;
   num_partitions = (width + partition_size - 1) / partition_size;
   auto fopts = q.options().dtype(at::kFloat);
-  auto tmp = ring_out("tq_sk_tmp", {batch, heads, num_partitions, head_size},
-                      fopts);
+  auto tmp =
+      ring_out("tq_sk_tmp", {batch, heads, num_partitions, head_size}, fopts);
   auto ml = ring_out("tq_sk_ml", {batch, heads, num_partitions}, fopts);
   auto es = ring_out("tq_sk_es", {batch, heads, num_partitions}, fopts);
   auto out = at::empty_like(q);
@@ -2775,8 +2841,8 @@ at::Tensor turboquant_attention_splitk_metal(
   encode("qc_turboquant_attention_splitk", [&](TorchEncoder& e) {
     tk::launch_tq_attention_splitk(
         e, q, kv_cache, block_table, lengths, centroids, tmp, ml, es, batch,
-        heads, static_cast<int>(num_kv_heads), head_size, bt_stride,
-        block_size, static_cast<int>(kv_cache.stride(0)),
+        heads, static_cast<int>(num_kv_heads), head_size, bt_stride, block_size,
+        static_cast<int>(kv_cache.stride(0)),
         static_cast<int>(kv_cache.stride(1)),
         static_cast<int>(kv_cache.stride(2)), num_partitions, partition_size,
         static_cast<int>(k_bits), k_signed ? 1 : 0, static_cast<int>(v_bits),
@@ -3005,15 +3071,14 @@ at::Tensor fp8ch_mul_mat_vec(const at::Tensor& w, const at::Tensor& x,
     return !(e && e[0] == '0');
   }();
   encode("qc_fp8ch_mmvq", [&](TorchEncoder& e) {
-    if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 &&
-        x.dim() == 2 && x.is_contiguous()) {
+    if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 && x.dim() == 2 &&
+        x.is_contiguous()) {
       tk::launch_qgemv_fp8ch_mv4r(e, out, w, x, w_scale, N, K, batch,
                                   type_name);
       return;
     }
     if (batch > 1 && batch % 2 == 0 && x.dim() == 2 && x.is_contiguous()) {
-      tk::launch_qgemv_fp8ch_mb(e, out, w, x, w_scale, N, K, batch,
-                                type_name);
+      tk::launch_qgemv_fp8ch_mb(e, out, w, x, w_scale, N, K, batch, type_name);
       return;
     }
     for (int b = 0; b < batch; ++b) {
@@ -3040,8 +3105,9 @@ at::Tensor nvfp4_mul_mat_vec(const at::Tensor& w, const at::Tensor& x,
   check_mps(x, "x");
   check_mps(w_scale, "w_scale");
   check_mps(global_scale, "global_scale");
-  TORCH_CHECK(w.scalar_type() == at::kByte && w_scale.scalar_type() == at::kByte,
-              "quixicore(metal): nvfp4 weight and scale must be uint8 bytes");
+  TORCH_CHECK(
+      w.scalar_type() == at::kByte && w_scale.scalar_type() == at::kByte,
+      "quixicore(metal): nvfp4 weight and scale must be uint8 bytes");
   TORCH_CHECK(w.dim() == 2 && w.is_contiguous() && w_scale.is_contiguous(),
               "quixicore(metal): nvfp4 weight/scale must be contiguous");
   TORCH_CHECK(global_scale.scalar_type() == at::kFloat,
@@ -3065,22 +3131,22 @@ at::Tensor nvfp4_mul_mat_vec(const at::Tensor& w, const at::Tensor& x,
     return !(e && e[0] == '0');
   }();
   encode("qc_nvfp4_mmvq", [&](TorchEncoder& e) {
-    if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 &&
-        x.dim() == 2 && x.is_contiguous()) {
+    if (use_mv4r && batch >= 3 && batch <= 8 && N % 8 == 0 && x.dim() == 2 &&
+        x.is_contiguous()) {
       tk::launch_qgemv_nvfp4_mv4r(e, out, w, x, w_scale, global_scale, N, K,
                                   batch, type_name);
       return;
     }
     if (batch > 1 && batch % 2 == 0 && x.dim() == 2 && x.is_contiguous()) {
-      tk::launch_qgemv_nvfp4_planar_mb(e, out, w, x, w_scale, global_scale,
-                                       N, K, batch, type_name);
+      tk::launch_qgemv_nvfp4_planar_mb(e, out, w, x, w_scale, global_scale, N,
+                                       K, batch, type_name);
       return;
     }
     for (int b = 0; b < batch; ++b) {
       const at::Tensor x_row = x.select(0, b);
       const at::Tensor out_row = out.select(0, b);
-      tk::launch_qgemv_nvfp4_planar(e, out_row, w, x_row, w_scale,
-                                    global_scale, N, K, type_name);
+      tk::launch_qgemv_nvfp4_planar(e, out_row, w, x_row, w_scale, global_scale,
+                                    N, K, type_name);
     }
   });
   return out;
@@ -4458,8 +4524,7 @@ at::Tensor gdn_short_conv(const at::Tensor& x, const at::Tensor& weight,
   const int state_cols = static_cast<int>(state_pool.size(2));
   // Page-packed pools (vLLM bind_kv_cache) are contiguous within a slot with
   // a wider slot stride; the kernel takes that stride explicitly.
-  TORCH_CHECK(state_pool.stride(2) == 1 &&
-                  state_pool.stride(1) == state_cols,
+  TORCH_CHECK(state_pool.stride(2) == 1 && state_pool.stride(1) == state_cols,
               "conv state pool rows must be (channels, state_cols) "
               "contiguous");
   const auto conv_stride64 = state_pool.stride(0);
@@ -4473,11 +4538,10 @@ at::Tensor gdn_short_conv(const at::Tensor& x, const at::Tensor& weight,
   TORCH_CHECK(cu_seqlens.numel() >= R + 1, "cu_seqlens must be [R+1]");
   at::Tensor out = ring_out_like("qc_gdn_conv", x);
   encode("qc_gdn_short_conv", [&](TorchEncoder& e) {
-    tk::launch_gdn_short_conv(e, x, weight, state_pool, cu_seqlens,
-                              slot_mapping, out, R, channels, kernel_size,
-                              load_initial ? 1 : 0, apply_silu ? 1 : 0,
-                              static_cast<int>(conv_stride64), state_cols,
-                              activation_type_name(x));
+    tk::launch_gdn_short_conv(
+        e, x, weight, state_pool, cu_seqlens, slot_mapping, out, R, channels,
+        kernel_size, load_initial ? 1 : 0, apply_silu ? 1 : 0,
+        static_cast<int>(conv_stride64), state_cols, activation_type_name(x));
   });
   return out;
 }
@@ -4503,11 +4567,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> gdn_qkv_prepare(
   at::Tensor v =
       ring_out("qc_gdn_v", {tokens, (int64_t)Hv * Dv}, mixed.options());
   encode("qc_gdn_qkv_prepare", [&](TorchEncoder& e) {
-    tk::launch_gdn_qkv_prepare(e, mixed, q, k, v, tokens, Hk, Hv, Dk, Dv,
-                               static_cast<float>(eps),
-                               static_cast<float>(q_scale),
-                               static_cast<float>(k_scale),
-                               activation_type_name(mixed));
+    tk::launch_gdn_qkv_prepare(
+        e, mixed, q, k, v, tokens, Hk, Hv, Dk, Dv, static_cast<float>(eps),
+        static_cast<float>(q_scale), static_cast<float>(k_scale),
+        activation_type_name(mixed));
   });
   return {q, k, v};
 }
@@ -4523,9 +4586,9 @@ std::tuple<at::Tensor, at::Tensor> gdn_gate_beta(const at::Tensor& a,
   TORCH_CHECK(a.sizes() == b.sizes() && a.scalar_type() == b.scalar_type(),
               "a and b must match");
   const int heads = static_cast<int>(a.size(-1));
-  TORCH_CHECK(A_log.scalar_type() == at::kFloat &&
-                  dt_bias.scalar_type() == at::kFloat,
-              "A_log and dt_bias must be fp32");
+  TORCH_CHECK(
+      A_log.scalar_type() == at::kFloat && dt_bias.scalar_type() == at::kFloat,
+      "A_log and dt_bias must be fp32");
   TORCH_CHECK(A_log.numel() == heads && dt_bias.numel() == heads,
               "A_log/dt_bias must be [heads]");
   const auto n = static_cast<uint32_t>(a.numel());
@@ -4572,9 +4635,9 @@ at::Tensor gdn_recur(const at::Tensor& q, const at::Tensor& k,
               "v must be [tokens, Hv*Dv] of q's dtype, got ", v.sizes());
   // g/beta are read through the activation type in the kernel: on the fp32
   // serving chain they are gate_beta's fp32 outputs verbatim.
-  TORCH_CHECK(g.numel() == (int64_t)tokens * Hv &&
-                  g.scalar_type() == q.scalar_type(),
-              "g must be [tokens, Hv] of q's dtype");
+  TORCH_CHECK(
+      g.numel() == (int64_t)tokens * Hv && g.scalar_type() == q.scalar_type(),
+      "g must be [tokens, Hv] of q's dtype");
   TORCH_CHECK(beta.numel() == (int64_t)tokens * Hv &&
                   beta.scalar_type() == q.scalar_type(),
               "beta must be [tokens, Hv] of q's dtype");
@@ -4639,9 +4702,9 @@ gdn_fused_prepare(const at::Tensor& qkvz, const at::Tensor& ba,
                   const at::Tensor& conv_w, const at::Tensor& conv_state_pool,
                   const at::Tensor& cu_seqlens, const at::Tensor& slot_mapping,
                   const at::Tensor& A_log, const at::Tensor& dt_bias,
-                  int64_t num_k_heads, int64_t num_v_heads,
-                  int64_t head_k_dim, int64_t head_v_dim, double eps,
-                  double q_scale, double k_scale, bool load_initial,
+                  int64_t num_k_heads, int64_t num_v_heads, int64_t head_k_dim,
+                  int64_t head_v_dim, double eps, double q_scale,
+                  double k_scale, bool load_initial,
                   const c10::optional<at::Tensor>& num_accepted) {
   check_mps_strided(qkvz, "qkvz");
   check_mps_strided(ba, "ba");
@@ -4658,26 +4721,25 @@ gdn_fused_prepare(const at::Tensor& qkvz, const at::Tensor& ba,
   TORCH_CHECK((Dk == 64 || Dk == 128) && (Dv == 64 || Dv == 128),
               "gdn_fused_prepare instantiations cover head dims {64,128}");
   const int channels = 2 * Hk * Dk + Hv * Dv;
-  TORCH_CHECK(qkvz.dim() == 2 && qkvz.size(1) >= channels &&
-                  qkvz.stride(1) == 1,
-              "qkvz must be [tokens, >=2*Hk*Dk+Hv*Dv] with unit column "
-              "stride, got ",
-              qkvz.sizes());
+  TORCH_CHECK(
+      qkvz.dim() == 2 && qkvz.size(1) >= channels && qkvz.stride(1) == 1,
+      "qkvz must be [tokens, >=2*Hk*Dk+Hv*Dv] with unit column "
+      "stride, got ",
+      qkvz.sizes());
   const auto qkvz_stride64 = qkvz.stride(0);
   TORCH_CHECK(qkvz_stride64 >= channels &&
                   qkvz_stride64 <= std::numeric_limits<int>::max(),
               "qkvz row stride out of range: ", qkvz_stride64);
   const int tokens = static_cast<int>(qkvz.size(0));
-  TORCH_CHECK(ba.dim() == 2 && ba.size(0) == tokens &&
-                  ba.size(1) >= 2 * Hv && ba.stride(1) == 1 &&
-                  ba.scalar_type() == qkvz.scalar_type(),
+  TORCH_CHECK(ba.dim() == 2 && ba.size(0) == tokens && ba.size(1) >= 2 * Hv &&
+                  ba.stride(1) == 1 && ba.scalar_type() == qkvz.scalar_type(),
               "ba must be [tokens, >=2*Hv] of qkvz's dtype with unit column "
               "stride, got ",
               ba.sizes());
   const auto ba_stride64 = ba.stride(0);
-  TORCH_CHECK(ba_stride64 >= 2 * Hv &&
-                  ba_stride64 <= std::numeric_limits<int>::max(),
-              "ba row stride out of range: ", ba_stride64);
+  TORCH_CHECK(
+      ba_stride64 >= 2 * Hv && ba_stride64 <= std::numeric_limits<int>::max(),
+      "ba row stride out of range: ", ba_stride64);
   TORCH_CHECK(conv_w.scalar_type() == at::kFloat && conv_w.dim() == 2 &&
                   conv_w.size(0) == channels && conv_w.is_contiguous(),
               "conv_w must be contiguous fp32 [channels, kernel], got ",
@@ -4695,17 +4757,17 @@ gdn_fused_prepare(const at::Tensor& qkvz, const at::Tensor& ba,
               "layout), got ",
               conv_state_pool.sizes());
   const int state_cols = static_cast<int>(conv_state_pool.size(2));
-  TORCH_CHECK(conv_state_pool.stride(2) == 1 &&
-                  conv_state_pool.stride(1) == state_cols,
-              "conv state pool rows must be (channels, state_cols) "
-              "contiguous");
+  TORCH_CHECK(
+      conv_state_pool.stride(2) == 1 && conv_state_pool.stride(1) == state_cols,
+      "conv state pool rows must be (channels, state_cols) "
+      "contiguous");
   const auto conv_stride64 = conv_state_pool.stride(0);
   TORCH_CHECK(conv_stride64 >= (int64_t)channels * state_cols &&
                   conv_stride64 <= std::numeric_limits<int>::max(),
               "conv state slot stride out of range: ", conv_stride64);
   TORCH_CHECK(A_log.scalar_type() == at::kFloat &&
-                  dt_bias.scalar_type() == at::kFloat &&
-                  A_log.numel() == Hv && dt_bias.numel() == Hv,
+                  dt_bias.scalar_type() == at::kFloat && A_log.numel() == Hv &&
+                  dt_bias.numel() == Hv,
               "A_log/dt_bias must be fp32 [Hv]");
   TORCH_CHECK(cu_seqlens.scalar_type() == at::kInt, "cu_seqlens must be i32");
   TORCH_CHECK(slot_mapping.scalar_type() == at::kInt,
@@ -4732,8 +4794,8 @@ gdn_fused_prepare(const at::Tensor& qkvz, const at::Tensor& ba,
   } else {
     // The kernel only dereferences num_accepted in spec mode; bind a
     // persistent 1-element dummy so the pipeline's buffer table is complete.
-    static at::Tensor dummy = at::zeros(
-        {1}, at::TensorOptions().dtype(at::kInt).device(at::kMPS));
+    static at::Tensor dummy =
+        at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(at::kMPS));
     accepted = dummy;
   }
   const auto f32 = qkvz.options().dtype(at::kFloat);
@@ -4780,8 +4842,7 @@ at::Tensor gdn_recur_spec(const at::Tensor& q, const at::Tensor& k,
   const int Hv = static_cast<int>(num_v_heads);
   const int Dk = static_cast<int>(head_k_dim);
   const int Dv = static_cast<int>(head_v_dim);
-  TORCH_CHECK(Dk == 64 || Dk == 128,
-              "gdn_recur_spec supports Dk in {64,128}");
+  TORCH_CHECK(Dk == 64 || Dk == 128, "gdn_recur_spec supports Dk in {64,128}");
   TORCH_CHECK(Hv % Hk == 0, "Hv must be a multiple of Hk (GQA broadcast)");
   const int tokens = static_cast<int>(q.size(0));
   TORCH_CHECK(q.dim() == 2 && q.size(1) == (int64_t)Hk * Dk, "q must be ",
@@ -4792,9 +4853,9 @@ at::Tensor gdn_recur_spec(const at::Tensor& q, const at::Tensor& k,
                   v.size(1) == (int64_t)Hv * Dv &&
                   v.scalar_type() == q.scalar_type(),
               "v must be [tokens, Hv*Dv] of q's dtype, got ", v.sizes());
-  TORCH_CHECK(g.numel() == (int64_t)tokens * Hv &&
-                  g.scalar_type() == q.scalar_type(),
-              "g must be [tokens, Hv] of q's dtype");
+  TORCH_CHECK(
+      g.numel() == (int64_t)tokens * Hv && g.scalar_type() == q.scalar_type(),
+      "g must be [tokens, Hv] of q's dtype");
   TORCH_CHECK(beta.numel() == (int64_t)tokens * Hv &&
                   beta.scalar_type() == q.scalar_type(),
               "beta must be [tokens, Hv] of q's dtype");
@@ -4827,11 +4888,10 @@ at::Tensor gdn_recur_spec(const at::Tensor& q, const at::Tensor& k,
   at::Tensor y =
       ring_out("qc_gdn_y_spec", {tokens, (int64_t)Hv * Dv}, q.options());
   encode("qc_gdn_recur_spec", [&](TorchEncoder& e) {
-    tk::launch_gdn_recur_spec(e, q, k, v, g, beta, state_pool, cu_seqlens,
-                              slot_table, num_accepted, y, R, Hk, Hv, Dv, Dk,
-                              static_cast<int>(ssm_stride64),
-                              static_cast<int>(table_stride64),
-                              activation_type_name(q));
+    tk::launch_gdn_recur_spec(
+        e, q, k, v, g, beta, state_pool, cu_seqlens, slot_table, num_accepted,
+        y, R, Hk, Hv, Dv, Dk, static_cast<int>(ssm_stride64),
+        static_cast<int>(table_stride64), activation_type_name(q));
   });
   return y;
 }
@@ -4849,10 +4909,10 @@ at::Tensor gdn_gated_rmsnorm_f32(const at::Tensor& y, const at::Tensor& z,
   const int D = static_cast<int>(y.size(1));
   TORCH_CHECK(D == 64 || D == 128,
               "gdn_gated_rmsnorm_f32 instantiations cover D in {64,128}");
-  TORCH_CHECK(z.dim() == 3 && z.size(2) == D && z.stride(2) == 1 &&
-                  z.stride(1) == D,
-              "z must be [tokens, Hv, D] with contiguous (Hv, D) rows, got ",
-              z.sizes());
+  TORCH_CHECK(
+      z.dim() == 3 && z.size(2) == D && z.stride(2) == 1 && z.stride(1) == D,
+      "z must be [tokens, Hv, D] with contiguous (Hv, D) rows, got ",
+      z.sizes());
   const int tokens = static_cast<int>(z.size(0));
   const int Hv = static_cast<int>(z.size(1));
   const int rows = static_cast<int>(y.size(0));
@@ -4867,10 +4927,9 @@ at::Tensor gdn_gated_rmsnorm_f32(const at::Tensor& y, const at::Tensor& z,
   at::Tensor out =
       ring_out("qc_gdn_norm", {(int64_t)tokens, (int64_t)Hv * D}, z.options());
   encode("qc_gdn_gated_rmsnorm_f32", [&](TorchEncoder& e) {
-    tk::launch_gdn_gated_rmsnorm_f32(e, y, z, weight, out, rows, Hv, D,
-                                     static_cast<int>(z_stride64),
-                                     static_cast<float>(eps),
-                                     activation_type_name(z));
+    tk::launch_gdn_gated_rmsnorm_f32(
+        e, y, z, weight, out, rows, Hv, D, static_cast<int>(z_stride64),
+        static_cast<float>(eps), activation_type_name(z));
   });
   return out;
 }
@@ -5559,7 +5618,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("q"), pybind11::arg("key_cache"),
         pybind11::arg("value_cache"), pybind11::arg("block_table"),
         pybind11::arg("context_lens"), pybind11::arg("scale"),
-        pybind11::arg("window"));
+        pybind11::arg("window"), pybind11::arg("max_context_len") = -1);
   m.def("dflash_sample_greedy", &dflash_sample_greedy,
         "fused greedy draft sampling: shared lm_head GEMM + row argmax",
         pybind11::arg("hidden"), pybind11::arg("lm_w"),
@@ -5601,20 +5660,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("max_blocks"), pybind11::arg("block_size"),
         pybind11::arg("final_norm_w"), pybind11::arg("aux_layers"),
         pybind11::arg("ref"));
-  m.def("muse_q38_layer_gdn", &muse_q38_layer_gdn,
-        "Register one GDN decoder layer (mixer + MLP + norm seams)",
-        pybind11::arg("idx"), pybind11::arg("in_norm_w"),
-        pybind11::arg("post_norm_w"), pybind11::arg("qkvz_t"),
-        pybind11::arg("qkvz_fmt"), pybind11::arg("ba_t"),
-        pybind11::arg("ba_fmt"), pybind11::arg("conv_w"),
-        pybind11::arg("A_log"), pybind11::arg("dt_bias"),
-        pybind11::arg("gated_norm_w"), pybind11::arg("out_t"),
-        pybind11::arg("out_fmt"), pybind11::arg("conv_state"),
-        pybind11::arg("ssm_state"), pybind11::arg("prep_eps"),
-        pybind11::arg("q_scale"), pybind11::arg("k_scale"),
-        pybind11::arg("norm_eps"), pybind11::arg("gu_t"),
-        pybind11::arg("gu_fmt"), pybind11::arg("down_t"),
-        pybind11::arg("down_fmt"));
+  m.def(
+      "muse_q38_layer_gdn", &muse_q38_layer_gdn,
+      "Register one GDN decoder layer (mixer + MLP + norm seams)",
+      pybind11::arg("idx"), pybind11::arg("in_norm_w"),
+      pybind11::arg("post_norm_w"), pybind11::arg("qkvz_t"),
+      pybind11::arg("qkvz_fmt"), pybind11::arg("ba_t"), pybind11::arg("ba_fmt"),
+      pybind11::arg("conv_w"), pybind11::arg("A_log"), pybind11::arg("dt_bias"),
+      pybind11::arg("gated_norm_w"), pybind11::arg("out_t"),
+      pybind11::arg("out_fmt"), pybind11::arg("conv_state"),
+      pybind11::arg("ssm_state"), pybind11::arg("prep_eps"),
+      pybind11::arg("q_scale"), pybind11::arg("k_scale"),
+      pybind11::arg("norm_eps"), pybind11::arg("gu_t"), pybind11::arg("gu_fmt"),
+      pybind11::arg("down_t"), pybind11::arg("down_fmt"));
   m.def("muse_q38_layer_attn", &muse_q38_layer_attn,
         "Register one gated full-attention decoder layer (mixer + MLP + "
         "norm seams)",
@@ -5642,6 +5700,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("debug_out") = pybind11::none(),
         pybind11::arg("debug_layer") = 0);
 
+  m.def("paged_attention_partitioned", &paged_attention_partitioned,
+        "Partitioned paged decode attention (partition + reduce), strided "
+        "caches accepted; max_context_len sizes the partition grid host-side",
+        pybind11::arg("q"), pybind11::arg("key_cache"),
+        pybind11::arg("value_cache"), pybind11::arg("block_table"),
+        pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("window"), pybind11::arg("max_context_len"));
   m.def("paged_attention", &paged_attention,
         "Dense/GQA paged attention decode over the block-table KV cache. "
         "window > 0 limits each query to the last `window` positions. "

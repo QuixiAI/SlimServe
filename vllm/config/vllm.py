@@ -80,6 +80,8 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "InklingForConditionalGeneration",
         "LongcatFlashNgramForCausalLM",
         "Qwen2MoeForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 
@@ -663,16 +665,19 @@ class VllmConfig:
         if model_config.runner_type != "generate":
             return False
 
-        if getattr(model_config, "is_hybrid", False):
+        architectures = getattr(model_config, "architectures", [])
+        is_default_v2_architecture = any(
+            arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures
+        )
+
+        # A hybrid model runs V2 only when its architecture is explicitly
+        # qualified for it (e.g. Qwen4Exp); other hybrids stay on V1.
+        if getattr(model_config, "is_hybrid", False) and not is_default_v2_architecture:
             return False
 
         if getattr(model_config, "is_attention_free", False):
             return False
-        architectures = getattr(model_config, "architectures", [])
-        return (
-            any(arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures)
-            or not model_config.is_moe
-        )
+        return is_default_v2_architecture or not model_config.is_moe
 
     @property
     def needs_dp_coordinator(self) -> bool:

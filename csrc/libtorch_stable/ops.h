@@ -689,6 +689,20 @@ void cp_gather_indexer_k_quant_cache(
     const torch::stable::Tensor& block_table,   // [batch_size, num_blocks]
     const torch::stable::Tensor& cu_seq_lens);  // [batch_size + 1]
 
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+// Fused GDN decode (post-conv scan + gated norm) with MTP verify support.
+void fused_gdn_decode_post_conv_mtp(
+    torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
+    torch::stable::Tensor const& dt_bias,
+    torch::stable::Tensor const& state_indices,
+    torch::stable::Tensor const& cu_seqlens,
+    torch::stable::Tensor const& num_accepted_tokens,
+    torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
+    torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
+    double scale, double norm_eps, const std::string& output_gate_activation);
+#endif
+
 // LongCat n-gram embedding index kernel (see ngram_embedding_kernels.cu).
 void ngram_compute_n_gram_ids(
     int64_t ne_n, int64_t ne_k, torch::stable::Tensor& ne_weights,

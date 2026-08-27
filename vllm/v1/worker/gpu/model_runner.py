@@ -55,7 +55,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    KVCacheConfig,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -457,25 +462,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         block_sizes = []
         max_num_blocks_per_group = []
+        slot_mapping_enabled = []
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             spec = kv_cache_group.kv_cache_spec
             block_sizes.append(spec.block_size)
+            layer_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            slot_mapping_enabled.append(not isinstance(layer_spec, CircularBufferSpec))
             # When using DCP, each request's KV cache is sharded among different ranks.
             # As a result, one block on the current rank covers `block_size * cp_size`
             # tokens in the full, global (unsharded) sequence.
             max_num_blocks = cdiv(
                 block_table_max_model_len, spec.block_size * self.dcp_size
             )
-            # Align to a multiple of (128 / block_size) as required by some attention
-            # backends such as TRTLLM (#39324)
-            if spec.block_size <= 128:
-                alignment = 128 // spec.block_size
-                max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
-            # For Mamba/Hybrid Model, KVCaches need extra blocks for speculative tokens
-            if isinstance(spec, MambaSpec):
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
+            if isinstance(layer_spec, CircularBufferSpec):
+                # Circular caches keep one physical ring block per request for
+                # its whole lifetime; no TRTLLM width alignment applies.
+                max_num_blocks = 1
+            else:
+                # Align to a multiple of (128 / block_size) as required by some
+                # attention backends such as TRTLLM (#39324)
+                if spec.block_size <= 128:
+                    alignment = 128 // spec.block_size
+                    max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
+                # For Mamba/Hybrid Model, KVCaches need extra blocks for
+                # speculative tokens
+                if isinstance(layer_spec, MambaSpec):
+                    max_num_blocks = (
+                        max_num_blocks if self.cache_config.enable_prefix_caching else 1
+                    ) + layer_spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
@@ -488,6 +504,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             max_num_blocks_per_group=max_num_blocks_per_group,
             device=self.device,
             kernel_block_sizes=self.kernel_block_sizes,
+            slot_mapping_enabled=slot_mapping_enabled,
             cp_size=self.dcp_size,
             cp_rank=self.dcp_rank,
             cp_interleave=self.cp_interleave,
@@ -977,6 +994,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             num_logits = num_draft_tokens_per_req + num_bonus_tokens
+            # combine_sampled_and_draft_tokens places a request's logits rows
+            # at [query_end - num_logits, query_end). Fewer query rows than
+            # that would silently select the preceding request's hidden states.
+            assert (num_scheduled_tokens >= num_logits).all()
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
