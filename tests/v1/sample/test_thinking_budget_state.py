@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU coverage for the native reasoning-token budget state machine."""
 
 from types import SimpleNamespace
@@ -373,3 +374,17 @@ def test_invalid_reasoning_effort_budget_map_is_rejected(budget_map):
             {"thinking_token_budget": budget_map},
             "medium",
         )
+
+
+def test_reasoning_effort_none_ignores_scalar_default_and_explicit_budget():
+    """`none` disables thinking at the template layer, so no cutoff applies
+    even against a scalar server default or an explicit request budget."""
+    from vllm.sampling_params import get_effective_thinking_token_budget
+
+    assert (
+        get_effective_thinking_token_budget(
+            None, 1000, {"thinking_token_budget": 256}, "none"
+        )
+        is None
+    )
+    assert get_effective_thinking_token_budget(64, 1000, {}, "none") is None

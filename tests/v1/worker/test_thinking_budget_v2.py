@@ -186,3 +186,15 @@ def test_mixed_batch_only_budgeted_rows_forced():
     st.apply_staged_writes()
     batch = make_batch([0, 1], [1, 1], [7, 7])
     assert forced_rows(st, batch) == [0]
+
+
+def test_explicit_minus_one_budget_is_inactive_even_in_mixed_batch():
+    """-1 is the unlimited opt-out: a direct SamplingParams can carry it to
+    add_request, and it must not become an active budget of -1 (which would
+    force the end marker on the first in-think token)."""
+    st = make_state()
+    st.add_request(0, [1, START], sp(-1))  # opted out, in an open block
+    st.add_request(1, [1, START], sp(0))  # exhausted budget
+    st.apply_staged_writes()
+    batch = make_batch([0, 1], [1, 1], [7, 7])
+    assert forced_rows(st, batch) == [1]

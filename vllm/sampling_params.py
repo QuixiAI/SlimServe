@@ -96,6 +96,13 @@ def get_effective_thinking_token_budget(
     fallback for omitted request levels and for levels absent from a partial
     map. An explicit request budget (including ``-1``) takes precedence.
     """
+    # `none` disables thinking at the template layer entirely: no reasoning
+    # block will open, so no cutoff applies -- regardless of a scalar server
+    # default or an explicit request budget (which would otherwise make a
+    # no-thinking request look budgeted and trip the V2 multi-token-marker
+    # rejection).
+    if reasoning_effort == "none":
+        return None
     configured_budget = request_budget
     # An explicit API -1 must disable an operator-configured server default.
     if configured_budget == -1:
@@ -132,11 +139,6 @@ def get_effective_thinking_token_budget(
                 )
             validate_thinking_token_budget(level_budget)
 
-        # `none` disables thinking at the template layer and should not acquire
-        # the map's medium fallback. An explicit numeric request budget has
-        # already bypassed this map branch above.
-        if reasoning_effort == "none":
-            return None
         level = reasoning_effort or DEFAULT_REASONING_EFFORT
         configured_budget = configured_budget.get(
             level, configured_budget[DEFAULT_REASONING_EFFORT]
