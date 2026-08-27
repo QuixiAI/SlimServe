@@ -306,7 +306,7 @@ class MetalAttentionImpl(AttentionImpl):
     # parity around ctx 2500 (2.93 vs 2.91); batch >= 2 amortizes the fixed
     # cost and the kernel wins big (c4 +10%, c8 +17%). Route batch-1 short
     # context to SDPA, everything else to the kernel.
-    _PA256_MIN_CTX_BATCH1 = 2048
+    _PA256_MIN_CTX_BATCH1 = int(os.environ.get("VLLM_QC_PA256_MIN_CTX_B1", "2048"))
 
     def _pa256_route_ok(self, metadata: MetalAttentionMetadata) -> bool:
         if self.head_size != 256:
