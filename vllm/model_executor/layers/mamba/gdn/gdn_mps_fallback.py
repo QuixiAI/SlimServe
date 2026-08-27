@@ -180,6 +180,7 @@ def gated_delta_rule_decode_native(
     state_indices: torch.Tensor,
     scale: float | None = None,
     use_qk_l2norm: bool = True,
+    tiled_gqa: bool = False,
 ) -> torch.Tensor:
     """fused_sigmoid_gating_delta_rule_update for the decode case
     (one token per sequence), vectorized over the batch.
@@ -210,9 +211,14 @@ def gated_delta_rule_decode_native(
     qf = qf * scale
     g, beta = _sigmoid_gating(a[:N][valid], b[:N][valid], A_log, dt_bias)
 
-    # Grouped GQA broadcast: value head i_hv uses key head i_hv // ratio.
-    q_hv = qf.repeat_interleave(ratio, dim=1)  # [n, HV, K]
-    k_hv = kf.repeat_interleave(ratio, dim=1)
+    if tiled_gqa:
+        # ggml tiled layout: value head i_hv uses key head i_hv % H.
+        q_hv = qf.repeat(1, ratio, 1)  # [n, HV, K]
+        k_hv = kf.repeat(1, ratio, 1)
+    else:
+        # HF grouped layout: value head i_hv uses key head i_hv // ratio.
+        q_hv = qf.repeat_interleave(ratio, dim=1)  # [n, HV, K]
+        k_hv = kf.repeat_interleave(ratio, dim=1)
 
     S = ssm_state[idx].float()  # [n, HV, V, K]
     S = S * torch.exp(g)[..., None, None]
@@ -235,6 +241,7 @@ def gated_delta_rule_prefill_native(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     scale: float | None = None,
+    tiled_gqa: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """chunk_gated_delta_rule as a sequential fp32 recurrence.
 
@@ -249,8 +256,14 @@ def gated_delta_rule_prefill_native(
     if scale is None:
         scale = K**-0.5
 
-    q_hv = (q[0].float() * scale).repeat_interleave(ratio, dim=1)  # [T, HV, K]
-    k_hv = k[0].float().repeat_interleave(ratio, dim=1)
+    if tiled_gqa:
+        # ggml tiled layout: value head i_hv uses key head i_hv % H.
+        q_hv = (q[0].float() * scale).repeat(1, ratio, 1)  # [T, HV, K]
+        k_hv = k[0].float().repeat(1, ratio, 1)
+    else:
+        # HF grouped layout: value head i_hv uses key head i_hv // ratio.
+        q_hv = (q[0].float() * scale).repeat_interleave(ratio, dim=1)  # [T, HV, K]
+        k_hv = k[0].float().repeat_interleave(ratio, dim=1)
     vf = v[0].float()
     decay = torch.exp(g[0].float())  # [T, HV]
     betaf = beta[0].float()

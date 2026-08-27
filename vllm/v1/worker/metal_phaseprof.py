@@ -7,7 +7,7 @@ drafter propose, plus the compressor's save-partial/full-compress
 sub-phases) with torch.mps.synchronize() timers, so each bucket is
 GPU-inclusive wall time. The synchronizes serialize the step pipeline, so
 absolute step time under this profiler is slightly inflated; the SPLIT is
-the diagnostic. Dump lands in /tmp/phaseprof_<pid>.txt, rewritten every
+the diagnostic. Dump lands in a private mkdtemp dir (path logged), rewritten every
 few dozen phase closes — EngineCore exits via os._exit, which skips
 atexit, so the periodic rewrite is the only dump that survives a server
 shutdown.
@@ -233,7 +233,7 @@ def _dump_census() -> None:
 
 
 def _dump() -> None:
-    path = f"/tmp/phaseprof_{os.getpid()}.txt"
+    path = _prof_path(f"phaseprof_{os.getpid()}.txt")
     total = sum(s for _, s in _stats.values())
     with open(path, "w") as f:
         f.write(f"{'seconds':>10} {'count':>8} {'ms/call':>9} {'share':>6}  phase\n")

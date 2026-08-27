@@ -72,18 +72,20 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
         return None
     # Older flashinfer releases predate the deterministic kwarg _topk
     # passes; treat them as unavailable rather than TypeError at serve time.
+    # The import itself stays inside the try: has_flashinfer() only checks
+    # find_spec, so a broken installation raises ImportError right here.
     import inspect
 
-    from flashinfer import top_k
-
     try:
+        from flashinfer import top_k
+
         if "deterministic" not in inspect.signature(top_k).parameters:
             logger.info_once(
                 "flashinfer top_k lacks the deterministic kwarg; the DFlash2 "
                 "selector uses torch.topk."
             )
             return None
-    except (TypeError, ValueError):
+    except (ImportError, TypeError, ValueError):
         return None
     return top_k
 

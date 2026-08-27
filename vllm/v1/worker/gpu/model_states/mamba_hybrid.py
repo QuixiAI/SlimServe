@@ -109,10 +109,14 @@ class MambaHybridModelState(DefaultModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
         # One trailing dump slot (index max_num_reqs): the MPS postprocess
-        # scatter routes -1 sentinel rows there instead of boolean-mask
-        # indexing, whose data-dependent shape forces a full GPU-queue drain
-        # per step on MPS (measured 67 ms/step at c1-spec). Every reader
-        # indexes by valid request indices, so the slot is never read.
+        # readers that gather with a raw idx_mapping can carry -1 rows, and
+        # Python negative indexing lands those on the LAST slot -- which the
+        # ones-init keeps at the neutral acceptance count of 1. (The MPS
+        # postprocess scatter itself redirects sentinel rows to slot 0 with
+        # an additive delta of zero; see postprocess_state. Boolean-mask
+        # indexing is avoided throughout: its data-dependent shape forces a
+        # full GPU-queue drain per step on MPS, measured 67 ms/step at
+        # c1-spec.)
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs + 1, dtype=torch.int32, device=self.device
         )

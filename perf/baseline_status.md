@@ -1498,7 +1498,7 @@ boot**.log).
   perf/results/2026-08-24/steady_gate/. Notebook: UPDATE 43.
 - N11a FUSED DFLASH2 GROUPED CONV RETAINED (UPDATE 44, 2026-08-24):
   qc_dflash_conv kernel (serving/dflash_conv/) — one dispatch replaces
-  the ~10-op eager chain per _grouped_conv call (~200 encodes/step
+  the ~10-op eager chain per `_grouped_conv` call (~200 encodes/step
   across 4 calls x 5 drafter layers; the pad/arange/mask ops go with
   it). Kernel parity 37/37 BIT-EXACT vs the eager chain (per-op
   fp32-round mirror of MPS elementwise semantics), so drafts and
@@ -1615,7 +1615,7 @@ boot**.log).
   Old pin f75e1d41ac3d retired. Canonical Qwen3.8 pins: see UPDATE 55 in
   optimization_status (two boot defects fixed in the merged build first:
   vision-wrapper torchvision requirement -> language_model_only in the
-  Metal variants; duplicate _forward_core_mps def shadowing the Metal
+  Metal variants; duplicate `_forward_core_mps` def shadowing the Metal
   GDN dispatcher -> renamed + unified dispatch). Raw:
   perf/results/2026-08-25/{anchor_regate_merge, merge_regate}/.
 ## Muse-Glimmer-30B (Metal, M5 Max 128 GB)
