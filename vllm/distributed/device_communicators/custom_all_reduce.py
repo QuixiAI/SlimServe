@@ -148,12 +148,20 @@ class CustomAllreduce:
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if world_size > 2 and not fully_connected:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+            if not envs.VLLM_CUSTOM_AR_ALLOW_PCIE:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly. If this"
+                    " box has working PCIe P2P with a full-size BAR1, set"
+                    " VLLM_CUSTOM_AR_ALLOW_PCIE=1 to enable it."
+                )
+                return
+            logger.info_once(
+                "Custom allreduce enabled on a PCIe-only topology"
+                " (VLLM_CUSTOM_AR_ALLOW_PCIE=1); P2P must be functional"
+                " for this to be correct."
             )
-            return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -234,6 +242,8 @@ class CustomAllreduce:
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
             return False
+        if inp.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
@@ -241,8 +251,13 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        # little performance improvement over NCCL -- unless the platform has
+        # real PCIe P2P (large-BAR1 patched driver) and the user opted in.
+        if (
+            self.world_size == 2
+            or self.fully_connected
+            or envs.VLLM_CUSTOM_AR_ALLOW_PCIE
+        ):
             return inp_size < self.max_size
         return False
 
