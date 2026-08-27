@@ -15809,6 +15809,181 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_part.log,
   spec_sdpa_ab.log, longctx_mq_smoke2.log, paged_partitioned_parity.py.
 
+## 2026-08-27 - Review feedback: two profile-schema guards added (both caught real issues)
+
+- Capture-coupling enforcement: new registry test asserts
+  max_cudagraph_capture_size >= (k_max+1) x max_num_seqs for every
+  speculative profile with FULL decode graphs (k_max includes dynamic
+  schedules). On its FIRST run it caught qwen38-nvfp4-1/mi300x at capture
+  64 with k=2 x seqs 64 - decode batches above 21 requests silently ran
+  eager there, the same -52% cliff class measured on rtx3090. The MI300X
+  record is raised to 192 (safety-directional: more graphs, same kernels)
+  with a note that its re-baseline is pending on that platform.
+- Host-RAM gate: schema gains per-platform min_host_ram_bytes at the quant
+  level; hardware.detect() reads MemTotal; registry.allowed_on/resolve and
+  the CLI thread it through with a plan-time error naming the shortfall.
+  qwen38fn FP8/rtx3090 gates at 448 GiB (47.7 GiB pinned PLE x TP8 +
+  staging). Enforced by a test: any variant enabling
+  VLLM_QWEN4_EXP_PLE_HOST must carry a covering gate.
+- 53 profile tests pass.
+- Follow-up accepted from the same review discussion: the PLE table is
+  TP-replicated 8x in host RAM (381.6 GiB) though its content is
+  identical per rank - a /dev/shm-shared single pinned copy (the
+  sysmem_all_reduce.py pattern) cuts the requirement to ~48 GiB + weights
+  staging; the gate then drops to ~128 GiB. NVMe-backed tables were
+  considered and rejected for the serving default: UVA zero-copy needs
+  pinned pages, and the mmap alternative puts NVMe random-read latency on
+  the layer-2 decode critical path (prefetch could hide it; backlog).
+
+## 2026-08-27 - Grossness audit (user-prompted) + PLE dedup + dynamic-k status
+
+- PLE host table now SHARED across TP ranks: one /dev/shm segment, every
+  rank mmaps + cudaHostRegisters the same pages, rank 0 alone writes the
+  shards during load (the safetensors views are lazy, so the 47.7 GiB is
+  also read from disk once, not 8x). Host requirement drops 381.6 -> 47.7
+  GiB; the profile's min_host_ram_bytes gate drops 448 -> 128 GiB.
+  Fallback to a private pinned copy when /dev/shm cannot host it. Unit
+  tests: cross-instance aliasing + gather parity + fallback.
+- Removed vllm/distributed/device_communicators/sysmem_all_reduce.py:
+  unwired, superseded by the P2P fabric; repo policy is remove-or-
+  quarantine for retired experiments.
+- Deprecation note: the fp8-e4m3 main-KV path (VLLM_QWEN4_EXP_FP8_MAIN_KV)
+  is dominated by TQ k8v4 on speed, acceptance, and compression; retained
+  one cycle as a diagnostic, candidate for deletion.
+- Systemic risk flagged: dataclasses.replace() config views re-run full
+  __post_init__ against SHARED sub-configs (today's draft-view cudagraph
+  downgrade was one instance; _maybe_disable_dynamic_sd_for_data_parallel
+  mutates shared speculative_config the same way). Needs a design fix.
+- Dynamic-k V2 status: machinery works at steady state (dispatch stats
+  show 4tok/FULL at c1 k=3, 24tok/FULL at c8 k=2, no PIECEWISE override
+  after the draft-view guard), but (a) ramp-phase partial batches (e.g.
+  57-60 tokens) miss dispatch instead of padding up, (b) a crash
+  reappeared at c32, (c) early numbers (c1 135, c8 438) suggest the k=3
+  win is smaller on TQ than the bf16 sweep promised. PARKED as
+  experimental pending those three; static k=2 remains the profile
+  setting.
+- Open flake: test_qsa_reference[tp1_split64] fails deterministically in
+  the FULL tests/models/qwen4_exp run since the shm-PLE additions, passes
+  alone and in every pairwise combination. Repro:
+  pytest tests/models/qwen4_exp/ -q. Tracked, not yet root-caused.
+
+## 2026-08-27 - Dynamic-k WORKING on V2; c4 +18.6%; c32 under repetition test
+
+- After the family-staging fix, family-range clipping, and the memory
+  diagnosis (4000 allocator-OOM retries at unclipped two-family capture ->
+  0 after clipping; c32 no longer throttles to batch 16), dynamic
+  [[1,4,3],[5,32,2]] vs static k=2 on the IDENTICAL raw config
+  (TQ@262K, seqs 32, cap 128, trimmed capture list):
+  | c  | dynamic | static | delta  |
+  | 1  | 129-142 | ~131-136 (profile band) | wash  |
+  | 4  | 391.9   | 330.5  | +18.6% |
+  | 8  | 554-561 | 547-585 (profile band)  | wash  |
+  | 32 | 765.3   | 857.5  | -10.8% |
+- The c4 win is the pattern's payoff and is real (same-config control).
+  The c32 deficit decomposes into ~4% lower acceptance (59.8 vs 63.9 -
+  possibly plain sampling variance; the c8 acceptance band spans
+  58.1-66.0 across identical configs) and ~7% unattributed. Repetition
+  matrix (c32 x3 per config, dynrep/statrep) in flight before any
+  ship/no-ship call; the schedule stays OUT of the registered profile
+  until it wins or ties everywhere.
+- Pattern hardening shipped regardless (registry-relevant for future
+  profiles): per-family padded-up candidate staging, per-family batch
+  ranges clipped to the schedule (+/-4 margin), drafter-manager guard,
+  draft-view config guard, propose(num_steps), handler-width verify
+  control, scheduler prev-k padding - all pinned by
+  tests/v1/worker/test_cudagraph_dispatch.py (7 pure-Python tests incl.
+  an exhaustive batch x qlen sweep and a graph-budget bound).
+
+## 2026-08-27 - Dynamic-k c32 deficit fully attributed: machinery is free; the max-k-sized verify path costs 5%
+
+- Three-way controlled decomposition at c32 (TQ@262K, seqs 32, cap 128,
+  trimmed capture list, 3 runs each):
+  | config                                        | mean tok/s | accept |
+  | static k=2 (num_spec=2, no schedule)          | 845.7      | 0.644  |
+  | dynamic machinery, k=2 everywhere, num_spec=3 | 801.2      | 0.652  |
+  | dynamic machinery, k=2 everywhere, num_spec=2 | 871.0      | -      |
+  | dynamic schedule [[1,4,3],[5,32,2]]           | 787.8      | 0.617  |
+- Conclusions: (1) the dynamic-k machinery itself costs nothing (row 3 >=
+  static); (2) the whole step-rate deficit is the verify path being sized
+  by the CONFIG MAX k (sampler built decode_query_len=4 wide, per-seq
+  slots at 4) while steady rows are 3 tokens - a ~33% width tax on the
+  sampler stage worth ~5% of the step; (3) the residual acceptance dip
+  under the real schedule is schedule content (k=3 ramp/drain drafting).
+- Remaining engineering to make the real schedule free at c32: size the
+  verify/sampler path per step by the scheduled k instead of the config
+  maximum. Until then the schedule is a documented option (+18.6% at c4,
+  -7% at c32), not the profile default.
+- Raw: dynrep/statrep/dyndeg/dyndeg2 logs and benches under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Dynamic-k steady-state deficit ROOT-CAUSED: two synchronizing index_put_ per step
+
+- The "max-k width tax" hypothesis was wrong. GPU trace diff of the
+  num_spec=3 vs num_spec=2 degenerate configs (identical drafting) showed
+  per-step GPU time equal within 2% and kernel shares flat - but the
+  wider config fit 10% fewer steps into the capture window at LOWER GPU
+  utilization (39.6% vs 44.5% busy): the cost was host-side gap time.
+- CPU-op diff named it: aten::index_put_ at 2 calls/step x 13.8 ms in the
+  wide config vs 1 call/step x 0.056 ms in the narrow one. The draft
+  buffer write `buf[idx_mapping, :k] = drafts` plus the `-1` tail fill
+  use sliced advanced indexing, which falls onto a synchronizing path
+  when the slice does not cover the full row - each call drains the GPU
+  pipeline and erases the async-scheduling overlap.
+- FIX (model_runner.py): pad drafts to buffer width with one F.pad, then
+  a single full-row advanced-index write (the fast path); the handler
+  receives the pre-pad [reqs, k] tensor directly instead of a sliced
+  re-read of the persistent buffer.
+- Validation in flight (dynfix.log): degenerate-schedule config that
+  measured 801 with the syncing writes; expected ~846-871 (static
+  parity). The real-schedule 3x3 re-verdict follows.
+
+## 2026-08-27 - Dynamic-k SHIP-GATE verdict: machinery free, schedule ships as documented option
+
+- With the sync-free draft writes, the degenerate control reached static
+  parity (dynfix c32: 842.7/833.8/846.6 vs static 831-858) - the entire
+  dynamic-k machinery is now measured at zero cost.
+- Real schedule [[1,4,3],[5,32,2]] ship-gate: c32 823.8/831.8/816.8
+  (mean 824, -2.6% vs static mean 846), c4 394.9 (+19.5% vs 330.5),
+  c32 acceptance 0.621 vs 0.644. The residual c32 gap equals the
+  tokens/step arithmetic of the acceptance delta exactly: it is schedule
+  CONTENT (k=3 drafting during ramp/drain), not implementation.
+- Per the pre-committed rule (ship as default only if c32 lands in the
+  static band): mean 824 vs band floor 831 -> ships as a DOCUMENTED
+  OPTION in the profile notes; static k=2 remains the default because
+  c32 is the profile's peak operating point. Deployments with
+  latency-shaped (low-concurrency) traffic should flip the overrides.
+- Pattern complete for future profiles: schedule in speculative_overrides
+  + capture ceiling covering (k_max+1) x max_num_seqs is all a profile
+  needs; capture, dispatch, drafting, padding, and verify-width behavior
+  are automatic and pinned by tests/v1/worker/test_cudagraph_dispatch.py.
+- Raw: dynfix.log, dynship.log, bench_dynship_* under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Cleanup sweep: roaming test flake root-caused; fp8 main-KV removed; config-view invariant enforced
+
+- Roaming full-suite flake (tp1_split64 one run, PLE host-gather the
+  next): the shm-PLE tests unlinked and dropped their mmap while the
+  pages were still cudaHostRegistered - dangling pinned-page state
+  corrupted whichever CUDA test ran next. A per-tensor finalizer made it
+  a core dump instead (nn.Parameter shares storage without keeping the
+  tensor object alive, so the finalizer fired mid-use). Fix: a
+  process-lifetime registry keyed by segment path (matching production
+  semantics, deduping same-process instances onto one mapping) with an
+  explicit release_shared_ple_tables() that unregisters BEFORE unmapping;
+  tests call it in teardown. Three consecutive clean full-suite runs.
+- fp8-e4m3 main-KV path removed entirely (env, layer/impl/backend
+  acceptance, aligner branch, arithmetic e4m3 Triton decoder, kv_fp8
+  wrapper path, parity test): dominated by TQ k8v4 on speed, acceptance,
+  and compression since the tile fix.
+- Config-view invariant named and enforced: VllmConfig._is_draft_model_view
+  documents that replace()-built draft views share every sub-config with
+  the serving config and must never mutate them from __post_init__; both
+  known mutators (dynamic-SD cudagraph downgrade, dynamic-SD DP disable)
+  are guarded, and a regression test builds the real config, creates the
+  draft view, and asserts the shared cudagraph_mode and schedule survive.
+- 213 tests green twice consecutively across qwen4_exp, profiles,
+  dispatcher, and CSA planner suites. MI300X capture re-baseline remains
+  deferred to that platform.
 ## 2026-08-27 - Metal re-validation after the Flash-Next 3090 merge (PR #15): all green
 
 - Trigger: main merged the Qwen3.8-Flash-Next-FP8 8x3090 port (101
