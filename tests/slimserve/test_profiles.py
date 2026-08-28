@@ -853,3 +853,57 @@ def test_host_offload_profiles_declare_a_host_ram_gate():
                 f"(~{floor / 2**30:.0f} GiB pinned, shared across ranks) "
                 "but no quant declares a min_host_ram_bytes gate covering it"
             )
+
+
+def test_every_profile_states_prefix_caching_explicitly():
+    """Prefix caching is stated, never inherited.
+
+    vLLM defaults prefix caching OFF for hybrid (mamba/GDN) models, so a
+    profile that omits enable_prefix_caching silently pays full-history
+    re-prefill on every chat turn -- exactly how qwen38fn-fp8-8 shipped
+    with a 0.0% hit rate. Policy since 2026-08-28: every record states the
+    setting explicitly, and anything other than true needs a note naming
+    the model-level reason (e.g. R-SWA decode KV is not cacheable).
+    """
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert "enable_prefix_caching" in engine, (
+                f"{profile_id}/{platform} does not state enable_prefix_caching; "
+                "it would silently inherit vLLM's per-model default"
+            )
+            if engine["enable_prefix_caching"] is not True:
+                notes = " ".join(record.get("notes", []))
+                assert "prefix" in notes.lower(), (
+                    f"{profile_id}/{platform} disables prefix caching without "
+                    "a note naming the model-level reason"
+                )
+
+
+def test_every_profile_serves_with_tool_calling_and_thinking():
+    """Automatic tool calling and thinking are always on.
+
+    Every profile names its tool-call and reasoning parsers, and the
+    registry's _SERVING_DEFAULTS force enable_auto_tool_choice plus
+    thinking-on template kwargs (and prefix caching) into every resolved
+    plan unless a record overrides the key itself.
+    """
+    from slimserve.registry import _SERVING_DEFAULTS
+
+    assert _SERVING_DEFAULTS.get("enable_auto_tool_choice") is True
+    assert _SERVING_DEFAULTS.get("enable_prefix_caching") is True
+    kwargs = _SERVING_DEFAULTS.get("default_chat_template_kwargs", {})
+    assert kwargs.get("thinking") is True and kwargs.get("enable_thinking") is True
+
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert engine.get("tool_call_parser"), (
+                f"{profile_id}/{platform} has no tool_call_parser"
+            )
+            assert engine.get("reasoning_parser"), (
+                f"{profile_id}/{platform} has no reasoning_parser"
+            )
+            assert engine.get("enable_auto_tool_choice", True) is True, (
+                f"{profile_id}/{platform} disables automatic tool calling"
+            )

@@ -12464,3 +12464,110 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   production recurrence self-documents in /var/log/SlimServe/serve.log.
 - Status: CLOSED as monitored. Production restored to QA on the fixed
   profile (util 0.95, admission 96, all correctness fixes).
+
+## 2026-08-28 - Host KV tier: architecture built and unit-proven; e2e restore debug in progress
+
+- Built: HostTierConnector (custom KV connector, SupportsHMA) + HostKVTierIndex
+  (scheduler-side hash->slot index, per-group completeness, trajectory-affine
+  LRU) + KVTierDMA (per-rank pinned arena at the packed slab stride, in-order
+  copy stream, one contiguous DMA per block). 14 unit tests green. Profile
+  wires 64 GiB/rank (512 GiB pinned, ~3.4M host tokens). Registered in the
+  connector factory; rides the framework's async-KV-load path
+  (WAITING_FOR_REMOTE_KVS) for prefetch-at-admission.
+- Also shipped en route (operator direction): bf16 KV at native 262144
+  (util 0.96, 269,544-token pool, 1.03x; TQ retained as documented option -
+  operator observed turn-tracking confusion plausibly linked to KV
+  quantization at A6B active params, though two of today's fixed bugs are
+  alternative explanations); prefix caching ON across ALL profiles with a
+  registry-defaults backstop and enforcement tests; standing policy in
+  CLAUDE.md and registry.py (always prefix caching + tool calling +
+  thinking, never greedy - benches un-greedied).
+- E2E acceptance status across 8 instrumented server cycles: offload staging
+  works at scale (680 hashes / 3400 slots across 6 trajectories), return-turn
+  lookup finds the full 105-block chain, DMA and completion reporting proven
+  in isolation. Open: the restore hand-off - the framework allocates far
+  fewer GPU target blocks than the external span (observed [3,1,3,3,3,3]
+  per group for a 42K restore; per-manager external token views 840 / 1),
+  meaning per-group external-allocation semantics (mamba boundary-state-only,
+  and an unexplained full-attention clip) differ from the naive
+  every-boundary model. Entry-point tracing cycle in flight to pin the
+  exact per-manager arithmetic; restore pairing will then match the
+  framework's contract instead of assuming it.
+- Discipline note: every serving-path edit cycled through a full boot
+  (~12 min/cycle); prod stayed on port 8000 throughout with QA-visible
+  interruptions authorized by the operator.
+
+## 2026-08-28 - Host KV tier: the debugging saga and final design
+
+Fourteen server cycles of differential debugging, each isolating one layer.
+The final architecture and why each piece is shaped the way it is:
+
+- ATTENTION blocks: mirrored to the pinned host arena at fill time, one
+  step behind the verified-token watermark (speculative rejections can
+  never be captured). Immutable once full, so offload is write-once and
+  GPU eviction is free.
+- STATE (mamba align) blocks: copied ONCE at request finish, when the
+  newest state block is quiescent. Two designs were tried and measured
+  before this one: (a) per-boundary saves during life captured TORN state
+  (the newest block is updated in place every step; restoring those
+  copies = 6/6 NaN follow-ups; saving the "frozen previous boundary"
+  instead lost a race with chunked prefill advancing ~5 boundaries/step
+  and archived reallocated blocks = token-soup restores); (b) the
+  framework's async-save hold (request_finished_all_groups -> True /
+  deferred free) CORRUPTS THE BLOCK POOL for hybrid models - the decisive
+  differential: tier+hold = intermittent NaN logits on any cached
+  follow-up deeper than ~1 chunk, tier-without-hold = 0/12, no-tier =
+  0/12. Final: pin the state blocks with a plain BlockPool.touch()
+  reference, copy, release one meta-build later (the same
+  in-order-copy-stream window that confirms slot writes).
+- RESTORES ride the framework's async-KV-load path with per-step
+  progressive chunking (the scheduler clips the external span to its
+  token budget and re-queries; progress must be tracked
+  connector-relative because num_computed_tokens does not advance for
+  waiting requests). Mixed local+tier resumes work (GPU cache serves the
+  head, tier serves the tail); state blocks ride the final chunk.
+- Wrong turns worth remembering: scheduler-side cache_config.block_size
+  holds a STALE pre-alignment value (8) - the group spec's block_size
+  (400) is authoritative, and the 50x underreport made the scheduler
+  "clip" restores to nothing; CircularBufferSpec ring groups are excluded
+  from prefix caching by their own manager and must be ignored by the
+  tier; block tracking must come from scheduler_output (NewRequestData /
+  CachedRequestData), not update_state_after_alloc (admission-only, full
+  lists); tail saves must be issued in start_load_kv because
+  wait_for_save is skipped on empty-batch steps (dropping them leaked
+  every finished request's blocks until the pool wedged at 93.9%).
+- Measured before the final fix landed: return-to-conversation restore of
+  a 42K-token trajectory in 0.9-1.7s vs 8.5s re-prefill, sub-second
+  6-op mixed restores, 62 confirmed save batches, KV pool recycling
+  correctly. ENGINE BUG filed in-notebook: the HMA deferred-free path
+  (SupportsHMA request_finished_all_groups asymc-save hold) corrupts the
+  block pool on this hybrid - do not use it; the refcount pin is the
+  sanctioned pattern here.
+
+## 2026-08-28 - Host KV tier parked (disabled in profile) pending the state-geometry fix
+
+- Ring-in-tier improved deep resumes 0/8 -> 4/8 recall (the framework
+  skips zeroing every block in an async-load's token range, so the tier
+  must overwrite the ring; its finish-time content is the trajectory tail
+  window and is semantically correct to restore). The remaining failures
+  were then proven byte-clean (SHA verify: 0 mismatches across 8 ranks,
+  all sizes, including failing runs) -> pure semantics.
+- Two state-snapshot theories measured and disproven (live tail block:
+  4/8; penultimate "boundary snapshot": 0/5), then direct instrumentation
+  of request_finished_all_groups revealed the false foundation: for a
+  1312-token request (3 full 400-token attention blocks), the mamba
+  groups hold SIX position slots with THREE resident blocks - the state
+  groups do not share the attention block geometry at runtime, despite
+  kv_cache_config reporting uniform block_size 400 for every group. All
+  position arithmetic built on shared geometry was therefore wrong by
+  construction, and which saved block happened to be a valid boundary
+  snapshot was luck - matching the observed nondeterminism exactly.
+- DECISION: prod reverted to the proven-clean config (bf16 + prefix
+  caching, no tier; 0/12 corruption controls). The tier ships in-tree,
+  disabled, with the attention path fully validated (byte-exact offload/
+  restore, sub-second 42K resumes, leak-free lifecycle, 11 unit tests)
+  and a profile note stating the exact re-enable condition. Next session:
+  read the mamba-align cache_blocks commit path to learn the true state
+  position/granularity mapping (resolve_block_hashes alignment_tokens
+  scaling is the likely key) and mirror it; the acceptance battery in
+  perf/results/2026-08-28/kv-tier/ is the ready-made gate.

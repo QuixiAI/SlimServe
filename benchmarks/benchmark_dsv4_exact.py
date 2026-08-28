@@ -50,9 +50,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=_concurrency, required=True)
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=-1)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=0.95)
+    parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--allow-no-spec",
