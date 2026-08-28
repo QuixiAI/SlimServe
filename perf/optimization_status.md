@@ -12571,3 +12571,18 @@ The final architecture and why each piece is shaped the way it is:
   position/granularity mapping (resolve_block_hashes alignment_tokens
   scaling is the likely key) and mirror it; the acceptance battery in
   perf/results/2026-08-28/kv-tier/ is the ready-made gate.
+
+## 2026-08-28 - Deployed-config baseline: bf16 + prefix caching (post all fixes)
+
+- Exact bench (1000/2000, temp 1.0 / top_p 0.95 / top_k 20, seed 42),
+  idle prod server, deployed profile (bf16 KV @ native 262144, prefix
+  caching + mamba align, util 0.96, admission 96, no tier):
+  c1 129.8 / c8 590.7 / c32 1,151.2 tok/s.
+- c32 is the best recorded for this box (TQ config: 1,134.4); c8 at the
+  top of its band; c1 -14% vs TQ@0.95 (prefix-caching/align bookkeeping
+  unamortized at single stream) - acceptable for the 99%-agentic load and
+  noted as a future single-stream tuning target.
+- Operator confirmed the multi-turn turn-tracking issue is FIXED on this
+  config. Campaign cumulative: 409.7 (bring-up) -> 1,151.2 = 2.8x with
+  double the context, exact KV, and correct conversation behavior.
+- Raw: perf/results/2026-08-28/qwen38fn-bf16-baseline/.
