@@ -1357,6 +1357,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if uniform_tok_count is not None and not dummy_run:
+            # Shape alone cannot distinguish a decode batch from one that
+            # contains mid-prefill requests: a fresh 1-token prompt, or a
+            # prompt/tail chunk exactly as wide as a (spec-)decode step,
+            # produces the same token counts. FULL decode graphs replay
+            # capture-time decode kernels, which read sampled-token and
+            # state slots such a request has never written (garbage logits;
+            # occasionally an illegal memory access). Keep those batches on
+            # the non-uniform path.
+            computed_prefill = self.req_states.num_computed_prefill_tokens
+            prefill_len = self.req_states.prefill_len.np
+            idx_of = self.req_states.req_id_to_index
+            for req_id in scheduler_output.num_scheduled_tokens:
+                idx = idx_of[req_id]
+                if computed_prefill[idx] < prefill_len[idx]:
+                    uniform_tok_count = None
+                    break
 
         num_active_loras = 0
         if self.lora_config:
