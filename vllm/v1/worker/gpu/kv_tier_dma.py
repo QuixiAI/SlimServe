@@ -42,6 +42,14 @@ class TierOpBatch:
     seq: int
     offload: list[tuple[int, int]]  # (gpu_block, host_slot)
     restore: list[tuple[int, int]]  # (host_slot, gpu_block)
+    # GPU blocks to zero with the batch (a resumed request's ring block:
+    # the framework never zeroes ring blocks, so this is defensive
+    # determinism over the stale-claimed bytes internal hits run on).
+    zero: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.zero is None:
+            self.zero = []
 
 
 class KVTierDMA:
@@ -69,7 +77,7 @@ class KVTierDMA:
 
     def issue(self, batch: TierOpBatch) -> None:
         """Enqueue a batch of copies on the copy stream."""
-        if not batch.offload and not batch.restore:
+        if not batch.offload and not batch.restore and not batch.zero:
             return
         main = torch.cuda.current_stream(self.device)
         with torch.cuda.stream(self.copy_stream):
@@ -77,12 +85,14 @@ class KVTierDMA:
             self.copy_stream.wait_stream(main)
             for gpu_block, slot in batch.offload:
                 self.arena[slot].copy_(self.blocks[gpu_block], non_blocking=True)
+            for gpu_block in batch.zero:
+                self.blocks[gpu_block].zero_()
             for slot, gpu_block in batch.restore:
                 self.blocks[gpu_block].copy_(self.arena[slot], non_blocking=True)
             event = torch.cuda.Event()
             event.record(self.copy_stream)
         self._inflight.append((batch, event))
-        if batch.restore:
+        if batch.restore or batch.zero:
             self._restore_events.append(event)
 
     def fence_restores(self) -> None:

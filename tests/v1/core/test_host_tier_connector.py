@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HostTierConnector scheduler-side: fill staging, tail save, resume."""
+"""HostTierConnector scheduler-side: fill staging, tail save, resume.
+
+Save contract: the tail state saved for boundary B = k * block_size is the
+engine's own frozen align-mode snapshot - the pool-cached mamba block keyed
+by block_hashes[k - 1] - never a live block read positionally.
+
+Restore contract: the state lands at position k - 1 of each mamba group
+(the worker seeds state_idx = (num_computed - 1) // block_size), and the
+ring block is zeroed, not restored (engine-internal hit semantics).
+"""
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -102,6 +111,18 @@ def make_connector():
             self.blocks = {i: SimpleNamespace(block_id=i, ref_cnt=1)
                            for i in range(1000)}
             self.touched, self.freed = [], []
+            # (block_hash, group_id) -> block, mirroring the engine's
+            # prefix cache of frozen align-mode boundary states.
+            self.cached: dict[tuple, SimpleNamespace] = {}
+
+        def get_cached_block(self, block_hash, kv_cache_group_ids):
+            out = []
+            for gid in kv_cache_group_ids:
+                blk = self.cached.get((bytes(block_hash), gid))
+                if blk is None:
+                    return None
+                out.append(blk)
+            return out
 
         def touch(self, blocks):
             self.touched.extend(b.block_id for b in blocks)
@@ -115,7 +136,9 @@ def make_connector():
 
     conn.bind_gpu_block_pool(FakePool())
     assert conn.hash_block_size == BLOCK  # from the attn spec, not config
-    assert conn.attn_groups == [0] and conn.state_groups == [1, 2, 3]
+    assert conn.attn_groups == [0]
+    assert conn.state_groups == [2, 3]  # mamba only
+    assert conn.ring_groups == [1]
     return conn
 
 
@@ -129,45 +152,43 @@ def sched_output(step_tokens, new_reqs=(), cached=None):
     )
 
 
-def alloc(n_attn, base=0, state_last=0):
-    """Allocation shape mirroring the engine: attention positional, ring 1,
-    mamba groups position-indexed with nulls before the tail."""
+def alloc(n_attn, planned, base=0):
+    """Allocation shape mirroring the engine at external-load admission:
+    attention positional; ring exactly one block; mamba groups shaped
+    [null] * (planned - 1) + [real tail] (+ live compute blocks after)."""
     attn = [FakeBlock(base + i) for i in range(n_attn)]
     ring = [FakeBlock(base + 90)]
-    # Align-mode keeps two resident state blocks: the frozen previous
-    # boundary and the live newest one; earlier positions are nulls.
-    mamba = [
-        [FakeBlock(0, is_null=True)] * max(0, n_attn - 2)
-        + [FakeBlock(base + 95 + g + state_last)][: min(1, max(0, n_attn - 1))]
-        + [FakeBlock(base + 97 + g + state_last)]
-        for g in range(2)
-    ]
+    mamba = []
+    for g in range(2):
+        gb = [FakeBlock(0, is_null=True)] * max(0, planned - 1)
+        gb.append(FakeBlock(base + 95 + g))
+        gb.extend(
+            FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned))
+        )
+        mamba.append(gb)
     return FakeKVCacheBlocks(blocks=(attn, ring, *mamba))
 
 
-def finish_blocks(n_attn, base=0):
-    # Mamba groups: {exact boundary snapshot at position n-2, live partial
-    # at position n-1}; the connector must save the snapshot.
-    return (
-        [base + i for i in range(n_attn)],
-        [base + 90],
-        [-1] * (n_attn - 2) + [base + 95, base + 99],
-        [-1] * (n_attn - 2) + [base + 96, base + 98],
-    )
-
-
 def run_conversation(conn, req_id, n_blocks, base=0):
-    """Fill a request; tail states save continuously as boundaries advance."""
+    """Fill a request, freeze its boundary states in the fake pool's prefix
+    cache (as the engine's align mode does), and finish it."""
     req = FakeRequest(
         req_id, [h(i) for i in range(n_blocks)], num_tokens=n_blocks * BLOCK + 4
     )
     conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc(n_blocks, base=base), 0)
+    conn.update_state_after_alloc(req, alloc(n_blocks, planned=0, base=base), 0)
     conn.build_connector_meta(sched_output({req_id: n_blocks * BLOCK}))
     req.num_computed_tokens = n_blocks * BLOCK
     meta = conn.build_connector_meta(sched_output({req_id: 1}))
     conn.build_connector_meta(sched_output({}))  # confirm writes
-    ok, _ = conn.request_finished_all_groups(req, finish_blocks(n_blocks, base))
+    # The engine cached the frozen boundary snapshot for each mamba group
+    # when the final boundary was crossed.
+    pool = conn._block_pool
+    for g, gid in enumerate((2, 3)):
+        pool.cached[(bytes(h(n_blocks - 1)), gid)] = pool.blocks[base + 95 + g]
+    ok, _ = conn.request_finished_all_groups(
+        req, tuple([] for _ in range(4))
+    )
     assert ok is False  # never hold blocks (HMA deferred-free corrupts)
     tail_meta = conn.build_connector_meta(sched_output({}))  # issues save
     conn.build_connector_meta(sched_output({}))  # confirms + releases pins
@@ -180,13 +201,32 @@ def test_fill_stages_attention_and_pinned_tail_at_finish():
     fill_ops = [op for ops in meta.offloads.values() for op in ops]
     assert len(fill_ops) == 3  # attention only during fill
     tail_ops = [op for ops in tail_meta.offloads.values() for op in ops]
-    assert len(tail_ops) == 3  # ring + one block per mamba group
+    assert len(tail_ops) == 2  # one frozen snapshot per mamba group, no ring
+    assert {b for b, _ in tail_ops} == {95, 96}  # the pool-cached snapshots
     assert async_save is False
     pool = conn._block_pool
     assert sorted(pool.touched) == sorted(pool.freed)  # pins released
     assert all(pool.blocks[b].ref_cnt == 1 for b in pool.touched)
     assert conn.index.stats()["pending_writes"] == 0
     assert conn.index.stats()["resumable"] == 1
+
+
+def test_missing_cached_boundary_skips_save():
+    conn = make_connector()
+    req = FakeRequest("rx", [h(i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(3, planned=0), 0)
+    conn.build_connector_meta(sched_output({"rx": 3 * BLOCK}))
+    req.num_computed_tokens = 3 * BLOCK
+    conn.build_connector_meta(sched_output({"rx": 1}))
+    conn.build_connector_meta(sched_output({}))
+    # Boundary snapshot evicted before finish: no tail save, no pins.
+    ok, _ = conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    assert ok is False
+    tail_meta = conn.build_connector_meta(sched_output({}))
+    assert not tail_meta.offloads
+    assert not conn._block_pool.touched
+    assert conn.index.stats()["resumable"] == 0
 
 
 def test_resume_round_trip():
@@ -198,17 +238,20 @@ def test_resume_round_trip():
     )
     conn.on_new_request(fresh)
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
-    # Resumable at the exact snapshot boundary: 3 of 4 blocks.
-    assert is_async and n_ext == 3 * BLOCK
+    # Resumable at the finished request's final boundary: all 4 blocks.
+    assert is_async and n_ext == 4 * BLOCK
 
-    conn.update_state_after_alloc(fresh, alloc(5, base=200), n_ext)
+    conn.update_state_after_alloc(fresh, alloc(5, planned=4, base=200), n_ext)
     meta = conn.build_connector_meta(sched_output({}))
     ops = meta.restores["r2"]
-    # 3 attention restores + 3 tail-state restores (ring + mamba).
-    assert len(ops) == 3 + 3
+    # 4 attention restores + 2 mamba tail-state restores; the ring is
+    # zeroed, not restored.
+    assert len(ops) == 4 + 2
     targets = {b for _, b in ops}
-    assert {200, 201, 202} <= targets  # attention span
-    assert len([b for b in targets if b >= 290]) == 3
+    assert {200, 201, 202, 203} <= targets  # attention span
+    # Both mamba states land on the position-(k-1) tail blocks.
+    assert {295, 296} <= targets
+    assert meta.zeros["r2"] == [290]  # the ring block
 
 
 def test_progressive_clipped_restore():
@@ -217,18 +260,20 @@ def test_progressive_clipped_restore():
     fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
     conn.on_new_request(fresh)
     n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
-    assert n_ext == 3 * BLOCK
+    assert n_ext == 4 * BLOCK
     # Scheduler clips to 2 blocks this step.
-    conn.update_state_after_alloc(fresh, alloc(2, base=300), 2 * BLOCK)
+    conn.update_state_after_alloc(fresh, alloc(2, planned=4, base=300), 2 * BLOCK)
     meta = conn.build_connector_meta(sched_output({}))
     assert len(meta.restores["r2"]) == 2  # attention only, no tail yet
-    # Load completes; scheduler re-queries with the new computed count.
+    assert "r2" not in meta.zeros
+    # Load continues; scheduler re-queries with the new computed count.
     fresh.num_computed_tokens = 2 * BLOCK
     n_ext2, is_async2 = conn.get_num_new_matched_tokens(fresh, 2 * BLOCK)
-    assert is_async2 and n_ext2 == 1 * BLOCK
-    conn.update_state_after_alloc(fresh, alloc(4, base=300), n_ext2)
+    assert is_async2 and n_ext2 == 2 * BLOCK
+    conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=300), n_ext2)
     meta2 = conn.build_connector_meta(sched_output({}))
-    assert len(meta2.restores["r2"]) == 1 + 3  # final chunk carries the tail
+    assert len(meta2.restores["r2"]) == 2 + 2  # final chunk carries the tail
+    assert meta2.zeros["r2"] == [390]
 
 
 def test_mixed_local_and_tier_resume():
@@ -239,23 +284,24 @@ def test_mixed_local_and_tier_resume():
     conn.on_new_request(fresh)
     # Scheduler reports 2 blocks already computed locally.
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 2 * BLOCK)
-    assert is_async and n_ext == 1 * BLOCK
+    assert is_async and n_ext == 2 * BLOCK
     # num_computed_tokens stays 0 while waiting (framework behavior).
-    conn.update_state_after_alloc(fresh, alloc(4, base=400), n_ext)
+    conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=400), n_ext)
     meta = conn.build_connector_meta(sched_output({}))
     ops = meta.restores["r5"]
-    # 1 attention block (position 2) + 3 tail states.
-    assert len(ops) == 1 + 3
+    # 2 attention blocks (positions 2, 3) + 2 mamba tail states.
+    assert len(ops) == 2 + 2
     targets = {b for _, b in ops}
-    assert 402 in targets
-    assert len([b for b in targets if b >= 490]) == 3
+    assert {402, 403} <= targets
+    assert {495, 496} <= targets
+    assert meta.zeros["r5"] == [490]
 
 
 def test_short_prompt_or_mismatch_misses():
     conn = make_connector()
     run_conversation(conn, "r1", 4)
     # Prompt ends exactly at the tail boundary: nothing left to compute.
-    exact = FakeRequest("r3", [h(i) for i in range(3)], num_tokens=3 * BLOCK)
+    exact = FakeRequest("r3", [h(i) for i in range(4)], num_tokens=4 * BLOCK)
     assert conn.get_num_new_matched_tokens(exact, 0) == (0, False)
     other = FakeRequest("r4", [h(50 + i) for i in range(6)], num_tokens=99)
     assert conn.get_num_new_matched_tokens(other, 0) == (0, False)
