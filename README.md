@@ -942,9 +942,13 @@ KV, prefix caching, MTP speculation, QuixiAI P2P driver. Exact-token harness
 
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
 | ---: | ---: | ---: | ---: |
-| 1 | 129.8 | 129.8 | 15 s |
+| 1 | 139.7 | 139.7 | 14 s |
 | 8 | 590.7 | 81.1 | 25 s |
 | 32 | 1,151.2 | 39.8 | 50 s |
+
+The c1 row is the median of four seeded runs; single-stream varies
+129.8–157.8 tok/s run-to-run with MTP draft-acceptance luck on the sampled
+text.
 
 Concurrency 32 is the measured peak for this profile; `max_num_seqs` is set
 there deliberately. Peak aggregate throughput scaled 2.8× over the

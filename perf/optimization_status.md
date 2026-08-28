@@ -12586,3 +12586,25 @@ The final architecture and why each piece is shaped the way it is:
   config. Campaign cumulative: 409.7 (bring-up) -> 1,151.2 = 2.8x with
   double the context, exact KV, and correct conversation behavior.
 - Raw: perf/results/2026-08-28/qwen38fn-bf16-baseline/.
+
+## 2026-08-28 - c1 variance check + KV policy sweep (bf16 everywhere)
+
+- c1 re-runs on deployed prod (seeds 43/44/45): 141.3 / 157.8 / 138.0 tok/s.
+  The baseline entry's 129.8 (seed 42) is a low outlier, not a bf16 cost:
+  single-stream spread is 129.8-157.8 across four seeds, driven by MTP
+  draft-acceptance on the sampled text. Median of four = 139.7; README uses
+  that with the spread noted. Raw: qwen38fn-bf16-baseline/bench_bf16_c1_rerun*.
+- Operator policy (2026-08-28): NO quantized main KV on any profile.
+  Flipped the five A100 DSV4 variants from kv_cache_dtype fp8 -> auto with
+  notes: their KV byte budgets were qualified at fp8, so the same bytes now
+  hold half the tokens - A100 requalification required before trusting the
+  old context/concurrency ceilings. All other profiles were already auto.
+  Exceptions on record: Metal fp8_ds_mla (kernel packed-layout requirement,
+  not a quant choice) and DSpark TurboQuant DRAFT KV (rejection sampling
+  verifies drafts against the target; draft precision cannot alter output).
+  Enforced by test_no_profile_quantizes_main_kv (56 profile tests green).
+- Standing directive recorded in CLAUDE.md + registry: CPU-offloaded KV
+  (HostTierConnector pinned-RAM tier) is the goal on ALL non-Metal
+  profiles once the mamba/GDN state-geometry fix lands; enable only with
+  on-box validation per platform. Metal will instead get NVMe-backed KV
+  offload later (unified memory; no host-RAM tier distinction).

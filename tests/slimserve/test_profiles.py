@@ -272,7 +272,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
-    assert tp2.engine["kv_cache_dtype"] == "fp8"
+    assert tp2.engine["kv_cache_dtype"] == "auto"  # bf16 main KV, policy 2026-08-28
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -285,7 +285,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
-    assert tp4.engine["kv_cache_dtype"] == "fp8"
+    assert tp4.engine["kv_cache_dtype"] == "auto"  # bf16 main KV, policy 2026-08-28
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -906,4 +906,26 @@ def test_every_profile_serves_with_tool_calling_and_thinking():
             )
             assert engine.get("enable_auto_tool_choice", True) is True, (
                 f"{profile_id}/{platform} disables automatic tool calling"
+            )
+
+
+def test_no_profile_quantizes_main_kv():
+    """Main KV is always bf16 (operator decision 2026-08-28).
+
+    Quantized main KV was implicated in multi-turn tracking errors on
+    Qwen3.8-Flash-Next; no profile may set a quantized kv_cache_dtype.
+    Draft-model KV (DSpark TurboQuant) is exempt because rejection
+    sampling verifies drafts against the target. The Metal fp8_ds_mla
+    packed cache is a kernel layout requirement and the one recorded
+    exception.
+    """
+    allowed_exceptions = {("dsv4-xxs-1", "metal"): "fp8_ds_mla"}
+
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
+            expected = allowed_exceptions.get((profile_id, platform), "auto")
+            assert dtype == expected, (
+                f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
+                "main KV must be bf16 (auto) on every profile"
             )

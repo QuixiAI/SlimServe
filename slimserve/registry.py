@@ -272,6 +272,14 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
 # recommended sampling (temperature 1.0 / top_p 0.95 / top_k 20, seeded for
 # reproducibility), never temperature 0.
 #
+# Main KV is ALWAYS bf16 (kv_cache_dtype auto) - no quantized main KV on
+# any profile (operator decision 2026-08-28; quantized KV was implicated
+# in multi-turn tracking errors on Qwen3.8-Flash-Next). Draft-model KV
+# (DSpark TurboQuant) is exempt: rejection sampling verifies drafts
+# against the target, so draft precision affects speed, never output.
+# The Metal fp8_ds_mla packed cache is a kernel layout requirement and
+# the one recorded exception (see test_no_profile_quantizes_main_kv).
+#
 # "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
 # GLM/Qwen one; templates ignore the name they do not use.
 _SERVING_DEFAULTS: dict[str, Any] = {
