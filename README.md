@@ -103,15 +103,18 @@ for each model family.
 
 ### Models
 
-Five architectures: [GLM-5.2-Vision][glm], [Kimi K3](#also-supported-kimi-k3-vision),
-[Muse-Glimmer-30B](#also-supported-muse-glimmer-30b-vision-apple-silicon), and
-[Qwen3.8-27B](#also-supported-qwen38-27b-vision-apple-silicon) with vision,
+Six architectures: [GLM-5.2-Vision][glm], [Kimi K3](#also-supported-kimi-k3-vision),
+[Muse-Glimmer-30B](#also-supported-muse-glimmer-30b-vision-apple-silicon),
+[Qwen3.8-27B](#also-supported-qwen38-27b-vision-apple-silicon), and
+[Qwen3.8-Flash-Next](#also-supported-qwen38-flash-next-rtx-3090) with vision,
 [DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only) text-only.
 GLM-5.2-Vision is what the ROCm/CUDA tuning targets, and DeepSeek-V4 and
-Kimi K3 reuse its kernels; Muse-Glimmer and Qwen3.8 are served by the
+Kimi K3 reuse its kernels; Muse-Glimmer and Qwen3.8-27B are served by the
 Metal stack with their own kernel work (fused gated-DeltaNet step, DFlash 2
-drafter kernels, hybrid cache pool). The [profile table](#quick-start) below
-has the GPU counts.
+drafter kernels, hybrid cache pool); Qwen3.8-Flash-Next is the RTX 3090
+target, serving its official FP8 checkpoint through Marlin W8A16
+expert-parallel MoE. The [profile table](#quick-start) below has the GPU
+counts.
 
 This is not general-purpose vLLM. Support for models, accelerators and
 quantization paths outside the ones above has been deleted so the rest can be
@@ -162,7 +165,8 @@ profile exists for exactly the platforms it is validated on — if it is
 listed for your platform it works there, and it refuses to resolve anywhere
 else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `q4ktail` = Q4K-tail, `mxfp4` =
 MXFP4, `q4k` = Q4_K, `q2k` = Q2_K, `kdyn` = K-quant dynamic (per-layer
-mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
+mixed), `q2kxl` = Unsloth dynamic Q2_K_XL, `fp8` = the official block-FP8
+checkpoint.
 
 | Profile | Model | GPUs | Runs on | Draft cache |
 | --- | --- | ---: | --- | --- |
@@ -180,6 +184,7 @@ mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
 | `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
 | `muse-kdyn-1` | Muse-Glimmer-30B | 1 | Apple Silicon | DFlash |
 | `qwen38-q2kxl-1` | Qwen3.8-27B | 1 | Apple Silicon | DFlash 2 |
+| `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (built-in) |
 | `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
 
 † The GLM Apple Silicon variant is described but not yet runnable. DeepSeek-V4
@@ -190,7 +195,8 @@ takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
 larger ones need 4 GPUs. Kimi K3 has one published quant. Muse-Glimmer takes
 `--quant kquant-dynamic|kquant-17gb`; Qwen3.8-27B has one published quant
 (Unsloth dynamic Q2_K_XL). Both are vision models served with their DFlash
-block-diffusion drafters. `slimserve --list`
+block-diffusion drafters. Qwen3.8-Flash-Next serves the official FP8
+checkpoint with its own single-layer MTP drafter. `slimserve --list`
 shows every profile and why any of them will not run here;
 `slimserve <profile> --dry-run` prints the resolved settings without loading
 anything.
@@ -583,6 +589,34 @@ prompts, where acceptance is high. The `qwen3_5` architecture also loads
 the HF safetensors checkpoint (`Qwen/Qwen3.8-27B`) directly, alongside the
 GGUF path.
 
+## Also supported: Qwen3.8-Flash-Next (RTX 3090)
+
+`Qwen/Qwen3.8-Flash-Next-FP8` — a 125B-A6B vision-language hybrid (Gated
+DeltaNet + Qwen Sparse Attention, 1-in-4 full attention, 4-branch gated
+residual) with 51 GiB of n-gram (PLE) embedding tables. This is the 8×
+RTX 3090 target:
+
+```bash
+slimserve qwen38fn-fp8-8 --serve
+```
+
+- **FP8 without FP8 hardware.** SM86 has no FP8 tensor cores, so the experts
+  run expert-parallel through Marlin W8A16 block-FP8 kernels (weight-only
+  decode to BF16 compute). Expert parallelism is a correctness requirement
+  here, not a tuning choice — the block scale geometry doesn't shard under TP.
+- **PLE tables in host RAM.** The full 47.7 GiB n-gram table stays pinned in
+  host memory per rank; the forward gathers 16 rows per token over UVA, inside
+  CUDA graph capture. GPU memory holds weights and KV only.
+- **Native 262,144-token context** with bf16 KV, prefix caching, and the
+  checkpoint's own single-layer MTP drafter.
+- **P2P driver strongly recommended.** Multi-GPU GeForce runs on the stock
+  driver but leaves 36–58% of throughput on the table; see
+  [docs/geforce-p2p.md](docs/geforce-p2p.md) for QuixiAI's patched
+  open-gpu-kernel-modules.
+
+Measured throughput is in [Performance](#8-rtx-3090--qwen38-flash-next-fp8)
+below.
+
 ## Apple Silicon
 
 Three models run through the in-tree PyTorch-MPS worker and the vendored
@@ -899,6 +933,25 @@ Speculation is always on in the shipped profiles; the plain row is the
 diagnostic reference. DeepSeek-V4 on Metal is under re-validation and its
 number is deliberately absent (the historical 33.7 tok/s was measured under
 a since-changed profile geometry; see `perf/baseline_status.md`).
+
+### 8× RTX 3090 — Qwen3.8-Flash-Next FP8
+
+`qwen38fn-fp8-8`, deployed configuration: native 262,144-token context, bf16
+KV, prefix caching, MTP speculation, QuixiAI P2P driver. Exact-token harness
+(1,000 in / 2,000 out per request, shipped sampling defaults, seeded):
+
+| Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 129.8 | 129.8 | 15 s |
+| 8 | 590.7 | 81.1 | 25 s |
+| 32 | 1,151.2 | 39.8 | 50 s |
+
+Concurrency 32 is the measured peak for this profile; `max_num_seqs` is set
+there deliberately. Peak aggregate throughput scaled 2.8× over the
+optimization campaign (409.7 tok/s at bring-up to 1,151.2 now) while the
+context ceiling doubled to the model's native 262K. On the stock NVIDIA driver (no GPU-GPU P2P) the same
+profile measures 36–58% lower — install the
+[P2P driver](docs/geforce-p2p.md).
 
 ### Benchmarking caveat
 
