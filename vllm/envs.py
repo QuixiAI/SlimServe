@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
+    VLLM_ADMISSION_MAX_CONCURRENT: int | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
@@ -751,6 +752,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # API key for vLLM API server
     "VLLM_API_KEY": lambda: os.environ.get("VLLM_API_KEY", None),
+    # Cap on concurrent in-flight generation requests per API-server process;
+    # requests beyond it get an immediate 429 instead of queueing. None = off.
+    "VLLM_ADMISSION_MAX_CONCURRENT": lambda: (
+        int(v) if (v := os.environ.get("VLLM_ADMISSION_MAX_CONCURRENT")) else None
+    ),
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
