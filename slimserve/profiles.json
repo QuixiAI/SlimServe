@@ -2088,7 +2088,14 @@
               "moe_backend": "auto",
               "linear_backend": "auto"
             },
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 64
+              }
+            }
           },
           "env": {
             "VLLM_QWEN4_EXP_PLE_HOST": "1",
@@ -2113,7 +2120,7 @@
             "VLLM_ADMISSION_MAX_CONCURRENT=96 caps total in-flight generation requests (decode slots plus engine queue) at 3x max_num_seqs; beyond that the API server answers 429 + Retry-After instead of letting the queue grow without bound. Measured at 64 concurrent sessions, oversubscription past 32 buys zero throughput (780.5 vs 779.7 tok/s) and only queueing delay (TTFT p50 40.2s vs 11.6s), so the cap exists to shed pathological load, not to police normal bursts: naive clients that burst to 60-90 requests still queue and complete. Non-generation routes (models, health, metrics) are never capped.",
             "Prefix caching is ON (TurboQuant main-KV + mamba cache mode 'align', correctness validated 2026-08-27: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity). The mamba-page alignment forces 1056-token cache blocks, so hits require shared prefixes of at least one full block: shallow chats (~2K histories) measured only a 2.2% hit rate for ~4% peak throughput, but deep multi-turn traffic is transformed - a 100K-token history is ~94 cached blocks and each turn re-prefills only the tail, versus re-paying the entire history every turn with caching off (measured: the engine degenerates to ~5K tok/s prefill / ~20 tok/s generation on deep conversations). Finer-grained caching needs decoupling the attention block from the mamba state snapshot (open kernel/allocator work).",
             "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Validated on rtx3090: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity.",
-            "Host KV tier (HostTierConnector) is BUILT BUT NOT ENABLED: attention block offload/restore is byte-verified correct end-to-end (SHA-checked, sub-second 42K restores, leak-free lifecycle), but the mamba align state groups do not share the attention block geometry at runtime (observed: 6 state positions vs 3 attention blocks for 1312 tokens despite the aligner reporting uniform block_size 400), so the connector's state-snapshot selection restores wrong-boundary states and deep evicted resumes can return garbled text. Re-enable with kv_transfer_config {'kv_connector': 'HostTierConnector', 'kv_role': 'kv_both', 'kv_connector_extra_config': {'host_tier_gb_per_rank': 64}} ONLY after the state-geometry fix; see perf/optimization_status.md 2026-08-28 entries for the full contract learned."
+            "Host KV tier (HostTierConnector, kv_transfer_config above) is ENABLED and validated on this box (2026-08-28): 64 GiB pinned host RAM per rank (512 GiB total) = ~12,146 block slots = ~4.8M tokens of evicted-conversation capacity behind the ~270K-token GPU pool. Tail states ride the engine's own frozen align-mode boundary snapshots (pool prefix cache, looked up by boundary hash - never live blocks); restores land at position k-1 per mamba group and the QSA ring is zeroed defensively. Validated: multi-depth marker-recall acceptance (8K/24K/42K restored sub-second after full GPU-pool eviction, outputs byte-identical to GPU-cache controls at 8K/24K), throughput-neutral (c1 133.6 / c8 599.4 / c32 1,149.7 vs 1,151.2 no-tier baseline). Known limitation: one tail per trajectory - a sibling re-ask after a deeper follow-up turn re-prefills instead of resuming (correct, just slower); resume boundaries exist at ~2K-token chunk ends, so sub-chunk (<2K) conversations are not tier-resumable (re-prefill is faster anyway). Raw: perf/results/2026-08-28/kv-tier/."
           ],
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true

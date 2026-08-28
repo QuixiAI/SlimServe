@@ -31,6 +31,7 @@ Config (kv_transfer_config.kv_connector_extra_config):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -201,6 +202,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 return remaining, True
         hit = self.index.lookup(request.block_hashes)
         if hit is None:
+            if logger.isEnabledFor(logging.DEBUG) and len(request.block_hashes) >= 8:
+                logger.debug(
+                    "host-tier: lookup miss for %s: %s",
+                    request.request_id[-8:],
+                    self.index.explain_miss(request.block_hashes),
+                )
             return 0, False
         n_blocks, attn_slots, state_slots = hit
         n_tokens = n_blocks * bs
@@ -443,27 +450,40 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         bs = self.hash_block_size
         if not self.state_groups or self._block_pool is None:
             return False, None
-        boundary = min(
+        max_boundary = min(
             request.num_computed_tokens // bs, len(request.block_hashes)
         )
-        if boundary <= 0:
+        if max_boundary <= 0:
             return False, None
-        boundary_hash = request.block_hashes[boundary - 1]
+        # Frozen states materialize only at positions that were a chunk-end
+        # column at some scheduling step (this fork's align mode keeps ONE
+        # live column per chunk; intermediate positions stay null and
+        # cache_full_blocks skips them). Scan down from the last full block
+        # to the deepest boundary every mamba group actually has cached; the
+        # gap above it (at most one prefill chunk) re-prefills on resume.
         targets: list[int] = []
-        for gid in self.state_groups:
-            cached = self._block_pool.get_cached_block(boundary_hash, [gid])
-            if not cached:
-                # Evicted before finish (pool pressure) or never crossed
-                # into cache; the tail is not resumable - skip the save.
-                logger.debug(
-                    "host-tier: no cached boundary state for %s group %d "
-                    "at block %d; skipping tail save",
-                    request.request_id[-8:],
-                    gid,
-                    boundary,
-                )
-                return False, None
-            targets.append(cached[0].block_id)
+        boundary = 0
+        scan_floor = max(1, max_boundary - 64)
+        for j in range(max_boundary, scan_floor - 1, -1):
+            cached = self._block_pool.get_cached_block(
+                request.block_hashes[j - 1], self.state_groups
+            )
+            if cached:
+                boundary = j
+                targets = [blk.block_id for blk in cached]
+                break
+        if boundary <= 0:
+            # Nothing cached in reach (short single-chunk request, or the
+            # states were evicted): the tail is not resumable - skip.
+            logger.debug(
+                "host-tier: no cached boundary state for %s within blocks "
+                "[%d, %d] (computed=%d); skipping tail save",
+                request.request_id[-8:],
+                scan_floor,
+                max_boundary,
+                request.num_computed_tokens,
+            )
+            return False, None
         owner = self._owner(request)
         slots = self.index.stage_tail_states(
             owner, boundary, len(self.state_groups)

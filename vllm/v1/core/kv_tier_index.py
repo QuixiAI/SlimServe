@@ -157,6 +157,43 @@ class HostKVTierIndex:
             self.touch(best_owner)
         return best
 
+    def explain_miss(self, hashes: list[BlockHash]) -> str:
+        """Diagnose why lookup(hashes) found nothing (debug aid)."""
+        if not hashes:
+            return "no hashes"
+        notes = []
+        for owner, traj in self._trajectories.items():
+            if not traj.hashes or traj.hashes[0] != hashes[0]:
+                continue
+            gap = next(
+                (
+                    i
+                    for i, s in enumerate(traj.attn_slots[: traj.tail_boundary])
+                    if s is None
+                ),
+                None,
+            )
+            mism = next(
+                (
+                    i
+                    for i in range(min(len(traj.hashes), len(hashes)))
+                    if traj.hashes[i] != hashes[i]
+                ),
+                None,
+            )
+            pend = [
+                s
+                for s in traj.attn_slots[: traj.tail_boundary]
+                if s in self._pending_write
+            ]
+            notes.append(
+                f"owner={owner[:12]} tail={traj.tail_boundary} "
+                f"tail_pending={traj.tail_pending} attn_len={len(traj.attn_slots)} "
+                f"first_gap={gap} hash_mismatch_at={mism} "
+                f"pending_attn={len(pend)} req_hashes={len(hashes)}"
+            )
+        return "; ".join(notes) or "no trajectory shares hashes[0]"
+
     def touch(self, owner: str) -> None:
         traj = self._trajectories.get(owner)
         if traj is not None:

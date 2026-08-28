@@ -184,6 +184,9 @@ behavior:
 - CPU-offloaded KV (the pinned-host-RAM tier, `HostTierConnector`) is the
   standing goal for ALL non-Metal profiles; Metal instead gets NVMe-backed
   KV offload later (unified memory makes a host-RAM tier meaningless
-  there). The tier ships disabled until the mamba/GDN state-geometry fix
-  lands; enable it per-platform only with on-box validation, never by
-  editing a profile for a machine the connector has not run on.
+  there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
+  (2026-08-28, mamba state-geometry fix landed: tail states are the
+  engine's frozen align-mode boundary snapshots). MI300X/A100 need the
+  connector generalized to their paged MLA layouts (issues #17/#18);
+  enable per-platform only with on-box validation, never by editing a
+  profile for a machine the connector has not run on.

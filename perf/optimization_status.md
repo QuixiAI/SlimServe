@@ -12608,3 +12608,42 @@ The final architecture and why each piece is shaped the way it is:
   profiles once the mamba/GDN state-geometry fix lands; enable only with
   on-box validation per platform. Metal will instead get NVMe-backed KV
   offload later (unified memory; no host-RAM tier distinction).
+
+## 2026-08-28 - Host KV tier: mamba state-geometry fix, VALIDATED, ENABLED
+
+- Root cause of the parked corruption: the tier saved mamba state by
+  POSITION among a request's live blocks, but align mode migrates state
+  forward in place - every resident block covers an unaligned token count,
+  and the "extra positions" were MTP speculative blocks. Restoring any of
+  them desynchronized state from the attention span (the garbled resumes).
+- Fix rides the engine's own machinery: at a boundary crossing align mode
+  freezes the boundary state, hashes it into the pool prefix cache, and
+  never rewrites it. The tail save looks that block up by boundary hash
+  (get_cached_block) and offloads the immutable snapshot; restore lands it
+  at position k-1, matching the worker's state_idx=(computed-1)//bs seed.
+  MambaManager external allocation now mirrors the internal-hit shape
+  ([null]*(k-1)+[real]). The QSA ring needs nothing (never framework-
+  zeroed; internal hits validate correct on stale-claimed rings at aligned
+  boundaries) - the tier zeroes it anyway for determinism.
+- Two more discoveries en route (TIER-DBG differential logging):
+  (1) frozen states materialize ONLY at chunk-end columns (~2000-token
+  scheduling chunks): one real column per chunk, intermediates stay null
+  and the cache watermark seals them forever -> the save now scans DOWN
+  from computed//400 to the deepest boundary all 4 mamba groups have
+  cached (<=1 chunk of re-prefill on resume). (2) ninja must be on PATH
+  for flashinfer JIT when launching manually (.venv/bin).
+- Acceptance (multi-depth marker recall, 8K/24K/42K, full GPU-pool
+  eviction via 6x55K fillers): restores fired sub-second at all depths
+  (42K: 0.5s vs 9.0s cold), outputs byte-identical to GPU-cache hot
+  controls at 8K/24K, correct recall at 42K (restored answered correctly
+  in a run where the hot control degenerated). Known limitation: one tail
+  per trajectory (sibling re-ask after a deeper follow-up re-prefills;
+  append-only agentic turns always reach the deepest tail).
+- Throughput with tier enabled (exact 1000/2000, seeded, port-8001 manual
+  server, same config as prod): c1 133.6 / c8 599.4 / c32 1,149.7 vs
+  no-tier baseline 129.8-157.8 / 590.7 / 1,151.2 -> NEUTRAL.
+- ENABLED in qwen38fn-fp8-8/rtx3090: 64 GiB pinned/rank = 12,146 slots
+  = ~4.8M tokens of evicted-conversation capacity. 75 tests green.
+  Platform ports tracked: MI300X #17, A100 #18, Metal NVMe #19.
+- Raw: perf/results/2026-08-28/kv-tier/ (acceptance_v2_final.log,
+  bench_tier_c*.log, serve_tier_fix*.log).

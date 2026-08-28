@@ -229,6 +229,34 @@ def test_missing_cached_boundary_skips_save():
     assert conn.index.stats()["resumable"] == 0
 
 
+def test_save_scans_down_to_deepest_cached_boundary():
+    """Align mode freezes one state per chunk-end column, so the final
+    400-block boundary is often uncached; the save must scan down to the
+    deepest boundary every mamba group has and stage the tail there."""
+    conn = make_connector()
+    pool = conn._block_pool
+    req = FakeRequest("rc", [h(i) for i in range(6)], num_tokens=6 * BLOCK + 4)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(6, planned=0), 0)
+    conn.build_connector_meta(sched_output({"rc": 6 * BLOCK}))
+    req.num_computed_tokens = 6 * BLOCK
+    conn.build_connector_meta(sched_output({"rc": 1}))
+    conn.build_connector_meta(sched_output({}))
+    # Chunk end fell at block 4: only boundary 4 (hash index 3) is cached.
+    for g, gid in enumerate((2, 3)):
+        pool.cached[(bytes(h(3)), gid)] = pool.blocks[70 + g]
+    conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    tail_meta = conn.build_connector_meta(sched_output({}))
+    assert {b for ops in tail_meta.offloads.values() for b, _ in ops} == {70, 71}
+    conn.build_connector_meta(sched_output({}))
+
+    fresh = FakeRequest("rd", [h(i) for i in range(6)], num_tokens=6 * BLOCK + 8)
+    conn.on_new_request(fresh)
+    n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
+    # Resumable at the scanned-down boundary, not the final block count.
+    assert is_async and n_ext == 4 * BLOCK
+
+
 def test_resume_round_trip():
     conn = make_connector()
     run_conversation(conn, "r1", 4)
