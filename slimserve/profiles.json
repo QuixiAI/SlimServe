@@ -2046,7 +2046,7 @@
             "enable_expert_parallel": true,
             "max_model_len": 262144,
             "max_num_seqs": 32,
-            "gpu_memory_utilization": 0.9,
+            "gpu_memory_utilization": 0.95,
             "kv_cache_dtype": "auto",
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -2066,7 +2066,8 @@
             "VLLM_QWEN4_EXP_PLE_HOST": "1",
             "NCCL_P2P_LEVEL": "SYS",
             "VLLM_GDN_DECODE_KERNEL": "triton",
-            "VLLM_QWEN4_EXP_TQ_MAIN_KV": "1"
+            "VLLM_QWEN4_EXP_TQ_MAIN_KV": "1",
+            "VLLM_ADMISSION_MAX_CONCURRENT": "96"
           },
           "notes": [
             "enable_expert_parallel is a correctness requirement, not a tuning choice: moe_intermediate_size is 640 and the FP8 block scales are [128, 128], so a TP shard of 80 cannot carry exact block scales. EP keeps 64 whole experts per rank (640 = 5 x 128).",
@@ -2080,7 +2081,10 @@
             "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
             "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps.",
             "min_host_ram_bytes gates this platform at 128 GiB system RAM: the 47.7 GiB n-gram (PLE) table is pinned ONCE in a /dev/shm segment shared by all TP ranks (not per rank), plus load staging and runtime headroom. A machine that passes the GPU gate but lacks the RAM fails at plan time instead of dying mid-load.",
-            "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range."
+            "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range.",
+            "gpu_memory_utilization 0.95, not 0.9: this hybrid's packed KV slab charges every running request ~13-14 blocks at chat context (QSA token blocks at 1056 tokens/block, one compressor ring block, 3 GDN state blocks at MTP k=2, plus the drafter's cache group), and at 0.9 the ~2.2 GiB/rank pool holds ~373 blocks = 27 requests -- the scheduler silently caps below max_num_seqs 32 with the KV meter at 100%. 0.95 sizes the pool for the full 32 with margin. Found by WildChat multi-turn replay (2026-08-27).",
+            "VLLM_ADMISSION_MAX_CONCURRENT=96 caps total in-flight generation requests (decode slots plus engine queue) at 3x max_num_seqs; beyond that the API server answers 429 + Retry-After instead of letting the queue grow without bound. Measured at 64 concurrent sessions, oversubscription past 32 buys zero throughput (780.5 vs 779.7 tok/s) and only queueing delay (TTFT p50 40.2s vs 11.6s), so the cap exists to shed pathological load, not to police normal bursts: naive clients that burst to 60-90 requests still queue and complete. Non-generation routes (models, health, metrics) are never capped.",
+            "Prefix caching is deliberately OFF. It was trialed (2026-08-27) with TurboQuant main-KV and mamba cache mode 'align': correctness is exact (byte-identical cached/uncached greedy outputs) and the KV capacity cost is only 1.5%, but the hybrid's mamba-page alignment forces 1056-token cache blocks and prefix caching reuses only complete blocks, so typical chat traffic measured a 2.2% hit rate for a 4% throughput cost. Flip 'enable_prefix_caching': true only for long-context multi-turn deployments whose shared histories span many 1056-token blocks, and re-bench in that regime first."
           ],
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true

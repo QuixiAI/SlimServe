@@ -12231,3 +12231,236 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   - glm52-xxs-1 remains registry-blocked on this 128 GiB box (needs
     256 GiB) -- unchanged.
 - Suites: 45 passed / 104 skipped.
+
+## 2026-08-27 - Production service + WildChat-1M multi-turn traffic replay (qwen38fn-fp8-8 via systemd)
+
+- Deployment: systemd unit slimserve-qwen38fn (Restart=always, boot-enabled,
+  logs to /var/log/SlimServe with logrotate, VLLM_API_KEY auth). Two install
+  faults found and fixed: (1) StandardOutput=append: opens the log file
+  BEFORE LogsDirectory= creates the directory -> 209/STDOUT crash loop;
+  fixed with a tmpfiles.d entry (deploy/slimserve.tmpfiles). (2) systemd
+  units do not source ~/.bashrc, so FlashInfer JIT warmup died with
+  FileNotFoundError: 'ninja'; fixed by putting venv bin + CUDA 13.3 bin on
+  PATH plus CUDA_HOME/LD_LIBRARY_PATH in /etc/slimserve/env. The rank-5/6
+  CUDACachingAllocator OOM warnings during weight load were a red herring -
+  the same non-fatal retry warnings appear 4000x in successful serve logs.
+- New harness: benchmarks/benchmark_wildchat_replay.py. Samples real
+  WildChat-1M conversations, replays user turns one at a time per session,
+  appends the model's OWN streamed replies to the history (real trajectory
+  growth), closed-loop session concurrency, per-turn TTFT/e2e/usage records.
+- Workload: 128 conversations, 504 user turns, mean 3.9 turns/session,
+  thinking on (deployment default), temp 1.0 / top_p 0.95 / top_k 20,
+  max_tokens 1024/turn, identical workload at both concurrencies.
+- Results (0 errors in 1,008 turns; service healthy throughout):
+  - c32: 779.7 out tok/s (1,470 total tok/s incl prefill), TTFT p50/p90
+    11.6/24.2 s, e2e p50 31.5 s, mean reply 813 tok.
+  - c64: 780.5 out tok/s (identical - saturated), TTFT p50/p90 40.2/55.3 s.
+    Oversubscription buys zero throughput, only 3.5x TTFT: the profile's
+    c32 operating point is the right admission cap.
+- FINDING (open): effective concurrency ceiling is 27, not 32. Engine logs
+  show Running peaks at 27 with GPU KV cache usage 100% and a 5-6 deep
+  waiting queue even at c32, while the token pool (386,212 tokens) is far
+  from full on token count alone (~80K live tokens). Hypothesis: the
+  per-request fixed-size GDN recurrent-state group inside the 2.2 GiB/rank
+  KV budget exhausts at 27 slots. Impact: the c32 campaign numbers were
+  really c27+queue; a modest KV budget bump (util 0.9 -> 0.92, or trimmed
+  capture list) should recover true 32-slot decode. Follow-up: inspect
+  kv_cache_groups sizing, re-bench c32.
+- Comparison to synthetic baseline: exact-token c32 = 881.6 out tok/s;
+  real-traffic c32 = 779.7 out tok/s (-11.6%), explained by per-turn
+  full-history re-prefill (prefix caching disabled; hit rate 0.0%), short
+  replies (813 vs 2000 tok), and client-side turn turnaround. Total
+  processed throughput 1,470 tok/s. Multi-turn traffic is the first
+  workload where enable_prefix_caching=False visibly costs: depth-8 turns
+  re-prefill ~2K tokens every turn.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (warmup.json,
+  c32.json, c64.json, stdouts).
+
+## 2026-08-27 - 27-slot ceiling fixed (+27% c32); admission control shipped; short-prompt correctness bug found
+
+- Ceiling root cause (from WildChat replay finding): the packed CSA+linear
+  KV slab at util 0.9 held ~373 blocks/rank (2.23 GiB); each running chat
+  request pins ~13-14 blocks (attn pages at block_size 1056 + compressor
+  ring + 3 GDN state blocks at k=2 + drafter group), capping Running at 27
+  with the KV meter at 100%. util 0.9 was leaving ~1.2 GiB/rank idle.
+- Fix: gpu_memory_utilization 0.9 -> 0.95 in qwen38fn-fp8-8/rtx3090.
+  Pool: 2.23 -> 3.41 GiB, 386,212 -> 590,324 tokens, max concurrency
+  1.47x -> 2.25x. Validated on a manual serve (port 8001, no QA traffic):
+  c1 131.7 (baseline band unchanged), c32 1115.6 vs 881.6 = +26.5%,
+  Running peaks at the full 32 with Waiting 0 and KV peak 86.9%.
+  New baseline candidate; bench logs bench_ceilingfix_c{1,32}.log.
+- Admission control: new AdmissionControlMiddleware (api_server, env
+  VLLM_ADMISSION_MAX_CONCURRENT, profile sets 96 = 3x max_num_seqs) sheds
+  load past a bounded queue with 429 + Retry-After. Verified: burst of 120
+  -> exactly 96 admitted + 24 rejected. Unit tests
+  tests/entrypoints/test_admission_control.py (3 green).
+- OPEN CORRECTNESS BUG (found by the 120-burst, reproduced at c1): prompts
+  of exactly 1 or 3 tokens produce garbage ('!!!!' = token 0 = NaN-logits
+  signature) NONDETERMINISTICALLY at temperature 0 (n=3 gave ' at'/' in'/'!'
+  across identical runs). n=2 and n>=4 are always correct (mapped n=1..12
+  with fixed content). n=1 garbage from the first sampled token (prefill
+  broken); n=3 sometimes-good first token then garbage (decode also
+  implicated). Draft acceptance collapses to 1.2% in the same regime.
+  One of two 120-burst runs escalated to a fatal CUDA illegal memory access
+  (crash log serve_manual_8001_crash1.log) - consistent with the campaign's
+  intermittent illegal-access watch flag: reads of uninitialized/unmapped
+  memory that usually land in mapped garbage and occasionally fault.
+- PLE dilated short-conv (kernel 4, dilation 3 = ngram_size, state 9) prefill
+  math reviewed and looks correct; parity {1,3} does not match dilation-3
+  residues, so conv is not the prime suspect. Current A/B in flight: same
+  config without speculative_config (suspect: drafter KV/state writes for
+  packed-layout backends, cf. commit b4cc16492) - if no-spec is clean, the
+  drafter path is the fault; else next A/B is VLLM_QWEN4_EXP_TQ_MAIN_KV=0.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (crash logs,
+  repro_burst.py, serve_nospec_8001.log).
+
+## 2026-08-27 - Short-prompt garbage + burst crash root-caused and fixed (two bugs)
+
+- Isolation matrix (spec x cudagraphs, manual servers on 8001): n=3 garbage
+  requires spec+FULL graphs; n=1 garbage persists in every combination.
+  Logprobs showed CONFIDENT distributions over wrong context (n=1 continued
+  an ASCII run: capture-dummy arange content), and greedy outputs were
+  nondeterministic -> uninitialized-memory reads, not NaNs.
+- Bug B (n=3, spec+graphs): batch shape alone chose the graph family. A
+  fresh 3-token prompt has the same shape as a k=2 spec-decode step
+  (uniform 3 tokens/req), so dispatch replayed the FULL spec-decode graph
+  over prefill work, reading sampled-token/state slots the request never
+  wrote. This is also the 120-burst engine killer ("Say hi." = 3 tokens
+  x 96 requests; 1-in-2 runs escalated to a fatal CUDA illegal access).
+  FIX: model_runner dispatch gate - a shape-uniform batch is only
+  graph-eligible if no scheduled request is still prefilling
+  (num_computed_prefill < prefill_len, O(num_reqs) numpy/dict check).
+- Bug A (n=1, everywhere): decode/prefill classification by query length.
+  The GDN builder split with plain qlen==1 (split_decodes_and_prefills
+  without treat_short_extends_as_decodes=False, unlike the mamba base
+  builder which already passes it), so a fresh 1-token prompt took the
+  GDN DECODE path (fused packed decode / causal_conv1d_update), which
+  reads conv+SSM state slots unconditionally - uninitialized for a
+  never-prefilled request. Same latent defect in the GDN spec-branch
+  manual count and the short-conv spec-branch masks.
+  FIX: gdn_attn non-spec split now passes
+  treat_short_extends_as_decodes=False; gdn spec-branch count and
+  short_conv spec-branch masks exclude is_prefilling rows (reorder
+  already places them behind true decodes, so contiguous splits hold).
+- Validation on the full production config (spec k=2, FULL graphs, TQ,
+  util 0.95, admission 96): n=1..12 all correct and DETERMINISTIC at
+  temp 0 (3 runs each); 3x 120-burst rounds of 3-token prompts all
+  survived (96x200 + 24x429 each); draft acceptance on short-prompt
+  bursts recovered 1.2% -> 58.0%. Dispatcher + admission suites green.
+  Perf re-check c1/c32 in flight (dispatch gate only affects batches
+  containing mid-prefill requests; steady decode untouched).
+- Logs: serve_{nospec,nograph,fixed}_8001.log, crash1/2 logs, repro_burst.py
+  under perf/results/2026-08-27/qwen38fn-service-wildchat/.
+
+## 2026-08-27 - PLE dilated-conv prefill OOM under multi-turn waves at util 0.95; sliced transient fix
+
+- First prefix-caching trial server (TQ + mamba 'align', util 0.95) passed
+  the single-stream correctness gate (byte-identical cached/uncached greedy
+  outputs, incl. n=1..8 short prompts and a 700-token shared-prefix chat
+  shape; mamba-align KV cost only 590,324 -> 581,447 tokens, -1.5%) but the
+  ENGINE OOM-crashed under the WildChat c32 replay: torch.OutOfMemoryError
+  allocating 148 MiB in _short_conv_dilated_prefill_batched.
+- Root cause is NOT prefix caching: the PLE dilated short-conv prefill packs
+  requests into ~5 dense [num_prefills, max_query_len, hidden] transients
+  (~1.7 GB for a 31 x ~2K-token turn wave at hidden 2560), which fit inside
+  the activation slack at util 0.9 but not at 0.95. The exact-token bench
+  (uniform 1000-token prompts, fewer concurrent prefills) never triggers
+  it -- so the shipped util-0.95 profile was exposed for ANY multi-turn
+  workload, prefix caching or not.
+- Fix: slice the packed conv pipeline over request chunks bounded by a
+  16M-element budget (single-pass fast path preserved; token selection via
+  sync-free masked gathers; per-slice state update). PLE suite 5/5 green.
+- Trial-2 relaunched: correctness gate + WildChat c32 replay on the fixed
+  build; ship/revert decision on its results.
+
+## 2026-08-27 - Prefix-caching trial verdict: correct but not shipped (1056-token blocks starve the hit rate)
+
+- Trial-2 (post PLE-slicing fix): correctness gate PASS twice (byte-identical
+  cached/uncached greedy outputs incl. short prompts and shared-prefix chat
+  shapes); WildChat c32 replay 504/504 turns, 0 errors - the OOM fix holds
+  on the exact workload that killed trial-1.
+- Measured benefit: prefix cache hit rate 2.2-2.4%. Root cause is
+  structural: the hybrid's mamba-page alignment forces block_size 1056, and
+  prefix caching reuses only COMPLETE blocks, so typical chat histories
+  (195-1,738 prompt tokens across depths 1-8 in this workload) rarely
+  finish even one shared block. Throughput 746.2 vs ~780 out tok/s (-4%),
+  mamba-align KV capacity cost -1.5%.
+- DECISION: not shipped as profile default. enable_prefix_caching remains
+  off; documented as a valid option for long-context multi-turn deployments
+  (10K+ token histories span many 1056-token blocks) pending a bench in
+  that regime. Raw: c32_prefixcache.json, serve_prefixcache_8001.log.
+- Final sweep: 104 tests green (slimserve profiles, cudagraph dispatch,
+  admission control, PLE host table, config-view invariant).
+
+## 2026-08-27 - c64 retest after the slot fix: 32 remains the peak, now for an honest reason
+
+- Motivation: the earlier "no gain past 32" verdict was measured while the
+  engine silently capped at 27 slots, so it had to be retested.
+- seqs=32/capture=96 (shipped config): c48 = 1056-1067 over three clean
+  rounds (vs 1134 at c32) - beyond 32 the client queue costs a little and
+  buys nothing, because decode batches above 32 seqs (>96 tokens) exceed
+  the graph ceiling and run eager.
+- seqs=40/capture=128 (proper >32 config): c32 987 / c40 1065 / c48 1077,
+  no crashes. Still below the shipped config's 1134 peak: the packed-slab
+  KV pool's fixed per-request cost (~90 MB/rank) binds at ~36 concurrent,
+  so extra slots trade graph efficiency for pool pressure. The wider
+  capture config also regresses c32 itself by 13%.
+- DECISION: profile stays at max_num_seqs 32 / capture 96; the c32 peak
+  (1,134.4) is now measured with all 32 slots genuinely active.
+- OPEN (top watch item): intermittent CUDA illegal-instruction race in
+  COMPILED-EAGER mixed spec+prefill batches. Repro: exact bench c48 on the
+  shipped config, ~1-in-4 runs (first hit dumped a 10-req mixed batch at
+  28% KV, no preemption; crash log serve_c64test_8001.log). Hidden by
+  CUDA_LAUNCH_BLOCKING=1 (960 tok/s c48 fully serialized, no crash);
+  today's classification/gate/PLE edits verified no-ops for the crashing
+  batch shape, and 3x c48 + all graphed seqs40 runs survived - consistent
+  with the campaign's pre-existing 2-in-6 watch-flag, which now has a
+  repro recipe. Suspect surface: stream ordering in the mixed-batch
+  metadata/state path; async_tensor_h2d itself audited stock-safe.
+  Production c32 exposure unchanged from the entire campaign (mixed
+  batches occur at any concurrency; crash observed only under the c48
+  stress shape so far).
+
+## 2026-08-27 - Crash-hunt update: burst crash attributed to the FIXED dispatch bug; soak hunting the one residual
+
+- Re-reading crash dumps: crash-1 (120-burst engine death) ran on PRE-fix
+  code and its dumped batch is a uniform 32x3=96-token spec-graph replay
+  containing fresh 3-token prompts - exactly bug B (shape-matched dispatch
+  into the spec-decode graph family), already fixed and regression-tested.
+  Attributed, closed.
+- Crash-2 (c48 bench warmup, post-fix) is the only unexplained instance:
+  a 2048-token mixed batch (7 spec decodes + 2 new prefills + 1 chunk
+  continuation) saturating the chunked-prefill budget, which is also the
+  compile_ranges endpoint; ALL TP ranks faulted simultaneously (illegal
+  address on one rank, illegal instruction on another - one wild-pointer
+  event, rank-local views), implicating TP-replicated inputs. Post-fix
+  rate: 1 in ~25 crash-shaped exposures; synthetic churn (135 waves), 10
+  warmup-shape bench loops, and 8 chunk-512-amplified loops all clean;
+  CUDA_LAUNCH_BLOCKING run clean (weak evidence - serialization changes
+  batch formation). Static audit cleared async H2D lifetime, output/draft
+  copy streams, QSA gather + store masking, fused-GDN (not on the shape).
+- Soak in flight: detached loop of the only crashing workload (c48
+  1000/2000, standard config), auto-preserving each crash's serve log +
+  SchedulerOutput dump, relaunching between crashes (soak_hunt.sh; quota
+  4 crashes or 5 h).
+
+## 2026-08-28 - Crash-hunt closed: 149-run soak, zero crashes; residual bounded below ~1.5%
+
+- Soak: 149 consecutive c48 exact-bench runs (1000 in / 2000 out, the only
+  workload that ever crashed post-fix) over ~4.7 h on the shipped profile
+  config, warm engine throughout. ZERO crashes, zero errors. A post-fix
+  crash rate above ~1.5%/run is excluded at high confidence.
+- Final attribution: crash-1 (120-burst) = bug B (fresh 3-token prompts
+  replayed through the spec-decode graph family), fixed and
+  regression-tested same day. Crash-2 = a single unexplained sub-1% tail
+  event on a cold server's first traffic; never recurred across 149 warm
+  + several cold exposures. Plausible non-software contribution noted:
+  no ECC on 3090s, and on the P2P fabric one rank's wild write can land
+  in a peer's mapped BAR, which would produce exactly the observed
+  all-ranks-simultaneous fault from a single event.
+- Standing recipe if it recurs: soak_hunt.sh loops the workload,
+  auto-preserves each crash's serve log + SchedulerOutput dump, and
+  relaunches; the engine's dump_input fires on every engine death, so any
+  production recurrence self-documents in /var/log/SlimServe/serve.log.
+- Status: CLOSED as monitored. Production restored to QA on the fixed
+  profile (util 0.95, admission 96, all correctness fixes).

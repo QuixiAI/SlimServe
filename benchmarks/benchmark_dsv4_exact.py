@@ -175,9 +175,12 @@ def request_completion(
             "ignore_eos": True,
         }
     ).encode()
-    request = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    # Servers started with an API key (VLLM_API_KEY) require the bearer token.
+    api_key = os.environ.get("SLIMSERVE_BENCH_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(url, data=body, headers=headers)
     started = time.perf_counter()
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = json.load(response)
