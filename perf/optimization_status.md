@@ -16845,3 +16845,14 @@ The final architecture and why each piece is shaped the way it is:
   (the 2026-08-28 flip to auto was never A100-validated and halved their
   token pools); each carries a note to flip only with an on-box
   requalification pass. The -tq Metal variant stands as shipped.
+
+## 2026-08-29 - Post-merge prod bounce: one CUDA/Metal seam fix, then healthy
+
+- First boot of the merged tree crashed in warmup: run_fused_postprocess_align
+  copy 32 vs 33 - the Metal campaign grew the shared num_accepted_tokens_gpu
+  by one trailing MPS sentinel slot (max_num_reqs + 1), while the CUDA align
+  context's whole-buffer snapshot stayed at max_num_reqs. Fixed by sizing
+  num_accepted_tokens_out to match, comment ties the two allocations.
+- Service healthy on the merged code: host tier arena registered (12,146
+  slots x 64 GiB/rank), reasoning_effort low live (trivial turn answered
+  with 0 thinking tokens), c8 spot bench 590.7 tok/s (= the 590.7 baseline).
