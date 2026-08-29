@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
+from vllm.platforms import current_platform
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
@@ -66,11 +67,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        layer.logical_widths = output_partition_sizes
-        layer.input_size_per_partition = input_size_per_partition
-        layer.output_size_per_partition = output_size_per_partition
-        layer.orig_dtype = params_dtype
-        layer.weight_block_size = None
+        layer.logical_widths = output_partition_sizes  # type: ignore[assignment]
+        layer.input_size_per_partition = input_size_per_partition  # type: ignore[assignment]
+        layer.output_size_per_partition = output_size_per_partition  # type: ignore[assignment]
+        layer.orig_dtype = params_dtype  # type: ignore[assignment]
+        layer.weight_block_size = None  # type: ignore[assignment]
 
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.weight_block_size is not None
@@ -93,10 +94,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
 
         # WEIGHT SCALE
         weight_scale = create_fp8_scale_parameter(
-            STRATEGY_TO_PARAMETER_TYPE[self.strategy],
+            STRATEGY_TO_PARAMETER_TYPE[self.strategy],  # type: ignore[arg-type]
             output_partition_sizes,
             input_size_per_partition,
-            layer.weight_block_size,
+            layer.weight_block_size,  # type: ignore[arg-type]
             weight_loader,
         )
         layer.register_parameter("weight_scale", weight_scale)
@@ -112,8 +113,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         self.linear_kernel = init_wfp8_a16_linear_kernel(
             weight_quant_key=self.weight_quant_key,
             activation_quant_key=self.activation_quant_key,
-            weight_shape=layer.weight.shape,
-            input_dtype=self.input_dtype,
+            weight_shape=layer.weight.shape,  # type: ignore[arg-type]
+            input_dtype=self.input_dtype,  # type: ignore[arg-type]
             out_dtype=self.out_dtype,
         )
 
@@ -125,9 +126,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             # Rename by deleting the old parameter and adding the new one so
             # that prepare_fp8_layer_for_marlin (which prefers "weight_scale"
             # over "weight_scale_inv") picks up "weight_scale_inv" correctly.
-            weight_scale_data = layer.weight_scale.data
+            weight_scale_data = layer.weight_scale.data  # type: ignore[union-attr, arg-type]
             del layer._parameters["weight_scale"]
-            replace_parameter(layer, "weight_scale_inv", weight_scale_data)
+            replace_parameter(layer, "weight_scale_inv", weight_scale_data)  # type: ignore[arg-type]
         else:
             if self.strategy == QuantizationStrategy.TENSOR:
                 # For fused modules with per-tensor scales, expand each scale
@@ -135,18 +136,24 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 replace_parameter(
                     layer,
                     "weight_scale",
-                    convert_to_channelwise(layer.weight_scale, layer.logical_widths),
+                    convert_to_channelwise(
+                        layer.weight_scale,  # type: ignore[arg-type]
+                        layer.logical_widths,  # type: ignore[arg-type]
+                    ),
                 )
                 self.strategy = QuantizationStrategy.CHANNEL
                 self.weight_quant_key = STRATEGY_TO_WEIGHT_QUANT_KEY[self.strategy]
                 self.linear_kernel.config.weight_quant_key = self.weight_quant_key
 
-            # Canonicalize to (K, N) for the kernel.
-            replace_parameter(layer, "weight", layer.weight.t())
-            # Preserve the dim tags dropped by the transpose so layout-aware
-            # kernels see (K, N).
-            layer.weight.input_dim = 0
-            layer.weight.output_dim = 1
+            if not current_platform.is_metal():
+                # Canonicalize to (K, N) for the kernel. Metal keeps the
+                # checkpoint's row-major (N, K): its GEMV host binding
+                # asserts contiguity and reads rows.
+                replace_parameter(layer, "weight", layer.weight.t())  # type: ignore[operator, arg-type]
+                # Preserve the dim tags dropped by the transpose so
+                # layout-aware kernels see (K, N).
+                layer.weight.input_dim = 0  # type: ignore[union-attr]
+                layer.weight.output_dim = 1  # type: ignore[union-attr]
 
         self.linear_kernel.process_weights_after_loading(layer)
 

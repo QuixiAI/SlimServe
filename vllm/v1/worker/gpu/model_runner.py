@@ -117,6 +117,10 @@ from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.thinking_budget import (
+    ThinkingBudgetState,
+    reasoning_markers_are_single_token,
+)
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
@@ -132,6 +136,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.metal_phaseprof import phase as _qc_phase
+from vllm.v1.worker.metal_phaseprof import wrap as _qc_phase_wrap
 from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 
 logger = init_logger(__name__)
@@ -261,6 +266,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
+        self.thinking_budget_state: ThinkingBudgetState | None = None
         self.rejection_sampler: RejectionSampler | None = None
         self.prompt_logprobs_worker: PromptLogprobsWorker | None = None
         self.structured_outputs_worker: StructuredOutputsWorker | None = None
@@ -374,6 +380,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
+            # Hard thinking-token budget enforcement (single-token reasoning
+            # markers only); rides the grammar-bitmask logits seam, so it is
+            # async-safe and spec-decode-correct. See thinking_budget.py.
+            reasoning_config = self.vllm_config.reasoning_config
+            if reasoning_markers_are_single_token(reasoning_config):
+                self.thinking_budget_state = ThinkingBudgetState(
+                    self.max_num_reqs, self.device, reasoning_config
+                )
+            else:
+                self.thinking_budget_state = None
             self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
@@ -489,9 +505,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # speculative tokens
                 if isinstance(layer_spec, MambaSpec):
                     max_num_blocks = (
-                        max_num_blocks
-                        if self.cache_config.enable_prefix_caching
-                        else 1
+                        max_num_blocks if self.cache_config.enable_prefix_caching else 1
                     ) + layer_spec.num_speculative_blocks
             max_num_blocks_per_group.append(max_num_blocks)
 
@@ -553,7 +567,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_caches: list[torch.Tensor] = []
         kv_caches_dict = init_kv_cache(
-            self.kv_caches,
+            self.kv_caches,  # type: ignore[arg-type]
             self.compilation_config.static_forward_context,
             self.kv_cache_config,
             self.attn_groups,
@@ -625,7 +639,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens=np.array(num_tokens_per_request, dtype=np.int32),
-            num_sampled_tokens=None,
+            num_sampled_tokens=None,  # type: ignore[arg-type]
             remove_lora=True,
             num_active_loras=max_loras,
         ):
@@ -892,6 +906,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.add_request(
                     req_index, prompt_len, new_req_data.sampling_params
                 )
+                if self.thinking_budget_state is not None:
+                    self.thinking_budget_state.add_request(
+                        req_index,
+                        new_req_data.prompt_token_ids,
+                        new_req_data.sampling_params,
+                    )
                 assert self.prompt_logprobs_worker is not None
                 self.prompt_logprobs_worker.add_request(
                     req_id, req_index, new_req_data.sampling_params
@@ -908,6 +928,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # the async pipeline.
             if self.sampler is not None:
                 self.sampler.apply_staged_writes()
+                if self.thinking_budget_state is not None:
+                    self.thinking_budget_state.apply_staged_writes()
 
     def update_requests(self, scheduler_output: SchedulerOutput) -> None:
         # Add new blocks and update num_computed_tokens for the existing requests.
@@ -1283,6 +1305,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
+        if self.thinking_budget_state is not None:
+            # Same seam as the grammar bitmask: forcing the reasoning-end
+            # token on exhausted rows works for both the plain sampler and
+            # the rejection sampler (a masked verify row rejects any draft
+            # token that disagrees).
+            self.thinking_budget_state.apply_mask(logits, input_batch)
+
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
@@ -1297,7 +1326,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
-        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+        if self.thinking_budget_state is not None:
+            assert sampler_output.num_sampled is not None
+            self.thinking_budget_state.update_state(
+                input_batch,
+                sampler_output.sampled_token_ids,
+                sampler_output.num_sampled,
+            )
+
+        return (
+            sampler_output,
+            sampler_output.num_sampled,  # type: ignore[return-value]
+            sampler_output.num_rejected,
+        )
 
     def postprocess_sampled(
         self,
@@ -1331,6 +1372,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    @_qc_phase_wrap("execute_model")
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1488,7 +1530,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     scheduled_encoder_inputs, input_batch, self.req_states
                 )
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
-                input_ids = None
+                input_ids = None  # type: ignore[assignment]
 
         model_inputs = {
             "input_ids": input_ids,
@@ -1588,9 +1630,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
-            num_spec_tokens_to_schedule=(
-                scheduler_output.num_spec_tokens_to_schedule
-            ),
+            num_spec_tokens_to_schedule=(scheduler_output.num_spec_tokens_to_schedule),
         )
 
         if not self.is_last_pp_rank:
@@ -1600,6 +1640,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     @step_eplb_after()
+    @_qc_phase_wrap("sample_tokens")
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
@@ -1682,8 +1723,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
         )
 
+        # Dynamic SD (num_speculative_tokens_per_batch_size): the scheduler
+        # computed zero draft slots for the next step at this batch size, so
+        # the drafter forward is skipped entirely and the scheduler must see
+        # zero drafts rather than stale ones. On this (sync-scheduler) path
+        # only K == 0 gates; intermediate K values are not trimmed.
+        skip_drafting = self.speculator is not None and num_spec_scheduled == 0
+
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        if (
+            self.speculator is not None
+            and not skip_drafting
+            and self.speculator.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1713,10 +1765,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled,
                 grammar_output,
             )
-            draft_grammar = self.draft_structured_output_state.begin_draft(input_batch)
+            if not skip_drafting:
+                # begin_draft arms per-request grammar state for the draft
+                # about to run; batch-adaptive spec skips both together.
+                draft_grammar = self.draft_structured_output_state.begin_draft(
+                    input_batch
+                )
 
         drafted_this_step: torch.Tensor | None = None
-        if self.speculator is not None:
+        if self.speculator is not None and not skip_drafting:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1771,16 +1828,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The handed-over width is the draft count the scheduler will
             # verify next step; the speculator branch above kept the
             # un-padded [reqs, k] tensor for exactly this (avoiding a
-            # sliced advanced-index read on the persistent buffer).
-            if drafted_this_step is not None:
+            # sliced advanced-index read on the persistent buffer). Under a
+            # skipped draft (K == 0: batch-adaptive schedule or the
+            # acceptance throttle) the handler gets a zero-width view, so
+            # the scheduler runs the next step as pure decode.
+            if skip_drafting:
+                handler_drafts = self.req_states.draft_tokens[input_batch.idx_mapping][
+                    :, :0
+                ]
+            elif drafted_this_step is not None:
                 handler_drafts = drafted_this_step
             else:
-                handler_drafts = self.req_states.draft_tokens[
-                    input_batch.idx_mapping
-                ]
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch, handler_drafts
-            )
+                handler_drafts = self.req_states.draft_tokens[input_batch.idx_mapping]
+            self.draft_tokens_handler.set_draft_tokens(input_batch, handler_drafts)
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
@@ -1829,7 +1889,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert self.pooling_runner is not None
         pooler_output, is_valid = self.pooling_runner.pool(
-            hidden_states, input_batch, self.req_states
+            hidden_states,  # type: ignore[arg-type]
+            input_batch,
+            self.req_states,
         )
 
         # Build the model runner output.
@@ -1921,8 +1983,9 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
-    # Dynamic speculative decoding: the scheduler's k for this step
-    # (0 -> use the configured maximum).
+    # Dynamic speculative decoding: the scheduler's k for this step. The
+    # real scheduler always sets it; 0 means a skipped draft (the runner
+    # skips the drafter forward and hands the scheduler zero-width drafts).
     num_spec_tokens_to_schedule: int = 0
 
 

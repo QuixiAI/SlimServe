@@ -50,10 +50,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=_concurrency, required=True)
     parser.add_argument("--input-tokens", type=int, default=1000)
     parser.add_argument("--output-tokens", type=int, default=2000)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--seed", type=int)
+    # Sampling: greedy/temp-0 is banned stack-wide. When these are left
+    # unset the request omits them, so the server applies the model's
+    # SHIPPED generation_config defaults; the default seed keeps runs
+    # deterministic and sha-pinnable under real sampling. Every value is
+    # still overridable for diagnostics, but never silently greedy.
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--allow-no-spec",
         action="store_true",
@@ -155,26 +160,29 @@ def request_completion(
     prompt: str,
     output_tokens: int,
     timeout: float,
-    temperature: float,
-    top_p: float,
-    top_k: int,
+    temperature: float | None,
+    top_p: float | None,
+    top_k: int | None,
     seed: int | None,
 ) -> dict[str, object]:
-    body = json.dumps(
-        {
-            "model": served_model_name,
-            "prompt": prompt,
-            "max_tokens": output_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "seed": seed,
-            "stream": False,
-            # vLLM honors this extension. DS4 may ignore it until its server
-            # adapter exposes the same benchmark control.
-            "ignore_eos": True,
-        }
-    ).encode()
+    payload: dict[str, object] = {
+        "model": served_model_name,
+        "prompt": prompt,
+        "max_tokens": output_tokens,
+        "seed": seed,
+        "stream": False,
+        # vLLM honors this extension. DS4 may ignore it until its server
+        # adapter exposes the same benchmark control.
+        "ignore_eos": True,
+    }
+    # Omitted knobs fall through to the model's shipped generation_config.
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if top_k is not None:
+        payload["top_k"] = top_k
+    body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
     # Servers started with an API key (VLLM_API_KEY) require the bearer token.
     api_key = os.environ.get("SLIMSERVE_BENCH_API_KEY")

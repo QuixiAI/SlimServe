@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom normalization layers."""
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +14,10 @@ from vllm import envs, ir
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.batch_invariant import rms_norm_batch_invariant
+
+# Fused Metal add+RMSNorm on the residual seams (kill switch; see
+# RMSNorm.forward_mps).
+_QC_ADDNORM = os.environ.get("VLLM_QC_ADDNORM", "1") != "0"
 
 logger = init_logger(__name__)
 
@@ -115,6 +121,24 @@ class RMSNorm(CustomOp):
 
         hidden = x.shape[-1]
         if residual is not None:
+            # Fused add+norm kernel: one dispatch and one less hidden-state
+            # round trip than the eager add + rms_norm pair, bit-identical
+            # output (the kernel rounds the sum once and norms the rounded
+            # values, exactly like this chain). VLLM_QC_ADDNORM=0 restores
+            # the two-dispatch path.
+            if (
+                _QC_ADDNORM
+                and x.dim() == 2
+                and x.is_contiguous()
+                and residual.dim() == 2
+                and residual.is_contiguous()
+                and residual.dtype == torch.bfloat16
+                and quixicore_ops.has("add_rms_norm")
+            ):
+                out, res_sum = quixicore_ops.add_rms_norm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+                return out, res_sum
             residual = residual + x
             out = quixicore_ops.rms_norm(
                 residual.reshape(-1, hidden).contiguous(),
@@ -195,6 +219,50 @@ class GemmaRMSNorm(CustomOp):
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
+    def forward_mps(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Single-dispatch QuixiCore Metal kernels with Gemma semantics
+        # (fp32 (1 + w) multiply, single final round). The eager native
+        # path decomposes into ~10 MPS ops per call and the Qwen3.5
+        # target hits it 128x per decode step. Parity vs the ir chain is
+        # reduction-order ulps (same protocol as RMSNorm.forward_mps);
+        # VLLM_QC_ADDNORM=0 restores the eager path.
+        from vllm.quixicore import quixicore_ops
+
+        if (
+            not _QC_ADDNORM
+            or not quixicore_ops.is_available()
+            or x.dtype != torch.bfloat16
+            or self.weight.dtype != torch.bfloat16
+            or x.shape[-1] % 4 != 0
+            or not quixicore_ops.has("gemma_add_rms_norm")
+            or not quixicore_ops.has("gemma_rms_norm")
+        ):
+            return self.forward_native(x, residual)
+
+        hidden = x.shape[-1]
+        if residual is not None:
+            if (
+                x.dim() == 2
+                and x.is_contiguous()
+                and residual.dim() == 2
+                and residual.is_contiguous()
+                and residual.dtype == torch.bfloat16
+            ):
+                return quixicore_ops.gemma_add_rms_norm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                )
+            return self.forward_native(x, residual)
+        out = quixicore_ops.gemma_rms_norm(
+            x.reshape(-1, hidden).contiguous(),
+            self.weight.data,
+            self.variance_epsilon,
+        )
+        return out.view(x.shape)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -245,7 +313,9 @@ class RMSNormGated(CustomOp):
         super().__init__()
         self.eps = eps
         self.activation = activation
-        self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
+        self.weight = nn.Parameter(
+            torch.empty(hidden_size, **factory_kwargs)  # type: ignore[arg-type]
+        )
         self.register_parameter("bias", None)
         self.group_size = group_size
         self.norm_before_gate = norm_before_gate

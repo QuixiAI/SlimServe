@@ -50,8 +50,9 @@ def test_every_profile_uses_dspark_with_turboquant():
                 assert "speculative_config" not in engine_kwargs(plan)
                 continue
             config = engine_kwargs(plan)["speculative_config"]
-            source = registry._registry()["sources"][entry["source"]]
-            registered = source["speculator"]["engine"]["method"]
+            # The variant may override the source drafter (qwen38-nvfp4-1:
+            # MTP on MI300X, DFlash2 on Metal).
+            registered = plan.speculator["engine"]["method"]
             assert config["method"] == registered
             if registered == "dspark":
                 assert config["attention_backend"] == "TURBOQUANT"
@@ -363,12 +364,18 @@ def test_registry_contains_only_the_supported_model_artifacts():
         for entry in quant["files"]
     } == {
         "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
-        "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
-        "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
-        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+        (
+            "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
+            "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+        ),
     }
 
     assert [entry["path"] for entry in muse["shared"]] == [
@@ -429,6 +436,36 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
 
 
 GB = 1 << 30
+
+
+def test_nvfp4_directory_entry_resolves_to_the_model_dir():
+    """The NVFP4 quant is an HF-format directory checkpoint (source format
+    safetensors): --model must be the folder, not files[0]."""
+    plan = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert plan.entry_file == plan.model_dir
+
+
+def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
+    """MI300X reuses the checkpoint's own MTP head; Metal serves the DFlash2
+    drafter that measured +23% at c1 (variant-level speculator override)."""
+    metal = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert metal.speculator["engine"]["method"] == "dflash"
+    assert metal.speculator["repo"] == "z-lab/Qwen3.8-27B-DFlash2"
+    mi300x = resolve("qwen38-nvfp4-1", "mi300x", 1, None)
+    assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
+
+
+def test_tq_profile_pins_both_drafter_turboquant_fields():
+    """The -tq drafter must pin attention_backend AND kv_cache_dtype
+    together: unset, the drafter inherits the engine-global turboquant_k8v4
+    dtype but keeps metal_attn, whose 5-dim cache shape cannot view the
+    TQ-sized page (boot reshape failure documented in the profile notes)."""
+    from slimserve.engine import _speculative_config
+
+    plan = resolve("qwen38-nvfp4-1-tq", "metal", 1, "NVFP4", 128 * GB)
+    cfg = _speculative_config(plan)
+    assert cfg["attention_backend"] == "TURBOQUANT"
+    assert cfg["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():
@@ -798,8 +835,10 @@ def test_full_decode_graphs_cover_the_largest_speculative_batch():
         if not profile.get("speculative"):
             continue
         source = raw["sources"][profile["source"]]
-        base_k = (source.get("speculator") or {}).get("engine", {}).get(
-            "num_speculative_tokens", 0
+        base_k = (
+            (source.get("speculator") or {})
+            .get("engine", {})
+            .get("num_speculative_tokens", 0)
         )
         for platform, record in profile["variants"].items():
             engine = record.get("engine", {})
@@ -845,8 +884,7 @@ def test_host_offload_profiles_declare_a_host_ram_gate():
             gated = [
                 quant
                 for quant in source["quants"].values()
-                if (quant.get("min_host_ram_bytes") or {}).get(platform, 0)
-                >= floor
+                if (quant.get("min_host_ram_bytes") or {}).get(platform, 0) >= floor
             ]
             assert gated, (
                 f"{profile_id}/{platform} enables PLE host offload "

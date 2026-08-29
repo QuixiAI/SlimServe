@@ -58,7 +58,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    AcceptanceThrottle,
+    build_dynamic_sd_schedule_lookup,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -249,6 +252,7 @@ class Scheduler(SchedulerInterface):
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self.sd_accept_throttle = None
         self._dynamic_prev_spec_tokens: int = self.num_spec_tokens
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
@@ -257,6 +261,10 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
+            # Acceptance-adaptive drafting (VLLM_SD_ADAPT_THROTTLE=1):
+            # pause drafting while measured acceptance says it is a net
+            # loss, re-probing periodically. See AcceptanceThrottle.
+            self.sd_accept_throttle = AcceptanceThrottle.from_env()
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -849,6 +857,7 @@ class Scheduler(SchedulerInterface):
                         pad_spec = (
                             self.num_spec_tokens
                             if self.dynamic_sd_lookup is None
+                            and self.sd_accept_throttle is None
                             else self._dynamic_prev_spec_tokens
                         )
                         num_new_tokens = 1 + pad_spec
@@ -1049,9 +1058,9 @@ class Scheduler(SchedulerInterface):
                 request.num_computed_tokens = num_computed_tokens
                 if pad_spec_decode:
                     assert num_new_tokens == pad_spec_width
-                    scheduled_spec_decode_tokens[request_id] = [
-                        -1
-                    ] * (pad_spec_width - 1)
+                    scheduled_spec_decode_tokens[request_id] = [-1] * (
+                        pad_spec_width - 1
+                    )
                 # Only track requests that will still be prefilling after this chunk.
                 if num_computed_tokens + num_new_tokens < request.num_tokens:
                     self._inflight_prefills.add(request)
@@ -1154,8 +1163,16 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.sd_accept_throttle is not None:
+            num_spec_tokens_to_schedule = self.sd_accept_throttle.gate(
+                num_spec_tokens_to_schedule, len(num_scheduled_tokens)
+            )
+        if (
+            self.dynamic_sd_lookup is not None or self.sd_accept_throttle is not None
+        ) and len(num_scheduled_tokens) > 0:
             # Remembered for next step's new-decode-request padding: the
-            # drafts produced under this step's k are what get verified then.
+            # drafts produced under this step's k -- AFTER the acceptance
+            # throttle's gate -- are what get verified then.
             self._dynamic_prev_spec_tokens = num_spec_tokens_to_schedule
 
         scheduled_encoder_input_stats = None
@@ -1675,6 +1692,8 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
+        step_draft_tokens = 0
+        step_accepted_tokens = 0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1730,6 +1749,8 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                step_draft_tokens += num_draft_tokens
+                step_accepted_tokens += num_accepted
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1884,6 +1905,11 @@ class Scheduler(SchedulerInterface):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+        if self.sd_accept_throttle is not None and step_draft_tokens > 0:
+            # One observation per scheduling step (gate() also runs once per
+            # step): a c8 batch must not burn eight warmup calls in one step.
+            self.sd_accept_throttle.observe(step_draft_tokens, step_accepted_tokens)
+
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
             self.running = remove_all(self.running, stopped_running_reqs)
@@ -1946,7 +1972,7 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
+            batch = KVEventBatch(ts=time.time(), events=events)  # type: ignore[arg-type]
             self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
