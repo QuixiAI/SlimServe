@@ -1634,7 +1634,7 @@
           "default_quant": "Q4K-tail",
           "engine": {
             "tensor_parallel_size": 2,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "block_size": 256,
             "enable_prefix_caching": true,
             "attention_config": {
@@ -1656,7 +1656,7 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
-            "Main KV is bf16 (kv_cache_dtype auto) - operator decision 2026-08-28: no quantized main KV on any profile, after quantized main KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next. The KV byte budgets and context/concurrency ceilings in this variant were qualified at fp8 KV, so the same bytes now hold half the tokens; requalify on A100 before relying on the old ceilings.",
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
@@ -1686,7 +1686,7 @@
           "default_quant": "Q4K-tail",
           "engine": {
             "tensor_parallel_size": 4,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1709,7 +1709,7 @@
             "VLLM_DSV4_W1_QWARP8": "1"
           },
           "notes": [
-            "Main KV is bf16 (kv_cache_dtype auto) - operator decision 2026-08-28: no quantized main KV on any profile, after quantized main KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next. The KV byte budgets and context/concurrency ceilings in this variant were qualified at fp8 KV, so the same bytes now hold half the tokens; requalify on A100 before relying on the old ceilings.",
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
@@ -1735,7 +1735,7 @@
           "engine": {
             "tensor_parallel_size": 4,
             "data_parallel_size": 2,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1758,7 +1758,7 @@
             "VLLM_DSV4_W1_QWARP8": "1"
           },
           "notes": [
-            "Main KV is bf16 (kv_cache_dtype auto) - operator decision 2026-08-28: no quantized main KV on any profile, after quantized main KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next. The KV byte budgets and context/concurrency ceilings in this variant were qualified at fp8 KV, so the same bytes now hold half the tokens; requalify on A100 before relying on the old ceilings.",
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
@@ -1814,7 +1814,7 @@
           "default_quant": "MXFP4",
           "engine": {
             "tensor_parallel_size": 4,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1836,7 +1836,7 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
-            "Main KV is bf16 (kv_cache_dtype auto) - operator decision 2026-08-28: no quantized main KV on any profile, after quantized main KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next. The KV byte budgets and context/concurrency ceilings in this variant were qualified at fp8 KV, so the same bytes now hold half the tokens; requalify on A100 before relying on the old ceilings.",
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
@@ -1861,7 +1861,7 @@
           "default_quant": "MXFP4",
           "engine": {
             "tensor_parallel_size": 8,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1883,7 +1883,7 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
-            "Main KV is bf16 (kv_cache_dtype auto) - operator decision 2026-08-28: no quantized main KV on any profile, after quantized main KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next. The KV byte budgets and context/concurrency ceilings in this variant were qualified at fp8 KV, so the same bytes now hold half the tokens; requalify on A100 before relying on the old ceilings.",
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",

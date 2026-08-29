@@ -16834,3 +16834,14 @@ The final architecture and why each piece is shaped the way it is:
   get_diff_sampling_param, 5 good shapes pass through); both budget
   suites 52/52; mypy hook green. This makes the PR #13 text's
   "rejected at config time" claim true as written.
+
+## 2026-08-29 - KV policy scoped: bf16 main KV enforced on rtx3090 only
+
+- Operator decision after the Metal-campaign merge surfaced the
+  qwen38-nvfp4-1-tq TurboQuant-main-KV Metal variant: bf16 main KV is
+  enforced (by test) on rtx3090 profiles only, where the multi-turn
+  tracking corruption was root-caused; it is aspirational elsewhere.
+- Reverted the five A100 DSV4 variants to their qualified fp8 KV configs
+  (the 2026-08-28 flip to auto was never A100-validated and halved their
+  token pools); each carries a note to flip only with an on-box
+  requalification pass. The -tq Metal variant stands as shipped.

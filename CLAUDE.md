@@ -173,14 +173,16 @@ behavior:
 - Benchmarks and diagnostics sample at the model's recommended settings
   (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
   never temperature 0, and never disable thinking to save time.
-- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`). Never ship quantized
-  main KV on any profile (operator decision 2026-08-28: TurboQuant main-KV
-  and fp8 main-KV retired after quantized KV was implicated in multi-turn
-  tracking errors on Qwen3.8-Flash-Next). Draft-model KV (DSpark TurboQuant
-  k8v4) is exempt: rejection sampling verifies every draft token against
-  the target, so draft KV precision can only affect acceptance rate and
-  speed, never output content. The Metal `fp8_ds_mla` packed cache is a
-  kernel layout requirement, currently the one main-KV exception on record.
+- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 profiles -
+  enforced by test (operator 2026-08-29): quantized KV was implicated in
+  multi-turn tracking errors on Qwen3.8-Flash-Next and root-caused on this
+  platform. bf16 main KV is ASPIRATIONAL on the other platforms for now:
+  they keep their qualified configs (A100 DSV4 fp8, Metal fp8_ds_mla and
+  the qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
+  requalification pass. Draft-model KV (DSpark TurboQuant k8v4) is exempt
+  everywhere: rejection sampling verifies every draft token against the
+  target, so draft KV precision can only affect acceptance rate and speed,
+  never output content.
 - CPU-offloaded KV (the pinned-host-RAM tier, `HostTierConnector`) is the
   standing goal for ALL non-Metal profiles; Metal instead gets NVMe-backed
   KV offload later (unified memory makes a host-RAM tier meaningless

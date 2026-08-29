@@ -273,7 +273,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
-    assert tp2.engine["kv_cache_dtype"] == "auto"  # bf16 main KV, policy 2026-08-28
+    assert tp2.engine["kv_cache_dtype"] == "fp8"  # qualified A100 config; bf16 aspirational
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -286,7 +286,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
-    assert tp4.engine["kv_cache_dtype"] == "auto"  # bf16 main KV, policy 2026-08-28
+    assert tp4.engine["kv_cache_dtype"] == "fp8"  # qualified A100 config; bf16 aspirational
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -948,35 +948,29 @@ def test_every_profile_serves_with_tool_calling_and_thinking():
 
 
 def test_no_profile_quantizes_main_kv():
-    """Main KV is always bf16 (operator decision 2026-08-28).
+    """Main KV is bf16 on rtx3090; aspirational elsewhere (operator 2026-08-29).
 
     Quantized main KV was implicated in multi-turn tracking errors on
-    Qwen3.8-Flash-Next; no profile may set a quantized kv_cache_dtype.
-    Draft-model KV (DSpark TurboQuant) is exempt because rejection
-    sampling verifies drafts against the target. The Metal fp8_ds_mla
-    packed cache is a kernel layout requirement and the one recorded
-    exception.
+    Qwen3.8-Flash-Next, so no rtx3090 profile may set a quantized
+    kv_cache_dtype. Other platforms keep their qualified configs until an
+    on-box requalification pass flips them. Draft-model KV (DSpark
+    TurboQuant) is exempt everywhere because rejection sampling verifies
+    drafts against the target.
     """
-    allowed_exceptions = {
-        ("dsv4-xxs-1", "metal"): {"fp8_ds_mla"},
-        # FLAGGED EXCEPTION (2026-08-29, pending operator decision): the
-        # Metal campaign shipped this TurboQuant-main-KV variant (needle
-        # validated at 262K on M5 Max) alongside the bf16 default. It
-        # contradicts the bf16-main-KV directive; keep it only as an
-        # explicitly named alternative, never as a default profile.
-        ("qwen38-nvfp4-1-tq", "metal"): {"turboquant_k8v4"},
-    }
-
+    # Enforced on rtx3090 (operator 2026-08-29): quantized main KV was
+    # implicated in multi-turn tracking errors on Qwen3.8-Flash-Next, and
+    # this box is where that was root-caused and validated. Other platforms
+    # keep their qualified configs; bf16 main KV is aspirational there and
+    # flips only with an on-box requalification pass.
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry.get("variants", {}).items():
+            if platform != "rtx3090":
+                continue
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
             # 'auto' resolves to the model dtype (bf16 for every supported
             # model); an explicit 'bfloat16' is the same commitment spelled
             # out and equally compliant.
-            allowed = allowed_exceptions.get(
-                (profile_id, platform), {"auto", "bfloat16"}
-            )
-            assert dtype in allowed, (
+            assert dtype in {"auto", "bfloat16"}, (
                 f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
-                "main KV must be bf16 (auto) on every profile"
+                "main KV must be bf16 (auto) on every rtx3090 profile"
             )
