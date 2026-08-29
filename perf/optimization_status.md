@@ -17065,3 +17065,43 @@ The final architecture and why each piece is shaped the way it is:
   external_prefix_cache_hits_total vs saves over the next hours. The
   index-level behavior (separate trajectories per conversation, adoption
   on resume, tail-hash safety) is unit-proven.
+
+## 2026-08-29 - Agent concurrency ceiling: pi scaling waves on qwen38fn-fp8-8
+
+- Method: waves of N simultaneous pi agents (N=2..32) against the live
+  service, each running a ~20-tool-call audit mission over a real repo
+  clone (tree exploration, line counts, multi-file reads, repo-wide
+  grep, git log, web fetch, report write+verify). Event streams
+  captured per agent; per-turn latency = wall/turns. Raw logs:
+  scratchpad piheavy/logs (plus a 2-call light-task baseline in
+  piscale/logs).
+- Results (mean task | p95 | fails | mean tool calls | s/turn |
+  marginal prefix-hit):
+    N=2   84s |   76s | 0 | 21.5 |  3.8s | 91%
+    N=4   60s |   58s | 0 | 14.0 |  4.3s | 81%
+    N=8   91s |  124s | 0 | 20.9 |  4.8s | 88%
+    N=16 316s |  978s | 0 | 19.5 | 17.9s | 75%
+    N=24 748s | 1771s | 2 timeouts | 12.2 | 45.0s | 17%
+    N=32 all agents stalled: uniform 1218s (pi provider timeout),
+         zero tool calls completed.
+- Caveat: waves 24 and 32 overlapped genuine production bursts from the
+  /v1/responses client (engine showed Waiting 18 during w24 and
+  Waiting 59 during w32, i.e. ~27 foreign requests at peak), so those
+  waves measure agents + production contention, not agents alone. GPU
+  KV reached 89% during w24.
+- Verdict: <=8 agents indistinguishable from solo (4-5 s/turn); the
+  practical ceiling for tolerable interactivity is 12-16 agents
+  (~18 s/turn, task p95 already 16 min); 24+ is intolerable (45 s/turn,
+  30-min timeouts) and 32 alongside a production burst is a full stall.
+  The binding constraint is aggregate decode throughput + KV pressure;
+  queueing spirals once demand exceeds it.
+- Host tier first real workout under eviction pressure: wave 24 alone
+  restored 1.27M tokens from the pinned host tier (external hits
+  +1,268k), vs 6.8k tokens in 12 HOURS under the old owner-collision
+  code. Cumulative external hit rate reached ~40% during the run. The
+  lineage-owner fix is confirmed effective under real thrash.
+- Raw-response anomaly worth tracking: at higher load the model
+  occasionally hallucinated tool names not in the pi schema
+  ("write_file", capitalized "Read"); pi rejected them and the model
+  recovered via bash. Model behavior, not a serving bug; some agents
+  also wrote their reports via bash heredoc instead of the write tool.
