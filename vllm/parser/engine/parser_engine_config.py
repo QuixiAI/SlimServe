@@ -102,6 +102,13 @@ class ParserEngineConfig:
     # Reject tool calls whose names are absent from the request tools.
     validate_tool_names: bool = False
 
+    # Chat-template scaffold rendered between the reasoning-end marker and
+    # the response content (e.g. Qwen3 replays assistant turns as
+    # ``'</think>\n\n' + content``). The model reproduces it at inference,
+    # but per the template it is not part of the response: structured-output
+    # grammars tolerate exactly this prefix before the constrained payload.
+    response_scaffold: str = ""
+
     @cached_property
     def terminal_defs(self):
         from vllm.parser.engine.incremental_lexer import terminals_from_literals

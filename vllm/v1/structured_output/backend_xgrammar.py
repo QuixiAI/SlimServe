@@ -127,17 +127,35 @@ class XgrammarBackend(StructuredOutputBackend):
                 self.vllm_config.speculative_config.num_speculative_tokens
             )
 
+    def _compile_json_schema(self, schema: str):
+        """Compile a JSON schema, tolerating the chat template's scaffold.
+
+        The template renders the response after a fixed scaffold (Qwen3:
+        '</think>\n\n' + content) and the model reproduces that scaffold
+        at inference. xgrammar's JSON root accepts no leading whitespace,
+        so without the wrap the first constrained token fights the model's
+        (and the drafter's) natural continuation. The scaffold is accepted
+        at most once, exactly as the template renders it.
+        """
+        any_whitespace = not self.disable_any_whitespace
+        if not self.response_scaffold:
+            return self.compiler.compile_json_schema(
+                schema, any_whitespace=any_whitespace
+            )
+        scaffold_rule = f"root ::= ({json.dumps(self.response_scaffold)})?"
+        grammar = xgr.Grammar.concat(
+            xgr.Grammar.from_ebnf(scaffold_rule),
+            xgr.Grammar.from_json_schema(schema, any_whitespace=any_whitespace),
+        )
+        return self.compiler.compile_grammar(grammar)
+
     def compile_grammar(
         self, request_type: StructuredOutputOptions, grammar_spec: str
     ) -> StructuredOutputGrammar:
         if request_type == StructuredOutputOptions.JSON:
-            ctx = self.compiler.compile_json_schema(
-                grammar_spec, any_whitespace=not self.disable_any_whitespace
-            )
+            ctx = self._compile_json_schema(grammar_spec)
         elif request_type == StructuredOutputOptions.JSON_OBJECT:
-            ctx = self.compiler.compile_json_schema(
-                '{"type": "object"}', any_whitespace=not self.disable_any_whitespace
-            )
+            ctx = self._compile_json_schema('{"type": "object"}')
         elif request_type == StructuredOutputOptions.GRAMMAR:
             ctx = self.compiler.compile_grammar(grammar_spec)
         elif request_type == StructuredOutputOptions.REGEX:

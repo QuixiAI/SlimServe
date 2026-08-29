@@ -101,6 +101,10 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def reasoning_end_str(self) -> str | None:
         return self._parser_engine.reasoning_end_str
 
+    @property
+    def response_scaffold(self) -> str:
+        return self._parser_engine.parser_engine_config.response_scaffold
+
     def adjust_request(
         self,
         request: ChatCompletionRequest | ResponsesRequest,

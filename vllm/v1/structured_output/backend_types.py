@@ -102,6 +102,12 @@ class StructuredOutputBackend(ABC):
     vllm_config: VllmConfig
     tokenizer: TokenizerLike
     vocab_size: int
+    # Chat-template scaffold the model emits between the reasoning-end
+    # marker and the constrained payload (e.g. Qwen3's "\n\n" from
+    # '</think>\n\n' + content). Sourced from the reasoning parser;
+    # backends that support it accept exactly this optional prefix ahead
+    # of the grammar root. Empty disables the wrap.
+    response_scaffold: str = ""
 
     @abstractmethod
     def compile_grammar(

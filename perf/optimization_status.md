@@ -16856,3 +16856,122 @@ The final architecture and why each piece is shaped the way it is:
 - Service healthy on the merged code: host tier arena registered (12,146
   slots x 64 GiB/rank), reasoning_effort low live (trivial turn answered
   with 0 thinking tokens), c8 spot bench 590.7 tok/s (= the 590.7 baseline).
+
+## 2026-08-29 - Tool-call diagnostics: serving paths validated; "no tool calls" reports traced to saturation queueing
+
+- Operator relayed reports that the deployed Qwen3.8-Flash-Next
+  (rtx3090 x8, port 8000) "is not properly responding to tool calls."
+  Tested every tool-call path directly against the live service:
+  chat/completions non-streaming, streaming, tool-result round trip,
+  parallel tool calls (Tokyo+London), Responses API auto tool choice,
+  Responses streaming, json_schema + thinking, and a multi-turn
+  function_call/function_call_output replay with a 13-tool set. All
+  passed with correct tool names, valid JSON arguments, and
+  finish_reason=tool_calls. Reliability sweep 8/8 at temp 1.0 /
+  top_p 0.95 / top_k 20.
+- End-to-end harness validation: installed pi coding agent, registered
+  the service as a provider (~/.pi/agent/models.json: slimserve ->
+  http://localhost:8000/v1, openai-completions, qwen-chat-template
+  thinking format, sampling 1.0/0.95/20), and pi drove a real
+  read-file tool call through the model to a correct answer.
+- Root cause of the reports (evidence, not fix): during production
+  bursts from the /v1/responses agent client, GPU KV sat at 95-99%
+  with 5-7 requests waiting and 1 deferred; a fresh request queued
+  4+ minutes with zero bytes streamed (pi died twice on 180/240 s
+  timeouts). Client harness timeouts present exactly as "model does
+  not respond to tool calls." When the burst drained, TTFB on the
+  same request was 5 ms, and pi completed in seconds. Capacity /
+  admission behavior under agentic burst load is the follow-up, not
+  the tool-call stack.
+- Log noise ruled out as corruption: recurring
+  backend_xgrammar.py:214 "Failed to advance FSM ... tokens 271"
+  (271 = "\n\n") is the DSpark drafter proposing whitespace right
+  after </think> where a JSON grammar starts; the spec-decode
+  bitmask path tolerates it (post_reasoning_end_in_window) and
+  rejection sampling discards the draft. Reproduced on a
+  json_schema request of mine that still returned valid JSON. Same
+  for grammar_matcher.cc "terminated after accepting stop token"
+  (token 198 = "\n"). Harmless but noisy at ~200+ occurrences;
+  candidate cleanup: downgrade that accept_tokens log to debug when
+  the reject is a tolerated post-reasoning draft.
+
+## 2026-08-29 - Prefix caching: local layer healthy, host tier dead in production (owner-key collision)
+
+- Question under investigation: production cumulative prefix hit rate
+  ~16% (declining through bursts) with external (host tier) hit rate
+  0.4%, on agentic traffic where the policy expects near-100%.
+- Local layer verified working, controlled tests on the live server:
+  identical 9,655-token prompt twice -> second run 8,400/9,655 tokens
+  (87%) from cache, 2.08 s -> 0.54 s. Multi-turn replay (turn-2
+  carrying turn-1's assistant reply) -> 2,400/2,844 (84%) hit, with
+  or without reasoning replayed. Mechanism and mamba align-mode
+  hashing are fine; template replay divergence ruled out.
+- Production misses are capacity thrash: bursts of ~18 concurrent
+  long-context conversations from the /v1/responses client push GPU
+  KV to 95-99%, conversations evict each other, every turn re-prefills
+  its history (prompt throughput 600-2,400 tok/s while gen sits at
+  40-500). The host tier exists to absorb exactly this spillover and
+  does not: since boot, 197 tail-boundary saves, 48 restores issued,
+  only 6 lookup hits (all at shallow boundaries, blocks 2-8),
+  6,800/1.79M external tokens hit.
+- ROOT CAUSE (host_tier_connector.py:189 `_owner`): the trajectory
+  owner key is `request.block_hashes[0].hex()` - the hash of the
+  FIRST 400-token block. All concurrent conversations share the same
+  system-prompt opening block, so they all collapse into ONE
+  Trajectory in HostKVTierIndex: stage_attention keeps the first
+  conversation's block at each position (later convs skipped),
+  stage_tail_states lets every finisher overwrite the shared tail, and
+  lookup's `traj.hashes[:n] == hashes[:n]` full-chain compare then
+  fails for every individual conversation once the chain is a mix.
+  The rare hits happen when traffic is briefly single-conversation.
+  The 2026-08-28 validation passed because the bench ran one
+  conversation per system prompt at a time - no collision.
+- Fix direction (not yet implemented): owner must identify a
+  conversation lineage, not a shared first block. vLLM block hashes
+  chain (hash at position i commits to the full prefix), so keying
+  trajectories by a deeper chain hash - or forking a new trajectory on
+  hash conflict at stage time instead of skipping - restores
+  per-conversation trajectories; the cleaner endpoint is a
+  content-addressed per-block store (hash -> slot, refcounted) with
+  tail states keyed by tail hash, sharing prefix slots instead of
+  fighting over them. Needs the usual on-box validation pass with a
+  concurrent multi-conversation workload, which the current bench
+  lacks.
+
+## 2026-08-29 - Structured output now tolerates the chat template's post-reasoning scaffold
+
+- Operator insight adopted: the '\n\n' between '</think>' and the answer
+  is CHAT TEMPLATE SCAFFOLD, not response. The Qwen3 template renders
+  replayed assistant turns as '</think>\n\n' + content (and literally
+  injects '<think>\n\n</think>\n\n' when thinking is disabled), so the
+  template - not the grammar - is the authority on where the response
+  starts. Previously the JSON grammar armed at '</think>' and its root
+  accepts no leading whitespace (verified: xgrammar's any_whitespace
+  only permits whitespace INSIDE the JSON, first-token acceptance is
+  identical with the flag on or off), which coerced the model
+  off-distribution at the first constrained token and rejected the MTP
+  drafter's natural '\n\n' (~213 tolerated FSM errors since boot).
+- Fix: the template convention is declared once in
+  ParserEngineConfig.response_scaffold ("\n\n" for qwen3), exposed via
+  ReasoningParser.response_scaffold (default ""), read by
+  StructuredOutputManager and passed to XgrammarBackend, whose JSON /
+  json_object compiles now concat an optional bounded prefix grammar
+  (root ::= ("\n\n")?) ahead of the schema. Scaffold accepted at most
+  once, exactly as rendered; a third newline is still rejected; empty
+  scaffold keeps the old strict root. A pure parser-boundary fix
+  (consuming the scaffold in is_reasoning_end) was rejected: the
+  streaming contract fires on the last reasoning token and cannot
+  retroactively distinguish a model that skips the separator, which
+  would swallow the first content token and desync the grammar.
+- Validation: 6 new tests in tests/v1/test_response_scaffold_grammar.py
+  (scaffold accepted whole and split across tokens, optional, not
+  repeatable, empty-scaffold strictness, qwen3 adapter declares "\n\n");
+  tests/parser 284/284, tests/reasoning + xgrammar tokenizer info 34/34,
+  import smoke green. NOT yet validated live: the running production
+  server predates the change; expected effects on restart are the
+  backend_xgrammar FSM errors dropping to zero on json_schema requests
+  and one fewer wasted draft per structured request.
+- Known cosmetic follow-up, same convention: the text path still leaks
+  the scaffold into returned content (leading "\n\n") because
+  extract_reasoning/streaming do not strip it; upstream vLLM's qwen3
+  parser lstrips it. Separate change, API-visible, not bundled here.
