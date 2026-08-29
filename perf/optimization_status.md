@@ -17043,3 +17043,25 @@ The final architecture and why each piece is shaped the way it is:
   template reasoning_content already.
 - All suites: 316 passed (parser 291 incl. 7 new, kv-tier 10+... , host
   tier connector 7, warmup gate 2, scaffold grammar 6).
+
+## 2026-08-29 - Open-items deploy (9cf0155ee): live validation on restart
+
+- Restarted slimserve-qwen38fn in a quiet window; healthy 21:36:07 UTC.
+- Warmup gate CONFIRMED live: "Warming up Qwen Triton kernels for
+  model_type=qwen4_exp_text" on all ranks. First-request JIT warnings
+  dropped 8 -> 5 kernels: _zero_kv_blocks, _fused_post_conv and
+  _qsa_merge_splitk no longer JIT at first request. _causal_conv1d_fwd
+  still fires once on a shape the warmup config doesn't hit (warmup runs
+  a single conv shape; note for the follow-up pass), plus the four
+  documented-uncovered kernels (_qsa_mqa_paged, _qsa_sparse_paged_gqa
+  _splitk, _expand_qsa_indices, _topk_topp).
+- Scaffold strip CONFIRMED live on both APIs: chat content and
+  responses json_schema text no longer carry the leading "\n\n"; JSON
+  valid; xgrammar errors still zero.
+- Host tier on new boot: connector healthy (packed slab 76/76 layers,
+  6452 slots x 400-token blocks), boundary-state saves flowing under the
+  new lineage owners, zero errors. Hit-rate improvement is NOT yet
+  measured - it needs production burst/eviction cycles; watch
+  external_prefix_cache_hits_total vs saves over the next hours. The
+  index-level behavior (separate trajectories per conversation, adoption
+  on resume, tail-hash safety) is unit-proven.
