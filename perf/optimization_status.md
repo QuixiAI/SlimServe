@@ -12647,3 +12647,14 @@ The final architecture and why each piece is shaped the way it is:
   Platform ports tracked: MI300X #17, A100 #18, Metal NVMe #19.
 - Raw: perf/results/2026-08-28/kv-tier/ (acceptance_v2_final.log,
   bench_tier_c*.log, serve_tier_fix*.log).
+
+## 2026-08-29 - Deployed-service full bench (tier enabled, port 8000)
+
+- Exact bench (1000/2000, seeded, engine idle) against the production
+  systemd service with the host KV tier live: c1 142.2 / c8 600.5 /
+  c32 1,091.8 (seed 42) and 1,199.8 (seed 43 re-run) tok/s.
+- c32 1,199.8 is the best number ever recorded on this box (prior peak
+  1,151.2); the 1,091.8 sample shows c32 run-to-run spread of ~10% with
+  MTP acceptance + prefix-hit interplay - band, not point. c1/c8 within
+  their established bands. Tier remains throughput-neutral in production.
+- Raw: perf/results/2026-08-29/qwen38fn-tier-deployed/.
