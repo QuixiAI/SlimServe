@@ -11,6 +11,16 @@ Lookups match a new request's hash chain against a stored trajectory: a hit
 restores attention blocks [0, tail) plus the tail state blocks, and the
 request resumes computing from the tail boundary.
 
+Ownership: a trajectory is keyed by the request id that CREATED it, and a
+request that resumes from a trajectory adopts that key so the conversation's
+next turn extends the same lineage. Keys must never be derived from shared
+content (an earlier scheme keyed on the first block hash, which collapsed
+every conversation sharing a system prompt into one chimera trajectory that
+matched nobody - 6 hits per 197 saves in production). Concurrent requests
+that share a prefix therefore build separate trajectories; the duplication
+is reclaimed by LRU, while correctness is guarded by full-chain hash
+comparison at lookup plus the tail_hash check in resumable_blocks.
+
 Eviction is trajectory-affine and LRU: reclamation frees whole cold
 trajectories, never individual slots.
 """
@@ -34,12 +44,26 @@ class Trajectory:
     # Tail-boundary state: logical block index -> {tier_state_gid: slot}.
     tail_boundary: int = -1
     tail_state_slots: dict[int, int] = field(default_factory=dict)
+    # Chain hash at the tail boundary (block tail_boundary - 1) recorded by
+    # the request that saved the tail. Resumability requires the staged
+    # attention chain to carry the SAME hash there: a tail state paired
+    # with another conversation's attention blocks would resume with the
+    # wrong mamba state (silent output corruption), so a mismatched
+    # trajectory is simply dead rather than dangerously matchable.
+    tail_hash: BlockHash = b""
     tail_pending: bool = False  # tail-state writes still in flight
     last_touch: float = 0.0
 
     def resumable_blocks(self) -> int:
-        """Longest gap-free attention prefix ending at the tail boundary."""
+        """Longest gap-free attention prefix ending at the tail boundary,
+        with the boundary block's hash matching the saved tail state."""
         if self.tail_boundary <= 0 or self.tail_pending:
+            return 0
+        if (
+            not self.tail_hash
+            or self.tail_boundary > len(self.hashes)
+            or self.hashes[self.tail_boundary - 1] != self.tail_hash
+        ):
             return 0
         n = 0
         for slot in self.attn_slots[: self.tail_boundary]:
@@ -87,9 +111,17 @@ class HostKVTierIndex:
         return slot
 
     def stage_tail_states(
-        self, owner: str, boundary: int, num_state_groups: int
+        self,
+        owner: str,
+        boundary: int,
+        num_state_groups: int,
+        boundary_hash: BlockHash = b"",
     ) -> dict[int, int] | None:
         """Reserve slots for the tail-boundary state blocks of `owner`.
+
+        ``boundary_hash`` is the saver's chain hash at block
+        ``boundary - 1``; resumability later requires the staged attention
+        chain to carry the same hash there (see Trajectory.tail_hash).
 
         Returns {tier_state_gid: slot} or None when capacity is unavailable.
         Replaces any previously recorded tail (a trajectory grows; its old
@@ -111,6 +143,7 @@ class HostKVTierIndex:
             self._free.append(s)
         traj.tail_state_slots = slots
         traj.tail_boundary = boundary
+        traj.tail_hash = boundary_hash
         traj.tail_pending = True
         return slots
 
@@ -127,19 +160,22 @@ class HostKVTierIndex:
 
     def lookup(
         self, hashes: list[BlockHash]
-    ) -> tuple[int, list[int], dict[int, int]] | None:
+    ) -> tuple[str, int, list[int], dict[int, int]] | None:
         """Match `hashes` against stored trajectories.
 
-        Returns (num_blocks, attention_slots, tail_state_slots) for the
-        deepest resumable trajectory whose hash prefix matches, or None.
+        Returns (owner, num_blocks, attention_slots, tail_state_slots) for
+        the deepest resumable trajectory whose hash prefix matches, or
+        None. The owner lets a resuming request ADOPT the trajectory and
+        extend it in place (the conversation's next turn keeps growing one
+        lineage instead of duplicating it).
         """
-        best: tuple[int, list[int], dict[int, int]] | None = None
+        best: tuple[str, int, list[int], dict[int, int]] | None = None
         best_owner: str | None = None
         for owner, traj in list(self._trajectories.items()):
             n = traj.resumable_blocks()
             if n <= 0 or n > len(hashes):
                 continue
-            if best is not None and n <= best[0]:
+            if best is not None and n <= best[1]:
                 continue
             if any(
                 s in self._pending_write for s in traj.attn_slots[:n]
@@ -148,6 +184,7 @@ class HostKVTierIndex:
             if traj.hashes[:n] != hashes[:n]:
                 continue
             best = (
+                owner,
                 n,
                 [s for s in traj.attn_slots[:n] if s is not None],
                 dict(traj.tail_state_slots),

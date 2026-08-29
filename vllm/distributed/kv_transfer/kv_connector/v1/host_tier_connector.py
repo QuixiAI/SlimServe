@@ -81,6 +81,10 @@ class _ReqTrack:
     planned_state_slots: dict[int, int] = field(default_factory=dict)
     planned_start: int = 0
     restored_upto: int = 0  # blocks already staged for restore
+    # Trajectory key this request stages into: the adopted trajectory's
+    # owner when the request resumed from the tier (its true lineage), the
+    # request's own id otherwise. Never derived from shared content.
+    owner: str | None = None
 
 
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
@@ -186,9 +190,20 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     # ==================================================================
 
     @staticmethod
-    def _owner(request: "Request") -> str:
-        hashes = request.block_hashes
-        return hashes[0].hex() if hashes else request.request_id
+    def _owner(request: "Request", track: "_ReqTrack | None") -> str:
+        """Trajectory key for this request's saves.
+
+        The adopted lineage when the request resumed from the tier, else
+        the request's own id. NEVER derived from shared content: keying on
+        block_hashes[0] collapsed every conversation sharing a system
+        prompt into one chimera trajectory (root cause of the 6-hits-per-
+        197-saves production miss rate).
+        """
+        if track is not None:
+            if track.owner is None:
+                track.owner = request.request_id
+            return track.owner
+        return request.request_id
 
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
@@ -209,7 +224,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self.index.explain_miss(request.block_hashes),
                 )
             return 0, False
-        n_blocks, attn_slots, state_slots = hit
+        hit_owner, n_blocks, attn_slots, state_slots = hit
         n_tokens = n_blocks * bs
         # Resume is only possible exactly at the stored tail boundary
         # (mamba state exists only there), and at least one token must
@@ -219,6 +234,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if track is None:
             track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
             self._tracks[request.request_id] = track
+        # Adopt the resumed trajectory: this request is its continuation,
+        # so its saves extend that lineage instead of duplicating it.
+        track.owner = hit_owner
         track.planned_blocks = n_blocks
         track.planned_attn_slots = attn_slots
         track.planned_state_slots = state_slots
@@ -366,7 +384,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             if track.staged_upto > n_full:
                 track.staged_upto = n_full  # preemption reset
                 continue
-            owner = self._owner(request)
+            owner = self._owner(request, track)
             for logical in range(track.staged_upto, n_full):
                 block_hash = request.block_hashes[logical]
                 ops: list[tuple[int, int]] = []
@@ -446,6 +464,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         """
         track = self._tracks.pop(request.request_id, None)
         self._requests.pop(request.request_id, None)
+        finished_owner = self._owner(request, track)
         del track
         bs = self.hash_block_size
         if not self.state_groups or self._block_pool is None:
@@ -484,9 +503,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 request.num_computed_tokens,
             )
             return False, None
-        owner = self._owner(request)
         slots = self.index.stage_tail_states(
-            owner, boundary, len(self.state_groups)
+            finished_owner,
+            boundary,
+            len(self.state_groups),
+            boundary_hash=request.block_hashes[boundary - 1],
         )
         if slots is None:
             return False, None

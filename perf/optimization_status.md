@@ -16975,3 +16975,71 @@ The final architecture and why each piece is shaped the way it is:
   the scaffold into returned content (leading "\n\n") because
   extract_reasoning/streaming do not strip it; upstream vLLM's qwen3
   parser lstrips it. Separate change, API-visible, not bundled here.
+
+## 2026-08-29 - Scaffold fix deployed to prod; pi agentic load validation clean
+
+- Restarted slimserve-qwen38fn.service (e319ddff1) in a zero-load
+  window; healthy in ~4.5 min (20:32:29 UTC). Post-restart json_schema
+  requests: 3/3 valid JSON, model now emits its natural '</think>\n\n{'
+  and the grammar accepts it - backend_xgrammar FSM errors since
+  restart: 0 (was ~213 on the prior boot). The scaffold now appears at
+  the head of returned json_schema text ("\n\n{...") - legal for
+  json.loads, the declared text-path strip follow-up would remove it.
+- Agentic anomaly sweep through a real harness (pi against the live
+  service, two waves, 3-way then 6-way concurrent): 12 tasks / 39 tool
+  calls covering single read, multi-file parallel reads (2 tool calls
+  in one assistant message, streamed), grep+read chains, edit+bash
+  verify loops, write, 4-step sequential chains, python-authoring, and
+  a long-context read that navigated pi's 50KB read boundary across 8
+  turns. Raw event streams inspected per run: zero error/aborted stop
+  reasons, zero malformed tool arguments, zero tool-result errors,
+  zero unparseable events. All 12 final answers verified against
+  ground truth (csv total 100, appended total 142 on disk, ERROR
+  count 95, mean latency 449.20 exact, both a/b discrepancies, etc.).
+- Server side during load: zero errors; only cold-start Triton JIT
+  warmup warnings at 20:32-33 (known; consider extending warmup
+  shapes). Prefix cache hit rate on the fresh boot reached 69.7% under
+  pi's shared-prefix agentic traffic - consistent with the earlier
+  finding that the low production rate is capacity thrash + the
+  host-tier owner-key collision, not the cache mechanism.
+
+## 2026-08-29 - Open items landed: host-tier lineage owners, content scaffold strip, warmup gate
+
+- Host tier owner-key collision FIXED. Trajectories are now keyed by the
+  request id that created them; a request that resumes from the tier
+  adopts the stored owner so a conversation keeps extending one lineage
+  (index.lookup now returns the owner). Content-derived keys are gone.
+  Divergent-continuation safety: stage_tail_states records the saver's
+  chain hash at the boundary block (Trajectory.tail_hash) and
+  resumable_blocks requires the staged attention chain to carry the same
+  hash there - a tail state paired with another conversation's blocks is
+  dead, never dangerously matchable (the wrong-mamba-state resume the old
+  chimera trajectories could theoretically have produced). Concurrent
+  same-prefix conversations now build separate trajectories; duplication
+  is LRU-reclaimed. 4 new index regression tests + connector suite green.
+- Content scaffold strip (text path) DONE: ParserEngine strips exactly
+  one leading response_scaffold occurrence from content after reasoning
+  end, non-streaming and streaming (the existing whitespace-defer holds
+  split deltas until the decision is atomic). A single newline or absent
+  scaffold passes through untouched; only one occurrence is stripped.
+  7 new tests in tests/parser/test_response_scaffold_strip.py.
+- JIT warmup root cause: qwen_triton_warmup was gated on a model-type set
+  that lacked qwen4_exp - the ENTIRE Qwen warmup silently skipped on this
+  deployment, which is why even already-covered kernels (zero_kv, conv,
+  post_conv) JIT'ed at first request. Added qwen4_exp/qwen4_exp_text to
+  the gate (+ gate regression test). Still uncovered, documented in the
+  module: QSA paged kernels, PLE short-conv, sampler topk_topp - extend
+  against live jit_monitor output on a future boot, not blind shapes.
+- Cache-rate context recorded from today's measurements: identical fully
+  cached rerun caps at 71.4% (1200/1680) for a 1.7k prompt - align-block
+  granularity (400) + boundary-freeze lag consume the tail 1-2 blocks,
+  proportionally negligible at 10-50k production contexts. Replay
+  divergence verified: a client that does NOT send reasoning back
+  re-renders prior turns as empty think blocks -> token mismatch at every
+  prior assistant turn -> full-history re-prefill (template-level check:
+  68/68 token continuity WITH reasoning_content replay, divergence at the
+  first think block without). Production clients should echo reasoning
+  items back for cache continuity; vLLM maps assistant `reasoning` ->
+  template reasoning_content already.
+- All suites: 316 passed (parser 291 incl. 7 new, kv-tier 10+... , host
+  tier connector 7, warmup gate 2, scaffold grammar 6).
