@@ -451,6 +451,18 @@ EntryClass = DFlash2Qwen3ForCausalLM
 # --------------------------------------------------------------------------- #
 
 
+def _resolve_serving_block_size(
+    trained_block_size: int, num_speculative_tokens: int
+) -> int:
+    active_block_size = 1 + num_speculative_tokens
+    if trained_block_size and active_block_size > trained_block_size:
+        raise ValueError(
+            "DFlash 2 cannot serve a wider block than the checkpoint was trained "
+            f"for ({active_block_size} > {trained_block_size})"
+        )
+    return active_block_size
+
+
 def _dump_draft_record(record: dict) -> None:
     if _DUMP_DIR is None:
         return
@@ -540,7 +552,15 @@ class DFlash2QwenDecoderLayer(DFlashQwen3DecoderLayer):
             raise ValueError("hidden_size must be divisible by conv_group_size")
         self.conv_group_channels = group_channels
         self.n_conv_groups = config.hidden_size // group_channels
-        self.dflash_block_size = int(getattr(config, "block_size", 0))
+        # The convolution is block-local to each request's active query block,
+        # not the maximum block width used to train the checkpoint. Serving may
+        # intentionally verify a shorter prefix of that block. Keeping this
+        # width fixed to the active 1+N layout also makes it invariant across
+        # torch.compile capture and replay shapes.
+        self.dflash_block_size = _resolve_serving_block_size(
+            int(getattr(config, "block_size", 0)),
+            vllm_config.num_speculative_tokens,
+        )
 
         dtype = vllm_config.model_config.dtype
         conv_out = 2 * self.conv_kernel_size * self.n_conv_groups
