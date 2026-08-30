@@ -120,19 +120,16 @@ class InputProcessor:
                     )
                 if self.use_v2_model_runner:
                     from vllm.v1.worker.gpu.sample.thinking_budget import (
-                        reasoning_markers_are_single_token,
+                        reasoning_budget_supported,
                     )
 
-                    if not reasoning_markers_are_single_token(
+                    if not reasoning_budget_supported(
                         self.vllm_config.reasoning_config
                     ):
                         raise ValueError(
-                            "thinking_token_budget on the V2 model runner "
-                            "requires single-token reasoning markers; this "
-                            "model's reasoning start/end markers tokenize to "
-                            "multiple tokens. Run vLLM with "
-                            "VLLM_USE_V2_MODEL_RUNNER=0 to use "
-                            "thinking_token_budget with this model."
+                            "thinking_token_budget requires resolved "
+                            "reasoning start/end markers; this model's "
+                            "reasoning configuration produced none."
                         )
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [

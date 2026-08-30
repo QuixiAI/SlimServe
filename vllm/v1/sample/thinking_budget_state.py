@@ -66,6 +66,15 @@ class ThinkingBudgetStateHolder:
         self._state: dict[int, dict[str, Any]] = {}
         self.cu_num_tokens: dict[int, int] = {}
 
+        # Token ids whose bytes end mid-UTF-8-codepoint: forcing the end
+        # marker right after one would sever a multi-byte character (CJK,
+        # emoji), so the exhaustion transition is HELD while the last
+        # committed token is one of these (llama.cpp's
+        # REASONING_BUDGET_WAITING_UTF8, committed-token granularity here).
+        self._incomplete_utf8: frozenset[int] = frozenset(
+            getattr(reasoning_config, "incomplete_utf8_token_ids", None) or []
+        )
+
         if self.num_spec_tokens > 0:
             self._mask_capacity = max_num_reqs * (self.num_spec_tokens + 1)
         else:
@@ -170,6 +179,14 @@ class ThinkingBudgetStateHolder:
             if target_list[i : i + len(token_ids)] == token_ids:
                 return i
         return -1
+
+    def _utf8_hold(self, state: dict[str, Any]) -> bool:
+        """True when the exhaustion transition must wait for the codepoint
+        the last committed token left open to close."""
+        if not self._incomplete_utf8:
+            return False
+        output = state.get("output_tok_ids") or []
+        return bool(output) and output[-1] in self._incomplete_utf8
 
     @staticmethod
     def _find_first_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
@@ -339,6 +356,7 @@ class ThinkingBudgetStateHolder:
                 if (
                     len(state["spec_token_ids"]) + 1 > remaining_budget
                     and not natural_spec_close_in_budget
+                    and not self._utf8_hold(state)
                 ):
                     state["in_think"] = False
                     state["in_end"] = True
@@ -369,6 +387,7 @@ class ThinkingBudgetStateHolder:
                 if (
                     len(state["spec_token_ids"]) + 1 > remaining_budget
                     and not natural_spec_close_in_budget
+                    and not self._utf8_hold(state)
                 ):
                     state["in_think"] = False
                     state["in_end"] = True
@@ -491,6 +510,7 @@ class ThinkingBudgetStateHolder:
                 state["in_think"]
                 and total_thinking_tokens > state["thinking_token_budget"]
                 and not natural_spec_close_in_budget
+                and not self._utf8_hold(state)
             ):
                 # Calculate force_index: position within spec_token_ids where
                 # forcing starts. If we're already over budget without spec

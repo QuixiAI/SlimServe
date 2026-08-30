@@ -119,7 +119,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.thinking_budget import (
     ThinkingBudgetState,
-    reasoning_markers_are_single_token,
+    reasoning_budget_supported,
 )
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -380,13 +380,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
-            # Hard thinking-token budget enforcement (single-token reasoning
-            # markers only); rides the grammar-bitmask logits seam, so it is
-            # async-safe and spec-decode-correct. See thinking_budget.py.
+            # Hard thinking-token budget enforcement; rides the
+            # grammar-bitmask logits seam, so it is async-safe and
+            # spec-decode-correct. See thinking_budget.py.
             reasoning_config = self.vllm_config.reasoning_config
-            if reasoning_markers_are_single_token(reasoning_config):
+            if reasoning_budget_supported(reasoning_config):
                 self.thinking_budget_state = ThinkingBudgetState(
-                    self.max_num_reqs, self.device, reasoning_config
+                    self.max_num_reqs,
+                    self.device,
+                    reasoning_config,
+                    self.vocab_size,
                 )
             else:
                 self.thinking_budget_state = None

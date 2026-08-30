@@ -2370,6 +2370,13 @@
               "preserve_thinking": true,
               "thinking": true,
               "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": {
+                "low": 6000,
+                "medium": 7000,
+                "high": 8000
+              }
             }
           },
           "env": {
