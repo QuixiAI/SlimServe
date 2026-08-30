@@ -2039,6 +2039,9 @@
               "preserve_thinking": true,
               "thinking": true,
               "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {
@@ -2083,6 +2086,9 @@
               "preserve_thinking": true,
               "thinking": true,
               "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {
@@ -2159,6 +2165,9 @@
               "preserve_thinking": true,
               "thinking": true,
               "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "speculative_overrides": {
@@ -2274,6 +2283,9 @@
               "preserve_thinking": true,
               "thinking": true,
               "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
             }
           },
           "env": {
@@ -2308,7 +2320,10 @@
             },
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
-            "served_model_name": "Qwen3.8-27B"
+            "served_model_name": "Qwen3.8-27B",
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1",
@@ -2372,11 +2387,7 @@
               "enable_thinking": true
             },
             "override_generation_config": {
-              "thinking_token_budget": {
-                "low": 6000,
-                "medium": 7000,
-                "xhigh": 8000
-              }
+              "thinking_token_budget": 2000
             }
           },
           "env": {
