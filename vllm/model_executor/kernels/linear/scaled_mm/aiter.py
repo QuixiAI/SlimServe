@@ -384,13 +384,6 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             and n % 16 == 0
             and k % 128 == 0
         )
-        # AITER's automatic split-K pick is poor for reduction-heavy shapes: a
-        # tall K with few output tiles leaves CUs idle. Measured on gfx942,
-        # splitK=2 is 1.50x (down_proj, K=17408) and 1.30x (o_proj, K=6144)
-        # over auto, while wide shapes (qkv, gate_up) prefer auto. K >= N picks
-        # out exactly the reduction-heavy ones. Split-K reorders the float
-        # accumulation, so results move within fp tolerance.
-        self.split_k = 2 if (self.use_bpreshuffle and k >= n) else -1
 
     @classmethod
     def is_supported(cls, compute_capability=None):
@@ -440,7 +433,7 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         out_dtype = self.config.out_dtype
         if self.use_bpreshuffle:
             return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
-                A, B, As, Bs, output_dtype=out_dtype, split_k=self.split_k
+                A, B, As, Bs, output_dtype=out_dtype
             )
         if self.use_triton:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
