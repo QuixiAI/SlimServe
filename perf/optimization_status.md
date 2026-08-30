@@ -17462,3 +17462,92 @@ The final architecture and why each piece is shaped the way it is:
 - Box state at end of test: :8000 prod service STOPPED (operator
   ordered), test twin live on :8001, pi pointed at :8001. Restore =
   stop slimserve-test-8001, start slimserve-qwen38fn, flip pi baseUrl.
+
+## 2026-08-30 - A100 campaign re-applied after the history rewrite (bf16 KV, host tier, zeroer fix, sweep record)
+
+Re-application of the 2026-08-29/30 A100 work lost from the worktree by
+the origin history rewrite (uncommitted changes; see the CLAUDE.md
+rewritten-history rule). Raw artifacts survived in the git-ignored
+perf/results/2026-08-29/a100-bf16-kvtier/ and
+~/.local/scratch/a100-sweep/. Summary of the re-applied record:
+
+- DSV4 bf16 main KV on A100, implemented per operator directive: the
+  sparse-MLA decode was already templated for all-bf16 slots
+  (mla_decode_fp8_v NFP8=0, SLOT_BYTES=2*QW - the geometry GLM-5.2
+  serves on A100); the fused bf16 insert, plain-row compressor store
+  flag, SWA bf16 dtype, and plain-row KV specs existed for other
+  platforms. New: the <true,true,512,512,0,0> instantiation of the
+  merged two-source persistent decode (dtype-driven binding, byte
+  strides via element_size, scale plane never read), STORE_BF16
+  branches in both Triton compress-store kernels, a bf16 paged-gather
+  for prefill, and Ampere layout gating (auto/bfloat16 -> plain rows).
+  Gates on this box: kernel parity 2.5e-04 vs fp32 reference
+  (unpartitioned/partitioned/two-source; fp8 path re-validated at the
+  same magnitude, bf16-vs-fp8 delta 2.0e-02 = the removed quantization
+  error); TP4 boot healthy with DSpark TQ draft + FULL_DECODE_ONLY
+  graphs (KV pool 33.59 GiB = 2.12M tokens at 262K); marker recall 7/7
+  to 58K depth at c2 and clean through the c8 sweep legs below.
+- KVBlockZeroer packed-slab overrun ROOT-CAUSED AND FIXED: the zeroer
+  used the tensor's block-dim stride as both per-block ADVANCE and zero
+  EXTENT. Packed cross-layer slabs hand out block-strided layer views
+  at slab_base+layer_offset, so each deferred zero wiped layer_offset
+  bytes of the NEXT block (silent cross-block KV corruption) and ran
+  past the slab end on the highest block ids (illegal memory access,
+  engine death). Armed on every DSV4 spec-decode config: the TQ draft
+  cache makes (dtype, kv_quant_mode) mixed, which enables
+  needs_kv_cache_zeroing. The zeroer landed with the Metal merge; the
+  14-day production services booted pre-merge and never ran it.
+  Bisection: tier-ON + CUDA_LAUNCH_BLOCKING=1 faulted synchronously in
+  _zero_kv_blocks_kernel at 13 min; tier-OFF control died of the same
+  async IMA at 45 min (tier incidental). Fix: segments carry
+  (addr, stride_el, page_el) - advance by stride, zero only the layer's
+  own page; contiguous layouts byte-identical; ratio>1 over strided
+  views asserts. Validated: synthetic packed-slab exact-byte test PASS
+  under compute-sanitizer incl. the last-block case, then the exact
+  crash workload ran a full hour clean (recall 11/11, sessions to 82.7K
+  ctx, zero engine incidents). NOTE: the rtx3090 tier validation
+  predates this fix; its byte-identical eviction-restore checks should
+  re-run.
+- WildChat deep-context sweep (c8, model-default context, bf16 + tier +
+  TQ draft, 1.25h/leg):
+  dsv4-q4ktail-2 (TP2): recall 16/16, 0 errors, ctx median 81.8K/max
+  92.0K; TTFT heavy at depth (13 GiB fp8-era byte budget is the bind).
+  dsv4-q4ktail-4 (TP4): recall 40/40, 0 errors, ctx median 220.6K/max
+  236.3K, 29.8M prompt tok, TTFT p50 ~104s at 200-262K.
+  dsv4-mxfp4-4 (TP4): recall 23/23, 0 errors, ctx median 122.6K/max
+  135.5K (~half the Q4K-tail depth per wall-clock - the known MXFP4
+  deficit, now quantified at depth).
+  dsv4-mxfp4-8 (TP8): recall 44/44, 0 errors, ctx median 244.0K/max
+  258.5K, 35.5M prompt tok.
+  glm52-q2k-4/-8: boots fail in inductor ("auto_functionalized was not
+  removed") - post-merge pass gap; the pass now logs the unhandled op
+  name; fix pending a named-op boot.
+  dsv4-q4ktail-8 (TP4 x DP2): 0 request errors, ctx median 157.6K, but
+  recall 9/28 -> see the OPEN item below.
+- OPEN P0: TP4xDP2 (dsv4-q4ktail-8) engine-wide degeneration. Both DP
+  replicas produce fluent multilingual token soup on trivial fresh
+  prompts; deterministic per seed; present at IDLE on a fresh boot
+  (3/3 canaries); NAN_WATCH silent; spec acceptance pegs to 5.8 (k=5
+  ceiling 6.0) during benches. Exonerated by bisection arms: spec
+  (no-spec arm crashed loudly at warmup in ggml_dsv4_moe_a8 "invalid
+  packed Q8_1 input" - same subsystem), custom all-reduce, mHC async
+  schedule, load itself (idle-degenerate). NOT the old 0*NaN split-K
+  bug (fixed 2026-08-13, NaN-free here) and NOT the zeroer (fixed,
+  arms re-ran on the fix). Prime suspect: the DSV4 fused-MoE
+  expert-map path - DP shards experts across engines and the
+  q4ktail-8 profile is the only config that exercises it; production
+  ran two manual TP4 replicas, so this path is unvalidated since the
+  Metal merge. Next discriminators (arms staged in
+  ~/.local/scratch/a100-sweep/quick_arm.sh): VLLM_GGUF_DSV4_AMPERE_FUSED=0,
+  VLLM_DSV4_W1_QWARP8=0, VLLM_DSV4_ALIGNED_Q8=0, each judged by idle
+  canaries on a fresh boot.
+- Also in this batch: deep-context harness hardening (records persisted
+  before summary; ttft percentiles over the filtered list; 512-token
+  probe budget - a 96-token cap starved thinking-enabled probes into
+  false recall failures), the fix_functionalization unhandled-op
+  logger, GLM A100 context restored to the model default 202752 (the
+  local GGUF's glm-dsa.context_length metadata-patched from the
+  exporter's erroneous 1,048,576; upstream repo fix flagged in the
+  glm52-vision source artifact_note), and the serving-policy updates in
+  CLAUDE.md (bf16 rtx3090+a100, model-default context, tier standing on
+  A100).
