@@ -17431,3 +17431,34 @@ The final architecture and why each piece is shaped the way it is:
   made from this entry.
 - Next command: `slimserve qwen38-q2kxl-1 --serve` on the MI300X box, then a
   multi-turn exact pass to record the prefix-cache hit rate.
+## 2026-08-30 - CLEAN agent-concurrency curve (isolated :8001, zero foreign traffic)
+
+- The 2026-08-29 scaling run was invalidated: the "production bursts"
+  were a coworker's performance test sharing the box. Clean rerun
+  methodology: stopped slimserve-qwen38fn (:8000), launched a transient
+  systemd twin (slimserve-test-8001, same profile/env/limits) on :8001
+  that no other client knows about, repointed pi, and recorded a
+  foreign-POST count for every wave window (0 for all 22 waves).
+- Second methodology lesson: ladder-order bias. Back-to-back ascending
+  waves inherit the prior waves' KV saturation - the main ladder
+  measured N=16 at 34 s/turn, but a settled re-probe measured 6.6.
+  Final curve uses settled-state probes throughout.
+- Heavy agent task (~15-20 tool calls, repo audit), per-turn latency:
+    N=2 2.4s | N=4 3.0s | N=8 6.1s | N=10 6.0s | N=12 6.2s
+    N=14 7.9s | N=16 6.6s | N=20 9.1s | N=24 12.4s | N=32 43.1s
+  Task p95: <=140s through N=24; 1,434s at N=32 (24-minute tasks).
+  Zero failures at every N; GPU KV hit 98.8% with a waiting queue only
+  at N=32.
+- Light task (2 tool calls) never walled: N=32 mean 10s, p95 22s -
+  run 1's light-N=32 "wall" (p95 123s) was pure coworker contention.
+- VERDICT: ~16 simultaneous heavy agents feel near-solo (<7 s/turn);
+  20-24 is the tolerable ceiling (9-12 s/turn); the cliff is between 24
+  and 32, where 32 heavy contexts exceed the KV pool (98.8% + queue)
+  and per-turn latency jumps 3.5x to 43s. Recommended operating point:
+  cap agent fleets at 24 on this profile; revisit after KV-capacity or
+  scheduling work if 32 is needed.
+- Raw data: scratchpad cleanrun/logs (main ladder + 3 settled probes);
+  run-1 contaminated logs preserved in piheavy/logs_run1_contaminated.
+- Box state at end of test: :8000 prod service STOPPED (operator
+  ordered), test twin live on :8001, pi pointed at :8001. Restore =
+  stop slimserve-test-8001, start slimserve-qwen38fn, flip pi baseUrl.
