@@ -17588,3 +17588,13 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   throughput impact of the budget path under load (expected nil when
   no request carries a budget; the default map now puts one on every
   request - watch the next bench).
+
+## 2026-08-30 - Mitigated dsv4-q4ktail-8 resident VALIDATED
+
+- Fresh boot of the profile (repack disabled, everything else standard:
+  bf16 KV, host tier, DSpark TQ draft, FULL graphs) on this box: idle
+  canary coherent, then the c8 deep-context recall bench - recall 40/40,
+  0 request errors, all 8 sessions to wall-clock, ctx median 130.6K /
+  max 139.4K (raw: ~/.local/scratch/a100-sweep/resident-final-recall.json).
+  The DP2 profile is serving-healthy under the mitigation; the resident
+  stays up on :8000.
