@@ -255,3 +255,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
 .tmp/
+
+# Deployment configuration is machine-specific and often holds live
+# credentials; it does not belong in the repo. Keep it out of tree.
+deploy/
