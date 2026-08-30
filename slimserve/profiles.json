@@ -1808,9 +1808,12 @@
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
             "VLLM_DSV4_AUX_STREAMS": "0",
-            "VLLM_DSV4_W1_QWARP8": "1"
+            "VLLM_DSV4_W1_QWARP8": "1",
+            "VLLM_GGUF_DSV4_REPACK_IQ2": "0",
+            "VLLM_GGUF_DSV4_REPACK_Q2K": "0"
           },
           "notes": [
+            "REPACK_IQ2/REPACK_Q2K are 0 on this profile: under data parallelism the native fused-MoE path with repacked expert layouts degenerates the engine (deterministic fluent token soup from boot; both replicas; reproduced across spec/all-reduce/mHC/prequant/graph/launch-blocking arms and absent the moment either the repack or the fused kernels are disabled, while every offline and in-situ per-call parity check of the kernels and repacked bytes passes). Root cause is still open - see the perf notebook's DP2 degeneration entries; single-engine profiles keep the repack and its measured wins. Re-enable here only with a root-caused fix plus a c8 deep-context recall gate.",
             "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
             "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
