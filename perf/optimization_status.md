@@ -17613,3 +17613,74 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   unlimited. Metal/MI300X records take effect on those boxes' next
   boots (config-only; the V2 enforcement machine is platform-neutral
   and its suite runs on MPS).
+
+## 2026-08-30 - RETAIN: wide-tile fused SiLU-mul + fp8 group quant, tile sized by M
+
+- Status: retained on `rocm-fp8-followups` (PR #14). Kernel-level measurement
+  only; not yet run through a serving profile.
+- Scope: `wide_act_mul_fp8_group_quant` replacing AITER's
+  `act_mul_and_fp8_group_quant` on the ROCm fp8 path. MI300X (gfx942), one
+  GPU, real Qwen3.8 MLP width (N=17408, so x is [M, 34816] bf16), group 128,
+  output `float8_e4m3fnuz`.
+- Method: each call timed inside a CUDA graph, 50 replays after warmup, us per
+  call. Graph capture rather than an eager loop because at these sizes the op
+  is launch-bound and eager timing overstates it.
+- Baseline: AITER's kernel launches one program per (row, 128-wide group).
+- Hypothesis: a program covering BLOCK_M rows x GROUPS groups removes most of
+  that launch and indexing overhead on a memory-bound op.
+
+- First result, and the problem it exposed. The kernel as submitted fixed
+  BLOCK_M=8, GROUPS=8, which is the WORST config in the grid below M=64:
+
+  | M | aiter us | submitted us | ratio |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 2.52 | 3.57 | 0.71x |
+  | 8 | 2.52 | 3.52 | 0.72x |
+  | 32 | 4.73 | 3.70 | 1.28x |
+  | 128 | 14.29 | 4.26 | 3.36x |
+  | 2048 | 249.77 | 50.30 | 4.97x |
+
+  A ~40% regression at M=1-8 -- single-stream decode -- because one program
+  per 8 rows leaves a 304-CU card with a handful of workgroups. The PR
+  measured only M>=256, where the config is fine, so this was invisible.
+
+- Grid sweep (BLOCK_M x GROUPS over 1,2,4,8 each) showed GROUPS=8 is right
+  everywhere and BLOCK_M is the term that matters: at M=1, BM2G8 is 2.23us
+  against BM8G8's 3.50us. BLOCK_M=8 only earns its keep from about M=1024.
+
+- Change: select BLOCK_M by M -- 2 below 64, 4 below 1024, 8 above. A pure
+  function of M resolved before launch, so it is safe under CUDA graph
+  capture; Triton autotune is not, because it benchmarks at first call.
+
+- Result after the change: matches or beats AITER at every width tested, and
+  is unchanged where it already won.
+
+  | M | aiter us | retained us | ratio |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 2.45 | 2.24 | 1.09x |
+  | 8 | 2.53 | 2.30 | 1.10x |
+  | 32 | 4.69 | 2.42 | 1.94x |
+  | 128 | 14.19 | 4.00 | 3.55x |
+  | 512 | 57.71 | 13.58 | 4.25x |
+  | 2048 | 248.25 | 50.94 | 4.87x |
+
+- Correctness: output bit-identical to AITER's kernel at every M tested,
+  compared as raw int8 on the fp8 tensor plus exact equality on the scales.
+  This is the same arithmetic, re-tiled.
+- Decision: retain. The regression band is closed and the win at batch is
+  unchanged.
+- Open, deliberately not changed here: `DTYPE_MAX` stays at AITER's 240.0 for
+  fnuz, while `_silu_mul_per_token_group_quant_fp8_colmajor` in
+  `fp8_utils.py` clamps the same operation to 224.0 because 240.0 "will
+  cause accuracy issue on dynamic quantization models". Matching AITER keeps
+  this swap a pure performance change with testable bit-identity; moving to
+  224.0 is a numerics change and needs an accuracy run (gsm8k or lm-eval)
+  behind it. Recorded so the divergence is not silent.
+- NOT yet measured: end-to-end serving effect. These are kernel microbenchmarks
+  on one GPU; no profile has been booted with the change, so there is no TPS
+  number for it. The per-call delta at decode is ~0.2us against AITER at M=1,
+  so the expected single-stream effect is small; the batch case is where the
+  4-5x should show up.
+- Hardware: AMD Instinct MI300X (gfx942), 8 GPUs present, one used.
+- Raw artifacts: `perf/results/2026-08-30/actquant-tile-sweep/`
+  (actquant.json plus the three benchmark scripts).
