@@ -1,3 +1,13 @@
+<!--
+Two active campaign handoffs live in this file. They cover different
+platforms and different hardware, and each is current for its own campaign;
+neither supersedes the other. They met on this file in the 2026-08-28 merge
+of origin/main and were joined rather than reconciled.
+
+  1. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)  -- section below
+  2. MI300X GGUF profile record                   -- second section
+-->
+
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 
 ## Mission
@@ -1219,3 +1229,176 @@ default for Qwen.
   block 8 counts the anchor (7 drafted), target layers [5,19,33,47,61]
   0-based, selector A/B tables {248320,256} Q4_K dequantized at load. The
   registered Metal serving depth is deliberately k=3 after the powered sweep.
+
+---
+
+# Handoff: MI300X GGUF profile record (2026-08-25)
+
+> **Status update (2026-08-28, added during the origin/main merge).** The
+> "actual open problem" below is **resolved**; read this section as the
+> investigation record it was, not as current state. The illegal-memory-access
+> fault at `max_num_seqs: 64` was root-caused to the DFlash2 two-tap
+> convolution using the checkpoint's trained block width (8) instead of the
+> active `1 + num_speculative_tokens` serving layout, and fixed in
+> `_resolve_serving_block_size` (`vllm/model_executor/models/qwen3_dflash2.py`).
+> The `qwen38-q2kxl-1` mi300x record ships at 64 sequences with the fixed
+> 96 GiB KV pool -- the "fallback that passes" was not needed. Measured exact
+> workload: c1 77.23 tok/s, c8 194.21 tok/s on the V2 runner, 200.20 tok/s
+> after type-aware imatrix routing. Full write-ups: the three entries dated
+> 2026-08-25/26 at the end of `perf/optimization_status.md`.
+
+## One-paragraph state
+
+The Qwen3.8-27B GGUF path on MI300X **works** — correct text and vision output,
+DFlash2 speculation live — and that is committed and pushed. What is **not**
+finished is the `qwen38-q2kxl-1` mi300x profile *record*: it is uncommitted in
+the worktree, and the config values I picked fail in ways I had not finished
+bisecting when this session ended. A working configuration is known (see
+"Fallback that passes"). The open question is whether the failures are bugs
+worth fixing or shapes to back away from.
+
+## What is committed and pushed (do not redo)
+
+`main` @ `2989f4b28b`, in order:
+
+- `cd7e983d07` — **GDN value-head layout fix.** llama.cpp stores per-value-head
+  gated-deltanet tensors in ggml *tiled* order (value head `hv` pairs with key
+  head `hv % H`, expanded with `ggml_repeat_4d`, see
+  `~/llama.cpp/src/models/qwen35.cpp:443`); the FLA kernels expand with
+  `repeat_interleave`, i.e. HF *grouped* order. Selected by platform:
+  `gdn_core_honors_tiled = current_platform.is_metal()`. Metal keeps its native
+  tiled scan; elsewhere the v-head axis is normalized around the recurrence.
+  The same normalization also had to go into `_forward_core_decode_non_spec`,
+  whose early `return` sits between the two reorder points — that is why
+  prefill was perfect while every decoded token was garbage.
+- `b4cc16492c` — **DFlash drafter KV layout fix.** The drafter hardcoded the
+  split cache layout `(2, num_blocks, block_size, H, head_size)` it was written
+  against on Metal. TRITON_ATTN and ROCM_AITER_FA *pack*:
+  `(num_blocks, H, block_size, 2*head_size)`. `_store_kv_at_slots` now detects
+  the layout and **raises on anything unrecognized rather than guessing**.
+- `a4ee5caea6` — NVFP4 regression gate (that profile still passes).
+- `2989f4b28b` — **profiles are one config per platform.** Five profiles used
+  to span platforms via `platform_overrides`; each id now stores one record per
+  platform under `variants`, each tagged with its own `platform`. The CLI still
+  takes no platform (it detects one). `registry.variant(id, platform)` gets one
+  record. Two tests enforce it. `platform_overrides` is retired.
+
+Earlier in the session (also pushed): IQ2_XXS dense-dispatch fix, `default:`
+guards on the GGUF kernel switches, ROCm build repair, compiled-startup fix.
+See `perf/optimization_status.md` for the full write-ups.
+
+## Uncommitted work in progress
+
+`git status` shows two modified files:
+
+- `slimserve/profiles.json` — adds the `mi300x` record to
+  `qwen38-q2kxl-1.variants`, retitles the profile ("Qwen3.8-27B GGUF on 1 GPU",
+  was "on one Mac" which is wrong for a two-platform id), and adds
+  `min_gpus.mi300x = 1` to the `q2kxl` quant.
+- `tests/slimserve/test_profiles.py` — the smoke matrix asserted every mi300x
+  profile drafts with DSpark; this one legitimately uses DFlash2, so it needed
+  an exception next to the existing NVFP4 one.
+
+62/62 tests pass with these changes.
+
+## The actual open problem
+
+I sized the mi300x record from the `qwen38-nvfp4-1` mi300x record (same model,
+same card, already tuned) rather than from the Metal record. That changed four
+things at once versus the config known to work, and then I guessed at which one
+broke it instead of bisecting. That was the wrong method and it cost four runs.
+
+| run | config delta from Metal baseline | result |
+| --- | --- | --- |
+| `gguf-mi300x` | `gpu_memory_utilization: 0.9`, 262144 ctx, 64 seqs, FULL_DECODE_ONLY | **PASSED**, 268.6 s load |
+| `gguf-mi300x2` | fixed 96 GiB KV pool, `max_num_batched_tokens: 8192` | illegal memory access |
+| `gguf-mi300x3` | fixed pool, batched tokens back to 2048 | illegal memory access, truncated answer |
+| `gguf-mi300x4` | fixed pool, `cudagraph_mode: NONE` | **different** failure: `invalid configuration argument` in `_dummy_sampler_run` → `apply_temperature` |
+| `gguf-mi300x5` | `max_num_seqs: 16`, graph capture restored | **was still running at handoff** — read `perf/results/2026-08-25/gguf-mi300x5/smoke.json` |
+
+Raw logs for every run: `perf/results/2026-08-25/gguf-mi300x*/`.
+
+### What is ruled out
+
+- **Memory pressure.** GPU 1 was idle; every run allocated a valid KV cache
+  (~1.2M tokens, 4.6x concurrency for 262144-token requests).
+- **CUDA graph capture.** Disabling it did not fix the fault, it produced a
+  *different, earlier* one. So the decode-path GDN changes from `cd7e983d07`
+  are not implicated in the memory fault.
+- **The profiling forward.** I claimed this was the discriminator and was
+  wrong — the earlier passing `gguf-spec3` run also skipped it (it used the
+  Metal record's fixed `kv_cache_memory_bytes`).
+
+### Live hypothesis
+
+Something about the larger shapes trips a kernel launch-configuration limit.
+`invalid configuration argument` from `apply_temperature` during sampler warmup
+is a bad grid, and the shape driving that is `max_num_seqs` (I raised it 16 →
+64). `max_model_len: 262144` may interact. **If confirmed this is likely a real
+bug worth fixing rather than a value to retreat from** — but bisect one variable
+at a time before concluding anything.
+
+### Fallback that passes
+
+If the bisection stalls and you need a landable record, `gguf-mi300x` passed:
+`gpu_memory_utilization: 0.9`, 262144 ctx, 64 seqs, FULL_DECODE_ONLY,
+`max_num_batched_tokens` default. Its one flaw is a 268.6 s boot, of which
+**142 s is an 8192-token profiling forward** JIT-compiling Triton GDN kernels
+(`profile_run: LM dummy run`, boot +80.2 s → +222.5 s). A fixed
+`kv_cache_memory_bytes` skips that phase entirely — which is why I reached for
+it, and where the trouble started. Do not ship a record that faults, and do not
+ship the slow one without saying why in the notebook.
+
+## Verification recipes
+
+Smoke the profile as registered (this is the gate that matters):
+
+```bash
+HIP_VISIBLE_DEVICES=1 CUDA_VISIBLE_DEVICES=1 .venv/bin/python -c "
+import sys; sys.argv=['smoke','--profile','qwen38-q2kxl-1','--max-tokens','64',
+ '--log-dir','perf/results/<date>/<run>','--output','perf/results/<date>/<run>/smoke.json']
+from slimserve.smoke import main; sys.exit(main())"
+```
+
+Decode/prefill self-consistency (no external oracle; catches decode-path bugs
+that prefill-only checks miss — this is what found the fast-path bug):
+`/tmp/.../scratchpad/decode_equiv.py` in this session, or re-derive: generate N
+tokens incrementally, then re-prefill the growing sequence for each token, and
+compare. They must match exactly.
+
+Per-layer parity against llama.cpp:
+
+```bash
+# reference (writes ~2700 tensors with sums and corner values)
+~/llama.cpp/build/bin/llama-eval-callback -m <gguf> -p "<prompt>" -n 1 --temp 0 -ngl 99 < /dev/null
+# ours: env-gated per-layer dump, arm with a prompt starting "The three most", >= 11 tokens
+VLLM_QWEN38_DEBUG_DUMP=<dir> .venv/bin/python <script>
+```
+
+`llama-cli` needs `--no-conversation --single-turn` with stdin closed; `-no-cnv`
+is ignored in this build and it will loop emitting prompts.
+
+## Traps that cost real time today
+
+1. **Sums are permutation-invariant.** They cannot distinguish right-values-
+   wrong-order, and on a near-zero residual dominated by cancellation they are
+   actively misleading (`linear_attn_out` read 204 vs 360 while the elementwise
+   corners matched to quantization noise). I built and published a wrong root
+   cause on this and had to retract it. **Compare corner values.**
+2. **A missing probe is evidence.** The decode step printing no `conv_out` while
+   prefill printed it is what exposed the bypassed fast path. When two paths
+   disagree, diff *which code each executes* before diffing numbers.
+3. **`pgrep -f <script>` matches the Bash wrapper's own command line.** I hung
+   three shells with this today, despite a memory note warning about it. Wait on
+   explicit PIDs with `kill -0`.
+4. **Don't change four things and then guess.** See the table above.
+5. `llama.cpp`'s `attn_output-N` is the GDN core output *before* `out_proj`; the
+   counterpart to a module-level hook is `linear_attn_out-N`.
+
+## House rules that bit me
+
+- A profile is **model x quant x platform x config**. Never widen a profile to a
+  platform it was not tuned on; add that platform's own record. I used a
+  temporary-widening script all session before being corrected — don't.
+- Ask the user about facts he already knows (was this artifact validated, what
+  did that campaign run) instead of spending GPU runs deriving them.

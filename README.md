@@ -2,13 +2,17 @@
 
 By Eric Hartford, QuixiAI
 
-*A simplicity-first, opinionated inference engine for the antirez GGUF quants —
-ds4's interface, vLLM's engine, and every performance trick we can land.*
+*A simplicity-first, opinionated inference engine for a curated set of open
+models and quants — ds4's interface, vLLM's engine, and every performance trick
+we can land. For teams that would rather run frontier-class models on hardware
+they own than send their data to a cloud API.*
 
 <!-- markdownlint-disable-next-line MD013 MD033 -->
 <img width="480" height="480" alt="SlimServe" src="https://github.com/user-attachments/assets/cbc419c0-2bb7-4294-be1c-121f1c8121b0" />
 
-## With SlimServe you can run GLM-5.2-Vision at
+## What it delivers
+
+### GLM-5.2-Vision
 
 Aggregate throughput, by concurrent requests:
 
@@ -33,13 +37,31 @@ CUDA graphs; the A100 serving path is fully native CUDA (verified serving
 with the `triton` package absent). An 8-GPU A100 box can also run two
 independent TP4 instances for isolation, at roughly the 4× row each.</sub>
 
-### …while supporting up to 1 Million tokens of context
+### GLM-5.2-Vision, up to 1 Million tokens of context
 
 <sub>Measured on Hot Aisle MI300X: Q2_K quant, 100k-token prompts, 2k-token
 responses, temperature 0, DSpark speculative decoding with TurboQuant draft
 KV. 1M-token context is available on 4+ GPUs. Temperature 0 was the method of
 record for these historical numbers; current benchmarking uses each model's
 shipped sampling defaults, seeded.</sub>
+
+### Qwen3.8-Flash-Next, on eight consumer RTX 3090s
+
+| | 1 | 8 | 16 | 32 |
+| --- | ---: | ---: | ---: | ---: |
+| **8× RTX 3090** | **131–136** | **547–585** | **838** | **880–882** |
+
+<sub>Profile `qwen38fn-fp8-8` as registered: TP8 + expert parallel, the model's
+native 262,144-token context, TurboQuant k8v4 main-KV, MTP k=2, FULL_DECODE_ONLY
+graphs. Exact workload — 1,000 input and exactly 2,000 output tokens per
+request, the model's shipped sampling defaults (temperature 1.0, top-p 0.95,
+top-k 20) seeded 42 — so these are not directly comparable to the GLM rows
+above, which use varied real prompts at temperature 0 with natural stops. Draft
+acceptance 58.9–64.5%. Requires the [QuixiAI P2P driver](docs/geforce-p2p.md)
+(32 GiB BAR1, `iommu=pt`); the P2P fabric is worth +36–58% here. A 125B-A6B MoE
+serving its native 262K context at 880 tok/s, on eight cards you can buy used,
+is the clearest statement of what this engine is for.</sub>
+
 <!-- markdownlint-enable MD033 -->
 
 ---
@@ -57,8 +79,10 @@ rates on two GPUs.
 
 ## What SlimServe is
 
-**A simplicity-first inference engine for the [antirez][antirez] GGUF quants,
-with vision enabled wherever the model has it.**
+**A simplicity-first inference engine for a curated set of open models and
+quants, with vision enabled wherever the model has it.** The set is chosen for
+what enterprises actually want to self-host as an alternative to a cloud API —
+and every entry in it is measured on the hardware it ships for.
 
 One command, a fixed set of tested profiles, no flag archaeology:
 
@@ -74,44 +98,62 @@ that is not in there rather than letting you discover the hard way, eight hours
 into a 244 GiB download, that the combination does not fit. Settings are the
 measured ones; the file records why each number is what it is.
 
-It is **inspired by [ds4][ds4]** — antirez's from-scratch C engine — and takes
-its interface philosophy from it: the model's voice on stdout and the tool's on
+It is **inspired by [ds4][ds4]** — [antirez][antirez]'s from-scratch C
+engine — and takes its interface philosophy from it: the model's voice on stdout and the tool's on
 stderr, Ctrl-C stops generation without leaving the prompt, one line of rates
 after each turn. Where ds4 is built from scratch against llama.cpp's world,
 SlimServe is built from vLLM, so it inherits continuous batching, paged KV,
 prefix caching and a production HTTP server.
 
 It is **performance-focused, and every bleeding-edge trick is in scope.**
-Right now that means DSpark speculative decoding against a GGUF-quantized
-verifier and TurboQuant compressed KV for the draft. That list is expected to
-turn over as better tricks appear — this is not a codebase that will refuse a
-hack because it is exotic.
+Right now that means speculative decoding everywhere, TurboQuant compressed KV,
+hand-written kernels per platform, and host-memory offload for embeddings too
+large to hold in VRAM. That list is expected to turn over as better tricks
+appear — this is not a codebase that will refuse a hack because it is exotic.
 
-Every profile on every platform enables that same pair: DSpark is never
-silently dropped, and every draft uses TurboQuant attention with a
-`turboquant_k8v4` KV cache. The registry names one blessed Hugging Face download
-for each model family.
+**Every profile speculates**, and none of them drop the drafter silently — but
+which drafter is a measured choice, not a default. GLM-5.2-Vision, DeepSeek-V4
+and Kimi K3 run DSpark against a GGUF-quantized verifier with a
+`turboquant_k8v4` draft KV cache. Qwen3.8-27B and Muse-Glimmer run DFlash 2
+block-diffusion drafters, which share the target's KV layout and so need no
+separate draft cache. Qwen3.8-Flash-Next uses the MTP head that ships inside its
+own checkpoint. The registry names one blessed Hugging Face download per model
+family, and the test suite fails if any profile loses its registered drafter.
 
 ### Hardware
 
 | Runs today | Coming |
 | --- | --- |
-| AMD MI300X (2–8 GPUs) | Apple Metal for GLM-5.2-Vision |
+| AMD MI300X (1–8 GPUs) | Apple Metal for GLM-5.2-Vision |
 | NVIDIA A100 (4–8 GPUs) | RTX 4090 / 5090, RTX PRO 6000 |
 | NVIDIA RTX 3090 (8 GPUs, [P2P driver](docs/geforce-p2p.md)) | |
 | [Apple Metal](#apple-silicon) (DeepSeek-V4 128 GiB+; Muse-Glimmer 64 GiB+; Qwen3.8 48 GiB+) | NVIDIA DGX Spark, multi-node |
 
 ### Models
 
-Five architectures: [GLM-5.2-Vision][glm], [Kimi K3](#also-supported-kimi-k3-vision),
-[Muse-Glimmer-30B](#also-supported-muse-glimmer-30b-vision-apple-silicon), and
-[Qwen3.8-27B](#also-supported-qwen38-27b-vision-apple-silicon) with vision,
-[DeepSeek-V4-Flash](#also-supported-deepseek-v4-flash-text-only) text-only.
-GLM-5.2-Vision is what the ROCm/CUDA tuning targets, and DeepSeek-V4 and
-Kimi K3 reuse its kernels; Muse-Glimmer and Qwen3.8 are served by the
-Metal stack with their own kernel work (fused gated-DeltaNet step, DFlash 2
-drafter kernels, hybrid cache pool). The [profile table](#quick-start) below
-has the GPU counts.
+Six architectures. Five carry vision — [GLM-5.2-Vision][glm],
+[Kimi K3](#kimi-k3-vision),
+[Muse-Glimmer-30B](#muse-glimmer-30b-vision-apple-silicon),
+[Qwen3.8-27B](#qwen38-27b-vision-mac-or-mi300x) and
+[Qwen3.8-Flash-Next](#qwen38-flash-next-vision) — and
+[DeepSeek-V4-Flash](#deepseek-v4-flash-text-only) is text-only.
+
+A profile here is not just a model. It is **model × quant × platform ×
+config**, and the platform is part of its identity rather than a list it
+ranges over: a config tuned for MI300X is a different profile from one tuned
+for A100, even for the same model and the same quant. That is what curated
+means in practice — 18 profile ids expand to **25 validated configurations**
+across MI300X, A100, Apple Metal and RTX 3090, each measured on the exact
+hardware it ships for, with its own drafter and its own recorded throughput.
+Nothing is widened to a platform it was not tuned and validated on.
+
+GLM-5.2-Vision is what the ROCm/CUDA tuning targets first, and DeepSeek-V4
+and Kimi K3 reuse its kernels; Muse-Glimmer and Qwen3.8 brought their own
+kernel work (fused gated-DeltaNet step, DFlash 2 drafter kernels, hybrid
+cache pool), and Qwen3.8-Flash-Next brought the QSA/hyper-connection stack
+and a P2P-fabric build for consumer cards. The walkthrough below uses
+GLM-5.2-Vision as the worked example; every other model follows the same
+shape. The [profile table](#quick-start) has the GPU counts.
 
 This is not general-purpose vLLM. Support for models, accelerators and
 quantization paths outside the ones above has been deleted so the rest can be
@@ -129,8 +171,12 @@ What the specialization buys:
 - A vendored QuixiCore Metal kernel library (native MPS serving for three
   model families: packed sparse-MLA caches, GGUF i-quant/k-quant GEMV/GEMM,
   fused gated-DeltaNet decode, tensor-ops speculative verify)
-- DFlash / DFlash 2 block-diffusion drafters on Metal (path-selector
-  drafting with per-step dynamic convolutions)
+- DFlash / DFlash 2 block-diffusion drafters on Metal and MI300X
+  (path-selector drafting with per-step dynamic convolutions)
+- Host-memory offload for embedding tables too large for VRAM: 51B of n-gram
+  embeddings served from pinned host RAM, shared across tensor-parallel ranks
+- A [P2P driver](docs/geforce-p2p.md) for consumer NVIDIA cards (32 GiB BAR1),
+  worth +36–58% on 8× RTX 3090 collectives
 
 [antirez]: https://huggingface.co/antirez
 [ds4]: https://github.com/antirez/ds4
@@ -164,11 +210,12 @@ else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `q4ktail` = Q4K-tail, `mxfp4` =
 MXFP4, `q4k` = Q4_K, `q2k` = Q2_K, `kdyn` = K-quant dynamic (per-layer
 mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
 
-| Profile | Model | GPUs | Runs on | Draft cache |
+| Profile | Model | GPUs | Runs on | Drafter |
 | --- | --- | ---: | --- | --- |
 | `glm52-q2k-2` | GLM-5.2-Vision | 2 | MI300X | DSpark + TurboQuant |
 | `glm52-q2k-4` | GLM-5.2-Vision | 4 | MI300X, A100 | DSpark + TurboQuant |
 | `glm52-q2k-8` | GLM-5.2-Vision | 8 | MI300X, A100 | DSpark + TurboQuant |
+| `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Mac | DSpark + TurboQuant |
 | `dsv4-xxs-1` | DeepSeek-V4-Flash (text) | 1 | MI300X, Mac | DSpark + TurboQuant |
 | `dsv4-q4ktail-2` | DeepSeek-V4-Flash (text) | 2 | MI300X, A100 | DSpark + TurboQuant |
 | `dsv4-q4ktail-4` | DeepSeek-V4-Flash (text) | 4 | A100 | DSpark + TurboQuant |
@@ -178,9 +225,16 @@ mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
 | `dsv4-q4k-8` | DeepSeek-V4-Flash (text) | 8 | MI300X | DSpark + TurboQuant |
 | `k3-xxs-6` | Kimi K3 | 6 | MI300X | DSpark + TurboQuant |
 | `k3-xxs-8` | Kimi K3 | 8 | MI300X | DSpark + TurboQuant |
-| `muse-kdyn-1` | Muse-Glimmer-30B | 1 | Apple Silicon | DFlash |
-| `qwen38-q2kxl-1` | Qwen3.8-27B | 1 | Apple Silicon | DFlash 2 |
-| `glm52-xxs-1` † | GLM-5.2-Vision | 1 | Apple Silicon | DSpark + TurboQuant |
+| `muse-kdyn-1` | Muse-Glimmer-30B | 1 | Mac | DFlash |
+| `qwen38-q2kxl-1` | Qwen3.8-27B (GGUF) | 1 | MI300X, Mac | DFlash 2 |
+| `qwen38-nvfp4-1` | Qwen3.8-27B (NVFP4) | 1 | MI300X, Mac | MTP on MI300X, DFlash 2 on Mac |
+| `qwen38-nvfp4-1-tq` | Qwen3.8-27B (NVFP4) | 1 | Mac | DFlash 2 + TurboQuant draft KV |
+| `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (ships with the checkpoint) |
+
+18 profile ids, 25 platform records. `qwen38-nvfp4-1` is the clearest example of
+why platform is part of a profile's identity: the same model and quant serve
+with a different drafter on each platform, because that is what measured fastest
+on each.
 
 † The GLM Apple Silicon variant is described but not yet runnable. DeepSeek-V4
 is measured and supported; see [Apple Silicon](#apple-silicon).
@@ -388,7 +442,7 @@ Rules of thumb:
 
 ---
 
-## Also supported: DeepSeek-V4-Flash (text only)
+## DeepSeek-V4-Flash (text only)
 
 The second architecture this fork serves. Text only — the model has no vision
 tower, so none of the mmproj path applies.
@@ -482,7 +536,7 @@ on the bitwise-verified MFMA `fp8_mqa_logits`.
 
 ---
 
-## Also supported: Kimi K3 (vision)
+## Kimi K3 (vision)
 
 The third architecture, and the largest thing this fork serves: an 858 GB
 IQ2_XXS/Q2_K GGUF with 896 routed experts over 93 layers (69 KDA + 24 MLA), plus
@@ -548,7 +602,7 @@ the ceiling, so `k3-xxs-6` is the configuration a stale build degrades.
 
 ---
 
-## Also supported: Muse-Glimmer-30B (vision, Apple Silicon)
+## Muse-Glimmer-30B (vision, Apple Silicon)
 
 A 30B vision model served natively on one Mac (64 GiB+) through the
 PyTorch-MPS worker and the vendored QuixiCore Metal kernels, with a DFlash
@@ -565,9 +619,10 @@ Two published quants from `meta-models/Muse-Glimmer-30B-GGUF`:
 decode on an M5 Max with speculation on (exact-token harness, shipped
 sampling defaults, seeded).
 
-## Also supported: Qwen3.8-27B (vision, Apple Silicon)
+## Qwen3.8-27B (vision, Mac or MI300X)
 
-The smallest-Mac entry point (48 GiB+): a 64-layer hybrid with 48
+The smallest entry point on either platform — a 48 GiB+ Mac, or one
+MI300X: a 64-layer hybrid with 48
 gated-DeltaNet linear-attention layers and 16 full-attention layers
 (GQA 24/4, head_dim 256) over a 248,320-token vocabulary, plus a
 qwen3vl-merger vision tower. The linear-attention state and the attention
@@ -584,9 +639,34 @@ continuations with per-step two-tap dynamic convolutions; the profile runs
 3 draft tokens per block. On an M5 Max (exact-token harness, shipped
 sampling defaults, seeded): ~17 tok/s plain, 23.1–23.7 tok/s with
 speculation on essay-style prompts, and 34.3–35.3 tok/s on GSM8K-style
-prompts, where acceptance is high. The `qwen3_5` architecture also loads
-the HF safetensors checkpoint (`Qwen/Qwen3.8-27B`) directly, alongside the
-GGUF path.
+prompts, where acceptance is high. On one MI300X the same
+profile serves the full 262,144-token context at 77.2 tok/s single-stream and
+200.2 tok/s at eight concurrent requests (exact 1,000-in / 2,000-out harness,
+same seeded defaults). The `qwen3_5` architecture also loads the HF safetensors
+checkpoint (`Qwen/Qwen3.8-27B`) directly, alongside the GGUF path.
+
+## Qwen3.8-Flash-Next (vision)
+
+The newest model here, and the one that makes the strongest case for consumer
+hardware:
+a 125B-A6B vision-language hybrid — Gated DeltaNet plus Qwen Sparse Attention
+with 1-in-4 full attention, a 4-branch gated residual, and 51B of n-gram
+embeddings held in **pinned host memory** rather than VRAM. The 512 FP8 experts
+run expert-parallel through Marlin W8A16.
+
+```bash
+slimserve qwen38fn-fp8-8
+```
+
+One published quant: `Qwen/Qwen3.8-Flash-Next-FP8` (block-128 FP8 experts, BF16
+backbone and vision tower). The checkpoint ships its own one-layer MTP drafter,
+so the draft model is the target directory itself; the profile runs k=2. It
+serves the model's native 262,144-token context on **eight RTX 3090s** with
+TurboQuant k8v4 main-KV — 2.64x the KV capacity of bf16, which is what makes the
+native context fit at all — reaching 838 tok/s at 16 concurrent requests and 880
+at 32. Requires the [QuixiAI P2P driver](docs/geforce-p2p.md); the
+[headline numbers](#qwen38-flash-next-on-eight-consumer-rtx-3090s) carry the
+full methodology and caveats.
 
 ## Apple Silicon
 

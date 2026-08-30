@@ -1752,6 +1752,39 @@ requests stay finite and token-stable across the former corruption window;
 final focused suite 17 passed and SlimServe suite 58 passed/1 skipped. Raw:
 `perf/results/2026-08-23/qwen38-kv-gather/`.
 
+### MI300X Single-GPU Exact Baseline - 2026-08-26 (type-aware imatrix route)
+
+- Model/profile: Unsloth Qwen3.8-27B UD-Q2_K_XL GGUF,
+  `qwen38-q2kxl-1`, TP1, full 262,144-token context, fixed 96 GiB KV pool,
+  `max_num_seqs=64`, compiled `FULL_DECODE_ONLY` graphs, DFlash2 Q4_K_M k=3,
+  V2 runner with the drafter's rank-256 path selector.
+- Workload: hot OpenAI completion server, 1,000 input tokens and exactly 2,000
+  output tokens per request; temperature 1.0, top-p 0.95, top-k 20, seed 42,
+  8-token shape warmup. One timed pass at c1; two retained timed passes at c8.
+
+| Concurrency | Aggregate tok/s | Median request s | Spec accepted / drafted | Exact |
+| ---: | ---: | ---: | ---: | --- |
+| 1 | 77.23 | 25.90 | 1,285 / 2,142 | yes |
+| 8 | 200.20 | 69.79 / 72.08 | 21,106 / 32,709 (two runs) | yes |
+
+The c8 baseline combines two exact retained-route passes (197.15 and 203.33
+tok/s); its median-request column reports the two run medians. The type-aware
+ROCm route keeps compact importance-matrix kernels through
+their measured M=16 or M=32 crossover instead of dequantizing every wider
+forward. The c1 row remains the stable V2 measurement because the route is
+unchanged at M=4; a 2026-08-26 c1 sample had anomalously low draft acceptance
+and is recorded, but not promoted, in the optimization notebook.
+
+The registered vision profile passed text and deterministic red-image smoke
+at the same 64-sequence sizing. All exact c8 completions were healthy. Raw:
+`perf/results/2026-08-26/gguf-mi300x25-imatrix-route/`; smoke:
+`perf/results/2026-08-26/gguf-mi300x26-imatrix-route-smoke/`. The prior V2
+baseline remains at `perf/results/2026-08-25/gguf-mi300x21-v2-exact/`.
+
+The superseded legacy-runner measurements were 75.47 tok/s at c1 and 164.87
+tok/s at c8; V2 improved those by 2.3% and 17.8%, respectively. Their raw
+artifacts remain at `perf/results/2026-08-25/gguf-mi300x19-seq64-exact/`.
+
 ## Qwen3.8-27B NVFP4
 
 ### MI300X Single-GPU Exact Baseline - 2026-08-19 (optimization pass 2)

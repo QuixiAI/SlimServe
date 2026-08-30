@@ -15187,7 +15187,8 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Both ROCm profiles now pass as registered, nothing disabled:
   qwen38-nvfp4-1 (safetensors, MTP k=2) and qwen38-q2kxl-1 (GGUF, DFlash2
   k=3, run under a temporary mi300x widening that is reverted after each
-  run -- the profile still lists only `metal`).
+  run -- at that checkpoint the profile still listed only `metal`; the next
+  entry records the retained MI300X variant).
 
 ### UPDATE 55 (2026-08-25) — Merge origin/main (55 parallel commits) + full re-gate
 
@@ -16408,3 +16409,282 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   get_diff_sampling_param, 5 good shapes pass through); both budget
   suites 52/52; mypy hook green. This makes the PR #13 text's
   "rejected at config time" claim true as written.
+
+## 2026-08-25 - FIX: DFlash2 short-block convolution under compiled MI300X serving
+
+- Status: retained.
+- Scope: `qwen38-q2kxl-1`, GGUF Q2_K_XL target plus DFlash2 Q4_K_M drafter,
+  TP1 on one MI300X, `max_num_seqs=64`, DFlash k=3, compiled
+  `FULL_DECODE_ONLY` serving. Working-tree base `2989f4b28b`.
+- Baseline: the same registered profile passed at `max_num_seqs=16`, but at
+  64 the first proposal completed and the second draft forward raised a ROCm
+  illegal-memory-access error. The target alone passed at 64 with `--no-spec`,
+  ruling out the target model, fixed 96 GiB KV pool, and target graph replay.
+- Hypothesis: DFlash2's two-tap convolution was using the checkpoint's trained
+  maximum block width (8) even though the profile deliberately serves only the
+  first three drafts, whose per-request query block is four rows (anchor + 3).
+  The token-count-dependent fallback selected width 4 eagerly but could be
+  specialized as width 8 by `torch.compile`, and it also joined two live
+  four-row requests into one block whenever the total happened to be eight.
+- Change: resolve the convolution width once from the active serving layout,
+  `1 + num_speculative_tokens`, and reject configurations wider than the
+  checkpoint's trained block. Added a regression proving that row 4 starts a
+  fresh request and cannot read row 3 as its predecessor.
+- Correctness/isolation:
+  - serialized stage synchronization showed both input expansion and context-KV
+    insertion clean; the fault first appeared inside the second compiled draft
+    forward;
+  - disabling compilation only for a diagnostic layer-by-layer run completed
+    correctly, distinguishing compile specialization from a generally broken
+    ROCm kernel;
+  - production compiled one-shot at 64 returned the correct answer with
+    speculation enabled;
+  - registry-driven smoke passed text and deterministic red-image requests,
+    DFlash k=3, load 114.26 s;
+  - final relevant model/SlimServe suite: 69 passed, 3 skipped.
+- Performance: exact OpenAI completion workload, shipped sampling defaults
+  (`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed 42), 8-token warmup,
+  1,000 input and exactly 2,000 output tokens per request. One timed pass per
+  concurrency after shape warmup:
+
+  | concurrency | aggregate output tok/s | median request s | accepted / drafted | exact |
+  | ---: | ---: | ---: | ---: | --- |
+  | 1 | 75.47 | 26.50 | 1,299 / 2,109 | yes |
+  | 8 | 164.87 | 78.11 | 10,383 / 16,848 | yes |
+
+  All completions were non-degenerate (minimum 2.65 chars/token). The c8 run
+  sustained all eight concurrent requests without a crash or missing token.
+- Decision: keep the active-block fix and the MI300X profile at 64 sequences.
+  The 2.18x c8/c1 throughput gain is now a measured optimization target, not a
+  correctness blocker; batch-width GGUF MMQ and DFlash acceptance remain the
+  next performance work.
+- Hardware: AMD Instinct MI300X, ROCm 7.2.53211, driver 6.16.13, PyTorch
+  2.14.0.dev20260723+rocm7.2; dual AMD EPYC 9754 (256 CPUs), 3.0 TiB host RAM.
+- Raw artifacts:
+  - isolation: `perf/results/2026-08-25/gguf-mi300x14-seq64-dflash-sync/`
+    through `gguf-mi300x17-seq64-compiled-fix/`;
+  - smoke: `perf/results/2026-08-25/gguf-mi300x18-seq64-smoke/`;
+  - exact JSON, completions, and server log:
+    `perf/results/2026-08-25/gguf-mi300x19-seq64-exact/`.
+
+## 2026-08-25 - RETAIN: V2 DFlash2 path selection for Qwen3.8 GGUF on MI300X
+
+- Status: retained in the `qwen38-q2kxl-1` MI300X variant as
+  `VLLM_USE_V2_MODEL_RUNNER=1`.
+- Baseline/hypothesis: the legacy model runner measured 75.47 tok/s at c1 and
+  164.87 tok/s at c8. Its generic proposal path independently argmaxes draft
+  logits, while the V2 DFlash speculator invokes the model's trained rank-256
+  path selector. The Metal variant already required V2 for this reason, but
+  the new MI300X variant had not carried that setting over.
+- Method: unchanged compiled profile and exact OpenAI completion workload from
+  the preceding entry, with V2 selected externally for the comparison. One
+  timed pass per concurrency after warmup; 1,000 input and exactly 2,000 output
+  tokens per request, temperature 1.0, top-p 0.95, top-k 20, seed 42.
+
+  | runner | concurrency | aggregate output tok/s | median request s | accepted / drafted | exact |
+  | --- | ---: | ---: | ---: | ---: | --- |
+  | V1 | 1 | 75.47 | 26.50 | 1,299 / 2,109 | yes |
+  | V2 | 1 | 77.23 | 25.90 | 1,285 / 2,142 | yes |
+  | V1 | 8 | 164.87 | 78.11 | 10,383 / 16,848 | yes |
+  | V2 | 8 | 194.21 | 76.81 | 10,645 / 16,086 | yes |
+
+- Result: c1 improved 2.3%; c8 improved 17.8%. All eight c8 completions were
+  exact and non-degenerate (minimum 3.15 chars/token), and the compiled runner
+  completed without a ROCm fault. The larger c8 gain and fewer total draft
+  tokens support retaining the selector path rather than treating c1 noise as
+  sufficient evidence by itself.
+- Registered validation: after adding V2 to the profile itself, the registry
+  smoke passed text (`4`) and deterministic red-image (`Red`) requests with
+  DFlash k=3; load time 116.28 s. A diagnostic smoke constrained to only 16
+  output tokens correctly returned HTTP 200 but exhausted its budget in the
+  model's visible reasoning before emitting `4`; it is retained as a rejected
+  harness setting, not counted as a correctness pass. The repository-default
+  128-token smoke is the passing validation.
+- Regression suite: 70 passed, 3 platform skips across the focused DFlash2
+  model tests and the complete SlimServe test directory; profile JSON parsing
+  and `git diff --check` also passed.
+- Decision: keep V2 on MI300X. Remaining measured gap is the GGUF target path:
+  at c8 this profile is still far below the same model's optimized NVFP4 path,
+  so batch-width native MMQ remains the next kernel target.
+- Raw artifacts:
+  - V2 compiled one-shot: `perf/results/2026-08-25/gguf-mi300x20-v2-one-shot/`;
+  - exact JSON and completions: `perf/results/2026-08-25/gguf-mi300x21-v2-exact/`;
+  - rejected 16-token diagnostic:
+    `perf/results/2026-08-25/gguf-mi300x22-v2-registered-smoke/`;
+  - passing registered smoke:
+    `perf/results/2026-08-25/gguf-mi300x23-v2-registered-smoke/`.
+
+## 2026-08-26 - RETAIN: type-aware importance-matrix GGUF routing on MI300X
+
+- Status: retained. Scope is the `qwen38-q2kxl-1` target model on one MI300X;
+  the registered profile, DFlash2 k=3, V2 runner, graph policy, and sampling
+  configuration are unchanged.
+- Baseline: an unchanged exact c8 run produced 197.54 output tok/s in 81.00 s,
+  with all eight requests returning exactly 2,000 tokens. The Q2_K_XL file is
+  predominantly importance-matrix formats (including 112 IQ3_XXS, 67 IQ2_S,
+  57 IQ3_S, 48 IQ2_XXS, and 34 IQ2_XS tensors), but the GGUF router used one
+  row-count heuristic for all of them. Above that threshold it unpacked the
+  weight to BF16 on every forward and called dense GEMM.
+- Hypothesis: DFlash k=3 verification reaches target batches up to M=32, and
+  several compact importance-matrix vector kernels remain faster there. Route
+  each measured format at its own crossover instead of treating all formats as
+  having the same decode-width limit.
+- Kernel A/B on real model weights confirmed different crossovers. At M=32,
+  compact MMVQ was 1.82x faster for IQ1_S, 1.50x for IQ2_XXS, 1.38x for IQ2_S,
+  1.36x for IQ3_XXS, and 1.07-1.14x for IQ4_XS. IQ2_XS won only through M=16;
+  IQ3_S was already 2.43x slower at M=16 and 4.26x slower at M=32. Therefore
+  the ROCm limits are 32 for IQ1_S/IQ1_M/IQ2_XXS/IQ2_S/IQ3_XXS/IQ4_XS, 16
+  for IQ2_XS, and 8 for IQ3_S. The existing environment override remains
+  authoritative, and CUDA/Metal/unmeasured formats retain the old heuristic.
+- Exact end-to-end results, using 1,000 input and exactly 2,000 output tokens
+  per request, temperature 1.0, top-p 0.95, top-k 20, seed 42, and an 8-token
+  warmup:
+
+  | route | concurrency | aggregate output tok/s | wall s | accepted / drafted | exact |
+  | --- | ---: | ---: | ---: | ---: | --- |
+  | old heuristic | 8 | 197.54 | 81.00 | 10,691 / 15,924 | yes |
+  | type-aware, run 1 | 8 | 197.15 | 81.16 | 10,542 / 16,383 | yes |
+  | type-aware, run 2 | 8 | 203.33 | 78.69 | 10,564 / 16,326 | yes |
+  | type-aware, combined | 8 | 200.20 | 159.84 | 21,106 / 32,709 | yes |
+
+  The two retained runs improve delivered throughput by 1.35% over the fresh
+  baseline. Proposal-cycle rate improves from 65.53/s to 68.21/s (+4.09%),
+  consistent with the isolated target-kernel gain; stochastic draft acceptance
+  obscured it in the first output-TPS sample. A c1 sample returned exactly
+  2,000 tokens at 43.63 tok/s, but its acceptance collapsed to 743/3,768 even
+  though this change cannot affect its M=4 route. It is recorded as acceptance
+  variance, not used to replace the stable 77.23 tok/s c1 baseline.
+- Correctness: all exact runs produced the requested token count and healthy
+  text. The registered text+image smoke passed (`4` and `Red`) with DFlash k=3.
+  Routing unit tests cover the measured table and the environment override.
+  The final focused model/profile suite passed 73 tests with 3 platform skips;
+  the rebuilt native GGUF extension passed all 18 dequant/vector tests. That
+  native gate also corrected a pre-existing test-oracle flaw: arbitrary bytes
+  had produced invalid FP16 block scales and the reference used the original
+  activation rather than the Q8_1 values actually consumed by the kernel.
+- Rejected kernel experiment: a native dense IQ2_XXS MMQ using the existing
+  tile decoder was numerically identical to MMVQ at printed precision, but was
+  slower than MMVQ at every measured M=4..64 (for example 0.266 vs 0.209 ms at
+  M=32) and slower than dequant+dense at M=64 (0.472 vs 0.324 ms). The csrc
+  experiment was removed; the production extension was rebuilt and its import
+  and operator schema passed.
+- Decision: retain the type-aware Python route; reject the first dense
+  IQ2_XXS MMQ. Further native work needs a materially different MFMA schedule,
+  not a wider version of the current tile/vector organization.
+- Raw artifacts:
+  - unchanged exact baseline:
+    `perf/results/2026-08-26/gguf-mi300x24-imatrix-route-baseline/`;
+  - retained exact runs:
+    `perf/results/2026-08-26/gguf-mi300x25-imatrix-route/`;
+  - registered text+image smoke:
+    `perf/results/2026-08-26/gguf-mi300x26-imatrix-route-smoke/`;
+  - real-weight kernel A/B and rejected experiment transcript:
+    `perf/results/2026-08-26/gguf-mi300x27-imatrix-kernel-ab/`.
+
+## 2026-08-28 - Merge origin/main (59 commits) into the MI300X GGUF worktree
+
+- Status: merge only; no serving measurement taken or claimed here.
+- Scope: fast-forward of `main` from `2989f4b28b` to `b639a842e9` (59 commits:
+  the Flash-Next 8x3090 campaign, thinking-token budgets, the safetensors
+  DFlash2 stack, dynamic-k, and the Metal re-gates) under the uncommitted
+  MI300X GGUF profile work. Local HEAD carried no commits of its own, so the
+  history is a fast-forward; the reconciliation was entirely in the working
+  tree, 3-way merged against the exact merge base.
+- Three files conflicted, all resolved by keeping both sides:
+  - `vllm/model_executor/models/qwen3_dflash2.py` — main added the
+    safetensors DFlash2 stack (`DFlash2Qwen3*`, FlashInfer top-k, compiled
+    selector) at the same offset where this branch added
+    `_resolve_serving_block_size` for the GGUF stack. Both kept; the helper
+    now sits inside the GGUF section that uses it. The two stacks agree
+    independently: main's new decoder layer sizes its conv block as
+    `1 + num_speculative_tokens`, which is what the helper resolves.
+  - `perf/optimization_status.md`, `HANDOFF.md` — parallel append-logs and
+    parallel campaign handoffs; both retained in full. HANDOFF.md follows the
+    existing in-file precedent for concatenated campaign handoffs, and the
+    MI300X section carries a dated pointer noting its open fault was since
+    root-caused (the conv block-width bug) so it is not read as live state.
+- One SEMANTIC conflict that no textual merge would have caught: main added
+  `test_full_decode_graphs_cover_the_largest_speculative_batch`, which
+  requires `max_cudagraph_capture_size >= (k+1) x max_num_seqs` on FULL-graph
+  speculative profiles. The new `qwen38-q2kxl-1` mi300x record set capture 64
+  at 64 sequences with DFlash k=3, needing 256 — the largest decode batches
+  would have fallen to eager silently. Raised to 256, matching the rule the
+  sibling `qwen38-nvfp4-1` mi300x record already follows at 192 for MTP k=2
+  and `qwen38fn-fp8-8` at 96 for 32 sequences.
+- The recorded c1/c8 baselines are UNAFFECTED and are not re-stated: at k=3
+  those runs submit 4 and 32 graph rows, inside the old 64 ceiling. The
+  change widens coverage for c9..c64, which is unmeasured on this box and is
+  claimed only as a correctness/coverage fix, not as a throughput result.
+- Validation: slimserve suite 68 passed; profile suite 57 passed (including
+  both one-config-per-platform guards and the new capture guard); DFlash2
+  model, GGUF routing and GGUF vector-kernel tests 25 passed, 3 platform
+  skips; the merged `qwen3_dflash2` module imports with both drafter stacks
+  live and both architectures registered (`DFlash2DraftModel` safetensors,
+  `DFlash2QwenDraftModel` GGUF); `git diff --check` clean.
+- Next command: re-run the exact c8 workload on the merged tree to confirm
+  the ~200 tok/s pin still holds under main's spec-decode changes, then take
+  the first c16/c32 samples now that graph capture actually covers them.
+
+## 2026-08-28 - FIX: the speculative capture guard was skipping 9 of its 12 cases
+
+- Status: retained (correctness/coverage). No throughput measurement is
+  claimed here; see "Not measured" below.
+- Scope: `test_full_decode_graphs_cover_the_largest_speculative_batch`
+  (merged from main earlier today) and the five `glm52-q2k-*` FULL-graph
+  records it was not reaching.
+- Baseline: the guard asserts
+  `max_cudagraph_capture_size >= (k+1) x max_num_seqs` on FULL-graph
+  speculative variants, after main measured the failure at 425 vs 880 tok/s
+  on 8x3090. But it opened with `if not (k and max_num_seqs and capture):
+  continue`, so it only ran where BOTH fields were spelled out in the record.
+  Of the 12 FULL-graph speculative variants in the registry it checked 3.
+- Defect: the skip covered exactly the silent cases. An omitted
+  `max_cudagraph_capture_size` does not disable graph capture -- it inherits
+  `min(max_num_seqs * 2, 512)` (`vllm/config/vllm.py::_set_cudagraph_sizes`).
+  That default budgets ONE row per sequence with 2x headroom, while a
+  speculative step submits `k+1` rows per sequence, so at k>=2 the inherited
+  ceiling is always short. "Field unset" was being read as "nothing to
+  check" when it actually means "nobody made this decision at all", which is
+  the condition most likely to be wrong.
+- Found: all five `glm52-q2k-*` FULL_DECODE_ONLY records (dspark k=3) set no
+  capture and were under-covered by exactly 2x --
+  `glm52-q2k-2/mi300x`, `glm52-q2k-4/mi300x`, `glm52-q2k-8/mi300x` at 32
+  sequences inherited 64 against 128 needed; `glm52-q2k-4/a100` and
+  `glm52-q2k-8/a100` at 64 sequences inherited 128 against 256 needed. Every
+  one of them ran its largest decode batches eager, silently, and had done so
+  since the profiles were written.
+- Change 1 (guard): resolve both sides to EFFECTIVE values instead of
+  skipping -- unset capture becomes `min(max_num_seqs * 2, 512)`, unset
+  `max_num_seqs` becomes `SchedulerConfig.DEFAULT_MAX_NUM_SEQS` (128). The
+  mirrored constants are pinned against vLLM by
+  `test_mirrored_vllm_defaults_have_not_drifted`, so a vLLM-side default
+  change fails loudly rather than quietly weakening the guard.
+- Change 2 (profiles): the five glm52 records now pin capture explicitly at
+  `(k+1) x max_num_seqs` -- 128 at 32 sequences, 256 at 64 -- the same rule
+  `qwen38-nvfp4-1/mi300x` (192) and `qwen38fn-fp8-8/rtx3090` (96) follow.
+- NOT fixed, deliberately: the four `dsv4-*/a100` tiers pin capture 64 but
+  leave `max_num_seqs` unset, so it inherits 128 and batches past ~10
+  concurrent requests fall off the graphs. That capture was not an oversight
+  -- it is the fix from "2026-08-10 TP8 c8 Cliff Root Cause: Graph Capture
+  Width", measured against the c8 verify width of 8 x 6 = 48 rows. Raising
+  it is coupled to the KV budget on that hardware ("its larger graphs shrink
+  the KV pool"), and there is no A100 here to measure it on. Recorded as a
+  narrow, dated exemption that still asserts the band that WAS measured, not
+  as a skip: dropping dsv4 capture below 48 fails the guard.
+- Correctness: both guard branches were proven non-vacuous by reverting each
+  case in turn -- restoring a glm52 default fails the arithmetic branch, and
+  lowering dsv4 capture to 32 fails the exemption branch. Resolved engine
+  kwargs confirm the new ceilings reach the serving args
+  (`glm52-q2k-2 -> capture 128, max_num_seqs 32`). slimserve suite 58 passed.
+- NOT MEASURED: no glm52 serving run was taken for this change. It only
+  widens graph coverage, and the arithmetic is exact rather than tuned, but
+  the memory cost is real and unquantified here: the MI300X records use a
+  fixed `kv_cache_memory_bytes`, so the extra graphs come out of headroom,
+  while the A100 records derive their pool from
+  `gpu_memory_utilization: 0.92` and will trade some KV for graph memory (at
+  `max_model_len: 4096` that pool is small). Boot is the first thing to
+  watch.
+- Next command: boot `glm52-q2k-2` on 2 MI300X and confirm (a) it reaches
+  health with the 47 GiB fixed KV pool intact at capture 128, then (b) take
+  a c16/c32 exact pass -- c32 is 128 rows, precisely the band that was
+  running eager and the one main measured at roughly half throughput.
