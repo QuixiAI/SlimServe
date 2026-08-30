@@ -17551,3 +17551,40 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   glm52-vision source artifact_note), and the serving-policy updates in
   CLAUDE.md (bf16 rtx3090+a100, model-default context, tier standing on
   A100).
+
+## 2026-08-30 - Issue #20 implemented: reasoning-budget graceful close + wrap-up nudge, deployed
+
+- V2 thinking-budget enforcement rewritten as the llama.cpp
+  reasoning-budget state machine (IDLE/COUNTING/WAITING_UTF8/FORCING/
+  DONE with re-arm) extended per operator directive with a wrap-up
+  NUDGE: at thinking_budget_nudge_fraction (0.85) the configured
+  message is injected uncharged so the model can react with its
+  remaining budget; the budget stays a HARD cutoff (end marker forced
+  at exhaustion, held across UTF-8 codepoint boundaries - 787
+  byte-fallback tokens flagged in the Qwen3.8 vocab). Multi-token
+  markers now supported via dense KMP DFAs; the V2 single-token
+  restriction is gone. All shape-static tensor ops; simulated across
+  speculative verify spans. V1 holder gains the UTF-8 hold; nudge is
+  V2-only (the production runner).
+- Defaults (operator directive): thinking_token_budget map
+  {low: 6000, medium: 7000, xhigh: 8000} on qwen38fn-fp8-8/rtx3090
+  ("high" is not a level this template accepts - learned live);
+  default effort low -> 6000. Per-request override and -1 opt-out
+  unchanged. Default nudge message: "Considering the limited time by
+  the user, I have to give the solution based on the thinking
+  directly now."
+- Deploy hit a crash-loop: the coworker's KVBlockZeroer packed-slab
+  fix (b8d3f34c5) widened _meta to 6 fields; qwen_triton_warmup still
+  unpacked 5 - and only qwen4_exp boots run that helper (our warmup
+  gate fix), which no A100 box ever did. Fixed the unpack, passed the
+  new seg_strides through to the kernel, and added an arity guard so
+  warmup can never kill a boot again.
+- Live validation on prod (rtx3090): budget map loaded at boot;
+  budget=40 request shows the nudge injected mid-reasoning at the 85%
+  point and a hard close with a coherent final answer; budget=60
+  accounting exact (51 charged + 23 uncharged nudge tokens, closed
+  within budget); -1 opt-out unlimited with no nudge. 22-case V2 unit
+  suite green (cuda/mps/cpu); registry suite green. NOT yet measured:
+  throughput impact of the budget path under load (expected nil when
+  no request carries a budget; the default map now puts one on every
+  request - watch the next bench).

@@ -173,7 +173,20 @@ def _zero_kv_warmup_config(runner: object) -> _ZeroKvWarmupConfig | None:
     if meta is None:
         return None
 
-    _, seg_page_sizes, max_chunks, block_size, n_segs = meta
+    # KVBlockZeroer._meta is (seg_addrs, seg_strides, seg_page_sizes,
+    # max_chunks, block_size, n_segs) since the packed-slab overrun fix
+    # separated the block advance from the zero extent. Guard the arity:
+    # warmup is an optimization and must never kill a boot when the
+    # zeroer's internals move again (2026-08-30: a 5-field unpack of the
+    # widened tuple crash-looped the rtx3090 service).
+    if len(meta) != 6:
+        logger.warning(
+            "Skipping zero-kv warmup: unexpected KVBlockZeroer._meta "
+            "arity %d (expected 6); update _zero_kv_warmup_config.",
+            len(meta),
+        )
+        return None
+    _, _, seg_page_sizes, max_chunks, block_size, n_segs = meta
     return _ZeroKvWarmupConfig(
         seg_page_sizes=seg_page_sizes,
         max_chunks=int(max_chunks),
@@ -210,12 +223,17 @@ def _warm_zero_kv_blocks_kernel(
         dtype=torch.uint64,
         device=device,
     )
+    # All segments alias one scratch buffer here, so the per-block advance
+    # equals the zero extent (real slabs separate the two; the JIT
+    # specialization is identical either way).
+    seg_strides = config.seg_page_sizes
 
     for n_blocks in _ZERO_KV_N_BLOCKS:
         block_ids = torch.arange(n_blocks, dtype=torch.int64, device=device)
         grid = (n_blocks * config.n_segs * config.max_chunks,)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
+            seg_strides,
             config.seg_page_sizes,
             block_ids,
             n_blocks,
