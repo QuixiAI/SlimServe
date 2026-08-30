@@ -210,6 +210,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "HostTierConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector",
+    "HostTierConnector",
+)
+
+KVConnectorFactory.register_connector(
     "DecodeBenchConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.decode_bench_connector",
     "DecodeBenchConnector",

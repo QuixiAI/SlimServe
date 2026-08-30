@@ -98,6 +98,32 @@ class StructuredOutputManager:
         self.enable_in_reasoning = (
             self.vllm_config.structured_outputs_config.enable_in_reasoning
         )
+        self._response_scaffold: str | None = None
+
+    def _get_response_scaffold(self) -> str:
+        """Chat-template scaffold between reasoning end and the response.
+
+        Sourced from the configured reasoning parser (which mirrors the
+        template convention); backends accept it as an optional prefix
+        ahead of the grammar root.
+        """
+        if self._response_scaffold is None:
+            scaffold = ""
+            if self.reasoner_cls is not None:
+                try:
+                    scaffold = self.reasoner_cls(
+                        tokenizer=self.tokenizer
+                    ).response_scaffold
+                except Exception:
+                    logger.warning(
+                        "Failed to read response scaffold from reasoning "
+                        "parser %s; grammars will not tolerate template "
+                        "scaffold prefixes.",
+                        self.reasoner_cls,
+                        exc_info=True,
+                    )
+            self._response_scaffold = scaffold
+        return self._response_scaffold
 
     def _get_reasoner(self, request: "Request") -> "ReasoningParser | None":
         structured_req = request.structured_output_request
@@ -138,6 +164,7 @@ class StructuredOutputManager:
                     self.vllm_config,
                     tokenizer=self.tokenizer,
                     vocab_size=vocab_size,
+                    response_scaffold=self._get_response_scaffold(),
                 )
             elif backend == "guidance":
                 self.backend = GuidanceBackend(

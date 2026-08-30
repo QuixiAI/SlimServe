@@ -123,6 +123,10 @@ class ParserEngine(Parser):
         self._deferred_content: str = ""
         self._deferred_reasoning: str = ""
         self._content_has_nonws: bool = False
+        # Whether the template's post-reasoning scaffold (e.g. Qwen3's
+        # '</think>\n\n') has been stripped from (or found absent at) the
+        # head of the content this response.
+        self._scaffold_stripped: bool = False
         self._suppress_tool_calls: bool = False
 
         self._arg_converter = parser_engine_config.arg_converter
@@ -201,6 +205,7 @@ class ParserEngine(Parser):
         self._deferred_content = ""
         self._deferred_reasoning = ""
         self._content_has_nonws = False
+        self._scaffold_stripped = False
         self._prompt_streaming_prepared = False
 
     def adjust_request(
@@ -513,7 +518,13 @@ class ParserEngine(Parser):
         if self._strip_trailing_reasoning_ws:
             raw_reasoning = raw_reasoning.rstrip()
         reasoning = raw_reasoning or None
-        content = "".join(content_parts) or None
+        content_str = "".join(content_parts)
+        # Template scaffold between '</think>' and the response is
+        # formatting, not content (see _events_to_delta).
+        scaffold = self.parser_engine_config.response_scaffold
+        if scaffold and self._reasoning_ended and content_str.startswith(scaffold):
+            content_str = content_str[len(scaffold) :]
+        content = content_str or None
         return reasoning, content
 
     # ── Non-streaming: extract_reasoning_streaming ────────────────────
@@ -757,6 +768,28 @@ class ParserEngine(Parser):
             self._deferred_content = ""
 
         content_str = "".join(content_parts)
+
+        # The chat template renders the response after a fixed scaffold
+        # (Qwen3: '</think>\n\n' + content); the model reproduces it, but
+        # it is formatting, not response. Strip exactly one occurrence
+        # from the head of the content. Split deltas are safe: the
+        # whitespace-defer below holds ws-only content until either
+        # non-whitespace arrives or the stream finishes, so the full
+        # scaffold sits at the head of content_str when we decide.
+        scaffold = self.parser_engine_config.response_scaffold
+        if (
+            scaffold
+            and not self._scaffold_stripped
+            and self._reasoning_ended
+            and not self._content_has_nonws
+            and content_str
+        ):
+            if content_str.startswith(scaffold):
+                content_str = content_str[len(scaffold) :]
+                self._scaffold_stripped = True
+            elif not scaffold.startswith(content_str) or finished:
+                # Content diverges from the scaffold: nothing to strip.
+                self._scaffold_stripped = True
 
         if self._content_has_nonws:
             pass

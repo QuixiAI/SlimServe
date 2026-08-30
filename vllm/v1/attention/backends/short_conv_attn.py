@@ -306,6 +306,21 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         non_spec_mask_cpu = ~spec_sequence_masks_cpu
         decode_mask_cpu = non_spec_mask_cpu & (query_lens_cpu == 1)
         prefill_mask_cpu = non_spec_mask_cpu & (query_lens_cpu > 1)
+        if common_attn_metadata.is_prefilling is not None:
+            # A 1-token row still mid-prefill (fresh 1-token prompt or a
+            # 1-token tail chunk of a chunked prefill) must be classified as
+            # prefill: the decode conv path reads the conv-state slot, which
+            # such a request has never written. The prefill path handles it
+            # via has_initial_states. is_prefilling may be unpadded; padded
+            # rows are never prefilling.
+            isp = common_attn_metadata.is_prefilling
+            n_rows = query_lens_cpu.size(0)
+            if isp.size(0) < n_rows:
+                isp = torch.cat([isp, isp.new_zeros(n_rows - isp.size(0))])
+            isp = isp[:n_rows]
+            short_prefill = decode_mask_cpu & isp
+            decode_mask_cpu &= ~isp
+            prefill_mask_cpu |= short_prefill
 
         num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
         num_decodes = int(decode_mask_cpu.sum().item())

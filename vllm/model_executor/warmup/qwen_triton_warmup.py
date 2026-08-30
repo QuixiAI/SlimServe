@@ -21,8 +21,20 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        # Qwen4Exp (Qwen3.8-Flash-Next) shares the GDN linear-attention
+        # stack this warmup covers; before it was listed here the whole
+        # warmup silently skipped and every kernel JIT'ed on the first
+        # production request (jit_monitor, rtx3090, 2026-08-29).
+        "qwen4_exp",
+        "qwen4_exp_text",
     }
 )
+# Still uncovered for qwen4_exp (jit_monitor 2026-08-29): the QSA paged
+# attention kernels (_qsa_mqa_paged_kernel, _qsa_sparse_paged_gqa_splitk,
+# _expand_qsa_indices, _qsa_merge_splitk), the PLE short-conv path, and the
+# sampler's _topk_topp_kernel. Warming those needs paged KV metadata and a
+# live runner shape; extend against jit_monitor output on the next boot
+# rather than guessing shapes here.
 
 _ZERO_KV_N_BLOCKS = (1, 2)
 

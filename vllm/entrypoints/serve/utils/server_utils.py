@@ -41,6 +41,71 @@ logger = init_logger("vllm.entrypoints.openai.server_utils")
 
 GUARDED_PREFIX = ("/v1", "/v2", "/inference")
 
+# Generation endpoints subject to admission control. Non-generation routes
+# (models, health, metrics, tokenize) stay unlimited: they are cheap and are
+# how load balancers decide whether to route here at all.
+ADMISSION_GUARDED_SUFFIXES = (
+    "/chat/completions",
+    "/completions",
+    "/responses",
+    "/messages",
+)
+
+
+class AdmissionControlMiddleware:
+    """
+    Pure ASGI middleware that caps concurrent in-flight generation requests.
+
+    A saturated engine converts extra concurrency into queueing delay, not
+    throughput, so past the cap it is strictly better to tell the client to
+    back off: requests over the limit get an immediate OpenAI-style 429 with
+    a Retry-After header instead of a slot in an invisible queue.
+
+    Only generation endpoints (ADMISSION_GUARDED_SUFFIXES) are counted and
+    capped; everything else passes through untouched.
+    """
+
+    def __init__(self, app: ASGIApp, max_concurrent: int) -> None:
+        assert max_concurrent > 0
+        self.app = app
+        self.max_concurrent = max_concurrent
+        self.in_flight = 0
+
+    def _is_guarded(self, scope: Scope) -> bool:
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            return False
+        root_path = scope.get("root_path", "")
+        url_path = scope["path"].removeprefix(root_path)
+        return url_path.startswith(GUARDED_PREFIX) and url_path.endswith(
+            ADMISSION_GUARDED_SUFFIXES
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not self._is_guarded(scope):
+            return await self.app(scope, receive, send)
+        if self.in_flight >= self.max_concurrent:
+            response = JSONResponse(
+                content={
+                    "error": {
+                        "message": (
+                            f"Server is at its admission limit of "
+                            f"{self.max_concurrent} concurrent requests. "
+                            "Retry after a short backoff."
+                        ),
+                        "type": "rate_limit_exceeded",
+                        "code": "concurrency_limit",
+                    }
+                },
+                status_code=HTTPStatus.TOO_MANY_REQUESTS,
+                headers={"Retry-After": "2"},
+            )
+            return await response(scope, receive, send)
+        self.in_flight += 1
+        try:
+            return await self.app(scope, receive, send)
+        finally:
+            self.in_flight -= 1
+
 
 class AuthenticationMiddleware:
     """

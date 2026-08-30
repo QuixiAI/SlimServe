@@ -1470,6 +1470,41 @@ class MambaManager(SingleTypeKVCacheManager):
 
         return mask
 
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        if self.mamba_cache_mode != "align":
+            return super().allocate_external_computed_blocks(
+                request_id,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        # Align mode: mirror the internal-hit shape ([null] * i + [state]).
+        # A resumed request reads exactly one state block - the one at
+        # position ``num_computed // block_size - 1`` (the worker seeds
+        # ``state_idx`` from that position); earlier positions are never
+        # read, so allocating real blocks there wastes pool space
+        # proportional to the restored depth. cache_full_blocks skips the
+        # nulls when the loaded prefix is cached.
+        num_total_computed_tokens = (
+            num_local_computed_tokens + num_external_computed_tokens
+        )
+        if num_external_computed_tokens <= 0:
+            return
+        req_blocks = self.req_to_blocks[request_id]
+        num_required_blocks = cdiv(num_total_computed_tokens, self.block_size)
+        num_new_blocks = num_required_blocks - len(req_blocks)
+        if num_new_blocks <= 0:
+            return
+        tail_block = self.block_pool.get_new_blocks(1)[0]
+        req_blocks.extend([self._null_block] * (num_new_blocks - 1))
+        req_blocks.append(tail_block)
+        if self._record_new_block_ids:
+            self.new_block_ids.append(tail_block.block_id)
+
     def remove_skipped_blocks(
         self,
         request_id: str,

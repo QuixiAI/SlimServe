@@ -998,10 +998,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         req_indices = torch.searchsorted(q_starts[1:], positions, right=True)
         col_indices = positions - q_starts[req_indices]
 
-        packed_tokens = x_p.new_zeros((num_prefills, max_len, hidden_size))
-        packed_tokens[req_indices, col_indices] = x_p
-        packed_tokens = packed_tokens.transpose(1, 2).contiguous()
-
         state_indices = state_indices_tensor_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -1012,66 +1008,108 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         has_initial = has_initial_states_p[:num_prefills].to(
             device=conv_state.device, dtype=torch.bool
         )
-        if self.conv_state_len > 0:
-            if conv_state.shape[0] == 0:
-                state = conv_state.new_zeros(
-                    (num_prefills, hidden_size, self.conv_state_len),
-                    dtype=x_p.dtype,
-                )
-            else:
-                state = conv_state.index_select(0, state_indices)[
-                    ..., : self.conv_state_len
-                ].to(x_p.dtype)
-            use_initial_mask = (valid_state & has_initial).view(num_prefills, 1, 1)
-            initial_state = torch.where(
-                use_initial_mask,
-                state,
-                torch.zeros_like(state),
-            )
-            history = torch.cat((initial_state, packed_tokens), dim=-1)
-        else:
-            history = packed_tokens
 
-        conv_output = F.conv1d(
-            history,
-            conv_weights.unsqueeze(1).contiguous(),
-            groups=history.size(1),
-            dilation=self.short_conv_dilation,
-        )
-        conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
-
+        # The packed pipeline materializes ~5 dense [rows, max_len, hidden]
+        # transients. A wave of concurrent long prefills can push that past
+        # the profiled activation reserve (observed: 31 x ~2K-token chat
+        # turns OOMing at gpu_memory_utilization 0.95), so bound the
+        # transient by processing requests in slices. The common case
+        # (product under the budget) remains a single full-batch pass.
+        slice_budget_elems = 16 << 20
+        rows_per_slice = max(1, slice_budget_elems // max(1, max_len * hidden_size))
+        conv_w = conv_weights.unsqueeze(1).contiguous()
         token_positions = torch.arange(max_len, device=x_p.device, dtype=torch.int64)
-        valid_tokens = token_positions.view(1, max_len) < lengths.view(num_prefills, 1)
-        valid_output_mask = valid_tokens & valid_state.to(device=x_p.device).view(
-            num_prefills, 1
-        )
-        conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
-        output.copy_(conv_output[req_indices, col_indices])
 
-        if self.conv_state_len > 0 and conv_state.shape[0] > 0:
-            state_starts = lengths.to(device=history.device, dtype=torch.int64).view(
-                num_prefills, 1, 1
+        for row_start in range(0, num_prefills, rows_per_slice):
+            row_end = min(row_start + rows_per_slice, num_prefills)
+            rows = row_end - row_start
+            if rows == num_prefills:
+                tok_idx = None
+                req_rel = req_indices
+                col_rel = col_indices
+                x_slice = x_p
+            else:
+                sel = (req_indices >= row_start) & (req_indices < row_end)
+                tok_idx = sel.nonzero(as_tuple=True)[0]
+                req_rel = req_indices[tok_idx] - row_start
+                col_rel = col_indices[tok_idx]
+                x_slice = x_p[tok_idx]
+
+            packed_tokens = x_p.new_zeros((rows, max_len, hidden_size))
+            packed_tokens[req_rel, col_rel] = x_slice
+            packed_tokens = packed_tokens.transpose(1, 2).contiguous()
+
+            state_idx_s = state_indices[row_start:row_end]
+            valid_state_s = valid_state[row_start:row_end]
+            has_initial_s = has_initial[row_start:row_end]
+            lengths_s = lengths[row_start:row_end]
+
+            if self.conv_state_len > 0:
+                if conv_state.shape[0] == 0:
+                    state = conv_state.new_zeros(
+                        (rows, hidden_size, self.conv_state_len),
+                        dtype=x_p.dtype,
+                    )
+                else:
+                    state = conv_state.index_select(0, state_idx_s)[
+                        ..., : self.conv_state_len
+                    ].to(x_p.dtype)
+                use_initial_mask = (valid_state_s & has_initial_s).view(rows, 1, 1)
+                initial_state = torch.where(
+                    use_initial_mask,
+                    state,
+                    torch.zeros_like(state),
+                )
+                history = torch.cat((initial_state, packed_tokens), dim=-1)
+            else:
+                history = packed_tokens
+
+            conv_output = F.conv1d(
+                history,
+                conv_w,
+                groups=history.size(1),
+                dilation=self.short_conv_dilation,
             )
-            state_offsets = torch.arange(
-                self.conv_state_len, device=history.device, dtype=torch.int64
-            ).view(1, 1, self.conv_state_len)
-            next_state = history.gather(
-                dim=2,
-                index=(state_starts + state_offsets).expand(-1, history.size(1), -1),
-            )
-            # Write back without a host synchronization. Valid, non-empty rows
-            # receive their new state; padding and zero-length rows keep the
-            # current cache value.
-            existing_state = conv_state.index_select(0, state_indices)
-            existing_base_state = existing_state[..., : self.conv_state_len]
-            update_mask = valid_state & (lengths.to(device=conv_state.device) > 0)
-            safe_next_state = torch.where(
-                update_mask.view(num_prefills, 1, 1),
-                next_state.to(conv_state.dtype),
-                existing_base_state,
-            )
-            existing_state[..., : self.conv_state_len] = safe_next_state
-            conv_state.index_copy_(0, state_indices, existing_state)
+            conv_output = F.silu(conv_output).transpose(1, 2).contiguous()
+
+            valid_tokens = token_positions.view(1, max_len) < lengths_s.view(rows, 1)
+            valid_output_mask = valid_tokens & valid_state_s.to(
+                device=x_p.device
+            ).view(rows, 1)
+            conv_output.masked_fill_(~valid_output_mask.unsqueeze(-1), 0)
+            if tok_idx is None:
+                output.copy_(conv_output[req_rel, col_rel])
+            else:
+                output[tok_idx] = conv_output[req_rel, col_rel]
+
+            if self.conv_state_len > 0 and conv_state.shape[0] > 0:
+                state_starts = lengths_s.to(
+                    device=history.device, dtype=torch.int64
+                ).view(rows, 1, 1)
+                state_offsets = torch.arange(
+                    self.conv_state_len, device=history.device, dtype=torch.int64
+                ).view(1, 1, self.conv_state_len)
+                next_state = history.gather(
+                    dim=2,
+                    index=(state_starts + state_offsets).expand(
+                        -1, history.size(1), -1
+                    ),
+                )
+                # Write back without a host synchronization. Valid, non-empty
+                # rows receive their new state; padding and zero-length rows
+                # keep the current cache value.
+                existing_state = conv_state.index_select(0, state_idx_s)
+                existing_base_state = existing_state[..., : self.conv_state_len]
+                update_mask = valid_state_s & (
+                    lengths_s.to(device=conv_state.device) > 0
+                )
+                safe_next_state = torch.where(
+                    update_mask.view(rows, 1, 1),
+                    next_state.to(conv_state.dtype),
+                    existing_base_state,
+                )
+                existing_state[..., : self.conv_state_len] = safe_next_state
+                conv_state.index_copy_(0, state_idx_s, existing_state)
         return output
 
     def _short_conv_dilated_spec_batched(

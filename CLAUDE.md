@@ -156,3 +156,39 @@ behavior:
 
 - Eric Hartford is the sole author. Do not add co-author or assistance
   trailers, and do not discuss automated assistance in commit messages.
+
+## Serving policy (standing)
+
+- SlimServe serving ALWAYS has automatic prefix caching, automatic tool
+  calling, and thinking enabled, and NEVER uses greedy sampling. These are
+  enforced as registry-level `_SERVING_DEFAULTS` plus explicit per-profile
+  values and a registry test; a profile may opt out of one only for a
+  model-level impossibility, stated in a note.
+- Never rely on engine-layer defaults for these: vLLM silently defaults
+  prefix caching OFF for hybrid (mamba/GDN) models, which shipped a
+  profile with a 0.0% hit rate and full-history re-prefill on every turn.
+  Production load is dominated by agentic traffic - long shared prefixes
+  extended turn over turn - where prefix caching approaches a 100% hit
+  rate and its absence is catastrophic, not marginal.
+- Benchmarks and diagnostics sample at the model's recommended settings
+  (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
+  never temperature 0, and never disable thinking to save time.
+- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 profiles -
+  enforced by test (operator 2026-08-29): quantized KV was implicated in
+  multi-turn tracking errors on Qwen3.8-Flash-Next and root-caused on this
+  platform. bf16 main KV is ASPIRATIONAL on the other platforms for now:
+  they keep their qualified configs (A100 DSV4 fp8, Metal fp8_ds_mla and
+  the qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
+  requalification pass. Draft-model KV (DSpark TurboQuant k8v4) is exempt
+  everywhere: rejection sampling verifies every draft token against the
+  target, so draft KV precision can only affect acceptance rate and speed,
+  never output content.
+- CPU-offloaded KV (the pinned-host-RAM tier, `HostTierConnector`) is the
+  standing goal for ALL non-Metal profiles; Metal instead gets NVMe-backed
+  KV offload later (unified memory makes a host-RAM tier meaningless
+  there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
+  (2026-08-28, mamba state-geometry fix landed: tail states are the
+  engine's frozen align-mode boundary snapshots). MI300X/A100 need the
+  connector generalized to their paged MLA layouts (issues #17/#18);
+  enable per-platform only with on-box validation, never by editing a
+  profile for a machine the connector has not run on.

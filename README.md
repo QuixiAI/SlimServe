@@ -47,20 +47,23 @@ shipped sampling defaults, seeded.</sub>
 
 ### Qwen3.8-Flash-Next, on eight consumer RTX 3090s
 
-| | 1 | 8 | 16 | 32 |
-| --- | ---: | ---: | ---: | ---: |
-| **8× RTX 3090** | **131–136** | **547–585** | **838** | **880–882** |
+| | 1 | 8 | 32 |
+| --- | ---: | ---: | ---: |
+| **8× RTX 3090** | **139.7** | **590.7** | **1,151.2** |
 
-<sub>Profile `qwen38fn-fp8-8` as registered: TP8 + expert parallel, the model's
-native 262,144-token context, TurboQuant k8v4 main-KV, MTP k=2, FULL_DECODE_ONLY
-graphs. Exact workload — 1,000 input and exactly 2,000 output tokens per
-request, the model's shipped sampling defaults (temperature 1.0, top-p 0.95,
-top-k 20) seeded 42 — so these are not directly comparable to the GLM rows
-above, which use varied real prompts at temperature 0 with natural stops. Draft
-acceptance 58.9–64.5%. Requires the [QuixiAI P2P driver](docs/geforce-p2p.md)
-(32 GiB BAR1, `iommu=pt`); the P2P fabric is worth +36–58% here. A 125B-A6B MoE
-serving its native 262K context at 880 tok/s, on eight cards you can buy used,
-is the clearest statement of what this engine is for.</sub>
+<sub>Profile `qwen38fn-fp8-8` as deployed: TP8 + expert parallel, the model's
+native 262,144-token context, bf16 main KV, prefix caching, MTP k=2,
+FULL_DECODE_ONLY graphs. Exact workload — 1,000 input and exactly 2,000 output
+tokens per request, the model's shipped sampling defaults (temperature 1.0,
+top-p 0.95, top-k 20) seeded — so these are not directly comparable to the GLM
+rows above, which use varied real prompts at temperature 0 with natural stops.
+The c1 figure is the median of four seeded runs; single-stream varies
+129.8–157.8 with MTP draft-acceptance luck on the sampled text. Concurrency 32
+is this profile's measured peak, and `max_num_seqs` is set there deliberately.
+Requires the [QuixiAI P2P driver](docs/geforce-p2p.md) (32 GiB BAR1,
+`iommu=pt`); the P2P fabric is worth +36–58% here. A 125B-A6B MoE serving its
+native 262K context at over 1,100 tok/s, on eight cards you can buy used, is
+the clearest statement of what this engine is for.</sub>
 
 <!-- markdownlint-enable MD033 -->
 
@@ -208,7 +211,8 @@ profile exists for exactly the platforms it is validated on — if it is
 listed for your platform it works there, and it refuses to resolve anywhere
 else. Quant tags: `xxs` = IQ2_XXS(-Q2_K), `q4ktail` = Q4K-tail, `mxfp4` =
 MXFP4, `q4k` = Q4_K, `q2k` = Q2_K, `kdyn` = K-quant dynamic (per-layer
-mixed), `q2kxl` = Unsloth dynamic Q2_K_XL.
+mixed), `q2kxl` = Unsloth dynamic Q2_K_XL, `fp8` = the official block-FP8
+checkpoint.
 
 | Profile | Model | GPUs | Runs on | Drafter |
 | --- | --- | ---: | --- | --- |
@@ -244,7 +248,8 @@ takes `--quant MXFP4|Q4_K|Q4K-tail|IQ2_XXS`, the four 0731 builds; the two
 larger ones need 4 GPUs. Kimi K3 has one published quant. Muse-Glimmer takes
 `--quant kquant-dynamic|kquant-17gb`; Qwen3.8-27B has one published quant
 (Unsloth dynamic Q2_K_XL). Both are vision models served with their DFlash
-block-diffusion drafters. `slimserve --list`
+block-diffusion drafters. Qwen3.8-Flash-Next serves the official FP8
+checkpoint with its own single-layer MTP drafter. `slimserve --list`
 shows every profile and why any of them will not run here;
 `slimserve <profile> --dry-run` prints the resolved settings without loading
 anything.
@@ -648,24 +653,36 @@ checkpoint (`Qwen/Qwen3.8-27B`) directly, alongside the GGUF path.
 ## Qwen3.8-Flash-Next (vision)
 
 The newest model here, and the one that makes the strongest case for consumer
-hardware:
-a 125B-A6B vision-language hybrid — Gated DeltaNet plus Qwen Sparse Attention
-with 1-in-4 full attention, a 4-branch gated residual, and 51B of n-gram
-embeddings held in **pinned host memory** rather than VRAM. The 512 FP8 experts
-run expert-parallel through Marlin W8A16.
+hardware: a 125B-A6B vision-language hybrid — Gated DeltaNet plus Qwen Sparse
+Attention with 1-in-4 full attention, a 4-branch gated residual, and 51B of
+n-gram embeddings held in **pinned host memory** rather than VRAM.
 
 ```bash
 slimserve qwen38fn-fp8-8
 ```
 
 One published quant: `Qwen/Qwen3.8-Flash-Next-FP8` (block-128 FP8 experts, BF16
-backbone and vision tower). The checkpoint ships its own one-layer MTP drafter,
-so the draft model is the target directory itself; the profile runs k=2. It
-serves the model's native 262,144-token context on **eight RTX 3090s** with
-TurboQuant k8v4 main-KV — 2.64x the KV capacity of bf16, which is what makes the
-native context fit at all — reaching 838 tok/s at 16 concurrent requests and 880
-at 32. Requires the [QuixiAI P2P driver](docs/geforce-p2p.md); the
-[headline numbers](#qwen38-flash-next-on-eight-consumer-rtx-3090s) carry the
+backbone and vision tower). This is the 8× RTX 3090 target:
+
+- **FP8 without FP8 hardware.** SM86 has no FP8 tensor cores, so the 512
+  experts run expert-parallel through Marlin W8A16 block-FP8 kernels
+  (weight-only decode to BF16 compute). Expert parallelism is a correctness
+  requirement here, not a tuning choice — the block scale geometry does not
+  shard under TP.
+- **PLE tables in host RAM.** The full 47.7 GiB n-gram table stays pinned in
+  host memory per rank; the forward gathers 16 rows per token over UVA, inside
+  CUDA graph capture. GPU memory holds weights and KV only.
+- **Native 262,144-token context** with bf16 main KV, prefix caching, and the
+  checkpoint's own single-layer MTP drafter — the draft model is the target
+  directory itself, and the profile runs k=2.
+- **P2P driver strongly recommended.** Multi-GPU GeForce runs on the stock
+  driver but leaves 36–58% of throughput on the table; see
+  [docs/geforce-p2p.md](docs/geforce-p2p.md) for QuixiAI's patched
+  open-gpu-kernel-modules.
+
+It serves that native context on eight RTX 3090s at 1,151.2 tok/s with 32
+concurrent requests. The [headline numbers](#qwen38-flash-next-on-eight-consumer-rtx-3090s)
+and the [Performance](#8-rtx-3090--qwen38-flash-next-fp8) section carry the
 full methodology and caveats.
 
 ## Apple Silicon
@@ -984,6 +1001,29 @@ Speculation is always on in the shipped profiles; the plain row is the
 diagnostic reference. DeepSeek-V4 on Metal is under re-validation and its
 number is deliberately absent (the historical 33.7 tok/s was measured under
 a since-changed profile geometry; see `perf/baseline_status.md`).
+
+### 8× RTX 3090 — Qwen3.8-Flash-Next FP8
+
+`qwen38fn-fp8-8`, deployed configuration: native 262,144-token context, bf16
+KV, prefix caching, MTP speculation, QuixiAI P2P driver. Exact-token harness
+(1,000 in / 2,000 out per request, shipped sampling defaults, seeded):
+
+| Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |
+| ---: | ---: | ---: | ---: |
+| 1 | 139.7 | 139.7 | 14 s |
+| 8 | 590.7 | 81.1 | 25 s |
+| 32 | 1,151.2 | 39.8 | 50 s |
+
+The c1 row is the median of four seeded runs; single-stream varies
+129.8–157.8 tok/s run-to-run with MTP draft-acceptance luck on the sampled
+text.
+
+Concurrency 32 is the measured peak for this profile; `max_num_seqs` is set
+there deliberately. Peak aggregate throughput scaled 2.8× over the
+optimization campaign (409.7 tok/s at bring-up to 1,151.2 now) while the
+context ceiling doubled to the model's native 262K. On the stock NVIDIA driver (no GPU-GPU P2P) the same
+profile measures 36–58% lower — install the
+[P2P driver](docs/geforce-p2p.md).
 
 ### Benchmarking caveat
 

@@ -325,6 +325,22 @@ def build_app(
 
         app.add_middleware(XRequestIdMiddleware)
 
+    # Admission control: reject generation requests beyond a concurrency cap
+    # with 429 instead of queueing them invisibly. Per API-server process.
+    if envs.VLLM_ADMISSION_MAX_CONCURRENT is not None:
+        from vllm.entrypoints.serve.utils.server_utils import (
+            AdmissionControlMiddleware,
+        )
+
+        app.add_middleware(
+            AdmissionControlMiddleware,
+            max_concurrent=envs.VLLM_ADMISSION_MAX_CONCURRENT,
+        )
+        logger.info(
+            "Admission control enabled: max %d concurrent generation requests",
+            envs.VLLM_ADMISSION_MAX_CONCURRENT,
+        )
+
     # Add scaling middleware to check for scaling state
     app.add_middleware(ScalingMiddleware)
 

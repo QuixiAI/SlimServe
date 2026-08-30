@@ -1458,7 +1458,8 @@
             "kv_cache_dtype": "auto",
             "reasoning_parser": "kimi_k3",
             "tool_call_parser": "kimi_k3",
-            "served_model_name": "Kimi-K3"
+            "served_model_name": "Kimi-K3",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1",
@@ -1469,7 +1470,8 @@
             "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
             "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
             "HSA_XNACK=1 is required for this load.",
-            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "speculative_overrides": {
             "replicate_draft_backbone": true
@@ -1504,7 +1506,8 @@
             "kv_cache_dtype": "auto",
             "reasoning_parser": "kimi_k3",
             "tool_call_parser": "kimi_k3",
-            "served_model_name": "Kimi-K3"
+            "served_model_name": "Kimi-K3",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1",
@@ -1514,7 +1517,8 @@
             "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
             "HSA_XNACK=1 is required for this load.",
             "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
-            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         }
       }
@@ -1542,7 +1546,8 @@
             "trust_remote_code": true,
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
-            "served_model_name": "DeepSeek-V4-Flash"
+            "served_model_name": "DeepSeek-V4-Flash",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1551,7 +1556,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "metal": {
@@ -1616,7 +1622,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "max_num_seqs": 64
+            "max_num_seqs": 64,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1625,7 +1632,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "a100": {
@@ -1655,6 +1663,7 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
@@ -1697,7 +1706,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1706,12 +1716,14 @@
             "VLLM_DSV4_W1_QWARP8": "1"
           },
           "notes": [
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -1743,7 +1755,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1752,13 +1765,15 @@
             "VLLM_DSV4_W1_QWARP8": "1"
           },
           "notes": [
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 only (the measured platform). Two TP4 replicas keep each engine's verify batches at the graph-covered sweet spot; capture 64 covers the per-replica c8 width. Requires the 2026-08-10 DP-padding router fix."
         }
@@ -1787,7 +1802,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "max_num_seqs": 64
+            "max_num_seqs": 64,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1796,7 +1812,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "a100": {
@@ -1817,7 +1834,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1825,12 +1843,14 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -1861,7 +1881,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1869,13 +1890,15 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is fp8 here as qualified; bf16 main KV is the aspirational target (operator 2026-08-29: enforced on rtx3090 only for now, after quantized KV was implicated in multi-turn tracking errors on Qwen3.8-Flash-Next). Flip to auto only with an on-box A100 requalification pass - the KV byte budgets here were qualified at fp8 and hold half the tokens at bf16.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
         }
@@ -1904,7 +1927,8 @@
             "trust_remote_code": true,
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
-            "served_model_name": "DeepSeek-V4-Flash"
+            "served_model_name": "DeepSeek-V4-Flash",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1913,7 +1937,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         }
       }
@@ -1945,6 +1970,7 @@
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
             "served_model_name": "Qwen3.8-27B",
+            "enable_prefix_caching": true,
             "default_chat_template_kwargs": {
               "reasoning_effort": "low",
               "preserve_thinking": true,
@@ -1964,6 +1990,7 @@
             "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
             "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout.",
             "max_cudagraph_capture_size raised 64->192 to satisfy the capture-coupling rule (>= (k+1) x max_num_seqs at MTP k=2, seqs 64): with 64, decode batches above 21 requests silently ran eager (measured on rtx3090 as a -52% cliff before its fix). Raise is safety-directional (more graphs, same kernels); MI300X re-baseline pending.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ]
         },
@@ -2090,7 +2117,8 @@
             "Use case: capacity/long-context \u2014 k8v4 compresses full-attn KV 4096 -> 1728 bytes/token (~2.4x, target and drafter). Measured: 292,882 KV tokens vs canonical 158,038 under the same 16 GiB budget (1.85x; 8.94x vs 4.82x concurrency at 32k). Since UPDATE 40 this profile also wins on throughput at c4/c8/2500x64 and trails c1 by 0.8%; the canonical default is a flagged quality decision (k8v4 KV cos ~0.9955 floor vs bf16), not a TPS one.",
             "Engine settings otherwise identical to qwen38-nvfp4-1 (adaptive DFlash2 spec, V2 runner, DS conv layout, async scheduling).",
             "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix.",
-            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
+            "Prefix caching is off for hybrid state on Metal (same GDN state contract as qwen38-nvfp4-1; the align cache mode is unvalidated on this platform). Stated explicitly per the standing serving policy."
           ],
           "speculator": {
             "repo": "z-lab/Qwen3.8-27B-DFlash2",
@@ -2249,7 +2277,7 @@
             "enable_expert_parallel": true,
             "max_model_len": 262144,
             "max_num_seqs": 32,
-            "gpu_memory_utilization": 0.9,
+            "gpu_memory_utilization": 0.96,
             "kv_cache_dtype": "auto",
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
@@ -2264,6 +2292,14 @@
               "moe_backend": "auto",
               "linear_backend": "auto"
             },
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 64
+              }
+            },
             "default_chat_template_kwargs": {
               "reasoning_effort": "low",
               "preserve_thinking": true,
@@ -2275,7 +2311,7 @@
             "VLLM_QWEN4_EXP_PLE_HOST": "1",
             "NCCL_P2P_LEVEL": "SYS",
             "VLLM_GDN_DECODE_KERNEL": "triton",
-            "VLLM_QWEN4_EXP_TQ_MAIN_KV": "1"
+            "VLLM_ADMISSION_MAX_CONCURRENT": "96"
           },
           "notes": [
             "enable_expert_parallel is a correctness requirement, not a tuning choice: moe_intermediate_size is 640 and the FP8 block scales are [128, 128], so a TP shard of 80 cannot carry exact block scales. EP keeps 64 whole experts per rank (640 = 5 x 128).",
@@ -2285,11 +2321,16 @@
             "Multi-GPU GeForce runs fine on the stock NVIDIA driver but leaves 36-58% of TP throughput on the table: install QuixiAI's P2P driver (github.com/QuixiAI/open-gpu-kernel-modules, see docs/geforce-p2p.md) for direct GPU-GPU DMA. Measured on this profile: c1 109.6->148.8 (+36%), c8 409.7->647.9 (+58%). NCCL_P2P_LEVEL=SYS in this env is required for P2P across root complexes and harmless on stock drivers.",
             "reasoning_parser qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML.",
             "Speculation uses the checkpoint's own single-layer QSA MTP drafter (Qwen4ExpMTP) via method 'mtp'; there is no separate DSpark artifact for this model yet.",
-            "max_model_len is the model's native 262144, enabled by VLLM_QWEN4_EXP_TQ_MAIN_KV=1: the main QSA KV is stored as TurboQuant k8v4 (fp8 keys + 4-bit values, per-slot f16 scale/zero, 2.64x smaller than bf16), decoded in-register by the sparse-gather kernel. Measured cost vs bf16@131072 is within noise at c8-c32 and ~8% at c1; draft acceptance stays at bf16 parity. bf16 KV cannot fit 262144 on 24 GiB cards (weights take 17.6 GiB).",
+            "Main QSA KV is bf16 at the native max_model_len 262144 (operator decision 2026-08-28, was TurboQuant k8v4): bf16 measures ~8% faster at c1 and at parity c8-c32, with exact (unquantized) KV. The GPU pool at util 0.95 holds ~273K tokens = 1.04x one max-length request, so deep-context CONCURRENCY comes from the host KV tier (system RAM holds >8M tokens on this box), not the GPU pool. TurboQuant remains available: VLLM_QWEN4_EXP_TQ_MAIN_KV=1 restores 2.25x GPU-resident concurrency at 262144 (validated 2026-08-27) for boxes without the RAM for the host tier.",
             "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
             "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps.",
             "min_host_ram_bytes gates this platform at 128 GiB system RAM: the 47.7 GiB n-gram (PLE) table is pinned ONCE in a /dev/shm segment shared by all TP ranks (not per rank), plus load staging and runtime headroom. A machine that passes the GPU gate but lacks the RAM fails at plan time instead of dying mid-load.",
             "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range.",
+            "gpu_memory_utilization 0.96, not 0.9: this hybrid's packed KV slab charges every running request ~13-14 blocks at chat context (QSA token blocks at 1056 tokens/block, one compressor ring block, 3 GDN state blocks at MTP k=2, plus the drafter's cache group), and at 0.9 the ~2.2 GiB/rank pool holds ~373 blocks = 27 requests -- the scheduler silently caps below max_num_seqs 32 with the KV meter at 100%. 0.95 sizes the pool for the full 32 with margin. Found by WildChat multi-turn replay (2026-08-27). Raised again 0.95 -> 0.96 on 2026-08-28: bf16 KV at the native 262144 needs 3.55 GiB/rank and 0.95 provides 3.41 (startup check fails 140 MB short); 0.96 provides ~3.65 with ~0.4 GiB true free after the profiled activation and graph reserves.",
+            "VLLM_ADMISSION_MAX_CONCURRENT=96 caps total in-flight generation requests (decode slots plus engine queue) at 3x max_num_seqs; beyond that the API server answers 429 + Retry-After instead of letting the queue grow without bound. Measured at 64 concurrent sessions, oversubscription past 32 buys zero throughput (780.5 vs 779.7 tok/s) and only queueing delay (TTFT p50 40.2s vs 11.6s), so the cap exists to shed pathological load, not to police normal bursts: naive clients that burst to 60-90 requests still queue and complete. Non-generation routes (models, health, metrics) are never capped.",
+            "Prefix caching is ON (TurboQuant main-KV + mamba cache mode 'align', correctness validated 2026-08-27: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity). The mamba-page alignment forces 1056-token cache blocks, so hits require shared prefixes of at least one full block: shallow chats (~2K histories) measured only a 2.2% hit rate for ~4% peak throughput, but deep multi-turn traffic is transformed - a 100K-token history is ~94 cached blocks and each turn re-prefills only the tail, versus re-paying the entire history every turn with caching off (measured: the engine degenerates to ~5K tok/s prefill / ~20 tok/s generation on deep conversations). Finer-grained caching needs decoupling the attention block from the mamba state snapshot (open kernel/allocator work).",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Validated on rtx3090: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above) is ENABLED and validated on this box (2026-08-28): 64 GiB pinned host RAM per rank (512 GiB total) = ~12,146 block slots = ~4.8M tokens of evicted-conversation capacity behind the ~270K-token GPU pool. Tail states ride the engine's own frozen align-mode boundary snapshots (pool prefix cache, looked up by boundary hash - never live blocks); restores land at position k-1 per mamba group and the QSA ring is zeroed defensively. Validated: multi-depth marker-recall acceptance (8K/24K/42K restored sub-second after full GPU-pool eviction, outputs byte-identical to GPU-cache controls at 8K/24K), throughput-neutral (c1 133.6 / c8 599.4 / c32 1,149.7 vs 1,151.2 no-tier baseline). Known limitation: one tail per trajectory - a sibling re-ask after a deeper follow-up turn re-prefills instead of resuming (correct, just slower); resume boundaries exist at ~2K-token chunk ends, so sub-chunk (<2K) conversations are not tier-resumable (re-prefill is faster anyway). Raw: perf/results/2026-08-28/kv-tier/.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ],
           "speculative_overrides": {

@@ -271,11 +271,33 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
 
 
 # Serving behavior every profile gets unless it overrides the key itself.
+#
+# STANDING POLICY (2026-08-28): SlimServe serving ALWAYS has automatic
+# prefix caching, automatic tool calling, and thinking enabled, and NEVER
+# uses greedy sampling. A profile may override a key only for a model-level
+# impossibility (e.g. R-SWA decode KV is not cacheable) and must carry a
+# note naming the reason. Do not rely on engine defaults for any of these:
+# vLLM silently defaults prefix caching OFF for hybrid (mamba/GDN) models,
+# which shipped qwen38fn-fp8-8 with a 0.0% cache hit rate and full-history
+# re-prefill on every chat turn. Benchmarks and diagnostics use the model's
+# recommended sampling (temperature 1.0 / top_p 0.95 / top_k 20, seeded for
+# reproducibility), never temperature 0.
+#
+# Main KV is ALWAYS bf16 (kv_cache_dtype auto) on rtx3090 profiles
+# (operator 2026-08-29; quantized KV was implicated in multi-turn
+# tracking errors on Qwen3.8-Flash-Next). bf16 main KV is aspirational
+# on other platforms: they keep their qualified configs until an on-box
+# requalification pass. Draft-model KV (DSpark TurboQuant) is exempt
+# everywhere: rejection sampling verifies drafts against the target, so
+# draft precision affects speed, never output content. Enforced by
+# test_no_profile_quantizes_main_kv.
+#
 # "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
 # GLM/Qwen one; templates ignore the name they do not use.
 _SERVING_DEFAULTS: dict[str, Any] = {
     "enable_auto_tool_choice": True,
     "default_chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+    "enable_prefix_caching": True,
 }
 
 

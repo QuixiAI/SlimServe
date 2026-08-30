@@ -59,6 +59,19 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def response_scaffold(self) -> str:
+        """Chat-template scaffold between the reasoning-end marker and the
+        response content (e.g. Qwen3's ``'</think>\\n\\n' + content``).
+
+        The model reproduces this scaffold at inference time, but the
+        template defines it as formatting, not response. Structured-output
+        backends use it to tolerate exactly this prefix before the
+        constrained payload instead of fighting the model's first token.
+        Empty when the template has no such scaffold.
+        """
+        return ""
+
     def has_engine_confirmed_reasoning_end(self) -> bool:
         """Whether the engine has confirmed the reasoning end transition.
 

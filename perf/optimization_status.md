@@ -16006,6 +16006,432 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
     256 GiB) -- unchanged.
 - Suites: 45 passed / 104 skipped.
 
+## 2026-08-27 - Production service + WildChat-1M multi-turn traffic replay (qwen38fn-fp8-8 via systemd)
+
+- Deployment: systemd unit slimserve-qwen38fn (Restart=always, boot-enabled,
+  logs to /var/log/SlimServe with logrotate, VLLM_API_KEY auth). Two install
+  faults found and fixed: (1) StandardOutput=append: opens the log file
+  BEFORE LogsDirectory= creates the directory -> 209/STDOUT crash loop;
+  fixed with a tmpfiles.d entry (deploy/slimserve.tmpfiles). (2) systemd
+  units do not source ~/.bashrc, so FlashInfer JIT warmup died with
+  FileNotFoundError: 'ninja'; fixed by putting venv bin + CUDA 13.3 bin on
+  PATH plus CUDA_HOME/LD_LIBRARY_PATH in /etc/slimserve/env. The rank-5/6
+  CUDACachingAllocator OOM warnings during weight load were a red herring -
+  the same non-fatal retry warnings appear 4000x in successful serve logs.
+- New harness: benchmarks/benchmark_wildchat_replay.py. Samples real
+  WildChat-1M conversations, replays user turns one at a time per session,
+  appends the model's OWN streamed replies to the history (real trajectory
+  growth), closed-loop session concurrency, per-turn TTFT/e2e/usage records.
+- Workload: 128 conversations, 504 user turns, mean 3.9 turns/session,
+  thinking on (deployment default), temp 1.0 / top_p 0.95 / top_k 20,
+  max_tokens 1024/turn, identical workload at both concurrencies.
+- Results (0 errors in 1,008 turns; service healthy throughout):
+  - c32: 779.7 out tok/s (1,470 total tok/s incl prefill), TTFT p50/p90
+    11.6/24.2 s, e2e p50 31.5 s, mean reply 813 tok.
+  - c64: 780.5 out tok/s (identical - saturated), TTFT p50/p90 40.2/55.3 s.
+    Oversubscription buys zero throughput, only 3.5x TTFT: the profile's
+    c32 operating point is the right admission cap.
+- FINDING (open): effective concurrency ceiling is 27, not 32. Engine logs
+  show Running peaks at 27 with GPU KV cache usage 100% and a 5-6 deep
+  waiting queue even at c32, while the token pool (386,212 tokens) is far
+  from full on token count alone (~80K live tokens). Hypothesis: the
+  per-request fixed-size GDN recurrent-state group inside the 2.2 GiB/rank
+  KV budget exhausts at 27 slots. Impact: the c32 campaign numbers were
+  really c27+queue; a modest KV budget bump (util 0.9 -> 0.92, or trimmed
+  capture list) should recover true 32-slot decode. Follow-up: inspect
+  kv_cache_groups sizing, re-bench c32.
+- Comparison to synthetic baseline: exact-token c32 = 881.6 out tok/s;
+  real-traffic c32 = 779.7 out tok/s (-11.6%), explained by per-turn
+  full-history re-prefill (prefix caching disabled; hit rate 0.0%), short
+  replies (813 vs 2000 tok), and client-side turn turnaround. Total
+  processed throughput 1,470 tok/s. Multi-turn traffic is the first
+  workload where enable_prefix_caching=False visibly costs: depth-8 turns
+  re-prefill ~2K tokens every turn.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (warmup.json,
+  c32.json, c64.json, stdouts).
+
+## 2026-08-27 - 27-slot ceiling fixed (+27% c32); admission control shipped; short-prompt correctness bug found
+
+- Ceiling root cause (from WildChat replay finding): the packed CSA+linear
+  KV slab at util 0.9 held ~373 blocks/rank (2.23 GiB); each running chat
+  request pins ~13-14 blocks (attn pages at block_size 1056 + compressor
+  ring + 3 GDN state blocks at k=2 + drafter group), capping Running at 27
+  with the KV meter at 100%. util 0.9 was leaving ~1.2 GiB/rank idle.
+- Fix: gpu_memory_utilization 0.9 -> 0.95 in qwen38fn-fp8-8/rtx3090.
+  Pool: 2.23 -> 3.41 GiB, 386,212 -> 590,324 tokens, max concurrency
+  1.47x -> 2.25x. Validated on a manual serve (port 8001, no QA traffic):
+  c1 131.7 (baseline band unchanged), c32 1115.6 vs 881.6 = +26.5%,
+  Running peaks at the full 32 with Waiting 0 and KV peak 86.9%.
+  New baseline candidate; bench logs bench_ceilingfix_c{1,32}.log.
+- Admission control: new AdmissionControlMiddleware (api_server, env
+  VLLM_ADMISSION_MAX_CONCURRENT, profile sets 96 = 3x max_num_seqs) sheds
+  load past a bounded queue with 429 + Retry-After. Verified: burst of 120
+  -> exactly 96 admitted + 24 rejected. Unit tests
+  tests/entrypoints/test_admission_control.py (3 green).
+- OPEN CORRECTNESS BUG (found by the 120-burst, reproduced at c1): prompts
+  of exactly 1 or 3 tokens produce garbage ('!!!!' = token 0 = NaN-logits
+  signature) NONDETERMINISTICALLY at temperature 0 (n=3 gave ' at'/' in'/'!'
+  across identical runs). n=2 and n>=4 are always correct (mapped n=1..12
+  with fixed content). n=1 garbage from the first sampled token (prefill
+  broken); n=3 sometimes-good first token then garbage (decode also
+  implicated). Draft acceptance collapses to 1.2% in the same regime.
+  One of two 120-burst runs escalated to a fatal CUDA illegal memory access
+  (crash log serve_manual_8001_crash1.log) - consistent with the campaign's
+  intermittent illegal-access watch flag: reads of uninitialized/unmapped
+  memory that usually land in mapped garbage and occasionally fault.
+- PLE dilated short-conv (kernel 4, dilation 3 = ngram_size, state 9) prefill
+  math reviewed and looks correct; parity {1,3} does not match dilation-3
+  residues, so conv is not the prime suspect. Current A/B in flight: same
+  config without speculative_config (suspect: drafter KV/state writes for
+  packed-layout backends, cf. commit b4cc16492) - if no-spec is clean, the
+  drafter path is the fault; else next A/B is VLLM_QWEN4_EXP_TQ_MAIN_KV=0.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (crash logs,
+  repro_burst.py, serve_nospec_8001.log).
+
+## 2026-08-27 - Short-prompt garbage + burst crash root-caused and fixed (two bugs)
+
+- Isolation matrix (spec x cudagraphs, manual servers on 8001): n=3 garbage
+  requires spec+FULL graphs; n=1 garbage persists in every combination.
+  Logprobs showed CONFIDENT distributions over wrong context (n=1 continued
+  an ASCII run: capture-dummy arange content), and greedy outputs were
+  nondeterministic -> uninitialized-memory reads, not NaNs.
+- Bug B (n=3, spec+graphs): batch shape alone chose the graph family. A
+  fresh 3-token prompt has the same shape as a k=2 spec-decode step
+  (uniform 3 tokens/req), so dispatch replayed the FULL spec-decode graph
+  over prefill work, reading sampled-token/state slots the request never
+  wrote. This is also the 120-burst engine killer ("Say hi." = 3 tokens
+  x 96 requests; 1-in-2 runs escalated to a fatal CUDA illegal access).
+  FIX: model_runner dispatch gate - a shape-uniform batch is only
+  graph-eligible if no scheduled request is still prefilling
+  (num_computed_prefill < prefill_len, O(num_reqs) numpy/dict check).
+- Bug A (n=1, everywhere): decode/prefill classification by query length.
+  The GDN builder split with plain qlen==1 (split_decodes_and_prefills
+  without treat_short_extends_as_decodes=False, unlike the mamba base
+  builder which already passes it), so a fresh 1-token prompt took the
+  GDN DECODE path (fused packed decode / causal_conv1d_update), which
+  reads conv+SSM state slots unconditionally - uninitialized for a
+  never-prefilled request. Same latent defect in the GDN spec-branch
+  manual count and the short-conv spec-branch masks.
+  FIX: gdn_attn non-spec split now passes
+  treat_short_extends_as_decodes=False; gdn spec-branch count and
+  short_conv spec-branch masks exclude is_prefilling rows (reorder
+  already places them behind true decodes, so contiguous splits hold).
+- Validation on the full production config (spec k=2, FULL graphs, TQ,
+  util 0.95, admission 96): n=1..12 all correct and DETERMINISTIC at
+  temp 0 (3 runs each); 3x 120-burst rounds of 3-token prompts all
+  survived (96x200 + 24x429 each); draft acceptance on short-prompt
+  bursts recovered 1.2% -> 58.0%. Dispatcher + admission suites green.
+  Perf re-check c1/c32 in flight (dispatch gate only affects batches
+  containing mid-prefill requests; steady decode untouched).
+- Logs: serve_{nospec,nograph,fixed}_8001.log, crash1/2 logs, repro_burst.py
+  under perf/results/2026-08-27/qwen38fn-service-wildchat/.
+
+## 2026-08-27 - PLE dilated-conv prefill OOM under multi-turn waves at util 0.95; sliced transient fix
+
+- First prefix-caching trial server (TQ + mamba 'align', util 0.95) passed
+  the single-stream correctness gate (byte-identical cached/uncached greedy
+  outputs, incl. n=1..8 short prompts and a 700-token shared-prefix chat
+  shape; mamba-align KV cost only 590,324 -> 581,447 tokens, -1.5%) but the
+  ENGINE OOM-crashed under the WildChat c32 replay: torch.OutOfMemoryError
+  allocating 148 MiB in _short_conv_dilated_prefill_batched.
+- Root cause is NOT prefix caching: the PLE dilated short-conv prefill packs
+  requests into ~5 dense [num_prefills, max_query_len, hidden] transients
+  (~1.7 GB for a 31 x ~2K-token turn wave at hidden 2560), which fit inside
+  the activation slack at util 0.9 but not at 0.95. The exact-token bench
+  (uniform 1000-token prompts, fewer concurrent prefills) never triggers
+  it -- so the shipped util-0.95 profile was exposed for ANY multi-turn
+  workload, prefix caching or not.
+- Fix: slice the packed conv pipeline over request chunks bounded by a
+  16M-element budget (single-pass fast path preserved; token selection via
+  sync-free masked gathers; per-slice state update). PLE suite 5/5 green.
+- Trial-2 relaunched: correctness gate + WildChat c32 replay on the fixed
+  build; ship/revert decision on its results.
+
+## 2026-08-27 - Prefix-caching trial verdict: correct but not shipped (1056-token blocks starve the hit rate)
+
+- Trial-2 (post PLE-slicing fix): correctness gate PASS twice (byte-identical
+  cached/uncached greedy outputs incl. short prompts and shared-prefix chat
+  shapes); WildChat c32 replay 504/504 turns, 0 errors - the OOM fix holds
+  on the exact workload that killed trial-1.
+- Measured benefit: prefix cache hit rate 2.2-2.4%. Root cause is
+  structural: the hybrid's mamba-page alignment forces block_size 1056, and
+  prefix caching reuses only COMPLETE blocks, so typical chat histories
+  (195-1,738 prompt tokens across depths 1-8 in this workload) rarely
+  finish even one shared block. Throughput 746.2 vs ~780 out tok/s (-4%),
+  mamba-align KV capacity cost -1.5%.
+- DECISION: not shipped as profile default. enable_prefix_caching remains
+  off; documented as a valid option for long-context multi-turn deployments
+  (10K+ token histories span many 1056-token blocks) pending a bench in
+  that regime. Raw: c32_prefixcache.json, serve_prefixcache_8001.log.
+- Final sweep: 104 tests green (slimserve profiles, cudagraph dispatch,
+  admission control, PLE host table, config-view invariant).
+
+## 2026-08-27 - c64 retest after the slot fix: 32 remains the peak, now for an honest reason
+
+- Motivation: the earlier "no gain past 32" verdict was measured while the
+  engine silently capped at 27 slots, so it had to be retested.
+- seqs=32/capture=96 (shipped config): c48 = 1056-1067 over three clean
+  rounds (vs 1134 at c32) - beyond 32 the client queue costs a little and
+  buys nothing, because decode batches above 32 seqs (>96 tokens) exceed
+  the graph ceiling and run eager.
+- seqs=40/capture=128 (proper >32 config): c32 987 / c40 1065 / c48 1077,
+  no crashes. Still below the shipped config's 1134 peak: the packed-slab
+  KV pool's fixed per-request cost (~90 MB/rank) binds at ~36 concurrent,
+  so extra slots trade graph efficiency for pool pressure. The wider
+  capture config also regresses c32 itself by 13%.
+- DECISION: profile stays at max_num_seqs 32 / capture 96; the c32 peak
+  (1,134.4) is now measured with all 32 slots genuinely active.
+- OPEN (top watch item): intermittent CUDA illegal-instruction race in
+  COMPILED-EAGER mixed spec+prefill batches. Repro: exact bench c48 on the
+  shipped config, ~1-in-4 runs (first hit dumped a 10-req mixed batch at
+  28% KV, no preemption; crash log serve_c64test_8001.log). Hidden by
+  CUDA_LAUNCH_BLOCKING=1 (960 tok/s c48 fully serialized, no crash);
+  today's classification/gate/PLE edits verified no-ops for the crashing
+  batch shape, and 3x c48 + all graphed seqs40 runs survived - consistent
+  with the campaign's pre-existing 2-in-6 watch-flag, which now has a
+  repro recipe. Suspect surface: stream ordering in the mixed-batch
+  metadata/state path; async_tensor_h2d itself audited stock-safe.
+  Production c32 exposure unchanged from the entire campaign (mixed
+  batches occur at any concurrency; crash observed only under the c48
+  stress shape so far).
+
+## 2026-08-27 - Crash-hunt update: burst crash attributed to the FIXED dispatch bug; soak hunting the one residual
+
+- Re-reading crash dumps: crash-1 (120-burst engine death) ran on PRE-fix
+  code and its dumped batch is a uniform 32x3=96-token spec-graph replay
+  containing fresh 3-token prompts - exactly bug B (shape-matched dispatch
+  into the spec-decode graph family), already fixed and regression-tested.
+  Attributed, closed.
+- Crash-2 (c48 bench warmup, post-fix) is the only unexplained instance:
+  a 2048-token mixed batch (7 spec decodes + 2 new prefills + 1 chunk
+  continuation) saturating the chunked-prefill budget, which is also the
+  compile_ranges endpoint; ALL TP ranks faulted simultaneously (illegal
+  address on one rank, illegal instruction on another - one wild-pointer
+  event, rank-local views), implicating TP-replicated inputs. Post-fix
+  rate: 1 in ~25 crash-shaped exposures; synthetic churn (135 waves), 10
+  warmup-shape bench loops, and 8 chunk-512-amplified loops all clean;
+  CUDA_LAUNCH_BLOCKING run clean (weak evidence - serialization changes
+  batch formation). Static audit cleared async H2D lifetime, output/draft
+  copy streams, QSA gather + store masking, fused-GDN (not on the shape).
+- Soak in flight: detached loop of the only crashing workload (c48
+  1000/2000, standard config), auto-preserving each crash's serve log +
+  SchedulerOutput dump, relaunching between crashes (soak_hunt.sh; quota
+  4 crashes or 5 h).
+
+## 2026-08-28 - Crash-hunt closed: 149-run soak, zero crashes; residual bounded below ~1.5%
+
+- Soak: 149 consecutive c48 exact-bench runs (1000 in / 2000 out, the only
+  workload that ever crashed post-fix) over ~4.7 h on the shipped profile
+  config, warm engine throughout. ZERO crashes, zero errors. A post-fix
+  crash rate above ~1.5%/run is excluded at high confidence.
+- Final attribution: crash-1 (120-burst) = bug B (fresh 3-token prompts
+  replayed through the spec-decode graph family), fixed and
+  regression-tested same day. Crash-2 = a single unexplained sub-1% tail
+  event on a cold server's first traffic; never recurred across 149 warm
+  + several cold exposures. Plausible non-software contribution noted:
+  no ECC on 3090s, and on the P2P fabric one rank's wild write can land
+  in a peer's mapped BAR, which would produce exactly the observed
+  all-ranks-simultaneous fault from a single event.
+- Standing recipe if it recurs: soak_hunt.sh loops the workload,
+  auto-preserves each crash's serve log + SchedulerOutput dump, and
+  relaunches; the engine's dump_input fires on every engine death, so any
+  production recurrence self-documents in /var/log/SlimServe/serve.log.
+- Status: CLOSED as monitored. Production restored to QA on the fixed
+  profile (util 0.95, admission 96, all correctness fixes).
+
+## 2026-08-28 - Host KV tier: architecture built and unit-proven; e2e restore debug in progress
+
+- Built: HostTierConnector (custom KV connector, SupportsHMA) + HostKVTierIndex
+  (scheduler-side hash->slot index, per-group completeness, trajectory-affine
+  LRU) + KVTierDMA (per-rank pinned arena at the packed slab stride, in-order
+  copy stream, one contiguous DMA per block). 14 unit tests green. Profile
+  wires 64 GiB/rank (512 GiB pinned, ~3.4M host tokens). Registered in the
+  connector factory; rides the framework's async-KV-load path
+  (WAITING_FOR_REMOTE_KVS) for prefetch-at-admission.
+- Also shipped en route (operator direction): bf16 KV at native 262144
+  (util 0.96, 269,544-token pool, 1.03x; TQ retained as documented option -
+  operator observed turn-tracking confusion plausibly linked to KV
+  quantization at A6B active params, though two of today's fixed bugs are
+  alternative explanations); prefix caching ON across ALL profiles with a
+  registry-defaults backstop and enforcement tests; standing policy in
+  CLAUDE.md and registry.py (always prefix caching + tool calling +
+  thinking, never greedy - benches un-greedied).
+- E2E acceptance status across 8 instrumented server cycles: offload staging
+  works at scale (680 hashes / 3400 slots across 6 trajectories), return-turn
+  lookup finds the full 105-block chain, DMA and completion reporting proven
+  in isolation. Open: the restore hand-off - the framework allocates far
+  fewer GPU target blocks than the external span (observed [3,1,3,3,3,3]
+  per group for a 42K restore; per-manager external token views 840 / 1),
+  meaning per-group external-allocation semantics (mamba boundary-state-only,
+  and an unexplained full-attention clip) differ from the naive
+  every-boundary model. Entry-point tracing cycle in flight to pin the
+  exact per-manager arithmetic; restore pairing will then match the
+  framework's contract instead of assuming it.
+- Discipline note: every serving-path edit cycled through a full boot
+  (~12 min/cycle); prod stayed on port 8000 throughout with QA-visible
+  interruptions authorized by the operator.
+
+## 2026-08-28 - Host KV tier: the debugging saga and final design
+
+Fourteen server cycles of differential debugging, each isolating one layer.
+The final architecture and why each piece is shaped the way it is:
+
+- ATTENTION blocks: mirrored to the pinned host arena at fill time, one
+  step behind the verified-token watermark (speculative rejections can
+  never be captured). Immutable once full, so offload is write-once and
+  GPU eviction is free.
+- STATE (mamba align) blocks: copied ONCE at request finish, when the
+  newest state block is quiescent. Two designs were tried and measured
+  before this one: (a) per-boundary saves during life captured TORN state
+  (the newest block is updated in place every step; restoring those
+  copies = 6/6 NaN follow-ups; saving the "frozen previous boundary"
+  instead lost a race with chunked prefill advancing ~5 boundaries/step
+  and archived reallocated blocks = token-soup restores); (b) the
+  framework's async-save hold (request_finished_all_groups -> True /
+  deferred free) CORRUPTS THE BLOCK POOL for hybrid models - the decisive
+  differential: tier+hold = intermittent NaN logits on any cached
+  follow-up deeper than ~1 chunk, tier-without-hold = 0/12, no-tier =
+  0/12. Final: pin the state blocks with a plain BlockPool.touch()
+  reference, copy, release one meta-build later (the same
+  in-order-copy-stream window that confirms slot writes).
+- RESTORES ride the framework's async-KV-load path with per-step
+  progressive chunking (the scheduler clips the external span to its
+  token budget and re-queries; progress must be tracked
+  connector-relative because num_computed_tokens does not advance for
+  waiting requests). Mixed local+tier resumes work (GPU cache serves the
+  head, tier serves the tail); state blocks ride the final chunk.
+- Wrong turns worth remembering: scheduler-side cache_config.block_size
+  holds a STALE pre-alignment value (8) - the group spec's block_size
+  (400) is authoritative, and the 50x underreport made the scheduler
+  "clip" restores to nothing; CircularBufferSpec ring groups are excluded
+  from prefix caching by their own manager and must be ignored by the
+  tier; block tracking must come from scheduler_output (NewRequestData /
+  CachedRequestData), not update_state_after_alloc (admission-only, full
+  lists); tail saves must be issued in start_load_kv because
+  wait_for_save is skipped on empty-batch steps (dropping them leaked
+  every finished request's blocks until the pool wedged at 93.9%).
+- Measured before the final fix landed: return-to-conversation restore of
+  a 42K-token trajectory in 0.9-1.7s vs 8.5s re-prefill, sub-second
+  6-op mixed restores, 62 confirmed save batches, KV pool recycling
+  correctly. ENGINE BUG filed in-notebook: the HMA deferred-free path
+  (SupportsHMA request_finished_all_groups asymc-save hold) corrupts the
+  block pool on this hybrid - do not use it; the refcount pin is the
+  sanctioned pattern here.
+
+## 2026-08-28 - Host KV tier parked (disabled in profile) pending the state-geometry fix
+
+- Ring-in-tier improved deep resumes 0/8 -> 4/8 recall (the framework
+  skips zeroing every block in an async-load's token range, so the tier
+  must overwrite the ring; its finish-time content is the trajectory tail
+  window and is semantically correct to restore). The remaining failures
+  were then proven byte-clean (SHA verify: 0 mismatches across 8 ranks,
+  all sizes, including failing runs) -> pure semantics.
+- Two state-snapshot theories measured and disproven (live tail block:
+  4/8; penultimate "boundary snapshot": 0/5), then direct instrumentation
+  of request_finished_all_groups revealed the false foundation: for a
+  1312-token request (3 full 400-token attention blocks), the mamba
+  groups hold SIX position slots with THREE resident blocks - the state
+  groups do not share the attention block geometry at runtime, despite
+  kv_cache_config reporting uniform block_size 400 for every group. All
+  position arithmetic built on shared geometry was therefore wrong by
+  construction, and which saved block happened to be a valid boundary
+  snapshot was luck - matching the observed nondeterminism exactly.
+- DECISION: prod reverted to the proven-clean config (bf16 + prefix
+  caching, no tier; 0/12 corruption controls). The tier ships in-tree,
+  disabled, with the attention path fully validated (byte-exact offload/
+  restore, sub-second 42K resumes, leak-free lifecycle, 11 unit tests)
+  and a profile note stating the exact re-enable condition. Next session:
+  read the mamba-align cache_blocks commit path to learn the true state
+  position/granularity mapping (resolve_block_hashes alignment_tokens
+  scaling is the likely key) and mirror it; the acceptance battery in
+  perf/results/2026-08-28/kv-tier/ is the ready-made gate.
+
+## 2026-08-28 - Deployed-config baseline: bf16 + prefix caching (post all fixes)
+
+- Exact bench (1000/2000, temp 1.0 / top_p 0.95 / top_k 20, seed 42),
+  idle prod server, deployed profile (bf16 KV @ native 262144, prefix
+  caching + mamba align, util 0.96, admission 96, no tier):
+  c1 129.8 / c8 590.7 / c32 1,151.2 tok/s.
+- c32 is the best recorded for this box (TQ config: 1,134.4); c8 at the
+  top of its band; c1 -14% vs TQ@0.95 (prefix-caching/align bookkeeping
+  unamortized at single stream) - acceptable for the 99%-agentic load and
+  noted as a future single-stream tuning target.
+- Operator confirmed the multi-turn turn-tracking issue is FIXED on this
+  config. Campaign cumulative: 409.7 (bring-up) -> 1,151.2 = 2.8x with
+  double the context, exact KV, and correct conversation behavior.
+- Raw: perf/results/2026-08-28/qwen38fn-bf16-baseline/.
+
+## 2026-08-28 - c1 variance check + KV policy sweep (bf16 everywhere)
+
+- c1 re-runs on deployed prod (seeds 43/44/45): 141.3 / 157.8 / 138.0 tok/s.
+  The baseline entry's 129.8 (seed 42) is a low outlier, not a bf16 cost:
+  single-stream spread is 129.8-157.8 across four seeds, driven by MTP
+  draft-acceptance on the sampled text. Median of four = 139.7; README uses
+  that with the spread noted. Raw: qwen38fn-bf16-baseline/bench_bf16_c1_rerun*.
+- Operator policy (2026-08-28): NO quantized main KV on any profile.
+  Flipped the five A100 DSV4 variants from kv_cache_dtype fp8 -> auto with
+  notes: their KV byte budgets were qualified at fp8, so the same bytes now
+  hold half the tokens - A100 requalification required before trusting the
+  old context/concurrency ceilings. All other profiles were already auto.
+  Exceptions on record: Metal fp8_ds_mla (kernel packed-layout requirement,
+  not a quant choice) and DSpark TurboQuant DRAFT KV (rejection sampling
+  verifies drafts against the target; draft precision cannot alter output).
+  Enforced by test_no_profile_quantizes_main_kv (56 profile tests green).
+- Standing directive recorded in CLAUDE.md + registry: CPU-offloaded KV
+  (HostTierConnector pinned-RAM tier) is the goal on ALL non-Metal
+  profiles once the mamba/GDN state-geometry fix lands; enable only with
+  on-box validation per platform. Metal will instead get NVMe-backed KV
+  offload later (unified memory; no host-RAM tier distinction).
+
+## 2026-08-28 - Host KV tier: mamba state-geometry fix, VALIDATED, ENABLED
+
+- Root cause of the parked corruption: the tier saved mamba state by
+  POSITION among a request's live blocks, but align mode migrates state
+  forward in place - every resident block covers an unaligned token count,
+  and the "extra positions" were MTP speculative blocks. Restoring any of
+  them desynchronized state from the attention span (the garbled resumes).
+- Fix rides the engine's own machinery: at a boundary crossing align mode
+  freezes the boundary state, hashes it into the pool prefix cache, and
+  never rewrites it. The tail save looks that block up by boundary hash
+  (get_cached_block) and offloads the immutable snapshot; restore lands it
+  at position k-1, matching the worker's state_idx=(computed-1)//bs seed.
+  MambaManager external allocation now mirrors the internal-hit shape
+  ([null]*(k-1)+[real]). The QSA ring needs nothing (never framework-
+  zeroed; internal hits validate correct on stale-claimed rings at aligned
+  boundaries) - the tier zeroes it anyway for determinism.
+- Two more discoveries en route (TIER-DBG differential logging):
+  (1) frozen states materialize ONLY at chunk-end columns (~2000-token
+  scheduling chunks): one real column per chunk, intermediates stay null
+  and the cache watermark seals them forever -> the save now scans DOWN
+  from computed//400 to the deepest boundary all 4 mamba groups have
+  cached (<=1 chunk of re-prefill on resume). (2) ninja must be on PATH
+  for flashinfer JIT when launching manually (.venv/bin).
+- Acceptance (multi-depth marker recall, 8K/24K/42K, full GPU-pool
+  eviction via 6x55K fillers): restores fired sub-second at all depths
+  (42K: 0.5s vs 9.0s cold), outputs byte-identical to GPU-cache hot
+  controls at 8K/24K, correct recall at 42K (restored answered correctly
+  in a run where the hot control degenerated). Known limitation: one tail
+  per trajectory (sibling re-ask after a deeper follow-up re-prefills;
+  append-only agentic turns always reach the deepest tail).
+- Throughput with tier enabled (exact 1000/2000, seeded, port-8001 manual
+  server, same config as prod): c1 133.6 / c8 599.4 / c32 1,149.7 vs
+  no-tier baseline 129.8-157.8 / 590.7 / 1,151.2 -> NEUTRAL.
+- ENABLED in qwen38fn-fp8-8/rtx3090: 64 GiB pinned/rank = 12,146 slots
+  = ~4.8M tokens of evicted-conversation capacity. 75 tests green.
+  Platform ports tracked: MI300X #17, A100 #18, Metal NVMe #19.
+- Raw: perf/results/2026-08-28/kv-tier/ (acceptance_v2_final.log,
+  bench_tier_c*.log, serve_tier_fix*.log).
+
+## 2026-08-29 - Deployed-service full bench (tier enabled, port 8000)
+
+- Exact bench (1000/2000, seeded, engine idle) against the production
+  systemd service with the host KV tier live: c1 142.2 / c8 600.5 /
+  c32 1,091.8 (seed 42) and 1,199.8 (seed 43 re-run) tok/s.
+- c32 1,199.8 is the best number ever recorded on this box (prior peak
+  1,151.2); the 1,091.8 sample shows c32 run-to-run spread of ~10% with
+  MTP acceptance + prefix-hit interplay - band, not point. c1/c8 within
+  their established bands. Tier remains throughput-neutral in production.
+- Raw: perf/results/2026-08-29/qwen38fn-tier-deployed/.
 ## 2026-08-27 - PR #12 x main: semantic merge of the two Metal campaigns
 
 - Scope: merged current main (Metal KV working-set fit + 7 GiB reserve,
@@ -16688,3 +17114,274 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   health with the 47 GiB fixed KV pool intact at capture 128, then (b) take
   a c16/c32 exact pass -- c32 is 128 rows, precisely the band that was
   running eager and the one main measured at roughly half throughput.
+
+## 2026-08-29 - KV policy scoped: bf16 main KV enforced on rtx3090 only
+
+- Operator decision after the Metal-campaign merge surfaced the
+  qwen38-nvfp4-1-tq TurboQuant-main-KV Metal variant: bf16 main KV is
+  enforced (by test) on rtx3090 profiles only, where the multi-turn
+  tracking corruption was root-caused; it is aspirational elsewhere.
+- Reverted the five A100 DSV4 variants to their qualified fp8 KV configs
+  (the 2026-08-28 flip to auto was never A100-validated and halved their
+  token pools); each carries a note to flip only with an on-box
+  requalification pass. The -tq Metal variant stands as shipped.
+
+## 2026-08-29 - Post-merge prod bounce: one CUDA/Metal seam fix, then healthy
+
+- First boot of the merged tree crashed in warmup: run_fused_postprocess_align
+  copy 32 vs 33 - the Metal campaign grew the shared num_accepted_tokens_gpu
+  by one trailing MPS sentinel slot (max_num_reqs + 1), while the CUDA align
+  context's whole-buffer snapshot stayed at max_num_reqs. Fixed by sizing
+  num_accepted_tokens_out to match, comment ties the two allocations.
+- Service healthy on the merged code: host tier arena registered (12,146
+  slots x 64 GiB/rank), reasoning_effort low live (trivial turn answered
+  with 0 thinking tokens), c8 spot bench 590.7 tok/s (= the 590.7 baseline).
+
+## 2026-08-29 - Tool-call diagnostics: serving paths validated; "no tool calls" reports traced to saturation queueing
+
+- Operator relayed reports that the deployed Qwen3.8-Flash-Next
+  (rtx3090 x8, port 8000) "is not properly responding to tool calls."
+  Tested every tool-call path directly against the live service:
+  chat/completions non-streaming, streaming, tool-result round trip,
+  parallel tool calls (Tokyo+London), Responses API auto tool choice,
+  Responses streaming, json_schema + thinking, and a multi-turn
+  function_call/function_call_output replay with a 13-tool set. All
+  passed with correct tool names, valid JSON arguments, and
+  finish_reason=tool_calls. Reliability sweep 8/8 at temp 1.0 /
+  top_p 0.95 / top_k 20.
+- End-to-end harness validation: installed pi coding agent, registered
+  the service as a provider (~/.pi/agent/models.json: slimserve ->
+  http://localhost:8000/v1, openai-completions, qwen-chat-template
+  thinking format, sampling 1.0/0.95/20), and pi drove a real
+  read-file tool call through the model to a correct answer.
+- Root cause of the reports (evidence, not fix): during production
+  bursts from the /v1/responses agent client, GPU KV sat at 95-99%
+  with 5-7 requests waiting and 1 deferred; a fresh request queued
+  4+ minutes with zero bytes streamed (pi died twice on 180/240 s
+  timeouts). Client harness timeouts present exactly as "model does
+  not respond to tool calls." When the burst drained, TTFB on the
+  same request was 5 ms, and pi completed in seconds. Capacity /
+  admission behavior under agentic burst load is the follow-up, not
+  the tool-call stack.
+- Log noise ruled out as corruption: recurring
+  backend_xgrammar.py:214 "Failed to advance FSM ... tokens 271"
+  (271 = "\n\n") is the DSpark drafter proposing whitespace right
+  after </think> where a JSON grammar starts; the spec-decode
+  bitmask path tolerates it (post_reasoning_end_in_window) and
+  rejection sampling discards the draft. Reproduced on a
+  json_schema request of mine that still returned valid JSON. Same
+  for grammar_matcher.cc "terminated after accepting stop token"
+  (token 198 = "\n"). Harmless but noisy at ~200+ occurrences;
+  candidate cleanup: downgrade that accept_tokens log to debug when
+  the reject is a tolerated post-reasoning draft.
+
+## 2026-08-29 - Prefix caching: local layer healthy, host tier dead in production (owner-key collision)
+
+- Question under investigation: production cumulative prefix hit rate
+  ~16% (declining through bursts) with external (host tier) hit rate
+  0.4%, on agentic traffic where the policy expects near-100%.
+- Local layer verified working, controlled tests on the live server:
+  identical 9,655-token prompt twice -> second run 8,400/9,655 tokens
+  (87%) from cache, 2.08 s -> 0.54 s. Multi-turn replay (turn-2
+  carrying turn-1's assistant reply) -> 2,400/2,844 (84%) hit, with
+  or without reasoning replayed. Mechanism and mamba align-mode
+  hashing are fine; template replay divergence ruled out.
+- Production misses are capacity thrash: bursts of ~18 concurrent
+  long-context conversations from the /v1/responses client push GPU
+  KV to 95-99%, conversations evict each other, every turn re-prefills
+  its history (prompt throughput 600-2,400 tok/s while gen sits at
+  40-500). The host tier exists to absorb exactly this spillover and
+  does not: since boot, 197 tail-boundary saves, 48 restores issued,
+  only 6 lookup hits (all at shallow boundaries, blocks 2-8),
+  6,800/1.79M external tokens hit.
+- ROOT CAUSE (host_tier_connector.py:189 `_owner`): the trajectory
+  owner key is `request.block_hashes[0].hex()` - the hash of the
+  FIRST 400-token block. All concurrent conversations share the same
+  system-prompt opening block, so they all collapse into ONE
+  Trajectory in HostKVTierIndex: stage_attention keeps the first
+  conversation's block at each position (later convs skipped),
+  stage_tail_states lets every finisher overwrite the shared tail, and
+  lookup's `traj.hashes[:n] == hashes[:n]` full-chain compare then
+  fails for every individual conversation once the chain is a mix.
+  The rare hits happen when traffic is briefly single-conversation.
+  The 2026-08-28 validation passed because the bench ran one
+  conversation per system prompt at a time - no collision.
+- Fix direction (not yet implemented): owner must identify a
+  conversation lineage, not a shared first block. vLLM block hashes
+  chain (hash at position i commits to the full prefix), so keying
+  trajectories by a deeper chain hash - or forking a new trajectory on
+  hash conflict at stage time instead of skipping - restores
+  per-conversation trajectories; the cleaner endpoint is a
+  content-addressed per-block store (hash -> slot, refcounted) with
+  tail states keyed by tail hash, sharing prefix slots instead of
+  fighting over them. Needs the usual on-box validation pass with a
+  concurrent multi-conversation workload, which the current bench
+  lacks.
+
+## 2026-08-29 - Structured output now tolerates the chat template's post-reasoning scaffold
+
+- Operator insight adopted: the '\n\n' between '</think>' and the answer
+  is CHAT TEMPLATE SCAFFOLD, not response. The Qwen3 template renders
+  replayed assistant turns as '</think>\n\n' + content (and literally
+  injects '<think>\n\n</think>\n\n' when thinking is disabled), so the
+  template - not the grammar - is the authority on where the response
+  starts. Previously the JSON grammar armed at '</think>' and its root
+  accepts no leading whitespace (verified: xgrammar's any_whitespace
+  only permits whitespace INSIDE the JSON, first-token acceptance is
+  identical with the flag on or off), which coerced the model
+  off-distribution at the first constrained token and rejected the MTP
+  drafter's natural '\n\n' (~213 tolerated FSM errors since boot).
+- Fix: the template convention is declared once in
+  ParserEngineConfig.response_scaffold ("\n\n" for qwen3), exposed via
+  ReasoningParser.response_scaffold (default ""), read by
+  StructuredOutputManager and passed to XgrammarBackend, whose JSON /
+  json_object compiles now concat an optional bounded prefix grammar
+  (root ::= ("\n\n")?) ahead of the schema. Scaffold accepted at most
+  once, exactly as rendered; a third newline is still rejected; empty
+  scaffold keeps the old strict root. A pure parser-boundary fix
+  (consuming the scaffold in is_reasoning_end) was rejected: the
+  streaming contract fires on the last reasoning token and cannot
+  retroactively distinguish a model that skips the separator, which
+  would swallow the first content token and desync the grammar.
+- Validation: 6 new tests in tests/v1/test_response_scaffold_grammar.py
+  (scaffold accepted whole and split across tokens, optional, not
+  repeatable, empty-scaffold strictness, qwen3 adapter declares "\n\n");
+  tests/parser 284/284, tests/reasoning + xgrammar tokenizer info 34/34,
+  import smoke green. NOT yet validated live: the running production
+  server predates the change; expected effects on restart are the
+  backend_xgrammar FSM errors dropping to zero on json_schema requests
+  and one fewer wasted draft per structured request.
+- Known cosmetic follow-up, same convention: the text path still leaks
+  the scaffold into returned content (leading "\n\n") because
+  extract_reasoning/streaming do not strip it; upstream vLLM's qwen3
+  parser lstrips it. Separate change, API-visible, not bundled here.
+
+## 2026-08-29 - Scaffold fix deployed to prod; pi agentic load validation clean
+
+- Restarted slimserve-qwen38fn.service (e319ddff1) in a zero-load
+  window; healthy in ~4.5 min (20:32:29 UTC). Post-restart json_schema
+  requests: 3/3 valid JSON, model now emits its natural '</think>\n\n{'
+  and the grammar accepts it - backend_xgrammar FSM errors since
+  restart: 0 (was ~213 on the prior boot). The scaffold now appears at
+  the head of returned json_schema text ("\n\n{...") - legal for
+  json.loads, the declared text-path strip follow-up would remove it.
+- Agentic anomaly sweep through a real harness (pi against the live
+  service, two waves, 3-way then 6-way concurrent): 12 tasks / 39 tool
+  calls covering single read, multi-file parallel reads (2 tool calls
+  in one assistant message, streamed), grep+read chains, edit+bash
+  verify loops, write, 4-step sequential chains, python-authoring, and
+  a long-context read that navigated pi's 50KB read boundary across 8
+  turns. Raw event streams inspected per run: zero error/aborted stop
+  reasons, zero malformed tool arguments, zero tool-result errors,
+  zero unparseable events. All 12 final answers verified against
+  ground truth (csv total 100, appended total 142 on disk, ERROR
+  count 95, mean latency 449.20 exact, both a/b discrepancies, etc.).
+- Server side during load: zero errors; only cold-start Triton JIT
+  warmup warnings at 20:32-33 (known; consider extending warmup
+  shapes). Prefix cache hit rate on the fresh boot reached 69.7% under
+  pi's shared-prefix agentic traffic - consistent with the earlier
+  finding that the low production rate is capacity thrash + the
+  host-tier owner-key collision, not the cache mechanism.
+
+## 2026-08-29 - Open items landed: host-tier lineage owners, content scaffold strip, warmup gate
+
+- Host tier owner-key collision FIXED. Trajectories are now keyed by the
+  request id that created them; a request that resumes from the tier
+  adopts the stored owner so a conversation keeps extending one lineage
+  (index.lookup now returns the owner). Content-derived keys are gone.
+  Divergent-continuation safety: stage_tail_states records the saver's
+  chain hash at the boundary block (Trajectory.tail_hash) and
+  resumable_blocks requires the staged attention chain to carry the same
+  hash there - a tail state paired with another conversation's blocks is
+  dead, never dangerously matchable (the wrong-mamba-state resume the old
+  chimera trajectories could theoretically have produced). Concurrent
+  same-prefix conversations now build separate trajectories; duplication
+  is LRU-reclaimed. 4 new index regression tests + connector suite green.
+- Content scaffold strip (text path) DONE: ParserEngine strips exactly
+  one leading response_scaffold occurrence from content after reasoning
+  end, non-streaming and streaming (the existing whitespace-defer holds
+  split deltas until the decision is atomic). A single newline or absent
+  scaffold passes through untouched; only one occurrence is stripped.
+  7 new tests in tests/parser/test_response_scaffold_strip.py.
+- JIT warmup root cause: qwen_triton_warmup was gated on a model-type set
+  that lacked qwen4_exp - the ENTIRE Qwen warmup silently skipped on this
+  deployment, which is why even already-covered kernels (zero_kv, conv,
+  post_conv) JIT'ed at first request. Added qwen4_exp/qwen4_exp_text to
+  the gate (+ gate regression test). Still uncovered, documented in the
+  module: QSA paged kernels, PLE short-conv, sampler topk_topp - extend
+  against live jit_monitor output on a future boot, not blind shapes.
+- Cache-rate context recorded from today's measurements: identical fully
+  cached rerun caps at 71.4% (1200/1680) for a 1.7k prompt - align-block
+  granularity (400) + boundary-freeze lag consume the tail 1-2 blocks,
+  proportionally negligible at 10-50k production contexts. Replay
+  divergence verified: a client that does NOT send reasoning back
+  re-renders prior turns as empty think blocks -> token mismatch at every
+  prior assistant turn -> full-history re-prefill (template-level check:
+  68/68 token continuity WITH reasoning_content replay, divergence at the
+  first think block without). Production clients should echo reasoning
+  items back for cache continuity; vLLM maps assistant `reasoning` ->
+  template reasoning_content already.
+- All suites: 316 passed (parser 291 incl. 7 new, kv-tier 10+... , host
+  tier connector 7, warmup gate 2, scaffold grammar 6).
+
+## 2026-08-29 - Open-items deploy (9cf0155ee): live validation on restart
+
+- Restarted slimserve-qwen38fn in a quiet window; healthy 21:36:07 UTC.
+- Warmup gate CONFIRMED live: "Warming up Qwen Triton kernels for
+  model_type=qwen4_exp_text" on all ranks. First-request JIT warnings
+  dropped 8 -> 5 kernels: _zero_kv_blocks, _fused_post_conv and
+  _qsa_merge_splitk no longer JIT at first request. _causal_conv1d_fwd
+  still fires once on a shape the warmup config doesn't hit (warmup runs
+  a single conv shape; note for the follow-up pass), plus the four
+  documented-uncovered kernels (_qsa_mqa_paged, _qsa_sparse_paged_gqa
+  _splitk, _expand_qsa_indices, _topk_topp).
+- Scaffold strip CONFIRMED live on both APIs: chat content and
+  responses json_schema text no longer carry the leading "\n\n"; JSON
+  valid; xgrammar errors still zero.
+- Host tier on new boot: connector healthy (packed slab 76/76 layers,
+  6452 slots x 400-token blocks), boundary-state saves flowing under the
+  new lineage owners, zero errors. Hit-rate improvement is NOT yet
+  measured - it needs production burst/eviction cycles; watch
+  external_prefix_cache_hits_total vs saves over the next hours. The
+  index-level behavior (separate trajectories per conversation, adoption
+  on resume, tail-hash safety) is unit-proven.
+
+## 2026-08-29 - Agent concurrency ceiling: pi scaling waves on qwen38fn-fp8-8
+
+- Method: waves of N simultaneous pi agents (N=2..32) against the live
+  service, each running a ~20-tool-call audit mission over a real repo
+  clone (tree exploration, line counts, multi-file reads, repo-wide
+  grep, git log, web fetch, report write+verify). Event streams
+  captured per agent; per-turn latency = wall/turns. Raw logs:
+  scratchpad piheavy/logs (plus a 2-call light-task baseline in
+  piscale/logs).
+- Results (mean task | p95 | fails | mean tool calls | s/turn |
+  marginal prefix-hit):
+    N=2   84s |   76s | 0 | 21.5 |  3.8s | 91%
+    N=4   60s |   58s | 0 | 14.0 |  4.3s | 81%
+    N=8   91s |  124s | 0 | 20.9 |  4.8s | 88%
+    N=16 316s |  978s | 0 | 19.5 | 17.9s | 75%
+    N=24 748s | 1771s | 2 timeouts | 12.2 | 45.0s | 17%
+    N=32 all agents stalled: uniform 1218s (pi provider timeout),
+         zero tool calls completed.
+- Caveat: waves 24 and 32 overlapped genuine production bursts from the
+  /v1/responses client (engine showed Waiting 18 during w24 and
+  Waiting 59 during w32, i.e. ~27 foreign requests at peak), so those
+  waves measure agents + production contention, not agents alone. GPU
+  KV reached 89% during w24.
+- Verdict: <=8 agents indistinguishable from solo (4-5 s/turn); the
+  practical ceiling for tolerable interactivity is 12-16 agents
+  (~18 s/turn, task p95 already 16 min); 24+ is intolerable (45 s/turn,
+  30-min timeouts) and 32 alongside a production burst is a full stall.
+  The binding constraint is aggregate decode throughput + KV pressure;
+  queueing spirals once demand exceeds it.
+- Host tier first real workout under eviction pressure: wave 24 alone
+  restored 1.27M tokens from the pinned host tier (external hits
+  +1,268k), vs 6.8k tokens in 12 HOURS under the old owner-collision
+  code. Cumulative external hit rate reached ~40% during the run. The
+  lineage-owner fix is confirmed effective under real thrash.
+- Raw-response anomaly worth tracking: at higher load the model
+  occasionally hallucinated tool names not in the pi schema
+  ("write_file", capitalized "Read"); pi rejected them and the model
+  recovered via bash. Model behavior, not a serving bug; some agents
+  also wrote their reports via bash heredoc instead of the write tool.

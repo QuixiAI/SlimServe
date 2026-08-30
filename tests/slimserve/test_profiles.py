@@ -290,6 +290,8 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
+    # Qualified A100 config; bf16 main KV is aspirational here and
+    # flips only with an on-box requalification pass.
     assert tp2.engine["kv_cache_dtype"] == "fp8"
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -303,6 +305,8 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
+    # Qualified A100 config; bf16 main KV is aspirational here and
+    # flips only with an on-box requalification pass.
     assert tp4.engine["kv_cache_dtype"] == "fp8"
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -991,3 +995,86 @@ def test_mirrored_vllm_defaults_have_not_drifted():
         "min(max_num_seqs * 2, 512) model in "
         "test_full_decode_graphs_cover_the_largest_speculative_batch"
     )
+
+
+def test_every_profile_states_prefix_caching_explicitly():
+    """Prefix caching is stated, never inherited.
+
+    vLLM defaults prefix caching OFF for hybrid (mamba/GDN) models, so a
+    profile that omits enable_prefix_caching silently pays full-history
+    re-prefill on every chat turn -- exactly how qwen38fn-fp8-8 shipped
+    with a 0.0% hit rate. Policy since 2026-08-28: every record states the
+    setting explicitly, and anything other than true needs a note naming
+    the model-level reason (e.g. R-SWA decode KV is not cacheable).
+    """
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert "enable_prefix_caching" in engine, (
+                f"{profile_id}/{platform} does not state enable_prefix_caching; "
+                "it would silently inherit vLLM's per-model default"
+            )
+            if engine["enable_prefix_caching"] is not True:
+                notes = " ".join(record.get("notes", []))
+                assert "prefix" in notes.lower(), (
+                    f"{profile_id}/{platform} disables prefix caching without "
+                    "a note naming the model-level reason"
+                )
+
+
+def test_every_profile_serves_with_tool_calling_and_thinking():
+    """Automatic tool calling and thinking are always on.
+
+    Every profile names its tool-call and reasoning parsers, and the
+    registry's _SERVING_DEFAULTS force enable_auto_tool_choice plus
+    thinking-on template kwargs (and prefix caching) into every resolved
+    plan unless a record overrides the key itself.
+    """
+    from slimserve.registry import _SERVING_DEFAULTS
+
+    assert _SERVING_DEFAULTS.get("enable_auto_tool_choice") is True
+    assert _SERVING_DEFAULTS.get("enable_prefix_caching") is True
+    kwargs = _SERVING_DEFAULTS.get("default_chat_template_kwargs", {})
+    assert kwargs.get("thinking") is True and kwargs.get("enable_thinking") is True
+
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert engine.get("tool_call_parser"), (
+                f"{profile_id}/{platform} has no tool_call_parser"
+            )
+            assert engine.get("reasoning_parser"), (
+                f"{profile_id}/{platform} has no reasoning_parser"
+            )
+            assert engine.get("enable_auto_tool_choice", True) is True, (
+                f"{profile_id}/{platform} disables automatic tool calling"
+            )
+
+
+def test_no_profile_quantizes_main_kv():
+    """Main KV is bf16 on rtx3090; aspirational elsewhere (operator 2026-08-29).
+
+    Quantized main KV was implicated in multi-turn tracking errors on
+    Qwen3.8-Flash-Next, so no rtx3090 profile may set a quantized
+    kv_cache_dtype. Other platforms keep their qualified configs until an
+    on-box requalification pass flips them. Draft-model KV (DSpark
+    TurboQuant) is exempt everywhere because rejection sampling verifies
+    drafts against the target.
+    """
+    # Enforced on rtx3090 (operator 2026-08-29): quantized main KV was
+    # implicated in multi-turn tracking errors on Qwen3.8-Flash-Next, and
+    # this box is where that was root-caused and validated. Other platforms
+    # keep their qualified configs; bf16 main KV is aspirational there and
+    # flips only with an on-box requalification pass.
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            if platform != "rtx3090":
+                continue
+            dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
+            # 'auto' resolves to the model dtype (bf16 for every supported
+            # model); an explicit 'bfloat16' is the same commitment spelled
+            # out and equally compliant.
+            assert dtype in {"auto", "bfloat16"}, (
+                f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
+                "main KV must be bf16 (auto) on every rtx3090 profile"
+            )

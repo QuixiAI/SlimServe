@@ -259,8 +259,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         if spec_sequence_masks is None:
+            # treat_short_extends_as_decodes=False: the decode kernels
+            # (causal_conv1d_update, fused recurrent decode) read the conv and
+            # SSM state slots unconditionally, so a request that has not
+            # finished its prefill (a 1-token prompt, or a 1-token tail chunk)
+            # must take the prefill path, whose kernels zero uninitialized
+            # state via has_initial_state.
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m, decode_threshold=1, treat_short_extends_as_decodes=False
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
@@ -284,7 +292,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             # Use CPU tensors to avoid CPU-GPU sync
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = int((non_spec_query_lens_cpu == 1).sum().item())
+            decode_rows = non_spec_query_lens_cpu == 1
+            if m.is_prefilling is not None:
+                # A 1-token row still mid-prefill (fresh 1-token prompt or a
+                # 1-token tail chunk) must count as prefill: the decode
+                # kernels read state slots the request has not written yet.
+                # The batch reorder already places such rows behind the true
+                # decodes, so the contiguous split stays valid. is_prefilling
+                # may be unpadded; padded rows are never prefilling.
+                isp = m.is_prefilling
+                n_rows = query_lens_cpu.size(0)
+                if isp.size(0) < n_rows:
+                    isp = torch.cat([isp, isp.new_zeros(n_rows - isp.size(0))])
+                decode_rows &= ~isp[:n_rows][~spec_sequence_masks_cpu]
+            num_decodes = decode_rows.sum().item()
             # Exclude zero-length padded sequences from prefill count.
             num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
             num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len

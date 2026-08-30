@@ -110,6 +110,8 @@ def qwen3_config(
     return ParserEngineConfig(
         name=name,
         initial_state=ParserState.REASONING if thinking else ParserState.CONTENT,
+        # The template renders assistant turns as '</think>\n\n' + content.
+        response_scaffold="\n\n",
         terminals={
             # Reasoning terminals
             "THINK_START": think_start,

@@ -896,8 +896,12 @@ class MambaSpecDecodeGPUContext:
             num_states=total_states,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
+            # Mirrors num_accepted_tokens_gpu, which carries one trailing
+            # sentinel dump slot past max_num_reqs (see
+            # MambaHybridModelState.__init__); the V2 align postprocess
+            # snapshots the WHOLE buffer, so the sizes must match.
             num_accepted_tokens_out=torch.zeros(
-                max_num_reqs, dtype=torch.int32, device=device
+                max_num_reqs + 1, dtype=torch.int32, device=device
             ),
             block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device

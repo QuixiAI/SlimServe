@@ -5,6 +5,31 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
+### 8x RTX 3090 Current Baseline - 2026-08-27 evening (KV-pool fix + correctness fixes)
+
+- Same registered profile as the "Final Baseline" below plus:
+  gpu_memory_utilization 0.95 (KV pool 2.23 -> 3.41 GiB/rank, 590,324
+  tokens; the packed slab at 0.9 silently capped Running at 27 of 32),
+  VLLM_ADMISSION_MAX_CONCURRENT=96 (429 + Retry-After past a bounded
+  queue), the fresh-request classification and cudagraph dispatch-gate
+  correctness fixes (1- and 3-token prompts produced garbage and could
+  crash the engine), and the sliced PLE dilated-conv prefill transient
+  (multi-turn prefill waves OOM'd at util 0.95).
+- Workload: exact 1,000 in / 2,000 out, temp 1.0 / top_p 0.95 / top_k 20,
+  seed 42, manual serve on an idle box (no QA traffic).
+
+| Concurrency | Aggregate tok/s | vs prior baseline |
+| ---: | ---: | ---: |
+| 1 | 151.8 | +12-16% |
+| 32 | 1,134.4 | +28.7% |
+
+- Running peaks at the full 32 (Waiting 0, KV peak 86.9%); the prior
+  "c32" rows below were effectively c27 plus a queue.
+- Real-traffic reference (WildChat-1M multi-turn replay, 128 sessions,
+  504 turns, thinking on): 32 concurrent sessions sustain ~780 out tok/s
+  pre-fix; oversubscription to 64 buys zero throughput and 3.5x TTFT.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/.
+
 ### 8x RTX 3090 Final Baseline - 2026-08-27 (TQ main-KV @ native 262K)
 
 - Profile `qwen38fn-fp8-8` as registered: TP8+EP, max_model_len 262144
