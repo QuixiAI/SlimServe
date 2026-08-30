@@ -80,6 +80,14 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "InklingForConditionalGeneration",
         "LongcatFlashNgramForCausalLM",
         "Qwen2MoeForCausalLM",
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+        # The MTP drafter runs inside the V2 runner's speculator. Its draft
+        # VllmConfig (built by replace() with the draft model_config, which
+        # re-runs __post_init__ on shared sub-configs) must classify as V2 or
+        # dynamic-SD guards evaluate against the wrong runner and downgrade
+        # the SHARED compilation_config for the whole worker.
+        "Qwen4ExpMTP",
     }
 )
 
@@ -602,6 +610,12 @@ class VllmConfig:
         if self._dflash_needs_multi_kv_group():
             return True
 
+        # The DFlash2 candidate selector exists only in the V2 speculator. On V1
+        # the same checkpoint drafts through DFlashProposer, which never calls
+        # it, so the draft degrades to DFlash1 silently. Force V2 as for dspark.
+        if self._is_dflash2_draft():
+            return True
+
         if self.model_config is not None and self.model_config.is_diffusion:
             return True
 
@@ -626,6 +640,17 @@ class VllmConfig:
 
         return True
 
+    def _is_dflash2_draft(self) -> bool:
+        """Whether the DFlash draft is a DFlash2 one, by the architecture the
+        speculator selects on (v1/worker/gpu/spec_decode/__init__.py)."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DFlash2DraftModel" in (draft_config.architectures or [])
+
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
         spec = self.speculative_config
@@ -646,16 +671,19 @@ class VllmConfig:
         if model_config.runner_type != "generate":
             return False
 
-        if getattr(model_config, "is_hybrid", False):
+        architectures = getattr(model_config, "architectures", [])
+        is_default_v2_architecture = any(
+            arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures
+        )
+
+        # A hybrid model runs V2 only when its architecture is explicitly
+        # qualified for it (e.g. Qwen4Exp); other hybrids stay on V1.
+        if getattr(model_config, "is_hybrid", False) and not is_default_v2_architecture:
             return False
 
         if getattr(model_config, "is_attention_free", False):
             return False
-        architectures = getattr(model_config, "architectures", [])
-        return (
-            any(arch in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES for arch in architectures)
-            or not model_config.is_moe
-        )
+        return is_default_v2_architecture or not model_config.is_moe
 
     @property
     def needs_dp_coordinator(self) -> bool:
@@ -852,6 +880,25 @@ class VllmConfig:
 
         apply_recursive(self, defaults)
 
+    def _is_draft_model_view(self) -> bool:
+        """Whether this config is a draft-model view of a serving config.
+
+        Loaders build such views with ``dataclasses.replace(vllm_config,
+        model_config=draft_model_config)``. ``replace`` re-runs
+        ``__post_init__`` while every sub-config (compilation_config,
+        speculative_config, cache_config, ...) is still the SAME OBJECT as
+        the serving config's, and the view's model_config has runner_type
+        "draft", so runner predicates misclassify it. INVARIANT: any
+        __post_init__ step that MUTATES a shared sub-config must skip when
+        this returns True, or it silently rewrites the serving config
+        (a draft view once downgraded the whole worker's cudagraph_mode
+        to PIECEWISE this way).
+        """
+        return (
+            self.speculative_config is not None
+            and self.model_config is self.speculative_config.draft_model_config
+        )
+
     def _maybe_override_dynamic_sd_cudagraph_mode(self) -> None:
         speculative_config = self.speculative_config
         if (
@@ -859,6 +906,9 @@ class VllmConfig:
             or not speculative_config.uses_dynamic_speculative_decoding()
             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             or self.use_v2_model_runner
+            # See _is_draft_model_view: a view must never decide global
+            # graph policy on the shared compilation_config.
+            or self._is_draft_model_view()
         ):
             return
 
@@ -877,6 +927,9 @@ class VllmConfig:
             speculative_config is None
             or not speculative_config.uses_dynamic_speculative_decoding()
             or self.parallel_config.data_parallel_size <= 1
+            # See _is_draft_model_view: this method mutates the SHARED
+            # speculative_config; a view must not.
+            or self._is_draft_model_view()
         ):
             return
 
@@ -1077,11 +1130,16 @@ class VllmConfig:
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
+                    # dflash drafts through the same count-only placeholder
+                    # surface as dspark on the V2 runner (draft ids stay
+                    # GPU-resident; the scheduler sees counts), and the
+                    # AsyncScheduler placeholder sizing is dynamic-SD aware.
+                    and self.speculative_config.method != "dflash"
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of "
-                        "speculative decoding"
+                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark/DFlash "
+                        "kind of speculative decoding"
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(
@@ -1109,6 +1167,7 @@ class VllmConfig:
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "dspark"
+                and self.speculative_config.method != "dflash"
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -1593,6 +1652,19 @@ class VllmConfig:
                     "Please check whether your reasoning parser has implemented "
                     "the `reasoning_start_str` and `reasoning_end_str`."
                 )
+            elif self.use_v2_model_runner:
+                # Runs AFTER initialize_token_ids: the marker lists do not
+                # exist before it, so an earlier check can never fire.
+                starts = self.reasoning_config.reasoning_start_token_ids or []
+                ends = self.reasoning_config.reasoning_end_token_ids or []
+                if len(starts) != 1 or len(ends) != 1:
+                    logger.warning_once(
+                        "Model Runner V2 enforces thinking_token_budget only "
+                        "for single-token reasoning markers; this model's "
+                        "markers tokenize to multiple tokens, so the "
+                        "parameter will be rejected per request. Set "
+                        "VLLM_USE_V2_MODEL_RUNNER=0 if it is required."
+                    )
 
         # Resolve kv_offloading-derived connector name into kv_transfer_config
         # before the HMA check below, which inspects the connector class.
@@ -2257,12 +2329,6 @@ class VllmConfig:
         if unsupported:
             raise ValueError(
                 f"Model Runner V2 does not yet support: {', '.join(unsupported)}"
-            )
-
-        if self.reasoning_config is not None:
-            logger.warning_once(
-                "Model Runner V2 does not yet support the thinking_token_budget "
-                "request parameter. Set VLLM_USE_V2_MODEL_RUNNER=0 if this is required."
             )
 
     def validate_block_size(self) -> None:

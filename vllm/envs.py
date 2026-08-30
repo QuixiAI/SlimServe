@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_ITERATION_TIMEOUT_S: int = 60
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
+    VLLM_ADMISSION_MAX_CONCURRENT: int | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
@@ -142,6 +143,10 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_NVFP4_EMULATION_CACHE_WEIGHTS: bool = True
     VLLM_NVFP4_TRITON_GEMM: bool = True
+    VLLM_QWEN4_EXP_PLE_HOST: bool = False
+    VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
+    VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
@@ -747,6 +752,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # API key for vLLM API server
     "VLLM_API_KEY": lambda: os.environ.get("VLLM_API_KEY", None),
+    # Cap on concurrent in-flight generation requests per API-server process;
+    # requests beyond it get an immediate 429 instead of queueing. None = off.
+    "VLLM_ADMISSION_MAX_CONCURRENT": lambda: (
+        int(v) if (v := os.environ.get("VLLM_ADMISSION_MAX_CONCURRENT")) else None
+    ),
     # Whether to log responses from API Server for debugging
     "VLLM_DEBUG_LOG_API_SERVER_RESPONSE": lambda: (
         os.environ.get("VLLM_DEBUG_LOG_API_SERVER_RESPONSE", "False").lower() == "true"
@@ -1238,8 +1248,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # ROCm NVFP4: fused triton w4a16 GEMM reading packed weights directly.
     # Set to 0 to fall back to the emulation kernel.
+    "VLLM_GDN_DECODE_KERNEL": env_with_choices(
+        "VLLM_GDN_DECODE_KERNEL",
+        "cuda",
+        ["cuda", "triton"],
+        case_sensitive=False,
+    ),
+    # Keep the Qwen4Exp n-gram (PLE) embedding tables in pinned host memory and
+    # gather rows from the GPU over UVA instead of holding the tables in VRAM.
+    "VLLM_QWEN4_EXP_PLE_HOST": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_PLE_HOST", "False").lower() in ("true", "1")
+    ),
     "VLLM_NVFP4_TRITON_GEMM": lambda: (
         os.getenv("VLLM_NVFP4_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Store the Qwen4Exp main QSA KV as TurboQuant k8v4 (e4b15 keys, 4-bit
+    # uniform values with per-slot fp16 scale/zero): ~2.64x smaller than
+    # bf16, decoded in-register by the QSA gather kernel.
+    "VLLM_QWEN4_EXP_TQ_MAIN_KV": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_TQ_MAIN_KV", "False").lower() in ("true", "1")
+    ),
+    # Allow the custom allreduce on >2 PCIe-only GPUs. Requires working GPU
+    # P2P with a full-size BAR1 (e.g. the QuixiAI patched driver on GeForce);
+    # without that the P2P probe fails and the gate below still disables it.
+    "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
+        os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

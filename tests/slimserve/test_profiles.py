@@ -50,8 +50,9 @@ def test_every_profile_uses_dspark_with_turboquant():
                 assert "speculative_config" not in engine_kwargs(plan)
                 continue
             config = engine_kwargs(plan)["speculative_config"]
-            source = registry._registry()["sources"][entry["source"]]
-            registered = source["speculator"]["engine"]["method"]
+            # The variant may override the source drafter (qwen38-nvfp4-1:
+            # MTP on MI300X, DFlash2 on Metal).
+            registered = plan.speculator["engine"]["method"]
             assert config["method"] == registered
             if registered == "dspark":
                 assert config["attention_backend"] == "TURBOQUANT"
@@ -118,6 +119,17 @@ def test_qwen38_uses_measured_metal_speculation_settings():
     assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
+def test_qwen38_uses_measured_mi300x_speculation_settings():
+    plan = resolve("qwen38-q2kxl-1", "mi300x", 1, None, 2**38)
+    speculative = validate_acceleration(plan)
+
+    assert speculative["method"] == "dflash"
+    assert speculative["num_speculative_tokens"] == 3
+    assert speculative["quantization"] == "gguf"
+    assert plan.env["VLLM_ROCM_USE_AITER"] == "1"
+    assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
 def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     machine = Machine("mi300x", "AMD Instinct MI300X", 8)
     expected = {
@@ -144,6 +156,12 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
             # The checkpoint ships its own MTP head; there is no separate
             # DSpark artifact or TurboQuant draft cache to require.
             assert speculative["method"] == "qwen3_5_mtp"
+            continue
+        if profile_id == "qwen38-q2kxl-1":
+            # The GGUF artifact's blessed drafter is the published DFlash 2
+            # block model, which shares the target's KV layout and so has no
+            # TurboQuant draft cache of its own.
+            assert speculative["method"] == "dflash"
             continue
         assert speculative["method"] == "dspark"
         assert speculative["attention_backend"] == "TURBOQUANT"
@@ -272,7 +290,10 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
-    assert tp2.engine["kv_cache_dtype"] == "fp8"
+    # bf16 main KV (serving policy): the Ampere bf16 sparse-MLA page path
+    # is the NFP8=0 instantiation; see the profile note and
+    # csrc/quixicore/dsv4_bf16_kv_design.md.
+    assert tp2.engine["kv_cache_dtype"] == "auto"
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -285,7 +306,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
-    assert tp4.engine["kv_cache_dtype"] == "fp8"
+    assert tp4.engine["kv_cache_dtype"] == "auto"  # same policy as tp2 above
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -311,6 +332,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "muse-glimmer",
         "qwen38-27b",
         "qwen38-27b-nvfp4",
+        "qwen38-flash-next-fp8",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -362,12 +384,18 @@ def test_registry_contains_only_the_supported_model_artifacts():
         for entry in quant["files"]
     } == {
         "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
-        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
-        "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
-        "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
-        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
-        "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+        (
+            "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-"
+            "Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
+        ),
+        (
+            "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-"
+            "Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
+        ),
     }
 
     assert [entry["path"] for entry in muse["shared"]] == [
@@ -428,6 +456,36 @@ def test_kimi_uses_the_registered_q8_dspark_gguf():
 
 
 GB = 1 << 30
+
+
+def test_nvfp4_directory_entry_resolves_to_the_model_dir():
+    """The NVFP4 quant is an HF-format directory checkpoint (source format
+    safetensors): --model must be the folder, not files[0]."""
+    plan = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert plan.entry_file == plan.model_dir
+
+
+def test_qwen38_nvfp4_platforms_diverge_on_the_measured_drafter():
+    """MI300X reuses the checkpoint's own MTP head; Metal serves the DFlash2
+    drafter that measured +23% at c1 (variant-level speculator override)."""
+    metal = resolve("qwen38-nvfp4-1", "metal", 1, "NVFP4", 128 * GB)
+    assert metal.speculator["engine"]["method"] == "dflash"
+    assert metal.speculator["repo"] == "z-lab/Qwen3.8-27B-DFlash2"
+    mi300x = resolve("qwen38-nvfp4-1", "mi300x", 1, None)
+    assert mi300x.speculator["engine"]["method"] == "qwen3_5_mtp"
+
+
+def test_tq_profile_pins_both_drafter_turboquant_fields():
+    """The -tq drafter must pin attention_backend AND kv_cache_dtype
+    together: unset, the drafter inherits the engine-global turboquant_k8v4
+    dtype but keeps metal_attn, whose 5-dim cache shape cannot view the
+    TQ-sized page (boot reshape failure documented in the profile notes)."""
+    from slimserve.engine import _speculative_config
+
+    plan = resolve("qwen38-nvfp4-1-tq", "metal", 1, "NVFP4", 128 * GB)
+    cfg = _speculative_config(plan)
+    assert cfg["attention_backend"] == "TURBOQUANT"
+    assert cfg["kv_cache_dtype"] == "turboquant_k8v4"
 
 
 def test_metal_gates_on_memory_not_on_gpu_count():
@@ -783,3 +841,266 @@ def test_no_profile_carries_another_platforms_environment():
                     assert not any(tok in key for tok in tokens), (
                         f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
                     )
+
+
+# vllm/config/scheduler.py::SchedulerConfig.DEFAULT_MAX_NUM_SEQS. Mirrored
+# rather than imported so profile-registry tests stay free of a vllm import;
+# test_mirrored_vllm_defaults_have_not_drifted below pins it to the real value.
+DEFAULT_MAX_NUM_SEQS = 128
+
+
+# (profile, platform) -> (validated concurrency, why the max_num_seqs rule is
+# not applied). These records pin a capture ceiling that was MEASURED against a
+# specific concurrency band rather than against max_num_seqs, and raising it is
+# coupled to the KV budget on hardware not present here.
+#
+# dsv4 A100 tiers: capture 64 was the fix for this very bug (2026-08-10, "TP8 c8
+# Cliff Root Cause: Graph Capture Width") -- the c8 verify batch is 8 reqs x 6
+# spec tokens = 48 rows, and the list topped out at 32, so every decode step ran
+# eager. 64 makes the derived list [1,2,4,8,16,24,32,40,48,56,64], which
+# contains 48. These records leave max_num_seqs unpinned, so it inherits 128 and
+# batches past ~10 concurrent requests still fall off the graphs. The notebook's
+# own follow-up ("extend cudagraph_capture_sizes to include 48 and re-derive the
+# KV budget") is the open work; larger graphs measurably shrink the KV pool
+# there, so the fix needs an A100, not an edit. Until then this asserts the band
+# that WAS measured.
+_CAPTURE_BAND_EXEMPT = {
+    ("dsv4-q4ktail-4", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-q4ktail-8", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-mxfp4-4", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-mxfp4-8", "a100"): (8, "capture measured against the c8 verify width"),
+}
+
+
+def test_full_decode_graphs_cover_the_largest_speculative_batch():
+    """capture >= (k+1) * max_num_seqs, or the biggest batches run eager.
+
+    Measured on 8x3090: c32 at 425 tok/s with a 64-token capture ceiling vs
+    880 with the ceiling covering seqs x (1+k) -- and the failure is silent.
+    A note is not a guard; this is.
+
+    Both sides are resolved to their EFFECTIVE values. An unset capture
+    inherits min(max_num_seqs * 2, 512), a ceiling derived with no knowledge
+    of speculation: it budgets one row per sequence with 2x headroom, while a
+    speculative step submits k+1 rows per sequence. At k>=2 the default is
+    therefore always short, so treating "unset" as "nothing to check" skipped
+    precisely the records where nobody had made the decision at all.
+    """
+    raw = registry._registry()
+    for profile_id, profile in raw["profiles"].items():
+        if not profile.get("speculative"):
+            continue
+        source = raw["sources"][profile["source"]]
+        base_k = (
+            (source.get("speculator") or {})
+            .get("engine", {})
+            .get("num_speculative_tokens", 0)
+        )
+        for platform, record in profile["variants"].items():
+            engine = record.get("engine", {})
+            compilation = engine.get("compilation_config") or {}
+            mode = str(compilation.get("cudagraph_mode", ""))
+            if "FULL" not in mode:
+                continue
+            overrides = record.get("speculative_overrides") or {}
+            k = overrides.get("num_speculative_tokens", base_k)
+            schedule = overrides.get("num_speculative_tokens_per_batch_size")
+            if schedule:
+                k = max(k, max(entry[2] for entry in schedule))
+            if not k:
+                continue
+            # Resolve what the engine will ACTUALLY use, not just what the
+            # record spells out. Skipping the unset cases would skip exactly
+            # the silent ones: an omitted capture inherits a default derived
+            # from max_num_seqs with no knowledge of speculation, which is
+            # where this bug hides rather than where it is absent.
+            max_num_seqs = engine.get("max_num_seqs") or DEFAULT_MAX_NUM_SEQS
+            capture = compilation.get("max_cudagraph_capture_size")
+            if capture is None:
+                # vllm/config/vllm.py::_set_cudagraph_sizes.
+                capture = min(max_num_seqs * 2, 512)
+                source_note = (
+                    f"the inherited default min({max_num_seqs} x 2, 512) = {capture}"
+                )
+            else:
+                source_note = f"the pinned {capture}"
+            needed = (k + 1) * max_num_seqs
+            if (profile_id, platform) in _CAPTURE_BAND_EXEMPT:
+                band, why = _CAPTURE_BAND_EXEMPT[(profile_id, platform)]
+                assert capture >= (k + 1) * band, (
+                    f"{profile_id}/{platform} is exempt from the full "
+                    f"max_num_seqs rule ({why}), but its capture {capture} no "
+                    f"longer covers even the validated c{band} band "
+                    f"({(k + 1) * band} rows)"
+                )
+                continue
+            assert capture >= needed, (
+                f"{profile_id}/{platform}: max_cudagraph_capture_size "
+                f"{source_note} < ({k}+1) x max_num_seqs {max_num_seqs} = "
+                f"{needed}; the largest decode batches would silently run "
+                "eager"
+            )
+
+
+def test_host_offload_profiles_declare_a_host_ram_gate():
+    """PLE-host pins ~48 GiB of system RAM per rank; the GPU gate can't see
+    that. Any variant that turns on host offload must carry a
+    min_host_ram_bytes entry for its platform, sized at least to the pinned
+    tables across the tensor-parallel ranks."""
+    raw = registry._registry()
+    # One shared /dev/shm segment across TP ranks (see
+    # Qwen4ExpHostNGramEmbedding._shared_pinned_table): the floor is one
+    # table, not one per rank.
+    ple_table_bytes = 47_700_000_000  # 47.7 GiB, model-defined
+    for profile_id, profile in raw["profiles"].items():
+        source = raw["sources"][profile["source"]]
+        for platform, record in profile["variants"].items():
+            env = record.get("env") or {}
+            if env.get("VLLM_QWEN4_EXP_PLE_HOST") != "1":
+                continue
+            floor = ple_table_bytes
+            gated = [
+                quant
+                for quant in source["quants"].values()
+                if (quant.get("min_host_ram_bytes") or {}).get(platform, 0) >= floor
+            ]
+            assert gated, (
+                f"{profile_id}/{platform} enables PLE host offload "
+                f"(~{floor / 2**30:.0f} GiB pinned, shared across ranks) "
+                "but no quant declares a min_host_ram_bytes gate covering it"
+            )
+
+
+def test_mirrored_vllm_defaults_have_not_drifted():
+    """The capture guard resolves unset fields against vLLM's own defaults.
+
+    Those defaults are mirrored as literals so the registry tests do not import
+    vllm; this is the one test that pays the import, so a vLLM-side change to
+    either default fails loudly here instead of silently weakening the guard.
+    """
+    from vllm.config.scheduler import SchedulerConfig
+
+    assert SchedulerConfig.DEFAULT_MAX_NUM_SEQS == DEFAULT_MAX_NUM_SEQS
+
+    # The capture default itself: vllm/config/vllm.py::_set_cudagraph_sizes
+    # computes min(max_num_seqs * 2, 512).
+    import inspect
+
+    from vllm.config import VllmConfig
+
+    source = inspect.getsource(VllmConfig._set_cudagraph_sizes)
+    assert "min(max_num_seqs * 2, 512)" in source, (
+        "vLLM's default cudagraph capture ceiling changed; update the "
+        "min(max_num_seqs * 2, 512) model in "
+        "test_full_decode_graphs_cover_the_largest_speculative_batch"
+    )
+
+
+def test_every_profile_states_prefix_caching_explicitly():
+    """Prefix caching is always ON, and always stated.
+
+    vLLM defaults prefix caching OFF for hybrid (mamba/GDN) models, so a
+    profile that omits enable_prefix_caching silently pays full-history
+    re-prefill on every chat turn -- exactly how qwen38fn-fp8-8 shipped
+    with a 0.0% hit rate. Policy since 2026-08-28: every record states the
+    setting explicitly. Tightened 2026-08-30 by operator directive: it must
+    also be true everywhere, so this no longer accepts an opt-out with a
+    note. The engine supports it -- ModelConfig.is_prefix_caching_supported
+    returns True for hybrid generative models -- so an off record is a
+    stale default, never a capability limit.
+    """
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert "enable_prefix_caching" in engine, (
+                f"{profile_id}/{platform} does not state enable_prefix_caching; "
+                "it would silently inherit vLLM's per-model default"
+            )
+            assert engine["enable_prefix_caching"] is True, (
+                f"{profile_id}/{platform} sets enable_prefix_caching="
+                f"{engine['enable_prefix_caching']!r}; SlimServe serving always "
+                "has prefix caching enabled"
+            )
+
+
+def test_every_profile_serves_with_tool_calling_and_thinking():
+    """Automatic tool calling and thinking are always on.
+
+    Every profile names its tool-call and reasoning parsers, and the
+    registry's _SERVING_DEFAULTS force enable_auto_tool_choice plus
+    thinking-on template kwargs (and prefix caching) into every resolved
+    plan unless a record overrides the key itself.
+    """
+    from slimserve.registry import _SERVING_DEFAULTS
+
+    assert _SERVING_DEFAULTS.get("enable_auto_tool_choice") is True
+    assert _SERVING_DEFAULTS.get("enable_prefix_caching") is True
+    kwargs = _SERVING_DEFAULTS.get("default_chat_template_kwargs", {})
+    assert kwargs.get("thinking") is True and kwargs.get("enable_thinking") is True
+
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            engine = record.get("engine", {})
+            assert engine.get("tool_call_parser"), (
+                f"{profile_id}/{platform} has no tool_call_parser"
+            )
+            assert engine.get("reasoning_parser"), (
+                f"{profile_id}/{platform} has no reasoning_parser"
+            )
+            assert engine.get("enable_auto_tool_choice", True) is True, (
+                f"{profile_id}/{platform} disables automatic tool calling"
+            )
+
+
+def test_no_profile_quantizes_main_kv():
+    """Main KV is bf16 on rtx3090; aspirational elsewhere (operator 2026-08-29).
+
+    Quantized main KV was implicated in multi-turn tracking errors on
+    Qwen3.8-Flash-Next, so no rtx3090 profile may set a quantized
+    kv_cache_dtype. Other platforms keep their qualified configs until an
+    on-box requalification pass flips them. Draft-model KV (DSpark
+    TurboQuant) is exempt everywhere because rejection sampling verifies
+    drafts against the target.
+    """
+    # Enforced on rtx3090 (operator 2026-08-29): quantized main KV was
+    # implicated in multi-turn tracking errors on Qwen3.8-Flash-Next, and
+    # this box is where that was root-caused and validated. Other platforms
+    # keep their qualified configs; bf16 main KV is aspirational there and
+    # flips only with an on-box requalification pass.
+    for profile_id, entry in registry._registry()["profiles"].items():
+        for platform, record in entry.get("variants", {}).items():
+            if platform not in ("rtx3090", "a100"):
+                continue
+            dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
+            # 'auto' resolves to the model dtype (bf16 for every supported
+            # model); an explicit 'bfloat16' is the same commitment spelled
+            # out and equally compliant.
+            assert dtype in {"auto", "bfloat16"}, (
+                f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
+                "main KV must be bf16 (auto) on every rtx3090 profile"
+            )
+
+
+def test_every_a100_profile_carries_the_host_kv_tier():
+    """Every A100 variant declares the HostTierConnector config.
+
+    The connector requires the packed cross-layer KV slab: the DSV4
+    records get it via the allocator's is_dsv4 gate, and the GLM records
+    force it with enable_cross_layers_blocks in the connector extra
+    config, because their group specs are not verified to resolve
+    all-uniform on their own.
+    """
+    seen = 0
+    for profile_id, entry in registry._registry()["profiles"].items():
+        record = entry.get("variants", {}).get("a100")
+        if record is None:
+            continue
+        seen += 1
+        transfer = record["engine"]["kv_transfer_config"]
+        assert transfer["kv_connector"] == "HostTierConnector", profile_id
+        assert transfer["kv_role"] == "kv_both", profile_id
+        extra = transfer["kv_connector_extra_config"]
+        assert extra["host_tier_gb_per_rank"] > 0, profile_id
+        if entry["source"] == "glm52-vision":
+            assert extra["enable_cross_layers_blocks"] == "True", profile_id
+    assert seen == 7, "expected all seven A100 variants to be checked"

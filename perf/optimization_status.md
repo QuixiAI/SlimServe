@@ -4,6 +4,398 @@ This is the running performance notebook. Follow `perf/perf.md`: record the
 baseline, hypothesis, controlled change, correctness result, throughput result,
 decision, and raw artifact locations.
 
+## 2026-08-26 - Qwen3.8-Flash-Next 8x RTX 3090 Bring-Up (IN PROGRESS)
+
+New platform (`rtx3090`, nv3090-02: 8x GeForce RTX 3090 24 GiB, EPYC 7702,
+996 GiB host RAM) and new model (Qwen/Qwen3.8-Flash-Next-FP8, `qwen4_exp`
+arch: 48-layer GDN + QSA hybrid, 512-expert MoE, 4-branch gated residual,
+51B-parameter n-gram PLE embedding at layer 2, vision tower, 1-layer QSA MTP).
+Profile: `qwen38fn-fp8-8`.
+
+Port source: vLLM PR #53896 (upstream base 903a02192f) semantically merged
+into this fork: 33 new files taken as-is (`vllm/models/qwen4_exp/`,
+`short_conv_attn.py`, spec/config files), 17 shared files merged clean, 19
+conflicted files resolved by hand. Notable resolutions:
+
+- The upstream CSA-linear KV planner was rebuilt on this fork's packed-slab
+  allocator (`_get_kv_cache_config_packed`): the fork's "block id owns one
+  group, group layouts may overlap" contract is the same mechanism upstream
+  special-cased, so `_get_kv_cache_config_csa_linear` was dropped and the
+  dispatcher routes CSA models into the packed planner. MRV2's MambaSpec
+  reshape learned packed-slab views (offset/block_stride) for the mamba
+  members of the slab.
+- Upstream's `tokens_per_state` vocabulary maps onto this fork's
+  `MLAAttentionSpec.compress_ratio` (same meaning); `CircularBufferSpec`
+  (QSA raw-key ring, one block per request, prefix caching off) was added to
+  this fork's spec/manager registry with a K-only page size.
+- The fork's GDN stack already supported sigmoid output gating (the PR's
+  qwen_gdn/fused-kernel edits target upstream code the fork replaced), so
+  those hunks were dropped rather than grafted.
+- The fork's slot-mapping Triton kernel gained a `mapping_enabled` flag per
+  KV group: a disabled group is a circular buffer addressed at block-table
+  column 0 by `position % ring_capacity` (the fork's `positions % block_size`
+  offset math already produces the ring modulo). The quixicore native
+  slot-mapping path is bypassed when any group disables plain mapping.
+
+Hard constraints measured/verified on this platform:
+
+- `torch.cuda.can_device_access_peer` = False between all pairs (GeForce
+  P2P disabled). All TP collectives stage through host memory; expect
+  collectives, not kernels, to bound TP8 decode.
+- SM86 has no FP8 tensor cores; `supports_fp8()` gates Triton FP8 MoE off.
+  The FP8 block-128 experts therefore run Marlin W8A16 MoE (sm80 kernels).
+- `--enable-expert-parallel` is a correctness requirement:
+  moe_intermediate_size 640 / TP8 = 80 is incompatible with [128,128] block
+  scales, and the PR's scale-refine fallback computes gcd 16 < its own
+  floor of 32 and raises. EP keeps 64 whole experts per rank (640 = 5x128).
+
+PLE n-gram host offload (`VLLM_QWEN4_EXP_PLE_HOST=1`): PR #53896 holds the
+47.7 GiB FP8 n-gram table TP-sharded in VRAM (5.96 GiB/rank), which does not
+fit next to 14.06 GiB/rank of EP experts on a 24 GiB card. Implemented
+host-pinned tables gathered from the GPU over UVA by a Triton kernel
+(int->pointer cast), replicated per rank to also remove the per-step
+embedding all-reduce this no-P2P box cannot afford. Microbenchmark
+(perf/results/2026-08-26/qwen38fn-3090-bringup/uva_gather_microbench.txt):
+correct vs reference, correct across CUDA-graph replay with mutated indices,
+39.8 us for a c64-decode-shaped gather (4096 rows x 160 B), 1.95 ms for a
+16K-token prefill-chunk gather (40 MB, 21.5 GB/s effective) -- the tech
+report's design intent ("tables prefetched from host memory") at ~2% of a
+prefill chunk's budget. Host cost ~48 GiB pinned per rank (~382 GiB total).
+Follow-up optimization: one /dev/shm table shared across ranks.
+
+Weight budget per rank (EP + PLE host offload): 14.06 GiB FP8 experts +
+~3.5 GiB BF16 backbone/vision/MTP ~= 17.6 GiB of 24 GiB, leaving ~4 GiB for
+KV, GDN state, activations and graphs at 0.9 utilization. Without the PLE
+offload the model does not fit.
+
+Status: merge complete and pyflakes-clean; native build for SM86 in
+progress; profile `qwen38fn-fp8-8` registered (platform `rtx3090` added to
+hardware detection). Not yet validated: end-to-end health, correctness,
+TPS, MTP speculation on MRV2 (the PR only wired its Qwen4ExpMTPProposer
+into the V1 runner; MRV2 routes method=mtp to the generic MTPSpeculator --
+unverified against this hybrid drafter). No baseline claim is made yet.
+
+### 2026-08-26 - SGLang PR 36497 cross-reference (Qwen3.8-Flash-Next)
+
+Examined SGLang's implementation (sgl-project/sglang#36497, ~/sglang @
+73a255206f) after our port. Their PLE offload independently converges on the
+same core mechanism as ours: FP8/BF16 table pinned in host memory, Triton UVA
+gather via an int->pointer cast (`--ple-offload-embedding`, on by default for
+this model on CUDA). Differences and adoptable ideas, in priority order for
+this platform:
+
+1. Async prefetch overlap: before running decoder layer i, SGLang kicks layer
+   i+1's PLE gather on a dedicated stream (`start_prefetch` at the top of the
+   layer loop, per-batch-size capture buffers for graph mode, consume waits on
+   the stream inside the PLE layer). This is the tech report's "prefetch
+   overlaps with the computation of the first layer" realized; it would hide
+   our ~2 ms per-16K-chunk prefill gather (decode's ~40 us is already
+   negligible in-graph). Adopt during the optimization phase.
+2. In-kernel fp8->bf16 conversion in the gather (scale multiplied once after
+   the TP reduce), saving one elementwise pass over [tokens, 2560] vs our
+   gather-bytes-then-dequant.
+3. Decode-sized bitwise-exact fused kernels: single-launch 16-head n-gram
+   hash, fused gate/value broadcast, fused short-conv state advance
+   (python/sglang/kernels/ops/qwen4_ple.py) -- small decode wins.
+4. TP design difference: SGLang keeps the table TP-sharded (masked gather +
+   all-reduce, symmetric-memory output when TP>1) at 47.7 GiB host total; we
+   replicate per rank (382 GiB host) to remove the per-step all-reduce, which
+   is the right trade on this no-P2P box but theirs is the RAM-lean fallback.
+5. Reference material: JIT CUDA QSA indexer + fast_topk kernels
+   (sgl-kernel jit csrc), 2K-line QSA reference test, PLE offload parity
+   tests (test/registered/kernels/ops/embeddings/) usable for cross-checks.
+
+Deep-read addendum (after full pass over the SGLang PR):
+
+6. MTP shared sparse indices (`QSAMTPSharedSparseIndices`): the draft-extend
+   pass captures the QSA indexer's freshest per-request selection on
+   target-aligned hidden states, and the following speculative decode steps
+   reuse it -- the indexer QK projection, MQA logits and top-k vanish from
+   the decode graphs entirely (causally valid since draft positions advance
+   at most spec_num_steps within a growing row). This is what the
+   `index_share_for_mtp_iteration` knob we ported in speculative.py drives on
+   the vLLM side; worth verifying our MTP path actually exercises it, and
+   worth benchmarking on/off once spec decode is baselined.
+7. SGLang pins `page_size=64` for compressed QSA (compressed cache addressed
+   as full_slot // compress_ratio needs page-aligned full-KV pages, page a
+   multiple of the ratio) and requires page-granular prefix sharing. The
+   vLLM port encodes the same constraint through the CSA group builder
+   (block-size/prefix_match_unit % ratio validation) -- same invariant,
+   different mechanism.
+8. Their PLE offload defaults ON only for BF16 checkpoints on CUDA; the FP8
+   table path exists but is not the default. Ours defaults off and the
+   profile opts in explicitly for the FP8 checkpoint -- keep that, but note
+   their gather kernel does fp8->bf16 conversion in-kernel with the scale
+   applied once after the TP reduce.
+9. PLE per-request states (short-conv window + n-gram context) are
+   registered as MambaPool slot siblings so radix COW / offload round-trips
+   carry them; the vLLM port covers the same lifecycle through the mamba
+   align machinery and the model-state ngram context. Their
+   `ple_state_pool.py` is the reference if we see prefix-cache staleness.
+10. Their JIT CUDA `fast_topk` (block_topk 512/2048 only) and `qsa_indexer`
+    kernels are PDL-gated (SM90+); on SM86 they would fall back like our
+    cooperative-vs-persistent topk split does. Nothing to adopt for 3090.
+11. Their fused-MoE H200 tuning JSONs at N=80/160/320 are for the BF16
+    checkpoint (TP sharding of 640 without block-scale constraints); they do
+    not contradict the EP requirement for the FP8 block-quant checkpoint.
+
+### 2026-08-26 - qwen38fn-fp8-8 first live baseline (8x RTX 3090)
+
+Profile `qwen38fn-fp8-8` reached full health after five bring-up fixes, each
+recorded in the profile notes or below:
+
+1. moe/linear backend aiter defaults raise on CUDA -> profile pins auto at
+   both levels.
+2. torch.compile rejected a raw data_ptr() Triton argument -> host gather
+   wrapped as a functional vLLM custom op.
+3. Inductor "auto_functionalized was not removed" -> the op made functional
+   (returns rows) instead of mutating an out tensor.
+4. Illegal memory access, isolated with CUDA_LAUNCH_BLOCKING to the gather:
+   vLLM's cross-process torch-compile cache had baked the previous run's
+   pinned-table data_ptr() into the compiled artifact. The table is now a
+   tensor argument whose pointer is read at call time; never bake host
+   pointers into compiled graphs.
+5. KV planning needed a CSA branch in `_max_memory_usage_bytes_from_groups`
+   (packed-slab stride x summed per-group block demand), and 262144 max len
+   does not fit (3.52 GiB needed vs 2.2 GiB free at 17.6 GiB/rank weights;
+   engine's own estimate 161600) -> profile caps max_model_len at 131072.
+
+Validation: server healthy with FULL prefill+decode graph capture and the
+MTP speculator captured; text request answers correctly; image request
+answers correctly (vision tower + MRoPE + PLE host table all live).
+
+Exact-token baseline, 1000 in / 2000 out, shipped thinking-mode sampling
+(temp 1.0 / top_p 0.95 / top_k 20, seed 42), MTP k=2, PLE host offload on
+(raw JSON in perf/results/2026-08-26/qwen38fn-3090-bringup/):
+
+| Concurrency | Aggregate tok/s | Mean wall s | Draft acceptance |
+| ---: | ---: | ---: | ---: |
+| 1 | 109.61 | 18.25 | 54.2% |
+| 2 | 206.77 | 18.08 | 73.0% |
+| 4 | 283.30 | 27.37 | 67.8% |
+| 8 | 409.66 | 37.44 | 62.4% |
+
+Greedy c1 reference (harness default before the sampling flags): 142.95
+tok/s at 85.1% acceptance -- kept as an artifact only; sampled numbers are
+the baseline per the no-greedy rule.
+
+Interpretation: c2 = 1.89x c1 (near-linear), c4 = 1.37x c2, c8 = 1.45x c4.
+The TP-scaling sanity gate does not apply across concurrency, but the
+flattening past c2 points at the expected no-P2P collective ceiling and
+Marlin decode batching; profiling comes next. Follow-ups queued, in order:
+(a) SGLang-style layer-ahead PLE prefetch stream (hides the ~2 ms
+prefill-chunk gather), (b) `index_share_for_mtp_iteration` on/off
+experiment, (c) nsys decode-step breakdown to size the all-reduce share,
+(d) fp8->bf16 conversion inside the gather kernel, (e) /dev/shm-shared PLE
+table to cut host RAM 8x.
+
+### 2026-08-26 - Optimization campaign plan: throughput + context (qwen38fn-fp8-8)
+
+Grounding measurements (raw in perf/results/2026-08-26/qwen38fn-3090-bringup/):
+
+- NCCL all-reduce, 8x3090, host-staged SHM (no P2P), eager:
+  [1x2560] bf16 39.5 us; [3x2560] 49.3 us; [8x2560] 69.1 us; [16x2560]
+  90.4 us; [64x2560] 333 us; [256x2560] 825 us; [2048x2560] 6.94 ms;
+  [16384x2560] 53.5 ms. Bus bandwidth saturates at ~2.7 GB/s.
+- PCIe is Gen4 x16 per card (idle readings show gen1 downclock); the PLE UVA
+  gather sustains 21.5 GB/s per GPU on the same links, in-graph. NCCL is
+  therefore leaving ~8x interconnect on the table.
+- The model issues 2 all-reduces of [tokens, 2560] bf16 per layer (attention
+  out-proj + MoE) = 96 per forward. At c1 spec-verify (3 rows) that is
+  ~4.7 ms of a ~19 ms step (~25%); at c8 (~24 rows) ~8.6 ms of ~44 ms
+  (~20%). For long-context prefill an 8K chunk pays 96 x ~27 ms = ~2.6 s in
+  collectives alone -- collectives are the hard ceiling on prefill
+  throughput (~3K tok/s) before any kernel work matters.
+- VRAM: 17.6 GiB weights/rank + 2.2 GiB KV pool = ~181K-token slab
+  (per-64-token slab stride ~816 KiB: 12 x 64 KiB main KV + 12 x 4 KiB
+  compressed + mamba/ring overlap). Host RAM: ~500 GiB still free.
+
+Throughput ideas, ranked by measured leverage:
+
+T1. Custom UVA pinned-host all-reduce ("the PLE trick, applied to
+    collectives"). One-shot direct-read for decode sizes (each rank writes
+    its slice to a pinned /dev/shm segment, spins on flags, reads+reduces
+    the other 7 -- ~15-20 us vs NCCL's 40-50 us), chunked/pipelined for
+    prefill sizes (target 15-20 GB/s vs 2.7). Optional FP8-compressed
+    variant halves bytes (port the ROCm QuickReduce idea in
+    csrc/quickreduce to CUDA host-staging). References:
+    QuixiCore-CUDA/kernels/parallel/all_reduce, csrc/quickreduce,
+    csrc/libtorch_stable/custom_all_reduce.cu. Expected: c1 +15-20%,
+    long-prefill 3-5x. The primitive (UVA in-graph, flags, 21.5 GB/s) is
+    already production-proven here by the PLE gather.
+T2. DP2 x TP4 (+EP over all 8) profile experiment: halves the AR group and
+    hop count; vLLM supports attention-DP with expert-EP. Pure config
+    change -- run the same exact-token matrix and compare. Also worth DP4 x
+    TP2 at high concurrency.
+T3. Vendor the upstream fused GDN decode CUDA kernel
+    (csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu at PR #53896 tip,
+    sigmoid gating included) -- one launch per layer for conv+scan+norm at
+    decode across 36 GDN layers, replacing the fla triton chain. The fork
+    deleted this path when it went Metal-first; on CUDA it is a ready win.
+T4. Speculation: enable index_share_for_mtp_iteration (the QSA indexer
+    disappears from draft decode steps; SGLang ships this as
+    QSAMTPSharedSparseIndices), sweep num_speculative_tokens 2->3 (MTP is
+    multi-step trained), re-measure acceptance x cost.
+T5. PLE micro-opts: SGLang-style layer-ahead prefetch on a side stream
+    (hides the ~2 ms per-16K-chunk gather), fp8->bf16 conversion inside the
+    gather kernel, fused decode-sized ngram-hash / gate-value / short-conv
+    kernels (SGLang's qwen4_ple.py is the reference).
+T6. Marlin MoE decode tuning for EP tiny-M (64 experts/rank, ~10 hit per
+    token): moe_align overhead, M<=8 configs, and if profiling justifies
+    it, a QuixiCore-style fused route/align -> grouped W8A16 GEMM -> SwiGLU
+    -> finalize chain per the a100_glm52_design.md playbook.
+T7. nsys decode+prefill step breakdown BEFORE T1/T6 kernels are written, to
+    keep this ranking honest.
+
+Context ideas, staged:
+
+C1. FP8 KV for the 12 main QSA KV layers: halves the dominant slab term
+    (64 KiB -> 32 KiB per 64-token page) -> ~320K-token pool; restores
+    max_model_len 262144 (native) with concurrency headroom. We own the QSA
+    triton kernels (ops/qsa.py) -- add fp8 loads + dequant; the FA2 core
+    path either gains fp8 dequant or yields to our triton sparse kernel.
+    The fork's TurboQuant KV machinery is local precedent.
+C2. gpu_memory_utilization 0.90 -> 0.92-0.93 after graph-memory
+    remeasurement (+~50K tokens).
+C3. Host-resident main KV with UVA sparse gather (the flagship): QSA decode
+    reads only the top-2048 tokens per layer, so decode needs just ~24
+    MB/step from host = ~1.2 ms at the proven 21.5 GB/s -- sparse attention
+    makes host KV *viable*, which dense attention never allows. Keep the
+    compressed indexer cache, ring, and GDN state on GPU (small); page main
+    KV to pinned host pools sized by the ~500 GiB of free host RAM. Prefill
+    writes stream H2D; prefill reads gather per-layer unions (worst case
+    the whole prefix: 128K x 1 KiB x 12 layers / 21 GB/s = ~73 ms per 8K
+    chunk -- acceptable). Combined with C1 (fp8 host KV) traffic halves
+    again. End state: YaRN x4 to 1M tokens on 24 GB cards.
+C4. KV-head sharing: TP8 replicates each of the 2 KV heads across 4 ranks;
+    a /dev/shm-shared host KV pool stores each head once, cutting host KV
+    (and PLE table, same mechanism) storage 4-8x.
+
+Execution order: Phase A = T2 + T4 + T3 + T5 + C2 (cheap, config/vendor
+work, each measured against the recorded baseline). Phase B = T7 then T1
+(custom collective). Phase C = C1 (fp8 KV -> 262K native). Phase D = C3/C4
+(host KV -> 1M). Every step gets baseline / hypothesis / correctness /
+throughput / decision per perf.md.
+
+### 2026-08-26 - Rejected DP2xTP4 attention-DP experiment
+
+Hypothesis: halving the all-reduce group (TP4 within DP2) cuts the per-AR
+latency that dominates decode. Result: rejected before measurement on two
+hard grounds. (1) This vLLM revision forces sequence-parallel MoE whenever
+DP>1 x TP>1 x EP (the "naive" a2a backend was removed upstream and
+allgather_reducescatter implies SP), and the Qwen4Exp hyper-connection
+residual layout cannot shard by sequence -- the model guards against it
+explicitly ("Qwen4Exp HC does not support sequence-parallel MoE",
+perf/results/2026-08-26/qwen38fn-3090-opt/serve_dp2tp4.log). (2) Memory:
+TP4 leaves 28 GiB/rank of FP8 experts, which does not fit 24 GiB cards, so
+attention-DP variants are unreachable without a W4 expert requant.
+Decision: rejected; the collective cost is addressed head-on by the custom
+UVA all-reduce (T1) instead.
+
+### 2026-08-26 - Custom sysmem all-reduce prototyping (decision: prefill-tier only)
+
+Built and iterated a pinned-/dev/shm UVA all-reduce in Triton (one shared
+segment cudaHostRegistered in all 8 ranks, per-rank slot banks double-
+buffered by round parity, cumulative arrival counters, single publisher per
+rank, packed 8-flag word swept in one volatile vector load, device-memory
+gate for the other blocks; round index derived in-kernel from the arrival
+counter so one AR = one kernel launch; correct under CUDA-graph replay).
+Artifacts: perf/results/2026-08-26/qwen38fn-3090-opt/ (sysmem_ar_proto*.py
++ outputs). Hard-won protocol lessons recorded in the sources: the entire
+happens-before chain must be system-scope (device-scope arrivals give
+remote readers stale slots), a single shared host counter fetch-added by
+all 8 GPUs hangs this EPYC root complex (per-rank words work), and Triton
+while-loops cannot contain break.
+
+Measured (8x3090, vs NCCL from nccl_ar_microbench.txt):
+
+| payload | NCCL | one-shot | two-phase RS+AG |
+| --- | ---: | ---: | ---: |
+| 15 KB (3 tok) | 49 us | 62-76 us | - |
+| 328 KB (64 tok) | 333 us | 411 us | 420 us |
+| 1.3 MB (256 tok) | 825 us | 1475 us | 1304 us |
+| 10.5 MB (2048 tok) | 6.94 ms | 11.2 ms | 8.27 ms |
+
+NCCL env sweep (Tree/Simple/SHM_USE_CUDA_MEMCPY/NTHREADS/BUFFSIZE) never
+moved NCCL off ~2.7 GB/s busbw, so that is the SHM-transport platform
+ceiling, but its LL protocol is already near the small-payload latency
+floor: the custom one-shot cannot meaningfully beat ~40 us at decode sizes.
+The prototype's large-payload loss traces to GPU-side UVA read bandwidth
+(~4-5 GB/s from 64 persistent blocks with accumulate chains) versus the
+21.5 GB/s the PLE gather achieves with one-program-per-row parallelism.
+
+Decision: pivot T1 to a prefill-tier collective only -- structure large ARs
+as [copy-in huge-grid kernel] [1-block barrier kernel] [stripe gather+
+reduce huge-grid] [barrier] [result gather huge-grid], PLE-style massive
+parallelism in every data mover, keeping NCCL for decode-size payloads.
+Target: >15 GB/s effective -> 4-8x on the 96 x 27 ms per-8K-chunk prefill
+collective bill. Decode-side wins must come from T3/T4/T6 and from
+reducing collective count, not collective latency.
+
+### 2026-08-26 - Platform DMA asymmetry bounds host-staged collectives
+
+Aggregate concurrent-DMA microbench (8 ranks,
+perf/results/2026-08-26/qwen38fn-3090-opt/agg_dma_bench.py): H2D scales to
+105.6 GB/s aggregate (13.2/GPU) but D2H collapses to 16.5 GB/s aggregate
+(2.1/GPU) -- the EPYC root complex serializes concurrent device-to-host
+writes. Single-GPU D2H is 20-26 GB/s, so this is contention, not link
+speed.
+
+Consequences: every inter-GPU byte must transit host (no P2P), so any
+8-rank all-reduce of B bytes pays >= 7B of aggregate D2H, flooring the op
+at 7B / 16.5 GB/s. NCCL's measured 26.8 ms for an 8K-chunk AR sits within
+~35% of that wall -- NCCL is not leaving 8x on the table after all; the
+apparent 21.5 GB/s UVA headroom was read-path-only. The copy-engine
+RS+AG SysmemAllreduce built today (correct, graph-capturable,
+vllm/distributed/device_communicators/sysmem_all_reduce.py + standalone
+test) measures 0.85-0.89x NCCL at large sizes and is retained as
+infrastructure, not enabled.
+
+Revised collective plan: the only real prefill-AR lever is sending fewer
+bytes -- an FP8-compressed all-reduce (QuickReduce scheme, local precedent
+in csrc/quickreduce for ROCm) halves D2H and should combine with the
+copy-engine transport for ~2-3x on prefill collectives. Decode-size ARs
+stay NCCL (its LL protocol is at the latency floor). Campaign priority
+shifts decode-ward (fused GDN, spec knobs, MoE) and context-ward (fp8 KV),
+with fp8-AR as the follow-up collective work.
+
+### 2026-08-26 - Phase A results: fused GDN, MTP index share, MTP k sweep
+
+Paired A/B chain (each leg: fresh serve of qwen38fn-fp8-8, exact-token
+1000/2000, shipped sampling, seed 42, c1+c8; raw logs
+perf/results/2026-08-26/qwen38fn-3090-opt/bench_*.log). The harness is
+tight: the control leg reproduces the prior session baseline to 0.02%
+(409.61 vs 409.66 c8).
+
+| leg | GDN kernel | spec | c1 tok/s | c8 tok/s |
+| --- | --- | --- | ---: | ---: |
+| gdntriton (control) | triton | k=2 | 106.01 | 409.61 |
+| gdnfused | fused CUDA | k=2 | 107.64 | 391.07 |
+| idxshare | fused CUDA | k=2 + index share | 108.65 | 414.94 |
+| k3 | fused CUDA | k=3 + index share | 114.30 | 368.64 |
+
+Decisions:
+
+- Fused GDN decode kernel (vendored from PR #53896 tip with sigmoid
+  support, 16/16 unit tests pass on SM86 including pure-decode/pure-MTP/
+  mixed/prefill): REJECTED as default. Inside FULL decode graphs the launch
+  savings are already amortized and the kernel loses 4.5% at c8 (391.1 vs
+  409.6); c1 +1.5% is within sampling-trajectory noise (its slightly
+  different norm numerics shift acceptance). Kernel stays built and
+  selectable via VLLM_GDN_DECODE_KERNEL=cuda; profile pins triton. An
+  SM86-tuned variant (occupancy/tile work) is a future kernel project.
+- index_share_for_mtp_iteration: RETAINED. +6.1% at c8 vs its paired
+  baseline (414.9 vs 391.1) and above the triton control even while
+  carrying the slower fused kernel; c1 +1%. The MTP draft reuses the
+  target-aligned QSA indexer selection, deleting indexer QK/MQA/top-k from
+  draft decode steps (the mechanism SGLang ships as
+  QSAMTPSharedSparseIndices).
+- MTP k=3: split verdict -- +6.2% c1 (114.3), -11% c8 (368.6). The fork's
+  num_speculative_tokens_per_batch_size schedule captures both regimes;
+  chain 3 probes k=3 for batch<=2 and k=2 above (with FULL-graph
+  compatibility of dynamic-K the open question, since dynamic SD disables
+  spec padding).
+
 ## 2026-08-09 - Retained Merged Sparse-MLA Decode And Exact Baseline
 
 - Status: retained production improvement; tensor-parallel scaling gate still
@@ -7084,6 +7476,3602 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
 - Decision: merge RETAINED, PR #2 updated. Raw:
   perf/results/2026-08-17/remerge_gate/.
 
+## 2026-08-17 — Async-output completion-event wedge: structural Metal fix (native mps event, no cross-stream choreography)
+
+- Status: retained (separate PR; user-requested follow-up to the campaign)
+- The defect, from the accumulated evidence (boot_v12/v12c py-spy 2/2,
+  08-15 merge-gate wedge, cleanup-phase host-timing bisect): the engine
+  parks forever in THPEvent_synchronize -> MPSEvent::synchronize on
+  AsyncOutput.copy_event, GPU idle, no CB error — the signal is lost. The
+  machinery it rides is fictional on Metal: torch.Stream(mps) ALWAYS
+  returns stream_id 0 (probed, torch 2.13), so async_utils'
+  set_stream + copy_stream.wait_stream(main_stream) + generic
+  torch.Event().record(copy_stream) is a cross-stream dance on one stream
+  — zero overlap bought, and a completion path routed through an event
+  observed to never fire on timing-sensitive boots.
+- Fix (vllm/v1/worker/gpu/async_utils.py): on Metal, AsyncOutput and
+  AsyncPoolingOutput skip the stream context, wait_stream, and generic
+  Event entirely; the same non-blocking D2H copies enqueue on the only
+  stream and completion is a native torch.mps.Event recorded there
+  (record() on current stream, no stream juggling). get_output() waits on
+  that event. Ops kill-switch VLLM_QC_ASYNC_OUT_DRAIN=1 replaces the event
+  with a full torch.mps.synchronize() drain.
+- Why not just drain: measured. The drain-only variant lost the drafter
+  tail overlap — off1-2000 wall 65.26 s / 30.6 tok/s vs 62.93-63.09 s
+  baseline (-3.7%). The native-event build restores it: 62.53 s /
+  32.0 tok/s (best wall of the day). The 08-15 CB-timeout drain variant is
+  also explained: it swapped only the host wait and left wait_stream's
+  GPU-side encodeWaitForEvent in place; this fix removes both.
+- Honesty note on reproduction: the wedge did NOT reproduce today on the
+  UNFIXED build (2/2 clean cold triggers: no-primer 2500-direct and
+  primer+2500-direct) — the host-timing race has drifted out of its
+  trigger window on this box (the same environmental drift that re-rolled
+  the 2500 trajectory, see UPDATE 29). The fix therefore rests on the
+  structural argument plus the prior deterministic evidence, not on a
+  live repro-kill. By construction the parked-event failure mode cannot
+  occur: there is no cross-stream event to lose.
+- Validation (5 boots, fixed build): (1) drain variant: cold 2500 direct
+  clean + all anchors bit-exact; (2) native event, standard ramp: 8-tok
+  db2846cf721b 7/10/2, off1-2000 7ce993786ba1 1538/2320/464 @ 62.53 s
+  (32.0 tok/s), 2500 e973493bef44 51/60/12 @ 3.37 s — ALL bit-exact vs
+  UPDATE 29 anchors; (3) boot_v12 wedge protocol (primer -> 2500 direct)
+  clean; (4) 08-15 wedge protocol (primer -> 8-tok -> 2500) clean;
+  (5) VLLM_QC_ASYNC_OUT_DRAIN=1 boot serves bit-exact (8-tok + 2500).
+- Kept: compressor/metal.py phaseprof/memo structure and the boot-ramp ops
+  protocol stay until a soak on the fixed path proves them unnecessary
+  (documented in metal_compat.py). CUDA/ROCm path byte-identical.
+- Raw: perf/results/2026-08-17/wedge_fix/ (boot_fix1..5 logs).
+
+## 2026-08-17 — Qwen3.8-27B Metal bring-up: scoped, registry landed, download started (CAMPAIGN OPEN)
+
+- Goal (user request): measure how the M1 Ultra Metal kernel stack serves
+  Qwen3.8-27B.
+- What Qwen3.8-27B is (HF Qwen/Qwen3.8-27B config.json, fetched):
+  architecture Qwen3_5ForConditionalGeneration (model_type qwen3_5 — the
+  3.8 release reuses the 3.5-series architecture), dense 27B VL hybrid:
+  64 text layers = 16 x (3 x Gated-DeltaNet linear_attention + 1
+  full_attention), hidden 5120, gated attention 24Q/4KV head_dim 256 with
+  attn_output_gate, vocab 248320, native 262144 context. GGUFs at
+  ggml-org/Qwen3.8-27B-GGUF: Q4_K_M 17.7 GiB, Q8_0 26.6 GiB, separate
+  mmproj vision tower, and an mtp-* MTP drafter (Qwen3_5MTP).
+- Landed this session (branch qwen38-bringup): source `qwen38-27b`
+  (Q4_K_M + Q8_0 + mmproj shared + MTP speculator declaration) and profile
+  `qwen38-1` (metal, 32768 bring-up context, 8 GiB KV pool, reasoning
+  parser qwen3, tool parser qwen3_xml, prefix caching off, speculation
+  off) in slimserve/profiles.json; test allowlist updated; 48/48 profile
+  tests pass; `slimserve qwen38-1 --dry-run` resolves;
+  `--download-only -y` fetching into ~/models/Qwen3.8-27B-GGUF/.
+- GAP ANALYSIS — why it does not serve yet (all verified in-tree):
+  1. Model class missing: the registry's qwen3_5 row is DANGLING (module
+     stripped from this fork). Upstream chain to vendor: qwen3_5.py (732
+     lines) -> qwen3_next.py (~32 KB) + qwen3_vl.py (~117 KB, vision) +
+     qwen2_moe.py (MLP dep) + transformers_utils/configs/{qwen3_5,
+     qwen3_5_moe}.py. Interfaces have drifted in this fork; expect real
+     adaptation, not copy-paste. Text-only first (muse_glimmer precedent:
+     text GGUF + separate mmproj).
+  2. GDN compute is Triton-only: qwen_gdn_linear_attn.py (already in-tree
+     from the Kimi K3 A100/MI300X work) calls
+     vllm.third_party.flash_linear_attention chunk/recurrent ops,
+     causal_conv1d Triton kernels, and optional AITER Triton — none run on
+     Metal. Bring-up needs torch-native MPS fallbacks (correct first),
+     then Metal kernels (fast; the actual point of the campaign).
+     Reference implementations: kimi_gdn/qwen_gdn layers + fla ops for
+     algorithm, QuixiCore-Metal for kernel idioms.
+  3. Hybrid state cache: gdn_attn.py backend + mamba_hybrid model states
+     exist in-tree (K3) but are unproven on Metal; metadata builders may
+     also carry Triton assumptions.
+  4. GGUF weight mapping: this fork's loader needs qwen3_5 tensor-name
+     mappings for the llama.cpp Qwen3.8 arch (mmproj + MTP files must be
+     ignored by the text loader).
+- MILESTONE PLAN: (M1) vendor + adapt the model chain, torch-native GDN
+  fallback, first greedy tokens vs HF reference; (M2) exact-harness
+  baseline + notebook entry (expect slow); (M3) Metal GDN kernels
+  (chunked delta rule prefill, recurrent decode step, conv1d) in
+  csrc/quixicore/metal, oracle-tested, then e2e; (M4) MMVQ/dense GEMV
+  reuse for the FFN/attention projections (Muse qgemv_mm precedent),
+  llama.cpp bar on the same box; (M5) 262144 context + MTP speculation.
+- The dsv4 campaign anchors are untouched by any of this (profile-only
+  changes on a separate branch).
+
+### UPDATE 1 (2026-08-17) — Reference study complete: llama.cpp / MLX / upstream vLLM / SGLang + in-tree perf-interaction audit
+
+Study pass over every ecosystem that serves this model, plus an audit of how
+the bring-up interacts with our existing Metal optimizations. Reference trees
+cloned on this box: `~/llama.cpp` (master d8df12e, includes the merged qwen35
+support) and `~/mlx-lm` (3010810). Upstream vLLM qwen3_5 chain preserved at
+`~/references/vllm-upstream-qwen35/` (models/qwen3_5.py, qwen3_next.py,
+qwen3_5_mtp.py, qwen2_moe.py, registry.py, configs/, gdn/).
+
+**GGUF layout facts (llama.cpp arch `qwen35`; wrong = silent garbage):**
+- Qwen3.5 HF checkpoints ship the GDN in-proj ALREADY SPLIT
+  (`in_proj_qkv/z/b/a`) — there is NO qkvzba de-interleave in the converter.
+  The handoff's "qkvzba split" gap is thus simpler than feared; the one real
+  permutation is the V-head reorder below.
+- V-head reorder (conversion/qwen.py:446-611): GGUF stores V heads TILED
+  (`h_new = r*16 + k` for k=K-group 0..15, r=V-in-group 0..2; invert with
+  `h_old = k*3 + r`) so ggml's modulo broadcast (`vhead % 16`) works. Touches:
+  V rows (4096..10239) of `blk.N.attn_qkv`, all of `attn_gate` (=z), `ssm_beta`,
+  `ssm_alpha`, `ssm_a`, `ssm_dt.bias`, V channels of `ssm_conv1d`, and the
+  COLUMNS of `ssm_out`. MLX/HF keep grouped order (`vhead / 3`). Our adapter +
+  kernel must pick one convention and apply it everywhere (state cache and
+  out-proj included).
+- `attn_qkv` rows: q(0..2047) | k(2048..4095) | v(4096..10239).
+- `ssm_a` = `-exp(A_log)` (transformed at conversion); `ssm_dt.bias` raw.
+- Norm storage: converter pre-adds +1 (Gemma zero-centered -> plain RMS) to
+  ALL norms EXCEPT `ssm_norm` (GDN gated norm, stored raw). A vLLM
+  GemmaRMSNorm-based model must subtract 1 from every norm tensor except
+  ssm_norm when loading from GGUF.
+- Full-attn `blk.N.attn_q` is [12288, 5120]: per-head interleaved
+  [q(256) | gate(256)] — the sigmoid output gate is fused in q_proj (llama.cpp
+  splits with strided views at graph time; GGML rows quantize independently, so
+  we can split rows at load). Gate applied post-SDPA, pre-o_proj, as
+  `out * sigmoid(gate)`. o_proj input is 6144 (gate excluded).
+- Rope: IMROPE, n_rot 64 of head_dim 256, sections [11,11,10,0], theta 1e7 —
+  degenerates to standard NeoX partial rope for text-only (all position
+  components equal). MLX ignores mrope entirely for text.
+- Metadata keys: `qwen35.full_attention_interval = 4` (layer i is full-attn
+  iff (i+1)%4==0 → 16 layers at 3,7,...,63), `qwen35.ssm.{conv_kernel 4,
+  state_size 128, group_count 16, time_step_rank 48, inner_size 6144}`,
+  `rope.dimension_count 64`, `rope.dimension_sections`. Pre-tokenizer
+  `"qwen35"` (qwen2 regex + \p{M}); bos=eos=248044 flows through standard keys.
+
+**GDN numerics oracle (MLX + llama.cpp CPU ref agree; exact op order):**
+- q/k L2-normalized per head (weightless rms_norm, eps hardcoded 1e-6);
+  scale 1/sqrt(128) (MLX folds into q; llama.cpp fused op applies at output).
+- `g = exp(-exp(A_log_fp32) * softplus(a + dt_bias))` fp32, per (token,
+  v-head); `beta = sigmoid(b)`.
+- Per token: `S *= g; kv = S.k (post-decay); d = (v - kv)*beta; S += k (x) d;
+  y = S.q (post-update)`. State [48, 128(v), 128(k)] fp32 ALWAYS; y cast bf16.
+- Output gate: per-head RMSNorm(128, ssm_norm raw weight) then
+  `* silu(z)` computed in fp32.
+- Conv: depthwise k=4, no bias; state = last 3 timesteps of the 10240-dim
+  pre-conv projection, model dtype; conv -> SiLU -> split q/k/v.
+- Parity bars: chunked-vs-recurrent ~3e-3 output / 1e-2 state (fp32);
+  validate LONG generations — the ecosystem's GDN bug signature is
+  match-for-20-30-tokens-then-diverge (mlx-lm #1058), and every shipped bug
+  passed short smokes.
+- MLX post-landing regressions to not repeat: bf16 state accumulation
+  (#997), fp32-casting A_log at convert (#902), missing cache.advance (#1024),
+  conv-tail slice retaining the whole concat buffer (#1077).
+
+**Metal GDN kernel design (llama.cpp #19504 op + #20361/#20443 Metal kernel;
+MLX gated_delta.py):**
+- BOTH Metal implementations use a pure recurrent per-token scan — no chunked
+  kernel exists on Metal anywhere; llama.cpp's fused recurrent BEATS its own
+  chunked graph even at ubatch 2048, and bought +20% tg (27B dense Q8_0) to
+  +35-38% (M1 Ultra, qwen35moe) over unfused.
+- llama.cpp geometry (the M3 template): one launch per layer per batch, token
+  loop in-kernel; grid (32, Hv=48, B), threadgroup (32, NSG=Sv/32=4);
+  one simdgroup owns one value-channel state row (128 fp32 across 32 lanes x 4
+  regs) held in registers the whole launch; two simd_sum reductions per token;
+  no threadgroup memory. State layout MUST be key-dim-contiguous per value row
+  — the first merged kernel read it column-strided and REGRESSED 39% on
+  L2-spilling models (issue #20436 -> PR #20443).
+- Broadcast: llama.cpp uses tiled `% 16` (enabled by the converter reorder);
+  MLX uses grouped `/ 3`. Decision required (couples adapter/kernel/cache).
+- Follow-up worth stealing: write final state directly into the recurrent
+  cache from the kernel (CUDA #23940 merged; Metal #25788 open, up to +31% tg
+  on small models) instead of a separate cpy.
+- conv1d decode is a 4-float dot per channel (trivial); llama.cpp keeps
+  SSM_CONV + SiLU as separate ops — folding conv+SiLU+state-shift into a
+  pre-GDN stage is an obvious fusion we can do that they haven't.
+- IN-TREE HEAD START: csrc/quixicore/metal/kernels/linear_attention/gdn/
+  gdn.metal already contains `gdn_recur` (Dk 64/128), `gdn_short_conv`
+  (history<=7 — covers k=4), `gdn_qkv_prepare`, `gdn_gate_beta`,
+  `gdn_gated_rmsnorm`, with complete host ABIs in tk_launch.h:1275-1388 and
+  ZERO callers. M3 may be wire-and-validate, not from-scratch. Must audit
+  gdn_recur's state orientation + broadcast convention against the two traps
+  above before trusting it.
+
+**vLLM adaptation map (fork-verified):**
+- In-tree `mamba/gdn/qwen_gdn_linear_attn.py` IS the exact upstream layer
+  qwen3_5 uses (`gqa_interleaved_layout=False` = flat [B|A] ba concat, flat
+  qkvz splits — vLLM #36329 confirmed 3.5 differs from 3-Next here). Two
+  dangling imports make it unimportable today (mamba_mixer2's
+  mamba_v2_sharded_weight_loader — TP1 needs only a trivial vendored fn — and
+  configs.qwen3_next typing import). Metal dispatch trap: it falls into
+  forward_cuda -> Triton, and ChunkGatedDeltaRule's "forward_native" IS the
+  Triton path — MPS fallbacks hook at forward_mps / _forward_core seams.
+- Torch-native MPS fallbacks needed (7 entries): causal_conv1d_update,
+  fused_recurrent_gated_delta_rule_packed_decode (or
+  fused_sigmoid_gating_delta_rule_update), causal_conv1d_fn,
+  fused_post_conv_prep, chunk_gated_delta_rule (replace at outer entry),
+  l2norm_fwd (inline), and mamba_hybrid.py's _scatter_num_accepted_kernel
+  (3-line torch scatter).
+- Restore: models/qwen3_5.py + dense pieces of qwen3_next.py
+  (Qwen3NextAttention/DecoderLayer/Model) + 3 config modules (venv
+  transformers 5.15.0 already ships qwen3_5 configs; lazy rows in
+  transformers_utils dangle today) + dense MLP (Qwen2MoeMLP shape ==
+  MuseGlimmerMLP). Registry needs the dense ForConditionalGeneration +
+  CausalLM rows; the existing Moe row dangles.
+- GGUF side: new build_qwen35_config_from_gguf (gguf_kimi_k3 precedent) +
+  Qwen35GGUFAdapter (muse_glimmer build_name_map precedent). embed_tokens must
+  load unquantized (Metal has no dequant-gather; muse override precedent,
+  ~2.4 GiB fp16 at 248320x5120). mtp-*.gguf never picked up by shard
+  discovery; in-checkpoint mtp.* dropped via skip_prefixes.
+- Surprisingly already in-tree: Qwen3_5ForConditionalGenerationConfig handler
+  (mamba_ssm_cache_dtype from HF mamba_ssm_dtype), qwen3_5_mtp speculative
+  plumbing, hybrid mamba block-size alignment, MambaSpec fp32 state dtype
+  calculators, GDN backend selection independent of Metal's attn backend.
+
+**Perf-optimization interaction verdicts (audit vs recent campaigns):**
+- Steady-decode metadata reuse: quadruple-inert for qwen38-1 (needs FULL
+  cudagraph + opt-in env + V2 runner + no model_specific_attn_metadata; hybrid
+  fails all four). No conflict; nothing to do.
+- qwarp8 IQ2 W1 dial: A100-profile env only. No interaction.
+- Async-output wedge fix (ad521687d): V2-tree only. Hybrid models DEFAULT TO
+  THE V1 RUNNER (vllm/config/vllm.py:649-650 excludes is_hybrid from V2), and
+  V1's AsyncGPUModelRunnerOutput still has the pre-fix wedge choreography.
+  DECISION REQUIRED at M1: (a) async scheduling off on V1, (b) port the fix to
+  V1, or (c) force V2 (then patch mamba_hybrid's Triton scatter). V2 also
+  brings the steady-meta guards for free. Boot-ramp protocol stays regardless.
+- Dense-path kernels: ALL major projections clear MMVQ/qgemv_mm/qgemm shape
+  gates as-is (q4_K/q6_K fully covered incl. lm_head 5120->248320; K dims all
+  %256). Landmines: (1) GDN b/a projections are 48-wide — fine on qgemv, but
+  if the GGUF stores them QUANTIZED the M>17 prefill path hits the
+  N%32 qgemm check and falls to the dequant path which RAISES on Metal; if
+  F32/F16 they bypass Metal cleanly. gguf_reader dump of the actual file is a
+  pre-M1 action item. (2) head_dim 256 attention: paged kernel instantiated
+  for 64/128 only -> the 16 attn layers run the SDPA-loop fallback (known
+  ceiling, includes 6x GQA repeat_interleave ~400 MiB/layer/req at 32k);
+  accept through M2, D=256 paged instantiation is the M4 candidate.
+- KV/memory accounting: Metal supports mixed hybrid specs (no uniform-spec
+  assumption). Derived math for qwen38-1: GDN page 3.21 MB/layer (conv 60 KB +
+  state 3 MiB fp32), unified attn block size 784 tokens, 167 blocks in the
+  8 GiB pool -> ~3.7 concurrent seqs vs max_num_seqs 16. Profile adjustment
+  needed (grow pool or drop max_num_seqs to ~4). All this math only runs once
+  the registry row resolves.
+- Anchor risk (DSV4 anchors per UPDATE 29 must stay green): HIGH =
+  gguf/linear.py + gguf/ops.py (b/a guard would land here),
+  platforms/metal{,_compat}.py, kv_cache_utils/interface hybrid block-size
+  path, and ANY qc_metal_serving.mm/metallib rebuild (UPDATE 28 rule: kernel
+  oracles + full anchor re-gate). LOW = registry rows, new model/adapter
+  files, gdn/* (platform-gate edits to protect Kimi K3 CUDA/ROCm).
+- Pre-existing latent bugs found during audit (fix opportunistically):
+  emit_matvec passes raw M to launch_qgemv_mm without decomposition (M in
+  {3,5,6,7,9..15} throws); C++ launch_paged_attention lacks head-size/GQA
+  guards; V1/V2 hybrid attn-cache as_strided layout mismatch vs QuixiCore
+  paged contract (Qwen3.8 escapes via SDPA; future 64/128-head hybrids won't).
+
+**Ecosystem pitfalls adopted as gates:**
+- Guard every GDN kernel launch against zero-length batches — SGLang #31594's
+  ROCm "hang in chunk_gated_delta_rule under serialization" was a degenerate
+  zero-sized grid from an idle DP rank, surfacing as async errors in unrelated
+  ops.
+- Prefix caching stays OFF (profile already correct): GDN conv + recurrent
+  state cross request/item boundaries un-maskably (SGLang #31969); vLLM's
+  align-mode prefix caching for GDN has an open bug tail (block-boundary state
+  off-by-one corrupted agent workloads, #47861 cluster); snapshots cannot be
+  rewound like KV blocks.
+- Batched decode: omlx #2119 reports GDN state corruption at batch>=3 on this
+  exact model family (Metal, ArraysCache) — add a c>2 correctness case to the
+  M2 harness, not just c1.
+- MTP (M5): bound every accepted-count-derived state index, fail closed
+  (vLLM #50021 IMA pattern); MTP DeltaNet workspace exceeds naive memory
+  profiling (syv-ai: dies mid-request at high mem-util on long generations
+  while passing short benchmarks).
+- fp32 ssm state is the bring-up reference; fp16 state measured
+  perplexity-neutral (halves the 150 MB/req state, syv-ai) — a legitimate
+  M4+ bandwidth dial, A/B only after baseline.
+- MLX bars/oracle on this box: `mlx_lm.generate --model
+  mlx-community/Qwen3.8-27B-bf16 -p "..." -m 256 --temp 0.0` (argmax; prints
+  prompt/generation tok/s + peak mem); stream_generate for raw token-id
+  parity. llama.cpp bar via ~/llama.cpp build (Muse precedent: record both
+  next to ours).
+
+**Open decisions gating M1 (record before code):** (a) V1-with-async-off vs
+forced-V2 runner; (b) V-head order convention — tiled-in-adapter (llama.cpp,
+lets a future kernel use %16) vs grouped-passthrough (MLX/HF order, matches
+in-tree FLA fallback expectations); (c) qwen38-1 concurrency fix (pool size
+vs max_num_seqs); (d) whether GDN b/a + norm tensors in the actual Q4_K_M
+file are F32 (gguf_reader dump).
+
+### UPDATE 2 (2026-08-17) — The four M1-gating decisions: researched and resolved
+
+**(a) Runner: FORCE V2** (`env: {"VLLM_USE_V2_MODEL_RUNNER": "1"}` in
+qwen38-1; the env override at vllm/config/vllm.py:586-588 wins before the
+is_hybrid exclusion, and `_get_v2_model_runner_unsupported_features` has no
+hybrid entry — forced-V2 hybrid validates clean). Evidence: nothing on Metal
+serves V1 today (muse-kdyn-1 and dsv4-xxs-1 are both V2 — verified via
+selection logic + git ancestry + notebook line 2841); Kimi K3 runs
+hybrid+spec through MambaHybridModelState/GDN backend in production on
+MI300X (dspark-forced V2), so the V2 hybrid glue is proven, just not on
+MPS; the entire last month of Metal hardening (wedge fix, drain kill-switch,
+MPS-native batch prep at gpu/input_batch.py + block_table.py, V2 warmup) is
+V2-only; V2's decode-first batch sort satisfies GDN's
+reorder_batch_threshold=1 structurally. The one hard blocker is
+`_scatter_num_accepted_kernel` (mamba_hybrid.py:304-349) — fires every
+sampling step because V2 always passes num_sampled as a tensor — needing a
+device-gated ~3-line torch scatter fallback in that hybrid-only file (DSV4
+never imports it; anchor exposure ~zero). V1's wedge exposure is moot
+anyway: Metal force-disables async scheduling (metal.py:244-249), so V1
+would run sync — but with zero Metal mileage (MetalModelRunner is a 26-line
+shim nothing serves through). Fallback is free: delete the env line → V1.
+Option "port wedge fix to V1" rejected — dead code unless
+VLLM_METAL_ASYNC_SCHED=1, unproven even for dsv4.
+- Residual watch items at M1/M2: first MambaHybridModelState execution on
+  MPS (prepare_attn CPU tensors, .max().item() syncs), GDN builder
+  async_tensor_h2d non-pinned copies — shared-with-V1 or hybrid-only.
+
+**(b) V-head order: GROUPED-NATIVE** (un-permute llama.cpp's tiled GGUF
+order back to HF grouped at load). Evidence: every compute path we own
+hard-codes grouped division broadcast — all 7 FLA Triton kernels
+(`i_h = i_hv // (HV // H)`: fused_recurrent.py:64/286,
+fused_sigmoid_gating.py:64, chunk_scaled_dot_kkt.py:89, wy_fast.py:98,
+chunk_delta_h.py:99, chunk_o.py:84-85), the dormant Metal kernel
+(gdn.metal:48 `hk = hv / (Hv/Hk)`), and the CUDA cousin
+(lin_attn_tm/gdn_kernels.cuh:46). Tiled-native would fork shared kernels
+that Kimi/Qwen3-Next HF checkpoints also use, and breaks TP-shard
+alignment. State orientation needs NO change: gdn.metal's pool
+(slot, Hv, Dv, Dk) with Dk contiguous == llama.cpp's proven
+row-contiguous-in-key layout == FLA's [N, HV, V, K].
+Adapter permutation (grouped slot h_g takes tiled row
+`(h_g % 3) * 16 + h_g // 3`): V rows 4096..10239 of attn_qkv (48
+row-groups of 128), all of attn_gate/z, ssm_beta + ssm_alpha rows,
+ssm_a + ssm_dt.bias elements, ssm_conv1d channels 4096..10239, and
+ssm_out COLUMNS (48 column-groups of 128 = 4 whole Q8_0 blocks per move —
+lossless). REQUIRED GUARD: assert ssm_out quant block width divides 128
+(Q8_0/F16/BF16/F32 pass; 256-superblock K-quants fail loudly) — ggml-org's
+convert.log shows ssm_ tensors were explicitly OVERRIDDEN to q8_0 in both
+shipped variants (default q4_K would have been un-permutable); third-party
+requants are the hazard. Provenance note: gdn.metal arrived with DSV4
+(1ba170c91, "port of metal-forge gdn_linear_attention, state promoted to
+fp32"), zero callers, zero tests — M3 must oracle-test it regardless;
+grouped order lets FLA/HF/MLX be that oracle unmodified. M3 perf note:
+llama.cpp packs NSG=4 simdgroups per threadgroup vs our
+1-simdgroup-per-tg dispatch — revisit if occupancy profiling warrants.
+
+**(c) Concurrency: pool 8 GiB -> 16 GiB AND max_num_seqs 16 -> 8.**
+16 GiB matches the dsv4-xxs-1 Metal precedent (muse-kdyn-1 runs 12 GiB);
+doubles capacity to ~335 blocks = ~7.4 concurrent full-32k sequences;
+max_num_seqs 8 keeps admission honest (16 was ~4x oversubscribed at 8 GiB).
+Box budget fine: 17.7 GiB weights + ~2.4 GiB fp16 embed + 16 GiB pool
+well under the 120 GiB wired limit. Revisit after M2 measurements.
+
+**(d) GGUF tensor dtypes (local Q4_K_M, gguf_reader dump): ANSWERED.**
+ssm_beta/ssm_alpha ARE Q8_0 [5120->48] — the N%32 prefill landmine is
+real; fix = dequantize both at load in the adapter (~0.5 MB each, no
+shared-code edit). ssm_conv1d/ssm_a/ssm_dt/ssm_norm + all attn norms F32
+(clean). attn_qkv/attn_gate/attn_q/attn_k/attn_v/ssm_out Q8_0;
+attn_output + lm_head Q6_K; FFN + token_embd Q4_K — all quants covered by
+qgemv/qgemv_mm/qgemm instantiations; token_embd still needs the
+muse-style unquantized-embedding load. No MTP tensors in the main file.
+CORRECTION to HANDOFF.md: **eos_token_id is 248046** (bos 248044), not
+bos=eos=248044 as recorded — metadata `tokenizer.ggml.pre = "qwen35"`,
+full_attention_interval 4, rope sections [11,11,10,0] all match the study.
+
+Next: apply the profile edits (V2 env + pool/max_num_seqs), then M1
+(model chain restore + adapter with the six permutations + b/a dequant +
+norm -1 + q|gate row split, torch MPS fallbacks mirroring FLA grouped
+semantics).
+
+### UPDATE 3 (2026-08-17) — M1: first tokens on Metal. Serving path implemented end-to-end; smokes green
+
+Status: qwen38-1 serves greedy text on the M1 Ultra through forced-V2 +
+torch-MPS GDN fallbacks. Profile edits landed first (V2 env, pool 16 GiB,
+max_num_seqs 8; 48/48 profile tests). MLX-bf16 oracle parity still pending
+(model downloading); llama.cpp same-GGUF greedy comparison in progress.
+
+**What was built (all on qwen38-bringup, uncommitted):**
+- Model chain restored: `models/qwen3_5.py` (text-only dense subset:
+  DecoderLayer/Model/ForCausalLMBase/ForCausalLM; VL + MoE classes trimmed
+  — fork has no qwen3_vl stack or FusedMoEFactory) + `models/qwen3_next.py`
+  (dense subset; Qwen2MoeMLP inlined as Qwen3NextMLP; fused_qk_norm_rope
+  import made lazy inside its CUDA-only branch). Registry rows:
+  Qwen3_5ForCausalLM + Qwen3_5ForConditionalGeneration BOTH -> the
+  text-only class (VL checkpoints load with visual.* skipped); dangling Moe
+  row removed. `layers/mamba/mamba_mixer2.py` recreated as a minimal module
+  holding upstream's mamba_v2_sharded_weight_loader verbatim (preserves the
+  GDN layer's import path). Config modules qwen3_5/qwen3_5_moe/qwen3_next
+  created as re-export shims from transformers 5.15.0 (isinstance stays
+  consistent with AutoConfig; upstream vendors full copies only for older
+  transformers).
+- Mapper fix in vendored qwen3_5.py: stacked-mapping keys dot-anchored
+  (".in_proj_qkv." not ".in_proj_qkv") — WeightsMapper matches raw
+  substrings, so upstream's bare keys corrupt pre-fused checkpoint names
+  (".in_proj_qkv" ⊂ ".in_proj_qkvz", ".in_proj_b" ⊂ ".in_proj_ba").
+- MPS fallbacks (`gdn/gdn_mps_fallback.py` + additive `forward_mps` /
+  `_forward_core_mps` on QwenGatedDeltaNetAttention): decode = ONE
+  vectorized fp32 step over the batch (repeat_interleave grouped
+  broadcast); prefill = sequential fp32 recurrence replacing
+  chunk_gated_delta_rule; conv fn/update mirrors incl. null-slot skip and
+  state writeback; l2norm rsqrt(sum+1e-6); softplus == F.softplus(beta=1,
+  threshold=20). Self-consistency oracle (scratchpad
+  test_gdn_fallback_consistency.py): conv fn ≡ stepped update, prefill scan
+  ≡ stepped decode, bit-exact on CPU AND MPS; null-slot guard green. Layer
+  init needed the Metal branch in its hard-coded _forward_method platform
+  chain (UPDATE 1's dispatch trap, confirmed live: requests bypassed
+  CustomOp dispatch into forward_cuda -> Triton). Spec-decode on MPS raises
+  NotImplementedError (M5). Zero-length batches return early (SGLang gate).
+  V2 worker scatter fallback added in mamba_hybrid.py (device-gated).
+- GGUF side: `gguf_qwen35.py` (config builder validated field-for-field:
+  vocab from token_embd dims, layer_types from full_attention_interval 4,
+  partial_rotary 64/256, mamba_ssm_dtype="float32" — with `auto` the ssm
+  state would silently be BF16, the exact MLX shipped-bug failure mode;
+  models/config.py handler row added for Qwen3_5ForCausalLM) + qwen35
+  tokenizer builder (QWEN35 pre-split = qwen2 + \p{M}; ids verified
+  BIT-EXACT vs llama-tokenize incl. digits, code whitespace, Hebrew
+  niqqud, Hangul, im_start/im_end) + `gguf_adapters/qwen3_5.py` (explicit
+  851-tensor name map with bidirectional coverage assert; V-head
+  un-permute grouped<-tiled verified BYTE-EXACT on real Q8_0 data for both
+  row moves and the ssm_out column-block move, guard-asserted block|128;
+  A_log = log(-ssm_a) finite, range [-5.56, -1.09]; b/a dequant to
+  unquantized in_proj_ba — NOTE is_layer_skipped_gguf expands fused
+  modules to SHARD prefixes, so the unquantized list needs in_proj_b +
+  in_proj_a, not the parent; attn_qkv+attn_gate emitted PRE-FUSED as one
+  in_proj_qkvz qweight because MergedColumnParallelLinear rejects
+  tuple-shard GGUF loads, and a whole-tensor load splits row-wise per
+  shard which is lossless on quant rows; norms -1 except ssm_norm; embed
+  dequant fp16 muse-style; attn_q needs NO row split — GGUF ships the HF
+  per-head [q|gate] interleave that Qwen3NextAttention expects, contra
+  the earlier handoff note).
+- Metal platform: additive `current_device()` classmethod (Platform base
+  __getattr__ returns None for missing attrs; the GDN layer calls it).
+- V2 sampler logprobs on Metal: compute_token_logprobs + ranks had NO mps
+  branch (muse/dsv4 never requested logprobs) — Triton stub crash took the
+  engine down. Torch fallbacks added following the file's existing
+  apply_temperature/gumbel_sample mps-branch convention. Custom
+  logprob_token_ids (_fill_logprob_token_ids_kernel) still Triton-only —
+  fails loudly if ever requested on Metal.
+
+**Boot-and-fix ledger (5 boots):** (1) in_proj_ba shard-consistency
+ValueError -> shard-name unquantized entries; (2) current_device None ->
+platform classmethod; (3) booted, first request hit forward_cuda ->
+_forward_method Metal branch; (4) SERVED: "The capital of France is" ->
+" Paris." greedy; 81-token clean-stop chat answer (eos 248046 honored);
+8252-token prompt = 5 prefill chunks -> exact retrieval ("green widget
+42, 127 grams") proving GDN state chains across chunk boundaries;
+batch-4 concurrent decode: 3/4 byte-identical to solo, 1 fork at a
+near-tie after 8 identical tokens (solo reruns deterministic; coherent
+alternate = batch-size logit variance, NOT the omlx #2119 corruption
+signature — garbage); logprobs request crashed (fix above); (5) current.
+
+**Interval-log observations (diagnostics only, NOT benchmarks):** decode
+~2.2-2.7 tok/s c1; 8252-token prefill wall 122 s (~68 tok/s). This is the
+expected M1 floor: the GDN prefill scan is a per-token Python loop over
+48 layers and decode launches ~10 small MPS ops per layer per step. M2
+measures properly; M3 (Metal GDN kernel, llama.cpp-geometry) is the fix.
+
+**M1 gate remaining:** greedy parity vs llama.cpp (same GGUF, in flight)
+and vs MLX bf16 (mlx-community/Qwen3.8-27B-bf16 downloading; harness =
+mlx_lm.generate --temp 0 vs our /v1/completions temp 0, short prompts +
+long generations, watching the match-20-30-tokens-then-diverge
+signature). Raw logs: scratchpad qwen38_boot{1..5}.log this session.
+
+### UPDATE 4 (2026-08-17) — M1 GATE PASSED: greedy parity vs llama.cpp (same GGUF) + MLX bf16 oracle
+
+**Implementation oracle — llama.cpp b1-d8df12e Metal, IDENTICAL Q4_K_M
+weights, greedy, raw prompts (llama-server /completion, samplers=
+[temperature], cache_prompt off; ours /v1/completions temp 0):**
+- 4 of 6 prompts: 64/64 generated tokens EXACT (omelette, Apollo 11,
+  Newton, Great Wall).
+- fibonacci: 56/57, fork at our top-2 gap 0.625 nats (end-of-snippet tie:
+  we emit endoftext, llama continues prose).
+- French ("La capitale de la France est"): fork at token 2 with our top-2
+  gap 0.0000 — an EXACT logit tie; argmax order differs across engines.
+- Long generation: 256-token continuation agreed for 516 chars (~110+
+  tokens) before a coherent near-tie fork ("controlled much of Europe" vs
+  "dominated the Mediterranean").
+- Aggregate 313/377 tokens, EVERY fork explained by a measured near-tie;
+  zero garbage, zero decay-divergence. Two independent implementations of
+  the same weights agreeing at this level validates the whole chain:
+  adapter permutations, norm -1, A_log inverse, fused-qkvz split, conv
+  cache, GDN scan, gated norm, rope, attention, sampler.
+- The tie behavior itself is signal: on the French exact-tie, the MLX bf16
+  oracle continues with OUR branch (" une destination de rêve"), not
+  llama.cpp's.
+
+**Numerics oracle — MLX bf16 (mlx_lm 0.31.3, ~/.venvs/mlx, temp 0,
+--ignore-chat-template; 11.1 tok/s generation, 54.0 GB peak):** ours
+agrees with the unquantized oracle for as long as Q4_K_M-vs-bf16 logit
+shifts permit — Newton 16+ tokens exact, Apollo 5 tokens then a ':' vs
+' when' fork, French matches through the tie — and every completion on
+both sides is fluent and factually parallel. No layout-bug signature
+(those produce immediate or fast-decaying garbage, not synonym-level
+forks). Since ours == llama.cpp exactly on the same weights, remaining
+MLX deltas are quantization, not implementation.
+
+**M1 DECLARED PASSED.** Serving path: GGUF Q4_K_M through forced-V2 +
+torch-MPS GDN fallbacks, profile qwen38-1. Perf floor (diagnostics only):
+~2.5 tok/s c1 decode, ~68 tok/s prefill — M2 measures with the exact
+harness; M3 = Metal GDN kernel (llama.cpp recurrent geometry, gdn.metal
+wire-up + oracle) attacks the floor. Watch items carried to M2:
+first-request-after-boot near-tie wobble (single occurrence, self-heals,
+deterministic ever after — compare first-vs-later logits at M2); batch-4
+near-tie forks are batch-size logit variance (solo runs deterministic,
+identical across boots 4/5); custom logprob_token_ids still Triton-only.
+Raw: scratchpad parity_llamacpp.py + qwen38_boot{1..5}.log + llama.cpp
+server log, this session.
+
+### UPDATE 5 (2026-08-17) — M2 PASSED: exact-token baseline pinned + cross-engine bars; first-request wobble reproduced and bounded
+
+- Status: retained (measurement milestone, no code change)
+- Scope: qwen38-1 (Qwen3.8-27B GGUF Q4_K_M, forced V2 runner, torch-MPS
+  GDN fallbacks), M1 Ultra 128 GiB, wired limit 122880, worktree on
+  b1ee83671 + the uncommitted M1 implementation.
+- Method: `benchmarks/benchmark_dsv4_exact.py` with `--metrics-url none`
+  (no drafter on this profile). Overhead probe: our /v1/completions adds
+  ZERO wrapper tokens (no BOS; 100- and 1000-token round-trips exact), so
+  `--prompt-overhead 0`. Source = concat of perf/perf.md +
+  baseline_status.md + metal_m1ultra_retrospective.md (25,368 tokens).
+  Matrix on warmed boot 5; confirm run on fresh boot 6. All 11 runs
+  `exact: true`, none degenerate.
+- Results (ours, aggregate output tok/s):
+
+  | workload | runs | tok/s |
+  | --- | --- | --- |
+  | c1 1000→256 | 3 | 2.425 / 2.433 / 2.432 |
+  | c4 1000→256 | 2 | 5.387 / 5.389 (2.22x c1) |
+  | c8 1000→256 | 2 | 6.558 / 6.554 (2.70x c1) |
+  | c1 2500→64 | 3 | 1.110–1.115 (57.4–57.6 s wall) |
+  | c1 1000→256, fresh boot 6 | 1 | 2.368 |
+
+  Two-workload solve (c1): pure decode ~2.80 tok/s, prefill ~72 tok/s.
+  Determinism: every c1 run — three on warmed boot 5 and the boot-6
+  confirm — produced the SAME completion sha 7c766419; cross-boot
+  bit-stable. c4/c8 repeats fork per-prompt at near-ties (sha lists differ
+  between identical repeats): the known batch-size logit variance, now
+  captured in raw artifacts.
+- Bars (same box, run sequentially after the matrix, server idle-resident):
+  - llama.cpp d8df12e Metal, IDENTICAL GGUF — llama-bench: pp1000 252.2,
+    pp2500 250.9, tg256 21.03 tok/s. llama-batched-bench 1000/256:
+    B=1 20.90, B=4 35.00 agg, B=8 40.54 agg tok/s.
+  - MLX bf16 (mlx_lm 0.31.3): prompt 221 tok/s, generation 10.85 tok/s,
+    peak 55.5 GB.
+  - Headroom = the M3 target: llama.cpp on the same weights is 7.5x our
+    pure c1 decode, 3.5x our prefill, 6.2x our B=8 aggregate. Note
+    llama.cpp's own batch scaling is sublinear (1.9x at B=8) — batching a
+    recurrent decode is intrinsically hard; our 2.7x at c8 scales
+    "better" only because the base is Python-overhead-dominated.
+- WOBBLE CONFIRMED (2/2 fresh boots): the true first request after boot
+  computes measurably different logits. Boot 6 (wobble_check.py, 3
+  identical greedy requests, logprobs=5): run 1 forked from runs 2/3 at
+  pos 6 (' light' vs ' sunlight') across run-1's 0.50-nat top-2 gap; runs
+  2/3 bit-identical to each other. Self-heals permanently after the first
+  request; boot-5 evidence (later different-prompt requests all canonical)
+  says global-first-forward, not per-prompt. Both sides coherent — impact
+  is tie-side choice only. OPEN ITEM for M3 (we will be inside the forward
+  path anyway): candidates are MPS first-call kernel-variant selection vs
+  a lazily-initialized persistent buffer read on the first forward.
+  OPS RULE from this: prime every fresh boot with one throwaway request
+  before anything determinism-sensitive (parity, anchors, pinned shas).
+- Boot 6 reached health in 30 s (GGUF metadata cache + page-cached model
+  file); six boots on this profile, zero wedges without the DSV4 ramp
+  (profile does not use the DSV4 async-output/metal-kernel path).
+- Decision: M2 baseline PINNED (also snapshotted in baseline_status.md).
+  Next = M3 Metal GDN kernel; success bar is movement toward llama.cpp's
+  21 tok/s c1 decode / 252 tok/s prefill on identical weights.
+- Raw: perf/results/2026-08-17/qwen38_m2_baseline/ (matrix + confirm
+  JSONs, bar_llamabench.json, bar_batchedbench.txt, bar_mlx_bf16.txt,
+  boot6_wobble.txt, meta.txt).
+
+### UPDATE 6 (2026-08-17) — M3 phase A: dormant gdn.metal audited end-to-end; integration design fixed
+
+- Status: in progress (design; no code changed yet)
+- Diagnosis of the 2.8 tok/s decode floor: the projections already run on
+  QuixiCore Metal qgemv/qgemm reading packed Q4_K (gguf/linear.py routes
+  Metal to `_quixicore_C`, Muse precedent) — dequant is NOT the cost. The
+  cost is the GDN fallback itself: ~40 eager torch-MPS ops x 48 layers ~=
+  2k dispatches per decode step plus fp32 einsum/repeat_interleave
+  materializations. llama.cpp runs each GDN stage as one fused kernel.
+- Kernel audit (csrc/quixicore/metal/kernels/linear_attention/gdn/
+  gdn.metal, launchers tk_launch.h:1270-1382, ZERO callers today): five
+  kernels cover the whole mixer — gdn_short_conv (varlen+decode, fp32
+  state, slot<0 skip, MAX_HISTORY 7 >= our 3), gdn_qkv_prepare (fused
+  split+norm from the 10240-wide POST-CONV row — exactly our contiguous
+  conv output, no stride issue), gdn_gate_beta (bit-for-bit our
+  _sigmoid_gating: softplus threshold 20, sigmoid beta, fp32 out),
+  gdn_recur (varlen delta-rule scan, fp32 state pool [slots,48,128,128] =
+  EXACTLY our ssm_state layout, GQA hk=hv/(Hv/Hk) = our
+  repeat_interleave), gdn_gated_rmsnorm (norm-before-gate silu, weight[128]
+  = our RMSNormGated shape, mean-square + eps = rms semantics, eps 1e-6).
+  All needed instantiations (float32/float16/bfloat16, d128/dk128_dv128)
+  are compiled into the shipping metallib already.
+- llama.cpp cross-check: kernel_gated_delta_net_impl (ggml-metal.metal:
+  2704) is ALGORITHMICALLY IDENTICAL to gdn_recur — same per-token loop
+  (S*=exp(g); s_k=S.k; d=(v-s_k)*beta; S+=k*d; y=q.S*scale), fp32 state
+  rows in registers, simd lanes over Dk, sequential t for prefill too.
+  21 tok/s whole-model is the existence proof for this geometry; their
+  only extra trick is NSG simdgroups per threadgroup (dispatch
+  amortization we can add later if profiling asks for it).
+- qkv_prepare numerics mapping (kernel is rms-form, reference is l2norm):
+  rsqrt(ss/128 + eps) with eps = 1e-6/128 equals sqrt(128)*rsqrt(ss+1e-6),
+  so k_scale = 128^-0.5 recovers l2norm exactly and q_scale = 128^-1
+  additionally folds the q * K^-0.5 the reference applies. Exact, not
+  approximate.
+- Dtype plan: cast the conv INPUT to fp32 once, then run
+  conv/prepare/gate/recur/rmsnorm all on the float32 instantiations; cast
+  back to bf16 only before out_proj (qgemv wants bf16 activations). This
+  (a) matches the fallback's fp32-post-conv chain and llama.cpp practice,
+  (b) avoids bf16-rounding the decay (exp(g)~0.99x in bf16's 8 mantissa
+  bits would be a genuine quality hazard), and (c) makes the T=float
+  g/beta buffer types line up with gate_beta's fp32 outputs — the whole
+  chain wires up with ZERO kernel-source edits.
+- State-pool contracts resolved at CONFIG level (no kernel or allocator
+  code): profile gains VLLM_SSM_CONV_STATE_LAYOUT=DS (conv pool becomes
+  [slots, dim, k-1] contiguous = the kernel's exact layout; default SD
+  would break its indexing) and mamba_cache_dtype=float32 (conv pool fp32
+  as `device float*` requires; ~65 MB, negligible; ssm already forced
+  fp32 by the GGUF config hook). conv1d has bias=False — kernel has no
+  bias buffer, none needed.
+- Per-request has_initial_state vs the kernels' single load_initial flag:
+  pre-zero the state rows of fresh-start requests (one masked write when
+  fresh prefills exist), then always launch with load_initial=1.
+  Decode cu_seqlens needs NO new tensor: for a pure-decode batch
+  non_spec_query_start_loc IS arange(R+1). Pad slots: clamp_min(0);
+  slot-0 null-block writes are harmless by design (CUDA does the same).
+- Integration shape: five thin bindings in qc_metal_serving.mm (the mHC
+  precedent; ring_out for decode-scale outputs), quixicore_ops wrappers,
+  kernel path inside _forward_core_mps behind VLLM_METAL_GDN kill switch
+  (default on when the ops import), torch fallback retained as the oracle
+  and the =0 path. Build = manual xcrun metal (cmake/metal.cmake flags) +
+  clang++, artifacts into vllm/, backups first (campaign recipe).
+- Gate plan for phase C: kernel oracle harness vs the torch fallbacks
+  (now the proven reference), then serve + llama.cpp greedy parity with
+  near-tie analysis (trajectory re-rolls EXPECTED — fp32-vs-bf16 boundary
+  differences re-roll near-ties; re-pin sha canonicals), re-run the M2
+  matrix, and the FULL DSV4 anchor re-gate (metallib + .so rebuild is the
+  UPDATE 28 trigger, no exceptions).
+
+### UPDATE 7 (2026-08-17) — M3 LANDED: Metal GDN kernels serving; decode 2.43 -> 7.21 tok/s (2.97x), prefill 72 -> 161 tok/s
+
+- Status: retained (kernel path live behind VLLM_METAL_GDN, default on)
+- Change (all uncommitted, on top of the M1/M2 worktree):
+  - qc_metal_serving.mm: five GDN host bindings (gdn_short_conv,
+    gdn_qkv_prepare, gdn_gate_beta, gdn_recur, gdn_gated_rmsnorm) in the
+    house encode/ring_out/TORCH_CHECK style + pybind defs. gdn_gated_rmsnorm
+    is bound and oracle-green but NOT yet wired into serving (self.norm
+    stays eager; measured as a follow-up, not assumed).
+  - gdn.metal + tk_launch.h: state_stride param on gdn_recur (buffer 14)
+    and gdn_short_conv (buffer 11). Root cause: MambaBase.bind_kv_cache
+    slices each state out of a per-block byte page, so every pool is
+    contiguous WITHIN a slot with a page-wide slot stride — the kernels'
+    slot*row_numel indexing was wrong for real serving pools (boot 7
+    tripped the gate on exactly this; the M1-era layer never saw it
+    because torch indexing follows strides). Bindings read stride(0) off
+    the tensor and validate inner-row contiguity; no Python-visible
+    signature change. Ported byte-identically to QuixiCore-Metal
+    (uncommitted there too).
+  - qwen_gdn_linear_attn.py: lazy _resolve_metal_gdn gate (kill switch,
+    ops presence, pool dtype/layout/stride contracts, fp32 param memos,
+    l2norm-recovery constants eps=1e-6/Dk, k_scale=Dk^-0.5, q_scale=Dk^-1)
+    + _forward_core_metal: ONE varlen conv dispatch over the whole
+    non-spec batch (cu = non_spec_query_start_loc, slots =
+    non_spec_state_indices), fused split+norm, fused gating, decode-peel +
+    prefill recur dispatches, fp32 chain, one-time non-negative-slot
+    assert. Fresh sequences: pre-zero their pool rows via torch.where
+    (NOT a masked multiply — 0*Inf on a never-written pool row would
+    manufacture NaN), then always load_initial.
+  - profiles.json qwen38-1: VLLM_SSM_CONV_STATE_LAYOUT=DS +
+    mamba_cache_dtype=float32 (the kernel state contracts; fallback path
+    remains correct under both). 48/48 profile tests.
+- Build: metallib rebuilt (xcrun metal per cmake/metal.cmake flags, 16.7 s)
+  + .so rebuilt (scratchpad build_qc_metal.sh); backups of the prior
+  artifacts in scratchpad/artifacts_backup.
+- ORACLE (scratchpad gdn_kernel_oracle.py, kernels vs the M1-proven torch
+  fallbacks, real geometry Hk16/Hv48/Dk=Dv=128/conv4): 25/25 PASS —
+  conv prefill/decode/chunked/pad at fp32-ulp (chunked == one-shot
+  bit-exact), qkv_prepare l2norm recovery exact to 6e-8, recur
+  decode/varlen/chunked at 1e-7..1e-8 (chunked bit-exact), gated rmsnorm
+  2e-6, composed bf16 chain within 1.9e-4 of the serving fallback, and
+  page-strided pools BIT-EXACT vs contiguous with padding untouched.
+- SERVING (boot 8, all 48 layers "Metal GDN kernels enabled"):
+  exact-token matrix, all exact:true, raw in
+  perf/results/2026-08-17/qwen38_m3_kernels/:
+
+  | workload | fallback (UPDATE 5) | kernels | speedup |
+  | --- | ---: | ---: | ---: |
+  | c1 1000→256 | 2.43 | 7.205–7.211 | 2.97x |
+  | c4 1000→256 | 5.39 | 11.42–11.44 | 2.12x |
+  | c8 1000→256 | 6.56 | 11.86–11.90 | 1.81x |
+  | c1 2500→64 | 1.11 | 2.80–2.81 | 2.53x |
+
+  Two-workload solve: pure c1 decode 2.80 -> 8.73 tok/s (3.1x), prefill
+  72 -> 161 tok/s (2.2x). Now 42% of llama.cpp's 20.9 tok/s decode and
+  64% of its 252 tok/s prefill on identical weights (was 13% / 29%).
+- CORRECTNESS: c1 sha 7c766419 — the fallback's canonical completion
+  TOKEN-FOR-TOKEN, reproduced 3/3 on boot 8 and once each on boots 9/11
+  (cross-boot, cross-path deterministic). llama.cpp same-GGUF parity
+  rerun (perf/results/.../parity_m3.txt): 4/6 prompts 64/64 exact,
+  fibonacci 56/57 at the same 0.625 fork, French near-tie (gap now 0.125,
+  was exact 0.0) still takes our MLX-endorsed branch, 256-token long-gen
+  agrees 363 chars then forks at a synonym near-tie. 10.3k-token 6-chunk
+  needle retrieval passes; batch-4 clean. c4 runs now repeat-identical
+  (more batch-stable than the fallback was); c8 forks 2/8 at near-ties.
+- WATCH ITEMS (open, recorded honestly):
+  1. ONE transient degeneration: boot 9's first 6-chunk prefill (10,329
+     tok) produced '!' repetition (token-0/NaN signature), then the
+     IDENTICAL request passed 2/2 on the same boot and 1/1 on boot 10 and
+     1/1 on boot 11 (which replicated boot 9's exact request history).
+     Not reproduced in ~10 subsequent long-prefill fires across 3 boots.
+     Kernel-path-linked circumstantially (fallback boot 5 passed its
+     first 5-chunk fire; boot 8's first 2048-token chunk was inside a
+     discarded benchmark warmup, so it may have degenerated invisibly).
+     MITIGATION: qwen boot ramp now = primer + 1-chunk-with-decode + one
+     multi-chunk throwaway before traffic. M4: NaN-count instrumentation
+     on first-vs-later long prefills.
+  2. 2500x64 intra-boot sha re-roll (run 3 of 3 on boot 8): near-tie
+     fork under some nondeterministic reduction (suspect SDPA split-K on
+     longer contexts, NOT GDN — the GDN kernels have fixed reduction
+     order and 1000-token runs are 3/3 bit-stable). Quantify at M4.
+- DSV4 SAFETY: rebuilt metallib+extension re-validated — all six Metal
+  kernel suites pass (prefill FA oracle, compress-front c128, indexer
+  topk, MoE SoA/sum6/mm). Full anchor re-gate (UPDATE 30 pins) run on a
+  fresh ramped dsv4-xxs-1 boot with the recovered gate driver
+  (scratchpad dsv4_gate.py): results in
+  perf/results/2026-08-17/anchor_regate_gdn_metallib/.
+  VERDICT: ALL THREE ANCHORS BIT-EXACT vs the UPDATE 30 pins — 8tok
+  573db39598e7 5/15/3 @ 1.68-1.72 s (2/2), off1-2000 bb83cc3054a3
+  1581/2115/423 @ 57.39-57.44 s (2/2), 2500x64 f75e1d41ac3d 43/105/21 @
+  4.49-4.59 s (3/3). Identical shas, counters, and step time; the GDN
+  work has ZERO DSV4 exposure. M3 gate chain complete.
+- Next levers (measured order, not assumed): gdn_gated_rmsnorm wire-in;
+  sync/dispatch census on the remaining 114 ms c1 step (llama.cpp does
+  the whole model in 47.6 ms); batch scaling (c8 1.65x c1 vs llama.cpp
+  1.9x).
+
+### UPDATE 8 (2026-08-18) — Norm wire-in (+1.3% c1) AND the transient ROOT-CAUSED: hybrid KV page-layout collision, fixed layout-only
+
+Two things landed. The small one first.
+
+**gdn_gated_rmsnorm wire-in (M4 change 1).** `_output_projection` now
+routes through the bound kernel when the layer's metal GDN namespace is
+active (getattr-safe; warmup and non-Metal platforms keep eager
+RMSNormGated). c1 7.21 -> 7.31 tok/s (+1.3%). The c1 sha re-rolled
+7c766419 -> 2e4defe1 as expected from fp32-rounding-level norm changes;
+fork-gap MEASURED: position 29 was an exact three-way tie on the old
+path (' The' = ' It' = ' Keep' at -2.00596), the kernel lifts ' Keep' by
+0.125 nats; pre-fork top-5 perturbation <= 0.249 nats. Same class as the
+M1/M3 forks. Old stream regenerated via a VLLM_METAL_GDN=0 boot
+(sha 7c766419 reproduced exactly); both streams with top-5 logprobs in
+perf/results/2026-08-17/qwen38_m4_norm/stream_{fallback,norm_kernel}.json.
+
+**The '!' transient: reproduced, instrumented, root-caused, fixed.**
+The boot-13 ramp-3 throwaway (10,329-token 6-chunk prefill) degenerated
+again — hit rate turned out ~5/6 per fresh boot on this exact sequence,
+not the ~1/3 estimated from the boot 9-12 era. Hunt chronology, all
+under a new env-gated probe kit (VLLM_QC_NANPROBE=1; probes in
+qwen_gdn_linear_attn.py, qwen3_next.py, metal_attn.py — zero cost off):
+
+1. Layer probes: first non-finite tensor = layers.4 GDN ENTRY, 100% of
+   (89, 5120), on the FINAL 89-token chunk; layers 0-2 clean all event.
+2. SDPA cache probe: bad_q=0, bad_V=0, bad_K = 499 rows at positions
+   9660..10239, ALL in physical block 30, scattered elements. K-only.
+3. Byte forensics (dump in scratchpad nanprobe_kv_dump_c5.pt): the
+   corrupt rows are fp32 DATA overlaid on the bf16 K cache — read as
+   fp32 pairs they are plausible O(1) activations; NaNs sit at the even
+   bf16 columns (fp32 mantissa halves). Corruption starts EXACTLY
+   122,880 B (= conv state size) into block 30 and is page-aligned.
+4. GDN=0 control: reproduces IDENTICALLY on the torch fallback path —
+   both engines write the same thing somewhere wrong, so the bug is the
+   DESTINATION, not the writer.
+5. Victim canary (deterministic address, re-read at every probe point):
+   flips non-finite at layer 0's linear_attn, EVERY chunk, specifically
+   at the gdn_recur state save; chunk N's flip gets overwritten by the
+   request's own later K writes, and only the last chunk's scribble
+   survives to the gather. Slot-index probe: state_indices=[15] for the
+   failing request — perfectly VALID (pool has 327 slots).
+6. Memory map probe: mamba layers 0-2 and attention layer 3 SHARE one
+   1,071,513,600-byte raw tensor (same untyped_storage data_ptr) — the
+   vLLM hybrid KV manager's page-shared design, page = 3,276,800 B,
+   327 pages. The mamba views honor page identity (slot stride = 1
+   page; conv at +0, ssm at +122,880 in the page). The attention view
+   did NOT: MetalAttentionBackend declared no kv_cache_stride_order, so
+   its logical (2, num_blocks, 800, 4, 256) shape was also the physical
+   layout — all K first, then all V. Attention block b therefore lived
+   at bytes b*1,638,400 (K) and (327+b)*1,638,400 (V): pages b/2 and
+   163+b/2, NOT page b.
+
+ROOT CAUSE: with both views on one tensor, "disjoint" block ids collide:
+mamba slot s's 3-MB ssm save covers attention K blocks 2s and 2s+1.
+The failing request held mamba slot 15 and attention blocks 18..30 —
+slot 15 = K blocks 30-31. Every chunk's state save shredded K block 30
+(fp32-over-bf16 = the scattered-NaN signature; start offset = conv size
+because conv leads the page). Self-heal on re-fire = a different slot id
+maps to unallocated K blocks. THE SAME MECHANISM under load corrupts
+OTHER requests' K with finite garbage — silent wrong answers, no NaN.
+The M2 first-request wobble was this too (a fresh request's own slot
+overlapping its own early K blocks): post-fix, the first request on a
+fresh boot is BIT-IDENTICAL to its repeats (max |dlogprob| = 0.000000;
+was a 2/2-boot fork at <=0.5 nats).
+
+FIX (layout-only, python-only, NO metallib rebuild, no DSV4 exposure —
+DSV4 runs the MLA/TurboQuant backends):
+- MetalAttentionBackend.get_kv_cache_stride_order() = (1, 0, 2, 3, 4):
+  physical [num_blocks, 2, block, H, D], so block b's K and V both live
+  inside page b. Layered variant intentionally not provided, keeping
+  indexes_kv_by_block_stride() False (packed/padded machinery untouched).
+- The fused paged kernel addresses blocks densely, so it receives the
+  contiguous dense (2N, block, H, D) view with a doubled block table
+  (K = dense block 2b) and a one-block-shifted alias for V (2b+1). Both
+  call sites (fused decode + expanded spec-verify decode).
+- All hot-path reads/writes go through the same dense view with
+  transformed indices (write: dense[2b]/[2b+1]; SDPA gather:
+  index_select(blocks*2)) — first gate attempt showed advanced indexing
+  over the strided per-K/V views falls off the MPS fast path (ramp
+  decode 0.6 tok/s); dense-view routing restores it.
+
+VERIFICATION: 3/3 fresh-boot repro cycles CLEAN with 0 canary flips
+(pre-fix 5/6 DEGENERATE with the identical slot-15/block-30 geometry —
+confirmed live via k_stride0 1638400 and state_indices=[15]); wobble
+gone (above). Measurement gate below.
+
+Probe kit retained env-gated as documented diagnostics; the victim
+canary hardcodes block 30 / rows 60:640 and should be deleted once the
+soak is boring.
+
+MEASUREMENT (gate2, fresh ramped boot, exact harness, raw in
+perf/results/2026-08-18/qwen38_m4_layoutfix/):
+
+| run            | M3 pin | M4 norm | M4 norm+layout | delta vs M3 |
+|----------------|--------|---------|----------------|-------------|
+| c1 1000x256    | 7.21   | 7.31    | 8.749 (2/2)    | +21%        |
+| c4 1000x256    | 11.43  | —       | 15.789         | +38%        |
+| c8 1000x256    | 11.88  | —       | 16.521         | +39%        |
+| c1 2500x64     | 2.81   | —       | 3.037 (3/3)    | +8%         |
+
+- Derived (two-point c1 solve): pure decode 8.73 -> 11.06 tok/s (+27%),
+  prefill ~164 tok/s (flat). c1 step 114.6 -> 90.4 ms. vs llama.cpp
+  same-GGUF: decode 53% (was 42%), prefill 65%.
+- c8/c1 batch scaling 1.65x -> 1.89x — now MATCHES llama.cpp's 1.9x.
+  The "batch scaling investigation" lever is closed: the collision-era
+  layout was the bottleneck (per-request slot writes shredding shared
+  pages + K-first layout splitting each block's K/V across distant
+  pages for the paged kernel).
+- Shas: c1 2e4defe1 preserved EXACTLY (2/2) across the layout change —
+  attention math untouched. c4 2e4defe1. c8 9512fbd5 (batch-variance
+  near-tie class, expected). 2500x64 f687018e BIT-STABLE 3/3 — the
+  intra-boot sha re-roll watch item is CLOSED (it was the collision,
+  not SDPA split-K).
+- Watch items closed this update: '!' transient (root-caused, fixed),
+  first-request wobble (bit-identical 2/2 fresh boots), 2500x64 sha
+  re-roll (3/3 stable). Boot-ramp protocol: keep the primer +
+  multi-chunk throwaway until a longer soak, then consider retiring.
+
+SURVEY (recent Metal work on this model class, per boss request —
+checked against our architecture for boundaries):
+- llama.cpp PR #19504 added the fused GATED_DELTA_NET Metal op (the
+  kernel our gdn.metal descends from); build b8333 fixed a state-access
+  coalescing bug (39% Metal regression) by storing state transposed so
+  each thread-row is contiguous. Our gdn_recur already uses the
+  post-fix access pattern (K-contiguous state rows, lanes over Dk).
+- Their kernel runs NSG state-rows per THREADGROUP (shared q/k loads);
+  ours runs one simdgroup per (req,hv,dv). Kernel-local optimization
+  candidate for the census phase, no architectural boundary.
+- llama.cpp's kernel emits PER-TOKEN STATE SNAPSHOTS (slot s = s tokens
+  back) — that is their MTP-rollback mechanism. Our M5 gap: the Metal
+  path raises NotImplementedError on spec_sequence_masks; gdn_recur
+  would need a snapshot output (transient buffer, no pool layout
+  change). metal_attn's expanded-decode paged path is already
+  spec-verify-shaped. No boundary, just work.
+- MLX-side: no fused-GDN advantage over us (mlx-lm issue #932 shows
+  their GDN Metal path has its own fragility); community MLX 4-bit
+  decode ~33 tok/s on M5 Max — different silicon, not comparable to
+  our M1 Ultra bars.
+- int4 KV-cache work exists for Apple Silicon; our profile-driven page
+  sizing accommodates dtype changes, no boundary.
+
+Next levers (updated): sync/dispatch census on the remaining 90 ms c1
+step (llama.cpp whole model = 47.6 ms) — VLLM_SYNCPROF, then act;
+NSG-multi-row gdn_recur threadgroup shape (llama.cpp precedent); MTP
+drafter (M5) needs gdn_recur state snapshots + spec metadata support.
+
+### UPDATE 9 (2026-08-18) — CENSUS: c1 step is GPU-KERNEL-BOUND; Q4_K mmvq is the #1 lever (MLP = 40 of 90 ms)
+
+- Question: where do the 90.4 ms of the c1 decode step go (llama.cpp
+  whole model = 47.6 ms, same GGUF, same box)?
+- Method (all DSV4-campaign instruments, reused unchanged):
+  boot A = VLLM_SYNCPROF=1 (+cb_census) with ioreg 2 Hz device-util
+  sampling over 3x c1 1000x256; boot B = VLLM_QC_PHASE_PROF=1 with new
+  layer-category brackets; standalone mmvq microbench at the exact
+  serving shapes. Steady-state numbers are postramp->final DELTAS.
+  Both profiler boots reproduced c1 sha 2e4defe1 (timing-only, free
+  correctness gate).
+- Boot A verdict — the DSV4 picture is INVERTED; host is exonerated:
+  - execute_model (CPU encode) 30.0 ms/step, fully overlapped;
+    AsyncOutput.get_output ~0 ms/step (engine NEVER blocks on the GPU
+    event; DSV4 had 238 ms there pre-fix);
+  - zero steady-state sync kills (in-window .item/.tolist/.numpy = 2 ms
+    TOTAL across 828 calls; the one fat .item at
+    qwen_gdn_linear_attn.py:1347 is a one-time boot check, 48 calls,
+    identical postramp vs final);
+  - 17.3 command buffers/step (DSV4: 61) — dispatch count is lean;
+  - ioreg device util p50 = 96 (mean 86.3 incl. gaps); cb_census busy
+    ~= wall. The GPU is saturated; the step IS kernel time.
+- Boot B phase split (sync-inflated 2.6x, split-is-the-diagnostic):
+  mlp 38.7% / gdn_attn 23.3% / full_attn 15.9% / unbracketed glue 22.1%
+  (128 RMSNorms, residuals, layer_scale, embed+logits) of target_forward;
+  sample_and_reject 6.5 ms/call. Call counts prove the config:
+  64 layers = 48 GDN + 16 full attn (notebook previously said 48/36/12
+  — WRONG, corrected here).
+- GGUF census (shapes/quants actually served): hidden 5120, ffn 17408,
+  vocab 248,320. ffn gate/up/down Q4_K; gdn qkvz/z/ba/out Q8_0; attn
+  q/k/v Q8_0, attn.o Q6_K; lm_head Q6_K = 1.043 GB read per decode
+  token. Total weight bytes ~16.5 GB + GDN state r/w ~0.3 GB =>
+  effective decode BW: ours 187 GB/s vs llama.cpp 355 GB/s.
+- mmvq microbench (kernel-back-to-back, serving shapes, scratchpad
+  mmvq_bench.py; raw in perf/results/2026-08-18/qwen38_m4b_census/):
+    gdn.qkvz  Q8_0 448 GB/s | gdn.z   Q8_0 471 | gdn.out Q8_0 537
+    attn.qkv  Q8_0 640      | attn.o  Q6_K 280 | lm_head Q6_K 426
+    mlp.gate_up Q4_K 289    | mlp.down Q4_K 180 (!)
+    gdn.ba (96-row) 23 GB/s fixed-cost floor, 1.1 ms/step total
+  Idealized all-GEMV step = 59.4 ms of the measured 90.4.
+- CONCLUSION + ranked levers:
+  1. Q4_K mmvq kernel (mlp.gate_up 289 / mlp.down 180 GB/s vs Q8_0
+     kernels at ~500+): at Q8_0-class BW the MLP drops 40.0 -> ~19 ms
+     => step ~70 ms => decode ~14.3 tok/s (+29%). Reference:
+     llama.cpp kernel_mul_mv_q4_K_f32 SIMD-group layout. METALLIB
+     REBUILD => DSV4 anchor re-gate required; summation-order change
+     may re-roll Qwen c1 sha (fork-gap methodology ready).
+  2. Non-GEMV ~31 ms (gdn conv/recur/gate/norm ~ paged attn ~ glue):
+     NSG-multi-row gdn_recur, norm/residual fusion, ba-GEMV fusion
+     into qkvz dispatch (1.1 ms). Attack after (1).
+  3. attn.o + lm_head Q6_K at 280/426 GB/s: minor (o is 25.8 MB x16;
+     lm_head already near floor).
+- Instrumentation left in tree (env-gated, zero cost off): phaseprof
+  brackets gdn_attn/full_attn/mlp in qwen3_next.py DecoderLayer.forward
+  (pattern-matches model_runner's existing target_forward brackets).
+- Artifacts: perf/results/2026-08-18/qwen38_m4b_census/ (syncprof
+  postramp/final, cb CSVs, gpu_util_c1.csv, phaseprof postramp/final,
+  benchmark JSONs, mmvq_bench.txt, meta.txt).
+
+### UPDATE 10 (2026-08-18) — Q4_K mmvq kernel LANDED: c1 8.75 -> 11.20 (+28%), decode ~15.3 tok/s = 73% of llama.cpp
+
+- Hypothesis (UPDATE 9 lever #1): the one-simdgroup-per-row qgemv walk has
+  BPI=1 for 256-wide q4_K blocks (whole simdgroup in a single 144-byte
+  block per iteration), collapsing memory-level parallelism; llama.cpp's
+  kernel_mul_mv_q4_K_f32 layout fixes exactly this.
+- Change (metallib + .so REBUILT — anchors re-gated below):
+  - qgemv.metal: new `qgemv_q4k_nr` (llama.cpp port): NR=2 rows/simdgroup,
+    NSG=2 simdgroups/threadgroup, 4 blocks in flight (ib += 4), activation
+    spans + per-sub-block y-sums register-cached and shared across rows,
+    masked-ushort nibble accumulate into four fp32 accumulators
+    (renormalized once by 1/256 and 1/16), 6-bit scale/min factored out per
+    (block, row). No dequantized span materialized — retires the register-
+    pressure objection recorded against the old two-rows-per-simdgroup
+    geometry experiment in tk_launch.h.
+  - tk_launch.h: route fmt==q4_K && N%4==0 && K%256==0 && !fp32 to it;
+    VLLM_QC_Q4K_NR=0 kill switch. Divisibility guards the kernel's
+    unpadded tail reads (llama.cpp leaves them unguarded; MPS won't fault).
+- Correctness (scratchpad q4k_oracle.py, float64 GGUF-spec reference,
+  seeded synthetic blocks): new max_rel 3.7e-3 vs old 5.9e-2 — the new
+  kernel is 16-25x TIGHTER (fp32 accumulate, no per-element half
+  rounding); residual mean is bf16 output rounding.
+- Microbench (serving shapes, kernel-back-to-back): gate_up 289 -> 633
+  GB/s (2.2x), down 180 -> 533 GB/s (3.0x); MLP GEMV 40.0 -> 16.2 ms/step;
+  idealized all-GEMV step 59.4 -> 35.1 ms. q4_K now out-bandwidths the
+  q8_0 kernels (fewer bytes/weight on the better layout).
+- Serving gate (fresh boot, full ramp, retrieval PASS, batch-4 coherent):
+  c1 11.197 2/2 sha 36ed113a (was 8.749, +28%); 2500x64
+  3.247/3.261/3.238 sha 268721b3 3/3 (was 3.037, +7%); c4 15.674 /
+  c8 16.513 FLAT (batched decode rides qgemv_mm — same BPI=1 walk, the
+  designated next lever). Derived: pure decode ~15.3 tok/s (was 11.06,
+  +38%) = 73% of llama.cpp 20.9 same-GGUF; step ~65.5 ms vs llama.cpp
+  47.6 — and 65.5 = 35.1 idealized GEMV + ~31 non-GEMV: the census model
+  now closes to measurement. Predicted step saving 23.9 ms, measured 25.1.
+- Fork-gap (sha re-roll 2e4defe1 -> 36ed113a): kill-switch boot
+  reproduced 2e4defe1 BIT-EXACT (old path intact on the rebuilt
+  artifacts; whole delta attributable to the new kernel). Fork at pos 32
+  was an EXACT TIE in the old stream ('kernel' == 'same' at -2.24063,
+  tie-broken by token id); the new kernel lifts 'same' by 0.125 nats.
+  Pre-fork max |dlogprob| over shared top-5: 0.168 nats. Same benign
+  class as the UPDATE 8 norm fork. ramp-32 sha 0f9506fc unchanged (no
+  fork within 32 tokens).
+- DSV4 ANCHOR RE-GATE (mandatory, metallib+.so rebuild):
+  perf/results/2026-08-18/anchor_regate_q4k_metallib/ — ALL THREE
+  BIT-EXACT with walls on the pins (8tok 573db39598e7 5/15/3 1.7s;
+  off1-2000 bb83cc3054a3 1581/2115/423 57.3s; 2500x64 f75e1d41ac3d
+  43/105/21 4.5s). DSV4 serves no q4_K GEMVs; zero drift.
+- QuixiCore-Metal port: qgemv.metal + tk_launch.h copied wholesale
+  (QC-Metal twins were strict subsets; now byte-identical), uncommitted.
+- Next levers (ranked, post-UPDATE-10): (1) extend the NR layout to the
+  qgemv_mm batch path — c4/c8 decode still pays the BPI=1 walk (c8 flat
+  at 16.5 while c1 jumped; c8/c1 ratio fell to 1.47x); (2) non-GEMV
+  ~31 ms of the 65.5 ms step: gdn conv/recur/gate/norm (NSG-multi-row
+  shape), paged attention, 192-norm/residual glue; (3) prefill campaign
+  (ours ~164 vs llama.cpp 252 tok/s; M>17 ggml_mul_mat_a8 path,
+  untouched by this update); (4) attn.o/lm_head Q6_K (minor).
+- Artifacts: perf/results/2026-08-18/qwen38_q4k_gate/ (gate JSONs,
+  streams old/new, mmvq_bench_old/new.txt, meta.txt);
+  anchor_regate_q4k_metallib/ (3 anchor JSONs).
+
+### UPDATE 11 (2026-08-18) — Q4_K batch mmvq kernel (qgemv_q4k_nr_mb): c4 +6% / c8 +5.5%; the M-scaling investigation (i-cache wall, then ALU wall)
+
+- Baseline (UPDATE 10 state): c4 15.674 / c8 16.513 aggregate — flat vs
+  pre-q4k because batch decode rode the qgemv_mm BPI=1 walk. New M-batch
+  microbench (mmvq_bench_mm.py, serving route, M=2/4/8) widened the
+  finding: EVERY weight-stationary batch path collapses at M=8, not just
+  q4_K — q8_0 qkvz 107 GB/s, gate_z 85, attn.qkv 115, q6_K attn.o 58
+  (vs 448-640 at M=1); q4_K gate_up/down 91/81. Idealized all-GEMV step
+  at M=8: 204.5 ms (M=1: ~46). c8's 1.47x scaling was fully explained.
+- Hypothesis: port the NR layout (factored scales, 4 blocks in flight)
+  into a weight-stationary M-batch kernel; expected q4_K batch GB/s to
+  approach the batch-1 kernel's 533-633.
+- INVESTIGATION (all variants measured at the M=8 MLP shapes; standalone
+  Metal harness qgemv_mb_bench.m + single-file metallib for the loop):
+  1. M-wide unroll, register accumulators (array-staged y): M=2 379/355
+     GB/s but M=4 86, M=8 13. 2. Fused scalar y stage, then arithmetic
+     scale extraction replacing the `thread uchar*` sc16 view: M=2 best
+     (379/380) — M>=4 unchanged. 3. simdgroup_barrier scheduling fences
+     between columns: unchanged. 4. STRUCTURAL unroll (literal column
+     indices via macro chain, so no dynamic sumf indexing is possible):
+     unchanged — falsified the advisory-pragma/stack-RMW theory.
+  5. Pipeline introspection: maxTotalThreadsPerThreadgroup identical for
+     M=4 and M=8 (384) — NOT register spill. All-columns-read-row-0
+     variant reproduced the collapse — NOT the X access pattern.
+     VERDICT: instruction-cache thrash of the unrolled block-loop body
+     (superlinear in M, address-independent, register-independent).
+  6. Rolled column loop + threadgroup-memory accumulators (lane-private
+     slots, no atomics): scaling fixed but only PARITY with the old walk
+     (95/88 at M=8) — occupancy + TG RMW latency give back the win.
+  7. Sequential per-pair K sweeps in one TG: break-even (96 at M=8);
+     a sweep's weight working set does not stay cache-resident.
+  8. LANDED: grid-split column pairs — grid.y = M/2, each threadgroup
+     the batch-1 register budget over 2 columns (dispatch (N/4, M/2),
+     64 threads). Serving-route microbench: M=2 gate_up/down 414/382,
+     M=4 217/211, M=8 111/112 GB/s = +68/+103%, +27/+53%, +22/+38% vs
+     the old walk. Idealized M=8 all-GEMV step 204.5 -> 181.1 ms.
+     (Grid-axis swap x<->y: no change — schedule adjacency was not the
+     limiter.)
+- COST-MODEL FINDING (why not more): batch-1 call 0.158 ms vs one-pair
+  0.308 at the same weight traffic — the NR inner loop is ALU-bound PER
+  COLUMN, so weight-stationarity can only save the memory share and any
+  M-scheme pays linear compute per column. The next real batch lever is
+  lower per-column ALU: dequant-once-to-registers (kills the per-column
+  fold + sumy) or simdgroup_matrix GEMM at M=8 — which would also fix
+  the q8_0/q6_K qgemv_mb collapse (same disease, measured above).
+- Correctness oracle (q4k_oracle_mb.py, synthetic blocks vs float64
+  GGUF-spec reference, bf16 x, M=2/3/4/5/8 x K=5120/17408): max_rel
+  <= 4.6e-3 (batch-1 class), and EVERY batch row bit-identical to the
+  looped batch-1 qgemv_q4k_nr (odd M exercises the 2+1/4+1 host
+  decomposition; remainder rides batch-1 NR).
+- SERVING GATE A (fresh boot on rebuilt metallib+.so): ramp 4.256 sha
+  0f9506fc; retrieval PASS; c1 11.168 sha 36ed113a BIT-EXACT (batch-1
+  path unaffected by the rebuild); c4 16.596/16.609 (+5.9% vs 15.674);
+  c8 17.421/17.414 (+5.5% vs 16.513); 2500x64 3.27 sha 268721b3
+  BIT-EXACT.
+- SERVING GATE B (kill-switch boot VLLM_QC_Q4K_NR_MM=0): c4 15.772 /
+  c8 16.450 — old-baseline throughput reproduced, so the whole c4/c8
+  delta is attributable to the new kernel; c4 request-1 sha fbe69266
+  reproduces the morning old-path run BIT-EXACT.
+- SHA CAVEAT (recorded once, applies to all c4/c8 runs): request 0
+  shares the c1 prompt and carries the UPDATE 10 pos-32 EXACT TIE; its
+  batch-decode sha is composition-sensitive in BOTH worlds (new-kernel
+  c4 run1 != run2; kill-switch c4[0] 547dd1dd != morning 599e2a96)
+  because chunked-prefill overlap routes decode rows through the M>17
+  GEMM during ragged windows. c4/c8 request-0 shas are NOT determinism
+  anchors; c1/2500x64/ramp shas remain the canonical gates. Under the
+  new kernel c8[0] is stably 2e4defe1 (= the old c1 stream text: the
+  tie resolves old-side under batch numerics — benign).
+- DSV4 ANCHOR RE-GATE (mandatory, metallib+.so rebuild):
+  perf/results/2026-08-18/anchor_regate_q4k_mb/ — ALL THREE BIT-EXACT
+  (8tok 573db39598e7 5/15/3; off1-2000 bb83cc3054a3 1581/2115/423;
+  2500x64 f75e1d41ac3d 43/105/21).
+- Kill switches: VLLM_QC_Q4K_NR=0 disables every NR route (batch-1 and
+  batch); VLLM_QC_Q4K_NR_MM=0 disables only the batch route.
+- QuixiCore-Metal port: qgemv.metal + tk_launch.h copied wholesale,
+  verified byte-identical, uncommitted.
+- Next levers (re-ranked): (1) non-GEMV ~31 ms of the 65.5 ms c1 step:
+  gdn conv/recur/gate/norm (NSG-multi-row shape), paged attention,
+  192-norm/residual glue; (2) batch-decode ALU: dequant-once or
+  simdgroup_matrix path for M=4..8 across q4_K/q8_0/q6_K (the mb/mm
+  collapse table above is the target list); (3) prefill campaign (~164
+  vs llama.cpp 252; M>17 ggml_mul_mat_a8 GEMM, untouched); (4) attn.o/
+  lm_head Q6_K (minor).
+- Artifacts: perf/results/2026-08-18/qwen38_q4k_mb_gate/ (gate JSONs,
+  mmvq_bench_mm_old/new.txt, q4k_oracle_mb.txt, meta.txt);
+  anchor_regate_q4k_mb/ (3 anchor JSONs); scratchpad qgemv_mb_bench.m
+  (standalone Metal harness), pipe_info.m (pipeline introspection).
+
+### UPDATE 12 (2026-08-18) — DIRECTION: campaign pivots to NVFP4 (unsloth/Qwen3.8-27B-NVFP4) on Metal
+
+- Product direction (user, from the boss): SlimServe is to be
+  opinionated — fine-tuned for specific quants per platform. BF16 is
+  not a serving target. For this model the quant of record becomes
+  NVFP4 (Unsloth Dynamic v3.0, ~98% of BF16 quality, ~23.4 GB
+  checkpoint, FP8-KV calibration, MTP weights included), replacing
+  Q4_K_M GGUF once at parity.
+- BF16 audit of the campaign to date: nothing is BF16-load-bearing.
+  All Metal kernels are half+bf16 dual-instantiated; bf16 is only the
+  activation compute dtype. The Q4_K investment is GGUF-format-specific
+  and stays serving until the NVFP4 path passes its gates
+  (decommission gate in the plan). Format-independent levers (#16
+  non-GEMV, #17 batch ALU) transfer unchanged; the NR-layout /
+  i-cache / ALU-wall lessons (UPDATEs 10-11) apply directly to the
+  NVFP4 kernels — NVFP4's planar group-16 layout decodes cheaper than
+  q4_K's packed blocks.
+- Plan of record: HANDOFF.md at the repo root (milestones N0-N5:
+  discovery/de-risk -> bring-up via dequant path -> exact-token
+  baseline -> NR-style NVFP4 GEMV kernels -> prefill + transferred
+  levers -> opinionated cleanup). Known risks logged there, headline:
+  lm_head dtype (bf16 lm_head = 2.5 GB read/token vs 1.04 Q6_K today).
+- Box left serving qwen38-1 (Q4_K) clean: c1 11.195 sha 36ed113a on
+  the final fresh-boot sanity.
+
+### UPDATE 13 (2026-08-19) — N1 bring-up COMPLETE: NVFP4 checkpoint serves on Metal, all gates pass
+
+- Status: retained (bring-up path; N3 replaces the apply, not the math)
+- Baseline: none (first serving of this checkpoint on this platform).
+  Bar for N2: Q4_K M4c c1 11.17 / c4 16.60 / c8 17.42.
+- What landed (plumbing, in hit order; HANDOFF.md N0 blocker list):
+  1. `vllm/platforms/metal.py` supported_quantization += compressed-tensors.
+  2. slimserve: source `qwen38-27b-nvfp4` + profile `qwen38-nvfp4-1`;
+     `registry.py` gained quant-level `"entry": "directory"` (safetensors
+     dirs as --model; GGUF entry_file behavior unchanged, regression-checked).
+  3. New kernels `MetalNvFp4LinearKernel` (W4A16; checkpoint input scales
+     loaded but unused) + `MetalWFp8A16LinearKernel` (XPU-W8A16 pattern, no
+     QuantFP8) + shared `metal_dequant.py` (u8 LUT decode, row-chunked);
+     registered under PlatformEnum.METAL; Marlin a16-force CUDA-gated.
+  4. fp8 params allocate uint8 on Metal (fp8_utils weight, W4A4 scheme
+     block-scale) with byteview-wrapped loaders (plain copy_ would
+     VALUE-cast fp8->u8 and silently corrupt).
+  5. W8A16 scheme's (K,N) transpose Metal-gated off (kernels want row-major
+     (N,K), host GEMV binding asserts contiguity).
+  6. NEW blocker (not in N0 list): fork-wide KernelConfig default
+     linear/moe_backend="aiter" leaks into every platform;
+     check_and_update_config resets aiter->auto on Metal.
+  7. NEW blocker: RopeState.prepare_positions is a Triton kernel and this
+     config has uses_mrope=True (GGUF's synthesized config did not) —
+     torch replacement added to metal_compat (same pattern as slot mapping).
+  8. NEW blocker: checkpoint kv_cache_scheme(fp8) + kv_cache_dtype=auto
+     flips the cache to fp8 (attention.py:299); Metal dense/GQA backend has
+     no fp8-KV path -> profile pins kv_cache_dtype=bfloat16 explicitly
+     (the designed "explicit choice wins" escape). fp8/TurboQuant KV is N6.
+- Correctness gates (all PASS, raw in perf/results/2026-08-19/n1_nvfp4_bringup/):
+  - Helper oracle: dequant_nvfp4/dequant_fp8_channel bit-exact vs CPU
+    fp8/fp4 ground truth over the full 256-byte E4M3 range (subnormals
+    included), on CPU and MPS.
+  - Gate A (n1_gate_a.py): 11 structural asserts — every layer group on
+    the intended scheme, lm_head CONFIRMED CompressedTensorsW8A16Fp8
+    (the silent-bf16 trap did not fire) — plus 6 load-path weight
+    comparisons (NVFP4 fused gate_up + down, FP8 fused mlp/qkv/gdn-qkvz,
+    lm_head rows) ALL BIT-EXACT vs CPU oracle dequant of raw checkpoint
+    bytes, fused-scale max-of-divisors replicated.
+  - Gate B (n1_gate_b.py, live server, ramp protocol observed): primer,
+    1000-tok decode ramp, 3340-tok multi-chunk needle retrieved exactly
+    (MAGENTA-7734), greedy probes 391/Au/dog all correct.
+  - eos resolved: generation_config.json = [248046, 248044]; chat stops on
+    <|im_end|> 248046 same as GGUF campaign. No discrepancy.
+- Indicative throughput (interval-class, NOT harness numbers): 1000-tok
+  greedy decode 8.83 tok/s c1 on the bring-up path (VLLM_METAL_CT_DEQUANT
+  =once: weights materialized to bf16 at load, ~40 GB resident, plain
+  F.linear apply). Boot ~35 s page-cached. Exact-token baseline is N2.
+- Decisions: dequant-once default / per-call "call" env fallback; scheme
+  selection untouched (W4A4 scheme with kernel-side W4A16 keeps every
+  checkpoint tensor matched); fused gate/up NVFP4 global scales verified
+  equal per layer (scheme's mismatch warning did not fire).
+- Next: N2 exact-token baseline (benchmark_dsv4_exact.py + m2_source.txt,
+  c1/c4/c8 + 2500x64, pin shas), then N3 kernels FP8-channel GEMV first.
+
+### UPDATE 14 (2026-08-19) — N2 exact-token baseline pinned (bring-up path, pre-kernel)
+
+- Status: baseline (snapshot in perf/baseline_status.md)
+- Method: benchmark_dsv4_exact.py + m2_source.txt, same runner and source
+  as the Q4_K M2/M4 matrices; server `qwen38-nvfp4-1` on :8000, ramped.
+- Results (aggregate_output_tps): c1 1000x256 7.021/6.990/7.020 —
+  response sha 8c58a4c6 identical 3/3; c4 14.370/14.356; c8
+  15.933/15.993; c1 2500x64 2.552/2.550/2.556 — sha d0e07ddd 3/3.
+  Canonical NVFP4 anchors: c1 8c58a4c6, 2500x64 d0e07ddd. c4/c8
+  request-0 shas confirmed tie-carriers in this world too (c4 run 2
+  flipped to 8a969e98) — not anchors, same as Q4_K.
+- Reading: c1 63% of Q4_K M4c (the bf16-materialized path reads ~40
+  GB/tok), c4/c8 already 87%/92% (aten bf16 GEMM batches well), prefill
+  ~130 tok/s equivalent. The c1 gap is the kernel campaign's target:
+  real quantized reads (19.1 GB/tok) put the c1 cap near ~17 tok/s
+  (GEMV floor ~27 ms + ~31 ms non-GEMV).
+- Raw: perf/results/2026-08-19/n2_nvfp4_baseline/ (10 JSON runs + errs).
+
+### UPDATE 15 (2026-08-19) — N3 kernels: qgemv_fp8ch + qgemv_nvfp4_planar; c1 7.02 -> 10.10 (+44%)
+
+- Status: retained (both kernels; M==1 decode route only, mb twins open)
+- New kernels (qgemv.metal, q4k_nr geometry: 2 simdgroups x 2 rows,
+  dispatch (N/4,1), X staged once and shared across rows, fp32 accumulate):
+  - `qgemv_fp8ch`: planar (N,K) e4m3 bytes + per-row fp32 scale (the
+    checkpoint layout, no repack), exact tk_e4m3_decode, scale in the
+    epilogue. Clean-box microbench: qkv 471 / o 461 / gdn.qkvz 573 /
+    gdn.out 479 / mlp gate_up 615 / down 527 / lm_head 650 GB/s;
+    idealized FP8-GEMV step 19.4 ms (roofline 15.1).
+  - `qgemv_nvfp4_planar`: planar weight_packed (N,K/2) + e4m3 group
+    scales (N,K/16) + fp32 global, three buffers, NO repack to the
+    interleaved nvfp4 struct. Winning decode (v5/v6): select-free
+    bit-pattern place [ee][m]->half bits 11..9 + sign->15, CONVERT to
+    fp32 (converts are exact on subnormal halfs — FTZ-safe without the
+    tk_e2m1_decode select), uniform 2^14 rebias folded into the
+    per-group scale multiply; vec4 X staging. gate_up 426 / down 447
+    GB/s; idealized NVFP4-GEMV step 19.5 ms (roofline 12.0).
+- Variant study (all oracle-exact, all measured at the MLP shapes):
+  arith tk_e2m1_decode select chain 260/323 (ALU-bound); simd_shuffle
+  register LUT 139/128 and dynamic constant-table 133/126 (dynamic
+  indexing serializes on M1 — do not revisit); two-groups-per-lane
+  uint4 + vec4 staging 138/127 (unrolled-body register pressure, the
+  UPDATE 11 class); v5 bit-pattern decode 357/447; v6 = v5 + vec4 X
+  staging 426/447 SHIPPED.
+- Host/route: ops fp8ch_mul_mat_vec / nvfp4_mul_mat_vec (batch loop of
+  batch-1 launches inside one command buffer); Metal kernel classes
+  route M==1 decode to the GEMVs, everything else to the materialized
+  bf16 matmul. M<=8 batch loop measured BELOW dense bf16 GEMM (c4
+  14.37->13.00, c8 15.93->14.00) — M==1-gated; weight-stationary mb
+  twins are the open c4/c8 lever (the q4_K UPDATE 11 pattern). Kill
+  switches VLLM_QC_FP8CH=0 / VLLM_QC_NVFP4=0.
+- Float64 oracles (fp8ch_oracle.py / nvfp4_oracle.py, all serving
+  shapes incl. lm_head): maxrel 3.8-5.7e-3 (bf16-output envelope),
+  bit-stable across reruns, batch rows == looped batch-1 bit-exact.
+  NaN-byte contract verified: checkpoint contains zero 0x7f/0xff bytes.
+- Serving (exact-token): c1 7.02 -> 7.56-7.77 (fp8ch only, sha
+  ee4bbef5) -> 10.10/10.14 both kernels (sha 2e567ea7 2/2); 2500x64
+  2.55 -> 2.82/2.83 (sha 95adbd97 2/2); c4 14.38 / c8 15.85 unchanged
+  (M==1 gate; c4/c8 shas remain tie-carriers). Kill-switch boots
+  reproduce N2 BIT-EXACT (7.033 sha 8c58a4c6; earlier fp8ch-off run
+  also 8c58a4c6/d0e07ddd). Ramp indicative 8.83 -> 14.50 tok/s.
+- DSV4 anchors: re-gated ALL BIT-EXACT after the fp8ch rebuild
+  (perf/results/2026-08-19/anchor_regate_fp8ch/: 573db39598e7,
+  bb83cc3054a3, f75e1d41ac3d). The FINAL (nvfp4_planar v6) rebuild
+  re-gated ALL BIT-EXACT the same day
+  (perf/results/2026-08-19/anchor_regate_nvfp4_final/: 8tok
+  573db39598e7 5/15/3 2/2 @1.68-1.72s; off1-2000 bb83cc3054a3
+  1581/2115/423 2/2 @57.33-57.35s; 2500x64 f75e1d41ac3d 43/105/21 3/3
+  @4.50-4.55s). The N3 build is fully cleared; the kill on this
+  re-gate was verified by pid with wired at 2.6 GB before boot.
+- OPS INCIDENT (recorded so it never repeats): the first DSV4 kill
+  after the re-gate reported dead but the processes survived TERM in a
+  hung shutdown, holding 101 GB wired; every microbench for ~40 min
+  ran poisoned (the ~135 GB/s wall across unrelated variants was THIS,
+  not the kernels; fp8ch bench even hung). Verify kills BY PID; wired
+  dropped 101 -> 2.7 GB the moment the processes actually died.
+- Raw: perf/results/2026-08-19/n3a_fp8ch_gate/ + n3b_nvfp4_gate/.
+
+### UPDATE 16 (2026-08-19) — N3 mb twins: qgemv_fp8ch_mb + qgemv_nvfp4_planar_mb; c4 14.38 -> 15.64 (+8.8%), c8 16.02 -> 16.89 (+5.4%)
+
+- Status: retained (both twins; the open N3 c4/c8 lever closed)
+- BASELINE: UPDATE 15 (c1 10.10-10.14 sha 2e567ea7, c4 14.38, c8
+  16.02, 2500x64 2.82-2.83 sha 95adbd97; M==1-only GEMV route).
+  HYPOTHESIS: the q4_K UPDATE 11 grid-split column-pair pattern
+  transfers — grid.y = M/2 column pairs, batch-1 lane geometry and
+  register budget per threadgroup, weights loaded and decoded ONCE per
+  pair, per-(row,col) FP chain identical to looped batch-1 (rows
+  bit-identical by construction), tgid.y-siblings cache-share the
+  weight re-reads.
+- New kernels (qgemv.metal): `qgemv_fp8ch_mb` and
+  `qgemv_nvfp4_planar_mb`, half+bf16, dispatch (N/4, M/2). Host ops
+  auto-select the mb twin for even contiguous batches (odd batches
+  keep the batch-1 loop); python routes even M to the ops — NVFP4
+  bound M<=8, FP8 bound M<=4 (see crossover below). Kill switches
+  VLLM_QC_NVFP4_MB / VLLM_QC_FP8CH_MB (default on; VLLM_QC_NVFP4 /
+  VLLM_QC_FP8CH still kill the whole route). The dead kNvfp4Nib
+  constant table was removed in the same metallib change.
+- BUILD FIX found en route: qgemv.metal spelled `vec<T,4>` unqualified
+  inside namespace mittens (batch-1 nvfp4_planar vec4 X staging),
+  which does not compile under build_metallib.sh — the checked-in
+  source was AHEAD of the shipped 14:24 metallib. Qualified to
+  metal::vec (name resolution only). The serving gate below proves
+  compiled numerics unchanged (c1 + 2500x64 shas bit-exact).
+- Oracle (mb_oracle.py): ALL PASS — M in {2,4,6,8} outputs
+  bit-identical per row to looped batch-1 at all four serving-shape
+  classes, odd-M loop path intact, float64 maxrel 3.9-7.8e-3 (bf16
+  envelope; e4m3 NaN bytes remapped as always).
+- Clean-box microbench (mb_bench.py, op vs dense bf16 F.linear):
+  - nvfp4 mb WINS at every M — M=8 gate_up 0.910 vs 1.217 ms (-25%),
+    down 0.454 vs 0.647 (-30%); M=4 0.464 vs 0.659 / 0.237 vs 0.412.
+  - fp8ch mb wins at M=2/4 (qkv M=4 0.241 vs 0.247) but reaches
+    parity-loss by M=8 (0.466 vs 0.456; qkvz 0.390 vs 0.379) — at 8
+    bits the M/2 weight re-reads equal the dense bf16 read, so the
+    fp8ch mb bound is 4 and M=8 fp8ch stays dense.
+- Serving gate (n3c_mb_gate/, two boots, full ramp):
+  - Default (mb on): c1 10.024/10.049 sha 2e567ea7 BIT-EXACT 2/2;
+    c4 15.638/15.636 (+8.8%, request-0 sha 467b35c3 — the tie-carrier
+    rolled off the dense value as expected, GEMV vs GEMM numerics);
+    c8 16.889/16.876 (+5.4%); 2500x64 2.853/2.858 sha 95adbd97
+    BIT-EXACT 2/2.
+  - Null check (both MB switches off): c1 10.023 sha 2e567ea7,
+    c4 14.354, c8 15.89 — reproduces UPDATE 15 exactly; the mb
+    routing is the entire delta.
+  - vs the Q4_K M4c bar: c1 90%, c4 94% (15.64/16.60), c8 97%
+    (16.89/17.42).
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT
+  (perf/results/2026-08-19/anchor_regate_ct_mb/: 8tok 573db39598e7
+  5/15/3 2/2 @1.72-1.73s; off1-2000 bb83cc3054a3 1581/2115/423 2/2
+  @57.18-57.19s; 2500x64 f75e1d41ac3d 43/105/21 3/3 @4.50-4.59s).
+  The mb build is fully cleared for further metallib work.
+- OPS NOTE (second occurrence class): a `PIDS=$(ps aux | grep ...)`
+  capture inside one compound shell silently matched nothing while the
+  server was alive — TERM no-opped and the survivor held 79 GB wired.
+  Caught by re-checking the pattern AFTER the kill. Kill protocol is
+  now: pgrep -f capture, kill by explicit pid, kill -0 verify each,
+  re-grep the pattern, then wait for wired < ~10 GB before any
+  measurement.
+- Raw: perf/results/2026-08-19/n3c_mb_gate/; benches/oracle in the
+  session-04ba9b90 scratchpad (mb_bench.py, mb_oracle.py).
+
+### UPDATE 17 (2026-08-19) — RE-PLAN: DFlash 2 exists for Qwen3.8-27B; N5 promoted to DFlash 2, decode-port lever parked
+
+- Status: decision record (no code/perf change).
+- The user caught that HANDOFF's resolution of the 2026-08-19 "use
+  DFlash and TurboQuant where possible" directive — "speculation rides
+  MTP because no DFlash drafter exists for Qwen3.8" — was FALSE when
+  written: z-lab/Inco AI shipped **DFlash 2** ~2026-08-13 including
+  `z-lab/Qwen3.8-27B-DFlash2` (mirror incoai/, Apache 2.0). The premise
+  was resolved from in-repo knowledge only and never checked online;
+  process rule saved to memory (web-verify any "no X exists" premise;
+  re-verify at every milestone re-plan).
+- Drafter facts (HF card + config.json): 2B bf16, one 3.85 GB
+  safetensors (downloaded to the HF cache); `DFlash2DraftModel` = 5
+  sliding-window(2048) qwen3 layers, hidden 5120 / vocab 248320 / GQA
+  32-8 / head 128 (all match target), non-causal block attention,
+  block_size 8 (7 draft tokens/verify), mask_token_id 248070, target
+  hidden-state taps at layers [5,19,33,47,61], selector rank 256
+  top_k 16, two-tap grouped dynamic conv (group 16). LOSSLESS by
+  construction; claims 3.43x GSM8K c1. NOTE: z-lab README recommends
+  block_size <= 5 for QUANTIZED targets — acceptance on our NVFP4
+  target must be measured, not assumed.
+- In-tree: DFlash V1 stack complete (DFlashProposer, qwen3_dflash.py,
+  GGUF adapter/tests). V2 delta = selector, dynamic convs,
+  per-position candidates + path tracing, DFlash2DraftModel registry
+  entry. Reference implementation: upstream vLLM PR #52816 (OPEN;
+  "DFlash2: local convolution + candidate selector"; 13 files incl.
+  qwen3_dflash2.py + spec_decode/dflash2/speculator.py) +
+  github.com/z-lab/dflash.
+- Projection (to be proven by harness): spec step ~1.2-1.4x current
+  99.5 ms c1 step (drafter ~4 GB read + M=8 verify) at 2.5-3.5
+  accepted tok/step => c1 ~18-29 tok/s vs bars Q4_K 11.17 /
+  llama.cpp 20.9. Verify pass = M=8 target forward, i.e. the UPDATE 16
+  mb/dense crossover routing becomes the production verify path.
+- Plan order now: N5 DFlash 2 (active) -> N6 TurboQuant KV -> re-rank
+  remaining kernel levers by post-spec profiling (fp8ch v6-decode port
+  + geometry parked; it was started this session and cleanly reverted
+  — qgemv.metal is byte-identical to the UPDATE 16 state). Gates for
+  N5: spec-on greedy c1 sha MUST stay 2e567ea7 (lossless), exact-token
+  c1/c4/c8 + 2500x64, acceptance-length stats, no-spec null boot
+  reproduces UPDATE 16, DSV4 anchor re-gate only if metallib/.so
+  changes (none expected).
+
+### UPDATE 18 (2026-08-19) — fp8ch v6-decode port + mb bound 8: c1 10.05 -> 10.35 (+2.9%), c4 15.64 -> 16.28 (+4.1%), c8 16.89 -> 17.54 (+3.9%) — c8 PASSES the Q4_K bar
+
+- Status: retained (perf + one attributed numerics roll; see sha note).
+- Baseline (UPDATE 16 / N3b): c1 10.02-10.05 sha 2e567ea7, c4 15.64
+  sha 467b35c3, c8 16.89, 2500x64 2.85 sha 95adbd97. Bars: Q4_K M4c
+  11.17 / 16.60 / 17.42.
+- Hypothesis: qgemv_fp8ch spends ~3x more ALU on tk_e4m3_decode's two
+  selects + half-mul-256 per byte than on the FMA work — port the v6
+  select-free bit-pattern idea (UPDATE 15's E2M1 lesson) to E4M3.
+- Change (qgemv.metal only; tk_e4m3_decode in dequant.metal untouched
+  — MLA/DSV4 share it): qgemv_fp8ch + qgemv_fp8ch_mb now decode 4
+  bytes per uint as two half2 bit patterns — even ((w<<7)&0x3F803F80)
+  |((w<<8)&0x80008000), odd ((w>>1)&0x3F803F80)|(w&0x80008000) — i.e.
+  e4m3 exp/mant dropped into the half field positions = value/2^8
+  exactly (subnormals included; float(as_type<half>) is a convert, so
+  FTZ can't flush). The 2^8 rebias is folded into the per-row scale
+  epilogue (256.0f * WS[row]). vec4 X staging (the v6 idiom). ~9 int
+  ops per 4 bytes vs ~35. mb twin keeps the identical per-(row,col)
+  chain -> mb rows stay bit-identical to looped batch-1 (oracle-held).
+- Routing follow-up (scaled_mm/metal.py): _GEMV_MB_MAX_ROWS 4 -> 8.
+  The old bound came from the select-chain decode reaching dense
+  parity at M=8 (0.466 vs 0.456 ms qkv); with the cheap decode the mb
+  twin now wins M=8 (qkv 0.285 vs 0.455, qkvz 0.237 vs 0.379), so
+  fp8ch matches NVFP4's bound. fp8ch M=8 moves dense GEMM -> mb GEMV.
+- Clean-box microbench (fp8ch_bench.py, like-for-like vs UPDATE 15):
+  qkv 471->687, o 461->759, gdn.qkvz 573->963*, gdn.out 479->783,
+  gate_up 615->698, down 527->971*, lm_head 650->732 GB/s
+  (*sub-96MB weights get SLC residency in the loop-same-weight bench;
+  lm_head 1.27 GB = the honest DRAM number). Idealized FP8-GEMV step
+  19.4 -> 13.0 ms (700 GB/s roofline print: 15.1; serving-realistic
+  ~14.5-15 since all 19.1 GB stream per step).
+- Oracles: fp8ch float64 ALL PASS, maxrel 3.8-5.7e-3 (identical
+  envelope to UPDATE 15 — a decode value bug would exceed it by
+  orders of magnitude); mb bit-identity vs looped batch-1 ALL PASS at
+  M in {2,3,4,6,8}.
+- Serving gate (n3d_v6port_gate/, one ramped boot, exact-token):
+  - c1 1000x256: 10.357/10.338 sha 467b35c3 2/2
+  - c4 1000x256: 16.309/16.259 sha 467b35c3 2/2 (HELD from N3b)
+  - c8 1000x256: 17.538/17.543 (tie-carrier rolls per run as always)
+    — FIRST TIME PAST the Q4_K c8 bar 17.42 (100.7%)
+  - 2500x64: 2.849/2.858 sha 95adbd97 2/2 (HELD bit-exact)
+  - vs Q4_K bar: c1 92.7%, c4 98.1%, c8 100.7%.
+- SHA NOTE (prediction falsified, honestly attributed): the edit was
+  claimed bit-identical (power-of-2 folding commutes with rounding —
+  still true per-element) and c1 was predicted to hold 2e567ea7. It
+  rolled to 467b35c3 (deterministic 2/2, same text c4's request-0
+  already produced). Attribution: the old select chain blocked
+  fast-math FMA reordering; the straight-line decode lets the
+  compiler reassociate the accumulation, changing summation-order
+  rounding only. Evidence: float64 envelope unchanged; 2500x64 (64
+  decode steps) held BIT-EXACT while c1 (256 steps) rolled at a tie;
+  c4 held. Accuracy class unchanged. New canonical c1 sha: 467b35c3.
+  Lesson: bit-identity claims survive value math but NOT changes to
+  what the optimizer can see — treat any restructuring of an FMA
+  chain's neighborhood as a potential sha roll even when the values
+  are provably exact.
+- DSV4 anchors (metallib rebuilt): re-gated ALL BIT-EXACT (anchor_regate_v6port/: 8tok 573db39598e7 5/15/3 2/2 @1.68-1.72s; off1-2000 bb83cc3054a3 1581/2115/423 2/2 @57.35-57.36s; 2500x64 f75e1d41ac3d 43/105/21 3/3 @4.49-4.60s). The v6-port build is fully cleared for further metallib work.
+- Raw: perf/results/2026-08-19/n3d_v6port_gate/ +
+  anchor_regate_v6port/; build log metallib_build_fp8v6.log, scripts
+  v6port_gate.sh / kill_server.sh (session-04ba9b90 scratchpad).
+
+### UPDATE 19 (2026-08-19) — nvfp4_planar half2-vectorized decode (v7): c1 10.36 -> 10.70 (+3.3%), c4 16.98 (+4.2%, bar CROSSED), c8 18.25 (+4.0%) — all-GEMV idealized step hits the ~27 ms campaign target
+
+- Status: retained.
+- Baseline (UPDATE 18 / N3d): c1 10.357/10.338 sha 467b35c3, c4
+  16.309/16.259 sha 467b35c3, c8 17.538/17.543, 2500x64 2.849/2.858
+  sha 95adbd97. Bars: Q4_K M4c 11.17 / 16.60 / 17.42.
+- Hypothesis: nvfp4_planar's per-byte decode (byte extraction + two
+  scalar nibble constructs, ~5.5 int ops/value) is the same ALU-bound
+  signature UPDATE 18 fixed on fp8ch; vectorizing to half2 pairs
+  should close most of the 529/452-vs-732 GB/s gap.
+- Change (qgemv.metal, qgemv_nvfp4_planar + _mb): four half2
+  bit-pattern constructs per uint decode all 8 nibbles with no byte
+  extraction — lo-even (v<<9 / v<<12), lo-odd (v<<1 / v<<4), hi-even
+  (v<<5 / v<<8), hi-odd (v>>3 / v) against masks 0x0E000E00 /
+  0x80008000, ~2.5 ops/value; FMAs in ascending column order. Group
+  scale swaps its tk_e4m3_decode select chain for the UPDATE 18
+  select-free e4m3 pattern with one 2^22 fold (2^14 E2M1 rebias x 2^8
+  E4M3 rebias; both power-of-two multiplies, per-group product exactly
+  equal). mb twin uses identical constructs (per-(row,col) chain
+  matches batch-1). No host/.so change; nvfp4 mb bound stays 8.
+- Prediction (made in advance, per the UPDATE 18 lesson): per-element
+  and per-group values exactly equal; serving shas MAY roll from
+  fast-math reassociation of the restructured FMA neighborhood.
+  Acceptance = float64 envelope unchanged + mb bit-identity + 2/2
+  determinism + DSV4 anchors bit-exact.
+- Oracles: nvfp4 float64 ALL PASS (maxrel 3.9e-3, same envelope); mb
+  bit-identity vs looped batch-1 ALL PASS at M in {2,3,4,6,8}.
+- Clean-box microbench (nvfp4_bench.py / mb_bench.py, like-for-like):
+  gate_up 529 -> 631 GB/s (+19%), down 452 -> 662 (+46%); idealized
+  NVFP4-GEMV step 17.3 -> 13.1 ms (12.0 roofline print). Combined
+  with UPDATE 18's fp8ch 13.0 ms: idealized all-GEMV step ~26.1 ms —
+  AT the ~27 ms campaign GEMV target; remaining c1 headroom is the
+  ~31 ms non-GEMV class (N4 #16). mb twins improved at every M (M=8
+  gate_up 0.911 -> 0.679 ms, down 0.454 -> 0.375) and win everywhere;
+  bound stays 8.
+- Serving gate (n3e_nvfp4v7_gate/, one ramped boot, exact-token):
+  - c1 1000x256: 10.706/10.685 sha fa58598b 2/2 (rolled as predicted
+    IN ADVANCE — same reassociation class as UPDATE 18; deterministic)
+  - c4 1000x256: 16.992/16.972 — 102.3% of the Q4_K bar 16.60, CROSSED
+  - c8 1000x256: 18.252/18.245 — 104.8% of the bar 17.42
+  - 2500x64: 2.907/2.905 sha 95adbd97 2/2 HELD BIT-EXACT (+1.9%) —
+    third consecutive build where the 64-step workload holds while the
+    256-step one rolls at a tie: the reassociation signature.
+  - c4/c8 request-0 tie-carriers now vary per run (8c58a4c6/560d8409);
+    same composition-sensitive class as c8 before — NOT anchors.
+  - vs Q4_K M4c bar: c1 95.8%, c4 102.3% CROSSED, c8 104.8% CROSSED.
+    New canonical c1 sha: fa58598b.
+- DSV4 anchors (metallib rebuilt): re-gated ALL BIT-EXACT (anchor_regate_nvfp4v7/: 8tok 573db39598e7 5/15/3 2/2 @1.68-1.72s; off1-2000 bb83cc3054a3 1581/2115/423 2/2 @57.33-57.39s; 2500x64 f75e1d41ac3d 43/105/21 3/3 @4.49-4.55s — 5th bit-exact re-gate of 2026-08-19). Build fully cleared.
+- Raw: perf/results/2026-08-19/n3e_nvfp4v7_gate/ +
+  anchor_regate_nvfp4v7/; build log metallib_build_nvfp4v7.log.
+
+### UPDATE 20 (2026-08-19) — N4 census + lever 1: paged-attention D=256 split-K replaces the full-attn SDPA fallback (c4 16.98 -> 18.54 (+9.1%), c8 18.25 -> 21.26 (+16.5%); c1 crossover-routed, bit-exact)
+
+- Status: retained.
+- Baseline (UPDATE 19 / N3e): c1 10.706/10.685 sha fa58598b, c4
+  16.992/16.972, c8 18.252/18.245, 2500x64 2.907/2.905 sha 95adbd97.
+- CENSUS (UPDATE 9 instruments reused unchanged on the NVFP4 profile;
+  raw perf/results/2026-08-19/qwen38_n4_census/):
+  - Boot A (VLLM_SYNCPROF=1 + cb census + ioreg): tps 10.72-10.76 =
+    zero profiler overhead, sha fa58598b 3/3 (free correctness gate),
+    retrieval PASS. execute_model 26.4 ms/step fully overlapped,
+    get_output ~0, zero steady-state sync kills (828 .item calls = 0
+    ms), 19.0 cb/step, GPU saturated during runs (ioreg p50 95). The
+    step IS kernel time; host exonerated again.
+  - Boot B (VLLM_QC_PHASE_PROF=1; brackets INHERITED — Qwen3_5
+    DecoderLayer subclasses Qwen3Next's bracketed forward): sha
+    fa58598b under profiler. Steady-state split (264 forwards):
+    mlp 33.5% / gdn_attn 25.3% / full_attn 17.5% / glue 23.7%
+    (vs Q4_K UPDATE 9: 38.7/23.3/15.9/22.1 — mlp share fell as its
+    GEMVs got faster). Per layer, full_attn is the heaviest bracket
+    (2.32 ms sync-inflated vs ~1.11 for gdn/mlp) with only ~2.4 ms
+    idealized GEMV content per step -> the fat is the attention op.
+  - Non-GEMV is now the MAJORITY of the ~93.5 ms step (~60 ms across
+    mlp glue ~15 / gdn non-GEMV ~17 / full_attn non-GEMV ~14 /
+    norms+residuals+logits glue ~20; share-scaled, sync-distorted —
+    treat as ranking, not ms truth).
+- ROOT CAUSE (lever 1): head_dim 256 (Qwen3.8 full attn) had NO
+  paged-attention instantiation — `_PAGED_HEAD_SIZES = (64, 128)` and
+  `paged_attention_bfloat16_256` absent from the metallib (probe
+  crash proved it) — so every full-attn DECODE ran the per-request
+  SDPA gather fallback. Bonus: the same gate blocks the
+  batch-expanded verify path DFlash 2 needs (N5).
+- DEAD END measured first: instantiating the MONOLITHIC kernel at 256
+  is unusable at this shape — one simdgroup per (head, seq) x 24
+  heads x batch 1 = 24 simdgroups, 4.61 ms/call at ctx 1000 (0.9
+  GB/s), WORSE than SDPA. Presumably why the gate stopped at (64,128)
+  for low-head-count models. Do not revisit; the 256 monolithic
+  instantiations stay (harmless, name-complete) but nothing routes to
+  them at this shape.
+- CHANGE: route D=256 through the split-K partition/reduce pair
+  (paged_attn_v2.metal instantiate_paged_v2 @256, all three dtypes):
+  qc_metal_serving.mm::paged_attention gets a D==256 branch sized
+  like the MLA decode split-K (final: occupancy target 1536, P =
+  min(ceil(target/(batch*heads)), 64), one serial-dispatch encoder
+  for partition+reduce, MLA ring_out tmp/ml/es pattern) +
+  a new optional `max_context` op arg (host-side batch max from
+  metadata.seq_lens_cpu — no device sync; 0 falls back to the
+  block-table width bound, empty partitions early-out). D=64/128
+  keep the monolithic route (muse etc. numerics untouched).
+  metal_attn.py: _PAGED_HEAD_SIZES gains 256 behind VLLM_QC_PA256
+  (default on; =0 -> SDPA null path). metallib AND .so rebuilt.
+- Oracle (pa256_oracle.py, NEW): kernel vs float64 torch-SDPA
+  reference at the exact serving shape (24/4/256 GQA-6, block 800,
+  bf16) — ALL PASS, maxrel 3.8e-3 (bf16 envelope), deterministic,
+  block-boundary ctx 799/800/801 and batch 4/8 clean.
+- Microbench (pa_bench.py): ctx-1000 call 4.61 (monolithic) -> 0.437
+  ms split-K (10.6x); x16 layers ~7.0 ms/step vs ~10-14 ms SDPA.
+  ctx 2500: 0.835 ms/call; ctx 32k: 10.4 ms/call (166 ms/step x16 —
+  long-context decode now viable at all).
+- Prediction (in advance): serving shas WILL roll (SDPA -> online-
+  softmax kernel numerics). Acceptance = oracle envelope + retrieval
+  PASS + 2/2 determinism + PA256-off null boot reproduces UPDATE 19
+  + DSV4 anchors bit-exact (MLA untouched).
+- ITERATION (three serving rounds, all recorded raw):
+  - Round 1 (n4a_pa256_gate/, two encoders/layer, P<=16): c4 18.15
+    (+6.9) / c8 20.63 (+13.0) but **c1 REGRESSED 10.70 -> 9.45** —
+    the kernel's fixed per-call cost loses to batch-1 SDPA, which
+    rides fused in-stream MPSGraph ops with zero extra encoders.
+    Null leg (VLLM_QC_PA256=0) reproduced UPDATE 19 exactly
+    (10.766 sha fa58598b) — routing is the entire delta.
+  - Fixes measured stand-alone (pa_lat_bench.py, sync-per-call
+    latency mode + queue-saturated thr): single serial-dispatch
+    encoder for partition+reduce (implicit barrier orders them) and
+    partition cap 16 -> 64 with default target 1536: ctx-1000 batch-1
+    call 0.437 -> 0.131 ms thr / 0.55 -> 0.43 lat; batch-8 1.02 ->
+    0.57. More partitions won at every point measured (occupancy >
+    reduce cost up to P=64); VLLM_QC_PA256_SPLITK overrides.
+  - Round 2 (n4b_pa256v2_gate/): c1 10.02 — still -0.72 vs SDPA at
+    ctx 1000, but ctx-2500 batch-1 reached parity (2.93 vs 2.91).
+    Crossover is context-dependent: SDPA gather cost grows with ctx,
+    the kernel's fixed cost does not.
+  - DECISION: route by measured crossover (metal_attn.py
+    _pa256_route_ok): batch >= 2 OR max_context >= 2048 -> kernel;
+    batch-1 short context keeps SDPA. The expanded verify path
+    (q_len > 1, DFlash) always expands to batch >= 2 -> kernel.
+- Final serving gate (n4c_pa256final_gate/, one ramped boot):
+  - c1 1000x256: 10.717/10.726 sha fa58598b BIT-EXACT 2/2 (SDPA
+    route == UPDATE 19; the crossover routing is its own null)
+  - c4 1000x256: 18.541/18.546 (+9.1%) — 111.7% of the Q4_K bar
+  - c8 1000x256: 21.263/21.258 (+16.5%) — 122.1% of the bar
+  - 2500x64: 2.914/2.915 sha aedef4ec 2/2 (kernel route,
+    deterministic; par with N3e wall)
+  - vs Q4_K M4c bar: c1 96.0%, c4 111.7%, c8 122.1%.
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT (anchor_regate_pa256/: 8tok 573db39598e7 5/15/3 2/2 @1.69-1.71s; off1-2000 bb83cc3054a3 1581/2115/423 2/2 @57.33-57.40s; 2500x64 f75e1d41ac3d 43/105/21 3/3 @4.49-4.82s — 6th bit-exact re-gate of 2026-08-19; MLA kernels untouched as predicted). Build fully cleared.
+- Raw: perf/results/2026-08-19/qwen38_n4_census/ + n4{a,b,c}_pa256*
+  gate dirs + anchor_regate_pa256/; scripts n4_census_boot{A,B}.sh, pa256_oracle
+  .py, pa_bench.py, pa256_gate.sh (session-04ba9b90 scratchpad);
+  build logs metallib_build_pa256b.log / so_build_pa256.log.
+
+### UPDATE 21 (2026-08-19) — N4 lever 2: fused add+RMSNorm (qc add_rms_norm) — bit-exact, c4 +1.5% / c8 +0.8% / 2500x64 +1.1%; SwiGLU hypothesis CLOSED (already fused)
+
+- Status: retained.
+- Baseline (UPDATE 20 / N4a): c1 10.717/10.726 sha fa58598b, c4
+  18.541/18.546, c8 21.263/21.258, 2500x64 2.914/2.915 sha aedef4ec.
+- HYPOTHESIS CHECKED AND CLOSED FIRST: the census "mlp glue" was NOT
+  an unfused SwiGLU — SiluAndMul.forward_mps already routes to the
+  one-dispatch qc_swiglu kernel (serving/swiglu/qc_swiglu.metal,
+  bitwise-mirroring the eager chain; wired via _metal_swiglu). The
+  mlp bracket is its GEMVs + one swiglu + dispatch overhead. Do not
+  redo.
+- LEVER 2 (glue share 23.7%): every decoder residual seam ran TWO
+  dispatches (aten bf16 add + qc rms_norm via rms_norm_dyn) x128 per
+  step plus a hidden-state round trip. New `rms_norm_add_dyn` kernel
+  (norms/rms_norm/rms_norm.metal, next to rms_norm_dyn): pass 1
+  computes s = bf16(x + residual) per bf16_4 chunk (rounded ONCE,
+  exactly like the aten add), writes res_out, accumulates the square
+  sum from the ROUNDED s; pass 2 re-reads its own chunks (same-thread
+  device ordering) and applies rms_norm_dyn's identical *inv*w chain.
+  Host op add_rms_norm(x, residual, weight, eps) -> (out, res_sum)
+  (one encode); ops.py wrapper; RMSNorm.forward_mps residual branch
+  routes to it behind VLLM_QC_ADDNORM (default on; guards: 2D
+  contiguous bf16). Existing kernels untouched. Note: the register-
+  resident norms/add_norm/rms_norm_add exists but is shape-keyed
+  D<=1024 — hidden 5120 needs the dynamic 32-lane form.
+- Prediction (in advance): BIT-EXACT — the add is a single-rounding
+  elementwise op with no reassociation freedom and the norm chain is
+  byte-for-byte the rms_norm_dyn math. (Contrast with UPDATE 18/19
+  where FMA-neighborhood restructuring rolled shas.)
+- Oracle (addnorm_oracle.py): fused op vs the eager chain BIT-EXACT
+  at M in {1,2,8,256} x D in {5120,4096,2048}, deterministic.
+- Serving gate (n4d_addnorm_gate/, kill-first + one ramped boot):
+  - c1 10.711/10.703 sha fa58598b BIT-EXACT 2/2 (prediction held)
+  - c4 18.795/18.874 (+1.5%)
+  - c8 21.430/21.418 (+0.8%)
+  - 2500x64 2.945/2.940 sha aedef4ec BIT-EXACT 2/2 (+1.1%)
+  - vs Q4_K bar: c1 95.9%, c4 113.4%, c8 123.0%.
+  - c1 is ~flat: at batch 1 the two saved dispatches/seam overlap
+    with the step's serial kernel chain; the win shows where steps
+    carry more tokens (batch/prefill).
+- OPS LESSON (first gate attempt aborted): gate scripts MUST
+  kill-first idempotently. The box had been restored (18:56 boot) and
+  the derived gate assumed clean -> its api_server died on
+  EADDRINUSE while the health check saw the OLD server (c1 "passed"
+  against the old build — meaningless) and the half-booted second
+  EngineCore's memory pressure failed every batch run. kill_server
+  is now the first step of the gate template.
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT (anchor_regate_addnorm/: 8tok 573db39598e7 2/2 @1.71-1.72s; off1-2000 bb83cc3054a3 2/2 @57.31-57.37s; 2500x64 f75e1d41ac3d 3/3 @4.49-4.66s — 7th bit-exact re-gate of 2026-08-19; rms_norm_dyn itself untouched). Build fully cleared.
+- Raw: perf/results/2026-08-19/n4d_addnorm_gate/ +
+  anchor_regate_addnorm/; addnorm_oracle.py, addnorm_gate.sh
+  (session-04ba9b90 scratchpad); build logs
+  metallib_build_addnorm.log / so_build_addnorm.log.
+
+### UPDATE 22 (2026-08-20) — N4 lever 3: GDN dispatch fusion (gdn_fused_prepare + gdn_gated_rmsnorm_f32) — bit-exact, c1 +2.7% (98.4% of bar) / c4 +2.0% / c8 +1.2% / 2500x64 +0.9%
+
+- Status: retained.
+- Baseline (UPDATE 21 / N4b): c1 10.711/10.703 sha fa58598b, c4
+  18.795/18.874, c8 21.430/21.418, 2500x64 2.945/2.940 sha aedef4ec.
+- DIAGNOSIS (host-side read + UPDATE 20 census): at decode each of the 48
+  GDN layers ran 12 non-GEMV dispatches — 5 qc kernels (short_conv,
+  qkv_prepare, gate_beta, recur, gated_rmsnorm) plus ~7 aten glue ops
+  (mixed_qkv.float() cast, b/a contiguous copies, torch.zeros container,
+  fp32->bf16 cast, merged->container copy, z reshape-gather). ~576
+  dispatches/step; the kernels' real work at batch 1 is microseconds
+  (recur state traffic ~0.3 GB/step = ~0.4 ms). The bracket is launch
+  overhead, not math.
+- LEVER (two new kernels + host rewiring, kill switches
+  VLLM_QC_GDN_FUSEPREP / VLLM_QC_GDN_FUSENORM, both default on):
+  1. gdn_fused_prepare (gdn.metal): one simdgroup per (request, logical
+     row) — q rows, k rows, v rows, one gate row — computes the short conv
+     in registers (identical per-channel op order, fp32 weights, silu, conv
+     state pool update included), the q/k rms-form l2norm+scale with
+     qkv_prepare's exact d = lane*4+i mapping and simd_sum, v passthrough,
+     and gate_beta's decay/beta verbatim, reading the qkvz/ba projection
+     rows IN PLACE (strided). Replaces 3 kernels + the fp32 cast + both
+     b/a copies. Routed for pure-decode batches only (prefill keeps the
+     wider-parallel conv kernel for occupancy; the fused kernel is still
+     varlen-general for future spec verify).
+  2. gdn_gated_rmsnorm_f32 (gdn.metal): the existing norm kernel with fp32
+     y input rounded to the activation dtype in-register
+     (float(bf16(y)) == the chain's .to(bfloat16) cast) and z read in place
+     from the strided [tokens, Hv, Dv] projection view. Replaces the cast,
+     the z gather, and (with the forward_mps container restructure: the
+     normed rows go straight to out_proj; zeros container only when
+     num_actual < num_tokens) the zeros fill + container copy. Routed for
+     decode AND prefill slices.
+  - Net at decode: 12 -> 3 non-GEMV dispatches per GDN layer
+    (fused_prepare, recur, gated_rmsnorm_f32) = ~430 fewer dispatches per
+    step. _output_projection's dead metal branch removed (MPS no longer
+    routes through it); the torch fallback norms internally, same numerics.
+- Prediction (in advance): serving shas HOLD bit-exact. HELD (c1 fa58598b
+  2/2, 2500x64 aedef4ec 2/2; c8 sha equals the N4b run-1 sha 2/2).
+- Oracle (gdnfuse_oracle.py): 20/20 BIT-EXACT vs the unfused chain —
+  q/k/v/decay/beta AND the updated conv state pools, at (Hk16,Hv32,
+  Dk128,Dv128,ksize4) and (4,8,64,128), R in {1,2,8}, decode and varlen
+  [3,1,5], contiguous and page-packed pools; norm bit-exact at all shapes.
+  Deterministic 2/2.
+- Serving gate (n4e_gdnfuse_gate/, kill-first + one ramped boot):
+  - c1 11.019/10.968 sha fa58598b BIT-EXACT 2/2 (+2.7%)
+  - c4 19.215/19.281 (+2.0%; run-1 sha 2e567ea7 = N4b's)
+  - c8 21.683/21.681 sha 467b35c3 2/2 (+1.2%)
+  - 2500x64 2.967/2.968 sha aedef4ec BIT-EXACT 2/2 (+0.9%)
+  - vs Q4_K bar (11.17 / 16.63 / 17.42): c1 98.4%, c4 115.7%, c8 124.5%.
+- CALIBRATION LESSON: the win is ~2.4 ms/step against a ~13 ms
+  dispatch-math estimate (430 dispatches x ~30 us census attribution).
+  Marginal dispatch cost at batch 1 is ~5 us once the pipeline overlaps
+  launches; VLLM_SYNCPROF-derived shares over-attribute serial launch
+  cost (same pattern as the addnorm lever's flat c1). Treat census
+  percentages as upper bounds on dispatch-elimination levers.
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT
+  (anchor_regate_gdnfuse/: 8tok 573db39598e7 2/2 @1.69-1.72s; off1-2000
+  bb83cc3054a3 2/2 @57.32-57.38s; 2500x64 f75e1d41ac3d 3/3 @4.49-4.55s —
+  8th consecutive bit-exact re-gate; DSV4 does not exercise GDN, this
+  gates the shared build).
+- Raw: perf/results/2026-08-20/n4e_gdnfuse_gate/ +
+  anchor_regate_gdnfuse/; gdnfuse_oracle.py, gdnfuse_gate.sh
+  (session-04ba9b90 scratchpad); build logs metallib_build_gdnfuse.log /
+  so_build_gdnfuse.log.
+
+### UPDATE 23 (2026-08-20) — N4 close-out: xctrace true-GPU-time diagnostic; base-decode ceiling declared at c1 98.4% of the Q4_K bar
+
+- Status: diagnostic (no code change). Declares the N-campaign base-decode
+  ceiling and starts N5 DFlash 2 per the user's standing order.
+- Instrument: `xcrun xctrace record --template 'Metal System Trace'
+  --attach <EngineCore pid> --time-limit 8s` against the live
+  qwen38-nvfp4-1 box during steady c1 decode (2000-token generation,
+  attached at ~12 s). NO rebuild, NO anchor re-gate needed. Exported
+  metal-gpu-intervals + metal-application-intervals tables and
+  aggregated (scratchpad gdn_c1_trace.trace, gpu_intervals.xml,
+  app_intervals.xml).
+- FINDINGS (~93 decode steps in the window, ~10.9 tok/s during trace):
+  - 22,274 command buffers in 8.56 s = ~240 CBs/step — torch-MPS core
+    commits per op (commitAndContinue chaining, present and default in
+    the installed torch; our qc encode() already encodes onto the
+    stream CB without committing, exonerated).
+  - Compute-channel busy 6.90 s / 8.56 s = 81%; gaps ~17 ms/step.
+    Pure gap elimination (the Muse single-CB loop's direct effect)
+    caps at ~+19% c1 even if perfect.
+  - CB-duration distribution: 2,246 CBs of 1-3 ms carry 5.04 s (73%)
+    of channel time (~24/step ~= 54 ms/step); 16,614 CBs under 50 us
+    total only 144 ms (~1.7 ms/step) — the tiny-dispatch class UPDATE
+    22 fused was already small on-GPU, consistent with its measured
+    +2.7% vs the census-share estimate.
+  - Encoder-level payloads inside those CBs sum to far less than the
+    CB channel footprints: the step's channel time is dominated by
+    per-CB scheduling/serialization granularity, not kernel
+    arithmetic. The GEMV floor (26.1 ms/step, UPDATE 19) plus
+    CB-granular overhead is the step.
+  - CPU->GPU latency p50 8.2 ms / p90 23 ms: the CPU runs far ahead;
+    host re-exonerated (matches UPDATE 20).
+- CONCLUSION: no measured single-kernel lever remains at c1. The
+  remaining ~65 ms/step above the GEMV floor is CB-granularity
+  overhead + real non-GEMV kernel time; the only lever of size is the
+  Muse-class whole-step single-command-buffer loop (multi-day,
+  structural, and its value re-ranks under speculation where verify
+  steps amortize per-CB cost over 8 tokens). Base decode is declared
+  AT CEILING for single-token stepping: c1 11.02 (98.4% of the 11.17
+  Q4_K bar), c4 19.25 (115.7%), c8 21.68 (124.5%), vs N2 start
+  7.02/14.37/15.96 = +57%/+34%/+36% over the campaign.
+- NEXT: N5 DFlash 2 (UPDATE 17 decision record; drafter downloaded,
+  verify attention path lit since UPDATE 20, lossless gate ref = c1
+  sha fa58598b). Then N6 TurboQuant KV; Muse loop re-ranks post-spec.
+- Raw: scratchpad gdn_c1_trace.trace + exported XMLs (session
+  04ba9b90); box restored and healthy after capture.
+
+### UPDATE 24 (2026-08-20) — N5 step 1: MPS GDN speculative-verify path (gdn_fused_prepare spec mode + gdn_recur_spec) — oracle 24/24 bit-exact, non-spec re-gates bit-exact
+
+- Status: retained (infrastructure for N5 DFlash2; no serving-perf claim of
+  its own — the spec path first serves under the DFlash2 gate).
+- CONTEXT: DFlash2 verify steps present each spec request as 1 bonus + 7
+  draft tokens to the GDN layers. The CUDA path (causal_conv1d_update
+  IS_SPEC_DECODING + fused_sigmoid_gating_delta_rule_update with
+  ssm_state_indices [R, num_spec+1] and num_accepted_tokens) rewinds the
+  conv window to the last accepted token and checkpoints the SSM state
+  after every timestep so the next step can resume from any accepted
+  position. _forward_core_mps raised NotImplementedError for spec batches,
+  and the Metal kernels hardcoded channel stride = width-1 (a spec-sized
+  pool carries width-1+num_spec columns).
+- LEVER (metallib + .so + host wiring):
+  1. gdn_fused_prepare: 3 new buffers (state_cols@24, num_accepted@25,
+     spec_mode@26). Spec mode reads the conv history at column offset
+     num_accepted-1 and writes the Triton layout exactly: cols[0..w-3] =
+     old[off+1..off+w-2] (from the initial registers, before the ring
+     shifts), cols[w-2+t] = raw token t (inline in the token loop).
+     Non-spec keeps the front ring, restrided by state_cols (== w-1
+     without spec: arithmetic-identical).
+  2. NEW gdn_recur_spec: gdn_recur clone (math verbatim, state in
+     registers) + slot-table indirection — initial state from
+     slot_table[r, num_accepted[r]-1], full state checkpointed to
+     slot_table[r, t] after every timestep; slot <= 0 = null block.
+  3. gdn_short_conv: state_cols buffer (prefill path on spec-sized pools).
+  4. Hosts: pool checks relaxed to [slots, dim, >=w-1] with
+     stride(1)==size(2); gdn_fused_prepare gains optional num_accepted
+     (spec_mode = has_value, persistent 1-int MPS dummy otherwise);
+     gdn_recur_spec host op (slot_table [R,S] int32 row-strided).
+  5. qwen_gdn_linear_attn.py: _forward_core_metal_spec — pure-spec batches
+     run fused_prepare(spec)+gdn_recur_spec IN PLACE on the projection rows
+     (zero gathers); mixed batches (builder reclassifies decodes to
+     prefills) index_select spec/non-spec rows, run the varlen-general
+     fused prep + gdn_recur for the non-spec side, and index_copy-merge
+     into token order before ONE gated RMSNorm with z read in place.
+     Per-step derived tensors cached once on the shared metadata object
+     (48 layers reuse). _resolve_metal_gdn accepts spec-sized pools.
+- ORACLE (gdnspec_oracle.py): 24/24 BIT-EXACT, references = the PROVEN
+  kernels themselves: spec prep vs non-spec prep on an offset-seeded
+  narrow pool (identical math => bitwise outputs); spec conv state layout
+  checked directly (shifted old + all new tokens + untouched tail);
+  gdn_recur_spec y vs gdn_recur seeded from the accepted checkpoint;
+  every per-position checkpoint vs a truncated gdn_recur run. Plus
+  wide-pool non-spec regression: outputs and front ring identical,
+  tail untouched. Geometries: serving (Hk16 Hv32 Dk128 Dv128 k4 spec7,
+  accepted {1,8},{3,5,2}), small varlen, ksize2.
+- Prediction (in advance): DSV4 anchors AND qwen no-spec shas HOLD
+  bit-exact (non-spec paths arithmetic-identical; new buffers inert).
+  HELD: DSV4 8tok 573db39598e7 2/2 @1.69-1.71s, off1-2000 bb83cc3054a3
+  2/2 @57.26-57.28s, 2500x64 f75e1d41ac3d 3/3 @4.49-4.55s — 9th
+  consecutive bit-exact anchor re-gate; qwen c1 fa58598b 2/2
+  (11.059/10.979, matches N4c), 2500x64 aedef4ec 2/2 (2.977/2.974).
+- Raw: perf/results/2026-08-20/anchor_regate_gdnspec/ +
+  qwen_regate_gdnspec/; gdnspec_oracle.py, regate_gdnspec.sh,
+  metallib_build_gdnspec.log, so_build_gdnspec.log (session-04ba9b90
+  scratchpad).
+
+### UPDATE 25 (2026-08-20) — N5 DFlash2 gate: integration COMPLETE and greedy-correct on Metal; throughput gated by the KNOWN M=8 batch-GEMV collapse (UPDATE 11), not by DFlash2
+
+- Status: integration retained on the twin profile `qwen38-nvfp4-1-df2`
+  (source `qwen38-27b-nvfp4` speculator = z-lab/Qwen3.8-27B-DFlash2 pinned
+  50307d4c, method=dflash k=7). The canonical `qwen38-nvfp4-1` stays
+  no-spec: spec is currently SLOWER at c1/c4/c8 (below). NOT a rejection —
+  the binding constraint is a pre-existing kernel gap with its own lever.
+- WHAT SHIPPED (beyond UPDATE 24's GDN spec path): PR #52816 port
+  (qwen3_dflash2.py model incl. grouped dynamic conv + candidate selector,
+  dflash2/ speculator with a torch-native MPS selector walk, registry /
+  config / V2-runner forcing, draft_logits_spec hook), compressed-tensors
+  lm_head acceptance for compute_candidates (candidate top-K through the
+  same deterministic fp8ch GEMV the serving logits use), and three MPS
+  gaps in the DFlash1 context-KV precompute that had never run on Metal:
+  torch-native rms_norm (ir reference numerics) at 2 sites, RoPE via the
+  module's forward_native, and metal_attn.do_kv_cache_update (per-token
+  advanced-indexing insert, PAD rows clamped onto the null block).
+- BOOT/BRING-UP: 3 crash-fix cycles (CUDA-only ops.rms_norm /
+  ops.rotary_embedding / missing do_kv_cache_update, then a
+  SimpleNamespace scope miss). After that: full pipeline live — drafter
+  propose -> candidates -> walk -> target GDN spec verify -> rejection.
+- LOSSLESSNESS VERDICT (the star gate, resolved with evidence): spec c1
+  greedy output is DETERMINISTIC (sha b46e676c 2/2 at c1 AND c4
+  request-0) but differs from the no-spec sha fa58598b. Token-level diff
+  (dump_spec/ vs dump_nospec/): identical for the first 29 tokens, then
+  the no-spec run picks ' Use' and the spec run ' Report' — and the
+  server's own logprobs at that position show ' Use' and ' Report'
+  EXACTLY TIED at -1.538660 each. The divergence is an exact-tie argmax
+  flip under the verify pass's batched kernels (M=8 GEMVs, q_len=8
+  attention), the same class as the UPDATE 11 SHA CAVEAT tie. Both
+  continuations are coherent; no state-corruption signature. CONCLUSION:
+  greedy-correct under its own forward numerics; bit-parity with the
+  no-spec sha is not achievable across kernel shapes (upstream spec
+  decoding has the same property) and this token was a coin flip even
+  within one kernel. Gate redefined: determinism (2/2) + tie-flip-only
+  divergence (evidenced) + acceptance + throughput.
+- ACCEPTANCE (essay prose, k=7): mean acceptance length 2.93 tokens/step
+  (position-0 78%, decaying), draft acceptance ~39% at c1. Below the
+  GSM8K-domain 3.43x claim, as z-lab's "<=5 on quantized targets" note
+  predicts.
+- THROUGHPUT (perf/results/2026-08-20/n5_df2_gate/, vs N4c no-spec):
+  c1 9.59/9.60 (-13% vs 11.02), c4 11.83/11.88 (-38% vs 19.25),
+  c8 15.19/15.46 (-29% vs 21.68, run-to-run shas vary: mixed batches),
+  2500x64 3.05 (+2.7% vs 2.97, prefill-dominated).
+- WHY (VLLM_QC_PHASE_PROF census, 400-token c1 decode, 144 steps):
+  target_forward 234.4 ms/step (vs ~26 no-spec) = mlp 92.8 + gdn 56.7 +
+  full_attn 29.5 + glue; drafter_propose only 29.7; sample_and_reject
+  11.5. The gdn share is honest recurrence work (8 sequential timesteps;
+  a recurrent mixer cannot amortize verify tokens). The mlp/attn GEMV
+  share is the UPDATE 11 disease verbatim: every weight-stationary batch
+  kernel collapses at M=8 (~111 GB/s vs 533-633 at M=1; the NVFP4/fp8ch
+  mb kernels inherit the grid-split pair scheme), and at c4/c8 the verify
+  batch (M=32/64) exceeds _GEMV_MB_MAX_ROWS and falls to dequant+dense.
+  Syncprof: host-side syncs clean (~51 ms/step host; GPU genuinely busy
+  ~257 ms/step; ~87 CBs/step).
+- DECISION: k-sweep (7 vs <=5) DEFERRED — with the M-batch bandwidth
+  collapse, even optimistic k=3..5 acceptance lands ~12 tok/s; the sweep
+  re-ranks after the batch-GEMM lever. NEXT LEVER (promoted from UPDATE
+  11's "next levers (2)"): simdgroup_matrix / dequant-once batch GEMM for
+  NVFP4 + fp8ch at M in [2, 64] — it is now the DFlash2 enabler AND the
+  known c4/c8 batch-decode lever. Back-of-envelope with a weight-bound
+  M=8 route: verify ~= 30 (gdn) + 56 + 30 + 20 ~= 136 ms -> ~21 tok/s c1
+  (+90% over no-spec) at the measured 2.93 acceptance.
+- Aux findings: compute_candidates runs the fp8ch lm_head at M=R*7 (odd
+  at c1) -> falls off the even-M mb route to dequant+dense; pad to even
+  rows when the batch-GEMM work lands. max_num_scheduled_tokens drops to
+  2000 under spec (draft-slot accounting inside max_num_batched_tokens
+  2048) — resize with the same campaign.
+- Raw: n5_df2_gate/ (8 run JSONs + c1_dump_spec.json + dump_spec/ +
+  dump_nospec/ + c1_dump_nospec.json); df2_boot.log, df2_census_boot.log
+  (+ /tmp/syncprof_10753.txt copied to scratchpad), df2_phaseprof_boot.log
+  + phaseprof split (session-04ba9b90 scratchpad: df2_smoke.sh,
+  df2_runs.sh, df2_census.sh, df2_phaseprof.sh, df2_trace.trace).
+
+### UPDATE 26 (2026-08-20) — N5b: mv_ext batch GEMVs (qgemv_fp8ch_mv4r + qgemv_nvfp4_mv4r) for M in [3, 8] — no-spec c4 +7.4% / c8 +9.5%; SPEC c1 9.59 -> 11.11, first pass ABOVE no-spec; the M=8 "collapse" recalibrated as an FMA-issue wall
+
+- Status: retained. Baseline (UPDATE 22/25): no-spec c1 11.02 sha fa58598b,
+  c4 19.25, c8 21.68, 2500x64 2.97 sha aedef4ec; spec c1 9.59 sha b46e676c
+  (verify target_forward 234 ms/step, mlp 92.8).
+- HYPOTHESIS GOING IN (UPDATE 25): the M=8 batch collapse is the UPDATE 11
+  grid-split pair scheme's M/2 weight re-reads; a decode-once batch GEMM
+  (simdgroup_matrix or dequant-once) restores weight-bound M=8 and yields
+  spec c1 ~21. MEASURED VERDICT: only half true, and the projection was
+  wrong — see the wall below.
+- INVESTIGATION (standalone harness qgemm_proto.metal/qgemm_bench.m +
+  nvgemm_bench.m, clean box, serving shapes; GB/s counts quantized bytes
+  once):
+  1. simdgroup_matrix GEMM, llama.cpp kernel_mul_mm classic geometry
+     (64x32 tile, NK=32, 4 SGs, both operands staged in TG 8x8 blocks,
+     fp32 accumulators): CPU-double correct on first compile, M-flat 2..32
+     as designed, but 153 GB/s at qkv M=8. Variants: prefetch +3%; 32-row
+     tile (2x residency) +0-13%; HALF tiles (vs bfloat) +25-30% ->
+     197-251; row-major staging + transposed simdgroup_load REGRESSED
+     (-9%). Probes: device reads alone at this dispatch shape 1088 GB/s;
+     full skeleton minus the MAC phase ~600; the simdgroup load/MAC phase
+     is 2/3 of runtime at an effective ~2.3e12 FMA/s.
+  2. THE WALL, recalibrated: M1's simdgroup_matrix is cooperative lane
+     math, not a tensor core — the MAC phase and plain fp32 FMA converge
+     at ~2.3e12 FMA/s effective (~22% of the 10.6e12 nominal). At M=8 the
+     FMA work itself (N*K*8) is the binding cost, NOT bandwidth: the
+     UPDATE 11 "collapse to ~111-228 GB/s" at M=8 is mostly physics, and
+     the shipped mb twins were already within ~25% of this issue-rate
+     ceiling. The UPDATE 25 back-of-envelope (weight-bound M=8 verify,
+     spec c1 ~21) is therefore NOT reachable by kernel shape alone;
+     honest kernel headroom at M=8 is ~1.3-1.7x, from issue efficiency
+     and fewer non-FMA ops, not from bandwidth.
+  3. WINNER — mv_ext scheme (the llama.cpp kernel_mul_mv_ext precedent,
+     added upstream for speculative-decode batches; llama caps columns
+     per pass at 4-5 on its heavier decodes): batch-1 lane geometry, NO
+     threadgroup memory or barriers, NR=4 weight rows per simdgroup
+     (X loads/converts amortized 4 rows — lifts issue rate to ~3.0e12
+     FMA/s), R1 columns per pass with X via device vec4 loads (L1-served,
+     dodging UPDATE 11's register-staging blowup), weights re-read
+     ceil(M/R1) times. fp8ch R1=4; nvfp4 R1=2 (heavier decode; R1=4
+     regresses on registers). Any M >= 1 (pad columns clamp-read,
+     store-guarded) — odd M covered natively.
+- SERVING-ROUTE MICROBENCH (mv4r_bench.py, clean box, op vs dense):
+  fp8ch qkv M=8 0.276 -> 0.173 ms (1.6x), M=4 0.139 -> 0.096, M=7 (old
+  route dense) 0.398 -> 0.166 (2.4x); qkvz M=8 0.230 -> 0.147; lm_head
+  M=8 6.77 -> 3.43, M=7 dense ~9 -> ~3.4 (the compute_candidates odd-M
+  fix, UPDATE 25 aux finding, closed for M<=8); nvfp4 gate_up M=8 0.670
+  -> 0.571 (1.19x), down 0.367 -> 0.287 (1.28x). The op now beats dense
+  at EVERY M in [1, 8] for both formats. M=1/2 legs unchanged.
+- ROUTING: host ops route contiguous batches 3..8 (any parity) to mv4r
+  (VLLM_QC_FP8CH_MV4R / VLLM_QC_NVFP4_MV4R, boot-time, default on),
+  batch 2 stays on the mb pair twin (890 vs 783 GB/s), batch 1 and
+  non-contiguous keep the batch-1 loop; python admits odd m in [3, 8]
+  (use_gemv_mv). M > 8 stays dense (the simdgroup GEMM path — M-flat to
+  32 at ~197-251 GB/s — is parked as the M in [9, 32] follow-up; it
+  needs its own nvfp4 twin and is only ~1.4x over dense).
+- ORACLE (mv4r_oracle.py): ALL PASS — M in {2..8} x both formats x
+  serving shapes, float64 envelope + every batch row BIT-IDENTICAL to
+  looped batch-1. Lesson re-learned (UPDATE 18/19 class): the fp8ch
+  per-row 16-FMA chain first compiled to a fast-math re-tree and broke
+  bit-identity; interleaving the row accumulators per element (the
+  batch-1/mb chain structure) restored it. nvfp4's gsum form survived
+  as-is (its batch-1 chain has the same shape).
+- SERVING GATE (n5b_mv4r_gate/, kill-first, one ramped boot per profile;
+  all four predictions made in advance HELD):
+  - no-spec c1 1000x256: 11.064/11.055 sha fa58598b BIT-EXACT 2/2
+    (M=1 route untouched, as predicted)
+  - no-spec 2500x64: 2.977/2.974 sha aedef4ec BIT-EXACT 2/2
+  - no-spec c4: 20.67/20.68 (+7.4% vs 19.25; request-0 23a0b9fb both
+    runs this composition)
+  - no-spec c8: 23.749/23.725 (+9.5% vs 21.68) sha 467b35c3 2/2 — the
+    UPDATE 22 sha reproduced: decode numerics identical (mv4r rows
+    bit-identical to batch-1, exactly like the mb rows they replace),
+    delta is pure speed.
+  - vs Q4_K M4c bar (11.17/16.63/17.42): c1 99.0%, c4 124.3%, c8 136.3%.
+  - SPEC (df2 twin, k=7): c1 11.11/11.082 sha b46e676c HELD 2/2
+    (+15.9% vs 9.59) — FIRST TIME SPEC BEATS NO-SPEC at c1 (11.11 vs
+    11.06); 2500x64 3.154 sha ab7dde1b (= UPDATE 25 spec sha, +3.4%,
+    +5.9% vs no-spec); c4 12.06/11.73, c8 15.19/15.57 (dense-bound
+    verify at M=32/64 — spec remains a c1 feature, batch serving stays
+    no-spec). Acceptance diagnostics read 3.21-3.92 tok/step across the
+    run mix (vs 2.93 recorded pre-mv4r; interval-class observation, not
+    a gate — the candidates path now scores through the fp32-accum GEMV
+    instead of dense bf16).
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT
+  (anchor_regate_mv4r/: 8tok 573db39598e7 5/15/3 2/2; off1-2000
+  bb83cc3054a3 1581/2115/423 2/2; 2500x64 f75e1d41ac3d 43/105/21 3/3 —
+  10th consecutive bit-exact re-gate). Build fully cleared.
+- NEXT (re-ranked by the FMA-wall finding): (1) k-sweep 7 vs 3/5 — with
+  verify compute-bound, smaller k cuts verify FMAs linearly; UPDATE 25
+  deferred it pending this lever, and the lever's honest size makes the
+  sweep the biggest remaining spec knob (script staged: k_sweep.sh);
+  (2) Muse-class single-CB step loop (UPDATE 23's CB-granularity wall
+  applies to the verify step too); (3) simdgroup GEMM for M in [9, 32]
+  if c4/c8 spec ever matters; (4) TurboQuant KV (N6); (5) promote df2
+  onto the canonical profile once the k-sweep picks the operating point.
+- Raw: n5b_mv4r_gate/ + anchor_regate_mv4r/; scratchpad qgemm_proto.metal
+  (7 GEMM variants + 2 probes + mv prototypes), qgemm_bench.m,
+  nvgemm_bench.m, mv4r_oracle.py, mv4r_bench.py, n5b_gate.sh, k_sweep.sh,
+  build logs metallib_build_mv4r{,2}.log / so_build_mv4r.log.
+
+### UPDATE 27 (2026-08-20) — DFlash2 k-sweep: k=3 WINS at 13.65 tok/s c1 (+23% over k=7 and over no-spec); twin profile pinned to k=3
+
+- Status: retained (config only — no kernel/host change, no anchor
+  re-gate needed; same build as UPDATE 26).
+- Baseline (UPDATE 26): spec k=7 c1 11.11/11.082 sha b46e676c, 2500x64
+  3.154; no-spec c1 11.06.
+- HYPOTHESIS (UPDATE 26 NEXT #1): verify is compute-bound (the FMA-issue
+  wall), so smaller k cuts verify cost linearly and can win despite a
+  lower acceptance ceiling.
+- METHOD (k_sweep.sh): profiles.json edited per leg and byte-restored
+  from backup after; kill-first boots of qwen38-nvfp4-1-df2 at k=3 and
+  k=5; exact-token c1 x2 + 2500x64 x1 + interval acceptance each; the
+  k=7 leg is UPDATE 26's same-build gate.
+- RESULTS (perf/results/2026-08-20/n5b_ksweep/):
+  | k | spec c1 | spec 2500x64 | mean acceptance | draft rate |
+  | 3 | 13.651/13.693 sha 8c58a4c6 2/2 | 3.239 | 2.90-3.00 (of 3) | 63-67% |
+  | 5 | 11.696/11.708 sha 467b35c3 2/2 | 3.186 | 3.00 (of 5) | 40% |
+  | 7 | 11.11/11.082 sha b46e676c 2/2  | 3.154 | ~2.9-3.9 (of 7) | 31-42% |
+- READING: mean acceptance is ~3.0 REGARDLESS of k — the drafter's
+  useful horizon on essay prose is ~3 tokens, so every draft slot past
+  3 is pure wasted verify FMAs at the binding cost. k=3 (M=4 verify =
+  mv4r's best point, 712 GB/s qkv) lands at 13.65 c1 = 123.4% of
+  no-spec and 122.2% of the Q4_K bar; 2500x64 3.239 = +8.7% over
+  no-spec. Matches (and sharpens) z-lab's "block <= 5 on quantized
+  targets" note. Each leg deterministic 2/2; per-k shas differ (verify
+  batch composition flips the known exact-tie — the UPDATE 25 class).
+- DECISION: twin profile source pinned to num_speculative_tokens=3
+  (profiles.json; summary updated). CANONICAL stays no-spec: spec c4/c8
+  still lose (12.1/15.4 vs 20.7/23.7 — M=16..32 verify rides dense) and
+  this V1 fork has no disable-by-batch-size knob (V0 feature, dropped).
+  PROMOTION PATH (open): a batch-adaptive spec gate (skip drafting when
+  num_running > 1-2) would let df2\@k=3 ride the canonical profile — c1
+  +23% with c4/c8 untouched; engine-level change, own gates.
+- NEXT: batch-adaptive spec gate (the promotion enabler) or Muse
+  single-CB loop (helps both modes; CB granularity binds), then N6
+  TurboQuant KV. Aux (carried): revisit max_num_batched_tokens under
+  spec; simdgroup GEMM for M in [9, 32] only if c4/c8 spec matters.
+- Raw: n5b_ksweep/ (6 run JSONs); scratchpad k_sweep.sh,
+  df2_k{3,5}_boot.log; box restored no-spec (BOX RESTORED 16:08:53).
+
+### UPDATE 28 (2026-08-21) — Batch-adaptive speculation PROMOTED to the canonical profile: dynamic SD wired into the V2 runner; c1 13.65 (+23%) with c4/c8 within ~3% of no-spec
+
+- Status: retained + PROMOTED (Python + profiles.json only — no
+  metallib/.so rebuild). DSV4 anchors re-gated anyway (model_runner.py is
+  shared with the DSpark path): 8tok 573db39598e7, off1-2000 bb83cc3054a3,
+  2500x64 f75e1d41ac3d — BIT-EXACT, 11th consecutive
+  (perf/results/2026-08-21/anchor_regate_adaptive/).
+- Baseline (UPDATEs 26/27): no-spec c1 11.06 fa58598b / c4 20.68 / c8
+  23.74; always-on spec k=3 c1 13.65 8c58a4c6 but c4/c8 LOSE (12.1/15.4).
+  UPDATE 27 promotion path: skip drafting when more than ~1 request runs.
+- DISCOVERY: UPDATE 27's "this V1 fork has no disable-by-batch-size knob
+  (V0 feature, dropped)" was WRONG. The fork HAS dynamic SD:
+  SpeculativeConfig.num_speculative_tokens_per_batch_size ([start, end, K]
+  ranges, K=0 legal) -> scheduler builds a dense batch->K lookup
+  (scheduler.py:251) and ships the per-step K as
+  SchedulerOutput.num_spec_tokens_to_schedule (scheduler.py:1131). The OLD
+  gpu_model_runner threads that K into propose(); the V2 modular runner
+  (our Metal path, sync scheduler) IGNORED it — the drafter ran
+  unconditionally every step, so the feature was inert here.
+- CHANGE (three pieces):
+  1. vllm/v1/worker/gpu/model_runner.py: ExecuteModelState carries
+     num_spec_tokens_to_schedule; sample_tokens skips speculator.propose
+     entirely when it is 0 (only reachable with a dynamic schedule; dummy
+     runs bypass sample_tokens; non-dynamic configs — DSV4/DSpark — see
+     K == k > 0, bit-neutral by construction) and hands set_draft_tokens a
+     zero-width [B, 0] slice so update_draft_token_ids clears
+     request.spec_token_ids -> next step schedules pure decode. V2 sync
+     supports {0, k} gating only; intermediate K is not trimmed (pre-existing).
+  2. profiles.json source qwen38-27b-nvfp4 speculator engine:
+     num_speculative_tokens_per_batch_size = [[1, 1, 3], [2, 8, 0]] —
+     draft k=3 only at batch 1 (max_num_seqs = 8).
+  3. vllm/v1/attention/backends/gdn_attn.py:253 (found by the first gate,
+     see below): block_table_tensor[:, 0].contiguous() in the
+     no-spec-masks branch.
+- FIRST GATE (adaptive_gate.sh): c1 PASSED bit-exact (13.585/13.564
+  8c58a4c6 2/2; 2500x64 3.229 f497f4a9) but c4 KILLED THE ENGINE:
+  "slot_mapping must be contiguous" from gdn_short_conv via
+  _forward_core_metal. ROOT CAUSE: a batch whose decode requests carry
+  zero total draft tokens takes the gdn_attn "no spec sequences" branch,
+  which built non_spec_state_indices_tensor = block_table_tensor[:, 0].
+  In a spec engine the mamba block table is [batch, num_spec+1] = 4
+  columns, so the column view has stride 4 — non-contiguous at batch >= 2.
+  Never fired before: no-spec engines have a [batch, 1] table (stride-1
+  view); the always-drafting twin routed decode batches through the
+  boolean-mask branch whose advanced indexing copies contiguously; and
+  batch-1 slices always report contiguous (why c1 passed). Fix restores
+  the metadata contract at the source; no-op for no-spec engines (torch
+  returns the already-contiguous view as-is).
+- RE-GATE (adaptive_regate.sh, twin) vs no-spec / old always-on spec:
+  | leg | adaptive twin | no-spec | spec k=3 always-on |
+  | c1 x2   | 13.478/13.639 8c58a4c6 2/2 | 11.06 fa58598b | 13.65 8c58a4c6 |
+  | c4 x2   | 20.031/19.994              | 20.68          | 12.06/11.73    |
+  | c8 x2   | 23.21/23.257               | 23.74          | 15.19/15.57    |
+- PROMOTE-CONFIRM (promote_confirm.sh, canonical qwen38-nvfp4-1 with
+  speculative: true): c1 13.651/13.62 8c58a4c6 2/2 BIT-EXACT vs the
+  pinned k=3 twin; c4 20.104; c8 23.275/23.26 2/2. Canonical c1 is now
+  123.4% of no-spec and 122.2% of the Q4_K bar; c4 97.2% and c8 98.0% of
+  no-spec (both still far above the Q4_K bars: 120.9% / 133.6%).
+- ACCEPTANCE DIAGNOSTICS (interval log, adaptive runs): during c4/c8 legs
+  the drafter emitted only ~3 draft tokens per 30 s interval — drafting
+  fires solely on transitional solo-batch steps (run tails, 100%
+  acceptance on essay-tail tokens) and is off otherwise. c1 legs show the
+  usual ~2.9-3.0 acceptance at 63-67% draft rate.
+- SHA SEMANTICS: concurrency FIRST-shas are composition-timeline
+  dependent under the adaptive config (c4 flapped 467b35c3/23a0b9fb
+  across runs; c8 gave 2e567ea7 then 8c58a4c6) — the early solo-decode
+  window runs spec (M=4 verify numerics) before the batch fills, and its
+  length is timing-dependent. Same class as the no-spec c8 second-sha
+  flap already on record (UPDATE 26). c1 shas remain the bit-exactness
+  anchors; concurrency legs are throughput gates.
+- RESIDUAL (~2-3% at c4/c8 vs no-spec): in a spec engine
+  decode_query_len = 1 + k = 4, so 1-token decodes classify as
+  non-uniform and take the extend path instead of the fused-decode path,
+  plus transitional solo-spec steps. Possible micro-lever: classify
+  zero-draft batches as uniform decode; not worth it before Muse/N6.
+- DECISION: canonical qwen38-nvfp4-1 promoted to speculative: true
+  (summary + notes updated); twin qwen38-nvfp4-1-df2 retained as the
+  historical spec-gate profile id (now identical to canonical). The
+  NO-SPEC kernel anchors (c1 fa58598b, 2500x64 aedef4ec) stay
+  reproducible by flipping speculative: false — kernel-level bit-exact
+  gates should keep using them; the promoted-canonical anchors are c1
+  8c58a4c6 (spec) and the concurrency TPS bands above.
+- NEXT: Muse single-CB step loop (CB granularity binds both modes,
+  UPDATE 23), then N6 TurboQuant KV, N7 decommission gate. Aux
+  (carried): uniform-decode classification for zero-draft batches;
+  revisit max_num_batched_tokens under spec; simdgroup GEMM for
+  M in [9, 32] only if batch-spec ever matters.
+- Raw: perf/results/2026-08-21/anchor_regate_adaptive/ (3 anchor JSONs) +
+  adaptive_spec_gate/ (ad_ = first gate incl. the c4 crash legs, ad2_ =
+  re-gate, pr_ = promote-confirm); scratchpad adaptive_gate.sh,
+  adaptive_regate.sh, promote_confirm.sh, df2_adaptive{,2}_boot.log,
+  qwen_promoted_boot.log. Box serving the PROMOTED canonical
+  (PROMOTED BOX SERVING 10:20:48).
+
+### UPDATE 29 (2026-08-21) — Muse scoping diagnostic: the promoted c1-spec step is CPU-DISPATCH-BOUND (GPU idle 54%); single-CB/launch-count reduction is the lever, async scheduling parked as minor
+
+- Status: diagnostic (fresh traces + phase census on the promoted box; the
+  only code change is inert instrumentation — a phase-wrap decorator on
+  execute_model/sample_tokens, no-op unless VLLM_QC_PHASE_PROF=1).
+- CONTEXT: UPDATE 23 declared the Muse single-CB loop the remaining lever
+  from a NO-SPEC trace (81% busy, ~+19% gap ceiling). The promoted
+  adaptive-spec canonical changes the step structure, so re-measure first.
+- TRACES (xctrace Metal System Trace, attach to live EngineCore, no
+  rebuild; muse_trace.sh):
+  | regime | busy (Compute) | CBs seen | CB-time distribution | lat p50/p90 |
+  | c1 spec | 46.3% of 6.0 s | 1848 | >3ms CBs carry 85% | 4.1 / 46.2 ms |
+  | c8 (short-ctx) | 75.9% of 8.3 s | 871 | >3ms CBs carry 98.7% | 2.2 / 100 ms |
+  Aggregator muse_agg.py VALIDATED against the UPDATE 23 export: window
+  8.56 s, busy 80.6%, lat 8.2/23.1 ms reproduce. CORRECTION to UPDATE 23:
+  its "240 CBs/step" were ENCODER INTERVALS/step; distinct CBs were
+  ~2383 (~26/step).
+- PHASE CENSUS (VLLM_QC_PHASE_PROF=1 boot, 600-tok c1 gen;
+  phase_census_spec.sh): per step execute_model 171.5 ms (target_forward
+  157.2: mlp ~50.5, gdn ~33.9, full_attn ~22.4, per-layer glue ~50),
+  sample_tokens 26.6 (drafter_propose 17.9, sample_and_reject 6.3,
+  glue 2.4); execute_model prep outside the forward ~14.3. Engine-core
+  gap between steps: small (wall ~= covered phases).
+- SMOKING GUN: the profiled gen ran ~13.3 tok/s vs 13.65 unprofiled —
+  ~128 forced torch.mps.synchronize() per step cost ALMOST NOTHING,
+  which is only possible if the GPU queue is already near-empty at op
+  boundaries. The unprofiled step is ALREADY per-op serialized.
+- VERDICT: c1-spec step ~220 ms = ~100 ms GPU + ~120 ms host time
+  launching/feeding 300+ small torch-MPS ops (per-op dispatch cost,
+  Python glue, tiny-op launches). The 46% busy and 46 ms p90 latency are
+  symptoms. c8 (no drafting) is healthier (76% busy) but shares the
+  per-op regime.
+- RE-RANKED LEVERS:
+  1. Muse-class dispatch collapse on the decode/verify step — reduce
+     per-op launches (batch torch glue into QC kernels, then a step-level
+     single-CB/encoder session). Needs the per-layer op census (next).
+  2. Async scheduling (VLLM_METAL_ASYNC_SCHED=1 exists; dflash NOT on
+     the config async whitelist, vllm.py:1091-1102 raises) — PARKED:
+     engine-core gap measured small; revisit after dispatch collapse.
+  3. N6 TurboQuant KV unchanged in the queue.
+- Raw: perf/results/2026-08-21/muse_scoping/ (phaseprof pre/post, trace
+  aggregates, logs); scratchpad muse_trace.sh, muse_agg.py,
+  phase_census_spec.sh, muse_c1*/muse_c8* traces + XML exports. Box
+  restored to the clean promoted canonical after the census.
+
+### UPDATE 30 (2026-08-21) — Gemma-norm Metal kernels (the 128-per-step torch-native target norms): +1.9% c1 / +2.6% c4 / +2.5% c8; c8 23.84 passes the old no-spec bar with spec armed — and a calibration lesson on dispatch-count models
+
+- Status: retained. metallib + .so REBUILT (gemma_rms_norm_dyn +
+  gemma_rms_norm_add_dyn in norms/rms_norm/rms_norm.metal, launchers,
+  qc_metal_serving.mm hosts gemma_rms_norm/gemma_add_rms_norm, ops.py,
+  GemmaRMSNorm.forward_mps in layernorm.py gated by VLLM_QC_ADDNORM).
+- CONTEXT (UPDATE 29 census): GemmaRMSNorm (= Qwen3NextRMSNorm, all 128
+  per-step target-layer norms + final norm) never had a Metal path — its
+  ir.ops chain decomposes to ~10 MPS ops per call (~1300 dispatches/step,
+  the largest single glue block of the 6831/step census). N4b's fused
+  add_rms_norm covers only the RMSNorm class.
+- KERNELS: exact ir-chain semantics — fused: statistic and normed value
+  from the UNROUNDED fp32 sum (unlike rms_norm_add_dyn, which follows the
+  round-first eager chain), residual rounded once; epilogue
+  (x_hat32) * (float(w) + 1) rounded once, promote in-kernel so the host
+  passes the raw bf16 module weight.
+- ORACLE (gemma_norm_oracle.py, M in {1,2,3,4,7,8,64}, D 5120): ALL PASS —
+  deterministic 2/2; res_out BITWISE EXACT vs the ir chain at every shape
+  (round-once has no order freedom -> the residual stream carries zero
+  divergence); normed out 99.98-100% bit-equal, stragglers last-ulp
+  (reduction order), fp64 rel err ~3.9e-3 = bf16 scale.
+- GATE (gemmanorm_gate.sh; predictions held incl. the sha-roll class):
+  | leg | adaptive (UPDATE 28) | gemma-norm | delta |
+  | c1 x2       | 13.651/13.62 8c58a4c6 | 13.900/13.912 8c58a4c6 HELD 2/2 | +1.9% |
+  | c1 2500x64  | 3.229 f497f4a9        | 3.248/3.247 d0e07ddd ROLLED 2/2 | +0.6% |
+  | c4 x2       | 20.104                | 20.612/20.657                   | +2.6% |
+  | c8 x2       | 23.275/23.26          | 23.844/23.843                   | +2.5% |
+  DSV4 anchors ALL BIT-EXACT (12th consecutive, anchor_regate_gemmanorm/)
+  — DSV4 has no GemmaRMSNorm. c8 23.84 is ABOVE the old no-spec 23.74:
+  the adaptive canonical now beats no-spec at every measured workload
+  (c1 124.5% of the Q4_K bar, c4 123.9%, c8 136.9%). The c1 1000x256 sha
+  survived (that greedy stream crossed no tie); 2500x64 rolled
+  deterministically to d0e07ddd (coincidentally the old N2 sha value — a
+  tie-outcome coincidence, not a numeric reversion). c8 first-shas flap
+  by composition as established in UPDATE 28.
+- CALIBRATION LESSON (important for the roadmap): removing ~19% of all
+  per-step torch dispatches bought only ~2%. Host time is NOT
+  proportional to aten-op count — tiny view/cast ops are near-free and
+  the cost concentrates in the ~395 real encode events, per-layer Python,
+  and framework machinery. Fusion-by-fusion dispatch collapse has poor
+  marginal returns from here; STRUCTURAL levers re-rank up.
+- NEXT (re-ranked): (1) CPU time profile of EngineCore during c1-spec
+  decode (py-spy / Instruments attach — where do the ~115 ms/step of
+  host time actually go, by function), THEN choose between async-sched
+  overlap, Muse whole-step encode, and targeted Python fixes with real
+  cost data. Parked from the census stacks (lower priority now): mrope
+  torch-native at full-attn layers, metal_attn index_put_ KV updates,
+  ~80 MPSGraph unquantized linears (drafter + candidates).
+- Raw: perf/results/2026-08-21/{anchor_regate_gemmanorm, gemmanorm_gate}/;
+  scratchpad gemma_norm_oracle.py, gemmanorm_gate.sh,
+  metallib_build_gemmanorm.log, so_build_gemmanorm.log,
+  qwen_gemmanorm_boot.log. Box left SERVING the gated canonical
+  (BOX SERVING 11:37:24). OPS NOTE: the first gate launch was killed by a
+  background-task sweep ~30 s in (second occurrence of the UPDATE-25-era
+  failure mode); box verified clean by PID + wired pages and the relaunch
+  was start-verified (log markers + live server process) before waiting.
+
+### UPDATE 31 (2026-08-21) — postprocess_state MPS sync fix (the 67 ms/step queue drain): +3.3% c1 / +2.0% 2500x64 / +1.5% c4 / +0.7% c8, ALL shas bit-exact; c8 crosses 24
+
+- Status: retained (Python-only, vllm/v1/worker/gpu/model_states/
+  mamba_hybrid.py; qwen mamba-hybrid path only — DSV4 unaffected, no
+  anchor re-gate needed per protocol, no rebuild).
+- DISCOVERY (cProfile census, VLLM_QC_PYPROF=1 mode added to
+  metal_phaseprof.py): postprocess_state was 30.0 of 51.6 profiled
+  seconds — 67 ms/call, once per step, booked as SELF time because
+  slot-dispatched __getitem__/__setitem__ emit no cProfile c_call
+  events. Root cause: the MPS scatter used boolean-mask indexing
+  (idx_mapping[idx_mapping >= 0]) whose data-dependent shape forces a
+  host round trip that DRAINS THE ENTIRE IN-FLIGHT GPU QUEUE every
+  step. The sync-bracketed phase census (UPDATE 29) could not see it —
+  its own syncs emptied the queue first. This also explains the
+  no-spec/spec busy split (81% vs 46%): the no-spec path takes the
+  index_fill_ int branch (no mask, no sync); only spec passes a tensor.
+- FIX: num_accepted_tokens_gpu gains one trailing dump slot
+  [max_num_reqs + 1]; -1 sentinel rows scatter there via torch.where —
+  static shapes, zero syncs, identical values at every valid index
+  (readers all index by valid request ids; the dump slot is never read).
+- GATE (syncfix_gate.sh, no rebuild => qwen only):
+  | leg | gemma-norm (UPDATE 30) | sync fix | delta |
+  | c1 x2      | 13.900/13.912 8c58a4c6 | 14.341/14.361 8c58a4c6 BIT-EXACT | +3.3% |
+  | c1 2500x64 | 3.248/3.247 d0e07ddd   | 3.313/3.328 d0e07ddd BIT-EXACT   | +2.0% |
+  | c4 x2      | 20.612/20.657          | 20.951/20.955 (> old no-spec)    | +1.5% |
+  | c8 x2      | 23.844/23.843          | 24.019/24.016 (first > 24)       | +0.7% |
+- READING: the gain is real but far below the 67 ms — in SYNC scheduling
+  the engine must wait for sampled tokens at the end of every step
+  anyway, so the removed sync mostly RELOCATED the mandatory end-of-step
+  wait; only the true overlap headroom (~7 ms) was banked. Strict
+  CPU/GPU alternation is inherent to sync scheduling => async
+  scheduling re-ranked to the top (UPDATE 32).
+- Raw: perf/results/2026-08-21/syncfix_gate/ + muse_scoping/pyprof_*.
+
+### UPDATE 32 (2026-08-21) — async scheduling enabled for dflash on Metal (whitelist + VLLM_METAL_ASYNC_SCHED=1): +2.3% c4 / +2.1% c8, c1 flat, ALL shas bit-exact; PROMOTED into both qwen profiles
+
+- Status: retained + PROMOTED. Changes: vllm/config/vllm.py async
+  whitelist gains "dflash" in both branches (the V2 drafting flow is the
+  same count-only placeholder surface dspark uses; AsyncScheduler
+  placeholder sizing is dynamic-SD aware, which the batch-adaptive gate
+  already exercises); profiles.json canonical + twin env gains
+  VLLM_METAL_ASYNC_SCHED=1 (the metal.py opt-in existed since bring-up,
+  "not yet gate-proven").
+- GATE (async_gate.sh; boot log confirms "Asynchronous scheduling is
+  enabled"; ramp clean):
+  | leg | sync fix (UPDATE 31) | async | delta |
+  | c1 x2      | 14.341/14.361 8c58a4c6 | 14.252/14.269 8c58a4c6 BIT-EXACT | ~flat |
+  | c1 2500x64 | 3.313/3.328 d0e07ddd   | 3.297/3.300 d0e07ddd BIT-EXACT   | -0.7% |
+  | c4 x2      | 20.951/20.955          | 21.438/21.453                    | +2.3% |
+  | c8 x2      | 24.019/24.016          | 24.520/24.520                    | +2.1% |
+  Every sha BIT-EXACT — the async placeholder bookkeeping is correct
+  with dflash + adaptive K (a token change here would have been a real
+  bug, not an ulp roll).
+- READING: async pays where multiple requests give the scheduler real
+  work to overlap; at c1 the binding serializer is INSIDE the worker's
+  own step chain (c1 flat). The -0.7% long-prefill cost is consistent
+  and accepted for +2.1-2.3% at batch. PROMOTED: c4/c8 wins with c1
+  neutral.
+- CUMULATIVE (this session, promoted canonical): c1 11.06 -> 14.27
+  (+29%), c4 20.68 -> 21.45 (+3.7%), c8 23.74 -> 24.52 (+3.3%),
+  2500x64 2.98 -> 3.30 (+10.7%). vs Q4_K bar: c1 127.8%, c4 129.2%,
+  c8 140.8%.
+- NEXT: async-mode cProfile census to name the c1 in-worker serializer
+  (the postprocess drain is gone; something still serializes each step
+  — candidate: per-step blocking waits in the sampler/output path or
+  the GDN builder). Then N6 TurboQuant KV.
+- Raw: perf/results/2026-08-21/async_sched_gate/; scratchpad
+  async_gate.sh, qwen_async_boot.log.
+
+### UPDATE 33 (2026-08-21) — metal_attn sync-free metadata (lazy exact lens + bound-mode draft SDPA): 2500x64 +1.7%, c4 +0.7%, c8 +0.3%, c1 flat; spec c1 sha rolls (predicted)
+
+- Status: retained (Python-only, vllm/v1/attention/backends/metal_attn.py;
+  qwen dense-GQA path only — DSV4 uses MLA, untouched; no rebuild).
+- DISCOVERY (timed op census — per-stack seconds added to the
+  VLLM_QC_OP_CENSUS mode): ONE call site held 60.25 ms/step under async:
+  the DRAFT attn metadata build's eager `seq_lens.to("cpu")`
+  (metal_attn.py build, via _build_draft_attn_metadata) — a D2H that
+  drains the whole in-flight queue at propose time. Upstream already
+  deprecates eager seq_lens_cpu for exactly this ("avoid implicit H<>D
+  sync") with a lazy pattern; ours predates it.
+- CHANGE: MetalAttentionMetadata drops the eager CPU lens — lazy
+  `seq_lens_cpu` property + `seq_lens_cpu_max` (host bound from
+  CommonAttentionMetadata.seq_lens_cpu_upper_bound) + per-request
+  `seq_lens_cpu_bound`. PA256 routing and both paged max_context args use
+  the bound (safe: kernel reads exact GPU lens; sizing only). The
+  non-causal DRAFT SDPA (5 DFlash2 layers/step) runs BOUND MODE: gather
+  by the bound with one-block back-off, exact key visibility enforced by
+  a GPU mask from seq_lens_gpu — zero host syncs. Causal SDPA (target
+  prefill; bound rows precise there) keeps the exact path, lazily
+  materialized, loop byte-identical.
+- GATE (boundmode_gate.sh, async canonical):
+  | leg | async (UPDATE 32) | bound mode | delta |
+  | c1 x2      | 14.252/14.269 8c58a4c6 | 14.339/14.332 sha ROLLED 467b35c3 2/2 | ~flat |
+  | c1 2500x64 | 3.297/3.300 d0e07ddd   | 3.355/3.351 d0e07ddd HELD             | +1.7% |
+  | c4 x2      | 21.438/21.453          | 21.595/21.574                          | +0.7% |
+  | c8 x2      | 24.520/24.520          | 24.600/24.592                          | +0.3% |
+  The spec c1 roll was PREDICTED (draft SDPA now runs with an attn_mask
+  and extra masked keys — ulp-class shift in draft scores flips
+  occasional draft picks; acceptance-equivalent). 2500x64 banks the win
+  (prefill-heavy steps no longer pay the build sync).
+- READING: c1 decode flat AGAIN — the wait moved to the next
+  materialization point in the step chain. The sync-hunt loop continues
+  with the same tooling; each iteration is ~6 min.
+- NEXT: timed op census round 3 on the current code to name the next
+  c1-step blocker.
+- Raw: perf/results/2026-08-21/boundmode_gate/ + muse_scoping/
+  aopcensus_*. Canonical anchors now: c1 467b35c3, 2500x64 d0e07ddd.
+
+### UPDATE 34 (2026-08-21) — GDN builder sync-free index_select rewrite (the 71 ms/step mask-indexing drain): c1 +3.2% to 14.80, ALL shas bit-exact
+
+- Status: retained (Python-only, gdn_attn.py spec branch; qwen GDN path
+  only, no rebuild).
+- DISCOVERY (cProfile census round 3): with the metal_attn build sync
+  gone, the wait landed in gdn_attn.py build — 32.9 s self-time, 10
+  calls/step = 71 ms/step. Same MPS pathology as UPDATE 31: FIVE sites
+  index GPU tensors with the CPU boolean spec mask
+  (block_table_tensor[mask, :k+1] x2, [~mask, 0], query_lens[mask/~mask],
+  num_accepted_tokens[mask]) — data-dependent nonzero => host round trip
+  => full queue drain, every spec step.
+- FIX: index lists computed on CPU (free nonzero on the CPU mask),
+  async_tensor_h2d'd, and applied with index_select — same rows, same
+  order, static shapes, zero syncs. The [~mask, 0] site keeps
+  .contiguous() (metadata contract, UPDATE 28 fix). CPU-tensor mask
+  sites (query_lens_cpu, 2x) left as-is (free). Prefill-only
+  has_initial_state site noted for later.
+- GATE (gdnsync_gate.sh, async canonical):
+  | leg | bound mode (UPDATE 33) | gdn sync fix | delta |
+  | c1 x2      | 14.339/14.332 467b35c3 | 14.788/14.801 467b35c3 BIT-EXACT | +3.2% |
+  | c1 2500x64 | 3.355/3.351 d0e07ddd   | 3.371/3.378 d0e07ddd BIT-EXACT   | +0.5% |
+  | c4 x2      | 21.595/21.574          | 21.592/21.610                     | flat  |
+  | c8 x2      | 24.600/24.592          | 24.628/24.649                     | +0.2% |
+  c4/c8 flat as expected — the spec branch runs only when drafts exist
+  (batch-1 steps).
+- SYNC-HUNT LEDGER (UPDATEs 31-34, all against the MPS single-queue
+  drain pathology): postprocess boolean-mask scatter -> draft metadata
+  eager D2H -> GDN builder mask indexing. c1 13.65 -> 14.80 (+8.4%)
+  across the arc; part of each removed drain still relocates downstream
+  — census round 4 next.
+- CUMULATIVE vs the no-spec session start: c1 11.06 -> 14.80 (+33.8%),
+  c4 20.68 -> 21.61, c8 23.74 -> 24.65, 2500x64 2.98 -> 3.38 (+13.4%).
+  vs Q4_K bar: c1 132.5%, c4 130.1%, c8 141.5%.
+- Raw: perf/results/2026-08-21/gdnsync_gate/. Canonical anchors:
+  c1 467b35c3, 2500x64 d0e07ddd (both held through this gate).
+
+### UPDATE 35 (2026-08-21) — GDN repeat_interleave -> static segment-id (retained-NEUTRAL); sync-hunt PARKED
+
+- Status: retained (Python-only, gdn_attn.py spec branch, no rebuild).
+  Perf-NEUTRAL by the pre-set decision rule; kept because it is
+  bit-exact and strictly better structurally (one fewer queue drain).
+- DISCOVERY (census round 4): with the mask-indexing drains gone
+  (UPDATE 34), the wait relocated to the ~line-335 spec-token-mask
+  build: `torch.repeat_interleave(spec_sequence_masks, query_lens,
+  output_size=...)` with a GPU repeats tensor — data-dependent
+  execution even with output_size pinned, ~65 ms/step queue drain.
+- FIX: static-shape segment-id construction — `seg = zeros(total_tokens,
+  int64)`; scatter_add ones at `query_start_loc[1:-1]` (indices clamped
+  to total_tokens-1, values gated on `starts < total_tokens` so
+  duplicate/degenerate boundaries stay correct); `token_req =
+  seg.cumsum(0)`; `spec_token_masks = spec_sequence_masks.index_select
+  (0, token_req)`. CPU oracle passed incl. zero-length padded requests
+  ([4,4,4], [3,0,5], [1], [2,0,0,3], [0,4]). NOTE: plain `seg[starts]=1`
+  is WRONG with duplicate boundaries — scatter_add is load-bearing.
+- GATE (rilv_gate.sh, async canonical):
+  | leg | gdn index_select (UPDATE 34) | segment-id fix | delta |
+  | c1 x2      | 14.788/14.801 467b35c3 | 14.713/14.710 467b35c3 BIT-EXACT | flat (−0.6%) |
+  | c1 2500x64 | 3.371/3.378 d0e07ddd   | 3.374/3.380 d0e07ddd BIT-EXACT   | flat |
+  | c4 x2      | 21.592/21.610          | 21.562/21.524                     | flat |
+  | c8 x2      | 24.628/24.649          | 24.594/24.599                     | flat |
+  The 65 ms wait RELOCATED again (third consecutive relocation under
+  async: each removed drain banks only its overlap headroom; the last
+  drain in the chain absorbs the queue tail).
+- DECISION (rule pre-set before the gate): relocation with <2% gain =>
+  keep the fix, PARK the sync-hunt. Diminishing returns confirmed —
+  UPDATEs 31/34 each bought +3.2-3.3% c1, UPDATE 35 bought 0%. The
+  remaining known sites (gdn_attn has_initial_state prefill-only mask,
+  metal_attn target-prefill lazy materialization) stay parked with the
+  arc; a future census round should follow whatever N6/N7 exposes.
+- SYNC-HUNT ARC CLOSED (UPDATEs 31-35): c1 13.65 -> 14.80 (+8.4%),
+  c8 23.28 -> 24.65, all bit-exact or predicted-deterministic sha
+  rolls. Final canonical: c1 14.80 (132.5% of Q4_K bar) / c4 21.61 /
+  c8 24.65 (141.5%) / 2500x64 3.378. NEXT = N6 TurboQuant KV.
+- Raw: perf/results/2026-08-21/rilv_gate/. Box left SERVING the
+  canonical (health-verified 13:17:56).
+
+### UPDATE 36 (2026-08-21) — N6 TurboQuant KV gate 1 PASSED: composition validated after 4 fixes incl. TQ Metal GQA head-mapping kernel bug; TPS tax 6-13%, needle exact
+
+- Status: RETAINED (as validated experimental profile; canonical serving
+  default UNCHANGED = qwen38-nvfp4-1). Four root-caused fixes landed,
+  kernel parity PASSED, DSV4 anchors BIT-EXACT post-rebuild (13th
+  consecutive), TQ gate run 6 PASSED quality+determinism.
+- Goal: gate profile `qwen38-nvfp4-1-tq` (canonical + attention_backend
+  TURBOQUANT + kv_cache_dtype turboquant_k8v4). Gate = boot health,
+  planted-needle recall "739214" at ~4.5k-token multi-chunk prefill,
+  determinism 2/2 per leg, TPS vs canonical 14.80/21.61/24.65/3.378.
+- KEY DISCOVERY: the Metal TQ kernels were NEVER production-validated.
+  The "DSV4 drafter serves through TQ" precedent is a CUDA/ROCm-profile
+  fact; on Metal only `turboquant_encode_metal`/`turboquant_attention_metal`
+  are bound (no stage1/stage2/dequant symbols) and nothing exercised them.
+- Debugging ledger (each run named the next composition piece):
+  1. Run 1 BOOT FAIL (KV reshape): drafter inherited engine-global
+     turboquant_k8v4 (dflash/utils.py only swaps cache_config when the
+     drafter-scoped dtype is set) while its backend stayed metal_attn;
+     Attention.get_kv_cache_spec keys the TQ page layout purely off the
+     dtype string -> TQ-sized allocation vs metal_attn 5-dim view.
+  2. Run 2 BOOT FAIL (page unification): drafter pinned bf16 -> its
+     4096 B/token page cannot pad into the TQ-aligned max page because
+     metal_attn does not index KV by block stride. In bf16 target(4x256)
+     and drafter(8x128) both cost 4096 B/token — coincidence that hid
+     this class. FIX: drafter on TQ too (DSV4-precedent, both fields in
+     `speculative_overrides`); both quanta become 1728 B/token
+     (4x432 hs256 / 8x216 hs128) and TQ pads by block stride.
+  3. Run 3 CRASH on first request: native encode rejects non-contiguous
+     V (check_mps fires before the wrapper's own .contiguous() — dead
+     defensive code). K is fresh after QK-norm/RoPE; V arrives as a
+     strided slice of the fused QKV projection. FIX: .contiguous()
+     guards in _store_kv Metal branch (Python-only).
+  4. Run 4 CRASH on multi-chunk prefill: _continuation_prefill calls
+     quixicore_ops.turboquant_dequant_kv — symbol absent from the Metal
+     .so (CUDA/ROCm-only binding). FIX: Metal routes ALL continuation
+     sizes through the synthetic-decode path (numerically equivalent;
+     the >128-token dequant+flash route is a CUDA throughput
+     optimization) + skip reserving the unreachable dequant workspace
+     (~134 MB/engine).
+  5. Run 5 COMPLETED but QUALITY FAIL: needle answered incoherent
+     "1144114"; c1 7.076/7.076 d692dc17 (2/2 deterministic, -52%),
+     2500x64 2.269/2.266 a54be856 (2/2, -33%), c4 19.67 (-9%),
+     c8 23.23/23.24 ee342fff (-5.7%). Spec-off legs (c4/c8, adaptive
+     spec disables drafting at batch>=2) showed only single-digit
+     overhead -> decode numerics wrong, not throughput.
+- ROOT CAUSE (kernel): `tq_attention_combined` mapped q-head->kv-head as
+  `head % num_kv_heads`; vLLM's GQA convention is `head / (Hq/Hkv)`
+  (consecutive q heads share a kv head). Every non-coincident q head
+  attended against the wrong KV head — garbled target logits (needle
+  babble) and garbled drafts (acceptance collapse -> c1 below the 11.06
+  no-spec floor). Bisection: ctx=1 probe (out == dequant(v0)) failed
+  with per-head-random V but PASSED with head-identical V (cos 0.996);
+  head-probe table showed q_h -> kv (h % nkv) exactly.
+  Manual byte-decode of the combined slot ([K|V|Ks|Vs|Kzp], 216 B hs128
+  / 432 B hs256) had already cleared the V codec (cos 0.996,
+  little-endian nibbles, per-32 fp16 RMS scales, signs=1 FWHT).
+- FIX: turboquant.metal `kvh = head / (num_heads / num_kv_heads)`
+  (one line; MHA group=1 unaffected). Metallib rebuilt 14:07.
+- PARITY (post-fix, encode->attention vs fp16 SDPA on raw K/V):
+  hs128 kv8 q32 ctx300 cos 0.99557; hs256 kv4 q24 ctx300 cos 0.99552;
+  hs256 ctx2500 cos 0.99559; hs64 kv8 q8 cos 0.99507; ctx1 cos 0.99539
+  — pure k8v4 quantization envelope at every head size. Harness:
+  scratchpad/tq_parity.py (session 04ba9b90).
+- Protocol: metallib rebuild -> DSV4 anchor re-gate (pins 573db39598e7 /
+  bb83cc3054a3 / f75e1d41ac3d, expected BIT-EXACT — DSV4 dispatches no
+  tq_attention_combined) chained into TQ gate run 6
+  (scratchpad/regate_then_tq.sh).
+- DSV4 ANCHOR RE-GATE: all three pins BIT-EXACT at 14:19 (13th
+  consecutive). The TQ kernel fix is provably isolated from the DSV4
+  serving path.
+- RUN 6 RESULTS (GQA-fixed kernels, first valid numbers for the
+  composition; canonical = 14.80 / 21.61 / 24.65 / 3.378):
+
+  | leg | TQ run1/run2 | sha | canonical | delta |
+  |-----|--------------|-----|-----------|-------|
+  | needle @4.5k multi-chunk | PASS exact "739214" | — | — | quality PASS |
+  | c1 1000x256 | 13.120 / 13.106 | 0c92d6e3 2/2 | 14.80 | -11.3% |
+  | c1 2500x64 | 2.926 / 2.921 | 4494d8e6 2/2 | 3.378 | -13.4% |
+  | c4 1000x256 | 19.725 / 19.737 | 0c92d6e3 2/2 | 21.61 | -8.7% |
+  | c8 1000x256 | 23.167 / 23.172 | (TPS gate) | 24.65 | -6.0% |
+
+  Ramp time 39 s = identical to canonical (run 5's broken-draft ramp
+  was 99 s) — acceptance recovered with the head-mapping fix.
+- READING: the tax concentrates where the Metal synthetic-decode
+  continuation path runs (2500x64 -13.4%; the [B, width] slots matrix
+  is O(q_len x max_ctx) index math per layer) and where spec decode
+  leans on TQ reads (c1 -11.3%); spec-off legs show the raw decode
+  overhead (c4 -8.7%, c8 -6.0%). As predicted in the gate header, N6's
+  payoff is NOT short-ctx TPS: k8v4 compresses full-attn KV 4096 ->
+  1728 B/token (~2.4x) on the 16 full-attn layers (drafter also 2.4x),
+  which pays at long context / larger admission under the fixed 16 GiB
+  KV budget.
+- CAPACITY (boot-log kv_cache_utils, same 16 GiB budget): canonical
+  158,038 KV tokens (4.82x concurrency at 32k) vs TQ 292,882 tokens
+  (8.94x) — 1.85x KV capacity. This is the measured N6 payoff.
+- DECISION: qwen38-nvfp4-1-tq RETAINED as a validated, quality-gated
+  experimental profile. Canonical serving default UNCHANGED
+  (qwen38-nvfp4-1 — TPS still rules at 32k ctx). Next N6 step if
+  pursued: long-context legs (e.g. 16k+ input) and max-admission
+  sizing where the 2.4x KV compression should flip the comparison;
+  candidate perf lever: native TQ dequant kernel (or slots-matrix-free
+  continuation) to close the 2500x64 gap. TQ shas 0c92d6e3/4494d8e6
+  are profile-local pins, NOT canonical anchors.
+- Files: slimserve/profiles.json (qwen38-nvfp4-1-tq + speculative_overrides),
+  vllm/v1/attention/backends/turboquant_attn.py (contiguity guards,
+  Metal continuation routing, workspace skip),
+  csrc/quixicore/metal/kernels/quantization/turboquant/turboquant.metal
+  (GQA fix; PENDING QuixiCore-Metal twin port with the qgemv/rms_norm
+  batch), vllm/quixicore_metal.metallib (rebuilt 14:07).
+- Raw: perf/results/2026-08-21/{tq_gate, anchor_regate_tqfix}/.
+  Box left SERVING canonical (health-verified 14:33:43).
+
+### UPDATE 37 (2026-08-21) — N7 decommission gate: qwen38-1 GGUF profile retired; NVFP4 is the sole Qwen3.8 serving line
+
+- Status: DONE (registry retirement; no kernel or serving-path changes).
+- Criteria (all met before retiring):
+  1. Throughput: canonical qwen38-nvfp4-1 beats the Q4_K bar on every
+     leg — c1 14.80/11.168 = 132.5%, c4 21.61/16.60 = 130.1%,
+     c8 24.65/17.42 = 141.5%, 2500x64 3.378/3.270 = 103.3%.
+  2. Quality: planted-needle recall "739214" EXACT on the live
+     canonical server at 4.5k-token multi-chunk prefill (14:38,
+     perf/results/2026-08-21/tq_gate/needle_canonical_response.json);
+     canonical shas deterministic across today's gates (467b35c3 /
+     d0e07ddd, UPDATEs 34-35).
+  3. Greedy-parity heritage: the GGUF bring-up's llama.cpp parity and
+     the campaign's bit-exactness discipline (13 consecutive DSV4
+     anchor gates) stand as the correctness lineage.
+- Action: removed profile `qwen38-1` and source `qwen38-27b` (GGUF
+  Q4_K_M/Q8_0 + mmproj + MTP-drafter entries) from
+  slimserve/profiles.json. Zero dangling references (grep clean);
+  canonical dry-run resolves. Remaining qwen38 line: qwen38-nvfp4-1
+  (canonical) + -df2 (historical id) + -tq (validated experimental).
+- Per boss directive: q4_K kernels STAY in the shared QuixiCore-Metal
+  library (other GGUF models use them); the retired profile's local
+  GGUF files on disk are untouched (user's cache, reversible via git
+  for the registry).
+- The Q4_K bar rows in perf/baseline_status.md remain as the
+  historical baseline record.
+- Remaining N7 tail (future): 262k/1M context sizing — now informed by
+  UPDATE 36's TQ capacity data (TQ 292,882 KV tokens vs canonical
+  158,038 under the 16 GiB budget; canonical bf16 KV cannot hold even
+  one 262k request, TQ can).
+
+### UPDATE 38 (2026-08-21) — N8 262k long-ctx sizing, phase 1: admission PASSES, prefill BLOCKED by synthetic-decode continuation; verdict = build the Metal dequant route
+
+- Status: measured partial; long-ctx line gated on the dequant kernel
+  (UPDATE 39 target). No serving-path change in this update.
+- Setup: qwen38-nvfp4-1-tq booted with `--ctx 262144` (cli.py --ctx
+  replaces max_model_len on the plan; model native
+  max_position_embeddings = 262144, no rope scaling — in-spec). Boot
+  healthy 14:57:20; needle payloads server-tokenizer-calibrated at
+  15,764 / 64,500 / 129,651 / 259,884 prompt tokens (distinct planted
+  codes per depth, 40% depth). Raw:
+  perf/results/2026-08-21/tq_longctx/.
+- Admission RESULT (the N8 headline half): 262k max_model_len boots and
+  admits — TQ capacity 292,882 KV tokens >= 262,144. Canonical bf16
+  (158,038) cannot admit one such request. PASS.
+- Prefill RESULT: 16k leg wall = 406 s for a 15,764-token prefill +32
+  decode (~39 tok/s effective; interval logger credits the whole prompt
+  on completion, so interval logs show nothing during the prefill —
+  diagnostics-only confirmation, wall time is the datum). The needle
+  check itself was inconclusive: max_tokens 32 was consumed by the
+  <think> preamble (harness bug, fixed for the rerun via a pre-closed
+  think block + max_tokens 200). Legs 65k+ were aborted as pointless at
+  this rate.
+- Cost model (calibrated on the 2500-prefill ~17 s estimate from the
+  UPDATE 36 2500x64 leg + this 406 s point):
+  T(C) ~= a*C + b*C^2 with a ~= 6.8 ms/token (GDN+MLP+encode, chunked)
+  and b ~= 2.3e-6 s/token^2. Extrapolation: 65k ~= 86 min, 131k ~= 5.6 h,
+  262k ~= 22 h. Long-context prefill is BLOCKED on the quadratic term.
+- Root cause (read, not guessed): Metal routes ALL continuation chunks
+  through the synthetic-decode path (turboquant_attn.py: `q_len <=
+  _CONTINUATION_DECODE_THRESHOLD or _is_metal_platform()` — the run-4
+  interim fix, because the CUDA `turboquant_dequant_kv` symbol has no
+  Metal twin). Each of the chunk's 2048 rows re-streams its entire
+  cached KV per layer, and each of the 24 q-heads re-reads its kv-head's
+  432 B/token independently (6x redundant per GQA group, no row tiling):
+  ~21 TB of KV traffic for a 16k prefill. The tq_attention_combined
+  kernel loop is visible-bound (`for j < len`), so the block-table width
+  is NOT the driver; the redundancy is structural to decode-as-prefill.
+- Decision: port the CUDA continuation design (dequant cached KV once
+  per chunk + dense attention) to Metal — `_continuation_prefill` in
+  turboquant_attn.py already implements the host path incl. the
+  key_fp8 no-rotation case and an SDPA fallback; the split-layout
+  `tq_decode` kernel in turboquant.metal already implements the exact
+  K/V decode math ((kq+kz)*ks; inverse_fwht(centroids[vi]*vs)). Missing
+  pieces: (1) `tq_decode_combined` kernel (combined-slot layout, writes
+  (1,Hk,alloc,D) fp16 like CUDA), (2) tk_launch launcher + .mm binding
+  `turboquant_dequant_kv_metal` + ops.py wrapper, (3) Python dispatch:
+  restore the >128 threshold on Metal, Metal branch in
+  _continuation_prefill, re-enable the continuation workspace reserve
+  skipped in run 4, KV-tiled online-softmax attention for the masked
+  long-ctx case (a 2048 x 262k bool mask / materialized scores would be
+  0.5-26 GB per call if MPS SDPA composites). Expected side effect:
+  closes part of the 2500x64 TQ gap (-13.4%), since short-ctx
+  continuations pay the same redundancy.
+- Predictions for UPDATE 39 (in advance): dequant parity within quant
+  tolerance vs encode round-trip; short-ctx TQ shas ROLL (attention op
+  order changes vs synthetic-decode; determinism 2/2 still required);
+  2500x64 improves toward canonical; 16k prefill drops from 406 s to
+  <120 s (linear term + GEMM-bound attention); 262k prefill lands in
+  tens of minutes, not hours.
+
+### UPDATE 39 (2026-08-21) — N8 Metal TQ dequant continuation route RETAINED: 262k needle EXACT end-to-end; 2500x64 gap -13.4% -> -3.0% (canonical sha); c1 pin bit-exact
+
+- Status: RETAINED on the -tq profile path. Chain run 15:26-17:37,
+  scratchpad 04ba9b90 dequant_chain.sh; raw:
+  perf/results/2026-08-21/{anchor_regate_dequant, tq_dequant_gate,
+  tq_longctx2}/.
+- Change set (per UPDATE 38's decision, all worktree-uncommitted):
+  `tq_decode_combined` kernel (turboquant.metal; combined-slot dequant,
+  decode math identical to tq_attention_combined; 12 instantiations) +
+  `launch_tq_decode_combined` (tk_launch.h) + `turboquant_dequant_kv_metal`
+  (qc_metal_serving.mm + ops.py). turboquant_attn.py: >128 continuation
+  threshold restored on Metal (synthetic-decode stays for small chunks);
+  Metal `_continuation_prefill` branch builds a 1-D slot list from the
+  block table (no (q_len, ctx) slots matrix); CUDA Pi inverse-rotation
+  guarded off on Metal (Metal K is quantized unrotated);
+  `_metal_tiled_continuation_attention` = KV-tiled fp32 online softmax
+  (tile 4096) for seq_len > 8192 where masked SDPA would materialize
+  0.5-26 GB per layer call; continuation workspace reserve re-enabled on
+  Metal (fp16 dequant buffers, ~2 GB at 262k). metallib 13,094,352 B;
+  .so 937,600 B.
+- Kernel parity (tq_dequant_parity.py, hs256/hs128, three geometries):
+  dequant K cos 0.99998 (8-bit asym error), V cos 0.9955 (exactly the
+  known 4-bit FWHT/Lloyd-Max error from UPDATE 36 parity — decode is
+  exact); tiled-vs-SDPA on identical KV cos 0.99999 (fp16 rounding only);
+  vs raw-KV oracle cos 0.996. Also settled empirically: the Metal codec
+  convention is sqrt(D)-scaled centroids on BOTH encode and decode.
+- DSV4 anchor re-gate: all three pins BIT-EXACT, 14th consecutive
+  (8tok 573db39598e7 / off1-2000 bb83cc3054a3 / 2500x64 f75e1d41ac3d).
+- TQ short-ctx re-gate (vs UPDATE 36 / canonical):
+  needle "739214" EXACT at 4.5k multi-chunk;
+  c1 1000x256 13.078/13.082 sha 0c92d6e3 BIT-EXACT vs the UPDATE 36 pin
+  (predicted: that leg has no continuation chunk — proves the change is
+  isolated to the continuation path);
+  2500x64 3.278/3.268 sha d0e07ddd 2/2 — the CANONICAL sha: dequant+SDPA
+  mirrors canonical's op order so greedy argmax matches token-for-token;
+  gap -13.4% -> -3.0%;
+  c4 20.055/20.058 sha 0c92d6e3 2/2, gap -8.7% -> -7.2%;
+  c8 24.133/24.146 (TPS gate; shas roll with batch mix), gap -6.0% ->
+  -2.1%.
+- 262k ladder (--ctx 262144, needle at 40% depth, distinct code per leg,
+  pre-closed <think> + max_tokens 200; temperature 0):
+  16k = 111 s PASS (was 406 s synthetic-decode = 3.7x),
+  65k = 577 s PASS, 131k = 1492 s PASS, 262k = 4493 s PASS at 259,888
+  prompt tokens. Cost model fit: T(C) ~= 6.4e-3*C + 3.9e-8*C^2 (all four
+  points within ~5%; 131k predicted 1489 vs 1492 measured). Quadratic
+  constant is 59x smaller than the synthetic-decode route's 2.3e-6;
+  remaining quadratic = irreducible exact-attention GEMM flops + per-chunk
+  re-dequant (both O(C^2)).
+- N8 HEADLINE: qwen38-nvfp4-1-tq serves a 262k-token request with exact
+  needle recall in 75 min prefill; canonical bf16 (158,038 KV tokens)
+  cannot admit it at all. TQ capacity 292,882 tokens (1.85x).
+- 1M note: not reachable at 16 GiB KV (needs ~36,288 B/token * 1M ~= 36
+  GiB for target+drafter full-attn KV) — would need kv_cache_memory_bytes
+  raised to ~40 GiB (box has headroom) AND ~2.5 h+ prefill at the fitted
+  quadratic, AND the model's native max_position_embeddings is 262144
+  (1M would require rope scaling = out of checkpoint spec). Parked.
+- Decision: dequant route RETAINED (strictly dominates: quality equal or
+  closer to canonical, TPS better on every continuation leg, long-ctx
+  unlocked). Canonical default STILL unchanged at 32k (c1 -11.6% tax
+  remains — decode-side TQ read, not continuation). Profile notes to be
+  refreshed. PENDING: twin-port turboquant.metal + tk_launch.h additions
+  to QuixiCore-Metal with the qgemv/rms_norm batch (commit-gated).
+
+### UPDATE 40 (2026-08-21) — #16b resolved: split-K TQ decode attention (tq_attention_splitk + tq_attention_reduce) — kernel 12-33x, TQ decode now FASTER than canonical bf16 PA256 at every shape
+
+- Status: retained.
+- Baseline (UPDATE 39 / N8): -tq c1 13.08 sha 0c92d6e3 (-11.6% vs
+  canonical 14.80), 2500x64 3.27 sha d0e07ddd (-3.0%), c4 20.06
+  (-7.2%), c8 24.13 (-2.1%). Canonical unchanged (c1 14.80 sha
+  467b35c3 / c4 21.61 / c8 24.65 / 2500x64 3.378).
+- #16b evaluation (the queue item): bench tq256_bench.py at the
+  serving geometry (24q/4kv/D256, block 800, k8v4 slot 432), clean
+  box, lat+thr modes, raw in perf/results/2026-08-21/tq_splitk_bench/.
+  VERDICT on #16b as posed (tq_attention_combined_hs256 replacing the
+  PA256/SDPA head-256 route): REJECTED — the monolithic TQ kernel is
+  12-19x SLOWER than PA256 (ctx1000 b1: 1.51 vs 0.13 ms thr; ctx32k
+  b1: 50.7 vs 2.70). But the eval found the entire remaining -11.6%
+  c1 TQ tax: at the c1 spec-verify shape (ctx~1000, B=4 expanded,
+  x16 layers) the old route costs 29.0 ms/step vs canonical's 9.7 —
+  ~19 ms/step of the ~23 ms/step gap.
+- ROOT CAUSE (kernel): tq_attention_combined runs ONE threadgroup per
+  (q-head, batch) — 24 TGs at b1 on a 64-core GPU — with a serial
+  token loop carrying TWO threadgroup barriers per token (cross-simd
+  score reduction through threadgroup memory). Occupancy-bound proof:
+  b4 costs the same as b1 (4x work, same time); effective KV
+  bandwidth ~7 GB/s. Host slots-matrix build and block-table width
+  exonerated (tqroute ~= tqk ~= tqwide) — the N8-era "slots-matrix-
+  free continuation" lever was mis-aimed at a minor cost.
+- CHANGE (same treatment PA256 got in UPDATE 20, plus one better
+  idea): new kernel pair in turboquant.metal —
+  - tq_attention_splitk: grid (H, B, P) partitions like paged_attn_v2;
+    within a TG, one SIMDGROUP per token (lane covers HEAD_SIZE/32
+    elements, aligned runs never straddle a scale group), so the
+    256-wide dot is a single simd_sum and the token loop has ZERO
+    threadgroup barriers. V accumulates in the FWHT domain per
+    simdgroup; one staged online-softmax merge across the NSG
+    simdgroups at the end; partials land in tmp/ml/es (B,H,P[,HS])
+    f32. Reads the BLOCK TABLE directly — the per-layer B x width
+    slots-matrix build (8 host graph ops/layer) disappears.
+  - tq_attention_reduce: merges P partials (es==0 partitions skipped),
+    folds the sink, normalizes, runs the single inverse FWHT.
+  - Host: turboquant_attention_splitk_metal (qc_metal_serving.mm)
+    sized like the PA256 D=256 branch (occupancy target 1536 via
+    VLLM_QC_TQ_SPLITK_TARGET, P = min(ceil(target/(B*H)), 64), one
+    serial-dispatch encoder, ring_out tq_sk_* buffers) + new
+    max_context arg (host batch max, no device sync).
+  - Routing (turboquant_native.py): Metal + head_size==256 +
+    sliding_window<=0 only, behind VLLM_QC_TQ_SPLITK (default on,
+    =0 -> monolithic null path). hs64/128 (DSV4 drafter geometry)
+    stays on the monolithic kernel BY CONSTRUCTION so the DSV4
+    anchors keep their bit-exact pins. max_context plumbed from
+    attn_metadata.seq_lens_cpu at _decode_attention and
+    _uniform_query_attention (the spec-verify hot path), and from
+    host-int seq_len at the synthetic-decode continuation site.
+- Kernel parity (tq_splitk_parity.py, 10 cases): splitk vs monolithic
+  rel 1e-9..3e-6 (worst 2.4e-4 max|err| on many-small-blocks — fp
+  summation order only), vs fp32 SDPA on raw KV min-cos 0.9954-0.9958
+  = the known k8v4 quant floor, unchanged. Covers ragged batches
+  [1000,337,1,995], ctx=1, ctx=5 (empty trailing simdgroups), 48-token
+  blocks, finite sinks, max_context 0/exact/over-bound, hs128 (E=4)
+  and hs256 (E=8). ALL PASS.
+- Clean-box microbench (thr mode, ms/call):
+  | shape | pa256 | tqk (old) | tqsk (new) | new vs old | new vs pa256 |
+  | ctx1000 b1 | 0.132 | 1.514 | 0.122 | 12.4x | 1.08x faster |
+  | ctx1000 b4 | 0.380 | 1.422 | 0.229 | 6.2x | 1.66x faster |
+  | ctx2500 b4 | 0.902 | 3.670 | 0.504 | 7.3x | 1.79x faster |
+  | ctx8192 b4 | 3.796 | 11.94 | 1.546 | 7.7x | 2.46x faster |
+  | ctx32k b1 | 2.744 | 49.20 | 1.539 | 32.0x | 1.78x faster |
+  | ctx32k b4 | 12.38 | 54.02 | 6.146 | 8.8x | 2.01x faster |
+  Effective KV bandwidth ~7 -> ~220 GB/s. TQ reads 432 B/token vs
+  bf16's 1024 — the -tq profile's decode attention is now ~2x FASTER
+  than canonical at long context. max_context sizing pays at short
+  ctx (tqsk 0.229 vs tqsk_w0 0.387 at ctx1000 b4).
+- Predictions (in advance): DSV4 anchors BIT-EXACT (15th consecutive;
+  splitk gated to hs256, MLA untouched). -tq c1 sha ROLLS off
+  0c92d6e3 (summation order), det 2/2 required; c1 TPS 13.08 ->
+  ~14.3+ (recovering ~19-20 ms/step); 2500x64 toward/past canonical
+  3.378; c4/c8 up; 4.5k needle 739214 EXACT; new 2100x32 tail leg
+  (52-token continuation chunk -> synthetic-decode via splitk) det
+  2/2; 16k needle EXACT at the 262k config, wall ~111 s class.
+- DSV4 anchors (metallib + .so rebuilt): re-gated ALL BIT-EXACT
+  (anchor_regate_tqsk/: 8tok 573db39598e7, off1-2000 bb83cc3054a3,
+  2500x64 f75e1d41ac3d) — 15th consecutive, exactly as predicted
+  (splitk routing scoped to hs256; MLA and the hs64/128 TQ drafter
+  never dispatch it).
+- Serving gate (tq_splitk_gate/, one ramped boot, exact-token):
+  - 4.5k needle 739214 EXACT (multi-chunk prefill + splitk decode).
+  - c1 1000x256: 14.688/14.685 sha 228d0bf4 2/2 (rolled off 0c92d6e3
+    as predicted IN ADVANCE; deterministic). +12.3% over UPDATE 39's
+    13.08 — the -11.6% TQ decode tax is now -0.8% vs canonical 14.80.
+  - 2500x64: 3.459/3.448 sha d0e07ddd 2/2 — the CANONICAL sha HELD
+    (64 decode steps stayed token-identical to canonical greedy; the
+    summation-order drift never crossed an argmax boundary). TPS is
+    now ABOVE canonical: 3.45 vs 3.378 (+2.1%).
+  - NEW tail leg 2100x32 (2048+52 chunking -> 52-token continuation
+    chunk -> synthetic-decode through splitk): 2.174/2.171 sha
+    1337d2f7 2/2 (fresh profile-local pin).
+  - c4 1000x256: 22.106/22.082 — +10.1% over 20.06, +2.2% ABOVE
+    canonical 21.61 (shas 7ea83dc2/d367d85b — c4/c8 stay TPS gates,
+    composition-sensitive tie-carriers as established).
+  - c8 1000x256: 25.136/25.160 sha 3edadb98 — +4.2% over 24.13,
+    +2.0% ABOVE canonical 24.65.
+  - 16k needle at the 262k config (--ctx 262144 boot): PASS EXACT,
+    wall 110 s at 15,768 prompt tokens — the same class as UPDATE
+    39's 111 s (prefill route unchanged; decode side faster).
+- Decision: RETAINED. The -tq profile now BEATS canonical on 3 of 4
+  legs (2500x64 +2.1%, c4 +2.2%, c8 +2.0%) and trails c1 by 0.8%,
+  with 2.4x smaller KV and 292,882-token capacity. FLAG: canonical-
+  default flip to -tq is now a live decision — needle-exact quality
+  everywhere measured, but k8v4 KV is still lossy (cos 0.9955 floor)
+  vs bf16; leaving the default to an explicit quality call rather
+  than flipping on TPS alone.
+- Raw: perf/results/2026-08-21/tq_splitk_bench/ (pre/post bench +
+  parity), tq_splitk_gate/, tq_splitk_longctx/, anchor_regate_tqsk/;
+  scripts tq256_bench.py, tq_splitk_parity.py, splitk_chain.sh
+  (session-04ba9b90 scratchpad); build logs in the a99b scratchpad
+  recipes (metallib 13,327,040 B; .so 960,272 B).
+
+### UPDATE 41 (2026-08-24) — N9: the mrope repeat_interleave queue-drain (65.8 ms/step) — static-shape token->request map in _metal_prepare_rope_positions
+
+- Status: retained.
+- Baseline (UPDATE 40): canonical c1 14.80 sha 467b35c3 / c4 21.61 /
+  c8 24.65 / 2500x64 3.378 sha d0e07ddd; -tq c1 14.69 sha 228d0bf4 /
+  c4 22.11 / c8 25.15 / 2500x64 3.45 sha d0e07ddd.
+- Investigation chain (all raw in perf/results/2026-08-24/ + session
+  scratchpad):
+  1. Live-box xctrace (gdn_c1_2.trace, 8 s during steady c1 spec
+     decode on the CURRENT build): GPU compute 74.9% busy over the
+     covered 3.53 s; the idle is 33 contiguous ~21.3 ms gaps — ONE
+     PER STEP — plus 5% in 12.5 us median micro-bubbles. Host
+     application-intervals during the gaps: fully covered by
+     'Encoding'/'Encode MPSGraph' events — the GPU starves while the
+     host is still ENCODING the next work (~620 Metal encodes/step:
+     ~357 MPSGraph + ~265 custom-kernel).
+  2. FALSE LEAD KILLED BY PROBE: the 2026-08-21 11:42 pyprof census
+     showed mamba_hybrid postprocess_state at 67 ms/step in-frame
+     (STORE_SUBSCR is invisible to cProfile call events). A pptime
+     statement-timer boot on the CURRENT build measured it at
+     0.055 ms/step — the census predates the async-sched promotion
+     and its boot lacked VLLM_METAL_ASYNC_SCHED=1. Lesson: census
+     artifacts are only valid against the build+env they profiled;
+     re-census before designing a fix. (VLLM_QC_PPTIME diagnostic
+     left in mamba_hybrid.py, env-dead.)
+  3. Fresh census (pyprof2, canonical env + VLLM_QC_PYPROF=1, 608
+     steps): torch.repeat_interleave = 39.93 s tottime = 65.8 ms/step
+     = 64% of the whole 62.45 s profile, called once per step from
+     _metal_prepare_rope_positions (metal_compat.py) — the N1 torch
+     replacement for RopeState's Triton mrope positions kernel.
+     repeat_interleave with tensor counts has a data-dependent output
+     shape; torch-MPS resolves it with a host round trip that DRAINS
+     THE WHOLE IN-FLIGHT QUEUE — the exact bug class gdn_attn.py
+     already fixed ("65 ms/step measured") with the
+     scatter-ones+cumsum static-shape map. After the drain the queue
+     is empty and the host must re-encode from scratch = the 21 ms
+     GPU-idle gap. Next-largest host entries are an order of
+     magnitude down (arange 4.8 ms/step over 65 calls, index_select
+     2.6, drafter SDPA 2.3) and all static-shape.
+- CHANGE (metal_compat.py, python-only, no metallib/.so rebuild):
+  - _metal_prepare_rope_positions gains num_tokens (host int); when
+    supplied, the token->request map is built with static shapes:
+    seg = zeros(num_tokens); scatter_add_ ones at inner request
+    starts (clamped, masked; duplicates accumulate so zero-length
+    requests are skipped exactly like repeat_interleave's
+    zero-repeat); req_of_tok = seg.cumsum(0). None falls back to the
+    original dynamic path.
+  - New _metal_prepare_model_inputs patch re-points
+    DefaultModelState.prepare_inputs to pass
+    num_tokens=input_batch.num_tokens (host-known, no sync); the
+    rope_state-None early return (DSV4, every non-mrope model) is
+    behavior-identical.
+- Oracle: 200/200 random ragged cases (zero-count requests forced,
+  nonzero starts[0]) — static-shape map EQUAL to repeat_interleave
+  on MPS.
+- Predictions (in advance): position VALUES identical -> ALL shas
+  BIT-EXACT (canonical c1 467b35c3, 2500x64 d0e07ddd; -tq c1
+  228d0bf4); c1 TPS +15-25% (gap collapse; step ~107 -> ~85 ms
+  class); c4/c8 up as well (the drain is per-step); -tq needle
+  exact; DSV4 8tok anchor bit-exact (prudence leg only — python
+  change with unchanged None path, no binary rebuild).
+- Serving gate (rope_gate/, chain rope_gate2.sh — the first chain
+  burned on the swept scratchpad, see UPDATE 42):
+  - Phase 0 VALIDATION (VLLM_QC_ROPE_STATIC=0 null boot + the
+    RECONSTRUCTED m2_source.txt): c1 14.719 sha 467b35c3 BIT-EXACT,
+    2500x64 3.382 sha d0e07ddd BIT-EXACT — certifies the
+    reconstructed source bytes AND the null path in one boot.
+  - Phase 1 (fix ON): c1 16.139/16.138 sha 467b35c3 BIT-EXACT 2/2 —
+    +9.6% (14.72 -> 16.14, new campaign c1 record, 144.5% of the
+    Q4_K bar); 2500x64 3.454/3.447 sha d0e07ddd BIT-EXACT 2/2
+    (+2.1%); c4 23.126/23.187 (+7.2% over 21.61); c8 25.613/25.619
+    (+3.9% over 24.65). Both sha predictions held: pure
+    shape-derivation change, zero value drift.
+  - Phase 2 (-tq): needle 739214 EXACT; c1 16.094/16.077 sha
+    228d0bf4 BIT-EXACT 2/2 — +9.6% (14.69 -> 16.08), now -0.3% vs
+    canonical c1. (-tq c4/c8/2500x64 not re-run this chain; the
+    UPDATE 40 pre-rope numbers 22.11/25.15/3.45 should track the
+    same per-step gain but are NOT yet re-measured.)
+  - Phase 3: DSV4 8tok anchor 573db39598e7 BIT-EXACT with the
+    recovered driver (rope_state None path unchanged; python-only
+    change, no binary rebuild).
+- New canonical baseline: c1 16.139 sha 467b35c3 (144.5% of the
+  Q4_K bar 11.168) / c4 23.16 (139.5%) / c8 25.62 (147.1%) /
+  2500x64 3.45 sha d0e07ddd. Session c1 arc: 7.02 (N2) -> 16.14
+  (+130% cumulative).
+- Decision: RETAINED. Kill-switch VLLM_QC_ROPE_STATIC=0 restores the
+  dynamic path (validated: reproduces the old pins bit-exact).
+  Remaining step structure per the trace: ~80 ms GPU + residual
+  encode burst; next levers = encode-volume reduction (steady-cache
+  metadata for the mamba-hybrid path — the gdn builder still runs
+  ~30 ops x 10 calls/step — and the drafter's MPSGraph linears),
+  then Muse single-CB.
+- Raw: perf/results/2026-08-24/{rope_gate, anchor_leg_rope}/;
+  gdn_c1_2.trace + interval XMLs, pyprof2_post.txt, pptime probe
+  logs, rope_gate.sh (session-04ba9b90 scratchpad).
+
+### UPDATE 42 (2026-08-24) — OPS: tmp cleaner destroyed the harness assets mid-gate; all four recovered byte-exact; stable home perf/results/harness_assets/
+
+- Status: recovered; process fix adopted.
+- Incident: the first rope-fix gate chain failed all legs with
+  FileNotFoundError — the macOS tmp cleaner had swept the a99b session
+  scratchpad (files removed by atime, dirs kept) some time after
+  2026-08-21, taking m2_source.txt (the exact-token benchmark source
+  EVERY Qwen sha pin since 2026-08-17 is measured against),
+  dsv4_gate.py (the DSV4 anchor driver), and both build recipes.
+- Recovery (all byte-exact or verbatim):
+  - m2_source.txt: the a99b transcript records its creation —
+    `cat perf/perf.md perf/baseline_status.md
+    perf/metal_m1ultra_retrospective.md` at 2026-08-17T22:39Z with
+    wc -c 69105. Those three files at commit 2ae908e42 sum to exactly
+    69,105 bytes; reconstruction sha256 733860b1b9b6... SERVING PROOF:
+    a VLLM_QC_ROPE_STATIC=0 null boot reproduced c1 sha 467b35c3 AND
+    2500x64 sha d0e07ddd bit-exact with the reconstructed file
+    (rope_gate/ Phase 0) — the pins chain is unbroken.
+  - dsv4_gate.py: the a99b copy was a verbatim `cp` of the 43e3
+    session's gate.py (confirmed from the a99b transcript); gate.py's
+    full content recovered from the 43e3 transcript's Write call. Its
+    SOURCE constant (<QuixiCore-Metal>/perf/
+    perf.md) is a stable repo file unmodified since 2026-08-14 —
+    predates the UPDATE 30 anchor pins, so anchor legs are unaffected.
+  - build_metallib.sh / build_qc_metal.sh: extracted from the a99b
+    transcript (bash heredoc / Write call).
+- Process fix: canonical copies now live in
+  perf/results/harness_assets/ (stable disk, git-ignored, README with
+  provenance); rope_gate2.sh and all future chains reference that
+  path. Lesson: /private/tmp session scratchpads are swept by file
+  atime after a few days — copy any load-bearing asset to the stable
+  home the moment a gate depends on it; session transcripts
+  (~/.claude/projects/.../<session>.jsonl) retain full Write contents
+  and bash heredocs for reconstruction.
+- Raw: perf/results/2026-08-24/rope_gate/ (Phase 0 null legs = the
+  serving proof), perf/results/harness_assets/README.md.
+
+### UPDATE 43 (2026-08-24) — N10: steady-cache metadata for the mamba-hybrid path (GDN builder ~8.2 ms/step -> two copy_ ops on steady steps)
+
+- Status: RETAINED — all pins bit-exact, needles exact, c1 +1.2%.
+- Baseline (UPDATE 41): canonical c1 16.139 sha 467b35c3 / c4 23.16 /
+  c8 25.62 / 2500x64 3.454 sha d0e07ddd; -tq c1 16.08 sha 228d0bf4.
+- Post-rope census (pyprof3, 608 steps, host profile 62.45 -> 26.01 s
+  after the rope fix): target forward 16.9 ms/step, drafter 14.0,
+  build_attn_metadata 8.5 (2 calls/step) of which gdn_attn build =
+  8.2 ms/step (10 group builds x 0.82 ms — ~30 tensor ops + h2d
+  copies each, rebuilt from scratch every step). The upstream steady
+  metadata machinery (merge f7bba480) never fires here: gated on
+  CUDAGraphMode.FULL + opt-in env, and disqualified whenever
+  model_specific_attn_metadata is present — always true for this
+  model. Raw: perf/results/2026-08-24/pyprof_census/ (pre-async,
+  pre-rope, post-rope dumps).
+- CHANGE (python-only, 4 files):
+  - interface.py: ModelSpecificAttnMetadata.steady_signature() -> None
+    default (pre-existing behavior).
+  - mamba_hybrid.py: MambaHybridAttnMetadata.steady_signature()
+    returns ("mamba-spec", k) only in the uniform all-spec decode
+    regime (every row a spec row with the same draft count; CPU
+    checks, no sync — adaptive-k changes force a rebuild);
+    prepare_attn passes a steady_cache on Metal (eager path — the
+    cached objects are views over persistent buffers), gated by
+    VLLM_QC_STEADY_META (default on, =0 null path).
+  - attn_utils.py: steady eligibility accepts model-specific metadata
+    with a non-None signature (folded into the sig tuple); when it is
+    present the signature is the sole all-decode guarantee (CPU-side —
+    the is_prefilling tensor is only consulted, and required non-None,
+    in the no-metadata case); on a hit, cm.max_seq_len and
+    cm.seq_lens_cpu_upper_bound are refreshed in place (the runner
+    allocates the bound fresh each step, so the cached view otherwise
+    freezes — see round 2), supporting builders get
+    steady_decode_update(meta, cm, **fresh extra kwargs), and
+    non-supporting builders are rebuilt WITH the same kwargs the cold
+    path passes (previously rebuilt without — a latent bug had any
+    kwarg-taking builder lacked steady support). DSV4/None case
+    byte-identical (steady still opt-in off there).
+  - gdn_attn.py: GDNAttentionMetadataBuilder.steady_decode_update —
+    re-copies spec_state_indices_tensor from the LIVE block table
+    (same-shape batch-composition swaps can never serve stale state
+    slots) and refreshes num_accepted_tokens from the fresh kwarg;
+    everything else in the cached metadata is a shape constant, a
+    persistent-buffer view (query_start_loc, seq_lens), or
+    content-constant at steady (spec masks all-true, arange token
+    indices). Two device copy_ ops replace ~30 ops + h2d per group.
+- Unit: steady_signature all-spec/mixed/no-spec cases verified.
+- Gate round 1 (11:31-11:37): null leg PASSED (snull_c1 16.153 sha
+  467b35c3 — reproduces UPDATE 41 exactly), steady boot CRASHED on the
+  first request: the pre-existing upstream eligibility clause
+  `bool(is_prefilling[:num_reqs].any())` dereferenced None — the
+  mamba-hybrid caller keeps is_prefilling inside its model-specific
+  metadata (per-group extra kwargs) and passes None at top level, a
+  path upstream never exercised because model-specific metadata was
+  always disqualified. EngineDeadError -> every Phase 1/2 leg
+  connection-refused; the restore boot (steady default ON) died the
+  same way — 1-second "ramp" was the tell. Fix: when model-specific
+  metadata is present, a non-None steady_signature IS the all-decode
+  guarantee (CPU-side; also avoids a per-step MPS sync the .any()
+  would cost); the tensor check now only governs the no-metadata case
+  and requires the tensor non-None. Crash log:
+  perf/results/2026-08-24/steady_gate/round1_crash_qwen_steady_boot.log.
+  Lesson: the ramp helper must verify text was actually generated —
+  an instant HTTP 500 satisfies curl and reads as "ramped".
+- Gate round 2 (11:40-11:56, after the eligibility fix): steady boot
+  healthy, verified ramp passed (steady hits live), CANON NEEDLE PASS,
+  c1 16.581/16.575 (+2.7%) but sha ROLLED to ac33cee5 both runs —
+  deterministic divergence; 2500x64 3.441/3.431 sha ad3efbfd (also
+  rolled); c4 run 1 23.068 with first-response sha matching canonical
+  467b35c3 (composition churn refreshes the cache constantly at c4, so
+  staleness barely accumulates — the clue). Root cause: the runner
+  allocates seq_lens_cpu_upper_bound FRESH each step (np.zeros +
+  from_numpy, model_runner InputBatch construction), so the cached
+  CommonAttentionMetadata's view froze at cold-build content, and the
+  metal full-attn builder — rebuilt on every steady hit — derives its
+  decode max_context from that tensor: newest tokens silently excluded
+  from full attention between rebuilds. seq_lens / query_start_loc /
+  gathered block tables / slot mappings are in-place persistent
+  buffers (audited); query_start_loc_cpu is frozen but content-equal
+  under the uniform all-spec signature. Fix: refresh
+  cm.seq_lens_cpu_upper_bound in place on every steady hit (CPU copy
+  of num_reqs int32s, negligible). Chain stopped mid-Phase-1 (legs
+  were measuring a known-wrong build), round 3 relaunched.
+- Predictions (in advance): ALL shas BIT-EXACT (canonical c1
+  467b35c3, 2500x64 d0e07ddd, -tq c1 228d0bf4) — metadata content is
+  identical on hits and misses rebuild; null boot
+  (VLLM_QC_STEADY_META=0) reproduces UPDATE 41 exactly; c1 +4-8%
+  (up to ~8 ms/step recovered); c4/c8 up similarly; needles exact.
+- Serving gate round 3 (11:48-12:04, both fixes in): CANON NEEDLE
+  PASS; c1 16.334 / 16.346 sha 467b35c3 BIT-EXACT (+1.2% vs 16.139);
+  2500x64 3.444 / 3.452 sha d0e07ddd BIT-EXACT; c4 23.022 / 23.011
+  (bar 23.16, -0.6% — noise; hits are rare under composition churn);
+  c8 25.567 / 25.566 (bar 25.62, -0.2% — noise); TQ NEEDLE PASS;
+  -tq c1 16.216 / 16.210 sha 228d0bf4 BIT-EXACT (+0.8% vs 16.08).
+  Null boot (VLLM_QC_STEADY_META=0) reproduced UPDATE 41 exactly
+  (16.153 sha 467b35c3, round 1 Phase 0).
+- Prediction audit: bit-exactness held only after the round-2 fix —
+  the +2.7% the stale-bound build showed was bought with silently
+  truncated attention windows; the honest gain is c1 +1.2%, under the
+  +4-8% predicted. Adaptive-k signature breaks make steady hits rarer
+  than the census's per-step build cost implied; the GDN rebuild also
+  still runs on every miss step.
+- Decision: RETAINED (default ON on Metal). Bit-exact on every pin,
+  both needles exact, c1 +1.2% for two device copies per hit, and the
+  VLLM_QC_STEADY_META=0 null path is proven identical to UPDATE 41.
+  c4/c8 unchanged at noise level.
+- NEW CANONICAL c1: 16.334 (146.3% of the 11.168 Q4_K bar); c4/c8/
+  2500x64 and -tq pins carried with the values above.
+- Raw: perf/results/2026-08-24/{steady_gate, pyprof_census}/;
+  steady_gate.sh / steady_gate2.sh (session-04ba9b90 scratchpad);
+  round-1 crash log at
+  perf/results/2026-08-24/steady_gate/round1_crash_qwen_steady_boot.log.
+
+### UPDATE 44 (2026-08-24) — N11a: fused DFlash2 grouped-conv kernel (qc_dflash_conv — ~40 eager dispatches/drafter-layer -> 4)
+
+- Status: RETAINED — anchors + all pins bit-exact, needle exact, c1 +0.6%.
+- Baseline (UPDATE 43): canonical c1 16.334/16.346 sha 467b35c3 / c4
+  23.02 / c8 25.57 / 2500x64 3.444 sha d0e07ddd; -tq c1 16.216 sha
+  228d0bf4.
+- Lead: post-N10 phase census (phaseprof2_post_steady, sync-bracketed,
+  496 steps): drafter_propose 24.4 ms/step serialized, of which the 2B
+  bf16 5-layer forward reads only ~5 ms of GPU weight traffic — ~19
+  ms/step is host encode. Op inventory: each drafter layer runs 4
+  _grouped_conv calls (attention_conv/mlp_conv x prepare/finish), each
+  ~10 eager MPS ops (unflatten view, coefficient add, per-tap F.pad +
+  three muls + add, torch.arange position mask) — ~40 dispatches/layer,
+  ~200/step across 5 layers, the largest single encode block in the
+  drafter step (pyprof4: _grouped_conv 3.8 ms/step + 2.2 ms/step pad +
+  ~1.1 ms/step of the arange bucket). sample_tokens 32.7 ms/step
+  serialized — CORRECTED post-gate: drafter_propose nests INSIDE the
+  sample_tokens bracket (model_runner.py:1651 under the :1522 wrap),
+  so 32.7 = 24.4 drafter + 6.5 sample_and_reject + ~1.8 glue; there
+  is no unattributed sampling cost.
+- CHANGE:
+  - csrc .../serving/dflash_conv/dflash_conv.metal: qc_dflash_conv
+    kernel (f16/bf16/f32) — one thread per element, block-local taps
+    with the position mask folded in; numerics mirror the eager chain
+    exactly (every binary op fp32-computed, rounded once to storage
+    dtype, same association order; masked taps skipped = the chain's
+    mul-by-0 + add-exact-0).
+  - tk_launch.h launch_qc_dflash_conv; qc_metal_serving.mm
+    qc_dflash_conv wrapper (delta side slices of the [T,2,taps,G]
+    projection view pass via storage offset + row stride, no
+    contiguous copy — check_mps_strided + explicit inner-stride
+    contract) + pybind registration; ops.py wrapper.
+  - qwen3_dflash2.py _grouped_conv routes to the kernel on Metal
+    (VLLM_QC_DFLASH_CONV=0 restores eager; stale-.so hasattr guard;
+    layout guards fall back to eager).
+- Parity (dflash_conv_parity.py): 37/37 BIT-EXACT vs the eager torch
+  chain — bf16/f16/f32 x block 4/8/9 x 1/4 requests x both side
+  views, plus a taps=3 generality probe.
+- Predictions (in advance): DSV4 anchors ALL BIT-EXACT (zero exposure
+  — routing is qwen3_dflash2-only; rebuild deterministic); null boot
+  (VLLM_QC_DFLASH_CONV=0) reproduces UPDATE 43 (16.33-class, sha
+  467b35c3); conv-ON c1 sha 467b35c3 — DOUBLY guaranteed (greedy
+  verify makes accepted text draft-independent AND the kernel is
+  bit-exact so drafts/acceptance are bit-identical: any TPS delta is
+  pure host-encode recovery); c1 +1-3% (dispatch-elimination
+  calibration lesson: sync-prof shares are upper bounds, marginal
+  encode ~5 us; ~200 encodes + the pad/arange kernels removed);
+  needle exact.
+- Serving gate (12:29-12:44): DSV4 anchors ALL BIT-EXACT 2/2 each —
+  8tok 573db39598e7 5/15/3 @ 1.72-1.79 s, off1-2000 bb83cc3054a3
+  1581/2115/423 @ 57.22 s x2, 2500x64 f75e1d41ac3d 43/105/21 @
+  4.50-4.56 s (17th consecutive anchor re-gate). Null boot
+  (VLLM_QC_DFLASH_CONV=0) 16.337 sha 467b35c3 = UPDATE 43 exactly.
+  Conv-ON: CANON NEEDLE PASS; c1 16.428/16.438 sha 467b35c3 BIT-EXACT
+  (+0.6% vs the same-day null; 147.1% of the Q4_K bar); 2500x64 3.454
+  sha d0e07ddd BIT-EXACT; c4 23.111 / c8 25.615 (noise-level vs
+  UPDATE 43's 23.02/25.57).
+- Prediction audit: bit-exactness held everywhere as predicted; the
+  TPS gain landed at +0.6%, the floor of the +1-3% band — consistent
+  with the UPDATE 22 calibration (marginal encode ~5 us x ~200
+  dispatches ~= 1 ms/step). The eager chain's profiler-visible 5-7
+  ms/step was mostly absorbed queue-tail wait, not recoverable encode.
+- Decision: RETAINED (default ON on Metal). Bit-exact at every level
+  (kernel parity, drafts, serving pins), one dispatch replaces ~10,
+  and the null path is proven identical. NEW CANONICAL c1:
+  16.428/16.438 sha 467b35c3.
+- Raw: perf/results/2026-08-24/{anchor_regate_dflashconv,
+  dflash_conv_gate, phaseprof_census, pyprof_census}/; scripts
+  session-04ba9b90 scratchpad (dflash_conv_parity.py, dflash_gate.sh,
+  census4.sh, phasecensus.sh).
+
+### UPDATE 45 (2026-08-24) — N11b: pure-prefill causal SDPA reads the CPU bound (kills the per-prefill seq_lens D2H queue drain)
+
+- Status: RETAINED — every pin bit-exact, no regression; the win is long-context TTFT, not leg TPS.
+- Baseline (UPDATE 44): canonical c1 16.428/16.438 sha 467b35c3 / c4
+  23.111 / c8 25.615 / 2500x64 3.454 sha d0e07ddd.
+- Lead: op census stacks (opcensus1_post_dflashconv): the causal SDPA
+  loop's lazy exact-lens materialization (metal_attn.py:156
+  seq_lens_gpu.to("cpu")) cost 3.43 s over 12 calls in a 496-step run
+  (~286 ms/call) — each first causal _sdpa_forward of a prefill event
+  blocks on every queued prefill chunk. Concentrated entirely in
+  prefill: pure TTFT/prefill-wall tax (the 2500x64 leg carries it
+  inside its timed window).
+- CHANGE (python-only, metal_attn.py): MetalAttentionMetadata gains
+  bound_exact — set at build time when the batch is entirely
+  mid-prefill rows (m.is_prefilling CPU all-true): for such batches
+  the CPU bound (computed-mirror + scheduled) equals the exact lens
+  row-for-row, because the async-scheduling mirror only diverges on
+  spec-decode rows. The causal SDPA loop then reads the bound instead
+  of the D2H; geometry (kv_start/first_block/row_start) stays on the
+  exact path — only the lens source changes, values identical by
+  construction. Mixed prefill+decode batches keep the exact pull.
+  VLLM_QC_SDPA_PREFILL_BOUND=0 restores the old path.
+- Rope-memo lead PARKED with a danger note: memoizing per-step mrope
+  cos/sin across the 16 layers (~100 encodes/step) needs a step
+  identity for the in-place-rewritten positions buffer; custom-kernel
+  writes may not bump tensor._version — the exact stale-cache class
+  UPDATE 43 round 2 hit. ~0.5-1 ms by the dispatch calibration; not
+  worth the risk today.
+- Predictions (in advance): ALL shas BIT-EXACT (canonical c1 467b35c3,
+  2500x64 d0e07ddd, DSV4 8tok 573db39598e7 — lens values identical);
+  2500x64 +2-7% (sync sat inside the timed prefill); c1 +0-1%; null
+  boot (=0) reproduces UPDATE 44.
+- Serving gate (13:00-13:13): DSV4 8tok prudence 573db39598e7 5/15/3
+  BIT-EXACT 2/2 (DSV4 prefill takes the new path too); null boot
+  (VLLM_QC_SDPA_PREFILL_BOUND=0) 2500x64 3.454 d0e07ddd = UPDATE 44
+  exactly; bound-ON: CANON NEEDLE PASS (the 16k needle prefill
+  exercises the path), 2500x64 3.465/3.465 sha d0e07ddd BIT-EXACT,
+  c1 16.414/16.438 sha 467b35c3 BIT-EXACT, c4 23.106 / c8 25.60
+  (c8 first-sha rolled to 5c46ba9a — TPS gate, composition-sensitive,
+  not a pin).
+- Prediction audit: correctness predictions all held; the 2500x64
+  +2-7% MISSED (+0.3%, noise). In hindsight the 2500-token prompt is
+  a single prefill chunk — little queued work to drain at its first
+  causal SDPA build. The census's 286 ms/call average came from
+  MULTI-CHUNK prefills (16k needle, ramp essay), where chunk N's
+  build blocked on chunk N-1's full GPU work. The recovered time
+  lands in long-context TTFT, which no current TPS leg samples;
+  leg-level TTFT quantification deferred to the next long-ctx
+  session.
+- Decision: RETAINED (default ON). Value-identical by construction
+  (bound == exact for all-prefill batches), every pin bit-exact, no
+  regression on any leg, and multi-chunk prefill loses a
+  hundreds-of-ms-per-chunk host stall.
+- Raw: perf/results/2026-08-24/{opcensus_census, sdpa_bound_gate}/.
+
+### UPDATE 46 (2026-08-24) — -tq full re-measure on the U43/U44/U45 stack (closes the post-rope gap; flip data refreshed)
+
+- Status: MEASUREMENT (no code change). Boot: qwen38-nvfp4-1-tq with
+  all current defaults (steady meta + dflash conv + prefill bound).
+- Results (tq_remeasure/, needle PASS, deterministic 2/2 per leg):
+  c1 16.182/16.240 sha 228d0bf4 BIT-EXACT (the -tq pin holds through
+  U44/U45 as predicted); 2500x64 3.512/3.506 sha d0e07ddd — the
+  CANONICAL sha, +1.4% above canonical's 3.465; c4 23.715/23.615
+  (+2.4% above canonical 23.106); c8 26.053/26.090 (+1.8% above
+  canonical 25.60).
+- Standing vs canonical (both on today's stack): -tq WINS c4/c8/
+  2500x64, trails c1 by 1.2%, adds 2.4x KV capacity (262k-capable,
+  needle-exact). The pre-rope relative standing carried through all
+  three of today's retentions.
+- FLAGGED DECISION unchanged and now fully current: canonical-default
+  flip to -tq is a quality call (k8v4 V-cache cos ~0.9955 floor vs
+  bf16), not a TPS call — TPS favors -tq at every concurrency above 1.
+- Raw: perf/results/2026-08-24/tq_remeasure/.
+
+### UPDATE 47 (2026-08-24) — N11c: DFlash draft-block attention routes to the expanded paged kernel (kills the per-request SDPA python loop)
+
+- Status: REJECTED — loses TPS on every leg; quarantined opt-in (VLLM_QC_DRAFT_BLOCK_PA=1).
+- Baseline (UPDATEs 44-46): canonical c1 16.428/16.438 sha 467b35c3 /
+  c4 23.106 / c8 25.60 / 2500x64 3.465 sha d0e07ddd; -tq c1
+  16.18-16.24 sha 228d0bf4 / c4 23.6-23.7 / c8 26.05-26.09 / 2500x64
+  3.51.
+- Lead: the drafter's 5 non-causal SWA-2048 hs128 layers ran the
+  _sdpa_forward python loop every draft step (bound-mode: per-request
+  block-table gathers, GPU validity mask, torch SDPA — ~2,470 calls
+  per 494-step census; ~3.9 ms/call serialized in phaseprof). The
+  drafter has NO sink bias (metal_attn raises on sinks at init; the
+  model boots), so the existing expanded paged kernel can serve it.
+- CHANGE (python-only, metal_attn.py): _expanded_block_decode_applies
+  — non-causal twin of the expanded-decode gate (uniform q_len blocks,
+  paged head sizes). Every query token of a request sees the same key
+  range, so pseudo-requests carry the FLAT seq_len (no causal step
+  offsets), and the sliding window widens by q_len - 1: the SDPA loop
+  anchors the window at the block start (kv_start = seq_len - q_len -
+  W + 1) while the kernel clamps to [context_len - window,
+  context_len) — with context_len = seq_len and window = W + q_len -
+  1 the ranges are identical. Reads exact seq_lens_gpu (sync-free;
+  the SDPA bound-mode needed a GPU validity mask). Draft context
+  precompute (large q_len) keeps SDPA. VLLM_QC_DRAFT_BLOCK_PA=0
+  restores the loop.
+- Predictions (in advance): kernel-vs-SDPA reduction order changes
+  drafter logits at ULP level -> draft CONTENT may differ -> ACCEPTED
+  text is invariant (greedy verify accepts exactly the target-argmax
+  prefix; batch positions are causally independent, so different
+  rejected-tail tokens cannot alter accepted-position logits). ALL
+  shas HOLD: canonical c1 467b35c3, 2500x64 d0e07ddd, -tq untested
+  this round (next -tq boot), DSV4 8tok 573db39598e7 with counters
+  5/15/3 (DSpark drafter layers are causal — never route). Needle
+  exact. TPS: c1 +0-3%, c4/c8 +1-3% (five python-loop SDPA calls +
+  gathers + mask builds replaced by five dispatches per draft step);
+  acceptance-rate drift possible at ULP ties but small.
+- Gate round 1 (13:32-13:39): DSV4 8tok 573db39598e7 5/15/3 BIT-EXACT
+  2/2 (DSpark causal, never routes — as predicted); null c1 16.40 sha
+  467b35c3 (= current canonical); route-ON crashed on the first draft
+  step: `context_lens must be contiguous` — `expand(-1,
+  q_len).reshape(-1)` is NOT contiguous on MPS (the causal branch
+  never hits this because its `+ steps` add materializes a fresh
+  buffer). The verified ramp caught the dead engine immediately.
+  Fixed with seq_lens.repeat_interleave(q_len) (scalar count — static
+  shape, contiguous). Round-2 script gained restore-on-fail (round 1
+  left the box dead on exit — the N11b-derived script had no failure
+  restore).
+- Serving gate round 2 (13:40-13:48, contiguity fix in): needle PASS;
+  c1 15.142/15.129 sha 467b35c3 (-7.7% vs the same-build null 16.40);
+  2500x64 3.323 sha 95adbd97 (-4.1%, trajectory FORKED off d0e07ddd —
+  shifted verify-batch boundaries move the split-K partition seams,
+  ULP forks at ties; 95adbd97 is the old N3-era trajectory); c4 22.96
+  (-0.6%); c8 25.52 (-0.3%).
+- Diagnosis (counter probe, same-leg): SDPA acceptance 781/491 = 1.59
+  accepted/draft vs kernel 940/612 = 1.54 — a ~3% relative acceptance
+  dip (kernel-vs-SDPA numerics shift the 16-way candidate/path
+  selection at near-ties far more often than plain argmax), plus the
+  kernel is slower than ONE-request SDPA at draft shapes (q_len 4,
+  ctx ~1.3k < SWA window so the window math was never even exercised;
+  5 tiny expanded launches + expansion ops vs one gather+SDPA call).
+  Both factors real; both against the route. The text-invariance
+  argument held for c1 (sha 467b35c3 both runs) but NOT as a pin
+  regime: acceptance-dependent step boundaries fork ULP trajectories
+  on longer contexts.
+- Decision: REJECTED as default. Default flipped to opt-in
+  (VLLM_QC_DRAFT_BLOCK_PA=1 enables), branch kept as a documented
+  diagnostic with the rejection noted in the code comment. Revert
+  cycle: c1 16.426 sha 467b35c3 — canonical exactly restored, box
+  serving. LESSON: for spec-decode DRAFTER math, reduction-order
+  changes are NOT benign — the candidate selector amplifies ULP
+  noise into acceptance loss; only bit-exact (or measured-neutral)
+  drafter changes are safe.
+- Raw: perf/results/2026-08-24/draft_block_pa_gate/.
+
+### UPDATE 48 (2026-08-24) — N12: fused Metal QK-norm-RoPE-gate (qc_qk_norm_rope_gate — ~25 dispatches/attn-layer -> 1, bit-exact)
+
+- Status: REJECTED (parked opt-in VLLM_QC_QKROPE=1) — eager torch-MPS numerics are SIZE-DEPENDENT, the trajectory forks at prefill, and the measured win did not justify a full re-pin.
+- Baseline (UPDATEs 44-46): canonical c1 16.428/16.438 sha 467b35c3 /
+  c4 23.106 / c8 25.60 / 2500x64 3.465 sha d0e07ddd; -tq c1
+  16.18-16.24 sha 228d0bf4.
+- Lead: each of the 16 target attention layers ran per step: 2
+  reshape copies (q/gate de-interleave), 2 gemma_rms_norm dispatches,
+  and the ~20-op torch mrope decomposition (cache fancy-index, chunk,
+  2x interleave clone+strided copies, per-q/k rotate: 4 muls, sub,
+  add, 2 cats, reshape) — ~25 dispatches/layer, ~400 encodes/step,
+  the largest remaining encode block (op census: 16/step
+  aten.index.Tensor + 4x 16/step mrope copy_ + 2x 16/step cats + ...).
+  The upstream fused path (fused_qk_rmsnorm_rope_gate) is CUDA/Triton
+  only. KEY ENABLER (from the CUDA path's own comment): text-only
+  serving makes the three mRoPE position rows identical, so the flat
+  T row + plain NeoX rotation over cos_sin_cache is value-exact — no
+  section/interleave machinery needed.
+- CHANGE:
+  - csrc .../serving/qk_norm_rope_gate/qk_norm_rope_gate.metal:
+    qc_qk_norm_rope_gate (bf16/f16 x i64/i32 positions) — one
+    256-thread threadgroup per (head, token): gemma RMSNorm mirroring
+    qc_rms_norm's exact reduction tree (one element/thread at D=256,
+    simd_sum, sequential 8-slot total, single final round), partial
+    NeoX rotation (rot 64) over the ROUNDED bf16 norm outputs with
+    the per-op-rounding mirror (t1=T(x1*c), t2=T(x2*s), o1=T(t1-t2),
+    ...), dims >= 64 pass through, gate de-interleaved to contiguous
+    in the same pass. V stays a caller-side view.
+  - tk_launch launcher, qc_metal_serving.mm binding (std::tuple
+    return), ops.py wrapper.
+  - qwen3_next.py: use_fused_qk_rope_metal (attn_output_gate + neox +
+    Metal + text_only + VLLM_QC_QKROPE==1 + symbol guard) routes
+    _project_qkv_gate; bf16-only (fp16 eager falls back to the native
+    ir norm whose numerics differ — parity showed ulp diffs there);
+    VLLM_QC_QKROPE=0 restores eager.
+- Parity (qkrope_parity.py, real GemmaRMSNorm + MRotaryEmbedding
+  modules): bf16 8/8 BIT-EXACT (q, k, gate; T 1/4/9/37; 1D and 3-row
+  positions). fp16 left unrouted (different eager reference chain).
+- Predictions (in advance): ALL pins BIT-EXACT (canonical c1
+  467b35c3, 2500x64 d0e07ddd, DSV4 anchors 573db39598e7 /
+  bb83cc3054a3 / f75e1d41ac3d — DSV4 never touches Qwen3NextAttention
+  but the metallib+.so rebuild mandates the full 3-leg re-gate); null
+  boot (VLLM_QC_QKROPE=0) reproduces UPDATE 44-46 canonical; needle
+  exact; c1 +1.5-4% (~400 encodes/step + 2 materializations removed;
+  calibration ~5 us x count ~= 2 ms/step, plus allocator pressure);
+  c4/c8 similar direction.
+- Serving gate (14:02-14:18): DSV4 anchors ALL BIT-EXACT 2/2 each
+  (18th consecutive; metallib+.so rebuild cleared); null boot
+  (VLLM_QC_QKROPE=0) 16.412 sha 467b35c3 = canonical; fused-ON:
+  needle PASS, c1 16.120/16.107 sha d7c66851 (ROLLED, -1.8%);
+  2500x64 3.454/3.466 sha a9001e38 (rolled, flat); c4 23.39 (+1.2%);
+  c8 25.789 (+0.7%).
+- Root cause of the roll (serving-faithful harness, get_rope-built
+  rotary, qkrope_parity2.py): at T=1000 prefill shapes the eager
+  chain diverges from the kernel by ~5 ppm single-ulp elements
+  (31/6.1M q, 2/1M k) while T=4 decode and T<=37 are EXACT —
+  torch-MPS elementwise numerics are SIZE-DEPENDENT (large tensors
+  evidently fuse/round the rotation chain differently). No static
+  kernel can mirror a size-dependent reference at all shapes; decode
+  steps are bit-exact but prefill shifts the prefix state, forking
+  the canonical trajectory deterministically.
+- Decision: REJECTED for now, default OFF (opt-in diagnostic with the
+  rejection documented in the code comment). The candidate win (c4/c8
+  ~+1%, c1 flat-to-negative, all content-confounded by the roll) does
+  not justify re-pinning every sha. Revisit if Muse single-CB changes
+  dispatch economics or a same-text measurement method exists.
+  Revert cycle: c1 16.437 sha 467b35c3, acceptance counters replay
+  exactly (781/491) — canonical restored, box serving.
+- KEY LESSON (saved): "bit-exact vs the eager chain" contracts hold
+  only PER-SHAPE on torch-MPS — validate parity at SERVING shapes
+  (prefill T included), not just synthetic small T. The U44 dflash
+  conv survives because drafter shapes are small and fixed; this
+  kernel was exact at every shape the first harness tried and still
+  forked at T=1000.
+- Raw: perf/results/2026-08-24/{qkrope_gate, anchor_regate_qkrope}/.
+
+### UPDATE 49 (2026-08-24) — N13: one-dispatch paged KV insert (kv_cache_scatter wired — 5 torch ops -> 1 per attention layer)
+
+- Status: RETAINED — everything bit-exact; TPS flat within noise (gain at/below leg resolution, as the low-end prediction allowed).
+- Baseline (UPDATE 44): canonical c1 16.43 sha 467b35c3 / c4 23.11 /
+  c8 25.60 / 2500x64 3.465 sha d0e07ddd.
+- Lead: op census — aten.index_put_ 60/step + the .to/floordiv/mod
+  index math: every metal_attn forward writes K/V via 5 torch ops
+  (dtype cast, block/off division, two advanced-indexing scatters)
+  x ~21 layer-calls/step. A kv_cache_scatter kernel existed
+  (serving/kv_cache/, launcher plumbed) but was never bound — and it
+  assumed contiguous caches, not the serving page-local layout.
+- CHANGE: kernel + launcher gain block_mult (1 = standard contiguous
+  caches; 2 = page-local dense layout, V pointer bound one block past
+  the dense base — the same aliasing the attention kernels use);
+  qc_kv_cache_scatter .mm binding + ops.py wrapper; metal_attn
+  forward KV write routes to it (VLLM_QC_KV_SCATTER=0 restores the
+  torch path; slot<0 rows skipped — never occur on this path).
+  Pure copies to identical destination rows: bit-exact by
+  construction at ANY shape (no arithmetic, so the U48
+  size-dependent-numerics trap does not apply).
+- Parity: standard + page-local layouts EXACT incl. a skipped -1 row
+  (first build failed: the explicit-instantiation block also needed
+  the new buffer — parity caught the stale metallib immediately).
+- Predictions (in advance): ALL pins BIT-EXACT (canonical c1
+  467b35c3, 2500x64 d0e07ddd, DSV4 anchors — DSV4's drafter
+  metal_attn layers route too, pure copies); null boot reproduces
+  canonical; needle exact; c1 +0.2-0.6% (~80 encodes/step removed
+  across 21 calls; calibration ~5 us x count).
+- Serving gate (14:30-14:46): DSV4 anchors ALL BIT-EXACT 2/2 each
+  (19th consecutive — the scatter runs live in DSV4's drafter
+  metal_attn layers); null boot 16.439 sha 467b35c3; scatter-ON:
+  needle PASS, c1 16.443/16.440 sha 467b35c3 BIT-EXACT, 2500x64
+  3.456/3.459 sha d0e07ddd BIT-EXACT, c4 23.131 / c8 25.619 (+0.1%
+  each, noise).
+- Decision: RETAINED (default ON). Bit-exact at every level and
+  strictly fewer dispatches (5 -> 1 per attention layer, ~80
+  encodes/step); the throughput gain is at or below the ±0.3% leg
+  resolution — consistent with the dispatch calibration (~0.4
+  ms/step upper bound). Encode hygiene that compounds if whole-step
+  CB batching (Muse) lands later. Box left serving canonical
+  (verified live).
+- Raw: perf/results/2026-08-24/{kvscatter_gate, anchor_regate_kvscatter}/.
+
+### DECISION (2026-08-24, user) — -tq canonical-default flip REJECTED: KV cache stays unquantized
+
+- The user ruled on the flagged UPDATE 40/46 decision: **we do NOT
+  quantize the KV cache for the canonical profile.** `qwen38-nvfp4-1`
+  keeps the bf16 KV cache as its default.
+- Rationale: quality. The k8v4 TurboQuant KV has a measured
+  reconstruction floor of cos ~0.9955 on V (UPDATE 39 dequant parity),
+  and the throughput upside (-tq wins c4 +2.4% / c8 +1.8% / 2500x64
+  +1.4%, trails c1 -1.2% per UPDATE 46) does not justify accepting
+  that floor as the default serving quality.
+- Scope of the decision: the DEFAULT only. The `qwen38-nvfp4-1-tq`
+  profile stays registered, quality-gated, and maintained as the
+  opt-in long-context/capacity profile (2.4x KV capacity, 262k
+  needle-exact) — it is not being removed or deprecated.
+- **PR REQUIREMENT (user directive): this decision and its rationale
+  must be stated in the PR description when UPDATEs 5-49 are
+  submitted.** See the "PR notes" section in HANDOFF.md.
+
+### DECISION (2026-08-24, user) — Muse single-CB: GO (N14 opens)
+
+- The user accepted the trajectory re-pin cost for the Muse
+  single-command-buffer step loop ("we've done it before" — the
+  muse_glimmer precedent paid the same trade on the dense arch).
+- Bringup discipline: opt-in env gate (canonical stays bit-exact at
+  467b35c3 / d0e07ddd throughout development); target-forward-only
+  scope (sampling + drafter stay eager); at flip time a full quality
+  revalidation (262k needle, long decodes, drafter acceptance
+  before/after — U47 showed acceptance is ULP-sensitive) precedes
+  pinning NEW canonical shas. DSV4 anchors re-gate as usual and are
+  expected to hold (their compute paths untouched).
+- Commit of UPDATEs 5-49 remains user-gated and can land at any
+  point before the flip.
+
+### UPDATE 50 (2026-08-24) — N14 design: Muse-qwen38 single-CB decode step
+
+- Status: DESIGN COMPLETE — csrc/quixicore/metal/muse_qwen38_design.md
+  (scope, registration surface, per-layer emit map, phases P1-P4).
+- Key findings from the scoping read:
+  - The muse_glimmer precedent (muse_step_init/layer/run,
+    serving_glue/muse_step.metal) is directly reusable in structure:
+    register weights once, one encode() closure emits the whole
+    forward, only per-step tensors passed per call.
+  - EVERY op in the qwen38 steady-decode forward already has a
+    tk_launch emit: qgemv_{fp8ch,nvfp4_planar}(+_mb/_mv4r),
+    gdn_fused_prepare / gdn_recur_spec / gdn_gated_rmsnorm_f32,
+    qk_norm_rope_gate, kv_cache_scatter (block_mult),
+    paged_attention(_partition), gemma_rms_norm(_add)_dyn, qc_swiglu.
+    New glue needed: ONE tiny kernel (muse_expand_meta for the
+    expanded-PA seq_lens/block-table) plus reuse of
+    muse_sigmoid_mul/silu/add.
+  - All 64 layer norms are GemmaRMSNorm -> the fused
+    gemma_rms_norm_add_dyn covers every add+norm seam.
+  - The U48 qk_norm_rope_gate kernel (rejected ONLY for forking the
+    trajectory) is free to use inside muse — the re-pin is already
+    paid. U47 stays untouchable: the drafter remains eager.
+  - V1 eligibility: steady all-spec decode (U43 signature), total
+    rows m <= 8 (covers c1 k=3 -> m=4), bf16, text-only. At m <= 8
+    the quantized GEMV family covers every projection (m==1 base /
+    even<=8 _mb / odd 3..8 _mv4r) — no dense fallback in-CB.
+- Bringup instruments: VLLM_QC_MUSE=shadow (run both, compare, serve
+  eager) + VLLM_QC_MUSE_LAYERS=N prefix capture for divergence
+  bisection. Gates = shadow cos/ulp stats at serving shapes, then
+  needle/long-decode/acceptance-delta, then NEW pins (no bit-exact
+  target vs eager — U48 size-dependent numerics make it unattainable
+  by construction).
+- NEXT: P1 .mm scaffolding (muse_q38_init/layer/run + glue), build
+  clean, then P2 GDN-prefix shadow parity.
+
+### UPDATE 51 (2026-08-24) — N14 P1+P2 bringup (IN PROGRESS: shadow first contact)
+
+- P1 SHIPPED: muse_q38_init/layer_gdn/layer_attn/run in
+  qc_metal_serving.mm (one encode() closure, all 64 layers + final
+  gemma norm + drafter aux taps); glue kernels in muse_step.metal
+  (muse_expand_meta, muse_copy_rows, muse_silu_mul_rows,
+  muse_add_out, muse_dense_gemv). Python wire-in
+  vllm/model_executor/models/muse_q38_metal.py: lazy registration
+  from live modules, per-step eligibility (uniform pure-spec decode,
+  m<=8), VLLM_QC_MUSE=1|shadow with exact state snapshot/restore
+  (muse mutates conv/ssm/KV state, so shadow runs eager first,
+  replays muse against the pre-state, restores the eager
+  post-state); every failure path degrades to eager + one log line.
+- Bringup rounds (each = full serving gate chain, restore-on-fail):
+  - R1: DSV4 anchors BIT-EXACT (20th consecutive) + canonical null
+    c1 16.418/16.378 sha 467b35c3 BIT-EXACT (hook inert without
+    env). Shadow phases INERT — two causes found:
+  - R2 diagnosis: (a) eligibility demanded
+    hidden_rows == num_actual_tokens but the runner PADS decode
+    batches -> muse runs the actual rows, zeroes the tail; (b) added
+    first-N rejection-reason diagnostics (a silently-inert opt-in
+    path is a bug class of its own).
+  - R3 ROOT CAUSE of the remaining inertness: the DFlash2 drafter
+    taps target hidden states at layers [5,19,33,47,61] via
+    aux_hidden_state_layers EVERY step; the hook guard excluded any
+    aux configuration -> permanently skipped. FIX = real scope
+    addition: the muse CB now EXPORTS the five tap values in-CB
+    (muse_add_out: hidden + residual at each tapped boundary,
+    matching interfaces._maybe_add_hidden_state), and shadow mode
+    compares the taps too — direct validation of the
+    acceptance-critical drafter inputs. Anchors BIT-EXACT (21st) +
+    null c1 16.403 467b35c3 on the R3 build. Registration then
+    reached its first real contract failure: in_proj_ba is
+    UNQUANTIZED (Unsloth Dynamic ignore-list: in_proj_a/in_proj_b
+    only) -> added fmt 2 dense-bf16 GEMV (muse_dense_gemv glue,
+    simdgroup fp32-accum dot; ba is N=2*Hv, tiny).
+- Checkpoint quant map (from config.json config_groups, recorded for
+  the emit): fp8ch = attn q/k/v/o + gdn in_proj_qkv/z + out_proj +
+  lm_head + layers 56-63 MLP; nvfp4 = all other MLP gate/up/down;
+  dense bf16 = in_proj_ba only.
+- R4 (dense-GEMV build): anchors BIT-EXACT (22nd) + null c1 16.403
+  467b35c3. Muse CB ran END-TO-END for the first time (64 layers, no
+  crash) but shadow read garbage (final cos ~0.01). cap-1 split:
+  residual EXACT / hidden cos ~0 -> suspected in-place residual
+  aliasing in the fused add-norm; ping-pong res buffers shipped (R5)
+  + GEMV routing aligned to the serving hosts (m==1 base / 3..8
+  mv4r / 2 mb). R5: unchanged -> aliasing theory DISPROVEN.
+- R6 stage-dump instrument (layer-0 slots vs host-op recompute):
+  EVERY stage bit-exact or ulp — gu and mlp EXACT vs host GEMVs.
+  The "garbage" was a COMPARISON ARTIFACT: _eager_prefix captured
+  mid-loop (h, r) as REFERENCES and compared after the remaining 63
+  eager layers ran — the serving stack recycles those buffers.
+  LESSON: shadow-compare boundaries must be CLONED at capture.
+- R7 (clone fix + cap sweep 1,3,4,5,8,16,48,0 in ONE boot): cap-1
+  hidden now cos 0.999997 (ulp), residual EXACT. Break enters at
+  cap 3; caps 1,2,3 refine: LAYER 1 ALONE breaks (cap-2 hidden cos
+  0.12, residual cos 0.73-0.82). Layer types confirmed: attn at
+  3,7,11,... so this is GDN-vs-GDN — layer 0 perfect, layer 1 wrong.
+- R8 stage isolation on layer 1 (debug_layer instrument): h0 ulp,
+  qkvz/ba EXACT vs host GEMVs, mixer/gu/mid/mlp EXACT — ONLY
+  "gdncore" diverges (cos ~0.8 vs host replay of the same three
+  kernels on the same dumped inputs against restore(pre) state).
+  Same kernels + same inputs are deterministic => THE TWO SIDES SAW
+  DIFFERENT STATE. Hypothesis: some conv/ssm write escapes the
+  shadow snapshot row set (conv_slots rows + slot_table rows).
+  R9 probes: host replay deterministic (replay2 bit-exact);
+  mixer_vs_eager cos ~0.1 (muse genuinely wrong); full-pool diff
+  found the smoking gun.
+- R10 ROOT CAUSE (the real one): **GDN state pools are SHARED across
+  layers with PER-LAYER slot windows** — interval attribution showed
+  the eager pass writes conv rows [1,5,9,13,...] / ssm [1..12+]
+  (stride 4 = table width per layer) while muse wrote only layer-0's
+  window [1]/[1..4] FOR EVERY LAYER: I fed one layer's
+  _mps_spec_cache to all 48 GDN layers, so every muse layer stomped
+  layer-0's state. Layer 0 was perfect because those were its own
+  slots. FIX: per-GDN-layer spec metadata threaded end-to-end
+  (registration stores each layer's metadata prefix; try_step
+  collects each layer's spec cache; muse_q38_run takes
+  spec_cu/conv_slots/slot_table/num_accepted as per-layer tensor
+  vectors; shadow snapshot/restore cover each layer's own rows).
+  R11 RESULT: the fix LANDED. Caps 1-4 ulp-class (hidden cos
+  0.99997-0.999997 — the first attention layer included), then
+  smooth drift: cap 8 cos 0.987, cap 16/48 ~0.956, FINAL cos 0.993,
+  aux taps 0.987-0.99999. Shape = accumulated ulp amplified by the
+  GDN recurrence (the divergent ops vs eager: native fused-add-norm
+  seams x129, silu glue, qk-rope chain, sigmoid-mul — each
+  ulp-class; muse GEMVs are bit-identical to the host ops), not a
+  broken layer.
+- R12 (running): anchors (23rd, .so rebuilt) + null c1 + fine sweep
+  caps 4,5,6,7,8 + **FIRST MUSE-SERVE BOOT** (VLLM_QC_MUSE=1):
+  needle, c1 x2, 2500x64, c4, c8. PREDICTIONS (in advance): anchors
+  bit-exact; null c1 467b35c3; fine sweep shows smooth growth (no
+  single-layer jump); serve needle PASS; c1 sha DIFFERS from
+  467b35c3 (the accepted trajectory re-pin); c1 TPS is the headline
+  unknown — muse removes the entire per-op host dispatch for
+  eligible decode steps (U23 measured ~73% of channel time in
+  CB-granularity footprints, but U44 calibration warns shares are
+  queue-tail-inflated): anything from flat to +30%.
+- R12 RESULTS: **MUSE-SERVE c1 = 20.73/20.74 tok/s sha 8037fd34
+  (deterministic 2/2) = +26.1% over canonical 16.44 — the U23
+  CB-granularity thesis VALIDATED.** c4 22.99 / c8 25.54 sha
+  467b35c3 (m>8 ineligible -> eager fallback BIT-EXACT: the off-path
+  is transparent). 2500x64 3.44 sha 3b4921fb (re-pinned trajectory).
+  Ramp essay coherent. **BUT: 30k NEEDLE FAIL** — coherent refusal
+  ("no such vault mentioned"), i.e. long-context retrieval loss, not
+  garbage. Theory 1 (registration-time max_blocks truncating the
+  expanded block table) FALSIFIED: fixing the bound to the pool size
+  changed NOTHING (all shas byte-identical). R13: cap-sweep shadow
+  AT 30k — **cap 4 (first attn layer) still ULP-EXACT at 30k** (cos
+  0.99995): the attention emit is CORRECT at long context. The
+  blow-up is pure compounding (cap 8 cos 0.865, final 0.71 at 30k vs
+  0.987/0.993 at ramp ctx): per-layer ulp seeds x 30k-softmax gain x
+  GDN recurrence. Strategy pivot: ELIMINATE THE SEEDS instead of
+  accepting drift. Audit found the seams already bit-match (eager
+  GemmaRMSNorm.forward_mps routes to the SAME qc gemma kernels muse
+  emits); remaining seeds = 3: (a) MLP silu — eager is qc_swiglu
+  ("bitwise vs native"), muse had its own glue -> now emits
+  qc_swiglu with identical args; (b) attention gate — eager is
+  torch sigmoid+mul (two roundings), muse fused one -> new
+  muse_sigmoid_mul_exact per-op-round mirror (U44 technique);
+  (c) layer-0 entry — eager uses the 1-arg gemma kernel, muse used
+  add-zero -> now emits the same 1-arg kernel + residual copy.
+- R14 PREDICTION (in advance): all shadow caps at 30k read
+  max|d| = 0 BIT-EXACT — every muse op is now either the same kernel
+  eager runs or a proven per-op mirror. If so, THE TRAJECTORY RE-PIN
+  BECOMES UNNECESSARY: muse would serve sha 467b35c3 at +26%.
+- R14 RESULT: cap 4 and aux6 went BIT-EXACT at 30k (seed fixes
+  landed) but cap 8 was unchanged — divergence entered at LAYER 7,
+  the SECOND attention layer. Instrumented group counts: **the 16
+  attention layers span 4 KV GROUPS (4 distinct metadata objects, 4
+  block tables, 4 slot mappings; GDN has 10 distinct mds)** — the
+  same class of bug as R10: muse fed group-0's block table to all 16
+  layers, so 12 of them attended over group-local block ids resolved
+  against the wrong pool. Caps 6/7 bit-exact, cap 8 broken =
+  perfect signature.
+- R15 (per-group attention refactor: run() takes per-group
+  block_table/seq_lens/slots/max_context vectors + per-attn-layer
+  group index; per-group expand emits + split-K sizing; snapshot
+  uses per-layer group slots):
+  - 30k shadow: cap 8 |d| 9.8e-04, cap 48 cos 0.9993, final cos
+    0.9997, aux6 EXACT — ulp-class everywhere, no structural break.
+  - **MUSE SERVE: NEEDLE PASS. c1 17.098/17.111 sha 467b35c3
+    BIT-EXACT with canonical (+4.0% over 16.44).** 2500x64 3.427
+    sha aa448847 (residual ulp seed rolls the longer-ctx
+    trajectory; -1% TPS). c4 23.00 sha 467b35c3 / c8 25.55 (eager
+    fallback, tie-carriers as expected).
+  - HONESTY NOTE: the R12 "+26%" was INFLATED by the group bug —
+    12/16 attention layers read tiny wrong page sets, making PA
+    artificially cheap. Correct attention pays its bandwidth; +4.0%
+    is the true muse c1 win as of this build.
+- NEXT: muse-mode phase census (where does the step spend time now —
+  if the CB is GPU-bound, the dispatch-tax thesis is closed at c1
+  scale and further wins need different levers: drafter/sampler
+  host cost or kernel time).
+
+### UPDATE 53 (2026-08-24) — N14 P4: muse retained + default flip; c1 reaches the modeled ceiling
+
+- Phase census (sync-bracketed, muse vs pre-muse): target_forward
+  **176.7 -> 87.9 ms/call (-50%)**; eager layer brackets fired on
+  only ~4/492 steps (~99% muse eligibility at c1); drafter+sampling
+  ~32 ms bracket unchanged. Production async overlap already hid
+  most of eager's encode cost, so the sync -50% nets +4.1% TPS —
+  the U44 calibration (queue-tail-inflated profiler shares) applied
+  to U23's ~73% claim exactly as warned.
+- **c1 17.10 tok/s = the N3-era modeled ceiling** ("GEMV floor ~27
+  ms + ~31 ms non-GEMV => ~17 tok/s c1 cap", UPDATE 15): muse
+  closed the dispatch tax; c1 now sits at its bandwidth wall.
+- P4 retention gate (final build): DSV4 anchors BIT-EXACT 2/2 x3
+  (24th consecutive); null boot c1 16.419 sha 467b35c3 (hook
+  transparent); MUSE SERVE: 30k needle PASS, c1 17.068/17.142 sha
+  **467b35c3 BIT-EXACT** (+4.1% over canonical 16.44), 2500x64
+  3.448/3.459 sha aa448847 DETERMINISTIC 2/2 (TPS flat vs 3.46;
+  the one re-pinned leg — ulp-class per-step diffs, quality gated
+  by the needle), c4 23.12 / c8 25.59 eager-fallback bit-exact,
+  400-token quality read coherent and articulate.
+- DECISION: RETAINED + **DEFAULT FLIP for qwen38-nvfp4-1 only**
+  (VLLM_QC_MUSE=1 in the profile env; VLLM_QC_MUSE=0 is the kill
+  switch; the -tq profile keeps muse OFF — its TQ KV layout is
+  untested under muse and registration would quarantine to eager
+  anyway). The flip is within the user's standing GO (re-pin
+  accepted); the realized cost is smaller than accepted: c1 pin
+  UNCHANGED, only 2500x64 re-pins.
+- New canonical pins: c1 17.10 sha 467b35c3 (154.4% of the Q4_K
+  bar) / c4 23.12 / c8 25.59 / 2500x64 3.45 sha aa448847.
+- Raw: perf/results/2026-08-24/{muse_shadow_gate,
+  anchor_regate_muse_p2}/; /tmp/phaseprof_68861.txt vs _28113.txt.
+
 ## 2026-08-17 — CodeRabbit review response (QuixiCore-Metal PR #3 findings applied to both repos)
 
 - Status: retained (correctness/hardening, no perf-path change)
@@ -7168,6 +11156,58 @@ Raw: perf/results/2026-08-15/kdial-sweep/.
   the qgemv mr-geometry thread pending its follow-up verification. The
   decode commit's own review pass produced no actionable comments.
 
+### UPDATE 54 (2026-08-25) — Pre-PR audit cleanup: NANPROBE harness removal, steady-cache conv_slots fix, dead-kernel deletion, lint/format pass
+
+- Trigger: user GO for the PR. Four parallel review agents audited all 63
+  dirty files (bring-up python / Metal kernels / serving-path python /
+  configs+docs+global sweep) before the commit series.
+- Findings fixed (full list in the commit series that follows):
+  1. CORRECTNESS (latent): GDNAttentionMetadata._mps_spec_cache outlives
+     its step under VLLM_QC_STEADY_META reuse, and its conv_slots field is
+     a COPY of spec column 0 (strided -> .contiguous() copies) that the
+     in-place steady_decode_update refresh cannot reach -> stale GDN conv
+     slot ids on a same-shape batch-composition swap. Fix: the steady
+     update now drops the memo (metadata._mps_spec_cache = None); the
+     first GDN layer of each steady step rebuilds it (the memo's scope is
+     one step across 48 layers, never the metadata lifetime).
+  2. NANPROBE forensic harness removed wholesale (qwen3_next /
+     qwen_gdn_linear_attn / metal_attn): _victim_check hard-coded canary,
+     /tmp torch.save dump, ~30 env-dead probe sites — scaffolding for the
+     KV stride-order bug that get_kv_cache_stride_order already fixed.
+  3. _PPTimer print() diagnostic removed from mamba_hybrid postprocess
+     (its own comment marked it interim; the 71 ms/step cost it chased
+     was resolved by UPDATE 34).
+  4. Metal: dead muse_silu_mul_rows kernel deleted (qc_swiglu won the
+     emit); dead res_dump/zero State buffers deleted; gdn_recur_spec now
+     guards num_accepted in [1, table_stride] (OOB slot_table[-1] read on
+     invalid input); muse_q38_run validates positions like the standalone
+     host; pybind arg names for the 23/17-arg layer registration defs.
+  5. metal_phaseprof.wrap() now returns fn undecorated when all profiling
+     is off (was: wrapper frame on every execute_model call on every
+     platform).
+  6. Hygiene: profiles.json note fixes (-df2/muse, qwen38-1 back-refs,
+     DFlash2 k=3 vs block_size contradiction, fetch-management honesty),
+     test_profiles.py source-key update + entry-mode validation test,
+     HANDOFF scratchpad-path/stale-section fixes, ruff check+format clean
+     over all 47 python files (repo config; HEAD was already clean).
+- PREDICTIONS (in advance of the rebuild gate): DSV4 anchors 8tok
+  573db39598e7 / off1-2000 bb83cc3054a3 / 2500x64 f75e1d41ac3d ALL
+  BIT-EXACT (no DSV4-path behavior change; 25th consecutive). Canonical
+  c1 17.10-class sha 467b35c3 BIT-EXACT, 2500x64 3.45-class sha aa448847
+  BIT-EXACT, needle EXACT: every change is dead-code removal, comments,
+  validation on already-valid inputs, or env-dead paths; the conv_slots
+  fix only changes steps where the old value was WRONG (c1 has no
+  composition swaps; c4/c8 are TPS gates). TPS within noise everywhere
+  (phaseprof early-return removes a python frame; too small to see).
+- Serving gate (12:45-12:59): DSV4 anchors 8tok 573db39598e7 5/15/3 2/2 /
+  off1-2000 bb83cc3054a3 2/2 / 2500x64 f75e1d41ac3d 2/2 — ALL BIT-EXACT,
+  25th consecutive. Canonical (profile boot, muse registered): NEEDLE
+  PASS; c1 17.117/17.142 sha 467b35c3 BIT-EXACT; 2500x64 3.453/3.434 sha
+  aa448847 BIT-EXACT; c4 23.04 / c8 25.54 (TPS gates, within noise).
+  Box left serving the canonical.
+- Prediction audit: all predictions held exactly.
+- Decision: series committed (UPDATEs 5-54) and pushed for PR.
+- Raw: perf/results/2026-08-25/{anchor_regate_audit, audit_regate}/.
 ## 2026-08-12 - DFlash Spec Gap: Reference Measurements Localize the Wall
 
 - Question: model card advertises 250 tok/s spec on RTX 5090 (74.9 no-spec,
@@ -10977,6 +15017,115 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
   which step first diverges. Their sums are already extracted; our side needs
   hooks inside QwenGatedDeltaNetAttention rather than at module boundary.
 
+## 2026-08-25 - Metal Profile Validation Sweep: 2 PASS, 1 blocked, DSV4 registry geometry FAILS on 128 GiB
+
+- Scope: every registry profile compatible with this machine (M5 Max,
+  128 GiB), each with its registered drafter, via the real server path
+  (`slimserve <profile> --serve`) and seeded shipped-defaults requests
+  (seed 42, no sampling overrides). Vision profiles got text + image
+  requests (synthetic red-bordered rectangle + blue ellipse PNG).
+  Harness: perf/results/2026-08-25/profile-validation/validate_profile.py.
+- glm52-xxs-1: BLOCKED by the registry, correctly -- IQ2_XXS needs
+  256 GiB unified memory (this box has 128) and the profile is also
+  status-gated (Metal sparse-MLA unvalidated). Not substituted.
+- qwen38-q2kxl-1: PASS text+image. Health 19-21 s warm. Text: coherent
+  Jupiter-moons answer, 221 tokens in 5.8 s, DFlash 2 acceptance 43.7%
+  (mean len 2.31). Image: vision path healthy without torchvision (PIL
+  fallback); shipped thinking mode deliberates at length on the shapes
+  image (2048 tokens still thinking, grounded pixel-arithmetic
+  reasoning, no loop); offline smoke shows the completed answer path.
+- muse-kdyn-1: PASS text+image. Artifacts fetched by slimserve.fetch
+  (registry-exact sizes; the Aug-10 local copies were a different
+  revision). Health 32 s. Text coherent; image answer describes the
+  shapes exactly, finish=stop, 264 tokens in 23.6 s. DFlash acceptance
+  mean len 2.4-3.0.
+- dsv4-xxs-1: FAIL at registry geometry. Server reached health (537 s
+  cold) and returned 200s, but output is multilingual token soup at
+  1.1 tok/s with 0/55 draft tokens accepted. This is the pending
+  close-out from 2026-08-24 (registry.log's resp1 was an EngineCore
+  500; small-geometry smoke was healthy).
+- Bisect (offline probes, ctx 3072 fixed, only kv_cache_memory_bytes
+  varied; seeded, same prompt; raw in ~/.local/scratch/dsv4-geom/):
+  1 GiB 29.9 tok/s coherent; 4 GiB 30.8 coherent (head byte-identical);
+  8 GiB 27.3 coherent; 9 GiB 26.2 coherent; 12 GiB 3.6 tok/s COHERENT
+  but crawling; 16 GiB 1.9 tok/s GIBBERISH. Context length is
+  exonerated (all probes at 3072; the 262144 resize never entered).
+- Mechanism: weights+drafter stack is 93.6 GiB;
+  torch.mps.recommended_max_memory() = 107.52 GiB on this box.
+  93.6+9 = 102.6 fits (fast, correct); +12 = 105.6 approaches the limit
+  (driver paging, 7x slowdown, still correct); +16 = 109.6 exceeds it
+  (non-resident reads return garbage rather than faulting). Classic
+  working-set eviction: perf degrades before correctness.
+- Not an int32/uint32 offset bug: 4 GiB (2^32 bytes) and 9 GiB pools
+  are clean, so 32-bit byte/element offset theories are all ruled out.
+  Branch exonerated too: metal-decode-sync-removal's small-geometry
+  output matches the 08-24 main-stack smoke.
+- Decision: dsv4-xxs-1's Metal override (16 GiB KV) does not fit a
+  128 GiB machine alongside 93.6 GiB of weights. Options for the fix
+  owner: size the Metal KV pool from
+  recommended_max_memory - weights - margin (8 GiB here keeps ~300K
+  fp8_ds_mla tokens and measured 27 tok/s), and/or add a boot-time
+  guard refusing geometries whose planned residency exceeds the
+  device working set -- today it serves garbage with HTTP 200.
+- Raw: perf/results/2026-08-25/profile-validation/ (server/engine logs,
+  raw request JSON per profile) and ~/.local/scratch/dsv4-geom/probe_*.
+
+## 2026-08-25 - FIXED: Metal KV pools are fitted to the device working set
+
+- Baseline: the validation sweep earlier today. dsv4-xxs-1 at its
+  registry geometry served multilingual token soup at 1.1 tok/s with 0%
+  draft acceptance while returning HTTP 200; the KV-pool bisect showed
+  <=9 GiB coherent at 26-31 tok/s, 12 GiB coherent at 3.6, 16 GiB
+  garbage.
+- Hypothesis: the profile's fixed pool is honoured verbatim, and on
+  unified memory an oversized pool is not an OOM. Since
+  `_pin_weights_resident` pins the weight heaps, the KV pool is what the
+  driver evicts, so decode reads non-resident pages and returns garbage
+  with no error to catch.
+- Change (vllm/v1/worker/metal_worker.py): new
+  `_fit_kv_pool_to_working_set`, applied on both budget paths in
+  `determine_available_memory`. It measures residency from
+  `torch.accelerator.get_memory_info` (which on Metal reports against
+  `recommendedMaxWorkingSetSize`), keeps back max(4 GiB, 4% of the
+  working set) for activations/scratch/fragmentation, grants the smaller
+  of the request and that budget, and raises when under 0.5 GiB would
+  remain instead of booting a doomed geometry. The granted value is
+  written back to `cache_config.kv_cache_memory_bytes` so the log line
+  and the KV allocator agree. Only the Metal worker changed; the CUDA
+  path is untouched, since a discrete GPU answers an oversized pool with
+  a real OOM.
+- Why residency is measured, not declared: DSV4 IQ2_XXS is 87.3 GiB of
+  files but loads to 93.57 GiB, and Muse's Q4_K_XL is 18.3 GiB of files
+  at 42.66 GiB resident (1.07x to 2.0x). No profile can compute this
+  from artifact sizes, which is exactly how the 16 GiB figure was
+  derived wrongly.
+- Correctness/measurement, all through `slimserve <profile> --serve`
+  with registered drafters and seeded shipped defaults:
+  - dsv4-xxs-1: PASS. Clamp fired -- "Requested 16.00 GiB KV pool does
+    not fit this machine; using 6.52 GiB" (96.70 GiB resident of the
+    107.52 GiB working set, 4.30 GiB reserved). 880,117 KV tokens, 3.36x
+    concurrency at 262,144 per request. Coherent Jupiter-moons answer,
+    256 tokens in 10.84 s = 23.6 tok/s, spec accepting (mean length
+    1.51). Was 1.1 tok/s of garbage.
+  - qwen38-q2kxl-1: unchanged. 12 GiB granted exactly, no clamp, text
+    output byte-identical to the pre-fix run.
+  - muse-kdyn-1: unchanged. 12 GiB granted exactly, no clamp, image
+    answer identical, finish=stop.
+- Also corrected: the dsv4-xxs-1 Metal profile note in profiles.json
+  contained the bad arithmetic in prose (artifact bytes vs a guessed
+  ~115 GiB working set). It now states the pool is a ceiling the worker
+  fits to the machine, and records the real figures.
+- Tests: tests/v1/worker/test_metal_kv_pool_fit.py (8 cases: exact grant
+  when it fits, the DSV4 clamp, refusal when nothing useful fits, the
+  floor boundary, reserve scaling on a 512 GiB machine, and that the fit
+  never inflates a request). Suite: 45 passed / 103 skipped. Ruff clean.
+- Decision: RETAINED. Remaining follow-up: the 6.52 GiB grant is the
+  safe floor, not a tuned figure -- the bisect showed 8-9 GiB pools
+  decoding at 26-27 tok/s on this box, so the 4 GiB reserve could be
+  revisited with a measured activation peak for DSV4.
+- Raw: perf/results/2026-08-25/profile-validation/ (post-fix server logs
+  and per-request JSON) and ~/.local/scratch/dsv4-geom/probe_*.
+
 ## 2026-08-25 - FIX: DFlash drafter wrote K/V in the wrong cache layout
 
 - Status: RESOLVED. DFlash2 speculation now passes the full profile smoke on
@@ -11038,7 +15187,2432 @@ Load test (no-spec, in-process LLM, max_model_len 8192) iterated through:
 - Both ROCm profiles now pass as registered, nothing disabled:
   qwen38-nvfp4-1 (safetensors, MTP k=2) and qwen38-q2kxl-1 (GGUF, DFlash2
   k=3, run under a temporary mi300x widening that is reverted after each
-  run -- the profile still lists only `metal`).
+  run -- at that checkpoint the profile still listed only `metal`; the next
+  entry records the retained MI300X variant).
+
+### UPDATE 55 (2026-08-25) — Merge origin/main (55 parallel commits) + full re-gate
+
+- The PR branch merged main's parallel Qwen3.8 campaign (vision/MoE
+  qwen3_5 stack, GGUF fixes, per-platform profiles schema, fused DFlash
+  drafter CB, small-M GEMMs, stride-aware paged kernel + 64-bit KV
+  gather). 32 conflicts reconciled — details in merge commit b59af307c.
+  Key integration decisions: steady-decode metadata kept OURS (main's
+  version excluded the GDN hybrid) + main's num_computed_tokens_cpu
+  refresh grafted; metal_attn keeps split-K D=256 + bound machinery and
+  adopts main's kv_cache_gather_range on the exact path; profiles fold
+  our three Metal profiles into main's variants schema with a NEW
+  variant-level speculator override (MI300X=MTP / Metal=DFlash2);
+  both DFlash2 drafter stacks and both single-CB systems coexist.
+- Metallib + .so rebuilt from merged sources (main's tensor-ops kernels
+  needed __HAVE_TENSOR__ guards for the metal3.1 toolchain; duplicate
+  D=256 instantiations deduped; muse PA fallback passes the new
+  kv_block_stride). slimserve suite 63 passed; all merged modules import.
+- PREDICTIONS (in advance): DSV4 anchors ALL BIT-EXACT (26th; main's
+  kernel deltas are additive instantiations, a batch-kernel bit-compat
+  pragma off the anchor path, and new kernels our legs never launch).
+  Canonical c1 17.1-class sha 467b35c3 BIT-EXACT, 2500x64 3.45-class
+  sha aa448847 BIT-EXACT, needle EXACT (serving-path kernels and
+  value-critical python unchanged; merged python deltas are
+  value-identical restructures). Risk to watch: boot-time structural
+  breakage from the new profile schema / model-class routing (arch now
+  resolves to main's ConditionalGeneration wrapper), muse registration
+  on the shared trunk.
+
+- GATE ROUND 1 (post-merge build): DSV4 anchors 8tok 573db39598e7 and
+  off1-2000 bb83cc3054a3 BIT-EXACT (26th consecutive); 2500x64 ROLLED to
+  73f41acf8ca0 (42/110/22, deterministic 2/2, wall 4.60-4.65s — same
+  class as the aa448847 pin). Prediction MISSED on that leg. Attribution
+  (hypothesis, code-level): main's DSpark grammar-aware drafting commits
+  (7d0b41f4a, 09f714f37) touch vllm/v1/worker/gpu/spec_decode/, which
+  shifts acceptance trajectories without changing verified numerics —
+  response text inspected and coherent (bandwidth/FLOPs essay prose).
+  Accepted as the new pin; recorded in baseline_status.
+- GATE ROUND 1 canonical boot: DIED at processor init —
+  Qwen3VLVideoProcessor hard-requires torchvision (absent from the venv;
+  torch 2.13.0 pairs badly with a naive pip torchvision). Merged arch
+  resolution sends Qwen3.5 through main's ConditionalGeneration vision
+  wrapper, exactly the predicted risk. Fix: `language_model_only: true`
+  added to all three Metal variants' engine args (text-only serving is
+  what these profiles are; zeroes the modality limits so the vision
+  processor chain is never constructed). Suite 63 passed.
+- GATE ROUND 2: boot reached health (fix effective) but the primer 500'd:
+  TypeError in qwen_gdn_step — the merge had left BOTH campaigns'
+  `_forward_core_mps` defs in QwenGatedDeltaNetAttention. Python resolves
+  the LATER def (main's in-place `(mixed_qkv, b, a, core_attn_out)`
+  core), silently shadowing ours, so our forward_mps call bound
+  num_tokens (an int) to the tensor param. Unification: main's core
+  renamed `_forward_core_mps_native`; our dispatcher stays the single
+  entry with priority metal-five-kernel (canonical, gate-default-on) >
+  main's fused-step core (incl. its spec-verify route, via a new
+  `_forward_core_native` adapter: split_ba + container alloc + gated
+  norm) > `_forward_core_torch` oracle. `_output_projection` refactored
+  into `_gated_norm` + projection wrapper so the adapter reuses the
+  fused-norm eligibility path. NOTE for main's box: with no env set,
+  dispatch now prefers our metal path; VLLM_QWEN38_FUSED_GDN semantics
+  unchanged, VLLM_METAL_GDN=0 restores their exact pre-merge route.
+- AST sweep of all merge-touched python for the same duplicate-def
+  pattern: clean (model_runner property/setter pairs are false
+  positives). Phase-B re-gate (round 3) relaunched.
+- GATE ROUND 3 (both fixes in): ALL GREEN. Boot healthy 71 s, ramp
+  clean, muse_q38 registered (64 layers, mode=1). Needle EXACT. c1
+  1000x256 **17.260 / 17.258 tok/s sha 467b35c3 BIT-EXACT** (canonical
+  held through the merge; marginally above the 17.10-17.14 class). c1
+  2500x64 3.459 / 3.453 sha aa448847 BIT-EXACT. c4 23.129 (sha matches
+  canonical tie-carrier), c8 25.62 (tie-carrier, TPS matches 25.59
+  canonical). Raw: perf/results/2026-08-25/merge_regate/.
+- PREDICTION AUDIT: canonical legs ALL HIT (c1 sha, 2500x64 sha, needle).
+  DSV4 2/3 — the 2500x64 roll to 73f41acf8ca0 was missed; the stated
+  risk (boot-time structural breakage from schema/model-class routing)
+  materialized twice (torchvision wrapper, GDN duplicate def), both
+  fixed above. Verdict: merged build is the new canonical baseline; the
+  serving-path numerics survived a 55-commit parallel campaign merge
+  bit-exactly.
+
+### UPDATE 56 (2026-08-25) — CodeRabbit review round on PR #12: 14 fixes + 2 declines
+
+- Review triggered manually (repo <10 stars). 16 inline findings; the two
+  most valuable were REAL merge regressions CodeRabbit caught that our
+  gates missed: (1) attn_utils steady-eligibility gained main's
+  `is_prefilling is not None` conjunct, which the mamba-hybrid caller
+  never passes top-level — the steady metadata cache silently never hit
+  post-merge (perf-only; U38's landed win was off). Restored our gate
+  structure. (2) the profiles variants rebuild dropped the -tq profile's
+  `speculative_overrides` (drafter TURBOQUANT backend + turboquant_k8v4
+  dtype) — the -tq boot-reshape failure its own notes document.
+  Restored + regression test.
+- Other fixes: paged_attention_verify now takes the kernel-facing
+  contiguous cache pair under page-local layouts (latent crash with
+  VLLM_QC_MUSE=0 at ctx>1024); steady_decode_update also invalidates
+  _mps_fused_spec_plans (same lifetime bug class as U54's conv_slots);
+  the Metal spec dispatch falls back to the native spec route when the
+  .so lacks gdn_recur_spec; gdn_mps_fallback conv fns slice the front
+  width-1 ring (spec-configured pools are width-1+num_spec wide);
+  turboquant splitk gated on op presence; flashinfer top_k deterministic
+  kwarg guard; drafter hub fallback carries the pinned revision;
+  muse cap validates attn_group length; spec conv state_cols guard
+  raised to kernel-1+run-1 (uniform-run bound, matches its own error
+  message); phaseprof dumps moved from predictable /tmp names to a
+  mkdtemp dir; HANDOFF header refreshed; 3 pre-existing ISC004s fixed.
+- DECLINED with reasoning (replied on the PR): dequant-once dual layout
+  (measured, gated design for the 128 GB target: packed GEMV feeds
+  decode bandwidth, dense feeds MPS prefill GEMM; =call is the
+  constrained-box escape; native quantized-GEMM prefill via qgemm_sm is
+  the recorded follow-up).
+- .so rebuilt (host-side .mm guards only; metallib untouched).
+- PREDICTIONS (in advance): DSV4 anchors BIT-EXACT vs current pins
+  (573db39598e7 / bb83cc3054a3 / 73f41acf8ca0) — changed .mm entry
+  points are off the DSV4 path. Canonical: needle EXACT, c1 sha
+  467b35c3 BIT-EXACT (TPS 17.1-17.3; steady-cache restoration is
+  value-identical metadata reuse), 2500x64 sha aa448847 BIT-EXACT,
+  c4/c8 at canonical.
+- GATE RESULTS (all predictions HIT): DSV4 anchors BIT-EXACT 2/2 x3
+  (27th consecutive: 573db39598e7 / bb83cc3054a3 / 73f41acf8ca0).
+  Canonical: needle EXACT; c1 **17.400 / 17.383 tok/s sha 467b35c3
+  BIT-EXACT** — up from the post-merge 17.26: the restored steady
+  metadata cache is live again and worth ~+0.8% at c1; 2500x64
+  3.443/3.455 sha aa448847 BIT-EXACT; c4 23.012 sha 467b35c3; c8 25.563
+  (tie-carrier 8c58a4c6, matches the merge-gate run). muse_q38
+  registered. Raw: perf/results/2026-08-25/{anchor_regate_coderabbit,
+  coderabbit_regate}/. Box left serving canonical.
+
+## 2026-08-27 - 8x3090: P2P driver + 32 GiB BAR1 + NCCL P2P (infrastructure, supersedes SHM-era collectives)
+
+- Baseline (pre-change): NCCL SHM transport, 2.7 GB/s all-reduce busbw at
+  84 MB payloads on 8x RTX 3090 (EPYC 7702, four root complexes). Phase-A
+  serving baseline on that fabric: c1 109.61 / c8 409.66 tok/s
+  (perf/baseline_status.md).
+- Hypothesis: consumer-GPU P2P is a driver-policy limit, not hardware; the
+  QuixiAI 610.57.04 fork (tinygrad-derived BAR1-P2P force-enables) plus a
+  full-size BAR1 restores direct GPU-GPU DMA and lifts the collective
+  ceiling roughly 10x.
+- What it took (each step measured, all needed):
+  1. Patched modules installed; P2P matrix all-OK; but pairs at 0.9 GB/s ->
+     IOMMU translated mode was the cause; `iommu=pt` -> 23-26 GB/s peer
+     copies on every pair.
+  2. NCCL still hung at the FIRST collective, even 2 ranks. Root cause:
+     256 MiB BAR1 cannot hold NCCL's persistent peer mappings (copy-engine
+     transient mappings work, which is why bandwidth tests pass). BAR1 must
+     cover the framebuffer.
+  3. Firmware path to 32 GiB BAR1 on Gigabyte MZ22-G20: BIOS R43 exposes a
+     ~1.75 TB 64-bit window per root complex ("Prefetchable MMIO Above 4G
+     Size" = 2 TB/NBIO, already set); but firmware still enumerates GPUs at
+     256 MiB and neither the driver probe resize nor sysfs
+     resource1_resize can regrow the bridge windows in place (ENOSPC).
+     Fix: program the ReBAR control register directly, remove the four GPU
+     root-port subtrees, rescan, reload driver. Scripted in the driver
+     repo: open-gpu-kernel-modules/tools/resize-bar1.sh (+ systemd unit;
+     the ReBAR register resets every boot). All 8 GPUs now 32768 MiB BAR1.
+  4. NCCL then works but defaults to SHM for cross-root-complex pairs:
+     4.2 GB/s. `NCCL_P2P_LEVEL=SYS` -> 24.7 GB/s busbw, 41 us small-AR
+     latency (1x2560 bf16). 9.1x over the SHM ceiling.
+- Profile changes (qwen38fn-fp8-8/rtx3090): env += NCCL_P2P_LEVEL=SYS,
+  VLLM_GDN_DECODE_KERNEL=triton (Phase-A verdict, now pinned rather than
+  per-run).
+- Correctness: ar_bench2.py all-reduces converge (values verified by NCCL's
+  own reduction; serving correctness gate = the re-baseline bench runs).
+- Raw: perf/results/2026-08-27/qwen38fn-3090-p2p/ (bench logs), README and
+  scripts in /home/quixi/open-gpu-kernel-modules (commit a5c0fb70).
+- Decision: RETAINED (infrastructure). Serving re-baseline with P2P
+  collectives is the new reference; SHM-era numbers are historical.
+- Follow-up in flight: vLLM custom allreduce on PCIe P2P. Upstream gate
+  refuses >2 PCIe GPUs; C++ dispatch also launched NO kernel for
+  not-fully-connected topologies (silent no-op - would have produced
+  garbage if only the Python gate were lifted). Both fixed:
+  VLLM_CUSTOM_AR_ALLOW_PCIE=1 opt-in + PCIe-tuned 1stage/2stage cutover
+  (64 KiB) in csrc/custom_all_reduce.cuh. A/B pending rebuild.
+
+## 2026-08-27 - 8x3090: P2P serving re-baseline; custom-AR-over-PCIe rejected
+
+- New serving baseline on the P2P fabric (NCCL_P2P_LEVEL=SYS, triton GDN,
+  idxshare, MTP k=2, 128K): c1 148.81 (+35.8% vs SHM-era 109.61),
+  c8 647.88 (+58.2% vs 409.66). Raw:
+  perf/results/2026-08-27/qwen38fn-3090-p2p/bench_p2p_c{1,8}.log.
+- Custom allreduce over PCIe P2P (VLLM_CUSTOM_AR_ALLOW_PCIE=1):
+  - Correctness: PASS against an fp32 all-gather reference; CA is MORE
+    accurate than NCCL (single fp32 accumulate: max err 3.1e-2 vs NCCL
+    5.7e-2..1.1e-1 on 8-way bf16 sums). First parity run "failed" only
+    because it treated NCCL as ground truth.
+  - Latency (8 ranks, bf16 [t,2560]): CA wins only at t=1 (34.0 vs
+    40.3 us); loses at t=3 (74 vs 40), t=8 (159 vs 40), t=64 (393 vs 69).
+    1stage's all-peers-read-all pattern multiplies PCIe traffic; with MTP
+    k=2 decode ARs are ~3-token, squarely in the losing region.
+  - Decision: REJECTED for serving (skipped the serving leg; microbench is
+    conclusive). Code retained env-gated off: correct, opt-in, and the
+    right substrate for a future PCIe-shaped kernel (reduce-scatter tree
+    with fp32 staging). Raw: car_parity2.log (latency), rerun (fp32 ref).
+
+## 2026-08-27 - 8x3090 chain2: FP8 main-KV serving verdicts (128K parity, 262K restore, APC)
+
+- Baseline: P2P serving reference, bf16 KV @128K: c1 148.81 / c8 647.88.
+- Hypothesis: layer-scoped FP8 main QSA KV (VLLM_QWEN4_EXP_FP8_MAIN_KV=1)
+  halves the dominant KV slab, restoring the model's native 262,144 context
+  that bf16 could not fit (3.52 GiB needed vs 2.2 free at 128K-era sizing),
+  at some decode cost from the SM86 software e4m3 decode.
+- Three integration bugs found and fixed on the way (first end-to-end run of
+  the fp8 path; unit tests had covered only the kernels):
+  1. Layer gate mapped "fp8" through STR_DTYPE_TO_TORCH_DTYPE (=uint8, the
+     view dtype) and tripped its own allocation-dtype assert -> allocate
+     torch.float8_e4m3fn directly.
+  2. FlashAttentionImpl base __init__ rejects fp8 KV on SM86 -> resolved
+     structurally: Qwen4ExpQSAFlashAttentionImpl is now a standalone
+     AttentionImpl (FA contributed no kernels; cache writes use the generic
+     reshape_and_cache_flash CUDA op; vestigial FA checks deleted).
+  3. Hybrid block-size aligner computed the attention page from the global
+     cache dtype (bf16), so fp8 halved the real page and the packed GDN
+     state page (406,016 B) no longer fit a main-KV slot (204,800 B) ->
+     aligner now recomputes with the override dtype; block_size doubles,
+     page bytes stay 409,600, token capacity doubles.
+- Results (exact 1000/2000, temp 1.0/top_p 0.95/top_k 20, seed 42):
+  | config            | c1     | c8     |
+  | bf16 @128K (ref)  | 148.81 | 647.88 |
+  | fp8  @128K        | 133.17 | 465.92 |
+  | fp8  @262K        | 123.85 | 483.74 |
+  | fp8  @128K + APC  | 128.17 | 471.06 |
+- Reading: fp8 tax is ~10% c1 / ~25-28% c8 (software e4m3 decode in the QSA
+  gather kernel dominates under batch load). 262K serves correctly - the
+  native-context goal is met. APC costs ~4% on a no-reuse workload and
+  functions at both concurrencies (functional gate passed; its win needs
+  prefix-repeating traffic).
+- Decision: profile default stays bf16 @128K (throughput config). FP8 is
+  RETAINED as the context-max option (fp8 @262K), pending user choice on a
+  second profile id vs. a documented env override. Next optimization lead:
+  replace the arithmetic e4m3 decode with a 256-entry LUT or tighter
+  bit-twiddle to close the c8 gap, then re-run this A/B.
+- Raw: perf/results/2026-08-27/qwen38fn-3090-p2p/bench_fp8kv*_c{1,8}.log,
+  serve_fp8kv*.log (chain2d).
+
+## 2026-08-27 - 8x3090 chain3: MTP k=3 wins c1, loses c8; dynamic-k rejected (cudagraph fall-off)
+
+- Baseline: P2P reference (k=2 + idxshare): c1 148.81 / c8 647.88.
+- k=3 fixed: c1 163.26 (+9.7%) / c8 571.06 (-11.9%). On the P2P fabric,
+  deeper speculation now pays at low concurrency (ARs 9x cheaper than the
+  SHM era, where k=3 lost both legs); still loses under batch.
+- dynamic-k ([[1,2,3],[3,32,2]] = k3 for bs<=2, k2 for bs 3-32):
+  c1 60.88 / c8 435.34 - catastrophic, NOT a schedule-format error.
+  ROOT CAUSE: vllm/v1/core/sched/scheduler.py gates the
+  pad-decode-to-uniform-spec-size branch on `dynamic_sd_lookup is None`,
+  so with a dynamic schedule decode batches are never padded to the
+  uniform shape and FULL_DECODE_ONLY cudagraphs never match -> every
+  decode step runs eager.
+- Decision: dynamic-k REJECTED until the cudagraph dispatcher can capture
+  and dispatch multiple uniform-decode query lengths (one per scheduled
+  k). k choice stays fixed; the k sweep (nospec,1,2,3,4,5 x c 1,2,4,8)
+  will pick the operating point and quantify what a graph-compatible
+  dynamic-k would be worth.
+- Raw: bench_k3p2p_c{1,8}.log, bench_dynkp2p_c{1,8}.log (chain3).
+
+## 2026-08-27 - 8x3090: MTP draft-length sweep, full k x concurrency surface
+
+- Method: one server lifecycle per k (engine-level setting; graphs are
+  captured per decode shape), exact 1000/2000 bench at c in {1,2,4,8},
+  idxshare on for every k>0 leg. k=2 c1/c8 and k=3 c1/c8 reuse the p2p
+  baseline and chain3 legs (same config, same fabric).
+
+  | k      | c1     | c2     | c4     | c8     |
+  | nospec |  88.49 | 157.27 | 285.68 | 489.16 |
+  | 1      | 128.17 | 205.19 | 348.23 | 602.11 |
+  | 2      | 148.81 | 242.98 | 371.29 | 647.88 |
+  | 3      | 163.26 | 262.33 | 426.13 | 571.06 |
+  | 4      | 154.04 | 234.40 | 394.55 | 564.59 |
+  | 5      | failed to start: QSA ring capacity 12 (compress_ratio 4,
+             span 4+5=9 -> 12) does not divide attention block size 416.
+             Structural, not a flake; not pursued (k4 already declines). |
+
+- Reading:
+  - The drafter is worth +68% (c1) tapering to +32% (c8) at k=2 vs nospec.
+  - k=3 is the best fixed k at c1 (+9.7%), c2 (+8.0%), and c4 (+14.8%);
+    k=2 only wins at c8 (647.9 vs 571.1, -11.9% for k3). The crossover
+    sits between c4 and c8.
+  - k=4 declines everywhere vs k=3: acceptance decay beats the extra
+    draft depth on this fabric.
+- Decision: the ideal operating point is per-batch k (k=3 below the
+  crossover, k=2 at c8), which requires the cudagraph dispatcher to hold
+  captures for multiple uniform-decode query lengths - the same gap that
+  made the scheduler-level dynamic-k run eager (previous entry). Until
+  that lands, fixed k is a traffic-profile choice:
+  k=3 maximizes c<=4 throughput, k=2 maximizes c8. Profile currently
+  keeps k=2 (idxshare); recommendation to flip pending user's traffic
+  shape. Raw: bench_{nospec,k1,k4,k2fill,k3fill}_c{1,2,4,8}.log.
+
+## 2026-08-27 - 8x3090: TurboQuant k8v4 main-KV RETAINED - dominates FP8 on every axis
+
+- Hypothesis: TQ k8v4 (fp8 keys - e4b15 on Ampere - plus 4-bit uniform
+  values with per-slot f16 scale/zero, 388 B vs 1024 B bf16 per
+  token-head, 2.64x) beats the unit-scale e4m3 main-KV both on decode
+  cost (integer dequant vs arithmetic fp8 emulation on SM86) and on
+  quality (real scales).
+- Implementation: VLLM_QWEN4_EXP_TQ_MAIN_KV=1, layer-scoped like the fp8
+  option. Reuses the drafter-path fused store (_tq_fused_store_fp8); the
+  QSA sparse-gather kernel decodes K via Triton's native e4b15 bitcast
+  and V via nibble unpack + FMA. TQFullAttentionSpec end-to-end; three
+  exact-type checks (CSA role classifier, packed-layout detector, MTP
+  drafter owner lookup) widened to accept the TQ subclass - each found
+  by a startup failure, each now unit-covered.
+- Results (exact 1000/2000, seed 42, k=2+idxshare):
+  | config          | c1     | c8     | c8 accept |
+  | bf16  @128K     | 148.81 | 647.88 | 62.8%     |
+  | fp8   @128K     | 133.17 | 465.92 | 59.9%     |
+  | TQ    @128K     | 133.21 | 562.12 | 62.3%     |
+  | TQ    @262K     | 131.79 | 571.63 | 65.3%     |
+- Reading: TQ ties fp8 at c1, beats it +20.7% at c8, and its draft
+  acceptance sits at bf16 parity (62.3 vs 62.8) where fp8 loses 3 points
+  - the per-vector value scales matter for verifier quality. The native
+  262,144 context serves at effectively no cost over TQ@128K: the bench
+  workload (1000/2000 tokens) never exercises the ceiling, so the
+  562-vs-572 c8 delta and the 62.3-vs-65.3 acceptance delta are
+  single-run noise, not a 262K speedup. A long-context bench leg
+  (e.g. 100K prompts) is the follow-up that actually measures the
+  large-context regime.
+- Decision: TQ k8v4 RETAINED as the context-max KV format; the fp8
+  option is superseded (kept only as a diagnostic env). Remaining trade
+  vs bf16@128K: -10% c1 / -13% c8 for 2x the context. Profile default
+  decision (throughput vs context) left to the user; both configs are
+  one env + one field apart.
+- Raw: bench_tq{128k,262k}_c{1,8}.log, serve_tq*.log (tq_legs2).
+
+## 2026-08-27 - 8x3090: TQ 128K vs 262K decision matrix (c1..c64) + the c8 scaling cliff
+
+- Both legs TQ main-KV, max_num_seqs 64, identical but for max_model_len:
+  |  c | TQ@128K | accept | TQ@262K | accept |
+  |  1 |  150.21 | 72.5%  |  129.86 | 57.1%  |
+  |  8 |  564.61 | 61.7%  |  576.75 | 66.0%  |
+  | 16 |  461.97 | 59.4%  |  466.12 | 61.8%  |
+  | 32 |  420.40 | 60.2%  |  425.47 | 63.0%  |
+  | 64 |  426.76 | 63.9%  |  421.32 | 61.9%  |
+- Verdict: the legs are statistically identical at every concurrency
+  (c1 is single-stream sampling noise; acceptance for the SAME config
+  spans 57-73% at c1 across runs). 262K WINS BY DEFAULT: same speed and
+  quality, double the ceiling. Caveat recorded: this workload never
+  exercises deep context; a long-context leg (100K prompts) is still
+  owed before claiming the deep regime.
+- New problem surfaced: throughput PEAKS AT c8 (~570) and falls ~25% by
+  c32, identically in both legs. Known half: with k=2, decode steps are
+  seqs x 3 query tokens; c32 (96) and c64 (192) exceed the 64-token
+  graph-capture ceiling and run eager. Unknown half: the c8->c16 drop
+  (564->462) happens with BOTH shapes graph-captured (24 and 48 both in
+  the capture list).
+- In flight: Exp A re-benches c8-c64 with max_cudagraph_capture_size 192
+  (config-only); Exp B captures torch-profiler traces at steady-state
+  decode c8 vs c16 on that config and diffs GPU-time share by kernel
+  (trace_diff.py) to attribute the remaining gap. Suspects: QSA
+  sparse-kernel tile-tier switch at 32<programs<=256, Marlin MoE
+  M-growth, GDN batch scaling, AR payload growth.
+- Raw: bench_tqd{128,262}_c*.log, tq_decision.log; traces under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/traces/ once Exp B runs.
+
+## 2026-08-27 - 8x3090 cliff hunt: graphs and GPU kernels exonerated; slow-48-token state is per-server-instance
+
+- Timeline of evidence (all c16, exact 1000/2000, TQ main-KV, 128K):
+  - Dispatch-stats instrumentation (VLLM_CUDAGRAPH_DISPATCH_STATS in the v2
+    CudaGraphManager.dispatch) shows 48tok/FULL graph hits >82% in BOTH
+    fast and slow runs -> not a graph miss.
+  - Torch-profiler trace diff seqs64-vs-seqs32 is NULL on the GPU side
+    (kernel shares within 0.25%) while unprofiled throughput differed
+    462 vs 660 -> whatever differs is not steady-state GPU kernel time.
+  - Exp D: seqs=64 reproduced 461.6. Exp F: identical seqs=64 config
+    measured 653.1 -> the valley is NON-DETERMINISTIC per server launch.
+  - Exp A observed c16 slow (463) and c32/c64 fast (661/669) in the SAME
+    server -> when present, the pathology is specific to the 48-token
+    step, not global to the instance.
+  - Acceptance correlates (slow ~0.60, fast ~0.63) but is far too small
+    to explain 40%; treated as symptom.
+- Current hypothesis space: per-launch state affecting the 48-token decode
+  step only - e.g. capture-time memory layout of that graph's static
+  buffers, or a host-side per-step cost that intermittently lands on the
+  critical path. py-spy attach failed (yama ptrace_scope); needs
+  `sudo sysctl kernel.yama.ptrace_scope=0` for host-side flamegraphs.
+- In flight: Exp G - one seqs=64 server, bench sequence c16 x3, c8, c32,
+  c16 to test whether the slow state is sticky per instance and whether
+  it survives interleaved other-size benches.
+- Raw: cliff_exp{C,D,E,F,G}.log, serve_exp*.log, traces/ under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - 8x3090: NEW correctness bug - CUDA illegal memory access at c32 after bench churn
+
+- During Exp G (seqs=64, cap 96, TQ main-KV): after 56 completed requests
+  (c16 x3 + c8 benches), the first c32 bench crashed every worker with
+  "CUDA error: an illegal memory access was encountered", surfacing at
+  metadata build (short_conv_attn.py:333) - i.e. an earlier async kernel
+  faulted; the report site is just the sync point.
+- The only prior c32 run (Exp A: seqs 64, cap 192) worked at 661 tok/s but
+  ran c32 after only c8/c16 legs on a fresh server. Suspects: request-churn
+  state (CSA ring wraparound, TQ store slot edges, drafter state reuse)
+  interacting with the 96-token step.
+- Correctness outranks the perf mystery: Exp H (cliff_expH.log) replays a
+  compressed churn sequence (c16,c8,c32,c16,c32,c8 at 600 output tokens)
+  to find a fast repro; next step after repro is CUDA_LAUNCH_BLOCKING=1 +
+  eager mode to name the faulting kernel, then compute-sanitizer on a
+  reduced case.
+- Exp G stickiness data (before the crash): c16 on one seqs=64 server ran
+  664/619/638 - a FAST instance; the slow state was not reproduced this
+  launch. Bimodality remains open, possibly linked to the same
+  state-lifecycle bug.
+
+## 2026-08-27 - 8x3090: CORRECTION - bf16 c16/c32 was never measured; TQ's high-concurrency tax is ~25-30%
+
+- Exp M (bf16 KV @128K, seqs 32, cap 96, standard 1000/2000 bench, churn
+  order c16,c16,c16,c8,c32,c16): c16 843/809/908/919, c8 586.7, c32 861.0.
+- Corrected KV table (standard bench, best observed):
+  | config      | c8      | c16    | c32    |
+  | bf16 @128K  | 587-648 | ~870   | ~861   |
+  | TQ   @128K  | 570     | 625-660| 661*   | (*c32 at cap192/seqs64)
+  | TQ   @262K  | ~570    | ~625   | ~660   |
+- The earlier "TQ ties bf16" conclusion compared TQ c16/c32 against bf16's
+  c8 only - bf16 was never benched at c16/c32. TQ's real cost at high
+  concurrency is 25-30%; the 262K context still requires TQ (bf16 cannot
+  fit 262K), but the trade is context vs meaningful throughput, not free.
+- Also: bf16 shows NO c16 valley (870 at c16) - the valley phenomenon and
+  the depressed 620-660 band are TQ-specific; prime suspect is the TQ
+  gather kernel's V-dequant cost at batch (each V byte loaded twice via
+  dim//2 addressing; scale/zero as four 1-byte loads per column).
+- Exp N: cap96+TQ churn ran CLEAN (crash now 2-of-4, intermittent,
+  TQ+cap96-implicated; next tool is compute-sanitizer on the churn).
+- Next: optimize the TQ gather (single-load nibble unpack, 32-bit
+  scale/zero load), re-A/B, then sanitizer run for the crash.
+
+## 2026-08-27 - 8x3090: c16 valley ROOT-CAUSED and FIXED - QSA tile-tier collapse for quantized KV
+
+- Root cause (found by direct kernel microbench, rows x topk=2048/rank
+  shapes): qsa_sparse_paged_attention's launch profile switches at
+  base_programs > 32 from (block_n=16, warps=4) to (block_n=64, warps=2).
+  For bf16 KV that tier is fine; for in-register-dequant KV the ALU-heavy
+  decode cannot be hidden by 2 warps over 64-wide tiles:
+  | rows | bf16    | fp8-e4m3  | TQ k8v4  |
+  | 24   | 105 us  | 137 us    | 116 us   |
+  | 48   | 140 us  | 3179 us   | 530 us   |  <- the c16 valley (48 tokens)
+  | 96   | 275 us  | 6002 us   | 937 us   |
+  This also explains the serving observations: c8 (24 tokens) unaffected,
+  c16 (48) collapsed, and the fp8 main-KV c8 serving loss (its prefill and
+  larger steps hit the wide tiers catastrophically). The earlier "valley
+  disappears at seqs=32" runs were coincidental batch-mix effects; the
+  bimodality tracked how often steps landed in the bad tier.
+- FIX: quantized-KV paths (KV_TQ/KV_FP8) keep block_n=16 / 4 warps at
+  every program count (ops/qsa.py). Microbench after:
+  | rows | fp8     | TQ       | TQ/bf16 |
+  | 24   | 138 us  | 114 us   | 1.09x   |
+  | 48   | 232 us  | 192 us   | 1.37x   |
+  | 96   | 503 us  | 354 us   | 1.29x   |
+- Also retained: 32-bit fused scale/zero load in the TQ path (replaces 4
+  scattered byte loads). REJECTED: tl.interleave single-load nibble unpack
+  - Triton 3.7.1 miscompiles interleave feeding tl.dot (parity maxdiff
+  1.2; probes that materialize to memory pass, dot-operand layout breaks);
+  the dim//2 double-read hits the same L1 line and is effectively free.
+- All 124 qwen4_exp tests pass. Exp O (cliff_expO.log) re-runs the TQ
+  standard-bench row (c16 x3, c8, c32, c16; seqs 32, cap 96) for the
+  corrected KV decision table against bf16's 843-919 c16 / 861 c32.
+
+## 2026-08-27 - 8x3090: tier fix validated in serving - TQ matches bf16, cliff eliminated
+
+- Exp O (TQ @128K, seqs 32, cap 96, fixed kernel, standard bench):
+  c16 829/888/826/864, c8 592.9, c32 867.6. vs bf16 (Exp M): c16 843-919,
+  c8 586.7, c32 861.0. TQ == bf16 within noise at every measured
+  concurrency; the 2.64x KV compression is now effectively free.
+- Scaling is monotonic and healthy: c8 593 -> c16 ~850 -> c32 868. The
+  entire c16-valley / scaling-cliff phenomenon was the quantized-KV
+  tile-tier collapse (previous entry); every TQ and fp8 serving number
+  measured before this fix (562-660 band) was afflicted.
+- No crash during Exp O (fixed kernel, TQ+cap96, 6 benches with churn).
+- Decision: TQ k8v4 main KV RETAINED as the profile default with the tier
+  override in place. In flight: Exp P = TQ@262K, seqs 32, cap 96,
+  c1/c8/c16/c32 - the final profile validation row.
+
+## 2026-08-27 - 8x3090: campaign close-out - converged
+
+- Long-context first datapoint: 100,000-token prompt, 500 output, final
+  profile (TQ@262K): c1 aggregate 21.0 tok/s (wall includes the ~100K
+  prefill; no server errors; deep-context serving works). The c4 leg is
+  BLOCKED BY THE BENCH HARNESS, not serving: exact_prompts can construct
+  only one distinct 100K prompt from sonnet.txt (follow-up: offset-cycled
+  prompt construction for multi-request long-context benches).
+- Final validated state (slimserve-launched, registered profile):
+  c1 130.9 / c8 547.0 / c32 881.6; raw-command row c1 136.2 / c8 585.0 /
+  c16 838.2 / c32 879.6; accept 58-65%. 175 tests pass. Baseline table
+  updated in perf/baseline_status.md.
+- Campaign arc (c8/c32 standard bench unless noted):
+  | stage                          | c8    | c32   | context |
+  | bring-up (SHM, bf16)           | 409.7 | -     | 128K    |
+  | P2P driver + NCCL SYS          | 647.9 | 425.5 | 128K    |
+  | + capture ceiling covers c32   | 564.6 | 661.1 | 262K TQ |
+  | + quantized-KV tile fix        | 585.0 | 879.6 | 262K TQ |
+  Net: 2.15x on peak throughput with double (native) context.
+- Retained: P2P driver stack (32 GiB BAR1 + iommu=pt + NCCL_P2P_LEVEL=SYS),
+  TQ k8v4 main KV (tile-fixed; == bf16 at c8-c32, 2.64x smaller),
+  max_num_seqs 32 + capture 96, MTP k=2 + index share, triton GDN.
+- Rejected along the way: fused GDN decode (-4.5% c8), custom AR over PCIe
+  (latency), fp8-e4m3 main KV (superseded by TQ), scheduler dynamic-k
+  (cudagraph fall-off), tl.interleave nibble unpack (Triton 3.7.1
+  miscompile into tl.dot).
+- WATCH FLAG: intermittent CUDA illegal access/instruction under bench
+  churn (2-of-6 pre-tier-fix, 0-of-4 after). The suspect wide-tile
+  quantized kernel path no longer executes; reopen with compute-sanitizer
+  if it recurs.
+- Backlog, in expected-value order: dynamic-k via multi-length graph
+  capture (k=3 wins c1-c4 by 8-15%); k=3 re-verdict on the fixed kernel;
+  Marlin EP tiny-M tuning; PLE gather fp8->bf16 fusion; multi-request
+  long-context bench support; py-spy host profiling (needs
+  kernel.yama.ptrace_scope=0).
+- Convergence criteria met: final two rounds (Exp P validation, slimserve
+  validation) changed nothing beyond noise; no unexplained anomaly open
+  (valley root-caused and fixed; crash under watch flag with its suspect
+  path removed); profile serves the best-known config with recorded
+  validation.
+## 2026-08-25 - Tuned the Metal KV reserve: 4 GiB -> 7 GiB (measured, not guessed)
+
+- Baseline: the fit shipped with a 4 GiB reserve floor, and its notebook
+  entry suggested the reserve was conservative because the earlier
+  KV-pool bisect showed 8-9 GiB pools decoding at 26-27 tok/s. That
+  bisect used ONE sequence. It understated memory demand badly.
+- Method: new harness
+  `perf/results/2026-08-25/kv-reserve-tuning/measure_activation_peak.py`
+  boots a profile at its registered geometry, stresses it at its OWN
+  configured batch width (max_num_seqs concurrent requests whose prompts
+  each exceed max_num_batched_tokens, so chunked prefill runs full-width
+  while decode carries max sequences), and samples device residency at
+  20 Hz throughout. Peak is reported against residency right after KV
+  allocation, which is exactly what the reserve must cover.
+  Two traps found while building it: the engine runs in a separate
+  EngineCore process by default, so the parent measured 0.0 GiB
+  residency (fixed with VLLM_ENABLE_V1_MULTIPROCESSING=0 plus a hard
+  failure when the baseline is implausibly small); and activation peak
+  is set by per-step batch width, not total prompt tokens, so the first
+  oversized-prompt version just ran 11 minutes for the same answer.
+- Measurements (M5 Max, 107.52 GiB working set):
+  | profile | pool | transient peak | peak resident | spare | tok/s |
+  |---|---|---|---|---|---|
+  | qwen38-q2kxl-1 (16 seqs x 2048) | 12.00 | 0.085 | 41.23 | 66.29 | - |
+  | dsv4-xxs-1 (32 seqs x 2176) | 6.52 | 5.411 | 106.64 | 0.88 | 22.17 |
+  | dsv4-xxs-1 | 4.00 | 6.411 | 105.13 | 2.39 | 22.62 |
+  | dsv4-xxs-1 (tuned) | 3.82 | 6.411 | 104.94 | 2.58 | 22.68 |
+- Finding, which REVERSES the earlier suggestion: DSV4's transient peak
+  under its own registered batch width is 5.4-6.4 GiB -- larger than the
+  4 GiB reserve. The 6.52 GiB grant survived only because post-KV
+  residency lands ~2 GiB below the naive weights+pool prediction, and it
+  came within 0.88 GiB of the working set at peak. The reserve was too
+  small in the dangerous direction, not too large.
+  Qwen3.8's transient is 0.085 GiB by contrast: the gap is architectural
+  (43 layers, sparse-MLA indexer scratch, 32 seqs, drafter), not a
+  batch-width scaling law, which is why the reserve stays a flat floor
+  anchored on the heaviest profile instead of a fitted formula.
+- The KV pool is not the transient: 90,560 prompt tokens commit only
+  ~0.67 GiB at DSV4's 7,954 bytes/token, and the transient peak is the
+  same 6.411 GiB at a 4.00 GiB pool as at 3.82 GiB. Total peak residency
+  grows ~0.6 GiB per GiB of pool (measured slope over two points).
+- Change: _KV_RESERVE_MIN_BYTES 4 GiB -> 7 GiB, chosen so a stressed
+  engine keeps ~2.5 GiB of the working set spare.
+- Result on dsv4-xxs-1: grant 6.52 -> 3.82 GiB, KV capacity 880,117 ->
+  515,461 tokens (still 1.97x the profile's 262,144 max_model_len),
+  peak residency 106.64 -> 104.94 GiB, spare 0.88 -> 2.58 GiB. Stress
+  throughput 22.17 -> 22.68 tok/s and server-path single-request output
+  byte-identical: the safety costs no measurable throughput.
+- Correctness: server path through `slimserve dsv4-xxs-1 --serve` with
+  the registered DSpark drafter and seeded shipped defaults returns the
+  same coherent answer as before the tune. Suite 45 passed / 103
+  skipped; ruff clean.
+- Decision: RETAINED. Follow-up if DSV4 ever needs more KV: the reserve
+  is dominated by sparse-MLA indexer and prefill scratch, so lowering
+  max_num_batched_tokens or max_num_seqs would free reserve directly --
+  measure before trading it.
+- Raw: perf/results/2026-08-25/kv-reserve-tuning/ (harness, peak-*.json,
+  logs) and perf/results/2026-08-25/profile-validation/.
+
+## 2026-08-26 - RETAINED: D=256 decode via partition+reduce (+6% gsm8k, essay wash)
+
+- Baseline: qwen38-q2kxl-1 D=256 attention entirely on the SDPA gather
+  path after the 2026-08-25 plain-kernel rejection (~15% slower,
+  under-occupancy: one simdgroup per (head, batch) = ~96 simdgroups at
+  decode widths). The rejection entry named this exact follow-up.
+- Change:
+  - Threaded the explicit 64-bit kv_block_stride through
+    paged_attention_partition and paged_attention_verify
+    (paged_attn_v2.metal buffer 17, launchers, host ops), same contract
+    as the plain kernel: hybrid blocks-first strided views walk
+    stride(0), bit-identical addressing for contiguous callers (fp16
+    partition site only; the fp8 partition and cascade kernels keep
+    contiguous addressing -- their callers pass dense caches).
+  - New host op paged_attention_partitioned(q, k, v, bt, ctx, scale,
+    window, max_context_len): partition (512-token slices) + exact
+    online-softmax reduce in one encode. max_context_len comes from the
+    HOST-side seq_lens copy -- sizing from the device tensor would be a
+    per-layer pipeline drain, the class the campaign just removed.
+    paged_attention_verify grew the same defaulted arg (its internal
+    context_lens.max().item() sync now only fires for callers without a
+    host bound).
+  - metal_attn.py: _PARTITIONED_HEAD_SIZES = (256,). Decode and the
+    expanded verify path route 256 through the partitioned op; the mq
+    verify gate dropped its head_size != 256 exclusion (the kernel now
+    walks strided caches) and both gates now read seq_lens_cpu instead
+    of seq_lens_gpu.max().item() (removes a per-call device sync that
+    also fired on the 64/128 expansion path).
+  - New instantiation paged_attention_verify_bfloat16_256: qwen38's
+    full-attention layers are bf16 and the mq route engages past 1k
+    ctx; found live when the long-context smoke aborted with "kernel
+    not found in metallib". kt/vt tiles 16 KB, inside the 32 KB budget.
+- Correctness: synthetic parity vs SDPA ground truth (rel <= 3e-4)
+  across D=256 strided qwen38-shape (batch 4 + single), D=128/64
+  contiguous (also bit-vs-plain-kernel), and the m=4 verify per-row
+  causal boundaries at 1.5k ctx. Live: seeded bench seed-stable both
+  arms; 3.6k-ctx prompt engages mq on all 16 layers and summarizes
+  coherently. NOTE: outputs are numerically exact but NOT bit-identical
+  to SDPA (different reduction order); at temp 1.0 the essay trajectory
+  flips one word ("discover" -> "generate") at a sampling boundary.
+  gsm8k trajectory unchanged.
+- Measured (same-conditions A/B, box warm, 3 repeats each):
+  - partitioned: essay 26.5-28.2, gsm8k 44.95-45.00
+  - SDPA route:  essay 25.9-28.5, gsm8k 41.68-42.71
+  Essay is a wash (both runs decline across repeats -- thermal, not the
+  route); gsm8k +6.4%, from getting D=256 verify/decode off the SDPA
+  per-request gather loop. The plain-kernel failure mode does not
+  recur: short contexts are 1 partition (occupancy-neutral vs plain but
+  fused), long contexts split.
+- Decision: RETAINED. Follow-ups mapped: partitioned route for 64/128
+  at long context (currently plain-kernel); mq engage log prints once
+  per layer (16 lines) on first long request.
+- Raw: ~/.local/scratch/qwen38-rebaseline/spec_paged256_part.log,
+  spec_sdpa_ab.log, longctx_mq_smoke2.log, paged_partitioned_parity.py.
+
+## 2026-08-27 - Review feedback: two profile-schema guards added (both caught real issues)
+
+- Capture-coupling enforcement: new registry test asserts
+  max_cudagraph_capture_size >= (k_max+1) x max_num_seqs for every
+  speculative profile with FULL decode graphs (k_max includes dynamic
+  schedules). On its FIRST run it caught qwen38-nvfp4-1/mi300x at capture
+  64 with k=2 x seqs 64 - decode batches above 21 requests silently ran
+  eager there, the same -52% cliff class measured on rtx3090. The MI300X
+  record is raised to 192 (safety-directional: more graphs, same kernels)
+  with a note that its re-baseline is pending on that platform.
+- Host-RAM gate: schema gains per-platform min_host_ram_bytes at the quant
+  level; hardware.detect() reads MemTotal; registry.allowed_on/resolve and
+  the CLI thread it through with a plan-time error naming the shortfall.
+  qwen38fn FP8/rtx3090 gates at 448 GiB (47.7 GiB pinned PLE x TP8 +
+  staging). Enforced by a test: any variant enabling
+  VLLM_QWEN4_EXP_PLE_HOST must carry a covering gate.
+- 53 profile tests pass.
+- Follow-up accepted from the same review discussion: the PLE table is
+  TP-replicated 8x in host RAM (381.6 GiB) though its content is
+  identical per rank - a /dev/shm-shared single pinned copy (the
+  sysmem_all_reduce.py pattern) cuts the requirement to ~48 GiB + weights
+  staging; the gate then drops to ~128 GiB. NVMe-backed tables were
+  considered and rejected for the serving default: UVA zero-copy needs
+  pinned pages, and the mmap alternative puts NVMe random-read latency on
+  the layer-2 decode critical path (prefetch could hide it; backlog).
+
+## 2026-08-27 - Grossness audit (user-prompted) + PLE dedup + dynamic-k status
+
+- PLE host table now SHARED across TP ranks: one /dev/shm segment, every
+  rank mmaps + cudaHostRegisters the same pages, rank 0 alone writes the
+  shards during load (the safetensors views are lazy, so the 47.7 GiB is
+  also read from disk once, not 8x). Host requirement drops 381.6 -> 47.7
+  GiB; the profile's min_host_ram_bytes gate drops 448 -> 128 GiB.
+  Fallback to a private pinned copy when /dev/shm cannot host it. Unit
+  tests: cross-instance aliasing + gather parity + fallback.
+- Removed vllm/distributed/device_communicators/sysmem_all_reduce.py:
+  unwired, superseded by the P2P fabric; repo policy is remove-or-
+  quarantine for retired experiments.
+- Deprecation note: the fp8-e4m3 main-KV path (VLLM_QWEN4_EXP_FP8_MAIN_KV)
+  is dominated by TQ k8v4 on speed, acceptance, and compression; retained
+  one cycle as a diagnostic, candidate for deletion.
+- Systemic risk flagged: dataclasses.replace() config views re-run full
+  __post_init__ against SHARED sub-configs (today's draft-view cudagraph
+  downgrade was one instance; _maybe_disable_dynamic_sd_for_data_parallel
+  mutates shared speculative_config the same way). Needs a design fix.
+- Dynamic-k V2 status: machinery works at steady state (dispatch stats
+  show 4tok/FULL at c1 k=3, 24tok/FULL at c8 k=2, no PIECEWISE override
+  after the draft-view guard), but (a) ramp-phase partial batches (e.g.
+  57-60 tokens) miss dispatch instead of padding up, (b) a crash
+  reappeared at c32, (c) early numbers (c1 135, c8 438) suggest the k=3
+  win is smaller on TQ than the bf16 sweep promised. PARKED as
+  experimental pending those three; static k=2 remains the profile
+  setting.
+- Open flake: test_qsa_reference[tp1_split64] fails deterministically in
+  the FULL tests/models/qwen4_exp run since the shm-PLE additions, passes
+  alone and in every pairwise combination. Repro:
+  pytest tests/models/qwen4_exp/ -q. Tracked, not yet root-caused.
+
+## 2026-08-27 - Dynamic-k WORKING on V2; c4 +18.6%; c32 under repetition test
+
+- After the family-staging fix, family-range clipping, and the memory
+  diagnosis (4000 allocator-OOM retries at unclipped two-family capture ->
+  0 after clipping; c32 no longer throttles to batch 16), dynamic
+  [[1,4,3],[5,32,2]] vs static k=2 on the IDENTICAL raw config
+  (TQ@262K, seqs 32, cap 128, trimmed capture list):
+  | c  | dynamic | static | delta  |
+  | 1  | 129-142 | ~131-136 (profile band) | wash  |
+  | 4  | 391.9   | 330.5  | +18.6% |
+  | 8  | 554-561 | 547-585 (profile band)  | wash  |
+  | 32 | 765.3   | 857.5  | -10.8% |
+- The c4 win is the pattern's payoff and is real (same-config control).
+  The c32 deficit decomposes into ~4% lower acceptance (59.8 vs 63.9 -
+  possibly plain sampling variance; the c8 acceptance band spans
+  58.1-66.0 across identical configs) and ~7% unattributed. Repetition
+  matrix (c32 x3 per config, dynrep/statrep) in flight before any
+  ship/no-ship call; the schedule stays OUT of the registered profile
+  until it wins or ties everywhere.
+- Pattern hardening shipped regardless (registry-relevant for future
+  profiles): per-family padded-up candidate staging, per-family batch
+  ranges clipped to the schedule (+/-4 margin), drafter-manager guard,
+  draft-view config guard, propose(num_steps), handler-width verify
+  control, scheduler prev-k padding - all pinned by
+  tests/v1/worker/test_cudagraph_dispatch.py (7 pure-Python tests incl.
+  an exhaustive batch x qlen sweep and a graph-budget bound).
+
+## 2026-08-27 - Dynamic-k c32 deficit fully attributed: machinery is free; the max-k-sized verify path costs 5%
+
+- Three-way controlled decomposition at c32 (TQ@262K, seqs 32, cap 128,
+  trimmed capture list, 3 runs each):
+  | config                                        | mean tok/s | accept |
+  | static k=2 (num_spec=2, no schedule)          | 845.7      | 0.644  |
+  | dynamic machinery, k=2 everywhere, num_spec=3 | 801.2      | 0.652  |
+  | dynamic machinery, k=2 everywhere, num_spec=2 | 871.0      | -      |
+  | dynamic schedule [[1,4,3],[5,32,2]]           | 787.8      | 0.617  |
+- Conclusions: (1) the dynamic-k machinery itself costs nothing (row 3 >=
+  static); (2) the whole step-rate deficit is the verify path being sized
+  by the CONFIG MAX k (sampler built decode_query_len=4 wide, per-seq
+  slots at 4) while steady rows are 3 tokens - a ~33% width tax on the
+  sampler stage worth ~5% of the step; (3) the residual acceptance dip
+  under the real schedule is schedule content (k=3 ramp/drain drafting).
+- Remaining engineering to make the real schedule free at c32: size the
+  verify/sampler path per step by the scheduled k instead of the config
+  maximum. Until then the schedule is a documented option (+18.6% at c4,
+  -7% at c32), not the profile default.
+- Raw: dynrep/statrep/dyndeg/dyndeg2 logs and benches under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Dynamic-k steady-state deficit ROOT-CAUSED: two synchronizing index_put_ per step
+
+- The "max-k width tax" hypothesis was wrong. GPU trace diff of the
+  num_spec=3 vs num_spec=2 degenerate configs (identical drafting) showed
+  per-step GPU time equal within 2% and kernel shares flat - but the
+  wider config fit 10% fewer steps into the capture window at LOWER GPU
+  utilization (39.6% vs 44.5% busy): the cost was host-side gap time.
+- CPU-op diff named it: aten::index_put_ at 2 calls/step x 13.8 ms in the
+  wide config vs 1 call/step x 0.056 ms in the narrow one. The draft
+  buffer write `buf[idx_mapping, :k] = drafts` plus the `-1` tail fill
+  use sliced advanced indexing, which falls onto a synchronizing path
+  when the slice does not cover the full row - each call drains the GPU
+  pipeline and erases the async-scheduling overlap.
+- FIX (model_runner.py): pad drafts to buffer width with one F.pad, then
+  a single full-row advanced-index write (the fast path); the handler
+  receives the pre-pad [reqs, k] tensor directly instead of a sliced
+  re-read of the persistent buffer.
+- Validation in flight (dynfix.log): degenerate-schedule config that
+  measured 801 with the syncing writes; expected ~846-871 (static
+  parity). The real-schedule 3x3 re-verdict follows.
+
+## 2026-08-27 - Dynamic-k SHIP-GATE verdict: machinery free, schedule ships as documented option
+
+- With the sync-free draft writes, the degenerate control reached static
+  parity (dynfix c32: 842.7/833.8/846.6 vs static 831-858) - the entire
+  dynamic-k machinery is now measured at zero cost.
+- Real schedule [[1,4,3],[5,32,2]] ship-gate: c32 823.8/831.8/816.8
+  (mean 824, -2.6% vs static mean 846), c4 394.9 (+19.5% vs 330.5),
+  c32 acceptance 0.621 vs 0.644. The residual c32 gap equals the
+  tokens/step arithmetic of the acceptance delta exactly: it is schedule
+  CONTENT (k=3 drafting during ramp/drain), not implementation.
+- Per the pre-committed rule (ship as default only if c32 lands in the
+  static band): mean 824 vs band floor 831 -> ships as a DOCUMENTED
+  OPTION in the profile notes; static k=2 remains the default because
+  c32 is the profile's peak operating point. Deployments with
+  latency-shaped (low-concurrency) traffic should flip the overrides.
+- Pattern complete for future profiles: schedule in speculative_overrides
+  + capture ceiling covering (k_max+1) x max_num_seqs is all a profile
+  needs; capture, dispatch, drafting, padding, and verify-width behavior
+  are automatic and pinned by tests/v1/worker/test_cudagraph_dispatch.py.
+- Raw: dynfix.log, dynship.log, bench_dynship_* under
+  perf/results/2026-08-27/qwen38fn-3090-p2p/.
+
+## 2026-08-27 - Cleanup sweep: roaming test flake root-caused; fp8 main-KV removed; config-view invariant enforced
+
+- Roaming full-suite flake (tp1_split64 one run, PLE host-gather the
+  next): the shm-PLE tests unlinked and dropped their mmap while the
+  pages were still cudaHostRegistered - dangling pinned-page state
+  corrupted whichever CUDA test ran next. A per-tensor finalizer made it
+  a core dump instead (nn.Parameter shares storage without keeping the
+  tensor object alive, so the finalizer fired mid-use). Fix: a
+  process-lifetime registry keyed by segment path (matching production
+  semantics, deduping same-process instances onto one mapping) with an
+  explicit release_shared_ple_tables() that unregisters BEFORE unmapping;
+  tests call it in teardown. Three consecutive clean full-suite runs.
+- fp8-e4m3 main-KV path removed entirely (env, layer/impl/backend
+  acceptance, aligner branch, arithmetic e4m3 Triton decoder, kv_fp8
+  wrapper path, parity test): dominated by TQ k8v4 on speed, acceptance,
+  and compression since the tile fix.
+- Config-view invariant named and enforced: VllmConfig._is_draft_model_view
+  documents that replace()-built draft views share every sub-config with
+  the serving config and must never mutate them from __post_init__; both
+  known mutators (dynamic-SD cudagraph downgrade, dynamic-SD DP disable)
+  are guarded, and a regression test builds the real config, creates the
+  draft view, and asserts the shared cudagraph_mode and schedule survive.
+- 213 tests green twice consecutively across qwen4_exp, profiles,
+  dispatcher, and CSA planner suites. MI300X capture re-baseline remains
+  deferred to that platform.
+## 2026-08-27 - Metal re-validation after the Flash-Next 3090 merge (PR #15): all green
+
+- Trigger: main merged the Qwen3.8-Flash-Next-FP8 8x3090 port (101
+  files), which reworks shared machinery on the Metal path
+  (mamba_utils.py +907 lines, gpu_model_runner.py). csrc/quixicore is
+  untouched (the new fused GDN decode kernel is _C_stable_libtorch,
+  CUDA-only), so no Metal extension rebuild.
+- Offline gate: seeded consolidated bench, heads byte-identical to the
+  post-partitioned-route baseline. essay 26.4-28.3, gsm8k 44.5-45.8 --
+  the partitioned-256 gain holds.
+- Server-path validation (registered drafters, seeded shipped
+  defaults; perf/results/2026-08-27/profile-validation/):
+  - qwen38-q2kxl-1 PASS text+image; the image request now finishes
+    thinking and answers correctly (577 tokens, finish=stop).
+  - muse-kdyn-1 PASS text+image, image finish=stop.
+  - dsv4-xxs-1 PASS text, 23.9 tok/s; KV working-set clamp fired as
+    designed (16 -> 3.82 GiB, 7 GiB reserve).
+  - glm52-xxs-1 remains registry-blocked on this 128 GiB box (needs
+    256 GiB) -- unchanged.
+- Suites: 45 passed / 104 skipped.
+
+## 2026-08-27 - Production service + WildChat-1M multi-turn traffic replay (qwen38fn-fp8-8 via systemd)
+
+- Deployment: systemd unit slimserve-qwen38fn (Restart=always, boot-enabled,
+  logs to /var/log/SlimServe with logrotate, VLLM_API_KEY auth). Two install
+  faults found and fixed: (1) StandardOutput=append: opens the log file
+  BEFORE LogsDirectory= creates the directory -> 209/STDOUT crash loop;
+  fixed with a tmpfiles.d entry (deploy/slimserve.tmpfiles). (2) systemd
+  units do not source ~/.bashrc, so FlashInfer JIT warmup died with
+  FileNotFoundError: 'ninja'; fixed by putting venv bin + CUDA 13.3 bin on
+  PATH plus CUDA_HOME/LD_LIBRARY_PATH in /etc/slimserve/env. The rank-5/6
+  CUDACachingAllocator OOM warnings during weight load were a red herring -
+  the same non-fatal retry warnings appear 4000x in successful serve logs.
+- New harness: benchmarks/benchmark_wildchat_replay.py. Samples real
+  WildChat-1M conversations, replays user turns one at a time per session,
+  appends the model's OWN streamed replies to the history (real trajectory
+  growth), closed-loop session concurrency, per-turn TTFT/e2e/usage records.
+- Workload: 128 conversations, 504 user turns, mean 3.9 turns/session,
+  thinking on (deployment default), temp 1.0 / top_p 0.95 / top_k 20,
+  max_tokens 1024/turn, identical workload at both concurrencies.
+- Results (0 errors in 1,008 turns; service healthy throughout):
+  - c32: 779.7 out tok/s (1,470 total tok/s incl prefill), TTFT p50/p90
+    11.6/24.2 s, e2e p50 31.5 s, mean reply 813 tok.
+  - c64: 780.5 out tok/s (identical - saturated), TTFT p50/p90 40.2/55.3 s.
+    Oversubscription buys zero throughput, only 3.5x TTFT: the profile's
+    c32 operating point is the right admission cap.
+- FINDING (open): effective concurrency ceiling is 27, not 32. Engine logs
+  show Running peaks at 27 with GPU KV cache usage 100% and a 5-6 deep
+  waiting queue even at c32, while the token pool (386,212 tokens) is far
+  from full on token count alone (~80K live tokens). Hypothesis: the
+  per-request fixed-size GDN recurrent-state group inside the 2.2 GiB/rank
+  KV budget exhausts at 27 slots. Impact: the c32 campaign numbers were
+  really c27+queue; a modest KV budget bump (util 0.9 -> 0.92, or trimmed
+  capture list) should recover true 32-slot decode. Follow-up: inspect
+  kv_cache_groups sizing, re-bench c32.
+- Comparison to synthetic baseline: exact-token c32 = 881.6 out tok/s;
+  real-traffic c32 = 779.7 out tok/s (-11.6%), explained by per-turn
+  full-history re-prefill (prefix caching disabled; hit rate 0.0%), short
+  replies (813 vs 2000 tok), and client-side turn turnaround. Total
+  processed throughput 1,470 tok/s. Multi-turn traffic is the first
+  workload where enable_prefix_caching=False visibly costs: depth-8 turns
+  re-prefill ~2K tokens every turn.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (warmup.json,
+  c32.json, c64.json, stdouts).
+
+## 2026-08-27 - 27-slot ceiling fixed (+27% c32); admission control shipped; short-prompt correctness bug found
+
+- Ceiling root cause (from WildChat replay finding): the packed CSA+linear
+  KV slab at util 0.9 held ~373 blocks/rank (2.23 GiB); each running chat
+  request pins ~13-14 blocks (attn pages at block_size 1056 + compressor
+  ring + 3 GDN state blocks at k=2 + drafter group), capping Running at 27
+  with the KV meter at 100%. util 0.9 was leaving ~1.2 GiB/rank idle.
+- Fix: gpu_memory_utilization 0.9 -> 0.95 in qwen38fn-fp8-8/rtx3090.
+  Pool: 2.23 -> 3.41 GiB, 386,212 -> 590,324 tokens, max concurrency
+  1.47x -> 2.25x. Validated on a manual serve (port 8001, no QA traffic):
+  c1 131.7 (baseline band unchanged), c32 1115.6 vs 881.6 = +26.5%,
+  Running peaks at the full 32 with Waiting 0 and KV peak 86.9%.
+  New baseline candidate; bench logs bench_ceilingfix_c{1,32}.log.
+- Admission control: new AdmissionControlMiddleware (api_server, env
+  VLLM_ADMISSION_MAX_CONCURRENT, profile sets 96 = 3x max_num_seqs) sheds
+  load past a bounded queue with 429 + Retry-After. Verified: burst of 120
+  -> exactly 96 admitted + 24 rejected. Unit tests
+  tests/entrypoints/test_admission_control.py (3 green).
+- OPEN CORRECTNESS BUG (found by the 120-burst, reproduced at c1): prompts
+  of exactly 1 or 3 tokens produce garbage ('!!!!' = token 0 = NaN-logits
+  signature) NONDETERMINISTICALLY at temperature 0 (n=3 gave ' at'/' in'/'!'
+  across identical runs). n=2 and n>=4 are always correct (mapped n=1..12
+  with fixed content). n=1 garbage from the first sampled token (prefill
+  broken); n=3 sometimes-good first token then garbage (decode also
+  implicated). Draft acceptance collapses to 1.2% in the same regime.
+  One of two 120-burst runs escalated to a fatal CUDA illegal memory access
+  (crash log serve_manual_8001_crash1.log) - consistent with the campaign's
+  intermittent illegal-access watch flag: reads of uninitialized/unmapped
+  memory that usually land in mapped garbage and occasionally fault.
+- PLE dilated short-conv (kernel 4, dilation 3 = ngram_size, state 9) prefill
+  math reviewed and looks correct; parity {1,3} does not match dilation-3
+  residues, so conv is not the prime suspect. Current A/B in flight: same
+  config without speculative_config (suspect: drafter KV/state writes for
+  packed-layout backends, cf. commit b4cc16492) - if no-spec is clean, the
+  drafter path is the fault; else next A/B is VLLM_QWEN4_EXP_TQ_MAIN_KV=0.
+- Raw: perf/results/2026-08-27/qwen38fn-service-wildchat/ (crash logs,
+  repro_burst.py, serve_nospec_8001.log).
+
+## 2026-08-27 - Short-prompt garbage + burst crash root-caused and fixed (two bugs)
+
+- Isolation matrix (spec x cudagraphs, manual servers on 8001): n=3 garbage
+  requires spec+FULL graphs; n=1 garbage persists in every combination.
+  Logprobs showed CONFIDENT distributions over wrong context (n=1 continued
+  an ASCII run: capture-dummy arange content), and greedy outputs were
+  nondeterministic -> uninitialized-memory reads, not NaNs.
+- Bug B (n=3, spec+graphs): batch shape alone chose the graph family. A
+  fresh 3-token prompt has the same shape as a k=2 spec-decode step
+  (uniform 3 tokens/req), so dispatch replayed the FULL spec-decode graph
+  over prefill work, reading sampled-token/state slots the request never
+  wrote. This is also the 120-burst engine killer ("Say hi." = 3 tokens
+  x 96 requests; 1-in-2 runs escalated to a fatal CUDA illegal access).
+  FIX: model_runner dispatch gate - a shape-uniform batch is only
+  graph-eligible if no scheduled request is still prefilling
+  (num_computed_prefill < prefill_len, O(num_reqs) numpy/dict check).
+- Bug A (n=1, everywhere): decode/prefill classification by query length.
+  The GDN builder split with plain qlen==1 (split_decodes_and_prefills
+  without treat_short_extends_as_decodes=False, unlike the mamba base
+  builder which already passes it), so a fresh 1-token prompt took the
+  GDN DECODE path (fused packed decode / causal_conv1d_update), which
+  reads conv+SSM state slots unconditionally - uninitialized for a
+  never-prefilled request. Same latent defect in the GDN spec-branch
+  manual count and the short-conv spec-branch masks.
+  FIX: gdn_attn non-spec split now passes
+  treat_short_extends_as_decodes=False; gdn spec-branch count and
+  short_conv spec-branch masks exclude is_prefilling rows (reorder
+  already places them behind true decodes, so contiguous splits hold).
+- Validation on the full production config (spec k=2, FULL graphs, TQ,
+  util 0.95, admission 96): n=1..12 all correct and DETERMINISTIC at
+  temp 0 (3 runs each); 3x 120-burst rounds of 3-token prompts all
+  survived (96x200 + 24x429 each); draft acceptance on short-prompt
+  bursts recovered 1.2% -> 58.0%. Dispatcher + admission suites green.
+  Perf re-check c1/c32 in flight (dispatch gate only affects batches
+  containing mid-prefill requests; steady decode untouched).
+- Logs: serve_{nospec,nograph,fixed}_8001.log, crash1/2 logs, repro_burst.py
+  under perf/results/2026-08-27/qwen38fn-service-wildchat/.
+
+## 2026-08-27 - PLE dilated-conv prefill OOM under multi-turn waves at util 0.95; sliced transient fix
+
+- First prefix-caching trial server (TQ + mamba 'align', util 0.95) passed
+  the single-stream correctness gate (byte-identical cached/uncached greedy
+  outputs, incl. n=1..8 short prompts and a 700-token shared-prefix chat
+  shape; mamba-align KV cost only 590,324 -> 581,447 tokens, -1.5%) but the
+  ENGINE OOM-crashed under the WildChat c32 replay: torch.OutOfMemoryError
+  allocating 148 MiB in _short_conv_dilated_prefill_batched.
+- Root cause is NOT prefix caching: the PLE dilated short-conv prefill packs
+  requests into ~5 dense [num_prefills, max_query_len, hidden] transients
+  (~1.7 GB for a 31 x ~2K-token turn wave at hidden 2560), which fit inside
+  the activation slack at util 0.9 but not at 0.95. The exact-token bench
+  (uniform 1000-token prompts, fewer concurrent prefills) never triggers
+  it -- so the shipped util-0.95 profile was exposed for ANY multi-turn
+  workload, prefix caching or not.
+- Fix: slice the packed conv pipeline over request chunks bounded by a
+  16M-element budget (single-pass fast path preserved; token selection via
+  sync-free masked gathers; per-slice state update). PLE suite 5/5 green.
+- Trial-2 relaunched: correctness gate + WildChat c32 replay on the fixed
+  build; ship/revert decision on its results.
+
+## 2026-08-27 - Prefix-caching trial verdict: correct but not shipped (1056-token blocks starve the hit rate)
+
+- Trial-2 (post PLE-slicing fix): correctness gate PASS twice (byte-identical
+  cached/uncached greedy outputs incl. short prompts and shared-prefix chat
+  shapes); WildChat c32 replay 504/504 turns, 0 errors - the OOM fix holds
+  on the exact workload that killed trial-1.
+- Measured benefit: prefix cache hit rate 2.2-2.4%. Root cause is
+  structural: the hybrid's mamba-page alignment forces block_size 1056, and
+  prefix caching reuses only COMPLETE blocks, so typical chat histories
+  (195-1,738 prompt tokens across depths 1-8 in this workload) rarely
+  finish even one shared block. Throughput 746.2 vs ~780 out tok/s (-4%),
+  mamba-align KV capacity cost -1.5%.
+- DECISION: not shipped as profile default. enable_prefix_caching remains
+  off; documented as a valid option for long-context multi-turn deployments
+  (10K+ token histories span many 1056-token blocks) pending a bench in
+  that regime. Raw: c32_prefixcache.json, serve_prefixcache_8001.log.
+- Final sweep: 104 tests green (slimserve profiles, cudagraph dispatch,
+  admission control, PLE host table, config-view invariant).
+
+## 2026-08-27 - c64 retest after the slot fix: 32 remains the peak, now for an honest reason
+
+- Motivation: the earlier "no gain past 32" verdict was measured while the
+  engine silently capped at 27 slots, so it had to be retested.
+- seqs=32/capture=96 (shipped config): c48 = 1056-1067 over three clean
+  rounds (vs 1134 at c32) - beyond 32 the client queue costs a little and
+  buys nothing, because decode batches above 32 seqs (>96 tokens) exceed
+  the graph ceiling and run eager.
+- seqs=40/capture=128 (proper >32 config): c32 987 / c40 1065 / c48 1077,
+  no crashes. Still below the shipped config's 1134 peak: the packed-slab
+  KV pool's fixed per-request cost (~90 MB/rank) binds at ~36 concurrent,
+  so extra slots trade graph efficiency for pool pressure. The wider
+  capture config also regresses c32 itself by 13%.
+- DECISION: profile stays at max_num_seqs 32 / capture 96; the c32 peak
+  (1,134.4) is now measured with all 32 slots genuinely active.
+- OPEN (top watch item): intermittent CUDA illegal-instruction race in
+  COMPILED-EAGER mixed spec+prefill batches. Repro: exact bench c48 on the
+  shipped config, ~1-in-4 runs (first hit dumped a 10-req mixed batch at
+  28% KV, no preemption; crash log serve_c64test_8001.log). Hidden by
+  CUDA_LAUNCH_BLOCKING=1 (960 tok/s c48 fully serialized, no crash);
+  today's classification/gate/PLE edits verified no-ops for the crashing
+  batch shape, and 3x c48 + all graphed seqs40 runs survived - consistent
+  with the campaign's pre-existing 2-in-6 watch-flag, which now has a
+  repro recipe. Suspect surface: stream ordering in the mixed-batch
+  metadata/state path; async_tensor_h2d itself audited stock-safe.
+  Production c32 exposure unchanged from the entire campaign (mixed
+  batches occur at any concurrency; crash observed only under the c48
+  stress shape so far).
+
+## 2026-08-27 - Crash-hunt update: burst crash attributed to the FIXED dispatch bug; soak hunting the one residual
+
+- Re-reading crash dumps: crash-1 (120-burst engine death) ran on PRE-fix
+  code and its dumped batch is a uniform 32x3=96-token spec-graph replay
+  containing fresh 3-token prompts - exactly bug B (shape-matched dispatch
+  into the spec-decode graph family), already fixed and regression-tested.
+  Attributed, closed.
+- Crash-2 (c48 bench warmup, post-fix) is the only unexplained instance:
+  a 2048-token mixed batch (7 spec decodes + 2 new prefills + 1 chunk
+  continuation) saturating the chunked-prefill budget, which is also the
+  compile_ranges endpoint; ALL TP ranks faulted simultaneously (illegal
+  address on one rank, illegal instruction on another - one wild-pointer
+  event, rank-local views), implicating TP-replicated inputs. Post-fix
+  rate: 1 in ~25 crash-shaped exposures; synthetic churn (135 waves), 10
+  warmup-shape bench loops, and 8 chunk-512-amplified loops all clean;
+  CUDA_LAUNCH_BLOCKING run clean (weak evidence - serialization changes
+  batch formation). Static audit cleared async H2D lifetime, output/draft
+  copy streams, QSA gather + store masking, fused-GDN (not on the shape).
+- Soak in flight: detached loop of the only crashing workload (c48
+  1000/2000, standard config), auto-preserving each crash's serve log +
+  SchedulerOutput dump, relaunching between crashes (soak_hunt.sh; quota
+  4 crashes or 5 h).
+
+## 2026-08-28 - Crash-hunt closed: 149-run soak, zero crashes; residual bounded below ~1.5%
+
+- Soak: 149 consecutive c48 exact-bench runs (1000 in / 2000 out, the only
+  workload that ever crashed post-fix) over ~4.7 h on the shipped profile
+  config, warm engine throughout. ZERO crashes, zero errors. A post-fix
+  crash rate above ~1.5%/run is excluded at high confidence.
+- Final attribution: crash-1 (120-burst) = bug B (fresh 3-token prompts
+  replayed through the spec-decode graph family), fixed and
+  regression-tested same day. Crash-2 = a single unexplained sub-1% tail
+  event on a cold server's first traffic; never recurred across 149 warm
+  + several cold exposures. Plausible non-software contribution noted:
+  no ECC on 3090s, and on the P2P fabric one rank's wild write can land
+  in a peer's mapped BAR, which would produce exactly the observed
+  all-ranks-simultaneous fault from a single event.
+- Standing recipe if it recurs: soak_hunt.sh loops the workload,
+  auto-preserves each crash's serve log + SchedulerOutput dump, and
+  relaunches; the engine's dump_input fires on every engine death, so any
+  production recurrence self-documents in /var/log/SlimServe/serve.log.
+- Status: CLOSED as monitored. Production restored to QA on the fixed
+  profile (util 0.95, admission 96, all correctness fixes).
+
+## 2026-08-28 - Host KV tier: architecture built and unit-proven; e2e restore debug in progress
+
+- Built: HostTierConnector (custom KV connector, SupportsHMA) + HostKVTierIndex
+  (scheduler-side hash->slot index, per-group completeness, trajectory-affine
+  LRU) + KVTierDMA (per-rank pinned arena at the packed slab stride, in-order
+  copy stream, one contiguous DMA per block). 14 unit tests green. Profile
+  wires 64 GiB/rank (512 GiB pinned, ~3.4M host tokens). Registered in the
+  connector factory; rides the framework's async-KV-load path
+  (WAITING_FOR_REMOTE_KVS) for prefetch-at-admission.
+- Also shipped en route (operator direction): bf16 KV at native 262144
+  (util 0.96, 269,544-token pool, 1.03x; TQ retained as documented option -
+  operator observed turn-tracking confusion plausibly linked to KV
+  quantization at A6B active params, though two of today's fixed bugs are
+  alternative explanations); prefix caching ON across ALL profiles with a
+  registry-defaults backstop and enforcement tests; standing policy in
+  CLAUDE.md and registry.py (always prefix caching + tool calling +
+  thinking, never greedy - benches un-greedied).
+- E2E acceptance status across 8 instrumented server cycles: offload staging
+  works at scale (680 hashes / 3400 slots across 6 trajectories), return-turn
+  lookup finds the full 105-block chain, DMA and completion reporting proven
+  in isolation. Open: the restore hand-off - the framework allocates far
+  fewer GPU target blocks than the external span (observed [3,1,3,3,3,3]
+  per group for a 42K restore; per-manager external token views 840 / 1),
+  meaning per-group external-allocation semantics (mamba boundary-state-only,
+  and an unexplained full-attention clip) differ from the naive
+  every-boundary model. Entry-point tracing cycle in flight to pin the
+  exact per-manager arithmetic; restore pairing will then match the
+  framework's contract instead of assuming it.
+- Discipline note: every serving-path edit cycled through a full boot
+  (~12 min/cycle); prod stayed on port 8000 throughout with QA-visible
+  interruptions authorized by the operator.
+
+## 2026-08-28 - Host KV tier: the debugging saga and final design
+
+Fourteen server cycles of differential debugging, each isolating one layer.
+The final architecture and why each piece is shaped the way it is:
+
+- ATTENTION blocks: mirrored to the pinned host arena at fill time, one
+  step behind the verified-token watermark (speculative rejections can
+  never be captured). Immutable once full, so offload is write-once and
+  GPU eviction is free.
+- STATE (mamba align) blocks: copied ONCE at request finish, when the
+  newest state block is quiescent. Two designs were tried and measured
+  before this one: (a) per-boundary saves during life captured TORN state
+  (the newest block is updated in place every step; restoring those
+  copies = 6/6 NaN follow-ups; saving the "frozen previous boundary"
+  instead lost a race with chunked prefill advancing ~5 boundaries/step
+  and archived reallocated blocks = token-soup restores); (b) the
+  framework's async-save hold (request_finished_all_groups -> True /
+  deferred free) CORRUPTS THE BLOCK POOL for hybrid models - the decisive
+  differential: tier+hold = intermittent NaN logits on any cached
+  follow-up deeper than ~1 chunk, tier-without-hold = 0/12, no-tier =
+  0/12. Final: pin the state blocks with a plain BlockPool.touch()
+  reference, copy, release one meta-build later (the same
+  in-order-copy-stream window that confirms slot writes).
+- RESTORES ride the framework's async-KV-load path with per-step
+  progressive chunking (the scheduler clips the external span to its
+  token budget and re-queries; progress must be tracked
+  connector-relative because num_computed_tokens does not advance for
+  waiting requests). Mixed local+tier resumes work (GPU cache serves the
+  head, tier serves the tail); state blocks ride the final chunk.
+- Wrong turns worth remembering: scheduler-side cache_config.block_size
+  holds a STALE pre-alignment value (8) - the group spec's block_size
+  (400) is authoritative, and the 50x underreport made the scheduler
+  "clip" restores to nothing; CircularBufferSpec ring groups are excluded
+  from prefix caching by their own manager and must be ignored by the
+  tier; block tracking must come from scheduler_output (NewRequestData /
+  CachedRequestData), not update_state_after_alloc (admission-only, full
+  lists); tail saves must be issued in start_load_kv because
+  wait_for_save is skipped on empty-batch steps (dropping them leaked
+  every finished request's blocks until the pool wedged at 93.9%).
+- Measured before the final fix landed: return-to-conversation restore of
+  a 42K-token trajectory in 0.9-1.7s vs 8.5s re-prefill, sub-second
+  6-op mixed restores, 62 confirmed save batches, KV pool recycling
+  correctly. ENGINE BUG filed in-notebook: the HMA deferred-free path
+  (SupportsHMA request_finished_all_groups asymc-save hold) corrupts the
+  block pool on this hybrid - do not use it; the refcount pin is the
+  sanctioned pattern here.
+
+## 2026-08-28 - Host KV tier parked (disabled in profile) pending the state-geometry fix
+
+- Ring-in-tier improved deep resumes 0/8 -> 4/8 recall (the framework
+  skips zeroing every block in an async-load's token range, so the tier
+  must overwrite the ring; its finish-time content is the trajectory tail
+  window and is semantically correct to restore). The remaining failures
+  were then proven byte-clean (SHA verify: 0 mismatches across 8 ranks,
+  all sizes, including failing runs) -> pure semantics.
+- Two state-snapshot theories measured and disproven (live tail block:
+  4/8; penultimate "boundary snapshot": 0/5), then direct instrumentation
+  of request_finished_all_groups revealed the false foundation: for a
+  1312-token request (3 full 400-token attention blocks), the mamba
+  groups hold SIX position slots with THREE resident blocks - the state
+  groups do not share the attention block geometry at runtime, despite
+  kv_cache_config reporting uniform block_size 400 for every group. All
+  position arithmetic built on shared geometry was therefore wrong by
+  construction, and which saved block happened to be a valid boundary
+  snapshot was luck - matching the observed nondeterminism exactly.
+- DECISION: prod reverted to the proven-clean config (bf16 + prefix
+  caching, no tier; 0/12 corruption controls). The tier ships in-tree,
+  disabled, with the attention path fully validated (byte-exact offload/
+  restore, sub-second 42K resumes, leak-free lifecycle, 11 unit tests)
+  and a profile note stating the exact re-enable condition. Next session:
+  read the mamba-align cache_blocks commit path to learn the true state
+  position/granularity mapping (resolve_block_hashes alignment_tokens
+  scaling is the likely key) and mirror it; the acceptance battery in
+  perf/results/2026-08-28/kv-tier/ is the ready-made gate.
+
+## 2026-08-28 - Deployed-config baseline: bf16 + prefix caching (post all fixes)
+
+- Exact bench (1000/2000, temp 1.0 / top_p 0.95 / top_k 20, seed 42),
+  idle prod server, deployed profile (bf16 KV @ native 262144, prefix
+  caching + mamba align, util 0.96, admission 96, no tier):
+  c1 129.8 / c8 590.7 / c32 1,151.2 tok/s.
+- c32 is the best recorded for this box (TQ config: 1,134.4); c8 at the
+  top of its band; c1 -14% vs TQ@0.95 (prefix-caching/align bookkeeping
+  unamortized at single stream) - acceptable for the 99%-agentic load and
+  noted as a future single-stream tuning target.
+- Operator confirmed the multi-turn turn-tracking issue is FIXED on this
+  config. Campaign cumulative: 409.7 (bring-up) -> 1,151.2 = 2.8x with
+  double the context, exact KV, and correct conversation behavior.
+- Raw: perf/results/2026-08-28/qwen38fn-bf16-baseline/.
+
+## 2026-08-28 - c1 variance check + KV policy sweep (bf16 everywhere)
+
+- c1 re-runs on deployed prod (seeds 43/44/45): 141.3 / 157.8 / 138.0 tok/s.
+  The baseline entry's 129.8 (seed 42) is a low outlier, not a bf16 cost:
+  single-stream spread is 129.8-157.8 across four seeds, driven by MTP
+  draft-acceptance on the sampled text. Median of four = 139.7; README uses
+  that with the spread noted. Raw: qwen38fn-bf16-baseline/bench_bf16_c1_rerun*.
+- Operator policy (2026-08-28): NO quantized main KV on any profile.
+  Flipped the five A100 DSV4 variants from kv_cache_dtype fp8 -> auto with
+  notes: their KV byte budgets were qualified at fp8, so the same bytes now
+  hold half the tokens - A100 requalification required before trusting the
+  old context/concurrency ceilings. All other profiles were already auto.
+  Exceptions on record: Metal fp8_ds_mla (kernel packed-layout requirement,
+  not a quant choice) and DSpark TurboQuant DRAFT KV (rejection sampling
+  verifies drafts against the target; draft precision cannot alter output).
+  Enforced by test_no_profile_quantizes_main_kv (56 profile tests green).
+- Standing directive recorded in CLAUDE.md + registry: CPU-offloaded KV
+  (HostTierConnector pinned-RAM tier) is the goal on ALL non-Metal
+  profiles once the mamba/GDN state-geometry fix lands; enable only with
+  on-box validation per platform. Metal will instead get NVMe-backed KV
+  offload later (unified memory; no host-RAM tier distinction).
+
+## 2026-08-28 - Host KV tier: mamba state-geometry fix, VALIDATED, ENABLED
+
+- Root cause of the parked corruption: the tier saved mamba state by
+  POSITION among a request's live blocks, but align mode migrates state
+  forward in place - every resident block covers an unaligned token count,
+  and the "extra positions" were MTP speculative blocks. Restoring any of
+  them desynchronized state from the attention span (the garbled resumes).
+- Fix rides the engine's own machinery: at a boundary crossing align mode
+  freezes the boundary state, hashes it into the pool prefix cache, and
+  never rewrites it. The tail save looks that block up by boundary hash
+  (get_cached_block) and offloads the immutable snapshot; restore lands it
+  at position k-1, matching the worker's state_idx=(computed-1)//bs seed.
+  MambaManager external allocation now mirrors the internal-hit shape
+  ([null]*(k-1)+[real]). The QSA ring needs nothing (never framework-
+  zeroed; internal hits validate correct on stale-claimed rings at aligned
+  boundaries) - the tier zeroes it anyway for determinism.
+- Two more discoveries en route (TIER-DBG differential logging):
+  (1) frozen states materialize ONLY at chunk-end columns (~2000-token
+  scheduling chunks): one real column per chunk, intermediates stay null
+  and the cache watermark seals them forever -> the save now scans DOWN
+  from computed//400 to the deepest boundary all 4 mamba groups have
+  cached (<=1 chunk of re-prefill on resume). (2) ninja must be on PATH
+  for flashinfer JIT when launching manually (.venv/bin).
+- Acceptance (multi-depth marker recall, 8K/24K/42K, full GPU-pool
+  eviction via 6x55K fillers): restores fired sub-second at all depths
+  (42K: 0.5s vs 9.0s cold), outputs byte-identical to GPU-cache hot
+  controls at 8K/24K, correct recall at 42K (restored answered correctly
+  in a run where the hot control degenerated). Known limitation: one tail
+  per trajectory (sibling re-ask after a deeper follow-up re-prefills;
+  append-only agentic turns always reach the deepest tail).
+- Throughput with tier enabled (exact 1000/2000, seeded, port-8001 manual
+  server, same config as prod): c1 133.6 / c8 599.4 / c32 1,149.7 vs
+  no-tier baseline 129.8-157.8 / 590.7 / 1,151.2 -> NEUTRAL.
+- ENABLED in qwen38fn-fp8-8/rtx3090: 64 GiB pinned/rank = 12,146 slots
+  = ~4.8M tokens of evicted-conversation capacity. 75 tests green.
+  Platform ports tracked: MI300X #17, A100 #18, Metal NVMe #19.
+- Raw: perf/results/2026-08-28/kv-tier/ (acceptance_v2_final.log,
+  bench_tier_c*.log, serve_tier_fix*.log).
+
+## 2026-08-29 - Deployed-service full bench (tier enabled, port 8000)
+
+- Exact bench (1000/2000, seeded, engine idle) against the production
+  systemd service with the host KV tier live: c1 142.2 / c8 600.5 /
+  c32 1,091.8 (seed 42) and 1,199.8 (seed 43 re-run) tok/s.
+- c32 1,199.8 is the best number ever recorded on this box (prior peak
+  1,151.2); the 1,091.8 sample shows c32 run-to-run spread of ~10% with
+  MTP acceptance + prefix-hit interplay - band, not point. c1/c8 within
+  their established bands. Tier remains throughput-neutral in production.
+- Raw: perf/results/2026-08-29/qwen38fn-tier-deployed/.
+## 2026-08-27 - PR #12 x main: semantic merge of the two Metal campaigns
+
+- Scope: merged current main (Metal KV working-set fit + 7 GiB reserve,
+  partitioned-256 route, Flash-Next 3090 stack) into the NVFP4 campaign
+  branch. Five textual conflicts; the real work was the two branches'
+  convergent D=256 fixes and their different strided-cache mechanisms.
+- Resolutions of record:
+  - 256 routing: PR12's design survives in Python -- 256 rides
+    _PAGED_HEAD_SIZES under VLLM_QC_PA256 with the measured batch-1
+    ctx<2048 SDPA crossover, and the plain paged_attention op routes
+    split-K internally from the host-side max_context bound. main's
+    _PARTITIONED_HEAD_SIZES global and its Python routing are dropped;
+    main's paged_attention_partitioned op and proxy remain (harness
+    surface). The crossover constant is M1 Ultra-measured; re-verdict
+    on this box is queued for the post-baseline phase.
+  - Metadata: PR12's bound machinery survives (seq_lens_cpu_max /
+    seq_lens_cpu_bound / bound_exact / lazy exact lens). main's
+    grafts that read seq_lens_cpu.max() were re-pointed at
+    seq_lens_cpu_max -- under the lazy property they would have
+    reintroduced the per-layer D2H drain both campaigns removed.
+  - Strided caches: main's 64-bit kv_block_stride (partition + verify,
+    buffer 17) is the one mechanism in the v2 kernels; PR12's two new
+    partition call sites (split-K route, muse-q38 attn layer) now pass
+    the cache's stride(0). PR12's block_mult lives only in its NEW
+    kv_cache_scatter kernel (no collision; the page-local doubling
+    lives in the block table for attention kernels).
+  - GDN: main's CUDA fused-norm spec methods (3090 campaign) and
+    PR12's _forward_core_mps_native rename/dispatcher coexist as
+    siblings; the conflict was a same-anchor insert.
+  - mq verify at 256 (main) kept, now reading the sync-free bound;
+    main's partitioned-expansion special case deleted (redundant under
+    the op-internal routing, and it passed the raw strided views the
+    page-local layout forbids).
+- Validation on the merged build (M5 Max):
+  - Kernel parity ALL PASS (D=256 strided decode/single, D=128/64
+    contiguous vs plain kernel, m=4 verify boundaries); PR12's
+    op-internal split-K vs main's partitioned op agree to 1.2e-4.
+  - Q2K seeded bench: essay 29.3-31.1 / gsm8k 44.9-45.9, heads
+    byte-identical to the established post-partitioned trajectories --
+    best recorded on this box (PR12's scatter/fusion work now applies
+    to the Q2K path too).
+  - Suites: 109 passed / 105 skipped (includes PR12's registry tests).
+  - NOT yet validated here: the NVFP4 profiles themselves (artifacts
+    live on the M1 Ultra; this box's baseline run is the next step)
+    and the M1 Ultra pin chain, which needs a re-gate on that box.
+
+## 2026-08-27 - qwen38-nvfp4-1 M5 Max baseline (merged tree, seeded shipped defaults)
+
+- First exact-token baseline of the NVFP4 profile on THIS box (M5 Max,
+  128 GiB), on the merged PR#12 x main tree (8ea670cab), through the
+  real server path (`slimserve qwen38-nvfp4-1 --serve`): canonical env
+  (muse ON, DFlash2 adaptive k=3@c1, VLLM_METAL_ASYNC_SCHED=1).
+- Sampling policy: the M1 Ultra pin chain is GREEDY; greedy is banned
+  stack-wide, so this box's pins use the model's shipped
+  generation_config defaults, seeded 42. The harness
+  (benchmarks/benchmark_dsv4_exact.py) was changed to make that the
+  DEFAULT: temperature/top_p/top_k are omitted from the request unless
+  explicitly passed (server applies shipped defaults) and seed defaults
+  to 42. It can no longer silently run greedy. Runs remain
+  deterministic and sha-pinnable under real sampling.
+- Baseline pins (aggregate output tok/s, exact-token, ignore_eos):
+  | workload | tok/s | sha |
+  | c1 1000/256 | 21.74 / 21.76 / 21.29 | 7dd1fc9874df (3/3 bit-stable) |
+  | c4 1000/256 | 45.87 | 960116e7c5cd |
+  | c8 1000/256 | 58.69 | 73d4ba12b89c |
+  | c1 2500/64 | 10.89 / 10.00 | 87383cf5a0e3 (2/2 bit-stable) |
+  Chat coherence: seeded Jupiter-moons request correct with qwen3
+  thinking + content both present.
+- OBSERVATION for the change phase: DFlash2 acceptance under real
+  sampling is very low -- 81 accepted / 522 drafted on the pinned c1
+  run (~15%), and a later interval logged 2/426 (mean acceptance length
+  1.01). The M1 Ultra +23% c1 spec win was measured under greedy;
+  under shipped sampling the 16-way selector's acceptance collapses,
+  so spec at c1 may currently be near-neutral-or-negative here. Per
+  the standing rule (spec always on, net-positive), this is the top
+  candidate for the suggested-changes phase, alongside the
+  batch>=2-drafting-off policy question.
+- Not directly comparable to the M1 Ultra pins (different box, greedy
+  vs sampling): their c1 17.10 / c4 23.12 / c8 25.59 / 2500x64 3.45.
+  This box is substantially faster at every point on the merged tree.
+- Raw: perf/results/2026-08-27/nvfp4-baseline/ (per-run JSON, server +
+  engine logs).
+
+## 2026-08-27 - DFlash2 acceptance "collapse" on M5 Max: ROOT-CAUSED as workload content + trajectory lottery; drafter, merge, muse, box ALL exonerated
+
+- Presenting symptom: the M5 Max baseline (sonnet.txt, offset 0) showed
+  mean acceptance 1.47 (per-position 33%/10%/2%) vs the M1 Ultra
+  campaign's ~2.9-3.0 of 3 -- and spec looked barely net-positive.
+- Hypothesis chain, each killed by measurement (all runs c1 1000/256,
+  seeded shipped defaults unless noted; raw in
+  perf/results/2026-08-27/nvfp4-baseline/):
+  1. Sampling-vs-greedy discount: KILLED. Greedy diagnostic run gave
+     byte-identical acceptance counters (81/522/174).
+  2. Muse aux-tap corruption: KILLED. muse-off (-df2) 1.56 vs 1.47.
+  3. Box or merge: sonnets on the PRE-merge build also 1.53. Then essay
+     prose on pre-merge gave 3.94 -- workload identified as factor one.
+  4. Apparent merge regression on prose (3.94 pre vs 2.55-2.68 merged):
+     bisected with seven legs -- metal_attn.py, the GDN cluster, the
+     runner/spec cluster, scheduler.py, the KV-manager cluster, then
+     the halving pair (pre binaries x merged python and merged binaries
+     x pre python BOTH 2.55; only pre x pre 3.94). No component or half
+     explains it -- the signature of the TRAJECTORY LOTTERY this PR's
+     own DSV4 protocol documents (draws 2.63-4.61 on retained
+     trajectories).
+  5. Lottery CONFIRMED: prompt-offset draws on the merged build --
+     leg-G build offs {500,1200,2000,3000} = 4.00/4.00/3.23/4.00;
+     canonical (muse ON) offs {0,500,1200,2000,3000} =
+     1.93/4.00/4.00/3.32/2.44, mean 3.14, mean 39.6 tok/s (peak 48.5).
+     Offset 0 is simply a bad draw; every build draws ~4.0 elsewhere.
+- Verdict: the drafter is HEALTHY on this box and the merged tree --
+  acceptance regularly saturates the k=3 ceiling (4.00) on prose. The
+  real, standing findings:
+  - sonnet.txt is a drafting-hostile source (~1.5 acceptance by
+    content); the published sonnet-offset-0 baseline pins are
+    worst-case-content pins and remain valid AS pins, but acceptance
+    conclusions must never be drawn from them.
+  - Acceptance comparisons require the PR's own protocol: MEAN ACROSS
+    PROMPT OFFSETS, never a single draw. Both my "collapse" and the
+    apparent muse/merge deltas were single-draw artifacts.
+  - The batch-1 256 crossover finding stands (+23% no-spec c1, a
+    per-step-time effect insensitive to trajectory): kernel route wins
+    at batch 1 on M5 Max, VLLM_QC_PA256_MIN_CTX_B1=0 selects it.
+- Canonical M5 Max essay-prose reference (merged tree): c1 mean 39.6
+  tok/s over 5 offsets, acceptance mean 3.14. Sonnet pins unchanged.
+
+## 2026-08-27 - RETAINED: k=3 drafting at every batch size + acceptance-adaptive throttle (c8 prose +51%)
+
+- Baseline: the batch-adaptive schedule [[1,1,3],[2,8,0]] -- drafting
+  off at batch >= 2, a boundary bracketed on the M1 Ultra (c1 win at
+  k=3, c4/c8 loss at k=7-era stack) but never probed at c2/c3 or under
+  real sampling.
+- Sweep (essay prose, offset-mean protocol, c 1000/256, M5 Max merged
+  tree; raw in perf/results/2026-08-27/nvfp4-baseline/):
+  | c | draft-off | k=3 | delta | acc mean |
+  | 2 | 33.93 | 55.72 | +64% | 3.70 |
+  | 4 | 48.48 | 63.16 | +30% | 3.72 |
+  | 8 | 55.09 | 83.28 | +51% | 3.69 |
+  Acceptance holds ~3.7 of 4 at every batch size; the old cutoff was
+  costing a third to half of batch throughput on prose. 83.3 tok/s at
+  c8 is the highest Metal serving number this repo has recorded.
+- The counter-case that forbids a naive flip: drafting-hostile content.
+  c8 sonnets (verse, acceptance 1.20): k=3 unthrottled 38.16 vs
+  draft-off 58.69 (-35%).
+- Change: AcceptanceThrottle (vllm/v1/spec_decode/dynamic/utils.py),
+  wired at the scheduler's dynamic-SD K decision and acceptance
+  accounting sites. EMA of accepted/drafted (alpha 0.1); after 8
+  observed draft calls, EMA < 0.30 pauses drafting for 96 scheduling
+  steps, then re-probes with a fresh warmup. Enabled only by
+  VLLM_SD_ADAPT_THROTTLE=1 (set in the qwen38-nvfp4 metal profiles);
+  all other platforms keep exact scheduler behavior. 6 unit tests.
+- Validation: verse c8 with throttle 52.4-63.4 across two constant
+  sets (~= draft-off, vs -35% unthrottled); prose fresh-boot first-run
+  79.0 ~= the k3-open adjacent-first 83.4. CAVEAT: the recovery-latency
+  arm (verse then prose on one server) is confounded by thermal soak --
+  eight consecutive c8 runs decline monotonically 79 -> 43 regardless
+  of arm, so live recovery validation needs a cool box and longer
+  streams. The recovery logic is unit-tested; live gate is an open
+  follow-up, as is the M1 Ultra re-gate of the new schedule.
+- Profile changes: schedule -> [[1,8,3]] + VLLM_SD_ADAPT_THROTTLE=1 on
+  the qwen38-nvfp4 metal variants, prose updated. Also:
+  qwen38-nvfp4-1-df2 retired (it was canonical minus VLLM_QC_MUSE=1 --
+  a kill-switch state, not a config; the notes say how to reproduce
+  it), and the language_model_only note corrected -- the checkpoint
+  carries the full vision tower (333 tensors) and torchvision is no
+  longer the blocker; the tower is simply unvalidated on the CT Metal
+  path.
+
+## 2026-08-27 - Hardening: mypy debt cleared (hook live again); backlog re-ranked
+
+- All 191 mypy errors across the 20 PR-touched files fixed,
+  behavior-neutral by class (int() on .item() counts, @staticmethod on
+  a statically-called proxy, one narrowing assert, Any for the Metal
+  GDN dispatcher handle, targeted type: ignore[code] for torch Module
+  attribute typing). Seeded bench heads byte-identical. Commits no
+  longer need SKIP=mypy-3.10. NOT fixed (out of scope): main-side debt
+  that rode in via the merge (qwen4_exp tree, fp8.py,
+  gpu_model_runner.py, ~400 errors) -- that is main's to clear, on
+  hardware that can test it.
+- PR backlog re-ranked after the k=3-everywhere adoption:
+  1. simdgroup GEMM for M in [9, 32] over quantized weights -- was
+     "only if c4/c8 spec matters"; c4/c8 spec now carries +30-51%, and
+     its verify (m=16/32) rides dense bf16 GEMM against materialized
+     weights. A quantized mid-M GEMM would cut the resident bf16 copy
+     and likely stack on the spec win. Kernel campaign, own gates.
+  2. Acceptance-throttle recovery-latency live gate (cool box, long
+     streams) + M1 Ultra re-gate of the new schedule.
+  3. max_num_batched_tokens revisit under spec (carried from
+     UPDATE 27).
+  4. TQ long-context validation pass at 262k under the new schedule.
+- Box state note: the day's marathon left the box thermally soaked
+  (seeded gsm8k 33.6-34.3 vs the 45 band, heads identical); the
+  baseline re-pin under the new canonical waits for cooldown.
+
+## 2026-08-27 - Throttle batch exemption + FINAL RE-PIN: anchors bit-exact, hostile content now net-positive
+
+- The first re-pin caught a self-inflicted c1 regression: one break-even
+  ratio cannot serve all batch sizes. At batch 1 the verify rows ride
+  the small-M GEMV band and drafting measured +12% even at acceptance
+  1.47 (ratio 0.16), but the throttle's 0.30 threshold -- correct for
+  wide-batch dense-GEMM verify -- paused it, dropping c1 sonnets to
+  ~16.2 with rolling shas (the global EMA carried across runs).
+- Fix: AcceptanceThrottle.min_batch (default 2, VLLM_SD_ADAPT_MIN_BATCH)
+  -- batches below it are exempt from gating and do not tick the pause
+  clock; a hostile pause still applies to the next wide-batch step.
+  7 unit tests.
+- FINAL RE-PIN (cool box, 3-min gaps between legs, canonical
+  qwen38-nvfp4-1: schedule [[1,8,3]], throttle on, seeded shipped
+  defaults):
+  | leg | tok/s | sha |
+  | c1 sonnet x3 | 21.73/21.40/20.72 (21.29) | 7dd1fc9874df 3/3 -- BIT-EXACT to the original pin |
+  | c1 2500x64 x2 | 8.76/10.06 | 87383cf5a0e3 2/2 -- BIT-EXACT to the original pin |
+  | c4 sonnet | 50.73 | +10.6% vs old canonical 45.87 |
+  | c8 sonnet | 57.20 | -2.5% vs old 58.69 (noise); vs 38.2 unthrottled |
+  | c1 essay 5-off | mean 34.64 (14.9-49.6, acc 2.67) | lottery spread |
+  | c8 essay 3-off | mean 63.45 (cool-first 61.3, peak 81.2, acc 3.09) | vs 55.1 draft-off |
+- Reading: the worst-case anchors are byte-identical to the pre-change
+  baseline (min_batch keeps c1 drafting always-on, so its trajectory is
+  untouched); hostile content at c4 now WINS (+11%, warmup drafting is
+  cheap there too) and c8 hostile is noise-level vs draft-off; prose
+  batch throughput keeps the k=3 win. Within-leg thermal drift remains
+  the dominant measurement noise at c8 (61-81 across three offsets).
+- These are the PR's shipping numbers on M5 Max. M1 Ultra re-gate of
+  the schedule+throttle remains the one open cross-box gate.
+
+## 2026-08-27 - Merge main (PR #16 dynamic-k) x this branch: unified per-step k, anchors hold
+
+- main gained the 3090 campaign's second round: dynamic-k speculation
+  for the V2 runner, the registry host-RAM gate (the exact gap the
+  design review flagged), draft-write sync fixes.
+- Semantic resolutions: the two per-step-k mechanisms are unified --
+  PR12's skip_drafting (K == 0: drafter forward skipped, zero-width
+  handler drafts) composes with main's num_steps trimming (0 < K < max)
+  and un-padded fast-path handler writes; _dynamic_prev_spec_tokens
+  records the POST-throttle k (newcomer padding must match what was
+  actually drafted), and the padding consumer trusts it whenever either
+  dynamic mechanism is active.
+- The anchor gate caught two real merge bugs before push: main's runner
+  passes num_steps= into every speculator and the DFlash family did not
+  accept it (TypeError on the first drafted request -- fixed with the
+  parameter plus a fixed-block contract assert); and the bulk mypy
+  annotator had MASKED a wrong attribute name in that new assert with
+  type: ignore[attr-defined] (AttributeError at runtime -- lesson: an
+  attr-defined ignore on fresh code is a bug, not noise).
+- Gates on the merged tree: suites 125 passed / 105 skipped; c1 sonnet
+  anchor 21.74/21.55 tok/s sha 7dd1fc9874df 2/2 -- BIT-EXACT to the
+  final re-pin. No csrc changes; no Metal rebuild.
+
+## 2026-08-27 - Long-context multi-turn chat gate on the post-review canonical: PASS
+
+- Gap called out by the user: the CodeRabbit round (tiled fallback,
+  steady-memo invalidation, throttle per-step observe) had been gated
+  only by unit tests + single-turn exact-token runs, while several of
+  those changes matter most under long multi-turn context.
+- Gate (perf/results/2026-08-27/nvfp4-baseline/multiturn_chat.py):
+  6-turn chat on canonical qwen38-nvfp4-1, seeded shipped defaults;
+  needle A planted at turn 1 (~3k ctx), needle B at turn 3, context
+  grown 2,955 -> 13,343 prompt tokens; retrieval asked at turn 6.
+- Result: BOTH needles EXACT at 13.3k ('731942, 447.25 MHz'); all
+  turns served without error; drafter acceptance 2.72 across the
+  conversation with the throttle live; the mq-verify 256 route engaged
+  from turn 1 onward (ctx > 1024). Intermediate turns' empty content at
+  60-80-token caps is the known qwen3 thinking-mode budget behavior --
+  re-verified: the same turn at 400 tokens finishes thinking and
+  answers with finish=stop.
+
+## 2026-08-27 - Qwen3.8 chat defaults: reasoning_effort low + preserve_thinking pinned; multi-turn gate re-passed
+
+- User directives: default reasoning_effort to low on every Qwen3.8
+  profile, and pin preserve_thinking on. Template facts verified first:
+  the shipped chat template defaults reasoning_effort to XHIGH (the
+  source of hundreds of thinking tokens on trivial turns) and treats an
+  UNDEFINED preserve_thinking as true -- pinned explicitly so a template
+  update cannot silently flip it. Unknown kwargs are inert in jinja, so
+  applying to the Flash-Next profile is safe even though its template
+  lives on the 3090 box (kwarg support there unverified -- flagged).
+- Applied to all five qwen38* variants via
+  engine.default_chat_template_kwargs. A profile-level kwargs dict
+  replaces the registry _SERVING_DEFAULTS wholesale, so the thinking /
+  enable_thinking switches ride along (the registry test caught the
+  omission). Per-request values override everything.
+- The multi-turn gate harness was also corrected per user: intermediate
+  turns previously ran with 60-80-token caps that starved qwen3
+  thinking (empty content, finish=length). Every turn now gets a
+  1024-token budget and the gate FAILS on any turn with empty content
+  or finish != stop.
+- Gate re-run on the new defaults: 6 turns to 13.6k prompt tokens, all
+  turns complete with substantive content, both needles EXACT at depth
+  (731942 / 447.25 MHz). Raw: multiturn_chat.py + engine-lowreason.log
+  under perf/results/2026-08-27/nvfp4-baseline/.
+
+## 2026-08-27 - Post-merge long-context gates on M5 Max: GGUF multi-turn PASS, -tq 262k needle EXACT
+
+- GGUF profile (qwen38-q2kxl-1), multi-turn chat gate with the new
+  low-reasoning/preserve-thinking defaults: 6 turns to 13.6k prompt
+  tokens, every turn completing with substantive content (finish=stop
+  asserted per turn), both needles EXACT at depth. The GGUF-embedded
+  template accepts the chat kwargs without error. Turns run 30-138 s
+  (Q2K prefill re-processes history each turn; prefix caching is off on
+  this profile by design -- recurrent GDN state).
+- -tq long-context (qwen38-nvfp4-1-tq, --ctx 262144 per the UPDATE 39
+  protocol): 16k sanity leg EXACT in 28 s; full leg 254,881 prompt
+  tokens, needle at 40% depth, retrieval EXACT (code 914637), wall
+  2,251 s (~37.5 min -- half the M1 Ultra's 75 min for the same
+  protocol). KV pool on this box grants 455,706 TQ tokens (no
+  working-set clamp; weights 22 GiB). This closes the "262k needle on
+  this box" item from the merge tracking list.
+- Raw: perf/results/2026-08-27/nvfp4-baseline/ (tq_needle.py,
+  multiturn_chat.py, engine/server logs per leg).
+
+## 2026-08-27 - V2 thinking-token budget enforcement (PR #13 extension): token-exact on the canonical profile
+
+- Motivation (user): Qwen3.8 thinks nearly endlessly even at low
+  reasoning effort -- live-demonstrated on the canonical profile: an
+  unbudgeted xhigh request spent ALL 1500 completion tokens inside
+  <think> and produced zero content. A hard cap is basic functionality.
+- PR #13's enforcement lives in the V1 sampler (host-side state holder,
+  per-step output scans); the V2 runner -- which every SlimServe profile
+  runs -- rejected the parameter with a 400. The V1 design cannot port:
+  it needs host knowledge of step N's tokens when scheduling N+1, which
+  async scheduling forbids.
+- Implementation (vllm/v1/worker/gpu/sample/thinking_budget.py):
+  GPU-resident per-slot state (remaining budget, in-think flag, active
+  mirror), admission-staged like the other sampler states; enforcement
+  rides the SAME logits seam as the grammar bitmask, applied before the
+  sampler/rejection-sampler dispatch, so one mask serves both paths --
+  a masked verify row simply rejects any draft token that is not the
+  reasoning-end marker, and a draft that closes the block naturally
+  within budget is left for rejection sampling (no special case).
+  Per-request draft consumption is computed positionally with
+  host-known span geometry (cu_num_logits_np): no device syncs, no
+  boolean-mask indexing (masked_fill_ + where -- the MPS queue-drain
+  lessons applied). Scope: single-token reasoning markers (qwen3
+  family: <think>=248068, </think>=248069); multi-token markers keep a
+  per-request rejection with an explicit message.
+- Semantics match the V1 holder after PR #13's fixes: budgets count
+  generated in-think tokens only; markers uncharged; prompt-open blocks
+  start at zero consumed; budget-0 forces immediately.
+- Tests: 9 unit tests (prompt-open, budget-0, marker accounting, spec
+  span forcing at the violating row, natural close un-forced, rejected
+  drafts uncharged, slot reuse, mixed batches). First draft had a real
+  bug the spec test caught: per-row counters instead of per-request
+  cumulative consumption never triggered mid-span forcing.
+- Live gate (canonical qwen38-nvfp4-1, V2 + DFlash2 + throttle, seeded):
+  budget 64 -> exactly 64 reasoning tokens then a complete proof
+  (finish=stop); budget 16 -> exactly 16; no budget -> the pathological
+  all-thinking completion above. Suites: 167 passed / 105 skipped;
+  mypy clean across all touched files (incl. PR #13's pre-existing
+  debt).
+- Evidence fields (this is a correctness feature, recorded to the
+  optimization standard regardless):
+  - Baseline: V2 rejects thinking_token_budget per request (400); an
+    unbudgeted xhigh request spends all 1,500 completion tokens in
+    <think> (raw: perf/results/2026-08-27/nvfp4-baseline/
+    server-budget.log, engine-budget.log).
+  - Hypothesis: logits-seam forcing (grammar-bitmask precedent) gives
+    token-exact budgets on V2 with zero cost when unused.
+  - Correctness: 9 unit tests + live gate (budget 64 -> exactly 64;
+    16 -> 16; both finish=stop with complete answers).
+  - Throughput: inert path is a host-side numpy check per step (no
+    kernel launches when no batch row carries a budget); seeded Q2K
+    bench heads byte-identical post-change (spec_mypyclean pins).
+  - Decision: RETAINED; enforcement is a functional requirement.
+- Open from the PR review, left for the author or follow-up: map
+  validation still occurs per request (the PR text claims config time),
+  and template-level default reasoning_effort (our profiles' low) does
+  not inform map level selection.
+
+## 2026-08-27 - Thinking budgets: defaults stay UNLIMITED (user decision); template-effort map selection fixed
+
+- Decision of record: no SlimServe profile bakes a thinking_token_budget
+  default. Budgets are operator-set exactly per the PR #13 design
+  (server map via --override-generation-config, per-request numeric
+  override, -1 opt-out); an earlier draft that capped every Qwen3.8
+  profile was reverted before commit.
+- Kept: when an operator DOES configure a map, level selection now
+  falls back to the server's default_chat_template_kwargs
+  reasoning_effort before the medium fallback, so a profile serving
+  low-effort by template default selects the low budget rather than
+  medium (to_sampling_params gained default_reasoning_effort, passed by
+  the chat serving layer). This closes the effort-sourcing gap from the
+  PR #13 review.
+
+## 2026-08-27 - Thinking budgets: bad server default now fails at boot (closes the last PR #13 review item)
+
+- The map/scalar validation that lived only inside
+  get_effective_thinking_token_budget (per request) is extracted to
+  validate_thinking_token_budget_config and invoked from
+  ModelConfig.get_diff_sampling_param, which every serving handler
+  constructor calls at startup (7 call sites: chat, completion,
+  responses, speech-to-text, scale-out x2, LLM entrypoint). A bad
+  operator default (unknown map keys, missing medium, bad values,
+  scalar < -1) now kills the server at boot instead of 400ing every
+  request. The per-request path re-validates via the same helper, so
+  programmatically supplied maps keep the same errors.
+- Live proof (dummy-load boot of qwen38-nvfp4-1's checkpoint):
+  {"thinking_token_budget": {"low": 100}} -> exit 1 during
+  OpenAIServingResponses init with "map must define `medium`", zero
+  startup-complete lines; control boot with {"low": 1024,
+  "medium": 4096} reaches Application startup complete.
+- Tests: 10 new config-time cases (5 bad shapes raise from
+  get_diff_sampling_param, 5 good shapes pass through); both budget
+  suites 52/52; mypy hook green. This makes the PR #13 text's
+  "rejected at config time" claim true as written.
+
+## 2026-08-25 - FIX: DFlash2 short-block convolution under compiled MI300X serving
+
+- Status: retained.
+- Scope: `qwen38-q2kxl-1`, GGUF Q2_K_XL target plus DFlash2 Q4_K_M drafter,
+  TP1 on one MI300X, `max_num_seqs=64`, DFlash k=3, compiled
+  `FULL_DECODE_ONLY` serving. Working-tree base `2989f4b28b`.
+- Baseline: the same registered profile passed at `max_num_seqs=16`, but at
+  64 the first proposal completed and the second draft forward raised a ROCm
+  illegal-memory-access error. The target alone passed at 64 with `--no-spec`,
+  ruling out the target model, fixed 96 GiB KV pool, and target graph replay.
+- Hypothesis: DFlash2's two-tap convolution was using the checkpoint's trained
+  maximum block width (8) even though the profile deliberately serves only the
+  first three drafts, whose per-request query block is four rows (anchor + 3).
+  The token-count-dependent fallback selected width 4 eagerly but could be
+  specialized as width 8 by `torch.compile`, and it also joined two live
+  four-row requests into one block whenever the total happened to be eight.
+- Change: resolve the convolution width once from the active serving layout,
+  `1 + num_speculative_tokens`, and reject configurations wider than the
+  checkpoint's trained block. Added a regression proving that row 4 starts a
+  fresh request and cannot read row 3 as its predecessor.
+- Correctness/isolation:
+  - serialized stage synchronization showed both input expansion and context-KV
+    insertion clean; the fault first appeared inside the second compiled draft
+    forward;
+  - disabling compilation only for a diagnostic layer-by-layer run completed
+    correctly, distinguishing compile specialization from a generally broken
+    ROCm kernel;
+  - production compiled one-shot at 64 returned the correct answer with
+    speculation enabled;
+  - registry-driven smoke passed text and deterministic red-image requests,
+    DFlash k=3, load 114.26 s;
+  - final relevant model/SlimServe suite: 69 passed, 3 skipped.
+- Performance: exact OpenAI completion workload, shipped sampling defaults
+  (`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed 42), 8-token warmup,
+  1,000 input and exactly 2,000 output tokens per request. One timed pass per
+  concurrency after shape warmup:
+
+  | concurrency | aggregate output tok/s | median request s | accepted / drafted | exact |
+  | ---: | ---: | ---: | ---: | --- |
+  | 1 | 75.47 | 26.50 | 1,299 / 2,109 | yes |
+  | 8 | 164.87 | 78.11 | 10,383 / 16,848 | yes |
+
+  All completions were non-degenerate (minimum 2.65 chars/token). The c8 run
+  sustained all eight concurrent requests without a crash or missing token.
+- Decision: keep the active-block fix and the MI300X profile at 64 sequences.
+  The 2.18x c8/c1 throughput gain is now a measured optimization target, not a
+  correctness blocker; batch-width GGUF MMQ and DFlash acceptance remain the
+  next performance work.
+- Hardware: AMD Instinct MI300X, ROCm 7.2.53211, driver 6.16.13, PyTorch
+  2.14.0.dev20260723+rocm7.2; dual AMD EPYC 9754 (256 CPUs), 3.0 TiB host RAM.
+- Raw artifacts:
+  - isolation: `perf/results/2026-08-25/gguf-mi300x14-seq64-dflash-sync/`
+    through `gguf-mi300x17-seq64-compiled-fix/`;
+  - smoke: `perf/results/2026-08-25/gguf-mi300x18-seq64-smoke/`;
+  - exact JSON, completions, and server log:
+    `perf/results/2026-08-25/gguf-mi300x19-seq64-exact/`.
+
+## 2026-08-25 - RETAIN: V2 DFlash2 path selection for Qwen3.8 GGUF on MI300X
+
+- Status: retained in the `qwen38-q2kxl-1` MI300X variant as
+  `VLLM_USE_V2_MODEL_RUNNER=1`.
+- Baseline/hypothesis: the legacy model runner measured 75.47 tok/s at c1 and
+  164.87 tok/s at c8. Its generic proposal path independently argmaxes draft
+  logits, while the V2 DFlash speculator invokes the model's trained rank-256
+  path selector. The Metal variant already required V2 for this reason, but
+  the new MI300X variant had not carried that setting over.
+- Method: unchanged compiled profile and exact OpenAI completion workload from
+  the preceding entry, with V2 selected externally for the comparison. One
+  timed pass per concurrency after warmup; 1,000 input and exactly 2,000 output
+  tokens per request, temperature 1.0, top-p 0.95, top-k 20, seed 42.
+
+  | runner | concurrency | aggregate output tok/s | median request s | accepted / drafted | exact |
+  | --- | ---: | ---: | ---: | ---: | --- |
+  | V1 | 1 | 75.47 | 26.50 | 1,299 / 2,109 | yes |
+  | V2 | 1 | 77.23 | 25.90 | 1,285 / 2,142 | yes |
+  | V1 | 8 | 164.87 | 78.11 | 10,383 / 16,848 | yes |
+  | V2 | 8 | 194.21 | 76.81 | 10,645 / 16,086 | yes |
+
+- Result: c1 improved 2.3%; c8 improved 17.8%. All eight c8 completions were
+  exact and non-degenerate (minimum 3.15 chars/token), and the compiled runner
+  completed without a ROCm fault. The larger c8 gain and fewer total draft
+  tokens support retaining the selector path rather than treating c1 noise as
+  sufficient evidence by itself.
+- Registered validation: after adding V2 to the profile itself, the registry
+  smoke passed text (`4`) and deterministic red-image (`Red`) requests with
+  DFlash k=3; load time 116.28 s. A diagnostic smoke constrained to only 16
+  output tokens correctly returned HTTP 200 but exhausted its budget in the
+  model's visible reasoning before emitting `4`; it is retained as a rejected
+  harness setting, not counted as a correctness pass. The repository-default
+  128-token smoke is the passing validation.
+- Regression suite: 70 passed, 3 platform skips across the focused DFlash2
+  model tests and the complete SlimServe test directory; profile JSON parsing
+  and `git diff --check` also passed.
+- Decision: keep V2 on MI300X. Remaining measured gap is the GGUF target path:
+  at c8 this profile is still far below the same model's optimized NVFP4 path,
+  so batch-width native MMQ remains the next kernel target.
+- Raw artifacts:
+  - V2 compiled one-shot: `perf/results/2026-08-25/gguf-mi300x20-v2-one-shot/`;
+  - exact JSON and completions: `perf/results/2026-08-25/gguf-mi300x21-v2-exact/`;
+  - rejected 16-token diagnostic:
+    `perf/results/2026-08-25/gguf-mi300x22-v2-registered-smoke/`;
+  - passing registered smoke:
+    `perf/results/2026-08-25/gguf-mi300x23-v2-registered-smoke/`.
+
+## 2026-08-26 - RETAIN: type-aware importance-matrix GGUF routing on MI300X
+
+- Status: retained. Scope is the `qwen38-q2kxl-1` target model on one MI300X;
+  the registered profile, DFlash2 k=3, V2 runner, graph policy, and sampling
+  configuration are unchanged.
+- Baseline: an unchanged exact c8 run produced 197.54 output tok/s in 81.00 s,
+  with all eight requests returning exactly 2,000 tokens. The Q2_K_XL file is
+  predominantly importance-matrix formats (including 112 IQ3_XXS, 67 IQ2_S,
+  57 IQ3_S, 48 IQ2_XXS, and 34 IQ2_XS tensors), but the GGUF router used one
+  row-count heuristic for all of them. Above that threshold it unpacked the
+  weight to BF16 on every forward and called dense GEMM.
+- Hypothesis: DFlash k=3 verification reaches target batches up to M=32, and
+  several compact importance-matrix vector kernels remain faster there. Route
+  each measured format at its own crossover instead of treating all formats as
+  having the same decode-width limit.
+- Kernel A/B on real model weights confirmed different crossovers. At M=32,
+  compact MMVQ was 1.82x faster for IQ1_S, 1.50x for IQ2_XXS, 1.38x for IQ2_S,
+  1.36x for IQ3_XXS, and 1.07-1.14x for IQ4_XS. IQ2_XS won only through M=16;
+  IQ3_S was already 2.43x slower at M=16 and 4.26x slower at M=32. Therefore
+  the ROCm limits are 32 for IQ1_S/IQ1_M/IQ2_XXS/IQ2_S/IQ3_XXS/IQ4_XS, 16
+  for IQ2_XS, and 8 for IQ3_S. The existing environment override remains
+  authoritative, and CUDA/Metal/unmeasured formats retain the old heuristic.
+- Exact end-to-end results, using 1,000 input and exactly 2,000 output tokens
+  per request, temperature 1.0, top-p 0.95, top-k 20, seed 42, and an 8-token
+  warmup:
+
+  | route | concurrency | aggregate output tok/s | wall s | accepted / drafted | exact |
+  | --- | ---: | ---: | ---: | ---: | --- |
+  | old heuristic | 8 | 197.54 | 81.00 | 10,691 / 15,924 | yes |
+  | type-aware, run 1 | 8 | 197.15 | 81.16 | 10,542 / 16,383 | yes |
+  | type-aware, run 2 | 8 | 203.33 | 78.69 | 10,564 / 16,326 | yes |
+  | type-aware, combined | 8 | 200.20 | 159.84 | 21,106 / 32,709 | yes |
+
+  The two retained runs improve delivered throughput by 1.35% over the fresh
+  baseline. Proposal-cycle rate improves from 65.53/s to 68.21/s (+4.09%),
+  consistent with the isolated target-kernel gain; stochastic draft acceptance
+  obscured it in the first output-TPS sample. A c1 sample returned exactly
+  2,000 tokens at 43.63 tok/s, but its acceptance collapsed to 743/3,768 even
+  though this change cannot affect its M=4 route. It is recorded as acceptance
+  variance, not used to replace the stable 77.23 tok/s c1 baseline.
+- Correctness: all exact runs produced the requested token count and healthy
+  text. The registered text+image smoke passed (`4` and `Red`) with DFlash k=3.
+  Routing unit tests cover the measured table and the environment override.
+  The final focused model/profile suite passed 73 tests with 3 platform skips;
+  the rebuilt native GGUF extension passed all 18 dequant/vector tests. That
+  native gate also corrected a pre-existing test-oracle flaw: arbitrary bytes
+  had produced invalid FP16 block scales and the reference used the original
+  activation rather than the Q8_1 values actually consumed by the kernel.
+- Rejected kernel experiment: a native dense IQ2_XXS MMQ using the existing
+  tile decoder was numerically identical to MMVQ at printed precision, but was
+  slower than MMVQ at every measured M=4..64 (for example 0.266 vs 0.209 ms at
+  M=32) and slower than dequant+dense at M=64 (0.472 vs 0.324 ms). The csrc
+  experiment was removed; the production extension was rebuilt and its import
+  and operator schema passed.
+- Decision: retain the type-aware Python route; reject the first dense
+  IQ2_XXS MMQ. Further native work needs a materially different MFMA schedule,
+  not a wider version of the current tile/vector organization.
+- Raw artifacts:
+  - unchanged exact baseline:
+    `perf/results/2026-08-26/gguf-mi300x24-imatrix-route-baseline/`;
+  - retained exact runs:
+    `perf/results/2026-08-26/gguf-mi300x25-imatrix-route/`;
+  - registered text+image smoke:
+    `perf/results/2026-08-26/gguf-mi300x26-imatrix-route-smoke/`;
+  - real-weight kernel A/B and rejected experiment transcript:
+    `perf/results/2026-08-26/gguf-mi300x27-imatrix-kernel-ab/`.
+
+## 2026-08-28 - Merge origin/main (59 commits) into the MI300X GGUF worktree
+
+- Status: merge only; no serving measurement taken or claimed here.
+- Scope: fast-forward of `main` from `2989f4b28b` to `b639a842e9` (59 commits:
+  the Flash-Next 8x3090 campaign, thinking-token budgets, the safetensors
+  DFlash2 stack, dynamic-k, and the Metal re-gates) under the uncommitted
+  MI300X GGUF profile work. Local HEAD carried no commits of its own, so the
+  history is a fast-forward; the reconciliation was entirely in the working
+  tree, 3-way merged against the exact merge base.
+- Three files conflicted, all resolved by keeping both sides:
+  - `vllm/model_executor/models/qwen3_dflash2.py` — main added the
+    safetensors DFlash2 stack (`DFlash2Qwen3*`, FlashInfer top-k, compiled
+    selector) at the same offset where this branch added
+    `_resolve_serving_block_size` for the GGUF stack. Both kept; the helper
+    now sits inside the GGUF section that uses it. The two stacks agree
+    independently: main's new decoder layer sizes its conv block as
+    `1 + num_speculative_tokens`, which is what the helper resolves.
+  - `perf/optimization_status.md`, `HANDOFF.md` — parallel append-logs and
+    parallel campaign handoffs; both retained in full. HANDOFF.md follows the
+    existing in-file precedent for concatenated campaign handoffs, and the
+    MI300X section carries a dated pointer noting its open fault was since
+    root-caused (the conv block-width bug) so it is not read as live state.
+- One SEMANTIC conflict that no textual merge would have caught: main added
+  `test_full_decode_graphs_cover_the_largest_speculative_batch`, which
+  requires `max_cudagraph_capture_size >= (k+1) x max_num_seqs` on FULL-graph
+  speculative profiles. The new `qwen38-q2kxl-1` mi300x record set capture 64
+  at 64 sequences with DFlash k=3, needing 256 — the largest decode batches
+  would have fallen to eager silently. Raised to 256, matching the rule the
+  sibling `qwen38-nvfp4-1` mi300x record already follows at 192 for MTP k=2
+  and `qwen38fn-fp8-8` at 96 for 32 sequences.
+- The recorded c1/c8 baselines are UNAFFECTED and are not re-stated: at k=3
+  those runs submit 4 and 32 graph rows, inside the old 64 ceiling. The
+  change widens coverage for c9..c64, which is unmeasured on this box and is
+  claimed only as a correctness/coverage fix, not as a throughput result.
+- Validation: slimserve suite 68 passed; profile suite 57 passed (including
+  both one-config-per-platform guards and the new capture guard); DFlash2
+  model, GGUF routing and GGUF vector-kernel tests 25 passed, 3 platform
+  skips; the merged `qwen3_dflash2` module imports with both drafter stacks
+  live and both architectures registered (`DFlash2DraftModel` safetensors,
+  `DFlash2QwenDraftModel` GGUF); `git diff --check` clean.
+- Next command: re-run the exact c8 workload on the merged tree to confirm
+  the ~200 tok/s pin still holds under main's spec-decode changes, then take
+  the first c16/c32 samples now that graph capture actually covers them.
+
+## 2026-08-28 - FIX: the speculative capture guard was skipping 9 of its 12 cases
+
+- Status: retained (correctness/coverage). No throughput measurement is
+  claimed here; see "Not measured" below.
+- Scope: `test_full_decode_graphs_cover_the_largest_speculative_batch`
+  (merged from main earlier today) and the five `glm52-q2k-*` FULL-graph
+  records it was not reaching.
+- Baseline: the guard asserts
+  `max_cudagraph_capture_size >= (k+1) x max_num_seqs` on FULL-graph
+  speculative variants, after main measured the failure at 425 vs 880 tok/s
+  on 8x3090. But it opened with `if not (k and max_num_seqs and capture):
+  continue`, so it only ran where BOTH fields were spelled out in the record.
+  Of the 12 FULL-graph speculative variants in the registry it checked 3.
+- Defect: the skip covered exactly the silent cases. An omitted
+  `max_cudagraph_capture_size` does not disable graph capture -- it inherits
+  `min(max_num_seqs * 2, 512)` (`vllm/config/vllm.py::_set_cudagraph_sizes`).
+  That default budgets ONE row per sequence with 2x headroom, while a
+  speculative step submits `k+1` rows per sequence, so at k>=2 the inherited
+  ceiling is always short. "Field unset" was being read as "nothing to
+  check" when it actually means "nobody made this decision at all", which is
+  the condition most likely to be wrong.
+- Found: all five `glm52-q2k-*` FULL_DECODE_ONLY records (dspark k=3) set no
+  capture and were under-covered by exactly 2x --
+  `glm52-q2k-2/mi300x`, `glm52-q2k-4/mi300x`, `glm52-q2k-8/mi300x` at 32
+  sequences inherited 64 against 128 needed; `glm52-q2k-4/a100` and
+  `glm52-q2k-8/a100` at 64 sequences inherited 128 against 256 needed. Every
+  one of them ran its largest decode batches eager, silently, and had done so
+  since the profiles were written.
+- Change 1 (guard): resolve both sides to EFFECTIVE values instead of
+  skipping -- unset capture becomes `min(max_num_seqs * 2, 512)`, unset
+  `max_num_seqs` becomes `SchedulerConfig.DEFAULT_MAX_NUM_SEQS` (128). The
+  mirrored constants are pinned against vLLM by
+  `test_mirrored_vllm_defaults_have_not_drifted`, so a vLLM-side default
+  change fails loudly rather than quietly weakening the guard.
+- Change 2 (profiles): the five glm52 records now pin capture explicitly at
+  `(k+1) x max_num_seqs` -- 128 at 32 sequences, 256 at 64 -- the same rule
+  `qwen38-nvfp4-1/mi300x` (192) and `qwen38fn-fp8-8/rtx3090` (96) follow.
+- NOT fixed, deliberately: the four `dsv4-*/a100` tiers pin capture 64 but
+  leave `max_num_seqs` unset, so it inherits 128 and batches past ~10
+  concurrent requests fall off the graphs. That capture was not an oversight
+  -- it is the fix from "2026-08-10 TP8 c8 Cliff Root Cause: Graph Capture
+  Width", measured against the c8 verify width of 8 x 6 = 48 rows. Raising
+  it is coupled to the KV budget on that hardware ("its larger graphs shrink
+  the KV pool"), and there is no A100 here to measure it on. Recorded as a
+  narrow, dated exemption that still asserts the band that WAS measured, not
+  as a skip: dropping dsv4 capture below 48 fails the guard.
+- Correctness: both guard branches were proven non-vacuous by reverting each
+  case in turn -- restoring a glm52 default fails the arithmetic branch, and
+  lowering dsv4 capture to 32 fails the exemption branch. Resolved engine
+  kwargs confirm the new ceilings reach the serving args
+  (`glm52-q2k-2 -> capture 128, max_num_seqs 32`). slimserve suite 58 passed.
+- NOT MEASURED: no glm52 serving run was taken for this change. It only
+  widens graph coverage, and the arithmetic is exact rather than tuned, but
+  the memory cost is real and unquantified here: the MI300X records use a
+  fixed `kv_cache_memory_bytes`, so the extra graphs come out of headroom,
+  while the A100 records derive their pool from
+  `gpu_memory_utilization: 0.92` and will trade some KV for graph memory (at
+  `max_model_len: 4096` that pool is small). Boot is the first thing to
+  watch.
+- Next command: boot `glm52-q2k-2` on 2 MI300X and confirm (a) it reaches
+  health with the 47 GiB fixed KV pool intact at capture 128, then (b) take
+  a c16/c32 exact pass -- c32 is 128 rows, precisely the band that was
+  running eager and the one main measured at roughly half throughput.
+
+## 2026-08-29 - KV policy scoped: bf16 main KV enforced on rtx3090 only
+
+- Operator decision after the Metal-campaign merge surfaced the
+  qwen38-nvfp4-1-tq TurboQuant-main-KV Metal variant: bf16 main KV is
+  enforced (by test) on rtx3090 profiles only, where the multi-turn
+  tracking corruption was root-caused; it is aspirational elsewhere.
+- Reverted the five A100 DSV4 variants to their qualified fp8 KV configs
+  (the 2026-08-28 flip to auto was never A100-validated and halved their
+  token pools); each carries a note to flip only with an on-box
+  requalification pass. The -tq Metal variant stands as shipped.
+
+## 2026-08-29 - Post-merge prod bounce: one CUDA/Metal seam fix, then healthy
+
+- First boot of the merged tree crashed in warmup: run_fused_postprocess_align
+  copy 32 vs 33 - the Metal campaign grew the shared num_accepted_tokens_gpu
+  by one trailing MPS sentinel slot (max_num_reqs + 1), while the CUDA align
+  context's whole-buffer snapshot stayed at max_num_reqs. Fixed by sizing
+  num_accepted_tokens_out to match, comment ties the two allocations.
+- Service healthy on the merged code: host tier arena registered (12,146
+  slots x 64 GiB/rank), reasoning_effort low live (trivial turn answered
+  with 0 thinking tokens), c8 spot bench 590.7 tok/s (= the 590.7 baseline).
+
+## 2026-08-29 - Tool-call diagnostics: serving paths validated; "no tool calls" reports traced to saturation queueing
+
+- Operator relayed reports that the deployed Qwen3.8-Flash-Next
+  (rtx3090 x8, port 8000) "is not properly responding to tool calls."
+  Tested every tool-call path directly against the live service:
+  chat/completions non-streaming, streaming, tool-result round trip,
+  parallel tool calls (Tokyo+London), Responses API auto tool choice,
+  Responses streaming, json_schema + thinking, and a multi-turn
+  function_call/function_call_output replay with a 13-tool set. All
+  passed with correct tool names, valid JSON arguments, and
+  finish_reason=tool_calls. Reliability sweep 8/8 at temp 1.0 /
+  top_p 0.95 / top_k 20.
+- End-to-end harness validation: installed pi coding agent, registered
+  the service as a provider (~/.pi/agent/models.json: slimserve ->
+  http://localhost:8000/v1, openai-completions, qwen-chat-template
+  thinking format, sampling 1.0/0.95/20), and pi drove a real
+  read-file tool call through the model to a correct answer.
+- Root cause of the reports (evidence, not fix): during production
+  bursts from the /v1/responses agent client, GPU KV sat at 95-99%
+  with 5-7 requests waiting and 1 deferred; a fresh request queued
+  4+ minutes with zero bytes streamed (pi died twice on 180/240 s
+  timeouts). Client harness timeouts present exactly as "model does
+  not respond to tool calls." When the burst drained, TTFB on the
+  same request was 5 ms, and pi completed in seconds. Capacity /
+  admission behavior under agentic burst load is the follow-up, not
+  the tool-call stack.
+- Log noise ruled out as corruption: recurring
+  backend_xgrammar.py:214 "Failed to advance FSM ... tokens 271"
+  (271 = "\n\n") is the DSpark drafter proposing whitespace right
+  after </think> where a JSON grammar starts; the spec-decode
+  bitmask path tolerates it (post_reasoning_end_in_window) and
+  rejection sampling discards the draft. Reproduced on a
+  json_schema request of mine that still returned valid JSON. Same
+  for grammar_matcher.cc "terminated after accepting stop token"
+  (token 198 = "\n"). Harmless but noisy at ~200+ occurrences;
+  candidate cleanup: downgrade that accept_tokens log to debug when
+  the reject is a tolerated post-reasoning draft.
+
+## 2026-08-29 - Prefix caching: local layer healthy, host tier dead in production (owner-key collision)
+
+- Question under investigation: production cumulative prefix hit rate
+  ~16% (declining through bursts) with external (host tier) hit rate
+  0.4%, on agentic traffic where the policy expects near-100%.
+- Local layer verified working, controlled tests on the live server:
+  identical 9,655-token prompt twice -> second run 8,400/9,655 tokens
+  (87%) from cache, 2.08 s -> 0.54 s. Multi-turn replay (turn-2
+  carrying turn-1's assistant reply) -> 2,400/2,844 (84%) hit, with
+  or without reasoning replayed. Mechanism and mamba align-mode
+  hashing are fine; template replay divergence ruled out.
+- Production misses are capacity thrash: bursts of ~18 concurrent
+  long-context conversations from the /v1/responses client push GPU
+  KV to 95-99%, conversations evict each other, every turn re-prefills
+  its history (prompt throughput 600-2,400 tok/s while gen sits at
+  40-500). The host tier exists to absorb exactly this spillover and
+  does not: since boot, 197 tail-boundary saves, 48 restores issued,
+  only 6 lookup hits (all at shallow boundaries, blocks 2-8),
+  6,800/1.79M external tokens hit.
+- ROOT CAUSE (host_tier_connector.py:189 `_owner`): the trajectory
+  owner key is `request.block_hashes[0].hex()` - the hash of the
+  FIRST 400-token block. All concurrent conversations share the same
+  system-prompt opening block, so they all collapse into ONE
+  Trajectory in HostKVTierIndex: stage_attention keeps the first
+  conversation's block at each position (later convs skipped),
+  stage_tail_states lets every finisher overwrite the shared tail, and
+  lookup's `traj.hashes[:n] == hashes[:n]` full-chain compare then
+  fails for every individual conversation once the chain is a mix.
+  The rare hits happen when traffic is briefly single-conversation.
+  The 2026-08-28 validation passed because the bench ran one
+  conversation per system prompt at a time - no collision.
+- Fix direction (not yet implemented): owner must identify a
+  conversation lineage, not a shared first block. vLLM block hashes
+  chain (hash at position i commits to the full prefix), so keying
+  trajectories by a deeper chain hash - or forking a new trajectory on
+  hash conflict at stage time instead of skipping - restores
+  per-conversation trajectories; the cleaner endpoint is a
+  content-addressed per-block store (hash -> slot, refcounted) with
+  tail states keyed by tail hash, sharing prefix slots instead of
+  fighting over them. Needs the usual on-box validation pass with a
+  concurrent multi-conversation workload, which the current bench
+  lacks.
+
+## 2026-08-29 - Structured output now tolerates the chat template's post-reasoning scaffold
+
+- Operator insight adopted: the '\n\n' between '</think>' and the answer
+  is CHAT TEMPLATE SCAFFOLD, not response. The Qwen3 template renders
+  replayed assistant turns as '</think>\n\n' + content (and literally
+  injects '<think>\n\n</think>\n\n' when thinking is disabled), so the
+  template - not the grammar - is the authority on where the response
+  starts. Previously the JSON grammar armed at '</think>' and its root
+  accepts no leading whitespace (verified: xgrammar's any_whitespace
+  only permits whitespace INSIDE the JSON, first-token acceptance is
+  identical with the flag on or off), which coerced the model
+  off-distribution at the first constrained token and rejected the MTP
+  drafter's natural '\n\n' (~213 tolerated FSM errors since boot).
+- Fix: the template convention is declared once in
+  ParserEngineConfig.response_scaffold ("\n\n" for qwen3), exposed via
+  ReasoningParser.response_scaffold (default ""), read by
+  StructuredOutputManager and passed to XgrammarBackend, whose JSON /
+  json_object compiles now concat an optional bounded prefix grammar
+  (root ::= ("\n\n")?) ahead of the schema. Scaffold accepted at most
+  once, exactly as rendered; a third newline is still rejected; empty
+  scaffold keeps the old strict root. A pure parser-boundary fix
+  (consuming the scaffold in is_reasoning_end) was rejected: the
+  streaming contract fires on the last reasoning token and cannot
+  retroactively distinguish a model that skips the separator, which
+  would swallow the first content token and desync the grammar.
+- Validation: 6 new tests in tests/v1/test_response_scaffold_grammar.py
+  (scaffold accepted whole and split across tokens, optional, not
+  repeatable, empty-scaffold strictness, qwen3 adapter declares "\n\n");
+  tests/parser 284/284, tests/reasoning + xgrammar tokenizer info 34/34,
+  import smoke green. NOT yet validated live: the running production
+  server predates the change; expected effects on restart are the
+  backend_xgrammar FSM errors dropping to zero on json_schema requests
+  and one fewer wasted draft per structured request.
+- Known cosmetic follow-up, same convention: the text path still leaks
+  the scaffold into returned content (leading "\n\n") because
+  extract_reasoning/streaming do not strip it; upstream vLLM's qwen3
+  parser lstrips it. Separate change, API-visible, not bundled here.
+
+## 2026-08-29 - Scaffold fix deployed to prod; pi agentic load validation clean
+
+- Restarted slimserve-qwen38fn.service (e319ddff1) in a zero-load
+  window; healthy in ~4.5 min (20:32:29 UTC). Post-restart json_schema
+  requests: 3/3 valid JSON, model now emits its natural '</think>\n\n{'
+  and the grammar accepts it - backend_xgrammar FSM errors since
+  restart: 0 (was ~213 on the prior boot). The scaffold now appears at
+  the head of returned json_schema text ("\n\n{...") - legal for
+  json.loads, the declared text-path strip follow-up would remove it.
+- Agentic anomaly sweep through a real harness (pi against the live
+  service, two waves, 3-way then 6-way concurrent): 12 tasks / 39 tool
+  calls covering single read, multi-file parallel reads (2 tool calls
+  in one assistant message, streamed), grep+read chains, edit+bash
+  verify loops, write, 4-step sequential chains, python-authoring, and
+  a long-context read that navigated pi's 50KB read boundary across 8
+  turns. Raw event streams inspected per run: zero error/aborted stop
+  reasons, zero malformed tool arguments, zero tool-result errors,
+  zero unparseable events. All 12 final answers verified against
+  ground truth (csv total 100, appended total 142 on disk, ERROR
+  count 95, mean latency 449.20 exact, both a/b discrepancies, etc.).
+- Server side during load: zero errors; only cold-start Triton JIT
+  warmup warnings at 20:32-33 (known; consider extending warmup
+  shapes). Prefix cache hit rate on the fresh boot reached 69.7% under
+  pi's shared-prefix agentic traffic - consistent with the earlier
+  finding that the low production rate is capacity thrash + the
+  host-tier owner-key collision, not the cache mechanism.
+
+## 2026-08-29 - Open items landed: host-tier lineage owners, content scaffold strip, warmup gate
+
+- Host tier owner-key collision FIXED. Trajectories are now keyed by the
+  request id that created them; a request that resumes from the tier
+  adopts the stored owner so a conversation keeps extending one lineage
+  (index.lookup now returns the owner). Content-derived keys are gone.
+  Divergent-continuation safety: stage_tail_states records the saver's
+  chain hash at the boundary block (Trajectory.tail_hash) and
+  resumable_blocks requires the staged attention chain to carry the same
+  hash there - a tail state paired with another conversation's blocks is
+  dead, never dangerously matchable (the wrong-mamba-state resume the old
+  chimera trajectories could theoretically have produced). Concurrent
+  same-prefix conversations now build separate trajectories; duplication
+  is LRU-reclaimed. 4 new index regression tests + connector suite green.
+- Content scaffold strip (text path) DONE: ParserEngine strips exactly
+  one leading response_scaffold occurrence from content after reasoning
+  end, non-streaming and streaming (the existing whitespace-defer holds
+  split deltas until the decision is atomic). A single newline or absent
+  scaffold passes through untouched; only one occurrence is stripped.
+  7 new tests in tests/parser/test_response_scaffold_strip.py.
+- JIT warmup root cause: qwen_triton_warmup was gated on a model-type set
+  that lacked qwen4_exp - the ENTIRE Qwen warmup silently skipped on this
+  deployment, which is why even already-covered kernels (zero_kv, conv,
+  post_conv) JIT'ed at first request. Added qwen4_exp/qwen4_exp_text to
+  the gate (+ gate regression test). Still uncovered, documented in the
+  module: QSA paged kernels, PLE short-conv, sampler topk_topp - extend
+  against live jit_monitor output on a future boot, not blind shapes.
+- Cache-rate context recorded from today's measurements: identical fully
+  cached rerun caps at 71.4% (1200/1680) for a 1.7k prompt - align-block
+  granularity (400) + boundary-freeze lag consume the tail 1-2 blocks,
+  proportionally negligible at 10-50k production contexts. Replay
+  divergence verified: a client that does NOT send reasoning back
+  re-renders prior turns as empty think blocks -> token mismatch at every
+  prior assistant turn -> full-history re-prefill (template-level check:
+  68/68 token continuity WITH reasoning_content replay, divergence at the
+  first think block without). Production clients should echo reasoning
+  items back for cache continuity; vLLM maps assistant `reasoning` ->
+  template reasoning_content already.
+- All suites: 316 passed (parser 291 incl. 7 new, kv-tier 10+... , host
+  tier connector 7, warmup gate 2, scaffold grammar 6).
+
+## 2026-08-29 - Open-items deploy (9cf0155ee): live validation on restart
+
+- Restarted slimserve-qwen38fn in a quiet window; healthy 21:36:07 UTC.
+- Warmup gate CONFIRMED live: "Warming up Qwen Triton kernels for
+  model_type=qwen4_exp_text" on all ranks. First-request JIT warnings
+  dropped 8 -> 5 kernels: _zero_kv_blocks, _fused_post_conv and
+  _qsa_merge_splitk no longer JIT at first request. _causal_conv1d_fwd
+  still fires once on a shape the warmup config doesn't hit (warmup runs
+  a single conv shape; note for the follow-up pass), plus the four
+  documented-uncovered kernels (_qsa_mqa_paged, _qsa_sparse_paged_gqa
+  _splitk, _expand_qsa_indices, _topk_topp).
+- Scaffold strip CONFIRMED live on both APIs: chat content and
+  responses json_schema text no longer carry the leading "\n\n"; JSON
+  valid; xgrammar errors still zero.
+- Host tier on new boot: connector healthy (packed slab 76/76 layers,
+  6452 slots x 400-token blocks), boundary-state saves flowing under the
+  new lineage owners, zero errors. Hit-rate improvement is NOT yet
+  measured - it needs production burst/eviction cycles; watch
+  external_prefix_cache_hits_total vs saves over the next hours. The
+  index-level behavior (separate trajectories per conversation, adoption
+  on resume, tail-hash safety) is unit-proven.
+
+## 2026-08-29 - Agent concurrency ceiling: pi scaling waves on qwen38fn-fp8-8
+
+- Method: waves of N simultaneous pi agents (N=2..32) against the live
+  service, each running a ~20-tool-call audit mission over a real repo
+  clone (tree exploration, line counts, multi-file reads, repo-wide
+  grep, git log, web fetch, report write+verify). Event streams
+  captured per agent; per-turn latency = wall/turns. Raw logs:
+  scratchpad piheavy/logs (plus a 2-call light-task baseline in
+  piscale/logs).
+- Results (mean task | p95 | fails | mean tool calls | s/turn |
+  marginal prefix-hit):
+    N=2   84s |   76s | 0 | 21.5 |  3.8s | 91%
+    N=4   60s |   58s | 0 | 14.0 |  4.3s | 81%
+    N=8   91s |  124s | 0 | 20.9 |  4.8s | 88%
+    N=16 316s |  978s | 0 | 19.5 | 17.9s | 75%
+    N=24 748s | 1771s | 2 timeouts | 12.2 | 45.0s | 17%
+    N=32 all agents stalled: uniform 1218s (pi provider timeout),
+         zero tool calls completed.
+- Caveat: waves 24 and 32 overlapped genuine production bursts from the
+  /v1/responses client (engine showed Waiting 18 during w24 and
+  Waiting 59 during w32, i.e. ~27 foreign requests at peak), so those
+  waves measure agents + production contention, not agents alone. GPU
+  KV reached 89% during w24.
+- Verdict: <=8 agents indistinguishable from solo (4-5 s/turn); the
+  practical ceiling for tolerable interactivity is 12-16 agents
+  (~18 s/turn, task p95 already 16 min); 24+ is intolerable (45 s/turn,
+  30-min timeouts) and 32 alongside a production burst is a full stall.
+  The binding constraint is aggregate decode throughput + KV pressure;
+  queueing spirals once demand exceeds it.
+- Host tier first real workout under eviction pressure: wave 24 alone
+  restored 1.27M tokens from the pinned host tier (external hits
+  +1,268k), vs 6.8k tokens in 12 HOURS under the old owner-collision
+  code. Cumulative external hit rate reached ~40% during the run. The
+  lineage-owner fix is confirmed effective under real thrash.
+- Raw-response anomaly worth tracking: at higher load the model
+  occasionally hallucinated tool names not in the pi schema
+  ("write_file", capitalized "Read"); pi rejected them and the model
+  recovered via bash. Model behavior, not a serving bug; some agents
+  also wrote their reports via bash heredoc instead of the write tool.
+
+## 2026-08-30 - POLICY: prefix caching enabled on every profile, no opt-out
+
+- Status: retained (operator directive). Registry-only change; no kernel or
+  serving-path code touched.
+- Scope: the four platform records that still had `enable_prefix_caching:
+  false` -- `qwen38-q2kxl-1/metal`, `qwen38-q2kxl-1/mi300x`,
+  `qwen38-nvfp4-1/metal`, `qwen38-nvfp4-1-tq/metal`. All 25 platform records
+  now state `true`.
+- Baseline: the 2026-08-28 policy pass made every record state the setting
+  explicitly but allowed an opt-out with a note. These four kept theirs on
+  the premise that a hybrid GDN model cannot prefix cache, inherited from the
+  retired `qwen38-1` Q4_K_M profile.
+- Why the premise was wrong: it is the same reasoning that shipped
+  `qwen38fn-fp8-8` -- also a Gated DeltaNet hybrid -- with a 0.0% hit rate
+  and full-history re-prefill every turn. Only the 16 full-attention layers
+  hold paged KV, but those layers still cache; the 48 recurrent layers are
+  the hybrid manager's business, not a reason to disable the feature. The
+  sibling `qwen38-nvfp4-1/mi300x` record -- same model, same card, same GDN
+  state contract -- has been serving with prefix caching on.
+- Engine-side confirmation (read, not assumed):
+  `ModelConfig.is_prefix_caching_supported` returns True for `attn_type ==
+  "hybrid"` ("Generative hybrid models support prefix caching"), and
+  `EngineArgs` only fills the value when it is None, so an explicit true in a
+  profile is honored rather than overridden. The off records were a stale
+  default, never a capability limit.
+- Change: flipped the four booleans and DELETED the premise rather than
+  rebutting it -- the "which is why prefix caching is off" clause is gone from
+  both qwen38-q2kxl-1 architecture notes, and the retired qwen38-1 profile's
+  setting is gone from the qwen38-nvfp4-1/metal inheritance list. The four
+  records now carry the same standard policy note as the rest of the registry.
+  Tightened `test_every_profile_states_prefix_caching_explicitly` from
+  "stated, with a noted opt-out" to "must be true", and updated the standing
+  policy in `CLAUDE.md` and the `_SERVING_DEFAULTS` comment in
+  `slimserve/registry.py` so the docs and the test agree.
+- Correctness: 61 SlimServe registry tests pass; all four records resolve
+  with `enable_prefix_caching=True`; `profiles.json` parses; ruff clean.
+- NOT yet measured: this is a registry/policy change validated by test only.
+  No profile has been booted since the flip, so there is no on-box throughput
+  or hit-rate number for any of the four. The hybrid `align` cache mode is
+  still marked experimental upstream and is unvalidated on Metal and on
+  MI300X for this model, so the next live pass for each of these profiles
+  must confirm health and record a hit rate before any performance claim is
+  made from this entry.
+- Next command: `slimserve qwen38-q2kxl-1 --serve` on the MI300X box, then a
+  multi-turn exact pass to record the prefix-cache hit rate.
+## 2026-08-30 - CLEAN agent-concurrency curve (isolated :8001, zero foreign traffic)
+
+- The 2026-08-29 scaling run was invalidated: the "production bursts"
+  were a coworker's performance test sharing the box. Clean rerun
+  methodology: stopped slimserve-qwen38fn (:8000), launched a transient
+  systemd twin (slimserve-test-8001, same profile/env/limits) on :8001
+  that no other client knows about, repointed pi, and recorded a
+  foreign-POST count for every wave window (0 for all 22 waves).
+- Second methodology lesson: ladder-order bias. Back-to-back ascending
+  waves inherit the prior waves' KV saturation - the main ladder
+  measured N=16 at 34 s/turn, but a settled re-probe measured 6.6.
+  Final curve uses settled-state probes throughout.
+- Heavy agent task (~15-20 tool calls, repo audit), per-turn latency:
+    N=2 2.4s | N=4 3.0s | N=8 6.1s | N=10 6.0s | N=12 6.2s
+    N=14 7.9s | N=16 6.6s | N=20 9.1s | N=24 12.4s | N=32 43.1s
+  Task p95: <=140s through N=24; 1,434s at N=32 (24-minute tasks).
+  Zero failures at every N; GPU KV hit 98.8% with a waiting queue only
+  at N=32.
+- Light task (2 tool calls) never walled: N=32 mean 10s, p95 22s -
+  run 1's light-N=32 "wall" (p95 123s) was pure coworker contention.
+- VERDICT: ~16 simultaneous heavy agents feel near-solo (<7 s/turn);
+  20-24 is the tolerable ceiling (9-12 s/turn); the cliff is between 24
+  and 32, where 32 heavy contexts exceed the KV pool (98.8% + queue)
+  and per-turn latency jumps 3.5x to 43s. Recommended operating point:
+  cap agent fleets at 24 on this profile; revisit after KV-capacity or
+  scheduling work if 32 is needed.
+- Raw data: scratchpad cleanrun/logs (main ladder + 3 settled probes);
+  run-1 contaminated logs preserved in piheavy/logs_run1_contaminated.
+- Box state at end of test: :8000 prod service STOPPED (operator
+  ordered), test twin live on :8001, pi pointed at :8001. Restore =
+  stop slimserve-test-8001, start slimserve-qwen38fn, flip pi baseUrl.
+
+## 2026-08-30 - A100 campaign re-applied after the history rewrite (bf16 KV, host tier, zeroer fix, sweep record)
+
+Re-application of the 2026-08-29/30 A100 work lost from the worktree by
+the origin history rewrite (uncommitted changes; see the CLAUDE.md
+rewritten-history rule). Raw artifacts survived in the git-ignored
+perf/results/2026-08-29/a100-bf16-kvtier/ and
+~/.local/scratch/a100-sweep/. Summary of the re-applied record:
+
+- DSV4 bf16 main KV on A100, implemented per operator directive: the
+  sparse-MLA decode was already templated for all-bf16 slots
+  (mla_decode_fp8_v NFP8=0, SLOT_BYTES=2*QW - the geometry GLM-5.2
+  serves on A100); the fused bf16 insert, plain-row compressor store
+  flag, SWA bf16 dtype, and plain-row KV specs existed for other
+  platforms. New: the <true,true,512,512,0,0> instantiation of the
+  merged two-source persistent decode (dtype-driven binding, byte
+  strides via element_size, scale plane never read), STORE_BF16
+  branches in both Triton compress-store kernels, a bf16 paged-gather
+  for prefill, and Ampere layout gating (auto/bfloat16 -> plain rows).
+  Gates on this box: kernel parity 2.5e-04 vs fp32 reference
+  (unpartitioned/partitioned/two-source; fp8 path re-validated at the
+  same magnitude, bf16-vs-fp8 delta 2.0e-02 = the removed quantization
+  error); TP4 boot healthy with DSpark TQ draft + FULL_DECODE_ONLY
+  graphs (KV pool 33.59 GiB = 2.12M tokens at 262K); marker recall 7/7
+  to 58K depth at c2 and clean through the c8 sweep legs below.
+- KVBlockZeroer packed-slab overrun ROOT-CAUSED AND FIXED: the zeroer
+  used the tensor's block-dim stride as both per-block ADVANCE and zero
+  EXTENT. Packed cross-layer slabs hand out block-strided layer views
+  at slab_base+layer_offset, so each deferred zero wiped layer_offset
+  bytes of the NEXT block (silent cross-block KV corruption) and ran
+  past the slab end on the highest block ids (illegal memory access,
+  engine death). Armed on every DSV4 spec-decode config: the TQ draft
+  cache makes (dtype, kv_quant_mode) mixed, which enables
+  needs_kv_cache_zeroing. The zeroer landed with the Metal merge; the
+  14-day production services booted pre-merge and never ran it.
+  Bisection: tier-ON + CUDA_LAUNCH_BLOCKING=1 faulted synchronously in
+  _zero_kv_blocks_kernel at 13 min; tier-OFF control died of the same
+  async IMA at 45 min (tier incidental). Fix: segments carry
+  (addr, stride_el, page_el) - advance by stride, zero only the layer's
+  own page; contiguous layouts byte-identical; ratio>1 over strided
+  views asserts. Validated: synthetic packed-slab exact-byte test PASS
+  under compute-sanitizer incl. the last-block case, then the exact
+  crash workload ran a full hour clean (recall 11/11, sessions to 82.7K
+  ctx, zero engine incidents). NOTE: the rtx3090 tier validation
+  predates this fix; its byte-identical eviction-restore checks should
+  re-run.
+- WildChat deep-context sweep (c8, model-default context, bf16 + tier +
+  TQ draft, 1.25h/leg):
+  dsv4-q4ktail-2 (TP2): recall 16/16, 0 errors, ctx median 81.8K/max
+  92.0K; TTFT heavy at depth (13 GiB fp8-era byte budget is the bind).
+  dsv4-q4ktail-4 (TP4): recall 40/40, 0 errors, ctx median 220.6K/max
+  236.3K, 29.8M prompt tok, TTFT p50 ~104s at 200-262K.
+  dsv4-mxfp4-4 (TP4): recall 23/23, 0 errors, ctx median 122.6K/max
+  135.5K (~half the Q4K-tail depth per wall-clock - the known MXFP4
+  deficit, now quantified at depth).
+  dsv4-mxfp4-8 (TP8): recall 44/44, 0 errors, ctx median 244.0K/max
+  258.5K, 35.5M prompt tok.
+  glm52-q2k-4/-8: boots fail in inductor ("auto_functionalized was not
+  removed") - post-merge pass gap; the pass now logs the unhandled op
+  name; fix pending a named-op boot.
+  dsv4-q4ktail-8 (TP4 x DP2): 0 request errors, ctx median 157.6K, but
+  recall 9/28 -> see the OPEN item below.
+- OPEN P0: TP4xDP2 (dsv4-q4ktail-8) engine-wide degeneration. Both DP
+  replicas produce fluent multilingual token soup on trivial fresh
+  prompts; deterministic per seed; present at IDLE on a fresh boot
+  (3/3 canaries); NAN_WATCH silent; spec acceptance pegs to 5.8 (k=5
+  ceiling 6.0) during benches. Exonerated by bisection arms: spec
+  (no-spec arm crashed loudly at warmup in ggml_dsv4_moe_a8 "invalid
+  packed Q8_1 input" - same subsystem), custom all-reduce, mHC async
+  schedule, load itself (idle-degenerate). NOT the old 0*NaN split-K
+  bug (fixed 2026-08-13, NaN-free here) and NOT the zeroer (fixed,
+  arms re-ran on the fix). Prime suspect: the DSV4 fused-MoE
+  expert-map path - DP shards experts across engines and the
+  q4ktail-8 profile is the only config that exercises it; production
+  ran two manual TP4 replicas, so this path is unvalidated since the
+  Metal merge. Next discriminators (arms staged in
+  ~/.local/scratch/a100-sweep/quick_arm.sh): VLLM_GGUF_DSV4_AMPERE_FUSED=0,
+  VLLM_DSV4_W1_QWARP8=0, VLLM_DSV4_ALIGNED_Q8=0, each judged by idle
+  canaries on a fresh boot.
+- Also in this batch: deep-context harness hardening (records persisted
+  before summary; ttft percentiles over the filtered list; 512-token
+  probe budget - a 96-token cap starved thinking-enabled probes into
+  false recall failures), the fix_functionalization unhandled-op
+  logger, GLM A100 context restored to the model default 202752 (the
+  local GGUF's glm-dsa.context_length metadata-patched from the
+  exporter's erroneous 1,048,576; upstream repo fix flagged in the
+  glm52-vision source artifact_note), and the serving-policy updates in
+  CLAUDE.md (bf16 rtx3090+a100, model-default context, tier standing on
+  A100).
+
+## 2026-08-30 - Issue #20 implemented: reasoning-budget graceful close + wrap-up nudge, deployed
+
+- V2 thinking-budget enforcement rewritten as the llama.cpp
+  reasoning-budget state machine (IDLE/COUNTING/WAITING_UTF8/FORCING/
+  DONE with re-arm) extended per operator directive with a wrap-up
+  NUDGE: at thinking_budget_nudge_fraction (0.85) the configured
+  message is injected uncharged so the model can react with its
+  remaining budget; the budget stays a HARD cutoff (end marker forced
+  at exhaustion, held across UTF-8 codepoint boundaries - 787
+  byte-fallback tokens flagged in the Qwen3.8 vocab). Multi-token
+  markers now supported via dense KMP DFAs; the V2 single-token
+  restriction is gone. All shape-static tensor ops; simulated across
+  speculative verify spans. V1 holder gains the UTF-8 hold; nudge is
+  V2-only (the production runner).
+- Defaults (operator directive): thinking_token_budget map
+  {low: 6000, medium: 7000, xhigh: 8000} on qwen38fn-fp8-8/rtx3090
+  ("high" is not a level this template accepts - learned live);
+  default effort low -> 6000. Per-request override and -1 opt-out
+  unchanged. Default nudge message: "Considering the limited time by
+  the user, I have to give the solution based on the thinking
+  directly now."
+- Deploy hit a crash-loop: the coworker's KVBlockZeroer packed-slab
+  fix (b8d3f34c5) widened _meta to 6 fields; qwen_triton_warmup still
+  unpacked 5 - and only qwen4_exp boots run that helper (our warmup
+  gate fix), which no A100 box ever did. Fixed the unpack, passed the
+  new seg_strides through to the kernel, and added an arity guard so
+  warmup can never kill a boot again.
+- Live validation on prod (rtx3090): budget map loaded at boot;
+  budget=40 request shows the nudge injected mid-reasoning at the 85%
+  point and a hard close with a coherent final answer; budget=60
+  accounting exact (51 charged + 23 uncharged nudge tokens, closed
+  within budget); -1 opt-out unlimited with no nudge. 22-case V2 unit
+  suite green (cuda/mps/cpu); registry suite green. NOT yet measured:
+  throughput impact of the budget path under load (expected nil when
+  no request carries a budget; the default map now puts one on every
+  request - watch the next bench).
+
+## 2026-08-30 - Mitigated dsv4-q4ktail-8 resident VALIDATED
+
+- Fresh boot of the profile (repack disabled, everything else standard:
+  bf16 KV, host tier, DSpark TQ draft, FULL graphs) on this box: idle
+  canary coherent, then the c8 deep-context recall bench - recall 40/40,
+  0 request errors, all 8 sessions to wall-clock, ctx median 130.6K /
+  max 139.4K (raw: ~/.local/scratch/a100-sweep/resident-final-recall.json).
+  The DP2 profile is serving-healthy under the mitigation; the resident
+  stays up on :8000.
+## 2026-08-30 - Qwen3.8 default thinking budget: flat 2000 on every variant
+
+- Operator directive: all six Qwen3.8 variant records (qwen38-nvfp4-1
+  mi300x/metal, qwen38-nvfp4-1-tq metal, qwen38-q2kxl-1 metal/mi300x,
+  qwen38fn-fp8-8 rtx3090) now default thinking_token_budget to a flat
+  2000, replacing the rtx3090-only effort map from earlier today. No
+  other model's profile carries a budget (verified by full-registry
+  scan). Per-request override and -1 unlimited opt-out unchanged.
+- Live validation on rtx3090 prod: a default long-thinking request
+  (xhigh effort) nudged at 1,700 tokens and closed at 1,723 total
+  (1,700 charged + 23 uncharged nudge) with a complete answer; an
+  explicit thinking_token_budget=50 capped at 43 charged; -1 remains
+  unlimited. Metal/MI300X records take effect on those boxes' next
+  boots (config-only; the V2 enforcement machine is platform-neutral
+  and its suite runs on MPS).
 
 ## 2026-08-30 - RETAIN: wide-tile fused SiLU-mul + fp8 group quant, tile sized by M
 

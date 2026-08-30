@@ -75,12 +75,14 @@ class MetalPlatform(Platform):
     # Neither inductor backend applies: there is no MPS backend, and the CPU
     # one needs a toolchain we do not require at runtime.
     simple_compile_backend: str = "eager"
-    supported_quantization: list[str] = ["gguf"]
+    supported_quantization: list[str] = ["gguf", "compressed-tensors"]
 
     @classmethod
-    def current_device(cls) -> str:
-        """Apple exposes exactly one GPU; parameters init on it directly."""
-        return "mps"
+    def current_device(cls) -> torch.device:
+        """Apple exposes exactly one GPU; parameters init on it directly.
+        Metal-only helper (no Platform-base counterpart); used by the GDN
+        serving path and weight loading."""
+        return torch.device("mps")
 
     @classmethod
     def is_available(cls) -> bool:
@@ -268,6 +270,16 @@ class MetalPlatform(Platform):
         model_config = vllm_config.model_config
         if model_config is not None:
             model_config.disable_cascade_attn = True
+
+        # The fork-wide kernel backend default is AITER (ROCm). It cannot be
+        # meant here, and the linear/MoE selectors treat any non-"auto" value
+        # as an explicit filter that would exclude the Metal kernels.
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if kernel_config is not None:
+            if kernel_config.linear_backend == "aiter":
+                kernel_config.linear_backend = "auto"
+            if kernel_config.moe_backend == "aiter":
+                kernel_config.moe_backend = "auto"
 
         cache_config = vllm_config.cache_config
         if not getattr(cache_config, "user_specified_block_size", False):

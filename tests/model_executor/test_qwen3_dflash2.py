@@ -15,6 +15,7 @@ import torch
 from vllm.model_executor.models.qwen3_dflash2 import (
     DFlash2QwenDraftModel,
     _apply_two_tap_conv,
+    _resolve_serving_block_size,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _rejection_sample_mps,
@@ -43,6 +44,28 @@ def test_two_tap_conv_matches_naive_reference(side: int) -> None:
                 src = xb[b, t - tap] if t - tap >= 0 else torch.zeros(hidden)
                 ref[b * bs + t] += w * src
     assert torch.allclose(got, ref, atol=1e-6)
+
+
+def test_short_serving_block_resets_conv_at_each_request() -> None:
+    """A 3-token draft uses 4-row blocks even for a checkpoint trained at 8."""
+    serving_block = _resolve_serving_block_size(8, num_speculative_tokens=3)
+    assert serving_block == 4
+
+    x = torch.arange(8, dtype=torch.float32).view(8, 1)
+    coeffs = torch.zeros(8, 2, 2, 1)
+    base = torch.zeros(2, 2, 1)
+    base[0, 1] = 1
+    got = _apply_two_tap_conv(
+        x, coeffs, base, side=0, block_size=serving_block, group_size=1
+    )
+
+    # Row 4 begins the second request and must not read row 3 as its predecessor.
+    assert got[:, 0].tolist() == [0, 0, 1, 2, 0, 4, 5, 6]
+
+
+def test_serving_block_cannot_exceed_training_block() -> None:
+    with pytest.raises(ValueError, match="wider block"):
+        _resolve_serving_block_size(8, num_speculative_tokens=8)
 
 
 @pytest.mark.skipif(

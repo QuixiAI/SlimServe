@@ -66,6 +66,15 @@ class ThinkingBudgetStateHolder:
         self._state: dict[int, dict[str, Any]] = {}
         self.cu_num_tokens: dict[int, int] = {}
 
+        # Token ids whose bytes end mid-UTF-8-codepoint: forcing the end
+        # marker right after one would sever a multi-byte character (CJK,
+        # emoji), so the exhaustion transition is HELD while the last
+        # committed token is one of these (llama.cpp's
+        # REASONING_BUDGET_WAITING_UTF8, committed-token granularity here).
+        self._incomplete_utf8: frozenset[int] = frozenset(
+            getattr(reasoning_config, "incomplete_utf8_token_ids", None) or []
+        )
+
         if self.num_spec_tokens > 0:
             self._mask_capacity = max_num_reqs * (self.num_spec_tokens + 1)
         else:
@@ -100,14 +109,17 @@ class ThinkingBudgetStateHolder:
 
         for i1, i2, direction in batch_update.moved:
             if direction == MoveDirectionality.SWAP:
-                state1 = self._state.get(i1)
-                state2 = self._state.get(i2)
+                # Remove both entries first. Otherwise swapping a budgeted row
+                # with a plain row duplicates the state into both slots.
+                state1 = self._state.pop(i1, None)
+                state2 = self._state.pop(i2, None)
                 if state1 is not None:
                     self._state[i2] = state1
                 if state2 is not None:
                     self._state[i1] = state2
             else:
                 state = self._state.pop(i1, None)
+                self._state.pop(i2, None)
                 if state is not None:
                     self._state[i2] = state
 
@@ -168,6 +180,23 @@ class ThinkingBudgetStateHolder:
                 return i
         return -1
 
+    def _utf8_hold(self, state: dict[str, Any]) -> bool:
+        """True when the exhaustion transition must wait for the codepoint
+        the last committed token left open to close."""
+        if not self._incomplete_utf8:
+            return False
+        output = state.get("output_tok_ids") or []
+        return bool(output) and output[-1] in self._incomplete_utf8
+
+    @staticmethod
+    def _find_first_sequence_index(target_list: list[int], token_ids: list[int]) -> int:
+        if not token_ids:
+            return -1
+        for i in range(len(target_list) - len(token_ids) + 1):
+            if target_list[i : i + len(token_ids)] == token_ids:
+                return i
+        return -1
+
     def _init_state_entry(
         self, prompt_tok_ids: list[int] | None, thinking_token_budget: int
     ) -> dict[str, Any]:
@@ -192,18 +221,13 @@ class ThinkingBudgetStateHolder:
                 prompt_tok_ids, self.think_end_token_ids
             )
             in_think = last_start > last_end
-            # load metrics such as think count, start thinking
-            # if request is in thinking mode, already
+            # Prompt tokens only establish whether generation starts inside a
+            # reasoning block. The cap counts generated reasoning tokens only.
             if in_think:
-                think_count = len(prompt_tok_ids) - (
-                    last_start + len(self.think_start_token_ids)
-                )
-                start_thinking = len(prompt_tok_ids) - think_count - 1
-                countdown -= think_count
+                think_count = 0
+                start_thinking = last_start
                 continue_thinking = True
-                # check if the token is exhausted within prompt
-                token_exhausted = thinking_token_budget - think_count
-                in_end = token_exhausted <= 0
+                in_end = thinking_token_budget <= 0
             else:
                 think_count = 0
 
@@ -238,6 +262,11 @@ class ThinkingBudgetStateHolder:
 
         if state["start_thinking"] == -1:
             scan_offset = state.get("scan_offset", 0)
+            scan_offset = max(
+                scan_offset,
+                state.get("prev_output_length", 0)
+                - max(0, len(self.think_start_token_ids) - 1),
+            )
             output_slice = state.get("output_tok_ids", [])[scan_offset:]
             start_thinking = self._find_last_sequence_index(
                 output_slice, self.think_start_token_ids
@@ -247,6 +276,11 @@ class ThinkingBudgetStateHolder:
             state["start_thinking"] = start_thinking
         if state["end_thinking"] == -1:
             scan_offset = state.get("scan_offset", 0)
+            scan_offset = max(
+                scan_offset,
+                state.get("prev_output_length", 0)
+                - max(0, len(self.think_end_token_ids) - 1),
+            )
             output_slice = state.get("output_tok_ids", [])[scan_offset:]
             end_thinking = self._find_last_sequence_index(
                 output_slice, self.think_end_token_ids
@@ -311,11 +345,29 @@ class ThinkingBudgetStateHolder:
             return
         output = state.get("output_tok_ids", [])
         if not output:
+            if not state.get("in_end", False) and state.get("in_think", False):
+                remaining_budget = current_step_countdown
+                spec_end_start = self._find_first_sequence_index(
+                    state["spec_token_ids"], self.think_end_token_ids
+                )
+                natural_spec_close_in_budget = (
+                    spec_end_start >= 0 and spec_end_start <= remaining_budget
+                )
+                if (
+                    len(state["spec_token_ids"]) + 1 > remaining_budget
+                    and not natural_spec_close_in_budget
+                    and not self._utf8_hold(state)
+                ):
+                    state["in_think"] = False
+                    state["in_end"] = True
+                    state["end_count"] = 0
+                    spec_len = len(state["spec_token_ids"])
+                    state["force_index"] = [min(max(remaining_budget, 0), spec_len)]
             # When in_end was set at init (budget=0, prompt already in think),
             # we must force the first generated token to be the end token;
             # otherwise apply() sees in_end=True but force_index=[] and
             # allows an extra thinking token.
-            if state.get("in_end", False):
+            if state.get("in_end", False) and not state.get("force_index"):
                 state["force_index"] = [0]
             return
 
@@ -324,6 +376,30 @@ class ThinkingBudgetStateHolder:
         current_length = len(output)
 
         if current_length <= prev_length:
+            if not state.get("in_end", False) and state.get("in_think", False):
+                remaining_budget = current_step_countdown
+                spec_end_start = self._find_first_sequence_index(
+                    state["spec_token_ids"], self.think_end_token_ids
+                )
+                natural_spec_close_in_budget = (
+                    spec_end_start >= 0 and spec_end_start <= remaining_budget
+                )
+                if (
+                    len(state["spec_token_ids"]) + 1 > remaining_budget
+                    and not natural_spec_close_in_budget
+                    and not self._utf8_hold(state)
+                ):
+                    state["in_think"] = False
+                    state["in_end"] = True
+                    state["end_count"] = 0
+                    spec_len = len(state["spec_token_ids"])
+                    if 0 < remaining_budget < spec_len:
+                        state["force_index"] = [remaining_budget]
+                    elif remaining_budget <= 0:
+                        state["force_index"] = [0]
+                    else:
+                        state["force_index"] = [spec_len]
+                    return
             if state.get("in_end", False):
                 remaining_budget = state["thinking_token_budget"] - state["think_count"]
                 spec_len = len(state["spec_token_ids"])
@@ -397,14 +473,14 @@ class ThinkingBudgetStateHolder:
                 state["scan_offset"] = len(state.get("output_tok_ids", []))
 
             elif state["in_think"]:
-                # Continue thinking mode, increment count by new tokens
-                prompt_tok_ids = state.get("prompt_tok_ids") or []
-                think_tokens_in_prompt = len(prompt_tok_ids) - (
-                    absolute_start_pos + start_len
-                )
-                state["think_count"] = (
-                    len(state["output_tok_ids"]) + think_tokens_in_prompt
-                )
+                # A prompt-open block counts from the first generated token;
+                # a generated block counts from just after its start marker.
+                if state["continue_thinking"]:
+                    state["think_count"] = len(state["output_tok_ids"])
+                else:
+                    state["think_count"] = len(state["output_tok_ids"]) - (
+                        absolute_start_pos + start_len
+                    )
             if state["in_think"]:
                 remaining_budget = max(
                     0, state["thinking_token_budget"] - state["think_count"]
@@ -416,12 +492,25 @@ class ThinkingBudgetStateHolder:
             total_thinking_tokens = (
                 state["think_count"] + len(state["spec_token_ids"]) + 1
             )
+            # If the proposal naturally closes reasoning before the cap, let
+            # rejection sampling validate it and do not force a duplicate end
+            # token. State remains based on committed output in case the draft
+            # is rejected before this marker.
+            spec_end_start = self._find_first_sequence_index(
+                state["spec_token_ids"], self.think_end_token_ids
+            )
+            remaining_budget = state["thinking_token_budget"] - state["think_count"]
+            natural_spec_close_in_budget = (
+                spec_end_start >= 0 and spec_end_start <= remaining_budget
+            )
             # Check if need to transition to end mode
             # If we have more thinking tokens than the budget,
             # we need to transition to end mode
             if (
                 state["in_think"]
                 and total_thinking_tokens > state["thinking_token_budget"]
+                and not natural_spec_close_in_budget
+                and not self._utf8_hold(state)
             ):
                 # Calculate force_index: position within spec_token_ids where
                 # forcing starts. If we're already over budget without spec
@@ -431,7 +520,6 @@ class ThinkingBudgetStateHolder:
                 state["in_end"] = True
                 state["end_count"] = 0
                 state["check_count_down"] = state["thinking_token_budget"]
-                remaining_budget = state["thinking_token_budget"] - state["think_count"]
                 spec_len = len(state["spec_token_ids"])
                 if 0 < remaining_budget < spec_len:
                     state["force_index"] = [remaining_budget]

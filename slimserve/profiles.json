@@ -160,7 +160,8 @@
           "kv_cache_dtype": "turboquant_k8v4"
         },
         "note": "DSpark draft. Speculation costs quality nothing -- the verifier accepts or rejects every draft token -- so it is on by default."
-      }
+      },
+      "artifact_note": "The upstream shard-1 header ships glm-dsa.context_length = 1,048,576 (the rope-extended ceiling); the model default is 202752 per GLM-5.2's config.json. Local copies carry a same-size in-place metadata patch to 202752 so engines resolve the default automatically; a fresh download needs the same patch until the upstream repo is fixed. An upstream fix must be coordinated with any record that explicitly extends max_model_len beyond the default: vLLM rejects a max above the derived length unless a rope-scaling declaration or VLLM_ALLOW_LONG_MAX_MODEL_LEN covers it."
     },
     "dsv4-flash": {
       "title": "DeepSeek-V4-Flash",
@@ -429,7 +430,10 @@
               "path": "chat_template.jinja",
               "bytes": 9993
             }
-          ]
+          ],
+          "min_memory_bytes": {
+            "metal": 68719476736
+          }
         }
       }
     },
@@ -519,7 +523,9 @@
           "title": "Unsloth dynamic Q2_K_XL (UD, per-layer mixed)",
           "bytes": 9828981664,
           "summary": "Unsloth dynamic 2-bit build; the campaign target quant.",
-          "min_gpus": {},
+          "min_gpus": {
+            "mi300x": 1
+          },
           "min_memory_bytes": {
             "metal": 51539607552
           },
@@ -547,6 +553,618 @@
           "quantization": "gguf"
         },
         "note": "DFlash 2 drafter (Inco AI, 2026-08-18): 5-layer qwen3-classed block-diffusion drafter reading target layers [5, 19, 33, 47, 61], trained with block size 8, with a top-16 path selector (rank-256 bilinear over adjacent candidates) and two-tap dynamic convolutions around every sublayer. Vendor-measured mean acceptance 4.80 at block 8; the Metal profile uses the first 3 draft positions because its M=4 verify kernel is faster on both retained text arms than verifying all 7 drafts. Re-blessed 2026-08-25: z-lab republished the file (1,143,006,752 -> 1,143,006,816 B) to fix an off-by-one in dflash.target_layers, which are 1-based in the GGUF and converted with layer-1 at load. The old file stored [5, 19, 33, 47, 61] and therefore read target layers [4, 18, 32, 46, 60] -- one lower than intended; the new file stores [6, 20, 34, 48, 62] and reads the documented [5, 19, 33, 47, 61]. Verified by reading the republished file's metadata, not by trusting the upload: 5 blocks, block size 8, SWA 2048, 32/8 heads at 128, hidden 5120, selector rank 256 top-16, two-tap conv (group 16), mask token 248070."
+      }
+    },
+    "qwen38-flash-next-fp8": {
+      "title": "Qwen3.8-Flash-Next",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "base_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next-FP8/resolve/main",
+      "local_dir": "Qwen3.8-Flash-Next-FP8",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP drafter and processor configs ship in the same repo.",
+      "speculator": {
+        "repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+        "local_dir": "Qwen3.8-Flash-Next-FP8",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint ships its own one-layer MTP drafter (mtp.* tensors in the weight index, QSA attention, trained multi-step), so the draft model is the target directory itself."
+      },
+      "quants": {
+        "FP8": {
+          "title": "FP8 (block-128 MoE experts, BF16 backbone)",
+          "bytes": 185563783127,
+          "summary": "The official release: 512-expert MoE weights in block-128 FP8, everything else (GDN, QSA, hyper-connections, embeddings, vision tower) BF16, plus 47.7 GiB of FP8 n-gram embedding shards designed for host-memory offload.",
+          "min_gpus": {
+            "rtx3090": 8
+          },
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1635
+            },
+            {
+              "path": "LICENSE",
+              "bytes": 3235
+            },
+            {
+              "path": "README.md",
+              "bytes": 65041
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 72423
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00131.safetensors",
+              "bytes": 1040155912
+            },
+            {
+              "path": "model-00002-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00003-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00004-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00005-of-00131.safetensors",
+              "bytes": 1717267690
+            },
+            {
+              "path": "model-00006-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00007-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00008-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00009-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00010-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00011-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00012-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00013-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00014-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00015-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00016-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00017-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00018-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00019-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00020-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00021-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00022-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00023-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00024-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00025-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00026-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00027-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00028-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00029-of-00131.safetensors",
+              "bytes": 1600008328
+            },
+            {
+              "path": "model-00030-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00031-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00032-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00033-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00034-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00035-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00036-of-00131.safetensors",
+              "bytes": 1600008336
+            },
+            {
+              "path": "model-00037-of-00131.safetensors",
+              "bytes": 942343240
+            },
+            {
+              "path": "model-00038-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00039-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00040-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00041-of-00131.safetensors",
+              "bytes": 1103350296
+            },
+            {
+              "path": "model-00042-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00043-of-00131.safetensors",
+              "bytes": 1000455912
+            },
+            {
+              "path": "model-00044-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00045-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00046-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00047-of-00131.safetensors",
+              "bytes": 878065752
+            },
+            {
+              "path": "model-00048-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00049-of-00131.safetensors",
+              "bytes": 1096817160
+            },
+            {
+              "path": "model-00050-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00051-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00052-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00053-of-00131.safetensors",
+              "bytes": 1000455920
+            },
+            {
+              "path": "model-00054-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00055-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00056-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00057-of-00131.safetensors",
+              "bytes": 1103350288
+            },
+            {
+              "path": "model-00058-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00059-of-00131.safetensors",
+              "bytes": 877982872
+            },
+            {
+              "path": "model-00060-of-00131.safetensors",
+              "bytes": 1794100080
+            },
+            {
+              "path": "model-00061-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00062-of-00131.safetensors",
+              "bytes": 1832994688
+            },
+            {
+              "path": "model-00063-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00064-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00065-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00066-of-00131.safetensors",
+              "bytes": 880605240
+            },
+            {
+              "path": "model-00067-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00068-of-00131.safetensors",
+              "bytes": 1096796552
+            },
+            {
+              "path": "model-00069-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00070-of-00131.safetensors",
+              "bytes": 993907416
+            },
+            {
+              "path": "model-00071-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00072-of-00131.safetensors",
+              "bytes": 1000456024
+            },
+            {
+              "path": "model-00073-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00074-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00075-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00076-of-00131.safetensors",
+              "bytes": 1100073480
+            },
+            {
+              "path": "model-00077-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00078-of-00131.safetensors",
+              "bytes": 993984232
+            },
+            {
+              "path": "model-00079-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00080-of-00131.safetensors",
+              "bytes": 877983688
+            },
+            {
+              "path": "model-00081-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00082-of-00131.safetensors",
+              "bytes": 1096816112
+            },
+            {
+              "path": "model-00083-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00084-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00085-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00086-of-00131.safetensors",
+              "bytes": 1103350296
+            },
+            {
+              "path": "model-00087-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00088-of-00131.safetensors",
+              "bytes": 1000455920
+            },
+            {
+              "path": "model-00089-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00090-of-00131.safetensors",
+              "bytes": 997179104
+            },
+            {
+              "path": "model-00091-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00092-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00093-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00094-of-00131.safetensors",
+              "bytes": 1096796928
+            },
+            {
+              "path": "model-00095-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00096-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00097-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00098-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00099-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00100-of-00131.safetensors",
+              "bytes": 877984072
+            },
+            {
+              "path": "model-00101-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00102-of-00131.safetensors",
+              "bytes": 1096797160
+            },
+            {
+              "path": "model-00103-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00104-of-00131.safetensors",
+              "bytes": 993901144
+            },
+            {
+              "path": "model-00105-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00106-of-00131.safetensors",
+              "bytes": 1025359600
+            },
+            {
+              "path": "model-00107-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00108-of-00131.safetensors",
+              "bytes": 1062060032
+            },
+            {
+              "path": "model-00109-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00110-of-00131.safetensors",
+              "bytes": 877983696
+            },
+            {
+              "path": "model-00111-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00112-of-00131.safetensors",
+              "bytes": 1096797168
+            },
+            {
+              "path": "model-00113-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00114-of-00131.safetensors",
+              "bytes": 993907400
+            },
+            {
+              "path": "model-00115-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00116-of-00131.safetensors",
+              "bytes": 993902176
+            },
+            {
+              "path": "model-00117-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00118-of-00131.safetensors",
+              "bytes": 878004272
+            },
+            {
+              "path": "model-00119-of-00131.safetensors",
+              "bytes": 1678211256
+            },
+            {
+              "path": "model-00120-of-00131.safetensors",
+              "bytes": 1109903856
+            },
+            {
+              "path": "model-00121-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00122-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00123-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00124-of-00131.safetensors",
+              "bytes": 891089968
+            },
+            {
+              "path": "model-00125-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00126-of-00131.safetensors",
+              "bytes": 1096795496
+            },
+            {
+              "path": "model-00127-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00128-of-00131.safetensors",
+              "bytes": 993901136
+            },
+            {
+              "path": "model-00129-of-00131.safetensors",
+              "bytes": 1678209208
+            },
+            {
+              "path": "model-00130-of-00131.safetensors",
+              "bytes": 2136177320
+            },
+            {
+              "path": "model-00131-of-00131.safetensors",
+              "bytes": 1271398496
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 17410140
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ],
+          "min_host_ram_bytes": {
+            "rtx3090": 137438953472
+          }
+        }
       }
     }
   },
@@ -580,6 +1198,20 @@
         "recommendedMaxWorkingSetSize is roughly 90% of physical (115.4 of 128 GiB measured on an M5 Max). The min_memory_bytes figures are physical RAM, chosen to leave that margin plus a KV pool.",
         "No multi-device story: Apple exposes one GPU per machine, so every Metal profile is tensor_parallel_size 1 and scaling past one box means separate machines."
       ]
+    },
+    "rtx3090": {
+      "title": "NVIDIA GeForce RTX 3090",
+      "compute_capability": [
+        8,
+        6
+      ],
+      "vram_bytes": 25769803776,
+      "gate": "gpus",
+      "status": "supported",
+      "notes": [
+        "GeForce driver disables GPU peer-to-peer, so every tensor-parallel collective stages through host memory. Profiles on this platform should prefer expert parallelism and host-offloaded tables over designs that add per-step all-reduces.",
+        "SM86 has no FP8 tensor cores; FP8 checkpoints serve through the Marlin W8A16 weight-only kernels."
+      ]
     }
   },
   "profiles": {
@@ -609,7 +1241,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -648,7 +1281,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -664,7 +1298,6 @@
           "default_quant": "Q2_K",
           "engine": {
             "tensor_parallel_size": 4,
-            "max_model_len": 4096,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 16384,
             "block_size": 64,
@@ -677,15 +1310,28 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
             "served_model_name": "GLM-5.2-Vision",
-            "gpu_memory_utilization": 0.92
+            "gpu_memory_utilization": 0.92,
+            "kv_cache_dtype": "auto",
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
-          "note": "80 GB cards: the MI300X KV byte table does not apply, so size the pool by utilization. Q2_K weights leave roughly 58 GB across four cards, which is why the ceiling is 4096 rather than 1M."
+          "note": "80 GB cards: the MI300X KV byte table does not apply, so size the pool by utilization. Context resolves automatically to the model default (202752, the GGUF's glm-dsa.context_length): serving policy is the model's default context, read from the artifact, with no max_model_len in the record.",
+          "notes": [
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box. enable_cross_layers_blocks is required: it forces the packed cross-layer slab the connector needs, since the GLM-5.2 group specs are not guaranteed to resolve all-uniform (DSV4 records get the slab via the allocator's is_dsv4 gate). A layout mismatch fails loudly at register time (the connector rejects an allocation that is not a whole number of block strides). The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes."
+          ]
         }
       }
     },
@@ -715,7 +1361,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -731,7 +1378,6 @@
           "default_quant": "Q2_K",
           "engine": {
             "tensor_parallel_size": 8,
-            "max_model_len": 4096,
             "max_num_seqs": 64,
             "max_num_batched_tokens": 16384,
             "block_size": 64,
@@ -744,14 +1390,27 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
             "served_model_name": "GLM-5.2-Vision",
-            "gpu_memory_utilization": 0.92
-          }
+            "gpu_memory_utilization": 0.92,
+            "kv_cache_dtype": "auto",
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
+          },
+          "notes": [
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box. enable_cross_layers_blocks is required: it forces the packed cross-layer slab the connector needs, since the GLM-5.2 group specs are not guaranteed to resolve all-uniform (DSV4 records get the slab via the allocator's is_dsv4 gate). A layout mismatch fails loudly at register time (the connector rejects an allocation that is not a whole number of block strides). The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes."
+          ]
         }
       }
     },
@@ -822,7 +1481,8 @@
             "kv_cache_dtype": "auto",
             "reasoning_parser": "kimi_k3",
             "tool_call_parser": "kimi_k3",
-            "served_model_name": "Kimi-K3"
+            "served_model_name": "Kimi-K3",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1",
@@ -833,7 +1493,8 @@
             "The exact draft's 64 query heads, 16 KV heads and 14336 intermediate width do not divide by six. SlimServe therefore replicates the five-layer draft backbone and its small quantized Markov head on each rank; target weights and base vocabulary logits remain distributed.",
             "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
             "HSA_XNACK=1 is required for this load.",
-            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "speculative_overrides": {
             "replicate_draft_backbone": true
@@ -868,7 +1529,8 @@
             "kv_cache_dtype": "auto",
             "reasoning_parser": "kimi_k3",
             "tool_call_parser": "kimi_k3",
-            "served_model_name": "Kimi-K3"
+            "served_model_name": "Kimi-K3",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1",
@@ -878,7 +1540,8 @@
             "kv_cache_dtype must be 'auto': this fork defaults the cache to fp8 for GLM. fp8 loads and answers correctly here but is a net loss, because K3 is a hybrid. Attention pages must be at least as large as the fixed KDA state page, so halving the per-token attention KV doubles the attention block size (960 -> 1920 tokens) to reach the same page size, and every sequence rounds up to that. Measured on TP6: 344,746 cache tokens and 42.1x concurrency at auto, versus 205,824 and 25.1x at fp8_e4m3.",
             "HSA_XNACK=1 is required for this load.",
             "Target CUDA graphs are disabled for speculative KDA decode: full-decode graphs are not supported for this stateful path, and ROCm piecewise capture can terminate a worker during startup. The DSpark draft graphs are disabled separately.",
-            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning."
+            "reasoning_parser must be kimi_k3. K3 frames every channel in XTML rather than with <think>, and the generation prompt opens the first channel, so the parser has to start inside it and drop the closing frame. Under any other parser the answer arrives with \"<|close|> response <|sep|> <|close|> message <|sep|>\" attached, or -- in thinking mode -- lands entirely in reasoning.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         }
       }
@@ -906,7 +1569,8 @@
             "trust_remote_code": true,
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
-            "served_model_name": "DeepSeek-V4-Flash"
+            "served_model_name": "DeepSeek-V4-Flash",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -915,7 +1579,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "metal": {
@@ -946,7 +1611,7 @@
             "Measured on an Apple M5 Max with the IQ2_XXS target, the matching 0731 DSpark drafter, and a TurboQuant k8v4 draft cache.",
             "block_size must be 256 so the target compressor, sparse MLA, and draft cache share compatible pages.",
             "reasoning_parser must be set, or the GLM default classifies a whole DeepSeek reply as reasoning and leaves content null.",
-            "The fixed 16 GiB hybrid KV pool is sized to hold one full 262,144-token request (target fp8_ds_mla across 43 layers plus the 3-layer TurboQuant draft cache, ~9 GiB) with margin for concurrent shorter sessions. Weights (80.8 GiB target + 6.5 GiB drafter) plus this pool total ~103 GiB, inside the ~115 GiB Metal working set of a 128 GiB machine. Higher API concurrency drains in scheduler waves instead of paging model weights.",
+            "The 16 GiB hybrid KV pool is a ceiling, not a promise: it holds one full 262,144-token request (target fp8_ds_mla across 43 layers plus the 3-layer TurboQuant draft cache, ~9 GiB) with margin for concurrent shorter sessions, and the Metal worker shrinks it to whatever stays resident on the machine it boots on. Sizing it from artifact bytes is what broke on 2026-08-25: 80.8 GiB target + 6.5 GiB drafter looks like 87.3 GiB but loads to 93.57 GiB, and an M5 Max's Metal working set is 107.52 GiB rather than the ~115 GiB assumed here, so the pool overran the working set and served token soup at 1.1 tok/s. On that machine the worker now grants ~9.6 GiB. Higher API concurrency drains in scheduler waves instead of paging model weights.",
             "max_model_len is 262144 for real (agentic) use. The 1k-in/2k-out benchmark matrix in perf/baseline_status.md is re-gated under this sizing (see the M1 Ultra campaign entries).",
             "max_num_batched_tokens is 2176 = 2048 + 32 seqs x 4 speculative slots: the scheduler reserves draft-token room, so 2048 would cap scheduled prefill tokens at 1920 and split a 2048-token prompt into two chunks (measured ~230 ms scheduler boundary plus an inefficient 128-token tail chunk).",
             "Long-context status (2026-08-23): the sparse-MLA indexer chain (fused indexer Q rope/quant, prefill top-k, scoring) has a native Metal implementation. Async output copies and their completion event stay on the producing MPS stream (unit-tested), which is believed to remove the cold cross-stream event ordering failure; the deterministic cold-boot wedge repro (primer then a direct multi-chunk prefill) has not been re-run, so the boot-ramp protocol in perf/prefill_handoff.md remains the ops guidance until it is. Prefill top-k sizes native work from the active request window and streams windows above 1,024 candidates with fixed scratch; the 65,536-candidate native oracle matches the eager chain on tie ordering and the streaming loop (its all-zero-query block does not exercise scoring). Full 262,144-token end-to-end serving still needs a dedicated long-context validation pass."
@@ -980,7 +1645,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "max_num_seqs": 64
+            "max_num_seqs": 64,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -989,7 +1655,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "a100": {
@@ -997,7 +1664,7 @@
           "default_quant": "Q4K-tail",
           "engine": {
             "tensor_parallel_size": 2,
-            "kv_cache_dtype": "fp8",
+            "kv_cache_dtype": "auto",
             "block_size": 256,
             "enable_prefix_caching": true,
             "attention_config": {
@@ -1011,7 +1678,14 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "kv_cache_memory_bytes": 13958643712
+            "kv_cache_memory_bytes": 13958643712,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48
+              }
+            }
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1019,6 +1693,8 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); A100 TP2 uses per-quant KV byte budgets.",
@@ -1048,7 +1724,7 @@
           "default_quant": "Q4K-tail",
           "engine": {
             "tensor_parallel_size": 4,
-            "kv_cache_dtype": "fp8",
+            "kv_cache_dtype": "auto",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1061,7 +1737,15 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48
+              }
+            }
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1070,12 +1754,15 @@
             "VLLM_DSV4_W1_QWARP8": "1"
           },
           "notes": [
+            "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -1094,7 +1781,7 @@
           "engine": {
             "tensor_parallel_size": 4,
             "data_parallel_size": 2,
-            "kv_cache_dtype": "fp8",
+            "kv_cache_dtype": "auto",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1107,22 +1794,36 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48
+              }
+            }
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
             "VLLM_DSV4_MHC_SCHEDULE": "async",
             "VLLM_DSV4_AUX_STREAMS": "0",
-            "VLLM_DSV4_W1_QWARP8": "1"
+            "VLLM_DSV4_W1_QWARP8": "1",
+            "VLLM_GGUF_DSV4_REPACK_IQ2": "0",
+            "VLLM_GGUF_DSV4_REPACK_Q2K": "0"
           },
           "notes": [
+            "REPACK_IQ2/REPACK_Q2K are 0 on this profile: under data parallelism the native fused-MoE path with repacked expert layouts degenerates the engine (deterministic fluent token soup from boot; both replicas; reproduced across spec/all-reduce/mHC/prequant/graph/launch-blocking arms and absent the moment either the repack or the fused kernels are disabled, while every offline and in-situ per-call parity check of the kernels and repacked bytes passes). Root cause is still open - see the perf notebook's DP2 degeneration entries; single-engine profiles keep the repack and its measured wins. Re-enable here only with a root-caused fix plus a c8 deep-context recall gate.",
+            "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "Throughput-optimized: hot c8 aggregate measured 858-926 tok/s (perf/optimization_status.md 2026-08-10). Latency-sensitive workloads should prefer dsv4-mxfp4-8.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 only (the measured platform). Two TP4 replicas keep each engine's verify batches at the graph-covered sweet spot; capture 64 covers the per-replica c8 width. Requires the 2026-08-10 DP-padding router fix."
         }
@@ -1151,7 +1852,8 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "max_num_seqs": 64
+            "max_num_seqs": 64,
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1160,7 +1862,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         },
         "a100": {
@@ -1168,7 +1871,7 @@
           "default_quant": "MXFP4",
           "engine": {
             "tensor_parallel_size": 4,
-            "kv_cache_dtype": "fp8",
+            "kv_cache_dtype": "auto",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1181,7 +1884,15 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48
+              }
+            }
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1189,12 +1900,15 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP4 keeps a larger warmup/graph scratch margin and limits CUDA graph capture to small decode batches because Lightning indexer logits scale with the 1M max context."
         }
@@ -1212,7 +1926,7 @@
           "default_quant": "MXFP4",
           "engine": {
             "tensor_parallel_size": 8,
-            "kv_cache_dtype": "fp8",
+            "kv_cache_dtype": "auto",
             "block_size": 256,
             "attention_config": {
               "sparse_mla_force_mqa": true
@@ -1225,7 +1939,15 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "gpu_memory_utilization": 0.78
+            "gpu_memory_utilization": 0.78,
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 48
+              }
+            }
           },
           "env": {
             "VLLM_DSV4_ALIGNED_Q8": "1",
@@ -1233,13 +1955,16 @@
             "VLLM_DSV4_AUX_STREAMS": "0"
           },
           "notes": [
+            "Main KV is bf16 (kv_cache_dtype auto -> plain 512-element rows, 1024B/slot) per the serving policy, served by the Ampere sparse-MLA NFP8=0 instantiation - design and gates in csrc/quixicore/dsv4_bf16_kv_design.md. fp8_ds_mla (584B/slot) remains available by setting kv_cache_dtype fp8; byte-sized KV pools hold ~57% as many tokens at bf16. Draft KV (DSpark TurboQuant k8v4) stays quantized per the standing exemption: rejection sampling verifies every draft token, so draft precision affects only acceptance rate, never content.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box (96/192/384 GiB total at 2/4/8 ranks). Registers over the DSV4 packed cross-layer slab. The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes.",
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "MXFP4 only by design: with eight GPUs the per-rank weight footprint is small enough that the hybrid's quality/size tradeoff is moot.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
             "FULL_DECODE_ONLY capture-64 restored 2026-08-11 after the degeneration-storm fix: the sparse-MLA builder's bt_per_token now uses ROCm-parity build-time persistence (the lazy in-forward gather was the capture hazard), validated 0 storms in 8 boots vs 2/6 pre-fix. Production keeps VLLM_NAN_WATCH plus the slimserve-canary quality probe; a rare sub-critical NaN seed (single-token blips, both graph modes, phase-drifting expression) remains under investigation - see perf/diagnostics/dsv4-nan/ and the notebook incident entries.",
-            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/."
+            "VLLM_DSV4_AUX_STREAMS=0 (2026-08-12): the multi-stream attention projection overlap is the only component whose removal silences the rare NaN seed (aux-off 3/3 boots silent in active phases; every other arm - collectives, mHC schedules, graph modes, spec, aligned-Q8 - fires; the concurrency race resists isolation: 20k-iteration standalone overlap repro clean). Disabling it also MEASURED FASTER at c11 (458 vs 427 tok/s clean-run means) - the overlap was a net loss at seam widths. Re-enable only after the race is root-caused; see perf/optimization_status.md and perf/diagnostics/dsv4-nan/.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ],
           "note": "A100 uses the DeepSeek-V4 Ampere attention path. TP8 with graph capture 64: the c8 verify batch is 48 tokens and must stay on CUDA graphs (at capture 32 it ran eager and halved throughput). TP4 x DP2 measured 111 c1 / 118-271 hot c8 for MXFP4 and was rejected. For maximum aggregate throughput see dsv4-q4ktail-8."
         }
@@ -1268,7 +1993,8 @@
             "trust_remote_code": true,
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
-            "served_model_name": "DeepSeek-V4-Flash"
+            "served_model_name": "DeepSeek-V4-Flash",
+            "enable_prefix_caching": true
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1277,7 +2003,8 @@
             "block_size must be 256: the DeepSeek-V4 sparse MLA backend rejects GLM's 64 with 'no common block size'.",
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
-            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client."
+            "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
         }
       }
@@ -1286,7 +2013,7 @@
       "title": "Qwen3.8-27B NVFP4 on 1 GPU",
       "source": "qwen38-27b-nvfp4",
       "gpus": 1,
-      "summary": "Vision-language 27B hybrid (gated-deltanet linear attention, 1-in-4 full attention) on a single MI300X. 23 GiB of weights leave most of the card for KV and linear-attention state.",
+      "summary": "Vision-language 27B hybrid (gated-deltanet linear attention, 1-in-4 full attention) on one GPU. MI300X serves the checkpoint's own MTP drafter; Apple Silicon serves the measured DFlash2 + Muse single-CB Metal stack (154% of the same-box Q4_K bar at c1).",
       "speculative": true,
       "variants": {
         "mi300x": {
@@ -1304,11 +2031,21 @@
             },
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 64
+              "max_cudagraph_capture_size": 192
             },
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
-            "served_model_name": "Qwen3.8-27B"
+            "served_model_name": "Qwen3.8-27B",
+            "enable_prefix_caching": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1320,8 +2057,162 @@
             "FULL_DECODE_ONLY graph capture (size 64) is qualified for this hybrid GDN + MTP path and is a measured 1.4x at c1: unlike Kimi's KDA, the qwen GDN decode captures cleanly on ROCm. Capture 64 covers the c8 spec verify width.",
             "NVFP4 layers run the vendored QuixiCore HIP kernels (RocmNativeNvFp4LinearKernel): decode-width calls (M<=4, the c1 spec-verify size) read the packed E2M1 weight directly through the q8 dp4a GEMV (measured 1.3-1.8x per layer), wider batches use a load-time-dequantized bf16 copy through hipBLASLt (~22 GiB extra weights memory) until the MFMA packed MMQ exists. VLLM_NVFP4_TRITON_GEMM=0 falls back to the emulation kernel, whose own load-time cache is controlled by VLLM_NVFP4_EMULATION_CACHE_WEIGHTS.",
             "reasoning_parser must be qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML; the fork's glm45/glm47 defaults would classify whole replies as reasoning and miss tool calls.",
-            "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout."
+            "Speculation uses the checkpoint's own qwen3_5_mtp drafter rather than a separate DSpark artifact; there is no TurboQuant draft KV here because the drafter shares the target's cache layout.",
+            "max_cudagraph_capture_size raised 64->192 to satisfy the capture-coupling rule (>= (k+1) x max_num_seqs at MTP k=2, seqs 64): with 64, decode batches above 21 requests silently ran eager (measured on rtx3090 as a -52% cliff before its fix). Raise is safety-directional (more graphs, same kernels); MI300X re-baseline pending.",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ]
+        },
+        "metal": {
+          "platform": "metal",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 17179869184,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "served_model_name": "Qwen3.8-27B-NVFP4",
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "kv_cache_dtype": "bfloat16",
+            "mamba_cache_dtype": "float32",
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+            "VLLM_METAL_ASYNC_SCHED": "1",
+            "VLLM_QC_MUSE": "1",
+            "VLLM_SD_ADAPT_THROTTLE": "1"
+          },
+          "notes": [
+            "VLLM_QC_MUSE=1 (UPDATE 53, 2026-08-24): the Muse single-command-buffer decode step serves eligible uniform spec-decode batches (m <= 8); everything else falls back to the eager layer loop bit-exactly. c1 17.10 tok/s sha 467b35c3, sha-identical to the pre-muse canonical pin (+4.1%); 2500x64 re-pins to aa448847 (deterministic, TPS flat, 30k needle exact). VLLM_QC_MUSE=0 is the kill switch back to UPDATE 49 behavior. This profile only -- the -tq and -df2 profiles keep muse off (-tq: TQ KV layout untested under the muse attention emit; -df2: preserved as the pre-muse historical gate config).",
+            "DFlash2 drafts k=3 at every batch size. The 2026-08-27 M5 Max offset-mean sweep measured drafting +64%/+30%/+51% at c2/c4/c8 on prose (acceptance ~3.7 of 4) and -35% at c8 on drafting-hostile verse (acceptance 1.2), so the old drafting-off-at-batch>=2 cutoff is replaced by the acceptance-adaptive throttle (VLLM_SD_ADAPT_THROTTLE=1): drafting pauses when the accepted/drafted EMA falls below VLLM_SD_ADAPT_MIN_RATIO (0.30) and re-probes every VLLM_SD_ADAPT_PAUSE_STEPS (128) steps. M1 Ultra has not re-gated this schedule; its prior numbers used the old cutoff.",
+            "kv_cache_dtype is explicitly bfloat16, not auto: this checkpoint ships a compressed-tensors kv_cache_scheme (fp8 static), and the fork resolves auto to fp8 when a scheme exists -- but the Metal dense/GQA attention backend has no fp8 KV path. The checkpoint's k/v scales stay available for the later TurboQuant/fp8-KV milestone.",
+            "Checkpoint (N0 discovery, HANDOFF.md): compressed-tensors mixed-precision -- NVFP4 g16 (weight_packed U8 [N,K/2] + weight_scale F8_E4M3 [N,K/16] + weight_global_scale F32) on mlp layers 0-55; FP8 E4M3 per-channel (weight F8 [N,K] + weight_scale BF16 [N,1]) on attn qkvo, GDN qkv/z/out, lm_head, mlp 56-63. Input-activation quant in the checkpoint is ignored on Metal: both schemes serve as weight-only (W4A16/W8A16) against bf16 activations.",
+            "model_mtp.safetensors is the model's own MTP head (bf16, mtp.* names in the weight-map index) -- excluded from the base-model load; speculation via qwen3_5_mtp is a later milestone.",
+            "Engine settings inherited from the retired qwen38-1 Q4_K_M profile (same architecture, same GDN state contracts): V2 runner forced, DS conv layout, fp32 mamba cache.",
+            "eos per this checkpoint's config.json is 248044 (the GGUF campaign used 248046); verify against the served tokenizer during bring-up.",
+            "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix.",
+            "The former qwen38-nvfp4-1-df2 twin (canonical minus muse) is retired: it differed only by VLLM_QC_MUSE, which is a kill switch, not a config. Reproduce it with VLLM_QC_MUSE=0 on this profile.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
+            "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+          ],
+          "speculator": {
+            "repo": "z-lab/Qwen3.8-27B-DFlash2",
+            "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+            "local_dir": "Qwen3.8-27B-DFlash2",
+            "engine": {
+              "method": "dflash",
+              "num_speculative_tokens": 3,
+              "num_speculative_tokens_per_batch_size": [
+                [
+                  1,
+                  8,
+                  3
+                ]
+              ]
+            },
+            "note": "2B bf16 DFlash2 drafter (5 non-causal SWA layers + grouped dynamic conv + candidate selector, block_size 8 -> 7 draft tokens). Ships no embed/lm_head: ties to the target's embeddings and fp8-channel lm_head. The trained conv block_size is 8 (1+7 draft tokens); we serve num_speculative_tokens=3 because the measured acceptance horizon on prose is ~3 (UPDATE 27 k-sweep: k=3 beats k=7 by +23% c1). NOT fetch-managed: this is a multi-file directory checkpoint, so slimserve resolves it from ~/models/Qwen3.8-27B-DFlash2 or the HF cache rather than the single-file fetch machinery; `revision` records the gated snapshot but is not enforced by the loader -- pin it manually via huggingface-cli download --revision when installing."
+          }
+        }
+      }
+    },
+    "qwen38-nvfp4-1-tq": {
+      "title": "Qwen3.8-27B NVFP4 + TurboQuant KV (experimental)",
+      "source": "qwen38-27b-nvfp4",
+      "gpus": 1,
+      "summary": "N6 experiment: identical to qwen38-nvfp4-1 except the 16 full-attention layers and the DFlash2 drafter run the TurboQuant backend with a turboquant_k8v4 KV cache (tq_attention_combined hs256/hs128 Metal kernels). GDN state pages are unchanged. Not the serving default until quality- and throughput-gated.",
+      "speculative": true,
+      "variants": {
+        "metal": {
+          "platform": "metal",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 32768,
+            "max_num_seqs": 8,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 17179869184,
+            "compilation_config": {
+              "cudagraph_mode": "NONE"
+            },
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "served_model_name": "Qwen3.8-27B-NVFP4",
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "attention_backend": "TURBOQUANT",
+            "kv_cache_dtype": "turboquant_k8v4",
+            "mamba_cache_dtype": "float32",
+            "language_model_only": true,
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "speculative_overrides": {
+            "attention_backend": "TURBOQUANT",
+            "kv_cache_dtype": "turboquant_k8v4"
+          },
+          "env": {
+            "VLLM_USE_V2_MODEL_RUNNER": "1",
+            "VLLM_SSM_CONV_STATE_LAYOUT": "DS",
+            "VLLM_METAL_ASYNC_SCHED": "1",
+            "VLLM_SD_ADAPT_THROTTLE": "1"
+          },
+          "notes": [
+            "TurboQuant applies to the target's 16 full-attention layers AND the DFlash2 drafter's 5 layers (DSV4 DSpark drafter precedent); the 48 GDN layers keep their fp32/DS state pages via mamba_cache_dtype.",
+            "Both drafter fields must be pinned together. Unset, the drafter inherits the engine-global turboquant_k8v4 dtype but keeps the metal_attn backend, and the TQ-sized page cannot be viewed with metal_attn's 5-dim cache shape (boot reshape failure). A bf16 drafter dtype fails earlier: its 4096-byte/token page cannot pad to the TQ-aligned max page because metal_attn does not index KV by block stride (unify_kv_cache_spec_page_size NotImplementedError). Drafter-on-TQ makes both quanta 1728 bytes/token (4x432 target hs256, 8x216 drafter hs128) and TQ pads by block stride.",
+            "GATED 2026-08-21 (UPDATE 36, re-gated through UPDATE 46 on the full U43/U44/U45 stack): needle recall exact at 4.5k multi-chunk prefill and at the 262k config, deterministic 2/2 per leg. Pins: c1 228d0bf4 (bit-exact through UPDATE 46); 2500x64 d0e07ddd — still the CANONICAL sha; tail 2100x32 1337d2f7. TPS (UPDATE 46, all legs re-measured): c1 16.18-16.24 (-1.2% vs canonical 16.43); 2500x64 3.51 (+1.4% above canonical); c4 23.62-23.72 (+2.4%); c8 26.05-26.09 (+1.8%). -tq beats canonical on every leg above c1 with 2.4x KV capacity; default flip remains a flagged quality decision (k8v4 cos ~0.9955 floor).",
+            "Decode attention (UPDATE 40): tq_attention_splitk + tq_attention_reduce (PA256-style split-K, one simdgroup per token, block-table direct) on the hs256 route; VLLM_QC_TQ_SPLITK=0 restores the monolithic kernel. Kernel 12-33x over monolithic; TQ decode reads 432 B/token vs bf16's 1024 and is ~2x faster than canonical PA256 at 32k context.",
+            "Continuation prefill (>128-token chunks) runs dequant-once via tq_decode_combined + SDPA (KV-tiled fp32 online softmax past 8k context); small chunks keep the synthetic-decode kernel. The pre-UPDATE-39 synthetic-decode-for-everything route made long prefill O(ctx^2) with a ~24x-redundant constant (16k prefill 406 s vs 111 s now).",
+            "LONG-CONTEXT VALIDATED 2026-08-21 (UPDATE 39): with --ctx 262144 (native max_position_embeddings, no rope scaling) the needle ladder passes EXACT at 16k/65k/131k/262k depths; the 262k leg = 259,888 prompt tokens, 75 min prefill. Prefill cost model T(C) ~= 6.4e-3*C + 3.9e-8*C^2 seconds. Canonical bf16 cannot admit a 262k request; this profile holds 292,882 KV tokens.",
+            "Use case: capacity/long-context — k8v4 compresses full-attn KV 4096 -> 1728 bytes/token (~2.4x, target and drafter). Measured: 292,882 KV tokens vs canonical 158,038 under the same 16 GiB budget (1.85x; 8.94x vs 4.82x concurrency at 32k). Since UPDATE 40 this profile also wins on throughput at c4/c8/2500x64 and trails c1 by 0.8%; the canonical default is a flagged quality decision (k8v4 KV cos ~0.9955 floor vs bf16), not a TPS one.",
+            "Engine settings otherwise identical to qwen38-nvfp4-1 (adaptive DFlash2 spec, V2 runner, DS conv layout, async scheduling).",
+            "language_model_only: the checkpoint carries the full vision tower (333 visual tensors), and torchvision is no longer a blocker (main lazified it; images serve via the PIL fallback on the GGUF profile). The tower is simply unvalidated on the compressed-tensors Metal path -- enabling vision needs its own bring-up gate (CT dequant/GEMV coverage for the visual blocks), not a dependency fix.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
+            "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+          ],
+          "speculator": {
+            "repo": "z-lab/Qwen3.8-27B-DFlash2",
+            "revision": "50307d4c4cde6860d4eee73e2547cd786fe8e8a4",
+            "local_dir": "Qwen3.8-27B-DFlash2",
+            "engine": {
+              "method": "dflash",
+              "num_speculative_tokens": 3,
+              "num_speculative_tokens_per_batch_size": [
+                [
+                  1,
+                  8,
+                  3
+                ]
+              ]
+            },
+            "note": "2B bf16 DFlash2 drafter (5 non-causal SWA layers + grouped dynamic conv + candidate selector, block_size 8 -> 7 draft tokens). Ships no embed/lm_head: ties to the target's embeddings and fp8-channel lm_head. The trained conv block_size is 8 (1+7 draft tokens); we serve num_speculative_tokens=3 because the measured acceptance horizon on prose is ~3 (UPDATE 27 k-sweep: k=3 beats k=7 by +23% c1). NOT fetch-managed: this is a multi-file directory checkpoint, so slimserve resolves it from ~/models/Qwen3.8-27B-DFlash2 or the HF cache rather than the single-file fetch machinery; `revision` records the gated snapshot but is not enforced by the loader -- pin it manually via huggingface-cli download --revision when installing."
+          }
         }
       }
     },
@@ -1365,10 +2256,10 @@
       }
     },
     "qwen38-q2kxl-1": {
-      "title": "Qwen3.8-27B on one Mac",
+      "title": "Qwen3.8-27B GGUF on 1 GPU",
       "source": "qwen38-27b",
       "gpus": 1,
-      "summary": "Vision-language 27B hybrid-attention model on a single Apple Silicon machine, sized by unified memory. Unsloth dynamic Q2_K_XL fits a 48 GB Mac with a 12 GiB KV pool.",
+      "summary": "Vision-language 27B hybrid-attention model from the published Unsloth dynamic Q2_K_XL GGUF, single device. Sized per platform: a 48 GB Mac by unified memory, an MI300X by its 192 GB of VRAM.",
       "speculative": true,
       "variants": {
         "metal": {
@@ -1383,24 +2274,154 @@
             "compilation_config": {
               "cudagraph_mode": "NONE"
             },
-            "enable_prefix_caching": false,
+            "enable_prefix_caching": true,
             "enable_chunked_prefill": true,
             "trust_remote_code": true,
             "served_model_name": "Qwen3.8-27B",
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
-            "kv_cache_dtype": "auto"
+            "kv_cache_dtype": "auto",
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
           },
           "env": {
             "VLLM_USE_V2_MODEL_RUNNER": "1"
           },
           "notes": [
-            "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
+            "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state.",
             "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
             "DFlash 2 speculation is on by default: the drafter evaluates the first 3 draft positions of its trained 8-token block against target layers [5, 19, 33, 47, 61], keeps top-16 candidates per position, and walks one path via the rank-256 selector. The shorter Metal verify width is measured faster than all 7 drafts on both essay and GSM8K-style arms; rejection sampling keeps the target distribution unchanged.",
             "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
-            "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal."
+            "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both.",
+            "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
           ]
+        },
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "q2kxl",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 103079215104,
+            "kv_cache_dtype": "auto",
+            "enable_prefix_caching": true,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-27B",
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_USE_V2_MODEL_RUNNER": "1"
+          },
+          "notes": [
+            "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state.",
+            "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
+            "The V2 runner is required for the DFlash2 rank-256 path selector. On the exact 1000-in/2000-out workload it raised c8 throughput from 164.87 to 194.21 tok/s while preserving exact token counts; the legacy runner independently argmaxes each draft position and does not execute the trained selector.",
+            "Sized from the qwen38-nvfp4-1 MI300X record (same model, same card) rather than from the Metal record: 192 GB of VRAM lifts the Metal profile's 12 GiB KV pool and 131072-token ceiling, so the full 262144 context and 64 concurrent sequences fit with room to spare on 9.2 GiB of weights.",
+            "kv_cache_dtype must be auto (bf16): this fork defaults the cache to fp8 for its GLM target, and the hybrid GDN/full-attention cache has only been validated at auto on this model.",
+            "enable_prefix_caching true is SlimServe policy: every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Enabled here 2026-08-30; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "max_cudagraph_capture_size 256 = (1 + k) x max_num_seqs for DFlash k=3 at 64 sequences, the same rule the qwen38-nvfp4-1 MI300X record follows at 192 for MTP k=2. A speculative decode step submits one row per draft slot per sequence, so a ceiling sized to max_num_seqs alone silently drops the largest batches to eager. The c1 and c8 numbers in the notebook are unaffected -- c8 is 8 x 4 = 32 rows, inside either ceiling -- so this widens graph coverage for c9..c64 rather than restating a measurement.",
+            "A fixed 96 GiB KV pool rather than gpu_memory_utilization: the utilization path runs an 8192-token profiling forward to measure free memory, which costs 142 s of Triton JIT on this model's GDN kernels and more than doubles boot. 96 GiB is half the card, comfortably above what 262144 tokens x 16 paged layers needs, and leaves the rest for the vision tower, the drafter and graph pools."
+          ]
+        }
+      }
+    },
+    "qwen38fn-fp8-8": {
+      "title": "Qwen3.8-Flash-Next FP8 on 8 GPUs",
+      "source": "qwen38-flash-next-fp8",
+      "gpus": 8,
+      "summary": "Vision-language 125B-A6B hybrid (Gated DeltaNet + Qwen Sparse Attention, 1-in-4 full attention, 4-branch gated residual) with 51B n-gram embeddings held in pinned host memory. FP8 experts run expert-parallel through Marlin W8A16 on 8x RTX 3090.",
+      "speculative": true,
+      "variants": {
+        "rtx3090": {
+          "platform": "rtx3090",
+          "default_quant": "FP8",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "enable_expert_parallel": true,
+            "max_model_len": 262144,
+            "max_num_seqs": 32,
+            "gpu_memory_utilization": 0.96,
+            "kv_cache_dtype": "auto",
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 96
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-Flash-Next",
+            "moe_backend": "auto",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "auto",
+              "linear_backend": "auto"
+            },
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 64
+              }
+            },
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_QWEN4_EXP_PLE_HOST": "1",
+            "NCCL_P2P_LEVEL": "SYS",
+            "VLLM_GDN_DECODE_KERNEL": "triton",
+            "VLLM_ADMISSION_MAX_CONCURRENT": "96"
+          },
+          "notes": [
+            "enable_expert_parallel is a correctness requirement, not a tuning choice: moe_intermediate_size is 640 and the FP8 block scales are [128, 128], so a TP shard of 80 cannot carry exact block scales. EP keeps 64 whole experts per rank (640 = 5 x 128).",
+            "moe_backend and linear_backend must be auto, not this fork's aiter defaults: AITER kernels do not exist on CUDA, and the forced-backend path raises at load ('FP8 MoE backend AITER does not support ... device cuda'). Both the top-level flags and kernel_config must be set, since a non-auto top-level flag overwrites kernel_config (same rule the qwen38-nvfp4-1 MI300X profile documents for linear_backend).",
+            "SM86 has no FP8 tensor cores and Triton FP8 MoE requires SM89+, so the experts run the Marlin W8A16 block-FP8 MoE kernels (weight-only decode to BF16 compute).",
+            "VLLM_QWEN4_EXP_PLE_HOST=1 keeps the full 47.7 GiB n-gram (PLE) table pinned in host RAM per rank and gathers the 16 rows per token (2560 bytes) from the GPU over UVA inside the forward, exactly as the model card intends ('tables prefetched from host memory'). The gather is graph-capturable, so FULL_DECODE_ONLY capture keeps working, and the TP-replicated table removes the per-step embedding all-reduce that this no-P2P platform cannot afford. Host cost: ~48 GiB pinned per rank (~382 GiB total of the 996 GiB box).",
+            "Multi-GPU GeForce runs fine on the stock NVIDIA driver but leaves 36-58% of TP throughput on the table: install QuixiAI's P2P driver (github.com/QuixiAI/open-gpu-kernel-modules, see docs/geforce-p2p.md) for direct GPU-GPU DMA. Measured on this profile: c1 109.6->148.8 (+36%), c8 409.7->647.9 (+58%). NCCL_P2P_LEVEL=SYS in this env is required for P2P across root complexes and harmless on stock drivers.",
+            "reasoning_parser qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML.",
+            "Speculation uses the checkpoint's own single-layer QSA MTP drafter (Qwen4ExpMTP) via method 'mtp'; there is no separate DSpark artifact for this model yet.",
+            "Main QSA KV is bf16 at the native max_model_len 262144 (operator decision 2026-08-28, was TurboQuant k8v4): bf16 measures ~8% faster at c1 and at parity c8-c32, with exact (unquantized) KV. The GPU pool at util 0.95 holds ~273K tokens = 1.04x one max-length request, so deep-context CONCURRENCY comes from the host KV tier (system RAM holds >8M tokens on this box), not the GPU pool. TurboQuant remains available: VLLM_QWEN4_EXP_TQ_MAIN_KV=1 restores 2.25x GPU-resident concurrency at 262144 (validated 2026-08-27) for boxes without the RAM for the host tier.",
+            "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
+            "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps.",
+            "min_host_ram_bytes gates this platform at 128 GiB system RAM: the 47.7 GiB n-gram (PLE) table is pinned ONCE in a /dev/shm segment shared by all TP ranks (not per rank), plus load staging and runtime headroom. A machine that passes the GPU gate but lacks the RAM fails at plan time instead of dying mid-load.",
+            "Dynamic speculative decoding is supported and measured: adding 'num_speculative_tokens': 3 and 'num_speculative_tokens_per_batch_size': [[1,4,3],[5,32,2]] to speculative_overrides (with max_cudagraph_capture_size 128) buys +19.5% at concurrency 4 for -2.6% at concurrency 32 (824 vs 846 tok/s, fully explained by k=3 ramp/drain acceptance). Static k=2 stays the default because c32 is this profile's peak; flip the overrides for latency-shaped traffic. The V2 runner captures one uniform-decode graph family per scheduled k, clipped to each k's batch range.",
+            "gpu_memory_utilization 0.96, not 0.9: this hybrid's packed KV slab charges every running request ~13-14 blocks at chat context (QSA token blocks at 1056 tokens/block, one compressor ring block, 3 GDN state blocks at MTP k=2, plus the drafter's cache group), and at 0.9 the ~2.2 GiB/rank pool holds ~373 blocks = 27 requests -- the scheduler silently caps below max_num_seqs 32 with the KV meter at 100%. 0.95 sizes the pool for the full 32 with margin. Found by WildChat multi-turn replay (2026-08-27). Raised again 0.95 -> 0.96 on 2026-08-28: bf16 KV at the native 262144 needs 3.55 GiB/rank and 0.95 provides 3.41 (startup check fails 140 MB short); 0.96 provides ~3.65 with ~0.4 GiB true free after the profiled activation and graph reserves.",
+            "VLLM_ADMISSION_MAX_CONCURRENT=96 caps total in-flight generation requests (decode slots plus engine queue) at 3x max_num_seqs; beyond that the API server answers 429 + Retry-After instead of letting the queue grow without bound. Measured at 64 concurrent sessions, oversubscription past 32 buys zero throughput (780.5 vs 779.7 tok/s) and only queueing delay (TTFT p50 40.2s vs 11.6s), so the cap exists to shed pathological load, not to police normal bursts: naive clients that burst to 60-90 requests still queue and complete. Non-generation routes (models, health, metrics) are never capped.",
+            "Prefix caching is ON (TurboQuant main-KV + mamba cache mode 'align', correctness validated 2026-08-27: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity). The mamba-page alignment forces 1056-token cache blocks, so hits require shared prefixes of at least one full block: shallow chats (~2K histories) measured only a 2.2% hit rate for ~4% peak throughput, but deep multi-turn traffic is transformed - a 100K-token history is ~94 cached blocks and each turn re-prefills only the tail, versus re-paying the entire history every turn with caching off (measured: the engine degenerates to ~5K tok/s prefill / ~20 tok/s generation on deep conversations). Finer-grained caching needs decoupling the attention block from the mamba state snapshot (open kernel/allocator work).",
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Validated on rtx3090: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above) is ENABLED and validated on this box (2026-08-28): 64 GiB pinned host RAM per rank (512 GiB total) = ~12,146 block slots = ~4.8M tokens of evicted-conversation capacity behind the ~270K-token GPU pool. Tail states ride the engine's own frozen align-mode boundary snapshots (pool prefix cache, looked up by boundary hash - never live blocks); restores land at position k-1 per mamba group and the QSA ring is zeroed defensively. Validated: multi-depth marker-recall acceptance (8K/24K/42K restored sub-second after full GPU-pool eviction, outputs byte-identical to GPU-cache controls at 8K/24K), throughput-neutral (c1 133.6 / c8 599.4 / c32 1,149.7 vs 1,151.2 no-tier baseline). Known limitation: one tail per trajectory - a sibling re-ask after a deeper follow-up turn re-prefills instead of resuming (correct, just slower); resume boundaries exist at ~2K-token chunk ends, so sub-chunk (<2K) conversations are not tier-resumable (re-prefill is faster anyway). Raw: perf/results/2026-08-28/kv-tier/.",
+            "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
+          ],
+          "speculative_overrides": {
+            "index_share_for_mtp_iteration": true
+          }
         }
       }
     }

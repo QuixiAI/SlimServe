@@ -39,9 +39,10 @@ from vllm.sampling_params import (
     BeamSearchParams,
     RepetitionDetectionParams,
     RequestOutputKind,
+    RequestThinkingTokenBudget,
     SamplingParams,
     StructuredOutputsParams,
-    ThinkingTokenBudget,
+    get_effective_thinking_token_budget,
 )
 from vllm.utils import random_uuid
 
@@ -238,7 +239,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "part of the standard OpenAI API specification."
         ),
     )
-    thinking_token_budget: ThinkingTokenBudget = None
+    thinking_token_budget: RequestThinkingTokenBudget = Field(
+        default=None,
+        description=(
+            "Maximum generated thinking tokens for this request. A "
+            "non-negative integer overrides the server default; -1 opts out "
+            "of the server cutoff."
+        ),
+    )
     include_reasoning: bool = True
     parallel_tool_calls: bool | None = True
 
@@ -499,7 +507,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 continue
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
-                msg["tool_calls"] = list(tool_calls)
+                msg["tool_calls"] = list(tool_calls)  # type: ignore[arg-type, typeddict-unknown-key]
             reasoning_content = msg.pop("reasoning_content", None)
             if reasoning_content is not None and msg.get("reasoning") is None:
                 msg["reasoning"] = reasoning_content
@@ -520,7 +528,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 continue
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
-                msg["tool_calls"] = list(tool_calls)
+                msg["tool_calls"] = list(tool_calls)  # type: ignore[arg-type, typeddict-unknown-key]
         return self
 
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
@@ -621,6 +629,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         self,
         max_tokens: int,
         default_sampling_params: dict,
+        default_reasoning_effort: str | None = None,
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -644,6 +653,17 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p = default_sampling_params.get(
                 "min_p", self._DEFAULT_SAMPLING_PARAMS["min_p"]
             )
+
+        # The template-level default effort (e.g. a profile serving
+        # reasoning_effort low via default_chat_template_kwargs) must select
+        # the same budget-map level the template actually renders at.
+        effective_effort = self.reasoning_effort or default_reasoning_effort
+        thinking_token_budget = get_effective_thinking_token_budget(
+            self.thinking_token_budget,
+            max_tokens,
+            default_sampling_params,
+            effective_effort,
+        )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -699,7 +719,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=thinking_token_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone

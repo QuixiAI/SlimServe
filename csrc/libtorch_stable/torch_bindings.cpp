@@ -727,6 +727,16 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // LongCat n-gram embedding index kernel. All tensor args are marked mutable
   // to match the (non-const) stable-Tensor& C++ signature; only ne_token_table
   // and n_gram_ids are actually written in place.
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+  ops.def(
+      "fused_gdn_decode_post_conv_mtp("
+      "Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
+      "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
+      "float scale, float norm_eps=1e-5, "
+      "str output_gate_activation='silu') -> ()");
+#endif
+
   ops.def(
       "ngram_compute_n_gram_ids(int ne_n, int ne_k, Tensor(a!) ne_weights, "
       "Tensor(b!) ne_mods, Tensor(c!) exclusive_ne_embedder_size_sums, "
@@ -738,6 +748,11 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
 STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // LongCat n-gram embedding index kernel.
   ops.impl("ngram_compute_n_gram_ids", TORCH_BOX(&ngram_compute_n_gram_ids));
+#ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+  ops.impl("fused_gdn_decode_post_conv_mtp",
+           TORCH_BOX(&fused_gdn_decode_post_conv_mtp));
+#endif
+
 
   // Per-token group quantization
   ops.impl("per_token_group_fp8_quant", TORCH_BOX(&per_token_group_quant_fp8));

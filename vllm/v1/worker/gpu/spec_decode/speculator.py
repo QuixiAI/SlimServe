@@ -63,6 +63,7 @@ class BaseSpeculator(ABC):
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
         draft_grammar=None,
+        num_steps: int | None = None,
     ) -> torch.Tensor:
         pass
 
@@ -133,13 +134,28 @@ class DraftModelSpeculator(BaseSpeculator):
         # DSpark sequential sampler. Never mutated from outside.
         self.draft_grammar = None
         if self.speculative_config.draft_sample_method == "probabilistic":
-            self.draft_logits = torch.zeros(
-                self.max_num_reqs,
-                self.num_speculative_steps,
-                self.vocab_size,
-                dtype=torch.float32,
+            # Pre-temperature logits, cached from the previous decode step.
+            dtype, fill = self.draft_logits_spec(vllm_config)
+            self.draft_logits = torch.full(
+                (
+                    self.max_num_reqs,
+                    self.num_speculative_steps,
+                    self.vocab_size,
+                ),
+                fill,
+                dtype=dtype,
                 device=device,
             )
+
+    def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
+        """Dtype and initial value for the cached proposal distribution.
+
+        A speculator that writes every column each step can start from zero.
+        One that writes a subset -- DFlash2 caches only its K candidates --
+        overrides this, since the columns it never touches have to read as
+        impossible.
+        """
+        return torch.float32, 0.0
 
     @abstractmethod
     def load_draft_model(
@@ -280,8 +296,8 @@ class DraftModelSpeculator(BaseSpeculator):
 
     def _greedy_sample_draft(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
-        logits = self.model.compute_logits(hidden_states)
+            return self.model.get_top_tokens(hidden_states)  # type: ignore[operator]
+        logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
         return logits.argmax(dim=-1)
 
     def sample_draft(
@@ -295,7 +311,7 @@ class DraftModelSpeculator(BaseSpeculator):
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
         if draft_logits is not None:
-            logits = self.model.compute_logits(hidden_states)
+            logits = self.model.compute_logits(hidden_states)  # type: ignore[operator]
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
             return gumbel_sample(

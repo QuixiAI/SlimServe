@@ -58,6 +58,19 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
 
     backend_cls = DeepseekV4AmpereMLASparseBackend
     def __init__(self, *args, **kwargs) -> None:
+        # Serving policy: bf16 main KV where the operator asks for it.
+        # auto/bfloat16 selects plain 512-element bf16 rows (1024B/slot, no
+        # scale plane) - the same NFP8=0 geometry GLM-5.2 serves on this
+        # platform - while fp8* keeps the packed UE8M0 fp8_ds_mla page. The
+        # instance attribute shadows the ClassVar consumed by
+        # _uses_fp8_ds_mla_layout() during base __init__.
+        vllm_config = kwargs.get("vllm_config", args[0] if args else None)
+        requested = (
+            vllm_config.cache_config.cache_dtype
+            if vllm_config is not None
+            else "fp8"
+        )
+        self.use_fp8_ds_mla_layout = requested not in ("auto", "bfloat16")
         super().__init__(*args, **kwargs)
         self.native_q8_o_proj = os.getenv(
             "VLLM_DSV4_NATIVE_Q8_O_PROJ", "1"
@@ -270,7 +283,12 @@ class DeepseekV4AmpereMLAAttention(DeepseekV4ROCMAiterMLAAttention):
         swa_only: bool,
         output: torch.Tensor,
     ) -> None:
-        if self.swa_cache_layer.kv_cache.dtype != torch.uint8:
+        # The native merged decode reads fp8_ds_mla packed pages (uint8) and
+        # plain bf16 rows (NFP8=0 instantiation); anything else falls back.
+        if self.swa_cache_layer.kv_cache.dtype not in (
+            torch.uint8,
+            torch.bfloat16,
+        ):
             return self._forward_decode_torch_fallback(
                 q=q,
                 kv_cache=kv_cache,

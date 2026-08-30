@@ -85,7 +85,16 @@ def kernel_warmup(worker: "Worker"):
             worker.scheduler_config.max_num_batched_tokens,
         )
     bootstamp("kernel_warmup: block_table done")
-    qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    # Warmup is an optimization: a failure here means first-request JIT
+    # latency, never a dead server. Under Restart=always a warmup crash
+    # becomes a boot CRASH LOOP (rtx3090, 2026-08-30), so shield it.
+    try:
+        qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    except Exception:
+        logger.exception(
+            "Qwen Triton warmup failed; continuing boot. Affected kernels "
+            "will JIT on first use (latency spike, not an outage)."
+        )
     bootstamp("kernel_warmup: qwen_triton done")
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder

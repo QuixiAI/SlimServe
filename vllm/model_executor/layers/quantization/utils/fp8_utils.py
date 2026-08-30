@@ -1244,6 +1244,26 @@ def validate_fp8_block_shape(
                 )
 
 
+def wrap_fp8_byteview_loader(weight_loader: Callable | None) -> Callable | None:
+    """Adapt a weight loader for platforms whose fp8 params are uint8 bytes.
+
+    torch-MPS cannot allocate fp8 tensors, so Metal registers fp8-payload
+    parameters as uint8. Checkpoint tensors still arrive as fp8; reinterpret
+    them as bytes before the copy — a plain copy_ would value-cast fp8 to
+    uint8 and silently corrupt the weights.
+    """
+    if weight_loader is None:
+        return None
+
+    @functools.wraps(weight_loader)
+    def loader(param, loaded_weight, *args, **kwargs):
+        if loaded_weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            loaded_weight = loaded_weight.view(torch.uint8)
+        return weight_loader(param, loaded_weight, *args, **kwargs)
+
+    return loader
+
+
 def create_fp8_weight_parameter(
     output_size_per_partition: int,
     input_size_per_partition: int,
@@ -1252,11 +1272,17 @@ def create_fp8_weight_parameter(
     """Create FP8 weight parameter."""
     from vllm.model_executor.parameter import ModelWeightParameter
 
+    # Metal stores the E4M3 bytes as uint8 (no fp8 dtype on torch-MPS); the
+    # Metal W8A16 kernel decodes them via LUT.
+    dtype = torch.uint8 if current_platform.is_metal() else torch.float8_e4m3fn
+    if current_platform.is_metal():
+        weight_loader = wrap_fp8_byteview_loader(weight_loader)
+
     return ModelWeightParameter(
         data=torch.empty(
             output_size_per_partition,
             input_size_per_partition,
-            dtype=torch.float8_e4m3fn,
+            dtype=dtype,
         ),
         input_dim=1,
         output_dim=0,
@@ -1275,7 +1301,7 @@ def create_fp8_scale_parameter(
     """Create scale parameter based on quantization strategy."""
     dtype = scale_dtype if scale_dtype is not None else torch.float32
     if parameter_type == ChannelQuantScaleParameter:
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty((sum(output_partition_sizes), 1), dtype=dtype),
             output_dim=0,
             weight_loader=weight_loader,
@@ -1284,7 +1310,7 @@ def create_fp8_scale_parameter(
         assert block_size is not None
         block_n, block_k = block_size[0], block_size[1]
         output_size_per_partition = sum(output_partition_sizes)
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty(
                 (output_size_per_partition + block_n - 1) // block_n,
                 (input_size_per_partition + block_k - 1) // block_k,
@@ -1295,7 +1321,7 @@ def create_fp8_scale_parameter(
             weight_loader=weight_loader,
         )
     elif parameter_type == PerTensorScaleParameter:
-        scale = parameter_type(
+        scale = parameter_type(  # type: ignore[operator]
             data=torch.empty(len(output_partition_sizes), dtype=dtype),
             weight_loader=weight_loader,
         )

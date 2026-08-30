@@ -352,14 +352,22 @@ def _reshape_kv_cache(
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
                 page_size_bytes = kv_cache_spec.page_size_bytes
-                # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                # int8 page view per layer; the layer's bind_kv_cache unpacks
-                # each block's bytes into its conv/ssm state views. Keeping
-                # one tensor per layer lets the KV connector register it
-                # without special-casing Mamba.
-                kv_caches[layer_name] = kv_raw_tensor[
-                    : num_blocks * page_size_bytes
-                ].view(num_blocks, 1, 1, page_size_bytes)
+                # Hold a single [num_blocks, 1, 1, page_size_bytes] int8 page
+                # view per layer; the layer's bind_kv_cache unpacks each
+                # block's bytes into its conv/ssm state views. Keeping one
+                # tensor per layer lets the KV connector register it without
+                # special-casing Mamba.
+                if packing is not None:
+                    # Packed slab (e.g. the CSA+linear layout): this layer's
+                    # page lives at a fixed byte offset within every block.
+                    offset, blk_stride = packing
+                    kv_caches[layer_name] = kv_raw_tensor.view(-1, blk_stride)[
+                        :, offset : offset + page_size_bytes
+                    ][:, None, None, :]
+                else:
+                    kv_caches[layer_name] = kv_raw_tensor[
+                        : num_blocks * page_size_bytes
+                    ].view(num_blocks, 1, 1, page_size_bytes)
             else:
                 raise NotImplementedError(
                     f"Unsupported KV cache spec type: {type(kv_cache_spec)}"
@@ -546,7 +554,12 @@ def init_kv_cache(
         in ("longcat_flash", "longcat_flash_ngram")
         else 1
     )
-    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
+    bind_kv_cache(
+        kv_caches,
+        forward_context,
+        runner_kv_caches,  # type: ignore[arg-type]
+        num_attn_module,
+    )
     return kv_caches
 
 
@@ -592,40 +605,95 @@ def build_attn_metadata(
     # only the persistent device buffers the builders write; the cached
     # metadata objects stay content-live because all their tensor fields are
     # views over those buffers (CPU scalars that drift are refreshed).
-    # `steady` is the cache narrowed to the eligible case (None otherwise), so
-    # the type checker follows the Optional through the blocks below.
-    steady: dict[str, Any] | None = None
-    if (
+    # Model-specific metadata (e.g. Mamba hybrid) participates when it
+    # reports a steady signature: the token folds into the shape signature,
+    # and on a hit each supporting builder gets the FRESH extra kwargs so it
+    # can refresh the few copied tensor fields (num_accepted, state indices)
+    # in place. Builders without steady_decode_update are rebuilt with the
+    # same kwargs the cold path would pass — correct, just not accelerated.
+    model_specific_sig = (
+        model_specific_attn_metadata.steady_signature()
+        if model_specific_attn_metadata is not None
+        else None
+    )
+    steady_eligible = (
         steady_cache is not None
-        and is_prefilling is not None
         and not for_cudagraph_capture
         and causal is True
         and dcp_local_seq_lens is None
         and mm_req_doc_ranges is None
-        and model_specific_attn_metadata is None
-        and not bool(is_prefilling[:num_reqs].any())
+        # All-decode guarantee: a non-None model-specific signature already
+        # certifies a uniform spec-decode batch (CPU-side checks, no device
+        # sync); the mamba-hybrid caller keeps is_prefilling inside its
+        # metadata and passes None at top level, so only consult the tensor
+        # when no model-specific metadata governs the batch.
+        and (
+            model_specific_sig is not None
+            if model_specific_attn_metadata is not None
+            else is_prefilling is not None and not bool(is_prefilling[:num_reqs].any())
+        )
+    )
+    steady_sig = (
+        (num_reqs, num_tokens, max_query_len, model_specific_sig)
+        if steady_eligible
+        else None
+    )
+    if steady_eligible:
+        assert steady_cache is not None
+    if (
+        steady_eligible
+        and steady_cache is not None
+        and (steady_cache.get("sig") == steady_sig)
     ):
-        steady = steady_cache
-    steady_sig = (num_reqs, num_tokens, max_query_len) if steady is not None else None
-    if steady is not None and steady.get("sig") == steady_sig:
-        for cm, items in steady["groups"]:
+        for cm, items in steady_cache["groups"]:
             cm.max_seq_len = max_seq_len
+            # The runner allocates seq_lens_cpu_upper_bound fresh every step
+            # (np.zeros + from_numpy in model_runner), so the cached view is
+            # frozen at cold-build content — and builders rebuilt on hits
+            # derive the decode max_context from it. Refresh it in place.
+            # query_start_loc_cpu is frozen too but its content is fully
+            # determined by the signature (uniform all-spec decode), so it
+            # needs no refresh. seq_lens / query_start_loc / block tables /
+            # slot mappings are views over persistent buffers the runner
+            # updates in place.
+            if (
+                cm.seq_lens_cpu_upper_bound is not None
+                and seq_lens_cpu_upper_bound is not None
+            ):
+                cm.seq_lens_cpu_upper_bound.copy_(
+                    seq_lens_cpu_upper_bound[: cm.num_reqs]
+                )
             # Computed-token counts advance every decode step; the cached
-            # tensor is a view of the producer's persistent buffer today,
-            # but refresh explicitly so a producer change cannot leave the
+            # tensor may be a view of the producer's persistent buffer, but
+            # refresh explicitly so a producer change cannot leave the
             # steady path reading first-step values.
             if num_computed_tokens_cpu is not None:
                 cm._num_computed_tokens_cpu = num_computed_tokens_cpu
+            # The device-side memo is a MATERIALIZED seq_lens - query_lens
+            # frozen at cold-build values (seq_lens itself is a live view the
+            # runner advances in place). Builders rebuilt on steady hits
+            # (no steady_decode_update: PLE short-conv, Flex, MiniMax) call
+            # compute_num_computed_tokens() and would read first-step values.
+            cm._num_computed_tokens_cache = None
             for builder, meta, layer_names, supports in items:
+                extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        builder, num_reqs
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
                 if supports:
-                    builder.steady_decode_update(meta, cm)
+                    builder.steady_decode_update(meta, cm, **extra_kwargs)
                 else:
                     rebuilt = builder.build(
-                        common_prefix_len=0, common_attn_metadata=cm
+                        common_prefix_len=0,
+                        common_attn_metadata=cm,
+                        **extra_kwargs,
                     )
                     for layer_name in layer_names:
-                        steady["attn_metadata"][layer_name] = rebuilt
-        return steady["attn_metadata"]
+                        steady_cache["attn_metadata"][layer_name] = rebuilt
+        return steady_cache["attn_metadata"]
 
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -711,10 +779,11 @@ def build_attn_metadata(
                         hasattr(attn_metadata_builder, "steady_decode_update"),
                     )
                 )
-    if steady is not None:
-        steady["sig"] = steady_sig
-        steady["attn_metadata"] = attn_metadata
-        steady["groups"] = steady_groups
+    if steady_sig is not None:
+        assert steady_cache is not None  # steady_sig requires steady_eligible
+        steady_cache["sig"] = steady_sig
+        steady_cache["attn_metadata"] = attn_metadata
+        steady_cache["groups"] = steady_groups
     elif steady_cache is not None:
         steady_cache["sig"] = None
     return attn_metadata

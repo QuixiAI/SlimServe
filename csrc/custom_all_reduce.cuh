@@ -761,6 +761,15 @@ class CustomAllreduce {
         } else {                                        \
           KL(ngpus, cross_device_reduce_2stage);        \
         }                                               \
+      } else {                                          \
+        /* PCIe P2P (large-BAR1): 1stage reads B*(n-1)  \
+           across the fabric, so cut over to 2stage     \
+           (B*2*(n-1)/n traffic) much earlier. */       \
+        if (bytes < 64 * 1024) {                        \
+          KL(ngpus, cross_device_reduce_1stage);        \
+        } else {                                        \
+          KL(ngpus, cross_device_reduce_2stage);        \
+        }                                               \
       }                                                 \
     }                                                   \
     break;                                              \

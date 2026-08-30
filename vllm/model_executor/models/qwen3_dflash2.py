@@ -1,43 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""DFlash 2 drafter for Qwen3.8-27B, from the published GGUF.
+"""DFlash2 draft model (z-lab DFlash 2): non-causal block-attention drafter.
 
-The backbone is exactly the DFlashQwen3 shape the Muse-Glimmer drafter uses:
-five decoder layers of split-QKV + per-head QK-RMSNorm + RoPE + sliding-window
-(here explicitly non-causal) attention and a SwiGLU MLP, plus the `fc` fusion
-of five concatenated target hidden states. DFlash 2 adds two things
-(inco.ai/blog/dflash2, llama.cpp PR #27342; layouts verified against the
-GGUF -- perf/qwen38_metal_design.md):
-
-- A two-tap dynamic depthwise convolution before AND after every attention
-  and MLP sublayer. Each sublayer pair computes one dynamic coefficient
-  projection from its normed input and applies `base + coeff` weighted taps
-  block-locally (tap 1 reads the predecessor row; row 0 of each 1+N draft
-  block is the last verified token, so position 1's tap naturally reads it).
-- A path selector over the top-k candidates per position: adjacent pairs
-  score `S(a, b) = U(b) + <A(a) * H(h), B(b)>`; a sequential walk from the
-  anchor picks one coherent path. `select_draft_path` runs the walk directly
-  (greedy at T=0), so only the actual predecessor's score row is ever
-  computed.
-
-The checkpoint carries no token embedding and no output head; both are
-shared with the target through the generic dflash proposer, the same
-contract as the Muse and Laguna drafters.
+Five sliding-window qwen3 layers + rank-r candidate selector + two-tap
+grouped dynamic conv over target hidden-state taps; block_size 8 drafts
+7 tokens per verify. Serves as the `dflash` speculative method's draft
+model for Qwen3.8-27B (upstream vLLM PR #52816, github.com/z-lab/dflash).
 """
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from functools import cache
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+from vllm.compilation.backends import set_model_tag
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    UnquantizedEmbeddingMethod,
+)
 from vllm.model_executor.models.muse_glimmer_dflash import MuseGlimmerDFlashModel
+from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer
 
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -48,12 +47,420 @@ from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
 
 logger = init_logger(__name__)
 
-# Env-gated diagnostic dump for the recall@k replay (set
-# QWEN38_DFLASH_DUMP=<dir> to record per-propose drafter candidates).
+# QWEN38_DFLASH_DUMP=<dir> to record per-propose drafter candidates (GGUF
+# drafter stack below).
 _DUMP_DIR = os.environ.get("QWEN38_DFLASH_DUMP")
 _DUMP_STEP = [0]
 _FUSED_CONV = os.environ.get("VLLM_QWEN38_FUSED_DFLASH2_CONV", "1") != "0"
 _FUSED_CONV_AVAILABLE: bool | None = None
+
+
+@cache
+def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
+    """FlashInfer's radix top-k, or None for torch.topk.
+
+    This top-k spans the vocabulary and is the selector's largest single cost,
+    where the radix kernel is about twice torch.topk.
+    """
+    if not current_platform.is_cuda():
+        return None
+    if not has_flashinfer():
+        logger.info_once(
+            "flashinfer is unavailable; the DFlash2 selector uses torch.topk, "
+            "at roughly half the speed."
+        )
+        return None
+    # Older flashinfer releases predate the deterministic kwarg _topk
+    # passes; treat them as unavailable rather than TypeError at serve time.
+    # The import itself stays inside the try: has_flashinfer() only checks
+    # find_spec, so a broken installation raises ImportError right here.
+    import inspect
+
+    try:
+        from flashinfer import top_k
+
+        if "deterministic" not in inspect.signature(top_k).parameters:
+            logger.info_once(
+                "flashinfer top_k lacks the deterministic kwarg; the DFlash2 "
+                "selector uses torch.topk."
+            )
+            return None
+    except (ImportError, TypeError, ValueError):
+        return None
+    return top_k
+
+
+def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    impl = _flashinfer_topk()
+    if impl is None or not scores.is_cuda:
+        return torch.topk(scores, k, dim=-1)
+    return impl(scores, k, sorted=True, deterministic=True)
+
+
+@cache
+def _dflash_conv_kernel_available() -> bool:
+    """Fused Metal grouped-conv route (VLLM_QC_DFLASH_CONV=0 restores the
+    eager chain). The eager form is ~10 dispatches per call x 4 calls per
+    drafter layer — the largest single encode block in the drafter step."""
+    import os
+
+    if os.environ.get("VLLM_QC_DFLASH_CONV", "1") == "0":
+        return False
+    if not current_platform.is_metal():
+        return False
+    try:
+        from vllm.quixicore import quixicore_ops
+
+        if not quixicore_ops.is_available():
+            return False
+        import vllm._quixicore_C as qc
+
+        if not hasattr(qc, "qc_dflash_conv"):  # stale .so guard
+            return False
+    except (ImportError, AttributeError):
+        return False
+    return True
+
+
+def _grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    if (
+        _dflash_conv_kernel_available()
+        and hidden_states.is_contiguous()
+        and delta.stride(2) == 1
+        and delta.stride(1) == delta.size(2)
+        and base.is_contiguous()
+    ):
+        from vllm.quixicore import quixicore_ops
+
+        return quixicore_ops.qc_dflash_conv(hidden_states, delta, base, block_size)
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    output = coefficients[:, 0] * blocks
+    position = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    if block_size & (block_size - 1) == 0:
+        position = position & (block_size - 1)
+    else:
+        position = position % block_size
+    for tap in range(1, taps):
+        shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+        output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return output.flatten(-2)
+
+
+class DFlashGroupedConv(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        taps: int,
+        group_size: int,
+        block_size: int,
+        params_dtype: torch.dtype,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        if hidden_size % group_size:
+            raise ValueError(
+                f"conv_group_size={group_size} must divide hidden_size={hidden_size}."
+            )
+        self.block_size = block_size
+        self.taps = taps
+        self.group_size = group_size
+        self.num_groups = hidden_size // group_size
+        self.base_kernel = nn.Parameter(
+            torch.empty(2, taps, hidden_size, dtype=params_dtype),
+            requires_grad=False,
+        )
+        self.kernel_projection = ReplicatedLinear(
+            hidden_size,
+            2 * taps * self.num_groups,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=None,
+            prefix=maybe_prefix(prefix, "kernel_projection"),
+            return_bias=False,
+        )
+
+    def _convolve(
+        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
+    ) -> torch.Tensor:
+        return _grouped_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            self.block_size,
+            self.num_groups,
+            self.group_size,
+            self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            hidden_states.shape[0], 2, self.taps, self.num_groups
+        )
+        return self._convolve(hidden_states, coefficients[:, 0], 0), coefficients[:, 1]
+
+    def finish(
+        self, hidden_states: torch.Tensor, coefficients: torch.Tensor
+    ) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, 1)
+
+
+class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        *,
+        config,
+        layer_idx: int,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        disable_tp: bool = False,
+    ) -> None:
+        super().__init__(
+            vllm_config,
+            config=config,
+            layer_idx=layer_idx,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+            disable_tp=disable_tp,
+        )
+        draft_config = config.dflash_config
+        speculative_config = vllm_config.speculative_config
+        assert speculative_config is not None
+        conv_args = dict(
+            hidden_size=config.hidden_size,
+            taps=int(draft_config["conv_kernel_size"]),
+            group_size=int(draft_config["conv_group_size"]),
+            # Query tokens per request: the bonus token plus the mask tokens.
+            block_size=1 + speculative_config.num_speculative_tokens,
+            params_dtype=vllm_config.model_config.dtype,
+        )
+        self.attention_conv = DFlashGroupedConv(
+            **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
+        )
+        self.mlp_conv = DFlashGroupedConv(
+            **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
+        return hidden_states, residual
+
+
+def _score_edges(
+    predecessor_table: torch.Tensor,
+    successor_table: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    hidden: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+    top_k: int,
+) -> torch.Tensor:
+    successors = successor_table[candidate_ids]
+    predecessor_ids = torch.cat(
+        (
+            anchor_token_ids[:, None, None].expand(-1, 1, top_k),
+            candidate_ids[:, :-1],
+        ),
+        dim=1,
+    )
+    predecessors = predecessor_table[predecessor_ids]
+    return unary_logits[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
+    )
+
+
+@support_torch_compile
+class CandidateSelector(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        vocab_size: int,
+        rank: int,
+        top_k: int,
+        params_dtype: torch.dtype,
+        prefix: str,
+    ) -> None:
+        super().__init__()
+        self.top_k = top_k
+        self.predecessor_codebook = nn.Parameter(
+            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+        )
+        self.successor_codebook = nn.Parameter(
+            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+        )
+        self.hidden_projection = ReplicatedLinear(
+            hidden_size,
+            rank,
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=None,
+            prefix=maybe_prefix(prefix, "hidden_projection"),
+            return_bias=False,
+        )
+
+    def forward(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden = self.hidden_projection(hidden_states)
+        return _score_edges(
+            self.predecessor_codebook,
+            self.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            hidden,
+            anchor_token_ids,
+            self.top_k,
+        )
+
+
+class DFlash2Qwen3Model(DFlashQwen3Model):
+    decoder_layer_cls = DFlash2Qwen3DecoderLayer
+
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        start_layer_id: int = 0,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            vllm_config=vllm_config,
+            start_layer_id=start_layer_id,
+            prefix=prefix,
+        )
+        draft_config = self.config.dflash_config
+        self.input_embedding_scale = float(
+            draft_config.get("input_embedding_scale", 1.0)
+        )
+        # The selector carries its own @support_torch_compile, but it is built
+        # while the active model tag is still the draft's, so without a tag of its
+        # own the two share a compile-cache namespace and the selector loads the
+        # draft's graph -- a different input signature, within the same startup.
+        with set_model_tag("dflash2_candidate_selector"):
+            self.candidate_selector = CandidateSelector(
+                hidden_size=self.config.hidden_size,
+                vocab_size=self.config.vocab_size,
+                rank=int(draft_config["selector_rank"]),
+                top_k=int(draft_config["selector_top_k"]),
+                params_dtype=vllm_config.model_config.dtype,
+                prefix=maybe_prefix(prefix, "candidate_selector"),
+            )
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return super().embed_input_ids(input_ids) * self.input_embedding_scale
+
+
+class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
+    model_cls = DFlash2Qwen3Model
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        draft_config = self.config.dflash_config
+        self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
+        softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
+        self.final_logit_softcapping = softcap if softcap > 0 else None
+
+    def compute_candidates(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+            CompressedTensorsLinearMethod,
+        )
+
+        # Upstream requires an unquantized lm_head here. We additionally accept
+        # the compressed-tensors method: on the Metal serving stack the target's
+        # fp8-channel lm_head applies through the same deterministic quixicore
+        # GEMV that computes serving logits every step, and greedy losslessness
+        # is enforced by verification regardless of drafter exactness -- the
+        # candidate list only has to be good, not bitwise-unquantized.
+        if not isinstance(
+            self.lm_head.quant_method,
+            (
+                UnquantizedEmbeddingMethod,
+                UnquantizedLinearMethod,
+                CompressedTensorsLinearMethod,
+            ),
+        ):
+            raise ValueError(
+                "DFlash2 requires an unquantized or fp8-channel target LM head "
+                f"for candidate TopK; got {type(self.lm_head.quant_method).__name__}."
+            )
+
+        selector = self.model.candidate_selector
+        logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
+        num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        values, ids = _topk(logits, selector.top_k)
+        ids = ids.to(torch.int64) + self.lm_head.shard_indices.org_vocab_start_index
+
+        if get_tensor_model_parallel_world_size() > 1:
+            values = tensor_model_parallel_all_gather(values, dim=-1)
+            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            values, selected = _topk(values, selector.top_k)
+            ids = ids.gather(-1, selected)
+
+        values = values.float() * self.output_multiplier
+        if self.final_logit_softcapping is not None:
+            cap = self.final_logit_softcapping
+            values = torch.tanh(values / cap) * cap
+        return ids, values
+
+
+EntryClass = DFlash2Qwen3ForCausalLM
+
+
+# --------------------------------------------------------------------------- #
+# GGUF-built DFlash2 drafter (arch "DFlash2QwenDraftModel"), vendored from the
+# Muse-Glimmer-shaped dflash backbone. The safetensors drafter above (arch
+# "DFlash2DraftModel") and this stack coexist: they serve the same published
+# drafter through the HF and GGUF checkpoints respectively.
+# --------------------------------------------------------------------------- #
+
+
+def _resolve_serving_block_size(
+    trained_block_size: int, num_speculative_tokens: int
+) -> int:
+    active_block_size = 1 + num_speculative_tokens
+    if trained_block_size and active_block_size > trained_block_size:
+        raise ValueError(
+            "DFlash 2 cannot serve a wider block than the checkpoint was trained "
+            f"for ({active_block_size} > {trained_block_size})"
+        )
+    return active_block_size
 
 
 def _dump_draft_record(record: dict) -> None:
@@ -145,7 +552,15 @@ class DFlash2QwenDecoderLayer(DFlashQwen3DecoderLayer):
             raise ValueError("hidden_size must be divisible by conv_group_size")
         self.conv_group_channels = group_channels
         self.n_conv_groups = config.hidden_size // group_channels
-        self.dflash_block_size = int(getattr(config, "block_size", 0))
+        # The convolution is block-local to each request's active query block,
+        # not the maximum block width used to train the checkpoint. Serving may
+        # intentionally verify a shorter prefix of that block. Keeping this
+        # width fixed to the active 1+N layout also makes it invariant across
+        # torch.compile capture and replay shapes.
+        self.dflash_block_size = _resolve_serving_block_size(
+            int(getattr(config, "block_size", 0)),
+            vllm_config.num_speculative_tokens,
+        )
 
         dtype = vllm_config.model_config.dtype
         conv_out = 2 * self.conv_kernel_size * self.n_conv_groups

@@ -31,6 +31,14 @@ MAX_LOGPROB_TOKEN_IDS = 128
 """Upper bound on `SamplingParams.logprob_token_ids` list length. Must match
 the per-request row width allocated by the sampler's `LogprobTokenIdsState`."""
 
+DEFAULT_REASONING_EFFORT = "medium"
+"""Level used to resolve a budget map when a request omits reasoning_effort."""
+
+CONFIGURABLE_REASONING_EFFORTS = frozenset(
+    {"minimal", "low", "medium", "high", "xhigh", "max"}
+)
+"""Reasoning levels accepted as keys in a server budget map."""
+
 
 def validate_thinking_token_budget(value: int | float | bool | None) -> int | None:
     """Validate ``thinking_token_budget``; return ``None`` if unset."""
@@ -55,10 +63,111 @@ def validate_thinking_token_budget(value: int | float | bool | None) -> int | No
     return value
 
 
+def validate_request_thinking_token_budget(
+    value: int | float | bool | None,
+) -> int | None:
+    """Validate the API value while preserving ``-1`` as an opt-out sentinel."""
+    if value == -1 and not isinstance(value, bool):
+        return -1
+    return validate_thinking_token_budget(value)
+
+
 ThinkingTokenBudget = Annotated[
     int | None,
     BeforeValidator(validate_thinking_token_budget),
 ]
+
+RequestThinkingTokenBudget = Annotated[
+    int | None,
+    BeforeValidator(validate_request_thinking_token_budget),
+]
+
+
+def validate_thinking_token_budget_config(value) -> None:
+    """Validate an operator-supplied ``thinking_token_budget`` default.
+
+    Accepts the legacy scalar or a map keyed by ``reasoning_effort``. Called
+    at CONFIG time (when generation-config defaults are loaded), so a bad
+    map fails the server at boot instead of rejecting every request.
+    """
+    if isinstance(value, dict):
+        invalid_levels = set(value) - CONFIGURABLE_REASONING_EFFORTS
+        if invalid_levels:
+            raise VLLMValidationError(
+                "`thinking_token_budget` map contains unsupported reasoning "
+                f"effort levels: {sorted(invalid_levels)}. Supported levels "
+                f"are {sorted(CONFIGURABLE_REASONING_EFFORTS)}.",
+                parameter="thinking_token_budget",
+                value=value,
+            )
+        if DEFAULT_REASONING_EFFORT not in value:
+            raise VLLMValidationError(
+                "`thinking_token_budget` map must define `medium`, which is "
+                "used when reasoning_effort is omitted or absent from the map.",
+                parameter="thinking_token_budget",
+                value=value,
+            )
+        for level_budget in value.values():
+            if level_budget is None:
+                raise VLLMValidationError(
+                    "`thinking_token_budget` map values must be non-negative "
+                    "integers or -1 for unlimited.",
+                    parameter="thinking_token_budget",
+                    value=value,
+                )
+            validate_thinking_token_budget(level_budget)
+    else:
+        validate_thinking_token_budget(value)
+
+
+def get_effective_thinking_token_budget(
+    request_budget: int | None,
+    max_tokens: int,
+    default_sampling_params: dict[str, Any],
+    reasoning_effort: str | None = None,
+) -> int | None:
+    """Resolve a chat reasoning cap within the total completion ceiling.
+
+    The server default may be a legacy scalar or a map keyed by
+    ``reasoning_effort``. A map must contain ``medium``, which is both the
+    fallback for omitted request levels and for levels absent from a partial
+    map. An explicit request budget (including ``-1``) takes precedence.
+    """
+    # `none` disables thinking at the template layer entirely: no reasoning
+    # block will open, so no cutoff applies -- regardless of a scalar server
+    # default or an explicit request budget (which would otherwise make a
+    # no-thinking request look budgeted and trip the V2 multi-token-marker
+    # rejection).
+    if reasoning_effort == "none":
+        return None
+    configured_budget = request_budget
+    # An explicit API -1 must disable an operator-configured server default.
+    if configured_budget == -1:
+        return None
+    if configured_budget is None:
+        configured_budget = default_sampling_params.get("thinking_token_budget")
+    if configured_budget is None:
+        return None
+
+    if isinstance(configured_budget, dict):
+        # Server defaults were validated at config time; re-validating here
+        # keeps programmatically supplied maps honest at trivial cost.
+        validate_thinking_token_budget_config(configured_budget)
+
+        level = reasoning_effort or DEFAULT_REASONING_EFFORT
+        configured_budget = configured_budget.get(
+            level, configured_budget[DEFAULT_REASONING_EFFORT]
+        )
+
+    configured_budget = validate_thinking_token_budget(configured_budget)
+    if configured_budget is None:
+        return None
+
+    # max_tokens remains the client's total completion ceiling. Keep only the
+    # single token needed to inject the native reasoning-end marker when the
+    # selected cutoff reaches that ceiling; final-answer capacity is otherwise
+    # simply max_tokens minus the reasoning tokens actually emitted.
+    return min(configured_budget, max(0, max_tokens - 1))
 
 
 class SamplingType(IntEnum):

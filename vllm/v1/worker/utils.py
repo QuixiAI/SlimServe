@@ -43,6 +43,7 @@ logger = init_logger(__name__)
 @triton.jit
 def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
+    seg_strides_ptr,
     seg_page_sizes_ptr,
     block_ids_ptr,
     n_blocks,
@@ -78,11 +79,18 @@ def _zero_kv_blocks_kernel(
     page_size_el = tl.load(seg_page_sizes_ptr + seg_index)
     if chunk_index >= page_size_el // BLOCK_SIZE:
         return
+    stride_el = tl.load(seg_strides_ptr + seg_index)
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
+    # Advance by the block STRIDE, zero only this layer's page EXTENT:
+    # packed cross-layer slabs hand out block-strided views whose stride
+    # spans every co-located page, so stepping by the extent both bled
+    # into the neighboring block's bytes and overran the slab on the
+    # highest block ids (host-tier deferred-zero illegal memory access).
+    # Ordinary contiguous layouts have stride == extent and are unchanged.
     offset = (
-        block_id.to(tl.int64) * page_size_el.to(tl.int64)
+        block_id.to(tl.int64) * stride_el.to(tl.int64)
         + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -119,13 +127,16 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
-        self._meta: tuple[torch.Tensor, torch.Tensor, int, int, int] | None = None
+        self._meta: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+        ) = None
         self._metal_segments: list[tuple[torch.Tensor, int, int]] = []
 
         if runner_only_attn_layers is None:
             runner_only_attn_layers = set()
         seen_ptrs: set[int] = set()
         seg_addrs: list[int] = []
+        seg_strides: list[int] = []
         seg_page_sizes: list[int] = []
 
         for group in attn_groups_iter:
@@ -159,10 +170,29 @@ class KVBlockZeroer:
                     continue
 
                 el = kv.element_size()
+                # Per-block ADVANCE: the tensor's block-dim stride. On
+                # packed cross-layer slabs this spans every co-located
+                # page, so it must never be used as the zero EXTENT.
                 cur_bytes = kv.stride(block_dim) * el
                 assert cur_bytes % 4 == 0
-                kernel_block_el = cur_bytes // 4
-                cur_page_el = kernel_block_el * ratio
+                stride_el = (cur_bytes // 4) * ratio
+                # Zero EXTENT: this layer's own page - the contiguous data
+                # inside one block of this view (dims after block_dim).
+                page_data_bytes = el
+                for d in range(block_dim + 1, kv.ndim):
+                    page_data_bytes *= kv.shape[d]
+                assert page_data_bytes % 4 == 0
+                assert page_data_bytes <= cur_bytes, (
+                    f"{layer_name}: page {page_data_bytes}B exceeds block "
+                    f"stride {cur_bytes}B"
+                )
+                # ratio > 1 treats a logical block as `ratio` CONTIGUOUS
+                # kernel pages; a strided (packed) view separates them.
+                assert ratio == 1 or page_data_bytes == cur_bytes, (
+                    f"{layer_name}: virtual block splitting (ratio {ratio}) "
+                    "over a block-strided view is not supported"
+                )
+                cur_page_el = (page_data_bytes // 4) * ratio
 
                 block_stride_bytes = cur_bytes
                 outer_dims = [
@@ -174,6 +204,7 @@ class KVBlockZeroer:
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
                     seg_addrs.append(dp + off_bytes)
+                    seg_strides.append(stride_el)
                     seg_page_sizes.append(cur_page_el)
 
         if not seg_addrs:
@@ -187,6 +218,7 @@ class KVBlockZeroer:
         )
         self._meta = (
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+            torch.tensor(seg_strides, dtype=torch.int64, device=self.device),
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
             max_page_size_el // blk_size,
             blk_size,
@@ -202,12 +234,20 @@ class KVBlockZeroer:
             return
         if not block_ids or self._meta is None:
             return
-        seg_addrs, seg_page_sizes, max_chunks, blk_size, n_segs = self._meta
+        (
+            seg_addrs,
+            seg_strides,
+            seg_page_sizes,
+            max_chunks,
+            blk_size,
+            n_segs,
+        ) = self._meta
         n_blocks = len(block_ids)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks * n_segs * max_chunks,)
         _zero_kv_blocks_kernel[grid](
             seg_addrs,
+            seg_strides,
             seg_page_sizes,
             idx,
             n_blocks,

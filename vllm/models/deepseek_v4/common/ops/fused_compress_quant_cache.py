@@ -458,6 +458,12 @@ def compress_norm_rope_store_triton(
         )
         return
 
+    # bf16 plain rows (A100 bf16 main-KV path): elements not bytes, no
+    # scale plane; the kernel's STORE_BF16 branch stores the full row.
+    store_bf16 = head_dim == 512 and kv_cache.dtype == torch.bfloat16
+    if store_bf16:
+        token_stride = 512
+
     if head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
@@ -504,6 +510,9 @@ def compress_norm_rope_store_triton(
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         USE_SOFTWARE_E4M3=_use_software_e4m3_store(kv_cache),
         num_warps=num_warps,
+        # store_bf16 implies head_dim == 512, i.e. the sparse_attn kernel -
+        # the only one declaring the flag.
+        **({"STORE_BF16": True} if store_bf16 else {}),
         **pdl_kwargs,
     )
 
@@ -547,6 +556,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
     USE_SOFTWARE_E4M3: tl.constexpr,
+    STORE_BF16: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -555,6 +565,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     Cache block layout (``block_size`` tokens):
       [0, bs*576):       token data (448 fp8 + 128 bf16 each)
       [bs*576, +bs*8):   uint8 UE8M0 scales (7 real + 1 pad each)
+
+    STORE_BF16 (the A100 bf16 main-KV path): ``k_cache_ptr`` is a bf16
+    tensor of plain 512-element rows; KV_BLOCK_STRIDE / TOKEN_STRIDE are in
+    ELEMENTS, the quant/scale section is compiled out, and the full
+    post-norm post-RoPE row is stored as bf16 (same rounding point as the
+    fused full-cache bf16 insert).
     """
     token_idx = tl.program_id(0)
 
@@ -637,41 +653,43 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2  # 32
 
-    # FP8 UE8M0 quant: cast fp32 → bf16 → fp32 before quant to match reference.
-    N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
-    N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
-    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
+    if not STORE_BF16:
+        # FP8 UE8M0 quant: cast fp32 → bf16 → fp32 before quant to match
+        # reference.
+        N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
+        N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
+        INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    quant_input = normed.to(tl.bfloat16).to(tl.float32)
-    quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
-    abs_2d = tl.abs(quant_2d)
-    block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
-    block_absmax = tl.maximum(block_absmax, 1e-4)
+        quant_input = normed.to(tl.bfloat16).to(tl.float32)
+        quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+        abs_2d = tl.abs(quant_2d)
+        block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
+        block_absmax = tl.maximum(block_absmax, 1e-4)
 
-    raw_scales = block_absmax * INV_FP8_MAX
-    exponents = tl.ceil(tl.log2(raw_scales))
-    inv_scales = tl.exp2(-exponents)
-    inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
-    x_scaled = quant_2d * inv_scales_col
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    if USE_SOFTWARE_E4M3:
-        x_uint8 = e4m3fn_encode_software(x_clamped)
-    else:
-        x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+        raw_scales = block_absmax * INV_FP8_MAX
+        exponents = tl.ceil(tl.log2(raw_scales))
+        inv_scales = tl.exp2(-exponents)
+        inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+        x_scaled = quant_2d * inv_scales_col
+        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+        if USE_SOFTWARE_E4M3:
+            x_uint8 = e4m3fn_encode_software(x_clamped)
+        else:
+            x_uint8 = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
 
-    nope_mask = block < NOPE_HEAD_DIM
-    tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
+        nope_mask = block < NOPE_HEAD_DIM
+        tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
 
-    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
-    encoded = exponents + 127.0
-    encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
-    tl.store(
-        scale_ptr + scale_idx,
-        encoded.to(tl.uint8),
-        mask=scale_idx < N_NOPE_BLOCKS,
-    )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+        scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+        encoded = exponents + 127.0
+        encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
+        tl.store(
+            scale_ptr + scale_idx,
+            encoded.to(tl.uint8),
+            mask=scale_idx < N_NOPE_BLOCKS,
+        )
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
     # Register-based GPT-J RoPE in fp32.
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
@@ -694,11 +712,16 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)  # [TRITON_BLOCK_SIZE] fp32
 
-    # Store rotated rope portion as bf16 into the cache's bf16 area.
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
-    rope_local = block - NOPE_HEAD_DIM
-    is_rope = (block >= NOPE_HEAD_DIM) & mask
-    tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+    if STORE_BF16:
+        # Full 512-element bf16 row (non-rope pairs pass through the rotation
+        # with cos=1/sin=0, so `result` is the complete post-norm row).
+        tl.store(fp8_ptr + block, result.to(tl.bfloat16), mask=mask)
+    else:
+        # Store rotated rope portion as bf16 into the cache's bf16 area.
+        bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+        rope_local = block - NOPE_HEAD_DIM
+        is_rope = (block >= NOPE_HEAD_DIM) & mask
+        tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
 
 
 # =============================================================================
@@ -822,9 +845,13 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
     USE_SOFTWARE_E4M3: tl.constexpr,
+    STORE_BF16: tl.constexpr = False,
 ):
     """Stage 2: read compressed_kv[512] from scratch buffer, then
-    RMSNorm + FP8 quant (nope) + RoPE + bf16 store
+    RMSNorm + FP8 quant (nope) + RoPE + bf16 store.
+
+    STORE_BF16: plain bf16 rows (elements not bytes, quant compiled out,
+    full post-norm post-RoPE row stored) - see the single-pass kernel.
     """
     token_idx = tl.program_id(0)
     slot_id = tl.load(slot_mapping_ptr + token_idx)
@@ -860,31 +887,33 @@ def _finalize_norm_rope_quant_store_sparse_attn(
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM
     HALF_ROPE: tl.constexpr = ROPE_HEAD_DIM // 2
-    N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
-    N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
-    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    quant_input = normed.to(tl.bfloat16).to(tl.float32)
-    quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
-    block_absmax = tl.maximum(tl.max(tl.abs(quant_2d), axis=1), 1e-4)
-    raw_scales = block_absmax * INV_FP8_MAX
-    exponents = tl.ceil(tl.log2(raw_scales))
-    inv_scales = tl.exp2(-exponents)
-    x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    if USE_SOFTWARE_E4M3:
-        x_uint8_2d = e4m3fn_encode_software(x_clamped)
-    else:
-        x_uint8_2d = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
-    x_uint8 = tl.reshape(x_uint8_2d, (TRITON_BLOCK_SIZE,))
-    tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
+    if not STORE_BF16:
+        N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
+        N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
+        INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
-    encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
-    tl.store(
-        scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
-    )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+        quant_input = normed.to(tl.bfloat16).to(tl.float32)
+        quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+        block_absmax = tl.maximum(tl.max(tl.abs(quant_2d), axis=1), 1e-4)
+        raw_scales = block_absmax * INV_FP8_MAX
+        exponents = tl.ceil(tl.log2(raw_scales))
+        inv_scales = tl.exp2(-exponents)
+        x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+        if USE_SOFTWARE_E4M3:
+            x_uint8_2d = e4m3fn_encode_software(x_clamped)
+        else:
+            x_uint8_2d = x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
+        x_uint8 = tl.reshape(x_uint8_2d, (TRITON_BLOCK_SIZE,))
+        tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
+
+        scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+        encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
+        tl.store(
+            scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
+        )
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
 
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
@@ -900,10 +929,13 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     new_even = even * cos_v - odd * sin_v
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
-    rope_local = block - NOPE_HEAD_DIM
-    is_rope = (block >= NOPE_HEAD_DIM) & mask
-    tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+    if STORE_BF16:
+        tl.store(fp8_ptr + block, result.to(tl.bfloat16), mask=mask)
+    else:
+        bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+        rope_local = block - NOPE_HEAD_DIM
+        is_rope = (block >= NOPE_HEAD_DIM) & mask
+        tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
 
 
 def _launch_two_stage_sparse_attn_compressor(
@@ -931,6 +963,11 @@ def _launch_two_stage_sparse_attn_compressor(
     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
     scratch = compress_scratch[:num_actual]
+    # bf16 plain rows (A100 bf16 main-KV path): elements not bytes, no
+    # scale plane; the finalize kernel's STORE_BF16 branch stores the row.
+    store_bf16 = head_dim == 512 and kv_cache.dtype == torch.bfloat16
+    if store_bf16:
+        token_stride = 512
     _compress_gather_split_sparse_attn[(num_actual * num_splits,)](
         state_cache,
         state_cache.stride(0),
@@ -971,6 +1008,7 @@ def _launch_two_stage_sparse_attn_compressor(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         USE_SOFTWARE_E4M3=_use_software_e4m3_store(kv_cache),
+        **({"STORE_BF16": True} if store_bf16 else {}),
     )
 
 

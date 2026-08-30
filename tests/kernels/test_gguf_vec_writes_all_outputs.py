@@ -37,6 +37,50 @@ QUANTS = [
 ]
 SUPPORTED = {int(t) for t in DEQUANT_TYPES}
 
+# Byte offsets of the fp16 block scales. Arbitrary bytes are not valid test
+# blocks: they frequently encode NaN/Inf scales, for which the direct dot and
+# dequantized reference need not preserve the same finite subset.
+SCALE_OFFSETS = {
+    10: (80, 82),  # Q2_K: d, dmin
+    11: (108,),  # Q3_K: d
+    12: (0, 2),  # Q4_K: d, dmin
+    13: (0, 2),  # Q5_K: d, dmin
+    14: (208,),  # Q6_K: d
+    8: (0,),  # Q8_0: d
+    16: (0,),  # IQ2_XXS: d
+}
+
+
+def _make_finite_blocks(
+    rows: int,
+    cols: int,
+    blk_bytes: int,
+    blk_elems: int,
+    qtype: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    weight = torch.randint(
+        0,
+        256,
+        (rows, cols // blk_elems * blk_bytes),
+        generator=generator,
+        dtype=torch.uint8,
+    )
+    blocks = weight.view(rows, -1, blk_bytes)
+    one = torch.tensor([1.0], dtype=torch.float16).view(torch.uint8)
+    for offset in SCALE_OFFSETS[qtype]:
+        blocks[:, :, offset : offset + 2] = one
+    return weight.cuda()
+
+
+def _dequantize_q8_1(x: torch.Tensor) -> torch.Tensor:
+    """Recover the activation actually consumed by the vector dot kernel."""
+    blocks = ops.ggml_quantize_q8_1(x).view(torch.uint8).reshape(x.shape[0], -1, 36)
+    blocks = blocks[:, : x.shape[1] // 32]
+    scales = blocks[:, :, :2].contiguous().view(torch.float16).squeeze(-1).float()
+    values = blocks[:, :, 4:].view(torch.int8).float()
+    return (values * scales.unsqueeze(-1)).reshape_as(x).float()
+
 
 @pytest.mark.parametrize(("name", "qtype", "blk_bytes", "blk_elems"), QUANTS)
 @pytest.mark.parametrize(
@@ -51,26 +95,18 @@ def test_matches_dequantized_reference(name, qtype, blk_bytes, blk_elems, cols, 
         pytest.skip(f"{cols} is not a whole number of {name} blocks")
 
     generator = torch.Generator(device="cpu").manual_seed(0)
-    weight = torch.randint(
-        0,
-        256,
-        (rows, cols // blk_elems * blk_bytes),
-        generator=generator,
-        dtype=torch.uint8,
-    ).cuda()
+    weight = _make_finite_blocks(rows, cols, blk_bytes, blk_elems, qtype, generator)
     x = torch.randn(1, cols, generator=generator, dtype=torch.bfloat16).cuda()
 
     got = ops.ggml_mul_mat_vec_a8(weight, x, qtype, rows)
-    deq = ops.ggml_dequantize(weight, qtype, rows, cols, torch.bfloat16)
-    want = (deq.to(torch.float32) @ x.to(torch.float32).T).T
+    deq = ops.ggml_dequantize(weight, qtype, rows, cols, torch.float32)
+    want = (deq @ _dequantize_q8_1(x).T).T
 
-    finite = torch.isfinite(want)
-    assert finite.any(), "reference produced no finite values; pick a different seed"
-    # The kernel quantizes the activation to q8_1, so it is deliberately lossy;
-    # this tolerance catches an unwritten or grossly wrong element, not rounding.
-    torch.testing.assert_close(
-        got.to(torch.float32)[finite], want[finite], atol=2e-1, rtol=2e-1
-    )
+    assert torch.isfinite(want).all()
+    # The direct kernel accumulates decoded values in a different order and
+    # returns bf16. This tolerance covers that rounding while still rejecting
+    # an unwritten or grossly wrong output element.
+    torch.testing.assert_close(got.float(), want, atol=8, rtol=5e-2)
 
 
 def test_iq2_xxs_moe_ep_matches_route_major_with_nonlocal_experts():

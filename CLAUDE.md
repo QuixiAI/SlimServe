@@ -90,7 +90,20 @@ behavior:
   nearby edits and build on them rather than reverting unrelated work.
 - Always merge. When a pull, rebase, or merge collides with local dirty state,
   semantically merge both sides — never resolve a conflict by picking one
-  side wholesale. Parallel implementations of the same file must be unified
+  side wholesale.
+- EXCEPTION, and it overrides "always merge": if the remote history was
+  rewritten, do NOT merge. `git fetch && git reset --hard origin/<branch>`,
+  then re-apply only your own unique work on top. Merging a stale clone into
+  rewritten history restores everything the rewrite removed -- this happened
+  on 2026-08-30, when a merge resurrected a purged credential and 19,427
+  superseded commits. A merge that reintroduces deleted paths is never the
+  correct resolution, however clean the semantic merge looks.
+- Deployment configuration NEVER goes in the repo: no systemd units, env
+  files, logrotate or tmpfiles entries, no host paths, usernames, ports or
+  keys. `deploy/` is git-ignored and a CI guard
+  (`.github/workflows/no-deploy-config.yml`) fails the build if it or a
+  literal credential returns. Operators keep those files on their own
+  machines. Parallel implementations of the same file must be unified
   so every platform's validated path keeps working, and the losing copy's
   functional changes must be grafted into the survivor, not discarded.
 - Finish the loop: implement, build, smoke, run the real profile or explain the
@@ -156,3 +169,58 @@ behavior:
 
 - Eric Hartford is the sole author. Do not add co-author or assistance
   trailers, and do not discuss automated assistance in commit messages.
+
+## Serving policy (standing)
+
+- SlimServe serving ALWAYS has automatic prefix caching, automatic tool
+  calling, and thinking enabled, and NEVER uses greedy sampling. These are
+  enforced as registry-level `_SERVING_DEFAULTS` plus explicit per-profile
+  values and a registry test. Prefix caching admits NO opt-out: every
+  platform record states `enable_prefix_caching: true` and the registry
+  test rejects anything else (operator directive 2026-08-30). For the
+  others, a profile may opt out only for a model-level impossibility,
+  stated in a note.
+- Never rely on engine-layer defaults for these: vLLM silently defaults
+  prefix caching OFF for hybrid (mamba/GDN) models, which shipped a
+  profile with a 0.0% hit rate and full-history re-prefill on every turn.
+  Production load is dominated by agentic traffic - long shared prefixes
+  extended turn over turn - where prefix caching approaches a 100% hit
+  rate and its absence is catastrophic, not marginal.
+- Benchmarks and diagnostics sample at the model's recommended settings
+  (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
+  never temperature 0, and never disable thinking to save time.
+- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 and a100
+  profiles - enforced by test: quantized KV was implicated in multi-turn
+  tracking errors on Qwen3.8-Flash-Next and root-caused on rtx3090
+  (operator 2026-08-29). The DSV4/A100 bf16 sparse-MLA page path is the
+  NFP8=0 instantiation of the merged decode plus the fused bf16 insert,
+  bf16 compressor stores, and bf16 prefill gather - design and gates in
+  csrc/quixicore/dsv4_bf16_kv_design.md (kernel parity 2.5e-04, boot with
+  TQ draft + full graphs, deep-context recall). Still owed there: the
+  fp8-vs-bf16 exact-token throughput A/B and KV pool re-sizing (bf16 rows
+  are 1024B vs fp8's 584B). bf16 main KV is ASPIRATIONAL on the remaining
+  platforms: they keep their qualified configs (Metal fp8_ds_mla and the
+  qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
+  requalification pass. Draft-model KV (DSpark TurboQuant k8v4) is exempt
+  everywhere: rejection sampling verifies every draft token against the
+  target, so draft KV precision can only affect acceptance rate and speed,
+  never output content.
+- Every profile serves its model's DEFAULT context unless genuinely
+  impossible on the platform (operator 2026-08-29): GLM-5.2 202752,
+  DSV4-Flash 1M, Qwen3.8-Flash-Next 262144 - as configured in the GGUF
+  or config.json. Do not cap max_model_len to fit the VRAM KV pool;
+  deep-context concurrency comes from the CPU-offloaded KV tier. A
+  max_model_len ABOVE the default (the MI300X GLM records' 1048576) is
+  that platform's explicit, validated extension - not a template.
+- CPU-offloaded KV (the pinned-host-RAM tier, `HostTierConnector`) is the
+  standing goal for ALL non-Metal profiles; Metal instead gets NVMe-backed
+  KV offload later (unified memory makes a host-RAM tier meaningless
+  there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
+  (2026-08-28, mamba state-geometry fix landed: tail states are the
+  engine's frozen align-mode boundary snapshots) and on all seven A100
+  profiles (2026-08-29 WildChat deep-context sweep; DSV4's packed
+  cross-layer slab registers directly, the GLM records force the packed
+  layout via enable_cross_layers_blocks). The eviction-restore acceptance
+  (marker recall after full GPU-pool eviction) is the standing check for
+  tier changes. MI300X still needs the connector generalized to its
+  layout (issues #17/#18); enable there only with on-box validation.

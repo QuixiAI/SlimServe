@@ -233,7 +233,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             num_spec_decodes = 0
         else:
             spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
+            num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
             if num_spec_decodes == 0:
                 spec_sequence_masks = None
                 spec_sequence_masks_cpu = None
@@ -259,14 +259,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         if spec_sequence_masks is None:
+            # treat_short_extends_as_decodes=False: the decode kernels
+            # (causal_conv1d_update, fused recurrent decode) read the conv and
+            # SSM state slots unconditionally, so a request that has not
+            # finished its prefill (a 1-token prompt, or a 1-token tail chunk)
+            # must take the prefill path, whose kernels zero uninitialized
+            # state via has_initial_state.
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
+                split_decodes_and_prefills(
+                    m, decode_threshold=1, treat_short_extends_as_decodes=False
+                )
             )
             num_spec_decode_tokens = 0
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            # contiguous(): with spec decode enabled the mamba block table is
+            # [batch, num_spec + 1], so this column view is strided; the Metal
+            # GDN kernels (and the metadata contract) require a dense [batch]
+            # tensor. A zero-draft decode batch (dynamic SD, K=0) reaches
+            # this branch in a spec-enabled engine. No-spec engines have a
+            # [batch, 1] table, so this is a no-op there.
+            non_spec_state_indices_tensor = block_table_tensor[:, 0].contiguous()
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
@@ -278,16 +292,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             # Use CPU tensors to avoid CPU-GPU sync
             non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
+            decode_rows = non_spec_query_lens_cpu == 1
+            if m.is_prefilling is not None:
+                # A 1-token row still mid-prefill (fresh 1-token prompt or a
+                # 1-token tail chunk) must count as prefill: the decode
+                # kernels read state slots the request has not written yet.
+                # The batch reorder already places such rows behind the true
+                # decodes, so the contiguous split stays valid. is_prefilling
+                # may be unpadded; padded rows are never prefilling.
+                isp = m.is_prefilling
+                n_rows = query_lens_cpu.size(0)
+                if isp.size(0) < n_rows:
+                    isp = torch.cat([isp, isp.new_zeros(n_rows - isp.size(0))])
+                decode_rows &= ~isp[:n_rows][~spec_sequence_masks_cpu]
+            num_decodes = decode_rows.sum().item()
             # Exclude zero-length padded sequences from prefill count.
-            num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
+            num_zero_len = int((non_spec_query_lens_cpu == 0).sum().item())
             num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
             num_decode_tokens = num_decodes
             num_prefill_tokens = (
-                non_spec_query_lens_cpu.sum().item() - num_decode_tokens
+                int(non_spec_query_lens_cpu.sum().item()) - num_decode_tokens
             )
             num_spec_decode_tokens = (
-                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
+                int(query_lens_cpu.sum().item())
+                - num_prefill_tokens
+                - num_decode_tokens
             )
 
             # num_decodes and num_spec_decodes are mutually exclusive.
@@ -326,11 +355,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_query_start_loc = None
                 non_spec_query_start_loc_cpu = None
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
+                # Sync-free per-token mask (== repeat_interleave(mask,
+                # query_lens)): tensor-repeats repeat_interleave has a
+                # data-dependent output shape on MPS even with output_size,
+                # draining the queue (65 ms/step measured). Build the token ->
+                # request map with static shapes instead: scatter ones at the
+                # request starts, cumsum, gather the mask.
+                total_tokens = int(query_start_loc_cpu[-1].item())
+                seg = torch.zeros(
+                    total_tokens,
+                    dtype=torch.int64,
+                    device=query_start_loc.device,
                 )
+                # scatter_add: duplicate starts (zero-length padded requests)
+                # must accumulate so the segment id skips them, matching
+                # repeat_interleave's zero-repeat semantics; starts at
+                # total_tokens (empty tail) contribute 0 at a clamped index.
+                starts = query_start_loc[1:-1].to(torch.long)
+                seg.scatter_add_(
+                    0,
+                    starts.clamp_max(max(total_tokens - 1, 0)),
+                    (starts < total_tokens).to(torch.int64),
+                )
+                token_req = seg.cumsum(0)
+                spec_token_masks = spec_sequence_masks.index_select(0, token_req)
                 index = torch.argsort(spec_token_masks, stable=True)
                 num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
                 non_spec_token_indx = index[:num_non_spec_tokens]
@@ -340,9 +388,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_indices_tensor = block_table_tensor.index_select(
                     0, spec_rows
                 )[:, : self.num_spec + 1]
+                # contiguous(): the column view of the index_select result is
+                # strided; the Metal GDN kernels require dense [rows].
                 non_spec_state_indices_tensor = block_table_tensor.index_select(
                     0, non_spec_rows
-                )[:, 0]
+                )[:, 0].contiguous()
 
                 spec_query_start_loc = torch.zeros(
                     num_spec_decodes + 1,
@@ -403,9 +453,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
                 prefill_state_indices = non_spec_state_indices_tensor[num_decodes:]
             else:
-                prefill_query_start_loc = non_spec_query_start_loc
-                prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu
-                prefill_state_indices = non_spec_state_indices_tensor
+                prefill_query_start_loc = non_spec_query_start_loc  # type: ignore[assignment]
+                prefill_query_start_loc_cpu = non_spec_query_start_loc_cpu  # type: ignore[assignment]
+                prefill_state_indices = non_spec_state_indices_tensor  # type: ignore[assignment]
 
             if self.gdn_prefill_backend == "cutedsl":
                 from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
@@ -448,7 +498,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 assert non_spec_query_start_loc_cpu is not None
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
                 compute_causal_conv1d_metadata(
-                    non_spec_query_start_loc_cpu,
+                    non_spec_query_start_loc_cpu,  # type: ignore[arg-type]
                     device=query_start_loc.device,
                 )
             )
@@ -479,7 +529,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ):
             assert spec_sequence_masks is not None
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(
-                spec_state_indices_tensor, non_blocking=True
+                spec_state_indices_tensor,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
             spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
@@ -504,14 +555,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx = self.spec_token_indx[: spec_token_indx.size(0)]
 
             self.spec_query_start_loc[: num_spec_decodes + 1].copy_(
-                spec_query_start_loc, non_blocking=True
+                spec_query_start_loc,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             spec_num_query_tokens = spec_query_start_loc[-1]  # type: ignore[index]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
 
             self.num_accepted_tokens[:num_spec_decodes].copy_(
-                num_accepted_tokens, non_blocking=True
+                num_accepted_tokens,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)
@@ -523,7 +576,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_decodes <= self.decode_cudagraph_max_bs
         ):
             self.non_spec_state_indices_tensor[:num_decodes].copy_(
-                non_spec_state_indices_tensor, non_blocking=True
+                non_spec_state_indices_tensor,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
@@ -531,7 +585,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
-                non_spec_query_start_loc, non_blocking=True
+                non_spec_query_start_loc,  # type: ignore[arg-type]
+                non_blocking=True,
             )
             non_spec_num_query_tokens = non_spec_query_start_loc[-1]  # type: ignore[index]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
@@ -564,6 +619,58 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
         return attn_metadata
+
+    def steady_decode_update(
+        self,
+        metadata: "GDNAttentionMetadata",
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+    ) -> "GDNAttentionMetadata":
+        """Refresh only the copied tensor fields for a steady uniform
+        all-spec decode step with an unchanged shape signature.
+
+        Eligibility (enforced by MambaHybridAttnMetadata.steady_signature +
+        the generic steady gate): every request is a spec-decode row with
+        the same draft count and no prefills — the branch of build() that
+        produces exactly two copied device tensors. Everything else in the
+        cached metadata is a shape constant, a view over a persistent
+        buffer the runner refreshes in place (query_start_loc, seq_lens),
+        or content-constant at steady (spec_sequence_masks all-true,
+        spec_token_indx arange). spec_state_indices_tensor is re-copied
+        from the live block table so a same-shape batch-composition swap
+        can never serve stale state slots.
+        """
+        cm = common_attn_metadata
+        n = metadata.num_spec_decodes
+        assert n == cm.num_reqs, (
+            f"steady GDN update expects all-spec ({n} != {cm.num_reqs})"
+        )
+        block_table_tensor = mamba_get_block_table_tensor(
+            cm.block_table_tensor,
+            cm.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        assert metadata.spec_state_indices_tensor is not None
+        metadata.spec_state_indices_tensor.copy_(
+            block_table_tensor[:n, : self.num_spec + 1]
+        )
+        if num_accepted_tokens is not None:
+            assert metadata.num_accepted_tokens is not None
+            metadata.num_accepted_tokens.copy_(num_accepted_tokens[:n])
+        # The per-step derived-tensor memo (qwen_gdn_linear_attn /
+        # muse_q38_metal) holds a COPY of spec column 0 (conv_slots), which
+        # the in-place refreshes above cannot reach. Drop it so the first
+        # GDN layer of this step rebuilds it — the memo's scope is one
+        # step across the 48 layers, not the metadata object's lifetime.
+        metadata._mps_spec_cache = None  # type: ignore[attr-defined]
+        # Same lifetime rule for the fused GDN step's spec plans: they bake
+        # copied slot ids and accepted counts, so the verify kernel must
+        # rebuild them from the refreshed tensors above. (The fused decode
+        # plan needs no invalidation here: this path is all-spec.)
+        metadata._mps_fused_spec_plans = None  # type: ignore[attr-defined]
+        return metadata
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata

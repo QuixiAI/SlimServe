@@ -104,6 +104,7 @@ class Quant:
     files: list[dict[str, Any]]
     min_gpus: dict[str, int]
     min_memory_bytes: dict[str, int]
+    min_host_ram_bytes: dict[str, int]
     assembly: dict[str, Any] | None
 
     def requirement(self, platform: str) -> int | None:
@@ -112,12 +113,26 @@ class Quant:
             return self.min_memory_bytes.get(platform)
         return self.min_gpus.get(platform)
 
-    def allowed_on(self, platform: str, gpus: int, memory_bytes: int = 0) -> bool:
+    def allowed_on(
+        self,
+        platform: str,
+        gpus: int,
+        memory_bytes: int = 0,
+        host_ram_bytes: int = 0,
+    ) -> bool:
         minimum = self.requirement(platform)
         if minimum is None:
             return False
         have = memory_bytes if platform_gate(platform) == "memory" else gpus
-        return have >= minimum
+        if have < minimum:
+            return False
+        # Host-offload profiles (e.g. a pinned PLE table per rank) need
+        # system RAM the GPU gate cannot see. Only enforced when the caller
+        # provides a detected figure; 0 means unknown, not zero RAM.
+        ram_minimum = self.min_host_ram_bytes.get(platform)
+        return not (
+            ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum
+        )
 
 
 @dataclass(frozen=True)
@@ -138,6 +153,13 @@ class Plan:
     speculative_overrides: dict[str, Any]
     chat_template_kwargs: dict[str, Any]
     notes: list[str] = field(default_factory=list)
+    # Variant-level drafter when platforms diverge; falls back to the
+    # source-level speculator.
+    variant_speculator: dict[str, Any] | None = None
+
+    @property
+    def speculator(self) -> dict[str, Any] | None:
+        return self.variant_speculator or self.source.get("speculator")
 
     @property
     def model_dir(self) -> Path:
@@ -177,6 +199,7 @@ def _quant(source: dict[str, Any], name: str) -> Quant:
         files=raw["files"],
         min_gpus=raw["min_gpus"],
         min_memory_bytes=raw.get("min_memory_bytes") or {},
+        min_host_ram_bytes=raw.get("min_host_ram_bytes") or {},
         assembly=raw.get("assembly"),
     )
 
@@ -210,7 +233,12 @@ def variant(profile_id: str, platform: str) -> dict[str, Any]:
     return record
 
 
-def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Quant]:
+def quants_for(
+    profile_id: str,
+    platform: str,
+    memory_bytes: int = 0,
+    host_ram_bytes: int = 0,
+) -> list[Quant]:
     """Every quant this profile can legally serve on this platform."""
     profile = describe(profile_id)
     source = _registry()["sources"][profile["source"]]
@@ -218,7 +246,7 @@ def quants_for(profile_id: str, platform: str, memory_bytes: int = 0) -> list[Qu
     return [
         quant
         for quant in (_quant(source, name) for name in source["quants"])
-        if quant.allowed_on(platform, gpus, memory_bytes)
+        if quant.allowed_on(platform, gpus, memory_bytes, host_ram_bytes)
     ]
 
 
@@ -235,15 +263,43 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
         "notes": list(record.get("notes") or []),
         "default_quant": record["default_quant"],
         "speculative_overrides": dict(record.get("speculative_overrides") or {}),
+        # A variant may carry its own drafter when platforms diverge (e.g.
+        # qwen38-nvfp4-1: the MI300X variant reuses the checkpoint's MTP
+        # head, the Metal variant serves the measured DFlash2 drafter).
+        "speculator": record.get("speculator"),
     }
 
 
 # Serving behavior every profile gets unless it overrides the key itself.
+#
+# STANDING POLICY (2026-08-28): SlimServe serving ALWAYS has automatic
+# prefix caching, automatic tool calling, and thinking enabled, and NEVER
+# uses greedy sampling. Prefix caching admits NO opt-out: every platform
+# record states enable_prefix_caching true and the registry test rejects
+# anything else. For the other keys a profile may override only for a
+# model-level impossibility, with a note naming the reason.
+# Do not rely on engine defaults for any of these:
+# vLLM silently defaults prefix caching OFF for hybrid (mamba/GDN) models,
+# which shipped qwen38fn-fp8-8 with a 0.0% cache hit rate and full-history
+# re-prefill on every chat turn. Benchmarks and diagnostics use the model's
+# recommended sampling (temperature 1.0 / top_p 0.95 / top_k 20, seeded for
+# reproducibility), never temperature 0.
+#
+# Main KV is ALWAYS bf16 (kv_cache_dtype auto) on rtx3090 profiles
+# (operator 2026-08-29; quantized KV was implicated in multi-turn
+# tracking errors on Qwen3.8-Flash-Next). bf16 main KV is aspirational
+# on other platforms: they keep their qualified configs until an on-box
+# requalification pass. Draft-model KV (DSpark TurboQuant) is exempt
+# everywhere: rejection sampling verifies drafts against the target, so
+# draft precision affects speed, never output content. Enforced by
+# test_no_profile_quantizes_main_kv.
+#
 # "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
 # GLM/Qwen one; templates ignore the name they do not use.
 _SERVING_DEFAULTS: dict[str, Any] = {
     "enable_auto_tool_choice": True,
     "default_chat_template_kwargs": {"thinking": True, "enable_thinking": True},
+    "enable_prefix_caching": True,
 }
 
 
@@ -253,6 +309,7 @@ def resolve(
     gpus: int,
     quant: str | None,
     memory_bytes: int = 0,
+    host_ram_bytes: int = 0,
 ) -> Plan:
     """Turn a request into a Plan, or explain why it is not legal.
 
@@ -282,6 +339,13 @@ def resolve(
             f"available: {', '.join(source['quants'])}"
         )
     chosen = _quant(source, name)
+    ram_minimum = chosen.min_host_ram_bytes.get(platform)
+    if ram_minimum is not None and host_ram_bytes and host_ram_bytes < ram_minimum:
+        raise ProfileError(
+            f"{chosen.title} pins host-offloaded tables in system RAM and "
+            f"needs at least {human_bytes(ram_minimum)}; this machine has "
+            f"{human_bytes(host_ram_bytes)}"
+        )
     if not chosen.allowed_on(platform, needed, memory_bytes):
         minimum = chosen.requirement(platform)
         if minimum is None:
@@ -339,6 +403,7 @@ def resolve(
         speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
+        variant_speculator=merged["speculator"],
     )
 
 
@@ -390,7 +455,7 @@ def files_for(plan: Plan) -> list[dict[str, Any]]:
                 "role": "shared",
             }
         )
-    spec = plan.source.get("speculator") if plan.speculative else None
+    spec = plan.speculator if plan.speculative else None
     if spec and (entry := spec.get("file")):
         wanted.append(
             {

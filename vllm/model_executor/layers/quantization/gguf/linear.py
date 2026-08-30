@@ -193,6 +193,38 @@ def _mmvq_batch_limit(rows: int, qweight_type: int) -> int:
     return 16
 
 
+_ROCM_IMATRIX_MMVQ_MAX_BATCH = {
+    # Real Qwen3.8 Q2_K_XL weights on MI300X, BF16 activations. At M=32 these
+    # compact-weight kernels are 1.1-1.8x faster than dynamically dequantizing
+    # to BF16 and then running GEMM. IQ4_XS is a narrower 1.1-1.2x win, but is
+    # still consistently ahead for both gate/up and down shapes.
+    WeightType.IQ1_S: 32,
+    WeightType.IQ1_M: 32,
+    WeightType.IQ2_XXS: 32,
+    WeightType.IQ2_S: 32,
+    WeightType.IQ3_XXS: 32,
+    WeightType.IQ4_XS: 32,
+    # IQ2_XS crosses near M=16. IQ3_S's scalar-heavy decoder crosses before
+    # M=16 and is 2.4-4.5x slower than dequant+dense there, so keep it narrow.
+    WeightType.IQ2_XS: 16,
+    WeightType.IQ3_S: 8,
+}
+
+
+def _imatrix_mmvq_batch_limit(rows: int, qweight_type: int) -> int:
+    """Measured compact-vector/dequant crossover for importance quants."""
+    override = os.environ.get("VLLM_GGUF_MMVQ_MAX_BATCH")
+    if override:
+        return int(override)
+    if current_platform.is_rocm():
+        measured = _ROCM_IMATRIX_MMVQ_MAX_BATCH.get(WeightType(qweight_type))
+        if measured is not None:
+            return measured
+    # Preserve the established CUDA/Metal routing for formats without a
+    # platform measurement. Output width approximates vector-kernel occupancy.
+    return 8 if rows > 5120 else 16
+
+
 _SM_QUANT_TYPES = (
     WeightType.Q4_0,
     WeightType.Q8_0,
@@ -219,7 +251,7 @@ def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
+        mmvq_safe = _imatrix_mmvq_batch_limit(qweight.shape[0], qweight_type)
     else:
         mmvq_safe = _mmvq_batch_limit(qweight.shape[0], qweight_type)
     if x.shape[0] == 0:
