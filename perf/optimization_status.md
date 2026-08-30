@@ -17598,3 +17598,18 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   max 139.4K (raw: ~/.local/scratch/a100-sweep/resident-final-recall.json).
   The DP2 profile is serving-healthy under the mitigation; the resident
   stays up on :8000.
+## 2026-08-30 - Qwen3.8 default thinking budget: flat 2000 on every variant
+
+- Operator directive: all six Qwen3.8 variant records (qwen38-nvfp4-1
+  mi300x/metal, qwen38-nvfp4-1-tq metal, qwen38-q2kxl-1 metal/mi300x,
+  qwen38fn-fp8-8 rtx3090) now default thinking_token_budget to a flat
+  2000, replacing the rtx3090-only effort map from earlier today. No
+  other model's profile carries a budget (verified by full-registry
+  scan). Per-request override and -1 unlimited opt-out unchanged.
+- Live validation on rtx3090 prod: a default long-thinking request
+  (xhigh effort) nudged at 1,700 tokens and closed at 1,723 total
+  (1,700 charged + 23 uncharged nudge) with a complete answer; an
+  explicit thinking_token_budget=50 capped at 43 charged; -1 remains
+  unlimited. Metal/MI300X records take effect on those boxes' next
+  boots (config-only; the V2 enforcement machine is platform-neutral
+  and its suite runs on MPS).
