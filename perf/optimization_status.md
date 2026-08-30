@@ -17776,3 +17776,17 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   (marker recall after full GPU-pool eviction with re-churn between
   probes, per issue #18), to be run against the dsv4-q4ktail-8 resident
   with VLLM_KV_TIER_VERIFY=1.
+
+### glm52-q2k-8 bf16@202752 sweep leg: PASS
+- First TP8 GLM boot of the campaign: model-default 202752 context resolves
+  from the patched GGUF, bf16 KV, GPU pool 313,728 tokens (1.55x one
+  full-default request), packed slab 102/102 layers, tier arena 8,474
+  slots x 6,081,792 B (48 GiB/rank) with scheduler and workers agreed.
+- WildChat c8 deep-context leg: 0 errors, 8/8 recall, all 8 sessions ran
+  the full 1.25h wall, max_ctx 55,252 / median 49,448. Text and image
+  canaries pass under load with thinking active (vision-profile rule).
+- VLLM_KV_TIER_VERIFY=1 was armed but UNEXERCISED: the 313K pool never
+  evicted a live session at this depth, so zero restores occurred. The
+  SHA round-trip is being exercised deliberately by
+  benchmarks/benchmark_kv_tier_eviction.py against a kept TP8 server
+  (results under perf/results/2026-08-30/kvtier-acceptance/).
