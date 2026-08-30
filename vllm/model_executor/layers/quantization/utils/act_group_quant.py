@@ -74,11 +74,33 @@ def _wide_act_mul_fp8_group_quant_kernel(
     tl.store(s_ptr + rm[:, None] * ss_m + rg[None, :] * ss_n, scale, mask=smask)
 
 
-# Timing is flat across (BLOCK_M, GROUPS) once the tile is wide enough, so these
-# are fixed rather than autotuned -- autotune benchmarks at first call, which is
-# not safe under CUDA graph capture.
-_BLOCK_M = 8
+# Rows per program, by batch width. Measured on MI300X (gfx942) against the
+# real Qwen3.8 MLP width, graph-timed, us per call:
+#
+#     M       aiter   BM2G8   BM4G8   BM8G8
+#     1        2.38    2.23    2.26    3.50
+#     8        2.53    2.33    2.34    3.52
+#     32       4.75    2.41    2.39    3.71
+#     64       7.70    3.07    3.04    4.00
+#     128     14.27    4.37    4.14    4.41
+#     512     57.71   15.37   13.70   14.45
+#     2048   251.07   55.66   53.24   51.77
+#
+# A fixed BLOCK_M=8 is the WORST config below M=64 -- 3.5us against aiter's
+# 2.4us, a ~40% regression on exactly the single-stream decode path -- because
+# one program per 8 rows leaves a 304-CU card with a handful of workgroups.
+# It only earns its keep from about M=1024. Selection is a pure function of M,
+# resolved before launch, so it stays safe under CUDA graph capture; autotune
+# would not, because it benchmarks at first call.
 _GROUPS = 8
+
+
+def _block_m(m: int) -> int:
+    if m < 64:
+        return 2
+    if m < 1024:
+        return 4
+    return 8
 
 
 def wide_act_mul_fp8_group_quant(
@@ -96,7 +118,8 @@ def wide_act_mul_fp8_group_quant(
     s = torch.empty(
         (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
     )
-    grid = (triton.cdiv(M, _BLOCK_M), triton.cdiv(N, group_size * _GROUPS))
+    block_m = _block_m(M)
+    grid = (triton.cdiv(M, block_m), triton.cdiv(N, group_size * _GROUPS))
     _wide_act_mul_fp8_group_quant_kernel[grid](
         x,
         y,
@@ -106,9 +129,17 @@ def wide_act_mul_fp8_group_quant(
         *x.stride(),
         *y.stride(),
         *s.stride(),
-        BLOCK_M=_BLOCK_M,
+        BLOCK_M=block_m,
         GROUPS=_GROUPS,
         QB=group_size,
+        # 240.0 for e4m3fnuz, matching aiter's kernel exactly -- this op
+        # REPLACES aiter's, so keeping its constant keeps the swap a pure
+        # performance change with bit-identical output, which is testable.
+        # Note the divergence: _silu_mul_per_token_group_quant_fp8_colmajor
+        # in fp8_utils.py deliberately clamps fnuz to 224.0, because 240.0
+        # "will cause accuracy issue on dynamic quantization models". That
+        # path is not this one, and moving to 224.0 here would be a numerics
+        # change that needs an accuracy run behind it, not a drive-by edit.
         DTYPE_MAX=torch.finfo(dtype_quant).max,
     )
     return y, s
