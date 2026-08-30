@@ -102,7 +102,11 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
                     "codename, exactly?"
                 )
                 probe = True
-                max_tokens = 96
+                # Thinking is always on (serving policy): the model spends
+                # tokens reasoning before content, and a 96-token cap starved
+                # probes into recall_ok=False with zero content emitted.
+                # Budget must cover think + answer.
+                max_tokens = 512
             else:
                 user_msg = (
                     make_paste(pastes, rng, args.paste_chars)
@@ -237,6 +241,11 @@ async def main():
     ])
     wall = time.time() - t0
 
+    # Persist raw records immediately: a bug in the summary code below must
+    # never lose the run.
+    with open(args.out, "w") as f:
+        json.dump({"summary": None, "wall_s": wall, "records": records}, f, indent=1)
+
     ok = [r for r in records if "prompt_tokens" in r and r.get("completion_tokens")]
     finals = [r for r in records if r.get("final")]
     errs = [r for r in records if "error" in r]
@@ -270,14 +279,14 @@ async def main():
         "by_context": {
             b: {
                 "n": len(rs),
-                "ttft_p50_s": statistics.median(
-                    [r["ttft_s"] for r in rs if r["ttft_s"]]) if rs else None,
-                "ttft_p90_s": sorted(
-                    [r["ttft_s"] for r in rs if r["ttft_s"]]
-                )[max(0, int(0.9 * len(rs)) - 1)] if rs else None,
+                # ttft can be None for turns that streamed no delta before
+                # usage; percentile over the ttfts that exist, guarded empty.
+                "ttft_p50_s": statistics.median(ts) if ts else None,
+                "ttft_p90_s": ts[max(0, int(0.9 * len(ts)) - 1)] if ts else None,
                 "e2e_p50_s": statistics.median([r["e2e_s"] for r in rs]),
             }
             for b, rs in sorted(by_bucket.items())
+            for ts in [sorted(r["ttft_s"] for r in rs if r["ttft_s"])]
         },
         "error_kinds": {},
     }
