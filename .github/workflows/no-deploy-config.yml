@@ -1,0 +1,52 @@
+name: no-deployment-config
+
+# Deployment configuration is machine-specific and has already shipped a
+# live credential once. Client-side hooks do not stop this: they are not
+# installed everywhere and `git commit --no-verify` skips them. This runs
+# on the server, on every push and pull request, and cannot be bypassed
+# from a workstation.
+on:
+  push:
+  pull_request:
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject deployment configuration in the tree
+        run: |
+          if git ls-files --error-unmatch deploy/ >/dev/null 2>&1; then
+            echo "::error::deploy/ is tracked. Deployment configuration is"
+            echo "::error::machine-specific and must stay out of the repo."
+            echo "::error::If a merge reintroduced it, remove it rather than"
+            echo "::error::resolving toward the side that restores it."
+            git ls-files deploy/
+            exit 1
+          fi
+          echo "deploy/ is not tracked."
+
+      - name: Reject committed environment files
+        run: |
+          hits=$(git ls-files | grep -E '(^|/)\.env$|(^|/)[^/]*\.env$|(^|/)env$' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::environment files are tracked:"; echo "$hits"; exit 1
+          fi
+          echo "No tracked environment files."
+
+      - name: Reject assigned secret-shaped variables
+        run: |
+          # Credential-shaped names assigned a literal, either env-file
+          # style (KEY=value) or as a quoted string. Deliberately narrow:
+          # a bare *_TOKEN is a core domain word in this codebase, so it is
+          # excluded to keep the check at zero false positives -- a guard
+          # that cries wolf gets disabled, and then it protects nothing.
+          PAT='(API_KEY|APIKEY|_SECRET|_PASSWORD|ACCESS_TOKEN|AUTH_TOKEN|BEARER_TOKEN|PRIVATE_KEY)(=[A-Za-z0-9_./+-]{6,}|[[:space:]]*=[[:space:]]*["'"'"'][A-Za-z0-9_./+-]{6,}["'"'"'])'
+          EXC='(CHANGE_ME|REPLACE_ME|PLACEHOLDER|YOUR_|EXAMPLE|DUMMY|TEST_|FAKE_)'
+          if git grep -nIE "$PAT" -- . ':!*.lock' ':!.github/workflows/*' | grep -viE "$EXC"; then
+            echo "::error::a credential-shaped variable is assigned a literal value."
+            echo "::error::Use a placeholder and load the real value at runtime."
+            exit 1
+          fi
+          echo "No credential-shaped literal assignments."

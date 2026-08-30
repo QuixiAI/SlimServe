@@ -90,7 +90,20 @@ behavior:
   nearby edits and build on them rather than reverting unrelated work.
 - Always merge. When a pull, rebase, or merge collides with local dirty state,
   semantically merge both sides — never resolve a conflict by picking one
-  side wholesale. Parallel implementations of the same file must be unified
+  side wholesale.
+- EXCEPTION, and it overrides "always merge": if the remote history was
+  rewritten, do NOT merge. `git fetch && git reset --hard origin/<branch>`,
+  then re-apply only your own unique work on top. Merging a stale clone into
+  rewritten history restores everything the rewrite removed -- this happened
+  on 2026-08-30, when a merge resurrected a purged credential and 19,427
+  superseded commits. A merge that reintroduces deleted paths is never the
+  correct resolution, however clean the semantic merge looks.
+- Deployment configuration NEVER goes in the repo: no systemd units, env
+  files, logrotate or tmpfiles entries, no host paths, usernames, ports or
+  keys. `deploy/` is git-ignored and a CI guard
+  (`.github/workflows/no-deploy-config.yml`) fails the build if it or a
+  literal credential returns. Operators keep those files on their own
+  machines. Parallel implementations of the same file must be unified
   so every platform's validated path keeps working, and the losing copy's
   functional changes must be grafted into the survivor, not discarded.
 - Finish the loop: implement, build, smoke, run the real profile or explain the
