@@ -245,6 +245,23 @@ class FixFunctionalizationPass(VllmInductorPass):
         )
         self.nodes_to_remove.clear()
 
+        # Any auto_functionalized node left here will kill compilation later
+        # with inductor's bare "auto_functionalized was not removed" assert,
+        # which does not name the op. Name it now so the fix is a one-line
+        # addition to the if-elif chain above instead of an excavation.
+        leftover = [
+            node.args[0]
+            for node in graph.nodes
+            if is_func(node, auto_functionalized)
+        ]
+        if leftover:
+            logger.warning(
+                "fix_functionalization left %d auto_functionalized node(s) "
+                "unhandled; inductor will fail on them: %s",
+                len(leftover),
+                sorted({str(t) for t in leftover}),
+            )
+
     def _remove(self, node_or_nodes: torch.fx.Node | Iterable[torch.fx.Node]) -> None:
         """
         Stage a node (or nodes) for removal at the end of the pass.
