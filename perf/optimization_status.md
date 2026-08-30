@@ -17758,3 +17758,21 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   KVCacheTensor.block_stride (authoritative, survives the scheduler
   deepcopy) and only falls back to recomputing from group specs for
   non-packed layouts. Validated on reboot: both roles log 15339 slots.
+
+### glm52-q2k-4 fp8@131072 sweep leg: PASS (stride fix validated under churn)
+- Rerun after the KVCacheTensor.block_stride fix: c8 WildChat deep-context,
+  full 1.25h wall, ZERO errors (first run: 16 errors/8 dead sessions at the
+  ~56-min arena wrap). max_ctx 54,434, median 44,222. Both roles agree on
+  15,339 slots; the arena wrapped repeatedly with no fault.
+- Recall 7/7 determinate probes (~31-39K ctx). One probe indeterminate, not
+  failed: completion hit exactly the 512-token cap with thinking unfinished
+  (successful probes used 66-227 tokens). Probe budget raised to 1024 in
+  the harness so GLM's thinking cannot starve a probe again.
+- Saturation note: probe TTFTs 725-1030s at c8 - this record is
+  prefill-bound at saturation (2048-token chunks, TP4 fp8). Capacity
+  record, not the throughput record; raw at
+  perf/results/2026-08-29/a100-bf16-kvtier/glm52-q2k-4/.
+- New acceptance tooling: benchmarks/benchmark_kv_tier_eviction.py
+  (marker recall after full GPU-pool eviction with re-churn between
+  probes, per issue #18), to be run against the dsv4-q4ktail-8 resident
+  with VLLM_KV_TIER_VERIFY=1.
