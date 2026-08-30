@@ -290,9 +290,10 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp2 = resolve("dsv4-q4ktail-2", "a100", 2, "Q4K-tail")
     assert tp2.engine["tensor_parallel_size"] == 2
     assert tp2.engine["block_size"] == 256
-    # Qualified A100 config; bf16 main KV is aspirational here and
-    # flips only with an on-box requalification pass.
-    assert tp2.engine["kv_cache_dtype"] == "fp8"
+    # bf16 main KV (serving policy): the Ampere bf16 sparse-MLA page path
+    # is the NFP8=0 instantiation; see the profile note and
+    # csrc/quixicore/dsv4_bf16_kv_design.md.
+    assert tp2.engine["kv_cache_dtype"] == "auto"
     assert tp2.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -305,9 +306,7 @@ def test_deepseek_v4_a100_tp2_and_tp4_profiles_are_legal():
     tp4 = resolve("dsv4-q4ktail-4", "a100", 4, "MXFP4")
     assert tp4.engine["tensor_parallel_size"] == 4
     assert tp4.engine["block_size"] == 256
-    # Qualified A100 config; bf16 main KV is aspirational here and
-    # flips only with an on-box requalification pass.
-    assert tp4.engine["kv_cache_dtype"] == "fp8"
+    assert tp4.engine["kv_cache_dtype"] == "auto"  # same policy as tp2 above
     assert tp4.env == {
         "VLLM_DSV4_ALIGNED_Q8": "1",
         "VLLM_DSV4_MHC_SCHEDULE": "async",
@@ -1070,7 +1069,7 @@ def test_no_profile_quantizes_main_kv():
     # flips only with an on-box requalification pass.
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry.get("variants", {}).items():
-            if platform != "rtx3090":
+            if platform not in ("rtx3090", "a100"):
                 continue
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
             # 'auto' resolves to the model dtype (bf16 for every supported
@@ -1080,3 +1079,28 @@ def test_no_profile_quantizes_main_kv():
                 f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
                 "main KV must be bf16 (auto) on every rtx3090 profile"
             )
+
+
+def test_every_a100_profile_carries_the_host_kv_tier():
+    """Every A100 variant declares the HostTierConnector config.
+
+    The connector requires the packed cross-layer KV slab: the DSV4
+    records get it via the allocator's is_dsv4 gate, and the GLM records
+    force it with enable_cross_layers_blocks in the connector extra
+    config, because their group specs are not verified to resolve
+    all-uniform on their own.
+    """
+    seen = 0
+    for profile_id, entry in registry._registry()["profiles"].items():
+        record = entry.get("variants", {}).get("a100")
+        if record is None:
+            continue
+        seen += 1
+        transfer = record["engine"]["kv_transfer_config"]
+        assert transfer["kv_connector"] == "HostTierConnector", profile_id
+        assert transfer["kv_role"] == "kv_both", profile_id
+        extra = transfer["kv_connector_extra_config"]
+        assert extra["host_tier_gb_per_rank"] > 0, profile_id
+        if entry["source"] == "glm52-vision":
+            assert extra["enable_cross_layers_blocks"] == "True", profile_id
+    assert seen == 7, "expected all seven A100 variants to be checked"

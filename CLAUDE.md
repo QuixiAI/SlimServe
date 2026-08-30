@@ -189,22 +189,38 @@ behavior:
 - Benchmarks and diagnostics sample at the model's recommended settings
   (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
   never temperature 0, and never disable thinking to save time.
-- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 profiles -
-  enforced by test (operator 2026-08-29): quantized KV was implicated in
-  multi-turn tracking errors on Qwen3.8-Flash-Next and root-caused on this
-  platform. bf16 main KV is ASPIRATIONAL on the other platforms for now:
-  they keep their qualified configs (A100 DSV4 fp8, Metal fp8_ds_mla and
-  the qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
+- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 and a100
+  profiles - enforced by test: quantized KV was implicated in multi-turn
+  tracking errors on Qwen3.8-Flash-Next and root-caused on rtx3090
+  (operator 2026-08-29). The DSV4/A100 bf16 sparse-MLA page path is the
+  NFP8=0 instantiation of the merged decode plus the fused bf16 insert,
+  bf16 compressor stores, and bf16 prefill gather - design and gates in
+  csrc/quixicore/dsv4_bf16_kv_design.md (kernel parity 2.5e-04, boot with
+  TQ draft + full graphs, deep-context recall). Still owed there: the
+  fp8-vs-bf16 exact-token throughput A/B and KV pool re-sizing (bf16 rows
+  are 1024B vs fp8's 584B). bf16 main KV is ASPIRATIONAL on the remaining
+  platforms: they keep their qualified configs (Metal fp8_ds_mla and the
+  qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
   requalification pass. Draft-model KV (DSpark TurboQuant k8v4) is exempt
   everywhere: rejection sampling verifies every draft token against the
   target, so draft KV precision can only affect acceptance rate and speed,
   never output content.
+- Every profile serves its model's DEFAULT context unless genuinely
+  impossible on the platform (operator 2026-08-29): GLM-5.2 202752,
+  DSV4-Flash 1M, Qwen3.8-Flash-Next 262144 - as configured in the GGUF
+  or config.json. Do not cap max_model_len to fit the VRAM KV pool;
+  deep-context concurrency comes from the CPU-offloaded KV tier. A
+  max_model_len ABOVE the default (the MI300X GLM records' 1048576) is
+  that platform's explicit, validated extension - not a template.
 - CPU-offloaded KV (the pinned-host-RAM tier, `HostTierConnector`) is the
   standing goal for ALL non-Metal profiles; Metal instead gets NVMe-backed
   KV offload later (unified memory makes a host-RAM tier meaningless
   there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
   (2026-08-28, mamba state-geometry fix landed: tail states are the
-  engine's frozen align-mode boundary snapshots). MI300X/A100 need the
-  connector generalized to their paged MLA layouts (issues #17/#18);
-  enable per-platform only with on-box validation, never by editing a
-  profile for a machine the connector has not run on.
+  engine's frozen align-mode boundary snapshots) and on all seven A100
+  profiles (2026-08-29 WildChat deep-context sweep; DSV4's packed
+  cross-layer slab registers directly, the GLM records force the packed
+  layout via enable_cross_layers_blocks). The eviction-restore acceptance
+  (marker recall after full GPU-pool eviction) is the standing check for
+  tier changes. MI300X still needs the connector generalized to its
+  layout (issues #17/#18); enable there only with on-box validation.
