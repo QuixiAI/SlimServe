@@ -1298,8 +1298,8 @@
           "default_quant": "Q2_K",
           "engine": {
             "tensor_parallel_size": 4,
-            "max_num_seqs": 64,
-            "max_num_batched_tokens": 16384,
+            "max_num_seqs": 32,
+            "max_num_batched_tokens": 2048,
             "block_size": 64,
             "enable_prefix_caching": true,
             "enable_chunked_prefill": true,
@@ -1317,8 +1317,8 @@
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
             "served_model_name": "GLM-5.2-Vision",
-            "gpu_memory_utilization": 0.92,
-            "kv_cache_dtype": "auto",
+            "gpu_memory_utilization": 0.96,
+            "kv_cache_dtype": "fp8",
             "kv_transfer_config": {
               "kv_connector": "HostTierConnector",
               "kv_role": "kv_both",
@@ -1326,9 +1326,10 @@
                 "host_tier_gb_per_rank": 48,
                 "enable_cross_layers_blocks": "True"
               }
-            }
+            },
+            "max_model_len": 131072
           },
-          "note": "80 GB cards: the MI300X KV byte table does not apply, so size the pool by utilization. Context resolves automatically to the model default (202752, the GGUF's glm-dsa.context_length): serving policy is the model's default context, read from the artifact, with no max_model_len in the record.",
+          "note": "TP4 cannot serve the model-default context (202752), and 131072 cannot be served in bf16 KV: Q2K weights take 65.8 GiB of each 80 GB rank, and bf16 KV at 131072 needs 12.2 GiB/rank on top (~97 KiB/token across the 102 packed layers), which exceeds the card at any utilization. This record therefore carves out of the bf16 main-KV policy: fp8 main KV (~54 KiB/token with the fp8 indexer cache) fits 131072 at gpu_memory_utilization 0.96 with max_num_batched_tokens 2048 (fp8 KV at 131072 measures 6.41 GiB/rank; the leaner prefill chunk buys the last of it). Requalified by the WildChat deep-context sweep's marker-recall probes. Use glm52-q2k-8 for bf16 KV at the model-default context.",
           "notes": [
             "Host KV tier (HostTierConnector, kv_transfer_config above): 48 GiB pinned host RAM per rank, sized for this 787 GiB A100 box. enable_cross_layers_blocks is required: it forces the packed cross-layer slab the connector needs, since the GLM-5.2 group specs are not guaranteed to resolve all-uniform (DSV4 records get the slab via the allocator's is_dsv4 gate). A layout mismatch fails loudly at register time (the connector rejects an allocation that is not a whole number of block strides). The eviction-restore acceptance (marker recall after full GPU-pool eviction, per perf/results/2026-08-28/kv-tier/) is the standing check for tier changes."
           ]

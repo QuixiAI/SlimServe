@@ -965,8 +965,10 @@ def _pool_bytes_per_block(
     `available_memory` into `num_blocks`. Used to compute the effective KV cache
     capacity once `num_gpu_blocks_override` is applied.
     """
-    if len(kv_cache_groups) == 1 and isinstance(
-        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    if (
+        len(kv_cache_groups) == 1
+        and isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+        and not _cross_layers_blocks_opt_in(vllm_config)
     ):
         return kv_cache_groups[0].kv_cache_spec.page_size_bytes
     if _use_packed_kv_cache_config(vllm_config, kv_cache_groups):
@@ -1257,14 +1259,13 @@ def _get_packed_kv_cache_layout(
     return block_stride, layers_by_offset
 
 
-def _use_packed_kv_cache_config(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-) -> bool:
-    is_dsv4 = all(
-        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        for group in kv_cache_groups
-    )
+def _cross_layers_blocks_opt_in(vllm_config: VllmConfig) -> bool:
+    """The operator explicitly requested the packed cross-layer slab via
+    kv_connector_extra_config. This must win over layout special cases that
+    would otherwise allocate per-layer tensors (e.g. a hybrid model whose
+    specs unify into a single UniformTypeKVCacheSpecs group), because tier
+    connectors require every managed layer to share one block-strided
+    backing."""
     kv_transfer_config = vllm_config.kv_transfer_config
     extra_config = (
         kv_transfer_config.kv_connector_extra_config
@@ -1273,10 +1274,22 @@ def _use_packed_kv_cache_config(
     )
     # NOTE: enable_cross_layers_blocks is an experimental API and subject to change with
     # https://github.com/vllm-project/vllm/issues/42082
-    enable_cross_layers = (
+    return (
         str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
     )
-    return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
+
+
+def _use_packed_kv_cache_config(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    is_dsv4 = all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in kv_cache_groups
+    )
+    return is_dsv4 or (
+        _cross_layers_blocks_opt_in(vllm_config) and len(kv_cache_groups) > 1
+    )
 
 
 def _get_kv_cache_config_packed(
@@ -1290,6 +1303,16 @@ def _get_kv_cache_config_packed(
     emitted tensor aliases the same physical backing allocation.
     """
     block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
+    logger.info(
+        "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes",
+        len(kv_cache_groups),
+        [
+            (type(g.kv_cache_spec).__name__, len(g.layer_names))
+            for g in kv_cache_groups
+        ],
+        sum(len(g.layer_names) for g in kv_cache_groups),
+        block_stride,
+    )
 
     num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
@@ -1343,12 +1366,16 @@ def get_kv_cache_config_from_groups(
         num_blocks, kv_cache_tensors = _get_kv_cache_config_packed(
             vllm_config, kv_cache_groups, available_memory
         )
-    elif len(kv_cache_groups) == 1 and isinstance(
-        kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
+    elif (
+        len(kv_cache_groups) == 1
+        and isinstance(kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs)
+        and not _cross_layers_blocks_opt_in(vllm_config)
     ):
         # Special case: all layers have the same type of KV cache but with
         # different hidden sizes. Allocate different amount of memory for each
-        # layer based on its hidden size.
+        # layer based on its hidden size. An explicit cross-layers opt-in
+        # skips this: per-layer tensors would leave a tier connector with no
+        # shared slab to register.
         num_blocks = (
             available_memory // kv_cache_groups[0].kv_cache_spec.page_size_bytes
         )

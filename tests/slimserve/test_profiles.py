@@ -282,7 +282,7 @@ def test_platform_override_replaces_the_mi300x_kv_budget():
     nvidia = resolve("glm52-q2k-4", "a100", 4, "Q2_K")
     assert "kv_cache_memory_bytes" in amd.engine
     assert "kv_cache_memory_bytes" not in nvidia.engine
-    assert nvidia.engine["gpu_memory_utilization"] == 0.92
+    assert nvidia.engine["gpu_memory_utilization"] == 0.95
     assert nvidia.env == {}, "AITER is a ROCm switch"
 
 
@@ -1067,17 +1067,27 @@ def test_no_profile_quantizes_main_kv():
     # this box is where that was root-caused and validated. Other platforms
     # keep their qualified configs; bf16 main KV is aspirational there and
     # flips only with an on-box requalification pass.
+    # glm52-q2k-4/a100 is the sole carve-out (operator-approved 2026-08-30):
+    # 65.8 GiB of Q2K weights per 80 GB rank leave no room for bf16 KV at
+    # 131072 (12.2 GiB/rank), a physical impossibility, so that record
+    # serves fp8 main KV, requalified by the WildChat deep-context sweep's
+    # marker-recall probes. The record's note states the arithmetic.
+    carve_outs = {("glm52-q2k-4", "a100"): {"fp8"}}
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry.get("variants", {}).items():
             if platform not in ("rtx3090", "a100"):
                 continue
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
+            allowed = {"auto", "bfloat16"} | carve_outs.get(
+                (profile_id, platform), set()
+            )
             # 'auto' resolves to the model dtype (bf16 for every supported
             # model); an explicit 'bfloat16' is the same commitment spelled
             # out and equally compliant.
-            assert dtype in {"auto", "bfloat16"}, (
+            assert dtype in allowed, (
                 f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
-                "main KV must be bf16 (auto) on every rtx3090 profile"
+                "main KV must be bf16 (auto) on rtx3090/a100 profiles "
+                "outside the noted carve-outs"
             )
 
 

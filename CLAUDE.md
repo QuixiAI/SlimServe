@@ -201,7 +201,12 @@ behavior:
   are 1024B vs fp8's 584B). bf16 main KV is ASPIRATIONAL on the remaining
   platforms: they keep their qualified configs (Metal fp8_ds_mla and the
   qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
-  requalification pass. Draft-model KV (DSpark TurboQuant k8v4) is exempt
+  requalification pass. One noted a100 carve-out (operator-approved
+  2026-08-30): glm52-q2k-4 serves fp8 main KV at 131072 because 65.8 GiB
+  of Q2K weights per 80 GB rank make bf16 KV at that length physically
+  impossible; the record's note states the arithmetic and glm52-q2k-8
+  remains the bf16 model-default-context record. Draft-model KV (DSpark
+  TurboQuant k8v4) is exempt
   everywhere: rejection sampling verifies every draft token against the
   target, so draft KV precision can only affect acceptance rate and speed,
   never output content.

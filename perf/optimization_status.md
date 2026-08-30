@@ -17598,3 +17598,56 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   max 139.4K (raw: ~/.local/scratch/a100-sweep/resident-final-recall.json).
   The DP2 profile is serving-healthy under the mitigation; the resident
   stays up on :8000.
+
+## 2026-08-30: GLM-5.2/A100 bring-up — compile fix, packed-slab fix, TP4 fp8 carve-out
+
+### torch.compile: per_token_group_fp8_quant left functionalized (fixed)
+- glm52-q2k-4 boot died in inductor with the bare "auto_functionalized was
+  not removed" assert. A diagnostic added to FixFunctionalizationPass named
+  the leftover op: `_C.per_token_group_fp8_quant.default` (and the `_packed`
+  sibling has the same shape). The pass's if/elif chain simply never listed
+  it; DSV4 never routes through that op, which is why only GLM hit it.
+- Fix: defunctionalize both variants (mutated args output_q/output_s[_packed])
+  in vllm/compilation/passes/utility/fix_functionalization.py. The leftover-
+  node diagnostic stays: it turns the next such miss from a bare assert into
+  a named op.
+
+### Host tier on GLM: packed cross-layer slab was never allocated (fixed)
+- With the compile fix in, boot failed at connector registration:
+  "packed KV backing is not a whole number of block strides
+  (6902016 % 6235392)". The 6902016 was one arbitrary indexer k_cache
+  (817 blocks x 8448 B): every layer had its own allocation.
+- Root cause: GLM's specs unify into a SINGLE UniformTypeKVCacheSpecs group
+  (the MLA+SWA promotion path in kv_cache_utils), and
+  get_kv_cache_config_from_groups orders its `len(groups)==1 and
+  UniformType` special case (per-layer tensors, shared_by=[layer]) BEFORE
+  the `_use_packed_kv_cache_config` branch — silently shadowing the
+  operator's enable_cross_layers_blocks opt-in. DSV4 dodges it only because
+  its groups don't collapse to one.
+- Fix: an explicit cross-layers opt-in now wins over the single-uniform-group
+  special case (same condition mirrored in _pool_bytes_per_block so
+  scheduler bytes-per-block matches worker allocation). Validated: TP4 boot
+  healthy, slab shared by 102/102 layers (indexer caches INSIDE, so tier
+  restores are complete), backing = 960 x 6235392 B exactly, 48 GiB/rank
+  arena registered on all 4 ranks.
+
+### glm52-q2k-4 context: physics and the fp8 carve-out (operator-approved)
+- Measured on-box: Q2K weights 65.76 GiB/rank at TP4 (checkpoint itself is
+  244 GiB; sharding is fine, nothing usefully replicated), KV ~97.4 KiB/token
+  across the 102 packed layers. bf16 KV at 202752 = 18.4 GiB/rank, at
+  131072 = 12.2 GiB/rank — both exceed the 80 GB card at ANY utilization.
+  bf16 ceiling is ~40-45K. The host tier cannot lift this: an active
+  request's KV must be GPU-resident (attention kernels + chunked prefill
+  read GPU pages); the tier provides concurrency, not single-request ceiling.
+- Operator decision (2026-08-30): glm52-q2k-4/a100 serves fp8 main KV at
+  max_model_len 131072 (util 0.95, max_num_batched_tokens 4096) as the sole
+  bf16-policy carve-out, documented in the record note, CLAUDE.md, and
+  test_no_profile_quantizes_main_kv. Requalification = WildChat deep-context
+  sweep marker-recall probes. glm52-q2k-8 keeps bf16 at the model-default
+  202752 (weights ~33 GiB/rank leave room; KV is per-rank-replicated MLA so
+  TP8 does not shrink it).
+- Rejected alternatives: bf16 @ ~40K cap (loses deep context on TP4);
+  PLE-style pinned-host UVA KV for sparse MLA (real design direction for
+  breaking GPU residency — top-k selected rows gathered from host inside
+  the kernel, precedent = qwen38fn PLE table — but a kernel+block-manager
+  project, not a config change; parked).
