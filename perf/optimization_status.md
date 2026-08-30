@@ -17385,3 +17385,49 @@ The final architecture and why each piece is shaped the way it is:
   ("write_file", capitalized "Read"); pi rejected them and the model
   recovered via bash. Model behavior, not a serving bug; some agents
   also wrote their reports via bash heredoc instead of the write tool.
+
+## 2026-08-30 - POLICY: prefix caching enabled on every profile, no opt-out
+
+- Status: retained (operator directive). Registry-only change; no kernel or
+  serving-path code touched.
+- Scope: the four platform records that still had `enable_prefix_caching:
+  false` -- `qwen38-q2kxl-1/metal`, `qwen38-q2kxl-1/mi300x`,
+  `qwen38-nvfp4-1/metal`, `qwen38-nvfp4-1-tq/metal`. All 25 platform records
+  now state `true`.
+- Baseline: the 2026-08-28 policy pass made every record state the setting
+  explicitly but allowed an opt-out with a note. These four kept theirs on
+  the premise that a hybrid GDN model cannot prefix cache, inherited from the
+  retired `qwen38-1` Q4_K_M profile.
+- Why the premise was wrong: it is the same reasoning that shipped
+  `qwen38fn-fp8-8` -- also a Gated DeltaNet hybrid -- with a 0.0% hit rate
+  and full-history re-prefill every turn. Only the 16 full-attention layers
+  hold paged KV, but those layers still cache; the 48 recurrent layers are
+  the hybrid manager's business, not a reason to disable the feature. The
+  sibling `qwen38-nvfp4-1/mi300x` record -- same model, same card, same GDN
+  state contract -- has been serving with prefix caching on.
+- Engine-side confirmation (read, not assumed):
+  `ModelConfig.is_prefix_caching_supported` returns True for `attn_type ==
+  "hybrid"` ("Generative hybrid models support prefix caching"), and
+  `EngineArgs` only fills the value when it is None, so an explicit true in a
+  profile is honored rather than overridden. The off records were a stale
+  default, never a capability limit.
+- Change: flipped the four booleans and DELETED the premise rather than
+  rebutting it -- the "which is why prefix caching is off" clause is gone from
+  both qwen38-q2kxl-1 architecture notes, and the retired qwen38-1 profile's
+  setting is gone from the qwen38-nvfp4-1/metal inheritance list. The four
+  records now carry the same standard policy note as the rest of the registry.
+  Tightened `test_every_profile_states_prefix_caching_explicitly` from
+  "stated, with a noted opt-out" to "must be true", and updated the standing
+  policy in `CLAUDE.md` and the `_SERVING_DEFAULTS` comment in
+  `slimserve/registry.py` so the docs and the test agree.
+- Correctness: 61 SlimServe registry tests pass; all four records resolve
+  with `enable_prefix_caching=True`; `profiles.json` parses; ruff clean.
+- NOT yet measured: this is a registry/policy change validated by test only.
+  No profile has been booted since the flip, so there is no on-box throughput
+  or hit-rate number for any of the four. The hybrid `align` cache mode is
+  still marked experimental upstream and is unvalidated on Metal and on
+  MI300X for this model, so the next live pass for each of these profiles
+  must confirm health and record a hit rate before any performance claim is
+  made from this entry.
+- Next command: `slimserve qwen38-q2kxl-1 --serve` on the MI300X box, then a
+  multi-turn exact pass to record the prefix-cache hit rate.

@@ -274,9 +274,11 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
 #
 # STANDING POLICY (2026-08-28): SlimServe serving ALWAYS has automatic
 # prefix caching, automatic tool calling, and thinking enabled, and NEVER
-# uses greedy sampling. A profile may override a key only for a model-level
-# impossibility (e.g. R-SWA decode KV is not cacheable) and must carry a
-# note naming the reason. Do not rely on engine defaults for any of these:
+# uses greedy sampling. Prefix caching admits NO opt-out: every platform
+# record states enable_prefix_caching true and the registry test rejects
+# anything else. For the other keys a profile may override only for a
+# model-level impossibility, with a note naming the reason.
+# Do not rely on engine defaults for any of these:
 # vLLM silently defaults prefix caching OFF for hybrid (mamba/GDN) models,
 # which shipped qwen38fn-fp8-8 with a 0.0% cache hit rate and full-history
 # re-prefill on every chat turn. Benchmarks and diagnostics use the model's

@@ -162,8 +162,11 @@ behavior:
 - SlimServe serving ALWAYS has automatic prefix caching, automatic tool
   calling, and thinking enabled, and NEVER uses greedy sampling. These are
   enforced as registry-level `_SERVING_DEFAULTS` plus explicit per-profile
-  values and a registry test; a profile may opt out of one only for a
-  model-level impossibility, stated in a note.
+  values and a registry test. Prefix caching admits NO opt-out: every
+  platform record states `enable_prefix_caching: true` and the registry
+  test rejects anything else (operator directive 2026-08-30). For the
+  others, a profile may opt out only for a model-level impossibility,
+  stated in a note.
 - Never rely on engine-layer defaults for these: vLLM silently defaults
   prefix caching OFF for hybrid (mamba/GDN) models, which shipped a
   profile with a 0.0% hit rate and full-history re-prefill on every turn.

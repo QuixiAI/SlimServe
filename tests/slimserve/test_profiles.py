@@ -998,14 +998,17 @@ def test_mirrored_vllm_defaults_have_not_drifted():
 
 
 def test_every_profile_states_prefix_caching_explicitly():
-    """Prefix caching is stated, never inherited.
+    """Prefix caching is always ON, and always stated.
 
     vLLM defaults prefix caching OFF for hybrid (mamba/GDN) models, so a
     profile that omits enable_prefix_caching silently pays full-history
     re-prefill on every chat turn -- exactly how qwen38fn-fp8-8 shipped
     with a 0.0% hit rate. Policy since 2026-08-28: every record states the
-    setting explicitly, and anything other than true needs a note naming
-    the model-level reason (e.g. R-SWA decode KV is not cacheable).
+    setting explicitly. Tightened 2026-08-30 by operator directive: it must
+    also be true everywhere, so this no longer accepts an opt-out with a
+    note. The engine supports it -- ModelConfig.is_prefix_caching_supported
+    returns True for hybrid generative models -- so an off record is a
+    stale default, never a capability limit.
     """
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry.get("variants", {}).items():
@@ -1014,12 +1017,11 @@ def test_every_profile_states_prefix_caching_explicitly():
                 f"{profile_id}/{platform} does not state enable_prefix_caching; "
                 "it would silently inherit vLLM's per-model default"
             )
-            if engine["enable_prefix_caching"] is not True:
-                notes = " ".join(record.get("notes", []))
-                assert "prefix" in notes.lower(), (
-                    f"{profile_id}/{platform} disables prefix caching without "
-                    "a note naming the model-level reason"
-                )
+            assert engine["enable_prefix_caching"] is True, (
+                f"{profile_id}/{platform} sets enable_prefix_caching="
+                f"{engine['enable_prefix_caching']!r}; SlimServe serving always "
+                "has prefix caching enabled"
+            )
 
 
 def test_every_profile_serves_with_tool_calling_and_thinking():
