@@ -47,14 +47,6 @@ _FLA_POST_CONV_WARMUP_LENGTHS = (1, 2, 16)
 
 
 @dataclass(frozen=True)
-class _ZeroKvWarmupConfig:
-    seg_page_sizes: torch.Tensor
-    max_chunks: int
-    block_size: int
-    n_segs: int
-
-
-@dataclass(frozen=True)
 class _QwenGDNWarmupConfig:
     h: int
     hv: int
@@ -167,35 +159,16 @@ def _get_kv_block_zeroer(runner: object) -> object | None:
     return zeroer
 
 
-def _zero_kv_warmup_config(runner: object) -> _ZeroKvWarmupConfig | None:
-    zeroer = _get_kv_block_zeroer(runner)
-    meta = getattr(zeroer, "_meta", None)
-    if meta is None:
-        return None
-
-    # KVBlockZeroer._meta is (seg_addrs, seg_strides, seg_page_sizes,
-    # max_chunks, block_size, n_segs) since the packed-slab overrun fix
-    # separated the block advance from the zero extent. Guard the arity:
-    # warmup is an optimization and must never kill a boot when the
-    # zeroer's internals move again (2026-08-30: a 5-field unpack of the
-    # widened tuple crash-looped the rtx3090 service).
-    if len(meta) != 6:
-        logger.warning(
-            "Skipping zero-kv warmup: unexpected KVBlockZeroer._meta "
-            "arity %d (expected 6); update _zero_kv_warmup_config.",
-            len(meta),
-        )
-        return None
-    _, _, seg_page_sizes, max_chunks, block_size, n_segs = meta
-    return _ZeroKvWarmupConfig(
-        seg_page_sizes=seg_page_sizes,
-        max_chunks=int(max_chunks),
-        block_size=int(block_size),
-        n_segs=int(n_segs),
-    )
-
-
 def _warm_zero_kv_blocks_with_runner_zeroer(runner: object) -> bool:
+    """JIT the zeroing kernel through the zeroer's own public entry point.
+
+    This is deliberately the ONLY zero-kv warmup path: it exercises the
+    exact production launch, so it cannot drift from KVBlockZeroer's
+    internals. A previous variant replicated the launch here from the
+    zeroer's private ``_meta`` tuple and crash-looped the rtx3090 boot
+    when that tuple gained a field (2026-08-30); do not reintroduce it.
+    Zeroing blocks 0..N-1 at warmup is safe - the cache is empty at boot.
+    """
     zeroer = _get_kv_block_zeroer(runner)
     zero_block_ids = getattr(zeroer, "zero_block_ids", None)
     if not callable(zero_block_ids):
@@ -205,42 +178,6 @@ def _warm_zero_kv_blocks_with_runner_zeroer(runner: object) -> bool:
         zero_block_ids(list(range(n_blocks)))
     return True
 
-
-def _warm_zero_kv_blocks_kernel(
-    device: torch.device, config: _ZeroKvWarmupConfig
-) -> None:
-    from vllm.v1.worker.utils import _zero_kv_blocks_kernel
-
-    max_n_blocks = max(_ZERO_KV_N_BLOCKS)
-    max_page_size = int(config.seg_page_sizes.max().item())
-    scratch = torch.empty(
-        max_n_blocks * max_page_size,
-        dtype=torch.int32,
-        device=device,
-    )
-    seg_addrs = torch.tensor(
-        [scratch.data_ptr()] * config.n_segs,
-        dtype=torch.uint64,
-        device=device,
-    )
-    # All segments alias one scratch buffer here, so the per-block advance
-    # equals the zero extent (real slabs separate the two; the JIT
-    # specialization is identical either way).
-    seg_strides = config.seg_page_sizes
-
-    for n_blocks in _ZERO_KV_N_BLOCKS:
-        block_ids = torch.arange(n_blocks, dtype=torch.int64, device=device)
-        grid = (n_blocks * config.n_segs * config.max_chunks,)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_strides,
-            config.seg_page_sizes,
-            block_ids,
-            n_blocks,
-            N_SEGS=config.n_segs,
-            MAX_CHUNKS=config.max_chunks,
-            BLOCK_SIZE=config.block_size,
-        )
 
 
 def _warm_compute_slot_mapping_kernel(device: torch.device) -> None:
@@ -403,12 +340,8 @@ def qwen_triton_warmup(
     device = getattr(runner, "device", torch.device("cuda"))
     logger.info("Warming up Qwen Triton kernels for model_type=%s.", model_type)
 
-    zero_config = _zero_kv_warmup_config(runner)
-    warmed_zeroer = _warm_zero_kv_blocks_with_runner_zeroer(runner)
-    if zero_config is not None:
-        _warm_zero_kv_blocks_kernel(device, zero_config)
-    elif not warmed_zeroer:
-        logger.info("Skipping Qwen zero-kv warmup: no KVBlockZeroer metadata.")
+    if not _warm_zero_kv_blocks_with_runner_zeroer(runner):
+        logger.info("Skipping Qwen zero-kv warmup: no KVBlockZeroer on runner.")
 
     _warm_compute_slot_mapping_kernel(device)
     _synchronize_device(device)
