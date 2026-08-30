@@ -25,18 +25,32 @@ def _silu(x):
 
 @triton.jit
 def _wide_act_mul_fp8_group_quant_kernel(
-    x_ptr, y_ptr, s_ptr,
-    M, N,  # N is the output width (half of x's last dim)
-    sx_m, sx_n, sy_m, sy_n, ss_m, ss_n,
-    BLOCK_M: tl.constexpr, GROUPS: tl.constexpr, QB: tl.constexpr,
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    M,
+    N,  # N is the output width (half of x's last dim)
+    sx_m,
+    sx_n,
+    sy_m,
+    sy_n,
+    ss_m,
+    ss_n,
+    BLOCK_M: tl.constexpr,
+    GROUPS: tl.constexpr,
+    QB: tl.constexpr,
     DTYPE_MAX: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_g = tl.program_id(1)
     BN: tl.constexpr = GROUPS * QB
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_g * BN + tl.arange(0, BN)
+    # int64 row offsets: M * 2N overflows int32 past ~2.1e9 elements. AITER
+    # casts its strides for the same reason, as do the sibling kernels in
+    # fp8_utils.py. Not reachable at today's max_num_batched_tokens, but this
+    # helper is generic and the overflow would silently read out of bounds.
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
+    rn = pid_g * BN + tl.arange(0, BN).to(tl.int64)
     mask = (rm[:, None] < M) & (rn[None, :] < N)
 
     off = rm[:, None] * sx_m + rn[None, :] * sx_n
@@ -49,8 +63,11 @@ def _wide_act_mul_fp8_group_quant_kernel(
     scale = amax.to(tl.float32) / DTYPE_MAX
     q = tl.clamp(y3 * (1.0 / scale.reshape(BLOCK_M, GROUPS, 1)), -DTYPE_MAX, DTYPE_MAX)
 
-    tl.store(y_ptr + rm[:, None] * sy_m + rn[None, :] * sy_n,
-             tl.reshape(q, (BLOCK_M, BN)).to(y_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        y_ptr + rm[:, None] * sy_m + rn[None, :] * sy_n,
+        tl.reshape(q, (BLOCK_M, BN)).to(y_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
     rg = pid_g * GROUPS + tl.arange(0, GROUPS)
     smask = (rm[:, None] < M) & (rg[None, :] < tl.cdiv(N, QB))
@@ -68,14 +85,30 @@ def wide_act_mul_fp8_group_quant(
     x: torch.Tensor, group_size: int, dtype_quant: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, N2 = x.shape
+    # The registered fake impl asserts this; without the same check here the
+    # eager path would silently pair the wrong columns and drop the last one,
+    # so traced and eager execution would disagree on whether the input is
+    # legal instead of both rejecting it.
+    if N2 % 2:
+        raise ValueError(f"activation width must be even, got {N2}")
     N = N2 // 2
     y = torch.empty((M, N), dtype=dtype_quant, device=x.device)
-    s = torch.empty((M, triton.cdiv(N, group_size)), dtype=torch.float32,
-                    device=x.device)
+    s = torch.empty(
+        (M, triton.cdiv(N, group_size)), dtype=torch.float32, device=x.device
+    )
     grid = (triton.cdiv(M, _BLOCK_M), triton.cdiv(N, group_size * _GROUPS))
     _wide_act_mul_fp8_group_quant_kernel[grid](
-        x, y, s, M, N, *x.stride(), *y.stride(), *s.stride(),
-        BLOCK_M=_BLOCK_M, GROUPS=_GROUPS, QB=group_size,
+        x,
+        y,
+        s,
+        M,
+        N,
+        *x.stride(),
+        *y.stride(),
+        *s.stride(),
+        BLOCK_M=_BLOCK_M,
+        GROUPS=_GROUPS,
+        QB=group_size,
         DTYPE_MAX=torch.finfo(dtype_quant).max,
     )
     return y, s
