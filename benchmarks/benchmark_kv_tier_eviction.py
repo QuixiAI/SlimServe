@@ -99,7 +99,9 @@ async def churn_filler(session, args, rng, fid, tokens_goal, counter):
             + " Summarize in one sentence.",
         }]
         try:
-            _, ptoks = await _turn(session, args, messages, 128, args.seed + fid)
+            # Prefill-only: cycling the pool needs prompt tokens, not
+            # generation; a 1-token reply keeps filler turns cheap.
+            _, ptoks = await _turn(session, args, messages, 1, args.seed + fid)
         except Exception as e:  # noqa: BLE001 - keep churning through timeouts
             print(f"[filler {fid}] error: {e}", flush=True)
             await asyncio.sleep(2)
