@@ -1561,31 +1561,51 @@ static void launch_mla_decode_fp8_sparse_dsv4_merged(
     const int launched = main_launched + extra_launched;
     if (launched <= 0) return;
 
+    // Page format follows the cache dtype: uint8 = fp8_ds_mla packed pages
+    // (576B data + 8B UE8M0 scales); bf16 = plain 512-element bf16 rows
+    // (1024B, no scale plane -- the NFP8=0 instantiation never reads it).
+    const bool bf16_pages = main_cache.scalar_type() == torch::kBFloat16;
     constexpr int SCALE_SLOT_STRIDE_BYTES = 8;
-    const int main_page_stride_bytes = int(main_cache.stride(0));
-    const int extra_page_stride_bytes = int(extra_cache.stride(0));
-    const int main_scale_block_offset_bytes = main_block_size * 576;
-    const int extra_scale_block_offset_bytes = extra_block_size * 576;
+    const int main_page_stride_bytes =
+        int(main_cache.stride(0) * main_cache.element_size());
+    const int extra_page_stride_bytes =
+        int(extra_cache.stride(0) * extra_cache.element_size());
+    const int main_scale_block_offset_bytes =
+        bf16_pages ? 0 : main_block_size * 576;
+    const int extra_scale_block_offset_bytes =
+        bf16_pages ? 0 : extra_block_size * 576;
     const int total_partitions = main_partitions + extra_partitions;
-    mla_decode_fp8_v<true, true><<<dim3(H, B, launched), 32, 0, stream()>>>(
-        bp(q), main_cache.data_ptr<uint8_t>(), main_cache.data_ptr<uint8_t>(),
-        main_bt.numel() > 0 ? main_bt.data_ptr<int>() : nullptr, nullptr,
-        main_indices.data_ptr<int>(), main_topk_length.data_ptr<int>(),
-        int(main_indices.size(1)), nullptr, tmp, ml, es, main_block_size,
-        main_bt.numel() > 0 ? int(main_bt.size(1)) : 0, float(scale), H,
-        main_partitions, partition_size, 1.0f, nullptr, 0,
-        main_page_stride_bytes, main_scale_block_offset_bytes,
-        SCALE_SLOT_STRIDE_BYTES, total_partitions, 0,
-        main_indices_are_slots, true,
-        extra_cache.data_ptr<uint8_t>(), extra_cache.data_ptr<uint8_t>(),
-        extra_bt.numel() > 0 ? extra_bt.data_ptr<int>() : nullptr, nullptr,
-        extra_indices.data_ptr<int>(), extra_topk_length.data_ptr<int>(),
-        int(extra_indices.size(1)), extra_block_size,
-        extra_bt.numel() > 0 ? int(extra_bt.size(1)) : 0,
-        extra_partitions, partition_size, 1.0f, extra_page_stride_bytes,
-        extra_scale_block_offset_bytes, SCALE_SLOT_STRIDE_BYTES,
-        main_partitions, extra_indices_are_slots, main_launched,
-        extra_launched, int(main_cache.size(0)), int(extra_cache.size(0)));
+    const uint8_t* main_data =
+        reinterpret_cast<const uint8_t*>(main_cache.data_ptr());
+    const uint8_t* extra_data =
+        reinterpret_cast<const uint8_t*>(extra_cache.data_ptr());
+    #define QC_DSV4_MERGED_ARGS \
+        bp(q), main_data, main_data, \
+        main_bt.numel() > 0 ? main_bt.data_ptr<int>() : nullptr, nullptr, \
+        main_indices.data_ptr<int>(), main_topk_length.data_ptr<int>(), \
+        int(main_indices.size(1)), nullptr, tmp, ml, es, main_block_size, \
+        main_bt.numel() > 0 ? int(main_bt.size(1)) : 0, float(scale), H, \
+        main_partitions, partition_size, 1.0f, nullptr, 0, \
+        main_page_stride_bytes, main_scale_block_offset_bytes, \
+        SCALE_SLOT_STRIDE_BYTES, total_partitions, 0, \
+        main_indices_are_slots, true, \
+        extra_data, extra_data, \
+        extra_bt.numel() > 0 ? extra_bt.data_ptr<int>() : nullptr, nullptr, \
+        extra_indices.data_ptr<int>(), extra_topk_length.data_ptr<int>(), \
+        int(extra_indices.size(1)), extra_block_size, \
+        extra_bt.numel() > 0 ? int(extra_bt.size(1)) : 0, \
+        extra_partitions, partition_size, 1.0f, extra_page_stride_bytes, \
+        extra_scale_block_offset_bytes, SCALE_SLOT_STRIDE_BYTES, \
+        main_partitions, extra_indices_are_slots, main_launched, \
+        extra_launched, int(main_cache.size(0)), int(extra_cache.size(0))
+    if (bf16_pages) {
+        mla_decode_fp8_v<true, true, 512, 512, 0, 0>
+            <<<dim3(H, B, launched), 32, 0, stream()>>>(QC_DSV4_MERGED_ARGS);
+    } else {
+        mla_decode_fp8_v<true, true>
+            <<<dim3(H, B, launched), 32, 0, stream()>>>(QC_DSV4_MERGED_ARGS);
+    }
+    #undef QC_DSV4_MERGED_ARGS
 }
 
 static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
@@ -1610,8 +1630,16 @@ static torch::Tensor py_mla_decode_fp8_sparse_dsv4(
                     "sink must be contiguous CUDA");
     }
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16, "q must be bf16");
-    TORCH_CHECK(main_cache.scalar_type() == torch::kUInt8, "main_cache must be uint8");
-    TORCH_CHECK(extra_cache.scalar_type() == torch::kUInt8, "extra_cache must be uint8");
+    TORCH_CHECK(main_cache.scalar_type() == torch::kUInt8 ||
+                    main_cache.scalar_type() == torch::kBFloat16,
+                "main_cache must be uint8 (fp8_ds_mla pages) or bf16 "
+                "(plain 512-element rows)");
+    TORCH_CHECK(extra_cache.scalar_type() == main_cache.scalar_type(),
+                "extra_cache dtype must match main_cache");
+    if (main_cache.scalar_type() == torch::kBFloat16) {
+        TORCH_CHECK(main_cache.stride(-1) == 1 && extra_cache.stride(-1) == 1,
+                    "bf16 pages must have unit inner stride");
+    }
     TORCH_CHECK(main_indices.scalar_type() == torch::kInt, "main_indices must be int32");
     TORCH_CHECK(extra_indices.scalar_type() == torch::kInt, "extra_indices must be int32");
     TORCH_CHECK(q.size(2) == 512, "DSV4 MLA expects q width 512, got ", q.size(2));

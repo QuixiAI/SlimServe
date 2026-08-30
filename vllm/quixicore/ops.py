@@ -697,12 +697,15 @@ class quixicore_ops:
         sm_scale: float,
         partition_size: int = 0,
     ) -> torch.Tensor:
-        """DeepSeek-V4 native sparse MLA over packed fp8_ds_mla pages.
+        """DeepSeek-V4 native sparse MLA over packed pages.
 
-        Each cache token is read in-place from the 584-byte DSV4 layout
-        (576B data + 8B UE8M0 scales). The two sources are merged by the
-        QuixiCore online-softmax reducer, so SWA and compressed sparse cache
-        can be combined without materializing a bf16 KV workspace.
+        uint8 caches are read in-place from the 584-byte fp8_ds_mla layout
+        (576B data + 8B UE8M0 scales); bf16 caches are plain 512-element
+        rows (1024B, no scale plane - the NFP8=0 instantiation, the same
+        geometry GLM-5.2 serves on A100). Both caches must share one dtype.
+        The two sources are merged by the QuixiCore online-softmax reducer,
+        so SWA and compressed sparse cache can be combined without
+        materializing a separate KV workspace.
         """
         return _qc().mla_decode_fp8_sparse_dsv4(
             q,
