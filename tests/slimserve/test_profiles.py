@@ -119,6 +119,17 @@ def test_qwen38_uses_measured_metal_speculation_settings():
     assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
 
 
+def test_qwen38_uses_measured_mi300x_speculation_settings():
+    plan = resolve("qwen38-q2kxl-1", "mi300x", 1, None, 2**38)
+    speculative = validate_acceleration(plan)
+
+    assert speculative["method"] == "dflash"
+    assert speculative["num_speculative_tokens"] == 3
+    assert speculative["quantization"] == "gguf"
+    assert plan.env["VLLM_ROCM_USE_AITER"] == "1"
+    assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
 def test_live_smoke_matrix_discovers_every_compatible_mi300x_profile():
     machine = Machine("mi300x", "AMD Instinct MI300X", 8)
     expected = {
@@ -145,6 +156,12 @@ def test_live_smoke_matrix_requires_dspark_and_turboquant_for_every_profile():
             # The checkpoint ships its own MTP head; there is no separate
             # DSpark artifact or TurboQuant draft cache to require.
             assert speculative["method"] == "qwen3_5_mtp"
+            continue
+        if profile_id == "qwen38-q2kxl-1":
+            # The GGUF artifact's blessed drafter is the published DFlash 2
+            # block model, which shares the target's KV layout and so has no
+            # TurboQuant draft cache of its own.
+            assert speculative["method"] == "dflash"
             continue
         assert speculative["method"] == "dspark"
         assert speculative["attention_backend"] == "TURBOQUANT"
@@ -823,12 +840,48 @@ def test_no_profile_carries_another_platforms_environment():
                     )
 
 
+# vllm/config/scheduler.py::SchedulerConfig.DEFAULT_MAX_NUM_SEQS. Mirrored
+# rather than imported so profile-registry tests stay free of a vllm import;
+# test_mirrored_vllm_defaults_have_not_drifted below pins it to the real value.
+DEFAULT_MAX_NUM_SEQS = 128
+
+
+# (profile, platform) -> (validated concurrency, why the max_num_seqs rule is
+# not applied). These records pin a capture ceiling that was MEASURED against a
+# specific concurrency band rather than against max_num_seqs, and raising it is
+# coupled to the KV budget on hardware not present here.
+#
+# dsv4 A100 tiers: capture 64 was the fix for this very bug (2026-08-10, "TP8 c8
+# Cliff Root Cause: Graph Capture Width") -- the c8 verify batch is 8 reqs x 6
+# spec tokens = 48 rows, and the list topped out at 32, so every decode step ran
+# eager. 64 makes the derived list [1,2,4,8,16,24,32,40,48,56,64], which
+# contains 48. These records leave max_num_seqs unpinned, so it inherits 128 and
+# batches past ~10 concurrent requests still fall off the graphs. The notebook's
+# own follow-up ("extend cudagraph_capture_sizes to include 48 and re-derive the
+# KV budget") is the open work; larger graphs measurably shrink the KV pool
+# there, so the fix needs an A100, not an edit. Until then this asserts the band
+# that WAS measured.
+_CAPTURE_BAND_EXEMPT = {
+    ("dsv4-q4ktail-4", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-q4ktail-8", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-mxfp4-4", "a100"): (8, "capture measured against the c8 verify width"),
+    ("dsv4-mxfp4-8", "a100"): (8, "capture measured against the c8 verify width"),
+}
+
+
 def test_full_decode_graphs_cover_the_largest_speculative_batch():
     """capture >= (k+1) * max_num_seqs, or the biggest batches run eager.
 
     Measured on 8x3090: c32 at 425 tok/s with a 64-token capture ceiling vs
     880 with the ceiling covering seqs x (1+k) -- and the failure is silent.
     A note is not a guard; this is.
+
+    Both sides are resolved to their EFFECTIVE values. An unset capture
+    inherits min(max_num_seqs * 2, 512), a ceiling derived with no knowledge
+    of speculation: it budgets one row per sequence with 2x headroom, while a
+    speculative step submits k+1 rows per sequence. At k>=2 the default is
+    therefore always short, so treating "unset" as "nothing to check" skipped
+    precisely the records where nobody had made the decision at all.
     """
     raw = registry._registry()
     for profile_id, profile in raw["profiles"].items():
@@ -851,14 +904,36 @@ def test_full_decode_graphs_cover_the_largest_speculative_batch():
             schedule = overrides.get("num_speculative_tokens_per_batch_size")
             if schedule:
                 k = max(k, max(entry[2] for entry in schedule))
-            max_num_seqs = engine.get("max_num_seqs")
-            capture = compilation.get("max_cudagraph_capture_size")
-            if not (k and max_num_seqs and capture):
+            if not k:
                 continue
+            # Resolve what the engine will ACTUALLY use, not just what the
+            # record spells out. Skipping the unset cases would skip exactly
+            # the silent ones: an omitted capture inherits a default derived
+            # from max_num_seqs with no knowledge of speculation, which is
+            # where this bug hides rather than where it is absent.
+            max_num_seqs = engine.get("max_num_seqs") or DEFAULT_MAX_NUM_SEQS
+            capture = compilation.get("max_cudagraph_capture_size")
+            if capture is None:
+                # vllm/config/vllm.py::_set_cudagraph_sizes.
+                capture = min(max_num_seqs * 2, 512)
+                source_note = (
+                    f"the inherited default min({max_num_seqs} x 2, 512) = {capture}"
+                )
+            else:
+                source_note = f"the pinned {capture}"
             needed = (k + 1) * max_num_seqs
+            if (profile_id, platform) in _CAPTURE_BAND_EXEMPT:
+                band, why = _CAPTURE_BAND_EXEMPT[(profile_id, platform)]
+                assert capture >= (k + 1) * band, (
+                    f"{profile_id}/{platform} is exempt from the full "
+                    f"max_num_seqs rule ({why}), but its capture {capture} no "
+                    f"longer covers even the validated c{band} band "
+                    f"({(k + 1) * band} rows)"
+                )
+                continue
             assert capture >= needed, (
                 f"{profile_id}/{platform}: max_cudagraph_capture_size "
-                f"{capture} < ({k}+1) x max_num_seqs {max_num_seqs} = "
+                f"{source_note} < ({k}+1) x max_num_seqs {max_num_seqs} = "
                 f"{needed}; the largest decode batches would silently run "
                 "eager"
             )
@@ -891,3 +966,28 @@ def test_host_offload_profiles_declare_a_host_ram_gate():
                 f"(~{floor / 2**30:.0f} GiB pinned, shared across ranks) "
                 "but no quant declares a min_host_ram_bytes gate covering it"
             )
+
+
+def test_mirrored_vllm_defaults_have_not_drifted():
+    """The capture guard resolves unset fields against vLLM's own defaults.
+
+    Those defaults are mirrored as literals so the registry tests do not import
+    vllm; this is the one test that pays the import, so a vLLM-side change to
+    either default fails loudly here instead of silently weakening the guard.
+    """
+    from vllm.config.scheduler import SchedulerConfig
+
+    assert SchedulerConfig.DEFAULT_MAX_NUM_SEQS == DEFAULT_MAX_NUM_SEQS
+
+    # The capture default itself: vllm/config/vllm.py::_set_cudagraph_sizes
+    # computes min(max_num_seqs * 2, 512).
+    import inspect
+
+    from vllm.config import VllmConfig
+
+    source = inspect.getsource(VllmConfig._set_cudagraph_sizes)
+    assert "min(max_num_seqs * 2, 512)" in source, (
+        "vLLM's default cudagraph capture ceiling changed; update the "
+        "min(max_num_seqs * 2, 512) model in "
+        "test_full_decode_graphs_cover_the_largest_speculative_batch"
+    )

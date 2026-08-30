@@ -522,7 +522,9 @@
           "title": "Unsloth dynamic Q2_K_XL (UD, per-layer mixed)",
           "bytes": 9828981664,
           "summary": "Unsloth dynamic 2-bit build; the campaign target quant.",
-          "min_gpus": {},
+          "min_gpus": {
+            "mi300x": 1
+          },
           "min_memory_bytes": {
             "metal": 51539607552
           },
@@ -1238,7 +1240,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -1277,7 +1280,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -1306,7 +1310,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -1344,7 +1349,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 128
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -1373,7 +1379,8 @@
               "sparse_mla_force_mqa": true
             },
             "compilation_config": {
-              "cudagraph_mode": "FULL_DECODE_ONLY"
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
             },
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
@@ -2145,10 +2152,10 @@
       }
     },
     "qwen38-q2kxl-1": {
-      "title": "Qwen3.8-27B on one Mac",
+      "title": "Qwen3.8-27B GGUF on 1 GPU",
       "source": "qwen38-27b",
       "gpus": 1,
-      "summary": "Vision-language 27B hybrid-attention model on a single Apple Silicon machine, sized by unified memory. Unsloth dynamic Q2_K_XL fits a 48 GB Mac with a 12 GiB KV pool.",
+      "summary": "Vision-language 27B hybrid-attention model from the published Unsloth dynamic Q2_K_XL GGUF, single device. Sized per platform: a 48 GB Mac by unified memory, an MI300X by its 192 GB of VRAM.",
       "speculative": true,
       "variants": {
         "metal": {
@@ -2187,6 +2194,42 @@
             "kv_cache_dtype must be auto (bf16): this fork defaults the KV cache to fp8_e4m3, and the Metal backends have no fp8 KV path.",
             "max_model_len 131072 of the model's 262144: matched to the muse profile until the hybrid KV/state manager is measured on Metal.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
+          ]
+        },
+        "mi300x": {
+          "platform": "mi300x",
+          "default_quant": "q2kxl",
+          "engine": {
+            "tensor_parallel_size": 1,
+            "max_model_len": 262144,
+            "max_num_seqs": 64,
+            "max_num_batched_tokens": 2048,
+            "kv_cache_memory_bytes": 103079215104,
+            "kv_cache_dtype": "auto",
+            "enable_prefix_caching": false,
+            "enable_chunked_prefill": true,
+            "trust_remote_code": true,
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 256
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-27B"
+          },
+          "env": {
+            "VLLM_ROCM_USE_AITER": "1",
+            "VLLM_USE_V2_MODEL_RUNNER": "1"
+          },
+          "notes": [
+            "Hybrid attention (qwen3_5): 64 text layers in a 3:1 interleave -- 48 gated-deltanet linear-attention layers (16 K-heads/48 V-heads at 128 dim, conv kernel 4) and 16 full-attention layers (GQA 24/4, head_dim 256, partial rotary 0.25, interleaved MRoPE). Only the 16 full layers hold paged KV; the rest carry recurrent state, which is why prefix caching is off.",
+            "Vision: the shared Qwen3.5 tower (27 blocks at hidden 1152, patch 16, 2x2 spatial merge into 5120-dim tokens), loaded from the published mmproj-F16 GGUF. GGUF and safetensors artifacts share one model implementation; the GGUF adapter restores the Conv3d patch-embed layout llama.cpp splits into two taps, and the processor is synthesized from the mmproj metadata.",
+            "The V2 runner is required for the DFlash2 rank-256 path selector. On the exact 1000-in/2000-out workload it raised c8 throughput from 164.87 to 194.21 tok/s while preserving exact token counts; the legacy runner independently argmaxes each draft position and does not execute the trained selector.",
+            "Sized from the qwen38-nvfp4-1 MI300X record (same model, same card) rather than from the Metal record: 192 GB of VRAM lifts the Metal profile's 12 GiB KV pool and 131072-token ceiling, so the full 262144 context and 64 concurrent sequences fit with room to spare on 9.2 GiB of weights.",
+            "kv_cache_dtype must be auto (bf16): this fork defaults the cache to fp8 for its GLM target, and the hybrid GDN/full-attention cache has only been validated at auto on this model.",
+            "Prefix caching is off for the same reason as on Metal: only the 16 full-attention layers hold paged KV, the other 48 carry recurrent state.",
+            "max_cudagraph_capture_size 256 = (1 + k) x max_num_seqs for DFlash k=3 at 64 sequences, the same rule the qwen38-nvfp4-1 MI300X record follows at 192 for MTP k=2. A speculative decode step submits one row per draft slot per sequence, so a ceiling sized to max_num_seqs alone silently drops the largest batches to eager. The c1 and c8 numbers in the notebook are unaffected -- c8 is 8 x 4 = 32 rows, inside either ceiling -- so this widens graph coverage for c9..c64 rather than restating a measurement.",
+            "A fixed 96 GiB KV pool rather than gpu_memory_utilization: the utilization path runs an 8192-token profiling forward to measure free memory, which costs 142 s of Triton JIT on this model's GDN kernels and more than doubles boot. 96 GiB is half the card, comfortably above what 262144 tokens x 16 paged layers needs, and leaves the rest for the vision tower, the drafter and graph pools."
           ]
         }
       }
