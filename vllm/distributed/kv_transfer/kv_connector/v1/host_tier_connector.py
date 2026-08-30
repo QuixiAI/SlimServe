@@ -102,9 +102,30 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 "HostTierConnector requires kv_connector_extra_config."
                 "host_tier_gb_per_rank > 0"
             )
-        self.block_stride, _ = _get_packed_kv_cache_layout(
-            kv_cache_config.kv_cache_groups
-        )
+        # Prefer the planner's authoritative packed stride over recomputing
+        # from group specs: generate_scheduler_kv_cache_config flattens a
+        # UniformTypeKVCacheSpecs group to ONE arbitrary member layer's spec,
+        # so on the scheduler side a heterogeneous uniform group (e.g.
+        # GLM-DSA: MLA main KV + indexer k_cache pages in one group) yields a
+        # spec-derived stride far below the real slab stride. The two roles
+        # then disagree on num_slots and the scheduler plans host slots the
+        # worker arena does not have (observed: 59811 vs 15339 slots,
+        # IndexError at restore). KVCacheTensor.block_stride survives the
+        # scheduler deepcopy unmodified, so both roles agree through it.
+        packed_strides = {
+            t.block_stride
+            for t in kv_cache_config.kv_cache_tensors
+            if t.block_stride
+        }
+        if packed_strides:
+            assert len(packed_strides) == 1, (
+                f"host-tier: mixed packed block strides {packed_strides}"
+            )
+            self.block_stride = packed_strides.pop()
+        else:
+            self.block_stride, _ = _get_packed_kv_cache_layout(
+                kv_cache_config.kv_cache_groups
+            )
         self.num_slots = int(tier_gb * (1 << 30)) // self.block_stride
         if self.num_slots <= 0:
             raise ValueError("host tier smaller than one block stride")

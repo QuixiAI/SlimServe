@@ -17738,3 +17738,23 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
 - Hardware: AMD Instinct MI300X (gfx942), 8 GPUs present, one used.
 - Raw artifacts: `perf/results/2026-08-30/actquant-tile-sweep/`
   (actquant.json plus the three benchmark scripts).
+
+### Host tier: scheduler/worker arena disagreement (fixed)
+- First TP4 fp8 sweep leg ran 56 min then all sessions 500'd:
+  IndexError in KVTierDMA.issue, planned host slots 15339/15351 vs a
+  15339-slot worker arena. Boot log showed the split brain: scheduler-side
+  index "59811 slots" vs worker "arena 15339 slots x 3360000 bytes".
+- Root cause: generate_scheduler_kv_cache_config replaces a
+  UniformTypeKVCacheSpecs group spec with ONE arbitrary member layer's
+  spec ("all layers have the same type"). GLM-DSA's uniform group is
+  heterogeneous (MLA main KV 52.5 KiB/token + indexer k_cache 132 B/token
+  pages), and the arbitrary pick was an indexer layer, so the scheduler
+  derived stride 102x8448=861696 instead of the real 3360000 and planned
+  restores into slots the arena does not have. DSV4 never hit it: its
+  uniform groups are homogeneous, so the flattened spec gives the same
+  stride. The bug only fires once the arena FILLS (GLM fp8 slots are
+  3.36 MB, so this was the first workload to wrap 48 GiB).
+- Fix: HostTierConnector now takes block_stride from the planner's
+  KVCacheTensor.block_stride (authoritative, survives the scheduler
+  deepcopy) and only falls back to recomputing from group specs for
+  non-packed layouts. Validated on reboot: both roles log 15339 slots.
