@@ -32,6 +32,7 @@ Config (kv_transfer_config.kv_connector_extra_config):
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -57,6 +58,12 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+# Acceptance/diagnostic aid: log every deep-prefix tier lookup miss (with
+# the index's explanation) at INFO. Misses are silent otherwise, which
+# leaves "recall passed" claims unable to distinguish a tier restore from
+# a plain full re-prefill.
+_LOG_MISS = os.environ.get("VLLM_KV_TIER_LOG_MISS", "0") == "1"
 
 
 @dataclass
@@ -238,8 +245,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 return remaining, True
         hit = self.index.lookup(request.block_hashes)
         if hit is None:
-            if logger.isEnabledFor(logging.DEBUG) and len(request.block_hashes) >= 8:
-                logger.debug(
+            log_miss = _LOG_MISS or logger.isEnabledFor(logging.DEBUG)
+            if log_miss and len(request.block_hashes) >= 8:
+                logger.info(
                     "host-tier: lookup miss for %s: %s",
                     request.request_id[-8:],
                     self.index.explain_miss(request.block_hashes),

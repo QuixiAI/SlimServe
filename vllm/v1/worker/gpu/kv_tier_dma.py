@@ -74,6 +74,13 @@ class KVTierDMA:
         self._inflight: list[tuple[TierOpBatch, torch.cuda.Event]] = []
         self._restore_events: list[torch.cuda.Event] = []
         self._slot_digests: dict[int, str] = {}
+        # Cumulative op counters, logged periodically: the tier moves bytes
+        # silently otherwise, which makes "acceptance passed" claims
+        # unfalsifiable (a full re-prefill answers recall probes just as
+        # well as a restore does).
+        self._total_offloads = 0
+        self._total_restores = 0
+        self._batches_since_log = 0
 
     def issue(self, batch: TierOpBatch) -> None:
         """Enqueue a batch of copies on the copy stream."""
@@ -94,6 +101,20 @@ class KVTierDMA:
         self._inflight.append((batch, event))
         if batch.restore or batch.zero:
             self._restore_events.append(event)
+        self._total_offloads += len(batch.offload)
+        self._total_restores += len(batch.restore)
+        self._batches_since_log += 1
+        if batch.restore or self._batches_since_log >= 200:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "kv-tier dma: totals offload=%d restore=%d (+%d/+%d this batch)",
+                self._total_offloads,
+                self._total_restores,
+                len(batch.offload),
+                len(batch.restore),
+            )
+            self._batches_since_log = 0
 
     def fence_restores(self) -> None:
         """Make the compute stream wait on all outstanding restore copies.
