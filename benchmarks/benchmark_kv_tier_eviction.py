@@ -59,7 +59,7 @@ async def _turn(session, args, messages, max_tokens, seed):
             raise RuntimeError(f"HTTP {resp.status}: {str(body)[:200]}")
     msg = body["choices"][0]["message"]
     usage = body.get("usage", {})
-    return msg.get("content") or "", usage.get("prompt_tokens", 0)
+    return msg.get("content") or "", usage.get("prompt_tokens", 0), msg, usage
 
 
 async def build_target(session, args, rng):
@@ -83,7 +83,9 @@ async def build_target(session, args, rng):
                 "Please briefly summarize this note. " + _words(rng, args.filler_words)
             )
         messages.append({"role": "user", "content": ask})
-        reply, ctx = await _turn(session, args, messages, args.reply_tokens, args.seed)
+        reply, ctx, _, _ = await _turn(
+            session, args, messages, args.reply_tokens, args.seed
+        )
         messages.append({"role": "assistant", "content": reply})
         print(f"[target] ctx={ctx} markers={len(markers)}", flush=True)
     return messages, markers, ctx
@@ -101,7 +103,9 @@ async def churn_filler(session, args, rng, fid, tokens_goal, counter):
         try:
             # Prefill-only: cycling the pool needs prompt tokens, not
             # generation; a 1-token reply keeps filler turns cheap.
-            _, ptoks = await _turn(session, args, messages, 1, args.seed + fid)
+            _, ptoks, _, _ = await _turn(
+                session, args, messages, 1, args.seed + fid
+            )
         except Exception as e:  # noqa: BLE001 - keep churning through timeouts
             print(f"[filler {fid}] error: {e}", flush=True)
             await asyncio.sleep(2)
@@ -182,17 +186,34 @@ async def main():
             )
             trial = messages + [{"role": "user", "content": q}]
             try:
-                reply, ptoks = await _turn(
+                reply, ptoks, msg, usage = await _turn(
                     session, args, trial, args.probe_tokens, args.seed
                 )
-                ok = m["code"] in reply
+                reasoning = msg.get("reasoning") or msg.get(
+                    "reasoning_content"
+                ) or ""
+                in_content = m["code"] in reply
+                in_reasoning = m["code"] in reasoning
+                # KV integrity is what this acceptance checks: the marker
+                # surfacing anywhere in the generation proves the restored
+                # context is intact. Content-vs-reasoning placement is a
+                # parser/budget concern, recorded but not a failure.
+                ok = in_content or in_reasoning
             except Exception as e:  # noqa: BLE001
-                reply, ptoks, ok = f"ERROR: {e}", 0, False
+                reply, reasoning, usage = f"ERROR: {e}", "", {}
+                in_content = in_reasoning = ok = False
             probes.append({
                 "index": m["index"], "code": m["code"], "ok": ok,
+                "in_content": in_content, "in_reasoning": in_reasoning,
+                "completion_tokens": usage.get("completion_tokens"),
                 "ctx_at_plant": m["ctx_at_plant"], "reply": reply[:200],
+                "reasoning_tail": reasoning[-300:],
             })
-            print(f"[probe {m['index']}] ok={ok} code={m['code']}", flush=True)
+            print(
+                f"[probe {m['index']}] ok={ok} (content={in_content} "
+                f"reasoning={in_reasoning}) code={m['code']}",
+                flush=True,
+            )
         result["phases"]["probe"] = {
             "probes": probes,
             "ok": sum(p["ok"] for p in probes),

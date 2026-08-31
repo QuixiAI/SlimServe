@@ -156,6 +156,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid, g in enumerate(groups)
             if isinstance(g.kv_cache_spec, MambaSpec)
         ]
+        # Attention-only models (GLM-DSA, DSV4 sparse MLA) have no mamba
+        # tail state to anchor resumability, and their chat replays always
+        # diverge from staged trajectories at the previous generation
+        # boundary. They therefore use partial-prefix lookup, adoption
+        # without restore, and supersede-on-divergence staging; the
+        # tail-exact mamba semantics stay untouched for hybrid models.
+        self._attention_only = not self.state_groups
         # The QSA compressor ring is NOT saved or restored. The framework
         # never zeroes ring blocks (CircularBufferSpec is not in the
         # zero-recording spec set), so engine-internal prefix hits - which
@@ -243,7 +250,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             remaining = track.planned_blocks * bs - num_computed_tokens
             if remaining > 0:
                 return remaining, True
-        hit = self.index.lookup(request.block_hashes)
+        hit = self.index.lookup(
+            request.block_hashes, allow_partial=self._attention_only
+        )
         if hit is None:
             log_miss = _LOG_MISS or logger.isEnabledFor(logging.DEBUG)
             if log_miss and len(request.block_hashes) >= 8:
@@ -254,7 +263,26 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             return 0, False
         hit_owner, n_blocks, attn_slots, state_slots = hit
+        if self._attention_only:
+            # Any gap-free prefix restores validly; clamp so at least one
+            # token remains to compute.
+            clamp = (request.num_tokens - 1) // bs
+            if n_blocks > clamp:
+                n_blocks = clamp
+                attn_slots = attn_slots[:clamp]
         n_tokens = n_blocks * bs
+        if n_tokens <= num_computed_tokens and self._attention_only:
+            # The GPU cache already covers the tier's span: no restore,
+            # but ADOPT the lineage so this turn's staging extends the
+            # conversation's one trajectory instead of fragmenting a new
+            # one per turn.
+            if track is None:
+                track = _ReqTrack(
+                    group_blocks=[[] for _ in range(self.num_groups)]
+                )
+                self._tracks[request.request_id] = track
+            track.owner = hit_owner
+            return 0, False
         # Resume is only possible exactly at the stored tail boundary
         # (mamba state exists only there), and at least one token must
         # remain to compute.
@@ -421,7 +449,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     block_id = track.group_blocks[gid][logical]
                     if block_id < 0:
                         continue
-                    slot = self.index.stage_attention(owner, logical, block_hash)
+                    slot = self.index.stage_attention(
+                        owner,
+                        logical,
+                        block_hash,
+                        supersede=self._attention_only,
+                    )
                     if slot is not None:
                         ops.append((block_id, slot))
                 if ops:

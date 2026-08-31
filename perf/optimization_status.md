@@ -17790,3 +17790,47 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   SHA round-trip is being exercised deliberately by
   benchmarks/benchmark_kv_tier_eviction.py against a kept TP8 server
   (results under perf/results/2026-08-30/kvtier-acceptance/).
+
+## 2026-08-31: A100 host tier was WRITE-ONLY - restore path root cause + fix
+
+- The instrumented eviction acceptance (issue #18 battery) proved the tier
+  never restored on A100: thousands of offloads, zero restores, every
+  probe lookup missing. Recall "passes" in all prior A100 validations
+  (incl. the 2026-08-29 seven-profile sweep) were full re-prefill, not
+  tier restores - indistinguishable without the new DMA counters.
+- Three stacked causes, all specific to attention-only models (GLM-DSA,
+  DSV4 sparse MLA; the validated qwen/rtx3090 mamba path is unaffected):
+  1. resumable_blocks() requires a mamba tail anchor; attention-only
+     models never save one (request_finished_all_groups returns early
+     when state_groups is empty), so EVERY trajectory reported zero
+     resumable blocks (explain_miss: tail=-1). The tier index was
+     structurally unmatchable.
+  2. All-or-nothing hash matching: chat replays always diverge from the
+     staged chain at the previous turn's generation boundary
+     (template-wrapped assistant text hashes differently from the tokens
+     as sampled), so even a tail-less exact match could never fire
+     (hash_mismatch_at=21 of attn_len=25).
+  3. Trajectory fragmentation: a turn continuing via GPU prefix cache
+     never adopted the prior turn's lineage, so each turn staged its own
+     gap-ridden fragment.
+- Fix (gated on state_groups == [], mamba semantics untouched):
+  attn_prefix_len() makes any gap-free staged prefix resumable
+  (attention KV is position-independent, unlike cumulative mamba state);
+  lookup(allow_partial=True) resumes at the longest common hash prefix,
+  clamped at pending-write slots; adoption-without-restore keeps one
+  lineage per conversation when the GPU cache covers the tier's span; and
+  stage_attention(supersede=True) frees + restages a diverged suffix
+  (deferred-free set for slots still pending write). Offline index unit
+  tests cover partial lookup, adoption, supersede recycling, pending
+  clamp, and orphan free.
+- On-box proof (glm52-q2k-8, 12K-token conversation, 491K-token churn of
+  the 330K pool, VLLM_KV_TIER_VERIFY=1): "host-tier: hit ... resume at
+  block 194 (12416 tokens)", DMA totals restore=203, and 80 verify
+  batches with 0 SHA mismatches - the first verified host-tier restores
+  on A100. Mid-build hits at blocks 151/172 show per-turn lineage
+  adoption working.
+- Residual: one probe returns empty content with the marker likely in the
+  reasoning channel (budget/parser shaped, not KV); the acceptance bench
+  now records content-vs-reasoning placement and completion tokens, and
+  counts either placement as KV-intact. Verification rerun in flight.
+- Raw: perf/results/2026-08-30/kvtier-acceptance/glm52-q2k-8/.

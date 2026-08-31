@@ -72,6 +72,20 @@ class Trajectory:
             n += 1
         return n if n == self.tail_boundary else 0
 
+    def attn_prefix_len(self) -> int:
+        """Longest gap-free staged attention prefix, tail-agnostic.
+
+        The resumable span for attention-only models: KV blocks are
+        position-independent (unlike cumulative mamba state), so any
+        gap-free prefix restores validly with the remainder re-prefilled.
+        """
+        n = 0
+        for slot in self.attn_slots:
+            if slot is None:
+                break
+            n += 1
+        return n
+
 
 class HostKVTierIndex:
     """Trajectory-centric host tier placement and lookup."""
@@ -82,6 +96,10 @@ class HostKVTierIndex:
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
+        # Slots superseded while their write was still in flight: no
+        # trajectory references them any more, so free them as soon as
+        # their write confirms.
+        self._orphaned_pending: set[int] = set()
 
     # ------------------------------------------------------------------ write
 
@@ -93,16 +111,41 @@ class HostKVTierIndex:
         return slot
 
     def stage_attention(
-        self, owner: str, logical: int, block_hash: BlockHash
+        self,
+        owner: str,
+        logical: int,
+        block_hash: BlockHash,
+        supersede: bool = False,
     ) -> int | None:
-        """Reserve a slot for attention block `logical` of `owner`."""
+        """Reserve a slot for attention block `logical` of `owner`.
+
+        With ``supersede`` (attention-only lineages), a position already
+        staged under a DIFFERENT hash means the chain diverged there (an
+        adopted conversation grew past its previous generation boundary):
+        the stale suffix is freed and restaged, mirroring what the GPU
+        prefix cache does with a diverged tail. Without it (mamba), an
+        occupied position is left untouched.
+        """
         traj = self._trajectories.setdefault(owner, Trajectory())
         self.touch(owner)
         while len(traj.attn_slots) <= logical:
             traj.attn_slots.append(None)
             traj.hashes.append(b"")
         if traj.attn_slots[logical] is not None:
-            return None
+            if not (supersede and traj.hashes[logical] != block_hash):
+                return None
+            # Chain diverged at `logical`: everything from here on belongs
+            # to a superseded branch. Free it (skip slots still pending
+            # write; they are reclaimed when their trajectory dies).
+            for i in range(logical, len(traj.attn_slots)):
+                s = traj.attn_slots[i]
+                if s is not None:
+                    if s in self._pending_write:
+                        self._orphaned_pending.add(s)
+                    else:
+                        self._free.append(s)
+                traj.attn_slots[i] = None
+                traj.hashes[i] = b""
         slot = self._alloc_slot(owner)
         if slot is None:
             return None
@@ -150,6 +193,9 @@ class HostKVTierIndex:
     def confirm_writes(self, slots: list[int]) -> None:
         for slot in slots:
             self._pending_write.discard(slot)
+            if slot in self._orphaned_pending:
+                self._orphaned_pending.discard(slot)
+                self._free.append(slot)
         for traj in self._trajectories.values():
             if traj.tail_pending and not any(
                 s in self._pending_write for s in traj.tail_state_slots.values()
@@ -159,7 +205,7 @@ class HostKVTierIndex:
     # ----------------------------------------------------------------- lookup
 
     def lookup(
-        self, hashes: list[BlockHash]
+        self, hashes: list[BlockHash], allow_partial: bool = False
     ) -> tuple[str, int, list[int], dict[int, int]] | None:
         """Match `hashes` against stored trajectories.
 
@@ -168,10 +214,39 @@ class HostKVTierIndex:
         None. The owner lets a resuming request ADOPT the trajectory and
         extend it in place (the conversation's next turn keeps growing one
         lineage instead of duplicating it).
+
+        With ``allow_partial`` (attention-only models: no mamba tail to
+        anchor), the match is the longest common hash prefix within the
+        trajectory's gap-free staged span, clamped at the first slot still
+        pending write. Chat replays ALWAYS diverge at the previous turn's
+        generation boundary (template-wrapped assistant text hashes
+        differently from the tokens as sampled), so all-or-nothing
+        matching never fires for chat traffic.
         """
         best: tuple[str, int, list[int], dict[int, int]] | None = None
         best_owner: str | None = None
         for owner, traj in list(self._trajectories.items()):
+            if allow_partial:
+                span = min(traj.attn_prefix_len(), len(hashes))
+                m = 0
+                while (
+                    m < span
+                    and traj.hashes[m] == hashes[m]
+                    and traj.attn_slots[m] not in self._pending_write
+                ):
+                    m += 1
+                if m <= 0:
+                    continue
+                if best is not None and m <= best[1]:
+                    continue
+                best = (
+                    owner,
+                    m,
+                    [s for s in traj.attn_slots[:m] if s is not None],
+                    {},
+                )
+                best_owner = owner
+                continue
             n = traj.resumable_blocks()
             if n <= 0 or n > len(hashes):
                 continue
