@@ -265,6 +265,23 @@ def register_xpu_c_ops() -> None:
         return
     lib = Library("_C", "FRAGMENT")
     _LIB = lib  # set first: imports below can re-enter through the platform
+    # vllm-xpu-kernels, when installed, defines many of these same _C schemas
+    # from C++ (csrc/torch_bindings.cpp). A Python def() followed by the C++
+    # def() on the same schema is a hard torch abort, not a catchable error, so
+    # load it FIRST and let the hasattr() guard below defer to it. Order is not
+    # something we can rely on the caller to get right: the model-registry
+    # inspection runs in a subprocess that inherits PYTHONPATH but none of the
+    # parent's already-loaded libraries. (2026-09-01)
+    try:
+        import vllm_xpu_kernels._C  # noqa: F401
+
+        logger.info_once("XPU: loaded vllm_xpu_kernels._C (C++ _C schemas).")
+    except Exception as e:
+        logger.warning_once(
+            "XPU: vllm_xpu_kernels._C not loaded (%s). Ops it provides "
+            "(e.g. static_scaled_fp8_quant) will be missing an XPU kernel.",
+            e,
+        )
     registered = []
     for schema, fn in _SCHEMAS.items():
         name = schema.split("(", 1)[0]
