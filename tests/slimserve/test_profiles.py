@@ -282,7 +282,7 @@ def test_platform_override_replaces_the_mi300x_kv_budget():
     nvidia = resolve("glm52-q2k-4", "a100", 4, "Q2_K")
     assert "kv_cache_memory_bytes" in amd.engine
     assert "kv_cache_memory_bytes" not in nvidia.engine
-    assert nvidia.engine["gpu_memory_utilization"] == 0.95
+    assert nvidia.engine["gpu_memory_utilization"] == 0.96
     assert nvidia.env == {}, "AITER is a ROCm switch"
 
 

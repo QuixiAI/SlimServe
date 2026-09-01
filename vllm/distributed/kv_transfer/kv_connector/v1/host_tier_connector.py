@@ -47,7 +47,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import _get_packed_kv_cache_layout
 from vllm.v1.core.kv_tier_index import HostKVTierIndex
-from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -68,10 +72,12 @@ _LOG_MISS = os.environ.get("VLLM_KV_TIER_LOG_MISS", "0") == "1"
 
 @dataclass
 class HostTierMeta(KVConnectorMetadata):
-    # req_id -> [(host_slot, gpu_block_id), ...] restores for held requests.
-    restores: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
-    # batch_seq -> [(gpu_block_id, host_slot), ...] attention fill offloads.
-    offloads: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    # req_id -> [(host_slot, gpu_block_id, kv_group_id), ...] restores for
+    # held requests.
+    restores: dict[str, list[tuple[int, int, int]]] = field(default_factory=dict)
+    # batch_seq -> [(gpu_block_id, host_slot, kv_group_id), ...] attention
+    # fill offloads.
+    offloads: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
     # req_id -> [gpu_block_id, ...] blocks to zero alongside the restore
     # (the ring block, whose framework zeroing was skipped for the
     # async-load range but which the tier deliberately does not restore).
@@ -84,7 +90,7 @@ class _ReqTrack:
     group_blocks: list[list[int]]
     staged_upto: int = 0
     planned_blocks: int = 0
-    planned_attn_slots: list[int] = field(default_factory=list)
+    planned_attn_slots: list[dict[int, int]] = field(default_factory=list)
     planned_state_slots: dict[int, int] = field(default_factory=dict)
     planned_start: int = 0
     restored_upto: int = 0  # blocks already staged for restore
@@ -156,13 +162,36 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid, g in enumerate(groups)
             if isinstance(g.kv_cache_spec, MambaSpec)
         ]
-        # Attention-only models (GLM-DSA, DSV4 sparse MLA) have no mamba
-        # tail state to anchor resumability, and their chat replays always
-        # diverge from staged trajectories at the previous generation
-        # boundary. They therefore use partial-prefix lookup, adoption
-        # without restore, and supersede-on-divergence staging; the
-        # tail-exact mamba semantics stay untouched for hybrid models.
+        # Attention-only models (GLM-DSA) have no mamba tail state to
+        # anchor resumability, and their chat replays always diverge from
+        # staged trajectories at the previous generation boundary. They
+        # therefore use partial-prefix lookup, adoption without restore,
+        # and supersede-on-divergence staging; the tail-exact mamba
+        # semantics stay untouched for hybrid models.
         self._attention_only = not self.state_groups
+        # Partial resume additionally requires every attention group to be
+        # deep KV at the shared hash granularity. Sliding-window groups
+        # (DSV4: SlidingWindowMLASpec at block sizes 4-64 beside the
+        # 256-block MLA group) keep only a recent window whose contents are
+        # boundary-specific state: restoring a deep prefix without the
+        # windows at the resume boundary would compute over holes, and the
+        # restore planner would otherwise strand the request in
+        # WAITING_FOR_REMOTE_KVS on the first missing window block.
+        # Until window-tail staging lands (issue #18 follow-up), such
+        # layouts keep the tier write-only and never plan restores.
+        hbs = groups[self.attn_groups[0]].kv_cache_spec.block_size
+        self._partial_resume_ok = self._attention_only and all(
+            type(groups[g].kv_cache_spec).__name__
+            in ("FullAttentionSpec", "MLAAttentionSpec", "UniformTypeKVCacheSpecs")
+            and groups[g].kv_cache_spec.block_size == hbs
+            for g in self.attn_groups
+        )
+        if self._attention_only and not self._partial_resume_ok:
+            logger.info(
+                "host-tier: restore path disabled for this KV layout "
+                "(sliding-window or mixed-block-size attention groups); "
+                "tier stays write-only until window-tail staging lands"
+            )
         # The QSA compressor ring is NOT saved or restored. The framework
         # never zeroes ring blocks (CircularBufferSpec is not in the
         # zero-recording spec set), so engine-internal prefix hits - which
@@ -186,6 +215,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # stale pre-alignment value in the scheduler process; the group spec
         # is authoritative.
         self.hash_block_size = groups[self.attn_groups[0]].kv_cache_spec.block_size
+        # Per-group live bytes within a block-stride row: each group's
+        # layers occupy a contiguous prefix [0, sum) of its own rows (the
+        # packed planner starts every group at offset 0), so DMA copies can
+        # stop at the group's extent instead of moving whole rows. Only the
+        # WORKER role may consume this: the scheduler's kv_cache_config has
+        # flattened UniformType specs (arbitrary member layer), which give
+        # wrong sums for heterogeneous groups.
+        self._group_nbytes: dict[int, int] = {}
+        for gid, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            total = 0
+            for layer_name in group.layer_names:
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    total += spec.kv_cache_specs[layer_name].page_size_bytes
+                else:
+                    total += spec.page_size_bytes
+            self._group_nbytes[gid] = min(total, self.block_stride)
 
         if role == KVConnectorRole.SCHEDULER:
             logger.info(
@@ -196,11 +242,21 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 self.attn_groups,
                 self.state_groups,
             )
-            self.index = HostKVTierIndex(self.num_slots)
+            for gid, group in enumerate(groups):
+                logger.info(
+                    "host-tier: group %d: %s, %d layers, block_size %d, "
+                    "live bytes/block %d",
+                    gid,
+                    type(group.kv_cache_spec).__name__,
+                    len(group.layer_names),
+                    group.kv_cache_spec.block_size,
+                    self._group_nbytes[gid],
+                )
+            self.index = HostKVTierIndex(self.num_slots, attn_gids=self.attn_groups)
             self._tracks: dict[str, _ReqTrack] = {}
             self._requests: dict[str, Request] = {}
-            self._staged_restores: dict[str, list[tuple[int, int]]] = {}
-            self._staged_offloads: dict[int, list[tuple[int, int]]] = {}
+            self._staged_restores: dict[str, list[tuple[int, int, int]]] = {}
+            self._staged_offloads: dict[int, list[tuple[int, int, int]]] = {}
             self._staged_zeros: dict[str, list[int]] = {}
             # Writes issued last step; confirmed next build (in-order copy
             # stream: any restore issued later observes completed writes).
@@ -251,7 +307,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             if remaining > 0:
                 return remaining, True
         hit = self.index.lookup(
-            request.block_hashes, allow_partial=self._attention_only
+            request.block_hashes, allow_partial=self._partial_resume_ok
         )
         if hit is None:
             log_miss = _LOG_MISS or logger.isEnabledFor(logging.DEBUG)
@@ -271,7 +327,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 n_blocks = clamp
                 attn_slots = attn_slots[:clamp]
         n_tokens = n_blocks * bs
-        if n_tokens <= num_computed_tokens and self._attention_only:
+        if n_tokens <= num_computed_tokens and self._partial_resume_ok:
             # The GPU cache already covers the tier's span: no restore,
             # but ADOPT the lineage so this turn's staging extends the
             # conversation's one trajectory instead of fragmenting a new
@@ -339,14 +395,18 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 gb = track.group_blocks[gid]
                 if logical >= len(gb) or gb[logical] < 0:
                     logger.warning(
-                        "host-tier: no target block for %s attn g%d pos %d",
+                        "host-tier: no target block for %s attn g%d pos %d "
+                        "(group table lens: %s)",
                         request.request_id[-8:],
                         gid,
                         logical,
+                        [len(g) for g in track.group_blocks],
                     )
                     track.planned_blocks = 0
                     return
-                ops.append((track.planned_attn_slots[logical], gb[logical]))
+                ops.append(
+                    (track.planned_attn_slots[logical][gid], gb[logical], gid)
+                )
         # Tail-boundary state blocks ride the FINAL restore chunk. The
         # resumed state must land at position ``boundary_blocks - 1`` of
         # each mamba group: the worker seeds its running state index as
@@ -372,7 +432,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     track.planned_blocks = 0
                     return
-                ops.append((slot, gb[state_pos]))
+                ops.append((slot, gb[state_pos], gid))
             # Zero the ring defensively (see __init__: internal hits run
             # on a stale-claimed, never-zeroed ring; zero is the same or
             # strictly cleaner).
@@ -453,10 +513,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                         owner,
                         logical,
                         block_hash,
-                        supersede=self._attention_only,
+                        gid=gid,
+                        supersede=self._partial_resume_ok,
                     )
                     if slot is not None:
-                        ops.append((block_id, slot))
+                        ops.append((block_id, slot, gid))
                 if ops:
                     self._offload_seq += 1
                     self._staged_offloads[self._offload_seq] = ops
@@ -483,7 +544,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self._staged_offloads = {}
         self._staged_zeros = {}
         self._last_step_write_slots.extend(
-            s for ops in meta.offloads.values() for _, s in ops
+            s for ops in meta.offloads.values() for _, s, _gid in ops
         )
         return meta
 
@@ -577,7 +638,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self._block_pool.touch(pin_blocks)
         self._pins_staged.append(pin_blocks)
         ops = [
-            (targets[tier_gid], slots[tier_gid])
+            (targets[tier_gid], slots[tier_gid], self.state_groups[tier_gid])
             for tier_gid in range(len(self.state_groups))
         ]
         self._offload_seq += 1
@@ -633,7 +694,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             backing.numel(),
         )
         self._dma = KVTierDMA(
-            backing, self.block_stride, self.num_slots, any_tensor.device
+            backing,
+            self.block_stride,
+            self.num_slots,
+            any_tensor.device,
+            group_nbytes=self._group_nbytes,
         )
         logger.info(
             "host-tier: arena %d slots x %d bytes (%.1f GiB pinned) per rank",

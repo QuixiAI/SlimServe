@@ -40,8 +40,8 @@ class TierOpBatch:
     """One scheduler-issued batch of tier operations."""
 
     seq: int
-    offload: list[tuple[int, int]]  # (gpu_block, host_slot)
-    restore: list[tuple[int, int]]  # (host_slot, gpu_block)
+    offload: list[tuple[int, int, int]]  # (gpu_block, host_slot, kv_group)
+    restore: list[tuple[int, int, int]]  # (host_slot, gpu_block, kv_group)
     # GPU blocks to zero with the batch (a resumed request's ring block:
     # the framework never zeroes ring blocks, so this is defensive
     # determinism over the stale-claimed bytes internal hits run on).
@@ -59,10 +59,16 @@ class KVTierDMA:
         block_stride: int,
         num_slots: int,
         device: torch.device,
+        group_nbytes: dict[int, int] | None = None,
     ):
         assert backing.dtype == torch.int8 and backing.is_cuda
         assert backing.numel() % block_stride == 0
         self.blocks = backing.view(-1, block_stride)
+        # Live bytes per KV-cache group within a row (each group's layers
+        # occupy a contiguous [0, n) prefix of its own rows); copies stop
+        # at the group's extent. Unknown group -> whole row.
+        self._group_nbytes = group_nbytes or {}
+        self._stride = block_stride
         self.device = device
         # One pinned arena; rows are DMA-contiguous with the GPU block rows.
         self.arena = torch.empty(
@@ -90,12 +96,18 @@ class KVTierDMA:
         with torch.cuda.stream(self.copy_stream):
             # Offloaded blocks were produced on the compute stream.
             self.copy_stream.wait_stream(main)
-            for gpu_block, slot in batch.offload:
-                self.arena[slot].copy_(self.blocks[gpu_block], non_blocking=True)
+            for gpu_block, slot, gid in batch.offload:
+                n = self._group_nbytes.get(gid, self._stride)
+                self.arena[slot][:n].copy_(
+                    self.blocks[gpu_block][:n], non_blocking=True
+                )
             for gpu_block in batch.zero:
                 self.blocks[gpu_block].zero_()
-            for slot, gpu_block in batch.restore:
-                self.blocks[gpu_block].copy_(self.arena[slot], non_blocking=True)
+            for slot, gpu_block, gid in batch.restore:
+                n = self._group_nbytes.get(gid, self._stride)
+                self.blocks[gpu_block][:n].copy_(
+                    self.arena[slot][:n], non_blocking=True
+                )
             event = torch.cuda.Event()
             event.record(self.copy_stream)
         self._inflight.append((batch, event))
@@ -145,13 +157,15 @@ class KVTierDMA:
         from vllm.logger import init_logger
 
         logger = init_logger(__name__)
-        for gpu_block, slot in batch.offload:
-            self._slot_digests[slot] = _digest(self.arena[slot])
+        for gpu_block, slot, gid in batch.offload:
+            n = self._group_nbytes.get(gid, self._stride)
+            self._slot_digests[slot] = _digest(self.arena[slot][:n])
         bad = 0
-        for slot, gpu_block in batch.restore:
+        for slot, gpu_block, gid in batch.restore:
+            n = self._group_nbytes.get(gid, self._stride)
             expect = self._slot_digests.get(slot)
-            got = _digest(self.blocks[gpu_block])
-            host = _digest(self.arena[slot])
+            got = _digest(self.blocks[gpu_block][:n])
+            host = _digest(self.arena[slot][:n])
             if expect is not None and got != expect:
                 bad += 1
                 logger.warning(

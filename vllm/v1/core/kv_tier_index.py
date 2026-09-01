@@ -37,10 +37,13 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 @dataclass
 class Trajectory:
     hashes: list[BlockHash] = field(default_factory=list)
-    # Attention slots, position-indexed: attn_slots[i] holds block i.
-    # A position may be missing (None) if staging failed; the resumable
-    # span ends at the first gap.
-    attn_slots: list[int | None] = field(default_factory=list)
+    # Attention slots, position-indexed: attn_slots[i] maps each attention
+    # KV-cache group id to the host slot holding that group's block i (a
+    # hybrid model splits one token-block position across several groups,
+    # each with its own block table - DSV4 has six). A position is complete
+    # only when every attention group is present; the resumable span ends
+    # at the first incomplete position.
+    attn_slots: list[dict[int, int]] = field(default_factory=list)
     # Tail-boundary state: logical block index -> {tier_state_gid: slot}.
     tail_boundary: int = -1
     tail_state_slots: dict[int, int] = field(default_factory=dict)
@@ -54,7 +57,7 @@ class Trajectory:
     tail_pending: bool = False  # tail-state writes still in flight
     last_touch: float = 0.0
 
-    def resumable_blocks(self) -> int:
+    def resumable_blocks(self, attn_gids: frozenset[int]) -> int:
         """Longest gap-free attention prefix ending at the tail boundary,
         with the boundary block's hash matching the saved tail state."""
         if self.tail_boundary <= 0 or self.tail_pending:
@@ -66,13 +69,13 @@ class Trajectory:
         ):
             return 0
         n = 0
-        for slot in self.attn_slots[: self.tail_boundary]:
-            if slot is None:
+        for slots in self.attn_slots[: self.tail_boundary]:
+            if not attn_gids <= slots.keys():
                 break
             n += 1
         return n if n == self.tail_boundary else 0
 
-    def attn_prefix_len(self) -> int:
+    def attn_prefix_len(self, attn_gids: frozenset[int]) -> int:
         """Longest gap-free staged attention prefix, tail-agnostic.
 
         The resumable span for attention-only models: KV blocks are
@@ -80,8 +83,8 @@ class Trajectory:
         gap-free prefix restores validly with the remainder re-prefilled.
         """
         n = 0
-        for slot in self.attn_slots:
-            if slot is None:
+        for slots in self.attn_slots:
+            if not attn_gids <= slots.keys():
                 break
             n += 1
         return n
@@ -90,9 +93,11 @@ class Trajectory:
 class HostKVTierIndex:
     """Trajectory-centric host tier placement and lookup."""
 
-    def __init__(self, num_slots: int):
+    def __init__(self, num_slots: int, attn_gids: list[int] | None = None):
         assert num_slots > 0
         self.num_slots = num_slots
+        # Attention KV-cache group ids a complete position must cover.
+        self.attn_gids = frozenset(attn_gids if attn_gids is not None else [0])
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
@@ -115,9 +120,10 @@ class HostKVTierIndex:
         owner: str,
         logical: int,
         block_hash: BlockHash,
+        gid: int = 0,
         supersede: bool = False,
     ) -> int | None:
-        """Reserve a slot for attention block `logical` of `owner`.
+        """Reserve a slot for attention group ``gid`` of block `logical`.
 
         With ``supersede`` (attention-only lineages), a position already
         staged under a DIFFERENT hash means the chain diverged there (an
@@ -129,27 +135,28 @@ class HostKVTierIndex:
         traj = self._trajectories.setdefault(owner, Trajectory())
         self.touch(owner)
         while len(traj.attn_slots) <= logical:
-            traj.attn_slots.append(None)
+            traj.attn_slots.append({})
             traj.hashes.append(b"")
-        if traj.attn_slots[logical] is not None:
-            if not (supersede and traj.hashes[logical] != block_hash):
+        if traj.hashes[logical] not in (b"", block_hash):
+            if not supersede:
                 return None
             # Chain diverged at `logical`: everything from here on belongs
-            # to a superseded branch. Free it (skip slots still pending
-            # write; they are reclaimed when their trajectory dies).
+            # to a superseded branch. Free it (a slot still pending write
+            # is orphaned and freed when its write confirms).
             for i in range(logical, len(traj.attn_slots)):
-                s = traj.attn_slots[i]
-                if s is not None:
+                for s in traj.attn_slots[i].values():
                     if s in self._pending_write:
                         self._orphaned_pending.add(s)
                     else:
                         self._free.append(s)
-                traj.attn_slots[i] = None
+                traj.attn_slots[i] = {}
                 traj.hashes[i] = b""
+        if gid in traj.attn_slots[logical]:
+            return None
         slot = self._alloc_slot(owner)
         if slot is None:
             return None
-        traj.attn_slots[logical] = slot
+        traj.attn_slots[logical][gid] = slot
         traj.hashes[logical] = block_hash
         return slot
 
@@ -206,7 +213,7 @@ class HostKVTierIndex:
 
     def lookup(
         self, hashes: list[BlockHash], allow_partial: bool = False
-    ) -> tuple[str, int, list[int], dict[int, int]] | None:
+    ) -> tuple[str, int, list[dict[int, int]], dict[int, int]] | None:
         """Match `hashes` against stored trajectories.
 
         Returns (owner, num_blocks, attention_slots, tail_state_slots) for
@@ -223,16 +230,19 @@ class HostKVTierIndex:
         differently from the tokens as sampled), so all-or-nothing
         matching never fires for chat traffic.
         """
-        best: tuple[str, int, list[int], dict[int, int]] | None = None
+        best: tuple[str, int, list[dict[int, int]], dict[int, int]] | None = None
         best_owner: str | None = None
         for owner, traj in list(self._trajectories.items()):
             if allow_partial:
-                span = min(traj.attn_prefix_len(), len(hashes))
+                span = min(traj.attn_prefix_len(self.attn_gids), len(hashes))
                 m = 0
                 while (
                     m < span
                     and traj.hashes[m] == hashes[m]
-                    and traj.attn_slots[m] not in self._pending_write
+                    and not any(
+                        s in self._pending_write
+                        for s in traj.attn_slots[m].values()
+                    )
                 ):
                     m += 1
                 if m <= 0:
@@ -242,18 +252,20 @@ class HostKVTierIndex:
                 best = (
                     owner,
                     m,
-                    [s for s in traj.attn_slots[:m] if s is not None],
+                    [dict(d) for d in traj.attn_slots[:m]],
                     {},
                 )
                 best_owner = owner
                 continue
-            n = traj.resumable_blocks()
+            n = traj.resumable_blocks(self.attn_gids)
             if n <= 0 or n > len(hashes):
                 continue
             if best is not None and n <= best[1]:
                 continue
             if any(
-                s in self._pending_write for s in traj.attn_slots[:n]
+                s in self._pending_write
+                for d in traj.attn_slots[:n]
+                for s in d.values()
             ):
                 continue
             if traj.hashes[:n] != hashes[:n]:
@@ -261,7 +273,7 @@ class HostKVTierIndex:
             best = (
                 owner,
                 n,
-                [s for s in traj.attn_slots[:n] if s is not None],
+                [dict(d) for d in traj.attn_slots[:n]],
                 dict(traj.tail_state_slots),
             )
             best_owner = owner
@@ -280,8 +292,8 @@ class HostKVTierIndex:
             gap = next(
                 (
                     i
-                    for i, s in enumerate(traj.attn_slots[: traj.tail_boundary])
-                    if s is None
+                    for i, d in enumerate(traj.attn_slots)
+                    if not self.attn_gids <= d.keys()
                 ),
                 None,
             )
@@ -295,7 +307,8 @@ class HostKVTierIndex:
             )
             pend = [
                 s
-                for s in traj.attn_slots[: traj.tail_boundary]
+                for d in traj.attn_slots
+                for s in d.values()
                 if s in self._pending_write
             ]
             notes.append(
@@ -315,7 +328,7 @@ class HostKVTierIndex:
     # --------------------------------------------------------------- eviction
 
     def _traj_slots(self, traj: Trajectory) -> list[int]:
-        return [s for s in traj.attn_slots if s is not None] + list(
+        return [s for d in traj.attn_slots for s in d.values()] + list(
             traj.tail_state_slots.values()
         )
 
@@ -350,7 +363,10 @@ class HostKVTierIndex:
             "used": self.num_slots - len(self._free),
             "trajectories": len(self._trajectories),
             "resumable": sum(
-                1 for t in self._trajectories.values() if t.resumable_blocks() > 0
+                1
+                for t in self._trajectories.values()
+                if t.resumable_blocks(self.attn_gids) > 0
+                or t.attn_prefix_len(self.attn_gids) > 0
             ),
             "pending_writes": len(self._pending_write),
         }

@@ -17852,3 +17852,30 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   boots cleanly as a fallback dtype. bf16 stays per policy (quality);
   cost now on record.
 - Raw: perf/results/2026-08-30/kvtier-ab/{baseline,notier,fp8kv}/.
+
+### DSV4 tier restores: real geometry found, restore path safety-gated
+- The group-aware acceptance rerun still hung at "no target block g1
+  pos 11". Per-group instrumentation revealed the true DSV4 layout: g0 =
+  MLAAttentionSpec 62 layers block 256 (the deep KV), g1-g4 =
+  SlidingWindowMLASpec (22/21/42/20 layers, block sizes 64/64/4/8!), g5 =
+  TQSlidingWindowSpec (drafter, block 64). The sliding-window groups keep
+  only a recent window (per-token cost ~90x the main KV), their tables
+  legitimately lack old positions, and a correct deep resume must restore
+  each WINDOW at the resume boundary - a generalization of the mamba
+  tail-state machinery, not the attention-only partial-resume path.
+- Uniform-position indexing of those tables was wrong at offload AND
+  restore; the missing-window abort then stranded requests in
+  WAITING_FOR_REMOTE_KVS (the acceptance's 30-min TimeoutError, twice).
+  Pre-restore-fix production never hit this only because lookups never
+  matched at all.
+- Safety gate shipped: partial resume now additionally requires every
+  attention group to be full-attention at the shared hash granularity
+  (_partial_resume_ok). DSV4 layouts log "restore path disabled for this
+  KV layout" and stay write-only (exactly the pre-fix production
+  behavior); GLM keeps its proven restores. Multi-group + single-group
+  index unit tests pass; registry suite green.
+- Follow-up design (issue #17/#18 continuation): stage SW-group windows
+  at recent hash boundaries (retain last K boundary windows, ~(K*256+W)
+  x ~190KB/token per trajectory), anchor resume at boundaries where both
+  the hash chain matches and every window is retained; group-unit
+  indexing (position = token // group_block_size) for the SW tables.
