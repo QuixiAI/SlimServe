@@ -5153,3 +5153,34 @@ is in the rebuilt source (`vllm-xpu-kernels` @ 471b7b6), so it is now native.
 
 262144 context, TurboQuant KV, the 56+58 TP4 wedge check
 (`opt-cycle/wedge-bisect/bisect.sh`), c64 / mixed-c16 rungs, and a soak.
+
+### Context-length sweep (same build, same harness, kv_cache_dtype=auto/fp8)
+
+`max_model_len` does not partition the KV pool -- it caps per-request length -- so
+the pool is free to differ with page/block alignment. Measured, 2 runs each:
+
+| max_model_len | KV pool (tok) | conc. at full len | c1 | c8 | c32 |
+|---|---|---|---|---|---|
+| 65536  | 1,391,274 | 21.23x | 59.0 | 260.5 | 548.5 |
+| 131072 | 1,598,184 | 12.19x | 58.7 | 260.2 | 526.1 |
+| 262144 | 1,654,591 |  6.31x | **59.0** | **260.5** | **559.0** |
+
+vs the reference control (56.2 / 252.3 / 549.9): 262144 is +5.0% / +3.3% / +1.7%
+and is the best of the three. Greedy probe correct at every length.
+
+**Non-monotonic, and unexplained.** c1 and c8 are flat to within noise across all
+three (as expected -- decode step cost does not depend on the cap), but c32 dips
+~4% at 131072 and recovers at 262144. The KV pool also *grows* with the cap
+(1.39M -> 1.60M -> 1.65M tokens), which is the opposite of the naive expectation.
+Both point at page/block-size alignment rather than capacity: the attention block
+size is chosen so the attention page is >= the mamba page, so the cap changes
+block geometry and therefore both the usable pool and the per-step block-table
+work. The 131072 dip is reproducible (spread 0.1%) but not diagnosed; it is not a
+capacity effect, since 131072 has a larger pool than 65536 and is slower.
+
+Consequence for config: 262144 -- the full checkpoint
+`max_position_embeddings` -- costs nothing at these benchmark shapes and is the
+fastest measured. It does drop full-length concurrency to 6.31x against
+max_num_seqs=32, so a workload that actually fills 256k contexts on many
+concurrent requests would preempt; TurboQuant KV is the lever there and is
+untested here.
