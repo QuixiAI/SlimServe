@@ -17981,3 +17981,22 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   (selection over 1,599 pools); exact-token c1 70.1 / c8 331.4 tok/s
   (dense was 74.1 / 343.6: ~5% at 1K context, the cost of indexing that
   sparse repays at depth). Raw: perf/results/2026-09-01/glm53-opt-sparse/.
+
+### GLM-5.3 vision tower live (text + image validated)
+- vllm/model_executor/models/glm5_next_vision.py: Qwen2VL-family ViT
+  ported from the reference with GLM-5.3 specifics - per-head RMSNorm
+  q/k norms, SwiGLU-limit clamped MLPs with biases, no absolute pos
+  embed, post-layernorm -> 2x2 Conv2d downsample -> gated merger (proj +
+  LayerNorm + GELU + clamped SwiGLU) -> 4096-wide tokens. Packed varlen
+  attention via MMEncoderAttention, 2D rotary via get_rope(partial 0.5)
+  with the merge-window-major (h,w) ordering.
+- Glm5NextForConditionalGeneration + processing classes over the
+  transformers Glm5NextProcessor (pixel_values + image_grid_thw; GLM's
+  smart_resize with min/max IMAGE TOKENS 16/8000 then pad-to-canvas);
+  placeholder markup <|begin_of_image|><|image|><|end_of_image|>, the
+  <|image|> token expanded per merged patch.
+- Boot (sparse config, limit 2 images): 0 unmatched weights. Canaries:
+  text "Paris"; solid red -> "Red"; two-half image -> "left: red, right:
+  blue" (position-sensitive: rules out rope/merge-order errors).
+- Indexer fix en route: k_norm as fp32 functional layer_norm (bf16
+  LayerNorm params vs fp32 input raised under the multimodal path).

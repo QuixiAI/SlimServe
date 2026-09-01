@@ -435,7 +435,13 @@ class Glm5NextPooledIndexer(nn.Module):
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim).to(torch.bfloat16)
         k, _ = self.wk(hidden_states)
-        k = self.k_norm(k.float()).to(torch.bfloat16)
+        k = torch.nn.functional.layer_norm(
+            k.float(),
+            (self.head_dim,),
+            self.k_norm.weight.float(),
+            self.k_norm.bias.float(),
+            self.k_norm.eps,
+        ).to(torch.bfloat16)
         gate = torch.nn.functional.linear(
             hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
         ).to(torch.bfloat16)

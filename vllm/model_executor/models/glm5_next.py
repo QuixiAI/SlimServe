@@ -606,3 +606,331 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                 param.data.copy_(weight)
             loaded.add(name)
         return loaded
+
+
+# ============================================================ multimodal
+
+
+from collections.abc import Mapping, Sequence  # noqa: E402
+from typing import Any  # noqa: E402
+
+from transformers.models.glm5_next import (  # noqa: E402
+    Glm5NextConfig,
+    Glm5NextImageProcessor,
+    Glm5NextProcessor,
+)
+from transformers.models.glm5_next.image_processing_glm5_next import (  # noqa: E402
+    smart_resize as glm5_next_smart_resize,
+)
+
+from vllm.model_executor.models.glm5_next_vision import (  # noqa: E402
+    Glm5NextVisionTransformer,
+)
+from vllm.model_executor.models.interfaces import (  # noqa: E402
+    MultiModalEmbeddings,
+    SupportsMultiModal,
+    _require_is_multimodal,
+)
+from vllm.model_executor.models.qwen2_5_vl import (  # noqa: E402
+    Qwen2_5_VLImageInputs,
+    Qwen2_5_VLImagePixelInputs,
+)
+from vllm.model_executor.models.qwen2_vl import (  # noqa: E402
+    Qwen2VLMultiModalDataParser,
+    Qwen2VLProcessingInfo,
+    _create_qwen2vl_field_factory,
+)
+from vllm.model_executor.models.utils import (  # noqa: E402
+    _merge_multimodal_embeddings,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY  # noqa: E402
+from vllm.config.multimodal import BaseDummyOptions  # noqa: E402
+from vllm.inputs import MultiModalDataDict  # noqa: E402
+from vllm.multimodal.inputs import (  # noqa: E402
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import ImageSize, MultiModalDataItems  # noqa: E402
+from vllm.multimodal.processing import (  # noqa: E402
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    PromptReplacement,
+    PromptUpdate,
+)
+
+_IMAGE_MARKUP = "<|begin_of_image|><|image|><|end_of_image|>"
+
+
+class Glm5NextProcessingInfo(Qwen2VLProcessingInfo):
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(Glm5NextConfig)
+
+    def get_hf_processor(self, **kwargs: object) -> Glm5NextProcessor:
+        return self.ctx.get_hf_processor(Glm5NextProcessor, **kwargs)
+
+    def get_image_processor(self, **kwargs: object) -> Glm5NextImageProcessor:
+        return self.get_hf_processor(**kwargs).image_processor
+
+    def get_data_parser(self):
+        return Qwen2VLMultiModalDataParser(
+            self.get_hf_config().vision_config.spatial_merge_size,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None}
+
+    def get_mm_max_tokens_per_item(
+        self, seq_len: int, mm_counts: Mapping[str, int]
+    ) -> Mapping[str, int]:
+        return {"image": self.get_max_image_tokens()}
+
+    def _get_vision_info(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+        num_frames: int = 1,
+        do_resize: bool = True,
+        image_processor,
+        mm_kwargs: Mapping[str, object],
+    ) -> tuple[ImageSize, int]:
+        vc = self.get_hf_config().vision_config
+        patch, merge, tp = vc.patch_size, vc.spatial_merge_size, vc.temporal_patch_size
+        min_tok = getattr(image_processor, "min_image_tokens", 16)
+        max_tok = getattr(image_processor, "max_image_tokens", 8000)
+        merged = self.ctx.get_merged_mm_kwargs(mm_kwargs)
+        min_tok = merged.get("min_image_tokens", min_tok)
+        max_tok = merged.get("max_image_tokens", max_tok)
+        if do_resize:
+            # The GLM processor resizes to fit, then PADS to the aligned
+            # canvas; the grid is the padded canvas.
+            h, w = glm5_next_smart_resize(
+                num_frames=tp,
+                height=image_height,
+                width=image_width,
+                temporal_factor=tp,
+                factor=patch * merge,
+                min_pixels=min_tok,
+                max_pixels=max_tok,
+            )
+            size = ImageSize(width=w, height=h)
+        else:
+            size = ImageSize(width=image_width, height=image_height)
+        grid_t = max((num_frames + (-num_frames % tp)) // tp, 1)
+        n_tokens = grid_t * (size.height // patch) * (size.width // patch) // (merge**2)
+        return size, n_tokens
+
+    def get_image_size_with_most_features(self, max_pixels=None) -> ImageSize:
+        vc = self.get_hf_config().vision_config
+        image_processor = self.get_image_processor()
+        max_tok = getattr(image_processor, "max_image_tokens", 8000)
+        side_patches = int((max_tok * vc.spatial_merge_size**2) ** 0.5)
+        side = side_patches * vc.patch_size
+        return ImageSize(width=side, height=side)
+
+
+class Glm5NextDummyInputsBuilder(BaseDummyInputsBuilder[Glm5NextProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        return _IMAGE_MARKUP * mm_counts.get("image", 0)
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
+    ) -> MultiModalDataDict:
+        num_images = mm_counts.get("image", 0)
+        w, h = self.info.get_image_size_with_most_features()
+        return {
+            "image": self._get_dummy_images(
+                width=w, height=h, num_images=num_images,
+                overrides=mm_options.get("image"),
+            )
+        }
+
+
+class Glm5NextMultiModalProcessor(BaseMultiModalProcessor[Glm5NextProcessingInfo]):
+    def _get_mm_fields_config(
+        self, hf_inputs, hf_processor_mm_kwargs
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return _create_qwen2vl_field_factory(
+            self.info.get_hf_config().vision_config.spatial_merge_size
+        )(hf_inputs)
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        hf_config = self.info.get_hf_config()
+        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
+        merge_len = image_processor.merge_size**2
+        image_token_id = hf_config.image_token_id
+
+        def get_replacement(item_idx: int):
+            grid = out_mm_kwargs["image"][item_idx]["image_grid_thw"].data
+            assert isinstance(grid, torch.Tensor)
+            return [image_token_id] * (int(grid.prod()) // merge_len)
+
+        return [
+            PromptReplacement(
+                modality="image", target=[image_token_id], replacement=get_replacement
+            )
+        ]
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Glm5NextMultiModalProcessor,
+    info=Glm5NextProcessingInfo,
+    dummy_inputs=Glm5NextDummyInputsBuilder,
+)
+class Glm5NextForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsPP, HasInnerState, IsHybrid
+):
+    """GLM-5.3-Flash: vision tower + hybrid text backbone."""
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return _IMAGE_MARKUP
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        self.config = config
+        quant_config = vllm_config.quant_config
+        with self._mark_tower_model(vllm_config, "image"):
+            self.visual = Glm5NextVisionTransformer(
+                config.vision_config,
+                quant_config=None,  # tower is unquantized in the checkpoint
+                prefix=maybe_prefix(prefix, "visual"),
+            )
+        self.language_model = Glm5NextForCausalLM(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
+        )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+    # --- hybrid state (delegated) ---
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        return Glm5NextForCausalLM.get_mamba_state_dtype_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        return Glm5NextForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        return Glm5NextForCausalLM.get_mamba_state_copy_func()
+
+    # --- multimodal ---
+    def get_language_model(self) -> nn.Module:
+        return self.language_model
+
+    def _parse_image_input(self, **kwargs) -> Qwen2_5_VLImageInputs | None:
+        pixel_values = kwargs.pop("pixel_values", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        if pixel_values is None:
+            return None
+        return Qwen2_5_VLImagePixelInputs(
+            type="pixel_values",
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        image_input = self._parse_image_input(**kwargs)
+        if image_input is None:
+            return []
+        grid_thw = image_input["image_grid_thw"]
+        assert grid_thw.ndim == 2
+        pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+        embeds = self.visual(pixel_values, grid_thw=grid_thw)
+        merge = self.visual.spatial_merge_size
+        sizes = (grid_thw.prod(-1) // merge // merge).tolist()
+        return tuple(embeds.split(sizes))
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        inputs_embeds = self._embed_text_input_ids(
+            input_ids,
+            self.language_model.embed_input_ids,
+            is_multimodal=is_multimodal,
+        )
+        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            return inputs_embeds
+        is_multimodal = _require_is_multimodal(is_multimodal)
+        return _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=multimodal_embeddings,
+            is_multimodal=is_multimodal,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor | IntermediateTensors:
+        if intermediate_tensors is not None:
+            inputs_embeds = None
+        return self.language_model.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        text_weights: list[tuple[str, torch.Tensor]] = []
+        vis_params = dict(self.visual.named_parameters())
+        loaded: set[str] = set()
+        vis_stacked = [
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        for name, weight in weights:
+            if not name.startswith("model.visual."):
+                text_weights.append((name, weight))
+                continue
+            vname = name[len("model.visual."):]
+            # merger: gate/up/down live on the merger's mlp submodule
+            for leaf in ("gate_proj", "up_proj", "down_proj"):
+                vname = vname.replace(f"merger.{leaf}", f"merger.mlp.{leaf}")
+            mapped = False
+            for target, ckpt, shard in vis_stacked:
+                if f".{ckpt}." in vname:
+                    tgt = vname.replace(ckpt, target)
+                    if tgt in vis_params:
+                        p = vis_params[tgt]
+                        p.weight_loader(p, weight, shard)
+                        loaded.add("visual." + tgt)
+                        mapped = True
+                    break
+            if mapped:
+                continue
+            if vname not in vis_params:
+                logger.warning_once("glm5_next: unmatched vision weight %s", name)
+                continue
+            p = vis_params[vname]
+            loader = getattr(p, "weight_loader", None)
+            if loader is not None:
+                loader(p, weight)
+            else:
+                p.data.copy_(weight)
+            loaded.add("visual." + vname)
+        for n in self.language_model.load_weights(text_weights):
+            loaded.add("language_model." + n)
+        return loaded
