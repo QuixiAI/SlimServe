@@ -17963,3 +17963,21 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   dispatch costs more than the sharded GEMM saves here. Profile default:
   enable_expert_parallel OFF. Raw: perf/results/2026-09-01/glm53-ep-ab-opt/
   (EP) and glm53-opt-dense/ (TP).
+
+### GLM-5.3 sparse DSA path live: pooled indexer + NoPE sparse MLA
+- vllm/model_executor/layers/glm5_next_indexer.py: per-token indexer
+  state [k_norm(wk x) | x @ compress_gate^T] cached as a 256-bf16 paged
+  group (Glm5NextIndexerBackend/Cache over the DSV3.2 indexer metadata);
+  a paged Triton kernel computes pooled logits straight from the block
+  table (4-token pools: softmax(gate + ape) weighted keys, relu-scaled
+  head scores, weight-summed), the existing per-row top-k kernel ranks
+  POOLS (fills -1 on short rows), and a second Triton kernel expands pools
+  to tokens and appends the incomplete tail. One custom op (compile-opaque,
+  decode-graph-captured with a fixed logits workspace).
+- Parity vs transformers' Glm5NextTextIndexer on random weights: exact
+  selected-token sets on all 61 rows incl. tail (tests/glm5_next/).
+- Boot: QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, compile +
+  FULL_DECODE_ONLY graphs: healthy; 6,396-token planted-fact recall PASS
+  (selection over 1,599 pools); exact-token c1 70.1 / c8 331.4 tok/s
+  (dense was 74.1 / 343.6: ~5% at 1K context, the cost of indexing that
+  sparse repays at depth). Raw: perf/results/2026-09-01/glm53-opt-sparse/.

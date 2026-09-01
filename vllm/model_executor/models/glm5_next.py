@@ -17,11 +17,10 @@ Composition sources, all already serving in this fork:
   mHC kernels are the planned optimization; the math is identical, DSV4's
   ``hc_post_alpha=2.0`` == the reference's ``2*sigmoid``).
 
-Bring-up status (perf notebook 2026-09-01): full-attention layers currently
-run DENSE NoPE MLA - exact for contexts <= index_topk (2048) and a
-diagnostic approximation beyond; the pooled DSA indexer (4-token pools,
-learned APE + gate compression) is required before any profile ships.
-The MTP head (layer 45) and video inputs are later phases.
+The DSA layers run SPARSE through the pooled indexer
+(vllm/model_executor/layers/glm5_next_indexer.py) and the quixicore NoPE
+sparse MLA kernel. The MTP head (layer 45) and video inputs are later
+phases.
 """
 
 from collections.abc import Iterable
@@ -55,6 +54,9 @@ from vllm.model_executor.layers.mhc import (
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
+)
+from vllm.model_executor.layers.glm5_next_indexer import (
+    Glm5NextPooledIndexer,
 )
 from vllm.model_executor.layers.mla import (
     MLAModules,
@@ -98,6 +100,7 @@ class Glm5NextMLAAttention(nn.Module):
         config,
         vllm_config: VllmConfig,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         cache_config = vllm_config.cache_config
@@ -149,6 +152,15 @@ class Glm5NextMLAAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        assert topk_indices_buffer is not None
+        self.indexer = Glm5NextPooledIndexer(
+            vllm_config,
+            config,
+            quant_config=quant_config,
+            cache_config=cache_config,
+            topk_indices_buffer=topk_indices_buffer,
+            prefix=f"{prefix}.indexer",
+        )
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
             kv_b_proj=self.kv_b_proj,
@@ -159,9 +171,9 @@ class Glm5NextMLAAttention(nn.Module):
             q_a_layernorm=self.q_a_layernorm,
             q_b_proj=self.q_b_proj,
             q_proj=None,
-            indexer=None,
-            is_sparse=False,
-            topk_indices_buffer=None,
+            indexer=self.indexer,
+            is_sparse=True,
+            topk_indices_buffer=topk_indices_buffer,
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
@@ -202,6 +214,7 @@ class Glm5NextDecoderLayer(nn.Module):
         config,
         vllm_config: VllmConfig,
         prefix: str = "",
+        topk_indices_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         quant_config = vllm_config.quant_config
@@ -218,7 +231,8 @@ class Glm5NextDecoderLayer(nn.Module):
             )
         else:
             self.self_attn = Glm5NextMLAAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn"
+                config, vllm_config, prefix=f"{prefix}.self_attn",
+                topk_indices_buffer=topk_indices_buffer,
             )
 
         if config.mlp_layer_types[self.layer_idx] == "sparse":
@@ -350,10 +364,21 @@ class Glm5NextTextModel(nn.Module):
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        # Shared top-k index buffer for every DSA layer: index_topk expanded
+        # from pools plus the (index_kpool - 1)-token tail, padded to 32.
+        width = config.index_topk + config.index_kpool - 1
+        width = (width + 31) // 32 * 32
+        self.topk_indices_buffer = torch.empty(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            width,
+            dtype=torch.int32,
+            device=torch.cuda.current_device(),
+        )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Glm5NextDecoderLayer(
-                config, vllm_config, prefix=prefix
+                config, vllm_config, prefix=prefix,
+                topk_indices_buffer=self.topk_indices_buffer,
             ),
             prefix=maybe_prefix(prefix, "layers"),
         )
@@ -522,10 +547,6 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                     name = new + name[len(pref):]
                     break
             else:
-                continue
-            # Indexer weights: retained by the sparse phase; skipped while
-            # the DSA layers run dense.
-            if ".self_attn.indexer." in name:
                 continue
 
             is_expert = ".mlp.experts." in name
