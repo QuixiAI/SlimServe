@@ -17911,3 +17911,21 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   pools, learned APE + gate compression, always-select-tail) + sparse
   attention, vision (processor contract is qwen-vl pixel_values +
   image_grid_thw), then EP on/off A/B, MTP later.
+
+### GLM-5.3-Flash EP on/off A/B (bring-up config, -O0)
+- gather_and_maybe_dequant_cache gained a 512 head-dim instantiation
+  (chunked-prefill context gather crashed at c8 on the NoPE cache; we own
+  the kernel, csrc/libtorch_stable/cache_kernels.cu).
+- Exact-token (1000 in / 300 out, temp 1.0/top-p 0.95/top-k 20 seed 42,
+  no spec), TP4, aggregate output tok/s:
+  | arm                          | c1  | c8   |
+  | TP experts (no EP)           | 5.4 | 41.6 |
+  | EP (--enable-expert-parallel)| 5.4 | 40.7 |
+- Verdict: PARITY within single-run noise at the bring-up config. This
+  is -O0 eager (no cudagraphs, eager python mHC, dense MLA) at tiny
+  batch - dispatch-path differences may only separate under the
+  optimized profile at real concurrency. Default stays EP OFF (simpler
+  path) for bring-up; REVISIT the A/B after compile/cudagraphs + sparse
+  attention land. Raw: perf/results/2026-09-01/glm53-ep-ab/.
+- Absolute numbers are bring-up-grade only (~5 tok/s c1): eager mHC
+  (python sinkhorn per site per layer) and -O0 dominate; not a baseline.
