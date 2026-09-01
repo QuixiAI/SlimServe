@@ -17879,3 +17879,35 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   x ~190KB/token per trajectory), anchor resume at boundaries where both
   the hash chain matches and every window is retained; group-unit
   indexing (position = token // group_block_size) for the SW tables.
+
+## 2026-09-01: GLM-5.3-Flash (glm5_next) bring-up - first tokens on A100 TP4
+
+- New model port for RedHatAI/GLM-5.3-Flash-NVFP4 (169B, 34 KDA linear
+  layers + 11 NoPE-MLA DSA layers, mHC hc_mult=4, 288-expert
+  sigmoid/noaux MoE, vision tower, MTP head). transformers upgraded to
+  5.16.1 (operator directive: upgrade, never vendor) which also supplied
+  the reference modeling code used as porting source.
+- vllm/model_executor/models/glm5_next.py composes fork-owned pieces:
+  shared KimiGatedDeltaNetAttention for KDA (checkpoint's separate
+  q/k/v/convs load into the merged layout via stacked mappings),
+  MultiHeadLatentAttentionWrapper NoPE path, DeepseekV2MoE (identical
+  config names), eager-torch mHC (reference math verbatim; DSV4's fused
+  tilelang mHC is the planned optimization).
+- Stack fixes to get here: glm5_next_text added to the is_deepseek_mla
+  model-type list (head_size fell back to 64 and MLA metadata rejected
+  it); 512 added to MLACommonBackend supported head sizes (NoPE = 512
+  latent, no rope segment); FA prefill dims allowlist gained
+  (256, 0, 256); kimi_k3 package gate relaxed so the platform-neutral
+  KDA Triton kernels re-export under nvidia/ (the model classes stay
+  ROCm-gated); fork gotchas: kv fp8 default, aiter moe default, per-hop
+  attention/moe backend flags.
+- Bring-up boot: TP4, TRITON_MLA (explicit; the Ampere priority list
+  bans dense MLA by design), marlin NVFP4 MoE, -O0, 8192 ctx. Dummy boot
+  clean, real weights load with 0 unmatched tensors (the flat
+  hc_attn_*/hc_ffn_* checkpoint names map onto the per-site mHC
+  modules), first completion coherent.
+- DENSE MLA is a bring-up diagnostic: exact only <= index_topk (2048)
+  context. Before any profile ships: the pooled DSA indexer (4-token
+  pools, learned APE + gate compression, always-select-tail) + sparse
+  attention, vision (processor contract is qwen-vl pixel_values +
+  image_grid_thw), then EP on/off A/B, MTP later.

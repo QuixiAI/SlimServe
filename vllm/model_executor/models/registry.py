@@ -241,6 +241,7 @@ _MULTIMODAL_MODELS = {
         "Gemma4UnifiedForConditionalGeneration",
     ),
     "Glm5vForConditionalGeneration": ("glm5v", "Glm5vForConditionalGeneration"),
+    "Glm5NextForConditionalGeneration": ("glm5_next", "Glm5NextForCausalLM"),
     "MuseGlimmerForConditionalGeneration": (
         "muse_glimmer",
         "MuseGlimmerForConditionalGeneration",
