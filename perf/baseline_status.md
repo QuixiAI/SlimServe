@@ -1879,3 +1879,25 @@ Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/`.
 Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-baseline/`.
 Headroom (unmeasured): native gfx942 NVFP4 decode, aiter FP8 shape tuning,
 graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
+
+## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4, A100 x4)
+
+### A100 TP4 Exact Baseline - 2026-09-01 (bring-up, sparse DSA, no spec)
+- Config: the registered glm53-nvfp4-4/a100 record (TP4, EP off,
+  QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, bf16 KV, Marlin
+  NVFP4 MoE, FULL_DECODE_ONLY graphs; no speculative decoding yet).
+- Exact-token harness (benchmarks/benchmark_dsv4_exact.py, 1000 in /
+  300 out, temperature 1.0 / top-p 0.95 / top-k 20, seed 42):
+  | concurrency | aggregate output tok/s |
+  | c1          | 70.1  |
+  | c8          | 331.4 |
+  Raw: perf/results/2026-09-01/glm53-opt-sparse/.
+- Same-harness A/B references: dense NoPE MLA (bring-up only) c1 74.1 /
+  c8 343.6; expert-parallel arm c1 70.0 / c8 330.4 (dense) - EP off is the
+  record's default. Eager -O0 (retired) was 5.4 / 41.6.
+- Correctness gates at this baseline: text/image/tool canaries via the
+  profile; 6,396-token planted-fact recall through sparse selection;
+  pooled-indexer parity vs the transformers reference.
+- Expected next moves: MTP speculative decoding (checkpoint ships the
+  head), host tier once the packed planner handles KDA+MLA mixed block
+  sizes, kernel-level tuning of the pooled-logits path.
