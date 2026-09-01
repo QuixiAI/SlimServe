@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shim for the SlimServe base: the full MambaMixer2 layer was pruned, but
 qwen_gdn_linear_attn.py imports mamba_v2_sharded_weight_loader from here.
-Only that loader (verbatim from the lazarus/upstream mamba_mixer2.py) is kept.
+Only that loader (verbatim from the reference/upstream mamba_mixer2.py) is kept.
 """
 
 import torch

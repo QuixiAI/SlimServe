@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model.
 
-Ported from the lazarus vLLM fork onto the SlimServe base. SlimServe has no
+Ported from the reference vLLM fork onto the SlimServe base. SlimServe has no
 Qwen VL stack, so the multimodal embedding path (SupportsMultiModal /
 _merge_multimodal_embeddings) is dropped: embed_input_ids is text-only.
 """

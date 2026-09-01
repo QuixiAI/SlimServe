@@ -1225,17 +1225,27 @@ class xpu_ops:
                 fake_impl=_xpu_fp8_bmm_fake,
             )
 
-            direct_register_custom_op(
-                op_name="xpu_fp8_mqa_logits",
-                op_func=_xpu_fp8_mqa_logits_impl,
-                fake_impl=_xpu_fp8_mqa_logits_fake,
-            )
+            # vllm/v1/attention/ops/xpu_mla_sparse.py registers torch-reference
+            # versions of these two ops for runs without vllm-xpu-kernels.
+            # Whichever module is imported first wins; a second def() on the
+            # same schema is a hard torch error. (2026-09-01)
+            if not hasattr(torch.ops.vllm, "xpu_fp8_mqa_logits"):
+                direct_register_custom_op(
+                    op_name="xpu_fp8_mqa_logits",
+                    op_func=_xpu_fp8_mqa_logits_impl,
+                    fake_impl=_xpu_fp8_mqa_logits_fake,
+                )
 
-            direct_register_custom_op(
-                op_name="xpu_fp8_paged_mqa_logits",
-                op_func=_xpu_fp8_paged_mqa_logits_impl,
-                fake_impl=_xpu_fp8_paged_mqa_logits_fake,
-            )
+            # vllm/v1/attention/ops/xpu_mla_sparse.py registers torch-reference
+            # versions of these two ops for runs without vllm-xpu-kernels.
+            # Whichever module is imported first wins; a second def() on the
+            # same schema is a hard torch error. (2026-09-01)
+            if not hasattr(torch.ops.vllm, "xpu_fp8_paged_mqa_logits"):
+                direct_register_custom_op(
+                    op_name="xpu_fp8_paged_mqa_logits",
+                    op_func=_xpu_fp8_paged_mqa_logits_impl,
+                    fake_impl=_xpu_fp8_paged_mqa_logits_fake,
+                )
 
             direct_register_custom_op(
                 op_name="gdn_attention_core_xpu",

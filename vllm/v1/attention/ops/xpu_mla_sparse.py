@@ -82,13 +82,27 @@ def _xpu_fp8_paged_mqa_logits_fake(
     )
 
 
-direct_register_custom_op(
-    op_name="xpu_fp8_mqa_logits",
-    op_func=_xpu_fp8_mqa_logits_impl,
-    fake_impl=_xpu_fp8_mqa_logits_fake,
-)
-direct_register_custom_op(
-    op_name="xpu_fp8_paged_mqa_logits",
-    op_func=_xpu_fp8_paged_mqa_logits_impl,
-    fake_impl=_xpu_fp8_paged_mqa_logits_fake,
-)
+def _already_registered(op_name: str) -> bool:
+    """True if something else already defined ``vllm::<op_name>``.
+
+    ``vllm/_xpu_ops.py`` registers kernel-backed versions of these two ops when
+    vllm-xpu-kernels is loaded, guarded by its own ``_OPS_REGISTERED`` flag.
+    This module registers platform-neutral torch references so the indexer runs
+    without those kernels. When both are present torch raises on the duplicate
+    ``def()``, so the kernel-backed registration wins and we stand down.
+    """
+    return hasattr(torch.ops.vllm, op_name)
+
+
+if not _already_registered("xpu_fp8_mqa_logits"):
+    direct_register_custom_op(
+        op_name="xpu_fp8_mqa_logits",
+        op_func=_xpu_fp8_mqa_logits_impl,
+        fake_impl=_xpu_fp8_mqa_logits_fake,
+    )
+if not _already_registered("xpu_fp8_paged_mqa_logits"):
+    direct_register_custom_op(
+        op_name="xpu_fp8_paged_mqa_logits",
+        op_func=_xpu_fp8_paged_mqa_logits_impl,
+        fake_impl=_xpu_fp8_paged_mqa_logits_fake,
+    )

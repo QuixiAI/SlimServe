@@ -5050,3 +5050,106 @@ work; (5) grouped GGUF GEMM for prefill on the SYCL-TLA mainloop.
   (QuixiCore-XPU XMX kernel) for prefill + a paged decode variant, removing
   the per-layer host syncs; (3) GGUF GEMV roofline probe (read-only variant)
   then occupancy/SLM-codebook work; (4) capturable collectives.
+
+---
+
+## 2026-09-01 — Qwen3.8-27B-NVFP4 on 4x Arc Pro B70 (TP4): parity with the Lazarus vLLM fork
+
+**Goal.** Serve `Qwen3.8-27B-NVFP4-RadixArk` (dense hybrid: 48 GDN + 16 full-attention
+of 64 layers, modelopt_mixed FP8+NVFP4) from SlimServe at or above the fork that
+currently holds production on :29734.
+
+**Baseline (comparator).** `~/quadb70-loop/state/control-qwen38.json`, measured on the
+Lazarus fork at max_model_len=65536, kv_cache_dtype=auto(fp8), TP4, max_num_seqs=32:
+c1 56.2 / c8 252.3 / c32 549.9 tok/s.
+
+**Harness.** `~/port-staging/bench.py --conc 1,8,32 --tokens 256 --repeat 2`,
+prompt ~512 tok. Raw logs: `perf/results/2026-09-01/qwen38-nvfp4-tp4-b70/`.
+Config matched to the comparator deliberately (65536 / fp8 KV), not the 262k target,
+so the engine change is the only variable.
+
+### Result
+
+| rung | control (fork) | SlimServe | delta |
+|---|---|---|---|
+| c1  | 56.2  | **59.0**  | +5.0% |
+| c8  | 252.3 | **260.5** | +3.3% |
+| c32 | 549.9 | **548.5** | -0.3% |
+
+ITL p50: 16.04 / 24.33 / 32.96 ms. Spread <= 2.4% over 2 runs. Greedy probe correct.
+Clears the loop promotion gate (no rung < 98% of control; c1 at 105% >= 103%).
+
+### How it got there (each step measured)
+
+| step | c1 | c8 | c32 |
+|---|---|---|---|
+| first boot, as-configured | 38.8 | 179.9 | 355.3 |
+| + prod drop-ins 57/58/59/62/63 | 44.6 | 196.7 | 370.7 |
+| + FLASH_ATTN instead of TRITON_ATTN | 48.3 | 227.2 | 463.3 |
+| + `xpu_kernels` IR op priority | **59.0** | **260.5** | **548.5** |
+
+1. **Drop-ins were not reaching the process.** 57 (`VLLM_XPU_GEMMA_NORM_FUSED`),
+   58 (`VLLM_XPU_GRAPH_REPLAY_ORDER=trail`), 59 (`VLLM_NVFP4_LINEAR_ROWLOOP_M_MAX`),
+   62/63 (`CCL_SYCL_ALLREDUCE_LL`, XPTI/UR tracing off) live in
+   `vllm-qwen38.service.d/*.conf` for the fork's unit. A standalone launch of
+   `run_qwen38_slimserve.sh` inherited none of them. Now set in the script with
+   `${VAR:-default}` so a unit drop-in can still override.
+2. **`XPUPlatform.get_attn_backend_cls` hard-returned TRITON_ATTN.**
+   `v1/attention/backends/fa_utils.py` already wires `flash_attn_varlen_func` for XPU
+   and falls back to Triton only on ImportError, i.e. when vllm-xpu-kernels is absent.
+   The hard return predated that package being installed. FLASH_ATTN is now honoured
+   when the kernel package supplies it. Largest single win, and biggest at c32 --
+   consistent with attention cost growing with concurrency.
+3. **`ir_op_priority` defaulted to `["native"]`.** `vllm/kernels/xpu_ops.py` registers
+   `xpu_kernels` impls of `rms_norm` / `fused_add_rms_norm` (torch.ops._C), but
+   `XPUPlatform` never defined `get_default_ir_op_priority`, so they were never
+   dispatched and every RMSNorm ran the eager ATen decomposition on all 64 layers.
+   This also silently defeated drop-in 57, whose entire purpose is to cache (1 + w)
+   in the activation dtype so the fused kernel *can* be selected. Now
+   `["xpu_kernels", "native"]`, staying `["native"]` under inductor.
+
+### Prerequisite: vllm-xpu-kernels rebuilt against torch 2.15
+
+The shipped `.so`s were built against torch 2.11; under SlimServe's torch 2.15 the
+compiled `torch::kXPU` constant resolves to **HPU**, so every op in `_C` and `_xpu_C`
+registered on the wrong dispatch key -- the library loaded, schemas existed,
+`hasattr` passed, and every call raised `NotImplementedError` for XPU. Verify with
+`torch._C._dispatch_dump('_C::rms_norm')`.
+
+Rebuilt into an isolated tree (`~/port-staging/xpu-kernels-torch215`) so the fork's
+own tree, which prod imports, is untouched. Two build fixes were needed and are
+saved as `~/qwen38-deploy/opt-cycle/kbuild/torch215-cxx20.diff`:
+C++17 -> C++20 (torch >= 2.13 headers need concepts/`<compare>`/`string_view::starts_with`),
+and `-Wno-error=deprecated-this-capture` (C++20 deprecates implicit `this` capture
+under `[=]`, which cutlass-sycl headers use throughout, and the repo builds -Werror).
+Consequence: **drop-in 61's K32 `libgrouped_gemm_xe_2.so` does not transfer via
+LD_LIBRARY_PATH** -- that override rode an op that never dispatched. The K32 change
+is in the rebuilt source (`vllm-xpu-kernels` @ 471b7b6), so it is now native.
+
+### Correctness fixes required to boot at all
+
+- `KVQuantMode.TURBOQUANT` + `turboquant_*` mapping (absent; boots at the 262k/TQ target died at cache init).
+- GDN call convention: the Qwen3.5 decoder layer called `linear_attn(..., output=)`
+  but this fork's `QwenGatedDeltaNetAttention.forward` returns its output. 48 of 64 layers.
+- `SupportsMRoPE` / `get_mrope_input_positions` on the text-only
+  `Qwen3_5ForConditionalGeneration` (the checkpoint carries an `mrope_section`).
+- Duplicate custom-op registration between QuixiCore and vllm-xpu-kernels (`_C` and
+  `vllm::xpu_fp8_*mqa_logits`); the `_C` collision is a hard abort, not catchable.
+- `KernelConfig.{linear,moe}_backend` default to ROCm-only `"aiter"`; coerced to `"auto"` on XPU.
+- mamba device-pointer int64 fold; `.contiguous()` before the UVA view for packed NVFP4.
+
+### Investigated and rejected
+
+- **Native XPU GDN decode** (`_try_xpu_gdn_decode` -> `_xpu_C.qwen_gdn_decode`).
+  Looked like the obvious lever at 48/64 layers, but it is gated
+  `if self.gqa_interleaved_layout or self.tp_size != 1: return None` -- **the fork does
+  not use it at TP4 either**, so it was never the difference. Not ported.
+- KV pool size: SlimServe gets 12.19 GiB/card (1,391,274 tok) vs the fork's 14.4 GiB
+  (1,643,977 tok). Real, unexplained ~15% difference in non-KV footprint, but H131
+  already refuted KV capacity as the binding constraint at these benchmark shapes.
+  Left open.
+
+### Not yet done
+
+262144 context, TurboQuant KV, the 56+58 TP4 wedge check
+(`opt-cycle/wedge-bisect/bisect.sh`), c64 / mixed-c16 rungs, and a soak.

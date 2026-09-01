@@ -23,6 +23,18 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 
+def _device_ptr_as_i64(ptr: int) -> int:
+    """Fold a device pointer into a signed int64 slot, preserving its 64 bits.
+
+    XPU device pointers live in the high canonical range (>= 2**63), which
+    overflows torch's checked int64 scalar assignment. Storing the two's-
+    complement value keeps the exact bit pattern the Triton kernels reinterpret
+    as an address (via ``.to(tl.pointer_type)`` / wrapping int64 arithmetic).
+    No-op for CUDA pointers, which are < 2**63.
+    """
+    return ptr - 2**64 if ptr >= 2**63 else ptr
+
+
 @triton.jit
 def _copy_mamba_state_block(
     state_idx,
@@ -646,7 +658,7 @@ class MambaSpecDecodeGPUContext:
 
                 for state_type_idx, state in enumerate(kv_caches):
                     # Base address
-                    self.state_base_addrs[idx] = state.data_ptr()
+                    self.state_base_addrs[idx] = _device_ptr_as_i64(state.data_ptr())
 
                     # Block stride (bytes between consecutive blocks)
                     # state shape: [num_blocks, ...], stride(0) = elements per block
@@ -729,7 +741,7 @@ class MambaSpecDecodeGPUContext:
         )
         self.block_table_stride_req = int(next(iter(strides)))
         for i, bt in enumerate(block_tables):
-            self.block_table_ptrs[i] = bt.data_ptr()
+            self.block_table_ptrs[i] = _device_ptr_as_i64(bt.data_ptr())
 
         self.is_initialized = True
 

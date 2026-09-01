@@ -35,6 +35,7 @@ from .interface import DeviceCapability, Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
 else:
     VllmConfig = None
@@ -116,12 +117,34 @@ class XPUPlatform(Platform):
         if attn_selector_config.use_mla:
             logger.info_once("Using Triton MLA backend on XPU.")
             return AttentionBackendEnum.TRITON_MLA.get_path()
-        if selected_backend not in (None, AttentionBackendEnum.TRITON_ATTN):
+        # FLASH_ATTN is available on XPU when vllm-xpu-kernels supplies
+        # flash_attn_varlen_func (see v1/attention/backends/fa_utils.py, which
+        # falls back to TRITON_ATTN only on ImportError). The hard TRITON_ATTN
+        # return here predates that package being installed. The reference fork
+        # serves Qwen3.8 with FLASH_ATTN, and on this box TRITON_ATTN measured
+        # materially slower, so honour an explicit request when it can be met.
+        if selected_backend == AttentionBackendEnum.FLASH_ATTN:
+            if cls._xpu_flash_attn_available():
+                logger.info_once("Using FLASH_ATTN backend on XPU.")
+                return AttentionBackendEnum.FLASH_ATTN.get_path()
+            logger.warning_once(
+                "FLASH_ATTN requested but vllm-xpu-kernels does not provide "
+                "flash_attn_varlen_func; using TRITON_ATTN."
+            )
+        elif selected_backend not in (None, AttentionBackendEnum.TRITON_ATTN):
             logger.warning_once(
                 "Attention backend %s is not available on XPU; using TRITON_ATTN.",
                 selected_backend,
             )
         return AttentionBackendEnum.TRITON_ATTN.get_path()
+
+    @staticmethod
+    def _xpu_flash_attn_available() -> bool:
+        try:
+            from vllm._xpu_ops import xpu_ops
+        except Exception:
+            return False
+        return getattr(xpu_ops, "flash_attn_varlen_func", None) is not None
 
     @classmethod
     def get_supported_vit_attn_backends(cls) -> list[AttentionBackendEnum]:
@@ -204,11 +227,29 @@ class XPUPlatform(Platform):
         # a FULL capture with TP > 1 replays garbage (measured 2026-08-18,
         # Qwen2.5-0.5B TP2). The breakable PIECEWISE capture runs them as
         # eager segments; FULL stays available for single-device serving.
+        #
+        # 2026-09-01: FULL_DECODE_ONLY is exempted at TP > 1 when the breakable
+        # capture is active. The 08-18 measurement was on FULL, which captures
+        # prefill too; FULL_DECODE_ONLY captures only the uniform decode step,
+        # whose collectives are already routed through the eager-tensor-output
+        # break in parallel_state (_maybe_breakable_tensor_output). The reference
+        # fork has served Qwen3.8-27B at TP4 FULL_DECODE_ONLY continuously since
+        # 08-18, and it is worth a large share of the c1 ITL, so PIECEWISE here
+        # is a parity floor we cannot accept. Set VLLM_XPU_FORCE_PIECEWISE_TP=1
+        # to restore the old unconditional downgrade.
+        _force_piecewise_tp = os.environ.get("VLLM_XPU_FORCE_PIECEWISE_TP", "0") == "1"
+        _breakable = os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH", "0") == "1"
+        _exempt = (
+            not _force_piecewise_tp
+            and _breakable
+            and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+        )
         if (
             vllm_config.parallel_config.world_size > 1
             and compilation_config.cudagraph_mode is not None
             and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE
+            and not _exempt
         ):
             logger.info_once(
                 "XPU with tensor parallelism: cudagraph_mode %s -> PIECEWISE "
@@ -216,6 +257,23 @@ class XPUPlatform(Platform):
                 compilation_config.cudagraph_mode.name,
             )
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+        # KernelConfig defaults to the ROCm-only "aiter" backends (this fork is
+        # AMD-first). On XPU those filter every candidate kernel out and
+        # choose_scaled_mm_linear_kernel raises "no 'aiter' kernel exists for
+        # this layer type" as soon as a quantized linear is built. The GGUF
+        # profiles never hit that path, which is why the b70 profile did not
+        # need this; modelopt/NVFP4 does. Coerce to auto and let the XPU kernel
+        # registry pick. (2026-09-01)
+        kernel_config = getattr(vllm_config, "kernel_config", None)
+        if kernel_config is not None:
+            for _attr in ("linear_backend", "moe_backend"):
+                if getattr(kernel_config, _attr, None) == "aiter":
+                    logger.info_once(
+                        "XPU: kernel_config.%s='aiter' is ROCm-only; using 'auto'.",
+                        _attr,
+                    )
+                    setattr(kernel_config, _attr, "auto")
+
         if compilation_config.mode != CompilationMode.NONE:
             # No inductor on XPU: graphs are recorded from the eager model
             # (CompilationMode.NONE + cudagraphs), the proven configuration.
@@ -293,6 +351,26 @@ class XPUPlatform(Platform):
     @classmethod
     def supports_fp8(cls) -> bool:
         return True
+
+    @classmethod
+    def get_default_ir_op_priority(
+        cls, vllm_config: "VllmConfig"
+    ) -> "IrOpPriorityConfig":
+        # vllm/kernels/xpu_ops.py registers "xpu_kernels" impls for rms_norm and
+        # fused_add_rms_norm (torch.ops._C, supplied by vllm-xpu-kernels), but
+        # without a platform default the priority stays ["native"] and those
+        # impls are never dispatched -- every RMSNorm then runs the eager ATen
+        # decomposition, on all 64 layers of a model like Qwen3.8. This also
+        # silently defeats VLLM_XPU_GEMMA_NORM_FUSED, which caches (1 + w) in
+        # the activation dtype precisely so the fused kernel can be selected.
+        # Native stays first under inductor, which codegens its own fusions.
+        from vllm.config.compilation import CompilationMode
+        from vllm.config.kernel import IrOpPriorityConfig
+
+        cc = vllm_config.compilation_config
+        using_inductor = cc.backend == "inductor" and cc.mode != CompilationMode.NONE
+        default = ["native"] if using_inductor else ["xpu_kernels", "native"]
+        return IrOpPriorityConfig.with_default(default)
 
     @classmethod
     def device_count(cls) -> int:

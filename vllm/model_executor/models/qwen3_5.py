@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights.
 
-Ported from the lazarus vLLM fork onto the SlimServe base.
+Ported from the reference vLLM fork onto the SlimServe base.
 
 SlimServe pruned the Qwen VL stack (qwen3_vl / qwen2_5_vl / qwen2_vl), so the
 `*ForConditionalGeneration` classes here are TEXT-ONLY adaptations: they keep
@@ -12,9 +12,13 @@ are skipped at load time. Multimodal (image/video) inputs are NOT supported.
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+
+if TYPE_CHECKING:
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
@@ -50,6 +54,7 @@ from .interfaces import (
     MixtureOfExperts,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 )
 from .qwen3_next import (
@@ -487,11 +492,12 @@ class Qwen3_5ForConditionalGeneration(
     IsHybrid,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMRoPE,
     SupportsPP,
 ):
     """Text-only adaptation of the Qwen3.5 checkpoint architecture.
 
-    The upstream (lazarus) implementation wraps Qwen3VLForConditionalGeneration
+    The upstream reference implementation wraps Qwen3VLForConditionalGeneration
     and instantiates a vision tower; SlimServe has no Qwen VL stack, so this
     class serves the language model only. `model.visual.*` and `mtp.*`
     checkpoint weights are skipped.
@@ -542,6 +548,31 @@ class Qwen3_5ForConditionalGeneration(
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.language_model.embed_input_ids(input_ids)
+
+    def get_mrope_input_positions(
+        self,
+        input_tokens: list[int],
+        mm_features: list["MultiModalFeatureSpec"],
+    ) -> tuple[torch.Tensor, int]:
+        """M-RoPE positions for the text-only Qwen3.5 adaptation.
+
+        The checkpoint config carries an ``mrope_section``, so the model runner
+        takes the M-RoPE path and requires this method. This class serves the
+        language model only (no vision tower), so there are never any grid
+        segments: the general Qwen-VL construction degenerates to plain
+        sequential positions broadcast across the T/H/W axes, with a zero
+        position delta (max + 1 - len == 0 for a pure text sequence).
+        """
+        if mm_features:
+            raise NotImplementedError(
+                "Qwen3_5ForConditionalGeneration in this fork is text-only; "
+                "multimodal M-RoPE positions require the Qwen VL stack."
+            )
+        text_len = len(input_tokens)
+        llm_positions = (
+            torch.arange(text_len, dtype=torch.long).unsqueeze(0).expand(3, -1).clone()
+        )
+        return llm_positions, 0
 
     def forward(
         self,

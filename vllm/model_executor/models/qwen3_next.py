@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model.
 
-Ported from the lazarus vLLM fork onto the SlimServe base:
+Ported from the reference vLLM fork onto the SlimServe base:
 - vllm.model_executor.layers.attention (package) provides Attention.
 - fused_qk_norm_rope is not present in SlimServe; the eager
   split + QK-RMSNorm + RoPE path is always used (see TODO below).
@@ -369,7 +369,7 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3NextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # TODO(SlimServe port): the lazarus fork fuses gated split + QK-RMSNorm
+        # TODO(SlimServe port): the reference fork fuses gated split + QK-RMSNorm
         # + partial NeoX RoPE + gate copy via fused_qk_rmsnorm_rope_gate
         # (vllm/model_executor/layers/fused_qk_norm_rope.py), which SlimServe
         # does not ship. Always use the eager path.
@@ -512,13 +512,14 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        self_attention_output = torch.empty_like(hidden_states)
         if self.layer_type == "linear_attention":
-            self.linear_attn(
-                hidden_states=hidden_states,
-                output=self_attention_output,
-            )
+            # This fork's GDN layer returns its output; it does not take an
+            # out-parameter (the vLLM fork this Qwen3.5 path was merged from
+            # uses the out-param convention, hence the mismatch). Taking the
+            # return value also skips an empty_like on 48 of 64 layers.
+            self_attention_output = self.linear_attn(hidden_states=hidden_states)
         elif self.layer_type == "full_attention":
+            self_attention_output = torch.empty_like(hidden_states)
             self.self_attn(
                 hidden_states=hidden_states,
                 output=self_attention_output,
