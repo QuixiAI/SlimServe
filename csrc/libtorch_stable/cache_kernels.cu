@@ -1096,6 +1096,9 @@ __global__ void gather_and_maybe_dequant_cache(
 #define CALL_GATHER_CACHE_512(SCALAR_T, CACHE_T, KV_DTYPE) \
   CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 512)
 
+#define CALL_GATHER_CACHE_256(SCALAR_T, CACHE_T, KV_DTYPE) \
+  CALL_GATHER_CACHE(SCALAR_T, CACHE_T, KV_DTYPE, 256)
+
 // Gather sequences from the cache into the destination tensor.
 //  - cu_seq_lens contains the cumulative sequence lengths for each batch
 //  - block_table contains the cache block indices for each sequence
@@ -1131,9 +1134,10 @@ void gather_and_maybe_dequant_cache(
         "seq_starts must be int32");
   }
   STD_TORCH_CHECK(
-      head_dim == 320 || head_dim == 512 || head_dim == 576,
-      "gather_and_maybe_dequant_cache only supports head_dim 320, 512 "
-      "(NoPE MLA) or 576 for better performance")
+      head_dim == 256 || head_dim == 320 || head_dim == 512 ||
+          head_dim == 576,
+      "gather_and_maybe_dequant_cache only supports head_dim 256 (glm5_next "
+      "pooled indexer rows), 320, 512 (NoPE MLA) or 576")
 
   STD_TORCH_CHECK(src_cache.device() == dst.device(),
                   "src_cache and dst must be on the same device");
@@ -1165,6 +1169,9 @@ void gather_and_maybe_dequant_cache(
   } else if (head_dim == 512) {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_512);
+  } else if (head_dim == 256) {
+    DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
+                               CALL_GATHER_CACHE_256);
   } else {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
                                CALL_GATHER_CACHE_320);

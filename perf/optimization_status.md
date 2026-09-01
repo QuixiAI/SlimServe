@@ -17950,3 +17950,16 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   the template's static_assert(VW <= QW) admits it), python wrapper, and
   QUIXICORE_MLA_SPARSE dispatches on q width 512. Unexercised until the
   pooled indexer feeds topk_indices_buffer.
+
+### GLM-5.3 EP on/off A/B on the OPTIMIZED path: TP experts wins
+- Same exact-token harness (1000/300, seed 42), compile + FULL_DECODE_ONLY
+  graphs, fused mHC, marlin NVFP4 MoE, dense NoPE MLA:
+  | arm                | c1   | c8    |
+  | TP experts (no EP) | 74.1 | 343.6 |
+  | EP                 | 70.0 | 330.4 |
+- EP is 4-6% slower at both concurrencies: with 288 experts and
+  moe_intermediate 2048 the TP shard (512/rank) stays block-aligned for
+  NVFP4 group-16 scales, so EP buys no correctness and its all2all
+  dispatch costs more than the sharded GEMM saves here. Profile default:
+  enable_expert_parallel OFF. Raw: perf/results/2026-09-01/glm53-ep-ab-opt/
+  (EP) and glm53-opt-dense/ (TP).
