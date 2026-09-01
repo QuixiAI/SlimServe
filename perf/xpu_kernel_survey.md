@@ -1,7 +1,7 @@
 # XPU kernel survey (2026-08-18): what the sibling Intel trees teach the SlimServe GGUF path
 
-Sources: /home/alex/port-staging/lazarus/vllm-xpu-kernels (HEAD 48ef52d, byte-identical
-to /home/lazarus/vllm-xpu-kernels), the vllm fork there (046fdfdba), sonar/ (CUDA
+Sources: the reference vllm-xpu-kernels tree (HEAD 48ef52d, byte-identical
+to the installed copy), the vllm fork there (046fdfdba), sonar/ (CUDA
 GGUF reference + humming/int8 Xe2 kernels), STAGED_IMPROVEMENTS.md,
 CRASH_ANALYSIS_decode_free.md, resume_optimization_work.md, improvements_list.md.
 None of these trees has GGUF/IQ2/Q2_K SYCL code; the value is in patterns and

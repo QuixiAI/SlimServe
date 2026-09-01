@@ -4881,7 +4881,7 @@ Serving-kernel entries go here per kernel with baseline/hypothesis/result.
 
 Scope: full vLLM XPU platform for this fork (the upstream one was removed
 in 75b5e0f60 with its vllm-xpu-kernels dependency), modeled on the Metal
-port and on the sibling XPU vLLM tree on this host (/home/lazarus/vllm,
+port and on the sibling XPU vLLM tree on this host (the reference fork,
 snapshot 046fdfdba: per-worker ZE_AFFINITY_MASK, oneCCL env, queue-lifetime
 rules). No vllm-xpu-kernels: kernels are QuixiCore-XPU SYCL + Triton-XPU +
 torch.
@@ -4953,7 +4953,7 @@ Measured (raw: perf/results/2026-08-18/xpu-bringup/, scratch logs):
   across TP1/TP2. This is a platform smoke, not a baseline (tiny model,
   eager, no graphs, first-JIT included).
 BLOCKER for the dsv4-xxs-b70-4 boot: ~4-5 GiB free per B70 while
-/home/lazarus's Qwen3.5 TP4 server holds ~28 GiB each; the 86.7 GB IQ2_XXS
+the reference Qwen3.5 TP4 server holds ~28 GiB each; the 86.7 GB IQ2_XXS
 target needs ~21 GiB/GPU. Level Zero drops the device on OOM, so no
 "try and see" against a shared card. Next: free the GPUs, then
   slimserve dsv4-xxs-b70-4 --serve -y (expect first-boot findings in the
@@ -4989,7 +4989,7 @@ with a host sync per request per layer, mHC torch reference, GGUF routed
 GEMV at 88 GB/s (correctness-first SYCL), dequant+oneDNN for prefill GEMMs.
 The sibling tree's data says the first two are the big-ticket items (device
 82% idle at ~1100 kernels/token; graphs alone 36.9 -> 67 tok/s there).
-Kernel survey of /home/alex/port-staging/lazarus (vllm-xpu-kernels csrc,
+Kernel survey of the reference XPU tree (vllm-xpu-kernels csrc,
 the vllm fork, sonar/): no GGUF/IQ2 code anywhere; transferable patterns
 recorded in perf/xpu_kernel_survey.md (subgroup-per-row / 8 rows per WG /
 16 B loads / per-K stride choice, SLM codebook, int8 dot + per-block scale,
@@ -5053,14 +5053,14 @@ work; (5) grouped GGUF GEMM for prefill on the SYCL-TLA mainloop.
 
 ---
 
-## 2026-09-01 — Qwen3.8-27B-NVFP4 on 4x Arc Pro B70 (TP4): parity with the Lazarus vLLM fork
+## 2026-09-01 — Qwen3.8-27B-NVFP4 on 4x Arc Pro B70 (TP4): parity with the reference vLLM fork
 
 **Goal.** Serve `Qwen3.8-27B-NVFP4-RadixArk` (dense hybrid: 48 GDN + 16 full-attention
 of 64 layers, modelopt_mixed FP8+NVFP4) from SlimServe at or above the fork that
 currently holds production on :29734.
 
 **Baseline (comparator).** `~/quadb70-loop/state/control-qwen38.json`, measured on the
-Lazarus fork at max_model_len=65536, kv_cache_dtype=auto(fp8), TP4, max_num_seqs=32:
+reference fork at max_model_len=65536, kv_cache_dtype=auto(fp8), TP4, max_num_seqs=32:
 c1 56.2 / c8 252.3 / c32 549.9 tok/s.
 
 **Harness.** `~/port-staging/bench.py --conc 1,8,32 --tokens 256 --repeat 2`,

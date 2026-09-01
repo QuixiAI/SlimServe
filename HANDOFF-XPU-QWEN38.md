@@ -19,14 +19,14 @@ the same kernel selection as prod, then dies at FP8 requantisation.
 
 ## The blocker
 
-`vllm-xpu-kernels` (`/home/lazarus/vllm-xpu-kernels`, the `.so`s shipped in
+`vllm-xpu-kernels` (the reference kernels tree on this host, the `.so`s shipped in
 `vllm_xpu_kernels/`) was built against **torch 2.11**. SlimServe's venv runs
 **torch 2.15.0.dev20260815+xpu**. The `DispatchKey` enum shifted between those
 releases, so the compiled constant for `torch::kXPU` now resolves to **HPU**:
 
     $ python -c "from torch._C import _dispatch_dump; \
         import vllm_xpu_kernels._C; print(_dispatch_dump('_C::rms_norm'))"
-    debug: registered at /home/lazarus/vllm-xpu-kernels/csrc/torch_bindings.cpp:16
+    debug: registered at <kernels-tree>/csrc/torch_bindings.cpp:16
     HPU: registered at .../torch_bindings.cpp:16
 
 Every op in the library is affected, checked across both namespaces:
@@ -60,7 +60,7 @@ resolved at runtime, so they land correctly.
 
 1. **Rebuild `vllm-xpu-kernels` against torch 2.15** with oneAPI icpx
    (`/opt/intel/oneapi/compiler/2026.1`). Correct fix, keeps SlimServe's torch.
-   Note `/home/lazarus/vllm-xpu-kernels` HEAD `471b7b6` already carries the K32
+   Note the kernels tree at HEAD `471b7b6` already carries the K32
    NVFP4 change, so a rebuild picks up drop-in 61 natively and the
    `LD_LIBRARY_PATH` override can be dropped.
 2. **Move SlimServe's venv to the fork's torch 2.13.0.dev20260603+xpu.** Avoids
