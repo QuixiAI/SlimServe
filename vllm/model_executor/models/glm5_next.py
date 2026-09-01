@@ -51,6 +51,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mhc import (
+    MHCFusedPostPreOp,
+    MHCPostOp,
+    MHCPreOp,
+)
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
@@ -79,55 +84,6 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
-
-
-class Glm5NextHyperConnection(nn.Module):
-    """Eager mHC site (reference math verbatim, fp32 throughout).
-
-    Owns fn/base/scale for ONE site (attn or ffn). Parameter names are set
-    by the owning decoder layer to match the checkpoint's flat
-    ``hc_{attn,ffn}_{fn,base,scale}`` tensors.
-    """
-
-    def __init__(self, hc_mult: int, hidden_size: int, sinkhorn_iters: int,
-                 eps: float):
-        super().__init__()
-        self.hc_mult = hc_mult
-        self.sinkhorn_iters = sinkhorn_iters
-        self.eps = eps
-        mix = (2 + hc_mult) * hc_mult
-        self.fn = nn.Parameter(
-            torch.empty(mix, hc_mult * hidden_size, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.base = nn.Parameter(
-            torch.empty(mix, dtype=torch.float32), requires_grad=False
-        )
-        self.scale = nn.Parameter(
-            torch.empty(3, dtype=torch.float32), requires_grad=False
-        )
-
-    def forward(
-        self, streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """streams: [T, H, D] -> (post [T, H], comb [T, H, H], collapsed [T, D])."""
-        hc = self.hc_mult
-        flat = streams.flatten(1).float()
-        # Unweighted RMSNorm over the flattened streams.
-        flat = flat * torch.rsqrt(flat.pow(2).mean(-1, keepdim=True) + 1e-5)
-        mixed = torch.nn.functional.linear(flat, self.fn)
-        pre_w, post_w, comb_w = mixed.split([hc, hc, hc * hc], dim=-1)
-        pre_b, post_b, comb_b = self.base.split([hc, hc, hc * hc])
-        pre = torch.sigmoid(pre_w * self.scale[0] + pre_b) + self.eps
-        post = 2.0 * torch.sigmoid(post_w * self.scale[1] + post_b)
-        comb = comb_w.view(-1, hc, hc) * self.scale[2] + comb_b.view(hc, hc)
-        comb = torch.softmax(comb, dim=-1) + self.eps
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
-        for _ in range(self.sinkhorn_iters - 1):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
-        collapsed = (pre.unsqueeze(-1) * streams.float()).sum(dim=1)
-        return post, comb, collapsed.to(streams.dtype)
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -229,6 +185,18 @@ class Glm5NextMLAAttention(nn.Module):
 
 
 class Glm5NextDecoderLayer(nn.Module):
+    """One hybrid layer with mHC at both sites.
+
+    Uses the fork's fused mHC ops (quixicore CUDA kernels on Ampere, the
+    same path DSV4 serves with): the first layer runs ``MHCPreOp`` on the
+    expanded streams, every later site runs ``MHCFusedPostPreOp`` which
+    applies the previous sublayer's post/comb placement and the next
+    site's pre in one launch. The layer returns its FFN output with the
+    placement deferred to the next layer (or the model's final
+    ``MHCPostOp``). hc parameters are flat on the layer, matching the
+    checkpoint's ``hc_{attn,ffn}_{fn,base,scale}`` names.
+    """
+
     def __init__(
         self,
         config,
@@ -239,6 +207,7 @@ class Glm5NextDecoderLayer(nn.Module):
         quant_config = vllm_config.quant_config
         self.layer_idx = int(prefix.rsplit(".", 1)[1])
         self.hidden_size = config.hidden_size
+        self.rms_norm_eps = config.rms_norm_eps
         self.is_linear = (
             config.layer_types[self.layer_idx] == "linear_attention"
         )
@@ -272,47 +241,96 @@ class Glm5NextDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             self.hidden_size, config.rms_norm_eps
         )
-        self.attn_hc = Glm5NextHyperConnection(
-            config.hc_mult, self.hidden_size, config.hc_sinkhorn_iters,
-            config.hc_eps,
-        )
-        self.ffn_hc = Glm5NextHyperConnection(
-            config.hc_mult, self.hidden_size, config.hc_sinkhorn_iters,
-            config.hc_eps,
-        )
 
-    def _apply_site(
-        self,
-        streams: torch.Tensor,
-        post: torch.Tensor,
-        comb: torch.Tensor,
-        out: torch.Tensor,
-    ) -> torch.Tensor:
-        """streams [T,H,D], post [T,H], comb [T,H,H], out [T,D] -> [T,H,D]."""
-        dtype = streams.dtype
-        placed = post.unsqueeze(-1).to(dtype) * out.unsqueeze(1)
-        mixed = torch.matmul(comb.to(dtype).transpose(-1, -2), streams)
-        return placed + mixed
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.hc_post_alpha = 2.0  # reference: post = 2 * sigmoid(.)
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * self.hidden_size
+
+        def _p(*shape):
+            return nn.Parameter(
+                torch.empty(*shape, dtype=torch.float32), requires_grad=False
+            )
+
+        self.hc_attn_fn = _p(mix_hc, hc_dim)
+        self.hc_ffn_fn = _p(mix_hc, hc_dim)
+        self.hc_attn_base = _p(mix_hc)
+        self.hc_ffn_base = _p(mix_hc)
+        self.hc_attn_scale = _p(3)
+        self.hc_ffn_scale = _p(3)
+
+        self.mhc_pre = MHCPreOp()
+        self.mhc_post = MHCPostOp()
+        self.mhc_fused_post_pre = MHCFusedPostPreOp()
+
+    def _site_pre(self, residual, fn, scale, base):
+        post_mix, res_mix, x = self.mhc_pre(
+            residual=residual,
+            fn=fn,
+            hc_scale=scale,
+            hc_base=base,
+            rms_eps=self.rms_norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=self.hc_post_alpha,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=0.0,
+        )
+        return residual, post_mix, res_mix, x
+
+    def _site_fused(self, x, residual, post_mix, res_mix, fn, scale, base):
+        return self.mhc_fused_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            fn,
+            scale,
+            base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            norm_weight=None,
+            norm_eps=0.0,
+        )
 
     def forward(
         self,
+        x: torch.Tensor,
         positions: torch.Tensor,
-        streams: torch.Tensor,
-    ) -> torch.Tensor:
-        post, comb, x = self.attn_hc(streams)
+        residual: torch.Tensor | None,
+        post_mix: torch.Tensor | None,
+        res_mix: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if residual is None:
+            # First layer: x is the expanded [T, hc_mult, D] stream tensor.
+            residual, post_mix, res_mix, x = self._site_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        else:
+            residual, post_mix, res_mix, x = self._site_fused(
+                x, residual, post_mix, res_mix,
+                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+            )
         x = self.input_layernorm(x)
         if self.is_linear:
             attn_out = torch.empty_like(x)
             self.self_attn(x, positions, attn_out)
         else:
             attn_out = self.self_attn(positions, x)
-        streams = self._apply_site(streams, post, comb, attn_out)
 
-        post, comb, x = self.ffn_hc(streams)
+        residual, post_mix, res_mix, x = self._site_fused(
+            attn_out, residual, post_mix, res_mix,
+            self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+        )
         x = self.post_attention_layernorm(x)
-        mlp_out = self.mlp(x)
-        streams = self._apply_site(streams, post, comb, mlp_out)
-        return streams
+        x = self.mlp(x)
+        return x, residual, post_mix, res_mix
 
 
 class Glm5NextTextModel(nn.Module):
@@ -361,15 +379,19 @@ class Glm5NextTextModel(nn.Module):
         else:
             hidden_states = self.embed_input_ids(input_ids)
         # Expand to hc_mult parallel residual streams: [T, H, D].
-        streams = hidden_states.unsqueeze(1).expand(
-            -1, self.hc_mult, -1
-        ).contiguous()
+        x = hidden_states.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+        residual = post_mix = res_mix = None
+        layer = None
         for layer in self.layers[self.start_layer:self.end_layer]:
-            streams = layer(positions, streams)
-        # HyperHead: unweighted mean over streams (unlike DSV4's weighted
-        # collapse).
+            x, residual, post_mix, res_mix = layer(
+                x, positions, residual, post_mix, res_mix
+            )
+        assert layer is not None
+        streams = layer.mhc_post(x, residual, post_mix, res_mix)
+        # HyperHead: unweighted mean over the streams (reference; DSV4's
+        # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
-        hidden_states, _ = self.norm(hidden_states), None
+        hidden_states = self.norm(hidden_states)
         return hidden_states
 
 
@@ -505,13 +527,6 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
             # the DSA layers run dense.
             if ".self_attn.indexer." in name:
                 continue
-            # mHC parameters are flat on the checkpoint layer
-            # (hc_attn_fn, ...); ours live on the per-site modules.
-            for site in ("attn", "ffn"):
-                for leaf in ("fn", "base", "scale"):
-                    name = name.replace(
-                        f".hc_{site}_{leaf}", f".{site}_hc.{leaf}"
-                    )
 
             is_expert = ".mlp.experts." in name
             mapped = False

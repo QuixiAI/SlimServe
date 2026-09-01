@@ -17929,3 +17929,24 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   attention land. Raw: perf/results/2026-09-01/glm53-ep-ab/.
 - Absolute numbers are bring-up-grade only (~5 tok/s c1): eager mHC
   (python sinkhorn per site per layer) and -O0 dominate; not a baseline.
+
+### GLM-5.3: eager retired - fused mHC + compile + cudagraphs (operator directive)
+- Operator: no eager paths, ever; only the optimized stack. The decoder now
+  uses the fork's fused mHC ops (MHCPreOp / MHCFusedPostPreOp / MHCPostOp ->
+  quixicore dsv4_mhc_* CUDA kernels on Ampere, hidden 4096 / hc_mult 4 -
+  the same geometry as DSV4), with DSV4's chaining: first-layer pre on the
+  expanded [T,4,D] streams, fused post+pre at every later site, final post,
+  then GLM's unweighted mean head. hc params are flat float32 on the layer
+  (checkpoint names load directly).
+- Boot at the default optimization level with FULL_DECODE_ONLY cudagraphs
+  (capture 64), TRITON_MLA (explicit), marlin NVFP4 MoE: healthy, canary
+  coherent. Exact-token 1000/300, TP4, no spec:
+  | config              | c1   | c8    |
+  | eager -O0 (retired) | 5.4  | 41.6  |
+  | fused mHC + graphs  | 74.1 | 343.6 |
+  Still dense NoPE MLA (bring-up); not a baseline until sparse lands.
+- NoPE sparse decode kernel: mla_decode_fp8_v<true,false,512,512,0,0>
+  bound as mla_decode_bf16_sparse_nope (q/slot 512 bf16, no rope segment;
+  the template's static_assert(VW <= QW) admits it), python wrapper, and
+  QUIXICORE_MLA_SPARSE dispatches on q width 512. Unexercised until the
+  pooled indexer feeds topk_indices_buffer.
