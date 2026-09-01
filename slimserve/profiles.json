@@ -1166,6 +1166,119 @@
           }
         }
       }
+    },
+    "glm53-flash-nvfp4": {
+      "title": "GLM-5.3-Flash",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
+      "local_dir": "GLM-5.3-Flash-NVFP4",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
+      "speculator": {
+        "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+        "local_dir": "GLM-5.3-Flash-NVFP4",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1
+        },
+        "note": "The checkpoint ships a one-layer MTP head (layer 45: DSA attention + MoE, eh_proj/enorm/hnorm). The glm5_next MTP draft path is not ported yet; profiles stay non-speculative until it is."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (group-16 FP4 experts, FP8 tail layer, BF16 backbone)",
+          "bytes": 197881155500,
+          "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: 42 MoE layers in NVFP4 (group 16), the last expert layer in FP8, attention/KDA/mHC/embeddings/vision in BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 kernels.",
+          "min_gpus": {
+            "a100": 4
+          },
+          "files": [
+            {
+              "path": "README.md",
+              "bytes": 2151
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 10644
+            },
+            {
+              "path": "config.json",
+              "bytes": 53876
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 177
+            },
+            {
+              "path": "model-00001-of-00010.safetensors",
+              "bytes": 20002894272
+            },
+            {
+              "path": "model-00002-of-00010.safetensors",
+              "bytes": 20002803476
+            },
+            {
+              "path": "model-00003-of-00010.safetensors",
+              "bytes": 20000726256
+            },
+            {
+              "path": "model-00004-of-00010.safetensors",
+              "bytes": 20000334356
+            },
+            {
+              "path": "model-00005-of-00010.safetensors",
+              "bytes": 20000724512
+            },
+            {
+              "path": "model-00006-of-00010.safetensors",
+              "bytes": 20000331556
+            },
+            {
+              "path": "model-00007-of-00010.safetensors",
+              "bytes": 20000725168
+            },
+            {
+              "path": "model-00008-of-00010.safetensors",
+              "bytes": 20000332348
+            },
+            {
+              "path": "model-00009-of-00010.safetensors",
+              "bytes": 20000722232
+            },
+            {
+              "path": "model-00010-of-00010.safetensors",
+              "bytes": 10215657876
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 17055736
+            },
+            {
+              "path": "model_mtp.safetensors",
+              "bytes": 7618560424
+            },
+            {
+              "path": "processor_config.json",
+              "bytes": 909
+            },
+            {
+              "path": "recipe.yaml",
+              "bytes": 1200
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 20217541
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 790
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -2423,6 +2536,59 @@
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true
           }
+        }
+      }
+    },
+    "glm53-nvfp4-4": {
+      "title": "GLM-5.3-Flash NVFP4 on 4 GPUs",
+      "source": "glm53-flash-nvfp4",
+      "gpus": 4,
+      "summary": "Vision-language 169B hybrid (34 KDA linear-attention layers + 11 DeepSeek-sparse-attention layers with a pooled indexer, mHC hyper-connections, 288-expert MoE). NVFP4 experts on Marlin, sparse NoPE MLA through the QuixiCore Ampere kernels, TP4 with experts sharded (EP measured slower).",
+      "speculative": false,
+      "variants": {
+        "a100": {
+          "platform": "a100",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 16,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "env": {},
+          "notes": [
+            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "enable_expert_parallel is off by measurement: with 288 experts at moe_intermediate 2048 the TP shard (512/rank) stays aligned to the NVFP4 group-16 scales, and the expert-parallel arm measured 4-6% slower at c1 and c8 on the optimized path (exact-token, perf/results/2026-09-01/glm53-ep-ab-opt/).",
+            "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
+            "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
+            "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
+            "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
+            "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
+            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+          ]
         }
       }
     }

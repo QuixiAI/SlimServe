@@ -18000,3 +18000,22 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   blue" (position-sensitive: rules out rope/merge-order errors).
 - Indexer fix en route: k_norm as fp32 functional layer_norm (bf16
   LayerNorm params vs fp32 input raised under the multimodal path).
+
+### glm53-nvfp4-4 registered and boots through SlimServe at the 1M model default
+- Source glm53-flash-nvfp4 (safetensors, 198 GB, 20 files) + profile
+  glm53-nvfp4-4/a100: TP4, EP off (measured), QUIXICORE_MLA_SPARSE +
+  sparse_mla_force_mqa, block 64, kv auto, marlin NVFP4 MoE, FULL_DECODE_ONLY
+  graphs (64), limit 2 images, glm47 reasoning + tool parsers, prefix
+  caching/thinking/auto tools via serving defaults. Non-speculative until the
+  MTP head is ported (checkpoint ships model_mtp.safetensors).
+- Boot via `slimserve glm53-nvfp4-4 --serve`: max_seq_len 1,048,576 from
+  config.json (no cap needed: ~17 KiB/token per rank), GPU pool 1,275,743
+  tokens = 1.22x concurrency at full context. Canaries: "Paris" with parsed
+  reasoning; spatial image "left: red, right: blue"; tool call
+  get_weather({"city": "Paris"}) with finish_reason tool_calls.
+- Host tier NOT on this record (test carve-out + note): the generic packed
+  slab planner assumes one block size across groups, but this layout mixes
+  KDA state pages with 64-token MLA/indexer pages and mis-sized the
+  attention views ('[544, 64, 256]' vs 262144 elements). The rtx3090
+  GDN+attention profile uses the dedicated CSA-linear planner; generalizing
+  that to KDA+MLA and running the eviction acceptance is the follow-up.
