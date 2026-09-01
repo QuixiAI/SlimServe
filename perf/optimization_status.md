@@ -17834,3 +17834,21 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   now records content-vs-reasoning placement and completion tokens, and
   counts either placement as KV-intact. Verification rerun in flight.
 - Raw: perf/results/2026-08-30/kvtier-acceptance/glm52-q2k-8/.
+
+### DSV4 q4ktail-4 A/B arms: tier no-regression PASS; fp8-vs-bf16 quantified
+- Exact-token bench (1000 in / 2000 out, temp 1.0/top-p 0.95/top-k 20
+  seed 42, hand-built launcher identical across arms, single run per
+  cell), aggregate output tok/s:
+  | arm                        | c1    | c8    |
+  | baseline (tier on, bf16)   | 152.8 | 233.7 |
+  | no-tier (bf16)             | 135.2 | 229.5 |
+  | fp8_ds_mla KV (tier on)    | 144.2 | 270.4 |
+- Tier on/off: no regression at either concurrency (c1 delta is
+  single-run spec-decoding variance; claim is "no regression", not "tier
+  is faster"). Issue #18 no-regression criterion: PASS.
+- fp8-vs-bf16 (the A/B owed since the bf16 campaign): bf16 costs ~14% at
+  c8 (233.7 vs 270.4) and is a wash at c1, at SHORT context - expect the
+  gap to widen with depth as KV bandwidth dominates. fp8_ds_mla still
+  boots cleanly as a fallback dtype. bf16 stays per policy (quality);
+  cost now on record.
+- Raw: perf/results/2026-08-30/kvtier-ab/{baseline,notier,fp8kv}/.
