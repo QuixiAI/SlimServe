@@ -18019,3 +18019,88 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   attention views ('[544, 64, 256]' vs 262144 elements). The rtx3090
   GDN+attention profile uses the dedicated CSA-linear planner; generalizing
   that to KDA+MLA and running the eviction acceptance is the follow-up.
+
+### Metal kernel hardening from the QuixiCore-Metal PR #3 review (2026-09-01)
+
+- Status: retained (sources + tests). End-to-end re-gate and the metallib
+  rebuild are owed on a macOS 26 box; see NOT DONE below.
+- Baseline: origin/main e848ed5f7, whose `csrc/quixicore/metal` tree is
+  byte-identical to QuixiCore-Metal PR #3 head cf4860a. CodeRabbit left 11
+  open threads on that PR: 9 on kernel files shared with this tree, 2 on
+  upstream-only docs. Fixed here first, then re-ported, so the twin stays
+  exact (same loop as 2026-08-17: 5452dc24b <-> upstream 6e64069).
+- Hypothesis: each kernel finding is a latent out-of-bounds access on a
+  host-invariant violation or a defensive-path inconsistency. In-kernel
+  guards that are no-ops on every served shape fix all of them without
+  changing a single served output bit.
+- Changes (in-kernel unless noted):
+  - `qgemm_sm.metal`: every split-K prologue (7 kernels) stages tile
+    `kb_beg` only when `kb_beg < kb_end`. The real bug of the set: with
+    K only required to be a multiple of 32, a K that does not fill
+    SPLIT_K chunks made the last threadgroup read one X/Wq tile past K.
+    Served K values divide evenly, which is why it never showed.
+  - `paged_attn_v2.metal` verify: stages a per-token validity flag and
+    skips unmapped blocks like `paged_attention_partition` does, instead of
+    scoring the zero tile (inflated denominator). Documents that verify
+    takes no softcap; `tk_launch.h` launcher comment says the same.
+  - `metal_attn.py` (host): raises NotImplementedError when a model asks
+    for attention logit soft-capping. Every Metal route passed softcap=0
+    and the value was silently dropped.
+  - `gdn.metal`: `gdn_fused_prepare` spec window bounded
+    (`num_accepted >= 1` and `read_off + hist_len <= state_cols`);
+    `gdn_recur_spec` checkpoint store bounded by `table_stride`.
+  - `gdn_step.metal`: S/width clamped to MAX_S/MAX_WIDTH; `off < 0`
+    (num_accepted < 1) returns.
+  - `indexer.metal`: after any 512-way merge, ranks past IDXTK_KEEP emit
+    -1 instead of unranked survivors (host already forbids that k_eff;
+    shared body, so prefill and decode both).
+  - `qk_norm_rope_gate.metal`: `MAX_HEAD_DIM` constant, whole-threadgroup
+    return before any barrier when head_dim exceeds it.
+  - `dflash_prepare.metal`: `valid_ctx_end` clamped to `ctx_start + 1`
+    (the Triton reference reads `tgt_pos[valid_ctx_end - 1]` unguarded).
+- Correctness, this box (M3 Max 128 GB, macOS 15.7.9, Xcode 26.3,
+  MetalToolchain 17.3.7003.10):
+  - Built extension + metallib at `-std=metal3.1` through a LOCAL,
+    uncommitted `cmake/metal.cmake` tweak: this toolchain has no
+    `metal::uint4b_format`, so the committed `-std=metal4.0` recipe fails in
+    the u4/u8 tensor kernels before anything else is compiled.
+  - Existing oracles (`test_qwen_gdn_metal`, `test_metal_indexer_topk_prefill`,
+    `test_metal_prefill_fa`): 5/5 before, 5/5 after.
+  - New `tests/kernels/test_metal_paged_attention_verify.py` (dense fp32
+    reference, bf16 D=128, bf16+fp16 D=256, m=1 and m=32, unmapped-block
+    case): before 3/4 with the unmapped case off by 0.195 max abs (the
+    finding reproduced); after 4/4.
+  - New `tests/kernels/test_metal_indexer_topk_decode.py` (direct 1,024
+    sort and 512-way streaming merge, exact vs torch.topk): 2/2 before and
+    after.
+  - GDN probe (`ab_gdn.py`: `gdn_fused_prepare` spec and plain,
+    `gdn_recur_spec` with wide and seq_len-tight slot tables, num_accepted
+    1..4 against the 6-column conv state mamba_utils allocates for
+    kernel 4 + num_spec 3): 16/16 tensors bit-exact before vs after.
+  - `qgemm_sm.metal` under `-std=metal4.0 -ferror-limit=0`: identical
+    14-error set before and after (all `uint4b_format` in the untouched
+    u4/u8 kernels). The guard edits inside the `__HAVE_TENSOR__` kernels
+    are compile-checked only to that extent.
+- NOT DONE: no end-to-end profile gate ran. `qc_metal_serving.mm` selects
+  the `mpp::tensor_ops` variants unconditionally (verify band 15/16/17,
+  Muse lm_head 16) and Metal 4 tensor ops need macOS 26; on 15.7 the
+  pipeline lookup would fail, so no Metal profile can serve here. The
+  tracked `vllm/quixicore_metal.metallib` is therefore NOT rebuilt in this
+  change and is stale against the sources until a macOS 26 box rebuilds it.
+- Throughput: not measured. The guards are a threadgroup-uniform predicate
+  outside the K loop and one threadgroup int per staged tile; expected
+  neutral, to be confirmed by the pins.
+- Side finding: a TORCH_CHECK failure inside an `encode` block (GCD
+  dispatch_sync) escapes as an uncaught C++ exception and aborts the
+  process instead of raising; seen when asking for
+  `paged_attention_verify_float16_128`, which is not instantiated (the
+  metallib carries bf16 at 128 and both dtypes at 256).
+- Next, on a macOS 26 Metal box: `uv pip install -e . --no-deps
+  --no-build-isolation`; run the three test files above; serve
+  `qwen38-nvfp4-1` and re-pin c1 1000x256 (sha 467b35c3) and 2500x64
+  (sha aa448847) with `benchmark_dsv4_exact.py` + m2_source.txt; serve
+  `muse-kdyn-1` under the rested protocol; commit the rebuilt metallib.
+- Raw: perf/results/2026-09-01/hardening_baseline/ (baseline build logs,
+  oracle and test logs, metal4.0 error sets) and
+  perf/results/2026-09-01/hardening_patched/ (patched build, tests,
+  `ab_gdn_compare.log`, `apply_hardening.py`, `ab_gdn.py`).

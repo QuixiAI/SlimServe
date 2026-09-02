@@ -293,6 +293,11 @@ class MetalAttentionImpl(AttentionImpl):
             raise NotImplementedError("Attention sinks require TurboQuant on Metal.")
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi has no Metal attention path.")
+        if self.logits_soft_cap:
+            raise NotImplementedError(
+                "Attention logit soft-capping has no Metal path: every Metal "
+                "attention route passes softcap=0 and the multi-query verify "
+                "kernel takes none.")
         # Sliding windows ride the paged-attention kernel's `window` argument
         # on the decode path and a banded mask on the SDPA fallback.
         if attn_type != AttentionType.DECODER:

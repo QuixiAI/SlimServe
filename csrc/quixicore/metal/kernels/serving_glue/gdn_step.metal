@@ -91,7 +91,12 @@ kernel void qwen_gdn_conv_step(
     if (c >= conv_dim) return;
     const int slot = conv_slot[n];
     if (slot <= 0) return;  // NULL entry: the scan kernel zeroes the output
+    // S and width index the fixed local windows below. The host checks
+    // 1 <= S <= MAX_S and 2 <= width <= MAX_WIDTH; a violation degrades to
+    // a no-op here instead of writing past the stack arrays.
+    if (S < 1 || S > MAX_S || width < 1 || width > MAX_WIDTH) return;
     const int off = use_accepted ? (num_accepted[n] - 1) : 0;
+    if (off < 0) return;  // num_accepted < 1: no history window to read
     const int w1 = width - 1;
 
     device TC* st = conv_state + (long)slot * cs_slot + (long)c * cs_chan;

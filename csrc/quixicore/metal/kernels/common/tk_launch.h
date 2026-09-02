@@ -4757,6 +4757,9 @@ void launch_paged_attention_partition(
 // Multi-query verify partition: the m expanded rows cooperate per (head,
 // partition) threadgroup, staging each K/V tile once. Partial layout matches
 // paged_attention_partition with batch == m, so the same reduce merges.
+// Unlike launch_paged_attention_partition there is no softcap argument:
+// the verify kernel never soft-caps, so callers must not route
+// soft-capped models through it.
 template <class E>
 void launch_paged_attention_verify(
     E& e, typename E::in_t q, typename E::in_t key_cache,

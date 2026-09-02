@@ -48,7 +48,12 @@ kernel void prepare_dflash_inputs(
     const int ctx_start = tgt_qsl[req_idx];
     const int ctx_end = tgt_qsl[req_idx + 1];
     const int num_ctx = ctx_end - ctx_start;
-    const int valid_ctx_end = ctx_end - num_rejected[req_idx];
+    // The bonus/anchor token is always accepted, so at least one context
+    // position is valid; clamp so a producer bug can never read before
+    // ctx_start (the Triton reference reads tgt_pos[valid_ctx_end - 1]
+    // unguarded).
+    const int valid_ctx_end =
+        metal::max(ctx_start + 1, ctx_end - num_rejected[req_idx]);
     const int bonus = num_sampled[req_idx] > 0
                           ? (int)last_sampled[req_state_idx]
                           : next_prefill[req_state_idx];
