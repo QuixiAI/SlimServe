@@ -18019,3 +18019,15 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   attention views ('[544, 64, 256]' vs 262144 elements). The rtx3090
   GDN+attention profile uses the dedicated CSA-linear planner; generalizing
   that to KDA+MLA and running the eviction acceptance is the follow-up.
+
+### glm53-nvfp4-4 WildChat deep-context leg: PASS
+- Standard sweep runner (c8, ctx-target 1M, 1.25h cap) on the registered
+  profile: 0 errors, 19/19 recall probes (31K -> 114K context), all 8
+  sessions ran the full wall, max_ctx 131,680 / median 116,208 - roughly
+  2-3x the depth the GLM-5.2 records reach in the same window, on the
+  sparse DSA path with real pool selection throughout. Raw:
+  perf/results/2026-09-01/glm53-leg/glm53-nvfp4-4/.
+- With this the record meets the profile-validation bar (text + image
+  requests, WildChat at concurrency 8, model-default context). Open on the
+  record: host tier (mixed-block-size packed planner) and MTP speculative
+  decoding.
