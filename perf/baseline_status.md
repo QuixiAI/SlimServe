@@ -1930,9 +1930,10 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 - Correctness gates at this baseline: text (+reasoning), image and tool
   canaries through both profiles; pooled-indexer parity vs transformers;
   bf16 sparse decode parity (tests/kernels/test_quixicore_sparse_mla_bf16.py).
-  The TP8 WildChat deep-context leg is running (perf/results/2026-09-03/
-  glm53-leg/glm53-nvfp4-8/); the TP4 leg passed on 2026-09-02 (19/19
-  recall to 114K) on the pre-kernel-fix stack.
+  TP8 WildChat deep-context leg PASS (perf/results/2026-09-03/glm53-leg/
+  glm53-nvfp4-8/): 0 errors, 34/34 recall, max ctx 202,509, median
+  190,704, 97,378 completion tokens in 1.25 h. The TP4 leg passed on
+  2026-09-02 (19/19 recall to 114K) on the pre-kernel-fix stack.
 - The 2026-09-01 TP4 numbers below predate all three fixes and are kept
   as history; their c8 331.4 is not reproducible and is superseded.
 

@@ -18388,3 +18388,12 @@ vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
   c1 + cache locality) is unchanged and TP8 now leads DP2's old c16 too.
 - glm53-nvfp4-4 is being re-measured through its profile on this stack
   for the scaling comparison.
+
+### glm53-nvfp4-8 deep-context leg (WildChat c8, 1.25 h): PASS
+- 0 errors, 34/34 recall probes, max ctx 202,509 / median 190,704 (the
+  TP8 pool is twice the TP4 record's, so sessions ran ~60K deeper than
+  the TP4 leg's 131,680 max). 97,378 completion tokens over the 4,554 s
+  wall vs the TP4 leg's 62,538 (+56% at depth, where the partitioned
+  sparse decode does the most work). 131K-200K bucket: TTFT p50 59 s,
+  e2e p50 279 s (72 turns). Raw: perf/results/2026-09-03/glm53-leg/
+  glm53-nvfp4-8/. Text and image canaries under load: see post_evidence.
