@@ -178,7 +178,7 @@ def _pooled_logits_kernel(
 
 @triton.jit
 def _expand_topk_kernel(
-    sel_ptr,        # [R, KSEL] int32 pool indices (-1 invalid)
+    sel_ptr,        # [R, KSEL] int32 pool indices (-1 invalid), valid first
     vis_ptr,        # [R] int32
     out_ptr,        # [R, OUT_W] int32
     sel_stride,
@@ -187,36 +187,39 @@ def _expand_topk_kernel(
     OUT_W: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
+    """Expand selected pools to tokens, then append the incomplete tail
+    pool's tokens IMMEDIATELY after the last valid expanded entry, then
+    -1 padding. The sparse decode kernel walks [0, last_valid + 1), so
+    valid entries must stay contiguous: a tail parked at column
+    KSEL*KP would force a full 2048-slot walk for every query."""
     r = tl.program_id(0)
     vis = tl.load(vis_ptr + r)
     n_pools = vis // KP
     tail_count = vis - n_pools * KP
     tail_start = n_pools * KP
+    n_sel = tl.minimum(n_pools, KSEL)  # top-k writes valid pools first
     for s0 in range(0, KSEL, BLOCK_S):
         s = s0 + tl.arange(0, BLOCK_S)
         smask = s < KSEL
         pool = tl.load(sel_ptr + r.to(tl.int64) * sel_stride + s, mask=smask, other=-1)
         ok = smask & (pool >= 0) & (pool < n_pools)
         m = tl.arange(0, KP)
-        tokens = pool[:, None] * KP + m[None, :]
-        tokens = tl.where(ok[:, None], tokens, -1)
+        tokens = tl.where(ok[:, None], pool[:, None] * KP + m[None, :], -1)
         tl.store(
             out_ptr + r.to(tl.int64) * OUT_W + s[:, None] * KP + m[None, :],
             tokens,
             mask=smask[:, None],
         )
-    # tail + padding: columns [KSEL*KP, OUT_W)
-    c = KSEL * KP + tl.arange(0, KP)
+    # tail right after the valid pools, then pad the rest of the row
+    tcol = n_sel * KP + tl.arange(0, KP)
     tail = tl.arange(0, KP)
     tval = tl.where(tail < tail_count, tail_start + tail, -1)
-    tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tval, mask=c < OUT_W)
-    # any remaining columns (OUT_W padded past KSEL*KP + KP) are -1
-    extra = KSEL * KP + KP + tl.arange(0, 32)
-    tl.store(
-        out_ptr + r.to(tl.int64) * OUT_W + extra,
-        tl.full((32,), -1, tl.int32),
-        mask=extra < OUT_W,
-    )
+    tl.store(out_ptr + r.to(tl.int64) * OUT_W + tcol, tval, mask=tcol < OUT_W)
+    pad0 = n_sel * KP + KP
+    for c0 in range(0, OUT_W, 256):
+        c = c0 + tl.arange(0, 256)
+        cm = (c >= pad0) & (c < OUT_W)
+        tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
 
 
 # --------------------------------------------------------------------- core op

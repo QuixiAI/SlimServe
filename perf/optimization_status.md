@@ -18219,3 +18219,35 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   .log, tier_acceptance_nvme_{A,B}.log, tier_exact_nvme_A.log,
   bench_fp8kv_c8_nvme.log, run_nvme_validation.sh, run_nvme_exact.sh,
   tier_exact_8001.py).
+
+
+## 2026-09-02: GLM-5.3 8-GPU configuration matrix - first pass was a measurement artifact
+
+- First matrix (TP8, TP8+EP, TP4xDP2, TP4xDP2+EP; exact-token 1000/300 at
+  c1/c8/c16) read TP8 at 10.3 / 71.1 / 124.4 tok/s - 7x SLOWER than TP4 -
+  and identical with EP (10.2 / 70.5 / 123.5), so the MoE shard width was
+  not it. Topology exonerated (full NV12 mesh). DP2 arms died on a fresh
+  regression of mine (support_torch_compile wants vllm_config by keyword).
+- Profiling (torch profiler, rank 0, 32 c1 decode tokens after warmup):
+  TP8 step median 9.5 ms (~105 tok/s) vs TP4 10.7 ms (~93 tok/s) - TP8
+  is FASTER once warm. The matrix's 10 tok/s was cold Triton autotune /
+  compile of never-seen 8-rank shapes running inside the measured window
+  (the arm only ran an 8-token canary first). Every arm now warms c1/c8/
+  c16 before measuring; the same rule applies to all future baselines.
+- Two real fixes fell out of the profile:
+  1. My pooled-indexer expand kernel parked the tail pool at column 2048,
+     so the sparse decode kernel's tlen (last valid + 1) was always >= 2049
+     and it walked every padded slot: mla_decode_fp8_v cost 258 us/call
+     at TP8 for a 40-token context. Tail now follows the last valid
+     expanded entry: 130 us/call, kernel time per step -26%. Parity test
+     still exact.
+  2. torch.compile was never active on glm5_next (no support_torch_compile;
+     DSV4's A100 model is not compiled either). Enabled: the quixicore mHC
+     kernels are wrapped as registered custom ops with fake impls
+     (layers/glm5_next_mhc_ops.py) so Dynamo can trace the decoder. c1
+     TP4: 70 -> ~93 tok/s from compile alone.
+- Remaining per-token cost at TP8 (rank 0): custom allreduce 1stage<8>
+  21% (~28 us/call x 91/token; the 1-stage algorithm reads N-1 peers, so
+  8 ranks pay ~2x TP4's 4-rank calls), fused mHC pre-transition 14%,
+  sparse decode 12%, marlin MoE 11%, cuBLAS GEMV 13%. Matrix v2 (with TP4
+  reference) running to pick the 8-GPU record.
