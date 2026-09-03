@@ -82,7 +82,7 @@ def make_connector():
             kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
         ),
     )
-    kv_cache_config = SimpleNamespace(kv_cache_groups=make_groups())
+    kv_cache_config = SimpleNamespace(kv_cache_groups=make_groups(), kv_cache_tensors=[])
     with patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
         "_get_packed_kv_cache_layout",
@@ -202,7 +202,7 @@ def test_fill_stages_attention_and_pinned_tail_at_finish():
     assert len(fill_ops) == 3  # attention only during fill
     tail_ops = [op for ops in tail_meta.offloads.values() for op in ops]
     assert len(tail_ops) == 2  # one frozen snapshot per mamba group, no ring
-    assert {b for b, _ in tail_ops} == {95, 96}  # the pool-cached snapshots
+    assert {b for b, _, _ in tail_ops} == {95, 96}  # the pool-cached snapshots
     assert async_save is False
     pool = conn._block_pool
     assert sorted(pool.touched) == sorted(pool.freed)  # pins released
@@ -226,7 +226,8 @@ def test_missing_cached_boundary_skips_save():
     tail_meta = conn.build_connector_meta(sched_output({}))
     assert not tail_meta.offloads
     assert not conn._block_pool.touched
-    assert conn.index.stats()["resumable"] == 0
+    # No tail state was saved, so the hybrid trajectory is not resumable.
+    assert conn.index.lookup(req.block_hashes) is None
 
 
 def test_save_scans_down_to_deepest_cached_boundary():
@@ -247,7 +248,7 @@ def test_save_scans_down_to_deepest_cached_boundary():
         pool.cached[(bytes(h(3)), gid)] = pool.blocks[70 + g]
     conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
     tail_meta = conn.build_connector_meta(sched_output({}))
-    assert {b for ops in tail_meta.offloads.values() for b, _ in ops} == {70, 71}
+    assert {b for ops in tail_meta.offloads.values() for b, _, _ in ops} == {70, 71}
     conn.build_connector_meta(sched_output({}))
 
     fresh = FakeRequest("rd", [h(i) for i in range(6)], num_tokens=6 * BLOCK + 8)
@@ -275,7 +276,7 @@ def test_resume_round_trip():
     # 4 attention restores + 2 mamba tail-state restores; the ring is
     # zeroed, not restored.
     assert len(ops) == 4 + 2
-    targets = {b for _, b in ops}
+    targets = {b for _, b, _ in ops}
     assert {200, 201, 202, 203} <= targets  # attention span
     # Both mamba states land on the position-(k-1) tail blocks.
     assert {295, 296} <= targets
@@ -319,7 +320,7 @@ def test_mixed_local_and_tier_resume():
     ops = meta.restores["r5"]
     # 2 attention blocks (positions 2, 3) + 2 mamba tail states.
     assert len(ops) == 2 + 2
-    targets = {b for _, b in ops}
+    targets = {b for _, b, _ in ops}
     assert {402, 403} <= targets
     assert {495, 496} <= targets
     assert meta.zeros["r5"] == [490]

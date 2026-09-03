@@ -63,8 +63,8 @@ def test_confirmed_host_writes_are_written_through_and_rank_counted():
     req, meta, tail_meta, _ = run_conversation(conn, "r1", 3)
     # The meta AFTER a confirmation carries the write-through of exactly
     # the confirmed host slots.
-    fill_slots = sorted(s for ops in meta.offloads.values() for _, s in ops)
-    tail_slots = [s for ops in tail_meta.offloads.values() for _, s in ops]
+    fill_slots = sorted(s for ops in meta.offloads.values() for _, s, _ in ops)
+    tail_slots = [s for ops in tail_meta.offloads.values() for _, s, _ in ops]
     for _ in range(2):
         conn.build_connector_meta(sched_output({}))
     # run_conversation already built the metas that carried the
@@ -113,7 +113,7 @@ def test_host_pressure_demotes_then_hit_promotes_from_disk():
     assert len(meta3.restores["r3"]) == 5  # 3 attention + 2 tail states
     reads = meta3.disk_reads["r3"]
     assert len(reads) == 5
-    assert {hs for _, hs in reads} == {hs for hs, _ in meta3.restores["r3"]}
+    assert {hs for _, hs in reads} == {hs for hs, _, _ in meta3.restores["r3"]}
     # Until the worker reports the request received, the promoted slots are
     # pending and the trajectory is not offered again.
     other = idx.lookup([h(0), h(1), h(2), h(9)])

@@ -106,6 +106,22 @@ class FixFunctionalizationPass(VllmInductorPass):
                 mutated_args = {1: "result", 2: "scale", 3: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
             elif at_target in [
+                torch.ops._C.per_token_group_fp8_quant.default,
+                torch.ops._C.per_token_group_fp8_quant_packed.default,
+            ]:
+                # (input, output_q!, output_s!, ...) -> (); both outputs are
+                # written in place. Left unhandled, inductor dies later with
+                # its bare "auto_functionalized was not removed" assert (the
+                # GLM-5.2 A100 boot failure of 2026-08-29/30).
+                mutated_args = {
+                    1: "output_q",
+                    2: "output_s"
+                    if at_target
+                    == torch.ops._C.per_token_group_fp8_quant.default
+                    else "output_s_packed",
+                }
+                self.defunctionalize(graph, node, mutated_args)
+            elif at_target in [
                 torch.ops._C.rms_norm.default,
                 torch.ops._C.rms_norm_static_fp8_quant.default,
             ]:

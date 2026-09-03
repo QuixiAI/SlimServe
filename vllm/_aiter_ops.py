@@ -1191,14 +1191,13 @@ def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
     x: torch.Tensor,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
-
-    return act_mul_and_fp8_group_quant(
-        x,
-        activation="silu",
-        group_size=group_size,
-        dtype_quant=FP8_DTYPE,
+    from vllm.model_executor.layers.quantization.utils.act_group_quant import (
+        wide_act_mul_fp8_group_quant,
     )
+
+    # Bit-identical to aiter's act_mul_and_fp8_group_quant, but wide-tiled:
+    # 3.8x at M=1024, 5.1x at M=2048 (see the module docstring).
+    return wide_act_mul_fp8_group_quant(x, group_size, FP8_DTYPE)
 
 
 def _rocm_aiter_act_mul_and_fp8_group_quant_fake(

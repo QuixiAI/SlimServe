@@ -51,7 +51,7 @@ def test_host_pressure_demotes_a_fully_written_trajectory():
     hit = idx.lookup([h(0), h(1), h(2), h(3)])
     assert hit is not None
     owner, n, attn, tail = hit
-    assert owner == "a" and n == 3 and attn == [None, None, None] and tail == {}
+    assert owner == "a" and n == 3 and attn == [{}, {}, {}] and tail == {}
     assert idx.needs_promotion(hit)
 
 
@@ -79,7 +79,7 @@ def test_promotion_allocates_host_slots_and_reads_from_disk():
     assert promoted is not None
     attn, tail, reads = promoted
     assert len(attn) == 3 and set(tail) == {0, 1} and len(reads) == 5
-    assert all(d is not None for d in attn)
+    assert all(0 in d for d in attn)
     # Until the worker completes the reads the slots are pending and the
     # trajectory is not offered to another request.
     assert idx.lookup([h(0), h(1), h(2), h(3)]) is None

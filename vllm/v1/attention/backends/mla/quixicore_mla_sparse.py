@@ -350,6 +350,12 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         tlen = quixicore_ops.sparse_topk_tlen(idx)
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
+            if q.shape[-1] == 512:
+                # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                return quixicore_ops.mla_decode_bf16_sparse_nope(
+                    q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
+                    attn_metadata.block_size, self.softmax_scale,
+                ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
                 q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
                 attn_metadata.block_size, self.softmax_scale,

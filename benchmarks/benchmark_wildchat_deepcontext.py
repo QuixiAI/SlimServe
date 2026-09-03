@@ -106,7 +106,10 @@ async def run_session(client, model, sid, turns, pastes, records, stop_at,
                 # tokens reasoning before content, and a 96-token cap starved
                 # probes into recall_ok=False with zero content emitted.
                 # Budget must cover think + answer.
-                max_tokens = 512
+                # Probe budget must cover the model's full thinking pass:
+                # 512 starved one GLM probe (thinking alone consumed it,
+                # leaving the recall indeterminate at exactly max_tokens).
+                max_tokens = 1024
             else:
                 user_msg = (
                     make_paste(pastes, rng, args.paste_chars)

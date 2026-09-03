@@ -206,10 +206,14 @@ behavior:
   fp8-vs-bf16 exact-token throughput A/B and KV pool re-sizing (bf16 rows
   are 1024B vs fp8's 584B). The other platforms keep their qualified
   configs (Metal fp8_ds_mla and the qwen38-nvfp4-1-tq TurboQuant
-  variant); any flip needs an on-box requalification pass. Draft-model
-  KV (DSpark TurboQuant k8v4) is always allowed: rejection sampling
-  verifies every draft token against the target, so draft KV precision
-  can only affect acceptance rate and speed, never output content.
+  variant); any flip needs an on-box requalification pass. glm52-q2k-4/
+  a100 serves fp8 main KV at 131072 (operator-approved 2026-08-30): 65.8
+  GiB of Q2K weights per 80 GB rank make bf16 KV at that length physically
+  impossible; the record's note states the arithmetic and glm52-q2k-8
+  remains the bf16 model-default-context record. Draft-model KV (DSpark
+  TurboQuant k8v4) is always allowed: rejection sampling verifies every
+  draft token against the target, so draft KV precision can only affect
+  acceptance rate and speed, never output content.
 - Every profile serves its model's DEFAULT context unless genuinely
   impossible on the platform (operator 2026-08-29): GLM-5.2 202752,
   DSV4-Flash 1M, Qwen3.8-Flash-Next 262144 - as configured in the GGUF
@@ -222,13 +226,20 @@ behavior:
   KV offload later (unified memory makes a host-RAM tier meaningless
   there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
   (2026-08-28, mamba state-geometry fix landed: tail states are the
-  engine's frozen align-mode boundary snapshots) and on all seven A100
-  profiles (2026-08-29 WildChat deep-context sweep; DSV4's packed
-  cross-layer slab registers directly, the GLM records force the packed
-  layout via enable_cross_layers_blocks). The eviction-restore acceptance
-  (marker recall after full GPU-pool eviction) is the standing check for
-  tier changes. MI300X still needs the connector generalized to its
-  layout (issues #17/#18); enable there only with on-box validation.
+  engine's frozen align-mode boundary snapshots) and configured on the
+  A100 DSV4/GLM-5.2 records (DSV4's packed cross-layer slab registers
+  directly, the GLM records force the packed layout via
+  enable_cross_layers_blocks). Tier RESTORES on A100 are proven only
+  where the instrumented acceptance shows them: GLM-5.2 (2026-08-31,
+  restores + SHA verify clean); DSV4 stays write-only by design until
+  window-tail staging exists for its sliding-window groups; glm53-nvfp4-4
+  carries no tier until the packed planner handles KDA+MLA mixed block
+  sizes. Recall probes alone do not prove the tier (full re-prefill
+  answers them too): the standing check is
+  benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1,
+  read alongside the connector's hit/restore counters. MI300X still
+  needs the connector generalized to its layout (issues #17/#18); enable
+  there only with on-box validation.
   A THIRD tier (NVMe, `nvme_tier_gb_per_rank`) sits under the host tier
   on qwen38fn-fp8-8/rtx3090 (2026-09-02): confirmed host blocks are
   written through to a per-rank O_TMPFILE, a fully-written trajectory is

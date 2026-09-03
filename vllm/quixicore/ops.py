@@ -1537,6 +1537,23 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mla_decode_bf16_sparse_nope(
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        block_table: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: torch.Tensor,
+        block_size: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """NoPE sparse MLA decode over a bf16 latent cache (512 bf16 per
+        slot, no rope segment): GLM-5.3-Flash (glm5_next). Returns
+        [tokens, heads, 512]."""
+        return _qc().mla_decode_bf16_sparse_nope(
+            q, kv, block_table, indices, topk_length, block_size, scale
+        )
+
+    @staticmethod
     def mla_decode(
         q: torch.Tensor,
         kv_cache: torch.Tensor,

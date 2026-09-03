@@ -103,6 +103,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     sources = registry._registry()["sources"]
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
+    assert sources["glm53-flash-nvfp4"]["modalities"] == ["text", "image"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
@@ -282,7 +283,7 @@ def test_platform_override_replaces_the_mi300x_kv_budget():
     nvidia = resolve("glm52-q2k-4", "a100", 4, "Q2_K")
     assert "kv_cache_memory_bytes" in amd.engine
     assert "kv_cache_memory_bytes" not in nvidia.engine
-    assert nvidia.engine["gpu_memory_utilization"] == 0.92
+    assert nvidia.engine["gpu_memory_utilization"] == 0.96
     assert nvidia.env == {}, "AITER is a ROCm switch"
 
 
@@ -333,6 +334,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",
+        "glm53-flash-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -1061,9 +1063,11 @@ def test_quantized_main_kv_is_an_explicit_validated_choice():
     quantization is a stated, on-box-validated choice, never an accident: a
     record that quantizes its main KV must carry a note naming the format,
     and the rtx3090 Flash-Next record pins fp8 (e4m3) - not TurboQuant -
-    through the engine's own kv_cache_dtype. Draft-model KV (DSpark
-    TurboQuant) is exempt everywhere because rejection sampling verifies
-    drafts against the target.
+    through the engine's own kv_cache_dtype. glm52-q2k-4/a100 (fp8 at
+    131072: 65.8 GiB of Q2K weights per 80 GB rank leave no room for bf16
+    KV, operator-approved 2026-08-30) is covered by the same rule through
+    its note. Draft-model KV (DSpark TurboQuant) is exempt everywhere
+    because rejection sampling verifies drafts against the target.
     """
     rec = registry._registry()["profiles"]["qwen38fn-fp8-8"]["variants"]["rtx3090"]
     assert rec["engine"]["kv_cache_dtype"] == "fp8"
@@ -1095,17 +1099,24 @@ def test_every_a100_profile_carries_the_host_kv_tier():
     config, because their group specs are not verified to resolve
     all-uniform on their own.
     """
+    # glm53-nvfp4-4 is the one a100 record without the tier: its KDA-state +
+    # MLA + indexer groups mix block sizes, which the generic packed slab
+    # planner cannot lay out (the record's note states the follow-up).
+    tier_pending = {"glm53-nvfp4-4"}
     seen = 0
     for profile_id, entry in registry._registry()["profiles"].items():
         record = entry.get("variants", {}).get("a100")
         if record is None:
             continue
         seen += 1
+        if profile_id in tier_pending:
+            assert "kv_transfer_config" not in record["engine"], profile_id
+            continue
         transfer = record["engine"]["kv_transfer_config"]
         assert transfer["kv_connector"] == "HostTierConnector", profile_id
         assert transfer["kv_role"] == "kv_both", profile_id
         extra = transfer["kv_connector_extra_config"]
         assert extra["host_tier_gb_per_rank"] > 0, profile_id
-        if entry["source"] == "glm52-vision":
+        if entry["source"] in ("glm52-vision", "glm53-flash-nvfp4"):
             assert extra["enable_cross_layers_blocks"] == "True", profile_id
-    assert seen == 7, "expected all seven A100 variants to be checked"
+    assert seen == 8, "expected all eight A100 variants to be checked"

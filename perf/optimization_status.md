@@ -17598,6 +17598,60 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   max 139.4K (raw: ~/.local/scratch/a100-sweep/resident-final-recall.json).
   The DP2 profile is serving-healthy under the mitigation; the resident
   stays up on :8000.
+
+## 2026-08-30: GLM-5.2/A100 bring-up — compile fix, packed-slab fix, TP4 fp8 carve-out
+
+### torch.compile: per_token_group_fp8_quant left functionalized (fixed)
+- glm52-q2k-4 boot died in inductor with the bare "auto_functionalized was
+  not removed" assert. A diagnostic added to FixFunctionalizationPass named
+  the leftover op: `_C.per_token_group_fp8_quant.default` (and the `_packed`
+  sibling has the same shape). The pass's if/elif chain simply never listed
+  it; DSV4 never routes through that op, which is why only GLM hit it.
+- Fix: defunctionalize both variants (mutated args output_q/output_s[_packed])
+  in vllm/compilation/passes/utility/fix_functionalization.py. The leftover-
+  node diagnostic stays: it turns the next such miss from a bare assert into
+  a named op.
+
+### Host tier on GLM: packed cross-layer slab was never allocated (fixed)
+- With the compile fix in, boot failed at connector registration:
+  "packed KV backing is not a whole number of block strides
+  (6902016 % 6235392)". The 6902016 was one arbitrary indexer k_cache
+  (817 blocks x 8448 B): every layer had its own allocation.
+- Root cause: GLM's specs unify into a SINGLE UniformTypeKVCacheSpecs group
+  (the MLA+SWA promotion path in kv_cache_utils), and
+  get_kv_cache_config_from_groups orders its `len(groups)==1 and
+  UniformType` special case (per-layer tensors, shared_by=[layer]) BEFORE
+  the `_use_packed_kv_cache_config` branch — silently shadowing the
+  operator's enable_cross_layers_blocks opt-in. DSV4 dodges it only because
+  its groups don't collapse to one.
+- Fix: an explicit cross-layers opt-in now wins over the single-uniform-group
+  special case (same condition mirrored in _pool_bytes_per_block so
+  scheduler bytes-per-block matches worker allocation). Validated: TP4 boot
+  healthy, slab shared by 102/102 layers (indexer caches INSIDE, so tier
+  restores are complete), backing = 960 x 6235392 B exactly, 48 GiB/rank
+  arena registered on all 4 ranks.
+
+### glm52-q2k-4 context: physics and the fp8 carve-out (operator-approved)
+- Measured on-box: Q2K weights 65.76 GiB/rank at TP4 (checkpoint itself is
+  244 GiB; sharding is fine, nothing usefully replicated), KV ~97.4 KiB/token
+  across the 102 packed layers. bf16 KV at 202752 = 18.4 GiB/rank, at
+  131072 = 12.2 GiB/rank — both exceed the 80 GB card at ANY utilization.
+  bf16 ceiling is ~40-45K. The host tier cannot lift this: an active
+  request's KV must be GPU-resident (attention kernels + chunked prefill
+  read GPU pages); the tier provides concurrency, not single-request ceiling.
+- Operator decision (2026-08-30): glm52-q2k-4/a100 serves fp8 main KV at
+  max_model_len 131072 (util 0.95, max_num_batched_tokens 4096) as the sole
+  bf16-policy carve-out, documented in the record note, CLAUDE.md, and
+  test_no_profile_quantizes_main_kv. Requalification = WildChat deep-context
+  sweep marker-recall probes. glm52-q2k-8 keeps bf16 at the model-default
+  202752 (weights ~33 GiB/rank leave room; KV is per-rank-replicated MLA so
+  TP8 does not shrink it).
+- Rejected alternatives: bf16 @ ~40K cap (loses deep context on TP4);
+  PLE-style pinned-host UVA KV for sparse MLA (real design direction for
+  breaking GPU residency — top-k selected rows gathered from host inside
+  the kernel, precedent = qwen38fn PLE table — but a kernel+block-manager
+  project, not a config change; parked).
+
 ## 2026-08-30 - Qwen3.8 default thinking budget: flat 2000 on every variant
 
 - Operator directive: all six Qwen3.8 variant records (qwen38-nvfp4-1
@@ -17614,6 +17668,369 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   boots (config-only; the V2 enforcement machine is platform-neutral
   and its suite runs on MPS).
 
+## 2026-08-30 - RETAIN: wide-tile fused SiLU-mul + fp8 group quant, tile sized by M
+
+- Status: retained on `rocm-fp8-followups` (PR #14). Kernel-level measurement
+  only; not yet run through a serving profile.
+- Scope: `wide_act_mul_fp8_group_quant` replacing AITER's
+  `act_mul_and_fp8_group_quant` on the ROCm fp8 path. MI300X (gfx942), one
+  GPU, real Qwen3.8 MLP width (N=17408, so x is [M, 34816] bf16), group 128,
+  output `float8_e4m3fnuz`.
+- Method: each call timed inside a CUDA graph, 50 replays after warmup, us per
+  call. Graph capture rather than an eager loop because at these sizes the op
+  is launch-bound and eager timing overstates it.
+- Baseline: AITER's kernel launches one program per (row, 128-wide group).
+- Hypothesis: a program covering BLOCK_M rows x GROUPS groups removes most of
+  that launch and indexing overhead on a memory-bound op.
+
+- First result, and the problem it exposed. The kernel as submitted fixed
+  BLOCK_M=8, GROUPS=8, which is the WORST config in the grid below M=64:
+
+  | M | aiter us | submitted us | ratio |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 2.52 | 3.57 | 0.71x |
+  | 8 | 2.52 | 3.52 | 0.72x |
+  | 32 | 4.73 | 3.70 | 1.28x |
+  | 128 | 14.29 | 4.26 | 3.36x |
+  | 2048 | 249.77 | 50.30 | 4.97x |
+
+  A ~40% regression at M=1-8 -- single-stream decode -- because one program
+  per 8 rows leaves a 304-CU card with a handful of workgroups. The PR
+  measured only M>=256, where the config is fine, so this was invisible.
+
+- Grid sweep (BLOCK_M x GROUPS over 1,2,4,8 each) showed GROUPS=8 is right
+  everywhere and BLOCK_M is the term that matters: at M=1, BM2G8 is 2.23us
+  against BM8G8's 3.50us. BLOCK_M=8 only earns its keep from about M=1024.
+
+- Change: select BLOCK_M by M -- 2 below 64, 4 below 1024, 8 above. A pure
+  function of M resolved before launch, so it is safe under CUDA graph
+  capture; Triton autotune is not, because it benchmarks at first call.
+
+- Result after the change: matches or beats AITER at every width tested, and
+  is unchanged where it already won.
+
+  | M | aiter us | retained us | ratio |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 2.45 | 2.24 | 1.09x |
+  | 8 | 2.53 | 2.30 | 1.10x |
+  | 32 | 4.69 | 2.42 | 1.94x |
+  | 128 | 14.19 | 4.00 | 3.55x |
+  | 512 | 57.71 | 13.58 | 4.25x |
+  | 2048 | 248.25 | 50.94 | 4.87x |
+
+- Correctness: output bit-identical to AITER's kernel at every M tested,
+  compared as raw int8 on the fp8 tensor plus exact equality on the scales.
+  This is the same arithmetic, re-tiled.
+- Decision: retain. The regression band is closed and the win at batch is
+  unchanged.
+- Open, deliberately not changed here: `DTYPE_MAX` stays at AITER's 240.0 for
+  fnuz, while `_silu_mul_per_token_group_quant_fp8_colmajor` in
+  `fp8_utils.py` clamps the same operation to 224.0 because 240.0 "will
+  cause accuracy issue on dynamic quantization models". Matching AITER keeps
+  this swap a pure performance change with testable bit-identity; moving to
+  224.0 is a numerics change and needs an accuracy run (gsm8k or lm-eval)
+  behind it. Recorded so the divergence is not silent.
+- NOT yet measured: end-to-end serving effect. These are kernel microbenchmarks
+  on one GPU; no profile has been booted with the change, so there is no TPS
+  number for it. The per-call delta at decode is ~0.2us against AITER at M=1,
+  so the expected single-stream effect is small; the batch case is where the
+  4-5x should show up.
+- Hardware: AMD Instinct MI300X (gfx942), 8 GPUs present, one used.
+- Raw artifacts: `perf/results/2026-08-30/actquant-tile-sweep/`
+  (actquant.json plus the three benchmark scripts).
+
+### Host tier: scheduler/worker arena disagreement (fixed)
+- First TP4 fp8 sweep leg ran 56 min then all sessions 500'd:
+  IndexError in KVTierDMA.issue, planned host slots 15339/15351 vs a
+  15339-slot worker arena. Boot log showed the split brain: scheduler-side
+  index "59811 slots" vs worker "arena 15339 slots x 3360000 bytes".
+- Root cause: generate_scheduler_kv_cache_config replaces a
+  UniformTypeKVCacheSpecs group spec with ONE arbitrary member layer's
+  spec ("all layers have the same type"). GLM-DSA's uniform group is
+  heterogeneous (MLA main KV 52.5 KiB/token + indexer k_cache 132 B/token
+  pages), and the arbitrary pick was an indexer layer, so the scheduler
+  derived stride 102x8448=861696 instead of the real 3360000 and planned
+  restores into slots the arena does not have. DSV4 never hit it: its
+  uniform groups are homogeneous, so the flattened spec gives the same
+  stride. The bug only fires once the arena FILLS (GLM fp8 slots are
+  3.36 MB, so this was the first workload to wrap 48 GiB).
+- Fix: HostTierConnector now takes block_stride from the planner's
+  KVCacheTensor.block_stride (authoritative, survives the scheduler
+  deepcopy) and only falls back to recomputing from group specs for
+  non-packed layouts. Validated on reboot: both roles log 15339 slots.
+
+### glm52-q2k-4 fp8@131072 sweep leg: PASS (stride fix validated under churn)
+- Rerun after the KVCacheTensor.block_stride fix: c8 WildChat deep-context,
+  full 1.25h wall, ZERO errors (first run: 16 errors/8 dead sessions at the
+  ~56-min arena wrap). max_ctx 54,434, median 44,222. Both roles agree on
+  15,339 slots; the arena wrapped repeatedly with no fault.
+- Recall 7/7 determinate probes (~31-39K ctx). One probe indeterminate, not
+  failed: completion hit exactly the 512-token cap with thinking unfinished
+  (successful probes used 66-227 tokens). Probe budget raised to 1024 in
+  the harness so GLM's thinking cannot starve a probe again.
+- Saturation note: probe TTFTs 725-1030s at c8 - this record is
+  prefill-bound at saturation (2048-token chunks, TP4 fp8). Capacity
+  record, not the throughput record; raw at
+  perf/results/2026-08-29/a100-bf16-kvtier/glm52-q2k-4/.
+- New acceptance tooling: benchmarks/benchmark_kv_tier_eviction.py
+  (marker recall after full GPU-pool eviction with re-churn between
+  probes, per issue #18), to be run against the dsv4-q4ktail-8 resident
+  with VLLM_KV_TIER_VERIFY=1.
+
+### glm52-q2k-8 bf16@202752 sweep leg: PASS
+- First TP8 GLM boot of the campaign: model-default 202752 context resolves
+  from the patched GGUF, bf16 KV, GPU pool 313,728 tokens (1.55x one
+  full-default request), packed slab 102/102 layers, tier arena 8,474
+  slots x 6,081,792 B (48 GiB/rank) with scheduler and workers agreed.
+- WildChat c8 deep-context leg: 0 errors, 8/8 recall, all 8 sessions ran
+  the full 1.25h wall, max_ctx 55,252 / median 49,448. Text and image
+  canaries pass under load with thinking active (vision-profile rule).
+- VLLM_KV_TIER_VERIFY=1 was armed but UNEXERCISED: the 313K pool never
+  evicted a live session at this depth, so zero restores occurred. The
+  SHA round-trip is being exercised deliberately by
+  benchmarks/benchmark_kv_tier_eviction.py against a kept TP8 server
+  (results under perf/results/2026-08-30/kvtier-acceptance/).
+
+## 2026-08-31: A100 host tier was WRITE-ONLY - restore path root cause + fix
+
+- The instrumented eviction acceptance (issue #18 battery) proved the tier
+  never restored on A100: thousands of offloads, zero restores, every
+  probe lookup missing. Recall "passes" in all prior A100 validations
+  (incl. the 2026-08-29 seven-profile sweep) were full re-prefill, not
+  tier restores - indistinguishable without the new DMA counters.
+- Three stacked causes, all specific to attention-only models (GLM-DSA,
+  DSV4 sparse MLA; the validated qwen/rtx3090 mamba path is unaffected):
+  1. resumable_blocks() requires a mamba tail anchor; attention-only
+     models never save one (request_finished_all_groups returns early
+     when state_groups is empty), so EVERY trajectory reported zero
+     resumable blocks (explain_miss: tail=-1). The tier index was
+     structurally unmatchable.
+  2. All-or-nothing hash matching: chat replays always diverge from the
+     staged chain at the previous turn's generation boundary
+     (template-wrapped assistant text hashes differently from the tokens
+     as sampled), so even a tail-less exact match could never fire
+     (hash_mismatch_at=21 of attn_len=25).
+  3. Trajectory fragmentation: a turn continuing via GPU prefix cache
+     never adopted the prior turn's lineage, so each turn staged its own
+     gap-ridden fragment.
+- Fix (gated on state_groups == [], mamba semantics untouched):
+  attn_prefix_len() makes any gap-free staged prefix resumable
+  (attention KV is position-independent, unlike cumulative mamba state);
+  lookup(allow_partial=True) resumes at the longest common hash prefix,
+  clamped at pending-write slots; adoption-without-restore keeps one
+  lineage per conversation when the GPU cache covers the tier's span; and
+  stage_attention(supersede=True) frees + restages a diverged suffix
+  (deferred-free set for slots still pending write). Offline index unit
+  tests cover partial lookup, adoption, supersede recycling, pending
+  clamp, and orphan free.
+- On-box proof (glm52-q2k-8, 12K-token conversation, 491K-token churn of
+  the 330K pool, VLLM_KV_TIER_VERIFY=1): "host-tier: hit ... resume at
+  block 194 (12416 tokens)", DMA totals restore=203, and 80 verify
+  batches with 0 SHA mismatches - the first verified host-tier restores
+  on A100. Mid-build hits at blocks 151/172 show per-turn lineage
+  adoption working.
+- Residual: one probe returns empty content with the marker likely in the
+  reasoning channel (budget/parser shaped, not KV); the acceptance bench
+  now records content-vs-reasoning placement and completion tokens, and
+  counts either placement as KV-intact. Verification rerun in flight.
+- Raw: perf/results/2026-08-30/kvtier-acceptance/glm52-q2k-8/.
+
+### DSV4 q4ktail-4 A/B arms: tier no-regression PASS; fp8-vs-bf16 quantified
+- Exact-token bench (1000 in / 2000 out, temp 1.0/top-p 0.95/top-k 20
+  seed 42, hand-built launcher identical across arms, single run per
+  cell), aggregate output tok/s:
+  | arm                        | c1    | c8    |
+  | baseline (tier on, bf16)   | 152.8 | 233.7 |
+  | no-tier (bf16)             | 135.2 | 229.5 |
+  | fp8_ds_mla KV (tier on)    | 144.2 | 270.4 |
+- Tier on/off: no regression at either concurrency (c1 delta is
+  single-run spec-decoding variance; claim is "no regression", not "tier
+  is faster"). Issue #18 no-regression criterion: PASS.
+- fp8-vs-bf16 (the A/B owed since the bf16 campaign): bf16 costs ~14% at
+  c8 (233.7 vs 270.4) and is a wash at c1, at SHORT context - expect the
+  gap to widen with depth as KV bandwidth dominates. fp8_ds_mla still
+  boots cleanly as a fallback dtype. bf16 stays per policy (quality);
+  cost now on record.
+- Raw: perf/results/2026-08-30/kvtier-ab/{baseline,notier,fp8kv}/.
+
+### DSV4 tier restores: real geometry found, restore path safety-gated
+- The group-aware acceptance rerun still hung at "no target block g1
+  pos 11". Per-group instrumentation revealed the true DSV4 layout: g0 =
+  MLAAttentionSpec 62 layers block 256 (the deep KV), g1-g4 =
+  SlidingWindowMLASpec (22/21/42/20 layers, block sizes 64/64/4/8!), g5 =
+  TQSlidingWindowSpec (drafter, block 64). The sliding-window groups keep
+  only a recent window (per-token cost ~90x the main KV), their tables
+  legitimately lack old positions, and a correct deep resume must restore
+  each WINDOW at the resume boundary - a generalization of the mamba
+  tail-state machinery, not the attention-only partial-resume path.
+- Uniform-position indexing of those tables was wrong at offload AND
+  restore; the missing-window abort then stranded requests in
+  WAITING_FOR_REMOTE_KVS (the acceptance's 30-min TimeoutError, twice).
+  Pre-restore-fix production never hit this only because lookups never
+  matched at all.
+- Safety gate shipped: partial resume now additionally requires every
+  attention group to be full-attention at the shared hash granularity
+  (_partial_resume_ok). DSV4 layouts log "restore path disabled for this
+  KV layout" and stay write-only (exactly the pre-fix production
+  behavior); GLM keeps its proven restores. Multi-group + single-group
+  index unit tests pass; registry suite green.
+- Follow-up design (issue #17/#18 continuation): stage SW-group windows
+  at recent hash boundaries (retain last K boundary windows, ~(K*256+W)
+  x ~190KB/token per trajectory), anchor resume at boundaries where both
+  the hash chain matches and every window is retained; group-unit
+  indexing (position = token // group_block_size) for the SW tables.
+
+## 2026-09-01: GLM-5.3-Flash (glm5_next) bring-up - first tokens on A100 TP4
+
+- New model port for RedHatAI/GLM-5.3-Flash-NVFP4 (169B, 34 KDA linear
+  layers + 11 NoPE-MLA DSA layers, mHC hc_mult=4, 288-expert
+  sigmoid/noaux MoE, vision tower, MTP head). transformers upgraded to
+  5.16.1 (operator directive: upgrade, never vendor) which also supplied
+  the reference modeling code used as porting source.
+- vllm/model_executor/models/glm5_next.py composes fork-owned pieces:
+  shared KimiGatedDeltaNetAttention for KDA (checkpoint's separate
+  q/k/v/convs load into the merged layout via stacked mappings),
+  MultiHeadLatentAttentionWrapper NoPE path, DeepseekV2MoE (identical
+  config names), eager-torch mHC (reference math verbatim; DSV4's fused
+  tilelang mHC is the planned optimization).
+- Stack fixes to get here: glm5_next_text added to the is_deepseek_mla
+  model-type list (head_size fell back to 64 and MLA metadata rejected
+  it); 512 added to MLACommonBackend supported head sizes (NoPE = 512
+  latent, no rope segment); FA prefill dims allowlist gained
+  (256, 0, 256); kimi_k3 package gate relaxed so the platform-neutral
+  KDA Triton kernels re-export under nvidia/ (the model classes stay
+  ROCm-gated); fork gotchas: kv fp8 default, aiter moe default, per-hop
+  attention/moe backend flags.
+- Bring-up boot: TP4, TRITON_MLA (explicit; the Ampere priority list
+  bans dense MLA by design), marlin NVFP4 MoE, -O0, 8192 ctx. Dummy boot
+  clean, real weights load with 0 unmatched tensors (the flat
+  hc_attn_*/hc_ffn_* checkpoint names map onto the per-site mHC
+  modules), first completion coherent.
+- DENSE MLA is a bring-up diagnostic: exact only <= index_topk (2048)
+  context. Before any profile ships: the pooled DSA indexer (4-token
+  pools, learned APE + gate compression, always-select-tail) + sparse
+  attention, vision (processor contract is qwen-vl pixel_values +
+  image_grid_thw), then EP on/off A/B, MTP later.
+
+### GLM-5.3-Flash EP on/off A/B (bring-up config, -O0)
+- gather_and_maybe_dequant_cache gained a 512 head-dim instantiation
+  (chunked-prefill context gather crashed at c8 on the NoPE cache; we own
+  the kernel, csrc/libtorch_stable/cache_kernels.cu).
+- Exact-token (1000 in / 300 out, temp 1.0/top-p 0.95/top-k 20 seed 42,
+  no spec), TP4, aggregate output tok/s:
+  | arm                          | c1  | c8   |
+  | TP experts (no EP)           | 5.4 | 41.6 |
+  | EP (--enable-expert-parallel)| 5.4 | 40.7 |
+- Verdict: PARITY within single-run noise at the bring-up config. This
+  is -O0 eager (no cudagraphs, eager python mHC, dense MLA) at tiny
+  batch - dispatch-path differences may only separate under the
+  optimized profile at real concurrency. Default stays EP OFF (simpler
+  path) for bring-up; REVISIT the A/B after compile/cudagraphs + sparse
+  attention land. Raw: perf/results/2026-09-01/glm53-ep-ab/.
+- Absolute numbers are bring-up-grade only (~5 tok/s c1): eager mHC
+  (python sinkhorn per site per layer) and -O0 dominate; not a baseline.
+
+### GLM-5.3: eager retired - fused mHC + compile + cudagraphs (operator directive)
+- Operator: no eager paths, ever; only the optimized stack. The decoder now
+  uses the fork's fused mHC ops (MHCPreOp / MHCFusedPostPreOp / MHCPostOp ->
+  quixicore dsv4_mhc_* CUDA kernels on Ampere, hidden 4096 / hc_mult 4 -
+  the same geometry as DSV4), with DSV4's chaining: first-layer pre on the
+  expanded [T,4,D] streams, fused post+pre at every later site, final post,
+  then GLM's unweighted mean head. hc params are flat float32 on the layer
+  (checkpoint names load directly).
+- Boot at the default optimization level with FULL_DECODE_ONLY cudagraphs
+  (capture 64), TRITON_MLA (explicit), marlin NVFP4 MoE: healthy, canary
+  coherent. Exact-token 1000/300, TP4, no spec:
+  | config              | c1   | c8    |
+  | eager -O0 (retired) | 5.4  | 41.6  |
+  | fused mHC + graphs  | 74.1 | 343.6 |
+  Still dense NoPE MLA (bring-up); not a baseline until sparse lands.
+- NoPE sparse decode kernel: mla_decode_fp8_v<true,false,512,512,0,0>
+  bound as mla_decode_bf16_sparse_nope (q/slot 512 bf16, no rope segment;
+  the template's static_assert(VW <= QW) admits it), python wrapper, and
+  QUIXICORE_MLA_SPARSE dispatches on q width 512. Unexercised until the
+  pooled indexer feeds topk_indices_buffer.
+
+### GLM-5.3 EP on/off A/B on the OPTIMIZED path: TP experts wins
+- Same exact-token harness (1000/300, seed 42), compile + FULL_DECODE_ONLY
+  graphs, fused mHC, marlin NVFP4 MoE, dense NoPE MLA:
+  | arm                | c1   | c8    |
+  | TP experts (no EP) | 74.1 | 343.6 |
+  | EP                 | 70.0 | 330.4 |
+- EP is 4-6% slower at both concurrencies: with 288 experts and
+  moe_intermediate 2048 the TP shard (512/rank) stays block-aligned for
+  NVFP4 group-16 scales, so EP buys no correctness and its all2all
+  dispatch costs more than the sharded GEMM saves here. Profile default:
+  enable_expert_parallel OFF. Raw: perf/results/2026-09-01/glm53-ep-ab-opt/
+  (EP) and glm53-opt-dense/ (TP).
+
+### GLM-5.3 sparse DSA path live: pooled indexer + NoPE sparse MLA
+- vllm/model_executor/layers/glm5_next_indexer.py: per-token indexer
+  state [k_norm(wk x) | x @ compress_gate^T] cached as a 256-bf16 paged
+  group (Glm5NextIndexerBackend/Cache over the DSV3.2 indexer metadata);
+  a paged Triton kernel computes pooled logits straight from the block
+  table (4-token pools: softmax(gate + ape) weighted keys, relu-scaled
+  head scores, weight-summed), the existing per-row top-k kernel ranks
+  POOLS (fills -1 on short rows), and a second Triton kernel expands pools
+  to tokens and appends the incomplete tail. One custom op (compile-opaque,
+  decode-graph-captured with a fixed logits workspace).
+- Parity vs transformers' Glm5NextTextIndexer on random weights: exact
+  selected-token sets on all 61 rows incl. tail (tests/glm5_next/).
+- Boot: QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, compile +
+  FULL_DECODE_ONLY graphs: healthy; 6,396-token planted-fact recall PASS
+  (selection over 1,599 pools); exact-token c1 70.1 / c8 331.4 tok/s
+  (dense was 74.1 / 343.6: ~5% at 1K context, the cost of indexing that
+  sparse repays at depth). Raw: perf/results/2026-09-01/glm53-opt-sparse/.
+
+### GLM-5.3 vision tower live (text + image validated)
+- vllm/model_executor/models/glm5_next_vision.py: Qwen2VL-family ViT
+  ported from the reference with GLM-5.3 specifics - per-head RMSNorm
+  q/k norms, SwiGLU-limit clamped MLPs with biases, no absolute pos
+  embed, post-layernorm -> 2x2 Conv2d downsample -> gated merger (proj +
+  LayerNorm + GELU + clamped SwiGLU) -> 4096-wide tokens. Packed varlen
+  attention via MMEncoderAttention, 2D rotary via get_rope(partial 0.5)
+  with the merge-window-major (h,w) ordering.
+- Glm5NextForConditionalGeneration + processing classes over the
+  transformers Glm5NextProcessor (pixel_values + image_grid_thw; GLM's
+  smart_resize with min/max IMAGE TOKENS 16/8000 then pad-to-canvas);
+  placeholder markup <|begin_of_image|><|image|><|end_of_image|>, the
+  <|image|> token expanded per merged patch.
+- Boot (sparse config, limit 2 images): 0 unmatched weights. Canaries:
+  text "Paris"; solid red -> "Red"; two-half image -> "left: red, right:
+  blue" (position-sensitive: rules out rope/merge-order errors).
+- Indexer fix en route: k_norm as fp32 functional layer_norm (bf16
+  LayerNorm params vs fp32 input raised under the multimodal path).
+
+### glm53-nvfp4-4 registered and boots through SlimServe at the 1M model default
+- Source glm53-flash-nvfp4 (safetensors, 198 GB, 20 files) + profile
+  glm53-nvfp4-4/a100: TP4, EP off (measured), QUIXICORE_MLA_SPARSE +
+  sparse_mla_force_mqa, block 64, kv auto, marlin NVFP4 MoE, FULL_DECODE_ONLY
+  graphs (64), limit 2 images, glm47 reasoning + tool parsers, prefix
+  caching/thinking/auto tools via serving defaults. Non-speculative until the
+  MTP head is ported (checkpoint ships model_mtp.safetensors).
+- Boot via `slimserve glm53-nvfp4-4 --serve`: max_seq_len 1,048,576 from
+  config.json (no cap needed: ~17 KiB/token per rank), GPU pool 1,275,743
+  tokens = 1.22x concurrency at full context. Canaries: "Paris" with parsed
+  reasoning; spatial image "left: red, right: blue"; tool call
+  get_weather({"city": "Paris"}) with finish_reason tool_calls.
+- Host tier NOT on this record (test carve-out + note): the generic packed
+  slab planner assumes one block size across groups, but this layout mixes
+  KDA state pages with 64-token MLA/indexer pages and mis-sized the
+  attention views ('[544, 64, 256]' vs 262144 elements). The rtx3090
+  GDN+attention profile uses the dedicated CSA-linear planner; generalizing
+  that to KDA+MLA and running the eviction acceptance is the follow-up.
+
+### glm53-nvfp4-4 WildChat deep-context leg: PASS
+- Standard sweep runner (c8, ctx-target 1M, 1.25h cap) on the registered
+  profile: 0 errors, 19/19 recall probes (31K -> 114K context), all 8
+  sessions ran the full wall, max_ctx 131,680 / median 116,208 - roughly
+  2-3x the depth the GLM-5.2 records reach in the same window, on the
+  sparse DSA path with real pool selection throughout. Raw:
+  perf/results/2026-09-01/glm53-leg/glm53-nvfp4-4/.
+- With this the record meets the profile-validation bar (text + image
+  requests, WildChat at concurrency 8, model-default context). Open on the
+  record: host tier (mixed-block-size packed planner) and MTP speculative
+  decoding.
 ## 2026-09-02 - qwen38fn-fp8-8/rtx3090: fp8 (e4m3) main KV restored and requalified; bf16 mandate reversed
 
 - Operator directive: "we are using FP8 kv cache - that's as opposed to

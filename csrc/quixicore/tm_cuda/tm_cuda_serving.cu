@@ -1382,6 +1382,25 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
     return out;
 }
 
+// GLM-5.3-Flash (glm5_next) NoPE MLA, bf16 cache. There is no rope segment:
+// q and each slot are 512 bf16 latents (1024 B/slot) and the whole width both
+// scores and accumulates, i.e. the same template at QW = VW = 512.
+static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tensor kv,
+        torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
+        int64_t block_size, double scale) {
+    CK(q); CK(kv); CK(bt); CK(indices); CK(topk_length);
+    const int B = q.size(0), H = q.size(1);
+    TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
+    const int max_topk = indices.size(1);
+    auto out = torch::empty({B, H, 512}, q.options());
+    mla_decode_fp8_v<true, false, 512, 512, 0, 0><<<dim3(H, B), 32, 0, stream()>>>(
+        bp(q), reinterpret_cast<const uint8_t*>(kv.data_ptr()), nullptr,
+        bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
+        topk_length.data_ptr<int>(), max_topk, bpm(out), nullptr, nullptr, nullptr,
+        int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f);
+    return out;
+}
+
 // GLM-5.2-Vision geometry: q/cache slot are 576 fp8 elements, the value is the
 // leading 512, and the cache carries one per-tensor kv_scale (vLLM's fp8 MLA
 // layout) rather than per-64 e8 exponents. `indices` are request-local logical
@@ -2119,6 +2138,9 @@ void init_serving(py::module_& m) {
           py::arg("sample_from_anchor"), py::arg("pad_slot_id"),
           py::arg("num_reqs"), py::arg("max_tokens_per_req"));
     m.def("mla_decode_bf16_sparse_glm", &py_mla_decode_bf16_sparse_glm, py::arg("q"),
+          py::arg("kv"), py::arg("block_table"), py::arg("indices"),
+          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"));
+    m.def("mla_decode_bf16_sparse_nope", &py_mla_decode_bf16_sparse_nope, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"));
     m.def("mla_decode_fp8_sparse_glm", &py_mla_decode_fp8_sparse_glm, py::arg("q"),
