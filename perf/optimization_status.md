@@ -18397,3 +18397,31 @@ vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
   sparse decode does the most work). 131K-200K bucket: TTFT p50 59 s,
   e2e p50 279 s (72 turns). Raw: perf/results/2026-09-03/glm53-leg/
   glm53-nvfp4-8/. Text and image canaries under load: see post_evidence.
+
+## 2026-09-03: fused allreduce + mHC transition for GLM-5.3 - REJECTED (no gain), plus a compile-cache A/B hazard
+
+- Hypothesis: TP8's replicated per-rank cost (91 custom allreduces per
+  token, replicated mHC) is the scaling gap; DSV4's A100 path fuses the
+  allreduce into the mHC transition (custom_all_reduce all_reduce_dsv4_mhc,
+  single-token steps). Implemented for glm5_next: o_proj and MoE reduce
+  deferred into a glm5_mhc_ar_fused_post_pre op (fused op at T == 1,
+  allreduce + fused kernel otherwise).
+- Measured at TP8, arm launch (32K, exact-token): fused c1 85.5 / c8 421.0
+  (registered-buffer variant), copy-in variant 84.7 / 422.6, vs the
+  committed path 84.0 (profile) - within noise. The merged kernel saves one
+  launch per site but the mHC math is still replicated on every rank; the
+  win DSV4 gets comes from channel OWNERSHIP (each rank transitions a
+  4096/TP slice, VLLM_DSV4_TP_OWNERSHIP), a much deeper integration
+  (owned projections, Q2 progress schedule) than the transition op alone.
+  Dropped; the tree carries none of it.
+- Hazard found while A/B-ing: an env-gated branch inside a
+  torch.compile'd forward (VLLM_GLM5_FUSED_MHC_AR read in __init__, traced
+  as a constant) does NOT change the compile cache key - the key is
+  envs.compile_factors() (a fixed VLLM_* list) + config + compiler + the
+  traced files' contents. The "unfused" arm loaded the fused arm's graph:
+  identical degenerate greedy texts in both, and the committed tree was
+  clean. Rule: A/B compiled paths only via distinct code (git stash/
+  worktree) or a factor that is in the cache key; never a private env var.
+- Next for the TP8 scaling gap: measure first - a TP8 profile at 1000-token
+  context on the current stack to size allreduce / mHC / indexer shares -
+  then channel ownership if the replicated mHC dominates.
