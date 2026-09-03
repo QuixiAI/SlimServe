@@ -18484,3 +18484,7 @@ token, approximate:
   (from 9.6 / 64.7 / 110.4: +55% / +26% / +22%). Raw: perf/results/
   2026-09-03/glm52-q2k-8-baseline/. Still far below glm53's TP8 numbers -
   GLM-5.2's Q2_K GGUF MoE path is its own budget and was not touched.
+- glm53-nvfp4-8 re-validated with the gate (prefill chunks unpartitioned,
+  decode P128): canaries pass, c1 84.4 / c8 413.6 / c16 578.8 - identical
+  to run 2 (84.0 / 412.3 / 575.8). Raw: perf/results/2026-09-03/
+  glm53-nvfp4-8-baseline/ (run 2 kept as -baseline-run2).
