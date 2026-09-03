@@ -18473,3 +18473,14 @@ token, approximate:
   integration; (4) the M=1 GEMV chain: 280 cuBLAS launches per token is
   launch-bound, fusable per layer (q_a+kv_a already fused; KDA's
   in_proj/f_b/g_a/g_b are four).
+- Partitioned bf16 GLM launch, first attempt: OOM in prefill. This MQA
+  path serves prefill chunks too, and the partition scratch
+  (B x H x P x 512 fp32) hit 3.4 GiB for a multi-thousand-token chunk on
+  the 202K-context bf16 record. Partitioning now applies only while the
+  scratch stays under 512 MB (decode-sized batches); large chunks stay
+  unpartitioned, where B x H warps already fill the machine. Both bf16
+  entry points (NoPE 512 and GLM 576) use the same gate.
+- glm52-q2k-8 after (canaries pass): c1 14.9 / c8 81.5 / c16 135.2 tok/s
+  (from 9.6 / 64.7 / 110.4: +55% / +26% / +22%). Raw: perf/results/
+  2026-09-03/glm52-q2k-8-baseline/. Still far below glm53's TP8 numbers -
+  GLM-5.2's Q2_K GGUF MoE path is its own budget and was not touched.

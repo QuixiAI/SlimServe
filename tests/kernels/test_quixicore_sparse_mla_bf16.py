@@ -72,10 +72,11 @@ def test_nope_partitioned_matches_unpartitioned():
 
 
 @pytest.mark.parametrize("heads", [8, 16])
-def test_glm_576_matches_reference(heads):
+@pytest.mark.parametrize("partition_size", [0, 128])
+def test_glm_576_matches_reference(heads, partition_size):
     q, kv, bt, idx, tlen = _inputs(576, heads)
     out = qc.mla_decode_bf16_sparse_glm(
-        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(576)
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(576), partition_size
     )
     ref = _reference(q, kv, idx, 512)
     err = (out.float() - ref).abs().max().item() / ref.abs().max().item()

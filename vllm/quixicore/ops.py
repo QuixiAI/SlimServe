@@ -1526,6 +1526,7 @@ class quixicore_ops:
         topk_length: torch.Tensor,
         block_size: int,
         scale: float,
+        partition_size: int = 0,
     ) -> torch.Tensor:
         """GLM sparse MLA decode over a bf16 latent cache (576 bf16 per slot).
 
@@ -1533,8 +1534,7 @@ class quixicore_ops:
         vLLM cannot store an fp8 KV cache there. Returns [tokens, heads, 512].
         """
         return _qc().mla_decode_bf16_sparse_glm(
-            q, kv, block_table, indices, topk_length, block_size, scale
-        )
+            q, kv, block_table, indices, topk_length, block_size, scale, partition_size)
 
     @staticmethod
     def mla_decode_bf16_sparse_nope(

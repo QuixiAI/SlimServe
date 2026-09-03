@@ -1368,17 +1368,35 @@ static torch::Tensor py_fp8_mqa_logits(torch::Tensor q, torch::Tensor k,
 // store an fp8 KV cache there -- this is the geometry that actually runs on A100.
 static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tensor kv,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
-        int64_t block_size, double scale) {
+        int64_t block_size, double scale, int64_t partition_size) {
     CK(q); CK(kv); CK(bt); CK(indices); CK(topk_length);
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 576, "GLM MLA expects q width 576, got ", q.size(2));
     const int max_topk = indices.size(1);
     auto out = torch::empty({B, H, 512}, q.options());
-    mla_decode_fp8_v<true, false, 576, 512, 0, 0><<<dim3(H, B), 32, 0, stream()>>>(
-        bp(q), reinterpret_cast<const uint8_t*>(kv.data_ptr()), nullptr,
-        bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
-        topk_length.data_ptr<int>(), max_topk, bpm(out), nullptr, nullptr, nullptr,
-        int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f);
+    const uint8_t* kvp = reinterpret_cast<const uint8_t*>(kv.data_ptr());
+    if (partition_size <= 0) {
+        mla_decode_fp8_v<true, false, 576, 512, 0, 0><<<dim3(H, B), 32, 0, stream()>>>(
+            bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
+            topk_length.data_ptr<int>(), max_topk, bpm(out), nullptr, nullptr, nullptr,
+            int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f);
+        return out;
+    }
+    // Partitioned like the fp8 GLM path and the NoPE bf16 path: the
+    // unpartitioned launch measured glm52-q2k-8 (bf16 KV, TP8, 8 local
+    // heads) at 9.6 tok/s c1 on 2026-09-03.
+    const int P = int((max_topk + partition_size - 1) / partition_size);
+    auto opts = q.options().dtype(torch::kFloat);
+    auto tmp = torch::empty({B, H, P, 512}, opts);
+    auto ml = torch::empty({B, H, P}, opts);
+    auto es = torch::empty({B, H, P}, opts);
+    mla_decode_fp8_v<true, true, 576, 512, 0, 0><<<dim3(H, B, P), 32, 0, stream()>>>(
+        bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
+        topk_length.data_ptr<int>(), max_topk, nullptr,
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f);
+    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
+        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
 }
 
@@ -2161,7 +2179,8 @@ void init_serving(py::module_& m) {
           py::arg("num_reqs"), py::arg("max_tokens_per_req"));
     m.def("mla_decode_bf16_sparse_glm", &py_mla_decode_bf16_sparse_glm, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
-          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"));
+          py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
+          py::arg("partition_size") = 0);
     m.def("mla_decode_bf16_sparse_nope", &py_mla_decode_bf16_sparse_nope, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
