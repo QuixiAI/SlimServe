@@ -25,6 +25,7 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from ...linear import (
@@ -427,12 +428,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        self._forward(
-            mixed_qkv=mixed_qkv,
-            g1=g1,
-            g2=g2,
-            beta=beta,
-            core_attn_out=core_attn_out,
+        # Opaque to torch.compile: the core reads the forward context
+        # (attention metadata, state indices) that Dynamo would otherwise
+        # bake in from the trace-time run. "vllm::kda_attention" is a
+        # splitting op (CompilationConfig._attention_ops), matching the
+        # unified-attention treatment.
+        torch.ops.vllm.kda_attention(
+            mixed_qkv, g1, g2, beta, core_attn_out, self.prefix
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
@@ -720,3 +722,36 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             assert core_attn_out_spec is not None
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+
+
+def kda_attention(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    layer._forward(
+        mixed_qkv=mixed_qkv, g1=g1, g2=g2, beta=beta, core_attn_out=core_attn_out
+    )
+
+
+def kda_attention_fake(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kda_attention",
+    op_func=kda_attention,
+    mutates_args=["core_attn_out"],
+    fake_impl=kda_attention_fake,
+)

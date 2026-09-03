@@ -18251,3 +18251,35 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   8 ranks pay ~2x TP4's 4-rank calls), fused mHC pre-transition 14%,
   sparse decode 12%, marlin MoE 11%, cuBLAS GEMV 13%. Matrix v2 (with TP4
   reference) running to pick the 8-GPU record.
+
+## 2026-09-03: torch.compile on glm5_next produced garbage tokens - two tracing faults, fixed
+
+- CORRECTION to the entry above: the "+33% from compile" TP4 step-rate
+  and the TP8 9.5 ms profile were measured on a model emitting garbage
+  (`!!!!!!!!`). Neither profile run checked text. Every arm now aborts on
+  a bad canary before it measures anything.
+- Bisect (TP4 boots, 2 at a time on GPU halves): compile off with the
+  tail fix + mHC op wrappers -> clean; compile on -> garbage; Dynamo-only
+  (mode 2) -> garbage; inductor with every vLLM fusion pass off ->
+  garbage. So a tracing fault, not codegen.
+- Fault 1: the pooled indexer op mutates topk_indices_buffer, which the
+  sparse attention op (a splitting op, i.e. the NEXT subgraph) reads
+  through a side channel. fix_functionalization left it as an
+  auto_functionalized node with only a warning ("inductor will fail" -
+  it no longer does, it lowers copy-in/copy-out and the write never lands
+  where the reader looks). Fixed by listing vllm::glm5_next_pooled_indexer
+  in CompilationConfig._attention_ops (upstream does the same for
+  sparse_attn_indexer), and the leftover warning is now a hard error.
+- Fault 2 (the one that actually produced the garbage): the fork's
+  KimiGatedDeltaNetAttention core (_forward) reads get_forward_context()
+  and the per-layer GDN metadata directly in Python; no custom op wraps
+  it (Kimi-K3 is never compiled here). Dynamo traced the dummy run's
+  metadata into the graph. vllm::kda_attention was already in the
+  splitting list but no op of that name existed. Registered it
+  (mutates core_attn_out, looks the layer up by prefix in
+  no_compile_layers) and routed the layer through it; the eager Kimi path
+  runs the same op body unchanged.
+- Result: TP4 + compile canary clean ("Paris, a city with a population
+  of over", fibonacci body). Matrix v3 (tp8, tp8-ep, tp4dp2, tp4dp2-ep,
+  tp4 reference) relaunched with warmup + canary guard; all earlier
+  compile-on numbers are void.
