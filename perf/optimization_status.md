@@ -18437,3 +18437,39 @@ vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
   one warp each walking the whole selection across GLM-5.2's MLA layers.
   Partitioned launch (P128 + reduce, exactly the fp8 GLM and NoPE fix)
   added; re-measure follows.
+
+## 2026-09-03: TP8 kernel profile at 1000-token context (current stack) - the remaining budget
+
+Torch profiler, rank 0, 32 decode tokens after a 1000-token prompt, arm
+launch. Kernel time 514 ms (the window also caught the prompt's prefill:
+the partials<24> and 2stage-allreduce rows are prefill-only). Decode per
+token, approximate:
+
+| kernel                              | share | ms/token | per call        |
+|-------------------------------------|-------|----------|-----------------|
+| Marlin NVFP4 MoE (W4A16)            | 13.4% | 2.15     | 84 calls, 26 us |
+| cuBLAS GEMV (q/kv/KDA/o projections)| 13.1% | 2.1      | ~280 calls      |
+| mHC fused_pre_transition (T=1)      |  8.4% | 1.35     | 90 calls, 16 us |
+| sparse MLA decode (P128) + reduce   |  7.0% | 1.1      | 11 calls, 84 us |
+| pooled indexer logits               |  4.5% | 0.72     | 11 calls, 65 us |
+| custom allreduce 1stage<8>          |  4.1% | 0.65     | 88 calls, 7 us  |
+| direct_copy (contiguous() etc.)     |  3.3% | 0.53     | ~150 calls      |
+| MoE topk / align / gemm tails       |  ~7%  | 1.1      |                 |
+
+- Wall 16.4 ms/token under the profiler vs 11.9 ms in the exact bench
+  (84 tok/s); the profiler's own overhead is the difference.
+- The 8-rank allreduce is no longer a problem (7 us per call; it was 28
+  us before the sparse-decode fix removed the stall that was inflating
+  it). The TP-invariant residue is mHC (1.35) + indexer (0.72) + AR
+  (0.65) + copies (0.53) = 3.3 ms of ~12, i.e. the 25-30% TP4->TP8
+  scaling shortfall, spread over four items.
+- Ranked next items (gain / effort): (1) the ~150 direct_copy launches per
+  token - contiguous()/view copies around the mHC op wrappers and the
+  q/idx staging in the sparse backend (0.5 ms, easy); (2) pooled indexer
+  at 65 us for a 250-pool context (should be ~15 us: one tile per program,
+  the q/APE preload dominates; 0.5 ms); (3) mHC channel ownership as DSV4
+  does (VLLM_DSV4_TP_OWNERSHIP: each rank transitions 4096/TP channels,
+  the transition fused into the allreduce) - up to 1.2 ms but a deep
+  integration; (4) the M=1 GEMV chain: 280 cuBLAS launches per token is
+  launch-bound, fusable per layer (q_a+kv_a already fused; KDA's
+  in_proj/f_b/g_a/g_b are four).
