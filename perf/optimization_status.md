@@ -18219,3 +18219,48 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   .log, tier_acceptance_nvme_{A,B}.log, tier_exact_nvme_A.log,
   bench_fp8kv_c8_nvme.log, run_nvme_validation.sh, run_nvme_exact.sh,
   tier_exact_8001.py).
+
+## 2026-09-03 - NVMe tier on the dedicated device: greedy recall validated, promotion path clean, c8 best-ever
+
+- Device: nvme1n1 (3.7 TB, PCIe gen3 x2) carried a stale NTFS boot
+  sector at 129 MiB (no partition table, no filesystem signature; the
+  operator confirmed it blank) - wiped, formatted XFS (label kvtier),
+  mounted at /mnt/kvtier with a nofail fstab entry, and pointed at by
+  SLIMSERVE_KV_TIER_DIR in /etc/slimserve/env (operator-side files, not
+  the repo). Profile nvme_tier_gb_per_rank 128 -> 448: 8 x 448 GiB =
+  3.5 TiB fallocated at boot, 80,273 slots x 800 tokens per rank = ~64M
+  tokens of disk-resident conversation capacity.
+- Greedy diagnostic (tier_exact_8001.py, temperature 0, 8K/24K/42K
+  markers, 6 x 55K churn), both configs on port 8001 with prod stopped:
+  | config                    | depth | restored | cold  | promoted from disk | recall |
+  | A: host 2 GiB + NVMe 32   | 8K    | 1.3 s    | 2.1 s | yes (13 reads)     | OK     |
+  |                           | 24K   | 2.0 s    | 5.7 s | yes (33 reads)     | OK     |
+  |                           | 42K   | 2.7 s    | 9.9 s | yes (56 reads)     | OK     |
+  | B: host 88 + NVMe 448     | 8K    | 0.8 s    | 2.1 s | no (host hit)      | OK     |
+  |                           | 24K   | 0.8 s    | 5.7 s | no (host hit)      | OK     |
+  |                           | 42K   | 0.8 s    | 10.0 s| no (host hit)      | OK     |
+  Every restored answer is a well-formed thinking trace closing on the
+  right codename; zero IO errors, zero invalid-block reports. The
+  script's first verdict rule (common prefix >= 40 chars with the hot
+  control) flagged three legs whose traces differ only in the model's
+  own paraphrase ("recall ... of their message" vs "identify ... of the
+  text", diverging at char 35) - the same variation appears between two
+  HOST-resident hits in config B where no disk read occurred, so it is
+  the re-prefill chunk split above the tail boundary, not the NVMe path.
+  Verdict rule corrected to recall + well-formed answer + restore speed;
+  the offline re-judgement of both logs is 6/6 OK.
+- NVMe promotion is exercised only by config A (the 88 GiB host tier
+  never fills in a short run); config B exercises write-through only
+  (KV Transfer metrics: disk_write_batches=14 in the interval log).
+- Throughput: c8 exact 1000/2000 seed 42 = 610.2 tok/s with the 448 GiB
+  tier writing through on the dedicated device - the best fp8 c8 recorded
+  (prior 594.2/590.4/568.8/559.5; bf16 band 590.7-600.5). Single sample;
+  reads as "write-through on its own device is free", not as a gain.
+- Disk housekeeping: the O_TMPFILE arenas vanish at shutdown (df back to
+  74 GB used on the 3.8 TB mount after the run).
+- Decision: RETAINED - profile at 448 GiB/rank on /mnt/kvtier. Next
+  command: `sudo systemctl start slimserve-qwen38fn`, then confirm
+  "kv-nvme: 80273 slots ... in /mnt/kvtier" in /var/log/SlimServe/serve.log.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A4,B4}_8001
+  .log, tier_exact_nvme_{A4,B4}.log, bench_fp8kv_c8_nvme4.log,
+  run_nvme_exact4.out).
