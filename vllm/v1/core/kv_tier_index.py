@@ -38,11 +38,16 @@ objects in both tiers; only their location differs.
 
 from __future__ import annotations
 
+import math
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+# hash position -> attention group ids whose KV block completes there
+DueGids = Callable[[int], frozenset[int]]
 
 
 @dataclass
@@ -75,12 +80,18 @@ class Trajectory:
     disk_tail_boundary: int = -1
 
     def _attn_complete(
-        self, i: int, attn_gids: frozenset[int], disk_pending: set[int]
+        self, i: int, due: "DueGids", disk_pending: set[int]
     ) -> bool:
-        """Every attention group of position i is on the host or on disk."""
+        """Every attention group DUE at position i is on the host or on disk.
+
+        ``due(i)`` is the set of attention groups whose block completes at
+        position i: a group whose block is ``ratio`` hash blocks wide (the
+        GLM-5.3 indexer group, 2176-token blocks over a 1088-token hash) is
+        due only at positions with ``(i + 1) % ratio == 0``.
+        """
         host = self.attn_slots[i] if i < len(self.attn_slots) else {}
         disk = self.disk_attn[i] if i < len(self.disk_attn) else {}
-        for gid in attn_gids:
+        for gid in due(i):
             if gid in host:
                 continue
             d = disk.get(gid)
@@ -98,7 +109,7 @@ class Trajectory:
         )
 
     def resumable_blocks(
-        self, attn_gids: frozenset[int], disk_pending: set[int] | None = None
+        self, due: "DueGids", disk_pending: set[int] | None = None
     ) -> int:
         """Longest gap-free attention prefix ending at the tail boundary,
         with the boundary block's hash matching the saved tail state.
@@ -116,12 +127,12 @@ class Trajectory:
             return 0
         n = 0
         for i in range(self.tail_boundary):
-            if not self._attn_complete(i, attn_gids, pending):
+            if not self._attn_complete(i, due, pending):
                 break
             n += 1
         return n if n == self.tail_boundary else 0
 
-    def attn_prefix_len(self, attn_gids: frozenset[int]) -> int:
+    def attn_prefix_len(self, due: "DueGids") -> int:
         """Longest gap-free HOST-staged attention prefix, tail-agnostic.
 
         The resumable span for attention-only models: KV blocks are
@@ -130,8 +141,8 @@ class Trajectory:
         Host-resident only: the partial-resume path does not promote.
         """
         n = 0
-        for slots in self.attn_slots:
-            if not attn_gids <= slots.keys():
+        for i, slots in enumerate(self.attn_slots):
+            if not due(i) <= slots.keys():
                 break
             n += 1
         return n
@@ -146,7 +157,7 @@ class Trajectory:
             self.disk_tail_slots.values()
         )
 
-    def fully_on_disk(self, attn_gids: frozenset[int], disk_pending: set[int]) -> bool:
+    def fully_on_disk(self, due: "DueGids", disk_pending: set[int]) -> bool:
         """Every resumable position and the current tail are disk-resident,
         so the host copies can be released without losing resumability."""
         if self.tail_boundary <= 0 or self.disk_tail_boundary != self.tail_boundary:
@@ -157,7 +168,7 @@ class Trajectory:
             return False
         for i in range(self.tail_boundary):
             disk = self.disk_attn[i] if i < len(self.disk_attn) else {}
-            for gid in attn_gids:
+            for gid in due(i):
                 d = disk.get(gid)
                 if d is None or d in disk_pending:
                     return False
@@ -172,11 +183,25 @@ class HostKVTierIndex:
         num_slots: int,
         attn_gids: list[int] | None = None,
         num_disk_slots: int = 0,
+        attn_ratio: dict[int, int] | None = None,
     ):
         assert num_slots > 0
         self.num_slots = num_slots
         # Attention KV-cache group ids a complete position must cover.
         self.attn_gids = frozenset(attn_gids if attn_gids is not None else [0])
+        # Hash blocks per KV block, per attention group (1 unless a group's
+        # block is a multiple of the hash block). A group is due at position
+        # i only when its block completes there; resume boundaries must be
+        # multiples of the ratios' lcm so every group's last block is whole.
+        self.attn_ratio = {
+            g: int((attn_ratio or {}).get(g, 1)) for g in self.attn_gids
+        }
+        assert all(r >= 1 for r in self.attn_ratio.values())
+        self.resume_align = 1
+        for r in self.attn_ratio.values():
+            self.resume_align = self.resume_align * r // math.gcd(
+                self.resume_align, r
+            )
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
@@ -197,6 +222,14 @@ class HostKVTierIndex:
         # Promotions in flight: host slots being filled from disk; confirmed
         # by the worker's restore completion for the resuming request.
         self._promotions: dict[str, list[int]] = {}
+
+    def due(self, i: int) -> frozenset[int]:
+        """Attention groups whose block completes at hash position i."""
+        if self.resume_align == 1:
+            return self.attn_gids
+        return frozenset(
+            g for g, r in self.attn_ratio.items() if (i + 1) % r == 0
+        )
 
     # ------------------------------------------------------------------ write
 
@@ -381,7 +414,7 @@ class HostKVTierIndex:
         traj = self._trajectories.get(owner)
         if traj is None:
             return False
-        if any(not self.attn_gids <= d.keys() for d in attn[:n]):
+        if any(not self.due(i) <= d.keys() for i, d in enumerate(attn[:n])):
             return True
         return bool(traj.tail_boundary > 0 and not tail and traj.disk_tail_slots)
 
@@ -405,7 +438,7 @@ class HostKVTierIndex:
         attn: list[dict[int, int]] = []
         for i in range(n_blocks):
             host = traj.attn_slots[i]
-            for gid in self.attn_gids:
+            for gid in self.due(i):
                 if gid in host:
                     continue
                 d = traj.disk_attn[i].get(gid)
@@ -487,7 +520,7 @@ class HostKVTierIndex:
             if owner in self._promotions:
                 continue
             if allow_partial:
-                span = min(traj.attn_prefix_len(self.attn_gids), len(hashes))
+                span = min(traj.attn_prefix_len(self.due), len(hashes))
                 m = 0
                 while (
                     m < span
@@ -510,7 +543,7 @@ class HostKVTierIndex:
                 )
                 best_owner = owner
                 continue
-            n = traj.resumable_blocks(self.attn_gids, self._disk_pending)
+            n = traj.resumable_blocks(self.due, self._disk_pending)
             if n <= 0 or n > len(hashes):
                 continue
             if best is not None and n <= best[1]:
@@ -547,7 +580,7 @@ class HostKVTierIndex:
                 (
                     i
                     for i in range(len(traj.attn_slots))
-                    if not traj._attn_complete(i, self.attn_gids, self._disk_pending)
+                    if not traj._attn_complete(i, self.due, self._disk_pending)
                 ),
                 None,
             )
@@ -570,7 +603,7 @@ class HostKVTierIndex:
                 f"tail_pending={traj.tail_pending} attn_len={len(traj.attn_slots)} "
                 f"first_gap={gap} hash_mismatch_at={mism} "
                 f"pending_attn={len(pend)} req_hashes={len(hashes)} "
-                f"on_disk={traj.fully_on_disk(self.attn_gids, self._disk_pending)}"
+                f"on_disk={traj.fully_on_disk(self.due, self._disk_pending)}"
             )
         return "; ".join(notes) or "no trajectory shares hashes[0]"
 
@@ -611,7 +644,7 @@ class HostKVTierIndex:
             host = traj.host_slots()
             if not host:
                 continue  # already disk-only; nothing to free here
-            if traj.fully_on_disk(self.attn_gids, self._disk_pending):
+            if traj.fully_on_disk(self.due, self._disk_pending):
                 for s in host:
                     self._disk_of_host.pop(s, None)
                     self._free.append(s)
@@ -668,8 +701,8 @@ class HostKVTierIndex:
             "resumable": sum(
                 1
                 for t in self._trajectories.values()
-                if t.resumable_blocks(self.attn_gids, self._disk_pending) > 0
-                or t.attn_prefix_len(self.attn_gids) > 0
+                if t.resumable_blocks(self.due, self._disk_pending) > 0
+                or t.attn_prefix_len(self.due) > 0
             ),
             "pending_writes": len(self._pending_write),
             "disk_slots": self.num_disk_slots,

@@ -738,6 +738,7 @@ class quixicore_ops:
         scale: float,
         kv_scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM sparse MLA decode reading q from its two source buffers.
 
@@ -757,6 +758,7 @@ class quixicore_ops:
             scale,
             kv_scale,
             partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -798,6 +800,7 @@ class quixicore_ops:
         scale: float,
         kv_scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM-5.2-Vision sparse MLA decode (576 fp8 slot, value = leading 512).
 
@@ -817,6 +820,7 @@ class quixicore_ops:
             scale,
             kv_scale,
             partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod
@@ -1527,6 +1531,7 @@ class quixicore_ops:
         block_size: int,
         scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """GLM sparse MLA decode over a bf16 latent cache (576 bf16 per slot).
 
@@ -1534,7 +1539,9 @@ class quixicore_ops:
         vLLM cannot store an fp8 KV cache there. Returns [tokens, heads, 512].
         """
         return _qc().mla_decode_bf16_sparse_glm(
-            q, kv, block_table, indices, topk_length, block_size, scale, partition_size)
+            q, kv, block_table, indices, topk_length, block_size, scale, partition_size,
+            page_stride_bytes,
+        )
 
     @staticmethod
     def mla_decode_bf16_sparse_nope(
@@ -1546,6 +1553,7 @@ class quixicore_ops:
         block_size: int,
         scale: float,
         partition_size: int = 0,
+        page_stride_bytes: int = 0,
     ) -> torch.Tensor:
         """NoPE sparse MLA decode over a bf16 latent cache (512 bf16 per
         slot, no rope segment): GLM-5.3-Flash (glm5_next). Returns
@@ -1554,6 +1562,7 @@ class quixicore_ops:
         return _qc().mla_decode_bf16_sparse_nope(
             q, kv, block_table, indices, topk_length, block_size, scale,
             partition_size,
+            page_stride_bytes,
         )
 
     @staticmethod

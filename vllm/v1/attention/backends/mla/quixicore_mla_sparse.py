@@ -47,6 +47,17 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
+    """Byte stride between consecutive blocks' pages, or 0 when the pages are
+    dense. The packed cross-layer slab (host KV tier) interleaves every
+    layer's page per block, so a layer's [num_blocks, block_size, ...] view
+    has stride(0) > page bytes; flattening it with reshape(-1) would COPY
+    the whole layer cache on every call (silently, per layer, per step)."""
+    if kv_cache.is_contiguous():
+        return 0
+    return kv_cache.stride(0) * kv_cache.element_size()
+
+
 _BF16_PARTITION = 128
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
 
@@ -81,7 +92,15 @@ class QuixiCoreMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [64]
+        # Every kernel on this path takes the block size at runtime (the
+        # sparse decode resolves indices through the block table with a
+        # runtime block_size; the prefill gather and the indexer likewise),
+        # so the kernel block may equal the KV-manager block. That matters
+        # for hybrid GLM-5.3 (KDA + MLA): mamba alignment raises the KV
+        # block to 576/1088 tokens, and a 64-token kernel block would split
+        # each KV page into 9-17 kernel pages, which the packed cross-layer
+        # slab (host KV tier) cannot express as a single strided view.
+        return [MultipleOf(64)]
 
     @staticmethod
     def get_name() -> str:
@@ -379,14 +398,16 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 # H=8 L=2048: unpartitioned 1138 us, P256 138 us, P128 74 us
                 # per call with the vectorized bf16 row path.
                 return quixicore_ops.mla_decode_bf16_sparse_nope(
-                    q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
+                    q, kv_c_and_k_pe_cache, bt, idx, tlen,
                     attn_metadata.block_size, self.softmax_scale,
                     partition_size=_bf16_partition(q, idx),
+                    page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
                 ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
-                q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
+                q, kv_c_and_k_pe_cache, bt, idx, tlen,
                 attn_metadata.block_size, self.softmax_scale,
                 partition_size=_bf16_partition(q, idx),
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             ), None
 
         if self._k_scale_host is None:
@@ -406,7 +427,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             out = quixicore_ops.mla_decode_fp8_sparse_glm_splitq(
                 splitq[0],
                 splitq[1],
-                kv_c_and_k_pe_cache.view(torch.uint8).reshape(-1),
+                kv_c_and_k_pe_cache.view(torch.uint8),
                 bt,
                 idx,
                 tlen,
@@ -414,6 +435,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
                 self.softmax_scale,
                 k_scale,
                 partition_size=256,
+                page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
             )
             _sparse_nan_debug(
                 out, splitq[0].transpose(0, 1), kv_c_and_k_pe_cache, bt, idx,
@@ -423,7 +445,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
 
         out = quixicore_ops.mla_decode_fp8_sparse_glm(
             q,
-            kv_c_and_k_pe_cache.view(torch.uint8).reshape(-1),
+            kv_c_and_k_pe_cache.view(torch.uint8),
             bt,
             idx,
             tlen,
@@ -431,6 +453,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
             self.softmax_scale,
             k_scale,
             partition_size=256,
+            page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
         )
         _sparse_nan_debug(out, q, kv_c_and_k_pe_cache, bt, idx, tlen,
                           attn_metadata)

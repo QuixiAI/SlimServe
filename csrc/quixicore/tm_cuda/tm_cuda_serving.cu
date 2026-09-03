@@ -1368,8 +1368,8 @@ static torch::Tensor py_fp8_mqa_logits(torch::Tensor q, torch::Tensor k,
 // store an fp8 KV cache there -- this is the geometry that actually runs on A100.
 static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tensor kv,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
-        int64_t block_size, double scale, int64_t partition_size) {
-    CK(q); CK(kv); CK(bt); CK(indices); CK(topk_length);
+        int64_t block_size, double scale, int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(kv.is_cuda() && kv.stride(-1) == 1, "kv must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 576, "GLM MLA expects q width 576, got ", q.size(2));
     const int max_topk = indices.size(1);
@@ -1379,7 +1379,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
         mla_decode_fp8_v<true, false, 576, 512, 0, 0><<<dim3(H, B), 32, 0, stream()>>>(
             bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
             topk_length.data_ptr<int>(), max_topk, bpm(out), nullptr, nullptr, nullptr,
-            int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f);
+            int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f, nullptr, 0, int(page_stride_bytes));
         return out;
     }
     // Partitioned like the fp8 GLM path and the NoPE bf16 path: the
@@ -1394,7 +1394,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
         bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
         topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
-        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f);
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f, nullptr, 0, int(page_stride_bytes));
     paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
@@ -1405,8 +1405,8 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
 // scores and accumulates, i.e. the same template at QW = VW = 512.
 static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tensor kv,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
-        int64_t block_size, double scale, int64_t partition_size) {
-    CK(q); CK(kv); CK(bt); CK(indices); CK(topk_length);
+        int64_t block_size, double scale, int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(kv.is_cuda() && kv.stride(-1) == 1, "kv must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 512, "NoPE MLA expects q width 512, got ", q.size(2));
     const int max_topk = indices.size(1);
@@ -1416,7 +1416,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         mla_decode_fp8_v<true, false, 512, 512, 0, 0><<<dim3(H, B), 32, 0, stream()>>>(
             bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
             topk_length.data_ptr<int>(), max_topk, bpm(out), nullptr, nullptr, nullptr,
-            int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f);
+            int(block_size), int(bt.size(1)), float(scale), H, 1, 0, 1.0f, nullptr, 0, int(page_stride_bytes));
         return out;
     }
     // Partitioned, as the GLM fp8 path above: the unpartitioned launch is one
@@ -1435,7 +1435,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         bp(q), kvp, nullptr, bt.data_ptr<int>(), nullptr, indices.data_ptr<int>(),
         topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
-        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f);
+        int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f, nullptr, 0, int(page_stride_bytes));
     paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
@@ -1449,8 +1449,8 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
 static torch::Tensor py_mla_decode_fp8_sparse_glm(torch::Tensor q, torch::Tensor data,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, double kv_scale,
-        int64_t partition_size) {
-    CK(q); CK(data); CK(bt); CK(indices); CK(topk_length);
+        int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
     const int B = q.size(0), H = q.size(1);
     TORCH_CHECK(q.size(2) == 576, "GLM MLA expects q width 576, got ", q.size(2));
     const int max_topk = indices.size(1);
@@ -1460,7 +1460,7 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm(torch::Tensor q, torch::Tensor
             bp(q), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
             indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, bpm(out),
             nullptr, nullptr, nullptr, int(block_size), int(bt.size(1)), float(scale), H, 1, 0,
-            float(kv_scale));
+            float(kv_scale), nullptr, 0, int(page_stride_bytes));
         return out;
     }
     // Partitioned: the unpartitioned launch is one 32-thread warp per
@@ -1478,7 +1478,7 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm(torch::Tensor q, torch::Tensor
         indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
-        float(kv_scale));
+        float(kv_scale), nullptr, 0, int(page_stride_bytes));
     paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
@@ -1490,8 +1490,8 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm(torch::Tensor q, torch::Tensor
 static torch::Tensor py_mla_decode_fp8_sparse_glm_splitq(torch::Tensor q_nope,
         torch::Tensor q_pe, torch::Tensor data, torch::Tensor bt,
         torch::Tensor indices, torch::Tensor topk_length, int64_t block_size,
-        double scale, double kv_scale, int64_t partition_size) {
-    CK(q_nope); CK(data); CK(bt); CK(indices); CK(topk_length);
+        double scale, double kv_scale, int64_t partition_size, int64_t page_stride_bytes) {
+    CK(q_nope); TORCH_CHECK(data.is_cuda() && data.stride(-1) == 1, "data must be a CUDA tensor with unit inner stride"); CK(bt); CK(indices); CK(topk_length);
     const int H = q_nope.size(0), B = q_nope.size(1);
     TORCH_CHECK(q_nope.size(2) == 512 && q_pe.size(2) == 64,
                 "splitq expects nope width 512 and pe width 64");
@@ -1510,7 +1510,7 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm_splitq(torch::Tensor q_nope,
             bp(q_nope), data.data_ptr<uint8_t>(), nullptr, bt.data_ptr<int>(), nullptr,
             indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, bpm(out),
             nullptr, nullptr, nullptr, int(block_size), int(bt.size(1)), float(scale), H,
-            1, 0, float(kv_scale), bp(q_pe), pe_stride);
+            1, 0, float(kv_scale), bp(q_pe), pe_stride, int(page_stride_bytes));
         return out;
     }
     const int P = int((max_topk + partition_size - 1) / partition_size);
@@ -1523,7 +1523,7 @@ static torch::Tensor py_mla_decode_fp8_sparse_glm_splitq(torch::Tensor q_nope,
         indices.data_ptr<int>(), topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size),
-        float(kv_scale), bp(q_pe), pe_stride);
+        float(kv_scale), bp(q_pe), pe_stride, int(page_stride_bytes));
     paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
     return out;
@@ -2180,20 +2180,24 @@ void init_serving(py::module_& m) {
     m.def("mla_decode_bf16_sparse_glm", &py_mla_decode_bf16_sparse_glm, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
-          py::arg("partition_size") = 0);
+          py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
     m.def("mla_decode_bf16_sparse_nope", &py_mla_decode_bf16_sparse_nope, py::arg("q"),
           py::arg("kv"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
-          py::arg("partition_size") = 0);
+          py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
     m.def("mla_decode_fp8_sparse_glm", &py_mla_decode_fp8_sparse_glm, py::arg("q"),
           py::arg("data"), py::arg("block_table"), py::arg("indices"),
           py::arg("topk_length"), py::arg("block_size"), py::arg("scale"),
-          py::arg("kv_scale"), py::arg("partition_size") = 0);
+          py::arg("kv_scale"), py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
     m.def("sparse_topk_tlen", &py_sparse_topk_tlen, py::arg("indices"));
     m.def("mla_decode_fp8_sparse_glm_splitq", &py_mla_decode_fp8_sparse_glm_splitq,
           py::arg("q_nope"), py::arg("q_pe"), py::arg("data"), py::arg("block_table"),
           py::arg("indices"), py::arg("topk_length"), py::arg("block_size"),
-          py::arg("scale"), py::arg("kv_scale"), py::arg("partition_size") = 0);
+          py::arg("scale"), py::arg("kv_scale"), py::arg("partition_size") = 0,
+          py::arg("page_stride_bytes") = 0);
     m.def("moe_weighted_sum", &py_moe_weighted_sum, py::arg("x"), py::arg("w"),
           py::arg("out"));
     m.def("mla_decode_fp8_sparse", &py_mla_decode_fp8_sparse, py::arg("q"), py::arg("data"),

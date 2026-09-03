@@ -48,6 +48,7 @@ Config (kv_transfer_config.kv_connector_extra_config):
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -275,7 +276,29 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # size AFTER hybrid alignment. cache_config.block_size can hold a
         # stale pre-alignment value in the scheduler process; the group spec
         # is authoritative.
-        self.hash_block_size = groups[self.attn_groups[0]].kv_cache_spec.block_size
+        attn_block_sizes = {
+            g: groups[g].kv_cache_spec.block_size for g in self.attn_groups
+        }
+        self.hash_block_size = min(attn_block_sizes.values())
+        # Hash blocks per KV block for each attention group. Hybrid page-size
+        # unification can widen a group's block (GLM-5.3: the 512 B/token
+        # indexer group runs 2176-token blocks beside the MLA group's 1088)
+        # while the scheduler hashes at the gcd; such a group's block covers
+        # ``ratio`` hash positions and is due (complete, offloadable,
+        # restorable) only at the last of them.
+        self._attn_ratio: dict[int, int] = {}
+        for g, bs_g in attn_block_sizes.items():
+            if bs_g % self.hash_block_size != 0:
+                raise ValueError(
+                    "host-tier: attention group %d block %d is not a multiple "
+                    "of the hash block %d" % (g, bs_g, self.hash_block_size)
+                )
+            self._attn_ratio[g] = bs_g // self.hash_block_size
+        self._resume_align = 1
+        for r in self._attn_ratio.values():
+            self._resume_align = self._resume_align * r // math.gcd(
+                self._resume_align, r
+            )
         # Per-group live bytes within a block-stride row: each group's
         # layers occupy a contiguous prefix [0, sum) of its own rows (the
         # packed planner starts every group at offset 0), so DMA copies can
@@ -317,7 +340,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 self.num_slots,
                 attn_gids=self.attn_groups,
                 num_disk_slots=self.num_disk_slots,
+                attn_ratio=self._attn_ratio,
             )
+            if self._resume_align > 1:
+                logger.info(
+                    "host-tier: attention block ratios %s; resume boundaries "
+                    "align to %d hash blocks",
+                    self._attn_ratio,
+                    self._resume_align,
+                )
             if self.num_disk_slots:
                 logger.info(
                     "host-tier: NVMe tier %d slots x %d bytes per rank",
@@ -400,11 +431,14 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         hit_owner, n_blocks, attn_slots, state_slots = hit
         if self._attention_only:
             # Any gap-free prefix restores validly; clamp so at least one
-            # token remains to compute.
+            # token remains to compute, and to whole blocks of every group.
             clamp = (request.num_tokens - 1) // bs
+            clamp -= clamp % self._resume_align
             if n_blocks > clamp:
                 n_blocks = clamp
                 attn_slots = attn_slots[:clamp]
+            n_blocks -= n_blocks % self._resume_align
+            attn_slots = attn_slots[:n_blocks]
         n_tokens = n_blocks * bs
         if n_tokens <= num_computed_tokens and self._partial_resume_ok:
             # The GPU cache already covers the tier's span: no restore,
@@ -491,8 +525,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         ops: list[tuple[int, int]] = []
         for logical in range(track.restored_upto, covered):
             for gid in self.attn_groups:
+                ratio = self._attn_ratio[gid]
+                if (logical + 1) % ratio != 0:
+                    continue  # this group's block completes later
                 gb = track.group_blocks[gid]
-                if logical >= len(gb) or gb[logical] < 0:
+                gidx = logical // ratio
+                if gidx >= len(gb) or gb[gidx] < 0:
                     logger.warning(
                         "host-tier: no target block for %s attn g%d pos %d "
                         "(group table lens: %s)",
@@ -504,7 +542,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     track.planned_blocks = 0
                     return
                 ops.append(
-                    (track.planned_attn_slots[logical][gid], gb[logical], gid)
+                    (track.planned_attn_slots[logical][gid], gb[gidx], gid)
                 )
         # Tail-boundary state blocks ride the FINAL restore chunk. The
         # resumed state must land at position ``boundary_blocks - 1`` of
@@ -598,7 +636,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 request.num_computed_tokens // bs,
                 len(request.block_hashes),
                 min(
-                    (len(track.group_blocks[g]) for g in self.attn_groups),
+                    (
+                        len(track.group_blocks[g]) * self._attn_ratio[g]
+                        for g in self.attn_groups
+                    ),
                     default=0,
                 ),
             )
@@ -610,7 +651,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 block_hash = request.block_hashes[logical]
                 ops: list[tuple[int, int]] = []
                 for gid in self.attn_groups:
-                    block_id = track.group_blocks[gid][logical]
+                    ratio = self._attn_ratio[gid]
+                    if (logical + 1) % ratio != 0:
+                        continue  # block not complete at this position
+                    block_id = track.group_blocks[gid][logical // ratio]
                     if block_id < 0:
                         continue
                     slot = self.index.stage_attention(
@@ -736,6 +780,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         boundary = 0
         scan_floor = max(1, max_boundary - 64)
         for j in range(max_boundary, scan_floor - 1, -1):
+            if j % self._resume_align != 0:
+                continue  # a wider attention group's block is incomplete
             cached = self._block_pool.get_cached_block(
                 request.block_hashes[j - 1], self.state_groups
             )

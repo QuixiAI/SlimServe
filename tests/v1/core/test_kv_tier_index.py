@@ -158,3 +158,32 @@ def test_adopted_owner_extends_one_lineage():
     assert idx.stats()["trajectories"] == 1
     hit = idx.lookup([h(i) for i in range(6)])
     assert hit is not None and hit[0] == "turn-1" and hit[1] == 5
+
+
+def test_ratio_groups_due_positions_and_resume():
+    """A group whose KV block spans 2 hash blocks (GLM-5.3 indexer beside
+    MLA) is due only at odd positions; a position is complete without it
+    at even positions, and the resumable span still covers every position
+    up to a tail boundary that is a multiple of the ratio."""
+    from vllm.v1.core.kv_tier_index import HostKVTierIndex
+
+    idx = HostKVTierIndex(64, attn_gids=[4, 5], attn_ratio={4: 2, 5: 1})
+    assert idx.resume_align == 2
+    assert idx.due(0) == frozenset({5}) and idx.due(1) == frozenset({4, 5})
+    hashes = [bytes([i]) * 4 for i in range(4)]
+    for pos in range(4):
+        s5 = idx.stage_attention("o", pos, hashes[pos], gid=5)
+        assert s5 is not None
+        if (pos + 1) % 2 == 0:
+            s4 = idx.stage_attention("o", pos, hashes[pos], gid=4)
+            assert s4 is not None
+    idx.confirm_writes(list(range(64)))
+    tails = idx.stage_tail_states("o", 4, 1, boundary_hash=hashes[3])
+    assert tails is not None
+    idx.confirm_writes(list(tails.values()) if isinstance(tails, dict) else list(tails))
+    hit = idx.lookup(hashes)
+    assert hit is not None
+    owner, n, attn, tail = hit
+    assert owner == "o" and n == 4
+    assert set(attn[0]) == {5} and set(attn[1]) == {4, 5}
+    assert set(attn[2]) == {5} and set(attn[3]) == {4, 5}

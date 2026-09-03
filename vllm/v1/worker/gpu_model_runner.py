@@ -7731,14 +7731,30 @@ class GPUModelRunner(
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     page_size_bytes = kv_cache_spec.page_size_bytes
-                    # Hold a single contiguous [num_blocks, 1, 1, page_size_bytes]
-                    # int8 page view per layer; the layer's bind_kv_cache unpacks
+                    # Hold a single [num_blocks, 1, 1, page_size_bytes] int8
+                    # page view per layer; the layer's bind_kv_cache unpacks
                     # each block's bytes into its conv/ssm state views. Keeping
                     # one tensor per layer lets the KV connector register it
                     # without special-casing Mamba.
-                    kv_caches[layer_name] = raw_tensor[
-                        : num_blocks * page_size_bytes
-                    ].view(num_blocks, 1, 1, page_size_bytes)
+                    if packing is not None:
+                        # Packed cross-layer slab (host KV tier): block b's
+                        # page for this layer is row b of the slab at the
+                        # layer's byte offset, exactly as the attention views
+                        # and the tier's row DMA address it. A contiguous
+                        # first-bytes view would alias the other layers'
+                        # rows (GLM-5.3 KDA + MLA, 2026-09-03).
+                        offset, blk_stride = packing
+                        kv_caches[layer_name] = (
+                            raw_tensor.view(-1, blk_stride)[
+                                :, offset : offset + page_size_bytes
+                            ]
+                            .unsqueeze(1)
+                            .unsqueeze(1)
+                        )
+                    else:
+                        kv_caches[layer_name] = raw_tensor[
+                            : num_blocks * page_size_bytes
+                        ].view(num_blocks, 1, 1, page_size_bytes)
                 else:
                     raise NotImplementedError
 

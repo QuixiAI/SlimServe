@@ -42,7 +42,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
-from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend, MultipleOf
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
     DeepseekV32IndexerMetadata,
@@ -69,6 +69,13 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
     def get_supported_head_sizes(cls) -> list[int]:
         return [_ROW_DIM]
 
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # Runtime block size everywhere (insert rows via slot mapping, pooled
+        # logits via block table // BLOCK_SIZE); the kernel block equals the
+        # KV-manager block so the packed slab view is a single stride.
+        return [MultipleOf(64)]
+
 
 class Glm5NextIndexerCache(DeepseekV32IndexerCache):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -92,15 +99,21 @@ def _insert_rows_kernel(
     cache_ptr,
     slot_ptr,
     num_tokens,
+    page_stride,    # elements between consecutive blocks' pages
+    BLOCK_SIZE: tl.constexpr,
     ROW: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
-    """cache[slot[t]] = src[t] for slot[t] >= 0."""
+    """cache[slot[t]] = src[t] for slot[t] >= 0. Pages may be strided (the
+    packed cross-layer slab interleaves every layer's page per block), so a
+    slot resolves to block * page_stride + (slot % BLOCK_SIZE) * ROW."""
     pid = tl.program_id(0)
     t = pid * BLOCK_T + tl.arange(0, BLOCK_T)
     tmask = t < num_tokens
     slot = tl.load(slot_ptr + t, mask=tmask, other=-1)
     valid = tmask & (slot >= 0)
+    blk = (slot // BLOCK_SIZE).to(tl.int64)
+    off = slot - blk * BLOCK_SIZE
     cols = tl.arange(0, ROW)
     vals = tl.load(
         src_ptr + t[:, None] * ROW + cols[None, :],
@@ -108,7 +121,7 @@ def _insert_rows_kernel(
         other=0.0,
     )
     tl.store(
-        cache_ptr + slot[:, None].to(tl.int64) * ROW + cols[None, :],
+        cache_ptr + (blk * page_stride + off * ROW)[:, None] + cols[None, :],
         vals,
         mask=valid[:, None],
     )
@@ -126,6 +139,7 @@ def _pooled_logits_kernel(
     out_ptr,        # [R, max_pools] fp32
     max_pools,
     bt_stride,
+    page_stride,    # elements between consecutive blocks' pages
     softmax_scale,
     BLOCK_SIZE: tl.constexpr,
     H: tl.constexpr,
@@ -166,8 +180,9 @@ def _pooled_logits_kernel(
             mask=pmask[:, None],
             other=0,
         )
-        slot = blk.to(tl.int64) * BLOCK_SIZE + (tok % BLOCK_SIZE)  # [P, KP]
-        base = cache_ptr + slot[:, :, None] * ROW  # [P, KP, 1]
+        base = cache_ptr + (
+            blk.to(tl.int64) * page_stride + (tok % BLOCK_SIZE) * ROW
+        )[:, :, None]  # [P, KP, 1]
         k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
         g = tl.load(
             base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0
@@ -240,7 +255,7 @@ def _pooled_select(
     q: torch.Tensor,           # [R, H, D] bf16
     weights: torch.Tensor,     # [R, H] fp32
     ape: torch.Tensor,         # [KP, D] fp32
-    cache: torch.Tensor,       # [num_slots, ROW] bf16 (flat)
+    cache: torch.Tensor,       # [num_blocks, BS, ROW] bf16 (pages may be strided)
     block_table: torch.Tensor, # [rows_bt, stride] int32
     row_req: torch.Tensor,     # [R] int32
     visible: torch.Tensor,     # [R] int32
@@ -261,7 +276,7 @@ def _pooled_select(
     grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
     _pooled_logits_kernel[grid](
         q, weights, ape, cache, block_table, row_req, visible,
-        logits, max_pools, block_table.stride(0), softmax_scale,
+        logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
         BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
     )
     # top-k over pools: prefill-style ranges [0, n_pools) per row.
@@ -300,14 +315,18 @@ def glm5_next_pooled_indexer(
     md = attn_metadata[k_cache_prefix]
     assert isinstance(md, DeepseekV32IndexerMetadata)
     num_tokens = md.slot_mapping.shape[0]
-    cache = kv_cache.view(-1, _ROW_DIM)
+    # [num_blocks, block_size, ROW]; in the packed cross-layer slab the
+    # block dim is strided (stride(0) > block_size * ROW), so kernels
+    # address pages as block * stride(0) + offset * ROW, never a flat view.
+    cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], _ROW_DIM)
+    assert cache.stride(2) == 1 and cache.stride(1) == _ROW_DIM
     block_size = kv_cache.shape[1]
 
     # 1) insert this step's rows.
     BLOCK_T = 64
     _insert_rows_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
-        packed[:num_tokens], cache, md.slot_mapping, num_tokens,
-        ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
+        packed[:num_tokens], cache, md.slot_mapping, num_tokens, cache.stride(0),
+        BLOCK_SIZE=block_size, ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
     )
     topk_indices_buffer[: q.shape[0]] = -1
 

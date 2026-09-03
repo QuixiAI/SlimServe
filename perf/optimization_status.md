@@ -18488,3 +18488,42 @@ token, approximate:
   decode P128): canaries pass, c1 84.4 / c8 413.6 / c16 578.8 - identical
   to run 2 (84.0 / 412.3 / 575.8). Raw: perf/results/2026-09-03/
   glm53-nvfp4-8-baseline/ (run 2 kept as -baseline-run2).
+
+## 2026-09-03: host + NVMe KV tier for GLM-5.3 - bring-up log
+
+- Goal (operator): the CPU-offloaded KV tier and the NVMe third tier on
+  the glm53 records, as on qwen38fn-fp8-8/rtx3090.
+- Reproduced the packed-slab failure the -4 record's note described:
+  `shape '[544, 64, 256]' is invalid for input of size 262144` in the
+  profiling-time minimal KV cache. Root causes, all fixed:
+  1. The sparse MLA and pooled-indexer backends advertised a 64-token
+     kernel block; hybrid alignment makes the KV block 1088 (TP4) / 576
+     (TP8), so each KV page was 17/9 kernel pages, which the packed view
+     helper cannot express. Every kernel on the path takes the block size
+     at runtime, so both backends now accept MultipleOf(64): kernel block
+     == KV block.
+  2. The runner's MambaSpec branch built a contiguous first-bytes view
+     regardless of packing; in a packed slab that aliases other layers'
+     rows. It now takes the row-strided view at the layer's offset.
+  3. Every flattening of a KV view on the sparse path - the indexer's
+     `view(-1, ROW)` (raised on the strided view) and the backend's
+     `reshape(-1)` (silently COPIED the whole layer cache per call on
+     any packed layout, i.e. on the GLM-5.2 tier records today) - is
+     replaced by block-stride addressing: the Triton kernels take a page
+     stride, the four sparse decode entry points take page_stride_bytes
+     (the kernel already had the packed-page path from DSV4).
+  4. Hybrid page-size unification gives the indexer group (512 B/token)
+     2176-token blocks beside the MLA group's 1088 while the scheduler
+     hashes at 1088. The connector assumed one KV block per hash block
+     per group; it now derives per-group ratios, stages/restores a group
+     only where its block completes, and aligns tail boundaries to the
+     ratios' lcm (HostKVTierIndex.due(i); unit test added).
+- Diagnostic-launch pitfall (found by the acceptance's metrics, not by
+  the recall probes): the raw api_server launches used for the arms and
+  tier repros never passed --enable-prefix-caching, and vLLM defaults it
+  OFF for hybrid models (mamba_cache_mode "none", mamba block = max ctx).
+  A first acceptance run "recalled 6/6" with ZERO tier activity - full
+  re-prefill, precisely the trap the standing check warns about. The
+  profile launches (`slimserve --serve`) always pass the flag (92% hit
+  rate on the leg). All raw launch scripts now pass it; the matrix
+  numbers are unaffected (unique prompts, all arms equal).

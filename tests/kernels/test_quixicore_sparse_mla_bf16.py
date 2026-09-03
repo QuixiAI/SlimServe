@@ -81,3 +81,43 @@ def test_glm_576_matches_reference(heads, partition_size):
     ref = _reference(q, kv, idx, 512)
     err = (out.float() - ref).abs().max().item() / ref.abs().max().item()
     assert err < 5e-3, err
+
+
+def _packed_view(kv: torch.Tensor, stride_mult: int = 3, offset_pages: int = 1):
+    """A [N_BLOCKS, BS, W] view whose block stride is stride_mult pages, at a
+    page offset inside each row: the packed cross-layer slab geometry."""
+    n, bs, w = kv.shape
+    page = bs * w
+    slab = torch.zeros(n * stride_mult * page, dtype=kv.dtype, device=DEV)
+    view = slab.view(n, stride_mult * page)[:, offset_pages * page : (offset_pages + 1) * page]
+    view = view.view(n, bs, w)
+    view.copy_(kv)
+    return view
+
+
+@pytest.mark.parametrize("partition_size", [0, 128])
+def test_nope_512_strided_pages(partition_size):
+    q, kv, bt, idx, tlen = _inputs(512, 8)
+    dense = qc.mla_decode_bf16_sparse_nope(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size
+    )
+    view = _packed_view(kv)
+    assert not view.is_contiguous()
+    strided = qc.mla_decode_bf16_sparse_nope(
+        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(512), partition_size,
+        view.stride(0) * view.element_size(),
+    )
+    assert torch.equal(dense, strided)
+
+
+def test_glm_576_strided_pages():
+    q, kv, bt, idx, tlen = _inputs(576, 8)
+    dense = qc.mla_decode_bf16_sparse_glm(
+        q, kv.reshape(-1), bt, idx, tlen, BS, 1.0 / math.sqrt(576), 128
+    )
+    view = _packed_view(kv)
+    strided = qc.mla_decode_bf16_sparse_glm(
+        q, view, bt, idx, tlen, BS, 1.0 / math.sqrt(576), 128,
+        view.stride(0) * view.element_size(),
+    )
+    assert torch.equal(dense, strided)
