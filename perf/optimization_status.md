@@ -18430,7 +18430,7 @@ vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
 
 - Through the profile (202752 ctx): c1 9.6 / c8 64.7 / c16 110.4 tok/s;
   text (+reasoning), image, tool canaries pass. Raw: perf/results/
-  2026-09-03/glm52-q2k-8-baseline/. This record never had an exact-token
+  2026-09-03/glm52-q2k-8-prepartition/. This record never had an exact-token
   baseline (only its 2026-08-30 deep-context leg).
 - The bf16 GLM 576 entry point (mla_decode_bf16_sparse_glm) got today's
   VECBF16 row path but was still launched unpartitioned: 8 local heads x
