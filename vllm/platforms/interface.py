@@ -855,13 +855,16 @@ class Platform:
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
 
-        # Qwen4Exp can store its main QSA KV as TurboQuant k8v4 through a
-        # layer-scoped override (VLLM_QWEN4_EXP_TQ_MAIN_KV) that never
-        # touches cache_config.cache_dtype, so the computation above sized
-        # the page for the model dtype. Recompute with the override's
-        # layout: the aligner then scales block_size up, keeping the page's
-        # byte size (the slot every packed GDN state page must fit inside)
-        # roughly unchanged while multiplying its token capacity.
+        # Qwen4Exp stores its main QSA KV in FP8 when the profile sets
+        # kv_cache_dtype fp8 (or the layer-scoped VLLM_QWEN4_EXP_FP8_MAIN_KV
+        # diagnostic), or as TurboQuant k8v4 through VLLM_QWEN4_EXP_TQ_MAIN_KV;
+        # the env overrides never touch cache_config.cache_dtype, so the
+        # computation above sized the page for the model dtype (the fp8
+        # profile path is already right and the recompute is a no-op).
+        # Recompute with the override's layout: the
+        # aligner then scales block_size up, keeping the page's byte size
+        # (the slot every packed GDN state page must fit inside) roughly
+        # unchanged while multiplying its token capacity.
         if model_config.architecture.startswith("Qwen4Exp"):
             if envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
                 from vllm.model_executor.layers.quantization.turboquant.config import (
@@ -879,6 +882,17 @@ class Platform:
                     dtype=torch.uint8,
                     tq_slot_size=tq_cfg.slot_size_aligned,
                     tq_cache_dtype="turboquant_k8v4",
+                ).page_size_bytes
+            elif envs.VLLM_QWEN4_EXP_FP8_MAIN_KV or cache_config.cache_dtype in (
+                "fp8",
+                "fp8_e4m3",
+            ):
+                attn_page_size_1_token = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=torch.float8_e4m3fn,
+                    kv_quant_mode=get_kv_quant_mode("fp8"),
                 ).page_size_bytes
 
         # Compute mamba page size

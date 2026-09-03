@@ -52,7 +52,7 @@ shipped sampling defaults, seeded.</sub>
 | **8× RTX 3090** | **139.7** | **590.7** | **1,151.2** |
 
 <sub>Profile `qwen38fn-fp8-8` as deployed: TP8 + expert parallel, the model's
-native 262,144-token context, bf16 main KV, prefix caching, MTP k=2,
+native 262,144-token context, fp8 main KV, prefix caching, MTP k=2,
 FULL_DECODE_ONLY graphs. Exact workload — 1,000 input and exactly 2,000 output
 tokens per request, the model's shipped sampling defaults (temperature 1.0,
 top-p 0.95, top-k 20) seeded — so these are not directly comparable to the GLM
@@ -672,7 +672,7 @@ backbone and vision tower). This is the 8× RTX 3090 target:
 - **PLE tables in host RAM.** The full 47.7 GiB n-gram table stays pinned in
   host memory per rank; the forward gathers 16 rows per token over UVA, inside
   CUDA graph capture. GPU memory holds weights and KV only.
-- **Native 262,144-token context** with bf16 main KV, prefix caching, and the
+- **Native 262,144-token context** with fp8 (e4m3) main KV, prefix caching, and the
   checkpoint's own single-layer MTP drafter — the draft model is the target
   directory itself, and the profile runs k=2.
 - **P2P driver strongly recommended.** Multi-GPU GeForce runs on the stock

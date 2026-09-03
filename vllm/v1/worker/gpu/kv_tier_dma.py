@@ -28,6 +28,11 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.logger import init_logger
+from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile
+
+logger = init_logger(__name__)
+
 _VERIFY = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 
 
@@ -46,10 +51,69 @@ class TierOpBatch:
     # the framework never zeroes ring blocks, so this is defensive
     # determinism over the stale-claimed bytes internal hits run on).
     zero: list[int] = None  # type: ignore[assignment]
+    # NVMe tier: write-through (host_slot, disk_slot) of rows whose GPU ->
+    # host copy an EARLIER batch produced (the scheduler stages them one
+    # confirmation later); promotion reads (disk_slot, host_slot) that must
+    # land before this request's restore copies run.
+    disk_writes: list[tuple[int, int]] = None  # type: ignore[assignment]
+    disk_reads: list[tuple[int, int]] = None  # type: ignore[assignment]
+    req_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.zero is None:
             self.zero = []
+        if self.disk_writes is None:
+            self.disk_writes = []
+        if self.disk_reads is None:
+            self.disk_reads = []
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.offload or self.restore or self.zero or self.disk_writes or self.disk_reads
+        )
+
+
+_HOST_REGISTER_PORTABLE = 0x01
+
+
+def padded_stride(block_stride: int) -> int:
+    """Arena row width: the block stride rounded up to a 4 KiB multiple so
+    every row is an O_DIRECT-able buffer and file slot."""
+    return -(-block_stride // PAGE) * PAGE
+
+
+def _register_host_arena(
+    num_slots: int, block_stride: int
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Exactly-sized, page-aligned page-locked host arena of padded rows.
+
+    Returns (arena_view, registered_buffer). The whole backing buffer is
+    registered from its own base (is_pinned() is answered for a view by
+    its storage base, and cudaHostUnregister needs the registered
+    pointer); the arena is the page-aligned window inside it. Falls back
+    to the caching pinned allocator (power-of-two rounded) only if
+    registration is refused, and says so, since that fallback can cost up
+    to 2x the requested RAM.
+    """
+    row = padded_stride(block_stride)
+    total = num_slots * row
+    raw = torch.empty(total + PAGE, dtype=torch.int8)
+    rc = torch.cuda.cudart().cudaHostRegister(
+        raw.data_ptr(), raw.numel(), _HOST_REGISTER_PORTABLE
+    )
+    if rc == 0 and raw.is_pinned():
+        off = (-raw.data_ptr()) % PAGE
+        return raw[off : off + total].view(num_slots, row), raw
+    logger.warning(
+        "kv-tier: cudaHostRegister of the %.1f GiB arena failed (%s); "
+        "falling back to pin_memory=True, which rounds up to the next "
+        "power of two",
+        total / (1 << 30),
+        rc,
+    )
+    del raw
+    return torch.empty((num_slots, row), dtype=torch.int8, pin_memory=True), None
 
 
 class KVTierDMA:
@@ -59,41 +123,172 @@ class KVTierDMA:
         block_stride: int,
         num_slots: int,
         device: torch.device,
+        disk: NvmeTierFile | None = None,
     ):
         assert backing.dtype == torch.int8 and backing.is_cuda
         assert backing.numel() % block_stride == 0
         self.blocks = backing.view(-1, block_stride)
+        self.block_stride = block_stride
         self.device = device
+        self.disk = disk
+        if disk is not None:
+            assert disk.slot_bytes == padded_stride(block_stride)
         # One pinned arena; rows are DMA-contiguous with the GPU block rows.
-        self.arena = torch.empty(
-            (num_slots, block_stride), dtype=torch.int8, pin_memory=True
-        )
+        # Allocated as a plain host tensor and page-locked with
+        # cudaHostRegister so it costs EXACTLY its size: torch's caching
+        # pinned allocator (pin_memory=True) rounds every allocation up to
+        # the next power of two, which turned an 88 GiB/rank arena into
+        # 128 GiB/rank (1 TiB across 8 ranks) and got the workers
+        # OOM-killed on a 995 GB box, while 64 GiB (a power of two) fit.
+        # Measured 2026-09-02: 3 GiB pin_memory -> 4,190 MiB of RAM;
+        # 3 GiB registered -> 3,118 MiB.
+        self.arena, self._registered_buf = _register_host_arena(num_slots, block_stride)
+        self._registered = self._registered_buf is not None
         self.copy_stream = torch.cuda.Stream(device)
         # In-flight batches: (batch, event) in issue order; events complete
         # in stream order, so polling stops at the first incomplete one.
         self._inflight: list[tuple[TierOpBatch, torch.cuda.Event]] = []
         self._restore_events: list[torch.cuda.Event] = []
         self._slot_digests: dict[int, str] = {}
+        # NVMe tier bookkeeping (all on the caller's thread; the IO threads
+        # only see DiskOps and report op ids back through poll_done).
+        # Last copy-stream event that wrote each host row (offload target):
+        # a disk write of that row waits on it before reading the bytes.
+        self._slot_event: dict[int, torch.cuda.Event] = {}
+        self._disk_op_seq = 0
+        # op id -> ("w", batch_seq) | ("r", req_id)
+        self._disk_ops: dict[int, tuple[str, object]] = {}
+        self._write_remaining: dict[int, int] = {}
+        self._disk_done: list[int] = []
+        self._read_remaining: dict[str, int] = {}
+        self._read_failed: set[str] = set()
+        # Restore batches waiting for their request's disk reads, in order.
+        self._deferred: list[TierOpBatch] = []
+        self._invalid_blocks: set[int] = set()
 
     def issue(self, batch: TierOpBatch) -> None:
-        """Enqueue a batch of copies on the copy stream."""
-        if not batch.offload and not batch.restore and not batch.zero:
+        """Enqueue a batch: copies on the copy stream, disk ops to the IO
+        engine. A batch carrying (or following) disk reads for its request
+        is held back until those reads have landed in the arena."""
+        if batch.is_empty:
             return
-        main = torch.cuda.current_stream(self.device)
-        with torch.cuda.stream(self.copy_stream):
-            # Offloaded blocks were produced on the compute stream.
-            self.copy_stream.wait_stream(main)
-            for gpu_block, slot in batch.offload:
-                self.arena[slot].copy_(self.blocks[gpu_block], non_blocking=True)
-            for gpu_block in batch.zero:
-                self.blocks[gpu_block].zero_()
-            for slot, gpu_block in batch.restore:
-                self.blocks[gpu_block].copy_(self.arena[slot], non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self.copy_stream)
-        self._inflight.append((batch, event))
-        if batch.restore or batch.zero:
-            self._restore_events.append(event)
+        if batch.disk_reads or (
+            batch.req_id is not None and self._read_remaining.get(batch.req_id, 0) > 0
+        ):
+            assert self.disk is not None and batch.req_id is not None
+            for disk_slot, host_slot in batch.disk_reads:
+                self._submit_disk(
+                    write=False, disk_slot=disk_slot, host_slot=host_slot,
+                    tag=("r", batch.req_id),
+                )
+            self._read_remaining[batch.req_id] = (
+                self._read_remaining.get(batch.req_id, 0) + len(batch.disk_reads)
+            )
+            batch.disk_reads = []
+            self._deferred.append(batch)
+            return
+        self._issue_copies(batch)
+
+    def _issue_copies(self, batch: TierOpBatch) -> None:
+        event: torch.cuda.Event | None = None
+        if batch.offload or batch.restore or batch.zero:
+            main = torch.cuda.current_stream(self.device)
+            with torch.cuda.stream(self.copy_stream):
+                # Offloaded blocks were produced on the compute stream.
+                self.copy_stream.wait_stream(main)
+                for gpu_block, slot in batch.offload:
+                    self.arena[slot, : self.block_stride].copy_(
+                        self.blocks[gpu_block], non_blocking=True
+                    )
+                for gpu_block in batch.zero:
+                    self.blocks[gpu_block].zero_()
+                for slot, gpu_block in batch.restore:
+                    self.blocks[gpu_block].copy_(
+                        self.arena[slot, : self.block_stride], non_blocking=True
+                    )
+                event = torch.cuda.Event()
+                event.record(self.copy_stream)
+            for _, slot in batch.offload:
+                self._slot_event[slot] = event
+            self._inflight.append((batch, event))
+            if batch.restore or batch.zero:
+                self._restore_events.append(event)
+        if batch.disk_writes:
+            assert self.disk is not None
+            self._write_remaining[batch.seq] = len(batch.disk_writes)
+            for host_slot, disk_slot in batch.disk_writes:
+                self._submit_disk(
+                    write=True, disk_slot=disk_slot, host_slot=host_slot,
+                    tag=("w", batch.seq),
+                )
+
+    def _submit_disk(
+        self, write: bool, disk_slot: int, host_slot: int, tag: tuple[str, object]
+    ) -> None:
+        self._disk_op_seq += 1
+        op_id = self._disk_op_seq
+        self._disk_ops[op_id] = tag
+        wait = None
+        if write:
+            ev = self._slot_event.get(host_slot)
+            if ev is not None:
+                wait = ev.synchronize
+        self.disk.submit(
+            DiskOp(
+                op_id=op_id,
+                write=write,
+                disk_slot=disk_slot,
+                buffer=memoryview(self.arena[host_slot].numpy()),
+                wait=wait,
+            )
+        )
+
+    def pump(self) -> None:
+        """Absorb IO completions: account write-through batches, and issue
+        restore batches whose disk reads have all landed."""
+        if self.disk is None:
+            return
+        for op_id, err in self.disk.poll_done():
+            kind, key = self._disk_ops.pop(op_id)
+            if kind == "w":
+                left = self._write_remaining[key] - 1
+                if left <= 0:
+                    del self._write_remaining[key]
+                    # A failed write leaves the disk slot unconfirmed for
+                    # the scheduler (never reported done): the block stays
+                    # host-resident and the trajectory is not demotable.
+                    if err is None:
+                        self._disk_done.append(key)
+                else:
+                    self._write_remaining[key] = left
+                continue
+            req_id = key
+            if err is not None:
+                self._read_failed.add(req_id)
+            left = self._read_remaining.get(req_id, 0) - 1
+            if left > 0:
+                self._read_remaining[req_id] = left
+                continue
+            self._read_remaining.pop(req_id, None)
+            failed = req_id in self._read_failed
+            self._read_failed.discard(req_id)
+            ready = [b for b in self._deferred if b.req_id == req_id]
+            self._deferred = [b for b in self._deferred if b.req_id != req_id]
+            for b in ready:
+                if failed:
+                    # Report the target blocks as failed loads so the
+                    # scheduler recomputes them instead of reading garbage.
+                    self._invalid_blocks.update(g for _, g in b.restore)
+                    b.restore = []
+                self._issue_copies(b)
+
+    def take_disk_done(self) -> list[int]:
+        done, self._disk_done = self._disk_done, []
+        return done
+
+    def take_invalid_blocks(self) -> set[int]:
+        inv, self._invalid_blocks = self._invalid_blocks, set()
+        return inv
 
     def fence_restores(self) -> None:
         """Make the compute stream wait on all outstanding restore copies.
@@ -111,6 +306,7 @@ class KVTierDMA:
 
     def poll_done(self) -> list[int]:
         """Return seq ids of batches whose copies have completed."""
+        self.pump()
         done: list[int] = []
         while self._inflight and self._inflight[0][1].query():
             batch = self._inflight[0][0]
@@ -121,16 +317,13 @@ class KVTierDMA:
         return done
 
     def _verify(self, batch: TierOpBatch) -> None:
-        from vllm.logger import init_logger
-
-        logger = init_logger(__name__)
         for gpu_block, slot in batch.offload:
-            self._slot_digests[slot] = _digest(self.arena[slot])
+            self._slot_digests[slot] = _digest(self.arena[slot, : self.block_stride])
         bad = 0
         for slot, gpu_block in batch.restore:
             expect = self._slot_digests.get(slot)
             got = _digest(self.blocks[gpu_block])
-            host = _digest(self.arena[slot])
+            host = _digest(self.arena[slot, : self.block_stride])
             if expect is not None and got != expect:
                 bad += 1
                 logger.warning(
@@ -146,5 +339,34 @@ class KVTierDMA:
 
     def flush(self) -> list[int]:
         """Synchronously drain all in-flight batches (shutdown/tests)."""
+        import time
+
+        while self.disk is not None and (
+            self._disk_ops or self._deferred
+        ):
+            self.pump()
+            if self._disk_ops:
+                time.sleep(0.001)
         self.copy_stream.synchronize()
         return self.poll_done()
+
+    def release(self) -> None:
+        """Drain, then unregister the arena BEFORE its storage can be freed.
+
+        Same lesson as the PLE shared table: dropping page-locked memory
+        while it is still cudaHostRegistered leaves dangling pinned-page
+        state that corrupts later CUDA work in the process.
+        """
+        if getattr(self, "_registered", False):
+            self.flush()
+            if self.disk is not None:
+                self.disk.close()
+                self.disk = None
+            torch.cuda.cudart().cudaHostUnregister(self._registered_buf.data_ptr())
+            self._registered = False
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:  # noqa: BLE001 - interpreter teardown
+            pass

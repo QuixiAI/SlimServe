@@ -1052,32 +1052,37 @@ def test_every_profile_serves_with_tool_calling_and_thinking():
             )
 
 
-def test_no_profile_quantizes_main_kv():
-    """Main KV is bf16 on rtx3090; aspirational elsewhere (operator 2026-08-29).
+def test_quantized_main_kv_is_an_explicit_validated_choice():
+    """Quantized main KV is allowed on any platform (operator 2026-09-02).
 
-    Quantized main KV was implicated in multi-turn tracking errors on
-    Qwen3.8-Flash-Next, so no rtx3090 profile may set a quantized
-    kv_cache_dtype. Other platforms keep their qualified configs until an
-    on-box requalification pass flips them. Draft-model KV (DSpark
+    This reverses the 2026-08-29 rtx3090 bf16 mandate: the multi-turn
+    tracking errors that motivated it were fixed by unrelated bugs and were
+    never attributed to KV precision. The policy that replaces it is that
+    quantization is a stated, on-box-validated choice, never an accident: a
+    record that quantizes its main KV must carry a note naming the format,
+    and the rtx3090 Flash-Next record pins fp8 (e4m3) - not TurboQuant -
+    through the engine's own kv_cache_dtype. Draft-model KV (DSpark
     TurboQuant) is exempt everywhere because rejection sampling verifies
     drafts against the target.
     """
-    # Enforced on rtx3090 (operator 2026-08-29): quantized main KV was
-    # implicated in multi-turn tracking errors on Qwen3.8-Flash-Next, and
-    # this box is where that was root-caused and validated. Other platforms
-    # keep their qualified configs; bf16 main KV is aspirational there and
-    # flips only with an on-box requalification pass.
+    rec = registry._registry()["profiles"]["qwen38fn-fp8-8"]["variants"]["rtx3090"]
+    assert rec["engine"]["kv_cache_dtype"] == "fp8"
+    assert "VLLM_QWEN4_EXP_TQ_MAIN_KV" not in rec.get("env", {})
+    assert any("fp8" in note and "kv_cache_dtype" in note for note in rec["notes"])
+
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry.get("variants", {}).items():
-            if platform not in ("rtx3090", "a100"):
-                continue
             dtype = record.get("engine", {}).get("kv_cache_dtype", "auto")
-            # 'auto' resolves to the model dtype (bf16 for every supported
-            # model); an explicit 'bfloat16' is the same commitment spelled
-            # out and equally compliant.
-            assert dtype in {"auto", "bfloat16"}, (
-                f"{profile_id}/{platform} sets kv_cache_dtype={dtype!r}; "
-                "main KV must be bf16 (auto) on every rtx3090 profile"
+            env = record.get("env", {})
+            quantized = dtype not in {"auto", "bfloat16"} or any(
+                env.get(k) == "1"
+                for k in ("VLLM_QWEN4_EXP_TQ_MAIN_KV", "VLLM_QWEN4_EXP_FP8_MAIN_KV")
+            )
+            if not quantized:
+                continue
+            assert any("KV" in note for note in record.get("notes", [])), (
+                f"{profile_id}/{platform} quantizes main KV as {dtype!r} without a "
+                "note naming the format and its on-box validation"
             )
 
 

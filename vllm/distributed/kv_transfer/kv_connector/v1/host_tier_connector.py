@@ -25,8 +25,22 @@ Contract (matches the engine's hybrid semantics, learned the hard way):
   (WAITING_FOR_REMOTE_KVS): issued while the request waits, hidden under
   running decode, and re-queried per scheduling step if clipped.
 
+Third tier (NVMe): with ``nvme_tier_gb_per_rank`` > 0 every offloaded
+block is also written through to a per-rank file on the tier device once
+its host copy is confirmed; a trajectory that is fully on disk is DEMOTED
+(host slots released, disk copies kept) instead of deleted when the host
+tier needs room, and a hit on a disk-only trajectory is PROMOTED: fresh
+host slots are allocated and the worker reads disk -> host before the
+usual host -> GPU restore. Disk-write completion flows worker -> scheduler
+through the connector stats channel (all TP ranks must report a batch);
+promotion completion rides the request's finished_recving.
+
 Config (kv_transfer_config.kv_connector_extra_config):
     host_tier_gb_per_rank: pinned arena size per rank in GiB (required).
+    nvme_tier_gb_per_rank: NVMe tier file size per rank in GiB (0 = off).
+    The tier directory comes from the operator's environment
+    (SLIMSERVE_KV_TIER_DIR, else $SLIMSERVE_CACHE/kv-tier, else
+    ~/.cache/slimserve/kv-tier) - never from the profile.
 """
 
 from __future__ import annotations
@@ -43,6 +57,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import _get_packed_kv_cache_layout
 from vllm.v1.core.kv_tier_index import HostKVTierIndex
@@ -54,6 +69,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -69,6 +85,37 @@ class HostTierMeta(KVConnectorMetadata):
     # (the ring block, whose framework zeroing was skipped for the
     # async-load range but which the tier deliberately does not restore).
     zeros: dict[str, list[int]] = field(default_factory=dict)
+    # batch_seq -> [(host_slot, disk_slot), ...] write-through of confirmed
+    # host rows to the NVMe tier.
+    disk_writes: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    # req_id -> [(disk_slot, host_slot), ...] promotion reads that must land
+    # before that request's restores.
+    disk_reads: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+
+
+@dataclass
+class HostTierStats(KVConnectorStats):
+    """Worker -> scheduler: completed write-through batches.
+
+    data["disk_done"] maps str(batch_seq) -> number of ranks reporting it;
+    the executor sums the ranks' stats, and the scheduler confirms a batch
+    once every TP rank has reported its file slots written.
+    """
+
+    def reset(self) -> None:
+        self.data = {}
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        mine = self.data.setdefault("disk_done", {})
+        for seq, n in other.data.get("disk_done", {}).items():
+            mine[seq] = mine.get(seq, 0) + n
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        return {"disk_write_batches": len(self.data.get("disk_done", {}))}
+
+    def is_empty(self) -> bool:
+        return not self.data.get("disk_done")
 
 
 @dataclass
@@ -85,6 +132,9 @@ class _ReqTrack:
     # owner when the request resumed from the tier (its true lineage), the
     # request's own id otherwise. Never derived from shared content.
     owner: str | None = None
+    # Promotion reads (disk_slot, host_slot) to hand the worker with the
+    # request's first restore chunk.
+    disk_reads: list[tuple[int, int]] = field(default_factory=list)
 
 
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
@@ -108,6 +158,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self.num_slots = int(tier_gb * (1 << 30)) // self.block_stride
         if self.num_slots <= 0:
             raise ValueError("host tier smaller than one block stride")
+        from vllm.v1.worker.gpu.kv_tier_dma import padded_stride
+
+        self.row_bytes = padded_stride(self.block_stride)
+        nvme_gb = float(extra.get("nvme_tier_gb_per_rank", 0) or 0)
+        self.num_disk_slots = (
+            int(nvme_gb * (1 << 30)) // self.row_bytes if nvme_gb > 0 else 0
+        )
+        parallel = getattr(vllm_config, "parallel_config", None)
+        self.num_ranks = int(getattr(parallel, "world_size", 1) or 1)
 
         groups = kv_cache_config.kv_cache_groups
         self.num_groups = len(groups)
@@ -161,7 +220,21 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 self.attn_groups,
                 self.state_groups,
             )
-            self.index = HostKVTierIndex(self.num_slots)
+            self.index = HostKVTierIndex(self.num_slots, self.num_disk_slots)
+            if self.num_disk_slots:
+                logger.info(
+                    "host-tier: NVMe tier %d slots x %d bytes per rank",
+                    self.num_disk_slots,
+                    self.row_bytes,
+                )
+            self._staged_disk_writes: dict[int, list[tuple[int, int]]] = {}
+            self._staged_disk_reads: dict[str, list[tuple[int, int]]] = {}
+            # Write-through batches awaiting every rank's completion report.
+            self._disk_write_batches: dict[int, list[tuple[int, int]]] = {}
+            self._disk_done_counts: dict[int, int] = {}
+            # req_id -> owner whose promotion completes with this request's
+            # finished_recving.
+            self._promoted: dict[str, str] = {}
             self._tracks: dict[str, _ReqTrack] = {}
             self._requests: dict[str, Request] = {}
             self._staged_restores: dict[str, list[tuple[int, int]]] = {}
@@ -231,9 +304,29 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # remain to compute.
         if n_tokens <= num_computed_tokens or n_tokens > request.num_tokens - 1:
             return 0, False
+        disk_reads: list[tuple[int, int]] = []
+        if self.index.needs_promotion(hit):
+            promoted = self.index.promote(hit_owner, n_blocks)
+            if promoted is None:
+                logger.info(
+                    "host-tier: disk hit for %s (%d blocks) but no host room "
+                    "to promote; re-prefilling",
+                    request.request_id[-8:],
+                    n_blocks,
+                )
+                return 0, False
+            attn_slots, state_slots, disk_reads = promoted
+            self._promoted[request.request_id] = hit_owner
+            logger.info(
+                "host-tier: promoting %s from NVMe for %s: %d reads",
+                hit_owner[-8:],
+                request.request_id[-8:],
+                len(disk_reads),
+            )
         if track is None:
             track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
             self._tracks[request.request_id] = track
+        track.disk_reads = disk_reads
         # Adopt the resumed trajectory: this request is its continuation,
         # so its saves extend that lineage instead of duplicating it.
         track.owner = hit_owner
@@ -323,6 +416,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 zero_blocks.extend(b for b in track.group_blocks[gid] if b > 0)
         if ops:
             self._staged_restores.setdefault(request.request_id, []).extend(ops)
+            if track.disk_reads:
+                self._staged_disk_reads.setdefault(
+                    request.request_id, []
+                ).extend(track.disk_reads)
+                track.disk_reads = []
             if zero_blocks:
                 self._staged_zeros.setdefault(
                     request.request_id, []
@@ -405,6 +503,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> KVConnectorMetadata:
         confirmed, self._last_step_write_slots = self._last_step_write_slots, []
         self.index.confirm_writes(confirmed)
+        if self.num_disk_slots and confirmed:
+            writes = self.index.take_disk_writes(confirmed)
+            if writes:
+                self._offload_seq += 1
+                self._staged_disk_writes[self._offload_seq] = writes
+                self._disk_write_batches[self._offload_seq] = writes
         if self._pins_issued and self._block_pool is not None:
             for pin_blocks in self._pins_issued:
                 self._block_pool.free_blocks(pin_blocks)
@@ -416,10 +520,14 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             restores=self._staged_restores,
             offloads=self._staged_offloads,
             zeros=self._staged_zeros,
+            disk_writes=self._staged_disk_writes,
+            disk_reads=self._staged_disk_reads,
         )
         self._staged_restores = {}
         self._staged_offloads = {}
         self._staged_zeros = {}
+        self._staged_disk_writes = {}
+        self._staged_disk_reads = {}
         self._last_step_write_slots.extend(
             s for ops in meta.offloads.values() for _, s in ops
         )
@@ -430,8 +538,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     def on_new_request(self, request: "Request") -> None:
         self._requests[request.request_id] = request
 
-    def update_connector_output(self, connector_output) -> None:
-        return
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        stats = getattr(connector_output, "kv_connector_stats", None)
+        if isinstance(stats, KVConnectorStats):
+            for seq_str, n in stats.data.get("disk_done", {}).items():
+                seq = int(seq_str)
+                if seq not in self._disk_write_batches:
+                    continue
+                count = self._disk_done_counts.get(seq, 0) + int(n)
+                if count >= self.num_ranks:
+                    self._disk_done_counts.pop(seq, None)
+                    self.index.confirm_disk_writes(self._disk_write_batches.pop(seq))
+                else:
+                    self._disk_done_counts[seq] = count
+        for req_id in getattr(connector_output, "finished_recving", None) or ():
+            owner = self._promoted.pop(req_id, None)
+            if owner is not None:
+                self.index.confirm_promotion(owner)
 
     def request_finished(
         self, request: "Request", block_ids: list[int]
@@ -570,8 +693,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             len(kv_caches),
             backing.numel(),
         )
+        disk = None
+        if self.num_disk_slots:
+            from vllm.v1.worker.gpu.kv_tier_nvme import NvmeTierFile, default_tier_dir
+
+            disk = NvmeTierFile(
+                default_tier_dir(), self.num_disk_slots, self.row_bytes
+            )
         self._dma = KVTierDMA(
-            backing, self.block_stride, self.num_slots, any_tensor.device
+            backing, self.block_stride, self.num_slots, any_tensor.device, disk=disk
         )
         logger.info(
             "host-tier: arena %d slots x %d bytes (%.1f GiB pinned) per rank",
@@ -586,6 +716,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             return
         from vllm.v1.worker.gpu.kv_tier_dma import TierOpBatch
 
+        self._dma.pump()
         self._dma.fence_restores()
         # Everything is issued here rather than in wait_for_save:
         # start_load_kv runs on EVERY step, including empty (no_forward)
@@ -595,19 +726,32 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # stream waits on compute, so pre-forward issuance is safe.
         for seq, ops in meta.offloads.items():
             self._dma.issue(TierOpBatch(seq=seq, offload=ops, restore=[]))
+        for seq, ops in meta.disk_writes.items():
+            self._dma.issue(
+                TierOpBatch(seq=seq, offload=[], restore=[], disk_writes=ops)
+            )
         for req_id, ops in meta.restores.items():
             self._seq += 1
             self._pending_restore_reqs[self._seq] = req_id
             zero = meta.zeros.get(req_id, [])
+            reads = meta.disk_reads.get(req_id, [])
             logger.info(
-                "host-tier: issuing restore seq=%d req=%s ops=%d zero=%d",
+                "host-tier: issuing restore seq=%d req=%s ops=%d zero=%d disk_reads=%d",
                 self._seq,
                 req_id[-8:],
                 len(ops),
                 len(zero),
+                len(reads),
             )
             self._dma.issue(
-                TierOpBatch(seq=self._seq, offload=[], restore=ops, zero=zero)
+                TierOpBatch(
+                    seq=self._seq,
+                    offload=[],
+                    restore=ops,
+                    zero=zero,
+                    disk_reads=reads,
+                    req_id=req_id,
+                )
             )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -621,6 +765,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_save(self) -> None:
         # All issuance happens in start_load_kv (see note there).
         return
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        if getattr(self, "_dma", None) is None:
+            return None
+        done = self._dma.take_disk_done()
+        if not done:
+            return None
+        return HostTierStats(data={"disk_done": {str(seq): 1 for seq in done}})
+
+    @classmethod
+    def build_kv_connector_stats(cls, data=None) -> KVConnectorStats | None:
+        return HostTierStats(data=data or {})
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if getattr(self, "_dma", None) is None:
+            return set()
+        return self._dma.take_invalid_blocks()
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -641,4 +802,4 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     def shutdown(self) -> None:
         if getattr(self, "_dma", None) is not None:
-            self._dma.flush()
+            self._dma.release()

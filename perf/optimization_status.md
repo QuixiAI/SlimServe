@@ -17613,3 +17613,192 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   unlimited. Metal/MI300X records take effect on those boxes' next
   boots (config-only; the V2 enforcement machine is platform-neutral
   and its suite runs on MPS).
+
+## 2026-09-02 - qwen38fn-fp8-8/rtx3090: fp8 (e4m3) main KV restored and requalified; bf16 mandate reversed
+
+- Operator directive: "we are using FP8 kv cache - that's as opposed to
+  TurboQuant or BF16", and "I think I overreacted to set BF16 mandatory".
+  The 2026-08-29 rtx3090 bf16 mandate is reversed; TurboQuant is NOT the
+  answer for this profile's main KV (an interim TQ edit was reverted on
+  the operator's word before any run).
+- Baseline (bf16 KV, deployed prod, 2026-08-28/29): GPU pool 3.64 GiB/rank
+  = 269,155 tokens = 1.03x one max-length request; exact 1000/2000 seeded
+  c1 129.8-157.8 (median 139.7) / c8 590.7-600.5 / c32 1,091.8-1,199.8.
+- Hypothesis: the fp8-e4m3 main-KV path (removed 2026-08-27, de0b2af8a,
+  when TQ dominated it pre tile-fix) halves the dominant QSA slab and,
+  with the quantized-KV tile fix already in the kernel (block_n 16 /
+  4 warps for KV_FP8 too), no longer pays the wide-tile collapse that
+  produced its old -25% c8.
+- Implementation: reverse-applied de0b2af8a's deletions (env, layer +
+  backend acceptance, aligner branch, arithmetic e4m3 Triton decoder,
+  uint8 view for Triton-on-SM86), then made the profile's own
+  `kv_cache_dtype: fp8` drive it: the QSA layer accepts fp8/fp8_e4m3
+  from cache_config and allocates float8_e4m3fn for the main KV only
+  (indexer compressed cache, raw-key ring, GDN state keep their dtypes);
+  the aligner's page recompute keys off the same selector (a no-op for
+  the profile path, which the generic fp8 sizing already gets right).
+  VLLM_QWEN4_EXP_FP8_MAIN_KV=1 remains the equivalent layer-scoped
+  diagnostic. Parity test restored as tests/models/qwen4_exp/
+  test_qsa_fp8_kv.py plus an all-256-codes e4m3 decode exactness test.
+  Policy: test_no_profile_quantizes_main_kv replaced by
+  test_quantized_main_kv_is_an_explicit_validated_choice (quantized main
+  KV allowed anywhere with a note; rtx3090 record pinned to fp8, no TQ
+  env). 73 slimserve + 128 qwen4_exp tests green.
+- Boot (temp server, port 8001, prod stopped): attention block 800 tokens
+  (bf16: 400) at the same page bytes; Available KV 3.64 GiB/rank ->
+  GPU KV cache 496,174 tokens, 1.89x one max-length request (bf16 1.03x).
+  Graphs 0.47 GiB, activation 0.9, weights+non-torch 18.07 - unchanged.
+- Correctness: host-tier eviction-restore recall (tier_acceptance_8001.py,
+  8K/24K/42K markers, 6x55K churn) PASS - restores 0.5-0.9 s, restored
+  answers match the hot controls (the 24K hot control itself missed, as
+  it has in earlier bf16 runs; restored matched it). Multi-turn
+  state-tracking (6-turn inventory chat, 5 tracked mutations, seeds
+  42/43/44 at temp 1.0) PASS 3/3.
+- Throughput (exact 1000/2000, temp 1.0/top_p 0.95/top_k 20):
+  | c  | fp8 seed42 | fp8 seed43 | bf16 reference          | accept (fp8) |
+  | 1  | 135.7      | -          | 129.8-157.8 (med 139.7) |              |
+  | 8  | 594.2      | 590.4      | 590.7-600.5             | 63.9-66.9%   |
+  | 32 | 1,016.6    | 1,100.9    | 1,091.8-1,199.8         | 58.5-61.9%   |
+  bf16 c8 acceptance was 64.3%: draft acceptance is at parity.
+- Reading: c1 and c8 at parity with bf16. c32 is ~7-8% under bf16 seed
+  for seed (1,016.6 vs 1,091.8; 1,100.9 vs 1,199.8) - the residual cost
+  of the arithmetic e4m3 decode (SM86 has no fp8 cvt) at the 96-row
+  verify width. The old -25% c8 is gone with the tile fix. Next lead to
+  close the c32 gap: replace the ALU decode with a 256-entry LUT or a
+  tighter bit-twiddle in _e4m3_to_bf16 (the 2026-08-27 entry's own
+  follow-up), then re-run c32.
+- Decision: RETAINED. Profile qwen38fn-fp8-8/rtx3090 now states
+  kv_cache_dtype fp8; GPU-resident capacity 1.84x for a c32-only ~7%
+  cost. Production unit was stopped on the operator's instruction and
+  NOT restarted; next command: `sudo systemctl start slimserve-qwen38fn`
+  (the unit runs `slimserve qwen38fn-fp8-8 --serve` and picks up the
+  profile), then confirm "GPU KV cache size: 496,174 tokens" in
+  /var/log/SlimServe/serve.log.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_fp8kv_8001.log,
+  tier_acceptance_fp8kv.log, multiturn_fp8kv.log, bench_fp8kv_c{1,8,32}
+  .log, bench_fp8kv_c{8,32}_seed43.log, run_bench.sh, scripts).
+
+## 2026-09-02 - Host tier 64 -> 88 GiB/rank; pinned-arena power-of-two rounding ROOT-CAUSED and fixed
+
+- Goal (operator): grow the host KV tier as far as the box allows; the
+  operator picked 104 GiB/rank.
+- Baseline: 64 GiB/rank = 11,471 slots x 800 tokens (fp8 KV) = ~9.2M
+  tokens; MemAvailable ~390 GB with prod up.
+- 104 GiB/rank: boot OOM-killed (dmesg: "Out of memory: Killed process
+  VLLM::Worker_TP", shmem-rss 170 GB for the victim). 88 GiB/rank: same
+  kill, and the kernel process table showed every worker at ~121 GB of
+  shmem-backed RSS with 959 GB mapped system-wide - far above the 704 GiB
+  + 48 GiB PLE that 88/rank should cost.
+- ROOT CAUSE: torch's caching pinned allocator rounds pin_memory=True
+  allocations up to the next power of two. 88 and 104 GiB both became
+  128 GiB/rank = 1 TiB across 8 ranks on a 995 GB box; 64 GiB only ever
+  fit because it IS a power of two. Measured directly: a 3 GiB
+  pin_memory tensor took 4,190 MiB of MemAvailable; the same 3 GiB as a
+  plain tensor + cudaHostRegister took 3,118 MiB.
+- FIX (vllm/v1/worker/gpu/kv_tier_dma.py): the arena is a plain host
+  tensor page-locked with cudaHostRegister (portable), exact size;
+  fallback to pin_memory with a warning if registration is refused.
+  KVTierDMA.release() drains and unregisters BEFORE the storage can be
+  freed (the PLE dangling-pinned-page lesson), called from the
+  connector's shutdown and __del__. Regression test: a 1.5 GiB arena
+  must cost 1.5 GiB, not 2 (tests/v1/worker/test_kv_tier_dma.py).
+- Result at 88 GiB/rank (temp server, port 8001): arena 15,773 slots x
+  5,990,400 B (88.0 GiB pinned) per rank = ~12.6M tokens; MemAvailable
+  188 GB with the server up (Shmem 49 GB = PLE table; registered pages
+  are anon, not shmem). Tier acceptance PASS at 8K/24K/42K: restores
+  0.9/1.9/0.9 s vs cold 2.2/6.1/10.0 s, all three recalls correct hot and
+  restored. c8 exact bench 568.8 tok/s (band 547-600; the tier-64 fp8 c8
+  runs were 594.2/590.4) - within run-to-run spread, tier remains
+  throughput-neutral.
+- Decision: 88 GiB/rank RETAINED in the profile (operator asked for 104:
+  with exact sizing that would leave ~60 GB MemAvailable, which is too
+  little margin for prefill staging and page cache on a production box;
+  96 would leave ~124 GB and is the most I would run - operator's call).
+- Artifact note: run_bench.sh reuses bench_fp8kv_c8.log, so the tier-64
+  seed-42 c8 raw log was overwritten by this run and renamed
+  bench_fp8kv_c8_tier88.log; its numbers (594.2 tok/s, accepted
+  8,975/14,046) are recorded in the previous entry and the baseline.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_fp8kv_tier104_8001
+  .log, serve_fp8kv_tier88_8001.log = OOM boots; serve_fp8kv_tier88_fix_
+  8001.log, tier_acceptance_fp8kv_tier88.log, bench_fp8kv_c8_tier88.log).
+
+## 2026-09-02 - NVMe KV tier (third tier) built, unit-proven, live promotion validated under sampling
+
+- Goal (operator): "add nvme offloading" below the pinned-host tier.
+- Design (see the module docstrings): write-through, demotion, promotion.
+  * kv_tier_index.py: every host slot staged for a trajectory gets a disk
+    slot; take_disk_writes() hands (host, disk) pairs to the worker one
+    confirmation after the GPU -> host copy; confirm_disk_writes() clears
+    them once EVERY TP rank reports (HostTierStats rides the connector
+    stats channel, summed by the executor's KVOutputAggregator). Host
+    reclaim demotes a fully-on-disk trajectory (host slots freed, disk
+    copies and resumability kept) and deletes an unwritten one; disk
+    reclaim is LRU per trajectory and kills a disk-only one. A hit on a
+    disk-only position calls promote(): fresh host slots, pending until
+    the request's finished_recving, with (disk, host) reads for the worker.
+  * kv_tier_nvme.py: per-rank O_TMPFILE (vanishes with the process, no
+    collisions between servers) opened O_DIRECT, posix_fallocate'd, a
+    4-thread pool doing pwritev/preadv on arena rows; buffered/named
+    fallbacks with a log line.
+  * kv_tier_dma.py: arena rows are 4 KiB-aligned and padded to a page
+    multiple (5,990,400 -> 5,992,448 B, +0.03%) so a row is a legal
+    O_DIRECT buffer and a file slot; disk writes wait on the copy-stream
+    event of the batch that filled the row; a restore batch carrying (or
+    following) its request's disk reads is DEFERRED until those reads
+    land, then issued to the copy stream as usual; a failed read reports
+    the target GPU blocks through get_block_ids_with_load_errors so the
+    scheduler recomputes instead of reading garbage.
+  * Config: kv_connector_extra_config.nvme_tier_gb_per_rank (0 = off);
+    directory from operator env SLIMSERVE_KV_TIER_DIR (else
+    $SLIMSERVE_CACHE/kv-tier, else ~/.cache/slimserve/kv-tier) - no host
+    path in the profile, per the deployment-config rule.
+- Along the way: cudaHostRegister on a page-aligned sub-view reported
+  is_pinned()=False (a view answers for its storage base), which silently
+  fell back to the power-of-two allocator and then unregistered a
+  cudaHostAlloc pointer, leaving a sticky "invalid argument" for the next
+  CUDA call. Fixed by registering the whole raw buffer and unregistering
+  by that pointer.
+- Tests: 117 green across tests/v1/core (index disk tests: write-through,
+  demotion, promotion + rollback, disk reclaim, tail replacement;
+  connector disk tests: rank-counted confirmation, demotion -> promotion
+  -> finished_recving), tests/v1/worker (NVMe engine round trip, DMA
+  write-through -> promote -> restore bytes, later chunk waits for reads,
+  failed read -> invalid blocks) and tests/slimserve.
+- Live A (port 8001, prod stopped; host tier 2 GiB/rank = 358 slots so
+  the acceptance churn evicts everything; NVMe 32 GiB/rank on the root
+  NVMe): marker recall PASS at 8K/24K/42K, all three restored FROM DISK
+  (log: "promoting ... from NVMe: 13/33/56 reads") in 1.3/1.5/2.5 s vs
+  cold 2.1/6.0/10.0 s and host-tier 0.9/1.9/0.9 s. IO engine: O_DIRECT,
+  4 threads/rank. No errors, no invalid-block reports.
+- Live B (registered profile: host 88 + NVMe 128 GiB/rank): boot OK
+  (22,935 disk slots/rank; MemAvailable 187 GB; root fs 1.3 TB free
+  after fallocate); sampled acceptance 8K/42K OK, 24K restored '' while
+  the hot control answered - the same 24K prompt returned '' on the HOT
+  control in the tier-64 run, so this is sampling behaviour at that
+  prompt, not attributed to the tier; c8 exact 559.5 tok/s (tier-88 no
+  NVMe: 568.8; band 547-600) - write-through is throughput-neutral
+  within spread on one sample each. "KV Transfer metrics:
+  disk_write_batches=N" now appears in the interval log.
+- Greedy diagnostic (A config, diagnostic-only temperature 0): 8K
+  restored byte-identical to hot; 24K/42K share the same opening (the
+  first ~100 chars) and diverge later. Byte identity was never
+  guaranteed: a resume re-prefills the gap above the tail boundary with
+  a different chunk split (the 2026-08-28 bf16 host-tier validation saw
+  42K diverge the same way). The sharpened check (codename recalled AND
+  opening identical) was launched twice and stopped both times before
+  boot completed - it remains OWED for both configs, along with a second
+  c8 sample. Until it runs, the NVMe path's evidence is the sampled
+  acceptance above (the same standard the host tier shipped on).
+- Decision: RETAINED in the profile (nvme_tier_gb_per_rank 128 on the
+  root NVMe). nvme1n1 (3.7 TB, blank, gen3 x2, 1.6 GB/s read) is the
+  intended dedicated device once the operator formats it; then set
+  SLIMSERVE_KV_TIER_DIR to its mount in /etc/slimserve/env and raise the
+  size (460 GiB/rank = ~66M tokens).
+- Next commands:
+    bash perf/results/2026-09-02/qwen38fn-fp8kv/run_nvme_exact.sh
+      (both configs, greedy recall + c8; ~15 min, port 8001)
+    sudo systemctl start slimserve-qwen38fn   (prod, when satisfied)
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A,B}_8001
+  .log, tier_acceptance_nvme_{A,B}.log, tier_exact_nvme_A.log,
+  bench_fp8kv_c8_nvme.log, run_nvme_validation.sh, run_nvme_exact.sh,
+  tier_exact_8001.py).

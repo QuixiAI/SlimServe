@@ -5,6 +5,31 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
+### 8x RTX 3090 Current Baseline - 2026-09-02 (fp8 main KV @ native 262K, host tier on)
+
+- Registered profile as deployed: TP8+EP, max_model_len 262144, main QSA
+  KV fp8 e4m3 (`kv_cache_dtype: fp8`; operator 2026-09-02, replaces the
+  bf16 mandate; NOT TurboQuant), gpu_memory_utilization 0.96, prefix
+  caching, HostTierConnector 88 GiB/rank (15,773 slots, ~12.6M tokens),
+  max_num_seqs 32, capture 96,
+  MTP k=2 + index share, thinking budget 2000.
+- GPU KV pool: 3.64 GiB/rank = 496,174 tokens = 1.89x one max-length
+  request (bf16 held 269,155 = 1.03x). Attention block 800 tokens.
+- Workload: exact 1,000 in / 2,000 out, temp 1.0 / top_p 0.95 / top_k 20,
+  temp server on port 8001, idle box.
+
+| Concurrency | Aggregate tok/s (seed 42 / 43) | Draft acceptance |
+| ---: | ---: | ---: |
+| 1 | 135.7 | - |
+| 8 | 594.2 / 590.4 | 63.9-66.9% |
+| 32 | 1,016.6 / 1,100.9 | 58.5-61.9% |
+
+- vs the bf16 deployed reference (c1 129.8-157.8, c8 590.7-600.5, c32
+  1,091.8-1,199.8): c1/c8 parity, c32 ~7-8% lower seed for seed.
+- Correctness gates passed: tier eviction-restore marker recall, 6-turn
+  multi-turn state tracking x3 seeds.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/.
+
 ### 8x RTX 3090 Current Baseline - 2026-08-27 evening (KV-pool fix + correctness fixes)
 
 - Same registered profile as the "Final Baseline" below plus:

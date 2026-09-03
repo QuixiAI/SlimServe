@@ -54,3 +54,34 @@ def test_empty_batch_is_a_noop():
     _, dma = _dma()
     dma.issue(TierOpBatch(seq=1, offload=[], restore=[]))
     assert dma.flush() == []
+
+
+def _mem_available_mib() -> int:
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) // 1024
+    raise RuntimeError("no MemAvailable")
+
+
+def test_arena_costs_exactly_its_size_not_the_next_power_of_two():
+    """A 1.5 GiB arena must consume ~1.5 GiB of RAM, not 2 GiB.
+
+    torch's caching pinned allocator rounds pin_memory=True allocations up
+    to the next power of two; an 88 GiB/rank arena became 128 GiB/rank and
+    OOM-killed the 8-rank boot on 2026-09-02. The arena is cudaHostRegister'd
+    instead, which pins exactly the pages it owns.
+    """
+    device = torch.device("cuda")
+    stride = 1 << 20
+    slots = 1536  # 1.5 GiB: not a power of two
+    backing = torch.zeros(2 * stride, dtype=torch.int8, device=device)
+    torch.cuda.synchronize()
+    before = _mem_available_mib()
+    dma = KVTierDMA(backing, stride, slots, device)
+    used = before - _mem_available_mib()
+    assert dma.arena.is_pinned()
+    assert dma.arena.numel() == slots * stride
+    # Power-of-two rounding would show ~2048 MiB here.
+    assert 1536 * 0.9 <= used <= 1536 * 1.15, used
+    dma.release()
+    assert not dma.arena.is_pinned()

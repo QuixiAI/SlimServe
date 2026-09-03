@@ -144,6 +144,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_EMULATION_CACHE_WEIGHTS: bool = True
     VLLM_NVFP4_TRITON_GEMM: bool = True
     VLLM_QWEN4_EXP_PLE_HOST: bool = False
+    VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
@@ -1259,12 +1260,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN4_EXP_PLE_HOST": lambda: (
         os.getenv("VLLM_QWEN4_EXP_PLE_HOST", "False").lower() in ("true", "1")
     ),
+    # Store the Qwen4Exp main QSA KV cache in FP8 (unit scale) and dequantize
+    # in the sparse-attention kernel; the indexer cache, raw-key ring and GDN
+    # state keep their own dtypes. Halves the dominant KV-slab term.
+    "VLLM_QWEN4_EXP_FP8_MAIN_KV": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_FP8_MAIN_KV", "False").lower() in ("true", "1")
+    ),
     "VLLM_NVFP4_TRITON_GEMM": lambda: (
         os.getenv("VLLM_NVFP4_TRITON_GEMM", "True").lower() in ("true", "1")
     ),
     # Store the Qwen4Exp main QSA KV as TurboQuant k8v4 (e4b15 keys, 4-bit
     # uniform values with per-slot fp16 scale/zero): ~2.64x smaller than
-    # bf16, decoded in-register by the QSA gather kernel.
+    # bf16, decoded in-register by the QSA gather kernel. Mutually exclusive
+    # with VLLM_QWEN4_EXP_FP8_MAIN_KV.
     "VLLM_QWEN4_EXP_TQ_MAIN_KV": lambda: (
         os.getenv("VLLM_QWEN4_EXP_TQ_MAIN_KV", "False").lower() in ("true", "1")
     ),
