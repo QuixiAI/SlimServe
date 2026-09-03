@@ -18283,3 +18283,41 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   of over", fibonacci body). Matrix v3 (tp8, tp8-ep, tp4dp2, tp4dp2-ep,
   tp4 reference) relaunched with warmup + canary guard; all earlier
   compile-on numbers are void.
+
+## 2026-09-03: GLM-5.3 sparse decode kernel - the real TP8 (and TP4) pathology
+
+- With compile fixed, TP8 c1 still read 10.6 tok/s (matrix v3). Request-
+  side experiment on one TP8 boot with the arm's flags: short prompt 67
+  tok/s, 1000-token prompt 11.4 tok/s. Prompt sweep: decode cost grows
+  ~75 us per context token per step and saturates at the 2048 top-k
+  (155 ms/token). TP4 with the same code: identical curve (84 ms/token at
+  991 tokens). Not TP-specific at all; the 09-02 TP4 70.1 tok/s baseline
+  is not reproducible with the current code and is treated as suspect.
+- Cause: py_mla_decode_bf16_sparse_nope launched mla_decode_fp8_v
+  UNPARTITIONED (one 32-thread warp per (head, token) walking the whole
+  selected list) and the NFP8 == 0 (bf16) row path was the scalar
+  fallback: per selected token, index load -> block-table load -> sixteen
+  64-byte rounds, fully serialized. Microbench (GPU 7, B=1, random KV):
+  H=8 L=2048 7,494 us per call; x11 layers = the observed 80+ ms.
+- Fix 1: partitioned launch + paged_attention_reduce, exactly the GLM fp8
+  path's remedy (which had found the same 48%-of-decode pathology in
+  2026-08). Fix 2: VECBF16 path in mla_kernels.cuh for SPARSE && NFP8==0:
+  32 indices resolved lane-parallel per round, each 1 KB row as two
+  16-byte loads per lane, 4 rows in flight, identical sequential online
+  softmax. Covers the NoPE 512 (GLM-5.3) and bf16 576 (GLM-5.2 bf16 KV,
+  glm52-q2k-8) geometries; the fp8 and DSV4 paths are untouched.
+- Microbench per call (us), H=8 / H=16:
+  | L    | unpart before | unpart after | P256 after | P128 after |
+  | 40   | 192 / 159     | 28 / 23      | 19 / 16    | 22 / 19    |
+  | 1000 | 4404 / 3785   | 559 / 453    | 82 / 66    | 57 / 46    |
+  | 2048 | 7494 / 7732   | 1138 / 919   | 138 / 120  | 74 / 75    |
+  Backend uses partition_size=128. Parity: tests/kernels/
+  test_quixicore_sparse_mla_bf16.py (9 tests: both geometries, P0/P256/
+  P128, interleaved -1 holes, empty rows) at 2e-3 rel vs fp32 torch,
+  identical to the pre-change error; partitioned vs unpartitioned 2.4e-4.
+- Server-side, partition alone (P256, before the row path): TP4 sweep 991
+  tokens 20.3 ms/token (49 tok/s) from 84; profile at 1000 ctx put the
+  kernel at 43.6% of kernel time (1.27 ms/call). Matrix v4 (tp8, tp4,
+  tp8-ep, tp4dp2, tp4dp2-ep) running with both fixes.
+- Owed: glm52-q2k-8 (bf16 KV, TP8) shares the launch and now the row path
+  - its exact-token c1 needs re-measuring; expect a large gain.

@@ -485,9 +485,42 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         (QW == 512) && (VW == 512) && (NFP8 == 448) && (SMODE == 0);
     constexpr int VR = VW / 128;              // full 4-byte rounds (V dims)
     constexpr int TAIL = (QW - VW) / 64;      // 2-byte tail rounds (rope dims)
+    // bf16 sparse latents (NFP8 == 0: GLM-5.3 NoPE 512 and GLM-5.2 bf16 576).
+    // The generic loop below is a per-token dependent chain (index -> block
+    // table -> sixteen 64-byte rounds) measured at ~4 us per selected token
+    // per warp. This path resolves 32 indices per lane-parallel round, reads
+    // each row as 16-byte vectors per lane (dims [8*lane + 256*i, +8)) and
+    // keeps BF_G rows in flight, with the identical sequential online-softmax
+    // update so partials and the reduce stay exact.
+    constexpr bool VECBF16 = SPARSE && (NFP8 == 0) && (VW % 256 == 0) &&
+                             (((QW - VW) * 2) % 16 == 0) &&
+                             ((QW - VW) * 2 <= 512);
+    constexpr int BF_NR = VW / 256;                    // full 512 B rounds
+    constexpr int BF_TAILB = (QW - VW) * 2;            // rope tail bytes
+    constexpr int BF_TL = BF_TAILB / 16;               // lanes owning tail
+    constexpr int BF_G = 4;                            // rows in flight
 
     float qv[QPL];
-    if constexpr (VECDSV4) {
+    float qtail[8];
+    if constexpr (VECBF16) {
+        #pragma unroll
+        for (int i = 0; i < BF_NR; ++i) {
+            const uint4 w = *reinterpret_cast<const uint4*>(
+                &q[q_base + 8 * lane + 256 * i]);
+            const bf16* qb = reinterpret_cast<const bf16*>(&w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) qv[8 * i + k] = float(qb[k]);
+        }
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) qtail[k] = 0.0f;
+        if (BF_TL > 0 && lane < BF_TL) {
+            const uint4 w = *reinterpret_cast<const uint4*>(
+                &q[q_base + VW + 8 * lane]);
+            const bf16* qb = reinterpret_cast<const bf16*>(&w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) qtail[k] = float(qb[k]);
+        }
+    } else if constexpr (VECDSV4) {
         #pragma unroll
         for (int i = 0; i < 3; ++i) {
             const bf16* src = &q[q_base + 4 * lane + 128 * i];
@@ -548,6 +581,95 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
     for (int i = 0; i < VPL; i++) acc[i] = 0.0f;
     float m = MLA_NEG_INF, l = 0.0f;
 
+    if constexpr (VECBF16) {
+    const bool packed_page = source_page_stride_bytes > 0;
+    for (int j0 = j_beg; j0 < j_end; j0 += 32) {
+        // Lane-parallel resolution of up to 32 indices: one index load and
+        // one block-table load per lane instead of per token per warp.
+        int my_block = -1, my_slot = 0;
+        const int jj = j0 + lane;
+        if (jj < j_end) {
+            const int t = source_indices[batch * source_max_topk + jj];
+            if (t >= 0) {
+                if (source_indices_are_slots) {
+                    const int blk = int(int64_t(t) / source_block_size);
+                    if (!(source_num_cache_blocks > 0 &&
+                          blk >= source_num_cache_blocks)) {
+                        my_block = blk;
+                        my_slot = t - blk * source_block_size;
+                    }
+                } else {
+                    const int col = t / source_block_size;
+                    if (col >= 0 && col < source_bt_stride) {
+                        const int blk =
+                            source_block_table[batch * source_bt_stride + col];
+                        if (blk >= 0 &&
+                            !(source_num_cache_blocks > 0 &&
+                              blk >= source_num_cache_blocks)) {
+                            my_block = blk;
+                            my_slot = t - col * source_block_size;
+                        }
+                    }
+                }
+            }
+        }
+        const int n = min(32, j_end - j0);
+        for (int g = 0; g < n; g += BF_G) {
+            uint4 w[BF_G][BF_NR];
+            uint4 wt[BF_G];
+            bool ok[BF_G];
+            #pragma unroll
+            for (int u = 0; u < BF_G; ++u) {
+                const int src = min(g + u, 31);
+                const int blk = __shfl_sync(0xffffffffu, my_block, src);
+                const int slt = __shfl_sync(0xffffffffu, my_slot, src);
+                ok[u] = (g + u < n) && (blk >= 0);
+                if (ok[u]) {
+                    const int64_t dbase = packed_page
+                        ? int64_t(blk) * source_page_stride_bytes +
+                              int64_t(slt) * SLOT_BYTES
+                        : (int64_t(blk) * source_block_size + slt) * SLOT_BYTES;
+                    const uint8_t* row = source_data_cache + dbase;
+                    #pragma unroll
+                    for (int i = 0; i < BF_NR; ++i)
+                        w[u][i] = *reinterpret_cast<const uint4*>(
+                            row + 16 * lane + 512 * i);
+                    if (BF_TL > 0 && lane < BF_TL)
+                        wt[u] = *reinterpret_cast<const uint4*>(
+                            row + VW * 2 + 16 * lane);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < BF_G; ++u) {
+                if (!ok[u]) continue;
+                float lat[QPL];
+                float partial = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < BF_NR; ++i) {
+                    const bf16* vb = reinterpret_cast<const bf16*>(&w[u][i]);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        lat[8 * i + k] = float(vb[k]);
+                        partial += qv[8 * i + k] * lat[8 * i + k];
+                    }
+                }
+                if (BF_TL > 0 && lane < BF_TL) {
+                    const bf16* tb = reinterpret_cast<const bf16*>(&wt[u]);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) partial += qtail[k] * float(tb[k]);
+                }
+                const float score = warp_sum_f(partial) * scale;
+                const float nm = fmaxf(m, score);
+                const float alpha = (l == 0.0f) ? 0.0f : expf(m - nm);
+                const float beta = expf(score - nm);
+                #pragma unroll
+                for (int i = 0; i < VPL; i++) acc[i] = acc[i] * alpha + beta * lat[i];
+                l = l * alpha + beta;
+                m = nm;
+            }
+        }
+    }
+    } else {
     for (int j = j_beg; j < j_end; j++) {
         const int t = SPARSE ? source_indices[batch * source_max_topk + j] : j;
         if (SPARSE && t < 0) continue;
@@ -688,6 +810,7 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         l = l * alpha + beta;
         m = nm;
     }
+    }  // VECBF16 / generic
     if (PART) {
         const int reduce_partitions =
             total_partitions > 0 ? total_partitions : num_partitions;
@@ -706,7 +829,18 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
             continue;
         }
         const int64_t ob = stat * VW;
-        if constexpr (VECDSV4) {
+        if constexpr (VECBF16) {
+            #pragma unroll
+            for (int i = 0; i < BF_NR; ++i) {
+                float4 a, b;
+                a.x = acc[8 * i] / l;     a.y = acc[8 * i + 1] / l;
+                a.z = acc[8 * i + 2] / l; a.w = acc[8 * i + 3] / l;
+                b.x = acc[8 * i + 4] / l; b.y = acc[8 * i + 5] / l;
+                b.z = acc[8 * i + 6] / l; b.w = acc[8 * i + 7] / l;
+                *reinterpret_cast<float4*>(&tmp_out[ob + 8 * lane + 256 * i]) = a;
+                *reinterpret_cast<float4*>(&tmp_out[ob + 8 * lane + 256 * i + 4]) = b;
+            }
+        } else if constexpr (VECDSV4) {
             #pragma unroll
             for (int i = 0; i < 3; ++i) {
                 float4 v;
@@ -742,7 +876,17 @@ __global__ void mla_decode_fp8_v(const bf16* q, const uint8_t* data_cache,
         }
     } else {
         const int64_t out_base = (int64_t(batch) * num_heads + head) * VW;
-        if constexpr (VECDSV4) {
+        if constexpr (VECBF16) {
+            #pragma unroll
+            for (int i = 0; i < BF_NR; ++i) {
+                bf16 v[8];
+                #pragma unroll
+                for (int k = 0; k < 8; ++k)
+                    v[k] = (l == 0.0f) ? bf16(0.0f) : bf16(acc[8 * i + k] / l);
+                *reinterpret_cast<uint4*>(&out[out_base + 8 * lane + 256 * i]) =
+                    *reinterpret_cast<const uint4*>(v);
+            }
+        } else if constexpr (VECDSV4) {
             #pragma unroll
             for (int i = 0; i < 3; ++i) {
                 bf16 v[4];

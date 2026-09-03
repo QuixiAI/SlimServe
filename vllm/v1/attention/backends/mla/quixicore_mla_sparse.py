@@ -352,9 +352,15 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             if q.shape[-1] == 512:
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                # Partitioned (128 -> 17 partitions at the 2080-wide list):
+                # the one-warp-per-(head, token) walk was 155 ms/token at
+                # TP8 with the 2048 top-k (8 warps per rank). Microbench
+                # H=8 L=2048: unpartitioned 1138 us, P256 138 us, P128 74 us
+                # per call with the vectorized bf16 row path.
                 return quixicore_ops.mla_decode_bf16_sparse_nope(
                     q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
                     attn_metadata.block_size, self.softmax_scale,
+                    partition_size=128,
                 ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
                 q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
