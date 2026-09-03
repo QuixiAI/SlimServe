@@ -54,6 +54,7 @@ logger = init_logger(__name__)
 # Row layout of the cached indexer state.
 _K_DIM = 128
 _ROW_DIM = 2 * _K_DIM  # [k | gate]
+_POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
@@ -133,52 +134,62 @@ def _pooled_logits_kernel(
     ROW: tl.constexpr,
     BLOCK_P: tl.constexpr,
 ):
+    """Pooled indexer logits for one query row. The grid's second axis is a
+    FIXED number of programs (CUDA-graph safe); each strides over the
+    row's pool tiles up to its actual visible count, so the work is
+    proportional to the context, not to max_model_len. Sizing the grid by
+    max_model_len // KP cost 16,384 programs per row per layer at the
+    1M-token default, each reloading q and APE and storing -inf for pools
+    the top-k never reads: 20 ms per sequence per decode step."""
     r = tl.program_id(0)
     pb = tl.program_id(1)
+    G = tl.num_programs(1)
     vis = tl.load(vis_ptr + r)
     n_pools = vis // KP
+    n_tiles = (n_pools + BLOCK_P - 1) // BLOCK_P
     req = tl.load(row_req_ptr + r)
 
-    p = pb * BLOCK_P + tl.arange(0, BLOCK_P)  # [P]
-    pmask = p < n_pools
     m = tl.arange(0, KP)  # [KP]
-    tok = p[:, None] * KP + m[None, :]  # [P, KP]
-    blk = tl.load(
-        bt_ptr + req.to(tl.int64) * bt_stride + tok // BLOCK_SIZE,
-        mask=pmask[:, None],
-        other=0,
-    )
-    slot = blk.to(tl.int64) * BLOCK_SIZE + (tok % BLOCK_SIZE)  # [P, KP]
     d = tl.arange(0, D)
-    base = cache_ptr + slot[:, :, None] * ROW  # [P, KP, 1]
-    k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
-    g = tl.load(
-        base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0
-    )
-    ape = tl.load(ape_ptr + m[:, None] * D + d[None, :])  # [KP, D]
-    logits_g = g.to(tl.float32) + ape[None, :, :]  # [P, KP, D]
-    # softmax over the pool members (axis 1), per channel
-    mx = tl.max(logits_g, axis=1)  # [P, D]
-    e = tl.exp(logits_g - mx[:, None, :])
-    probs = e / tl.sum(e, axis=1)[:, None, :]
-    pool_key = tl.sum(probs * k.to(tl.float32), axis=1)  # [P, D]
-
     h = tl.arange(0, H)
+    ape = tl.load(ape_ptr + m[:, None] * D + d[None, :])  # [KP, D]
     q = tl.load(q_ptr + (r.to(tl.int64) * H + h[:, None]) * D + d[None, :])
-    q = q.to(tl.float32)  # [H, D]
+    qb = q.to(tl.bfloat16)  # [H, D]
     w = tl.load(w_ptr + r * H + h)  # [H]
-    # scores[P, H] = relu(scale * pool_key . q_h)
-    scores = tl.dot(pool_key.to(tl.bfloat16), tl.trans(q.to(tl.bfloat16)))
-    scores = tl.maximum(scores * softmax_scale, 0.0)
-    logit = tl.sum(scores * w[None, :], axis=1)  # [P]
-    logit = tl.where(pmask, logit, float("-inf"))
-    omask = p < max_pools
-    tl.store(out_ptr + r.to(tl.int64) * max_pools + p, logit, mask=omask)
+
+    for tile in range(pb, n_tiles, G):
+        p = tile * BLOCK_P + tl.arange(0, BLOCK_P)  # [P]
+        pmask = p < n_pools
+        tok = p[:, None] * KP + m[None, :]  # [P, KP]
+        blk = tl.load(
+            bt_ptr + req.to(tl.int64) * bt_stride + tok // BLOCK_SIZE,
+            mask=pmask[:, None],
+            other=0,
+        )
+        slot = blk.to(tl.int64) * BLOCK_SIZE + (tok % BLOCK_SIZE)  # [P, KP]
+        base = cache_ptr + slot[:, :, None] * ROW  # [P, KP, 1]
+        k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
+        g = tl.load(
+            base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0
+        )
+        logits_g = g.to(tl.float32) + ape[None, :, :]  # [P, KP, D]
+        # softmax over the pool members (axis 1), per channel
+        mx = tl.max(logits_g, axis=1)  # [P, D]
+        e = tl.exp(logits_g - mx[:, None, :])
+        probs = e / tl.sum(e, axis=1)[:, None, :]
+        pool_key = tl.sum(probs * k.to(tl.float32), axis=1)  # [P, D]
+        # scores[P, H] = relu(scale * pool_key . q_h)
+        scores = tl.dot(pool_key.to(tl.bfloat16), tl.trans(qb))
+        scores = tl.maximum(scores * softmax_scale, 0.0)
+        logit = tl.sum(scores * w[None, :], axis=1)  # [P]
+        logit = tl.where(pmask, logit, float("-inf"))
+        omask = p < max_pools
+        tl.store(out_ptr + r.to(tl.int64) * max_pools + p, logit, mask=omask)
 
 
 @triton.jit
 def _expand_topk_kernel(
-    sel_ptr,        # [R, KSEL] int32 pool indices (-1 invalid)
+    sel_ptr,        # [R, KSEL] int32 pool indices (-1 invalid), valid first
     vis_ptr,        # [R] int32
     out_ptr,        # [R, OUT_W] int32
     sel_stride,
@@ -187,36 +198,39 @@ def _expand_topk_kernel(
     OUT_W: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
+    """Expand selected pools to tokens, then append the incomplete tail
+    pool's tokens IMMEDIATELY after the last valid expanded entry, then
+    -1 padding. The sparse decode kernel walks [0, last_valid + 1), so
+    valid entries must stay contiguous: a tail parked at column
+    KSEL*KP would force a full 2048-slot walk for every query."""
     r = tl.program_id(0)
     vis = tl.load(vis_ptr + r)
     n_pools = vis // KP
     tail_count = vis - n_pools * KP
     tail_start = n_pools * KP
+    n_sel = tl.minimum(n_pools, KSEL)  # top-k writes valid pools first
     for s0 in range(0, KSEL, BLOCK_S):
         s = s0 + tl.arange(0, BLOCK_S)
         smask = s < KSEL
         pool = tl.load(sel_ptr + r.to(tl.int64) * sel_stride + s, mask=smask, other=-1)
         ok = smask & (pool >= 0) & (pool < n_pools)
         m = tl.arange(0, KP)
-        tokens = pool[:, None] * KP + m[None, :]
-        tokens = tl.where(ok[:, None], tokens, -1)
+        tokens = tl.where(ok[:, None], pool[:, None] * KP + m[None, :], -1)
         tl.store(
             out_ptr + r.to(tl.int64) * OUT_W + s[:, None] * KP + m[None, :],
             tokens,
             mask=smask[:, None],
         )
-    # tail + padding: columns [KSEL*KP, OUT_W)
-    c = KSEL * KP + tl.arange(0, KP)
+    # tail right after the valid pools, then pad the rest of the row
+    tcol = n_sel * KP + tl.arange(0, KP)
     tail = tl.arange(0, KP)
     tval = tl.where(tail < tail_count, tail_start + tail, -1)
-    tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tval, mask=c < OUT_W)
-    # any remaining columns (OUT_W padded past KSEL*KP + KP) are -1
-    extra = KSEL * KP + KP + tl.arange(0, 32)
-    tl.store(
-        out_ptr + r.to(tl.int64) * OUT_W + extra,
-        tl.full((32,), -1, tl.int32),
-        mask=extra < OUT_W,
-    )
+    tl.store(out_ptr + r.to(tl.int64) * OUT_W + tcol, tval, mask=tcol < OUT_W)
+    pad0 = n_sel * KP + KP
+    for c0 in range(0, OUT_W, 256):
+        c = c0 + tl.arange(0, 256)
+        cm = (c >= pad0) & (c < OUT_W)
+        tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
 
 
 # --------------------------------------------------------------------- core op
@@ -242,7 +256,9 @@ def _pooled_select(
     if R == 0:
         return
     BLOCK_P = 16
-    grid = (R, triton.cdiv(max_pools, BLOCK_P))
+    # Fixed program count per row; each program strides over the row's
+    # actual pool tiles (see the kernel docstring).
+    grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
     _pooled_logits_kernel[grid](
         q, weights, ape, cache, block_table, row_req, visible,
         logits, max_pools, block_table.stride(0), softmax_scale,

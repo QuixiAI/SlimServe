@@ -47,6 +47,27 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+_BF16_PARTITION = 128
+_BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
+
+
+def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
+    """Partition size for the bf16 sparse decode launches.
+
+    Partitioning exists to expose parallelism at small token counts (a
+    decode step is B x H warps, 8 at TP8/c1). Its scratch is
+    B x H x P x 512 fp32; this MQA path also serves prefill chunks, where
+    B is thousands of tokens and the scratch reached 3.4 GiB and OOMed
+    glm52-q2k-8 (2026-09-03). Above the cap the unpartitioned launch is
+    already B x H warps wide, so partition only while the scratch is small.
+    """
+    B, H = q.shape[0], q.shape[1]
+    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
+        return 0
+    return _BF16_PARTITION
+
+
 class QuixiCoreMLASparseBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
     # The sparse decode kernel reads the latent cache as packed e4m3 + scales
@@ -352,13 +373,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             if q.shape[-1] == 512:
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                # Partitioned (128 -> 17 partitions at the 2080-wide list):
+                # the one-warp-per-(head, token) walk was 155 ms/token at
+                # TP8 with the 2048 top-k (8 warps per rank). Microbench
+                # H=8 L=2048: unpartitioned 1138 us, P256 138 us, P128 74 us
+                # per call with the vectorized bf16 row path.
                 return quixicore_ops.mla_decode_bf16_sparse_nope(
                     q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
                     attn_metadata.block_size, self.softmax_scale,
+                    partition_size=_bf16_partition(q, idx),
                 ), None
             return quixicore_ops.mla_decode_bf16_sparse_glm(
                 q, kv_c_and_k_pe_cache.reshape(-1), bt, idx, tlen,
                 attn_metadata.block_size, self.softmax_scale,
+                partition_size=_bf16_partition(q, idx),
             ), None
 
         if self._k_scale_host is None:

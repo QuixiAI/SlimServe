@@ -18220,6 +18220,274 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   bench_fp8kv_c8_nvme.log, run_nvme_validation.sh, run_nvme_exact.sh,
   tier_exact_8001.py).
 
+
+## 2026-09-02: GLM-5.3 8-GPU configuration matrix - first pass was a measurement artifact
+
+- First matrix (TP8, TP8+EP, TP4xDP2, TP4xDP2+EP; exact-token 1000/300 at
+  c1/c8/c16) read TP8 at 10.3 / 71.1 / 124.4 tok/s - 7x SLOWER than TP4 -
+  and identical with EP (10.2 / 70.5 / 123.5), so the MoE shard width was
+  not it. Topology exonerated (full NV12 mesh). DP2 arms died on a fresh
+  regression of mine (support_torch_compile wants vllm_config by keyword).
+- Profiling (torch profiler, rank 0, 32 c1 decode tokens after warmup):
+  TP8 step median 9.5 ms (~105 tok/s) vs TP4 10.7 ms (~93 tok/s) - TP8
+  is FASTER once warm. The matrix's 10 tok/s was cold Triton autotune /
+  compile of never-seen 8-rank shapes running inside the measured window
+  (the arm only ran an 8-token canary first). Every arm now warms c1/c8/
+  c16 before measuring; the same rule applies to all future baselines.
+- Two real fixes fell out of the profile:
+  1. My pooled-indexer expand kernel parked the tail pool at column 2048,
+     so the sparse decode kernel's tlen (last valid + 1) was always >= 2049
+     and it walked every padded slot: mla_decode_fp8_v cost 258 us/call
+     at TP8 for a 40-token context. Tail now follows the last valid
+     expanded entry: 130 us/call, kernel time per step -26%. Parity test
+     still exact.
+  2. torch.compile was never active on glm5_next (no support_torch_compile;
+     DSV4's A100 model is not compiled either). Enabled: the quixicore mHC
+     kernels are wrapped as registered custom ops with fake impls
+     (layers/glm5_next_mhc_ops.py) so Dynamo can trace the decoder. c1
+     TP4: 70 -> ~93 tok/s from compile alone.
+- Remaining per-token cost at TP8 (rank 0): custom allreduce 1stage<8>
+  21% (~28 us/call x 91/token; the 1-stage algorithm reads N-1 peers, so
+  8 ranks pay ~2x TP4's 4-rank calls), fused mHC pre-transition 14%,
+  sparse decode 12%, marlin MoE 11%, cuBLAS GEMV 13%. Matrix v2 (with TP4
+  reference) running to pick the 8-GPU record.
+
+## 2026-09-03: torch.compile on glm5_next produced garbage tokens - two tracing faults, fixed
+
+- CORRECTION to the entry above: the "+33% from compile" TP4 step-rate
+  and the TP8 9.5 ms profile were measured on a model emitting garbage
+  (`!!!!!!!!`). Neither profile run checked text. Every arm now aborts on
+  a bad canary before it measures anything.
+- Bisect (TP4 boots, 2 at a time on GPU halves): compile off with the
+  tail fix + mHC op wrappers -> clean; compile on -> garbage; Dynamo-only
+  (mode 2) -> garbage; inductor with every vLLM fusion pass off ->
+  garbage. So a tracing fault, not codegen.
+- Fault 1: the pooled indexer op mutates topk_indices_buffer, which the
+  sparse attention op (a splitting op, i.e. the NEXT subgraph) reads
+  through a side channel. fix_functionalization left it as an
+  auto_functionalized node with only a warning ("inductor will fail" -
+  it no longer does, it lowers copy-in/copy-out and the write never lands
+  where the reader looks). Fixed by listing vllm::glm5_next_pooled_indexer
+  in CompilationConfig._attention_ops (upstream does the same for
+  sparse_attn_indexer), and the leftover warning is now a hard error.
+- Fault 2 (the one that actually produced the garbage): the fork's
+  KimiGatedDeltaNetAttention core (_forward) reads get_forward_context()
+  and the per-layer GDN metadata directly in Python; no custom op wraps
+  it (Kimi-K3 is never compiled here). Dynamo traced the dummy run's
+  metadata into the graph. vllm::kda_attention was already in the
+  splitting list but no op of that name existed. Registered it
+  (mutates core_attn_out, looks the layer up by prefix in
+  no_compile_layers) and routed the layer through it; the eager Kimi path
+  runs the same op body unchanged.
+- Result: TP4 + compile canary clean ("Paris, a city with a population
+  of over", fibonacci body). Matrix v3 (tp8, tp8-ep, tp4dp2, tp4dp2-ep,
+  tp4 reference) relaunched with warmup + canary guard; all earlier
+  compile-on numbers are void.
+
+## 2026-09-03: GLM-5.3 sparse decode kernel - the real TP8 (and TP4) pathology
+
+- With compile fixed, TP8 c1 still read 10.6 tok/s (matrix v3). Request-
+  side experiment on one TP8 boot with the arm's flags: short prompt 67
+  tok/s, 1000-token prompt 11.4 tok/s. Prompt sweep: decode cost grows
+  ~75 us per context token per step and saturates at the 2048 top-k
+  (155 ms/token). TP4 with the same code: identical curve (84 ms/token at
+  991 tokens). Not TP-specific at all; the 09-02 TP4 70.1 tok/s baseline
+  is not reproducible with the current code and is treated as suspect.
+- Cause: py_mla_decode_bf16_sparse_nope launched mla_decode_fp8_v
+  UNPARTITIONED (one 32-thread warp per (head, token) walking the whole
+  selected list) and the NFP8 == 0 (bf16) row path was the scalar
+  fallback: per selected token, index load -> block-table load -> sixteen
+  64-byte rounds, fully serialized. Microbench (GPU 7, B=1, random KV):
+  H=8 L=2048 7,494 us per call; x11 layers = the observed 80+ ms.
+- Fix 1: partitioned launch + paged_attention_reduce, exactly the GLM fp8
+  path's remedy (which had found the same 48%-of-decode pathology in
+  2026-08). Fix 2: VECBF16 path in mla_kernels.cuh for SPARSE && NFP8==0:
+  32 indices resolved lane-parallel per round, each 1 KB row as two
+  16-byte loads per lane, 4 rows in flight, identical sequential online
+  softmax. Covers the NoPE 512 (GLM-5.3) and bf16 576 (GLM-5.2 bf16 KV,
+  glm52-q2k-8) geometries; the fp8 and DSV4 paths are untouched.
+- Microbench per call (us), H=8 / H=16:
+  | L    | unpart before | unpart after | P256 after | P128 after |
+  | 40   | 192 / 159     | 28 / 23      | 19 / 16    | 22 / 19    |
+  | 1000 | 4404 / 3785   | 559 / 453    | 82 / 66    | 57 / 46    |
+  | 2048 | 7494 / 7732   | 1138 / 919   | 138 / 120  | 74 / 75    |
+  Backend uses partition_size=128. Parity: tests/kernels/
+  test_quixicore_sparse_mla_bf16.py (9 tests: both geometries, P0/P256/
+  P128, interleaved -1 holes, empty rows) at 2e-3 rel vs fp32 torch,
+  identical to the pre-change error; partitioned vs unpartitioned 2.4e-4.
+- Server-side, partition alone (P256, before the row path): TP4 sweep 991
+  tokens 20.3 ms/token (49 tok/s) from 84; profile at 1000 ctx put the
+  kernel at 43.6% of kernel time (1.27 ms/call). Matrix v4 (tp8, tp4,
+  tp8-ep, tp4dp2, tp4dp2-ep) running with both fixes.
+- Owed: glm52-q2k-8 (bf16 KV, TP8) shares the launch and now the row path
+  - its exact-token c1 needs re-measuring; expect a large gain.
+
+## 2026-09-03: GLM-5.3 8-GPU configuration matrix v4 - decision: glm53-nvfp4-8 = TP8, EP off
+
+Exact-token 1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20 seed 42,
+each concurrency warmed first, canary-guarded, compile on, partitioned +
+vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
+<arm>/exact_c{1,8,16}.json (v4 overwrote the void v1 numbers in place).
+
+| arm            | c1   | c8    | c16   |
+|----------------|------|-------|-------|
+| tp8            | 83.0 | 343.7 | 447.7 |
+| tp8-ep         | 75.3 | 331.1 | 430.8 |
+| tp4dp2         | 67.2 | 382.8 | 527.6 |
+| tp4dp2-ep      | 51.3 | 317.0 | 480.1 |
+| tp4 (4 GPUs)   | 73.6 | 282.6 | 369.9 |
+
+- EP loses at every point on both 8-GPU layouts (as it did at TP4 on
+  09-02): the 288-expert MoE at 36 experts/rank is not routing-bound, and
+  EP adds the all-to-all on top of the same GEMMs.
+- TP8 vs TP4: +13% c1, +22% c8, +21% c16. Below the 50% scaling gate.
+  Sharded work (marlin MoE, GEMVs, KDA, attention) halves per rank; the
+  replicated per-rank work does not: 91 custom allreduces/token at 8
+  ranks (1-stage reads 7 peers), the mHC stream kernels (T x 4 x 4096 per
+  layer, replicated on every rank), the pooled indexer (replicated). That
+  fixed cost is why TP4xDP2 - two independent TP4 engines - wins c8/c16
+  by 11-18% while losing c1 by 19%.
+- Decision: TP8, EP off. Single-stream latency is best, and DP2 splits the
+  prefix cache and KV pool across two engines with no prefix-aware
+  routing - for the agentic traffic the serving policy is written for
+  (long shared prefixes, near-100% hit rate) that is the wrong trade.
+  DP2's throughput lead is recorded as the size of the TP8 fixed-cost
+  gap; fusing the mHC transition with the allreduce (the DSV4 path's
+  approach) and de-duplicating the replicated indexer are the next items.
+- glm53-nvfp4-4 re-measured on the same stack: 73.6 / 282.6 / 369.9 vs the
+  09-02 record 70.1 / 331.4 / -. c1 up with the kernel fix + compile, c8
+  DOWN 15%: not yet explained (the 09-02 c8 predates the tail fix, compile,
+  and the partitioned kernel). Owed: a c8 profile at TP4 to find it.
+- Follow-up on the 09-01 TP4 c8 331.4: its deep-context leg the same day
+  averaged ~14 tok/s aggregate at c8 near 116K context (62,538 completion
+  tokens in the 1.25 h wall), consistent with the OLD unpartitioned
+  kernel walking the full 2048-entry selection at depth. Only the 1000-
+  token c8 (7.2 s wall for 8 x 300 tokens) does not fit the old kernel's
+  measured per-token cost; it stays UNEXPLAINED and is not used as a
+  baseline. Today's 282.6 is the number of record for glm53-nvfp4-4 c8.
+
+## 2026-09-03: glm53-nvfp4-8 through the real profile - indexer cost was proportional to max_model_len
+
+- First boot of the record (TP8, EP off, model-default 1,048,576 context,
+  max_num_seqs 32): canaries pass (text + reasoning, image "a red
+  square", get_weather tool call) but exact-token c1 / c8 / c16 read
+  32.8 / 47.2 / 48.7 - flat across concurrency, ~20 ms per sequence per
+  step. The arm had measured 83 / 344 / 448 with the same flags at
+  max_model_len 32768.
+- Cause: _pooled_logits_kernel launched grid (R, max_pools / 16) with
+  max_pools = max_model_len // 4: 16,384 programs per row per layer at
+  1M, every one reloading q (32 KB) and APE, running a tl.dot on masked
+  zeros and storing -inf logits the top-k never reads (~600 MB of reads
+  per row per layer). Fixed grid of 128 programs per row, each striding
+  over the row's ACTUAL pool tiles, q/APE loaded once per program. Parity
+  vs the transformers indexer unchanged (tests/glm5_next).
+- Same profile after the fix: c1 84.0 / c8 412.3 / c16 575.8 tok/s.
+  Raw: perf/results/2026-09-03/glm53-nvfp4-8-baseline/. The arms also
+  paid this (512 programs/row at 32K), so the matrix table above
+  understates every arm at c8/c16; the ordering (EP off, TP8 vs DP2 on
+  c1 + cache locality) is unchanged and TP8 now leads DP2's old c16 too.
+- glm53-nvfp4-4 is being re-measured through its profile on this stack
+  for the scaling comparison.
+
+### glm53-nvfp4-8 deep-context leg (WildChat c8, 1.25 h): PASS
+- 0 errors, 34/34 recall probes, max ctx 202,509 / median 190,704 (the
+  TP8 pool is twice the TP4 record's, so sessions ran ~60K deeper than
+  the TP4 leg's 131,680 max). 97,378 completion tokens over the 4,554 s
+  wall vs the TP4 leg's 62,538 (+56% at depth, where the partitioned
+  sparse decode does the most work). 131K-200K bucket: TTFT p50 59 s,
+  e2e p50 279 s (72 turns). Raw: perf/results/2026-09-03/glm53-leg/
+  glm53-nvfp4-8/. Text and image canaries under load: see post_evidence.
+
+## 2026-09-03: fused allreduce + mHC transition for GLM-5.3 - REJECTED (no gain), plus a compile-cache A/B hazard
+
+- Hypothesis: TP8's replicated per-rank cost (91 custom allreduces per
+  token, replicated mHC) is the scaling gap; DSV4's A100 path fuses the
+  allreduce into the mHC transition (custom_all_reduce all_reduce_dsv4_mhc,
+  single-token steps). Implemented for glm5_next: o_proj and MoE reduce
+  deferred into a glm5_mhc_ar_fused_post_pre op (fused op at T == 1,
+  allreduce + fused kernel otherwise).
+- Measured at TP8, arm launch (32K, exact-token): fused c1 85.5 / c8 421.0
+  (registered-buffer variant), copy-in variant 84.7 / 422.6, vs the
+  committed path 84.0 (profile) - within noise. The merged kernel saves one
+  launch per site but the mHC math is still replicated on every rank; the
+  win DSV4 gets comes from channel OWNERSHIP (each rank transitions a
+  4096/TP slice, VLLM_DSV4_TP_OWNERSHIP), a much deeper integration
+  (owned projections, Q2 progress schedule) than the transition op alone.
+  Dropped; the tree carries none of it.
+- Hazard found while A/B-ing: an env-gated branch inside a
+  torch.compile'd forward (VLLM_GLM5_FUSED_MHC_AR read in __init__, traced
+  as a constant) does NOT change the compile cache key - the key is
+  envs.compile_factors() (a fixed VLLM_* list) + config + compiler + the
+  traced files' contents. The "unfused" arm loaded the fused arm's graph:
+  identical degenerate greedy texts in both, and the committed tree was
+  clean. Rule: A/B compiled paths only via distinct code (git stash/
+  worktree) or a factor that is in the cache key; never a private env var.
+- Next for the TP8 scaling gap: measure first - a TP8 profile at 1000-token
+  context on the current stack to size allreduce / mHC / indexer shares -
+  then channel ownership if the replicated mHC dominates.
+
+## 2026-09-03: glm52-q2k-8 (bf16 KV, TP8) first exact-token numbers - the same unpartitioned launch
+
+- Through the profile (202752 ctx): c1 9.6 / c8 64.7 / c16 110.4 tok/s;
+  text (+reasoning), image, tool canaries pass. Raw: perf/results/
+  2026-09-03/glm52-q2k-8-prepartition/. This record never had an exact-token
+  baseline (only its 2026-08-30 deep-context leg).
+- The bf16 GLM 576 entry point (mla_decode_bf16_sparse_glm) got today's
+  VECBF16 row path but was still launched unpartitioned: 8 local heads x
+  one warp each walking the whole selection across GLM-5.2's MLA layers.
+  Partitioned launch (P128 + reduce, exactly the fp8 GLM and NoPE fix)
+  added; re-measure follows.
+
+## 2026-09-03: TP8 kernel profile at 1000-token context (current stack) - the remaining budget
+
+Torch profiler, rank 0, 32 decode tokens after a 1000-token prompt, arm
+launch. Kernel time 514 ms (the window also caught the prompt's prefill:
+the partials<24> and 2stage-allreduce rows are prefill-only). Decode per
+token, approximate:
+
+| kernel                              | share | ms/token | per call        |
+|-------------------------------------|-------|----------|-----------------|
+| Marlin NVFP4 MoE (W4A16)            | 13.4% | 2.15     | 84 calls, 26 us |
+| cuBLAS GEMV (q/kv/KDA/o projections)| 13.1% | 2.1      | ~280 calls      |
+| mHC fused_pre_transition (T=1)      |  8.4% | 1.35     | 90 calls, 16 us |
+| sparse MLA decode (P128) + reduce   |  7.0% | 1.1      | 11 calls, 84 us |
+| pooled indexer logits               |  4.5% | 0.72     | 11 calls, 65 us |
+| custom allreduce 1stage<8>          |  4.1% | 0.65     | 88 calls, 7 us  |
+| direct_copy (contiguous() etc.)     |  3.3% | 0.53     | ~150 calls      |
+| MoE topk / align / gemm tails       |  ~7%  | 1.1      |                 |
+
+- Wall 16.4 ms/token under the profiler vs 11.9 ms in the exact bench
+  (84 tok/s); the profiler's own overhead is the difference.
+- The 8-rank allreduce is no longer a problem (7 us per call; it was 28
+  us before the sparse-decode fix removed the stall that was inflating
+  it). The TP-invariant residue is mHC (1.35) + indexer (0.72) + AR
+  (0.65) + copies (0.53) = 3.3 ms of ~12, i.e. the 25-30% TP4->TP8
+  scaling shortfall, spread over four items.
+- Ranked next items (gain / effort): (1) the ~150 direct_copy launches per
+  token - contiguous()/view copies around the mHC op wrappers and the
+  q/idx staging in the sparse backend (0.5 ms, easy); (2) pooled indexer
+  at 65 us for a 250-pool context (should be ~15 us: one tile per program,
+  the q/APE preload dominates; 0.5 ms); (3) mHC channel ownership as DSV4
+  does (VLLM_DSV4_TP_OWNERSHIP: each rank transitions 4096/TP channels,
+  the transition fused into the allreduce) - up to 1.2 ms but a deep
+  integration; (4) the M=1 GEMV chain: 280 cuBLAS launches per token is
+  launch-bound, fusable per layer (q_a+kv_a already fused; KDA's
+  in_proj/f_b/g_a/g_b are four).
+- Partitioned bf16 GLM launch, first attempt: OOM in prefill. This MQA
+  path serves prefill chunks too, and the partition scratch
+  (B x H x P x 512 fp32) hit 3.4 GiB for a multi-thousand-token chunk on
+  the 202K-context bf16 record. Partitioning now applies only while the
+  scratch stays under 512 MB (decode-sized batches); large chunks stay
+  unpartitioned, where B x H warps already fill the machine. Both bf16
+  entry points (NoPE 512 and GLM 576) use the same gate.
+- glm52-q2k-8 after (canaries pass): c1 14.9 / c8 81.5 / c16 135.2 tok/s
+  (from 9.6 / 64.7 / 110.4: +55% / +26% / +22%). Raw: perf/results/
+  2026-09-03/glm52-q2k-8-baseline/. Still far below glm53's TP8 numbers -
+  GLM-5.2's Q2_K GGUF MoE path is its own budget and was not touched.
+- glm53-nvfp4-8 re-validated with the gate (prefill chunks unpartitioned,
+  decode P128): canaries pass, c1 84.4 / c8 413.6 / c16 578.8 - identical
+  to run 2 (84.0 / 412.3 / 575.8). Raw: perf/results/2026-09-03/
+  glm53-nvfp4-8-baseline/ (run 2 kept as -baseline-run2).
 ## 2026-09-03 - NVMe tier on the dedicated device: greedy recall validated, promotion path clean, c8 best-ever
 
 - Device: nvme1n1 (3.7 TB, PCIe gen3 x2) carried a stale NTFS boot

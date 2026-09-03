@@ -1099,10 +1099,10 @@ def test_every_a100_profile_carries_the_host_kv_tier():
     config, because their group specs are not verified to resolve
     all-uniform on their own.
     """
-    # glm53-nvfp4-4 is the one a100 record without the tier: its KDA-state +
-    # MLA + indexer groups mix block sizes, which the generic packed slab
-    # planner cannot lay out (the record's note states the follow-up).
-    tier_pending = {"glm53-nvfp4-4"}
+    # The glm53 records are the a100 records without the tier: their
+    # KDA-state + MLA + indexer groups mix block sizes, which the generic
+    # packed slab planner cannot lay out (the notes state the follow-up).
+    tier_pending = {"glm53-nvfp4-4", "glm53-nvfp4-8"}
     seen = 0
     for profile_id, entry in registry._registry()["profiles"].items():
         record = entry.get("variants", {}).get("a100")
@@ -1119,4 +1119,4 @@ def test_every_a100_profile_carries_the_host_kv_tier():
         assert extra["host_tier_gb_per_rank"] > 0, profile_id
         if entry["source"] in ("glm52-vision", "glm53-flash-nvfp4"):
             assert extra["enable_cross_layers_blocks"] == "True", profile_id
-    assert seen == 8, "expected all eight A100 variants to be checked"
+    assert seen == 9, "expected all nine A100 variants to be checked"

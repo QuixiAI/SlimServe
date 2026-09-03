@@ -13,8 +13,8 @@ Composition sources, all already serving in this fork:
   GLM-5.3's ForgetGate/conv/beta math is identical).
 - NoPE MLA: the ``MultiHeadLatentAttentionWrapper`` NoPE path Kimi-K3 uses.
 - MoE routing: ``DeepseekV2MoE`` (config field names match verbatim).
-- mHC: eager implementation of the reference math (DSV4's fused tilelang
-  mHC kernels are the planned optimization; the math is identical, DSV4's
+- mHC: the fork's fused MHCPreOp / MHCFusedPostPreOp / MHCPostOp
+  (quixicore dsv4_mhc_* kernels on Ampere; identical math, DSV4's
   ``hc_post_alpha=2.0`` == the reference's ``2*sigmoid``).
 
 The DSA layers run SPARSE through the pooled indexer
@@ -28,6 +28,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
@@ -50,11 +51,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.mhc import (
-    MHCFusedPostPreOp,
-    MHCPostOp,
-    MHCPreOp,
-)
+import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
 from vllm.model_executor.layers.glm5_next_indexer import (
     Glm5NextPooledIndexer,
 )
@@ -89,11 +86,8 @@ logger = init_logger(__name__)
 
 
 class Glm5NextMLAAttention(nn.Module):
-    """NoPE MLA for the DeepSeek-sparse-attention layers.
-
-    Currently dense (see module docstring); the pooled indexer will hang
-    off this module and flip is_sparse when it lands.
-    """
+    """NoPE MLA for the DeepSeek-sparse-attention layers, sparse through
+    the pooled indexer."""
 
     def __init__(
         self,
@@ -275,42 +269,19 @@ class Glm5NextDecoderLayer(nn.Module):
         self.hc_attn_scale = _p(3)
         self.hc_ffn_scale = _p(3)
 
-        self.mhc_pre = MHCPreOp()
-        self.mhc_post = MHCPostOp()
-        self.mhc_fused_post_pre = MHCFusedPostPreOp()
 
     def _site_pre(self, residual, fn, scale, base):
-        post_mix, res_mix, x = self.mhc_pre(
-            residual=residual,
-            fn=fn,
-            hc_scale=scale,
-            hc_base=base,
-            rms_eps=self.rms_norm_eps,
-            hc_pre_eps=self.hc_eps,
-            hc_sinkhorn_eps=self.hc_eps,
-            hc_post_mult_value=self.hc_post_alpha,
-            sinkhorn_repeat=self.hc_sinkhorn_iters,
-            norm_weight=None,
-            norm_eps=0.0,
+        post_mix, res_mix, x = torch.ops.vllm.glm5_mhc_pre(
+            residual, fn, scale, base, self.rms_norm_eps, self.hc_eps,
+            self.hc_post_alpha, self.hc_sinkhorn_iters,
         )
         return residual, post_mix, res_mix, x
 
     def _site_fused(self, x, residual, post_mix, res_mix, fn, scale, base):
-        return self.mhc_fused_post_pre(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            fn,
-            scale,
-            base,
-            self.rms_norm_eps,
-            self.hc_eps,
-            self.hc_eps,
-            self.hc_post_alpha,
+        return torch.ops.vllm.glm5_mhc_fused_post_pre(
+            x, residual, post_mix, res_mix, fn, scale, base,
+            self.rms_norm_eps, self.hc_eps, self.hc_post_alpha,
             self.hc_sinkhorn_iters,
-            norm_weight=None,
-            norm_eps=0.0,
         )
 
     def forward(
@@ -347,6 +318,7 @@ class Glm5NextDecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+@support_torch_compile
 class Glm5NextTextModel(nn.Module):
     def __init__(
         self,
@@ -412,7 +384,7 @@ class Glm5NextTextModel(nn.Module):
                 x, positions, residual, post_mix, res_mix
             )
         assert layer is not None
-        streams = layer.mhc_post(x, residual, post_mix, res_mix)
+        streams = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
         # HyperHead: unweighted mean over the streams (reference; DSV4's
         # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
@@ -457,7 +429,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         config = vllm_config.model_config.hf_config.get_text_config()
         self.config = config
         self.model = Glm5NextTextModel(
-            vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
