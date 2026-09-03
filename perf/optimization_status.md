@@ -18425,3 +18425,15 @@ vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
 - Next for the TP8 scaling gap: measure first - a TP8 profile at 1000-token
   context on the current stack to size allreduce / mHC / indexer shares -
   then channel ownership if the replicated mHC dominates.
+
+## 2026-09-03: glm52-q2k-8 (bf16 KV, TP8) first exact-token numbers - the same unpartitioned launch
+
+- Through the profile (202752 ctx): c1 9.6 / c8 64.7 / c16 110.4 tok/s;
+  text (+reasoning), image, tool canaries pass. Raw: perf/results/
+  2026-09-03/glm52-q2k-8-baseline/. This record never had an exact-token
+  baseline (only its 2026-08-30 deep-context leg).
+- The bf16 GLM 576 entry point (mla_decode_bf16_sparse_glm) got today's
+  VECBF16 row path but was still launched unpartitioned: 8 local heads x
+  one warp each walking the whole selection across GLM-5.2's MLA layers.
+  Partitioned launch (P128 + reduce, exactly the fp8 GLM and NoPE fix)
+  added; re-measure follows.
