@@ -2592,6 +2592,59 @@
           ]
         }
       }
+    },
+    "glm53-nvfp4-8": {
+      "title": "GLM-5.3-Flash NVFP4 on 8 GPUs",
+      "source": "glm53-flash-nvfp4",
+      "gpus": 8,
+      "summary": "Vision-language 169B hybrid (34 KDA layers + 11 pooled-indexer DSA layers, mHC, 288-expert NVFP4 MoE) on eight A100s: TP8, experts sharded, chosen from the TP8 / TP4xDP2, EP on/off matrix.",
+      "speculative": false,
+      "variants": {
+        "a100": {
+          "platform": "a100",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 32,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "env": {},
+          "notes": [
+            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "Parallelism is by measurement on the 8x A100 matrix (exact-token, perf/results/2026-09-02/glm53-8gpu-matrix/): TP8 83.0 / 343.7 / 447.7 tok/s at c1 / c8 / c16; TP8+EP 75.3 / 331.1 / 430.8; TP4xDP2 67.2 / 382.8 / 527.6; TP4xDP2+EP 51.3 / 317.0 / 480.1; TP4 on four GPUs 73.6 / 282.6 / 369.9. TP8 wins single-stream latency and keeps one prefix cache and one KV pool for agentic traffic; DP2's c8/c16 lead is the TP8 per-rank fixed cost (8-rank allreduce, replicated mHC and indexer) still to be fused away. The record runs TP8, experts sharded.",
+            "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
+            "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
+            "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
+            "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
+            "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
+            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+          ]
+        }
+      }
     }
   }
 }

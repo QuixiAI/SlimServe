@@ -18321,3 +18321,70 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   tp8-ep, tp4dp2, tp4dp2-ep) running with both fixes.
 - Owed: glm52-q2k-8 (bf16 KV, TP8) shares the launch and now the row path
   - its exact-token c1 needs re-measuring; expect a large gain.
+
+## 2026-09-03: GLM-5.3 8-GPU configuration matrix v4 - decision: glm53-nvfp4-8 = TP8, EP off
+
+Exact-token 1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20 seed 42,
+each concurrency warmed first, canary-guarded, compile on, partitioned +
+vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
+<arm>/exact_c{1,8,16}.json (v4 overwrote the void v1 numbers in place).
+
+| arm            | c1   | c8    | c16   |
+|----------------|------|-------|-------|
+| tp8            | 83.0 | 343.7 | 447.7 |
+| tp8-ep         | 75.3 | 331.1 | 430.8 |
+| tp4dp2         | 67.2 | 382.8 | 527.6 |
+| tp4dp2-ep      | 51.3 | 317.0 | 480.1 |
+| tp4 (4 GPUs)   | 73.6 | 282.6 | 369.9 |
+
+- EP loses at every point on both 8-GPU layouts (as it did at TP4 on
+  09-02): the 288-expert MoE at 36 experts/rank is not routing-bound, and
+  EP adds the all-to-all on top of the same GEMMs.
+- TP8 vs TP4: +13% c1, +22% c8, +21% c16. Below the 50% scaling gate.
+  Sharded work (marlin MoE, GEMVs, KDA, attention) halves per rank; the
+  replicated per-rank work does not: 91 custom allreduces/token at 8
+  ranks (1-stage reads 7 peers), the mHC stream kernels (T x 4 x 4096 per
+  layer, replicated on every rank), the pooled indexer (replicated). That
+  fixed cost is why TP4xDP2 - two independent TP4 engines - wins c8/c16
+  by 11-18% while losing c1 by 19%.
+- Decision: TP8, EP off. Single-stream latency is best, and DP2 splits the
+  prefix cache and KV pool across two engines with no prefix-aware
+  routing - for the agentic traffic the serving policy is written for
+  (long shared prefixes, near-100% hit rate) that is the wrong trade.
+  DP2's throughput lead is recorded as the size of the TP8 fixed-cost
+  gap; fusing the mHC transition with the allreduce (the DSV4 path's
+  approach) and de-duplicating the replicated indexer are the next items.
+- glm53-nvfp4-4 re-measured on the same stack: 73.6 / 282.6 / 369.9 vs the
+  09-02 record 70.1 / 331.4 / -. c1 up with the kernel fix + compile, c8
+  DOWN 15%: not yet explained (the 09-02 c8 predates the tail fix, compile,
+  and the partitioned kernel). Owed: a c8 profile at TP4 to find it.
+- Follow-up on the 09-01 TP4 c8 331.4: its deep-context leg the same day
+  averaged ~14 tok/s aggregate at c8 near 116K context (62,538 completion
+  tokens in the 1.25 h wall), consistent with the OLD unpartitioned
+  kernel walking the full 2048-entry selection at depth. Only the 1000-
+  token c8 (7.2 s wall for 8 x 300 tokens) does not fit the old kernel's
+  measured per-token cost; it stays UNEXPLAINED and is not used as a
+  baseline. Today's 282.6 is the number of record for glm53-nvfp4-4 c8.
+
+## 2026-09-03: glm53-nvfp4-8 through the real profile - indexer cost was proportional to max_model_len
+
+- First boot of the record (TP8, EP off, model-default 1,048,576 context,
+  max_num_seqs 32): canaries pass (text + reasoning, image "a red
+  square", get_weather tool call) but exact-token c1 / c8 / c16 read
+  32.8 / 47.2 / 48.7 - flat across concurrency, ~20 ms per sequence per
+  step. The arm had measured 83 / 344 / 448 with the same flags at
+  max_model_len 32768.
+- Cause: _pooled_logits_kernel launched grid (R, max_pools / 16) with
+  max_pools = max_model_len // 4: 16,384 programs per row per layer at
+  1M, every one reloading q (32 KB) and APE, running a tl.dot on masked
+  zeros and storing -inf logits the top-k never reads (~600 MB of reads
+  per row per layer). Fixed grid of 128 programs per row, each striding
+  over the row's ACTUAL pool tiles, q/APE loaded once per program. Parity
+  vs the transformers indexer unchanged (tests/glm5_next).
+- Same profile after the fix: c1 84.0 / c8 412.3 / c16 575.8 tok/s.
+  Raw: perf/results/2026-09-03/glm53-nvfp4-8-baseline/. The arms also
+  paid this (512 programs/row at 32K), so the matrix table above
+  understates every arm at c8/c16; the ordering (EP off, TP8 vs DP2 on
+  c1 + cache locality) is unchanged and TP8 now leads DP2's old c16 too.
+- glm53-nvfp4-4 is being re-measured through its profile on this stack
+  for the scaling comparison.
