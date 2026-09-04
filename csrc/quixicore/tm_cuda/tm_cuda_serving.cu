@@ -984,7 +984,8 @@ static void py_post_update(torch::Tensor idx_mapping,
         int64_t sampled_tokens_stride, torch::Tensor num_sampled,
         torch::Tensor num_rejected, c10::optional<torch::Tensor> query_start_loc,
         torch::Tensor all_token_ids, int64_t all_token_ids_stride,
-        torch::Tensor total_len) {
+        torch::Tensor total_len, int64_t sampled_cols, int64_t vocab_size,
+        c10::optional<torch::Tensor> diag) {
     CKD(idx_mapping, torch::kInt); CKD(num_computed_tokens, torch::kInt);
     CKD(last_sampled_tokens, torch::kLong); CKD(sampled_tokens, torch::kLong);
     CKD(num_sampled, torch::kInt); CKD(num_rejected, torch::kInt);
@@ -1001,6 +1002,13 @@ static void py_post_update(torch::Tensor idx_mapping,
         CKD(q, torch::kInt);
         qsl = q.data_ptr<int>();
     }
+    int64_t* diag_ptr = nullptr;
+    if (diag) {
+        torch::Tensor& d = *diag;
+        CKD(d, torch::kLong);
+        TORCH_CHECK(d.numel() >= 40, "post_update diag needs 40 int64 slots");
+        diag_ptr = d.data_ptr<int64_t>();
+    }
     const int num_reqs = idx_mapping.numel();
     if (num_reqs == 0) return;
     post_update<<<(num_reqs + 255) / 256, 256, 0, stream()>>>(
@@ -1009,7 +1017,8 @@ static void py_post_update(torch::Tensor idx_mapping,
         (long)output_bin_counts_stride, sampled_tokens.data_ptr<int64_t>(),
         (long)sampled_tokens_stride, num_sampled.data_ptr<int>(),
         num_rejected.data_ptr<int>(), qsl, all_token_ids.data_ptr<int>(),
-        (long)all_token_ids_stride, total_len.data_ptr<int>(), num_reqs);
+        (long)all_token_ids_stride, total_len.data_ptr<int>(), num_reqs,
+        (int)sampled_cols, (long)vocab_size, (long*)diag_ptr);
 }
 
 static void py_post_update_num_computed_tokens(torch::Tensor idx_mapping,
@@ -2136,7 +2145,8 @@ void init_serving(py::module_& m) {
           py::arg("sampled_tokens_stride"), py::arg("num_sampled"),
           py::arg("num_rejected"), py::arg("query_start_loc"),
           py::arg("all_token_ids"), py::arg("all_token_ids_stride"),
-          py::arg("total_len"));
+          py::arg("total_len"), py::arg("sampled_cols"), py::arg("vocab_size"),
+          py::arg("diag"));
     m.def("post_update_num_computed_tokens", &py_post_update_num_computed_tokens,
           py::arg("idx_mapping"), py::arg("num_computed_tokens"),
           py::arg("query_start_loc"));

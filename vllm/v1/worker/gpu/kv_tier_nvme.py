@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NVMe tier IO engine: pinned host arena rows <-> slots in a per-rank file.
 
 Third KV tier below GPU and pinned host RAM. The engine owns one
@@ -25,8 +26,8 @@ from __future__ import annotations
 import os
 import threading
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from vllm.logger import init_logger
 
@@ -118,7 +119,9 @@ class NvmeTierFile:
             try:
                 fd = os.open(path, flags, 0o600)
             except OSError as exc:
-                logger.debug("kv-nvme: open named (direct=%s) failed: %s", is_direct, exc)
+                logger.debug(
+                    "kv-nvme: open named (direct=%s) failed: %s", is_direct, exc
+                )
                 continue
             os.unlink(path)
             self.direct = is_direct
@@ -155,6 +158,7 @@ class NvmeTierFile:
                 if self._stop and not self._queue:
                     return
                 op = self._queue.popleft()
+            assert op is not None
             err: str | None = None
             try:
                 if op.wait is not None:

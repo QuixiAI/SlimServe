@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler-side index for the host KV tier (trajectory-centric).
 
 The host tier mirrors a trajectory's immutable full-attention blocks at
@@ -48,6 +49,7 @@ from vllm.v1.core.kv_cache_utils import BlockHash
 
 # hash position -> attention group ids whose KV block completes there
 DueGids = Callable[[int], frozenset[int]]
+_EMPTY_HASH = BlockHash(b"")
 
 
 @dataclass
@@ -69,7 +71,7 @@ class Trajectory:
     # with another conversation's attention blocks would resume with the
     # wrong mamba state (silent output corruption), so a mismatched
     # trajectory is simply dead rather than dangerously matchable.
-    tail_hash: BlockHash = b""
+    tail_hash: BlockHash = _EMPTY_HASH
     tail_pending: bool = False  # tail-state writes still in flight
     last_touch: float = 0.0
     # Disk (NVMe tier) locations, mirroring the host ones position for
@@ -293,7 +295,7 @@ class HostKVTierIndex:
         self.touch(owner)
         while len(traj.attn_slots) <= logical:
             traj.attn_slots.append({})
-            traj.hashes.append(b"")
+            traj.hashes.append(_EMPTY_HASH)
             traj.disk_attn.append({})
         if traj.hashes[logical] not in (b"", block_hash):
             if not supersede:
@@ -308,7 +310,7 @@ class HostKVTierIndex:
                     self._free_disk_slot(d)
                 traj.attn_slots[i] = {}
                 traj.disk_attn[i] = {}
-                traj.hashes[i] = b""
+                traj.hashes[i] = _EMPTY_HASH
         if gid in traj.attn_slots[logical]:
             return None
         slot = self._alloc_slot(owner)
@@ -333,7 +335,7 @@ class HostKVTierIndex:
         owner: str,
         boundary: int,
         num_state_groups: int,
-        boundary_hash: BlockHash = b"",
+        boundary_hash: BlockHash = _EMPTY_HASH,
     ) -> dict[int, int] | None:
         """Reserve slots for the tail-boundary state blocks of `owner`.
 
@@ -389,13 +391,13 @@ class HostKVTierIndex:
         if self.num_disk_slots > 0:
             disk: dict[int, int] = {}
             for gid, slot in slots.items():
-                d = self._alloc_disk_slot(owner)
-                if d is None:
+                ds = self._alloc_disk_slot(owner)
+                if ds is None:
                     for dd in disk.values():
                         self._free_disk_slot(dd)
                     disk = {}
                     break
-                disk[gid] = d
+                disk[gid] = ds
             for gid, d in disk.items():
                 self._disk_of_host[slots[gid]] = d
             if disk:
@@ -417,7 +419,9 @@ class HostKVTierIndex:
 
     # ------------------------------------------------------------- disk tier
 
-    def take_disk_writes(self, confirmed_host_slots: list[int]) -> list[tuple[int, int]]:
+    def take_disk_writes(
+        self, confirmed_host_slots: list[int]
+    ) -> list[tuple[int, int]]:
         """Write-through ops (host_slot, disk_slot) for host slots whose GPU ->
         host copy is confirmed. The host slot stays busy (never freed) until
         confirm_disk_writes reports the disk copy complete."""
@@ -454,9 +458,9 @@ class HostKVTierIndex:
             return True
         return bool(traj.tail_boundary > 0 and not tail and traj.disk_tail_slots)
 
-    def promote(self, owner: str, n_blocks: int) -> tuple[
-        list[dict[int, int]], dict[int, int], list[tuple[int, int]]
-    ] | None:
+    def promote(
+        self, owner: str, n_blocks: int
+    ) -> tuple[list[dict[int, int]], dict[int, int], list[tuple[int, int]]] | None:
         """Give every disk-only copy of `owner`'s first `n_blocks` positions
         (and its tail) a host slot to be filled from disk.
 
@@ -562,8 +566,7 @@ class HostKVTierIndex:
                     m < span
                     and traj.hashes[m] == hashes[m]
                     and not any(
-                        s in self._pending_write
-                        for s in traj.attn_slots[m].values()
+                        s in self._pending_write for s in traj.attn_slots[m].values()
                     )
                 ):
                     m += 1

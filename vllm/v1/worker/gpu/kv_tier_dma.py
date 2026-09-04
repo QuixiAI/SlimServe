@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side host KV tier: pinned arena + async DMA queues.
 
 Each rank owns a pinned host arena shaped [num_slots, block_stride] that
@@ -22,9 +23,12 @@ Ordering contract:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -70,7 +74,11 @@ class TierOpBatch:
     @property
     def is_empty(self) -> bool:
         return not (
-            self.offload or self.restore or self.zero or self.disk_writes or self.disk_reads
+            self.offload
+            or self.restore
+            or self.zero
+            or self.disk_writes
+            or self.disk_reads
         )
 
 
@@ -105,9 +113,26 @@ def _register_host_arena(
     row = padded_stride(block_stride)
     total = num_slots * row
     raw = torch.empty(total + PAGE, dtype=torch.int8)
-    rc = torch.cuda.cudart().cudaHostRegister(
-        raw.data_ptr(), raw.numel(), _HOST_REGISTER_PORTABLE
-    )
+    # Retry on out-of-memory (rc 2): eight ranks pinning at once race the
+    # kernel's page-cache reclaim, and the losers fail instantly while a
+    # lone process pinning the same size succeeds (MI300X, 2026-08-31:
+    # 4/8 ranks pinned 256 GiB, the rest OOMed). Bounded backoff lets
+    # reclaim catch up before the power-of-two fallback is tried.
+    rc = -1
+    for attempt in range(60):
+        rc = torch.cuda.cudart().cudaHostRegister(
+            raw.data_ptr(), raw.numel(), _HOST_REGISTER_PORTABLE
+        )
+        if rc == 0 or int(rc) != 2:
+            break
+        if attempt % 10 == 0:
+            logger.warning(
+                "kv-tier: cudaHostRegister of the %.1f GiB arena hit "
+                "out-of-memory (attempt %d); retrying",
+                total / (1 << 30),
+                attempt,
+            )
+        time.sleep(5.0)
     if rc == 0 and raw.is_pinned():
         off = (-raw.data_ptr()) % PAGE
         return raw[off : off + total].view(num_slots, row), raw
@@ -168,7 +193,7 @@ class KVTierDMA:
         self._slot_event: dict[int, torch.cuda.Event] = {}
         self._disk_op_seq = 0
         # op id -> ("w", batch_seq) | ("r", req_id)
-        self._disk_ops: dict[int, tuple[str, object]] = {}
+        self._disk_ops: dict[int, tuple[str, Any]] = {}
         self._write_remaining: dict[int, int] = {}
         self._disk_done: list[int] = []
         self._read_remaining: dict[str, int] = {}
@@ -196,12 +221,14 @@ class KVTierDMA:
             assert self.disk is not None and batch.req_id is not None
             for disk_slot, host_slot in batch.disk_reads:
                 self._submit_disk(
-                    write=False, disk_slot=disk_slot, host_slot=host_slot,
+                    write=False,
+                    disk_slot=disk_slot,
+                    host_slot=host_slot,
                     tag=("r", batch.req_id),
                 )
-            self._read_remaining[batch.req_id] = (
-                self._read_remaining.get(batch.req_id, 0) + len(batch.disk_reads)
-            )
+            self._read_remaining[batch.req_id] = self._read_remaining.get(
+                batch.req_id, 0
+            ) + len(batch.disk_reads)
             batch.disk_reads = []
             self._deferred.append(batch)
             return
@@ -224,6 +251,7 @@ class KVTierDMA:
             # flight at submission (it was, for every row, on 2026-09-04).
         elif _VERIFY:
             self._read_targets[op_id] = (disk_slot, host_slot)
+        assert self.disk is not None
         self.disk.submit(
             DiskOp(
                 op_id=op_id,
@@ -310,7 +338,9 @@ class KVTierDMA:
                         self._group_nbytes.get(gid, self._stride) if gid >= 0 else 0
                     )
                 self._submit_disk(
-                    write=True, disk_slot=disk_slot, host_slot=host_slot,
+                    write=True,
+                    disk_slot=disk_slot,
+                    host_slot=host_slot,
                     tag=("w", batch.seq),
                 )
         if not batch.offload and not batch.restore and not batch.zero:
@@ -393,12 +423,19 @@ class KVTierDMA:
                 logger.warning(
                     "kv-tier VERIFY MISMATCH slot=%d block=%d gid=%d offloaded=%s "
                     "host_now=%s gpu_after_restore=%s",
-                    slot, gpu_block, gid, expect, host, got,
+                    slot,
+                    gpu_block,
+                    gid,
+                    expect,
+                    host,
+                    got,
                 )
         if batch.restore:
             logger.info(
                 "kv-tier verify: batch %d: %d/%d restores mismatched",
-                batch.seq, bad, len(batch.restore),
+                batch.seq,
+                bad,
+                len(batch.restore),
             )
 
     def flush(self) -> list[int]:
@@ -422,11 +459,11 @@ class KVTierDMA:
             if self.disk is not None:
                 self.disk.close()
                 self.disk = None
+            assert self._registered_buf is not None
             torch.cuda.cudart().cudaHostUnregister(self._registered_buf.data_ptr())
             self._registered = False
 
     def __del__(self) -> None:
-        try:
+        # Interpreter teardown: release() may fail once torch is half gone.
+        with contextlib.suppress(Exception):
             self.release()
-        except Exception:  # noqa: BLE001 - interpreter teardown
-            pass

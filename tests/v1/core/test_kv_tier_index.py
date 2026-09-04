@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HostKVTierIndex: trajectory staging, tail-boundary resume, eviction."""
 
 from vllm.v1.core.kv_tier_index import HostKVTierIndex
@@ -34,7 +35,12 @@ def test_resumable_only_with_confirmed_tail():
     hit = idx.lookup([h(0), h(1), h(2), h(3)])
     assert hit is not None
     owner, n, attn, states = hit
-    assert owner == "a" and n == 3 and [d[0] for d in attn] == slots and set(states) == {0, 1}
+    assert (
+        owner == "a"
+        and n == 3
+        and [d[0] for d in attn] == slots
+        and set(states) == {0, 1}
+    )
 
 
 def test_no_hit_on_hash_mismatch_or_short_prompt():
@@ -187,3 +193,18 @@ def test_ratio_groups_due_positions_and_resume():
     assert owner == "o" and n == 4
     assert set(attn[0]) == {5} and set(attn[1]) == {4, 5}
     assert set(attn[2]) == {5} and set(attn[3]) == {4, 5}
+
+
+def test_partial_lookup_clamps_a_longer_trajectory_to_the_query():
+    """A conversation continued from its own earlier, longer trajectory
+    (GLM-5.2/MI300X acceptance, 2026-09-03: 141 staged positions vs 139
+    queried) must match the query's full length, not miss because the
+    stored trajectory is longer."""
+    idx = HostKVTierIndex(num_slots=16)
+    slots = build_traj(idx, "a", 5, tail=False)
+    assert idx.lookup([h(0), h(1), h(2)]) is None  # tail-exact: no match
+    hit = idx.lookup([h(0), h(1), h(2)], allow_partial=True)
+    assert hit is not None
+    owner, n, attn, states = hit
+    assert owner == "a" and n == 3 and [d[0] for d in attn] == slots[:3]
+    assert states == {}

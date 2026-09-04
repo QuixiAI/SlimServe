@@ -1306,10 +1306,7 @@ def _get_kv_cache_config_packed(
     logger.info(
         "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes",
         len(kv_cache_groups),
-        [
-            (type(g.kv_cache_spec).__name__, len(g.layer_names))
-            for g in kv_cache_groups
-        ],
+        [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in kv_cache_groups],
         sum(len(g.layer_names) for g in kv_cache_groups),
         block_stride,
     )
@@ -1691,7 +1688,7 @@ def _classify_csa_linear_specs(
         # roles. TQFullAttentionSpec is a packed-layout FullAttentionSpec
         # (Qwen4Exp TQ main KV) and owns the same main-KV role.
         if type(spec) in (FullAttentionSpec, TQFullAttentionSpec):
-            roles.main_kv[name] = spec
+            roles.main_kv[name] = cast(FullAttentionSpec, spec)
         elif type(spec) is MLAAttentionSpec and spec.compress_ratio > 1:
             roles.compressed[name] = spec
         elif type(spec) is CircularBufferSpec:

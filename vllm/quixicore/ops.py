@@ -1351,6 +1351,35 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def mqa_logits_paged_gfx942(
+        q: torch.Tensor,
+        kv_values: torch.Tensor,
+        kv_scales: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        logits: torch.Tensor,
+        block_size: int,
+        block_tile: int = 16,
+        head_tile: int = 16,
+    ) -> None:
+        """Decode lightning-indexer logits straight from the paged indexer
+        cache with 64-bit addressing (fp8_paged_mqa_logits_kernel.cuh).
+        Writes logits[r, :seq_lens[r]] for every row."""
+        _qc().mqa_logits_paged_gfx942(
+            q,
+            kv_values,
+            kv_scales,
+            weights,
+            seq_lens,
+            block_table,
+            logits,
+            block_size,
+            block_tile,
+            head_tile,
+        )
+
+    @staticmethod
     def post_update(
         idx_mapping: torch.Tensor,
         num_computed_tokens: torch.Tensor,
@@ -1365,8 +1394,16 @@ class quixicore_ops:
         all_token_ids: torch.Tensor,
         all_token_ids_stride: int,
         total_len: torch.Tensor,
+        sampled_cols: int,
+        vocab_size: int,
+        diag: torch.Tensor | None,
     ) -> None:
-        """Native `_post_update_kernel`."""
+        """Native `_post_update_kernel` with the row bounds guard.
+
+        `sampled_cols` is the sampled_tokens row width, `vocab_size` bounds
+        the token ids (0 disables that check), `diag` is an int64[8] device
+        buffer that receives the first violating row (see the kernel).
+        """
         _qc().post_update(
             idx_mapping,
             num_computed_tokens,
@@ -1381,6 +1418,9 @@ class quixicore_ops:
             all_token_ids,
             all_token_ids_stride,
             total_len,
+            sampled_cols,
+            vocab_size,
+            diag,
         )
 
     @staticmethod

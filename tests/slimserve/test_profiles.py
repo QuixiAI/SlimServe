@@ -1119,3 +1119,45 @@ def test_every_a100_profile_carries_the_host_kv_tier():
         if entry["source"] in ("glm52-vision", "glm53-flash-nvfp4"):
             assert extra["enable_cross_layers_blocks"] == "True", profile_id
     assert seen == 9, "expected all nine A100 variants to be checked"
+
+
+def test_mi300x_glm52_and_dsv4_profiles_carry_the_host_kv_tier():
+    """Every MI300X GLM-5.2 and DeepSeek-V4 variant declares the host tier
+    (issue #17). DSV4 records get the packed slab from the allocator's
+    is_dsv4 gate; GLM records keep per-layer tensors (the AITER MLA
+    decode rejects strided cache views) and the tier manages them as
+    per-layer DMA segments. Every record states its
+    kv_cache_dtype explicitly so the arena stride is deterministic, and
+    binds the arena NUMA-local. Kimi-K3 is deliberately not enabled: its
+    KDA hybrid state goes through the mamba tail path validated only on
+    GDN align mode, and at 8192 context there is little to offload.
+    """
+    seen = 0
+    for profile_id, entry in registry._registry()["profiles"].items():
+        if entry["source"] not in ("glm52-vision", "dsv4-flash"):
+            continue
+        record = entry.get("variants", {}).get("mi300x")
+        if record is None:
+            continue
+        seen += 1
+        engine = record["engine"]
+        transfer = engine["kv_transfer_config"]
+        assert transfer["kv_connector"] == "HostTierConnector", profile_id
+        assert transfer["kv_role"] == "kv_both", profile_id
+        extra = transfer["kv_connector_extra_config"]
+        # All records pin 128 GiB/rank (the GTT aperture caps total pinned;
+        # see the glm52 mi300x record notes for the GLM capacity caveat).
+        expected = 128
+        assert extra["host_tier_gb_per_rank"] == expected, profile_id
+        assert "kv_cache_dtype" in engine, profile_id
+        assert engine["numa_bind"] is True, profile_id
+        # GLM packs the slab (the QuixiCore gfx942 sparse decode takes the
+        # block stride as a parameter; the per-layer fallback's copy
+        # amplification crashed the HSA runtime); DSV4 gets the slab from
+        # the allocator's is_dsv4 gate with no opt-in.
+        if entry["source"] == "glm52-vision":
+            assert extra["enable_cross_layers_blocks"] == "True", profile_id
+            assert record["engine"]["kv_cache_dtype"] == "auto", profile_id
+        else:
+            assert "enable_cross_layers_blocks" not in extra, profile_id
+    assert seen == 7, "expected three GLM and four DSV4 MI300X variants"

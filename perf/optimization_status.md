@@ -17759,6 +17759,562 @@ perf/results/2026-08-29/a100-bf16-kvtier/ and
   deepcopy) and only falls back to recomputing from group specs for
   non-packed layouts. Validated on reboot: both roles log 15339 slots.
 
+## 2026-08-30 - Issue #17: host KV tier generalized to MI300X
+
+dsv4-q4k-8 first light VALIDATED (mechanism + bytes + behavior parity).
+
+- SCOPE: bring HostTierConnector to the MI300X profiles. Investigation
+  found the issue's layout framing was half the problem; the other half
+  was that the tier NEVER RESTORED on attention-only or multi-rate
+  models: resumability was gated on a mamba tail (`Trajectory.
+  resumable_blocks` returned 0 without `tail_boundary`), whose only
+  writer sat behind `if not self.state_groups: return`. GLM-5.2 and
+  DSV4 have no MambaSpec groups, so the tier was a write-only cache on
+  exactly the models this issue targets. The A100 DSV4 enablement
+  (2026-08-30) never actually restored; its recall passes rode the GPU
+  prefix cache. Marker recall alone CANNOT catch this - the standing
+  acceptance now requires tier hit counters, not answer correctness.
+- REWRITE (multi-rate contract): a logical POSITION is one scheduler
+  block (LCM of group block sizes; 256 on DSV4), hashes are read at the
+  GCD the engine hashes at (4 on DSV4 with a connector configured - the
+  old code assumed attn-group granularity, a second latent DSV4 bug).
+  Full-attention groups stage r_g = S/b_g sub-blocks per position into
+  ONE column-addressed host slot row; sliding-window groups ride the
+  boundary-snapshot (tail) path generalized from mamba: the in-window
+  frozen blocks are looked up by hash in the pool's prefix cache at
+  finish (the engine nulls the live ones within tokens) and restored
+  onto the engine's own [null]*skipped + [real]*window allocation
+  shape. Attention-only models (GLM-5.2) need no tail: a trajectory
+  seals at finish (mark_complete) and resumes at any gap-free prefix.
+  DMA ops are (slot, col, group, gpu_block) executed against per-group
+  segment lists (packed slab = one strided view per group = one copy
+  per op; per-layer tensors = one segment per layer). Planner records
+  KVCacheConfig.group_block_bytes so both roles agree on the layout
+  (the scheduler's flattened uniform specs cannot recompute it - same
+  class of bug as the 59811-vs-15339 split brain).
+  Also fixed: restore-source slots are now pin-refcounted from plan to
+  issue (previously another request's staging could reclaim and re-
+  stage them before the DMA read - offloads issue before restores in a
+  batch, so the overwrite would land first); register_kv_caches is
+  driven by the planner's KVCacheTensors instead of a storage-pointer
+  majority vote that silently dropped unmanaged layers.
+- FILES: vllm/v1/core/kv_tier_index.py, vllm/distributed/kv_transfer/
+  kv_connector/v1/host_tier_connector.py, vllm/v1/worker/gpu/
+  kv_tier_dma.py (all rewritten), kv_cache_utils.py + kv_cache_interface
+  (group_block_bytes), profiles.json (7 mi300x records: kv_transfer_
+  config 128 GiB/rank, numa_bind, kv_cache_dtype pinned explicit;
+  glm52 records add enable_cross_layers_blocks), tests (56 tier tests
+  incl. multi-rate/window/pin coverage; mi300x profile guard),
+  benchmarks/kv_tier_acceptance.py (new standing battery).
+- ON-BOX (dsv4-q4k-8, 8x MI300X, fp8 KV, DSpark k=5): registration
+  170/170 layers in the packed slab, 6 groups (MLA+indexer x62 full-
+  attention; SWA x22/x21 w=128; C4 x42 w=8; C128 x20 w=128; TQ draft
+  x3 w=128; tail = 30 blocks), scheduler/worker agree: 137,131 slots x
+  1,002,240 B = 128.0 GiB pinned per rank. NUMA note: node-1 ranks pin
+  in 14 s; node-0 ranks took 10 min on first boot (page-cache reclaim
+  of freshly-read weights) and ~25 s on reboot.
+- BYTES: VLLM_KV_TIER_VERIFY=1 through the whole bring-up: ~300
+  restore batches, 0 mismatched ops (incl. 169-op restores at 46.6K
+  tokens and dozens of concurrent 181/182-position restores during the
+  eviction sweep).
+- MECHANISM: eviction-restore acceptance (plant 8K/24K/42K, one
+  eviction cycle of 243 x 57.6K-token fillers = 14.0M tokens > the
+  13.26M-token pool, probe): tier hits fired with
+  external_prefix_cache_hits_total rising (8,960 tokens restored for
+  the 8K probe; counters carry the _total suffix - the first harness
+  read the unsuffixed name and reported 0).
+- BEHAVIOR: recall at depth is calibrated by GPU-HOT controls and is
+  model-limited, not tier-limited: 24K/42K hot controls fail on word-
+  salad/archived-document contexts, and the decisive same-conversation
+  A/B measured hot 0/3 vs tier-restored 2/3 (the only probe actually
+  served from the tier that round recalled correctly). An earlier
+  hot-1/1-vs-restored-0/3 read had suggested corruption; it was n=1
+  hot sampling luck. Acceptance pass criterion is now hot-parity +
+  tier hits + VERIFY, never absolute recall.
+- NOT DONE YET (owed before closing #17): throughput-neutrality A/B
+  (tier on/off, exact 1000/2000 seeded c1/c8/c32 - no MI300X baseline
+  exists for these profiles at all, so the OFF arm is also the first
+  baseline), glm52-q2k-8 bring-up (enable_cross_layers_blocks path),
+  WildChat deep-context leg, K3 decision (KDA hybrid, 8K context -
+  deliberately NOT enabled), KVBlockZeroer packed-slab re-check under
+  the ROCm sanitizer.
+- Raw: perf/results/2026-08-30/kv-tier-mi300x/ (boot*.log,
+  acceptance_dsv4q4k8.{log,json}, tier_marker_ab.log, tier_equiv.log).
+
+## 2026-08-31 - dsv4-q4k-8/MI300X tier throughput A/B: NEUTRAL
+
+Also the first exact-token numbers for this profile.
+
+- Exact bench (random 1000/2000, temp 1.0 / top_p 0.95 / top_k 20, seed
+  42, ignore-eos; n=4/24/64), same box, same profile, tier ON (boot4,
+  hours of prior traffic) vs tier OFF (boot6, fresh, kv_transfer_config
+  stripped for the leg and the profile byte-restored after):
+    c1  ON 31.7  / OFF 36.9  tok/s   (TTFT 250 / 342 ms)
+    c8  ON 209.5 / OFF 172.8 tok/s   (TTFT 513 / 511 ms)
+    c32 ON 655.4 / OFF 572.7 tok/s   (TTFT 821 / 822 ms)
+- No consistent direction (-14% / +21% / +14%); TTFT equal at c8/c32.
+  Verdict: NEUTRAL within DSpark acceptance variance at these prompt
+  counts. These are also the FIRST exact-token numbers ever recorded
+  for this profile on this box; treat them as provisional baselines
+  (single runs; a seeded multi-run pass is owed with the full baseline
+  campaign). TP scaling sanity: c32/c1 = 20.7x on the ON arm.
+- Raw: perf/results/2026-08-30/kv-tier-mi300x/bench_tier_{on,off}.log,
+  bench_tier_{on,off}_c{1,8,32}.json, boot6_dsv4q4k8_notier.log.
+
+## 2026-08-31 - glm52-q2k-8/MI300X: AITER MLA decode rejects the packed slab
+
+GLM switched to the per-layer tier path.
+
+- First-ever boot of this record. With enable_cross_layers_blocks (the
+  A100 recipe) the packed slab planned perfectly - ONE group,
+  MLAAttentionSpec x102 layers (MLA main + DSA indexer), 3,206,400
+  B/block at 64 tokens, arena 42,863 slots = 128.0 GiB/rank on all 8
+  ranks - but warmup died in `rocm_aiter_mla_decode_fwd`
+  (vllm/_aiter_ops.py:2387): the AITER gfx942 decode flattens the cache
+  with `kv_buffer.view(-1, 1, 1, head)` to page-size-1 affine
+  addressing, which requires block-contiguous storage; the packed
+  slab's block-strided per-layer views cannot be flattened (and the
+  page map is not affine, so index remapping cannot save it). The A100
+  GLM path tolerated the same layout because its CUDA kernels take
+  block-strided pages.
+- DECISION: the three glm52 mi300x records drop the opt-in and the tier
+  manages GLM's per-layer KV tensors directly - the generalized DMA's
+  per-layer segment path (one segment per layer, 102 copies per
+  64-token block on the copy stream). This is the documented
+  correctness fallback; a stride-aware AITER decode (or a batched
+  gather) is the follow-up optimization if the copy-stream cost shows
+  up in the throughput A/B. Guard test updated: no mi300x record packs
+  the slab (DSV4 keeps it via the is_dsv4 gate - its own cache kernels
+  read block_stride from k_cache.stride(0)).
+
+## 2026-08-31 - Per-layer tier path RETIRED for GLM
+
+HSA runtime crash under copy amplification.
+
+- During the reduced-pool acceptance sweep, ALL ranks segfaulted
+  simultaneously inside libhsa-runtime64.so (dmesg 17:03:38, write
+  faults at small offsets across every worker). The per-layer DMA path
+  offloads one copy per (block, layer): a 46K-token GLM filler = 727
+  blocks x 102 layers ~ 74K async copies enqueued in one batch, at c8 -
+  enough to exhaust HSA queue/signal resources and take the runtime
+  down. The per-layer segment path stays in the DMA as the generic
+  fallback (and is fine at DSV4-like fan-out), but it is NOT viable at
+  GLM's 102-layer amplification; the packed slab is the required layout.
+
+## 2026-08-31 - QuixiCore gfx942 sparse MLA decode: packed-slab GLM path
+
+Own kernel; aiter displaced on this path.
+
+- Per operator direction ("we don't need aiter... if aiter breaks the
+  packed slab then we need to write our own"): extended our absorbed-MLA
+  gfx942 kernel (csrc/quixicore/rocm/mla_decode_kernels.cuh - the one
+  that already displaced aiter's baked-head-count code objects for Kimi
+  K3, exact 512+64 geometry) with a sparse top-k variant,
+  `mla_sparse_decode_fwd` (qc_rocm_mla.cu -> _quixicore_C):
+  - varlen per-token spans over the global page-size-1 indices vLLM's
+    convert pass already builds for aiter (-1 pads skipped);
+  - the cache's BLOCK STRIDE is a kernel parameter, so a layer's
+    block-strided view of the packed cross-layer slab is first-class -
+    the exact thing aiter's view(-1,1,1,head) flatten rejects;
+  - one query row per (token, head): under sparse_mla_force_mqa this
+    serves decode and prefill alike; kGroup load pipeline, online
+    softmax and the split/reduce machinery reused from the dense kernel.
+- Dispatch: rocm_aiter_mla_sparse.forward_mqa prefers the QuixiCore op
+  for non-fp8 caches when _quixicore_C carries it;
+  VLLM_QC_ROCM_MLA_SPARSE=0 restores aiter (contiguous caches only).
+  fp8 rows (per-tensor kv_scale, like py_mla_decode_fp8_sparse_glm on
+  CUDA) are the follow-up; GLM mi300x records flip to kv_cache_dtype
+  auto (bf16) - policy-aligned - with enable_cross_layers_blocks
+  restored.
+- PARITY: 8/8 vs a pure-torch fp32 oracle
+  (tests/kernels/test_qc_rocm_mla_sparse.py) on genuinely strided slab
+  views: heads {7,12,16}, block sizes {64,256}, -1 padding inside
+  spans, empty spans (zero output), and GLM's topk-2048 multi-split
+  reduce. atol/rtol 2e-2 (bf16 accumulate).
+- OWED: fp8 cache variant; boot + serve + tier acceptance on
+  glm52-q2k-8 (in progress); exact-token perf vs the aiter path on a
+  contiguous cache (the kernel-for-kernel A/B); port the finished
+  kernel to ~/QuixiCore/QuixiCore-ROCm with a measured run.
+
+## 2026-09-01 - GLM-5.2/MI300X: post-churn KV corruption isolated (OPEN P0)
+
+Pre-existing; tier and QuixiCore kernel exonerated.
+
+- SYMPTOM: after the GPU block pool cycles once (eviction-scale load),
+  NEW prompts >= ~4K tokens garble (fluent token soup, degenerating into
+  filler-word/digit repetition) while short prompts and prefix-cached
+  reruns of pre-churn prompts stay clean. On a fresh boot the same
+  prompts are clean. Reruns of a post-churn-garbled prompt stay garbled
+  (prefix cache serves the same rows), so the STORED KV (or indexer
+  rows) written into RECYCLED blocks is corrupt - fresh-boot writes land
+  on low sequential ids and are fine; post-churn writes land on
+  arbitrary recycled ids from the free queue and are not.
+- EXONERATED, each by direct test on this box:
+  - QuixiCore mla_sparse_decode_fwd: 8/8 oracle parity incl. strided
+    slab, high blocks (ids 3000-4212, offsets ~1.2e10 elements),
+    topk-2048 splits; in-vivo shadow oracle (VLLM_QC_MLA_SPARSE_SHADOW=1,
+    added this session) reads maxdiff 0.00000 on live tensors.
+  - concat_and_cache_mla on a strided slab view at block 4200:
+    byte-exact, neighbors untouched.
+  - KVBlockZeroer: corruption reproduces with zeroing disabled
+    (VLLM_QC_KV_ZERO_DISABLE=1 diagnostic env, added this session).
+  - The host tier: corruption reproduces with the connector inert
+    (VLLM_KV_TIER_IDLE=1 diagnostic env, added this session) - no
+    offload staging, no lookups, no DMA. On GLM the tier also never
+    touches the block pool (attention-only path has no pins).
+  - Triton index-convert, aiter indexer read/write kernels: already
+    int64-cast (the DSV4 campaign's fixes); prefill gather passes
+    kv_cache.stride(0)/(1).
+- NOT YET BISECTED: spec decode (--no-spec fails to boot: "No common
+  block size for 64" without the DSpark draft - the block-size choice
+  is entangled with the draft config); fp8-vs-bf16; packed-vs-per-layer
+  (the per-layer arm needs the HSA copy-amplification fix first).
+- IMPORTANT CONTEXT: NO GLM/MI300X configuration has ever passed a
+  post-churn probe - the aiter-era "9/9 recall" ran on a 2.57M-token
+  pool that never cycled, and the aiter small-pool arm crashed in the
+  HSA runtime before probing. This corruption is therefore NOT
+  attributable to the QuixiCore kernel or the tier; it is a
+  pre-existing serving bug exposed by pool recycling.
+- NEXT DISCRIMINATORS: (1) make --no-spec bootable (pin the kernel
+  block size without the draft) and repeat load+probe; (2) shadow-check
+  the INDEXER's topk output post-churn (extend the shadow to dump
+  indices for a garbled token: are wrong ROWS selected or wrong
+  CONTENT stored?); (3) dump one corrupted block's rows and diff
+  against a recompute of the same tokens (content-vs-address
+  discriminator); (4) run the same churn on dsv4-q4k-8 (same engine,
+  different model path) at a reduced pool to test model-independence.
+- Raw: perf/results/2026-08-30/kv-tier-mi300x/boot9..17*.log, probe
+  transcripts in the session log.
+
+## 2026-09-01 - GLM/MI300X corruption: root-cause campaign
+
+IMA under the full stack; fast reproducer; UVA reuse fence landed.
+
+- MECHANISM CONFIRMED AS WILD MEMORY ACCESS, not bad kernel math: with a
+  diagnostic allocator layout (VLLM_QC_WS_GRAVEYARD=1, workspaces parked
+  instead of freed) the silent garbling becomes a HARD
+  hipErrorIllegalAddress on the FIRST 46K prefill of a fresh boot -
+  churn was never causal, it only reshuffled allocations until stale
+  targets held live data (silent garble) or nothing (fault). This is a
+  ~2-minute reproducer where the old one took 25.
+- EXONERATED THIS PASS, each by direct instrumentation on-box:
+  - MLA latent insert: in-vivo read-back verify
+    (VLLM_QC_MLA_INSERT_VERIFY=1) - 0 mismatches through full repro;
+    the silent no-write branch (missing slot mapping) now warns.
+  - Indexer k-quant writes: shuffle-layout read-back verify
+    (VLLM_QC_IDX_VERIFY=1) - 0 mismatches.
+  - Indexer top-k output: bounds stats (VLLM_QC_IDX_STATS=1) - 0
+    out-of-range indices while output garbled.
+  - Attention wholesale: pure-torch oracle replacing the kernel
+    (VLLM_QC_MLA_SPARSE_ORACLE=1, vectorized) - still garbles.
+  - Kernel overlap: AMD_SERIALIZE_KERNEL=3 prevents the FAULT (queue
+    never deepens) but a serialized fresh boot still garbled post-churn
+    once - mixed evidence.
+- LANDED FIX (real latent bug regardless of whether it is THE bug):
+  UvaBufferPool reuse fence (vllm/v1/worker/gpu/buffer_utils.py). The
+  GPU reads these metadata buffers FROM HOST RAM AT KERNEL EXECUTION
+  TIME (UVA), the pool round-robined 2 slots, and chunked-prefill steps
+  queue with no data dependency - the CPU could rewrite a slot while
+  queued kernels still read it (stale slot mappings/block tables =>
+  foreign-slot KV writes). Now each slot records an event once its
+  consumers are enqueued and host-syncs before rewrite; default pool
+  depth 2 -> 4. The graveyard fault SURVIVED the fence, so the primary
+  corruptor is still at large.
+- HARDWARE EVIDENCE, inconclusive: every fault attributes to ONE
+  position - Worker_TP5 across three independent configs, and after
+  rotating HIP_VISIBLE_DEVICES by one, the fault moved to the rank
+  whose ring neighbor is physical GPU 5. But: UMC ECC counters clean,
+  XGMI error counters not exposed by this stack, GPU 5 passes 200
+  verified GEMM+copy iterations solo, and 100 x 256MB verified
+  all-reduces pass on all 8 ranks. The failure needs the full serving
+  concert (compute + RCCL + SDMA + UVA host reads overlapped).
+- STATE: dsv4-q4k-8 remains fully validated (its acceptance,
+  throughput A/B and verified restores all predate and survive this).
+  glm52 profiles restored to their real records; the corruption
+  gates ONLY GLM/MI300X serving under load and PREDATES this session's
+  changes. All diagnostics are env-gated, default-off, and in-tree:
+  WS_GRAVEYARD, MLA_INSERT_VERIFY, IDX_VERIFY, IDX_STATS,
+  MLA_SPARSE_ORACLE, KV_TIER_IDLE, KV_ZERO_DISABLE, IDX_TOPK_RECENCY
+  (broken semantics, do not trust), DEBUG_WORKSPACE.
+- NEXT (fresh campaign): (1) combined-stress harness = verified
+  GEMM + all-reduce + UVA host reads + SDMA overlapped, per GPU pair,
+  to chase the TP5/GPU-5-neighbor signal without the 192GB model in the
+  loop; (2) run the graveyard reproducer under
+  AMD_SERIALIZE_KERNEL=3 + AMD_SERIALIZE_COPY=3 (copies too) for exact
+  attribution; (3) dsv4 under the same graveyard layout (does DSV4
+  fault too = model-independent); (4) ROCm/RCCL versions vs known
+  gfx942 IMA errata; consider HSA_ENABLE_SDMA=0 as a discriminator.
+- Raw: perf/results/2026-08-30/kv-tier-mi300x/boot18..31*.log.
+
+## 2026-09-01 (late) - GLM/MI300X P0 ROOT-CAUSED: null-stream identity
+
+The worker's stream identity flipped to the null stream every step; AITER's
+stream contract; post_update row guard.
+
+- ROOT CAUSE (software, not hardware). Two layers, both fixed:
+  1. vllm/v1/worker/gpu/model_runner.py cached `main_stream` as a
+     functools.cached_property of torch.accelerator.current_stream() at
+     FIRST access - which happened while the thread was still on the
+     DEFAULT stream, before vLLM installed its dedicated per-process
+     stream (vllm/utils/torch_utils.py current_stream()). async_utils'
+     `stream()` context restored that stale cached stream after every
+     AsyncOutput copy, parking the main thread on the NULL stream until
+     the next explicit switch. Everything launched in that window
+     (post_update, the sparse-attention metadata builder, torch
+     elementwise ops, vLLM's wvSplitK GEMMs, our indexer_metadata
+     kernel - exactly 208 launches per worker per request in the HIP
+     API trace, boot40) ran on a second hardware queue with NO ordering
+     against the forward/sampler on the dedicated stream. post_update
+     read num_sampled/sampled_tokens BEFORE the sampler's fill kernels
+     executed and saw what the caching allocator had last put in those
+     512 B blocks: the MoE router's top-8 expert-id table (raw guard
+     dump [198,217,105,52,242,162,185,1 | 176,78,198,202,...], expert
+     198 hot; 256 experts; identical on all ranks because routing is
+     replicated). ns=515/67 then drove output_bin_counts[req*vocab +
+     token_id] += 1 across the address space: silent +1 garbling of
+     whatever was mapped (KV pool), MEMORY_APERTURE_VIOLATION when not.
+     The AsyncOutput D2H copy waited on the same stale stream, so the
+     scheduler also received the garbage counts (boot35 assertion).
+     Fix: main_stream resolved live; stream() restores the stream that
+     was actually current on entry; AsyncOutput waits on the live
+     producing stream (async_utils._producing_stream); pp_utils same.
+  2. AITER (owned dependency, ~/aiter): aiter::
+     getCurrentHIPStream() (csrc/include/aiter_stream.h) is a
+     thread-local defaulting to nullptr = the NULL stream, pointed at
+     torch's stream only for ops registered develop=True. Non-develop
+     pybind ops whose kernels read it launched on the null stream
+     unconditionally - module_mla_metadata (get_mla_metadata_v1, whose
+     outputs feed the decode kernel) on the GLM path; mhc/ds32 decode
+     kernels on DSV4's. Fix: in torch builds the header returns
+     c10::hip::getCurrentHIPStream() (the thread-local stays for
+     torch-free ctypes builds, which pass the stream explicitly), and
+     jit/core.py sets the thread-local for every op that has the
+     setter. All 27 built modules rebuilt against the new header.
+- EVIDENCE CHAIN (all on-box, boots 32-47, perf/results/2026-08-30/
+  kv-tier-mi300x/): dmesg page-fault records show all 8 workers
+  faulting within one second on a TCP read (compute kernel), each at
+  its own VA (not hardware); ROCm debug agent (works only with
+  LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1 - torch bundles its
+  own HSA) names the wave: tms::post_update, PC at the output_bin_counts
+  load; PYTORCH_NO_CUDA_MEMORY_CACHING=1 (hipFree syncs) -> 4/4 46K
+  prompts clean (freed-block reuse race); HSA_ENABLE_SDMA=0 -> still
+  faults (not the copy engine); VLLM_QC_NULL_STREAM=1 (worker on the
+  null stream so both queues coincide) -> clean; AMD_LOG_LEVEL=3 trace
+  -> 208 null-stream launches/worker/request pre-fix; VLLM_QC_STREAM_
+  DEBUG=1 post-fix -> forward, sampling and post_update all on
+  0x702fdd60 every step.
+- GUARD (permanent, native + Triton post_update): a row is validated
+  before any write (ns in [0, sampled_cols], tlen+ns within the row,
+  token ids in [0, vocab)); a bad row writes nothing and reports
+  through an int64[40] diag buffer that AsyncOutput.get_output checks
+  (plus a host-side count check), so this class now stops the server
+  with a fingerprint instead of scribbling the pool. Unit-checked on
+  GPU (valid rows update; the 515-count row is skipped and reported).
+- VALIDATION (fixed build, diag profile: 24 GiB pool, graphs NONE,
+  graveyard, tier idle): 4 x 46K prompts + 24 x 12K churn, no faults,
+  no guard trips (the same layout faulted on the FIRST 46K before).
+  Natural-text (WildChat) marker recall now holds at 2.2K/3.5K/5.4K/
+  6.3K (it failed from 3.6K before the fix, on every boot).
+- RESIDUAL (open, separate defect): natural-text recall garbles at
+  >= ~8.7K unserialized and >= ~10.4K under AMD_SERIALIZE_KERNEL=3+
+  COPY=3; a 10.4K request that reuses 5,120 prefix-cached tokens and
+  prefills only 5.3K new ones still garbles -> attention over a long
+  KV (~9-10K+) is wrong regardless of chunking, deterministic. Under
+  concurrent load the threshold drops (a 5.2K prompt garbled while
+  another decoded). Candidates: sparse indexer top-k / logits over
+  >8192 candidates, the ragged prefill kernel, QC decode splits at
+  high block counts, indexer K-cache tile addressing beyond 128
+  blocks. Next: extend tests/kernels/test_qc_rocm_mla_sparse.py to
+  kv 12K-16K; run VLLM_QC_MLA_SPARSE_SHADOW=1 and VLLM_QC_IDX_STATS=1
+  on a 12K natural prompt; bisect indexer vs attention by forcing a
+  dense window (index_topk >= ctx) via hf_overrides.
+- Still owed after the residual: real-profile (128 GiB, FULL_DECODE_
+  ONLY graphs) churn + eviction-restore acceptance for GLM, throughput
+  re-baseline (the null-stream RCCL cost is gone now that the worker
+  stays on its dedicated stream), DSV4 re-check with the rebuilt AITER
+  (its mhc kernels were on the null stream too), port of the QC sparse
+  kernel to QuixiCore-ROCm. The AITER fix stays local in ~/aiter
+  (we do not upstream; broken dependency kernels get replaced in-repo).
+- Diagnostics kept (env-gated, default off): VLLM_QC_STREAM_DEBUG,
+  VLLM_QC_NULL_STREAM, VLLM_QC_WS_GRAVEYARD, VLLM_KV_TIER_IDLE,
+  VLLM_QC_KV_ZERO_DISABLE, MLA_INSERT_VERIFY, IDX_VERIFY, IDX_STATS,
+  MLA_SPARSE_SHADOW/ORACLE. The rocm-debug-agent recipe:
+  LD_PRELOAD=/opt/rocm/lib/libhsa-runtime64.so.1 HSA_TOOLS_LIB=/opt/
+  rocm/lib/librocm-debug-agent.so.2 (+ --save-code-objects for
+  disassembly with /opt/rocm/llvm/bin/llvm-objdump --mcpu=gfx942).
+
+## 2026-09-02 - GLM/MI300X residual after the stream fix: still open
+
+Pool-position-dependent garbling, characterized.
+
+- WHAT IS KNOWN (boots 43-54, natural-text WildChat marker probes):
+  - The residual depends on WHERE in the KV pool a request lands, not
+    on its length: the same 4.3K/7.5K prompts recall cleanly when they
+    are among the first requests (low block ids) and garble after
+    ~36-42K tokens of other requests have been served (block ids past
+    ~350-650), on a fresh pool with no eviction. Under concurrent load
+    the threshold drops (a 5.2K prompt garbled while another decoded).
+  - Prefill is already wrong there: the first generated token is
+    garbage. A request that reuses 5,120 prefix-cached tokens and
+    prefills 5.3K new ones on high blocks still garbles.
+  - Exonerated on-box at high block ids: the QC sparse decode kernel
+    (parity vs oracle at the real 3,040,896-element block stride up to
+    720 blocks/46K rows, tests/kernels/test_qc_rocm_mla_sparse.py long
+    cases; in-vivo shadow maxdiff <= 0.015 on the garbling requests),
+    the latent insert (concat_and_cache_mla, int64; mla-insert-verify
+    now also fires for high slots: bad=0), the indexer K write (idx
+    verify bad=0; Triton and native paths both int64), the native and
+    Triton indexer gathers (int64 / long), the block zeroer (disabled:
+    unchanged), the UVA pool depth (64 slots: unchanged), the block
+    table gather + UVA num_blocks (VLLM_KV_INTEGRITY_CHECK extension:
+    no violation), top-k index range (no OOB).
+  - Timing matters: with the per-step synchronize of the integrity
+    check the high-block probes mostly recover (top-k reach returns to
+    ctxmax); under AMD_SERIALIZE_KERNEL/COPY=3 the 8.7K probe passes
+    but 10.4K still fails. The decode top-k reach on failing requests
+    stops at ~0.6 x context (e.g. max=2756 of 4605) while healthy
+    requests reach ctxmax-1; prefill reach is full even when the
+    output garbles.
+  - The torch-reference arm (VLLM_QC_MLA_SPARSE_ORACLE + VLLM_QC_
+    PAGED_LOGITS_TORCH) garbles even on low blocks: those references
+    are not production-equivalent on GLM and prove nothing.
+- OPEN: which consumer sees wrong data at high pool positions when the
+  CPU runs ahead. Remaining suspects: the AITER AOT paged MQA logits
+  (decode; Gluon AOT, offset types not auditable from Python), the
+  metadata builder's persistent buffers under run-ahead, the DSpark
+  draft/rejection path, prefix-cache block hashing at scale.
+- INSTRUMENTATION ADDED (env-gated): VLLM_KV_INTEGRITY_CHECK now also
+  verifies gathered block tables and UVA num_blocks against the CPU;
+  VLLM_QC_IDX_STATS samples every 32nd call (prefill included);
+  mla-insert-verify fires for every high-slot call (bounded 400);
+  VLLM_QC_UVA_POOL_DEPTH, VLLM_QC_PAGED_LOGITS_TORCH.
+- REPRODUCER (diag profile: 24 GiB pool, graphs NONE; ~3 min boot):
+  serve, send 3 x 10K "archive only" prompts, then a 4.3K marker
+  probe -> garbled head; the same probe as the first request recalls.
+
+## 2026-09-03 - GLM/MI300X residual ROOT-CAUSED AND FIXED
+
+AITER paged MQA logits is 32-bit; own paged kernel; host-tier lookup clamp; GLM
+tier acceptance PASS.
+
+- RESIDUAL ROOT CAUSE: AITER's paged lightning-indexer logits kernel
+  (aiter/ops/triton/gluon/pa_mqa_logits.py, Gluon, AMD buffer_load with
+  32-bit offsets) returns garbage for any cache block whose byte offset
+  exceeds 2 GiB. Proven in isolation: the same page bytes at block 100
+  vs blocks 200/350/352/353 agree exactly, blocks 360/700/1100 return
+  zeros (6 MB packed-slab stride, block 353 = 2.00 GiB). On the packed
+  cross-layer slab (~25 GB) the decode top-k therefore never saw
+  positions stored past ~22.6K pool tokens - the "position in the pool"
+  garbling, its 0.6x top-k reach, and its request-order dependence.
+  Buffer loads cannot address the slab from one base pointer whatever
+  the index type, so the kernel is replaced, not patched.
+- FIX (local, per policy - nothing goes upstream):
+  csrc/quixicore/rocm/fp8_paged_mqa_logits_kernel.cuh, bound as
+  quixicore_ops.mqa_logits_paged_gfx942: the contiguous fp8_mqa_logits
+  MFMA body and epilogue, keys fetched through the row's block table
+  with 64-bit addressing (SHUFFLE tile layout, scales after the values),
+  static grid (one CTA per padded row), lengths/tables read on device -
+  safe inside the captured decode graph. Dispatch in
+  rocm_fp8_paged_mqa_logits: required whenever the indexer cache view
+  spans >= 2 GiB; VLLM_QC_PAGED_LOGITS_NATIVE=1/0 forces it/AITER.
+  Parity test tests/kernels/test_qc_rocm_paged_mqa_logits.py (real
+  stride, blocks 3..700, top-k overlap > 0.98 vs torch reference).
+- A first attempt (per-request gather + contiguous kernel, plan built on
+  the CPU per step) was correct in isolation and wrong in vivo: the
+  production profile captures decode in FULL_DECODE_ONLY graphs, and
+  per-step plan tensors with a data-dependent gather grid are not
+  replayable. Removed; lesson recorded.
+- HOST TIER ON GLM: with kernels fixed the model recalled 3/3 but the
+  tier never restored (0 external hits). VLLM_KV_TIER_DEBUG=1 (new:
+  connector diagnostics at INFO) showed every post-eviction lookup
+  missing on `n > len(hashes)`: the sealed trajectory of the planted
+  conversation is longer than the follow-up's prefix (141/433 staged
+  positions incl. decoded blocks vs 139/431 queried). kv_tier_index
+  .lookup now clamps attention-only trajectories to the query length
+  (tail-required trajectories still need the exact boundary); unit test
+  added.
+- VALIDATION (fixed build, production glm52-q2k-8/mi300x record):
+  - low- and high-block natural probes 4/4 (4.5K/5K/8.4K/9.8K, the last
+    three past the 2 GiB boundary that garbled before); deep natural
+    recall pre-churn 5/5 to 22K and post-churn 4/4 to 18K; the original
+    P0 reproducer (24 x 12K churn, salad probes 4.3K-12.4K) recall 4/4
+    coherent; 46K prompts 22 s each; 0 guard trips / faults.
+  - Throughput (exact-token, random 1000/2000, temp 1.0/top_p 0.95/
+    top_k 20, tier idle): c1 83.0 tok/s TTFT 500 ms; c8 240.0 tok/s
+    TTFT 1.04 s (perf/results/2026-08-30/kv-tier-mi300x/bench_glm_
+    pagednative_c{1,8}.json). First GLM/MI300X numbers on record.
+  - Eviction-restore acceptance, 271K-token pool (fast cycle): PASS 2/2
+    - restored TTFT 0.21 s / 0.32 s vs 4.9 s / 15.5 s cold, external
+    hits 8,896 / 27,584, recall 3/3 per depth
+    (acceptance_glm52q2k8_fix.json). Production pool (1.36M) run with
+    VLLM_KV_TIER_VERIFY=1 in progress at this entry's time; see the
+    addendum below.
+- Still owed: DSV4 re-validation on the new dispatch (its indexer cache
+  is on the same packed slab, so AITER was wrong there past 2 GiB too;
+  its acceptance passed only because the planted requests were early),
+  tier-on throughput A/B, K3 unchanged, port of the two new gfx942
+  kernels to QuixiCore-ROCm.
+- ADDENDUM (production pool, 1.36M tokens, VLLM_KV_TIER_VERIFY=1,
+  acceptance_glm52q2k8_prod.json): recall 3/3 per depth and 0 verify
+  mismatches, but 0 external hits - a CAPACITY effect, not a fault. The
+  128 GiB pinned arena holds 22,598 slots x 64 = 1.446M tokens, only
+  ~90K more than the GPU pool; evicting the pool takes 26 x 55K = 1.43M
+  filler tokens, every one of them offloaded too, so the index's
+  reclaim (oldest complete trajectory first, kv_tier_index._reclaim)
+  dropped the three planted conversations (74K) before the probes. On
+  this record the tier therefore only ever retains ~6% beyond the GPU
+  pool; the mechanism is proven by the 271K-pool cycle above, and the
+  useful headroom needs the pinned ceiling lifted (per-device GTT
+  mapping / sharding follow-ups in the 2026-08-30 entry). The
+  acceptance harness should check plants + fillers against the arena
+  and say so instead of reporting a tier miss.
+- DSV4 (dsv4-q4k-8/mi300x, tier idle, 13.3M-token pool) on the same
+  build: the indexer cache spans 139 GiB so the native paged kernel is
+  selected there too (heads=64, top-k 512, block 256; parity vs
+  reference at that geometry 1.00). Sanity: factual, short natural
+  recall (813/2076 tokens) and salad recall (4.3K/10.8K) all correct at
+  low blocks. Past the 2 GiB boundary (78K tokens of fill) AITER-forced
+  salad recall was 1/3 (10K and 20K derailed); native recall 2/3 with
+  the miss a coherent digit slip, plus follow-up seeds recorded below.
+  The WildChat "archived document" probe format is unreliable on DSV4
+  regardless of kernel (also on 2026-08-30: hot 0/3) - not a regression;
+  it stays calibrated by the hot control in the acceptance harness.
+  No guard trips or faults in any DSV4 run.
+  DSV4 native-kernel follow-up seeds: high blocks 10K (x2) / 15K =
+  miss/hit/miss with coherent digit slips; the LOW-block control with
+  the same seeds on a fresh pool = miss/hit/miss identically
+  (boot69/boot70 logs). Position in the pool no longer changes DSV4's
+  behaviour; what remains is the model's salad-prompt weakness at
+  10K+, calibrated by the hot control as before.
+- NEXT: tier-on throughput A/B for GLM (tier idle numbers above are
+  the baseline), the acceptance-harness capacity check, port of
+  fp8_paged_mqa_logits_kernel.cuh + the sparse decode kernel to
+  QuixiCore-ROCm, K3 unchanged.
+- Tier-on throughput A/B (2026-09-03, glm52-q2k-8/mi300x, exact-token
+  random 1000/2000, temp 1.0 / top_p 0.95 / top_k 20, seed 42):
+  c1 tier-idle 83.0 tok/s (TTFT 500 ms) vs tier-on 73.2 (510 ms);
+  c8 tier-idle 240.0 (1042 ms) vs tier-on 261.4 (1013 ms). Same shape as
+  the DSV4 A/B: the per-step offload staging costs ~12% at c1 and is
+  hidden under batching. bench_glm_tieron_c{1,8}.json.
+- PORT + OPTIMIZATION (2026-09-03, QuixiCore-ROCm kernels/serving/
+  variants/rocm_cdna3): fp8_paged_mqa_logits_kernel.cuh and the sparse
+  varlen MLA decode (mla_sparse_varlen_kernels.cuh) now live in the
+  library with self-checking harnesses (bitwise vs the contiguous
+  kernel, fp64 oracle, past-2GiB cases; all 18 family harnesses pass);
+  shared headers re-synced (incl. the post_update guard). The library
+  bench exposed the paged kernel's occupancy bottleneck (one CTA per
+  row: 64 CTAs / 304 CUs -> 1.68 ms, 10 TFLOP/s at 64 rows x 32K). Fix
+  kept in both trees: split each row's context across CTAs
+  (split_len, static grid sized for max_model_len, empty splits free):
+  1024-key splits -> 0.111 ms, 155 TFLOP/s (15.2x), bitwise identical.
+  SlimServe's binding uses 1024. Library entry: QuixiCore-ROCm
+  perf/optimization_status.md 2026-09-03.
+  Serving effect (glm52-q2k-8/mi300x, tier idle, exact-token c8
+  random 1000/2000): 267.8 tok/s with 1024-key splits vs 240.0 with
+  the one-CTA-per-row kernel (+11.6%); mean TTFT 1443 ms vs 1042 ms in
+  this run (single sample, prefill unchanged by this kernel - treat as
+  noise until re-measured). bench_glm_split1024_c8.json. Recall probes
+  4/4 at low and high blocks on the same boot.
 ### glm52-q2k-4 fp8@131072 sweep leg: PASS (stride fix validated under churn)
 - Rerun after the KVCacheTensor.block_stride fix: c8 WildChat deep-context,
   full 1.25h wall, ZERO errors (first run: 16 errors/8 dead sessions at the
@@ -18595,3 +19151,91 @@ token, approximate:
   the 576-token hash block), VLLM_KV_TIER_VERIFY 0/109 mismatched on
   every restore, 6/6 markers recalled. Raw: perf/results/2026-09-04/
   glm53-nvfp4-8-tier/. Both glm53 records now carry the tiers.
+## 2026-09-03 - NVMe tier on the dedicated device: greedy recall validated, promotion path clean, c8 best-ever
+
+- Device: nvme1n1 (3.7 TB, PCIe gen3 x2) carried a stale NTFS boot
+  sector at 129 MiB (no partition table, no filesystem signature; the
+  operator confirmed it blank) - wiped, formatted XFS (label kvtier),
+  mounted at /mnt/kvtier with a nofail fstab entry, and pointed at by
+  SLIMSERVE_KV_TIER_DIR in /etc/slimserve/env (operator-side files, not
+  the repo). Profile nvme_tier_gb_per_rank 128 -> 448: 8 x 448 GiB =
+  3.5 TiB fallocated at boot, 80,273 slots x 800 tokens per rank = ~64M
+  tokens of disk-resident conversation capacity.
+- Greedy diagnostic (tier_exact_8001.py, temperature 0, 8K/24K/42K
+  markers, 6 x 55K churn), both configs on port 8001 with prod stopped:
+  | config                    | depth | restored | cold  | promoted from disk | recall |
+  | A: host 2 GiB + NVMe 32   | 8K    | 1.3 s    | 2.1 s | yes (13 reads)     | OK     |
+  |                           | 24K   | 2.0 s    | 5.7 s | yes (33 reads)     | OK     |
+  |                           | 42K   | 2.7 s    | 9.9 s | yes (56 reads)     | OK     |
+  | B: host 88 + NVMe 448     | 8K    | 0.8 s    | 2.1 s | no (host hit)      | OK     |
+  |                           | 24K   | 0.8 s    | 5.7 s | no (host hit)      | OK     |
+  |                           | 42K   | 0.8 s    | 10.0 s| no (host hit)      | OK     |
+  Every restored answer is a well-formed thinking trace closing on the
+  right codename; zero IO errors, zero invalid-block reports. The
+  script's first verdict rule (common prefix >= 40 chars with the hot
+  control) flagged three legs whose traces differ only in the model's
+  own paraphrase ("recall ... of their message" vs "identify ... of the
+  text", diverging at char 35) - the same variation appears between two
+  HOST-resident hits in config B where no disk read occurred, so it is
+  the re-prefill chunk split above the tail boundary, not the NVMe path.
+  Verdict rule corrected to recall + well-formed answer + restore speed;
+  the offline re-judgement of both logs is 6/6 OK.
+- NVMe promotion is exercised only by config A (the 88 GiB host tier
+  never fills in a short run); config B exercises write-through only
+  (KV Transfer metrics: disk_write_batches=14 in the interval log).
+- Throughput: c8 exact 1000/2000 seed 42 = 610.2 tok/s with the 448 GiB
+  tier writing through on the dedicated device - the best fp8 c8 recorded
+  (prior 594.2/590.4/568.8/559.5; bf16 band 590.7-600.5). Single sample;
+  reads as "write-through on its own device is free", not as a gain.
+- Disk housekeeping: the O_TMPFILE arenas vanish at shutdown (df back to
+  74 GB used on the 3.8 TB mount after the run).
+- Decision: RETAINED - profile at 448 GiB/rank on /mnt/kvtier. Next
+  command: `sudo systemctl start slimserve-qwen38fn`, then confirm
+  "kv-nvme: 80273 slots ... in /mnt/kvtier" in /var/log/SlimServe/serve.log.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A4,B4}_8001
+  .log, tier_exact_nvme_{A4,B4}.log, bench_fp8kv_c8_nvme4.log,
+  run_nvme_exact4.out).
+
+## 2026-09-04 - Merge with origin/main: upstream host tier survives; GLM re-PASS
+
+MI300X P0 branch (535d2886dc) merged with 34 upstream commits (4ed41b781d),
+then a hook-cleanliness commit for the tier modules (2fce6a002d).
+
+- MERGE DECISIONS: upstream's host tier (group-aware slots, attention-only
+  partial resume with lineage adoption/supersede, NVMe third tier, exact-size
+  cudaHostRegister arena) is the survivor for kv_tier_index, kv_tier_dma and
+  host_tier_connector; its allow_partial lookup already clamps a longer stored
+  trajectory to the query prefix, so the MI300X lookup clamp became a test
+  (`test_partial_lookup_clamps_a_longer_trajectory_to_the_query`). Grafted: a
+  bounded retry when cudaHostRegister returns out-of-memory (the 2026-08-31
+  eight-rank pin race), VLLM_KV_TIER_IDLE for tier-on vs tier-idle A/Bs, the
+  MI300X profile guard, and the post_update row-guard arguments on the CUDA
+  binding (upstream's partitioned sparse decode kept). Dropped: the
+  KVCacheConfig.group_block_bytes plumbing (the surviving connector reads
+  KVCacheTensor.block_stride). `_C_stable_libtorch` rebuilt for upstream's
+  cache_kernels change.
+- VALIDATION (merged tree): unit suites 88 passed (tier index/connector/disk/DMA
+  and profiles), ROCm kernel tests 15 passed (paged MQA logits at real stride
+  past 2 GiB, sparse decode at high block ids). glm52-q2k-8/mi300x fast-cycle
+  acceptance PASS 2/2, identical to the 2026-09-03 pre-merge run: depth 8000
+  (8,930 tok) plant TTFT 4.75 s, hot 0.21 s, restored 0.21 s, 8,896 external
+  hits; depth 24000 (27,591 tok) plant 15.2 s, hot 0.27 s, restored 0.33 s,
+  27,584 hits; 6 fillers, eviction 231 s, recall 3/3 per depth. Upstream's
+  exact-size registered arena pinned 22,598 slots (128 GiB) on every rank
+  without a retry; the native paged kernel was selected (24 GiB indexer span).
+  Artifacts: perf/results/2026-09-04/kv-tier-mi300x-merged/.
+- FAST-CYCLE RECIPE (record it, it bit again): shrinking the pool to 271,168
+  tokens (kv_cache_memory_bytes 25768552704) alone fails at boot because the
+  engine refuses a pool smaller than one max-length request; the record also
+  needs max_model_len 262144 for the run, then git checkout the profile.
+- NOT RE-RUN on the merged tree: production-pool acceptance (capacity-bound by
+  design, 2026-09-03 addendum), the tier-on/idle throughput A/B, DSV4.
+- PORT AUDIT vs QuixiCore-ROCm (2026-09-04): every vendored ROCm serving
+  header matches the library up to hipify/clang-format except
+  v2_sample_kernels.cuh, whose 2026-08-10 NaN-safe argmax fix (6ab3a92fe0)
+  had never been ported. Ported with harness cases and a bench; library
+  entry QuixiCore-ROCm perf/optimization_status.md 2026-09-04 (argmax at
+  T=64: 0.017 -> 0.019 ms, the sanitize cost SlimServe already pays). The
+  library's mla_kernels.cuh / paged_attn_v2_kernels.cuh are July CDNA3 ports
+  of the CUDA files and are not on the ROCm serving path; their CUDA
+  evolution belongs to QuixiCore-CUDA.

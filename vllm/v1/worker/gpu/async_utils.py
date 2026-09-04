@@ -3,6 +3,7 @@
 import contextlib
 import functools
 import os
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -28,6 +29,18 @@ def make_output_copy_stream(device: torch.device | str | None) -> torch.Stream:
     if dev is not None and dev.type == "mps":
         return torch.accelerator.current_stream(dev)
     return torch.Stream(device)
+
+
+def _producing_stream(main_stream: torch.Stream) -> torch.Stream:
+    """The stream the producer just ran on: the current stream, queried
+    live. Falls back to the handed stream only where it cannot be queried
+    (the MPS single-stream case keeps its handed producing stream)."""
+    if _is_metal_platform():
+        return main_stream
+    try:
+        return torch.accelerator.current_stream(main_stream.device)
+    except Exception:
+        return main_stream
 
 
 @functools.cache
@@ -103,11 +116,21 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # make_completion_event for why the generic machinery is unsafe there.
         self.copy_event = make_completion_event()
         self._has_fault: torch.Tensor | None = None
+        # (host int64[40], event) from the post_update row guard, attached by
+        # the runner after the kernel is enqueued; checked in get_output so
+        # a corrupted sampler buffer is reported before the scheduler can act
+        # on it. See model_runner._post_update_guard_failure.
+        self.post_update_guard: tuple[torch.Tensor, torch.cuda.Event] | None = None
+        self.post_update_guard_check: Callable[[torch.Tensor, int], None] | None = None
 
         # On MPS, make_output_copy_stream hands out the producing stream
         # (the only one that exists), so the copies enqueue with no stream
         # switching at all. CUDA/ROCm arrive with a dedicated copy stream
         # and retain the overlap.
+        # The producing stream is whatever is current NOW, never a cached
+        # value: the sampler ran on it, and this copy must wait for it
+        # (see stream() below for the corruption a stale cache caused).
+        main_stream = _producing_stream(main_stream)
         copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
         with (
@@ -146,6 +169,26 @@ class AsyncOutput(AsyncModelRunnerOutput):
         # rather than Python lists.
         sampled_token_ids: list[list[int]] = self.sampled_token_ids.tolist()
         num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
+        if self.post_update_guard is not None:
+            host, event = self.post_update_guard
+            # post_update is enqueued on the main stream right after the
+            # sampler; the copy event above already waited for the sampler,
+            # so this adds only the tiny kernel itself.
+            event.synchronize()
+            if int(host[0]) != 0 and self.post_update_guard_check is not None:
+                self.post_update_guard_check(host, len(num_sampled_tokens))
+        row_len = (
+            self.sampled_token_ids.shape[1] if self.sampled_token_ids.ndim == 2 else 1
+        )
+        for i, num_tokens in enumerate(num_sampled_tokens):
+            if num_tokens < 0 or num_tokens > row_len:
+                raise RuntimeError(
+                    f"sampler output corrupted: num_sampled[{i}]={num_tokens} on "
+                    f"a {row_len}-wide sampled_token_ids row (host copy); the "
+                    "per-step sampler buffers were overwritten before the output "
+                    "copy ran (perf/optimization_status.md 2026-09-01). Counts: "
+                    f"{num_sampled_tokens[:16]}"
+                )
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
         self.model_runner_output.sampled_token_ids = sampled_token_ids
@@ -188,6 +231,7 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
 
         # Same single-place platform decision as AsyncOutput: on MPS the
         # handed copy stream IS the main stream (make_output_copy_stream).
+        main_stream = _producing_stream(main_stream)
         copy_on_main_stream = copy_stream == main_stream
         output_stream = main_stream if copy_on_main_stream else copy_stream
         with (
@@ -221,10 +265,30 @@ def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
 
 
 @contextlib.contextmanager
-def stream(to_stream: torch.Stream, from_stream: torch.Stream):
-    """Lightweight accelerator stream context manager."""
+def stream(to_stream: torch.Stream, from_stream: torch.Stream | None = None):
+    """Lightweight accelerator stream context manager.
+
+    Restores the stream that was ACTUALLY current on entry, never a cached
+    `from_stream`. Restoring a stale cached stream was the GLM-5.2/MI300X
+    corruption root cause (2026-09-01): the runner had cached the default
+    stream as "main" before vLLM installed its dedicated per-process stream,
+    so every output copy exited this context by parking the main thread on
+    the null stream. Everything launched until the next explicit stream
+    switch (post_update, the attention metadata builder, parts of the next
+    forward) then ran on a second hardware queue with no ordering against
+    the sampler and the model - kernels read buffers before they were
+    written and saw whatever the allocator had recycled (the MoE router's
+    expert ids in the sampler's count buffer). `from_stream` is accepted
+    for call-site compatibility and only used when no accelerator stream
+    can be queried.
+    """
+    try:
+        prev = torch.accelerator.current_stream(to_stream.device)
+    except Exception:
+        prev = from_stream
     try:
         torch.accelerator.set_stream(to_stream)
         yield
     finally:
-        torch.accelerator.set_stream(from_stream)
+        if prev is not None:
+            torch.accelerator.set_stream(prev)

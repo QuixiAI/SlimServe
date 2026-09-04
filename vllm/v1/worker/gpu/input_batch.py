@@ -690,6 +690,9 @@ def _post_update_kernel(
     all_token_ids_ptr,
     all_token_ids_stride,
     total_len_ptr,
+    sampled_cols,
+    vocab_size,
+    diag_ptr,
 ):
     req_id = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_id)
@@ -699,6 +702,32 @@ def _post_update_kernel(
 
     total_len = tl.load(total_len_ptr + req_state_idx)
     num_sampled = tl.load(num_sampled_ptr + req_id)
+    # Bounds guard, mirrored from the native kernel: validate the whole row
+    # before writing anything, report the first bad row through diag.
+    bad = 0
+    if num_sampled < 0 or num_sampled > sampled_cols:
+        bad = 1
+    elif total_len < 0 or total_len + num_sampled > all_token_ids_stride:
+        bad = 2
+    else:
+        for i in range(num_sampled):
+            t = tl.load(sampled_tokens_ptr + req_id * sampled_tokens_stride + i)
+            t_bad = (t < 0) | ((vocab_size > 0) & (t >= vocab_size))
+            bad = bad + 3 * t_bad.to(tl.int32)
+    if bad != 0:
+        if diag_ptr is not None:
+            prev = tl.atomic_add(diag_ptr, 1)
+            if prev == 0:
+                tl.store(diag_ptr + 1, bad.to(tl.int64))  # type: ignore[attr-defined]
+                tl.store(diag_ptr + 2, req_id.to(tl.int64))
+                tl.store(diag_ptr + 3, req_state_idx.to(tl.int64))
+                tl.store(diag_ptr + 4, num_sampled.to(tl.int64))
+                tl.store(diag_ptr + 5, total_len.to(tl.int64))
+                first = tl.load(sampled_tokens_ptr + req_id * sampled_tokens_stride)
+                tl.store(diag_ptr + 6, first.to(tl.int64))
+                nr = tl.load(num_rejected_ptr + req_id)
+                tl.store(diag_ptr + 7, nr.to(tl.int64))
+        return
     if num_sampled > 0:
         token_id = tl.load(
             sampled_tokens_ptr + req_id * sampled_tokens_stride + num_sampled - 1
@@ -757,8 +786,17 @@ def post_update(
     all_token_ids: torch.Tensor,
     # [max_num_reqs]
     total_len: torch.Tensor,
+    # int64[8] device buffer receiving the first row that failed the bounds
+    # guard (native and Triton paths); None disables reporting, never the
+    # guard itself.
+    diag: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    # Row guard bounds. A corrupted num_sampled / sampled_tokens row turned
+    # the output_bin_counts increment loop into a GPU-wide scatter of +1s on
+    # GLM-5.2/MI300X (2026-09-01); every row is validated before any write.
+    sampled_cols = sampled_tokens.shape[1] if sampled_tokens.ndim == 2 else 1
+    vocab_size = output_bin_counts.shape[1] if output_bin_counts is not None else 0
     if idx_mapping.device.type == "mps":
         # Fully tensorized: num_sampled/num_rejected are verify outputs that
         # only exist on the GPU, so loop control on them would be a sync.
@@ -847,6 +885,9 @@ def post_update(
             all_token_ids,
             all_token_ids.stride(0),
             total_len,
+            sampled_cols,
+            vocab_size,
+            diag,
         )
         return
     _post_update_kernel[(num_reqs,)](
@@ -863,6 +904,9 @@ def post_update(
         all_token_ids,
         all_token_ids.stride(0),
         total_len,
+        sampled_cols,
+        vocab_size,
+        diag,
         num_warps=1,
     )
 

@@ -17,10 +17,10 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
 instead of embedding feature-specific logic directly.
 """
 
-import functools
 import gc
 import os
 import time
+from collections import deque
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -175,6 +175,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_encoder_decoder = self.model_config.is_encoder_decoder
 
         self.output_copy_stream = make_output_copy_stream(self.device)
+
+        # post_update row-guard reporting (GLM-5.2/MI300X root cause,
+        # 2026-09-01): the kernel validates every sampled row before writing
+        # and records the first violation in this int64[40] device buffer. Each
+        # step enqueues an async D2H of it behind the kernel; completed copies
+        # are checked on later steps without ever blocking the host, so the
+        # check cannot perturb the very timing that exposes the corruption.
+        self._pu_guard_enabled = self.device.type != "mps"
+        self._pu_diag: torch.Tensor | None = (
+            torch.zeros(40, dtype=torch.int64, device=self.device)
+            if self._pu_guard_enabled
+            else None
+        )
+        self._pu_pending: deque[tuple[torch.Tensor, torch.cuda.Event, int, int]] = (
+            deque()
+        )
+        self._pu_step = 0
 
         # Pipeline parallelism.
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -456,9 +473,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.vllm_config.model_config = self.model_config
         self.vllm_config.load_config = self.load_config
 
-    @functools.cached_property
+    def _stream_debug(self, tag: str) -> None:
+        """VLLM_QC_STREAM_DEBUG=1: log which stream the worker thread is on
+        at the step's key points (first calls only), alongside vLLM's
+        dedicated stream and the default stream."""
+        if os.environ.get("VLLM_QC_STREAM_DEBUG") != "1":
+            return
+        counts = self.__dict__.setdefault("_stream_debug_counts", {})
+        n = counts.get(tag, 0)
+        if n >= 10:
+            return
+        counts[tag] = n + 1
+        from vllm.utils.torch_utils import current_stream as vllm_current_stream
+
+        def sid(s) -> int:
+            v = getattr(s, "cuda_stream", None)
+            return int(v) if v is not None else int(getattr(s, "stream_id", -1))
+
+        cur = torch.cuda.current_stream(self.device)
+        logger.info(
+            "[STREAM DEBUG] %s #%d: torch current=0x%x vllm_helper=0x%x "
+            "default=0x%x copy=0x%x thread=%s",
+            tag,
+            n,
+            sid(cur),
+            sid(vllm_current_stream()),
+            sid(torch.cuda.default_stream(self.device)),
+            sid(self.output_copy_stream),
+            __import__("threading").current_thread().name,
+        )
+
+    @property
     def main_stream(self) -> torch.Stream:
-        # Cache the default accelerator stream to avoid lookup overhead.
+        # Queried live, never cached. A cached_property here captured the
+        # DEFAULT stream when first touched before vLLM installed its
+        # dedicated per-process stream; the AsyncOutput stream context then
+        # restored that stale value after every output copy and parked the
+        # main thread on the null stream - a second hardware queue with no
+        # ordering against the sampler and the forward. Root cause of the
+        # GLM-5.2/MI300X KV garbling and page faults (2026-09-01); see
+        # async_utils.stream(). Two lookups per step cost nothing.
         return torch.accelerator.current_stream(self.device)
 
     def get_kv_cache_spec(self):
@@ -1357,6 +1411,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
+        self._check_post_update_guard()
+        self._stream_debug("post_update.before")
         post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
@@ -1368,10 +1424,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc,
             self.req_states.all_token_ids.gpu,
             self.req_states.total_len.gpu,
+            diag=self._pu_diag,
         )
+        self._pu_last: tuple[torch.Tensor, torch.cuda.Event] | None = None
+        if self._pu_guard_enabled and self._pu_diag is not None:
+            host = torch.empty(40, dtype=torch.int64, pin_memory=True)
+            host.copy_(self._pu_diag, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            self._pu_pending.append(
+                (host, event, self._pu_step, int(idx_mapping.shape[0]))
+            )
+            self._pu_last = (host, event)
+        self._pu_step += 1
 
         self.model_state.postprocess_state(
             idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+        )
+
+    def _check_post_update_guard(self) -> None:
+        """Consume completed guard copies; fail loudly on the first violation.
+
+        Only copies whose event has completed are read (event.query()), so this
+        never blocks the host on the GPU.
+        """
+        while self._pu_pending and self._pu_pending[0][1].query():
+            host, _, step, num_reqs = self._pu_pending.popleft()
+            if int(host[0]) == 0:
+                continue
+            self._post_update_guard_failure(host, num_reqs, step)
+
+    def _post_update_guard_failure(
+        self, host: torch.Tensor, num_reqs: int, step: int = -1
+    ) -> None:
+        reasons = {
+            1: "num_sampled outside [0, sampled_cols]",
+            2: "total_len + num_sampled outside the all_token_ids row",
+            3: "sampled token id outside [0, vocab_size)",
+        }
+        v = host.tolist()
+        raw = [w & 0xFFFFFFFF for x in v[8:40] for w in (x, x >> 32)]
+        logger.error(
+            "post_update row guard: raw int32 words at the sampled_tokens row: %s",
+            raw,
+        )
+        raise RuntimeError(
+            f"post_update row guard tripped: {reasons.get(v[1], '?')} (reason "
+            f"{v[1]}) at step {step} (num_reqs={num_reqs}): count={v[0]} "
+            f"batch_row={v[2]} req_state_idx={v[3]} num_sampled={v[4]} "
+            f"total_len={v[5]} sampled_tokens[row][0]={v[6]} "
+            f"(0x{v[6] & ((1 << 64) - 1):x}) num_rejected={v[7]}. The "
+            "sampler's per-step num_sampled/sampled_tokens buffers held "
+            "foreign data when the post-update kernel ran; serving stops here "
+            "instead of scribbling the GPU pool (see "
+            "perf/optimization_status.md 2026-09-01)."
         )
 
     @torch.inference_mode()
@@ -1384,6 +1490,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        self._stream_debug("execute_model.entry")
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1607,8 +1714,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
+                    self._stream_debug("forward.before")
                     with _qc_phase("target_forward"):
                         model_output = self.model(**model_inputs)
+        self._stream_debug("forward.after")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1647,6 +1756,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
     ) -> AsyncOutput | ModelRunnerOutput | None:
+        self._stream_debug("sample_tokens.entry")
         if self.execute_model_state is None:
             # The prior execute_model call must have failed.
             return None
@@ -1866,6 +1976,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         raw_id & 0xFFFFFFFFFFFFFFFF,
                     )
 
+        # Hand the post_update guard record to the output: get_output() waits
+        # for the sampler copies anyway, so it can report a corrupted sampler
+        # row before the scheduler consumes the tokens.
+        async_output.post_update_guard = getattr(self, "_pu_last", None)
+        async_output.post_update_guard_check = self._post_update_guard_failure
         return async_output
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:

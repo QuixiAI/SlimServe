@@ -259,7 +259,43 @@ class BlockTables:
                 num_reqs,
                 BLOCK_SIZE=1024,  # type: ignore
             )
+        if _integrity_checks_enabled() and self.device.type != "mps":
+            self._check_gathered_block_tables(idx_mapping, out, num_reqs)
         return tuple(bt[:num_reqs_padded] for bt in out)
+
+    def _check_gathered_block_tables(self, idx_mapping, out, num_reqs) -> None:
+        """VLLM_KV_INTEGRITY_CHECK=1: the gathered per-batch block tables must
+        equal the per-request source rows for the live prefix, and the live
+        prefix length the GPU used (UVA num_blocks) must match the CPU's.
+        A stale prefix length silently truncates every downstream reader
+        (indexer gather, slot mapping, attention) at a request-varying point
+        - the 2026-09-02 high-block garbling signature."""
+        torch.cuda.synchronize()
+        idx = idx_mapping[:num_reqs].tolist()
+        for g in range(self.num_kv_cache_groups):
+            src = self.block_tables[g].gpu
+            for b, ridx in enumerate(idx):
+                if ridx < 0:
+                    continue
+                nb_cpu = int(self.num_blocks.np[g, ridx])
+                nb_gpu = int(self.num_blocks.gpu[g, ridx])
+                if nb_cpu != nb_gpu:
+                    raise RuntimeError(
+                        f"KV integrity: group {g} req_idx {ridx}: UVA num_blocks "
+                        f"{nb_gpu} != CPU {nb_cpu} (stale UVA slot)"
+                    )
+                if nb_cpu == 0:
+                    continue
+                got = out[g][b, :nb_cpu]
+                exp = src[ridx, :nb_cpu]
+                if not torch.equal(got, exp):
+                    bad = (got != exp).nonzero().flatten()[:8].tolist()
+                    raise RuntimeError(
+                        f"KV integrity: group {g} batch row {b} (req_idx {ridx}) "
+                        f"gathered block table differs from source at entries "
+                        f"{bad} of {nb_cpu}: got {got[bad].tolist()} exp "
+                        f"{exp[bad].tolist()}"
+                    )
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         # NOTE(woosuk): The output may be used for CUDA graph capture.
