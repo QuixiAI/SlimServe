@@ -1099,10 +1099,9 @@ def test_every_a100_profile_carries_the_host_kv_tier():
     config, because their group specs are not verified to resolve
     all-uniform on their own.
     """
-    # The glm53 records are the a100 records without the tier: their
-    # KDA-state + MLA + indexer groups mix block sizes, which the generic
-    # packed slab planner cannot lay out (the notes state the follow-up).
-    tier_pending = {"glm53-nvfp4-4", "glm53-nvfp4-8"}
+    # Every a100 record carries the tier (the glm53 records joined on
+    # 2026-09-03 once the connector handled per-group block ratios).
+    tier_pending: set[str] = set()
     seen = 0
     for profile_id, entry in registry._registry()["profiles"].items():
         record = entry.get("variants", {}).get("a100")

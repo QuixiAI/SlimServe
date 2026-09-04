@@ -232,9 +232,13 @@ behavior:
   enable_cross_layers_blocks). Tier RESTORES on A100 are proven only
   where the instrumented acceptance shows them: GLM-5.2 (2026-08-31,
   restores + SHA verify clean); DSV4 stays write-only by design until
-  window-tail staging exists for its sliding-window groups; glm53-nvfp4-4
-  carries no tier until the packed planner handles KDA+MLA mixed block
-  sizes. Recall probes alone do not prove the tier (full re-prefill
+  window-tail staging exists for its sliding-window groups; the glm53
+  records (TP4 and TP8) carry the host tier AND the NVMe third tier
+  since 2026-09-04 - the packed slab over KDA state + MLA + indexer
+  groups with per-group block ratios in the connector, proven by the
+  eviction-restore acceptance with VLLM_KV_TIER_VERIFY=1 (host restores
+  and disk promotions both 0/58 mismatched). Recall probes alone do not
+  prove the tier (full re-prefill
   answers them too): the standing check is
   benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1,
   read alongside the connector's hit/restore counters. MI300X still

@@ -1947,6 +1947,18 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   2026-09-02 (19/19 recall to 114K) on the pre-kernel-fix stack.
 - The 2026-09-01 TP4 numbers below predate all three fixes and are kept
   as history; their c8 331.4 is not reproducible and is superseded.
+- Host + NVMe KV tiers ENABLED on both records (2026-09-04): 64 GiB
+  pinned host RAM per rank plus a 128 GiB per-rank disk tier
+  (SLIMSERVE_KV_TIER_DIR, operator environment). Layout: packed
+  cross-layer slab over all 56 layers (4 KDA state groups + MLA +
+  indexer), per-group block ratios in the connector (indexer 2176-token
+  blocks over the 1088 hash block at TP4). Acceptance (TP4, 40K-token
+  target, 1.9M-token churn of a 1.24M-token pool, VLLM_KV_TIER_VERIFY=1):
+  host tier 48 GiB/rank - 6/6 probes hit and restored at block 36, 58
+  restore ops each, 0/58 mismatched; disk tier with an 8 GiB host tier
+  so restores promote from disk - 0/58 mismatched, 0 disk round-trip
+  mismatches, 6/6 recalled. Raw: perf/results/2026-09-03/
+  kvtier-acceptance/glm53-tp4-{host48,disk9}/.
 
 ### History: GLM-5.3-Flash NVFP4 (glm53-nvfp4-4, A100 x4)
 

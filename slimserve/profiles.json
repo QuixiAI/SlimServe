@@ -2577,7 +2577,16 @@
             "reasoning_parser": "glm47",
             "tool_call_parser": "glm47",
             "served_model_name": "GLM-5.3-Flash",
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 64,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
           "env": {},
           "notes": [
@@ -2588,7 +2597,7 @@
             "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
-            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+            "Host KV tier ENABLED (2026-09-03): 64 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 128 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53-nvfp4-8-tier/)."
           ]
         }
       }
@@ -2630,7 +2639,16 @@
             "reasoning_parser": "glm47",
             "tool_call_parser": "glm47",
             "served_model_name": "GLM-5.3-Flash",
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 64,
+                "nvme_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
           "env": {},
           "notes": [
@@ -2641,7 +2659,7 @@
             "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
-            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+            "Host KV tier ENABLED (2026-09-03): 64 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 128 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53-nvfp4-8-tier/)."
           ]
         }
       }
