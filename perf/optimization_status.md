@@ -19589,3 +19589,48 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   serve-logs/serve-20260904-162849.log and ab-o-norm-triton.log under
   /raid/scratch/slimserve-glm53/serve-logs/; driver ab.sh (boot the
   profile, bench two passes, stop).
+
+## 2026-09-04: KDA g_a_proj folded into the merged in-projection - RETAINED (+0.9% c1, neutral c8/c16)
+
+- Status: RETAINED. Phase 1 item 1 step 1a (same-input GEMV fold), the
+  first of the launch-count changes from the per-projection attribution.
+- Scope: rtx6000 record with the F32 sidecar and the o_norm Triton path
+  (e42866775), exact-token 1000/300 c1/c8/c16, one boot, two passes, then
+  the NLL/needle gate twice on the same boot.
+- Baseline: the o_norm boot (o-norm-triton): c1 110.05 / c8 444.6 / c16
+  603.0. Gate reference: the peer's sidecar boots, mean text logprob
+  -2.416 .. -2.440 (within-boot jitter ~0.02-0.03).
+- Hypothesis: g_a_proj (128 x 4096, replicated) reads the same
+  hidden_states as in_proj_qkvgfab; as a separate ReplicatedLinear it costs
+  one 2.1 us launch per KDA layer at decode (34 per step, 0.07-0.08 ms)
+  for 1 MB of weight that the merged GEMM can stream for free.
+- Change: _KimiGDNMergedColumnParallelLinear takes replicated_shard_ids
+  (a tuple) instead of one id; the low-rank-gate branch appends g_a as
+  shard 5 beside f_a (shard 4), both replicated; forward splits g_a off
+  the projection output and feeds g_b_proj; glm5_next's
+  stacked_params_mapping maps g_a_proj to shard 5. Local N goes 6288 ->
+  6416 (still 16-aligned, no padding). The full-rank-gate branch is
+  unchanged. Two files, +20/-18.
+- Correctness: boot clean (the loader takes the new shard; F32 overrides
+  applied), exact:true in all six cells; gate mean text logprob -2.417 /
+  -2.399 (reference -2.416..-2.440), needle margins 11.3/19.2 and
+  14.8/17.8 (reference 11.7-16.0 / 17.6-18.0). Not bit-exact by
+  construction (cuBLAS picks its own kernel for N=6416), equivalent within
+  the gate.
+- Results (aggregate tok/s, pass1 / pass2):
+
+  | shape | baseline | g_a fold | change |
+  |---|---:|---:|---:|
+  | c1 1000/300 | 110.05 | 111.01 / 111.04 | +0.9% |
+  | c8 1000/300 | 444.6 | 446.23 / 445.14 | +0.2% |
+  | c16 1000/300 | 603.0 | 604.61 / 603.22 | +0.1% |
+
+  c1 step 9.09 -> 9.01 ms, the 34 launches it removes. c8/c16 gain nothing
+  because the fold sits on the launch floor only at M=1.
+- Decision: RETAINED (smaller than the o_norm change, but strictly fewer
+  launches and one module less; the same-input fold pattern continues
+  with the DSA indexer projections). Next: f_b_proj + g_b_proj as one
+  strided-batched GEMV (they now read adjacent columns of the merged
+  output), then the indexer fold.
+- Raw: perf/results/2026-09-04/g-a-fold-pass{1,2}/, g-a-fold-gate{1,2}.json;
+  serve-logs/serve-20260904-163739.log, ab-g-a-fold.log.

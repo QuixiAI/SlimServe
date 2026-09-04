@@ -31,7 +31,6 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from ...linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from ..mamba_utils import (
@@ -154,9 +153,9 @@ def _make_fused_conv1d_weight_loader(
 
 
 class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
-    """Merged projection with one output replicated across TP ranks.
+    """Merged projection with some outputs replicated across TP ranks.
 
-    The replicated shard is represented as ``size * tp_size`` so the merged
+    Each replicated shard is represented as ``size * tp_size`` so the merged
     parameter reserves ``size`` local rows on every rank. Loading that shard
     from rank zero then gives every rank the complete checkpoint weight.
     """
@@ -165,13 +164,14 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         self,
         input_size: int,
         output_sizes: list[int],
-        replicated_shard_id: int,
+        replicated_shard_ids: tuple[int, ...],
         tp_size: int,
         **kwargs,
     ) -> None:
-        self.replicated_shard_id = replicated_shard_id
+        self.replicated_shard_ids = replicated_shard_ids
         output_sizes = output_sizes.copy()
-        output_sizes[replicated_shard_id] *= tp_size
+        for shard_id in replicated_shard_ids:
+            output_sizes[shard_id] *= tp_size
         super().__init__(input_size, output_sizes, **kwargs)
 
     def weight_loader(
@@ -182,7 +182,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     ) -> None:
         tp_rank = self.tp_rank
         param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id == self.replicated_shard_id:
+        if loaded_shard_id in self.replicated_shard_ids:
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
@@ -201,7 +201,7 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
     ) -> None:
         tp_rank = self.tp_rank
         param_tp_rank = getattr(param, "tp_rank", None)
-        if loaded_shard_id == self.replicated_shard_id:
+        if loaded_shard_id in self.replicated_shard_ids:
             self.tp_rank = 0
             if param_tp_rank is not None:
                 param.tp_rank = 0
@@ -264,6 +264,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.head_dim,
                 self.num_heads,
             ]
+            replicated_shard_ids: tuple[int, ...] = (4,)
             local_output_size = (
                 4 * self.local_projection_size + self.head_dim + self.local_num_heads
             )
@@ -271,15 +272,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.in_proj_padding:
                 in_proj_output_sizes.append(self.in_proj_padding * self.tp_size)
         else:
+            # The low-rank output gate's first stage (g_a_proj, head_dim rows
+            # of hidden_size) reads the same input as the projection, so it
+            # rides in the merged GEMM as a second replicated shard instead
+            # of a separate launch per layer at decode.
             in_proj_output_sizes = [self.projection_size] * 3 + [
                 self.num_heads,
                 self.head_dim,
+                self.head_dim,
             ]
+            replicated_shard_ids = (4, 5)
             self.in_proj_padding = 0
         self.in_proj_qkvgfab = _KimiGDNMergedColumnParallelLinear(
             self.hidden_size,
             in_proj_output_sizes,
-            replicated_shard_id=4,
+            replicated_shard_ids=replicated_shard_ids,
             tp_size=self.tp_size,
             bias=False,
             quant_config=self.quant_config,
@@ -348,13 +355,6 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             f"prefill backend, got {backend!r}."
         )
         if not self.use_full_rank_gate:
-            self.g_a_proj = ReplicatedLinear(
-                self.hidden_size,
-                self.head_dim,
-                bias=False,
-                quant_config=self.quant_config,
-                prefix=f"{prefix}.g_a_proj",
-            )
             self.g_b_proj = ColumnParallelLinear(
                 self.head_dim,
                 self.projection_size,
@@ -406,15 +406,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, g_proj_states, f_a, beta = projected[:4]
         else:
-            mixed_qkv, beta, f_a = projected_qkvgfab.split(
+            mixed_qkv, beta, f_a, g_a = projected_qkvgfab.split(
                 [
                     3 * self.local_projection_size,
                     self.local_num_heads,
                     self.head_dim,
+                    self.head_dim,
                 ],
                 dim=-1,
             )
-            g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
+            g_proj_states = self.g_b_proj(g_a)[0]
 
         g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)

@@ -376,6 +376,64 @@ class Glm5NextDecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
+class Glm5NextMTPBlock(nn.Module):
+    """The MTP (NextN) layer's decoder block: a plain-residual DSA layer.
+
+    Layer ``num_hidden_layers`` of GLM-5.3-Flash carries no mHC and no KDA:
+    input RMSNorm -> sparse NoPE MLA -> residual add -> post RMSNorm -> MoE
+    -> residual add. ``config.layer_types`` / ``mlp_layer_types`` stop at
+    the last target layer, so the block is built explicitly. The module
+    prefix stays ``...layers.<idx>`` so the checkpoint's compressed-tensors
+    targets for that layer (FP8 block experts) resolve; the draft loader
+    (``glm5_next_mtp.py``) rewrites checkpoint names onto the ``mtp_block``
+    attribute path.
+    """
+
+    def __init__(
+        self,
+        config,
+        vllm_config: VllmConfig,
+        prefix: str,
+        topk_indices_buffer: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        quant_config = vllm_config.quant_config
+        self.hidden_size = config.hidden_size
+        self.self_attn = Glm5NextMLAAttention(
+            config, vllm_config, prefix=f"{prefix}.self_attn",
+            topk_indices_buffer=topk_indices_buffer,
+        )
+        self.mlp = DeepseekV2MoE(
+            config=config,
+            parallel_config=vllm_config.parallel_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.input_layernorm = RMSNorm(self.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            self.hidden_size, config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
+        hidden_states = self.mlp(hidden_states)
+        # The caller adds the residual (pre-final-norm hidden for the logits).
+        return hidden_states, residual
+
+
 @support_torch_compile
 class Glm5NextTextModel(nn.Module):
     def __init__(
@@ -473,6 +531,7 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         ("in_proj_qkvgfab", "v_proj", 2),
         ("in_proj_qkvgfab", "b_proj", 3),
         ("in_proj_qkvgfab", "f_a_proj", 4),
+        ("in_proj_qkvgfab", "g_a_proj", 5),
         # KDA fused conv over [q, k, v]
         ("conv1d", "q_conv1d", 0),
         ("conv1d", "k_conv1d", 1),

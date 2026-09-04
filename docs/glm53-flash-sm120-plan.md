@@ -477,6 +477,22 @@ Design for item 1 (one factor per A/B, in this order):
    (gemv_bench.py) against cuBLAS at M = 1, 2, 4, 8, 16 first.
 Expected: c1 -0.6 to -0.9 ms/step (~7-10%), c8 -1.0 to -1.3 ms (~7%).
 
+Microbench (gemv_bench.py, weights rotated past the 128 MB L2, launches
+timed inside a captured CUDA graph; gemv-bench-sm120.txt in the profile
+results dir). It reproduces the trace within 5% at M=1 and settles two
+questions: the practical streaming ceiling on this card is ~1.6 TB/s
+(lm_head at 1.58-1.63 with either kernel, 89% of the 1.79 nominal), and
+the plain row-per-block QuixiCore kernel already beats cuBLAS on every
+K=4096 shape at M<=4 (in_proj 1.56 vs 1.49 TB/s, DSA o_proj 1.52 vs
+1.39, fused_qkv_a 1.42 vs 1.29, router 3.0 vs 3.7 us, 128-row GEMVs 1.6
+vs 2.5 us) while cuBLAS collapses at M=2 on narrow shapes (13.6 us for a
+1 MB read; weights_proj 13 us at M=2..8). The row-per-block design falls
+back to cuBLAS speed at M=8 on wide rows (in_proj 34.4 us) because every
+block re-reads x per token from L1: the M<=16 kernel of step 4 must tile
+rows per block (or use mma.sync) so x is staged once per tile. Kernel
+efficiency alone is worth ~0.5 ms/step at c1; the fusions of steps 1-3
+add the launch-count savings on top.
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`
