@@ -18558,3 +18558,28 @@ token, approximate:
      benchmark already credits recall in reasoning; the connector
      hit/promotion/restore counters plus the (fixed) verify are the
      evidence of record, never the marker count alone.
+- DISK TIER, runs 2-8 (8 GiB host + 64 GiB disk, tiny host on purpose):
+  every run hit and PROMOTED all 6 probes from disk (58 reads each) and
+  recalled the markers (6/6, 6/6, 6/6, 5/6 with one policy refusal, 6/6),
+  while the byte-level verify kept reporting mismatches on promoted
+  rows. Each was a verify-tool defect, fixed in turn, with one real
+  hazard found on the way:
+  1. digests keyed by host slot (promotion lands in fresh slots);
+  2. digests captured at write submission - the scheduler hands the
+     write-through one step after staging, BEFORE the worker has polled
+     the copy; the IO thread correctly waits on the copy event, so the
+     data is right but a submission-time digest is the previous
+     occupant's ("CHANGED" on every tail row);
+  3. the live length looked up at submission (same race) - now the
+     write-through op carries its KV group and the IO thread digests the
+     exact live prefix after the wait;
+  4. two digest functions (sha1 in the DMA, sha256 on the IO thread).
+  Real hazard fixed: stage_tail_states retired the previous tail by
+  freeing its host slot and disk slot unconditionally, even with a
+  write-through in flight, and the LIFO free lists hand those slots to
+  the new tail immediately - now busy/unconfirmed slots are orphaned
+  until confirm_disk_writes (regression test). The unit test
+  test_verify_digest_survives_promotion reproduces the full offload ->
+  write-through -> promote -> restore -> verify sequence in 3 s; the
+  data was bit-exact at every step (restored block == source), which is
+  also what the full-row IO-thread round-trip check said all along.
