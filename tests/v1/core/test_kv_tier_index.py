@@ -35,7 +35,12 @@ def test_resumable_only_with_confirmed_tail():
     hit = idx.lookup([h(0), h(1), h(2), h(3)])
     assert hit is not None
     owner, n, attn, states = hit
-    assert owner == "a" and n == 3 and [d[0] for d in attn] == slots and set(states) == {0, 1}
+    assert (
+        owner == "a"
+        and n == 3
+        and [d[0] for d in attn] == slots
+        and set(states) == {0, 1}
+    )
 
 
 def test_no_hit_on_hash_mismatch_or_short_prompt():

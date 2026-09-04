@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """HostTierConnector NVMe tier (scheduler side): write-through staging,
 rank-counted completion, demotion under host pressure, promotion on hit."""
 
@@ -6,7 +7,6 @@ from types import SimpleNamespace
 
 from tests.v1.core.test_host_tier_connector import (
     BLOCK,
-    STRIDE,
     FakeRequest,
     alloc,
     h,
@@ -52,9 +52,7 @@ def drain_writes(conn, ranks=2):
     every rank."""
     seqs = list(conn._disk_write_batches)
     for _ in range(ranks):
-        conn.update_connector_output(
-            outputs(disk_done={str(s): 1 for s in seqs})
-        )
+        conn.update_connector_output(outputs(disk_done={str(s): 1 for s in seqs}))
     return seqs
 
 
@@ -92,7 +90,7 @@ def test_host_pressure_demotes_then_hit_promotes_from_disk():
     # Squeeze the host tier: leave exactly the 5 slots r1 holds.
     idx = conn.index
     used = idx.stats()["used"]
-    idx._free = idx._free[: 0]
+    idx._free = idx._free[:0]
     idx.num_slots = used
     # A new unrelated conversation needs host slots -> r1 is demoted.
     run_conversation(conn, "r2", 1, base=200)

@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
+    from vllm.v1.worker.gpu.kv_tier_dma import KVTierDMA
 
 logger = init_logger(__name__)
 
@@ -160,9 +161,9 @@ class _ReqTrack:
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(
         self,
-        vllm_config: "VllmConfig",
+        vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig",
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
         extra = self._kv_transfer_config.kv_connector_extra_config
@@ -183,9 +184,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # IndexError at restore). KVCacheTensor.block_stride survives the
         # scheduler deepcopy unmodified, so both roles agree through it.
         packed_strides = {
-            t.block_stride
-            for t in kv_cache_config.kv_cache_tensors
-            if t.block_stride
+            t.block_stride for t in kv_cache_config.kv_cache_tensors if t.block_stride
         }
         if packed_strides:
             assert len(packed_strides) == 1, (
@@ -301,8 +300,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
         if role == KVConnectorRole.SCHEDULER:
             logger.info(
-                "host-tier: %d slots, block %d tokens, attn groups %s, "
-                "state groups %s",
+                "host-tier: %d slots, block %d tokens, attn groups %s, state groups %s",
                 self.num_slots,
                 self.hash_block_size,
                 self.attn_groups,
@@ -353,7 +351,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self._pins_staged: list[list] = []
             self._pins_issued: list[list] = []
         else:
-            self._dma = None
+            self._dma: KVTierDMA | None = None
             self._pending_restore_reqs: dict[int, str] = {}
             self._seq = 1 << 20
 
@@ -365,7 +363,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     # ==================================================================
 
     @staticmethod
-    def _owner(request: "Request", track: "_ReqTrack | None") -> str:
+    def _owner(request: Request, track: _ReqTrack | None) -> str:
         """Trajectory key for this request's saves.
 
         The adopted lineage when the request resumed from the tier, else
@@ -381,7 +379,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         return request.request_id
 
     def get_num_new_matched_tokens(
-        self, request: "Request", num_computed_tokens: int
+        self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         if _TIER_IDLE:
             return 0, False
@@ -419,9 +417,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             # conversation's one trajectory instead of fragmenting a new
             # one per turn.
             if track is None:
-                track = _ReqTrack(
-                    group_blocks=[[] for _ in range(self.num_groups)]
-                )
+                track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
                 self._tracks[request.request_id] = track
             track.owner = hit_owner
             return 0, False
@@ -471,8 +467,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     def update_state_after_alloc(
         self,
-        request: "Request",
-        blocks: "KVCacheBlocks",
+        request: Request,
+        blocks: KVCacheBlocks,
         num_external_tokens: int,
     ) -> None:
         track = self._tracks.get(request.request_id)
@@ -495,7 +491,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             track.restored_upto + num_external_tokens // bs,
             track.planned_blocks,
         )
-        ops: list[tuple[int, int]] = []
+        ops: list[tuple[int, int, int]] = []
         for logical in range(track.restored_upto, covered):
             for gid in self.attn_groups:
                 gb = track.group_blocks[gid]
@@ -510,9 +506,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     track.planned_blocks = 0
                     return
-                ops.append(
-                    (track.planned_attn_slots[logical][gid], gb[logical], gid)
-                )
+                ops.append((track.planned_attn_slots[logical][gid], gb[logical], gid))
         # Tail-boundary state blocks ride the FINAL restore chunk. The
         # resumed state must land at position ``boundary_blocks - 1`` of
         # each mamba group: the worker seeds its running state index as
@@ -547,14 +541,14 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if ops:
             self._staged_restores.setdefault(request.request_id, []).extend(ops)
             if track.disk_reads:
-                self._staged_disk_reads.setdefault(
-                    request.request_id, []
-                ).extend(track.disk_reads)
+                self._staged_disk_reads.setdefault(request.request_id, []).extend(
+                    track.disk_reads
+                )
                 track.disk_reads = []
             if zero_blocks:
-                self._staged_zeros.setdefault(
-                    request.request_id, []
-                ).extend(zero_blocks)
+                self._staged_zeros.setdefault(request.request_id, []).extend(
+                    zero_blocks
+                )
             track.restored_upto = covered
             logger.info(
                 "host-tier: staged %d restore ops for %s (blocks %d..%d of %d)",
@@ -569,15 +563,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     # Offload staging ---------------------------------------------------
 
-    def _absorb_block_allocations(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
+    def _absorb_block_allocations(self, scheduler_output: SchedulerOutput) -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
             track = self._tracks.get(new_req.req_id)
             if track is None:
-                track = _ReqTrack(
-                    group_blocks=[[] for _ in range(self.num_groups)]
-                )
+                track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
                 self._tracks[new_req.req_id] = track
             track.group_blocks = [list(g) for g in new_req.block_ids]
         cached = scheduler_output.scheduled_cached_reqs
@@ -592,9 +582,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 if gid < len(track.group_blocks) and group_new:
                     track.group_blocks[gid].extend(group_new)
 
-    def _stage_filled_attention_blocks(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> None:
+    def _stage_filled_attention_blocks(self, scheduler_output: SchedulerOutput) -> None:
         if _TIER_IDLE:
             return
         bs = self.hash_block_size
@@ -617,7 +605,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             owner = self._owner(request, track)
             for logical in range(track.staged_upto, n_full):
                 block_hash = request.block_hashes[logical]
-                ops: list[tuple[int, int]] = []
+                ops: list[tuple[int, int, int]] = []
                 for gid in self.attn_groups:
                     block_id = track.group_blocks[gid][logical]
                     if block_id < 0:
@@ -637,7 +625,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             track.staged_upto = n_full
 
     def build_connector_meta(
-        self, scheduler_output: "SchedulerOutput"
+        self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         confirmed, self._last_step_write_slots = self._last_step_write_slots, []
         self.index.confirm_writes(confirmed)
@@ -673,10 +661,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     # Request lifecycle -------------------------------------------------
 
-    def on_new_request(self, request: "Request") -> None:
+    def on_new_request(self, request: Request) -> None:
         self._requests[request.request_id] = request
 
-    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+    def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
         stats = getattr(connector_output, "kv_connector_stats", None)
         if isinstance(stats, KVConnectorStats):
             for seq_str, n in stats.data.get("disk_done", {}).items():
@@ -695,7 +683,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 self.index.confirm_promotion(owner)
 
     def request_finished(
-        self, request: "Request", block_ids: list[int]
+        self, request: Request, block_ids: list[int]
     ) -> tuple[bool, dict[str, Any] | None]:
         # Non-HMA entry point; HMA models use request_finished_all_groups.
         self._tracks.pop(request.request_id, None)
@@ -703,7 +691,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         return False, None
 
     def request_finished_all_groups(
-        self, request: "Request", block_ids: tuple[list[int], ...]
+        self, request: Request, block_ids: tuple[list[int], ...]
     ) -> tuple[bool, dict[str, Any] | None]:
         """Pin and save the tail boundary states; never hold via deferred free.
 
@@ -730,9 +718,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         bs = self.hash_block_size
         if not self.state_groups or self._block_pool is None:
             return False, None
-        max_boundary = min(
-            request.num_computed_tokens // bs, len(request.block_hashes)
-        )
+        max_boundary = min(request.num_computed_tokens // bs, len(request.block_hashes))
         if max_boundary <= 0:
             return False, None
         # Frozen states materialize only at positions that were a chunk-end
@@ -806,9 +792,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             by_storage.setdefault(key, []).append(name)
             storages[key] = (st, t.device)
         packed_key = max(by_storage, key=lambda k: len(by_storage[k]))
-        outside = {
-            k: v for k, v in by_storage.items() if k != packed_key
-        }
+        outside = {k: v for k, v in by_storage.items() if k != packed_key}
         if outside:
             logger.warning(
                 "host-tier: %d layers live outside the packed slab and are "
@@ -835,9 +819,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if self.num_disk_slots:
             from vllm.v1.worker.gpu.kv_tier_nvme import NvmeTierFile, default_tier_dir
 
-            disk = NvmeTierFile(
-                default_tier_dir(), self.num_disk_slots, self.row_bytes
-            )
+            disk = NvmeTierFile(default_tier_dir(), self.num_disk_slots, self.row_bytes)
         self._dma = KVTierDMA(
             backing,
             self.block_stride,
@@ -853,7 +835,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self.num_slots * self.block_stride / (1 << 30),
         )
 
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         meta = self._get_connector_metadata()
         if not isinstance(meta, HostTierMeta) or self._dma is None:
             return
@@ -869,9 +851,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # stream waits on compute, so pre-forward issuance is safe.
         for seq, ops in meta.offloads.items():
             self._dma.issue(TierOpBatch(seq=seq, offload=ops, restore=[]))
-        for seq, ops in meta.disk_writes.items():
+        for seq, dops in meta.disk_writes.items():
             self._dma.issue(
-                TierOpBatch(seq=seq, offload=[], restore=[], disk_writes=ops)
+                TierOpBatch(seq=seq, offload=[], restore=[], disk_writes=dops)
             )
         for req_id, ops in meta.restores.items():
             self._seq += 1
@@ -910,9 +892,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         return
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if getattr(self, "_dma", None) is None:
+        dma = getattr(self, "_dma", None)
+        if dma is None:
             return None
-        done = self._dma.take_disk_done()
+        done = dma.take_disk_done()
         if not done:
             return None
         return HostTierStats(data={"disk_done": {str(seq): 1 for seq in done}})
@@ -922,9 +905,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         return HostTierStats(data=data or {})
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        if getattr(self, "_dma", None) is None:
+        dma = getattr(self, "_dma", None)
+        if dma is None:
             return set()
-        return self._dma.take_invalid_blocks()
+        return dma.take_invalid_blocks()
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -944,5 +928,6 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         return None, done_recving or None
 
     def shutdown(self) -> None:
-        if getattr(self, "_dma", None) is not None:
-            self._dma.release()
+        dma = getattr(self, "_dma", None)
+        if dma is not None:
+            dma.release()

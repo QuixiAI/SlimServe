@@ -23,10 +23,12 @@ Ordering contract:
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -72,7 +74,11 @@ class TierOpBatch:
     @property
     def is_empty(self) -> bool:
         return not (
-            self.offload or self.restore or self.zero or self.disk_writes or self.disk_reads
+            self.offload
+            or self.restore
+            or self.zero
+            or self.disk_writes
+            or self.disk_reads
         )
 
 
@@ -187,7 +193,7 @@ class KVTierDMA:
         self._slot_event: dict[int, torch.cuda.Event] = {}
         self._disk_op_seq = 0
         # op id -> ("w", batch_seq) | ("r", req_id)
-        self._disk_ops: dict[int, tuple[str, object]] = {}
+        self._disk_ops: dict[int, tuple[str, Any]] = {}
         self._write_remaining: dict[int, int] = {}
         self._disk_done: list[int] = []
         self._read_remaining: dict[str, int] = {}
@@ -208,12 +214,14 @@ class KVTierDMA:
             assert self.disk is not None and batch.req_id is not None
             for disk_slot, host_slot in batch.disk_reads:
                 self._submit_disk(
-                    write=False, disk_slot=disk_slot, host_slot=host_slot,
+                    write=False,
+                    disk_slot=disk_slot,
+                    host_slot=host_slot,
                     tag=("r", batch.req_id),
                 )
-            self._read_remaining[batch.req_id] = (
-                self._read_remaining.get(batch.req_id, 0) + len(batch.disk_reads)
-            )
+            self._read_remaining[batch.req_id] = self._read_remaining.get(
+                batch.req_id, 0
+            ) + len(batch.disk_reads)
             batch.disk_reads = []
             self._deferred.append(batch)
             return
@@ -230,6 +238,7 @@ class KVTierDMA:
             ev = self._slot_event.get(host_slot)
             if ev is not None:
                 wait = ev.synchronize
+        assert self.disk is not None
         self.disk.submit(
             DiskOp(
                 op_id=op_id,
@@ -295,7 +304,9 @@ class KVTierDMA:
             self._write_remaining[batch.seq] = len(batch.disk_writes)
             for host_slot, disk_slot in batch.disk_writes:
                 self._submit_disk(
-                    write=True, disk_slot=disk_slot, host_slot=host_slot,
+                    write=True,
+                    disk_slot=disk_slot,
+                    host_slot=host_slot,
                     tag=("w", batch.seq),
                 )
         if not batch.offload and not batch.restore and not batch.zero:
@@ -377,12 +388,18 @@ class KVTierDMA:
                 logger.warning(
                     "kv-tier VERIFY MISMATCH slot=%d block=%d offloaded=%s "
                     "host_now=%s gpu_after_restore=%s",
-                    slot, gpu_block, expect, host, got,
+                    slot,
+                    gpu_block,
+                    expect,
+                    host,
+                    got,
                 )
         if batch.restore:
             logger.info(
                 "kv-tier verify: batch %d: %d/%d restores mismatched",
-                batch.seq, bad, len(batch.restore),
+                batch.seq,
+                bad,
+                len(batch.restore),
             )
 
     def flush(self) -> list[int]:
@@ -406,11 +423,11 @@ class KVTierDMA:
             if self.disk is not None:
                 self.disk.close()
                 self.disk = None
+            assert self._registered_buf is not None
             torch.cuda.cudart().cudaHostUnregister(self._registered_buf.data_ptr())
             self._registered = False
 
     def __del__(self) -> None:
-        try:
+        # Interpreter teardown: release() may fail once torch is half gone.
+        with contextlib.suppress(Exception):
             self.release()
-        except Exception:  # noqa: BLE001 - interpreter teardown
-            pass

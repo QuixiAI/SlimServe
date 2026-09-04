@@ -7,9 +7,7 @@ import torch
 
 from vllm.v1.worker.gpu.kv_tier_dma import KVTierDMA, TierOpBatch
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 STRIDE = 4096
 BLOCKS = 8
@@ -55,10 +53,13 @@ def test_empty_batch_is_a_noop():
     _, dma = _dma()
     dma.issue(TierOpBatch(seq=1, offload=[], restore=[]))
     assert dma.flush() == []
+
+
 def _mem_available_mib() -> int:
-    for line in open("/proc/meminfo"):
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) // 1024
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
     raise RuntimeError("no MemAvailable")
 
 

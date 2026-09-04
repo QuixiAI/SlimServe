@@ -28,6 +28,14 @@ BLOCK = 16
 STRIDE = 4096
 
 
+def _base_init(self, vc, role, kcc):
+    self._vllm_config = vc
+    self._kv_transfer_config = vc.kv_transfer_config
+    self._kv_cache_config = kcc
+    self._role = role
+    self._connector_metadata = None
+
+
 def h(i: int) -> bytes:
     return i.to_bytes(8, "little") + b"\x00" * 24
 
@@ -83,21 +91,20 @@ def make_connector():
             kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
         ),
     )
-    kv_cache_config = SimpleNamespace(kv_cache_groups=make_groups(), kv_cache_tensors=[])
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
-        "_get_packed_kv_cache_layout",
-        return_value=(STRIDE, {}),
-    ), patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.base."
-        "KVConnectorBase_V1.__init__",
-        lambda self, vc, role, kcc: (
-            setattr(self, "_vllm_config", vc),
-            setattr(self, "_kv_transfer_config", vc.kv_transfer_config),
-            setattr(self, "_kv_cache_config", kcc),
-            setattr(self, "_role", role),
-            setattr(self, "_connector_metadata", None),
-        )[-1],
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=make_groups(), kv_cache_tensors=[]
+    )
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
+            "_get_packed_kv_cache_layout",
+            return_value=(STRIDE, {}),
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.base."
+            "KVConnectorBase_V1.__init__",
+            _base_init,
+        ),
     ):
         from vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector import (
             HostTierConnector,
@@ -109,8 +116,9 @@ def make_connector():
 
     class FakePool:
         def __init__(self):
-            self.blocks = {i: SimpleNamespace(block_id=i, ref_cnt=1)
-                           for i in range(1000)}
+            self.blocks = {
+                i: SimpleNamespace(block_id=i, ref_cnt=1) for i in range(1000)
+            }
             self.touched, self.freed = [], []
             # (block_hash, group_id) -> block, mirroring the engine's
             # prefix cache of frozen align-mode boundary states.
@@ -163,9 +171,7 @@ def alloc(n_attn, planned, base=0):
     for g in range(2):
         gb = [FakeBlock(0, is_null=True)] * max(0, planned - 1)
         gb.append(FakeBlock(base + 95 + g))
-        gb.extend(
-            FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned))
-        )
+        gb.extend(FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned)))
         mamba.append(gb)
     return FakeKVCacheBlocks(blocks=(attn, ring, *mamba))
 
@@ -187,9 +193,7 @@ def run_conversation(conn, req_id, n_blocks, base=0):
     pool = conn._block_pool
     for g, gid in enumerate((2, 3)):
         pool.cached[(bytes(h(n_blocks - 1)), gid)] = pool.blocks[base + 95 + g]
-    ok, _ = conn.request_finished_all_groups(
-        req, tuple([] for _ in range(4))
-    )
+    ok, _ = conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
     assert ok is False  # never hold blocks (HMA deferred-free corrupts)
     tail_meta = conn.build_connector_meta(sched_output({}))  # issues save
     conn.build_connector_meta(sched_output({}))  # confirms + releases pins
@@ -263,9 +267,7 @@ def test_resume_round_trip():
     conn = make_connector()
     run_conversation(conn, "r1", 4)
 
-    fresh = FakeRequest(
-        "r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8
-    )
+    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
     conn.on_new_request(fresh)
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
     # Resumable at the finished request's final boundary: all 4 blocks.
