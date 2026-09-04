@@ -373,9 +373,9 @@ class KVTierDMA:
             if expect is not None and got != expect:
                 bad += 1
                 logger.warning(
-                    "kv-tier VERIFY MISMATCH slot=%d block=%d offloaded=%s "
+                    "kv-tier VERIFY MISMATCH slot=%d block=%d gid=%d offloaded=%s "
                     "host_now=%s gpu_after_restore=%s",
-                    slot, gpu_block, expect, host, got,
+                    slot, gpu_block, gid, expect, host, got,
                 )
         if batch.restore:
             logger.info(

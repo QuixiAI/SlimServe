@@ -46,6 +46,15 @@ class DiskOp:
     wait: Callable[[], None] | None = None
 
 
+_VERIFY_ROWS = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
+
+
+def _row_digest(buf) -> str:
+    import hashlib
+
+    return hashlib.sha256(bytes(buf)).hexdigest()[:12]
+
+
 class NvmeTierFile:
     def __init__(
         self,
@@ -66,6 +75,8 @@ class NvmeTierFile:
         self._done: deque[tuple[int, str | None]] = deque()
         self._done_lock = threading.Lock()
         self._stop = False
+        self.row_digests: dict[int, str] = {}
+        self._row_lock = threading.Lock()
         self._threads = [
             threading.Thread(target=self._worker, name=f"kv-nvme-{i}", daemon=True)
             for i in range(max(1, threads))
@@ -143,7 +154,24 @@ class NvmeTierFile:
             try:
                 if op.wait is not None:
                     op.wait()
+                if _VERIFY_ROWS:
+                    if op.write:
+                        # Fidelity check (VLLM_KV_TIER_VERIFY): hash the row
+                        # as written; a later read of the slot must hash the
+                        # same, or the disk tier (not the bookkeeping) is at
+                        # fault.
+                        with self._row_lock:
+                            self.row_digests[op.disk_slot] = _row_digest(op.buffer)
                 self._transfer(op)
+                if _VERIFY_ROWS and not op.write:
+                    got = _row_digest(op.buffer)
+                    with self._row_lock:
+                        exp = self.row_digests.get(op.disk_slot)
+                    if exp is not None and got != exp:
+                        logger.warning(
+                            "kv-nvme DISK ROUND-TRIP MISMATCH disk_slot=%d "
+                            "written=%s read=%s", op.disk_slot, exp, got,
+                        )
             except Exception as exc:  # noqa: BLE001 - reported, not raised
                 err = f"{type(exc).__name__}: {exc}"
                 logger.error(

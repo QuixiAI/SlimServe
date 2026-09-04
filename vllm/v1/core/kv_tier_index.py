@@ -209,6 +209,11 @@ class HostKVTierIndex:
         # trajectory references them any more, so free them as soon as
         # their write confirms.
         self._orphaned_pending: set[int] = set()
+        # Host slots superseded while their disk write-through is in flight,
+        # and disk slots superseded while their write is unconfirmed: freed
+        # when confirm_disk_writes reports the write.
+        self._orphaned_busy: set[int] = set()
+        self._orphaned_disk_pending: set[int] = set()
         # NVMe tier.
         self.num_disk_slots = max(0, int(num_disk_slots))
         self._disk_free: list[int] = list(range(self.num_disk_slots - 1, -1, -1))
@@ -347,12 +352,29 @@ class HostKVTierIndex:
                     self._free.append(s)
                 return None
             slots[gid] = slot
+        # Retire the previous tail. A host slot whose write-through is in
+        # flight (_host_busy: the IO thread is reading it) and a disk slot
+        # whose write has not been confirmed must NOT go back on the free
+        # lists yet: the LIFO lists would hand them straight to the new
+        # tail, and the old write could then land after the new one
+        # (observed as stale tail rows on promoted resumes, 2026-09-04).
+        # They are freed by confirm_disk_writes once the write reports.
+        old_disk = set(traj.disk_tail_slots.values())
         for s in traj.tail_state_slots.values():
-            self._pending_write.discard(s)
-            self._disk_of_host.pop(s, None)
-            self._free.append(s)
-        for d in traj.disk_tail_slots.values():
-            self._free_disk_slot(d)
+            d = self._disk_of_host.pop(s, None)
+            if d is not None:
+                old_disk.add(d)
+            if s in self._host_busy:
+                self._orphaned_busy.add(s)
+            elif s in self._pending_write:
+                self._orphaned_pending.add(s)
+            else:
+                self._free.append(s)
+        for d in old_disk:
+            if d in self._disk_pending:
+                self._orphaned_disk_pending.add(d)
+            else:
+                self._free_disk_slot(d)
         traj.disk_tail_slots = {}
         traj.disk_tail_boundary = -1
         traj.tail_state_slots = slots
@@ -408,6 +430,15 @@ class HostKVTierIndex:
             if self._host_busy.get(slot) == d:
                 del self._host_busy[slot]
             self._disk_pending.discard(d)
+            if slot in self._orphaned_busy:
+                self._orphaned_busy.discard(slot)
+                self._free.append(slot)
+                # Nothing references this superseded write's disk slot.
+                self._orphaned_disk_pending.discard(d)
+                self._free_disk_slot(d)
+            elif d in self._orphaned_disk_pending:
+                self._orphaned_disk_pending.discard(d)
+                self._free_disk_slot(d)
 
     def needs_promotion(self, hit: tuple) -> bool:
         owner, n, attn, tail = hit

@@ -153,3 +153,30 @@ def test_no_disk_tier_is_the_old_behaviour():
     assert idx.take_disk_writes(build_slots) == []
     assert idx.stage_attention("b", 0, h(9)) is not None  # deletes a
     assert idx.stats()["trajectories"] == 1
+
+
+def test_tail_restage_does_not_free_busy_slots():
+    """Re-staging a tail while the previous tail's write-through is in
+    flight must keep both the busy host slot and its unconfirmed disk slot
+    off the free lists until the write confirms (2026-09-04)."""
+    from vllm.v1.core.kv_tier_index import HostKVTierIndex
+
+    idx = HostKVTierIndex(8, attn_gids=[0], num_disk_slots=8)
+    first = idx.stage_tail_states("o", 2, 1, boundary_hash=b"h1")
+    assert first is not None
+    h_old = first[0]
+    idx.confirm_writes([h_old])
+    writes = idx.take_disk_writes([h_old])  # write-through now in flight
+    assert writes and writes[0][0] == h_old
+    d_old = writes[0][1]
+    second = idx.stage_tail_states("o", 4, 1, boundary_hash=b"h2")
+    assert second is not None
+    h_new = second[0]
+    assert h_new != h_old, "busy host slot handed to the new tail"
+    d_new = idx._disk_of_host[h_new]
+    assert d_new != d_old, "unconfirmed disk slot handed to the new tail"
+    assert h_old not in idx._free and d_old not in idx._disk_free
+    idx.confirm_disk_writes(writes)
+    assert h_old in idx._free and d_old in idx._disk_free
+    assert len(set(idx._free)) == len(idx._free)
+    assert len(set(idx._disk_free)) == len(idx._disk_free)
