@@ -167,8 +167,12 @@ behavior:
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- Commits are authored by the human maintainer who made them: Eric Hartford,
+  or a maintainer he has authorized (Sean Gherardi, GitHub `auroter`, since
+  2026-09-04). One human author per commit.
+- Do not add co-author or assistance trailers, and do not discuss automated
+  assistance in commit messages. The rule exists to keep attribution with
+  the maintainers, never with agents.
 
 ## Serving policy (standing)
 
