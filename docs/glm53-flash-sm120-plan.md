@@ -493,6 +493,26 @@ rows per block (or use mma.sync) so x is staged once per tile. Kernel
 efficiency alone is worth ~0.5 ms/step at c1; the fusions of steps 1-3
 add the launch-count savings on top.
 
+### Phase 1 progress log (2026-09-04, evening)
+
+Retained on the rtx6000 record, one factor per boot, each with a notebook
+entry (c1 / c8 / c16 at 1000/300): F32 sidecar 104.8 / 431.6 / 591 ->
+o_norm Triton 110.05 / 444.6 / 603 -> g_a fold 111.0 / 445.7 / 603.9 ->
+f_b+g_b batched 112.0 / 446.3 / 607.9 (+6.9% / +3.5% / +2.9% over Phase 0).
+Queued and coded: router gate through the QuixiCore decode projection GEMV
+(GateLinear tier 1b, fp32 logits, no cast kernel), then the indexer fold.
+
+Item 3 scoping (mHC): the cooperative fused_pre_transition kernel is taken
+only for T == 1 (py_dsv4_mhc_pre / fused_post_pre in tm_cuda_serving.cu);
+every T > 1 site runs partials -> finalize_pre_mix -> apply_pre_mix, three
+launches, which is the 271-launch / 1.13 ms mHC class at c8. The item is a
+T <= 16 cooperative variant (grid NSPLITS x T, or T tokens per block) so
+c8/c16 pay one launch per site like c1; expected 0.4-0.6 ms at c8.
+Kernel builds: the CMake build tree of build 6 did not survive the
+editable install, so new kernels are developed as a JIT extension
+(torch.utils.cpp_extension.load) against the same csrc/quixicore source and
+folded into _quixicore_C with one full rebuild at the end of the phase.
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`
