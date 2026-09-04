@@ -19482,3 +19482,66 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   control-bench.sh}. Side effect recorded: the 42 GB image lived in
   /var/lib/containerd on the root disk; containerd's root is now
   /raid/containerd (docker's was already /raid/docker).
+
+## 2026-09-04: F32 sidecar for the RedHatAI NVFP4 conversion (router bias, KDA decay, mHC vectors) - RETAINED
+
+- Status: retained (Phase 1 item 0 of docs/glm53-flash-sm120-plan.md).
+- Scope: GLM-5.3-Flash / glm53-nvfp4-4 / rtx6000 (4x RTX PRO 6000, TP4);
+  loader in `vllm/model_executor/models/glm5_next.py`, new builder
+  `slimserve/f32_overrides.py`, test `tests/glm5_next/test_f32_overrides.py`.
+- Baseline: the sm_120 bring-up record above (104.9 c1 / 431.4 c8 at
+  1000 in / 300 out, exact-token, no spec), shard tensors as shipped.
+- Hypothesis: RedHatAI's conversion downcast 290 tensors that are F32 in
+  `zai-org/GLM-5.3-Flash` and are F32 parameters here: `mlp.gate.
+  e_score_correction_bias` (42 MoE layers), `self_attn.A_log` and
+  `self_attn.dt_bias` (34 KDA layers), `hc_attn_base/scale` and
+  `hc_ffn_base/scale` (45 layers). BF16 at values of 5-15 is one ulp of
+  0.03-0.06, i.e. up to 0.39% relative error on the router bias (per-layer
+  spread of that bias is 0.27-0.58) and on the KDA decay gates. Loading the
+  native F32 values should improve scoring at zero throughput cost.
+- Change: `python -m slimserve.f32_overrides --native <native ckpt>
+  --model <served ckpt>` reads only the affected byte ranges from the native
+  shards and writes `<served ckpt>/f32-overrides.safetensors` (290 tensors,
+  1.2 MB, safetensors metadata records the source). The glm5_next loader
+  substitutes those names from the sidecar when the file exists
+  (`_load_f32_overrides` / `iter_with_f32_overrides`; rejects non-F32
+  sidecars; warns on names that never appear in the stream);
+  `SLIMSERVE_F32_OVERRIDES=0` serves the shard copies for the A/B. fetch.py's
+  `assembly.patch` mechanism is byte patches for GGUF parts and does not
+  apply. The MTP layer (45) is skipped: RedHatAI keeps its bias F32 and the
+  draft path is not ported.
+- Correctness: unit tests (4) for substitution, kill-switch, dtype
+  rejection and builder selection; all four parameter families verified as
+  F32 params in the tree (deepseek_v2.py, kimi_gdn_linear_attn.py,
+  glm5_next.py:262). Serve log on boot B: "290 F32 override tensors" on
+  every rank, no unmatched-name warning. Scoring gate
+  (`/raid/scratch/slimserve-glm53/gate.py`: prompt_logprobs mean logprob on
+  8 fixed 512+32-token slices of the repo-prose source, plus needle margins
+  at 1K and 7K), 4 runs per arm over two boots each:
+  | arm                    | mean text logprob (n=4)        | needle@1k    | needle@7k    |
+  | A shard copies (BF16)  | -2.4564 (-2.4680..-2.4412, sd 0.0097) | +12.2..+15.4 | +19.1..+20.6 |
+  | B F32 sidecar          | -2.4271 (-2.4404..-2.4157, sd 0.0093) | +11.7..+16.0 | +14.9..+18.0 |
+  B - A = +0.029 nats/token (about 3 sd of the run-to-run jitter; 6 of 8
+  slices improve on the per-slice means). Needle margins are saturated in
+  both arms and only a pass/fail signal here. Caveat: this gate is not
+  bit-stable across cache states (cold vs warm runs on one boot differ by
+  up to 0.025 in the mean), so the delta is a direction with a magnitude of
+  roughly 0.02-0.05, not a precise figure; a batch-invariant re-score is a
+  follow-up if a finer quality gate is ever needed for this item.
+- Results (exact-token, 1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k
+  20, seed 42, PROMPT_OVERHEAD 0, exact:true throughout):
+  | boot                          | c1     | c8     |
+  | A shard copies, pass 1        | 95.7   | 416.8  |  (host contention: 44 GB containerd move ran inside this window)
+  | B F32 sidecar, pass 1         | 104.65 | 431.55 |
+  | B F32 sidecar, pass 2 (quiet) | 104.77 | 431.57 |
+  | A shard copies, pass 2 (quiet)| 104.67 | 432.25 |
+  Throughput-neutral, as it must be (same bytes, different values).
+- Decision: retained. The sidecar is part of the rtx6000 record's setup
+  (note added); any other conversion with the same defect can use the same
+  builder. Lesson recorded: do not run host I/O or docker work during a
+  bench window (pass-1 A), and match the exec'd process name
+  (`api_server`, not `slimserve.cli`) in liveness checks.
+- Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-f32ab-{A,B}/
+  and -f32ab2-{A,B}/ (bench JSON, completions, nvidia-smi per shape);
+  gate JSON and serve logs under /raid/scratch/slimserve-glm53/ab-f32/ and
+  serve-logs/serve-20260904-16{0459,1100,1443,1826}.log.
