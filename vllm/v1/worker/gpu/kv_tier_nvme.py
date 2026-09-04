@@ -44,6 +44,10 @@ class DiskOp:
     # Called on the IO thread before the transfer (e.g. wait on the CUDA
     # event of the copy that produced the row).
     wait: Callable[[], None] | None = None
+    # VERIFY: live bytes of the row (a group's block may be shorter than
+    # the slab row); the write-time digest of this prefix is what a later
+    # restore of the promoted row is checked against.
+    nbytes: int = 0
 
 
 _VERIFY_ROWS = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
@@ -76,6 +80,7 @@ class NvmeTierFile:
         self._done_lock = threading.Lock()
         self._stop = False
         self.row_digests: dict[int, str] = {}
+        self.slot_digests: dict[int, str] = {}
         self._row_lock = threading.Lock()
         self._threads = [
             threading.Thread(target=self._worker, name=f"kv-nvme-{i}", daemon=True)
@@ -154,14 +159,18 @@ class NvmeTierFile:
             try:
                 if op.wait is not None:
                     op.wait()
-                if _VERIFY_ROWS:
-                    if op.write:
-                        # Fidelity check (VLLM_KV_TIER_VERIFY): hash the row
-                        # as written; a later read of the slot must hash the
-                        # same, or the disk tier (not the bookkeeping) is at
-                        # fault.
-                        with self._row_lock:
-                            self.row_digests[op.disk_slot] = _row_digest(op.buffer)
+                if _VERIFY_ROWS and op.write:
+                    # Fidelity check (VLLM_KV_TIER_VERIFY): hash the row AS
+                    # WRITTEN, i.e. after the producing copy's event - a
+                    # digest taken at submission can predate the copy. A
+                    # later read of the slot must hash the same (row), and
+                    # the restore verify checks the live prefix (slot).
+                    with self._row_lock:
+                        self.row_digests[op.disk_slot] = _row_digest(op.buffer)
+                        if op.nbytes > 0:
+                            self.slot_digests[op.disk_slot] = _row_digest(
+                                op.buffer[: op.nbytes]
+                            )
                 self._transfer(op)
                 if _VERIFY_ROWS and not op.write:
                     got = _row_digest(op.buffer)

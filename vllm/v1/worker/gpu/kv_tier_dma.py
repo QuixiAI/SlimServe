@@ -180,8 +180,9 @@ class KVTierDMA:
         # through the disk tier, so a promoted restore (new host slot) is
         # checked against the ORIGINAL offload digest, not whatever block
         # last used that host slot.
-        self._disk_digests: dict[int, str] = {}
         self._read_targets: dict[int, tuple[int, int]] = {}
+        self._slot_nbytes: dict[int, int] = {}
+        self._disk_nbytes: dict[int, int] = {}
 
     def issue(self, batch: TierOpBatch) -> None:
         """Enqueue a batch: copies on the copy stream, disk ops to the IO
@@ -217,8 +218,12 @@ class KVTierDMA:
             ev = self._slot_event.get(host_slot)
             if ev is not None:
                 wait = ev.synchronize
-            if _VERIFY and host_slot in self._slot_digests:
-                self._disk_digests[disk_slot] = self._slot_digests[host_slot]
+            if _VERIFY:
+                # The row's live byte count rides with the op; the IO thread
+                # digests that prefix AFTER the copy event. Never digest
+                # here: the producing copy may still be in flight at
+                # submission (it was, for every tail row, on 2026-09-04).
+                self._disk_nbytes[disk_slot] = self._slot_nbytes.get(host_slot, 0)
         elif _VERIFY:
             self._read_targets[op_id] = (disk_slot, host_slot)
         self.disk.submit(
@@ -228,6 +233,9 @@ class KVTierDMA:
                 disk_slot=disk_slot,
                 buffer=memoryview(self.arena[host_slot].numpy()),
                 wait=wait,
+                nbytes=(
+                    self._disk_nbytes.get(disk_slot, 0) if (write and _VERIFY) else 0
+                ),
             )
         )
 
@@ -242,9 +250,14 @@ class KVTierDMA:
                 target = self._read_targets.pop(op_id, None)
                 if target is not None and err is None:
                     disk_slot, host_slot = target
-                    d = self._disk_digests.get(disk_slot)
-                    if d is not None:
+                    with self.disk._row_lock:
+                        d = self.disk.slot_digests.get(disk_slot)
+                    n = self._disk_nbytes.get(disk_slot, 0)
+                    if d is not None and n > 0:
+                        # The promoted row inherits its disk slot's
+                        # write-time digest and live length.
                         self._slot_digests[host_slot] = d
+                        self._slot_nbytes[host_slot] = n
             if kind == "w":
                 left = self._write_remaining[key] - 1
                 if left <= 0:
@@ -364,6 +377,7 @@ class KVTierDMA:
         for gpu_block, slot, gid in batch.offload:
             n = self._group_nbytes.get(gid, self._stride)
             self._slot_digests[slot] = _digest(self.arena[slot][:n])
+            self._slot_nbytes[slot] = n
         bad = 0
         for slot, gpu_block, gid in batch.restore:
             n = self._group_nbytes.get(gid, self._stride)
