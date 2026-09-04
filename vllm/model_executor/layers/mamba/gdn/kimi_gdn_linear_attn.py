@@ -721,7 +721,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             ]
         else:
             assert core_attn_out_spec is not None
-        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        # This runs inside the opaque ``vllm::kda_attention`` op, where the
+        # model-level torch.compile never sees it: the CustomOp dispatch
+        # (custom ops off under compile) lands on the decomposed
+        # forward_native and issues ~12 eager kernels per layer at decode.
+        # Take the fused Triton kernel directly; it is bit-identical to the
+        # decomposed path on the (1, n, h, d) / (n, h, d) shapes used here.
+        if current_platform.is_cuda_alike():
+            core_attn_out.copy_(self.o_norm.forward_cuda(core_attn_out, g2))
+        else:
+            core_attn_out.copy_(self.o_norm(core_attn_out, g2))
 
 
 def kda_attention(

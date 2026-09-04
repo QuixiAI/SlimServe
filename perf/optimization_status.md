@@ -19545,3 +19545,47 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   and -f32ab2-{A,B}/ (bench JSON, completions, nvidia-smi per shape);
   gate JSON and serve logs under /raid/scratch/slimserve-glm53/ab-f32/ and
   serve-logs/serve-20260904-16{0459,1100,1443,1826}.log.
+
+## 2026-09-04: KDA o_norm through the fused Triton kernel - RETAINED (+5.0% c1, +3.0% c8, +2.0% c16)
+
+- Status: RETAINED. Phase 1 item 2 (launch tail), first sub-item.
+- Scope: rtx6000 record of glm53-nvfp4-4 with the F32 sidecar retained
+  (15e41c1b7), exact-token 1000/300 c1/c8/c16, one boot, two passes.
+- Baseline: the peer's quiet second-pass boot B of the same tree (f32ab2-B):
+  c1 104.77 / c8 431.57; c16 591.0 from the Phase 0 entry (same tree modulo
+  the sidecar, which was throughput-neutral).
+- Hypothesis: the c1 trace showed the KDA output gate norm (FusedRMSNormGated
+  "fused_rms_norm_gated") running as its decomposed forward_native, about
+  12 eager kernels per KDA layer inside the opaque vllm::kda_attention op.
+  The CustomOp dispatch turns custom ops off under torch.compile and lands
+  on forward_native, but the op body is never compiled (it is a splitting
+  op), so the decomposition is paid every step: ~400 launches of the
+  ~1,070-launch tail, ~0.4-0.5 ms at c1.
+- Change: kimi_gdn_linear_attn.py `_forward` calls
+  `self.o_norm.forward_cuda(core_attn_out, g2)` directly on CUDA-alike
+  platforms (the rms_norm_gated Triton kernel), else the CustomOp dispatch
+  as before. One line plus a comment; no kernel change.
+- Correctness: forward_cuda vs forward_native on the shapes used here
+  ((1, n, h, d) with n = 1, 8, 37; bf16 in, sigmoid gate) max |diff| = 0.0
+  (bit-identical) under set_current_vllm_config. Boot clean (0 errors),
+  exact:true in all six cells. Completion SHA-256 is not a cross-boot
+  signal on this stack: the peer's two identical-config boots (f32ab-B,
+  f32ab2-B) already differ at c1, so parity is the evidence, not the sha.
+- Results (aggregate tok/s, pass1 / pass2):
+
+  | shape | baseline | o_norm Triton | change |
+  |---|---:|---:|---:|
+  | c1 1000/300 | 104.77 | 110.05 / 110.06 | +5.0% |
+  | c8 1000/300 | 431.57 | 444.71 / 444.46 | +3.0% |
+  | c16 1000/300 | 591.0 | 604.49 / 601.57 | +2.0% |
+
+  Pass-to-pass spread 0.0% at c1, 0.1% at c8, 0.5% at c16. c1 step
+  9.54 -> 9.09 ms: about 0.45 ms, matching the launch-count estimate.
+- Decision: RETAINED. Next in item 2: the copies around the mHC wrappers
+  and the MoE glue (fp32 cast + router GEMV + topk + align/sort), which the
+  per-projection attribution folds into item 1 step 3 (router + shared
+  gate_up dual-output decode GEMV).
+- Raw: perf/results/2026-09-04/o-norm-triton-pass{1,2}/, serve log
+  serve-logs/serve-20260904-162849.log and ab-o-norm-triton.log under
+  /raid/scratch/slimserve-glm53/serve-logs/; driver ab.sh (boot the
+  profile, bench two passes, stop).
