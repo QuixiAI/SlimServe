@@ -56,7 +56,7 @@ _VERIFY_ROWS = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 def _row_digest(buf) -> str:
     import hashlib
 
-    return hashlib.sha256(bytes(buf)).hexdigest()[:12]
+    return hashlib.sha1(bytes(buf)).hexdigest()[:12]  # same digest as kv_tier_dma._digest
 
 
 class NvmeTierFile:
