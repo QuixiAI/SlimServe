@@ -1193,7 +1193,8 @@
           "bytes": 197881155500,
           "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: 42 MoE layers in NVFP4 (group 16), the last expert layer in FP8, attention/KDA/mHC/embeddings/vision in BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 kernels.",
           "min_gpus": {
-            "a100": 4
+            "a100": 4,
+            "rtx6000": 4
           },
           "files": [
             {
@@ -1324,6 +1325,20 @@
       "notes": [
         "GeForce driver disables GPU peer-to-peer, so every tensor-parallel collective stages through host memory. Profiles on this platform should prefer expert parallelism and host-offloaded tables over designs that add per-step all-reduces.",
         "SM86 has no FP8 tensor cores; FP8 checkpoints serve through the Marlin W8A16 weight-only kernels."
+      ]
+    },
+    "rtx6000": {
+      "title": "NVIDIA RTX PRO 6000 Blackwell",
+      "compute_capability": [
+        12,
+        0
+      ],
+      "vram_bytes": 102642417664,
+      "gate": "gpus",
+      "status": "supported",
+      "notes": [
+        "Workstation Blackwell (GB202, sm_120): 188 SMs, 128 MiB L2, 100 KB shared memory per SM (99 KB opt-in per block), 96 GB GDDR7 at 1.79 TB/s, PCIe 5 x16 and no NVLink. On a four-card box the cards pair up under two host bridges (GPU0-GPU1, GPU2-GPU3) with the cross-pair path through the root complex; peer reads work on every pair, so tensor-parallel collectives run over PCIe and each all-reduce is a latency cost the record must budget for.",
+        "Family cubin 12.0f needs CUDA >= 13.0; older toolkits fall back to 12.0a;12.1a. The sm_120 tensor cores do NVFP4, but the stock CUTLASS and FlashInfer grouped FP4 GEMMs produced garbage on this card class in vLLM (issue #54150, cutlass #3096), so NVFP4 experts serve through Marlin W4A16 until a QuixiCore sm_120 kernel is qualified. DeepGEMM, TileLang v2 DSA schedules and the SM90/SM100 attention kernels do not run here."
       ]
     }
   },
@@ -2691,6 +2706,50 @@
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
             "Host KV tier ENABLED (2026-09-03): 64 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 128 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53-nvfp4-8-tier/)."
+          ]
+        },
+        "rtx6000": {
+          "platform": "rtx6000",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 16,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "env": {},
+          "notes": [
+            "BRING-UP RECORD (2026-09-04), not yet validated: this is the a100 record's kernel set carried to sm_120 as the Phase 0 baseline of docs/glm53-flash-sm120-plan.md. Nothing here is a measured sm_120 choice until the notebook says so; each line below states what is known.",
+            "Same model facts as a100: context from config.json (1048576), ~17 KiB/token per rank of MLA + indexer KV, fixed-size KDA state; block_size 64 for the pooled-indexer cache; parsers glm47; TP4 with experts sharded (EP was 4-6% slower on a100; the PCIe all-reduce cost here is the reason to re-measure, not to assume).",
+            "moe_backend marlin: NVFP4 experts through Marlin W4A16 built for 12.0f. The sm_120 tensor cores can run W4A4, but the stock CUTLASS/FlashInfer grouped FP4 paths emitted garbage on this card class in vLLM (#54150), so Marlin is the correctness baseline and the native path is Phase 1 work behind the exact-token and U+FFFD gates.",
+            "attention_config QUIXICORE_MLA_SPARSE: the QuixiCore sparse NoPE MLA decode kernel compiled for sm_120 (99 KB opt-in shared memory, vs 163 KB on sm80); parity against tests/kernels/test_quixicore_sparse_mla_bf16.py is owed before any number is recorded. FlashInfer's SM120 GLM53_NOPE sparse MLA (#4802) is the A/B partner.",
+            "kv_cache_dtype auto (bf16) for bring-up. fp8_ds_mla KV is the planned Phase 1 change (row layout for pe_dim 0 from vLLM #55277) and needs its own on-box validation note before it lands here.",
+            "Host and NVMe KV tiers are NOT configured on this record yet, matching how the a100 baseline was measured (2026-09-03: no host tier) before the tier landed with its own acceptance. This box has 188 GB host RAM (earlyoom active), so the a100 figure of 64 GiB per rank does not transfer; the plan is 32 GiB per rank plus a 128 GiB per-rank disk tier in SLIMSERVE_KV_TIER_DIR, added only after benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1 passes here.",
+            "Speculation: the checkpoint ships model_mtp.safetensors but the glm5_next MTP draft path is not ported; profile stays non-speculative until Phase 3 of the plan.",
+            "Reference bars for this platform: rtx6kpro B12X R24 (2026-09-04) 169.9 c1 / 737.8 c8 no-spec and 247.8 / 903.2 with MTP-3; Foundry SGLang FP8 141.7 c1 / 274 c4 with NextN. The a100 TP4 record is 73.8 / 332.1 / 464.6 at c1/c8/c16."
           ]
         }
       }
