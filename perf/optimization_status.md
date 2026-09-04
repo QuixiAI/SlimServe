@@ -19634,3 +19634,45 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   output), then the indexer fold.
 - Raw: perf/results/2026-09-04/g-a-fold-pass{1,2}/, g-a-fold-gate{1,2}.json;
   serve-logs/serve-20260904-163739.log, ab-g-a-fold.log.
+
+## 2026-09-04: KDA f_b_proj + g_b_proj as one strided-batched GEMV - RETAINED (+0.9% c1, +0.3% c8, +0.8% c16)
+
+- Status: RETAINED. Phase 1 item 1 step 2.
+- Scope: rtx6000 record on the g_a fold tree (c1006a8ed), exact-token
+  1000/300 c1/c8/c16, one boot, two passes, gate twice.
+- Baseline: the g_a fold boot: c1 111.0 / c8 445.7 / c16 603.9 (mean of
+  its two passes). Gate reference -2.416..-2.440.
+- Hypothesis: after the g_a fold, f_a and g_a are adjacent 128-column
+  slices of the merged projection output, and f_b_proj / g_b_proj have the
+  same shape (2048 x 128 local), so the two per-layer GEMVs can be one
+  cuBLAS strided-batched launch with no copy: the [n, 256] slice viewed
+  as [n, 2, 128] and transposed is a valid strided batch.
+- Change: kimi_gdn_linear_attn.py allocates one [2, 2048, 128] buffer at
+  init and re-points f_b_proj.weight and g_b_proj.weight to views of it
+  (the checkpoint loaders write through the views); forward does one
+  torch.bmm on the strided view and unbinds g1 / g_proj_states. The
+  full-rank-gate branch keeps the old f_b_proj call. One file, +23/-5.
+- Correctness: unit check on GPU 0 before the boot: bmm on the strided
+  view is bit-identical to the two separate GEMVs (max |diff| = 0.0 at
+  n = 8) and launches exactly one kernel at n = 1, 8, 16 (gemvx at n = 1,
+  a 32x32 wmma tile kernel above), no copy kernel. Boot clean, exact:true
+  in all six cells; gate -2.437 / -2.425 (reference -2.416..-2.440),
+  needle margins 14.3/17.5 and 15.5/17.3.
+- Results (aggregate tok/s, pass1 / pass2):
+
+  | shape | baseline | fg_b batched | change (pass 2) |
+  |---|---:|---:|---:|
+  | c1 1000/300 | 111.0 | 108.56 / 112.01 | +0.9% |
+  | c8 1000/300 | 445.7 | 447.68 / 446.26 | +0.3% |
+  | c16 1000/300 | 603.9 | 609.96 / 607.86 | +0.8% |
+
+  The pass-1 c1 cell (wall 2.76 s vs 2.68 s) began in the same second the
+  server reported /health, the only c1 cell of the day that differs from
+  its pair by more than 0.1%; the next A/B's baseline will confirm 112.0.
+  Cumulative since the Phase 0 baseline: c1 104.8 -> 112.0 (+6.9%), c8
+  431.4 -> 446.3 (+3.5%), c16 591.0 -> 607.9 (+2.9%).
+- Decision: RETAINED. Next: the router gate through the QuixiCore decode
+  projection GEMV (fp32 logits, no cast kernel; item 1 step 3a), then the
+  DSA indexer fold (step 1b).
+- Raw: perf/results/2026-09-04/fg-b-batched-pass{1,2}/,
+  fg-b-batched-gate{1,2}.json; serve-logs/ab-fg-b-batched.log.

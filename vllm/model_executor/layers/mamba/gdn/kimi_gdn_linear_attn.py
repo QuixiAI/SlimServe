@@ -362,6 +362,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                 quant_config=self.quant_config,
                 prefix=f"{prefix}.g_b_proj",
             )
+        if not self.use_full_rank_gate:
+            # f_b_proj and g_b_proj share a shape (local projection rows of
+            # head_dim) and read adjacent columns of the merged projection
+            # output, so at decode they run as one strided-batched GEMV on
+            # this buffer. The two Parameters stay as views into it, which
+            # keeps the checkpoint loaders untouched.
+            self.fg_b_weight = torch.empty(
+                2,
+                self.local_projection_size,
+                self.head_dim,
+                dtype=self.f_b_proj.weight.dtype,
+                device=self.f_b_proj.weight.device,
+            )
+            self.f_b_proj.weight.data = self.fg_b_weight[0]
+            self.g_b_proj.weight.data = self.fg_b_weight[1]
         self.o_norm = FusedRMSNormGated(self.head_dim, activation="sigmoid")
         self.o_proj = RowParallelLinear(
             self.projection_size,
@@ -406,18 +421,21 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             projected = projected_qkvgfab.split(split_sizes, dim=-1)
             mixed_qkv, g_proj_states, f_a, beta = projected[:4]
         else:
-            mixed_qkv, beta, f_a, g_a = projected_qkvgfab.split(
+            mixed_qkv, beta, fg_a = projected_qkvgfab.split(
                 [
                     3 * self.local_projection_size,
                     self.local_num_heads,
-                    self.head_dim,
-                    self.head_dim,
+                    2 * self.head_dim,
                 ],
                 dim=-1,
             )
-            g_proj_states = self.g_b_proj(g_a)[0]
+            # [n, 2, d] -> [2, n, d] strided view; no copy.
+            fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
+            fg_b = torch.bmm(fg_a, self.fg_b_weight.transpose(1, 2))
+            g1, g_proj_states = fg_b.unbind(0)
 
-        g1 = self.f_b_proj(f_a)[0]
+        if self.use_full_rank_gate:
+            g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
 
