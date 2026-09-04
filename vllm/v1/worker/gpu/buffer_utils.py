@@ -15,7 +15,7 @@ from vllm.utils.torch_utils import (
 
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
-_DEFAULT_MAX_CONCURRENCY = 2
+_DEFAULT_MAX_CONCURRENCY = 4
 
 
 def _quixicore_disabled() -> bool:
@@ -46,7 +46,15 @@ def _use_native_apply_write() -> bool:
 
 def set_default_max_concurrency(n: int) -> None:
     global _DEFAULT_MAX_CONCURRENCY
-    _DEFAULT_MAX_CONCURRENCY = max(2, n)
+    _DEFAULT_MAX_CONCURRENCY = max(4, n)
+    # Diagnostic (VLLM_QC_UVA_POOL_DEPTH=N): a much deeper pool makes slot
+    # reuse rare; if a host-visible metadata race is still in play the
+    # symptom moves with this knob (2026-09-02 residual bisect).
+    import os as _os
+
+    override = _os.environ.get("VLLM_QC_UVA_POOL_DEPTH")
+    if override:
+        _DEFAULT_MAX_CONCURRENCY = max(_DEFAULT_MAX_CONCURRENCY, int(override))
 
 
 def async_copy_to_gpu(
@@ -110,11 +118,43 @@ class UvaBufferPool:
         self._uva_bufs = [UvaBuffer(size, dtype) for _ in range(max_concurrency)]
         # Current buffer index
         self._curr = 0
+        # Reuse fence, one event per slot. The GPU reads these buffers from
+        # host memory AT KERNEL EXECUTION TIME (UVA), and chunked-prefill
+        # steps queue without data dependencies, so the GPU can fall more
+        # than max_concurrency steps behind the CPU-side metadata writes.
+        # Rewriting a slot then feeds stale/foreign metadata (slot mappings,
+        # block tables) to still-queued kernels: silent KV corruption when
+        # the resulting addresses are mapped, hipErrorIllegalAddress when
+        # not (root-caused on GLM-5.2/MI300X, 2026-09-01). Each slot's event
+        # is recorded once its consumers are enqueued (at the next pool
+        # call) and host-synchronized before the slot is rewritten.
+        self._events: list = [None] * max_concurrency
 
     def copy_to_uva(self, x: torch.Tensor | np.ndarray | list) -> torch.Tensor:
+        fence = (
+            not self._uva_bufs[0].is_metal
+            and torch.cuda.is_available()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if fence:
+            # All consumers of the PREVIOUS slot's contents are enqueued on
+            # the compute stream by now (they were launched during the step
+            # that obtained it); order its reuse fence after them.
+            prev_ev = self._events[self._curr]
+            if prev_ev is None:
+                prev_ev = self._events[self._curr] = torch.cuda.Event()
+            prev_ev.record(torch.cuda.current_stream())
         # Round robin to the next buffer.
         self._curr = (self._curr + 1) % self.max_concurrency
         buf = self._uva_bufs[self._curr]
+        if fence:
+            ev = self._events[self._curr]
+            if ev is not None:
+                # Host-wait until the GPU has passed the point where this
+                # slot's previous consumers were all enqueued. Costs nothing
+                # unless the GPU is >= max_concurrency steps behind - the
+                # exact condition under which reuse would corrupt.
+                ev.synchronize()
         # CPU-to-CPU copy
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         n = len(x)

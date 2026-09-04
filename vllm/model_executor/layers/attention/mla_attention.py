@@ -189,6 +189,7 @@ return curr_o @ W_O
 
 import collections
 import functools
+import os as _os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -1220,6 +1221,8 @@ def unified_mla_kv_cache_update(
             kv_cache_dtype,
             k_scale,
         )
+        if _MLA_INSERT_VERIFY and not torch.cuda.is_current_stream_capturing():
+            _verify_mla_insert(layer_name, kv_c_normed, layer_slot_mapping, kv_cache)
 
     return torch.empty(0, device=kv_c_normed.device, dtype=kv_c_normed.dtype)
 
@@ -2683,3 +2686,59 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         raise NotImplementedError
+
+
+# --- diagnostic: VLLM_QC_MLA_INSERT_VERIFY=1 --------------------------------
+
+_MLA_INSERT_VERIFY = _os.environ.get("VLLM_QC_MLA_INSERT_VERIFY", "0") == "1"
+_mla_verify_state = {"calls": 0, "bad": 0}
+
+
+def _verify_mla_insert(layer_name, kv_c, slot_mapping, kv_cache) -> None:
+    """Read back rows just written by do_kv_cache_update and compare the
+    kv_c lanes (stored unrotated; exact modulo dtype cast). Bounded."""
+    _mla_verify_state["calls"] += 1
+    n = _mla_verify_state["calls"]
+    slots = slot_mapping.flatten()
+    bs = kv_cache.shape[1]
+    # Always verify writes that land past block 340 (a 6 MB block stride
+    # crosses 2^31 bytes at block 353): the first 40 calls all sit on low
+    # blocks at boot and told us nothing about the high-block garbling
+    # (2026-09-02). Bounded to 400 such calls.
+    high = slots.numel() > 0 and int(slots.max()) >= 340 * bs
+    if high:
+        _mla_verify_state["high"] = _mla_verify_state.get("high", 0) + 1
+    if not (n <= 40 or n % 512 == 0 or (high and _mla_verify_state["high"] <= 400)):
+        return
+    torch.cuda.synchronize()
+    lora = kv_c.shape[1]
+    bad = checked = 0
+    for i in range(min(4, slots.shape[0])):
+        s = int(slots[i])
+        if s < 0:
+            continue
+        row = kv_cache[s // bs, s % bs, :lora]
+        d = (row.float() - kv_c[i].float()).abs().max().item()
+        checked += 1
+        if d > 1e-2:
+            bad += 1
+            _mla_verify_state["bad"] += 1
+            logger.warning(
+                "mla-insert-verify MISMATCH %s call=%d slot=%d block=%d off=%d "
+                "maxdiff=%.4f",
+                layer_name,
+                n,
+                s,
+                s // bs,
+                s % bs,
+                d,
+            )
+    if n <= 40 or bad:
+        logger.info(
+            "mla-insert-verify: %s call=%d checked=%d bad=%d (total %d)",
+            layer_name,
+            n,
+            checked,
+            bad,
+            _mla_verify_state["bad"],
+        )

@@ -1247,11 +1247,26 @@
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.2-Vision"
+            "served_model_name": "GLM-5.2-Vision",
+            "kv_cache_dtype": "auto",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
-          }
+          },
+          "notes": [
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "host_tier_gb_per_rank is 128: the box-wide GTT aperture (1511.7 GB/GPU; pinned host memory maps portably into every GPU) saturates near 8 x 128-160 GiB once the server's own GTT consumers are counted - a worker OOMed at exactly 128 GiB pinned during the 2026-08-31 bring-up, while standalone probes pinned 8 x 160 GiB fine. GLM's replicated MLA KV (~50 KB/token) makes this ~2.7M tokens, roughly the GPU pool, so the tier's net capacity is thin until one of the filed follow-ups lands: map each rank's arena into its own device only (hipHostRegister without the portable flag), or shard the replicated rows across ranks (8x capacity). The restore mechanism itself was validated with a reduced-pool diagnostic boot (see the notebook, 2026-08-31).",
+            "The packed cross-layer slab is restored (enable_cross_layers_blocks): sparse MLA decode runs the QuixiCore gfx942 kernel (csrc/quixicore/rocm/mla_decode_kernels.cuh, mla_sparse_decode_fwd), which takes the slab's block stride as a parameter; aiter's mla_decode_fwd flattens the cache and rejects strided views, and the per-layer fallback was withdrawn after its ~100x copy amplification crashed the HSA runtime under eviction load (2026-08-31). VLLM_QC_ROCM_MLA_SPARSE=0 restores the aiter path (contiguous caches only). kv_cache_dtype auto (bf16): the QuixiCore kernel is bf16-first and bf16 main KV is the standing policy direction; the fp8 variant is the follow-up. 120 GiB fixed KV = ~1.26M tokens at ~100 KB/token; a 1M-token request fits."
+          ]
         }
       }
     },
@@ -1287,11 +1302,26 @@
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.2-Vision"
+            "served_model_name": "GLM-5.2-Vision",
+            "kv_cache_dtype": "auto",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
-          }
+          },
+          "notes": [
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "host_tier_gb_per_rank is 128: the box-wide GTT aperture (1511.7 GB/GPU; pinned host memory maps portably into every GPU) saturates near 8 x 128-160 GiB once the server's own GTT consumers are counted - a worker OOMed at exactly 128 GiB pinned during the 2026-08-31 bring-up, while standalone probes pinned 8 x 160 GiB fine. GLM's replicated MLA KV (~50 KB/token) makes this ~2.7M tokens, roughly the GPU pool, so the tier's net capacity is thin until one of the filed follow-ups lands: map each rank's arena into its own device only (hipHostRegister without the portable flag), or shard the replicated rows across ranks (8x capacity). The restore mechanism itself was validated with a reduced-pool diagnostic boot (see the notebook, 2026-08-31).",
+            "The packed cross-layer slab is restored (enable_cross_layers_blocks): sparse MLA decode runs the QuixiCore gfx942 kernel (csrc/quixicore/rocm/mla_decode_kernels.cuh, mla_sparse_decode_fwd), which takes the slab's block stride as a parameter; aiter's mla_decode_fwd flattens the cache and rejects strided views, and the per-layer fallback was withdrawn after its ~100x copy amplification crashed the HSA runtime under eviction load (2026-08-31). VLLM_QC_ROCM_MLA_SPARSE=0 restores the aiter path (contiguous caches only). kv_cache_dtype auto (bf16): the QuixiCore kernel is bf16-first and bf16 main KV is the standing policy direction; the fp8 variant is the follow-up. 120 GiB fixed KV = ~1.26M tokens at ~100 KB/token; a 1M-token request fits."
+          ]
         },
         "a100": {
           "platform": "a100",
@@ -1368,11 +1398,26 @@
             "trust_remote_code": true,
             "reasoning_parser": "glm45",
             "tool_call_parser": "glm47",
-            "served_model_name": "GLM-5.2-Vision"
+            "served_model_name": "GLM-5.2-Vision",
+            "kv_cache_dtype": "auto",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128,
+                "enable_cross_layers_blocks": "True"
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
-          }
+          },
+          "notes": [
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "host_tier_gb_per_rank is 128: the box-wide GTT aperture (1511.7 GB/GPU; pinned host memory maps portably into every GPU) saturates near 8 x 128-160 GiB once the server's own GTT consumers are counted - a worker OOMed at exactly 128 GiB pinned during the 2026-08-31 bring-up, while standalone probes pinned 8 x 160 GiB fine. GLM's replicated MLA KV (~50 KB/token) makes this ~2.7M tokens, roughly the GPU pool, so the tier's net capacity is thin until one of the filed follow-ups lands: map each rank's arena into its own device only (hipHostRegister without the portable flag), or shard the replicated rows across ranks (8x capacity). The restore mechanism itself was validated with a reduced-pool diagnostic boot (see the notebook, 2026-08-31).",
+            "The packed cross-layer slab is restored (enable_cross_layers_blocks): sparse MLA decode runs the QuixiCore gfx942 kernel (csrc/quixicore/rocm/mla_decode_kernels.cuh, mla_sparse_decode_fwd), which takes the slab's block stride as a parameter; aiter's mla_decode_fwd flattens the cache and rejects strided views, and the per-layer fallback was withdrawn after its ~100x copy amplification crashed the HSA runtime under eviction load (2026-08-31). VLLM_QC_ROCM_MLA_SPARSE=0 restores the aiter path (contiguous caches only). kv_cache_dtype auto (bf16): the QuixiCore kernel is bf16-first and bf16 main KV is the standing policy direction; the fp8 variant is the follow-up. 120 GiB fixed KV = ~1.26M tokens at ~100 KB/token; a 1M-token request fits."
+          ]
         },
         "a100": {
           "platform": "a100",
@@ -1571,7 +1616,16 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_cache_dtype": "fp8_e4m3",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1581,7 +1635,10 @@
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "kv_cache_dtype is stated explicitly as the value this record already served by inheritance (this fork defaults cache_dtype to fp8_e4m3) so the tier's block_stride and arena sizing are deterministic. This is documentation, not a policy change: bf16 main KV remains aspirational on MI300X and flips only with an on-box requalification pass.",
+            "The packed slab comes from the allocator's is_dsv4 gate (all-uniform groups), no opt-in needed. DeepSeek-V4 forms several attention groups (MLA, SWA, C4/C128 compressors) whose blocks are distinct slab rows; the tier stages one host slot per (block, attention group) so each restores onto its own block."
           ]
         },
         "metal": {
@@ -1647,7 +1704,16 @@
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
             "max_num_seqs": 64,
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_cache_dtype": "fp8_e4m3",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1657,7 +1723,10 @@
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "kv_cache_dtype is stated explicitly as the value this record already served by inheritance (this fork defaults cache_dtype to fp8_e4m3) so the tier's block_stride and arena sizing are deterministic. This is documentation, not a policy change: bf16 main KV remains aspirational on MI300X and flips only with an on-box requalification pass.",
+            "The packed slab comes from the allocator's is_dsv4 gate (all-uniform groups), no opt-in needed. DeepSeek-V4 forms several attention groups (MLA, SWA, C4/C128 compressors) whose blocks are distinct slab rows; the tier stages one host slot per (block, attention group) so each restores onto its own block."
           ]
         },
         "a100": {
@@ -1854,7 +1923,16 @@
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
             "max_num_seqs": 64,
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_cache_dtype": "fp8_e4m3",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -1864,7 +1942,10 @@
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "kv_cache_dtype is stated explicitly as the value this record already served by inheritance (this fork defaults cache_dtype to fp8_e4m3) so the tier's block_stride and arena sizing are deterministic. This is documentation, not a policy change: bf16 main KV remains aspirational on MI300X and flips only with an on-box requalification pass.",
+            "The packed slab comes from the allocator's is_dsv4 gate (all-uniform groups), no opt-in needed. DeepSeek-V4 forms several attention groups (MLA, SWA, C4/C128 compressors) whose blocks are distinct slab rows; the tier stages one host slot per (block, attention group) so each restores onto its own block."
           ]
         },
         "a100": {
@@ -1995,7 +2076,16 @@
             "reasoning_parser": "deepseek_v4",
             "tool_call_parser": "deepseek_v4",
             "served_model_name": "DeepSeek-V4-Flash",
-            "enable_prefix_caching": true
+            "enable_prefix_caching": true,
+            "kv_cache_dtype": "fp8_e4m3",
+            "numa_bind": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 128
+              }
+            }
           },
           "env": {
             "VLLM_ROCM_USE_AITER": "1"
@@ -2005,7 +2095,10 @@
             "sparse_mla_force_mqa is required, or short prompts take a dense forward the ROCm sparse backend does not implement.",
             "Context comes from the GGUF (1M, yarn over a 65536 base); KV is sized by the default utilization rather than a measured byte budget.",
             "reasoning_parser must be set: this fork defaults it to glm45 for its GLM target, and that parser classifies a whole DeepSeek reply as reasoning, leaving content null for every API client.",
-            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass."
+            "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Flipped by policy on 2026-08-28 from the rtx3090 box; validate on this platform (mamba 'align' cache mode is experimental upstream) at its next live validation pass.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above): 128 GiB pinned host RAM per rank, sized for this 3.0 TB / 8x MI300X box (1.0 TB pinned at TP8, ~2 TB left for the OS, page cache and weight staging). numa_bind lands each rank's arena on its socket-local node (2 NUMA nodes x 128 cores). Enabled per issue #17 with on-box validation; the eviction-restore acceptance (marker recall after full GPU-pool eviction, restores actually firing, tier hit counts recorded - not answer correctness alone, which the GPU prefix cache can satisfy with the tier idle) is the standing check for tier changes.",
+            "kv_cache_dtype is stated explicitly as the value this record already served by inheritance (this fork defaults cache_dtype to fp8_e4m3) so the tier's block_stride and arena sizing are deterministic. This is documentation, not a policy change: bf16 main KV remains aspirational on MI300X and flips only with an on-box requalification pass.",
+            "The packed slab comes from the allocator's is_dsv4 gate (all-uniform groups), no opt-in needed. DeepSeek-V4 forms several attention groups (MLA, SWA, C4/C128 compressors) whose blocks are distinct slab rows; the tier stages one host slot per (block, attention group) so each restores onto its own block."
           ]
         }
       }

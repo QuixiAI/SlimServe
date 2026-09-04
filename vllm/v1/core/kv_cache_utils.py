@@ -1306,10 +1306,7 @@ def _get_kv_cache_config_packed(
     logger.info(
         "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes",
         len(kv_cache_groups),
-        [
-            (type(g.kv_cache_spec).__name__, len(g.layer_names))
-            for g in kv_cache_groups
-        ],
+        [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in kv_cache_groups],
         sum(len(g.layer_names) for g in kv_cache_groups),
         block_stride,
     )
@@ -1333,7 +1330,33 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _group_block_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> list[int]:
+    """Bytes of one block per group, from the real per-layer specs."""
+    out: list[int] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            out.append(
+                sum(spec.kv_cache_specs[ln].page_size_bytes for ln in group.layer_names)
+            )
+        else:
+            out.append(spec.page_size_bytes * len(group.layer_names))
+    return out
+
+
 def get_kv_cache_config_from_groups(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> KVCacheConfig:
+    cfg = _get_kv_cache_config_from_groups(
+        vllm_config, kv_cache_groups, available_memory
+    )
+    cfg.group_block_bytes = _group_block_bytes(cfg.kv_cache_groups)
+    return cfg
+
+
+def _get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
@@ -1691,7 +1714,7 @@ def _classify_csa_linear_specs(
         # roles. TQFullAttentionSpec is a packed-layout FullAttentionSpec
         # (Qwen4Exp TQ main KV) and owns the same main-KV role.
         if type(spec) in (FullAttentionSpec, TQFullAttentionSpec):
-            roles.main_kv[name] = spec
+            roles.main_kv[name] = cast(FullAttentionSpec, spec)
         elif type(spec) is MLAAttentionSpec and spec.compress_ratio > 1:
             roles.compressed[name] = spec
         elif type(spec) is CircularBufferSpec:

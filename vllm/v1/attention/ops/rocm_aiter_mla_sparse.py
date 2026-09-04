@@ -3,6 +3,9 @@
 import functools
 import importlib
 import math
+import os
+import os as _os
+import os as _os_env
 from importlib.util import find_spec
 
 import torch
@@ -27,7 +30,6 @@ def _quixicore_disabled() -> bool:
     identical server; the kernels are bitwise-equal, so greedy output must
     match token for token.
     """
-    import os
 
     return os.environ.get("VLLM_QC_DISABLE_NATIVE") == "1"
 
@@ -196,6 +198,18 @@ def indexer_k_quant_and_cache_triton(
         IS_FNUZ=current_platform.fp8_dtype() == torch.float8_e4m3fnuz,
         USE_UE8M0=scale_fmt == "ue8m0",
     )
+    if _IDX_VERIFY and not torch.cuda.is_current_stream_capturing():
+        _verify_indexer_write(
+            k,
+            kv_cache_value,
+            kv_cache_scale,
+            slot_mapping,
+            block_size,
+            head_dim,
+            layout,
+            block_tile_size,
+            16,
+        )
 
 
 @triton.jit
@@ -468,6 +482,110 @@ def paged_mqa_logits_module():
     return None
 
 
+def _paged_logits_native_path(q_fp8, kv_cache_fp8, context_lens):
+    """Pick our paged logits kernel when AITER's cannot be correct.
+
+    AITER's paged MQA-logits kernel (Gluon, AMD buffer loads) addresses the
+    indexer cache with 32-bit offsets, so on a cache spanning more than
+    2 GiB - the packed cross-layer slab on GLM-5.2/MI300X - every block past
+    ~2 GiB reads garbage and the decode top-k silently loses those positions
+    (root-caused 2026-09-02/03, perf/optimization_status.md). Our kernel
+    (fp8_paged_mqa_logits_kernel.cuh) is 64-bit throughout and shares the
+    contiguous kernel's MFMA body. Selection: required whenever the cache
+    view spans >= 2 GiB; VLLM_QC_PAGED_LOGITS_NATIVE=1 forces it everywhere,
+    =0 forces AITER (A/B only). Returns the callable or None.
+    """
+    if not (_ON_GFX942 and _use_native_mqa_logits()):
+        return None
+    import os as _os
+
+    force = _os.environ.get("VLLM_QC_PAGED_LOGITS_NATIVE")
+    if force == "0":
+        return None
+    heads, head_dim = q_fp8.shape[-2], q_fp8.shape[-1]
+    if head_dim != 128 or heads not in (32, 64):
+        return None
+    if (
+        q_fp8.ndim == 4
+        and context_lens.dim() == 2
+        and (
+            context_lens.shape[0] != q_fp8.shape[0]
+            or context_lens.shape[1] not in (1, q_fp8.shape[1])
+        )
+    ):
+        return None  # unexpected MTP layout: leave it to AITER
+    span = kv_cache_fp8.stride(0) * kv_cache_fp8.element_size() * kv_cache_fp8.shape[0]
+    if force != "1" and span < (1 << 31):
+        return None
+    if not _paged_logits_native_path.__dict__.get("announced"):
+        _paged_logits_native_path.__dict__["announced"] = True
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "sparse indexer decode logits: native paged kernel "
+            "(mqa_logits_paged_gfx942) selected - indexer cache spans %.1f GiB "
+            "(heads=%d, forced=%s)",
+            span / 2**30,
+            heads,
+            force == "1",
+        )
+    return _rocm_fp8_paged_mqa_logits_native
+
+
+def _rocm_fp8_paged_mqa_logits_native(
+    q_fp8,
+    kv_cache_fp8,
+    weights,
+    context_lens,
+    block_tables,
+    max_model_len,
+    out_workspace,
+):
+    from vllm.quixicore import quixicore_ops
+
+    nn = 1
+    if q_fp8.ndim == 4:
+        b, nn, h, d = q_fp8.shape
+        q_rows = q_fp8.reshape(b * nn, h, d)
+    else:
+        q_rows = q_fp8
+    m = q_rows.shape[0]
+    num_blocks, block_size = kv_cache_fp8.shape[0], kv_cache_fp8.shape[1]
+    head_dim = q_rows.shape[2]
+    flat = kv_cache_fp8.view(num_blocks, -1)  # [NB, block_size*(D+4)], strided
+    kv_values = flat[:, : block_size * head_dim]
+    kv_scales = flat[:, block_size * head_dim :].view(torch.float32)
+    # context_lens is [B] / [B, 1] (flattened decode: one row per token)
+    # or [B, next_n] (native MTP: row (b, j) has its own length); block
+    # tables are per request either way, so the MTP layout repeats each
+    # request's row next_n times (fixed shapes: graph-replay safe).
+    if context_lens.dim() == 2 and context_lens.shape[1] == nn and nn > 1:
+        seq_lens = context_lens.reshape(-1)
+        bt = block_tables[: context_lens.shape[0]].repeat_interleave(nn, dim=0)
+    else:
+        seq_lens = context_lens.reshape(-1)[:m]
+        bt = block_tables[:m]
+    if seq_lens.dtype != torch.int32:
+        seq_lens = seq_lens.to(torch.int32)
+    if bt.dtype != torch.int32:
+        bt = bt.to(torch.int32)
+    if out_workspace is None:
+        out = torch.empty((m, max_model_len), dtype=torch.float32, device=q_rows.device)
+    else:
+        out = out_workspace
+    quixicore_ops.mqa_logits_paged_gfx942(
+        q_rows,
+        kv_values,
+        kv_scales,
+        weights[:m],
+        seq_lens,
+        bt,
+        out,
+        block_size,
+    )
+    return out
+
+
 def rocm_fp8_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -508,6 +626,18 @@ def rocm_fp8_paged_mqa_logits(
 
     if rocm_aiter_ops.is_enabled():
         aiter_paged_mqa_logits_module = paged_mqa_logits_module()
+
+    native = _paged_logits_native_path(q_fp8, kv_cache_fp8, context_lens)
+    if native is not None:
+        return native(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+            out_workspace,
+        )
 
     if aiter_paged_mqa_logits_module is not None:
         if _ON_GFX942 or _ON_GFX950:
@@ -1007,7 +1137,129 @@ def rocm_aiter_sparse_attn_indexer(
                 topk_indices
             )
 
+    if _IDX_TOPK_RECENCY:
+        _override_topk_recency(
+            topk_indices_buffer,
+            layer_attn_metadata,
+            num_decode_tokens,
+            hidden_states.shape[0],
+            topk_tokens,
+        )
+    if _IDX_STATS and not torch.cuda.is_current_stream_capturing():
+        _log_topk_stats(
+            topk_indices_buffer,
+            layer_attn_metadata,
+            num_decode_tokens,
+            hidden_states.shape[0],
+            topk_tokens,
+        )
     return topk_indices_buffer
+
+
+# Diagnostic (VLLM_QC_IDX_TOPK_RECENCY=1): replace the indexer's top-k with
+# the last `topk_tokens` request-local positions, computed in pure torch.
+# Removes the indexer logits/topk kernels from the loop entirely: if churn
+# garbling disappears under this override, those kernels are the corruptor.
+
+_IDX_TOPK_RECENCY = _os_env.environ.get("VLLM_QC_IDX_TOPK_RECENCY", "0") == "1"
+
+
+def _override_topk_recency(
+    buf, layer_attn_metadata, num_decode_tokens, num_tokens, topk
+) -> None:
+    dev = buf.device
+    ar = torch.arange(topk, device=dev, dtype=torch.int32)
+    if layer_attn_metadata.num_decodes > 0:
+        dm = layer_attn_metadata.decode
+        if dm is not None and not dm.requires_padding:
+            seq_lens = dm.seq_lens.to(dev)
+            next_n = num_decode_tokens // max(1, seq_lens.shape[0])
+            ends = (
+                seq_lens.repeat_interleave(next_n)
+                - (next_n - 1 - torch.arange(num_decode_tokens, device=dev) % next_n)
+                + 1
+            ).clamp_(min=1)
+            starts = (ends - topk).clamp_(min=0)
+            rows = starts.unsqueeze(1).to(torch.int32) + ar.unsqueeze(0)
+            rows[rows >= ends.unsqueeze(1).to(torch.int32)] = -1
+            buf[:num_decode_tokens, :topk] = rows
+    pm = layer_attn_metadata.prefill
+    if layer_attn_metadata.num_prefills > 0 and pm is not None:
+        for chunk in pm.chunks:
+            ks = chunk.cu_seqlen_ks.to(dev)
+            ke = chunk.cu_seqlen_ke.to(dev)
+            ends = (ke - ks).to(torch.int32)  # request-local context length
+            starts = (ends - topk).clamp_(min=0)
+            rows = starts.unsqueeze(1) + ar.unsqueeze(0)
+            rows[rows >= ends.unsqueeze(1)] = -1
+            buf[chunk.token_start : chunk.token_end, :topk] = rows
+
+
+_IDX_STATS = _os_env.environ.get("VLLM_QC_IDX_STATS", "0") == "1"
+_idx_stats_state = {"calls": 0, "oob": 0}
+
+
+def _log_topk_stats(
+    buf, layer_attn_metadata, num_decode_tokens, num_tokens, topk
+) -> None:
+    """Diagnostic (VLLM_QC_IDX_STATS=1): per sampled call, report the
+    indexer's emitted top-k index ranges against each token's context
+    bound. Out-of-range indices attend unwritten/foreign rows."""
+    from vllm.logger import init_logger
+
+    log = init_logger(__name__)
+    _idx_stats_state["calls"] += 1
+    n = _idx_stats_state["calls"]
+    # Sample densely enough to catch every request's prefill (102 layer
+    # calls per step): the top-k reach cutoff of the 2026-09-02 residual
+    # only shows on specific requests.
+    if n > 30 and n % 32 != 0:
+        return
+    torch.cuda.synchronize()
+    msgs = []
+
+    def check(rows, bounds, tag):
+        # rows [T, topk] int32 (-1 padded), bounds [T] context length.
+        live = rows >= 0
+        over = (rows >= bounds.unsqueeze(1).to(rows.dtype)) & live
+        n_over = int(over.sum())
+        if n_over:
+            _idx_stats_state["oob"] += n_over
+            t = int(over.any(dim=1).float().argmax())
+            bad = rows[t][over[t]][:4].tolist()
+            msgs.append(
+                f"{tag}: {n_over} OOB indices (e.g. tok{t} ctx={int(bounds[t])} "
+                f"idx={bad})"
+            )
+        else:
+            msgs.append(
+                f"{tag}: ok live={int(live.sum())} max={int(rows.max())} "
+                f"ctxmax={int(bounds.max())}"
+            )
+
+    dm = layer_attn_metadata.decode
+    if (
+        layer_attn_metadata.num_decodes > 0
+        and dm is not None
+        and not dm.requires_padding
+    ):
+        seq = dm.seq_lens.to(buf.device)
+        nn = num_decode_tokens // max(1, seq.shape[0])
+        k = torch.arange(num_decode_tokens, device=buf.device) % nn
+        bounds = seq.repeat_interleave(nn) - (nn - 1 - k)
+        check(buf[:num_decode_tokens, :topk], bounds, "decode")
+    pm = layer_attn_metadata.prefill
+    if layer_attn_metadata.num_prefills > 0 and pm is not None:
+        for chunk in pm.chunks:
+            ke = chunk.cu_seqlen_ke.to(buf.device)
+            check(buf[chunk.token_start : chunk.token_end, :topk], ke, "prefill")
+            break
+    log.info(
+        "idx-topk-stats call=%d %s (total oob %d)",
+        n,
+        "; ".join(msgs),
+        _idx_stats_state["oob"],
+    )
 
 
 def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
@@ -2554,3 +2806,78 @@ def rocm_sparse_attn_decode(
         extra_ragged_indptr=topk_ragged_indptr,
     )
     output.copy_(attn_out.to(output.dtype))
+
+
+# --- diagnostic: VLLM_QC_IDX_VERIFY=1 ---------------------------------------
+
+_IDX_VERIFY = _os.environ.get("VLLM_QC_IDX_VERIFY", "0") == "1"
+_idx_verify_state = {"calls": 0, "bad": 0}
+
+
+def _verify_indexer_write(
+    k,
+    cache_value,
+    cache_scale,
+    slot_mapping,
+    block_size,
+    head_dim,
+    layout,
+    block_tile,
+    head_tile,
+) -> None:
+    """Read back indexer fp8 rows just written and compare the dequantized
+    values against k (fp8 quantization tolerance). Replicates the SHUFFLE
+    tile addressing. Bounded sampling."""
+    from vllm.logger import init_logger
+
+    log = init_logger(__name__)
+    _idx_verify_state["calls"] += 1
+    n = _idx_verify_state["calls"]
+    if n > 40 and n % 512 != 0:
+        return
+    torch.cuda.synchronize()
+    slots = slot_mapping.flatten()
+    bad = checked = 0
+    for i in range(min(3, slots.shape[0])):
+        s = int(slots[i])
+        if s < 0:
+            continue
+        b, bo = divmod(s, block_size)
+        scale = float(cache_scale[b, bo])
+        row_flat = cache_value[b].float()  # [block_size * head_dim] shuffled
+        h = torch.arange(head_dim, device=row_flat.device)
+        if layout == "SHUFFLE":
+            off = (
+                (bo // block_tile) * block_tile * head_dim
+                + (bo % block_tile) * head_tile
+                + (h // head_tile) * (block_tile * head_tile)
+                + h % head_tile
+            )
+        else:
+            off = bo * head_dim + h
+        got = row_flat[off] * scale
+        exp = k[i].float()
+        rel = (got - exp).abs() / (exp.abs() + 1e-3)
+        d = rel.max().item()
+        checked += 1
+        if d > 0.35:  # fp8 e4m3 worst-case relative error with margin
+            bad += 1
+            _idx_verify_state["bad"] += 1
+            log.warning(
+                "idx-insert-verify MISMATCH call=%d slot=%d block=%d off=%d "
+                "relmax=%.3f scale=%.5f",
+                n,
+                s,
+                b,
+                bo,
+                d,
+                scale,
+            )
+    if n <= 40 or bad:
+        log.info(
+            "idx-insert-verify: call=%d checked=%d bad=%d (total %d)",
+            n,
+            checked,
+            bad,
+            _idx_verify_state["bad"],
+        )

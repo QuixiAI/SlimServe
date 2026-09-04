@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -1075,6 +1075,15 @@ class KVCacheConfig:
     contains all layers.
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
+    """
+    group_block_bytes: list[int] = field(default_factory=list)
+    """
+    Bytes of one block of each group (sum of its layers' page sizes), in
+    kv_cache_groups order. Recorded by the planner from the real per-layer
+    specs because generate_scheduler_kv_cache_config flattens a
+    UniformTypeKVCacheSpecs group to one arbitrary member's spec, so the
+    scheduler cannot recompute it; KV connectors that mirror whole blocks
+    (the host tier) need both roles to agree on it.
     """
 
     @property
