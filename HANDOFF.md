@@ -1,12 +1,66 @@
 <!--
-Two active campaign handoffs live in this file. They cover different
+Three active campaign handoffs live in this file. They cover different
 platforms and different hardware, and each is current for its own campaign;
-neither supersedes the other. They met on this file in the 2026-08-28 merge
-of origin/main and were joined rather than reconciled.
+none supersedes another. The first two met on this file in the 2026-08-28
+merge of origin/main and were joined rather than reconciled; the third was
+added 2026-09-04.
 
-  1. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)  -- section below
-  2. MI300X GGUF profile record                   -- second section
+  1. GLM-5.3-Flash on RTX PRO 6000 Blackwell (sm_120) -- section below
+  2. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)      -- second section
+  3. MI300X GGUF profile record                       -- third section
 -->
+
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-04; Phase 0 complete)
+
+## Mission
+
+Serve **GLM-5.3-Flash from `RedHatAI/GLM-5.3-Flash-NVFP4`** on tinybox
+(4x RTX PRO 6000 Blackwell, PCIe, no NVLink, CUDA 13.0, sm_120) through
+the `glm53-nvfp4-4` profile's new `rtx6000` record, then optimize the
+QuixiCore/fork kernels for this exact model, quant and card toward the
+per-token byte floor. Directive (operator, 2026-09-04): "an overfitted
+scenario where we've got a specific quant of a specific model on specific
+hardware running as fast as possible, approaching the limits of physics";
+methodical, measured every step, no regressions, clean code. The plan,
+physics, research digest and phase gates are in
+`docs/glm53-flash-sm120-plan.md`; every measurement is a
+`perf/optimization_status.md` entry and the record rows are in
+`perf/baseline_status.md`.
+
+## State (2026-09-04)
+
+- Phase 0 done: native build for `12.0f` (local CUTLASS v4.4.2, DeepGEMM
+  builder guarded), `rtx6000` platform + variant registered, profile
+  serves, exact-token baseline **c1 104.8 / c8 431.4 / c16 591.0** tok/s
+  (1000/300, APC-hot; 1k/2k c1 108.1 / c8 500.5), canaries clean.
+  Bars: a100 TP4 73.8 / 332.1 / 464.6; B12X R24 no-spec 169.9 / 737.8.
+- Attribution (torch profiler, 2026-09-04 entry): c1 = 8.4 ms of kernels
+  in one FULL graph (~1,840 kernels), ~4.1 ms launch-bound (281 cuBLAS
+  GEMVs, mHC, a ~1,070-launch tail), NCCL only 0.93 ms (11 us per ring);
+  c8 Marlin at the expert-bandwidth floor, cuBLAS M=8 KDA projections
+  3.9 + 0.4 ms (poor small-M algorithm) is the c8 lever.
+- Checkpoint defect (plan 3d): RedHatAI downcast `e_score_correction_bias`,
+  KDA `A_log`/`dt_bias`, mHC base/scale to BF16 (97% of experts change
+  bias rank vs native). Fix from the native F32 tensors precedes any
+  retained optimization.
+
+## Next step
+
+Phase 1 in the attribution order (plan section "Baseline attribution"):
+(0) F32 tensor fix, (1) KDA gate GEMV fusion + DSA q_a/kv_a fusion, (2)
+launch tail, (3) small-M GEMM for KDA in_proj at M=2..16, (4) Marlin M=1
+tuning for sm_120, (5) PCIe-IPC all-reduce (FlashInfer nightly only), (6)
+lm_head GEMV. Gates per plan section 4: exact-token c1/c8/c16 within
+noise or better, NLL + needle legs, U+FFFD, one notebook entry per
+experiment including rejections.
+
+## Machine notes
+
+Operator scratch (not in the repo): `/raid/scratch/slimserve-glm53/`
+(`serve.sh`, `bench.sh`, `prof_run.py`, `step_attrib.py`, build and serve
+logs, traces, research artifacts). Venv `~/venvs/slimserve-glm53-flash`
+(never on /raid). Never build FlashInfer from source on this box.
+
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
 

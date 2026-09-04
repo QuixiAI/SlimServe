@@ -19239,3 +19239,164 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   library's mla_kernels.cuh / paged_attn_v2_kernels.cuh are July CDNA3 ports
   of the CUDA files and are not on the ROCm serving path; their CUDA
   evolution belongs to QuixiCore-CUDA.
+
+## 2026-09-04: GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120) - Phase 0 bring-up baseline
+
+- Status: BASELINE RECORDED (no optimization yet). This is the a100 kernel
+  set carried to a new platform record (`rtx6000`, compute capability 12.0)
+  and measured; nothing on the record is an sm_120 choice yet.
+- Scope: profile glm53-nvfp4-4, variant rtx6000, TP4 over PCIe (no NVLink),
+  Marlin W4A16 NVFP4 experts, QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa,
+  bf16 KV, block 64, FULL_DECODE_ONLY graphs (capture 64), prefix caching,
+  no KV tier, no speculation, EP off. Tree: upstream/main 9247eedad plus the
+  uncommitted platform work (hardware classify, profiles.json record, the
+  DeepGEMM cmake guard, CLAUDE.md authorship). Checkpoint: RedHatAI
+  GLM-5.3-Flash-NVFP4 at /raid/weights.
+- Build: torch 2.13.0+cu130 prebuilt wheels in ~/venvs/slimserve-glm53-flash;
+  native `_C_stable_libtorch` + `_moe_C_stable_libtorch` + `_quixicore_C`
+  for TORCH_CUDA_ARCH_LIST=12.0f against CUDA 13.0 and a local CUTLASS
+  v4.4.2 (the FetchContent clone hung on this box), MAX_JOBS=8 NVCC_THREADS=2
+  under a 120 GB memory scope: 406 ninja steps, 73 min. The fork's deleted
+  DeepGEMM builder (tools/build_deepgemm_C.py) fires for any arch >= 9.0 and
+  never on A100; guarded in cmake/external_projects/deepgemm.cmake.
+  FlashMLA does not build for 12.0 and is not needed on this path. No
+  FlashInfer in the venv (the glm53 path never imports it).
+- Boot (serve-20260904-144436.log): weights 156 s from /raid, engine init
+  54.7 s (torch.compile 25.1 s), graph capture 3 s / 0.16 GiB (5 FULL decode sizes, n<=16), /health at
+  +290 s; 82.2 GB resident per card at gpu_memory_utilization 0.85. 66/66
+  profile + hardware tests pass on this tree.
+- Correctness: text canary (17*23 = 391, Canberra) and image canary (two
+  accurate sentences on a real photo) through the profile's chat endpoint
+  with reasoning on, 0 U+FFFD; 25 benchmark completions 0 U+FFFD, worst
+  repeated-40-char-window share 0.02-0.03 (no degeneration). NLL and
+  needle legs NOT yet run on this platform (owed before the first retained
+  change, section 4 of docs/glm53-flash-sm120-plan.md).
+- Exact-token harness (benchmarks/benchmark_dsv4_exact.py, 1000 in / 300
+  out, temp 1.0 / top-p 0.95 / top-k 20, seed 42, warmup 8,
+  PROMPT_OVERHEAD=0 gives exact:true on every shape, source
+  /raid/scratch/slimserve-glm53/prompt-source.txt with --repeat-source),
+  aggregate output tok/s, two identical passes (pass 2 = APC-hot):
+  | shape          | pass 1 | pass 2 | median latency | ms/step |
+  | c1-1000-300    | 104.9  | 104.8  | 2.86 s         | 9.5     |
+  | c8-1000-300    | 431.5  | 431.4  | 5.56 s         | 18.5    |
+  | c16-1000-300   | 592.2  | 591.0  | 8.10 s         | 27.0    |
+  | c1-1000-2000   | 108.1  | -      | 18.5 s         | 9.3     |
+  | c8-1000-2000   | 500.5  | -      | 32.0 s         | 16.0    |
+  Pass-to-pass spread < 0.3%. Prefix-cache hits do not move the numbers
+  (decode-dominated shapes).
+- Against the bars: a100 TP4 record 73.8 / 332.1 / 464.6 -> 1.42x / 1.30x /
+  1.27x on this card. rtx6kpro B12X R24 no-spec 169.9 / 737.8 (c1 / c8) ->
+  we are at 0.62x / 0.58x of it. Foundry's SGLang FP8 no-spec 88.5 c1 ->
+  1.19x. Plan targets (section 1): c1 300-350 no-spec, c8 1000-1200.
+- Where the time goes (physics, not yet a trace): c1 step 9.5 ms against a
+  3.2 ms per-token read floor (5.78 GB per GPU at 1.79 TB/s) -> 34% of
+  floor; c8 step 18.5 ms for 8 tokens; c16 27 ms. Ratios: c8/c1 4.1 (above
+  the 3.5 sanity gate, so c1 is latency-bound with headroom, not
+  bandwidth-bound); c16/c8 only 1.37 while the expert-byte model predicts
+  ~1.75x more bytes for 2x tokens, so something per-request (indexer
+  rows, KDA state, Marlin M-scaling, sparse MLA per-token top-k) grows
+  faster than the weight reads. Power 130-230 W of 600 W and SM clocks at
+  2842-2872 MHz during every shape: nowhere near bandwidth or power limits.
+  Every one of the ~90 per-step all-reduces is a pynccl ring here
+  (custom AR disables itself at world 4 without NVLink; plan section 3d).
+- Decision: record as the sm_120 baseline; next is attribution (torch
+  profiler trace of a c1 and a c8 decode step through --torch-profile-dir,
+  8 bounded iterations), then Phase 1 in the plan's order: the RedHatAI
+  router-bias fix from native F32 tensors (correctness), PCIe-IPC
+  all-reduce A/B, launch-residue cleanup, FP8 KV.
+- Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-{overhead-check,
+  baseline-pass1,baseline-pass2,baseline-1k2k}/ (run.txt with commit,
+  nvidia-smi clocks/power/temperature per shape, per-shape harness JSON
+  with response SHA-256 digests, *-completions/). Serve log:
+  /raid/scratch/slimserve-glm53/serve-logs/serve-20260904-144436.log.
+  Build log: /raid/scratch/slimserve-glm53/build-6.log.
+
+## 2026-09-04: sm_120 baseline attribution - torch profiler traces of a c1 and a c8 decode step
+
+- Status: ATTRIBUTION (ranking input for Phase 1). Same record and build as
+  the baseline above, rebooted with `--torch-profile-dir` (8 bounded engine
+  iterations, frontend ignored, detailed annotations). Driver: 2 warmup
+  rounds, then the profiled round started 0.9 s into a 1000-in / 96-out
+  request so prefill is outside the window. Rank 0 analyzed; NCCL stats on
+  all four ranks. Iterations split at cudaGraphLaunch timestamps.
+- Trace hygiene, two artifacts to know about: (1) the first all-reduce
+  after /start_profile stalled 68 ms on three ranks (rank 1 started late),
+  which put NCCL at "53% of GPU time" in the raw table; that iteration is
+  dropped. The real NCCL kernel is p50 10.3-11.1 us / p90 12.8 us at c1 and
+  14-15 us / 17 us at c8, on every rank. (2) Under the profiler the c1 step
+  is ~11 ms vs 9.5 ms in the exact bench; kernel durations below are
+  GPU-side and unaffected, gaps are not.
+- The decode step is ONE cudaGraphLaunch (FULL graph) plus 45 host-side
+  launches per step (sampling, bookkeeping). Inside the graph: ~1,840
+  kernels per step at c1, ~2,370 at c8. GPU kernel busy per step: c1
+  8.37 ms (bench step 9.5 ms), c8 15.06 ms (bench decode step ~16.7 ms after
+  subtracting prefill). The rest is host-side work between graph replays.
+- Per-step kernel time by class, rank 0, mean of 7 (c1) / 8 (c8) iterations:
+  | class                               | c1 ms | c1 launches | c8 ms | c8 launches |
+  | cuBLAS gemvx (M=1 GEMVs)            | 2.09  | 281 @ 7.4us | -     | -           |
+  | cuBLAS gemm 16x16 wmma (KDA in/out) | 1.37  | 81 @ 16.8us | 3.92  | 402 @ 9.7us |
+  | Marlin NVFP4 MoE (w13 + w2)         | 1.00  | 75 @ 13us   | 5.17  | 84 @ 61.5us |
+  | NCCL all-reduce (ring LL, pynccl)   | 0.93  | 82 @ 11.4us | 1.39  | 91 @ 15.3us |
+  | mHC fused_pre_transition            | 0.70  | 82 @ 8.5us  | 1.13  | 271 @ 4.2us |
+  | MoE glue (topk/align/sum/act/sort)  | 0.40  | 197         | 0.49  | 221         |
+  | aten elementwise/reduce             | 0.37  | 369         | 0.44  | 412         |
+  | copies (direct_copy, memcpy32)      | 0.36  | 282         | 0.40  | 317         |
+  | sparse MLA decode + reduce          | 0.31  | 20          | 0.37  | 22          |
+  | triton fused norms/adds             | 0.23  | 221         | 0.37  | 246         |
+  | pooled indexer                      | 0.19  | 20          | 0.23  | 22          |
+  | KDA recurrent + conv update         | 0.16  | 61          | 0.36  | 68          |
+  | sampling                            | 0.16  | 3           | 0.24  | 10          |
+  | cuBLAS splitK reduce                | 0.05  | 31          | 0.41  | 165         |
+  (c8: the M=8 GEMMs all go through the wmma 16x16 kernel + splitK, so the
+  gemvx row folds into the gemm row.)
+- Read, c1 (9.5 ms/token, floor 3.2 ms):
+  - Near-roofline already: KDA in_proj_qkvgfab 33.4 us per layer for ~52 MB
+    per rank = 87% of 1.79 TB/s; Marlin 42 layers x 27 MiB per rank = 0.63 ms
+    at roofline vs 1.00 measured (63%); sparse MLA + indexer 0.5 ms. This
+    "physics class" is ~3.0 ms/step. Only fewer bytes move it (FP8 KDA
+    projections, a quality-gated experiment).
+  - Launch-bound: 281 cuBLAS GEMVs per step at 7.4 us each = 2.09 ms for
+    what is ~0.6 ms of bytes (KDA gate projections b/f_a/f_b/g_a/g_b are 5
+    launches per KDA layer = 170; DSA q_a/kv_a/q_b/kv_b/o; shared experts
+    2 per MoE layer; lm_head 200 us alone at ~45% of roofline). mHC 0.70 ms
+    in 82 launches. The tail (MoE glue + aten + copies + triton norms) is
+    1.36 ms over ~1,070 launches at 1-2 us each: pure launch cost inside the
+    graph. Together ~4.1 ms of the 8.4 ms is launch-bound work that fusion
+    removes without touching any bandwidth-bound kernel.
+  - NCCL 0.93 ms (11%): 91 rings at 11.4 us. The plan's 30-50 us assumption
+    was wrong; NCCL LL over PCIe P2P is already ~11 us for 8 KB. The
+    PCIe-IPC all-reduce (section 3d of the plan) can win at most ~0.5 ms/step
+    here, not the 1.5-2.5 ms the plan estimated. Still worth an A/B, later.
+  - Host side: ~1.1 ms/step outside the graph (45 launches + scheduler +
+    sampler round trip). Measurable, second-order.
+- Read, c8 (16.7 ms decode step):
+  - Marlin 5.17 ms = at the expert-bandwidth floor: 8 tokens x top-8 = up to
+    64 distinct experts per layer x 3.4 MiB per rank = 218 MiB per layer,
+    42 layers = 9.1 GB per rank = 5.1 ms at 1.79 TB/s. c8 IS expert-bound as
+    the physics said; the c16/c8 step ratio (1.46x) is below the byte ratio
+    because only Marlin scales with distinct experts and everything else
+    scales with tokens or not at all.
+  - cuBLAS M=8 path for the KDA projections: 1.37 -> 3.92 ms + 0.41 ms of
+    splitK reduces, 402 launches. The bytes are the same as at c1; cuBLAS
+    picks a poor small-M algorithm on sm_120 (wmma 16x16 tiles + splitK).
+    ~2.5 ms/step recoverable at c8 with a small-M GEMM that reads the weight
+    once (cuBLASLt heuristic pin, a CUTLASS sm120 kernel, or a
+    batched-GEMV) - this is the single biggest c8 lever after the experts.
+  - NCCL 1.39 ms (15 us per ring for 64 KB), mHC 1.13 ms in 271 launches
+    (the M>1 mHC path launches 3 kernels per site), launch tail ~1.7 ms.
+- Ranked Phase 1 list from this trace (gain / effort at c1 unless noted):
+  1. Fuse the KDA gate GEMVs (5 -> 1 per layer, SGLang #37744 pattern) and
+     the DSA q_a/kv_a pair; ~1.0 ms, moderate. 2. Kill the ~1,070-launch
+     tail: copies around the mHC wrappers, MoE glue, norm/add fusions; ~1.0
+     ms, easy-to-moderate (A100 residue items 1 and 3). 3. Small-M GEMM for
+     KDA in_proj at M=2..16: ~2.5 ms at c8, moderate. 4. Marlin MoE c1 at
+     63% of roofline: kernel tuning for M=1 on sm_120 (188 SMs, 100 KB
+     smem); ~0.35 ms, hard. 5. PCIe-IPC all-reduce: ~0.5 ms, half a day of
+     merge + a nightly FlashInfer. 6. lm_head GEMV at 45% of roofline: 0.1
+     ms, easy. Correctness fix that precedes all of them: the RedHatAI F32
+     tensor downcast (router bias, KDA decay, mHC base/scale) from native.
+- Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-profile/
+  (per-class tables, top-60 kernel tables, torch profiler key_averages,
+  the driver and analysis scripts). Traces: /raid/scratch/slimserve-glm53/
+  profile-c1/ and profile-c8/ (4 ranks each). Serve log:
+  serve-logs/serve-20260904-145736.log.

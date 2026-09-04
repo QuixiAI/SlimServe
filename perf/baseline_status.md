@@ -1917,7 +1917,28 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   (+reasoning), image and tool canaries pass. The Q2_K GGUF MoE path is
   this record's remaining budget and was not touched today.
 
-## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100)
+## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
+
+### RTX PRO 6000 Blackwell (sm_120) TP4 Exact Baseline - 2026-09-04 (bring-up record, a100 kernel set)
+- Record: glm53-nvfp4-4 / rtx6000 variant (TP4 over PCIe, Marlin W4A16
+  NVFP4 experts, QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, bf16 KV,
+  block 64, FULL_DECODE_ONLY capture 64, prefix caching, no KV tier, no
+  speculation, EP off). Tree upstream/main 9247eedad + platform work.
+  Boot 290 s to /health, 82.2 GB per card resident.
+- Exact-token harness (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  seed 42, warmed, PROMPT_OVERHEAD=0, exact:true on every shape), aggregate
+  output tok/s, APC-hot pass:
+  | record                    | c1    | c8    | c16   |
+  | glm53-nvfp4-4 (rtx6000)   | 104.8 | 431.4 | 591.0 |
+  1000 in / 2000 out: c1 108.1, c8 500.5. Pass-to-pass spread < 0.3%.
+  Raw: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-baseline-pass{1,2}/,
+  -baseline-1k2k/.
+- vs a100 TP4: 1.42x / 1.30x / 1.27x. vs the platform bar (B12X R24
+  no-spec 169.9 / 737.8): 0.62x / 0.58x. Power 130-230 W of 600 W.
+- Correctness gates at this baseline: text (+reasoning) and image canaries
+  through the profile, 0 U+FFFD on 27 completions, no degeneration. NLL
+  and needle legs not yet run on this platform.
+- Details and the physics read: optimization_status 2026-09-04.
 
 ### A100 Exact Baseline - 2026-09-03 (compile on, partitioned + vectorized sparse decode, strided indexer)
 - Stack: torch.compile active on the text model (kda_attention op, indexer
