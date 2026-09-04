@@ -19376,25 +19376,37 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
     the physics said; the c16/c8 step ratio (1.46x) is below the byte ratio
     because only Marlin scales with distinct experts and everything else
     scales with tokens or not at all.
-  - cuBLAS M=8 path for the KDA projections: 1.37 -> 3.92 ms + 0.41 ms of
-    splitK reduces, 402 launches. The bytes are the same as at c1; cuBLAS
-    picks a poor small-M algorithm on sm_120 (wmma 16x16 tiles + splitK).
-    ~2.5 ms/step recoverable at c8 with a small-M GEMM that reads the weight
-    once (cuBLASLt heuristic pin, a CUTLASS sm120 kernel, or a
-    batched-GEMV) - this is the single biggest c8 lever after the experts.
+  - cuBLAS at c8: the M=8 GEMMs go through wmma 16x16/32x32 tensor-op
+    kernels plus splitK reduces, 4.3 ms/step in total (c1: 3.8 ms across
+    gemvx + gemm classes, same bytes). CORRECTION of the first reading of
+    this trace: the class did not triple, the gemvx rows merely moved into
+    the gemm row. The real finding is efficiency: ~4.3 GB of backbone weight
+    per GPU per token flows through cuBLAS at 63% (c1) / 56% (c8) of
+    1.79 TB/s, i.e. 1.4-1.9 ms/step of headroom at both concurrencies, the
+    largest single backbone item. A decode GEMV path that fuses the small
+    projections and runs the large ones at roofline is the lever (the fork
+    has precedent: csrc/quixicore/serving/dsv4_projection_ampere.cuh).
   - NCCL 1.39 ms (15 us per ring for 64 KB), mHC 1.13 ms in 271 launches
     (the M>1 mHC path launches 3 kernels per site), launch tail ~1.7 ms.
 - Ranked Phase 1 list from this trace (gain / effort at c1 unless noted):
-  1. Fuse the KDA gate GEMVs (5 -> 1 per layer, SGLang #37744 pattern) and
-     the DSA q_a/kv_a pair; ~1.0 ms, moderate. 2. Kill the ~1,070-launch
-     tail: copies around the mHC wrappers, MoE glue, norm/add fusions; ~1.0
-     ms, easy-to-moderate (A100 residue items 1 and 3). 3. Small-M GEMM for
-     KDA in_proj at M=2..16: ~2.5 ms at c8, moderate. 4. Marlin MoE c1 at
-     63% of roofline: kernel tuning for M=1 on sm_120 (188 SMs, 100 KB
-     smem); ~0.35 ms, hard. 5. PCIe-IPC all-reduce: ~0.5 ms, half a day of
-     merge + a nightly FlashInfer. 6. lm_head GEMV at 45% of roofline: 0.1
-     ms, easy. Correctness fix that precedes all of them: the RedHatAI F32
-     tensor downcast (router bias, KDA decay, mHC base/scale) from native.
+  1. Decode GEMV path for the backbone (M <= 16): fuse the KDA f_b/g_a/g_b
+     trio and the DSA q_a/kv_a pair, run the big projections at roofline;
+     cuBLAS is at 56-63% of roofline for ~4.3 GB/GPU/token, 1.4-1.9 ms/step
+     of headroom at c1 and c8, moderate-to-hard (QuixiCore precedent
+     dsv4_projection_ampere.cuh). 2. Kill the ~1,070-launch tail: the KDA
+     o_norm decomposed path (12 eager kernels per layer, one-line fix to
+     the Triton kernel), copies around the mHC wrappers, MoE glue (fp32
+     cast + fp32 router GEMM + topk + align/sort, ~12 us per MoE layer),
+     norm/add fusions; ~1.0-1.5 ms, easy-to-moderate. 3. mHC
+     fused_pre_transition: cooperative grid sync + 20 serial Sinkhorn
+     iterations, 8.6 us x 90 sites for ~1 us of bytes; 0.5 ms, moderate
+     (kernel we own). 4. Marlin MoE c1 at 63% of roofline: an NVFP4 M<=16
+     decode kernel (QuixiCore precedent dsv4_mxfp4_moe_ampere.cuh) that
+     also absorbs align/sort; ~0.5 ms, hard. 5. PCIe-IPC all-reduce: ~0.5
+     ms, half a day of merge + a nightly FlashInfer. 6. lm_head GEMV at 45%
+     of roofline: 0.1 ms, easy. Correctness fix that precedes all of them:
+     the RedHatAI F32 tensor downcast (router bias, KDA decay, mHC
+     base/scale) from native.
 - Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-profile/
   (per-class tables, top-60 kernel tables, torch profiler key_averages,
   the driver and analysis scripts). Traces: /raid/scratch/slimserve-glm53/

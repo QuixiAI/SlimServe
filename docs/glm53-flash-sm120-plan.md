@@ -401,13 +401,15 @@ chain (KDA's four projections).
   (281 cuBLAS GEMVs 2.09 ms, mHC 0.70, ~1,070-launch tail 1.36); NCCL 0.93.
 - c8 decode step ~16.7 ms = 15.1 ms GPU: Marlin 5.17 ms AT the
   expert-bandwidth floor (64 distinct experts x 3.4 MiB x 42 layers per
-  rank); cuBLAS M=8 KDA projections 3.92 + 0.41 ms splitK (poor small-M
-  algorithm on sm_120, ~2.5 ms recoverable); NCCL 1.39; mHC 1.13.
+  rank); cuBLAS 4.3 ms for the backbone (3.8 at c1: same bytes, 56-63% of
+  roofline at both); NCCL 1.39; mHC 1.13.
 - Phase 1 order is therefore: (0) RedHatAI F32 tensor fix from native;
-  (1) KDA gate GEMV fusion + DSA q_a/kv_a fusion; (2) launch tail (copies,
-  MoE glue, norm/add fusion); (3) small-M GEMM for KDA in_proj (c8 lever);
-  (4) Marlin M=1 tuning for sm_120; (5) PCIe-IPC all-reduce; (6) lm_head
-  GEMV. FP8 KV and the hybrid backbone bytes are the Phase 2 byte levers.
+  (1) decode GEMV path for the backbone (fuse KDA f_b/g_a/g_b and DSA
+  q_a/kv_a, big projections at roofline; 1.4-1.9 ms headroom); (2) launch
+  tail (KDA o_norm Triton path, copies, MoE glue, norm/add fusion); (3)
+  mHC transition kernel latency (grid sync + serial Sinkhorn); (4) NVFP4
+  M<=16 expert decode kernel; (5) PCIe-IPC all-reduce; (6) lm_head GEMV.
+  FP8 KV and the hybrid backbone bytes are the Phase 2 byte levers.
 
 ## 4. Methodology (every phase)
 
