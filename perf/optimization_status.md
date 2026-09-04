@@ -18527,3 +18527,34 @@ token, approximate:
   profile launches (`slimserve --serve`) always pass the flag (92% hit
   rate on the leg). All raw launch scripts now pass it; the matrix
   numbers are unaffected (unique prompts, all arms equal).
+- HOST TIER ACCEPTANCE PASS (TP4, 48 GiB/rank, VLLM_KV_TIER_VERIFY=1,
+  prefix caching on): target 40,629 tokens with 6 markers, churn
+  1,906,488 tokens of a 1,244,494-token pool; 6/6 probes hit the tier
+  ("resume at block 36, 39168 tokens"), 58 restore ops each = 36 MLA
+  blocks + 18 indexer blocks (ratio 2) + 4 KDA state pages, SHA verify
+  0/58 mismatched on every restore, 1,094 boundary-state saves during
+  the churn. Raw: perf/results/2026-09-03/kvtier-acceptance/
+  glm53-tp4-host48/ + ~/.local/scratch/glm53/tier-tp4-host48/server.log.
+- Sizing lesson: the 8 GiB diagnostic tier (700 slots) lost the target
+  to LRU reclaim under a 1.9M-token churn (2,600 slot-writes) and the
+  probes "passed" by re-prefill - the connector's hit/restore counters
+  and the verify lines are the evidence, never recall alone.
+- DISK TIER, first run (8 GiB host + 64 GiB disk, O_DIRECT per-rank
+  O_TMPFILE in SLIMSERVE_KV_TIER_DIR on /dev/sda2): every probe hit and
+  was PROMOTED from disk ("promoting ... from NVMe: 58 reads") and
+  restored; the run reported 2/6 markers and "58/58 restores mismatched".
+  Both signals were tooling, not corruption:
+  1. The DMA's VERIFY keyed offload digests by HOST slot; a promotion
+     lands in freshly allocated host slots, so every promoted restore was
+     compared against whatever block last used that slot. Digests now
+     travel with the bytes: recorded per disk slot at write-through
+     submission, handed to the new host slot when the read lands. The
+     standalone O_DIRECT round trip at the real 12,255,232-byte row with
+     pinned buffers is bit-exact, and the NVMe/DMA unit tests pass here.
+  2. The 4 "failed" probes were REFUSALS with intact recall: "I explicitly
+     declined to store that code earlier" (probe 1's reasoning quotes the
+     code). The build phase's planted-marker turns drew a refusing
+     sample at temperature 1.0 and the model stayed consistent. The
+     benchmark already credits recall in reasoning; the connector
+     hit/promotion/restore counters plus the (fixed) verify are the
+     evidence of record, never the marker count alone.

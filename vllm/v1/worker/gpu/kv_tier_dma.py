@@ -176,6 +176,12 @@ class KVTierDMA:
         # Restore batches waiting for their request's disk reads, in order.
         self._deferred: list[TierOpBatch] = []
         self._invalid_blocks: set[int] = set()
+        # VERIFY: offload digests keyed by host slot travel with the bytes
+        # through the disk tier, so a promoted restore (new host slot) is
+        # checked against the ORIGINAL offload digest, not whatever block
+        # last used that host slot.
+        self._disk_digests: dict[int, str] = {}
+        self._read_targets: dict[int, tuple[int, int]] = {}
 
     def issue(self, batch: TierOpBatch) -> None:
         """Enqueue a batch: copies on the copy stream, disk ops to the IO
@@ -211,6 +217,10 @@ class KVTierDMA:
             ev = self._slot_event.get(host_slot)
             if ev is not None:
                 wait = ev.synchronize
+            if _VERIFY and host_slot in self._slot_digests:
+                self._disk_digests[disk_slot] = self._slot_digests[host_slot]
+        elif _VERIFY:
+            self._read_targets[op_id] = (disk_slot, host_slot)
         self.disk.submit(
             DiskOp(
                 op_id=op_id,
@@ -228,6 +238,13 @@ class KVTierDMA:
             return
         for op_id, err in self.disk.poll_done():
             kind, key = self._disk_ops.pop(op_id)
+            if _VERIFY and kind == "r":
+                target = self._read_targets.pop(op_id, None)
+                if target is not None and err is None:
+                    disk_slot, host_slot = target
+                    d = self._disk_digests.get(disk_slot)
+                    if d is not None:
+                        self._slot_digests[host_slot] = d
             if kind == "w":
                 left = self._write_remaining[key] - 1
                 if left <= 0:
