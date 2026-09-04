@@ -420,6 +420,63 @@ chain (KDA's four projections).
   M<=16 expert decode kernel; (5) PCIe-IPC all-reduce; (6) lm_head GEMV.
   FP8 KV and the hybrid backbone bytes are the Phase 2 byte levers.
 
+### Phase 1 item 1 pre-work: per-projection cuBLAS attribution (2026-09-04)
+
+One decode step of the c1 and c8 traces (rank 0), cuBLAS-family kernels
+grouped by (kernel, grid, block) and tied to projections by count and
+launch order (perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-profile/
+step-gemv-c{1,8}.txt, gemv_attrib.py). Per-GPU shapes at TP4 (N x K),
+bytes at bf16, roofline at 1.79 TB/s.
+
+| projection (per GPU N x K) | per step | c1 us each | c1 % roofline | c8 us each | c8 % roofline |
+|---|---:|---:|---:|---:|---:|
+| KDA in_proj_qkvgfab 6288 x 4096 (51.5 MB) | 34 | 33.5 + 1.5 splitK | 82% | 34.5 | 83% |
+| KDA o_proj 4096 x 2048 (16.8 MB) | 34 | 12.8 | 73% | ~9.5 (shared grid group) | ~99%* |
+| KDA g_a 128 x 4096, g_b 2048 x 128, f_b 2048 x 128 (2 MB total) | 34 x 3 | 2.1 + 3.3 + 2.0 | 15% | 2.3 + 2.5 + 1.4 splitK | launch floor |
+| DSA fused_qkv_a 2048 x 4096 (16.8 MB) | 11 | 12.5 | 75% | 12.3 + 1.8 splitK | 67% |
+| DSA q_b 4096 x 1536, indexer wq_b 4096 x 1536 (12.6 MB each) | 11 + 11 | 10.9, 10.4 | 65% | ~9.5 | ~74% |
+| DSA o_proj 4096 x 4096 (33.5 MB) | 11 | 23.3 | 80% | 21.7 | 86% |
+| DSA indexer wk 128 x 4096, kpool gate 128 x 4096, weights_proj 32 x 4096 | 11 x 3 | 3.6 + 3.1 + 3.1 | launch floor | 2.5 + 1.4, 2.5 + 1.4, **21.3** | weights_proj: 2 CTAs |
+| MoE router gate 288 x 4096 (2.4 MB, bf16 out then fp32 cast) | 42 | 6.4 | 21% | 3.3 + 2.3 splitK | 24% |
+| MoE shared gate_up 1024 x 4096 (8.4 MB) | 42 | 7.6 | 62% | 7.3 + 4.6 splitK | 39% |
+| MoE shared down 4096 x 512 (4.2 MB) | 42 | 5.1 | 46% | ~9.5 (shared grid group) | ~25%* |
+| dense gate_up 6144 x 4096, down 4096 x 3072 (layers 0-2) | 3 + 3 | 33.2, 19.8 | 85%, 71% | 34.1, 21.7 | 83%, 65% |
+| lm_head 38720 x 4096 (317 MB) | 1 | 199.8 | 89% | 198.4 | 89% |
+| total cuBLAS family | 436 launches | 3.89 ms | 66% | 567 launches, 4.32 ms | 59% |
+
+\* c8 groups the KDA o_proj, q_b, wq_b and shared down into one
+(kernel, grid) class of 98 launches at 9.5 us mean; the split is inferred.
+
+Reading. The big projections (in_proj, o_proj, dense, lm_head) are at
+73-89% of roofline: a tuned kernel buys ~0.3 ms/step at c1 there, not
+more. The waste is in the small and mid projections, which sit on the
+launch floor (2-3 us per launch for <= 1 MB) or on poor cuBLAS
+heuristics at M=8 (weights_proj 21 us for 256 KB, shared gate_up splitK
+22 at 39%, router 24%). Headroom per step: ~1.3 ms at c1, ~1.7 ms at c8.
+GateLinear's specialized tiers (cuteDSL ll_bf16, DSV3, fp32) are gated on
+is_device_capability_family(100), so sm_120 falls through to tier 7
+(bf16 F.linear + fp32 cast); the DSV4 A100 router kernel is fixed to
+E=256/H=4096 and GLM has E=288.
+
+Design for item 1 (one factor per A/B, in this order):
+1. Fold same-input GEMVs into the existing merged linears: KDA g_a_proj
+   (128 x 4096, replicated) into in_proj_qkvgfab beside f_a (a second
+   replicated shard id in _KimiGDNMergedColumnParallelLinear); DSA indexer
+   wk / kpool gate / weights_proj (all K=4096 on hidden_states) into
+   fused_qkv_a_proj. Removes 34 + 33 launches per step; bit-exact rows.
+2. Batch f_b_proj and g_b_proj (both 2048 x 128, different inputs) into one
+   strided-batched GEMV launch on stacked weights. Removes 34 launches.
+3. Router gate + shared-expert gate_up on the same post-norm input: one
+   QuixiCore decode-projection launch over [288 + 1024] x 4096 rows with
+   fp32 output for the gate rows and bf16 for the rest (generalize
+   csrc/quixicore/serving/dsv4_projection_ampere.cuh: template K, M <= 16,
+   dual output). Removes 42 launches, drops the fp32 cast, and takes the
+   router from 6.4 us to ~2 us and gate_up from 7.6 to ~5.
+4. Only then a tuned M <= 16 kernel for the 4096-row group and in_proj
+   (wide loads, split-K across warps, 2-4 rows per block); microbench
+   (gemv_bench.py) against cuBLAS at M = 1, 2, 4, 8, 16 first.
+Expected: c1 -0.6 to -0.9 ms/step (~7-10%), c8 -1.0 to -1.3 ms (~7%).
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`
