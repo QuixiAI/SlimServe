@@ -19123,3 +19123,12 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   needs max_model_len 262144 for the run, then git checkout the profile.
 - NOT RE-RUN on the merged tree: production-pool acceptance (capacity-bound by
   design, 2026-09-03 addendum), the tier-on/idle throughput A/B, DSV4.
+- PORT AUDIT vs QuixiCore-ROCm (2026-09-04): every vendored ROCm serving
+  header matches the library up to hipify/clang-format except
+  v2_sample_kernels.cuh, whose 2026-08-10 NaN-safe argmax fix (6ab3a92fe0)
+  had never been ported. Ported with harness cases and a bench; library
+  entry QuixiCore-ROCm perf/optimization_status.md 2026-09-04 (argmax at
+  T=64: 0.017 -> 0.019 ms, the sanitize cost SlimServe already pays). The
+  library's mla_kernels.cuh / paged_attn_v2_kernels.cuh are July CDNA3 ports
+  of the CUDA files and are not on the ROCm serving path; their CUDA
+  evolution belongs to QuixiCore-CUDA.
