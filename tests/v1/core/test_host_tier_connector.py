@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""HostTierConnector scheduler-side contract on a fake engine.
+"""HostTierConnector scheduler-side: fill staging, tail save, resume.
 
-Positions are scheduler blocks (LCM of group block sizes); ops are
-(slot, col, group, gpu_block). Three model shapes are exercised:
-Qwen-style hybrid (attention + ring + mamba tail), attention-only
-(GLM-5.2), and DeepSeek-V4-style multi-rate (MLA + a finer-grained indexer
-+ a sliding-window compressor whose window is the tail).
+Save contract: the tail state saved for boundary B = k * block_size is the
+engine's own frozen align-mode snapshot - the pool-cached mamba block keyed
+by block_hashes[k - 1] - never a live block read positionally.
+
+Restore contract: the state lands at position k - 1 of each mamba group
+(the worker seeds state_idx = (num_computed - 1) // block_size), and the
+ring block is zeroed, not restored (engine-internal hit semantics).
 """
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
@@ -21,10 +22,10 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
-    SlidingWindowSpec,
 )
 
 BLOCK = 16
+STRIDE = 4096
 
 
 def h(i: int) -> bytes:
@@ -50,19 +51,13 @@ class FakeRequest:
     num_computed_tokens: int = 0
 
 
-def _attn(block_size, names):
-    return SimpleNamespace(
-        kv_cache_spec=FullAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.bfloat16,
-        ),
-        layer_names=list(names),
-    )
-
-
 def make_groups():
+    attn = SimpleNamespace(
+        kv_cache_spec=FullAttentionSpec(
+            block_size=BLOCK, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+        ),
+        layer_names=["attn"],
+    )
     ring = SimpleNamespace(
         kv_cache_spec=CircularBufferSpec(
             block_size=8, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
@@ -78,76 +73,73 @@ def make_groups():
         )
         for i in range(2)
     ]
-    return [_attn(BLOCK, ["attn"]), ring, *mamba]
-
-
-class FakePool:
-    def __init__(self):
-        self.blocks = {i: SimpleNamespace(block_id=i, ref_cnt=1) for i in range(2000)}
-        self.touched, self.freed = [], []
-        # (block_hash, group_id) -> block, mirroring the engine's prefix
-        # cache of frozen boundary blocks.
-        self.cached: dict[tuple, SimpleNamespace] = {}
-
-    def get_cached_block(self, block_hash, kv_cache_group_ids):
-        out = []
-        for gid in kv_cache_group_ids:
-            blk = self.cached.get((bytes(block_hash), gid))
-            if blk is None:
-                return None
-            out.append(blk)
-        return out
-
-    def touch(self, blocks):
-        self.touched.extend(b.block_id for b in blocks)
-        for b in blocks:
-            b.ref_cnt += 1
-
-    def free_blocks(self, blocks):
-        self.freed.extend(b.block_id for b in blocks)
-        for b in blocks:
-            b.ref_cnt -= 1
-
-
-def build(groups, role=KVConnectorRole.SCHEDULER, tensors=(), gb=1.0):
-    vllm_config = SimpleNamespace(
-        cache_config=SimpleNamespace(block_size=8),  # deliberately stale
-        kv_transfer_config=SimpleNamespace(
-            kv_connector_extra_config={"host_tier_gb_per_rank": gb}
-        ),
-    )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=groups, kv_cache_tensors=list(tensors)
-    )
-
-    def _base_init(self, vc, role, kcc):
-        self._vllm_config = vc
-        self._kv_transfer_config = vc.kv_transfer_config
-        self._kv_cache_config = kcc
-        self._role = role
-        self._connector_metadata = None
-
-    with patch(
-        "vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1.__init__",
-        _base_init,
-    ):
-        from vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector import (  # noqa: E501
-            HostTierConnector,
-        )
-
-        conn = HostTierConnector(vllm_config, role, kv_cache_config)
-    if role == KVConnectorRole.SCHEDULER:
-        conn.bind_gpu_block_pool(FakePool())
-    return conn
+    return [attn, ring, *mamba]
 
 
 def make_connector():
-    conn = build(make_groups())
-    assert conn.pos_tokens == BLOCK and conn.hash_block_size == BLOCK
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=8),  # deliberately stale
+        kv_transfer_config=SimpleNamespace(
+            kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
+        ),
+    )
+    kv_cache_config = SimpleNamespace(kv_cache_groups=make_groups(), kv_cache_tensors=[])
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
+        "_get_packed_kv_cache_layout",
+        return_value=(STRIDE, {}),
+    ), patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.base."
+        "KVConnectorBase_V1.__init__",
+        lambda self, vc, role, kcc: (
+            setattr(self, "_vllm_config", vc),
+            setattr(self, "_kv_transfer_config", vc.kv_transfer_config),
+            setattr(self, "_kv_cache_config", kcc),
+            setattr(self, "_role", role),
+            setattr(self, "_connector_metadata", None),
+        )[-1],
+    ):
+        from vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector import (
+            HostTierConnector,
+        )
+
+        conn = HostTierConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, kv_cache_config
+        )
+
+    class FakePool:
+        def __init__(self):
+            self.blocks = {i: SimpleNamespace(block_id=i, ref_cnt=1)
+                           for i in range(1000)}
+            self.touched, self.freed = [], []
+            # (block_hash, group_id) -> block, mirroring the engine's
+            # prefix cache of frozen align-mode boundary states.
+            self.cached: dict[tuple, SimpleNamespace] = {}
+
+        def get_cached_block(self, block_hash, kv_cache_group_ids):
+            out = []
+            for gid in kv_cache_group_ids:
+                blk = self.cached.get((bytes(block_hash), gid))
+                if blk is None:
+                    return None
+                out.append(blk)
+            return out
+
+        def touch(self, blocks):
+            self.touched.extend(b.block_id for b in blocks)
+            for b in blocks:
+                b.ref_cnt += 1
+
+        def free_blocks(self, blocks):
+            self.freed.extend(b.block_id for b in blocks)
+            for b in blocks:
+                b.ref_cnt -= 1
+
+    conn.bind_gpu_block_pool(FakePool())
+    assert conn.hash_block_size == BLOCK  # from the attn spec, not config
     assert conn.attn_groups == [0]
     assert conn.state_groups == [2, 3]  # mamba only
     assert conn.ring_groups == [1]
-    assert conn.tail_groups == [2, 3] and conn.requires_tail
     return conn
 
 
@@ -171,13 +163,11 @@ def alloc(n_attn, planned, base=0):
     for g in range(2):
         gb = [FakeBlock(0, is_null=True)] * max(0, planned - 1)
         gb.append(FakeBlock(base + 95 + g))
-        gb.extend(FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned)))
+        gb.extend(
+            FakeBlock(base + 97 + g + i) for i in range(max(0, n_attn - planned))
+        )
         mamba.append(gb)
     return FakeKVCacheBlocks(blocks=(attn, ring, *mamba))
-
-
-def targets(ops):
-    return {op[3] for op in ops}
 
 
 def run_conversation(conn, req_id, n_blocks, base=0):
@@ -192,10 +182,14 @@ def run_conversation(conn, req_id, n_blocks, base=0):
     req.num_computed_tokens = n_blocks * BLOCK
     meta = conn.build_connector_meta(sched_output({req_id: 1}))
     conn.build_connector_meta(sched_output({}))  # confirm writes
+    # The engine cached the frozen boundary snapshot for each mamba group
+    # when the final boundary was crossed.
     pool = conn._block_pool
     for g, gid in enumerate((2, 3)):
         pool.cached[(bytes(h(n_blocks - 1)), gid)] = pool.blocks[base + 95 + g]
-    ok, _ = conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    ok, _ = conn.request_finished_all_groups(
+        req, tuple([] for _ in range(4))
+    )
     assert ok is False  # never hold blocks (HMA deferred-free corrupts)
     tail_meta = conn.build_connector_meta(sched_output({}))  # issues save
     conn.build_connector_meta(sched_output({}))  # confirms + releases pins
@@ -207,11 +201,9 @@ def test_fill_stages_attention_and_pinned_tail_at_finish():
     req, meta, tail_meta, async_save = run_conversation(conn, "r1", 3)
     fill_ops = [op for ops in meta.offloads.values() for op in ops]
     assert len(fill_ops) == 3  # attention only during fill
-    assert all(op[1] == 0 and op[2] == 0 for op in fill_ops)
     tail_ops = [op for ops in tail_meta.offloads.values() for op in ops]
     assert len(tail_ops) == 2  # one frozen snapshot per mamba group, no ring
-    assert targets(tail_ops) == {95, 96}  # the pool-cached snapshots
-    assert {op[2] for op in tail_ops} == {2, 3}
+    assert {b for b, _, _ in tail_ops} == {95, 96}  # the pool-cached snapshots
     assert async_save is False
     pool = conn._block_pool
     assert sorted(pool.touched) == sorted(pool.freed)  # pins released
@@ -229,15 +221,20 @@ def test_missing_cached_boundary_skips_save():
     req.num_computed_tokens = 3 * BLOCK
     conn.build_connector_meta(sched_output({"rx": 1}))
     conn.build_connector_meta(sched_output({}))
+    # Boundary snapshot evicted before finish: no tail save, no pins.
     ok, _ = conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
     assert ok is False
     tail_meta = conn.build_connector_meta(sched_output({}))
     assert not tail_meta.offloads
     assert not conn._block_pool.touched
-    assert conn.index.stats()["resumable"] == 0
+    # No tail state was saved, so the hybrid trajectory is not resumable.
+    assert conn.index.lookup(req.block_hashes) is None
 
 
 def test_save_scans_down_to_deepest_cached_boundary():
+    """Align mode freezes one state per chunk-end column, so the final
+    400-block boundary is often uncached; the save must scan down to the
+    deepest boundary every mamba group has and stage the tail there."""
     conn = make_connector()
     pool = conn._block_pool
     req = FakeRequest("rc", [h(i) for i in range(6)], num_tokens=6 * BLOCK + 4)
@@ -247,33 +244,44 @@ def test_save_scans_down_to_deepest_cached_boundary():
     req.num_computed_tokens = 6 * BLOCK
     conn.build_connector_meta(sched_output({"rc": 1}))
     conn.build_connector_meta(sched_output({}))
+    # Chunk end fell at block 4: only boundary 4 (hash index 3) is cached.
     for g, gid in enumerate((2, 3)):
         pool.cached[(bytes(h(3)), gid)] = pool.blocks[70 + g]
     conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
     tail_meta = conn.build_connector_meta(sched_output({}))
-    assert targets(op for ops in tail_meta.offloads.values() for op in ops) == {70, 71}
+    assert {b for ops in tail_meta.offloads.values() for b, _, _ in ops} == {70, 71}
     conn.build_connector_meta(sched_output({}))
 
     fresh = FakeRequest("rd", [h(i) for i in range(6)], num_tokens=6 * BLOCK + 8)
     conn.on_new_request(fresh)
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
+    # Resumable at the scanned-down boundary, not the final block count.
     assert is_async and n_ext == 4 * BLOCK
 
 
 def test_resume_round_trip():
     conn = make_connector()
     run_conversation(conn, "r1", 4)
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
+
+    fresh = FakeRequest(
+        "r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8
+    )
     conn.on_new_request(fresh)
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
+    # Resumable at the finished request's final boundary: all 4 blocks.
     assert is_async and n_ext == 4 * BLOCK
+
     conn.update_state_after_alloc(fresh, alloc(5, planned=4, base=200), n_ext)
     meta = conn.build_connector_meta(sched_output({}))
     ops = meta.restores["r2"]
-    assert len(ops) == 4 + 2  # attention span + two mamba tail states
-    assert {200, 201, 202, 203} <= targets(ops)
-    assert {295, 296} <= targets(ops)  # position-(k-1) tail blocks
-    assert meta.zeros["r2"] == [(1, 290)]  # the ring block
+    # 4 attention restores + 2 mamba tail-state restores; the ring is
+    # zeroed, not restored.
+    assert len(ops) == 4 + 2
+    targets = {b for _, b, _ in ops}
+    assert {200, 201, 202, 203} <= targets  # attention span
+    # Both mamba states land on the position-(k-1) tail blocks.
+    assert {295, 296} <= targets
+    assert meta.zeros["r2"] == [290]  # the ring block
 
 
 def test_progressive_clipped_restore():
@@ -283,403 +291,47 @@ def test_progressive_clipped_restore():
     conn.on_new_request(fresh)
     n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
     assert n_ext == 4 * BLOCK
+    # Scheduler clips to 2 blocks this step.
     conn.update_state_after_alloc(fresh, alloc(2, planned=4, base=300), 2 * BLOCK)
     meta = conn.build_connector_meta(sched_output({}))
     assert len(meta.restores["r2"]) == 2  # attention only, no tail yet
     assert "r2" not in meta.zeros
+    # Load continues; scheduler re-queries with the new computed count.
     fresh.num_computed_tokens = 2 * BLOCK
     n_ext2, is_async2 = conn.get_num_new_matched_tokens(fresh, 2 * BLOCK)
     assert is_async2 and n_ext2 == 2 * BLOCK
-    conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=300), 2 * BLOCK)
+    conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=300), n_ext2)
     meta2 = conn.build_connector_meta(sched_output({}))
-    assert len(meta2.restores["r2"]) == 2 + 2  # rest of span + tail
-    assert meta2.zeros["r2"] == [(1, 390)]
+    assert len(meta2.restores["r2"]) == 2 + 2  # final chunk carries the tail
+    assert meta2.zeros["r2"] == [390]
 
 
 def test_mixed_local_and_tier_resume():
+    """GPU cache holds most of the prefix; the tier supplies the tail."""
     conn = make_connector()
     run_conversation(conn, "r1", 4)
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
+    fresh = FakeRequest("r5", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
     conn.on_new_request(fresh)
-    # Two blocks already local: the tier reports only the remainder.
+    # Scheduler reports 2 blocks already computed locally.
     n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 2 * BLOCK)
     assert is_async and n_ext == 2 * BLOCK
+    # num_computed_tokens stays 0 while waiting (framework behavior).
     conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=400), n_ext)
     meta = conn.build_connector_meta(sched_output({}))
-    assert targets(meta.restores["r2"]) == {402, 403, 495, 496}
+    ops = meta.restores["r5"]
+    # 2 attention blocks (positions 2, 3) + 2 mamba tail states.
+    assert len(ops) == 2 + 2
+    targets = {b for _, b, _ in ops}
+    assert {402, 403} <= targets
+    assert {495, 496} <= targets
+    assert meta.zeros["r5"] == [490]
 
 
 def test_short_prompt_or_mismatch_misses():
     conn = make_connector()
     run_conversation(conn, "r1", 4)
-    short = FakeRequest("s", [h(i) for i in range(4)], num_tokens=4 * BLOCK)
-    conn.on_new_request(short)
-    assert conn.get_num_new_matched_tokens(short, 0) == (0, False)
-    other = FakeRequest("o", [h(0), h(1), h(99), h(3)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(other)
+    # Prompt ends exactly at the tail boundary: nothing left to compute.
+    exact = FakeRequest("r3", [h(i) for i in range(4)], num_tokens=4 * BLOCK)
+    assert conn.get_num_new_matched_tokens(exact, 0) == (0, False)
+    other = FakeRequest("r4", [h(50 + i) for i in range(6)], num_tokens=99)
     assert conn.get_num_new_matched_tokens(other, 0) == (0, False)
-
-
-# ---------------------------------------------------- attention-only models
-#
-# GLM-5.2 shape: MLA main KV plus its indexer in ONE uniform attention group,
-# no mamba and no ring. Gating resumability on a mamba tail made the tier
-# write-only on exactly these models (issue #17, MI300X).
-
-
-def make_attn_groups():
-    return [_attn(BLOCK, ["mla", "indexer"])]
-
-
-def make_attn_connector(groups=None):
-    return build(groups if groups is not None else make_attn_groups())
-
-
-def alloc_attn(n_attn, base=0):
-    return FakeKVCacheBlocks(blocks=([FakeBlock(base + i) for i in range(n_attn)],))
-
-
-def run_attn_conversation(conn, req_id, n_blocks, base=0):
-    req = FakeRequest(
-        req_id, [h(i) for i in range(n_blocks)], num_tokens=n_blocks * BLOCK + 4
-    )
-    conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc_attn(n_blocks, base), 0)
-    conn.build_connector_meta(sched_output({req_id: n_blocks * BLOCK}))
-    req.num_computed_tokens = n_blocks * BLOCK
-    meta = conn.build_connector_meta(sched_output({req_id: 1}))
-    conn.build_connector_meta(sched_output({}))  # confirm writes
-    ok, _ = conn.request_finished_all_groups(req, ([],))
-    assert ok is False
-    conn.build_connector_meta(sched_output({}))
-    return req, meta
-
-
-def test_attention_only_connector_has_no_tail():
-    conn = make_attn_connector()
-    assert conn.attn_groups == [0]
-    assert conn.state_groups == [] and conn.ring_groups == []
-    assert conn.window_groups == [] and not conn.requires_tail
-    assert conn.index.requires_tail is False
-
-
-def test_attention_only_resumes_after_finish():
-    """The issue-#17 regression: without this the tier never restores."""
-    conn = make_attn_connector()
-    _, meta = run_attn_conversation(conn, "r1", 4)
-    assert len([op for ops in meta.offloads.values() for op in ops]) == 4
-    assert conn.index.stats()["resumable"] == 1
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
-    assert is_async and n_ext == 4 * BLOCK
-
-
-def test_attention_only_restore_has_no_tail_ops_or_zeros():
-    conn = make_attn_connector()
-    run_attn_conversation(conn, "r1", 4)
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
-    conn.update_state_after_alloc(fresh, alloc_attn(5, base=200), n_ext)
-    meta = conn.build_connector_meta(sched_output({}))
-    ops = meta.restores["r2"]
-    assert len(ops) == 4
-    assert targets(ops) == {200, 201, 202, 203}
-    assert "r2" not in meta.zeros
-
-
-def test_attention_only_unfinished_request_is_not_resumable():
-    conn = make_attn_connector()
-    req = FakeRequest("r1", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 4)
-    conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc_attn(4), 0)
-    conn.build_connector_meta(sched_output({"r1": 4 * BLOCK}))
-    req.num_computed_tokens = 4 * BLOCK
-    conn.build_connector_meta(sched_output({"r1": 1}))
-    conn.build_connector_meta(sched_output({}))
-    assert conn.index.stats()["resumable"] == 0
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    assert conn.get_num_new_matched_tokens(fresh, 0) == (0, False)
-
-
-def test_attention_only_hash_mismatch_misses():
-    conn = make_attn_connector()
-    run_attn_conversation(conn, "r1", 4)
-    other = FakeRequest("r2", [h(0), h(1), h(99), h(3)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(other)
-    assert conn.get_num_new_matched_tokens(other, 0) == (0, False)
-
-
-# ----------------------------------------------- multi-rate (DeepSeek-V4)
-#
-# MLA at the scheduler block, an indexer paging 4x finer, and a sliding-
-# window compressor (block 2, window 4) whose out-of-window blocks the
-# engine nulls: the window is the tail. Hashes are at the GCD (2 tokens),
-# so a 16-token position closes 8 hashes.
-
-
-W_BLOCK, W_WIN = 2, 4
-IDX_BLOCK = 4
-
-
-def make_multirate_groups():
-    window = SimpleNamespace(
-        kv_cache_spec=SlidingWindowSpec(
-            block_size=W_BLOCK,
-            num_kv_heads=1,
-            head_size=8,
-            dtype=torch.bfloat16,
-            sliding_window=W_WIN,
-        ),
-        layer_names=["c4"],
-    )
-    return [_attn(BLOCK, ["mla"]), _attn(IDX_BLOCK, ["idx"]), window]
-
-
-def make_multirate_connector():
-    conn = build(make_multirate_groups())
-    assert conn.pos_tokens == BLOCK and conn.hash_block_size == W_BLOCK
-    assert conn.hashes_per_pos == BLOCK // W_BLOCK
-    assert conn.attn_groups == [0, 1] and conn.window_groups == [2]
-    assert conn.tail_groups == [2] and conn.requires_tail
-    assert [g for g, _, _ in conn.sub_layout] == [0, 1, 1, 1, 1]
-    return conn
-
-
-HPP = BLOCK // W_BLOCK  # hashes per position
-
-
-def mr_hashes(n_pos):
-    return [h(i) for i in range(n_pos * HPP)]
-
-
-def window_range(tokens):
-    skipped = max(0, tokens - W_WIN + 1) // W_BLOCK
-    return skipped, tokens // W_BLOCK
-
-
-def alloc_mr(n_pos, base=0, resume_tokens=None):
-    """MLA positional; indexer 4 per position; window: all real while
-    filling, or the engine's [null] * skipped + [real] * window shape when
-    admitted on an external hit of `resume_tokens`."""
-    mla = [FakeBlock(base + i) for i in range(n_pos)]
-    idx = [FakeBlock(base + 100 + i) for i in range(n_pos * (BLOCK // IDX_BLOCK))]
-    n_w = n_pos * (BLOCK // W_BLOCK)
-    if resume_tokens is None:
-        win = [FakeBlock(base + 500 + i) for i in range(n_w)]
-    else:
-        first, last = window_range(resume_tokens)
-        win = [FakeBlock(0, is_null=True)] * first + [
-            FakeBlock(base + 500 + i) for i in range(first, last)
-        ]
-    return FakeKVCacheBlocks(blocks=(mla, idx, win))
-
-
-def run_mr_conversation(conn, req_id, n_pos, base=0):
-    req = FakeRequest(req_id, mr_hashes(n_pos), num_tokens=n_pos * BLOCK + 4)
-    conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc_mr(n_pos, base), 0)
-    conn.build_connector_meta(sched_output({req_id: n_pos * BLOCK}))
-    req.num_computed_tokens = n_pos * BLOCK
-    meta = conn.build_connector_meta(sched_output({req_id: 1}))
-    conn.build_connector_meta(sched_output({}))
-    # The engine froze the window blocks at the boundary into its prefix
-    # cache (hash of window block m = the request hash closing it).
-    pool = conn._block_pool
-    first, last = window_range(n_pos * BLOCK)
-    for m in range(first, last):
-        pool.cached[(bytes(h(m)), 2)] = pool.blocks[base + 500 + m]
-    ok, _ = conn.request_finished_all_groups(req, ([], [], []))
-    assert ok is False
-    tail_meta = conn.build_connector_meta(sched_output({}))
-    conn.build_connector_meta(sched_output({}))
-    return req, meta, tail_meta
-
-
-def test_multirate_fill_stages_every_subblock_with_columns():
-    conn = make_multirate_connector()
-    _, meta, tail_meta = run_mr_conversation(conn, "r1", 3)
-    ops = [op for ops in meta.offloads.values() for op in ops]
-    assert len(ops) == 3 * 5  # per position: 1 MLA + 4 indexer sub-blocks
-    mla_bytes = conn.group_bytes[0]
-    idx_bytes = conn.group_bytes[1]
-    cols = sorted({op[1] for op in ops})
-    assert cols == [0] + [mla_bytes + k * idx_bytes for k in range(4)]
-    assert conn.slot_bytes == mla_bytes + 4 * idx_bytes
-    # One slot row per position: 5 sub-blocks share a slot.
-    per_slot: dict[int, int] = {}
-    for slot, _, _, _ in ops:
-        per_slot[slot] = per_slot.get(slot, 0) + 1
-    assert set(per_slot.values()) == {5}
-    # Tail = the two in-window compressor blocks at the boundary (48 tok).
-    tail_ops = [op for ops in tail_meta.offloads.values() for op in ops]
-    first, last = window_range(3 * BLOCK)
-    assert last - first == 2
-    assert [op[2] for op in tail_ops] == [2, 2]
-    assert targets(tail_ops) == {500 + first, 500 + last - 1}
-    assert all(op[1] == 0 for op in tail_ops)
-    assert conn.index.stats()["resumable"] == 1
-
-
-def test_multirate_resume_restores_subblocks_and_window():
-    conn = make_multirate_connector()
-    run_mr_conversation(conn, "r1", 3)
-    fresh = FakeRequest("r2", mr_hashes(3), num_tokens=3 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    n_ext, is_async = conn.get_num_new_matched_tokens(fresh, 0)
-    assert is_async and n_ext == 3 * BLOCK
-    conn.update_state_after_alloc(
-        fresh, alloc_mr(3, base=200, resume_tokens=3 * BLOCK), n_ext
-    )
-    meta = conn.build_connector_meta(sched_output({}))
-    ops = meta.restores["r2"]
-    assert len(ops) == 3 * 5 + 2
-    assert {200, 201, 202} <= targets(ops)  # MLA
-    assert set(range(300, 312)) <= targets(ops)  # indexer 4 per position
-    first, last = window_range(3 * BLOCK)
-    assert {700 + first, 700 + last - 1} <= targets(ops)  # window blocks
-    assert "r2" not in meta.zeros
-
-
-def test_multirate_missing_window_block_skips_tail_save():
-    conn = make_multirate_connector()
-    req = FakeRequest("r1", mr_hashes(3), num_tokens=3 * BLOCK + 4)
-    conn.on_new_request(req)
-    conn.update_state_after_alloc(req, alloc_mr(3), 0)
-    conn.build_connector_meta(sched_output({"r1": 3 * BLOCK}))
-    req.num_computed_tokens = 3 * BLOCK
-    conn.build_connector_meta(sched_output({"r1": 1}))
-    conn.build_connector_meta(sched_output({}))
-    # Only one of the two window blocks is still cached: no tail.
-    first, _ = window_range(3 * BLOCK)
-    conn._block_pool.cached[(bytes(h(first)), 2)] = conn._block_pool.blocks[9]
-    conn.request_finished_all_groups(req, ([], [], []))
-    assert not conn.build_connector_meta(sched_output({})).offloads
-    assert conn.index.stats()["resumable"] == 0
-
-
-# ---------------------------------------------------------------- pins
-
-
-def test_restore_sources_are_pinned_until_issued():
-    conn = make_attn_connector()
-    run_attn_conversation(conn, "r1", 4)
-    assert conn.index.stats()["pinned"] == 0
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
-    assert conn.index.stats()["pinned"] == 4
-    conn.index._free.clear()
-    assert conn.index.stage_attention("intruder", 0, h(77)) is None
-    assert conn.index.lookup([h(i) for i in range(4)]) is not None
-    conn.update_state_after_alloc(fresh, alloc_attn(5, base=200), n_ext)
-    meta = conn.build_connector_meta(sched_output({}))
-    assert len(meta.restores["r2"]) == 4
-    assert conn.index.stats()["pinned"] == 4
-    conn.build_connector_meta(sched_output({}))
-    assert conn.index.stats()["pinned"] == 0
-
-
-def test_abandoned_plan_releases_pins():
-    conn = make_attn_connector()
-    run_attn_conversation(conn, "r1", 4)
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    n_ext, _ = conn.get_num_new_matched_tokens(fresh, 0)
-    assert conn.index.stats()["pinned"] == 4
-    conn.update_state_after_alloc(fresh, alloc_attn(2, base=200), n_ext)
-    assert conn.index.stats()["pinned"] == 0
-    assert "r2" not in conn._staged_restores
-
-
-def test_finish_mid_plan_releases_pins():
-    conn = make_attn_connector()
-    run_attn_conversation(conn, "r1", 4)
-    fresh = FakeRequest("r2", [h(i) for i in range(4)], num_tokens=4 * BLOCK + 8)
-    conn.on_new_request(fresh)
-    conn.get_num_new_matched_tokens(fresh, 0)
-    assert conn.index.stats()["pinned"] == 4
-    conn.request_finished_all_groups(fresh, ([],))
-    assert conn.index.stats()["pinned"] == 0
-
-
-# ------------------------------------------------- worker registration
-
-
-cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-
-
-def _two_layer_group():
-    g = _attn(BLOCK, ["l0", "l1"])
-    return [g], g.kv_cache_spec
-
-
-@cuda
-def test_register_packed_slab_takes_one_strided_segment_per_group():
-    groups, spec = _two_layer_group()
-    page = spec.page_size_bytes
-    stride, n_blocks = 2 * page, 4
-    slab = torch.zeros(n_blocks * stride, dtype=torch.int8, device="cuda")
-    rows = slab.view(n_blocks, stride)
-    views = {"l0": rows[:, :page], "l1": rows[:, page:]}
-    tensors = [
-        SimpleNamespace(
-            size=slab.numel(), shared_by=["l0"], offset=0, block_stride=stride
-        ),
-        SimpleNamespace(
-            size=slab.numel(), shared_by=["l1"], offset=page, block_stride=stride
-        ),
-    ]
-    conn = build(groups, KVConnectorRole.WORKER, tensors, gb=0.001)
-    conn.register_kv_caches(views)
-    assert list(conn._dma.segments) == [0]
-    assert len(conn._dma.segments[0]) == 1
-    assert conn._dma.group_bytes[0] == stride == conn.slot_bytes
-    assert conn._dma.num_blocks == n_blocks
-
-
-@cuda
-def test_register_per_layer_tensors_takes_one_segment_per_layer():
-    groups, spec = _two_layer_group()
-    page = spec.page_size_bytes
-    l0 = torch.zeros(4 * page, dtype=torch.int8, device="cuda")
-    l1 = torch.zeros(4 * page, dtype=torch.int8, device="cuda")
-    tensors = [
-        SimpleNamespace(size=l0.numel(), shared_by=["l0"], offset=0, block_stride=0),
-        SimpleNamespace(size=l1.numel(), shared_by=["l1"], offset=0, block_stride=0),
-    ]
-    conn = build(groups, KVConnectorRole.WORKER, tensors, gb=0.001)
-    conn.register_kv_caches({"l0": l0, "l1": l1})
-    assert [s.width for s in conn._dma.segments[0]] == [page, page]
-    assert conn._dma.num_blocks == 4
-
-
-@cuda
-def test_register_refuses_an_unaccounted_layer():
-    groups, spec = _two_layer_group()
-    page = spec.page_size_bytes
-    l0 = torch.zeros(4 * page, dtype=torch.int8, device="cuda")
-    l1 = torch.zeros(4 * page, dtype=torch.int8, device="cuda")
-    tensors = [
-        SimpleNamespace(size=l0.numel(), shared_by=["l0"], offset=0, block_stride=0),
-    ]
-    conn = build(groups, KVConnectorRole.WORKER, tensors, gb=0.001)
-    with pytest.raises(RuntimeError, match="no KV tensor in the planner layout"):
-        conn.register_kv_caches({"l0": l0, "l1": l1})
-
-
-@cuda
-def test_register_refuses_group_pool_tensors():
-    groups, spec = _two_layer_group()
-    page = spec.page_size_bytes
-    pool = torch.zeros(4 * page, dtype=torch.int8, device="cuda")
-    tensors = [
-        SimpleNamespace(
-            size=pool.numel(), shared_by=["l0", "l1"], offset=0, block_stride=0
-        ),
-    ]
-    conn = build(groups, KVConnectorRole.WORKER, tensors, gb=0.001)
-    with pytest.raises(RuntimeError, match="not block-addressable"):
-        conn.register_kv_caches({"l0": pool, "l1": pool})

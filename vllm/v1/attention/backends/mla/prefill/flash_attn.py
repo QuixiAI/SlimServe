@@ -303,11 +303,24 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
             qk_rope_head_dim=64,
             v_head_dim=128,
         )
+        # GLM-5.3-Flash (glm5_next): NoPE MLA. With no rope segment the
+        # unabsorbed prefill is plain uniform-head attention at qk = v =
+        # 256, which FA2/FA3 support on every deployed capability.
+        dims_glm5_next = MLADimensions(
+            qk_nope_head_dim=256,
+            qk_rope_head_dim=0,
+            v_head_dim=256,
+        )
         fa_version = get_flash_attn_version()
         if fa_version == 4:
             return mla_dimensions in [dims_deepseek, dims_mistral_s4]
         else:
-            return mla_dimensions in [dims_deepseek, dims_glm, dims_mistral_s4]
+            return mla_dimensions in [
+                dims_deepseek,
+                dims_glm,
+                dims_mistral_s4,
+                dims_glm5_next,
+            ]
 
     def __init__(
         self,

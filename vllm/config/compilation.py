@@ -777,6 +777,7 @@ class CompilationConfig:
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::glm5_next_pooled_indexer",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
     ]

@@ -5,6 +5,32 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
+### 8x RTX 3090 Current Baseline - 2026-09-02 (fp8 main KV @ native 262K, host tier on)
+
+- Registered profile as deployed: TP8+EP, max_model_len 262144, main QSA
+  KV fp8 e4m3 (`kv_cache_dtype: fp8`; operator 2026-09-02, replaces the
+  bf16 mandate; NOT TurboQuant), gpu_memory_utilization 0.96, prefix
+  caching, HostTierConnector 88 GiB/rank (15,773 slots, ~12.6M tokens)
+  + NVMe tier 448 GiB/rank on the dedicated nvme1n1 (80,273 slots, ~64M
+  tokens), max_num_seqs 32, capture 96,
+  MTP k=2 + index share, thinking budget 2000.
+- GPU KV pool: 3.64 GiB/rank = 496,174 tokens = 1.89x one max-length
+  request (bf16 held 269,155 = 1.03x). Attention block 800 tokens.
+- Workload: exact 1,000 in / 2,000 out, temp 1.0 / top_p 0.95 / top_k 20,
+  temp server on port 8001, idle box.
+
+| Concurrency | Aggregate tok/s (seed 42 / 43) | Draft acceptance |
+| ---: | ---: | ---: |
+| 1 | 135.7 | - |
+| 8 | 594.2 / 590.4 (610.2 with the NVMe tier writing through, 2026-09-03) | 63.9-66.9% |
+| 32 | 1,016.6 / 1,100.9 | 58.5-61.9% |
+
+- vs the bf16 deployed reference (c1 129.8-157.8, c8 590.7-600.5, c32
+  1,091.8-1,199.8): c1/c8 parity, c32 ~7-8% lower seed for seed.
+- Correctness gates passed: tier eviction-restore marker recall, 6-turn
+  multi-turn state tracking x3 seeds.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/.
+
 ### 8x RTX 3090 Current Baseline - 2026-08-27 evening (KV-pool fix + correctness fixes)
 
 - Same registered profile as the "Final Baseline" below plus:
@@ -1879,3 +1905,68 @@ Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-perf/`.
 Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-baseline/`.
 Headroom (unmeasured): native gfx942 NVFP4 decode, aiter FP8 shape tuning,
 graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
+
+## GLM-5.2 glm52-q2k-8 (A100 x8, bf16 KV @ 202752) - first exact-token baseline 2026-09-03
+- Through `slimserve glm52-q2k-8 --serve`, exact-token harness (1000 in /
+  300 out, temp 1.0 / top-p 0.95 / top-k 20, seed 42), aggregate output tok/s:
+  | c1   | c8   | c16   |
+  | 14.9 | 81.5 | 135.2 |
+  Raw: perf/results/2026-09-03/glm52-q2k-8-baseline/. Before the
+  partitioned bf16 sparse decode launch the same boot read 9.6 / 64.7 /
+  110.4 (perf/results/2026-09-03/glm52-q2k-8-prepartition/). Text
+  (+reasoning), image and tool canaries pass. The Q2_K GGUF MoE path is
+  this record's remaining budget and was not touched today.
+
+## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100)
+
+### A100 Exact Baseline - 2026-09-03 (compile on, partitioned + vectorized sparse decode, strided indexer)
+- Stack: torch.compile active on the text model (kda_attention op, indexer
+  as a splitting op), bf16 sparse MLA decode partitioned (P128) with the
+  VECBF16 row path, pooled-indexer grid proportional to the actual
+  context. Both records booted through `slimserve <id> --serve`, model-
+  default 1,048,576 context, no speculative decoding, no host tier.
+- Exact-token harness (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  seed 42, warmed per concurrency), aggregate output tok/s:
+  | record                 | c1   | c8    | c16   |
+  | glm53-nvfp4-4 (TP4)    | 73.8 | 332.1 | 464.6 |
+  | glm53-nvfp4-8 (TP8)    | 84.0 | 412.3 | 575.8 |
+  Raw: perf/results/2026-09-03/glm53-nvfp4-{4,8}-baseline/.
+- TP8 / TP4: +14% / +24% / +24% - below the 50% scaling gate. The gap is
+  per-rank replicated work (91 custom allreduces per token at 8 ranks, the
+  mHC stream kernels, the pooled indexer); the 8-GPU matrix's TP4xDP2 arm
+  (two independent TP4 engines) is the upper bound that fusing it away
+  would recover. Documented in optimization_status 2026-09-03.
+- 8-GPU matrix (arm launches at 32K context, pre-strided-indexer): TP8
+  83.0 / 343.7 / 447.7; TP8+EP 75.3 / 331.1 / 430.8; TP4xDP2 67.2 / 382.8 /
+  527.6; TP4xDP2+EP 51.3 / 317.0 / 480.1. EP off on both records.
+- Correctness gates at this baseline: text (+reasoning), image and tool
+  canaries through both profiles; pooled-indexer parity vs transformers;
+  bf16 sparse decode parity (tests/kernels/test_quixicore_sparse_mla_bf16.py).
+  TP8 WildChat deep-context leg PASS (perf/results/2026-09-03/glm53-leg/
+  glm53-nvfp4-8/): 0 errors, 34/34 recall, max ctx 202,509, median
+  190,704, 97,378 completion tokens in 1.25 h. The TP4 leg passed on
+  2026-09-02 (19/19 recall to 114K) on the pre-kernel-fix stack.
+- The 2026-09-01 TP4 numbers below predate all three fixes and are kept
+  as history; their c8 331.4 is not reproducible and is superseded.
+
+### History: GLM-5.3-Flash NVFP4 (glm53-nvfp4-4, A100 x4)
+
+### A100 TP4 Exact Baseline - 2026-09-01 (bring-up, sparse DSA, no spec)
+- Config: the registered glm53-nvfp4-4/a100 record (TP4, EP off,
+  QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, bf16 KV, Marlin
+  NVFP4 MoE, FULL_DECODE_ONLY graphs; no speculative decoding yet).
+- Exact-token harness (benchmarks/benchmark_dsv4_exact.py, 1000 in /
+  300 out, temperature 1.0 / top-p 0.95 / top-k 20, seed 42):
+  | concurrency | aggregate output tok/s |
+  | c1          | 70.1  |
+  | c8          | 331.4 |
+  Raw: perf/results/2026-09-01/glm53-opt-sparse/.
+- Same-harness A/B references: dense NoPE MLA (bring-up only) c1 74.1 /
+  c8 343.6; expert-parallel arm c1 70.0 / c8 330.4 (dense) - EP off is the
+  record's default. Eager -O0 (retired) was 5.4 / 41.6.
+- Correctness gates at this baseline: text/image/tool canaries via the
+  profile; 6,396-token planted-fact recall through sparse selection;
+  pooled-indexer parity vs the transformers reference.
+- Expected next moves: MTP speculative decoding (checkpoint ships the
+  head), host tier once the packed planner handles KDA+MLA mixed block
+  sizes, kernel-level tuning of the pooled-logits path.

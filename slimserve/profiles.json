@@ -1166,6 +1166,119 @@
           }
         }
       }
+    },
+    "glm53-flash-nvfp4": {
+      "title": "GLM-5.3-Flash",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
+      "local_dir": "GLM-5.3-Flash-NVFP4",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
+      "speculator": {
+        "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
+        "local_dir": "GLM-5.3-Flash-NVFP4",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 1
+        },
+        "note": "The checkpoint ships a one-layer MTP head (layer 45: DSA attention + MoE, eh_proj/enorm/hnorm). The glm5_next MTP draft path is not ported yet; profiles stay non-speculative until it is."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (group-16 FP4 experts, FP8 tail layer, BF16 backbone)",
+          "bytes": 197881155500,
+          "summary": "RedHatAI's LLM Compressor release of the 169B GLM-5.3-Flash: 42 MoE layers in NVFP4 (group 16), the last expert layer in FP8, attention/KDA/mHC/embeddings/vision in BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 kernels.",
+          "min_gpus": {
+            "a100": 4
+          },
+          "files": [
+            {
+              "path": "README.md",
+              "bytes": 2151
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 10644
+            },
+            {
+              "path": "config.json",
+              "bytes": 53876
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 177
+            },
+            {
+              "path": "model-00001-of-00010.safetensors",
+              "bytes": 20002894272
+            },
+            {
+              "path": "model-00002-of-00010.safetensors",
+              "bytes": 20002803476
+            },
+            {
+              "path": "model-00003-of-00010.safetensors",
+              "bytes": 20000726256
+            },
+            {
+              "path": "model-00004-of-00010.safetensors",
+              "bytes": 20000334356
+            },
+            {
+              "path": "model-00005-of-00010.safetensors",
+              "bytes": 20000724512
+            },
+            {
+              "path": "model-00006-of-00010.safetensors",
+              "bytes": 20000331556
+            },
+            {
+              "path": "model-00007-of-00010.safetensors",
+              "bytes": 20000725168
+            },
+            {
+              "path": "model-00008-of-00010.safetensors",
+              "bytes": 20000332348
+            },
+            {
+              "path": "model-00009-of-00010.safetensors",
+              "bytes": 20000722232
+            },
+            {
+              "path": "model-00010-of-00010.safetensors",
+              "bytes": 10215657876
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 17055736
+            },
+            {
+              "path": "model_mtp.safetensors",
+              "bytes": 7618560424
+            },
+            {
+              "path": "processor_config.json",
+              "bytes": 909
+            },
+            {
+              "path": "recipe.yaml",
+              "bytes": 1200
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 20217541
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 790
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -2455,7 +2568,7 @@
             "max_model_len": 262144,
             "max_num_seqs": 32,
             "gpu_memory_utilization": 0.96,
-            "kv_cache_dtype": "auto",
+            "kv_cache_dtype": "fp8",
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
               "max_cudagraph_capture_size": 96
@@ -2474,7 +2587,8 @@
               "kv_connector": "HostTierConnector",
               "kv_role": "kv_both",
               "kv_connector_extra_config": {
-                "host_tier_gb_per_rank": 64
+                "host_tier_gb_per_rank": 88,
+                "nvme_tier_gb_per_rank": 448
               }
             },
             "default_chat_template_kwargs": {
@@ -2501,7 +2615,7 @@
             "Multi-GPU GeForce runs fine on the stock NVIDIA driver but leaves 36-58% of TP throughput on the table: install QuixiAI's P2P driver (github.com/QuixiAI/open-gpu-kernel-modules, see docs/geforce-p2p.md) for direct GPU-GPU DMA. Measured on this profile: c1 109.6->148.8 (+36%), c8 409.7->647.9 (+58%). NCCL_P2P_LEVEL=SYS in this env is required for P2P across root complexes and harmless on stock drivers.",
             "reasoning_parser qwen3 and tool_call_parser qwen3_xml: the template thinks in <think> blocks and calls tools with <function=...> XML.",
             "Speculation uses the checkpoint's own single-layer QSA MTP drafter (Qwen4ExpMTP) via method 'mtp'; there is no separate DSpark artifact for this model yet.",
-            "Main QSA KV is bf16 at the native max_model_len 262144 (operator decision 2026-08-28, was TurboQuant k8v4): bf16 measures ~8% faster at c1 and at parity c8-c32, with exact (unquantized) KV. The GPU pool at util 0.95 holds ~273K tokens = 1.04x one max-length request, so deep-context CONCURRENCY comes from the host KV tier (system RAM holds >8M tokens on this box), not the GPU pool. TurboQuant remains available: VLLM_QWEN4_EXP_TQ_MAIN_KV=1 restores 2.25x GPU-resident concurrency at 262144 (validated 2026-08-27) for boxes without the RAM for the host tier.",
+            "Main QSA KV is fp8 (float8_e4m3fn, unit scale) at the native max_model_len 262144 via kv_cache_dtype fp8 (operator decision 2026-09-02, reversing the 2026-08-28 bf16 mandate; NOT TurboQuant). The layer stores only the main QSA KV in fp8 - the indexer's compressed cache, the raw-key ring and the GDN state keep their own dtypes - and the sparse-gather kernel decodes e4m3 arithmetically in-register (SM86 has no fp8 cvt). The fp8 path was removed 2026-08-27 (de0b2af8a) and restored 2026-09-02; VLLM_QWEN4_EXP_FP8_MAIN_KV=1 is the equivalent layer-scoped diagnostic switch. Capacity: bf16 held 269,155 tokens = 1.03x one max-length request in the 3.64 GiB/rank pool; fp8 halves the dominant slab. Measured cost (2026-08-27 A/B, pre tile-fix): ~10% c1 / ~25% c8 vs bf16; the quantized-KV tile fix (block_n 16 / 4 warps) has since removed the wide-tile collapse that dominated that c8 loss. Requalified on-box 2026-09-02 (perf/optimization_status.md): GPU KV cache 496,174 tokens = 1.89x one max-length request in the same 3.64 GiB/rank (attention block 800 tokens), tier eviction-restore recall and 3-seed multi-turn tracking PASS, exact 1000/2000 c1 135.7 / c8 590-594 / c32 1,017-1,101 tok/s: c1/c8 at bf16 parity, c32 ~7-8% under bf16 (arithmetic e4m3 decode at the 96-row verify width; LUT decode is the open lead).",
             "max_num_seqs 32 with max_cudagraph_capture_size 96: at MTP k=2 every decode step is seqs x 3 query tokens, so 96 covers full-batch decode steps with FULL graphs (c32 measured 425 tok/s eager vs 880 graphed). Raising max_num_seqs requires raising the capture size with it (3 x max_num_seqs) or the largest batches silently run eager.",
             "The QSA sparse-gather kernel pins narrow tiles (block_n 16, 4 warps) for quantized KV: the wide-tile profile that suits bf16 collapses in-register dequant 3.8x (TQ) to 23x (fp8) at 48+ token steps.",
             "min_host_ram_bytes gates this platform at 128 GiB system RAM: the 47.7 GiB n-gram (PLE) table is pinned ONCE in a /dev/shm segment shared by all TP ranks (not per rank), plus load staging and runtime headroom. A machine that passes the GPU gate but lacks the RAM fails at plan time instead of dying mid-load.",
@@ -2510,12 +2624,118 @@
             "VLLM_ADMISSION_MAX_CONCURRENT=96 caps total in-flight generation requests (decode slots plus engine queue) at 3x max_num_seqs; beyond that the API server answers 429 + Retry-After instead of letting the queue grow without bound. Measured at 64 concurrent sessions, oversubscription past 32 buys zero throughput (780.5 vs 779.7 tok/s) and only queueing delay (TTFT p50 40.2s vs 11.6s), so the cap exists to shed pathological load, not to police normal bursts: naive clients that burst to 60-90 requests still queue and complete. Non-generation routes (models, health, metrics) are never capped.",
             "Prefix caching is ON (TurboQuant main-KV + mamba cache mode 'align', correctness validated 2026-08-27: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity). The mamba-page alignment forces 1056-token cache blocks, so hits require shared prefixes of at least one full block: shallow chats (~2K histories) measured only a 2.2% hit rate for ~4% peak throughput, but deep multi-turn traffic is transformed - a 100K-token history is ~94 cached blocks and each turn re-prefills only the tail, versus re-paying the entire history every turn with caching off (measured: the engine degenerates to ~5K tok/s prefill / ~20 tok/s generation on deep conversations). Finer-grained caching needs decoupling the attention block from the mamba state snapshot (open kernel/allocator work).",
             "enable_prefix_caching true is SlimServe policy (2026-08-28): every profile states it explicitly; hybrid models otherwise inherit vLLM's silent hybrid default of OFF and pay full history re-prefill every chat turn. Validated on rtx3090: byte-identical cached/uncached greedy outputs, 504/504 WildChat replay, -1.5% KV capacity.",
-            "Host KV tier (HostTierConnector, kv_transfer_config above) is ENABLED and validated on this box (2026-08-28): 64 GiB pinned host RAM per rank (512 GiB total) = ~12,146 block slots = ~4.8M tokens of evicted-conversation capacity behind the ~270K-token GPU pool. Tail states ride the engine's own frozen align-mode boundary snapshots (pool prefix cache, looked up by boundary hash - never live blocks); restores land at position k-1 per mamba group and the QSA ring is zeroed defensively. Validated: multi-depth marker-recall acceptance (8K/24K/42K restored sub-second after full GPU-pool eviction, outputs byte-identical to GPU-cache controls at 8K/24K), throughput-neutral (c1 133.6 / c8 599.4 / c32 1,149.7 vs 1,151.2 no-tier baseline). Known limitation: one tail per trajectory - a sibling re-ask after a deeper follow-up turn re-prefills instead of resuming (correct, just slower); resume boundaries exist at ~2K-token chunk ends, so sub-chunk (<2K) conversations are not tier-resumable (re-prefill is faster anyway). Raw: perf/results/2026-08-28/kv-tier/.",
+            "Host KV tier (HostTierConnector, kv_transfer_config above) is ENABLED and validated on this box (2026-08-28; resized 2026-09-02): 88 GiB pinned host RAM per rank (704 GiB total) = 15,773 block slots x 800 tokens = ~12.6M tokens of evicted-conversation capacity behind the ~496K-token GPU pool, leaving ~188 GB MemAvailable on this 995 GB box with the 48 GiB shared PLE table (a 104 GiB/rank tier would leave ~60 GB - too little for prefill staging and page cache). The arena is cudaHostRegister-ed at exactly its size: torch's pin_memory=True allocator rounds to the next power of two, which turned 88 and 104 GiB into 128 GiB/rank and OOM-killed the boot (2026-09-02); 64 GiB only ever fit because it is a power of two. Tail states ride the engine's own frozen align-mode boundary snapshots (pool prefix cache, looked up by boundary hash - never live blocks); restores land at position k-1 per mamba group and the QSA ring is zeroed defensively. Validated: multi-depth marker-recall acceptance (8K/24K/42K restored sub-second after full GPU-pool eviction, outputs byte-identical to GPU-cache controls at 8K/24K), throughput-neutral (c1 133.6 / c8 599.4 / c32 1,149.7 vs 1,151.2 no-tier baseline). Known limitation: one tail per trajectory - a sibling re-ask after a deeper follow-up turn re-prefills instead of resuming (correct, just slower); resume boundaries exist at ~2K-token chunk ends, so sub-chunk (<2K) conversations are not tier-resumable (re-prefill is faster anyway). Raw: perf/results/2026-08-28/kv-tier/. Third tier (2026-09-02, resized 2026-09-03 for the dedicated 3.7 TB nvme1n1 XFS mount): nvme_tier_gb_per_rank 448 writes every confirmed host block through to a per-rank O_TMPFILE on the tier device (directory from SLIMSERVE_KV_TIER_DIR, else $SLIMSERVE_CACHE/kv-tier, else ~/.cache/slimserve/kv-tier - never a path in this file); 448 GiB/rank (3.5 TiB total on the dedicated device) = 80,273 slots x 800 tokens = ~64M tokens of evicted conversations that survive host-tier eviction (demotion keeps the disk copy; a hit promotes disk -> host -> GPU). Validated on port 8001 with a 2 GiB host tier forcing demotion: marker recall PASS at 8K/24K/42K restored from NVMe in 1.3/1.5/2.5 s (cold 2.1/6.0/10.0 s). The dedicated device is nvme1n1 (XFS, /mnt/kvtier, operator fstab + SLIMSERVE_KV_TIER_DIR); see perf/optimization_status.md 2026-09-03 for the greedy recall validation of the promoted path.",
             "Chat-template defaults: reasoning_effort low (the template ships xhigh, which spends hundreds of thinking tokens on trivial turns) and preserve_thinking explicitly true (the template treats undefined as true; pinned so a template update cannot silently flip it). Per-request values override both."
           ],
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true
           }
+        }
+      }
+    },
+    "glm53-nvfp4-4": {
+      "title": "GLM-5.3-Flash NVFP4 on 4 GPUs",
+      "source": "glm53-flash-nvfp4",
+      "gpus": 4,
+      "summary": "Vision-language 169B hybrid (34 KDA linear-attention layers + 11 DeepSeek-sparse-attention layers with a pooled indexer, mHC hyper-connections, 288-expert MoE). NVFP4 experts on Marlin, sparse NoPE MLA through the QuixiCore Ampere kernels, TP4 with experts sharded (EP measured slower).",
+      "speculative": false,
+      "variants": {
+        "a100": {
+          "platform": "a100",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 16,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "env": {},
+          "notes": [
+            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "enable_expert_parallel is off by measurement: with 288 experts at moe_intermediate 2048 the TP shard (512/rank) stays aligned to the NVFP4 group-16 scales, and the expert-parallel arm measured 4-6% slower at c1 and c8 on the optimized path (exact-token, perf/results/2026-09-01/glm53-ep-ab-opt/).",
+            "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
+            "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
+            "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
+            "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
+            "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
+            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+          ]
+        }
+      }
+    },
+    "glm53-nvfp4-8": {
+      "title": "GLM-5.3-Flash NVFP4 on 8 GPUs",
+      "source": "glm53-flash-nvfp4",
+      "gpus": 8,
+      "summary": "Vision-language 169B hybrid (34 KDA layers + 11 pooled-indexer DSA layers, mHC, 288-expert NVFP4 MoE) on eight A100s: TP8, experts sharded, chosen from the TP8 / TP4xDP2, EP on/off matrix.",
+      "speculative": false,
+      "variants": {
+        "a100": {
+          "platform": "a100",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 8,
+            "enable_expert_parallel": false,
+            "max_num_seqs": 32,
+            "block_size": 64,
+            "gpu_memory_utilization": 0.85,
+            "kv_cache_dtype": "auto",
+            "attention_config": {
+              "backend": "QUIXICORE_MLA_SPARSE",
+              "sparse_mla_force_mqa": true
+            },
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 64
+            },
+            "limit_mm_per_prompt": {
+              "image": 2
+            },
+            "reasoning_parser": "glm47",
+            "tool_call_parser": "glm47",
+            "served_model_name": "GLM-5.3-Flash",
+            "enable_prefix_caching": true
+          },
+          "env": {},
+          "notes": [
+            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "Parallelism is by measurement on the 8x A100 matrix (exact-token, perf/results/2026-09-02/glm53-8gpu-matrix/): TP8 83.0 / 343.7 / 447.7 tok/s at c1 / c8 / c16; TP8+EP 75.3 / 331.1 / 430.8; TP4xDP2 67.2 / 382.8 / 527.6; TP4xDP2+EP 51.3 / 317.0 / 480.1; TP4 on four GPUs 73.6 / 282.6 / 369.9. TP8 wins single-stream latency and keeps one prefix cache and one KV pool for agentic traffic; DP2's c8/c16 lead is the TP8 per-rank fixed cost (8-rank allreduce, replicated mHC and indexer) still to be fused away. The record runs TP8, experts sharded.",
+            "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
+            "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
+            "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
+            "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
+            "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
+            "No host KV tier on this record yet: the packed cross-layer slab the HostTierConnector requires assumes one block size across groups, and this layout mixes KDA state groups (per-request state pages) with 64-token MLA and indexer pages, so the generic packed planner mis-sizes the attention views (the rtx3090 GDN+attention profile uses the dedicated CSA-linear planner instead). Enabling the tier here is the standing follow-up: generalize that planner to KDA+MLA layouts, then run the eviction-restore acceptance."
+          ]
         }
       }
     }

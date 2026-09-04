@@ -1405,7 +1405,10 @@ class MLACommonBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [320, 576]
+        # 576 = DeepSeek MLA (512 latent + 64 rope); 320 = Mistral-S4;
+        # 512 = NoPE MLA (glm5_next / kimi-linear lineage: 512 latent,
+        # no rope segment).
+        return [320, 512, 576]
 
     @classmethod
     def is_mla(cls) -> bool:

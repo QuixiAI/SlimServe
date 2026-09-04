@@ -1330,33 +1330,7 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
-def _group_block_bytes(kv_cache_groups: list[KVCacheGroupSpec]) -> list[int]:
-    """Bytes of one block per group, from the real per-layer specs."""
-    out: list[int] = []
-    for group in kv_cache_groups:
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            out.append(
-                sum(spec.kv_cache_specs[ln].page_size_bytes for ln in group.layer_names)
-            )
-        else:
-            out.append(spec.page_size_bytes * len(group.layer_names))
-    return out
-
-
 def get_kv_cache_config_from_groups(
-    vllm_config: VllmConfig,
-    kv_cache_groups: list[KVCacheGroupSpec],
-    available_memory: int,
-) -> KVCacheConfig:
-    cfg = _get_kv_cache_config_from_groups(
-        vllm_config, kv_cache_groups, available_memory
-    )
-    cfg.group_block_bytes = _group_block_bytes(cfg.kv_cache_groups)
-    return cfg
-
-
-def _get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,

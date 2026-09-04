@@ -285,14 +285,14 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
 # recommended sampling (temperature 1.0 / top_p 0.95 / top_k 20, seeded for
 # reproducibility), never temperature 0.
 #
-# Main KV is ALWAYS bf16 (kv_cache_dtype auto) on rtx3090 profiles
-# (operator 2026-08-29; quantized KV was implicated in multi-turn
-# tracking errors on Qwen3.8-Flash-Next). bf16 main KV is aspirational
-# on other platforms: they keep their qualified configs until an on-box
-# requalification pass. Draft-model KV (DSpark TurboQuant) is exempt
-# everywhere: rejection sampling verifies drafts against the target, so
-# draft precision affects speed, never output content. Enforced by
-# test_no_profile_quantizes_main_kv.
+# Main KV precision is a per-profile, on-box-validated choice (operator
+# 2026-09-02, reversing the 2026-08-29 rtx3090 bf16 mandate): a record may
+# quantize its main KV when a note names the format and the validation.
+# qwen38fn-fp8-8/rtx3090 runs fp8 (e4m3) main KV through kv_cache_dtype;
+# TurboQuant is not used for main KV there. Draft-model KV (DSpark
+# TurboQuant) is always allowed: rejection sampling verifies drafts against
+# the target, so draft precision affects speed, never output content.
+# Enforced by test_quantized_main_kv_is_an_explicit_validated_choice.
 #
 # "thinking" is the DeepSeek/Kimi template switch, "enable_thinking" the
 # GLM/Qwen one; templates ignore the name they do not use.

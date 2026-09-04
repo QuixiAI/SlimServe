@@ -268,6 +268,7 @@ class ModelArchConfigConvertorBase:
             "deepseek_v4",
             "deepseek_mtp",
             "glm_moe_dsa",
+            "glm5_next_text",
             "glm4_moe_lite",
             "glm4_moe_lite_mtp",
             "kimi_k2",

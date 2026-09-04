@@ -18315,3 +18315,776 @@ tier acceptance PASS.
   this run (single sample, prefill unchanged by this kernel - treat as
   noise until re-measured). bench_glm_split1024_c8.json. Recall probes
   4/4 at low and high blocks on the same boot.
+### glm52-q2k-4 fp8@131072 sweep leg: PASS (stride fix validated under churn)
+- Rerun after the KVCacheTensor.block_stride fix: c8 WildChat deep-context,
+  full 1.25h wall, ZERO errors (first run: 16 errors/8 dead sessions at the
+  ~56-min arena wrap). max_ctx 54,434, median 44,222. Both roles agree on
+  15,339 slots; the arena wrapped repeatedly with no fault.
+- Recall 7/7 determinate probes (~31-39K ctx). One probe indeterminate, not
+  failed: completion hit exactly the 512-token cap with thinking unfinished
+  (successful probes used 66-227 tokens). Probe budget raised to 1024 in
+  the harness so GLM's thinking cannot starve a probe again.
+- Saturation note: probe TTFTs 725-1030s at c8 - this record is
+  prefill-bound at saturation (2048-token chunks, TP4 fp8). Capacity
+  record, not the throughput record; raw at
+  perf/results/2026-08-29/a100-bf16-kvtier/glm52-q2k-4/.
+- New acceptance tooling: benchmarks/benchmark_kv_tier_eviction.py
+  (marker recall after full GPU-pool eviction with re-churn between
+  probes, per issue #18), to be run against the dsv4-q4ktail-8 resident
+  with VLLM_KV_TIER_VERIFY=1.
+
+### glm52-q2k-8 bf16@202752 sweep leg: PASS
+- First TP8 GLM boot of the campaign: model-default 202752 context resolves
+  from the patched GGUF, bf16 KV, GPU pool 313,728 tokens (1.55x one
+  full-default request), packed slab 102/102 layers, tier arena 8,474
+  slots x 6,081,792 B (48 GiB/rank) with scheduler and workers agreed.
+- WildChat c8 deep-context leg: 0 errors, 8/8 recall, all 8 sessions ran
+  the full 1.25h wall, max_ctx 55,252 / median 49,448. Text and image
+  canaries pass under load with thinking active (vision-profile rule).
+- VLLM_KV_TIER_VERIFY=1 was armed but UNEXERCISED: the 313K pool never
+  evicted a live session at this depth, so zero restores occurred. The
+  SHA round-trip is being exercised deliberately by
+  benchmarks/benchmark_kv_tier_eviction.py against a kept TP8 server
+  (results under perf/results/2026-08-30/kvtier-acceptance/).
+
+## 2026-08-31: A100 host tier was WRITE-ONLY - restore path root cause + fix
+
+- The instrumented eviction acceptance (issue #18 battery) proved the tier
+  never restored on A100: thousands of offloads, zero restores, every
+  probe lookup missing. Recall "passes" in all prior A100 validations
+  (incl. the 2026-08-29 seven-profile sweep) were full re-prefill, not
+  tier restores - indistinguishable without the new DMA counters.
+- Three stacked causes, all specific to attention-only models (GLM-DSA,
+  DSV4 sparse MLA; the validated qwen/rtx3090 mamba path is unaffected):
+  1. resumable_blocks() requires a mamba tail anchor; attention-only
+     models never save one (request_finished_all_groups returns early
+     when state_groups is empty), so EVERY trajectory reported zero
+     resumable blocks (explain_miss: tail=-1). The tier index was
+     structurally unmatchable.
+  2. All-or-nothing hash matching: chat replays always diverge from the
+     staged chain at the previous turn's generation boundary
+     (template-wrapped assistant text hashes differently from the tokens
+     as sampled), so even a tail-less exact match could never fire
+     (hash_mismatch_at=21 of attn_len=25).
+  3. Trajectory fragmentation: a turn continuing via GPU prefix cache
+     never adopted the prior turn's lineage, so each turn staged its own
+     gap-ridden fragment.
+- Fix (gated on state_groups == [], mamba semantics untouched):
+  attn_prefix_len() makes any gap-free staged prefix resumable
+  (attention KV is position-independent, unlike cumulative mamba state);
+  lookup(allow_partial=True) resumes at the longest common hash prefix,
+  clamped at pending-write slots; adoption-without-restore keeps one
+  lineage per conversation when the GPU cache covers the tier's span; and
+  stage_attention(supersede=True) frees + restages a diverged suffix
+  (deferred-free set for slots still pending write). Offline index unit
+  tests cover partial lookup, adoption, supersede recycling, pending
+  clamp, and orphan free.
+- On-box proof (glm52-q2k-8, 12K-token conversation, 491K-token churn of
+  the 330K pool, VLLM_KV_TIER_VERIFY=1): "host-tier: hit ... resume at
+  block 194 (12416 tokens)", DMA totals restore=203, and 80 verify
+  batches with 0 SHA mismatches - the first verified host-tier restores
+  on A100. Mid-build hits at blocks 151/172 show per-turn lineage
+  adoption working.
+- Residual: one probe returns empty content with the marker likely in the
+  reasoning channel (budget/parser shaped, not KV); the acceptance bench
+  now records content-vs-reasoning placement and completion tokens, and
+  counts either placement as KV-intact. Verification rerun in flight.
+- Raw: perf/results/2026-08-30/kvtier-acceptance/glm52-q2k-8/.
+
+### DSV4 q4ktail-4 A/B arms: tier no-regression PASS; fp8-vs-bf16 quantified
+- Exact-token bench (1000 in / 2000 out, temp 1.0/top-p 0.95/top-k 20
+  seed 42, hand-built launcher identical across arms, single run per
+  cell), aggregate output tok/s:
+  | arm                        | c1    | c8    |
+  | baseline (tier on, bf16)   | 152.8 | 233.7 |
+  | no-tier (bf16)             | 135.2 | 229.5 |
+  | fp8_ds_mla KV (tier on)    | 144.2 | 270.4 |
+- Tier on/off: no regression at either concurrency (c1 delta is
+  single-run spec-decoding variance; claim is "no regression", not "tier
+  is faster"). Issue #18 no-regression criterion: PASS.
+- fp8-vs-bf16 (the A/B owed since the bf16 campaign): bf16 costs ~14% at
+  c8 (233.7 vs 270.4) and is a wash at c1, at SHORT context - expect the
+  gap to widen with depth as KV bandwidth dominates. fp8_ds_mla still
+  boots cleanly as a fallback dtype. bf16 stays per policy (quality);
+  cost now on record.
+- Raw: perf/results/2026-08-30/kvtier-ab/{baseline,notier,fp8kv}/.
+
+### DSV4 tier restores: real geometry found, restore path safety-gated
+- The group-aware acceptance rerun still hung at "no target block g1
+  pos 11". Per-group instrumentation revealed the true DSV4 layout: g0 =
+  MLAAttentionSpec 62 layers block 256 (the deep KV), g1-g4 =
+  SlidingWindowMLASpec (22/21/42/20 layers, block sizes 64/64/4/8!), g5 =
+  TQSlidingWindowSpec (drafter, block 64). The sliding-window groups keep
+  only a recent window (per-token cost ~90x the main KV), their tables
+  legitimately lack old positions, and a correct deep resume must restore
+  each WINDOW at the resume boundary - a generalization of the mamba
+  tail-state machinery, not the attention-only partial-resume path.
+- Uniform-position indexing of those tables was wrong at offload AND
+  restore; the missing-window abort then stranded requests in
+  WAITING_FOR_REMOTE_KVS (the acceptance's 30-min TimeoutError, twice).
+  Pre-restore-fix production never hit this only because lookups never
+  matched at all.
+- Safety gate shipped: partial resume now additionally requires every
+  attention group to be full-attention at the shared hash granularity
+  (_partial_resume_ok). DSV4 layouts log "restore path disabled for this
+  KV layout" and stay write-only (exactly the pre-fix production
+  behavior); GLM keeps its proven restores. Multi-group + single-group
+  index unit tests pass; registry suite green.
+- Follow-up design (issue #17/#18 continuation): stage SW-group windows
+  at recent hash boundaries (retain last K boundary windows, ~(K*256+W)
+  x ~190KB/token per trajectory), anchor resume at boundaries where both
+  the hash chain matches and every window is retained; group-unit
+  indexing (position = token // group_block_size) for the SW tables.
+
+## 2026-09-01: GLM-5.3-Flash (glm5_next) bring-up - first tokens on A100 TP4
+
+- New model port for RedHatAI/GLM-5.3-Flash-NVFP4 (169B, 34 KDA linear
+  layers + 11 NoPE-MLA DSA layers, mHC hc_mult=4, 288-expert
+  sigmoid/noaux MoE, vision tower, MTP head). transformers upgraded to
+  5.16.1 (operator directive: upgrade, never vendor) which also supplied
+  the reference modeling code used as porting source.
+- vllm/model_executor/models/glm5_next.py composes fork-owned pieces:
+  shared KimiGatedDeltaNetAttention for KDA (checkpoint's separate
+  q/k/v/convs load into the merged layout via stacked mappings),
+  MultiHeadLatentAttentionWrapper NoPE path, DeepseekV2MoE (identical
+  config names), eager-torch mHC (reference math verbatim; DSV4's fused
+  tilelang mHC is the planned optimization).
+- Stack fixes to get here: glm5_next_text added to the is_deepseek_mla
+  model-type list (head_size fell back to 64 and MLA metadata rejected
+  it); 512 added to MLACommonBackend supported head sizes (NoPE = 512
+  latent, no rope segment); FA prefill dims allowlist gained
+  (256, 0, 256); kimi_k3 package gate relaxed so the platform-neutral
+  KDA Triton kernels re-export under nvidia/ (the model classes stay
+  ROCm-gated); fork gotchas: kv fp8 default, aiter moe default, per-hop
+  attention/moe backend flags.
+- Bring-up boot: TP4, TRITON_MLA (explicit; the Ampere priority list
+  bans dense MLA by design), marlin NVFP4 MoE, -O0, 8192 ctx. Dummy boot
+  clean, real weights load with 0 unmatched tensors (the flat
+  hc_attn_*/hc_ffn_* checkpoint names map onto the per-site mHC
+  modules), first completion coherent.
+- DENSE MLA is a bring-up diagnostic: exact only <= index_topk (2048)
+  context. Before any profile ships: the pooled DSA indexer (4-token
+  pools, learned APE + gate compression, always-select-tail) + sparse
+  attention, vision (processor contract is qwen-vl pixel_values +
+  image_grid_thw), then EP on/off A/B, MTP later.
+
+### GLM-5.3-Flash EP on/off A/B (bring-up config, -O0)
+- gather_and_maybe_dequant_cache gained a 512 head-dim instantiation
+  (chunked-prefill context gather crashed at c8 on the NoPE cache; we own
+  the kernel, csrc/libtorch_stable/cache_kernels.cu).
+- Exact-token (1000 in / 300 out, temp 1.0/top-p 0.95/top-k 20 seed 42,
+  no spec), TP4, aggregate output tok/s:
+  | arm                          | c1  | c8   |
+  | TP experts (no EP)           | 5.4 | 41.6 |
+  | EP (--enable-expert-parallel)| 5.4 | 40.7 |
+- Verdict: PARITY within single-run noise at the bring-up config. This
+  is -O0 eager (no cudagraphs, eager python mHC, dense MLA) at tiny
+  batch - dispatch-path differences may only separate under the
+  optimized profile at real concurrency. Default stays EP OFF (simpler
+  path) for bring-up; REVISIT the A/B after compile/cudagraphs + sparse
+  attention land. Raw: perf/results/2026-09-01/glm53-ep-ab/.
+- Absolute numbers are bring-up-grade only (~5 tok/s c1): eager mHC
+  (python sinkhorn per site per layer) and -O0 dominate; not a baseline.
+
+### GLM-5.3: eager retired - fused mHC + compile + cudagraphs (operator directive)
+- Operator: no eager paths, ever; only the optimized stack. The decoder now
+  uses the fork's fused mHC ops (MHCPreOp / MHCFusedPostPreOp / MHCPostOp ->
+  quixicore dsv4_mhc_* CUDA kernels on Ampere, hidden 4096 / hc_mult 4 -
+  the same geometry as DSV4), with DSV4's chaining: first-layer pre on the
+  expanded [T,4,D] streams, fused post+pre at every later site, final post,
+  then GLM's unweighted mean head. hc params are flat float32 on the layer
+  (checkpoint names load directly).
+- Boot at the default optimization level with FULL_DECODE_ONLY cudagraphs
+  (capture 64), TRITON_MLA (explicit), marlin NVFP4 MoE: healthy, canary
+  coherent. Exact-token 1000/300, TP4, no spec:
+  | config              | c1   | c8    |
+  | eager -O0 (retired) | 5.4  | 41.6  |
+  | fused mHC + graphs  | 74.1 | 343.6 |
+  Still dense NoPE MLA (bring-up); not a baseline until sparse lands.
+- NoPE sparse decode kernel: mla_decode_fp8_v<true,false,512,512,0,0>
+  bound as mla_decode_bf16_sparse_nope (q/slot 512 bf16, no rope segment;
+  the template's static_assert(VW <= QW) admits it), python wrapper, and
+  QUIXICORE_MLA_SPARSE dispatches on q width 512. Unexercised until the
+  pooled indexer feeds topk_indices_buffer.
+
+### GLM-5.3 EP on/off A/B on the OPTIMIZED path: TP experts wins
+- Same exact-token harness (1000/300, seed 42), compile + FULL_DECODE_ONLY
+  graphs, fused mHC, marlin NVFP4 MoE, dense NoPE MLA:
+  | arm                | c1   | c8    |
+  | TP experts (no EP) | 74.1 | 343.6 |
+  | EP                 | 70.0 | 330.4 |
+- EP is 4-6% slower at both concurrencies: with 288 experts and
+  moe_intermediate 2048 the TP shard (512/rank) stays block-aligned for
+  NVFP4 group-16 scales, so EP buys no correctness and its all2all
+  dispatch costs more than the sharded GEMM saves here. Profile default:
+  enable_expert_parallel OFF. Raw: perf/results/2026-09-01/glm53-ep-ab-opt/
+  (EP) and glm53-opt-dense/ (TP).
+
+### GLM-5.3 sparse DSA path live: pooled indexer + NoPE sparse MLA
+- vllm/model_executor/layers/glm5_next_indexer.py: per-token indexer
+  state [k_norm(wk x) | x @ compress_gate^T] cached as a 256-bf16 paged
+  group (Glm5NextIndexerBackend/Cache over the DSV3.2 indexer metadata);
+  a paged Triton kernel computes pooled logits straight from the block
+  table (4-token pools: softmax(gate + ape) weighted keys, relu-scaled
+  head scores, weight-summed), the existing per-row top-k kernel ranks
+  POOLS (fills -1 on short rows), and a second Triton kernel expands pools
+  to tokens and appends the incomplete tail. One custom op (compile-opaque,
+  decode-graph-captured with a fixed logits workspace).
+- Parity vs transformers' Glm5NextTextIndexer on random weights: exact
+  selected-token sets on all 61 rows incl. tail (tests/glm5_next/).
+- Boot: QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, compile +
+  FULL_DECODE_ONLY graphs: healthy; 6,396-token planted-fact recall PASS
+  (selection over 1,599 pools); exact-token c1 70.1 / c8 331.4 tok/s
+  (dense was 74.1 / 343.6: ~5% at 1K context, the cost of indexing that
+  sparse repays at depth). Raw: perf/results/2026-09-01/glm53-opt-sparse/.
+
+### GLM-5.3 vision tower live (text + image validated)
+- vllm/model_executor/models/glm5_next_vision.py: Qwen2VL-family ViT
+  ported from the reference with GLM-5.3 specifics - per-head RMSNorm
+  q/k norms, SwiGLU-limit clamped MLPs with biases, no absolute pos
+  embed, post-layernorm -> 2x2 Conv2d downsample -> gated merger (proj +
+  LayerNorm + GELU + clamped SwiGLU) -> 4096-wide tokens. Packed varlen
+  attention via MMEncoderAttention, 2D rotary via get_rope(partial 0.5)
+  with the merge-window-major (h,w) ordering.
+- Glm5NextForConditionalGeneration + processing classes over the
+  transformers Glm5NextProcessor (pixel_values + image_grid_thw; GLM's
+  smart_resize with min/max IMAGE TOKENS 16/8000 then pad-to-canvas);
+  placeholder markup <|begin_of_image|><|image|><|end_of_image|>, the
+  <|image|> token expanded per merged patch.
+- Boot (sparse config, limit 2 images): 0 unmatched weights. Canaries:
+  text "Paris"; solid red -> "Red"; two-half image -> "left: red, right:
+  blue" (position-sensitive: rules out rope/merge-order errors).
+- Indexer fix en route: k_norm as fp32 functional layer_norm (bf16
+  LayerNorm params vs fp32 input raised under the multimodal path).
+
+### glm53-nvfp4-4 registered and boots through SlimServe at the 1M model default
+- Source glm53-flash-nvfp4 (safetensors, 198 GB, 20 files) + profile
+  glm53-nvfp4-4/a100: TP4, EP off (measured), QUIXICORE_MLA_SPARSE +
+  sparse_mla_force_mqa, block 64, kv auto, marlin NVFP4 MoE, FULL_DECODE_ONLY
+  graphs (64), limit 2 images, glm47 reasoning + tool parsers, prefix
+  caching/thinking/auto tools via serving defaults. Non-speculative until the
+  MTP head is ported (checkpoint ships model_mtp.safetensors).
+- Boot via `slimserve glm53-nvfp4-4 --serve`: max_seq_len 1,048,576 from
+  config.json (no cap needed: ~17 KiB/token per rank), GPU pool 1,275,743
+  tokens = 1.22x concurrency at full context. Canaries: "Paris" with parsed
+  reasoning; spatial image "left: red, right: blue"; tool call
+  get_weather({"city": "Paris"}) with finish_reason tool_calls.
+- Host tier NOT on this record (test carve-out + note): the generic packed
+  slab planner assumes one block size across groups, but this layout mixes
+  KDA state pages with 64-token MLA/indexer pages and mis-sized the
+  attention views ('[544, 64, 256]' vs 262144 elements). The rtx3090
+  GDN+attention profile uses the dedicated CSA-linear planner; generalizing
+  that to KDA+MLA and running the eviction acceptance is the follow-up.
+
+### glm53-nvfp4-4 WildChat deep-context leg: PASS
+- Standard sweep runner (c8, ctx-target 1M, 1.25h cap) on the registered
+  profile: 0 errors, 19/19 recall probes (31K -> 114K context), all 8
+  sessions ran the full wall, max_ctx 131,680 / median 116,208 - roughly
+  2-3x the depth the GLM-5.2 records reach in the same window, on the
+  sparse DSA path with real pool selection throughout. Raw:
+  perf/results/2026-09-01/glm53-leg/glm53-nvfp4-4/.
+- With this the record meets the profile-validation bar (text + image
+  requests, WildChat at concurrency 8, model-default context). Open on the
+  record: host tier (mixed-block-size packed planner) and MTP speculative
+  decoding.
+## 2026-09-02 - qwen38fn-fp8-8/rtx3090: fp8 (e4m3) main KV restored and requalified; bf16 mandate reversed
+
+- Operator directive: "we are using FP8 kv cache - that's as opposed to
+  TurboQuant or BF16", and "I think I overreacted to set BF16 mandatory".
+  The 2026-08-29 rtx3090 bf16 mandate is reversed; TurboQuant is NOT the
+  answer for this profile's main KV (an interim TQ edit was reverted on
+  the operator's word before any run).
+- Baseline (bf16 KV, deployed prod, 2026-08-28/29): GPU pool 3.64 GiB/rank
+  = 269,155 tokens = 1.03x one max-length request; exact 1000/2000 seeded
+  c1 129.8-157.8 (median 139.7) / c8 590.7-600.5 / c32 1,091.8-1,199.8.
+- Hypothesis: the fp8-e4m3 main-KV path (removed 2026-08-27, de0b2af8a,
+  when TQ dominated it pre tile-fix) halves the dominant QSA slab and,
+  with the quantized-KV tile fix already in the kernel (block_n 16 /
+  4 warps for KV_FP8 too), no longer pays the wide-tile collapse that
+  produced its old -25% c8.
+- Implementation: reverse-applied de0b2af8a's deletions (env, layer +
+  backend acceptance, aligner branch, arithmetic e4m3 Triton decoder,
+  uint8 view for Triton-on-SM86), then made the profile's own
+  `kv_cache_dtype: fp8` drive it: the QSA layer accepts fp8/fp8_e4m3
+  from cache_config and allocates float8_e4m3fn for the main KV only
+  (indexer compressed cache, raw-key ring, GDN state keep their dtypes);
+  the aligner's page recompute keys off the same selector (a no-op for
+  the profile path, which the generic fp8 sizing already gets right).
+  VLLM_QWEN4_EXP_FP8_MAIN_KV=1 remains the equivalent layer-scoped
+  diagnostic. Parity test restored as tests/models/qwen4_exp/
+  test_qsa_fp8_kv.py plus an all-256-codes e4m3 decode exactness test.
+  Policy: test_no_profile_quantizes_main_kv replaced by
+  test_quantized_main_kv_is_an_explicit_validated_choice (quantized main
+  KV allowed anywhere with a note; rtx3090 record pinned to fp8, no TQ
+  env). 73 slimserve + 128 qwen4_exp tests green.
+- Boot (temp server, port 8001, prod stopped): attention block 800 tokens
+  (bf16: 400) at the same page bytes; Available KV 3.64 GiB/rank ->
+  GPU KV cache 496,174 tokens, 1.89x one max-length request (bf16 1.03x).
+  Graphs 0.47 GiB, activation 0.9, weights+non-torch 18.07 - unchanged.
+- Correctness: host-tier eviction-restore recall (tier_acceptance_8001.py,
+  8K/24K/42K markers, 6x55K churn) PASS - restores 0.5-0.9 s, restored
+  answers match the hot controls (the 24K hot control itself missed, as
+  it has in earlier bf16 runs; restored matched it). Multi-turn
+  state-tracking (6-turn inventory chat, 5 tracked mutations, seeds
+  42/43/44 at temp 1.0) PASS 3/3.
+- Throughput (exact 1000/2000, temp 1.0/top_p 0.95/top_k 20):
+  | c  | fp8 seed42 | fp8 seed43 | bf16 reference          | accept (fp8) |
+  | 1  | 135.7      | -          | 129.8-157.8 (med 139.7) |              |
+  | 8  | 594.2      | 590.4      | 590.7-600.5             | 63.9-66.9%   |
+  | 32 | 1,016.6    | 1,100.9    | 1,091.8-1,199.8         | 58.5-61.9%   |
+  bf16 c8 acceptance was 64.3%: draft acceptance is at parity.
+- Reading: c1 and c8 at parity with bf16. c32 is ~7-8% under bf16 seed
+  for seed (1,016.6 vs 1,091.8; 1,100.9 vs 1,199.8) - the residual cost
+  of the arithmetic e4m3 decode (SM86 has no fp8 cvt) at the 96-row
+  verify width. The old -25% c8 is gone with the tile fix. Next lead to
+  close the c32 gap: replace the ALU decode with a 256-entry LUT or a
+  tighter bit-twiddle in _e4m3_to_bf16 (the 2026-08-27 entry's own
+  follow-up), then re-run c32.
+- Decision: RETAINED. Profile qwen38fn-fp8-8/rtx3090 now states
+  kv_cache_dtype fp8; GPU-resident capacity 1.84x for a c32-only ~7%
+  cost. Production unit was stopped on the operator's instruction and
+  NOT restarted; next command: `sudo systemctl start slimserve-qwen38fn`
+  (the unit runs `slimserve qwen38fn-fp8-8 --serve` and picks up the
+  profile), then confirm "GPU KV cache size: 496,174 tokens" in
+  /var/log/SlimServe/serve.log.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_fp8kv_8001.log,
+  tier_acceptance_fp8kv.log, multiturn_fp8kv.log, bench_fp8kv_c{1,8,32}
+  .log, bench_fp8kv_c{8,32}_seed43.log, run_bench.sh, scripts).
+
+## 2026-09-02 - Host tier 64 -> 88 GiB/rank; pinned-arena power-of-two rounding ROOT-CAUSED and fixed
+
+- Goal (operator): grow the host KV tier as far as the box allows; the
+  operator picked 104 GiB/rank.
+- Baseline: 64 GiB/rank = 11,471 slots x 800 tokens (fp8 KV) = ~9.2M
+  tokens; MemAvailable ~390 GB with prod up.
+- 104 GiB/rank: boot OOM-killed (dmesg: "Out of memory: Killed process
+  VLLM::Worker_TP", shmem-rss 170 GB for the victim). 88 GiB/rank: same
+  kill, and the kernel process table showed every worker at ~121 GB of
+  shmem-backed RSS with 959 GB mapped system-wide - far above the 704 GiB
+  + 48 GiB PLE that 88/rank should cost.
+- ROOT CAUSE: torch's caching pinned allocator rounds pin_memory=True
+  allocations up to the next power of two. 88 and 104 GiB both became
+  128 GiB/rank = 1 TiB across 8 ranks on a 995 GB box; 64 GiB only ever
+  fit because it IS a power of two. Measured directly: a 3 GiB
+  pin_memory tensor took 4,190 MiB of MemAvailable; the same 3 GiB as a
+  plain tensor + cudaHostRegister took 3,118 MiB.
+- FIX (vllm/v1/worker/gpu/kv_tier_dma.py): the arena is a plain host
+  tensor page-locked with cudaHostRegister (portable), exact size;
+  fallback to pin_memory with a warning if registration is refused.
+  KVTierDMA.release() drains and unregisters BEFORE the storage can be
+  freed (the PLE dangling-pinned-page lesson), called from the
+  connector's shutdown and __del__. Regression test: a 1.5 GiB arena
+  must cost 1.5 GiB, not 2 (tests/v1/worker/test_kv_tier_dma.py).
+- Result at 88 GiB/rank (temp server, port 8001): arena 15,773 slots x
+  5,990,400 B (88.0 GiB pinned) per rank = ~12.6M tokens; MemAvailable
+  188 GB with the server up (Shmem 49 GB = PLE table; registered pages
+  are anon, not shmem). Tier acceptance PASS at 8K/24K/42K: restores
+  0.9/1.9/0.9 s vs cold 2.2/6.1/10.0 s, all three recalls correct hot and
+  restored. c8 exact bench 568.8 tok/s (band 547-600; the tier-64 fp8 c8
+  runs were 594.2/590.4) - within run-to-run spread, tier remains
+  throughput-neutral.
+- Decision: 88 GiB/rank RETAINED in the profile (operator asked for 104:
+  with exact sizing that would leave ~60 GB MemAvailable, which is too
+  little margin for prefill staging and page cache on a production box;
+  96 would leave ~124 GB and is the most I would run - operator's call).
+- Artifact note: run_bench.sh reuses bench_fp8kv_c8.log, so the tier-64
+  seed-42 c8 raw log was overwritten by this run and renamed
+  bench_fp8kv_c8_tier88.log; its numbers (594.2 tok/s, accepted
+  8,975/14,046) are recorded in the previous entry and the baseline.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_fp8kv_tier104_8001
+  .log, serve_fp8kv_tier88_8001.log = OOM boots; serve_fp8kv_tier88_fix_
+  8001.log, tier_acceptance_fp8kv_tier88.log, bench_fp8kv_c8_tier88.log).
+
+## 2026-09-02 - NVMe KV tier (third tier) built, unit-proven, live promotion validated under sampling
+
+- Goal (operator): "add nvme offloading" below the pinned-host tier.
+- Design (see the module docstrings): write-through, demotion, promotion.
+  * kv_tier_index.py: every host slot staged for a trajectory gets a disk
+    slot; take_disk_writes() hands (host, disk) pairs to the worker one
+    confirmation after the GPU -> host copy; confirm_disk_writes() clears
+    them once EVERY TP rank reports (HostTierStats rides the connector
+    stats channel, summed by the executor's KVOutputAggregator). Host
+    reclaim demotes a fully-on-disk trajectory (host slots freed, disk
+    copies and resumability kept) and deletes an unwritten one; disk
+    reclaim is LRU per trajectory and kills a disk-only one. A hit on a
+    disk-only position calls promote(): fresh host slots, pending until
+    the request's finished_recving, with (disk, host) reads for the worker.
+  * kv_tier_nvme.py: per-rank O_TMPFILE (vanishes with the process, no
+    collisions between servers) opened O_DIRECT, posix_fallocate'd, a
+    4-thread pool doing pwritev/preadv on arena rows; buffered/named
+    fallbacks with a log line.
+  * kv_tier_dma.py: arena rows are 4 KiB-aligned and padded to a page
+    multiple (5,990,400 -> 5,992,448 B, +0.03%) so a row is a legal
+    O_DIRECT buffer and a file slot; disk writes wait on the copy-stream
+    event of the batch that filled the row; a restore batch carrying (or
+    following) its request's disk reads is DEFERRED until those reads
+    land, then issued to the copy stream as usual; a failed read reports
+    the target GPU blocks through get_block_ids_with_load_errors so the
+    scheduler recomputes instead of reading garbage.
+  * Config: kv_connector_extra_config.nvme_tier_gb_per_rank (0 = off);
+    directory from operator env SLIMSERVE_KV_TIER_DIR (else
+    $SLIMSERVE_CACHE/kv-tier, else ~/.cache/slimserve/kv-tier) - no host
+    path in the profile, per the deployment-config rule.
+- Along the way: cudaHostRegister on a page-aligned sub-view reported
+  is_pinned()=False (a view answers for its storage base), which silently
+  fell back to the power-of-two allocator and then unregistered a
+  cudaHostAlloc pointer, leaving a sticky "invalid argument" for the next
+  CUDA call. Fixed by registering the whole raw buffer and unregistering
+  by that pointer.
+- Tests: 117 green across tests/v1/core (index disk tests: write-through,
+  demotion, promotion + rollback, disk reclaim, tail replacement;
+  connector disk tests: rank-counted confirmation, demotion -> promotion
+  -> finished_recving), tests/v1/worker (NVMe engine round trip, DMA
+  write-through -> promote -> restore bytes, later chunk waits for reads,
+  failed read -> invalid blocks) and tests/slimserve.
+- Live A (port 8001, prod stopped; host tier 2 GiB/rank = 358 slots so
+  the acceptance churn evicts everything; NVMe 32 GiB/rank on the root
+  NVMe): marker recall PASS at 8K/24K/42K, all three restored FROM DISK
+  (log: "promoting ... from NVMe: 13/33/56 reads") in 1.3/1.5/2.5 s vs
+  cold 2.1/6.0/10.0 s and host-tier 0.9/1.9/0.9 s. IO engine: O_DIRECT,
+  4 threads/rank. No errors, no invalid-block reports.
+- Live B (registered profile: host 88 + NVMe 128 GiB/rank): boot OK
+  (22,935 disk slots/rank; MemAvailable 187 GB; root fs 1.3 TB free
+  after fallocate); sampled acceptance 8K/42K OK, 24K restored '' while
+  the hot control answered - the same 24K prompt returned '' on the HOT
+  control in the tier-64 run, so this is sampling behaviour at that
+  prompt, not attributed to the tier; c8 exact 559.5 tok/s (tier-88 no
+  NVMe: 568.8; band 547-600) - write-through is throughput-neutral
+  within spread on one sample each. "KV Transfer metrics:
+  disk_write_batches=N" now appears in the interval log.
+- Greedy diagnostic (A config, diagnostic-only temperature 0): 8K
+  restored byte-identical to hot; 24K/42K share the same opening (the
+  first ~100 chars) and diverge later. Byte identity was never
+  guaranteed: a resume re-prefills the gap above the tail boundary with
+  a different chunk split (the 2026-08-28 bf16 host-tier validation saw
+  42K diverge the same way). The sharpened check (codename recalled AND
+  opening identical) was launched twice and stopped both times before
+  boot completed - it remains OWED for both configs, along with a second
+  c8 sample. Until it runs, the NVMe path's evidence is the sampled
+  acceptance above (the same standard the host tier shipped on).
+- Decision: RETAINED in the profile (nvme_tier_gb_per_rank 128 on the
+  root NVMe). nvme1n1 (3.7 TB, blank, gen3 x2, 1.6 GB/s read) is the
+  intended dedicated device once the operator formats it; then set
+  SLIMSERVE_KV_TIER_DIR to its mount in /etc/slimserve/env and raise the
+  size (460 GiB/rank = ~66M tokens).
+- Next commands:
+    bash perf/results/2026-09-02/qwen38fn-fp8kv/run_nvme_exact.sh
+      (both configs, greedy recall + c8; ~15 min, port 8001)
+    sudo systemctl start slimserve-qwen38fn   (prod, when satisfied)
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A,B}_8001
+  .log, tier_acceptance_nvme_{A,B}.log, tier_exact_nvme_A.log,
+  bench_fp8kv_c8_nvme.log, run_nvme_validation.sh, run_nvme_exact.sh,
+  tier_exact_8001.py).
+
+
+## 2026-09-02: GLM-5.3 8-GPU configuration matrix - first pass was a measurement artifact
+
+- First matrix (TP8, TP8+EP, TP4xDP2, TP4xDP2+EP; exact-token 1000/300 at
+  c1/c8/c16) read TP8 at 10.3 / 71.1 / 124.4 tok/s - 7x SLOWER than TP4 -
+  and identical with EP (10.2 / 70.5 / 123.5), so the MoE shard width was
+  not it. Topology exonerated (full NV12 mesh). DP2 arms died on a fresh
+  regression of mine (support_torch_compile wants vllm_config by keyword).
+- Profiling (torch profiler, rank 0, 32 c1 decode tokens after warmup):
+  TP8 step median 9.5 ms (~105 tok/s) vs TP4 10.7 ms (~93 tok/s) - TP8
+  is FASTER once warm. The matrix's 10 tok/s was cold Triton autotune /
+  compile of never-seen 8-rank shapes running inside the measured window
+  (the arm only ran an 8-token canary first). Every arm now warms c1/c8/
+  c16 before measuring; the same rule applies to all future baselines.
+- Two real fixes fell out of the profile:
+  1. My pooled-indexer expand kernel parked the tail pool at column 2048,
+     so the sparse decode kernel's tlen (last valid + 1) was always >= 2049
+     and it walked every padded slot: mla_decode_fp8_v cost 258 us/call
+     at TP8 for a 40-token context. Tail now follows the last valid
+     expanded entry: 130 us/call, kernel time per step -26%. Parity test
+     still exact.
+  2. torch.compile was never active on glm5_next (no support_torch_compile;
+     DSV4's A100 model is not compiled either). Enabled: the quixicore mHC
+     kernels are wrapped as registered custom ops with fake impls
+     (layers/glm5_next_mhc_ops.py) so Dynamo can trace the decoder. c1
+     TP4: 70 -> ~93 tok/s from compile alone.
+- Remaining per-token cost at TP8 (rank 0): custom allreduce 1stage<8>
+  21% (~28 us/call x 91/token; the 1-stage algorithm reads N-1 peers, so
+  8 ranks pay ~2x TP4's 4-rank calls), fused mHC pre-transition 14%,
+  sparse decode 12%, marlin MoE 11%, cuBLAS GEMV 13%. Matrix v2 (with TP4
+  reference) running to pick the 8-GPU record.
+
+## 2026-09-03: torch.compile on glm5_next produced garbage tokens - two tracing faults, fixed
+
+- CORRECTION to the entry above: the "+33% from compile" TP4 step-rate
+  and the TP8 9.5 ms profile were measured on a model emitting garbage
+  (`!!!!!!!!`). Neither profile run checked text. Every arm now aborts on
+  a bad canary before it measures anything.
+- Bisect (TP4 boots, 2 at a time on GPU halves): compile off with the
+  tail fix + mHC op wrappers -> clean; compile on -> garbage; Dynamo-only
+  (mode 2) -> garbage; inductor with every vLLM fusion pass off ->
+  garbage. So a tracing fault, not codegen.
+- Fault 1: the pooled indexer op mutates topk_indices_buffer, which the
+  sparse attention op (a splitting op, i.e. the NEXT subgraph) reads
+  through a side channel. fix_functionalization left it as an
+  auto_functionalized node with only a warning ("inductor will fail" -
+  it no longer does, it lowers copy-in/copy-out and the write never lands
+  where the reader looks). Fixed by listing vllm::glm5_next_pooled_indexer
+  in CompilationConfig._attention_ops (upstream does the same for
+  sparse_attn_indexer), and the leftover warning is now a hard error.
+- Fault 2 (the one that actually produced the garbage): the fork's
+  KimiGatedDeltaNetAttention core (_forward) reads get_forward_context()
+  and the per-layer GDN metadata directly in Python; no custom op wraps
+  it (Kimi-K3 is never compiled here). Dynamo traced the dummy run's
+  metadata into the graph. vllm::kda_attention was already in the
+  splitting list but no op of that name existed. Registered it
+  (mutates core_attn_out, looks the layer up by prefix in
+  no_compile_layers) and routed the layer through it; the eager Kimi path
+  runs the same op body unchanged.
+- Result: TP4 + compile canary clean ("Paris, a city with a population
+  of over", fibonacci body). Matrix v3 (tp8, tp8-ep, tp4dp2, tp4dp2-ep,
+  tp4 reference) relaunched with warmup + canary guard; all earlier
+  compile-on numbers are void.
+
+## 2026-09-03: GLM-5.3 sparse decode kernel - the real TP8 (and TP4) pathology
+
+- With compile fixed, TP8 c1 still read 10.6 tok/s (matrix v3). Request-
+  side experiment on one TP8 boot with the arm's flags: short prompt 67
+  tok/s, 1000-token prompt 11.4 tok/s. Prompt sweep: decode cost grows
+  ~75 us per context token per step and saturates at the 2048 top-k
+  (155 ms/token). TP4 with the same code: identical curve (84 ms/token at
+  991 tokens). Not TP-specific at all; the 09-02 TP4 70.1 tok/s baseline
+  is not reproducible with the current code and is treated as suspect.
+- Cause: py_mla_decode_bf16_sparse_nope launched mla_decode_fp8_v
+  UNPARTITIONED (one 32-thread warp per (head, token) walking the whole
+  selected list) and the NFP8 == 0 (bf16) row path was the scalar
+  fallback: per selected token, index load -> block-table load -> sixteen
+  64-byte rounds, fully serialized. Microbench (GPU 7, B=1, random KV):
+  H=8 L=2048 7,494 us per call; x11 layers = the observed 80+ ms.
+- Fix 1: partitioned launch + paged_attention_reduce, exactly the GLM fp8
+  path's remedy (which had found the same 48%-of-decode pathology in
+  2026-08). Fix 2: VECBF16 path in mla_kernels.cuh for SPARSE && NFP8==0:
+  32 indices resolved lane-parallel per round, each 1 KB row as two
+  16-byte loads per lane, 4 rows in flight, identical sequential online
+  softmax. Covers the NoPE 512 (GLM-5.3) and bf16 576 (GLM-5.2 bf16 KV,
+  glm52-q2k-8) geometries; the fp8 and DSV4 paths are untouched.
+- Microbench per call (us), H=8 / H=16:
+  | L    | unpart before | unpart after | P256 after | P128 after |
+  | 40   | 192 / 159     | 28 / 23      | 19 / 16    | 22 / 19    |
+  | 1000 | 4404 / 3785   | 559 / 453    | 82 / 66    | 57 / 46    |
+  | 2048 | 7494 / 7732   | 1138 / 919   | 138 / 120  | 74 / 75    |
+  Backend uses partition_size=128. Parity: tests/kernels/
+  test_quixicore_sparse_mla_bf16.py (9 tests: both geometries, P0/P256/
+  P128, interleaved -1 holes, empty rows) at 2e-3 rel vs fp32 torch,
+  identical to the pre-change error; partitioned vs unpartitioned 2.4e-4.
+- Server-side, partition alone (P256, before the row path): TP4 sweep 991
+  tokens 20.3 ms/token (49 tok/s) from 84; profile at 1000 ctx put the
+  kernel at 43.6% of kernel time (1.27 ms/call). Matrix v4 (tp8, tp4,
+  tp8-ep, tp4dp2, tp4dp2-ep) running with both fixes.
+- Owed: glm52-q2k-8 (bf16 KV, TP8) shares the launch and now the row path
+  - its exact-token c1 needs re-measuring; expect a large gain.
+
+## 2026-09-03: GLM-5.3 8-GPU configuration matrix v4 - decision: glm53-nvfp4-8 = TP8, EP off
+
+Exact-token 1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20 seed 42,
+each concurrency warmed first, canary-guarded, compile on, partitioned +
+vectorized sparse decode. Raw: perf/results/2026-09-02/glm53-8gpu-matrix/
+<arm>/exact_c{1,8,16}.json (v4 overwrote the void v1 numbers in place).
+
+| arm            | c1   | c8    | c16   |
+|----------------|------|-------|-------|
+| tp8            | 83.0 | 343.7 | 447.7 |
+| tp8-ep         | 75.3 | 331.1 | 430.8 |
+| tp4dp2         | 67.2 | 382.8 | 527.6 |
+| tp4dp2-ep      | 51.3 | 317.0 | 480.1 |
+| tp4 (4 GPUs)   | 73.6 | 282.6 | 369.9 |
+
+- EP loses at every point on both 8-GPU layouts (as it did at TP4 on
+  09-02): the 288-expert MoE at 36 experts/rank is not routing-bound, and
+  EP adds the all-to-all on top of the same GEMMs.
+- TP8 vs TP4: +13% c1, +22% c8, +21% c16. Below the 50% scaling gate.
+  Sharded work (marlin MoE, GEMVs, KDA, attention) halves per rank; the
+  replicated per-rank work does not: 91 custom allreduces/token at 8
+  ranks (1-stage reads 7 peers), the mHC stream kernels (T x 4 x 4096 per
+  layer, replicated on every rank), the pooled indexer (replicated). That
+  fixed cost is why TP4xDP2 - two independent TP4 engines - wins c8/c16
+  by 11-18% while losing c1 by 19%.
+- Decision: TP8, EP off. Single-stream latency is best, and DP2 splits the
+  prefix cache and KV pool across two engines with no prefix-aware
+  routing - for the agentic traffic the serving policy is written for
+  (long shared prefixes, near-100% hit rate) that is the wrong trade.
+  DP2's throughput lead is recorded as the size of the TP8 fixed-cost
+  gap; fusing the mHC transition with the allreduce (the DSV4 path's
+  approach) and de-duplicating the replicated indexer are the next items.
+- glm53-nvfp4-4 re-measured on the same stack: 73.6 / 282.6 / 369.9 vs the
+  09-02 record 70.1 / 331.4 / -. c1 up with the kernel fix + compile, c8
+  DOWN 15%: not yet explained (the 09-02 c8 predates the tail fix, compile,
+  and the partitioned kernel). Owed: a c8 profile at TP4 to find it.
+- Follow-up on the 09-01 TP4 c8 331.4: its deep-context leg the same day
+  averaged ~14 tok/s aggregate at c8 near 116K context (62,538 completion
+  tokens in the 1.25 h wall), consistent with the OLD unpartitioned
+  kernel walking the full 2048-entry selection at depth. Only the 1000-
+  token c8 (7.2 s wall for 8 x 300 tokens) does not fit the old kernel's
+  measured per-token cost; it stays UNEXPLAINED and is not used as a
+  baseline. Today's 282.6 is the number of record for glm53-nvfp4-4 c8.
+
+## 2026-09-03: glm53-nvfp4-8 through the real profile - indexer cost was proportional to max_model_len
+
+- First boot of the record (TP8, EP off, model-default 1,048,576 context,
+  max_num_seqs 32): canaries pass (text + reasoning, image "a red
+  square", get_weather tool call) but exact-token c1 / c8 / c16 read
+  32.8 / 47.2 / 48.7 - flat across concurrency, ~20 ms per sequence per
+  step. The arm had measured 83 / 344 / 448 with the same flags at
+  max_model_len 32768.
+- Cause: _pooled_logits_kernel launched grid (R, max_pools / 16) with
+  max_pools = max_model_len // 4: 16,384 programs per row per layer at
+  1M, every one reloading q (32 KB) and APE, running a tl.dot on masked
+  zeros and storing -inf logits the top-k never reads (~600 MB of reads
+  per row per layer). Fixed grid of 128 programs per row, each striding
+  over the row's ACTUAL pool tiles, q/APE loaded once per program. Parity
+  vs the transformers indexer unchanged (tests/glm5_next).
+- Same profile after the fix: c1 84.0 / c8 412.3 / c16 575.8 tok/s.
+  Raw: perf/results/2026-09-03/glm53-nvfp4-8-baseline/. The arms also
+  paid this (512 programs/row at 32K), so the matrix table above
+  understates every arm at c8/c16; the ordering (EP off, TP8 vs DP2 on
+  c1 + cache locality) is unchanged and TP8 now leads DP2's old c16 too.
+- glm53-nvfp4-4 is being re-measured through its profile on this stack
+  for the scaling comparison.
+
+### glm53-nvfp4-8 deep-context leg (WildChat c8, 1.25 h): PASS
+- 0 errors, 34/34 recall probes, max ctx 202,509 / median 190,704 (the
+  TP8 pool is twice the TP4 record's, so sessions ran ~60K deeper than
+  the TP4 leg's 131,680 max). 97,378 completion tokens over the 4,554 s
+  wall vs the TP4 leg's 62,538 (+56% at depth, where the partitioned
+  sparse decode does the most work). 131K-200K bucket: TTFT p50 59 s,
+  e2e p50 279 s (72 turns). Raw: perf/results/2026-09-03/glm53-leg/
+  glm53-nvfp4-8/. Text and image canaries under load: see post_evidence.
+
+## 2026-09-03: fused allreduce + mHC transition for GLM-5.3 - REJECTED (no gain), plus a compile-cache A/B hazard
+
+- Hypothesis: TP8's replicated per-rank cost (91 custom allreduces per
+  token, replicated mHC) is the scaling gap; DSV4's A100 path fuses the
+  allreduce into the mHC transition (custom_all_reduce all_reduce_dsv4_mhc,
+  single-token steps). Implemented for glm5_next: o_proj and MoE reduce
+  deferred into a glm5_mhc_ar_fused_post_pre op (fused op at T == 1,
+  allreduce + fused kernel otherwise).
+- Measured at TP8, arm launch (32K, exact-token): fused c1 85.5 / c8 421.0
+  (registered-buffer variant), copy-in variant 84.7 / 422.6, vs the
+  committed path 84.0 (profile) - within noise. The merged kernel saves one
+  launch per site but the mHC math is still replicated on every rank; the
+  win DSV4 gets comes from channel OWNERSHIP (each rank transitions a
+  4096/TP slice, VLLM_DSV4_TP_OWNERSHIP), a much deeper integration
+  (owned projections, Q2 progress schedule) than the transition op alone.
+  Dropped; the tree carries none of it.
+- Hazard found while A/B-ing: an env-gated branch inside a
+  torch.compile'd forward (VLLM_GLM5_FUSED_MHC_AR read in __init__, traced
+  as a constant) does NOT change the compile cache key - the key is
+  envs.compile_factors() (a fixed VLLM_* list) + config + compiler + the
+  traced files' contents. The "unfused" arm loaded the fused arm's graph:
+  identical degenerate greedy texts in both, and the committed tree was
+  clean. Rule: A/B compiled paths only via distinct code (git stash/
+  worktree) or a factor that is in the cache key; never a private env var.
+- Next for the TP8 scaling gap: measure first - a TP8 profile at 1000-token
+  context on the current stack to size allreduce / mHC / indexer shares -
+  then channel ownership if the replicated mHC dominates.
+
+## 2026-09-03: glm52-q2k-8 (bf16 KV, TP8) first exact-token numbers - the same unpartitioned launch
+
+- Through the profile (202752 ctx): c1 9.6 / c8 64.7 / c16 110.4 tok/s;
+  text (+reasoning), image, tool canaries pass. Raw: perf/results/
+  2026-09-03/glm52-q2k-8-prepartition/. This record never had an exact-token
+  baseline (only its 2026-08-30 deep-context leg).
+- The bf16 GLM 576 entry point (mla_decode_bf16_sparse_glm) got today's
+  VECBF16 row path but was still launched unpartitioned: 8 local heads x
+  one warp each walking the whole selection across GLM-5.2's MLA layers.
+  Partitioned launch (P128 + reduce, exactly the fp8 GLM and NoPE fix)
+  added; re-measure follows.
+
+## 2026-09-03: TP8 kernel profile at 1000-token context (current stack) - the remaining budget
+
+Torch profiler, rank 0, 32 decode tokens after a 1000-token prompt, arm
+launch. Kernel time 514 ms (the window also caught the prompt's prefill:
+the partials<24> and 2stage-allreduce rows are prefill-only). Decode per
+token, approximate:
+
+| kernel                              | share | ms/token | per call        |
+|-------------------------------------|-------|----------|-----------------|
+| Marlin NVFP4 MoE (W4A16)            | 13.4% | 2.15     | 84 calls, 26 us |
+| cuBLAS GEMV (q/kv/KDA/o projections)| 13.1% | 2.1      | ~280 calls      |
+| mHC fused_pre_transition (T=1)      |  8.4% | 1.35     | 90 calls, 16 us |
+| sparse MLA decode (P128) + reduce   |  7.0% | 1.1      | 11 calls, 84 us |
+| pooled indexer logits               |  4.5% | 0.72     | 11 calls, 65 us |
+| custom allreduce 1stage<8>          |  4.1% | 0.65     | 88 calls, 7 us  |
+| direct_copy (contiguous() etc.)     |  3.3% | 0.53     | ~150 calls      |
+| MoE topk / align / gemm tails       |  ~7%  | 1.1      |                 |
+
+- Wall 16.4 ms/token under the profiler vs 11.9 ms in the exact bench
+  (84 tok/s); the profiler's own overhead is the difference.
+- The 8-rank allreduce is no longer a problem (7 us per call; it was 28
+  us before the sparse-decode fix removed the stall that was inflating
+  it). The TP-invariant residue is mHC (1.35) + indexer (0.72) + AR
+  (0.65) + copies (0.53) = 3.3 ms of ~12, i.e. the 25-30% TP4->TP8
+  scaling shortfall, spread over four items.
+- Ranked next items (gain / effort): (1) the ~150 direct_copy launches per
+  token - contiguous()/view copies around the mHC op wrappers and the
+  q/idx staging in the sparse backend (0.5 ms, easy); (2) pooled indexer
+  at 65 us for a 250-pool context (should be ~15 us: one tile per program,
+  the q/APE preload dominates; 0.5 ms); (3) mHC channel ownership as DSV4
+  does (VLLM_DSV4_TP_OWNERSHIP: each rank transitions 4096/TP channels,
+  the transition fused into the allreduce) - up to 1.2 ms but a deep
+  integration; (4) the M=1 GEMV chain: 280 cuBLAS launches per token is
+  launch-bound, fusable per layer (q_a+kv_a already fused; KDA's
+  in_proj/f_b/g_a/g_b are four).
+- Partitioned bf16 GLM launch, first attempt: OOM in prefill. This MQA
+  path serves prefill chunks too, and the partition scratch
+  (B x H x P x 512 fp32) hit 3.4 GiB for a multi-thousand-token chunk on
+  the 202K-context bf16 record. Partitioning now applies only while the
+  scratch stays under 512 MB (decode-sized batches); large chunks stay
+  unpartitioned, where B x H warps already fill the machine. Both bf16
+  entry points (NoPE 512 and GLM 576) use the same gate.
+- glm52-q2k-8 after (canaries pass): c1 14.9 / c8 81.5 / c16 135.2 tok/s
+  (from 9.6 / 64.7 / 110.4: +55% / +26% / +22%). Raw: perf/results/
+  2026-09-03/glm52-q2k-8-baseline/. Still far below glm53's TP8 numbers -
+  GLM-5.2's Q2_K GGUF MoE path is its own budget and was not touched.
+- glm53-nvfp4-8 re-validated with the gate (prefill chunks unpartitioned,
+  decode P128): canaries pass, c1 84.4 / c8 413.6 / c16 578.8 - identical
+  to run 2 (84.0 / 412.3 / 575.8). Raw: perf/results/2026-09-03/
+  glm53-nvfp4-8-baseline/ (run 2 kept as -baseline-run2).
+## 2026-09-03 - NVMe tier on the dedicated device: greedy recall validated, promotion path clean, c8 best-ever
+
+- Device: nvme1n1 (3.7 TB, PCIe gen3 x2) carried a stale NTFS boot
+  sector at 129 MiB (no partition table, no filesystem signature; the
+  operator confirmed it blank) - wiped, formatted XFS (label kvtier),
+  mounted at /mnt/kvtier with a nofail fstab entry, and pointed at by
+  SLIMSERVE_KV_TIER_DIR in /etc/slimserve/env (operator-side files, not
+  the repo). Profile nvme_tier_gb_per_rank 128 -> 448: 8 x 448 GiB =
+  3.5 TiB fallocated at boot, 80,273 slots x 800 tokens per rank = ~64M
+  tokens of disk-resident conversation capacity.
+- Greedy diagnostic (tier_exact_8001.py, temperature 0, 8K/24K/42K
+  markers, 6 x 55K churn), both configs on port 8001 with prod stopped:
+  | config                    | depth | restored | cold  | promoted from disk | recall |
+  | A: host 2 GiB + NVMe 32   | 8K    | 1.3 s    | 2.1 s | yes (13 reads)     | OK     |
+  |                           | 24K   | 2.0 s    | 5.7 s | yes (33 reads)     | OK     |
+  |                           | 42K   | 2.7 s    | 9.9 s | yes (56 reads)     | OK     |
+  | B: host 88 + NVMe 448     | 8K    | 0.8 s    | 2.1 s | no (host hit)      | OK     |
+  |                           | 24K   | 0.8 s    | 5.7 s | no (host hit)      | OK     |
+  |                           | 42K   | 0.8 s    | 10.0 s| no (host hit)      | OK     |
+  Every restored answer is a well-formed thinking trace closing on the
+  right codename; zero IO errors, zero invalid-block reports. The
+  script's first verdict rule (common prefix >= 40 chars with the hot
+  control) flagged three legs whose traces differ only in the model's
+  own paraphrase ("recall ... of their message" vs "identify ... of the
+  text", diverging at char 35) - the same variation appears between two
+  HOST-resident hits in config B where no disk read occurred, so it is
+  the re-prefill chunk split above the tail boundary, not the NVMe path.
+  Verdict rule corrected to recall + well-formed answer + restore speed;
+  the offline re-judgement of both logs is 6/6 OK.
+- NVMe promotion is exercised only by config A (the 88 GiB host tier
+  never fills in a short run); config B exercises write-through only
+  (KV Transfer metrics: disk_write_batches=14 in the interval log).
+- Throughput: c8 exact 1000/2000 seed 42 = 610.2 tok/s with the 448 GiB
+  tier writing through on the dedicated device - the best fp8 c8 recorded
+  (prior 594.2/590.4/568.8/559.5; bf16 band 590.7-600.5). Single sample;
+  reads as "write-through on its own device is free", not as a gain.
+- Disk housekeeping: the O_TMPFILE arenas vanish at shutdown (df back to
+  74 GB used on the 3.8 TB mount after the run).
+- Decision: RETAINED - profile at 448 GiB/rank on /mnt/kvtier. Next
+  command: `sudo systemctl start slimserve-qwen38fn`, then confirm
+  "kv-nvme: 80273 slots ... in /mnt/kvtier" in /var/log/SlimServe/serve.log.
+- Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A4,B4}_8001
+  .log, tier_exact_nvme_{A4,B4}.log, bench_fp8kv_c8_nvme4.log,
+  run_nvme_exact4.out).

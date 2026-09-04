@@ -189,27 +189,31 @@ behavior:
 - Benchmarks and diagnostics sample at the model's recommended settings
   (temperature 1.0 / top_p 0.95 / top_k 20, seeded for reproducibility),
   never temperature 0, and never disable thinking to save time.
-- Main KV is ALWAYS bf16 (`kv_cache_dtype: auto`) on rtx3090 and a100
-  profiles - enforced by test: quantized KV was implicated in multi-turn
-  tracking errors on Qwen3.8-Flash-Next and root-caused on rtx3090
-  (operator 2026-08-29). The DSV4/A100 bf16 sparse-MLA page path is the
-  NFP8=0 instantiation of the merged decode plus the fused bf16 insert,
-  bf16 compressor stores, and bf16 prefill gather - design and gates in
+- Main KV precision is a per-profile, on-box-validated choice (operator
+  2026-09-02, reversing the 2026-08-29 bf16 mandate): quantized main KV
+  is allowed when the record's note names the format and the validation
+  evidence, and `test_quantized_main_kv_is_an_explicit_validated_choice`
+  enforces that. qwen38fn-fp8-8/rtx3090 runs fp8 (e4m3) main KV through
+  its own `kv_cache_dtype: fp8` - NOT TurboQuant (operator: "we are using
+  FP8 kv cache - that's as opposed to TurboQuant or BF16"); the fp8 path
+  removed on 2026-08-27 was restored for it. The multi-turn tracking
+  errors that once motivated bf16 were fixed by unrelated bugs, never by
+  KV precision. The DSV4/A100 bf16 sparse-MLA page path is the NFP8=0
+  instantiation of the merged decode plus the fused bf16 insert, bf16
+  compressor stores, and bf16 prefill gather - design and gates in
   csrc/quixicore/dsv4_bf16_kv_design.md (kernel parity 2.5e-04, boot with
   TQ draft + full graphs, deep-context recall). Still owed there: the
   fp8-vs-bf16 exact-token throughput A/B and KV pool re-sizing (bf16 rows
-  are 1024B vs fp8's 584B). bf16 main KV is ASPIRATIONAL on the remaining
-  platforms: they keep their qualified configs (Metal fp8_ds_mla and the
-  qwen38-nvfp4-1-tq TurboQuant variant) and flip only with an on-box
-  requalification pass. One noted a100 carve-out (operator-approved
-  2026-08-30): glm52-q2k-4 serves fp8 main KV at 131072 because 65.8 GiB
-  of Q2K weights per 80 GB rank make bf16 KV at that length physically
+  are 1024B vs fp8's 584B). The other platforms keep their qualified
+  configs (Metal fp8_ds_mla and the qwen38-nvfp4-1-tq TurboQuant
+  variant); any flip needs an on-box requalification pass. glm52-q2k-4/
+  a100 serves fp8 main KV at 131072 (operator-approved 2026-08-30): 65.8
+  GiB of Q2K weights per 80 GB rank make bf16 KV at that length physically
   impossible; the record's note states the arithmetic and glm52-q2k-8
   remains the bf16 model-default-context record. Draft-model KV (DSpark
-  TurboQuant k8v4) is exempt
-  everywhere: rejection sampling verifies every draft token against the
-  target, so draft KV precision can only affect acceptance rate and speed,
-  never output content.
+  TurboQuant k8v4) is always allowed: rejection sampling verifies every
+  draft token against the target, so draft KV precision can only affect
+  acceptance rate and speed, never output content.
 - Every profile serves its model's DEFAULT context unless genuinely
   impossible on the platform (operator 2026-08-29): GLM-5.2 202752,
   DSV4-Flash 1M, Qwen3.8-Flash-Next 262144 - as configured in the GGUF
@@ -222,10 +226,26 @@ behavior:
   KV offload later (unified memory makes a host-RAM tier meaningless
   there; issue #19). ENABLED and validated on qwen38fn-fp8-8/rtx3090
   (2026-08-28, mamba state-geometry fix landed: tail states are the
-  engine's frozen align-mode boundary snapshots) and on all seven A100
-  profiles (2026-08-29 WildChat deep-context sweep; DSV4's packed
-  cross-layer slab registers directly, the GLM records force the packed
-  layout via enable_cross_layers_blocks). The eviction-restore acceptance
-  (marker recall after full GPU-pool eviction) is the standing check for
-  tier changes. MI300X still needs the connector generalized to its
-  layout (issues #17/#18); enable there only with on-box validation.
+  engine's frozen align-mode boundary snapshots) and configured on the
+  A100 DSV4/GLM-5.2 records (DSV4's packed cross-layer slab registers
+  directly, the GLM records force the packed layout via
+  enable_cross_layers_blocks). Tier RESTORES on A100 are proven only
+  where the instrumented acceptance shows them: GLM-5.2 (2026-08-31,
+  restores + SHA verify clean); DSV4 stays write-only by design until
+  window-tail staging exists for its sliding-window groups; glm53-nvfp4-4
+  carries no tier until the packed planner handles KDA+MLA mixed block
+  sizes. Recall probes alone do not prove the tier (full re-prefill
+  answers them too): the standing check is
+  benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1,
+  read alongside the connector's hit/restore counters. MI300X still
+  needs the connector generalized to its layout (issues #17/#18); enable
+  there only with on-box validation.
+  A THIRD tier (NVMe, `nvme_tier_gb_per_rank`) sits under the host tier
+  on qwen38fn-fp8-8/rtx3090 (2026-09-02): confirmed host blocks are
+  written through to a per-rank O_TMPFILE, a fully-written trajectory is
+  demoted (host slots released, disk kept) instead of deleted under host
+  pressure, and a hit on a disk-only trajectory is promoted disk -> host
+  -> GPU behind the request's async-KV-load wait. The tier directory is
+  operator environment (SLIMSERVE_KV_TIER_DIR), never a profile field.
+  The eviction-restore acceptance with a deliberately tiny host tier
+  (so restores must come from disk) is the standing check for it.
