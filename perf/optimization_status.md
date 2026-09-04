@@ -19412,3 +19412,73 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   the driver and analysis scripts). Traces: /raid/scratch/slimserve-glm53/
   profile-c1/ and profile-c8/ (4 ranks each). Serve log:
   serve-logs/serve-20260904-145736.log.
+
+## 2026-09-04: B12X R24 control on tinybox (handicapped) - local floor for the sm_120 campaign
+
+- Status: CONTROL RECORDED, no code change. A handicapped lower bound for
+  the B12X "Jovian Judgement" R24 stack on this exact host; the bar for the
+  campaign stays the published numbers.
+- Scope: image voipmonitor/vllm:jovian-judgement-community-20260904-r24
+  (sha256 ab4ff9d6...), checkpoint local-inference-lab/GLM-5.3-Flash-NVFP4
+  from the HF cache on /raid, the published recipe verbatim: TP4 DCP1,
+  fp8_ds_mla KV, FULL_AND_PIECEWISE graphs (13 piecewise sizes to 256 plus
+  FULL decode), max_num_seqs 32, 4,096 batched tokens, compute-share
+  fairness 0.4, gpu_memory_utilization 0.93; B12X NVFP4 W4A4 experts, B12X
+  linear, B12X sparse attention, FlashInfer sampler. Same exact-token
+  harness, shapes, source and sampling as the Phase 0 baseline entry.
+- Handicap (why this is a floor, not the bar): host driver 580.173.02 is
+  CUDA 13.0; the image is CUDA 13.3 + NCCL 2.31.2 on forward-compat libs,
+  which the RTX PRO 6000 workstation driver does not fully honour. Stock
+  recipe: NCCL init "unhandled cuda error". NCCL_CUMEM_ENABLE=0 alone:
+  ncclP2pImportShareableBuffer "invalid device ordinal". NCCL_CUMEM_ENABLE=0
+  + NCCL_P2P_DISABLE=1: NCCL up, but the B12X PCIe one-shot all-reduce
+  fails its CUDA IPC import-open on all four ranks and its failure exchange
+  hangs 600 s (twice; VLLM_ENABLE_PCIE_ALLREDUCE=0 from docker -e is
+  overwritten by the launcher). B12X_PCIE_ALLREDUCE=0, the launcher's own
+  knob (clears the env and passes --disable-custom-all-reduce), boots. So
+  the control ran every TP all-reduce as a PyNCCL ring over host shared
+  memory with GPU P2P off, in place of the qualified B12X PCIe
+  one-shot/two-shot over P2P. Everything else is the qualified B12X path.
+- Boot: weights 24 s (instanttensor), graph capture 49 s + 30 s (42 s for
+  the MTP arm), KV 4.71 M tokens, /health at about +6 min.
+- Results, 1000 in / 300 out, exact:true in every cell; pass 1 carries
+  first-time costs at c8/c16 (walls 10.2/12.8 s vs 5.0/8.0 s), passes 2-3
+  are the steady state:
+
+  | arm | pass | c1 | c8 | c16 |
+  |---|---|---:|---:|---:|
+  | no-spec | 1 | 134.7 | 235.6 | 376.3 |
+  | no-spec | 2 | 134.0 | 479.7 | 598.3 |
+  | no-spec | 3 | 134.0 | 483.7 | 598.6 |
+  | MTP-3 | 1 | 208.6 | 430.9 | 592.5 |
+  | MTP-3 | 2 | 194.2 | 508.8 | 620.7 |
+  | MTP-3 | 3 | 211.5 | 477.4 | 629.5 |
+
+  MTP-3 acceptance 0.41-0.59 per draft token (2.2-2.8 tokens per step),
+  consistent with the published 2.50. Published R24 on the same image with
+  the stock driver and B12X PCIe AR, 30 s context-zero cells with other
+  serving active: no-spec 169.9 / 737.8, MTP-3 247.8 / 903.2 (c1 / c8).
+- Reading against our Phase 0 baseline (104.8 / 431.4 / 591.0):
+  - c1 21.8% behind, c8 10.8% behind, c16 level with a control whose
+    all-reduce is crippled. c1 is the cell where the handicap hurts the
+    control most (two ring all-reduces per layer over SHM), so the true
+    B12X gap at c1 is larger than 21.8%; the published 169.9 puts it at
+    38%. That gap is the backbone: B12X linear vs cuBLAS at 56-63% of
+    roofline, W4A4 experts vs Marlin W4A16, fused KDA decode vs our
+    decomposed o_norm and five separate gate GEMVs. Phase 1 order stands.
+  - c16 parity says both stacks sit on the same expert-bandwidth floor at
+    c16 (64 distinct experts per rank per step); the levers there are the
+    byte levers (FP8 KV, NVFP4 M<=16 expert kernel), not launch count.
+  - Speculation on the control: +55% at c1, +0% to +5% at c8/c16 with this
+    handicap; the published unhandicapped stack gets +46% / +22%. MTP is
+    the c1 lever after the backbone, as the plan says.
+- Decision: bar unchanged (169.9 / 737.8 no-spec, 247.8 / 903.2 MTP-3).
+  Beating the local floor in every cell is necessary, not sufficient. An
+  unhandicapped local control needs a 13.3-capable driver on tinybox, an
+  operator decision (shared box); flagged in the plan doc.
+- Raw: perf/results/2026-09-04/b12x-r24-control-{nospec,mtp3}-pass{1,2,3}/
+  (harness JSON, completions), container logs and the launcher/bench
+  drivers in /raid/scratch/slimserve-glm53/{control-logs,control.sh,
+  control-bench.sh}. Side effect recorded: the 42 GB image lived in
+  /var/lib/containerd on the root disk; containerd's root is now
+  /raid/containerd (docker's was already /raid/docker).

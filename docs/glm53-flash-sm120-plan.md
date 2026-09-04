@@ -64,13 +64,22 @@ comm -> ~630 tok/s; c8 floor ~15.4 ms for 24 tokens -> ~1550 tok/s.
 
 Engineering target = 60-70% of floor:
 
-| shape | today (Foundry SGLang FP8) | B12X R24 bar (4x PRO 6000) | target |
-|---|---|---|---|
-| c1, no spec | 88.5 | 169.9 | 300-350 |
-| c1, MTP-3 | 141.7 (NextN 5/6) | 247.8 (2.50 acc/step) | 400-500 |
-| c8, no spec | - | 737.8 | 900-1000 |
-| c8, MTP-3 | 274 at c4 | 903.2 | 1000-1200 |
-| prefill at 32K | not measured | 14.9K tok/s | >= 15K |
+| shape | today (Foundry SGLang FP8) | B12X R24 bar (4x PRO 6000) | B12X R24 on tinybox, handicapped | our Phase 0 baseline | target |
+|---|---|---|---|---|---|
+| c1, no spec | 88.5 | 169.9 | 134.0 | 104.8 | 300-350 |
+| c1, MTP-3 | 141.7 (NextN 5/6) | 247.8 (2.50 acc/step) | 194-212 (2.2-2.8 acc/step) | - | 400-500 |
+| c8, no spec | - | 737.8 | 483.7 | 431.4 | 900-1000 |
+| c8, MTP-3 | 274 at c4 | 903.2 | 477-509 | - | 1000-1200 |
+| c16, no spec | - | - | 598.6 | 591.0 | - |
+| prefill at 32K | not measured | 14.9K tok/s | not measured | not measured | >= 15K |
+
+The handicapped column is the published image run on this host with its TP
+all-reduce forced onto a PyNCCL ring over host shared memory (the 580.173
+driver is CUDA 13.0; the CUDA 13.3 image's NCCL cuMem/P2P and B12X CUDA IPC
+paths fail, launcher knob B12X_PCIE_ALLREDUCE=0; notebook entry "B12X R24
+control on tinybox (handicapped)"). It is a floor we must beat in every cell,
+not the bar; an unhandicapped local control needs a 13.3-capable driver,
+which is an operator decision on the shared box.
 
 TP2 halves sync count but doubles bytes per GPU and leaves no KV room at
 131K context; TP4 with TP-sharded experts is the layout (EP measured 4-6%
