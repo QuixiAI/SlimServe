@@ -18583,3 +18583,15 @@ token, approximate:
   write-through -> promote -> restore -> verify sequence in 3 s; the
   data was bit-exact at every step (restored block == source), which is
   also what the full-row IO-thread round-trip check said all along.
+- FINAL disk-tier acceptance (TP4, 8 GiB host + 64 GiB disk, unified
+  digest): promotions from NVMe verify 0/58 mismatched, 0 disk
+  round-trip mismatches, 6/6 recalled. Raw: perf/results/2026-09-03/
+  kvtier-acceptance/glm53-tp4-disk9/.
+- glm53-nvfp4-8 THROUGH THE PROFILE with both tiers (64 GiB host +
+  128 GiB disk per rank, prefix caching on / align): text, image and tool
+  canaries pass; acceptance on the 2,696,830-token pool with a
+  3,323,324-token churn: 6/6 probes hit and resumed at block 70 (40,320
+  tokens), 109 restore ops each (70 MLA + 35 indexer + 4 KDA states at
+  the 576-token hash block), VLLM_KV_TIER_VERIFY 0/109 mismatched on
+  every restore, 6/6 markers recalled. Raw: perf/results/2026-09-04/
+  glm53-nvfp4-8-tier/. Both glm53 records now carry the tiers.
