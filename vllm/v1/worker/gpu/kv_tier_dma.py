@@ -218,12 +218,10 @@ class KVTierDMA:
             ev = self._slot_event.get(host_slot)
             if ev is not None:
                 wait = ev.synchronize
-            if _VERIFY:
-                # The row's live byte count rides with the op; the IO thread
-                # digests that prefix AFTER the copy event. Never digest
-                # here: the producing copy may still be in flight at
-                # submission (it was, for every tail row, on 2026-09-04).
-                self._disk_nbytes[disk_slot] = self._slot_nbytes.get(host_slot, 0)
+            # VERIFY: the IO thread digests the row's live prefix (length
+            # from the write's KV group, set by the caller) AFTER the copy
+            # event. Never digest here: the producing copy may still be in
+            # flight at submission (it was, for every row, on 2026-09-04).
         elif _VERIFY:
             self._read_targets[op_id] = (disk_slot, host_slot)
         self.disk.submit(
@@ -304,7 +302,13 @@ class KVTierDMA:
         if batch.disk_writes:
             assert self.disk is not None
             self._write_remaining[batch.seq] = len(batch.disk_writes)
-            for host_slot, disk_slot in batch.disk_writes:
+            for op in batch.disk_writes:
+                host_slot, disk_slot = op[0], op[1]
+                if _VERIFY:
+                    gid = op[2] if len(op) > 2 else -1
+                    self._disk_nbytes[disk_slot] = (
+                        self._group_nbytes.get(gid, self._stride) if gid >= 0 else 0
+                    )
                 self._submit_disk(
                     write=True, disk_slot=disk_slot, host_slot=host_slot,
                     tag=("w", batch.seq),

@@ -103,7 +103,7 @@ class HostTierMeta(KVConnectorMetadata):
     zeros: dict[str, list[int]] = field(default_factory=dict)
     # batch_seq -> [(host_slot, disk_slot), ...] write-through of confirmed
     # host rows to the NVMe tier.
-    disk_writes: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    disk_writes: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
     # req_id -> [(disk_slot, host_slot), ...] promotion reads that must land
     # before that request's restores.
     disk_reads: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
@@ -680,7 +680,14 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             writes = self.index.take_disk_writes(confirmed)
             if writes:
                 self._offload_seq += 1
-                self._staged_disk_writes[self._offload_seq] = writes
+                # Tag each write with the row's KV-cache group so the worker
+                # knows its live length (verify digests the exact prefix).
+                tagged = []
+                for host_slot, disk_slot in writes:
+                    kind, g = self.index.slot_kind.get(host_slot, ("attn", -1))
+                    kv_gid = self.state_groups[g] if kind == "tail" else g
+                    tagged.append((host_slot, disk_slot, kv_gid))
+                self._staged_disk_writes[self._offload_seq] = tagged
                 self._disk_write_batches[self._offload_seq] = writes
         if self._pins_issued and self._block_pool is not None:
             for pin_blocks in self._pins_issued:

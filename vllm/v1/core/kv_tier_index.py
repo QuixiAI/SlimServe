@@ -214,6 +214,9 @@ class HostKVTierIndex:
         # when confirm_disk_writes reports the write.
         self._orphaned_busy: set[int] = set()
         self._orphaned_disk_pending: set[int] = set()
+        # host slot -> ("attn", kv_gid) | ("tail", tier_gid): lets the
+        # connector tag disk write-throughs with the row's live length.
+        self.slot_kind: dict[int, tuple[str, int]] = {}
         # NVMe tier.
         self.num_disk_slots = max(0, int(num_disk_slots))
         self._disk_free: list[int] = list(range(self.num_disk_slots - 1, -1, -1))
@@ -311,6 +314,7 @@ class HostKVTierIndex:
         slot = self._alloc_slot(owner)
         if slot is None:
             return None
+        self.slot_kind[slot] = ("attn", gid)
         traj.attn_slots[logical][gid] = slot
         traj.hashes[logical] = block_hash
         if gid in traj.disk_attn[logical]:
@@ -352,6 +356,7 @@ class HostKVTierIndex:
                     self._free.append(s)
                 return None
             slots[gid] = slot
+            self.slot_kind[slot] = ("tail", gid)
         # Retire the previous tail. A host slot whose write-through is in
         # flight (_host_busy: the IO thread is reading it) and a disk slot
         # whose write has not been confirmed must NOT go back on the free
