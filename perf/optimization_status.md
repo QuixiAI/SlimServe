@@ -19088,3 +19088,38 @@ token, approximate:
 - Raw: perf/results/2026-09-02/qwen38fn-fp8kv/ (serve_nvme_{A4,B4}_8001
   .log, tier_exact_nvme_{A4,B4}.log, bench_fp8kv_c8_nvme4.log,
   run_nvme_exact4.out).
+
+## 2026-09-04 - Merge with origin/main: upstream host tier survives; GLM re-PASS
+
+MI300X P0 branch (535d2886dc) merged with 34 upstream commits (4ed41b781d),
+then a hook-cleanliness commit for the tier modules (2fce6a002d).
+
+- MERGE DECISIONS: upstream's host tier (group-aware slots, attention-only
+  partial resume with lineage adoption/supersede, NVMe third tier, exact-size
+  cudaHostRegister arena) is the survivor for kv_tier_index, kv_tier_dma and
+  host_tier_connector; its allow_partial lookup already clamps a longer stored
+  trajectory to the query prefix, so the MI300X lookup clamp became a test
+  (`test_partial_lookup_clamps_a_longer_trajectory_to_the_query`). Grafted: a
+  bounded retry when cudaHostRegister returns out-of-memory (the 2026-08-31
+  eight-rank pin race), VLLM_KV_TIER_IDLE for tier-on vs tier-idle A/Bs, the
+  MI300X profile guard, and the post_update row-guard arguments on the CUDA
+  binding (upstream's partitioned sparse decode kept). Dropped: the
+  KVCacheConfig.group_block_bytes plumbing (the surviving connector reads
+  KVCacheTensor.block_stride). `_C_stable_libtorch` rebuilt for upstream's
+  cache_kernels change.
+- VALIDATION (merged tree): unit suites 88 passed (tier index/connector/disk/DMA
+  and profiles), ROCm kernel tests 15 passed (paged MQA logits at real stride
+  past 2 GiB, sparse decode at high block ids). glm52-q2k-8/mi300x fast-cycle
+  acceptance PASS 2/2, identical to the 2026-09-03 pre-merge run: depth 8000
+  (8,930 tok) plant TTFT 4.75 s, hot 0.21 s, restored 0.21 s, 8,896 external
+  hits; depth 24000 (27,591 tok) plant 15.2 s, hot 0.27 s, restored 0.33 s,
+  27,584 hits; 6 fillers, eviction 231 s, recall 3/3 per depth. Upstream's
+  exact-size registered arena pinned 22,598 slots (128 GiB) on every rank
+  without a retry; the native paged kernel was selected (24 GiB indexer span).
+  Artifacts: perf/results/2026-09-04/kv-tier-mi300x-merged/.
+- FAST-CYCLE RECIPE (record it, it bit again): shrinking the pool to 271,168
+  tokens (kv_cache_memory_bytes 25768552704) alone fails at boot because the
+  engine refuses a pool smaller than one max-length request; the record also
+  needs max_model_len 262144 for the run, then git checkout the profile.
+- NOT RE-RUN on the merged tree: production-pool acceptance (capacity-bound by
+  design, 2026-09-03 addendum), the tier-on/idle throughput A/B, DSV4.
