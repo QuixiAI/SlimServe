@@ -20017,3 +20017,35 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   greedy fingerprints, logit probes, noise summary, accept probes,
   workload bench JSON, foundry-prompt.txt); scratch under
   /raid/scratch/slimserve-glm53/mtp-gate/ (serve outputs, draft dumps).
+
+## 2026-09-04: GLM-5.3-Flash MTP on the Foundry fan-out - REJECTED as the rtx6000 default
+
+- Status: rejected as the record default (record flipped to speculative
+  false; MTP stays an explicit opt-in with the measured depth 3). Follow-up
+  to the MTP entry above; same branch and build.
+- Scope: glm53-nvfp4-4 / rtx6000; the owed measurement before the Foundry
+  arm switches: the pipeline's real 8-wide pass.
+- Baseline / workload: 8 concurrent director commitments built exactly as
+  production-serve.py's setting and character passes do (director-setting /
+  director-character role prompts + image-model-gotchas, a real 15-18 KB
+  elaboration as the specification, ~4K prompt tokens each), chat template
+  with thinking on, the pipeline's GLM preset (temperature 1.0 / top-p 0.95),
+  4096-token outputs (every request ran the full budget). Two runs per cell;
+  server counters for acceptance. workload_bench_c8.py --chat.
+- Results (aggregate output tok/s over the 8-request wall time):
+  | cell                             | spec off    | MTP k=3 (accepted/step) |
+  | c8, temp 1.0 / top-p 0.95        | 452.9 / 480.1 | 377.3 / 378.9 (0.82)  |
+  | c8, greedy                       | 503.5       | 411.4 (0.91)            |
+  | c1, temp 1.0 / top-p 0.95        | 108.7 / 108.7 | 113.7 / 113.3 (0.77)  |
+  At c8 the drafter costs 20% (18% greedy): 0.82 accepted tokens per step do
+  not pay for the 3-token verify plus the draft passes when the batch is
+  already touching most experts. Single-stream is neutral inside the boot
+  band. The pipeline's dominant phase is the fan-out.
+- Decision: the rtx6000 record serves speculation off; `speculative: true`
+  on the record re-enables MTP at depth 3 for single-stream deterministic
+  serving where it measured +17..+46%. The per-record flag and the
+  speculator engine settings stay so the opt-in is one line. The Foundry arm
+  can switch to the profile as spec-off; the prose exact-token record for
+  that config is unchanged (c1 112-113 / c8 446-457 / c16 608-611).
+- Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-mtp-diag/
+  wl8-*.json, wl8.log, foundry-fanout-prompts.json.
