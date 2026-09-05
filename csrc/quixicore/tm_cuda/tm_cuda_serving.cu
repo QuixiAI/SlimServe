@@ -18,6 +18,7 @@
 #include "mhc_ampere.cuh"
 #include "dsv4_router_ampere.cuh"
 #include "dsv4_projection_ampere.cuh"
+#include "glm_moe_routing.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
@@ -163,6 +164,37 @@ static torch::Tensor py_dsv4_projection_gemv(torch::Tensor x,
                                 int(weight.size(0)), stream());
     }
     return output;
+}
+
+static std::vector<torch::Tensor> py_glm_route_align(
+        torch::Tensor logits, torch::Tensor bias, int64_t topk, int64_t scoring,
+        bool renormalize, double scaling, int64_t block_size, int64_t max_padded,
+        int64_t max_blocks) {
+    CK(logits); CK(bias);
+    TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.dim() == 2,
+                "glm_route_align expects fp32 [M, E] router logits");
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32 &&
+                    bias.numel() == logits.size(1),
+                "glm_route_align expects an fp32 [E] correction bias");
+    const int M = int(logits.size(0)), E = int(logits.size(1));
+    TORCH_CHECK(M >= 1 && M <= glm_route::MAX_TOKENS,
+                "glm_route_align handles 1..16 tokens");
+    TORCH_CHECK(E == 288 && topk == 8,
+                "glm_route_align is instantiated for E=288, topk=8");
+    auto i32 = logits.options().dtype(torch::kInt32);
+    auto topk_weights = torch::empty({M, topk}, logits.options());
+    auto topk_ids = torch::empty({M, topk}, i32);
+    auto sorted = torch::empty({max_padded}, i32);
+    auto expert_ids = torch::empty({max_blocks}, i32);
+    auto post_pad = torch::empty({1}, i32);
+    glm_route::route_align_kernel<288, 8>
+        <<<1, glm_route::THREADS, 0, stream()>>>(
+            fp(logits), fp(bias), fpm(topk_weights),
+            topk_ids.data_ptr<int32_t>(), sorted.data_ptr<int32_t>(),
+            expert_ids.data_ptr<int32_t>(), post_pad.data_ptr<int32_t>(), M,
+            int(scoring), float(scaling), renormalize, int(block_size),
+            int(max_padded), int(max_blocks));
+    return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
 }
 
 __global__ void fill_short_context_topk_indices_kernel(
@@ -2053,6 +2085,11 @@ void init_serving(py::module_& m) {
     m.def("dsv4_hash_router_debug", &py_dsv4_hash_router_debug);
     m.def("dsv4_projection_gemv", &py_dsv4_projection_gemv, py::arg("x"),
           py::arg("weight"), py::arg("bf16_output") = false);
+    m.def("glm_route_align", &py_glm_route_align, py::arg("logits"),
+          py::arg("bias"), py::arg("topk"), py::arg("scoring"),
+          py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
+          py::arg("max_padded"), py::arg("max_blocks"),
+          "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
     m.def("fill_short_context_topk_indices",
           &py_fill_short_context_topk_indices, py::arg("output"),
           py::arg("positions"), py::arg("topk"),

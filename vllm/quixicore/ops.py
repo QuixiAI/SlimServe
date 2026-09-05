@@ -61,6 +61,31 @@ class quixicore_ops:
             logger.debug("QuixiCore-CUDA extension unavailable: %s", e)
             return False
 
+    @staticmethod
+    @cache
+    def has_glm_route_align() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "glm_route_align")
+
+    @staticmethod
+    def glm_route_align(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        scoring: int,
+        renormalize: bool,
+        scaling: float,
+        block_size: int,
+        max_padded: int,
+        max_blocks: int,
+    ) -> list[torch.Tensor]:
+        """Fused small-M routing: scored top-k with bias-only selection plus
+        the Marlin block alignment, one launch. Returns [topk_weights,
+        topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
+        return _qc().glm_route_align(
+            logits, bias, topk, scoring, renormalize, scaling, block_size,
+            max_padded, max_blocks,
+        )
+
     # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------

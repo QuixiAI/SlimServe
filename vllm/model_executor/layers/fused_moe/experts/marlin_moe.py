@@ -25,6 +25,7 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
     TopKWeightAndReduceNoOP,
@@ -328,13 +329,25 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    alignment = glm_route_align.consume(topk_ids)
+    if (
+        alignment is not None
+        and alignment.block_size == block_size_m
+        and expert_map is None
+    ):
+        # The fused router already aligned this very batch for this block
+        # size; skip the align / count_and_sort / fill launches.
+        sorted_token_ids = alignment.sorted_token_ids
+        expert_ids = alignment.expert_ids
+        num_tokens_post_padded = alignment.num_tokens_post_padded
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(

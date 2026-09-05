@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
     rocm_aiter_grouped_topk,
 )
+from vllm.model_executor.layers.fused_moe.router import glm_route_align
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
@@ -322,6 +323,12 @@ class GroupedTopKRouter(BaseRouter):
                     indices_type=indices_type,
                 )
             return topk_weights, topk_ids
+
+        # Decode-sized batches with one expert group: one QuixiCore launch does
+        # the scored top-k and the Marlin block alignment, which it publishes
+        # for fused_marlin_moe (glm_route_align.consume).
+        if glm_route_align.eligible(self, router_logits, indices_type):
+            return glm_route_align.route(self, router_logits)
 
         # Select grouped_topk implementation
         if rocm_aiter_ops.is_fused_moe_enabled():

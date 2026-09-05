@@ -19843,3 +19843,65 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Raw: perf/results/2026-09-04/mhc-coop-multi{,-b2}-pass{1,2}/,
   fold-tree-b2-pass{1,2}/, gate JSONs beside them; jit/{qc_dev.cu,
   test_mhc.py, site/sitecustomize.py} under /raid/scratch/slimserve-glm53/.
+
+## 2026-09-04: fused small-M routing + Marlin alignment - RETAINED on the profiler pair (-81 launches, -1.2% c1 step)
+
+- Status: RETAINED. Phase 1 item 2, first half (the MoE glue).
+- Scope: rtx6000 record on the fold tree (99180f9b6 + 180e043c4 docs), the
+  QuixiCore kernel `glm_route_align` (csrc/quixicore/serving/
+  glm_moe_routing.cuh, binding in tm_cuda_serving.cu) exercised through
+  a JIT build of that same header and a dev import hook until the native
+  rebuild; Python: GroupedTopKRouter takes the fused path for eligible
+  batches (CUDA, H=4096-agnostic, E=288/top-8, one expert group, fp32
+  logits and bias, M <= 16) and publishes the alignment; fused_marlin_moe
+  consumes it when it belongs to the very same topk_ids tensor and its
+  block size matches, else recomputes.
+- Hypothesis: one block does sigmoid scoring, bias-only top-8,
+  renormalize x 2.5 and the Marlin block alignment, replacing grouped_topk
+  + moe_align_block_size (two blocks) + count_and_sort, i.e. four launches
+  per MoE layer with three dependency gaps.
+- Correctness: tests/kernels/test_quixicore_glm_route_align.py (8 pass):
+  ids identical to the router's grouped_topk, weights within 1e-6,
+  block layout and num_tokens_post_padded identical to
+  moe_align_block_size for M = 1, 2, 3, 4, 8, 13, 16; exact:true in all
+  12 bench cells; gates -2.421..-2.448 (band -2.416..-2.457).
+- First attempt (hand-off through the modular kernel classes) did not
+  reach the Marlin wrapper: the Marlin quant method never calls
+  FusedMoEModularMethod.apply, so the alignment sat on the layer and the
+  align kernels still ran; the profiler pair caught it (B slower than A,
+  launches unchanged). Redesigned as publish/consume in the routing module,
+  matched on tensor identity.
+- Results. Exact-token harness, two boots per arm (both arms inside the
+  +-2.5% boot band, no decision possible from it):
+
+  | arm | boot 1 (c1 / c8 / c16) | boot 2 |
+  |---|---|---|
+  | fold tree | 113.28 / 456.3 / 609.9 | 107.96 / 444.2 / 596.8 |
+  | routing fused | 107.13 / 442.6 / 594.1 | 112.57 / 455.6 / 605.8 |
+
+  Profiler pair, same tree, hook off (A) then on (B), one c1 capture each,
+  full decode steps only (perf/results/2026-09-04/route-fused-profile/):
+
+  | arm | span / step | kernel busy | in-graph gaps | launches |
+  |---|---:|---:|---:|---:|
+  | A: reference routing | 8.39 ms | 8.37 ms | 0.02 ms | 1507 |
+  | B: fused route_align | 8.29 ms | 8.32 ms | -0.03 ms | 1426 |
+
+  Per MoE layer B runs router GEMV, shared gate_up, route_align (5.6 us),
+  shared silu, shared down, one Fill, Marlin w13, act, Marlin w2, moe_sum,
+  memcpy, add, NCCL. The surviving Fill (42 per step, 1.4 us) is Marlin's
+  workspace zeroing, the next launch to remove. At M=8 the kernel saves
+  more (6.8 -> 4.8 us per layer in the microbench) plus the 21 us cuBLAS
+  weights_proj that the fold already removed.
+- Decision: RETAINED. -81 launches and -0.10 ms per c1 step on the
+  profiler; throughput-neutral within the harness band.
+- Instrument change: for launch-count changes expected under ~3%, the
+  decision is made on a same-tree profiler pair (prof_pair.sh: arm A then
+  arm B booted back to back, full-step GPU span and launch count), not on
+  the exact-token harness. The pair also explained the slow boots: the
+  same hook-off tree captured 8.84 ms span with 0.46 ms of in-graph gaps
+  at 19:50 and 8.39 ms with 0.02 ms at 21:17; the boot spread is inter-
+  kernel idle inside the CUDA graph on the GPU timeline, not host work.
+- Raw: perf/results/2026-09-04/route-fused{,-b2}-pass{1,2}/, gate JSONs,
+  route-fused-profile/ (step-attrib for both pairs, prof_pair.sh);
+  /raid/scratch/slimserve-glm53/jit/{routing.cu,test_routing.py}.
