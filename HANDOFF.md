@@ -43,11 +43,15 @@ physics, research digest and phase gates are in
   indexer wk/gate/weights_proj folded into fused_qkv_a_proj; fused small-M
   routing + Marlin alignment (`glm_route_align`, -81 launches, -1.2% step
   on the profiler pair). Harness now **c1 ~112 / c8 ~456 / c16 ~608** on a
-  normal boot (+7% / +6% / +3% over Phase 0). Parked: cooperative mHC for
-  T <= 8 (per-site win, neutral end to end; launcher change in
-  `/raid/scratch/slimserve-glm53/step_mhc_apply.py` for the rebuild).
-- MTP (NextN) draft path merged from the peer session (40c0146e7): record
-  resolves to `spec mtp k=3` here (speculative_overrides); k=3 wins +17..46% greedy on Foundry
+  normal boot (+7% / +6% / +3% over Phase 0), then one Marlin lock
+  workspace per device (-37 launches, neutral). REJECTED: the cooperative
+  mHC launch for T <= 8 (per-site win standalone, but a 512-block
+  cooperative grid captured in the decode graph next to the indexer's aux
+  stream faults with an illegal memory access in the server; notebook
+  entry of 2026-09-04 evening).
+- MTP (NextN) draft path merged from the peer session (40c0146e7, then
+  c0c8118c8): the record serves spec-off by default (on the pipeline's 8-wide
+  director fan-out k=3 loses 20%), depth 3 stays as the opt-in; k=3 wins +17..46% greedy on Foundry
   JSON / context-zero / chat, loses on the dense-prose exact-token harness
   (pessimistic bound). Owed before the Foundry arm flips: c8 with real
   director prompts. **Non-speculative A/Bs now boot with `--no-spec`.**
@@ -59,20 +63,24 @@ physics, research digest and phase gates are in
   (clocks, foreign processes, NUMA, shared compile cache ruled out).
   Launch-count changes under ~3% are decided on a same-tree profiler pair
   (`perf/results/2026-09-04/route-fused-profile/prof_pair.sh`).
-- Native build state: the CMake tree did not survive the editable install;
-  new kernels (`glm_moe_routing.cuh`, the mHC launcher change) are proven
-  through the JIT harness in `/raid/scratch/slimserve-glm53/jit/` and need
-  ONE full rebuild (73 min, MemoryMax=120G, no benches while it runs) to
-  land in `_quixicore_C`; until then the routing fusion needs the dev hook
-  (`QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`).
+- Native build state: `/raid/scratch/slimserve-glm53/rebuild.sh` is the
+  build-6 recipe (uv editable install, no build isolation, 12.0f,
+  CMAKE_BUILD_TYPE=Release, MemoryMax=120G, ~75 min; the default
+  RelWithDebInfo makes 5x larger binaries). The first rebuild carried the
+  faulty mHC launcher; a Release rebuild with only the routing binding
+  (`glm_route_align`) was started 22:40 on 2026-09-04. Until it is
+  validated (`post_rebuild.sh`: parity tests, native-vs-hook profiler pair,
+  `ab.sh native-rebuild -- --no-spec`), the routing fusion is served via the
+  dev hook (`QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`)
+  and the pre-rebuild extensions are in `so-backup-20260904/`.
 
 ## Next step
 
-1. Full native rebuild at a quiet moment (peer idle, no benches), then a
-   no-hook profiler pair and an exact-token boot to confirm the routing
-   fusion and the mHC launcher on the shipped extension.
-2. Item 2 remainder: Marlin's per-call workspace zeroing (42 fills/step;
-   dense Marlin allocates once per layer), then moe_sum + memcpy + add.
+1. Validate the Release rebuild (post_rebuild.sh), commit, and drop the
+   dev hook from the serving instructions.
+2. Item 2 remainder: moe_sum + the shared-expert add + the output copy
+   into one kernel (accumulate variant of moe_sum_vec_kernel; 3 -> 1
+   launches per MoE layer).
 3. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
    doc "Phase 1 item 1 pre-work": row-tiled or mma.sync; cuBLAS at 73-89%).
 4. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
