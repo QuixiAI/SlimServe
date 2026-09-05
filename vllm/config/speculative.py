@@ -56,6 +56,7 @@ MTPModelTypes = Literal[
     "hy_v3_mtp",
     "gemma4_mtp",
     "inkling_mtp",
+    "glm5_next_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -617,6 +618,28 @@ class SpeculativeConfig:
             n_predict = getattr(hf_config, "num_mtp_modules", 1)
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["MiniMaxM3MTP"]}
+            )
+
+        if hf_config.model_type == "glm5_next" or initial_architecture in (
+            "Glm5NextForCausalLM",
+            "Glm5NextForConditionalGeneration",
+        ):
+            # GLM-5.3-Flash: the MTP head (layer num_hidden_layers) belongs
+            # to the text model of the VL checkpoint. Promote text_config and
+            # carry the top-level quantization_config with it so the draft's
+            # FP8-block experts (layer 45 in the compressed-tensors config)
+            # resolve to their quant scheme.
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            hf_config = getattr(hf_config, "text_config", hf_config)
+            if (
+                quantization_config is not None
+                and getattr(hf_config, "quantization_config", None) is None
+            ):
+                hf_config.update({"quantization_config": quantization_config})
+            hf_config.model_type = "glm5_next_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update(
+                {"n_predict": n_predict, "architectures": ["Glm5NextMTPModel"]}
             )
 
         return hf_config
@@ -1343,6 +1366,15 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "step3p5_mtp"
+        )
+
+    def use_glm5_next_mtp(self) -> bool:
+        """GLM-5.3-Flash MTP: two draft cache owners (sparse MLA + indexer)."""
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "glm5_next_mtp"
         )
 
     def use_qwen4_exp_mtp(self) -> bool:
