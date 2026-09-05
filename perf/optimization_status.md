@@ -19701,3 +19701,52 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   (the rest of Phase 1), not more small removals. The per-launch floor
   inside a FULL graph on this stack is ~0.5 us; 1,545 launches carry
   ~0.9 ms of it.
+
+## 2026-09-04: router gate through the QuixiCore decode projection GEMV - RETAINED (neutral c1, +0.9% c8, fp32 logits, -42 launches)
+
+- Status: RETAINED after a repeat boot (the two-boot rule). Phase 1 item 1
+  step 3a.
+- Scope: rtx6000 record on the f_b/g_b tree (0bb1b0c14), exact-token
+  1000/300 c1/c8/c16, two boots x two passes, gate twice per boot, plus a
+  profiler boot (perf/results/2026-09-04/router-gemv-profile/).
+- Baseline: the f_b/g_b boot: c1 112.0 / c8 446.3 / c16 607.9.
+- Hypothesis: GateLinear's specialized tiers are gated on device
+  capability family 100, so sm_120 takes tier 7: bf16 F.linear (6.4 us in
+  the c1 trace for a 2.4 MB read) plus an fp32 cast kernel. The existing
+  QuixiCore dsv4_projection_gemv (bf16 in, fp32 out, H=4096, any N, M<=8)
+  does the same read in 2.8-3.0 us and writes fp32 logits directly.
+- Change: GateLinear tier 1b (`torch.ops.vllm.router_projection_gemv`,
+  registered in gate_linear.py, CUDA + H=4096 + bf16 weight + fp32 out +
+  M<=8, gated on quixicore_ops.is_available()); DSV4's E=256 tier stays
+  first. Parity test tests/kernels/test_quixicore_router_projection_gemv.py
+  (E=288/256/32, M=1..8 vs fp32 reference; 16 pass). One file +48 lines,
+  one new test.
+- Correctness: logits within 1.2e-6 of an fp32 reference at M=1..8 where
+  the replaced path is off by up to 1.7e-2 (bf16 rounding of the logits)
+  and flips a top-8 expert on random data at M=2 and M=4. Gate: boot 1
+  -2.437 / -2.428, boot 2 -2.4xx / -2.447 (band -2.416..-2.447); needle
+  margins 13.2-15.5 / 17.3-18.2. exact:true in all 12 cells.
+- Results (aggregate tok/s):
+
+  | boot | c1 pass1/2 | c8 pass1/2 | c16 pass1/2 |
+  |---|---:|---:|---:|
+  | 1 (17:29) | 106.85 / 106.94 | 438.9 / 435.6 | 595.0 / 594.5 |
+  | 2 (17:56) | 112.06 / 112.18 | 449.9 / 450.6 | 608.4 / 609.2 |
+  | profile boot (17:36), c1 step from the trace | 8.94 ms = ~112 | - | - |
+
+  Two of three boots of this tree sit at the previous tree's 112 at c1 and
+  +0.9% at c8; boot 1 ran 5% slow across all three cells with identical
+  clocks, KV size, NCCL backends and (recompiled) artifacts. The trace of
+  the tree shows the tier active (42 bf16_fp32_gemv launches per step,
+  2.7-3.6 us each) and the router GEMV out of the cuBLAS gemvx class
+  (2.30 -> 2.00 ms). Both boots recompiled the backbone ("source code has
+  changed" although the tree was identical between them), so inductor's
+  autotune ran anew on each boot: the leading suspect for the slow boot,
+  to be tested by pinning the compile cache (open item).
+- Decision: RETAINED. Throughput-neutral at c1 within the noise band,
+  +0.9% at c8, fewer launches, and fp32-accurate routing (the peer will
+  re-measure MTP acceptance on this tree; the target's own argmax noise
+  caps acceptance, and routing precision is part of that noise).
+- Raw: perf/results/2026-09-04/router-gemv-pass{1,2}/, router-gemv-b2-pass{1,2}/,
+  the gate JSONs beside them, router-gemv-profile/; serve logs
+  serve-20260904-{172942,173640,175648}.log.
