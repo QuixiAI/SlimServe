@@ -15,7 +15,7 @@ def test_rtx6000_record_opts_into_mtp_while_a100_stays_off():
     assert a100.speculative is False
     spec = _speculative_config(rtx)
     assert spec["method"] == "mtp"
-    assert spec["num_speculative_tokens"] == 1  # the k=1 equivalence gate first
+    assert spec["num_speculative_tokens"] == 3  # the retained depth (perf entry 2026-09-04)
     assert spec["moe_backend"] == "triton"
     assert spec["attention_backend"] == "QUIXICORE_MLA_SPARSE"
     assert spec["index_share_for_mtp_iteration"] is True

@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
@@ -47,6 +48,7 @@ from vllm.sequence import IntermediateTensors
 logger = init_logger(__name__)
 
 MTP_SIDECAR_FILE = "model_mtp.safetensors"
+_DEBUG_TEACHER_FORCED = os.environ.get("SLIMSERVE_MTP_DEBUG", "0") == "1"
 
 
 def topk_buffer_width(config) -> int:
@@ -238,9 +240,43 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.model(
+        out = self.model(
             input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
         )
+        if _DEBUG_TEACHER_FORCED and input_ids is not None and input_ids.shape[0] > 8:
+            self._log_teacher_forced(out[0], input_ids, spec_step_idx)
+        return out
+
+    @torch.no_grad()
+    def _log_teacher_forced(
+        self, hidden: torch.Tensor, input_ids: torch.Tensor, spec_step_idx: int
+    ) -> None:
+        """Diagnostic (SLIMSERVE_MTP_DEBUG=1): on a multi-token draft pass the
+        draft's input at row i is the token at position i+1 and its target
+        is the token at i+2, i.e. input_ids[i + 1]; report top-1 agreement."""
+        logits = self.model.compute_logits(hidden, spec_step_idx)
+        if logits is None:
+            return
+        pred = logits.argmax(dim=-1)[:-1]
+        gold = input_ids[1:]
+        acc = (pred == gold).float().mean().item()
+        logger.info(
+            "glm5_next_mtp teacher-forced: %d rows, top-1 next-token agreement %.3f",
+            int(gold.numel()),
+            acc,
+        )
+        dump_dir = os.environ.get("SLIMSERVE_MTP_DEBUG_DIR")
+        if dump_dir and get_tensor_model_parallel_rank() == 0:
+            # Draft argmax per row for the offline draft-vs-target comparison.
+            os.makedirs(dump_dir, exist_ok=True)
+            self._dump_idx = getattr(self, "_dump_idx", 0) + 1
+            torch.save(
+                {
+                    "input_ids": input_ids.cpu(),
+                    "draft_argmax": logits.argmax(dim=-1).cpu(),
+                },
+                os.path.join(dump_dir, f"draft-{self._dump_idx:03d}.pt"),
+            )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

@@ -19750,3 +19750,116 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Raw: perf/results/2026-09-04/router-gemv-pass{1,2}/, router-gemv-b2-pass{1,2}/,
   the gate JSONs beside them, router-gemv-profile/; serve logs
   serve-20260904-{172942,173640,175648}.log.
+
+## 2026-09-04: GLM-5.3-Flash MTP (NextN) draft path on sm_120 - port, the stack's noise floor, and a per-workload verdict
+
+- Status: retained for the rtx6000 record at num_speculative_tokens 3, as a
+  workload-dependent win (deterministic / structured / chat) with the dense
+  prose exact-token shapes recorded as the pessimistic bound. Phase 3 of
+  docs/glm53-flash-sm120-plan.md. Branch glm53-flash-sm120-mtp (worktree),
+  rebased on bb9fa28a4 (router gate) at measurement time.
+- Scope: GLM-5.3-Flash / glm53-nvfp4-4 / rtx6000 (4x RTX PRO 6000, TP4).
+  New: vllm/model_executor/models/glm5_next_mtp.py (draft model),
+  vllm/v1/spec_decode/glm5_next_mtp.py (proposer on Step3p5MTPProposer:
+  one block table AND one slot mapping per KV cache group, non-primary
+  groups recomputed per draft step with their own block size),
+  Glm5NextMTPBlock in glm5_next.py (plain-residual DSA block: the MTP layer
+  has no mHC and no KDA). Edits: config/speculative.py (glm5_next ->
+  glm5_next_mtp: promotes text_config, carries quantization_config;
+  use_glm5_next_mtp), models/registry.py, model_loader/default_loader.py (a
+  model naming explicit weight files bypasses the index filter),
+  llm_base_proposer.py (tuple-return arch; GLM VL config uses
+  image_token_id), gpu_model_runner.py, slimserve/registry.py (a platform
+  record may carry its own `speculative`), profiles.json (source speculator
+  engine: mtp, index_share_for_mtp_iteration, moe_backend triton for the
+  FP8-block draft experts, attention_backend QUIXICORE_MLA_SPARSE; rtx6000
+  record speculative, k=3; a100 unchanged). Spec-off boots of the record:
+  `slimserve glm53-nvfp4-4 --no-spec`. Tests: tests/v1/spec_decode/
+  test_glm5_next_mtp.py (5), tests/glm5_next/test_mtp_port.py (6),
+  tests/slimserve/test_record_speculative.py (1).
+- Baseline: the same tree with speculation off. Exact-token 1000 in / 300
+  out: c1 112-113 / c8 446-457 / c16 608-611 (peer's cells, two boots);
+  single-stream 300-token cells: greedy 109-119 tok/s, temp 0.7 / top-p 0.9
+  112-115 (workload_bench.py, two runs per cell).
+- Hypothesis: the checkpoint's own MTP head (layer 45, 7.1 GB in
+  model_mtp.safetensors, experts FP8 block-128) gives >= 2 accepted tokens
+  per step at depth 3 (llama.cpp per-position 0.92/0.81/0.60; B12X 2.50
+  accepted per step at MTP-3 on this hardware).
+- Change (draft design): the draft reads only model_mtp.safetensors (the
+  11 target shards are not re-streamed); enorm/hnorm/eh_proj +
+  Glm5NextMTPBlock + SharedHead; embeddings and lm_head shared from the
+  target by the proposer (log lines confirm); forward returns (pre-norm
+  hidden, post-norm recycled hidden) as deepseek_mtp; step 0 computes top-k
+  in the draft's own pooled indexer, later steps reuse it
+  (set_skip_topk / compact_topk_indices). Bring-up fixes: (1) the loader
+  hands the draft the serving VllmConfig whose model_config is the VL
+  wrapper (no num_hidden_layers), so the draft takes its config from
+  speculative_config.draft_model_config; (2)
+  get_spec_layer_idx_from_weight_name matches "model.layers.<n>." only, so
+  the "model.language_model." prefix is stripped first; (3) the proposer's
+  VL list needed Glm5NextForConditionalGeneration (image_token_id); (4) the
+  base proposer hands the draft ONE slot mapping (the sparse-MLA group's),
+  so the indexer's key rows were inserted at MLA-group slot numbers: fixed
+  by building on Step3p5MTPProposer; (5) the indexer group's block is 2176
+  tokens beside the MLA group's 1088 on this record, so the per-step slot
+  recompute uses each group's own block size. Fixes (4)+(5) moved k=1
+  acceptance from 0.44 to 0.49 on the prose harness: real but secondary.
+- Correctness / noise floor (applies to every gate in this campaign): the
+  planned greedy k=1 bit-equivalence gate FAILED (0/8 prompts identical)
+  and turned out to be inapplicable. On ONE spec-off boot, two consecutive
+  prompt_logprobs requests over 4,344 prompt tokens differ per token with
+  sd 0.47 nats (13% by > 0.5; 8-slice mean moves ~0.02); two spec-off boots
+  flip the first greedy token on 1/8 prompts with a max top-5 delta of
+  1.94 nats; spec-off vs MTP boot: 0/8 flips, 0.99 max delta, prefill
+  mean +0.014, per-token sd 0.47. The stack is not run-to-run deterministic
+  at the token level (MoE routing flips from nondeterministic reductions;
+  VLLM_BATCH_INVARIANT does not cover Marlin MoE, the QuixiCore sparse
+  kernels, the pooled indexer or KDA), and the MTP verify path is
+  indistinguishable from the no-spec path inside that noise. Gates are
+  statistical from here on: >= 2 boots per arm, exact-token deltas under
+  3% need two boots (boot spread ~2.5% at every concurrency), scoring
+  deltas under 0.03 are noise. Raw: perf/results/2026-09-04/
+  glm53-nvfp4-4-rtx6000-mtp-diag/noise-summary.txt.
+- Draft health (accept_probe.py, greedy, k=1, 200-token cells, server
+  counters): context-zero self-continuation 84.3% (the published setting),
+  Foundry repair-triage JSON 79.3%, chat 52-85%, dense technical prose
+  50-75% (mean 66%); at temp 1.0 / top-p 0.95 / top-k 20: ctx0 68%, JSON
+  50%, chat 59-84%, prose 33-61%. The head is where the published curve
+  says on the published setting; the prose harness is hard text for any
+  drafter (the target's own top-1 vs gold there is ~45%). Draft-vs-target
+  argmax agreement measured on the draft's prefill pass (SLIMSERVE_MTP_DEBUG
+  hook) is 35-53% on prose and is NOT a usable health proxy (it tracks
+  target-vs-gold, not decode acceptance). The Triton FP8-block MoE path
+  serving the draft experts therefore needs no parity chase for this item.
+- Results (all exact:true; accepted per step from the harness counters):
+  | shape (prose harness, temp 1.0)   | spec off  | MTP k=1     | MTP k=3     |
+  | c1 1000/300                        | 112-113   | 99.0 (0.49) | 94.9 (0.59) |
+  | c8 1000/300                        | 446-457   | 396 (0.43)  | 323 (0.58)  |
+  | c16 1000/300                       | 608-611   | -           | 421 (0.61)  |
+  | c1 1000/2000                       | -         | -           | 108 (0.62)  |
+  | c8 1000/2000                       | -         | -           | 423 (0.92)  |
+  | single-stream cell, 300 out        | spec off  | MTP k=3 (accepted/step)            |
+  | Foundry JSON, greedy               | 114 / 109 | 127 / 135 (0.89 / 1.07)            |
+  | ctx0, greedy                       | 119 / 119 | 151 / 151 (1.23 / 1.23)            |
+  | code chat, greedy                  | 115 / 115 | 167 / 147 (1.50 / 1.17)            |
+  | prose-style chat, greedy           | 115 / 115 | 120 / 135 (0.73 / 0.95)            |
+  | code chat, temp 0.7 / top-p 0.9    | 112 / 112 | 120 / 157 (0.81 / 1.39)            |
+  | prose-style chat, 0.7 / 0.9        | 112 / 112 | 130 / 126 (0.98 / 0.89)            |
+  | ctx0, 0.7 / 0.9                    | 115 / 115 | 123 / 106 (0.83 / 0.55)            |
+  | Foundry JSON, 0.7 / 0.9            | 70 / 108  | 57 / 117 (1.14 / 0.89) [107-152-token completions; not timeable] |
+  Reading: MTP k=3 is +17..+46% in deterministic mode on structured / chat /
+  self-continuation, +5..+40% on chat at the pipeline's sampling, neutral on
+  free text at 0.7, and -15..-30% on the dense-prose exact-token shapes at
+  temp 1.0 where acceptance is 0.6 of 3. The Foundry pipeline runs either
+  deterministic (greedy) or temp 0.7 / top-p 0.9 on templated JSON.
+- Decision: retained on the rtx6000 record with k=3 for the pipeline
+  workload it was measured on; the prose harness cells are the pessimistic
+  bound and are reported alongside. The spec-off arm stays one flag away
+  (`--no-spec`) for the launch-count work. Owed before the Foundry arm
+  switches: c8 with real director prompts (the prose c8 was 323 vs 457) and
+  a longer JSON cell (the synthetic triage prompt finishes in ~110 tokens).
+- Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-mtp-{k1,k3,
+  fix-k1,fix-k3}/ (exact-token JSON + completions), .../mtp-diag/ (gate,
+  greedy fingerprints, logit probes, noise summary, accept probes,
+  workload bench JSON, foundry-prompt.txt); scratch under
+  /raid/scratch/slimserve-glm53/mtp-gate/ (serve outputs, draft dumps).
