@@ -10,6 +10,7 @@ returns the usual (topk_weights, topk_ids) and publishes the alignment for
 fused_marlin_moe, which consumes it (matched on the topk_ids tensor) when its
 own block size matches. Decode only: M <= 16 tokens."""
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -72,10 +73,16 @@ def alignment_geometry(
     return max_padded, (max_padded + block_size - 1) // block_size
 
 
+# Kill-switch for performance diagnosis: SLIMSERVE_GLM_ROUTE_ALIGN=0 keeps the
+# reference routing (grouped_topk + moe_align_block_size) on every batch.
+_ENABLED = os.getenv("SLIMSERVE_GLM_ROUTE_ALIGN", "1") != "0"
+
+
 def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
     bias = router.e_score_correction_bias
     return (
-        current_platform.is_cuda()
+        _ENABLED
+        and current_platform.is_cuda()
         and quixicore_ops.has_glm_route_align()
         and router_logits.dim() == 2
         and router_logits.dtype == torch.float32

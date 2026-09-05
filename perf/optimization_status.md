@@ -20103,3 +20103,42 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   which never exercised the change inside a captured graph with the
   auxiliary stream, so "parked on kernel evidence" was too weak a bar for
   a launcher that changes residency assumptions.
+
+## 2026-09-05: Release rebuild validated for serving; open issue: native glm_route_align + profiler boot
+
+- Status: RETAINED build; one OPEN ISSUE. The Release rebuild of 2026-09-04
+  22:40-23:52 (rebuild.sh, build-6 recipe, CMAKE_BUILD_TYPE=Release, mHC
+  launcher reverted) ships the fused routing kernel in _quixicore_C
+  (4.05 MB, `has_glm_route_align()` true).
+- Validation on the native binding, no dev hook: 24 kernel parity tests
+  pass (routing at M = 1..16, router GEMV); exact-token boot `--no-spec`:
+  c1 107.04 / 110.48 (pass 1 at /health), c8 449.5 / 448.1, c16 599.4 /
+  599.0, gates -2.435 / -2.427 (band -2.416..-2.457). The JIT-hook arm of
+  the same pair profiled at 8.29 ms span / 1392 launches as before.
+- Open issue: every profiler boot (`--torch-profile-dir`) on this build
+  with the native routing binding active dies with "CUDA error: an
+  illegal memory access" about 2 s after "Torch profiler disabled for
+  CUDA graph capture", before any request (3 of 3). The same boot with
+  SLIMSERVE_GLM_ROUTE_ALIGN=0 profiles cleanly (0 CUDA errors, trace
+  captured); the same boot with the JIT-built kernel through the dev hook
+  profiles cleanly; the same boot with CUDA_LAUNCH_BLOCKING=1 comes up
+  healthy; plain boots (no profiler) serve, bench and gate cleanly.
+  Standalone, the native kernel passes M = 1..16 under CUDA_LAUNCH_BLOCKING,
+  under CUDA graph capture + replay, and under torch.profiler. So this is
+  a race that needs asynchronous execution plus the profiler-boot sequence
+  (profile_run at 8192 tokens, capture, sampler warmup, the inductor
+  lazy-init pre-trigger) and the native compile of the kernel (12.0f
+  family cubin, Release) rather than the JIT compile (12.0a, -O3,
+  --use_fast_math). Not understood yet.
+- Workarounds recorded: profiling boots use `QC_DEV_ROUTE=1
+  PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site` (JIT kernel) or
+  `SLIMSERVE_GLM_ROUTE_ALIGN=0` (reference routing); serving boots need
+  nothing. Kill-switch added to glm_route_align.py (same pattern as the F32
+  sidecar's).
+- Next: rebuild the JIT extension with the native flags (12.0f, no
+  fast-math) and profile-boot it through the hook; if that faults, the
+  cause is the compile, else the binding path; then compute-sanitizer
+  racecheck on the smallest reproducer (TP1 if it reproduces there).
+- Raw: serve-logs/serve-20260904-215236.log (pair arm A), 20260905-001133
+  (native-only), 002508 (routing off, clean), 002806 (CUDA_LAUNCH_BLOCKING,
+  healthy); perf/results/2026-09-04/route-fused-profile/ for the pairs.
