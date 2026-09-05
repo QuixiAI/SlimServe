@@ -204,6 +204,7 @@ from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+from vllm.v1.spec_decode.glm5_next_mtp import Glm5NextMTPProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
@@ -633,6 +634,7 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
                 | Qwen4ExpMTPProposer
+                | Glm5NextMTPProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -671,6 +673,8 @@ class GPUModelRunner(
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_qwen4_exp_mtp():
                 self.drafter = Qwen4ExpMTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_glm5_next_mtp():
+                self.drafter = Glm5NextMTPProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2655,7 +2659,7 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
             if self.speculative_config and isinstance(
-                self.drafter, Qwen4ExpMTPProposer
+                self.drafter, (Qwen4ExpMTPProposer, Glm5NextMTPProposer)
             ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor

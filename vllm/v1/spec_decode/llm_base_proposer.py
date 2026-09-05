@@ -1025,8 +1025,9 @@ class SpecDecodeBaseProposer:
             # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
             # norm hidden, so its forward returns (logit_hidden,
             # recycle_hidden). Other MTP families return a single tensor.
-            return "DeepSeekMTPModel" in (
-                self.draft_model_config.hf_config.architectures or []
+            archs = self.draft_model_config.hf_config.architectures or []
+            return any(
+                arch in archs for arch in ("DeepSeekMTPModel", "Glm5NextMTPModel")
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 
@@ -1394,6 +1395,7 @@ class SpecDecodeBaseProposer:
                 "Qwen3VLForConditionalGeneration",
                 "Qwen3VLMoeForConditionalGeneration",
                 "Qwen4ExpForConditionalGeneration",
+                "Glm5NextForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
                 "Gemma4UnifiedForConditionalGeneration",
                 "Step3p7ForConditionalGeneration",

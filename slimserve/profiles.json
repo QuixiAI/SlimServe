@@ -1183,9 +1183,12 @@
         "local_dir": "GLM-5.3-Flash-NVFP4",
         "engine": {
           "method": "mtp",
-          "num_speculative_tokens": 1
+          "num_speculative_tokens": 1,
+          "index_share_for_mtp_iteration": true,
+          "moe_backend": "triton",
+          "attention_backend": "QUIXICORE_MLA_SPARSE"
         },
-        "note": "The checkpoint ships a one-layer MTP head (layer 45: DSA attention + MoE, eh_proj/enorm/hnorm). The glm5_next MTP draft path is not ported yet; profiles stay non-speculative until it is."
+        "note": "The checkpoint ships a one-layer MTP head (layer 45: DSA attention + pooled indexer + MoE, eh_proj/enorm/hnorm, shared_head.norm) in model_mtp.safetensors, outside the shard index; the glm5_next_mtp draft reads that file alone. Its experts are FP8 block-128 (compressed-tensors group_1), not NVFP4, so the draft pins moe_backend triton instead of inheriting the target's marlin; attention_backend pins the QuixiCore sparse NoPE MLA the target serves with (the draft's attention backend is auto-selected otherwise). Ported 2026-09-04; each platform record opts in with its own `speculative` flag once validated there."
       },
       "quants": {
         "NVFP4": {
@@ -2740,6 +2743,10 @@
             "served_model_name": "GLM-5.3-Flash",
             "enable_prefix_caching": true
           },
+          "speculative": true,
+          "speculative_overrides": {
+            "num_speculative_tokens": 1
+          },
           "env": {},
           "notes": [
             "BRING-UP RECORD (2026-09-04), not yet validated: this is the a100 record's kernel set carried to sm_120 as the Phase 0 baseline of docs/glm53-flash-sm120-plan.md. Nothing here is a measured sm_120 choice until the notebook says so; each line below states what is known.",
@@ -2748,7 +2755,7 @@
             "attention_config QUIXICORE_MLA_SPARSE: the QuixiCore sparse NoPE MLA decode kernel compiled for sm_120 (99 KB opt-in shared memory, vs 163 KB on sm80); parity against tests/kernels/test_quixicore_sparse_mla_bf16.py is owed before any number is recorded. FlashInfer's SM120 GLM53_NOPE sparse MLA (#4802) is the A/B partner.",
             "kv_cache_dtype auto (bf16) for bring-up. fp8_ds_mla KV is the planned Phase 1 change (row layout for pe_dim 0 from vLLM #55277) and needs its own on-box validation note before it lands here.",
             "Host and NVMe KV tiers are NOT configured on this record yet, matching how the a100 baseline was measured (2026-09-03: no host tier) before the tier landed with its own acceptance. This box has 188 GB host RAM (earlyoom active), so the a100 figure of 64 GiB per rank does not transfer; the plan is 32 GiB per rank plus a 128 GiB per-rank disk tier in SLIMSERVE_KV_TIER_DIR, added only after benchmarks/benchmark_kv_tier_eviction.py with VLLM_KV_TIER_VERIFY=1 passes here.",
-            "Speculation: the checkpoint ships model_mtp.safetensors but the glm5_next MTP draft path is not ported; profile stays non-speculative until Phase 3 of the plan.",
+            "Speculation: MTP (NextN) draft path ported 2026-09-04 (vllm/model_executor/models/glm5_next_mtp.py + v1/spec_decode/glm5_next_mtp.py). This record opts in with `speculative: true`; speculative_overrides.num_speculative_tokens starts at 1 for the greedy k=1 equivalence gate and moves to 3 (the acceptance curve's sweet spot) once k=2/3 pass the exact-token and deep-context legs. The a100 record stays non-speculative (not validated there). Validation status is recorded in perf/optimization_status.md.",
             "Reference bars for this platform: rtx6kpro B12X R24 (2026-09-04) 169.9 c1 / 737.8 c8 no-spec and 247.8 / 903.2 with MTP-3; Foundry SGLang FP8 141.7 c1 / 274 c4 with NextN. The a100 TP4 record is 73.8 / 332.1 / 464.6 at c1/c8/c16.",
             "F32 sidecar REQUIRED (2026-09-04, retained): the RedHatAI conversion downcast the router bias (e_score_correction_bias), the KDA decay tensors (A_log, dt_bias) and the mHC base/scale vectors to BF16; after fetching, build `<model>/f32-overrides.safetensors` from the native zai-org/GLM-5.3-Flash checkpoint with `python -m slimserve.f32_overrides --native <native> --model <this checkpoint>` (290 tensors, 1.2 MB). The glm5_next loader applies it when present (log line: '290 F32 override tensors'); it is throughput-neutral (104.7 / 431.6 vs 104.7 / 432.3 at c1 / c8) and lifts the scoring gate's mean text logprob by ~0.03 nats/token (perf/optimization_status.md 2026-09-04, F32 sidecar)."
           ]

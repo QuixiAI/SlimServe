@@ -267,6 +267,9 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
         # qwen38-nvfp4-1: the MI300X variant reuses the checkpoint's MTP
         # head, the Metal variant serves the measured DFlash2 drafter).
         "speculator": record.get("speculator"),
+        # A record may enable or disable speculation for its platform alone
+        # (glm53-nvfp4-4: MTP validated on rtx6000 first, a100 stays off).
+        "speculative": record.get("speculative"),
     }
 
 
@@ -399,7 +402,11 @@ def resolve(
         quant=chosen,
         engine=merged["engine"],
         env=merged["env"],
-        speculative=bool(profile.get("speculative")),
+        speculative=bool(
+            profile.get("speculative")
+            if merged["speculative"] is None
+            else merged["speculative"]
+        ),
         speculative_overrides=merged["speculative_overrides"],
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],

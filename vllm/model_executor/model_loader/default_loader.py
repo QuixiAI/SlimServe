@@ -214,7 +214,14 @@ class DefaultModelLoader(BaseModelLoader):
                     use_safetensors = True
                 break
 
-        if use_safetensors:
+        # A model that names its files explicitly (no glob) owns that choice:
+        # GLM-5.3-Flash NVFP4 conversions keep the MTP head in
+        # model_mtp.safetensors outside model.safetensors.index.json, and the
+        # index filter below would drop it.
+        explicit_files = allow_patterns_overrides is not None and not any(
+            any(ch in pattern for ch in "*?[") for pattern in allow_patterns_overrides
+        )
+        if use_safetensors and not explicit_files:
             # For models like Mistral-7B-Instruct-v0.3
             # there are both sharded safetensors files and a consolidated
             # safetensors file. Using both breaks.
