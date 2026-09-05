@@ -2659,7 +2659,7 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
             if self.speculative_config and isinstance(
-                self.drafter, (Qwen4ExpMTPProposer, Glm5NextMTPProposer)
+                self.drafter, Qwen4ExpMTPProposer
             ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor

@@ -3,32 +3,33 @@
 """Proposer for the GLM-5.3-Flash MTP head.
 
 The draft layer owns two KV cache layers that land in two scheduler groups:
-the sparse NoPE MLA cache (``...self_attn.attn``, the main owner whose
+the sparse NoPE MLA cache (``...self_attn.attn``, the primary owner whose
 group carries the proposer's block table and slot mapping) and the pooled
 indexer's key cache (``...self_attn.indexer.k_cache``). The base proposer
-assumes one group; this follows ``Qwen4ExpMTPProposer`` and builds each
-owner's metadata from its own group's block table.
+assumes one group and hands the drafter one slot mapping; the indexer's
+rows would then be inserted at the MLA group's slot numbers. This builds on
+``Step3p5MTPProposer``, which stages a block table AND a slot mapping per
+group from the runner and recomputes the non-primary groups' slot mappings
+per draft step from their own block tables.
 """
-
-from copy import copy
 
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.worker.utils import AttentionGroup
 
 MAIN_LAYER_SUFFIX = ".self_attn.attn"
 
 
-class Glm5NextMTPProposer(EagleProposer):
+class Glm5NextMTPProposer(Step3p5MTPProposer):
     """Speculative decoding proposer for GLM-5.3-Flash MTP."""
 
     def __init__(
@@ -38,50 +39,16 @@ class Glm5NextMTPProposer(EagleProposer):
         runner=None,
     ) -> None:
         super().__init__(vllm_config, device, runner)
-        self._per_group_block_tables: dict[int, torch.Tensor] = {}
 
     def model_returns_tuple(self) -> bool:
         """The draft returns (pre-norm hidden, recycled post-norm hidden)."""
         return True
 
-    def set_per_group_block_table(self, gid: int, block_table: torch.Tensor) -> None:
-        """Stage one scheduler group's block table for drafting."""
-        self._per_group_block_tables[gid] = block_table
-
-    def build_per_group_and_layer_attn_metadata(
-        self,
-        common_attn_metadata: CommonAttentionMetadata,
-        draft_index: int = 0,
-    ) -> tuple[list[object], dict[str, object]]:
-        per_group_attn_metadata: list[object] = []
-        per_layer_attn_metadata: dict[str, object] = {}
-        common_by_gid: dict[int, CommonAttentionMetadata] = {}
-        num_reqs = common_attn_metadata.num_reqs
-
-        for attn_group in self.draft_attn_groups:
-            gid = attn_group.kv_cache_group_id
-            group_common = common_by_gid.get(gid)
-            if group_common is None:
-                if gid == self.kv_cache_gid:
-                    group_common = common_attn_metadata
-                else:
-                    block_table = self._per_group_block_tables.get(gid)
-                    assert block_table is not None, (
-                        f"Missing GLM-5.3 draft block table for KV cache group {gid}"
-                    )
-                    group_common = copy(common_attn_metadata)
-                    group_common.block_table_tensor = block_table[:num_reqs]
-                common_by_gid[gid] = group_common
-
-            attn_metadata = attn_group.get_metadata_builder().build_for_drafting(
-                common_attn_metadata=group_common,
-                draft_index=draft_index,
-            )
-            per_group_attn_metadata.append(attn_metadata)
-            for layer_name in attn_group.layer_names:
-                per_layer_attn_metadata[layer_name] = attn_metadata
-
-        return per_group_attn_metadata, per_layer_attn_metadata
+    def _maybe_share_lm_head(self, target_language_model: torch.nn.Module) -> None:
+        # Unlike Step3.5, the GLM-5.3 head has no lm_head of its own: the
+        # checkpoint carries shared_head.norm only, the target's lm_head is
+        # shared in (base behaviour).
+        EagleProposer._maybe_share_lm_head(self, target_language_model)
 
     def initialize_attn_backend(
         self,
@@ -131,8 +98,8 @@ class Glm5NextMTPProposer(EagleProposer):
             )
             attention_groups.append(attn_group)
 
-        # Main owner first so the base proposer's single-group assumptions
-        # (block table, slot mapping) read the sparse MLA group.
+        # Primary owner first: the base proposer reads the first group's
+        # block table and slot mapping.
         self.draft_attn_groups = sorted(
             attention_groups,
             key=lambda group: (
@@ -142,6 +109,13 @@ class Glm5NextMTPProposer(EagleProposer):
             ),
         )
         self.block_size = kernel_block_sizes[self.kv_cache_gid]
+        # The per-step slot recomputation for the other groups uses one
+        # block size; both GLM groups share the unified attention block.
+        for gid in {g.kv_cache_group_id for g in self.draft_attn_groups}:
+            assert kernel_block_sizes[gid] == self.block_size, (
+                "GLM-5.3 draft cache groups must share one kernel block size, "
+                f"got {kernel_block_sizes}"
+            )
 
     def _map_draft_layers_to_groups(
         self,
