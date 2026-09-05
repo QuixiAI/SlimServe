@@ -140,9 +140,14 @@ def test_indexer_group_gets_its_own_block_table_and_slot_mapping(monkeypatch):
     assert sm[INDEXER_LAYER].tolist() == [7, 8, 9]
 
 
-def test_next_step_recomputes_the_indexer_slots_from_its_own_table(monkeypatch):
+def test_next_step_recomputes_the_indexer_slots_with_its_own_block_size(monkeypatch):
     p, config = _proposer(monkeypatch)
-    p.initialize_attn_backend(config, kernel_block_sizes=[BLOCK, BLOCK])
+    # Indexer group (gid 0) uses a block twice the MLA group's, as on rtx6000.
+    p.initialize_attn_backend(config, kernel_block_sizes=[2 * BLOCK, BLOCK])
+    assert p.block_size == BLOCK and p._per_group_block_sizes == {
+        0: 2 * BLOCK,
+        1: BLOCK,
+    }
     p.uses_mrope = False
     p.max_model_len = 4096
     # Indexer group block table: request 0 -> blocks [10, 11], request 1 -> [20, 21].
@@ -151,7 +156,9 @@ def test_next_step_recomputes_the_indexer_slots_from_its_own_table(monkeypatch):
         torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
         torch.zeros(2, dtype=torch.int64),
     )
-    positions = torch.tensor([BLOCK - 1, BLOCK + 5])  # old positions, one per request
+    positions = torch.tensor(
+        [2 * BLOCK - 1, BLOCK + 5]
+    )  # old positions, one per request
     common = SimpleNamespace(slot_mapping=torch.tensor([100, 200]), max_seq_len=10)
     monkeypatch.setattr(
         Glm5NextMTPProposer.__mro__[2],
@@ -159,13 +166,18 @@ def test_next_step_recomputes_the_indexer_slots_from_its_own_table(monkeypatch):
         lambda self, pos, cm, b, ib, bs: pos + 1,
     )
     new_pos = p._update_positions_dependent_metadata(positions, common, 2, 2, BLOCK)
-    assert new_pos.tolist() == [BLOCK, BLOCK + 6]
-    # request 0 moved into its second block; request 1 stays in its second block
-    assert p._per_group_slot_mappings[0].tolist() == [11 * BLOCK, 21 * BLOCK + 6]
+    assert new_pos.tolist() == [2 * BLOCK, BLOCK + 6]
+    # Indexer slots use the 2*BLOCK geometry: request 0 crosses into its
+    # second indexer block; request 1 stays in its first.
+    assert p._per_group_slot_mappings[0].tolist() == [
+        11 * 2 * BLOCK,
+        20 * 2 * BLOCK + BLOCK + 6,
+    ]
     assert p._per_group_slot_mappings[1].tolist() == [100, 200]
 
 
-def test_mismatched_group_block_sizes_are_rejected(monkeypatch):
+def test_group_block_sizes_may_differ(monkeypatch):
     p, config = _proposer(monkeypatch)
-    with pytest.raises(AssertionError, match="share one kernel block size"):
-        p.initialize_attn_backend(config, kernel_block_sizes=[128, BLOCK])
+    p.initialize_attn_backend(config, kernel_block_sizes=[128, BLOCK])
+    assert p.block_size == BLOCK
+    assert p._per_group_block_sizes == {0: 128, 1: BLOCK}

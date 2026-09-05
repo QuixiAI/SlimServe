@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
+from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
 from vllm.v1.worker.utils import AttentionGroup
 
 MAIN_LAYER_SUFFIX = ".self_attn.attn"
@@ -109,13 +110,58 @@ class Glm5NextMTPProposer(Step3p5MTPProposer):
             ),
         )
         self.block_size = kernel_block_sizes[self.kv_cache_gid]
-        # The per-step slot recomputation for the other groups uses one
-        # block size; both GLM groups share the unified attention block.
-        for gid in {g.kv_cache_group_id for g in self.draft_attn_groups}:
-            assert kernel_block_sizes[gid] == self.block_size, (
-                "GLM-5.3 draft cache groups must share one kernel block size, "
-                f"got {kernel_block_sizes}"
-            )
+        # The indexer group's block is not the MLA group's (2176 vs 1088
+        # tokens on the rtx6000 record: hybrid page-size unification), so
+        # the per-step slot recomputation below uses each group's own size.
+        self._per_group_block_sizes = {
+            g.kv_cache_group_id: kernel_block_sizes[g.kv_cache_group_id]
+            for g in self.draft_attn_groups
+        }
+
+    def _update_positions_dependent_metadata(
+        self,
+        positions: torch.Tensor,
+        common_attn_metadata,
+        batch_size: int,
+        input_batch_size: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Step3p5's recompute, with each non-primary group's own block size."""
+        old_positions_1d = positions[0] if self.uses_mrope else positions
+        positions = EagleProposer._update_positions_dependent_metadata(
+            self,
+            positions,
+            common_attn_metadata,
+            batch_size,
+            input_batch_size,
+            block_size,
+        )
+        self._per_group_slot_mappings[self.kv_cache_gid] = (
+            common_attn_metadata.slot_mapping
+        )
+        new_positions_1d = positions[0] if self.uses_mrope else positions
+        exceeds = old_positions_1d + 1 >= self.max_model_len
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            if gid == self.kv_cache_gid:
+                continue
+            block_table = self._per_group_block_tables.get(gid)
+            if block_table is None:
+                continue
+            gbs = self._per_group_block_sizes[gid]
+            n_blocks = block_table.shape[1]
+            bn = new_positions_1d // gbs
+            bn.clamp_(max=n_blocks - 1)
+            bn = bn.to(torch.long)
+            block_ids = block_table[:batch_size].gather(1, bn.unsqueeze(1)).squeeze(1)
+            sm = block_ids * gbs + (new_positions_1d % gbs)
+            sm.masked_fill_(exceeds, PADDING_SLOT_ID)
+            buf = self._slot_mapping_buffer_for(gid)
+            buf[:batch_size].copy_(sm)
+            if input_batch_size > batch_size:
+                buf[batch_size:input_batch_size].fill_(PADDING_SLOT_ID)
+            self._per_group_slot_mappings[gid] = buf[:batch_size]
+        return positions
 
     def _map_draft_layers_to_groups(
         self,
