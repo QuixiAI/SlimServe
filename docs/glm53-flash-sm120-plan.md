@@ -549,6 +549,15 @@ override in the Marlin MoE path for M <= 16 that skips fused_topk_bias and
 moe_align_block_size when the kernel ran. Second half of item 2 (moe_sum +
 memcpy + fused_add -> one kernel) follows the same shape. Both develop in
 the JIT harness and land in csrc/quixicore with the phase-end rebuild.
+Item 2 prototype (2026-09-04 19:30, jit/routing.cu): one block of 512
+threads does sigmoid scoring, bias-only top-8 (GLM's noaux_tc: n_group 1,
+norm_topk_prob, routed_scaling_factor 2.5), and the Marlin block alignment.
+Against the router's own grouped_topk and moe_align_block_size: ids
+identical, weights within 9e-8, block layout identical, M = 1..16. In-graph
+per layer: 6.3 -> 3.7 us at M=1, 6.8 -> 4.8 at M=8, 6.8 -> 6.0 at M=16,
+and three launches fewer (~0.15-0.2 ms per c1 step with their gaps).
+Plumbing next: GroupedTopKRouter override for M <= 16 that also returns the
+alignment, and fused_marlin_moe accepting it instead of recomputing.
 Kernel builds: the CMake build tree of build 6 did not survive the
 editable install, so new kernels are developed as a JIT extension
 (torch.utils.cpp_extension.load) against the same csrc/quixicore source and

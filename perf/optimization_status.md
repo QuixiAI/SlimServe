@@ -19793,3 +19793,53 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   mHC T<=8 cooperative launch).
 - Raw: perf/results/2026-09-04/indexer-fold-pass{1,2}/, gate JSONs beside
   them; serve-logs/serve-20260904-182244.log, ab-indexer-fold.log.
+
+## 2026-09-04: mHC cooperative launch for T <= 8 - NEUTRAL within the boot spread, PARKED; the boot spread itself measured
+
+- Status: PARKED (neutral end to end). Phase 1 item 3.
+- Scope: rtx6000 record on the indexer-fold tree (99180f9b6), the
+  cooperative fused_pre_transition launched with grid NSPLITS x T for
+  T <= 8 (the shipped binding takes it only for T == 1 and runs partials /
+  finalize / apply, three launches, above that). Prototype through a JIT
+  extension and a dev import hook (no repo change), two boots, two passes
+  each, gate twice on boot 2 (boot 1's gate hit an OOM caused by the hook
+  itself querying occupancy at import in the API-server and engine
+  processes, i.e. an extra CUDA context per process; fixed before boot 2).
+- Baseline: the fold tree, two boots: 113.28 / 456.3 / 609.9 (18:22) and
+  107.96 / 444.2 / 596.8 (19:17), gates -2.415..-2.457.
+- Kernel-level evidence (jit/test_mhc.py, in-graph per fused post+pre
+  site): T=1 7.5 -> 6.3 us, T=2 8.9 -> 6.5, T=4 9.0 -> 7.8, T=8 10.2 ->
+  9.3, T=16 12.0 -> 13.6 (worse, hence the cap at 8); parity at summation
+  order (1e-7 fp32, single-ulp bf16 flips). Expected end to end: ~0.2 ms
+  per c8 step (~1%), nothing at c1 (already cooperative) or c16 (capped).
+- Results (aggregate tok/s, pass1 / pass2):
+
+  | boot | c1 | c8 | c16 |
+  |---|---:|---:|---:|
+  | mHC arm 1 (18:55) | 109.28 / 109.43 | 452.6 / 451.6 | 598.6 / 599.1 |
+  | mHC arm 2 (19:07) | 109.13 / 109.13 | 452.2 / 451.8 | 598.1 / 595.9 |
+  | fold tree 1 (18:22) | 109.70 / 113.28 | 457.2 / 456.3 | 611.4 / 609.9 |
+  | fold tree 2 (19:17) | 107.80 / 107.96 | 443.5 / 444.2 | 598.2 / 596.8 |
+
+  The two mHC boots sit inside the fold tree's own two-boot spread at every
+  concurrency; a 1% c8 effect is not resolvable with two boots per arm.
+- Decision: PARKED. The launcher change (tm_cuda_serving.cu: occupancy
+  query, grid NSPLITS x T, cap 8; /raid/scratch/slimserve-glm53/
+  step_mhc_apply.py) rides with the phase-end native rebuild on its
+  kernel-level evidence, not as a retained throughput change.
+- The boot spread, measured: same tree, same config, consecutive boots
+  differ by up to 5% at c1 and 3% at c8/c16 (113.3 vs 108.0, 456 vs 444,
+  610 vs 597), gates in band both times, pass-to-pass inside a boot
+  < 0.3%. Ruled out today: clocks (2842-2872 MHz at every cell), foreign
+  GPU processes (none; the slow boot had 1 GiB MORE KV memory), the
+  compile cache being shared with the peer's MTP boots (each AOT entry has
+  its own inductor cache). Pattern that survives: all three slow boots
+  started within a minute of the peer's server exiting, the fast boots had
+  a 10-minute gap; a per-token slowdown at every concurrency is what
+  host-side contention on the API server's streaming path looks like.
+  From now on ab.sh logs load average and the top CPU processes at each
+  pass (serve-logs/hostload-<run>.txt); a slow boot with a busy host is
+  discarded, a slow boot on a quiet host is the next thing to profile.
+- Raw: perf/results/2026-09-04/mhc-coop-multi{,-b2}-pass{1,2}/,
+  fold-tree-b2-pass{1,2}/, gate JSONs beside them; jit/{qc_dev.cu,
+  test_mhc.py, site/sitecustomize.py} under /raid/scratch/slimserve-glm53/.
