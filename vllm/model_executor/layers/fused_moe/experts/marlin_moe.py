@@ -54,6 +54,20 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType, scalar_types
 
+# Marlin's lock/counter workspace only has to be zero when a kernel starts
+# and the kernel leaves it zero, which is why the dense Marlin methods
+# allocate it once per layer. Allocating (and zeroing) one per call put a
+# fill kernel in front of every MoE layer at decode; keep one per device.
+_MARLIN_MOE_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+
+
+def _marlin_moe_workspace(device: torch.device) -> torch.Tensor:
+    workspace = _MARLIN_MOE_WORKSPACE.get(device)
+    if workspace is None:
+        workspace = marlin_make_workspace_new(device, 4)
+        _MARLIN_MOE_WORKSPACE[device] = workspace
+    return workspace
+
 
 def _fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -100,7 +114,7 @@ def _fused_marlin_moe(
     N = marlin_moe_intermediate_size(w1, w2)
     w13_num_shards = 2 if activation.is_gated else 1
     if workspace is None:
-        workspace = marlin_make_workspace_new(hidden_states.device, 4)
+        workspace = _marlin_moe_workspace(hidden_states.device)
 
     if intermediate_cache13 is None:
         intermediate_cache13 = torch.empty(

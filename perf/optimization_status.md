@@ -20017,3 +20017,28 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   greedy fingerprints, logit probes, noise summary, accept probes,
   workload bench JSON, foundry-prompt.txt); scratch under
   /raid/scratch/slimserve-glm53/mtp-gate/ (serve outputs, draft dumps).
+
+## 2026-09-04: one Marlin MoE workspace per device instead of one per call - RETAINED (-37 launches, neutral time)
+
+- Status: RETAINED (clean-up with evidence). Phase 1 item 2, glue.
+- Scope: the routing-fusion tree (d72bb0a03 + docs, MTP merged, booted
+  `--no-spec` with the routing dev hook), profiler pair with the change
+  stashed (A) then applied (B), one c1 capture and one scoring gate each
+  (perf/results/2026-09-04/marlin-ws-profile/, prof_pair_stash.sh).
+- Hypothesis: `_fused_marlin_moe` allocated and zeroed a fresh lock
+  workspace on every call (`marlin_make_workspace_new`), one Fill kernel
+  in front of every MoE layer at decode (42 per step). The dense Marlin
+  methods allocate the workspace once per layer because the kernel leaves
+  it zeroed; the MoE kernel uses the same lock protocol.
+- Change: `_marlin_moe_workspace(device)` keeps one zeroed workspace per
+  device in marlin_moe.py and `_fused_marlin_moe` uses it when the caller
+  passes none. One file, +15/-1.
+- Correctness: gate on the same boot type, A -2.4302 vs B -2.4317 (band
+  -2.416..-2.457), needle margins 11.2/19.1 vs 16.6/19.2; a stale lock
+  would corrupt Marlin's output and show here.
+- Results (c1 full decode steps): A 8.16 ms span / 8.21 busy / 1406
+  launches; B 8.18 / 8.22 / 1369. The fills were hidden behind neighbours,
+  so no time is won; 37 launches per step are.
+- Decision: RETAINED. The chain since Phase 0 now stands at 8.2 ms of
+  kernels per c1 step against 9.19 (-11%), 1369 launches against 2041.
+- Raw: profile-marlin-ws-{A,B} traces under /raid/scratch/slimserve-glm53/.
