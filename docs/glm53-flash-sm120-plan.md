@@ -532,6 +532,23 @@ capped at T <= 8: about 0.9 us plus two launches per site at c8 (~0.2 ms
 per step, ~1%), nothing at c1, nothing at c16. Production form:
 step_mhc_apply.py (tm_cuda_serving.cu launcher + occupancy query), which
 needs the full native rebuild; the A/B runs through the dev import hook.
+Item 2 design (fused small-M routing, 2026-09-04 18:55): moe_align_block_size
+takes its single-kernel small-batch mode only for num_experts <= 64 (its
+shared memory is (threads+1) x experts ints), so GLM's 288 experts pay the
+two-block align kernel + count_and_sort + the Python-side fill every layer,
+after the separate grouped_topk kernel: 4 launches, ~9 us + 3 gaps per MoE
+layer at c1. A GLM-sized kernel for M x topk <= 128 assignments does all of
+it in one block: scores = sqrt(softplus(logits)) + bias from the fp32
+router logits, top-8 per token, renormalize/scale, then a 288-entry count
+in shared memory, warp prefix sum, block-aligned sorted_token_ids /
+expert_ids / num_tokens_post_pad in the layout Marlin expects (block_size_m
+8 at these M). It replaces grouped_topk 3.7 + align 2.6 + count_and_sort
+1.8 + fill 0.8 us and three dependency gaps: ~0.28 ms per c1 step (~3%),
+similar at c8 (M x topk = 64 assignments). Python wiring: a routing
+override in the Marlin MoE path for M <= 16 that skips fused_topk_bias and
+moe_align_block_size when the kernel ran. Second half of item 2 (moe_sum +
+memcpy + fused_add -> one kernel) follows the same shape. Both develop in
+the JIT harness and land in csrc/quixicore with the phase-end rebuild.
 Kernel builds: the CMake build tree of build 6 did not survive the
 editable install, so new kernels are developed as a JIT extension
 (torch.utils.cpp_extension.load) against the same csrc/quixicore source and
