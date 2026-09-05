@@ -253,7 +253,10 @@ def _show(plan: Plan) -> None:
     if plan.speculative:
         spec = plan.source["speculator"]
         method = spec["engine"].get("method", "dspark")
-        print(f"  spec      {method} k={spec['engine']['num_speculative_tokens']}")
+        depth = plan.speculative_overrides.get(
+            "num_speculative_tokens", spec["engine"]["num_speculative_tokens"]
+        )
+        print(f"  spec      {method} k={depth}")
     for key, value in sorted(plan.env.items()):
         print(f"  env       {key}={value}")
     for note in plan.notes:

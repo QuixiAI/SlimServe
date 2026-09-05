@@ -47,7 +47,7 @@ physics, research digest and phase gates are in
   T <= 8 (per-site win, neutral end to end; launcher change in
   `/raid/scratch/slimserve-glm53/step_mhc_apply.py` for the rebuild).
 - MTP (NextN) draft path merged from the peer session (40c0146e7): record
-  resolves to `spec mtp k=1` here; k=3 wins +17..46% greedy on Foundry
+  resolves to `spec mtp k=3` here (speculative_overrides); k=3 wins +17..46% greedy on Foundry
   JSON / context-zero / chat, loses on the dense-prose exact-token harness
   (pessimistic bound). Owed before the Foundry arm flips: c8 with real
   director prompts. **Non-speculative A/Bs now boot with `--no-spec`.**
