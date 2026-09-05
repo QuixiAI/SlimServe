@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-04; Phase 0 complete)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-04 evening; Phase 1 in progress, MTP merged)
 
 ## Mission
 
@@ -27,32 +27,60 @@ physics, research digest and phase gates are in
 `perf/optimization_status.md` entry and the record rows are in
 `perf/baseline_status.md`.
 
-## State (2026-09-04)
+## State (2026-09-04, evening)
 
-- Phase 0 done: native build for `12.0f` (local CUTLASS v4.4.2, DeepGEMM
-  builder guarded), `rtx6000` platform + variant registered, profile
-  serves, exact-token baseline **c1 104.8 / c8 431.4 / c16 591.0** tok/s
-  (1000/300, APC-hot; 1k/2k c1 108.1 / c8 500.5), canaries clean.
-  Bars: a100 TP4 73.8 / 332.1 / 464.6; B12X R24 no-spec 169.9 / 737.8.
-- Attribution (torch profiler, 2026-09-04 entry): c1 = 8.4 ms of kernels
-  in one FULL graph (~1,840 kernels), ~4.1 ms launch-bound (281 cuBLAS
-  GEMVs, mHC, a ~1,070-launch tail), NCCL only 0.93 ms (11 us per ring);
-  c8 Marlin at the expert-bandwidth floor, cuBLAS M=8 KDA projections
-  3.9 + 0.4 ms (poor small-M algorithm) is the c8 lever.
-- Checkpoint defect (plan 3d): RedHatAI downcast `e_score_correction_bias`,
-  KDA `A_log`/`dt_bias`, mHC base/scale to BF16 (97% of experts change
-  bias rank vs native). Fix from the native F32 tensors precedes any
-  retained optimization.
+- Phase 0 done: native build for `12.0f`, `rtx6000` platform + variant,
+  exact-token baseline **c1 104.8 / c8 431.4 / c16 591.0** (1000/300).
+  Bars: a100 TP4 73.8 / 332.1 / 464.6; B12X R24 no-spec 169.9 / 737.8
+  (published); the same image on this box, handicapped (CUDA 13.3 image on
+  the 580 driver, PCIe all-reduce off) 134.0 / 483.7 / 598.6 is the local
+  floor (notebook "B12X R24 control on tinybox").
+- Phase 1 retained, in order, all on the rtx6000 record (notebook entries
+  of 2026-09-04): F32 sidecar for the RedHatAI downcast (quality, neutral
+  throughput); KDA o_norm through the Triton kernel (+5.0% c1); g_a folded
+  into the merged in-projection; f_b/g_b as one strided bmm; router gate
+  through the QuixiCore projection GEMV (fp32 logits, -42 launches);
+  indexer wk/gate/weights_proj folded into fused_qkv_a_proj; fused small-M
+  routing + Marlin alignment (`glm_route_align`, -81 launches, -1.2% step
+  on the profiler pair). Harness now **c1 ~112 / c8 ~456 / c16 ~608** on a
+  normal boot (+7% / +6% / +3% over Phase 0). Parked: cooperative mHC for
+  T <= 8 (per-site win, neutral end to end; launcher change in
+  `/raid/scratch/slimserve-glm53/step_mhc_apply.py` for the rebuild).
+- MTP (NextN) draft path merged from the peer session (40c0146e7): record
+  resolves to `spec mtp k=1` here; k=3 wins +17..46% greedy on Foundry
+  JSON / context-zero / chat, loses on the dense-prose exact-token harness
+  (pessimistic bound). Owed before the Foundry arm flips: c8 with real
+  director prompts. **Non-speculative A/Bs now boot with `--no-spec`.**
+- Measurement facts that changed the method: the corrected attribution
+  (c1 9.19 ms GPU busy, 2,041 launches, GPU-bound; the earlier "8.4 + 1.1
+  host" averaged partial windows); the exact-token harness moves +-2.5%
+  between boots of one tree, and that spread is inter-kernel idle inside
+  the CUDA graph (same tree: 0.02 vs 0.46 ms per step), cause unknown
+  (clocks, foreign processes, NUMA, shared compile cache ruled out).
+  Launch-count changes under ~3% are decided on a same-tree profiler pair
+  (`perf/results/2026-09-04/route-fused-profile/prof_pair.sh`).
+- Native build state: the CMake tree did not survive the editable install;
+  new kernels (`glm_moe_routing.cuh`, the mHC launcher change) are proven
+  through the JIT harness in `/raid/scratch/slimserve-glm53/jit/` and need
+  ONE full rebuild (73 min, MemoryMax=120G, no benches while it runs) to
+  land in `_quixicore_C`; until then the routing fusion needs the dev hook
+  (`QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`).
 
 ## Next step
 
-Phase 1 in the attribution order (plan section "Baseline attribution"):
-(0) F32 tensor fix, (1) KDA gate GEMV fusion + DSA q_a/kv_a fusion, (2)
-launch tail, (3) small-M GEMM for KDA in_proj at M=2..16, (4) Marlin M=1
-tuning for sm_120, (5) PCIe-IPC all-reduce (FlashInfer nightly only), (6)
-lm_head GEMV. Gates per plan section 4: exact-token c1/c8/c16 within
-noise or better, NLL + needle legs, U+FFFD, one notebook entry per
-experiment including rejections.
+1. Full native rebuild at a quiet moment (peer idle, no benches), then a
+   no-hook profiler pair and an exact-token boot to confirm the routing
+   fusion and the mHC launcher on the shipped extension.
+2. Item 2 remainder: Marlin's per-call workspace zeroing (42 fills/step;
+   dense Marlin allocates once per layer), then moe_sum + memcpy + add.
+3. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
+   doc "Phase 1 item 1 pre-work": row-tiled or mma.sync; cuBLAS at 73-89%).
+4. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
+   between a fast and a slow boot; CPU governor `performance` as its own
+   experiment if that is empty.
+5. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
+Gates unchanged (plan section 4): exact-token within the band or better,
+NLL + needle within 0.03 nats, one notebook entry per experiment.
 
 ## Machine notes
 
