@@ -510,6 +510,17 @@ every T > 1 site runs partials -> finalize_pre_mix -> apply_pre_mix, three
 launches, which is the 271-launch / 1.13 ms mHC class at c8. The item is a
 T <= 16 cooperative variant (grid NSPLITS x T, or T tokens per block) so
 c8/c16 pay one launch per site like c1; expected 0.4-0.6 ms at c8.
+Item 2 scoping (MoE glue, from the router-gate tree's c1 trace): one MoE
+layer at c1 is 17 kernels, mHC pre 8.9 us, rms 1.5, router GEMV 2.7-3.6,
+shared gate_up 8.4, grouped_topk 3.7, shared silu 1.5, moe_align 2.6,
+shared down 5.5, count_and_sort 1.8, fill 0.8, Marlin w13 16.1, act 1.2,
+Marlin w2 10.5, moe_sum 1.3, memcpy 0.7, fused_add 0.8, NCCL 11.7. Fusable:
+topk + align + count_and_sort + fill into one M<=16 routing kernel (4 -> 1
+per layer, 126 launches per step), and moe_sum + memcpy + add into one or
+into the Marlin w2 epilogue (3 -> 1, 84 launches). A KDA layer is already
+11 kernels (mHC, rms, in_proj + splitK, fg_b bmm, conv, recurrent, memcpy,
+o_norm, o_proj, NCCL). Given the in-graph gap finding, each removed
+launch is worth its kernel time plus ~0.5 us of dependency latency.
 Kernel builds: the CMake build tree of build 6 did not survive the
 editable install, so new kernels are developed as a JIT extension
 (torch.utils.cpp_extension.load) against the same csrc/quixicore source and
