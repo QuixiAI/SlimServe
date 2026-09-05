@@ -19750,3 +19750,46 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Raw: perf/results/2026-09-04/router-gemv-pass{1,2}/, router-gemv-b2-pass{1,2}/,
   the gate JSONs beside them, router-gemv-profile/; serve logs
   serve-20260904-{172942,173640,175648}.log.
+
+## 2026-09-04: DSA indexer wk / kpool gate / weights_proj folded into fused_qkv_a_proj - RETAINED (+1.0% c1, +1.3% c8)
+
+- Status: RETAINED. Phase 1 item 1 step 1b (same-input GEMV fold).
+- Scope: rtx6000 record on the router-gate tree (bb9fa28a4), exact-token
+  1000/300 c1/c8/c16, one boot, two passes, gate twice.
+- Baseline: the router-gate repeat boot: c1 112.2 / c8 450.6 / c16 609.2.
+- Hypothesis: the pooled indexer computes three projections of the same
+  hidden_states per DSA layer (wk 128 x 4096, the kpool compress gate
+  128 x 4096, weights_proj 32 x 4096): three launch-floor GEMVs of 3.1-3.6
+  us at c1 (and weights_proj 21 us at c8 from a two-CTA cuBLAS heuristic),
+  33 launches per step, while fused_qkv_a_proj (replicated, disable_tp)
+  reads the same input.
+- Change: fused_qkv_a_proj gains three output shards (indexer_a_sizes);
+  MLAModules.indexer_a_sizes lets the MLA wrapper split them off and hand
+  them to the indexer as `precomputed`; Glm5NextPooledIndexer(fold_input_
+  projections=True) owns no wk / weights_proj / gate weights and skips the
+  three GEMVs; glm5_next's stacked_params_mapping maps the three checkpoint
+  tensors to shards 2-4 (the bare compress-gate parameter lands in the
+  merged .weight via a one-line loader fallback). Mapping dry-run on the
+  real tensor names: the three map, ape / k_norm / wq_b stay. Three files,
+  +71/-23; the non-folded path is unchanged for other models.
+- Correctness: boot clean (loader takes the new shards; F32 overrides
+  applied), exact:true in all six cells; gate -2.446 / -2.415 (band
+  -2.416..-2.447), needle margins 12.5/17.6 and 11.9/17.2.
+- Results (aggregate tok/s, pass1 / pass2):
+
+  | shape | baseline | indexer fold | change (pass 2) |
+  |---|---:|---:|---:|
+  | c1 1000/300 | 112.2 | 109.70 / 113.28 | +1.0% |
+  | c8 1000/300 | 450.6 | 457.16 / 456.28 | +1.3% |
+  | c16 1000/300 | 609.2 | 611.38 / 609.91 | +0.1% |
+
+  The pass-1 c1 cell started in the same second as /health (18:25:41) and
+  is discarded under the methodology rule. c8 gains more than c1 because
+  the 21 us weights_proj launch at M=8 is gone with the fold.
+  Cumulative since Phase 0: c1 104.8 -> 113.3 (+8.1%), c8 431.4 -> 456.3
+  (+5.8%), c16 591.0 -> 609.9 (+3.2%).
+- Decision: RETAINED. Item 1 steps 1-3a done; step 4 (tuned M<=16 GEMV
+  kernel) waits behind the larger launch-count items (MoE glue fusion,
+  mHC T<=8 cooperative launch).
+- Raw: perf/results/2026-09-04/indexer-fold-pass{1,2}/, gate JSONs beside
+  them; serve-logs/serve-20260904-182244.log, ab-indexer-fold.log.

@@ -170,9 +170,18 @@ class Glm5NextMLAAttention(nn.Module):
         self.num_local_heads = self.num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
 
+        # The pooled indexer's three hidden_states projections (wk, the kpool
+        # compress gate, weights_proj) ride in the same replicated GEMM as
+        # extra output shards instead of three launches per DSA layer.
+        self.indexer_a_sizes = (
+            config.index_head_dim,
+            config.index_head_dim,
+            config.index_n_heads,
+        )
         self.fused_qkv_a_proj = MergedColumnParallelLinear(
             self.hidden_size,
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim]
+            + list(self.indexer_a_sizes),
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
@@ -212,6 +221,7 @@ class Glm5NextMLAAttention(nn.Module):
             cache_config=cache_config,
             topk_indices_buffer=topk_indices_buffer,
             prefix=f"{prefix}.indexer",
+            fold_input_projections=True,
         )
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -226,6 +236,7 @@ class Glm5NextMLAAttention(nn.Module):
             indexer=self.indexer,
             is_sparse=True,
             topk_indices_buffer=topk_indices_buffer,
+            indexer_a_sizes=self.indexer_a_sizes,
         )
         self.mla_attn = MultiHeadLatentAttentionWrapper(
             self.hidden_size,
@@ -525,6 +536,9 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         # MLA latent projections
         ("fused_qkv_a_proj", "q_a_proj", 0),
         ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+        ("fused_qkv_a_proj", "indexer.wk", 2),
+        ("fused_qkv_a_proj", "indexer.index_kpool_compress_gate", 3),
+        ("fused_qkv_a_proj", "indexer.weights_proj", 4),
         # KDA merged input projection: [q, k, v, b(beta), f_a]
         ("in_proj_qkvgfab", "q_proj", 0),
         ("in_proj_qkvgfab", "k_proj", 1),
@@ -652,6 +666,10 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
                     ):
                         continue
                     tgt = name.replace(ckpt_name, target)
+                    if tgt not in params_dict and f"{tgt}.weight" in params_dict:
+                        # A bare checkpoint parameter folded into a Linear
+                        # (the indexer's kpool compress gate) lands in .weight.
+                        tgt = f"{tgt}.weight"
                     if tgt not in params_dict:
                         continue
                     param = params_dict[tgt]

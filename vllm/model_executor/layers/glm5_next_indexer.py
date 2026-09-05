@@ -404,8 +404,13 @@ class Glm5NextPooledIndexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor,
         prefix: str = "",
+        fold_input_projections: bool = False,
     ) -> None:
         super().__init__()
+        # When the owning attention layer folds wk, the kpool compress gate
+        # and weights_proj into its fused_qkv_a_proj, forward() receives their
+        # outputs as ``precomputed`` and this module holds no such weights.
+        self.fold_input_projections = fold_input_projections
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         assert self.head_dim == _K_DIM
@@ -423,20 +428,21 @@ class Glm5NextPooledIndexer(nn.Module):
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False,
             quant_config=quant_config, prefix=f"{prefix}.wq_b",
         )
-        self.wk = ReplicatedLinear(
-            config.hidden_size, self.head_dim, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.wk",
-        )
+        if not fold_input_projections:
+            self.wk = ReplicatedLinear(
+                config.hidden_size, self.head_dim, bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                config.hidden_size, self.n_heads, bias=False,
+                quant_config=quant_config, prefix=f"{prefix}.weights_proj",
+            )
+            self.index_kpool_compress_gate = nn.Parameter(
+                torch.zeros(self.head_dim, config.hidden_size), requires_grad=False
+            )
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
-            config.hidden_size, self.n_heads, bias=False,
-            quant_config=quant_config, prefix=f"{prefix}.weights_proj",
-        )
         self.index_kpool_compress_ape = nn.Parameter(
             torch.zeros(self.kp, self.head_dim), requires_grad=False
-        )
-        self.index_kpool_compress_gate = nn.Parameter(
-            torch.zeros(self.head_dim, config.hidden_size), requires_grad=False
         )
         self.k_cache = Glm5NextIndexerCache(
             head_dim=_ROW_DIM,
@@ -466,10 +472,19 @@ class Glm5NextPooledIndexer(nn.Module):
         qr: torch.Tensor,
         positions: torch.Tensor,
         rotary_emb=None,
+        precomputed: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_heads, self.head_dim).to(torch.bfloat16)
-        k, _ = self.wk(hidden_states)
+        if precomputed is not None:
+            k, gate, weights = precomputed
+        else:
+            k, _ = self.wk(hidden_states)
+            gate = torch.nn.functional.linear(
+                hidden_states,
+                self.index_kpool_compress_gate.to(hidden_states.dtype),
+            )
+            weights, _ = self.weights_proj(hidden_states)
         k = torch.nn.functional.layer_norm(
             k.float(),
             (self.head_dim,),
@@ -477,11 +492,7 @@ class Glm5NextPooledIndexer(nn.Module):
             self.k_norm.bias.float(),
             self.k_norm.eps,
         ).to(torch.bfloat16)
-        gate = torch.nn.functional.linear(
-            hidden_states, self.index_kpool_compress_gate.to(hidden_states.dtype)
-        ).to(torch.bfloat16)
-        packed = torch.cat([k, gate], dim=-1).contiguous()
-        weights, _ = self.weights_proj(hidden_states)
+        packed = torch.cat([k, gate.to(torch.bfloat16)], dim=-1).contiguous()
         weights = (weights.float() * self.n_head_scale).contiguous()
         if self._ape_f32 is None or self._ape_f32.device != q.device:
             self._ape_f32 = self.index_kpool_compress_ape.float().contiguous()

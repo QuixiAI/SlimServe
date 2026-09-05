@@ -521,6 +521,17 @@ into the Marlin w2 epilogue (3 -> 1, 84 launches). A KDA layer is already
 11 kernels (mHC, rms, in_proj + splitK, fg_b bmm, conv, recurrent, memcpy,
 o_norm, o_proj, NCCL). Given the in-graph gap finding, each removed
 launch is worth its kernel time plus ~0.5 us of dependency latency.
+Item 3 prototype (2026-09-04 18:40, JIT harness jit/qc_dev.cu): the
+cooperative fused_pre_transition already indexes tokens on blockIdx.y, so a
+grid of NSPLITS x T is one launch per site for any T whose blocks stay
+co-resident (17 on this card at 64 splits). Parity vs the shipped paths is
+summation-order level (1e-7 fp32, single-ulp bf16 flips). In-graph time per
+fused post+pre site: T=1 7.5 -> 6.3 us, T=2 8.9 -> 6.5, T=4 9.0 -> 7.8,
+T=8 10.2 -> 9.3, T=16 12.0 -> 13.6 (worse), so the cooperative path is
+capped at T <= 8: about 0.9 us plus two launches per site at c8 (~0.2 ms
+per step, ~1%), nothing at c1, nothing at c16. Production form:
+step_mhc_apply.py (tm_cuda_serving.cu launcher + occupancy query), which
+needs the full native rebuild; the A/B runs through the dev import hook.
 Kernel builds: the CMake build tree of build 6 did not survive the
 editable install, so new kernels are developed as a JIT extension
 (torch.utils.cpp_extension.load) against the same csrc/quixicore source and
