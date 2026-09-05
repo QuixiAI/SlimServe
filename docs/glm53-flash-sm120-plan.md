@@ -404,10 +404,12 @@ chain (KDA's four projections).
   (native has F32 `weight_scale_inv`), the rest BF16.
 
 ### Baseline attribution (2026-09-04, optimization_status entry of the same date)
-- c1 step 9.5 ms = 8.4 ms GPU kernels in one FULL graph (~1,840 kernels)
-  + ~1.1 ms host side. Physics class ~3.0 ms (KDA in_proj at 87% of
-  roofline, Marlin at 63%, sparse MLA + indexer); launch-bound class ~4.1 ms
-  (281 cuBLAS GEMVs 2.09 ms, mHC 0.70, ~1,070-launch tail 1.36); NCCL 0.93.
+- c1 step 9.5 ms = 9.2 ms GPU kernels in one FULL graph (2,041 kernels;
+  GPU-bound, ~0.3 ms outside the graph). CORRECTED 2026-09-04 evening: the
+  first reading (8.4 ms + 1.1 ms host) averaged partial capture windows.
+  Physics class ~3.3 ms (KDA in_proj at 82% of roofline, Marlin at 63%,
+  sparse MLA + indexer); launch-bound class ~4.5 ms (309 cuBLAS GEMVs 2.30
+  ms, mHC 0.77, ~1,200-launch tail 1.5); NCCL 0.99.
 - c8 decode step ~16.7 ms = 15.1 ms GPU: Marlin 5.17 ms AT the
   expert-bandwidth floor (64 distinct experts x 3.4 MiB x 42 layers per
   rank); cuBLAS 4.3 ms for the backbone (3.8 at c1: same bytes, 56-63% of

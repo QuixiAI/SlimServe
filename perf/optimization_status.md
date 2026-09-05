@@ -19676,3 +19676,28 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   DSA indexer fold (step 1b).
 - Raw: perf/results/2026-09-04/fg-b-batched-pass{1,2}/,
   fg-b-batched-gate{1,2}.json; serve-logs/ab-fg-b-batched.log.
+
+## 2026-09-04: CORRECTION to the sm_120 baseline attribution - the c1 step is GPU-bound
+
+- The "c1 step 9.5 ms = 8.4 ms GPU + ~1.1 ms host" reading in the
+  attribution entry above came from step_attrib.py averaging partial
+  capture windows (the first and last graph-launch windows of a bounded
+  capture hold fractions of a step). Selecting full decode steps (exactly
+  one sampling round per window) gives: c1 kernel busy 9.19 ms, span 9.11
+  ms, 2,041 launches per step, 90 NCCL rings, 83 Marlin launches; c8 15.12
+  ms busy, 2,380 launches. The c1 step is GPU-bound: the 9.5 ms bench step
+  leaves ~0.3 ms, not 1.1 ms, outside the graph. Class shares are unchanged
+  (cuBLAS gemvx 2.30 ms, wmma 1.50, Marlin 1.10, NCCL 0.99, mHC 0.77, MoE
+  glue 0.45, aten elementwise 0.42, copies 0.40). Tables regenerated in
+  perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-profile/, script fixed.
+- Same-method trace of today's tree with the router-gate tier applied
+  (perf/results/2026-09-04/router-gemv-profile/): 8.47 ms busy, 1,545
+  launches (-496: the o_norm decomposition, g_a, f_b/g_b and the router
+  cast), span 8.94 ms. New: 0.48 ms of net in-graph gaps per step where
+  Phase 0 had -0.08 (positive gaps 0.88 vs 0.50 ms, spread over every
+  class, largest before NCCL rings and after Triton/gemvx kernels). As the
+  graph loses small kernels it exposes launch-to-launch dependency latency
+  that used to be hidden by overlap; the remedy is fewer, larger kernels
+  (the rest of Phase 1), not more small removals. The per-launch floor
+  inside a FULL graph on this stack is ~0.5 us; 1,545 launches carry
+  ~0.9 ms of it.
