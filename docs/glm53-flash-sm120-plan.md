@@ -559,6 +559,16 @@ folded into _quixicore_C with one full rebuild at the end of the phase.
 - One factor per experiment. Every retained or rejected change gets a
   notebook entry (Status / Scope / Baseline / Hypothesis / Change /
   Correctness / Results / Decision / Raw artifacts). Rejections are recorded.
+- Noise band on this stack (measured 2026-09-04, both sessions): the
+  exact-token c1 cell moves up to ~4% between boots of the same tree
+  (pass-to-pass within a boot <0.3%); the 8-slice prompt_logprobs mean
+  moves 0.02-0.03 nats between boots and per-token logprobs have sd 0.47
+  nats even between two requests on one boot (MoE routing flips from
+  nondeterministic reductions). Rules: a throughput delta under 3% needs
+  two boots per arm; discard a c1 cell that starts in the same second as
+  /health; scoring gates compare boot means with a 0.03 nat band; there
+  is no bit-exact greedy gate on GLM-5.3 here, parity tests carry that
+  burden for kernel changes.
 - Regression rule: a change is retained only if c1 and c8 on the canonical
   shape are within noise or better, and the Foundry shape does not regress.
 - Clocks: record `nvidia-smi -q -d CLOCK,POWER` per run. Stock 600 W and
