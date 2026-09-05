@@ -20073,3 +20073,33 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   that config is unchanged (c1 112-113 / c8 446-457 / c16 608-611).
 - Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-mtp-diag/
   wl8-*.json, wl8.log, foundry-fanout-prompts.json.
+
+## 2026-09-04: cooperative mHC launch for T <= 8 - REJECTED in the native build (illegal memory access in the server)
+
+- Status: REJECTED (was PARKED). Phase 1 item 3.
+- What happened: the launcher change (grid NSPLITS x T for T <= 8 with an
+  occupancy-derived cap) was compiled into _quixicore_C by the 21:51
+  rebuild. Every server boot on that build died with "CUDA error: an
+  illegal memory access" right after graph capture and sampler warmup
+  (profiler pair arms A and B, the exact-token boot), while the same
+  binding passes standalone: parity and stress at T = 1..20, 64, 545 under
+  CUDA_LAUNCH_BLOCKING, and capture + replay of T = 4 and 8 in a private
+  CUDA graph. A boot with VLLM_DSV4_MHC_COOPERATIVE=0 on the same build
+  serves normally (200 OK completions, no CUDA errors), which pins the
+  fault on the cooperative path at T > 1.
+- Reading: a cooperative launch needs every block resident at once, and
+  cudaLaunchCooperativeKernel only checks that against device limits. In
+  the decode graph the mHC transition replays next to work on the
+  indexer's auxiliary stream, so a 512-block grid (T=8, 64 splits) can be
+  only partially resident when it reaches grid.sync(); the shipped
+  one-token grid of 64 blocks never was. Undefined behaviour of that kind
+  matches a fault that standalone replay (one stream) cannot reproduce.
+- Decision: REJECTED; launcher reverted to T == 1 before the Release
+  rebuild. If the item is revisited, the multi-token path must not depend
+  on grid-wide residency (per-token blocks with a device-side counter, or
+  the split path fused into two launches instead of three).
+- Cost of the finding: one wasted 75-minute rebuild plus three failed
+  boots; the parked prototype had only been proven through the JIT hook,
+  which never exercised the change inside a captured graph with the
+  auxiliary stream, so "parked on kernel evidence" was too weak a bar for
+  a launcher that changes residency assumptions.
