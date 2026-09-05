@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-04 evening; Phase 1 in progress, MTP merged)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-05 00:40; Phase 1 in progress, MTP merged, Release rebuild shipped)
 
 ## Mission
 
@@ -67,17 +67,22 @@ physics, research digest and phase gates are in
   build-6 recipe (uv editable install, no build isolation, 12.0f,
   CMAKE_BUILD_TYPE=Release, MemoryMax=120G, ~75 min; the default
   RelWithDebInfo makes 5x larger binaries). The first rebuild carried the
-  faulty mHC launcher; a Release rebuild with only the routing binding
-  (`glm_route_align`) was started 22:40 on 2026-09-04. Until it is
-  validated (`post_rebuild.sh`: parity tests, native-vs-hook profiler pair,
-  `ab.sh native-rebuild -- --no-spec`), the routing fusion is served via the
-  dev hook (`QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`)
-  and the pre-rebuild extensions are in `so-backup-20260904/`.
+  faulty mHC launcher; the Release rebuild of 22:40-23:52 ships only the
+  routing binding (`glm_route_align`) and is VALIDATED for serving (24
+  parity tests, exact-token 110.5 / 448 / 599 with gates in band, no hook).
+  OPEN ISSUE: profiler boots (`--torch-profile-dir`) with the native
+  routing binding race into an illegal memory access before the first
+  request; profile with `QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/
+  slimserve-glm53/jit/site` (JIT kernel) or `SLIMSERVE_GLM_ROUTE_ALIGN=0`
+  until it is explained (notebook entry of 2026-09-05). Pre-rebuild
+  extensions are in `/raid/scratch/slimserve-glm53/so-backup-20260904/`.
 
 ## Next step
 
-1. Validate the Release rebuild (post_rebuild.sh), commit, and drop the
-   dev hook from the serving instructions.
+1. The profiler-boot race of the native routing binding: rebuild the JIT
+   extension with the native flags (12.0f, no fast-math) and profile-boot
+   through the hook; then compute-sanitizer racecheck on the smallest
+   reproducer. Serving is unaffected.
 2. Item 2 remainder: moe_sum + the shared-expert add + the output copy
    into one kernel (accumulate variant of moe_sum_vec_kernel; 3 -> 1
    launches per MoE layer).
