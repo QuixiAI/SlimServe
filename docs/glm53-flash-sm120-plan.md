@@ -596,6 +596,13 @@ folded into _quixicore_C with one full rebuild at the end of the phase.
 - One factor per experiment. Every retained or rejected change gets a
   notebook entry (Status / Scope / Baseline / Hypothesis / Change /
   Correctness / Results / Decision / Raw artifacts). Rejections are recorded.
+- Instrument for launch-count changes (2026-09-04, evening): decide on a
+  same-tree profiler pair (perf/results/.../route-fused-profile/prof_pair.sh:
+  arm A then arm B booted back to back, one c1 capture each, full decode
+  steps only, compare GPU span and launches per step), not on the
+  exact-token harness, whose boot spread (below) hides anything under ~3%.
+  The spread itself is inter-kernel idle inside the CUDA graph (0.02 vs
+  0.46 ms per step on the same tree), on the GPU timeline, not host work.
 - Noise band on this stack (measured 2026-09-04, both sessions): the
   exact-token c1 cell moves up to ~4% between boots of the same tree
   (pass-to-pass within a boot <0.3%); the 8-slice prompt_logprobs mean
