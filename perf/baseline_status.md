@@ -1926,6 +1926,24 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   (+reasoning), image and tool canaries pass. The Q2_K GGUF MoE path is
   this record's remaining budget and was not touched today.
 
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - maximized record, 2026-09-06
+- TP8, EP off, model-default 1,048,576 context on three KV tiers: VRAM
+  pool 50.08 GiB/rank = 3,171,368 tokens (gpu_memory_utilization 0.95),
+  pinned host tier 72 GiB/rank (576 GiB), disk tier 256 GiB/rank (2 TiB,
+  per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR). max_num_seqs 64 with a
+  64-deep FULL_DECODE_ONLY capture. Boot through `slimserve glm53f-nvfp4-8
+  --serve`; text (+reasoning), image, tool canaries pass.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20, seed
+  42), aggregate output tok/s:
+  | c1   | c8    | c16   | c32   | c64   |
+  | 83.8 | 402.6 | 562.1 | 750.0 | 931.9 |
+  Raw: perf/results/2026-09-06/glm53-nvfp4-8-max/ (pre-rename path).
+- Tier acceptance on this pool with VLLM_KV_TIER_VERIFY=1: 6/6 probes hit
+  and resumed at block 68 (39,168 tokens), 106 restore ops each, 0/106
+  mismatched on every restore, one promotion from disk, 6/6 recalled
+  after a 3,980,143-token churn. WildChat deep-context leg on this record:
+  see the 2026-09-06 notebook entry.
+
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100)
 
 ### A100 Exact Baseline - 2026-09-03 (compile on, partitioned + vectorized sparse decode, strided indexer)
