@@ -1937,14 +1937,14 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   42), aggregate output tok/s:
   | c1   | c8    | c16   | c32   | c64   |
   | 83.8 | 402.6 | 562.1 | 750.0 | 931.9 |
-  Raw: perf/results/2026-09-06/glm53-nvfp4-8-max/ (pre-rename path).
+  Raw: perf/results/2026-09-06/glm53f-nvfp4-8-max/ (pre-rename path).
 - Tier acceptance on this pool with VLLM_KV_TIER_VERIFY=1: 6/6 probes hit
   and resumed at block 68 (39,168 tokens), 106 restore ops each, 0/106
   mismatched on every restore, one promotion from disk, 6/6 recalled
   after a 3,980,143-token churn. WildChat deep-context leg on this record:
   see the 2026-09-06 notebook entry.
 
-## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100)
+## GLM-5.3-Flash NVFP4 (glm53f-nvfp4-4 / glm53f-nvfp4-8, A100)
 
 ### A100 Exact Baseline - 2026-09-03 (compile on, partitioned + vectorized sparse decode, strided indexer)
 - Stack: torch.compile active on the text model (kda_attention op, indexer
@@ -1955,8 +1955,8 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 - Exact-token harness (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
   seed 42, warmed per concurrency), aggregate output tok/s:
   | record                 | c1   | c8    | c16   |
-  | glm53-nvfp4-4 (TP4)    | 73.8 | 332.1 | 464.6 |
-  | glm53-nvfp4-8 (TP8)    | 84.0 | 412.3 | 575.8 |
+  | glm53f-nvfp4-4 (TP4)    | 73.8 | 332.1 | 464.6 |
+  | glm53f-nvfp4-8 (TP8)    | 84.0 | 412.3 | 575.8 |
   Raw: perf/results/2026-09-03/glm53-nvfp4-{4,8}-baseline/.
 - TP8 / TP4: +14% / +24% / +24% - below the 50% scaling gate. The gap is
   per-rank replicated work (91 custom allreduces per token at 8 ranks, the
@@ -1970,7 +1970,7 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   canaries through both profiles; pooled-indexer parity vs transformers;
   bf16 sparse decode parity (tests/kernels/test_quixicore_sparse_mla_bf16.py).
   TP8 WildChat deep-context leg PASS (perf/results/2026-09-03/glm53-leg/
-  glm53-nvfp4-8/): 0 errors, 34/34 recall, max ctx 202,509, median
+  glm53f-nvfp4-8/): 0 errors, 34/34 recall, max ctx 202,509, median
   190,704, 97,378 completion tokens in 1.25 h. The TP4 leg passed on
   2026-09-02 (19/19 recall to 114K) on the pre-kernel-fix stack.
 - The 2026-09-01 TP4 numbers below predate all three fixes and are kept
@@ -1988,10 +1988,10 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   mismatches, 6/6 recalled. Raw: perf/results/2026-09-03/
   kvtier-acceptance/glm53-tp4-{host48,disk9}/.
 
-### History: GLM-5.3-Flash NVFP4 (glm53-nvfp4-4, A100 x4)
+### History: GLM-5.3-Flash NVFP4 (glm53f-nvfp4-4, A100 x4)
 
 ### A100 TP4 Exact Baseline - 2026-09-01 (bring-up, sparse DSA, no spec)
-- Config: the registered glm53-nvfp4-4/a100 record (TP4, EP off,
+- Config: the registered glm53f-nvfp4-4/a100 record (TP4, EP off,
   QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, block 64, bf16 KV, Marlin
   NVFP4 MoE, FULL_DECODE_ONLY graphs; no speculative decoding yet).
 - Exact-token harness (benchmarks/benchmark_dsv4_exact.py, 1000 in /

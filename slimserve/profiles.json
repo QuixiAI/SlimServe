@@ -1167,7 +1167,7 @@
         }
       }
     },
-    "glm53-flash-nvfp4": {
+    "glm53f-nvfp4": {
       "title": "GLM-5.3-Flash",
       "modalities": [
         "text",
@@ -2633,9 +2633,9 @@
         }
       }
     },
-    "glm53-nvfp4-4": {
+    "glm53f-nvfp4-4": {
       "title": "GLM-5.3-Flash NVFP4 on 4 GPUs",
-      "source": "glm53-flash-nvfp4",
+      "source": "glm53f-nvfp4",
       "gpus": 4,
       "summary": "Vision-language 169B hybrid (34 KDA linear-attention layers + 11 DeepSeek-sparse-attention layers with a pooled indexer, mHC hyper-connections, 288-expert MoE). NVFP4 experts on Marlin, sparse NoPE MLA through the QuixiCore Ampere kernels, TP4 with experts sharded (EP measured slower).",
       "speculative": false,
@@ -2675,8 +2675,8 @@
               "kv_connector": "HostTierConnector",
               "kv_role": "kv_both",
               "kv_connector_extra_config": {
-                "host_tier_gb_per_rank": 64,
-                "nvme_tier_gb_per_rank": 128,
+                "host_tier_gb_per_rank": 72,
+                "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
             }
@@ -2690,14 +2690,15 @@
             "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
-            "Host KV tier ENABLED (2026-09-03): 64 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 128 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53-nvfp4-8-tier/)."
+            "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved."
           ]
         }
       }
     },
-    "glm53-nvfp4-8": {
+    "glm53f-nvfp4-8": {
       "title": "GLM-5.3-Flash NVFP4 on 8 GPUs",
-      "source": "glm53-flash-nvfp4",
+      "source": "glm53f-nvfp4",
       "gpus": 8,
       "summary": "Vision-language 169B hybrid (34 KDA layers + 11 pooled-indexer DSA layers, mHC, 288-expert NVFP4 MoE) on eight A100s: TP8, experts sharded, chosen from the TP8 / TP4xDP2, EP on/off matrix.",
       "speculative": false,
@@ -2708,9 +2709,9 @@
           "engine": {
             "tensor_parallel_size": 8,
             "enable_expert_parallel": false,
-            "max_num_seqs": 32,
+            "max_num_seqs": 64,
             "block_size": 64,
-            "gpu_memory_utilization": 0.85,
+            "gpu_memory_utilization": 0.95,
             "kv_cache_dtype": "auto",
             "attention_config": {
               "backend": "QUIXICORE_MLA_SPARSE",
@@ -2737,8 +2738,8 @@
               "kv_connector": "HostTierConnector",
               "kv_role": "kv_both",
               "kv_connector_extra_config": {
-                "host_tier_gb_per_rank": 64,
-                "nvme_tier_gb_per_rank": 128,
+                "host_tier_gb_per_rank": 72,
+                "nvme_tier_gb_per_rank": 256,
                 "enable_cross_layers_blocks": "True"
               }
             }
@@ -2752,7 +2753,9 @@
             "kv_cache_dtype auto is required: this fork defaults the cache to fp8, and no Ampere MLA backend serves fp8 at the 512-wide NoPE head; bf16 main KV is also the a100 serving policy.",
             "moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config): this fork defaults to aiter, which is ROCm-only; Marlin W4A16 is the NVFP4 MoE path on sm80.",
             "reasoning_parser and tool_call_parser glm47: GLM-5.3 uses the GLM-4.7-family thinking and tool-call markup; enable_auto_tool_choice and thinking are the registry serving defaults.",
-            "Host KV tier ENABLED (2026-09-03): 64 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 128 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53-nvfp4-8-tier/)."
+            "Host KV tier ENABLED (2026-09-03): 72 GiB pinned host RAM per rank (cudaHostRegister-ed at exact size) plus a 256 GiB per-rank NVMe/disk third tier under it (per-rank O_TMPFILE in SLIMSERVE_KV_TIER_DIR - operator environment, never a profile field; on this box the tier directory sits on the 4.9 TB /dev/sda2 filesystem). The layout is the packed cross-layer slab (enable_cross_layers_blocks) over 56 layers: 4 KDA state groups + the MLA and indexer groups. Hybrid page-size unification gives the indexer group (512 B/token) 2176-token blocks beside the MLA group's 1088 (TP4; 576/1152 at TP8), so the connector runs per-group block ratios: the wider group is offloaded/restored only where its block completes and resume boundaries align to the ratios' lcm. Every kernel on this path addresses pages by block stride (no flattening of the packed view). Validation: host tier at TP4 (48 GiB/rank): 6/6 probes hit and restored at block 36 (39,168 tokens), 58 restore ops each, VLLM_KV_TIER_VERIFY 0/58 mismatched; disk tier at TP4 (8 GiB host + 64 GiB disk, restores forced from disk): promotions from NVMe, verify 0/58 mismatched, 0 disk round-trip mismatches, 6/6 recalled after a 1.9M-token churn of a 1.24M-token pool (perf/results/2026-09-03/kvtier-acceptance/glm53-tp4-{host48,disk9}/); the TP8 record validated through slimserve on 2026-09-04 (perf/results/2026-09-04/glm53f-nvfp4-8-tier/).",
+            "Sized to the 8x A100 / 787 GB host box (2026-09-06): gpu_memory_utilization 0.95 (weights 23.6 GiB/rank, the rest of the budget is the VRAM KV pool), max_num_seqs 64 with a matching FULL_DECODE_ONLY capture size, 72 GiB pinned host tier per rank (576 GiB, leaving ~200 GB for prefill staging and page cache) and 256 GiB disk tier per rank (2 TiB on the 4.9 TB /dev/sda2). Three tiers: VRAM pool -> pinned host -> per-rank O_TMPFILE disk, all at the model-default 1,048,576 context.",
+            "Reasoning effort: the GLM-5.3-Flash chat template implements the GLM-5.3 Low / High / Max levels (default Max) from the reasoning_effort chat_template_kwargs; thinking itself stays always-on (serving policy). No server flag is involved."
           ]
         }
       }

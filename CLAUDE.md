@@ -232,8 +232,8 @@ behavior:
   enable_cross_layers_blocks). Tier RESTORES on A100 are proven only
   where the instrumented acceptance shows them: GLM-5.2 (2026-08-31,
   restores + SHA verify clean); DSV4 stays write-only by design until
-  window-tail staging exists for its sliding-window groups; the glm53
-  records (TP4 and TP8) carry the host tier AND the NVMe third tier
+  window-tail staging exists for its sliding-window groups; the glm53f
+  records (GLM-5.3-Flash, TP4 and TP8) carry the host tier AND the NVMe third tier
   since 2026-09-04 - the packed slab over KDA state + MLA + indexer
   groups with per-group block ratios in the connector, proven by the
   eviction-restore acceptance with VLLM_KV_TIER_VERIFY=1 (host restores

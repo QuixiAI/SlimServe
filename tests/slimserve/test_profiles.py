@@ -103,7 +103,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     sources = registry._registry()["sources"]
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]
     assert sources["kimi-k3"]["modalities"] == ["text", "image"]
-    assert sources["glm53-flash-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["glm53f-nvfp4"]["modalities"] == ["text", "image"]
     assert sources["dsv4-flash"]["modalities"] == ["text"]
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
@@ -334,7 +334,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",
-        "glm53-flash-nvfp4",
+        "glm53f-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
     kimi = data["sources"]["kimi-k3"]
@@ -1099,7 +1099,7 @@ def test_every_a100_profile_carries_the_host_kv_tier():
     config, because their group specs are not verified to resolve
     all-uniform on their own.
     """
-    # Every a100 record carries the tier (the glm53 records joined on
+    # Every a100 record carries the tier (the glm53f records joined on
     # 2026-09-03 once the connector handled per-group block ratios).
     tier_pending: set[str] = set()
     seen = 0
@@ -1116,7 +1116,7 @@ def test_every_a100_profile_carries_the_host_kv_tier():
         assert transfer["kv_role"] == "kv_both", profile_id
         extra = transfer["kv_connector_extra_config"]
         assert extra["host_tier_gb_per_rank"] > 0, profile_id
-        if entry["source"] in ("glm52-vision", "glm53-flash-nvfp4"):
+        if entry["source"] in ("glm52-vision", "glm53f-nvfp4"):
             assert extra["enable_cross_layers_blocks"] == "True", profile_id
     assert seen == 9, "expected all nine A100 variants to be checked"
 
