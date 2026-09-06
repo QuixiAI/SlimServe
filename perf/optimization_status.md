@@ -19513,3 +19513,12 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/ (serve_boot19_final_8001
   .log, bench_final_c{8,1}.log, run_final.out; the A/B legs
   bench_window{24,64,64b}_*.log, bench_tuned_c{1,6}.log).
+
+## 2026-09-06 - Production switched to qwen38fn-nvfp4-4 on GPUs 0-3
+
+- Operator: "put the new nvfp4 tp4 on production" and "I only want 4 GPUs
+  in production, the other 4 should be free." The systemd unit
+  (operator-side, not in the repo) now runs
+  `slimserve.cli qwen38fn-nvfp4-4 --serve --port 8000` with
+  CUDA_VISIBLE_DEVICES=0,1,2,3; the FP8 8-GPU unit file is backed up in
+  ~/.local/scratch. No second instance: GPUs 4-7 stay free.
