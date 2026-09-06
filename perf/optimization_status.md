@@ -19258,3 +19258,32 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   no longer `reshape(-1)`-copies the packed layer cache on every call
   (page_stride_bytes on the entry points) and the merged MI300X work
   reworked the v2 batch kernels; the split is not measured separately.
+
+## 2026-09-06: glm53f-nvfp4-8 maximized - 1M context on three KV tiers, max_num_seqs 64
+
+- Operator ask: 1M context with VRAM + pinned host + disk KV, maximize the
+  pool and max_num_seqs. Record (renamed glm53f-*: GLM-5.3-Flash is the
+  hybrid glm5_next model, not the 743B GLM-5.3 that shares GLM-5.2's
+  architecture): gpu_memory_utilization 0.85 -> 0.95, max_num_seqs 32 ->
+  64 (FULL_DECODE_ONLY capture 64), host tier 64 -> 72 GiB/rank (576 GiB
+  pinned, ~169 GB host RAM left available), disk tier 128 -> 256 GiB/rank
+  (2 TiB). glm53f-nvfp4-4 takes the same tier sizes.
+- Boot (weights 23.6 GiB/rank): VRAM KV 50.08 GiB/rank = 3,171,368 tokens
+  (3.02x one full 1,048,576-token request; was 2,696,830 at 0.85); host
+  11,915 slots/rank at the 576-token hash block; disk 42,366 slots/rank.
+  Canaries (text + reasoning, image, tool) pass.
+- Exact-token through the profile (1000 in / 300 out, temp 1.0 / top-p
+  0.95 / top-k 20, seed 42):
+  | c1   | c8    | c16   | c32   | c64   |
+  | 83.8 | 402.6 | 562.1 | 750.0 | 931.9 |
+  c1/c8/c16 match the 0.85 boot (84.4 / 413.6 / 578.8); c32 and c64 are
+  new points and still scaling. Raw: perf/results/2026-09-06/
+  glm53-nvfp4-8-max/.
+- Tier acceptance on this pool (churn 3,980,143 tokens of 3,171,368,
+  VLLM_KV_TIER_VERIFY=1): 6/6 probes hit and resumed at block 68 (39,168
+  tokens), 106 restore ops each (68 MLA + 34 indexer + 4 KDA states),
+  0/106 mismatched on every restore, one promotion from disk, 6/6
+  recalled. The WildChat deep-context leg on this final record follows.
+- Client knob, no server change: the Flash chat template implements the
+  GLM-5.3 reasoning_effort levels (Low / High / Max, default Max) via
+  chat_template_kwargs; thinking stays always-on per policy.
