@@ -83,9 +83,18 @@ from .qsa import Qwen4ExpQSAAttention
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4."""
+    """Return ``None`` for weights excluded from Qwen4Exp ModelOpt-FP4.
 
-    if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+    Covers both the plain NVFP4 config and the MIXED_PRECISION release
+    (NVFP4 routed experts, FP8 MTP experts and PLE tables, BF16 everything
+    else): the QSA projections are bf16 in both, so they never see a
+    ModelOpt quant config.
+    """
+
+    if quant_config is not None and quant_config.get_name() in (
+        "modelopt_fp4",
+        "modelopt_mixed",
+    ):
         return None
     return quant_config
 

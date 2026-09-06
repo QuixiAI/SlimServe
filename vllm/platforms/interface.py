@@ -866,7 +866,41 @@ class Platform:
         # (the slot every packed GDN state page must fit inside) roughly
         # unchanged while multiplying its token capacity.
         if model_config.architecture.startswith("Qwen4Exp"):
-            if envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
+            kv_transfer = getattr(vllm_config, "kv_transfer_config", None)
+            extra = (kv_transfer.kv_connector_extra_config or {}) if kv_transfer else {}
+            # Sticky: config views built later (the MTP draft view shares this
+            # cache_config) may lack the transfer config, and an aligner pass
+            # with the main-KV bytes/token would re-pad the mamba page 8x.
+            if extra.get("main_kv_host_resident"):
+                cache_config.main_kv_host_resident = True
+            if getattr(cache_config, "main_kv_host_resident", False):
+                # Host-resident main KV (docs/host_resident_kv_design.md): the
+                # QSA main KV lives in pinned host rows, so the largest GPU
+                # page per attention layer is the indexer's compressed cache
+                # (one entry per compress_ratio tokens). Sizing the block from
+                # it lets one block cover ~10K+ tokens, so a max-length
+                # request charges the packed slab tens of rows, not hundreds.
+                from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+                text_cfg = model_config.hf_text_config
+                cr = int(getattr(text_cfg, "indexer_compress_ratio", 4))
+                indexer_dim = int(getattr(text_cfg, "indexer_head_dim", 128))
+                attn_page_size_1_token = (
+                    MLAAttentionSpec(
+                        block_size=cr,
+                        num_kv_heads=1,
+                        head_size=indexer_dim,
+                        dtype=model_config.dtype,
+                        compress_ratio=cr,
+                    ).page_size_bytes
+                    // cr
+                )
+                logger.info(
+                    "Host-resident main KV: attention block sized from the "
+                    "indexer page (%d bytes/token)",
+                    attn_page_size_1_token,
+                )
+            elif envs.VLLM_QWEN4_EXP_TQ_MAIN_KV:
                 from vllm.model_executor.layers.quantization.turboquant.config import (
                     TurboQuantConfig,
                 )
@@ -914,6 +948,14 @@ class Platform:
 
         if mamba_page_size == 0:
             return
+        logger.info(
+            "Hybrid block alignment: mamba page %d bytes (padded %s), attention "
+            "%d bytes/token, block_size %d",
+            mamba_page_size,
+            cache_config.mamba_page_size_padded,
+            attn_page_size_1_token,
+            cache_config.block_size,
+        )
 
         # mamba_block_size here should either be user specified value or None
         mamba_block_size = (

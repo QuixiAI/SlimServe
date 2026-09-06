@@ -234,6 +234,7 @@ checkpoint.
 | `qwen38-nvfp4-1` | Qwen3.8-27B (NVFP4) | 1 | MI300X, Mac | MTP on MI300X, DFlash 2 on Mac |
 | `qwen38-nvfp4-1-tq` | Qwen3.8-27B (NVFP4) | 1 | Mac | DFlash 2 + TurboQuant draft KV |
 | `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (ships with the checkpoint) |
+| `qwen38fn-nvfp4-4` | Qwen3.8-Flash-Next (NVFP4) | 4 | RTX 3090 | MTP (ships with the checkpoint); native 262K context via host-resident main KV |
 
 18 profile ids, 25 platform records. `qwen38-nvfp4-1` is the clearest example of
 why platform is part of a profile's identity: the same model and quant serve
@@ -1004,8 +1005,9 @@ a since-changed profile geometry; see `perf/baseline_status.md`).
 
 ### 8× RTX 3090 — Qwen3.8-Flash-Next FP8
 
-`qwen38fn-fp8-8`, deployed configuration: native 262,144-token context, bf16
-KV, prefix caching, MTP speculation, QuixiAI P2P driver. Exact-token harness
+`qwen38fn-fp8-8`, deployed configuration: native 262,144-token context, fp8
+KV with the host and NVMe KV tiers, prefix caching, MTP speculation, QuixiAI
+P2P driver. Exact-token harness
 (1,000 in / 2,000 out per request, shipped sampling defaults, seeded):
 
 | Concurrent requests | Aggregate tok/s | Per-request tok/s | Median latency |

@@ -185,7 +185,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # IndexError at restore). KVCacheTensor.block_stride survives the
         # scheduler deepcopy unmodified, so both roles agree through it.
         packed_strides = {
-            t.block_stride for t in kv_cache_config.kv_cache_tensors if t.block_stride
+            t.block_stride
+            for t in kv_cache_config.kv_cache_tensors
+            if t.block_stride and not getattr(t, "host_resident", False)
         }
         if packed_strides:
             assert len(packed_strides) == 1, (

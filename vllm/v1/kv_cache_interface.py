@@ -1041,6 +1041,16 @@ class KVCacheTensor:
     shared_by: list[str]  # layer names that share the same KV cache tensor
     offset: int = 0  # byte offset of this layer within a contiguous block
     block_stride: int = 0  # total bytes per block in a packed layout (0 = not packed)
+    # Host-resident main KV (docs/host_resident_kv_design.md): this tensor's
+    # blocks live in a pinned-host arena and only a hot window of them in
+    # GPU rows; the worker allocates `gpu_rows` device rows instead of
+    # `size` bytes and addresses pages through a per-step offset table.
+    host_resident: bool = False
+    gpu_rows: int = 0
+    # Each logical block splits into `sub_blocks` residency rows (tokens per
+    # row = block_size / sub_blocks) so the GPU hot window holds tails, not
+    # whole 10K-token blocks.
+    sub_blocks: int = 1
 
 
 @dataclass

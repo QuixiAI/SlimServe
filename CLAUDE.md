@@ -253,3 +253,12 @@ behavior:
   operator environment (SLIMSERVE_KV_TIER_DIR), never a profile field.
   The eviction-restore acceptance with a deliberately tiny host tier
   (so restores must come from disk) is the standing check for it.
+  HOST-RESIDENT MAIN KV (docs/host_resident_kv_design.md, 2026-09-06):
+  for Qwen Sparse Attention models the main QSA KV of ACTIVE requests can
+  live in pinned host rows and be gathered over PCIe (the gather reads
+  only the indexer's top-2048 rows per query), with a small GPU window
+  for the blocks being written. Opt-in per profile through
+  kv_connector_extra_config main_kv_host_resident / main_kv_gpu_rows /
+  main_kv_sub_blocks; it is what lets qwen38fn-nvfp4-4 serve the native
+  262,144 context on 4x 24 GB cards. Standing checks: deep marker recall
+  past the window, the exact bench, and zero invalid-block reports.

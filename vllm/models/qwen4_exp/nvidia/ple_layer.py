@@ -205,8 +205,21 @@ def _get_ple_embedding_quant_method(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> QuantizeMethodBase | None:
-    """Select global-scale FP8 only for quantized PLE checkpoint shards."""
+    """Select global-scale FP8 only for quantized PLE checkpoint shards.
 
+    Two checkpoint families serve FP8 PLE tables: the official FP8 release
+    (``quant_method: fp8`` -> :class:`Fp8Config`, tables listed by
+    ``modules_to_not_convert`` when NOT quantized) and NVIDIA's ModelOpt
+    MIXED_PRECISION release (``quantized_layers`` names each layer's
+    ``ngram_embedding`` with ``quant_algo: FP8``, per-tensor ``weight_scale``
+    - the same tensor layout as the FP8 release's shards).
+    """
+
+    if quant_config is not None and quant_config.get_name() == "modelopt_mixed":
+        resolve = getattr(quant_config, "_resolve_quant_algo", None)
+        if resolve is not None and resolve(prefix) == "FP8":
+            return Qwen4ExpPLEFp8EmbeddingMethod()
+        return None
     if not isinstance(quant_config, Fp8Config):
         return None
     if not quant_config.is_checkpoint_fp8_serialized:

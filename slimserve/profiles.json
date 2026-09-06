@@ -1279,6 +1279,145 @@
           ]
         }
       }
+    },
+    "qwen38-flash-next-nvfp4": {
+      "title": "Qwen3.8-Flash-Next",
+      "modalities": [
+        "text",
+        "image"
+      ],
+      "format": "safetensors",
+      "repo": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "base_url": "https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4/resolve/main",
+      "local_dir": "Qwen3.8-Flash-Next-NVFP4",
+      "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP drafter (mtp.* tensors, FP8 experts in model-fp8-mtp-ple.safetensors) and processor configs ship in the same repo.",
+      "speculator": {
+        "repo": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+        "local_dir": "Qwen3.8-Flash-Next-NVFP4",
+        "engine": {
+          "method": "mtp",
+          "num_speculative_tokens": 2
+        },
+        "note": "The checkpoint ships its own one-layer MTP drafter (mtp.* tensors in the weight index; its 512 experts stay block-128 FP8 in model-fp8-mtp-ple.safetensors), so the draft model is the target directory itself."
+      },
+      "quants": {
+        "NVFP4": {
+          "title": "NVFP4 (group-16 FP4 MoE experts, FP8 MTP experts, BF16 backbone)",
+          "bytes": 132734506847,
+          "summary": "NVIDIA's ModelOpt MIXED_PRECISION release of Qwen3.8-Flash-Next: the 48 x 512-expert MoE layers in NVFP4 (group 16, weight_scale E4M3 + weight_scale_2), the MTP drafter's experts in block-128 FP8, the 47.7 GiB n-gram (PLE) tables in per-tensor FP8 for host offload, and everything else (GDN, QSA, hyper-connections, embeddings, vision tower) BF16. On Ampere the experts run through the Marlin W4A16 NVFP4 MoE kernels. Shard checksums are size-only, like the other safetensors sources: the fetcher re-validates every listed sha256 on every boot, and hashing 124 GiB costs ~2 minutes per start.",
+          "min_gpus": {
+            "rtx3090": 4
+          },
+          "min_host_ram_bytes": {
+            "rtx3090": 137438953472
+          },
+          "files": [
+            {
+              "path": ".gitattributes",
+              "bytes": 1635
+            },
+            {
+              "path": "README.md",
+              "bytes": 12109
+            },
+            {
+              "path": "chat_template.jinja",
+              "bytes": 8952
+            },
+            {
+              "path": "config.json",
+              "bytes": 30820
+            },
+            {
+              "path": "generation_config.json",
+              "bytes": 202
+            },
+            {
+              "path": "hf_quant_config.json",
+              "bytes": 23001
+            },
+            {
+              "path": "merges.txt",
+              "bytes": 3353259
+            },
+            {
+              "path": "model-00001-of-00010.safetensors",
+              "bytes": 3115991696
+            },
+            {
+              "path": "model-00002-of-00010.safetensors",
+              "bytes": 10005510304
+            },
+            {
+              "path": "model-00003-of-00010.safetensors",
+              "bytes": 10005364728
+            },
+            {
+              "path": "model-00004-of-00010.safetensors",
+              "bytes": 10006060112
+            },
+            {
+              "path": "model-00005-of-00010.safetensors",
+              "bytes": 10005362392
+            },
+            {
+              "path": "model-00006-of-00010.safetensors",
+              "bytes": 10005375328
+            },
+            {
+              "path": "model-00007-of-00010.safetensors",
+              "bytes": 10005956544
+            },
+            {
+              "path": "model-00008-of-00010.safetensors",
+              "bytes": 10005375200
+            },
+            {
+              "path": "model-00009-of-00010.safetensors",
+              "bytes": 5679113808
+            },
+            {
+              "path": "model-00010-of-00010.safetensors",
+              "bytes": 128587536,
+              "sha256": "0d49b0cf7c15bf9b5bd1e17403b36727315860a8f2a2e0f5a53655547084f640"
+            },
+            {
+              "path": "model-fp8-mtp-ple.safetensors",
+              "bytes": 53717551730
+            },
+            {
+              "path": "model.safetensors.index.json",
+              "bytes": 31275518,
+              "sha256": "660414e8300728ba80062e6a3c81cb76a65e2ab136ac9e9ceb450ba0c51c3c0d"
+            },
+            {
+              "path": "preprocessor_config.json",
+              "bytes": 390
+            },
+            {
+              "path": "processor_config.json",
+              "bytes": 1191
+            },
+            {
+              "path": "tokenizer.json",
+              "bytes": 12809320,
+              "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+            },
+            {
+              "path": "tokenizer_config.json",
+              "bytes": 17928
+            },
+            {
+              "path": "video_preprocessor_config.json",
+              "bytes": 385
+            },
+            {
+              "path": "vocab.json",
+              "bytes": 6722759
+            }
+          ]
+        }
+      }
     }
   },
   "platforms": {
@@ -2630,6 +2769,78 @@
           "speculative_overrides": {
             "index_share_for_mtp_iteration": true
           }
+        }
+      }
+    },
+    "qwen38fn-nvfp4-4": {
+      "title": "Qwen3.8-Flash-Next NVFP4 on 4 GPUs",
+      "source": "qwen38-flash-next-nvfp4",
+      "gpus": 4,
+      "summary": "Vision-language 125B-A6B hybrid (Gated DeltaNet + Qwen Sparse Attention, 1-in-4 full attention, 4-branch gated residual) with 51B n-gram embeddings held in pinned host memory. NVFP4 experts run through Marlin W4A16 on 4x RTX 3090.",
+      "speculative": true,
+      "variants": {
+        "rtx3090": {
+          "platform": "rtx3090",
+          "default_quant": "NVFP4",
+          "engine": {
+            "tensor_parallel_size": 4,
+            "enable_expert_parallel": true,
+            "max_model_len": 262144,
+            "max_num_seqs": 8,
+            "gpu_memory_utilization": 0.975,
+            "kv_cache_dtype": "fp8",
+            "compilation_config": {
+              "cudagraph_mode": "FULL_DECODE_ONLY",
+              "max_cudagraph_capture_size": 24
+            },
+            "reasoning_parser": "qwen3",
+            "tool_call_parser": "qwen3_xml",
+            "served_model_name": "Qwen3.8-Flash-Next",
+            "moe_backend": "marlin",
+            "linear_backend": "auto",
+            "kernel_config": {
+              "moe_backend": "marlin",
+              "linear_backend": "auto"
+            },
+            "enable_prefix_caching": true,
+            "kv_transfer_config": {
+              "kv_connector": "HostTierConnector",
+              "kv_role": "kv_both",
+              "kv_connector_extra_config": {
+                "host_tier_gb_per_rank": 88,
+                "nvme_tier_gb_per_rank": 448,
+                "main_kv_host_resident": true,
+                "main_kv_gpu_rows": 24,
+                "main_kv_sub_blocks": 8
+              }
+            },
+            "default_chat_template_kwargs": {
+              "reasoning_effort": "low",
+              "preserve_thinking": true,
+              "thinking": true,
+              "enable_thinking": true
+            },
+            "override_generation_config": {
+              "thinking_token_budget": 2000
+            }
+          },
+          "env": {
+            "VLLM_QWEN4_EXP_PLE_HOST": "1",
+            "NCCL_P2P_LEVEL": "SYS",
+            "VLLM_GDN_DECODE_KERNEL": "triton",
+            "VLLM_ADMISSION_MAX_CONCURRENT": "96"
+          },
+          "speculative_overrides": {
+            "index_share_for_mtp_iteration": true
+          },
+          "notes": [
+            "Serves the model's native 262,144-token context on 4x 24 GB cards through the three-tier redesign (docs/host_resident_kv_design.md, validated 2026-09-06): the 13 QSA main-KV layers live in pinned host rows read by the sparse gather over PCIe (kv_connector_extra_config main_kv_host_resident), with main_kv_gpu_rows 24 hot rows for the blocks being written and main_kv_sub_blocks residency rows per scheduler block (13 x 976-token rows at the 12,688-token block the indexer page sizes). Weights take 21.08 of 22.97 GiB per card at util 0.975; the packed slab (indexer, ring, GDN) charges a max-length request 0.37 GiB and the pool holds 531,186 tokens = 2.03 max-length requests of GPU-resident state; the main KV itself needs ~6 GiB of pinned host rows per rank. Gates passed 2026-09-06: marker recall at 54K/144K/243K tokens, multi-turn tracking 3/3, image canary, 0 server errors; exact 1000/2000 c1 120.1 / c8 361.7 tok/s.",
+            "NVFP4 MoE experts (ModelOpt MIXED_PRECISION, group 16) run through the Marlin W4A16 NVFP4 MoE kernels on SM86 - the same path glm53f-nvfp4-4/a100 validated on sm80 - selected explicitly with moe_backend marlin (top-level and kernel_config, since a non-auto top-level flag overwrites kernel_config; this fork's default is the ROCm-only aiter). The MTP drafter's 512 experts are block-128 FP8 (weight_scale_inv, the official FP8 release's layout) and serve through the drafter-scoped Qwen4ExpDraftBlockFp8Config -> Fp8MoEMethod -> Marlin W8A16 block-FP8 path the FP8 record validated; ModelOpt's own FP8 MoE method only knows per-tensor scales. The PLE tables are per-tensor FP8 (quantized_layers FP8) and take the same host-pinned fp8 gather as the FP8 record.",
+            "enable_expert_parallel stays a correctness requirement: the drafter's block-128 FP8 expert scales cannot split moe_intermediate_size 640 across 4 ranks (160 per rank is not a multiple of 128), so EP keeps 128 whole experts per rank for both the NVFP4 main experts and the FP8 MTP experts (group-16 NVFP4 would split cleanly on its own; glm53f-nvfp4-4 measured TP experts 4-6% faster than EP on the Marlin NVFP4 path, an A/B that would need a per-layer parallelism split here).",
+            "Sized for TWO co-resident instances on one 8-GPU / 995 GB / 3.7 TB-NVMe box (operator 2026-09-06: each instance may take at most half the host RAM and half the NVMe): host KV tier 88 GiB pinned per rank (352 GiB per instance, cudaHostRegister-ed at exact size) and NVMe tier 448 GiB per rank (1.75 TiB per instance). Two instances therefore pin 704 GiB and preallocate 3.5 TiB - exactly the totals the 8-rank FP8 record validated on this box - and the 47.7 GiB PLE table is one /dev/shm segment shared across ranks. Run the second instance on the other four GPUs (CUDA_VISIBLE_DEVICES) and another port; the NVMe arenas are unnamed O_TMPFILEs in SLIMSERVE_KV_TIER_DIR, so both instances share the directory without colliding.",
+            "Main QSA KV is fp8 (float8_e4m3fn) through kv_cache_dtype fp8 as on the FP8 record (operator 2026-09-02; NOT TurboQuant). Without host residency this checkpoint's GPU pool caps the context near 46-60K tokens (boots 2-3, 2026-09-06: 0.52-0.77 GiB free after 20.59 GiB of weights vs 2.02 GiB for one 262K request); the host-resident main KV is what makes the native context possible here.",
+            "max_num_seqs 8 with max_cudagraph_capture_size 24 (3 x 8 at MTP k=2): every running request charges the packed slab ~9 rows x 10.56 MB (attention, ring, and the GDN align-mode state blocks - fp32 SSM state is 812 KB per layer at TP4), so the pool admits ~5 concurrent requests at any context; a larger hot window (64 rows) or more sequences only shrink that (measured: 64 rows -> 2 running, -35% c8). The 24-row window keeps a short-context batch of 5 x 4 rows resident; deep history is gathered from host rows at ~25 GB/s (PCIe 4.0)."
+          ]
         }
       }
     },

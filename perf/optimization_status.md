@@ -19287,3 +19287,218 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Client knob, no server change: the Flash chat template implements the
   GLM-5.3 reasoning_effort levels (Low / High / Max, default Max) via
   chat_template_kwargs; thinking stays always-on per policy.
+
+## 2026-09-06 - qwen38fn-nvfp4-4 bring-up record: nvidia/Qwen3.8-Flash-Next-NVFP4 on 4x RTX 3090 (unbooted)
+
+- Request: a profile for nvidia/Qwen3.8-Flash-Next-NVFP4 on four 3090s.
+- Checkpoint (HF metadata + config.json): ModelOpt MIXED_PRECISION, 25
+  files, 123.6 GiB. quantized_layers: the 48 x 512 routed experts NVFP4
+  (group 16: weight U8 packed, weight_scale E4M3 [N, K/16], weight_scale_2,
+  input_scale), mtp.layers.0.mlp.experts FP8 group 128 with the official
+  FP8 release's weight_scale_inv layout, and every layer's
+  ple.ple_embedding.ngram_embedding FP8 per-tensor (47.7 GiB of tables in
+  model-fp8-mtp-ple.safetensors, same shard/scale naming as the FP8
+  release). Excluded (bf16): self_attn*, linear_attn*, hyper-connections,
+  mlp.gate, shared_expert*, embed_tokens, lm_head, visual*. On-GPU weight
+  bytes = 123.6 - 47.7 (PLE, host-pinned) = ~76 GiB -> ~19 GiB/rank at TP4.
+- Registry: source qwen38-flash-next-nvfp4 (all 25 files with LFS sha256,
+  min_gpus rtx3090 4, min_host_ram 128 GiB for the PLE table), profile
+  qwen38fn-nvfp4-4 with one rtx3090 record cloned from qwen38fn-fp8-8
+  (kv fp8 at 262144, util 0.96, seqs 32 / capture 96, prefix caching,
+  MTP k=2 + index share, PLE host, triton GDN, admission 96) with
+  tensor_parallel_size 4, moe_backend marlin (top-level + kernel_config,
+  the glm53f-nvfp4 precedent), host tier 176 + NVMe 896 GiB/rank (the
+  8-rank record's 704 GiB / 3.5 TiB totals over 4 ranks). Every note is
+  labelled as inherited until the first boot decides.
+- Code (three seams the mixed release needs; all unit-covered in
+  tests/models/qwen4_exp/test_weight_loading.py, 33 green):
+  1. PLE tables: _get_ple_embedding_quant_method accepted only Fp8Config;
+     it now also maps a modelopt_mixed config whose quantized_layers names
+     the table as FP8 onto Qwen4ExpPLEFp8EmbeddingMethod (prefix roots
+     bridged by the config's own _resolve_quant_algo candidates).
+  2. QSA: without_modelopt_fp4 also strips modelopt_mixed (the projections
+     are bf16 in the release either way).
+  3. MTP drafter: ModelOpt's FP8 MoE method only knows per-tensor scales,
+     but the drafter's experts are block-128 FP8 with weight_scale_inv.
+     _draft_quant_config_from_modelopt_mixed renumbers the mtp.layers.<i>
+     keys onto the draft model's layer indices and builds
+     Qwen4ExpDraftBlockFp8Config (an Fp8Config that quantizes exactly those
+     RoutedExperts through Fp8MoEMethod - the FP8 record's validated Marlin
+     W8A16 block-FP8 path - and leaves every other draft module bf16).
+- enable_expert_parallel is again a correctness requirement, now because
+  of the drafter: block-128 scales cannot split intermediate 640 four ways
+  (160/rank). NVFP4 group 16 would split, so a TP-experts A/B needs a
+  per-layer parallelism split first.
+- KV arithmetic to watch at boot: 2 KV heads, so each rank holds one head
+  at TP4 exactly as at TP8 -> the same 7,488 B/token/rank; 262144 needs
+  ~1.9 GiB/rank of pool plus GDN state, against a budget of 22.62 - ~19
+  (weights) - ~1.2 (non-torch) - 0.9 (activation) - 0.47 (graphs) GiB.
+  If the pool comes up short the record caps max_model_len at the largest
+  length that fits and states the arithmetic (policy: default context
+  unless genuinely impossible on the platform).
+- Status: download in progress (~19 of 124 GiB at 20:xx UTC); nothing
+  booted. Validation needs the four GPUs, which production holds - boot on
+  port 8001 after the operator stops prod: health, GPU KV size, exact bench
+  c1/c8, tier eviction-restore recall, multi-turn tracking, image request.
+
+## 2026-09-06 - Three-tier redesign, milestone 1: pointer-table QSA gather (host-resident main KV)
+
+- Trigger: qwen38fn-nvfp4-4 cannot hold one 262,144-token request in GPU
+  KV (weights 20.59 GiB of 24 per rank; pool 0.77 GiB vs 2.02 needed,
+  ceiling ~46-60K tokens). The tiers as built store finished/evicted
+  conversations; an ACTIVE request still has to fit in VRAM. Operator:
+  "then redesign the tiers", "we own the whole stack all the way down to
+  the kernels" - design in docs/host_resident_kv_design.md.
+- Key fact: QSA reads only the indexer's top-2048 tokens per query, and
+  the main QSA KV is 82% of the per-token slab (6,144 of 7,488 B/rank).
+  With main KV in the pinned host arena and gathered over PCIe (the PLE
+  table's mechanism), a 262K request needs ~0.35 GiB of GPU KV.
+- Milestone 1: `qsa_sparse_paged_attention(..., page_offsets=)` - a
+  per-request int64 table (same shape as the block table) of each logical
+  page's element offset from the slab pointer, PTR_SENTINEL for nulls,
+  built once per step by `page_offsets_from_table(block_table, page_base,
+  k_cache)`; pages may be GPU rows or MAPPED host rows. Three iterations
+  measured on the way: per-page int-to-pointer cast 1.6x slower on GPU
+  pages (lost vectorization); a second dependent table load 1.35x; the
+  per-request table + `tl.multiple_of(.., 16)` alignment hint 1.2x.
+- Results (GPU 4, TP4 geometry, x12 layers/step, bit-exact parity in all
+  configurations; bench_ptrtable_gather_v4.log):
+  | rows | slab | table GPU | all host | 50% host |
+  | 3    | 1.45 | 1.51      |  1.83    |  1.49    | ms/step
+  | 24   | 1.73 | 2.13      | 12.05    |  6.18    |
+  | 48   | 3.21 | 4.20      | 23.9     | 12.2     |
+  | 96   | 5.74 | 7.09      | 47.5     | 24.1     |
+  Host gather = ~25 GB/s effective (PCIe 4.0 x16 saturated; the design's
+  12 GB/s estimate was pessimistic). c1 cost is negligible (+0.3 ms/step
+  all-host); c8 all-host +10 ms/step, so the hot window and real
+  selection locality decide the batch regime.
+- Test: tests/models/qwen4_exp/test_qsa_fp8_kv.py::
+  test_qsa_pointer_table_pages_match_slab_indexing (GPU, host, mixed,
+  null-page masking).
+- Also today: the merged tree's `_quixicore_C` is stale (post_update
+  binding changed upstream; the sampler dies "incompatible function
+  arguments" - the notebook's 2026-09-06 GLM entry hit the same). First
+  rebuild attempt failed at cmake configure (Makefiles vs the Ninja-built
+  FetchContent cache: ninja was not on PATH); retrying with .venv/bin and
+  CUDA on PATH. Production cannot restart on this tree until it lands.
+- Next: milestone 2 (pointer-table cache store), 3 (residency manager +
+  split main-KV slab + pool = GPU rows + active host rows), 4 (tier
+  rebind = zero-copy restore), 5 (serving gates).
+
+## 2026-09-06 - Three-tier redesign, milestones 2-3: host-resident main KV boots at the native 262,144 context on 4x RTX 3090
+
+- Design: docs/host_resident_kv_design.md. The 13 QSA main-KV layers
+  (target + MTP drafter) leave the packed slab for their own tensor:
+  logical blocks live in pinned host rows (cudaHostRegister PORTABLE |
+  MAPPED, read by the gather over PCIe), a small window of GPU rows holds
+  the blocks being written, and one per-request offset table (built once
+  per step, kernel-page granularity) addresses both.
+- The obstacle was not the main KV itself but what every block id costs
+  in the packed slab. Measured on the way (boot 5-13 logs):
+  1. Excluding the main KV from the slab left the stride at 78 MB: the 12
+     GDN state pages per row were padded to the main-KV page (block 12688
+     x 512 B = 6.5 MB each) by the CSA+linear grouping.
+  2. Sizing the attention block from the indexer page (64 B/token, so
+     the block grows from 1600 to 12688 tokens and a max-length request
+     charges 21 attention blocks, not 164) needed the aligner override to
+     be sticky on cache_config: a later config view without the transfer
+     config re-ran the aligner with 512 B/token.
+  3. The residency sub-row count must divide the block into 16-token
+     rows: 12688 = 16 x 13 x 61 splits at 13 (976-token rows), not 8.
+  Result: slab stride 10,556,416 B (the ring group: 13 rings padded to
+  the indexer page), a 262,144-token request needs 0.37 GiB of GPU KV
+  (21 attention + 1 ring + 16 mamba blocks), and the check passes against
+  the 0.78 GiB pool: "GPU KV cache size: 441,505 tokens, maximum
+  concurrency for 262,144 tokens per request: 1.68x". Main KV: 832
+  logical rows x 6.5 MB, 24 GPU hot rows (0.15 GiB), 5.03 GiB pinned host
+  rows per rank. CUDA graphs capture (0.28 GiB).
+- Per-step bookkeeping (vllm/v1/worker/gpu/kv_residency.py,
+  model_runner._prepare_main_kv_residency): written rows come from the
+  CPU block-table mirror + computed/scheduled token counts (no device
+  sync); the row holding the last computed token and the next is
+  protected; demotion copies the coldest unprotected GPU row to its host
+  row on the compute stream and rewrites its offset; a bound row is
+  zeroed before its first write; dummy/capture runs resolve every page to
+  scratch row 0. Unit tests: tests/v1/worker/test_kv_residency.py (bind,
+  demote, protect, and a bit-exact gather from a demoted host row).
+- Not yet: serving correctness (smoke at 6K/16K in flight after the
+  warmup indexing fix), tier integration (M4: the trajectory tier
+  currently saves only the slab rows; main-KV rows are the residency's
+  own host pool), the drafter's block-size interplay, and throughput.
+
+## 2026-09-06 - qwen38fn-nvfp4-4 with host-resident main KV: first validated numbers at the native 262,144 context
+
+- Boot 14 (serve_boot14_hostkv_8001.log): health, 441,505-token GPU pool,
+  1.68x one max-length request, main KV 832 rows x 6.5 MB per rank (24
+  GPU hot rows, 5.03 GiB host rows), graphs captured.
+- Correctness (port 8001, 4x RTX 3090, sampled at temp 1.0 / top_p 0.95 /
+  top_k 20):
+  | gate                                  | result                              |
+  | marker recall 54K / 144K / 243K tokens| PASS / PASS / PASS (follow-up 9.7 / 12.0 / 12.7 s; prefill 20 / 58 / 118 s) |
+  | multi-turn state tracking, 3 seeds    | 3/3 PASS                            |
+  | image canary (red circle)             | PASS ("A red circle is drawn")      |
+  | server errors                         | 0                                   |
+  At 243K tokens the request holds 249 main-KV rows against a 24-row
+  window: the follow-up's gathers read ~90% of their pages from pinned
+  host rows over PCIe and still answer in 12.7 s.
+- Throughput (exact 1000/2000, seed 42): c1 119.8 / c8 336.5 / c16 335.1
+  tok/s; draft acceptance 51.6% / 59.3% / 57.9%. For scale, the 8-GPU FP8
+  record does 136 / 594 / ~850 with GPU-resident KV, so 4 cards of NVFP4
+  through Marlin land at 88% of its c1 and 57% of its c8. c16 == c8 is the
+  window: 16 requests x 3-4 rows exceed 24, so decode gathers run at PCIe
+  speed (48 queries x 12 MiB per step = ~23 ms, matching the milestone-1
+  microbench). Lever: main_kv_gpu_rows - A/B at 64 rows in flight.
+- Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/ (deep_recall_250k.log,
+  multiturn_hostkv.log, image_canary.log, bench_hostkv_c{1,8,16}.log,
+  smoke_hostkv_boot14.log, run_validation_hostkv.out).
+
+## 2026-09-06 - qwen38fn-nvfp4-4: the hot-window A/B says the limiter is per-request slab rows, not the gather
+
+- Hypothesis: c16 == c8 (335 vs 337) because 16 requests' rows spill the
+  24-row window and decode gathers run at PCIe speed. Test: main_kv_gpu_rows
+  24 -> 64 (boots 15/17; the 24-row baseline re-measured on boot 16).
+  | window | GPU pool (tokens) | c8 (s42 / s43)  | c16 (s42 / s43) | Running (interval log) | residency counters |
+  | 24     | 441,505           | 349.0 / 330.9   | 339.1 / 329.2   | 4 max                  | 178 binds, 155 demotions |
+  | 64     | 269,042           | 227.5 / 211.2   | 217.2 / 225.1   | 2 max                  | 16 binds, 0 demotions    |
+  REJECTED - the larger window is 35% slower, and the counters show why:
+  the scheduler never had more than 2 requests running at 64 rows and 4
+  at 24. Every running request charges the packed slab a fixed ~18 rows
+  x 10.56 MB = 190 MB regardless of context: 1 attention block, 1 ring
+  block, and (2 + num_spec) = 4 GDN state blocks in each of the 4 mamba
+  groups (fp32 SSM state, 812 KB per layer at TP4). The 0.78 GiB pool
+  therefore admits 4 requests; each extra hot row (6.5 MB) comes out of
+  that pool. The "c8" and "c16" numbers are effectively c4.
+- Bookkeeping cost measured: 0.4 ms of CPU per step (residency stats log).
+- Consequence for this platform: a 4x 3090 NVFP4 instance serves ~4-5
+  concurrent requests at any context up to 262K, gathering deep history
+  over PCIe; the 8-GPU FP8 record serves 32 at 1.89x max-length capacity.
+  Two 4-GPU instances = ~8-10 sessions with full context across the box.
+- Levers left (in flight: boot 18): gpu_memory_utilization 0.97 -> 0.975,
+  hot rows 24 -> 16, max_num_seqs 6 with capture 24 (smaller graph
+  reserve). Not taken: dropping the ring padding to the indexer page
+  (-8% stride); GDN state precision (fp32 -> bf16 would halve 12 of the
+  18 rows but is a numerics change needing its own qualification).
+
+## 2026-09-06 - qwen38fn-nvfp4-4 final record: util 0.975, 24 hot rows, 8 seqs, capture 24
+
+- Pool tuning (boots 18/19): 16 rows + 6 seqs gave the largest pool
+  (565,679 tokens, 2.16x) but c6 fell to 295 - five requests' 20 active
+  rows no longer fit a 16-row window, so every decode gather went to host.
+  24 rows + 8 seqs + capture 24 at util 0.975: pool 531,186 tokens (2.03x
+  one max-length request), 5 running, c8 361.7 / c1 120.1 tok/s, 0 errors;
+  residency 41 binds / 18 demotions over the c8+c1 legs, 0.42 ms CPU per
+  step. RETAINED as the profile.
+- Free memory on device after the boot: 23.0/23.56 GiB usable, 21.08
+  weights+non-torch, 0.98 activation, 0.19 graphs - the 0.975 utilization
+  leaves ~0.3 GiB true headroom, the same band the FP8 record runs at.
+- Standing next steps: (1) M4 tier rebind - the trajectory tier still
+  saves slab rows only, so a resumed conversation re-prefills its main KV
+  until the residency's host rows become the trajectory's slots; (2) ring
+  padding to the indexer page (8% of the stride); (3) the same design on
+  the 8-GPU FP8 record, where the 1.89x pool would become many x at no
+  weight cost; (4) two co-resident instances (GPUs 0-3 / 4-7) as the
+  operator asked - the profile is sized for it (88 GiB host + 448 GiB
+  NVMe per rank, ~6 GiB host rows per rank).
+- Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/ (serve_boot19_final_8001
+  .log, bench_final_c{8,1}.log, run_final.out; the A/B legs
+  bench_window{24,64,64b}_*.log, bench_tuned_c{1,6}.log).

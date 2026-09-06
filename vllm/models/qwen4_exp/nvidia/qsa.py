@@ -238,6 +238,7 @@ class Qwen4ExpQSAFlashAttentionImpl(AttentionImpl):
         token_to_req: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        page_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -296,6 +297,7 @@ class Qwen4ExpQSAFlashAttentionImpl(AttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
+            page_offsets=page_offsets,
         )
         return output
 
@@ -570,12 +572,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         ):
             raise RuntimeError("QSA indexer returned an invalid selection shape")
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
+        # Host-resident main KV: writes go through the residency's row-mapped
+        # slot mapping and the gather through its page-offset table.
+        residency = getattr(self, "main_kv_residency", None)
+        slot_mapping = main_metadata.slot_mapping
+        page_offsets = None
+        if residency is not None:
+            slot_mapping = residency.slot_mapping[: slot_mapping.shape[0]]
+            page_offsets = residency.page_offsets[: main_metadata.block_table.shape[0]]
         impl.do_kv_cache_update(
             self,
             key,
             value,
             self.kv_cache,
-            main_metadata.slot_mapping,
+            slot_mapping,
         )
         impl.forward_qsa(
             self,
@@ -586,6 +596,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            page_offsets=page_offsets,
         )
 
     def forward(

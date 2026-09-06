@@ -78,3 +78,62 @@ def test_e4m3_decode_is_exact_over_all_codes():
         idx = torch.full((1, 1), i, device="cuda", dtype=torch.int32)
         out = qsa_sparse_paged_attention(q, k8, v8, idx, block_table, token_to_req)
         assert out[0, 0, 0].item() == ref[i].item(), (i, out[0, 0, 0].item(), ref[i].item())
+
+
+@requires_cuda
+def test_qsa_pointer_table_pages_match_slab_indexing():
+    """Milestone 1 of the host-resident main-KV design: with a per-request
+    page-offset table the gather must be bit-exact against slab indexing,
+    whether a page lives in the GPU slab or in a cudaHostRegister-ed
+    (MAPPED) host row read over PCIe."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        page_offsets_from_table,
+        qsa_sparse_paged_attention,
+    )
+
+    torch.manual_seed(3)
+    pages, page, kv_heads, head_dim, rows, topk = 12, 64, 1, 256, 8, 128
+    kv = (torch.randn(pages, page, kv_heads, 2 * head_dim, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    k_cache, v_cache = kv.split(head_dim, dim=-1)
+    q = torch.randn(rows, 6, head_dim, device="cuda", dtype=torch.bfloat16)
+    idx = torch.randint(0, pages * page, (rows, topk), device="cuda", dtype=torch.int32)
+    block_table = torch.arange(pages, device="cuda", dtype=torch.int32).unsqueeze(0)
+    t2r = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    ref = qsa_sparse_paged_attention(q, k_cache, v_cache, idx, block_table, t2r)
+
+    # Host copy of the same pages, page-aligned, registered PORTABLE|MAPPED.
+    raw = torch.empty(kv.numel() + 4096, dtype=torch.uint8)
+    off = (-raw.data_ptr()) % 4096
+    host = raw[off : off + kv.numel()]
+    host.copy_(kv.view(torch.uint8).reshape(-1).cpu())
+    assert torch.cuda.cudart().cudaHostRegister(raw.data_ptr(), raw.numel(), 3) == 0
+    try:
+        page_bytes = page * kv_heads * 2 * head_dim
+        for host_pages in (set(), set(range(pages)), {p for p in range(pages) if p % 3 == 0}):
+            base = torch.tensor(
+                [
+                    (host.data_ptr() if p in host_pages else kv.data_ptr()) + p * page_bytes
+                    for p in range(pages)
+                ],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            offsets = page_offsets_from_table(block_table, base, k_cache.view(torch.uint8))
+            out = qsa_sparse_paged_attention(
+                q, k_cache, v_cache, idx, block_table, t2r, page_offsets=offsets
+            )
+            assert torch.equal(out, ref), host_pages
+        # A null block-table entry masks its page out instead of reading it.
+        holed = block_table.clone()
+        holed[0, 5] = -1
+        base = torch.tensor(
+            [kv.data_ptr() + p * page_bytes for p in range(pages)], dtype=torch.int64, device="cuda"
+        )
+        offsets = page_offsets_from_table(holed, base, k_cache.view(torch.uint8))
+        out = qsa_sparse_paged_attention(q, k_cache, v_cache, idx, holed, t2r, page_offsets=offsets)
+        ref_holed = qsa_sparse_paged_attention(q, k_cache, v_cache, idx, holed, t2r)
+        assert torch.equal(out, ref_holed)
+    finally:
+        torch.cuda.cudart().cudaHostUnregister(raw.data_ptr())

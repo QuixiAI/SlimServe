@@ -7,7 +7,7 @@ import hashlib
 import math
 import os
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
@@ -1044,6 +1044,7 @@ def _get_kv_cache_groups_uniform_type(
 
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
+    exclude: Collection[str] = (),
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
@@ -1063,7 +1064,16 @@ def unify_kv_cache_spec_page_size(
     Returns:
         The updated KVCacheSpec with the same page_size_bytes.
     """
-    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
+    # Host-resident main-KV layers (docs/host_resident_kv_design.md) do not
+    # occupy the shared slab: their pages neither set the maximum nor get
+    # unified, otherwise every mamba page would be padded to the main-KV
+    # page (measured 8x at block 12688) for rows that are never on the GPU.
+    skip = set(exclude)
+    page_sizes = {
+        layer.page_size_bytes
+        for name, layer in kv_cache_spec.items()
+        if name not in skip
+    }
     if len(page_sizes) <= 1:
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
@@ -1071,7 +1081,7 @@ def unify_kv_cache_spec_page_size(
     max_page_size = max(page_sizes)
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        if layer_name in skip or layer_spec.page_size_bytes == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         elif isinstance(layer_spec, MambaSpec):
             # MambaSpec's page size is determined by its state shapes and does
@@ -1234,20 +1244,77 @@ def _get_kv_cache_groups_uniform_page_size(
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
 
 
+def _main_kv_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return {}
+    return kv_transfer_config.kv_connector_extra_config or {}
+
+
+def host_resident_kv_layers(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> list[str]:
+    """Layers whose main KV lives in the pinned-host arena
+    (docs/host_resident_kv_design.md), in slab order.
+
+    Opt-in per profile through ``kv_connector_extra_config.main_kv_host_resident``.
+    The candidates are the plain FullAttentionSpec layers of the uniform
+    attention groups: for Qwen4Exp these are exactly the QSA main-KV layers
+    (target and MTP drafter), which the sparse gather reads top-k rows of and
+    can fetch over PCIe; the indexer's compressed caches (MLAAttentionSpec),
+    rings and GDN states stay in the GPU slab.
+    """
+    if not _main_kv_extra_config(vllm_config).get("main_kv_host_resident"):
+        return []
+    names: list[str] = []
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            continue
+        for layer_name in group.layer_names:
+            if type(spec.kv_cache_specs[layer_name]) is FullAttentionSpec:
+                names.append(layer_name)
+    return names
+
+
+def main_kv_sub_blocks(vllm_config: VllmConfig, block_size: int) -> int:
+    """Residency rows per logical block (default 8): rows must be whole
+    multiples of 16 tokens for the kernels; fall back to 1 otherwise."""
+    want = int(_main_kv_extra_config(vllm_config).get("main_kv_sub_blocks", 8) or 8)
+    candidates = [
+        d for d in range(1, block_size + 1)
+        if block_size % d == 0 and (block_size // d) % 16 == 0
+    ]
+    # Nearest legal divisor to the request (12688 = 16 x 13 x 61 splits only
+    # at 13, 61 or 793 rows); ties prefer the finer split.
+    return min(candidates, key=lambda d: (abs(d - want), -d))
+
+
+def main_kv_gpu_rows(vllm_config: VllmConfig) -> int:
+    """GPU hot-window rows for the host-resident main KV (default 16: the
+    write tails of max_num_seqs requests plus a few recently filled pages)."""
+    return int(_main_kv_extra_config(vllm_config).get("main_kv_gpu_rows", 16) or 16)
+
+
 def _get_packed_kv_cache_layout(
     kv_cache_groups: list[KVCacheGroupSpec],
+    exclude: Collection[str] = (),
 ) -> tuple[int, dict[int, list[str]]]:
     """Lay out each cache group densely in one shared block slab.
 
     A block ID is owned by one cache group at a time, so layouts from different
-    groups may overlap. Layers within a group remain disjoint.
+    groups may overlap. Layers within a group remain disjoint. ``exclude``
+    names layers laid out elsewhere (the host-resident main KV).
     """
     layers_by_offset: dict[int, list[str]] = defaultdict(list)
     block_stride = 0
+    skip = set(exclude)
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
         byte_offset = 0
         for layer_name in group.layer_names:
+            if layer_name in skip:
+                continue
             if isinstance(spec, UniformTypeKVCacheSpecs):
                 page_size = spec.kv_cache_specs[layer_name].page_size_bytes
             else:
@@ -1257,6 +1324,28 @@ def _get_packed_kv_cache_layout(
         block_stride = max(block_stride, byte_offset)
     assert block_stride > 0
     return block_stride, layers_by_offset
+
+
+def _host_resident_layout(
+    kv_cache_groups: list[KVCacheGroupSpec], layers: list[str]
+) -> tuple[int, dict[str, int]]:
+    """Byte stride of one host-resident block and each layer's offset in it."""
+    per_layer: dict[str, int] = {}
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        for layer_name in group.layer_names:
+            if layer_name in layers:
+                per_layer[layer_name] = (
+                    spec.kv_cache_specs[layer_name].page_size_bytes
+                    if isinstance(spec, UniformTypeKVCacheSpecs)
+                    else spec.page_size_bytes
+                )
+    offsets: dict[str, int] = {}
+    stride = 0
+    for layer_name in layers:
+        offsets[layer_name] = stride
+        stride += per_layer[layer_name]
+    return stride, offsets
 
 
 def _cross_layers_blocks_opt_in(vllm_config: VllmConfig) -> bool:
@@ -1300,9 +1389,15 @@ def _get_kv_cache_config_packed(
     """Plan a packed per-block KV cache tensor layout.
 
     Cache groups use dense, overlapping layouts within one block slab. Each
-    emitted tensor aliases the same physical backing allocation.
+    emitted tensor aliases the same physical backing allocation. Host-resident
+    main-KV layers (docs/host_resident_kv_design.md) leave the slab for their
+    own tensor whose blocks are backed by host rows plus a GPU hot window
+    reserved here.
     """
-    block_stride, layers_by_offset = _get_packed_kv_cache_layout(kv_cache_groups)
+    host_layers = host_resident_kv_layers(vllm_config, kv_cache_groups)
+    block_stride, layers_by_offset = _get_packed_kv_cache_layout(
+        kv_cache_groups, exclude=host_layers
+    )
     logger.info(
         "Packed KV slab: %d groups (%s), %d layers, block_stride %d bytes",
         len(kv_cache_groups),
@@ -1310,10 +1405,35 @@ def _get_kv_cache_config_packed(
         sum(len(g.layer_names) for g in kv_cache_groups),
         block_stride,
     )
-
+    gpu_rows = 0
+    main_stride = 0
+    main_offsets: dict[str, int] = {}
+    sub_blocks = 1
+    if host_layers:
+        main_stride, main_offsets = _host_resident_layout(kv_cache_groups, host_layers)
+        block_size = next(
+            g.kv_cache_spec.block_size
+            for g in kv_cache_groups
+            if host_layers[0] in g.layer_names
+        )
+        sub_blocks = main_kv_sub_blocks(vllm_config, block_size)
+        gpu_rows = main_kv_gpu_rows(vllm_config)
+        reserved = gpu_rows * (main_stride // sub_blocks)
+        logger.info(
+            "Host-resident main KV: %d layers, %d bytes per %d-token block in %d "
+            "sub-rows, %d GPU hot rows (%.2f GiB reserved); the packed slab keeps "
+            "%d bytes per block",
+            len(host_layers),
+            main_stride,
+            block_size,
+            sub_blocks,
+            gpu_rows,
+            reserved / (1 << 30),
+            block_stride,
+        )
+        available_memory = max(0, available_memory - reserved)
     num_blocks = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
-
     total_size = block_stride * num_blocks
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -1326,7 +1446,18 @@ def _get_kv_cache_config_packed(
                 block_stride=block_stride,
             )
         )
-
+    for layer_name in host_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(
+                size=main_stride * num_blocks,
+                shared_by=[layer_name],
+                offset=main_offsets[layer_name],
+                block_stride=main_stride,
+                host_resident=True,
+                gpu_rows=gpu_rows,
+                sub_blocks=sub_blocks,
+            )
+        )
     return num_blocks, kv_cache_tensors
 
 
@@ -1911,7 +2042,16 @@ def _get_kv_cache_groups_csa_linear(
                 "CSA+linear pipeline stage has mamba cache owners but no "
                 "main_kv tensor slots; realign the pipeline partition."
             )
-        padded_spec = replace(representative, page_size_padded=main_kv_page)
+        # Mamba pages share the packed row with the attention pages. With the
+        # main KV host-resident (docs/host_resident_kv_design.md) the main_kv
+        # page never enters the slab, so pad to the compressed (indexer) page
+        # - the largest attention page that does - instead of 8x it.
+        pad_target = (
+            max(compressed_page, unpadded_page)
+            if _main_kv_extra_config(vllm_config).get("main_kv_host_resident")
+            else main_kv_page
+        )
+        padded_spec = replace(representative, page_size_padded=pad_target)
         grouped_names: list[list[str]] = [[] for _ in range(num_groups)]
         for index, name in enumerate(names):
             grouped_names[index % num_groups].append(name)
@@ -2234,7 +2374,14 @@ def get_kv_cache_groups(
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.
     try:
-        filtered_spec = unify_kv_cache_spec_page_size(filtered_spec)
+        filtered_spec = unify_kv_cache_spec_page_size(
+            filtered_spec,
+            exclude=(
+                {n for n, sp in filtered_spec.items() if type(sp) is FullAttentionSpec}
+                if _main_kv_extra_config(vllm_config).get("main_kv_host_resident")
+                else ()
+            ),
+        )
     except NotImplementedError:
         fallback_groups = _try_get_full_allocation_fallback_groups(kv_cache_spec)
         if fallback_groups is None:
@@ -2320,7 +2467,10 @@ def _max_memory_usage_bytes_from_groups(
         # group. Block ids are shared across groups, so each group's maximum
         # page demand consumes that common stride. This covers DeepSeek-V4's
         # MLA tuples and independent uniform draft-cache groups alike.
-        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        block_stride, _ = _get_packed_kv_cache_layout(
+            kv_cache_groups,
+            exclude=host_resident_kv_layers(vllm_config, kv_cache_groups),
+        )
         return sum(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
                 vllm_config
@@ -2332,8 +2482,13 @@ def _max_memory_usage_bytes_from_groups(
         # CSA+linear packed slab: block ids come from one pool and each block
         # occupies the slab stride, so worst-case memory is the stride times
         # the summed per-group block demand (attention pages, one ring block
-        # per request, and the mamba groups' state blocks).
-        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        # per request, and the mamba groups' state blocks). Host-resident
+        # main-KV layers are backed by host rows: they leave the stride and
+        # charge only their GPU hot window (docs/host_resident_kv_design.md).
+        host_layers = host_resident_kv_layers(vllm_config, kv_cache_groups)
+        block_stride, _ = _get_packed_kv_cache_layout(
+            kv_cache_groups, exclude=host_layers
+        )
         total_blocks = 0
         for group in kv_cache_groups:
             spec = group.kv_cache_spec
@@ -2343,7 +2498,41 @@ def _max_memory_usage_bytes_from_groups(
                 total_blocks += cdiv(
                     spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
                 )
-        return block_stride * total_blocks
+        needed = block_stride * total_blocks
+        logger.info(
+            "KV memory check (packed): stride %d bytes x %d blocks = %.2f GiB; per group %s",
+            block_stride,
+            total_blocks,
+            needed / (1 << 30),
+            [
+                (
+                    type(g.kv_cache_spec).__name__,
+                    len(g.layer_names),
+                    g.kv_cache_spec.block_size,
+                    (
+                        g.kv_cache_spec.max_memory_usage_pages(vllm_config)
+                        if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs)
+                        else cdiv(
+                            g.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                            g.kv_cache_spec.page_size_bytes,
+                        )
+                    ),
+                    g.kv_cache_spec.page_size_bytes,
+                )
+                for g in kv_cache_groups
+            ],
+        )
+        if host_layers:
+            main_stride, _ = _host_resident_layout(kv_cache_groups, host_layers)
+            block_size = next(
+                g.kv_cache_spec.block_size
+                for g in kv_cache_groups
+                if host_layers[0] in g.layer_names
+            )
+            needed += main_kv_gpu_rows(vllm_config) * (
+                main_stride // main_kv_sub_blocks(vllm_config, block_size)
+            )
+        return needed
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len

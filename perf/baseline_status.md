@@ -5,6 +5,34 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
+### 4x RTX 3090 - qwen38fn-nvfp4-4 first validated record - 2026-09-06 (host-resident main KV @ native 262K)
+
+- nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt mixed: NVFP4 experts via
+  Marlin W4A16, FP8 drafter experts via Marlin W8A16, FP8 PLE tables
+  host-pinned), TP4 + EP, fp8 main KV, max_model_len 262144, util 0.97,
+  max_num_seqs 16, capture 48, MTP k=2, host tier 88 + NVMe 448 GiB/rank.
+- Three-tier redesign (docs/host_resident_kv_design.md): the 13 QSA main-KV
+  layers live in pinned host rows gathered over PCIe; 24 GPU hot rows;
+  attention block 12,688 tokens; GPU pool 531,186 tokens = 2.03 max-length
+  requests of resident state (util 0.975, max_num_seqs 8, capture 24).
+- Gates passed: marker recall 54K/144K/243K, multi-turn tracking 3/3,
+  image canary, 0 server errors.
+- Workload: exact 1,000 in / 2,000 out, temp 1.0 / top_p 0.95 / top_k 20,
+  seed 42, port 8001, idle box:
+
+| Concurrency | Aggregate tok/s | Draft acceptance |
+| ---: | ---: | ---: |
+| 1 | 120.1 | - |
+| 8 | 361.7 (5 running) | - |
+| 16 | 335.1 at the earlier util 0.97 / seqs 16 config (4 running) | 57.9% |
+
+- c16 == c8 because the packed slab admits ~4 running requests: each one
+  charges ~18 rows x 10.56 MB (GDN align-mode state blocks + ring +
+  attention) against the 0.78 GiB pool, so both numbers are effectively
+  c4. A 64-row hot window measured 35% slower (2 running). Tuning of the
+  pool (util 0.975, 16 rows, 6 seqs) recorded in the notebook.
+- Raw: perf/results/2026-09-06/qwen38fn-nvfp4-4/.
+
 ### 8x RTX 3090 Current Baseline - 2026-09-02 (fp8 main KV @ native 262K, host tier on)
 
 - Registered profile as deployed: TP8+EP, max_model_len 262144, main QSA

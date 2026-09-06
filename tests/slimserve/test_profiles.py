@@ -108,6 +108,7 @@ def test_every_source_declares_its_live_smoke_modalities():
     assert sources["muse-glimmer"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b"]["modalities"] == ["text", "image"]
     assert sources["qwen38-27b-nvfp4"]["modalities"] == ["text", "image"]
+    assert sources["qwen38-flash-next-nvfp4"]["modalities"] == ["text", "image"]
 
 
 def test_qwen38_uses_measured_metal_speculation_settings():
@@ -334,6 +335,7 @@ def test_registry_contains_only_the_supported_model_artifacts():
         "qwen38-27b",
         "qwen38-27b-nvfp4",
         "qwen38-flash-next-fp8",
+        "qwen38-flash-next-nvfp4",
         "glm53f-nvfp4",
     }
     glm = data["sources"]["glm52-vision"]
