@@ -129,3 +129,34 @@ def test_disk_tier_off_keeps_metadata_empty():
     m = conn.build_connector_meta(sched_output({}))
     assert not meta.disk_writes and not tail_meta.disk_writes and not m.disk_writes
     assert not m.disk_reads
+
+
+def test_host_resident_main_kv_disables_restores_until_rebind():
+    """Without milestone 4 the tier has no main-KV rows to restore: a hit
+    must not be reported (the request re-prefills) while offloads continue."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector as m
+
+    orig = m.HostTierConnector.__init__
+
+    def init(self, vllm_config, role, kv_cache_config):
+        vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "host_tier_gb_per_rank": 1.0,
+            "main_kv_host_resident": True,
+        }
+        vllm_config.parallel_config = SimpleNamespace(world_size=1)
+        orig(self, vllm_config, role, kv_cache_config)
+
+    with patch.object(m.HostTierConnector, "__init__", init):
+        conn = make_connector()
+    assert conn._main_kv_host_resident and not conn._main_kv_tiered
+    req, meta, tail_meta, _ = run_conversation(conn, "r1", 3)
+    assert meta.offloads  # fill offloads still staged
+    for _ in range(2):
+        conn.build_connector_meta(sched_output({}))
+    assert conn.index.lookup(req.block_hashes) is not None  # trajectory exists
+    again = FakeRequest("r2", [h(i) for i in range(3)] + [h(9)], num_tokens=4 * BLOCK + 4)
+    conn.on_new_request(again)
+    assert conn.get_num_new_matched_tokens(again, 0) == (0, False)

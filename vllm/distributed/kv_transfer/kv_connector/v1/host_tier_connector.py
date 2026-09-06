@@ -210,6 +210,14 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         )
         parallel = getattr(vllm_config, "parallel_config", None)
         self.num_ranks = int(getattr(parallel, "world_size", 1) or 1)
+        # docs/host_resident_kv_design.md: main KV in pinned host rows.
+        self._main_kv_host_resident = bool(extra.get("main_kv_host_resident"))
+        self._main_kv_tiered = False  # set by milestone 4 (tier rebind)
+        if self._main_kv_host_resident and role == KVConnectorRole.SCHEDULER:
+            logger.warning(
+                "host-tier: main KV is host-resident but not tier-managed yet; "
+                "tier RESTORES are disabled (resumed conversations re-prefill)"
+            )
 
         groups = kv_cache_config.kv_cache_groups
         self.num_groups = len(groups)
@@ -423,6 +431,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             remaining = track.planned_blocks * bs - num_computed_tokens
             if remaining > 0:
                 return remaining, True
+        if self._main_kv_host_resident and not self._main_kv_tiered:
+            # Host-resident main KV without tier rebind (milestone 4): the
+            # tier holds this trajectory's slab rows (indexer pages, GDN
+            # tails) but not its main-KV rows, so a restore would attend
+            # over stale rows. Re-prefill instead; offloads keep running.
+            return 0, False
         hit = self.index.lookup(
             request.block_hashes, allow_partial=self._partial_resume_ok
         )
