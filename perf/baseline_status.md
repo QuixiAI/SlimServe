@@ -42,6 +42,11 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
   + NVMe tier 448 GiB/rank on the dedicated nvme1n1 (80,273 slots, ~64M
   tokens), max_num_seqs 32, capture 96,
   MTP k=2 + index share, thinking budget 2000.
+- 2026-09-06: the record now runs the host-resident main KV (see the
+  notebook entry of that date): 3.65 GiB/rank available KV, 2,110,949-token
+  pool = 8.05x one max-length request; exact bench c1 116.2 / c8 549.4 /
+  c16 631.3 / c32 787.5 (c32 runs 21 requests: chat-context slab cost).
+  The lines below are the 2026-09-02 pre-port record kept for comparison.
 - GPU KV pool: 3.64 GiB/rank = 496,174 tokens = 1.89x one max-length
   request (bf16 held 269,155 = 1.03x). Attention block 800 tokens.
 - Workload: exact 1,000 in / 2,000 out, temp 1.0 / top_p 0.95 / top_k 20,

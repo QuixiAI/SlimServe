@@ -53,7 +53,9 @@ shipped sampling defaults, seeded.</sub>
 
 <sub>Profile `qwen38fn-fp8-8` as deployed: TP8 + expert parallel, the model's
 native 262,144-token context, fp8 main KV, prefix caching, MTP k=2,
-FULL_DECODE_ONLY graphs. Exact workload — 1,000 input and exactly 2,000 output
+FULL_DECODE_ONLY graphs; since 2026-09-06 the record serves the host-resident
+main KV (8.05 max-length requests resident, c32 787.5 tok/s with 21 running -
+perf/optimization_status.md of that date). Exact workload — 1,000 input and exactly 2,000 output
 tokens per request, the model's shipped sampling defaults (temperature 1.0,
 top-p 0.95, top-k 20) seeded — so these are not directly comparable to the GLM
 rows above, which use varied real prompts at temperature 0 with natural stops.
@@ -233,7 +235,7 @@ checkpoint.
 | `qwen38-q2kxl-1` | Qwen3.8-27B (GGUF) | 1 | MI300X, Mac | DFlash 2 |
 | `qwen38-nvfp4-1` | Qwen3.8-27B (NVFP4) | 1 | MI300X, Mac | MTP on MI300X, DFlash 2 on Mac |
 | `qwen38-nvfp4-1-tq` | Qwen3.8-27B (NVFP4) | 1 | Mac | DFlash 2 + TurboQuant draft KV |
-| `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (ships with the checkpoint) |
+| `qwen38fn-fp8-8` | Qwen3.8-Flash-Next | 8 | RTX 3090 | MTP (ships with the checkpoint); native 262K context via host-resident main KV (8.05 max-length requests resident) |
 | `qwen38fn-nvfp4-4` | Qwen3.8-Flash-Next (NVFP4) | 4 | RTX 3090 | MTP (ships with the checkpoint); native 262K context via host-resident main KV |
 
 18 profile ids, 25 platform records. `qwen38-nvfp4-1` is the clearest example of

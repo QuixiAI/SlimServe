@@ -19550,3 +19550,147 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   GPU green.
 - Profile: host_tier 12 GiB + main_kv_tier 76 GiB per rank (352 GiB
   pinned total, as validated); production restarted on it.
+
+## 2026-09-06 - qwen38fn-nvfp4-4 capacity levers: what bounds the 2.03x resident concurrency
+
+- Operator: "the 531k tokens, 2.03 max length requests is unacceptable -
+  the entire purpose of kv cache cpu offload and kv cache nvme offload is
+  to maximize that and transcend the limitation of gpu vram."
+- What the number is: the main QSA KV is already off the GPU (host rows,
+  76 GiB tier per rank). The 2.03x counts the GPU-RESIDENT residue per
+  max-length request: 38 packed slab blocks x 10,556,416 B = 0.37 GiB,
+  made of 21 indexer-key blocks (13 layers x 12,688 tokens x 64 B, bf16,
+  dense-scanned every step), 16 GDN state blocks (12 layers x 812,032 B:
+  fp32 temporal state 12 heads x 128 x 128 + conv tail) and 1 ring block.
+  The pool that holds them is 0.44 GiB out of 0.91 GiB "available KV"
+  after the 24 hot rows and the drafter's share. Everything else on the
+  card is 20.8-21.1 GiB of weights + non-torch, 1 GiB peak activation,
+  0.19 GiB graphs.
+- Lever 1, max_num_batched_tokens 1024 (test on GPUs 4-7, port 8001,
+  serve_boot21_batch1024_8001.log): available KV 0.91 -> 1.06 GiB, pool
+  531,186 -> 634,664 tokens (2.03x -> 2.42x). Peak activation did NOT
+  drop (0.98 -> 1.08 GiB); the gain came from a smaller non-torch share.
+  Cost: c8 361.7 -> 310.6 tok/s (-14%), c1 120.1 -> 128.9 (+7%).
+  REJECTED: the batched-token cap is not what sets the activation peak,
+  and it taxes the concurrent case the profile exists for.
+- Finding: the activation peak is the vision encoder's profiling image -
+  the encoder cache is profiled with one image of the maximum feature
+  size (16,384 encoder tokens = 65,536 patches through the 27-layer,
+  1152-wide ViT), not the LLM's batched tokens. Lever 2 is bounding the
+  image side (mm_processor_kwargs max_pixels, which the Qwen3-VL
+  processing info maps onto size.longest_edge, so it bounds both the
+  profile and real requests by downscaling larger images); measured next.
+- Lever 2, mm_processor_kwargs max_pixels 4194304 (encoder budget 16,384 ->
+  4,096 tokens; serve_boot22/23_maxpix_*_8001.log): at util 0.975 the
+  profiler handed the pool 1.62 GiB (1,034,778 tokens, 3.95x) and CUDA
+  graph capture died OOM (free 2.4 MB on ranks 1-2). At util 0.96 the
+  pool was 1.27 GiB (786,432 tokens, 3.00x), boot and capture passed,
+  idle free 620 MiB per card (production idles at 1,040), and the c8
+  exact bench crashed the workers with torch.OutOfMemoryError (126 MiB
+  request, 46 MiB free) inside execute_model. REJECTED as configured.
+  What it taught: the vision profile's oversized activation peak was
+  never waste - it was the only thing reserving the ~0.5 GiB that graph
+  capture and the c8 prefill transient actually need. Without it the
+  profiler over-commits, and vLLM has no accounting for those transients.
+  Bounding images could still buy ~0.1-0.3 GiB with an explicit
+  kv_cache_memory_bytes chosen from a loaded measurement, not from the
+  profiler; that is at most +0.3x and was not pursued.
+- Conclusion: the resident-concurrency bound at this checkpoint is
+  structural, not a tuning knob. Per max-length request the GPU still
+  carries 218 MB of bf16 indexer keys (dense-scanned every step) and
+  156 MB of GDN state, packed at a uniform 10.56 MB stride. Ways to move
+  it, sized from the layout: (1) fp8 indexer keys with a per-group
+  (non-uniform) slab stride: 401 -> 272 MB per max-length request
+  (+47%); (2) bf16 GDN temporal state on top: -> 195 MB (+106%; needs
+  a deep-recall requalification, fp32 state was chosen for long-sequence
+  drift); (3) host-resident indexer keys (milestone 5): the scan reads
+  every compressed key each step, so at 262K x 8 requests that is
+  1.7 GB/step over PCIe (~70-90 ms) - concurrency unbounded by VRAM at a
+  measurable deep-context decode cost. None of these was started;
+  decision owed to the operator (see the 2026-09-06 report).
+- Housekeeping: profiles.json restored to the committed record (util
+  0.975, no batched-token cap, no image bound); GPUs 4-7 released;
+  production untouched throughout.
+
+## 2026-09-06 - qwen38fn-fp8-8: the host-resident main KV ported to the 8-GPU FP8 record
+
+- Operator: "do the 8-gpu FP8 port. stop production when you are ready to
+  test it." Production (qwen38fn-nvfp4-4 on GPUs 0-3) was stopped for the
+  test window and restarted after it.
+- Baseline (perf/baseline_status.md, 2026-09-02/03 record): GPU pool
+  496,174 tokens = 1.89 max-length requests at 1,056-token blocks; c1
+  130.9-136.2, c8 547-585, c16 838, c32 880-882 tok/s (exact 1000/2000).
+- Port: the FP8 record's kv_connector_extra_config gains
+  main_kv_host_resident / main_kv_gpu_rows 104 (32 seqs x up to 3 write
+  rows + scratch) / main_kv_sub_blocks 8 / main_kv_tier_gb_per_rank 48,
+  with host_tier_gb_per_rank 88 -> 12 (the slab tier now holds 12,688-token
+  blocks: 1,220 = 15.5M tokens) and nvme 448 unchanged.
+- Boot 1 (serve_boot1_hostkv_8001.log) failed the planner: at TP8 the GDN
+  state page halves (406 KB), so the aligner's natural attention block
+  became 6,352 tokens = 16 x 397, which splits into no sub-row near 8 -
+  main_kv_sub_blocks resolved to 1, every hot row became a whole 19.5 MB
+  block, and the one-request check wanted 4.39 GiB of 3.64. Fix
+  (vllm/platforms/interface.py): the host-resident aligner holds the block
+  at main_kv_block_tokens (default 12,688, the validated 13 x 976 geometry)
+  and pads the GDN page to match; tests/v1/core/
+  test_main_kv_planner_helpers.py pins the arithmetic. The main KV is one
+  KV head replicated per rank, so blocks stay 84,451,328 B at TP8 and the
+  hot window is 0.63 GiB.
+- Boot 2 (16 + 64 GiB tiers) came up but left 64 GiB MemAvailable on the
+  995 GiB box (24 GiB of residency rows per rank on top of the tiers and
+  the 48 GiB PLE segment); boot 3 = the record as committed (12 + 48):
+  MemAvailable 221 GiB at idle.
+- Boot 3 (serve_boot3_final_8001.log): available KV 3.65 GiB, GPU pool
+  2,110,949 tokens = 8.05 max-length requests (1.89x before; 2.03x on the
+  4-GPU NVFP4 record), weights + non-torch 18.07 GiB, peak activation 0.9,
+  graphs 0.47.
+- Exact bench (bench_hostkv_c{1,8,16,32}.log): c1 116.2 (-12%), c8 549.4
+  (in band), c16 631.3 (-25%), c32 787.5 (-11%). Two causes, both
+  measured: (1) the residency's per-step host bookkeeping, 10.6 ms/step at
+  c1 falling to 4.1 ms/step amortized at c32 (a dozen small device ops and
+  pageable H2D copies per step in MainKVResidency.prepare_step) - the c1
+  and c16 loss; (2) capacity at chat context: c32 ran 21 requests (KV
+  96.4%, 11 waiting) because every chat request charges 14 packed blocks -
+  1 attention + 1 ring + 12 GDN snapshots that each occupy a 10.56 MB slot
+  for 812 KB of state - while the interval generation rate at that plateau
+  was 900-1,019 tok/s (baseline-equivalent per running request).
+- Image canary PASS ('A red circle is drawn in the image.'); tier
+  acceptance (48-request churn of 55K tokens against the 306-block pool)
+  PASS: hits fired (resume at block 3 = 38,064 tokens), marker recall on
+  all three restored conversations, 8K 2.3 s / 24K 7.4 s / 42K 4.2 s vs
+  cold 1.9 / 5.7 / 10.1 s; 0 errors over the whole run.
+- Decision: ADOPTED on the record - 4.3x the resident deep-context
+  capacity at the native 262,144 context for -11% at c32 and flat c8.
+  Owed next, in order: (a) vectorize prepare_step (keep the device tables
+  incremental, pinned staging) - recovers most of c1/c16; (b) per-group
+  slab strides so a GDN snapshot stops paying an attention-sized slot -
+  chat concurrency 21 -> the full 32 and max-length residency ~8x -> ~13x
+  in the same pool; (c) fp8 indexer keys on top of (b).
+- Raw: perf/results/2026-09-06/qwen38fn-fp8-8_hostkv/.
+- Deep-recall follow-up (after the entry above): the first smoke run's
+  raw-prompt cold turns return an immediate end-of-turn token (raw text
+  ending in a period; 68% EOS probability at 8K) - a model behaviour, not
+  a KV fault - so recall was re-measured with the question inside one
+  fresh request: PASS at 1.8K, 2.1K, 6.3K, 24K, 50K, 51K, 54K, 72K, 99K
+  and 198K tokens. Controlled tier restores (restore_depth_probe.py: fresh
+  conversation, 44 x 55K churn, follow-up) PASS at 3, 4 and 5 full
+  blocks (5.2 / 3.3 / 8.1 s vs 10.4 / 12.7 / 18.1 s cold); a 198K
+  conversation (203 rows against the 104-row window) recalled across a
+  follow-up under two concurrent 50K prefills and a quiet one after
+  (oversub_probe.py); the exact smoke flow rerun on the same 54K prompt
+  and a fresh variant PASS.
+- OPEN: between 22:44 and 22:48 UTC three follow-ups (54K, 144K, 198K)
+  returned empty answers - the 54K/144K ones were tier restores of
+  trajectories written at boot by the aborted first smoke, the 198K one a
+  fresh conversation whose follow-up ran beside 43-51K sweeps. Nothing in
+  the log (no warnings, disk_reads 0, restores staged for the full span),
+  and none of the probes above reproduces it. Suspected mechanism, real by
+  inspection whether or not it fired here: KVTierIndex._delete (reclaim
+  under a full main-KV tier) frees main slots without telling the
+  residency, so a block still alive in the GPU prefix cache whose demoted
+  rows point into a reclaimed slot reads another trajectory's bytes. Fix
+  owed (design doc, 8-GPU section, item c). Production keeps the TP4
+  record, which carries the same code path.
+- Production restarted on qwen38fn-nvfp4-4 (GPUs 0-3) at 23:45 UTC; the
+  FP8 record's new configuration is committed but not deployed (operator:
+  one instance on GPUs 0-3, GPUs 4-7 free).

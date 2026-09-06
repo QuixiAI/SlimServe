@@ -174,6 +174,37 @@ after full-pool eviction, recall correct at 8K/24K/42K, 42K resumes 2.5x
 faster than cold. Not yet: main slots on NVMe (trajectories carrying them
 are deleted, not demoted, under host pressure).
 
+## 8-GPU FP8 port (2026-09-06): the block floor and what TP changes
+
+- `qwen38fn-fp8-8/rtx3090` runs the same design (extras: host_tier 12,
+  main_kv_tier 48, gpu_rows 104, sub_blocks 8 -> 13). The main KV is one KV
+  head replicated per rank, so a block is 84,451,328 B per rank at TP8 as at
+  TP4; only the GDN state page halves (406 KB).
+- The aligner's natural block (GDN page / 64 B per token) therefore halves
+  to 6,352 = 16 x 397 tokens, which splits into no sub-row near the
+  requested 8 (only 1 or 397), making every hot row a whole 19.5 MB block
+  and failing the one-request memory check. `main_kv_block_tokens`
+  (default 12,688) holds the block at the validated 13 x 976 geometry and
+  pads the GDN page to match (interface.py; tests/v1/core/
+  test_main_kv_planner_helpers.py). A max-length request still charges 38
+  packed blocks (21 indexer + 1 ring + 16 GDN) at the 10.56 MB stride.
+- Result: 3.65 GiB available KV = 306 packed blocks, 2,110,949-token pool,
+  8.05 max-length requests (1.89x on the 2026-09-02 record). Exact bench
+  c1/c8/c16/c32 116.2/549.4/631.3/787.5 vs 131-136/547-585/838/880: c1 and
+  c16 pay the residency's per-step host bookkeeping (10.6 ms/step at c1),
+  c32 runs 21 requests because a chat request charges 14 slab blocks (12
+  of them GDN snapshots in attention-sized slots).
+- Owed, in order: (a) incremental `prepare_step` (device tables updated
+  only for changed rows, pinned staging); (b) per-group slab strides so
+  GDN snapshots stop paying an attention-sized slot (21 -> 32 chat
+  requests, ~8x -> ~13x max-length residency in the same pool); (c) the
+  reclaim hazard: `KVTierIndex._delete` frees main slots without telling
+  the residency, so a block still alive in the GPU prefix cache whose
+  demoted rows point into a reclaimed slot would read another
+  trajectory's bytes - the index must not reclaim slots referenced by
+  live pool blocks, or the worker must copy them back to residency rows
+  first; (d) milestone 4b (main slots on NVMe).
+
 ## Milestones and gates
 
 1. **Pointer-table gather kernel + microbench** (this entry). Gate: bit-exact

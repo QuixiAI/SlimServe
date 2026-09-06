@@ -873,6 +873,17 @@ class Platform:
             # with the main-KV bytes/token would re-pad the mamba page 8x.
             if extra.get("main_kv_host_resident"):
                 cache_config.main_kv_host_resident = True
+                # Floor for the attention block (tokens). The natural block is
+                # the GDN state page over the indexer's 64 B/token, which
+                # halves with every TP doubling (12,688 at TP4, 6,352 at TP8);
+                # 6,352 = 16 x 397 splits into no sub-row near the requested
+                # count, so every hot-window row would be a whole 19.5 MB
+                # block. Holding the block at the validated 12,688 (13 rows
+                # of 976 tokens) pads the GDN page instead - cheap, since a
+                # request carries 16 GDN blocks against 21 indexer blocks.
+                cache_config.main_kv_block_tokens = int(
+                    extra.get("main_kv_block_tokens", 12688) or 12688
+                )
             if getattr(cache_config, "main_kv_host_resident", False):
                 # Host-resident main KV (docs/host_resident_kv_design.md): the
                 # QSA main KV lives in pinned host rows, so the largest GPU
@@ -991,6 +1002,19 @@ class Platform:
             attn_block_size = kernel_block_alignment_size * cdiv(
                 mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
+            )
+
+        floor_tokens = int(getattr(cache_config, "main_kv_block_tokens", 0) or 0)
+        if floor_tokens and attn_block_size < floor_tokens:
+            natural_block_size = attn_block_size
+            attn_block_size = kernel_block_alignment_size * cdiv(
+                floor_tokens, kernel_block_alignment_size
+            )
+            logger.info(
+                "Host-resident main KV: attention block held at %d tokens "
+                "(natural %d); the GDN page is padded to match",
+                attn_block_size,
+                natural_block_size,
             )
 
         if cache_config.block_size < attn_block_size:
