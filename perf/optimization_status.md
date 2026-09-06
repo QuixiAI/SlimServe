@@ -19287,6 +19287,17 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Client knob, no server change: the Flash chat template implements the
   GLM-5.3 reasoning_effort levels (Low / High / Max, default Max) via
   chat_template_kwargs; thinking stays always-on per policy.
+- WildChat deep-context leg on the maximized glm53f-nvfp4-8 (tiers active,
+  VLLM_KV_TIER_VERIFY=1): PASS - 0 errors, 33/33 recall, max ctx 204,088 /
+  median 181,931 across the 8 sessions, 96,467 completion tokens in the
+  4,548 s wall (97,378 on the 0.85 boot of 09-03: unchanged, as decode
+  does not depend on pool size), prefix cache hit rate 92.1%. Tier: 228
+  boundary-state saves, ZERO restores - with 8 sessions at ~180K the
+  3.17M-token VRAM pool never evicts a live session, so the leg cannot
+  exercise restores (same as the GLM-5.2 TP8 leg of 2026-08-30); the
+  forced-eviction acceptance above (0/106 mismatched, promotion from
+  disk) is the restore evidence of record. Raw: perf/results/2026-09-06/
+  glm53-leg-tier/glm53-nvfp4-8/ (pre-rename path).
 
 ## 2026-09-06 - qwen38fn-nvfp4-4 bring-up record: nvidia/Qwen3.8-Flash-Next-NVFP4 on 4x RTX 3090 (unbooted)
 
