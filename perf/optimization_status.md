@@ -19239,3 +19239,22 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   library's mla_kernels.cuh / paged_attn_v2_kernels.cuh are July CDNA3 ports
   of the CUDA files and are not on the ROCm serving path; their CUDA
   evolution belongs to QuixiCore-CUDA.
+
+## 2026-09-06: GLM-5.2 A100 tier records re-measured after the sparse-decode copy removal
+
+- Both records boot through their profiles with the host tier active
+  (48 GiB/rank). The merged tree needed `_quixicore_C` rebuilt first: the
+  MI300X commit changed `post_update`'s binding and the stale extension
+  died at the sampler with "incompatible function arguments" - any merge
+  that touches csrc means a rebuild before the next boot.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  seed 42), aggregate tok/s, canaries (text + reasoning, image, tool)
+  passing on both:
+  | record               | c1   | c8    | c16   | previous                     |
+  | glm52-q2k-4 (TP4,fp8)| 31.7 | 93.7  | 115.6 | no exact baseline on file    |
+  | glm52-q2k-8 (TP8)    | 72.5 | 166.5 | 223.1 | 14.9 / 81.5 / 135.2 (09-03)  |
+  TP8/TP4 at c1 = 2.3x. Raw: perf/results/2026-09-06/glm52-q2k-{4,8}-
+  baseline/. Between the 09-03 TP8 numbers and these: the sparse decode
+  no longer `reshape(-1)`-copies the packed layer cache on every call
+  (page_stride_bytes on the entry points) and the merged MI300X work
+  reworked the v2 batch kernels; the split is not measured separately.

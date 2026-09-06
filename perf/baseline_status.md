@@ -1906,7 +1906,16 @@ Raw results: `perf/results/2026-08-18/qwen38-nvfp4-1-mi300x-baseline/`.
 Headroom (unmeasured): native gfx942 NVFP4 decode, aiter FP8 shape tuning,
 graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
-## GLM-5.2 glm52-q2k-8 (A100 x8, bf16 KV @ 202752) - first exact-token baseline 2026-09-03
+## GLM-5.2 A100 tier records - exact-token baseline 2026-09-06 (stack: copy-free sparse decode, tier active)
+- Through `slimserve <id> --serve` with the 48 GiB/rank host tier, exact-token
+  harness (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20, seed 42):
+  | record                        | c1   | c8    | c16   |
+  | glm52-q2k-4 (TP4, fp8 KV)     | 31.7 | 93.7  | 115.6 |
+  | glm52-q2k-8 (TP8, bf16 KV)    | 72.5 | 166.5 | 223.1 |
+  Raw: perf/results/2026-09-06/glm52-q2k-{4,8}-baseline/. Canaries pass on
+  both. Supersedes the 2026-09-03 TP8 entry below (14.9 / 81.5 / 135.2).
+
+## GLM-5.2 glm52-q2k-8 (A100 x8, bf16 KV @ 202752) - first exact-token baseline 2026-09-03 (superseded)
 - Through `slimserve glm52-q2k-8 --serve`, exact-token harness (1000 in /
   300 out, temp 1.0 / top-p 0.95 / top-k 20, seed 42), aggregate output tok/s:
   | c1   | c8   | c16   |
