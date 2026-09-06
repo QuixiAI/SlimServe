@@ -1941,8 +1941,10 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 - Tier acceptance on this pool with VLLM_KV_TIER_VERIFY=1: 6/6 probes hit
   and resumed at block 68 (39,168 tokens), 106 restore ops each, 0/106
   mismatched on every restore, one promotion from disk, 6/6 recalled
-  after a 3,980,143-token churn. WildChat deep-context leg on this record:
-  see the 2026-09-06 notebook entry.
+  after a 3,980,143-token churn. WildChat deep-context leg on this record
+  (tiers active): 0 errors, 33/33 recall, max ctx 204,088, median 181,931,
+  96,467 completion tokens in 1.25 h, prefix cache 92.1%; no tier restores
+  occurred because the 3.17M-token pool never evicted a live session.
 
 ## GLM-5.3-Flash NVFP4 (glm53f-nvfp4-4 / glm53f-nvfp4-8, A100)
 
