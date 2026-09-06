@@ -19522,3 +19522,31 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   `slimserve.cli qwen38fn-nvfp4-4 --serve --port 8000` with
   CUDA_VISIBLE_DEVICES=0,1,2,3; the FP8 8-GPU unit file is backed up in
   ~/.local/scratch. No second instance: GPUs 4-7 stay free.
+
+## 2026-09-06 - Milestone 4: tier rebind for the host-resident main KV - validated
+
+- Hazard closed first: with the main KV host-resident, a tier restore
+  brought back indexer pages and GDN tails but not main-KV rows (a
+  resumed conversation would attend over stale rows). Restores were gated
+  off (d04f69abe, production restarted on it) until this landed.
+- Design (docs/host_resident_kv_design.md, milestone 4): second pinned
+  arena of main-KV tier slots (84,451,328 B = one 12,688-token block of 13
+  sub-rows), reserved at block allocation (main_homes), flushed at fill
+  (main_flush, confirmed next build), rebound on restore (main_rebinds:
+  offset-table update, zero copy, pinned until the request ends), released
+  when a reserved block never fills (main_release). Index: per-position
+  main slot, main-aware resumability, pins block reclaim; trajectories
+  carrying main slots are deleted rather than demoted to disk (4b owed).
+- Live (port 8001 on GPUs 4-7 beside production, slab 4 + main 20 GiB per
+  rank, 12 x 55K churn after 8K/24K/42K conversations): hits fired
+  ("resume at block 3 (38064 tokens)"), recall correct on all three
+  rebound conversations, 0 errors. Restore vs cold: 8K 3.5 vs 2.6 s, 24K
+  7.5 vs 6.3 s, 42K 4.6 vs 11.3 s - the 12,688-token block is the resume
+  granularity, so conversations shorter than ~2 blocks re-prefill most of
+  themselves; deep ones gain the full win.
+- Tests: index (reserve/confirm/release/pin), connector (homes at alloc,
+  flush at fill, rebinds + pins on resume, release at finish), residency
+  (home demotion, flush, rebind, gather from the tier slot): 118 CPU + 5
+  GPU green.
+- Profile: host_tier 12 GiB + main_kv_tier 76 GiB per rank (352 GiB
+  pinned total, as validated); production restarted on it.

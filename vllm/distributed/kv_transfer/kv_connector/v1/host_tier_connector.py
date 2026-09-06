@@ -113,6 +113,15 @@ class HostTierMeta(KVConnectorMetadata):
     # req_id -> [(disk_slot, host_slot), ...] promotion reads that must land
     # before that request's restores.
     disk_reads: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # Host-resident main KV tier (milestone 4): scheduler block -> main slot
+    # to demote into; batch_seq -> [(block, slot)] blocks whose fill is
+    # complete (flush GPU rows into the slot); req_id -> [(block, slot)]
+    # restored blocks to rebind onto slots; blocks whose reserved slot was
+    # released (demote to the residency's own pool instead).
+    main_homes: dict[int, int] = field(default_factory=dict)
+    main_flush: dict[int, list[tuple[int, int]]] = field(default_factory=dict)
+    main_rebinds: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    main_release: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -157,6 +166,10 @@ class _ReqTrack:
     # Promotion reads (disk_slot, host_slot) to hand the worker with the
     # request's first restore chunk.
     disk_reads: list[tuple[int, int]] = field(default_factory=list)
+    # Main-KV tier: logical position -> reserved slot (this request's fills);
+    # planned slots of a resumed span (rebound read-only).
+    main_slots: dict[int, int] = field(default_factory=dict)
+    planned_main_slots: list[int] = field(default_factory=list)
 
 
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
@@ -212,12 +225,40 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self.num_ranks = int(getattr(parallel, "world_size", 1) or 1)
         # docs/host_resident_kv_design.md: main KV in pinned host rows.
         self._main_kv_host_resident = bool(extra.get("main_kv_host_resident"))
-        self._main_kv_tiered = False  # set by milestone 4 (tier rebind)
+        # Milestone 4: a second arena of main-KV slots (one scheduler block of
+        # sub-rows each) reserved at allocation, flushed at fill, rebound on
+        # restore. Size from main_kv_tier_gb_per_rank.
+        host_tensors = [
+            t for t in kv_cache_config.kv_cache_tensors if getattr(t, "host_resident", False)
+        ]
+        self._main_block_bytes = host_tensors[0].block_stride if host_tensors else 0
+        main_gb = float(extra.get("main_kv_tier_gb_per_rank", 0) or 0)
+        self.num_main_slots = (
+            int(main_gb * (1 << 30)) // self._main_block_bytes
+            if self._main_kv_host_resident and self._main_block_bytes and main_gb > 0
+            else 0
+        )
+        self._main_kv_tiered = self.num_main_slots > 0
+        self._main_gid = -1
+        if host_tensors:
+            for gid, g in enumerate(kv_cache_config.kv_cache_groups):
+                if host_tensors[0].shared_by[0] in g.layer_names:
+                    self._main_gid = gid
+                    break
         if self._main_kv_host_resident and role == KVConnectorRole.SCHEDULER:
-            logger.warning(
-                "host-tier: main KV is host-resident but not tier-managed yet; "
-                "tier RESTORES are disabled (resumed conversations re-prefill)"
-            )
+            if self._main_kv_tiered:
+                logger.info(
+                    "host-tier: main-KV tier %d slots x %d bytes per rank (%.1f GiB)",
+                    self.num_main_slots,
+                    self._main_block_bytes,
+                    self.num_main_slots * self._main_block_bytes / (1 << 30),
+                )
+            else:
+                logger.warning(
+                    "host-tier: main KV is host-resident but not tier-managed "
+                    "(main_kv_tier_gb_per_rank unset); tier RESTORES are "
+                    "disabled (resumed conversations re-prefill)"
+                )
 
         groups = kv_cache_config.kv_cache_groups
         self.num_groups = len(groups)
@@ -354,7 +395,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 attn_gids=self.attn_groups,
                 num_disk_slots=self.num_disk_slots,
                 attn_ratio=self._attn_ratio,
+                num_main_slots=self.num_main_slots,
             )
+            self._staged_main_homes: dict[int, int] = {}
+            self._staged_main_flush: dict[int, list[tuple[int, int]]] = {}
+            self._staged_main_rebinds: dict[str, list[tuple[int, int]]] = {}
+            self._staged_main_release: list[int] = []
+            self._last_step_main_slots: list[int] = []
             if self._resume_align > 1:
                 logger.info(
                     "host-tier: attention block ratios %s; resume boundaries "
@@ -499,6 +546,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
             self._tracks[request.request_id] = track
         track.disk_reads = disk_reads
+        if self._main_kv_tiered:
+            track.planned_main_slots = self.index.main_slots_for(hit_owner, n_blocks)
+            self.index.pin_main(hit_owner, n_blocks, request.request_id)
         # Adopt the resumed trajectory: this request is its continuation,
         # so its saves extend that lineage instead of duplicating it.
         track.owner = hit_owner
@@ -563,6 +613,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 ops.append(
                     (track.planned_attn_slots[logical][gid], gb[gidx], gid)
                 )
+                if gid == self._main_gid and track.planned_main_slots:
+                    self._staged_main_rebinds.setdefault(
+                        request.request_id, []
+                    ).append((gb[gidx], track.planned_main_slots[logical]))
         # Tail-boundary state blocks ride the FINAL restore chunk. The
         # resumed state must land at position ``boundary_blocks - 1`` of
         # each mamba group: the worker seeds its running state index as
@@ -619,6 +673,30 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     # Offload staging ---------------------------------------------------
 
+    def _reserve_main_homes(self, req_id: str, track: _ReqTrack) -> None:
+        """Reserve a main-KV tier slot for every newly allocated attention
+        block of this request (positions beyond a restored span), so the
+        residency demotes the block straight into the tier."""
+        if not self._main_kv_tiered or self._main_gid < 0:
+            return
+        request = self._requests.get(req_id)
+        if request is None:
+            return
+        owner = self._owner(request, track)
+        ratio = self._attn_ratio[self._main_gid]
+        blocks = track.group_blocks[self._main_gid]
+        for gidx, block_id in enumerate(blocks):
+            logical = gidx * ratio
+            if block_id < 0 or logical in track.main_slots:
+                continue
+            if logical < len(track.planned_main_slots):
+                continue  # restored position: rebound, not reserved
+            slot = self.index.reserve_main_slot(owner, logical)
+            if slot is None:
+                continue
+            track.main_slots[logical] = slot
+            self._staged_main_homes[block_id] = slot
+
     def _absorb_block_allocations(self, scheduler_output: SchedulerOutput) -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
             track = self._tracks.get(new_req.req_id)
@@ -626,6 +704,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
                 self._tracks[new_req.req_id] = track
             track.group_blocks = [list(g) for g in new_req.block_ids]
+            self._reserve_main_homes(new_req.req_id, track)
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
             new_ids = cached.new_block_ids[i]
@@ -637,6 +716,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid, group_new in enumerate(new_ids):
                 if gid < len(track.group_blocks) and group_new:
                     track.group_blocks[gid].extend(group_new)
+            self._reserve_main_homes(req_id, track)
 
     def _stage_filled_attention_blocks(self, scheduler_output: SchedulerOutput) -> None:
         if _TIER_IDLE:
@@ -681,6 +761,18 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     if slot is not None:
                         ops.append((block_id, slot, gid))
+                    if self._main_kv_tiered and gid == self._main_gid:
+                        main = track.main_slots.get(logical)
+                        if main is None:
+                            main = self.index.reserve_main_slot(owner, logical)
+                            if main is not None:
+                                track.main_slots[logical] = main
+                                self._staged_main_homes[block_id] = main
+                        if main is not None:
+                            self._staged_main_flush.setdefault(
+                                self._offload_seq + 1, []
+                            ).append((block_id, main))
+                            self._last_step_main_slots.append(main)
                 if ops:
                     self._offload_seq += 1
                     self._staged_offloads[self._offload_seq] = ops
@@ -691,6 +783,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> KVConnectorMetadata:
         confirmed, self._last_step_write_slots = self._last_step_write_slots, []
         self.index.confirm_writes(confirmed)
+        if self._main_kv_tiered:
+            main_done, self._last_step_main_slots = self._last_step_main_slots, []
+            self.index.confirm_main(main_done)
         if self.num_disk_slots and confirmed:
             writes = self.index.take_disk_writes(confirmed)
             if writes:
@@ -717,12 +812,20 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             zeros=self._staged_zeros,
             disk_writes=self._staged_disk_writes,
             disk_reads=self._staged_disk_reads,
+            main_homes=self._staged_main_homes,
+            main_flush=self._staged_main_flush,
+            main_rebinds=self._staged_main_rebinds,
+            main_release=self._staged_main_release,
         )
         self._staged_restores = {}
         self._staged_offloads = {}
         self._staged_zeros = {}
         self._staged_disk_writes = {}
         self._staged_disk_reads = {}
+        self._staged_main_homes = {}
+        self._staged_main_flush = {}
+        self._staged_main_rebinds = {}
+        self._staged_main_release = []
         self._last_step_write_slots.extend(
             s for ops in meta.offloads.values() for _, s, _gid in ops
         )
@@ -755,9 +858,29 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self, request: Request, block_ids: list[int]
     ) -> tuple[bool, dict[str, Any] | None]:
         # Non-HMA entry point; HMA models use request_finished_all_groups.
-        self._tracks.pop(request.request_id, None)
+        track = self._tracks.pop(request.request_id, None)
+        self._finish_main(request, track)
         self._requests.pop(request.request_id, None)
         return False, None
+
+    def _finish_main(self, request: Request, track: _ReqTrack | None) -> None:
+        """Main-KV tier bookkeeping at request end: drop the rebind pins and
+        free slots reserved for blocks that never filled (their residency
+        rows fall back to the pool)."""
+        if not self._main_kv_tiered:
+            return
+        self.index.unpin_main(request.request_id)
+        if track is None:
+            return
+        owner = self._owner(request, track)
+        freed = set(self.index.release_main_reservations(owner, track.staged_upto))
+        if freed and self._main_gid >= 0:
+            ratio = self._attn_ratio[self._main_gid]
+            blocks = track.group_blocks[self._main_gid]
+            for logical, slot in track.main_slots.items():
+                gidx = logical // ratio
+                if slot in freed and gidx < len(blocks) and blocks[gidx] >= 0:
+                    self._staged_main_release.append(blocks[gidx])
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
@@ -781,6 +904,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         (differential-tested 2026-08-28), so this never holds.
         """
         track = self._tracks.pop(request.request_id, None)
+        self._finish_main(request, track)
         self._requests.pop(request.request_id, None)
         finished_owner = self._owner(request, track)
         del track
@@ -899,6 +1023,20 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             group_nbytes=self._group_nbytes,
             disk=disk,
         )
+        # Milestone 4: the main-KV tier slots live in a second pinned arena
+        # owned by the residency (its demotions land there directly).
+        self._main_arena_base = 0
+        if self._main_kv_tiered:
+            from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
+
+            residency = get_main_kv_residency()
+            if residency is None:
+                raise RuntimeError(
+                    "host-tier: main_kv_tier_gb_per_rank set but no main-KV residency"
+                )
+            self._main_arena_base = residency.attach_tier_arena(
+                self.num_main_slots, self._main_block_bytes
+            )
         logger.info(
             "host-tier: arena %d slots x %d bytes (%.1f GiB pinned) per rank",
             self.num_slots,
@@ -914,6 +1052,24 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._dma.pump()
         self._dma.fence_restores()
+        if self._main_kv_tiered and (
+            meta.main_homes or meta.main_release or meta.main_rebinds or meta.main_flush
+        ):
+            from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
+
+            residency = get_main_kv_residency()
+            base = self._main_arena_base
+            stride = self._main_block_bytes
+            for block in meta.main_release:
+                residency.clear_home(block)
+            for block, slot in meta.main_homes.items():
+                residency.set_home(block, base + slot * stride)
+            for req_ops in meta.main_rebinds.values():
+                for block, slot in req_ops:
+                    residency.rebind(block, base + slot * stride)
+            for ops in meta.main_flush.values():
+                for block, _slot in ops:
+                    residency.flush(block)
         # Everything is issued here rather than in wait_for_save:
         # start_load_kv runs on EVERY step, including empty (no_forward)
         # steps, while wait_for_save is skipped there - and a finished

@@ -180,3 +180,66 @@ def test_tail_restage_does_not_free_busy_slots():
     assert h_old in idx._free and d_old in idx._disk_free
     assert len(set(idx._free)) == len(idx._free)
     assert len(set(idx._disk_free)) == len(idx._disk_free)
+
+
+# --- main-KV tier slots (host-resident main KV, milestone 4) ---------------
+
+
+def test_main_slot_reserved_at_alloc_then_confirmed_makes_position_resumable():
+    idx = HostKVTierIndex(num_slots=32, num_disk_slots=0, num_main_slots=8)
+    assert idx.require_main
+    # Reserved before the block fills; the same slot is returned again.
+    m0 = idx.reserve_main_slot("a", 0)
+    assert m0 is not None and idx.reserve_main_slot("a", 0) == m0
+    m1 = idx.reserve_main_slot("a", 1)
+    s0 = idx.stage_attention("a", 0, h(0))
+    s1 = idx.stage_attention("a", 1, h(1))
+    st = idx.stage_tail_states("a", 2, 2, boundary_hash=h(1))
+    idx.confirm_writes([s0, s1, *st.values()])
+    # Slab rows confirmed but main slots still pending: not resumable.
+    assert idx.lookup([h(0), h(1), h(2)]) is None
+    idx.confirm_main([m0])
+    assert idx.lookup([h(0), h(1), h(2)]) is None  # position 1 still pending
+    idx.confirm_main([m1])
+    hit = idx.lookup([h(0), h(1), h(2)])
+    assert hit is not None and hit[1] == 2
+    assert idx.main_slots_for("a", 2) == [m0, m1]
+    assert idx.stats()["main_used"] == 2 and idx.stats()["main_pending"] == 0
+
+
+def test_unfilled_reservations_are_released_at_finish():
+    idx = HostKVTierIndex(num_slots=32, num_main_slots=4)
+    for i in range(3):
+        idx.reserve_main_slot("a", i)
+    s0 = idx.stage_attention("a", 0, h(0))
+    idx.confirm_writes([s0]); idx.confirm_main([idx.main_slot("a", 0)])
+    freed = idx.release_main_reservations("a", filled_upto=1)
+    assert len(freed) == 2 and idx.stats()["main_used"] == 1
+    assert idx.main_slot("a", 1) is None and idx.main_slot("a", 0) is not None
+
+
+def test_pinned_main_slots_block_reclaim_until_unpinned():
+    idx = HostKVTierIndex(num_slots=64, num_main_slots=2)
+    for i in range(2):
+        idx.reserve_main_slot("a", i)
+        s = idx.stage_attention("a", i, h(i)); idx.confirm_writes([s])
+    st = idx.stage_tail_states("a", 2, 2, boundary_hash=h(1)); idx.confirm_writes(list(st.values()))
+    idx.confirm_main(idx.main_slots_for("a", 2))
+    idx.pin_main("a", 2, "req-x")  # a resumer has the slots rebound
+    # Main tier full: a new lineage cannot take a's slots while pinned.
+    assert idx.reserve_main_slot("b", 0) is None
+    assert idx.lookup([h(0), h(1), h(2)]) is not None
+    idx.unpin_main("req-x")
+    assert idx.reserve_main_slot("b", 0) is not None  # a reclaimed
+    assert idx.stats()["trajectories"] == 1
+
+
+def test_trajectory_with_main_slots_is_deleted_not_demoted_under_host_pressure():
+    idx = HostKVTierIndex(num_slots=5, num_disk_slots=32, num_main_slots=8)
+    for i in range(3):
+        idx.reserve_main_slot("a", i)
+    build(idx, "a", 3)  # fully written through to disk (slab rows)
+    idx.confirm_main(idx.main_slots_for("a", 3))
+    assert idx.stage_attention("b", 0, h(100)) is not None  # needs a host slot
+    st = idx.stats()
+    assert st["trajectories"] == 1 and st["disk_only"] == 0 and st["main_used"] == 0

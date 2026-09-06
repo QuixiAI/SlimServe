@@ -112,3 +112,62 @@ def test_gather_reads_host_resident_pages_through_the_offset_table():
         assert torch.equal(out, ref)
     finally:
         r.release()
+
+
+def test_tier_home_flush_and_rebind_serve_the_gather_from_the_tier_slot():
+    """Milestone 4: a block homed on a tier slot demotes into it, a flush
+    copies its still-resident rows there, and a rebind of a fresh block id
+    onto the slot reads the same bytes through the offset table."""
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    page, kv_heads, head_dim = BS, 1, 256
+    sub = 2  # two residency rows per scheduler block
+    dev = torch.device("cuda")
+    r = MainKVResidency(num_blocks=8, gpu_rows=3, row_bytes=ROW, device=dev)
+    r.sub_blocks = sub
+    r.manager_block_size = BS * sub
+    r.bind(group_id=0, block_size=BS, max_reqs=4, table_width=8, max_tokens=64)
+    try:
+        base = r.attach_tier_arena(num_slots=3, slot_bytes=ROW * sub)
+        bt = torch.zeros((4, 8), dtype=torch.int32, device="cuda")
+        slots = torch.full((64,), -1, dtype=torch.int64, device="cuda")
+        # Scheduler block 1 (rows 2, 3) is homed on tier slot 2 before writes.
+        r.set_home(1, base + 2 * ROW * sub)
+        content = torch.randint(0, 127, (sub, page, kv_heads, 2 * head_dim), dtype=torch.uint8, device="cuda")
+        for k in range(sub):
+            row = 1 * sub + k
+            r.prepare_step(bt, slots, written_blocks=[row], protected_blocks=[row])
+            r.gpu[int(r.row_of_block[row])].copy_(content[k].reshape(-1).view(torch.int8))
+        # Row 2 gets demoted by window pressure (rows 1..2 usable): it must land in the slot.
+        r.prepare_step(bt, slots, written_blocks=[6], protected_blocks=[6, 3])
+        torch.cuda.synchronize()
+        assert int(r.row_of_block[2]) == -1
+        slot_view = r.tier_arena[2].view(torch.uint8).view(sub, page, kv_heads, 2 * head_dim)
+        assert torch.equal(slot_view[0].cpu(), content[0].cpu())
+        # Row 3 is still resident and dirty; the flush copies it without unbinding.
+        r.flush(1)
+        torch.cuda.synchronize()
+        assert int(r.row_of_block[3]) >= 1 and not r.dirty[3]
+        assert torch.equal(slot_view[1].cpu(), content[1].cpu())
+        # Rebind scheduler block 3 (rows 6, 7) onto the slot; row 6 was resident -> released.
+        r.rebind(3, base + 2 * ROW * sub)
+        torch.cuda.synchronize()
+        assert int(r.row_of_block[6]) == -1
+        bt[0, 0] = 3  # scheduler block 3 -> kernel pages (rows) 6, 7
+        r.prepare_step(bt, slots, written_blocks=[], protected_blocks=[])
+        torch.cuda.synchronize()
+        # Reference: slab indexing over the original content.
+        kv_ref = content.view(torch.float8_e4m3fn)
+        k_ref, v_ref = kv_ref.split(head_dim, dim=-1)
+        q = torch.randn(2, 6, head_dim, device="cuda", dtype=torch.bfloat16)
+        idx = torch.randint(0, sub * page, (2, 32), device="cuda", dtype=torch.int32)
+        t2r = torch.zeros(2, device="cuda", dtype=torch.int32)
+        ref_bt = torch.arange(sub, device="cuda", dtype=torch.int32).unsqueeze(0)
+        ref = qsa_sparse_paged_attention(q, k_ref, v_ref, idx, ref_bt, t2r)
+        window = r.gpu.view(torch.uint8).view(r.gpu_rows, page, kv_heads, 2 * head_dim).view(torch.float8_e4m3fn)
+        k_win, v_win = window.split(head_dim, dim=-1)
+        out = qsa_sparse_paged_attention(q, k_win, v_win, idx, ref_bt, t2r, page_offsets=r.page_offsets[:1, : sub])
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
+    finally:
+        r.release()

@@ -6,6 +6,7 @@ rank-counted completion, demotion under host pressure, promotion on hit."""
 from types import SimpleNamespace
 
 from tests.v1.core.test_host_tier_connector import (
+    STRIDE,
     BLOCK,
     FakeRequest,
     alloc,
@@ -160,3 +161,93 @@ def test_host_resident_main_kv_disables_restores_until_rebind():
     again = FakeRequest("r2", [h(i) for i in range(3)] + [h(9)], num_tokens=4 * BLOCK + 4)
     conn.on_new_request(again)
     assert conn.get_num_new_matched_tokens(again, 0) == (0, False)
+
+
+# --- main-KV tier slots through the connector (milestone 4) -----------------
+
+
+def make_main_tier_connector(main_gb=1.0):
+    from unittest.mock import patch
+
+    import vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector as m
+
+    orig = m.HostTierConnector.__init__
+
+    def init(self, vllm_config, role, kv_cache_config):
+        vllm_config.kv_transfer_config.kv_connector_extra_config = {
+            "host_tier_gb_per_rank": 1.0,
+            "main_kv_host_resident": True,
+            "main_kv_tier_gb_per_rank": main_gb,
+        }
+        vllm_config.parallel_config = SimpleNamespace(world_size=1)
+        # The attention layer's main KV is host-resident: 13 sub-rows of
+        # STRIDE bytes per scheduler block.
+        kv_cache_config.kv_cache_tensors = [
+            SimpleNamespace(
+                host_resident=True, block_stride=13 * STRIDE, shared_by=["attn"], gpu_rows=4, sub_blocks=13
+            )
+        ]
+        orig(self, vllm_config, role, kv_cache_config)
+
+    with patch.object(m.HostTierConnector, "__init__", init):
+        conn = make_connector()
+    assert conn._main_kv_tiered and conn._main_gid == 0
+    return conn
+
+
+def test_main_slots_are_reserved_at_alloc_flushed_at_fill_and_rebound_on_resume():
+    conn = make_main_tier_connector()
+    req = FakeRequest("r1", [h(i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(3, planned=0), 0)
+    new_req = SimpleNamespace(req_id="r1", block_ids=alloc(3, planned=0).blocks)
+    new_req.block_ids = tuple([b.block_id for b in g] for g in new_req.block_ids)
+    meta0 = conn.build_connector_meta(sched_output({"r1": 3 * BLOCK}, new_reqs=[new_req]))
+    # Homes for the three attention blocks arrived before any fill.
+    assert set(meta0.main_homes) == {0, 1, 2}
+    slots = dict(meta0.main_homes)
+    req.num_computed_tokens = 3 * BLOCK
+    meta1 = conn.build_connector_meta(sched_output({"r1": 1}))
+    flushed = [op for ops in meta1.main_flush.values() for op in ops]
+    assert sorted(flushed) == sorted(slots.items())
+    assert conn.index.stats()["main_pending"] == 3
+    conn.build_connector_meta(sched_output({}))  # confirms slab + main writes
+    assert conn.index.stats()["main_pending"] == 0
+    # Finish with the tail snapshot cached, as the engine does.
+    pool = conn._block_pool
+    for g, gid in enumerate((2, 3)):
+        pool.cached[(bytes(h(2)), gid)] = pool.blocks[95 + g]
+    conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    conn.build_connector_meta(sched_output({}))
+    conn.build_connector_meta(sched_output({}))
+    assert conn.index.stats()["main_used"] == 3  # nothing released: all filled
+    # Resume: the hit rebinds the new block ids onto the same slots.
+    again = FakeRequest("r2", [h(i) for i in range(3)] + [h(9)], num_tokens=4 * BLOCK + 4)
+    conn.on_new_request(again)
+    n, is_async = conn.get_num_new_matched_tokens(again, 0)
+    assert n == 3 * BLOCK and is_async
+    conn.update_state_after_alloc(again, alloc(4, planned=3, base=300), 3 * BLOCK)
+    meta2 = conn.build_connector_meta(sched_output({}))
+    rebinds = meta2.main_rebinds["r2"]
+    assert [slot for _, slot in rebinds] == [slots[0], slots[1], slots[2]]
+    assert [blk for blk, _ in rebinds] == [300, 301, 302]
+    # Pinned while r2 runs: the trajectory cannot be reclaimed.
+    assert conn.index._main_pinned and not conn.index._reclaim(protect="zzz")
+    conn.request_finished_all_groups(again, tuple([] for _ in range(4)))
+    assert not conn.index._main_pinned
+
+
+def test_unfilled_reservation_is_released_with_the_block_at_finish():
+    conn = make_main_tier_connector()
+    req = FakeRequest("r1", [h(i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(3, planned=0), 0)
+    new_req = SimpleNamespace(req_id="r1", block_ids=tuple([b.block_id for b in g] for g in alloc(3, planned=0).blocks))
+    conn.build_connector_meta(sched_output({"r1": 2 * BLOCK}, new_reqs=[new_req]))
+    req.num_computed_tokens = 2 * BLOCK  # third block never fills
+    conn.build_connector_meta(sched_output({"r1": 1}))
+    conn.build_connector_meta(sched_output({}))
+    conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    meta = conn.build_connector_meta(sched_output({}))
+    assert meta.main_release == [2]
+    assert conn.index.stats()["main_used"] == 2

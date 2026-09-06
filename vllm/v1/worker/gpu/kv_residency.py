@@ -76,6 +76,14 @@ class MainKVResidency:
         self.host_base = self.host.data_ptr()
 
         # CPU bookkeeping.
+        # Tier integration (milestone 4): a scheduler block's home is a main-KV
+        # tier slot (byte address of its first sub-row) when the tier reserved
+        # one, else the residency's own pool row; dirty marks GPU rows whose
+        # bytes are not yet at the home.
+        self.home_addr: dict[int, int] = {}  # scheduler block -> slot address
+        self.dirty = np.zeros(num_blocks, dtype=bool)  # per residency row
+        self.tier_arena: torch.Tensor | None = None
+        self._tier_raw: torch.Tensor | None = None
         self.row_of_block = np.full(num_blocks, -1, dtype=np.int32)
         self.block_of_row = np.full(gpu_rows, -1, dtype=np.int32)
         self.free_rows: list[int] = list(range(gpu_rows - 1, 0, -1))
@@ -120,6 +128,109 @@ class MainKVResidency:
         )
         self.slot_mapping = torch.full((max_tokens,), PAD_SLOT_ID, dtype=torch.int64, device=self.device)
 
+    # ------------------------------------------------------- tier integration
+
+    def attach_tier_arena(self, num_slots: int, slot_bytes: int) -> int:
+        """Pinned MAPPED host arena of main-KV tier slots (one scheduler block
+        of sub-rows per slot). Returns its base address."""
+        assert slot_bytes == self.row_bytes * self.sub_blocks
+        total = num_slots * slot_bytes
+        self._tier_raw = torch.empty(total + PAGE_ALIGN, dtype=torch.int8)
+        off = (-self._tier_raw.data_ptr()) % PAGE_ALIGN
+        self.tier_arena = self._tier_raw[off : off + total].view(num_slots, slot_bytes)
+        rc = torch.cuda.cudart().cudaHostRegister(
+            self._tier_raw.data_ptr(),
+            self._tier_raw.numel(),
+            _HOST_REGISTER_PORTABLE | _HOST_REGISTER_MAPPED,
+        )
+        if rc != 0:
+            raise RuntimeError(f"main-kv tier arena: cudaHostRegister failed ({rc})")
+        self._tier_registered = True
+        logger.info(
+            "main-kv tier arena: %d slots x %d bytes (%.2f GiB pinned)",
+            num_slots, slot_bytes, total / (1 << 30),
+        )
+        return self.tier_arena.data_ptr()
+
+    def _home_row_addr(self, row: int) -> int:
+        """Where residency row `row` lives when not on the GPU."""
+        block = row // self.sub_blocks
+        home = self.home_addr.get(block)
+        if home is not None:
+            return home + (row % self.sub_blocks) * self.row_bytes
+        return self.host_base + row * self.row_bytes
+
+    def _host_view(self, addr: int) -> torch.Tensor:
+        """A [row_bytes] int8 view of pinned host memory at `addr` (pool or
+        tier arena)."""
+        if self.tier_arena is not None:
+            base = self.tier_arena.data_ptr()
+            if base <= addr < base + self.tier_arena.numel():
+                off = addr - base
+                return self.tier_arena.view(-1)[off : off + self.row_bytes]
+        off = addr - self.host_base
+        assert 0 <= off < self.host.numel()
+        return self.host.view(-1)[off : off + self.row_bytes]
+
+    def set_home(self, block: int, slot_addr: int) -> None:
+        """Scheduler block `block` now demotes into the tier slot at
+        `slot_addr` (called when the block is allocated, before writes)."""
+        self.home_addr[block] = slot_addr
+        # Rows already demoted to the pool (window pressure before the home
+        # arrived) move to the slot so the slot ends up complete.
+        for k in range(self.sub_blocks):
+            row = block * self.sub_blocks + k
+            if self.row_of_block[row] < 0:
+                cur = int(self.page_delta[row].item()) + self.gpu_base
+                if cur == self.host_base + row * self.row_bytes and self.dirty[row]:
+                    dst = slot_addr + k * self.row_bytes
+                    self._host_view(dst).copy_(self._host_view(cur))
+                    self.page_delta[row] = dst - self.gpu_base
+                    self.dirty[row] = False
+
+    def clear_home(self, block: int) -> None:
+        self.home_addr.pop(block, None)
+
+    def flush(self, block: int) -> None:
+        """The block is full: its GPU-resident dirty rows are copied into
+        the home slot (rows stay hot); pool-resident dirty rows move."""
+        home = self.home_addr.get(block)
+        if home is None:
+            return
+        for k in range(self.sub_blocks):
+            row = block * self.sub_blocks + k
+            dst = home + k * self.row_bytes
+            gpu_row = int(self.row_of_block[row])
+            if gpu_row >= 0:
+                if self.dirty[row]:
+                    self._host_view(dst).copy_(self.gpu[gpu_row], non_blocking=True)
+                    self.dirty[row] = False
+            else:
+                cur = int(self.page_delta[row].item()) + self.gpu_base
+                if cur != dst:
+                    self._host_view(dst).copy_(self._host_view(cur))
+                    self.page_delta[row] = dst - self.gpu_base
+                self.dirty[row] = False
+
+    def rebind(self, block: int, slot_addr: int) -> None:
+        """A restored block: point its rows at the tier slot (read-only, no
+        copy). Any GPU row still bound to a previous use is released."""
+        rows_freed = []
+        for k in range(self.sub_blocks):
+            row = block * self.sub_blocks + k
+            gpu_row = int(self.row_of_block[row])
+            if gpu_row >= 0:
+                self.row_of_block[row] = -1
+                self.block_of_row[gpu_row] = -1
+                self.free_rows.append(gpu_row)
+                rows_freed.append(row)
+            self.page_delta[row] = slot_addr + k * self.row_bytes - self.gpu_base
+            self.dirty[row] = False
+        self.home_addr[block] = slot_addr
+        if rows_freed:
+            idx = torch.tensor(rows_freed, dtype=torch.int64, device=self.device)
+            self.row_of_block_dev[idx] = -1
+
     def layer_raw(self) -> torch.Tensor:
         """The GPU window as the layers' raw backing ([gpu_rows * row_bytes])."""
         return self.gpu.view(-1)
@@ -145,7 +256,11 @@ class MainKVResidency:
                     "main-kv: GPU hot window exhausted by protected blocks; "
                     "raise main_kv_gpu_rows"
                 )
-            self.host[victim].copy_(self.gpu[victim_row], non_blocking=True)
+            dst = self._home_row_addr(victim)
+            if self.dirty[victim]:
+                self._host_view(dst).copy_(self.gpu[victim_row], non_blocking=True)
+                self.dirty[victim] = False
+            self.page_delta[victim] = dst - self.gpu_base
             self.row_of_block[victim] = -1
             self.block_of_row[victim_row] = -1
             self._changed.append(victim)
@@ -156,6 +271,7 @@ class MainKVResidency:
         self.gpu[row].zero_()
         self.row_of_block[block] = row
         self.block_of_row[row] = block
+        self.dirty[block] = True
         self._changed.append(block)
         self.binds += 1
 
@@ -196,16 +312,19 @@ class MainKVResidency:
             self._bind_block(b, protected)
             self.last_use[b] = self.step
         if self._changed:
-            idx = torch.tensor(sorted(set(self._changed)), dtype=torch.int64)
-            rows = torch.from_numpy(self.row_of_block[idx.numpy()])
-            delta = np.where(
-                rows.numpy() >= 0,
-                rows.numpy().astype(np.int64) * self.row_bytes,
-                (self.host_base - self.gpu_base) + idx.numpy() * self.row_bytes,
-            )
-            idx_dev = idx.to(self.device, non_blocking=True)
-            self.page_delta[idx_dev] = torch.from_numpy(delta).to(self.device, non_blocking=True)
-            self.row_of_block_dev[idx_dev] = rows.to(self.device, non_blocking=True)
+            changed = sorted(set(self._changed))
+            gpu_bound = [b for b in changed if self.row_of_block[b] >= 0]
+            if gpu_bound:
+                idx = torch.tensor(gpu_bound, dtype=torch.int64)
+                rows = torch.from_numpy(self.row_of_block[idx.numpy()])
+                idx_dev = idx.to(self.device, non_blocking=True)
+                self.page_delta[idx_dev] = (rows.to(torch.int64) * self.row_bytes).to(
+                    self.device, non_blocking=True
+                )
+            idx_all = torch.tensor(changed, dtype=torch.int64)
+            self.row_of_block_dev[idx_all.to(self.device, non_blocking=True)] = torch.from_numpy(
+                self.row_of_block[idx_all.numpy()]
+            ).to(self.device, non_blocking=True)
         # Page offsets at row (kernel page) granularity: scheduler block b
         # owns rows b*sub .. b*sub+sub-1; null entries keep the sentinel.
         sub = self.sub_blocks
@@ -241,6 +360,9 @@ class MainKVResidency:
             torch.cuda.synchronize(self.device)
             torch.cuda.cudart().cudaHostUnregister(self._raw.data_ptr())
             self._registered = False
+        if getattr(self, "_tier_registered", False):
+            torch.cuda.cudart().cudaHostUnregister(self._tier_raw.data_ptr())
+            self._tier_registered = False
 
     def __del__(self) -> None:
         try:

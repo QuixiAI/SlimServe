@@ -157,6 +157,23 @@ findings shaped the implementation: the CSA+linear grouping padded every
 mamba page to the main-KV page (8x), and the aligner override has to be
 sticky on cache_config because draft config views re-run it.
 
+## Milestone 4 status (2026-09-06): tier rebind
+
+The trajectory tier gained a second pinned arena of main-KV slots (one
+scheduler block of sub-rows per slot, `main_kv_tier_gb_per_rank`). A slot
+is reserved when the scheduler allocates the block (`main_homes` in the
+connector metadata), so every demotion the residency performs lands in the
+tier directly; when the block fills, the connector emits `main_flush` and
+the residency copies its still-resident dirty rows into the slot (rows stay
+hot), confirmed one build later like slab writes. A tier hit REBINDS the
+resumed request's new block ids onto the trajectory's slots
+(`main_rebinds`: an offset-table update, no copy) and pins them until the
+request finishes; slots reserved for blocks that never filled are released
+(`main_release`) so their rows fall back to the residency pool. Live: hits
+after full-pool eviction, recall correct at 8K/24K/42K, 42K resumes 2.5x
+faster than cold. Not yet: main slots on NVMe (trajectories carrying them
+are deleted, not demoted, under host pressure).
+
 ## Milestones and gates
 
 1. **Pointer-table gather kernel + microbench** (this entry). Gate: bit-exact
