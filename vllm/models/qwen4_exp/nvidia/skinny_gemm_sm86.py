@@ -35,7 +35,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-MAX_M = 32  # decode token counts (max_num_seqs x (k+1)); larger M -> cuBLAS
+MAX_M = 128  # batched-decode row counts (max_num_seqs x (k+1), 96 at 32 x 3); larger M -> cuBLAS
 
 
 @dataclass(frozen=True)
@@ -181,7 +181,10 @@ def skinny_gemm(
     quantize_w8)."""
     M, K = x.shape
     N = weight.shape[0]
-    block_m = 16 if M <= 16 else 32
+    # Tile rows: 16/32 at decode counts, 64/128 for the batched-decode
+    # counts of 16-32 running requests (M = seqs x (k+1) up to 96), so one
+    # weight stream serves every row instead of a per-call int8 dequant.
+    block_m = 16 if M <= 16 else 32 if M <= 32 else 64 if M <= 64 else 128
     n_tiles = triton.cdiv(N, cfg.block_n)
     grid = (n_tiles, cfg.split_k)
     y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
@@ -261,13 +264,13 @@ def dequantize_w8(w8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 # 0.8-0.9x at M=24-32; the <=7 MB shapes are latency-bound and stay bf16).
 # Shapes without an entry derive one from the bf16 plan (tests only).
 SM86_SKINNY_W8_PLANS: dict[tuple[int, int], list[tuple[int, SkinnyCfg]]] = {
-    (2048, 2560): [(4, _C(64, 128, 2, num_warps=8)), (8, _C(32, 128, 2)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 4)), (32, _C(64, 128, 2))],
-    (2560, 1536): [(4, _C(32, 128, 1)), (8, _C(32, 128, 1)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 2)), (32, _C(64, 128, 2, num_warps=8))],
-    (2560, 2560): [(4, _C(32, 128, 1)), (8, _C(32, 128, 1)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 2)), (32, _C(64, 128, 2, num_warps=8))],
-    (3584, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(64, 128, 1, num_warps=8)), (24, _C(32, 128, 2)), (32, _C(32, 128, 2))],
-    (4096, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(64, 128, 1, num_warps=8)), (24, _C(64, 128, 1)), (32, _C(64, 128, 1))],
-    (10240, 320): [(4, _C(128, 64, 1)), (8, _C(128, 64, 1)), (16, _C(128, 64, 1)), (24, _C(128, 64, 1, num_warps=8)), (32, _C(128, 32, 1))],
-    (62080, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(128, 128, 1, num_warps=8)), (24, _C(128, 128, 1)), (32, _C(128, 128, 1))],
+    (2048, 2560): [(4, _C(64, 128, 2, num_warps=8)), (8, _C(32, 128, 2)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 4)), (32, _C(64, 128, 2)), (64, _C(64, 128, 2, num_warps=8)), (128, _C(32, 64, 2, num_warps=8))],
+    (2560, 1536): [(4, _C(32, 128, 1)), (8, _C(32, 128, 1)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 2)), (32, _C(64, 128, 2, num_warps=8)), (64, _C(32, 64, 2)), (128, _C(32, 64, 2, num_warps=8))],
+    (2560, 2560): [(4, _C(32, 128, 1)), (8, _C(32, 128, 1)), (16, _C(64, 128, 2, num_warps=8)), (24, _C(64, 128, 2)), (32, _C(64, 128, 2, num_warps=8)), (64, _C(64, 128, 2, num_warps=8)), (128, _C(32, 64, 2, num_warps=8))],
+    (3584, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(64, 128, 1, num_warps=8)), (24, _C(32, 128, 2)), (32, _C(32, 128, 2)), (64, _C(32, 64, 2)), (128, _C(32, 64, 2, num_warps=8))],
+    (4096, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(64, 128, 1, num_warps=8)), (24, _C(64, 128, 1)), (32, _C(64, 128, 1)), (64, _C(32, 64, 1)), (128, _C(64, 128, 1, num_warps=8))],
+    (10240, 320): [(4, _C(128, 64, 1)), (8, _C(128, 64, 1)), (16, _C(128, 64, 1)), (24, _C(128, 64, 1, num_warps=8)), (32, _C(128, 32, 1)), (64, _C(128, 64, 1)), (128, _C(64, 64, 1))],
+    (62080, 2560): [(4, _C(64, 128, 1, num_warps=8)), (8, _C(64, 128, 1, num_warps=8)), (16, _C(128, 128, 1, num_warps=8)), (24, _C(128, 128, 1)), (32, _C(128, 128, 1)), (64, _C(128, 64, 1)), (128, _C(64, 64, 1))],
 }
 
 
@@ -279,7 +282,9 @@ def plan_for_w8(shape: tuple[int, int], m: int) -> SkinnyCfg | None:
         for max_m, cfg in buckets:
             if m <= max_m:
                 return cfg
-        return None
+        # No bucket this wide yet: the widest one still beats the per-call
+        # dequant fallback (2026-09-07 sweep, 64/128-row tiles).
+        return buckets[-1][1]
     bf16 = SM86_SKINNY_PLANS.get(shape)
     if bf16 is None:
         return None

@@ -59,3 +59,33 @@ def test_pools_follow_page_classes_and_keep_deep_capacity(monkeypatch):
     )
     assert cfg.num_pools == len(pool_sizes)
     assert cfg.blocks_in_pool(1) == pool_sizes[1]
+
+
+def test_capture_check_bounds_max_num_seqs_by_the_state_pool():
+    """With the multi-pool slab the Mamba groups draw from their own pool;
+    the FULL-cudagraph guard must read that pool, not pool 0 (attention),
+    which is deliberately small when deep capacity is traded for chat
+    concurrency (2026-09-07: pool 0 = 23 blocks refused max_num_seqs 32
+    while the state pool held 183)."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm.config.compilation import _mamba_blocks_available
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+    attn = SimpleNamespace(
+        kv_cache_spec=FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+    )
+    state = SimpleNamespace(
+        kv_cache_spec=MambaSpec(shapes=((4, 4),), dtypes=(torch.bfloat16,), block_size=16)
+    )
+    cfg = SimpleNamespace(
+        num_blocks=23,
+        pool_num_blocks=[23, 183, 62],
+        kv_cache_groups=[attn, state, state],
+        pool_of_group=lambda gid: [0, 1, 2][gid],
+    )
+    assert _mamba_blocks_available(cfg) == 62
+    single = SimpleNamespace(num_blocks=40, pool_num_blocks=[], kv_cache_groups=[attn, state], pool_of_group=lambda g: 0)
+    assert _mamba_blocks_available(single) == 40
