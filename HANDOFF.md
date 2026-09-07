@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07; Phase 1 in progress, MTP merged, routing NaN root cause fixed)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07 afternoon; Phase 1 items 1-3 done, MoE combine fused, routing NaN root cause fixed)
 
 ## Mission
 
@@ -91,15 +91,28 @@ physics, research digest and phase gates are in
 
 ## Next step
 
-1. Item 2 remainder: moe_sum + the shared-expert add + the output copy
-   into one kernel (accumulate variant of moe_sum_vec_kernel; 3 -> 1
-   launches per MoE layer).
-2. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
+0. Item 2 remainder is DONE in the tree (2026-09-07 afternoon entry): the
+   modular-kernel output alias (active now) and the fused shared-expert
+   combine (moe_sum_add). The combine's native binding is in
+   csrc/quixicore/tm_cuda/tm_cuda_serving.cu but the shipped
+   _quixicore_C .so predates it, so the Python path is inert until the
+   next native rebuild (/raid/scratch/slimserve-glm53/rebuild.sh, ~72 min,
+   no boots meanwhile); the measurements used the JIT build of the same
+   header (QC_DEV_COMBINE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site,
+   build_combine_120f). Batch that rebuild with item 4's csrc changes. The
+   compile cache key now includes the QuixiCore graph capabilities, so the
+   rebuild recompiles the graphs once instead of failing on a stale cache.
+1. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
    doc "Phase 1 item 1 pre-work": row-tiled or mma.sync; cuBLAS at 73-89%).
-3. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
+2. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
    between a fast and a slow boot; CPU governor `performance` as its own
    experiment if that is empty.
-4. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
+3. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
+Profiler captures: prof_run.py now runs a 384-token profiled round so the
+8-iteration capture sits in steady decode (96 ended before the capture
+with MTP on and produced a 2-iteration trace whose "step" was a partial
+window). Read step_attrib's "mean over N full steps" and want N >= 2.
+Never git stash/checkout in the tree while a server boots or runs from it.
 Gates unchanged (plan section 4): exact-token within the band or better,
 NLL + needle within 0.03 nats, one notebook entry per experiment.
 

@@ -577,6 +577,20 @@ sel), tested on non-finite inputs, native rebuild the same day. The
 2026-09-04 rejection of the cooperative mHC launcher rested on faults of the
 same signature and is unproven until re-tested on the fixed build.
 
+Item 2 remainder, done 2026-09-07 afternoon (notebook entry of that date):
+the modular kernel now hands Marlin its own output buffer when the finalize
+step is a no-op (the copy after every MoE layer is gone), and the runner
+folds the shared-expert add into the Marlin sum with the QuixiCore
+moe_sum_add kernel (shared experts launched ahead of the routed experts on
+the aux stream, joined where the sum consumes them, one launch instead of
+moe_sum + copy + add). 1379 -> 1298 launches per decode step, -0.5 us per
+MoE layer tail, step time -0.9% in the profiler pair (inside boot spread),
+exact-token unchanged to +0.7%. Two side fixes came with it: the
+functionalization pass handles the single-output moe_forward op, and the
+compile cache key carries the QuixiCore graph capabilities. The kernel
+binding ships with the next native rebuild; until then the Python path is
+inert (old op, old kernels).
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`

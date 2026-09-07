@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -52,6 +53,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Static,
 )
 from vllm.platforms import current_platform
+from vllm.quixicore.ops import quixicore_ops
 from vllm.scalar_type import ScalarType, scalar_types
 
 # Marlin's lock/counter workspace only has to be zero when a kernel starts
@@ -970,6 +972,17 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
     ) -> None:
         if expert_map is not None:
             ops.moe_sum(input, output, topk_ids, expert_map)
+            return
+        shared = (
+            combine_shared.consume(topk_ids, output)
+            if input.is_contiguous() and output.is_contiguous()
+            else None
+        )
+        if shared is not None:
+            # The runner published this batch's shared-expert output: fold it
+            # into the sum, one launch instead of moe_sum, the finalize copy
+            # and the add.
+            quixicore_ops.moe_sum_add(input, shared, output)
         else:
             ops.moe_sum(input, output)
 

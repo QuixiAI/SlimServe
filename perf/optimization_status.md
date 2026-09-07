@@ -20228,3 +20228,40 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   the core dump (deleted after analysis; cuda-gdb facts above),
   /raid/scratch/slimserve-glm53/jit/{build_routing_120f.py, stress_routing.py,
   fault_hunt.sh}.
+
+## 2026-09-07: Phase 1 item 2 remainder - MoE finalize copy removed, shared-expert add fused into the Marlin sum
+
+**Status: RETAINED** (both factors), lands in `_quixicore_C` at the next native rebuild (the binding is in `tm_cuda_serving.cu`; measured here through the JIT build of the same header).
+
+**Baseline.** Tree 928e68be2 (NaN-safe routing), profile glm53-nvfp4-4, spec on, c1 profiler capture: 8.56 ms GPU span/step, 1379 launches/step (alias-A boot). Per MoE layer after the Marlin w2 GEMM: `moe_sum_vec_kernel` 1.2 us -> `memcpy32_post` 0.7 us -> `triton_poi_fused_add_1` 0.8 us -> NCCL all-reduce; 42 MoE layers.
+
+**Hypothesis.** The three launches are one elementwise pass: out[t] = shared[t] + sum_k w2_out[t, k]. The copy is `TopKWeightAndReduceNoOP` moving the Marlin result from the modular kernel's `fused_out` workspace into its output buffer; the add is the runner's `shared_output + fused_output` outside the opaque `moe_forward_shared` op (so inductor emits it as its own kernel). Fusing the three into one launch saves ~1.5 us of kernel time and two launch slots per layer (~60 us and 84 launches per step).
+
+**Change (two factors, measured separately).**
+1. *Output alias* (`modular_kernel.py`): when the experts' finalize impl is `TopKWeightAndReduceNoOP` and the caller's output buffer matches `fused_out` (shape, dtype, device, contiguous), the modular kernel hands the experts its own output buffer, so the NoOP finalize's `output.copy_` is the already-handled self-copy. Generalises the ROCm/AITER alias that was already there.
+2. *In-op combine* (`combine_shared.py`, `moe_runner.py`, `experts/marlin_moe.py`, `runner/shared_experts.py`, kernel `csrc/quixicore/serving/glm_moe_combine.cuh`, binding `moe_sum_add`): the runner decides statically per layer (`_combine_shared_in_op`: shared experts present, CUDA, `quixicore_ops.has_moe_sum_add()`, runner routed scale 1.0, no routed transforms or padding, no DP/EP/PCP/SP, no DBO) to use the single-output `moe_forward` op; inside it the aux-stream shared experts are launched *before* the routed experts and published (keyed on the batch's `topk_ids`); `MarlinExperts.moe_sum` consumes the publication, joins the aux stream at that point and runs `moe_sum_add` (fp32 accumulate, one bf16 rounding instead of two); if nothing consumed it the runner adds in Python inside the op. `SharedExperts` now joins the aux stream when its output is consumed rather than when it is launched (same GPU ordering for every existing caller, one more overlap opportunity for this one). Two side fixes were required: `fix_functionalization` had no entry for `moe_forward` (this fork raises on unhandled auto-functionalized ops; every model without shared experts would have hit it under compile), and the compile cache key now carries `quixicore_ops.graph_factors()` (`moe_sum_add=<bool>`) because the op choice changes the traced graph - a cached artifact from a combine-off boot called `moe_forward_shared` on the combine-on tree and died with "Object of type 'Tensor' is not an instance of 'sequence'".
+
+**Correctness.** `tests/kernels/test_quixicore_moe_sum_add.py` (32 cases: bit-exact against the same fp32 fold in torch for T in 1..300, topk 8/6, D 4096/2048/8; within 2 bf16 ulps of the two-step path; total on NaN; shape/dtype rejection). Smoke boot (health, completion, 8 concurrent, 0 CUDA errors). Scoring gate on the combine boot: continuation NLL -2.4637 (band -2.416..-2.457, 256 tokens) but over the 4344 prompt tokens the gate also scores, mean logprob -3.2827 sits between the identical-code boots (-3.276/-3.274 today, -3.285/-3.294 on 09-04): the continuation number is small-sample noise, not a shift. The fused kernel rounds once where the old path rounded twice.
+
+**Measured (profiler pairs, spec on, c1, rank 0, mean over full decode steps).**
+
+| arm | tree | ms/step | launches/step | per-layer tail w2 end -> all-reduce |
+|---|---|---|---|---|
+| alias-A | committed 928e68be2 | 8.56 | 1379 | (3 kernels) |
+| combine-A | + output alias, combine off | 8.23 | 1344 | 4.4 us |
+| combine-B | + combine on (JIT moe_sum_add) | 8.16 | 1298 | 3.9 us |
+
+Kernel histogram deltas (median step window): alias: `memcpy32_post` 75 -> 34, everything else +-1. Combine: `moe_sum_vec_kernel` 42 -> 0, `triton_poi_fused_add_1` 41 -> 0, `moe_sum_add_kernel` 0 -> 39..42, rest identical (inductor renumbered its rms-norm kernels). The ms/step differences are inside the +-2.5% boot spread; the launch counts and the per-layer tail are the evidence. (Pair 1's arm B capture held only two iterations and reported a partial window - discarded; `prof_run.py` now runs a 384-token profiled round so the 8-iteration capture sits in steady decode.)
+
+**Exact-token (--no-spec, 1000/300, two passes per boot, tok/s).**
+
+| arm | c1 | c8 | c16 | gate (continuation NLL) |
+|---|---|---|---|---|
+| item2-A: alias tree, combine off | 110.8 / 115.7 | 462.4 / 460.3 | 611.4 / 613.0 | (not run) |
+| item2-B: combine on (JIT moe_sum_add) | 115.7 / 115.8 | 461.0 / 462.6 | 617.8 / 615.2 | -2.435 / -2.439 (band -2.416..-2.457) |
+
+No regression; c1 and c8 are at the boot-spread floor (arm A's first c1 pass was a low outlier), c16 +0.7%. Consistent with the -0.9% step time of the profiler pair. The reference before this item (nan-safe-routing, 09-07 morning): 110.8/111.0, 449.5/449.4, 601.6/603.6.
+
+**Decision.** Retain both. The plumbing is inert without the binding (`has_moe_sum_add()` False -> old op, old path), so the Python lands now and the kernel activates with the rebuild; any config outside the static gate keeps the two-output op unchanged.
+
+**Raw artifacts.** /raid/scratch/slimserve-glm53/profile-{alias-A,alias-B,combine-A,combine-B}/, serve-logs/{item2_pairs.out,prof-combine-B.out,gate-alias-*.json,gate-combine-B.json,smoke-combine.out}, jit/{combine.cu,build_combine.py,build_combine_120f/}, perf/results/2026-09-07/item2-{A,B}-pass{1,2}/.

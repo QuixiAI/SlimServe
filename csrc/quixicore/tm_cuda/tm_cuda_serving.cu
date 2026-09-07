@@ -19,6 +19,7 @@
 #include "dsv4_router_ampere.cuh"
 #include "dsv4_projection_ampere.cuh"
 #include "glm_moe_routing.cuh"
+#include "glm_moe_combine.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
@@ -195,6 +196,20 @@ static std::vector<torch::Tensor> py_glm_route_align(
             int(scoring), float(scaling), renormalize, int(block_size),
             int(max_padded), int(max_blocks));
     return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
+}
+
+static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor out) {
+    CK(x); CK(shared); CK(out);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && shared.scalar_type() == torch::kBFloat16 &&
+                    out.scalar_type() == torch::kBFloat16,
+                "moe_sum_add: bf16 tensors");
+    TORCH_CHECK(x.dim() == 3 && shared.dim() == 2 && out.dim() == 2,
+                "moe_sum_add: x [T, topk, D], shared/out [T, D]");
+    const int64_t T = x.size(0), topk = x.size(1), d = x.size(2);
+    TORCH_CHECK(shared.size(0) == T && shared.size(1) == d && out.size(0) == T && out.size(1) == d,
+                "moe_sum_add: shape mismatch");
+    TORCH_CHECK(d % glm_moe_combine::VEC == 0, "moe_sum_add: D must be a multiple of 8");
+    glm_moe_combine::launch_moe_sum_add(bpm(out), bp(x), bp(shared), T, int(d), int(topk), stream());
 }
 
 __global__ void fill_short_context_topk_indices_kernel(
@@ -2090,6 +2105,8 @@ void init_serving(py::module_& m) {
           py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
           py::arg("max_padded"), py::arg("max_blocks"),
           "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("moe_sum_add", &py_moe_sum_add, py::arg("x"), py::arg("shared"), py::arg("out"),
+          "out[t] = shared[t] + sum_k x[t, k]: Marlin per-assignment sum + shared-expert add, one launch");
     m.def("fill_short_context_topk_indices",
           &py_fill_short_context_topk_indices, py::arg("output"),
           py::arg("positions"), py::arg("topk"),

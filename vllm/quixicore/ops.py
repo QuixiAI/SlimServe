@@ -86,6 +86,26 @@ class quixicore_ops:
             max_padded, max_blocks,
         )
 
+    @staticmethod
+    @cache
+    def has_moe_sum_add() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
+
+    @staticmethod
+    def graph_factors() -> list[str]:
+        """Capabilities that change the traced computation graph (the MoE
+        runner picks its custom op by them), for VllmConfig.compute_hash: a
+        compiled artifact from a build without the kernel must not be reused
+        by one with it."""
+        return [f"moe_sum_add={quixicore_ops.has_moe_sum_add()}"]
+
+    @staticmethod
+    def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
+        """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
+        the Marlin per-assignment sum, the finalize copy and the shared-expert
+        add in one launch."""
+        _qc().moe_sum_add(x, shared, out)
+
     # ------------------------------------------------------------------
     # DeepSeek-V4 multi-stream residual mixing (Ampere decode path)
     # ------------------------------------------------------------------
