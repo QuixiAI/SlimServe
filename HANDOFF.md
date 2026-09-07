@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07 afternoon; Phase 1 items 1-3 done, MoE combine fused, routing NaN root cause fixed)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07 evening; Phase 1 items 1-4 done, MoE combine fused, decode GEMM in, routing NaN root cause fixed; native rebuild pending for the two new bindings)
 
 ## Mission
 
@@ -91,28 +91,47 @@ physics, research digest and phase gates are in
 
 ## Next step
 
-0. Item 2 remainder is DONE in the tree (2026-09-07 afternoon entry): the
-   modular-kernel output alias (active now) and the fused shared-expert
-   combine (moe_sum_add). The combine's native binding is in
-   csrc/quixicore/tm_cuda/tm_cuda_serving.cu but the shipped
-   _quixicore_C .so predates it, so the Python path is inert until the
-   next native rebuild (/raid/scratch/slimserve-glm53/rebuild.sh, ~72 min,
-   no boots meanwhile); the measurements used the JIT build of the same
-   header (QC_DEV_COMBINE=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site,
-   build_combine_120f). Batch that rebuild with item 4's csrc changes. The
-   compile cache key now includes the QuixiCore graph capabilities, so the
-   rebuild recompiles the graphs once instead of failing on a stale cache.
-1. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
-   doc "Phase 1 item 1 pre-work": row-tiled or mma.sync; cuBLAS at 73-89%).
-2. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
-   between a fast and a slow boot; CPU governor `performance` as its own
-   experiment if that is empty.
-3. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
+0. NATIVE REBUILD FIRST. Items 2 and 4 are DONE in the tree (2026-09-07
+   entries) but both of their kernels - moe_sum_add (fused shared-expert
+   combine) and decode_gemm (bf16 M <= 16 tensor-core GEMM) - have their
+   bindings in csrc/quixicore/tm_cuda/tm_cuda_serving.cu only; the shipped
+   _quixicore_C .so predates them, so both Python paths are inert on it.
+   Run /raid/scratch/slimserve-glm53/rebuild.sh (~72 min, Release, no boots
+   meanwhile), then: the three kernel tests (tests/kernels/
+   test_quixicore_{moe_routing,moe_sum_add,decode_gemm}.py: 27 + 32 + 44),
+   a smoke boot without the JIT hooks (smoke.sh native "" ""), GATE=1 ab.sh
+   on the plain tree, and check the serve log's torch_compile_cache hash is
+   new (graph_factors now reports both kernels true). Until the rebuild, the
+   JIT hooks reproduce every measurement: QC_DEV_COMBINE=1 QC_DEV_GEMM=1
+   PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site.
+1. Boot spread (notebook 2026-09-07 "Boot spread probe"): six boots of
+   identical code span 4-5% at c1 with identical per-kernel times; the
+   spread is host-side (idle gaps between kernels, allreduce wait). Needs
+   root: `cpupower frequency-set -g performance` (governor is schedutil on
+   the EPYC 9334), then pin EngineCore + workers per CCD (numactl/taskset),
+   three boots of one arm after each; add an nvidia-smi clock/power log to
+   bench.sh so GPU-side causes are excluded per run. Until it is fixed,
+   decide kernel work on the profiler pair's kernel-busy time and compare
+   exact-token boots like-state to like-state (fast ~115-117, slow ~111-113
+   at c1).
+2. Item 4 follow-ups, in order of prize: shared-expert gate_up (1024 rows,
+   42 launches x 7.4 us on the aux stream; row-per-block at M=1, the mma
+   kernel above M=1); C++ TORCH_LIBRARY registration of
+   quixicore_decode_linear (removes the 2-4 us Python trampoline on starved
+   prefill chunks; batch with the rebuild after this one); optional CONC=16
+   prof_pair.sh for a GPU-side M=16 comparison.
+3. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer);
+   optional re-test of the cooperative mHC launcher on the fixed build.
 Profiler captures: prof_run.py now runs a 384-token profiled round so the
 8-iteration capture sits in steady decode (96 ended before the capture
 with MTP on and produced a 2-iteration trace whose "step" was a partial
 window). Read step_attrib's "mean over N full steps" and want N >= 2.
 Never git stash/checkout in the tree while a server boots or runs from it.
+Queued runs: write the waiter as a script file and launch it once - a
+`bash -c` waiter launched from the assistant shell was invisible to pgrep
+right after launch, got launched twice, and the two chains interleaved one
+stdout file and overwrote a results directory (item4-A2 raw files lost).
+prof_pair.sh takes CONC=<n> for a profiled round at another concurrency.
 Gates unchanged (plan section 4): exact-token within the band or better,
 NLL + needle within 0.03 nats, one notebook entry per experiment.
 

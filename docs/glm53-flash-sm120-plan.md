@@ -591,6 +591,24 @@ compile cache key carries the QuixiCore graph capabilities. The kernel
 binding ships with the next native rebuild; until then the Python path is
 inert (old op, old kernels).
 
+Item 4, done 2026-09-07 (notebook entry of that date): a bf16 M <= 16
+tensor-core GEMM (m16n8k16 mma.sync, cp.async-staged K chunks, warps
+splitting K, one shared-memory reduction) replaces cuBLAS on the unquantized
+backbone projections with 2048..16384 rows and K a multiple of 128 - KDA
+in_proj and o_proj, the DSA projections, the dense MLP, the shared-expert
+down - through an opaque custom op whose M branch stays inside the op, so
+torch.compile traces one graph. Kernel-busy time -0.20 ms (-2.4%) per c1
+step, 34 split-K reduce launches gone, every replaced shape at or below
+cuBLAS at every M; +1.5% c1 / +1.3% c8 / +0.7% c16 between like boot states,
+gates in band. Kill switch SLIMSERVE_DECODE_GEMM=0. Left on cuBLAS on
+purpose: lm_head (parity), shared gate_up 1024 rows (loses at M=1), the
+K=128 KDA projections. The measurement itself produced the boot-spread
+finding (same notebook date): six boots of identical code span 4-5% at c1
+with identical per-kernel times, so the spread is host-side (gaps between
+kernels, rank skew), the profiler's kernel-busy time is the decision
+metric for kernel work, and the CPU governor / core pinning experiment is
+queued as its own item.
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`

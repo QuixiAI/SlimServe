@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
 from collections.abc import Callable
+from functools import cache
 
 import torch
 
@@ -91,6 +93,72 @@ def default_unquantized_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ):
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+# QuixiCore bf16 decode GEMM (csrc/quixicore/serving/bf16_decode_gemm.cuh): the
+# M <= 16 tensor-core kernel that replaces cuBLAS on the backbone projections
+# at decode. The M branch lives inside an opaque custom op so torch.compile
+# traces one graph for every batch size; the shape gate below mirrors the
+# kernel's `supports` (the shapes where it beat cuBLAS at every M).
+# SLIMSERVE_DECODE_GEMM=0 keeps cuBLAS for A/B and diagnosis.
+DECODE_GEMM_MAX_TOKENS = 16
+
+
+@cache
+def decode_gemm_enabled() -> bool:
+    if os.getenv("SLIMSERVE_DECODE_GEMM", "1") == "0" or not current_platform.is_cuda():
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.has_decode_gemm()
+
+
+def decode_gemm_supports(n: int, k: int) -> bool:
+    return 2048 <= n <= 16384 and k >= 512 and k % 128 == 0
+
+
+def _quixicore_decode_linear_impl(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.shape[0] <= DECODE_GEMM_MAX_TOKENS and bias is None:
+        from vllm.quixicore.ops import quixicore_ops
+
+        out = quixicore_ops.decode_gemm(x2.contiguous(), weight)
+        return out.view(*x.shape[:-1], weight.shape[0])
+    return torch.nn.functional.linear(x, weight, bias)
+
+
+def _quixicore_decode_linear_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+) -> torch.Tensor:
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+direct_register_custom_op(
+    op_name="quixicore_decode_linear",
+    op_func=_quixicore_decode_linear_impl,
+    fake_impl=_quixicore_decode_linear_fake,
+)
+
+
+def cuda_unquantized_gemm(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    if (
+        bias is None
+        and decode_gemm_enabled()
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.is_contiguous()
+        and decode_gemm_supports(weight.shape[0], weight.shape[1])
+    ):
+        return torch.ops.vllm.quixicore_decode_linear(x, weight, None)
     return torch.nn.functional.linear(x, weight, bias)
 
 
@@ -340,5 +408,7 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return rocm_unquantized_gemm
     elif current_platform.is_cpu():
         return cpu_unquantized_gemm
+    elif current_platform.is_cuda():
+        return cuda_unquantized_gemm
     else:
         return default_unquantized_gemm

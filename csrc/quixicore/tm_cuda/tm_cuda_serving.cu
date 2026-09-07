@@ -20,6 +20,7 @@
 #include "dsv4_projection_ampere.cuh"
 #include "glm_moe_routing.cuh"
 #include "glm_moe_combine.cuh"
+#include "bf16_decode_gemm.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
@@ -210,6 +211,27 @@ static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor 
                 "moe_sum_add: shape mismatch");
     TORCH_CHECK(d % glm_moe_combine::VEC == 0, "moe_sum_add: D must be a multiple of 8");
     glm_moe_combine::launch_moe_sum_add(bpm(out), bp(x), bp(shared), T, int(d), int(topk), stream());
+}
+
+static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
+                                    c10::optional<torch::Tensor> bias, bool fp32_out) {
+    CK(x); CK(weight);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && weight.scalar_type() == torch::kBFloat16,
+                "decode_gemm: bf16 x and weight");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
+                "decode_gemm: x [M, K], weight [N, K]");
+    const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
+    TORCH_CHECK(decode_gemm::supports(M, N, K), "decode_gemm: unsupported shape M=", M, " N=", N, " K=", K);
+    const float* bias_ptr = nullptr;
+    if (bias.has_value()) {
+        CK((*bias));
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm: fp32 bias [N]");
+        bias_ptr = bias->data_ptr<float>();
+    }
+    auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
+    if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
+    else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
+    return out;
 }
 
 __global__ void fill_short_context_topk_indices_kernel(
@@ -2105,6 +2127,9 @@ void init_serving(py::module_& m) {
           py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
           py::arg("max_padded"), py::arg("max_blocks"),
           "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
+          py::arg("bias") = py::none(), py::arg("fp32_out") = false,
+          "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
     m.def("moe_sum_add", &py_moe_sum_add, py::arg("x"), py::arg("shared"), py::arg("out"),
           "out[t] = shared[t] + sum_k x[t, k]: Marlin per-assignment sum + shared-expert add, one launch");
     m.def("fill_short_context_topk_indices",

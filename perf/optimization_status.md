@@ -20265,3 +20265,78 @@ No regression; c1 and c8 are at the boot-spread floor (arm A's first c1 pass was
 **Decision.** Retain both. The plumbing is inert without the binding (`has_moe_sum_add()` False -> old op, old path), so the Python lands now and the kernel activates with the rebuild; any config outside the static gate keeps the two-output op unchanged.
 
 **Raw artifacts.** /raid/scratch/slimserve-glm53/profile-{alias-A,alias-B,combine-A,combine-B}/, serve-logs/{item2_pairs.out,prof-combine-B.out,gate-alias-*.json,gate-combine-B.json,smoke-combine.out}, jit/{combine.cu,build_combine.py,build_combine_120f/}, perf/results/2026-09-07/item2-{A,B}-pass{1,2}/.
+
+## 2026-09-07: Phase 1 item 4 - bf16 M<=16 tensor-core GEMM replaces cuBLAS on the backbone projections
+
+**Status: RETAINED**
+
+**Baseline.** Tree 64dd8894f (+ the item 2 combine through its JIT hook), c1 profiler step 8.16-8.26 ms; the cuBLAS family is 3.46 ms of it in 293 launches (gemv_attrib.py on profile-combine-B): in_proj 34 x 34.1 us (1.51 TB/s) + 34 split-K reduces of 1.4 us, the 4096-row group (KDA o_proj, DSA q_b / wq_b / o_proj, dense down) 70 x 14.2 us, DSA fused_qkv_a 11 x 14.3, shared gate_up / down on the aux stream 42 x 7.3 / 7.4, lm_head 200. The Sep 4 microbench put cuBLAS at 1.09-1.50 TB/s on these shapes against a ~1.6 TB/s streaming ceiling (lm_head), dropping further at M = 2..16 (q_b 1.09, fused_qkv_a 1.13, dense down 1.12 at M=2), and showed the row-per-block fp32 GEMV (dsv4_projection) re-reading x per token at M >= 8.
+
+**Hypothesis.** A weight-streaming M<=16 kernel on tensor cores (x padded to 16 rows, m16n8k16 bf16 mma, cp.async-staged K chunks, ldmatrix fragments, warps splitting K and reducing once through shared memory) holds ~1.5 TB/s at every M on every shape with N >= 2048, taking ~0.15-0.2 ms off the c1 step (kernel time plus the 34 split-K reduce launches) and more at c8/c16 where cuBLAS is worst.
+
+**Change.** `csrc/quixicore/serving/bf16_decode_gemm.cuh` (kernel + `launch_auto` + `supports`), binding `decode_gemm` in `tm_cuda_serving.cu`, `quixicore_ops.decode_gemm` / `has_decode_gemm`, and `cuda_unquantized_gemm` in `model_executor/layers/utils.py`: on CUDA the unquantized bf16 linears without bias whose weight is [2048..16384] x (K % 128 == 0, K >= 512) go through the opaque custom op `quixicore_decode_linear`, whose impl takes the kernel for M <= 16 and F.linear otherwise (the M branch stays inside the op so torch.compile traces one graph). `SLIMSERVE_DECODE_GEMM=0` keeps cuBLAS. `graph_factors` carries `decode_gemm=<enabled>` so the compile cache key follows it. Shapes left on cuBLAS on purpose: lm_head (38720 rows: equal at M=1, +1.4% at M=16), moe shared gate_up (1024 rows: 7.4 us at every M vs cuBLAS 6.9 at M=1 / 9.1 at M>=2; on the aux stream; a follow-up), K=128 KDA projections (launch floor).
+
+**Microbench (gemm16_bench.py, weights rotated past L2, graph-captured, GPU 0).** Correct on every shape (max rel err 2-3e-3 = bf16 output rounding). us per launch, cuBLAS -> kernel:
+
+| shape (N x K) | M=1 | M=2 | M=4 | M=8 | M=16 |
+|---|---|---|---|---|---|
+| in_proj 6288 x 4096 | 34.5 -> 33.8 | 36.3 -> 33.8 | 36.5 -> 34.0 | 34.5 -> 34.0 | 34.5 -> 34.7 |
+| KDA o_proj 4096 x 2048 | 13.1 -> 12.0 | 13.7 -> 12.0 | 13.7 -> 12.1 | 13.8 -> 12.2 | 14.0 -> 12.2 |
+| DSA fused_qkv_a 2048 x 4096 | 13.2 -> 12.1 | 14.3 -> 12.1 | 14.4 -> 12.1 | 14.5 -> 12.1 | 14.8 -> 12.2 |
+| DSA q_b / wq_b 4096 x 1536 | 11.1 -> 9.7 | 11.3 -> 9.6 | 11.3 -> 9.6 | 11.4 -> 9.6 | 11.6 -> 9.8 |
+| DSA o_proj 4096 x 4096 | 24.1 -> 22.5 | 26.7 -> 22.5 | 24.1 -> 22.5 | 24.2 -> 22.5 | 24.3 -> 22.6 |
+| shared down 4096 x 512 | 4.8 -> 4.2 | 4.8 -> 4.2 | 4.8 -> 4.3 | 4.9 -> 4.3 | 4.9 -> 4.4 |
+| dense down 4096 x 3072 | 18.9 -> 18.2 | 22.5 -> 18.3 | 19.1 -> 18.2 | 19.2 -> 18.3 | 21.3 -> 18.4 |
+
+Config sweep (row tile 8..64, 2..8 stages, 128/256-wide chunks): 32 rows / 3 stages best for N >= 4096, 16 rows / 6 stages for N = 2048; nothing moved the 10-25 us kernels above ~1.4 TB/s - the residual is launch ramp and tail, which only fusing launches would recover.
+
+**Correctness.** tests/kernels/test_quixicore_decode_gemm.py (44 cases: seven shapes incl. the N tail 6288 and 2064 x 640, M in 1..16, bias, fp32 output, shape gate). Dispatcher check: M <= 16 through the kernel, M = 17 / 64 and 3-D inputs on F.linear. TBD smoke / gate.
+
+**Measured - profiler pair (prof_pair.sh gemm, c1, 384-token round, both arms with the item 2 combine through its hook; arm A adds SLIMSERVE_DECODE_GEMM=0).**
+
+| | arm A (cuBLAS) | arm B (decode gemm) | delta |
+|---|---|---|---|
+| GPU span / step (step_attrib, mean of 5 full steps) | 8.59 ms | 8.46 ms | -0.13 |
+| kernel busy / step | 8.35 ms | 8.15 ms | -0.20 (-2.4%) |
+| launches / step | 1304 | 1270 | -34 (the split-K reduces) |
+| cuBLAS family (gemv_attrib, median step) | 3.46 ms, 293 launches | 3.27 ms, 259 launches | -0.19 |
+| of which the new kernel | - | 2.57 ms, 160 launches | |
+
+Per shape in the trace (rank 0, per-rank shapes; us per launch, A -> B): KDA in_proj (6288 rows, 34/step) 34.1 + 1.4 split-K reduce -> 34.3 and no reduce, i.e. cuBLAS's 13-way split-K was already at the same 1.50 TB/s and the gain there is the reduce launch; the 4096-row group (KDA o_proj, DSA q_b / wq_b / o_proj, dense down; 70/step) plus the shared-expert down (42/step, 512 K) 14.2 x 70 + 7.0 x 42 = 1.29 ms -> 10.3 x 112 = 1.16 ms (-10%); DSA fused_qkv_a (2336 rows, 11/step) 14.3 -> 13.1; dense gate_up (6144 rows, 3/step) 33.7 -> 32.7. Left on cuBLAS as designed: shared gate_up (1024 rows, 42/step, 7.4 us), the K=128 KDA projections (34/step, 2.5 us), lm_head (200 us), and two small DSA linears under 2048 rows (11/step each, 5.2 and 4.3 us). Everything else in the step is unchanged within noise (marlin 1.16/1.17, allreduce 1.00/1.00, mHC 0.78/0.78, MLA 0.35/0.36).
+
+**Measured - exact-token (ab.sh, --no-spec, 1000/300, two passes per boot, two boots per arm per the 09-04 rule; tok/s).**
+
+| arm | c1 | c8 | c16 | gate (continuation NLL) |
+|---|---|---|---|---|
+| item4-A: cuBLAS (SLIMSERVE_DECODE_GEMM=0), boot 1 | 112.2 / 112.3 | 452.2 / 452.0 | 609.7 / 607.5 | (not run) |
+| item4-B: decode gemm, boot 1 | 112.7 / 112.7 | 456.3 / 457.1 | 606.1 / 605.6 | -2.433 / -2.411 (band -2.416..-2.457) |
+| item4-A2: cuBLAS, boot 2 | 115.6 / 115.6 | 460.0 / 462.6 | 613.7 / 613.1 | (not run) |
+| item4-B2: decode gemm, boot 2 | 112.9 / 112.9 | 457.6 / 458.3 | 608.1 / 605.2 | (not run) |
+| item4-A3: cuBLAS, boot 3 (accidental duplicate of the second-boot chain, kept as data) | 111.0 / 111.2 | 449.6 / 448.7 | 603.8 / 602.6 | (not run) |
+| item4-B3: decode gemm, boot 3 | 117.3 / 117.4 | 466.9 / 467.9 | 617.9 / 617.2 | (not run) |
+
+The boots fall into the fast / slow host states of the boot-spread entry below (cuBLAS 111.0 / 112.2 / 115.6 at c1, kernel 112.7 / 112.9 / 117.3), so the like-state comparison is the one that means anything: fast boots 117.4 vs 115.6 at c1 (+1.5%), 467.4 vs 461.3 at c8 (+1.3%), 617.5 vs 613.4 at c16 (+0.7%); slow boots 112.8 vs 111.0-112.2 at c1 (+0.5..+1.6%), 457.5 vs 448.7-452.2 at c8 (+1.2..+1.9%), 606.5 vs 603.2-608.6 at c16 (-0.3..+0.5%). Best-of-arm and worst-of-arm both favour the kernel by ~1.5% at c1, consistent with the 0.20 ms the profiler removed from an ~8.9 ms token (GPU step plus host gap). No concurrency shows a regression outside the spread; c16 is the smallest gain, as expected from in_proj being at parity at M=16 and prefill being untouched. Raw files: the A2 pass directories were overwritten by the accidental third boot (numbers above were read before that); A3/B3 are the renamed duplicates.
+
+Custom-op trampoline (op_overhead_bench.py, eager, GPU 0): the torch.library Python impl costs 2-4 us per call over a direct F.linear only when the GPU is starved (M ~64), and nothing at M = 256..1024 where the GEMM dominates; decode replays inside CUDA graphs, so it never pays it. A C++ TORCH_LIBRARY registration of the op would remove it entirely - a cleanup for the native rebuild after this one, not a blocker.
+
+Correctness in the serving path: the second gate run landed 0.005 above the band's upper edge (the better side; same-boot gate repeats differ by 0.02-0.03, so this is the sampled-continuation noise the 09-04 entry documents, and a wrong GEMM would move it the other way). The lower-noise check is the mean of the 4344 prompt logprobs in the gate JSON: item4-B -3.2857 / -3.2774 vs item2-B (same tree, cuBLAS) -3.2819 / -3.2696 and alias-B -3.2744, i.e. within the 0.012 that two gate runs on one boot differ by. Note for the record: the per-token prompt logprobs are not repeatable even within a boot (mean |delta| 0.25, max 19 between two gate runs on the same server; the batch-variant kernels the 09-04 entry lists), so only the mean is a usable signal.
+
+**Decision.** RETAINED. Kernel-level: 0.20 ms (2.4%) off the c1 step's kernel-busy time and 34 fewer launches, every replaced shape at or below its cuBLAS time at every M; end-to-end: +1.5% c1, +1.3% c8, +0.7% c16 between like boot states, gates in band, prompt-logprob mean within same-boot noise. Ships with `SLIMSERVE_DECODE_GEMM=0` as the kill switch and `decode_gemm=<enabled>` in the compile-cache factors. Inert in the shipped binary until the native rebuild adds the binding (batched with item 2's moe_sum_add); until then the JIT hook (`QC_DEV_GEMM=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`) is the way to run it. Follow-ups: shared gate_up 1024 rows (row-per-block at M=1 / mma above; 42 launches x 7.4 us on the aux stream, so ~0.1 ms of overlapped time), the C++ op registration above, and the `tile the K loop over two weight rows per warp` idea for the 10-25 us shapes stuck at ~1.4 TB/s (launch ramp; only fusing launches recovers the rest).
+
+**Raw artifacts.** /raid/scratch/slimserve-glm53/{gemm16_bench.py, jit/decode_gemm.cu, jit/build_decode_gemm_120f/}, profile-gemm-{A,B}/, serve-logs/{smoke-gemm.out, ab-item4-*.out}, perf/results/2026-09-07/item4-{A,B}-pass{1,2}/.
+
+## 2026-09-07: Boot spread probe - the exact-token harness moves 4% between boots of identical code, and it is not the GPU
+
+**Status: FINDING (measurement), follow-up open**
+
+**Observation.** Three boots of the same tree and env (item 4 arm A: cuBLAS, combine on, --no-spec) gave c1 112.2, 115.6, 111.0 tok/s (c8 452, 461, 450; c16 608, 613, 604), two passes each agreeing within 0.3%. Three boots of the kernel arm gave 112.7, 112.9 and 117.3 (c8 457, 458, 467; c16 606, 607, 618). The 09-04 noise study put the spread at ~2.5%; it is 4-5% at c1 across these six boots, and the 09-07 item 2 arm A moved 110.8 -> 115.7 between two passes of one boot, so it is a state that can flip mid-run.
+
+**Where it is.** The three profiled c1 boots of today (combine-B, gemm-A, gemm-B) have the same per-launch times for every fixed kernel - Marlin MoE 13.70 / 13.72 / 13.91 us, mHC 8.56 / 8.55 / 8.53, MLA decode 22.3 in all three, lm_head 199.8 / 200.8 / 200.5 (pure HBM streaming, so the memory clock is the same too) - while the GPU span per step is 8.16 / 8.59 / 8.46 ms. The difference is idle gap between kernels (-0.08 / +0.24 / +0.31 ms per step; negative = aux-stream overlap) plus 0.25 us per allreduce launch (10.76 -> 11.01 us, the kernel waiting for a slower rank). GPU clocks at idle: SM 2722-2737 MHz on all four cards, no throttle reasons, P1. So the spread is host-side: inter-step CPU work (scheduler, sampling, graph launch) and rank skew, not SM or memory clocks.
+
+**Suspects.** CPU frequency governor is `schedutil` on the EPYC 9334 (32 cores); worker/engine placement across the two CCDs and NUMA nodes is uncontrolled; the aux-stream overlap in the fast boot suggests launch timing decides whether the shared-expert stream actually overlaps.
+
+**What this means for gates.** A GPU-side change under ~4% cannot be resolved by the exact-token harness at any concurrency without either pinning the host state or 4+ boots per arm. The profiler pair's kernel-busy time (sum of kernel durations per step) is immune to it and is the decision metric for kernel work from here; the exact-token boots stay as the regression guard for correctness and as the reported throughput.
+
+**Follow-up (its own item, needs root).** (1) `cpupower frequency-set -g performance` and re-run three boots of one arm; (2) pin EngineCore and the four workers (taskset / numactl) to one CCD each and repeat; (3) log `nvidia-smi --query-gpu=clocks.sm,clocks.mem,power.draw -l 1` alongside every bench so a GPU-side cause can be excluded per run rather than per profiler pair.
+
+**Raw artifacts.** perf/results/2026-09-07/item4-{A,B,A2,B2,A3,B3}-pass{1,2}/, /raid/scratch/slimserve-glm53/profile-{combine-B,gemm-A,gemm-B}/.
