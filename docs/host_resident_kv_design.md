@@ -209,6 +209,35 @@ are deleted, not demoted, under host pressure).
   un-homed so it never demotes into a stale slot; (d) milestone 4b (main
   slots on NVMe).
 
+## Multi-pool packed slab (2026-09-07, E5b)
+
+- Problem: the packed slab hands every group the same block stride, so a
+  GDN state page (5.0 MB bf16 for a 12-layer group, 0.2 MB for the 1-layer
+  group) and the compressor ring (29 KB) each occupy a 10.56 MB slot. A
+  chat request holds 14 slots: 1 attention, 1 ring, and per GDN group the
+  running state plus `num_speculative_blocks` (= k) rollback slots.
+- Design: one BlockPool per page-size class (`KVCacheConfig.pool_num_blocks`
+  / `group_pool`, `KVCacheTensor.pool`, `KVCacheBlock.pool_id`). Pages of
+  the non-attention classes are laid out at their natural size (the
+  aligner's padding is dropped for them). The coordinator builds one pool
+  per class and gives each group's manager its pool; capacity checks,
+  frees, cache-hit lookups, events and the tier's boundary-state pins are
+  per pool. The worker allocates one backing per pool; the tier connector
+  registers every backing and the DMA selects the view by group id; the
+  arena row stays the attention stride.
+- Sizing (`kv_connector_extra_config.kv_pool_deep_requests`, 0 = single
+  pool): the attention-class pool holds that many max-length requests
+  (+ null + 1); the remaining memory goes to the other classes at equal
+  chat-context concurrency (per-class demand = 1 for attention/ring,
+  1 + k for each GDN group).
+- Result on qwen38fn-nvfp4-4 (bf16 GDN state): pools [44, 71, 25, 9] at
+  [10.56 MB, 5.03 MB, 225 KB, 29 KB] = 0.77 GiB, deep capacity 2.1x
+  (unchanged), chat concurrency 8 (from 5): c8 +17%, c32 +27%, c1
+  unchanged; restores/recall/canary pass.
+- Limit: at 8 running the rollback slots are 8 x 4 groups x 2 x 5 MB =
+  320 MB; going past ~8 running needs fewer per-position state copies
+  (recompute-on-reject) or a smaller state, not a layout change.
+
 ## Milestones and gates
 
 1. **Pointer-table gather kernel + microbench** (this entry). Gate: bit-exact

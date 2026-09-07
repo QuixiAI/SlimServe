@@ -19695,6 +19695,776 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   FP8 record's new configuration is committed but not deployed (operator:
   one instance on GPUs 0-3, GPUs 4-7 free).
 
+## 2026-09-07 - qwen38fn-nvfp4-4: optimization brainstorm and the host-reality microbenchmarks
+
+- Status: in progress (plan). Scope: qwen38fn-nvfp4-4/rtx3090 decode path.
+- Deliverable: perf/qwen38fn_nvfp4_4_optimization_plan.md (inventory, bytes
+  per step, c1 budget, ranked experiments E0-E8, do-not-redo list),
+  written per the QuixiCore CUDA handbook with the Metal/ROCm findings
+  cross-checked.
+- Measured 2026-09-07 on idle GPUs 4-7 (raw in perf/results/2026-09-07/qwen38fn-nvfp4-4-plan/, tables in
+  the plan): DRAM copy 844 GB/s; NCCL all-reduce TP4 bf16 [t,2560] ~40-48
+  us flat for t<=24 (77 us at t=64); vLLM custom all-reduce over PCIe at
+  TP4 (car_parity.py, VLLM_CUSTOM_AR_ALLOW_PCIE=1) 24.0/25.1 us at t=1/3
+  vs NCCL 40.2 - the TP8 rejection of 2026-08-27 does not transfer to TP4
+  - and 50/53/174/649 us at t=8/16/64/256 (NCCL 40/41/48/127); cuBLAS
+  bf16 decode GEMMs at M=3: 703 GB/s on 2560->4096 but 80-125 GB/s on the
+  2560->320/512 shared-expert and router shapes and 318-474 on the
+  1536->2560 and hyper-connection mixer shapes, with a 16-21 us floor per
+  call independent of M (1..24).
+- Finding: the checkpoint quantizes only the routed experts; GDN
+  projections (3.89 GiB), the replicated hyper-connection mixers (1.19
+  GiB), QSA projections, lm_head and shared experts are bf16, so a rank
+  streams ~3.9 GB per c1 step (4.6 ms at roofline) through ~11 cuBLAS
+  calls per layer that run latency-shaped. With 96 all-reduces at ~42 us,
+  the dense chain and the collectives are about two thirds of the 15.9 ms
+  c1 step. c8 remains pool-bound (5 running).
+- Next: E0 nsys census + E1 custom AR at TP4 (config + payload cutover),
+  then the skinny-GEMM family (E2) and hyper-connection fusion (E3).
+
+## 2026-09-07 - qwen38fn-nvfp4-4 optimization campaign: same-instance baseline (loop start)
+
+- Status: in progress. Scope: qwen38fn-nvfp4-4/rtx3090, test instance on
+  GPUs 4-7 (port 8001), production untouched on GPUs 0-3.
+- Baseline (record as committed, exact 1000/2000 seeded, c1/c8/c32):
+  **129.5 / 361.1 / 384.7 tok/s**, pool 531,186 tokens, 0 errors
+  (perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/bench_baseline_c{1,8,32}.log).
+  c1 is above the 120.1 recorded on 2026-09-06 (same config; that run was
+  taken beside a busy production box), so today's numbers are the A/B
+  reference; c32 == pool-bound c8 (max_num_seqs 8, 5 running).
+- E1 change under test: VLLM_CUSTOM_AR_PCIE_MAX_BYTES (new env; PCIe
+  opt-in custom all-reduce only for payloads <= the cap, NCCL above), run
+  with VLLM_CUSTOM_AR_ALLOW_PCIE=1 and a 16 KiB cap so MTP verify steps
+  (3 x 2560 bf16 = 15,360 B) take the 24 us one-shot and c8+ steps stay on
+  NCCL. tests/distributed/test_custom_ar_pcie_cap.py (3) green.
+- E1 result (serve_e1_car2_8001.log, bench_e1_car2_c{1,8,32}.log): c1
+  **101.9 (-21%)**, c8 353.3 (-2%), c32 391.5 (+2%). REJECTED. The
+  standalone parity harness (24 vs 40 us at t<=3) does not transfer to the
+  decode graph: inside the FULL decode graph the registered one-shot
+  kernel spins on peer flags, so every all-reduce waits for the slowest
+  rank's position in its own graph, and with 96 of them per step the rank
+  skew that NCCL's LL protocol absorbs becomes serial waiting (the
+  microbench synchronized all ranks before each timed call). c8/c32
+  payloads exceed the cap and stayed on NCCL, hence unchanged. The env
+  knobs (VLLM_CUSTOM_AR_PCIE_MAX_BYTES + cap-sized IPC buffers) stay
+  opt-in and off; the buffer sizing is a real fix for the existing
+  VLLM_CUSTOM_AR_ALLOW_PCIE path (an 8 MiB buffer tipped the startup
+  free-memory check at gpu_memory_utilization 0.975, which leaves only
+  ~30 MB of slack on this record - worth remembering for any change that
+  allocates before the check). Lesson for the plan: collective latency is
+  a floor at TP4 on PCIe; the lever is fewer collectives or more tokens
+  per step, not a faster all-reduce kernel.
+- E2 gate microbench (skinny_gemm_proto.py, CUDA-graph replay timing, GPU 4
+  idle; skinny_gemm_graph.out): the wall-clock table in the plan was
+  launch-bound (Triton flat at 29-38 us per call, cuBLAS 16-21 us floor).
+  In-graph GPU time per call at M=3: cuBLAS 5.1 / 7.4 / 13.1 / 13.0 /
+  11.4 / 7.4 / 17.4 / 28.3 us on shared-expert 2560->320 / router 2560->512
+  / GDN out 1536->2560 / QSA o / hyper down 10240->320 / hyper up
+  320->10240 / QSA qkv 2560->2048 / GDN in 2560->4096 (320-887 GB/s), so
+  the dense chain is ~100 us per layer = ~4.8 ms of the c1 step, not the
+  8-10 ms the wall-clock numbers implied. A weight-stationary split-K
+  Triton kernel (BN 16-64, BK 64-256, SK 1-8, fp32 accumulate, 2e-2
+  parity) beats cuBLAS by 1.01-1.27x at M=3 and 1.12-1.78x at M=24 (cuBLAS
+  drops to 417-474 GB/s on the 1536->2560 and 2560->2048 shapes at M=24
+  where the kernel holds 726-743). Revised E2 expectation: c1 -0.8 ms
+  (~+5%), c8 -2 ms of a ~26 ms step (~+8%); larger with the E3 epilogue
+  fusions. Decision: proceed after the E0 census confirms the chain's
+  share.
+- E0 nsys census (census_c1c8.nsys-rep -> sqlite; census_report.txt,
+  census_gaps.txt; `--cuda-graph-trace=node`, c1 112.7 / c8 362.4 tok/s
+  under the profiler). Per decode step on rank 0:
+
+  | item | c1 (18.7 ms/step) | c8, 5 running (29 ms/step) |
+  |---|---:|---:|
+  | cuBLAS small-M cutlass WMMA "Kernel2" (441/step at c1) | 5.8 ms | 6.2 ms |
+  | cuBLAS ampere_bf16 s16816 GEMMs + splitKreduce (220/step) | 2.0 ms | 2.5 ms |
+  | cuBLAS dot_kernel/reduce_1Block (router/gate GEMVs) | 0.2 ms | 0.9 ms |
+  | NCCL all-reduce RING_LL (103/step) + all-gather | 2.3 ms | 4.5 ms |
+  | Marlin NVFP4 experts (100/step) | 1.7 ms | 3.8 ms |
+  | QSA gather splitk + merge + indexer scoring | 0.6 ms | 1.9 ms |
+  | GDN delta-rule update + conv | 0.4 ms | 1.1 ms |
+  | MoE glue (topkGating, align, sum, silu, act) | 1.1 ms | 1.4 ms |
+  | elementwise + vectorized_elementwise (~350/step) | 0.9 ms | 1.8 ms |
+  | hyper-connection glue (_hc_*) | 0.4 ms | 0.6 ms |
+  | sampler _topk_topp (1/step, 248K vocab) | 0.36 ms | 0.44 ms |
+  | host gaps (GPU idle) | 2.3 ms (12%) | 2.5 ms (9%) |
+
+  "Kernel2" is cutlass_80_wmma_tensorop_bf16_s161616gemm 16x16/32x32 tiles
+  with split-K (grids 8x80, 8x3x40, 8x10, ...), i.e. cuBLAS's small-M
+  heuristic for the hyper-connection mixers, router, shared expert, GDN
+  B/A projection and output projections: 9 per layer plus the
+  splitKreduce follow-ups. The dense bf16 chain is therefore ~7.7 ms of
+  the c1 step (37%) and ~9.3 ms at c8 (32%): the plan's ranking of E2
+  stands, and the graph microbench (5-28 us per call) under-counted the
+  number of calls, not their cost. In-graph NCCL LL is 13-21 us per call
+  at 3 rows (2.1 ms/step), 37 us at 15 rows. Idle gaps cluster after the
+  input-prep index/elementwise kernels and after the sampler: the host
+  floor (E7) is 2.3-2.5 ms/step. Marlin holds ~550 GB/s effective on the
+  expert stream at c1 (E4 demoted). Sampler at 0.36-0.44 ms/step is a
+  cheap follow-up (Metal "lm_head_sample" precedent).
+- E2 leg 1 (vllm/models/qwen4_exp/nvidia/skinny_gemm_sm86.py, env
+  VLLM_QWEN4_EXP_SKINNY_GEMM=1, one config per (N, K); 397 linears / 8
+  shapes routed; tests/models/qwen4_exp/test_skinny_gemm_sm86.py 64
+  green): c1 **138.8 (+7.2%)**, c8 355.9 (-1.4%), c32 386.8 (+0.5%), 0
+  errors. Per-M sweep (skinny_sweep_m.out) explains c8: the single config
+  loses to cuBLAS on (320,2560) at M<=16 (4.5 vs 5.5 us), (512,2560)
+  (needs bn16/bk256/sk1: 5.8 vs 6.5) and (336,10240) at M>=24 (21 vs 18
+  us), while the wide shapes hold 1.1-1.7x at every M. Leg 2 = per-M
+  bucketed plan (cuBLAS for the shared-expert shape below M=24), under
+  test as e2b.
+- METHOD CORRECTION (2026-09-07): c1 tok/s on this record is dominated by
+  the drafter's acceptance draw, which varies with any numeric change
+  (custom AR reduction order, Triton vs cuBLAS accumulation) and between
+  repeats: the same E2b instance measured 126.3 / 120.5 / 123.1 / 154.1
+  tok/s on four c1 runs at 55.9 / 51.1 / 53.4 / 80.1% acceptance, while
+  its decode step time was 16.78-16.90 ms every time. The exact bench
+  reports spec_decode_drafts (= verify steps) and wall_seconds, so
+  ms/step = wall / drafts is the paired c1 metric from here on, and c8/c32
+  are read as verify-steps/s = tok/s / (1 + accepted/drafts). bench.sh
+  prints both. Re-read with that metric: baseline 16.81 ms/step; E1 17.00
+  (+1.1%, rejected on step time too, and its 36.6% acceptance was the
+  lottery, not a defect); E2 leg 1 16.93 and E2b 16.78-16.90: the skinny
+  route has NOT moved the c1 step despite the kernel-level 1.1-1.27x,
+  which needs the census with the route on (running) before E2 is judged.
+- E2b census (census_e2b.nsys-rep, 15 s c1 window, 809 steps, GPU busy
+  93%): `_skinny_gemm_kernel` ran only 60 times per step (0.45 ms) while
+  cuBLAS "Kernel2" still ran 394/step (5.5 ms) and ampere GEMMs 53/step:
+  the route reached only the QSA attention projections. Cause: the decode
+  model came from cached torch.compile artifacts ("reconstructed
+  serializable fn from standalone compile artifacts, num_submods=50"),
+  compiled before the route existed; the switch was read from the raw
+  environment and so was not in the compile hash. Fix: register
+  VLLM_QWEN4_EXP_SKINNY_GEMM in vllm/envs.py (every registered env var is a
+  compile factor). Leg e2c = fresh compile with the per-M plan.
+- E2c (fresh compile, per-M plan, 8 shapes / 397 linears; e2c logs): c1
+  **16.36 / 16.44 ms/step vs 16.81 (-2.4%)**, c8 167.5 vs 166.8
+  verify-steps/s (flat), c32 184.4 vs 180.8 (+2.0%). Real but small. The
+  checkpoint enumeration (safetensors headers) shows the plan was still
+  missing four per-rank shapes; graph-replay sweep (skinny_sweep_extra.out):
+  GDN fused B/A (24,2560) cuBLAS 15.6 -> 5.1 us (3x, 36/step), MTP
+  fc (2560,2560) 21 -> 17, shared-expert down (2560,160) 3.4 -> 2.5,
+  lm_head (62080,2560) 416 -> 361 us (1/step). Added (13 shapes; parity
+  86 green); census e2d with the full route at c1 and c8 in flight.
+- E2d census (census_e2d.nsys-rep, 13-shape route): `_skinny_gemm_kernel`
+  now runs 444/step (Kernel2 down to 63/step), averaging 14.1 us in-graph
+  (6.3 ms/step) against the 7.5 ms the cuBLAS chain took, so GPU time per
+  step fell ~1.2 ms while the measured step fell 0.45 ms: the remainder
+  is absorbed by host gaps (E7 becomes binding at c1). NCCL all-reduce
+  durations in the same census are 39-80 us per call (8.2 ms/step in the
+  c8-style window), well above the 13-21 us standalone figure: in-graph
+  the kernel duration includes waiting for the slowest rank, so
+  collectives are both the rank-skew sink and, at 15-24 rows (77-123 KB),
+  a bandwidth item on NCCL's LL protocol (~1.5-2.7 GB/s). Next: E2d
+  serving verdict (running), then an NCCL env sweep (protocol/algorithm/
+  buffer sizes) at decode payloads on the P2P fabric, then E7.
+- **E2 RETAINED (e2d, 13-shape per-M plan, 483 linears / 12 shapes routed):
+  c1 15.81 / 15.87 ms/step vs 16.81 (-5.8%), c8 168.3 vs 166.8
+  verify-steps/s (+0.9%), c32 187.1 vs 180.8 (+3.5%), 0 errors; tok/s at
+  the drawn acceptances 143.1 / 354.9 / 401.5.** Kept behind
+  VLLM_QWEN4_EXP_SKINNY_GEMM (registered env, compile-hash factor); the
+  record's env turns it on once the correctness gates (deep recall to
+  144K, image canary, tier restore at 3-5 blocks) pass on the same
+  instance. Lesson recorded twice now: a kernel A/B is not a serving A/B
+  until the census shows the kernel in the graph, and the c1 metric is
+  ms/step.
+- NCCL env sweep (nccl_env_sweep.sh, torchrun world 4 on GPUs 4-7, bf16
+  [t,2560] all-reduce): default 41-47 us from t=1 to t=64 (isolated
+  60-75 us outliers at single sizes are timer noise, not a trend);
+  NCCL_PROTO=Simple 48-81 (worse), LL128 = default, NCCL_ALGO=Tree
+  worse above t=8 (87-123 us), BUFFSIZE / LL_BUFFSIZE / NTHREADS /
+  P2P_USE_CUDA_MEMCPY all within noise of default. REJECTED: NCCL's LL
+  ring is already at its latency floor on this fabric; the 39-80 us
+  in-graph durations at c8 are rank-skew waits, which the host-floor work
+  (E7) addresses, not a protocol knob.
+- E7 host floor, py-spy (pyspy_worker0_e7.txt / pyspy_core_e7.txt, 250 Hz
+  x 20 s during c1, route on): worker 0 self-time is 45% on
+  `short_conv_attn.py:348` (`non_spec_req_idx_cpu.to(device)`, a pageable
+  host-to-device copy that blocks behind the previous step's kernels) and
+  45% on `sync_completion_event`; the engine core sits in
+  shm_broadcast waits (it is ahead of the workers). The pageable copy is
+  a per-step drain: the host cannot run the next step's metadata build
+  and graph launch while the GPU still works, which is the 2.3 ms of
+  GPU idle the census showed. E7a: the five pageable `.to(device)` sites
+  in the short-conv builder -> `async_tensor_h2d` (pinned, non_blocking),
+  and pinned staging for the residency's per-step index copies. Under
+  test (e7a).
+- **E7a RETAINED (drain kill): c1 15.38 / 15.34 ms/step (vs 15.81 with E2
+  alone, 16.81 baseline: -8.7% cumulative), c8 176.0 verify-steps/s
+  (+5.5% vs baseline), c32 189.7 (+4.9%); tok/s at the drawn acceptances
+  140.4 / 384.9 / 407.8; 0 errors.** py-spy after the fix: worker 0 54%
+  in sync_completion_event (GPU wait) and ~30% in shm_broadcast waits
+  (waiting for the engine core's next step), the core mostly waiting for
+  worker output - the residual host gap is the per-step scheduler/worker
+  handshake, not a blocking copy. Change: five pageable `.to(device)` in
+  vllm/v1/attention/backends/short_conv_attn.py -> async_tensor_h2d, and
+  pinned staging in MainKVResidency.prepare_step. Not gated (the code is
+  correct either way); the residency tests (5) pass.
+- E5a (num_speculative_tokens 3, max_cudagraph_capture_size 32; e5a logs):
+  c1 16.83 ms/step at 37.3% per-draft acceptance = 2.12 tok/step
+  (~126 tok/s vs ~140 at k=2), c8 271.1 tok/s / 117.1 verify-steps/s
+  (vs 384.9 / 176.0). REJECTED: the third draft token is accepted too
+  rarely to pay for the fourth verify row, and align-mode GDN needs
+  k+2 snapshot slots per group per request, so c8 loses running
+  requests on top. Record reverted to k=2 / capture 24.
+- E5b two-pool packed slab (in flight): the scheduler had one BlockPool, so
+  a GDN snapshot block occupied a full attention-sized slot (10.56 MB for
+  812 KB of state) and a 1,000-token request charged ~8 of the 42 slots
+  (18.4% KV usage per request -> 5 running at c8/c32). Change: mamba/GDN
+  groups draw block ids from a second pool at their own stride
+  (kv_connector_extra_config mamba_pool_blocks_per_attn_block = GDN blocks
+  per attention-class block; 0 = old single pool). Touch points: planner
+  (_get_kv_cache_config_packed splits layouts and memory, KVCacheConfig
+  pool_num_blocks/group_pool, KVCacheTensor.pool, packed memory check and
+  cross-rank unify per pool), BlockPool(pool_id) + KVCacheBlock.pool_id,
+  coordinator (one pool per class, per-pool allocation counts, cache-hit
+  lookups on the group's pool), KVCacheManager (per-pool capacity checks
+  with watermark/reservation, free_blocks routing by pool, usage = max),
+  scheduler frees via the manager and bind_gpu_block_pools, worker
+  (one backing per pool), tier connector (per-pool strides, state-group
+  pool for tail pins, DMA views per pool), warmup (min pool bound).
+  Tests: tests/v1/core/test_two_pool_packed_planner.py + the core, tier
+  DMA, residency and registry suites (136 green).
+- E5b RESULT: REJECTED and reverted. Boot e5b_pools (serve_e5b_pools_8001.log):
+  the mamba-class stride came out at 9,744,384 bytes - a GDN group block is
+  12 layers x 812 KB of real fp32 state, not a small page padded to the
+  attention stride - so the split only moved memory (20 attention-class +
+  60 mamba-class blocks, 0.53x max-length) and the tier rejected the
+  backing size. The per-request slab charge at chat context is real state
+  bytes (~2 x 10.56 MB attention/ring + ~6 x 9.7 MB GDN = ~80 MB), not
+  slot padding; the c8/c32 concurrency lever is the GDN state size (fp32
+  SSM state, spec/boundary copies), not the pool layout. The two-pool code
+  is removed (no model here can benefit); the design note stays above.
+- E-GDN (mamba_ssm_cache_dtype bfloat16; egdn logs): GDN page 812,032 ->
+  418,816 B; c1 15.16 ms/step (-1.2% vs 15.34), c8 175.4 verify-steps/s
+  (flat), c32 192.4 (+1.4%); recall PASS at 18K/54K/144K, canary PASS,
+  0 errors. Alone it changes nothing structural because the aligner pads
+  the GDN page back to the attention page inside the single pool.
+- Per-request accounting corrected: the pool is 76 blocks (0.81 GiB /
+  10.56 MB; 531,186 tokens = 2.03 x 38 blocks, not 42), and a chat
+  request holds 14: 1 attention + 1 ring + 3 per GDN group (running
+  state + num_speculative_blocks=2 rollback slots) x 4 groups. Twelve of
+  the fourteen are GDN pages (5.0 MB bf16 / 0.42 MB for the 1-layer
+  group) in 10.56 MB slots.
+- E5b (multi-pool, second attempt): one BlockPool per page-size class at
+  the class's natural (unpadded) page size; extras kv_pool_deep_requests
+  sizes the attention-class pool for that many max-length requests and
+  gives the rest to the other classes at equal chat-context concurrency.
+  Same plumbing as before (perf/results/.../apply_pools_plumbing.py,
+  apply_pools_planner.py); tests/v1/core/test_multi_pool_packed_planner.py;
+  136 tests green. Leg e5b_pools2 = bf16 state + kv_pool_deep_requests 2.0.
+- E5b leg 4 (e5b_pools4; bf16 GDN state + kv_pool_deep_requests 2.0):
+  pools [43, 72, 24, 8] blocks at strides [10.56 MB, 5.03 MB, 225 KB,
+  29 KB] = 0.77 GiB (attention/indexer, 12-layer GDN x3 groups, 1-layer
+  GDN, ring), 2.05 max-length requests kept; **c8 424.1 tok/s / 190.8
+  verify-steps/s (+8.4% vs E7a, +14% vs baseline), c32 487.1 / 227.7
+  (+20% vs E7a, +26% vs baseline), c1 15.25 ms/step (unchanged)**; recall
+  PASS 18K/54K/144K, canary PASS, 0 errors. Two defects found by the
+  gates: the ring pool got 8 blocks including its null block so c32 ran 7
+  (fixed: +1 null allowance per pool), and no tail state was ever saved
+  because the boundary lookup asked one pool for all four state groups
+  while the 1-layer GDN group lives in another (fixed: per-group pools
+  for the lookup, pins and pin releases). Three boots were lost to the
+  connector's slab selection (most-layers storage is now the GDN pool;
+  the residency window ties pool 0's layer count) - both fixed by
+  selecting the pool-0 storage explicitly and excluding host-resident
+  layers. Leg 5 re-checks c32/c8, restores (hit counts) and recall.
+- Capacity reality behind E5b: at 8 running, the GDN rollback slots alone
+  (8 x 4 groups x 2 x 5 MB = 320 MB) are 40% of the 0.81 GiB pool, so
+  c32 cannot reach 16 running while keeping 2 max-length requests; the
+  next structural lever there is the spec-slot count (k+1 per-position
+  states), not the layout.
+- **E5b RETAINED (leg 5, e5b_pools5; record now carries
+  mamba_ssm_cache_dtype bfloat16 + kv_pool_deep_requests 2.0): pools
+  [44, 71, 25, 9], deep 2.1x; c32 507.8 tok/s / 230.2 verify-steps/s
+  (+27% vs baseline 180.8), c8 430.5 / 194.6 (+17% vs 166.8), c1 15.25
+  ms/step (unchanged vs E7a); restores 3/3 (42K 4.7 s, 54K 3.3 s, 76K
+  8.0 s vs 12.0/15.9/24.9 fresh; 50 tail saves), recall PASS, 0 errors.**
+  Cumulative vs the 2026-09-07 baseline: c1 16.81 -> 15.25 ms/step
+  (-9.3%), c8 166.8 -> 194.6 verify-steps/s (+17%), c32 180.8 -> 230.2
+  (+27%); tok/s at the drawn acceptances 140.9 / 430.5 / 507.8 vs 129.5 /
+  361.1 / 384.7.
+- Kernel-count census (E2d sqlite, c1 window): 2,655 launches per decode
+  step (~55 per layer), 15.6 ms GPU/step under nsys. By count: skinny
+  GEMM 437, vectorized_elementwise 437 (the split-K path's accumulator
+  zero-fill and fp32->bf16 convert: 2 extra launches per split-K call,
+  ~270/step), elementwise 177, NCCL 103, hc gate_mix/silu/combine_norm
+  ~300, Marlin 100, MoE glue (topkGating, align, count_and_sort, dot,
+  reduce, silu, act_and_mul, sum) ~450, GDN conv+update 72, QSA chain
+  ~100. Inside CUDA graphs each launch still costs a 1-5 us GPU floor, so
+  the count itself is a c1 lever (Metal precedent: fused eager chains
+  498 -> 302 ms). Next: E2e single-launch split-K (last-CTA reduce, no
+  zero-fill/convert), then E3 hyper-connection epilogue fusion (SiLU into
+  the mixer GEMM, gate-mix into the up-projection), then MoE glue.
+- NVTX census (census_nvtx2): no module attribution is possible inside
+  the FULL decode graph (only NCCL's own ranges and scheduler scopes
+  appear); recorded so it is not retried.
+- E-max10 (max_num_seqs 10, capture 32, kv_pool_deep_requests 1.5; pools
+  [33, 94, 32, 12], 1.57x deep): c32 146.3 tok/s / 67.6 verify-steps/s -
+  a 3.4x collapse from thrash at 100% pool usage (10 running x 9 GDN
+  blocks against 94). REJECTED; record back to 8 / 24 / 2.0. The
+  chat-concurrency sizing needs headroom above max_num_seqs, and the
+  GDN-state bytes cap running requests near 8 on 24 GB regardless.
+
+### 2026-09-07 E2e + E3: single-launch split-K and fused hyper-connection ops (qwen38fn-nvfp4-4, port 8001, GPUs 4-7)
+
+- Baseline: the retained E5b instance (c1 15.25 ms/step, c8 194.6, c32 230.2
+  verify-steps/s; perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/bench_e5b_*).
+- Hypothesis: the kernel-count census (2,655 launches/step) attributed ~270
+  launches to the split-K zero-fill/convert pair and ~300 to hyper-connection
+  glue (hc_silu, gate GEMV, hc_gate_mix). E2e folds split-K into one launch
+  (partials to a persistent workspace, last-CTA reduce via an acq_rel counter,
+  SiLU epilogue); E3 fuses mixer-down + silu(x/HC) and up-projection +
+  sigmoid gate-mix into two Triton ops (`qwen4_exp_hc_down_silu`,
+  `qwen4_exp_hc_up_gate_mix`).
+- Correctness: tests/models/qwen4_exp/test_skinny_gemm_sm86.py 105 passed
+  (split-K re-entrancy, fp32-reference parity for both fused ops). The op
+  path and the direct call differ by one bf16 ulp; the test compares each to
+  the fp32 reference. First boot failed inside Dynamo: the route gate called
+  `is_device_capability` (lru_cache wrapper) in the compiled region; fixed by
+  deciding the route at enable time (`HyperConnection.sm86_hc_fused`).
+- Result (serve_e3_hcfuse_8001.log, bench_e3_hcfuse_c*.log): c1 14.92 /
+  14.95 ms/step (-2.1%), c8 193.6 verify-steps/s (-0.5%), c32 230.2 (0%).
+  Gates: recall 18K/54K/144K PASS, canary PASS.
+- Reading: ~570 fewer launches bought 0.3 ms/step, far below the ~2 us per
+  in-graph launch that the census model assumed. The decode step at c1 is
+  not launch-bound to that degree; the remaining time sits in the collectives
+  (NCCL skew) and the big kernels.
+- Decision: below the keep rule for complexity-adding changes (>=8-10%).
+  Attribution leg (HC_FUSED=False, E2e alone) recorded below before the
+  revert decision.
+- Attribution leg (HC fusion off, E2e alone; serve_e2e_only_8001.log,
+  bench_e2e_only_c*.log): c1 14.97 / 15.02 ms/step (-1.7% vs 15.25), c8
+  194.0 verify-steps/s (-0.3%), c32 231.1 (+0.4%). The E2e+E3 leg was
+  14.92 / 14.95: the hyper-connection fusion contributed nothing
+  measurable on top of the single-launch split-K.
+- **E3 REJECTED and removed** (hyperconnection.py restored, the fused
+  ops and their test deleted). **E2e below the keep rule on its own
+  (-1.7%)**; it stays as the kernel base for E8 (int8 weight-only, same
+  kernel, next entry) and is judged with it: if E8 does not clear the bar
+  the whole line reverts to the pre-E2e kernel.
+- Lesson: the kernel-count census over-weighted launch count. 570 fewer
+  in-graph launches were worth ~0.3 ms; the c1 step is dominated by the
+  bytes the dense bf16 chain streams (below).
+
+### 2026-09-07 E8: int8 weight-only storage for the skinny-routed dense linears (qwen38fn-nvfp4-4)
+
+- Baseline: E2e leg above (c1 14.97 / 15.02 ms/step, c8 194.0, c32 231.1).
+- Evidence (census_e2d.sqlite, `_skinny_gemm_kernel` grouped by grid,
+  per rank-step): lm_head (62080,2560) 3 calls x 361 us at 880 GB/s;
+  HC mixer down (336,10240) 96 x 12.3 us at 560 GB/s; HC up (10240,320)
+  97 x 9.8 us at 670 GB/s; (4096,2560) 36 x 26.2 us at 800 GB/s;
+  (2560,1536)/(2560,2560) 49 x 12.4 us; (512,2560) 48 x 7.8 us at 336 GB/s;
+  (3584,2560) 12 x 23.2 us at 790 GB/s. Total 5.7 ms/step for ~3.9 GB of
+  bf16 weights per rank-step: 4.1 ms at the 936 GB/s peak, i.e. the chain
+  is bandwidth-bound and the big shapes already sit at 85-94% of peak.
+  Only halving the bytes moves it materially.
+- Hypothesis: int8 weight-only (symmetric absmax/127 per row and per
+  group of 128/64/32 columns, fp16 scales) halves the stream: ~2 ms/step
+  at c1 (13%), and c8/c32 in proportion since M <= 24 stays weight-bound.
+  W8A16 at this granularity is the standard near-lossless setting (llama.cpp
+  Q8_0 lm_head, vLLM/AutoGPTQ int8 weight-only) but the NVIDIA NVFP4
+  checkpoint deliberately left these layers bf16, so a quality gate is
+  mandatory: prompt-logprob parity against production (logprob_parity.py:
+  PPL ratio, mean |dlogprob|, top-1 agreement on 32 fixed texts), plus
+  recall, canary and the MTP acceptance rate.
+- Implementation (skinny_gemm_sm86.py): GROUP_K constexpr path in the
+  kernel (int8 tile -> bf16 in registers, integer dot, one fp32 scale
+  multiply on the accumulator per BLOCK_K chunk since BLOCK_K divides the
+  group); quantize_w8 / dequantize_w8 (Triton); the quant method's
+  process_weights_after_loading swaps the bf16 Parameter for int8 +
+  weight_scale_sm86 when VLLM_QWEN4_EXP_SKINNY_W8=1 (registered env,
+  compile factor); custom op qwen4_exp_skinny_gemm_w8_sm86: skinny kernel
+  at M <= 32, bf16 dequant + cuBLAS above, lm_head (318 MB) chunks its rows
+  through the kernel instead of materializing the bf16 copy. Frees ~1.6 GB
+  of weights per rank, which the memory profile hands to the KV pools.
+- Correctness: test_skinny_gemm_sm86.py 185 passed (int8 vs dequantized
+  fp32 reference at every planned shape and M, large-M paths, post-load
+  quantization).
+- Sweep (skinny_sweep_w8.py -> skinny_sweep_w8.out/json): best config per
+  (shape, M) for int8 and, with the single-launch kernel, bf16 again.
+- Sweep verdict (skinny_sweep_w8.out, make_plans.out): int8 wins on the
+  seven large shapes, 0.52-0.64x of the best bf16 config at M<=8 and
+  0.80-0.93x at M=24-32 ((2048,2560), (2560,1536), (2560,2560),
+  (3584,2560), (4096,2560), (10240,320), lm_head 371 -> 202 us); the seven
+  <=7 MB shapes are latency-bound (~4-5 us in-graph floor per launch) and
+  int8 LOSES there (1.07-1.31x), so they stay bf16. Variant microbench
+  (w8_variants.out): the fp16 bit-trick dequant is no faster than the
+  int8 -> fp32 -> bf16 cast, so the cost is the tensor-core operand path,
+  not the conversion; an FMA GEMV variant wins only at M=1 and loses at
+  M=3 (the c1 verify batch), so the dot path stays.
+- bf16 re-sweep with the single-launch kernel (E2f, same run): every
+  bucket beats cuBLAS by >3% now, including (320,2560) at M<=16 (4.3 vs
+  4.3-5.3 us) which the first sweep had left on cuBLAS; new SM86_SKINNY_PLANS
+  table installed. 192 tests pass.
+- **E8 leg (int8 on the 7 shapes + E2f tables; serve_e8_w8_8001.log,
+  bench_e8_w8_c*.log): c1 13.41 / 13.44 ms/step (-10.4% vs the E2e leg
+  14.97 / 15.02; -12% vs E5b 15.25), c8 279.8 verify-steps/s (+44% vs
+  194.0), c32 258.8 (+12% vs 231.1); tok/s at the drawn acceptances
+  164.6 / 593.5 / 567.2.** Available KV memory per rank 0.91 -> 1.59 GiB
+  (the freed bf16 weights). Recall 18K/54K/144K PASS, canary PASS.
+  Quality gate pending (below).
+- INCIDENT 08:11-08:13: the first logprob-parity run used production
+  (:8000) as the bf16 reference. Its prompt-logprobs request (~800
+  tokens) OOM-killed the production worker: compute_prompt_logprobs_with_
+  chunking used a fixed 1024-token chunk, i.e. ~1 GB of fp32 full-vocab
+  logits after the TP gather, against 65 MB free at 0.975 utilization
+  (/var/log/SlimServe/serve.log 08:12:58, rank 2 "allocate 465567744
+  bytes (free: 65339392)"). The engine died, systemd's stop timed out
+  and it auto-restarted the unit at 08:13:40 on the current working
+  tree (skinny route with the new bf16 tables, drain kill, bf16 GDN
+  state, multi-pool slab; int8 off since the record does not set
+  VLLM_QWEN4_EXP_SKINNY_W8). Not an intentional bounce. Any client
+  sending echo/prompt_logprobs could have triggered it.
+  Fix (vllm/v1/worker/gpu/sample/prompt_logprob.py): the chunk is now
+  sized from device free memory + the allocator's idle reserve (first
+  chunk 8 tokens to learn the vocab width, then half the budget at
+  ~16 B/token/vocab entry, capped at 1024). The parity gate
+  (logprob_parity.py) is now dump-and-compare between two test servers
+  on :8001 and never targets production.
+- Quality gate results (logprob_parity.py dump/compare, 31 texts, 25.7K
+  prompt tokens, top-1 prompt logprobs; all on :8001):
+  | pair | PPL a / b | mean abs dlogprob | top-1 agree | max abs d |
+  |---|---|---|---|---|
+  | bf16 (e2f) vs int8 run1 | 4.679 / 4.740 | 0.173 | 92.6% | 26.2 |
+  | int8 run1 vs int8 run2 (same server) | 4.740 / 4.698 | 0.144 | 93.9% | 26.2 |
+  | int8 run2 vs run3 (same server) | 4.698 / 4.701 | 0.133 | 93.9% | 4.9 |
+  | bf16 run1 vs run2 (same server, fresh boot) | 5.230 / 5.937 | 0.271 | 92.4% | 32.7 |
+  | bf16 boot1 vs bf16 boot2 run1 | 4.679 / 5.230 | 0.243 | 92.5% | 35.6 |
+  The int8 quantization is inside the run-to-run spread of the SAME
+  server (bf16-vs-int8 0.173 vs int8-vs-int8 0.133-0.144). The
+  serving path itself, bf16 included, is NOT deterministic: identical
+  prompts re-prefilled on the same server (prompt-logprobs requests
+  skip the prefix cache) disagree by 0.13 nats per token on average
+  with 6% top-1 flips, and on top of that whole runs of consecutive
+  requests come back 0.2-0.6 nats/token worse (bf16 run2 texts 0-10,
+  bf16 boot2 texts 11-30, int8 run1 text 10) with single near-certain
+  tokens scored at -20..-35. The recall probes never saw this (a marker
+  survives spotty corruption). E8 is therefore judged on throughput
+  and on being within the same-server spread; the nondeterminism /
+  corruption is a separate correctness defect being bisected with the
+  same probe, starting from the committed HEAD (6e140ce6a) served from
+  a worktree (~/.local/scratch/ss-head, native .so files linked, the
+  prompt-logprob chunk fix copied in so the probe cannot OOM it).
+- Committed HEAD (6e140ce6a, worktree ~/.local/scratch/ss-head, record as
+  committed): 5 dumps, all clean: run-to-run mean |dlogprob| 0.131-0.134,
+  top-1 agreement 93.9-94.2%, max |d| 4.2-5.3, no per-text shift above
+  0.04. So the 0.13-nat / 6%-flip floor is pre-existing (bf16 logits and
+  discrete MoE/indexer choices; recorded as the baseline), but the
+  episodic per-text corruption (3 of 7 working-tree dumps, 2 of 4
+  servers; max |d| 20-35, whole requests 0.2-0.6 nats worse) is NOT in
+  HEAD: one of the loop's retained changes introduced it. Bisecting with
+  probe_chain.sh (boot, 3 dumps, compare vs HEAD run1; CORRUPT_TEXTS
+  counts texts shifted > 0.1 nats): leg 1 = kv_pool_deep_requests 0
+  (single pool, E5b off), then E7a, then bf16 GDN state, then the
+  skinny route.
+- Bisect leg 1 (kv_pool_deep_requests 0, single pool): run1 CORRUPT
+  texts 11-30 (every request from the 12th on, -0.2..-0.85 nats), then
+  the engine died during run2 with "RPC call to sample_tokens timed
+  out". The multi-pool slab is NOT the cause. The hang is the tell: a
+  timeout inside sample_tokens is a collective deadlock, and the only
+  collective there is the prompt-logprob logits all-gather. Root cause:
+  today's chunk fix sized the chunk from EACH RANK's free memory, so TP
+  ranks disagreed; with unequal chunk sizes the all-gather misaligns the
+  gathered rows (garbage logprobs from the second chunk on: onset at
+  token ~130-160, exactly what the per-64 profile showed), and with
+  unequal chunk counts it deadlocks. HEAD stayed clean because its
+  looser memory put every rank at the 1024 cap. Every corrupted dump was
+  on a server carrying the per-rank chunk. So the corruption is an
+  artifact of the probe's own fix, not of any retained optimization.
+  Fix: all-reduce(MIN) the chunk across the TP group before use.
+  Verification probe (chunkfix: working tree, record restored, int8
+  off): 3 dumps must show CORRUPT_TEXTS 0 and max |d| at the ~5 floor.
+- Verification (chunkfix probe: working tree, record restored, int8 off,
+  TP-consistent chunk): 3 dumps vs HEAD run1, CORRUPT_TEXTS 0 / 0 / 0,
+  mean |dlogprob| 0.134-0.137, top-1 93.7-94.0%, max |d| 4.3-6.1: the
+  same floor as HEAD-vs-HEAD. Root cause confirmed and closed. The
+  standing lesson: a prompt-logprob dump/compare (logprob_parity.py) is
+  the sensitive correctness gate for this stack - it found in one pass
+  what three recall probes, the canary and the tier restore could not -
+  and it must run against test servers only.
+- E8 final quality gate (e8_final: int8 on, TP-consistent chunk; 3 dumps vs
+  HEAD run1): CORRUPT_TEXTS 0/0/0, PPL ratio 1.0040 / 1.0032 / 1.0008,
+  mean |dlogprob| 0.157-0.159 (bf16 floor 0.131-0.137), top-1 agreement
+  93.0-93.1% (floor 93.7-94.2%), max |d| 5.5-7.4 (floor 4.2-6.1). The int8
+  signature is +0.02 nats/token of spread and -0.8 pt of top-1 agreement
+  on top of the floor, with no systematic shift: accepted for W8A16 at
+  group 32-128 (int8 stays off the seven latency-bound small shapes).
+- INCIDENT 2 (09:18): the c8 bench that followed the 93 prompt-logprob
+  requests on the same server OOM'd in the QSA indexer's scoring
+  temporary (`qsa_mqa_paged` logits, 128 MiB fp32, 108 MiB free) and the
+  engine died. The same bench passed on every earlier server that had not
+  served prompt logprobs first: the variable-size logits chunks
+  fragmented the caching allocator's reserved pool so a 128 MiB contiguous
+  block was no longer reclaimable at 0.975 utilization. Fix below.
+- Fixes for incident 2: prompt-logprob chunk capped at 64 tokens (still
+  TP-agreed) and PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True in the
+  record's env; vllm/config/vllm.py's connector guard now exempts
+  HostTierConnector (_VMM_SAFE_KV_CONNECTORS: it copies live tensors
+  stream-ordered and never registers GPU memory with a NIC, which is what
+  the guard protects). Regression test tests/v1/sample/
+  test_prompt_logprob_chunk.py.
+- **E8 RETAINED (e8_v2: int8 on the 7 large shapes, E2f bf16 tables,
+  expandable segments, chunk fix; serve_e8_v2_8001.log, bench_e8_v2*_c*.log):
+  c1 13.46 / 13.47 ms/step, c8 281.6 / 275.4 verify-steps/s (before /
+  after 93 prompt-logprob requests), c32 258.5; tok/s at the drawn
+  acceptances 151.8 / 615.1 / 554.2.** Quality 3 dumps vs HEAD:
+  CORRUPT_TEXTS 0, PPL ratio 1.001-1.004, mean |dlogprob| 0.158-0.161
+  (floor 0.13), top-1 92.9-93.2% (floor 94.0%). Recall PASS, canary PASS,
+  tier restore PASS (restore issued, hot == restored). The post-dump c8
+  bench that OOM'd before now runs. Record: VLLM_QWEN4_EXP_SKINNY_W8=1 +
+  expandable segments + two notes.
+  Cumulative vs the 2026-09-07 baseline (16.81 ms/step, 166.8, 180.8):
+  c1 -19.9% (13.46), c8 +69% (281.6), c32 +43% (258.5).
+
+### 2026-09-07 census of the retained build (census_e8.nsys-rep / .sqlite, census_e8_windows.out)
+
+Per rank-step under nsys (c1 14.07 ms, GPU busy 14.16 ms, 2345 kernels;
+c8 28.2 ms, 2353 kernels). The windows in census_rank.py's automatic split
+were mislabeled (warmup vs benches); census_e8_windows.out uses explicit
+windows (c1 t=3-28 s, c8 t=50-95 s from the first traced kernel).
+
+| item | c1 ms/step | c8 ms/step |
+|---|---:|---:|
+| _skinny_gemm_kernel (486/step) | 4.52 | 5.36 |
+| NCCL all-reduce (103) + all-gather (7) | 2.38 + 0.32 | 4.96 + 1.33 |
+| Marlin NVFP4 experts (100) | 1.66 | 6.17 |
+| QSA sparse gather (14) + indexer scoring | 0.44 | 4.28 + 0.36 |
+| MoE glue (gating, align, sum, silu, act, count/sort, router GEMV) | ~1.5 | ~1.5 |
+| bf16 BinaryFunctor elementwise, 51/step | 0.25 (4.9 us) | 0.99 (19.5 us) |
+| sampler _topk_topp (1) | 0.36 | 0.49 |
+| HC glue (combine_norm, gate_mix, silu) | 0.52 | 0.57 |
+| GDN gating-delta + conv | 0.33 | 0.68 |
+
+Reading: the int8 route holds (lm_head 189 us, (4096,2560) 16 us,
+(3584,2560) 15 us in-graph); the HC down (336,10240) is still the largest
+skinny item (96 x 12.3 us, 44 CTAs). Marlin streams ~8 experts x 3.9 MB at
+c1 and ~50 at c8 at ~800-940 GB/s: bandwidth-bound, done. Host gaps are
+gone (busy == wall). Levers left, by size: c8 collectives (skew +
+123 KB LL payloads), QSA gather at c8 (306 us per call for ~24 x 2K rows
+of 1 KB = ~160 GB/s, 2-3x headroom), a non-vectorized bf16 binary op in
+the MoE path (51/step, 19.5 us at c8), MoE glue fusion (E4), the
+single-CTA sampler (355-490 us, 2.5% c1 / 1.7% c8, below the keep bar
+alone).
+
+### 2026-09-07 E1 revisit at c8/c32 and E9 shared-expert gate fusion
+
+- E1 revisit leg (VLLM_CUSTOM_AR_PCIE_MAX_BYTES=262144 only): the worker
+  log shows "Custom allreduce is disabled ... more than two PCIe-only
+  GPUs" - the PCIe opt-in also needs VLLM_CUSTOM_AR_ALLOW_PCIE=1, so this
+  leg was a no-op and stands as the repeat baseline of the retained build:
+  c8 277.4 / 279.4 verify-steps/s, c32 258.5, c1 13.55 ms/step (e8_v2 was
+  281.6 / 275.4, 258.5, 13.46): noise ~1.5% at c8, ~0.5% at c1. The
+  corrected leg is queued after E9.
+- E9 hypothesis: the shared expert (Qwen2MoeMLP with expert_gate) ends in
+  `sigmoid(expert_gate(x)) * out`: a (1,2560) cuBLAS GEMV (dot_kernel +
+  reduce_1Block), a sigmoid and an unvectorized bf16 broadcast multiply
+  (elementwise_kernel<128,4> BinaryFunctor, 4.9 us at c1 / 19.5 us at c8)
+  = ~12 us per MoE layer at c1, ~27 us at c8, x50 layers: 0.6 ms (4.2%)
+  and 1.35 ms (4.8%). Fold the gate dot (2560 MACs per row, recomputed by
+  every program) and the sigmoid row scale into the down projection's
+  skinny kernel (ROW_GATE path); 7 launches per shared expert become 3.
+  Implementation: `_skinny_gemm_kernel` ROW_GATE/K_GATE/xg/wg, custom op
+  `qwen4_exp_skinny_gated_down_sm86(out, w_down, x, w_gate)`,
+  `Qwen4ExpSharedExpertMLP` (class-swapped onto the shared expert by
+  Qwen4ExpSparseMoeBlock; the route hook sets `sm86_gated_down` when the
+  down shape is planned and bf16). Tests: 198 passed (gated kernel vs
+  fp32 reference at split_k 1 and 4, module forward fused vs base).
+- E9 first cut (gate dot recomputed in the down kernel, leg e9_gate): c1
+  13.72 / 13.72 ms/step (+1.5% vs 13.46-13.55), c8 281.4, c32 256.5:
+  REJECTED. Microbench (e9_micro.py): the fused down took 22 us vs 8.7 us
+  for the four launches - the in-kernel gate dot walks K=2560 in BLOCK_K=32
+  chunks (80 latency-bound iterations). Quality/recall/canary all passed.
+- E9b (row scale from precomputed gate logits; e9b_micro.out): the
+  (1,2560) gate GEMV is faster on cuBLAS dot+reduce (3.0 us) than on the
+  skinny kernel (3.9 us), so it stays; the down kernel applies
+  sigmoid(g[m]) for free: 5.5 us vs 8.7 us at M<=8, and the 19.5 us
+  broadcast multiply at c8 goes away (expected +1% c1, +3.5% c8). 211
+  tests pass; leg e9b running (c1/c8/c32/c1/c8, logprob compare, recall,
+  canary).
+- E9b leg (e9b): c1 13.50 / 13.56 ms/step (flat vs 13.46-13.55), c8 274.1 /
+  267.1 verify-steps/s (-2..-4% vs 277-281), c32 261.7 (+1%); quality
+  CORRUPT 0, PPL ratio 1.0037, recall/canary PASS. No gain: either the
+  fused path is not active in the served model or the multiply it removes
+  is not the shared expert's. Checking the module tree on the meta device
+  before deciding; E1 corrected leg (VLLM_CUSTOM_AR_ALLOW_PCIE=1 + 256 KB
+  cap) runs meanwhile.
+- E1 corrected leg (VLLM_CUSTOM_AR_ALLOW_PCIE=1 + 256 KB cap, e1b): the
+  custom all-reduce enabled ("P2P must be functional") and the engine then
+  hung until "RuntimeError: cancelled" in shm_broadcast: the IPC buffer
+  registration does not work under the expandable_segments allocator the
+  record now carries. E1 was already rejected at c1; REJECTED for good and
+  not pursued further (the collectives' c8 cost is rank skew, not the LL
+  transfer).
+
+### 2026-09-07 E10: QSA sparse-gather launch shape for fp8 caches (qwen38fn-nvfp4-4)
+
+- Evidence: census_e8 c8 window - `_qsa_sparse_paged_gqa_splitk_kernel`
+  14 x 306 us = 4.3 ms of the 28 ms step (15%); microbench (qsa_micro.py,
+  fp8 KV, 6 q heads / 2 kv heads per rank, top-2048): 24 rows 258 us =
+  195 GB/s, 3 rows 39 us = 161 GB/s, i.e. a fifth of the card.
+- Hypothesis: the fp8 override (16-key tiles, 4 warps, 8 splits, 16
+  sequential gather iterations per program) is latency-bound; more bytes
+  per iteration and more programs in flight lift it.
+- Sweep (qsa_sweep.py -> qsa_sweep.out; direct split-K + merge launches,
+  parity vs the library): best block_n=64 splits=32 warps=8 stages=2 at
+  both row counts: 3 rows 39.2 -> 24.7 us (1.59x), 24 rows 227 -> 134.5 us
+  (1.69x); stages 3/4 fail to compile. Parity vs an fp32 dense reference
+  over the selected rows: 0.28-0.32% max relative error, same as the
+  library shape, with padded -1 indices.
+- Implementation: ops/qsa.py fp8 branch of qsa_sparse_paged_attention
+  (block_n 64, 8 warps, 32 splits at <= 512 base programs; prefill row
+  counts scale splits so the fp32 partial buffer stays under 64 MiB). TQ
+  keeps its shape. Test tests/models/qwen4_exp/test_qsa_fp8_gather_sm86.py
+  (rows 1/3/24/96/600, both table modes).
+- Expected: c8/c32 ~1.7 ms/step (6%), c1 ~0.16 ms (1%).
+- E10 leg (e10, with E9b still in; the boot log confirms "48 shared experts
+  with the gated down projection", so E9b IS active): c1 13.45 / 13.50
+  ms/step (flat), c8 284.3 / 274.5 verify-steps/s (flat vs 277-281; the
+  284 is the best c8 reading so far), c32 263.0 / 255.7 (flat vs 258.5);
+  quality CORRUPT 0, PPL ratio 1.0048; recall/canary PASS. A 1.6-1.7x
+  kernel gain on 15% of the c8 step should have been ~6%: measuring the
+  in-graph QSA kernel on this build with the census before judging.
+- E9b verdict: active and null (c1/c8/c32 unchanged over three legs).
+  REJECT; revert after the census.
+- E10 census (census_e10.sqlite, census_e10_windows.out): the (rows,1,32)
+  grid confirms the new shape is in the graph; the serving geometry is ONE
+  kv head per rank with a 6-head group (the sweep modelled two heads), and
+  in-graph the gather went 306 -> 275 us at c8 (-10%) and 31.6 -> 35.8 us
+  at c1 (+13%): step-level flat, as measured. Re-run at the serving
+  geometry (qsa_decode_micro.out, GPU-resident random pages over a 33 MB
+  slab): old shape 92.5 / 134 us at 3 / 24 rows, E10 shape 21.6 / 84 us,
+  so the same kernel is 1.7x (c1) to 3.3x (c8) slower in serving than on
+  the microbench's inputs; a bit-trick e4m3 decode (fp16 exponent
+  re-bias, no exp2/selects) gains only 0-12%, so the ALU decode is not the
+  limiter either. Next: reproduce the serving slowdown (address spread
+  over the 0.8 GB pool / TLB, interleaved K|V page layout, host-mapped
+  pages, index order) before touching the kernel again.
+- Spread/order/layout microbench (qsa_spread_micro.out, library path with
+  the E10 shape, serving geometry): 33 MB vs 1 GB slab, random vs sorted
+  indices, separate vs interleaved K|V pages all land at 22-26 us (3 rows)
+  and 105-121 us (24 rows). None reproduces serving's 35.8 / 275 us, so
+  the serving gather is slowed by something the microbench does not have:
+  the host-resident main KV pages read over PCIe (a minority of
+  host-mapped rows at ~25 GB/s dominates the kernel). If so the lever is
+  the GPU window (main_kv_gpu_rows), which the int8 route's freed memory
+  can now afford: E12.
+- Residency geometry (serve_e10 log): a residency row is one 16-token
+  kernel page across the attention layers = 6.5 MB; 24 GPU hot rows =
+  0.15 GiB against 572 host rows (3.46 GiB pinned); at c8 the stats show
+  537 binds / 514 demotions over 12.5K steps. Eight 1-3K-token contexts
+  need ~1500 rows (9.7 GB), so at c8 the gather is mostly PCIe reads of
+  host-mapped pages: raising main_kv_gpu_rows within the freed 0.7 GB
+  cannot change that, and the only structural lever is deduplicating the
+  three query rows' selections per request (one PCIe fetch per row) -
+  parked as a design item.
+
+### 2026-09-07 E13: decode batch 16 (qwen38fn-nvfp4-4)
+
+- Hypothesis: c32 is capped at c8's throughput (258 vs 280 verify-steps/s)
+  because max_num_seqs is 8; the weight streams (Marlin, skinny, ~12 GB
+  per step) amortize over more rows, so 16 running requests should lift
+  c32 substantially. E-max10 collapsed because its GDN pool ran at 100%
+  (thrash) and 30-row batches fell outside the captured graphs; the int8
+  route freed 0.7 GB per rank since, and capture goes to 48.
+- Leg e13: record temporarily max_num_seqs 16 / max_cudagraph_capture_size
+  48 (pools, kv_pool_deep_requests 2.0 unchanged); bench c32, c8, c1, c32;
+  preemption and residency counters; recall gate.
+- E13 leg (e13): pools [44, 195, 66, 23] (attention pool 76 -> 44 to fund
+  the GDN pool for 16 chat requests); c32 204.8 / 233.2 verify-steps/s
+  (-10..-20% vs 258-263), c8 258.1 (-7%), c1 13.48 (flat). Sixteen running
+  requests take 2.4x the step time of eight (68 vs 28 ms): the per-row
+  costs (PCIe gather, collectives, GDN state, glue) dominate, not the
+  weight streams. REJECTED; record back to 8 / 24.
+
+### 2026-09-07 E14: tensor-parallel experts instead of expert parallelism (qwen38fn-nvfp4-4)
+
+- Hypothesis: with EP4 each rank serves a different subset of the experts
+  a step routes to, so ranks finish the MoE at different times and the
+  in-graph all-reduces absorb the skew (c1: 103 x 23 us against a ~10 us
+  LL floor = ~1.4 ms/step; c8: 103 x 48 us = ~4 ms) and the 7 all-gathers
+  per step are EP dispatch. Sharding every expert across the 4 ranks
+  (enable_expert_parallel false) streams the same bytes per rank on
+  average but balances them exactly and removes the dispatch. Risk:
+  Marlin tiles on N/4-wide expert shards, and the router/glue runs on
+  every rank for all tokens.
+- Leg e14: record temporarily enable_expert_parallel false; bench c1, c8,
+  c32, c1, c8; recall gate.
+- E14 leg (e14): BOOT FAILED - OOM in process_weights_after_loading
+  (Marlin NVFP4 repack, `permute_scales`) with 22.4 GiB already allocated
+  per rank: tensor-parallel experts keep all 512 experts per rank at
+  quarter width and the Marlin tiles pad the 160-wide shards, so the
+  weights alone exceed the card. REJECTED as infeasible on 24 GB; record
+  back to enable_expert_parallel true. Config levers are exhausted
+  (E1, E12, E13, E14); the remaining items are kernels: the sampler,
+  MoE glue fusion (E4), the QSA per-request gather dedup.
+
+### 2026-09-07 E15: small-k sampler fast path (qwen38fn-nvfp4-4)
+
+- Evidence: `_topk_topp_kernel` runs once per step from ONE program per
+  row over the 248K vocabulary: 355 us at c1, 469-490 us at c8/c32 in the
+  census (2.5% / 1.7% of the step), the same at any batch.
+- Design: when the batch's largest k (known CPU-side in
+  gpu/sample/states.py, no sync) is <= 32: (1) 64 programs per row
+  extract their vocabulary slice's top round8(max_k) candidates
+  (sequential max/argmax over a 4096 tile), (2) one program per row
+  extracts the top-k of the candidates in order, applies the top-p prefix
+  rule (softmax over the survivors; keep while the mass strictly above is
+  < p, the largest always) and emits the pivot logit, (3) a masking pass
+  writes -inf below the pivot in place. Exact ties at the pivot are kept
+  (the reference's sort drops an arbitrary subset). Rows with top-k
+  disabled carry k == vocab and push the batch past the cap, so the
+  generic kernel keeps serving them.
+- Parity (tests/v1/sample/test_topk_topp_fast_path.py, 13 tests): kept
+  sets equal to apply_top_k_top_p_pytorch at batch 1/3/8/24, mixed k and
+  p, and the >32 fallback.
+- Microbench (sampler_micro.out, sampler_sweep.out): 64 splits x 4 warps
+  38 / 51 / 97 / 225 us at batch 1 / 3 / 8 / 24 vs 386-436 us generic.
+  Expected: c1 -0.3 ms (2.2%), c8/c32 -0.25 ms (0.9%): below the keep bar
+  on its own; measured on the leg before judging.
+- E15 leg (e15): c1 13.16 / 13.28 ms/step (-2.1% vs 13.46 / 13.55), c8
+  286.0 / 271.3 verify-steps/s (noise around 277-284), c32 261.7 (flat);
+  recall and canary PASS. Real and counter-backed (the sampler launch is
+  ~50 us instead of 355), but the sampler was 2.5% of the step, so the
+  gain cannot reach the handbook's 3% low-risk bar. REJECTED/DEFERRED
+  per the decide rule; source reverted, the implementation and its parity
+  test kept under perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/
+  (e15_patch.py in the session scratch, test_topk_topp_fast_path.py) to
+  revive if the step shrinks enough for 0.3 ms to clear the bar.
+
+### 2026-09-07 closing assessment of the qwen38fn-nvfp4-4 loop
+
+Retained build (record + working tree, uncommitted): skinny bf16/int8 dense
+route with the re-swept tables (E2/E2e/E2f/E8), drain kill (E7a), bf16 GDN
+state (E-GDN), multi-pool packed slab (E5b), expandable-segments allocator,
+TP-consistent budgeted prompt-logprob chunks. Cumulative vs the 2026-09-07
+baseline: c1 16.81 -> 13.46 ms/step (-20%), c8 166.8 -> 282 verify-steps/s
+(+69%), c32 180.8 -> 259 (+43%); gates: recall 18K/54K/144K, image canary,
+tier restore, prompt-logprob parity (no corrupted texts, PPL +0.1-0.4%).
+
+Rejected today with measurements: E1 (custom AR, and incompatible with
+VMM), E3 (HC fusion, 0), E9/E9b (shared-expert gate fusion, 0), E10 (QSA
+gather shape, -10% kernel in serving because the gather is PCIe-bound),
+E13 (batch 16, -10..-20% c32), E14 (TP experts, OOM), E15 (sampler fast
+path, -2.1% c1: real but under the 3% bar; archived).
+
+Remaining levers, all below their keep bars on the census_e10 numbers:
+| lever | predicted | bar |
+|---|---:|---:|
+| E15 sampler fast path (archived) | c1 -2.1% | 3% low-risk |
+| E4a fused MoE prologue (router top-k + align, one launch) | c1 -3.6% | 8-10% |
+| E4b fused moe_sum + shared-expert combine | c1 -1.5% | 8-10% |
+| horizontal fusion of same-input small GEMMs (GDN B/A+QKVZ, router+shared gate_up) | c1 -2.5% | 8-10% |
+| QSA per-request gather dedup (one PCIe fetch for the 3 verify rows) | c8/c32 -6% | 8-10% |
+The step is now dominated by bandwidth-bound weight streams (skinny 4.5 ms
++ Marlin 1.6 ms at 85-94% of peak) and collective rank skew (2.7 ms at
+c1, 6.3 ms at c8), neither of which a kernel-level change on this box
+moves by 8%. Stopping the loop here; the sub-bar items are documented for
+a future pass if the bar is relaxed or the step shrinks.
+Production (:8000) runs the working tree of 08:13 (auto-restart after the
+prompt-logprob OOM): skinny bf16 route, drain kill, bf16 GDN state, pools;
+it does NOT yet have the int8 route (record env added after 08:13) - a
+restart is the operator's call.
+
 ## 2026-09-07 - Main-KV tier reclaim hazard closed: slot holds that outlive the request
 
 - The hazard (recorded open in the 2026-09-06 8-GPU entry, shared by the

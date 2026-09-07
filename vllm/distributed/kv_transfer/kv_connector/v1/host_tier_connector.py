@@ -202,11 +202,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for t in kv_cache_config.kv_cache_tensors
             if t.block_stride and not getattr(t, "host_resident", False)
         }
+        # Multi-pool packed slab: pool 0 (attention-class) sets the arena row;
+        # the other pools' blocks are smaller and copy their own stride.
+        self._pool_strides: dict[int, int] = {
+            int(getattr(t, "pool", 0)): t.block_stride
+            for t in kv_cache_config.kv_cache_tensors
+            if t.block_stride and not getattr(t, "host_resident", False)
+        }
+        _pool_of = getattr(kv_cache_config, "pool_of_group", None)
+        self._gid_pool: dict[int, int] = {
+            gid: (_pool_of(gid) if _pool_of is not None else 0)
+            for gid in range(len(kv_cache_config.kv_cache_groups))
+        }
         if packed_strides:
-            assert len(packed_strides) == 1, (
+            assert len(packed_strides) == len(self._pool_strides), (
                 f"host-tier: mixed packed block strides {packed_strides}"
             )
-            self.block_stride = packed_strides.pop()
+            self.block_stride = max(packed_strides)
         else:
             self.block_stride, _ = _get_packed_kv_cache_layout(
                 kv_cache_config.kv_cache_groups
@@ -370,7 +382,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     total += spec.kv_cache_specs[layer_name].page_size_bytes
                 else:
                     total += spec.page_size_bytes
-            self._group_nbytes[gid] = min(total, self.block_stride)
+            self._group_nbytes[gid] = min(
+                total, self._pool_strides.get(self._gid_pool.get(gid, 0), self.block_stride)
+            )
 
         if role == KVConnectorRole.SCHEDULER:
             logger.info(
@@ -434,6 +448,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self._last_step_write_slots: list[int] = []
             self._offload_seq = 0
             self._block_pool = None
+            self._state_pool = None
             # State blocks ref-pinned for in-flight tail saves, released one
             # meta build after their copies were issued (same in-order-stream
             # window as slot confirmation). Two-phase: staged -> issued.
@@ -446,6 +461,26 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         self._block_pool = gpu_block_pool
+        self._state_pool = gpu_block_pool
+
+    def bind_gpu_block_pools(self, pools, kv_cache_config) -> None:
+        """Multi-pool slab: the boundary-state (mamba) blocks live in their
+        groups' pool, which is where tail pins and cached-block lookups go."""
+        self._block_pool = pools[0]
+        self._state_pool = (
+            pools[self._gid_pool.get(self.state_groups[0], 0)]
+            if self.state_groups
+            else pools[0]
+        )
+        # State groups may span pools (12-layer and 1-layer GDN groups):
+        # boundary-state lookups and pins go to each group's own pool.
+        self._state_group_pools = [
+            pools[self._gid_pool.get(gid, 0)] for gid in self.state_groups
+        ]
+
+    def _state_pool_for(self, tier_gid: int):
+        pools = getattr(self, "_state_group_pools", None)
+        return pools[tier_gid] if pools else self._state_pool
 
     # ==================================================================
     # Scheduler side
@@ -836,9 +871,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     tagged.append((host_slot, disk_slot, kv_gid))
                 self._staged_disk_writes[self._offload_seq] = tagged
                 self._disk_write_batches[self._offload_seq] = writes
-        if self._pins_issued and self._block_pool is not None:
+        if self._pins_issued and self._state_pool is not None:
             for pin_blocks in self._pins_issued:
-                self._block_pool.free_blocks(pin_blocks)
+                for tier_gid, blk in enumerate(pin_blocks):
+                    self._state_pool_for(tier_gid).free_blocks([blk])
         self._pins_issued, self._pins_staged = self._pins_staged, []
 
         self._absorb_block_allocations(scheduler_output)
@@ -947,7 +983,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         finished_owner = self._owner(request, track)
         del track
         bs = self.hash_block_size
-        if not self.state_groups or self._block_pool is None:
+        if not self.state_groups or self._state_pool is None:
             return False, None
         max_boundary = min(request.num_computed_tokens // bs, len(request.block_hashes))
         if max_boundary <= 0:
@@ -964,9 +1000,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         for j in range(max_boundary, scan_floor - 1, -1):
             if j % self._resume_align != 0:
                 continue  # a wider attention group's block is incomplete
-            cached = self._block_pool.get_cached_block(
-                request.block_hashes[j - 1], self.state_groups
-            )
+            cached = []
+            for tier_gid, gid in enumerate(self.state_groups):
+                hit = self._state_pool_for(tier_gid).get_cached_block(
+                    request.block_hashes[j - 1], [gid]
+                )
+                if not hit:
+                    cached = []
+                    break
+                cached.extend(hit)
             if cached:
                 boundary = j
                 targets = [blk.block_id for blk in cached]
@@ -991,8 +1033,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if slots is None:
             return False, None
-        pin_blocks = [self._block_pool.blocks[b] for b in targets]
-        self._block_pool.touch(pin_blocks)
+        pin_blocks = [
+            self._state_pool_for(tier_gid).blocks[b] for tier_gid, b in enumerate(targets)
+        ]
+        for tier_gid, blk in enumerate(pin_blocks):
+            self._state_pool_for(tier_gid).touch([blk])
         self._pins_staged.append(pin_blocks)
         ops = [
             (targets[tier_gid], slots[tier_gid], self.state_groups[tier_gid])
@@ -1024,8 +1069,44 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             key = st.data_ptr()
             by_storage.setdefault(key, []).append(name)
             storages[key] = (st, t.device)
-        packed_key = max(by_storage, key=lambda k: len(by_storage[k]))
-        outside = {k: v for k, v in by_storage.items() if k != packed_key}
+        # Multi-pool slab: pool 0 (attention-class) is the arena-row slab;
+        # the other pools' storages are packed backings of their own stride,
+        # tier-managed through the DMA's pool views. Without pools the slab
+        # is the storage shared by the most layers.
+        layer_gid = {
+            name: gid
+            for gid, g in enumerate(self._kv_cache_config.kv_cache_groups)
+            for name in g.layer_names
+        }
+        # Host-resident main-KV layers share the residency's GPU hot window,
+        # which is not a packed slab; never pick it as the pool-0 backing.
+        host_resident_layers = {
+            n
+            for t in self._kv_cache_config.kv_cache_tensors
+            if getattr(t, "host_resident", False)
+            for n in t.shared_by
+        }
+        storage_pool: dict[int, int | None] = {}
+        for key, names in by_storage.items():
+            if all(n in host_resident_layers for n in names):
+                storage_pool[key] = None
+                continue
+            pools = {self._gid_pool.get(layer_gid.get(n, 0), 0) for n in names}
+            storage_pool[key] = pools.pop() if len(pools) == 1 else None
+        pool0_keys = [k for k, pl in storage_pool.items() if pl == 0]
+        if len(self._pool_strides) > 1 and pool0_keys:
+            packed_key = max(pool0_keys, key=lambda k: len(by_storage[k]))
+        else:
+            packed_key = max(by_storage, key=lambda k: len(by_storage[k]))
+        pool_keys: dict[int, int] = {}
+        for key, pool in storage_pool.items():
+            if key != packed_key and pool is not None and pool > 0 and pool in self._pool_strides:
+                pool_keys[pool] = key
+        outside = {
+            k: v
+            for k, v in by_storage.items()
+            if k != packed_key and k not in pool_keys.values()
+        }
         if outside:
             logger.warning(
                 "host-tier: %d layers live outside the packed slab and are "
@@ -1053,6 +1134,19 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             from vllm.v1.worker.gpu.kv_tier_nvme import NvmeTierFile, default_tier_dir
 
             disk = NvmeTierFile(default_tier_dir(), self.num_disk_slots, self.row_bytes)
+        pool_backings: dict[int, tuple[torch.Tensor, int]] = {}
+        for pool, key in pool_keys.items():
+            pstorage, _ = storages[key]
+            pb = torch.empty(0, dtype=torch.int8, device=device)
+            pb.set_(pstorage)
+            pool_backings[pool] = (pb, self._pool_strides[pool])
+            logger.info(
+                "host-tier: pool %d packed slab (%d layers, %d bytes, stride %d)",
+                pool,
+                len(by_storage[key]),
+                pb.numel(),
+                self._pool_strides[pool],
+            )
         self._dma = KVTierDMA(
             backing,
             self.block_stride,
@@ -1060,6 +1154,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             any_tensor.device,
             group_nbytes=self._group_nbytes,
             disk=disk,
+            pool_backings=pool_backings,
+            gid_pool=self._gid_pool,
         )
         # Milestone 4: the main-KV tier slots live in a second pinned arena
         # owned by the residency (its demotions land there directly).

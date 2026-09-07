@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 from collections import Counter
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum, IntEnum
 from math import prod
 from typing import TYPE_CHECKING
@@ -1051,6 +1051,9 @@ class KVCacheTensor:
     # row = block_size / sub_blocks) so the GPU hot window holds tails, not
     # whole 10K-token blocks.
     sub_blocks: int = 1
+    # Block pool this tensor's blocks are drawn from (multi-pool packed slab:
+    # one pool per page-size class; 0 = the attention-class stride).
+    pool: int = 0
 
 
 @dataclass
@@ -1086,6 +1089,21 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    # Multi-pool packed slab (docs/host_resident_kv_design.md, E5b): block
+    # ids of each group come from `group_pool[gid]`; `pool_num_blocks[p]` is
+    # that pool's size. Empty = one pool of `num_blocks` (the default).
+    pool_num_blocks: list[int] = field(default_factory=list)
+    group_pool: list[int] = field(default_factory=list)
+
+    @property
+    def num_pools(self) -> int:
+        return len(self.pool_num_blocks) if self.pool_num_blocks else 1
+
+    def pool_of_group(self, gid: int) -> int:
+        return self.group_pool[gid] if self.group_pool else 0
+
+    def blocks_in_pool(self, pool: int) -> int:
+        return self.pool_num_blocks[pool] if self.pool_num_blocks else self.num_blocks
 
     @property
     def has_mamba_layers(self) -> bool:

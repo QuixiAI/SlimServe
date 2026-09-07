@@ -1073,10 +1073,13 @@ def qsa_sparse_paged_attention(
         # In-register dequant is ALU-heavy: wide tiles with 2 warps cannot
         # hide it (measured 3.8x for TQ and 23x for arithmetic-e4m3 at 48
         # rows on SM86). Keep narrow tiles and 4 warps for quantized KV.
+        # (E10, 2026-09-07: 64-key tiles / 32 splits / 8 warps were 1.7x on
+        # a GPU-resident microbench but only 306 -> 275 us in serving at c8
+        # and slower at c1, because the serving gather reads host-resident
+        # pages over PCIe; perf/optimization_status.md.)
         if block_n > 16:
             block_n, partial_warps = 16, 4
             target_splits = max(target_splits, 8)
-
     num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
     # Avoid empty splits when the selection width is smaller than the profile.
     max_useful_splits = 1 << (num_tiles.bit_length() - 1)

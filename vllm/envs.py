@@ -147,6 +147,9 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_CUSTOM_AR_PCIE_MAX_BYTES: int = 0
+    VLLM_QWEN4_EXP_SKINNY_GEMM: bool = False
+    VLLM_QWEN4_EXP_SKINNY_W8: bool = False
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1281,6 +1284,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # without that the P2P probe fails and the gate below still disables it.
     "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
         os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
+    ),
+    # PCIe-only custom allreduce: payloads above this many bytes fall back to
+    # NCCL (0 = no extra cap). The one-shot kernel reads every peer's slice,
+    # so it wins only at decode-size payloads: on 4x RTX 3090 (PCIe P2P)
+    # 24-25 us vs NCCL 40 us at <=16 KiB, 50+ us from 40 KiB up.
+    "VLLM_CUSTOM_AR_PCIE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_CUSTOM_AR_PCIE_MAX_BYTES", "0")
+    ),
+    # Qwen4Exp on SM 8.6: route the bf16 decode projections through the
+    # weight-stationary Triton skinny GEMMs (models/qwen4_exp/nvidia/
+    # skinny_gemm_sm86.py). Registered here so it is part of the
+    # torch.compile cache key: a cached decode graph otherwise keeps cuBLAS.
+    "VLLM_QWEN4_EXP_SKINNY_GEMM": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_GEMM", "0").lower() in ("1", "true")
+    ),
+    # int8 weight-only storage for the skinny-routed linears (E8); a
+    # compile factor for the same reason.
+    "VLLM_QWEN4_EXP_SKINNY_W8": lambda: (
+        os.getenv("VLLM_QWEN4_EXP_SKINNY_W8", "0").lower() in ("1", "true")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

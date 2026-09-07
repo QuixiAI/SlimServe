@@ -314,17 +314,19 @@ class MainKVResidency:
         if self._changed:
             changed = sorted(set(self._changed))
             gpu_bound = [b for b in changed if self.row_of_block[b] >= 0]
+            # Pinned staging: non_blocking from pageable memory still blocks
+            # the host behind the stream (the drain lesson, 2026-09-07).
             if gpu_bound:
-                idx = torch.tensor(gpu_bound, dtype=torch.int64)
-                rows = torch.from_numpy(self.row_of_block[idx.numpy()])
+                idx = torch.tensor(gpu_bound, dtype=torch.int64, pin_memory=True)
+                rows = torch.from_numpy(self.row_of_block[idx.numpy()].astype("int64"))
                 idx_dev = idx.to(self.device, non_blocking=True)
-                self.page_delta[idx_dev] = (rows.to(torch.int64) * self.row_bytes).to(
+                self.page_delta[idx_dev] = (rows * self.row_bytes).pin_memory().to(
                     self.device, non_blocking=True
                 )
-            idx_all = torch.tensor(changed, dtype=torch.int64)
+            idx_all = torch.tensor(changed, dtype=torch.int64, pin_memory=True)
             self.row_of_block_dev[idx_all.to(self.device, non_blocking=True)] = torch.from_numpy(
                 self.row_of_block[idx_all.numpy()]
-            ).to(self.device, non_blocking=True)
+            ).pin_memory().to(self.device, non_blocking=True)
         # Page offsets at row (kernel page) granularity: scheduler block b
         # owns rows b*sub .. b*sub+sub-1; null entries keep the sentinel.
         sub = self.sub_blocks

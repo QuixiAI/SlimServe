@@ -642,6 +642,17 @@ class Qwen4ExpForCausalLM(
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
+        from .skinny_gemm_sm86 import enable_qwen4_exp_skinny_gemm_sm86
+
+        routed = enable_qwen4_exp_skinny_gemm_sm86(self, self.model_config.dtype)
+        if routed:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "Qwen4Exp SM86 skinny GEMM route on for %d linears (%d shapes)",
+                len(routed),
+                len(set(routed)),
+            )
 
     @staticmethod
     def get_model_state_cls():

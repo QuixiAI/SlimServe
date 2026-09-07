@@ -173,7 +173,9 @@ def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-    packed_backing: torch.Tensor | None = None
+    # One packed backing per block pool (multi-pool slab: each page-size
+    # class has its own stride and block count).
+    packed_backings: dict[int, torch.Tensor] = {}
     residency = None
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if getattr(kv_cache_tensor, "host_resident", False):
@@ -198,12 +200,13 @@ def _allocate_kv_cache(
                 set_main_kv_residency(residency)
             tensor = residency.layer_raw()
         elif kv_cache_tensor.block_stride > 0:
-            # Allocate once; all packed tensors alias the same backing.
-            if packed_backing is None:
-                packed_backing = torch.zeros(
+            # Allocate once per pool; packed tensors of a pool alias its backing.
+            pool = int(getattr(kv_cache_tensor, "pool", 0))
+            if pool not in packed_backings:
+                packed_backings[pool] = torch.zeros(
                     kv_cache_tensor.size, dtype=torch.int8, device=device
                 )
-            tensor = packed_backing
+            tensor = packed_backings[pool]
         else:
             tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:

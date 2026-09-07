@@ -832,16 +832,19 @@ def test_a_profile_is_one_config_per_platform():
 
 def test_no_profile_carries_another_platforms_environment():
     """A ROCm switch on an a100 or Metal record is a config that leaked."""
+    # Token -> the platforms it belongs to. CUDA_ keys belong to every CUDA
+    # platform (a100 and rtx3090 both run PyTorch's CUDA allocator).
     marker = {
-        "mi300x": ("ROCM", "AITER", "HIP_"),
-        "a100": ("CUDA_",),
+        ("mi300x",): ("ROCM", "AITER", "HIP_"),
+        ("a100", "rtx3090"): ("CUDA_",),
     }
     for profile_id, entry in registry._registry()["profiles"].items():
         for platform, record in entry["variants"].items():
             for key in record.get("env") or {}:
-                for owner, tokens in marker.items():
-                    if owner == platform:
+                for owners, tokens in marker.items():
+                    if platform in owners:
                         continue
+                    owner = "/".join(owners)
                     assert not any(tok in key for tok in tokens), (
                         f"{profile_id}/{platform} sets {key}, which belongs to {owner}"
                     )

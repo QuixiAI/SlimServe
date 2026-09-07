@@ -156,10 +156,20 @@ class KVTierDMA:
         device: torch.device,
         group_nbytes: dict[int, int] | None = None,
         disk: NvmeTierFile | None = None,
+        pool_backings: dict[int, tuple[torch.Tensor, int]] | None = None,
+        gid_pool: dict[int, int] | None = None,
     ):
         assert backing.dtype == torch.int8 and backing.is_cuda
         assert backing.numel() % block_stride == 0
         self.blocks = backing.view(-1, block_stride)
+        # Multi-pool packed slab: other page-size classes keep their own
+        # (smaller) backing; ops carry the group id, which selects the view.
+        self._pool_blocks: dict[int, torch.Tensor] = {0: self.blocks}
+        for pool, (pb, pstride) in (pool_backings or {}).items():
+            assert pb.dtype == torch.int8 and pb.is_cuda and pb.numel() % pstride == 0
+            assert pstride <= block_stride, "pool stride exceeds the arena row"
+            self._pool_blocks[pool] = pb.view(-1, pstride)
+        self._gid_pool = dict(gid_pool or {})
         self.disk = disk
         if disk is not None:
             assert disk.slot_bytes == padded_stride(block_stride)
@@ -324,6 +334,10 @@ class KVTierDMA:
         inv, self._invalid_blocks = self._invalid_blocks, set()
         return inv
 
+    def _blocks_for(self, gid: int) -> torch.Tensor:
+        """Block view of the pool that owns KV-cache group `gid`."""
+        return self._pool_blocks.get(self._gid_pool.get(gid, 0), self.blocks)
+
     def _issue_copies(self, batch: TierOpBatch) -> None:
         """Enqueue a batch of copies on the copy stream (and its disk
         write-through, which waits on the producing copies' events)."""
@@ -352,13 +366,13 @@ class KVTierDMA:
             for gpu_block, slot, gid in batch.offload:
                 n = self._group_nbytes.get(gid, self._stride)
                 self.arena[slot][:n].copy_(
-                    self.blocks[gpu_block][:n], non_blocking=True
+                    self._blocks_for(gid)[gpu_block][:n], non_blocking=True
                 )
             for gpu_block in batch.zero:
                 self.blocks[gpu_block].zero_()
             for slot, gpu_block, gid in batch.restore:
                 n = self._group_nbytes.get(gid, self._stride)
-                self.blocks[gpu_block][:n].copy_(
+                self._blocks_for(gid)[gpu_block][:n].copy_(
                     self.arena[slot][:n], non_blocking=True
                 )
             event = torch.cuda.Event()
@@ -416,7 +430,7 @@ class KVTierDMA:
         for slot, gpu_block, gid in batch.restore:
             n = self._group_nbytes.get(gid, self._stride)
             expect = self._slot_digests.get(slot)
-            got = _digest(self.blocks[gpu_block][:n])
+            got = _digest(self._blocks_for(gid)[gpu_block][:n])
             host = _digest(self.arena[slot][:n])
             if expect is not None and got != expect:
                 bad += 1

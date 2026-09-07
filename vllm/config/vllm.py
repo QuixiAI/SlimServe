@@ -337,8 +337,15 @@ def _v2_runner_kernels_available() -> bool:
     except Exception:
         return False
 
+# KV connectors that move KV with ordinary stream-ordered copies and never pin
+# or register GPU memory (no IB memory regions), hence compatible with
+# PyTorch's expandable_segments (VMM) allocator.
+_VMM_SAFE_KV_CONNECTORS = frozenset({"HostTierConnector"})
+
+
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
+
 class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
@@ -1007,6 +1014,14 @@ class VllmConfig:
         ):
             return
         if self.model_config is not None and (self.model_config.enable_cumem_allocator):
+            return
+        # Connectors that never register GPU memory with a NIC are safe: the
+        # host tier moves KV with stream-ordered copies on live tensors, whose
+        # virtual addresses stay mapped for the tensor's lifetime under VMM.
+        # expandable_segments is what keeps a 0.975-utilization rank from
+        # fragmenting into an OOM after variable-size transients
+        # (perf/optimization_status.md, 2026-09-07).
+        if self.kv_transfer_config.kv_connector in _VMM_SAFE_KV_CONNECTORS:
             return
 
         raise ValueError(

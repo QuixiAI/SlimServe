@@ -166,14 +166,17 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        pool_id: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        # Multi-pool packed slab: blocks carry their pool so frees route back.
+        self.pool_id = pool_id
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
-            KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+            KVCacheBlock(idx, pool_id=pool_id) for idx in range(num_gpu_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is

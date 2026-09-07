@@ -210,6 +210,41 @@ def get_prompt_logprobs_token_ids(
     return token_ids
 
 
+_FIRST_CHUNK = 8
+# 64 tokens: <= 64 MiB of gathered fp32 logits per chunk plus temporaries.
+# Larger chunks (the old fixed 1024) fragmented the caching allocator so a
+# later prefill could not get a 128 MiB block at 0.975 utilization.
+_MAX_CHUNK = 64
+# Per token: the gathered fp32 logits, the local shard, and the top-k /
+# log-softmax temporaries of compute_topk_scores (~4x the logits row).
+_BYTES_PER_TOKEN_PER_VOCAB = 4 * 4
+
+
+def _chunk_for_budget(vocab_size: int, device: torch.device) -> int:
+    """Prompt-logprob chunk (tokens) that fits half of the memory currently
+    free on the device (device free + the caching allocator's idle
+    reserve)."""
+    if device.type != "cuda":
+        return _MAX_CHUNK
+    free_device, _ = torch.cuda.mem_get_info(device)
+    idle_reserved = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    budget = (free_device + max(idle_reserved, 0)) // 2
+    per_token = max(vocab_size, 1) * _BYTES_PER_TOKEN_PER_VOCAB
+    chunk = int(max(_FIRST_CHUNK, min(_MAX_CHUNK, budget // per_token)))
+    # The logits all-gather needs every TP rank to use the SAME chunk: a
+    # per-rank budget misaligns the gathered rows (garbage logprobs for the
+    # rest of the prompt) or deadlocks when the chunk counts differ
+    # (2026-09-07: both seen on the 4x3090 record). Agree on the minimum.
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    if tp.world_size > 1:
+        t = torch.tensor([chunk], dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=tp.device_group)
+        chunk = int(t.item())
+    return chunk
+
+
 def compute_prompt_logprobs_with_chunking(
     prompt_token_ids: torch.Tensor,
     prompt_hidden_states: torch.Tensor,
@@ -218,17 +253,25 @@ def compute_prompt_logprobs_with_chunking(
     logprobs_mode: LogprobsMode = "raw_logprobs",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
-    # we compute it in chunks.
-    CHUNK_SIZE = 1024
+    # we compute it in chunks. The chunk is sized from the memory actually
+    # free on the device: with a 0.975 utilization the slack past the KV
+    # pools is tens of MB, and a fixed 1024-token chunk (1 GB of fp32
+    # full-vocab logits after the TP gather) OOM-killed the production
+    # worker on 2026-09-07. The first chunk is small so the vocab width is
+    # known before the budget is applied.
     token_ids = []
     scores = []
     ranks = []
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, prompt_token_ids.shape[0], CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
+    num_tokens = prompt_token_ids.shape[0]
+    start_idx = 0
+    chunk_size = _FIRST_CHUNK
+    while start_idx < num_tokens:
+        end_idx = min(start_idx + chunk_size, num_tokens)
         # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
         prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        chunk_size = _chunk_for_budget(prompt_logits.shape[-1], prompt_logits.device)
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
@@ -243,6 +286,7 @@ def compute_prompt_logprobs_with_chunking(
         token_ids.append(result.logprob_token_ids)
         scores.append(result.logprobs)
         ranks.append(result.selected_token_ranks)
+        start_idx = end_idx
 
     token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
     scores = torch.cat(scores, dim=0) if len(scores) > 1 else scores[0]
