@@ -402,6 +402,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self._staged_main_rebinds: dict[str, list[tuple[int, int]]] = {}
             self._staged_main_release: list[int] = []
             self._last_step_main_slots: list[int] = []
+            self._last_step_main_blocks: list[tuple[int, int]] = []
             if self._resume_align > 1:
                 logger.info(
                     "host-tier: attention block ratios %s; resume boundaries "
@@ -416,7 +417,6 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self.row_bytes,
                 )
             self._staged_disk_writes: dict[int, list[tuple[int, int]]] = {}
-            self._last_step_main_blocks: list[tuple[int, int]] = []
             self._staged_disk_reads: dict[str, list[tuple[int, int]]] = {}
             # Write-through batches awaiting every rank's completion report.
             self._disk_write_batches: dict[int, list[tuple[int, int]]] = {}
@@ -615,6 +615,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     (track.planned_attn_slots[logical][gid], gb[gidx], gid)
                 )
                 if gid == self._main_gid and track.planned_main_slots:
+                    slot = track.planned_main_slots[logical]
                     self._staged_main_rebinds.setdefault(
                         request.request_id, []
                     ).append((gb[gidx], slot))
@@ -655,7 +656,6 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid in self.ring_groups:
                 zero_blocks.extend(b for b in track.group_blocks[gid] if b > 0)
         if ops:
-                    slot = track.planned_main_slots[logical]
             self._staged_restores.setdefault(request.request_id, []).extend(ops)
             if track.disk_reads:
                 self._staged_disk_reads.setdefault(request.request_id, []).extend(
@@ -711,11 +711,17 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 continue
             if logical < len(track.planned_main_slots):
                 continue  # restored position: rebound, not reserved
+            fresh = gidx >= computed_blocks
+            if fresh:
+                self.index.unhold_main(block_id)
             slot = self.index.reserve_main_slot(owner, logical)
             if slot is None:
+                if fresh and block_id not in self._staged_main_homes:
+                    self._staged_main_release.append(block_id)
                 continue
             track.main_slots[logical] = slot
             self._staged_main_homes[block_id] = slot
+            self.index.hold_main(block_id, slot)
 
     def _absorb_block_allocations(self, scheduler_output: SchedulerOutput) -> None:
         for new_req in scheduler_output.scheduled_new_reqs:
@@ -749,17 +755,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             track = self._tracks.get(req_id)
             request = self._requests.get(req_id)
             if track is None or request is None:
-            fresh = gidx >= computed_blocks
-            if fresh:
-                self.index.unhold_main(block_id)
                 continue
             n_full = min(
-                if fresh and block_id not in self._staged_main_homes:
-                    self._staged_main_release.append(block_id)
                 request.num_computed_tokens // bs,
                 len(request.block_hashes),
                 min(
-            self.index.hold_main(block_id, slot)
                     (
                         len(track.group_blocks[g]) * self._attn_ratio[g]
                         for g in self.attn_groups
@@ -797,11 +797,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                             if main is not None:
                                 track.main_slots[logical] = main
                                 self._staged_main_homes[block_id] = main
+                                self.index.hold_main(block_id, main)
                         if main is not None:
                             self._staged_main_flush.setdefault(
                                 self._offload_seq + 1, []
                             ).append((block_id, main))
                             self._last_step_main_slots.append(main)
+                            self._last_step_main_blocks.append((block_id, main))
                 if ops:
                     self._offload_seq += 1
                     self._staged_offloads[self._offload_seq] = ops
@@ -814,6 +816,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self.index.confirm_writes(confirmed)
         if self._main_kv_tiered:
             main_done, self._last_step_main_slots = self._last_step_main_slots, []
+            moved, self._last_step_main_blocks = self._last_step_main_blocks, []
+            # A confirmed flush moved the block's rows into its slot: any
+            # older slot the rows pointed at (a prefix-cache hit re-homed
+            # into this lineage) no longer needs the hold.
+            for block_id, slot in moved:
+                self.index.unhold_main(block_id, keep=slot)
             self.index.confirm_main(main_done)
         if self.num_disk_slots and confirmed:
             writes = self.index.take_disk_writes(confirmed)
@@ -832,13 +840,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for pin_blocks in self._pins_issued:
                 self._block_pool.free_blocks(pin_blocks)
         self._pins_issued, self._pins_staged = self._pins_staged, []
-                                self.index.hold_main(block_id, main)
 
         self._absorb_block_allocations(scheduler_output)
         self._stage_filled_attention_blocks(scheduler_output)
         meta = HostTierMeta(
             restores=self._staged_restores,
-                            self._last_step_main_blocks.append((block_id, main))
             offloads=self._staged_offloads,
             zeros=self._staged_zeros,
             disk_writes=self._staged_disk_writes,
@@ -851,12 +857,6 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self._staged_restores = {}
         self._staged_offloads = {}
         self._staged_zeros = {}
-            moved, self._last_step_main_blocks = self._last_step_main_blocks, []
-            # A confirmed flush moved the block's rows into its slot: any
-            # older slot the rows pointed at (a prefix-cache hit re-homed
-            # into this lineage) no longer needs the hold.
-            for block_id, slot in moved:
-                self.index.unhold_main(block_id, keep=slot)
         self._staged_disk_writes = {}
         self._staged_disk_reads = {}
         self._staged_main_homes = {}
@@ -918,6 +918,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 gidx = logical // ratio
                 if slot in freed and gidx < len(blocks) and blocks[gidx] >= 0:
                     self._staged_main_release.append(blocks[gidx])
+                    self.index.unhold_main(blocks[gidx])
 
     def request_finished_all_groups(
         self, request: Request, block_ids: tuple[list[int], ...]
@@ -954,7 +955,6 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # Frozen states materialize only at positions that were a chunk-end
         # column at some scheduling step (this fork's align mode keeps ONE
         # live column per chunk; intermediate positions stay null and
-                    self.index.unhold_main(blocks[gidx])
         # cache_full_blocks skips them). Scan down from the last full block
         # to the deepest boundary every mamba group actually has cached; the
         # gap above it (at most one prefill chunk) re-prefills on resume.
