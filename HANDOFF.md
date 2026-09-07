@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-05 00:40; Phase 1 in progress, MTP merged, Release rebuild shipped)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07; Phase 1 in progress, MTP merged, routing NaN root cause fixed)
 
 ## Mission
 
@@ -70,28 +70,36 @@ physics, research digest and phase gates are in
   faulty mHC launcher; the Release rebuild of 22:40-23:52 ships only the
   routing binding (`glm_route_align`) and is VALIDATED for serving (24
   parity tests, exact-token 110.5 / 448 / 599 with gates in band, no hook).
-  OPEN ISSUE: profiler boots (`--torch-profile-dir`) with the native
-  routing binding race into an illegal memory access before the first
-  request; profile with `QC_DEV_ROUTE=1 PYTHONPATH=/raid/scratch/
-  slimserve-glm53/jit/site` (JIT kernel) or `SLIMSERVE_GLM_ROUTE_ALIGN=0`
-  until it is explained (notebook entry of 2026-09-05). Pre-rebuild
-  extensions are in `/raid/scratch/slimserve-glm53/so-backup-20260904/`.
+  RESOLVED 2026-09-07 (notebook entry of that date): every illegal memory
+  access since 2026-09-04 21:51 (five `Xid 31` faults, one rank each) was
+  the fused routing kernel not being total over NaN logits: vLLM's dummy
+  runs (capture warmups, sampler warmup) carry NaN activations, the kernel
+  selected "expert 288" and laid assignments after padding, and Marlin read
+  the padding value as a row one past the activations (fault when that page
+  was unmapped, silent one-row corruption otherwise). Found with a GPU core
+  dump read in cuda-gdb after the SASS of native/JIT builds proved
+  identical. Fixed in glm_moe_routing.cuh (NaN ranks below finite, selected
+  experts -inf, shared sel), covered by
+  `test_glm_route_align_is_total_on_non_finite_logits`, in-graph time
+  unchanged. The 2026-09-04 rejection of the cooperative mHC launcher rested
+  on faults of the same signature: unproven, launcher stays reverted.
+  Native Release rebuild of the fix validated 2026-09-07 13:31 (27 tests,
+  two native profiler boots clean, exact-token 110.8-111.0 / 449.5 / 602-604
+  in band, gates -2.427 / -2.425). Profiler boots need no hook or switch any
+  more. Pre-fix extension kept in
+  `/raid/scratch/slimserve-glm53/so-backup-20260907/`.
 
 ## Next step
 
-1. The profiler-boot race of the native routing binding: rebuild the JIT
-   extension with the native flags (12.0f, no fast-math) and profile-boot
-   through the hook; then compute-sanitizer racecheck on the smallest
-   reproducer. Serving is unaffected.
-2. Item 2 remainder: moe_sum + the shared-expert add + the output copy
+1. Item 2 remainder: moe_sum + the shared-expert add + the output copy
    into one kernel (accumulate variant of moe_sum_vec_kernel; 3 -> 1
    launches per MoE layer).
-3. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
+2. Item 4: tuned M <= 16 GEMV for the 4096-row group and in_proj (plan
    doc "Phase 1 item 1 pre-work": row-tiled or mma.sync; cuBLAS at 73-89%).
-4. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
+3. The boot spread: NCCL_DEBUG=INFO on boots to compare ring/channel setup
    between a fast and a slow boot; CPU governor `performance` as its own
    experiment if that is empty.
-5. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
+4. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer).
 Gates unchanged (plan section 4): exact-token within the band or better,
 NLL + needle within 0.03 nats, one notebook entry per experiment.
 

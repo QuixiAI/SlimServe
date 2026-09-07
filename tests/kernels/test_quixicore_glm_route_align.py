@@ -92,6 +92,74 @@ def test_glm_route_align_matches_router_and_alignment(tokens):
     assert max_blocks == triton.cdiv(max_padded, block_size)
 
 
+def _non_finite_cases(tokens):
+    torch.manual_seed(1)
+    base = (torch.randn(tokens, E, device=DEV) * 2).float()
+    cases = {"all_nan": torch.full_like(base, float("nan"))}
+    half = base.clone()
+    half[tokens // 2 :] = float("nan")
+    cases["half_nan"] = half
+    row = base.clone()
+    row[0] = float("inf")
+    cases["inf_row"] = row
+    row = base.clone()
+    row[-1] = float("-inf")
+    cases["neg_inf_row"] = row
+    mixed = base.clone()
+    mixed[:, ::3] = float("nan")
+    cases["nan_columns"] = mixed
+    return cases
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 16])
+def test_glm_route_align_is_total_on_non_finite_logits(tokens):
+    """vLLM's dummy runs (graph-capture warmups, the sampler warmup) carry NaN
+    activations. Whatever the logits, every expert id must stay in [0, E) and
+    the alignment must be one Marlin can consume: post_pad a multiple of the
+    block size within the buffer, every block its valid entries first and then
+    padding, the tails filled, every assignment placed exactly once in a block
+    of its own expert. The ids of a NaN token are meaningless but bounded."""
+    bias = (torch.randn(E, device=DEV) * 0.5).float()
+    block_size = glm_route_align.marlin_block_size_m(tokens, K, E)
+    max_padded, max_blocks = glm_route_align.alignment_geometry(
+        tokens, K, E, block_size
+    )
+    numel = tokens * K
+    for name, logits in _non_finite_cases(tokens).items():
+        w, ids, sorted_ids, expert_ids, post_pad = torch.ops.vllm.glm_route_align(
+            logits,
+            bias,
+            K,
+            glm_route_align.SCORING["sigmoid"],
+            True,
+            SCALE,
+            block_size,
+            max_padded,
+            max_blocks,
+        )
+        n = int(post_pad.item())
+        assert 0 < n <= max_padded and n % block_size == 0, name
+        assert int(ids.min()) >= 0 and int(ids.max()) < E, name
+        assert ids.shape == (tokens, K) and w.shape == (tokens, K), name
+        blocks = sorted_ids[:n].view(-1, block_size)
+        valid = blocks < numel
+        padded_before = (~valid).int().cumsum(dim=1) > 0
+        assert not bool((padded_before & valid).any()), f"{name}: pad before valid"
+        assert bool((sorted_ids[n:] == numel).all()), f"{name}: sorted tail"
+        used = expert_ids[: n // block_size]
+        assert int(used.min()) >= 0 and int(used.max()) < E, name
+        assert bool((expert_ids[n // block_size :] == -1).all()), f"{name}: expert tail"
+        assignments = blocks[valid]
+        assert torch.equal(
+            assignments.sort().values,
+            torch.arange(numel, device=DEV, dtype=assignments.dtype),
+        ), f"{name}: every assignment once"
+        owner = ids.view(-1)[blocks.clamp(max=numel - 1)]
+        assert not bool(((owner != used[:, None]) & valid).any()), (
+            f"{name}: assignment outside its expert's block"
+        )
+
+
 def test_glm_route_align_rejects_unsupported_shapes():
     logits = torch.zeros(17, E, device=DEV)
     bias = torch.zeros(E, device=DEV)

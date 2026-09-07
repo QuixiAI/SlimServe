@@ -563,6 +563,20 @@ editable install, so new kernels are developed as a JIT extension
 (torch.utils.cpp_extension.load) against the same csrc/quixicore source and
 folded into _quixicore_C with one full rebuild at the end of the phase.
 
+Illegal memory accesses of 2026-09-04/05, root cause found 2026-09-07 (notebook
+entry of that date): the fused routing kernel was not total over NaN logits.
+vLLM's dummy runs (capture warmups, sampler warmup) put NaN activations
+through the router on every boot; the kernel selected "expert 288", aliased
+its shared counters and laid assignments after padding, and Marlin, which
+takes the first num_valid entries of a block as tokens, read the padding
+value as a row one past the activations. Found with a GPU core dump
+(cuda-gdb: Marlin, Warp Illegal Address, the block's shared ids, A all NaN,
+A row prob_m unmapped) after the SASS of all three builds proved identical.
+Fixed in the kernel (NaN ranks below finite, selected experts -inf, shared
+sel), tested on non-finite inputs, native rebuild the same day. The
+2026-09-04 rejection of the cooperative mHC launcher rested on faults of the
+same signature and is unproven until re-tested on the fixed build.
+
 ## 4. Methodology (every phase)
 
 - Serve only through the profile: `slimserve glm53-nvfp4-4 --serve -y`
@@ -618,6 +632,26 @@ folded into _quixicore_C with one full rebuild at the end of the phase.
 - Clocks: record `nvidia-smi -q -d CLOCK,POWER` per run. Stock 600 W and
   3090 MHz boost; no overclock. Optional `-lgc 3090` lock is an experiment
   with its own entry.
+
+- Non-finite inputs (2026-09-07): a kernel that emits indices or layouts
+  (routing, alignment, top-k, gather tables) is tested on NaN and inf inputs
+  before it is retained, because every boot runs the model on dummy
+  activations that vLLM itself documents as possibly inf/NaN
+  (`_dummy_sampler_run`). The output must be a layout the consumer can take
+  for any input; "garbage in, garbage out" is acceptable, out of range is
+  not. The reference kernels (grouped_topk, moe_align_block_size) meet this.
+- Illegal-memory-access triage (2026-09-07): do not reason from boot
+  conditions; the fault surfaced as "profiler boots" only by allocator
+  layout luck. Read `dmesg` for the `Xid 31` lines first (faulting address,
+  PID -> rank, page alignment; one signature across several faults means one
+  cause), then reproduce with `CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1
+  CUDA_COREDUMP_FILE=<dir>/core_%h_%p.nvcudmp` and read the dump with
+  cuda-gdb (`target cudacore`, `info cuda kernels`, `x/i $pc`,
+  `x/8xw (@shared int*)`, `x/8xw (@global int*)`): kernel, exception type,
+  the block's shared state and whether the accessed page is mapped. A full
+  dump is the context size (87 GB, ~15 min) and the process must not be
+  killed while it is written. Compare SASS across builds (cuobjdump) before
+  suspecting the compiler.
 
 ## 5. Phases and exit gates
 

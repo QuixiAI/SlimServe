@@ -7,6 +7,17 @@
 // fill kernel, four launches per MoE layer at decode. Developed and measured on
 // sm_120 (2026-09-04): ids / weights / alignment identical to the reference path,
 // 6.3 -> 3.7 us per layer at M=1, 6.8 -> 4.8 at M=8.
+//
+// The selection is total over non-finite inputs (2026-09-07): vLLM's dummy runs
+// (graph-capture warmups, the sampler warmup) feed NaN activations, so a NaN
+// score ranks below every finite score, a selected expert is marked -inf, and
+// ties go to the lowest index. Every expert id is therefore in [0, E) and the
+// block layout is valid (valid entries first, then padding) whatever the input.
+// Before that, NaN logits produced the index E, aliased the shared counters and
+// scattered assignments after padding; Marlin takes the first num_valid entries
+// of a block as tokens, so it read the padding value numel as a row and touched
+// one row past the activations (illegal address when that page was unmapped,
+// silent corruption of the neighbouring buffer otherwise).
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cfloat>
@@ -38,33 +49,38 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
         int M, int scoring, float scaling, bool renormalize, int block_size,
         int max_padded, int max_blocks) {
     static_assert(E <= THREADS, "one thread per expert for the scan");
+    static_assert((E + 31) / 32 > TOPK, "every lane must keep an unselected candidate");
     __shared__ float choice[MAX_TOKENS][E];   // biased scores, -inf once selected
     __shared__ float score[MAX_TOKENS][E];    // unbiased scores (weights)
     __shared__ int counts[E];
     __shared__ int cursor[E];
     __shared__ int cumsum[E + 1];
+    __shared__ int sel[MAX_TOKENS][TOPK];      // selected experts, always < E
     __shared__ typename cub::BlockScan<int, THREADS>::TempStorage scan_tmp;
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int numel = M * TOPK;
 
-    // A. scores for every (token, expert)
+    // A. scores for every (token, expert); a NaN choice ranks below every
+    // finite one (-FLT_MAX) but above a selected expert (-inf).
     for (int idx = tid; idx < M * E; idx += THREADS) {
         const int m = idx / E, e = idx - m * E;
         const float s = apply_scoring(logits[idx], scoring);
         score[m][e] = s;
-        choice[m][e] = s + bias[e];
+        const float c = s + bias[e];
+        choice[m][e] = (c == c) ? c : -FLT_MAX;
     }
     if (tid < E) { counts[tid] = 0; cursor[tid] = 0; }
     __syncthreads();
 
     // B. top-k per token, one warp per token: TOPK rounds of warp argmax.
+    // Each lane scans 9 experts of which at most TOPK are selected (-inf), so
+    // every round has a candidate >= -FLT_MAX and yields an index in [0, E).
     if (warp < M) {
         const int m = warp;
         float wsum = 0.0f;
-        int sel[TOPK];
 #pragma unroll
         for (int k = 0; k < TOPK; ++k) {
-            float best = -FLT_MAX; int best_e = E;
+            float best = -INFINITY; int best_e = E;
             for (int e = lane; e < E; e += 32) {
                 const float v = choice[m][e];
                 if (v > best || (v == best && e < best_e)) { best = v; best_e = e; }
@@ -75,18 +91,18 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
                 const int oe = __shfl_xor_sync(0xffffffffu, best_e, off);
                 if (ov > best || (ov == best && oe < best_e)) { best = ov; best_e = oe; }
             }
-            if (lane == 0) choice[m][best_e] = -FLT_MAX;
+            if (lane == 0) { choice[m][best_e] = -INFINITY; sel[m][k] = best_e; }
             __syncwarp();
-            sel[k] = best_e;
             wsum += score[m][best_e];
         }
         if (lane == 0) {
             const float inv = renormalize ? 1.0f / fmaxf(wsum, 1e-20f) : 1.0f;
 #pragma unroll
             for (int k = 0; k < TOPK; ++k) {
-                topk_ids[m * TOPK + k] = sel[k];
-                topk_weights[m * TOPK + k] = score[m][sel[k]] * inv * scaling;
-                atomicAdd(&counts[sel[k]], 1);
+                const int e = sel[m][k];
+                topk_ids[m * TOPK + k] = e;
+                topk_weights[m * TOPK + k] = score[m][e] * inv * scaling;
+                atomicAdd(&counts[e], 1);
             }
         }
     }
@@ -108,7 +124,7 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
     __syncthreads();
     // scatter the assignments (token*TOPK + k) into their expert's range
     for (int a = tid; a < numel; a += THREADS) {
-        const int e = topk_ids[a];
+        const int e = sel[a / TOPK][a - (a / TOPK) * TOPK];
         const int pos = cumsum[e] + atomicAdd(&cursor[e], 1);
         sorted_token_ids[pos] = a;
     }

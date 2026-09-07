@@ -20142,3 +20142,89 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Raw: serve-logs/serve-20260904-215236.log (pair arm A), 20260905-001133
   (native-only), 002508 (routing off, clean), 002806 (CUDA_LAUNCH_BLOCKING,
   healthy); perf/results/2026-09-04/route-fused-profile/ for the pairs.
+
+## 2026-09-07: fused routing kernel was not total over NaN logits - ROOT CAUSE of the illegal memory accesses, FIXED
+
+- Status: RETAINED (kernel + test, native rebuild validated); the
+  2026-09-05 "profiler-boot race" open issue is closed by this entry.
+- Scope: glm53-nvfp4-4 / rtx6000, csrc/quixicore/serving/glm_moe_routing.cuh
+  (`glm_route_align`), every boot of the Release build since 2026-09-04
+  21:51 (and every JIT-hook boot before it).
+- Symptom history (kernel log, all `Xid 31 MMU Fault ... FAULT_PDE
+  ACCESS_TYPE_VIRT_READ`, one rank each, page-aligned addresses):
+  2026-09-04 21:55 rank 3 and 22:03 rank 1 (RelWithDebInfo build, attributed
+  then to the cooperative mHC launcher), 23:56 rank 2 (Release, first
+  requests), 2026-09-05 00:13 rank 3 (Release, sampler warmup), 2026-09-07
+  11:39 rank 1 (Release, sampler warmup, this hunt). Clean boots in between
+  (bench, gates, smoke, one profiler boot today) are the same build.
+- Method: not the exact-token harness. (1) The three builds' SASS for
+  route_align_kernel are byte-identical (native 12.0f, JIT 12.0a, JIT with the
+  native flags; 3496 instructions): the compile was never the factor, and the
+  rebuilt _moe_C/_C differ from build 6 only in metadata. (2) GPU core dump on
+  the next fault (`CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1`, 87 GB, 15 min to
+  write) read with cuda-gdb: the faulting kernel is
+  `marlin_moe_wna16::Marlin<..., m_block_size_8=true>` (the decode block size
+  that consumes the fused alignment), "Warp Illegal Address" at the cp.async
+  of an activation row; the block's `sh_block_sorted_ids` in shared memory
+  was `[128,128,128,128,34,35,36,37]` (padding BEFORE valid entries, four
+  consecutive k of one token), the activation matrix A was bf16 NaN
+  (0x7fff) in every row, and A row 16 = `prob_m` was an unmapped page. (3)
+  The kernel fed NaN logits standalone reproduces it exactly: `ids.max() =
+  288` (= E, out of range), padding before valid entries, tails wrong, at
+  M = 16 with all, half or a few NaN rows. 3000 random finite iterations
+  (M = 1..16, identical tokens, equal scores, buffer reuse) show no
+  violation, which is why the parity tests and the benches never saw it.
+- Cause: the warp argmax started at `best = -FLT_MAX, best_e = E` and a NaN
+  choice never compares greater, so a NaN token selects "expert 288";
+  `counts[288]`/`cursor[288]`/`choice[m][288]` alias the neighbouring shared
+  arrays, the scan and the scatter disagree, and assignments land after
+  padding. Marlin takes the first `block_num_valid_tokens` entries of a
+  block as its tokens, so it reads the padding value `numel` as a row: A row
+  `prob_m` and C row `numel`, one row past both buffers. vLLM's dummy runs
+  (the five capture warmups and the sampler warmup, every boot;
+  `_dummy_sampler_run` documents that dummy hidden states can be inf/NaN)
+  put NaN through the router on every rank; the fault surfaces only when the
+  activation tensor ends at an unmapped page (allocator layout luck, hence
+  one rank, hence intermittent), and is a silent one-row over-read plus a
+  zeroed row past `moe_output` otherwise. The reference path (grouped_topk +
+  moe_align_block_size) keeps NaN ids in range, so it never showed this.
+- Change: the choice of a NaN score is -FLT_MAX (below every finite score,
+  above a selected expert, which is now -inf), ties go to the lowest index,
+  and the selected experts live in a shared `sel[16][8]` that the scatter
+  reads instead of re-reading `topk_ids` from global memory. Each lane scans
+  9 experts of which at most 8 are selected, so every round has a finite
+  candidate and every id is in [0, E) for any input. 48 registers (46),
+  44,080 B shared (43,568).
+- Correctness: tests/kernels/test_quixicore_glm_route_align.py gains
+  `test_glm_route_align_is_total_on_non_finite_logits` (all-NaN, half-NaN,
+  +inf row, -inf row, NaN columns at M = 1/8/16: ids in range, post_pad a
+  block multiple within the buffer, valid-first blocks, tails, every
+  assignment once in a block of its own expert); 11 tests pass through the
+  JIT hook, the parity cases unchanged; jit/stress_routing.py 3000
+  iterations clean. In-graph time unchanged: 3.7 / 4.7 / 6.3 us at M = 1 /
+  8 / 16 (3.7 / 4.8 / 6.0 before).
+- What this changes upstream of it: (a) the "profiler boot" framing of
+  2026-09-05 was a sampling artefact; every boot ran the corruption. (b) The
+  2026-09-04 rejection of the cooperative mHC launcher rests on two faults
+  of this same signature on a build that also carried the routing kernel;
+  the launcher stays reverted, but its rejection is unproven and must be
+  re-tested on the fixed build if the item is revisited. (c) Retained
+  throughput and quality numbers stand: finite inputs were parity-exact.
+- Native validation (Release rebuild 12:07-13:19, 72 min, exit 0; the
+  shipped kernel's SASS equals the JIT build's, 3,560 instructions, 48
+  registers, 44,080 B shared): 27 kernel tests pass natively; two profiler
+  boots with the native binding and no hook (the case that faulted 3 of 3
+  before) come up healthy, 0 CUDA errors, c1 capture arm A 8.66 ms span /
+  8.42 busy / 1,384 launches per step (arm B's window was partial); the
+  exact-token boot `--no-spec` c1 110.8 / 111.0, c8 449.5 / 449.4, c16
+  601.6 / 603.6 (band 110-113 / 450-457 / 600-610), gates -2.427 / -2.425
+  (band -2.416..-2.457), needle margins 15.8/18.1 and 13.2/18.6; no Xid
+  line in the kernel log after the rebuild.
+- Decision: RETAINED. Rule added to the plan's methodology: a kernel that
+  emits indices is tested on non-finite inputs before it is retained, and
+  illegal memory accesses are triaged from the Xid lines and a core dump,
+  not from boot conditions.
+- Raw: kernel log Xid lines (dmesg), serve-logs/serve-20260907-113752.log,
+  the core dump (deleted after analysis; cuda-gdb facts above),
+  /raid/scratch/slimserve-glm53/jit/{build_routing_120f.py, stress_routing.py,
+  fault_hunt.sh}.
