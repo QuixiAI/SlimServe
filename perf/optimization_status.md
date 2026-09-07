@@ -19694,3 +19694,52 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Production restarted on qwen38fn-nvfp4-4 (GPUs 0-3) at 23:45 UTC; the
   FP8 record's new configuration is committed but not deployed (operator:
   one instance on GPUs 0-3, GPUs 4-7 free).
+
+## 2026-09-07 - Main-KV tier reclaim hazard closed: slot holds that outlive the request
+
+- The hazard (recorded open in the 2026-09-06 8-GPU entry, shared by the
+  production TP4 record): a pool block whose residency rows point INTO a
+  main-KV tier slot - a rebound block, or a block that demoted into its
+  home - stays in the GPU prefix cache after its request ends, but the
+  index only pinned slots for the request's lifetime and never for
+  homes. `KVTierIndex._reclaim` could then `_delete` that trajectory,
+  hand its slots to another lineage, and a later prefix-cache hit on the
+  block read that lineage's bytes. A second, write-side variant: the
+  residency keeps `home_addr` across pool block reuse, so a fresh
+  allocation of the block id that found the tier full (`reserve_main_slot`
+  None) kept the stale home and would demote its NEW rows into the old
+  trajectory's slot.
+- Fix (kv_tier_index.py, host_tier_connector.py): block-level HOLDS.
+  `hold_main(block, slot)` when the connector stages a home or a rebind
+  (and on the fill path's late reservation); `_main_busy` treats held
+  slots like pinned ones, so reclaim skips the trajectory. Holds drop
+  when the pool reuses the block id (a fresh allocation: positions >=
+  the request's computed blocks in `_reserve_main_homes`, which now
+  takes `computed_blocks`), when a confirmed flush moved the rows into a
+  new slot (`unhold_main(block, keep=slot)` on the confirm path - the
+  prefix-cache-hit re-home case), and when an unfilled reservation is
+  released at finish. A fresh block that gets no slot is explicitly
+  un-homed (`main_release` -> `clear_home`) so it demotes into pool rows.
+  Pins stay as they were. Holds are bounded by the pool's block count
+  (42 at TP4, 306 at TP8) against 921 / 813 tier slots, so at most that
+  many trajectories are ever protected from reclaim by cache residue.
+- Tests (CPU): index - held slots block reclaim until every block lets
+  go; unhold-keep and slot-free drop holds. Connector - rebound blocks
+  hold their slots after the resumer finishes, until the pool reuses
+  every block that pointed at them (then reclaim proceeds); a fresh
+  block without a slot is un-homed while the tier is full. 112 green
+  across the tier, residency, planner and registry suites.
+- Live check: qwen38fn-nvfp4-4 on GPUs 4-7 (port 8001, the current
+  working tree) with a 2 GiB main tier (25 slots vs a 43-block pool).
+  Marker conversation (29.7K tokens, 2 full blocks), hot follow-up, then
+  10 x 29.7K churn (30 slots through a 25-slot tier), follow-up. The
+  index logged 28 reclaims with 20-23 slots held throughout - reclaim
+  proceeded only through unheld lineages - and every follow-up recalled
+  its marker: 2/2 in the acceptance (both mixed resumes: block 0 from the
+  GPU prefix cache, block 1 rebound from its tier slot, 3.6-3.9 s vs 7.7 s
+  cold) and 4/4 in the classification probe (three tier resumes at 2
+  blocks, one GPU/cold), 0 errors. One earlier miss at a 200-token
+  answer budget was the model thinking past the budget (the same flow
+  passes at 300 tokens with the codename produced), not a KV fault.
+  Raw: perf/results/2026-09-07/reclaim_hazard/ (serve_tinytier_8001.log,
+  reclaim_acceptance_v2.out, restore_probe.out, scripts).

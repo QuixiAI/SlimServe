@@ -198,12 +198,16 @@ are deleted, not demoted, under host pressure).
   only for changed rows, pinned staging); (b) per-group slab strides so
   GDN snapshots stop paying an attention-sized slot (21 -> 32 chat
   requests, ~8x -> ~13x max-length residency in the same pool); (c) the
-  reclaim hazard: `KVTierIndex._delete` frees main slots without telling
-  the residency, so a block still alive in the GPU prefix cache whose
-  demoted rows point into a reclaimed slot would read another
-  trajectory's bytes - the index must not reclaim slots referenced by
-  live pool blocks, or the worker must copy them back to residency rows
-  first; (d) milestone 4b (main slots on NVMe).
+  reclaim hazard - CLOSED 2026-09-07: `KVTierIndex._delete` freed main
+  slots that pool blocks still pointed into (rebinds, demoted homes), so
+  a block alive in the GPU prefix cache could read another trajectory's
+  bytes after reclaim. The index now carries block-level holds
+  (`hold_main` / `unhold_main`) staged with every home and rebind;
+  `_main_busy` honours them, and they drop only when the pool reuses the
+  block id, a confirmed flush moved the rows into a new slot, or the
+  reservation is released. A fresh block that finds the tier full is
+  un-homed so it never demotes into a stale slot; (d) milestone 4b (main
+  slots on NVMe).
 
 ## Milestones and gates
 

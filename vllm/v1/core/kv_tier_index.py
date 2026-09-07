@@ -45,7 +45,10 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+logger = init_logger(__name__)
 
 # hash position -> attention group ids whose KV block completes there
 DueGids = Callable[[int], frozenset[int]]
@@ -263,6 +266,13 @@ class HostKVTierIndex:
         self._main_pending: set[int] = set()  # reserved or flush in flight
         # slot -> request ids that have it rebound read-only
         self._main_pinned: dict[int, set[str]] = {}
+        # Holds: pool blocks whose residency rows point INTO a slot (a home
+        # they demoted into, or a rebind). Unlike pins they outlive the
+        # request: the block stays in the GPU prefix cache and a later hit
+        # would read the slot, so the slot cannot be reclaimed until the
+        # pool reuses the block id or a confirmed flush moved its rows.
+        self._main_held: dict[int, set[int]] = {}  # slot -> block ids
+        self._held_by_block: dict[int, set[int]] = {}  # block id -> slots
 
     def due(self, i: int) -> frozenset[int]:
         """Attention groups whose block completes at hash position i."""
@@ -462,6 +472,12 @@ class HostKVTierIndex:
     def _free_main_slot(self, slot: int) -> None:
         self._main_pending.discard(slot)
         self._main_pinned.pop(slot, None)
+        for block in self._main_held.pop(slot, ()):
+            slots = self._held_by_block.get(block)
+            if slots is not None:
+                slots.discard(slot)
+                if not slots:
+                    del self._held_by_block[block]
         self._main_free.append(slot)
 
     def reserve_main_slot(self, owner: str, logical: int) -> int | None:
@@ -526,9 +542,30 @@ class HostKVTierIndex:
             if not self._main_pinned[slot]:
                 del self._main_pinned[slot]
 
+    def hold_main(self, block: int, slot: int) -> None:
+        """Pool block `block`'s residency rows now point into `slot`."""
+        self._main_held.setdefault(slot, set()).add(block)
+        self._held_by_block.setdefault(block, set()).add(slot)
+
+    def unhold_main(self, block: int, keep: int | None = None) -> None:
+        """Drop `block`'s holds (all of them, or every slot but `keep`): the
+        pool reallocated the block id, or a confirmed flush moved its rows
+        into `keep`."""
+        for slot in list(self._held_by_block.get(block, ())):
+            if slot == keep:
+                continue
+            self._held_by_block[block].discard(slot)
+            blocks = self._main_held.get(slot)
+            if blocks is not None:
+                blocks.discard(block)
+                if not blocks:
+                    del self._main_held[slot]
+        if not self._held_by_block.get(block):
+            self._held_by_block.pop(block, None)
+
     def _main_busy(self, traj: Trajectory) -> bool:
         return any(
-            m in self._main_pending or m in self._main_pinned
+            m in self._main_pending or m in self._main_pinned or m in self._main_held
             for m in traj.main_slot_list()
         )
 
@@ -816,6 +853,14 @@ class HostKVTierIndex:
                 traj.tail_state_slots = {}
                 traj.tail_pending = False
             else:
+                if traj.main_slot_list():
+                    logger.info(
+                        "host-tier index: reclaimed %s (%d main slots, %d held "
+                        "elsewhere)",
+                        owner[-8:],
+                        len(traj.main_slot_list()),
+                        len(self._main_held),
+                    )
                 self._delete(owner, traj)
             return True
         return False
@@ -885,4 +930,5 @@ class HostKVTierIndex:
             "main_slots": self.num_main_slots,
             "main_used": self.num_main_slots - len(self._main_free),
             "main_pending": len(self._main_pending),
+            "main_held": len(self._main_held),
         }

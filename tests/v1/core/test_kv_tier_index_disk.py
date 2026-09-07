@@ -243,3 +243,39 @@ def test_trajectory_with_main_slots_is_deleted_not_demoted_under_host_pressure()
     assert idx.stage_attention("b", 0, h(100)) is not None  # needs a host slot
     st = idx.stats()
     assert st["trajectories"] == 1 and st["disk_only"] == 0 and st["main_used"] == 0
+
+
+def test_held_main_slots_block_reclaim_until_every_block_lets_go():
+    """A pool block whose residency rows point into a slot (its home, or a
+    rebind) holds the slot beyond the request: the block stays in the GPU
+    prefix cache and a later hit would read the slot."""
+    idx = HostKVTierIndex(num_slots=64, num_main_slots=2)
+    for i in range(2):
+        idx.reserve_main_slot("a", i)
+        s = idx.stage_attention("a", i, h(i)); idx.confirm_writes([s])
+    st = idx.stage_tail_states("a", 2, 2, boundary_hash=h(1)); idx.confirm_writes(list(st.values()))
+    slots = idx.main_slots_for("a", 2)
+    idx.confirm_main(slots)
+    idx.hold_main(300, slots[0]); idx.hold_main(301, slots[1])
+    assert idx.stats()["main_held"] == 2
+    assert idx.reserve_main_slot("b", 0) is None  # full and held: no reclaim
+    idx.unhold_main(300)
+    assert idx.reserve_main_slot("b", 0) is None  # block 301 still holds
+    idx.unhold_main(301)
+    assert idx.reserve_main_slot("b", 0) is not None  # a reclaimed
+    assert idx.stats()["main_held"] == 0 and idx.stats()["trajectories"] == 1
+
+
+def test_unhold_keep_and_slot_free_drop_holds():
+    idx = HostKVTierIndex(num_slots=64, num_main_slots=4)
+    old = idx.reserve_main_slot("a", 0)
+    new = idx.reserve_main_slot("b", 0)
+    # A prefix-cache hit re-homed into lineage b: both slots held until the
+    # flush into `new` is confirmed, then only `new`.
+    idx.hold_main(7, old); idx.hold_main(7, new)
+    idx.unhold_main(7, keep=new)
+    assert idx._held_by_block[7] == {new} and old not in idx._main_held
+    # Freeing a slot (an unfilled reservation released at finish) drops
+    # every hold on it.
+    idx.release_main_reservations("b", filled_upto=0)
+    assert 7 not in idx._held_by_block and idx.stats()["main_held"] == 0

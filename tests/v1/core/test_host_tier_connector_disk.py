@@ -251,3 +251,94 @@ def test_unfilled_reservation_is_released_with_the_block_at_finish():
     meta = conn.build_connector_meta(sched_output({}))
     assert meta.main_release == [2]
     assert conn.index.stats()["main_used"] == 2
+
+
+def _new_req(req_id, n, base=0, computed=0):
+    blocks = alloc(n, planned=0, base=base).blocks
+    return SimpleNamespace(
+        req_id=req_id,
+        block_ids=tuple([b.block_id for b in g] for g in blocks),
+        num_computed_tokens=computed,
+    )
+
+
+def _fill_and_finish(conn, req_id, n, base=0):
+    req = FakeRequest(req_id, [h(i) for i in range(n)], num_tokens=n * BLOCK + 4)
+    conn.on_new_request(req)
+    conn.update_state_after_alloc(req, alloc(n, planned=0, base=base), 0)
+    meta = conn.build_connector_meta(
+        sched_output({req_id: n * BLOCK}, new_reqs=[_new_req(req_id, n, base)])
+    )
+    req.num_computed_tokens = n * BLOCK
+    conn.build_connector_meta(sched_output({req_id: 1}))
+    conn.build_connector_meta(sched_output({}))
+    pool = conn._block_pool
+    for g, gid in enumerate((2, 3)):
+        pool.cached[(bytes(h(n - 1)), gid)] = pool.blocks[base + 95 + g]
+    conn.request_finished_all_groups(req, tuple([] for _ in range(4)))
+    conn.build_connector_meta(sched_output({}))
+    conn.build_connector_meta(sched_output({}))
+    return req, meta
+
+
+def test_rebound_blocks_hold_their_slots_after_the_resumer_finishes():
+    """The reclaim hazard (2026-09-06, 8-GPU port): rebound rows point into
+    tier slots and the block outlives the request in the GPU prefix cache,
+    so the slots stay unreclaimable until the pool reuses the block ids."""
+    conn = make_main_tier_connector()
+    _fill_and_finish(conn, "r1", 3)
+    again = FakeRequest("r2", [h(i) for i in range(3)] + [h(9)], num_tokens=4 * BLOCK + 4)
+    conn.on_new_request(again)
+    assert conn.get_num_new_matched_tokens(again, 0)[0] == 3 * BLOCK
+    conn.update_state_after_alloc(again, alloc(4, planned=3, base=300), 3 * BLOCK)
+    meta = conn.build_connector_meta(sched_output({}))
+    assert [blk for blk, _ in meta.main_rebinds["r2"]] == [300, 301, 302]
+    conn.request_finished_all_groups(again, tuple([] for _ in range(4)))
+    conn.build_connector_meta(sched_output({}))
+    # Pins are gone, holds remain: r1's trajectory cannot be reclaimed.
+    assert not conn.index._main_pinned
+    assert conn.index.stats()["main_held"] >= 3
+    assert not conn.index._reclaim(protect="zzz")
+    # The pool hands 300-302 to a fresh request: the holds drop with them.
+    fresh = FakeRequest("r3", [h(50 + i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(fresh)
+    conn.update_state_after_alloc(fresh, alloc(3, planned=0, base=300), 0)
+    conn.build_connector_meta(
+        sched_output({"r3": 3 * BLOCK}, new_reqs=[_new_req("r3", 3, base=300)])
+    )
+    held = {b for blocks in conn.index._main_held.values() for b in blocks}
+    assert {300, 301, 302} <= held  # now holding r3's own homes
+    # r1's own blocks 0-2 (its homes) still hold: not yet reclaimable.
+    assert not conn.index._reclaim(protect="r3")
+    other = FakeRequest("r4", [h(70 + i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(other)
+    conn.update_state_after_alloc(other, alloc(3, planned=0), 0)
+    conn.build_connector_meta(
+        sched_output({"r4": 3 * BLOCK}, new_reqs=[_new_req("r4", 3)])
+    )
+    # Every block that pointed into r1's slots has been reused: reclaimable.
+    assert conn.index._reclaim(protect="r4")
+    assert "r1" not in conn.index._trajectories
+
+
+def test_fresh_block_without_a_slot_is_unhomed():
+    """Homes persist across block reuse in the residency: a fresh block that
+    gets no slot (tier full) must be un-homed, or its rows would demote
+    into the previous lineage's slot."""
+    main_gb = (3 * 13 * STRIDE + 1) / 2**30
+    conn = make_main_tier_connector(main_gb=main_gb)
+    assert conn.index.num_main_slots == 3
+    _fill_and_finish(conn, "r1", 3)
+    assert conn.index.stats()["main_used"] == 3
+    # Pool reuse of block ids 0..2 for a fresh request while the tier is
+    # full: 0 and 1 find r1's slots still held by blocks 1/2 and are
+    # released; by block 2 every hold is gone, r1 is reclaimed, 2 is homed.
+    fresh = FakeRequest("r2", [h(50 + i) for i in range(3)], num_tokens=3 * BLOCK + 4)
+    conn.on_new_request(fresh)
+    conn.update_state_after_alloc(fresh, alloc(3, planned=0), 0)
+    meta = conn.build_connector_meta(
+        sched_output({"r2": 3 * BLOCK}, new_reqs=[_new_req("r2", 3)])
+    )
+    assert meta.main_release == [0, 1]
+    assert set(meta.main_homes) == {2}
+    assert conn.index.stats()["trajectories"] == 1

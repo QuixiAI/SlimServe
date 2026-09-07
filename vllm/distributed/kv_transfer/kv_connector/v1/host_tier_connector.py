@@ -416,6 +416,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self.row_bytes,
                 )
             self._staged_disk_writes: dict[int, list[tuple[int, int]]] = {}
+            self._last_step_main_blocks: list[tuple[int, int]] = []
             self._staged_disk_reads: dict[str, list[tuple[int, int]]] = {}
             # Write-through batches awaiting every rank's completion report.
             self._disk_write_batches: dict[int, list[tuple[int, int]]] = {}
@@ -616,7 +617,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 if gid == self._main_gid and track.planned_main_slots:
                     self._staged_main_rebinds.setdefault(
                         request.request_id, []
-                    ).append((gb[gidx], track.planned_main_slots[logical]))
+                    ).append((gb[gidx], slot))
+                    # The block's rows point into the slot from now on;
+                    # the hold outlives the request (the block stays in
+                    # the GPU prefix cache).
+                    self.index.unhold_main(gb[gidx])
+                    self.index.hold_main(gb[gidx], slot)
         # Tail-boundary state blocks ride the FINAL restore chunk. The
         # resumed state must land at position ``boundary_blocks - 1`` of
         # each mamba group: the worker seeds its running state index as
@@ -649,6 +655,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for gid in self.ring_groups:
                 zero_blocks.extend(b for b in track.group_blocks[gid] if b > 0)
         if ops:
+                    slot = track.planned_main_slots[logical]
             self._staged_restores.setdefault(request.request_id, []).extend(ops)
             if track.disk_reads:
                 self._staged_disk_reads.setdefault(request.request_id, []).extend(
@@ -673,10 +680,23 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
 
     # Offload staging ---------------------------------------------------
 
-    def _reserve_main_homes(self, req_id: str, track: _ReqTrack) -> None:
+    def _reserve_main_homes(
+        self, req_id: str, track: _ReqTrack, computed_blocks: int = 0
+    ) -> None:
         """Reserve a main-KV tier slot for every newly allocated attention
         block of this request (positions beyond a restored span), so the
-        residency demotes the block straight into the tier."""
+        residency demotes the block straight into the tier.
+
+        Blocks at positions >= `computed_blocks` are fresh allocations: the
+        pool block id may have carried another trajectory's home (and a
+        hold on its slot) in a previous life, and the residency keeps homes
+        across block reuse, so a fresh block that gets no slot (tier full)
+        is explicitly un-homed - otherwise its new rows would demote into
+        the stale slot and overwrite that trajectory. Prefix-cache hits
+        (positions < `computed_blocks`) keep their rows where they are and
+        get a slot for this lineage; the flush copies the rows over and
+        the old slot's hold is released only once that flush is confirmed
+        (_release_moved_holds)."""
         if not self._main_kv_tiered or self._main_gid < 0:
             return
         request = self._requests.get(req_id)
@@ -704,7 +724,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 track = _ReqTrack(group_blocks=[[] for _ in range(self.num_groups)])
                 self._tracks[new_req.req_id] = track
             track.group_blocks = [list(g) for g in new_req.block_ids]
-            self._reserve_main_homes(new_req.req_id, track)
+            computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
+            self._reserve_main_homes(
+                new_req.req_id, track, computed // self.hash_block_size
+            )
         cached = scheduler_output.scheduled_cached_reqs
         for i, req_id in enumerate(cached.req_ids):
             new_ids = cached.new_block_ids[i]
@@ -726,11 +749,17 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             track = self._tracks.get(req_id)
             request = self._requests.get(req_id)
             if track is None or request is None:
+            fresh = gidx >= computed_blocks
+            if fresh:
+                self.index.unhold_main(block_id)
                 continue
             n_full = min(
+                if fresh and block_id not in self._staged_main_homes:
+                    self._staged_main_release.append(block_id)
                 request.num_computed_tokens // bs,
                 len(request.block_hashes),
                 min(
+            self.index.hold_main(block_id, slot)
                     (
                         len(track.group_blocks[g]) * self._attn_ratio[g]
                         for g in self.attn_groups
@@ -803,11 +832,13 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for pin_blocks in self._pins_issued:
                 self._block_pool.free_blocks(pin_blocks)
         self._pins_issued, self._pins_staged = self._pins_staged, []
+                                self.index.hold_main(block_id, main)
 
         self._absorb_block_allocations(scheduler_output)
         self._stage_filled_attention_blocks(scheduler_output)
         meta = HostTierMeta(
             restores=self._staged_restores,
+                            self._last_step_main_blocks.append((block_id, main))
             offloads=self._staged_offloads,
             zeros=self._staged_zeros,
             disk_writes=self._staged_disk_writes,
@@ -820,6 +851,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         self._staged_restores = {}
         self._staged_offloads = {}
         self._staged_zeros = {}
+            moved, self._last_step_main_blocks = self._last_step_main_blocks, []
+            # A confirmed flush moved the block's rows into its slot: any
+            # older slot the rows pointed at (a prefix-cache hit re-homed
+            # into this lineage) no longer needs the hold.
+            for block_id, slot in moved:
+                self.index.unhold_main(block_id, keep=slot)
         self._staged_disk_writes = {}
         self._staged_disk_reads = {}
         self._staged_main_homes = {}
@@ -917,6 +954,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # Frozen states materialize only at positions that were a chunk-end
         # column at some scheduling step (this fork's align mode keeps ONE
         # live column per chunk; intermediate positions stay null and
+                    self.index.unhold_main(blocks[gidx])
         # cache_full_blocks skips them). Scan down from the last full block
         # to the deepest boundary every mamba group actually has cached; the
         # gap above it (at most one prefill chunk) re-prefills on resume.
