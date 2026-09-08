@@ -269,6 +269,24 @@ class quixicore_ops:
         return int(_qc().get_dsv4_mhc_mode())
 
     @staticmethod
+    def has_topk_sample() -> bool:
+        try:
+            return hasattr(_qc(), "topk_sample")
+        except Exception:
+            return False
+
+    @staticmethod
+    def topk_sample(
+        logits: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor | None,
+        noise: torch.Tensor,
+    ) -> torch.Tensor:
+        """Top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with
+        caller-drawn exponential noise [B, 32]; int64 token ids [B]."""
+        return _qc().topk_sample(logits, top_k, top_p, noise)
+
+    @staticmethod
     def dsv4_mhc_post(
         x: torch.Tensor,
         residual: torch.Tensor,

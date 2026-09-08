@@ -960,6 +960,7 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            max_top_k=None if self.no_top_k else int(self.top_k_cpu[:num_reqs].max()),
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

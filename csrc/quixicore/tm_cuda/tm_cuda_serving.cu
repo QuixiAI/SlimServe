@@ -23,6 +23,7 @@
 #include "glm_moe_combine.cuh"
 #include "bf16_decode_gemm.cuh"
 #include "fp8_decode_gemm.cuh"
+#include "topk_sample.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
@@ -233,6 +234,38 @@ static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
     else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
+    return out;
+}
+
+// Small-k sampling (top_k <= 32 on every row): two launches on fp32 logits
+// [B, V], the masks of vLLM's apply_top_k_top_p_pytorch, exponential noise
+// [B, 32] drawn by the caller. Returns int64 token ids [B].
+static torch::Tensor py_topk_sample(torch::Tensor logits, torch::Tensor top_k,
+                                    c10::optional<torch::Tensor> top_p, torch::Tensor noise) {
+    using namespace tms::topk_sample;
+    CK(top_k); CK(noise);
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == torch::kFloat32 &&
+                logits.stride(1) == 1, "topk_sample: fp32 [B, V] logits with unit inner stride");
+    const int B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(V >= NB * K, "topk_sample: vocabulary smaller than the candidate window");
+    TORCH_CHECK(top_k.scalar_type() == torch::kInt32 && top_k.numel() == B, "topk_sample: int32 top_k [B]");
+    TORCH_CHECK(noise.scalar_type() == torch::kFloat32 && noise.dim() == 2 && noise.size(0) == B &&
+                noise.size(1) == K, "topk_sample: fp32 noise [B, 32]");
+    const float* p_ptr = nullptr;
+    if (top_p.has_value()) {
+        const torch::Tensor& p_t = *top_p;
+        CK(p_t);
+        TORCH_CHECK(p_t.scalar_type() == torch::kFloat32 && p_t.numel() == B, "topk_sample: fp32 top_p [B]");
+        p_ptr = p_t.data_ptr<float>();
+    }
+    auto cand_val = torch::empty({B, NB * K}, logits.options());
+    auto cand_idx = torch::empty({B, NB * K}, logits.options().dtype(torch::kInt32));
+    auto out = torch::empty({B}, logits.options().dtype(torch::kInt64));
+    candidates_kernel<<<dim3(NB, B), THREADS, 0, stream()>>>(
+        logits.data_ptr<float>(), logits.stride(0), V, cand_val.data_ptr<float>(), cand_idx.data_ptr<int>());
+    merge_sample_kernel<<<B, MERGE_THREADS, 0, stream()>>>(
+        cand_val.data_ptr<float>(), cand_idx.data_ptr<int>(), top_k.data_ptr<int>(), p_ptr,
+        noise.data_ptr<float>(), out.data_ptr<long>());
     return out;
 }
 
@@ -2236,6 +2269,10 @@ void init_serving(py::module_& m) {
     m.def("set_dsv4_mhc_mode", &py_set_dsv4_mhc_mode,
           "T == 1 mHC pre-transition launch mode: 0 cooperative, 1 last-block, 2 split kernels");
     m.def("get_dsv4_mhc_mode", &py_get_dsv4_mhc_mode);
+    m.def("topk_sample", &py_topk_sample, py::arg("logits"), py::arg("top_k"),
+          py::arg("top_p") = py::none(), py::arg("noise"),
+          "top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with caller-drawn "
+          "exponential noise [B, 32]; int64 token ids");
     m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 x FP8 block-scaled weights (e4m3, 128x128 fp32 scales), M<=16, tensor cores: "

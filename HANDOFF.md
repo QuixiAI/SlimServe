@@ -160,6 +160,29 @@ physics, research digest and phase gates are in
    threshold is a one-factor A/B), the 11 DSA layers' bf16 fused_qkv_a /
    kv_b (22 launches, 0.24 ms: native FP8 q_a/kv_a exist but share a
    module with BF16 indexer shards).
+2d. Small-k sampler kernel DONE 2026-09-07 22:06 (notebook "Small-k
+   sampler kernel (QuixiCore topk_sample)"): RETAINED, default on. Two
+   launches (csrc/quixicore/serving/topk_sample.cuh: per-row 16-block
+   radix top-32 candidates, then merge + top-k/top-p masks + softmax +
+   noise argmax) replace the fused Triton top-k/top-p kernel + full-vocab
+   softmax: sampling class 0.17 -> 0.01 ms/step; like-state +2.8% c1 /
+   +1.0% c8 / +1.0% c16 (sampler-B2 vs mhc-t8-B, both slow/fast);
+   four gates in band (-2.439..-2.473; the next boot carries GATES=4).
+   Dispatch: TopKTopPSampler.forward_native when every request's
+   top_k <= 32 (CPU-side `max_top_k` on SamplingMetadata), raw logprobs
+   mode, cuda, V >= 512; else the Triton path unchanged. Noise stays
+   torch's seeded [B, 32] draw. Known deviation: rows with > 32 tokens
+   tied at the k-th value keep 32 of them. Tests: tests/kernels/
+   test_quixicore_topk_sample.py (needs the op). Also in this commit:
+   mHC cooperative launch default T <= 8 (+1.2% c8; env
+   VLLM_DSV4_MHC_COOP_MAX_T=1 restores), custom AR forced 1-stage
+   REJECTED (-1.5% c8 / -2.6% c16), c16 attribution on the final tree
+   (52% Marlin at the floor; mHC split path 1.26 ms, AR 1.15, logits
+   all-gather 0.18). Next on this path: vocab-parallel candidates-only
+   sampling (drops the all-gather: 26 / 102 / 176 us at c1/c8/c16),
+   batched Philox noise for seeded rows (~5 us host per seeded row).
+   Fast/fast-state number of this tree not yet observed (1 of 7 boots
+   today landed fast/fast); like-state predicts ~157 / 525 / 685.
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
@@ -196,6 +219,18 @@ physics, research digest and phase gates are in
    custom all-reduce at 8.8 us/launch instead of 5.1 (+0.32 ms/step) ->
    slow-state throughput; clocks/PCIe link identical. Read the attrib
    line's "custom allreduce" us/launch as well as the idle when labelling.
+   Second slow-AR boot 21:53 (sampler-B, fast idle + 8.7 us AR): per-GPU
+   SM clocks 2700 +- 20 MHz, power, temperature, PCIe gen5 x16 all equal
+   to the fast-AR boots (serve-logs/clocks-gpu-*.csv); worker threads
+   migrate over all 64 logical CPUs in every boot (threads-*.log), no
+   placement pattern; the tinybox display service (pid 558811,
+   /opt/tinybox/service/display/service.py) sits at 20-50% of a core in
+   every boot. Today's seven labelled boots: fast/fast 1, fast/slow-AR 2,
+   slow/fast 4. Untested hypotheses: launch skew between ranks at the
+   first AR of each graph replay (rank 0 waiting on a late peer: the
+   per-rank trace timestamps of the four workers would show it; only rank
+   0 is profiled today), P2P mapping state per boot (cudaDeviceEnablePeer
+   ordering / IPC handle placement), PIN=1 in ab.sh (untested).
 Profiler captures: prof_run.py now runs a 384-token profiled round so the
 8-iteration capture sits in steady decode (96 ended before the capture
 with MTP on and produced a 2-iteration trace whose "step" was a partial

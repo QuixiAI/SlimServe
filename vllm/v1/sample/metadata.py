@@ -53,3 +53,7 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+    # Largest top_k in the batch (CPU-side, from the input batch); None when
+    # no request uses top-k. Lets the sampler take the small-k kernel path
+    # without a device sync.
+    max_top_k: int | None = None

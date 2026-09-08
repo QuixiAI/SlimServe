@@ -136,12 +136,23 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        max_top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
+        if (
+            k is not None
+            and max_top_k is not None
+            and max_top_k <= SMALL_TOPK_WINDOW
+            and self.logprobs_mode not in PROCESSED_LOGPROBS_MODES
+            and small_topk_kernel_available(logits)
+        ):
+            return small_topk_sample(
+                logits, generators, k, p, self.use_fp64_gumbel
+            ), None
         logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
@@ -160,6 +171,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        max_top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """More optimized implementation for top-k and top-p sampling."""
         # Fall back to the PyTorch-native path when FlashInfer has nothing
@@ -189,6 +201,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        max_top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         PyTorch-native implementation of top-k and top-p sampling for CPU.
@@ -235,6 +248,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        max_top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Optimized ROCm/aiter path (same structure as forward_cuda)."""
         if (k is None and p is None) or generators:
@@ -297,6 +311,7 @@ class TopKTopPSampler(nn.Module):
         generators: dict[int, torch.Generator],
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        max_top_k: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if generators:
             logger.warning_once(
@@ -403,6 +418,56 @@ def apply_top_k_top_p_pytorch(
 
     # Re-sort the probabilities.
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
+
+
+# Small-k kernel path (QuixiCore ``topk_sample``): when every request's top_k
+# is at most SMALL_TOPK_WINDOW, two launches select each row's top-32 logits
+# (multi-block radix select), apply the masks of apply_top_k_top_p_pytorch
+# (k-th value ties kept; smallest tokens dropped while their cumulative mass is
+# <= 1 - p, the largest kept), take the softmax over what is left and pick
+# argmax(prob / noise) with exponential noise drawn here by torch's (seeded)
+# generators, one draw per candidate. Same sampling distribution as the
+# full-vocabulary path; the seeded streams differ (32 draws per row, not V).
+# Measured 2026-09-07 on GLM-5.3-Flash (V = 154880, rtx6000): the fused
+# Triton kernel + full softmax cost ~180 us per step at any batch size.
+SMALL_TOPK_WINDOW = 32
+
+
+def small_topk_kernel_available(logits: torch.Tensor) -> bool:
+    if logits.device.type != "cuda" or logits.shape[1] < 16 * SMALL_TOPK_WINDOW:
+        return False
+    from vllm.quixicore.ops import quixicore_ops
+
+    return quixicore_ops.has_topk_sample()
+
+
+def small_topk_sample(
+    logits: torch.Tensor,
+    generators: dict[int, torch.Generator],
+    k: torch.Tensor,
+    p: torch.Tensor | None,
+    use_fp64_gumbel: bool = False,
+) -> torch.Tensor:
+    from vllm.quixicore.ops import quixicore_ops
+
+    batch = logits.shape[0]
+    q = torch.empty(
+        (batch, SMALL_TOPK_WINDOW),
+        dtype=torch.float64 if use_fp64_gumbel else torch.float32,
+        device=logits.device,
+    )
+    if len(generators) != batch:
+        q.exponential_()
+    for i, generator in generators.items():
+        q[i].exponential_(generator=generator)
+    if q.dtype != torch.float32:
+        q = q.float()
+    return quixicore_ops.topk_sample(
+        logits.float() if logits.dtype != torch.float32 else logits,
+        k.to(torch.int32),
+        None if p is None else p.to(torch.float32),
+        q,
+    )
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:

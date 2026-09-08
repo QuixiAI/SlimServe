@@ -843,6 +843,20 @@ Expected: c1 well under 200 because of the BF16 backbone and NCCL.
 Exit: c8 no-spec >= 740 (B12X bar), TP2/TP4 scaling >= 1.5x, correctness
 legs unchanged. Notebook entries for every kernel choice including the loser.
 
+Phase 2 third lever, done 2026-09-07 22:06 (notebook "Small-k sampler
+kernel (QuixiCore topk_sample)"): the decode sampler's fused Triton
+top-k/top-p kernel plus full-vocabulary softmax (~180 us per step at every
+concurrency) replaced by two QuixiCore launches (radix top-32 candidates
+per row, then merge + masks + softmax + noise argmax on the candidates)
+when every request's top_k <= 32; sampling class 0.17 -> 0.01 ms/step,
+like-state +2.8% c1 / +1.0% c8 / +1.0% c16, gates in band. Same session:
+mHC cooperative launch extended to T <= 8 by default (+1.2% c8), custom AR
+forced one-stage rejected (-1.5% c8 / -2.6% c16), c16 attribution on the
+final tree (Marlin 52% at the expert-bandwidth floor; the movable
+remainder is the mHC split path at T = 16, the reduces, the logits
+all-gather and ~1000 sub-5 us launches). Fast/fast-state throughput of
+this tree not yet observed; like-state predicts ~157 / 525 / 685.
+
 ### Phase 2: fixed overhead (the single-stream lever)
 
 1. All-reduce: measure NCCL vs vLLM custom AR vs FlashInfer PCIe-IPC
