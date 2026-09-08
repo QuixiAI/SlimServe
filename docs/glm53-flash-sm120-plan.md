@@ -12,7 +12,7 @@ floor as the engineering allows, measured every step, with no regressions.
 
 ## 1. Hardware and model facts that set the ceiling
 
-RTX PRO 6000 Blackwell Workstation (measured on tinybox, driver 580.173.02):
+RTX PRO 6000 Blackwell Workstation (measured on the sm_120 box, driver 580.173.02):
 
 | item | value |
 |---|---|
@@ -22,7 +22,7 @@ RTX PRO 6000 Blackwell Workstation (measured on tinybox, driver 580.173.02):
 | topology | GPU0-GPU1 and GPU2-GPU3 PHB, cross-pair NODE; P2P read OK on all pairs |
 | CUDA | 12.8, 13.0, 13.2 toolkits; family cubin `12.0f` needs CUDA >= 13.0 |
 
-GLM-5.3-Flash (`/raid/weights/GLM-5.3-Flash/config.json`, native FP8, 306 GiB):
+GLM-5.3-Flash (`<models>/GLM-5.3-Flash/config.json`, native FP8, 306 GiB):
 45 layers, first 3 dense (FFN 12288), 42 MoE layers with 288 routed experts
 (top-8, `moe_intermediate_size` 2048 -> 25.2M params per expert) plus one
 shared expert; 34 KDA linear-attention layers (64 heads x 128, state 2 MiB
@@ -64,7 +64,7 @@ comm -> ~630 tok/s; c8 floor ~15.4 ms for 24 tokens -> ~1550 tok/s.
 
 Engineering target = 60-70% of floor:
 
-| shape | today (Foundry SGLang FP8) | B12X R24 bar (4x PRO 6000) | B12X R24 on tinybox, handicapped | our Phase 0 baseline | target |
+| shape | today (Foundry SGLang FP8) | B12X R24 bar (4x PRO 6000) | B12X R24 on the sm_120 box, handicapped | our Phase 0 baseline | target |
 |---|---|---|---|---|---|
 | c1, no spec | 88.5 | 169.9 | 134.0 | 104.8 | 300-350 |
 | c1, MTP-3 | 141.7 (NextN 5/6) | 247.8 (2.50 acc/step) | 194-212 (2.2-2.8 acc/step) | - | 400-500 |
@@ -77,7 +77,7 @@ The handicapped column is the published image run on this host with its TP
 all-reduce forced onto a PyNCCL ring over host shared memory (the 580.173
 driver is CUDA 13.0; the CUDA 13.3 image's NCCL cuMem/P2P and B12X CUDA IPC
 paths fail, launcher knob B12X_PCIE_ALLREDUCE=0; notebook entry "B12X R24
-control on tinybox (handicapped)"). It is a floor we must beat in every cell,
+control on the sm_120 box (handicapped)"). It is a floor we must beat in every cell,
 not the bar; an unhandicapped local control needs a 13.3-capable driver,
 which is an operator decision on the shared box.
 
@@ -244,27 +244,20 @@ chain (KDA's four projections).
   `TORCH_CUDA_ARCH_LIST=12.0f` (one family cubin), `MAX_JOBS=8`,
   `NVCC_THREADS=2`, under `systemd-run --user --scope -p MemoryMax=120G`.
   earlyoom is active; 188 GB host RAM.
-- Venvs live under `~/venvs` on the main drive, never on /raid (operator
-  rule, 2026-09-04): `~/venvs/slimserve-glm53-flash`, symlinked to `.venv`.
-  Scratch goes to /raid: `UV_CACHE_DIR=/raid/scratch/uv-cache`,
-  `TMPDIR=/raid/scratch/slimserve-glm53/tmp` (setuptools puts the CMake
-  build tree under TMPDIR, tens of GB), logs and operator scripts under
-  `/raid/scratch/slimserve-glm53/`, never /tmp.
-- CUTLASS via `VLLM_CUTLASS_SRC_DIR=/raid/scratch/slimserve-glm53/cutlass`
+- The venv lives outside the repo, symlinked to `.venv`. Scratch (the uv
+  cache, `TMPDIR` for the CMake build tree, tens of GB, logs and operator
+  scripts) lives outside the repo too, never /tmp; `<scratch>` below stands
+  for it and `<models>` for the model cache (`SLIMSERVE_CACHE`).
+- CUTLASS via `VLLM_CUTLASS_SRC_DIR=<scratch>/cutlass`
   (v4.4.2, shallow clone): the FetchContent clone hung at 0% CPU for 38
   minutes once; a local checkout removes the network from the build.
 - While `uv pip install -e .` runs it holds `.venv/.lock`; any other uv
   install into that venv waits until the build finishes.
 - Docker is not the house tool (operator, 2026-09-04): acceptable only when
   it is the only practical way, which the image-only B12X control is.
-  Before pulling it again, containerd's root must move to /raid: Docker's
-  data-root is /raid/docker but the containerd image store is
-  `/var/lib/containerd` on the root disk (a 42 GB pull landed there).
 - Foundry and its model servers are stopped while this work runs; the four
-  GPUs are otherwise idle. The parked HunyuanImage-3 Distil weights went
-  back to /raid (verified identical, duplicate removed) and
-  hunyuan-v3-work moved to /raid/tmp with a symlink; root is at 65%. Attribute GPU processes by PID lineage, never by
-  memory footprint (Foundry deployment notes, 2026-07-16).
+  GPUs are otherwise idle. Attribute GPU processes by PID lineage, never by
+  memory footprint.
 - Commit authorship: one human author per commit (Eric Hartford or the
   authorized maintainer), no co-author or assistance trailers. `CLAUDE.md`
   updated on this branch.
@@ -312,7 +305,7 @@ chain (KDA's four projections).
   p50 10.3-11.1 us at c1 (8 KB) and 14-15 us at c8 (64 KB), 0.93 / 1.39 ms
   per step. The 30-50 us assumption was wrong; the PCIe-IPC ceiling is
   ~0.5 ms/step (~5% at c1), so this drops to item 5 of the Phase 1 list.
-- Artifacts: /raid/scratch/slimserve-glm53/research/pr53576.diff and
+- Artifacts: <scratch>/research/pr53576.diff and
   upstream_prepr/.
 
 ### MTP draft model (vLLM #53906, merged 2026-09-03)
@@ -367,11 +360,11 @@ chain (KDA's four projections).
 - sm_120 validation order: greedy k=1 equivalence (draft on vs off, same
   seed) before k=2/3; k=2,3 exercise the indexer `use_flattening` path off
   SM100; re-run the deep-context leg because group geometry changed.
-- Artifact: /raid/scratch/slimserve-glm53/research/pr53906.diff (mtp.py at
+- Artifact: <scratch>/research/pr53906.diff (mtp.py at
   diff lines 12099-12530).
 
 ### Hybrid checkpoint inventory (RedHatAI NVFP4 vs native FP8)
-- Files: /raid/scratch/slimserve-glm53/research/tensors-{redhat,native}.tsv
+- Files: <scratch>/research/tensors-{redhat,native}.tsv
   (148,498 and 76,108 tensors), scripts `dump_tensors.py`,
   `classify_tensors.py`, `per_token_bytes.py` and their outputs there.
 - RedHatAI backbone is all BF16 = dequant(native FP8) rounded to BF16
@@ -658,7 +651,7 @@ plan's own tolerance: -0.014 nats mean NLL over 8 vs 26 readings, needle
 unchanged. Record now 152.7 / 519 / 679 no-spec (fast state); the c8 bar
 (740) is 70% covered. Revert = relink the plain sidecar.
 
-### Bytes research digest (2026-09-07, read-only; full notes in /raid/scratch/slimserve-glm53/research/fp8-{swapset,kv}-research-2026-09-07.md)
+### Bytes research digest (2026-09-07, read-only; full notes in <scratch>/research/fp8-{swapset,kv}-research-2026-09-07.md)
 
 FP8 weight swap-set (Phase 1 item 2b): the native checkpoint's FP8 block
 tensors (e4m3, 128x128 F32 scales) cover exactly the dense MLP (L0-2), the
@@ -785,8 +778,7 @@ once the NLL / needle legs run on this platform.
 
 ### Phase 0: platform, build, baseline (no kernel work)
 
-1. Build on tinybox per section 3c: prebuilt torch cu130 wheels into
-   `~/venvs/slimserve-glm53-flash`, then the capped native build of
+1. Build per section 3c: prebuilt torch cu130 wheels into the venv, then the capped native build of
    `_C_stable_libtorch` for `12.0f`; smoke `import vllm._C_stable_libtorch`.
    Pull the B12X r24 control image and measure it first on the same shapes.
 2. Add platform `rtx6000`: `hardware.py:_classify` branch, `profiles.json`
@@ -797,8 +789,7 @@ once the NLL / needle legs run on this platform.
    A100 64 GiB per rank); NVMe tier dir is operator env.
 3. Checkpoint: `RedHatAI/GLM-5.3-Flash-NVFP4` (198 GB, compressed-tensors,
    the one the profile already names and the one that produced clean text
-   on 4x RTX PRO 6000 in vLLM). Download needs operator approval (966 GB
-   free on /raid). Keep `/raid/weights/GLM-5.3-Flash` (native FP8) for the
+   on 4x RTX PRO 6000 in vLLM). Download needs operator approval. Keep `<models>/GLM-5.3-Flash` (native FP8) for the
    backbone in Phase 1.
 4. First serve with the lowest-risk kernel set: Marlin W4A16 NVFP4 experts
    (Marlin builds for 12.0f), QuixiCore sparse NoPE MLA (check the 99 KB
@@ -996,14 +987,12 @@ parity test, microbench GB/s, and an e2e entry.
 ## 6. Operator decisions
 
 1. Checkpoint download: approved 2026-09-04 for whichever NVFP4 build the
-   quant survey ranks first (section 7). Lands under /raid/weights.
+   quant survey ranks first (section 7). Lands under the model cache.
 2. Commit authorship: resolved 2026-09-04, see section 3c.
 3. Host tier size on 188 GB RAM and the NVMe tier directory: open.
 4. Foundry: stopped for the duration; the pipeline arm switches to the
    SlimServe profile when a phase beats the B12X control on the Foundry
    shape, not before.
-5. Home volume at 91% (`~/venvs` 198 GB, `~/weights-parked` 158 GB): worth
-   a cleanup pass before large builds land there.
 
 ## 7. Quant survey (2026-09-04)
 
@@ -1035,10 +1024,10 @@ ModelOpt-specific bugs: weight-only MoE input_scale folded to zero
 
 Decision (2026-09-04): serve **RedHatAI** first (clean on this hardware,
 stock loader, MTP head present, quality at parity with FP8). Downloading
-to `/raid/weights/GLM-5.3-Flash-NVFP4`. Check that SlimServe's loader
+to `<models>/GLM-5.3-Flash-NVFP4`. Check that SlimServe's loader
 picks up `model_mtp.safetensors`, which sits outside the shard index.
 The control image runs its own qualified `local-inference-lab` checkpoint
-(downloading into the shared HF cache at `/raid/weights/huggingface`).
+(downloading into the shared HF cache at `<models>/huggingface`).
 Phase 1 builds the hybrid ourselves: RedHatAI experts plus the native FP8
 block tensors from `zai-org/GLM-5.3-Flash` for all 45 layers, in the mixed
 compressed-tensors layout RedHatAI already uses for layer 45. coolbho3k's

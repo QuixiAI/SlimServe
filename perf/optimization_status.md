@@ -19251,8 +19251,8 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   no KV tier, no speculation, EP off. Tree: upstream/main 9247eedad plus the
   uncommitted platform work (hardware classify, profiles.json record, the
   DeepGEMM cmake guard, CLAUDE.md authorship). Checkpoint: RedHatAI
-  GLM-5.3-Flash-NVFP4 at /raid/weights.
-- Build: torch 2.13.0+cu130 prebuilt wheels in ~/venvs/slimserve-glm53-flash;
+  GLM-5.3-Flash-NVFP4 at <models>.
+- Build: torch 2.13.0+cu130 prebuilt wheels in the venv;
   native `_C_stable_libtorch` + `_moe_C_stable_libtorch` + `_quixicore_C`
   for TORCH_CUDA_ARCH_LIST=12.0f against CUDA 13.0 and a local CUTLASS
   v4.4.2 (the FetchContent clone hung on this box), MAX_JOBS=8 NVCC_THREADS=2
@@ -19261,7 +19261,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   never on A100; guarded in cmake/external_projects/deepgemm.cmake.
   FlashMLA does not build for 12.0 and is not needed on this path. No
   FlashInfer in the venv (the glm53 path never imports it).
-- Boot (serve-20260904-144436.log): weights 156 s from /raid, engine init
+- Boot (serve-20260904-144436.log): weights 156 s from disk, engine init
   54.7 s (torch.compile 25.1 s), graph capture 3 s / 0.16 GiB (5 FULL decode sizes, n<=16), /health at
   +290 s; 82.2 GB resident per card at gpu_memory_utilization 0.85. 66/66
   profile + hardware tests pass on this tree.
@@ -19274,7 +19274,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Exact-token harness (benchmarks/benchmark_dsv4_exact.py, 1000 in / 300
   out, temp 1.0 / top-p 0.95 / top-k 20, seed 42, warmup 8,
   PROMPT_OVERHEAD=0 gives exact:true on every shape, source
-  /raid/scratch/slimserve-glm53/prompt-source.txt with --repeat-source),
+  <scratch>/prompt-source.txt with --repeat-source),
   aggregate output tok/s, two identical passes (pass 2 = APC-hot):
   | shape          | pass 1 | pass 2 | median latency | ms/step |
   | c1-1000-300    | 104.9  | 104.8  | 2.86 s         | 9.5     |
@@ -19308,8 +19308,8 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   baseline-pass1,baseline-pass2,baseline-1k2k}/ (run.txt with commit,
   nvidia-smi clocks/power/temperature per shape, per-shape harness JSON
   with response SHA-256 digests, *-completions/). Serve log:
-  /raid/scratch/slimserve-glm53/serve-logs/serve-20260904-144436.log.
-  Build log: /raid/scratch/slimserve-glm53/build-6.log.
+  <scratch>/serve-logs/serve-20260904-144436.log.
+  Build log: <scratch>/build-6.log.
 
 ## 2026-09-04: sm_120 baseline attribution - torch profiler traces of a c1 and a c8 decode step
 
@@ -19409,18 +19409,18 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
      base/scale) from native.
 - Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-profile/
   (per-class tables, top-60 kernel tables, torch profiler key_averages,
-  the driver and analysis scripts). Traces: /raid/scratch/slimserve-glm53/
+  the driver and analysis scripts). Traces: <scratch>/
   profile-c1/ and profile-c8/ (4 ranks each). Serve log:
   serve-logs/serve-20260904-145736.log.
 
-## 2026-09-04: B12X R24 control on tinybox (handicapped) - local floor for the sm_120 campaign
+## 2026-09-04: B12X R24 control on the sm_120 box (handicapped) - local floor for the sm_120 campaign
 
 - Status: CONTROL RECORDED, no code change. A handicapped lower bound for
   the B12X "Jovian Judgement" R24 stack on this exact host; the bar for the
   campaign stays the published numbers.
 - Scope: image voipmonitor/vllm:jovian-judgement-community-20260904-r24
   (sha256 ab4ff9d6...), checkpoint local-inference-lab/GLM-5.3-Flash-NVFP4
-  from the HF cache on /raid, the published recipe verbatim: TP4 DCP1,
+  from the HF cache, the published recipe verbatim: TP4 DCP1,
   fp8_ds_mla KV, FULL_AND_PIECEWISE graphs (13 piecewise sizes to 256 plus
   FULL decode), max_num_seqs 32, 4,096 batched tokens, compute-share
   fairness 0.4, gpu_memory_utilization 0.93; B12X NVFP4 W4A4 experts, B12X
@@ -19474,14 +19474,12 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
     the c1 lever after the backbone, as the plan says.
 - Decision: bar unchanged (169.9 / 737.8 no-spec, 247.8 / 903.2 MTP-3).
   Beating the local floor in every cell is necessary, not sufficient. An
-  unhandicapped local control needs a 13.3-capable driver on tinybox, an
+  unhandicapped local control needs a 13.3-capable driver on the sm_120 box, an
   operator decision (shared box); flagged in the plan doc.
 - Raw: perf/results/2026-09-04/b12x-r24-control-{nospec,mtp3}-pass{1,2,3}/
   (harness JSON, completions), container logs and the launcher/bench
-  drivers in /raid/scratch/slimserve-glm53/{control-logs,control.sh,
-  control-bench.sh}. Side effect recorded: the 42 GB image lived in
-  /var/lib/containerd on the root disk; containerd's root is now
-  /raid/containerd (docker's was already /raid/docker).
+  drivers in <scratch>/{control-logs,control.sh,
+  control-bench.sh}.
 
 ## 2026-09-04: F32 sidecar for the RedHatAI NVFP4 conversion (router bias, KDA decay, mHC vectors) - RETAINED
 
@@ -19515,7 +19513,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   F32 params in the tree (deepseek_v2.py, kimi_gdn_linear_attn.py,
   glm5_next.py:262). Serve log on boot B: "290 F32 override tensors" on
   every rank, no unmatched-name warning. Scoring gate
-  (`/raid/scratch/slimserve-glm53/gate.py`: prompt_logprobs mean logprob on
+  (`<scratch>/gate.py`: prompt_logprobs mean logprob on
   8 fixed 512+32-token slices of the repo-prose source, plus needle margins
   at 1K and 7K), 4 runs per arm over two boots each:
   | arm                    | mean text logprob (n=4)        | needle@1k    | needle@7k    |
@@ -19531,7 +19529,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
 - Results (exact-token, 1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k
   20, seed 42, PROMPT_OVERHEAD 0, exact:true throughout):
   | boot                          | c1     | c8     |
-  | A shard copies, pass 1        | 95.7   | 416.8  |  (host contention: 44 GB containerd move ran inside this window)
+  | A shard copies, pass 1        | 95.7   | 416.8  |  (host contention: a 44 GB file move ran inside this window)
   | B F32 sidecar, pass 1         | 104.65 | 431.55 |
   | B F32 sidecar, pass 2 (quiet) | 104.77 | 431.57 |
   | A shard copies, pass 2 (quiet)| 104.67 | 432.25 |
@@ -19543,7 +19541,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   (`api_server`, not `slimserve.cli`) in liveness checks.
 - Raw artifacts: perf/results/2026-09-04/glm53-nvfp4-4-rtx6000-f32ab-{A,B}/
   and -f32ab2-{A,B}/ (bench JSON, completions, nvidia-smi per shape);
-  gate JSON and serve logs under /raid/scratch/slimserve-glm53/ab-f32/ and
+  gate JSON and serve logs under <scratch>/ab-f32/ and
   serve-logs/serve-20260904-16{0459,1100,1443,1826}.log.
 
 ## 2026-09-04: KDA o_norm through the fused Triton kernel - RETAINED (+5.0% c1, +3.0% c8, +2.0% c16)
@@ -19587,7 +19585,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   gate_up dual-output decode GEMV).
 - Raw: perf/results/2026-09-04/o-norm-triton-pass{1,2}/, serve log
   serve-logs/serve-20260904-162849.log and ab-o-norm-triton.log under
-  /raid/scratch/slimserve-glm53/serve-logs/; driver ab.sh (boot the
+  <scratch>/serve-logs/; driver ab.sh (boot the
   profile, bench two passes, stop).
 
 ## 2026-09-04: KDA g_a_proj folded into the merged in-projection - RETAINED (+0.9% c1, neutral c8/c16)
@@ -19824,7 +19822,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   The two mHC boots sit inside the fold tree's own two-boot spread at every
   concurrency; a 1% c8 effect is not resolvable with two boots per arm.
 - Decision: PARKED. The launcher change (tm_cuda_serving.cu: occupancy
-  query, grid NSPLITS x T, cap 8; /raid/scratch/slimserve-glm53/
+  query, grid NSPLITS x T, cap 8; <scratch>/
   step_mhc_apply.py) rides with the phase-end native rebuild on its
   kernel-level evidence, not as a retained throughput change.
 - The boot spread, measured: same tree, same config, consecutive boots
@@ -19842,7 +19840,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   discarded, a slow boot on a quiet host is the next thing to profile.
 - Raw: perf/results/2026-09-04/mhc-coop-multi{,-b2}-pass{1,2}/,
   fold-tree-b2-pass{1,2}/, gate JSONs beside them; jit/{qc_dev.cu,
-  test_mhc.py, site/sitecustomize.py} under /raid/scratch/slimserve-glm53/.
+  test_mhc.py, site/sitecustomize.py} under <scratch>/.
 
 ## 2026-09-04: fused small-M routing + Marlin alignment - RETAINED on the profiler pair (-81 launches, -1.2% c1 step)
 
@@ -19904,7 +19902,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   kernel idle inside the CUDA graph on the GPU timeline, not host work.
 - Raw: perf/results/2026-09-04/route-fused{,-b2}-pass{1,2}/, gate JSONs,
   route-fused-profile/ (step-attrib for both pairs, prof_pair.sh);
-  /raid/scratch/slimserve-glm53/jit/{routing.cu,test_routing.py}.
+  <scratch>/jit/{routing.cu,test_routing.py}.
 ## 2026-09-04: GLM-5.3-Flash MTP (NextN) draft path on sm_120 - port, the stack's noise floor, and a per-workload verdict
 
 - Status: retained for the rtx6000 record at num_speculative_tokens 3, as a
@@ -20016,7 +20014,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   fix-k1,fix-k3}/ (exact-token JSON + completions), .../mtp-diag/ (gate,
   greedy fingerprints, logit probes, noise summary, accept probes,
   workload bench JSON, foundry-prompt.txt); scratch under
-  /raid/scratch/slimserve-glm53/mtp-gate/ (serve outputs, draft dumps).
+  <scratch>/mtp-gate/ (serve outputs, draft dumps).
 
 ## 2026-09-04: one Marlin MoE workspace per device instead of one per call - RETAINED (-37 launches, neutral time)
 
@@ -20041,7 +20039,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   so no time is won; 37 launches per step are.
 - Decision: RETAINED. The chain since Phase 0 now stands at 8.2 ms of
   kernels per c1 step against 9.19 (-11%), 1369 launches against 2041.
-- Raw: profile-marlin-ws-{A,B} traces under /raid/scratch/slimserve-glm53/.
+- Raw: profile-marlin-ws-{A,B} traces under <scratch>/.
 ## 2026-09-04: GLM-5.3-Flash MTP on the Foundry fan-out - REJECTED as the rtx6000 default
 
 - Status: rejected as the record default (record flipped to speculative
@@ -20131,7 +20129,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   family cubin, Release) rather than the JIT compile (12.0a, -O3,
   --use_fast_math). Not understood yet.
 - Workarounds recorded: profiling boots use `QC_DEV_ROUTE=1
-  PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site` (JIT kernel) or
+  PYTHONPATH=<scratch>/jit/site` (JIT kernel) or
   `SLIMSERVE_GLM_ROUTE_ALIGN=0` (reference routing); serving boots need
   nothing. Kill-switch added to glm_route_align.py (same pattern as the F32
   sidecar's).
@@ -20226,7 +20224,7 @@ then a hook-cleanliness commit for the tier modules (2fce6a002d).
   not from boot conditions.
 - Raw: kernel log Xid lines (dmesg), serve-logs/serve-20260907-113752.log,
   the core dump (deleted after analysis; cuda-gdb facts above),
-  /raid/scratch/slimserve-glm53/jit/{build_routing_120f.py, stress_routing.py,
+  <scratch>/jit/{build_routing_120f.py, stress_routing.py,
   fault_hunt.sh}.
 
 ## 2026-09-07: Phase 1 item 2 remainder - MoE finalize copy removed, shared-expert add fused into the Marlin sum
@@ -20264,7 +20262,7 @@ No regression; c1 and c8 are at the boot-spread floor (arm A's first c1 pass was
 
 **Decision.** Retain both. The plumbing is inert without the binding (`has_moe_sum_add()` False -> old op, old path), so the Python lands now and the kernel activates with the rebuild; any config outside the static gate keeps the two-output op unchanged.
 
-**Raw artifacts.** /raid/scratch/slimserve-glm53/profile-{alias-A,alias-B,combine-A,combine-B}/, serve-logs/{item2_pairs.out,prof-combine-B.out,gate-alias-*.json,gate-combine-B.json,smoke-combine.out}, jit/{combine.cu,build_combine.py,build_combine_120f/}, perf/results/2026-09-07/item2-{A,B}-pass{1,2}/.
+**Raw artifacts.** <scratch>/profile-{alias-A,alias-B,combine-A,combine-B}/, serve-logs/{item2_pairs.out,prof-combine-B.out,gate-alias-*.json,gate-combine-B.json,smoke-combine.out}, jit/{combine.cu,build_combine.py,build_combine_120f/}, perf/results/2026-09-07/item2-{A,B}-pass{1,2}/.
 
 ## 2026-09-07: Phase 1 item 4 - bf16 M<=16 tensor-core GEMM replaces cuBLAS on the backbone projections
 
@@ -20321,9 +20319,9 @@ Custom-op trampoline (op_overhead_bench.py, eager, GPU 0): the torch.library Pyt
 
 Correctness in the serving path: the second gate run landed 0.005 above the band's upper edge (the better side; same-boot gate repeats differ by 0.02-0.03, so this is the sampled-continuation noise the 09-04 entry documents, and a wrong GEMM would move it the other way). The lower-noise check is the mean of the 4344 prompt logprobs in the gate JSON: item4-B -3.2857 / -3.2774 vs item2-B (same tree, cuBLAS) -3.2819 / -3.2696 and alias-B -3.2744, i.e. within the 0.012 that two gate runs on one boot differ by. Note for the record: the per-token prompt logprobs are not repeatable even within a boot (mean |delta| 0.25, max 19 between two gate runs on the same server; the batch-variant kernels the 09-04 entry lists), so only the mean is a usable signal.
 
-**Decision.** RETAINED. Kernel-level: 0.20 ms (2.4%) off the c1 step's kernel-busy time and 34 fewer launches, every replaced shape at or below its cuBLAS time at every M; end-to-end: +1.5% c1, +1.3% c8, +0.7% c16 between like boot states, gates in band, prompt-logprob mean within same-boot noise. Ships with `SLIMSERVE_DECODE_GEMM=0` as the kill switch and `decode_gemm=<enabled>` in the compile-cache factors. Inert in the shipped binary until the native rebuild adds the binding (batched with item 2's moe_sum_add); until then the JIT hook (`QC_DEV_GEMM=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site`) is the way to run it. Follow-ups: shared gate_up 1024 rows (row-per-block at M=1 / mma above; 42 launches x 7.4 us on the aux stream, so ~0.1 ms of overlapped time), the C++ op registration above, and the `tile the K loop over two weight rows per warp` idea for the 10-25 us shapes stuck at ~1.4 TB/s (launch ramp; only fusing launches recovers the rest).
+**Decision.** RETAINED. Kernel-level: 0.20 ms (2.4%) off the c1 step's kernel-busy time and 34 fewer launches, every replaced shape at or below its cuBLAS time at every M; end-to-end: +1.5% c1, +1.3% c8, +0.7% c16 between like boot states, gates in band, prompt-logprob mean within same-boot noise. Ships with `SLIMSERVE_DECODE_GEMM=0` as the kill switch and `decode_gemm=<enabled>` in the compile-cache factors. Inert in the shipped binary until the native rebuild adds the binding (batched with item 2's moe_sum_add); until then the JIT hook (`QC_DEV_GEMM=1 PYTHONPATH=<scratch>/jit/site`) is the way to run it. Follow-ups: shared gate_up 1024 rows (row-per-block at M=1 / mma above; 42 launches x 7.4 us on the aux stream, so ~0.1 ms of overlapped time), the C++ op registration above, and the `tile the K loop over two weight rows per warp` idea for the 10-25 us shapes stuck at ~1.4 TB/s (launch ramp; only fusing launches recovers the rest).
 
-**Raw artifacts.** /raid/scratch/slimserve-glm53/{gemm16_bench.py, jit/decode_gemm.cu, jit/build_decode_gemm_120f/}, profile-gemm-{A,B}/, serve-logs/{smoke-gemm.out, ab-item4-*.out}, perf/results/2026-09-07/item4-{A,B}-pass{1,2}/.
+**Raw artifacts.** <scratch>/{gemm16_bench.py, jit/decode_gemm.cu, jit/build_decode_gemm_120f/}, profile-gemm-{A,B}/, serve-logs/{smoke-gemm.out, ab-item4-*.out}, perf/results/2026-09-07/item4-{A,B}-pass{1,2}/.
 
 ## 2026-09-07: Boot spread probe - the exact-token harness moves 4% between boots of identical code, and it is not the GPU
 
@@ -20339,13 +20337,13 @@ Correctness in the serving path: the second gate run landed 0.005 above the band
 
 **Follow-up (its own item, needs root).** (1) `cpupower frequency-set -g performance` and re-run three boots of one arm; (2) pin EngineCore and the four workers (taskset / numactl) to one CCD each and repeat; (3) log `nvidia-smi --query-gpu=clocks.sm,clocks.mem,power.draw -l 1` alongside every bench so a GPU-side cause can be excluded per run rather than per profiler pair.
 
-**Raw artifacts.** perf/results/2026-09-07/item4-{A,B,A2,B2,A3,B3}-pass{1,2}/, /raid/scratch/slimserve-glm53/profile-{combine-B,gemm-A,gemm-B}/.
+**Raw artifacts.** perf/results/2026-09-07/item4-{A,B,A2,B2,A3,B3}-pass{1,2}/, <scratch>/profile-{combine-B,gemm-A,gemm-B}/.
 
 **Probe results (2026-09-07 17:16-17:50, same tree, item 4 kernel arm, --no-spec).**
 
 *Governor: ruled out.* `cpupower frequency-set -g performance` for three boots, then three more on `schedutil` (governor_ab.sh; serve-logs/governor-ab.out). Performance: c1 117.4/117.5, 112.8/112.8, 113.3/113.3. Schedutil: 112.6/112.7, 117.4/117.5, 112.6/112.7 (c8 469 fast / 457 slow, c16 619 / 607 in both governors). The mean CPU clock under `performance` is 3.0 GHz against 1.8 GHz under `schedutil` (clocks-cpu-gov-*.csv) and it changes nothing: the state is binary and independent of the governor. GPU SM clocks under load are 2812-2835 MHz median on every card in all six boots, memory 13365 MHz, power 437-448 W median, no throttle reasons (clocks_summary.py) - the GPU clocks are ruled out per run now, not only per profiler pair.
 
-*Thread placement: ruled out.* The 5 s placement sampler (threads-gov-sched-*.log) showed the EngineCore thread of both slow schedutil boots sitting on the SMT sibling of (or the same logical core as) the tinybox display service, a permanent daemon at 27% of a core, and never colocated in the fast boot. pin_probe.sh tested that inside one boot: c1 unpinned 117.3/117.5, EngineCore pinned to a clean physical core 117.5/117.5, pinned onto the display service's sibling 117.4/117.4, released 117.4/117.3. Placement of the serial host thread does not move the number, and the state did not change across eight passes and three affinity changes, so it is not a host-thread property. Engine-side TPOT tracks the client number (it is not the API server or the client).
+*Thread placement: ruled out.* The 5 s placement sampler (threads-gov-sched-*.log) showed the EngineCore thread of both slow schedutil boots sitting on the SMT sibling of (or the same logical core as) the the sm_120 box display service, a permanent daemon at 27% of a core, and never colocated in the fast boot. pin_probe.sh tested that inside one boot: c1 unpinned 117.3/117.5, EngineCore pinned to a clean physical core 117.5/117.5, pinned onto the display service's sibling 117.4/117.4, released 117.4/117.3. Placement of the serial host thread does not move the number, and the state did not change across eight passes and three affinity changes, so it is not a host-thread property. Engine-side TPOT tracks the client number (it is not the API server or the client).
 
 *Where it actually is: per-node latency inside the CUDA-graph replay, on all four GPUs at once.* gap_locate.py on the rank traces: per step the host is ahead on every rank (the next cudaGraphLaunch is issued 3-7 us before the previous step's last kernel ends; ranks 1-3 launch 250 us ahead), launch latency is 10 us, and the whole difference is in-step idle: 0.370 ms (fast boot, combine-B) against 0.685 / 0.672 ms (slow boots gemm-A / gemm-B), identical on ranks 0-3 of each boot. The idle is not a few large gaps: gaps above 3 us total 45 us (fast) and 90 us (slow) per step, and the extra 0.3 ms is spread across the ~1250 nodes. Same-stream gap histogram (gap_hist.py, main stream): fast boot median 0.10 us with 81% of gaps under 0.5 us; slow boots median 0.45 us with 61-64% under 0.5 us and 18-20% in 0.5-1 us. The gap before each NCCL allreduce kernel moves the same way (median 2.2 -> 2.6 us, share above 3 us 13% -> 31%, ar_stats.py), and allreduce duration +0.25 us. So the slow state is the GPU front-end taking ~0.25-0.35 us longer per graph node, set once per boot, the same on all four cards; nothing on the host critical path is involved. That also explains why the exact-token spread scales with node count: the launch census's 685 sub-4 us kernels per step are the surface it acts on, so node-count reductions (fusions, custom all-reduce on the compute stream) shrink the spread as well as the mean.
 
@@ -20353,7 +20351,7 @@ Correctness in the serving path: the second gate run landed 0.005 above the band
 
 *Method change (ab.sh STATE=1).* Every exact-token boot can now label its own front-end state: the profiler is armed at boot (`--torch-profile-dir`, idle until /start_profile), one profiled c1 round runs after the two benches, and gap_locate.py's in-step idle (~0.37 ms fast, ~0.68 ms slow) plus step_attrib's kernel-busy are printed with the run. Exact-token arms are compared like-state from here; a boot in the other state is reported, not averaged.
 
-**Raw artifacts (probes).** serve-logs/governor-ab.out, clocks-{gpu,cpu}-gov-*.csv, threads-gov-sched-*.log, pinprobe-1.out, perf/results/2026-09-07/gov-{perf,sched}-{1,2,3}-pass{1,2}/ and pinprobe-1-{u1,u2,p1,p2,s1,s2,r1,r2}/; scripts governor_ab.sh, pin_probe.sh, gap_locate.py, gap_hist.py, ar_stats.py, clocks_summary.py in /raid/scratch/slimserve-glm53.
+**Raw artifacts (probes).** serve-logs/governor-ab.out, clocks-{gpu,cpu}-gov-*.csv, threads-gov-sched-*.log, pinprobe-1.out, perf/results/2026-09-07/gov-{perf,sched}-{1,2,3}-pass{1,2}/ and pinprobe-1-{u1,u2,p1,p2,s1,s2,r1,r2}/; scripts governor_ab.sh, pin_probe.sh, gap_locate.py, gap_hist.py, ar_stats.py, clocks_summary.py in <scratch>.
 
 ## 2026-09-07: FP8 weight swap-set, part 1 - kernel choice for the block-FP8 backbone linears at decode
 
@@ -20381,7 +20379,7 @@ Per c1 step on the item 4 tree: dense 3 x (15 + 8) + DSA 11 x (4.7 + 10.1) + sha
 
 **Lossless, measured.** The sidecar builder (`slimserve/fp8_swapset.py`, layers 0-44, 314 tensors, 2.53 GB) checks every swapped weight: bf16(scale x fp8) from the native shards equals the RedHatAI BF16 tensor in 0 of 723M elements (max 0 bf16 ulp) across all eight module kinds. The decode kernel converts exactly that way, so at M <= 16 it multiplies bit-for-bit the weights served today; only the accumulation order differs from cuBLAS, as for item 4.
 
-**Raw artifacts.** /raid/scratch/slimserve-glm53/{fp8_block_bench.py, fp8_gemm16_bench.py, jit/fp8_decode_gemm.cuh, jit/fp8_decode_gemm.cu, jit/build_fp8_decode_gemm_120f/, fp8-swapset/, serve-logs/fp8-swapset-build.out}, research/fp8-swapset-research-2026-09-07.md.
+**Raw artifacts.** <scratch>/{fp8_block_bench.py, fp8_gemm16_bench.py, jit/fp8_decode_gemm.cuh, jit/fp8_decode_gemm.cu, jit/build_fp8_decode_gemm_120f/, fp8-swapset/, serve-logs/fp8-swapset-build.out}, research/fp8-swapset-research-2026-09-07.md.
 
 ## 2026-09-07: FP8 weight swap-set, part 2 - serving A/B of the native e4m3 backbone tensors on the W8A16 decode GEMM
 
@@ -20420,7 +20418,7 @@ The first pair is ambiguous: 118.4 is +0.8% on a fast-state A, but it is also ex
 
 **Follow-ups.** (1) Small-K fp8 shapes under aux-stream contention: shared down (N=4096, K=512) 8.7 us vs bf16 4.0, shared gate_up (N=1024, K=4096) 8.2 vs cuBLAS 7.4. Options, one factor each: keep shared down on BF16 (sidecar variant without `shared_experts.down_proj`; the manifest hash keys the compile cache); a K<=1536 variant of the fp8 kernel (KCHUNK 64 / more stages, scale hoisted out of the chunk loop, or a row-per-warp GEMV at M=1); check co-residency with Marlin (registers/smem). The prize is only real if the aux chain is ever on the critical path, so measure the union, not the durations. (2) fused_qkv_a stays BF16 (indexer shards); (3) the C++ binding lands with the next native rebuild (post_rebuild_validate.sh covers decode_gemm_fp8).
 
-**Raw artifacts.** perf/results/2026-09-07/fp8swap-{A,B,B2,A2}-pass{1,2}/, fp8swap-B-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-fp8swap-{A,B}/ (profiler pair) and profile-fp8swap-{B2,A2}/ (state labels), serve-logs/{smoke-fp8swap.out,fp8swap-ab.out,state-ab.out,bench-fp8swap-*}, fp8-swapset/{fp8-swapset.safetensors,fp8-swapset.json} (installed as symlinks in /raid/weights/GLM-5.3-Flash-NVFP4); scripts fp8_swapset_ab.sh, state_ab.sh, gap_locate.py, dur_sorted.py, stream_split.py.
+**Raw artifacts.** perf/results/2026-09-07/fp8swap-{A,B,B2,A2}-pass{1,2}/, fp8swap-B-gate{1,2}.json; <scratch>/profile-fp8swap-{A,B}/ (profiler pair) and profile-fp8swap-{B2,A2}/ (state labels), serve-logs/{smoke-fp8swap.out,fp8swap-ab.out,state-ab.out,bench-fp8swap-*}, fp8-swapset/{fp8-swapset.safetensors,fp8-swapset.json} (installed as symlinks in <models>/GLM-5.3-Flash-NVFP4); scripts fp8_swapset_ab.sh, state_ab.sh, gap_locate.py, dur_sorted.py, stream_split.py.
 
 ## 2026-09-07: Custom all-reduce on the PCIe-only TP4 topology (Phase 2 fixed overhead, cheapest lever first)
 
@@ -20445,7 +20443,7 @@ Gate reading: over the 16 gate runs to date the mean text logprob spans -2.407 .
 
 **Decision.** RETAINED and made the rtx6000 record's default through its env (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`, note on the record; unset the key to return to NCCL). Best on record: 137.4 / 499 / 657 (no-spec; item 4 + swap-set + custom AR), the c8 B12X bar (740) is now 67% covered from 63%. The fork's escape hatch is the whole change; the P2P test in custom_all_reduce.py still guards it at boot. What is left in the reduction: 90 x 5.1 us = 0.46 ms per c1 step. The next lever on the same line is the node count itself (mHC cooperative launcher re-test on the fixed build; the 685 sub-4 us kernels of the launch census), since every removed node also shrinks the boot spread's surface.
 
-**Raw artifacts.** perf/results/2026-09-07/customar-B-pass{1,2}/, customar-B-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-customar-A/ (pair, slow state), profile-customar-B/ (labelled exact-token boot's trace), serve-logs/customar-ab.out; scripts customar_ab.sh, gap_locate.py, step_attrib.py (class "custom allreduce (vllm)").
+**Raw artifacts.** perf/results/2026-09-07/customar-B-pass{1,2}/, customar-B-gate{1,2}.json; <scratch>/profile-customar-A/ (pair, slow state), profile-customar-B/ (labelled exact-token boot's trace), serve-logs/customar-ab.out; scripts customar_ab.sh, gap_locate.py, step_attrib.py (class "custom allreduce (vllm)").
 
 ## 2026-09-07: FP8 swap-set, part 3 - the shared-expert shapes under contention (follow-up 1), and a stage-count slip between the JIT and native builds
 
@@ -20470,7 +20468,7 @@ Like-state, both boots fast. B is neutral to slightly worse (c1 -0.4%, c8/c16 wi
 
 **Decision.** Variant REJECTED; the full swap-set stays the default. The retained change of this entry is the launch table: 8 stages for the N<2048 configs (shared-expert gate_up), which the serving numbers of parts 1-2 were measured with and the committed source did not carry until now. Kernel choice rule added to the plan: a kernel that runs on the aux stream is tuned from the serving trace under Marlin contention (aux_window.py), never from the isolated bench alone.
 
-**Raw artifacts.** perf/results/2026-09-07/{native3,smallk-B,smallk-hook-A,smallk-hook-B}-pass{1,2}/, native3-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-state-{native3,smallk-B,smallk-hook-A,smallk-hook-B}/, serve-logs/{rebuild-chain.out,smallk-ab.out,smallk-hook-ab.out,native-incremental.out,jit-fp8-rebuild.out}; fp8-swapset-noshdown/ (variant sidecar, build_variant.py); scripts aux_window.py, dur_sorted.py, native_incremental.sh.
+**Raw artifacts.** perf/results/2026-09-07/{native3,smallk-B,smallk-hook-A,smallk-hook-B}-pass{1,2}/, native3-gate{1,2}.json; <scratch>/profile-state-{native3,smallk-B,smallk-hook-A,smallk-hook-B}/, serve-logs/{rebuild-chain.out,smallk-ab.out,smallk-hook-ab.out,native-incremental.out,jit-fp8-rebuild.out}; fp8-swapset-noshdown/ (variant sidecar, build_variant.py); scripts aux_window.py, dur_sorted.py, native_incremental.sh.
 
 ## 2026-09-07: mHC pre-transition without the cooperative launch (Phase 2, fixed overhead)
 
@@ -20491,7 +20489,7 @@ Both boots slow-state, so like-state: identical at every concurrency, identical 
 
 **Decision.** NEUTRAL, not retained as the default (VLLM_DSV4_MHC_MODE stays 0). Kept as a documented diagnostic: the mode switch, the last-block kernel (no cooperative-launch requirement, which matters if a future graph needs the mHC node to overlap other work) and the parity test, which is also the first test coverage of the fused mHC kernel against the split path. What would move the 0.78 ms: parallelize the tail (a two-barrier cooperative form where all 64 blocks apply the pre-mix to their own slice after block 0 finalizes: the tail's residual pass at one block is ~3 us of the 8.5), shorten the partials phase (fn is float32 here, 1.5 MB per site; half would halve the bytes in flight but the phase is latency-bound), or fuse the site with its neighbours (the RMS norm and the residual add). Estimated 1-2 us per site for the two-barrier form, 0.1-0.2 ms per step; queued behind the larger bytes item (KDA projections).
 
-**Raw artifacts.** perf/results/2026-09-07/mhc-lastblock-B-pass{1,2}/, mhc-lastblock-B-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-state-mhc-lastblock-B/, serve-logs/mhc-lastblock-B.out, native-incremental-mhc.out.
+**Raw artifacts.** perf/results/2026-09-07/mhc-lastblock-B-pass{1,2}/, mhc-lastblock-B-gate{1,2}.json; <scratch>/profile-state-mhc-lastblock-B/, serve-logs/mhc-lastblock-B.out, native-incremental-mhc.out.
 
 ### 2026-09-07 KDA projections self-quantized to block FP8 (plan item "Self-quantizing KDA q/k/v/o", own quality gate)
 
@@ -20511,7 +20509,7 @@ Both boots slow-state, so like-state: identical at every concurrency, identical 
 
 Ceiling: 34 x (16.0 + 4.8) = 0.71 ms/step at c1 (~9.7%), about the same absolute at c8/c16 (the fp8 kernel stays flat in M there too). The quality question is the experiment: the KDA projections feed a recurrent state (delta rule), and ZAI kept them BF16 while shipping the MLP and DSA projections in FP8. Gate: 4+ NLL readings within the band (-2.407..-2.465 nats, spread 0.02-0.03 within a boot) plus the needle, else REJECT regardless of speed.
 
-**Layout problem and its fix.** The merged projection's shards are q/k/v (2048 rows per rank each), beta (16 per rank), f_a and g_a (128 each, replicated). Block scales are per 128 rows of the *local* parameter, and vLLM's merged loader places each shard's scale rows at `offset / 128`: beta's 16-row shard has no scale rows of its own and f_a/g_a would land mid-block. Fix: the sidecar stores `b_proj` per rank, padded to 128 rows (rank r's 16 heads in block r, zeros after) with one scale row per rank, and the model reserves 128 beta rows per rank (`KimiGatedDeltaNetAttention(beta_shard_rows=128)`, asked for through the manifest by `slimserve.fp8_swapset.beta_shard_rows`); the forward drops the padding columns. Every shard is then 128-aligned (offsets 0/16/32/48/49/50 in scale rows), the standard loaders apply, and per rank N = 6528 (51 blocks; the padding costs 0.2 us of the 18). The layout is TP-specific: the manifest records `tp_size` and the loader refuses another. `o_proj` (RowParallel, K per rank 2048) needs nothing special. Build: `python -m slimserve.fp8_swapset --native ... --model ... --out /raid/scratch/slimserve-glm53/fp8-swapset-kda/fp8-swapset.safetensors --self-quant-kda --tp-size 4` (variant dir; the model-dir symlinks select it, manifest digest keys the compile cache). Tests: tests/glm5_next/test_fp8_swapset.py (block quantization bound, per-rank beta layout, manifest/targets, TP guard).
+**Layout problem and its fix.** The merged projection's shards are q/k/v (2048 rows per rank each), beta (16 per rank), f_a and g_a (128 each, replicated). Block scales are per 128 rows of the *local* parameter, and vLLM's merged loader places each shard's scale rows at `offset / 128`: beta's 16-row shard has no scale rows of its own and f_a/g_a would land mid-block. Fix: the sidecar stores `b_proj` per rank, padded to 128 rows (rank r's 16 heads in block r, zeros after) with one scale row per rank, and the model reserves 128 beta rows per rank (`KimiGatedDeltaNetAttention(beta_shard_rows=128)`, asked for through the manifest by `slimserve.fp8_swapset.beta_shard_rows`); the forward drops the padding columns. Every shard is then 128-aligned (offsets 0/16/32/48/49/50 in scale rows), the standard loaders apply, and per rank N = 6528 (51 blocks; the padding costs 0.2 us of the 18). The layout is TP-specific: the manifest records `tp_size` and the loader refuses another. `o_proj` (RowParallel, K per rank 2048) needs nothing special. Build: `python -m slimserve.fp8_swapset --native ... --model ... --out <scratch>/fp8-swapset-kda/fp8-swapset.safetensors --self-quant-kda --tp-size 4` (variant dir; the model-dir symlinks select it, manifest digest keys the compile cache). Tests: tests/glm5_next/test_fp8_swapset.py (block quantization bound, per-rank beta layout, manifest/targets, TP guard).
 
 **Build.** `fp8-swapset-kda/`: 790 tensors, 7.20 GB (the 2.4 GB native swap-set plus 238 self-quantized KDA tensors: 34 layers x q/k/v/b/f_a/g_a/o with their scales; b_proj stored as [512, 4096] with a [4, 32] scale). Built on GPU 0 in ~4 min. Quantization error of the self-quantized tensors, dequant vs the served BF16: relative Frobenius error 2.6-2.8% on every module class (q 0.0266, k 0.0270, v 0.0260, o 0.0267, b/f_a/g_a 0.0265), worst element 3.5-3.8% of its tensor's absmax - the e4m3 rounding floor (3 mantissa bits), nothing pathological in any layer. The native twins still dequantize bit-exact (0 elements differ).
 
@@ -20540,7 +20538,7 @@ The A boot is a new kind of boot for the boot-spread file: graph replay was fast
 
 **Quality, all eight B readings vs the day's 26 baseline readings.** B: -2.444, -2.460, -2.448, -2.461, -2.442, -2.440, -2.478, -2.443 (mean -2.452, sd 0.013). Baseline (every gate on the record tree today, 22 earlier + the 4 A readings): mean -2.438, sd 0.017. Shift -0.014 nats (standard error of the difference ~0.006), so a small real cost, about 1.4% in perplexity, from 2.7% weight rounding on 34 layers of recurrent-state projections. Needle margins unchanged (B 12.2-14.7 / 17.1-19.8; baseline 11.1-15.9 / 15.3-19.7). The pre-declared gate (within 0.03 nats, needle intact) passes with room.
 
-**Decision: RETAINED, default on through the sidecar links**, with the quality cost stated: -0.014 nats mean NLL for +11% c1 / +4% c8 / +3.4% c16. New record (fast state, no-spec, 1000/300): **152.7 / 519 / 679** tok/s; slow-state 144.8 / 507 / 663. The plain native-only sidecar stays at `/raid/scratch/slimserve-glm53/fp8-swapset/` and reverting is relinking the two model-dir symlinks (the manifest digest keys the compile cache, so either boots clean). The retain rests on the plan's own tolerance; if the operator wants the BF16 KDA back, that is a link change and one notebook line, not a code change. Knob if the 0.014 matters: keep the 272 gating rows per rank (beta, f_a, g_a) in BF16 through a split launch (~0.1 ms of the 0.7 ms) to test whether the recurrent gates carry the shift; also ZAI-style per-channel calibration is not available (no activations were used here: pure absmax weight rounding).
+**Decision: RETAINED, default on through the sidecar links**, with the quality cost stated: -0.014 nats mean NLL for +11% c1 / +4% c8 / +3.4% c16. New record (fast state, no-spec, 1000/300): **152.7 / 519 / 679** tok/s; slow-state 144.8 / 507 / 663. The plain native-only sidecar stays at `<scratch>/fp8-swapset/` and reverting is relinking the two model-dir symlinks (the manifest digest keys the compile cache, so either boots clean). The retain rests on the plan's own tolerance; if the operator wants the BF16 KDA back, that is a link change and one notebook line, not a code change. Knob if the 0.014 matters: keep the 272 gating rows per rank (beta, f_a, g_a) in BF16 through a split launch (~0.1 ms of the 0.7 ms) to test whether the recurrent gates carry the shift; also ZAI-style per-channel calibration is not available (no activations were used here: pure absmax weight rounding).
 
 Code: `slimserve/fp8_swapset.py` (`--self-quant-kda --tp-size`, `quantize_block`, `quantize_beta`, `beta_shard_rows`), `KimiGatedDeltaNetAttention(beta_shard_rows=)` in `vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py`, glm5_next wiring and the TP guard; tests in tests/glm5_next/test_fp8_swapset.py (9). Raw: perf/results/2026-09-07/kda-fp8-{B,B2,A}-pass{1,2}/, kda-fp8-*-gate{1..4}.json, traces profile-state-kda-fp8-{B,B2,A}/, build log serve-logs/build-swapset-kda.out, microbench kda_gemm_bench.py.
 
@@ -20561,7 +20559,7 @@ fn in float16 instead of float32: 7.2 vs 7.4 us (halving the 1.5 MB per site buy
 
 **Read.** Inside the fused kernel the tail (finalize + apply) costs about 7.4 - 3.1 - ~0.7 (grid sync) = ~3.6 us. Spreading the apply over 64 blocks needs a second barrier before it (the pre-mix coefficients) and a third for the RMS reduction (or an atomic sum plus barrier); at ~0.5-0.7 us per barrier on 64 blocks, the best case is ~7.4 - 3.6 + 1.4 + ~1.0 (finalize, which stays serial) + ~0.4 ≈ 6.6 us, a ~0.8 us per site win, ~0.07 ms/step, inside the boot-to-boot noise of the exact-token harness (~1%). Partials is at its structure's floor already (one round of 24 independent loads per thread, then 25 warp reductions).
 
-**Decision.** NOT BUILT; the mHC item is closed at 0.78 ms/step unless the site count changes (fusing a site with its neighbouring norm/add would remove launches, not shorten this kernel). Raw: /raid/scratch/slimserve-glm53/mhc_phase_bench.py output (this entry).
+**Decision.** NOT BUILT; the mHC item is closed at 0.78 ms/step unless the site count changes (fusing a site with its neighbouring norm/add would remove launches, not shorten this kernel). Raw: <scratch>/mhc_phase_bench.py output (this entry).
 
 ### 2026-09-07 Marlin NVFP4 experts against the bandwidth floor at c1 / c8 / c16 (plan Phase 1 item 1 pre-work; measurement, no change)
 
@@ -20593,7 +20591,7 @@ fn in float16 instead of float32: 7.2 vs 7.4 us (halving the 1.5 MB per site buy
 
 Slower. torch.topk on a [B, 154880] fp32 row is a single-block radix select (67 us), and the ~14 tiny ops behind it cost their eager launch overhead (~10 us each) because the sampler is not inside the CUDA graph. The GPU work of the window path is ~15 us; the form is wrong, not the idea.
 
-**Decision.** REJECTED as written; reverted from the tree (patch and test parked in /raid/scratch/slimserve-glm53/parked/sampler-candidate-window.*). The winning form is two CUDA launches: a per-row multi-block radix top-32 candidate kernel (16 blocks per row, shared-memory histogram select over the row's slice) and a merge + mask + softmax + noise-argmax kernel on the 512 candidates, with the noise still drawn by torch's seeded generators on a [B, 32] tensor. Expected ~15 us GPU + 2 launches vs ~180 us: ~0.16 ms/step at every concurrency (2.7% at c1, 1.5% at c8). Queued behind the mHC T<=8 cooperative launch (c8, 0.37 ms) and the all-reduce stage A/B.
+**Decision.** REJECTED as written; reverted from the tree (patch and test parked in <scratch>/parked/sampler-candidate-window.*). The winning form is two CUDA launches: a per-row multi-block radix top-32 candidate kernel (16 blocks per row, shared-memory histogram select over the row's slice) and a merge + mask + softmax + noise-argmax kernel on the 512 candidates, with the noise still drawn by torch's seeded generators on a [B, 32] tensor. Expected ~15 us GPU + 2 launches vs ~180 us: ~0.16 ms/step at every concurrency (2.7% at c1, 1.5% at c8). Queued behind the mHC T<=8 cooperative launch (c8, 0.37 ms) and the all-reduce stage A/B.
 
 ### 2026-09-07 c8 attribution on the KDA FP8 tree (profile-conc8-kda; ranking input for the c8 levers)
 
@@ -20675,11 +20673,11 @@ Tests: tests/kernels/test_quixicore_topk_sample.py (reference parity with shared
 
 Gates: B -2.439 / -2.447, B2 -2.465 / -2.473 (band -2.407..-2.478; the B2 pair sits at the low end, the B pair on the day's mean; the kernel draws the same distribution by construction, the Gumbel-max argmax over the kept set does not depend on how many noise values are drawn, so the next boot of this tree carries GATES=4 to add readings rather than a re-run now). Needles 12.7-15.0 / 17.0-18.4.
 
-**Attribution (profiled c1 rounds, rank 0).** The sampling class goes from 0.17 ms/step (3 launches, `_topk_topp_kernel` 124 us + softmax 48) to 0.01 ms (candidates 6.5 us + merge 4.5 us per step, now filed under "other"); no other class moved between sampler-B2 and mhc-t8-B (both slow/fast): union busy 5.379 vs 5.506 ms (-0.127 ms; -0.17 expected, the rest is the like-state spread). The sampler-B boot shows the third boot-state component again: custom AR at 8.7 us/launch (+0.32 ms/step over 5.1) with the fast front-end, which is why its end-to-end c1 149.4 sits under the fast/fast record 152.7 while its busy is 5.649 = 5.530 (B2 record) + 0.32 (AR) - 0.17 (sampler) - 0.03. GPU SM clocks (2700 +- 20 MHz all four), power, temperature and the PCIe link state (gen5 x16 under load) are identical between the slow-AR and fast-AR boots (clocks-gpu-*.csv); the worker threads migrate across all 64 logical CPUs in every boot (threads-*.log) with no placement pattern; the tinybox display service (pid 558811, /opt/tinybox/service/display/service.py) runs at 20-50% of a core throughout every boot today. The AR state stays HANDOFF item 4's open question. Of today's seven labelled boots one was fast/fast, so the tree's fast/fast number is not yet observed; the like-state gain predicts ~157 / 525 / 685 there, to be confirmed by whichever future boot lands in that state (the record line stays at 152.7 / 519 / 679 until measured).
+**Attribution (profiled c1 rounds, rank 0).** The sampling class goes from 0.17 ms/step (3 launches, `_topk_topp_kernel` 124 us + softmax 48) to 0.01 ms (candidates 6.5 us + merge 4.5 us per step, now filed under "other"); no other class moved between sampler-B2 and mhc-t8-B (both slow/fast): union busy 5.379 vs 5.506 ms (-0.127 ms; -0.17 expected, the rest is the like-state spread). The sampler-B boot shows the third boot-state component again: custom AR at 8.7 us/launch (+0.32 ms/step over 5.1) with the fast front-end, which is why its end-to-end c1 149.4 sits under the fast/fast record 152.7 while its busy is 5.649 = 5.530 (B2 record) + 0.32 (AR) - 0.17 (sampler) - 0.03. GPU SM clocks (2700 +- 20 MHz all four), power, temperature and the PCIe link state (gen5 x16 under load) are identical between the slow-AR and fast-AR boots (clocks-gpu-*.csv); the worker threads migrate across all 64 logical CPUs in every boot (threads-*.log) with no placement pattern; the the sm_120 box display service (pid 558811, /opt/the sm_120 box/service/display/service.py) runs at 20-50% of a core throughout every boot today. The AR state stays HANDOFF item 4's open question. Of today's seven labelled boots one was fast/fast, so the tree's fast/fast number is not yet observed; the like-state gain predicts ~157 / 525 / 685 there, to be confirmed by whichever future boot lands in that state (the record line stays at 152.7 / 519 / 679 until measured).
 
 Parity test tolerance, for the record: the first tree run failed 2 of 12 parametrised cases, both trial-3 (rounded logits) rows; two tie classes needed a rule: (a) more than 32 tokens tied at the k-th value (the window deviation, checked as top-k membership), (b) the top-p boundary falling inside a tie group inside the window (the reference's choice among the tied members is torch.sort's order, the kernel's is lane order, same kept multiset; checked as logit >= the reference's minimum kept logit). Rows without ties at either boundary are checked for the exact reference token (14 cases pass; 165/168 rows were exact in the JIT harness before the rules).
 
-**Decision: RETAINED, default on** (dispatch condition: every request's top_k <= 32, cuda, vocabulary >= 512, logprobs mode raw; anything else falls through to the fused Triton path unchanged). Prize as designed: ~0.16 ms per step at every concurrency, +2.8% c1 / +1.0% c8 / +1.0% c16 like-state. Follow-ups on the same path, in prize order: the logits all-gather (26 us c1, 102 c8, 176 c16: a vocab-parallel candidates-only exchange, 32 x 8 B per rank instead of 154880 x 4 B per row), and a batched Philox draw for seeded requests (the per-row `exponential_(generator=)` loop is ~5 us per seeded row on both the old and new path: 40 us at c8, 80 at c16 of host-side launch time). Raw: perf/results/2026-09-07/sampler-B{,2}-pass{1,2}/, sampler-B{,2}-gate{1,2}.json, /raid/scratch/slimserve-glm53/profile-state-sampler-B{,2}/, sampler_bench.py (isolated timing), jit/test_topk_sample.py (harness parity).
+**Decision: RETAINED, default on** (dispatch condition: every request's top_k <= 32, cuda, vocabulary >= 512, logprobs mode raw; anything else falls through to the fused Triton path unchanged). Prize as designed: ~0.16 ms per step at every concurrency, +2.8% c1 / +1.0% c8 / +1.0% c16 like-state. Follow-ups on the same path, in prize order: the logits all-gather (26 us c1, 102 c8, 176 c16: a vocab-parallel candidates-only exchange, 32 x 8 B per rank instead of 154880 x 4 B per row), and a batched Philox draw for seeded requests (the per-row `exponential_(generator=)` loop is ~5 us per seeded row on both the old and new path: 40 us at c8, 80 at c16 of host-side launch time). Raw: perf/results/2026-09-07/sampler-B{,2}-pass{1,2}/, sampler-B{,2}-gate{1,2}.json, <scratch>/profile-state-sampler-B{,2}/, sampler_bench.py (isolated timing), jit/test_topk_sample.py (harness parity).
 
 ### 2026-09-07 Prefix-cache granularity on the hybrid profile (measurement; explains the bench's 0% hit rate)
 
@@ -20745,7 +20743,7 @@ Reading: the one-warp reducer costs ~0.5 us per partition (a serial dependent ch
 
 **Result (dsa-A, 2026-09-08 09:39, the first fast/fast boot of this tree: in-step idle 0.180, custom AR 5.1 us; 1000/300 no-spec, pass 1 / pass 2).** c1 154.5 / **162.8**, c8 532.0 / **534.5**, c16 683.8 / **691.0**. Gates -2.477 / -2.465 (band -2.407..-2.478; the change is fp32 summation order only, so these are two more readings of the sampler tree: ten now, mean -2.456). Attribution (profiled c1 round): sparse MLA decode+reduce 0.35 -> 0.13 ms/step (21 launches at 6.3 us: decode + reduce together), pooled indexer 0.20 unchanged, custom AR 0.46 (fast), wall/step 5.534 ms vs the 5.866 of the previous fast/fast boot (kda-fp8-B2: before the sampler kernel, the mHC T <= 8 default and this change). Against that record, 152.7 / 519 / 679: c1 +6.6%, c8 +3.0%, c16 +1.8%; the sampler and mHC entries predicted ~157 / 531 / 685 for this state, so this change's share is ~+3.7% c1 / +0.7% c8 / +0.9% c16, matching its expected -0.22 / -0.06 / -0.14 ms per step (the c1 profiled round sits at 1000-1400 context where the isolated table said -0.16 to -0.28 ms).
 
-**Decision: RETAINED, default** (channel reducer, 32/64-token partitions). **New record (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0 tok/s.** Raw: perf/results/2026-09-08/dsa-A-pass{1,2}/, dsa-A-gate{1,2}.json, /raid/scratch/slimserve-glm53/profile-state-dsa-A/, dsa_decode_bench.py sweeps in serve-logs/dsa-reduce-chain.out. Revert: VLLM_MLA_SPARSE_REDUCE=0 restores the one-warp reducer (the partition rule then costs, see the mode-0 column), or the previous `_bf16_partition` constant 128.
+**Decision: RETAINED, default** (channel reducer, 32/64-token partitions). **New record (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0 tok/s.** Raw: perf/results/2026-09-08/dsa-A-pass{1,2}/, dsa-A-gate{1,2}.json, <scratch>/profile-state-dsa-A/, dsa_decode_bench.py sweeps in serve-logs/dsa-reduce-chain.out. Revert: VLLM_MLA_SPARSE_REDUCE=0 restores the one-warp reducer (the partition rule then costs, see the mode-0 column), or the previous `_bf16_partition` constant 128.
 
 Next on this path (Phase 4-class): a head-batched kernel that reads each selected latent row once for all 16 heads (the current one-warp-per-head form re-reads it 16x; at B = 8/16 the kernel is bound by that L2 traffic, 22-44 us per layer for ~1-2 MB of distinct KV) and the pooled indexer's `_pooled_logits_kernel` (17 us per layer at 1000 tokens, 128 blocks x 128 threads at 255 registers).
 
@@ -20753,7 +20751,7 @@ Next on this path (Phase 4-class): a head-batched kernel that reads each selecte
 
 **Baseline.** A 7001-token prefill step (c8, 1000-token prompts, 8192-token chunks) spends 37% of its ~870 ms GPU time in NCCL AllReduce (`RING_LL`, 57 MB per site: [7001, 4096] bf16, 15 GB/s effective). The custom all-reduce (`VLLM_CUSTOM_AR_ALLOW_PCIE=1`, P2P over PCIe, 5.1 us per decode launch) only takes inputs below its 8 MiB `max_size` (`CustomAllreduce(max_size=8192*1024)`, `should_custom_ar`: `inp_size < max_size`), so the c1 prefill ([1000, 4096] bf16 = 8.19 MB) uses it and every larger chunk falls to NCCL. Probe: ttft_probe.sh (per-shape /metrics deltas over two passes, prefill = `request_prefill_time`; the shape's aggregate tok/s alongside; state label from the 10 s engine window; gates). Reference readings (ttft-A, slow front-end state): c8 prefill 831 / 811 ms, c16 1354 / 1357 ms, c1 206 / 133 ms (pass 1 / pass 2; pass 1 of c1 carries the warm-up of the shape).
 
-**Arm 1: `NCCL_PROTO=Simple` (nccl-simple).** No change: c8 prefill 818 / 811, c16 1312 / 1358; the trace still shows `RING_LL` kernels. The env does reach the workers (the API server's environ carried it; the workers' /proc environ is rewritten by setproctitle, which is why grepping it showed nothing). Reason found while checking: `~/.config/fish/conf.d/tinybox-env.fish` exports `NCCL_P2P_DISABLE=1` box-wide (added for CUDA 13.3-built images on the 13.0 driver), so NCCL runs the TP all-reduce through host memory (SHM transport). The protocol choice is not what limits it. Gate -2.487 (the only reading outside the -2.407..-2.478 band so far; nothing in this arm touches numerics; GATES=4 on the car128 arm below adds readings).
+**Arm 1: `NCCL_PROTO=Simple` (nccl-simple).** No change: c8 prefill 818 / 811, c16 1312 / 1358; the trace still shows `RING_LL` kernels. The env does reach the workers (the API server's environ carried it; the workers' /proc environ is rewritten by setproctitle, which is why grepping it showed nothing). Reason found while checking: `~/.config/fish/conf.d/the sm_120 box-env.fish` exports `NCCL_P2P_DISABLE=1` box-wide (added for CUDA 13.3-built images on the 13.0 driver), so NCCL runs the TP all-reduce through host memory (SHM transport). The protocol choice is not what limits it. Gate -2.487 (the only reading outside the -2.407..-2.478 band so far; nothing in this arm touches numerics; GATES=4 on the car128 arm below adds readings).
 
 **Arm 2: `NCCL_P2P_DISABLE=0` (nccl-p2p).** No change: c8 prefill 811 / 813, c16 1315 / 1361. `nvidia-smi topo -m`: GPU0-GPU1 and GPU2-GPU3 are PHB (same host bridge), the cross pairs NODE (same NUMA node, different bridges); NCCL's default `NCCL_P2P_LEVEL` (PXB) refuses P2P over both, so enabling P2P alone leaves the SHM transport in place. Arm 5 (`NCCL_P2P_LEVEL=SYS`) tests the transport itself. Gate -2.465.
 
@@ -20789,7 +20787,7 @@ Decode untouched: busy 5.193 ms per step (5.16-5.19 in every boot of this tree),
 
 Decode untouched: busy 5.161 ms, 1242 launches, custom AR 4.9 us x 89. Gate -2.449. The reduce's cost in a 7001-token step falls by ~145 ms of the ~320 ms it had (NCCL's ring over P2P moves the 57 MB better than the custom two-stage kernel did: 666-678 vs 696-698 ms at c8, 1103-1106 vs 1165-1168 at c16), so the two levers claim the same messages and the NCCL one wins outright; no combined arm.
 
-**Decision: RETAINED as the rtx6000 record env** (`NCCL_P2P_DISABLE=0`, `NCCL_P2P_LEVEL=SYS` in slimserve/profiles.json with a dated note). The custom-AR cap stays at 8 MiB; the `VLLM_CUSTOM_AR_MAX_SIZE_MB` knob is committed at that default (behaviour-neutral) as the measured alternative. Caveat that matters on this box: the profile env applies with setdefault (`engine.apply_env`, `server.start`), so a shell export of `NCCL_P2P_DISABLE=1` (tinybox's `~/.config/fish/conf.d/tinybox-env.fish` has one, added for the CUDA 13.3 B12X container on the 13.0 driver) silently wins over the profile; the CLI's plan print now marks such keys as shadowed (`slimserve/cli.py`). The harness runs the record with the export unset (`env -u NCCL_P2P_DISABLE`), which is how the validation boot below was launched. Whether the box-wide export stays is the operator's call (it was a container workaround; nothing else on the box is known to need it).
+**Decision: RETAINED as the rtx6000 record env** (`NCCL_P2P_DISABLE=0`, `NCCL_P2P_LEVEL=SYS` in slimserve/profiles.json with a dated note). The custom-AR cap stays at 8 MiB; the `VLLM_CUSTOM_AR_MAX_SIZE_MB` knob is committed at that default (behaviour-neutral) as the measured alternative. Caveat that matters on this box: the profile env applies with setdefault (`engine.apply_env`, `server.start`), so a shell export of `NCCL_P2P_DISABLE=1` (the sm_120 box's `~/.config/fish/conf.d/the sm_120 box-env.fish` has one, added for the CUDA 13.3 B12X container on the 13.0 driver) silently wins over the profile; the CLI's plan print now marks such keys as shadowed (`slimserve/cli.py`). The harness runs the record with the export unset (`env -u NCCL_P2P_DISABLE`), which is how the validation boot below was launched. Whether the box-wide export stays is the operator's call (it was a container workaround; nothing else on the box is known to need it).
 
 **Validation through the profile (p2p-profile, 2026-09-08 10:15; launched `env -u NCCL_P2P_DISABLE`, GATES=2).** The profile's own entries applied (the dry-run plan print shows `NCCL_P2P_DISABLE=0  (shadowed: environment has 1)` under the fish export and a plain `NCCL_P2P_DISABLE=0` without it). Slow front-end boot again (in-step idle 0.491): c1 153.9 / 153.8 (prefill 169 / 134 ms), c8 542.8 / 540.0 (prefill 663 / 644), c16 713.7 / 713.6 (prefill 1101 / 1104); decode busy 5.164, custom AR 4.9 us; gates -2.469, -2.468. Slow-state like-for-like: c8 518-521 -> 540-543 (+4.2%), c16 668-679 -> 713-714 (+5-6%). **The fast/fast-state record stays 162.8 / 534.5 / 691.0 until a fast-state boot of this env lands** (four slow-state boots in a row today; the like-state projection is ~163 / ~556 / ~730). Raw: perf/results/2026-09-08/{nccl-simple,car64,nccl-p2p,car128,nccl-sys,p2p-profile}-pass{1,2}-c{1,8,16}-1000-300 and the *-gate*.json beside them.
 

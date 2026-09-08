@@ -14,7 +14,7 @@ added 2026-09-04.
 
 ## Mission
 
-Serve **GLM-5.3-Flash from `RedHatAI/GLM-5.3-Flash-NVFP4`** on tinybox
+Serve **GLM-5.3-Flash from `RedHatAI/GLM-5.3-Flash-NVFP4`** on the sm_120 box
 (4x RTX PRO 6000 Blackwell, PCIe, no NVLink, CUDA 13.0, sm_120) through
 the `glm53-nvfp4-4` profile's new `rtx6000` record, then optimize the
 QuixiCore/fork kernels for this exact model, quant and card toward the
@@ -34,7 +34,7 @@ physics, research digest and phase gates are in
   Bars: a100 TP4 73.8 / 332.1 / 464.6; B12X R24 no-spec 169.9 / 737.8
   (published); the same image on this box, handicapped (CUDA 13.3 image on
   the 580 driver, PCIe all-reduce off) 134.0 / 483.7 / 598.6 is the local
-  floor (notebook "B12X R24 control on tinybox").
+  floor (notebook "B12X R24 control on the sm_120 box").
 - Phase 1 retained, in order, all on the rtx6000 record (notebook entries
   of 2026-09-04): F32 sidecar for the RedHatAI downcast (quality, neutral
   throughput); KDA o_norm through the Triton kernel (+5.0% c1); g_a folded
@@ -63,7 +63,7 @@ physics, research digest and phase gates are in
   (clocks, foreign processes, NUMA, shared compile cache ruled out).
   Launch-count changes under ~3% are decided on a same-tree profiler pair
   (`perf/results/2026-09-04/route-fused-profile/prof_pair.sh`).
-- Native build state: `/raid/scratch/slimserve-glm53/rebuild.sh` is the
+- Native build state: `<scratch>/rebuild.sh` is the
   build-6 recipe (uv editable install, no build isolation, 12.0f,
   CMAKE_BUILD_TYPE=Release, MemoryMax=120G, ~75 min; the default
   RelWithDebInfo makes 5x larger binaries). The first rebuild carried the
@@ -87,13 +87,13 @@ physics, research digest and phase gates are in
   two native profiler boots clean, exact-token 110.8-111.0 / 449.5 / 602-604
   in band, gates -2.427 / -2.425). Profiler boots need no hook or switch any
   more. Pre-fix extension kept in
-  `/raid/scratch/slimserve-glm53/so-backup-20260907/`.
+  `<scratch>/so-backup-20260907/`.
 
 ## Next step
 
 0. Native build state: full rebuild 2026-09-07 19:44 (Release, 72 min,
    HEAD 186657677) landed decode_gemm_fp8; then the incremental path:
-   /raid/scratch/slimserve-glm53/native_incremental.sh configures a
+   <scratch>/native_incremental.sh configures a
    persistent cmake dir (build-native, same args as setup.py) and builds
    only `_quixicore_C` (86 s), swaps the .so by rename, runs the GEMM /
    moe_sum_add tests. Use it for every csrc change to that extension; the
@@ -111,7 +111,7 @@ physics, research digest and phase gates are in
    per-node latency inside the CUDA-graph replay, the same on all four
    GPUs of a boot: in-step idle 0.37 ms (fast) vs 0.68 ms (slow) spread
    over the ~1250 nodes (same-stream gap median 0.10 vs 0.45 us), host
-   ahead on every rank. Next probe: /raid/scratch/slimserve-glm53/
+   ahead on every rank. Next probe: <scratch>/
    graph_node_bench.py in fresh processes (single GPU, 1200-node graph);
    bimodal there = driver/graph-exec state, then vary
    CUDA_DEVICE_MAX_CONNECTIONS, cudaGraphUpload, fork/join. Until it is
@@ -141,9 +141,9 @@ physics, research digest and phase gates are in
    kernel with the tail spread over all blocks (est. 0.1-0.2 ms/step).
 2c. KDA FP8 self-quantization DONE 2026-09-07 21:10 (notebook "KDA
    projections self-quantized to block FP8"): RETAINED, default on via
-   the model-dir sidecar links -> /raid/scratch/slimserve-glm53/
+   the model-dir sidecar links -> <scratch>/
    fp8-swapset-kda/ (7.2 GB; build `python -m slimserve.fp8_swapset
-   --native /raid/weights/GLM-5.3-Flash --model /raid/weights/
+   --native <models>/GLM-5.3-Flash --model <models>/
    GLM-5.3-Flash-NVFP4 --out <dir>/fp8-swapset.safetensors
    --self-quant-kda --tp-size 4`; the plain native-only sidecar stays in
    fp8-swapset/ - relink to revert). Record 152.7 / 519 / 679 (fast
@@ -268,7 +268,7 @@ physics, research digest and phase gates are in
    Fast/fast boot idx-rec3: NEW RECORD 165.2 / 585.1 / 780.7 (c8 bar 79%
    covered), gate -2.461. Next prefill lever: head-batched sparse MLA
    prefill in `forward_mqa` (quixicore_mla_sparse.py; 63 ms of the ~555
-   ms c8 step on the decode walk; prototype /raid/scratch/slimserve-glm53/
+   ms c8 step on the decode walk; prototype <scratch>/
    mla_prefill_dev.py), then fp8 blockwise (61), Marlin at M >= 64 (112).
 2i. Sparse MLA prefill DONE 2026-09-08 12:06 (notebook "Sparse MLA
    prefill: head-batched tensor-core attention over the top-k list"):
@@ -306,12 +306,12 @@ physics, research digest and phase gates are in
    plan "Item 2b"): RETAINED, default on. Like-state exact-token c1 117.4
    -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 (+5.5 / +2.0 / +1.1%),
    gates -2.408 / -2.437, profiler pair -0.35 ms/step. Serving needs the
-   sidecar next to the checkpoint (/raid/weights/GLM-5.3-Flash-NVFP4/
-   fp8-swapset.{safetensors,json} -> symlinks into /raid/scratch/
-   slimserve-glm53/fp8-swapset/; rebuild with `python -m
-   slimserve.fp8_swapset /raid/weights/GLM-5.3-Flash /raid/weights/
+   sidecar next to the checkpoint (<models>/GLM-5.3-Flash-NVFP4/
+   fp8-swapset.{safetensors,json} -> symlinks into
+   <scratch>/fp8-swapset/; rebuild with `python -m
+   slimserve.fp8_swapset <models>/GLM-5.3-Flash <models>/
    GLM-5.3-Flash-NVFP4`) and, until the next native rebuild, the JIT hook
-   QC_DEV_GEMM_FP8=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site
+   QC_DEV_GEMM_FP8=1 PYTHONPATH=<scratch>/jit/site
    (without it decode falls back to CUTLASS w8a8 blockwise, +1 quant
    launch per linear - slower than BF16 at c1, so keep the hook or
    rebuild). Follow-up, one factor: the small-K fp8 shapes on the aux
@@ -334,8 +334,7 @@ physics, research digest and phase gates are in
    SM clocks 2700 +- 20 MHz, power, temperature, PCIe gen5 x16 all equal
    to the fast-AR boots (serve-logs/clocks-gpu-*.csv); worker threads
    migrate over all 64 logical CPUs in every boot (threads-*.log), no
-   placement pattern; the tinybox display service (pid 558811,
-   /opt/tinybox/service/display/service.py) sits at 20-50% of a core in
+   placement pattern; a display-service daemon sits at 20-50% of a core in
    every boot. Today's seven labelled boots: fast/fast 1, fast/slow-AR 2,
    slow/fast 4. Untested hypotheses: launch skew between ranks at the
    first AR of each graph replay (rank 0 waiting on a late peer: the
@@ -347,8 +346,7 @@ Profiler captures: prof_run.py now runs a 384-token profiled round so the
 with MTP on and produced a 2-iteration trace whose "step" was a partial
 window). Read step_attrib's "mean over N full steps" and want N >= 2.
 Never git stash/checkout in the tree while a server boots or runs from it.
-Shared box (2026-09-07 22:44-): another job (the operator's LTX server,
-~/venvs/vllm-omni, ltx-serve.py) held ~37 GB per GPU for an hour; the
+Shared box (2026-09-07 22:44-): another job (the operator's video-model server) held ~37 GB per GPU for an hour; the
 profile cannot boot beside it. ab.sh, ttft_probe.sh, prof_*.sh and
 native_incremental.sh now abort or wait when nvidia-smi lists a foreign
 compute process. native_incremental.sh's wait loop is anchored to real
@@ -369,10 +367,10 @@ NLL + needle within 0.03 nats, one notebook entry per experiment.
 
 ## Machine notes
 
-Operator scratch (not in the repo): `/raid/scratch/slimserve-glm53/`
-(`serve.sh`, `bench.sh`, `prof_run.py`, `step_attrib.py`, build and serve
-logs, traces, research artifacts). Venv `~/venvs/slimserve-glm53-flash`
-(never on /raid). Never build FlashInfer from source on this box.
+Operator scratch (not in the repo, `<scratch>` in this section): `serve.sh`,
+`bench.sh`, `prof_run.py`, `step_attrib.py`, build and serve logs, traces,
+research artifacts. The venv lives outside the repo, symlinked to `.venv`.
+Never build FlashInfer from source on this box.
 
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
