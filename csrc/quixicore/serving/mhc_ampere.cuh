@@ -292,9 +292,10 @@ __global__ void apply_pre_mix_rms_norm(
     }
 }
 
-template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE = 4096,
-          int NSPLITS = SPLITS, typename FnT = float>
-__global__ void fused_pre_transition(
+// Phase 1 of the fused pre-transition: one block's slice of the 24 mix
+// partials (and the fused post-mix residual write when FUSED_POST).
+template <bool FUSED_POST, int HIDDEN_SIZE, int NSPLITS, typename FnT>
+__device__ __forceinline__ void pre_transition_partials(
     const __nv_bfloat16* x,
     const __nv_bfloat16* residual,
     const float* post_mix,
@@ -302,23 +303,9 @@ __global__ void fused_pre_transition(
     const FnT* fn,
     __nv_bfloat16* residual_out,
     float* partial,
-    const float* scale,
-    const float* base,
-    float* next_post,
-    float* next_comb,
-    __nv_bfloat16* layer_input,
-    const __nv_bfloat16* norm_weight,
-    float rms_eps,
-    float pre_eps,
-    float sinkhorn_eps,
-    float post_multiplier,
-    int sinkhorn_repeat,
-    float norm_eps) {
-    static_assert(HIDDEN_SIZE % THREADS == 0);
+    int split,
+    int token) {
     constexpr int NOUT = MIXES;
-    constexpr int VALUES = HIDDEN_SIZE / THREADS;
-    const int split = blockIdx.x;
-    const int token = blockIdx.y;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -384,9 +371,33 @@ __global__ void fused_pre_transition(
                 block_sum;
         }
     }
+}
 
-    cooperative_groups::this_grid().sync();
-    if (split != 0) return;
+// Phase 2, one block per token: finalize the mixes (Sinkhorn), apply the
+// pre-mix to the (post-mixed) residual and write the layer input.
+template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE, int NSPLITS>
+__device__ __forceinline__ void pre_transition_tail(
+    const __nv_bfloat16* residual,
+    const __nv_bfloat16* residual_out,
+    float* partial,
+    const float* scale,
+    const float* base,
+    float* next_post,
+    float* next_comb,
+    __nv_bfloat16* layer_input,
+    const __nv_bfloat16* norm_weight,
+    float rms_eps,
+    float pre_eps,
+    float sinkhorn_eps,
+    float post_multiplier,
+    int sinkhorn_repeat,
+    float norm_eps,
+    int token) {
+    constexpr int NOUT = MIXES;
+    constexpr int VALUES = HIDDEN_SIZE / THREADS;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
 
     finalize_pre_mix_block<NSPLITS>(
         partial, scale, base, next_post, next_comb, token, HIDDEN_SIZE,
@@ -444,6 +455,103 @@ __global__ void fused_pre_transition(
             layer_input[token * HIDDEN_SIZE + dim] = values[i];
         }
     }
+}
+
+// Cooperative form: NSPLITS blocks per token, one grid sync, block 0 runs
+// the tail. Needs cudaLaunchCooperativeKernel.
+template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE,
+          int NSPLITS = SPLITS, typename FnT = float>
+__global__ void fused_pre_transition(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* residual,
+    const float* post_mix,
+    const float* comb_mix,
+    const FnT* fn,
+    __nv_bfloat16* residual_out,
+    float* partial,
+    const float* scale,
+    const float* base,
+    float* next_post,
+    float* next_comb,
+    __nv_bfloat16* layer_input,
+    const __nv_bfloat16* norm_weight,
+    float rms_eps,
+    float pre_eps,
+    float sinkhorn_eps,
+    float post_multiplier,
+    int sinkhorn_repeat,
+    float norm_eps) {
+    static_assert(HIDDEN_SIZE % THREADS == 0);
+    const int split = blockIdx.x;
+    const int token = blockIdx.y;
+    pre_transition_partials<FUSED_POST, HIDDEN_SIZE, NSPLITS, FnT>(
+        x, residual, post_mix, comb_mix, fn, residual_out, partial, split,
+        token);
+
+    cooperative_groups::this_grid().sync();
+    if (split != 0) return;
+
+    pre_transition_tail<FUSED_POST, RMS_NORM, HIDDEN_SIZE, NSPLITS>(
+        residual, residual_out, partial, scale, base, next_post, next_comb,
+        layer_input, norm_weight, rms_eps, pre_eps, sinkhorn_eps,
+        post_multiplier, sinkhorn_repeat, norm_eps, token);
+}
+
+// Last-block form (2026-09-07, rtx6000): the same math with a regular
+// launch. Every block publishes its partials, fences, and bumps `counter`;
+// the block that observes NSPLITS - 1 is the last one, so the partials of
+// all others are visible to it (threadFenceReduction pattern), and it runs
+// the tail and resets the counter for the next launch on the stream. One
+// token per launch (grid NSPLITS x 1); the counter is a persistent device
+// int owned by the launcher. Removes the cooperative-launch requirement and
+// the grid-wide barrier, which is what the 8.5 us per site was made of.
+template <bool FUSED_POST, bool RMS_NORM, int HIDDEN_SIZE,
+          int NSPLITS = SPLITS, typename FnT = float>
+__global__ void fused_pre_transition_lastblock(
+    const __nv_bfloat16* x,
+    const __nv_bfloat16* residual,
+    const float* post_mix,
+    const float* comb_mix,
+    const FnT* fn,
+    __nv_bfloat16* residual_out,
+    float* partial,
+    const float* scale,
+    const float* base,
+    float* next_post,
+    float* next_comb,
+    __nv_bfloat16* layer_input,
+    const __nv_bfloat16* norm_weight,
+    float rms_eps,
+    float pre_eps,
+    float sinkhorn_eps,
+    float post_multiplier,
+    int sinkhorn_repeat,
+    float norm_eps,
+    int* counter) {
+    static_assert(HIDDEN_SIZE % THREADS == 0);
+    const int split = blockIdx.x;
+    constexpr int token = 0;
+    pre_transition_partials<FUSED_POST, HIDDEN_SIZE, NSPLITS, FnT>(
+        x, residual, post_mix, comb_mix, fn, residual_out, partial, split,
+        token);
+
+    // Every writer fences its own partials, the block joins, then one thread
+    // takes the ticket: the last block observes all NSPLITS partials.
+    __shared__ int is_last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        is_last = atomicAdd(counter, 1) == NSPLITS - 1;
+    }
+    __syncthreads();
+    if (!is_last) return;
+    __threadfence();
+    if (threadIdx.x == 0) *counter = 0;
+
+    pre_transition_tail<FUSED_POST, RMS_NORM, HIDDEN_SIZE, NSPLITS>(
+        residual, residual_out, partial, scale, base, next_post, next_comb,
+        layer_input, norm_weight, rms_eps, pre_eps, sinkhorn_eps,
+        post_multiplier, sinkhorn_repeat, norm_eps, token);
 }
 
 __global__ void post(

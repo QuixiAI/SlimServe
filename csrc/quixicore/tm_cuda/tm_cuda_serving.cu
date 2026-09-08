@@ -1,3 +1,4 @@
+#include <atomic>
 // tk_cuda serving/decode bindings: torch wrappers over the validated W4/W5
 // kernels (kernels/serving/*_kernels.cuh). Registered into the _C module by
 // init_serving(m), called from tm_cuda_ext.cu's PYBIND11_MODULE.
@@ -294,12 +295,47 @@ static void py_fill_short_context_topk_indices(
 }
 
 // ---- DeepSeek-V4 mHC, decode-specialized for Ampere ----
-static bool dsv4_mhc_cooperative_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("VLLM_DSV4_MHC_COOPERATIVE");
-        return value == nullptr || value[0] != '0';
+// T == 1 pre-transition launch mode: 0 = cooperative fused kernel (grid sync),
+// 1 = last-block fused kernel (regular launch, 2026-09-07 rtx6000), 2 = the
+// three-kernel split path. VLLM_DSV4_MHC_MODE sets it; the legacy
+// VLLM_DSV4_MHC_COOPERATIVE=0 still selects the split path. Settable at
+// runtime (set_dsv4_mhc_mode) so one process can compare the modes.
+static std::atomic<int> g_dsv4_mhc_mode{-1};
+
+static int dsv4_mhc_mode() {
+    int mode = g_dsv4_mhc_mode.load(std::memory_order_relaxed);
+    if (mode >= 0) return mode;
+    mode = 0;
+    if (const char* value = std::getenv("VLLM_DSV4_MHC_MODE")) {
+        const int parsed = std::atoi(value);
+        if (parsed >= 0 && parsed <= 2) mode = parsed;
+    } else if (const char* legacy = std::getenv("VLLM_DSV4_MHC_COOPERATIVE")) {
+        if (legacy[0] == '0') mode = 2;
+    }
+    g_dsv4_mhc_mode.store(mode, std::memory_order_relaxed);
+    return mode;
+}
+
+static void py_set_dsv4_mhc_mode(int64_t mode) {
+    TORCH_CHECK(mode >= 0 && mode <= 2, "dsv4 mHC mode must be 0, 1 or 2");
+    g_dsv4_mhc_mode.store(int(mode), std::memory_order_relaxed);
+}
+
+static int64_t py_get_dsv4_mhc_mode() { return dsv4_mhc_mode(); }
+
+// Persistent device counter for the last-block kernel (one launch in flight
+// per stream; the last block resets it). Allocated on first use, which is an
+// eager call - vLLM warms every shape up before it captures graphs.
+static int* dsv4_mhc_counter() {
+    static int* counter = [] {
+        int* ptr = nullptr;
+        TORCH_CHECK(cudaMalloc(&ptr, sizeof(int)) == cudaSuccess,
+                    "dsv4 mHC counter: cudaMalloc failed");
+        TORCH_CHECK(cudaMemset(ptr, 0, sizeof(int)) == cudaSuccess,
+                    "dsv4 mHC counter: cudaMemset failed");
+        return ptr;
     }();
-    return enabled;
+    return counter;
 }
 
 static int dsv4_mhc_splits() {
@@ -346,6 +382,17 @@ static void launch_dsv4_mhc_pre_transition(
         &rms_eps, &pre_eps, &sinkhorn_eps, &post_multiplier,
         &sinkhorn_repeat, &norm_eps,
     };
+    if (dsv4_mhc_mode() == 1) {
+        dsv4_mhc::fused_pre_transition_lastblock<FUSED_POST, RMS_NORM, 4096,
+                                                 NSPLITS, FnT>
+            <<<dim3(NSPLITS, 1), dim3(dsv4_mhc::THREADS), 0, stream()>>>(
+                x_ptr, residual_ptr, post_ptr, comb_ptr, fn_ptr,
+                residual_out_ptr, partial_ptr, scale_ptr, base_ptr,
+                next_post_ptr, next_comb_ptr, layer_input_ptr, norm_ptr,
+                rms_eps, pre_eps, sinkhorn_eps, post_multiplier,
+                sinkhorn_repeat, norm_eps, dsv4_mhc_counter());
+        return;
+    }
     const cudaError_t error = cudaLaunchCooperativeKernel(
         reinterpret_cast<const void*>(kernel), dim3(NSPLITS, 1),
         dim3(dsv4_mhc::THREADS), args, 0, stream());
@@ -421,7 +468,7 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     auto post = torch::empty({T, dsv4_mhc::HC}, float_options);
     auto comb = torch::empty({T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T == 1 && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<false, true>(
                 nullptr, residual, nullptr, nullptr, fn, nullptr, partial,
@@ -488,7 +535,7 @@ py_dsv4_mhc_fused_post_pre(
     auto next_comb = torch::empty(
         {T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_cooperative_enabled() && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T == 1 && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<true, true>(
                 &x, residual, &post_mix, &comb_mix, fn, &residual_out,
@@ -2157,6 +2204,9 @@ void init_serving(py::module_& m) {
     m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
+    m.def("set_dsv4_mhc_mode", &py_set_dsv4_mhc_mode,
+          "T == 1 mHC pre-transition launch mode: 0 cooperative, 1 last-block, 2 split kernels");
+    m.def("get_dsv4_mhc_mode", &py_get_dsv4_mhc_mode);
     m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 x FP8 block-scaled weights (e4m3, 128x128 fp32 scales), M<=16, tensor cores: "

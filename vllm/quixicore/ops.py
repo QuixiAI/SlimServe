@@ -252,6 +252,23 @@ class quixicore_ops:
         )
 
     @staticmethod
+    def has_dsv4_mhc_modes() -> bool:
+        """True when the extension exposes the T == 1 mHC launch-mode switch."""
+        try:
+            return hasattr(_qc(), "set_dsv4_mhc_mode")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_dsv4_mhc_mode(mode: int) -> None:
+        """0 cooperative fused kernel, 1 last-block fused kernel, 2 split kernels."""
+        _qc().set_dsv4_mhc_mode(int(mode))
+
+    @staticmethod
+    def get_dsv4_mhc_mode() -> int:
+        return int(_qc().get_dsv4_mhc_mode())
+
+    @staticmethod
     def dsv4_mhc_post(
         x: torch.Tensor,
         residual: torch.Tensor,

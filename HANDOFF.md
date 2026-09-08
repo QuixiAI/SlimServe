@@ -131,11 +131,21 @@ physics, research digest and phase gates are in
    rtx6000 record. c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on
    the swap-set tree; 90 x 5.1 us custom AR kernels replace 91 x 11.2 us
    NCCL launches and the in-step idle halves (0.37 -> 0.18 ms); six gates
-   in band (one -2.465 tail re-gated x4: -2.428..-2.447). Remaining fixed
-   overhead, in order: the mHC cooperative launcher re-test (0.78 ms/step,
-   91 launches), the launch census's sub-4 us kernels (fusions), the
-   custom AR's own 0.46 ms (two-stage vs one-stage threshold is vLLM's
-   default; a PCIe-tuned threshold is a one-factor A/B).
+   in band (one -2.465 tail re-gated x4: -2.428..-2.447). mHC last-block
+   variant (notebook "mHC pre-transition: last-block kernel", 20:40):
+   NEUTRAL - bit-exact, 8.5-8.9 us/site either way, like-state c1/c8/c16
+   identical; kept as a documented diagnostic (VLLM_DSV4_MHC_MODE 0 coop
+   default / 1 last-block / 2 split, tests/kernels/
+   test_quixicore_dsv4_mhc_modes.py). The 0.78 ms is the kernel's own
+   serial tail, not the launch: next form is a two-barrier cooperative
+   kernel with the tail spread over all blocks (est. 0.1-0.2 ms/step).
+   Remaining fixed overhead, in order: the KDA in_proj/out_proj bytes
+   (34 x 34 us + 34 x 11.8 us bf16, ~0.85 ms/step; only an FP8
+   self-quantization with its own quality gate cuts it - scoping now),
+   that two-barrier mHC form, the launch census's sub-4 us kernels
+   (fusions), the custom AR's own 0.46 ms (two-stage vs one-stage
+   threshold is vLLM's default; a PCIe-tuned threshold is a one-factor
+   A/B).
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
