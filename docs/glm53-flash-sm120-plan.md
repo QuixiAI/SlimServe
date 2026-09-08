@@ -862,9 +862,9 @@ partition and reduce"): the DSA layers' sparse decode reduce switched to
 the one-thread-per-channel reducer and the index-list partition set by
 batch (32 tokens at B <= 8, 64 above): 0.35 -> 0.13 ms/step at c1.
 Record now (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0
-tok/s; the c8 bar (740) is 72% covered. With the NCCL P2P env (below)
-the slow-state readings are 540-543 / 713-714 (+4% / +5-6% like-for-like);
-a fast-state boot of that env is pending and projects ~163 / ~556 / ~730.
+tok/s; the c8 bar (740) was 72% covered. With the NCCL P2P env (below)
+the fast/fast record is 163.1 / 556.1 / 728.9 (p2p-rec2, 2026-09-08
+10:26): c8 +4.0%, c16 +5.5%; the c8 bar is 75% covered.
 
 Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
 the bars are measured on 1000-in / 300-out requests whose prefill is
@@ -890,8 +890,19 @@ NCCL_P2P_DISABLE=1 shadows the record (the CLI plan print now says so).
 Every VLLM_* value is a torch-compile cache-key factor with the Triton
 cache inside that directory: a new value costs one longer boot and a
 ~49 s first request (12 KDA-prefill/indexer kernels outside the boot
-warm-up), a profile follow-up. Remaining prefill levers: the mHC prefill
-kernel, FP4 grouped GEMM at M >= 64, prefill attention.
+warm-up), a profile follow-up.
+
+Prefill second lever, done 2026-09-08 10:50 (notebook "mHC prefill
+partials: a kernel shaped for T = 7000"): the split path's `partials<24>`
+(20% of the prefill step, 2.06 ms per launch at 7001 tokens, 7% of HBM)
+replaced above T = 64 by `partials_prefill`: a block per 128-dim slice of
+all four streams and 32-token tile, fn and residual staged once, whole
+dot products per lane; 0.39 ms per launch at 1.3 TB/s, fused residual
+bit-exact. Served: c8 prefill 644-678 -> 532-549 ms, c16 1101-1106 ->
+873-875; aggregates +4% c8 / +5% c16 like-for-like, decode identical,
+gates in band. Remaining prefill levers: FP4 grouped GEMM at M >= 64
+(Marlin at ~25% of the tensor-core rate), the sparse MLA prefill walk,
+the pooled indexer, the fp8 blockwise GEMM; re-attribution queued.
 
 ### Phase 2: fixed overhead (the single-stream lever)
 

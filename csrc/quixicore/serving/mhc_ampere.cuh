@@ -116,6 +116,185 @@ __global__ void partials(
     }
 }
 
+// Prefill-shaped partials for the split path. `partials` above is shaped
+// for decode: 32 x T blocks, two residual elements per thread, 24 fn loads
+// and 24 FMAs per element and a 125-shuffle reduction per warp per token;
+// at T = 7000 it runs the residual streams at 7% of HBM bandwidth. Here a
+// block owns one split of one 32-token tile, where split s is the 128-dim
+// slice [s * 128, s * 128 + 128) of all four streams (512 flats): the
+// split's fn values are staged in shared memory once per tile, the tile's
+// residual rows once (for the fused post-mix, each input element is read
+// once and yields all four output streams), and each lane then runs whole
+// 512-long dot products for one token and three mix rows. Same partial
+// layout ([T][SPLITS][MIXES + 1]; the flat-to-split assignment differs from
+// the strided one above), so finalize_pre_mix / apply_pre_mix are unchanged.
+// residual_out is bit-identical to `partials` (same expression, same
+// order); the mix sums differ only in fp32 summation order.
+constexpr int PREFILL_TILE = 32;
+constexpr int PREFILL_FLATS = 2 * THREADS;
+constexpr int PREFILL_FN_STRIDE = PREFILL_FLATS;
+constexpr int PREFILL_V_STRIDE = PREFILL_FLATS + 2;
+constexpr size_t PREFILL_SMEM =
+    size_t(MIXES) * PREFILL_FN_STRIDE * sizeof(float) +
+    size_t(PREFILL_TILE) * PREFILL_V_STRIDE * sizeof(__nv_bfloat16);
+
+template <bool FUSED_POST, int HIDDEN_SIZE, typename FnT>
+__global__ void __launch_bounds__(THREADS) partials_prefill(
+    const __nv_bfloat16* __restrict__ x,
+    const __nv_bfloat16* __restrict__ residual,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    const FnT* __restrict__ fn,
+    __nv_bfloat16* __restrict__ residual_out,
+    float* __restrict__ partial,
+    int num_tokens) {
+    constexpr int TOTAL = HC * HIDDEN_SIZE;
+    constexpr int DIMS = HIDDEN_SIZE / SPLITS;
+    static_assert(HC * DIMS == PREFILL_FLATS,
+                  "partials_prefill: 32 splits of 4 x 128 flats");
+    static_assert(DIMS % 64 == 0, "partials_prefill: 8-wide chunks per thread");
+    static_assert(PREFILL_TILE == 32 && THREADS == 8 * 32 && MIXES == 24,
+                  "partials_prefill: lane = token, warp = 3 mix rows");
+    extern __shared__ __align__(16) unsigned char prefill_smem[];
+    float* fn_tile = reinterpret_cast<float*>(prefill_smem);
+    __nv_bfloat16* v_tile = reinterpret_cast<__nv_bfloat16*>(
+        fn_tile + MIXES * PREFILL_FN_STRIDE);
+
+    const int split = blockIdx.x;
+    const int token0 = blockIdx.y * PREFILL_TILE;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int dim_split = split * DIMS;
+
+    // Local flat l in [0, 512): stream l / 128, dim dim_split + l % 128.
+    for (int i = tid; i < MIXES * PREFILL_FLATS; i += THREADS) {
+        const int output = i / PREFILL_FLATS;
+        const int l = i - output * PREFILL_FLATS;
+        const int stream = l / DIMS;
+        fn_tile[output * PREFILL_FN_STRIDE + l] =
+            float(fn[output * TOTAL + stream * HIDDEN_SIZE + dim_split + (l - stream * DIMS)]);
+    }
+    // Staging: thread (t = tid / 8, g = tid % 8) owns token t and dims
+    // dim_split + g * 16 .. + 16 as two 8-wide chunks; 16-byte loads, all of
+    // a chunk's inputs in flight together. With the fused post-mix the five
+    // input rows are read once and produce the four output streams.
+    {
+        constexpr int CHUNKS = DIMS / 64;
+        const int t = tid >> 3;
+        const int g = tid & 7;
+        const int token = token0 + t;
+        if (token < num_tokens) {
+            __nv_bfloat16* v_row = v_tile + t * PREFILL_V_STRIDE;
+            if constexpr (FUSED_POST) {
+                float post_mix[HC];
+                float comb_mix[HC * HC];
+#pragma unroll
+                for (int output_stream = 0; output_stream < HC; ++output_stream) {
+                    post_mix[output_stream] = post[token * HC + output_stream];
+                }
+#pragma unroll
+                for (int i = 0; i < HC * HC; ++i) {
+                    comb_mix[i] = comb[token * HC * HC + i];
+                }
+#pragma unroll
+                for (int c = 0; c < CHUNKS; ++c) {
+                    const int dim = dim_split + g * (8 * CHUNKS) + c * 8;
+                    const uint4 xv = *reinterpret_cast<const uint4*>(
+                        x + size_t(token) * HIDDEN_SIZE + dim);
+                    uint4 rv[HC];
+#pragma unroll
+                    for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                        rv[input_stream] = *reinterpret_cast<const uint4*>(
+                            residual + (size_t(token) * HC + input_stream) * HIDDEN_SIZE + dim);
+                    }
+                    const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
+#pragma unroll
+                    for (int output_stream = 0; output_stream < HC; ++output_stream) {
+                        __align__(16) __nv_bfloat16 rounded[8];
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            float value = post_mix[output_stream] * float(xb[j]);
+#pragma unroll
+                            for (int input_stream = 0; input_stream < HC; ++input_stream) {
+                                const __nv_bfloat16* rb =
+                                    reinterpret_cast<const __nv_bfloat16*>(&rv[input_stream]);
+                                value += comb_mix[input_stream * HC + output_stream] * float(rb[j]);
+                            }
+                            rounded[j] = __float2bfloat16_rn(value);
+                        }
+                        *reinterpret_cast<uint4*>(
+                            residual_out + (size_t(token) * HC + output_stream) * HIDDEN_SIZE + dim) =
+                            *reinterpret_cast<const uint4*>(rounded);
+                        __nv_bfloat16* v_dst =
+                            v_row + output_stream * DIMS + g * (8 * CHUNKS) + c * 8;
+#pragma unroll
+                        for (int j = 0; j < 8; j += 2) {
+                            *reinterpret_cast<__nv_bfloat162*>(v_dst + j) =
+                                *reinterpret_cast<const __nv_bfloat162*>(rounded + j);
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int stream = 0; stream < HC; ++stream) {
+#pragma unroll
+                    for (int c = 0; c < CHUNKS; ++c) {
+                        const int dim = dim_split + g * (8 * CHUNKS) + c * 8;
+                        const uint4 rv = *reinterpret_cast<const uint4*>(
+                            residual + (size_t(token) * HC + stream) * HIDDEN_SIZE + dim);
+                        const __nv_bfloat16* rb = reinterpret_cast<const __nv_bfloat16*>(&rv);
+                        __nv_bfloat16* v_dst = v_row + stream * DIMS + g * (8 * CHUNKS) + c * 8;
+#pragma unroll
+                        for (int j = 0; j < 8; j += 2) {
+                            *reinterpret_cast<__nv_bfloat162*>(v_dst + j) =
+                                *reinterpret_cast<const __nv_bfloat162*>(rb + j);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // lane = token of the tile; warp w = mix rows w, w + 8, w + 16; warp 0
+    // also the square sum. v rows are padded by one word so the 32 lanes hit
+    // 32 banks; the fn reads are warp-uniform broadcasts (no pad needed).
+    const __nv_bfloat16* v_row = v_tile + lane * PREFILL_V_STRIDE;
+    const float* fn0 = fn_tile + warp * PREFILL_FN_STRIDE;
+    const float* fn1 = fn_tile + (warp + 8) * PREFILL_FN_STRIDE;
+    const float* fn2 = fn_tile + (warp + 16) * PREFILL_FN_STRIDE;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, square_sum = 0.0f;
+#pragma unroll 8
+    for (int f = 0; f < PREFILL_FLATS; f += 2) {
+        const float2 v = __bfloat1622float2(
+            *reinterpret_cast<const __nv_bfloat162*>(v_row + f));
+        const float2 c0 = *reinterpret_cast<const float2*>(fn0 + f);
+        const float2 c1 = *reinterpret_cast<const float2*>(fn1 + f);
+        const float2 c2 = *reinterpret_cast<const float2*>(fn2 + f);
+        acc0 += v.x * c0.x;
+        acc0 += v.y * c0.y;
+        acc1 += v.x * c1.x;
+        acc1 += v.y * c1.y;
+        acc2 += v.x * c2.x;
+        acc2 += v.y * c2.y;
+        if (warp == 0) {
+            square_sum += v.x * v.x;
+            square_sum += v.y * v.y;
+        }
+    }
+    const int token = token0 + lane;
+    if (token < num_tokens) {
+        float* out = partial + (token * SPLITS + split) * (MIXES + 1);
+        out[warp] = acc0;
+        out[warp + 8] = acc1;
+        out[warp + 16] = acc2;
+        if (warp == 0) {
+            out[MIXES] = square_sum;
+        }
+    }
+}
+
 template <int NSPLITS>
 __device__ __forceinline__ void finalize_pre_mix_block(
     float* partial,

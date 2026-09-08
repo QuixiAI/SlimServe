@@ -269,6 +269,24 @@ class quixicore_ops:
         return int(_qc().get_dsv4_mhc_mode())
 
     @staticmethod
+    def has_dsv4_mhc_prefill() -> bool:
+        """True when the extension has the prefill-shaped mHC partials kernel."""
+        try:
+            return hasattr(_qc(), "set_dsv4_mhc_prefill_min_t")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_dsv4_mhc_prefill_min_t(min_t: int) -> None:
+        """Smallest T the split path hands to the prefill-shaped partials
+        kernel (0 = never; the env default is VLLM_DSV4_MHC_PREFILL_MIN_T)."""
+        _qc().set_dsv4_mhc_prefill_min_t(int(min_t))
+
+    @staticmethod
+    def get_dsv4_mhc_prefill_min_t() -> int:
+        return int(_qc().get_dsv4_mhc_prefill_min_t())
+
+    @staticmethod
     def has_topk_sample() -> bool:
         try:
             return hasattr(_qc(), "topk_sample")

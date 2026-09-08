@@ -492,6 +492,67 @@ static void launch_dsv4_mhc_pre_transition_selected(
 #undef LAUNCH_MHC_TYPED
 }
 
+// Prefill-shaped partials (mhc_ampere.cuh partials_prefill) for the split
+// path at T >= VLLM_DSV4_MHC_PREFILL_MIN_T (default 64: measured on
+// glm53-nvfp4-4/rtx6000, faster from T = 64 up and slower at T = 16;
+// 0 disables). Decode batches keep `partials`.
+// Runtime-settable (set_dsv4_mhc_prefill_min_t) so one process can compare
+// the two split-path partials kernels.
+static std::atomic<int> g_dsv4_mhc_prefill_min_t{-1};
+static int dsv4_mhc_prefill_min_t() {
+    int value = g_dsv4_mhc_prefill_min_t.load(std::memory_order_relaxed);
+    if (value >= 0) return value;
+    const char* env = std::getenv("VLLM_DSV4_MHC_PREFILL_MIN_T");
+    const int parsed = env ? std::atoi(env) : 64;
+    value = parsed < 0 ? 0 : parsed;
+    g_dsv4_mhc_prefill_min_t.store(value, std::memory_order_relaxed);
+    return value;
+}
+static void py_set_dsv4_mhc_prefill_min_t(int64_t min_t) {
+    TORCH_CHECK(min_t >= 0, "dsv4 mHC prefill min T must be >= 0");
+    g_dsv4_mhc_prefill_min_t.store(int(min_t), std::memory_order_relaxed);
+}
+static int64_t py_get_dsv4_mhc_prefill_min_t() {
+    return dsv4_mhc_prefill_min_t();
+}
+template <bool FUSED_POST, typename FnT>
+static void launch_dsv4_mhc_partials_prefill_typed(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, const FnT* fn,
+        __nv_bfloat16* residual_out, float* partial, int T) {
+    auto kernel = dsv4_mhc::partials_prefill<FUSED_POST, 4096, FnT>;
+    static const bool configured = [&] {
+        return cudaFuncSetAttribute(
+                   kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                   int(dsv4_mhc::PREFILL_SMEM)) == cudaSuccess;
+    }();
+    TORCH_CHECK(configured, "DSV4 mHC prefill partials: ",
+                dsv4_mhc::PREFILL_SMEM, " bytes of shared memory refused");
+    const dim3 grid(dsv4_mhc::SPLITS,
+                    (T + dsv4_mhc::PREFILL_TILE - 1) / dsv4_mhc::PREFILL_TILE);
+    kernel<<<grid, dsv4_mhc::THREADS, dsv4_mhc::PREFILL_SMEM, stream()>>>(
+        x, residual, post, comb, fn, residual_out, partial, T);
+}
+// Returns false when the split path must use `partials` (small T, H != 4096
+// or the kernel disabled).
+template <bool FUSED_POST>
+static bool launch_dsv4_mhc_partials_prefill(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, torch::Tensor fn,
+        __nv_bfloat16* residual_out, float* partial, int T, int H) {
+    const int min_t = dsv4_mhc_prefill_min_t();
+    if (min_t == 0 || T < min_t || H != 4096) return false;
+    if (fn.scalar_type() == torch::kHalf) {
+        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, half>(
+            x, residual, post, comb,
+            reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
+            partial, T);
+    } else {
+        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, float>(
+            x, residual, post, comb, fp(fn), residual_out, partial, T);
+    }
+    return true;
+}
 template <int NOUT, bool FUSED_POST>
 static void launch_dsv4_mhc_partials(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
@@ -546,9 +607,13 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
         }
         return {post, comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
-        nullptr, bp(residual), nullptr, nullptr, fn, nullptr, fpm(partial), H,
-        dim3(dsv4_mhc::SPLITS, T));
+    if (!launch_dsv4_mhc_partials_prefill<false>(
+            nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
+            fpm(partial), T, H)) {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
+            nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
+            fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(post),
         fpm(comb), H, float(rms_eps), float(pre_eps),
@@ -614,9 +679,13 @@ py_dsv4_mhc_fused_post_pre(
         }
         return {residual_out, next_post, next_comb, layer_input};
     }
-    launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
-        bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-        bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    if (!launch_dsv4_mhc_partials_prefill<true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), T, H)) {
+        launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
+            bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
+            bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
+    }
     dsv4_mhc::finalize_pre_mix<<<T, 32, 0, stream()>>>(
         fpm(partial), fp(hc_scale), fp(hc_base), fpm(next_post),
         fpm(next_comb), H, float(rms_eps), float(pre_eps),
@@ -2298,6 +2367,9 @@ void init_serving(py::module_& m) {
     m.def("set_dsv4_mhc_mode", &py_set_dsv4_mhc_mode,
           "T == 1 mHC pre-transition launch mode: 0 cooperative, 1 last-block, 2 split kernels");
     m.def("get_dsv4_mhc_mode", &py_get_dsv4_mhc_mode);
+    m.def("set_dsv4_mhc_prefill_min_t", &py_set_dsv4_mhc_prefill_min_t,
+          "smallest T the split path hands to the prefill-shaped partials kernel (0 = never)");
+    m.def("get_dsv4_mhc_prefill_min_t", &py_get_dsv4_mhc_prefill_min_t);
     m.def("topk_sample", &py_topk_sample, py::arg("logits"), py::arg("top_k"),
           py::arg("top_p") = py::none(), py::arg("noise"),
           "top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with caller-drawn "

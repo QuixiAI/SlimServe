@@ -208,7 +208,9 @@ physics, research digest and phase gates are in
    +3.3% / +3-5% aggregate, 4 gates in band); NCCL_P2P_LEVEL=SYS with
    P2P enabled: c8 prefill 811-831 -> 666-678 ms, c16 1354-1361 ->
    1103-1106 (-18%), aggregates +4.2% c8 / +5-6% c16 in a slow-state
-   boot (540.5 / 713.2), decode untouched, gate -2.449. RETAINED as the
+   boot (540.5 / 713.2), decode untouched, gate -2.449; fast/fast boot
+   p2p-rec2: NEW RECORD 163.1 / 556.1 / 728.9 (c8 +4.0%, c16 +5.5%; c8
+   bar 75% covered). RETAINED as the
    rtx6000 record env (NCCL_P2P_DISABLE=0, NCCL_P2P_LEVEL=SYS); the cap
    stays 8 MiB (VLLM_CUSTOM_AR_MAX_SIZE_MB committed as a knob). The
    profile env is setdefault, so an operator export of NCCL_P2P_DISABLE=1
@@ -226,6 +228,22 @@ physics, research digest and phase gates are in
    attention. The 1088-token hybrid cache block means 1000-token bench
    prompts never hit the prefix cache (notebook "Prefix-cache
    granularity").
+2g. mHC prefill partials DONE 2026-09-08 10:50 (notebook "mHC prefill
+   partials: a kernel shaped for T = 7000"): `partials_prefill` in
+   csrc/quixicore/serving/mhc_ampere.cuh replaces the decode-shaped
+   `partials<24>` on the split path at T >= 64 (VLLM_DSV4_MHC_PREFILL_MIN_T;
+   runtime setter for tests; 0 = off). A block owns a 128-dim slice of all
+   four streams for a 32-token tile: fn staged once, each input element
+   read once for all four output streams, lane-per-token dot products.
+   Isolated at T = 7001: 2061 -> 392 us fused site (1.3 TB/s), 1704 -> 317
+   pre site; fused residual bit-exact, mixes within 1e-4 (13 new tests +
+   21 modes tests). Served (slow-state boot): c8 prefill 644-678 -> 532-549
+   ms, c16 1101-1106 -> 873-875, aggregates 155.6 / 564.6 / 751.3 (+1% /
+   +4% / +5% like-for-like), decode step identical (busy 5.173, 1243
+   launches), gates -2.457 / -2.462. Fast-state record attempt pending
+   (projection ~164 / ~578 / ~766). Next: re-attribute the c8 prefill
+   (queued: prof_prefill.sh c8-mhcpf) and pick among Marlin at M >= 64,
+   the sparse MLA prefill walk, the pooled indexer, the fp8 blockwise GEMM.
    Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
    decode = the profiled steps plus boot state plus context growth; no
    hidden host cost. The c8 bar needs prefill + 300 x step <= 3.24 s.
