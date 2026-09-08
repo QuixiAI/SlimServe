@@ -20974,3 +20974,31 @@ Sequential greedy c1 (the acceptance probe itself): 163.8 tok/s with the drafter
 **Greedy equivalence: not decidable by string comparison on this tree.** Spec vs no-spec greedy outputs diverge at 12 / 86 / 75 characters on three prompts whose within-boot pairs agree to the last character in both boots; three other prompts already diverge between two greedy samples of the same boot (Marlin MoE non-determinism), and the verify step's 2-row batch takes different GEMM configs than the 1-row decode (the fp8 decode GEMM and Marlin pick by M), so near-tie argmax points flip. Validation of the port has to be quality-based (the same eval under spec and no-spec, within noise) plus the acceptance rate, not token-exact.
 
 **Decision.** The MTP head works on this tree at k=1 with 84% greedy acceptance; the plan's port order shrinks to the cost side. Not adopted in the profile: it is a regression at both shapes until the per-step cost comes down. Next: profile one spec step (draft pass, verify pass, rejection sampler, glue), then draft CUDA-graph capture and the verify-shape kernels. Raw: perf/results/2026-09-08/mtp-probe2-{pass1,pass2}-{c1,c8}-1000-300/, mtp-probe2-gate1.json.
+
+## 2026-09-08: where the MTP step's time goes (profiled c1 and c8 rounds, k=1, rank 0)
+
+Same temporary speculator block as the probe above; profiled 384-token rounds, mean over 7 full steps.
+
+| class (ms/step) | c1 no-spec | c1 MTP | c8 no-spec | c8 MTP |
+|---|---|---|---|---|
+| GPU span | 6.05 | 11.46 | 11.74 | 21.32 |
+| launch gaps | -0.32 | 2.65 | ~0 | 3.04 |
+| launches | 1244 | 1467 | 1264 | 1755 |
+| marlin moe | 1.11 | 1.85 | 5.34 | 8.73 |
+| fp8 decode gemm | 1.90 | 2.16 | 4.01 | 1.79 (busy-only view) |
+| custom allreduce | 0.45 | 0.58 | 0.94 | 1.84 |
+| mHC transition | 0.76 | 0.77 | 0.99 | 1.27 |
+| cuBLAS wmma 16x16 | 0.05 | 0.39 | 0.39 | 0.75 |
+| cuBLAS gemvx | 0.44 | 0.32 | - | - |
+| norms + elementwise + other | 0.69 | 1.26 | ~0.9 | 1.18 |
+| sampling | 0.00 | 0.18 | - | 0.25 |
+
+**Three separate costs.**
+
+1. *Launch gaps, ~3 ms/step at both shapes.* The draft pass and the proposer glue run eagerly outside the FULL_DECODE_ONLY graphs; 220-490 extra launches per step and 3 ms of CPU-bound gaps that the no-spec step does not have. Fixable: capture the draft step (the target's graphs already cover the verify shape).
+2. *More expert weight traffic, proportional to rows.* The verify batch carries 2 rows per request. With top-8 of 288 routed experts, 16 rows at c8 touch ~103 distinct experts per layer against ~57 for 8 rows, so Marlin streams ~80% more expert bytes: 5.34 -> 8.73 ms at c8, 1.11 -> 1.85 at c1 (8 -> 16 experts per layer). The custom all-reduce doubles with the rows (0.94 -> 1.84). This is bytes at the wire, not a kernel inefficiency; it is the MoE tax on every speculative token and it does not go away with better kernels.
+3. *M >= 2 kernel paths.* At 2 rows cuBLAS leaves the gemv path for the slower wmma kernels (+0.34 ms at c1), Marlin's per-launch time rises more than its bytes at c1, the small fused kernels roughly double, and the rejection sampler costs 0.18-0.25 ms. Fixable in kernels (decode GEMM and expert paths that take M = 2..16 rows at the M = 1 cost per byte).
+
+**What that means for the gain.** Per-token cost is step time / tokens per step. c1: no-spec 6.05 ms/token; MTP today 11.46 / 1.84 = 6.2 (greedy) or 11.46 / 1.43 = 8.0 ms (bench sampling, 42.5% acceptance). With the draft captured (-3 ms) the greedy figure becomes ~4.6 ms/token (~217 tok/s, the Phase 2 exit territory) but the bench-sampling figure only ~5.9, level with no-spec; the M >= 2 kernel work is what would tip the sampled case positive at c1. c8: no-spec 1.47 ms/token; MTP today 21.32 / 1.43 = 14.9 ms per 8 tokens (1.86 ms/token); with the gaps removed 1.6 ms/token, still behind, because cost 2 (the extra expert bytes) is larger than the 0.43 extra tokens at the bench's acceptance. At c8 the drafter only pays if acceptance is greedy-like (1.84 tokens/step: 18.3 / 1.84 = 9.9 ms per 8 tokens, 1.24 ms/token, +18%).
+
+**Decision.** MTP k=1 stays out of the record profile. Phase 3 order becomes: (1) draft CUDA-graph capture, the one lever that helps every shape; (2) M = 2..16 row paths for the decode GEMMs and the expert kernel (shared with Phase 4); (3) re-measure acceptance on the profile's real sampling defaults, since the gain at c8 is decided by acceptance, not kernels. The c8 bar (740 tok/s on the exact-token workload) is not reachable through k=1 MTP at the workload's 42.5% acceptance: the extra expert traffic per speculative row is physics on a 288-expert MoE. Gate on the c8 boot: -2.4271, needles 12.7 / 19.0.
