@@ -21259,3 +21259,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Reproduce with benchmarks/kernels/repro_torch_reduce_boundary.py --build-dir
   <scratch> --repeats 1 --output <new.json>, with and without --barrier, under
   compute-sanitizer --tool racecheck --kernel-name kns=reduce_kernel.
+
+## 2026-09-08: Expand the reproducible prefill quality baseline
+
+- Status: harness unit tests and pinned-tokenizer preflight pass; live validation
+  pending. No new model/kernel change and no performance claim.
+- Baseline: the legacy scratch gate scored only 256 continuation tokens and
+  decoded/re-encoded boundaries; its needle candidates had unequal token lengths.
+- Change: benchmark_glm53_quality.py submits explicit token IDs, scores the actual
+  continuation IDs, checks server alignment and finite scores, and retains raw
+  responses before validating them. Defaults: 32 source windows, 512 prefix plus
+  128 scored tokens each; needle contrasts at 1024/8192/32768 prefix tokens and
+  positions .25/.75. Four fixed arbitrary codes each tokenize to seven tokens.
+- Method: raw prompt log probabilities measure prefill, not teacher-forced decode.
+  Generated requests retain temperature 1, top_p .95, top_k 20. The metric is a
+  regression baseline, not broad model-quality certification; decode arithmetic
+  still needs per-shape kernel parity and generated-request validation.
+- Correctness: 11 focused quality/campaign tests pass, including malformed-response
+  retention. Actual tokenizer preflight confirms 427489 source tokens, 32 distinct
+  continuation windows, all equal candidate lengths and all exact needle prefixes.
+- Next: three predetermined starts x three repetitions x c1/c8/c16, same recipe
+  and native binary as sampler-serving, with --traces --quality. Quality scoring
+  runs only after all timed work and traces on each start. Keep every start and
+  failure; record NLL spread instead of selecting a best score or fast boot.
+- Raw destination: perf/results/2026-09-08/quality-baseline/. Run the campaign
+  harness with its established source, --boots 3 --repeats 3 --traces --quality.

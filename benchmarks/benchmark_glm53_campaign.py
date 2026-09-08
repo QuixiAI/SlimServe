@@ -226,6 +226,11 @@ def main():
     ap.add_argument("--input-tokens", type=int, default=1000)
     ap.add_argument("--output-tokens", type=int, default=300)
     ap.add_argument("--traces", action="store_true")
+    ap.add_argument(
+        "--quality",
+        action="store_true",
+        help="score exact continuations and needle contrasts after timed work",
+    )
     args = ap.parse_args()
     if min(args.boots, args.repeats, *args.concurrency) < 1 or args.output_tokens < 2:
         ap.error("boots, repeats and concurrency must be positive; output tokens >= 2")
@@ -376,6 +381,29 @@ def main():
                         (folder / f"profile-c{c}.json").write_text(
                             json.dumps(result, indent=2) + "\n"
                         )
+                if args.quality:
+                    from benchmark_glm53_quality import run as run_quality
+
+                    quality_path = folder / "quality.json"
+                    run["quality_path"] = str(quality_path)
+                    quality = run_quality(
+                        argparse.Namespace(
+                            url=base,
+                            model=model,
+                            tokenizer=str(plan.model_dir),
+                            source=args.source,
+                            output=quality_path,
+                            pairs=32,
+                            prefix_tokens=512,
+                            score_tokens=128,
+                            needle_contexts=[1024, 8192, 32768],
+                            needle_positions=[0.25, 0.75],
+                        ),
+                        tokenizer,
+                    )
+                    run["quality"] = quality["summary"]
+                    if not quality["summary"]["all_needles_rank_first"]:
+                        raise ValueError("needle contrast gate failed")
                 run["status"] = "complete"
             except Exception as error:
                 run["status"] = "failed"
