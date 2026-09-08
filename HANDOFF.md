@@ -183,6 +183,37 @@ physics, research digest and phase gates are in
    batched Philox noise for seeded rows (~5 us host per seeded row).
    Fast/fast-state number of this tree not yet observed (1 of 7 boots
    today landed fast/fast); like-state predicts ~157 / 525 / 685.
+2e. Sparse MLA decode partition + reduce DONE 2026-09-08 09:42 (notebook
+   "Sparse MLA decode: partition and reduce"): RETAINED, default. The
+   one-warp reducer cost 0.5 us per partition; the channel reducer
+   (paged_attention_reduce_channels, env VLLM_MLA_SPARSE_REDUCE, default
+   2) is flat at 2.4-4 us, and the decode kernel then wants 32-token
+   partitions at B <= 8 and 64 above (_bf16_partition). Per DSA layer
+   25.4 -> 10.6 us at c1, 31.9 -> 26.3 at c8, 54.0 -> 41.4 at c16
+   isolated; in the server the class fell 0.35 -> 0.13 ms/step. dsa-A
+   was the first fast/fast boot of the sampler tree: NEW RECORD 162.8 /
+   534.5 / 691.0 (c1 pass 2; +6.6 / +3.0 / +1.8% over kda-fp8-B2, of
+   which this change ~+3.7 / +0.7 / +0.9%). Gates -2.477 / -2.465.
+   Next on this path: a head-batched decode kernel (read each selected
+   latent row once for all 16 heads; the current form re-reads it 16x
+   and is L2-bound at B >= 8), and the pooled indexer kernel (17 us per
+   layer at 1000 tokens, 255 registers).
+2f. Prefill (notebook "Prefill attribution at c8" and "Where the bench's
+   time goes", 22:20-22:40): prefill is 18-20% of the c8/c16 bench wall
+   and runs at 8k tok/s; of a 7001-token step, 37% is NCCL all-reduce
+   (57 MB per site, RING_LL at 15 GB/s over PCIe), 20% the mHC partials
+   kernel at 7% of HBM bandwidth, 12% Marlin at ~25% of the FP4
+   tensor-core rate, 7% sparse MLA prefill through the decode walk. Arms
+   queued (resume_chain.sh): NCCL_PROTO=Simple, then the custom AR with
+   VLLM_CUSTOM_AR_MAX_SIZE_MB=64 (env patch in parked/
+   apply_custom_ar_max_size.py). Bigger items after: an mHC prefill
+   kernel (est. 176 -> ~20 ms per 7000 tokens), FP4 tensor-core grouped
+   GEMM for M >= 64, a real prefill attention. The 1088-token hybrid
+   cache block means 1000-token bench prompts never hit the prefix
+   cache (notebook "Prefix-cache granularity").
+   Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
+   decode = the profiled steps plus boot state plus context growth; no
+   hidden host cost. The c8 bar needs prefill + 300 x step <= 3.24 s.
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
@@ -236,6 +267,18 @@ Profiler captures: prof_run.py now runs a 384-token profiled round so the
 with MTP on and produced a 2-iteration trace whose "step" was a partial
 window). Read step_attrib's "mean over N full steps" and want N >= 2.
 Never git stash/checkout in the tree while a server boots or runs from it.
+Shared box (2026-09-07 22:44-): another job (the operator's LTX server,
+~/venvs/vllm-omni, ltx-serve.py) held ~37 GB per GPU for an hour; the
+profile cannot boot beside it. ab.sh, ttft_probe.sh, prof_*.sh and
+native_incremental.sh now abort or wait when nvidia-smi lists a foreign
+compute process. native_incremental.sh's wait loop is anchored to real
+script launches (a tool-wrapper shell whose text mentioned "ab.sh "
+deadlocked it for an hour).
+Box rebooted 2026-09-08 03:10 (uptime -s): the dsa-A attempt at 02:53
+failed with "glm53-nvfp4-4 needs 4 GPUs and this machine shows 3" - one
+GPU had dropped off the bus before the reboot. After the reboot all four
+show (gen5 x16), nothing else on them; the retrying queue
+(resume_chain2.sh: dsa-A, nccl-simple, car64) was relaunched 09:33.
 Queued runs: write the waiter as a script file and launch it once - a
 `bash -c` waiter launched from the assistant shell was invisible to pgrep
 right after launch, got launched twice, and the two chains interleaved one

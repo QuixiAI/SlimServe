@@ -857,6 +857,24 @@ remainder is the mHC split path at T = 16, the reduces, the logits
 all-gather and ~1000 sub-5 us launches). Fast/fast-state throughput of
 this tree not yet observed; like-state predicts ~157 / 525 / 685.
 
+Phase 2 fourth lever, done 2026-09-08 09:42 (notebook "Sparse MLA decode:
+partition and reduce"): the DSA layers' sparse decode reduce switched to
+the one-thread-per-channel reducer and the index-list partition set by
+batch (32 tokens at B <= 8, 64 above): 0.35 -> 0.13 ms/step at c1.
+Record now (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0
+tok/s; the c8 bar (740) is 72% covered.
+
+Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
+the bars are measured on 1000-in / 300-out requests whose prefill is
+18-20% of the c8/c16 wall at 8k tok/s, two thirds of it the TP all-reduce
+over PCIe (57 MB per site through NCCL's LL ring at 15 GB/s) and an mHC
+partials kernel shaped for decode (7% of HBM bandwidth). Prefill levers
+now sit in this plan next to the decode ones: large-message reduce path
+(NCCL protocol, custom AR cap), an mHC prefill kernel, FP4 tensor-core
+grouped GEMM at M >= 64, prefill attention for the sparse MLA path. The
+c8 bar (740) needs prefill + 300 x step <= 3.24 s per request: with
+prefill halved the decode step must reach 9.4 ms (12.1 today).
+
 ### Phase 2: fixed overhead (the single-stream lever)
 
 1. All-reduce: measure NCCL vs vLLM custom AR vs FlashInfer PCIe-IPC

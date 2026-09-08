@@ -58,7 +58,6 @@ def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
     return kv_cache.stride(0) * kv_cache.element_size()
 
 
-_BF16_PARTITION = 128
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
 
 
@@ -73,10 +72,20 @@ def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
     already B x H warps wide, so partition only while the scratch is small.
     """
     B, H = q.shape[0], q.shape[1]
-    P = (idx.shape[1] + _BF16_PARTITION - 1) // _BF16_PARTITION
+    # Decode sizes by batch, measured 2026-09-07 on glm53-nvfp4-4 / rtx6000
+    # with the channel reducer (notebook "Sparse MLA decode: partition and
+    # reduce"): one warp per (head, token, partition) walks its partition
+    # serially, so at small B the 2080-wide list wants 32-token partitions
+    # (B = 1: decode 6.6 us vs 15.8 at 128 for 1000 selected tokens, 10.8 vs
+    # 31.0 at 2048; B = 8: within 2 us of 128 either way); at B >= 16 the
+    # per-head re-reads of the shared latent dominate and 64 is best (41.4 vs
+    # 47.1 us at 1000, 75.0 vs 93.1 at 2048). The reduce is flat in the
+    # partition count since the channel reducer.
+    size = 32 if B <= 8 else 64
+    P = (idx.shape[1] + size - 1) // size
     if B * H * P * 512 * 4 > _BF16_PARTITION_SCRATCH_CAP:
         return 0
-    return _BF16_PARTITION
+    return size
 
 
 class QuixiCoreMLASparseBackend(AttentionBackend):

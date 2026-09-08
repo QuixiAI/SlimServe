@@ -1617,6 +1617,36 @@ static torch::Tensor py_mla_decode_bf16_sparse_glm(torch::Tensor q, torch::Tenso
 // GLM-5.3-Flash (glm5_next) NoPE MLA, bf16 cache. There is no rope segment:
 // q and each slot are 512 bf16 latents (1024 B/slot) and the whole width both
 // scores and accumulates, i.e. the same template at QW = VW = 512.
+// Reduce form for the partitioned sparse decode (VLLM_MLA_SPARSE_REDUCE, read
+// once per process): 0 = one warp per (head, token) walking the partitions
+// serially (the original; ~0.5 us per partition on sm_120, 9.6 us at the
+// served 17 partitions and linear beyond), 1 = paged_attention_reduce_multiwarp
+// with 8 warps (3.1-5.7 us), 2 = paged_attention_reduce_channels, one thread
+// per value channel (2.4-4.2 us at 17-65 partitions; default, measured
+// 2026-09-07 on glm53-nvfp4-4/rtx6000, notebook "Sparse MLA decode: partition
+// and reduce").
+static int mla_sparse_reduce_mode() {
+    static const int value = [] {
+        const char* env = std::getenv("VLLM_MLA_SPARSE_REDUCE");
+        const int parsed = env ? std::atoi(env) : 2;
+        return parsed < 0 ? 0 : (parsed > 2 ? 2 : parsed);
+    }();
+    return value;
+}
+static void launch_sparse_reduce_512(const float* tmp, const float* ml, const float* es,
+                                     __nv_bfloat16* out, int H, int B, int P) {
+    const int mode = mla_sparse_reduce_mode();
+    if (mode == 2) {
+        paged_attention_reduce_channels<__nv_bfloat16, 512>
+            <<<dim3(H, B), 512, P * sizeof(float), stream()>>>(tmp, ml, es, out, H, P);
+    } else if (mode == 1) {
+        paged_attention_reduce_multiwarp<__nv_bfloat16, 512, 8>
+            <<<dim3(H, B), 256, P * sizeof(float), stream()>>>(tmp, ml, es, out, H, P);
+    } else {
+        paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(tmp, ml, es, out, H, P);
+    }
+}
+
 static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tensor kv,
         torch::Tensor bt, torch::Tensor indices, torch::Tensor topk_length,
         int64_t block_size, double scale, int64_t partition_size, int64_t page_stride_bytes) {
@@ -1650,8 +1680,7 @@ static torch::Tensor py_mla_decode_bf16_sparse_nope(torch::Tensor q, torch::Tens
         topk_length.data_ptr<int>(), max_topk, nullptr,
         tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(),
         int(block_size), int(bt.size(1)), float(scale), H, P, int(partition_size), 1.0f, nullptr, 0, int(page_stride_bytes));
-    paged_attention_reduce<__nv_bfloat16, 512><<<dim3(H, B), 32, 0, stream()>>>(
-        tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, P);
+    launch_sparse_reduce_512(tmp.data_ptr<float>(), ml.data_ptr<float>(), es.data_ptr<float>(), bpm(out), H, B, P);
     return out;
 }
 
