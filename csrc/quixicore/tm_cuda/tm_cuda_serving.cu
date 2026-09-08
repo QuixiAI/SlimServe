@@ -323,6 +323,21 @@ static void py_set_dsv4_mhc_mode(int64_t mode) {
 
 static int64_t py_get_dsv4_mhc_mode() { return dsv4_mhc_mode(); }
 
+// Largest token count the cooperative fused kernel takes (T x NSPLITS blocks
+// co-resident, one grid barrier); larger T goes through the split path.
+// Default 8: measured 2026-09-07 on glm53-nvfp4-4/rtx6000 (notebook "mHC
+// cooperative launch for T <= 8"), c8 +1.2% like-state, c1 and c16 (split
+// path) unchanged, bit-exact. VLLM_DSV4_MHC_COOP_MAX_T overrides (1 = the
+// previous behaviour). Read once per process.
+static int dsv4_mhc_coop_max_t() {
+    static const int value = [] {
+        const char* env = std::getenv("VLLM_DSV4_MHC_COOP_MAX_T");
+        const int parsed = env ? std::atoi(env) : 8;
+        return parsed < 1 ? 1 : (parsed > 16 ? 16 : parsed);
+    }();
+    return value;
+}
+
 // Persistent device counter for the last-block kernel (one launch in flight
 // per stream; the last block resets it). Allocated on first use, which is an
 // eager call - vLLM warms every shape up before it captures graphs.
@@ -382,7 +397,8 @@ static void launch_dsv4_mhc_pre_transition(
         &rms_eps, &pre_eps, &sinkhorn_eps, &post_multiplier,
         &sinkhorn_repeat, &norm_eps,
     };
-    if (dsv4_mhc_mode() == 1) {
+    const int T = residual.size(0);
+    if (dsv4_mhc_mode() == 1 && T == 1) {
         dsv4_mhc::fused_pre_transition_lastblock<FUSED_POST, RMS_NORM, 4096,
                                                  NSPLITS, FnT>
             <<<dim3(NSPLITS, 1), dim3(dsv4_mhc::THREADS), 0, stream()>>>(
@@ -393,8 +409,21 @@ static void launch_dsv4_mhc_pre_transition(
                 sinkhorn_repeat, norm_eps, dsv4_mhc_counter());
         return;
     }
+    // All T x NSPLITS blocks must be co-resident for the grid barrier.
+    static const int max_coresident = [&] {
+        int device = 0, sms = 0, blocks_per_sm = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, kernel, dsv4_mhc::THREADS, 0);
+        return blocks_per_sm * sms;
+    }();
+    TORCH_CHECK(T * NSPLITS <= max_coresident,
+                "DSV4 cooperative mHC: ", T * NSPLITS,
+                " blocks exceed the co-resident limit ", max_coresident,
+                "; lower VLLM_DSV4_MHC_COOP_MAX_T");
     const cudaError_t error = cudaLaunchCooperativeKernel(
-        reinterpret_cast<const void*>(kernel), dim3(NSPLITS, 1),
+        reinterpret_cast<const void*>(kernel), dim3(NSPLITS, T),
         dim3(dsv4_mhc::THREADS), args, 0, stream());
     TORCH_CHECK(error == cudaSuccess,
                 "DSV4 cooperative mHC launch failed: ",
@@ -468,7 +497,7 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     auto post = torch::empty({T, dsv4_mhc::HC}, float_options);
     auto comb = torch::empty({T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_mode() != 2 && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T <= dsv4_mhc_coop_max_t() && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<false, true>(
                 nullptr, residual, nullptr, nullptr, fn, nullptr, partial,
@@ -535,7 +564,7 @@ py_dsv4_mhc_fused_post_pre(
     auto next_comb = torch::empty(
         {T, dsv4_mhc::HC, dsv4_mhc::HC}, float_options);
     auto layer_input = torch::empty({T, H}, residual.options());
-    if (dsv4_mhc_mode() != 2 && T == 1 && H == 4096) {
+    if (dsv4_mhc_mode() != 2 && T <= dsv4_mhc_coop_max_t() && H == 4096) {
         if (norm_weight) {
             launch_dsv4_mhc_pre_transition_selected<true, true>(
                 &x, residual, &post_mix, &comb_mix, fn, &residual_out,

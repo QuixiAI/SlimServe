@@ -20543,3 +20543,105 @@ The A boot is a new kind of boot for the boot-spread file: graph replay was fast
 **Decision: RETAINED, default on through the sidecar links**, with the quality cost stated: -0.014 nats mean NLL for +11% c1 / +4% c8 / +3.4% c16. New record (fast state, no-spec, 1000/300): **152.7 / 519 / 679** tok/s; slow-state 144.8 / 507 / 663. The plain native-only sidecar stays at `/raid/scratch/slimserve-glm53/fp8-swapset/` and reverting is relinking the two model-dir symlinks (the manifest digest keys the compile cache, so either boots clean). The retain rests on the plan's own tolerance; if the operator wants the BF16 KDA back, that is a link change and one notebook line, not a code change. Knob if the 0.014 matters: keep the 272 gating rows per rank (beta, f_a, g_a) in BF16 through a split launch (~0.1 ms of the 0.7 ms) to test whether the recurrent gates carry the shift; also ZAI-style per-channel calibration is not available (no activations were used here: pure absmax weight rounding).
 
 Code: `slimserve/fp8_swapset.py` (`--self-quant-kda --tp-size`, `quantize_block`, `quantize_beta`, `beta_shard_rows`), `KimiGatedDeltaNetAttention(beta_shard_rows=)` in `vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py`, glm5_next wiring and the TP guard; tests in tests/glm5_next/test_fp8_swapset.py (9). Raw: perf/results/2026-09-07/kda-fp8-{B,B2,A}-pass{1,2}/, kda-fp8-*-gate{1..4}.json, traces profile-state-kda-fp8-{B,B2,A}/, build log serve-logs/build-swapset-kda.out, microbench kda_gemm_bench.py.
+
+### 2026-09-07 mHC pre-transition phases measured: the multi-barrier form is not worth building (kernel choice, not built)
+
+**Question.** After the last-block variant came out neutral, the remaining idea was a two-barrier cooperative form with the tail (finalize + pre-mix apply + RMS norm) spread over all blocks. Before writing it, the split path's kernels were timed in isolation (mhc_phase_bench.py, GPU 0, torch profiler over 200 launches, fn float32 and float16; the DtoD copies in the bench are the harness's clones, the serving trace has none per site).
+
+| phase (mode 2, standalone kernels) | pre | fused_post_pre |
+|---|---|---|
+| partials (64 blocks x 256 threads, one element per thread, 24 fn loads each) | 3.1 us | 4.0 us |
+| finalize (one block: 64-way partial reduce, Sinkhorn) | 2.0 | 2.0 |
+| apply pre-mix + RMS norm (one block, 4096 dims) | 3.9 | 3.9 |
+| fused cooperative kernel (mode 0), same inputs | 7.4 | 7.9 |
+| fused last-block (mode 1) | 7.6 | 7.9 |
+| serving (B2 trace, 90 sites/step) | 8.6 mean | |
+
+fn in float16 instead of float32: 7.2 vs 7.4 us (halving the 1.5 MB per site buys 0.2 us: the partials phase is latency-bound, not byte-bound, so a bf16/fp16 fn is not a lever either).
+
+**Read.** Inside the fused kernel the tail (finalize + apply) costs about 7.4 - 3.1 - ~0.7 (grid sync) = ~3.6 us. Spreading the apply over 64 blocks needs a second barrier before it (the pre-mix coefficients) and a third for the RMS reduction (or an atomic sum plus barrier); at ~0.5-0.7 us per barrier on 64 blocks, the best case is ~7.4 - 3.6 + 1.4 + ~1.0 (finalize, which stays serial) + ~0.4 ≈ 6.6 us, a ~0.8 us per site win, ~0.07 ms/step, inside the boot-to-boot noise of the exact-token harness (~1%). Partials is at its structure's floor already (one round of 24 independent loads per thread, then 25 warp reductions).
+
+**Decision.** NOT BUILT; the mHC item is closed at 0.78 ms/step unless the site count changes (fusing a site with its neighbouring norm/add would remove launches, not shorten this kernel). Raw: /raid/scratch/slimserve-glm53/mhc_phase_bench.py output (this entry).
+
+### 2026-09-07 Marlin NVFP4 experts against the bandwidth floor at c1 / c8 / c16 (plan Phase 1 item 1 pre-work; measurement, no change)
+
+**Method.** Marlin launch times from the existing rank-0 traces (672 launches per trace = 8 profiled steps x 42 MoE layers x 2 launches), bytes from the geometry: 288 routed experts, top-8, moe_intermediate 2048 (512 per rank at TP4), hidden 4096, NVFP4 = 0.5 B/weight + e4m3 scale per 16 = 0.56 B/weight. Per distinct expert per rank: gate_up 4096 x 1024 = 2.36 MB, down 512 x 4096 = 1.18 MB, 3.54 MB total. Distinct experts per layer: c1 = 8 exactly; c8 and c16 estimated for near-uniform routing (aux-loss-free bias balancing): 288 x (1 - (1 - 1/288)^(8 x tokens)) = 57 at c8, 103 at c16 (an upper bound on bytes; skewed routing means fewer experts and a lower efficiency than quoted).
+
+| trace | Marlin per launch (median / mean) | per layer (pair) | bytes per layer | achieved | of 1.79 TB/s |
+|---|---|---|---|---|---|
+| c1 (profile-state-kda-fp8-B2, also customar-B) | 13.5 / 13.5 us | 27.0 us | 28.3 MB | 1.05 TB/s | 59% |
+| c8 (profile-c8) | 55.9 / 61.5 us | 123 us | ~202 MB | ~1.64 TB/s | ~92% |
+| c16 (profile-c16check-A) | 97.0 / 104.8 us | 210 us | ~365 MB | ~1.74 TB/s | ~97% |
+
+**Read.** At c8 and c16 Marlin is at the expert-bandwidth floor (to the accuracy of the distinct-expert estimate); at c1 it runs at 59% of peak: the W4A16 tensor-core pipeline is occupancy- and latency-bound with one row per expert. The decode-shaped expert kernel of Phase 4 item 1 (weight-streaming grouped GEMV over the 8 active experts, in-place read of the Marlin tile layout since the 28.5 GB per rank of expert weights cannot be duplicated) would bring the pair from 27 us to ~17-18 us at 90% of peak: 42 x 9.4 = 0.40 ms/step, ~7% at c1 and nothing at c8/c16. That sets its priority: after the smaller fixed-overhead items with similar prize and far lower effort (the sampler's 170 us per step, the bf16 lm_head's 200 us), and behind MTP for the throughput bar.
+
+**Physics check at c1 on this tree.** Weight bytes per step per rank now: experts 1.19 GB, KDA in/out 1.19 GB, DSA projections ~0.33 GB, lm_head 0.32 GB (bf16), shared experts 0.26 GB, dense MLP 0.11 GB: ~3.4 GB, 2.1 ms at 1.6 TB/s effective against the 5.9 ms step (36% of physics). The remaining 3.8 ms is fixed overhead by class: fp8/bf16 GEMM inefficiency on small shapes ~0.5, Marlin at M=1 0.4, mHC 0.76, custom AR 0.46, attention 0.55, sampler + lm_head 0.37, ~650 sub-4 us launches 1.06, graph idle + launch latency 0.35.
+
+### 2026-09-07 Sampler at small batch: candidate-window path in torch ops REJECTED (measurement; the kernel form is queued)
+
+**Baseline.** Per decode step outside the layer loop (kda-fp8-B2 c1 trace): the fused Triton top-k/top-p kernel (`_topk_topp_kernel`, Qrita pivot algorithm, one program per row) 124 us, the full-vocabulary fp32 softmax 48 us, exponential noise + argmax 7 us: ~180 us per step at c1 on the 154880-token vocabulary, and the same wall at c8/c16 because the rows run in parallel programs (c8 trace: sampling class 0.23 ms + the logits all-gather 0.10 ms). Plus the bf16 lm_head GEMV, 200 us at c1 (317 MB per rank at 1.58 TB/s: at bandwidth; FP8 would halve it but the vocab-parallel head has its own loader and 38720 rows per rank are not a multiple of 128 - a separate item).
+
+**Hypothesis.** With top_k <= 32 on every row (the profile samples top-k 20 / top-p 0.95), gather the top 32 logits once and run the same masks (k-th value ties kept, cumulative mass <= 1 - p dropped from the bottom, largest kept), softmax and noise draw on the 32-wide window. Implemented as torch ops with a CPU-side `max_top_k` in the sampling metadata (no device sync) and a reference-equivalence test (kept mass per distinct logit value, 15 cases).
+
+**Result (sampler_bench.py, GPU 0, eager like the real sampler, seeded generators per row):**
+
+| batch | shipped path | candidate window (torch ops) | torch.topk(32) alone |
+|---|---|---|---|
+| 1 | 186 us | 242 us | 67 us |
+| 8 | 234 us | 277 us | 80 us |
+| 16 | 271 us | 322 us | 82 us |
+
+Slower. torch.topk on a [B, 154880] fp32 row is a single-block radix select (67 us), and the ~14 tiny ops behind it cost their eager launch overhead (~10 us each) because the sampler is not inside the CUDA graph. The GPU work of the window path is ~15 us; the form is wrong, not the idea.
+
+**Decision.** REJECTED as written; reverted from the tree (patch and test parked in /raid/scratch/slimserve-glm53/parked/sampler-candidate-window.*). The winning form is two CUDA launches: a per-row multi-block radix top-32 candidate kernel (16 blocks per row, shared-memory histogram select over the row's slice) and a merge + mask + softmax + noise-argmax kernel on the 512 candidates, with the noise still drawn by torch's seeded generators on a [B, 32] tensor. Expected ~15 us GPU + 2 launches vs ~180 us: ~0.16 ms/step at every concurrency (2.7% at c1, 1.5% at c8). Queued behind the mHC T<=8 cooperative launch (c8, 0.37 ms) and the all-reduce stage A/B.
+
+### 2026-09-07 c8 attribution on the KDA FP8 tree (profile-conc8-kda; ranking input for the c8 levers)
+
+Profiled c8 round (prof_one_conc.sh CONC=8, rank 0, 6 full steps): wall/step 10.75 ms = launch latency 0.18 + union busy 10.39 + in-step idle 0.20 (fast state). Kernel classes (sum 14.10 ms with 3.7 ms of aux-stream overlap):
+
+| class | ms/step | launches | us/launch | note |
+|---|---|---|---|---|
+| marlin moe | 5.26 | 83 | 63.4 | at the expert-bandwidth floor (Marlin entry above) |
+| fp8 decode gemm (swap-set) | 3.56 | 178 | 20.0 | KDA in_proj 18.5 / o_proj 7.3 as benched; the 84 shared-expert launches run at ~28 us under Marlin on the aux stream, mostly hidden |
+| mHC transition | 1.12 | 268 | 4.2 | T=8 takes the three-launch split path (the cooperative kernel is gated to T == 1): 12.6 us per site vs 8.6 fused at c1 |
+| custom allreduce | 0.96 | 90 | 10.7 | 64 KB reduces already on cross_device_reduce_2stage (the PCIe rule cuts over at 64 KB); 1-stage is the A/B |
+| triton norms/adds | 0.39 | 202 | 1.9 | |
+| cuBLAS gemm 16x16 wmma | 0.39 | 57 | 6.9 | KDA fg_b bmm and friends at M=8 |
+| sparse MLA + indexer | 0.60 | 44 | | |
+| KDA recurrent+conv | 0.35 | 67 | 5.2 | |
+| sampling + logits all-gather | 0.33 | 11 | | NCCL all-gather of [8, 38720] fp32 logits 102 us |
+| bf16 decode gemm, glue, aten, copies, other | ~0.95 | ~400 | | |
+
+Levers this ranks, in order of prize per effort: (1) cooperative mHC for T <= 8 (`VLLM_DSV4_MHC_COOP_MAX_T`, knob added to the launcher; est. 90 x 4 us = 0.37 ms, 3.4% at c8, nothing at c1); (2) custom AR 1-stage vs the 2-stage the size rule picks at 64 KB (env `VLLM_CUSTOM_ALLREDUCE_ALGO`; unknown sign); (3) the sampler kernel form (0.2 ms at every concurrency); (4) a candidates-only vocab-parallel sampling path that drops the logits all-gather (0.1 ms at c8, larger at c16). The c16 profiled round produced no trace: its boot (21:24) picked up the sampler candidate-window edit that was in the tree at that minute, before its import line existed, and the worker raised in `small_topk_sample` on the first sampled step (serve-20260907-212426.log). Self-inflicted: Python in the tree is read at boot, so no model/sampler edits while a boot chain is running (the standing rule for scripts applies to the tree). The c8 profile booted before the edit and is clean; the c16 attribution is re-run on the reverted tree after the current chain.
+
+**c16 attribution (re-run 2026-09-07 21:59 on the final tree: KDA FP8 links, mHC T <= 8 default, sampler kernel; profile-conc16-sampler, gate -2.480 in band).** Profiled c16 round: wall/step 14.72 ms = launch latency 0.19 + union busy 14.34 + in-step idle 0.19 (fast state). Kernel classes (sum 16.77 ms, 2.4 ms of aux-stream overlap):
+
+| class | ms/step | launches | us/launch | note |
+|---|---|---|---|---|
+| marlin moe | 8.79 | 84 | 105.0 | 52% of the step, at the expert-bandwidth floor (~103 distinct experts x 3.54 MB per layer in 210 us = 1.74 TB/s) |
+| fp8 decode gemm (swap-set) | 1.78 | 179 | 9.9 | flat in M as designed (10.9 us at c1) |
+| mHC transition | 1.26 | 270 | 4.7 | T = 16 takes the three-launch split path (the T <= 8 cooperative form is capped at 8: T = 16 measured 13.6 us per site vs 12.0 split in the 09-04 phase bench) |
+| custom allreduce | 1.15 | 91 | 12.6 | 128 KB reduces, 2-stage (1-stage lost, entry below) |
+| sparse MLA decode+reduce | 0.63 | 22 | 28.6 | grows with tokens (16.2 at c1) |
+| KDA recurrent+conv | 0.56 | 68 | 8.2 | |
+| cuBLAS gemm 16x16 wmma | 0.50 | 88 | 5.7 | |
+| pooled indexer | 0.38 | 22 | 17.5 | |
+| nccl allgather (logits) | 0.18 | 1 | 176 | [16, 38720] fp32 per rank; the candidates-only vocab-parallel sampler would remove it |
+| sampling | 0.02 | 16 | 1.0 | the new kernel pair (was 0.23 ms at c8 on the old path) |
+| norms/adds, bf16 gemm, glue, aten, copies, splitK, other | ~1.5 | ~700 | | |
+
+Read: at c16 the step is 52% expert weight streaming at the floor, and the movable remainder is the same list as c8 in the same order (mHC split path 1.26 ms, the reduces 1.15 ms, the logits all-gather 0.18 ms, the sub-5 us launch classes ~1.2 ms across ~1000 launches). Nothing at c16 is a c16-only lever; the throughput bar at this concurrency is MTP (fewer steps per token), not step time.
+
+### 2026-09-07 mHC cooperative launch for T <= 8 (c8 lever from the c8 attribution): RETAINED, default
+
+**Baseline.** The fused cooperative pre-transition kernel was gated to T == 1; at c8 every site took the three-launch split path (partials / finalize / apply): 268 launches at 4.2 us = 1.12 ms/step (c8 attribution above) against 0.76 ms fused at c1.
+
+**Change.** The launcher takes T <= `VLLM_DSV4_MHC_COOP_MAX_T` tokens through the cooperative kernel with a (NSPLITS, T) grid (the kernel already indexed the token by blockIdx.y; the partial buffer was already [T, 64, 25]); a one-time occupancy check refuses a grid that cannot be co-resident; the last-block variant stays T == 1. One incremental rebuild (native_incremental.sh, 20 s build). Bit-exact: the same kernel as T == 1 per token.
+
+**Result (one boot, slow-state, like-state against kda-fp8-B slow 144.8 / 506.8 / 662.7):** c1 144.6 / 144.6, c8 511.9 / 513.0 (+1.2%), c16 663.4 / 664.5 (T = 16 still splits). Gates -2.423 / -2.455 (band). Smaller than the 0.37 ms estimate (the split kernels overlap each other and the c8 step has more slack than the c1 step), but the same sign in both passes and above the like-state c8 spread (~±0.3%).
+
+**Decision.** RETAINED as the launcher default (8; `VLLM_DSV4_MHC_COOP_MAX_T=1` restores the old gate). Raw: perf/results/2026-09-07/mhc-t8-B-pass{1,2}/, mhc-t8-B-gate{1,2}.json, profile-state-mhc-t8-B/.
+
+### 2026-09-07 Custom all-reduce forced one-stage at 64-128 KB: REJECTED
+
+The kernel's PCIe rule switches from cross_device_reduce_1stage to 2stage at 64 KB (c8's reduce is exactly 64 KB, c16's 128 KB; c1's 8 KB stays 1-stage). One boot with `VLLM_CUSTOM_ALLREDUCE_ALGO=1stage` (slow-state, like-state vs kda-fp8-B): c1 142.4 / 142.9 (no change expected; -1.3% is the like-state c1 spread, see the three slow-state c1 readings 144.8 / 144.6 / 142.9 today), c8 500.3 / 499.2 (-1.5%), c16 645.6 / 645.4 (-2.6%). The 2-stage cut-over is right for this fabric; nothing to change. Gates -2.444 / -2.469. Raw: perf/results/2026-09-07/ar-1stage-B-pass{1,2}/.
