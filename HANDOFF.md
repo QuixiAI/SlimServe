@@ -81,16 +81,18 @@ indexer 0.23. c1 6.05: fp8 1.90, Marlin 1.11,
 mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
 norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
 
-The sampler tie/FP64 repair is implemented and kernel-tested (60 tests,
-zero memcheck/racecheck findings with an independent CPU oracle), with a
-fixed-start serving recheck next. It retains every cutoff tie, defines a
-stable token-ID nucleus order and uses vocabulary-indexed FP32/FP64 noise.
-Seeded output streams change from the old 32-draw implementation. Raw:
-perf/results/2026-09-08/sampler-exact/. A separate PyTorch reduction race
-report reproduced in isolation remains under investigation; see the notebook.
+The sampler tie/FP64 repair is now validated through three fixed profile
+starts (commit 4a7a5a73e): **156.08 / 575.67 / 777.04** median E2E TPS,
+all 27 runs retained, all text/image and exact-token checks pass. It also
+passes 60 kernel tests and clean memcheck/racecheck with an independent CPU
+oracle. Every cutoff tie is retained; nucleus order is stable by token ID;
+noise is vocabulary-indexed FP32/FP64. Seeded streams change from the old
+32-draw implementation. Raw: perf/results/2026-09-08/sampler-exact/ and
+sampler-serving/. The persistent slow graph state is unchanged. A separate
+PyTorch reduction race report remains under investigation; see the notebook.
 
-Immediate work: serving validation of the sampler, the PyTorch reduction
-report, and startup graph latency. The live state-copy warmup is validated.
+Immediate work: the PyTorch reduction report, stronger quality references,
+and startup graph latency. Sampler and state-copy fixes are live-validated.
 Then revisit these
 kernel candidates with one-factor experiments and fixed-count serving runs.
 The savings below are hypotheses, not measured remaining headroom:

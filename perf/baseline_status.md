@@ -1919,6 +1919,33 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 corrected-sampler fixed-start baseline - 2026-09-08
+
+Commit 4a7a5a73e, same pinned recipe v1, TP4 no-spec, exact 1000/300,
+temperature 1 / top-p .95 / top-k 20. Three predetermined starts and
+three repetitions at c1/c8/c16; every result retained. Startup-copy and
+full-workload warmups are unchanged. The sampler now keeps all cutoff
+ties and preserves FP64 noise; its vocabulary-indexed draws intentionally
+change seeded token streams from the old 32-candidate implementation.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median |
+| ---: | ---: | ---: |
+| 1 | 156.08 [155.82, 156.41] | 164.67 |
+| 8 | 575.67 [572.05, 577.92] | 590.07 |
+| 16 | 777.04 [773.71, 780.63] | 789.70 |
+
+Relative to warmup-boundary medians: -0.20% / -0.16% / +0.10%, not a
+material throughput change. All text/image canaries pass; all 225 measured
+requests have exact counts and no replacement characters. Kernel validation
+includes 60 sampler tests against an independent CPU oracle and clean
+memcheck/racecheck. Broader model-quality checks remain separate.
+
+All starts still show the slower graph state: rank-0 c1 means
+5.742 / 5.746 / 5.740 ms, with 0.428 / 0.428 / 0.427 ms lacking an active
+graph kernel. No restart or graph-latency remedy is implied by this repair.
+Raw: perf/results/2026-09-08/sampler-serving/ (summary.json with native
+hashes, every request, logs, all-rank traces, graph-replays-rank0.json).
+
 ### RTX6000 startup-copy warmup recheck - 2026-09-08
 
 Commit a2cd7a240, same verified recipe and sampling as the fixed-start

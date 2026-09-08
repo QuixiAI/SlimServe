@@ -702,7 +702,8 @@ once the NLL / needle legs run on this platform.
 - Speculative runs report accepted tokens per step and normalized
   `steps/s = tps / (1 + accepted/draft)`, never TPS alone.
 - Correctness gates before any retained change: scoring NLL on the fixed
-  text set (0.0000 boot jitter expected), needle recall leg (TP4 deep-context
+  text set (report observed repeat/boot variation, not assumed zero jitter),
+  needle recall leg (TP4 deep-context
   leg to 131K as the A100 record did), SHA-256 completion digests for
   bit-exact kernel changes, degeneration guard on every spec run, text and
   image requests (vision profile).
@@ -717,17 +718,23 @@ once the NLL / needle legs run on this platform.
   config the bench preferred (8 rows / 4 stages, 4.5 us alone) took 21 us
   next to Marlin where 8 stages took 7; the decision metric stays the
   overlap-free busy of a state-labelled boot.
-- Boot-state label on every exact-token boot (ab.sh STATE=1): the profiled
-  round after the benches gives gap_locate.py's in-step idle (the fast /
-  slow front-end state) and step_attrib's kernel-busy; arms are compared
-  like-state, and pass 2 of c1 is the quoted number (pass 1 can dip 4% in
-  some boots).
+- Fixed-count startup method (2026-09-08): declare the number of starts and
+  repetitions before running; keep every measured result and failed start.
+  Warm the actual workload and report median/range with separate E2E,
+  TTFT and client decode timings. Use benchmark_glm53_campaign.py. No
+  restart-until-fast selection and no pass-2-only headline numbers.
+  Profile after timing and label observed GPU graph states using CUPTI
+  graph/correlation IDs (analyze_cuda_graph_trace.py). CPU launch windows
+  can be several steps ahead. Like-state comparisons are supplementary
+  diagnosis, not permission to discard slower states from the baseline.
 - Attribution: one Nsight Systems trace per phase of a c1 and a c8 decode
   step; report kernel time vs wall, launch count per token, sync count per
   step. This is the ranking input for the next phase.
-- Sanity gates: TP2 vs TP4 on the same build must scale >= 1.5x
-  (`CLAUDE.md`); a c8/c1 ratio under ~3.5 at NVFP4 means expert reads are
-  not the limiter and something else is.
+- Sanity gates: supported TP levels on the same build must scale >= 1.5x
+  (`CLAUDE.md`). Only TP4 is registered and compatible for this recipe on
+  the current four-card machine. Concurrency scaling is a useful diagnostic,
+  but a c8/c1 ratio alone cannot establish a bandwidth bottleneck: measure
+  actual expert reuse and device traffic before deriving a physical limit.
 - One factor per experiment. Every retained or rejected change gets a
   notebook entry (Status / Scope / Baseline / Hypothesis / Change /
   Correctness / Results / Decision / Raw artifacts). Rejections are recorded.
@@ -743,9 +750,12 @@ once the NLL / needle legs run on this platform.
   (pass-to-pass within a boot <0.3%); the 8-slice prompt_logprobs mean
   moves 0.02-0.03 nats between boots and per-token logprobs have sd 0.47
   nats even between two requests on one boot (MoE routing flips from
-  nondeterministic reductions). Rules: a throughput delta under 3% needs
-  two boots per arm; discard a c1 cell that starts in the same second as
-  /health; scoring gates compare boot means with a 0.03 nat band; there
+  nondeterministic reductions). These are historical observations, not an
+  exclusion rule or proof that all future variation is harmless. Small
+  throughput deltas need enough predetermined starts/repetitions to separate
+  them from the measured spread. Keep cold warmups and never discard a timed
+  cell for proximity to /health; fix missing startup work at its origin.
+  Scoring gates compare boot means with a 0.03 nat band; there
   is no bit-exact greedy gate on GLM-5.3 here, parity tests carry that
   burden for kernel changes.
 - Regression rule: a change is retained only if c1 and c8 on the canonical

@@ -21206,3 +21206,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   PyTorch reproductions, original binary and microbench.json. Next command:
   benchmark_glm53_campaign.py with the same source, --boots 3 --repeats 3
   --traces, writing a new sampler-serving run directory.
+
+## 2026-09-08: Corrected sampler passes the fixed three-start serving series
+
+- Status: retained; real-profile validation complete.
+- Configuration: commit 4a7a5a73e, recipe v1, no-spec, full warmups and
+  three predetermined starts x three repetitions at c1/c8/c16. Same source,
+  1000/300 and recommended sampling as warmup-boundary. The changed noise
+  indexing intentionally changes seeded completions. Serving source and
+  the native binary remained fixed throughout the series; only documentation
+  and unrelated, not-yet-imported diagnostic tools were prepared meanwhile.
+- Results: median E2E 156.084 / 575.670 / 777.037 tok/s; full ranges
+  155.816-156.409 / 572.052-577.918 / 773.710-780.633. Changes against
+  warmup-boundary medians: -0.20% / -0.16% / +0.10%. Median client decode
+  164.667 / 590.071 / 789.695 tok/s. This is a correctness repair without
+  a material measured throughput change, not a new speed record.
+- Correctness: all three starts passed text/image canaries; all 225
+  measured requests returned exact counts and no replacement characters.
+  Kernel/sanitizer evidence is in the preceding entry. These checks do not
+  establish broad language or long-context quality.
+- Attribution: all 24 observed rank-0 c1 replays contain 1185 kernels.
+  Per-start mean span 5.742 / 5.746 / 5.740 ms and no-active-kernel time
+  0.428 / 0.428 / 0.427 ms: the persistent slow graph state remains.
+- Documentation: removed the plan's stale pass-2 selection/discard advice
+  and zero-NLL-jitter assumption. Routing/traffic measurements, not a fixed
+  concurrency ratio, are required before claiming a physical ceiling.
+- Raw: perf/results/2026-09-08/sampler-serving/summary.json, every warmup
+  and measured request, server logs, all-rank traces and graph-replays-rank0.json.
