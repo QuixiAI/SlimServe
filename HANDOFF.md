@@ -31,19 +31,32 @@ physics, research digest and phase gates are in
 
 Goal: exceed B12X R24 on this hardware by as much as possible, compared
 like for like under the serving policy (sampling at the model's
-recommended settings, never greedy). The fair bar is B12X no-spec:
-**c1 169.9 / c8 737.8**. Its MTP-3 figures (247.8 / 903.2 at 2.50
-accepted per step) imply greedy-like acceptance; our drafter accepts 84%
-greedy but 42.5% under the policy sampling, so those are a different
-workload until B12X is measured the same way.
+recommended settings, never greedy). The fair bar is B12X no-spec on the
+exact-token harness at 1000/300: **c1 169.9 / c8 737.8**. Its MTP-3
+figures (247.8 / 903.2 at 2.50 accepted per step) imply greedy-like
+acceptance; our drafter accepts 84% greedy but 42.5% under the policy
+sampling, so those are a different workload until B12X is measured the
+same way. The same B12X image on this box, handicapped (CUDA 13.3 image
+on the 580 driver, PCIe all-reduce off), gave 134.0 / 483.7 / 598.6.
 
-Record (rtx6000 profile, no-spec, 1000/300, fast/fast boot, 2026-09-08
-12:29): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is 98% /
-80% of the bar and +58% / +37% / +35% over the Phase 0 baseline
+Record (rtx6000 profile, no-spec, fast/fast boot, 2026-09-08 12:29, run
+mlapf-rec4): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is
+98% / 80% of the bar and +58% / +37% / +35% over the Phase 0 baseline
 (104.8 / 431.4 / 591.0). Every retained lever has a notebook entry with
-its A/B; the 2026-09-08 entries cover the pooled indexer prefill, the
-sparse MLA prefill, the c1/c8 attributions, the MTP probe and the expert
-kernel probe.
+its A/B (perf/optimization_status.md, 2026-09-04 through 2026-09-08).
+
+What the bar needs, per round of the harness:
+
+- c1: 300 tokens in 1.77 s. Today 0.10 s prefill + 300 x 5.7 ms cadence
+  (6.05 ms profiled) = 1.81 s. The step must reach 5.56 ms: -0.15.
+- c8: 2400 tokens in 3.25 s. Today 0.45 s prefill + 300 x 12.0 ms = 4.05
+  s. The step must reach 9.3 ms with prefill unchanged, 9.9 ms if the two
+  remaining prefill levers land (fp8 blockwise GEMM 61 ms, Marlin at
+  M >= 64 112 ms; the reduce's 168 ms is at the wire). The no-spec decode
+  levers below sum to ~1.2-1.5 ms (12.0 -> ~10.6), so no-spec tops out
+  near 90-94% of the c8 bar. The rest is steps per token, i.e. MTP: at
+  k=1 the spec step must get under ~14 ms at policy acceptance (~18 ms at
+  greedy-like acceptance); it is 21.3 ms today.
 
 Where the step goes (profiled, rank 0, ms/step). c8 11.74: Marlin experts
 5.34 (wire floor 5.25, done), fp8 dense GEMMs 4.0 busy but mostly
@@ -53,382 +66,97 @@ indexer 0.23. c1 6.05: fp8 1.90 (floor 1.4), Marlin 1.11 (floor 0.66),
 mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
 norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
 
-To beat the bar: c8 needs 10.8 ms/step (-0.94), c1 needs 5.9 (-0.15).
-Levers, no-spec, in order of expected value:
+Levers, in order of expected value, each a one-factor A/B on the profiler
+pair and then the exact-token chain:
 
-1. c8 fixed overheads, each a one-factor A/B on the profiler pair then the
-   exact-token chain: the fp8 dense GEMMs stretched under Marlin (net 1.7
-   -> 1.4, ~0.3); custom AR 0.94 (compute-stream placement, message cap);
-   mHC 0.99 (last-block mode was neutral at c1, untested at c8); cuBLAS
-   wmma 0.39 (route the remaining bf16 shapes through the decode GEMM);
-   norm/glue fusions (~0.2); indexer 0.23. Sum ~1.2 if all land, which is
-   the whole c8 gap.
-2. c1: lm_head in FP8 (~0.1), the same fusions, and the Phase 4 expert
-   kernel only in its persistent stream-K form (~0.35 at best; the
-   prototype at Marlin parity and its ceilings are in the 2026-09-08
-   notebook entry and perf/results/2026-09-08/nvfp4-expert-proto/).
-3. MTP (Phase 3): boots at k=1 once the speculator engine block carries
+1. c8 decode fixed overheads: fp8 dense GEMMs stretched under Marlin (net
+   1.7 -> 1.4, ~0.3); mHC 0.99 (next form is a two-barrier cooperative
+   kernel with the serial tail spread over all blocks, est. 0.1-0.5; the
+   last-block mode was neutral at c1 and is untested at c8,
+   VLLM_DSV4_MHC_MODE); cuBLAS wmma 0.39 (the KDA fg_b bmm at M = 8; a
+   small-M kernel ~0.25); sparse MLA decode 0.31 against a 0.11 floor (a
+   head-batched kernel that reads each selected latent row once for all
+   16 heads); norm/glue fusions over ~470 sub-2 us launches (~0.3);
+   indexer 0.23; the 11 DSA layers' bf16 fused_qkv_a / kv_b (0.24; native
+   FP8 exists but shares a module with the BF16 indexer shards). Custom
+   AR 0.94 is measured at both algorithms with ~0 left (forced 1-stage
+   was rejected, -1.5% c8).
+2. c1: lm_head in FP8 (~0.1); shared-expert gate_up on the aux stream (42
+   launches x 7.4 us, row-per-block at M = 1); C++ TORCH_LIBRARY
+   registration of quixicore_decode_linear (a 2-4 us Python trampoline per
+   call); the same fusions; the Phase 4 expert kernel only in its
+   persistent stream-K form (~0.35 at best; the prototype at Marlin parity
+   and its ceilings are in the 2026-09-08 notebook entry and
+   perf/results/2026-09-08/nvfp4-expert-proto/).
+3. Prefill (c8/c16 aggregates): fp8 blockwise GEMM (61 ms of the 446 ms
+   c8 prefill), Marlin at M >= 64 (112 ms; needs a purpose-built FP4
+   grouped GEMM), warming the prefill-only kernels in the boot (pass 1 of
+   any boot is not a prefill reading). The hybrid cache block is 1088
+   tokens, so 1000-token bench prompts never hit the prefix cache.
+   Vocab-parallel candidates-only sampling drops the logits all-gather
+   (26 / 102 / 176 us at c1/c8/c16).
+4. MTP (Phase 3): boots at k=1 once the speculator engine block carries
    `"attention_backend": "QUIXICORE_MLA_SPARSE"` (the proposer never
    inherits the target's backend and the sm_120 auto-list lacks ours);
    index sharing, lm_head and embedding sharing are already wired. Slower
-   today at both shapes: ~3 ms/step of eager-draft launch gaps, expert
-   bytes that scale with the verify rows, and M >= 2 kernel paths. Draft
-   CUDA-graph capture is the first fix; the expert-byte tax is physics, so
-   it pays only where acceptance is greedy-like.
+   today at both shapes under the policy (c1 145.9 / c8 464.7): spec step
+   c1 11.46 / c8 21.32 ms, of which ~2.7 / ~3.0 ms are eager-draft launch
+   gaps, Marlin at c8 streams ~103 distinct experts per step against ~57
+   no-spec, and the M >= 2 kernel paths (custom AR 1.84) cost the rest.
+   Draft CUDA-graph capture is the first fix; the expert-byte tax is
+   physics, so MTP pays at c8 only where acceptance is greedy-like. The
+   rtx6000 record keeps `"speculative": false`; the probe patched it in
+   place.
+
+Retained since Phase 0, all default on the rtx6000 record (a switch named
+here exists for one-factor A/Bs only):
+
+- Phase 1 (2026-09-04): F32 sidecar for the RedHatAI downcast; KDA o_norm
+  through the Triton kernel; g_a folded into the merged in-projection;
+  f_b/g_b as one strided bmm; router gate through the QuixiCore GEMV;
+  indexer wk/gate/weights_proj folded into fused_qkv_a_proj; fused
+  routing + Marlin alignment (`glm_route_align`, made total over NaN
+  logits on 2026-09-07 after five Xid 31 faults were traced to it; the
+  cooperative mHC launch rejected on those same faults is now default for
+  T <= 8, VLLM_DSV4_MHC_COOP_MAX_T).
+- FP8 weight swap-set with KDA self-quantization (2026-09-07): the dense
+  and DSA linears run block-FP8 from a sidecar next to the checkpoint
+  (fp8-swapset.safetensors + fp8-swapset.json, built by
+  `python -m slimserve.fp8_swapset --native <GLM-5.3-Flash> --model
+  <GLM-5.3-Flash-NVFP4> --out <dir>/fp8-swapset.safetensors
+  --self-quant-kda --tp-size 4`). The KDA part costs -0.014 nats mean NLL,
+  inside the plan's 0.03 tolerance and stated in the notebook; the
+  operator may prefer BF16 KDA back (a sidecar without --self-quant-kda).
+- Custom all-reduce over PCIe (VLLM_CUSTOM_AR_ALLOW_PCIE=1, cap
+  VLLM_CUSTOM_AR_MAX_SIZE_MB) and NCCL P2P for the prefill reduce
+  (NCCL_P2P_DISABLE=0, NCCL_P2P_LEVEL=SYS in the record env). The profile
+  env is setdefault, so an operator export of NCCL_P2P_DISABLE=1 silently
+  wins; the CLI plan print marks shadowed keys.
+- Small-k sampler (csrc/quixicore/serving/topk_sample.cuh, top_k <= 32);
+  sparse MLA decode partition + channel reducer (VLLM_MLA_SPARSE_REDUCE);
+  mHC prefill partials (VLLM_DSV4_MHC_PREFILL_MIN_T); pooled indexer
+  prefill (VLLM_GLM5_INDEXER_PREFILL_MATMUL); head-batched sparse MLA
+  prefill (VLLM_MLA_SPARSE_PREFILL_TC).
+
+Rejected, each with a notebook entry: forced 1-stage custom AR; the
+swap-set sidecar without shared down; NCCL_PROTO=Simple; custom AR caps
+of 64 / 128 MiB (superseded by P2P); the mHC last-block mode (neutral,
+kept as a diagnostic); MTP k=1 and the Phase 4 prototype (above).
 
 Method that holds: one factor per A/B; kernel decisions on the profiler
 pair's kernel-busy; exact-token records only from fast/fast boots (in-step
 idle < 0.3 ms, custom AR busy < 5.3 ms at c8), boots retried until one
 lands; gate band -2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
-non-deterministic); a notebook entry for every result including
-rejections. Commits carry the human maintainer only and are pushed to the
-QuixiAI branch after each commit. Repo docs carry no machine paths;
-operator notes live outside the repo.
-
-## State (2026-09-04, evening)
-
-- Phase 0 done: native build for `12.0f`, `rtx6000` platform + variant,
-  exact-token baseline **c1 104.8 / c8 431.4 / c16 591.0** (1000/300).
-  Bars: a100 TP4 73.8 / 332.1 / 464.6; B12X R24 no-spec 169.9 / 737.8
-  (published); the same image on this box, handicapped (CUDA 13.3 image on
-  the 580 driver, PCIe all-reduce off) 134.0 / 483.7 / 598.6 is the local
-  floor (notebook "B12X R24 control on the sm_120 box").
-- Phase 1 retained, in order, all on the rtx6000 record (notebook entries
-  of 2026-09-04): F32 sidecar for the RedHatAI downcast (quality, neutral
-  throughput); KDA o_norm through the Triton kernel (+5.0% c1); g_a folded
-  into the merged in-projection; f_b/g_b as one strided bmm; router gate
-  through the QuixiCore projection GEMV (fp32 logits, -42 launches);
-  indexer wk/gate/weights_proj folded into fused_qkv_a_proj; fused small-M
-  routing + Marlin alignment (`glm_route_align`, -81 launches, -1.2% step
-  on the profiler pair). Harness now **c1 ~112 / c8 ~456 / c16 ~608** on a
-  normal boot (+7% / +6% / +3% over Phase 0), then one Marlin lock
-  workspace per device (-37 launches, neutral). REJECTED: the cooperative
-  mHC launch for T <= 8 (per-site win standalone, but a 512-block
-  cooperative grid captured in the decode graph next to the indexer's aux
-  stream faults with an illegal memory access in the server; notebook
-  entry of 2026-09-04 evening).
-- MTP (NextN) draft path merged from the peer session (40c0146e7, then
-  c0c8118c8): the record serves spec-off by default (on the pipeline's 8-wide
-  director fan-out k=3 loses 20%), depth 3 stays as the opt-in; k=3 wins +17..46% greedy on Foundry
-  JSON / context-zero / chat, loses on the dense-prose exact-token harness
-  (pessimistic bound). Owed before the Foundry arm flips: c8 with real
-  director prompts. **Non-speculative A/Bs now boot with `--no-spec`.**
-- Measurement facts that changed the method: the corrected attribution
-  (c1 9.19 ms GPU busy, 2,041 launches, GPU-bound; the earlier "8.4 + 1.1
-  host" averaged partial windows); the exact-token harness moves +-2.5%
-  between boots of one tree, and that spread is inter-kernel idle inside
-  the CUDA graph (same tree: 0.02 vs 0.46 ms per step), cause unknown
-  (clocks, foreign processes, NUMA, shared compile cache ruled out).
-  Launch-count changes under ~3% are decided on a same-tree profiler pair
-  (`perf/results/2026-09-04/route-fused-profile/prof_pair.sh`).
-- Native build state: `<scratch>/rebuild.sh` is the
-  build-6 recipe (uv editable install, no build isolation, 12.0f,
-  CMAKE_BUILD_TYPE=Release, MemoryMax=120G, ~75 min; the default
-  RelWithDebInfo makes 5x larger binaries). The first rebuild carried the
-  faulty mHC launcher; the Release rebuild of 22:40-23:52 ships only the
-  routing binding (`glm_route_align`) and is VALIDATED for serving (24
-  parity tests, exact-token 110.5 / 448 / 599 with gates in band, no hook).
-  RESOLVED 2026-09-07 (notebook entry of that date): every illegal memory
-  access since 2026-09-04 21:51 (five `Xid 31` faults, one rank each) was
-  the fused routing kernel not being total over NaN logits: vLLM's dummy
-  runs (capture warmups, sampler warmup) carry NaN activations, the kernel
-  selected "expert 288" and laid assignments after padding, and Marlin read
-  the padding value as a row one past the activations (fault when that page
-  was unmapped, silent one-row corruption otherwise). Found with a GPU core
-  dump read in cuda-gdb after the SASS of native/JIT builds proved
-  identical. Fixed in glm_moe_routing.cuh (NaN ranks below finite, selected
-  experts -inf, shared sel), covered by
-  `test_glm_route_align_is_total_on_non_finite_logits`, in-graph time
-  unchanged. The 2026-09-04 rejection of the cooperative mHC launcher rested
-  on faults of the same signature: unproven, launcher stays reverted.
-  Native Release rebuild of the fix validated 2026-09-07 13:31 (27 tests,
-  two native profiler boots clean, exact-token 110.8-111.0 / 449.5 / 602-604
-  in band, gates -2.427 / -2.425). Profiler boots need no hook or switch any
-  more. Pre-fix extension kept in
-  `<scratch>/so-backup-20260907/`.
-
-## Next step
-
-0. Native build state: full rebuild 2026-09-07 19:44 (Release, 72 min,
-   HEAD 186657677) landed decode_gemm_fp8; then the incremental path:
-   <scratch>/native_incremental.sh configures a
-   persistent cmake dir (build-native, same args as setup.py) and builds
-   only `_quixicore_C` (86 s), swaps the .so by rename, runs the GEMM /
-   moe_sum_add tests. Use it for every csrc change to that extension; the
-   full rebuild is only for the other targets. Shipped .so (20:12) carries
-   the 8-stage fp8 launch table; validated by native4 (tests, gates
-   -2.436 / -2.449, exact; slow-state boot). No JIT hook is needed any
-   more (QC_DEV_GEMM_FP8 stays as a dev path). post_rebuild_validate.sh
-   <label> = the full check after a full rebuild.
-1. Boot spread (notebook 2026-09-07 "Boot spread probe", incl. "Probe
-   results"): the 4-5% c1 spread between boots of identical code is NOT
-   the governor (3 boots each way, identical bimodal split), NOT GPU
-   clocks (logged per run now), NOT host-thread placement (pin_probe.sh:
-   EngineCore pinned to a clean core / onto the display daemon's SMT
-   sibling / released, eight c1 passes all 117.3-117.5 in one boot). It is
-   per-node latency inside the CUDA-graph replay, the same on all four
-   GPUs of a boot: in-step idle 0.37 ms (fast) vs 0.68 ms (slow) spread
-   over the ~1250 nodes (same-stream gap median 0.10 vs 0.45 us), host
-   ahead on every rank. Next probe: <scratch>/
-   graph_node_bench.py in fresh processes (single GPU, 1200-node graph);
-   bimodal there = driver/graph-exec state, then vary
-   CUDA_DEVICE_MAX_CONNECTIONS, cudaGraphUpload, fork/join. Until it is
-   controlled: decide kernel work on the profiler pair's kernel-busy,
-   classify a profiled boot's state with gap_locate.py's in-step idle,
-   compare exact-token boots like-state (fast ~117, slow ~112-113 at c1),
-   and note that every node removed (fusion, custom AR on the compute
-   stream) shrinks the spread as well as the mean.
-2. Item 4 follow-ups, in order of prize: shared-expert gate_up (1024 rows,
-   42 launches x 7.4 us on the aux stream; row-per-block at M=1, the mma
-   kernel above M=1); C++ TORCH_LIBRARY registration of
-   quixicore_decode_linear (removes the 2-4 us Python trampoline on starved
-   prefill chunks; batch with the rebuild after this one); optional CONC=16
-   prof_pair.sh for a GPU-side M=16 comparison.
-2b. Custom all-reduce DONE 2026-09-07 18:40 (notebook "Custom all-reduce"):
-   RETAINED, profile default via env VLLM_CUSTOM_AR_ALLOW_PCIE=1 on the
-   rtx6000 record. c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on
-   the swap-set tree; 90 x 5.1 us custom AR kernels replace 91 x 11.2 us
-   NCCL launches and the in-step idle halves (0.37 -> 0.18 ms); six gates
-   in band (one -2.465 tail re-gated x4: -2.428..-2.447). mHC last-block
-   variant (notebook "mHC pre-transition: last-block kernel", 20:40):
-   NEUTRAL - bit-exact, 8.5-8.9 us/site either way, like-state c1/c8/c16
-   identical; kept as a documented diagnostic (VLLM_DSV4_MHC_MODE 0 coop
-   default / 1 last-block / 2 split, tests/kernels/
-   test_quixicore_dsv4_mhc_modes.py). The 0.78 ms is the kernel's own
-   serial tail, not the launch: next form is a two-barrier cooperative
-   kernel with the tail spread over all blocks (est. 0.1-0.2 ms/step).
-2c. KDA FP8 self-quantization DONE 2026-09-07 21:10 (notebook "KDA
-   projections self-quantized to block FP8"): RETAINED, default on via
-   the model-dir sidecar links -> <scratch>/
-   fp8-swapset-kda/ (7.2 GB; build `python -m slimserve.fp8_swapset
-   --native <models>/GLM-5.3-Flash --model <models>/
-   GLM-5.3-Flash-NVFP4 --out <dir>/fp8-swapset.safetensors
-   --self-quant-kda --tp-size 4`; the plain native-only sidecar stays in
-   fp8-swapset/ - relink to revert). Record 152.7 / 519 / 679 (fast
-   state; slow 144.8 / 507 / 663), +11 / +4 / +3.4% like-state. Quality
-   cost -0.014 nats mean NLL (8 vs 26 readings), needle unchanged, inside
-   the plan's 0.03 tolerance - stated, not hidden; the operator may
-   prefer BF16 KDA back (one relink). Mechanism: beta shard padded to a
-   128-row block per rank (`KimiGatedDeltaNetAttention(beta_shard_rows=
-   128)` asked for by the manifest; TP-specific, loader guard). Knob if
-   the 0.014 matters: gating rows (beta/f_a/g_a) BF16 via a split launch.
-   Remaining fixed overhead, in order: the two-barrier mHC form, the
-   launch census's sub-4 us kernels (fusions), the custom AR's own 0.46
-   ms (two-stage vs one-stage threshold is vLLM's default; a PCIe-tuned
-   threshold is a one-factor A/B), the 11 DSA layers' bf16 fused_qkv_a /
-   kv_b (22 launches, 0.24 ms: native FP8 q_a/kv_a exist but share a
-   module with BF16 indexer shards).
-2d. Small-k sampler kernel DONE 2026-09-07 22:06 (notebook "Small-k
-   sampler kernel (QuixiCore topk_sample)"): RETAINED, default on. Two
-   launches (csrc/quixicore/serving/topk_sample.cuh: per-row 16-block
-   radix top-32 candidates, then merge + top-k/top-p masks + softmax +
-   noise argmax) replace the fused Triton top-k/top-p kernel + full-vocab
-   softmax: sampling class 0.17 -> 0.01 ms/step; like-state +2.8% c1 /
-   +1.0% c8 / +1.0% c16 (sampler-B2 vs mhc-t8-B, both slow/fast);
-   four gates in band (-2.439..-2.473; the next boot carries GATES=4).
-   Dispatch: TopKTopPSampler.forward_native when every request's
-   top_k <= 32 (CPU-side `max_top_k` on SamplingMetadata), raw logprobs
-   mode, cuda, V >= 512; else the Triton path unchanged. Noise stays
-   torch's seeded [B, 32] draw. Known deviation: rows with > 32 tokens
-   tied at the k-th value keep 32 of them. Tests: tests/kernels/
-   test_quixicore_topk_sample.py (needs the op). Also in this commit:
-   mHC cooperative launch default T <= 8 (+1.2% c8; env
-   VLLM_DSV4_MHC_COOP_MAX_T=1 restores), custom AR forced 1-stage
-   REJECTED (-1.5% c8 / -2.6% c16), c16 attribution on the final tree
-   (52% Marlin at the floor; mHC split path 1.26 ms, AR 1.15, logits
-   all-gather 0.18). Next on this path: vocab-parallel candidates-only
-   sampling (drops the all-gather: 26 / 102 / 176 us at c1/c8/c16),
-   batched Philox noise for seeded rows (~5 us host per seeded row).
-   Fast/fast-state number of this tree not yet observed (1 of 7 boots
-   today landed fast/fast); like-state predicts ~157 / 525 / 685.
-2e. Sparse MLA decode partition + reduce DONE 2026-09-08 09:42 (notebook
-   "Sparse MLA decode: partition and reduce"): RETAINED, default. The
-   one-warp reducer cost 0.5 us per partition; the channel reducer
-   (paged_attention_reduce_channels, env VLLM_MLA_SPARSE_REDUCE, default
-   2) is flat at 2.4-4 us, and the decode kernel then wants 32-token
-   partitions at B <= 8 and 64 above (_bf16_partition). Per DSA layer
-   25.4 -> 10.6 us at c1, 31.9 -> 26.3 at c8, 54.0 -> 41.4 at c16
-   isolated; in the server the class fell 0.35 -> 0.13 ms/step. dsa-A
-   was the first fast/fast boot of the sampler tree: NEW RECORD 162.8 /
-   534.5 / 691.0 (c1 pass 2; +6.6 / +3.0 / +1.8% over kda-fp8-B2, of
-   which this change ~+3.7 / +0.7 / +0.9%). Gates -2.477 / -2.465.
-   Next on this path: a head-batched decode kernel (read each selected
-   latent row once for all 16 heads; the current form re-reads it 16x
-   and is L2-bound at B >= 8), and the pooled indexer kernel (17 us per
-   layer at 1000 tokens, 255 registers).
-2f. Prefill DONE 2026-09-08 10:11 (notebook "Prefill: the all-reduce
-   arms"): the 37% of a 7001-token step that was NCCL AllReduce over
-   host-memory SHM is gone because the box exported NCCL_P2P_DISABLE=1
-   (fish config, a B12X-container workaround) and NCCL's default P2P
-   level refuses the PHB/NODE topology anyway. Five one-factor arms:
-   NCCL_PROTO=Simple no effect; NCCL_P2P_DISABLE=0 alone no effect;
-   custom-AR cap 64 MiB (-14% c8 prefill) and 128 MiB (-14% c8 and c16,
-   +3.3% / +3-5% aggregate, 4 gates in band); NCCL_P2P_LEVEL=SYS with
-   P2P enabled: c8 prefill 811-831 -> 666-678 ms, c16 1354-1361 ->
-   1103-1106 (-18%), aggregates +4.2% c8 / +5-6% c16 in a slow-state
-   boot (540.5 / 713.2), decode untouched, gate -2.449; fast/fast boot
-   p2p-rec2: NEW RECORD 163.1 / 556.1 / 728.9 (c8 +4.0%, c16 +5.5%; c8
-   bar 75% covered). RETAINED as the
-   rtx6000 record env (NCCL_P2P_DISABLE=0, NCCL_P2P_LEVEL=SYS); the cap
-   stays 8 MiB (VLLM_CUSTOM_AR_MAX_SIZE_MB committed as a knob). The
-   profile env is setdefault, so an operator export of NCCL_P2P_DISABLE=1
-   silently wins: the CLI plan print now marks shadowed keys; the harness
-   launches the record with `env -u NCCL_P2P_DISABLE`; the box-wide fish
-   export is the operator's call. Lesson: every VLLM_* value is a
-   torch-compile cache-key factor and the Triton cache sits inside that
-   directory, so a new env value costs one longer boot and a ~49 s first
-   request (12 KDA-prefill/indexer Triton kernels the boot warm-up does
-   not cover); pass-1 c1 TTFT of such a boot is not a reading. Follow-up
-   for the profile: a post-health warm request through the KDA prefill
-   path or a Triton cache outside the hash directory. Bigger prefill
-   items after: an mHC prefill kernel (est. 176 -> ~20 ms per 7000
-   tokens), FP4 tensor-core grouped GEMM for M >= 64, a real prefill
-   attention. The 1088-token hybrid cache block means 1000-token bench
-   prompts never hit the prefix cache (notebook "Prefix-cache
-   granularity").
-2g. mHC prefill partials DONE 2026-09-08 10:50 (notebook "mHC prefill
-   partials: a kernel shaped for T = 7000"): `partials_prefill` in
-   csrc/quixicore/serving/mhc_ampere.cuh replaces the decode-shaped
-   `partials<24>` on the split path at T >= 64 (VLLM_DSV4_MHC_PREFILL_MIN_T;
-   runtime setter for tests; 0 = off). A block owns a 128-dim slice of all
-   four streams for a 32-token tile: fn staged once, each input element
-   read once for all four output streams, lane-per-token dot products.
-   Isolated at T = 7001: 2061 -> 392 us fused site (1.3 TB/s), 1704 -> 317
-   pre site; fused residual bit-exact, mixes within 1e-4 (13 new tests +
-   21 modes tests). Served (slow-state boot): c8 prefill 644-678 -> 532-549
-   ms, c16 1101-1106 -> 873-875, aggregates 155.6 / 564.6 / 751.3 (+1% /
-   +4% / +5% like-for-like), decode step identical (busy 5.173, 1243
-   launches), gates -2.457 / -2.462. Fast/fast boot mhcpf-rec1: NEW
-   RECORD 164.7 / 575.7 / 764.8 (c8 bar 78% covered), gate -2.476. Next: re-attribute the c8 prefill
-   (queued: prof_prefill.sh c8-mhcpf) and pick among Marlin at M >= 64,
-   the sparse MLA prefill walk, the pooled indexer, the fp8 blockwise GEMM.
-   Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
-   decode = the profiled steps plus boot state plus context growth; no
-   hidden host cost. The c8 bar needs prefill + 300 x step <= 3.24 s.
-2h. Pooled indexer prefill DONE 2026-09-08 11:37 (notebook "Pooled indexer
-   prefill: pooled keys once per request, tiled tensor-core scoring"):
-   prefill chunks score through `_pooled_logits_by_request` in
-   vllm/model_executor/layers/glm5_next_indexer.py (pool keys once per
-   request, tiles of 8 rows that never straddle a request, a [256, 128] x
-   [128, 64] tl.dot with the relu / head-weight epilogue; no host sync;
-   decode rows keep the per-row kernel). Kill switch for A/B only:
-   VLLM_GLM5_INDEXER_PREFILL_MATMUL=0. Isolated 4.48 -> 0.50 ms per call
-   at the c8 shape; served pass 2 vs the same-tree control: c8 prefill
-   531.8 -> 487.1 ms, c16 875.7 -> 798.8, aggregates 165.4 / 585.2 / 781.8
-   (fast/fast), gates -2.448 / -2.472 (control -2.466 / -2.439). Two
-   correctness fixes landed first (f47d4ed32): the expansion kernel raced
-   its tail store (1-2% of rows lost the tail pool, often the query's own
-   token; every gate before this was measured with it, band unchanged so
-   far) and the prefill row -> request map read the KV-indexed
-   token_to_seq (wrong after a prefix-cached request). Compile-cache
-   gotcha: editing a traced Python file opens a new torch-compile cache
-   hash, so pass 1 of the next boot is cold at every shape; quote pass 2.
-   Fast/fast boot idx-rec3: NEW RECORD 165.2 / 585.1 / 780.7 (c8 bar 79%
-   covered), gate -2.461. Next prefill lever: head-batched sparse MLA
-   prefill in `forward_mqa` (quixicore_mla_sparse.py; 63 ms of the ~555
-   ms c8 step on the decode walk; prototype <scratch>/
-   mla_prefill_dev.py), then fp8 blockwise (61), Marlin at M >= 64 (112).
-2i. Sparse MLA prefill DONE 2026-09-08 12:06 (notebook "Sparse MLA
-   prefill: head-batched tensor-core attention over the top-k list"):
-   vllm/v1/attention/backends/mla/quixicore_mla_sparse_prefill.py, a
-   Triton kernel with one program per query token and the 32 heads as the
-   tensor-core M dimension (S = Q K^T and O += P V per 32-key tile, online
-   softmax per head, P in fp16); `forward_mqa` takes it for steps with
-   prefill tokens (heads a power of two >= 16), decode keeps the walk.
-   Kill switch for A/B only: VLLM_MLA_SPARSE_PREFILL_TC=0. Isolated 11.5
-   -> 1.7 ms per call at the c8 shape, one bf16 rounding from the walk.
-   Served pass 2 vs the same-tree control: c1 prefill 106.4 -> 97.7, c8
-   489.2 -> 445.9, c16 802.2 -> 729.9 (-8..-9%), aggregates +0.6 / +1.0
-   / +3.0% in a slow-front-end boot, gates -2.467 / -2.436. Commit
-   60ac5abc9. Fast/fast boot mlapf-rec4: NEW RECORD 165.7 / 591.9 / 797.4
-   (c8 bar 80% covered), gate -2.450. c8 decode attribution on this tree
-   (notebook, 12:22): weight streaming 6.7-7.0 of the 11.7 ms step is at
-   the wire (Marlin 5.34 at the expert floor, fp8 net ~1.7 vs 1.4 floor);
-   the movable ~4.7 ms is 90-site latency work (mHC 0.99, custom AR 0.94)
-   and ~470 sub-2 us launches; the listed decode levers sum to ~1.2 ms,
-   so the no-spec c8 bar needs MTP. Pass 1 of a boot is not a prefill reading at any shape
-   (first launches of kernels the warm-up never runs, 0-465 ms per
-   request today); profile follow-up: warm the prefill-only kernels in
-   the boot. Remaining prefill: fp8 blockwise (61 ms), Marlin at M >= 64
-   (112; needs the purpose-built FP4 grouped GEMM), reduce at the wire
-   (168, physics).
-3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
-   retained numbers ran the shared gate_up at 8 stages while the committed
-   table said 4 (an edit after the JIT build); natively the 4-stage config
-   took 21 us next to Marlin vs 7 - fixed (both N<2048 branches 8 stages,
-   the 16-row one by analogy: check with a profiled c16 round), validated
-   natively. Sidecar variant without shared down: REJECTED (neutral). Rule:
-   aux-stream kernels are tuned from the serving trace under contention
-   (aux_window.py). Pass 1 of c1 dips 4% in some boots (open; quote pass 2).
-3a. FP8 weight swap-set DONE 2026-09-07 18:17 (notebook parts 1 and 2,
-   plan "Item 2b"): RETAINED, default on. Like-state exact-token c1 117.4
-   -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 (+5.5 / +2.0 / +1.1%),
-   gates -2.408 / -2.437, profiler pair -0.35 ms/step. Serving needs the
-   sidecar next to the checkpoint (<models>/GLM-5.3-Flash-NVFP4/
-   fp8-swapset.{safetensors,json} -> symlinks into
-   <scratch>/fp8-swapset/; rebuild with `python -m
-   slimserve.fp8_swapset <models>/GLM-5.3-Flash <models>/
-   GLM-5.3-Flash-NVFP4`) and, until the next native rebuild, the JIT hook
-   QC_DEV_GEMM_FP8=1 PYTHONPATH=<scratch>/jit/site
-   (without it decode falls back to CUTLASS w8a8 blockwise, +1 quant
-   launch per linear - slower than BF16 at c1, so keep the hook or
-   rebuild). Follow-up, one factor: the small-K fp8 shapes on the aux
-   stream (shared down K=512 takes 8.7 us vs bf16 4.0 under Marlin;
-   hidden today) - sidecar variant without shared_experts.down_proj
-   (SWAP_MODULES edit + build with out=, manifest hash keys the compile
-   cache) or a K<=1536 kernel variant; decide on the overlap-free busy.
-   FP8 KV stays deprioritized (capacity item). Then MTP k=3 on the
-   Foundry shape (peer); optional re-test of the cooperative mHC launcher.
-4. Method: ab.sh STATE=1 labels a boot's front-end state (profiled round
-   after the benches, trace in profile-state-<run>; "-- state:" in-step idle ~0.18 fast / ~0.49 slow
-   on the custom-AR tree, "-- attrib:" kernel-busy). Use it on every exact-token arm from now on;
-   the first swap-set B boot (118.4, unlabelled) was a slow-state boot
-   that read as +0.8% until B2 (fast) gave 123.8. Third boot-state
-   component found 2026-09-07 21:10 (kda-fp8-A): fast replay idle but the
-   custom all-reduce at 8.8 us/launch instead of 5.1 (+0.32 ms/step) ->
-   slow-state throughput; clocks/PCIe link identical. Read the attrib
-   line's "custom allreduce" us/launch as well as the idle when labelling.
-   Second slow-AR boot 21:53 (sampler-B, fast idle + 8.7 us AR): per-GPU
-   SM clocks 2700 +- 20 MHz, power, temperature, PCIe gen5 x16 all equal
-   to the fast-AR boots (serve-logs/clocks-gpu-*.csv); worker threads
-   migrate over all 64 logical CPUs in every boot (threads-*.log), no
-   placement pattern; a display-service daemon sits at 20-50% of a core in
-   every boot. Today's seven labelled boots: fast/fast 1, fast/slow-AR 2,
-   slow/fast 4. Untested hypotheses: launch skew between ranks at the
-   first AR of each graph replay (rank 0 waiting on a late peer: the
-   per-rank trace timestamps of the four workers would show it; only rank
-   0 is profiled today), P2P mapping state per boot (cudaDeviceEnablePeer
-   ordering / IPC handle placement), PIN=1 in ab.sh (untested).
-Profiler captures: prof_run.py now runs a 384-token profiled round so the
-8-iteration capture sits in steady decode (96 ended before the capture
-with MTP on and produced a 2-iteration trace whose "step" was a partial
-window). Read step_attrib's "mean over N full steps" and want N >= 2.
-Never git stash/checkout in the tree while a server boots or runs from it.
-Shared box (2026-09-07 22:44-): another job (the operator's video-model server) held ~37 GB per GPU for an hour; the
-profile cannot boot beside it. ab.sh, ttft_probe.sh, prof_*.sh and
-native_incremental.sh now abort or wait when nvidia-smi lists a foreign
-compute process. native_incremental.sh's wait loop is anchored to real
-script launches (a tool-wrapper shell whose text mentioned "ab.sh "
-deadlocked it for an hour).
-Box rebooted 2026-09-08 03:10 (uptime -s): the dsa-A attempt at 02:53
-failed with "glm53-nvfp4-4 needs 4 GPUs and this machine shows 3" - one
-GPU had dropped off the bus before the reboot. After the reboot all four
-show (gen5 x16), nothing else on them; the retrying queue
-(resume_chain2.sh: dsa-A, nccl-simple, car64) was relaunched 09:33.
-Queued runs: write the waiter as a script file and launch it once - a
-`bash -c` waiter launched from the assistant shell was invisible to pgrep
-right after launch, got launched twice, and the two chains interleaved one
-stdout file and overwrote a results directory (item4-A2 raw files lost).
-prof_pair.sh takes CONC=<n> for a profiled round at another concurrency.
-Gates unchanged (plan section 4): exact-token within the band or better,
-NLL + needle within 0.03 nats, one notebook entry per experiment.
-
-## Machine notes
-
-Operator scratch (not in the repo, `<scratch>` in this section): `serve.sh`,
-`bench.sh`, `prof_run.py`, `step_attrib.py`, build and serve logs, traces,
-research artifacts. The venv lives outside the repo, symlinked to `.venv`.
-Never build FlashInfer from source on this box.
+non-deterministic); gates per plan section 4 (exact-token within the band
+or better, NLL + needle within 0.03 nats); a notebook entry for every
+result including rejections. A traced Python edit or a new VLLM_* value
+opens a new torch-compile cache hash, so pass 1 of the next boot is cold
+at every shape: quote pass 2. Profiler captures use a 384-token round so
+the capture sits in steady decode; read the attribution's "mean over N
+full steps" and want N >= 2. Never git stash or checkout in the tree
+while a server boots or runs from it. Commits carry the human maintainer
+only and are pushed to the QuixiAI branch after each commit. Repo docs
+carry no machine paths; operator notes live outside the repo.
 
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
