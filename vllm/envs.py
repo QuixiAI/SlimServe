@@ -147,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_FP8_MAIN_KV: bool = False
     VLLM_QWEN4_EXP_TQ_MAIN_KV: bool = False
     VLLM_CUSTOM_AR_ALLOW_PCIE: bool = False
+    VLLM_CUSTOM_AR_MAX_SIZE_MB: int = 8
     VLLM_GDN_DECODE_KERNEL: Literal["cuda", "triton"] = "cuda"
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1281,6 +1282,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # without that the P2P probe fails and the gate below still disables it.
     "VLLM_CUSTOM_AR_ALLOW_PCIE": lambda: (
         os.getenv("VLLM_CUSTOM_AR_ALLOW_PCIE", "False").lower() in ("true", "1")
+    ),
+    # Custom all-reduce buffer cap in MiB; messages above it fall back to
+    # NCCL. 8 covers decode; a prefill chunk's [tokens, hidden] reduce is
+    # larger (57 MB at 7001 tokens x 4096 bf16) and NCCL's PCIe ring ran it
+    # at 15 GB/s on rtx6000 (notebook 2026-09-07 "Prefill attribution").
+    "VLLM_CUSTOM_AR_MAX_SIZE_MB": lambda: int(
+        os.getenv("VLLM_CUSTOM_AR_MAX_SIZE_MB", "8")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (

@@ -252,6 +252,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
                 device=self.device,
+                max_size=envs.VLLM_CUSTOM_AR_MAX_SIZE_MB << 20,
                 symm_mem_enabled=(
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
