@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The GLM-5.3-Flash pooled indexer on a synthetic paged cache with uneven
-requests and cached prefixes: the tail tokens of every row, and the
+"""The GLM-5.3-Flash pooled indexer's prefill path (pooled keys once per
+request, tiled tensor-core matmul) against the per-row kernel, on a
+synthetic paged cache with uneven requests and cached prefixes; and the
 query-row -> block-table-row map of a prefill chunk."""
 
 import pytest
@@ -56,7 +57,7 @@ def _synth(query_lens, cached, seed=0):
     return q, w, ape, cache, bt, row_req, visible, max_pools
 
 
-def _select(q, w, ape, cache, bt, row_req, visible, max_pools):
+def _select(by_request, q, w, ape, cache, bt, row_req, visible, max_pools):
     R = q.shape[0]
     logits = torch.full((R, max_pools), float("nan"), device=DEV)
     topk = torch.full((R, KSEL * KP + KP), -7, dtype=torch.int32, device=DEV)
@@ -75,11 +76,60 @@ def _select(q, w, ape, cache, bt, row_req, visible, max_pools):
         KSEL,
         topk,
         KP,
+        by_request=by_request,
     )
     return logits, topk
 
 
-def test_tail_tokens_survive():
+@pytest.mark.parametrize(
+    "query_lens,cached",
+    [
+        ([1000, 700, 1300, 5, 1000], [0, 0, 0, 0, 0]),
+        ([500, 1000, 3, 900], [1500, 0, 2000, 64]),  # cached prefixes
+        ([1], [0]),  # a single one-token chunk
+        ([7, 9], [3, 2500]),  # tiny queries, one over a long context
+    ],
+)
+def test_matches_per_row_kernel(query_lens, cached):
+    q, w, ape, cache, bt, row_req, visible, max_pools = _synth(query_lens, cached)
+    ref_logits, ref_topk = _select(
+        False, q, w, ape, cache, bt, row_req, visible, max_pools
+    )
+    new_logits, new_topk = _select(
+        True, q, w, ape, cache, bt, row_req, visible, max_pools
+    )
+    torch.cuda.synchronize()
+    n_pools = visible // KP
+    R = q.shape[0]
+    p = torch.arange(max_pools, device=DEV)
+    written = p[None, :] < n_pools[:, None]  # both leave the rest unwritten
+    torch.testing.assert_close(
+        new_logits[written], ref_logits[written], atol=1e-5, rtol=1e-5
+    )
+    assert not torch.isnan(new_logits[written]).any()
+    # Same tokens per row. The two kernels accumulate in a different order,
+    # so pools whose logits sit within float noise of the k-th largest may
+    # legitimately swap in and out when a row has more pools than KSEL.
+    ref_sets = ref_topk.sort(dim=1).values
+    new_sets = new_topk.sort(dim=1).values
+    for r in (ref_sets != new_sets).any(dim=1).nonzero().flatten().tolist():
+        a = set(ref_topk[r][ref_topk[r] >= 0].tolist())
+        b = set(new_topk[r][new_topk[r] >= 0].tolist())
+        assert len(a) == len(b), r
+        np_r = int(n_pools[r])
+        assert np_r > KSEL, (r, sorted(a ^ b))
+        kth = ref_logits[r, :np_r].topk(KSEL).values[-1]
+        for tok in a ^ b:
+            assert abs(float(ref_logits[r, tok // KP]) - float(kth)) < 1e-4, r
+    for r in range(0, R, max(1, R // 16)):
+        valid = ref_topk[r][ref_topk[r] >= 0]
+        assert valid.numel() == min(int(n_pools[r]), KSEL) * KP + (
+            int(visible[r]) - int(n_pools[r]) * KP
+        )
+
+
+@pytest.mark.parametrize("by_request", [False, True])
+def test_tail_tokens_survive(by_request):
     """The incomplete tail pool's tokens (including the query's own token,
     three rows in four) sit right after the selected pools in every row,
     on every run: the expansion loop used to write -1 over those columns
@@ -96,7 +146,7 @@ def test_tail_tokens_survive():
         m[None, :] < tail_count[:, None], (n_pools * KP)[:, None] + m[None, :], -1
     )
     for _ in range(5):
-        _, topk = _select(q, w, ape, cache, bt, row_req, visible, max_pools)
+        _, topk = _select(by_request, q, w, ape, cache, bt, row_req, visible, max_pools)
         torch.cuda.synchronize()
         got = torch.gather(topk, 1, cols.long())
         bad = (got != want).any(dim=1).nonzero().flatten()

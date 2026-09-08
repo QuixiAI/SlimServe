@@ -28,6 +28,8 @@ opaque to torch.compile and captures into decode CUDA graphs.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -55,6 +57,14 @@ logger = init_logger(__name__)
 _K_DIM = 128
 _ROW_DIM = 2 * _K_DIM  # [k | gate]
 _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
+# Prefill path: pooled keys once per (request, pool), then a tensor-core
+# matmul of [_ROW_TILE * H, D] query rows against [_POOL_TILE, D] pooled keys.
+# Kill switch for A/B runs only (read here, so it is not a compile factor):
+# VLLM_GLM5_INDEXER_PREFILL_MATMUL=0 scores prefill rows with the decode-shaped
+# per-row kernel instead.
+_PREFILL_MATMUL = os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1") != "0"
+_ROW_TILE = 8
+_POOL_TILE = 64
 
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
@@ -254,7 +264,209 @@ def _expand_topk_kernel(
         tl.store(out_ptr + r.to(tl.int64) * OUT_W + c, tl.full((256,), -1, tl.int32), mask=cm)
 
 
+@triton.jit(do_not_specialize=["max_pools"])
+def _pool_keys_kernel(
+    ape_ptr,        # [KP, D] fp32
+    cache_ptr,      # [num_slots, ROW] bf16
+    bt_ptr,         # [num_bt_rows, bt_stride] int32
+    req_pools_ptr,  # [num_bt_rows] int32: pools to build per block-table row
+    pk_ptr,         # [num_bt_rows, max_pools, D] bf16
+    max_pools,
+    bt_stride,
+    page_stride,
+    BLOCK_SIZE: tl.constexpr,
+    D: tl.constexpr,
+    KP: tl.constexpr,
+    ROW: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """pk[req, p, :] = sum_m softmax_m(gate(t_m) + ape[m]) * k(t_m) over the
+    KP members of pool p of the request in block-table row req. The pooled
+    key depends only on the cache and APE, never on the query, so the
+    prefill path builds it once per request instead of once per query row
+    (`_pooled_logits_kernel` re-pools it for every row: rows x visible
+    softmaxes gathered through the block table). Same arithmetic and the
+    same bf16 rounding as that kernel's pool_key."""
+    req = tl.program_id(0)
+    pt = tl.program_id(1)
+    n_pools = tl.load(req_pools_ptr + req)
+    p = pt * BLOCK_P + tl.arange(0, BLOCK_P)
+    pmask = p < n_pools
+    m = tl.arange(0, KP)
+    d = tl.arange(0, D)
+    ape = tl.load(ape_ptr + m[:, None] * D + d[None, :])  # [KP, D]
+    tok = p[:, None] * KP + m[None, :]  # [P, KP]
+    blk = tl.load(
+        bt_ptr + req.to(tl.int64) * bt_stride + tok // BLOCK_SIZE,
+        mask=pmask[:, None],
+        other=0,
+    )
+    base = cache_ptr + (
+        blk.to(tl.int64) * page_stride + (tok % BLOCK_SIZE) * ROW
+    )[:, :, None]  # [P, KP, 1]
+    k = tl.load(base + d[None, None, :], mask=pmask[:, None, None], other=0.0)
+    g = tl.load(base + D + d[None, None, :], mask=pmask[:, None, None], other=0.0)
+    logits_g = g.to(tl.float32) + ape[None, :, :]  # [P, KP, D]
+    mx = tl.max(logits_g, axis=1)  # [P, D]
+    e = tl.exp(logits_g - mx[:, None, :])
+    probs = e / tl.sum(e, axis=1)[:, None, :]
+    pool_key = tl.sum(probs * k.to(tl.float32), axis=1)  # [P, D]
+    tl.store(
+        pk_ptr + (req.to(tl.int64) * max_pools + p)[:, None] * D + d[None, :],
+        pool_key.to(tl.bfloat16),
+        mask=pmask[:, None],
+    )
+
+
+@triton.jit
+def _row_tiles_kernel(
+    start_ptr,      # [num_req] int32: first query row of the request
+    count_ptr,      # [num_req] int32: query rows of the request
+    first_ptr,      # [num_req] int32: first tile slot of the request
+    row0_ptr,       # [max_tiles] int32 out
+    end_ptr,        # [max_tiles] int32 out
+    req_ptr,        # [max_tiles] int32 out
+    RT: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Tiles of RT consecutive query rows of one request (the last tile of a
+    request is short), written at the request's slots of the tile table.
+    Sized on the host from an upper bound, so no sync: unused slots keep
+    their (0, 0) fill and the matmul programs that draw them exit."""
+    req = tl.program_id(0)
+    start = tl.load(start_ptr + req)
+    count = tl.load(count_ptr + req)
+    first = tl.load(first_ptr + req)
+    n_tiles = (count + RT - 1) // RT
+    for t0 in range(0, n_tiles, BLOCK_T):
+        t = t0 + tl.arange(0, BLOCK_T)
+        tmask = t < n_tiles
+        row0 = start + t * RT
+        tl.store(row0_ptr + first + t, row0, mask=tmask)
+        tl.store(end_ptr + first + t, tl.minimum(row0 + RT, start + count), mask=tmask)
+        req_v = tl.full((BLOCK_T,), 0, tl.int32) + req
+        tl.store(req_ptr + first + t, req_v, mask=tmask)
+
+
+@triton.jit(do_not_specialize=["max_pools"])
+def _pooled_logits_matmul_kernel(
+    q_ptr,          # [R, H, D] bf16
+    w_ptr,          # [R, H] fp32 (already * n_heads^-0.5)
+    pk_ptr,         # [num_bt_rows, max_pools, D] bf16 pooled keys
+    row0_ptr,       # [max_tiles] int32
+    end_ptr,        # [max_tiles] int32
+    req_ptr,        # [max_tiles] int32
+    vis_ptr,        # [R] int32
+    out_ptr,        # [R, max_pools] fp32
+    max_pools,
+    softmax_scale,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    KP: tl.constexpr,
+    RT: tl.constexpr,
+    PT: tl.constexpr,
+):
+    """logits[r, p] = sum_h w[r, h] * relu(scale * <pk[req(r), p], q[r, h]>)
+    for p < vis(r) // KP. One program scores a row tile (rows [row0, end)
+    of one request) against PT pools as a [RT * H, D] x [D, PT] tensor-core
+    product; pool tiles past every row's visibility exit at once."""
+    rt = tl.program_id(0)
+    pt = tl.program_id(1)
+    r0 = tl.load(row0_ptr + rt)
+    r_end = tl.load(end_ptr + rt)
+    rows = r0 + tl.arange(0, RT)
+    rmask = rows < r_end
+    vis = tl.load(vis_ptr + rows, mask=rmask, other=0)
+    n_pools = vis // KP
+    p0 = pt * PT
+    if p0 >= tl.max(n_pools, axis=0):
+        return
+    req = tl.load(req_ptr + rt)
+    p = p0 + tl.arange(0, PT)
+    d = tl.arange(0, D)
+    pk = tl.load(
+        pk_ptr + (req.to(tl.int64) * max_pools + p)[:, None] * D + d[None, :],
+        mask=(p < max_pools)[:, None],
+        other=0.0,
+    )  # [PT, D]
+    qi = tl.arange(0, RT * H)
+    qrow = r0 + qi // H
+    qmask = qrow < r_end
+    q = tl.load(
+        q_ptr + (qrow.to(tl.int64) * H + qi % H)[:, None] * D + d[None, :],
+        mask=qmask[:, None],
+        other=0.0,
+    )  # [RT * H, D]
+    scores = tl.dot(q, tl.trans(pk))  # [RT * H, PT] fp32
+    scores = tl.maximum(scores * softmax_scale, 0.0)
+    w = tl.load(w_ptr + qrow * H + qi % H, mask=qmask, other=0.0)  # [RT * H]
+    scores = tl.reshape(scores * w[:, None], (RT, H, PT))
+    logit = tl.sum(scores, axis=1)  # [RT, PT]
+    valid = (p[None, :] < n_pools[:, None]) & rmask[:, None]
+    logit = tl.where(valid, logit, float("-inf"))
+    tl.store(
+        out_ptr + rows.to(tl.int64)[:, None] * max_pools + p[None, :],
+        logit,
+        mask=rmask[:, None] & (p[None, :] < max_pools),
+    )
+
+
 # --------------------------------------------------------------------- core op
+
+
+def _pooled_logits_by_request(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    ape: torch.Tensor,
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_req: torch.Tensor,
+    n_pools: torch.Tensor,     # [R] int32: visible // kp per row
+    visible: torch.Tensor,
+    logits: torch.Tensor,
+    max_pools: int,
+    block_size: int,
+    softmax_scale: float,
+    kp: int,
+) -> None:
+    """Fill `logits` for rows grouped by request (rows of a request are
+    contiguous, requests in block-table order, as in a prefill chunk):
+    pooled keys once per request, then the tiled matmul. Every size that
+    shapes a launch is a host int, so nothing syncs."""
+    R, H, D = q.shape
+    RT, PT = _ROW_TILE, _POOL_TILE
+    n_req = block_table.shape[0]
+    dev = q.device
+    i32 = torch.int32
+    req_ids = torch.arange(n_req, device=dev, dtype=row_req.dtype)
+    start = torch.searchsorted(row_req, req_ids).to(i32)
+    end = torch.searchsorted(row_req, req_ids, right=True).to(i32)
+    count = end - start
+    req_pools = torch.zeros(n_req, dtype=i32, device=dev)
+    req_pools.scatter_reduce_(0, row_req.long(), n_pools, reduce="amax")
+    n_tiles = (count + (RT - 1)) // RT
+    tile_first = torch.cumsum(n_tiles, 0, dtype=i32) - n_tiles
+    # sum over requests of ceil(count / RT) <= ceil(R / RT) + n_req; padded
+    # to 16 slots so the three table rows stay 16-byte aligned (Triton
+    # specialises pointer args on alignment: one compile per boot, not one
+    # per tile count).
+    max_tiles = -(-(triton.cdiv(R, RT) + n_req) // 16) * 16
+    tiles = torch.zeros((3, max_tiles), dtype=i32, device=dev)
+    _row_tiles_kernel[(n_req,)](
+        start, count, tile_first, tiles[0], tiles[1], tiles[2],
+        RT=RT, BLOCK_T=256,
+    )
+    pk = torch.empty((n_req, max_pools, D), dtype=torch.bfloat16, device=dev)
+    BLOCK_P = 16
+    _pool_keys_kernel[(n_req, triton.cdiv(max_pools, BLOCK_P))](
+        ape, cache, block_table, req_pools, pk, max_pools,
+        block_table.stride(0), cache.stride(0),
+        BLOCK_SIZE=block_size, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
+    )
+    _pooled_logits_matmul_kernel[(max_tiles, triton.cdiv(max_pools, PT))](
+        q, weights, pk, tiles[0], tiles[1], tiles[2], visible, logits,
+        max_pools, softmax_scale, H=H, D=D, KP=kp, RT=RT, PT=PT,
+    )
 
 
 def _prefill_row_req(chunk, R: int) -> torch.Tensor:
@@ -286,21 +498,30 @@ def _pooled_select(
     ksel: int,
     topk_out: torch.Tensor,    # [R, OUT_W] int32
     kp: int,
+    by_request: bool = False,  # rows grouped by request: prefill chunks
 ) -> None:
     R, H, D = q.shape
     if R == 0:
         return
-    BLOCK_P = 16
-    # Fixed program count per row; each program strides over the row's
-    # actual pool tiles (see the kernel docstring).
-    grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
-    _pooled_logits_kernel[grid](
-        q, weights, ape, cache, block_table, row_req, visible,
-        logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
-        BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
-    )
-    # top-k over pools: prefill-style ranges [0, n_pools) per row.
     n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
+    if by_request:
+        _pooled_logits_by_request(
+            q, weights, ape, cache, block_table, row_req, n_pools, visible,
+            logits, max_pools, block_size, softmax_scale, kp,
+        )
+    else:
+        BLOCK_P = 16
+        # Fixed program count per row; each program strides over the row's
+        # actual pool tiles (see the kernel docstring).
+        grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
+        _pooled_logits_kernel[grid](
+            q, weights, ape, cache, block_table, row_req, visible,
+            logits, max_pools, block_table.stride(0), cache.stride(0),
+            softmax_scale,
+            BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM,
+            BLOCK_P=BLOCK_P,
+        )
+    # top-k over pools: prefill-style ranges [0, n_pools) per row.
     zeros = torch.zeros_like(n_pools)
     sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
     ops.top_k_per_row_prefill(
@@ -369,6 +590,7 @@ def glm5_next_pooled_indexer(
                 ape, cache, chunk.block_table, row_req, visible, logits,
                 max_pools, block_size, softmax_scale, ksel,
                 topk_indices_buffer[chunk.token_start:chunk.token_end], kp,
+                by_request=_PREFILL_MATMUL,
             )
 
     # 3) decode rows (fixed-size workspace: CUDA-graph safe).
