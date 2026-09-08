@@ -642,8 +642,21 @@ the fork's VLLM_CUSTOM_AR_ALLOW_PCIE=1 escape hatch, now the rtx6000
 record's env default. 90 x 5.1 us cross_device_reduce kernels on the
 compute stream replace 91 x 11.2 us NCCL ring-LL launches and their
 cross-stream graph gaps; c1 123.8 -> 137.4, c8 478 -> 499, c16 628 ->
-657 on the swap-set tree, six gates in band. Record now 137.4 / 499 /
-657 no-spec; the c8 bar (740) is 67% covered.
+657 on the swap-set tree, six gates in band. Record then 137.4 / 499 /
+657 no-spec.
+
+Phase 2 second lever, done 2026-09-07 21:10 (notebook "KDA projections
+self-quantized to block FP8"): the 34 KDA layers' q/k/v/beta/f_a/g_a and
+o_proj, BF16 in every checkpoint, quantized here to the swap-set's
+128x128 block-e4m3 format (absmax / 448) and served through the same
+W8A16 decode GEMM; per rank in_proj 34.3 -> 18.3 us, o_proj 11.7 -> 6.9,
+union busy -0.65 ms/step. The merged projection's 16-row beta shard is
+stored per rank padded to a 128-row block (TP-specific sidecar, manifest
+`tp_size`, loader guard) so every shard's block scales load through the
+standard merged loader. Quality cost measured and accepted under this
+plan's own tolerance: -0.014 nats mean NLL over 8 vs 26 readings, needle
+unchanged. Record now 152.7 / 519 / 679 no-spec (fast state); the c8 bar
+(740) is 70% covered. Revert = relink the plain sidecar.
 
 ### Bytes research digest (2026-09-07, read-only; full notes in /raid/scratch/slimserve-glm53/research/fp8-{swapset,kv}-research-2026-09-07.md)
 
@@ -819,7 +832,8 @@ Expected: c1 well under 200 because of the BF16 backbone and NCCL.
    Needs an sm_120 FP8 block linear kernel choice and regex targets on the
    fused vLLM module names (the model has no `packed_modules_mapping`).
    Self-quantizing KDA q/k/v/o to FP8 (ceiling ~460) is a separate
-   experiment with its own quality gate, since ZAI kept them BF16.
+   experiment with its own quality gate, since ZAI kept them BF16 - DONE
+   2026-09-07, retained at -0.014 nats (Phase 2 second lever, below).
    NVFP4 linear via CUTLASS W4A4 (#55170) is the follow-on A/B.
 3. FP8 KV (`fp8_ds_mla`, NoPE row layout from #55277) as an explicit,
    validated per-profile choice; ~1.8x KV tokens.

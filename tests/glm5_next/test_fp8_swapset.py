@@ -63,9 +63,19 @@ def _fake_checkpoints(tmp_path):
     fp8(f"{L}.3.self_attn.o_proj", 128, 256)
     fp8(f"{L}.3.mlp.shared_experts.down_proj", 128, 128)
     fp8(f"{L}.45.mlp.shared_experts.down_proj", 128, 128)  # MTP layer: skipped
-    # KDA o_proj is BF16 in native: not a swap candidate.
-    nat[f"{L}.4.self_attn.o_proj.weight"] = torch.randn(128, 128).to(torch.bfloat16)
-    con[f"{L}.4.self_attn.o_proj.weight"] = nat[f"{L}.4.self_attn.o_proj.weight"]
+    # KDA layer 4: BF16 in native, not a swap candidate; a self-quant one.
+    for suffix, n, k in [
+        ("o_proj", 128, 256),
+        ("q_proj", 256, 128),
+        ("k_proj", 256, 128),
+        ("v_proj", 256, 128),
+        ("b_proj", 8, 128),
+        ("f_a_proj", 128, 128),
+        ("g_a_proj", 128, 128),
+    ]:
+        w = (torch.randn(n, k) * 0.02).to(torch.bfloat16)
+        nat[f"{L}.4.self_attn.{suffix}.weight"] = w
+        con[f"{L}.4.self_attn.{suffix}.weight"] = w
     save_file(nat, str(native / "model-00001-of-00001.safetensors"))
     save_file(con, str(conv / "model-00001-of-00001.safetensors"))
     (conv / "config.json").write_text(
@@ -170,7 +180,7 @@ def test_loader_substitutes_weights_and_injects_scales(tmp_path, monkeypatch):
         )
         yield (
             f"{L}.4.self_attn.o_proj.weight",
-            torch.zeros(128, 128, dtype=torch.bfloat16),
+            torch.zeros(128, 256, dtype=torch.bfloat16),
         )
 
     got = list(iter_with_overrides(stream(), subs, extras, strict=True))
@@ -197,4 +207,132 @@ def test_manifest_and_file_must_agree(tmp_path, monkeypatch):
     manifest["tensors"].append("extra")
     (conv / fp8_swapset.MANIFEST_FILE).write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="do not match the manifest"):
+        _load_fp8_swapset(str(conv))
+
+
+def _dequant(q, scale):
+    return fp8_swapset.dequant_bf16(q, scale).float()
+
+
+def test_quantize_block_is_absmax_over_448_with_a_ragged_last_block():
+    torch.manual_seed(1)
+    w = (torch.randn(200, 256) * 0.05).to(torch.bfloat16)
+    q, s = fp8_swapset.quantize_block(w)
+    assert q.shape == (200, 256) and q.dtype == torch.float8_e4m3fn
+    assert s.shape == (2, 2) and s.dtype == torch.float32
+    blk = w[128:200, 128:256].float().abs().amax()
+    assert torch.isclose(s[1, 1], blk / 448.0)
+    err = (_dequant(q, s) - w.float()).abs()
+    # e4m3 keeps 3 mantissa bits: half an ulp of the block's absmax at worst.
+    assert err.max() <= w.float().abs().max() / 16 * 1.01
+    assert err.norm() / w.float().norm() < 0.05
+    with pytest.raises(ValueError, match="multiple of 128"):
+        fp8_swapset.quantize_block(torch.zeros(128, 100, dtype=torch.bfloat16))
+
+
+def test_quantize_beta_lays_each_rank_in_its_own_block():
+    torch.manual_seed(2)
+    w = (torch.randn(8, 256) * 0.05).to(torch.bfloat16)
+    q, s = fp8_swapset.quantize_beta(w, tp_size=2)
+    assert q.shape == (2 * fp8_swapset.BETA_ROWS, 256) and s.shape == (2, 2)
+    d = _dequant(q, s)
+    for r in range(2):
+        rows = d[r * fp8_swapset.BETA_ROWS : (r + 1) * fp8_swapset.BETA_ROWS]
+        ref = w[4 * r : 4 * r + 4].float()
+        assert (rows[:4] - ref).abs().max() <= ref.abs().max() / 16 * 1.01
+        assert (rows[4:] == 0).all()
+        # The scale is the rank's own absmax, not the whole tensor's.
+        assert torch.isclose(
+            s[r, 0], w[4 * r : 4 * r + 4, :128].float().abs().amax() / 448
+        )
+    with pytest.raises(ValueError, match="do not shard"):
+        fp8_swapset.quantize_beta(w, tp_size=3)
+
+
+def test_self_quant_kda_extends_sidecar_manifest_and_targets(tmp_path, monkeypatch):
+    monkeypatch.delenv(fp8_swapset.SWAPSET_ENV, raising=False)
+    native, conv = _fake_checkpoints(tmp_path)
+    with pytest.raises(SystemExit, match="tp-size"):
+        fp8_swapset.build(str(native), str(conv), self_quant_kda=True)
+    out = fp8_swapset.build(str(native), str(conv), self_quant_kda=True, tp_size=2)
+    from safetensors.torch import load_file
+
+    tensors = load_file(str(out))
+    kda = [n for n in tensors if f"{L}.4." in n]
+    assert sorted(kda) == sorted(
+        f"{L}.4.self_attn.{p}.{t}"
+        for p in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "b_proj",
+            "f_a_proj",
+            "g_a_proj",
+            "o_proj",
+        ]
+        for t in ["weight", "weight_scale"]
+    )
+    assert tensors[f"{L}.4.self_attn.b_proj.weight"].shape == (256, 128)
+    assert tensors[f"{L}.4.self_attn.b_proj.weight_scale"].shape == (2, 1)
+    assert tensors[f"{L}.4.self_attn.q_proj.weight_scale"].shape == (2, 1)
+    assert tensors[f"{L}.4.self_attn.o_proj.weight_scale"].shape == (1, 2)
+    # The native-FP8 twins are still there, byte for byte.
+    assert f"{L}.3.self_attn.o_proj.weight" in tensors
+    manifest = json.loads((conv / fp8_swapset.MANIFEST_FILE).read_text())
+    assert manifest["tp_size"] == 2 and manifest["beta_rows"] == 128
+    assert manifest["self_quantized"] == sorted(n for n in kda if n.endswith(".weight"))
+    assert (
+        "language_model.model.layers.4.self_attn.in_proj_qkvgfab" in manifest["modules"]
+    )
+    assert "language_model.model.layers.4.self_attn.o_proj" in manifest["modules"]
+    targets = manifest["config_group"]["targets"]
+    assert "re:.*\\.layers\\.(4)\\.self_attn\\.in_proj_qkvgfab$" in targets
+    assert "re:.*\\.layers\\.(3|4)\\.self_attn\\.o_proj$" in targets
+    # The model asks for the padded beta shard only where the manifest says so.
+    assert (
+        fp8_swapset.beta_shard_rows(
+            str(conv), "model.layers.4.self_attn.in_proj_qkvgfab"
+        )
+        == 128
+    )
+    assert (
+        fp8_swapset.beta_shard_rows(
+            str(conv), "model.layers.3.self_attn.in_proj_qkvgfab"
+        )
+        is None
+    )
+    monkeypatch.setenv(fp8_swapset.SWAPSET_ENV, "0")
+    assert (
+        fp8_swapset.beta_shard_rows(
+            str(conv), "model.layers.4.self_attn.in_proj_qkvgfab"
+        )
+        is None
+    )
+
+
+def test_plain_sidecar_asks_for_no_beta_padding(tmp_path, monkeypatch):
+    monkeypatch.delenv(fp8_swapset.SWAPSET_ENV, raising=False)
+    native, conv = _fake_checkpoints(tmp_path)
+    fp8_swapset.build(str(native), str(conv))
+    manifest = json.loads((conv / fp8_swapset.MANIFEST_FILE).read_text())
+    assert "self_quantized" not in manifest and "tp_size" not in manifest
+    assert (
+        fp8_swapset.beta_shard_rows(
+            str(conv), "model.layers.4.self_attn.in_proj_qkvgfab"
+        )
+        is None
+    )
+
+
+def test_loader_refuses_a_self_quant_sidecar_of_another_tp(tmp_path, monkeypatch):
+    monkeypatch.delenv(fp8_swapset.SWAPSET_ENV, raising=False)
+    native, conv = _fake_checkpoints(tmp_path)
+    fp8_swapset.build(str(native), str(conv), self_quant_kda=True, tp_size=2)
+    import vllm.model_executor.models.glm5_next as m
+
+    monkeypatch.setattr(m, "get_tensor_model_parallel_world_size", lambda: 2)
+    subs, extras = _load_fp8_swapset(str(conv))
+    assert subs[f"{L}.4.self_attn.b_proj.weight"].shape == (256, 128)
+    monkeypatch.setattr(m, "get_tensor_model_parallel_world_size", lambda: 4)
+    with pytest.raises(ValueError, match="tp_size=2, serving with 4"):
         _load_fp8_swapset(str(conv))

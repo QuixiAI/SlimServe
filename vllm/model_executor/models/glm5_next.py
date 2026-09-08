@@ -184,6 +184,14 @@ def _load_fp8_swapset(
     tensors = load_file(file)
     if sorted(tensors) != sorted(manifest["tensors"]):
         raise ValueError(f"{file}: tensor names do not match the manifest {path}")
+    if manifest.get("self_quantized"):
+        tp_size = get_tensor_model_parallel_world_size()
+        if manifest.get("tp_size") != tp_size:
+            raise ValueError(
+                f"{path}: the self-quantized KDA beta layout is for tp_size="
+                f"{manifest.get('tp_size')}, serving with {tp_size}; rebuild the "
+                "swap-set with --self-quant-kda --tp-size"
+            )
     subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
     extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
     bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
@@ -348,8 +356,16 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
         if self.is_linear:
+            from slimserve.fp8_swapset import beta_shard_rows
+
             self.self_attn = KimiGatedDeltaNetAttention(
-                config, vllm_config, prefix=f"{prefix}.self_attn"
+                config,
+                vllm_config,
+                prefix=f"{prefix}.self_attn",
+                beta_shard_rows=beta_shard_rows(
+                    vllm_config.model_config.model,
+                    f"{prefix}.self_attn.in_proj_qkvgfab",
+                ),
             )
         else:
             self.self_attn = Glm5NextMLAAttention(

@@ -139,13 +139,27 @@ physics, research digest and phase gates are in
    test_quixicore_dsv4_mhc_modes.py). The 0.78 ms is the kernel's own
    serial tail, not the launch: next form is a two-barrier cooperative
    kernel with the tail spread over all blocks (est. 0.1-0.2 ms/step).
-   Remaining fixed overhead, in order: the KDA in_proj/out_proj bytes
-   (34 x 34 us + 34 x 11.8 us bf16, ~0.85 ms/step; only an FP8
-   self-quantization with its own quality gate cuts it - scoping now),
-   that two-barrier mHC form, the launch census's sub-4 us kernels
-   (fusions), the custom AR's own 0.46 ms (two-stage vs one-stage
-   threshold is vLLM's default; a PCIe-tuned threshold is a one-factor
-   A/B).
+2c. KDA FP8 self-quantization DONE 2026-09-07 21:10 (notebook "KDA
+   projections self-quantized to block FP8"): RETAINED, default on via
+   the model-dir sidecar links -> /raid/scratch/slimserve-glm53/
+   fp8-swapset-kda/ (7.2 GB; build `python -m slimserve.fp8_swapset
+   --native /raid/weights/GLM-5.3-Flash --model /raid/weights/
+   GLM-5.3-Flash-NVFP4 --out <dir>/fp8-swapset.safetensors
+   --self-quant-kda --tp-size 4`; the plain native-only sidecar stays in
+   fp8-swapset/ - relink to revert). Record 152.7 / 519 / 679 (fast
+   state; slow 144.8 / 507 / 663), +11 / +4 / +3.4% like-state. Quality
+   cost -0.014 nats mean NLL (8 vs 26 readings), needle unchanged, inside
+   the plan's 0.03 tolerance - stated, not hidden; the operator may
+   prefer BF16 KDA back (one relink). Mechanism: beta shard padded to a
+   128-row block per rank (`KimiGatedDeltaNetAttention(beta_shard_rows=
+   128)` asked for by the manifest; TP-specific, loader guard). Knob if
+   the 0.014 matters: gating rows (beta/f_a/g_a) BF16 via a split launch.
+   Remaining fixed overhead, in order: the two-barrier mHC form, the
+   launch census's sub-4 us kernels (fusions), the custom AR's own 0.46
+   ms (two-stage vs one-stage threshold is vLLM's default; a PCIe-tuned
+   threshold is a one-factor A/B), the 11 DSA layers' bf16 fused_qkv_a /
+   kv_b (22 launches, 0.24 ms: native FP8 q_a/kv_a exist but share a
+   module with BF16 indexer shards).
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
@@ -174,10 +188,14 @@ physics, research digest and phase gates are in
    FP8 KV stays deprioritized (capacity item). Then MTP k=3 on the
    Foundry shape (peer); optional re-test of the cooperative mHC launcher.
 4. Method: ab.sh STATE=1 labels a boot's front-end state (profiled round
-   after the benches, trace in profile-state-<run>; "-- state:" in-step idle ~0.37 fast / ~0.68 slow,
-   "-- attrib:" kernel-busy). Use it on every exact-token arm from now on;
+   after the benches, trace in profile-state-<run>; "-- state:" in-step idle ~0.18 fast / ~0.49 slow
+   on the custom-AR tree, "-- attrib:" kernel-busy). Use it on every exact-token arm from now on;
    the first swap-set B boot (118.4, unlabelled) was a slow-state boot
-   that read as +0.8% until B2 (fast) gave 123.8.
+   that read as +0.8% until B2 (fast) gave 123.8. Third boot-state
+   component found 2026-09-07 21:10 (kda-fp8-A): fast replay idle but the
+   custom all-reduce at 8.8 us/launch instead of 5.1 (+0.32 ms/step) ->
+   slow-state throughput; clocks/PCIe link identical. Read the attrib
+   line's "custom allreduce" us/launch as well as the idle when labelling.
 Profiler captures: prof_run.py now runs a 384-token profiled round so the
 8-iteration capture sits in steady decode (96 ended before the capture
 with MTP on and produced a 2-iteration trace whose "step" was a partial

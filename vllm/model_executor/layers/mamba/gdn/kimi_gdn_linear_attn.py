@@ -240,7 +240,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        beta_shard_rows: int | None = None,
     ) -> None:
+        """``beta_shard_rows``: rows per rank to reserve for the beta shard of
+        the merged input projection instead of ``num_heads / tp``. A
+        block-quantized projection needs every shard's local rows to be a
+        multiple of the block size, so the FP8 swap-set (slimserve.fp8_swapset)
+        stores beta per rank padded to 128 rows and asks for 128 here; the
+        padding rows are zero weights whose outputs the forward drops."""
         super().__init__(config, vllm_config, prefix)
 
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
@@ -256,6 +263,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.use_full_rank_gate = kda_config.get("use_full_rank_gate", False)
 
         if self.use_full_rank_gate:
+            if beta_shard_rows is not None:
+                raise ValueError("beta_shard_rows applies to the low-rank gate only")
+            self.beta_shard_rows = self.local_num_heads
             # Keep f_a before the narrow beta shard, then pad each TP-local row
             # to select the aligned BF16 GEMM path. The padding also avoids an
             # Inductor correctness issue seen with the row-strided G view.
@@ -276,8 +286,14 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             # of hidden_size) reads the same input as the projection, so it
             # rides in the merged GEMM as a second replicated shard instead
             # of a separate launch per layer at decode.
+            if beta_shard_rows is not None and beta_shard_rows < self.local_num_heads:
+                raise ValueError(
+                    f"beta_shard_rows={beta_shard_rows} < {self.local_num_heads} "
+                    "local heads"
+                )
+            self.beta_shard_rows = beta_shard_rows or self.local_num_heads
             in_proj_output_sizes = [self.projection_size] * 3 + [
-                self.num_heads,
+                self.beta_shard_rows * self.tp_size,
                 self.head_dim,
                 self.head_dim,
             ]
@@ -424,11 +440,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv, beta, fg_a = projected_qkvgfab.split(
                 [
                     3 * self.local_projection_size,
-                    self.local_num_heads,
+                    self.beta_shard_rows,
                     2 * self.head_dim,
                 ],
                 dim=-1,
             )
+            if self.beta_shard_rows != self.local_num_heads:
+                beta = beta[:, : self.local_num_heads]
             # [n, 2, d] -> [2, n, d] strided view; no copy.
             fg_a = fg_a.view(num_tokens, 2, self.head_dim).transpose(0, 1)
             fg_b = torch.bmm(fg_a, self.fg_b_weight.transpose(1, 2))

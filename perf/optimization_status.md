@@ -20492,3 +20492,54 @@ Both boots slow-state, so like-state: identical at every concurrency, identical 
 **Decision.** NEUTRAL, not retained as the default (VLLM_DSV4_MHC_MODE stays 0). Kept as a documented diagnostic: the mode switch, the last-block kernel (no cooperative-launch requirement, which matters if a future graph needs the mHC node to overlap other work) and the parity test, which is also the first test coverage of the fused mHC kernel against the split path. What would move the 0.78 ms: parallelize the tail (a two-barrier cooperative form where all 64 blocks apply the pre-mix to their own slice after block 0 finalizes: the tail's residual pass at one block is ~3 us of the 8.5), shorten the partials phase (fn is float32 here, 1.5 MB per site; half would halve the bytes in flight but the phase is latency-bound), or fuse the site with its neighbours (the RMS norm and the residual add). Estimated 1-2 us per site for the two-barrier form, 0.1-0.2 ms per step; queued behind the larger bytes item (KDA projections).
 
 **Raw artifacts.** perf/results/2026-09-07/mhc-lastblock-B-pass{1,2}/, mhc-lastblock-B-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-state-mhc-lastblock-B/, serve-logs/mhc-lastblock-B.out, native-incremental-mhc.out.
+
+### 2026-09-07 KDA projections self-quantized to block FP8 (plan item "Self-quantizing KDA q/k/v/o", own quality gate)
+
+**Baseline.** Record tree (swap-set + custom AR + 8-stage fp8 table, mHC mode 0): fast-state 137.4 / 499 / 657 tok/s (c1/c8/c16, 1000/300), slow-state 130.6 / 484.4 / 646.4 (native4). The 34 KDA layers keep their projections in BF16 in every GLM-5.3-Flash checkpoint (ZAI's native one included), which is why the swap-set could not touch them: per rank the merged `in_proj_qkvgfab` is 6416 x 4096 bf16 (52.6 MB, 34.3 us at M=1, 87% of HBM bandwidth) and `o_proj` 4096 x 2048 (16.8 MB, 11.7 us). Together 34 x 46 us = 1.56 ms of the 7.3 ms step: the largest bf16 item left, and bytes-bound, so only fewer bytes can move it.
+
+**Hypothesis.** Quantizing those weights here to the same 128x128 block-e4m3 format the swap-set already serves (per-block absmax / 448, the DeepSeek recipe) halves their bytes; the W8A16 decode GEMM then runs them at ~18 / 7 us. Isolated microbench (kda_gemm_bench.py, graph-captured, weights rotated past L2, GPU 0):
+
+| shape (per rank) | M | bf16 decode GEMM | fp8 W8A16 (auto config) | best config |
+|---|---|---|---|---|
+| in_proj 6528 x 4096 (beta padded) | 1 | 34.3 us | 18.3 us | 17.9 (16,4) |
+| | 8 | 34.4 | 18.5 | 18.5 (32,4) |
+| | 16 | 34.5 | 19.1 | 18.7 (64,3) |
+| in_proj 6416 x 4096 (unpadded) | 1 | 34.0 | 18.1 | 17.6 |
+| o_proj 4096 x 2048 | 1 | 11.7 | 6.9 | 6.6 (16,4) |
+| | 8 | 11.8 | 7.3 | 7.2 (32,6) |
+| | 16 | 11.9 | 7.5 | 7.5 (32,4) |
+
+Ceiling: 34 x (16.0 + 4.8) = 0.71 ms/step at c1 (~9.7%), about the same absolute at c8/c16 (the fp8 kernel stays flat in M there too). The quality question is the experiment: the KDA projections feed a recurrent state (delta rule), and ZAI kept them BF16 while shipping the MLP and DSA projections in FP8. Gate: 4+ NLL readings within the band (-2.407..-2.465 nats, spread 0.02-0.03 within a boot) plus the needle, else REJECT regardless of speed.
+
+**Layout problem and its fix.** The merged projection's shards are q/k/v (2048 rows per rank each), beta (16 per rank), f_a and g_a (128 each, replicated). Block scales are per 128 rows of the *local* parameter, and vLLM's merged loader places each shard's scale rows at `offset / 128`: beta's 16-row shard has no scale rows of its own and f_a/g_a would land mid-block. Fix: the sidecar stores `b_proj` per rank, padded to 128 rows (rank r's 16 heads in block r, zeros after) with one scale row per rank, and the model reserves 128 beta rows per rank (`KimiGatedDeltaNetAttention(beta_shard_rows=128)`, asked for through the manifest by `slimserve.fp8_swapset.beta_shard_rows`); the forward drops the padding columns. Every shard is then 128-aligned (offsets 0/16/32/48/49/50 in scale rows), the standard loaders apply, and per rank N = 6528 (51 blocks; the padding costs 0.2 us of the 18). The layout is TP-specific: the manifest records `tp_size` and the loader refuses another. `o_proj` (RowParallel, K per rank 2048) needs nothing special. Build: `python -m slimserve.fp8_swapset --native ... --model ... --out /raid/scratch/slimserve-glm53/fp8-swapset-kda/fp8-swapset.safetensors --self-quant-kda --tp-size 4` (variant dir; the model-dir symlinks select it, manifest digest keys the compile cache). Tests: tests/glm5_next/test_fp8_swapset.py (block quantization bound, per-rank beta layout, manifest/targets, TP guard).
+
+**Build.** `fp8-swapset-kda/`: 790 tensors, 7.20 GB (the 2.4 GB native swap-set plus 238 self-quantized KDA tensors: 34 layers x q/k/v/b/f_a/g_a/o with their scales; b_proj stored as [512, 4096] with a [4, 32] scale). Built on GPU 0 in ~4 min. Quantization error of the self-quantized tensors, dequant vs the served BF16: relative Frobenius error 2.6-2.8% on every module class (q 0.0266, k 0.0270, v 0.0260, o 0.0267, b/f_a/g_a 0.0265), worst element 3.5-3.8% of its tensor's absmax - the e4m3 rounding floor (3 mantissa bits), nothing pathological in any layer. The native twins still dequantize bit-exact (0 elements differ).
+
+**Result, boot 1 (kda-fp8-B, slow-state: in-step idle 0.486).** Loaded and served through the profile with the padded beta layout (health at 195 s, fresh compile). Exact-token, 1000/300:
+
+| arm (like-state) | c1 pass1 / pass2 | c8 | c16 | in-step idle | union busy |
+|---|---|---|---|---|---|
+| slow-state reference (mhc-lastblock-B / native4) | 130.7 / 130.9 | 486.7 / 485.0 | 643.5 / 646.1 | 0.489 | 6.170 ms |
+| kda-fp8-B | 138.9 / 144.8 | 506.9 / 506.8 | 666.3 / 662.7 | 0.486 | 5.524 ms |
+
+c1 +10.6% (pass 2; pass 1 shows the known first-pass dip), c8 +4.5%, c16 +2.6%. Union busy -0.65 ms/step against the 0.71 ceiling. Attribution (step_attrib, profiled c1 round): the fp8 decode GEMM class grows from 110 launches / 1.04 ms to 176 / 1.87 ms (+0.83 ms for the 68 new launches: in_proj + o_proj at 12.2 us average, i.e. the benched 18 + 7) while the bf16 decode GEMM class falls from 89 launches / 1.79 ms to 22 / 0.24 ms (what is left: the 11 DSA layers' fused_qkv_a_proj at 13.4 us and kv_b_proj at 9.5 us). No other class moved; launches/step 1236 vs 1251 is the trace window, not a kernel change.
+
+**Quality, boot 1.** Four gates: -2.444, -2.460, -2.448, -2.461 (needle margins 12.9-14.7 / 17.4-18.5, all comfortably positive). All inside the band, but the mean, -2.453, sits 0.017 nats below the mean of every reading on the record tree today (n=22: mean -2.436, sd 0.017, range -2.408..-2.478). The four B readings have sd 0.009, so the shift is about two standard errors: probably real, about 1.7% in perplexity, and well inside the pre-declared 0.03-nat tolerance. Second B boot and a same-day baseline boot, four gates each, to pin it (below).
+
+**Boots 2 and 3 (chain: kda-fp8-B2 on the variant, then kda-fp8-A on the plain sidecar, same tree, 4 gates each).**
+
+| boot | state (in-step idle) | c1 pass1 / pass2 | c8 | c16 | gates (4) |
+|---|---|---|---|---|---|
+| kda-fp8-B2 (variant) | fast, 0.177 | 152.3 / 152.7 | 519.6 / 519.0 | 678.2 / 679.3 | -2.442, -2.440, -2.478, -2.443 |
+| fast-state record reference (customar-B) | fast, 0.18 | 137.4 | 499 | 657 | six in band, -2.428..-2.465 |
+| kda-fp8-A (plain sidecar, same tree) | fast replay 0.176 but AR-slow | 126.4 / 131.3 | 487.3 / 486.8 | 646.2 / 645.8 | -2.442, -2.446, -2.455, -2.436 |
+
+B2 against the fast-state record: c1 +11.1%, c8 +4.0%, c16 +3.4%; B (slow state) against the slow-state reference: +10.6% / +4.5% / +2.6%. Both boots of the variant beat their like-state references by the same margin, and the kernel-busy delta is the benched one.
+
+The A boot is a new kind of boot for the boot-spread file: graph replay was fast (in-step idle 0.176) yet the custom all-reduce ran at 8.8 us per launch instead of 5.1 (class 0.78 vs 0.46 ms/step; every other class identical to the other boots), so it landed on slow-state throughput (131 / 487 / 646). Clocks, power and PCIe link state (gen 5 x16 on all cards throughout) are the same as B2's log. It is not a comparison arm for B (different tree state), it is a third per-boot latency component: the custom AR's own per-launch time, which the STATE label (replay idle) does not see. Recorded here and in HANDOFF item 4 as an open component of the boot spread; ab.sh's "-- attrib" line already shows it (custom allreduce us/launch).
+
+**Quality, all eight B readings vs the day's 26 baseline readings.** B: -2.444, -2.460, -2.448, -2.461, -2.442, -2.440, -2.478, -2.443 (mean -2.452, sd 0.013). Baseline (every gate on the record tree today, 22 earlier + the 4 A readings): mean -2.438, sd 0.017. Shift -0.014 nats (standard error of the difference ~0.006), so a small real cost, about 1.4% in perplexity, from 2.7% weight rounding on 34 layers of recurrent-state projections. Needle margins unchanged (B 12.2-14.7 / 17.1-19.8; baseline 11.1-15.9 / 15.3-19.7). The pre-declared gate (within 0.03 nats, needle intact) passes with room.
+
+**Decision: RETAINED, default on through the sidecar links**, with the quality cost stated: -0.014 nats mean NLL for +11% c1 / +4% c8 / +3.4% c16. New record (fast state, no-spec, 1000/300): **152.7 / 519 / 679** tok/s; slow-state 144.8 / 507 / 663. The plain native-only sidecar stays at `/raid/scratch/slimserve-glm53/fp8-swapset/` and reverting is relinking the two model-dir symlinks (the manifest digest keys the compile cache, so either boots clean). The retain rests on the plan's own tolerance; if the operator wants the BF16 KDA back, that is a link change and one notebook line, not a code change. Knob if the 0.014 matters: keep the 272 gating rows per rank (beta, f_a, g_a) in BF16 through a split launch (~0.1 ms of the 0.7 ms) to test whether the recurrent gates carry the shift; also ZAI-style per-channel calibration is not available (no activations were used here: pure absmax weight rounding).
+
+Code: `slimserve/fp8_swapset.py` (`--self-quant-kda --tp-size`, `quantize_block`, `quantize_beta`, `beta_shard_rows`), `KimiGatedDeltaNetAttention(beta_shard_rows=)` in `vllm/model_executor/layers/mamba/gdn/kimi_gdn_linear_attn.py`, glm5_next wiring and the TP guard; tests in tests/glm5_next/test_fp8_swapset.py (9). Raw: perf/results/2026-09-07/kda-fp8-{B,B2,A}-pass{1,2}/, kda-fp8-*-gate{1..4}.json, traces profile-state-kda-fp8-{B,B2,A}/, build log serve-logs/build-swapset-kda.out, microbench kda_gemm_bench.py.
