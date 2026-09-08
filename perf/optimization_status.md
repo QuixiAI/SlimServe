@@ -20947,3 +20947,30 @@ Profiled c1 round (prof_one_conc.sh CONC=1, rank 0, 6 full steps, 12:34; the sta
 The c1 attribution's latency-shaped GEMMs (shared gate_up 41 x 7.3 us for 4 MB, shared down 42 x 5.5 us for 2 MB, K = 512 DSA projections) suggested more bytes in flight per block. JIT variants (8, 12) / (8, 16) / (16, 12) added to jit/fp8_decode_gemm.cu and swept with fp8_small_sweep.py (graph-captured, weights rotated past L2, GPU 0, parity worst 3.7e-3 of the row scale): shared gate_up at M = 1 is 4.50 us at (8, 4), 4.61 at (8, 8), 4.68-4.70 at 12-16 stages, 5.6 at 16 rows, 6.2 at 32 rows (floor 2.62); shared down 2.22 us at (32, 4) against 3.0-3.6 at 8 rows (floor 1.31); DSA q_b / fused_qkv_a / o_proj best at (32, 4) as shipped (4.9 / 8.6 / 12.1 us; floors 3.9 / 6.0 / 10.5). Every served config is already the isolated best or within 0.5 us of it; the in-situ 7.3 / 5.5 us are these kernels sharing HBM with the Marlin kernels on the other stream, not a staging shortfall. **Decision: REJECTED; no tree change.** The only shape-level lever left in this class is structural (the shared expert fused with the routed experts' launch, or its two GEMMs fused), i.e. Phase 4 work, not a config.
 
 **Phase 2 standing after today's attributions.** c1 wall 5.50 ms at 94% kernel-busy; weights ~2.1 ms at the wire plus Marlin's M = 1 inefficiency (0.45 ms, Phase 4); the ~3 ms of latency work is 90 mHC sites (design floor), 90 reduces (PCIe latency floor), the lm_head's 200 us bf16 GEMV (an FP8 lm_head would take ~0.1 ms off), and ~1000 sub-5 us launches whose fusions are each worth 0.05-0.1 ms. The Phase 2 exit (c1 no-spec >= 250, i.e. <= 4.0 ms per token) is not reachable from these: everything listed, Phase 4's expert kernel included, sums to ~1.5 ms. Phase 3 (MTP) is the multiplier for both remaining bars; the c1 items above (lm_head FP8, fusions) stay queued as fill-in work.
+
+## 2026-09-08: Phase 3 probe - the checkpoint's MTP head through the profile's speculator block (k=1)
+
+**Question.** Does the tree's upstream MTP path (`Glm5NextMTPModel`, `llm_base_proposer`) boot and draft for the rtx6000 record, and which of the plan's port-study gaps bites first?
+
+**Setup.** Temporary speculator block on the `glm53-nvfp4-4` rtx6000 record: `{"method": "mtp", "num_speculative_tokens": 1}` with the draft pointed at the target checkpoint (the MTP layer ships in `model_mtp.safetensors`, layer 45); `speculative_overrides.num_speculative_tokens` 1. Everything else the record. Two boots.
+
+**Boot 1 (no draft attention backend): fails at draft construction.** `_create_draft_vllm_config` never inherits the target's attention backend ("always independently autoselect unless explicitly specified"), so the draft's MLA layer goes through the sm_120 auto-list in `platforms/cuda.py`, which is `[TRITON_MLA, FLASHINFER_MLA_SPARSE_SM120]`: `No valid attention backend found ... use_sparse=True. Reasons: {TRITON_MLA: [sparse not supported], FLASHINFER_MLA_SPARSE_SM120: [ImportError]}`. `QUIXICORE_MLA_SPARSE` is not in that list (it is in the Ampere list). Two fixes possible: `"attention_backend": "QUIXICORE_MLA_SPARSE"` in the speculator engine block (used below), or adding the backend to the sm_120 auto-list (one line, not done).
+
+**Boot 2 (explicit `attention_backend`): serves.** Healthy at 330 s (new compile hash, cold Triton cache). The proposer shares the target's embedding, lm_head and indexer top-k buffer with the draft (`Detected MTP model with topk_indices_buffer`), so index sharing is already wired; the draft falls back to text-only for multimodal inputs. No other gap from the port study fired.
+
+**Acceptance (k=1, one position).** Greedy (temperature 0, 8 prompts x 2 x 256 tokens): 1865 of 2220 drafts accepted, 84.0%, 1.84 tokens per step. Bench sampling (temperature 1.0, top-p 0.95, top-k 20): 1647 of 3874, 42.5%, 1.43 tokens per step.
+
+**Throughput (1000/300, tok/s).**
+
+| shape | pass 1 | pass 2 | no-spec record |
+|---|---|---|---|
+| c1 | 145.9 | 137.6 | 165.7 |
+| c8 | 464.7 | 492.7 | 591.9 |
+
+Sequential greedy c1 (the acceptance probe itself): 163.8 tok/s with the drafter vs 158.4 without, +3%. At 1.43 tokens per step, c1 pass 2 is ~10.4 ms per step against 6.05 ms no-spec: the draft pass plus the 2-row verify add ~4.3 ms per step, more than the extra 0.43 token buys. The draft is one decoder block (about 1/45 of the target's weights), so the cost is launch-bound, not bytes-bound: the draft runs outside the CUDA graphs and the verify step's M=2 rows take different (slower per row) GEMM paths than the M=1 decode.
+
+**Gate.** mean_text_logprob -2.4844, needles 12.9 / 18.8: 0.006 below the band edge, the same reading as the slow-front-end boots (prompt_logprobs never run the drafter).
+
+**Greedy equivalence: not decidable by string comparison on this tree.** Spec vs no-spec greedy outputs diverge at 12 / 86 / 75 characters on three prompts whose within-boot pairs agree to the last character in both boots; three other prompts already diverge between two greedy samples of the same boot (Marlin MoE non-determinism), and the verify step's 2-row batch takes different GEMM configs than the 1-row decode (the fp8 decode GEMM and Marlin pick by M), so near-tie argmax points flip. Validation of the port has to be quality-based (the same eval under spec and no-spec, within noise) plus the acceptance rate, not token-exact.
+
+**Decision.** The MTP head works on this tree at k=1 with 84% greedy acceptance; the plan's port order shrinks to the cost side. Not adopted in the profile: it is a regression at both shapes until the per-step cost comes down. Next: profile one spec step (draft pass, verify pass, rejection sampler, glue), then draft CUDA-graph capture and the verify-shape kernels. Raw: perf/results/2026-09-08/mtp-probe2-{pass1,pass2}-{c1,c8}-1000-300/, mtp-probe2-gate1.json.
