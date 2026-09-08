@@ -91,18 +91,17 @@ physics, research digest and phase gates are in
 
 ## Next step
 
-0. Native rebuild DONE 2026-09-07 17:05 (Release, 73 min, HEAD fdddc62e9)
-   and validated 17:15: moe_sum_add and decode_gemm live in _quixicore_C,
-   117 QuixiCore kernel tests pass on it (route_align 11, router gemv 16,
-   sparse MLA 14, moe_sum_add 32, decode_gemm 44), smoke clean, gates
-   -2.452 / -2.449, exact-token c1 112.6 / 117.4 (the boot flipped host
-   state between passes), c8 469.9 / 470.4, c16 619.1 / 617.9 - the best
-   on record and equal to the JIT-hook boots. The FP8 swap-set binding
-   (decode_gemm_fp8) is NOT in this .so (its TU compiled before the edit):
-   QC_DEV_GEMM_FP8=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site
-   until the next rebuild - NEXT REBUILD IS DUE (the swap-set is retained
-   and default on; rebuild + post_rebuild_validate.sh, no GPU A/B during it). /raid/scratch/slimserve-glm53/
-   post_rebuild_validate.sh <label> runs the whole check.
+0. Native build state: full rebuild 2026-09-07 19:44 (Release, 72 min,
+   HEAD 186657677) landed decode_gemm_fp8; then the incremental path:
+   /raid/scratch/slimserve-glm53/native_incremental.sh configures a
+   persistent cmake dir (build-native, same args as setup.py) and builds
+   only `_quixicore_C` (86 s), swaps the .so by rename, runs the GEMM /
+   moe_sum_add tests. Use it for every csrc change to that extension; the
+   full rebuild is only for the other targets. Shipped .so (20:12) carries
+   the 8-stage fp8 launch table; validated by native4 (tests, gates
+   -2.436 / -2.449, exact; slow-state boot). No JIT hook is needed any
+   more (QC_DEV_GEMM_FP8 stays as a dev path). post_rebuild_validate.sh
+   <label> = the full check after a full rebuild.
 1. Boot spread (notebook 2026-09-07 "Boot spread probe", incl. "Probe
    results"): the 4-5% c1 spread between boots of identical code is NOT
    the governor (3 boots each way, identical bimodal split), NOT GPU
@@ -137,7 +136,15 @@ physics, research digest and phase gates are in
    91 launches), the launch census's sub-4 us kernels (fusions), the
    custom AR's own 0.46 ms (two-stage vs one-stage threshold is vLLM's
    default; a PCIe-tuned threshold is a one-factor A/B).
-3. FP8 weight swap-set DONE 2026-09-07 18:17 (notebook parts 1 and 2,
+3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
+   retained numbers ran the shared gate_up at 8 stages while the committed
+   table said 4 (an edit after the JIT build); natively the 4-stage config
+   took 21 us next to Marlin vs 7 - fixed (both N<2048 branches 8 stages,
+   the 16-row one by analogy: check with a profiled c16 round), validated
+   natively. Sidecar variant without shared down: REJECTED (neutral). Rule:
+   aux-stream kernels are tuned from the serving trace under contention
+   (aux_window.py). Pass 1 of c1 dips 4% in some boots (open; quote pass 2).
+3a. FP8 weight swap-set DONE 2026-09-07 18:17 (notebook parts 1 and 2,
    plan "Item 2b"): RETAINED, default on. Like-state exact-token c1 117.4
    -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 (+5.5 / +2.0 / +1.1%),
    gates -2.408 / -2.437, profiler pair -0.35 ms/step. Serving needs the

@@ -180,15 +180,19 @@ inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale,
 
 // Production configs (fp8_gemm16_bench.py, 2026-09-07, RTX PRO 6000, weights rotated past L2): 32 rows /
 // 4 stages for N >= 2048 (dense gate_up 17 us = 1.45 TB/s, dense down 10, DSA o_proj 12, DSA q_b 5, shared
-// down 2.1-2.9 us; within 2% of the best config at every M); at N = 1024 the grid is the limit, so 8 rows /
-// 4 stages (128 blocks) up to M = 8 (4.5-5.7 us vs cuBLAS bf16 6.8-8.5) and 16 rows / 4 stages at M = 16,
-// where the 8-row tile re-streams the 16-row x tile too often (8.3 vs 6.8 us).
+// down 2.1-2.9 us; within 2% of the best config at every M). At N = 1024 (the shared-expert gate_up, which runs
+// on the aux stream underneath the Marlin routed-expert kernels) the grid is the limit, so 8 rows (128 blocks)
+// up to M = 8 and 16 rows above, where the 8-row tile re-streams the 16-row x tile too often. The stage count
+// there is chosen under contention, not in isolation: in isolation 4 stages is best (4.5-5.7 us vs cuBLAS
+// bf16 6.8-8.5), but in the serving trace the 4-stage kernel takes 20-23 us next to Marlin where the 8-stage
+// one takes 7-8 us (notebook 2026-09-07, swap-set part 2 follow-up); deeper prefetch keeps more bytes in
+// flight while the SMs are shared. The 16-row branch follows by analogy pending a profiled c16 round.
 template <typename OutT>
 inline void launch_auto(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                         int M, int N, int K, cudaStream_t stream) {
     if (N >= 2048) launch<32, 8, 128, 4>(x, w, scale, bias, out, M, N, K, stream);
-    else if (M <= 8) launch<8, 8, 128, 4>(x, w, scale, bias, out, M, N, K, stream);
-    else launch<16, 8, 128, 4>(x, w, scale, bias, out, M, N, K, stream);
+    else if (M <= 8) launch<8, 8, 128, 8>(x, w, scale, bias, out, M, N, K, stream);
+    else launch<16, 8, 128, 8>(x, w, scale, bias, out, M, N, K, stream);
 }
 
 inline bool supports(int M, int N, int K) {

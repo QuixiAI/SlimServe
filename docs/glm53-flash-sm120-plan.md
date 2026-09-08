@@ -704,6 +704,18 @@ once the NLL / needle legs run on this platform.
   `tests/kernels/test_quixicore_sparse_mla_bf16.py`, 2e-3), microbenchmark
   at the real shapes (M = 1, 4, 8, 32, 64 per expert; real `topk_ids` from
   a captured step), then end to end. Report GB/s against 1.79 TB/s.
+- Kernel choice for anything on the aux stream (2026-09-07, swap-set part
+  3): a kernel that runs underneath the Marlin routed-expert kernels is
+  tuned from the serving trace under contention (aux_window.py around one
+  launch), never from the isolated bench alone. The shared-expert gate_up
+  config the bench preferred (8 rows / 4 stages, 4.5 us alone) took 21 us
+  next to Marlin where 8 stages took 7; the decision metric stays the
+  overlap-free busy of a state-labelled boot.
+- Boot-state label on every exact-token boot (ab.sh STATE=1): the profiled
+  round after the benches gives gap_locate.py's in-step idle (the fast /
+  slow front-end state) and step_attrib's kernel-busy; arms are compared
+  like-state, and pass 2 of c1 is the quoted number (pass 1 can dip 4% in
+  some boots).
 - Attribution: one Nsight Systems trace per phase of a c1 and a c8 decode
   step; report kernel time vs wall, launch count per token, sync count per
   step. This is the ranking input for the next phase.
