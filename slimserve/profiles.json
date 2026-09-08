@@ -2747,8 +2747,11 @@
           "speculative_overrides": {
             "num_speculative_tokens": 3
           },
-          "env": {},
+          "env": {
+            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1"
+          },
           "notes": [
+            "VLLM_CUSTOM_AR_ALLOW_PCIE=1 (2026-09-07): vLLM's custom all-reduce on the PCIe-only TP4 topology (P2P functional on every pair, BAR1 128 GiB). Replaces 91 NCCL ring-LL launches x 11.2 us with 90 x 5.1 us on the compute stream and removes their cross-stream graph gaps: exact-token c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on the swap-set tree, six gates in band (notebook 2026-09-07 'Custom all-reduce'). Off = unset the key (NCCL).",
             "BRING-UP RECORD (2026-09-04), not yet validated: this is the a100 record's kernel set carried to sm_120 as the Phase 0 baseline of docs/glm53-flash-sm120-plan.md. Nothing here is a measured sm_120 choice until the notebook says so; each line below states what is known.",
             "Same model facts as a100: context from config.json (1048576), ~17 KiB/token per rank of MLA + indexer KV, fixed-size KDA state; block_size 64 for the pooled-indexer cache; parsers glm47; TP4 with experts sharded (EP was 4-6% slower on a100; the PCIe all-reduce cost here is the reason to re-measure, not to assume).",
             "moe_backend marlin: NVFP4 experts through Marlin W4A16 built for 12.0f. The sm_120 tensor cores can run W4A4, but the stock CUTLASS/FlashInfer grouped FP4 paths emitted garbage on this card class in vLLM (#54150), so Marlin is the correctness baseline and the native path is Phase 1 work behind the exact-token and U+FFFD gates.",

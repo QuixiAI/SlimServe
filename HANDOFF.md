@@ -127,15 +127,16 @@ physics, research digest and phase gates are in
    quixicore_decode_linear (removes the 2-4 us Python trampoline on starved
    prefill chunks; batch with the rebuild after this one); optional CONC=16
    prof_pair.sh for a GPU-side M=16 comparison.
-2b. Fixed overhead, cheapest first (launch census in
-   /raid/scratch/slimserve-glm53/research/launch-census-2026-09-07.md): the
-   NCCL all-reduce is 91 x 10.5-13.2 us = ~1.0 ms of the 8.1 ms c1 step and
-   the custom all-reduce is off only because of vLLM's ">2 PCIe GPUs" rule;
-   the fork's escape hatch is VLLM_CUSTOM_AR_ALLOW_PCIE=1 (needs P2P + a
-   full-size BAR1; nvidia-smi topo -p2p r says OK on every pair) plus
-   disable_custom_all_reduce=false in the profile. One-factor A/B after the
-   swap-set: expected 4-7 us per reduction -> ~0.4 ms/step. Then the mHC
-   cooperative launcher re-test (0.78 ms/step of latency-bound launches).
+2b. Custom all-reduce DONE 2026-09-07 18:40 (notebook "Custom all-reduce"):
+   RETAINED, profile default via env VLLM_CUSTOM_AR_ALLOW_PCIE=1 on the
+   rtx6000 record. c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on
+   the swap-set tree; 90 x 5.1 us custom AR kernels replace 91 x 11.2 us
+   NCCL launches and the in-step idle halves (0.37 -> 0.18 ms); six gates
+   in band (one -2.465 tail re-gated x4: -2.428..-2.447). Remaining fixed
+   overhead, in order: the mHC cooperative launcher re-test (0.78 ms/step,
+   91 launches), the launch census's sub-4 us kernels (fusions), the
+   custom AR's own 0.46 ms (two-stage vs one-stage threshold is vLLM's
+   default; a PCIe-tuned threshold is a one-factor A/B).
 3. FP8 weight swap-set DONE 2026-09-07 18:17 (notebook parts 1 and 2,
    plan "Item 2b"): RETAINED, default on. Like-state exact-token c1 117.4
    -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 (+5.5 / +2.0 / +1.1%),
@@ -156,7 +157,7 @@ physics, research digest and phase gates are in
    FP8 KV stays deprioritized (capacity item). Then MTP k=3 on the
    Foundry shape (peer); optional re-test of the cooperative mHC launcher.
 4. Method: ab.sh STATE=1 labels a boot's front-end state (profiled round
-   after the benches; "-- state:" in-step idle ~0.37 fast / ~0.68 slow,
+   after the benches, trace in profile-state-<run>; "-- state:" in-step idle ~0.37 fast / ~0.68 slow,
    "-- attrib:" kernel-busy). Use it on every exact-token arm from now on;
    the first swap-set B boot (118.4, unlabelled) was a slow-state boot
    that read as +0.8% until B2 (fast) gave 123.8.

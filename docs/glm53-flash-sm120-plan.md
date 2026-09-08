@@ -636,6 +636,15 @@ hidden today, a sidecar variant without shared down or a K<=1536 kernel
 variant is the one-factor follow-up; the C++ binding rides the next native
 rebuild (JIT hook until then).
 
+Phase 2 first lever, done 2026-09-07 (notebook "Custom all-reduce"):
+vLLM's custom all-reduce enabled on the PCIe-only TP4 topology through
+the fork's VLLM_CUSTOM_AR_ALLOW_PCIE=1 escape hatch, now the rtx6000
+record's env default. 90 x 5.1 us cross_device_reduce kernels on the
+compute stream replace 91 x 11.2 us NCCL ring-LL launches and their
+cross-stream graph gaps; c1 123.8 -> 137.4, c8 478 -> 499, c16 628 ->
+657 on the swap-set tree, six gates in band. Record now 137.4 / 499 /
+657 no-spec; the c8 bar (740) is 67% covered.
+
 ### Bytes research digest (2026-09-07, read-only; full notes in /raid/scratch/slimserve-glm53/research/fp8-{swapset,kv}-research-2026-09-07.md)
 
 FP8 weight swap-set (Phase 1 item 2b): the native checkpoint's FP8 block
