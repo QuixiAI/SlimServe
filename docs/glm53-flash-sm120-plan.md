@@ -866,8 +866,9 @@ tok/s; the c8 bar (740) was 72% covered. With the NCCL P2P env (below)
 the fast/fast record was 163.1 / 556.1 / 728.9 (p2p-rec2, 2026-09-08
 10:26); with the mHC prefill kernel (below) it was 164.7 / 575.7 / 764.8
 (mhcpf-rec1, 10:52); with the pooled-indexer prefill path (below) it is
-**165.2 / 585.1 / 780.7** (idx-rec3, 11:51): the c8 bar (740) is 79%
-covered.
+165.2 / 585.1 / 780.7 (idx-rec3, 11:51); with the sparse MLA prefill
+kernel (below) it is **165.7 / 591.9 / 797.4** (mlapf-rec4, 12:29): the
+c8 bar (740) is 80% covered.
 
 Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
 the bars are measured on 1000-in / 300-out requests whose prefill is
@@ -920,6 +921,18 @@ prefix-cached request). Remaining prefill levers: the sparse MLA prefill
 walk (63 ms on the decode kernel), the fp8 blockwise GEMM (61), Marlin
 at M >= 64 (112, needs a purpose-built FP4 grouped GEMM: the CUTLASS
 sm120 backend as wired lost 7% prefill and 13-25% decode).
+
+Prefill fourth lever, done 2026-09-08 12:06 (notebook "Sparse MLA
+prefill: head-batched tensor-core attention over the top-k list"): the
+DSA layers' sparse attention over each token's top-k list ran prefill
+chunks on the decode walk (one warp per head and token, CUDA-core dot
+products; 63 ms of the c8 step). A Triton kernel with one program per
+token and the heads as the tensor-core M dimension replaces it for steps
+with prefill tokens: 11.5 -> 1.7 ms per call isolated; served c8 prefill
+489 -> 446 ms (-9%), c16 802 -> 730 (-9%), gates in band, decode
+untouched. Remaining prefill levers: the fp8 blockwise GEMM (61 ms), the
+FP4 grouped GEMM (Marlin 112 ms), and the reduce at the wire (168 ms,
+physics: micro-batch overlap is the only lever left there).
 
 ### Phase 2: fixed overhead (the single-stream lever)
 

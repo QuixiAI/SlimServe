@@ -270,6 +270,30 @@ physics, research digest and phase gates are in
    prefill in `forward_mqa` (quixicore_mla_sparse.py; 63 ms of the ~555
    ms c8 step on the decode walk; prototype /raid/scratch/slimserve-glm53/
    mla_prefill_dev.py), then fp8 blockwise (61), Marlin at M >= 64 (112).
+2i. Sparse MLA prefill DONE 2026-09-08 12:06 (notebook "Sparse MLA
+   prefill: head-batched tensor-core attention over the top-k list"):
+   vllm/v1/attention/backends/mla/quixicore_mla_sparse_prefill.py, a
+   Triton kernel with one program per query token and the 32 heads as the
+   tensor-core M dimension (S = Q K^T and O += P V per 32-key tile, online
+   softmax per head, P in fp16); `forward_mqa` takes it for steps with
+   prefill tokens (heads a power of two >= 16), decode keeps the walk.
+   Kill switch for A/B only: VLLM_MLA_SPARSE_PREFILL_TC=0. Isolated 11.5
+   -> 1.7 ms per call at the c8 shape, one bf16 rounding from the walk.
+   Served pass 2 vs the same-tree control: c1 prefill 106.4 -> 97.7, c8
+   489.2 -> 445.9, c16 802.2 -> 729.9 (-8..-9%), aggregates +0.6 / +1.0
+   / +3.0% in a slow-front-end boot, gates -2.467 / -2.436. Commit
+   60ac5abc9. Fast/fast boot mlapf-rec4: NEW RECORD 165.7 / 591.9 / 797.4
+   (c8 bar 80% covered), gate -2.450. c8 decode attribution on this tree
+   (notebook, 12:22): weight streaming 6.7-7.0 of the 11.7 ms step is at
+   the wire (Marlin 5.34 at the expert floor, fp8 net ~1.7 vs 1.4 floor);
+   the movable ~4.7 ms is 90-site latency work (mHC 0.99, custom AR 0.94)
+   and ~470 sub-2 us launches; the listed decode levers sum to ~1.2 ms,
+   so the no-spec c8 bar needs MTP. Pass 1 of a boot is not a prefill reading at any shape
+   (first launches of kernels the warm-up never runs, 0-465 ms per
+   request today); profile follow-up: warm the prefill-only kernels in
+   the boot. Remaining prefill: fp8 blockwise (61 ms), Marlin at M >= 64
+   (112; needs the purpose-built FP4 grouped GEMM), reduce at the wire
+   (168, physics).
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
