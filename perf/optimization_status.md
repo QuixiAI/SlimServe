@@ -20821,3 +20821,23 @@ Gates -2.457, -2.462. c8 prefill -17..-21%, c16 -21%: the 87 launches went from 
 
 **Decision: RETAINED, default** (`partials_prefill` on the split path at T >= 64; `VLLM_DSV4_MHC_PREFILL_MIN_T=0` restores `partials`). Record-state projection from the fast/fast p2p-rec2 boot (163.1 / 556.1 / 728.9): ~164 / ~578 / ~766; a fast-state boot of this tree is the next record attempt. Prefill attribution of this tree (c8) is being re-profiled for the next lever (Marlin 12%, sparse MLA prefill through the decode walk 7%, pooled indexer 6%, cutlass fp8 7% of the old 870 ms step; the reduce now ~175 ms).
 
+### 2026-09-08 Prefill attribution at c8, after the two prefill levers
+
+Same harness as "Prefill attribution at c8" (prof_prefill.sh c8-mhcpf, 8 concurrent 1000-token prompts; the first prefills alone, then the other seven with its decode token: 7001 tokens). The step now spans 599 ms of GPU (was 870): -31%. The window is read with prefill_attrib_big.py (WINDOW=start,end ms), because a cudaGraphLaunch now lands inside the step and the pre-first-graph rule only sees the single-request 130 ms prefill.
+
+| class | ms | share | launches | per launch | note |
+|---|---|---|---|---|---|
+| NCCL all-reduce bf16 RING_LL | 168 | 28% | 91 | 1.85 ms | over PCIe P2P now (was 3.70 ms per site through host memory); still the LL protocol at 57 MB, which spends half its bytes on flags: the NCCL_PROTO=Simple arm is queued (nccl-simple2), with NCCL_ALGO=Tree and 8 channels |
+| Marlin NVFP4 experts | 112 | 19% | 196 | 572 us | unchanged; W4A16 at ~25% of the FP4 tensor-core rate |
+| sparse MLA via the decode kernel | 63 | 11% | 11 | 5.75 ms | unchanged; `mla_decode_fp8_v` walking the prefill chunk one warp per (head, token) |
+| cutlass fp8 blockwise GEMMs | 61 | 10% | 180 | 339 us | unchanged, at rate |
+| pooled indexer `_pooled_logits_kernel` | 52 | 9% | 37 | 1.39 ms | unchanged; every query row recomputes the softmax-pooled keys of every visible pool (O(T^2) pool evaluations gathered through the block table) |
+| mHC: `partials_prefill` 35 (89 x 393 us), `apply_pre_mix` 14 (at the HBM floor), finalize 0.5 | 52 | 9% | 398 | | was 176 + 13 |
+| KDA chunked prefill (FLA) 20, MoE glue 20 (moe_sum_add 14), bf16 GEMMs 14, rms 6, quant 4, rest ~15 | ~80 | 13% | ~2500 | | |
+
+The single-request 1000-token prefill (step 1) is 131 ms in this boot: custom AR 91 x 503 us = 46 ms (this boot has the slow custom-AR state; 344 us per site in a fast one), Marlin 29, sparse MLA 11.4, fp8 7.7, pooled indexer 7.4, mHC 5.6 (was 27), so the c1 TTFT gain (133 -> 113 ms measured) is the mHC saving.
+
+**Read.** Two levers left the reduce as the largest item at 28%, and the cheap probe is the protocol (queued). Among code changes, ordered by value per effort: the pooled indexer (52 ms: pool keys depend only on the cache, so computing them once per pool and taking the logits as one masked GEMM against the queries turns O(T^2) pool softmaxes into a [7001 x 32 heads, 128] x [128, 1750] matmul), a prefill attention for the sparse MLA path (63 ms), then the FP4 tensor-core grouped GEMM for the experts (112 ms, the largest and the most work).
+
+**Record (mhcpf-rec1, 2026-09-08 10:52, first ab.sh boot of the mHC-prefill tree, fast/fast: in-step idle 0.181, busy 5.176; `env -u NCCL_P2P_DISABLE`, no-spec, 1000/300, pass 1 / pass 2).** c1 164.3 / **164.7**, c8 577.4 / **575.7**, c16 770.8 / **764.8**; gate -2.476. Against p2p-rec2 (163.1 / 556.1 / 728.9): c1 +1.0%, c8 +3.5%, c16 +4.9%. **New record: 164.7 / 575.7 / 764.8 tok/s; the c8 bar (740) is 78% covered.** Raw: perf/results/2026-09-08/mhcpf-rec1-pass{1,2}.
+

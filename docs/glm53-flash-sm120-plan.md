@@ -863,8 +863,9 @@ the one-thread-per-channel reducer and the index-list partition set by
 batch (32 tokens at B <= 8, 64 above): 0.35 -> 0.13 ms/step at c1.
 Record now (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0
 tok/s; the c8 bar (740) was 72% covered. With the NCCL P2P env (below)
-the fast/fast record is 163.1 / 556.1 / 728.9 (p2p-rec2, 2026-09-08
-10:26): c8 +4.0%, c16 +5.5%; the c8 bar is 75% covered.
+the fast/fast record was 163.1 / 556.1 / 728.9 (p2p-rec2, 2026-09-08
+10:26); with the mHC prefill kernel (below) it is **164.7 / 575.7 /
+764.8** (mhcpf-rec1, 10:52): the c8 bar (740) is 78% covered.
 
 Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
 the bars are measured on 1000-in / 300-out requests whose prefill is

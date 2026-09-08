@@ -240,8 +240,8 @@ physics, research digest and phase gates are in
    21 modes tests). Served (slow-state boot): c8 prefill 644-678 -> 532-549
    ms, c16 1101-1106 -> 873-875, aggregates 155.6 / 564.6 / 751.3 (+1% /
    +4% / +5% like-for-like), decode step identical (busy 5.173, 1243
-   launches), gates -2.457 / -2.462. Fast-state record attempt pending
-   (projection ~164 / ~578 / ~766). Next: re-attribute the c8 prefill
+   launches), gates -2.457 / -2.462. Fast/fast boot mhcpf-rec1: NEW
+   RECORD 164.7 / 575.7 / 764.8 (c8 bar 78% covered), gate -2.476. Next: re-attribute the c8 prefill
    (queued: prof_prefill.sh c8-mhcpf) and pick among Marlin at M >= 64,
    the sparse MLA prefill walk, the pooled indexer, the fp8 blockwise GEMM.
    Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
