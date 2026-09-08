@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-07 evening; Phase 1 items 1-4 done, MoE combine fused, decode GEMM in, routing NaN root cause fixed; native rebuild pending for the two new bindings)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-08 evening; record 165.7 / 591.9 / 797.4 no-spec = 98% / 80% of the B12X bar; MTP k=1 and the decode-shaped expert kernel probed, neither adopted)
 
 ## Mission
 
@@ -26,6 +26,64 @@ physics, research digest and phase gates are in
 `docs/glm53-flash-sm120-plan.md`; every measurement is a
 `perf/optimization_status.md` entry and the record rows are in
 `perf/baseline_status.md`.
+
+## State (2026-09-08, evening) - start here
+
+Goal: exceed B12X R24 on this hardware by as much as possible, compared
+like for like under the serving policy (sampling at the model's
+recommended settings, never greedy). The fair bar is B12X no-spec:
+**c1 169.9 / c8 737.8**. Its MTP-3 figures (247.8 / 903.2 at 2.50
+accepted per step) imply greedy-like acceptance; our drafter accepts 84%
+greedy but 42.5% under the policy sampling, so those are a different
+workload until B12X is measured the same way.
+
+Record (rtx6000 profile, no-spec, 1000/300, fast/fast boot, 2026-09-08
+12:29): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is 98% /
+80% of the bar and +58% / +37% / +35% over the Phase 0 baseline
+(104.8 / 431.4 / 591.0). Every retained lever has a notebook entry with
+its A/B; the 2026-09-08 entries cover the pooled indexer prefill, the
+sparse MLA prefill, the c1/c8 attributions, the MTP probe and the expert
+kernel probe.
+
+Where the step goes (profiled, rank 0, ms/step). c8 11.74: Marlin experts
+5.34 (wire floor 5.25, done), fp8 dense GEMMs 4.0 busy but mostly
+overlapped on graph-internal streams (net ~1.7 vs floor 1.4), mHC 0.99,
+custom AR 0.94, cuBLAS wmma 0.39, KDA 0.36, norms 0.32, sparse MLA 0.31,
+indexer 0.23. c1 6.05: fp8 1.90 (floor 1.4), Marlin 1.11 (floor 0.66),
+mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
+norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
+
+To beat the bar: c8 needs 10.8 ms/step (-0.94), c1 needs 5.9 (-0.15).
+Levers, no-spec, in order of expected value:
+
+1. c8 fixed overheads, each a one-factor A/B on the profiler pair then the
+   exact-token chain: the fp8 dense GEMMs stretched under Marlin (net 1.7
+   -> 1.4, ~0.3); custom AR 0.94 (compute-stream placement, message cap);
+   mHC 0.99 (last-block mode was neutral at c1, untested at c8); cuBLAS
+   wmma 0.39 (route the remaining bf16 shapes through the decode GEMM);
+   norm/glue fusions (~0.2); indexer 0.23. Sum ~1.2 if all land, which is
+   the whole c8 gap.
+2. c1: lm_head in FP8 (~0.1), the same fusions, and the Phase 4 expert
+   kernel only in its persistent stream-K form (~0.35 at best; the
+   prototype at Marlin parity and its ceilings are in the 2026-09-08
+   notebook entry and perf/results/2026-09-08/nvfp4-expert-proto/).
+3. MTP (Phase 3): boots at k=1 once the speculator engine block carries
+   `"attention_backend": "QUIXICORE_MLA_SPARSE"` (the proposer never
+   inherits the target's backend and the sm_120 auto-list lacks ours);
+   index sharing, lm_head and embedding sharing are already wired. Slower
+   today at both shapes: ~3 ms/step of eager-draft launch gaps, expert
+   bytes that scale with the verify rows, and M >= 2 kernel paths. Draft
+   CUDA-graph capture is the first fix; the expert-byte tax is physics, so
+   it pays only where acceptance is greedy-like.
+
+Method that holds: one factor per A/B; kernel decisions on the profiler
+pair's kernel-busy; exact-token records only from fast/fast boots (in-step
+idle < 0.3 ms, custom AR busy < 5.3 ms at c8), boots retried until one
+lands; gate band -2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
+non-deterministic); a notebook entry for every result including
+rejections. Commits carry the human maintainer only and are pushed to the
+QuixiAI branch after each commit. Repo docs carry no machine paths;
+operator notes live outside the repo.
 
 ## State (2026-09-04, evening)
 
