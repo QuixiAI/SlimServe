@@ -21233,3 +21233,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   concurrency ratio, are required before claiming a physical ceiling.
 - Raw: perf/results/2026-09-08/sampler-serving/summary.json, every warmup
   and measured request, server logs, all-rank traces and graph-replays-rank0.json.
+
+## 2026-09-08: Isolate the ATen global-reduction shared-memory warning
+
+- Status: source-level cause isolated; installed serving dependency unchanged.
+- Baseline: standalone Torch FP64 reductions at [3,154880] report shared-memory
+  hazards under both CUDA 13.0 and 13.2 sanitizers, without SlimServe. No numerical
+  failure has been observed. Related synchronization precedent: PyTorch #162995.
+- Hypothesis: global_reduce reuses shared storage for block-x reduction before
+  every thread finishes block-y reduction. The two stages lack a boundary barrier.
+- Experiment: a small extension compiles the installed Reduce.cuh with an FP64
+  row-sum wrapper. Its second variant adds exactly one __syncthreads() between
+  those stages. Neither variant registers an ATen override or edits Torch files.
+- Correctness: original source reports read/write hazards at batches 3 and 8;
+  the barrier variant reports zero across batches 1/3/8/16, vocabulary 154880.
+  Both return the exact expected sums of distinct row constants. This proves the
+  warning's source boundary, not user-visible corruption or a deployed repair.
+  Same-value shared-memory writes may explain why numerical outputs remain right.
+- Decision: retain the bounded reproducer. Do not silently monkeypatch all Torch
+  reductions or claim the installed binary was fixed. Assess serving exposure and
+  integrate a narrowly validated dependency repair if the affected path is used.
+  No serving speedup is claimed; this diagnostic has no throughput comparison.
+- Raw: perf/results/2026-09-08/sampler-exact/torch-reduce-original.json,
+  torch-reduce-barrier.json, their racecheck logs, and isolated build directories.
+  Reproduce with benchmarks/kernels/repro_torch_reduce_boundary.py --build-dir
+  <scratch> --repeats 1 --output <new.json>, with and without --barrier, under
+  compute-sanitizer --tool racecheck --kernel-name kns=reduce_kernel.
