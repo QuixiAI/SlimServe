@@ -21071,3 +21071,50 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Throughput: no new measurement yet; these changes claim reproducibility,
   not speed. Next is a fixed three-start, three-repeat c1/c8/c16 series.
 - Raw baseline: perf/results/2026-09-08/mlapf-rec{1,2,3,4}-pass2/.
+
+## 2026-09-08: Fixed-start baseline and the first state-copy JIT stall
+
+- Status: baseline complete; startup warmup fix unit-tested, profile recheck next.
+- Scope: glm53-nvfp4-4 / rtx6000, recipe v1, no-spec, four RTX PRO 6000
+  Blackwell Workstation GPUs, driver 580.173.02, CUDA 13.0, stock 600 W limits.
+- Baseline: commit 143e18073, three predetermined starts, three repetitions
+  each at c1/c8/c16, exact 1000/300, temperature 1 / top-p .95 / top-k 20.
+  Existing source prompt and per-request seed 42 + index. Initial warmup
+  was 32 output tokens per concurrency. No starts or repetitions excluded.
+- Results: median E2E 156.111 / 576.305 / 775.444 tok/s; ranges
+  145.513-156.723 / 573.729-579.218 / 774.519-778.329. Median client decode
+  165.023 / 590.410 / 787.986; median mean TTFT 106.0 / 551.3 / 852.7 ms.
+  All three text/image canary pairs passed. All 225 measured requests had
+  exact counts and zero replacement characters. This does not qualify
+  broader model quality or fix the known small-k sampler distribution issue.
+- Diagnosis: first c1 has one 157.277 ms inter-token gap at output token 89,
+  total context 1088. The server logs first JIT of batch_memcpy_kernel at
+  that point. The short warmup stopped before the align-cache copy boundary.
+  Dummy model forwards also never exercised this live request transition.
+- Origin fix: warm_mamba_copy_kernel calls the production batch_memcpy API
+  with its uint64/uint64/int32 metadata before the V1 align-cache worker
+  enables the JIT monitor and declares readiness. It owns two tiny scratch
+  tensors and never mutates model/KV state. Full-length benchmark warmups
+  separately ensure measured workloads reach their real context boundaries.
+- Correctness: the copy test covers zero/partial/multiple-block lengths and
+  left-overlap, and installs a failing Triton compile hook after warmup to
+  prove those runtime lengths reuse the compiled signature. Seven focused
+  copy/harness/trace tests passed on this GPU. Live profile verification of
+  the startup hook is still owed; no steady-state speedup is claimed.
+- Graph attribution: use actual CUPTI graph/correlation IDs, not CPU launch
+  timestamps (the host queues multiple steps ahead). All 24 c1 replays have
+  1185 kernels. Per-start mean spans 5.732 / 5.746 / 5.742 ms; intervals
+  with no active graph kernel 0.428 / 0.430 / 0.428 ms; same-stream gap
+  medians approximately 0.447 us. Reanalyzing old mlapf-rec1/rec4 gives
+  spans 5.727/5.381 ms, busy unions 5.299/5.281 ms, and gap medians
+  0.418/0.096 us. The persistent launch-state difference is real and not
+  explained by the one-time JIT stall; its cause remains open.
+- Tooling: new trace analyzer retains every observed replay, including
+  unusual node counts. The harness now records native extension hashes,
+  package versions, CPU affinity and per-round GPU clocks/power; git alone
+  does not identify an editable native build. Retired mixed-metric physical
+  ceiling claims and pass-2 selection instructions from the current handoff.
+- Raw: perf/results/2026-09-08/repro-baseline/summary.json, per-request JSON,
+  server logs, all-rank traces and graph-replays-rank0.json.
+- Next: fixed three-start profile recheck with full-workload warmup and
+  startup copy warmup, then correct the sampler at its selection/mass source.

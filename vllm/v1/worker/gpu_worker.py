@@ -886,6 +886,19 @@ class Worker(WorkerBase):
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
             bootstamp(f"worker[{self.rank}]: sampler warmup done")
 
+        if (
+            not self.use_v2_model_runner
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            from vllm.model_executor.warmup.mamba_copy_warmup import (
+                warm_mamba_copy_kernel,
+            )
+
+            # Dummy forwards never cross a live request's cache-block boundary.
+            # Compile the real state-copy signature before declaring readiness.
+            warm_mamba_copy_kernel(self.device)
+            bootstamp(f"worker[{self.rank}]: mamba state-copy warmup done")
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

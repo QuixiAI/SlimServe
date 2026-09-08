@@ -47,6 +47,16 @@ and native ZAI revisions, the FP32 repairs, and the FP8 swap-set including
 self-quantized KDA. It prepares an isolated directory and verifies sidecar
 tensor digests before serving; it must not silently fall back to BF16.
 
+The first fixed-count series is now complete (commit 143e18073): three
+starts x three repetitions at c1/c8/c16, all 27 runs retained. Median
+complete-request TPS is **156.11 / 576.31 / 775.44**; median client decode
+TPS is 165.02 / 590.41 / 787.99. Every start passed text/image canaries.
+All three have the slower graph-node state. One cold c1 run includes a
+157 ms first-JIT stall at the 1088-token state-copy boundary. Details and
+limits: perf/baseline_status.md; raw: perf/results/2026-09-08/repro-baseline/.
+The next checkpoint warms that kernel before health and warms the full
+benchmark workload. Neither change claims to solve persistent graph latency.
+
 Record (rtx6000 profile, no-spec, fast/fast boot, 2026-09-08 12:29, run
 mlapf-rec4): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is
 the best of four starts, NOT a repeatable baseline, and +58% / +37% / +35%
@@ -54,31 +64,22 @@ over the Phase 0 baseline
 (104.8 / 431.4 / 591.0). Every retained lever has a notebook entry with
 its A/B (perf/optimization_status.md, 2026-09-04 through 2026-09-08).
 
-Historical target arithmetic below assumes the published decode bar applies
-to our complete-request harness. That assumption is false. These are rough
-optimization budgets, not demonstrated B12X gaps or physical ceilings:
+Earlier target budgets mixed B12X sustained decode with our complete-request
+timings. Those budgets are retired, not exit criteria. Establish a matched
+control and measure actual routing/traffic before declaring a physical limit.
 
-- c1: 300 tokens in 1.77 s. Today 0.10 s prefill + 300 x 5.7 ms cadence
-  (6.05 ms profiled) = 1.81 s. The step must reach 5.56 ms: -0.15.
-- c8: 2400 tokens in 3.25 s. Today 0.45 s prefill + 300 x 12.0 ms = 4.05
-  s. The step must reach 9.3 ms with prefill unchanged, 9.9 ms if the two
-  remaining prefill levers land (fp8 blockwise GEMM 61 ms, Marlin at
-  M >= 64 112 ms; the reduce's 168 ms is at the wire). The no-spec decode
-  levers below sum to ~1.2-1.5 ms (12.0 -> ~10.6), so no-spec tops out
-  near 90-94% of the c8 bar. The rest is steps per token, i.e. MTP: at
-  k=1 the spec step must get under ~14 ms at policy acceptance (~18 ms at
-  greedy-like acceptance); it is 21.3 ms today.
-
-Where the step goes (profiled, rank 0, ms/step). c8 11.74: Marlin experts
-5.34 (wire floor 5.25, done), fp8 dense GEMMs 4.0 busy but mostly
-overlapped on graph-internal streams (net ~1.7 vs floor 1.4), mHC 0.99,
+Historical attribution (profiled, rank 0, ms/step): c8 11.74, Marlin experts
+5.34, fp8 dense GEMMs 4.0 busy but mostly
+overlapped on graph-internal streams (net ~1.7), mHC 0.99,
 custom AR 0.94, cuBLAS wmma 0.39, KDA 0.36, norms 0.32, sparse MLA 0.31,
-indexer 0.23. c1 6.05: fp8 1.90 (floor 1.4), Marlin 1.11 (floor 0.66),
+indexer 0.23. c1 6.05: fp8 1.90, Marlin 1.11,
 mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
 norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
 
-Levers, in order of expected value, each a one-factor A/B on the profiler
-pair and then the exact-token chain:
+Immediate work: correct sampler ties/FP64 noise, warm the live state-copy
+path before health, and isolate startup graph latency. Then revisit these
+kernel candidates with one-factor experiments and fixed-count serving runs.
+The savings below are hypotheses, not measured remaining headroom:
 
 1. c8 decode fixed overheads: fp8 dense GEMMs stretched under Marlin (net
    1.7 -> 1.4, ~0.3); mHC 0.99 (next form is a two-barrier cooperative
@@ -116,8 +117,9 @@ pair and then the exact-token chain:
    no-spec, and the M >= 2 kernel paths (custom AR 1.84) cost the rest.
    Draft CUDA-graph capture is the first fix; the expert-byte tax is
    physics, so MTP pays at c8 only where acceptance is greedy-like. The
-   rtx6000 record keeps `"speculative": false`; the probe patched it in
-   place.
+   rtx6000 record keeps `"speculative": false`. The distinct-expert counts
+   above were estimated, not observed; they do not establish that sampled
+   MTP cannot win after optimization. Use an isolated experiment config.
 
 Retained since Phase 0, all default on the rtx6000 record (a switch named
 here exists for one-factor A/Bs only):
@@ -137,7 +139,8 @@ here exists for one-factor A/Bs only):
   <GLM-5.3-Flash-NVFP4> --out <dir>/fp8-swapset.safetensors
   --self-quant-kda --tp-size 4`). The KDA part costs -0.014 nats mean NLL,
   inside the plan's 0.03 tolerance and stated in the notebook; the
-  operator may prefer BF16 KDA back (a sidecar without --self-quant-kda).
+  operator has now selected this explicit recipe. Do not silently swap
+  back to BF16 KDA or change the weight quant during the campaign.
 - Custom all-reduce over PCIe (VLLM_CUSTOM_AR_ALLOW_PCIE=1, cap
   VLLM_CUSTOM_AR_MAX_SIZE_MB) and NCCL P2P for the prefill reduce
   (NCCL_P2P_DISABLE=0, NCCL_P2P_LEVEL=SYS in the record env). The profile
@@ -164,13 +167,13 @@ near-uniform routing and are not measured DRAM traffic. Gate band
 -2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
 non-deterministic); gates per plan section 4 (exact-token within the band
 or better, NLL + needle within 0.03 nats); a notebook entry for every
-result including rejections. A traced Python edit or a new VLLM_* value
-opens a new torch-compile cache hash, so pass 1 of the next boot is cold
-at every shape: quote pass 2. Profiler captures use a 384-token round so
-the capture sits in steady decode; read the attribution's "mean over N
-full steps" and want N >= 2. Never git stash or checkout in the tree
-while a server boots or runs from it. Commits carry the human maintainer
-only and are pushed to the QuixiAI branch after each commit. Repo docs
+result including rejections. Warm the full measured workload before timed
+runs, retain cold warmups separately, and do not discard measured repetitions.
+Profiler captures use a 384-token round after timed runs. Attribute replays by
+GPU launch correlation with benchmarks/analyze_cuda_graph_trace.py; CPU
+launch timestamps can be several steps ahead. Never git stash or checkout
+in the tree while a server boots or runs from it. Commit coherent checkpoints
+under the maintainer's sole authorship. Repo docs
 carry no machine paths; operator notes live outside the repo.
 
 

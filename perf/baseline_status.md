@@ -1919,6 +1919,36 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 fixed-start baseline - 2026-09-08
+
+Commit 143e18073, registered TP4 no-spec profile and verified
+glm53-redhatai-nvfp4-fp8-kda-tp4-v1 recipe. Three predetermined starts,
+three measured repetitions at each concurrency, every result retained.
+1000 input / 300 output, temperature 1 / top-p .95 / top-k 20, seed 42
+plus request index. Text and image canaries passed on all starts; all
+225 measured completions had exact counts and no replacement characters.
+These are smoke/structural gates, not a broader quality qualification;
+the pre-existing small-k sampler tie deviation remains in this baseline.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median | Mean TTFT median |
+| ---: | ---: | ---: | ---: |
+| 1 | 156.11 [145.51, 156.72] | 165.02 | 106.0 ms |
+| 8 | 576.31 [573.73, 579.22] | 590.41 | 551.3 ms |
+| 16 | 775.44 [774.52, 778.33] | 787.99 | 852.7 ms |
+
+The first start's first c1 measurement includes a 157 ms inter-token gap
+at output token 89 (1088 total context), coincident with first compilation
+of batch_memcpy_kernel. It is retained. The 32-output-token warmup did
+not reach that boundary; subsequent harness revisions warm the full workload.
+All three starts have the slower graph-node state: rank-0 c1 graph spans
+5.732 / 5.746 / 5.742 ms, with 0.428 / 0.430 / 0.428 ms containing no
+active graph kernel. This is independent of the one-time copy-kernel JIT.
+
+Raw: perf/results/2026-09-08/repro-baseline/ (summary.json, per-request
+JSON, server logs, all-rank traces, graph-replays-rank0.json). Correlation-
+based graph analysis retains all eight observed replays per trace; it does
+not assign kernels using CPU launch windows. B12X comparisons remain unmatched.
+
 ### RTX6000 audit - 2026-09-08: selected best versus repeated baseline
 
 The latest optimized tree recorded 165.7 / 591.9 / 797.4 aggregate output
@@ -1935,9 +1965,9 @@ historical row below means warmed kernels only: its 1000-token prompts are
 shorter than the hybrid profile's 1088-token prefix-cache block.
 
 The RTX6000 registry now selects the named RedHatAI NVFP4 + FP8 KDA TP4
-recipe with pinned input revisions and verified sidecars. A new fixed-count
-startup series must establish its median, spread, and separate prefill/decode
-timings. The recipe preserves the measured weights; it does not claim a new
+recipe with pinned input revisions and verified sidecars. The fixed-count
+startup series above establishes its observed median and spread, with
+separate client timings. The recipe preserves the measured weights; it does not claim a new
 speedup or broader quality qualification.
 
 ### RTX PRO 6000 Blackwell (sm_120) TP4 Exact Baseline - 2026-09-04 (bring-up record, a100 kernel set)

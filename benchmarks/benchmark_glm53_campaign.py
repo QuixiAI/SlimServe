@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import hashlib
+import importlib.metadata
 import json
 import os
 import signal
@@ -174,6 +175,46 @@ def stop_owned(process):
     raise RuntimeError(f"owned process group {process.pid} did not exit")
 
 
+def gpu_snapshot():
+    fields = (
+        "index,uuid,pci.bus_id,name,driver_version,memory.total,memory.used,"
+        "utilization.gpu,clocks.current.graphics,clocks.current.memory,"
+        "clocks.max.memory,pstate,power.limit,power.draw,temperature.gpu"
+    )
+    return subprocess.check_output(
+        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv"], text=True
+    ).strip()
+
+
+def runtime_identity():
+    # Editable git identity alone does not identify rebuilt native extensions.
+    native = sorted(
+        set(Path("vllm").glob("_C*.so")) | set(Path("vllm").glob("_quixicore*.so"))
+    )
+    hashes = {}
+    for path in native:
+        with path.open("rb") as stream:
+            hashes[str(path)] = hashlib.file_digest(stream, "sha256").hexdigest()
+    versions = {}
+    for package in (
+        "torch",
+        "triton",
+        "transformers",
+        "safetensors",
+        "flashinfer-python",
+    ):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return {
+        "packages": versions,
+        "native_sha256": hashes,
+        "gpu_before_start": gpu_snapshot(),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", default="glm53-nvfp4-4")
@@ -208,6 +249,7 @@ def main():
         "plan": dataclasses.asdict(plan),
         "compatible_profiles": compatible,
         "command": sys.argv,
+        "runtime": runtime_identity(),
         "environment": {
             k: v
             for k, v in os.environ.items()
@@ -282,7 +324,12 @@ def main():
                     _require_match(canary, pattern, label)
                 run["warmups"] = []
                 for c in args.concurrency:
-                    warmup = round_requests(base, model, prompts[c], 32, 42)
+                    # Reach the same state-copy/cache/context boundaries as
+                    # measured requests. A short decode warmup can miss JIT
+                    # kernels needed only later in a request (GLM: 1088 tokens).
+                    warmup = round_requests(
+                        base, model, prompts[c], args.output_tokens, 42
+                    )
                     warmup_path = folder / f"warmup-c{c}.json"
                     warmup_path.write_text(json.dumps(warmup, indent=2) + "\n")
                     run["warmups"].append(str(warmup_path))
@@ -291,6 +338,7 @@ def main():
                         result = round_requests(
                             base, model, prompts[c], args.output_tokens, 42
                         )
+                        result["gpu_after_round"] = gpu_snapshot()
                         result["exact"] = all(
                             r["usage"]["prompt_tokens"] == args.input_tokens
                             and r["usage"]["completion_tokens"] == args.output_tokens
