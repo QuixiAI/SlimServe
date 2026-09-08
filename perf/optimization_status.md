@@ -20513,3 +20513,282 @@ restart is the operator's call.
   passes at 300 tokens with the codename produced), not a KV fault.
   Raw: perf/results/2026-09-07/reclaim_hazard/ (serve_tinytier_8001.log,
   reclaim_acceptance_v2.out, restore_probe.out, scripts).
+
+## 2026-09-07 - qwen38fn-nvfp4-4 scaling campaign: throughput vs concurrency (operator: "get throughput to grow linearly with concurrency")
+
+- Production as measured live on port 8000 after the reclaim-fix restart
+  (exact 1000/2000, temp 1.0, seed 42): c1 103.0 (another request was
+  live during the leg), c8 557.3, c32 549.4 tok/s. c32 == c8 because the
+  record admits 8 decode slots (max_num_seqs 8).
+- Baseline leg (seqs32u96: max_num_seqs 32, capture 96, util 0.96 - at
+  0.975 the 96-size graph set took 0.47 GiB against 0.19 at 24 and the
+  first c8 request OOM'd in the PLE short conv; pools [44, 121, 41, 15] =
+  1.01 GiB, chat concurrency ~13, window 24 rows): c1 143.8 (13.32
+  ms/step), c8 608.0 (273.5 verify-steps/s), c16 474.3 (221.7), c32 507.0
+  (233.2), 13 running steadily at c32, 0 preemptions, pool 97.5%.
+  Per-request step time 29 ms at 8 running -> 58 ms at 13: the per-row
+  cost doubled. The residency shows why: 24 hot rows against 39-52 rows
+  of active main KV (13 chat requests x 3-4 rows of 976 tokens), 219
+  demotions by step 6500, so most pages of every request are read over
+  PCIe each step (the M1 cost table: 48 rows at 50% host = 12 ms vs 3.2
+  ms all-GPU). Hypothesis for the next leg: the hot window, not the
+  pool, caps scaling on this box; per-request VRAM at chat context is
+  ~26 MB of hot main-KV rows + 45 MB of GDN slots (9 x 5.03 MB: the
+  running state plus k=2 rollback copies per group) + 10.6 MB indexer +
+  0.7 MB, ~83 MB, so 32 fully-hot chat requests need ~2.6 GiB against a
+  1.15-1.5 GiB KV budget.
+- Window leg (win48: 48 hot rows funded by kv_pool_deep_requests 1.0,
+  capture 48, util 0.97; pools [23, 184, 62, 22] = 1.10 GiB, chat
+  concurrency ~20). The FULL-graph guard first refused max_num_seqs 32
+  against "23 Mamba blocks": it read pool 0 (attention) under the
+  multi-pool slab; fixed to read the smallest state pool
+  (_mamba_blocks_available, unit test). Results: c1 162.9 (13.46
+  ms/step, flat), c8 593.2 (282.2 verify-steps/s), c16 580.8 (260.7) at
+  16 running with 30 demotions by step 3000 (the window mostly holds:
+  16 x 3-4 rows against 48), c32 347.9 (160.1) at 20 running - 60-80
+  rows against 48 (148 demotions) AND 20 x 3 = 60 query tokens beyond
+  the 48-size graph set, so those steps ran eager. Reading: with pages
+  hot and in-graph, 16 running still costs ~61 ms per request-step
+  against 29 at 8 - the step grows linearly with rows (3.8 ms/row) even
+  without PCIe, so the aggregate is flat from 8 to 16. The kernel census
+  at c16 (next) has to name the O(rows) term before anything else is
+  built; the window and graph sizes are necessary but not sufficient.
+- c16 kernel census on win48 (census_win48c16.sqlite, window 12-45 s,
+  3188 rank-steps, 48 query rows): busy/step 43.99 ms vs 28.80 at c8 (24
+  rows). Growth by kernel: the int8 skinny route ran 4 calls/step (486 at
+  c8) - above its row cutoff the dense projections fall back to
+  cuBLAS/cutlass bf16 GEMMs fed by a per-call int8 dequant
+  (_dequant_w8_kernel 194 calls, 3.77 ms/step) - 13.6 ms of fallback
+  against 5.4 ms of skinny at c8 (+8 ms). Collectives: all-reduce 7.92
+  ms (103 calls at 77 us; 4.91 at c8) and all-gather 2.38 (1.37), both
+  RING_LL on doubled messages (+4 ms). Marlin MoE 8.08 (5.96): the
+  expected saturation. The sparse gather is flat at 4.06 ms (grid
+  (48,1,8); 3.84 at c8): with the 48-row window the pages are hot and the
+  gather is not the scaling term. GDN update 1.20 (0.58), sampler 0.55.
+  Order of attack: (A) carry the int8 route past 24 rows (tensor-core
+  tiles or a W8A16 GEMM without the per-call dequant); (B) the NCCL
+  protocol for 100-250 KB all-reduces (LL128/Simple test next); then the
+  VRAM levers (GDN single-slot replay, window) to reach 32 running.
+- Lever B, NCCL_PROTO=LL128 (leg ll128 on the win48 config, env only):
+  c8 614.1 tok/s (288.2 verify-steps/s vs 282.2), c16 763.4 (342.9 vs
+  260.7: +31%) at 16 running, 0 errors. The RING_LL kernels the census
+  showed (77 us per all-reduce at 48 rows, 103 per step) are latency
+  protocol on 100-250 KB messages; LL128 moves them at line rate over
+  the P2P links. c1 measured next (LL128 adds ~1 us per tiny call).
+  c1 under LL128: 14.79 ms/step (13.3-13.5 baseline, +10%): the tiny
+  per-call messages pay LL128's higher latency. Caveat before any
+  record change: NCCL disables LL128 on PCIe-only topologies by default
+  (it relies on 128-byte store atomicity that PCIe does not guarantee),
+  so a forced LL128 is not production-safe on evidence alone; testing
+  NCCL_PROTO=Simple and NCCL_MIN_NCHANNELS=8 (default protocol) next.
+  NCCL_PROTO=Simple: c8 523.2 (244.0 verify-steps/s: -14%), c16 635.2
+  (307.9: +18%) - no per-size selection, so it trades c8 for c16.
+  NCCL_MIN_NCHANNELS=8: c8 609.4 (283.1, flat), c16 OOM in execute_model
+  (the extra channel buffers eat the headroom at util 0.97). Decision:
+  the collectives stay on the default LL for now; LL128 is recorded as
+  the measured ceiling (+31% at c16) pending a PCIe-atomicity argument
+  or an integrity soak, and the message count (103 all-reduces + 7
+  all-gathers per step) is the structural lever if one is built later.
+- Lever A, int8 skinny tiles past 32 rows (skinny_sweep_w8_m96.out, GPU 4,
+  graph-timed): with BLOCK_M 64/128 the int8 kernel at M=48/64 beats the
+  per-call dequant + cuBLAS fallback ~2x on every routed shape and
+  matches cuBLAS bf16 (4096x2560 @48: 32.8 us vs 86.5 fallback / 48.4
+  bf16; 3584x2560: 28.7 / 62.4 / 26.9; 2560x2560: 21.4 / 45.6 / 23.8;
+  2048x2560: 23.0 / 42.9 / 24.1; 2560x1536: 14.8 / 32.6 / 18.5). At
+  M=96 the tiles trail cuBLAS bf16 (35.7 vs 26.1 on 2048x2560) but still
+  beat the fallback (44.8). Marlin W8 (marlin_w8_microbench.out) beats
+  the fallback too but has a ~45 us floor that loses to the skinny kernel
+  at M<=32 and would need a second weight layout (+0.35 GiB/rank):
+  rejected in favour of extending the existing kernel. Installed:
+  block_m 16/32/64/128 by M, MAX_M 128, 64/128-row buckets for the five
+  swept shapes, widest-bucket reuse for shapes without one (the lm_head
+  62080x2560 and 10240x320 sweep next). Live A/B at c8/c16 queued.
+- k=1 leg (k1: num_speculative_tokens 1, capture 64, win48 config): c8
+  468.6 tok/s (266.5 verify-steps/s, 1.76 tok/step: -23% vs k=2's 2.13
+  tok/step), c16 823.3 (462.8: +42% vs 580.8) at 16 running, c32 700.2
+  (397.0) at 22 running. Reading: at k=1, 16 running is 32 query rows -
+  inside the int8 route's original cutoff, half the collective bytes,
+  Marlin below saturation - so the request-step is 35 ms instead of 61
+  and the lost draft token is repaid twice over. At 22 running (44 rows)
+  the same cliffs return plus window overflow (88 rows vs 48). The record
+  already supports num_speculative_tokens_per_batch_size (dynamic k):
+  leg dynk = k 2 up to 8 running, 1 above, queued behind the tiles A/B.
+- Tiles A/B (leg tiles: win48 config, k=2, the int8 kernel with 64/128-row
+  buckets for all seven shapes - lm_head 62080x2560 @48: 356.9 us vs
+  997.6 fallback / 391.9 bf16; 10240x320 @48: 10.7 / 25.9 / 13.0):
+  c8 620.4 tok/s (287.3 verify-steps/s, flat vs 282.2 - c8 never left the
+  route), c16 801.3 (361.4 vs 260.7: +38%) at 16 running, 0 errors,
+  192 skinny unit cases green. RETAINED: the per-call dequant is gone
+  from the batched-decode regime; the route now covers M <= 128.
+- Dynamic k (leg dynk: num_speculative_tokens_per_batch_size
+  [[1,8,2],[9,32,1]], capture 64, win48, tiles in): c1 161.6 (13.44
+  ms/step, flat), c8 572.7 (276.7 verify-steps/s, in the 277-288 band),
+  c16 887.7 (491.7: +53% vs the tiles-only 361.4, +88% vs the campaign
+  baseline's 260.7) at 16 running, c32 784.2 (436.7) at 20 running with
+  the 48-row window overflowing (20 x 4 rows), 0 errors. Curve so far:
+  c1 162 / c8 573 / c16 888 / c32 784 against the start's 144 / 608 /
+  474 / 507. Leg dynk64 (window 64 rows) running for the c32 point.
+- Window 64 with dynamic k (leg dynk64, deep 1.0): c16 902.6 (509.6
+  verify-steps/s), c32 826.9 (468.4) at 18 running (pools [23, ~150, ..]
+  admit two fewer than the 48-row leg's 20, which had 784.2 at 20 with
+  the window overflowing). The two sides of the VRAM trade are now
+  measured: rows for the gather vs GDN slots for admission. Leg deep2
+  (deep 2.0 kept, 40 rows) running for the record decision.
+- Deep 2.0 kept (leg deep2: window 40 rows, capture 64, dynamic k): c8
+  594.5 (271.8 verify-steps/s), c16 798.9 (450.3), c32 760.8 (422.5) at
+  16 running, 0 errors. Decision for the record: deep 2.0 / 40 rows /
+  dynamic k - the operator's standing complaint is that 2.03 resident
+  262K requests is too few, so the window is not funded from the deep
+  pool; c16 +43% and c32 +39% over production (557 / 549) at no deep
+  cost. The deep-1.0 / 64-row variant (903 / 827) is recorded as the
+  chat-optimised alternative; the GDN single-slot replay (design doc)
+  is what funds both at once. Gates (recall, canary, tier acceptance,
+  restore probe) running on the chosen configuration.
+- Gates on the chosen record (leg final, port 8001, gates_final.out /
+  gates2.out): recall PASS at 54K, 144K and 216K tokens in one fresh
+  request each (216K prefill 78.6 s: the part beyond the 40-row window
+  is written over PCIe; follow-up 9.3 s); image canary PASS at idle and
+  4/4 under c16 load (c16 with images 813.7 tok/s); tier acceptance PASS
+  at 3 depths (42K restored 4.1 s vs 10.7 s cold); the 60,000-repeat
+  recall depth in the old smoke is ~550K tokens and is rejected with 400
+  by design. The first image after boot logged 48 expandable-segments
+  mapping retries at util 0.97 (none under load afterwards): the vision
+  encoder's first-run transient lands on near-zero headroom, so the
+  record moves to util 0.965 and is re-verified (leg final2). The
+  restore probe's first run missed one of two follow-ups; the wrapper
+  dropped the answer text, so it is rerun with full answers (gates3).
+- Residency per-step CPU: the leg final log showed cpu_ms_per_step 50-100
+  while rows changed every step (the 216K prefill: 2 rows bound and 2
+  demoted per step), against ~1 ms in the chat benches. Cause: the
+  retained build's pinned staging allocated fresh pinned tensors per step
+  (torch.tensor(pin_memory=True), .pin_memory()), each a synchronizing
+  cudaHostAlloc. Fixed with persistent pinned staging buffers grown
+  geometrically (kv_residency._staging); 5 residency GPU tests green.
+  Perf-only: it lengthens long prefills, not answers.
+- Follow-up correctness on the 32-seq configs (leg final: restore probe
+  3/3 FAIL even on the hot follow-up, answers coherent but blind to the
+  prompt head or empty; static k=2 on the same config: every follow-up
+  empty; fresh single requests PASS to 216K; tier acceptance PASS at
+  8K/24K/42K; the same 29.7K probe PASSED 4/4 at 22:05 on the 8-seq /
+  24-row / capture-24 config). The log shows the "hot" follow-ups were
+  tier restores at block 2, so the GPU prefix cache had already dropped
+  the cold turn. Discrimination chain running: (8 seqs, 24 rows), (32
+  seqs, 24 rows), (8 seqs, 40 rows), probe_m.py on each.
+- RETRACTION of the follow-up-defect reading above: the raw-completion
+  probes (restore_probe, probe_m) are not a KV oracle for this model.
+  Production (8 seqs / 24 rows, untouched) fails them the same way -
+  follow-ups with 46-59 new tokens returned empty, a FRESH single request
+  answered "I don't know" once and the identical resend answered - while
+  the same document and question through the chat template (probe_chat:
+  enable_thinking false, three seeds) recall exactly: production fresh
+  3/3, resume 3/3 (29.8K tokens). The model's end-of-turn probability at
+  the answer position of a template-less prompt is high (the notebook's
+  2026-09-06 note: 68% at 8K), so at temperature 1.0 empty and evasive
+  answers are legitimate samples, and the earlier FP8 "empty answer"
+  episode reads the same way. The chat oracle (fresh vs resume, plus a
+  108K variant and a resume-after-churn variant for the tier path) is
+  the standing recall check from here; running it on the new record.
+- Chat oracle on the new record, first run (serve_final2_stagingrace):
+  30K fresh 1/3 ("OSPREY-5150", "OSINT", "OSINT"), resume 0/3
+  ("OSPREY", "OSWorld", "OSWorld") - the prompt head's first token
+  survives and the rest is lost, non-deterministically, on FRESH
+  requests too; production is 6/6 on the same oracle. A real defect,
+  and the code delta from production narrows it to the staging change
+  above: reusing one pinned buffer for the residency's page_delta /
+  row_of_block updates while the previous step's non_blocking H2D copy
+  from that buffer may still be in flight overwrites the copy's source
+  (the original per-step allocations were slow but race-free). Fixed:
+  a CUDA event recorded after the copies and synchronized before the
+  buffers are rewritten (and before they are grown). 5 residency GPU
+  tests green; the oracle is rerun twice (seeds 1-3, 4-6) on the record
+  before any number is trusted; the 108K, churn and post-bench oracle
+  variants follow with the final numbers.
+
+## 2026-09-08 - ROOT CAUSE of the resumed-conversation recall failures: flush skipped clean rows on a re-homed block
+
+- Found with the chat oracle plus a VLLM_KV_TIER_VERIFY digest of every
+  main-KV slot at flush and at rebind (kv_residency): every rebind
+  digest matched its flush, so slot bytes survive intact; but the rank-0
+  timeline showed slot 6fb000 - the first request's logical block 0 -
+  flushed AGAIN 13 s later with different bytes while a third request
+  was reading it. The third request was a MIXED resume: logical 1 from
+  the tier (rebind), logical 0 a GPU prefix-cache hit (the second
+  request's pool block, whose rows were clean: flushed to the second
+  lineage's slot). The connector re-homed that block into the resumed
+  lineage's slot and staged a flush; flush() skipped every clean
+  resident row on the assumption "clean == already in the home", true
+  only for the slot the row was flushed to. The new home received a
+  partial image (demoted rows moved, resident rows never copied), and
+  the resumed conversation attended over stale bytes for its prompt
+  head - hence "OSINT"/"OSWorld": the first token survives (its slot was
+  copied) and the rest does not. The same rule sat in the demotion path.
+- This is pre-existing (production has it; it needs a GPU-cache hit to
+  coincide with a tier resume of the same content, which my oracle's
+  identical back-to-back prompts produce reliably and production's
+  oracle run happened not to) and it is the mechanism behind the 8-GPU
+  port's "empty follow-up" episode (2026-09-06, recorded open).
+- Fix (kv_residency.py): a per-row `flushed_to` address (the host copy
+  that is current); flush and demotion copy when the row is dirty OR its
+  current copy is elsewhere; bind resets it; rebind sets it to the slot;
+  set_home moves demoted rows unconditionally (they are never dirty).
+  Regression test: flush to slot 2, re-home to slot 0, flush -> slot 0
+  complete; demotion into a third home copies too. 6 residency GPU
+  tests green. Exonerated by the bisect on the way: the int8 tiles
+  (restored), the pinned staging rewrite (restored, event-guarded), the
+  tier arena size, the GPUs, the environment.
+- Verification running: the chat oracle (fresh vs resume, and resume
+  after a churn that forces tier restores) on production's configuration
+  and on the new record, both with VLLM_KV_TIER_VERIFY=1.
+- Verification (leg fixA, production config, VLLM_KV_TIER_VERIFY=1): the
+  flush fix behaves as designed - the re-homed block's slot digest is now
+  identical across every re-home (cec4950e... on all four lineage
+  swaps, where before each re-home produced a different digest) and every
+  rebind digest matches its flush, slab restores 0 mismatched. It is a
+  real bug and it is fixed, but it was NOT the oracle's cause: the
+  identical-prompt oracle still fails (fresh 2/3, resume 0/3) while the
+  resume-AFTER-CHURN oracle passes 6/6 on the same instance. Reading:
+  pure tier resumes (both blocks from the tier) are correct; MIXED
+  resumes - an internal GPU prefix-cache hit on logical block 0 plus a
+  tier restore of logical 1 and the boundary state ("staged 5 restore
+  ops (blocks 1..2 of 2)") - are what fail. Every earlier passing probe
+  (reclaim test, tier acceptance) was either a full re-prefill or a pure
+  tier resume; the mixed path had never been exercised until the
+  back-to-back oracle. On paper the mixed path checks out (the scheduler
+  hands the request to the worker only after the async load with the
+  full computed count, so the GDN state column seeds at 1; the state
+  restore targets gb[1]; the attention/main-KV restore covers logical 1
+  and the cached block keeps its rows). Two experiments queued to split
+  it: (a) a verify-mode row consistency pass every 25 steps (every clean
+  GPU row vs its host copy, every demoted row vs flushed_to); (b)
+  VLLM_KV_TIER_RESTORE_FROM_ZERO=1, which restores the GPU-cached span
+  from the tier as well (identical bytes, zero-copy rebind) so the
+  main-KV/slab side matches the pure case and only the state/ring side
+  of the mixed resume remains different.
+- ROOT CAUSE (2026-09-08 00:40): the restore's defensive RING zero. The
+  connector stages the resumed request's ring block ids to be zeroed
+  with the restore, and the DMA zeroed `self.blocks[gpu_block]` - pool 0,
+  the ATTENTION slab. Under the single packed slab a block id was one
+  physical row owned by one group, so zeroing "ring block N" was
+  harmless; since the multi-pool slab (E5b, 2026-09-07, in production
+  since 08:13) the ring has its own pool and ring block id N is a
+  DIFFERENT block from attention block N, so the zero wiped attention
+  block N's indexer keys (and raw keys). A pure tier resume rewrites
+  every restored attention block right after the zero, so it never
+  showed; a MIXED resume keeps its GPU-cached leading block, and when
+  that block's id coincided with the request's ring block id (the
+  identical-prompt oracle recycles the same few ids) the prompt head's
+  indexer keys were zeroed: the top-k never selected the codename tokens
+  again - "OSINT"/"OSWorld" - while the main-KV rows and slab digests
+  all verified intact (they were, the damage was to a block the digests
+  never covered). Proven by VLLM_KV_TIER_RESTORE_FROM_ZERO (restoring the
+  cached block too rewrites it after the zero: 6/6) and by the fix: zero
+  ops now carry their KV group and the DMA zeroes `_blocks_for(gid)`.
+  Unit test: a zero on the ring pool leaves pool 0 untouched. Verification
+  legs (mixed, churn, 108K oracles, verify on) running on production's
+  configuration and on the record. Production carries this bug today.
+- Verification (chain_zerofix, VLLM_KV_TIER_VERIFY=1, no diagnostic
+  toggle): production's configuration - mixed 6/6, resume-after-churn
+  6/6, 108K 6/6, 15 tier hits, 0 divergent rows, 0 slab mismatches, 0
+  errors; the new record (32 seqs, capture 64, util 0.965, 40 rows,
+  dynamic k, with the tiles, the flushed_to fix and the event-guarded
+  persistent staging) - the same 18/18 and the same clean counters.

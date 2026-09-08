@@ -22,6 +22,7 @@ tables are updated with a handful of small index writes per step.
 from __future__ import annotations
 
 import numpy as np
+import os
 import torch
 
 from vllm.logger import init_logger
@@ -36,6 +37,9 @@ PTR_SENTINEL = -(1 << 62)
 PAD_SLOT_ID = -1
 
 _ACTIVE: "MainKVResidency | None" = None
+
+
+_VERIFY = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 
 
 def get_main_kv_residency() -> "MainKVResidency | None":
@@ -81,7 +85,14 @@ class MainKVResidency:
         # one, else the residency's own pool row; dirty marks GPU rows whose
         # bytes are not yet at the home.
         self.home_addr: dict[int, int] = {}  # scheduler block -> slot address
+        self._digests: dict[int, str] = {}  # VLLM_KV_TIER_VERIFY: slot -> digest at flush
         self.dirty = np.zeros(num_blocks, dtype=bool)  # per residency row
+        # Host address holding an up-to-date copy of each row (-1: none).
+        # A clean row is NOT "already in its home": a block re-homed into
+        # another lineage's slot (a GPU prefix-cache hit adopted by a tier
+        # resume, 2026-09-08) must be copied into the new home or the slot
+        # keeps stale bytes for every clean row.
+        self.flushed_to = np.full(num_blocks, -1, dtype=np.int64)
         self.tier_arena: torch.Tensor | None = None
         self._tier_raw: torch.Tensor | None = None
         self.row_of_block = np.full(num_blocks, -1, dtype=np.int32)
@@ -182,14 +193,34 @@ class MainKVResidency:
             row = block * self.sub_blocks + k
             if self.row_of_block[row] < 0:
                 cur = int(self.page_delta[row].item()) + self.gpu_base
-                if cur == self.host_base + row * self.row_bytes and self.dirty[row]:
+                if cur == self.host_base + row * self.row_bytes:
+                    # Demoted rows are never dirty (the demotion copied them),
+                    # so the move is unconditional: the pool row is the only
+                    # valid copy and the slot must end up complete.
                     dst = slot_addr + k * self.row_bytes
                     self._host_view(dst).copy_(self._host_view(cur))
                     self.page_delta[row] = dst - self.gpu_base
                     self.dirty[row] = False
+                    self.flushed_to[row] = dst
 
     def clear_home(self, block: int) -> None:
         self.home_addr.pop(block, None)
+
+    def _slot_digest(self, slot_addr: int) -> str:
+        import hashlib
+
+        torch.cuda.synchronize()
+        view = self._host_view(slot_addr)  # first row; the slot is contiguous
+        base = view.data_ptr()
+        n = self.row_bytes * self.sub_blocks
+        if self.tier_arena is not None:
+            arena = self.tier_arena.view(-1)
+            off = base - arena.data_ptr()
+            buf = arena[off : off + n]
+        else:
+            off = base - self.host_base
+            buf = self.host.view(-1)[off : off + n]
+        return hashlib.blake2b(buf.numpy().tobytes(), digest_size=8).hexdigest()
 
     def flush(self, block: int) -> None:
         """The block is full: its GPU-resident dirty rows are copied into
@@ -197,24 +228,40 @@ class MainKVResidency:
         home = self.home_addr.get(block)
         if home is None:
             return
+        self._flush_rows(block, home)
+        if _VERIFY:
+            d = self._slot_digest(home)
+            self._digests[home] = d
+            logger.info("main-kv verify: flush block %d -> slot @%x digest %s", block, home, d)
+
+    def _flush_rows(self, block: int, home: int) -> None:
         for k in range(self.sub_blocks):
             row = block * self.sub_blocks + k
             dst = home + k * self.row_bytes
             gpu_row = int(self.row_of_block[row])
             if gpu_row >= 0:
-                if self.dirty[row]:
+                if self.dirty[row] or self.flushed_to[row] != dst:
                     self._host_view(dst).copy_(self.gpu[gpu_row], non_blocking=True)
                     self.dirty[row] = False
+                    self.flushed_to[row] = dst
             else:
                 cur = int(self.page_delta[row].item()) + self.gpu_base
                 if cur != dst:
                     self._host_view(dst).copy_(self._host_view(cur))
                     self.page_delta[row] = dst - self.gpu_base
                 self.dirty[row] = False
+                self.flushed_to[row] = dst
 
     def rebind(self, block: int, slot_addr: int) -> None:
         """A restored block: point its rows at the tier slot (read-only, no
         copy). Any GPU row still bound to a previous use is released."""
+        if _VERIFY:
+            d = self._slot_digest(slot_addr)
+            was = self._digests.get(slot_addr)
+            logger.info(
+                "main-kv verify: rebind block %d <- slot @%x digest %s (flushed %s) %s",
+                block, slot_addr, d, was, "OK" if was == d else "MISMATCH" if was else "UNKNOWN",
+            )
         rows_freed = []
         for k in range(self.sub_blocks):
             row = block * self.sub_blocks + k
@@ -226,6 +273,7 @@ class MainKVResidency:
                 rows_freed.append(row)
             self.page_delta[row] = slot_addr + k * self.row_bytes - self.gpu_base
             self.dirty[row] = False
+            self.flushed_to[row] = slot_addr + k * self.row_bytes
         self.home_addr[block] = slot_addr
         if rows_freed:
             idx = torch.tensor(rows_freed, dtype=torch.int64, device=self.device)
@@ -257,9 +305,10 @@ class MainKVResidency:
                     "raise main_kv_gpu_rows"
                 )
             dst = self._home_row_addr(victim)
-            if self.dirty[victim]:
+            if self.dirty[victim] or self.flushed_to[victim] != dst:
                 self._host_view(dst).copy_(self.gpu[victim_row], non_blocking=True)
                 self.dirty[victim] = False
+                self.flushed_to[victim] = dst
             self.page_delta[victim] = dst - self.gpu_base
             self.row_of_block[victim] = -1
             self.block_of_row[victim_row] = -1
@@ -272,6 +321,7 @@ class MainKVResidency:
         self.row_of_block[block] = row
         self.block_of_row[row] = block
         self.dirty[block] = True
+        self.flushed_to[block] = -1  # the GPU copy is about to diverge
         self._changed.append(block)
         self.binds += 1
 
@@ -315,18 +365,34 @@ class MainKVResidency:
             changed = sorted(set(self._changed))
             gpu_bound = [b for b in changed if self.row_of_block[b] >= 0]
             # Pinned staging: non_blocking from pageable memory still blocks
-            # the host behind the stream (the drain lesson, 2026-09-07).
+            # the host behind the stream (the drain lesson, 2026-09-07), and
+            # a fresh pinned allocation per step is a synchronizing
+            # cudaHostAlloc (50-100 ms/step measured during long prefills,
+            # where rows change every step): stage through persistent
+            # pinned buffers, waiting on the previous step's copies before
+            # they are rewritten.
+            stage = self._staging(2 * max(len(changed), 1))
+            ev = stage.get("event")
+            if ev is not None:
+                ev.synchronize()
             if gpu_bound:
-                idx = torch.tensor(gpu_bound, dtype=torch.int64, pin_memory=True)
-                rows = torch.from_numpy(self.row_of_block[idx.numpy()].astype("int64"))
-                idx_dev = idx.to(self.device, non_blocking=True)
-                self.page_delta[idx_dev] = (rows * self.row_bytes).pin_memory().to(
-                    self.device, non_blocking=True
+                n = len(gpu_bound)
+                stage["idx"][:n] = torch.tensor(gpu_bound, dtype=torch.int64)
+                stage["val"][:n] = torch.from_numpy(
+                    self.row_of_block[gpu_bound].astype("int64") * self.row_bytes
                 )
-            idx_all = torch.tensor(changed, dtype=torch.int64, pin_memory=True)
-            self.row_of_block_dev[idx_all.to(self.device, non_blocking=True)] = torch.from_numpy(
-                self.row_of_block[idx_all.numpy()]
-            ).pin_memory().to(self.device, non_blocking=True)
+                self.page_delta[stage["idx"][:n].to(self.device, non_blocking=True)] = (
+                    stage["val"][:n].to(self.device, non_blocking=True)
+                )
+            m = len(changed)
+            stage["idx2"][:m] = torch.tensor(changed, dtype=torch.int64)
+            stage["val2"][:m] = torch.from_numpy(self.row_of_block[changed].astype("int64"))
+            self.row_of_block_dev[stage["idx2"][:m].to(self.device, non_blocking=True)] = (
+                stage["val2"][:m].to(self.device, non_blocking=True).to(self.row_of_block_dev.dtype)
+            )
+            if "event" not in stage:
+                stage["event"] = torch.cuda.Event()
+            stage["event"].record()
         # Page offsets at row (kernel page) granularity: scheduler block b
         # owns rows b*sub .. b*sub+sub-1; null entries keep the sentinel.
         sub = self.sub_blocks
@@ -346,6 +412,68 @@ class MainKVResidency:
         phys = rows * self.block_size + slots % self.block_size
         self.slot_mapping[:num_tokens] = torch.where((slots >= 0) & (rows >= 0), phys, torch.full_like(slots, PAD_SLOT_ID))
         self.cpu_seconds = getattr(self, "cpu_seconds", 0.0) + (_time.perf_counter() - _t0)
+        if _VERIFY and self.step % 25 == 0:
+            self._verify_rows(block_table)
+
+    def _verify_rows(self, block_table: torch.Tensor) -> None:
+        """Diagnostic: every clean GPU-resident row with a host copy must
+        equal that copy; every demoted row's page_delta must point at its
+        flushed_to address. Logs each divergence with the row's block."""
+        torch.cuda.synchronize()
+        table = block_table.cpu().numpy()
+        bad = 0
+        seen = set()
+        for req in range(table.shape[0]):
+            for blk in table[req]:
+                if blk < 0 or blk in seen:
+                    continue
+                seen.add(int(blk))
+                for k in range(self.sub_blocks):
+                    row = int(blk) * self.sub_blocks + k
+                    gpu_row = int(self.row_of_block[row])
+                    ft = int(self.flushed_to[row])
+                    if gpu_row >= 0:
+                        if ft >= 0 and not self.dirty[row]:
+                            host = self._host_view(ft).cpu()
+                            dev = self.gpu[gpu_row].cpu()
+                            if not torch.equal(host, dev):
+                                bad += 1
+                                logger.warning(
+                                    "main-kv verify: req %d block %d row %d: GPU row %d differs "
+                                    "from its host copy @%x (dirty=%s)",
+                                    req, int(blk), row, gpu_row, ft, self.dirty[row],
+                                )
+                    else:
+                        cur = int(self.page_delta[row].item()) + self.gpu_base
+                        if ft >= 0 and cur != ft:
+                            bad += 1
+                            logger.warning(
+                                "main-kv verify: req %d block %d row %d: demoted at @%x but "
+                                "flushed_to @%x",
+                                req, int(blk), row, cur, ft,
+                            )
+        if bad:
+            logger.warning("main-kv verify: %d divergent rows at step %d", bad, self.step)
+        elif self.step % 500 == 0:
+            logger.info("main-kv verify: rows consistent at step %d", self.step)
+
+    def _staging(self, n: int) -> dict[str, torch.Tensor]:
+        """Persistent pinned host buffers for the per-step table updates
+        (grown geometrically; the previous step's copies are drained
+        through the recorded event before the buffers are rewritten)."""
+        cur = getattr(self, "_stage", None)
+        if cur is None or cur["idx"].numel() < n:
+            cap = max(n, 2 * self.gpu_rows, 64)
+            if cur is not None:
+                cap = max(cap, 2 * cur["idx"].numel())
+                if cur.get("event") is not None:
+                    cur["event"].synchronize()
+            cur = {
+                k: torch.empty(cap, dtype=torch.int64, pin_memory=True)
+                for k in ("idx", "val", "idx2", "val2")
+            }
+            self._stage = cur
+        return cur
 
     def stats(self) -> dict[str, int]:
         return {

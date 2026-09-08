@@ -253,3 +253,88 @@ are deleted, not demoted, under host pressure).
 5. **Serving gates**: exact-token bench c1/c8/c16, deep-context marker recall
    (8K/24K/42K/100K/200K), multi-turn tracking, image request; then the
    8-GPU FP8 record gets the same design (its 1.03x pool becomes many x).
+
+## Zero ops carry their KV group (2026-09-08 fix)
+
+The tier restore zeroes the resumed request's compressor ring block
+defensively. Under the multi-pool packed slab (E5b) every page-size class
+is its own pool with its own block ids, so a zero op is `(block, group)` and
+the DMA zeroes `_blocks_for(group)[block]`. The previous bare block id was
+zeroed in pool 0 - the attention slab - which under the single slab was the
+same physical row (harmless) and under the multi-pool slab was attention
+block N: a mixed resume (GPU prefix-cache hit on the leading block, tier
+restore of the rest) whose ring block id coincided with the cached block's
+id lost that block's indexer keys, and the top-k never selected the prompt
+head again. Pure tier resumes rewrite every restored attention block after
+the zero, which is why only mixed resumes failed. Regression test:
+`test_zero_op_targets_the_groups_pool_not_pool_zero`. Standing gate: the
+chat oracle with identical back-to-back prompts (it recycles the same few
+block ids, which is what makes the collision reliable).
+
+## Row validity in the residency (2026-09-08 fix)
+
+A residency row has up to three copies: the GPU hot-window row, a pool
+host row, and a tier-slot row. `dirty` says the GPU copy is newer than any
+host copy; `flushed_to` says WHICH host address holds the current copy
+(-1: none). Every copy decision uses both: flush and demotion copy when the
+row is dirty or its current copy is not at the destination; bind resets
+`flushed_to` (the GPU copy is about to diverge); rebind sets it to the slot
+row; `set_home` moves already-demoted rows unconditionally (they are never
+dirty). The previous rule ("clean means already in the home") was only true
+for the slot a row was first flushed to, and broke the moment the tier
+connector re-homed a GPU prefix-cache hit into a resumed lineage's slot: the
+new slot received only the demoted rows, and the resumed conversation read
+stale bytes for its prompt head (the 2026-09-06 "empty follow-up" episode
+and the 2026-09-07 oracle failures). Regression test:
+`test_rehomed_block_copies_its_clean_rows_into_the_new_slot`.
+
+`VLLM_KV_TIER_VERIFY=1` now also digests every main-KV slot at flush and
+at rebind ("main-kv verify: ... OK|MISMATCH") beside the slab digests.
+
+## Scaling campaign (2026-09-07): throughput vs concurrency on 4x RTX 3090
+
+Measured on qwen38fn-nvfp4-4 (perf/results/2026-09-07/scale/). The step at
+8 running is 29 ms; at 16 running, with every page hot and in-graph, 44 ms
+busy (census): the O(rows) terms are (a) the int8 skinny route's row cutoff
+(above 32 rows the dense projections fall back to per-call dequant plus
+cuBLAS: +8 ms), (b) the RING_LL collectives on doubled messages (+4 ms;
+LL128 recovers it but is barred on PCIe by NCCL policy), (c) Marlin MoE
+saturating (+2 ms, expected). The sparse gather is flat once the hot
+window holds the active rows (48 rows for 16 chat requests).
+
+Per-request VRAM at chat context is what caps the running count: ~26 MB
+of hot main-KV rows (4 x 6.5 MB), 45 MB of GDN state (3 groups x (1 + k)
+slots x 5.03 MB), 10.6 MB indexer keys, 0.7 MB ring/PLE - ~83 MB, so 32
+hot requests need ~2.6 GiB against a 1.15-1.5 GiB budget.
+
+### GDN single-slot replay (design, not built)
+
+The k+1 SSM slots per group exist only because acceptance is unknown until
+sampling: the fused recurrent kernel reads the previous step's state from
+slot[accepted-1] and writes the state after every draft position into its
+own slot; the conv state already lives in ONE slot with k extra history
+columns rolled by the accepted count (causal_conv1d_update,
+num_accepted_tokens). Replace the SSM rollback slots with a replay:
+
+- Keep one SSM slot per group per request holding the state BEFORE the
+  previous step's tokens (state_prev).
+- Keep the previous step's per-token kernel inputs for the k+1 positions
+  (post-conv q/k/v, g, beta: ~17 KB per token per layer; 36 layers x 32
+  rows x 3 tokens = 57 MB per rank, a per-batch-row scratch).
+- At the next step, with a_prev known, run the recurrence over
+  T = a_prev + (k+1) tokens from state_prev: the first a_prev tokens are
+  the replayed accepted prefix (outputs discarded), the rest are this
+  step's draft. The kernel stores the state ONLY after position a_prev-1,
+  in place, as the new state_prev (a REPLAY constexpr: store at one index
+  instead of every position). One launch per layer, T <= 6 instead of 3.
+- Planner: num_speculative_blocks 0 for the SSM/PLE groups (chat demand 1
+  instead of 1 + k), so a chat request charges 3 GDN blocks (15 MB) not 9
+  (45 MB): 32 running requests need 0.48 GiB of GDN state instead of
+  1.45. The align-mode postprocess copy (accepted slot -> running slot)
+  disappears with the slots.
+- Cost: the replay adds up to k tokens of recurrence per layer per step
+  (~0.6 ms at 8 running, ~1.5 ms at 32) and the scratch write of the
+  kernel inputs. Gates: bit-exact parity against the multi-slot path on
+  recorded (inputs, acceptance) traces; deep recall; the tier's tail
+  snapshots are unchanged (they save the running slot at block
+  boundaries).

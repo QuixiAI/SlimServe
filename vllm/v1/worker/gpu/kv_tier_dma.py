@@ -54,7 +54,7 @@ class TierOpBatch:
     # GPU blocks to zero with the batch (a resumed request's ring block:
     # the framework never zeroes ring blocks, so this is defensive
     # determinism over the stale-claimed bytes internal hits run on).
-    zero: list[int] = None  # type: ignore[assignment]
+    zero: list[tuple[int, int]] = None  # type: ignore[assignment]  # (gpu_block, kv_group)
     # NVMe tier: write-through (host_slot, disk_slot) of rows whose GPU ->
     # host copy an EARLIER batch produced (the scheduler stages them one
     # confirmation later); promotion reads (disk_slot, host_slot) that must
@@ -368,8 +368,10 @@ class KVTierDMA:
                 self.arena[slot][:n].copy_(
                     self._blocks_for(gid)[gpu_block][:n], non_blocking=True
                 )
-            for gpu_block in batch.zero:
-                self.blocks[gpu_block].zero_()
+            for gpu_block, gid in batch.zero:
+                # The group selects the pool: a ring block id is NOT an
+                # attention block id under the multi-pool slab.
+                self._blocks_for(gid)[gpu_block].zero_()
             for slot, gpu_block, gid in batch.restore:
                 n = self._group_nbytes.get(gid, self._stride)
                 self._blocks_for(gid)[gpu_block][:n].copy_(

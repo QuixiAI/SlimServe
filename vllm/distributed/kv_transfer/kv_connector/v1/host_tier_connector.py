@@ -92,6 +92,7 @@ _LOG_MISS = os.environ.get("VLLM_KV_TIER_LOG_MISS", "0") == "1"
 # Diagnostic: VLLM_KV_TIER_IDLE=1 keeps the connector configured (arena
 # pinned, backend selection unchanged) but never stages or restores, so a
 # tier-on vs tier-idle throughput A/B shares one server configuration.
+_RESTORE_FROM_ZERO = os.environ.get("VLLM_KV_TIER_RESTORE_FROM_ZERO", "0") == "1"
 _TIER_IDLE = os.environ.get("VLLM_KV_TIER_IDLE", "0") == "1"
 
 
@@ -106,7 +107,7 @@ class HostTierMeta(KVConnectorMetadata):
     # req_id -> [gpu_block_id, ...] blocks to zero alongside the restore
     # (the ring block, whose framework zeroing was skipped for the
     # async-load range but which the tier deliberately does not restore).
-    zeros: dict[str, list[int]] = field(default_factory=dict)
+    zeros: dict[str, list[tuple[int, int]]] = field(default_factory=dict)  # (block, group)
     # batch_seq -> [(host_slot, disk_slot), ...] write-through of confirmed
     # host rows to the NVMe tier.
     disk_writes: dict[int, list[tuple[int, int, int]]] = field(default_factory=dict)
@@ -170,6 +171,9 @@ class _ReqTrack:
     # planned slots of a resumed span (rebound read-only).
     main_slots: dict[int, int] = field(default_factory=dict)
     planned_main_slots: list[int] = field(default_factory=list)
+    # Diagnostic restore-from-zero: GPU-cached leading blocks counted as
+    # covered by the first staging call.
+    restore_extra: int = 0
 
 
 class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
@@ -442,7 +446,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             self._requests: dict[str, Request] = {}
             self._staged_restores: dict[str, list[tuple[int, int, int]]] = {}
             self._staged_offloads: dict[int, list[tuple[int, int, int]]] = {}
-            self._staged_zeros: dict[str, list[int]] = {}
+            self._staged_zeros: dict[str, list[tuple[int, int]]] = {}
             # Writes issued last step; confirmed next build (in-order copy
             # stream: any restore issued later observes completed writes).
             self._last_step_write_slots: list[int] = []
@@ -593,6 +597,15 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         track.planned_state_slots = state_slots
         track.planned_start = num_computed_tokens // bs
         track.restored_upto = num_computed_tokens // bs
+        if _RESTORE_FROM_ZERO and num_computed_tokens:
+            # Diagnostic (2026-09-08): a mixed resume - GPU prefix-cache hit
+            # on the leading blocks plus a tier restore of the rest - fails
+            # recall while pure tier resumes pass. Restoring the cached
+            # span too (identical bytes, zero-copy main-KV rebind) makes the
+            # main-KV/slab side identical to the pure case and isolates it.
+            track.planned_start = 0
+            track.restored_upto = 0
+            track.restore_extra = num_computed_tokens // bs
         logger.info(
             "host-tier: hit for %s: resume at block %d (%d tokens)",
             request.request_id[-8:],
@@ -624,9 +637,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # Progress is planned-relative: request.num_computed_tokens is not
         # advanced while the request waits on the async load.
         covered = min(
-            track.restored_upto + num_external_tokens // bs,
+            track.restored_upto
+            + num_external_tokens // bs
+            + getattr(track, "restore_extra", 0),
             track.planned_blocks,
         )
+        track.restore_extra = 0
         ops: list[tuple[int, int, int]] = []
         for logical in range(track.restored_upto, covered):
             for gid in self.attn_groups:
@@ -666,7 +682,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # column (mamba_hybrid.MambaHybridModelState.add_request). With the
         # align-mode external allocation shape ([null] * (k-1) + [real])
         # that position is the group's single real block.
-        zero_blocks: list[int] = []
+        zero_blocks: list[tuple[int, int]] = []
         if covered == track.planned_blocks and track.planned_state_slots:
             state_pos = track.planned_blocks - 1
             for tier_gid, slot in track.planned_state_slots.items():
@@ -689,7 +705,11 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             # on a stale-claimed, never-zeroed ring; zero is the same or
             # strictly cleaner).
             for gid in self.ring_groups:
-                zero_blocks.extend(b for b in track.group_blocks[gid] if b > 0)
+                # (block, group): under the multi-pool packed slab the ring
+                # lives in its own pool, and a bare block id would zero the
+                # ATTENTION block of that id (2026-09-08: a resumed request's
+                # cached prompt head lost its indexer keys that way).
+                zero_blocks.extend((b, gid) for b in track.group_blocks[gid] if b > 0)
         if ops:
             self._staged_restores.setdefault(request.request_id, []).extend(ops)
             if track.disk_reads:

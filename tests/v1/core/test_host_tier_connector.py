@@ -283,7 +283,7 @@ def test_resume_round_trip():
     assert {200, 201, 202, 203} <= targets  # attention span
     # Both mamba states land on the position-(k-1) tail blocks.
     assert {295, 296} <= targets
-    assert meta.zeros["r2"] == [290]  # the ring block
+    assert meta.zeros["r2"] == [(290, 1)]  # the ring block
 
 
 def test_progressive_clipped_restore():
@@ -305,7 +305,7 @@ def test_progressive_clipped_restore():
     conn.update_state_after_alloc(fresh, alloc(4, planned=4, base=300), n_ext2)
     meta2 = conn.build_connector_meta(sched_output({}))
     assert len(meta2.restores["r2"]) == 2 + 2  # final chunk carries the tail
-    assert meta2.zeros["r2"] == [390]
+    assert meta2.zeros["r2"] == [(390, 1)]
 
 
 def test_mixed_local_and_tier_resume():
@@ -326,7 +326,7 @@ def test_mixed_local_and_tier_resume():
     targets = {b for _, b, _ in ops}
     assert {402, 403} <= targets
     assert {495, 496} <= targets
-    assert meta.zeros["r5"] == [490]
+    assert meta.zeros["r5"] == [(490, 1)]
 
 
 def test_short_prompt_or_mismatch_misses():

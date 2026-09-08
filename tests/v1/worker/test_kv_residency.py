@@ -171,3 +171,47 @@ def test_tier_home_flush_and_rebind_serve_the_gather_from_the_tier_slot():
         assert torch.equal(out, ref)
     finally:
         r.release()
+
+
+def test_rehomed_block_copies_its_clean_rows_into_the_new_slot():
+    """2026-09-08: a GPU prefix-cache hit adopted by a tier resume is re-homed
+    into the resumed lineage's slot. Its rows are clean (flushed to the OLD
+    home), and the flush used to skip clean resident rows, leaving the new
+    slot with stale bytes for them - the resumed conversation then read
+    another request's rows for its prompt head."""
+    sub = 2
+    dev = torch.device("cuda")
+    r = MainKVResidency(num_blocks=8, gpu_rows=4, row_bytes=ROW, device=dev)
+    r.sub_blocks = sub
+    r.manager_block_size = BS * sub
+    r.bind(group_id=0, block_size=BS, max_reqs=4, table_width=8, max_tokens=64)
+    try:
+        base = r.attach_tier_arena(num_slots=3, slot_bytes=ROW * sub)
+        bt = torch.zeros((4, 8), dtype=torch.int32, device="cuda")
+        slots = torch.full((64,), -1, dtype=torch.int64, device="cuda")
+        r.set_home(1, base + 2 * ROW * sub)  # first lineage: slot 2
+        content = torch.randint(0, 127, (sub, ROW), dtype=torch.int8, device="cuda")
+        for k in range(sub):
+            row = 1 * sub + k
+            r.prepare_step(bt, slots, written_blocks=[row], protected_blocks=[row])
+            r.gpu[int(r.row_of_block[row])].copy_(content[k])
+        r.flush(1)
+        torch.cuda.synchronize()
+        assert not r.dirty[2] and not r.dirty[3]
+        assert torch.equal(r.tier_arena[2].view(sub, ROW).cpu(), content.cpu())
+        # Re-homed into another lineage's slot 0 (still resident, still clean).
+        r.set_home(1, base + 0 * ROW * sub)
+        r.flush(1)
+        torch.cuda.synchronize()
+        assert torch.equal(r.tier_arena[0].view(sub, ROW).cpu(), content.cpu())
+        # Demotion of a clean row into a home that never received it copies too.
+        r.set_home(1, base + 1 * ROW * sub)
+        r.prepare_step(bt, slots, written_blocks=[6, 7], protected_blocks=[6, 7])
+        r.prepare_step(bt, slots, written_blocks=[4], protected_blocks=[4, 6, 7])
+        torch.cuda.synchronize()
+        demoted = [k for k in range(sub) if int(r.row_of_block[2 + k]) < 0]
+        assert demoted, "window pressure should have demoted a row of block 1"
+        for k in demoted:
+            assert torch.equal(r.tier_arena[1].view(sub, ROW)[k].cpu(), content[k].cpu())
+    finally:
+        r.release()

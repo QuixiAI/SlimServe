@@ -85,3 +85,28 @@ def test_arena_costs_exactly_its_size_not_the_next_power_of_two():
     assert 1536 * 0.9 <= used <= 1536 * 1.15, used
     dma.release()
     assert not dma.arena.is_pinned()
+
+
+def test_zero_op_targets_the_groups_pool_not_pool_zero():
+    """2026-09-08: under the multi-pool packed slab the ring group has its
+    own (small-stride) pool, and a zero op carrying a bare block id zeroed
+    the ATTENTION block of that id - a resumed request whose cached prompt
+    head shared the id with its ring block lost the head's indexer keys."""
+    device = torch.device("cuda")
+    attn = torch.full((BLOCKS * STRIDE,), 7, dtype=torch.int8, device=device)
+    ring_stride = 256
+    ring = torch.full((BLOCKS * ring_stride,), 3, dtype=torch.int8, device=device)
+    dma = KVTierDMA(
+        attn, STRIDE, SLOTS, device,
+        pool_backings={1: (ring, ring_stride)}, gid_pool={0: 0, 1: 1},
+    )
+    try:
+        dma.issue(TierOpBatch(seq=1, offload=[], restore=[], zero=[(2, 1)]))
+        torch.cuda.synchronize()
+        assert int(ring.view(BLOCKS, ring_stride)[2].abs().sum()) == 0
+        assert int(attn.view(BLOCKS, STRIDE)[2].abs().sum()) == 7 * STRIDE
+        dma.issue(TierOpBatch(seq=2, offload=[], restore=[], zero=[(3, 0)]))
+        torch.cuda.synchronize()
+        assert int(attn.view(BLOCKS, STRIDE)[3].abs().sum()) == 0
+    finally:
+        dma.release()
