@@ -41,6 +41,7 @@ from vllm.v1.attention.backend import (
     MLAAttentionImpl,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla import quixicore_mla_sparse_prefill
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -401,6 +402,20 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             if q.shape[-1] == 512:
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
+                # Steps with prefill tokens take the head-batched
+                # tensor-core kernel (one program per token, the heads as
+                # the M dimension); decode steps keep the graph-captured
+                # walk below.
+                if (
+                    quixicore_mla_sparse_prefill.ENABLED
+                    and attn_metadata.num_prefills > 0
+                    and quixicore_mla_sparse_prefill.supports(q)
+                ):
+                    return quixicore_mla_sparse_prefill.sparse_mla_prefill_nope(
+                        q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                        attn_metadata.block_size, self.softmax_scale,
+                        page_stride_bytes=_page_stride_bytes(kv_c_and_k_pe_cache),
+                    ), None
                 # Partitioned (128 -> 17 partitions at the 2080-wide list):
                 # the one-warp-per-(head, token) walk was 155 ms/token at
                 # TP8 with the 2048 top-k (8 warps per rank). Microbench
