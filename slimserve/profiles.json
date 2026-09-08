@@ -2748,9 +2748,12 @@
             "num_speculative_tokens": 3
           },
           "env": {
-            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1"
+            "VLLM_CUSTOM_AR_ALLOW_PCIE": "1",
+            "NCCL_P2P_DISABLE": "0",
+            "NCCL_P2P_LEVEL": "SYS"
           },
           "notes": [
+            "NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS (2026-09-08): NCCL carries every TP all-reduce above the custom all-reduce's 8 MiB cap, i.e. the prefill chunks ([tokens, 4096] bf16: 57 MB at 7001 tokens, 67 MB at 8192). The four GPUs sit PHB/NODE (two per host bridge, no PCIe switch), which NCCL's default P2P level refuses, so it fell back to host-memory SHM at 15 GB/s and the reduce was 37% of a 7001-token prefill step. Over P2P: c8 prefill 811-831 -> 666-678 ms, c16 1354-1361 -> 1103-1106 ms, aggregates +4% c8 / +5-6% c16, decode untouched, gate in band (notebook 2026-09-08 'Prefill: the all-reduce arms'; the custom-AR cap at 64/128 MiB, VLLM_CUSTOM_AR_MAX_SIZE_MB, gave -14% and lost to this). Profile env applies with setdefault: a shell that exports NCCL_P2P_DISABLE=1 (tinybox's fish config does, for the CUDA 13.3 B12X container on the 13.0 driver) silently wins and the launcher prints the shadow; unset it for this record.",
             "VLLM_CUSTOM_AR_ALLOW_PCIE=1 (2026-09-07): vLLM's custom all-reduce on the PCIe-only TP4 topology (P2P functional on every pair, BAR1 128 GiB). Replaces 91 NCCL ring-LL launches x 11.2 us with 90 x 5.1 us on the compute stream and removes their cross-stream graph gaps: exact-token c1 123.8 -> 137.4, c8 478 -> 499, c16 628 -> 657 on the swap-set tree, six gates in band (notebook 2026-09-07 'Custom all-reduce'). Off = unset the key (NCCL).",
             "BRING-UP RECORD (2026-09-04), not yet validated: this is the a100 record's kernel set carried to sm_120 as the Phase 0 baseline of docs/glm53-flash-sm120-plan.md. Nothing here is a measured sm_120 choice until the notebook says so; each line below states what is known.",
             "Same model facts as a100: context from config.json (1048576), ~17 KiB/token per rank of MLA + indexer KV, fixed-size KDA state; block_size 64 for the pooled-indexer cache; parsers glm47; TP4 with experts sharded (EP was 4-6% slower on a100; the PCIe all-reduce cost here is the reason to re-measure, not to assume).",

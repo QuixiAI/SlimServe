@@ -862,7 +862,9 @@ partition and reduce"): the DSA layers' sparse decode reduce switched to
 the one-thread-per-channel reducer and the index-list partition set by
 batch (32 tokens at B <= 8, 64 above): 0.35 -> 0.13 ms/step at c1.
 Record now (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0
-tok/s; the c8 bar (740) is 72% covered.
+tok/s; the c8 bar (740) is 72% covered. With the NCCL P2P env (below)
+the slow-state readings are 540-543 / 713-714 (+4% / +5-6% like-for-like);
+a fast-state boot of that env is pending and projects ~163 / ~556 / ~730.
 
 Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
 the bars are measured on 1000-in / 300-out requests whose prefill is
@@ -874,6 +876,22 @@ now sit in this plan next to the decode ones: large-message reduce path
 grouped GEMM at M >= 64, prefill attention for the sparse MLA path. The
 c8 bar (740) needs prefill + 300 x step <= 3.24 s per request: with
 prefill halved the decode step must reach 9.4 ms (12.1 today).
+
+Prefill first lever, done 2026-09-08 10:11 (notebook "Prefill: the
+all-reduce arms"): the large-message reduce now runs over PCIe P2P in NCCL
+(record env NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS; the box exported
+NCCL_P2P_DISABLE=1 and NCCL's default P2P level refuses the PHB/NODE
+topology, so it was on host-memory SHM). c8 prefill 811-831 -> 666-678 ms,
+c16 1354-1361 -> 1103-1106 (-18%); aggregates +4.2% c8 / +5-6% c16 in a
+slow-state boot; decode untouched. Raising the custom all-reduce cap
+(64/128 MiB, new knob VLLM_CUSTOM_AR_MAX_SIZE_MB) gave -14% and lost to it,
+so the cap stays 8 MiB. Profile env is setdefault: an operator export of
+NCCL_P2P_DISABLE=1 shadows the record (the CLI plan print now says so).
+Every VLLM_* value is a torch-compile cache-key factor with the Triton
+cache inside that directory: a new value costs one longer boot and a
+~49 s first request (12 KDA-prefill/indexer kernels outside the boot
+warm-up), a profile follow-up. Remaining prefill levers: the mHC prefill
+kernel, FP4 grouped GEMM at M >= 64, prefill attention.
 
 ### Phase 2: fixed overhead (the single-stream lever)
 

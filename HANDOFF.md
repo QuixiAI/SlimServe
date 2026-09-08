@@ -198,19 +198,34 @@ physics, research digest and phase gates are in
    latent row once for all 16 heads; the current form re-reads it 16x
    and is L2-bound at B >= 8), and the pooled indexer kernel (17 us per
    layer at 1000 tokens, 255 registers).
-2f. Prefill (notebook "Prefill attribution at c8" and "Where the bench's
-   time goes", 22:20-22:40): prefill is 18-20% of the c8/c16 bench wall
-   and runs at 8k tok/s; of a 7001-token step, 37% is NCCL all-reduce
-   (57 MB per site, RING_LL at 15 GB/s over PCIe), 20% the mHC partials
-   kernel at 7% of HBM bandwidth, 12% Marlin at ~25% of the FP4
-   tensor-core rate, 7% sparse MLA prefill through the decode walk. Arms
-   queued (resume_chain.sh): NCCL_PROTO=Simple, then the custom AR with
-   VLLM_CUSTOM_AR_MAX_SIZE_MB=64 (env patch in parked/
-   apply_custom_ar_max_size.py). Bigger items after: an mHC prefill
-   kernel (est. 176 -> ~20 ms per 7000 tokens), FP4 tensor-core grouped
-   GEMM for M >= 64, a real prefill attention. The 1088-token hybrid
-   cache block means 1000-token bench prompts never hit the prefix
-   cache (notebook "Prefix-cache granularity").
+2f. Prefill DONE 2026-09-08 10:11 (notebook "Prefill: the all-reduce
+   arms"): the 37% of a 7001-token step that was NCCL AllReduce over
+   host-memory SHM is gone because the box exported NCCL_P2P_DISABLE=1
+   (fish config, a B12X-container workaround) and NCCL's default P2P
+   level refuses the PHB/NODE topology anyway. Five one-factor arms:
+   NCCL_PROTO=Simple no effect; NCCL_P2P_DISABLE=0 alone no effect;
+   custom-AR cap 64 MiB (-14% c8 prefill) and 128 MiB (-14% c8 and c16,
+   +3.3% / +3-5% aggregate, 4 gates in band); NCCL_P2P_LEVEL=SYS with
+   P2P enabled: c8 prefill 811-831 -> 666-678 ms, c16 1354-1361 ->
+   1103-1106 (-18%), aggregates +4.2% c8 / +5-6% c16 in a slow-state
+   boot (540.5 / 713.2), decode untouched, gate -2.449. RETAINED as the
+   rtx6000 record env (NCCL_P2P_DISABLE=0, NCCL_P2P_LEVEL=SYS); the cap
+   stays 8 MiB (VLLM_CUSTOM_AR_MAX_SIZE_MB committed as a knob). The
+   profile env is setdefault, so an operator export of NCCL_P2P_DISABLE=1
+   silently wins: the CLI plan print now marks shadowed keys; the harness
+   launches the record with `env -u NCCL_P2P_DISABLE`; the box-wide fish
+   export is the operator's call. Lesson: every VLLM_* value is a
+   torch-compile cache-key factor and the Triton cache sits inside that
+   directory, so a new env value costs one longer boot and a ~49 s first
+   request (12 KDA-prefill/indexer Triton kernels the boot warm-up does
+   not cover); pass-1 c1 TTFT of such a boot is not a reading. Follow-up
+   for the profile: a post-health warm request through the KDA prefill
+   path or a Triton cache outside the hash directory. Bigger prefill
+   items after: an mHC prefill kernel (est. 176 -> ~20 ms per 7000
+   tokens), FP4 tensor-core grouped GEMM for M >= 64, a real prefill
+   attention. The 1088-token hybrid cache block means 1000-token bench
+   prompts never hit the prefix cache (notebook "Prefix-cache
+   granularity").
    Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
    decode = the profiled steps plus boot state plus context growth; no
    hidden host cost. The c8 bar needs prefill + 300 x step <= 3.24 s.

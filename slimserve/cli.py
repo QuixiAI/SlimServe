@@ -258,7 +258,13 @@ def _show(plan: Plan) -> None:
         )
         print(f"  spec      {method} k={depth}")
     for key, value in sorted(plan.env.items()):
-        print(f"  env       {key}={value}")
+        shadow = os.environ.get(key)
+        if shadow is not None and shadow != value:
+            # The profile's env applies with setdefault (engine.apply_env,
+            # server.start): the operator's value wins, so say so.
+            print(f"  env       {key}={value}  (shadowed: environment has {shadow})")
+        else:
+            print(f"  env       {key}={value}")
     for note in plan.notes:
         print(f"  note      {note}")
 
