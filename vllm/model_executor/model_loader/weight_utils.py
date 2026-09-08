@@ -283,6 +283,14 @@ def get_quant_config(
         )
 
     if hf_quant_config is not None:
+        from slimserve.fp8_swapset import apply_config_group
+
+        if apply_config_group(model_config.model, hf_quant_config):
+            logger.info(
+                "FP8 swap-set: quantization config group added from %s",
+                model_config.model,
+            )
+
         # `model_config.quantization_config` may be set alongside a checkpoint
         # quant config: the checkpoint determines `quant_cls`, and the user's
         # QuantizationConfigArgs is consulted by individual quant methods

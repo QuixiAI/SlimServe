@@ -119,12 +119,18 @@ def _load_f32_overrides(model_path: str | None) -> dict[str, torch.Tensor]:
     return overrides
 
 
-def iter_with_f32_overrides(
+def iter_with_overrides(
     weights: Iterable[tuple[str, torch.Tensor]],
     overrides: dict[str, torch.Tensor],
+    extras: dict[str, torch.Tensor] | None = None,
+    strict: bool = False,
 ) -> Iterable[tuple[str, torch.Tensor]]:
-    """Yield ``weights`` with any name present in ``overrides`` replaced."""
-    if not overrides:
+    """Yield ``weights`` with any name present in ``overrides`` replaced, then
+    the ``extras`` (tensors the checkpoint stream does not carry, such as the
+    block scales of a swapped FP8 weight). ``strict`` turns an override that
+    never appeared into an error: for the FP8 swap-set a missing substitution
+    would let the loader copy a BF16 shard into an FP8 parameter."""
+    if not overrides and not extras:
         yield from weights
         return
     pending = set(overrides)
@@ -135,12 +141,65 @@ def iter_with_f32_overrides(
         else:
             yield name, weight
     if pending:
-        logger.warning(
-            "glm5_next: %d F32 override tensors never appeared in the "
-            "checkpoint stream, e.g. %s",
-            len(pending),
-            sorted(pending)[0],
+        msg = (
+            f"glm5_next: {len(pending)} override tensors never appeared in the "
+            f"checkpoint stream, e.g. {sorted(pending)[0]}"
         )
+        if strict:
+            raise ValueError(msg)
+        logger.warning(msg)
+    if extras:
+        yield from extras.items()
+
+
+def iter_with_f32_overrides(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    overrides: dict[str, torch.Tensor],
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """Yield ``weights`` with any name present in ``overrides`` replaced."""
+    return iter_with_overrides(weights, overrides)
+
+
+def _load_fp8_swapset(
+    model_path: str | None,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """(weights to substitute, block scales to inject) from the FP8 swap-set
+    ``slimserve.fp8_swapset`` wrote next to the checkpoint; empty when the
+    files are absent or ``SLIMSERVE_FP8_SWAPSET=0``. The quantization config
+    group that makes those modules block-FP8 is added by the model loader
+    from the same manifest, so the two cannot disagree."""
+    import json
+    import os
+
+    from slimserve.fp8_swapset import manifest_path
+
+    path = manifest_path(model_path)
+    if path is None:
+        return {}, {}
+    with open(path) as fh:
+        manifest = json.load(fh)
+    from safetensors.torch import load_file
+
+    file = os.path.join(model_path, manifest["file"])
+    tensors = load_file(file)
+    if sorted(tensors) != sorted(manifest["tensors"]):
+        raise ValueError(f"{file}: tensor names do not match the manifest {path}")
+    subs = {k: v for k, v in tensors.items() if k.endswith(".weight")}
+    extras = {k: v for k, v in tensors.items() if k.endswith(".weight_scale")}
+    bad = [k for k, v in subs.items() if v.dtype != torch.float8_e4m3fn]
+    bad += [k for k, v in extras.items() if v.dtype != torch.float32]
+    if bad or len(subs) + len(extras) != len(tensors):
+        raise ValueError(
+            f"{file}: expected float8_e4m3fn weights and float32 weight_scale "
+            f"tensors only, e.g. {(bad or sorted(tensors))[0]}"
+        )
+    logger.info(
+        "glm5_next: FP8 swap-set from %s: %d weights, %d block scales",
+        file,
+        len(subs),
+        len(extras),
+    )
+    return subs, extras
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -640,9 +699,10 @@ class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
-        weights = iter_with_f32_overrides(
-            weights, _load_f32_overrides(getattr(self, "_model_path", None))
-        )
+        model_path = getattr(self, "_model_path", None)
+        weights = iter_with_f32_overrides(weights, _load_f32_overrides(model_path))
+        fp8_weights, fp8_scales = _load_fp8_swapset(model_path)
+        weights = iter_with_overrides(weights, fp8_weights, fp8_scales, strict=True)
         for name, weight in weights:
             # Vision tower and MTP layer: later phases.
             if name.startswith("model.visual."):

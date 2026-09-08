@@ -109,16 +109,40 @@ class quixicore_ops:
         return _qc().decode_gemm(x, weight, bias, fp32_out)
 
     @staticmethod
+    @cache
+    def has_decode_gemm_fp8() -> bool:
+        return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm_fp8")
+
+    @staticmethod
+    def decode_gemm_fp8(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        fp32_out: bool = False,
+    ) -> torch.Tensor:
+        """x[M, K] (bf16) @ dequant(weight)[N, K]^T for M <= 16 on tensor cores,
+        where weight is float8_e4m3fn with fp32 128x128 block scales
+        [ceil(N/128), K/128] and dequant(w) = bf16(scale * w); fp32
+        accumulation. The FP8 swap-set's decode kernel (N in 1024..16384, N a
+        multiple of 8, K a multiple of 128 >= 512)."""
+        return _qc().decode_gemm_fp8(x, weight, scale, bias, fp32_out)
+
+    @staticmethod
     def graph_factors() -> list[str]:
         """Capabilities that change the traced computation graph (the MoE
         runner and the unquantized linear pick their custom ops by them),
         for VllmConfig.compute_hash: a compiled artifact from a build without
         a kernel must not be reused by one with it."""
-        from vllm.model_executor.layers.utils import decode_gemm_enabled
+        from vllm.model_executor.layers.utils import (
+            decode_gemm_enabled,
+            decode_gemm_fp8_enabled,
+        )
 
         return [
             f"moe_sum_add={quixicore_ops.has_moe_sum_add()}",
             f"decode_gemm={decode_gemm_enabled()}",
+            f"decode_gemm_fp8={decode_gemm_fp8_enabled()}",
         ]
 
     @staticmethod

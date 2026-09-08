@@ -13,6 +13,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
+    CutlassFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     expose_input_quant_key,
@@ -40,6 +43,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     cutlass_block_fp8_supported,
+)
+from vllm.model_executor.layers.utils import (
+    decode_gemm_fp8_enabled,
+    maybe_quixicore_fp8_block_linear,
 )
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
@@ -148,6 +155,13 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         )
 
         expose_input_quant_key(layer, self.fp8_linear)
+        # The QuixiCore M <= 16 kernel only stands in for the CUTLASS block path
+        # (its M > 16 branch reproduces that path exactly).
+        self._quixicore_decode = (
+            self.strategy == QuantizationStrategy.BLOCK
+            and isinstance(self.fp8_linear, CutlassFp8BlockScaledMMKernel)
+            and decode_gemm_fp8_enabled()
+        )
 
     def process_weights_after_loading(self, layer) -> None:
         if self.strategy == QuantizationStrategy.TENSOR:
@@ -204,4 +218,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._quixicore_decode and isinstance(x, torch.Tensor):
+            out = maybe_quixicore_fp8_block_linear(
+                x, layer.weight, layer.weight_scale, bias
+            )
+            if out is not None:
+                return out
         return self.fp8_linear.apply_weights(layer, x, bias)

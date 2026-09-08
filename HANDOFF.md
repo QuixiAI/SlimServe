@@ -91,37 +91,75 @@ physics, research digest and phase gates are in
 
 ## Next step
 
-0. NATIVE REBUILD FIRST. Items 2 and 4 are DONE in the tree (2026-09-07
-   entries) but both of their kernels - moe_sum_add (fused shared-expert
-   combine) and decode_gemm (bf16 M <= 16 tensor-core GEMM) - have their
-   bindings in csrc/quixicore/tm_cuda/tm_cuda_serving.cu only; the shipped
-   _quixicore_C .so predates them, so both Python paths are inert on it.
-   Run /raid/scratch/slimserve-glm53/rebuild.sh (~72 min, Release, no boots
-   meanwhile), then: the three kernel tests (tests/kernels/
-   test_quixicore_{moe_routing,moe_sum_add,decode_gemm}.py: 27 + 32 + 44),
-   a smoke boot without the JIT hooks (smoke.sh native "" ""), GATE=1 ab.sh
-   on the plain tree, and check the serve log's torch_compile_cache hash is
-   new (graph_factors now reports both kernels true). Until the rebuild, the
-   JIT hooks reproduce every measurement: QC_DEV_COMBINE=1 QC_DEV_GEMM=1
-   PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site.
-1. Boot spread (notebook 2026-09-07 "Boot spread probe"): six boots of
-   identical code span 4-5% at c1 with identical per-kernel times; the
-   spread is host-side (idle gaps between kernels, allreduce wait). Needs
-   root: `cpupower frequency-set -g performance` (governor is schedutil on
-   the EPYC 9334), then pin EngineCore + workers per CCD (numactl/taskset),
-   three boots of one arm after each; add an nvidia-smi clock/power log to
-   bench.sh so GPU-side causes are excluded per run. Until it is fixed,
-   decide kernel work on the profiler pair's kernel-busy time and compare
-   exact-token boots like-state to like-state (fast ~115-117, slow ~111-113
-   at c1).
+0. Native rebuild DONE 2026-09-07 17:05 (Release, 73 min, HEAD fdddc62e9)
+   and validated 17:15: moe_sum_add and decode_gemm live in _quixicore_C,
+   117 QuixiCore kernel tests pass on it (route_align 11, router gemv 16,
+   sparse MLA 14, moe_sum_add 32, decode_gemm 44), smoke clean, gates
+   -2.452 / -2.449, exact-token c1 112.6 / 117.4 (the boot flipped host
+   state between passes), c8 469.9 / 470.4, c16 619.1 / 617.9 - the best
+   on record and equal to the JIT-hook boots. The FP8 swap-set binding
+   (decode_gemm_fp8) is NOT in this .so (its TU compiled before the edit):
+   QC_DEV_GEMM_FP8=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site
+   until the next rebuild - NEXT REBUILD IS DUE (the swap-set is retained
+   and default on; rebuild + post_rebuild_validate.sh, no GPU A/B during it). /raid/scratch/slimserve-glm53/
+   post_rebuild_validate.sh <label> runs the whole check.
+1. Boot spread (notebook 2026-09-07 "Boot spread probe", incl. "Probe
+   results"): the 4-5% c1 spread between boots of identical code is NOT
+   the governor (3 boots each way, identical bimodal split), NOT GPU
+   clocks (logged per run now), NOT host-thread placement (pin_probe.sh:
+   EngineCore pinned to a clean core / onto the display daemon's SMT
+   sibling / released, eight c1 passes all 117.3-117.5 in one boot). It is
+   per-node latency inside the CUDA-graph replay, the same on all four
+   GPUs of a boot: in-step idle 0.37 ms (fast) vs 0.68 ms (slow) spread
+   over the ~1250 nodes (same-stream gap median 0.10 vs 0.45 us), host
+   ahead on every rank. Next probe: /raid/scratch/slimserve-glm53/
+   graph_node_bench.py in fresh processes (single GPU, 1200-node graph);
+   bimodal there = driver/graph-exec state, then vary
+   CUDA_DEVICE_MAX_CONNECTIONS, cudaGraphUpload, fork/join. Until it is
+   controlled: decide kernel work on the profiler pair's kernel-busy,
+   classify a profiled boot's state with gap_locate.py's in-step idle,
+   compare exact-token boots like-state (fast ~117, slow ~112-113 at c1),
+   and note that every node removed (fusion, custom AR on the compute
+   stream) shrinks the spread as well as the mean.
 2. Item 4 follow-ups, in order of prize: shared-expert gate_up (1024 rows,
    42 launches x 7.4 us on the aux stream; row-per-block at M=1, the mma
    kernel above M=1); C++ TORCH_LIBRARY registration of
    quixicore_decode_linear (removes the 2-4 us Python trampoline on starved
    prefill chunks; batch with the rebuild after this one); optional CONC=16
    prof_pair.sh for a GPU-side M=16 comparison.
-3. Then FP8 KV / bytes (Phase 2) and MTP k=3 on the Foundry shape (peer);
-   optional re-test of the cooperative mHC launcher on the fixed build.
+2b. Fixed overhead, cheapest first (launch census in
+   /raid/scratch/slimserve-glm53/research/launch-census-2026-09-07.md): the
+   NCCL all-reduce is 91 x 10.5-13.2 us = ~1.0 ms of the 8.1 ms c1 step and
+   the custom all-reduce is off only because of vLLM's ">2 PCIe GPUs" rule;
+   the fork's escape hatch is VLLM_CUSTOM_AR_ALLOW_PCIE=1 (needs P2P + a
+   full-size BAR1; nvidia-smi topo -p2p r says OK on every pair) plus
+   disable_custom_all_reduce=false in the profile. One-factor A/B after the
+   swap-set: expected 4-7 us per reduction -> ~0.4 ms/step. Then the mHC
+   cooperative launcher re-test (0.78 ms/step of latency-bound launches).
+3. FP8 weight swap-set DONE 2026-09-07 18:17 (notebook parts 1 and 2,
+   plan "Item 2b"): RETAINED, default on. Like-state exact-token c1 117.4
+   -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 (+5.5 / +2.0 / +1.1%),
+   gates -2.408 / -2.437, profiler pair -0.35 ms/step. Serving needs the
+   sidecar next to the checkpoint (/raid/weights/GLM-5.3-Flash-NVFP4/
+   fp8-swapset.{safetensors,json} -> symlinks into /raid/scratch/
+   slimserve-glm53/fp8-swapset/; rebuild with `python -m
+   slimserve.fp8_swapset /raid/weights/GLM-5.3-Flash /raid/weights/
+   GLM-5.3-Flash-NVFP4`) and, until the next native rebuild, the JIT hook
+   QC_DEV_GEMM_FP8=1 PYTHONPATH=/raid/scratch/slimserve-glm53/jit/site
+   (without it decode falls back to CUTLASS w8a8 blockwise, +1 quant
+   launch per linear - slower than BF16 at c1, so keep the hook or
+   rebuild). Follow-up, one factor: the small-K fp8 shapes on the aux
+   stream (shared down K=512 takes 8.7 us vs bf16 4.0 under Marlin;
+   hidden today) - sidecar variant without shared_experts.down_proj
+   (SWAP_MODULES edit + build with out=, manifest hash keys the compile
+   cache) or a K<=1536 kernel variant; decide on the overlap-free busy.
+   FP8 KV stays deprioritized (capacity item). Then MTP k=3 on the
+   Foundry shape (peer); optional re-test of the cooperative mHC launcher.
+4. Method: ab.sh STATE=1 labels a boot's front-end state (profiled round
+   after the benches; "-- state:" in-step idle ~0.37 fast / ~0.68 slow,
+   "-- attrib:" kernel-busy). Use it on every exact-token arm from now on;
+   the first swap-set B boot (118.4, unlabelled) was a slow-state boot
+   that read as +0.8% until B2 (fast) gave 123.8.
 Profiler captures: prof_run.py now runs a 384-token profiled round so the
 8-iteration capture sits in steady decode (96 ended before the capture
 with MTP on and produced a 2-iteration trace whose "step" was a partial

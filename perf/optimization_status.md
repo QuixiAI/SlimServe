@@ -20340,3 +20340,84 @@ Correctness in the serving path: the second gate run landed 0.005 above the band
 **Follow-up (its own item, needs root).** (1) `cpupower frequency-set -g performance` and re-run three boots of one arm; (2) pin EngineCore and the four workers (taskset / numactl) to one CCD each and repeat; (3) log `nvidia-smi --query-gpu=clocks.sm,clocks.mem,power.draw -l 1` alongside every bench so a GPU-side cause can be excluded per run rather than per profiler pair.
 
 **Raw artifacts.** perf/results/2026-09-07/item4-{A,B,A2,B2,A3,B3}-pass{1,2}/, /raid/scratch/slimserve-glm53/profile-{combine-B,gemm-A,gemm-B}/.
+
+**Probe results (2026-09-07 17:16-17:50, same tree, item 4 kernel arm, --no-spec).**
+
+*Governor: ruled out.* `cpupower frequency-set -g performance` for three boots, then three more on `schedutil` (governor_ab.sh; serve-logs/governor-ab.out). Performance: c1 117.4/117.5, 112.8/112.8, 113.3/113.3. Schedutil: 112.6/112.7, 117.4/117.5, 112.6/112.7 (c8 469 fast / 457 slow, c16 619 / 607 in both governors). The mean CPU clock under `performance` is 3.0 GHz against 1.8 GHz under `schedutil` (clocks-cpu-gov-*.csv) and it changes nothing: the state is binary and independent of the governor. GPU SM clocks under load are 2812-2835 MHz median on every card in all six boots, memory 13365 MHz, power 437-448 W median, no throttle reasons (clocks_summary.py) - the GPU clocks are ruled out per run now, not only per profiler pair.
+
+*Thread placement: ruled out.* The 5 s placement sampler (threads-gov-sched-*.log) showed the EngineCore thread of both slow schedutil boots sitting on the SMT sibling of (or the same logical core as) the tinybox display service, a permanent daemon at 27% of a core, and never colocated in the fast boot. pin_probe.sh tested that inside one boot: c1 unpinned 117.3/117.5, EngineCore pinned to a clean physical core 117.5/117.5, pinned onto the display service's sibling 117.4/117.4, released 117.4/117.3. Placement of the serial host thread does not move the number, and the state did not change across eight passes and three affinity changes, so it is not a host-thread property. Engine-side TPOT tracks the client number (it is not the API server or the client).
+
+*Where it actually is: per-node latency inside the CUDA-graph replay, on all four GPUs at once.* gap_locate.py on the rank traces: per step the host is ahead on every rank (the next cudaGraphLaunch is issued 3-7 us before the previous step's last kernel ends; ranks 1-3 launch 250 us ahead), launch latency is 10 us, and the whole difference is in-step idle: 0.370 ms (fast boot, combine-B) against 0.685 / 0.672 ms (slow boots gemm-A / gemm-B), identical on ranks 0-3 of each boot. The idle is not a few large gaps: gaps above 3 us total 45 us (fast) and 90 us (slow) per step, and the extra 0.3 ms is spread across the ~1250 nodes. Same-stream gap histogram (gap_hist.py, main stream): fast boot median 0.10 us with 81% of gaps under 0.5 us; slow boots median 0.45 us with 61-64% under 0.5 us and 18-20% in 0.5-1 us. The gap before each NCCL allreduce kernel moves the same way (median 2.2 -> 2.6 us, share above 3 us 13% -> 31%, ar_stats.py), and allreduce duration +0.25 us. So the slow state is the GPU front-end taking ~0.25-0.35 us longer per graph node, set once per boot, the same on all four cards; nothing on the host critical path is involved. That also explains why the exact-token spread scales with node count: the launch census's 685 sub-4 us kernels per step are the surface it acts on, so node-count reductions (fusions, custom all-reduce on the compute stream) shrink the spread as well as the mean.
+
+*Isolation probe: not reproducible on one GPU.* graph_node_bench.py (single GPU, a graph of 1200 tiny dependent kernels, or 600 nodes each forking onto a second stream and joining, replayed 50x) is identical in every fresh process: 0.718 us/node single-stream, 0.549 us/node with a fork/join per node, unchanged by CUDA_DEVICE_MAX_CONNECTIONS=1 or 32 (six, three, three, two and two processes). Dependent tiny launches pipeline behind the kernel itself, so a 0.1 -> 0.45 us per-node shift would need the real graph (four ranks, NCCL kernels, memcpys, 1250 nodes) to show; the state is a property of the full serving capture, not of the driver on one card.
+
+*Method change (ab.sh STATE=1).* Every exact-token boot can now label its own front-end state: the profiler is armed at boot (`--torch-profile-dir`, idle until /start_profile), one profiled c1 round runs after the two benches, and gap_locate.py's in-step idle (~0.37 ms fast, ~0.68 ms slow) plus step_attrib's kernel-busy are printed with the run. Exact-token arms are compared like-state from here; a boot in the other state is reported, not averaged.
+
+**Raw artifacts (probes).** serve-logs/governor-ab.out, clocks-{gpu,cpu}-gov-*.csv, threads-gov-sched-*.log, pinprobe-1.out, perf/results/2026-09-07/gov-{perf,sched}-{1,2,3}-pass{1,2}/ and pinprobe-1-{u1,u2,p1,p2,s1,s2,r1,r2}/; scripts governor_ab.sh, pin_probe.sh, gap_locate.py, gap_hist.py, ar_stats.py, clocks_summary.py in /raid/scratch/slimserve-glm53.
+
+## 2026-09-07: FP8 weight swap-set, part 1 - kernel choice for the block-FP8 backbone linears at decode
+
+**Status: KERNEL CHOSEN (W8A16 decode GEMM); swap-set integration and gates follow in part 2**
+
+**Question.** Plan Phase 1 item 2b takes ZAI's own FP8 block tensors (e4m3, 128x128 fp32 scales) for the dense MLP, the shared experts and the DSA q_a / kv_a / q_b / o_proj in place of the RedHatAI BF16 twins (0.72 GB/GPU/token, 0.63 GB without fused_qkv_a; research digest in the plan doc). Which kernel runs them at M <= 16? Candidates: the stock block-FP8 path (per-token-group activation quant + CUTLASS sm_120 blockwise w8a8, `CutlassFp8BlockScaledMMKernel`) and a W8A16 variant of the item 4 decode GEMM (bf16 activations, FP8 weights dequantized with the block scale in the load path).
+
+**CUTLASS sm_120 blockwise (fp8_block_bench.py; the kernel is compiled into the current _C_stable_libtorch, swap-AB path for M <= 64).** Correct: worst rel err vs a dequantized reference 3.4e-3 over six shapes x eleven M values incl. the M = 64 / 65 boundary; the activation quant itself perturbs outputs by 2.2-3.3% of scale (e4m3 per-token-group-128, which is the numerics ZAI shipped: `activation_scheme: dynamic`). Time per launch at M = 1 (weights past L2), bf16 cuBLAS -> quant + GEMM: dense gate_up 33.0 -> 1.5 + 17.9; dense down 18.6 -> 1.5 + 10.8; DSA o_proj 23.6 -> 1.5 + 13.0; DSA q_b 10.8 -> 1.5 + 6.4; shared gate_up 6.8 -> 1.5 + 9.3 (0.45 TB/s); shared down 3.1 -> 1.5 + 3.4. Flat in M up to 64. The shared experts (84 of the 134 swap linears per step) lose, and every linear costs two launches instead of one; with the shared experts included the step would get slower by ~60 us, without them it gains ~180 us.
+
+**W8A16 decode GEMM (jit/fp8_decode_gemm.cuh; fp8_gemm16_bench.py).** Same pipeline as the bf16 kernel; B fragments from two 16-bit shared loads per n8 tile (the e4m3 pairs k = 2q, 2q+1 and 2q+8, 2q+9 a lane holds), `cvt.rn.f16x2.e4m3x2` (exact) then fp32 scale and bf16 packing, so the mma sees bit-for-bit the BF16 a checkpoint dequant stores; one K chunk (128) is one scale block and a block's rows sit in one scale row group, so a chunk has one scale. Parity: worst rel err (to row scale) 3.7e-3 over seven shapes x M in {1,2,3,5,8,13,16} x eleven configs, bound 2^-7. Sweep, best config vs the bf16 decode GEMM (us; cuBLAS for the 1024-row shape the bf16 kernel does not serve):
+
+| shape (per rank) | M=1 | M=2 | M=4 | M=8 | M=16 | config |
+|---|---|---|---|---|---|---|
+| dense gate_up 6144 x 4096 | 32.2 -> 16.9 | 32.2 -> 17.2 | 32.2 -> 17.2 | 32.3 -> 17.3 | 32.6 -> 17.8 | 32 rows / 4 stages (1.41-1.49 TB/s) |
+| dense down 4096 x 3072 | 17.7 -> 9.8 | 17.7 -> 9.9 | 17.7 -> 10.0 | 17.7 -> 10.4 | 17.8 -> 10.7 | 32 / 4 |
+| shared gate_up 1024 x 4096 | 6.8 -> 4.5 | 8.4 -> 5.3 | 8.4 -> 5.5 | 8.5 -> 5.7 | 8.7 -> 6.5 | 8 / 4 to M = 8, 16 / 4 above |
+| shared down 4096 x 512 | 2.2 -> 2.1 | 2.6 -> 2.4 | 2.6 -> 2.4 | 3.4 -> 2.8 | 3.1 -> 2.9 | 32 / 4 (launch floor) |
+| DSA q_b 4096 x 1536 | 9.4 -> 4.7 | 9.4 -> 5.1 | 9.5 -> 5.1 | 9.4 -> 5.1 | 9.5 -> 5.7 | 32 / 4 |
+| DSA o_proj 4096 x 4096 | 22.0 -> 11.9 | 22.0 -> 12.1 | 22.1 -> 12.1 | 22.1 -> 12.2 | 22.2 -> 13.0 | 32 / 4 |
+| fused_qkv_a 2336 x 4096 (only if all five shards go FP8) | 13.0 -> 8.0 | 13.0 -> 8.5 | 13.1 -> 8.5 | 13.2 -> 8.5 | 14.9 -> 9.4 | 32 / 4 |
+
+Per c1 step on the item 4 tree: dense 3 x (15 + 8) + DSA 11 x (4.7 + 10.1) + shared 42 x (2.3 + 0.1) = about 0.33 ms, of which the shared gate_up's 0.10 ms is on the aux stream; c16 about 0.28 ms.
+
+**Decision.** The W8A16 decode GEMM is the decode kernel for the swap-set: one launch, no activation quant (the mma multiplies exactly the BF16 values served today), faster than CUTLASS w8a8 on every shape at every M <= 16 and the only one that wins on the shared experts. CUTLASS blockwise stays the M > 16 (prefill) path through the stock scheme, with its w8a8 numerics gated by the NLL / needle / exact-token legs in part 2; if the gate rejects it, the fallback is dequant-to-bf16 + cuBLAS for prefill behind a flag. Pin `DeepGemmFp8BlockScaledMMKernel` out (VLLM_DISABLED_KERNELS) so the prefill kernel cannot drift if deep_gemm appears in the venv.
+
+**Lossless, measured.** The sidecar builder (`slimserve/fp8_swapset.py`, layers 0-44, 314 tensors, 2.53 GB) checks every swapped weight: bf16(scale x fp8) from the native shards equals the RedHatAI BF16 tensor in 0 of 723M elements (max 0 bf16 ulp) across all eight module kinds. The decode kernel converts exactly that way, so at M <= 16 it multiplies bit-for-bit the weights served today; only the accumulation order differs from cuBLAS, as for item 4.
+
+**Raw artifacts.** /raid/scratch/slimserve-glm53/{fp8_block_bench.py, fp8_gemm16_bench.py, jit/fp8_decode_gemm.cuh, jit/fp8_decode_gemm.cu, jit/build_fp8_decode_gemm_120f/, fp8-swapset/, serve-logs/fp8-swapset-build.out}, research/fp8-swapset-research-2026-09-07.md.
+
+## 2026-09-07: FP8 weight swap-set, part 2 - serving A/B of the native e4m3 backbone tensors on the W8A16 decode GEMM
+
+**Status: RETAINED (default on the rtx6000 record); c1 117.4 -> 123.8, c8 468.8 -> 478.2, c16 620.8 -> 627.5 between fast-state boots**
+
+**Hypothesis.** Serving ZAI's own block-FP8 tensors (e4m3 with 128x128 fp32 scales) for the dense MLP (layers 0-2), the shared experts (layers 3-44) and the DSA q_b / o_proj (11 layers) in place of the RedHatAI BF16 copies removes 0.63-0.72 GB/GPU/token of weight traffic; with the W8A16 decode GEMM the output is bit-identical to today's BF16 path (part 1), so the only expected change is time. Part 1 predicted ~0.33 ms/step at c1 from the microbench.
+
+**Arms.** Same tree (item 4 + swap-set integration, uncommitted), same env, --no-spec, both arms with the JIT fp8 kernel hook (QC_DEV_GEMM_FP8=1, the binding is not in the built .so yet). A: SLIMSERVE_FP8_SWAPSET=0 (sidecar present but ignored; BF16 tensors, bf16 decode GEMM / cuBLAS as in item 4). B: swap-set on (157 weights + 157 block scales substituted at load, config group `slimserve_fp8_swapset` merged, CutlassFp8BlockScaledMMKernel selected for prefill, W8A16 decode GEMM for M <= 16). One factor.
+
+**Correctness.** Smoke on B: coherent completion, 8 concurrent requests, 0 CUDA errors. Gates on the B exact-token boot: mean text logprob -2.408 and -2.437 (band -2.416..-2.457, the first better than the band), needle margins 11.9/18.7 and 12.3/18.7 nats. Every exact-token bench exact:true.
+
+**Profiler pair (prof_pair.sh fp8swap; rank-0 traces; both boots in the fast front-end state, in-step idle 0.363 / 0.366 ms by gap_locate.py, so like-for-like).**
+
+| | A (swap-set off) | B (swap-set on) | delta |
+|---|---|---|---|
+| wall per step (gap_locate) | 7.290 ms | 6.940 ms | -0.350 ms (-4.8%) |
+| overlap-free GPU busy (union) | 6.923 ms | 6.572 ms | -0.351 ms |
+| in-step idle | 0.363 ms | 0.366 ms | same state |
+| launches per step | 1265 | 1264 | |
+| sum of kernel durations (step_attrib) | 8.16 ms | 8.18 ms | +0.02 (overlap-inflated, see below) |
+
+Per shape (dur_sorted.py, one steady step, us per launch; A -> B): DSA q_b 9.3 -> 5.8 (x11), DSA o_proj 22.4 -> 12.3 (x11), dense gate_up 33.0 -> 17.9 (x3), dense down ~18 -> ~14 (x3): the main-stream shapes save ~0.21 ms/step and land within 1-2 us of the part 1 bench. Shared experts (aux stream, under the Marlin routed-expert kernels): gate_up cuBLAS 7.4 -> fp8 8.2 (x42), down bf16 decode GEMM 4.0 -> fp8 8.7 (x42). Under contention the small-K fp8 launches take 2x their bf16 counterparts even though they move half the bytes (the bench had them at 2.1 / 4.5 us in isolation); their durations are hidden under the routed path, which is why the sum of durations does not move while the union and the wall do. Marlin MoE itself is 1.17 -> 1.13 ms (less HBM contention); the triton norm launches read longer (1.3 -> 2.1 us) because they now overlap the stretched aux kernels.
+
+**Exact-token (ab.sh fp8swap-A / fp8swap-B, c1/c8/c16 1000/300, two passes each).**
+
+| boot | c1 | c8 | c16 | front-end state |
+|---|---|---|---|---|
+| fp8swap-A (off) | 117.4 / 117.4 | 468.8 / 468.6 | 620.1 / 616.3 | fast (by the number; no label) |
+| fp8swap-B (on) | 118.3 / 118.5 | 466.5 / 464.2 | 614.2 / 616.0 | unlabelled - ambiguous |
+| fp8swap-B2 (on, STATE=1) | 123.7 / 123.9 | 478.0 / 478.3 | 627.9 / 627.1 | fast: in-step idle 0.365 ms, kernel busy 8.23 ms, 1268 launches |
+| fp8swap-A2 (off, STATE=1) | 117.4 / 117.4 | 468.8 / 468.7 | 621.5 / 620.1 | fast: in-step idle 0.370 ms, kernel busy 8.10 ms, 1266 launches |
+
+The first pair is ambiguous: 118.4 is +0.8% on a fast-state A, but it is also exactly what the profiler pair predicts for a slow-state B (112.7 tok/s = 8.87 ms/step, minus 0.35 ms = 8.52 ms = 117.4). ab.sh gained STATE=1 for this (boot-spread entry, method change) and both arms were re-run with the label.
+
+**Decision.** RETAINED. Like-state (both labelled fast) exact-token: c1 +5.5% (117.4 -> 123.8), c8 +2.0% (468.8 -> 478.2), c16 +1.1% (620.8 -> 627.5); the profiler pair's -0.35 ms/step (-4.8%) predicted 123.3 at c1. Output is bit-identical by construction (part 1) and the gates agree. The first B boot (118.4) is the boot-spread lesson in one number: a slow-state B is indistinguishable from a fast-state A plus noise without the label. Best on record: 123.8 / 478.2 / 627.5 (rtx6000, no-spec, item 4 + swap-set). Kill switches: SLIMSERVE_FP8_SWAPSET=0 (BF16 tensors, no config group; the sidecar is ignored) and SLIMSERVE_DECODE_GEMM_FP8=0 (swap-set on, stock CUTLASS w8a8 blockwise at decode). The sidecar is an operator artifact next to the checkpoint (`<model>/fp8-swapset.{safetensors,json}`), built once with `python -m slimserve.fp8_swapset <native> <model>` and verified bit-exact at build time.
+
+**Follow-ups.** (1) Small-K fp8 shapes under aux-stream contention: shared down (N=4096, K=512) 8.7 us vs bf16 4.0, shared gate_up (N=1024, K=4096) 8.2 vs cuBLAS 7.4. Options, one factor each: keep shared down on BF16 (sidecar variant without `shared_experts.down_proj`; the manifest hash keys the compile cache); a K<=1536 variant of the fp8 kernel (KCHUNK 64 / more stages, scale hoisted out of the chunk loop, or a row-per-warp GEMV at M=1); check co-residency with Marlin (registers/smem). The prize is only real if the aux chain is ever on the critical path, so measure the union, not the durations. (2) fused_qkv_a stays BF16 (indexer shards); (3) the C++ binding lands with the next native rebuild (post_rebuild_validate.sh covers decode_gemm_fp8).
+
+**Raw artifacts.** perf/results/2026-09-07/fp8swap-{A,B,B2,A2}-pass{1,2}/, fp8swap-B-gate{1,2}.json; /raid/scratch/slimserve-glm53/profile-fp8swap-{A,B}/ (profiler pair) and profile-fp8swap-{B2,A2}/ (state labels), serve-logs/{smoke-fp8swap.out,fp8swap-ab.out,state-ab.out,bench-fp8swap-*}, fp8-swapset/{fp8-swapset.safetensors,fp8-swapset.json} (installed as symlinks in /raid/weights/GLM-5.3-Flash-NVFP4); scripts fp8_swapset_ab.sh, state_ab.sh, gap_locate.py, dur_sorted.py, stream_split.py.

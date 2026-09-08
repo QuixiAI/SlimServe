@@ -21,6 +21,7 @@
 #include "glm_moe_routing.cuh"
 #include "glm_moe_combine.cuh"
 #include "bf16_decode_gemm.cuh"
+#include "fp8_decode_gemm.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
@@ -231,6 +232,32 @@ static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
     else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
+    return out;
+}
+
+static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, torch::Tensor scale,
+                                        c10::optional<torch::Tensor> bias, bool fp32_out) {
+    CK(x); CK(weight); CK(scale);
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "decode_gemm_fp8: bf16 x");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat8_e4m3fn, "decode_gemm_fp8: float8_e4m3fn weight");
+    TORCH_CHECK(scale.scalar_type() == torch::kFloat32, "decode_gemm_fp8: fp32 block scales");
+    TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && x.size(1) == weight.size(1),
+                "decode_gemm_fp8: x [M, K], weight [N, K]");
+    const int M = int(x.size(0)), K = int(x.size(1)), N = int(weight.size(0));
+    TORCH_CHECK(decode_gemm_fp8::supports(M, N, K), "decode_gemm_fp8: unsupported shape M=", M, " N=", N, " K=", K);
+    TORCH_CHECK(scale.dim() == 2 && scale.size(0) == (N + decode_gemm_fp8::SB - 1) / decode_gemm_fp8::SB
+                    && scale.size(1) == K / decode_gemm_fp8::SB,
+                "decode_gemm_fp8: scale [ceil(N/128), K/128]");
+    const float* bias_ptr = nullptr;
+    if (bias.has_value()) {
+        CK((*bias));
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->numel() == N, "decode_gemm_fp8: fp32 bias [N]");
+        bias_ptr = bias->data_ptr<float>();
+    }
+    auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
+    const auto* wp = reinterpret_cast<const uint8_t*>(weight.data_ptr());
+    if (fp32_out) decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, fpm(out), M, N, K, stream());
+    else decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, bpm(out), M, N, K, stream());
     return out;
 }
 
@@ -2130,6 +2157,10 @@ void init_serving(py::module_& m) {
     m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");
+    m.def("decode_gemm_fp8", &py_decode_gemm_fp8, py::arg("x"), py::arg("weight"), py::arg("scale"),
+          py::arg("bias") = py::none(), py::arg("fp32_out") = false,
+          "bf16 x FP8 block-scaled weights (e4m3, 128x128 fp32 scales), M<=16, tensor cores: "
+          "x @ dequant(weight)^T (+ bias), fp32 accumulation");
     m.def("moe_sum_add", &py_moe_sum_add, py::arg("x"), py::arg("shared"), py::arg("out"),
           "out[t] = shared[t] + sum_k x[t, k]: Marlin per-assignment sum + shared-expert add, one launch");
     m.def("fill_short_context_topk_indices",

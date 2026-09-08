@@ -604,10 +604,72 @@ gates in band. Kill switch SLIMSERVE_DECODE_GEMM=0. Left on cuBLAS on
 purpose: lm_head (parity), shared gate_up 1024 rows (loses at M=1), the
 K=128 KDA projections. The measurement itself produced the boot-spread
 finding (same notebook date): six boots of identical code span 4-5% at c1
-with identical per-kernel times, so the spread is host-side (gaps between
-kernels, rank skew), the profiler's kernel-busy time is the decision
-metric for kernel work, and the CPU governor / core pinning experiment is
-queued as its own item.
+with identical per-kernel times. The probes of the same evening (notebook
+"Probe results") ruled out the CPU governor, GPU clocks and host-thread
+placement and located it: per-node latency inside the CUDA-graph replay,
+set once per boot and the same on all four GPUs (in-step idle 0.37 vs
+0.68 ms over ~1250 nodes), not reproducible on one GPU in isolation. The
+profiler's kernel-busy time (overlap-free) is the decision metric for
+kernel work, every exact-token boot can label its own state (ab.sh
+STATE=1: a profiled round after the benches), and exact-token arms are
+compared like-state.
+
+Item 2b, done 2026-09-07 (notebook "FP8 weight swap-set" parts 1 and 2):
+the native checkpoint's block-FP8 tensors (e4m3, 128x128 fp32 scales) for
+the dense MLP, the shared experts and the DSA q_b / o_proj are served in
+place of their RedHatAI BF16 twins through a 2.53 GB sidecar
+(`slimserve/fp8_swapset.py` builds and verifies it, bit-exact against the
+BF16 tensors; the loader substitutes 157 weights and injects 157 block
+scales; a compressed-tensors group `slimserve_fp8_swapset` is merged from
+the manifest and hashed into the compile cache). Decode runs a W8A16
+variant of the item 4 GEMM (`csrc/quixicore/serving/fp8_decode_gemm.cuh`,
+dequant with the block scale in the load path, the mma multiplies exactly
+the BF16 values served before), prefill the compiled sm_120 CUTLASS
+blockwise kernel. fused_qkv_a stays BF16 (its indexer shards are BF16 in
+native). Like-state profiler pair: wall per c1 step 7.29 -> 6.94 ms
+(-4.8%), overlap-free busy -0.35 ms; exact-token fast-state boots c1 117.4
+-> 123.8, c8 469 -> 478, c16 618 -> 628 (+5.5 / +2.0 / +1.5%), gates in
+band, every bench exact. Kill switches SLIMSERVE_FP8_SWAPSET=0 and
+SLIMSERVE_DECODE_GEMM_FP8=0. Open: the small-K fp8 shapes on the aux
+stream (shared down K=512 8.7 us vs bf16 4.0 under Marlin contention) -
+hidden today, a sidecar variant without shared down or a K<=1536 kernel
+variant is the one-factor follow-up; the C++ binding rides the next native
+rebuild (JIT hook until then).
+
+### Bytes research digest (2026-09-07, read-only; full notes in /raid/scratch/slimserve-glm53/research/fp8-{swapset,kv}-research-2026-09-07.md)
+
+FP8 weight swap-set (Phase 1 item 2b): the native checkpoint's FP8 block
+tensors (e4m3, 128x128 F32 scales) cover exactly the dense MLP (L0-2), the
+shared experts (L3-45) and the DSA q_a / kv_a / q_b / o_proj; every one has
+a bit-identical-name BF16 twin in the RedHatAI checkpoint. Per GPU per
+token at TP4 the swap saves 0.723 GB (1.447 -> 0.724 GB; step 5.78 ->
+5.05 GB), or 0.631 GB if fused_qkv_a_proj stays BF16 (its three indexer
+shards are BF16 in native, and one module takes one scheme). The RedHatAI
+config is already compressed-tensors "mixed-precision" with an FP8-block
+group for the MTP experts, so a third group with targets on the fused vLLM
+names (DSA layers listed explicitly: KDA layers also call their output
+projection o_proj) is all the config needs; the loader needs the F32
+sidecar generalized to inject weight_scale tensors (renamed from
+weight_scale_inv, F32). Kernel: on sm_120 the block-FP8 linear resolves to
+CutlassFp8BlockScaledMMKernel (compiled in; swapAB path for M <= 64; no
+test in the tree; +1 activation-quant launch per linear = +134/step) with
+DeepGEMM silently outranking it if that package ever lands (pin it). The
+alternative that keeps one launch and bf16 activations is a W8A16 variant
+of the item 4 decode GEMM (dequant with the block scale in the load path;
+K chunk 128 = scale block). Evidence first: parity + microbench of both at
+M = 1..16 on the six swap shapes, then the sidecar + config + gates.
+
+FP8 KV (Phase 1 item 3): no path exists for this backend (the fp8 kernels
+assert GLM-5.2's 576-wide q; the cache-write kernel requires pe_dim 64;
+QuixiCore has no inline per-128 scale mode; the indexer cache is bf16
+only). At the benchmarked 1000-token shape the DSA path is dense (512
+pools selectable, 250 present) and reads 16.9 MB/step at c1, so FP8 rows
+save at most 0.15 ms/step (1.6%); it is a capacity lever (1.45x with
+fp8_ds_mla NoPE rows, 1.93x with the indexer row too; a plain 512 B row
+with the existing per-tensor scale mode gives 1.50x with today's page
+layout) and raising gpu_memory_utilization already gives 1.40x for free.
+Deprioritized behind the swap-set; returns as a long-context capacity item
+once the NLL / needle legs run on this platform.
 
 ## 4. Methodology (every phase)
 
