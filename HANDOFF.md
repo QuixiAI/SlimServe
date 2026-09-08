@@ -54,8 +54,13 @@ TPS is 165.02 / 590.41 / 787.99. Every start passed text/image canaries.
 All three have the slower graph-node state. One cold c1 run includes a
 157 ms first-JIT stall at the 1088-token state-copy boundary. Details and
 limits: perf/baseline_status.md; raw: perf/results/2026-09-08/repro-baseline/.
-The next checkpoint warms that kernel before health and warms the full
-benchmark workload. Neither change claims to solve persistent graph latency.
+The startup-copy fix has also passed a second fixed three-start series
+(commit a2cd7a240): **156.40 / 576.57 / 776.29** median complete-request
+TPS, with all 27 measurements retained. Its c1 range is 156.17-156.59;
+the cold outlier is absent. Copy-kernel warmup happens before health and
+benchmark warmups cover the full workload. Raw:
+perf/results/2026-09-08/warmup-boundary/. Neither change claims to solve
+persistent graph latency or improve steady-state throughput.
 
 Record (rtx6000 profile, no-spec, fast/fast boot, 2026-09-08 12:29, run
 mlapf-rec4): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is
@@ -76,8 +81,8 @@ indexer 0.23. c1 6.05: fp8 1.90, Marlin 1.11,
 mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
 norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
 
-Immediate work: correct sampler ties/FP64 noise, warm the live state-copy
-path before health, and isolate startup graph latency. Then revisit these
+Immediate work: correct sampler ties/FP64 noise and isolate startup graph
+latency. The live state-copy startup warmup is validated. Then revisit these
 kernel candidates with one-factor experiments and fixed-count serving runs.
 The savings below are hypotheses, not measured remaining headroom:
 

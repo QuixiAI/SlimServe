@@ -21118,3 +21118,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   server logs, all-rank traces and graph-replays-rank0.json.
 - Next: fixed three-start profile recheck with full-workload warmup and
   startup copy warmup, then correct the sampler at its selection/mass source.
+
+## 2026-09-08: Startup-copy warmup passes the real three-start workload
+
+- Status: retained; live profile verification complete. No steady-state
+  speedup claim and no claim that persistent graph latency is resolved.
+- Baseline/hypothesis: repro-baseline retained a cold c1 145.513 tok/s run,
+  with a 157.277 ms first-JIT gap at the 1088-token align-cache boundary.
+  Warm the actual copy signature before readiness; separately warm the
+  full benchmark shape before measuring it.
+- Configuration: commit a2cd7a240, same recipe v1 and 1000/300 recommended
+  sampling, three predetermined starts x three repetitions x c1/c8/c16.
+  All 27 measurements retained. Original native binaries and original
+  sampler stayed loaded throughout this series; later sampler source work
+  did not change these running processes. Native hashes, package versions,
+  CPU affinity and per-round GPU clocks are in summary.json.
+- Results: E2E median 156.397 / 576.570 / 776.288 tok/s; full ranges
+  156.169-156.593 / 573.234-578.967 / 770.200-777.792. These are effectively
+  unchanged steady-state results against 156.111 / 576.305 / 775.444.
+  The cold c1 outlier is absent from this series.
+- Correctness: every boot passed text and image canaries; all 225 measured
+  requests returned exactly 300 tokens. All workers log copy warmup before
+  the JIT monitor/readiness boundary. This validates the startup path;
+  smoke canaries do not qualify broader model quality, and the known
+  small-k sampler distribution defect is still present in these numbers.
+- Decision: retain the origin-level warmup and the full-workload harness.
+  Continue sampler correction and graph-latency diagnosis independently.
+- Raw: perf/results/2026-09-08/warmup-boundary/summary.json, per-request
+  JSON (including warmups), per-boot server logs and all-rank traces.

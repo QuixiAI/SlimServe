@@ -1919,6 +1919,29 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 startup-copy warmup recheck - 2026-09-08
+
+Commit a2cd7a240, same verified recipe and sampling as the fixed-start
+baseline below. Three predetermined starts, three repetitions at c1/c8/c16,
+all 27 measurements retained. The startup hook warms the production
+align-cache copy kernel before health; shape warmups now generate the full
+300-token workload. Native binaries and sampler remained unchanged during
+this series.
+
+| Concurrency | E2E output tok/s median [min, max] |
+| ---: | ---: |
+| 1 | 156.40 [156.17, 156.59] |
+| 8 | 576.57 [573.23, 578.97] |
+| 16 | 776.29 [770.20, 777.79] |
+
+Every start passed text/image canaries and every measured request had exact
+token counts. The cold c1 outlier is absent in this series, and the copy
+warmup is logged before readiness. This validates the startup fix on the
+real profile; it is not evidence of a steady-state speedup or broader model
+quality. The old sampler issue and persistent graph-launch latency remain
+separate outstanding work. Raw: perf/results/2026-09-08/warmup-boundary/
+(summary.json, all requests/warmups, server logs and all-rank traces).
+
 ### RTX6000 fixed-start baseline - 2026-09-08
 
 Commit 143e18073, registered TP4 no-spec profile and verified
