@@ -20841,3 +20841,29 @@ The single-request 1000-token prefill (step 1) is 131 ms in this boot: custom AR
 
 **Record (mhcpf-rec1, 2026-09-08 10:52, first ab.sh boot of the mHC-prefill tree, fast/fast: in-step idle 0.181, busy 5.176; `env -u NCCL_P2P_DISABLE`, no-spec, 1000/300, pass 1 / pass 2).** c1 164.3 / **164.7**, c8 577.4 / **575.7**, c16 770.8 / **764.8**; gate -2.476. Against p2p-rec2 (163.1 / 556.1 / 728.9): c1 +1.0%, c8 +3.5%, c16 +4.9%. **New record: 164.7 / 575.7 / 764.8 tok/s; the c8 bar (740) is 78% covered.** Raw: perf/results/2026-09-08/mhcpf-rec1-pass{1,2}.
 
+
+### 2026-09-08 NCCL tuning over PCIe P2P (after the record env landed)
+
+Arms through ttft_probe (prefill ms is the reading; NCCL variables are not compile-key factors, so the boots are warm), each on top of the record env (NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS). Reference on this tree: c8 prefill 532-549 ms, c16 873-875 (mhcpf-on); the reduce is 91 x 1.85 ms RING_LL per 7001-token step.
+
+- **NCCL_ALGO=Tree (nccl-tree): boot failed** ("NCCL error: invalid usage" at communicator init in every worker); Tree is rejected on this 4-GPU PCIe configuration. Dead arm.
+- **NCCL_MIN_NCHANNELS=8 NCCL_MAX_NCHANNELS=8 (nccl-ch8): no effect.** Fast/fast boot (busy 5.162, idle 0.178): c1 164.2 / 164.4 (prefill 144 / 113 ms), c8 581.0 / 578.8 (prefill 544 / 527), c16 771.3 / 765.4 (prefill 866 / 869); gate -2.469. A second fast-state sample of the record tree (164.7 / 575.7 / 764.8): the fast-boot spread is ~0.5%.
+- **NCCL_PROTO=Simple (nccl-simple2): no effect.** Mixed-state boot (front end fast, custom AR slow: busy 5.479): c1 155.6 / 156.1 (prefill 282 / 112), c8 563.9 / 565.9 (prefill 548 / 532), c16 755.3 / 755.8 (prefill 874 / 876); gate -2.478.
+
+**Read: the reduce is at the wire.** Per 7001-token site the ring moves 2 x 3/4 x 57 MB = 86 MB through each GPU's PCIe link in 1.85 ms: 46 GB/s per direction, the practical Gen5 x16 rate. Protocol, algorithm and channel count cannot move it; only fewer bytes (a narrower reduce dtype, which is a numerics change) or overlapping the reduce with compute (micro-batch pipelining of the prefill chunk on two streams) can. The remaining 28% of the prefill step is therefore parked as a physics item; the plan's prefill levers move on to the pooled indexer, the sparse MLA prefill kernel and the FP4 expert GEMM. Decision: all three arms REJECTED; the record env stays NCCL_P2P_DISABLE=0 NCCL_P2P_LEVEL=SYS alone.
+
+
+### 2026-09-08 FP4 tensor-core experts (CUTLASS sm120 NVFP4 grouped GEMM, W4A4): REJECTED as-is
+
+Arm: the routed experts on the tree's CUTLASS sm120 NVFP4 grouped GEMM (`csrc/libtorch_stable/quantization/fp4/nvfp4_blockwise_moe_kernel.cu`, built for 12.0f; `torch.ops._C.cutlass_fp4_group_mm` through `CutlassExpertsFp4`, profile field `moe_backend: "cutlass"` -> VLLM_CUTLASS) instead of Marlin W4A16: activations quantized to NVFP4 per call, the GEMM on the FP4 tensor cores. One factor; the profile edit was scoped to the glm53-nvfp4-4 rtx6000 block and restored after the run (fp4_cutlass_chain.sh, trap-restored profiles.json.bak). The new VLLM_* value opened a cold compile/Triton cache: pass-1 c1 TTFT 24.0 s is the JIT, not a reading.
+
+Served (fp4-cutlass, ttft_probe, boot 11:09, `env -u NCCL_P2P_DISABLE`, no-spec, 1000/300, pass 1 / pass 2; reference mhcpf-on on the same tree minus the arm, slow-state boot: 155.6 / 564.6 / 751.3, c8 prefill 532-549 ms, c16 873-875):
+
+- aggregates c1 113.3 / 116.8, c8 468.5 / 469.5, c16 659.9 / 653.7 tok/s: -25% / -17% / -13%;
+- prefill c1 121.5 ms (pass 2), c8 898 (cold) / 569, c16 936 / 938: +7% at c8 and c16;
+- state: busy 5.173 -> 6.868 ms (+33%), in-step idle 0.676 (slow front end), launch latency 253 us;
+- gates -2.4377 twice, bit-identical between the two runs: the W4A4 path is deterministic run to run, and in band (-2.407..-2.478), so the quality of the activation quantization is not the problem.
+
+Decode attribution of the arm's profiled step (step_attrib.py on profile-state-fp4-cutlass): busy 7.95 ms over 1789 launches (1243 on Marlin); the "other" class is 3.14 ms over 572 launches (the per-call activation quant, scale/permute glue and the grouped GEMM itself), fp8 decode GEMM 1.59, mHC 0.77. The grouped GEMM at decode M is a launch chain, not a tensor-core problem; at prefill M (7001 tokens over 8 requests, ~200 rows per expert per rank) it is still slower than Marlin's ~25%-of-rate W4A16, so the kernel's sm120 tile configuration or its glue dominates there too.
+
+**Decision: REJECTED as-is; `moe_backend` stays marlin.** The FP4 tensor-core route stays on the list as a kernel-writing item, not a switch: a purpose-built grouped GEMM with the activation quant fused into its prologue and a tile set chosen for ~200-row groups, plus a decode path that does not pay the per-call quant (Marlin's GEMV, or a plain-layout FP4 GEMV so the weights are not resident twice). Until then the prefill levers are the pooled indexer (next), the sparse MLA prefill walk and the fp8 blockwise GEMM.
