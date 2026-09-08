@@ -1175,7 +1175,8 @@
       ],
       "format": "safetensors",
       "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
-      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/main",
+      "revision": "36c184c6cda000a481711306df5adde42f63321a",
+      "base_url": "https://huggingface.co/RedHatAI/GLM-5.3-Flash-NVFP4/resolve/36c184c6cda000a481711306df5adde42f63321a",
       "local_dir": "GLM-5.3-Flash-NVFP4",
       "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
       "speculator": {
@@ -2714,6 +2715,23 @@
         "rtx6000": {
           "platform": "rtx6000",
           "default_quant": "NVFP4",
+          "weight_recipe": {
+            "id": "glm53-redhatai-nvfp4-fp8-kda-tp4-v1",
+            "description": "RedHatAI group-16 NVFP4 routed experts; native FP32 router/KDA/mHC repairs; native block-FP8 dense/shared/DSA weights; self-quantized block-FP8 KDA projections; BF16 KV and target vocabulary head.",
+            "local_dir": "GLM-5.3-Flash-NVFP4-FP8-KDA-TP4",
+            "target_revision": "36c184c6cda000a481711306df5adde42f63321a",
+            "native": {
+              "repo": "zai-org/GLM-5.3-Flash",
+              "revision": "3f1971b7b5f7a528c9c4ef6212c8785298a8c24a",
+              "local_dir": "GLM-5.3-Flash"
+            },
+            "tp_size": 4,
+            "artifact_digests": {
+              "f32-overrides.safetensors": "1c55137b1724151218d92c06735a16dbc9d9e3b7cdabd5c2ddfc842d8881f2e4",
+              "fp8-swapset.safetensors": "27e8aaf0e3cc3517c0e40622f176b3734924a0944bc0959c9eac3d3a6e74b327",
+              "fp8-swapset.json": "2f5fca340d60153ce80f9491db4167d7cf6fb2e8b8e32b35b3a0d2f21b29d1fb"
+            }
+          },
           "engine": {
             "tensor_parallel_size": 4,
             "enable_expert_parallel": false,

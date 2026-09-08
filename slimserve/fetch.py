@@ -220,6 +220,11 @@ def ensure(plan: Plan, assume_yes: bool = False) -> None:
     if plan.quant.assembly:
         _assemble(plan)
 
+    if plan.weight_recipe:
+        from slimserve.weight_recipe import ensure
+
+        ensure(plan)
+
 
 def _confirm() -> bool:
     try:

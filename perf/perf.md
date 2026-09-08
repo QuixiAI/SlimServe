@@ -20,6 +20,12 @@ live in `perf/baseline_status.md`. Raw benchmark output belongs under
   geometry, staging, quant decode, routing threshold, or scheduling policy.
 - Record rejected ideas. A rejected measurement is useful if it prevents the
   same detour later.
+- Choose the number of starts and repetitions before measuring. Retain slow
+  starts and failed runs, report the median and spread, and diagnose startup
+  variability. Restarting until a fast result appears is not a baseline.
+- Match timing definitions before comparing stacks: complete-request output
+  TPS includes prefill, while sustained decode TPS does not. Report TTFT and
+  decode separately, with identical prompts, sampling, and cache conditions.
 - Compare platforms deliberately. When ROCm, Metal, or CUDA has an optimized
   path, study its algorithm, layout, and fusion choices before implementing the
   next platform.

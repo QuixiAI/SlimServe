@@ -156,6 +156,7 @@ class Plan:
     # Variant-level drafter when platforms diverge; falls back to the
     # source-level speculator.
     variant_speculator: dict[str, Any] | None = None
+    weight_recipe: dict[str, Any] | None = None
 
     @property
     def speculator(self) -> dict[str, Any] | None:
@@ -171,6 +172,8 @@ class Plan:
         if self.source.get("format") == "safetensors":
             # A safetensors checkpoint is a directory of shards plus config
             # and tokenizer files; the engine takes the directory itself.
+            if self.weight_recipe:
+                return cache_root() / self.weight_recipe["local_dir"]
             return self.model_dir
         if self.quant.assembly:
             return self.model_dir / self.quant.assembly["output"]
@@ -270,6 +273,7 @@ def _merge_platform(profile: dict[str, Any], platform: str) -> dict[str, Any]:
         # A record may enable or disable speculation for its platform alone
         # (glm53-nvfp4-4: MTP validated on rtx6000 first, a100 stays off).
         "speculative": record.get("speculative"),
+        "weight_recipe": copy.deepcopy(record.get("weight_recipe")),
     }
 
 
@@ -411,6 +415,7 @@ def resolve(
         chat_template_kwargs=dict(profile.get("chat_template_kwargs") or {}),
         notes=merged["notes"],
         variant_speculator=merged["speculator"],
+        weight_recipe=merged["weight_recipe"],
     )
 
 

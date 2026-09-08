@@ -1919,6 +1919,27 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 audit - 2026-09-08: selected best versus repeated baseline
+
+The latest optimized tree recorded 165.7 / 591.9 / 797.4 aggregate output
+tok/s at c1/c8/c16 (1000 input, 300 output, temperature 1, top-p .95,
+top-k 20). This was start 4, selected for its faster execution state. The
+other three starts produced 156.8 / 580.1 / 777.2, 156.4 / 579.6 / 775.7,
+and 156.7 / 579.5 / 782.0. Keep all four as observations; the best is not
+a reproducible baseline. Raw: perf/results/2026-09-08/mlapf-rec{1,2,3,4}-pass2/.
+
+The B12X R24 published 169.9 / 737.8 figures use context-zero sustained
+decode and a different checkpoint/KV format. Ratios against this complete-
+request harness are not controlled comparisons. Likewise, "APC-hot" in the
+historical row below means warmed kernels only: its 1000-token prompts are
+shorter than the hybrid profile's 1088-token prefix-cache block.
+
+The RTX6000 registry now selects the named RedHatAI NVFP4 + FP8 KDA TP4
+recipe with pinned input revisions and verified sidecars. A new fixed-count
+startup series must establish its median, spread, and separate prefill/decode
+timings. The recipe preserves the measured weights; it does not claim a new
+speedup or broader quality qualification.
+
 ### RTX PRO 6000 Blackwell (sm_120) TP4 Exact Baseline - 2026-09-04 (bring-up record, a100 kernel set)
 - Record: glm53-nvfp4-4 / rtx6000 variant (TP4 over PCIe, Marlin W4A16
   NVFP4 experts, QUIXICORE_MLA_SPARSE + sparse_mla_force_mqa, bf16 KV,

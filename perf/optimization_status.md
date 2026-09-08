@@ -21024,3 +21024,50 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 **Numerics.** The bit-level path multiplies bf16(e2m1 * 2^-126) by bf16(scale * 2^118) exactly (<= 7 significant bits) before the mma, so the kernel's products equal Marlin's; only the accumulation order differs.
 
 **Decision.** Parity with Marlin at c1 and 10-20% behind at c8 is not a kernel to ship. To beat Marlin the kernel needs what Marlin has: persistent blocks whose cp.async ring runs across item boundaries, balanced stream-K partitioning of the byte stream over the 188 SMs (fp32 fixup for split items), and the down projection's items pipelined the same way; gate/up + SiLU + down + top-k weighting can then share one launch per layer with a per-expert ready counter. The payoff is bounded: at c1 the whole Marlin class is 1.11 ms of the 6.05 ms step against a 0.66 ms wire floor, so a kernel at 85% of the wire saves ~0.35 ms/step (+6% c1); at c8 Marlin is already at 88% and the same design can at best match it. Not built in this pass; the prototype, bench and outputs are under perf/results/2026-09-08/nvfp4-expert-proto/.
+
+## 2026-09-08: Quant identity and benchmark reproducibility audit
+
+- Status: implementation and preparation validated; new live baseline pending.
+- Scope: glm53-nvfp4-4 / rtx6000, TP4, existing optimized weights and kernels.
+- Baseline: the selected mlapf-rec4 start recorded 165.7 / 591.9 / 797.4
+  complete-request tok/s. Starts 1-3 were 156.8 / 580.1 / 777.2,
+  156.4 / 579.6 / 775.7, and 156.7 / 579.5 / 782.0. Selecting the fastest
+  start does not establish a repeatable serving baseline.
+- Corrections: B12X's published R24 C1/C8 numbers are sustained context-zero
+  decode, not our 1000/300 complete-request harness. Its checkpoint and KV
+  format differ. Acceptance alone does not identify the sampling policy.
+  Expert bandwidth estimates assume routing; measure actual routed experts
+  and traffic before calling the kernel physically optimal.
+- Current reference: [B12X R28](https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm-5.3-flash.md),
+  published 2026-09-08, documents its workload and
+  [public source mirror](https://github.com/voipmonitor/b12x/tree/integration/glm-fp8-checkpoint-serving-20260908).
+  Keep R24 as historical evidence and benchmark a pinned current artifact
+  under matched conditions before making a comparative speed claim.
+- Change: the record owns recipe glm53-redhatai-nvfp4-fp8-kda-tp4-v1.
+  Target revision 36c184c6cda000a481711306df5adde42f63321a and native
+  revision 3f1971b7b5f7a528c9c4ef6212c8785298a8c24a match the local download
+  provenance used for the campaign. The recipe pins the three derived
+  artifact digests (tensor descriptors and payload, excluding host paths),
+  isolates sidecars from original shards, refuses disabled/mismatched
+  artifacts, and prepares missing ones through the existing builders.
+- Origin fix: the builders previously globbed their own sidecars alongside
+  the source shards. A second build could therefore mistake derived FP32 or
+  FP8 tensors for original checkpoint tensors and omit them. Read the shard
+  index, with explicit MTP support, and exclude derived outputs in unindexed
+  fixtures. No tensor arithmetic changed.
+- Method: benchmarks/benchmark_glm53_campaign.py starts the real profile a
+  predetermined number of times, warms each shape, retains every request
+  and failed start, and reports the median/range. It records streaming token
+  IDs so first-token latency and subsequent decode exclude the entire first
+  chunk (including multi-token speculative chunks), separately from E2E
+  throughput. Sampling is temperature 1 / top-p .95 / top-k 20. Text and
+  image canaries run each start; traces run after the timed measurements.
+  Shutdown signals only the process group owned by that run.
+- Correctness: profile/builder tests passed (88); current sidecars passed
+  all recipe digests and were prepared through the profile's download-only
+  path. This establishes unchanged derived tensors, not a new end-to-end
+  quality result. The existing sampler tie deviation and the small scoring
+  gate remain outstanding; no broader quality qualification is implied.
+- Throughput: no new measurement yet; these changes claim reproducibility,
+  not speed. Next is a fixed three-start, three-repeat c1/c8/c16 series.
+- Raw baseline: perf/results/2026-09-08/mlapf-rec{1,2,3,4}-pass2/.

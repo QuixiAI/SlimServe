@@ -53,7 +53,21 @@ _DTYPES = {
 def _headers(model_dir: str) -> dict[str, tuple[dict, str, int]]:
     """name -> (header entry, shard path, data section offset)."""
     out: dict[str, tuple[dict, str, int]] = {}
-    for shard in sorted(glob.glob(os.path.join(model_dir, "*.safetensors"))):
+    index = Path(model_dir) / "model.safetensors.index.json"
+    if index.is_file():
+        names = set(json.loads(index.read_text())["weight_map"].values())
+        # The MTP shard ships outside the target's index.
+        if (Path(model_dir) / "model_mtp.safetensors").is_file():
+            names.add("model_mtp.safetensors")
+        shards = [str(Path(model_dir) / name) for name in sorted(names)]
+    else:
+        shards = sorted(glob.glob(os.path.join(model_dir, "*.safetensors")))
+        shards = [
+            path
+            for path in shards
+            if Path(path).name not in {OVERRIDES_FILE, "fp8-swapset.safetensors"}
+        ]
+    for shard in shards:
         with open(shard, "rb") as fh:
             n = struct.unpack("<Q", fh.read(8))[0]
             header = json.loads(fh.read(n))

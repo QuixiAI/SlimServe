@@ -10,7 +10,7 @@ added 2026-09-04.
   3. MI300X GGUF profile record                       -- third section
 -->
 
-# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (updated 2026-09-08 evening; record 165.7 / 591.9 / 797.4 no-spec = 98% / 80% of the B12X bar; MTP k=1 and the decode-shaped expert kernel probed, neither adopted)
+# HANDOFF - GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120), branch glm53-flash-sm120 (2026-09-08: reproducibility audit and campaign continuation)
 
 ## Mission
 
@@ -29,23 +29,34 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-Goal: exceed B12X R24 on this hardware by as much as possible, compared
-like for like under the serving policy (sampling at the model's
-recommended settings, never greedy). The fair bar is B12X no-spec on the
-exact-token harness at 1000/300: **c1 169.9 / c8 737.8**. Its MTP-3
-figures (247.8 / 903.2 at 2.50 accepted per step) imply greedy-like
-acceptance; our drafter accepts 84% greedy but 42.5% under the policy
-sampling, so those are a different workload until B12X is measured the
-same way. The same B12X image on this box, handicapped (CUDA 13.3 image
-on the 580 driver, PCIe all-reduce off), gave 134.0 / 483.7 / 598.6.
+Goal: exceed the strongest reproducible B12X result on this hardware under
+matched workloads and the model's recommended sampling. The historical R24
+figures (169.9 / 737.8 no-spec, 247.8 / 903.2 MTP-3 at c1/c8) are sustained
+context-zero decode, NOT this repository's 1000/300 complete-request TPS.
+Do not divide one by the other or infer greedy sampling from acceptance
+alone. B12X also uses a different NVFP4 checkpoint and FP8 KV. The local
+R24 control (134.0 / 483.7 / 598.6 no-spec) did use our exact-token harness,
+but disabled P2P because its CUDA 13.3 image failed on the host driver.
+R28 is now published with public source mirrors; see the 2026-09-08 audit
+entry in perf/optimization_status.md. A matched current control remains owed.
+
+The operator authorized autonomous continuation and incremental commits on
+2026-09-08. The selected RTX6000 weight recipe is now explicit in the
+registry: glm53-redhatai-nvfp4-fp8-kda-tp4-v1. It pins the original RedHatAI
+and native ZAI revisions, the FP32 repairs, and the FP8 swap-set including
+self-quantized KDA. It prepares an isolated directory and verifies sidecar
+tensor digests before serving; it must not silently fall back to BF16.
 
 Record (rtx6000 profile, no-spec, fast/fast boot, 2026-09-08 12:29, run
 mlapf-rec4): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is
-98% / 80% of the bar and +58% / +37% / +35% over the Phase 0 baseline
+the best of four starts, NOT a repeatable baseline, and +58% / +37% / +35%
+over the Phase 0 baseline
 (104.8 / 431.4 / 591.0). Every retained lever has a notebook entry with
 its A/B (perf/optimization_status.md, 2026-09-04 through 2026-09-08).
 
-What the bar needs, per round of the harness:
+Historical target arithmetic below assumes the published decode bar applies
+to our complete-request harness. That assumption is false. These are rough
+optimization budgets, not demonstrated B12X gaps or physical ceilings:
 
 - c1: 300 tokens in 1.77 s. Today 0.10 s prefill + 300 x 5.7 ms cadence
   (6.05 ms profiled) = 1.81 s. The step must reach 5.56 ms: -0.15.
@@ -143,10 +154,14 @@ swap-set sidecar without shared down; NCCL_PROTO=Simple; custom AR caps
 of 64 / 128 MiB (superseded by P2P); the mHC last-block mode (neutral,
 kept as a diagnostic); MTP k=1 and the Phase 4 prototype (above).
 
-Method that holds: one factor per A/B; kernel decisions on the profiler
-pair's kernel-busy; exact-token records only from fast/fast boots (in-step
-idle < 0.3 ms, custom AR busy < 5.3 ms at c8), boots retried until one
-lands; gate band -2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
+Current method: one factor per A/B, a predetermined number of starts and
+repeats, every result retained, median and spread reported. Never restart
+until a fast boot appears or exclude a run because it is slow. Startup
+variability is an unresolved correctness-of-measurement issue to diagnose.
+Profile attribution informs hypotheses; only matched serving measurements
+establish a throughput win. The expert-bandwidth estimates below assume
+near-uniform routing and are not measured DRAM traffic. Gate band
+-2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
 non-deterministic); gates per plan section 4 (exact-token within the band
 or better, NLL + needle within 0.03 nats); a notebook entry for every
 result including rejections. A traced Python edit or a new VLLM_* value

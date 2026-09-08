@@ -248,6 +248,9 @@ def _show(plan: Plan) -> None:
     else:
         print(f"  platform  {registry.platform_title(plan.platform)} x{plan.gpus}")
     print(f"  model     {plan.entry_file}")
+    if plan.weight_recipe:
+        print(f"  recipe    {plan.weight_recipe['id']}")
+        print(f"  weights   {plan.weight_recipe['description']}")
     for key, value in sorted(plan.engine.items()):
         print(f"  {key:<9} {value}")
     if plan.speculative:
