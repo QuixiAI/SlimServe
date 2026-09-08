@@ -300,8 +300,11 @@ class quixicore_ops:
         top_p: torch.Tensor | None,
         noise: torch.Tensor,
     ) -> torch.Tensor:
-        """Top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with
-        caller-drawn exponential noise [B, 32]; int64 token ids [B]."""
+        """Top-k (<=32, all ties kept), stable-order top-p, and sampling.
+
+        Caller noise is fp32/fp64 [B, V], indexed by vocabulary ID. Top-p
+        sorts ascending by (logit, ID). Returns int64 token IDs [B].
+        """
         return _qc().topk_sample(logits, top_k, top_p, noise)
 
     @staticmethod

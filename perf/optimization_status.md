@@ -21146,3 +21146,63 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Continue sampler correction and graph-latency diagnosis independently.
 - Raw: perf/results/2026-09-08/warmup-boundary/summary.json, per-request
   JSON (including warmups), per-boot server logs and all-rank traces.
+
+## 2026-09-08: Small-k sampler keeps all ties and preserves noise precision
+
+- Status: implementation, kernel correctness and sanitizer checks pass;
+  real-profile fixed-start recheck is next. This is a correctness repair,
+  not a measured speedup over the previously incorrect small-k sampler.
+- Baseline: warmup-boundary, 156.397 / 576.570 / 776.288 E2E tok/s. Its
+  sampler retained at most 32 candidates even when the kth cutoff had
+  more ties, changed their probability mass, and narrowed requested FP64
+  exponential noise to FP32. Previous tests excused tied-case mismatches.
+- Change: candidate windows now identify thresholds only. Each partition
+  counts omitted cutoff ties, the merge computes full nucleus mass, and a
+  vocabulary-wide pass samples every retained ID. Top-p uses an explicit
+  ascending (logit, token ID) order. Noise is [batch, vocabulary], indexed
+  by ID, retaining FP32/FP64 precision. This changes seeded streams from
+  the previous 32-draw implementation; historical completions need not match.
+- Numeric boundary: an initial FP32 cutoff and a GPU FP32 reference disagreed
+  on an all-tied half-vocabulary boundary. Analytic checks also exposed
+  rounding of 1-p in the kernel. The one-warp nucleus calculation now uses
+  FP64; tests use an independent CPU FP64 mass oracle and exact uniform
+  boundaries. This is not a claim of bitwise equality to PyTorch's unstable
+  tie ordering or FP32 reduction roundoff. No tied case is exempted from
+  the equality assertions. Invalid NaN/Inf dummy rows return an in-range
+  ID without NaN-to-integer cutoff arithmetic; their distribution is undefined.
+- Correctness: all 60 sampler tests pass, including all k=1..32, ties
+  exceeding the entire candidate window, local partition overflow, odd
+  vocabulary sizes, strided rows, signed zero, masked rows, FP64-noise
+  discrimination, seeded repetition and graph replay with changed inputs.
+  Full-suite memcheck and racecheck with the CPU oracle report zero errors
+  and zero hazards. The final combined run passes 314 tests: sampler,
+  decode GEMM/MLA/mHC/MoE, route/align, SlimServe profiles/recipe/harness,
+  graph analysis and startup-copy warmup.
+- Microbenchmark: V=154880, k=20, p=.95, fixed FP32 noise, three rounds
+  of 100 calls, all nine output comparisons pass. Normal-logit CUDA-graph
+  medians at batch 1/8/16: 22.67 / 24.63 / 30.78 us versus
+  166.17 / 395.21 / 477.98 us for a stable-order full-sort FP32 PyTorch
+  reference. Native eager medians: 26.84 / 26.82 / 32.99 us. All-tied
+  native graph medians: 34.87 / 34.87 / 42.97 us. These exclude noise
+  generation and are not serving TPS or a qualification of the fallback.
+- Build provenance: regenerated the relocated native build cache in a new
+  build directory. Pin both the CUDA compiler and toolkit roots to 13.0;
+  CUDA_HOME alone selected 13.2 headers here. Reused installed Torch and
+  existing disconnected dependency sources; rebuilt only _quixicore_C
+  for sm_120f. Original native binary is retained in the raw directory.
+  New SHA256: 256e4f70e305dc92e3fecfac409b5ddcec78de8f0ef54e4fd1d30b31797fd99b.
+- Separate open finding: unfiltered racecheck with a GPU probability oracle
+  reported PyTorch ReduceOp shared-memory hazards. A standalone [3,154880]
+  FP64 sum/argmax reproduces under sanitizers 2025.3.1 and 2026.1.1 without
+  SlimServe; [1,154880] does not. Outputs in that minimal case are correct.
+  Do not dismiss it as tool noise or claim observed corruption. The installed
+  Reduce.cuh global-reduce path reuses shared storage between block-y and
+  block-x reductions; inspect the boundary against the precedent in
+  [PyTorch #162995](https://github.com/pytorch/pytorch/pull/162995).
+  The CPU oracle avoids making our validation depend on that open finding;
+  it does not fix the serving dependency. No installed Torch files changed.
+- Raw: perf/results/2026-09-08/sampler-exact/ contains build logs, initial
+  failed tests, final tests, full and targeted sanitizer logs, standalone
+  PyTorch reproductions, original binary and microbench.json. Next command:
+  benchmark_glm53_campaign.py with the same source, --boots 3 --repeats 3
+  --traces, writing a new sampler-serving run directory.

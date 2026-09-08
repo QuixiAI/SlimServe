@@ -420,16 +420,11 @@ def apply_top_k_top_p_pytorch(
     return logits.scatter_(dim=-1, index=logits_idx, src=logits_sort)
 
 
-# Small-k kernel path (QuixiCore ``topk_sample``): when every request's top_k
-# is at most SMALL_TOPK_WINDOW, two launches select each row's top-32 logits
-# (multi-block radix select), apply the masks of apply_top_k_top_p_pytorch
-# (k-th value ties kept; smallest tokens dropped while their cumulative mass is
-# <= 1 - p, the largest kept), take the softmax over what is left and pick
-# argmax(prob / noise) with exponential noise drawn here by torch's (seeded)
-# generators, one draw per candidate. Same sampling distribution as the
-# full-vocabulary path; the seeded streams differ (32 draws per row, not V).
-# Measured 2026-09-07 on GLM-5.3-Flash (V = 154880, rtx6000): the fused
-# Triton kernel + full softmax cost ~180 us per step at any batch size.
+# Small-k kernel path: candidate windows find thresholds, but never limit
+# the set of sampled tokens or discard kth-value tie mass. Nucleus ordering
+# is ascending (logit, token ID), deterministic even where torch.sort's
+# default unstable equal-key order is not. Draw one exponential per vocabulary
+# ID, preserving its precision, just as in the full-vocabulary random sampler.
 SMALL_TOPK_WINDOW = 32
 
 
@@ -450,9 +445,9 @@ def small_topk_sample(
 ) -> torch.Tensor:
     from vllm.quixicore.ops import quixicore_ops
 
-    batch = logits.shape[0]
+    batch, vocab = logits.shape
     q = torch.empty(
-        (batch, SMALL_TOPK_WINDOW),
+        (batch, vocab),
         dtype=torch.float64 if use_fp64_gumbel else torch.float32,
         device=logits.device,
     )
@@ -460,8 +455,6 @@ def small_topk_sample(
         q.exponential_()
     for i, generator in generators.items():
         q[i].exponential_(generator=generator)
-    if q.dtype != torch.float32:
-        q = q.float()
     return quixicore_ops.topk_sample(
         logits.float() if logits.dtype != torch.float32 else logits,
         k.to(torch.int32),

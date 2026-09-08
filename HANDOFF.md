@@ -81,8 +81,17 @@ indexer 0.23. c1 6.05: fp8 1.90, Marlin 1.11,
 mHC 0.76, AR 0.45, cuBLAS gemv 0.44 (the bf16 lm_head GEMV is 0.2 of it),
 norms 0.30, other 0.29, bf16 decode GEMM 0.25, indexer 0.20.
 
-Immediate work: correct sampler ties/FP64 noise and isolate startup graph
-latency. The live state-copy startup warmup is validated. Then revisit these
+The sampler tie/FP64 repair is implemented and kernel-tested (60 tests,
+zero memcheck/racecheck findings with an independent CPU oracle), with a
+fixed-start serving recheck next. It retains every cutoff tie, defines a
+stable token-ID nucleus order and uses vocabulary-indexed FP32/FP64 noise.
+Seeded output streams change from the old 32-draw implementation. Raw:
+perf/results/2026-09-08/sampler-exact/. A separate PyTorch reduction race
+report reproduced in isolation remains under investigation; see the notebook.
+
+Immediate work: serving validation of the sampler, the PyTorch reduction
+report, and startup graph latency. The live state-copy warmup is validated.
+Then revisit these
 kernel candidates with one-factor experiments and fixed-count serving runs.
 The savings below are hypotheses, not measured remaining headroom:
 
