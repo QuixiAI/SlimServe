@@ -224,9 +224,15 @@ def _expand_topk_kernel(
     tail_count = vis - n_pools * KP
     tail_start = n_pools * KP
     n_sel = tl.minimum(n_pools, KSEL)  # top-k writes valid pools first
+    # Only the selected slots are written here; the tail store and the
+    # padding loop below own the columns from n_sel * KP on. Threads of one
+    # program are not ordered against each other, so a slot written by two
+    # stores keeps whichever lands last: writing -1 over [0, KSEL * KP) here
+    # raced the tail store and dropped the tail (often the query's own
+    # token) from a fraction of rows.
     for s0 in range(0, KSEL, BLOCK_S):
         s = s0 + tl.arange(0, BLOCK_S)
-        smask = s < KSEL
+        smask = s < n_sel
         pool = tl.load(sel_ptr + r.to(tl.int64) * sel_stride + s, mask=smask, other=-1)
         ok = smask & (pool >= 0) & (pool < n_pools)
         m = tl.arange(0, KP)
@@ -249,6 +255,20 @@ def _expand_topk_kernel(
 
 
 # --------------------------------------------------------------------- core op
+
+
+def _prefill_row_req(chunk, R: int) -> torch.Tensor:
+    """Block-table row of each query row of a prefill chunk. A request's
+    rows are contiguous and in block-table order, and all of them carry
+    the request's row start in `cu_seqlen_ks`, so a request begins
+    wherever ks changes. (`chunk.token_to_seq` is indexed by KV token, not
+    query row: a request with a cached prefix or an earlier chunk has more
+    KV tokens than query rows, and reading it by row shifts every request
+    after it onto the wrong block-table row.)"""
+    ks = chunk.cu_seqlen_ks[:R]
+    new_req = torch.ones(R, dtype=torch.int32, device=ks.device)
+    new_req[1:] = ks[1:] != ks[:-1]
+    return torch.cumsum(new_req, 0, dtype=torch.int32) - 1
 
 
 def _pooled_select(
@@ -338,7 +358,7 @@ def glm5_next_pooled_indexer(
             if R <= 0:
                 continue
             visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
-            row_req = chunk.token_to_seq[:R].to(torch.int32)
+            row_req = _prefill_row_req(chunk, R)
             max_pools = max(1, chunk.max_seq_len // kp)
             logits = torch.empty(
                 (R, max_pools), dtype=torch.float32, device=q.device
