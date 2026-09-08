@@ -5,6 +5,40 @@ This file holds stable baseline snapshots for comparison. Raw outputs belong in
 
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
+### 4x RTX 3090 - qwen38fn-nvfp4-4 concurrency record - 2026-09-08 (32 seqs, dynamic k, int8 tiles to 128 rows)
+
+- Record: max_num_seqs 32, max_cudagraph_capture_size 64, util 0.97,
+  main_kv_gpu_rows 40, kv_pool_deep_requests 2.0 (two resident 262K
+  requests kept), num_speculative_tokens_per_batch_size [[1,8,2],[9,32,1]].
+  Code: int8 skinny tiles to 128 rows (6dccba415); the tier zero-op and
+  residency flush fixes (2c3ccda82); ring-staged residency tables.
+- Workload: exact 1,000 input / 2,000 output tokens, temp 1.0 / top_p 0.95
+  / top_k 20, seed 42, port 8001 on GPUs 4-7, clean boot
+  (perf/results/2026-09-07/scale/, leg rec97).
+
+| Concurrency | Aggregate tok/s | verify-steps/s | Running |
+| ---: | ---: | ---: | ---: |
+| 1 | 145.6 | 13.40 ms/step | 1 |
+| 8 | 603.3 | 277.9 | 8 |
+| 16 | 813.1 | 450.7 | 16 |
+| 32 | 757.5 | 424.1 | 16 |
+
+- With four image requests in flight during c16: 790.0 tok/s, canaries
+  4/4. Chat oracle (identical prompts, fresh vs resume, 3 seeds) 6/6 after
+  the benches; 0 errors; residency bookkeeping 1.05 ms/step.
+- vs the 2026-09-06 record (8 decode slots; c8 557 / c32 549 measured
+  live on production 2026-09-07): c16 +46%, c32 +38%; c1 and c8 within
+  the run-to-run band. c32 == c16 because the slab pools admit 16 chat
+  requests at k=2 demand; 32 hot requests need ~2.6 GiB of per-request
+  GPU state against 1.4 GiB (docs/host_resident_kv_design.md, scaling
+  campaign; the GDN single-slot replay is the owed lever).
+- Chat-optimised alternative, not the record: kv_pool_deep_requests 1.0
+  with 64 hot rows: c16 902.6 / c32 826.9 at one resident 262K request.
+- Correctness gates (chat oracle with VLLM_KV_TIER_VERIFY=1): mixed
+  resume, resume after churn, 108K - 18/18 on this record and 18/18 on
+  the previous record's configuration; tier acceptance 3/3; recall in
+  one fresh request at 54K/144K/216K.
+
 ### 4x RTX 3090 - qwen38fn-nvfp4-4 first validated record - 2026-09-06 (host-resident main KV @ native 262K)
 
 - nvidia/Qwen3.8-Flash-Next-NVFP4 (ModelOpt mixed: NVFP4 experts via

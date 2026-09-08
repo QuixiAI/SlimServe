@@ -20792,3 +20792,37 @@ restart is the operator's call.
   errors; the new record (32 seqs, capture 64, util 0.965, 40 rows,
   dynamic k, with the tiles, the flushed_to fix and the event-guarded
   persistent staging) - the same 18/18 and the same clean counters.
+- Numbers with the fixes, first attempts: (1) on the verification
+  instance (VLLM_KV_TIER_VERIFY=1 left on) c1 measured 15.62 ms/step -
+  the slot digests and the row check are not free; never bench with
+  verify on. (2) On a clean boot: c1 13.40 ms/step (in band), c8 251.5
+  verify-steps/s (-7% vs 271.8 on this configuration before the fixes),
+  c16 343.2 (-24% vs 450.3). Cause: the event-guarded staging waited on
+  the PREVIOUS step's copy before rewriting its one pinned buffer; under
+  window thrash at c16 (64 rows of demand vs 40) rows change every step,
+  so the host synchronized with the GPU every step and lost the
+  scheduling overlap. Fixed with an 8-deep ring of staging buffers (the
+  wait lands on the copy from 8 steps ago); numbers rerun on a clean boot.
+- With the staging ring (clean boot, util 0.965): c1 13.37 ms/step, c8
+  634.8 tok/s (286.7 verify-steps/s - the sync cost is gone), c16 639.2
+  (343.4) - still -24% vs 450.3, and the log says why: 13 running, not
+  16. util 0.965 shrinks the GDN slot pool from 150 to 125 blocks (the
+  0.5% is 0.12 GiB = 25 blocks = 3 chat requests at k=2 demand). Not a
+  code cost. Record decision: back to util 0.97 (799 / 761 with 16
+  running, canaries 4/4 under load, oracle 18/18); the first-image
+  allocator retries at 0.97 are recoverable and stay noted. Numbers at
+  0.97 on the final code rerun for the baseline.
+- util 0.965 data point, complete (final code, clean boot): c1 146.9
+  (13.37 ms/step), c8 634.8 (286.7 verify-steps/s), c16 639.2 (343.4)
+  at 13 running, images under c16 4/4 at 611.1 tok/s, c32 676.3 (371.1)
+  at 13 running, post-bench oracle 6/6, 0 errors, residency 0.742
+  ms/step. The first-image allocator retries (48) appear at 0.965 as
+  well, so the lower utilization never bought the headroom it was meant
+  to; 0.97 is the record.
+- FINAL numbers, util 0.97, final code, clean boot (leg rec97): c1 145.6
+  tok/s (13.40 ms/step), c8 603.3 (277.9 verify-steps/s), c16 813.1
+  (450.7) at 16 running, images under c16 4/4 at 790.0, c32 757.5
+  (424.1) at 16 running, post-bench oracle 6/6, 0 errors. Baseline
+  snapshot updated; record committed. Owed next: the GDN single-slot
+  replay (design doc) to reach 32 hot requests; the LL128 question for
+  the collectives; the residency bookkeeping vectorization.

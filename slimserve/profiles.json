@@ -2791,12 +2791,12 @@
             "tensor_parallel_size": 4,
             "enable_expert_parallel": true,
             "max_model_len": 262144,
-            "max_num_seqs": 8,
-            "gpu_memory_utilization": 0.975,
+            "max_num_seqs": 32,
+            "gpu_memory_utilization": 0.97,
             "kv_cache_dtype": "fp8",
             "compilation_config": {
               "cudagraph_mode": "FULL_DECODE_ONLY",
-              "max_cudagraph_capture_size": 24
+              "max_cudagraph_capture_size": 64
             },
             "reasoning_parser": "qwen3",
             "tool_call_parser": "qwen3_xml",
@@ -2812,12 +2812,12 @@
               "kv_connector": "HostTierConnector",
               "kv_role": "kv_both",
               "kv_connector_extra_config": {
-                "host_tier_gb_per_rank": 12,
+                "host_tier_gb_per_rank": 4.0,
                 "nvme_tier_gb_per_rank": 448,
                 "main_kv_host_resident": true,
-                "main_kv_gpu_rows": 24,
+                "main_kv_gpu_rows": 40,
                 "main_kv_sub_blocks": 8,
-                "main_kv_tier_gb_per_rank": 76,
+                "main_kv_tier_gb_per_rank": 76.0,
                 "kv_pool_deep_requests": 2.0
               }
             },
@@ -2842,7 +2842,20 @@
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
           },
           "speculative_overrides": {
-            "index_share_for_mtp_iteration": true
+            "index_share_for_mtp_iteration": true,
+            "num_speculative_tokens": 2,
+            "num_speculative_tokens_per_batch_size": [
+              [
+                1,
+                8,
+                2
+              ],
+              [
+                9,
+                32,
+                1
+              ]
+            ]
           },
           "notes": [
             "Serves the model's native 262,144-token context on 4x 24 GB cards through the three-tier redesign (docs/host_resident_kv_design.md, validated 2026-09-06): the 13 QSA main-KV layers live in pinned host rows read by the sparse gather over PCIe (kv_connector_extra_config main_kv_host_resident), with main_kv_gpu_rows 24 hot rows for the blocks being written and main_kv_sub_blocks residency rows per scheduler block (13 x 976-token rows at the 12,688-token block the indexer page sizes). Weights take 21.08 of 22.97 GiB per card at util 0.975; the packed slab (indexer, ring, GDN) charges a max-length request 0.37 GiB and the pool holds 531,186 tokens = 2.03 max-length requests of GPU-resident state; the main KV itself needs ~6 GiB of pinned host rows per rank. Gates passed 2026-09-06: marker recall at 54K/144K/243K tokens, multi-turn tracking 3/3, image canary, 0 server errors; exact 1000/2000 c1 120.1 / c8 361.7 tok/s.",
@@ -2850,11 +2863,12 @@
             "enable_expert_parallel stays a correctness requirement: the drafter's block-128 FP8 expert scales cannot split moe_intermediate_size 640 across 4 ranks (160 per rank is not a multiple of 128), so EP keeps 128 whole experts per rank for both the NVFP4 main experts and the FP8 MTP experts (group-16 NVFP4 would split cleanly on its own; glm53f-nvfp4-4 measured TP experts 4-6% faster than EP on the Marlin NVFP4 path, an A/B that would need a per-layer parallelism split here).",
             "Sized for ONE instance on GPUs 0-3 with the other four cards free (operator 2026-09-06). Host tiers per rank: 12 GiB of slab rows (host_tier_gb_per_rank: indexer pages, ring, GDN tails; 1,190 blocks = 15M tokens) plus 76 GiB of main-KV tier slots (main_kv_tier_gb_per_rank, milestone 4: one 84.5 MB slot per 12,688-token block, reserved when the block is allocated so the residency demotes straight into it, flushed once the block fills, and REBOUND onto a resumed conversation's new block ids with no copy; 921 slots = 11.7M tokens of resumable conversation) - 352 GiB pinned across 4 ranks, the same total the 8-rank FP8 record validated, plus ~6 GiB/rank of residency pool rows. NVMe tier 448 GiB/rank holds slab rows only for now: a trajectory carrying main-KV slots is deleted rather than demoted to disk (milestone 4b: main slots on NVMe). Validated 2026-09-06 (port 8001, small tiers, 12 x 55K churn): tier hits fire after eviction and marker recall at 8K/24K/42K is correct on the rebound rows; a 42K conversation resumes in 4.6 s vs 11.3 s cold, while shallow ones (< 2 blocks) gain little because the 12,688-token block sets the resume granularity.",
             "Main QSA KV is fp8 (float8_e4m3fn) through kv_cache_dtype fp8 as on the FP8 record (operator 2026-09-02; NOT TurboQuant). Without host residency this checkpoint's GPU pool caps the context near 46-60K tokens (boots 2-3, 2026-09-06: 0.52-0.77 GiB free after 20.59 GiB of weights vs 2.02 GiB for one 262K request); the host-resident main KV is what makes the native context possible here.",
-            "max_num_seqs 8 with max_cudagraph_capture_size 24 (3 x 8 at MTP k=2): every running request charges the packed slab ~9 rows x 10.56 MB (attention, ring, and the GDN align-mode state blocks - fp32 SSM state is 812 KB per layer at TP4), so the pool admits ~5 concurrent requests at any context; a larger hot window (64 rows) or more sequences only shrink that (measured: 64 rows -> 2 running, -35% c8). The 24-row window keeps a short-context batch of 5 x 4 rows resident; deep history is gathered from host rows at ~25 GB/s (PCIe 4.0).",
+            "max_num_seqs 32 with max_cudagraph_capture_size 64 and dynamic speculation (num_speculative_tokens_per_batch_size [[1,8,2],[9,32,1]]: k=2 up to 8 running, k=1 above, so a full decode batch is at most max(8x3, 32x2) = 64 query tokens and stays inside the graph set; 2026-09-07 scaling campaign). At k=2 sixteen running requests are 48 rows per step and every kernel leaves its cheap regime (int8 route, collectives, Marlin), so the step doubled 8 -> 16 running; at k=1 the rows halve and the lost draft token is repaid twice over (c16 581 -> 888 tok/s). The packed slab pools (kv_pool_deep_requests 2.0: pool 0 keeps two resident 262K requests, the GDN/ring/PLE classes get equal chat concurrency from the rest) admit ~16 chat requests at k=2 demand and more at k=1. Measured on port 8001 (perf/results/2026-09-07/scale/): c1 162, c8 595, c16 799, c32 761 tok/s at 16 running, against the previous record's 557 at c8/c32 (8 decode slots).",
             "VLLM_QWEN4_EXP_SKINNY_GEMM=1 routes the bf16 decode projections (GDN QKVZ/BA/out, QSA QKV/o/indexer, hyper-connection mixers, router, shared expert, MTP fc, lm_head: 483 linears, 12 per-rank shapes at TP4) through the weight-stationary split-K Triton kernels in vllm/models/qwen4_exp/nvidia/skinny_gemm_sm86.py at decode token counts <= 32 (cuBLAS above, and for the shared-expert gate/up below M=24 where cuBLAS is faster). Validated 2026-09-07 on port 8001 (perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/): decode step 16.81 -> 15.81 ms at c1 (-5.8%), verify-steps/s +0.9% at c8 and +3.5% at c32, 0 errors; deep marker recall PASS at 18K/54K/144K, image canary PASS, tier restores PASS at 3/4/6 blocks. The env var is registered in vllm/envs.py so it is part of the torch.compile cache key: an unregistered switch left a cached decode graph on cuBLAS (the census showed only the attention projections routed). Judge c1 changes on ms/step (bench wall / spec_decode_drafts): tok/s at c1 swings 100-155 with the drafter's acceptance draw.",
             "mamba_ssm_cache_dtype bfloat16 + kv_pool_deep_requests 2.0 (2026-09-07 loop, E-GDN + E5b): the GDN temporal state is stored bf16 (page 812,032 -> 418,816 B per layer per rank; deep marker recall PASS at 18K/54K/144K, image canary PASS, tier restores PASS at 3/4/6 blocks), and the packed slab is split into one block pool per page-size class - attention/indexer 10.56 MB blocks, the three 12-layer GDN groups 5.03 MB, the 1-layer GDN group 225 KB, the compressor ring 29 KB - so a chat request stops charging an attention-sized slot for each of its 12 GDN pages (running state + 2 speculative rollback slots per group). kv_pool_deep_requests sizes the attention pool to hold that many max-length requests (2.1x here, the same deep capacity as the single pool) and gives the rest to the other classes at equal chat concurrency (~8). Measured on port 8001 (perf/results/2026-09-07/qwen38fn-nvfp4-4-opt/): c8 430.5 tok/s (194.6 verify-steps/s, +17% vs the 2026-09-07 baseline), c32 507.8 (230.2, +27%), c1 unchanged at 15.25 ms/step; 0 errors. c32 cannot go past ~8 running here because at 8 running the rollback slots alone are 320 MB of the 0.81 GiB pool. The tier connector registers every pool's backing (per-group strides; boundary-state lookups and pins go to each state group's own pool - the 1-layer GDN group lives in a different pool than the 12-layer ones).",
             "int8 weight-only dense route (E8, 2026-09-07): VLLM_QWEN4_EXP_SKINNY_W8=1 stores the seven large skinny-routed bf16 linears (GDN/QSA projections, MTP fc, lm_head) as int8 with per-row group-32..128 fp16 scales after loading; the decode kernel streams half the bytes (lm_head 371 -> 202 us). Measured on this box vs the bf16 route: c1 15.0 -> 13.5 ms/step, c8 194 -> 280 verify-steps/s, c32 231 -> 259; prompt-logprob parity vs the bf16 build over 25.7K tokens: PPL +0.1..0.4%, mean |dlogprob| 0.16 vs the 0.13 run-to-run floor, top-1 agreement 93.0% vs 94.0%, no per-text shift; recall 18K/54K/144K, image canary and tier restore pass. The seven small (<=7 MB) shapes are latency-bound and stay bf16.",
-            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (2026-09-07): at 0.975 utilization the caching allocator fragmented (772 MiB reserved-but-unallocated) after variable-size prompt-logprob transients and a later prefill OOM'd on a 128 MiB scoring buffer; VMM segments close that. vLLM's connector guard exempts HostTierConnector (stream-ordered copies on live tensors, no NIC registration)."
+            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (2026-09-07): at 0.975 utilization the caching allocator fragmented (772 MiB reserved-but-unallocated) after variable-size prompt-logprob transients and a later prefill OOM'd on a 128 MiB scoring buffer; VMM segments close that. vLLM's connector guard exempts HostTierConnector (stream-ordered copies on live tensors, no NIC registration).",
+            "gpu_memory_utilization 0.97 (not 0.975) and main_kv_gpu_rows 40 (2026-09-07/08): the 64-size graph set and the per-step transients at 16 running need ~0.35 GiB of headroom that 0.975 left to the profiler's activation reservation (an OOM in the PLE short conv at c8 with the 96-size set at 0.975). 0.965 was tried for the vision encoder's first-run transient (48 recoverable allocator mapping retries on the first image after boot at 0.97, none under load) and rejected: it costs 25 GDN slot blocks = 3 chat requests (13 running instead of 16, c16 639 vs 799 tok/s). 40 hot rows hold the active main KV of ~10 chat requests at 976 tokens per row and the sparse gather reads the rest over PCIe; the trade against the GDN slot pool is measured in the notebook (48-64 rows funded by kv_pool_deep_requests 1.0 give c16 903 / c32 827 at one resident 262K request; the record keeps two)."
           ]
         }
       }

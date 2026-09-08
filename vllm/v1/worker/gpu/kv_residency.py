@@ -40,6 +40,7 @@ _ACTIVE: "MainKVResidency | None" = None
 
 
 _VERIFY = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
+_STAGE_RING = 8  # pinned staging buffers in flight before a reuse waits
 
 
 def get_main_kv_residency() -> "MainKVResidency | None":
@@ -371,6 +372,10 @@ class MainKVResidency:
             # where rows change every step): stage through persistent
             # pinned buffers, waiting on the previous step's copies before
             # they are rewritten.
+            # Ring of pinned buffers: the wait lands on the copy issued
+            # _STAGE_RING steps ago (a wait on the previous step's copy
+            # serialized the host with the GPU every step under window
+            # thrash: c16 -24%, 2026-09-08).
             stage = self._staging(2 * max(len(changed), 1))
             ev = stage.get("event")
             if ev is not None:
@@ -461,7 +466,12 @@ class MainKVResidency:
         """Persistent pinned host buffers for the per-step table updates
         (grown geometrically; the previous step's copies are drained
         through the recorded event before the buffers are rewritten)."""
-        cur = getattr(self, "_stage", None)
+        ring = getattr(self, "_stage_ring", None)
+        if ring is None:
+            ring = [None] * _STAGE_RING
+            self._stage_ring = ring
+        slot = self.step % _STAGE_RING
+        cur = ring[slot]
         if cur is None or cur["idx"].numel() < n:
             cap = max(n, 2 * self.gpu_rows, 64)
             if cur is not None:
@@ -472,7 +482,7 @@ class MainKVResidency:
                 k: torch.empty(cap, dtype=torch.int64, pin_memory=True)
                 for k in ("idx", "val", "idx2", "val2")
             }
-            self._stage = cur
+            ring[slot] = cur
         return cur
 
     def stats(self) -> dict[str, int]:

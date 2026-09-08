@@ -931,7 +931,22 @@ def test_full_decode_graphs_cover_the_largest_speculative_batch():
                 )
             else:
                 source_note = f"the pinned {capture}"
-            needed = (k + 1) * max_num_seqs
+            if schedule:
+                # Dynamic speculation: the largest decode batch is the
+                # largest (k+1) x batch over the schedule's inclusive
+                # ranges (capped at max_num_seqs), not the static k on
+                # every sequence (qwen38fn-nvfp4-4 2026-09-07: k=2 up to 8
+                # running, k=1 above -> max(3 x 8, 2 x 32) = 64).
+                needed = max(
+                    (entry[2] + 1) * min(int(entry[1]), max_num_seqs)
+                    for entry in schedule
+                )
+                static_upto = max_num_seqs
+                covered = max(int(entry[1]) for entry in schedule)
+                if covered < max_num_seqs:
+                    needed = max(needed, (k + 1) * static_upto)
+            else:
+                needed = (k + 1) * max_num_seqs
             if (profile_id, platform) in _CAPTURE_BAND_EXEMPT:
                 band, why = _CAPTURE_BAND_EXEMPT[(profile_id, platform)]
                 assert capture >= (k + 1) * band, (
