@@ -864,8 +864,10 @@ batch (32 tokens at B <= 8, 64 above): 0.35 -> 0.13 ms/step at c1.
 Record now (fast/fast state, no-spec, 1000/300): 162.8 / 534.5 / 691.0
 tok/s; the c8 bar (740) was 72% covered. With the NCCL P2P env (below)
 the fast/fast record was 163.1 / 556.1 / 728.9 (p2p-rec2, 2026-09-08
-10:26); with the mHC prefill kernel (below) it is **164.7 / 575.7 /
-764.8** (mhcpf-rec1, 10:52): the c8 bar (740) is 78% covered.
+10:26); with the mHC prefill kernel (below) it was 164.7 / 575.7 / 764.8
+(mhcpf-rec1, 10:52); with the pooled-indexer prefill path (below) it is
+**165.2 / 585.1 / 780.7** (idx-rec3, 11:51): the c8 bar (740) is 79%
+covered.
 
 Prefill, found 2026-09-07 22:40 (notebook "Prefill attribution at c8"):
 the bars are measured on 1000-in / 300-out requests whose prefill is
@@ -904,6 +906,20 @@ bit-exact. Served: c8 prefill 644-678 -> 532-549 ms, c16 1101-1106 ->
 gates in band. Remaining prefill levers: FP4 grouped GEMM at M >= 64
 (Marlin at ~25% of the tensor-core rate), the sparse MLA prefill walk,
 the pooled indexer, the fp8 blockwise GEMM; re-attribution queued.
+
+Prefill third lever, done 2026-09-08 11:37 (notebook "Pooled indexer
+prefill: pooled keys once per request, tiled tensor-core scoring"): the
+DSA indexer's prefill rows no longer re-pool every visible pool per row
+(52 ms of the 599 ms c8 step); pooled keys are built once per request and
+scored as a tiled tensor-core matmul. Served, same-tree control: c8
+prefill 532 -> 487 ms (-8.4%), c16 876 -> 799 (-8.8%), gates in band. Two
+correctness bugs found by its parity test were fixed first (a tail-store
+race in the top-k expansion that dropped the query's own token from 1-2%
+of rows, and a KV-indexed row -> request map that was wrong after a
+prefix-cached request). Remaining prefill levers: the sparse MLA prefill
+walk (63 ms on the decode kernel), the fp8 blockwise GEMM (61), Marlin
+at M >= 64 (112, needs a purpose-built FP4 grouped GEMM: the CUTLASS
+sm120 backend as wired lost 7% prefill and 13-25% decode).
 
 ### Phase 2: fixed overhead (the single-stream lever)
 

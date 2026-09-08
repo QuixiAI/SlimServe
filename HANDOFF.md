@@ -247,6 +247,29 @@ physics, research digest and phase gates are in
    Engine cadence (itl-A): 12.1 ms/step at c8 and 17.5 at c16 in steady
    decode = the profiled steps plus boot state plus context growth; no
    hidden host cost. The c8 bar needs prefill + 300 x step <= 3.24 s.
+2h. Pooled indexer prefill DONE 2026-09-08 11:37 (notebook "Pooled indexer
+   prefill: pooled keys once per request, tiled tensor-core scoring"):
+   prefill chunks score through `_pooled_logits_by_request` in
+   vllm/model_executor/layers/glm5_next_indexer.py (pool keys once per
+   request, tiles of 8 rows that never straddle a request, a [256, 128] x
+   [128, 64] tl.dot with the relu / head-weight epilogue; no host sync;
+   decode rows keep the per-row kernel). Kill switch for A/B only:
+   VLLM_GLM5_INDEXER_PREFILL_MATMUL=0. Isolated 4.48 -> 0.50 ms per call
+   at the c8 shape; served pass 2 vs the same-tree control: c8 prefill
+   531.8 -> 487.1 ms, c16 875.7 -> 798.8, aggregates 165.4 / 585.2 / 781.8
+   (fast/fast), gates -2.448 / -2.472 (control -2.466 / -2.439). Two
+   correctness fixes landed first (f47d4ed32): the expansion kernel raced
+   its tail store (1-2% of rows lost the tail pool, often the query's own
+   token; every gate before this was measured with it, band unchanged so
+   far) and the prefill row -> request map read the KV-indexed
+   token_to_seq (wrong after a prefix-cached request). Compile-cache
+   gotcha: editing a traced Python file opens a new torch-compile cache
+   hash, so pass 1 of the next boot is cold at every shape; quote pass 2.
+   Fast/fast boot idx-rec3: NEW RECORD 165.2 / 585.1 / 780.7 (c8 bar 79%
+   covered), gate -2.461. Next prefill lever: head-batched sparse MLA
+   prefill in `forward_mqa` (quixicore_mla_sparse.py; 63 ms of the ~555
+   ms c8 step on the decode walk; prototype /raid/scratch/slimserve-glm53/
+   mla_prefill_dev.py), then fp8 blockwise (61), Marlin at M >= 64 (112).
 3. FP8 swap-set part 3 (notebook, 20:20): the JIT extension used for the
    retained numbers ran the shared gate_up at 8 stages while the committed
    table said 4 (an edit after the JIT build); natively the 4-stage config
