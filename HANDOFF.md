@@ -6,6 +6,7 @@ of origin/main and were joined rather than reconciled.
 
   1. NVFP4-on-Metal campaign (M1 Ultra / M5 Max)  -- section below
   2. MI300X GGUF profile record                   -- second section
+  3. GLM-5.3-Flash on 8x A100 (glm53f-*)          -- third section, at EOF
 -->
 
 # HANDOFF — NVFP4-on-Metal campaign (updated 2026-08-25; CAMPAIGN COMPLETE through UPDATE 55 — PR #12 open, origin/main merged and re-gated bit-exact, QuixiCore-Metal port landed)
@@ -1402,3 +1403,182 @@ is ignored in this build and it will loop emitting prompts.
   temporary-widening script all session before being corrected — don't.
 - Ask the user about facts he already knows (was this artifact validated, what
   did that campaign run) instead of spending GPU runs deriving them.
+
+---
+
+# HANDOFF — GLM-5.3-Flash on 8x A100 (`glm53f-nvfp4-4` / `glm53f-nvfp4-8`), updated 2026-09-08
+
+## One-paragraph state
+
+GLM-5.3-Flash (`glm5_next`: 34 KDA linear layers + 11 pooled-indexer sparse
+MLA layers + mHC residual streams + 288-expert NVFP4 MoE) serves on 8x A100
+through `slimserve glm53f-nvfp4-8 --serve`. The record is maximized for this
+box: model-default 1,048,576 context on three KV tiers (VRAM 3.17M tokens,
+72 GiB/rank pinned host, 256 GiB/rank disk), `max_num_seqs` 64, EP off.
+Text + image + tool canaries pass, the forced-eviction tier acceptance is
+clean (0/106 byte mismatches, promotion from disk exercised), and the
+WildChat deep-context leg passes (33/33 recall to 204K, 0 errors). Everything
+described here is committed and pushed to `main`. The campaign's live problem
+is **TP scaling**, which is below the repo's hard gate — see Open items #1.
+
+**Naming:** the Flash records are `glm53f-*`. Plain `glm53` reads as the 743B
+GLM-5.3, which shares GLM-5.2's dense-MLA architecture and is a different
+model. Renamed 2026-09-06 (operator). **Raw artifact paths under
+`perf/results/` predate the rename** and are still spelled `glm53-nvfp4-*`.
+
+## Measured baselines (all through the real profiles)
+
+Harness: `benchmarks/benchmark_dsv4_exact.py`, 1000 in / 300 out,
+temperature 1.0 / top-p 0.95 / top-k 20, seed 42, warmed per concurrency.
+Aggregate output tok/s.
+
+| record | c1 | c8 | c16 | c32 | c64 |
+|---|---|---|---|---|---|
+| `glm53f-nvfp4-8` (maximized, 2026-09-06) | 83.8 | 402.6 | 562.1 | 750.0 | 931.9 |
+| `glm53f-nvfp4-4` (2026-09-03, pre-tier)  | 73.8 | 332.1 | 464.6 | -- | -- |
+| `glm52-q2k-8` (2026-09-06)               | 72.5 | 166.5 | 223.1 | -- | -- |
+| `glm52-q2k-4` (2026-09-06)               | 31.7 | 93.7  | 115.6 | -- | -- |
+
+GLM-5.3-Flash beats GLM-5.2 at every concurrency (+16% c1, ~2.5x c8/c16);
+that is the architecture (only 11 of 45 layers touch KV) plus NVFP4 Marlin
+MoE vs Q2_K. Raw: `perf/results/2026-09-06/` and `2026-09-03/`.
+
+## Open items, ranked
+
+1. **TP scaling is below the repo's hard gate — the live problem.**
+   CLAUDE.md requires TP8 >= 1.5x TP4. Measured: 83.8 vs 73.8 at c1 = **+14%**
+   (c8/c16 ~ +21%). GLM-5.2 on the same box is a healthy 2.3x, so this is
+   specific to `glm5_next`, not the machine. Cause is measured, not guessed:
+   per-rank work that does not shrink with rank count. TP8 profile at
+   1000-token context (`perf/optimization_status.md`, 2026-09-03 entry) puts
+   the TP-invariant residue at ~3.3 ms of ~12 ms/token: mHC 1.35, pooled
+   indexer 0.72, custom allreduce 0.65, `direct_copy` 0.53.
+   Ranked fixes (gain / effort), already written up in the notebook:
+   1. ~150 `direct_copy` launches/token — `contiguous()`/view copies around
+      the mHC op wrappers and q/idx staging in the sparse backend (~0.5 ms, easy).
+   2. Pooled indexer at 65 us for a 250-pool context, should be ~15 us
+      (q/APE preload dominates; one tile per program) (~0.5 ms).
+   3. mHC **channel ownership** as DSV4 does it (`VLLM_DSV4_TP_OWNERSHIP`:
+      each rank transitions 4096/TP channels, transition fused into the
+      allreduce) — up to 1.2 ms, deep integration.
+   4. M=1 GEMV chain: 280 cuBLAS launches/token is launch-bound; fusable per
+      layer (q_a+kv_a already fused; KDA's in_proj/f_b/g_a/g_b are four).
+   **Do NOT re-try the plain fused allreduce+mHC transition op** — it was
+   implemented, measured (85.5/421 vs 84/413 = noise) and REJECTED 2026-09-03,
+   because the mHC math stays replicated on every rank. DSV4's win comes from
+   ownership (#3), not from merging the two kernels.
+
+2. **`glm53f-nvfp4-4` carries an unvalidated tier config.** The record now
+   states `host_tier_gb_per_rank: 72` / `nvme_tier_gb_per_rank: 256` (bumped
+   alongside the -8 record on 2026-09-06) but has **never been booted with
+   them** — its only profile validation (`perf/results/2026-09-03/
+   glm53-nvfp4-4-baseline/`) predates the tier being enabled on it at all.
+   It is also still at `util 0.85` / `max_num_seqs 16` (maximizing was scoped
+   to the -8 record). Next: boot it, run the canaries + exact bench, and run
+   the eviction acceptance; then decide whether to maximize it too.
+
+3. **MTP speculative decoding is unported.** The checkpoint ships an MTP head
+   at layer 45; `glm5_next.py` skips it at load. The upstream GLM-5.3 recipe
+   runs `--speculative-config.method mtp --num_speculative_tokens 5`. This is
+   the largest single-stream win still on the table. Follow the DSpark/MTP
+   precedent already in-tree for other profiles.
+
+4. **Tier restores are not exercised by the deep-context leg.** With 8
+   sessions at ~180K against a 3.17M-token VRAM pool, nothing evicts, so the
+   leg shows 228 boundary-state saves and ZERO restores (same as GLM-5.2's
+   TP8 leg). That is expected, not a bug. Restore evidence comes only from
+   `benchmarks/benchmark_kv_tier_eviction.py`, which forces eviction. If you
+   want restores under a realistic leg, shrink the pool or raise session count.
+
+5. **Follow-ups inherited, still open:** window-tail staging for DSV4's
+   sliding-window groups (its tier stays write-only by design until then);
+   MI300X connector generalization (issues #17/#18).
+
+## Verification recipes (copy-paste)
+
+```bash
+# Fast gate after ANY change (no GPU contention, ~25 s total)
+cd ~/SlimServe
+.venv/bin/python -m pytest tests/slimserve/test_profiles.py -q          # 63
+CUDA_VISIBLE_DEVICES=7 VLLM_KV_TIER_VERIFY=1 .venv/bin/python -m pytest \
+  tests/v1/core/test_kv_tier_index{,_disk}.py \
+  tests/v1/core/test_host_tier_connector{,_disk}.py \
+  tests/v1/worker/test_kv_tier_{dma,dma_disk,nvme}.py \
+  tests/v1/worker/test_kv_residency.py -q                               # 60
+CUDA_VISIBLE_DEVICES=7 .venv/bin/python -m pytest \
+  tests/kernels/test_quixicore_sparse_mla_bf16.py \
+  tests/glm5_next/test_pooled_indexer_parity.py -q                      # 14
+
+# Full profile validation (boot + text/image/tool canaries + exact bench)
+bash ~/.local/scratch/glm53/validate_today.sh glm53f-nvfp4-8
+
+# Tier acceptance (the ONLY thing that proves restores)
+export VLLM_KV_TIER_VERIFY=1 VLLM_KV_TIER_LOG_MISS=1 \
+       SLIMSERVE_KV_TIER_DIR=/home/ubuntu/.local/scratch/kv-tier
+bash ~/.local/scratch/glm53/tier_accept.sh <tag> <pool_tokens> 40000
+# PASS = "0/N restores mismatched" AND non-zero "host-tier: hit for" lines.
+
+# Deep-context leg (1.25 h)
+RESULTS_DATE=$(date +%Y-%m-%d) RESULTS_TAG=glm53f-leg \
+  bash ~/.local/scratch/a100-sweep/run_one.sh glm53f-nvfp4-8
+```
+
+## Traps that cost real time in this campaign (each one burned hours)
+
+- **Rebuild `_quixicore_C` after any merge that touches `csrc/`.** A merge
+  changed `post_update`'s pybind signature; the stale `.so` killed a boot at
+  the sampler with "incompatible function arguments".
+  `cmake --build build/temp.linux-x86_64-cpython-312 --target _quixicore_C -j$(nproc)`
+  then copy the `.so` into `vllm/`.
+- **Raw `api_server` launches need `--enable-prefix-caching` explicitly.**
+  vLLM defaults it **OFF** for hybrid (mamba/GDN) models. A tier acceptance
+  "passed 6/6" with ZERO tier activity — full re-prefill. `slimserve --serve`
+  always passes it; check `vllm:cache_config_info` in `/metrics`.
+- **Never A/B a compiled path with a private env var.** The compile cache key
+  hashes `envs.compile_factors()` (a fixed VLLM_* list) + config + traced file
+  contents. An env-gated branch inside a compiled forward does **not** change
+  the key, so the "off" arm silently loads the "on" arm's graph. A/B via
+  distinct code (git stash / worktree) instead. See memory
+  `compile-cache-ab-hazard`.
+- **Marker recall alone NEVER proves the tier.** Evidence is the connector's
+  hit/restore/promotion counters plus `kv-tier verify` lines. Also: at
+  temperature 1.0 the model may *refuse* the planted markers on policy
+  ("I didn't store that code") — check `in_reasoning` and the reply text
+  before calling it corruption.
+- **The verify tool itself was wrong four times** while the data was bit-exact
+  (host-slot-keyed digests, submission-time digests that predate the copy
+  event, live-length lookup racing the same way, sha1 vs sha256 across the DMA
+  and IO thread). Before trusting a mismatch count, run the 3-second
+  `tests/v1/worker/test_kv_tier_dma_disk.py::test_verify_digest_survives_promotion`.
+- **`safekill`, never `pkill -f`.** `~/.local/scratch/bin/safekill <pattern>`;
+  a `-f` pattern your own command contains matches the shell wrapper and kills
+  the turn. For GPU teardown, `nvidia-smi --query-compute-apps=pid` + kill by PID.
+- **Never flatten a packed KV view.** `reshape(-1)` on the packed cross-layer
+  slab silently COPIES the whole layer cache per call (this was costing
+  GLM-5.2 most of its throughput). Address pages by block stride; the sparse
+  entry points take `page_stride_bytes`.
+- **Warm every concurrency before measuring.** An unwarmed arm read TP8 at
+  10 tok/s purely from cold Triton autotune inside the measured window.
+
+## Design notes worth reading before touching the tier
+
+Hybrid page-size unification widens the smaller-page group's block: the
+indexer group (512 B/token) gets 2176-token blocks beside the MLA group's
+1088 at TP4 (576/1152 at TP8) while the scheduler hashes at the gcd. The
+connector therefore keeps **per-group block ratios** — a group is staged and
+restored only where its block completes, and resume boundaries align to the
+ratios' lcm (`HostKVTierIndex.due(i)`, `_resume_align`). A 58-op restore at
+TP4 = 36 MLA + 18 indexer + 4 KDA state pages; 106 at TP8 = 68 + 34 + 4.
+
+## Scripts and raw artifacts
+
+- Scripts: `~/.local/scratch/glm53/` — `validate_today.sh` (profile boot +
+  canaries + bench), `tier_boot2.sh` (raw boot, `HOST_GB`/`NVME_GB`),
+  `tier_accept.sh`, `max8_validate.sh`, `proflong.sh` (torch profiler at real
+  context), `write_max_records.py`, `bench_nope.py` (kernel microbench).
+- Leg runner: `~/.local/scratch/a100-sweep/run_one.sh`.
+- Raw results: `perf/results/2026-09-0{3,4,6}/` (pre-rename `glm53-*` names).
+- Notebook: `perf/optimization_status.md` (2026-09-03 through 09-06 entries);
+  baselines: `perf/baseline_status.md`.
+- Memory files that matter here: `glm53-flash-bringup`,
+  `kv-tier-hybrid-lessons`, `compile-cache-ab-hazard`, `safekill-not-pkill`.
