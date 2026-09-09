@@ -6,6 +6,17 @@ from benchmarks.kernels import benchmark_glm53_mhc_storage as probe
 from benchmarks.kernels.benchmark_glm53_mhc_storage import exact, lossless_bf16
 
 
+@pytest.mark.parametrize("indices", [[], [-1], [90], [0, 0]])
+def test_sanitizer_site_selection_rejects_invalid_indices(indices):
+    with pytest.raises(ValueError, match="distinct indices"):
+        probe.selected_check_sites(indices)
+
+
+def test_sanitizer_site_selection_defaults_to_exhaustive_census():
+    assert probe.selected_check_sites(None) == list(range(90))
+    assert probe.selected_check_sites([0, 89]) == [0, 89]
+
+
 def test_storage_conversion_requires_exact_checkpoint_values():
     value = torch.tensor([0.0, -1.0, 0.125, 1e-20], dtype=torch.bfloat16).float()
     assert torch.equal(lossless_bf16(value).float(), value)

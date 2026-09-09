@@ -23018,3 +23018,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   owned-group-lifecycle.log retains it. Corrected invocation adds benchmarks
   to sys.path. The separate paired mHC probe builds successfully using its
   module entrypoint; the initial direct-script import failure is also retained.
+
+## 2026-09-08: Paired BF16 mHC staging passes the exhaustive isolated gate
+
+- Status: promising isolated candidate; no serving integration/default change.
+  Native probe SHA b8597c7fc9b143549ca4bbdb4df233065e9f549c64ba7be92a2c32461a74f786,
+  CUDA13.0/sm120f, source3880f9201. All7020 prescribed actual-site cases pass
+  bit-for-bit, including signed zero and changed graph inputs, against installed
+  FP32/BF16 paths. Another2160 correctness cases pass during the timing run.
+- Five fixed A/B/A rounds, four replays/phase, all540 site calls per graph;
+  six distinct fn banks424673280bytes (3.164xL2). Both arms use BF16 fn
+  and unchanged FP32 math. Six immutable activation sets bound memory; this
+  does not simulate full-model dependency/cache behavior.
+- A/B/A2 median microseconds per site: batch64 17.449/15.146/17.458,
+  batch128 18.252/16.032/18.239, batch129 18.372/16.215/18.367,
+  batch7616 648.280/618.567/649.817. Median paired throughput differences
+  +15.265/+13.786/+13.302/+4.938%. The large batch drifts upward in all
+  phases; retain every sample and use the paired controls, not best times.
+  No end-to-end serving gain is claimed from these isolated rates.
+- Peak capture allocation5.782GB at7616 rows, host cap16GiB/no swap.
+  Paired pre/fused variants retain40/80 registers, zero stack/local bytes;
+  no resource growth versus scalar BF16. All native serving files unchanged.
+- Bounded sanitizer option --check-sites is allowed ONLY with --check-only;
+  timings still require all90 sites.13 CPU helper tests pass. Unfiltered
+  memcheck: all48 actual-site cases at sites0/89, three magnitudes, pre/fused,
+  batches64/65/129/7616 pass and report zero errors. Race/sync checks follow.
+- Raw: perf/results/2026-09-08/runtime-control/mhc-storage-paired-{check,
+  timing}.{json,log}, mhc-storage-paired-resources.txt, mhc-paired-memcheck*
+  and mhc-paired-selection-tests.xml. Earlier import-only failed build attempt
+  remains in mhc-storage-paired-build.log; module build succeeds without any
+  source workaround. No competing GPU or native build during timing.
+
+### Precreated graphs reproduce the missing second Nsight range
+
+- The existing model-free lifecycle probe built its second graph AFTER the
+  first capture. A new explicit --prebuild-graphs mode instantiates both
+  before any range, matching serving's batch-size graph lifetime.
+- Same32-node/four-replay/one-round tiny diagnostic: all six oracle phases
+  pass. First range has4 runtime launches and4 graph spans; second has4
+  runtime launches but0 graph spans and0 ordinary kernels. This reproduces
+  missing graph activities without model kernels or multiple GPUs. It does
+  not imply the GPU failed to run the graph or establish overhead magnitude.
+- Keep the old lifecycle evidence, but its graph-creation order did not
+  qualify this serving condition. Further collection should use one range
+  per model process unless the repeated-range limitation is resolved. A
+  prescribed model-free before/between/return control remains to confirm the
+  creation-order factor; do not change serving graph topology to feed a tool.
+- Raw: runtime-control/nsys-prebuilt-graphs{.log,.1.nsys-rep,.2.nsys-rep,
+  .1.sqlite,.2.sqlite,-analysis.json} and nsys-prebuilt-graphs-results/.

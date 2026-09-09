@@ -46,6 +46,7 @@ def run(args):
         "replays": args.replays,
         "rounds": args.rounds,
         "profiler": args.profiler,
+        "prebuild_graphs": args.prebuild_graphs,
         "phases": [],
     }
     path = args.output / "summary.json"
@@ -58,9 +59,9 @@ def run(args):
             x = torch.zeros(1024, device="cuda")
             y = torch.zeros_like(x)
         primary.synchronize()
-        for fork_join in (False, True):
 
-            def body(fork_join=fork_join):
+        def build_graph(fork_join):
+            def body():
                 for _ in range(args.nodes):
                     if fork_join:
                         auxiliary.wait_stream(primary)
@@ -79,6 +80,20 @@ def run(args):
                 for _ in range(3):
                     graph.replay()
                 primary.synchronize()
+            return graph
+
+        # Serving instantiates all batch-size graphs before the first range.
+        # The older lifecycle probe built its second graph after range one;
+        # both orders matter when qualifying repeated-range graph collection.
+        graphs = (
+            {fork_join: build_graph(fork_join) for fork_join in (False, True)}
+            if args.prebuild_graphs
+            else {}
+        )
+        for fork_join in (False, True):
+            graph = (
+                graphs[fork_join] if args.prebuild_graphs else build_graph(fork_join)
+            )
             for repeat in range(args.rounds):
                 for phase in (
                     "unprofiled-before",
@@ -186,4 +201,9 @@ if __name__ == "__main__":
     parser.add_argument("--replays", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--profiler", choices=("torch", "cuda"), default="torch")
+    parser.add_argument(
+        "--prebuild-graphs",
+        action="store_true",
+        help="instantiate both graphs before any profiler range, as serving does",
+    )
     run(parser.parse_args())

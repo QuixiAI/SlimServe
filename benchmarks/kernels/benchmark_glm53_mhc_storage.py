@@ -72,6 +72,18 @@ def timing_rows(sites, narrow, batch, shared_activations=False, weight_banks=2):
     return rows
 
 
+def selected_check_sites(indices):
+    if indices is None:
+        return list(range(90))
+    if (
+        not indices
+        or len(set(indices)) != len(indices)
+        or any(index < 0 or index >= 90 for index in indices)
+    ):
+        raise ValueError("check sites must be distinct indices in 0..89")
+    return list(indices)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -81,6 +93,12 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--check-sites",
+        type=int,
+        nargs="+",
+        help="bounded sanitizer census only; timing runs require all 90 sites",
+    )
     parser.add_argument("--check-installed-bf16", action="store_true")
     parser.add_argument(
         "--timing-baseline",
@@ -106,6 +124,14 @@ def main():
         help="reuse one activation set per timing bank to bound full-prefill memory",
     )
     args = parser.parse_args()
+    try:
+        check_sites = selected_check_sites(args.check_sites)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.check_sites is not None and not args.check_only:
+        parser.error(
+            "--check-sites requires --check-only; timing gates stay exhaustive"
+        )
     if args.timing_baseline == "installed-bf16":
         args.check_installed_bf16 = True
     if (
@@ -181,6 +207,7 @@ def main():
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
         },
         "checks": [],
+        "checked_site_indices": check_sites,
         "timings": [],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -205,7 +232,8 @@ def main():
             raise ValueError("expected all 90 GLM mHC sites")
         save()
         for batch in args.batch:
-            for site, weights in enumerate(sites):
+            for site in check_sites:
+                weights = sites[site]
                 for magnitude in (0.01, 1.0, 100.0):
                     data = inputs(batch, 301 + site, magnitude)[:7]
                     data[4:7] = weights
