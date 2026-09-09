@@ -23205,3 +23205,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: runtime-control/nsys-graph-order-{between-before,prebuilt,between-return}
   -results/summary.json, corresponding.{1,2}.{nsys-rep,sqlite},
   nsys-graph-order-{aba.log,export.log,analysis.json}. All processes exit0.
+
+## 2026-09-08: Independent mHC prefill tensor-core hypothesis prepared
+
+- Status: UNBUILT diagnostic; no serving integration, performance or GPU
+  correctness claim. Prepared while the fixed paired-storage1/3/1 campaign
+  runs on frozen serving/benchmark sources and native QC5d4d3790e9aeb6cb.
+  New standalone probe files do not participate in that campaign.
+- Baseline: installed paired BF16 prefill partials, native FP32 finalize and
+  apply, actual checkpoint fn values preserved exactly, unchanged scale/base.
+  Current attribution puts partials around38ms per full chunk across90sites;
+  the isolated paired-staging improvement does not establish their byte floor.
+- Hypothesis: dot products can use BF16xBF16/FP32 tensor cores while retaining
+  the fused post-mix, split boundaries, square-sum order and finalize/apply.
+  Unlike lossless storage, this CHANGES dot summation order and needs a new
+  numerical gate. There is no W4A4/FP8-KV or other recipe change here.
+- Design:32-token/512-flat/24-mix CTA, six warps cover2x3 m16n8k16 tiles;
+  a seventh preserves the scalar square-sum order. Shared BF16 fn/activation
+  rows have520-element strides for16-byte ldmatrix alignment, 58240bytes
+  total. Invalid token rows zero-filled before warp MMA; fused residual uses
+  the same vector loads, FP32 expression order and BF16 rounding as serving.
+  New module-local/device-aware checked launch setup; no persistent repack.
+- Precedents read: current CUDA partials_prefill and bf16_decode_gemm fragment
+  mapping; vendored Metal dsv4_mhc.metal staged-residual prefill path preserves
+  reuse but is not a CUDA tensor-core implementation. The external ds4 and
+  QuixiCore ROCm/Metal paths named in AGENTS.md do not exist on this host.
+  NVIDIA PTX fragment and alignment references:
+  https://docs.nvidia.com/cuda/parallel-thread-execution/#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+  https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-ldmatrix
+- Prescribed gates: all90actualsites, batches64/65/128/129/7616, magnitudes
+  .01/1/100, pre/fused (2700cases); exact residual bits, three changed-input
+  graph/eager checks, existing strict output bounds (FP32 rtol2e-5/atol2e-6,
+  BF16 per-row peak error<2^-7). Independent CPU FP64 dot/square oracle
+  samples tile boundaries and final row: dotNRMS<=2e-6, peak<=2e-5,
+  normrelative<=1e-5. Do not loosen these after seeing results.
+- Timing only after correctness: five A/B/A rounds, four replays/phase,
+  three warmups; six banks of all90 fn matrices, 424673280bytes>3xL2,
+  six shared immutable activation sets. Bounded sanitizer selections require
+  --check-only. Subsequent native and real-profile gates remain mandatory.
+- CPU oracle tests10pass, including nonuniform split/stream/mix coordinates,
+  bad dots/norms/tails, nonfinite input, zero values, shapes and signed zero.
+  Ruff passes. No native build or additional GPU work during serving timings.
+- Files: benchmarks/kernels/{mhc_prefill_tc_probe.cu,
+  benchmark_glm53_mhc_prefill_tc.py}, tests/slimserve/test_mhc_prefill_tc_probe.py.
+  CPU raw: runtime-control/mhc-tc-oracle-cpu-tests.xml.
+- Separate follow-up audit: native mHC prefill setup still has a static
+  once-only attribute cache. It is module-local but appears device-blind;
+  reproduce GPU0/1/0 after this serving series before changing it. Current
+  TP4 workers each own one device, so this is not a claimed campaign failure.
