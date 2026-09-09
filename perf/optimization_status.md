@@ -21781,3 +21781,22 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - CPU tests cover profiler start/request/stop order, stop on request failure,
   unique cache salts, exact prompt prefixes and exclusion of trace timings.
   All 139 SlimServe tests pass; touched Python lint and diff checks pass.
+
+### Prefill analysis preparation (same campaign)
+
+- Add benchmarks/analyze_model_step_trace.py: associate runtime/driver launch
+  correlations with detailed execute annotations on the launch thread, then
+  attribute GPU kernels/copies by those correlations. GPU work can execute
+  after its host annotation ends; do not intersect GPU times with CPU windows.
+  Keep all steps, separate per-device unions from summed kernel durations,
+  and report unmatched work rather than silently dropping it.
+- Three CPU tests pass: queued launches, overlap/copy unions, unmatched/empty
+  steps and rejection of ambiguous annotations. Checked against the existing
+  Marlin-repair decode trace: all eight execute regions map; the 72 unmatched
+  operations are sampler/copy work outside those regions. Whole-step spans
+  include eager preparation and are not the graph-only latency measurement.
+- Native resource inspection for the losing mHC norm probe: actual H4096 /
+  SPLITS64 / FP32-fn kernels all use 40 registers and zero local-memory bytes,
+  with or without norm. Register spilling does not explain the batch1 penalty.
+  Raw: mhc-norm/native-resources.txt; decoder analyzer check under
+  cold-prefill-profile/old-decode-analyzer-check.json in the dated results.
