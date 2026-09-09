@@ -51,3 +51,37 @@ def test_ahead_of_gpu_host_launches_do_not_define_replay_windows():
     assert second["gpu_start_after_host_launch_us"] == 149
     # A partially observed replay is retained, not silently filtered away.
     assert result["summaries"][0]["observed_kernel_counts"] == {3: 1, 1: 1}
+
+
+def test_gap_frontier_follows_longest_overlapping_event():
+    first = kernel(0, 10, 1)
+    first["name"] = "long"
+    short = kernel(3, 2, 1, stream=2)
+    short["name"] = "short"
+    last = kernel(12, 2, 1)
+    last["name"] = "last"
+    gaps = graph_trace.visible_gaps([short, last, first], 0, 14)
+    assert gaps == [
+        {
+            "duration_us": 2,
+            "after": "long",
+            "before": "last",
+            "after_stream": 1,
+            "before_stream": 1,
+        }
+    ]
+
+
+def test_non_graph_memcpy_and_other_graph_activity_fill_apparent_gap():
+    events = [kernel(0, 10, 1), kernel(20, 10, 1)]
+    copy = kernel(8, 5, 999, stream=3)
+    copy["cat"] = "gpu_memcpy"
+    copy["name"] = "copy"
+    copy["args"].pop("graph id")
+    other = kernel(15, 6, 2, stream=2)
+    other["name"] = "other replay"
+    first = graph_trace.analyze(events + [copy, other])["replays"][0]
+    assert first["no_kernel_active_us"] == 10
+    assert first["no_profiler_visible_gpu_activity_us"] == 2
+    assert first["visible_gap_boundaries"][0]["after"] == "copy"
+    assert first["visible_gap_boundaries"][0]["before"] == "other replay"

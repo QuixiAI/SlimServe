@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import collections
 import gzip
+import hashlib
 import json
 import statistics
 from pathlib import Path
@@ -42,6 +43,70 @@ def distribution(values):
     )
 
 
+def visible_gaps(events, start, stop):
+    """Uncovered intervals across ALL profiler-visible streams on one device.
+
+    Adjacent event names locate a gap; they do not establish a dependency or
+    its cause. Other processes/unprofiled engines may still be doing work.
+    The frontier must follow the longest overlapping event, not the last start.
+    """
+    frontier = start
+    previous = None
+    gaps = []
+    for event in sorted(events, key=lambda e: e["ts"]):
+        begin = max(start, event["ts"])
+        end = min(stop, event["ts"] + event["dur"])
+        if end <= start or begin >= stop or end <= begin:
+            continue
+        if begin > frontier:
+            gaps.append(
+                {
+                    "duration_us": begin - frontier,
+                    "after": previous["name"] if previous else None,
+                    "before": event["name"],
+                    "after_stream": previous.get("args", {}).get("stream")
+                    if previous
+                    else None,
+                    "before_stream": event.get("args", {}).get("stream"),
+                }
+            )
+        if end > frontier:
+            frontier = end
+            previous = event
+    if frontier < stop:
+        gaps.append(
+            {
+                "duration_us": stop - frontier,
+                "after": previous["name"] if previous else None,
+                "before": None,
+                "after_stream": previous.get("args", {}).get("stream")
+                if previous
+                else None,
+                "before_stream": None,
+            }
+        )
+    return gaps
+
+
+def group_gaps(gaps):
+    groups = collections.defaultdict(list)
+    for gap in gaps:
+        groups[
+            (gap["after"], gap["before"], gap["after_stream"], gap["before_stream"])
+        ].append(gap["duration_us"])
+    return [
+        {
+            "after": key[0],
+            "before": key[1],
+            "after_stream": key[2],
+            "before_stream": key[3],
+            "total_us": sum(values),
+            **distribution(values),
+        }
+        for key, values in sorted(groups.items(), key=lambda item: -sum(item[1]))
+    ]
+
+
 def analyze(events):
     launches = {
         event["args"]["correlation"]: event
@@ -50,8 +115,11 @@ def analyze(events):
         and "correlation" in event.get("args", {})
     }
     groups = collections.defaultdict(list)
+    device_activity = collections.defaultdict(list)
     for event in events:
         args = event.get("args", {})
+        if event.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset"):
+            device_activity[args.get("device")].append(event)
         if event.get("cat") == "kernel" and args.get("graph id"):
             groups[(args.get("device"), args["graph id"], args["correlation"])].append(
                 event
@@ -73,6 +141,7 @@ def analyze(events):
                 b["ts"] - (a["ts"] + a["dur"]) for a, b in zip(stream, stream[1:])
             )
         launch = launches.get(correlation)
+        visible = visible_gaps(device_activity[device], start, start + span)
         replays.append(
             {
                 "device": device,
@@ -82,6 +151,10 @@ def analyze(events):
                 "span_us": span,
                 "kernel_busy_union_us": busy,
                 "no_kernel_active_us": span - busy,
+                "no_profiler_visible_gpu_activity_us": sum(
+                    g["duration_us"] for g in visible
+                ),
+                "visible_gap_boundaries": group_gaps(visible),
                 "kernel_duration_sum_us": sum(e["dur"] for e in kernels),
                 "same_stream_gap_us": distribution(gaps),
                 "gpu_start_after_host_launch_us": start - launch["ts"]
@@ -109,6 +182,7 @@ def analyze(events):
                         "span_us",
                         "kernel_busy_union_us",
                         "no_kernel_active_us",
+                        "no_profiler_visible_gpu_activity_us",
                         "kernel_duration_sum_us",
                     )
                 },
@@ -127,6 +201,8 @@ def main():
         opener = gzip.open if path.suffix == ".gz" else open
         with opener(path, "rt") as stream:
             result = analyze(json.load(stream)["traceEvents"])
+        with path.open("rb") as stream:
+            result["source_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
         results[str(path)] = result
         print(path)
         print(json.dumps(result["summaries"], indent=2))

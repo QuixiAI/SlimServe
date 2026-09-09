@@ -50,6 +50,16 @@ hashes are in the notebook. Next fixed sequence: one FP32 control start,
 three BF16 starts, one FP32 return, all on the same rebuilt binary and full
 campaign workload. No retained serving gain or profile promotion yet.
 
+New graph-state evidence: the first FP32 control is mixed across ranks, not
+one global state. Its c1 rank0 has 99 us/step of graph gaps and 788 us of
+all-reduce duration; ranks1-3 have 424-428 us of gaps and 405-444 us of median
+all-reduce duration. All have the same ~5.736 ms median graph span. In the
+first BF16 start, all ranks have 423-430 us gaps and 409-447 us median all-reduce.
+This supports rank0 waiting for slower graph execution elsewhere; do not treat
+rank0's long collective duration alone as proof of a separately slow all-reduce
+kernel. The fast/slow per-rank graph cause remains open. All eight replays/rank,
+including first-replay skew, are retained in runtime-control/mhc-storage-all-rank-gaps.json.
+
 The digest-pinned R28.1 reference image is downloaded; its source lock and
 four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
 matches the cached model. The actual serving launcher/custom all-reduce and
@@ -181,6 +191,10 @@ no alternate serving path was added. Producer/consumer scheduling remains a
 separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
+
+First finish the active mHC fixed series and matched B12X control. For the
+startup variability, compare actual all-rank graph dependencies/launch attributes;
+rank0 alone hides mixed-rank graph speed. Do not restart until all ranks are fast.
 
 1. MoE launch geometry: routing and cold-cache traffic are now measured;
    test existing Marlin tile/grid controls on actual weights. The rank-0 c8 trace has

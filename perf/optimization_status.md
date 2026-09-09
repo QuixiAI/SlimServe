@@ -22234,3 +22234,65 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   capped150G/no-swap because Docker's daemon does not inherit that scope.
 - Reference: https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm-5.3-flash.md
   and the exact source.lock embedded in the digest-pinned image.
+
+## 2026-09-08: Mixed per-rank graph speed explains an apparent slow-AR state
+
+- Status: measured diagnostic finding, not a fix or new serving baseline.
+  The mHC fixed A/B/A remains in progress; no starts are selected or excluded.
+- Hypothesis: an apparently fast-graph/slow-all-reduce rank may simply wait
+  for slower graph execution on another rank. Inspect every rank before
+  classifying collective speed as an independent startup state.
+- Extended analyze_cuda_graph_trace.py to locate uncovered intervals across
+  ALL profiler-visible GPU kernels/copies/memsets on a device, not just one
+  stream or graph. Overlapping events advance a longest-end frontier; work
+  from another stream/replay fills apparent gaps. Boundary names locate the
+  gap, not its causal dependency. Other processes/unprofiled GPU engines may
+  still have work. Source SHA256 and every observed replay are retained.
+- Four CPU tests pass, including longest-overlap frontier and non-graph
+  memcpy/other-replay coverage. No serving path/harness or GPU binary changed.
+- Historical rec1/rec4 rank0 reanalysis: 8/8 replays each, 1185 kernels each.
+  Mean GPU spans 5727.284/5380.973 us; busy unions 5298.819/5280.674 us;
+  no-visible-activity 428.465/100.299 us. Extra gap is distributed broadly:
+  AR->mHC 0.437/0.107 us, mHC->norm 0.429/0.099 us, FP8 GEMM->AR
+  0.428/0.097 us, Marlin->combine 0.452/0.109 us. It is not one long pause
+  or one kernel family. This repeats the broad-gap observation with explicit
+  all-stream coverage; it does not identify the driver/graph cause.
+- Fresh first FP32 control versus first BF16 candidate, c1, all four ranks:
+
+  | arm/rank | median graph span us | median uncovered us | median summed AR us |
+  | --- | ---: | ---: | ---: |
+  | FP32 / 0 | 5735.94 | 99.13 | 788.09 |
+  | FP32 / 1 | 5736.20 | 424.31 | 411.73 |
+  | FP32 / 2 | 5736.62 | 428.17 | 404.86 |
+  | FP32 / 3 | 5736.59 | 425.49 | 444.11 |
+  | BF16 / 0 | 5708.27 | 429.95 | 447.01 |
+  | BF16 / 1 | 5708.32 | 422.98 | 424.61 |
+  | BF16 / 2 | 5707.73 | 428.84 | 409.16 |
+  | BF16 / 3 | 5708.24 | 426.85 | 446.19 |
+
+  All eight replays per rank remain in the result. Ranks1-3's first observed
+  replay has additional initial collective waiting: FP32 AR sums reach
+  1793-1828 us, BF16 1673-1710 us. Consequently their all-replay mean graph
+  spans are ~5909/~5866 us; these samples are NOT removed. Median/range
+  exposes the startup-of-profiling skew rather than hiding it.
+- Interpretation: the control has fast graph-node spacing on rank0 but slow
+  spacing on ranks1-3. Rank0's saved ~0.33 ms reappears as longer collective
+  duration. This strongly supports wait-for-peer/rank imbalance for this
+  observation, not an independently slower native all-reduce implementation.
+  It corrects the older inference from rank0-only fast-idle/slow-AR traces;
+  it does not claim every historical AR outlier has the same cause.
+- In the same first-pair c1 traces, total mHC duration is 778.883 -> 743.035 us
+  on rank0, a 35.85-us local saving. At c8 it is 1006.753 -> 966.432 us.
+  Serving gain remains unsettled until all prescribed starts and return
+  control complete. No extrapolated fastest-start baseline is substituted.
+- Next: inspect actual all-rank graph topology/attributes and a four-rank
+  reproducer. The old one-GPU 1200-node/fork-join probe did not reproduce the
+  state and cannot establish behavior of the full model's TP capture.
+  Installed PyTorch has get_graph_data, but it requires CUDA-driver13.1
+  graph-tools IDs; this host is13.0. Use supported older graph-query/DOT APIs
+  for diagnostics instead of changing the host driver. Keep all diagnostic
+  graph-retention/instantiation changes opt-in and outside baseline claims.
+- Raw: perf/results/2026-09-08/runtime-control/{graph-gap-boundaries.json,
+  mhc-storage-all-rank-gaps.json}; original trace paths and SHA256 are in each
+  result. First-pair rank0 c1/c8 summaries also live in each boot's
+  decode-graph-analysis.json. GPU ownership never overlapped.
