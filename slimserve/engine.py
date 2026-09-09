@@ -87,6 +87,10 @@ def serve_argv(plan: Plan, host: str, port: int) -> list[str]:
         if isinstance(value, bool):
             if value:
                 argv.append(flag)
+            elif key == "async_scheduling":
+                # Omission means auto, not false. The bounded routing journal
+                # requires an explicit synchronous scheduler for step metadata.
+                argv.append("--no-async-scheduling")
         elif isinstance(value, (dict, list)):
             argv += [flag, json.dumps(value)]
         else:

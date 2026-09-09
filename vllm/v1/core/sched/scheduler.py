@@ -349,6 +349,27 @@ class Scheduler(SchedulerInterface):
         self.enable_return_routed_experts = (
             vllm_config.model_config.enable_return_routed_experts
         )
+        self._slimserve_routing_journal = None
+        journal_dir = vllm_config.additional_config.get("slimserve_routing_journal")
+        if journal_dir:
+            from slimserve.routing_journal import RoutingJournal
+
+            if (
+                not self.enable_return_routed_experts
+                or self.scheduler_config.async_scheduling
+            ):
+                raise ValueError(
+                    "routing journal requires capture and synchronous scheduling"
+                )
+            config = vllm_config.model_config.hf_text_config
+            self._slimserve_routing_journal = RoutingJournal(
+                journal_dir,
+                model=vllm_config.model_config.model,
+                num_layers=config.num_hidden_layers,
+                first_moe_layer=config.first_k_dense_replace,
+                num_experts=config.n_routed_experts,
+                top_k=config.num_experts_per_tok,
+            )
 
         if self.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
@@ -1675,6 +1696,16 @@ class Scheduler(SchedulerInterface):
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
             re = model_runner_output.routed_experts
+            if self._slimserve_routing_journal is not None:
+                req_ids = model_runner_output.req_ids
+                self._slimserve_routing_journal.record(
+                    re.routing_data,
+                    re.slot_mapping,
+                    req_ids,
+                    num_scheduled_tokens,
+                    {rid: self.requests[rid].num_computed_tokens for rid in req_ids},
+                    {rid: self.requests[rid].num_prompt_tokens for rid in req_ids},
+                )
             self.routed_experts_mgr.store_batch(re.routing_data, re.slot_mapping)
             routing_data = re.routing_data.astype(
                 self.routed_experts_mgr.routed_experts_by_slot.dtype,

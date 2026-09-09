@@ -21316,3 +21316,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   mHC parity and A/B/A timing with actual GLM constants.
 - Raw: perf/results/2026-09-08/quality-baseline/summary.json, every request,
   per-start quality.json (including raw responses), logs and all-rank traces.
+
+## 2026-09-08: Add bounded actual-step expert routing diagnostics
+
+- Status: CPU tests and real-profile dry-run pass; live census pending.
+- Baseline/hypothesis: Marlin dominates concurrent decode, but estimated
+  expert reuse is not measured traffic. Capture actual expert IDs used together
+  in a scheduler step before choosing a scheduling or layout experiment.
+- Change: opt-in --route-profile-dir, restricted to the GLM53 RTX6000 TP4
+  no-spec profile. Existing worker capture supplies D2H data; the bounded
+  journal preserves model-runner request order, slots and computed positions.
+  Only all-decode one-token-per-request steps up to batch 16 are analyzed.
+  Dense layers are excluded; malformed records are retained then rejected.
+  Production capture stays off. False async scheduling now serializes to
+  --no-async-scheduling: omission means auto and would invalidate this method.
+- Correctness: all 114 SlimServe tests pass, including 15 journal tests for
+  ordering, skip/record limits, dimensions, IDs, raw failure preservation,
+  route-count arithmetic, profile scope and explicit CLI scheduling. The
+  scheduler also refuses to open a journal under asynchronous scheduling.
+- Decision: one predetermined start x one repeat plus full warmups and
+  text/image canaries, using campaign --routing. All timing output is explicitly
+  diagnostic-only and NOT baseline eligible. Unique weight footprint is not
+  DRAM traffic or an effective-bandwidth/physical-ceiling measurement.
+- Raw destination: perf/results/2026-09-08/routing-census/; profile source and
+  binary stay fixed while it runs. No serving speedup is claimed.

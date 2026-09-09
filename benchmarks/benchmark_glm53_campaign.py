@@ -227,6 +227,11 @@ def main():
     ap.add_argument("--output-tokens", type=int, default=300)
     ap.add_argument("--traces", action="store_true")
     ap.add_argument(
+        "--routing",
+        action="store_true",
+        help="diagnostic-only actual-step routing; timings are NOT a baseline",
+    )
+    ap.add_argument(
         "--quality",
         action="store_true",
         help="score exact continuations and needle contrasts after timed work",
@@ -239,6 +244,14 @@ def main():
     if args.profile not in compatible:
         ap.error(f"profile not compatible; available: {compatible}")
     plan = registry.resolve(args.profile, machine.platform, machine.count, None)
+    if args.routing:
+        from slimserve.routing_journal import diagnostic_plan
+
+        diagnostic_plan(plan, args.output)  # Validate scope before any launch.
+        print(
+            "DIAGNOSTIC ROUTING: scheduling changes; throughput is NOT a baseline",
+            flush=True,
+        )
     args.output.mkdir(parents=True, exist_ok=False)
     source = args.source.read_text()
     tokenizer = get_tokenizer(str(plan.model_dir))
@@ -254,6 +267,8 @@ def main():
         "plan": dataclasses.asdict(plan),
         "compatible_profiles": compatible,
         "command": sys.argv,
+        "diagnostic_only": args.routing,
+        "throughput_is_baseline_eligible": not args.routing,
         "runtime": runtime_identity(),
         "environment": {
             k: v
@@ -288,7 +303,13 @@ def main():
         ]
         if args.traces:
             argv += ["--torch-profile-dir", str(folder / "traces")]
+        if args.routing:
+            argv += ["--route-profile-dir", str(folder / "routing")]
         run = {"boot": boot, "argv": argv, "status": "starting", "measurements": []}
+        if args.routing:
+            run["diagnostic_plan"] = dataclasses.asdict(
+                diagnostic_plan(plan, folder / "routing")
+            )
         receipt["runs"].append(run)
         record.write_text(json.dumps(receipt, indent=2) + "\n")
         print(f"boot {boot}/{args.boots}: starting", flush=True)

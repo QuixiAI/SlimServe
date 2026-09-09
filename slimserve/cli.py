@@ -81,6 +81,10 @@ def _parser() -> argparse.ArgumentParser:
         "--torch-profile-dir",
         help="capture eight steady engine iterations after /start_profile",
     )
+    parser.add_argument(
+        "--route-profile-dir",
+        help="diagnostic-only GLM53 routing capture; changes scheduling and timings",
+    )
     return parser
 
 
@@ -105,6 +109,7 @@ def _help() -> None:
         ("--dry-run", "Print the resolved plan and stop."),
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
+        ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
         ("--list", "List every profile, including ones this machine cannot run."),
     ):
         print(f"  {term.paint(flag, term.CYAN, out):<38} {description}")
@@ -395,6 +400,15 @@ def main(argv: list[str] | None = None) -> int:
                 },
             },
         )
+
+    if args.route_profile_dir:
+        from slimserve.routing_journal import diagnostic_plan
+
+        try:
+            plan = diagnostic_plan(plan, args.route_profile_dir)
+        except ValueError as error:
+            term.fail(str(error))
+            return 2
 
     if args.dry_run:
         _show(plan)
