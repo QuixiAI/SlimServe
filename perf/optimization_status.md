@@ -23402,3 +23402,42 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   during the frozen census. Raw: runtime-control/mhc-tc-{build.log,resources.txt,
   sass.txt,first-check.log,census.log,failure.log,mutated-failure.log,
   receipt-cpu-tests.xml}; mhc-tc-first-check/ and mhc-tc-census/.
+
+## 2026-09-08: mHC prefill launch setup follows the active CUDA device
+
+- Status: native correctness repair, GPU/CPU gates passed; real-profile check
+  prescribed next. No performance or historical-startup-cause claim.
+- Baseline: QC5d4d3790e9aeb6cb caches the82,048-byte prefill shared-memory
+  opt-in once per process. All six FP32/FP16/BF16 x pre/fused cases reproduce
+  CUDAerror0/1/0 on GPU0/1/0. Native wrappers can return uninitialized output;
+  the new first FP32 regression fails on nonfinite data before the rebuild.
+  TP4 serving workers each use one device, so this is not evidence explaining
+  their historical throughput states.
+- Diagnostic correction retained: the first ctypes check loaded the toolkit's
+  separate libcudart and reported no immediate error despite wrong GPU1 output;
+  a later Torch operation raised invalid argument. /proc/self/maps identifies
+  the Torch-loaded runtime under nvidia/cu13/lib/libcudart.so.13. Checking that
+  exact runtime reproduces all six invalid launches. Preserve both logs.
+- Fix: module-local/thread-local current-device setup cache, checked get-device
+  and attribute calls, cache only after success, and immediate kernel launch
+  check. No changes to kernel math, tile geometry, data layout or model recipe.
+- Build: CUDA13.0, verified actual -gencode compute_120f/sm_120f, target
+  _quixicore_C in /home/tiny/.local/scratch/slimserve-glm53/build-native-sm120,
+  -j2,80GiB/no swap, no GPU work during compilation. Installed QC SHA
+  20588761728d7161ae774e84e176fdfe4550163e3bfab1a2797ebee86bff35fb.
+  Old library saved as runtime-control/mhc-device-native-before.so.
+- Complete cuobjdump --dump-sass output is identical before/after, SHA
+  dbb320d3b5461e0b221b277b83a62f6c25dbfd338792c58565d1870f9a697a18.
+  All eight pre/fused/dtype/alignment setup variables are TLS LOCAL.151 GPU
+  tests pass, including six new device-switch regressions and existing decode
+  GEMM/mHC tests;270 CPU tests pass/one GPU skip. Ruff/diff checks pass.
+- Next prescribed serving gate: ONE start, three repetitions c1/c8/c16,
+  --cold-prefix --quality --prefill, no profiler, registered glm53-nvfp4-4
+  with retained BF16 storage/indexer and unchanged recipe. Output
+  mhc-device-serving-check/. Freeze runtime and benchmark sources. This is
+  a correctness/sanity recheck, not a new three-start performance baseline.
+- Raw: runtime-control/mhc-device-{repro.log,cudart-identity.log,
+  native-runtime-repro.log,before-tests.{xml,log},native-build.log,
+  sass-identity.json,local-symbols.txt,gpu-tests.{xml,log},cpu-tests.{xml,log},
+  fixed-repro.log}. Build path above is this machine's actual configured tree;
+  the generic build/temp.linux-x86_64-cpython-312 path does not exist here.

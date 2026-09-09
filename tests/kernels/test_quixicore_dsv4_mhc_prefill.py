@@ -90,6 +90,40 @@ def _close(a, b):
     torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("fused", [False, True])
+def test_prefill_shared_memory_setup_follows_device_switches(fn_dtype, fused):
+    mode = quixicore_ops.get_dsv4_mhc_mode()
+    minimum = quixicore_ops.get_dsv4_mhc_prefill_min_t()
+    constants = (1e-5, 1e-6, 1e-6, 2.0, 20, None, 0.0)
+    reference = None
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(64)
+        for device in (0, 1, 0):
+            with torch.cuda.device(device):
+                residual, fn, scale, base, x, post, comb, _ = _inputs(51, 65, fn_dtype)
+                if fused:
+                    output = quixicore_ops.dsv4_mhc_fused_post_pre(
+                        x, residual, post, comb, fn, scale, base, *constants
+                    )
+                else:
+                    output = quixicore_ops.dsv4_mhc_pre(
+                        residual, fn, scale, base, *constants
+                    )
+                torch.cuda.synchronize()
+                host = [tensor.cpu() for tensor in output]
+                assert all(torch.isfinite(tensor).all() for tensor in host)
+                if reference is None:
+                    reference = host
+                for actual, expected in zip(host, reference):
+                    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(minimum)
+
+
 @pytest.mark.parametrize("T", [65, 129])
 @pytest.mark.parametrize("fused", [False, True])
 def test_bf16_prefill_preserves_unaligned_contiguous_fn(T, fused):

@@ -558,17 +558,22 @@ static void launch_dsv4_mhc_partials_prefill_typed(
         const float* post, const float* comb, const FnT* fn,
         __nv_bfloat16* residual_out, float* partial, int T) {
     auto kernel = dsv4_mhc::partials_prefill<FUSED_POST, 4096, FnT, PAIRED_FN>;
-    static const bool configured = [&] {
-        return cudaFuncSetAttribute(
-                   kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                   int(dsv4_mhc::PREFILL_SMEM)) == cudaSuccess;
-    }();
-    TORCH_CHECK(configured, "DSV4 mHC prefill partials: ",
-                dsv4_mhc::PREFILL_SMEM, " bytes of shared memory refused");
+    // This helper is module-local, but CUDA attributes also belong to the
+    // active device. A once-per-process flag leaves later devices unconfigured.
+    static thread_local int configured_device = -1;
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (configured_device != device) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            int(dsv4_mhc::PREFILL_SMEM)));
+        configured_device = device;
+    }
     const dim3 grid(dsv4_mhc::SPLITS,
                     (T + dsv4_mhc::PREFILL_TILE - 1) / dsv4_mhc::PREFILL_TILE);
     kernel<<<grid, dsv4_mhc::THREADS, dsv4_mhc::PREFILL_SMEM, stream()>>>(
         x, residual, post, comb, fn, residual_out, partial, T);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 // Returns false when the split path must use `partials` (small T, H != 4096
 // or the kernel disabled).
