@@ -68,6 +68,18 @@ def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, ac
         assert bench.diagnostic_only(SimpleNamespace(**(vars(args) | {key: value})))
 
 
+@pytest.mark.parametrize("mode", ["control", "legacy", "invalid"])
+def test_rmsnorm_intervention_is_never_a_baseline(monkeypatch, mode):
+    bench = _load(monkeypatch)
+    monkeypatch.setenv("SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC", mode)
+    args = SimpleNamespace(routing=False, cuda_traces=False, quality_repeats=1)
+    assert bench.diagnostic_only(args)
+    sources = bench.benchmark_sources()
+    assert "slimserve/rmsnorm_diagnostic.py" in sources
+    assert "vllm/v1/worker/gpu_model_runner.py" in sources
+    assert "benchmarks/kernels/check_glm53_cached_rmsnorm.py" in sources
+
+
 @pytest.mark.parametrize(
     "options",
     [

@@ -50,6 +50,7 @@ def diagnostic_only(args):
         or args.quality_repeats > 1
         or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
+        or os.environ.get("SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC")
         or any(
             os.environ.get(key) == "1"
             for key in (
@@ -87,6 +88,9 @@ def benchmark_sources():
         "slimserve/server.py",
         "vllm/utils/jit_monitor.py",
         "slimserve/glm53_ordering.py",
+        "slimserve/rmsnorm_diagnostic.py",
+        "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
+        "vllm/v1/worker/gpu_model_runner.py",
         "slimserve/canonical_moe.py",
         "slimserve/canonical_indexer.py",
         "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
@@ -595,6 +599,9 @@ def main():
     from slimserve.glm53_ordering import validate_plan
 
     validate_plan(plan)
+    from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
+
+    validate_rmsnorm_plan(plan)
     if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(
             plan,

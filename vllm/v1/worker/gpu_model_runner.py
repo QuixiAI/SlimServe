@@ -1016,6 +1016,9 @@ class GPUModelRunner(
         from slimserve.index_journal import install_index_journal
 
         install_index_journal(self)
+        from slimserve.rmsnorm_diagnostic import install as install_rmsnorm_diagnostic
+
+        install_rmsnorm_diagnostic(self)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len

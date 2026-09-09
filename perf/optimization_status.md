@@ -25990,3 +25990,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   must remain intact; a global force-first-config override is not the experiment.
   No intervention has been implemented/launched yet. Keep the old cross-mode
   score gate FAILED and native-order defaultOFF until full-model evidence exists.
+
+## 2026-09-09 - Prepare normalization-only cached-launcher intervention
+
+- Status: implementation/CPU preparation, no GPU/serving result yet.
+- Hypothesis: swap only the four source-bound RMSNorm launch choices to test
+  full-model causality. First a no-op control reconstructs identical native
+  launchers and must match every score from the nine existing native passes.
+- DefaultOFF diagnostic installs at runner initialization. Resolves actual
+  StaticAutotunerFuture, checks native source/binary identity, recompiles exact
+  source/config/metadata, checks replacement hash, clears cached callable, and
+  seals exactly one target per rank before graph capture. Records all unrelated
+  static launcher hashes unchanged. No model/kernel/profile arithmetic edit.
+- Private byte-identical AOT copies, relocated source paths and detached old
+  save hooks protect original caches; forced AOT load forbids silent recompiles.
+  No-op control is required evidence that these mechanisms do not perturb scores.
+- CPU124pass7.15s/14 existing Torch warnings; tests cover failure-before-mutation,
+  control/legacy selection, unrelated launchers, scope, source relocation, seal,
+  baseline exclusion and native-order wiring. Raw rmsnorm-intervention-cpu.*.
+  Subsequent environment-validation refactor still requires final CPU rerun.
+- Protocol perf/glm53-rmsnorm-intervention-protocol.md freezes one16-case real
+  GPU-hook job, then private-cache preparation, then exactly two serving arms
+  (no-op, legacy; stop before legacy if control fails). Both record the full
+  cold exact-token/text/image/three-pass quality workload. No replacement starts
+  or original cache edits. All source/native freeze requirements remain in force.
+  Final tightened-environment CPU suite124pass5.93s; lint/diff checks pass.

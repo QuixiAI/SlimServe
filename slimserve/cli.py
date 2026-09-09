@@ -460,8 +460,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from slimserve.glm53_ordering import validate_plan
+        from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
 
         validate_plan(plan)
+        validate_rmsnorm_plan(plan)
     except ValueError as error:
         term.fail(str(error))
         return 2
