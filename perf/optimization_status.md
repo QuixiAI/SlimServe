@@ -25551,3 +25551,10 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   atomic+sort, original-stable, parallel-stable, direct-stable), 12,000 samples
   under stable-align-scatter-timing/. Source/native freeze; no exclusions,
   retries or overlapping GPU work. No new latency or serving TPS claim yet.
+- Memcheck launch setup failure retained: the command omitted
+  SLIMSERVE_GLM53_STABLE_ALIGN_PROBE. All 520 fixtures errored in 8.11s;
+  sanitizer reports termination before first instrumented API call, exit255.
+  Original stable-align-scatter-memcheck.{log,xml} remain untouched. Correct
+  only the explicit environment and run the same frozen tests/binary once,
+  recording stable-align-scatter-memcheck-configured.{log,xml}. This is a
+  corrected pre-workload launch, not a replacement benchmark or kernel pass.
