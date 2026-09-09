@@ -33,10 +33,74 @@ IMAGE = (
 REVISION = "46aaae8a82032f77100f2f03e9cc11b391df3b4d"
 LOCK_SHA256 = "4473b46dbf696a386da1fbd6f75e7ef9159c36d216d153c6beb5cfe68b7a7477"
 MODEL_NAME = "GLM-5.3-Flash-NVFP4"
+FA2_DESTINATION = "/opt/glm53-flash/vllm/vllm/vllm_flash_attn/_vllm_fa2_C.abi3.so"
+ORIGINAL_FA2_SHA256 = "37e3a34edb6dbd3d86a7952b3ec9975cb38e3a56a2381cdab9e302eaefe4ff81"
 
 
 def command(*argv, timeout=30):
     return subprocess.check_output(argv, text=True, timeout=timeout).strip()
+
+
+def fa2_receipt(args):
+    """A binary override must carry both exact-source qualification arms."""
+    if args.fa2_library is None and args.fa2_qualification is None:
+        return None
+    if (
+        not args.host_cuda_driver
+        or args.fa2_library is None
+        or args.fa2_qualification is None
+    ):
+        raise ValueError(
+            "FA2 override requires host driver, library and qualification bundle"
+        )
+    library = args.fa2_library.resolve(strict=True)
+    bundle = args.fa2_qualification.resolve(strict=True)
+    original_path = bundle / "original-compat" / "summary.json"
+    native_path = bundle / "native-host" / "summary.json"
+    original = json.loads(original_path.read_text())
+    native = json.loads(native_path.read_text())
+    with library.open("rb") as handle:
+        library_hash = hashlib.file_digest(handle, "sha256").hexdigest()
+    probe = Path(__file__).parent / "kernels" / "probe_b12x_fa2.py"
+    if (
+        original["status"] != "complete"
+        or native["status"] != "complete"
+        or original["binary"]["sha256"] != ORIGINAL_FA2_SHA256
+        or native["binary"]["sha256"] != library_hash
+        or original["schema"] != native["schema"]
+        or native["reference"]["sha256"]
+        != hashlib.sha256(original_path.read_bytes()).hexdigest()
+        or original["probe_sha256"] != native["probe_sha256"]
+        or native["probe_sha256"] != hashlib.sha256(probe.read_bytes()).hexdigest()
+        or len(original["cases"]) != 30
+        or len(native["cases"]) != 30
+    ):
+        raise ValueError("FA2 qualification identity or completeness mismatch")
+    for before, after in zip(original["cases"], native["cases"]):
+        if (
+            before["status"] != "passed"
+            or after["status"] != "passed"
+            or not before["oracle"]["passed"]
+            or not after["oracle"]["passed"]
+            or not before["graph_exact"]
+            or not after["graph_exact"]
+            or not after["prior_binary"]["passed"]
+            or before["input_sha256"] != after["input_sha256"]
+        ):
+            raise ValueError("FA2 numerical or changed-input graph gate failed")
+    return {
+        "path": str(library),
+        "sha256": library_hash,
+        "image_destination": FA2_DESTINATION,
+        "qualification_directory": str(bundle),
+        "original_qualification_sha256": hashlib.sha256(
+            original_path.read_bytes()
+        ).hexdigest(),
+        "native_qualification_sha256": hashlib.sha256(
+            native_path.read_bytes()
+        ).hexdigest(),
+        "label": "host-driver and exact-source native-SM120 FA2 adapted image",
+    }
 
 
 def docker_create_args(args, name, port):
@@ -111,6 +175,11 @@ def docker_create_args(args, name, port):
         "--mount",
         f"type=bind,src={jit_cache},dst=/cache",
     ]
+    if adapted := fa2_receipt(args):
+        argv += [
+            "--mount",
+            f"type=bind,src={adapted['path']},dst={FA2_DESTINATION},readonly",
+        ]
     for key, value in environment.items():
         argv += ["-e", f"{key}={value}"]
     return argv + [
@@ -144,6 +213,7 @@ def run(args):
         "model_revision": REVISION,
         "diagnostic_only": args.diagnostic_nccl,
         "host_cuda_driver": args.host_cuda_driver,
+        "fa2_override": fa2_receipt(args),
         "command": sys.argv,
         "git_commit": command("git", "rev-parse", "HEAD"),
         "git_status": command("git", "status", "--short"),
@@ -191,6 +261,8 @@ def run(args):
             folder.mkdir()
             name = f"slimserve-b12x-r281-{secrets.token_hex(6)}"
             port = free_port()
+            if fa2_receipt(args) != receipt["fa2_override"]:
+                raise ValueError("FA2 binary or qualification changed during campaign")
             argv = docker_create_args(args, name, port)
             row = {"boot": boot, "status": "starting", "docker_create_argv": argv}
             receipt["runs"].append(row)
@@ -306,6 +378,16 @@ def main():
         "--host-cuda-driver",
         action="store_true",
         help="skip the image shell compatibility-driver hook; preserve host libcuda",
+    )
+    parser.add_argument(
+        "--fa2-library",
+        type=Path,
+        help="explicit native SM120 FA2 compatibility binary",
+    )
+    parser.add_argument(
+        "--fa2-qualification",
+        type=Path,
+        help="bundle with original-compat and native-host probe receipts",
     )
 
     # A controller interruption must run the owned-container finally block.

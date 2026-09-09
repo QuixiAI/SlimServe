@@ -40,6 +40,8 @@ def settings(bench, tmp_path):
         startup_timeout=1200,
         diagnostic_nccl=False,
         host_cuda_driver=False,
+        fa2_library=None,
+        fa2_qualification=None,
     )
 
 
@@ -84,6 +86,61 @@ def test_host_driver_only_suppresses_shell_hook(bench, tmp_path):
     index = adapted.index("BASH_ENV=/dev/null")
     assert adapted[index - 1] == "-e"
     assert adapted[: index - 1] + adapted[index + 1 :] == baseline
+
+
+def test_fa2_override_requires_complete_matched_numerical_bundle(bench, tmp_path):
+    args = settings(bench, tmp_path)
+    baseline = bench.docker_create_args(args, "owned-name", 8123)
+    args.fa2_library = tmp_path / "native.so"
+    args.fa2_library.write_bytes(b"native binary")
+    with pytest.raises(ValueError, match="requires host driver"):
+        bench.fa2_receipt(args)
+    args.host_cuda_driver = True
+    args.fa2_qualification = tmp_path / "qualification"
+    original_path = args.fa2_qualification / "original-compat" / "summary.json"
+    native_path = args.fa2_qualification / "native-host" / "summary.json"
+    original_path.parent.mkdir(parents=True)
+    native_path.parent.mkdir(parents=True)
+    probe = Path(bench.__file__).parent / "kernels" / "probe_b12x_fa2.py"
+    common = {
+        "status": "complete",
+        "schema": "schema",
+        "probe_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
+        "cases": [
+            {
+                "status": "passed",
+                "oracle": {"passed": True},
+                "graph_exact": True,
+                "prior_binary": {"passed": True},
+                "input_sha256": str(index),
+            }
+            for index in range(30)
+        ],
+    }
+    original = {**common, "binary": {"sha256": bench.ORIGINAL_FA2_SHA256}}
+    original_path.write_text(json.dumps(original))
+    native = {
+        **common,
+        "binary": {"sha256": hashlib.sha256(args.fa2_library.read_bytes()).hexdigest()},
+        "reference": {"sha256": hashlib.sha256(original_path.read_bytes()).hexdigest()},
+    }
+    native_path.write_text(json.dumps(native))
+    receipt = bench.fa2_receipt(args)
+    assert receipt["image_destination"] == bench.FA2_DESTINATION
+    adapted = bench.docker_create_args(args, "owned-name", 8123)
+    mounts = [adapted[i + 1] for i, value in enumerate(adapted) if value == "--mount"]
+    assert len(mounts) == 3 and mounts[-1].endswith(
+        f"dst={bench.FA2_DESTINATION},readonly"
+    )
+    assert bench.IMAGE in baseline and bench.IMAGE in adapted
+    args.fa2_library.write_bytes(b"changed binary")
+    with pytest.raises(ValueError, match="identity or completeness mismatch"):
+        bench.fa2_receipt(args)
+    args.fa2_library.write_bytes(b"native binary")
+    native["cases"][0]["graph_exact"] = False
+    native_path.write_text(json.dumps(native))
+    with pytest.raises(ValueError, match="graph gate failed"):
+        bench.fa2_receipt(args)
 
 
 @pytest.mark.parametrize(

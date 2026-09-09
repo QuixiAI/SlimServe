@@ -22560,3 +22560,49 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   this does not guarantee zero overhead on this workload.
 - Raw: perf/results/2026-09-08/runtime-control/nsys-range-{probe,lifecycle*},
   cuda-range-tests.xml and cuda-range-full-tests.xml. Whole-model data owed.
+
+## 2026-09-08: Old FP8 rotation does not exceed L2 for the small shared experts
+
+- Status: evidence correction and follow-up probe prepared; no kernel change.
+- Read the original fp8_gemm16_bench.py and fp8_small_sweep.py in the owned
+  scratch directory, plus current fp8_decode_gemm.cuh and its serving gate.
+  The original benchmark's ROT24 gives only96 MiB at N1024/K4096 and48 MiB
+  at N4096/K512, below the measured128-MiB L2. Three warmups/graph replay
+  cannot make these working sets cold. Allocating BF16 copies elsewhere is
+  not eviction when those copies are not read between FP8 measurements.
+- Therefore the old "rotated past L2" description and configuration-optimal
+  conclusion are not established for these small shapes. The raw prototype
+  also returns a best-of-three timing and only prints numerical failures.
+  Preserve it as historical evidence, not the next campaign harness. This
+  does NOT invalidate the actual serving results or justify changing the
+  retained eight-stage shared-expert path without a controlled experiment.
+- New benchmark_glm53_fp8_cache.py loads actual layer3/23/44 TP4 shared
+  gate/up and down bytes/scales, same installed production dispatch. Compare
+  ROT24 / greater-than-three-L2 rotation / ROT24 with five fixed A/B/A rounds,
+  16 graph replays/phase at M1/8/16. Streaming counts97/193 (388/386 MiB),
+  verified distinct allocations; no persistent serving repack/cache changes.
+- Independent CPU FP64 GEMM sees the defined FP32-product-to-BF16 dequant
+  weights; gates NRMS<=.004 and row-peak error<=2^-7. Every graph output
+  checks eager equality, including changed-sign inputs. All phase samples
+  retained, medians not fastest samples, actual weight and binary hashes.
+- Four CPU tests pass: byte-sized capacity, defined dequant rounding, rank0
+  and rank3 slicing/order. GPU timing pending until FA2 compilation ends;
+  run under16-GiB/no-swap scope, idleGPU, no concurrent build/serving.
+- This only measures isolated cache sensitivity. Cache working-set estimates
+  are not measured DRAM traffic or proof of an end-to-end optimization.
+- Raw CPU tests: runtime-control/fp8-cache-probe-tests.xml. No GPU result yet.
+
+### B12X FA2 override is explicit and qualification-bound
+
+- benchmark_glm53_b12x.py now accepts --fa2-library and --fa2-qualification,
+  both opt-in and requiring --host-cuda-driver. The bundle must include the
+  original-compat and native-host probe receipts,30 passing cases each,
+  identical inputs/operator schemas/probe source, original image binary
+  hash, matching new library hash and successful cross-binary/graph gates.
+- Exactly one additional read-only mount replaces the FA2 shared library;
+  no entrypoint, text kernel, quant or collective replacement. Receipt labels
+  the image host/FA2 adapted and records both qualification digests. Recheck
+  identity before every start; stop if the library or bundle changes.
+- Nine focused controller tests pass, including changed-binary and failed
+  graph rejection. Actual native build/probe and serving remain pending.
+- Raw: runtime-control/fa2-sm120-build/controller-tests.xml.
