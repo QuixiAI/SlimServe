@@ -126,6 +126,7 @@ def test_fixed_workload_uses_shared_function_and_retains_failure(
     )
 
     def chat(url, model, messages, **kwargs):
+        assert kwargs["include_reasoning"] is False
         image = isinstance(messages[0]["content"], list)
         answer = ("RedRed" if failure == "image" else "red") if image else "4"
         kwargs["on_event"]({"choices": [{"delta": {"content": answer}}]})

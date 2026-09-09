@@ -188,12 +188,14 @@ def run(args):
                     seed=42,
                     timeout=600,
                     on_event=events.append,
+                    include_reasoning=False,
                 )
             )
             canary = {
                 "answer": visible_text(raw)[:500],
                 "seconds": time.perf_counter() - started,
                 "response_events": events,
+                "answer_source": "content",
             }
             receipt["canaries"][label] = canary
             save()

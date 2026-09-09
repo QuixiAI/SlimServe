@@ -189,6 +189,7 @@ def _request(
             chat_template_kwargs=plan.chat_template_kwargs or None,
             timeout=timeout,
             on_event=events.append,
+            include_reasoning=False,
         )
     )
     answer = visible_text(raw)
@@ -196,6 +197,7 @@ def _request(
         "answer": answer[:500],
         "seconds": time.perf_counter() - started,
         "response_events": events,
+        "answer_source": "content",
     }
 
 

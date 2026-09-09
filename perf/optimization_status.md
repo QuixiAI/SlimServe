@@ -22740,3 +22740,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Next prescribed diagnostic: one host/native-FA2 start, --canary-only,
   unchanged sampling/regex/default field extraction; output
   b12x-r281-canary-events/. No timing result from this diagnostic.
+
+### Raw canary events confirm reasoning/content concatenation
+
+- One prescribed diagnostic start at source2037fd1dd reaches health in
+  136.053s, passes unchanged canaries, exits0/no OOM; no timing/quality/
+  prefill requests were made. Owned container removed after exit recording.
+- Raw image stream: reasoning deltas Red / solid / image / period, then
+  content Red, then finish_reason stop. The final answer is correct; the
+  old client joined reasoning and content into Red solid image.Red. Earlier
+  failed RedRed strings lack raw fields and cannot be retrospectively split;
+  their failure remains recorded, not silently relabeled as passed.
+- Origin repair: chat_completion gains include_reasoning=False for canary
+  callers; the interactive default remains its existing combined display.
+  Both smoke and comparative clients evaluate only content and record
+  answer_source=content plus ALL raw events. No prompt/sampling/server/regex
+  changes. Reasoning that says red cannot pass a blue, RedRed or absent final
+  answer; regression tests explicitly reject those cases.
+- CPU suite221pass/1GPUskip; request bodies are identical before/after
+  channel selection, raw events intact. Ruff/format pass. Full serving
+  recheck is still required; fixed3starts x3repeats will use --cold-prefix.
+- Raw: b12x-r281-canary-events/ and runtime-control/answer-channel-tests.xml.

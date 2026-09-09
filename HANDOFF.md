@@ -109,9 +109,13 @@ all nine timing rounds/quality/cold prefill. Its75 timed requests all report
 1000 cached prompt tokens versus0 in SlimServe's retained short-prompt data,
 so its155.79/656.40/922.05 E2E medians are NOT a matched cold-prefix baseline.
 Cold32K/128K engine TTFT2.729/11.000s; quality4096-token mean-2.913825,
-all six needles pass. Raw canary fields were not saved; parser duplication
-versus genuine output repetition remains to be isolated. Explicit canary-only
-event capture and --cold-prefix timing with a zero-cache gate are next.
+all six needles pass. The one-start canary diagnostic now records distinct
+reasoning Red solid image. and final content Red: the client concatenated
+channels. Canaries now evaluate content only and retain all raw events;
+interactive combined display and request bodies remain unchanged. Earlier
+RedRed responses lack raw fields, so their exact split cannot be reconstructed.
+The next full B12X comparison uses --cold-prefix and the same zero-cache
+gate on all timing requests; no direct ratios from the cached series.
 No vision disabling, canary relaxation, fastest-start selection or quant change.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact

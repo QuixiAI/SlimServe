@@ -71,13 +71,16 @@ def chat_completion(
     chat_template_kwargs: dict[str, Any] | None = None,
     timeout: float = 600.0,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    include_reasoning: bool = True,
 ) -> Iterator[str]:
-    """Yield content deltas from a streaming chat completion.
+    """Yield text deltas from a streaming chat completion.
 
     Sampling parameters are omitted from the request unless given, so the
     server's (i.e. the model's shipped) defaults apply. Greedy decoding is
     never used in this stack; pass `seed` when a run must be repeatable.
     An optional observer receives each decoded event before field extraction.
+    Set include_reasoning=False to evaluate only the model's final answer;
+    the default retains the interactive client's existing combined display.
     """
     import requests
 
@@ -119,7 +122,12 @@ def chat_completion(
                 # Reasoning models split the reply across fields, and which
                 # name carries it depends on the parser. Missing one of these
                 # shows an empty answer for a model that in fact replied.
-                for key in ("reasoning_content", "reasoning", "content"):
+                keys = (
+                    ("reasoning_content", "reasoning", "content")
+                    if include_reasoning
+                    else ("content",)
+                )
+                for key in keys:
                     piece = delta.get(key)
                     if piece:
                         yield piece
