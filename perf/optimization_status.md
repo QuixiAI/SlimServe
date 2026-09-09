@@ -23253,3 +23253,47 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   once-only attribute cache. It is module-local but appears device-blind;
   reproduce GPU0/1/0 after this serving series before changing it. Current
   TP4 workers each own one device, so this is not a claimed campaign failure.
+
+## 2026-09-08: Wait for owned GPU-driver cleanup, not only Linux process exit
+
+- Status: harness shutdown fix; no model/kernel/timing change. The paired-mHC
+  series (source54eeef1a5 control, 6ede3298e candidate; same eight benchmark
+  source hashes and QC5d4d3790e9aeb6cb) completes its FP32 control and FIRST
+  BF16 candidate with every exact-token, text/image, quality and prefill gate.
+  It then exits1 BEFORE candidate start2. The return control never starts.
+- Evidence: candidate teardown receipt records worker1383457 as LinuxZ/PPID1;
+  immediately following preflight lists the SAME PID as a GPU compute process.
+  A later read finds neither the process nor a GPU compute entry. Thus Linux
+  zombie state alone was insufficient evidence that the driver had completed
+  cleanup. There was no foreign workload to terminate or launch retry to select.
+  The original partial summary/log are preserved, not relabelled complete.
+- Completed results retained: control c1/c8/c16 medians156.205/576.187/779.276,
+  candidate156.730/578.810/778.894. Engine32K control/candidate2586.884/2587.658ms,
+  128K10889.242/10915.566ms. Quality means-2.738888/-2.731376, all12needles pass.
+  These do not complete the planned comparison or justify default promotion.
+- Fix: capture owned process IDs before shutdown plus remaining zombies;
+  after bounded process teardown, poll only those IDs in the GPU driver until
+  gone (30s deadline, 0.25s interval, each nvidia-smi query bounded10s).
+  Foreign processes are only recorded, never signalled or waited out; the
+  next-start all-GPU preflight still refuses them. Query failures fail closed.
+  Persist samples, timeout/error and completed measurements in every teardown
+  outcome. Campaign-level status now records preflight refusal and completion.
+- CPU suite266pass/oneGPUskip, including delayed-owned-entry, foreign-work,
+  timeout, query-failure and retained-receipt tests. Three prescribed tiny
+  CUDA-worker lifecycle checks exit0 and record released devices. These tiny
+  cases have zero delayed entries on their first poll; the delay itself is
+  evidenced by the real model failure and exercised with injected CPU reports.
+- Measurement invariance: request, cold-prefix verifier, round_requests and
+  observer_return_rounds ASTs match6ede3298e exactly. Other seven benchmark
+  files, model files and native libraries unchanged. This is an explicitly
+  recorded controller-source change AFTER the aborted process chain ended.
+- Continuation prescribed before further timings: exactly TWO remaining BF16
+  candidate starts, then ONE FP32 return, same flags/workload/binary. Output
+  mhc-paired-serving-remainder/ and mhc-paired-return-control/. Combine original
+  candidate boot1 with remainder boots1/2 as the three prescribed candidates;
+  no additional replacement control/candidate starts and no result exclusions.
+  Tensor-core probe stays unbuilt until the serving comparison finishes.
+- Raw: runtime-control/mhc-paired-aba.log; mhc-paired-{fp32-control,serving}/;
+  driver-release-{cpu-tests.xml,final-cpu-tests.xml,measurement-ast.txt,live.log},
+  driver-release-live-{1,2,3}.json under runtime-control. No active GPU jobs
+  remain after the bounded lifecycle checks.

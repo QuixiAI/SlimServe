@@ -59,16 +59,103 @@ def test_teardown_always_persists_completed_work_and_failure(
         return []
 
     monkeypatch.setattr(bench, "stop_owned", stop)
+    monkeypatch.setattr(bench, "process_group_snapshot", lambda _: [])
+    monkeypatch.setattr(bench, "gpu_compute_pids", lambda: [])
     if fails:
         with pytest.raises(RuntimeError, match="owned group"):
-            bench.finish_owned_run(SimpleNamespace(returncode=0), run, receipt, record)
+            bench.finish_owned_run(
+                SimpleNamespace(pid=11, returncode=0), run, receipt, record
+            )
     else:
-        bench.finish_owned_run(SimpleNamespace(returncode=0), run, receipt, record)
+        bench.finish_owned_run(
+            SimpleNamespace(pid=11, returncode=0), run, receipt, record
+        )
     saved = json.loads(record.read_text())["runs"][0]
     assert saved["status"] == ("failed" if fails else "complete")
     assert saved["teardown"]["status"] == ("failed" if fails else "complete")
     assert saved["quality"] == {"passed": True}
     assert saved["prefill"] == [123]
+
+
+def test_gpu_release_waits_for_owned_driver_entries_not_foreign_work(monkeypatch):
+    bench = _load(monkeypatch)
+    reports = iter([[12, 99], [12, 99], [99]])
+    monkeypatch.setattr(bench, "gpu_compute_pids", lambda: next(reports))
+    monkeypatch.setattr(bench.time, "sleep", lambda _: None)
+    evidence = {}
+    bench.wait_owned_gpu_release({11, 12}, evidence)
+    assert evidence["status"] == "complete"
+    assert [r["owned_active_pids"] for r in evidence["samples"]] == [[12], [12], []]
+    assert all(r["other_active_pids"] == [99] for r in evidence["samples"])
+
+
+def test_gpu_release_timeout_keeps_measurements_and_teardown_receipt(
+    monkeypatch, tmp_path
+):
+    bench = _load(monkeypatch)
+    zombie = {"pid": 12, "ppid": 1, "state": "Z"}
+    monkeypatch.setattr(bench, "process_group_snapshot", lambda _: [zombie])
+    monkeypatch.setattr(bench, "stop_owned", lambda _: [zombie])
+    monkeypatch.setattr(bench, "gpu_compute_pids", lambda: [12])
+    ticks = iter([0, 31])
+    monkeypatch.setattr(bench.time, "monotonic", lambda: next(ticks))
+    run = {"status": "complete", "measurements": [{"exact": True}]}
+    receipt = {"status": "running", "runs": [run]}
+    record = tmp_path / "summary.json"
+    with pytest.raises(RuntimeError, match="GPU processes did not release"):
+        bench.finish_owned_run(
+            SimpleNamespace(pid=11, returncode=0), run, receipt, record
+        )
+    saved = json.loads(record.read_text())
+    assert saved["status"] == "failed"
+    teardown = saved["runs"][0]["teardown"]
+    assert teardown["status"] == "failed"
+    assert teardown["remaining_zombies"] == [zombie]
+    assert teardown["gpu_release"]["samples"][0]["owned_active_pids"] == [12]
+    assert saved["runs"][0]["measurements"] == [{"exact": True}]
+
+
+def test_next_boot_refuses_foreign_gpu_work_and_persists_failure(monkeypatch, tmp_path):
+    bench = _load(monkeypatch)
+    monkeypatch.setattr(bench, "gpu_compute_pids", lambda: [99])
+    receipt = {"status": "running", "runs": [{"status": "complete"}]}
+    record = tmp_path / "summary.json"
+    with pytest.raises(RuntimeError, match="already have compute"):
+        bench.require_gpus_free(receipt, record, 2)
+    saved = json.loads(record.read_text())
+    assert saved["status"] == "failed"
+    assert saved["blocked_before_boot"] == 2
+    assert saved["runs"] == [{"status": "complete"}]
+
+
+def test_gpu_pid_query_deduplicates_and_has_a_timeout(monkeypatch):
+    bench = _load(monkeypatch)
+
+    def query(argv, **kwargs):
+        assert "--query-compute-apps=pid" in argv
+        assert kwargs == {"text": True, "timeout": 10}
+        return "12\n11\n12\n"
+
+    monkeypatch.setattr(bench.subprocess, "check_output", query)
+    assert bench.gpu_compute_pids() == [11, 12]
+
+
+def test_failed_gpu_query_is_never_interpreted_as_free_hardware(monkeypatch, tmp_path):
+    bench = _load(monkeypatch)
+
+    def query():
+        raise RuntimeError("driver query failed")
+
+    monkeypatch.setattr(bench, "gpu_compute_pids", query)
+    evidence = {}
+    with pytest.raises(RuntimeError, match="driver query failed"):
+        bench.wait_owned_gpu_release({11}, evidence)
+    assert evidence["status"] == "failed"
+    receipt = {"runs": []}
+    record = tmp_path / "summary.json"
+    with pytest.raises(RuntimeError, match="driver query failed"):
+        bench.require_gpus_free(receipt, record, 1)
+    assert json.loads(record.read_text())["status"] == "failed"
 
 
 @pytest.mark.parametrize("live", [False, True])

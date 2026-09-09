@@ -65,8 +65,19 @@ is SM120/aligned-BF16 only, preserving scalar fallback for odd storage offsets
 and other platforms/dtypes. Native QC136723a73c921cb333e5b1cb367610bb22b8cc624008c8d8d6684528d2717e9d
 passed this qualification; the previous f52 binary is saved as runtime-control/
 mhc-paired-native-before.so.54 operator tests, four alignment memchecks and
-all7020 installed census cases pass; fixed1/3/1 FP32/BF16/FP32 cold-profile
-validation is next. All69 existing mHC kernels preserve resource usage;
+all7020 installed census cases pass. The fixed1/3/1 FP32/BF16/FP32 cold-profile
+series completed its control and first candidate, including every gate, but
+stopped BEFORE candidate start2: Linux recorded worker1383457 as a zombie,
+while the next GPU preflight still saw that same PID in the driver. It soon
+disappeared without intervention. The controller now waits for owned driver
+entries to clear and records preflight failures. Timing/streaming routines are
+unchanged (AST checked); the other seven benchmark hashes and all native
+libraries stay unchanged. Continue exactly TWO missing candidate starts in
+mhc-paired-serving-remainder/, then mhc-paired-return-control/. Preserve both
+completed starts and the interrupted-series log; do not replace their results.
+First control/candidate c1 medians156.205/156.730; cold32K2.58688/2.58766s,
+128K10.88924/10.91557s. No promotion from this incomplete comparison.
+All69 existing mHC kernels preserve resource usage;
 two paired variants add no spills. Global/profile BF16-storage default staysOFF.
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
 was shared across separately loaded CUDA modules, while kernel attributes

@@ -252,8 +252,9 @@ def stop_owned(process):
             continue
         # A parent can exit before its workers. Nsight may adopt terminated
         # workers without reaping them until this controller exits. Zombies
-        # cannot execute or retain GPU resources; record, but do not wait on,
-        # those entries. Any live member still requires bounded escalation.
+        # cannot execute; record them without waiting for their reaper. The
+        # separate GPU-release gate must still wait for driver cleanup to
+        # remove their compute-process entries. Live members need escalation.
         deadline = time.monotonic() + timeout
         while True:
             members = process_group_snapshot(process.pid)
@@ -268,19 +269,75 @@ def stop_owned(process):
     )
 
 
+def gpu_compute_pids():
+    raw = subprocess.check_output(
+        ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+        text=True,
+        timeout=10,
+    )
+    return sorted({int(line.strip()) for line in raw.splitlines() if line.strip()})
+
+
+def wait_owned_gpu_release(owned_pids, evidence, timeout=30):
+    """Bounded read-only wait for this run's driver entries, not foreign jobs."""
+    owned_pids = set(owned_pids)
+    evidence.update(status="waiting", owned_pids=sorted(owned_pids), samples=[])
+    started = time.monotonic()
+    while True:
+        try:
+            active = set(gpu_compute_pids())
+        except BaseException as error:
+            evidence.update(status="failed", error=repr(error))
+            raise
+        elapsed = time.monotonic() - started
+        remaining = sorted(active & owned_pids)
+        evidence["samples"].append(
+            {
+                "elapsed_seconds": elapsed,
+                "owned_active_pids": remaining,
+                "other_active_pids": sorted(active - owned_pids),
+            }
+        )
+        if not remaining:
+            evidence.update(status="complete", elapsed_seconds=elapsed)
+            return
+        if elapsed >= timeout:
+            evidence.update(status="failed", elapsed_seconds=elapsed)
+            raise RuntimeError(f"owned GPU processes did not release: {remaining}")
+        time.sleep(0.25)
+
+
+def require_gpus_free(receipt, record, boot):
+    try:
+        active = gpu_compute_pids()
+        if active:
+            raise RuntimeError(f"GPUs already have compute processes: {active}")
+    except BaseException as error:
+        receipt.update(status="failed", blocked_before_boot=boot, error=repr(error))
+        record.write_text(json.dumps(receipt, indent=2) + "\n")
+        raise
+
+
 def finish_owned_run(process, run, receipt, record):
     # A teardown exception must not leave the on-disk run marked 'running',
     # lose completed quality/prefill results, or start another server.
     try:
+        members = process_group_snapshot(process.pid)
+        owned = {process.pid, *(row["pid"] for row in members)}
+        run["teardown"] = {"status": "stopping", "initial_owned_processes": members}
         zombies = stop_owned(process)
-        run["teardown"] = {
-            "status": "complete",
-            "returncode": process.returncode,
-            "remaining_zombies": zombies,
-        }
-    except Exception as error:
+        owned.update(row["pid"] for row in zombies)
+        run["teardown"].update(
+            returncode=process.returncode,
+            remaining_zombies=zombies,
+            gpu_release={},
+        )
+        wait_owned_gpu_release(owned, run["teardown"]["gpu_release"])
+        run["teardown"]["status"] = "complete"
+    except BaseException as error:
         run["status"] = "failed"
-        run["teardown"] = {"status": "failed", "error": repr(error)}
+        receipt["status"] = "failed"
+        run.setdefault("teardown", {}).update(status="failed", error=repr(error))
         raise
     finally:
         record.write_text(json.dumps(receipt, indent=2) + "\n")
@@ -464,6 +521,7 @@ def main():
     }
     command = lambda *cmd: subprocess.check_output(cmd, text=True).strip()
     receipt = {
+        "status": "running",
         "benchmark_implementation_sha256": require_benchmark_sources(),
         "git_commit": command("git", "rev-parse", "HEAD"),
         "git_status": command("git", "status", "--short"),
@@ -486,11 +544,7 @@ def main():
     record = args.output / "summary.json"
     for boot in range(1, args.boots + 1):
         require_benchmark_sources()
-        active = command(
-            "nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"
-        )
-        if active:
-            raise RuntimeError(f"GPUs already have compute processes: {active}")
+        require_gpus_free(receipt, record, boot)
         folder = args.output / f"boot-{boot}"
         folder.mkdir()
         port = free_port()
@@ -709,6 +763,11 @@ def main():
             finally:
                 finish_owned_run(process, run, receipt, record)
     receipt["aggregates"] = {}
+    receipt["status"] = (
+        "complete"
+        if all(r["status"] == "complete" for r in receipt["runs"])
+        else "failed"
+    )
     for c in args.concurrency:
         values = [
             m["aggregate_output_tps"]
