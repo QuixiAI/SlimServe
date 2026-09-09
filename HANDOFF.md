@@ -171,8 +171,19 @@ The opt-in canonical-order diagnostic is locally qualified:407 CPU tests,
 14 alignment GPU tests plus3 integrated tests pass; bounded memory/sync/race
 checks are clean. This deliberately adds a sorting launch AFTER alignment to
 test causality; it is not the final production implementation. The prescribed
-single-start three-pass run is mhc-canonical-moe-quality-diagnostic/ with
-SLIMSERVE_GLM53_CANONICAL_MOE=1 and the same three journals; results pending.
+single-start three-pass run mhc-canonical-moe-quality-diagnostic/ now completes
+on63d7704b0: all4096 text-token scores are exactly identical across all3 passes,
+as are all1024 traced model tensor hashes per rank and every1K needle score.
+All168 requests are cold and all18 retrieval contrasts pass. Long8K/32K needle
+scores still vary (max1.623/1.937nat per scored token); this is NOT complete
+model repeatability. Native/recipe unchanged, TC0; sorting remains diagnostic.
+Raw verification: runtime-control/mhc-canonical-moe-quality-analysis.json.
+Next isolate the long-context path, starting with top_k_per_row_prefill:
+sampler.cu emits selected indices using atomic positions and has unstable
+cutoff ties; the short <=512-pool shortcut is deterministic. This is a lead,
+not yet a demonstrated cause of the remaining long-context scores.
+Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
+the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
 do not relax quality gates or promote TC. This is diagnosis, not a throughput
 baseline. TC stays OFF.

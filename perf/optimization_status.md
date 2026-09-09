@@ -24116,3 +24116,53 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   TC accuracy contract; TC remains OFF. No production/default promotion here.
 - Raw qualification: runtime-control/mhc-canonical-moe-{final-cpu,gpu,integrated}-tests.xml,
   mhc-canonical-moe-{memcheck,synccheck,racecheck}-tests.xml and associated logs.
+
+## 2026-09-09 - Canonical MoE removes short-prompt score variation, long-context remains
+
+- Status: causal intervention succeeds for the4096 text-token quality sample;
+  broader repeatability remains unresolved. No production/default promotion.
+- Prescribed63d7704b0 run completes with unchanged nativeQC4ce801/recipe v1,
+  BF16-storage1/TC0, one boot/three full quality passes. All168 quality requests
+  cached0;12,288 text scores/18 positive retrieval contrasts, all75 priming
+  requests complete. Instrumented TPS108.772/458.018/645.271 is NOT a baseline.
+- Every one of the4096 text scores is now bit-identical across allthree passes,
+  mean -2.7282744364256297 each; pair mean-abs/RMS/max are allzero. Before the
+  intervention on7f011a235, RMS was0.430-0.435. Every one of the1024 traced
+  tensor fingerprints per worker is identical across all3 passes/all4 workers.
+  All4x3x639 GPU scores matchHTTP, all300 archives/source/native hashes verify,
+  canonical routing/semantic routes/static weights/workspaces/links all pass.
+  The95 tensors preceding the first alignment permutation also match the
+  original run exactly on all4 ranks. This is origin isolation, not merely a
+  repeatable new aggregate score.
+- Important remaining failure: all1K retrieval candidate scores are identical,
+  but8K has28/28 changed candidate-token scores for every pair/position, max
+  absolute1.623334nat, RMS0.167-0.419. 32K has27-28/28 changes, max1.936955nat,
+  RMS0.136-0.389. Every contrast still ranks the true code first, but do not
+  call the complete workload deterministic. Prompt and suffix IDs are identical.
+- Decision: keep canonical ordering as a proven diagnostic intervention;
+  defer production alignment tuning until the remaining path is isolated.
+  Keep TC OFF and the existing accuracy contract unchanged.
+- Next lead from local source: glm5_next_indexer selects512 complete pools,
+  expands each to4 tokens, then appends the incomplete tail. sampler.cu's
+  topKPerRowJob directly returns ascending indices for <=512 visible pools;
+  beyond that it emits many selected positions through atomic counters and
+  resolves cutoff ties using atomic-arrival/shared-item ordering. Order and
+  possibly tie membership may vary. This is NOT yet causal proof of the long
+  GLM result. First run a bounded installed-kernel reproducer, then observe
+  the actual8K request's selection inputs/outputs without changing its math.
+- Newly inspected primary precedent, not transplanted:
+  https://github.com/vllm-project/vllm/issues/52525 and draft
+  https://github.com/vllm-project/vllm/pull/52532 (e8a07dc) independently identify
+  Marlin within-expert ordering sensitivity. The proposal sorts composite
+  region/token keys after alignment and excludes undefined tails; contributor
+  reports are not our benchmarks. PR24722 documents DP plus stream-K scheduling:
+  https://github.com/vllm-project/vllm/pull/24722 . Our fixed-layout replay is
+  the GLM evidence. Existing vendored CUDA/Metal alignment also uses atomic
+  cursor scatter; preserve the local fused small-M router when implementing
+  stable order at its source.
+- Raw: mhc-canonical-moe-quality-diagnostic/;
+  runtime-control/mhc-canonical-moe-quality-analysis.json
+  SHA591ceb81724cb766e0d5daf019c66eb93df58228b62df52d8a9942bcb5d268b0.
+  Analyzer: scratch quality-diagnostics/analyze_canonical_moe_trace.py.
+  All processes exit0 and GPUs release in0.088s. No native builds or
+  competing GPU work during the run; no replacements/exclusions.
