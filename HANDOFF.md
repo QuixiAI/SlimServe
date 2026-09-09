@@ -140,12 +140,17 @@ in each pair, mean absolute0.247-0.250nat/token, RMS0.427-0.437, max4.114-5.092.
 All168 quality requests cached0;12,288 scored tokens/18 positive contrasts.
 Raw mhc-quality-serialized-diagnostic/ and its runtime-control analysis. Launch
 completion serialization did not remove the variation; it does not rule out
-intra-kernel/cross-rank issues. Next: ONE same serialized three-pass diagnostic,
-mhc-quality-score-trace-diagnostic/, with an opt-in bounded score journal for
-exact text window0. Fingerprint the prompt-head input, logits, log-softmax,
-target IDs and selected scores on each worker; compare final scores with HTTP.
-Blocking tensor copies deliberately perturb execution, so require the variation
-to reproduce under instrumentation before localizing it. TC stays OFF.
+intra-kernel/cross-rank issues. The score-boundary trace now completes onc1764a5d0:
+all4 workers x3 passes x639 GPU scores exactly match HTTP. Every stage agrees
+across ranks within a pass, but the prompt-head INPUT already differs between
+all three identical requests. Full-workload per-token RMS remains0.427-0.444,
+so instrumentation did not remove the variation. Raw
+mhc-quality-score-trace-diagnostic/ and runtime-control/mhc-quality-score-trace-analysis.json.
+Next: bounded model-boundary fingerprints through the existing compile-opaque
+mHC custom ops, plus immediate model return, to find the first varying interval
+and distinguish forward variation from later buffer clobber. Keep compilation,
+recipe and arithmetic unchanged, and require reproduction under that trace.
+This is diagnosis, not a quality pass or throughput baseline. TC stays OFF.
 E2E control/candidate/return157.051/156.928/156.712 c1,
 578.818/578.200/577.166 c8,781.849/779.553/777.069 c16. Candidate medians lie
 between controls, but retain the slower c16 samples. Cold32K2582.669/

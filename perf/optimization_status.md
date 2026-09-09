@@ -23853,3 +23853,42 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   narrow the next investigation. No quality-threshold change or TC promotion.
 - Validation:23 new CPU cases; full SlimServe suite366passed/one skip,14
   existing deprecation warnings. Raw runtime-control/mhc-score-journal-cpu-tests.xml.
+
+## 2026-09-09: Score-boundary trace places variation upstream of prompt scoring
+
+- Status: COMPLETE diagnostic onc1764a5d0/nativeQC4ce801, same selected recipe,
+  TC0/BF16-storage1, CUDA_LAUNCH_BLOCKING1. Exactly one start/three full quality
+  passes, nine priming rounds/75 exact cold requests; no retries, source/native
+  changes or competing workloads. All168 quality requests cached0,12,288 text
+  scores and18 positive retrieval contrasts. Teardown exit0; GPU release0.985s.
+- All four journals contain exactly three complete five-stage matches for the
+  same640-token window0. Source/config/native/client hashes verified. EVERY
+  stage agrees bit-for-bit across all four ranks within each pass. Across each
+  pair of passes, head input/logits/log-softmax/selected scores differ; target
+  IDs remain identical. All4x3x639 GPU-selected scores equal the raw API scores
+  exactly, with final-vector hashes independently recomputed from their values.
+- The first recorded boundary already varies: the639x4096 BF16 prompt-head
+  INPUT has three distinct hashes. This is after normal forward and next-token
+  bookkeeping, so it narrows the investigation upstream of this scoring path
+  without claiming a particular model layer or excluding buffer clobber.
+- Full32-window means -2.737223467/-2.727080608/-2.732775350. Pair1/2,1/3,2/3:
+  changed4096/4096/4095; mean absolute0.243317/0.248876/0.247693nat/token;
+  RMS0.426917/0.444092/0.431822; max4.438467/4.400424/3.902962;
+  26/28/24 windows differ by>0.01. The traced window's full639 scores ALL differ
+  per pair, RMS0.315967/0.330627/0.288500. Instrumentation did not suppress the
+  observed variation. Neither cross-rank agreement nor aggregate similarity
+  establishes model correctness. No gate changes; TC remains OFF.
+- Next: trace model inputs and immediate return, plus existing compile-opaque
+  mHC op inputs/outputs at all90 sites/final post. These boundaries bracket
+  attention/MLP/normalization intervals without disabling compilation or
+  changing arithmetic. Reproduce variation under the bounded trace, then
+  isolate the first differing interval; do not guess from source alone.
+- Raw: perf/results/2026-09-09/mhc-quality-score-trace-diagnostic/ including
+  score-trace/score-{1701099,1701309,1701469,1701636}.jsonl;
+  runtime-control/mhc-quality-score-trace-{diagnostic.log,analysis.json}.
+  Read-only analyzer and its source hash retained in scratch
+  author-fix.ODpxHi/analyze_score_trace.py and the analysis receipt. SummarySHA
+  4b89ef9da976083ace2adaadfbe2e2c6c9a1a2ee3b9fd0b72dfcf61386fe6273;
+  qualitySHA7430b7a9f78cf53ebec9e74e88b74c15d288f4b35b443f296392f8a4f9e45e3d;
+  7f5def4d35e7ca46cadde8ec45d04cb7f606a89ab9f4bd5ba4cd214021c2a6c4;
+  ad80be53f3cefe7a93dce94b28a31b1b3a8082f28faba1aeb263c95160ebd5e9.
