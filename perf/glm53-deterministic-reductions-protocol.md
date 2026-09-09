@@ -107,3 +107,38 @@ text/image, repeated quality and32K/128K prefill workloads. Match every score
 across identical-policy starts, retain comparisons to older mixed-tree references,
 and keep TC0/no promotion until the appropriate quality/performance gates pass.
 No full-model start names or launches are prescribed by this checkpoint alone.
+
+## Read-only graph receipts and bounded GPU frontend check
+
+`slimserve/reduction_receipts.py` inspects actual PyCodeCache module globals
+before and after CUDA graph capture. It records module/symbol/object bindings,
+source hashes (raw and cache-root-normalized), complete launcher config dictionaries
+and binary hashes. It never resolves a future, compiles, selects a launcher, reads
+tensor values or changes an autotuner. Missing/uninspectable named RMSNorm globals,
+unselected or nondeterministic reductions and active dynamic scaling fail closed.
+The recorder runs only for native-order1 plus explicit deterministic=True, stores
+exclusive rank/PID files beneath the private VLLM cache, and preserves failures.
+Default paths remain unchanged.118 CPU tests pass; source/native defaults unchanged.
+
+Before full-model serving, prescribe ONE16GiB/no-swap GPU process with a fresh
+output `perf/results/2026-09-09/deterministic-reduction-frontend`:
+
+```bash
+systemd-run --user --scope --unit=glm53-reduction-frontend \
+  -p MemoryMax=16G -p MemorySwapMax=0 \
+  env -u CUDA_LAUNCH_BLOCKING CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  CUDA_HOME=/usr/local/cuda-13.0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_reduction_frontend \
+  --model /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 \
+  --output perf/results/2026-09-09/deterministic-reduction-frontend
+```
+
+Two real vLLM RMSNorm IR graphs (in-place and three returned copies), lowered
+through VllmIRLoweringPass with the recorded compiler options, rows1/16/640/7616.
+Eight cases, real layer22 BF16 norm vector, seeds530901/531001. Require finite
+outputs, repeated eager/changed-input graph equality, input/weight/guard checks,
+FP64 maximum1 BF16 ULP, and complete before/after live graph receipts. One GPU
+does the arithmetic; the runner facade only tests the recorder's startup wiring,
+NOT a TP4 forward or full-model equivalence. Never label this full-model validation.
+Freeze sources through this job and audit; preserve failures and do not retry into
+the same output. No full-model start is prescribed until this check is assessed.

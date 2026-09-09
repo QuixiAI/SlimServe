@@ -26336,3 +26336,26 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   empty-cache starts plus a cached return with exact scores, cold throughput and
   long-prefill checks. Do not infer full graph coverage from static callbacks,
   promote the policy, clear TC, or claim startup variability/performance solved.
+
+## 2026-09-09 - Read-only deterministic graph receipts and frontend qualification
+
+- Status: recorder implemented, CPU checks pass; one bounded GPU frontend process
+  prescribed, not yet run. Full-model deterministic policy remains unqualified.
+- Baseline: two source-runtime processes32/32 pass known binary/FP64/repeat checks;
+  existing candidate records deterministic=True in the explicit compilation plan.
+- Hypothesis: real IR lowering must emit this policy, and actual graph globals
+  must hold selected deterministic reductions before and after graph capture.
+- Change: read-only startup scanner records every actual graph-held autotuner,
+  aliases, modules/symbols, raw/normalized source hashes, complete config dicts
+  and selected binary hashes. It preserves failures and rejects missing/uninspectable
+  RMSNorm globals or wrong/unselected reduction policy. No future resolution,
+  kernel selection, tensor reads or autotuner mutation; default paths unchanged.
+- CPU118pass6.03s/14 existing warnings, lint passes. New scanner tests cover aliases,
+  duplicate module references, no mutations, missing binary/source/metadata and
+  wrong numerical modes. Benchmark receipts now include24 source files.
+- Decision: ONE fresh16GiB/no-swap frontend probe, eight cases (two actual vLLM
+  RMSNorm IR graphs x rows1/16/640/7616), real layer22 weight, eager/graph/oracle
+  and installed recorder checks. No TP4/full-model claim. Full commands/gates
+  in `perf/glm53-deterministic-reductions-protocol.md`; no model starts yet.
+- Raw: `runtime-control/reduction-receipts-cpu.log`; prescribed
+  `deterministic-reduction-frontend/`. No quant/native/profile/TC/default changes.

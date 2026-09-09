@@ -1019,6 +1019,9 @@ class GPUModelRunner(
         from slimserve.rmsnorm_diagnostic import install as install_rmsnorm_diagnostic
 
         install_rmsnorm_diagnostic(self)
+        from slimserve.reduction_receipts import install as install_reduction_receipts
+
+        install_reduction_receipts(self)
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len

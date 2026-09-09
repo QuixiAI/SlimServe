@@ -90,6 +90,7 @@ def benchmark_sources():
         "vllm/utils/jit_monitor.py",
         "slimserve/glm53_ordering.py",
         "slimserve/deterministic_reductions.py",
+        "slimserve/reduction_receipts.py",
         "slimserve/rmsnorm_diagnostic.py",
         "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
         "vllm/v1/worker/gpu_model_runner.py",
