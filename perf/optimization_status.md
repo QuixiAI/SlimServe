@@ -23503,3 +23503,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Raw runtime-control/mhc-fp64-{pairwise-tests.xml,rounder-equivalence.log}.
   Prescribed bounded six-case recheck will verify identical recorded accuracy
   results before the frozen full census; no GPU kernel or serving change.
+- Pairwise rounder recheck completes: six eager cases/18 graph phases,
+  identical accuracy metrics and strict-parity diagnostics to the original
+  first check, including all31,195,136 coordinates per eager case.19.788s
+  versus77.361s for this checker workload, not a GPU throughput result.
+  Raw mhc-tc-accuracy-pairwise-check/ and
+  runtime-control/mhc-fp64-first-check-equivalence.log. Full2700-case census
+  then starts onaf3113740 with unchanged numerical contract/code/binaries;
+  original and pairwise first checks remain separate complete receipts.
+- Prepared the subsequent isolated timing gate while the census runs; it
+  cannot time a bounded/failed/unfinished census. It verifies all2700 ordered
+  journal rows/8100 graph phases, seeds, numerical gates, RMS consistency,
+  unchanged partial bounds and source/binary/parameter hashes. Old strict
+  parity failures remain counted, not renamed passes.25 CPU tests pass,
+  including malformed, incomplete, stale and falsely marked-passed receipts.
+  No GPU timing executed yet. Only used BF16 weight banks are allocated in
+  this timing driver, with the same six activation seeds and540-site rotation;
+  the original timing helper's unused FP32 bank copies are not needed.
+  Raw runtime-control/mhc-tc-qualified-timing-cpu-tests.xml. Next command,
+  only after the complete accuracy census and free-GPU preflight:
+  `python -m benchmarks.kernels.benchmark_glm53_mhc_tc_qualified --census
+  perf/results/2026-09-09/mhc-tc-accuracy-census --output
+  perf/results/2026-09-09/mhc-tc-qualified-timing` inside a16GiB/no-swap scope.
