@@ -23749,3 +23749,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   018a7473ed8db71c10abe533e7be3cfe7a9c2baa30e1925832e60ac0133505e9;
   candidate7a0cc77925ce97b12913946cc31362a487eec0714ed23b5a983fb8c2f18ff1e7;
   returna777599019f4ae08e4810686572e9b8fa34f9251bc8b90973548af8900b7b638.
+
+## 2026-09-09: Add bounded same-process quality-repeat diagnostics
+
+- Status: diagnostic harness ready; no kernel/profile change. Numerical gates
+  and benchmark_glm53_quality.py request/scoring implementation unchanged.
+- Add --quality-repeats (default1) to the existing real-profile controller.
+  First pass keeps quality.json and its historical primary summary fields;
+  further passes get distinct quality-repeat-N.json files. Record before/after
+  each pass, preserve partial failures, stop on scoring/needle failure, never
+  substitute a later score. Values>1 are explicitly diagnostic-only and not
+  eligible as throughput baselines. Nine new CPU cases exercise invalid CLI
+  values and completed/failed first/later passes; full suite343pass/one skip.
+- Prescribed ONE start: existing150GiB/no-swap environment above,
+  VLLM_GLM5_MHC_PREFILL_TC=0,VLLM_GLM5_MHC_BF16_FN=1, nativeQC4ce801,
+  .venv/bin/python benchmarks/benchmark_glm53_campaign.py --profile
+  glm53-nvfp4-4 --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt
+  --output perf/results/2026-09-09/mhc-quality-repeat-diagnostic --boots1
+  --repeats3 --cold-prefix --quality --quality-repeats3. No profiler, long-
+  prefill timing extension, arithmetic changes or extra restarts. Full32-window/
+  six-needle workload runs three times in the SAME live model after normal
+  exact-token workload priming. Retain every token score and cache receipt.
+- Hypothesis: determine whether score variation exists within a live process
+  or needs a new start. This does not prove the underlying cause and does not
+  override the failed tensor-core promotion gate. Raw CPU tests:
+  runtime-control/mhc-quality-repeats-cpu-tests.xml. Live diagnostic output is
+  the prescribed directory above, not a replacement serving baseline.

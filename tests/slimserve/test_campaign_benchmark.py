@@ -27,9 +27,12 @@ def _load(monkeypatch):
         ["--cuda-trace-concurrency", "8"],
         ["--cuda-traces", "--cuda-trace-concurrency", "4"],
         ["--cuda-traces", "--concurrency", "8"],
+        ["--quality-repeats", "0"],
+        ["--quality-repeats", "-1", "--quality"],
+        ["--quality-repeats", "2"],
     ],
 )
-def test_cuda_single_range_configuration_fails_before_hardware_probe(
+def test_invalid_campaign_configuration_fails_before_hardware_probe(
     monkeypatch, options
 ):
     bench = _load(monkeypatch)
@@ -42,6 +45,70 @@ def test_cuda_single_range_configuration_fails_before_hardware_probe(
     with pytest.raises(SystemExit) as error:
         bench.main()
     assert error.value.code == 2
+
+
+@pytest.mark.parametrize("repeats", [1, 3])
+@pytest.mark.parametrize("failure", [None, "score", "needle"])
+def test_quality_passes_preserve_every_pass_without_replacement(
+    monkeypatch, tmp_path, repeats, failure
+):
+    bench = _load(monkeypatch)
+    calls, snapshots = [], []
+    run = {}
+    expected_calls = min(2, repeats) if failure else repeats
+
+    def scorer(args, tokenizer):
+        calls.append(args)
+        assert (
+            args.pairs == 32 and args.prefix_tokens == 512 and args.score_tokens == 128
+        )
+        assert args.needle_contexts == [1024, 8192, 32768]
+        assert args.needle_positions == [0.25, 0.75]
+        assert tokenizer == "tokenizer"
+        if failure == "score" and len(calls) == expected_calls:
+            raise RuntimeError("scoring failed")
+        return {
+            "summary": {
+                "all_needles_rank_first": not (
+                failure == "needle" and len(calls) == expected_calls
+                ),
+                "mean_text_logprob": -float(len(calls)),
+            }
+        }
+
+    monkeypatch.setitem(
+        bench.sys.modules, "benchmark_glm53_quality", SimpleNamespace(run=scorer)
+    )
+    args = SimpleNamespace(quality_repeats=repeats, source=tmp_path / "source")
+
+    def check():
+        bench.quality_passes(
+            args,
+            "url",
+            "model",
+            "model-dir",
+            "tokenizer",
+            tmp_path,
+            run,
+            lambda: snapshots.append(json.loads(json.dumps(run))),
+        )
+
+    if failure:
+        with pytest.raises((ValueError, RuntimeError)):
+            check()
+    else:
+        check()
+    assert len(calls) == expected_calls
+    assert [a.output.name for a in calls] == ["quality.json"] + [
+        f"quality-repeat-{i}.json" for i in range(2, expected_calls + 1)
+    ]
+    assert run["quality_path"] == str(tmp_path / "quality.json")
+    assert len(snapshots) == expected_calls * 2
+    assert snapshots[-1] == run
+    assert run["quality_passes"][-1]["status"] == ("failed" if failure else "complete")
+    if repeats > 1 or failure != "score":
+        assert run["quality"]["mean_text_logprob"] == -1.0
+    assert all(r["status"] == "complete" for r in run["quality_passes"][:-1])
 
 
 @pytest.mark.parametrize("fails", [False, True])

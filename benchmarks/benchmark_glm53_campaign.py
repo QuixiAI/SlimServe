@@ -425,6 +425,54 @@ def observer_return_rounds(args, base, model, prompts, folder):
     return rows
 
 
+def quality_passes(args, base, model, model_dir, tokenizer, folder, run, save):
+    """Repeat fixed scoring on one live model, preserving every partial pass.
+
+    The first pass keeps the historical filename/summary fields. Additional
+    passes are an explicit reproducibility diagnostic, not replacement scores.
+    """
+    from benchmark_glm53_quality import run as run_quality
+
+    run["quality_passes"] = []
+    for repeat in range(1, args.quality_repeats + 1):
+        require_benchmark_sources()
+        path = folder / (
+            "quality.json" if repeat == 1 else f"quality-repeat-{repeat}.json"
+        )
+        row = {"repeat": repeat, "path": str(path), "status": "running"}
+        run["quality_passes"].append(row)
+        if repeat == 1:
+            run["quality_path"] = str(path)
+        save()
+        try:
+            quality = run_quality(
+                argparse.Namespace(
+                    url=base,
+                    model=model,
+                    tokenizer=str(model_dir),
+                    source=args.source,
+                    output=path,
+                    pairs=32,
+                    prefix_tokens=512,
+                    score_tokens=128,
+                    needle_contexts=[1024, 8192, 32768],
+                    needle_positions=[0.25, 0.75],
+                ),
+                tokenizer,
+            )
+            row["summary"] = quality["summary"]
+            if repeat == 1:
+                run["quality"] = quality["summary"]
+            if not quality["summary"]["all_needles_rank_first"]:
+                raise ValueError("needle contrast gate failed")
+            row["status"] = "complete"
+        except BaseException as error:
+            row.update(status="failed", error=repr(error))
+            raise
+        finally:
+            save()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", default="glm53-nvfp4-4")
@@ -463,6 +511,12 @@ def main():
         help="score exact continuations and needle contrasts after timed work",
     )
     ap.add_argument(
+        "--quality-repeats",
+        type=int,
+        default=1,
+        help="repeat quality without restarting; >1 is diagnostic only",
+    )
+    ap.add_argument(
         "--prefill",
         action="store_true",
         help="record cold-cache 32K/128K exact-ID TTFT after other workloads",
@@ -473,6 +527,8 @@ def main():
         help="with --prefill, trace additional cold requests after all TTFT timings",
     )
     args = ap.parse_args()
+    if args.quality_repeats < 1 or (args.quality_repeats != 1 and not args.quality):
+        ap.error("positive --quality-repeats requires --quality when greater than 1")
     if args.cuda_trace_concurrency is not None and not args.cuda_traces:
         ap.error("--cuda-trace-concurrency requires --cuda-traces")
     if args.cuda_traces:
@@ -529,8 +585,10 @@ def main():
         "plan": dataclasses.asdict(plan),
         "compatible_profiles": compatible,
         "command": sys.argv,
-        "diagnostic_only": args.routing or args.cuda_traces,
-        "throughput_is_baseline_eligible": not (args.routing or args.cuda_traces),
+        "diagnostic_only": args.routing or args.cuda_traces or args.quality_repeats > 1,
+        "throughput_is_baseline_eligible": not (
+            args.routing or args.cuda_traces or args.quality_repeats > 1
+        ),
         "cuda_profiler_ranges": args.cuda_traces,
         "runtime": runtime_identity(),
         "environment": {
@@ -709,29 +767,16 @@ def main():
                     )
                     record.write_text(json.dumps(receipt, indent=2) + "\n")
                 if args.quality:
-                    require_benchmark_sources()
-                    from benchmark_glm53_quality import run as run_quality
-
-                    quality_path = folder / "quality.json"
-                    run["quality_path"] = str(quality_path)
-                    quality = run_quality(
-                        argparse.Namespace(
-                            url=base,
-                            model=model,
-                            tokenizer=str(plan.model_dir),
-                            source=args.source,
-                            output=quality_path,
-                            pairs=32,
-                            prefix_tokens=512,
-                            score_tokens=128,
-                            needle_contexts=[1024, 8192, 32768],
-                            needle_positions=[0.25, 0.75],
-                        ),
+                    quality_passes(
+                        args,
+                        base,
+                        model,
+                        plan.model_dir,
                         tokenizer,
+                        folder,
+                        run,
+                        lambda: record.write_text(json.dumps(receipt, indent=2) + "\n"),
                     )
-                    run["quality"] = quality["summary"]
-                    if not quality["summary"]["all_needles_rank_first"]:
-                        raise ValueError("needle contrast gate failed")
                 if args.prefill:
                     require_benchmark_sources()
                     from benchmark_glm53_prefill import run as run_prefill
