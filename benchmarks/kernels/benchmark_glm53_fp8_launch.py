@@ -165,6 +165,7 @@ def main():
             Path(extension.__file__).read_bytes()
         ).hexdigest(),
         "weights": [],
+        "baseline_checks": [],
         "cases": [],
     }
 
@@ -218,16 +219,33 @@ def main():
                     ).bfloat16()
                     x = cpu_x.cuda()
                     expected = cpu_x.double() @ dequant.t()
+                    baseline_row = {
+                        "layer": layer,
+                        "kind": kind,
+                        "batch": batch,
+                        "input_sha256": digest_tensor(cpu_x),
+                        "status": "checking",
+                    }
+                    result["baseline_checks"].append(baseline_row)
+                    save()
                     installed = qc.decode_gemm_fp8(x, *banks[0])
                     baseline_errors = oracle_errors(installed.cpu(), expected)
+                    baseline_row["oracle"] = baseline_errors
                     if not baseline_errors["passed"]:
+                        baseline_row["status"] = "failed"
                         raise ValueError(
                             f"installed baseline fails oracle: {baseline_errors}"
                         )
-                    if not torch.equal(installed, extension.run(x, *banks[0], 0, 0, 0)):
+                    baseline_row["isolated_auto_exact"] = torch.equal(
+                        installed, extension.run(x, *banks[0], 0, 0, 0)
+                    )
+                    if not baseline_row["isolated_auto_exact"]:
+                        baseline_row["status"] = "failed"
                         raise ValueError(
                             "isolated auto config differs from installed serving"
                         )
+                    baseline_row["status"] = "complete"
+                    save()
                     a_graph, a_outputs = capture(
                         qc.decode_gemm_fp8, x, banks, installed
                     )

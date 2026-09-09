@@ -17,11 +17,16 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <stdexcept>
 
 namespace tms::decode_gemm {
 
 constexpr int MT = 16;        // token rows per mma; M is padded to this
 constexpr int PAD = 8;        // elements of padding per smem row (16 B): conflict-free ldmatrix
+
+inline void check_cuda_status(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
     return uint32_t(__cvta_generic_to_shared(p));
@@ -190,14 +195,20 @@ __global__ void __launch_bounds__(WARPS * 32) bf16_decode_gemm_kernel(
 }
 
 template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT>
-inline void launch(const __nv_bfloat16* x, const __nv_bfloat16* w, const float* bias, OutT* out,
+static inline void launch(const __nv_bfloat16* x, const __nv_bfloat16* w, const float* bias, OutT* out,
                    int M, int N, int K, cudaStream_t stream) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
     auto kern = bf16_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT>;
-    static bool attr_set = false;   // per instantiation
-    if (!attr_set) {
-        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM_BYTES);
-        attr_set = true;
+    // Internal linkage keeps this state local to its CUDA module, not an ELF
+    // GNU_UNIQUE flag shared by separately loaded probe/serving libraries.
+    // Attributes are device-specific; thread-local state also avoids host races.
+    static thread_local int configured_device = -1;
+    int device = -1;
+    check_cuda_status(cudaGetDevice(&device));
+    if (configured_device != device) {
+        check_cuda_status(cudaFuncSetAttribute(
+            kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM_BYTES));
+        configured_device = device;
     }
     const int blocks = (N + NT - 1) / NT;
     kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, bias, out, M, N, K);

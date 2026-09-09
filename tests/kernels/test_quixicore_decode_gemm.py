@@ -58,6 +58,16 @@ def test_decode_gemm_bias_and_fp32_output():
     _check(qc.decode_gemm(x, w, b), ref)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_shared_memory_setup_follows_device_switches():
+    for device in (0, 1, 0):
+        with torch.cuda.device(device):
+            # N2048 uses the six-stage, >48-KiB shared-memory kernel.
+            w = torch.randn(2048, 512, device="cuda", dtype=torch.bfloat16) * 0.05
+            x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+            _check(qc.decode_gemm(x, w), x.float() @ w.float().t())
+
+
 def test_decode_gemm_rejects_unsupported_shapes():
     x = torch.randn(17, 4096, device=DEV, dtype=torch.bfloat16)
     w = torch.randn(4096, 4096, device=DEV, dtype=torch.bfloat16)

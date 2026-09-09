@@ -23,6 +23,7 @@ using tms::decode_gemm::cp_async_wait;
 using tms::decode_gemm::ldmatrix_x4;
 using tms::decode_gemm::mma_bf16_16816;
 using tms::decode_gemm::to_out;
+using tms::decode_gemm::check_cuda_status;
 
 constexpr int SB = 128;     // scale block: 128 rows x 128 k
 constexpr int WPAD = 16;    // bytes of padding per fp8 weight row in smem (conflict-free 16-bit loads)
@@ -165,14 +166,20 @@ __global__ void __launch_bounds__(WARPS * 32) fp8_decode_gemm_kernel(
 }
 
 template <int NT, int WARPS, int KCHUNK, int STAGES, typename OutT>
-inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
+static inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale, const float* bias, OutT* out,
                    int M, int N, int K, cudaStream_t stream) {
     using C = Cfg<NT, WARPS, KCHUNK, STAGES>;
     auto kern = fp8_decode_gemm_kernel<NT, WARPS, KCHUNK, STAGES, OutT>;
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM_BYTES);
-        attr_set = true;
+    // The cache belongs to this module's kernel and the current device.
+    // An external inline function's GNU_UNIQUE flag can be coalesced across
+    // DSOs even though their CUDA kernel handles require separate setup.
+    static thread_local int configured_device = -1;
+    int device = -1;
+    check_cuda_status(cudaGetDevice(&device));
+    if (configured_device != device) {
+        check_cuda_status(cudaFuncSetAttribute(
+            kern, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM_BYTES));
+        configured_device = device;
     }
     const int blocks = (N + NT - 1) / NT;
     kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K);

@@ -27,6 +27,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -235,6 +236,7 @@ static torch::Tensor py_decode_gemm(torch::Tensor x, torch::Tensor weight,
     auto out = torch::empty({M, N}, x.options().dtype(fp32_out ? torch::kFloat32 : torch::kBFloat16));
     if (fp32_out) decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, fpm(out), M, N, K, stream());
     else decode_gemm::launch_auto(bp(x), bp(weight), bias_ptr, bpm(out), M, N, K, stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -320,6 +322,7 @@ static torch::Tensor py_decode_gemm_fp8(torch::Tensor x, torch::Tensor weight, t
     const auto* wp = reinterpret_cast<const uint8_t*>(weight.data_ptr());
     if (fp32_out) decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, fpm(out), M, N, K, stream());
     else decode_gemm_fp8::launch_auto(bp(x), wp, scale.data_ptr<float>(), bias_ptr, bpm(out), M, N, K, stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

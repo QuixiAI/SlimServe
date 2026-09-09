@@ -73,6 +73,21 @@ def test_bias_and_fp32_output() -> None:
     assert ((out - ref).abs() / scale).max().item() < 2**-8
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_shared_memory_setup_follows_device_switches() -> None:
+    # M16/N1024 selects the >48-KiB opt-in kernel. A process-wide bool
+    # incorrectly treats setup on device0 as setup on device1 too.
+    for device in (0, 1, 0):
+        with torch.cuda.device(device):
+            w = torch.randn(1024, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+            q, s = block_quant(w)
+            x = torch.randn(16, 512, device="cuda", dtype=torch.bfloat16)
+            ref = x.float() @ dequant_bf16(q, s).float().t()
+            out = quixicore_ops.decode_gemm_fp8(x, q, s)
+            scale = ref.abs().amax(1, keepdim=True).clamp_min(1e-6)
+            assert ((out.float() - ref).abs() / scale).max().item() < 2**-7
+
+
 def test_rejects_unsupported_shapes_and_dtypes() -> None:
     w = (torch.randn(4096, 1536, device=DEV) * 0.02).to(torch.bfloat16)
     q, s = block_quant(w)

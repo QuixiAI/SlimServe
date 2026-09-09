@@ -63,14 +63,28 @@ throughput at64/128/129/7616 rows against scalar BF16. This is NOT a serving
 speedup. Memcheck and targeted race/sync checks pass. The native integration
 is SM120/aligned-BF16 only, preserving scalar fallback for odd storage offsets
 and other platforms/dtypes. Native QC136723a73c921cb333e5b1cb367610bb22b8cc624008c8d8d6684528d2717e9d
-is installed; the previous f52 binary is saved as runtime-control/
+passed this qualification; the previous f52 binary is saved as runtime-control/
 mhc-paired-native-before.so.54 operator tests, four alignment memchecks and
 all7020 installed census cases pass; fixed1/3/1 FP32/BF16/FP32 cold-profile
 validation is next. All69 existing mHC kernels preserve resource usage;
 two paired variants add no spills. Global/profile BF16-storage default staysOFF.
-An independent FP8 launch probe is built but not GPU-qualified:12 combinations
-of tile width/warp count/staging, actual weights beyond three L2 capacities,
-independent FP64 oracle and subsequent contention gate. CPU tests: 8 pass.
+The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
+was shared across separately loaded CUDA modules, while kernel attributes
+were not. The same flag also ignored device switches. Both call orders and
+device0/1/0 reproduce invalid launches in the old path. The native wrapper
+did not check launch errors and could return uninitialized output.
+BF16/FP8 helpers now use module-local, thread-local, device-aware setup state,
+check setup errors, and native wrappers check launch errors. Kernel math and
+launch geometries are unchanged. Current installed QC is
+5d4d3790e9aeb6cbc92702a6d0754b625cecbb48a6ff93bde8a22b419ccb5760;
+the 136 binary is preserved as runtime-control/fp8-setup-native-before.so.
+Both call orders with both old/new probe modules pass the actual-weight
+oracle; 145 GPU tests (including device switches and mHC) and 251 CPU tests
+pass, one GPU-only CPU-suite skip. The failed sweep retains all24 completed
+M1/M8 configurations, none faster than the current geometry, and the failed
+M16 baseline. It is NOT full sweep qualification. The corrected 12-config,
+three-layer/three-batch, five-round cold A/B/A sweep is next, followed by
+contention tests for any promising configuration. No FP8 geometry promoted.
 
 The spill-free pooled-indexer tile is retained in the RTX6000 profile:
 `VLLM_GLM5_INDEXER_SM120_TILES=1` selects RT2/PT128/four warps. Three fixed

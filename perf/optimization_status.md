@@ -23116,3 +23116,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Installed exhaustive census completes all7020 cases bit-for-bit, including
   changed inputs and7616-row prefill, on native136723a73c921cb3. Serving
   qualification remains the next promotion gate; raw mhc-paired-native-census.*.
+
+## 2026-09-08: Decode launch setup must belong to its module and device
+
+- Status: correctness fix retained; no launch-geometry/performance promotion.
+  Source e6186009c plus this fix, selected recipe unchanged, CUDA13.0/sm120f.
+- Baseline/hypothesis: the prescribed FP8 sweep completes24 configurations
+  (layer3 shared gate/up, M1/M8), then installed native M16 fails the FP64
+  oracle (NRMS1.32045, row-peak1.65864). Native M16 alone passes at
+  .00167923/.00378620. All completed alternative geometries are slower than
+  current at M1/M8; no other layer/projection is qualified by this failed run.
+- Origin: external-inline launch helpers' static bool attr_set is ELF
+  GNU_UNIQUE in both probe/native DSOs. Their CUDA kernel handles need
+  separate cudaFuncSetAttribute calls; the coalesced flag suppresses one.
+  Probe-first/native-second and reverse order reproduce cudaErrorInvalidValue
+  (code1) on the second module's >48KiB kernel. Native wrappers lacked a
+  launch-error check, so one path returns an uninitialized tensor. The same
+  process-wide flag also reproduces errors0/1/0 on devices0/1/0.
+- Change: BF16/FP8 launch helpers have internal linkage and thread-local
+  current-device setup caches; CUDA setup failures throw before caching.
+  Native wrappers now check immediate launch errors. Kernel bodies, tiles,
+  stages, layouts and quant unchanged. The sweep also persists a baseline
+  check receipt before candidates so a baseline failure identifies its shape.
+- Build: installed QC SHA5d4d3790e9aeb6cbc92702a6d0754b625cecbb48a6ff93bde8a22b419ccb5760,
+  -j2, 80GiB/no swap; rebuilt independent probe in fp8-launch-local-build,
+  SHAe5fd08e3b431f2ea70cf5a8f4b489ac470ce59062839d91d5d6867bc0527d7ee,
+  32GiB/no swap. Both old binaries preserved. readelf confirms new setup
+  variables TLS LOCAL, not UNIQUE. No GPU work overlapped these builds.
+- Correctness: both call orders with both old and rebuilt probe DSOs pass
+  all8 actual-weight operations with CUDAerror0 and the FP64 oracle.
+  145 GPU tests pass, including BF16/FP8 device0/1/0 regressions and mHC;
+  CPU suite251pass/oneGPUskip. No SASS-identity claim or serving TPS yet.
+- Decision: rerun the entire prescribed cold FP8 sweep, retaining this failed
+  run. New output fp8-launch-local-sweep/, not a replacement for old artifacts.
+  Then run the already prescribed same-binary1/3/1 paired-mHC serving series.
+- Raw: runtime-control/fp8-launch-cold-sweep.json/summary.json (a directory
+  despite its suffix), fp8-launch-cold-sweep.log, fp8-baseline-alone.log,
+  fp8-order-{probe-first,native-first}.log, fp8-device-cache-repro.log,
+  fp8-{native,probe}-shared-flag-symbol.txt, fp8-setup-{native,probe}-build.log,
+  fp8-setup-{native,probe}-before.so, decode-local-device-symbols.txt,
+  fp8-fixed-fp8-launch{,-local}-build-{probe-first,native-first}.log,
+  decode-setup-gpu-tests.{xml,log}, decode-setup-cpu-tests.xml.
