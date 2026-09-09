@@ -21378,3 +21378,35 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/routing-census/summary.json,
   boot-1/routing/routing-623340.jsonl and routing-summary.json; all requests,
   startup/JIT logs and both canary responses are retained.
+
+## 2026-09-08: Output-parallel mHC partials pass parity but regress
+
+- Status: rejected first layout; isolated diagnostic, never served.
+- Baseline: existing cooperative 64-split mHC, FP32 parameters, actual GLM
+  constants (20 Sinkhorn iterations, rms epsilon 1e-5, hc epsilon 1e-6,
+  post multiplier 2, separate norm). Timings rotate over all 90 checkpoint
+  fn/base/scale sets, not one hot synthetic matrix. Activations are synthetic.
+- Hypothesis/change: assign three of the 24 output projections to each warp
+  instead of reducing all 24 across all eight warps. Preserve BF16 post-mix
+  rounding and the existing nonlinear tail/cooperative synchronization.
+- Build correction: initial probe used --use_fast_math, while the installed
+  serving target does NOT. It failed installed-baseline bit equivalence by
+  FP32 ULPs before candidate timing. Removed that flag, matched sm_120f and
+  CUDA 13.0, and added a toolkit-version guard. A follow-up diagnostic briefly
+  used the default CUDA 13.2 toolkit; both diagnostic binaries are retained,
+  neither was installed. The final isolated baseline is bit-exact against
+  installed serving at batches 1/2/4/8, with and without fused post/norm.
+- Correctness: 192 synthetic checks, 1080 checkpoint-parameter checks and
+  twelve graph replays with changed live inputs pass. BF16 residual is exact;
+  maximum FP32 mix error over checkpoint cases is 2.38419e-7. These are local
+  arithmetic checks, not serving qualification. No sanitizer claim yet.
+- A/B/A graph medians in microseconds/site (90 distinct sites, five rounds
+  of twenty graph replays per variant): batch1 9.078/12.314/9.067;
+  batch2 9.273/12.287/9.272; batch4 10.412/12.584/10.413;
+  batch8 11.754/13.170/11.788. All samples retained, no candidate win.
+- Decision: quarantine under benchmarks/kernels, not serving. One bounded
+  follow-up will coalesce partial-output stores via shared memory; the first
+  layout emits lane-zero global stores from every output-owning warp.
+- Raw: perf/results/2026-09-08/mhc-output-parallel/initial.json (failed
+  build-equivalence check), matched-build.json (complete), source snapshots
+  and binaries. Serving binary SHA remains 256e4f70e305dc92e3fecfac409b5ddcec78e8f0ef54e4fd1d30b31797fd99b.
