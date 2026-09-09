@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from slimserve import index_journal as ij
+from slimserve.canonical_indexer import maybe_ordered_topk
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers import glm5_next_indexer as gi
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -97,7 +98,10 @@ def test_native_observer_keeps_inputs_and_records_actual_output(config, family):
 
 
 @pytest.mark.parametrize("tiles", [(8, 64), (2, 128)])
-def test_compiled_real_indexer_journal_and_runner_chunks(config, monkeypatch, tiles):
+@pytest.mark.parametrize("canonical", [False, True])
+def test_compiled_real_indexer_journal_and_runner_chunks(
+    config, monkeypatch, tiles, canonical
+):
     """The registered real opaque op, real CUDA selector and synthetic paged KV.
 
     Input/return buffers are unchanged by observing. Selection order above512
@@ -105,8 +109,11 @@ def test_compiled_real_indexer_journal_and_runner_chunks(config, monkeypatch, ti
     """
     monkeypatch.setattr(gi, "_ROW_TILE", tiles[0])
     monkeypatch.setattr(gi, "_POOL_TILE", tiles[1])
+    monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER", str(int(canonical)))
     monkeypatch.setattr(
-        ops, "top_k_per_row_prefill", ij.instrument_topk(ops.top_k_per_row_prefill)
+        gi,
+        "top_k_per_row_prefill",
+        ij.instrument_topk(maybe_ordered_topk(ops.top_k_per_row_prefill)),
     )
     library = torch.library.Library("slimserve_index_journal_test", "FRAGMENT")
     direct_register_custom_op(
@@ -197,6 +204,7 @@ def test_compiled_real_indexer_journal_and_runner_chunks(config, monkeypatch, ti
             out[begin:end],
         )
         expected = compiled(*data).clone()
+        expected_indices = data[-1].clone()
         current_data = data
         actual = runner._model_forward(
             input_ids=torch.arange(begin, end, device="cuda"),
@@ -204,6 +212,8 @@ def test_compiled_real_indexer_journal_and_runner_chunks(config, monkeypatch, ti
             positions=torch.arange(begin, end, device="cuda"),
         )
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        if canonical:
+            assert torch.equal(data[-1], expected_indices)
         assert ij.ACTIVE.get() is None and ij.LAYER.get() is None
     events = [
         json.loads(line)

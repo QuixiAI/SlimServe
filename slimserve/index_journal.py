@@ -92,6 +92,8 @@ class IndexJournal:
         self.archive.mkdir(exist_ok=False)
         root = Path(__file__).resolve().parents[1]
         sources = (
+            "slimserve/canonical_indexer.py",
+            "slimserve/canonical_indexer_kernel.py",
             "slimserve/index_journal.py",
             "vllm/_custom_ops.py",
             "vllm/model_executor/layers/glm5_next_indexer.py",
@@ -114,6 +116,11 @@ class IndexJournal:
                 "max_tensor_bytes": MAX_TENSOR_BYTES,
                 "max_worker_archive_bytes": MAX_FILE_BYTES,
                 "undefined_logit_tails": "zeroed in private CPU copies only",
+                "selection_order": (
+                    "canonical-pool-id"
+                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
+                    else "native"
+                ),
                 "implementation_sha256": {
                     p: hashlib.sha256((root / p).read_bytes()).hexdigest()
                     for p in sources

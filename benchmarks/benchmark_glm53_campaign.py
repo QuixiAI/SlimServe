@@ -55,6 +55,7 @@ def diagnostic_only(args):
                 "SLIMSERVE_GLM53_MODEL_JOURNAL",
                 "SLIMSERVE_GLM53_MOE_JOURNAL",
                 "SLIMSERVE_GLM53_CANONICAL_MOE",
+                "SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER",
             )
         )
     )

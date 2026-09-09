@@ -33,7 +33,8 @@ import os
 import torch
 from torch import nn
 
-from slimserve.index_journal import instrument_pooled_indexer
+from slimserve.canonical_indexer import maybe_ordered_topk
+from slimserve.index_journal import instrument_pooled_indexer, instrument_topk
 
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -54,6 +55,10 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 logger = init_logger(__name__)
+
+# Keep the observer outside the intervention: record the actual selection order
+# passed to pool expansion. Both factories are identity functions when disabled.
+top_k_per_row_prefill = instrument_topk(maybe_ordered_topk(ops.top_k_per_row_prefill))
 
 # Row layout of the cached indexer state.
 _K_DIM = 128
@@ -530,7 +535,7 @@ def _pooled_select(
     # top-k over pools: prefill-style ranges [0, n_pools) per row.
     zeros = torch.zeros_like(n_pools)
     sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
-    ops.top_k_per_row_prefill(
+    top_k_per_row_prefill(
         logits[:R], zeros, n_pools, sel, R, logits.stride(0), logits.stride(1),
         ksel,
     )

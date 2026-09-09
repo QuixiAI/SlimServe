@@ -60,6 +60,8 @@ class ScoreJournal:
         self.stream = self.path.open("x", buffering=1)
         root = Path(__file__).resolve().parents[1]
         source_paths = (
+            "slimserve/canonical_indexer.py",
+            "slimserve/canonical_indexer_kernel.py",
             "slimserve/index_journal.py",
             "vllm/model_executor/layers/glm5_next_indexer.py",
             "slimserve/score_journal.py",

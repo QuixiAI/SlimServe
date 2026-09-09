@@ -201,6 +201,19 @@ each GPU emits11 distinct orders. Raw indexer-saved-input-replay/ onbd08719af.
 Next qualify an order-only model intervention; do not change tie membership or math.
 The bounded observer remains default-off;436 CPU tests (one skip) and8 GPU
 observer/integration tests pass. No performance/default promotion.
+The order-only intervention is now locally qualified: opt-in
+SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER=1, requiring model/index traces and
+canonical MoE. One Triton sort orders the existing selected pool IDs ascending
+and keeps -1 padding last; no score access, reselection or native arithmetic
+change. Default-off returns the original native callable. The observer now
+lives in the GLM-specific selector path and records AFTER ordering.
+450 CPU tests/one skip,34 GPU tests, bounded memory/sync/race checks pass.
+Next prescribed ONE start/three full quality passes:
+canonical-index-order-quality-diagnostic/, same recipe/native/TC0/canonical-MoE1,
+with the two runtime-control/canonical-index-order-{score,index}-config.json
+files. No source/build changes during this run. Causality and full-model
+repeatability remain to be demonstrated; performance promotion is not in scope
+for this diagnostic launch.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

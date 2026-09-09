@@ -24344,3 +24344,61 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: indexer-saved-input-replay/{summary.json,gpu-*-all11-outputs.pt};
   runtime-control/indexer-saved-input-replay.log. Source/native/input hashes
   and every per-call check are in the receipt. CPU oracle tests9pass.
+
+## 2026-09-09 - Qualified order-only indexer intervention and prescribed model test
+
+- Status: diagnostic locally qualified; full-model effect not yet measured.
+- Baseline:9aa123ebe full trace +bd08719af saved-input replay. Identical
+  first-layer inputs within each rank produce different selected-ID order,
+  but unchanged valid membership and no ambiguous cutoff ties. Full8K/32K
+  scores vary; short text/1K repeat exactly with canonical MoE.
+- Hypothesis: preserve membership and all scoring arithmetic, but give sparse
+  attention a fixed order of the chosen pools. Test whether remaining model
+  score variation disappears; do not conflate ordering with a tie-policy fix.
+- Change: SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER=1 requires MODEL_JOURNAL1,
+  CANONICAL_MOE1 and INDEX_JOURNAL config. slimserve/canonical_indexer.py and
+  canonical_indexer_kernel.py add one in-place Triton integer sort, one CTA
+  per row,512 entries/four warps; -1 sentinel moves behind ascending valid IDs.
+  No score reads, selection recomputation, quant change or native rebuild.
+  Full [1..8192,512] contiguous CUDA int32 guard. This post-selection sort is
+  an explicit causal diagnostic, NOT the final production implementation.
+- Scope/observer: factory composition in glm5_next_indexer.py only; remove
+  the global _custom_ops top-k observer. When both flags are off, the GLM alias
+  is the original native callable: no wrapper or extra GPU launch. The journal
+  wraps native+order so its index tensor is exactly what pool expansion sees.
+  Index headers say native/canonical-pool-id and hash9 sources; score headers
+  hash17 including ordering modules. Campaign receipt rejects index-order
+  instrumentation as baseline-eligible. Other model selectors are untouched.
+- Correctness:450 CPU tests pass/one skip (22.67s);34 GPU tests pass (43.88s).
+  Integer kernel:20 cases over M1/2/16/17/64/65/128/640/7616/8192, storage
+  offset0/1, empty/partial/full selections and duplicate preservation;3 changed
+  inputs in eager AND graph mode each, guards unchanged. All44 real native
+  output matrices on original GPUs canonicalize to the independently sorted
+  captured sets. Real registered/compiled indexer tests cover both tile layouts,
+  intervention0/1 and8192+7 chunks; with order1, full expanded selections also
+  match bit-for-bit across observed/unobserved calls. Existing model/MoE trace
+  integration still passes. No full-model repeatability claim from these tests.
+- Sanitizers: memcheck and synccheck each pass allfour M64/8192 xoffset0/1
+  tests, zero errors. Bounded racecheck M64/offset1, first SIX matching
+  _sort_selected_pools launches, zero errors/warnings/hazards. This is NOT
+  exhaustive full-size race qualification. No profiling or timing claim.
+- Prescribed ONE start: same150GiB/no-swap, CUDA_VISIBLE_DEVICES0..3,
+  unset NCCL_P2P_DISABLE, CUDA13/VLLM cache/prompt/recipe v1 unchanged,
+  OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0/nativeQC4ce801/core d45b4ace/
+  MoE1093b8a4. Keep MODEL_JOURNAL1/MOE_JOURNAL1/CANONICAL_MOE1 and add
+  CANONICAL_INDEX_ORDER1. SCORE_JOURNAL points to runtime-control/
+  canonical-index-order-score-config.json,
+  SHA27e820a72f793ee8e698c850447cb35aa709aba9b461e8c0be5e05733b810099;
+  INDEX_JOURNAL points to canonical-index-order-index-config.json,
+  SHAec4188af0ebad2dc27ed625f7d599f2487473b18a00f579564dbebef317e3235.
+  Both exact prompt-ID lists unchanged, only output directory changes.
+  Campaign --profile glm53-nvfp4-4 --boots 1 --repeats 3 --cold-prefix
+  --quality --quality-repeats 3, output canonical-index-order-quality-diagnostic/.
+  Keep every sample/failure; freeze loaded source/native until teardown.
+- Decision: verify source/native/rawHTTP/all archives and repeated scores.
+  Compare all index layers/chunks and pre-selection inputs against9aa123ebe;
+  first-layer selected sets must stay exact per rank. If variation remains,
+  identify the first changed traced boundary. Keep fixed cross-rank differences
+  as a separate follow-up, TC OFF and original quality contract unchanged.
+- Raw qualification: runtime-control/canonical-index-{cpu,gpu}-tests.xml/log,
+  canonical-index-{memcheck,synccheck,racecheck}-tests.xml and sanitizer logs.

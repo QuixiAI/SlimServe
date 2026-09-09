@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 import vllm.envs as envs
-from slimserve.index_journal import instrument_topk
 from slimserve.moe_journal import instrument_marlin_gemm
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -3104,7 +3103,6 @@ def indexer_k_quant_and_cache(
     )
 
 
-@instrument_topk
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
