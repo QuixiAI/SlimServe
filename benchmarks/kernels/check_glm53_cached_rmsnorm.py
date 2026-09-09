@@ -154,10 +154,12 @@ def run_configuration(launcher, layout, x, changed, weight):
 
     outputs = []
     graph = torch.cuda.CUDAGraph()
+    # torch.cuda.graph's implicit stream is process-global, not per device.
+    capture_stream = torch.cuda.Stream(device=working.device)
     for iteration, data in enumerate((x, x, changed)):
         working.copy_(data)
         if iteration == 2:
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=capture_stream):
                 launch()
             # Change input after capture; reset in-place data outside graph.
             working.copy_(x)
@@ -192,7 +194,12 @@ def main():
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--ranks", type=int, nargs="+", choices=range(4), default=[0, 1, 2, 3]
+    )
     args = parser.parse_args()
+    if len(set(args.ranks)) != len(args.ranks):
+        parser.error("duplicate ranks would repeat cases")
     if args.output.exists():
         parser.error("output must not exist; preserve every attempt")
     if subprocess.check_output(
@@ -216,7 +223,13 @@ def main():
         git_head=subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
-        cases=dict(rows=ROWS, seeds=SEEDS, sites=SITES, changed_seed_offset=100),
+        cases=dict(
+            rows=ROWS,
+            seeds=SEEDS,
+            sites=SITES,
+            changed_seed_offset=100,
+            ranks=args.ranks,
+        ),
         sources=[],
         weights=[],
         checks=[],
@@ -273,6 +286,8 @@ def main():
             if rank in seen_ranks or rank not in range(4):
                 raise ValueError("expected one source per rank")
             seen_ranks.add(rank)
+            if rank not in args.ranks:
+                continue
             for base in map(Path, audit["paths"]):
                 source = base / relative
                 key = AutotuneCache._prepare_key(str(source))

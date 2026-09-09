@@ -25914,3 +25914,22 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   before tests or GPU execution; no numerical test failed.
 - Frozen command/gates: perf/glm53-cached-rmsnorm-protocol.md. Next ONE bounded
   GPU process, all four devices sequentially; original caches remain read-only.
+
+### Cached RMSNorm first attempt and stream repair
+
+- On22d609633, rank1 completes24 cases/48 cross-config comparisons.25 pairs
+  differ,1140 BF16 values total, maximum one ULP. Both configurations reproduce
+  their recorded serving binary hashes exactly; all oracle checks <=one ULP,
+  repeated eager/graph and guard/mutation checks pass for this rank.
+- The process then fails in rank3's first graph capture: invalid CUDA driver
+  argument plus empty-graph warning. Its two eager calls succeeded. This is
+  the probe's process-global default graph stream from GPU1, not a serving or
+  arithmetic failure. Installed torch/cuda/graphs.py419..427 confirms the
+  default stream is initialized once per process. No rank3 case completed.
+- Preserve cached-rmsnorm-isolation/summary.json
+  SHA58f683152ed0f85e9257a7394275174cd708d8bd32af267b87c4d784ad0f78a7,
+  all partial output and launch log. Eight original source/config receipts
+  remain unchanged. Process exits1, GPUs empty after teardown.
+- Repair only the diagnostic to supply an explicit device-owned capture
+  stream. Add rank selection to resume just72 outstanding cases on3/0/2;
+  no rank1 replacement or gate changes. Frozen continuation in protocol.

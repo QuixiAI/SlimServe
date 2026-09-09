@@ -63,3 +63,28 @@ Next, if arithmetic differences are observed, design a narrow full-model
 intervention preserving unrelated compiler choices and both original caches.
 Do not enable global force-first-config or treat isolated differences as a
 complete explanation of the older score mismatch.
+
+## Preserved failed attempt and bounded continuation
+
+The first process on22d609633 completed all24 rank1 cases, then failed during
+the first rank3 graph capture. Its first two eager calls succeeded, but the
+implicit `torch.cuda.graph.default_capture_stream` still belonged to GPU1.
+The installed Torch source makes this stream process-global. Preserve the
+invalid-argument failure, empty-graph warning and partial summary:
+SHA256 `58f683152ed0f85e9257a7394275174cd708d8bd32af267b87c4d784ad0f78a7`.
+All eight original source/config receipts checked so far remain unchanged;
+no rank3 case completed, rank0/rank2 did not begin. GPUs released.
+
+Fix ONLY the diagnostic stream binding to an explicit per-device stream.
+The case list, source/compiled-hash gates, math and tolerances do not change.
+After CPU tests/commit, run exactly the remaining ranks3/0/2 once, using the
+same command with these three substitutions/addition:
+
+- Scope: `glm53-cached-rmsnorm-remainder`.
+- Output: `perf/results/2026-09-09/cached-rmsnorm-remainder`.
+- Launch log: `runtime-control/cached-rmsnorm-remainder-launch.log`.
+- Add `--ranks 3 0 2` (audit order is3/0/2 after filtering).
+
+Combine only the original24 completed cases and the remaining72, verifying
+exact coverage of96 unique rank/row/seed/site keys and all192 comparisons.
+Do not rerun rank1 or overwrite/relabel the failed attempt as successful.
