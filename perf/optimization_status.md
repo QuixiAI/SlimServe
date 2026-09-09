@@ -25691,3 +25691,46 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   c8ba8d56c. Verify source/native receipts throughout; only the declared JIT
   observability option may differ in the plan. Serving results remain
   serialized/instrumented diagnostics, not a new competitive baseline.
+
+## 2026-09-09 - Native stable alignment passes full-model equality
+
+- Frozen3e1dac08f/QC39b302f0, one prescribed start completes with server exit0.
+  Startup170.088s; 25 warmup and75 timed requests all exact1000/300, zero cache;
+  text4/imageRed pass. All168 quality requests are uncached; three4096-token
+  score vectors and all needle-token scores repeat exactly. All348 archives,
+  1024 short and94 long tensors/rank verify. Every one of nine control/candidate
+  pass pairs equals c8ba8d56c for all scores and traced tensors. All748 old GPU
+  bodies reverify identical;28 control/33 candidate source hashes match Git.
+- All three mean logprobs -2.7282744364256297; six margins
+  35.29122195731543,35.512668494373656,34.262808178651994,35.22929903132763,
+  37.584231621624895,37.835817329047586. No gate relaxation or exclusions.
+- Serialized/instrumented E2E rates by repetition: c1
+  108.093/109.128/107.302; c8 460.040/464.518/458.527; c16
+  651.976/649.484/645.398 tok/s. NOT production throughput. Every c16 largest
+  shared arrival gap is0.677-0.681s near the start, with one request generating
+  and15 awaiting first token. The old4.371s repeat2 gap did not recur; this
+  does not establish its cause or eliminate startup variability. Verbose JIT
+  logs record specializations through07:40:39 local; no later JIT warning.
+- Teardown GPU release0.348739s; firstpoll0.044007s still sees rank1, then free.
+  One transient zombie and existing shared-memory resource-tracker warning
+  retained. No allocator/OOM error in this run. Fresh live GPU check is empty.
+  After session tools changed, the completed summary/exit receipt plus absent
+  PIDs established termination; no replacement launch. Initial CPU-audit
+  systemd access was sandbox-denied before launch; retained original log,
+  permission-approved bounded audit used separate configured log and exit0.
+- Raw stable-align-quality-diagnostic/summary.json
+  SHA7a262eee2748daec06d90f55238a362bd0bf4af3ebe4731f5273d98ca5915222;
+  runtime-control/stable-align-quality-analysis.json
+  SHA81a6a1387eebdd6e1f2c12cc1c9241a1c9c299b450ab202bffbba1ab04a5dfca;
+  stable-align-intervention-comparison.json
+  SHAe0ce20eff7f5e6715685981605e796d80cc6450fc7e73b8ece0c13fed2f414d4;
+  stable-align-request-audit.json
+  SHAf53a9437e22525c31ac01d3f3cf77e2def5119515848b41644fe7d3ea6a1d18a;
+  stable-align-client-stream-windows.json
+  SHAcac8e276d1a0d50dd8dffe1beacf4b5b675a2c4d14db121ed8a91068afa7801f.
+- Next: expose the qualified native-only ordering policy as one explicit,
+  defaultOFF serving candidate, with a distinct compilation-cache factor and
+  strict model/hardware scope. Keep diagnostic sorting/control modes separate.
+  Test without CUDA_LAUNCH_BLOCKING or journals, on the same exact profile and
+  quality workload. This is qualification of normal asynchronous execution,
+  not default promotion or a claim that the campaign is complete.

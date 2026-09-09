@@ -35,7 +35,7 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 14:37 UTC)
+### Latest checkpoint (2026-09-09 19:32 UTC)
 
 Small-M origin routing PASSES full-model qualification on c8ba8d56c:
 one prescribed start, three quality passes, every text/needle score and all
@@ -74,11 +74,16 @@ samples verify, all32 cases17.47-90.45% faster than alignment-plus-sort.
 ActualM6405.50-6.01us; M7616/random21.288us. Atomic alone still wins26 cases.
 STABLE_ALIGN defaultsOFF; only actual native construction skips sorting.
 Final CPU573pass/one skip. Source/native receipts and baseline exclusion updated.
-Next ONE real-profile/three-pass equality run stable-align-quality-diagnostic/
-against c8ba8d56c, same quant/TC0/canonical journals, add STABLE_ALIGN1.
-Explicit --jit-monitor-verbose is now forwarded through the profile/campaign
-and marked diagnostic-only to investigate the retained c16 pause. Full-model
-equality and serving performance are NOT yet established for this integration.
+Full-model equality PASSES on3e1dac08f: one prescribed start, all three quality
+passes and all nine pairings against c8ba8d56c exactly match every score and
+1024short/94long tensors per rank. All348 archives,25warmup/75timed cold requests
+and text/image canaries pass. Raw stable-align-quality-diagnostic/ and
+runtime-control/stable-align-* analyses. Source/native freeze verified.
+Explicit verbose JIT logging captured specializations. The prior4.371s pause
+did not recur (c16 651.98/649.48/645.40), but its cause remains unresolved.
+These serialized/instrumented rates are NOT production baselines. Next qualify
+one defaultOFF native-only ordering policy under normal asynchronous execution,
+without journals/CUDA_LAUNCH_BLOCKING, preserving the recipe and quality gates.
 
 ### Chronological evidence (older next-step statements are historical)
 
