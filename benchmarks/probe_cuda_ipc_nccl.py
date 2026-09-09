@@ -12,9 +12,11 @@ import argparse
 import ctypes as ct
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import torch
@@ -38,6 +40,8 @@ def loaded_libraries():
 
 
 class Runtime:
+    handle_bytes = ct.sizeof(Handle)
+
     def __init__(self):
         paths = [p for p in loaded_libraries() if "libcudart." in p]
         if len(paths) != 1:
@@ -67,6 +71,48 @@ class Runtime:
             message = self.lib.cudaGetErrorString(result).decode()
             raise RuntimeError(f"{name}: CUDA error {result}: {message}")
 
+    def export_handle(self, pointer):
+        handle = Handle()
+        self.call("cudaIpcGetMemHandle", ct.byref(handle), pointer)
+        return bytes(handle)
+
+    def import_handle(self, encoded):
+        if len(encoded) != self.handle_bytes:
+            raise ValueError("invalid CUDA IPC handle size")
+        pointer = ct.c_void_p()
+        self.call(
+            "cudaIpcOpenMemHandle",
+            ct.byref(pointer),
+            Handle.from_buffer_copy(encoded),
+            1,
+        )
+        return pointer
+
+
+class B12XRuntime(Runtime):
+    """Use the image's actual wrapper for handle export/import, without JIT.
+
+    Other operations and the verification oracle remain the standard runtime
+    control. This qualifies only the wrapper, not B12X's shared-buffer setup.
+    """
+
+    def __init__(self, path):
+        super().__init__()
+        spec = importlib.util.spec_from_file_location(
+            "slimserve_b12x_ipc_probe", path
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        self.wrapper = module.CudaRTLibrary()
+        self.handle_bytes = ct.sizeof(module.cudaIpcMemHandle_t)
+
+    def export_handle(self, pointer):
+        return self.wrapper.cudaIpcGetMemHandleBytes(pointer)
+
+    def import_handle(self, encoded):
+        return ct.c_void_p(self.wrapper.cudaIpcOpenMemHandleBytes(encoded))
+
 
 def expected_bytes(rank, world, stripe):
     return b"".join(
@@ -78,6 +124,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=int, default=45)
+    parser.add_argument("--b12x-ipc-wrapper", type=Path)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     device = int(os.environ["LOCAL_RANK"])
@@ -94,6 +141,16 @@ def main():
         "world": world,
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
+        "ipc_wrapper": (
+            {
+                "path": str(args.b12x_ipc_wrapper),
+                "sha256": hashlib.sha256(
+                    args.b12x_ipc_wrapper.read_bytes()
+                ).hexdigest(),
+            }
+            if args.b12x_ipc_wrapper
+            else "standard CUDA runtime"
+        ),
         "environment": {
             k: v
             for k, v in os.environ.items()
@@ -137,16 +194,22 @@ def main():
 
     def load_runtime():
         nonlocal runtime
-        runtime = Runtime()
+        runtime = (
+            B12XRuntime(args.b12x_ipc_wrapper)
+            if args.b12x_ipc_wrapper
+            else Runtime()
+        )
+        return {"handle_bytes": runtime.handle_bytes}
 
     phase("load_runtime", load_runtime)
-    stripe, local, handle, imports = 1024, ct.c_void_p(), Handle(), []
+    stripe, local, handle, imports = 1024, ct.c_void_p(), b"", []
 
     def export():
+        nonlocal handle
         runtime.call("cudaMalloc", ct.byref(local), stripe * world)
         runtime.call("cudaMemset", local, 0, stripe * world)
         runtime.call("cudaDeviceSynchronize")
-        runtime.call("cudaIpcGetMemHandle", ct.byref(handle), local)
+        handle = runtime.export_handle(local)
         versions = []
         for name in ("cudaDriverGetVersion", "cudaRuntimeGetVersion"):
             value = ct.c_int()
@@ -156,20 +219,13 @@ def main():
 
     phase("ipc_export", export)
     handles = [None] * world
-    dist.all_gather_object(handles, bytes(handle))
+    dist.all_gather_object(handles, handle)
 
     def open_imports():
         for peer, encoded in enumerate(handles):
             if peer == rank:
                 continue
-            pointer = ct.c_void_p()
-            runtime.call(
-                "cudaIpcOpenMemHandle",
-                ct.byref(pointer),
-                Handle.from_buffer_copy(encoded),
-                1,
-            )
-            imports.append(pointer)
+            imports.append(runtime.import_handle(encoded))
 
     phase("ipc_import", open_imports)
 

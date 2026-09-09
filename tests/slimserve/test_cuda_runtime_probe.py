@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.probe_cuda_ipc_nccl import (
+    B12XRuntime,
     Handle,
     Runtime,
     expected_bytes,
@@ -41,3 +42,22 @@ def test_runtime_error_identifies_the_first_failing_cuda_operation():
     )
     with pytest.raises(RuntimeError, match="cudaIpcOpenMemHandle: CUDA error 217"):
         runtime.call("cudaIpcOpenMemHandle")
+
+
+def test_standard_import_rejects_wrong_handle_size_before_cuda():
+    runtime = Runtime.__new__(Runtime)
+    with pytest.raises(ValueError, match="invalid CUDA IPC handle size"):
+        runtime.import_handle(bytes(128))
+
+
+def test_b12x_diagnostic_calls_actual_wrapper_without_truncating_handles():
+    runtime = B12XRuntime.__new__(B12XRuntime)
+    pointer, encoded = ctypes.c_void_p(4096), bytes(range(128))
+    calls = []
+    runtime.wrapper = SimpleNamespace(
+        cudaIpcGetMemHandleBytes=lambda p: calls.append(p) or encoded,
+        cudaIpcOpenMemHandleBytes=lambda b: calls.append(b) or 8192,
+    )
+    assert runtime.export_handle(pointer) == encoded
+    assert runtime.import_handle(encoded).value == 8192
+    assert calls == [pointer, encoded]

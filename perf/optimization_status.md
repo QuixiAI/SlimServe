@@ -22052,3 +22052,60 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/runtime-control/r24-default/rank-*.json.
   Host control remains host-native/. Next isolate B12X's actual wrapper and
   custom setup before attempting a matched latest-image serving comparison.
+
+### R24 actual-wrapper comparison and return control
+
+- Extend the portable probe with --b12x-ipc-wrapper. Load only that source
+  file, not the package's native/JIT path; use its actual export/import calls
+  without truncating serialized handles. The standard remote-write oracle,
+  remaining CUDA operations and NCCL checks stay unchanged. Five CPU tests pass.
+- All four ranks pass using the image's actual 128-byte wrapper, then all
+  four pass a return to the standard 64-byte implementation. Each includes
+  every-pair remote writes and all three exact NCCL reductions. Same loaded
+  libraries/versions as the initial successful container control. The wrapper
+  discrepancy does NOT reproduce the old failure on this machine; do not
+  describe changing it as a fix for that timeout.
+- Wrapper SHA256 8ae32fff0537ef226253670142758731f57e75db45279ff41eca4712f34971bc.
+  Current published B12X source 3edbcbce70f491741b82f5eab9c1b30b39447228 also
+  declares 128 bytes; inspected directly at
+  https://raw.githubusercontent.com/voipmonitor/b12x/3edbcbce70f491741b82f5eab9c1b30b39447228/b12x/comm/pcie/_cuda_ipc.py .
+  Neither its larger shared-buffer setup nor native collective is covered.
+- Run through torchrun --standalone --nproc-per-node=4, --timeout-seconds 45,
+  same read-only R24 container, NCCL_P2P_DISABLE=0/NCCL_P2P_LEVEL=SYS,
+  150-second/16-GiB caps.
+  Wrapper argument is /opt/glm53-flash/b12x/b12x/comm/pcie/_cuda_ipc.py.
+  Raw: runtime-control/{r24-wrapper,r24-standard-return}/rank-*.json; source
+  hashes and implementation/handle size are recorded in every rank receipt.
+
+## 2026-09-08: Lossless mHC storage isolated gates
+
+- Status: promising isolated candidate, no serving integration. Existing
+  kernels convert original BF16 fn values to FP32 before unchanged arithmetic;
+  base/scale remain their native FP32 repairs. Independent extension only.
+- All 90 actual sites, three activation magnitudes, pre-only/fused paths and
+  three changed-input graph replays per case. The 4320 cases at batches
+  1/2/4/8/16/32/64/128 are bit-exact to installed FP32 serving and the paired
+  narrow path. Another 2700 cases at 9/63/65/129/7616 pass, including threshold
+  boundaries and the full serving prefill chunk. Every fn losslessly
+  round-trips to BF16; non-finite/changed values are rejected, not tolerated.
+- Five fixed A/B/A rounds x twenty replays per graph. Two independent banks
+  of all 90 sites rotate 141557760 bytes of BF16 fn (>128 MiB L2); 180 calls
+  per graph, first site per bank pre-only and remaining sites fused. Local
+  paired throughput changes at the eight timing batches above are
+  +11.80/+8.96/+9.76/+6.55/+0.34/+1.96/-0.33/+0.02 percent. Batch1 time is
+  ~9.34 -> 8.36 us/call, batch8 ~11.72 -> 11.00 us. These are isolated
+  mHC results, not decode or prefill serving improvements. Prefill is neutral.
+- Compiled metadata: corresponding FP32/BF16 variants have identical
+  register/shared usage and no spills. Cooperative path uses 40 registers;
+  split partials 72; prefill partials 40/80 for pre-only/fused.
+- Full memcheck over batches 1/8/16/65: zero errors, all 2160 cases pass.
+  mHC-filtered synccheck over the same census: zero errors. First targeted
+  racecheck (batch1, first 96 matching mHC operations, four workers): zero
+  errors/warnings; remaining launch shapes in progress. Every diagnostic has
+  an 80-GiB host cap/zero swap. Native serving libraries are still unchanged.
+- Raw: perf/results/2026-09-08/mhc-storage/{preflight,census,large-checks,
+  memcheck,synccheck,racecheck-b1}.json and sanitizer .log files. CUDA13.0
+  extension directory /home/tiny/.local/scratch/slimserve-glm53/mhc-storage-build.
+- Next: finish race gates; then opt-in native BF16 dispatch and guarded
+  load-time storage, with installed-kernel tests and fixed real-profile
+  serving/quality validation. Do not change the registered default yet.
