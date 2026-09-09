@@ -364,6 +364,13 @@ Probe0fef8ce3 remains isolated; serving QC is still4ce80155. Next fixed32-shape
 timing into stable-route-synced-timing/: separate installed->synced atomic,
 synced atomic->stable, and synced atomic+sort->stable comparisons. See notebook
 for frozen five-round A/B/A protocol. Native integration/real serving still owed.
+Fixed timing now COMPLETE on5d1256853: all7200 samples verify. Stable scatter
+costs at most0.1152us/2.60% versus synced atomic alone, but complete stable
+ordering is17.16-21.01% faster than synced atomic plus diagnostic sort; all32
+shape distributions strictly separated from both controls. M8 random6.1008/
+4.8800/6.0992us A/B/A. This is synthetic warm-cache kernel throughput, NOT
+serving TPS. Retain for opt-in native/serving qualification; M>16 unchanged.
+Raw stable-route-synced-timing/ and runtime-control/stable-route-synced-analysis.json.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

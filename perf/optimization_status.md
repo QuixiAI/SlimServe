@@ -25076,3 +25076,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   memcheck XML7fd67b97a49ff108707394e76693ea195931683957c5770c61572b0b2187a823.
   First failures remain FAIL; this separate corrected candidate passes its
   stated bounded scope only. No timing claims or source/default/native swaps.
+
+## 2026-09-09 - Stable small-M routing removes the diagnostic sort cheaply
+
+- Fixed32-shape/three-comparison/five-round A/B/A COMPLETE on5d1256853,
+  synchronized probe0fef8ce3, installed QC4ce80155. All7200 raw samples, exact
+  graph output/ID/weight/input checks and frozen source/native receipts verify.
+  Independent read-only analysis also rehashes all324-case and bounded race
+  qualification XML/source/probe/native receipts. No excluded rounds or retries.
+- Ordering-only cost versus synchronized atomic router: candidate medians range
+  -0.0048..+0.1152us against the two controls, at worst2.60% slower. This is
+  NOT a faster raw router. Full stable-order path versus synchronized atomic
+  plus diagnostic sort:17.16-21.01% lower latency,0.9168-1.3424us saved across
+  all32 shapes. EVERY shape's candidate maximum is below BOTH control minima.
+  Random-input A/B/A examples (microseconds):
+  M1 4.8144/3.8496/4.8320; M8 6.1008/4.8800/6.0992;
+  M16 7.6192/6.2992/7.6320. Warm-cache synthetic graph throughput only.
+- Installed native -> synchronized atomic probe median changes range
+  -0.0144..+0.0640us (-0.35..+1.46% latency), no strictly separated faster
+  shape. Repair/build overhead is small in this probe; this comparison includes
+  translation-unit/compiler effects and is NOT pure barrier-instruction timing.
+- Decision: retain stable scatter for native/serving qualification, not default
+  promotion. The synchronization fix is required independently of whether stable
+  alignment is enabled. Do not keep the unsafe probe as a selectable production
+  alternative. Native integration must preserve the new canonical layout's
+  provenance when bypassing the diagnostic sort, and retain sorting when the
+  fused routing alignment cannot be reused (block-size/EP/fallback cases).
+  M>16 is unchanged and still needs origin-level stable alignment work.
+- Raw stable-route-synced-timing/summary.json
+  SHAd543a407a81c5ce9b8a8367a526ad2f92055be8fca7ae628faa7a0d02e2cc9be;
+  runtime-control/stable-route-synced-analysis.json
+  SHA312acad20678043a07841f9f850bce7bd78917ea467fec7ea372609ac0a7987c.
+  Source-hashed scratch analyze_stable_route_timing.py; timing/analysis logs
+  retained. Both exit0 and GPU contexts released. No serving TPS/profile change.
