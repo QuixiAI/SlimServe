@@ -21489,3 +21489,26 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/marlin-counters/cold-v2.ncu-rep,
   cold-v2-cases.json, cold-v2-raw.csv and cold-v2-summary.json; the initial
   incomplete-metric report and available-metrics.txt remain alongside them.
+
+## 2026-09-08: Prepare a bounded existing-Marlin scheduling sweep
+
+- Status: layer-3 preflight passes; rotating multi-layer timing pending.
+- Hypothesis: batch1 has lower observed bandwidth than batch8/16. Test the
+  existing thread_k/thread_n/blocks_per_sm controls before designing another
+  expert kernel. Preserve BF16 activations, NVFP4 bytes and FP32 reduction.
+- Method: all sixteen generated tile/block combinations, unsupported cases
+  retained explicitly; baseline/candidate/baseline, five rounds of twenty
+  replays, eight distinct layers and three predetermined routes per batch.
+  Gate/up and down are measured separately. Down inputs use the unchanged
+  auto-scheduled gate/up plus actual GLM clamp/SILU. Activations are synthetic.
+  Compute and record each graph's unique weight footprint; a one-layer hot
+  preflight is not a serving performance result.
+- Preflight: layer3 batch1, three routes, one short A/B/A round. Six valid
+  tile/block combinations per phase pass local comparisons to auto scheduling;
+  ten unsupported shared-memory/shape configurations per phase are recorded.
+  Two CPU parser/footprint tests pass. No native or serving code changes.
+- Next: full isolated sweep, then independent/sanitizer and real-profile
+  validation only if a repeatable candidate wins. Local auto-scheduler parity
+  is not an independent quant oracle or end-to-end quality qualification.
+- Raw: perf/results/2026-09-08/marlin-schedule/preflight.json; forthcoming
+  rotating-sweep.json in the same directory.
