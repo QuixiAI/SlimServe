@@ -21526,3 +21526,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Validation: all 123 SlimServe tests pass; recursive comparison confirms
   every registry field outside title/summary/notes is unchanged. Recipe,
   checkpoint digests, serving settings and native binary stay fixed.
+
+## 2026-09-08: Marlin batch1 scheduling candidate clears composed timing
+
+- Status: isolated candidate; serving default unchanged, validation pending.
+- Full sweep: eight actual checkpoint layers, three captured routing cases
+  per batch, all sixteen tile/block combinations and all rejections retained.
+  Six configurations per phase are supported. The batch1 graph rotates over
+  427 MB gate/up or 214 MB down unique weights, above the 128 MiB L2 size.
+  Batch8 has no useful win; batch16 improvements are at most about 1% locally.
+- Candidate: batch1 gate/up K128/N64/one block per SM, down K64/N128/two.
+  Separate GEMMs improve about 5% each. Composed gate/up + clamp/SILU + down
+  A/B/A medians: 28.333 / 27.081 / 28.331 us per layer, 4.62% paired speedup.
+  Five rounds x twenty replays, all 24 distinct layer/routing cases retained.
+  Max composed difference from auto: 0.000976563; max normalized RMS 0.000144.
+  Roughly 53 us across 42 layers is only about 1% of a full decode step;
+  real serving and overlap decide whether it survives.
+- Independent oracle: decodes checkpoint nibbles and group scales on CPU,
+  BF16 fragments, FP64 dot products, no Marlin repack/dequant helpers. Initial
+  oracle probes failed equally for auto and candidate: they omitted two
+  existing BF16 boundaries, SiLU before the up multiply and dot/coefficient
+  rounding before the weighted down multiply. Source inspection identified
+  both; no tolerance relaxation or serving change. Corrected rank0/layer3
+  changed-input graph preflight has normalized RMS 4.1e-9 (auto) / 2.0e-9
+  (candidate), max absolute errors 1.2e-7 / 6.0e-8. Failed oracle artifacts
+  retained, not described as kernel faults.
+- Next: three layers x four TP weight ranks x three changed-input replays,
+  targeted memcheck/racecheck, then an opt-in exact-shape serving A/B if clean.
+- Raw: perf/results/2026-09-08/marlin-schedule/rotating-sweep.json,
+  paired.json, oracle-preflight.json, oracle-rounded-preflight.json and
+  oracle-boundaries-preflight.json. Three CPU config/footprint/decode tests pass.

@@ -36,6 +36,10 @@ def parse_config(value):
 
 
 def footprint(cases, phase):
+    if phase == "moe":
+        return footprint(cases, "gate_up") + footprint(cases, "down")
+    if phase not in ("gate_up", "down"):
+        raise ValueError("unknown phase")
     experts = defaultdict(set)
     for case in cases:
         experts[case["layer"]].update(e for row in case["expert_ids"] for e in row)
@@ -70,6 +74,10 @@ def prepare_case(weights, batch, record, layer_id):
     w13, s13, g13, w2, s2, g2, workspace = weights
 
     def call(phase, config):
+        if phase == "moe":
+            call("gate_up", config[0])
+            apply_moe_activation(MoEActivation.SILU, down_input, gate, clamp_limit=10.0)
+            return call("down", config[1])
         is_gate = phase == "gate_up"
         return ops.moe_wna16_marlin_gemm(
             x if is_gate else down_input,
@@ -106,9 +114,13 @@ def prepare_case(weights, batch, record, layer_id):
     call("gate_up", (-1, -1, -1))
     apply_moe_activation(MoEActivation.SILU, down_input, gate, clamp_limit=10.0)
     refs = {phase: call(phase, (-1, -1, -1)).clone() for phase in ("gate_up", "down")}
+    refs["moe"] = refs["down"]
     return {
         "call": call,
         "refs": refs,
+        "input": x,
+        "routing_weights": topk_weights,
+        "outputs": {"gate_up": gate, "down": down, "moe": down},
         "identity": {
             "layer": layer_id,
             "batch": batch,
@@ -182,6 +194,13 @@ def main():
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="Test the composed gate/up, activation and down path",
+    )
+    parser.add_argument("--gate-config", type=parse_config, default=(128, 64, 1))
+    parser.add_argument("--down-config", type=parse_config, default=(64, 128, 2))
+    parser.add_argument(
         "--configs",
         type=parse_config,
         nargs="+",
@@ -247,9 +266,15 @@ def main():
                 if b == batch
                 for layer in args.layers
             ]
-            for phase in ("gate_up", "down"):
-                baseline = capture(cases, phase, (-1, -1, -1))
-                for config in args.configs:
+            phase_configs = (
+                {"moe": [(args.gate_config, args.down_config)]}
+                if args.pipeline
+                else {"gate_up": args.configs, "down": args.configs}
+            )
+            for phase, configs in phase_configs.items():
+                auto = ((-1, -1, -1), (-1, -1, -1)) if phase == "moe" else (-1, -1, -1)
+                baseline = capture(cases, phase, auto)
+                for config in configs:
                     row = {
                         "batch": batch,
                         "phase": phase,
