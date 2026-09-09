@@ -40,15 +40,17 @@ changed-input graphs, memcheck, racecheck and synccheck pass. Other platforms
 keep their original geometry. Raw: perf/results/2026-09-08/indexer-tiles/,
 indexer-tile-serving/ and indexer-tile-return-control/.
 
-Current kernel candidate: retain mHC fn's original BF16 storage with unchanged
-FP32 arithmetic. All 7020 installed-kernel cases pass bit-exact at all 90 sites
-over 13 batch shapes, including changed-input graphs/full prefill chunks.
-Broader operator tests and sanitizer gates pass. VLLM_GLM5_MHC_BF16_FN=1 is
-opt-in and default OFF; checked loading refuses changed checkpoint values,
-and native FP32 base/scale repairs stay intact. The rebuilt library and backup
-hashes are in the notebook. Next fixed sequence: one FP32 control start,
-three BF16 starts, one FP32 return, all on the same rebuilt binary and full
-campaign workload. No retained serving gain or profile promotion yet.
+The mHC BF16-storage fixed A/B/A is complete: one FP32 control, three BF16
+starts, one FP32 return; all 45 exact timing rounds, text/image canaries,
+4096-token quality and six needle checks per start pass. BF16 c1 median is
+156.76 tok/s versus 155.98/156.00 in the controls, a repeatable ~0.5% gain.
+c8/c16 differences are within the observed variation. Cold 32K/128K engine
+TTFT is 2.614/10.994 s versus return 2.611/10.968 s: no prefill win; the trace
+shows a small (~0.45 ms/full chunk) mHC cost. Keep VLLM_GLM5_MHC_BF16_FN
+opt-in/default OFF pending that tradeoff's follow-up, not a promoted baseline.
+All 7020 installed-kernel cases remain bit-exact, with unchanged FP32 arithmetic
+and lossless checkpoint loading. Broader tests/sanitizers pass. Raw: the three
+mhc-storage-{fp32-control,serving,return-control}/ directories in the notebook.
 
 New graph-state evidence: the first FP32 control is mixed across ranks, not
 one global state. Its c1 rank0 has 99 us/step of graph gaps and 788 us of
@@ -67,6 +69,11 @@ visible in these traces, but its persistence without profiling is not yet
 established. Test profiler on/off and whole-graph timing before changing graph
 topology, stream attributes or the driver. Timed decode precedes profiling;
 do not discard its measurements or equate a traced gap with recoverable TPS.
+The one-GPU A/B/A probe confirms observer overhead: median paired graph latency
+increases 17.93% for 1200 linear nodes and 55.78% for the two-branch graph.
+All 18 phases pass exact output checks; post-profiler timings return near baseline.
+This does not establish the full TP4 model's unprofiled graph span. Probe raw:
+runtime-control/graph-profiler-bias/. Whole-model observer control is next.
 
 The digest-pinned R28.1 reference image is downloaded; its source lock and
 four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
@@ -200,9 +207,10 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-First finish the active mHC fixed series and matched B12X control. For the
-startup variability, compare actual all-rank graph dependencies/launch attributes;
-rank0 alone hides mixed-rank graph speed. Do not restart until all ranks are fast.
+First finish the active matched B12X control. For startup variability, compare
+whole-graph/unprofiled timing against node tracing before changing dependencies
+or launch attributes; rank0-only node traces are insufficient. Do not restart
+until all ranks appear fast in a profiler.
 
 1. MoE launch geometry: routing and cold-cache traffic are now measured;
    test existing Marlin tile/grid controls on actual weights. The rank-0 c8 trace has

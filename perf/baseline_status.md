@@ -1919,6 +1919,33 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 mHC candidate qualification - 2026-09-08 (not promoted)
+
+The retained profile baseline remains the spill-free indexer below. Lossless
+BF16 mHC fn storage passes its fixed one-FP32/three-BF16/one-FP32 series on
+the same rebuilt native library; all 45 exact-token timing rounds, per-start
+text/image canaries and expanded quality checks pass. No restart selection.
+
+| Arm | Starts | E2E c1 / c8 / c16 tok/s | Cold 32K / 128K engine TTFT s |
+| --- | ---: | ---: | ---: |
+| FP32 control | 1 | 155.98 / 575.90 / 780.40 | 2.613 / 10.935 |
+| BF16 candidate | 3 | 156.76 / 577.62 / 778.49 | 2.614 / 10.994 |
+| FP32 return | 1 | 156.00 / 576.23 / 777.12 | 2.611 / 10.968 |
+
+Candidate ranges: c1 156.57-156.97, c8 574.07-580.32, c16 775.17-781.38.
+Its c1 gain is about0.5%; c8/c16 are unresolved within variation. All timed
+prefill requests have cached_tokens=0. No prefill win: the first-eight-chunk
+node trace shows about0.45 ms extra mHC time per7616-token chunk. Keep the
+flag opt-in/defaultOFF while evaluating that small tradeoff. Do not substitute
+isolated-kernel gains for serving gains. Raw: perf/results/2026-09-08/
+mhc-storage-{fp32-control,serving,return-control}/; details in the notebook.
+
+Profiler caution applies to historical graph-state explanations: a controlled
+one-GPU test now measures17.93%/55.78% extra linear/fork-join graph latency
+under Torch node tracing. This is NOT the measured overhead of the TP4 model,
+nor proof that its historical unprofiled startup variability was a profiler
+artifact. Whole-model observer control remains required.
+
 ### RTX6000 spill-free indexer baseline - 2026-09-08
 
 Serving source 426282462, unchanged repaired native libraries and pinned recipe

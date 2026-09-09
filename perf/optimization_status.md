@@ -22337,3 +22337,75 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   traces/dp0_pp0_tp0_dcp0_ep0_rank0.1788922685736373365.pt.trace.json under
   perf/results/2026-09-08/. Isolation probe output is reserved at
   perf/results/2026-09-08/runtime-control/graph-profiler-bias/.
+
+### Observer-control result
+
+- One process completes all 18 prescribed phases, all exact changed-input
+  checks pass. Three A/B/A rounds x32 replays; unchanged graph, no per-replay
+  synchronization or profiling in either control phase. GPU0 exclusively owned.
+- Median whole-batch CUDA-event time per replay (us), before / during / after:
+  linear1200 nodes 872.544 /1030.310 /874.457; fork/join2400 kernel nodes
+  1254.085 /1952.654 /1256.784. Median paired profiling overhead17.9286% and
+  55.7772%, respectively. All samples remain in summary.json; fork profiling
+  overhead ranges43.85-59.31%. The overhead recedes after the profiler stops.
+- First-round node trace retains32 graphs per shape. Linear graph span mean
+  1000.843 us, busy union884.551 us, uncovered116.292 us. Fork graph span mean
+  1946.600 us, busy union1002.885 us, uncovered943.715 us. These are biased
+  node-profiler observations, not estimates of unprofiled inter-kernel gaps.
+- Decision: positive evidence that the observer perturbs this runtime. Do NOT
+  extrapolate these percentages to the model or claim the historical startup
+  variability solved. Next use whole-graph tracing of the real TP4 workload,
+  with model timing before/after and every rank represented.
+- Nsight2025.6.3 supports graph-level tracing on this driver. A CPU-only
+  start-later/start/stop lifecycle check produces nsys-lifecycle.nsys-rep;
+  it is not GPU/child-process trace qualification. An attempted stop --output
+  was rejected by the CLI; output belongs on the profile/start configuration.
+- Raw: runtime-control/graph-profiler-bias/{summary.json,node-analysis.json,
+  fork[01]-round[123].trace.json}; the raw report prefix is under the same
+  dated perf/results directory. Probe source78e0000f3, Ruff/diff checks pass.
+
+## 2026-09-08: Lossless BF16 mHC serving qualification complete; prefill follow-up
+
+- Status: decode candidate qualified, still opt-in/defaultOFF. No profile
+  promotion while its small prefill cost is unresolved. Fixed recipe v1,
+  indexerRT2/PT128, same repaired/rebuilt native binary throughout.
+- Prescribed sequence completes: one FP32 control /three BF16 starts /one
+  FP32 return, three repeats each at c1/c8/c16. All45 timing rounds/375 exact
+  1000-input/300-output requests, text/image canaries and per-start4096-token
+  quality plus six needle contrasts pass. No failed/excluded starts or retries.
+- E2E medians c1/c8/c16:
+  FP32 155.983395 /575.895943 /780.404859;
+  BF16 156.759348 /577.623366 /778.492085;
+  FP32 return155.999108 /576.232573 /777.119941 tok/s.
+  BF16 ranges156.571250-156.966585 /574.073450-580.318461 /
+  775.171048-781.382112. Control c1 ranges155.763721-156.402134 and
+  155.951330-156.162624. About0.5% c1 gain is repeatable; c8/c16 differences
+  are unresolved within the observed variation. The isolated11.8% kernel
+  result is NOT an E2E gain. Startup190.089 /[142.067,168.047,156.041] /
+  146.135 s, including the first rebuilt-binary start without exclusion.
+- Cold engine TTFT medians32K/128K (ms), all cached_tokens=0:
+  FP32 2613.051984 /10934.628551;
+  BF16 2614.210407 /10994.404392;
+  return2611.474161 /10967.982320.
+  BF16 nine-sample ranges2607.761054-2618.851908 and10933.864407-11045.243405.
+  Return three-sample ranges2608.282998-2613.740968 and10932.475139-11010.824029.
+  BF16 client medians2656.005698 /11108.234017; return2654.661200 /11078.521030.
+  No prefill win; differences are small and overlapping, with an actual local
+  kernel cost in the trace that merits follow-up rather than being hidden.
+- First-eight128K prefill chunk traces (7616 tokens/chunk), first FP32 control
+  vs third BF16 start: total mHC durations56.435-56.591 vs56.874-57.069 ms,
+  about0.45 ms extra per chunk. Fn partials38.715-38.862 vs39.249-39.386 ms.
+  All-reduce stays185.81-187.27 vs186.01-186.76 ms; KDA recurrent core stays
+  ~7.77-7.80 ms. This local mHC cost is under0.1% of the whole chunk and
+  does not explain every TTFT difference. Evaluate BF16 fn staging before
+  promoting, without duplicating persistent FP32 weights or changing arithmetic.
+- Quality text-logprob means -2.729009 /[-2.731740,-2.734544,-2.722865] /
+  -2.728053. All30 needle contrasts pass. No aggregate quality regression is
+  demonstrated; this remains a prefill-quality check, not broad capability or
+  long-running decode qualification. All7020 bit-exact installed cases and
+  previous sanitizer gates remain valid for this unchanged implementation.
+- Raw: perf/results/2026-09-08/mhc-storage-{fp32-control,serving,return-control}/,
+  runtime-control/mhc-prefill-fp32-bf16-analysis.json. Source185e9c33e;
+  later commits during the series changed only separate diagnostics/docs.
+- Next: pinned current B12X control and whole-model observer control. The
+  registered production recipe/default stays unchanged while these run.
