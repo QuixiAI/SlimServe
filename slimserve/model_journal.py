@@ -13,6 +13,8 @@ import os
 from contextvars import ContextVar
 from functools import wraps
 
+from slimserve.glm53_ordering import enabled as native_order_enabled
+
 ACTIVE = ContextVar("slimserve_glm53_model_journal", default=None)
 OP_NAMES = ("glm5_mhc_pre", "glm5_mhc_fused_post_pre", "glm5_mhc_post")
 
@@ -71,12 +73,14 @@ class ModelJournal:
                 "first_moe_snapshots": self.moe_enabled,
                 "small_route_order": (
                     "canonical-native"
-                    if os.getenv("SLIMSERVE_GLM53_STABLE_ROUTE", "0") == "1"
+                    if native_order_enabled()
+                    or os.getenv("SLIMSERVE_GLM53_STABLE_ROUTE", "0") == "1"
                     else "atomic-native"
                 ),
                 "large_alignment_order": (
                     "canonical-native"
-                    if os.getenv("SLIMSERVE_GLM53_STABLE_ALIGN", "0") == "1"
+                    if native_order_enabled()
+                    or os.getenv("SLIMSERVE_GLM53_STABLE_ALIGN", "0") == "1"
                     else "atomic-plus-sort"
                     if os.getenv("SLIMSERVE_GLM53_CANONICAL_MOE", "0") == "1"
                     else "atomic"

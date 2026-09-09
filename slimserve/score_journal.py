@@ -76,6 +76,7 @@ class ScoreJournal:
             "vllm/model_executor/layers/fused_moe/router/fused_moe_router.py",
             "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
             "slimserve/canonical_moe.py",
+            "slimserve/glm53_ordering.py",
             "slimserve/canonical_moe_kernel.py",
             "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
             "csrc/quixicore/serving/glm_moe_routing.cuh",

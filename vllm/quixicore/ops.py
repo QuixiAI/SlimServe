@@ -156,6 +156,7 @@ class quixicore_ops:
         runner and the unquantized linear pick their custom ops by them),
         for VllmConfig.compute_hash: a compiled artifact from a build without
         a kernel must not be reused by one with it."""
+        from slimserve.glm53_ordering import cache_factor
         from vllm.model_executor.layers.utils import (
             decode_gemm_enabled,
             decode_gemm_fp8_enabled,
@@ -165,6 +166,7 @@ class quixicore_ops:
             f"moe_sum_add={quixicore_ops.has_moe_sum_add()}",
             f"decode_gemm={decode_gemm_enabled()}",
             f"decode_gemm_fp8={decode_gemm_fp8_enabled()}",
+            cache_factor(),
         ]
 
     @staticmethod

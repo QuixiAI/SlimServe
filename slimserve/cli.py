@@ -458,6 +458,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.jit_monitor_verbose:
         plan = replace(plan, engine={**plan.engine, "jit_monitor_verbose": True})
 
+    try:
+        from slimserve.glm53_ordering import validate_plan
+
+        validate_plan(plan)
+    except ValueError as error:
+        term.fail(str(error))
+        return 2
+
     if args.dry_run:
         _show(plan)
         return 0

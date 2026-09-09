@@ -115,7 +115,8 @@ def test_three_requests_multiple_chunks_and_extra_match(journal):
     events = [json.loads(line) for line in journal.path.read_text().splitlines()]
     assert len([e for e in events if e["kind"] == "request_complete"]) == 3
     assert len([e for e in events if e["kind"] == "forward_complete"]) == 6
-    assert len(events[0]["implementation_sha256"]) == 9
+    assert len(events[0]["implementation_sha256"]) == 10
+    assert "slimserve/glm53_ordering.py" in events[0]["implementation_sha256"]
     assert events[0]["selection_order"] == "native"
     assert events[0]["selection_ties"] == "native"
     assert events[0]["selection_order_implementation"] == "native"

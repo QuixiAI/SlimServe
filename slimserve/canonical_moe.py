@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in GLM53 ordering intervention, NOT a production performance path.
+"""GLM53 ordering policy and the preserved diagnostic sorting control.
 
 Sort existing expert-contiguous alignment in place. This preserves routing,
 expert block counts, padding, and GEMM arithmetic, but adds one sorting launch.
-Requires the bounded model journal so a diagnostic cannot silently become a
-serving baseline. A final implementation should construct stable alignment at
-the source rather than sorting an already constructed alignment.
+Legacy flags require the bounded model journal. NATIVE_ORDER instead selects
+the qualified native source-alignment kernels without enabling any observer;
+its serving caller fails closed rather than taking this sorting fallback.
 """
 
 import os
 
+from slimserve.glm53_ordering import enabled as native_order_enabled
+
 
 def enabled():
+    if native_order_enabled():
+        return True
     flag = os.environ.get("SLIMSERVE_GLM53_CANONICAL_MOE", "0")
     if flag not in ("0", "1"):
         raise ValueError("SLIMSERVE_GLM53_CANONICAL_MOE must be 0 or 1")
@@ -21,6 +25,8 @@ def enabled():
 
 
 def stable_route_enabled():
+    if native_order_enabled():
+        return True
     flag = os.environ.get("SLIMSERVE_GLM53_STABLE_ROUTE", "0")
     if flag not in ("0", "1"):
         raise ValueError("stable route flag must be 0 or 1")
@@ -30,6 +36,8 @@ def stable_route_enabled():
 
 
 def stable_align_enabled():
+    if native_order_enabled():
+        return True
     flag = os.environ.get("SLIMSERVE_GLM53_STABLE_ALIGN", "0")
     if flag not in ("0", "1"):
         raise ValueError("stable align flag must be 0 or 1")

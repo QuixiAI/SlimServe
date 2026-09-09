@@ -58,6 +58,7 @@ def diagnostic_only(args):
                 "SLIMSERVE_GLM53_CANONICAL_MOE",
                 "SLIMSERVE_GLM53_STABLE_ROUTE",
                 "SLIMSERVE_GLM53_STABLE_ALIGN",
+                "SLIMSERVE_GLM53_NATIVE_ORDER",
                 "SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER",
                 "SLIMSERVE_GLM53_CANONICAL_INDEX_TIES",
                 "SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED",
@@ -85,6 +86,14 @@ def benchmark_sources():
         "slimserve/cli.py",
         "slimserve/server.py",
         "vllm/utils/jit_monitor.py",
+        "slimserve/glm53_ordering.py",
+        "slimserve/canonical_moe.py",
+        "slimserve/canonical_indexer.py",
+        "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
+        "vllm/model_executor/layers/fused_moe/router/glm_stable_align.py",
+        "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
+        "vllm/model_executor/layers/glm5_next_indexer.py",
+        "vllm/quixicore/ops.py",
     ]
     return {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in paths
@@ -583,6 +592,9 @@ def main():
     if args.profile not in compatible:
         ap.error(f"profile not compatible; available: {compatible}")
     plan = registry.resolve(args.profile, machine.platform, machine.count, None)
+    from slimserve.glm53_ordering import validate_plan
+
+    validate_plan(plan)
     if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(
             plan,

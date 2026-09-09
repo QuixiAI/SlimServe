@@ -17,6 +17,8 @@ from pathlib import Path
 
 import torch
 
+from slimserve.glm53_ordering import enabled as native_order_enabled
+
 ACTIVE = ContextVar("glm53_index_request", default=None)
 LAYER = ContextVar("glm53_index_layer", default=None)
 LAYERS = tuple(range(3, 44, 4))
@@ -28,7 +30,10 @@ def enabled():
     path = os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
     if path and (
         os.environ.get("SLIMSERVE_GLM53_MODEL_JOURNAL") != "1"
-        or os.environ.get("SLIMSERVE_GLM53_CANONICAL_MOE") != "1"
+        or (
+            not native_order_enabled()
+            and os.environ.get("SLIMSERVE_GLM53_CANONICAL_MOE") != "1"
+        )
     ):
         raise ValueError(
             "index journal requires bounded model journal and canonical MoE"
@@ -105,6 +110,7 @@ class IndexJournal:
             "vllm/model_executor/layers/glm5_next_indexer.py",
             "vllm/v1/worker/gpu_model_runner.py",
             "slimserve/canonical_moe.py",
+            "slimserve/glm53_ordering.py",
             "slimserve/canonical_moe_kernel.py",
             "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
         )
@@ -125,17 +131,20 @@ class IndexJournal:
                 "undefined_logit_tails": "zeroed in private CPU copies only",
                 "selection_order": (
                     "canonical-pool-id"
-                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
+                    if native_order_enabled()
+                    or os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
                     else "native"
                 ),
                 "selection_ties": (
                     "smaller-pool-id"
-                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES") == "1"
+                    if native_order_enabled()
+                    or os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES") == "1"
                     else "native"
                 ),
                 "selection_order_implementation": (
                     "native-bitonic"
-                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED") == "1"
+                    if native_order_enabled()
+                    or os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED") == "1"
                     else "post-sort"
                     if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
                     else "native"

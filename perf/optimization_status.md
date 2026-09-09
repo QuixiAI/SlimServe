@@ -25734,3 +25734,49 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Test without CUDA_LAUNCH_BLOCKING or journals, on the same exact profile and
   quality workload. This is qualification of normal asynchronous execution,
   not default promotion or a claim that the campaign is complete.
+
+## 2026-09-09 - Native ordering policy decoupled from diagnostic observers
+
+- Status: opt-in candidate; normal-execution serving qualification pending.
+- Baseline: full-model exact stable-align diagnostic on3e1dac08f, QC39b302f0.
+  Hypothesis: the already-qualified routing/alignment/selector kernels retain
+  exact score reproducibility without the serialized launch/tensor-journal
+  scaffolding. No new kernel arithmetic, quant, native binary or profile default.
+- Add one defaultOFF SLIMSERVE_GLM53_NATIVE_ORDER policy, strict fixed-recipe
+  RTX6000/TP4/noEP/no-spec/Marlin plan gate, and explicit graph-cache v1 factor.
+  It selects stable fused routing atM1..16, stable native alignment atM17..8192,
+  and fused canonical pool-ID selection with smaller-ID cutoff ties. Mixed
+  legacy flags, disabled fused routing, unsupported alignment and noncanonical
+  reuse fail closed. No diagnostic sorting fallback or observer auto-enabling.
+  Preserved observers record effective policy when separately requested.
+- CPU first run:601pass/7fail/one skip. Six failures are socket creation denied
+  by the new sandbox, not serving failures; one stale index-journal test expected
+  nine receipt sources instead of ten. Correct only the receipt assertion to
+  include the policy source. Same full suite in an8GiB/local-socket scope:
+  608pass/one existing GPU-only skip21.68s. Original failure artifacts retained;
+  no test suppression or masking. Focused preflight172pass7.34s also retained.
+- GPU:206pass14.66s in16GiB/no swap, normal asynchronous execution with only the
+  new ordering flag. Includes171 native alignment cases,20 stable/control
+  eager/Inductor/changed-input graph cases, and15 real policy-import/router/
+  wrapped-selector checks with independent CPU ordering and wide cutoff ties.
+  The15 new checks use real kernels, not monkeypatched native dispatch. This
+  requalifies Python wiring; prior full native sanitizer evidence remains valid.
+  Fourteen pre-existing Torch deprecation warnings, zero failures/skips.
+- Native hashes unchanged: QC39b302f041bb846712b396f84100aefefcb332ed3fd04bd787853fa43bfdb31c,
+  corefe4a7c2a3c2c03cc8f725528e40aead70f2570cdbb9bb1481d4874c7e6427639,
+  MoE1093b8a4ca7cb308d4ebff254ab502d7b01d65eb86423b2640c8f8a4bff4ac1a.
+  A read-only hash command initially used nonexistent core/MoE .abi3 names;
+  corrected to their actual _stable_libtorch.abi3 names, no files changed.
+- Raw runtime-control/native-order-{wiring-cpu,full-cpu,full-cpu-configured,gpu}
+  logs/XML. Campaign source receipt now freezes ordering implementation paths,
+  not just the client; candidate remains baseline-ineligible until qualified.
+  Final expanded-source CPU suite608pass/one skip21.29s; lint/diff checks pass.
+  Actual hardware-resolved dry-run retains the exact recipe/TP4/BF16/no-spec
+  plan, only enabling request metrics. Raw native-order-final-cpu.{log,xml}
+  and native-order-profile-dry-run.log. GPUs free after qualification.
+- Fixed next protocol: perf/glm53-native-order-protocol.md. ONE start, three
+  cold exact1000/300 repetitions atc1/c8/c16, text/image, three quality passes.
+  No journals, CUDA_LAUNCH_BLOCKING, verbose JIT or profiler; request metrics
+  retained for cold-cache checks. Require exact scores within all three passes
+  and all nine pairings versus the instrumented control. Keep every outcome;
+  no TPS, default-promotion or variability-resolution claim before that evidence.

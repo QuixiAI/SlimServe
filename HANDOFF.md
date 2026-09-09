@@ -35,7 +35,20 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 19:32 UTC)
+### Latest checkpoint (2026-09-09 19:45 UTC)
+
+DefaultOFF SLIMSERVE_GLM53_NATIVE_ORDER now selects the qualified kernels
+without enabling journals. Strict recipe/platform scope, no sorting fallback,
+distinct graph-cache factor. Mixed diagnostic flags rejected.206 real GPU
+wiring/graph cases pass under normal asynchronous execution; CPU608pass/one
+existing skip after fixing a stale provenance-count assertion. Six original
+CPU socket failures were sandbox denials; original logs retained. Native
+QC39b302f0/corefe4/MoE1093 unchanged. Full native sanitizers remain qualified.
+Next is ONE normal-execution serving start with three exact quality passes:
+see perf/glm53-native-order-protocol.md for the frozen command and gates.
+No journals or launch blocking, no promotion or new competitive TPS claim.
+
+### Completed instrumented checkpoints
 
 Small-M origin routing PASSES full-model qualification on c8ba8d56c:
 one prescribed start, three quality passes, every text/needle score and all

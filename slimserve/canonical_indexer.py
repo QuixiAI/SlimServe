@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in GLM pool-order and separate native cutoff-tie diagnostics.
+"""GLM pool-order policy and preserved diagnostic selection controls.
 
 The disabled factory returns the original callable. Enabled only in the GLM
 pooled indexer, with model/selector observers and canonical MoE also required.
@@ -8,6 +8,8 @@ instead emits ordered IDs inside the qualified native selector; it remains an
 opt-in diagnostic until full-model qualification, not a production default.
 CANONICAL_INDEX_TIES additionally chooses smaller pool IDs at exact equal-score
 cutoffs in the native selector. It never changes scores or higher-score choices.
+NATIVE_ORDER selects the qualified fused selector without requiring observers;
+the legacy diagnostic switches retain their original prerequisites.
 """
 
 import os
@@ -15,8 +17,12 @@ from functools import wraps
 
 import torch
 
+from slimserve.glm53_ordering import enabled as native_order_enabled
+
 
 def enabled():
+    if native_order_enabled():
+        return True
     value = os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER", "0")
     if value not in ("0", "1"):
         raise ValueError("canonical index order flag must be 0 or 1")
@@ -49,6 +55,8 @@ def canonicalize(indices):
 
 
 def ties_enabled():
+    if native_order_enabled():
+        return True
     value = os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES", "0")
     if value not in ("0", "1"):
         raise ValueError("canonical index ties flag must be 0 or 1")
@@ -66,6 +74,8 @@ def _native_tie_selector():
 
 
 def fused_enabled():
+    if native_order_enabled():
+        return True
     value = os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED", "0")
     if value not in ("0", "1"):
         raise ValueError("canonical index fusion flag must be 0 or 1")
