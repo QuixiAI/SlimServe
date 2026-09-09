@@ -32,21 +32,17 @@ def direct_bf16_rne(value):
     ):
         raise ValueError("direct rounding requires finite BF16-range values")
     estimate = value.bfloat16()
-    choices = torch.stack(
-        [
-            torch.nextafter(estimate, torch.full_like(estimate, -math.inf)),
-            estimate,
-            torch.nextafter(estimate, torch.full_like(estimate, math.inf)),
-        ]
-    )
-    distance = (choices.double() - value).abs()
-    closest = distance == distance.amin(0)
-    even = (choices.view(torch.int16) & 1) == 0
-    # Prefer an even tied value, then any nearest value. Argmin never chooses
-    # an infinite neighbor since the estimate is finite within this domain.
-    priority = torch.where(closest, (~even).int(), 2)
-    index = priority.argmin(0, keepdim=True)
-    rounded = choices.gather(0, index).squeeze(0)
+    rounded = estimate
+    distance = (estimate.double() - value).abs()
+    # Pairwise selection implements the same nearest/even ordering without
+    # a strided three-way argmin over millions of hidden coordinates.
+    for direction in (-math.inf, math.inf):
+        neighbor = torch.nextafter(estimate, torch.full_like(estimate, direction))
+        other_distance = (neighbor.double() - value).abs()
+        even = (neighbor.view(torch.int16) & 1) == 0
+        better = (other_distance < distance) | ((other_distance == distance) & even)
+        rounded = torch.where(better, neighbor, rounded)
+        distance = torch.minimum(distance, other_distance)
     return torch.where(value == 0, estimate, rounded)
 
 

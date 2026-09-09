@@ -23487,3 +23487,19 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Raw CPU: perf/results/2026-09-08/runtime-control/
   mhc-fp64-oracle-cpu-{tests,module-tests,final-tests}.xml. New GPU outputs
   will use perf/results/2026-09-09/mhc-tc-accuracy-{first-check,census}/.
+- Bounded first check completes on44127c7c9: all six site79/T7616 cases and
+  all18 changed-input graph phases pass the independent gates. Exactly one
+  strict parity comparison still fails, the original fused seed2240 case.
+  Its31,195,136 layer-input values have zero accuracy-budget violations in
+  BOTH kernels. Reference/candidate NRMS0.001660413992615/0.001660413989324;
+ 897/644 values differ from ideal direct BF16 rounding, respectively. This is
+  limited actual-site evidence, not the full census or serving qualification.
+  Raw mhc-tc-accuracy-first-check/{summary.json,checks.jsonl}, exit0,77.361s.
+- Before the full census, eliminate a CPU-oracle bottleneck: pairwise nearest/
+  even selection replaces a strided three-way argmin, with identical candidate
+  BF16 values and unchanged error budgets/math/coverage.195834 midpoint tests
+  still pass;1,048,576 seed9301 broad-exponent values are bit-exact to the old
+  oracle.31 tests pass. This improves checker runtime, not GPU serving speed.
+  Raw runtime-control/mhc-fp64-{pairwise-tests.xml,rounder-equivalence.log}.
+  Prescribed bounded six-case recheck will verify identical recorded accuracy
+  results before the frozen full census; no GPU kernel or serving change.
