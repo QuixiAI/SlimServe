@@ -4,8 +4,11 @@
 
 Isolated kernels only. Require bit-exact output to installed FP32 serving and
 changed-input graph parity over every actual checkpoint site. Fixed A/B/A
-timings rotate two independently allocated copies of all 90 parameter sets:
+timings default to two independent copies of all 90 parameter sets:
 even the narrower fn working set exceeds SM120's 128 MiB L2.
+Optional shared activation banks bound full-prefill timing memory; they are
+an isolated memory-layout control, not a simulation of model dependencies.
+Six banks increase the BF16 weight working set from 135 MiB to 405 MiB.
 """
 
 import argparse
@@ -40,6 +43,29 @@ def exact(reference, candidate):
             raise AssertionError(f"output {i} is not bit-exact")
 
 
+def timing_rows(sites, narrow, batch, shared_activations=False, weight_banks=2):
+    """Keep every fn allocation distinct; optionally share inputs within a bank."""
+    if len(sites) != len(narrow):
+        raise ValueError("parameter and narrow site counts differ")
+    if weight_banks < 1:
+        raise ValueError("positive weight bank count required")
+    rows = []
+    for bank in range(weight_banks):
+        shared = (
+            inputs(batch, 5001 + bank * len(sites))[:4] if shared_activations else None
+        )
+        for site, weights in enumerate(sites):
+            activations = (
+                shared
+                if shared is not None
+                else inputs(batch, 5001 + site + bank * len(sites))[:4]
+            )
+            data = [*activations, weights[0].clone(), *weights[1:]]
+            candidate = [*activations, narrow[site].clone(), *weights[1:]]
+            rows.append((data, candidate, site != 0))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
@@ -50,12 +76,41 @@ def main():
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--check-installed-bf16", action="store_true")
+    parser.add_argument(
+        "--timing-baseline",
+        choices=("fp32", "installed-bf16"),
+        default="fp32",
+        help="compare probe BF16 to probe FP32 or the installed BF16 operator",
+    )
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument(
+        "--weight-banks",
+        type=int,
+        default=2,
+        help="distinct copies of all 90 fn matrices; six exceed three L2 capacities",
+    )
+    parser.add_argument(
+        "--shared-activations",
+        action="store_true",
+        help="reuse one activation set per timing bank to bound full-prefill memory",
+    )
     args = parser.parse_args()
-    if min(args.rounds, args.replays, *args.batch) < 1 or max(args.batch) > 7616:
+    if args.timing_baseline == "installed-bf16":
+        args.check_installed_bf16 = True
+    if (
+        min(args.rounds, args.replays, args.weight_banks, *args.batch) < 1
+        or max(args.batch) > 7616
+    ):
         parser.error("positive rounds/replays/batches, at most 7616 rows")
-    if not args.check_only and not args.build_only and max(args.batch) > 128:
-        parser.error("large prefill shapes require --check-only to bound GPU memory")
+    if (
+        not args.check_only
+        and not args.build_only
+        and max(args.batch) > 128
+        and not args.shared_activations
+    ):
+        parser.error(
+            "large prefill shapes require --check-only or --shared-activations"
+        )
     if not args.build_only:
         if args.output is None or args.output.exists():
             parser.error("a run requires a new output path")
@@ -182,30 +237,42 @@ def main():
                     print(f"batch {batch}: checked site {site + 1}/90", flush=True)
             if args.check_only:
                 continue
-            rows = []
-            for bank in range(2):
-                for site, weights in enumerate(sites):
-                    data = inputs(batch, 5001 + site + bank * 90)[:7]
-                    data[4:7] = [weights[0].clone(), *weights[1:]]
-                    candidate = [*data[:4], narrow[site].clone(), *data[5:]]
-                    rows.append((data, candidate, site != 0))
+            torch.cuda.reset_peak_memory_stats()
+            rows = timing_rows(
+                sites, narrow, batch, args.shared_activations, args.weight_banks
+            )
             size = sum(row[1][4].numel() * row[1][4].element_size() for row in rows)
             if size <= 128 * 2**20:
                 raise ValueError("narrow weight rotation does not exceed SM120 L2")
             graphs = []
+
+            def timed_call(row, variant):
+                if variant == 0 and args.timing_baseline == "installed-bf16":
+                    return installed(row[1], row[2])
+                return extension.run(*row[variant], row[2])
+
             for variant in (0, 1):
                 for row in rows:
-                    extension.run(*row[variant], row[2])
+                    timed_call(row, variant)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     for row in rows:
-                        extension.run(*row[variant], row[2])
+                        timed_call(row, variant)
                 graphs.append(graph)
             timing = {
                 "batch": batch,
                 "sites_per_graph": len(rows),
                 "narrow_fn_bytes": size,
+                "activation_sets": args.weight_banks
+                if args.shared_activations
+                else len(rows),
+                "weight_banks": args.weight_banks,
+                "narrow_fn_l2_ratio": size / (128 * 2**20),
+                "shared_activations": args.shared_activations,
+                "baseline": args.timing_baseline,
+                "candidate": "probe-bf16",
+                "capture_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "rounds": [],
             }
             result["timings"].append(timing)

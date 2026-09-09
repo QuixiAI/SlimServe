@@ -22657,3 +22657,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   build-sha256.txt,native-elf-list.txt,native-ptx-check.log,native-host/,
   native-host.log,native-host-container.json}. Serving output reserved for
   perf/results/2026-09-08/b12x-r281-native-serving/.
+
+### Bound actual-weight mHC prefill timing without duplicating all activations
+
+- Status: diagnostic harness prepared; no kernel or serving-profile change.
+- Extend the existing benchmark_glm53_mhc_storage.py, not a second harness.
+  Explicit --shared-activations reuses one immutable activation set per
+  timing bank while retaining distinct allocations of every site's fn.
+  This permits full7616-token isolated timing without180 independent full
+  activation sets. All90-site/three-magnitude/changed-input graph checks
+  remain before timing. The default original timing layout is unchanged.
+- Explicit --weight-banks6 increases BF16 fn working set from135 to405 MiB,
+  over three128-MiB L2 capacities. Capacity is not a DRAM-traffic measurement.
+  Shared activations are documented as an isolated memory-layout control,
+  not a faithful simulation of sequential model dependencies. Record bank
+  count, working-set/L2 ratio and actual peak allocated bytes after capture.
+- Optional --timing-baseline installed-bf16 compares the isolated BF16
+  candidate directly to the currently installed BF16 operator and enables
+  all installed-BF16 parity gates. Default remains probe-FP32 versus
+  probe-BF16. This supports a later vectorized FN-staging experiment without
+  mistaking the previous storage change for a new kernel win.
+- Seven focused CPU tests pass, including distinct FN ownership, exactly
+  two/six shared activation banks and unchanged original seeds/site order.
+  Full CPU suite202pass/1GPUskip; Ruff/format pass. No GPU timing or build
+  overlaps the active B12X serving campaign.
+- Raw: runtime-control/mhc-bank-{expanded-tests.xml,full-tests.xml}.
