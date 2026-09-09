@@ -37,14 +37,26 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-@pytest.fixture(scope="module", params=[256, 1024])
+@pytest.fixture(
+    scope="module",
+    params=[
+        pytest.param((256, True), id="256"),
+        pytest.param((1024, True), id="1024"),
+        pytest.param((1024, False), id="direct"),
+    ],
+)
 def probe(request):
     module = build()
+    threads, aggregate = request.param
     return SimpleNamespace(
         __file__=module.__file__,
-        count_threads=request.param,
-        run=partial(module.run, parallel_count=request.param == 1024),
-        run_into=partial(module.run_into, parallel_count=request.param == 1024),
+        module=module,
+        count_threads=threads,
+        aggregate=aggregate,
+        run=partial(module.run, parallel_count=threads == 1024, aggregate=aggregate),
+        run_into=partial(
+            module.run_into, parallel_count=threads == 1024, aggregate=aggregate
+        ),
     )
 
 
@@ -54,6 +66,7 @@ def identities(probe, record_property):
     hashes = {str(p): sha(p) for p in files}
     record_property("source_sha256", json.dumps(hashes, sort_keys=True))
     record_property("count_threads", probe.count_threads)
+    record_property("aggregate", int(probe.aggregate))
     yield
     assert hashes == {str(p): sha(p) for p in files}
 
@@ -218,6 +231,7 @@ def test_foreign_current_device_and_nondefault_stream(probe, device):
         "padded_dtype",
         "offset_size",
         "device",
+        "direct_without_parallel",
     ],
 )
 def test_invalid_contracts(probe, case):
@@ -249,5 +263,9 @@ def test_invalid_contracts(probe, case):
         outputs[3] = outputs[3][:-1]
     elif case == "device":
         outputs[0] = outputs[0].cpu()
+    elif case == "direct_without_parallel":
+        with pytest.raises(RuntimeError, match="requires 1024 threads"):
+            probe.module.run_into(ids, *outputs, block, False, False)
+        return
     with pytest.raises(RuntimeError):
         probe.run_into(ids, *outputs, block)

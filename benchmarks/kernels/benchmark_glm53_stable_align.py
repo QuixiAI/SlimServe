@@ -7,6 +7,8 @@ sort separately with the stable probe. Five A/B/A rounds, three warmup graph
 replays and five timed 20-call replays per arm: 4,800 samples, no exclusions.
 With --parallel-count, use 1024 counting threads instead of 256 and add the
 original 256-thread stable path as a third A/B/A control: 7,200 samples total.
+With --direct-count, use 1024 threads without warp aggregation and retain both
+original stable counters as controls: four comparisons, 9,600 samples total.
 Routing scores/IDs, weights and GEMM arithmetic are outside this experiment.
 All buffers are hot; this does not establish model cache effects or serving TPS.
 """
@@ -93,7 +95,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--parallel-count", action="store_true")
+    parser.add_argument("--direct-count", action="store_true")
     args = parser.parse_args()
+    if args.direct_count:
+        args.parallel_count = True
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
@@ -132,6 +137,7 @@ def main():
     result = dict(
         status="running",
         count_threads=1024 if args.parallel_count else 256,
+        aggregate=not args.direct_count,
         diagnostic_only=True,
         protocol=__doc__,
         source_sha256=hashes,
@@ -172,7 +178,7 @@ def main():
             return out
 
         def stable(ids=ids, block=block):
-            return probe.run(ids, block, args.parallel_count)
+            return probe.run(ids, block, args.parallel_count, not args.direct_count)
 
         graphs = {
             name: graph_for(call)
@@ -185,6 +191,10 @@ def main():
         if args.parallel_count:
             graphs["original-stable"] = graph_for(
                 lambda ids=ids, block=block: probe.run(ids, block, False)
+            )
+        if args.direct_count:
+            graphs["parallel-stable"] = graph_for(
+                lambda ids=ids, block=block: probe.run(ids, block, True, True)
             )
 
         def check(
@@ -226,6 +236,8 @@ def main():
         baselines = ["atomic", "atomic-plus-sort"]
         if args.parallel_count:
             baselines.append("original-stable")
+        if args.direct_count:
+            baselines.append("parallel-stable")
         for baseline in baselines:
             rounds = []
             for repeat in range(5):

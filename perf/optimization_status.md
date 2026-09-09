@@ -25457,3 +25457,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   in the 1024-thread counter, preserving histogram layout, padding/prefix,
   bitmap scatter and all existing controls. This is a hypothesis, not an
   established microarchitectural cause. Qualify before any latency claim.
+
+### Direct per-lane counting isolated, functional gate complete
+
+- New counter uses the same 1024-thread per-warp histogram, prefix, padding
+  and scatter; only warp matching/leader election becomes direct atomic +1.
+  Both aggregated controls remain explicit, direct mode requires 1024 threads.
+  Separate stable-align-direct-probe-build; previous two build dirs preserved.
+  Probe SHA01047ecefad3a60dd8536b20dafea07ca90074af2b16f7e45955330996b7ae57.
+  Direct counter 48 registers / 42,144 shared bytes / zero stack/local bytes.
+- Full encoded instruction comparison proves all three control bodies are
+  unchanged: scatter 400 instructions, aggregated256 counter 584,
+  aggregated1024 counter 752. Direct counter adds 720 instructions and contains
+  no MATCH.ANY. Raw runtime-control/stable-align-direct-sass-comparison.json
+  SHA9c0b94e0b8b520b0520c2cd241788c4aa5a128ac1b088c8e8f8d979f8e5b208d;
+  original full SASS/binaries and source-hashed comparison script retained.
+- 387 functional cases pass in 18.56s: 129 per variant, including the new
+  invalid direct-without-parallel contract, all twelve actual M640 routes,
+  CPU full-capacity oracles, redzones, changed-input graphs and device/stream
+  checks. Test SHAa6b5b501c703745485d5870f549b6e21ace72c886ed35bdb691e6dde201ea1f9.
+  Raw runtime-control/stable-align-direct-{build,tests,resources}; no discarded
+  failures. Fourteen unrelated Torch deprecation warnings persist.
+- Fixed next gate: full 387-case memcheck/synccheck plus six bounded race
+  processes (each variant at M17 and M8192, first two matching launches each).
+  Then --direct-count, same 32 cases, four A/B/A comparisons (atomic,
+  atomic+sort, original-stable, parallel-stable), 9,600 samples total in
+  stable-align-direct-timing/. No replacements; source/native freeze. No
+  serving integration or new latency claim before this qualification.

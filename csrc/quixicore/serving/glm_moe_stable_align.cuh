@@ -13,7 +13,7 @@ constexpr int MAX_WORDS = 8192 * 8 / 32;
 
 // Integer histograms determine the same padded expert ranges as Marlin's
 // alignment. A second CTA initializes all sorted capacity, including tails.
-template<int COUNT_THREADS>
+template<int COUNT_THREADS, bool AGGREGATE = true>
 __global__ void count_prefix(const int* ids, int* sorted, int* experts,
                              int* padded, int* offsets, int numel, int block,
                              int capacity, int max_blocks) {
@@ -36,9 +36,15 @@ __global__ void count_prefix(const int* ids, int* sorted, int* experts,
     for (int base = 0; base < numel; base += COUNT_THREADS) {
         const int i = base + tid;
         const int expert = i < numel ? ids[i] : -1;
-        const unsigned peers = __match_any_sync(0xffffffffu, expert);
-        if (expert >= 0 && expert < EXPERTS && lane == __ffs(peers) - 1) {
-            atomicAdd(histogram + warp * EXPERTS + expert, __popc(peers));
+        if constexpr (AGGREGATE) {
+            const unsigned peers = __match_any_sync(0xffffffffu, expert);
+            if (expert >= 0 && expert < EXPERTS && lane == __ffs(peers) - 1) {
+                atomicAdd(histogram + warp * EXPERTS + expert, __popc(peers));
+            }
+        } else {
+            if (expert >= 0 && expert < EXPERTS) {
+                atomicAdd(histogram + warp * EXPERTS + expert, 1);
+            }
         }
     }
     __syncthreads();
