@@ -23441,3 +23441,16 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   sass-identity.json,local-symbols.txt,gpu-tests.{xml,log},cpu-tests.{xml,log},
   fixed-repro.log}. Build path above is this machine's actual configured tree;
   the generic build/temp.linux-x86_64-cpython-312 path does not exist here.
+- Serving follow-through: the ONE prescribed start completes on sourcea561242c6,
+  QC20588761728d7161; startup148.085s, all nine rounds/75 exact cold1000/300
+  requests, text/image,4096 scored tokens, six needles and six measured cold
+  prefill requests pass. E2E medians157.127/578.478/780.015, ranges156.948-
+  157.450/576.960-579.720/779.460-782.294. Engine32K/128K2576.236/10856.221ms,
+  ranges2575.821-2577.922/10826.858-10893.345. Quality mean-2.731603; all needle
+  margins positive. No competing work, profiler, rebuild or benchmark-source
+  changes; native/benchmark receipt hashes verified. Teardown exit0 and owned
+  GPU release completes on first check. This qualifies the host-side repair,
+  not a new performance improvement or multi-start baseline. Raw
+  mhc-device-serving-check/summary.json SHA
+  b2f02462519fac92718f9d8ad146622ce357d98736ea597cd1cdf8525b7c2c89;
+  runtime-control/mhc-device-serving-check.log. GPUs are free afterward.

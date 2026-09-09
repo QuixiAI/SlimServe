@@ -89,6 +89,25 @@ profile dry-run selects the same recipe and flag1. Raw mhc-paired-* directories,
 runtime-control/mhc-paired-combined-analysis.json. New teardown observed real
 driver-release delays0.990/0.735/0.461s and completed safely, exit0, GPUs free.
 All69 existing mHC kernels preserve resource usage; two paired variants add no spills.
+Current native after the additional mHC device-switch repair is QC
+20588761728d7161ae774e84e176fdfe4550163e3bfab1a2797ebee86bff35fb.
+Its complete GPU instruction dump is identical to QC5d4 below; only checked,
+device-aware host launch setup changed.151 GPU tests and270 CPU tests pass
+(one GPU skip). One prescribed unprofiled serving start then passes all nine
+timing rounds/75 exact cold1000/300 requests, text/image,4096 scored tokens,
+six needles and six cold32K/128K measurements. E2E157.127/578.478/780.015;
+engine TTFT2.57624/10.85622s. This is a correctness/sanity check, not a new
+multi-start performance baseline. Raw mhc-device-serving-check/.
+
+The isolated tensor-core mHC prototype remains unqualified and outside serving.
+Its original strict parity census failed case2638/2700 at a BF16 rounding
+boundary;2637 cases completed,62 remain untested. Small-batch isolated latency
+is29-34% lower, not a serving gain. Independent FP64 evaluation of the single
+offending row favors the candidate, but does not prove global accuracy. The
+operator approved a separate independent accuracy/model-quality evaluation;
+retain the original failed census and strict gate. See the current notebook
+entries before proceeding; do not promote this prototype from microbenchmarks.
+
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
 was shared across separately loaded CUDA modules, while kernel attributes
 were not. The same flag also ignored device switches. Both call orders and
@@ -96,7 +115,7 @@ device0/1/0 reproduce invalid launches in the old path. The native wrapper
 did not check launch errors and could return uninitialized output.
 BF16/FP8 helpers now use module-local, thread-local, device-aware setup state,
 check setup errors, and native wrappers check launch errors. Kernel math and
-launch geometries are unchanged. Current installed QC is
+launch geometries are unchanged. The binary qualified at that checkpoint was
 5d4d3790e9aeb6cbc92702a6d0754b625cecbb48a6ff93bde8a22b419ccb5760;
 the 136 binary is preserved as runtime-control/fp8-setup-native-before.so.
 Both call orders with both old/new probe modules pass the actual-weight
