@@ -23454,3 +23454,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   mhc-device-serving-check/summary.json SHA
   b2f02462519fac92718f9d8ad146622ce357d98736ea597cd1cdf8525b7c2c89;
   runtime-control/mhc-device-serving-check.log. GPUs are free afterward.
+
+## 2026-09-09: Predeclare independent tensor-core mHC accuracy qualification
+
+- Status: new qualification, not a revision of the FAILED original parity
+  census. Operator approved evaluating independent accuracy/model quality.
+  Frozen candidate probe45d5e817 and installedQC20588761 remain unchanged;
+  no tensor-core serving path or timing claim is introduced here.
+- Hypothesis: altered FP32 accumulation can produce a more accurate BF16
+  result at a rounding boundary while failing reference parity. Check both
+  implementations against independent CPU FP64 equations, all eager rows.
+  Fused residual bits and the existing sampled partial gate remain mandatory.
+- Contract: perf/glm53-mhc-tc-accuracy-contract.md fixes numerical budgets,
+  case/seed coverage, later sanitizer and1/3/1 serving/quality gates before
+  new GPU results. FP32 tolerance unchanged. BF16 acceptance is optimal direct
+  rounding error plus the existing FP32 coefficient tolerance propagated
+  through four streams; candidate RMS additionally must be noninferior.
+  This is an engineering accuracy budget, not a universal error proof.
+- CPU validation:31 tests pass, including all195834 signed finite-adjacent
+  BF16 midpoint/FP64-neighbor cases, signed zero, subnormal/overflow handling,
+  independent closed-form mHC equations, every output/last-row corruption,
+  fixed original seed2240 and held-out graph seeds. Original2.0/2.015625
+  parity still fails. First console-script pytest invocation failed import
+  collection; corrected python -m pytest invocation passes. No GPU run yet.
+- Plan: bounded site79/T7616/all magnitudes/both modes, then2700 full eager
+  cases and8100 changed-input graph phases. All eager coordinates receive
+  FP64 checks; graph FP64 uses recorded boundary rows while graph/eager bits
+  cover every output. Record old strict parity as diagnostics. Stop on new
+  accuracy failure without retries, exclusions or post-result budget changes.
+- Files: benchmarks/kernels/{mhc_fp64_oracle.py,
+  check_glm53_mhc_tc_accuracy.py}, tests/slimserve/test_mhc_fp64_oracle.py.
+  Raw CPU: perf/results/2026-09-08/runtime-control/
+  mhc-fp64-oracle-cpu-{tests,module-tests,final-tests}.xml. New GPU outputs
+  will use perf/results/2026-09-09/mhc-tc-accuracy-{first-check,census}/.
