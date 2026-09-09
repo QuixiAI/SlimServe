@@ -274,9 +274,9 @@ chain (KDA's four projections).
 - Foundry and its model servers are stopped while this work runs; the four
   GPUs are otherwise idle. Attribute GPU processes by PID lineage, never by
   memory footprint.
-- Commit authorship: one human author per commit (Eric Hartford or the
-  authorized maintainer), no co-author or assistance trailers. `CLAUDE.md`
-  updated on this branch.
+- Commit authorship: Auroter <auroter@users.noreply.github.com> for both author
+  and committer, no co-author or assistance trailers. Eric Hartford is the
+  operator's boss, not the identity for this campaign's commits.
 
 ## 3d. Port studies (2026-09-04, read-only, pre-baseline)
 

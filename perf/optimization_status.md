@@ -25780,3 +25780,48 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   retained for cold-cache checks. Require exact scores within all three passes
   and all nine pairings versus the instrumented control. Keep every outcome;
   no TPS, default-promotion or variability-resolution claim before that evidence.
+
+## 2026-09-09 - Native ordering repeats under normal execution; cross-mode gate fails
+
+- Frozen95fe67870, one prescribed start, QC39b302f0/corefe4/MoE1093 unchanged.
+  Server reaches health in184.088s and exits0. Text4/imageRed,25 warmup/75 timed
+  exact1000/300 requests,168 uncached quality requests,12,288 text scores and
+  18 positive needle contrasts all pass. All19 candidate source receipts match
+  Git/live files; all native/package/affinity receipts match the old control.
+- Every4096 text score and every168 needle-token score repeats EXACTLY across
+  all three normal-execution passes. Mean -2.727814820100083 each. This is the
+  first no-journal/no-launch-blocking repeatability result, not cross-start proof.
+- The predeclared cross-mode equality gate FAILS across all nine pairings with
+  3e1dac08f. All4096 text scores differ: mean delta+0.0004596163, mean absolute
+  delta0.25848546, RMS0.44090411, max4.88241875 nat/token.167/168 needle-token
+  scores differ, max2.80942154. No gate widening, replacement or exclusion.
+  Candidate stays defaultOFF; neither TC0 nor any new arithmetic is exonerated
+  by the small aggregate mean difference. TC remainsOFF.
+- Normal-execution E2E medians [min,max]: c1 156.956[156.850,157.238],
+  c8 579.394[579.157,580.160], c16 780.922[778.450,781.299] tok/s. This is a
+  one-start qualification observation, NOT a new competitive baseline/speedup.
+  All c16 largest shared client gaps0.552-0.555s are early-prefill with one
+  request generating and15 awaiting first token; old4.371s cause stays open.
+- Four rank-specific printed computation_graph.py files are byte-identical
+  between cefafd0752 and a731ee5176; only code/config hashes differ in cache
+  factors. This does not prove emitted kernels or autotuner choices identical.
+  The normal run reports fresh KDA autotuning with some infeasible shared-memory
+  configurations skipped; successful choices vary by rank. This is a possible
+  confound, NOT established causality. No forced-config or cache deletion.
+- Recorded scope memory126.156GB peak at one observation, below150GiB limit.
+  GPU release0.613925s, firstpoll0.319972s still rank1; two transient zombies
+  and existing shared-memory resource-tracker warning retained. Fresh GPU check
+  empty; scope success. No serving/native edits or competing GPU work.
+- Raw native-order-quality/summary.json
+  SHA05fe6f0c9357062b8f9b322e36d0c89558b891d84f325b877789b01d9e6ca338;
+  runtime-control/native-order-analysis.json
+  SHA5364932753ae38324d1d2340ea28821149e041ca8b7f030d7f4f5d9638e7f06a.
+  Source-hashed audit_native_order.py exits1 specifically for the failed exact
+  cross-mode gate, after preserving all15 quality pairs and all request audits.
+  Separate native-order-cache-comparison.{json,log} records all four graph pairs.
+- Next fixed diagnostic: exactly ONE native-order serialized start, then ONE
+  normal asynchronous return, each with the same three-pass workload, no
+  journals. See the follow-up in perf/glm53-native-order-protocol.md. This
+  isolates launch-blocking from observer removal and checks cross-start repeat
+  behavior; do not proceed to performance/default promotion or TC reevaluation
+  while the source of the deterministic cross-mode difference remains unknown.

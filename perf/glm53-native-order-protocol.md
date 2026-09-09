@@ -80,3 +80,35 @@ control is `perf/results/2026-09-09/stable-align-quality-diagnostic/`, summary
 SHA256 `7a262eee2748daec06d90f55238a362bd0bf4af3ebe4731f5273d98ca5915222`.
 Only plan difference allowed: the control's explicit verbose JIT option is
 absent. The environment differs by the stated observer/ordering controls.
+
+## Follow-up frozen after the failed cross-mode gate
+
+The first normal-execution start on95fe67870 repeats every quality score exactly
+within its three passes, but differs from the instrumented control. Preserve
+that failed cross-mode gate. Isolate launch serialization with exactly TWO
+further starts, prescribed together before either begins:
+
+| Order | Output directory under perf/results/2026-09-09 | Launch blocking |
+| --- | --- | --- |
+| 1 | native-order-serialized | CUDA_LAUNCH_BLOCKING=1 |
+| 2 | native-order-async-return | absent |
+
+Each uses the same command above (one start, three timing repeats and three
+quality passes), the same native-order-only policy, no journals, default JIT
+logging, same caches/recipe/TC0/BF16fn1 and resource limits. Only add the stated
+launch-blocking assignment for the first arm; give each arm its own scope and
+launch log named for its output directory. Do not clear caches, force an
+autotuner configuration, change source or substitute a new start. Stop and
+retain any workload failure. Audit each completed arm before the next; no
+commits or serving/client/native edits between these two starts.
+
+Compare every text and needle-token score within each arm, across both arms,
+and to both existing three-pass references (normal95fe67870 and instrumented
+3e1dac08f). Require exact repeated scores within each new arm; retain every
+cross-arm difference as the diagnostic result, not a passing promotion gate.
+A return differing from the original normal run would establish cross-start
+variation under otherwise matched declared settings. A match does not alone
+rule out all startup variability. Printed four-rank computation graphs already
+match between the two old runs; emitted kernels/autotuner state are not thereby
+proven equal. Do not attribute the score change to scheduling or autotuning
+without the discriminating evidence.

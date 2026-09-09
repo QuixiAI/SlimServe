@@ -35,7 +35,25 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 19:45 UTC)
+### Latest checkpoint (2026-09-09, native-order normal run complete)
+
+Normal native-order run on95fe67870 repeats EVERY text/needle-token score
+across three passes with no journals/launch blocking. BUT all nine pairings
+against instrumented3e1dac08f fail equality:4096 text scores differ, mean
+absolute0.258485/max4.882419nat. Preserve this failed gate; default staysOFF.
+All exact1000/300/cold requests and canaries pass; one-start medians
+156.956/579.394/780.922 are qualification, not new competitive TPS. Native
+hashes unchanged;19 source receipts verify. All four printed computation graphs
+match; emitted-kernel/autotuner equivalence is not established. Scope exits0,
+GPU release0.614s, GPUs free. Raw native-order-quality/ and
+runtime-control/native-order-analysis.json; full details in the notebook.
+Next fixed TWO-start isolation: one native-order + launch-blocking1, then one
+native-order normal return; both no journals and three full quality passes.
+See perf/glm53-native-order-protocol.md. No replacement starts or source changes
+between those arms. Cross-mode mismatch cause, startup variability and TC remain
+open. Finish these prescribed arms/audits before optimizing another kernel.
+
+### Native policy implementation checkpoint
 
 DefaultOFF SLIMSERVE_GLM53_NATIVE_ORDER now selects the qualified kernels
 without enabling journals. Strict recipe/platform scope, no sorting fallback,
