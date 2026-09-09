@@ -22413,7 +22413,7 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 ## 2026-09-08: Reproduce the B12X shell compatibility-driver IPC failure
 
 - Status: origin isolated with fixed model-free A/B/A; actual serving recheck
-  in progress. No competitive TPS from the failing image startup.
+  passes communications then exposes the separate FA2 failure below. No TPS.
 - Pinned R28.1 stock-launcher series: all three starts fail before weights
   load, in PyNcclCommunicator.ncclCommInitRank. All exit1/OOMKilled=false;
   logs, immutable container IDs/configuration and exit states are retained.
@@ -22463,3 +22463,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   runtime-control/{b12x-debug-tests,b12x-host-tests,shell-compat-tests}.xml.
 - This proves the R28.1 failure mechanism on this host; it does not claim
   every old R24 failure had this same cause without reproducing that path.
+
+## 2026-09-08: B12X host-driver recheck isolates vision FA2 PTX compatibility
+
+- Status: exact-source native SM120 build in progress; no serving baseline.
+- All three prescribed host-driver starts initialize B12X PCIe all-reduce
+  (TP dispatch B12X_PCIE/PYNCCL), load the full model, then fail vision warmup
+  in _vllm_fa2_C.varlen_fwd with unsupported PTX toolchain. All exit1,
+  OOMKilled=false; all logs and exit receipts retained. This is downstream
+  of the repaired IPC initialization, not evidence to disable collectives.
+- First start: weights20.37 s, model45.34 GiB/rank, total loading25.378 s;
+  then vision warmup at03:25:45 UTC. No health, quality score or TPS.
+  The first failing call is vit_attn_wrappers.flash_attn_maxseqlen_wrapper
+  through the image's FA2 varlen op, BF16 noncausal vision attention.
+- Binary inspection: image FA2 contains76 SM80 cubins, no native SM120;
+  its CUDA13.3 PTX cannot be compiled by host580.173.02. The installed local
+  FA2 also has SM80 cubins but uses CUDA13.0 PTX and a DIFFERENT source pin;
+  blindly swapping that library would not be an exact-source control.
+- Controlled build: image's pinned vllm-project/flash-attention revision
+  f3e1a4f74c99145c0717709860bf765de1703779, required CUTLASS submodule
+  62750a2b75c802660e4894434dc55e839f322277. The sole patch replaces the
+  FA2_ARCHS8.0+PTX intersection with12.0. All kernel source, compiler flags,
+  CUDA13.3.73, image Torch2.13 and stable-ABI registration remain. Patch is
+  benchmarks/patches/b12x-fa2-native-sm120.patch; source/build are in
+  /home/tiny/.local/scratch/slimserve-glm53/fa2-r281-{src,build}.
+- Build uses the same digest-pinned R28.1 image, no GPU or network,
+  UID1000, Docker80 GiB/no-swap and matching systemd limit. CMake Release,
+  Python=/opt/venv/bin/python, CUDA_ARCHS=12.0, NVCC_THREADS=2; target
+  _vllm_fa2_C, -j2. No competing serving campaign. Original image unchanged.
+- Qualification prepared, not yet run: probe_b12x_fa2.py uses packed BF16
+  QKV,16heads/head64, lengths1,17+33,1024,1024+512,4096, magnitudes
+  .01/1/3 and two fixed changed inputs per captured graph. Independent
+  chunked CPU FP64 attention oracle, NRMS<=.006 and error/peak<=.015625;
+  graph/eager bit equality, plus original-image output comparison under
+  its single-GPU compat driver. These are local gates, not vision quality
+  or serving performance. Three CPU oracle/digest/gate tests pass.
+- Next: inspect native cubins, record build/binary hashes and exit state,
+  run both binary probes, then an explicitly host/FA2-adapted three-start
+  serving control if the gates pass. Do not change text kernels, checkpoint,
+  activation/KV precision, custom collectives or the selected SlimServe recipe.
+- Raw: perf/results/2026-09-08/b12x-r281-host-serving/ and
+  runtime-control/fa2-sm120-build/{build.log,probe-tests.xml}.

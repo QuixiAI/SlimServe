@@ -83,8 +83,14 @@ all four ranks' every-peer writes/NCCL tests; restoring the hook fails again.
 CUDA runtime13.3 and NCCL2.31.2 are unchanged. No host-driver changes or
 transport disabling. The original fixed three serving starts all failed and
 remain recorded in b12x-r281-serving/. A new fixed three-start campaign uses
---host-cuda-driver at b12x-r281-host-serving/; its first start has passed
-communication initialization and begun model loading, but no TPS yet.
+--host-cuda-driver at b12x-r281-host-serving/ completed: all three starts
+initialize B12X PCIe all-reduce and load weights, then fail vision FA2 warmup
+with unsupported PTX toolchain (exit1, no OOM). Its FA2 binary contains only
+SM80 cubins and CUDA13.3 PTX; host580 cannot JIT that PTX for SM120. A native
+SM120 build of the image's exact FA2 source f3e1a4f74c99145c0717709860bf765de1703779
+is in progress, with only the architecture target changed. Independent FP64
+oracle and original-binary comparison probe: benchmarks/kernels/probe_b12x_fa2.py.
+No qualification or TPS claim yet; no host-driver change or vision disabling.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
 SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,
