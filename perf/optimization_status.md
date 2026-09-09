@@ -24014,3 +24014,56 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   the first differing operation for an offline reproducer. TC stays OFF.
 - Raw tests: runtime-control/mhc-moe-journal-{cpu,gpu}-tests.xml. Native library
   unchanged; test snapshots are synthetic-input fixtures, not serving captures.
+
+## 2026-09-09 - First-MoE ordering causes the first numeric variation
+
+- Status: diagnosis complete at the first changing GEMM; full-model cause still
+  requires intervention. No arithmetic change, performance baseline, or TC promotion.
+- Baseline/protocol: the ONE prescribed7f011a235 start completes on the same
+  glm53-nvfp4-4/rtx6000/TP4/no-spec recipe v1, BF16-storage1/TC0/nativeQC4ce801,
+  CUDA13/launch-blocking1/OMP1/P2P,150GiB/no-swap. Fresh compilation17.33s is
+  retained. All nine priming rounds/75 cold exact1000/300 requests complete;
+  serialized priming medians108.877/462.471/649.433TPS are NOT baseline eligible.
+- Correctness/evidence: three full quality passes,168 requests all cached0,
+  12,288 scored text tokens,18 positive retrieval contrasts. All4x3x639 selected
+  GPU scores exactly match raw HTTP. All12 model matches complete91 operations
+  and1024 tensor records. All300 snapshot files verify byte hashes and tensor
+  hashes;1,383,840,515 bytes per worker, below2GiB. Static weights/scales unchanged,
+  all lock workspaces zero before/after, every assignment present once with the
+  right expert and valid padding, all expected buffer links intact.
+- First numeric difference is moe3.up.output in EVERY pair/rank: identical
+  normalized activations/router logits/top8 IDs/weights/packed weights/scales/
+  global scales/launch parameters; only the within-expert sorted assignment
+  permutation changes beforehand. Gate/up differs5-16 of5,242,880 values per
+  pair/rank; largest absolute difference0.00390625. Shared-expert output is
+  identical. Full-workload mean logprobs -2.734150252/-2.734515863/-2.731961586;
+  pair RMS0.429597/0.435369/0.434718, max3.616229/8.508819/6.178815 and27/26/21
+  windows above0.01. The original quality problem remains, including outliers.
+- Causal replay: use captured rank-local gate/up tensors with the installed
+  native operator, fixing EVERY input except the three captured sorted-ID
+  permutations. Restore production allocation capacities with unused sentinel
+  tails. All4 ranks x3 layouts x8 eager repeats reproduce their corresponding
+  serving output bits exactly, as do36 graph replays with changed layout inputs
+  (1/2/3/3/2/1/1/2/3). Alternate output poison123/NaN; all outputs finite and
+  lock workspaces zero. This isolates ordering dependence without model loading,
+  routing recomputation, activation changes, or a new native build.
+- Source evidence: generic count_and_sort_expert_tokens uses atomicAdd to assign
+  within-expert positions; Marlin uses DP plus stream-K with tile-dependent
+  partial sums. The latter is a plausible rounding mechanism, not a proven
+  instruction-level explanation. Do not label this an atomic BF16 reduction
+  race: the captured GEMM calls are non-atomic with FP32 reduction.
+- Reproducer: benchmarks/kernels/replay_glm53_moe_up.py, module invocation with
+  --capture perf/results/2026-09-09/mhc-quality-moe-trace-diagnostic and a NEW
+  --output directory. Repository copy passes the same complete96+36 replay
+  protocol and lint. No timing claim. Failed tooling runs remain: the first
+  analyzer compared an absolute saved path to a relative run path (resolve fix);
+  the first replay reused Torch's process-global default capture stream on
+  device1 (explicit per-device stream fix). Neither required runtime/kernel edits.
+- Decision/next: preserve this first-divergence proof; test canonical assignment
+  order as a bounded opt-in diagnostic through the full three-pass quality
+  workload. Only then decide whether stable alignment alone solves the score
+  variation and how to implement it without a serving regression. TC stays OFF.
+- Raw: mhc-quality-moe-trace-diagnostic/, runtime-control/mhc-quality-moe-trace-analysis.json
+  and both analysis logs; mhc-moe-up-replay/ (partial tooling failure),
+  mhc-moe-up-replay-stream-fix/ and mhc-moe-up-replay-repo/ (complete, all exact).
+  Serving teardown exits0, all GPUs released after0.862s; no other GPU workloads.

@@ -155,10 +155,22 @@ routed/shared experts and final reduction; the exact operation is not yet known.
 All state links between mHC sites remain unchanged and immediate model return
 equals the later prompt-head input. All GPU scores equal HTTP. Full-workload
 RMS variation0.410-0.440 persists, so the trace did not suppress it. Raw
-mhc-quality-model-trace-diagnostic/ and its runtime-control analysis. Next:
-targeted first-MoE routing/Marlin/shared-sum fingerprints and bounded tensors
-for a small reproducer. Keep compilation/recipe/arithmetic unchanged. This is
-diagnosis, not a quality pass or throughput baseline. TC stays OFF.
+mhc-quality-model-trace-diagnostic/ and its runtime-control analysis.
+The first-MoE capture on7f011a235 and standalone replay now isolate the first
+numeric difference to gate/up Marlin's dependence on within-expert assignment
+ordering. All3 passes/all4 ranks have identical input, router choices/weights,
+packed weights/scales and zero lock workspaces. All semantic routes are valid;
+only sorted assignment ordering changes before the first numeric difference.
+Gate/up changes5-16/5,242,880 values per pair/rank. Replaying each saved order
+with otherwise fixed inputs reproduces its serving output bit-for-bit in all
+96 eager repeats and36 changed-layout graph replays. This proves ordering
+causes the first GEMM differences, NOT yet the entire downstream score spread.
+Raw: mhc-quality-moe-trace-diagnostic/, runtime-control/mhc-quality-moe-trace-analysis.json,
+and mhc-moe-up-replay-repo/ (standalone tool benchmarks/kernels/replay_glm53_moe_up.py).
+Next: bounded deterministic-alignment intervention, then the unchanged complete
+three-pass model-quality workload. Keep the current recipe/native arithmetic;
+do not relax quality gates or promote TC. This is diagnosis, not a throughput
+baseline. TC stays OFF.
 E2E control/candidate/return157.051/156.928/156.712 c1,
 578.818/578.200/577.166 c8,781.849/779.553/777.069 c16. Candidate medians lie
 between controls, but retain the slower c16 samples. Cold32K2582.669/
@@ -435,7 +447,9 @@ Current candidate priorities (hypotheses, not physical ceilings):
    fails the per-window model-quality gate. Keep TC OFF and isolate the existing
    control/control score variability before considering promotion or more
    arithmetic changes. Same-process repeated TC0 scoring reproduces it; the
-   next bounded test serializes kernel launches without changing arithmetic.
+   first numeric difference is now reproduced by varying only the first MoE's
+   within-expert assignment order. Next test deterministic alignment through
+   the model; serialization alone did not remove the variation.
    The unchanged probe is45d5e817, current nativeQC4ce80155. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
    Five-round cold timing gives29-34% lower small-batch latency but only2.61%
