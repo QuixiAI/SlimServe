@@ -22883,3 +22883,39 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   b12x-cold-client-stream-windows.json (all27 measured rounds). The analysis
   now also handles one coalesced chunk without fabricating a decode rate;
   seven CPU tests pass at runtime-control/client-stream-edge-tests.xml.
+
+## 2026-09-08: Prepare an actual-weight FP8 launch sweep beyond L2
+
+- Status: isolated probe prepared; native build and GPU results owed. The
+  running cold-recipe baseline retains exclusive GPU ownership, with no
+  serving source, profile, native library or benchmark-client changes.
+- Baseline: the completed FP8 cache control found that the old ROT24 shared
+  gate/up and down matrices fit in L2. Its launch sweep also fixed WARPS=8.
+  The current serving configurations are not proven optimal for cold weights.
+- Hypothesis: four versus eight warps, narrower versus wider output tiles,
+  and four versus eight staging buffers trade occupancy against instruction
+  count and latency hiding. Test the existing arithmetic implementation;
+  no weight/activation quantization, persistent repack or new serving branch.
+- New isolated fp8_launch_probe.cu instantiates the 12 combinations of
+  NT={8,16,32}, WARPS={4,8}, STAGES={4,8}, KCHUNK=128. Its auto mode must
+  match the installed operator exactly by torch.equal. Only the two actual
+  TP4 shared-expert shapes and batches 1..16 are accepted. Device, dtype,
+  block-scale shape and pointer-alignment checks precede launch. Record each
+  compiled kernel's register, local-memory and shared-memory requirements.
+- Prescribed sweep: actual layers 3/23/44, batches 1/8/16, all 12 configs;
+  five fixed A/B/A rounds, 16 graph replays per phase. A/A2 are installed
+  serving; B is the isolated candidate. BOTH arms rotate 97 gate/up or
+  193 down allocations (388/386 MiB, greater than three L2 capacities),
+  with the same inputs and checkpoint bytes. All samples and errors survive.
+- Correctness gate fixed before measurement: independent FP64 GEMM over
+  the defined FP32-scaled, BF16-rounded weights, NRMS <=0.004 and per-row
+  peak-normalized error <=2^-7, matching the completed cache control.
+  Initial and changed-sign graph outputs must equal their eager variant.
+  Shape broadcasting and nonfinite outputs cannot satisfy the oracle gate.
+- Decision rule: isolated timing is only a screening result. No serving
+  promotion without actual routed-expert contention, sanitizer and real-profile
+  validation. Earlier eight-stage contention evidence remains authoritative;
+  an isolated four-stage win cannot overturn it by itself.
+- CPU tests: 8 pass; Ruff/format and diff checks pass. Use a new scratch
+  fp8-launch-build directory; no native build during a serving series.
+  Raw: perf/results/2026-09-08/runtime-control/fp8-launch-final-cpu-tests.xml.
