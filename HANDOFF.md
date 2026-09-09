@@ -35,7 +35,32 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09, native-order normal run complete)
+### Latest checkpoint (2026-09-09 20:27 UTC)
+
+Both prescribed native-only isolation arms are COMPLETE on6422d43d6. Together
+with the initial normal run on95fe67870, every text/needle-token score is exact
+across all NINE passes /36 pairings. Launch serialization alone does not change
+these outputs; all three starts share the c8b11c6e AOT namespace. Old instrumented
+control comparisons remain FAILED; do not relabel that gate or promote yet.
+No serving/GPU job remains. Both new arms have eight recovered allocator OOM
+warnings during quality; preserve them. Full notebook records request counts,
+teardown warnings and hashes. No native/profile/quant/TC changes.
+
+Strong next lead: compiler cache audit finds19 changed configurations of68,
+including four source-identical RMSNorm kernels with changed R0_BLOCK/warps:
+rank0 rms_norm_1 (jt), rank1 rms_norm_0 (4j):4096/16 ->1024/8;
+rank2 rms_norm_1 (mv), rank3 rms_norm_0 (jo):1024/8 ->4096/16.
+Source-to-config binding uses actual AutotuneCache key methods; each source
+filename occurs in that rank's serialized model. This changes summation order,
+but full-model causality is not proved. All four printed model graphs match.
+Raw runtime-control/native-order-autotune-cache-comparison.json includes the
+exact paths, four source texts, saved configs and all model/source hashes.
+Next isolate these normalization choices at kernel level, then a narrowly
+scoped full-model intervention if needed. Preserve BOTH caches; no global
+first-config override or baseline/TC promotion. Current serving code is95fe67870;
+6422d43d6 only records results/protocol. All commits use Auroter, no pushes.
+
+### Initial normal-execution checkpoint
 
 Normal native-order run on95fe67870 repeats EVERY text/needle-token score
 across three passes with no journals/launch blocking. BUT all nine pairings

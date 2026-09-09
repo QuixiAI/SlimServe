@@ -112,3 +112,10 @@ rule out all startup variability. Printed four-rank computation graphs already
 match between the two old runs; emitted kernels/autotuner state are not thereby
 proven equal. Do not attribute the score change to scheduling or autotuning
 without the discriminating evidence.
+
+Both follow-up starts completed on6422d43d6. All36 pairings among nine
+native-only passes are exactly equal; all27 pairings against the three older
+instrumented passes still differ. See the notebook's execution-mode return
+entry and runtime-control/native-order-{serialized,async-return}-analysis.json.
+The next investigation is the recorded compiler RMSNorm reduction-width
+difference. This protocol is complete; do not rerun these starts as replacements.

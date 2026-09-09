@@ -25825,3 +25825,70 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   isolates launch-blocking from observer removal and checks cross-start repeat
   behavior; do not proceed to performance/default promotion or TC reevaluation
   while the source of the deterministic cross-mode difference remains unknown.
+
+## 2026-09-09 - Native ordering survives execution-mode return; compiler reduction choices differ
+
+- Fixed serialized/native-only and asynchronous-return arms complete on
+  6422d43d6, with no source/native changes or commits between them. Both reach
+  health, pass text4/imageRed,25 warmup/75 timed cold exact1000/300 requests,
+  and all168 uncached quality requests/three complete passes. Startup148.092s
+  serialized,150.090s return. Both directly load the same c8b11c6e AOT namespace
+  created by the first native-order run. No replacement starts or exclusions.
+- Every4096 text score and168 needle-token score matches exactly across all
+  NINE native-only passes from the three starts: all36 pairings exact. Means
+  all -2.727814820100083,54 positive needle contrasts overall. This demonstrates
+  cross-start repeatability with this warm compilation state and shows that
+  toggling launch serialization alone did not change these outputs. It does
+  not establish fresh-compilation invariance, fix every startup variation or
+  explain the older instrumented-control difference. All27 native/legacy
+  pairings still fail; that original gate stays failed, not reclassified.
+- Serialized E2E medians108.950/464.584/652.495; normal return
+  157.039/579.357/781.911 tok/s, ranges156.985-157.196/577.497-580.222/
+  779.896-785.276. These are diagnostic qualification, not competitive baseline
+  promotion. Return agrees with the original normal run's performance range
+  except the retained faster c16 sample; no cherry-picked aggregation.
+  Largest c16 shared gaps0.676-0.678s serialized and0.553-0.556s return, all
+  early-prefill. Original4.371s pause remains unexplained.
+- Each new arm has EIGHT allocator OOM warnings for4,718,592,000-byte temporary
+  requests during quality, followed by successful requests. No unhandled serving
+  exception or manual restart. Preserve these allocation/reclaim events; do
+  not claim the allocator path is clean. Both server/scope exits0. Serialized
+  GPU release0.460191s with two transient zombies; return0.045590s/no zombies.
+  Resource-tracker warnings remain: one shared-memory object serialized;
+  four semaphores/six shared-memory objects return. Fresh GPU check empty.
+- Read-only compiler-cache audit binds sources to best_config keys using the
+  installed AutotuneCache methods, not directory proximity. Of68 matched
+  entries,19 launch configurations differ between the legacy4f4cbd43 and
+  nativec8b11c6e namespaces. FOUR have changed RMSNorm reduction widths, with
+  identical source bodies and source filenames present in the appropriate
+  rank's serialized model in both namespaces:
+
+  | Rank / generated kernel | Legacy R0_BLOCK / warps | Native R0_BLOCK / warps |
+  | --- | --- | --- |
+  | 0 / rms_norm_1 (jt) | 4096 / 16 | 1024 / 8 |
+  | 1 / rms_norm_0 (4j) | 4096 / 16 | 1024 / 8 |
+  | 2 / rms_norm_1 (mv) | 1024 / 8 | 4096 / 16 |
+  | 3 / rms_norm_0 (jo) | 1024 / 8 | 4096 / 16 |
+
+  These generated kernels accumulate squared values in R0_BLOCK-sized partials
+  before reducing, so the selected width changes FP32 summation order. This
+  is a concrete arithmetic confound despite identical printed model graphs.
+  It is NOT yet a proof that these four choices explain the full score delta.
+  No cache or framework mutation, first-config override or kernel replacement.
+- Raw runtime-control/native-order-serialized-analysis.json
+  SHA05cfa8e7fcdb078ebd7fb0e368dc3cae5e4ad3a885ff775e97455ad893b65111;
+  native-order-async-return-analysis.json
+  SHA09f8fd872986db67990d19c8dcb596d2c497cda32f2bad62afe8c5546abe5d46;
+  native-order-autotune-cache-comparison.json
+  SHA249d26192e4a2ecc509f437e3560f982aa0b8eb82e2c53954c7212077bc636fb.
+  Original summaries777665432df2ba8dc5f4ebbda5e00c93028d9070d66dc7eb52a889f33c5cfaab
+  and7c02b7b269c3e3f86dfa12c8fab03e787a6d607158ae2afeb404789fcf32de41.
+  Source-hashed audit_native_isolation.py and audit_native_autotune.py, bounded
+  CPU scopes, all exit0. All19 serving/client receipt sources and all root
+  native/package/CPU-affinity identities verify against the original normal run.
+- Next: isolate these four cached RMSNorm reduction choices with a bounded
+  kernel-level comparison, then a narrowly scoped full-model intervention if
+  needed. Preserve both original compilation caches and successful runs. The
+  target is an explicit reproducible normalization policy, not reliance on a
+  lucky cached autotune result. Do not enable global force-first-config, alter
+  the quant or resume TC promotion before causality and a fair reference exist.
