@@ -24930,3 +24930,47 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   (both tile layouts, capture layers3/23, native/order/ties/fused modes) and24
   canonical-order/saved-input checks. No source/native changes during either
   attempt. Both logs retained; Ruff/diff checks pass and GPU contexts released.
+
+## 2026-09-09 - Fused selected-pool ordering preserves full-model results
+
+- Status: prescribed full-model qualification PASS on28d2249c14d9d68eed5af64c694405493797d88e.
+  Baseline8f79's native ties plus separate post-sort; hypothesis/protocol above
+  unchanged. Corefe4a7c2a/QC4ce80155/MoE1093b8a4 frozen, production flags OFF.
+- ONE start/all three timing rounds and three COMPLETE quality passes finish:
+  75 priming/timing requests,168 zero-cache quality requests,12,288 scored text
+  tokens and18 positive needle contrasts. Every one of4096 text scores and
+  every candidate-token score at1K/8K/32K is identical across all three passes.
+  Each text mean is-2.7282744364256297; needle margins35.29122195731543,
+  35.512668494373656,34.262808178651994,35.22929903132763,
+  37.584231621624895,37.835817329047586. All4x3x639 traced GPU scores equal HTTP.
+- All1024 short model tensors and94 long tensors per rank repeat exactly.
+  All348 archives/file and logical hashes verify; index221,004,780 bytes per
+  worker, both7616+583 chunks/all11 layers. Every observed MoE alignment is
+  canonical; layer23 selection matches the independent CPU tie/order oracle.
+- Cross-run analysis checks ALLnine old/new pass pairs: all4096 text scores,
+  all needle token scores, all94 long tensors and1024 short tensors per rank
+  are exact against8f79. Git-tree verification covers25 recorded sources per
+  run, identical recipe/plan/settings except the fused-order flag. The two
+  generic-decode code-generation changes require the matched32-case binary/
+  source-bound qualification receipts;4185 other copies remain identical and
+  the old selector's valid-input instructions are unchanged. Do not inflate
+  this to blanket binary identity or broad/cross-rank quality equivalence.
+- Serialized/instrumented E2E c1/c8/c16 medians107.845082/457.533207/645.385118
+  tok/s are NOT a serving performance baseline or gain. This run qualifies
+  full-model correctness of the previously measured12.9% warm full-chunk
+  selector-latency win, not end-to-end speed. TC stays OFF; no default changes.
+- Campaign and both independent read-only CPU analyses exit0. GPU release
+  takes0.442477s; initial poll still seesworker2, and three transient zombies
+  remain in the teardown record. No replacement start, retries, exclusions,
+  concurrent GPU workloads/native builds or source changes during execution.
+- Decision: retain qualified opt-in fusion. Next remove diagnostic MoE sorting
+  through stable origin alignment, then fixed uninstrumented timing and fair
+  TC quality re-evaluation against the unchanged accuracy contract.
+- Raw index-fused-quality-diagnostic/ and runtime-control/
+  index-fused-quality-analysis.json
+  SHA6be6f030d658ac5e234bf9febc31e1e6576dc13d4e7c6e3991bae90f4f14af09;
+  index-fused-intervention-comparison.json
+  SHA210f869d279122f58e1fa279753c8fb1676b7615874a3023ff285dd45bfc7244.
+  Read-only scratch analyze_fused_indexer_trace.py, verify_fused_indexer_trace.py,
+  compare_fused_intervention.py and imported helpers are source-hashed in the
+  outputs. The separate fixed cross-rank differences remain open.

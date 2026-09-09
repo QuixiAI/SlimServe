@@ -332,7 +332,21 @@ start/three full quality passes in index-fused-quality-diagnostic/ against
 8f79's exact repeated tie-policy control; configs index-fused-{score,index}-config.json,
 same prompt IDs/capture_layer23/TC0. See notebook for the complete frozen protocol.
 Final all-four wrapper/GPU suite now PASSES43 cases46.89s; no kernel/source
-changes were needed for the visibility-only rerun. Full-model run still pending.
+changes were needed for the visibility-only rerun. Full-model qualification
+COMPLETE on28d2249c1: one start/all three passes,75 priming/timing requests,
+168 uncached quality requests,12,288 text scores/18 positive needle contrasts.
+Every4096 text score and every needle token score repeats exactly; all1024
+short and94 long tensors per rank match within the run AND against8f79's
+stable-tie control across all nine pass pairs. All348 archives verify, as do
+25 source hashes per run and the explicitly scoped native-binary comparison.
+Full-model fusion preserves the selected tie policy's results on this workload.
+Exit0, GPU release0.442477s; transient zombies/release delay retained. No retries
+or excluded starts. Raw index-fused-quality-diagnostic/ and runtime-control/
+index-fused-{quality-analysis,intervention-comparison}.json. Serialized E2E
+107.845/457.533/645.385 is diagnostic, NOT a performance baseline. Retain the
+qualified opt-in fusion; next construct stable MoE alignment at the source,
+then qualify uninstrumented serving and revisit TC under the unchanged contract.
+No profile/default/quant/TC change or cross-rank-equality claim.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
