@@ -4,6 +4,19 @@ This is the running performance notebook. Follow `perf/perf.md`: record the
 baseline, hypothesis, controlled change, correctness result, throughput result,
 decision, and raw artifact locations.
 
+### GLM53 SM120 campaign commit attribution correction
+
+The 61 local campaign commits originally attributed to Eric Hartford were
+corrected to Auroter <auroter@users.noreply.github.com> at the user's request.
+All code trees, commit messages, timestamps and ordering are unchanged;
+upstream history is untouched and nothing was pushed. The following
+authorship-guidance commit also has a new hash because its parent changed.
+[The old-to-new commit map](glm53-sm120-authorship-map.json) covers all 62
+hashes. Earlier notebook entries and raw benchmark receipts retain their
+original source hashes; use the map to resolve them to corrected commits.
+The local backup branch `backup/glm53-flash-sm120-before-auroter-authorship`
+preserves the original objects. Do not rewrite raw measurement evidence.
+
 ## 2026-08-26 - Qwen3.8-Flash-Next 8x RTX 3090 Bring-Up (IN PROGRESS)
 
 New platform (`rtx3090`, nv3090-02: 8x GeForce RTX 3090 24 GiB, EPYC 7702,
