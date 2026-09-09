@@ -77,9 +77,15 @@ def _parser() -> argparse.ArgumentParser:
         "--engine-log",
         help="write the engine's own log here instead of discarding it",
     )
-    parser.add_argument(
+    profiler = parser.add_mutually_exclusive_group()
+    profiler.add_argument(
         "--torch-profile-dir",
         help="capture eight steady engine iterations after /start_profile",
+    )
+    profiler.add_argument(
+        "--cuda-profile",
+        action="store_true",
+        help="bounded CUDA profiler API ranges for an external process-tree trace",
     )
     parser.add_argument(
         "--route-profile-dir",
@@ -114,6 +120,7 @@ def _help() -> None:
         ("--dry-run", "Print the resolved plan and stop."),
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
+        ("--cuda-profile", "Enable bounded CUDA profiler API ranges for Nsight."),
         ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
         (
             "--request-metrics",
@@ -406,6 +413,19 @@ def main(argv: list[str] | None = None) -> int:
                     "ignore_frontend": True,
                     "max_iterations": 8,
                     "detailed_trace_annotation": True,
+                },
+            },
+        )
+
+    if args.cuda_profile:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "profiler_config": {
+                    "profiler": "cuda",
+                    "ignore_frontend": True,
+                    "max_iterations": 32,
                 },
             },
         )

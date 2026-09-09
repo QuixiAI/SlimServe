@@ -215,6 +215,41 @@ def runtime_identity():
     }
 
 
+def observer_return_rounds(args, base, model, prompts, folder):
+    """Repeat the exact pre-trace matrix; never merge these into the baseline."""
+    rows = []
+    for rep in range(args.repeats):
+        for concurrency in args.concurrency:
+            result = round_requests(
+                base, model, prompts[concurrency], args.output_tokens, 42
+            )
+            result["gpu_after_round"] = gpu_snapshot()
+            result["exact"] = all(
+                request["usage"]["prompt_tokens"] == args.input_tokens
+                and request["usage"]["completion_tokens"] == args.output_tokens
+                for request in result["requests"]
+            )
+            path = folder / f"observer-return-{rep + 1}-c{concurrency}.json"
+            path.write_text(json.dumps(result, indent=2) + "\n")
+            rows.append(
+                {
+                    "repeat": rep + 1,
+                    "concurrency": concurrency,
+                    "path": str(path),
+                    **{
+                        key: value for key, value in result.items() if key != "requests"
+                    },
+                }
+            )
+            if not result["exact"] or any(
+                request["replacement_characters"] for request in result["requests"]
+            ):
+                raise ValueError(
+                    "observer return token-count or replacement-character gate failed"
+                )
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--profile", default="glm53-nvfp4-4")
@@ -225,7 +260,13 @@ def main():
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 16])
     ap.add_argument("--input-tokens", type=int, default=1000)
     ap.add_argument("--output-tokens", type=int, default=300)
-    ap.add_argument("--traces", action="store_true")
+    profiler = ap.add_mutually_exclusive_group()
+    profiler.add_argument("--traces", action="store_true")
+    profiler.add_argument(
+        "--cuda-traces",
+        action="store_true",
+        help="CUDA API ranges and return timings; run under Nsight, diagnostic only",
+    )
     ap.add_argument(
         "--routing",
         action="store_true",
@@ -249,6 +290,10 @@ def main():
     args = ap.parse_args()
     if args.prefill_traces and not args.prefill:
         ap.error("--prefill-traces requires --prefill")
+    if args.cuda_traces and (args.prefill_traces or args.routing):
+        ap.error(
+            "--cuda-traces cannot combine with Torch prefill traces or routing capture"
+        )
     if min(args.boots, args.repeats, *args.concurrency) < 1 or args.output_tokens < 2:
         ap.error("boots, repeats and concurrency must be positive; output tokens >= 2")
     machine = hardware.detect()
@@ -288,8 +333,9 @@ def main():
         "plan": dataclasses.asdict(plan),
         "compatible_profiles": compatible,
         "command": sys.argv,
-        "diagnostic_only": args.routing,
-        "throughput_is_baseline_eligible": not args.routing,
+        "diagnostic_only": args.routing or args.cuda_traces,
+        "throughput_is_baseline_eligible": not (args.routing or args.cuda_traces),
+        "cuda_profiler_ranges": args.cuda_traces,
         "runtime": runtime_identity(),
         "environment": {
             k: v
@@ -324,6 +370,8 @@ def main():
         ]
         if args.traces or args.prefill_traces:
             argv += ["--torch-profile-dir", str(folder / "traces")]
+        if args.cuda_traces:
+            argv += ["--cuda-profile"]
         if args.routing:
             argv += ["--route-profile-dir", str(folder / "routing")]
         if args.prefill:
@@ -417,7 +465,7 @@ def main():
                             raise ValueError(
                                 "token-count or replacement-character gate failed"
                             )
-                if args.traces:
+                if args.traces or args.cuda_traces:
                     for c in (c for c in args.concurrency if c in (1, 8)):
                         result = round_requests(
                             base, model, prompts[c], 384, 42, profile=True
@@ -425,6 +473,11 @@ def main():
                         (folder / f"profile-c{c}.json").write_text(
                             json.dumps(result, indent=2) + "\n"
                         )
+                if args.cuda_traces:
+                    run["observer_return"] = observer_return_rounds(
+                        args, base, model, prompts, folder
+                    )
+                    record.write_text(json.dumps(receipt, indent=2) + "\n")
                 if args.quality:
                     from benchmark_glm53_quality import run as run_quality
 

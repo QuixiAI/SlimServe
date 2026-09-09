@@ -22504,3 +22504,59 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   activation/KV precision, custom collectives or the selected SlimServe recipe.
 - Raw: perf/results/2026-09-08/b12x-r281-host-serving/ and
   runtime-control/fa2-sm120-build/{build.log,probe-tests.xml}.
+
+### Original FA2 numerical control complete
+
+- The unmodified image FA2 passes all30 planned cases under the image's
+  compat610.43.02 driver on GPU0; max independent CPU-FP64 NRMS .002276717.
+  All changed-input graph outputs equal eager bit-for-bit. Binary SHA256
+  37e3a34edb6dbd3d86a7952b3ec9975cb38e3a56a2381cdab9e302eaefe4ff81.
+- Probe ran03:36:58-03:38:03 UTC, exit0/OOMKilled=false, UID1000,
+ 16-GiB/no-swap Docker/systemd caps,300-second bound. This numerical-only
+  job overlapped CPU compilation; no timing or serving-performance claim.
+  Its stopped owned container was removed after recording its full receipt;
+  all inputs' digests, output tensors, errors and loaded-library paths remain.
+- Raw: runtime-control/fa2-sm120-build/original-compat/, original-compat.log
+  and original-compat-container.json. Native build/cross-binary check pending.
+
+## 2026-09-08: Prepare whole-model CUDA graph observer control without graph hooks
+
+- Status: tooling/lifecycle qualified; actual TP4 model run remains pending.
+- Hypothesis: node tracing's demonstrated perturbation confounds graph-gap
+  attribution. Measure whole-graph spans with minimal collection and compare
+  the identical uncollected timing workload before/after profiling. Do not
+  mutate graph topology, persist extra graphs, alter streams or change driver.
+- Explicit CLI --cuda-profile selects existing CudaProfilerWrapper, frontend
+  ignored, max_iterations32. Its current stop condition is greater-than the
+  limit, so count actual collected graphs rather than promising exactly32.
+  No production defaults, weights, quant or kernel arithmetic change.
+- Campaign --cuda-traces excludes Torch/routing observers, requests bounded
+  c1/c8 ranges after normal exact1000/300 timing, then repeats the full same
+  seed/repetition/concurrency timing matrix into observer-return-* artifacts.
+  These runs are explicitly diagnostic/not baseline eligible. Failed return
+  counts retain raw receipts; return timings are not merged into aggregates.
+- Run the campaign controller under Nsight, preserving its existing separate
+  server process groups and ownership-safe teardown. Flags: --trace=cuda,
+  --cuda-graph-trace=graph:host-only, --cuda-trace-scope=process-tree,
+  --cuda-event-trace=false, --sample=none, --cpuctxsw=none,
+  --capture-range=cudaProfilerApi, --capture-range-end=repeat:100:defer,
+  --kill=none, --wait=all. Explicit 150-GiB/no-swap systemd scope; no builds
+  or other GPU jobs during the actual campaign. Fixed3starts x3repeats,
+  --cuda-traces --quality --prefill. Retain every range/rank, including
+  first-replay and partial-boundary evidence; no fast-state selection.
+- Nsight2025.6.3 lifecycle test: the existing one-GPU observer probe gains
+  an explicit CUDA API mode (Torch remains default). Launched with setsid
+  --wait under process-tree tracing,32nodes/4replays/oneA-B-A; two captured
+  ranges each contain four CUPTI_ACTIVITY_KIND_GRAPH_TRACE records and no
+  kernel/node table. All six phases pass exact output. No serving workload
+  and CPU build was active: this validates collection/ownership, NOT overhead.
+- CPU suite:190passed/1GPUskip, including explicit CLI recipe preservation,
+  mixed-observer rejection before hardware probe, exact return matrix and
+  failed-raw retention. Ruff passes. Docs corrected the old unsupported
+  driver-upgrade requirement and the incorrect TP2-halves-collective-count
+  claim; history remains marked as history.
+- Reference: [Nsight CUDA Graph Trace](https://docs.nvidia.com/nsight-systems/UserGuide/#cuda-graph-trace)
+  documents lower whole-graph overhead and warns about node-trace overhead;
+  this does not guarantee zero overhead on this workload.
+- Raw: perf/results/2026-09-08/runtime-control/nsys-range-{probe,lifecycle*},
+  cuda-range-tests.xml and cuda-range-full-tests.xml. Whole-model data owed.

@@ -74,6 +74,12 @@ increases 17.93% for 1200 linear nodes and 55.78% for the two-branch graph.
 All 18 phases pass exact output checks; post-profiler timings return near baseline.
 This does not establish the full TP4 model's unprofiled graph span. Probe raw:
 runtime-control/graph-profiler-bias/. Whole-model observer control is next.
+The explicit --cuda-profile CLI and --cuda-traces campaign mode are prepared:
+bounded CUDA API ranges, unchanged serving graph, and a separate full return
+timing matrix. Run the campaign itself under Nsight process-tree graph tracing,
+not its server child. A new-session child lifecycle probe captures four whole
+graphs in each of two ranges with no node activities; all six oracle phases
+pass. This is lifecycle proof only, not TP4 timing. CPU suite190pass/1GPUskip.
 
 The digest-pinned R28.1 reference has a reproduced container-startup failure
 and a model-free A/B/A repair: its Bash startup hook selects compat libcuda
@@ -90,7 +96,9 @@ SM80 cubins and CUDA13.3 PTX; host580 cannot JIT that PTX for SM120. A native
 SM120 build of the image's exact FA2 source f3e1a4f74c99145c0717709860bf765de1703779
 is in progress, with only the architecture target changed. Independent FP64
 oracle and original-binary comparison probe: benchmarks/kernels/probe_b12x_fa2.py.
-No qualification or TPS claim yet; no host-driver change or vision disabling.
+The original image FA2 under its single-GPU compat driver passes all30
+independent FP64-oracle/changed-input-graph cases (maxNRMS.002277). Rebuilt
+binary qualification is pending; no TPS claim or vision disabling.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
 SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,

@@ -98,6 +98,27 @@ def test_no_spec_cli_flag_disables_the_resolved_speculator(monkeypatch):
     assert "speculative_config" not in engine_kwargs(seen[0])
 
 
+def test_cuda_profiler_is_explicit_bounded_and_does_not_change_recipe(monkeypatch):
+    original = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    machine = Machine("rtx6000", "RTX PRO 6000 Blackwell", 4)
+    monkeypatch.setattr(cli.hardware, "detect", lambda: machine)
+    seen = []
+    monkeypatch.setattr(cli, "_show", seen.append)
+    assert cli.main(["glm53-nvfp4-4", "--cuda-profile", "--dry-run"]) == 0
+    configured = seen[0]
+    expected = {"profiler": "cuda", "ignore_frontend": True, "max_iterations": 32}
+    assert configured.engine["profiler_config"] == expected
+    assert replace(configured, engine=original.engine) == original
+    assert {
+        key: value
+        for key, value in configured.engine.items()
+        if key != "profiler_config"
+    } == original.engine
+    assert "profiler_config" not in original.engine
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["--cuda-profile", "--torch-profile-dir", "unused"])
+
+
 def test_every_profile_source_names_a_blessed_dspark_download():
     sources = registry._registry()["sources"]
     for profile_id in registry.profile_ids():

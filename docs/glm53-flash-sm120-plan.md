@@ -80,16 +80,25 @@ Engineering target = 60-70% of floor:
 | c16, no spec | - | - | 598.6 | 591.0 | - |
 | prefill at 32K | not measured | 14.9K tok/s | not measured | not measured | >= 15K |
 
-The handicapped column is the published image run on this host with its TP
+Historical account (not a current driver requirement): the handicapped column
+is the published image run on this host with its TP
 all-reduce forced onto a PyNCCL ring over host shared memory (the 580.173
 driver is CUDA 13.0; the CUDA 13.3 image's NCCL cuMem/P2P and B12X CUDA IPC
 paths fail, launcher knob B12X_PCIE_ALLREDUCE=0; notebook entry "B12X R24
 control on the sm_120 box (handicapped)"). It is a floor we must beat in every cell,
 not the bar; an unhandicapped local control needs a 13.3-capable driver,
-which is an operator decision on the shared box.
+which was then assumed to require an operator driver change. The 2026-09-08
+runtime audit does NOT establish that requirement: direct R24 CUDA IPC/NCCL
+passes with the host driver. R28.1's shell hook selects a different compat
+libcuda that fails IPC; preserving host libcuda fixes initialization. Its
+separate FA2 vision binary lacks native SM120 code, and an exact-source
+architecture rebuild is being qualified. See the current notebook; do not
+disable transports or change the shared host driver based on this old account.
 
-TP2 halves sync count but doubles bytes per GPU and leaves no KV room at
-131K context; TP4 with TP-sharded experts is the layout (EP measured 4-6%
+Correction: TP2 does not halve the model's all-reduce call count; it changes
+the participant count and bytes per rank. This selected recipe is qualified
+only at TP4; do not infer TP2 capacity/performance from the original estimate.
+TP4 with TP-sharded experts is the layout (EP measured 4-6%
 slower on A100, and B12X also serves TP4/DCP1).
 
 ## 2. Where the tree stands (upstream/main 2026-09-04)

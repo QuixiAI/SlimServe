@@ -45,9 +45,13 @@ def run(args):
         "nodes_per_branch": args.nodes,
         "replays": args.replays,
         "rounds": args.rounds,
+        "profiler": args.profiler,
         "phases": [],
     }
     path = args.output / "summary.json"
+    profile_phase = (
+        "torch-node-profile" if args.profiler == "torch" else "cuda-api-profile"
+    )
     try:
         primary, auxiliary = torch.cuda.Stream(), torch.cuda.Stream()
         with torch.cuda.stream(primary):
@@ -78,7 +82,7 @@ def run(args):
             for repeat in range(args.rounds):
                 for phase in (
                     "unprofiled-before",
-                    "torch-node-profile",
+                    profile_phase,
                     "unprofiled-after",
                 ):
                     row = {
@@ -89,7 +93,7 @@ def run(args):
                     }
                     receipt["phases"].append(row)
                     path.write_text(json.dumps(receipt, indent=2) + "\n")
-                    profile = phase == "torch-node-profile"
+                    profile = phase == profile_phase
                     profiler = (
                         torch.profiler.profile(
                             activities=[
@@ -101,6 +105,8 @@ def run(args):
                             with_stack=False,
                             with_flops=False,
                         )
+                        if profile and args.profiler == "torch"
+                        else torch.cuda.profiler.profile()
                         if profile
                         else nullcontext()
                     )
@@ -138,7 +144,7 @@ def run(args):
                                 ),
                             )
                         )
-                    if profile:
+                    if profile and args.profiler == "torch":
                         trace = (
                             args.output
                             / f"fork{int(fork_join)}-round{repeat + 1}.trace.json"
@@ -162,7 +168,7 @@ def run(args):
                 ),
             }
             for fork_join in (False, True)
-            for phase in ("unprofiled-before", "torch-node-profile", "unprofiled-after")
+            for phase in ("unprofiled-before", profile_phase, "unprofiled-after")
         ]
         receipt["status"] = "complete"
     except BaseException as error:
@@ -179,4 +185,5 @@ if __name__ == "__main__":
     parser.add_argument("--nodes", type=int, default=1200)
     parser.add_argument("--replays", type=int, default=32)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--profiler", choices=("torch", "cuda"), default="torch")
     run(parser.parse_args())
