@@ -195,8 +195,10 @@ layer logits and final model outputs differ. Full8K/32K score max deltas are
 Separately, fixed first-layer logits differ between rank groups0/1 and2/3,
 including two pool-set differences; preserve that follow-up instead of assuming
 cross-rank bit equality. Analysis: runtime-control/indexer-long-context-quality-analysis.json.
-GPUs released, serving exit0. Next replay saved native-selector inputs, then
-qualify an order-only model intervention; do not change tie membership or math.
+GPUs released, serving exit0. The saved-input native replay now passes all44
+executions (warmup+5 eager+5 graph on each GPU): every set remains exact while
+each GPU emits11 distinct orders. Raw indexer-saved-input-replay/ onbd08719af.
+Next qualify an order-only model intervention; do not change tie membership or math.
 The bounded observer remains default-off;436 CPU tests (one skip) and8 GPU
 observer/integration tests pass. No performance/default promotion.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;

@@ -24323,3 +24323,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   --run perf/results/2026-09-09/indexer-long-context-quality-diagnostic
   --output perf/results/2026-09-09/indexer-saved-input-replay.
   Keep every output/failure; no profiler, build or competing GPU job.
+
+## 2026-09-09 - Saved-input native indexer replay reproduces order variation
+
+- Status: fixed replay complete onbd08719af, unchanged core d45b4ace.
+- All44 prescribed native executions pass: four original GPUs x one warmup,
+  five eager and five graph calls. Every output has exactly the independently
+  CPU-validated captured selected set; changing undefined tails between NaN
+  and123 never changes membership. Native input buffers remain bit-identical
+  before/after each call. Each GPU emits11 distinct index orderings.
+- Relative to its serving capture, each call changes2,703,885-2,715,998 index
+  positions across5564-5565 rows. Four archives retain all44 output matrices;
+  every archive file hash/size verifies. No timing or end-to-end causal claim.
+  Exit0, GPUs released, no source/native changes during replay.
+- Decision: proceed to an opt-in order-only model intervention: sort the
+  already-selected512 pool IDs ascending, keeping -1 padding at the end.
+  Preserve the selected multiset exactly; do NOT resolve cutoff ties or
+  substitute selection arithmetic. This tests the observed order-only cause
+  without attributing the separate fixed cross-rank input differences to it.
+- Raw: indexer-saved-input-replay/{summary.json,gpu-*-all11-outputs.pt};
+  runtime-control/indexer-saved-input-replay.log. Source/native/input hashes
+  and every per-call check are in the receipt. CPU oracle tests9pass.
