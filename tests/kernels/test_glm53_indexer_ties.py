@@ -69,7 +69,12 @@ def matrix(rows, columns, family, phase):
     return values, ends
 
 
-def exercise(rows, columns, family, offset):
+@pytest.fixture(params=["post-sort", "fused"])
+def selector(request):
+    return request.param
+
+
+def exercise(rows, columns, family, offset, selector, ragged=True):
     # Guard both ends; storage offsets deliberately misalign vectorized input.
     backing = torch.full((rows * columns + offset + 1,), 417.0, device="cuda")
     logits = backing[offset : offset + rows * columns].view(rows, columns)
@@ -81,10 +86,14 @@ def exercise(rows, columns, family, offset):
     ends = torch.zeros_like(starts)
 
     def call():
-        ops.glm53_top_k_per_row_prefill(
-            logits, starts, ends, indices, rows, columns, 1, 512
+        operation = (
+            ops.glm53_top_k_per_row_ordered
+            if selector == "fused"
+            else ops.glm53_top_k_per_row_prefill
         )
-        canonicalize(indices)
+        operation(logits, starts, ends, indices, rows, columns, 1, 512)
+        if selector == "post-sort":
+            canonicalize(indices)
 
     logits.zero_()
     call()
@@ -93,6 +102,8 @@ def exercise(rows, columns, family, offset):
         call()
     for phase in range(3):
         values, visible = matrix(rows, columns, family, phase)
+        if not ragged:
+            visible.fill_(columns - phase)
         expected = oracle(values, visible)
         undefined = torch.arange(columns)[None, :] >= visible[:, None]
         values[undefined] = float("nan") if phase % 2 == 0 else 123.0
@@ -117,19 +128,48 @@ def exercise(rows, columns, family, offset):
     "family", ["random", "unique", "ties", "adjacent", "zeros", "cutoff"]
 )
 @pytest.mark.parametrize("offset", [0, 1])
-def test_native_tie_policy_changed_input_graphs(columns, family, offset):
-    exercise(8, columns, family, offset)
+def test_native_tie_policy_changed_input_graphs(columns, family, offset, selector):
+    exercise(8, columns, family, offset, selector)
 
 
 @pytest.mark.parametrize("rows,columns", [(7616, 1904), (8192, 2049)])
-def test_full_chunk_geometry(rows, columns):
-    exercise(rows, columns, "ties", 1)
+def test_full_chunk_geometry(rows, columns, selector):
+    exercise(rows, columns, "ties", 1, selector)
+
+
+@pytest.mark.parametrize("rows", [1, 2, 8, 16, 64])
+@pytest.mark.parametrize("columns", [1904, 262144])
+def test_small_rowcounts_all_visible(rows, columns, selector):
+    exercise(rows, columns, "cutoff", 1, selector, ragged=False)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() != 4, reason="requires all four GPUs")
+@pytest.mark.parametrize("device", [0, 1, 2, 3])
+def test_native_restores_foreign_current_device(device, selector):
+    values, visible = matrix(8, 1904, "adjacent", 1)
+    expected = oracle(values, visible)
+    logits, ends = values.to(device), visible.to(device)
+    starts = torch.zeros(8, dtype=torch.int32, device=device)
+    indices = torch.empty_like(expected, device=device)
+    operation = (
+        ops.glm53_top_k_per_row_ordered
+        if selector == "fused"
+        else ops.glm53_top_k_per_row_prefill
+    )
+    with torch.cuda.device((device + 1) % 4):
+        operation(logits, starts, ends, indices, 8, 1904, 1, 512)
+        assert torch.cuda.current_device() == (device + 1) % 4
+        if selector == "post-sort":
+            # Test the native guard independently of the Triton post-sort.
+            with torch.cuda.device(device):
+                canonicalize(indices)
+        assert torch.equal(indices.cpu(), expected)
 
 
 @pytest.mark.parametrize(
     "bad", ["rows", "columns", "topk", "stride", "dtype", "output", "device"]
 )
-def test_native_host_guards(bad):
+def test_native_host_guards(bad, selector):
     logits = torch.zeros(2, 600, device="cuda")
     starts = ends = torch.zeros(2, device="cuda", dtype=torch.int32)
     indices = torch.empty(2, 512, device="cuda", dtype=torch.int32)
@@ -150,15 +190,21 @@ def test_native_host_guards(bad):
     elif bad == "device":
         indices = indices.cpu()
     with pytest.raises(RuntimeError, match="GLM pool selector"):
-        ops.glm53_top_k_per_row_prefill(
-            logits, starts, ends, indices, rows, stride0, stride1, topk
+        operation = (
+            ops.glm53_top_k_per_row_ordered
+            if selector == "fused"
+            else ops.glm53_top_k_per_row_prefill
         )
+        operation(logits, starts, ends, indices, rows, stride0, stride1, topk)
 
 
 @pytest.mark.parametrize("start,end", [(1, 600), (0, -1), (0, 601)])
-def test_invalid_device_ranges_fail_in_isolated_process(start, end, record_property):
+def test_invalid_device_ranges_fail_in_isolated_process(
+    start, end, record_property, selector
+):
     # Device assertions invalidate a CUDA context: exercise them in a child,
     # never in the context used by the positive correctness/graph tests.
+    name = "ordered" if selector == "fused" else "prefill"
     code = f"""
 import torch
 from vllm import _custom_ops as ops
@@ -167,7 +213,7 @@ starts = torch.tensor([{start}], device='cuda', dtype=torch.int32)
 ends = torch.tensor([{end}], device='cuda', dtype=torch.int32)
 indices = torch.empty(1, 512, device='cuda', dtype=torch.int32)
 try:
-    ops.glm53_top_k_per_row_prefill(logits, starts, ends, indices, 1, 600, 1, 512)
+    ops.glm53_top_k_per_row_{name}(logits, starts, ends, indices, 1, 600, 1, 512)
     torch.cuda.synchronize()
 except RuntimeError as error:
     assert 'device-side assert' in str(error), str(error)

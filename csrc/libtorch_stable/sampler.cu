@@ -376,13 +376,14 @@ __device__ bool processHistogramStep(
 // Follows half - 11 - 11 - 10 bit iterations
 template <int kNumThreadsPerBlock, int kNumBins, bool useRadixSort,
           bool multipleBlocksPerRow = false, bool mergeBlocks = false,
-          bool canonicalTies = false>
+          bool canonicalTies = false, bool canonicalOrder = false>
 static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                      int rowStart, int rowEnd, int* outIndices,
                                      float* outLogits, int stride1, int topK) {
   // The number of slots for the final pass.
   static_assert(!canonicalTies || (!useRadixSort && !multipleBlocksPerRow &&
                                   !mergeBlocks));
+  static_assert(!canonicalOrder || (canonicalTies && kNumThreadsPerBlock == 512));
   static constexpr int kNumFinalItems = 2048;
   // The number of elements per thread for the final sort.
   static constexpr int kNumFinalItemsPerThread =
@@ -392,6 +393,9 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                         kNumFinalItemsPerThread, int>;
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
+  using PoolSort = cub::BlockRadixSort<int, kNumThreadsPerBlock, 1>;
+  using PoolSortTempStorage =
+      std::conditional_t<canonicalOrder, typename PoolSort::TempStorage, int>;
   // The class to compute the inclusive prefix-sum over the histogram.
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -412,6 +416,7 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   __shared__ union {
     FinalItems items;
     FinalSortTempStorage finalSort;
+    PoolSortTempStorage poolSort;
     Histogram histo;
   } smemFinal;
 
@@ -601,18 +606,31 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     __syncthreads();
   }
 
-  // Store to global memory.
-  for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
-    if constexpr (multipleBlocksPerRow) {
-      outIndices[i] = smemOutput[i];
-      outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
-    } else {
-      if (stride1 == 1) {
-        // stride1 == 1 will use vectorized_process, which indexes already skip
-        // the rowStart.
+  if constexpr (canonicalOrder) {
+    // Selection and every read of FinalItems/Histogram have completed. Reuse
+    // their storage; this needs neither an extra launch nor a global workspace.
+    // The <=512 shortcut above is already in ascending pool-ID order.
+    int pool[1] = {smemOutput[threadIdx.x]};
+    pool[0] = pool[0] < 0 ? INT_MAX : pool[0];
+    __syncthreads();
+    // Host bounds guarantee valid pool IDs <2^18. Bit18 separates any -1
+    // padding sentinel from valid IDs; sorting only [0,19) is sufficient.
+    PoolSort(smemFinal.poolSort).Sort(pool, 0, 19);
+    outIndices[threadIdx.x] = pool[0] == INT_MAX ? -1 : pool[0];
+  } else {
+    // Store to global memory.
+    for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {
+      if constexpr (multipleBlocksPerRow) {
         outIndices[i] = smemOutput[i];
+        outLogits[i] = reinterpret_cast<float*>(smemOutput + topK)[i];
       } else {
-        outIndices[i] = smemOutput[i] - rowStart;
+        if (stride1 == 1) {
+          // stride1 == 1 will use vectorized_process, which indexes already skip
+          // the rowStart.
+          outIndices[i] = smemOutput[i];
+        } else {
+          outIndices[i] = smemOutput[i] - rowStart;
+        }
       }
     }
   }
@@ -698,6 +716,17 @@ static __global__ __launch_bounds__(512) void glm53TopKPerRowPrefill(
   const int row = blockIdx.x;
   CUDA_KERNEL_ASSERT(starts[row] == 0 && ends[row] >= 0 && ends[row] <= columns);
   topKPerRowJob<512, 2048, false, false, false, true>(
+      nullptr, logits + int64_t(row) * columns, 0, ends[row],
+      indices + int64_t(row) * 512, nullptr, 1, 512);
+}
+
+// Diagnostic fusion candidate: identical tie policy, ascending selected IDs.
+static __global__ __launch_bounds__(512) void glm53TopKPerRowOrdered(
+    const float* logits, const int* starts, const int* ends, int* indices,
+    int columns) {
+  const int row = blockIdx.x;
+  CUDA_KERNEL_ASSERT(starts[row] == 0 && ends[row] >= 0 && ends[row] <= columns);
+  topKPerRowJob<512, 2048, false, false, false, true, true>(
       nullptr, logits + int64_t(row) * columns, 0, ends[row],
       indices + int64_t(row) * 512, nullptr, 1, 512);
 }
@@ -851,7 +880,8 @@ void top_k_per_row_prefill(const torch::stable::Tensor& logits,
   }
 }
 
-void glm53_top_k_per_row_prefill(
+template <bool canonicalOrder>
+static void glm53_top_k_per_row_impl(
     const torch::stable::Tensor& logits,
     const torch::stable::Tensor& starts,
     const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
@@ -877,11 +907,34 @@ void glm53_top_k_per_row_prefill(
                   indices.dim() == 2 && indices.size(0) == numRows &&
                   indices.size(1) == 512, "GLM pool selector buffer shape changed");
   const torch::stable::accelerator::DeviceGuard guard(logits.get_device_index());
-  vllm::glm53TopKPerRowPrefill<<<numRows, 512, 512 * sizeof(int32_t),
+  if constexpr (canonicalOrder) {
+    vllm::glm53TopKPerRowOrdered<<<numRows, 512, 512 * sizeof(int32_t),
+                                  get_current_cuda_stream()>>>(
+        logits.const_data_ptr<float>(), starts.const_data_ptr<int>(),
+        ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), int(stride0));
+  } else {
+    vllm::glm53TopKPerRowPrefill<<<numRows, 512, 512 * sizeof(int32_t),
                                get_current_cuda_stream()>>>(
       logits.const_data_ptr<float>(), starts.const_data_ptr<int>(),
       ends.const_data_ptr<int>(), indices.mutable_data_ptr<int>(), int(stride0));
+  }
   const cudaError_t error = cudaGetLastError();
   STD_TORCH_CHECK(error == cudaSuccess, "GLM pool selector launch failed: ",
                   cudaGetErrorString(error));
+}
+
+void glm53_top_k_per_row_prefill(
+    const torch::stable::Tensor& logits, const torch::stable::Tensor& starts,
+    const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
+    int64_t numRows, int64_t stride0, int64_t stride1, int64_t topK) {
+  glm53_top_k_per_row_impl<false>(logits, starts, ends, indices, numRows,
+                                stride0, stride1, topK);
+}
+
+void glm53_top_k_per_row_ordered(
+    const torch::stable::Tensor& logits, const torch::stable::Tensor& starts,
+    const torch::stable::Tensor& ends, torch::stable::Tensor& indices,
+    int64_t numRows, int64_t stride0, int64_t stride1, int64_t topK) {
+  glm53_top_k_per_row_impl<true>(logits, starts, ends, indices, numRows,
+                               stride0, stride1, topK);
 }

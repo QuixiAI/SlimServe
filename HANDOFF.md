@@ -275,6 +275,18 @@ cross-run receipts: runtime-control/index-ties-{quality-analysis,
 intervention-comparison}.json. Next remove extra diagnostic sorting launches
 through qualified origin-level ordering, measure uninstrumented timing, then
 revisit TC under the unchanged quality contract. Production defaults stay OFF.
+Next fusion candidate locally qualified after4fc14c06f: separate native
+glm53_top_k_per_row_ordered sorts512 IDs within the existing selector CTA;
+no serving caller yet. CPU484 pass/one skip plus14 analyzer fixtures, GPU260
+cases plus8 all-device guard cases pass. Memcheck/synccheck4cases each and
+bounded racecheck8 launches have zero errors/hazards. Native core now92c8f136
+(full hash/notebook); old8828383f preserved as index-fused-order-native-before.so.
+40 registers/no spills; static shared19568+2048 dynamic versus17424+2048.
+All4187 other kernel copies and the prior tie selector's valid-input path are
+bit-identical. Four error-path assertion metadata/line-number instructions
+change; the recorded checker permits ONLY these four, not selection changes.
+Actual88-call replay then fixed FIVE-round A/B/A timing across18 actual/synthetic
+shapes prescribed in the notebook. Neither has run yet; no speed claim/promotion.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

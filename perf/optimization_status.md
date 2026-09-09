@@ -24660,3 +24660,66 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Read-only scratch analyzers analyze_tie_indexer_trace.py,
   verify_tie_indexer_trace.py and compare_tie_intervention.py; all hashes in
   outputs. Replay/campaign/analysis logs preserved under runtime-control/.
+
+## 2026-09-09 - Selected-pool ordering fusion qualification and fixed protocol
+
+- Status: local qualification in progress; no serving caller or default change.
+- Baseline:8f79f3b5c native tie selector plus separate Triton pool-ID post-sort.
+  Hypothesis: reuse the native CTA's final-stage shared storage for512 integer
+  pool IDs, preserving exact selected membership/order with one fewer launch.
+- Candidate: separate glm53_top_k_per_row_ordered entry, compile-time policy
+  in the shared selector; CUB block radix sort of19 bits, valid IDs<2^18,
+  -1 padding ordered last. Rows with<=512 visible pools already have canonical
+  output and return without sorting. Existing entry/defaults unchanged.
+  No logit changes or global workspace; same native geometry/device guards.
+- Local GPU260 tests pass41.84s (two implementations, changed-input graphs,
+  finite adjacent/tied scores/signed zero, full chunks, physical262144-column
+  decode, host/device bounds); CPU484 pass/one skip23.30s. Memcheck4cases5.77s
+  and synccheck same4cases5.80s have zero errors. Bounded racecheck adjacent2049
+  offset1, first8 matching launches,5.41s, zero hazards/errors/warnings.
+- Build CUDA13/-j2/80GiB/no swap; first4-step build passes with one unreachable
+  loop warning in the new constexpr branch. Make the existing store path an
+  explicit else; final2-step build passes without that warning. Both logs kept.
+  Installed core92c8f1366588ee4954a33d52bdbcaad59125c3b39de3bd11d4963815dcf9f971;
+  prior8828383f preserved in runtime-control/index-fused-order-native-before.so.
+  New kernel40 registers/zero stack/local,19568 static shared bytes plus2048
+  dynamic, versus old40/17424+2048. Import/schema smoke passes. Disassembly
+  comparison and all-device guard tests pending; no throughput claim yet.
+- Prescribed replay AFTER local checks: benchmarks.kernels.
+  benchmark_glm53_indexer_order_fusion replay --run
+  perf/results/2026-09-09/index-ties-quality-diagnostic --native-comparison
+  perf/results/2026-09-09/index-fused-order-native-sass/comparison.json
+  --output perf/results/2026-09-09/index-fused-order-saved-input-replay.
+  Each original GPU/both arms:1 warmup+5 eager+5 graphs, all88 outputs saved,
+  undefined tails alternately NaN/123, independent CPU oracle equality required.
+- Prescribed timing AFTER replay/sanitizers: same tool with mode timing,
+  output index-fused-order-timing/. GPU0 only; actual7616-row matrix and its
+  last583 rows, plus synthetic rows1/8/16/64 at physical width262144 and visible
+  pools250/8192/32768/262144. FIVE A/B/A rounds EACH shape. Warm:20-call graph,
+  three warmups then five timed replays (100 selections/sample). Cold diagnostic:
+  TEN samples/arm/round, each one-call graph preceded on the same stream by a
+  256MiB read/write eviction outside the timed interval. Retain EVERY sample,
+  report medians/spread separately; eviction-conditioned is not measured DRAM
+  traffic. No profiler/native builds/other GPU work during timing. Freeze sources
+  and binaries. This measures selector latency, not serving TPS or general quality.
+- Raw local logs/XML/resources/builds: runtime-control/index-fused-order-*.
+  Unmangled cuobjdump --function filter found no symbol; complete resource dump
+  index-fused-order-all-native-resources.log contains both actual mangled kernels.
+- All-device guard qualification:8 tests pass4.38s; both native entries target
+  each GPU correctly while a different device is current, and restore the
+  caller's device. No serving/workload overlap. Additional14 CPU analyzer/
+  replay fixtures pass1.01s, including rejection of any selection, branch or
+  scheduling-bit change in the narrowly scoped binary comparison exception.
+- Binary comparison:4187 other existing function copies are bit-identical;
+  old tie selector's valid-input instruction path is bit-identical. Its ONLY
+  changes are four assertion-error-path instructions at0xf0/0x100/0x110/0x130,
+  relocated constant references and source line699->717. The unchanged valid
+  range branch skips this entire block to0x200; all scheduling bits stay exact.
+  The checker verifies the complete old/new function body hashes against the
+  raw comparison, explicitly records these four changes, and rejects any
+  additional difference. Do NOT claim all4188 old bodies are bit-identical.
+  Exactly one new kernel; no removed functions. Full raw disassembly retained
+  in index-fused-order-native-sass/, comparison.json
+  SHA31b7e640eeca465137903b73697509d27e9cd2dd6a0588cdac4d03da806016bf.
+  Benchmark/replay record the exception and both raw SASS hashes, not a blanket
+  unchanged-binary claim. Actual replay and timing remain pending.
