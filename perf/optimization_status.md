@@ -25348,3 +25348,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Fixed 32-case / 4,800-sample warm graph A/B/A is next, source frozen and
   GPU0 exclusively owned in a 16GiB/no-swap scope. Public installed alignment
   is the control; the candidate remains an isolated probe, not serving code.
+
+## 2026-09-09 - First large-M stable alignment timing is mixed; count stage isolated
+
+- Fixed run COMPLETE on 7877084e8, clean source / probe87a3736e; all 32 cases,
+  4,800 samples and before/after graph-output/input checks verify. Read-only
+  analysis rechecks every median, source against Git, all five functional/
+  sanitizer receipts and all actual-route archive hashes. Installed native
+  QC33decd2f/corefe4a7c2a/MoE1093b8a4 remain unchanged. No sample exclusions.
+- Compared with atomic alignment PLUS canonical sort: 28/32 cases strictly
+  faster, four strictly slower. Both random/skew regress at M256 and M1024,
+  worst 14.74% slower. M256 random A/B/A 6.192/7.010/6.202 us; M1024 random
+  13.893/15.410/13.894 us. Do not conceal these behind a large-M mean or enable
+  a broad dispatch. M7616 random 222.941/84.517/222.942 us (62.09% less), skew
+  129.816/73.597/129.832 us (43.31% less). Actual M640 routes improve
+  13.90-17.43%, from about 12.95-12.97 to 10.71-11.15 us.
+- Crucially, unstable alignment alone is only about 19.94 us at M7616 random;
+  the first stable candidate still costs 84.48 us against that path. These
+  are hot isolated graphs, not production throughput or cache-effect proof.
+  Candidate NOT ready for serving integration; retain as an isolated control
+  and optimize its measured counter rather than accepting avoidable overhead.
+- One prescribed Nsight stage attribution at M7616/random/BM64, same CPU/GPU
+  IDs and probe, three arms (atomic / atomic+sort / stable), five 20-call graph
+  replays each, kernel-node tracing. All three paths match the independent CPU
+  output after capture; all timing-source/native hashes reverify. Exactly 100
+  new count / 100 new scatter / 200 old count / 200 old scatter / 100 sort
+  instances. Median GPU durations: new count 70.207 us, bitmap scatter 13.472;
+  old count 11.616, old scatter 8.192, sort 202.718. Profiling overhead applies;
+  these explain the unprofiled result, not a replacement baseline. Counting
+  dominates the new path. Next controlled change: increase its parallelism
+  from 256 to 1024 threads, leaving bitmap scatter/routing/padding semantics
+  unchanged, followed by functional/sanitizer and fixed A/B/A checks.
+- Raw stable-align-probe-timing/summary.json
+  SHA2a4a76ee498e8117a1d9686dd6a21f2a62674bcdca7dbe969061ca6a8d645de3;
+  runtime-control/stable-align-timing-analysis.json
+  SHA11001fbde60b71d4c1a01fc0b39ad735385830c635ddad952bc8e77debf7ec39;
+  stable-align-stage-profile.{nsys-rep,sqlite,log}, stage-kernels.csv and
+  stage-profile-receipt.json under runtime-control/. Source-hashed scratch
+  analyze_stable_align_timing.py and profile_stable_align_stages.py retained.
+  All scopes exit 0 and GPUs release before further edits. Profile/quant/TC
+  defaults unchanged; no production baseline updated.

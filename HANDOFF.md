@@ -58,8 +58,16 @@ Keep the c16 repeat-2 slowdown: 387.96 versus 648.38 / 646.17 tok/s, including
 a shared 4.371-second client-arrival gap before six requests' first tokens.
 Cause unresolved; no replacement sample. These serialized/instrumented rates
 are not production baselines. Stable routing remains opt-in; profile, quant
-and TC defaults are unchanged. Next: isolate and measure M>16 stable alignment
-at its source, then qualify uninstrumented serving and the fair TC comparison.
+and TC defaults are unchanged.
+
+M>16 prototype is now isolated and measured (7877084e8, probe 87a3736e).
+128 functional/memory/sync cases and bounded races pass, including real M640
+routes. All 4,800 timing samples verify: 28/32 cases beat alignment-plus-sort,
+but four regress at M256/M1024. M7616 random is 84.52 vs 222.94 us; this is
+still much slower than the unstable alignment alone (19.94 us), not a serving
+win. A fixed stage trace isolates the bottleneck: new counting 70.21 us,
+stable scatter 13.47 us, old counting 11.62 us. Next increase count parallelism
+and requalify; no serving integration of this first large-M candidate.
 
 ### Chronological evidence (older next-step statements are historical)
 
