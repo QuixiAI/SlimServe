@@ -2000,9 +2000,10 @@ pass. Startup times: 156.06/152.04/154.15 seconds, all retained.
 | 8 | 574.79 [574.07, 578.49] | 588.73 |
 | 16 | 778.96 [775.66, 781.96] | 791.73 |
 
-Decode is performance-neutral. First-start c1 graph still has 1185 kernels,
-5.740 ms mean span and 0.427 ms without an active kernel. No claim that the
-persistent slow graph state is fixed. Each start scores 4096 continuation
+Decode is performance-neutral. The first-start c1 node trace has 1185 kernels,
+5.740 ms mean span and 0.427 ms without an active kernel. Node profiling can
+perturb execution; this is not the unprofiled graph span or an established
+cause of startup throughput variation. Each start scores 4096 continuation
 tokens; means -2.731303551/-2.733894219/-2.722965098, all six retrieval
 contrasts pass per start, minimum margin 33.6909. These checks show no measured
 regression, not a quality improvement or full-context capability qualification.
@@ -2046,9 +2047,10 @@ race without changing scheduling or arithmetic. Its SHA256 is
 | 16 | 779.05 [777.08, 780.05] | 791.37 |
 
 Performance-neutral versus the expanded quality reference below. All 24 c1
-rank-0 graph replays have 1185 kernels; mean spans per start are
+node-profiled rank-0 graph replays have 1185 kernels; mean spans per start are
 5.740/5.747/5.749 ms, with 0.428/0.428/0.429 ms when no kernel is active.
-The persistent slow graph state is not repaired. Time to health was
+These observer-perturbed spans do not establish the unprofiled cause.
+Time to health was
 220.10/150.05/150.08 seconds; all startup durations are retained.
 
 Each start scores 4096 continuation tokens: mean log probabilities
@@ -2117,9 +2119,10 @@ requests have exact counts and no replacement characters. Kernel validation
 includes 60 sampler tests against an independent CPU oracle and clean
 memcheck/racecheck. Broader model-quality checks remain separate.
 
-All starts still show the slower graph state: rank-0 c1 means
+All starts' node traces show wider gaps: rank-0 c1 means
 5.742 / 5.746 / 5.740 ms, with 0.428 / 0.428 / 0.427 ms lacking an active
-graph kernel. No restart or graph-latency remedy is implied by this repair.
+graph kernel. This is not an unprofiled graph measurement. No restart or
+graph-latency remedy is implied by this repair.
 Raw: perf/results/2026-09-08/sampler-serving/ (summary.json with native
 hashes, every request, logs, all-rank traces, graph-replays-rank0.json).
 
@@ -2142,8 +2145,8 @@ Every start passed text/image canaries and every measured request had exact
 token counts. The cold c1 outlier is absent in this series, and the copy
 warmup is logged before readiness. This validates the startup fix on the
 real profile; it is not evidence of a steady-state speedup or broader model
-quality. The old sampler issue and persistent graph-launch latency remain
-separate outstanding work. Raw: perf/results/2026-09-08/warmup-boundary/
+quality. The old sampler issue and unexplained startup throughput variation
+remain separate outstanding work. Raw: perf/results/2026-09-08/warmup-boundary/
 (summary.json, all requests/warmups, server logs and all-rank traces).
 
 ### RTX6000 fixed-start baseline - 2026-09-08
@@ -2167,9 +2170,11 @@ The first start's first c1 measurement includes a 157 ms inter-token gap
 at output token 89 (1088 total context), coincident with first compilation
 of batch_memcpy_kernel. It is retained. The 32-output-token warmup did
 not reach that boundary; subsequent harness revisions warm the full workload.
-All three starts have the slower graph-node state: rank-0 c1 graph spans
+All three starts' node traces show wider gaps: rank-0 c1 graph spans
 5.732 / 5.746 / 5.742 ms, with 0.428 / 0.430 / 0.428 ms containing no
-active graph kernel. This is independent of the one-time copy-kernel JIT.
+active graph kernel. The one-time copy JIT is separate. Later observer
+controls demonstrate that node profiling itself can inflate these gaps;
+their persistence without profiling is not established by these traces.
 
 Raw: perf/results/2026-09-08/repro-baseline/ (summary.json, per-request
 JSON, server logs, all-rank traces, graph-replays-rank0.json). Correlation-

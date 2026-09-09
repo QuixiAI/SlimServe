@@ -63,7 +63,8 @@ starts x three repeats plus a prescribed return-to-original control pass all
 exact-token, text/image and expanded quality gates. Cold 32K/128K engine TTFT
 is **2.606/10.933 s**, versus **2.634/11.433 s** in the return control: about
 1%/4.4% lower latency. Decode stays **155.98/574.79/778.96** E2E tok/s at
-c1/c8/c16; the persistent graph gap is unchanged. All 14 full-selection tests,
+c1/c8/c16; node-profiled gaps remain, with the observer caveat below.
+All 14 full-selection tests,
 changed-input graphs, memcheck, racecheck and synccheck pass. Other platforms
 keep their original geometry. Raw: perf/results/2026-09-08/indexer-tiles/,
 indexer-tile-serving/ and indexer-tile-return-control/.
@@ -193,7 +194,8 @@ The first fixed-count series is now complete (commit 143e18073): three
 starts x three repetitions at c1/c8/c16, all 27 runs retained. Median
 complete-request TPS is **156.11 / 576.31 / 775.44**; median client decode
 TPS is 165.02 / 590.41 / 787.99. Every start passed text/image canaries.
-All three have the slower graph-node state. One cold c1 run includes a
+All three node traces show the wider gaps; this does not prove the same
+gaps persist without profiling. One cold c1 run includes a
 157 ms first-JIT stall at the 1088-token state-copy boundary. Details and
 limits: perf/baseline_status.md; raw: perf/results/2026-09-08/repro-baseline/.
 The startup-copy fix has also passed a second fixed three-start series
@@ -202,7 +204,7 @@ TPS, with all 27 measurements retained. Its c1 range is 156.17-156.59;
 the cold outlier is absent. Copy-kernel warmup happens before health and
 benchmark warmups cover the full workload. Raw:
 perf/results/2026-09-08/warmup-boundary/. Neither change claims to solve
-persistent graph latency or improve steady-state throughput.
+unexplained startup throughput variation or improve steady-state throughput.
 
 Record (rtx6000 profile, no-spec, fast/fast boot, 2026-09-08 12:29, run
 mlapf-rec4): **c1 165.7 / c8 591.9 / c16 797.4**, gate -2.450. That is
@@ -230,8 +232,9 @@ passes 60 kernel tests and clean memcheck/racecheck with an independent CPU
 oracle. Every cutoff tie is retained; nucleus order is stable by token ID;
 noise is vocabulary-indexed FP32/FP64. Seeded streams change from the old
 32-draw implementation. Raw: perf/results/2026-09-08/sampler-exact/ and
-sampler-serving/. The persistent slow graph state is unchanged. A separate
-PyTorch reduction race report remains under investigation; see the notebook.
+sampler-serving/. Node-profiled graph gaps remain; unprofiled causality is
+unresolved. A separate PyTorch reduction race report remains under
+investigation; see the notebook.
 
 The stronger quality baseline is complete (9de9ad871): three fixed starts,
 all 27 timing measurements retained, E2E medians 155.93 / 575.96 / 778.33.
