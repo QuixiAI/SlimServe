@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Isolated GLM53 SM120 candidate; no serving dispatch uses this header yet.
+// GLM53 SM120 stable alignment. Native dispatch instantiates only the qualified
+// small/count256 and large/direct1024 policies; other variants are probe-only.
 #pragma once
 
 #include <cuda_runtime.h>

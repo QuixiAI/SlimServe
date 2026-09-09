@@ -25595,3 +25595,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   old-native SASS comparison, functional/graph/device/redzone/sanitizer gates,
   native fixed timing, then ONE real-profile three-pass equality diagnostic
   against c8ba8d56c. Do not start another micro-variant sweep first.
+
+### Selected native path built; GPU qualification pending
+
+- Native QC39b302f041bb846712b396f84100aefefcb332ed3fd04bd787853fa43bfdb31c
+  built in two steps, CUDA13/80GiB/no swap/-j2, and installed after preserving
+  QC33decd2f as runtime-control/stable-align-native-before.so. Initial backup
+  command used a nonexistent .abi3 filename and copied nothing; corrected to
+  the discovered cpython-312 filename before installation. Corefe4/MoE1093
+  unchanged. No GPU workload overlapped the build.
+- Checked native out-entry validates M17..8192/top8/int32/contiguity, all output
+  sizes/devices/dtypes and pairwise non-overlap, SM120, current device/stream.
+  Native dispatch is exactly the selected two policies. An opaque custom op
+  owns outputs plus a transient289-int workspace; no persistent repack/cache.
+  STABLE_ALIGN defaultsOFF and requires the canonical diagnostic/bounded journal.
+  Marlin validates the model scope before alignment and skips sorting only
+  after actual native construction or valid small-router reuse. Journal/source
+  receipts and baseline exclusion include the new path.
+- Every748 pre-existing GPU body is identical, both encoding words and all
+  duplicate copies preserved. Four scoped kernels added, no removed/changed
+  bodies. Proof runtime-control/stable-align-native-sass-comparison.json
+  SHA36819d3ce6d93f112e6c8aa7f7a9ff1cb6e1ac4759fb27ea0e222dfcbd186bf8.
+  The FOUR new native bodies differ from the isolated probe build; no native
+  latency inferred from probe results. Full comparison retained separately.
+- CPU wiring/scope/journal/baseline-exclusion tests159 PASS5.91s; new-source
+  lint passes. Native GPU test source06e6e99c388df564706ae5ee1c7e5f837eeca739e87e82ca64ea73c5b9528416.
+  Fixed next gate:171 native functional cases, full memcheck/synccheck, then
+  four bounded races atM17/32/33/8192, first14 matching launches (seven changed
+  inputs) each. Includes redzones, independent CPU layout, frozen-probe exact
+  parity, all12 actual routes, four foreign-device streams, alias rejection,
+  eager/Inductor custom ops and changed-input CUDA graphs. Source/native freeze.
+  No serving or native throughput qualification yet.

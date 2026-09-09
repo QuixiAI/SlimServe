@@ -99,6 +99,21 @@ class quixicore_ops:
         return quixicore_ops.is_available() and hasattr(_qc(), "moe_sum_add")
 
     @staticmethod
+    def glm_stable_align(
+        ids: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        experts: torch.Tensor,
+        padded: torch.Tensor,
+        offsets: torch.Tensor,
+        block: int,
+    ) -> None:
+        """Checked, scoped SM120 stable alignment; outputs must be disjoint."""
+        native = _qc()
+        if not hasattr(native, "glm_stable_align"):
+            raise RuntimeError("stable GLM alignment requires rebuilt native kernels")
+        native.glm_stable_align(ids, sorted_ids, experts, padded, offsets, block)
+
+    @staticmethod
     @cache
     def has_decode_gemm() -> bool:
         return quixicore_ops.is_available() and hasattr(_qc(), "decode_gemm")

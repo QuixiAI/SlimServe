@@ -79,6 +79,8 @@ class ScoreJournal:
             "slimserve/canonical_moe_kernel.py",
             "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
             "csrc/quixicore/serving/glm_moe_routing.cuh",
+            "csrc/quixicore/serving/glm_moe_stable_align.cuh",
+            "vllm/model_executor/layers/fused_moe/router/glm_stable_align.py",
             "csrc/quixicore/tm_cuda/tm_cuda_serving.cu",
         )
         self._write(

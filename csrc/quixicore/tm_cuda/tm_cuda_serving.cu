@@ -20,12 +20,14 @@
 #include "dsv4_router_ampere.cuh"
 #include "dsv4_projection_ampere.cuh"
 #include "glm_moe_routing.cuh"
+#include "glm_moe_stable_align.cuh"
 #include "glm_moe_combine.cuh"
 #include "bf16_decode_gemm.cuh"
 #include "fp8_decode_gemm.cuh"
 #include "glm53_mhc_prefill_tc.cuh"
 #include "topk_sample.cuh"
 #include <torch/extension.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -223,6 +225,50 @@ static std::vector<torch::Tensor> py_glm_route_align(
             int(max_padded), int(max_blocks));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
+}
+
+// Out-variant keeps allocations in the opaque Python custom op and permits
+// full-capacity/redzone tests of the exact serving entry. Off by default.
+static void py_glm_stable_align(
+        torch::Tensor ids, torch::Tensor sorted, torch::Tensor experts,
+        torch::Tensor padded, torch::Tensor offsets, int64_t block) {
+    CK(ids);
+    TORCH_CHECK(ids.scalar_type() == torch::kInt32 && ids.dim() == 2 &&
+                    ids.size(0) >= 17 && ids.size(0) <= 8192 && ids.size(1) == 8,
+                "glm_stable_align expects int32 [17..8192,8] IDs");
+    TORCH_CHECK(block == 8 || block == 16 || block == 32 || block == 48 || block == 64,
+                "glm_stable_align unsupported block size");
+    const int numel = int(ids.numel());
+    const int capacity = int(std::min(int64_t(numel) * block,
+                                    numel + 288 * (block - 1)));
+    const int blocks = int((capacity + block - 1) / block);
+    const std::vector<torch::Tensor> outputs{sorted, experts, padded, offsets};
+    const int sizes[] = {capacity, blocks, 1, 289};
+    for (int i = 0; i < 4; ++i) {
+        const auto& value = outputs[i];
+        TORCH_CHECK(value.device() == ids.device() && value.is_contiguous() &&
+                        value.scalar_type() == torch::kInt32 && value.dim() == 1 &&
+                        value.numel() == sizes[i],
+                    "glm_stable_align output contract mismatch at ", i);
+        at::assert_no_overlap(ids, value);
+        for (int j = 0; j < i; ++j) at::assert_no_overlap(outputs[j], value);
+    }
+    const c10::cuda::CUDAGuard guard(ids.device());
+    const auto* properties = at::cuda::getDeviceProperties(ids.get_device());
+    TORCH_CHECK(properties->major == 12 && properties->minor == 0,
+                "stable GLM alignment is qualified for SM120 only");
+    const bool small = ids.size(0) <= 32;
+    auto count = small ? glm_stable_align::count_prefix<256, true>
+                       : glm_stable_align::count_prefix<1024, false>;
+    count<<<2, small ? 256 : 1024, 0, stream()>>>(
+        ids.data_ptr<int>(), sorted.data_ptr<int>(), experts.data_ptr<int>(),
+        padded.data_ptr<int>(), offsets.data_ptr<int>(), numel, int(block), capacity, blocks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    auto scatter = small ? glm_stable_align::scatter_bitmap<256>
+                         : glm_stable_align::scatter_bitmap<512>;
+    scatter<<<288, small ? 256 : 512, 0, stream()>>>(
+        ids.data_ptr<int>(), sorted.data_ptr<int>(), offsets.data_ptr<int>(), numel);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 static void py_moe_sum_add(torch::Tensor x, torch::Tensor shared, torch::Tensor out) {
@@ -2499,6 +2545,9 @@ void init_serving(py::module_& m) {
           py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
           py::arg("max_padded"), py::arg("max_blocks"),
           "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("glm_stable_align", &py_glm_stable_align, py::arg("ids"),
+          py::arg("sorted"), py::arg("experts"), py::arg("padded"),
+          py::arg("offsets"), py::arg("block"));
     m.def("glm_route_align_stable", &py_glm_route_align<true>, py::arg("logits"),
           py::arg("bias"), py::arg("topk"), py::arg("scoring"),
           py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
