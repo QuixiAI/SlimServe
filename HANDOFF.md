@@ -35,7 +35,48 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 20:49 UTC)
+### Latest checkpoint (2026-09-09 21:22 UTC)
+
+Normalization-only intervention is implemented and locally qualified, defaultOFF.
+CPU128pass; GPU28 exact cases cover real StaticAutotunerFuture hook, four source
+bindings with1/2/2/2 separate objects, both modes, rows16/640, changed-input graphs.
+Source/native/replacement binary hashes required; unrelated launchers recorded.
+Use perf/glm53-rmsnorm-intervention-protocol.md, including its REPAIR follow-up.
+
+First no-op on ea2fff9ce FAILED BEFORE HEALTH: cached AOT loaded on all ranks,
+but the initial guard confused one source with one Python autotuner object.
+Actual objects1/2/2/2; all72 observed launchers unchanged. No benchmark/quality
+requests, legacy arm NOT launched. Verified controller2674507 was interrupted
+after worker errors; server1/controller130, teardown complete, GPUs free.
+The raw summary's running/starting status is STALE (KeyboardInterrupt bypassed
+exceptException); authoritative failure audit preserves/classifies it:
+runtime-control/rmsnorm-noop-startup-failure.json
+SHAbaf6736a06fbd851328ee99af6a0be4acb8a896acfe57ba477ccef6be477ab93.
+All5172 original cache files/22 source receipts verified before repair.
+
+Repair afe72ca52 replaces EVERY distinct object of each exact source, records
+binding indices, requires source presence and rejects wrong hashes/same-object/
+late bindings. Interrupts now mark run/root failed before teardown and rethrow,
+so no stale running receipt or next boot. Original raw failure is untouched.
+28-case GPU receipt45c6b6be1af71b3c33e783d97f3d0d126fef9d8e6c8308ac6ad018cb04b41faa.
+
+NEXT: exactly ONE repaired no-op `rmsnorm-noop-bindings-control`, then ONE
+`rmsnorm-legacy-bindings-only` ONLY IF all three no-op quality passes match all
+nine old native-only passes exactly. No source/native changes or commits during
+the pair/audits. Fresh byte-identical private cache copies are already prepared:
+perf/results/2026-09-09/rmsnorm-intervention-bindings-caches/{control,legacy}/,
+each with manifest.json and cache/. All5172 files copied/verified, GPU-free.
+Flags SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC=control|legacy, matching absolute
+SLIMSERVE_GLM53_RMSNORM_MANIFEST / VLLM_CACHE_ROOT paths, VLLM_FORCE_AOT_LOAD=1.
+All other settings use native-order protocol (TC0/BF16fn1/no observers/asynchronous).
+Full cold1000/300/c1,c8,c16/three repeats, text/image, three quality passes.
+Auditor runtime-control/audit_rmsnorm_intervention.py ARM --commit FROZEN_HEAD
+is prepared but not yet run; it expects the repaired output/cache names and
+checks all binding occurrences, original-cache snapshot, all22 sources and scores.
+Do not rerun old audits into existing outputs. No full-model intervention result
+yet; original cross-mode quality gate stays FAILED and native-order defaultOFF.
+
+### Previous checkpoint (2026-09-09 20:49 UTC)
 
 Source-exact cached RMSNorm probe COMPLETE: all96 prescribed cases/192
 cross-config comparisons,100 pairs differ (every7616-row pair). Max one BF16

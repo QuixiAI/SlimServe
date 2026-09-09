@@ -26064,3 +26064,18 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   repaired no-op control and ONE legacy arm only after exact no-op equality.
   No replacement or deletion of the first failed start; no relaxed quality gate.
   Repair CPU suite128pass8.70s/14 existing warnings; lint/diff checks pass.
+
+### Multi-binding repair qualified; corrected serving pair ready
+
+- On afe72ca52, all28 real GPU cases pass:1/2/2/2 independent objects across
+  ranks, both modes, rows16/640, exact direct-config eager/repeat/changed-graph
+  comparisons. Missing/late/same-object and wrong-hash guards remain intact;
+  source presence is required, not object uniqueness. GPUs released, exit0.
+  Raw rmsnorm-intervention-bindings-gpu/summary.json
+  SHA45c6b6be1af71b3c33e783d97f3d0d126fef9d8e6c8308ac6ad018cb04b41faa.
+- Fresh control/legacy private caches each copy/verify5172 original files under
+  rmsnorm-intervention-bindings-caches/, preparation exit0. Old failed run and
+  both earlier private copies remain unchanged. Auditing the corrected pair
+  uses runtime-control/audit_rmsnorm_intervention.py ARM --commit FROZEN_HEAD;
+  it checks every source-bound occurrence and records object multiplicities.
+  No corrected serving start or full-model quality result yet.
