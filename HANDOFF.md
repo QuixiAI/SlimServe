@@ -371,6 +371,13 @@ shape distributions strictly separated from both controls. M8 random6.1008/
 4.8800/6.0992us A/B/A. This is synthetic warm-cache kernel throughput, NOT
 serving TPS. Retain for opt-in native/serving qualification; M>16 unchanged.
 Raw stable-route-synced-timing/ and runtime-control/stable-route-synced-analysis.json.
+Native QC is now33decd2f (old4ce80155 preserved): both policies have the warp
+sync fix, stable entry SM120-only, checked shape/capacity/device-aware launch.
+All746 non-router GPU copies remain bit-identical;719 tests, full mem/sync and
+bounded native M13/M16 racechecks pass. Native router code differs from probe
+code; fresh native timing and real-profile qualification remain required.
+Stable native entry has no serving caller yet. Next explicit diagnostic
+provenance wiring, native timing, then full-model equality versus28d2249c1.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

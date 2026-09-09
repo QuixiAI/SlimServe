@@ -174,6 +174,7 @@ static torch::Tensor py_dsv4_projection_gemv(torch::Tensor x,
     return output;
 }
 
+template <bool STABLE_ALIGNMENT>
 static std::vector<torch::Tensor> py_glm_route_align(
         torch::Tensor logits, torch::Tensor bias, int64_t topk, int64_t scoring,
         bool renormalize, double scaling, int64_t block_size, int64_t max_padded,
@@ -181,27 +182,46 @@ static std::vector<torch::Tensor> py_glm_route_align(
     CK(logits); CK(bias);
     TORCH_CHECK(logits.scalar_type() == torch::kFloat32 && logits.dim() == 2,
                 "glm_route_align expects fp32 [M, E] router logits");
-    TORCH_CHECK(bias.scalar_type() == torch::kFloat32 &&
+    TORCH_CHECK(bias.scalar_type() == torch::kFloat32 && bias.dim() == 1 &&
                     bias.numel() == logits.size(1),
                 "glm_route_align expects an fp32 [E] correction bias");
+    TORCH_CHECK(bias.device() == logits.device(),
+                "glm_route_align bias must be on the logits device");
     const int M = int(logits.size(0)), E = int(logits.size(1));
     TORCH_CHECK(M >= 1 && M <= glm_route::MAX_TOKENS,
                 "glm_route_align handles 1..16 tokens");
     TORCH_CHECK(E == 288 && topk == 8,
                 "glm_route_align is instantiated for E=288, topk=8");
+    TORCH_CHECK(scoring == 0 || scoring == 1,
+                "glm_route_align expects sigmoid or sqrt-softplus scoring");
+    TORCH_CHECK(block_size == 8 || block_size == 16 || block_size == 32 ||
+                    block_size == 48 || block_size == 64,
+                "glm_route_align unsupported block size");
+    const int64_t expected_capacity = std::min(
+        M * topk * block_size, M * topk + E * (block_size - 1));
+    TORCH_CHECK(max_padded == expected_capacity &&
+                    max_blocks == (expected_capacity + block_size - 1) / block_size,
+                "glm_route_align alignment capacity mismatch");
+    const c10::cuda::CUDAGuard guard(logits.device());
+    if constexpr (STABLE_ALIGNMENT) {
+        const auto* properties = at::cuda::getDeviceProperties(logits.get_device());
+        TORCH_CHECK(properties->major == 12 && properties->minor == 0,
+                    "stable GLM routing is qualified for SM120 only");
+    }
     auto i32 = logits.options().dtype(torch::kInt32);
     auto topk_weights = torch::empty({M, topk}, logits.options());
     auto topk_ids = torch::empty({M, topk}, i32);
     auto sorted = torch::empty({max_padded}, i32);
     auto expert_ids = torch::empty({max_blocks}, i32);
     auto post_pad = torch::empty({1}, i32);
-    glm_route::route_align_kernel<288, 8>
+    glm_route::route_align_kernel<288, 8, STABLE_ALIGNMENT>
         <<<1, glm_route::THREADS, 0, stream()>>>(
             fp(logits), fp(bias), fpm(topk_weights),
             topk_ids.data_ptr<int32_t>(), sorted.data_ptr<int32_t>(),
             expert_ids.data_ptr<int32_t>(), post_pad.data_ptr<int32_t>(), M,
             int(scoring), float(scaling), renormalize, int(block_size),
             int(max_padded), int(max_blocks));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {topk_weights, topk_ids, sorted, expert_ids, post_pad};
 }
 
@@ -2474,11 +2494,16 @@ void init_serving(py::module_& m) {
     m.def("dsv4_hash_router_debug", &py_dsv4_hash_router_debug);
     m.def("dsv4_projection_gemv", &py_dsv4_projection_gemv, py::arg("x"),
           py::arg("weight"), py::arg("bf16_output") = false);
-    m.def("glm_route_align", &py_glm_route_align, py::arg("logits"),
+    m.def("glm_route_align", &py_glm_route_align<false>, py::arg("logits"),
           py::arg("bias"), py::arg("topk"), py::arg("scoring"),
           py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
           py::arg("max_padded"), py::arg("max_blocks"),
           "fused small-M routing: scored top-k with bias selection + Marlin block alignment");
+    m.def("glm_route_align_stable", &py_glm_route_align<true>, py::arg("logits"),
+          py::arg("bias"), py::arg("topk"), py::arg("scoring"),
+          py::arg("renormalize"), py::arg("scaling"), py::arg("block_size"),
+          py::arg("max_padded"), py::arg("max_blocks"),
+          "opt-in SM120 small-M routing with stable within-expert assignment order");
     m.def("decode_gemm", &py_decode_gemm, py::arg("x"), py::arg("weight"),
           py::arg("bias") = py::none(), py::arg("fp32_out") = false,
           "bf16 M<=16 GEMM on tensor cores: x @ weight^T (+ bias), fp32 accumulation");

@@ -22,9 +22,26 @@ from vllm.quixicore.ops import quixicore_ops as qc
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-@pytest.fixture(scope="module")
-def probe():
-    return build()
+@pytest.fixture(scope="module", params=("probe", "native"))
+def probe(request):
+    if request.param == "probe":
+        return build()
+    import vllm._quixicore_C as native
+
+    assert hasattr(native, "glm_route_align_stable"), "rebuild native stable router"
+
+    class NativeRouter:
+        __file__ = native.__file__
+
+        @staticmethod
+        def run(logits, bias, scoring, renormalize, scaling, block, stable):
+            capacity, blocks = alignment_geometry(len(logits), 8, 288, block)
+            call = native.glm_route_align_stable if stable else native.glm_route_align
+            return call(
+                logits, bias, 8, scoring, renormalize, scaling, block, capacity, blocks
+            )
+
+    return NativeRouter()
 
 
 @pytest.fixture(scope="module")
@@ -36,6 +53,7 @@ def source_receipts(probe):
         Path(probe.__file__),
         Path(native.__file__),
         Path("csrc/quixicore/serving/glm_moe_routing.cuh"),
+        Path("csrc/quixicore/tm_cuda/tm_cuda_serving.cu"),
         Path("benchmarks/kernels/glm53_stable_route_probe.cu"),
         Path("benchmarks/kernels/glm53_stable_route_probe.py"),
         Path("benchmarks/kernels/benchmark_mhc_output_parallel.py"),
@@ -172,14 +190,71 @@ def test_changed_inputs(probe, tokens, scoring, renormalize, block):
 
 
 @pytest.mark.parametrize("device", range(4))
-def test_foreign_current_device(probe, device):
+@pytest.mark.parametrize("stable", (False, True))
+def test_foreign_current_device(probe, device, stable):
     with torch.cuda.device(device):
         logits = torch.zeros(13, 288, device="cuda")
         bias = torch.zeros(288, device="cuda")
     with torch.cuda.device((device + 1) % 4):
         current = torch.cuda.current_device()
-        result = probe.run(logits, bias, 0, True, 2.5, 8, True)
+        result = probe.run(logits, bias, 0, True, 2.5, 8, stable)
         assert torch.cuda.current_device() == current
+        if not stable:
+            with torch.cuda.device(device):
+                canonicalize(*result[2:], tokens=13, block_size=8)
         for actual, expected in zip(result[2:], expected_alignment(result[1], 8)):
             assert actual.device == logits.device
             assert_bits(actual, expected)
+
+
+@pytest.mark.parametrize("stable", (False, True))
+@pytest.mark.parametrize(
+    "bad",
+    (
+        "rows0",
+        "rows17",
+        "experts",
+        "dtype",
+        "bias_shape",
+        "bias_device",
+        "scoring",
+        "topk",
+        "block0",
+        "block128",
+        "capacity",
+        "blocks",
+        "strided",
+    ),
+)
+def test_native_rejects_invalid_contract(stable, bad):
+    import vllm._quixicore_C as native
+
+    logits, bias = torch.zeros(1, 288, device="cuda"), torch.zeros(288, device="cuda")
+    args = [logits, bias, 8, 0, True, 2.5, 8, 64, 8]
+    if bad == "rows0":
+        args[0] = logits[:0]
+    elif bad == "rows17":
+        args[0] = logits.expand(17, 288).contiguous()
+    elif bad == "experts":
+        args[0], args[1] = logits[:, :287].contiguous(), bias[:287]
+    elif bad == "dtype":
+        args[0] = logits.bfloat16()
+    elif bad == "bias_shape":
+        args[1] = bias.view(1, 288)
+    elif bad == "bias_device":
+        args[1] = bias.to("cuda:1")
+    elif bad == "scoring":
+        args[3] = 2
+    elif bad == "topk":
+        args[2] = 7
+    elif bad in ("block0", "block128"):
+        args[6] = 0 if bad == "block0" else 128
+    elif bad == "capacity":
+        args[7] = 63
+    elif bad == "blocks":
+        args[8] = 7
+    elif bad == "strided":
+        args[0] = torch.zeros(1, 576, device="cuda")[:, ::2]
+    call = native.glm_route_align_stable if stable else native.glm_route_align
+    with pytest.raises(RuntimeError):
+        call(*args)

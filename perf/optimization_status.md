@@ -25109,3 +25109,42 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA312acad20678043a07841f9f850bce7bd78917ea467fec7ea372609ac0a7987c.
   Source-hashed scratch analyze_stable_route_timing.py; timing/analysis logs
   retained. Both exit0 and GPU contexts released. No serving TPS/profile change.
+
+## 2026-09-09 - Native stable router and synchronization repair qualify locally
+
+- Native integration built/installed, no stable serving caller yet. QC
+  33decd2ff72e1320767d40b49eb1d3bba84fd53ee742e6c5c8f4190490ac692d replaces
+  QC4ce80155, preserved as runtime-control/stable-route-native-before.so. Core
+  fe4a7c2a and MoE1093b8a4 unchanged. CUDA13/-j2/80GiB/no swap build completes
+  two steps; no GPU/build overlap. Host source500b747de560a66af28ea307390adb872b2934acf96f336687f7d4f9cd442fb2.
+- Both native policies include the qualified warp sync. Separate opt-in
+  glm_route_align_stable entry is SM120-only; existing glm_route_align remains
+  atomic. Shared checked host template validates CUDA/contiguity/FP32 geometry,
+  same-device one-dimensional bias, M1..16/E288/top8, scoring0/1, five supported
+  blocks and exact capacity. Uses device guard/current stream/launch check.
+  No new profile default or quant/arithmetic expression changes.
+- Strict full disassembly (both encoded words, duplicate copies retained):
+  old747/new748 function copies, ALL746 non-router copies identical. Only old
+  router symbol replaced by the two bool-specialized repaired/stable variants.
+  Their resources match the probe (48/46regs,44080/46384 shared, zero local).
+  Native router bodies are NOT byte-identical to the isolated probe; do not
+  infer exact native timings from the prior probe measurement.
+-719 tests PASS36.36s: both probe/native policies across640 changed-input cases,
+  16 foreign-device checks,26 unique rejection cases repeated under both fixture
+  variants, and11 prior routing regressions. IDs/weight bits match the frozen
+  probe and native control through the same generated input corpus; stable
+  layouts match CPU construction. Test sourcee0f02ed34e66d8ac5ff31170f63aa07ca8b41753742dd8c6f605431aad1e5e97.
+- Full719-case native/probe memcheck82.29s and synccheck51.01s PASS, zero errors.
+  Native M13/M16 bounded racechecks, first72 matching launches each including
+  repeated native controls and both changed-input graph policies, PASS7.92/8.39s,
+  zero hazards/errors/warnings. No old unsafe binary is being used by the active
+  serving imports now, but full-profile qualification of the repair is still owed.
+- Raw runtime-control/stable-route-native-{build,tests,memcheck,synccheck,
+  racecheck-m13,racecheck-m16,resources}.log/XML; complete before/candidate SASS.
+  SASS comparison8dfdedc7e984878d65137dc2aa089c049a53b8de30b5b5df53624b0a635043aa;
+  tests XMLee4c8c408ca210999c07aed6277ceb91ef942567862b87ea169f02bcd540c98f;
+  synccheck XML606a428990a0f20e12b0edbf88d2d3e9b5a2bdd276baa463fbb02ff84c2a8a8b.
+- Next: OFF-by-default diagnostic wiring with explicit canonical alignment
+  provenance, native-kernel A/B/A, and real-profile quality/trace equality.
+  Stable routing must not suppress a necessary fallback sort or affect other
+  platforms. No native timing, serving performance or full-model claim yet.
