@@ -88,3 +88,11 @@ same command with these three substitutions/addition:
 Combine only the original24 completed cases and the remaining72, verifying
 exact coverage of96 unique rank/row/seed/site keys and all192 comparisons.
 Do not rerun rank1 or overwrite/relabel the failed attempt as successful.
+
+Continuation completes onada8f2915. Combined audit verifies all96 unique cases
+and192 comparisons;100 pairs differ, maximum one BF16 ULP, all oracle/repeat/
+graph/guard checks pass. All eight compiled-kernel bindings match recorded hashes.
+Original caches unchanged; GPUs released. Raw combined analysis:
+`runtime-control/cached-rmsnorm-analysis.json`,
+SHA256 `b472082671205e9dc2c40c9cc744d9da94721b7cfbf8ab0a45b9c295132d660c`.
+This isolated protocol is COMPLETE; it does not establish full-model causality.

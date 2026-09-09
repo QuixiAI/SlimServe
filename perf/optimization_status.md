@@ -25933,3 +25933,60 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Repair only the diagnostic to supply an explicit device-owned capture
   stream. Add rank selection to resume just72 outstanding cases on3/0/2;
   no rank1 replacement or gate changes. Frozen continuation in protocol.
+
+## 2026-09-09 - Exact cached RMSNorm configurations demonstrably change BF16 output
+
+- Status: isolated arithmetic confound CONFIRMED; full-model causality open.
+  The72 outstanding cases onada8f2915 complete after the probe-only stream
+  fix. Independent8GiB CPU audit verifies exactly96 unique prescribed cases,
+  no duplicate/replacement cases, all original source/config receipts unchanged,
+  and all eight rank/config bindings reproduce recorded serving-kernel hashes.
+  The first process remains FAILED; its24 completed rank1 cases are retained,
+  not rerun. Diagnostic CPU regressions15pass0.97s; final lint/diff checks pass.
+- Four SM120 devices sequentially, BF16 H4096 synthetic normal inputs, actual
+  checkpoint norm vectors at layers0/22/44, two seeds, three magnitudes. Both
+  saved1024/8 and4096/16 configurations use the exact generated source and
+  Inductor signature/divisibility/options. Original caches were never imported
+  or written by the probe; byte-identical source copies and private caches used.
+- Results:100/192 cross-config comparisons differ,4560 BF16 output values
+  across1,626,537,984 compared element instances,2200 affected row instances.
+  Maximum difference one BF16 ULP /0.0078125; aggregate RMS2.989151e-6.
+  Counts include the prescribed repeated input families across ranks, not that
+  many independent random samples. Per-rank aggregate metrics are identical.
+
+  | Rows | Different pairs /48 | Different BF16 values |
+  | ---: | ---: | ---: |
+  | 1 | 0 | 0 |
+  | 16 | 8 | 16 |
+  | 640 | 44 | 392 |
+  | 7616 | 48 | 4152 |
+
+- All384 config/input FP64-oracle comparisons stay within the predeclared
+  one-BF16-ULP bound. Exact same-input eager repeats, original-input graph
+  equivalence, changed-input sensitivity, guard rows, unchanged weights and
+  read-only inputs, and all three rank0 outputs pass. These are functional
+  checks, NOT sanitizer qualification or evidence of full-model equivalence.
+  Neither reduction configuration is shown numerically invalid by this oracle.
+- Remainder process/scope exit0, no warning/error/traceback matches in its log.
+  Observed scope peak1,842,094,080 bytes, below16GiB/no swap. All GPUs released;
+  only unrelated tmux/init scopes remain. QC39b302f0/corefe4/MoE1093 hashes
+  unchanged. No serving run, timing, profile/quant/default or TC change.
+- Raw cached-rmsnorm-remainder/summary.json
+  SHA7653c598f3f2c75ab313c079b1736490c4fa9178e451774f4b5f44387cd8662f;
+  combined runtime-control/cached-rmsnorm-analysis.json
+  SHAb472082671205e9dc2c40c9cc744d9da94721b7cfbf8ab0a45b9c295132d660c.
+  Source-hashed audit_cached_rmsnorm.py validates source commits, case coverage,
+  config hashes and original receipts; exits0. Both launch logs and failed
+  first attempt remain intact. Protocol is complete; do not repeat these cases.
+- Decision/next: source-identical RMSNorm code is NOT enough to freeze model
+  arithmetic across fresh autotuning. Design a narrow full-model intervention
+  swapping only these four source-bound normalization choices, preserving all
+  unrelated native-order cached kernels. First establish a no-op instrumented
+  control that exactly matches the nine existing native-only quality passes,
+  then test the legacy normalization configurations without changing observers,
+  quant, TC or arithmetic elsewhere. Verify the actual launchers, not just edited
+  best_config files: AOT artifacts bundle static kernels and reload cache choices
+  via StaticAutotunerFuture.result / recheck_autotune_cache. Original caches
+  must remain intact; a global force-first-config override is not the experiment.
+  No intervention has been implemented/launched yet. Keep the old cross-mode
+  score gate FAILED and native-order defaultOFF until full-model evidence exists.

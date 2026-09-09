@@ -35,7 +35,38 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 20:27 UTC)
+### Latest checkpoint (2026-09-09 20:49 UTC)
+
+Source-exact cached RMSNorm probe COMPLETE: all96 prescribed cases/192
+cross-config comparisons,100 pairs differ (every7616-row pair). Max one BF16
+ULP; both configs satisfy FP64 oracle. All eight rank/config combinations
+reproduce their exact recorded serving-kernel hashes. Same-input repeats,
+changed-input graphs, guard/mutation checks and triple rank0 outputs pass.
+This CONFIRMS an arithmetic confound from autotune choice, NOT the full-model
+score-mismatch cause or invalid accuracy of either kernel. No serving/quant/
+native/default/TC changes. Original caches unchanged, GPUs free.
+
+Probe22d609633 first completed rank1, then failed at rank3 graph capture due
+to Torch's process-global default capture stream still onGPU1. Preserve that
+failed attempt. Probe-only per-device stream fixada8f2915 completed JUST the
+72 outstanding rank3/0/2 cases; no rank1 replacement. CPU15pass, raw audit
+verifies96 unique cases across both artifacts. Results/notebook/protocol:
+perf/glm53-cached-rmsnorm-protocol.md; raw cached-rmsnorm-{isolation,remainder}/;
+runtime-control/cached-rmsnorm-analysis.json
+SHAb472082671205e9dc2c40c9cc744d9da94721b7cfbf8ab0a45b9c295132d660c.
+
+NEXT: narrow full-model normalization-only intervention, with a no-op control
+that first matches the nine existing native-only quality passes. Preserve all
+unrelated cached launchers; require source/config/binary-bound receipts. Merely
+editing best_config files is not proof of changed executed kernels: AOT bundles
+static launchers, reload via StaticAutotunerFuture.result/recheck_autotune_cache.
+No intervention code or launches yet. No global force-first-config, original
+cache deletion, gate widening, default promotion or TC exoneration. The older
+cross-mode gate stays FAILED. Current serving implementation remains95fe67870;
+new commits only diagnostic/tests/docs. Continue toward an explicit reproducible
+normalization policy, then measured performance and TC reevaluation.
+
+### Previous checkpoint (2026-09-09 20:27 UTC)
 
 Both prescribed native-only isolation arms are COMPLETE on6422d43d6. Together
 with the initial normal run on95fe67870, every text/needle-token score is exact
