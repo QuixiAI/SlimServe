@@ -112,8 +112,12 @@ The exact original seed2240 still fails strict parity and passes independent
 accuracy. Sourceaf3113740, nativeQC20588761, unchanged probe45d5e817; raw
 `perf/results/2026-09-09/mhc-tc-accuracy-census/` and
 `runtime-control/mhc-tc-accuracy-analysis.json`.313 CPU tests pass/one skip.
-Full-size cold A/B/A timing is now running through the complete-receipt gate;
-sanitizers, native integration and fixed1/3/1 serving/quality remain owed.
+Full-size cold A/B/A timing completes: latency falls 33.5/33.2/29.6/29.5%
+at 64/65/128/129 rows, but only 2.61% at 7616 rows (about 613.37->597.34us).
+Do not extrapolate the small-batch gain to long-context serving. Memcheck
+passes 48 selected cases/144 graph phases with zero errors; synchronization
+and targeted race checks, native integration and fixed1/3/1 serving/quality
+remain owed. The full timing/source receipts are in mhc-tc-qualified-timing/.
 Do not equate this numerical qualification with a serving gain or promotion.
 
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
@@ -373,13 +377,14 @@ Current candidate priorities (hypotheses, not physical ceilings):
    completes all2700 eager cases/8100 changed-input graph phases, with zero
    pointwise violations in both kernels. The original strict parity failure
    at T7616/site79/fused/seed2240 remains recorded, not reclassified. Follow
-   `perf/glm53-mhc-tc-accuracy-contract.md`: complete the current five-round
-   cold timing run, prescribed sanitizers, gated native integration and fixed
+   `perf/glm53-mhc-tc-accuracy-contract.md`: finish the prescribed sanitizers,
+   then gated native integration and fixed
    control/candidate/return serving quality/performance series before promotion.
    The unchanged probe is45d5e817, current nativeQC20588761. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
-   Earlier small-batch latency fell29-34%; no full-chunk or serving gain is
-   claimed yet. Paired lossless storage is retained separately from this new
+   Five-round cold timing gives29-34% lower small-batch latency but only2.61%
+   at the full chunk. No serving gain is claimed. Paired lossless storage is
+   retained separately from this new
    arithmetic. Keep the current serving path while remaining gates run.
    Output-parallel arithmetic and actual 20-iteration
    norm fusion already lost; last-block synchronization was neutral. Do not

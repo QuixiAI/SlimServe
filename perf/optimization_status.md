@@ -23577,3 +23577,38 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-09/mhc-tc-accuracy-census/ and
   runtime-control/mhc-tc-accuracy-{census.log,analysis.json}. Stock clocks and
   600W limits are recorded in mhc-tc-qualified-timing-hardware-before.txt.
+
+## 2026-09-09: Qualified tensor-core mHC timing has a modest full-chunk gain
+
+- Status: isolated timing passed; serving value remains unmeasured. Source
+  35075df1e, native QC20588761, unchanged probe45d5e817. The complete independent
+  accuracy receipt is required and revalidated before the timing process starts.
+- Protocol: all five prescribed batches, five A/B/A rounds, four replays per
+  phase, three warmups; six banks of all 90 fn matrices, 540 sites/graph,
+  424,673,280 fn bytes = 3.164x L2. Same BF16 weights/activation seeds in both
+  arms, only used BF16 bank copies allocated; no unused FP32 bank duplicates.
+  Stock 600W limits, no clock changes, profiler, competing GPU job or build.
+- Median A/B/A2 microseconds per complete mHC operation:
+  T64 15.1287/10.0575/15.1249;
+  T65 15.1637/10.1305/15.1694;
+  T128 15.9763/11.2432/15.9839;
+  T129 16.2091/11.4337/16.2214;
+  T7616 612.8228/597.3414/613.9207.
+  Paired latency reductions 33.506/33.209/29.635/29.456/2.613%; corresponding
+  throughput changes +50.389/+49.722/+42.116/+41.756/+2.683%.
+- Full-chunk ranges A609.269-617.064, B597.316-597.360, A2 610.394-618.414us.
+  Keep the control drift and all 15 readings; no best-phase selection. Peak
+  graph allocation 2,734,833,664 bytes at T7616. The small-batch gain does not
+  carry over to the full chunk. This suggests further attribution of activation
+  traffic/finalization is needed; it does not establish a physical ceiling.
+- Decision: candidate remains isolated pending sanitizers and actual-profile
+  value. Do not describe this as a 29-34% long-prefill or serving improvement.
+  No profile/default/native modification. Timing controller exit0, all source,
+  model parameter and binary hashes match, GPU released afterward.
+- Raw: mhc-tc-qualified-timing/summary.json; runtime-control/
+  mhc-tc-qualified-timing{.log,-hardware-before.txt,-hardware-after.txt}.
+- First sanitizer follow-through: memcheck completes all 48 selected eager
+  cases / 144 changed-input graph phases, no count cap, candidate-symbol filter
+  only. Accuracy gates pass, sanitizer exit0 and ERROR SUMMARY: 0 errors;
+  elapsed54.310s. Baseline/Torch kernels are not claimed as newly sanitized.
+  Raw mhc-tc-memcheck/ and runtime-control/mhc-tc-memcheck{,-sanitizer}.log.
