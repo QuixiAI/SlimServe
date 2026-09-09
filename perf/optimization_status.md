@@ -25288,3 +25288,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   no new production baseline. Next isolate M>16 origin-level stable alignment
   versus current alignment plus sort, with independent layout/graph/sanitizer
   checks and actual captured routes before any serving integration.
+
+## 2026-09-09 - Isolated M>16 stable alignment candidate, functional qualification
+
+- Baseline: installed generic count/prefix plus atomic scatter, followed by
+  the quarantined canonical sort. Small-M fused routing and stable indexer
+  remain untouched. Reviewed the generic large/small-expert implementations,
+  canonical sort geometry, actual grouped-topk dispatch, GLM5.2 Ampere design
+  and vendored Metal router precedent. The documented external QuixiCore/DS4
+  directories are absent on this host; do not claim those trees were read.
+- Hypothesis: construct ascending flattened assignment IDs directly instead
+  of sorting the atomic result. New isolated glm_moe_stable_align.cuh uses
+  per-warp integer counts, padded prefix sum, then one bitmap/popcount-scan CTA
+  per nonempty expert. Two launches, 289-int workspace, no quant/arithmetic
+  changes. At M8192 all experts together may reread 72 MiB of IDs from cache;
+  this is a deliberate tradeoff to measure, not an assumed win. Scope E288,
+  top8, M17..8192, blocks8/16/32/48/64, int32, SM120, no EP/token mask.
+  Host guards and stream/device ownership are checked; no serving entry added.
+- Build: CUDA13.0 sm120f/O3, isolated 80GiB/no-swap scope, MAX_JOBS2, no
+  concurrent serving. Probe SHA87a3736eff7d8e9dd78210b77fefe0f34a1f7ad3928c01b7d10ace1027929b5b.
+  count_prefix 33 registers / 11,424 shared bytes; scatter_bitmap 38 / 10,400;
+  both zero stack/local bytes. Installed native binaries are unchanged.
+- Initial tests: 128 passed in 62.73s. Eleven sizes x five block sizes x two
+  storage offsets, seven routing phases, independent CPU full-capacity layout
+  and offsets, changed-input/poisoned-output graphs (14 replays per case),
+  input/output redzones, invalid IDs, duplicates, all-invalid and skewed routes.
+  Existing canonical native matches all distinct-top8 phases; duplicate phase
+  deliberately bypasses that diagnostic's M-row-per-expert bound and uses the
+  independent CPU oracle. All twelve actual M640 captures pass; four-GPU
+  foreign-device/nondefault-stream tests and thirteen invalid contracts pass.
+  Test SHA406290b70ceeab8fb0b86d8264580b1b7175e8d3639a7f3a62f2803bdd1e3e0e.
+  Raw runtime-control/stable-align-{probe-build,tests}.{log,xml}. The 142
+  warnings include 128 record_property/xunit2 compatibility warnings; future
+  receipts use junit_family=legacy, not suppressed test failures.
+- Next safety gate: full 128-case memcheck and synccheck on the candidate
+  kernels, plus bounded first-two-matching-launch racechecks at M17/M8192.
+  Then fixed 32-case / 4,800-sample A/B/A in stable-align-probe-timing/ via
+  benchmarks.kernels.benchmark_glm53_stable_align: 14 synthetic sizes x
+  random/skew plus first captured route per rank, actual Marlin block sizes.
+  Compare atomic alone and atomic plus sort separately; all samples retained,
+  outputs verified before/after. Freeze sources/binary throughout each run.
+  Correctness is functional only so far; sanitizer/timing outcomes PENDING.
