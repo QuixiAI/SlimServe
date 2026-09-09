@@ -25558,3 +25558,40 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   only the explicit environment and run the same frozen tests/binary once,
   recording stable-align-scatter-memcheck-configured.{log,xml}. This is a
   corrected pre-workload launch, not a replacement benchmark or kernel pass.
+
+## 2026-09-09 - Wider stable scatter qualifies; proceed to native integration
+
+- Frozen2b689556c / probe9b1ed132. Correctly configured memcheck passes all520
+  cases in76.00s; synccheck520 in34.80s, zero errors. Eight first-two-launch
+  races pass with zero hazards: 256/M17 7.29s, 256/M8192 7.75s,1024/M17 7.57s,
+  1024/M8192 7.62s,direct/M17 7.59s,direct/M8192 7.66s,scatter512/M17 7.58s,
+  scatter512/M8192 7.63s. The separate missing-env setup failure remains
+  retained and explicitly verified by the analysis, not counted as a pass.
+- All32 cases /12,000 samples verify against frozen source/Git/native/actual
+  archive/test hashes and four instruction-identical controls. No sample
+  exclusions, replacement runs or overlapping work. Versus direct/scatter256,
+  26 distributions strictly improve, six overlap, none strictly regress;
+  maximum median reduction16.22%. M7616/random24.877/21.109/24.912us,
+  skew29.566/24.957/29.573. ActualM640 improves3.03-5.35% (6.09/5.89us).
+- Versus atomic PLUS sort, all32 distributions strictly improve19.71-90.55%:
+  M7616/random222.960/21.075/222.955us; actualM64012.95-12.97 to5.89-6.09us.
+  Unstable alignment ALONE still wins30 distributions; no serving TPS claim.
+  Versus original256 stable,25 strictly improve, six overlap, M17/skew strictly
+  regresses9.29%. Do not hide the small-shape result in the full-chunk gain.
+- Select a simple native policy: M17..32 keeps count256/aggregated+scatter256
+  (at most one 256-assignment counting tile); M33..8192 uses direct1024+
+  scatter512. This conservative boundary retains the smaller launch where
+  the distributions overlap and avoids the measured M17 regression. It is
+  not asserted globally fastest; qualify native dispatch/output and timings.
+  Keep other variants in the isolated probe only. Existing M1..16 fused
+  routing remains unchanged. No profile/quant/TC changes or default promotion.
+- Raw stable-align-scatter-timing/summary.json
+  SHA7fe82b37da8cb3c81da2af30cbc424b80ce19f69168e729367a6baecf42c3c66;
+  runtime-control/stable-align-scatter-analysis.json
+  SHAb37638b2b338efa4e01584304d07b89cb292b25c6338569c14d188cdb5248c98.
+  Source-hashed scratch analyze_scatter_align_timing.py verifies every success
+  and the retained setup failure. All scopes exit0; GPUs release.
+- Next: minimal checked native entry, explicit opt-in Marlin wiring, strict
+  old-native SASS comparison, functional/graph/device/redzone/sanitizer gates,
+  native fixed timing, then ONE real-profile three-pass equality diagnostic
+  against c8ba8d56c. Do not start another micro-variant sweep first.

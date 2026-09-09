@@ -60,15 +60,16 @@ Cause unresolved; no replacement sample. These serialized/instrumented rates
 are not production baselines. Stable routing remains opt-in; profile, quant
 and TC defaults are unchanged.
 
-M>16 direct-count prototype is qualified in isolation (3805186a7, probe
-01047ece): 387 functional/memory/sync cases and six bounded races pass.
-All 9,600 samples verify; all 32 shapes beat alignment-plus-sort by 11.87-88.82%.
-M7616 random is now 24.95 us versus 223.06 us; actual M640 improves 51.36-52.22%.
-Unstable alignment alone is about 20.14 us at M7616. Small sizes can still
-prefer the original 256-thread stable counter. No serving integration/TPS claim.
-Stage tracing confirms counting is now 11.10 us (old counter 11.65), while
-stable scatter is 13.47 us. Next test 512-thread scatter with direct counting
-fixed; preserve qualified controls. For the unresolved c16 serving pause, use
+M>16 direct-count/scatter512 prototype is qualified in isolation (2b689556c,
+probe9b1ed132): 520 functional/memory/sync cases and eight bounded races pass.
+One missing-env memcheck launch failed before kernels and is retained separately.
+All12,000 samples verify; scatter512 strictly improves26/32 cases versus
+scatter256, none strictly regress. M7616 random21.08us versus222.96us for
+alignment-plus-sort; actualM6405.89-6.09us versus12.95-12.97us. Unstable
+alignment alone still wins30/32 distributions. No serving integration/TPS claim.
+Next integrate the selected policy: M17..32 original256 stable; M33..8192
+direct1024/scatter512. Keep other variants probe-only and M1..16 unchanged.
+Native and real-profile qualification are owed. For the unresolved c16 pause, use
 existing verbose JIT logging on the next diagnostic: default warning_once
 suppresses repeated same-kernel compiles, so silent logs cannot exclude JIT.
 
