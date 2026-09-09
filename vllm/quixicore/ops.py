@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from slimserve.moe_journal import instrument_moe_sum
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
@@ -146,6 +147,7 @@ class quixicore_ops:
         ]
 
     @staticmethod
+    @instrument_moe_sum
     def moe_sum_add(x: torch.Tensor, shared: torch.Tensor, out: torch.Tensor) -> None:
         """out[t] = shared[t] + sum_k x[t, k] (bf16 in/out, fp32 accumulation):
         the Marlin per-assignment sum, the finalize copy and the shared-expert

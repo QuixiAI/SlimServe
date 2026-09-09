@@ -48,10 +48,14 @@ def instrument_mhc(function):
 
 class ModelJournal:
     def __init__(self, score_journal):
+        from slimserve.moe_journal import enabled as moe_enabled
+
         self.prompt_ids = score_journal.prompt_ids
         self.limit = score_journal.limit
         self.matches = self.operations = self.records = 0
         self.active = self.pending = None
+        self.moe_enabled = moe_enabled()
+        self.moe_capture = None
         self.path = score_journal.path.with_name(f"model-{os.getpid()}.jsonl")
         self.stream = self.path.open("x", buffering=1)
         self.write(
@@ -64,6 +68,8 @@ class ModelJournal:
                 "max_tensor_bytes": 1024**3,
                 "max_tensor_records_per_match": 1024,
                 "expected_operations": 91,
+                "first_moe_snapshots": self.moe_enabled,
+                "max_moe_dump_bytes_per_worker": 2 * 1024**3,
                 "score_journal": str(score_journal.path),
                 "score_header": json.loads(
                     score_journal.path.read_text().splitlines()[0]
@@ -83,7 +89,9 @@ class ModelJournal:
         if not 0 < nbytes <= 1024**3:
             raise ValueError("model trace tensor byte bound exceeded")
         host = tensor.detach().cpu().contiguous()
-        digest = hashlib.sha256(memoryview(host.view(torch.uint8).numpy())).hexdigest()
+        digest = hashlib.sha256(
+            memoryview(host.reshape(-1).view(torch.uint8).numpy())
+        ).hexdigest()
         self.write(
             {
                 "kind": "tensor",
@@ -98,6 +106,7 @@ class ModelJournal:
             }
         )
         self.records += 1
+        return host
 
     def begin(self, request_id):
         if self.active is not None or self.matches >= self.limit:
@@ -155,6 +164,10 @@ class ModelJournal:
         self.operations += 1
 
     def finish(self):
+        if self.moe_enabled and (
+            self.moe_capture is None or self.matches not in self.moe_capture.completed
+        ):
+            raise ValueError("missing first-MoE capture")
         if self.active is None or self.pending is not None or self.operations != 91:
             raise ValueError("incomplete model trace")
         self.write(

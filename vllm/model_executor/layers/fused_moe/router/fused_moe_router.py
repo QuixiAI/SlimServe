@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import torch
 
+from slimserve.moe_journal import instrument_router
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 
@@ -42,6 +43,7 @@ class FusedMoERouter(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
+    @instrument_router
     def select_experts(
         self,
         hidden_states: torch.Tensor,

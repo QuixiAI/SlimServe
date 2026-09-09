@@ -147,6 +147,14 @@ def test_record_bound_checked_before_copy(journal):
         journal.record("bad", torch.empty(1, device="meta"))
 
 
+def test_scalar_snapshot_retains_shape_and_bits(journal):
+    journal.begin("one")
+    tensor = torch.tensor(-0.0)
+    host = journal.record("scalar", tensor)
+    assert host.shape == ()
+    assert torch.signbit(host)
+
+
 @pytest.mark.parametrize("change", ["model", "tp", "pp", "spec", "score_config"])
 def test_install_scope_is_validated(monkeypatch, change):
     monkeypatch.setenv("SLIMSERVE_GLM53_MODEL_JOURNAL", "1")

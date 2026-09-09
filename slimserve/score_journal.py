@@ -66,6 +66,10 @@ class ScoreJournal:
             "vllm/v1/sample/sampler.py",
             "slimserve/model_journal.py",
             "vllm/model_executor/layers/glm5_next_mhc_ops.py",
+            "slimserve/moe_journal.py",
+            "vllm/_custom_ops.py",
+            "vllm/quixicore/ops.py",
+            "vllm/model_executor/layers/fused_moe/router/fused_moe_router.py",
         )
         self._write(
             {

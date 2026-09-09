@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 import vllm.envs as envs
+from slimserve.moe_journal import instrument_marlin_gemm
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.scalar_type import ScalarType
@@ -2653,6 +2654,7 @@ def grouped_topk(
     )
 
 
+@instrument_marlin_gemm
 def moe_wna16_marlin_gemm(
     input: torch.Tensor,
     output: torch.Tensor | None,

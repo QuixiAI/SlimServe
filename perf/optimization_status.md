@@ -23972,3 +23972,45 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   qualitySHAb0ebebabd2f2f6c640f7df7246cbc619608b6782a4797f224143765d9479021b;
   8591c13440606a7f58123cbb2b6a54feeab197f60b767f365e27b8241114c0bc;
   239b1c4f01a2772932e06002f3bcaa0e45b972dc1782c5578096284edfbc1749.
+
+## 2026-09-09: Qualify targeted first-MoE snapshots for a small reproducer
+
+- Status: opt-in observer tested, no arithmetic/native/profile change.
+  SLIMSERVE_GLM53_MOE_JOURNAL=1 requires the model and score journals. Three
+  decorators cover router selection, Marlin GEMM and QuixiCore shared-expert
+  sum; when disabled they return the original function objects, with no added
+  per-call branch. Enabled observers activate only between mHC sites7 and8
+  of the already matched640-token first-window request.
+- Capture normalized input/router logits/topk IDs and weights; each GEMM's
+  input, packed weights/scales/global scale, before/after lock workspace,
+  defined alignment prefixes/padded count/topk weights and output; then routed
+  input/shared input/combined local output of moe_sum_add. Strict640x4096 TP4
+  NVFP4 path dimensions, BM32, two GEMMs, non-atomic/FP32 reduction; reject
+  unexpected nonempty optional GEMM tensors. Record static launch parameters.
+  Do NOT hash unused alignment capacity as if it were defined model data.
+- Up to29 additional tensor snapshots per match:995+29=1024, within the existing
+  per-match bound. Exact CPU tensors saved with file hashes, <=2GiB including
+  serialization per worker, <=8GiB total across four workers. Static packed
+  weights/scales saved once, still fingerprinted every pass; dynamic inputs,
+  outputs and metadata saved for each of the three prescribed matches.
+  No checkpoint mutation, retained GPU weight copies, or diagnostic arithmetic.
+- Validation: full CPU suite396passed/one skip, including scalar hashing,
+  exact serialization/storage compaction, duplicate/path/bound failures,
+  defined-prefix slicing, callback identity and forwarding. GPU qualification
+  uses actual layer3 TP4 rank0 checkpoint/Marlin preparation and synthetic640
+  token inputs/balanced routes. Both untraced repeats and observed outputs are
+  bit-identical for two changed inputs;29 snapshots per match/six static files.
+  Also rerun the90-site fullgraph mHC observer test: both GPU tests pass18.33s.
+  These are observer checks, not a numerical oracle or full-model quality pass.
+- Prescribed ONE run: same150GiB/no-swap four-GPU serialized environment,
+  TC0/BF16-storage1/nativeQC4ce801, glm53-nvfp4-4/rtx6000/TP4/no-spec. Add
+  SLIMSERVE_GLM53_MOE_JOURNAL=1, retain MODEL_JOURNAL1 and SCORE_JOURNAL pointing
+  to runtime-control/mhc-moe-trace-config.json. Same frozen source/cache/CUDA13,
+  unset NCCL_P2P_DISABLE, OMP1; --boots 1 --repeats 3 --cold-prefix --quality
+  --quality-repeats 3. Output mhc-quality-moe-trace-diagnostic/; journals and
+  bounded moe-PID/*.pt repro tensors under trace/. No timing claim, extra starts,
+  profiler/build, source changes or arithmetic change during the run.
+  Verify all stages/files/semantic routing and GPU/API results before selecting
+  the first differing operation for an offline reproducer. TC stays OFF.
+- Raw tests: runtime-control/mhc-moe-journal-{cpu,gpu}-tests.xml. Native library
+  unchanged; test snapshots are synthetic-input fixtures, not serving captures.
