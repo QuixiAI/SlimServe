@@ -22296,3 +22296,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   mhc-storage-all-rank-gaps.json}; original trace paths and SHA256 are in each
   result. First-pair rank0 c1/c8 summaries also live in each boot's
   decode-graph-analysis.json. GPU ownership never overlapped.
+
+## 2026-09-08: Graph-node profiling is a live confound, not a transparent observer
+
+- Status: diagnostic hypothesis; no serving change or performance fix yet.
+- Concrete observation: BF16 storage boot2's c8 trace, rank0, graph11 has
+  eight 1185-kernel replays. First correlation446903 has span11111.354 us,
+  108.400 us without visible activity, median same-stream gap0.09668 us and
+  summed all-reduce1256.019 us. The next seven have 427.385-431.760 us of
+  uncovered time, median same-stream gaps0.446-0.447 us and AR925-939 us.
+  This is a within-trace transition of one executable graph, not a new capture.
+  Structural capture variation alone cannot explain that transition.
+- Prior entry's mixed-rank waiting remains a valid observation OF THE TRACE.
+  It is not yet proof that those per-rank spacing states persist with the
+  profiler absent. Historical unprofiled rec1/rec4 complete-request timings
+  (156.809/165.697 tok/s in each pass2 c1 log) are real retained observations,
+  but attributing their difference to the node trace requires an observer control.
+- NVIDIA's Nsight Systems User Guide says whole-graph tracing has much lower
+  overhead than node tracing and warns node tracing may add substantial runtime
+  overhead: https://docs.nvidia.com/nsight-systems/UserGuide/#cuda-graph-trace
+  NVIDIA's CUPTI forum also describes breaking graph chaining for node profiling:
+  https://forums.developer.nvidia.com/t/cupti-tracing-cuda-graph-problems/340683
+  That answer discusses Range Profiling APIs; it is mechanism precedent, not
+  proof of the exact Kineto Activity-API path used by this PyTorch build.
+- Next prescribed isolation: benchmark_graph_profiler_bias.py, one process,
+  1200-node linear and 1200-per-branch fork/join graphs, three fixed A/B/A
+  rounds, 32 replays per phase. CUDA events bracket each entire replay batch;
+  measure before/during/after Torch node tracing on the unchanged graph.
+  Retain all timings and changed-input exact checks. No per-replay sync.
+  This toy test cannot establish full TP4-model behavior even if positive;
+  whole-graph or unprofiled event measurement of the real model is still owed.
+- Keep this diagnostic under benchmarks/kernels, not in the serving path.
+  The uncommitted graph-retention/instantiation-hook draft was removed before
+  integration; no unused production hooks or changed graph lifetime remain.
+- The active mHC FP32/BF16/FP32 sequence stays frozen. Its decode timing runs
+  precede profiler activation. Cold-prefill timings are unprofiled but follow
+  the decode trace phase equally in every arm; profiler persistence, if found,
+  must be disclosed before interpreting absolute timing as a clean-server state.
+- Raw observation: mhc-storage-serving/boot-2/decode-graph-analysis.json and
+  traces/dp0_pp0_tp0_dcp0_ep0_rank0.1788922685736373365.pt.trace.json under
+  perf/results/2026-09-08/. Isolation probe output is reserved at
+  perf/results/2026-09-08/runtime-control/graph-profiler-bias/.

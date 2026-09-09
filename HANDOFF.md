@@ -60,6 +60,14 @@ rank0's long collective duration alone as proof of a separately slow all-reduce
 kernel. The fast/slow per-rank graph cause remains open. All eight replays/rank,
 including first-replay skew, are retained in runtime-control/mhc-storage-all-rank-gaps.json.
 
+Important profiling caveat: BF16 boot2's c8 trace changes from 108 us of gaps
+in its first replay to 427-432 us in the next seven, on the SAME 1185-kernel
+graph. Node tracing can perturb CUDA graph execution. Mixed-rank waiting is
+visible in these traces, but its persistence without profiling is not yet
+established. Test profiler on/off and whole-graph timing before changing graph
+topology, stream attributes or the driver. Timed decode precedes profiling;
+do not discard its measurements or equate a traced gap with recoverable TPS.
+
 The digest-pinned R28.1 reference image is downloaded; its source lock and
 four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
 matches the cached model. The actual serving launcher/custom all-reduce and
