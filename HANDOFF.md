@@ -81,10 +81,16 @@ the 136 binary is preserved as runtime-control/fp8-setup-native-before.so.
 Both call orders with both old/new probe modules pass the actual-weight
 oracle; 145 GPU tests (including device switches and mHC) and 251 CPU tests
 pass, one GPU-only CPU-suite skip. The failed sweep retains all24 completed
-M1/M8 configurations, none faster than the current geometry, and the failed
-M16 baseline. It is NOT full sweep qualification. The corrected 12-config,
-three-layer/three-batch, five-round cold A/B/A sweep is next, followed by
-contention tests for any promising configuration. No FP8 geometry promoted.
+M1/M8 configurations and the failed M16 baseline. The corrected 12-config,
+three-layer/three-batch, five-round cold A/B/A sweep passes all216 cases and
+18 installed baseline checks. Current settings win every group except down
+at M1: NT16/warps8/stages4 saves just0.05-0.09us (1.8-3.1%) per isolated call.
+That candidate still needs routed-expert contention testing; no FP8 geometry
+promoted. Raw fp8-launch-local-sweep/summary.json, source3c052d6af.
+The model-free graph-creation-order return control also completes: all18
+oracle phases pass; collected spans are4/4,4/0,4/4 for build-between,
+prebuild-both, build-between. Each range has four runtime launches. Use one
+range per serving process; whole-model observer requalification remains owed.
 
 The spill-free pooled-indexer tile is retained in the RTX6000 profile:
 `VLLM_GLM5_INDEXER_SM120_TILES=1` selects RT2/PT128/four warps. Three fixed

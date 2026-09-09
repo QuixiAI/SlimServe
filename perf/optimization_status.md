@@ -23157,3 +23157,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   fp8-setup-{native,probe}-before.so, decode-local-device-symbols.txt,
   fp8-fixed-fp8-launch{,-local}-build-{probe-first,native-first}.log,
   decode-setup-gpu-tests.{xml,log}, decode-setup-cpu-tests.xml.
+
+## 2026-09-08: Corrected actual-weight cold FP8 geometry sweep completes
+
+- Status: screen complete; current geometry retained, one narrow follow-up.
+  Source3c052d6af, QC5d4d3790e9aeb6cb, probee5fd08e3b431f2ea, clean tree.
+  Actual rank0 layer3/23/44 shared gate/up1024x4096 and down4096x512;
+  BF16 activations, FP8 checkpoint weights/scales unchanged. Twelve configs
+  NT8/16/32 x warps4/8 x stages4/8, batches1/8/16, five A/B/A rounds,
+  16 replays and three warmups/phase. Weight rotations97/193 allocate
+  388/386MiB, exceeding3x128MiB L2, for both baseline and candidate graphs.
+- Correctness: all18 installed baselines, all216 candidates and all3240
+  changed-input graph timing phases pass. Maximum FP64-oracle NRMS.001744057,
+  row-peak.003786202, below fixed.004/2^-7 gates. Initial graph/eager equality
+  also passes. Exit0; no competing GPU work/build, host16GiB/no swap.
+- Results: original geometry wins gate/up at all three batches, and down
+  at M8/M16. The identical-config cross-module controls are approximately
+  neutral (individual medians -0.100% to +0.152%). Alternative gate/up tiles
+  are slower even at M16, where the earlier shared-flag bug masked baseline
+  correctness. Do not infer a new launch config from the earlier failed run.
+- Sole follow-up: down M1 NT16/warps8/stages4 versus current NT32/8/4.
+  Layer3/23/44 candidate medians2.680/2.692/2.719us, baseline about2.766us;
+  paired gains3.124/2.782/1.771%. Saving0.05-0.09us at42 sites is only about
+  2-4us before overlap. It needs an actual routed-expert contention check;
+  no serving dispatch change is justified by these isolated numbers alone.
+- Decision: preserve current production geometry; qualify paired mHC in the
+  already prescribed1/3/1 same-binary serving series next. The tiny FP8 down
+  candidate is a bounded contention follow-up, not the primary optimization.
+- Raw: fp8-launch-local-sweep/summary.json; runtime-control/
+  fp8-launch-local-{sweep.log,summary.txt}. All slow samples retained.
+
+### Graph creation-order before/between/return control closes the small repro
+
+- Fixed three fresh processes: build each graph just before its own range,
+  prebuild both before either range, then return to the first lifecycle.
+  Same32 nodes/four replays/one A/B/A round per topology; Nsight2025.6.3,
+  CUDA graph:host-only, runtimeAPI capture, no event tracing or CPU sampling.
+  Source3c052d6af, CUDA13, GPU0 exclusively, host8GiB/no swap.
+- All18 numerical phases pass. Every one of six ranges records four
+  cudaGraphLaunch calls. Graph spans by process/range are4/4,4/0,4/4:
+  only the precreated second graph loses activities. Its trace has no graph
+  table or ordinary kernels. This confirms the creation-order association
+  with collection loss, not a kernel execution failure or TP4 overhead rate.
+- Decision: keep serving graphs unchanged; one capture range per model
+  process for the next observer qualification. The prescribed whole-model
+  control remains owed. No profiling in the paired mHC performance series.
+- Raw: runtime-control/nsys-graph-order-{between-before,prebuilt,between-return}
+  -results/summary.json, corresponding.{1,2}.{nsys-rep,sqlite},
+  nsys-graph-order-{aba.log,export.log,analysis.json}. All processes exit0.
