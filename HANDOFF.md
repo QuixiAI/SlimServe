@@ -105,6 +105,13 @@ PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
 the installed Torch binary is unchanged and numerical corruption is unproven.
 
+Routing capture is now validated (8c7f8fc23): 1890 actual decode steps,
+no invalid records, all canaries/counts pass. Mean unique experts/layer are
+8 / 52.85 / 89.38 at batch 1/8/16, not the old estimated 8/57/103. Raw:
+perf/results/2026-09-08/routing-census/. Its synchronous scheduling and copies
+make timing diagnostic-only. Unique weight footprint is not DRAM traffic;
+MTP verifier reuse still needs its own capture.
+
 Current candidate priorities (hypotheses, not physical ceilings):
 
 1. MoE routing and traffic: capture the actual experts used together in each

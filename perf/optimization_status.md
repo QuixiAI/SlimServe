@@ -21340,3 +21340,41 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   DRAM traffic or an effective-bandwidth/physical-ceiling measurement.
 - Raw destination: perf/results/2026-09-08/routing-census/; profile source and
   binary stay fixed while it runs. No serving speedup is claimed.
+
+## 2026-09-08: Actual-step routing census passes and replaces reuse estimates
+
+- Status: retained diagnostic evidence, not a performance baseline.
+- Configuration: commit 8c7f8fc23, unchanged recipe/native binary, one fixed
+  start and one repeat at c1/c8/c16, full warmups and recommended sampling.
+  Capture explicitly disables async scheduling (confirmed in live config),
+  adds per-layer writes and D2H copies, and uses the existing 4.56 GB virtual
+  CPU slot buffer. Only new unbuilt/unimported mHC probe files were dirty.
+- Correctness: real profile reaches health; text/image canaries and all
+  25 measured 1000/300 requests pass. Journal contains 1890 valid decode
+  steps and 14 explicit prefill/mixed skips, no invalid or limit records.
+  Counts by actual batch: 1=694, 7=4, 8=596, 15=2, 16=594. Warmup, canary,
+  measured and finishing partial batches remain in the raw evidence.
+- Routing: mean unique experts per MoE layer: batch 1=8, batch 8=52.8519,
+  batch 16=89.3845. Batch-8 layer observations span 36-63 unique experts;
+  batch-16 span 58-122. Max tokens hitting one expert: 8 and 14 respectively.
+  The total unique-expert ratio batch16/batch8 is 1.6912, not the old estimate
+  103/57. These are separately scheduled requests, not speculative verifier
+  rows; do not transfer this ratio to MTP without its own capture.
+- Footprint accounting: all 42 target MoE layers use NVFP4; FP8 expert layer
+  45 is the separate MTP head. Per expert/layer/rank: packed gate/up/down
+  plus one-byte group scales = 3 * 4096 * 512 * (1/2 + 1/16) = 3538944 bytes,
+  excluding small global scales/metadata. Mean unique weight footprints are
+  1.189 / 7.856 / 13.286 GB per step/rank. These are NOT measured DRAM bytes;
+  caches, split-K rereads, work tiles and shared paths still require counters.
+- Marlin M8 padded-route utilization (useful rows / padded rows) averages
+  12.5% / 15.15% / 17.90%. This is not measured tensor-core utilization and
+  does not by itself prove an optimization opportunity is compute-bound.
+- Diagnostic E2E timings 120.09 / 488.45 / 670.65 tok/s are recorded solely
+  to expose capture overhead; never compare them as production performance.
+- Decision: replace estimated routing ceilings with these observations and
+  obtain DRAM/L2 evidence before selecting a new persistent expert schedule.
+  The separate mHC output-parallel probe is next, with installed-baseline
+  equivalence checked before candidate correctness or timing.
+- Raw: perf/results/2026-09-08/routing-census/summary.json,
+  boot-1/routing/routing-623340.jsonl and routing-summary.json; all requests,
+  startup/JIT logs and both canary responses are retained.
