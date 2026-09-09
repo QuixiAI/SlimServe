@@ -25329,3 +25329,22 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Compare atomic alone and atomic plus sort separately; all samples retained,
   outputs verified before/after. Freeze sources/binary throughout each run.
   Correctness is functional only so far; sanitizer/timing outcomes PENDING.
+
+### M>16 candidate safety gate complete; fixed timing next
+
+- Same probe 87a3736e / test 406290b7, no kernel changes. All 128 tests pass
+  memcheck in 19.29s and synccheck in 14.78s, both zero reported errors.
+  Filters cover the new glm_stable_align kernels, not the generic baseline.
+  Bounded racecheck covers the first two matching launches (count/prefix and
+  bitmap scatter) at M17 and M8192: 7.07s / 7.54s, zero hazards/errors/warnings.
+  The rest of each functional test still runs but is outside that race window;
+  this is not exhaustive race qualification for every input phase.
+- Raw runtime-control/stable-align-{memcheck,synccheck,racecheck-m17,
+  racecheck-m8192}.{log,xml}, stable-align-probe-resources.log. Legacy JUnit
+  receipts preserve properties without xunit2 warnings; 14 unrelated Torch
+  deprecation warnings remain. No failed test/sample discarded.
+- Timing harness import corrected to the installed _moe_C_stable_libtorch
+  module before the first timing attempt. Module/help import smoke passes.
+  Fixed 32-case / 4,800-sample warm graph A/B/A is next, source frozen and
+  GPU0 exclusively owned in a 16GiB/no-swap scope. Public installed alignment
+  is the control; the candidate remains an isolated probe, not serving code.

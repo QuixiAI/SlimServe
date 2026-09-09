@@ -97,7 +97,7 @@ def main():
     assert torch.cuda.get_device_capability() == (12, 0)
     probe = build()
     import vllm._C_stable_libtorch as core
-    import vllm._moe_C as moe
+    import vllm._moe_C_stable_libtorch as moe
 
     sources = [
         Path(__file__),
