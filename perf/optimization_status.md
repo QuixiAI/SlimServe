@@ -21456,3 +21456,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   observations per batch. Retain all counters and raw case identity, not just
   the best bandwidth. Raw: perf/results/2026-09-08/marlin-counters/preflight.json;
   forthcoming cold-cache counter files in the same directory.
+
+## 2026-09-08: Actual-weight Marlin DRAM counters bound the next experiment
+
+- Status: completed isolated diagnostic, not a serving throughput result.
+- Configuration: commit 00052fba9, unchanged serving binary/recipe; layers
+  3/23/44, batches 1/8/16, three predetermined journal observations per batch.
+  All 27 cases and 54 Marlin launches retained. Activations/router weights are
+  synthetic; the selected first/middle/last routing records include warmups
+  and are not a workload-weighted sample. All eager/graph comparisons are exact.
+- Counters: scoped privileged Nsight Compute, clock-control none, dynamic
+  pipeline boost, cache-control all. The first report used obsolete DRAM
+  metric names; its missing counters are NOT zero. The successful rerun uses
+  dram__bytes_op_read.sum and dram__bytes_op_write.sum. Both reports retained.
+  The checked analyzer rejects missing metrics, unexpected units or launches.
+- Median DRAM-read / unique packed-weight-plus-group-scale footprint is
+  1.004/1.008 at batch1, 1.001/1.002 at batch8, 1.001/1.002 at batch16
+  (gate-up/down). There is no large repeated-DRAM-weight-read penalty in these
+  isolated cases. L2 read-sector / unique-byte ratios are 1.138/1.229,
+  1.055/1.072 and 1.051/1.056; those include non-weight reads and scratch.
+- Profiled gate-up/down medians: batch1 18.656/12.736 us and 1021/747 GB/s;
+  batch8 84.480/45.568 us and 1495/1392 GB/s; batch16 143.200/76.992 us
+  and 1559/1486 GB/s. Nine measurements per group, with every range in JSON.
+  Profiler duration is not ordinary graph timing. Cold-cache, single-GPU
+  isolation omits serving overlap and cannot establish a whole-model ceiling.
+- Decision: investigate batch-1 launch geometry/split-K overhead first using
+  the existing explicit Marlin tile/grid controls. Require ordinary A/B/A
+  timing and correctness before changing serving. Concurrent decode needs a
+  different measured benefit, not an assumption that weights are reread often.
+- Validation: seven counter/selection tests pass, including unit conversion,
+  missing-metric rejection and exact launch pairing. No native changes.
+- Raw: perf/results/2026-09-08/marlin-counters/cold-v2.ncu-rep,
+  cold-v2-cases.json, cold-v2-raw.csv and cold-v2-summary.json; the initial
+  incomplete-metric report and available-metrics.txt remain alongside them.

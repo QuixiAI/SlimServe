@@ -99,8 +99,8 @@ the true code first at 1K/8K/32K context. This measures prefill quality, not
 teacher-forced decode or broad capability. Raw: quality-baseline/ under the
 same dated results directory. The serving binary/recipe were unchanged.
 
-Immediate work: actual-step routing capture and isolated mHC A/B tests,
-while continuing the graph-latency investigation. The
+Immediate work: isolated Marlin launch-geometry tests and explicit cold-prefill
+measurement, while continuing the graph-latency investigation. The
 PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
 the installed Torch binary is unchanged and numerical corruption is unproven.
@@ -112,15 +112,28 @@ perf/results/2026-09-08/routing-census/. Its synchronous scheduling and copies
 make timing diagnostic-only. Unique weight footprint is not DRAM traffic;
 MTP verifier reuse still needs its own capture.
 
+Marlin counters are complete (00052fba9 probe): 27 actual-weight/routing cases,
+54 launches, exact eager/graph output. Median cold DRAM bytes are within about
+0.1-0.8% of unique packed expert weights plus group scales. Batch8/16 stream
+much faster than batch1; prioritize a measured batch1 scheduling experiment.
+These isolated profiled times omit serving overlap and are not a physical
+ceiling. Raw: marlin-counters/cold-v2-summary.json in the dated results folder.
+
+The output-parallel mHC experiment is rejected (25aa8ba35). Both versions pass
+local parity but lose A/B/A timing across all 90 actual checkpoint parameter
+sets at batches 1/2/4/8. The probe is quarantined under benchmarks/kernels;
+no alternate serving path was added. Producer/consumer scheduling remains a
+separate untested hypothesis.
+
 Current candidate priorities (hypotheses, not physical ceilings):
 
-1. MoE routing and traffic: capture the actual experts used together in each
-   scheduler step, then measure DRAM traffic. The current rank-0 c8 trace has
+1. MoE launch geometry: routing and cold-cache traffic are now measured;
+   test existing Marlin tile/grid controls on actual weights. The rank-0 c8 trace has
    about 5.26 ms of Marlin and 4.10 ms of FP8 projection durations with overlap;
    summing those durations overstates their contribution to the step. Inspect
    the prior rejected expert prototype before changing its scheduling/layout.
-2. mHC arithmetic and producer/consumer scheduling: an output-parallel warp
-   layout could cut repeated reduction work while preserving FP32 parameters.
+2. mHC producer/consumer scheduling: the output-parallel arithmetic layout
+   lost measured timing and must not be integrated.
    The last-block synchronization experiment was neutral. The old phase probe
    used a three-iteration test fixture with fused RMS norm; GLM uses 20 Sinkhorn
    iterations and separate norms. Re-measure the actual path. B12X's dependent-
