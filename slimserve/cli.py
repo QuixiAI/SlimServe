@@ -85,6 +85,11 @@ def _parser() -> argparse.ArgumentParser:
         "--route-profile-dir",
         help="diagnostic-only GLM53 routing capture; changes scheduling and timings",
     )
+    parser.add_argument(
+        "--request-metrics",
+        action="store_true",
+        help="include engine request timings and cached prompt-token counts",
+    )
     return parser
 
 
@@ -110,6 +115,10 @@ def _help() -> None:
         ("--engine-log FILE", "Keep the engine's own log instead of discarding it."),
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
+        (
+            "--request-metrics",
+            "Include request timings and cached prompt-token counts.",
+        ),
         ("--list", "List every profile, including ones this machine cannot run."),
     ):
         print(f"  {term.paint(flag, term.CYAN, out):<38} {description}")
@@ -409,6 +418,16 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as error:
             term.fail(str(error))
             return 2
+
+    if args.request_metrics:
+        plan = replace(
+            plan,
+            engine={
+                **plan.engine,
+                "enable_prompt_tokens_details": True,
+                "enable_per_request_metrics": True,
+            },
+        )
 
     if args.dry_run:
         _show(plan)

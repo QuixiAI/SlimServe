@@ -21581,3 +21581,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/marlin-schedule/oracle-all-ranks.json (early
   failure), oracle-gate-census.json (all 36, failed_gates), and its named
   rank0-layer23-replay2.pt intermediate/input/reference tensor artifact.
+
+## 2026-09-08: Add explicit cold-prefill measurements and cache evidence
+
+- Status: 132 SlimServe tests pass; real-profile measurements pending.
+- Add opt-in --request-metrics to the real SlimServe launcher, using existing
+  engine per-request timings and prompt-token usage details. Defaults and
+  numerical settings are unchanged. Campaign --prefill records this actual
+  plan and runs the new workload after normal timings, traces and quality.
+- Workload: exact source-token prefixes of 32768/131072, recommended sampling,
+  eight output tokens, one cold warmup and three measured requests per context.
+  Every request uses the same prompt IDs but a distinct random cache salt;
+  cached_tokens must explicitly equal integer zero. Missing evidence fails.
+- Record client TTFT, engine scheduled-to-first-token time and queue time
+  separately. Input/TTFT rates are labeled effective rates, not pure GPU
+  prefill throughput. Retain every streaming event, exact request/response,
+  warmup and failure; no restart/pass-number selection.
+- Validation: eight dedicated tests cover zero-cache proof, rejected missing
+  or nonzero counts, truncated streams, warmup exclusion, unique salts, exact
+  IDs and actual CLI plan fields. The source has 427489 tokens and fits both
+  contexts. New benchmark code has not yet established a live baseline.
+- Next command: the normal campaign harness with --prefill and a new result
+  directory, after the Marlin race investigation frees the GPUs.

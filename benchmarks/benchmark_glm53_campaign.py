@@ -236,6 +236,11 @@ def main():
         action="store_true",
         help="score exact continuations and needle contrasts after timed work",
     )
+    ap.add_argument(
+        "--prefill",
+        action="store_true",
+        help="record cold-cache 32K/128K exact-ID TTFT after other workloads",
+    )
     args = ap.parse_args()
     if min(args.boots, args.repeats, *args.concurrency) < 1 or args.output_tokens < 2:
         ap.error("boots, repeats and concurrency must be positive; output tokens >= 2")
@@ -244,6 +249,15 @@ def main():
     if args.profile not in compatible:
         ap.error(f"profile not compatible; available: {compatible}")
     plan = registry.resolve(args.profile, machine.platform, machine.count, None)
+    if args.prefill:
+        plan = dataclasses.replace(
+            plan,
+            engine={
+                **plan.engine,
+                "enable_prompt_tokens_details": True,
+                "enable_per_request_metrics": True,
+            },
+        )
     if args.routing:
         from slimserve.routing_journal import diagnostic_plan
 
@@ -305,6 +319,8 @@ def main():
             argv += ["--torch-profile-dir", str(folder / "traces")]
         if args.routing:
             argv += ["--route-profile-dir", str(folder / "routing")]
+        if args.prefill:
+            argv += ["--request-metrics"]
         run = {"boot": boot, "argv": argv, "status": "starting", "measurements": []}
         if args.routing:
             run["diagnostic_plan"] = dataclasses.asdict(
@@ -425,6 +441,26 @@ def main():
                     run["quality"] = quality["summary"]
                     if not quality["summary"]["all_needles_rank_first"]:
                         raise ValueError("needle contrast gate failed")
+                if args.prefill:
+                    from benchmark_glm53_prefill import run as run_prefill
+
+                    prefill_path = folder / "prefill"
+                    run["prefill_path"] = str(prefill_path)
+                    prefill = run_prefill(
+                        argparse.Namespace(
+                            url=base,
+                            model=model,
+                            tokenizer=str(plan.model_dir),
+                            source=args.source,
+                            output=prefill_path,
+                            contexts=[32768, 131072],
+                            repeats=3,
+                            warmups=1,
+                            output_tokens=8,
+                        ),
+                        tokenizer,
+                    )
+                    run["prefill"] = prefill["aggregates"]
                 run["status"] = "complete"
             except Exception as error:
                 run["status"] = "failed"
