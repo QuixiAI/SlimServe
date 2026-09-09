@@ -23892,3 +23892,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   qualitySHA7430b7a9f78cf53ebec9e74e88b74c15d288f4b35b443f296392f8a4f9e45e3d;
   7f5def4d35e7ca46cadde8ec45d04cb7f606a89ab9f4bd5ba4cd214021c2a6c4;
   ad80be53f3cefe7a93dce94b28a31b1b3a8082f28faba1aeb263c95160ebd5e9.
+
+## 2026-09-09: Qualify bounded compiled model-boundary instrumentation
+
+- Status: diagnostic implementation tested, no model/native/profile arithmetic
+  change. SLIMSERVE_GLM53_MODEL_JOURNAL=1 requires the existing bounded score
+  configuration and GLM53 H4096/45 layers/TP4/PP1/no-spec. Disabled registration
+  returns original op callables and does not wrap the runner's forward method.
+- Enabled registration decorates the existing compile-opaque mHC operations,
+  leaving their signatures, fake implementations, native calls and outputs
+  unchanged. Only an exact single uncached640-token scoring request activates
+  tracing. Snapshot input IDs/embeddings/positions, inputs and outputs of the
+  first pre/89 fused sites/final post, immediate model return and its first639
+  rows. Record every tensor's logical-byte SHA, dtype/shape/stride/device and
+  scalar settings. No persistent tensor dumps. Exactly91 ordered operations,
+  <=1024 tensor records per match, <=1GiB per tensor, <=3 matches per worker;
+  capture/chunking/mixed requests/extra matches fail. Match IDs link model and
+  score journals. This deliberately synchronizes and is diagnostic-only.
+- Validation:14 new CPU tests; full SlimServe suite380passed/one skip. SM120
+  fullgraph/Inductor synthetic90-site+post test confirms all182 observed op
+  calls execute callbacks and output bits equal the untraced compiled path
+  for two changed inputs,996 tensor records per match, no context leak. This
+  is instrumentation qualification, not model quality or performance proof.
+  Initial synthetic fixture used zero sigmoid biases, causing exponential
+  residual growth/overflow without real sublayer normalization; failed XML is
+  retained. Set synthetic pre/post biases to-8 so the fixture remains finite;
+  corrected test passes9.74s. Neither fixture changes model parameters.
+- Prescribed ONE next profile start: same TC0/BF16-storage1, nativeQC4ce801,
+  CUDA_LAUNCH_BLOCKING=1, registered glm53-nvfp4-4/rtx6000/no-spec/TP4. Add
+  SLIMSERVE_GLM53_MODEL_JOURNAL=1 and SLIMSERVE_GLM53_SCORE_JOURNAL pointing
+  to runtime-control/mhc-model-trace-config.json. Existing150GiB/no-swap scope,
+  unset NCCL_P2P_DISABLE, four GPUs, CUDA13.0, OMP1, same fixed source/cache.
+  Controller --boots 1 --repeats 3 --cold-prefix --quality --quality-repeats 3;
+  output perf/results/2026-09-09/mhc-quality-model-trace-diagnostic/; eight
+  model/score worker journals under trace/. Keep compilation and arithmetic,
+  all full workloads, no profiler/retries/builds/source changes during the run.
+  Validate exact inputs, every operation and GPU/API scores. Only use a first
+  differing interval if score variation also reproduces under the trace.
+- Raw tests: runtime-control/mhc-model-journal-cpu-tests.xml,
+  mhc-model-journal-gpu-tests.xml (initial fixture FAILED),
+  mhc-model-journal-gpu-fixed-fixture-tests.xml (PASS). TC remains OFF; no quality
+  gate change, no candidate promotion and no throughput claim from these runs.

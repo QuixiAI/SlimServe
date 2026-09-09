@@ -1010,6 +1010,10 @@ class GPUModelRunner(
             )
         self.layerwise_nvtx_hooks_registered = False
 
+        from slimserve.model_journal import install_model_journal
+
+        install_model_journal(self)
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         if self.speculative_config:

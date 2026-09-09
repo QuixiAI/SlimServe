@@ -14,6 +14,7 @@ kernels; accumulation and reduction precision do not change.
 
 import torch
 
+from slimserve.model_journal import instrument_mhc
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _HC = 4
@@ -54,7 +55,9 @@ def validate_glm53_mhc_prefill_tc(config, bf16_fn: bool) -> None:
         "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
     }
     if any(getattr(config, key, None) != value for key, value in expected.items()):
-        raise ValueError("mHC tensor-core prefill requires the qualified GLM53 settings")
+        raise ValueError(
+            "mHC tensor-core prefill requires the qualified GLM53 settings"
+        )
     if torch.cuda.get_device_capability() != (12, 0):
         raise ValueError("mHC tensor-core prefill is qualified only on SM120")
     native = _qc()
@@ -154,14 +157,14 @@ def _glm5_mhc_post_fake(x, residual, post_mix, comb_mix):
 
 
 direct_register_custom_op(
-    op_name="glm5_mhc_pre", op_func=glm5_mhc_pre, mutates_args=[],
+    op_name="glm5_mhc_pre", op_func=instrument_mhc(glm5_mhc_pre), mutates_args=[],
     fake_impl=_glm5_mhc_pre_fake,
 )
 direct_register_custom_op(
-    op_name="glm5_mhc_fused_post_pre", op_func=glm5_mhc_fused_post_pre,
+    op_name="glm5_mhc_fused_post_pre", op_func=instrument_mhc(glm5_mhc_fused_post_pre),
     mutates_args=[], fake_impl=_glm5_mhc_fused_post_pre_fake,
 )
 direct_register_custom_op(
-    op_name="glm5_mhc_post", op_func=glm5_mhc_post, mutates_args=[],
+    op_name="glm5_mhc_post", op_func=instrument_mhc(glm5_mhc_post), mutates_args=[],
     fake_impl=_glm5_mhc_post_fake,
 )

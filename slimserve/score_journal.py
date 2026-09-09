@@ -64,6 +64,8 @@ class ScoreJournal:
             "vllm/v1/worker/gpu_model_runner.py",
             "vllm/model_executor/models/glm5_next.py",
             "vllm/v1/sample/sampler.py",
+            "slimserve/model_journal.py",
+            "vllm/model_executor/layers/glm5_next_mhc_ops.py",
         )
         self._write(
             {
