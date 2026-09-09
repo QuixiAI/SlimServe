@@ -188,9 +188,9 @@ def gpu_snapshot():
 
 def runtime_identity():
     # Editable git identity alone does not identify rebuilt native extensions.
-    native = sorted(
-        set(Path("vllm").glob("_C*.so")) | set(Path("vllm").glob("_quixicore*.so"))
-    )
+    # Include MoE, allocator and other root-level native extensions as well:
+    # _C*.so alone does not identify the Marlin kernels in _moe_C*.so.
+    native = sorted(Path("vllm").glob("*.so"))
     hashes = {}
     for path in native:
         with path.open("rb") as stream:

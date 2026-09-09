@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import hashlib
 import importlib.util
 import io
 import json
@@ -49,3 +50,22 @@ def test_truncated_stream_is_a_failure_not_a_fast_result(monkeypatch):
     )
     with pytest.raises(ValueError, match="incomplete stream"):
         bench.request("http://localhost", "test", "prompt", 3, 42)
+
+
+def test_native_receipt_includes_moe_and_allocator(monkeypatch, tmp_path):
+    bench = _load(monkeypatch)
+    directory = tmp_path / "vllm"
+    directory.mkdir()
+    names = [
+        "_C_stable_libtorch.abi3.so",
+        "_moe_C_stable_libtorch.abi3.so",
+        "cumem_allocator.abi3.so",
+    ]
+    for name in names:
+        (directory / name).write_bytes(name.encode())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bench, "gpu_snapshot", lambda: "test GPU")
+    receipt = bench.runtime_identity()
+    assert receipt["native_sha256"] == {
+        f"vllm/{name}": hashlib.sha256(name.encode()).hexdigest() for name in names
+    }

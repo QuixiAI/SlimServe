@@ -21603,3 +21603,39 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   contexts. New benchmark code has not yet established a live baseline.
 - Next command: the normal campaign harness with --prefill and a new result
   directory, after the Marlin race investigation frees the GPUs.
+
+## 2026-09-08: Isolate a pre-existing Marlin shared-memory phase hazard
+
+- Status: reproduced on the installed production path; isolated repair tests
+  in progress. Scheduling candidate remains unqualified and unintegrated.
+- Memcheck: full rank0/layer3 three changed-input replays pass with zero errors.
+  Unfiltered racecheck instrumented checkpoint preparation and grew to 166092
+  MiB RSS; earlyoom sent SIGTERM. That incomplete zero-hazard report is NOT
+  a pass. Preserve it. All subsequent sanitizer/build jobs have explicit
+  80 GiB host limits; filter the relevant kernels and use four racecheck workers.
+- Bounded racecheck: combined auto/candidate fixture completes with 20 error
+  reports, about 10 GiB peak host use. The production-only counter probe, with
+  no scheduling override, independently completes with 15 error reports.
+  All numerical comparisons still pass; no observed corruption is claimed.
+- Reproducer: compile two actual NVFP4/BF16 M8 templates from this repo's
+  header with CUDA13.0, explicit sm_120f and line information. Six changed-input
+  composed calls are bit-exact against the installed matching configurations.
+  PyTorch's arch-list parser rejects 12.0f; pass the exact compiler target,
+  as the serving build does, rather than using the default CUDA13.2 toolkit.
+- Attribution: original probe racecheck locates reads in fetch_to_registers
+  (weight tile) against writes in thread_block_reduce (first shared reduction
+  store). sh_b and sh_red alias the same allocation; the transition lacks a
+  block-wide barrier before reusing it. Test compute-entry and output-entry
+  barriers separately in isolated copies before changing the serving header.
+- Provenance cleanup: campaign receipts now hash every root-level native .so,
+  including _moe_C_stable_libtorch. Older receipts omitted that extension;
+  do not imply they pinned its bytes. Current original MoE binary is retained
+  as marlin-schedule/moe-before.so, SHA256
+  a13fcffdecf2993974f0d7e6ec598556909e7122ac4af6f3238e12fb392c1072.
+  Original header SHA256
+  3c2779547e940304cbc4d4584504e00767da0d3ffcdec4e2cc1a3a13aa52f8c8.
+- Validation: all 134 SlimServe tests pass, including strict source-transform
+  scope and inclusion of the MoE/allocator libraries in native receipts.
+- Raw: perf/results/2026-09-08/marlin-schedule/memcheck*, racecheck*,
+  shared-original.json and shared-original-race.*. Generated source/binaries
+  remain in the isolated build directory; installed native libraries unchanged.

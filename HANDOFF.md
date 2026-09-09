@@ -29,6 +29,14 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
+Current priority: a bounded racecheck now reproduces a shared-memory hazard
+in the installed Marlin production configuration, not only a tuning candidate.
+The line-numbered isolated copy matches installed output exactly and identifies
+weight-tile reads overlapping reuse of the same storage for block reduction.
+Test the missing phase barrier before promoting any scheduling change or new
+baseline. No numerical corruption has been established; the sanitizer finding
+still blocks stronger correctness claims. See the latest notebook entry.
+
 Goal: exceed the strongest reproducible B12X result on this hardware under
 matched workloads and the model's recommended sampling. The historical R24
 figures (169.9 / 737.8 no-spec, 247.8 / 903.2 MTP-3 at c1/c8) are sustained
@@ -99,8 +107,8 @@ the true code first at 1K/8K/32K context. This measures prefill quality, not
 teacher-forced decode or broad capability. Raw: quality-baseline/ under the
 same dated results directory. The serving binary/recipe were unchanged.
 
-Immediate work: isolated Marlin launch-geometry tests and explicit cold-prefill
-measurement, while continuing the graph-latency investigation. The
+Immediate work: isolate and repair the Marlin shared-memory phase hazard, then
+resume scheduling and explicit cold-prefill measurement. The
 PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
 the installed Torch binary is unchanged and numerical corruption is unproven.

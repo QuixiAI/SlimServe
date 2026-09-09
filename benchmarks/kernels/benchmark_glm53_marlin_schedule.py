@@ -47,7 +47,7 @@ def footprint(cases, phase):
     return sum(map(len, experts.values())) * n * k * 9 // 16
 
 
-def prepare_case(weights, batch, record, layer_id):
+def prepare_case(weights, batch, record, layer_id, gemm=None):
     from vllm import _custom_ops as ops
     from vllm.model_executor.layers.fused_moe.activation import (
         MoEActivation,
@@ -57,6 +57,9 @@ def prepare_case(weights, batch, record, layer_id):
         moe_align_block_size,
     )
     from vllm.scalar_type import scalar_types
+
+    if gemm is None:
+        gemm = ops.moe_wna16_marlin_gemm
 
     ids_cpu = [r[layer_id - 3] for r in record["routes"]]
     if len(ids_cpu) != batch or any(
@@ -79,7 +82,7 @@ def prepare_case(weights, batch, record, layer_id):
             apply_moe_activation(MoEActivation.SILU, down_input, gate, clamp_limit=10.0)
             return call("down", config[1])
         is_gate = phase == "gate_up"
-        return ops.moe_wna16_marlin_gemm(
+        return gemm(
             x if is_gate else down_input,
             gate if is_gate else down,
             w13 if is_gate else w2,
