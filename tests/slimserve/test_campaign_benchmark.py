@@ -21,6 +21,29 @@ def _load(monkeypatch):
     return module
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--cuda-trace-concurrency", "8"],
+        ["--cuda-traces", "--cuda-trace-concurrency", "4"],
+        ["--cuda-traces", "--concurrency", "8"],
+    ],
+)
+def test_cuda_single_range_configuration_fails_before_hardware_probe(
+    monkeypatch, options
+):
+    bench = _load(monkeypatch)
+    monkeypatch.setattr(bench.hardware, "detect", lambda: pytest.fail("hardware probe"))
+    monkeypatch.setattr(
+        bench.sys,
+        "argv",
+        ["campaign", "--source", "unused", "--output", "unused", *options],
+    )
+    with pytest.raises(SystemExit) as error:
+        bench.main()
+    assert error.value.code == 2
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_teardown_always_persists_completed_work_and_failure(
     monkeypatch, tmp_path, fails

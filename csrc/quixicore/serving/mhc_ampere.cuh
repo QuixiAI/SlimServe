@@ -169,7 +169,8 @@ __global__ void __launch_bounds__(THREADS) partials_prefill(
     const int dim_split = split * DIMS;
 
     // Local flat l in [0, 512): stream l / 128, dim dim_split + l % 128.
-    // Diagnostic instantiation only; all serving callers retain PAIRED_FN=false.
+    // The serving dispatcher enables paired staging only for aligned BF16 fn
+    // on SM120. Other dtypes/devices and odd BF16 storage offsets stay scalar.
     // Pair adjacent BF16 loads and exact FP32 conversions without changing the
     // shared layout, arithmetic or reduction order. DIMS/strides and the
     // 16-byte shared base make every source pair and float2 store aligned.

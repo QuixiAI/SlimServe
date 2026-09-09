@@ -90,6 +90,32 @@ def _close(a, b):
     torch.testing.assert_close(a.float(), b.float(), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("T", [65, 129])
+@pytest.mark.parametrize("fused", [False, True])
+def test_bf16_prefill_preserves_unaligned_contiguous_fn(T, fused):
+    residual, fn, scale, base, x, post, comb, _ = _inputs(41, T, torch.bfloat16)
+    storage = torch.empty(fn.numel() + 1, device=fn.device, dtype=fn.dtype)
+    odd = storage[1:].view_as(fn)
+    odd.copy_(fn)
+    assert odd.is_contiguous() and odd.data_ptr() % 4 == 2
+    assert fn.data_ptr() % 4 == 0
+    mode = quixicore_ops.get_dsv4_mhc_mode()
+    minimum = quixicore_ops.get_dsv4_mhc_prefill_min_t()
+    try:
+        quixicore_ops.set_dsv4_mhc_mode(2)
+        if fused:
+            aligned = _fused(1, x, residual, post, comb, fn, scale, base, None)
+            unaligned = _fused(1, x, residual, post, comb, odd, scale, base, None)
+        else:
+            aligned = _pre(1, residual, fn, scale, base, None)
+            unaligned = _pre(1, residual, odd, scale, base, None)
+        for a, b in zip(aligned, unaligned):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    finally:
+        quixicore_ops.set_dsv4_mhc_mode(mode)
+        quixicore_ops.set_dsv4_mhc_prefill_min_t(minimum)
+
+
 @pytest.mark.parametrize("T", [33, 256, 1000])
 @pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_norm", [False, True])

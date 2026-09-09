@@ -42,8 +42,10 @@ Raw: perf/results/2026-09-08/{cold-recipe-baseline,b12x-r281-cold-serving}/.
 B12X is pinned R28.1 with the qualified host-driver/native-FA2 adaptations
 below, no-spec/DCP1, and its unchanged 4096-token/prefill-compute-share0.4
 scheduling. It uses DIFFERENT W4A4/FP8-KV precision, not our selected recipe.
-Our profile, quant, native libraries and spill-free indexer remain unchanged;
-the mHC BF16-storage candidate is still OFF. No starts were discarded.
+The profile, quant and spill-free indexer remain unchanged; the mHC BF16-storage
+candidate is still OFF. The baseline used native QC f52c2d3d27a30567. A new
+native paired-staging candidate is installed for qualification (below), not
+yet a promoted performance baseline. No baseline starts were discarded.
 
 Neither stack's client-decode metric is sustained full-concurrency decode:
 both first-to-last windows include staggered cold prefill. During the common
@@ -55,13 +57,18 @@ The cached reference's first c16 timing has a synchronized 2.67s client pause
 of unresolved origin; keep its slow result. Raw stream analyses are under
 runtime-control/{b12x,recipe}-cold-client-stream-windows.json.
 
-Next isolated kernel candidate is prepared, NOT built or promoted: paired
-BF16 fn staging for mHC prefill, same FP32 arithmetic/reduction order.
-Only the diagnostic probe enables it; serving callers remain unchanged.
-CPU tests: 8 pass, including strict signed-zero parity. Full actual-site GPU
-checks, five fixed A/B/A rounds and sanitizers are owed. See the notebook's
-prescribed shapes and mhc-storage-paired-build scratch directory.
-An independent FP8 launch probe is also prepared, not built: 12 combinations
+Paired BF16 fn staging for mHC prefill passes all7020 actual-site cases
+bit-for-bit and its five-round A/B/A: +15.3/+13.8/+13.3/+4.9% isolated
+throughput at64/128/129/7616 rows against scalar BF16. This is NOT a serving
+speedup. Memcheck and targeted race/sync checks pass. The native integration
+is SM120/aligned-BF16 only, preserving scalar fallback for odd storage offsets
+and other platforms/dtypes. Native QC136723a73c921cb333e5b1cb367610bb22b8cc624008c8d8d6684528d2717e9d
+is installed; the previous f52 binary is saved as runtime-control/
+mhc-paired-native-before.so.54 operator tests, four alignment memchecks and
+all7020 installed census cases pass; fixed1/3/1 FP32/BF16/FP32 cold-profile
+validation is next. All69 existing mHC kernels preserve resource usage;
+two paired variants add no spills. Global/profile BF16-storage default staysOFF.
+An independent FP8 launch probe is built but not GPU-qualified:12 combinations
 of tile width/warp count/staging, actual weights beyond three L2 capacities,
 independent FP64 oracle and subsequent contention gate. CPU tests: 8 pass.
 
@@ -110,13 +117,22 @@ The one-GPU A/B/A probe confirms observer overhead: median paired graph latency
 increases 17.93% for 1200 linear nodes and 55.78% for the two-branch graph.
 All 18 phases pass exact output checks; post-profiler timings return near baseline.
 This does not establish the full TP4 model's unprofiled graph span. Probe raw:
-runtime-control/graph-profiler-bias/. Whole-model observer control is next.
+runtime-control/graph-profiler-bias/. The whole-model observer attempt below
+is diagnostic and incomplete; it does not replace the unprofiled baseline.
 The explicit --cuda-profile CLI and --cuda-traces campaign mode are prepared:
 bounded CUDA API ranges, unchanged serving graph, and a separate full return
 timing matrix. Run the campaign itself under Nsight process-tree graph tracing,
-not its server child. A new-session child lifecycle probe captures four whole
-graphs in each of two ranges with no node activities; all six oracle phases
-pass. This is lifecycle proof only, not TP4 timing. CPU suite190pass/1GPUskip.
+not its server child. The original lifecycle probe passed but created its
+second graph after range one. Precreating both graphs reproduces missing
+second-range graph activities despite four successful launches. The model's
+first range records32 graphs per GPU (~5.660ms median); its c8 range has129
+runtime launches but no spans. Keep that failed series as diagnostic evidence.
+It also exposed Nsight-adopted zombies confusing teardown; a model-free
+reproduction confirms the mechanism and fixed teardown records zombies without
+accepting live workers. Use ONE range per model process via --cuda-traces
+--cuda-trace-concurrency 1 or8; the full timing/return matrices stay unchanged.
+Real-profile requalification is still owed. Raw: graph-observer-cold/ and
+runtime-control/{nsys-prebuilt-graphs*,owned-group-*}.31 focused CPU tests pass.
 
 The digest-pinned R28.1 reference has a reproduced container-startup failure
 and a model-free A/B/A repair: its Bash startup hook selects compat libcuda
@@ -285,23 +301,24 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-1. Whole-model observer control is next: fixed three starts under bounded
-   Nsight whole-graph capture, --cuda-traces --cold-prefix --quality --prefill,
-   plus the separate return timing matrix. The unprofiled reference is now
-   cold-recipe-baseline/. Preserve every rank and boundary record. Do not
-   change graph topology/driver or restart until a profiler looks fast.
-2. Paired BF16 mHC prefill staging: test the prepared isolated candidate over
-   all 90 actual sites, then its prescribed A/B/A against installed BF16.
-   The storage candidate's ~0.5% c1 gain is qualified but its small prefill
-   cost remains unresolved. Output-parallel arithmetic and actual 20-iteration
+1. Paired BF16 mHC prefill staging: fixed1/3/1 FP32/BF16/FP32 profile starts,
+   all cold-prefix, no profiling,
+   three timing repeats, quality and cold32K/128K. Keep the same new native
+   binary throughout and BF16-storage defaultOFF until a retained decision.
+   Isolated staging gains do not establish the whole-model tradeoff.
+   Output-parallel arithmetic and actual 20-iteration
    norm fusion already lost; last-block synchronization was neutral. Do not
    repeat those experiments from the old three-iteration fixture.
-3. FP8 launch geometry: run the prepared actual-weight cold sweep, then test
+2. FP8 launch geometry: run the built actual-weight cold sweep, then test
    any candidate under routed-expert contention. The old shared ROT24 fit L2
    and never varied warp count. Preserve the existing eight-stage contention
    evidence. The separate Marlin scheduling candidate failed its stricter
    numerical gate and remains unintegrated; the shared-memory race repair is
    retained. Measured Marlin traffic is already near the unique-weight floor.
+3. Whole-model observer follow-up: fixed three starts, one bounded Nsight
+   range per model process, explicitly choose --cuda-trace-concurrency 8.
+   Preserve the full before/return matrices and every rank/boundary record.
+   Do not change graph topology/driver or restart until a profiler looks fast.
 4. Long-context prefill and weight staging: the matched 128K result is about
    1.3% slower than this B12X control. Keep the retained indexer geometry and
    use fresh attribution to select the next kernel/overlap experiment. B12X's

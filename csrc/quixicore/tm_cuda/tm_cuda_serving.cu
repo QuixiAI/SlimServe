@@ -549,12 +549,12 @@ static void py_set_dsv4_mhc_prefill_min_t(int64_t min_t) {
 static int64_t py_get_dsv4_mhc_prefill_min_t() {
     return dsv4_mhc_prefill_min_t();
 }
-template <bool FUSED_POST, typename FnT>
+template <bool FUSED_POST, typename FnT, bool PAIRED_FN = false>
 static void launch_dsv4_mhc_partials_prefill_typed(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
         const float* post, const float* comb, const FnT* fn,
         __nv_bfloat16* residual_out, float* partial, int T) {
-    auto kernel = dsv4_mhc::partials_prefill<FUSED_POST, 4096, FnT>;
+    auto kernel = dsv4_mhc::partials_prefill<FUSED_POST, 4096, FnT, PAIRED_FN>;
     static const bool configured = [&] {
         return cudaFuncSetAttribute(
                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -582,8 +582,18 @@ static bool launch_dsv4_mhc_partials_prefill(
             reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
             partial, T);
     } else if (fn.scalar_type() == torch::kBFloat16) {
-        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16>(
-            x, residual, post, comb, bp(fn), residual_out, partial, T);
+        const auto* properties = at::cuda::getDeviceProperties(fn.get_device());
+        // Qualify this layout only on SM120. A contiguous tensor may still
+        // have an odd BF16 storage offset; preserve its valid scalar path.
+        const bool paired = properties->major == 12 && properties->minor == 0 &&
+                            reinterpret_cast<uintptr_t>(fn.data_ptr()) % 4 == 0;
+        if (paired) {
+            launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16, true>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+        } else {
+            launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+        }
     } else {
         launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, float>(
             x, residual, post, comb, fp(fn), residual_out, partial, T);

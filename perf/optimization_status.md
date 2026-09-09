@@ -23066,3 +23066,53 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   creation-order factor; do not change serving graph topology to feed a tool.
 - Raw: runtime-control/nsys-prebuilt-graphs{.log,.1.nsys-rep,.2.nsys-rep,
   .1.sqlite,.2.sqlite,-analysis.json} and nsys-prebuilt-graphs-results/.
+
+## 2026-09-08: Native paired mHC staging integration and serving plan
+
+- Status: native build/import and operator tests pass; installed census and
+  serving qualification in progress. Default BF16 fn storage remainsOFF.
+- Isolated sanitizer completion: unfiltered memcheck48cases, paired-kernel
+  synccheck48cases including7616 rows, and targeted racecheck at64/65/129,
+  first24 matching paired launches per shape, all zero errors/warnings.
+  Filter substring __nv_bfloat16Lb1EEEv matches exactly the two new kernels
+  in cuobjdump. The initial overbroad racecheck also instrumented unchanged
+  references; it was explicitly interrupted at four saved passing cases,
+  exit130, and is NOT a passed gate. Its original running-status partial JSON
+  and log remain. The probe now persists KeyboardInterrupt as a failed receipt.
+- Native dispatch selects paired staging only on device major12/minor0 and
+  four-byte-aligned BF16 fn. Other devices/dtypes and odd contiguous BF16
+  storage offsets use the original scalar path. No new persistent weight
+  copies, altered arithmetic, stream dependency or production profile flag.
+- Build target _quixicore_C, CUDA13.0/sm120f, -j2, host80GiB/no swap;
+  native SHA136723a73c921cb333e5b1cb367610bb22b8cc624008c8d8d6684528d2717e9d
+  copied to the editable import. Previous f52c2d3d27a30567 binary preserved
+  as runtime-control/mhc-paired-native-before.so. MoE/core hashes unchanged.
+  All69 existing mHC functions retain resource usage; two paired variants
+  add40/80-register, zero-spill functions. The measured isolated extension
+  is preserved as mhc-paired-probe-before-native.so before rebuilding its
+  current-source counterpart in mhc-storage-paired-native-build.
+- 54 installed operator tests pass. Four new aligned-versus-odd-offset BF16
+  cases are bit-identical and pass unfiltered memcheck. CPU suite251pass,
+  oneGPUskip. No GPU work overlaps native builds. The small independent FP8
+  probe also builds in a32GiB/no-swap scope while no timing/GPU jobs are active.
+- Serving plan prescribed before new measurements: one FP32 control start,
+  three BF16 paired-staging starts, one FP32 return. Same new native binary,
+  glm53-nvfp4-4/rtx6000/recipev1, indexer flag1, BF16 KV/activations/lm_head;
+  change only VLLM_GLM5_MHC_BF16_FN=0/1/0. Each start runs three exact1000/300
+  repeats atc1/c8/c16, --cold-prefix --quality --prefill, NO profiler. All
+  starts/results retained. Output directories mhc-paired-fp32-control/,
+  mhc-paired-serving/, mhc-paired-return-control/. Launch with the existing
+  cache/CUDA13.0 environment, unset NCCL_P2P_DISABLE, all four GPUs, OMP1,
+  150GiB/no swap; freeze all benchmark/serving sources until the series ends.
+- CUDA observer controller now accepts one explicitly selected concurrency
+  per model process (--cuda-trace-concurrency, default1), without changing
+  the complete timing/return matrices. Invalid combinations fail before
+  hardware checks.31 focused CPU tests pass. This avoids the reproduced
+  repeated-range limitation without changing model graphs; actual model
+  requalification remains owed, not implied by the CPU tests.
+- Raw: runtime-control/mhc-paired-{memcheck,race-64,race-65,race-129,synccheck}*,
+  mhc-paired-native-{build.log,resources.json,tests.xml,tests.log},
+  mhc-paired-alignment-*, paired-full-cpu-tests.xml, single-range-cpu-tests.xml.
+- Installed exhaustive census completes all7020 cases bit-for-bit, including
+  changed inputs and7616-row prefill, on native136723a73c921cb3. Serving
+  qualification remains the next promotion gate; raw mhc-paired-native-census.*.

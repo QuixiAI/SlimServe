@@ -391,6 +391,11 @@ def main():
         help="CUDA API ranges and return timings; run under Nsight, diagnostic only",
     )
     ap.add_argument(
+        "--cuda-trace-concurrency",
+        type=int,
+        help="one CUDA range per model process (default 1); timing matrix is unchanged",
+    )
+    ap.add_argument(
         "--routing",
         action="store_true",
         help="diagnostic-only actual-step routing; timings are NOT a baseline",
@@ -411,6 +416,15 @@ def main():
         help="with --prefill, trace additional cold requests after all TTFT timings",
     )
     args = ap.parse_args()
+    if args.cuda_trace_concurrency is not None and not args.cuda_traces:
+        ap.error("--cuda-trace-concurrency requires --cuda-traces")
+    if args.cuda_traces:
+        if args.cuda_trace_concurrency is None:
+            args.cuda_trace_concurrency = 1
+        if args.cuda_trace_concurrency not in args.concurrency:
+            ap.error(
+                "CUDA trace concurrency must be in the measured concurrency matrix"
+            )
     if args.prefill_traces and not args.prefill:
         ap.error("--prefill-traces requires --prefill")
     if args.cuda_traces and (args.prefill_traces or args.routing):
@@ -609,7 +623,16 @@ def main():
                                 "token-count or replacement-character gate failed"
                             )
                 if args.traces or args.cuda_traces:
-                    for c in (c for c in args.concurrency if c in (1, 8)):
+                    # Nsight repeated ranges can omit activities for graphs
+                    # instantiated before the first range. Do not mutate the
+                    # model's graphs to accommodate collection: one range per
+                    # process, independent of the complete timing matrix.
+                    profile_concurrencies = (
+                        [args.cuda_trace_concurrency]
+                        if args.cuda_traces
+                        else [c for c in args.concurrency if c in (1, 8)]
+                    )
+                    for c in profile_concurrencies:
                         result = round_requests(
                             base,
                             model,

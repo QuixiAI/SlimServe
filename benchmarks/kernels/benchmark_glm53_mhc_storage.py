@@ -346,7 +346,7 @@ def main():
             del graphs, graph, rows, data, candidate
             save()
         result["status"] = "complete"
-    except Exception as exc:
+    except BaseException as exc:
         result["status"], result["error"] = "failed", repr(exc)
         save()
         raise
