@@ -23297,3 +23297,9 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   driver-release-{cpu-tests.xml,final-cpu-tests.xml,measurement-ast.txt,live.log},
   driver-release-live-{1,2,3}.json under runtime-control. No active GPU jobs
   remain after the bounded lifecycle checks.
+- Real-model follow-up on source0e2761e42: remainder boot1 completes every
+  gate. Linux records four zombie workers; the new driver gate observes
+  allfour still active at0.0448s, one at0.6966s, and none at0.9895s. It then
+  starts the next prescribed boot successfully. This directly reproduces the
+  model-scale release delay and validates the wait, beyond the CPU fixtures.
+  Raw: mhc-paired-serving-remainder/summary.json, first run teardown receipt.
