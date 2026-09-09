@@ -167,8 +167,13 @@ with otherwise fixed inputs reproduces its serving output bit-for-bit in all
 causes the first GEMM differences, NOT yet the entire downstream score spread.
 Raw: mhc-quality-moe-trace-diagnostic/, runtime-control/mhc-quality-moe-trace-analysis.json,
 and mhc-moe-up-replay-repo/ (standalone tool benchmarks/kernels/replay_glm53_moe_up.py).
-Next: bounded deterministic-alignment intervention, then the unchanged complete
-three-pass model-quality workload. Keep the current recipe/native arithmetic;
+The opt-in canonical-order diagnostic is locally qualified:407 CPU tests,
+14 alignment GPU tests plus3 integrated tests pass; bounded memory/sync/race
+checks are clean. This deliberately adds a sorting launch AFTER alignment to
+test causality; it is not the final production implementation. The prescribed
+single-start three-pass run is mhc-canonical-moe-quality-diagnostic/ with
+SLIMSERVE_GLM53_CANONICAL_MOE=1 and the same three journals; results pending.
+Keep the current recipe/native arithmetic;
 do not relax quality gates or promote TC. This is diagnosis, not a throughput
 baseline. TC stays OFF.
 E2E control/candidate/return157.051/156.928/156.712 c1,

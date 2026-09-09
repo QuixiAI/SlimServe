@@ -42,6 +42,23 @@ from slimserve.smoke import (
 )
 
 
+def diagnostic_only(args):
+    return bool(
+        args.routing
+        or args.cuda_traces
+        or args.quality_repeats > 1
+        or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
+        or any(
+            os.environ.get(key) == "1"
+            for key in (
+                "SLIMSERVE_GLM53_MODEL_JOURNAL",
+                "SLIMSERVE_GLM53_MOE_JOURNAL",
+                "SLIMSERVE_GLM53_CANONICAL_MOE",
+            )
+        )
+    )
+
+
 def benchmark_sources():
     root = Path(__file__).resolve().parents[1]
     paths = [
@@ -585,10 +602,8 @@ def main():
         "plan": dataclasses.asdict(plan),
         "compatible_profiles": compatible,
         "command": sys.argv,
-        "diagnostic_only": args.routing or args.cuda_traces or args.quality_repeats > 1,
-        "throughput_is_baseline_eligible": not (
-            args.routing or args.cuda_traces or args.quality_repeats > 1
-        ),
+        "diagnostic_only": diagnostic_only(args),
+        "throughput_is_baseline_eligible": not diagnostic_only(args),
         "cuda_profiler_ranges": args.cuda_traces,
         "runtime": runtime_identity(),
         "environment": {

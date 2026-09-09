@@ -24067,3 +24067,52 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   and both analysis logs; mhc-moe-up-replay/ (partial tooling failure),
   mhc-moe-up-replay-stream-fix/ and mhc-moe-up-replay-repo/ (complete, all exact).
   Serving teardown exits0, all GPUs released after0.862s; no other GPU workloads.
+
+## 2026-09-09 - Prescribed canonical-order model intervention
+
+- Status: prepared and locally qualified; full-model outcome not yet known.
+- Hypothesis: fixing within-expert assignment order at every MoE layer removes
+  the repeated-request variation. The prior replay proves only the first
+  changing GEMM; do not infer the complete model outcome from it.
+- Change: SLIMSERVE_GLM53_CANONICAL_MOE=1, default OFF, requires bounded
+  MODEL_JOURNAL1. One Triton CTA per expert sorts its existing contiguous
+  assignment range in place, ascending assignment ID, with padding last.
+  No router scores/choices/weights, expert blocks, activation values, GEMM
+  launch settings/arithmetic, checkpoint bytes, or native library changes.
+  This post-alignment sort is a quarantined causal intervention, NOT the
+  production solution. If validated, construct stable order at the origin.
+- Bounds: GLM53 BF16/H4096/NVFP4/E288/top8/no EP or map,1..8192 tokens;
+  distinct top8 means at most M assignments per expert. Validate buffer
+  geometry/dtype/device; never touch undefined capacity. Runs at all MoE
+  layers/batches, not just the traced request. Existing path when flag OFF.
+- Validation:407 CPU tests pass/one skip;14 GPU alignment tests pass against
+  independent CPU construction at13 sizes1..8192, balanced/maximally skewed/
+  changed routing, two eager repeats and six changed-input graph phases.
+  All12 real serving layouts canonicalize to the same exact alignment.
+  Integrated actual-weight observer parity runs with flag OFF and ON plus
+  compiled mHC observer test:3pass. Lint/diff checks pass.
+- Sanitizers: memcheck/synccheck cover all eager/graph phases at640/8192,
+  both2pass/zero errors. Bounded racecheck covers the first six matching
+  sorting launches at640 (balanced/skewed/changed each twice),1pass/zero
+  hazards/warnings/errors; not a full graph/rank race census. An initial
+  incorrect filter spelling failed before launching Python; its log remains.
+- Provenance: score journals now also hash Marlin's Python path and both
+  diagnostic sorting modules (13 source files). Campaign receipt eligibility
+  now explicitly excludes score/model/MoE observers and canonical-order
+  intervention even with quality-repeats1. Actual workload/scoring code is
+  unchanged; no timing comparison across these instrumented runs.
+- Prescribed ONE start: same150GiB/no-swap scope, CUDA_VISIBLE_DEVICES0,1,2,3,
+  unset NCCL_P2P_DISABLE, CUDA13/VLLM cache/prompt/recipe unchanged,
+  OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0/nativeQC4ce801.
+  Set CANONICAL_MOE1/MODEL_JOURNAL1/MOE_JOURNAL1 and SCORE_JOURNAL to
+  runtime-control/mhc-canonical-moe-trace-config.json. Run the campaign with
+  --profile glm53-nvfp4-4 --boots 1 --repeats 3 --cold-prefix --quality
+  --quality-repeats 3, output mhc-canonical-moe-quality-diagnostic/.
+  Retain every quality pass/startup/priming result; no source/binary changes,
+  profiler, builds, or competing GPU work during the run.
+- Decision criterion: compare every repeated score and traced stage, verify
+  semantic routing and complete workload/raw HTTP evidence. If differences
+  remain, isolate the first remaining boundary. Do not widen or replace the
+  TC accuracy contract; TC remains OFF. No production/default promotion here.
+- Raw qualification: runtime-control/mhc-canonical-moe-{final-cpu,gpu,integrated}-tests.xml,
+  mhc-canonical-moe-{memcheck,synccheck,racecheck}-tests.xml and associated logs.

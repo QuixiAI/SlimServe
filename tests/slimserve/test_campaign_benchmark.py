@@ -22,6 +22,38 @@ def _load(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "active",
+    [
+        None,
+        "SLIMSERVE_GLM53_SCORE_JOURNAL",
+        "SLIMSERVE_GLM53_MODEL_JOURNAL",
+        "SLIMSERVE_GLM53_MOE_JOURNAL",
+        "SLIMSERVE_GLM53_CANONICAL_MOE",
+    ],
+)
+def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, active):
+    bench = _load(monkeypatch)
+    keys = (
+        "SLIMSERVE_GLM53_SCORE_JOURNAL",
+        "SLIMSERVE_GLM53_MODEL_JOURNAL",
+        "SLIMSERVE_GLM53_MOE_JOURNAL",
+        "SLIMSERVE_GLM53_CANONICAL_MOE",
+    )
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    args = SimpleNamespace(routing=False, cuda_traces=False, quality_repeats=1)
+    if active:
+        monkeypatch.setenv(active, "1")
+    assert bench.diagnostic_only(args) is bool(active)
+    for key, value in (
+        ("routing", True),
+        ("cuda_traces", True),
+        ("quality_repeats", 3),
+    ):
+        assert bench.diagnostic_only(SimpleNamespace(**(vars(args) | {key: value})))
+
+
+@pytest.mark.parametrize(
     "options",
     [
         ["--cuda-trace-concurrency", "8"],
@@ -70,7 +102,7 @@ def test_quality_passes_preserve_every_pass_without_replacement(
         return {
             "summary": {
                 "all_needles_rank_first": not (
-                failure == "needle" and len(calls) == expected_calls
+                    failure == "needle" and len(calls) == expected_calls
                 ),
                 "mean_text_logprob": -float(len(calls)),
             }

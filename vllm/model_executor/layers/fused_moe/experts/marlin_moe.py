@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from slimserve.canonical_moe import enabled as canonical_moe_enabled
 from vllm.model_executor.layers.fused_moe import combine_shared
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -61,6 +62,7 @@ from vllm.scalar_type import ScalarType, scalar_types
 # allocate it once per layer. Allocating (and zeroing) one per call put a
 # fill kernel in front of every MoE layer at decode; keep one per device.
 _MARLIN_MOE_WORKSPACE: dict[torch.device, torch.Tensor] = {}
+_CANONICAL_MOE_DIAGNOSTIC = canonical_moe_enabled()
 
 
 def _marlin_moe_workspace(device: torch.device) -> torch.Tensor:
@@ -363,6 +365,27 @@ def fused_marlin_moe(
             global_num_experts,
             expert_map,
             ignore_invalid_experts=True,
+        )
+
+    if _CANONICAL_MOE_DIAGNOSTIC:
+        from slimserve.canonical_moe import canonicalize
+
+        if (
+            hidden_states.dtype != torch.bfloat16
+            or K != 4096
+            or E != 288
+            or topk != 8
+            or quant_type != scalar_types.float4_e2m1f
+            or expert_map is not None
+            or global_num_experts != E
+        ):
+            raise ValueError("canonical alignment diagnostic requires GLM53 NVFP4 TP")
+        canonicalize(
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            tokens=hidden_states.shape[0],
+            block_size=block_size_m,
         )
 
     assert activation is not None

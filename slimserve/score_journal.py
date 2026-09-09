@@ -70,6 +70,9 @@ class ScoreJournal:
             "vllm/_custom_ops.py",
             "vllm/quixicore/ops.py",
             "vllm/model_executor/layers/fused_moe/router/fused_moe_router.py",
+            "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
+            "slimserve/canonical_moe.py",
+            "slimserve/canonical_moe_kernel.py",
         )
         self._write(
             {

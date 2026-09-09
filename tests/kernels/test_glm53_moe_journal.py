@@ -31,7 +31,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_native_marlin_and_shared_sum_observers_preserve_bits(tmp_path, monkeypatch):
+@pytest.mark.parametrize("canonical", [False, True])
+def test_native_marlin_and_shared_sum_observers_preserve_bits(
+    tmp_path, monkeypatch, canonical
+):
+    from vllm.model_executor.layers.fused_moe.experts import marlin_moe
+
+    monkeypatch.setattr(marlin_moe, "_CANONICAL_MOE_DIAGNOSTIC", canonical)
     monkeypatch.setenv("SLIMSERVE_GLM53_MODEL_JOURNAL", "1")
     monkeypatch.setenv("SLIMSERVE_GLM53_MOE_JOURNAL", "1")
     monkeypatch.setattr(
