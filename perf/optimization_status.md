@@ -21854,3 +21854,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   serving change or retained performance claim yet.
 - Raw: perf/results/2026-09-08/cold-prefill-profile/ (all-rank traces,
   prefill32k-rank0.json, prefill128k-all-ranks.json) and indexer-tiles/preflight.json.
+
+### Indexer tile sweep and changed-input shape validation
+
+- Full sweep completes: 24 supported configurations pass the initial score,
+  sampled FP64 oracle and top-512 selection gates. Six RT16 variants exceed
+  the 101376-byte shared-memory limit (131072 required); all six retained.
+  Strongest local result is RT2/PT128/four warps: 158 registers, zero spills,
+  16 KiB shared, +55.71% paired throughput (~35.8% less time). RT4/PT128 has
+  four spills and is slower (+49.23%); original control is -0.027%.
+- Broaden the diagnostic without relaxing gates: handle early rows with
+  fewer than 512 visible pools (including zero), excluding unwritten future
+  pools from selection. Three changed-input graph replays regenerate BF16
+  queries/keys and FP32 weights, and rerun the independent oracle. Three
+  CPU probe tests pass. Timing is now five A/B/A rounds x twenty replays.
+- RT2/PT128 candidate at four prescribed shapes, rows/pools/prefix/fixtures:
+  2202/15232/53312/8, 7616/1904/0/3, 4405/7616/22848/4 and
+  1024/32768/130048/8. Every initial/changed-input score and selection check
+  passes; max score differences 4.77e-7 (first chunk 7.15e-7). Rotating inputs
+  exceed 128 MiB in every case. Median paired throughput improvements
+  +55.34% / +60.65% / +53.40% / +54.53%; this is local scoring, not TTFT.
+- Next: full pooled-selection tests on uneven requests, cached prefixes,
+  odd/empty tails and changed-input graphs; sanitizer gates; only then opt-in
+  real-profile validation. No default or serving source change yet.
+- Raw: perf/results/2026-09-08/indexer-tiles/{sweep,paired,first-chunk,
+  mid-chunk,long-chunk}.json. Expanded full-selection tests are recorded in
+  the same directory as selection-tests.xml when complete.

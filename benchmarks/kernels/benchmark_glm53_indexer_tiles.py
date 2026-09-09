@@ -38,6 +38,15 @@ def oracle(q, weights, keys, visible, rows, columns):
     return values, valid
 
 
+def selected_pools(scores, visible):
+    # Early prefill rows can have fewer than 512 complete pools, including
+    # zero. Never compare arbitrary top-k positions drawn from masked -inf.
+    return [
+        row[:count].topk(min(512, count)).indices.sort().values
+        for row, count in zip(scores, (visible.cpu() // 4).tolist())
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -47,6 +56,7 @@ def main():
     parser.add_argument("--fixtures", type=int, default=8)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--replays", type=int, default=5)
+    parser.add_argument("--changed-inputs", type=int, default=0)
     parser.add_argument("--config", type=int, nargs=3, action="append")
     args = parser.parse_args()
     if args.output.exists() or not args.output.parent.is_dir():
@@ -55,8 +65,8 @@ def main():
         parser.error("positive dimensions/counts required")
     if args.prefix < 0 or args.prefix + args.rows > 4 * args.pools:
         parser.error("visibility must fit the pooled-key context")
-    if (args.prefix + 1) // 4 < 512:
-        parser.error("this top-512 diagnostic requires at least 512 visible pools")
+    if args.changed_inputs < 0:
+        parser.error("changed-input replay count cannot be negative")
     configs = [tuple(c) for c in args.config] if args.config else configurations()
     if any(c not in configurations() for c in configs):
         parser.error("unsupported requested geometry")
@@ -192,15 +202,9 @@ def main():
             torch.testing.assert_close(
                 values[valid], observed[valid], atol=1e-5, rtol=1e-5
             )
-            mask = (
-                torch.arange(args.pools, device="cuda")[None, :]
-                < (visible[samples] // 4)[:, None]
-            )
-            selected = []
-            for output in (expected, got):
-                scores = output[samples].masked_fill(~mask, float("-inf"))
-                selected.append(scores.topk(512).indices.sort(1).values)
-            if not torch.equal(*selected):
+            wanted = selected_pools(expected[samples], visible[samples])
+            selected = selected_pools(got[samples], visible[samples])
+            if not all(torch.equal(a, b) for a, b in zip(wanted, selected)):
                 raise AssertionError("top-512 sets changed on predetermined rows")
         return {"max_abs": maximum, "top512_sets_exact": True, "oracle_pass": True}
 
@@ -242,6 +246,21 @@ def main():
             torch.cuda.synchronize()
             try:
                 row["check"] = validate(reference, outputs)
+                row["changed_input_checks"] = []
+                for replay in range(args.changed_inputs):
+                    for i, (q, weights, keys, _) in enumerate(fixtures):
+                        generator = torch.Generator(device="cuda").manual_seed(
+                            17103 + replay * 97 + i
+                        )
+                        q.normal_(generator=generator)
+                        keys.normal_(generator=generator)
+                        weights.uniform_(0, 32**-0.5, generator=generator)
+                        expected = oracle(q, weights, keys, visible, samples, columns)
+                        fixtures[i] = (q, weights, keys, expected)
+                    baseline_graph.replay()
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    row["changed_input_checks"].append(validate(reference, outputs))
             except AssertionError as error:
                 row.update(status="failed_gates", error=str(error))
                 del graph, outputs

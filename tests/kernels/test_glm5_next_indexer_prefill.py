@@ -22,6 +22,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(params=[(8, 64), (2, 128)])
+def prefill_tiles(request, monkeypatch):
+    """Exercise the original and isolated SM120 candidate through full selection."""
+    rt, pt = request.param
+    monkeypatch.setattr(gi, "_ROW_TILE", rt)
+    monkeypatch.setattr(gi, "_POOL_TILE", pt)
+
+
 def _synth(query_lens, cached, seed=0):
     """A paged indexer cache for one prefill chunk: request i has
     cached[i] KV tokens before its query_lens[i] query rows (a cached
@@ -90,7 +98,7 @@ def _select(by_request, q, w, ape, cache, bt, row_req, visible, max_pools):
         ([7, 9], [3, 2500]),  # tiny queries, one over a long context
     ],
 )
-def test_matches_per_row_kernel(query_lens, cached):
+def test_matches_per_row_kernel(query_lens, cached, prefill_tiles):
     q, w, ape, cache, bt, row_req, visible, max_pools = _synth(query_lens, cached)
     ref_logits, ref_topk = _select(
         False, q, w, ape, cache, bt, row_req, visible, max_pools
@@ -129,7 +137,7 @@ def test_matches_per_row_kernel(query_lens, cached):
 
 
 @pytest.mark.parametrize("by_request", [False, True])
-def test_tail_tokens_survive(by_request):
+def test_tail_tokens_survive(by_request, prefill_tiles):
     """The incomplete tail pool's tokens (including the query's own token,
     three rows in four) sit right after the selected pools in every row,
     on every run: the expansion loop used to write -1 over those columns
@@ -187,3 +195,34 @@ def test_prefill_row_req_uses_query_rows():
     visible = chunk.cu_seqlen_ke - chunk.cu_seqlen_ks
     assert int(visible[0]) == 1001 and int(visible[499]) == 1500
     assert int(visible[500]) == 1 and int(visible[R - 1]) == 1200
+
+
+def test_sm120_tile_changed_input_graphs_match_original_selection(monkeypatch):
+    data = _synth([17, 5, 33], [0, 7000, 33000], seed=921)
+    q, weights, ape, cache, _, _, visible, max_pools = data
+    graphs, outputs = [], []
+    for rt, pt in ((8, 64), (2, 128)):
+        monkeypatch.setattr(gi, "_ROW_TILE", rt)
+        monkeypatch.setattr(gi, "_POOL_TILE", pt)
+        _select(True, *data)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = _select(True, *data)
+        graphs.append(graph)
+        outputs.append(output)
+    valid = torch.arange(max_pools, device=DEV)[None, :] < (visible // KP)[:, None]
+    for replay in range(3):
+        generator = torch.Generator(device=DEV).manual_seed(1251 + replay)
+        q.normal_(generator=generator)
+        cache.normal_(generator=generator)
+        ape.normal_(generator=generator)
+        weights.uniform_(0, H**-0.5, generator=generator)
+        for graph in graphs:
+            graph.replay()
+        torch.cuda.synchronize()
+        reference, candidate = outputs
+        torch.testing.assert_close(
+            reference[0][valid], candidate[0][valid], atol=1e-5, rtol=1e-5
+        )
+        assert torch.equal(reference[1].sort(1).values, candidate[1].sort(1).values)
