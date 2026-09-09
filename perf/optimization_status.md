@@ -24297,3 +24297,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Cross-rank numeric check: runtime-control/indexer-cross-rank-logit-check.log.
   Serving exit0; driver release0.436s includes one transient worker zombie
   retained in teardown evidence. All GPUs free; no replacement starts.
+
+## 2026-09-09 - Prescribed saved-input indexer replay
+
+- Status: bounded reproducer ready; not yet measured.
+- Baseline:9aa123ebe saved layer3/chunk1 matrices7616x1904, unchanged core
+  native d45b4ace. First-layer input/range bits repeat within every rank;
+  selected membership is valid and has no cutoff ambiguity in all captures.
+- Hypothesis: unchanged installed top_k_per_row_prefill reproduces varying
+  order at the REAL full-chunk geometry without needing a model forward.
+- Protocol: benchmarks/kernels/replay_glm53_indexer.py on each original GPU,
+  first-pass captured logits/start/end. Independently verify bounds, distinct
+  selections and exact CPU top-k score sets. ONE warmup + FIVE eager + FIVE
+  graph executions/device (44 native executions total); NaN/123 alternate in
+  undefined input tails only, output poisoned-777 before each execution.
+  Input bits must remain unchanged, sorted selected IDs must equal the
+  independently validated capture; order may vary. Save ALL44 output matrices
+  in four archives plus input/source/native hashes and per-call checks.
+  Explicit per-device graph streams; no serving/native change or timing claim.
+- Local CPU validation:9 tests pass (range, duplicate, score, NaN, undefined
+  tail, padding, tie and valid ragged cases), indexer-replay-cpu-tests.xml/log.
+- Next command after idle GPU preflight:16GiB/no-swap scope, CUDA_VISIBLE_DEVICES
+  0,1,2,3, CUDA_HOME=/usr/local/cuda-13.0, OMP_NUM_THREADS=1,
+  .venv/bin/python -m benchmarks.kernels.replay_glm53_indexer
+  --run perf/results/2026-09-09/indexer-long-context-quality-diagnostic
+  --output perf/results/2026-09-09/indexer-saved-input-replay.
+  Keep every output/failure; no profiler, build or competing GPU job.
