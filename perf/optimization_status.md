@@ -21409,4 +21409,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   layout emits lane-zero global stores from every output-owning warp.
 - Raw: perf/results/2026-09-08/mhc-output-parallel/initial.json (failed
   build-equivalence check), matched-build.json (complete), source snapshots
-  and binaries. Serving binary SHA remains 256e4f70e305dc92e3fecfac409b5ddcec78e8f0ef54e4fd1d30b31797fd99b.
+  and binaries. Serving binary SHA remains
+  256e4f70e305dc92e3fecfac409b5ddcec78de8f0ef54e4fd1d30b31797fd99b.
+
+## 2026-09-08: Coalesced partial stores help the probe, not the production bar
+
+- Status: rejected mHC layout; no serving changes.
+- Hypothesis/change: retain the output-owning warp arithmetic, but collect
+  25 partials in shared memory and emit one coalesced warp store. This replaces
+  the first candidate's lane-zero stores from separate warps. Everything else
+  in the isolated matched-build probe is unchanged.
+- Correctness: all 192 synthetic and 1080 checkpoint-parameter checks pass,
+  as do twelve changed-input graph replays and bit-exact installed-baseline
+  comparisons. No real-profile or sanitizer qualification is claimed.
+- Results, A/B/A microseconds/site: batch1 9.072/11.310/9.070;
+  batch2 9.248/11.260/9.244; batch4 10.414/11.520/10.415;
+  batch8 11.755/12.072/11.749. Coalescing saves roughly 1 us versus the first
+  candidate, but still loses to the production algorithm at every batch.
+- Decision: do not integrate. Keep the explicitly isolated benchmark for
+  reproducibility; no speculative header or alternate dispatcher remains in
+  serving. Move effort to Marlin traffic and producer/consumer scheduling.
+- Raw: perf/results/2026-09-08/mhc-output-parallel/coalesced-stores.json;
+  complete A/B/A samples and arithmetic errors retained with source hashes.

@@ -28,6 +28,7 @@ __device__ __forceinline__ void output_parallel_partials(
     const int lane = tid & 31;
     const int warp = tid >> 5;
     __shared__ float coeffs[HC + HC * HC];
+    __shared__ float block_partials[MIXES + 1];
     if constexpr (FUSED_POST) {
         if (tid < HC) coeffs[tid] = post_mix[token * HC + tid];
         if (tid < HC * HC) coeffs[HC + tid] = comb_mix[token * HC * HC + tid];
@@ -65,12 +66,17 @@ __device__ __forceinline__ void output_parallel_partials(
     for (int output = 0; output < 3; ++output) {
         const float sum = warp_sum(accum[output]);
         if (lane == 0) {
-            partial[(token * NSPLITS + split) * (MIXES + 1) + warp * 3 + output] = sum;
+            block_partials[warp * 3 + output] = sum;
         }
     }
     if (warp == 0) {
         square_sum = warp_sum(square_sum);
-        if (lane == 0) partial[(token * NSPLITS + split) * (MIXES + 1) + MIXES] = square_sum;
+        if (lane == 0) block_partials[MIXES] = square_sum;
+    }
+    __syncthreads();
+    // One coalesced warp store, instead of 25 lane-zero global stores.
+    if (tid < MIXES + 1) {
+        partial[(token * NSPLITS + split) * (MIXES + 1) + tid] = block_partials[tid];
     }
 }
 
