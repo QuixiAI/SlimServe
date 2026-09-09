@@ -178,9 +178,12 @@ inline void launch(const __nv_bfloat16* x, const uint8_t* w, const float* scale,
     kern<<<blocks, C::THREADS, C::SMEM_BYTES, stream>>>(x, w, scale, bias, out, M, N, K);
 }
 
-// Production configs (fp8_gemm16_bench.py, 2026-09-07, RTX PRO 6000, weights rotated past L2): 32 rows /
+// Retained configs (fp8_gemm16_bench.py, 2026-09-07, RTX PRO 6000): 32 rows /
 // 4 stages for N >= 2048 (dense gate_up 17 us = 1.45 TB/s, dense down 10, DSA o_proj 12, DSA q_b 5, shared
-// down 2.1-2.9 us; within 2% of the best config at every M). At N = 1024 (the shared-expert gate_up, which runs
+// down 2.1-2.9 us in that historical sweep). Its ROT24 was only 96/48 MiB for shared gate/up/down,
+// below this GPU's 128 MiB L2. The 2026-09-08 actual-weight cache control measures higher latency
+// with >3 L2 capacities; the old sweep does NOT establish cold-memory configuration optimality.
+// At N = 1024 (the shared-expert gate_up, which runs
 // on the aux stream underneath the Marlin routed-expert kernels) the grid is the limit, so 8 rows (128 blocks)
 // up to M = 8 and 16 rows above, where the 8-row tile re-streams the 16-row x tile too often. The stage count
 // there is chosen under contention, not in isolation: in isolation 4 stages is best (4.5-5.7 us vs cuBLAS

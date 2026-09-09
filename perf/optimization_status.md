@@ -22761,3 +22761,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   channel selection, raw events intact. Ruff/format pass. Full serving
   recheck is still required; fixed3starts x3repeats will use --cold-prefix.
 - Raw: b12x-r281-canary-events/ and runtime-control/answer-channel-tests.xml.
+
+## 2026-09-08: Actual FP8 shared-expert cache control confirms old small-shape bias
+
+- Status: diagnostic complete; no kernel/config/profile change.
+- Same installed production FP8 kernel f52c2d3d27a30567c313fd6ce6928e5046850f4dc008b0e085dc31ec463241fe,
+  actual layer3/23/44 TP4-rank0 shared weights/scales, BF16 inputs.18cases:
+  two shapes x three layers x batches1/8/16. Five fixed A/B/A rounds,
+  16 replays/phase; all90rounds/270phases retained, no fastest selection.
+- A/A2 rotate24 matrices:96 MiB gate/up and48 MiB down. B rotates97/193:
+  388/386 MiB, greater than three128-MiB L2 capacities. No competing GPU
+  process/build; systemd16-GiB/no-swap, CUDA13.0, GPU0. Process exits0.
+  This demonstrates working-set sensitivity, not measured DRAM traffic.
+- Independent FP64 GEMM gates pass for all18cases; all initial and changed-
+  sign graph outputs equal eager exactly. Detailed errors/all samples and
+  weight/native/source hashes retained in fp8-cache-control/summary.json.
+- c1 shared gate/up is about4.53us with the old rotation versus5.45us with
+  the larger one; down about1.98us versus2.75us. Return timings recover.
+  The old claim that all these shapes were tested beyond L2 was false;
+  correct the serving header comment as well as the notebook. Retained
+  end-to-end eight-stage contention evidence still stands. Do not change
+  dispatch from isolated timing alone; a fresh cold and contended sweep is
+  warranted before declaring the small-shape configuration exhausted.
+- Raw: perf/results/2026-09-08/fp8-cache-control/{summary,analysis}.json,
+  runtime-control/fp8-cache-control.log. Analysis groups all15paired rounds
+  per shape/batch, not best cases or medians selected by layer.
