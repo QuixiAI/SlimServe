@@ -24529,3 +24529,82 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   compare_layer23_capture.py; all source hashes recorded. Five CPU analyzer
   fixtures pass (1.20s), raw layer23-analysis-fixtures.xml/log; first-pass-only
   cutoff inspection retained in layer23-first-pass-inspect.log.
+
+## 2026-09-09 - Locally qualified native cutoff-tie intervention
+
+- Status: opt-in native intervention locally qualified; actual-input replay and
+  full-model qualification pending, not a production default or performance claim.
+- Baseline:4cead10f6's actual layer23 capture proves pool994/1398 exchange
+  at an exact negative cutoff; native core d45b4ace saved unchanged in
+  runtime-control/index-ties-native-before.so. Full-repeatability remains open.
+- Change/hypothesis: new bounded glm53_top_k_per_row_prefill entry shares the
+  existing selector implementation with a compile-time canonicalTies policy.
+  Final insertion ties compare original pool IDs, not temporary atomic slots;
+  the oversized exact32-bit bin scans pool IDs with block prefix sums, reusing
+  existing shared storage. Signed zeros are one equal-score group. No logit
+  buffer mutation, score epsilon, additional global workspace or launch for the
+  tie decision. Generic prefill/decode defaults remain unchanged. Host geometry/
+  dtype/device guards, release-build device range assertions, checked launches.
+- Opt-in only: SLIMSERVE_GLM53_CANONICAL_INDEX_TIES=1 requires existing canonical
+  order/model/index/MoE diagnostic prerequisites. Journal records the tie policy;
+  campaign marks it baseline-ineligible. TC/profile/quant defaults unchanged.
+- CPU qualification: first473 pass/one skip23.62s; expanded480 pass/one skip
+ 20.95s, including stable independent CPU score/index oracle, adjacent FP32
+  values, signed zeros, empty/short rows and invalid bounds. Ruff/diff checks pass.
+  Raw runtime-control/index-ties-{cpu,final-cpu}-tests.xml/log.
+- Build complete: CUDA13 target_C_stable_libtorch, scratch build-native-sm120,
+  -j2/80GiB/no swap;74 build steps. Existing persistent-topk launch-bound,
+  unused GGUF-variable and CUTLASS deprecated-capture warnings retained. No GPU
+  work overlaps. Installed core8828383f2993a22058de53bf3dc83947edc43f082270fd945ab702f6916f35d5;
+  QuixiCore4ce801/MoE1093b8a4 unchanged. Native import/schema smoke passes.
+- Binary proof: all4187 existing cubin function COPIES retain identical encoded
+  instructions, offsets and scheduling control words across sm_120f/other embedded
+  architectures. Exactly one new kernel glm53TopKPerRowPrefill;40 registers,
+  STACK0/LOCAL0,17424 static shared bytes plus2048 dynamic. Full raw disassembly
+  and comparison index-ties-native-sass-final/comparison.json
+  SHA2ca49e855a3d8d3263b35d6e0cc2a6747dae1f899f31dffb75c1615bf2fee0ab.
+  First checker attempt stopped on duplicate CUB helper names in the OLD binary;
+  corrected checker compares a multiset of all copies per architecture/symbol.
+  Both attempts retained; this was a checker limitation, not a binary failure.
+- GPU qualification:162 tests pass76.45s.108 small cases (nine widths160..262144,
+  six score families, offsets0/1), full7616x1904 and8192x2049 shapes; each has
+  three changed-input eager/graph phases against independent stable CPU sort.
+  Seven host guards and three isolated-process release-build device assertions
+  pass; all three expected assertion logs are verified in the XML (pytest warns
+  about the properties extension under xunit2, but the records are present).
+  Fifteen real-indexer observer cases cover both tiles/layers3/23 and native/
+  order/tie modes; existing model/MoE tracing and24 ordering/replay tests pass.
+- Sanitizers: memcheck4cases6.58s and synccheck same4cases6.74s, zero errors.
+  Cases: offset1 adjacent2049, signed zeros8193, offset0 cutoff262144, full
+ 8192x2049. Bounded racecheck offset1 adjacent2049, first EIGHT matching launches,
+ 5.06s, zero errors/warnings/hazards. Not exhaustive full-size race qualification.
+  Raw runtime-control/index-ties-{gpu,memcheck,synccheck,racecheck} logs/XML;
+  build/disassembly/resource logs alongside them.
+- Prescribed saved-input replay after local GPU/sanitizer qualification:
+  benchmarks/kernels/replay_glm53_indexer_ties.py --run
+  perf/results/2026-09-09/index-layer23-quality-diagnostic --reference-native
+  perf/results/2026-09-09/runtime-control/index-ties-native-before.so
+  --native-comparison perf/results/2026-09-09/index-ties-native-sass-final/comparison.json
+  --output
+  perf/results/2026-09-09/index-ties-saved-input-replay.
+  EACH originalGPU/EACH selector(native,new):ONE warmup+FIVE eager+FIVE graphs,
+  canonical output order in both arms, alternating NaN/123 undefined tails,
+  output poison-777; ALL88 output matrices archived. Every score set must remain
+  valid; candidate must equal CPU score-descending/ID-ascending oracle. Existing
+  native may choose either exact tied member, with no retry requirement to vary.
+  Require unchanged legacy GPU instructions and saved input/source/native hashes.
+- Prescribed full-model run AFTER saved-input qualification: ONE start, three
+  timing rounds and three COMPLETE quality passes, no replacement starts.
+  Same150GiB/no swap/TP4/profile glm53-nvfp4-4/recipe v1/CUDA13/cache/source,
+  OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0, canonical MoE/order/model/MoE/index
+  traces unchanged; add SLIMSERVE_GLM53_CANONICAL_INDEX_TIES=1, capture_layer23.
+  --boots 1 --repeats 3 --cold-prefix --quality --quality-repeats 3,
+  output index-ties-quality-diagnostic/. SCORE_JOURNAL points to runtime-control/
+  index-ties-score-config.json
+  SHA42e318404070d278331385e58caf59c9f7db12be1c46ec68b66865eb902e0735;
+  INDEX_JOURNAL index-ties-index-config.json
+  SHA0a560414b0fd3d4bc16146773347331f8e9c3f8cb3dc42b5658dbe0ddbabdb61.
+  Exact640/8199 token lists unchanged. Freeze source/native throughout all runs.
+- Actual-input replay, full-model correctness/repeatability and TPS are NOT yet
+  measured for this candidate. Keep TC OFF and both extra sorting launches
+  diagnostic. No retained performance claim or relaxed quality contract.

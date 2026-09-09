@@ -31,6 +31,7 @@ def _load(monkeypatch):
         "SLIMSERVE_GLM53_MOE_JOURNAL",
         "SLIMSERVE_GLM53_CANONICAL_MOE",
         "SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER",
+        "SLIMSERVE_GLM53_CANONICAL_INDEX_TIES",
     ],
 )
 def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, active):
@@ -42,6 +43,7 @@ def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, ac
         "SLIMSERVE_GLM53_MOE_JOURNAL",
         "SLIMSERVE_GLM53_CANONICAL_MOE",
         "SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER",
+        "SLIMSERVE_GLM53_CANONICAL_INDEX_TIES",
     )
     for key in keys:
         monkeypatch.delenv(key, raising=False)

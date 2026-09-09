@@ -243,6 +243,27 @@ Raw index-layer23-quality-diagnostic/, runtime-control/index-layer23-
 opt-in native tie policy at the selector origin, preserving all score values
 and strictly-better selections. TC stays OFF and both ordering kernels remain
 diagnostic, not production defaults; full-workload repeatability is unsolved.
+Locally qualified afterfc531bb83: opt-in native pool-ID cutoff tie policy under
+SLIMSERVE_GLM53_CANONICAL_INDEX_TIES=1 (requires existing order/trace flags).
+Separate guarded GLM entry, generic default untouched. Both the final insertion
+comparison and oversized exact-bin selection use pool ID; signed zeros share
+a tie group. No extra GPU launch/workspace for the native tie decision.
+480 CPU tests/one skip and162 GPU tests pass. Native core build completes
+CUDA13/-j2/80GiB/no swap; core is now8828383f2993a22058de53bf3dc83947edc43f082270fd945ab702f6916f35d5.
+All4187 pre-existing cubin function copies have identical instruction encodings
+and scheduling bits; exactly one new kernel.40 registers/no local spills,
+17424 static shared bytes plus2048 dynamic. Backup index-ties-native-before.so
+preservesd45b4ace. Memcheck/synccheck each pass4 selected cases; bounded
+racecheck first8 matching launches passes, zero errors/hazards. Raw
+index-ties-native-sass-final/ and runtime-control/index-ties-* logs/XML.
+Real saved-input replay/full model are NOT yet run for this change. Do not
+promote or claim stability. The new fixed replay tool
+replay_glm53_indexer_ties.py requires a verified old/new native instruction
+comparison, runs both selectors11 times/original GPU and retains all88 outputs.
+After that qualification, ONE start/three full quality passes are prescribed
+in index-ties-quality-diagnostic/, same recipe/all previous diagnostic flags,
+TC0, capture_layer23; only native tie policy is enabled. Both exact prompt-ID
+lists are unchanged; configs runtime-control/index-ties-{score,index}-config.json.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

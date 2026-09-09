@@ -117,6 +117,7 @@ def test_three_requests_multiple_chunks_and_extra_match(journal):
     assert len([e for e in events if e["kind"] == "forward_complete"]) == 6
     assert len(events[0]["implementation_sha256"]) == 9
     assert events[0]["selection_order"] == "native"
+    assert events[0]["selection_ties"] == "native"
     assert events[0]["capture_layer"] == 3
 
 

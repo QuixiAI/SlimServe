@@ -128,6 +128,11 @@ class IndexJournal:
                     if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
                     else "native"
                 ),
+                "selection_ties": (
+                    "smaller-pool-id"
+                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES") == "1"
+                    else "native"
+                ),
                 "implementation_sha256": {
                     p: hashlib.sha256((root / p).read_bytes()).hexdigest()
                     for p in sources

@@ -3125,6 +3125,29 @@ def top_k_per_row_prefill(
     )
 
 
+def glm53_top_k_per_row_prefill(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    raw_topk_indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    topk_tokens: int,
+) -> None:
+    """Opt-in GLM pool-ID tie policy; native output order remains unspecified."""
+    torch.ops._C.glm53_top_k_per_row_prefill(
+        logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        raw_topk_indices,
+        num_rows,
+        stride0,
+        stride1,
+        topk_tokens,
+    )
+
+
 def top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,

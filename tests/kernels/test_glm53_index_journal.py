@@ -98,10 +98,12 @@ def test_native_observer_keeps_inputs_and_records_actual_output(config, family):
 
 
 @pytest.mark.parametrize("tiles", [(8, 64), (2, 128)])
-@pytest.mark.parametrize("canonical", [False, True])
+@pytest.mark.parametrize(
+    "canonical,ties", [(False, False), (True, False), (True, True)]
+)
 @pytest.mark.parametrize("capture_layer", [3, 23])
 def test_compiled_real_indexer_journal_and_runner_chunks(
-    config, monkeypatch, tiles, canonical, capture_layer
+    config, monkeypatch, tiles, canonical, ties, capture_layer
 ):
     """The registered real opaque op, real CUDA selector and synthetic paged KV.
 
@@ -114,6 +116,7 @@ def test_compiled_real_indexer_journal_and_runner_chunks(
     monkeypatch.setattr(gi, "_ROW_TILE", tiles[0])
     monkeypatch.setattr(gi, "_POOL_TILE", tiles[1])
     monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER", str(int(canonical)))
+    monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES", str(int(ties)))
     settings = json.loads(config.read_text())
     settings["capture_layer"] = capture_layer
     config.write_text(json.dumps(settings))

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in causal diagnostic: order existing GLM pool selections, never reselect.
+"""Opt-in GLM pool-order and separate native cutoff-tie diagnostics.
 
 The disabled factory returns the original callable. Enabled only in the GLM
 pooled indexer, with model/selector observers and canonical MoE also required.
 This extra sorting launch is NOT the proposed final serving implementation.
+CANONICAL_INDEX_TIES additionally chooses smaller pool IDs at exact equal-score
+cutoffs in the native selector. It never changes scores or higher-score choices.
 """
 
 import os
@@ -44,9 +46,28 @@ def canonicalize(indices):
     sort_selected_pools(indices)
 
 
+def ties_enabled():
+    value = os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES", "0")
+    if value not in ("0", "1"):
+        raise ValueError("canonical index ties flag must be 0 or 1")
+    if value == "1" and not enabled():
+        raise ValueError("canonical index ties requires canonical index order")
+    return value == "1"
+
+
+def _native_tie_selector():
+    from vllm import _custom_ops as ops
+
+    if not hasattr(torch.ops._C, "glm53_top_k_per_row_prefill"):
+        raise RuntimeError("canonical index ties requires a rebuilt native selector")
+    return ops.glm53_top_k_per_row_prefill
+
+
 def maybe_ordered_topk(function):
+    canonical_ties = ties_enabled()
     if not enabled():
         return function
+    selector = _native_tie_selector() if canonical_ties else function
 
     @wraps(function)
     def ordered(
@@ -61,7 +82,7 @@ def maybe_ordered_topk(function):
     ):
         if num_rows != raw_topk_indices.shape[0] or topk_tokens != 512:
             raise ValueError("canonical index order selector geometry changed")
-        result = function(
+        result = selector(
             logits,
             cu_seqlen_ks,
             cu_seqlen_ke,
