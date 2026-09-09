@@ -21880,3 +21880,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/indexer-tiles/{sweep,paired,first-chunk,
   mid-chunk,long-chunk}.json. Expanded full-selection tests are recorded in
   the same directory as selection-tests.xml when complete.
+
+### Indexer candidate safety gates and opt-in serving
+
+- All 14 full-selection GPU tests pass: original/candidate tiles, uneven
+  requests, cached prefixes, incomplete tails, metadata mapping, and changed
+  inputs under CUDA graphs. All 55 rows in the changed-input fixture select
+  identical token sets across tile geometries on each of three replays.
+- Full-suite memcheck: zero errors. Targeted scoring-kernel racecheck over
+  both geometries and changed-input graphs: zero errors/warnings. Sanitizers
+  use CUDA 13.0, explicit 80 GiB host-memory caps and four racecheck workers.
+- Scoring-kernel synccheck over the full 14-test suite also reports zero
+  errors with the opt-in environment enabled. All 145 CPU SlimServe tests pass.
+- Add opt-in VLLM_GLM5_INDEXER_SM120_TILES=1 (read before worker import).
+  Only RT/PT change from 8/64 to 2/128; no quant, pooling, score arithmetic,
+  visibility, top-k or decode-path change. Other profiles retain their original
+  geometry by default. Registry promotion requires real-profile validation.
+- Next fixed plan: three starts x three repetitions at c1/c8/c16, expanded
+  quality checks, cold 32K/128K TTFT, and additional traces after timing.
+  Baseline is marlin-repair-serving/; every start and result will be retained.
+- Raw: perf/results/2026-09-08/indexer-tiles/{selection,memcheck,racecheck,
+  synccheck,cpu}-tests.xml and {memcheck,racecheck,synccheck}.log.
+  Planned serving output: perf/results/2026-09-08/indexer-tile-serving/.

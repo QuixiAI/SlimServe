@@ -63,8 +63,12 @@ _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 # VLLM_GLM5_INDEXER_PREFILL_MATMUL=0 scores prefill rows with the decode-shaped
 # per-row kernel instead.
 _PREFILL_MATMUL = os.getenv("VLLM_GLM5_INDEXER_PREFILL_MATMUL", "1") != "0"
-_ROW_TILE = 8
-_POOL_TILE = 64
+# Opt-in SM120 geometry: fewer query rows and more pooled keys avoid the
+# original tile's register spills. Arithmetic and selection are unchanged.
+# Keep other profiles on their measured geometry; set before worker import.
+_SM120_TILES = os.getenv("VLLM_GLM5_INDEXER_SM120_TILES", "0") == "1"
+_ROW_TILE = 2 if _SM120_TILES else 8
+_POOL_TILE = 128 if _SM120_TILES else 64
 
 
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):

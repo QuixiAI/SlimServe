@@ -29,7 +29,15 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-Current priority: measured kernel experiments and fresh cold-prefill attribution.
+Current priority: qualify the spill-free pooled-indexer prefill tile through
+the real profile. Cold-prefill traces identified growing indexer scoring cost;
+RT2/PT128/four warps cuts isolated scoring time ~35-38% across four shapes,
+with changed-input graph, FP64 sampled-score and selection gates passing.
+All 14 full-selection tests pass; full memcheck and targeted changed-input
+racecheck are clean. `VLLM_GLM5_INDEXER_SM120_TILES=1` opts in; the registered
+default remains unchanged until fixed-start serving/quality validation passes.
+Raw: perf/results/2026-09-08/indexer-tiles/. This is not yet an E2E speed claim.
+
 The repaired Marlin library has completed the fixed three-start serving campaign:
 all 27 exact timing runs, text/image canaries and expanded quality checks pass.
 E2E medians are **155.91 / 574.42 / 779.05** at c1/c8/c16, performance-neutral.
@@ -114,10 +122,11 @@ the true code first at 1K/8K/32K context. This measures prefill quality, not
 teacher-forced decode or broad capability. Raw: quality-baseline/ under the
 same dated results directory. The serving binary/recipe were unchanged.
 
-Immediate work: complete the isolated mHC/norm fusion assessment and profile
-cold prefill before choosing its kernel target. The existing fused norm loses
-local A/B/A timing at batches 1/2/4/8 despite passing numerical gates; it is
-not integrated. The repaired library leaves the same 1185-node c1 graph and
+The isolated mHC/norm fusion assessment is complete and rejected: the existing
+fused norm loses local A/B/A timing at batches 1/2/4/8 despite passing numerical
+gates; it is not integrated. Cold-prefill attribution is now recorded, including
+all-rank 32K/128K traces (the 128K trace samples only its first eight chunks).
+The repaired library leaves the same 1185-node c1 graph and
 about 0.429 ms of inter-kernel gaps. The
 PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
