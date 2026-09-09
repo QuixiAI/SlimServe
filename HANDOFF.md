@@ -342,12 +342,15 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-1. mHC tensor-core prefill probe: standalone build and six initial cases pass;
-   full2700-case actual-site/shape/magnitude census with independent FP64
-   partial oracle and changed-input graph checks is running at mhc-tc-census/.
-   Timing uses six banks of all90 fn matrices (>3xL2), five A/B/A rounds;
-   no serving integration or speedup claim yet. This changes dot summation
-   order and must pass the predeclared numerical gates without relaxation.
+1. mHC tensor-core prefill probe: census fails after2637 completed cases at
+   T7616/site79/fused. A single BF16 output2.0->2.015625 reaches the strict
+   <2^-7 row-peak boundary. Exact replay uses seed2240 left by the preceding
+   graph checks; independent FP64 rounds to the candidate, but the original
+   parity gate still fails. No full-chunk timing, sanitizer or serving claim.
+   All2160 small-batch cases pass and isolated latency falls29-34% using six
+   banks of all90 fn matrices (>3xL2), five A/B/A rounds. Keep unqualified;
+   any independently specified accuracy qualification is separate work, not
+   a post-hoc relaxation or reclassification of mhc-tc-census/ as passed.
    Paired lossless storage is now retained separately, not this new arithmetic.
    Output-parallel arithmetic and actual 20-iteration
    norm fusion already lost; last-block synchronization was neutral. Do not

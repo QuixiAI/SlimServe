@@ -91,3 +91,27 @@ def test_output_gate_preserves_residual_bits_and_output_arity():
         check_outputs(reference, candidate)
     with pytest.raises(ValueError, match="output count"):
         check_outputs(reference, candidate[:3])
+
+
+def test_output_gate_keeps_strict_boundary_and_reports_failed_value():
+    reference = [
+        torch.zeros(1, dtype=torch.bfloat16),
+        torch.ones(1),
+        torch.ones(1),
+        torch.tensor([[2.0]], dtype=torch.bfloat16),
+    ]
+    candidate = [tensor.clone() for tensor in reference]
+    candidate[-1].fill_(2.015625)
+    with pytest.raises(AssertionError, match='"row_peak_error": 0.0078125') as error:
+        check_outputs(reference, candidate)
+    assert '"reference": 2.0' in str(error.value)
+    assert '"candidate": 2.015625' in str(error.value)
+
+
+@pytest.mark.parametrize("change", ["shape", "dtype"])
+def test_output_gate_rejects_broadcasting_and_dtype_changes(change):
+    reference = [torch.ones(2, 1), torch.ones(2, 1), torch.ones(2, 1), torch.ones(2, 1)]
+    candidate = list(reference)
+    candidate[-1] = reference[-1][:1] if change == "shape" else reference[-1].bfloat16()
+    with pytest.raises(ValueError, match="shape or dtype"):
+        check_outputs(reference, candidate)

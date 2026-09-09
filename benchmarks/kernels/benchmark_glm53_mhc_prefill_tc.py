@@ -105,8 +105,35 @@ def installed(data, fused):
 def check_outputs(reference, candidate):
     if len(reference) != 4 or len(candidate) != 4:
         raise ValueError("unexpected operator output count")
-    exact(reference[:1], candidate[:1])
-    return compare(reference, candidate)
+    for ref, got in zip(reference, candidate):
+        if ref.shape != got.shape or ref.dtype != got.dtype:
+            raise ValueError("operator output shape or dtype changed")
+    try:
+        exact(reference[:1], candidate[:1])
+        return compare(reference, candidate)
+    except AssertionError as error:
+        # Preserve the original gate and report the failed value, not only an
+        # empty AssertionError. Compute this extra diagnostic only on failure.
+        details = []
+        for index, (ref, got) in enumerate(zip(reference, candidate)):
+            finite = bool(torch.isfinite(ref).all() and torch.isfinite(got).all())
+            row = {"output": index, "dtype": str(ref.dtype), "finite": finite}
+            if finite and ref.numel():
+                delta = (got.float() - ref.float()).abs()
+                peak = ref.float().abs().amax(-1, keepdim=True).clamp_min(1e-6)
+                normalized = delta / peak
+                flat = int(normalized.argmax())
+                row.update(
+                    max_abs=float(delta.max()),
+                    row_peak_error=float(normalized.max()),
+                    max_flat_index=flat,
+                    reference=float(ref.flatten()[flat]),
+                    candidate=float(got.flatten()[flat]),
+                )
+            details.append(row)
+        raise AssertionError(
+            f"{error}; output diagnostics: {json.dumps(details)}"
+        ) from error
 
 
 def main():
@@ -223,6 +250,14 @@ def main():
                             "site": site,
                             "magnitude": magnitude,
                             "fused": fused,
+                            # The unfused graph checks mutate these same
+                            # buffers before the fused eager comparison.
+                            "eager_input_seed": (
+                                2001 + site * 3 + 2 if fused else 301 + site
+                            ),
+                            "graph_input_seeds": [
+                                2001 + site * 3 + replay for replay in range(3)
+                            ],
                             "status": "checking",
                         }
                         result["checks"].append(row)

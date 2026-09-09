@@ -23356,3 +23356,49 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Profile validation:267 CPU tests pass/one GPU skip, including explicit
   RTX6000-only storage selection and existing lossless-loader rejection gates.
   Ruff/diff checks pass. Raw: runtime-control/mhc-paired-profile-cpu-tests.{xml,log}.
+
+## 2026-09-08: Tensor-core mHC probe fails the full-chunk parity boundary
+
+- Status: isolated screen FAILED; no serving integration or full-chunk timing.
+  Original run retained at mhc-tc-census/, sourcee8e2bdafc, nativeQC5d4d3790e9aeb6cb,
+  probeSHA45d5e817520a56bbc818e3e237d54b1feea3cb11385540aaabb1fec8fb7980e3.
+  Build CUDA13.0/sm120f, host32GiB/no swap; GPU run16GiB/no swap, no competing
+  GPU work/build.13 CPU oracle/receipt tests pass after the diagnostic update.
+- Hypothesis/baseline: same BF16 values and FP32 finalizer/apply, MMA dot
+  accumulation instead of installed scalar partials. All2637 completed cases
+  pass, but case2638 (T7616, site79/layer39.hc_ffn, magnitude1, fused) fails
+  the predeclared BF16 row-peak error <2^-7 gate. The remaining62 cases are
+  untested. All2160 small-batch cases pass; never report2700 passed.
+- Isolated small-batch timings, five A/B/A rounds/four replays, six banks of
+  all90 fn matrices (424673280bytes>3xL2): T64 A/B/A2=15.1069/10.0413/15.1059us;
+  T65=15.1258/10.1305/15.1287; T128=15.9630/11.2356/15.9678;
+  T129=16.1380/11.3911/16.1408. Paired throughput+50.47/+49.35/+42.08/+41.67%,
+  about29-34% lower latency. These do not qualify the candidate for serving.
+- Exact repro: preceding unfused changed-input graph checks leave seed2240
+  in the shared input buffers before fused eager. Seed380 (initial input) is
+  a different case and does not reproduce; preserve both diagnostic logs.
+  At row6382/column703, installed2.0 versus candidate2.015625, row peak2.0:
+  exactly0.0078125, one element at the rejection boundary. Residual bits match;
+  FP32 post/comb maximum differences6.56e-7/4.77e-7. Sampled independent
+  partial oracle still passes (dotNRMS5.25e-7, row-peak1.11e-6, norm2.58e-6).
+- Independent FP64 calculation of the offending row gives2.007812650812945,
+  rounding directly to BF16 as2.015625, matching the candidate. All4096 values
+  of that row match the directly rounded FP64 result. This diagnoses a
+  rounding-boundary parity failure, not global accuracy proof or a passed
+  original gate. Direct rounding compares adjacent BF16 values in FP64;
+  Torch double->BF16 alone can double-round through FP32. The first seed380
+  diagnostic used that conversion and is not an authoritative rounding oracle.
+- Decision: keep this version isolated/unqualified and preserve the strict
+  bound. An independently specified accuracy qualification is separate work;
+  do not flip < to <=, omit the failing site, or call the old census passed.
+  The prior lossless paired-storage promotion is unaffected: different kernel,
+  unchanged FP32 arithmetic and exhaustive bit parity.
+- Harness improvement: record actual eager/graph seeds, output shape/dtype,
+  and failed value/position/normalized error. Error-bound computation and
+  successful measurement behavior are unchanged. CPU regression preserves
+  this exact2.0/2.015625 boundary as a failure, plus shape/dtype rejection.
+- Resources: pre/fused38/64 registers; fused8-byte stack, two local stores
+  and two local loads in SASS. No unsupported zero-spill claim. No tuning
+  during the frozen census. Raw: runtime-control/mhc-tc-{build.log,resources.txt,
+  sass.txt,first-check.log,census.log,failure.log,mutated-failure.log,
+  receipt-cpu-tests.xml}; mhc-tc-first-check/ and mhc-tc-census/.
