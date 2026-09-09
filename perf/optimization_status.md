@@ -21687,3 +21687,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   boundary-after.json, native-{memcheck,synccheck,racecheck}.* and
   native-oracle-census.json. Build configuration/stdout: native-build.log,
   native-build-cache.txt and native-build.ninja in the same directory.
+
+## 2026-09-08: Prepare an actual-serving mHC + RMS norm fusion probe
+
+- Status: CPU tests/lint pass; no GPU experiment yet and serving is unchanged.
+  Prepared only this unimported diagnostic during the frozen Marlin campaign.
+- Hypothesis: the existing native mHC operator already accepts a norm weight.
+  Removing the separate norm node may help, but increased register pressure
+  and tail work can erase that saving. First test the existing kernel rather
+  than introducing another CUDA implementation.
+- Reference inspection matters: Python rms_norm casts to the weight dtype
+  before multiplying. An initial source-only reading suggested the native
+  fused path would omit that BF16 boundary. The actual serving AOT artifact
+  5fca9498... instead keeps that intermediate in FP32, multiplies the weight
+  in FP32 and rounds only on store. The trace places triton_red_fused_rms_norm_1
+  immediately after the mHC cooperative kernel (about 1.25 us in the inspected
+  batch1 event). Use that compiled arithmetic as the local reference; do not
+  silently insert an eager-only rounding boundary. Archived its generated code.
+- Probe: all 90 checkpoint mHC sites and their actual BF16 norm vectors;
+  GLM's 20 Sinkhorn iterations, exact epsilons and post multiplier. Synthetic
+  inputs at three magnitudes, batches 1/2/4/8, three changed-input graph replays.
+  Require exact residual/post/comb results and at most one BF16 ULP for norm
+  output versus both the compiled reference and independent CPU FP64 norm.
+  Predetermine five A/B/A rounds x twenty replays across all 90 parameter sets.
+  No timing if a numerical gate fails; these would still be isolated timings.
+- Validation so far: two CPU tests cover signed BF16 ordering, signed zero,
+  rejected nonfinite/mismatched tensors, and in-place reference behavior.
+- Tool: benchmarks/kernels/benchmark_glm53_mhc_norm.py. Run only after the
+  current three-start serving campaign releases the GPUs. No native rebuild
+  needed; no production fallback or dispatch option is added.
+- Raw reference: perf/results/2026-09-08/mhc-norm/serving-norm-reference.py.
