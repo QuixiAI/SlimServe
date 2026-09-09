@@ -87,6 +87,8 @@ def test_deterministic_plan_and_server_command_agree(monkeypatch, tmp_path, enab
 
     bench = _load(monkeypatch)
     monkeypatch.setenv("SLIMSERVE_GLM53_NATIVE_ORDER", "1")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path / "triton"))
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
     monkeypatch.setattr(bench.hardware, "detect", lambda: Machine("rtx6000", "RTX", 4))
     monkeypatch.setattr(bench, "compatible_profile_ids", lambda _: ["glm53-nvfp4-4"])
     monkeypatch.setattr(bench, "get_tokenizer", lambda *a, **k: "tokenizer")
@@ -113,13 +115,18 @@ def test_deterministic_plan_and_server_command_agree(monkeypatch, tmp_path, enab
     assert len(launched) == 1
     assert ("--deterministic-reductions" in launched[0]) is enabled
     receipt = json.loads((output / "summary.json").read_text())
+    assert receipt["environment"]["TRITON_CACHE_DIR"] == str(tmp_path / "triton")
+    assert receipt["environment"]["TORCHINDUCTOR_CACHE_DIR"] == str(
+        tmp_path / "inductor"
+    )
     options = receipt["plan"]["engine"]["compilation_config"].get(
         "inductor_compile_config", {}
     )
     assert (options.get("deterministic") is True) is enabled
-    assert "slimserve/deterministic_reductions.py" in receipt[
-        "benchmark_implementation_sha256"
-    ]
+    assert (
+        "slimserve/deterministic_reductions.py"
+        in receipt["benchmark_implementation_sha256"]
+    )
 
 
 @pytest.mark.parametrize(

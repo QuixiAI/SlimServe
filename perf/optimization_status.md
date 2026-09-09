@@ -26359,3 +26359,35 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   in `perf/glm53-deterministic-reductions-protocol.md`; no model starts yet.
 - Raw: `runtime-control/reduction-receipts-cpu.log`; prescribed
   `deterministic-reduction-frontend/`. No quant/native/profile/TC/default changes.
+
+## 2026-09-09 - GPU frontend passes; full-model fresh/cache qualification prescribed
+
+- Status: frontend qualified; full-model policy series prescribed, not yet run.
+- Baseline: runtime policy32/32 cases passed; opt-in deterministic compiler plan
+  and startup graph recorder on49f9bff98. Native-order1/BF16fn1/TC0 unchanged.
+- Hypothesis: actual IR lowering emits the deterministic policy, then independent
+  full-model compilations and a cached return reproduce graph choices and scores.
+- Frontend: one fresh16GiB/no-swap GPU process8/8 passes two RMSNorm IR graphs x
+  rows1/16/640/7616. Real weight, eager repeat, changed-input graph replay, guards
+  and mutation checks pass; FP64 maximum1 BF16 ULP. Four graph bindings identical
+  before/after, all1/1024/eight warps/one stage. Not TP4/full-model validation.
+- Audit: metadata, selected cache keys and cubin byte digests verified;7 source
+  receipts,7 native binaries and5172 original files unchanged, exit0/GPU-free.
+  Initial audit's hex/base32 key comparison corrected; both logs retained. No
+  GPU retry, output replacement or new throughput measurement.
+- Change: tracked offline serving/graph auditors with independently parsed graph
+  symbols, live binding/policy/config/binary/source/native/cache/recipe gates,
+  every exact score, cold throughput and32K/128K prefill validation. Campaign
+  records TORCHINDUCTOR/TRITON cache environment. No serving numerical changes.
+- CPU122pass15.94s; lint/diff checks pass. Replay real artifacts:4 frontend
+  bindings,12 timing files,3 quality passes,24 historical cold prefill requests.
+- Decision: freeze exactly fresh-a/fresh-b/cached-a, one150GiB/no-swap start each,
+  new independent empty caches and cached return without removing receipts.
+  Same full workload plus quality x3/prefill. Stop at failed gate; no retries,
+  source edits/commits/builds during series/audits. Native-order defaultOFF/TC0
+  stay; no promotion or new speed claim. Full protocol tail contains commands.
+- Raw: `deterministic-reduction-frontend/`, audit
+  `runtime-control/deterministic-reduction-frontend-analysis.json`
+  SHA48830fce4a1fec6868f23609dd6cd8510f164e32d263f5996d5de72f2b9b815b;
+  `runtime-control/deterministic-serving-{cpu-final,audit-replay}.log`.
+  Next series root: `deterministic-reduction-serving/` (not launched here).

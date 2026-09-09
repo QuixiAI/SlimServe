@@ -35,7 +35,37 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 23:28 UTC): deterministic runtime policy passes
+### Latest checkpoint (2026-09-09 23:55 UTC): frontend passes; full-model series prescribed
+
+The ONE prescribed frontend GPU process on49f9bff98 completes8/8 cases. Two
+actual vLLM RMSNorm IR graphs x rows1/16/640/7616, native lowering, real layer22
+weight. Repeated eager/changed-input graphs/guards/mutation checks pass; FP64
+maximum1 BF16 ULP. Four actual graph bindings are identical before/after capture,
+all XBLOCK1/RBLOCK1024/eight warps/one stage. Offline audit checks emitted metadata,
+selected cache keys AND cubin byte hashes,7 source receipts,7 native libraries,
+all5172 original files and empty GPU compute query. Not a TP4/full-model forward.
+Audit `runtime-control/deterministic-reduction-frontend-analysis.json`,
+SHA48830fce4a1fec6868f23609dd6cd8510f164e32d263f5996d5de72f2b9b815b.
+Initial offline audit's hex/base32 cache-key mismatch is corrected; failure log
+preserved. No GPU retry. Do not rerun the completed frontend output.
+
+Full-model auditor now implemented BEFORE launches: independent graph-source
+symbol inventory versus actual globals, emitted policy/config/cubin checks,
+source/native/original-cache/recipe/exact-token/quality/prefill gates. Cache paths
+are now recorded in benchmark environment receipts. CPU122pass; real-artifact
+replay passes4 frontend bindings,12 timing files,3 quality passes,24 cold prefill
+requests. No serving/profile/quant/kernel/default changes.
+
+NEXT: prepare `deterministic-reduction-serving/`, freeze sources/native binaries,
+then exactly `fresh-a`, `fresh-b`, `cached-a`, one start each in150GiB/no-swap
+scopes, with per-arm8GiB preflight/audit. Independent EMPTY VLLM/Inductor/Triton
+caches A/B; cached return reuses A without deleting its first receipts. Full
+cold1000/300 c1/c8/c16 x3, text/image, quality x3, cold32K/128K. Stop on failed
+gate, preserve outputs, no retries/edits/commits through series and audits.
+Commands/stop gates: `perf/glm53-deterministic-reductions-protocol.md` tail.
+No full-model launch yet at this checkpoint; no policy or performance promotion.
+
+### Previous checkpoint (2026-09-09 23:28 UTC): deterministic runtime policy passes
 
 The TWO source-runtime qualification jobs on3e497c7c0 are COMPLETE:32 cases
 pass,16 corresponding cases exactly identical across independent empty caches.

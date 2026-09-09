@@ -668,7 +668,17 @@ def main():
         "environment": {
             k: v
             for k, v in os.environ.items()
-            if k.startswith(("VLLM_", "SLIMSERVE_", "NCCL_", "CUDA_", "OMP_"))
+            if k.startswith(
+                (
+                    "VLLM_",
+                    "SLIMSERVE_",
+                    "NCCL_",
+                    "CUDA_",
+                    "OMP_",
+                    "TORCHINDUCTOR_",
+                    "TRITON_",
+                )
+            )
             and not any(s in k for s in ("TOKEN", "PASSWORD", "SECRET", "API_KEY"))
         },
         "runs": [],

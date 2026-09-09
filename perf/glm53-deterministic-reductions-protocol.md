@@ -142,3 +142,98 @@ does the arithmetic; the runner facade only tests the recorder's startup wiring,
 NOT a TP4 forward or full-model equivalence. Never label this full-model validation.
 Freeze sources through this job and audit; preserve failures and do not retry into
 the same output. No full-model start is prescribed until this check is assessed.
+
+## Frontend result and frozen full-model series (2026-09-09 23:55 UTC)
+
+Frontend49f9bff98:8/8 pass, four actual graph bindings identical before/after,
+selected1/1024/eight warps/one stage, FP64 maximum1 BF16 ULP. Eager repeats,
+changed-input graphs, guards and mutation checks pass. Emitted metadata, compiler
+cache keys and cubin byte digests verified;7 source receipts,7 native libraries,
+5172 original files unchanged; exit0/GPU-free. Audit
+`runtime-control/deterministic-reduction-frontend-analysis.json`,
+SHA48830fce4a1fec6868f23609dd6cd8510f164e32d263f5996d5de72f2b9b815b.
+First offline audit compared hex metadata keys directly with base32 launcher keys;
+corrected using Triton's documented encoding. Both logs preserved, no GPU retry.
+
+`benchmarks/analyze_glm53_deterministic_serving.py` prepares/audits this series.
+`benchmarks/analyze_glm53_reduction_receipts.py` independently parses graph-source
+Triton symbols and emitted policy without executing generated code. It checks
+actual globals, complete reduction configs, compiled metadata and cubin bytes.
+122 CPU tests pass; real-artifact replay verifies4 frontend bindings,12 exact
+timing files,3 quality passes and24 prefill requests. Raw `runtime-control/`
+`deterministic-serving-{cpu-final,audit-replay}.log` and replay script.
+
+Prescribe exactly THREE starts, sequential: `fresh-a`, `fresh-b`, `cached-a`.
+Prepare once after committing this checkpoint (clean tree required):
+
+```bash
+systemd-run --user --scope --unit=glm53-deterministic-prepare \
+  -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
+  -m benchmarks.analyze_glm53_deterministic_serving prepare
+```
+
+This exclusively creates `perf/results/2026-09-09/deterministic-reduction-serving/`
+and EMPTY `cache-a/`, `cache-b/`, records source/native/original-cache receipts.
+No seeds, forced AOT namespace, cached RMSNorm substitution, remote cache, TC,
+new quant, or changed driver/power/clocks. Original caches stay untouched.
+
+Each arm requires its own8GiB/no-swap preflight immediately before serving:
+
+```bash
+systemd-run --user --scope --unit=glm53-deterministic-preflight-fresh-a \
+  -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
+  -m benchmarks.analyze_glm53_deterministic_serving fresh-a --preflight
+```
+
+The serving command for fresh-a is below. Preserve a separate launch log via
+`set -o pipefail`/`tee` under `runtime-control/`. Use identical arguments/env for
+fresh-b/cached-a except scope/output name and fresh-b's cache-b paths.
+Cached-a MUST reuse cache-a including its old receipt files, not a copy or seed.
+
+```bash
+systemd-run --user --scope --unit=glm53-deterministic-fresh-a \
+  -p MemoryMax=150G -p MemorySwapMax=0 \
+  env -u NCCL_P2P_DISABLE -u CUDA_LAUNCH_BLOCKING \
+  CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_HOME=/usr/local/cuda-13.0 \
+  OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 SLIMSERVE_CACHE=/raid/weights \
+  VLLM_GLM5_MHC_BF16_FN=1 VLLM_GLM5_MHC_PREFILL_TC=0 \
+  SLIMSERVE_GLM53_NATIVE_ORDER=1 \
+  VLLM_CACHE_ROOT=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-09/deterministic-reduction-serving/cache-a \
+  TORCHINDUCTOR_CACHE_DIR=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-09/deterministic-reduction-serving/cache-a/inductor \
+  TRITON_CACHE_DIR=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-09/deterministic-reduction-serving/cache-a/triton \
+  .venv/bin/python benchmarks/benchmark_glm53_campaign.py \
+  --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+  --output perf/results/2026-09-09/deterministic-reduction-serving/fresh-a \
+  --boots 1 --repeats 3 --concurrency 1 8 16 \
+  --input-tokens 1000 --output-tokens 300 --cold-prefix \
+  --quality --quality-repeats 3 --prefill --deterministic-reductions
+```
+
+After EACH exit and GPU release, audit before the next arm:
+
+```bash
+systemd-run --user --scope --unit=glm53-deterministic-audit-fresh-a \
+  -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
+  -m benchmarks.analyze_glm53_deterministic_serving fresh-a
+```
+
+Freeze all sources/native binaries through ALL jobs and audits, no intervening
+commits/builds/other GPU work. Every start keeps25 warmup/75 timed1000/300 requests,
+text4/imageRed,168 quality requests/12288 text+504 needle scores, two long-prefill
+warmups plus six timed requests (8 output tokens each, zero cached prompts).
+Require exact score equality within/across starts, complete graph-source/global
+coverage on all four ranks, emitted deterministic metadata/config/binary equality
+(not process-local alias multiplicity), unchanged0.01-nat per-window quality gate
+against fixed native controls and positive needle margins. Keep every comparison
+to all12 older/native reference passes; do not require historical-tree equality
+or mistake an aggregate proximity for a per-window pass.
+
+Stop if a start/preflight/audit fails; keep failures, partial outputs and warnings.
+Do not replace slow or failed starts, change gates, or continue B/return after a
+failed preceding arm. A failed planned series can inform a newly prescribed
+experiment, not a silent retry. No policy/TC/default/performance promotion from
+this diagnostic series alone. After it, qualify any remaining numerical gate
+before returning to TC or claiming a faster serving baseline.
