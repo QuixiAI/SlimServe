@@ -24447,3 +24447,40 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Read-only scripts: scratch quality-diagnostics/analyze_ordered_indexer_trace.py,
   verify_ordered_indexer_trace.py and compare_order_intervention.py; hashes
   recorded in outputs. No raw artifact exclusions or quality-contract edits.
+
+## 2026-09-09 - Qualified layer23 capture and fixed next-run protocol
+
+- Status: observer-only extension qualified; full-model capture not yet run.
+- Baseline/hypothesis:145467c58's first remaining long-context trace difference
+  is sorted layer23 indices on GPU3 with unchanged logits/ranges. Capture those
+  actual inputs/outputs to distinguish exact cutoff ties from invalid selection.
+  Do not assume tie causality before verifying the saved matrices.
+- Change: optional strict capture_layer, default3, limited to the11 real DSA
+  layers3..43. Header records it; only that layer's first-call/first-chunk four
+  tensors are archived. All-layer hashes and archive bounds are unchanged;
+  no native, selector, profile, math or production-default changes.
+- Correctness: final468 CPU tests pass/one skip (21.12s),14 GPU tests pass
+  (41.23s), including compiled real indexer with both tile layouts, both order
+  settings, and capture layers3/23. First attempt:468 CPU pass/one skip and
+  13 GPU pass/one failure before execution, TorchDynamo's8-entry compile cache
+  exhausted by fresh synthetic-op identities sharing one fixture code object.
+  Reset that fixture cache between independent cases; serving compile limits
+  unchanged. Retain both attempts. Ruff and git diff --check pass.
+- Prescribed ONE start/three passes: same150GiB/no-swap scope, CUDA0..3,
+  unset NCCL_P2P_DISABLE, CUDA13/VLLM cache/prompt/recipe v1 unchanged,
+  OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0/nativeQC4ce801/core d45b4ace/
+  MoE1093b8a4. MODEL_JOURNAL1/MOE_JOURNAL1/CANONICAL_MOE1/
+  CANONICAL_INDEX_ORDER1 unchanged. Runtime-control index-layer23-score-config.json
+  SHA9f3bf57f20e3d2849cafb60661fdb02729fafb882c9c9c605acc1680e37d18c5;
+  index-layer23-index-config.json
+  SHAfe37de6465542a33ec2e67ed5a373bf6bfe51b7acbba36b3b13dba854556ec82.
+  Exact640/8199 prompt IDs unchanged; capture_layer23 and new output directory.
+  Campaign --profile glm53-nvfp4-4 --boots 1 --repeats 3 --cold-prefix
+  --quality --quality-repeats 3, output index-layer23-quality-diagnostic/.
+  Keep every sample/failure; freeze loaded sources/native until teardown.
+- Decision: validate every archive/HTTP score/source/native receipt, complete
+  all-layer/chunk trace, selected score sets and exact cutoff exchanges. TC
+  remains OFF; both sorts remain diagnostics. No performance claim or new
+  baseline from this serialized instrumented run.
+- Raw qualification: runtime-control/index-layer23-{cpu,gpu}-tests.xml/log
+  (first attempt), index-layer23-final-{cpu,gpu}-tests.xml/log (final).

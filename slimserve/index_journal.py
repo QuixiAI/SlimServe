@@ -3,7 +3,7 @@
 
 All hooks are absent when disabled. Copies/hashes are diagnostic synchronization;
 no GPU values are changed. Undefined logit tails are zeroed ONLY in private CPU
-copies before hashing. Save first layer3/first chunk inputs for an offline replay.
+copies before hashing. Save one configured layer's first chunk for offline replay.
 """
 
 import hashlib
@@ -63,7 +63,7 @@ class IndexJournal:
         config = json.loads(raw)
         if (
             not isinstance(config, dict)
-            or set(config)
+            or set(config) - {"capture_layer"}
             != {"schema", "prompt_ids", "max_matches", "output_directory"}
             or type(config["schema"]) is not int
             or config["schema"] != 1
@@ -74,10 +74,16 @@ class IndexJournal:
             or not 1 <= config["max_matches"] <= 3
             or not isinstance(config["output_directory"], str)
             or not config["output_directory"]
+            or type(config.get("capture_layer", 3)) is not int
+            or config.get("capture_layer", 3) not in LAYERS
         ):
-            raise ValueError("index journal requires 8199 token IDs and 1..3 matches")
+            raise ValueError(
+                "index journal requires 8199 token IDs, 1..3 matches "
+                "and a DSA capture layer"
+            )
         self.prompt_ids = config["prompt_ids"]
         self.limit = config["max_matches"]
+        self.capture_layer = config.get("capture_layer", 3)
         self.match = self.cursor = self.chunk = self.saved_bytes = 0
         self.request = self.device = None
         self.in_forward = False
@@ -113,6 +119,7 @@ class IndexJournal:
                 "max_matches": self.limit,
                 "max_chunks_per_match": 8,
                 "expected_layers": list(LAYERS),
+                "capture_layer": self.capture_layer,
                 "max_tensor_bytes": MAX_TENSOR_BYTES,
                 "max_worker_archive_bytes": MAX_FILE_BYTES,
                 "undefined_logit_tails": "zeroed in private CPU copies only",
@@ -313,7 +320,11 @@ def instrument_topk(function):
         ):
             raise ValueError("long-context index selector shape/recipe changed")
         stage = f"layer-{layer:02d}.call-{journal.layer_calls}"
-        save = layer == 3 and journal.chunk == 1 and journal.layer_calls == 0
+        save = (
+            layer == journal.capture_layer
+            and journal.chunk == 1
+            and journal.layer_calls == 0
+        )
         journal.layer_calls += 1
         journal.layer_rows += rows
         if journal.layer_rows > journal.tokens:

@@ -90,6 +90,13 @@ def test_prerequisites_fail_closed(enabled, monkeypatch, missing):
         {"output_directory": ""},
         {"output_directory": 12},
         {"extra": 1},
+        {"capture_layer": None},
+        {"capture_layer": True},
+        {"capture_layer": "23"},
+        {"capture_layer": 23.0},
+        {"capture_layer": 0},
+        {"capture_layer": 1},
+        {"capture_layer": 45},
     ],
 )
 def test_config_strict(tmp_path, change):
@@ -110,6 +117,7 @@ def test_three_requests_multiple_chunks_and_extra_match(journal):
     assert len([e for e in events if e["kind"] == "forward_complete"]) == 6
     assert len(events[0]["implementation_sha256"]) == 9
     assert events[0]["selection_order"] == "native"
+    assert events[0]["capture_layer"] == 3
 
 
 def test_overlap_missing_layers_and_wrong_continuation(journal):
@@ -249,6 +257,31 @@ def test_missing_layer_and_selector_rejected_with_context_reset(journal, enabled
         assert ij.LAYER.get() is None
     finally:
         ij.ACTIVE.reset(token)
+
+
+@pytest.mark.parametrize("layer", ij.LAYERS)
+def test_configured_layer_is_the_only_archived_layer(tmp_path, enabled, layer):
+    value = ij.IndexJournal(config(tmp_path, capture_layer=layer))
+    value.begin("selected-layer", 0, 4, "cpu")
+    topk = ij.instrument_topk(native)
+
+    @ij.instrument_pooled_indexer
+    def pooled(k_cache_prefix):
+        return run_topk(topk)
+
+    token = ij.ACTIVE.set(value)
+    try:
+        for current in ij.LAYERS:
+            pooled(f"model.layers.{current}.self_attn.indexer.k_cache")
+        value.finish()
+    finally:
+        ij.ACTIVE.reset(token)
+        value.close()
+    paths = list(value.archive.glob("*.pt"))
+    assert len(paths) == 4
+    assert all(f"layer-{layer:02d}.call-0." in p.name for p in paths)
+    header = json.loads(value.path.read_text().splitlines()[0])
+    assert header["capture_layer"] == layer
 
 
 def test_runner_configuration_and_unmatched_request(tmp_path, monkeypatch, enabled):

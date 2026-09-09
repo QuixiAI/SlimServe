@@ -99,17 +99,24 @@ def test_native_observer_keeps_inputs_and_records_actual_output(config, family):
 
 @pytest.mark.parametrize("tiles", [(8, 64), (2, 128)])
 @pytest.mark.parametrize("canonical", [False, True])
+@pytest.mark.parametrize("capture_layer", [3, 23])
 def test_compiled_real_indexer_journal_and_runner_chunks(
-    config, monkeypatch, tiles, canonical
+    config, monkeypatch, tiles, canonical, capture_layer
 ):
     """The registered real opaque op, real CUDA selector and synthetic paged KV.
 
     Input/return buffers are unchanged by observing. Selection order above512
     pools is already variable, so do not claim raw repeated-index parity there.
     """
+    # Each scenario registers a fresh synthetic op in the same namespace.
+    # Do not accumulate guards for destroyed op instances across test cases.
+    torch._dynamo.reset()
     monkeypatch.setattr(gi, "_ROW_TILE", tiles[0])
     monkeypatch.setattr(gi, "_POOL_TILE", tiles[1])
     monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER", str(int(canonical)))
+    settings = json.loads(config.read_text())
+    settings["capture_layer"] = capture_layer
+    config.write_text(json.dumps(settings))
     monkeypatch.setattr(
         gi,
         "top_k_per_row_prefill",
@@ -225,6 +232,7 @@ def test_compiled_real_indexer_journal_and_runner_chunks(
     runner._slimserve_index_journal.close()
     assert len([e for e in events if e["kind"] == "tensor"]) == 2 * (11 * 4 + 4)
     for item in (e for e in events if "archive" in e):
+        assert item["stage"].startswith(f"layer-{capture_layer:02d}.call-0.")
         path = (
             config.parent
             / "trace"

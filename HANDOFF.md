@@ -220,7 +220,15 @@ on every rank. Passes2/3 of the traced true-code request match all94 tensors;
 other candidate requests still vary, so do not infer whole-workload stability.
 Full analysis and cross-intervention verification: runtime-control/
 canonical-index-order-{quality-analysis,intervention-comparison}.json.
-Next capture layer23 logits/ranges/indices to verify the suspected cutoff-tie
+The observer now accepts a bounded capture_layer (default3, only the11 DSA
+layers), so the next prescribed run archives layer23 without changing math.
+468 CPU tests/one skip and14 GPU tests pass. The first GPU matrix attempt had
+13 passes and one fixture compile-cache-limit failure; clearing the synthetic
+op fixture cache between independent cases fixes it, with no serving-limit
+change. Both attempts are retained. Next: ONE start/three full quality passes
+in index-layer23-quality-diagnostic/, same canonical MoE/index-order flags,
+TC0/native/recipe and exact prompt IDs. Only the archive target changes3->23.
+Capture layer23 logits/ranges/indices to verify the suspected cutoff-tie
 membership issue. No reselection/tie-policy change until that capture; TC stays
 OFF and both ordering kernels remain diagnostic, not production defaults.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
