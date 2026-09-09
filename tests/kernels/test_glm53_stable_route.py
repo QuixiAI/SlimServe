@@ -117,7 +117,7 @@ def check_result(result, native, tokens, block):
 
 @pytest.mark.parametrize("tokens", range(1, 17))
 @pytest.mark.parametrize(
-    "scoring,renormalize", itertools.product((0, 1), (False, True))
+    "scoring,renormalize", tuple(itertools.product((0, 1), (False, True)))
 )
 @pytest.mark.parametrize("block", (8, 16, 32, 48, 64))
 def test_changed_inputs(probe, tokens, scoring, renormalize, block):
@@ -153,14 +153,20 @@ def test_changed_inputs(probe, tokens, scoring, renormalize, block):
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        atomic_output = probe.run(
+            logits, bias, scoring, renormalize, scaling, block, False
+        )
         output = probe.run(logits, bias, scoring, renormalize, scaling, block, True)
     for case in cases + cases[::-1]:
         before = set_inputs(case)
         # Poison outputs to check every slot is written on every replay.
-        for t in output:
+        for t in atomic_output + output:
             t.fill_(-123)
         graph.replay()
-        check_result(output, control(), tokens, block)
+        native = control()
+        check_result(output, native, tokens, block)
+        canonicalize(*atomic_output[2:], tokens=tokens, block_size=block)
+        check_result(atomic_output, native, tokens, block)
         for a, b in zip(backing, before):
             assert_bits(a, b)
 

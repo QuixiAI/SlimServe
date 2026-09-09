@@ -2,9 +2,11 @@
 """Fixed isolated A/B/A of origin-stable small-M routing, NOT serving TPS.
 
 32 synthetic shapes: M1..16, random/skew, sigmoid/renormalize/scale2.5/BM8.
-Compare against BOTH the installed native router and native + diagnostic sort.
-Each comparison uses five A/B/A rounds, three warmup graph replays, and five
-timed 20-call graph replays per arm/round. All samples retained; no retries.
+Three separate comparisons: installed native -> synchronized atomic probe;
+synchronized atomic -> stable probe; synchronized atomic + sort -> stable.
+Each uses five A/B/A rounds, three warmup graph replays, and five timed 20-call
+graph replays per arm/round. All samples retained; no retries. Both probe
+policies contain the warp synchronization repair, isolating it from ordering.
 """
 
 import argparse
@@ -56,6 +58,9 @@ def main():
         status="running",
         diagnostic_only=True,
         protocol=__doc__,
+        torch_version=torch.__version__,
+        cuda_version=torch.version.cuda,
+        device_properties=str(torch.cuda.get_device_properties(0)),
         source_sha256=hashes,
         git_commit=subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -124,8 +129,11 @@ def main():
                     logits, bias, 8, 0, True, 2.5, 8, capacity, blocks
                 )
 
-            def sorted_call(native_call=native_call, tokens=tokens):
-                out = native_call()
+            def atomic_call(logits=logits, bias=bias):
+                return probe.run(logits, bias, 0, True, 2.5, 8, False)
+
+            def sorted_call(atomic_call=atomic_call, tokens=tokens):
+                out = atomic_call()
                 canonicalize(*out[2:], tokens=tokens, block_size=8)
                 return out
 
@@ -138,7 +146,8 @@ def main():
                 name: graph_for(call)
                 for name, call in (
                     ("native", native_call),
-                    ("native-plus-sort", sorted_call),
+                    ("synchronized-atomic", atomic_call),
+                    ("synchronized-atomic-plus-sort", sorted_call),
                     ("stable", stable_call),
                 )
             }
@@ -159,7 +168,7 @@ def main():
                             bits_equal(a, b)
                         for a, b in zip(out[3:], reference[3:]):
                             bits_equal(a, b)
-                        if name != "native":
+                        if name in ("synchronized-atomic-plus-sort", "stable"):
                             for a, b in zip(out[2:], expected):
                                 bits_equal(a, b)
                 bits_equal(logits, cpu_logits)
@@ -174,14 +183,18 @@ def main():
                 bias_sha256=tensor_sha(cpu_bias),
                 comparisons=[],
             )
-            for baseline in ("native", "native-plus-sort"):
+            for baseline, candidate in (
+                ("native", "synchronized-atomic"),
+                ("synchronized-atomic", "stable"),
+                ("synchronized-atomic-plus-sort", "stable"),
+            ):
                 rounds = []
                 for repeat in range(5):
                     rounds.append(
                         dict(
                             repeat=repeat + 1,
                             control=measure(graphs[baseline][0]),
-                            candidate=measure(graphs["stable"][0]),
+                            candidate=measure(graphs[candidate][0]),
                             return_control=measure(graphs[baseline][0]),
                         )
                     )
@@ -190,7 +203,12 @@ def main():
                     for arm in ("control", "candidate", "return_control")
                 }
                 case["comparisons"].append(
-                    dict(baseline=baseline, rounds=rounds, medians_us=medians)
+                    dict(
+                        baseline=baseline,
+                        candidate=candidate,
+                        rounds=rounds,
+                        medians_us=medians,
+                    )
                 )
                 print(
                     json.dumps(
@@ -198,6 +216,7 @@ def main():
                             tokens=tokens,
                             pattern=pattern,
                             baseline=baseline,
+                            candidate=candidate,
                             medians_us=medians,
                         )
                     ),

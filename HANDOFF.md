@@ -357,6 +357,13 @@ failures in the notebook/runtime-control/stable-route-* and native-route-*.
 Native serving remains unchanged; no output mismatch or link to prior M640
 score variation is proven. This is a new bounded sanitizer finding, not a
 retraction of the full-model fused-indexer equality result above.
+Explicit pre-overwrite warp sync now clears bounded M13/M16 racechecks for
+BOTH probe policies (48 launches each, zero hazards), and the expanded324-case
+suite plus full memcheck/synccheck passes with exact old IDs/weight bits.
+Probe0fef8ce3 remains isolated; serving QC is still4ce80155. Next fixed32-shape
+timing into stable-route-synced-timing/: separate installed->synced atomic,
+synced atomic->stable, and synced atomic+sort->stable comparisons. See notebook
+for frozen five-round A/B/A protocol. Native integration/real serving still owed.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

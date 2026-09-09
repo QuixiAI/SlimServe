@@ -98,6 +98,10 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
                 const int oe = __shfl_xor_sync(0xffffffffu, best_e, off);
                 if (ov > best || (ov == best && oe < best_e)) { best = ov; best_e = oe; }
             }
+            // Shuffle synchronization does not order shared-memory accesses.
+            // Finish every lane's choice reads before lane0 marks the winner;
+            // the following sync then publishes that write for the next round.
+            __syncwarp();
             if (lane == 0) { choice[m][best_e] = -INFINITY; sel[m][k] = best_e; }
             __syncwarp();
             wsum += score[m][best_e];

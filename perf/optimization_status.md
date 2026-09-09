@@ -25030,3 +25030,49 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   memcheck XML0cee964254d85ececb535144df90494fbe40bf782d4dc73266e55b3d0a8286a7.
   Pytest iterator deprecation retained with the initial test-source receipt;
   no hidden retries, promoted defaults, timing samples or serving claims.
+
+## 2026-09-09 - Explicit router warp ordering clears bounded race qualification
+
+- Source fix: add __syncwarp() between the scored argmax reduction and lane0's
+  shared choice overwrite, preserving the existing post-write sync and all
+  floating-point expressions. Applies to BOTH atomic and stable probe policies.
+  Shuffle operations alone do not provide shared-memory ordering. Installed
+  native remains QC4ce80155; this is probe qualification, not a deployed fix.
+- New separate probe build0fef8ce330825736326628fbefcf5646e1ff21d111f3a40be7f7ed80b1fe7025
+  (CUDA13/-O3/sm_120f,80GiB/no swap/-j2, two steps), old80b05608 preserved.
+  Resource counts unchanged: atomic48regs/44080shared, stable46/46384, no spills.
+  Header34803dc0d0655e733141576ebade9480db834b14d251779ac514a3e7de111501;
+  test73a7e1f9b71b7de96a49dc6c6d1d987003643aa7fbe766f72df7649d8262a01d.
+- Expanded graph qualification now captures BOTH policies. All324 cases
+  pass20.56s; all old native IDs/weight bits preserved, CPU canonical layouts,
+  diagnostic-sort equivalence, red zones and poisoned changed-input graph
+  outputs pass. Iterator deprecation corrected before this new qualification;
+  old source and warning receipts remain intact in255ef7eee/raw logs.
+- Bounded racechecks on M13 and M16/BM8/sigmoid each run the first48 matching
+  probe launches (both policies, eight eager phases and16 graph phases each):
+  PASS7.98/8.24s, zero hazards/errors/warnings. The old installed native is
+  intentionally excluded from these fixed-probe checks, not silently declared
+  race-free. Complete324-case probe memcheck34.12s/synccheck27.48s each PASS,
+  zero errors. All test/source/native hashes frozen and recorded per case.
+- Fixed timing protocol amended BEFORE any timing:32 synthetic shapes, M1..16
+  x random/max-skew, sigmoid/renormalize/scale2.5/BM8, GPU0. Three distinct
+  A/B/A comparisons: installed native -> synchronized atomic probe (repair
+  plus compiler/build difference); synchronized atomic -> stable probe
+  (ordering only); synchronized atomic plus diagnostic sort -> stable probe
+  (complete ordering path). Do not call first comparison a pure barrier cost.
+  Five rounds/three warmup graph replays/five timed20-call graph replays per
+  arm, all7200 samples retained, exact weights/IDs/stable layouts/input bytes
+  before and after timing. Warm-cache kernel-graph throughput only, not an
+  actual decode capture, cold-memory latency, serving TPS or promotion.
+- Next command: CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 MAX_JOBS=2
+  OMP_NUM_THREADS=1 SLIMSERVE_GLM53_STABLE_ROUTE_PROBE=/home/tiny/.local/scratch/slimserve-glm53/stable-route-synced-probe-build
+  .venv/bin/python -m benchmarks.kernels.benchmark_glm53_stable_route
+  --output perf/results/2026-09-09/stable-route-synced-timing
+  in16GiB/no-swap scope, no concurrent GPU/CPU test/build workloads. Source and
+  installed native remain frozen. Native integration/full profile still owed.
+- Raw runtime-control/stable-route-synced-{probe-build,probe-resources,tests,
+  memcheck,synccheck,racecheck-m13,racecheck-m16}.log and associated test XMLs.
+  Test XML54f6f879145ffc9597416f8f25c8316444a2e8e0cb8525889e309461f3485d1c;
+  memcheck XML7fd67b97a49ff108707394e76693ea195931683957c5770c61572b0b2187a823.
+  First failures remain FAIL; this separate corrected candidate passes its
+  stated bounded scope only. No timing claims or source/default/native swaps.
