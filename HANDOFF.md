@@ -124,9 +124,23 @@ cases/8100 changed-input graph phases match the frozen probe bit-for-bit;
 The44 new native tests also pass memcheck and synccheck, candidate kernels only.
 Opt in with VLLM_GLM5_MHC_PREFILL_TC=1; unsupported settings/dtypes/alignment
 retain the old path, and requested features fail startup on stale native builds.
-The fixed1/3/1 real-profile serving/quality gate remains owed. Outputs are
-prescribed as mhc-tc-serving-{control,candidate,return}/, using nativeQC4ce801
-and retained BF16 storage in ALL arms. Only the new TC flag changes0/1/0.
+The fixed1/3/1 real-profile series is COMPLETE, but promotion is REJECTED for
+now: all three candidates fail the predeclared per-window quality gate
+(10/5/8 windows), although aggregate scores and all retrieval contrasts pass.
+Both TC0 controls themselves differ by0.244 nat/token mean absolute score
+delta, up to6.787 on one token. Cause is not established; do not blame or
+exonerate the new arithmetic, or relax the gate. Next isolate within-process
+versus between-start quality variability with TC OFF before more arithmetic work.
+E2E control/candidate/return157.051/156.928/156.712 c1,
+578.818/578.200/577.166 c8,781.849/779.553/777.069 c16. Candidate medians lie
+between controls, but retain the slower c16 samples. Cold32K2582.669/
+2576.940/2588.775ms;128K10868.380/10873.613/10924.900ms. Small32K gain,
+no robust128K gain. All45 timing rounds/375 exact cold requests, all30 measured
+prefills and30 retrieval contrasts complete; no retries, exclusions or code/
+binary changes. Outputs: mhc-tc-serving-{control,candidate,return}/, native
+QC4ce801 and retained BF16 storage in ALL arms; only TC changes0/1/0.
+Raw combined performance and failed quality analysis are in runtime-control/
+mhc-tc-serving-{analysis,quality-analysis}.json. All jobs ended and GPUs released.
 The full timing/source receipts are in mhc-tc-qualified-timing/ and the native
 integration proof is in mhc-tc-native-census/ under perf/results/2026-09-09/.
 Do not equate this numerical qualification with a serving gain or promotion.
@@ -389,8 +403,10 @@ Current candidate priorities (hypotheses, not physical ceilings):
    pointwise violations in both kernels. The original strict parity failure
    at T7616/site79/fused/seed2240 remains recorded, not reclassified. Follow
    `perf/glm53-mhc-tc-accuracy-contract.md`: sanitizers and gated native
-   integration now pass; finish the fixed
-   control/candidate/return serving quality/performance series before promotion.
+   integration pass; the fixed control/candidate/return series completes but
+   fails the per-window model-quality gate. Keep TC OFF and isolate the existing
+   control/control score variability before considering promotion or more
+   arithmetic changes. A same-process repeated TC0 quality diagnostic is next.
    The unchanged probe is45d5e817, current nativeQC4ce80155. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
    Five-round cold timing gives29-34% lower small-batch latency but only2.61%

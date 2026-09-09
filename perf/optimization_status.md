@@ -23674,3 +23674,78 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   matching runtime-control logs. Serving outputs prescribed as
   mhc-tc-serving-{control,candidate,return}/; next command is the existing
   benchmark_glm53_campaign.py with the first arm's TC0/boots1 settings above.
+
+## 2026-09-09: Tensor-core mHC serving series completes, quality blocks promotion
+
+- Status: promotion rejected pending diagnosis; TC remains OFF in the profile.
+  All fixed1/3/1 starts complete on55cb6783f/nativeQC4ce801, same selected recipe,
+  BF16-storage1 throughout, TC flag0/1/0. Benchmark/native hashes match in all
+  arms. No retries, excluded samples, rebuilds, profiler or competing GPU jobs.
+  Read-only analysis tools were developed during the run; loaded serving and
+  benchmark sources stayed fixed. Startup188.093/150.082/136.038/148.049/
+  134.566s; the first control includes fresh compilation, retained as prescribed.
+- Serving validity:45 rounds/375 exact1000/300 requests with zero cached tokens,
+  no replacement characters; all five text/image canaries4/Red,20,480 scored
+  tokens,30 positive needle contrasts and30 measured cold32K/128K requests.
+  All teardown exit0; final driver release0.531s, no live workers afterward.
+  This does NOT constitute a pass of the separate paired model-quality gate.
+- Control / pooled candidate / return E2E medians in tok/s:
+  c1 157.050716 /156.927781 /156.711658;
+  c8 578.817517 /578.200068 /577.165550;
+  c16 781.848637 /779.553156 /777.069500.
+  Candidate ranges156.734832-157.096349,576.799951-579.655302,
+  773.727439-782.869931. Medians bracketed by controls, not a decode gain;
+  candidate c16 includes a reading below either control's range, retained.
+- Cold engine TTFT control / candidate / return, milliseconds:
+  32K2582.669235 /2576.939974 /2588.775315;
+  128K10868.379652 /10873.612624 /10924.899677.
+  Candidate32K range2569.815002-2579.589156 (all9 below all6 controls), median
+  latency reduction0.222-0.457%. Candidate128K range10819.206759-10907.861663;
+  -0.048% against first control,+0.469% against return: no robust128K gain.
+  Full-chunk2.61% isolated improvement does not translate into a large serving win.
+- Paired quality gate FAILED. Source-hashed analyzer rechecks raw response
+  scores, exact matching prompt IDs/offsets, all32 windows/4096 scored tokens,
+  all six needle prefixes/alternatives and recomputed summaries. Predeclared
+  rule unchanged: each candidate window and aggregate >= lower TC0 control
+  minus0.01nat/token. Candidates fail10/5/8 windows; worst shortfalls BEYOND
+  that allowance0.094576/0.032584/0.064328. All aggregate gates pass:
+  means in order control/candidates/return -2.735242401 /-2.724443203 /
+  -2.719323636 /-2.738817679 /-2.723519163. No threshold adjustment.
+- Control/control variability is itself substantial: all4096 scores differ,
+  mean delta+0.011723, mean absolute0.244054, RMS0.440245, max absolute6.787223
+  nat/token. Candidate/control RMS0.433-0.476 is of similar scale, but that is
+  NOT proof of equivalence or evidence that the candidate caused the failure.
+  Historical same-FP32-path controls with identical QC5d4 also differ: mean
+  absolute0.238951, RMS0.418131,max6.992445,28/32 windows differ by>0.01.
+  Exact input IDs and raw scores checked in both historical receipts. This is
+  an existing measurement/runtime reproducibility issue requiring isolation.
+- Generated-output inspection: all five canaries return4/Red; all375 timed
+  responses pass token/UTF8 checks. Sampled c1 continuations from each start
+  continue the technical README coherently but differ, including invented
+  benchmark prose. Those generated claims are NOT measurements or a factual
+  accuracy pass. Example quality-window7 next tokens differ across starts;
+  full raw outputs and per-token extrema retained. Not broad quality certification.
+- Decision/next: do not enable TC, widen the gate or choose favorable starts.
+  Isolate whether the unchanged TC0 path varies within one live process or only
+  between starts. Prescribe ONE real-profile start with the same canaries,
+  three exact cold c1/c8/c16 timing repetitions as workload priming, followed
+  by THREE complete quality passes on the same live model (same32 windows,
+  all six needles). Diagnostic only; no performance claim. No extra restarts
+  or arithmetic changes. Record every pass and compare all raw token scores.
+  Only after locating the variation consider a paired arithmetic comparison.
+- Added read-only quality analyzer and12 CPU regressions covering altered IDs,
+  raw-score/summary mismatch, missing cases, window failure despite aggregate
+  success, inclusive boundary and negative retrieval margins. Full CPU suite
+  334pass/one skip. Native proof refinement compares all745 existing function
+  instances/734 unique symbols including BOTH encoding words/scheduling bits:
+  unchanged; two new instances/symbols. The first uniqueness-only diagnostic
+  rejected duplicate symbols across cubins; the multiset check retains them all.
+- Raw: perf/results/2026-09-09/mhc-tc-serving-{control,candidate,return}/,
+  runtime-control/mhc-tc-serving-{series.log,analysis.json,quality-analysis.json},
+  mhc-tc-historical-quality-control-spread.json,
+  mhc-tc-native-instruction-multiset-equivalence.json,
+  mhc-tc-paired-analysis-cpu-tests.xml. Quality analyzer exit1 intentionally
+  records the failed gate; serving controller exit0. Summary SHA control
+  018a7473ed8db71c10abe533e7be3cfe7a9c2baa30e1925832e60ac0133505e9;
+  candidate7a0cc77925ce97b12913946cc31362a487eec0714ed23b5a983fb8c2f18ff1e7;
+  returna777599019f4ae08e4810686572e9b8fa34f9251bc8b90973548af8900b7b638.
