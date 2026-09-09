@@ -24166,3 +24166,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Analyzer: scratch quality-diagnostics/analyze_canonical_moe_trace.py.
   All processes exit0 and GPUs release in0.088s. No native builds or
   competing GPU work during the run; no replacements/exclusions.
+
+## 2026-09-09 - Installed indexer top-k ordering reproducer
+
+- Status: standalone selection repeatability problem reproduced; causality for
+  the remaining long-context GLM score variation still needs serving captures.
+- Protocol:322bfa82d+probe, installed core native unchanged, SM120 GPU0 only,
+  no serving process,16GiB/no-swap. top_k_per_row_prefill,8 rows/top512,
+  column counts160/512/513/1904/2048/8192. Unique-score, cutoff-tied and random
+  FP32 inputs, fixed per case;10 eager plus10 graph invocations each. Output
+  poisoned before every call. No timing claim or replacement cases.
+- Results: all360 calls pass independent CPU valid-count/padding/uniqueness
+  and exact selected-score-multiset checks. The <=512-column shortcuts are
+  bit-repeatable. Every18 comparison pair per case above512 columns changes
+  output order, including unique-score inputs; unique/random selected sets
+  remain identical, while tied selected sets vary. Sorting the selected IDs
+  alone would not resolve tied-set membership variation.
+- Raw inputs and ALL20 outputs per case retained in18 hashed tensor archives;
+  all file hashes verify. Probe helper CPU tests2pass; lint/diff clean.
+  Source/native hashes in indexer-order-probe/summary.json; raw log in
+  runtime-control/indexer-order-probe.log. No serving/native change.
+- Next: record actual8K request selection logits/ranges/IDs across repeated
+  canonical-MoE quality passes, masking undefined logit tails only in CPU
+  diagnostic copies. Prove input identity and distinguish selected-set changes
+  from order-only changes before choosing an indexer intervention.
