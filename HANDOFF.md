@@ -29,33 +29,41 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-The current B12X cold-prefix control is complete: three prescribed starts,
-all27 timing rounds/225 exact1000-in/300-out requests, text/image canaries,
-4096-token quality and six needle checks per start pass. E2E medians
-132.588/466.690/589.276 tok/s at c1/c8/c16; cold32K/128K engine TTFT
-2.714/10.824s. Every measured request reports zero cached tokens. All owned
-containers exit0/no OOM and are removed. This is digest-pinned R28.1 with
-the qualified host-driver/native-FA2 adaptations below, no-spec/DCP1 and
-the launcher's unchanged4096-token/prefill-compute-share0.4 scheduling.
-It uses DIFFERENT W4A4/FP8-KV precision, not our selected recipe. Raw:
-perf/results/2026-09-08/b12x-r281-cold-serving/. A fresh SlimServe three-start
---cold-prefix series is next before a direct current comparison.
+Both current cold-prefix baselines are complete: three prescribed starts
+per stack, all 27 timing rounds/225 exact 1000-in/300-out requests, text/image
+canaries, 4096-token quality and six needle checks per start pass. Every
+measured request reports zero cached tokens. Our unchanged selected recipe
+delivers 155.903/575.555/779.064 E2E tok/s at c1/c8/c16, versus B12X
+132.588/466.690/589.276: +17.6%/+23.3%/+32.2%. Cold 32K/128K engine TTFT
+is 2.600/10.968s versus 2.714/10.824s: 4.2% lower at 32K, 1.3% higher at
+128K. These are current request-level results, not new kernel speedups.
+Raw: perf/results/2026-09-08/{cold-recipe-baseline,b12x-r281-cold-serving}/.
 
-Do not read the reference's499.85/615.39 client-decode medians as sustained
-batch8/16 kernel throughput: the first-to-last window includes staggered
-cold prefill. Raw chunk analysis shows ~668 tok/s at c8 once all requests
-are generating, close to the cached run. The cached first c16 timing has a
-synchronized2.67s client pause of unresolved origin; keep its slow result.
-benchmarks/analyze_glm53_client_streams.py preserves every original metric
-and makes the window distinction explicit. Raw: runtime-control/
-b12x-{client-stream-windows,cold-client-stream-windows}.json.
+B12X is pinned R28.1 with the qualified host-driver/native-FA2 adaptations
+below, no-spec/DCP1, and its unchanged 4096-token/prefill-compute-share0.4
+scheduling. It uses DIFFERENT W4A4/FP8-KV precision, not our selected recipe.
+Our profile, quant, native libraries and spill-free indexer remain unchanged;
+the mHC BF16-storage candidate is still OFF. No starts were discarded.
+
+Neither stack's client-decode metric is sustained full-concurrency decode:
+both first-to-last windows include staggered cold prefill. During the common
+interval when all requests are generating, median client arrivals are
+673.36/956.43 tok/s for SlimServe c8/c16 versus B12X 663.52/958.55. These are
+diagnostic windows, not replacement benchmark rates or pure GPU timings.
+Batched decode is close; the large E2E advantage is not a kernel-only gain.
+The cached reference's first c16 timing has a synchronized 2.67s client pause
+of unresolved origin; keep its slow result. Raw stream analyses are under
+runtime-control/{b12x,recipe}-cold-client-stream-windows.json.
 
 Next isolated kernel candidate is prepared, NOT built or promoted: paired
 BF16 fn staging for mHC prefill, same FP32 arithmetic/reduction order.
 Only the diagnostic probe enables it; serving callers remain unchanged.
-CPU tests8pass, including strict signed-zero parity. Full actual-site GPU
+CPU tests: 8 pass, including strict signed-zero parity. Full actual-site GPU
 checks, five fixed A/B/A rounds and sanitizers are owed. See the notebook's
 prescribed shapes and mhc-storage-paired-build scratch directory.
+An independent FP8 launch probe is also prepared, not built: 12 combinations
+of tile width/warp count/staging, actual weights beyond three L2 capacities,
+independent FP64 oracle and subsequent contention gate. CPU tests: 8 pass.
 
 The spill-free pooled-indexer tile is retained in the RTX6000 profile:
 `VLLM_GLM5_INDEXER_SM120_TILES=1` selects RT2/PT128/four warps. Three fixed
@@ -143,8 +151,8 @@ reasoning Red solid image. and final content Red: the client concatenated
 channels. Canaries now evaluate content only and retain all raw events;
 interactive combined display and request bodies remain unchanged. Earlier
 RedRed responses lack raw fields, so their exact split cannot be reconstructed.
-The next full B12X comparison uses --cold-prefix and the same zero-cache
-gate on all timing requests; no direct ratios from the cached series.
+The completed cold-prefix comparison above uses the same zero-cache gate
+on all timing requests; no direct ratios from the cached series.
 No vision disabling, canary relaxation, fastest-start selection or quant change.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
@@ -181,7 +189,8 @@ not established: a model-free R24 container probe now passes every-pair IPC
 writes and all three NCCL reductions with P2P enabled, loading host libcuda
 580.173.02 with CUDA runtime 13.3. Its custom collective is not yet qualified.
 R28.1 is now published with public source mirrors; see the 2026-09-08 audit
-entries in perf/optimization_status.md. A matched current control remains owed.
+entries in perf/optimization_status.md. The matched cold-prefix control is
+now complete above; other scheduler/speculation configurations remain separate.
 
 The operator authorized autonomous continuation and incremental commits on
 2026-09-08. The selected RTX6000 weight recipe is now explicit in the
@@ -276,29 +285,29 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-First finish the active matched B12X control. For startup variability, compare
-whole-graph/unprofiled timing against node tracing before changing dependencies
-or launch attributes; rank0-only node traces are insufficient. Do not restart
-until all ranks appear fast in a profiler.
-
-1. MoE launch geometry: routing and cold-cache traffic are now measured;
-   test existing Marlin tile/grid controls on actual weights. The rank-0 c8 trace has
-   about 5.26 ms of Marlin and 4.10 ms of FP8 projection durations with overlap;
-   summing those durations overstates their contribution to the step. Inspect
-   the prior rejected expert prototype before changing its scheduling/layout.
-2. mHC producer/consumer scheduling: the output-parallel arithmetic layout
-   lost measured timing and must not be integrated.
-   The last-block synchronization experiment was neutral. The old phase probe
-   used a three-iteration test fixture with fused RMS norm; GLM uses 20 Sinkhorn
-   iterations and separate norms. Re-measure the actual path. B12X's dependent-
-   launch implementation is a relevant separate precedent, not a guaranteed gain.
-3. Sparse-MLA decode, pooled indexer and neighboring norm/glue fusion. Validate
-   numerical and state behavior across decode, prefill and context boundaries.
-   Python-to-C++ registration alone does not remove captured GPU graph nodes.
-4. Fresh long-context prefill attribution and matched TTFT measurements. Keep
-   cold startup/warmup costs recorded separately, with no pass-number selection.
-   The recipe's BF16 lm_head and KV stay fixed; FP8 variants would be a different
-   quant experiment, not an optimization silently applied to this baseline.
+1. Whole-model observer control is next: fixed three starts under bounded
+   Nsight whole-graph capture, --cuda-traces --cold-prefix --quality --prefill,
+   plus the separate return timing matrix. The unprofiled reference is now
+   cold-recipe-baseline/. Preserve every rank and boundary record. Do not
+   change graph topology/driver or restart until a profiler looks fast.
+2. Paired BF16 mHC prefill staging: test the prepared isolated candidate over
+   all 90 actual sites, then its prescribed A/B/A against installed BF16.
+   The storage candidate's ~0.5% c1 gain is qualified but its small prefill
+   cost remains unresolved. Output-parallel arithmetic and actual 20-iteration
+   norm fusion already lost; last-block synchronization was neutral. Do not
+   repeat those experiments from the old three-iteration fixture.
+3. FP8 launch geometry: run the prepared actual-weight cold sweep, then test
+   any candidate under routed-expert contention. The old shared ROT24 fit L2
+   and never varied warp count. Preserve the existing eight-stage contention
+   evidence. The separate Marlin scheduling candidate failed its stricter
+   numerical gate and remains unintegrated; the shared-memory race repair is
+   retained. Measured Marlin traffic is already near the unique-weight floor.
+4. Long-context prefill and weight staging: the matched 128K result is about
+   1.3% slower than this B12X control. Keep the retained indexer geometry and
+   use fresh attribution to select the next kernel/overlap experiment. B12X's
+   L2-prefetch windows are a studied reference, not an implemented win here.
+   The recipe's BF16 lm_head, activations and KV stay fixed. Sum neither
+   overlapping kernel times nor mixed timing definitions into a speed claim.
 5. MTP: the earlier k=1 probe served but regressed recommended-sampling throughput.
    Draft CUDA-graph capture remains the first cost-side experiment. Acceptance and
    actual verifier routing decide the benefit; estimated 57/103 expert counts do

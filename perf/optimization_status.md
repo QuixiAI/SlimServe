@@ -22919,3 +22919,56 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - CPU tests: 8 pass; Ruff/format and diff checks pass. Use a new scratch
   fp8-launch-build directory; no native build during a serving series.
   Raw: perf/results/2026-09-08/runtime-control/fp8-launch-final-cpu-tests.xml.
+
+## 2026-09-08: Explicit cold-prefix SlimServe baseline completes the comparison
+
+- Status: retained current baseline, not a new kernel speedup. Registered
+  glm53-nvfp4-4/rtx6000, recipe v1, BF16 KV/activations/lm_head, retained
+  spill-free indexer, mHC BF16-storage OFF. Source803672802; unchanged
+  native QC f52c2d3d27a30567, MoE 1093b8a4ca7cb308 and core d45b4aceb9068664.
+- Three prescribed starts x three repeats at c1/c8/c16, exact1000/300,
+  recommended sampling. All 27 rounds/225 requests and text/image canaries
+  pass. Every timing and warmup uses an independent salt and cached_tokens=0.
+  Startup150.074895/150.045651/140.046804s; all retained, no extra starts.
+  All client sources remain frozen for the entire series. Concurrent edits
+  touch only independent probes/analyses/docs, not serving or benchmark code.
+- E2E medians155.902700/575.555250/779.063869 tok/s; nine-sample ranges
+  155.674256-156.159155/573.888095-579.201815/775.429272-780.008755.
+  Client-decode medians164.586468/589.407063/791.692637, median mean-TTFT
+  107.053/554.460/855.706ms. No material change from the retained baseline.
+- Cold32K/128K engine TTFT medians2599.959335/10967.698613ms, ranges
+  2593.595731-2603.675088/10899.932021-11014.546353. Client medians
+  2642.379137/11077.171792ms. Nine measured requests per length, zero cached
+  tokens throughout; all warmups remain separate and preserved.
+- Quality: 4096 scored tokens/start, means -2.723662451/-2.729105216/
+  -2.733481317; all 18 needle contrasts pass, minimum margin33.047501.
+  No claim of broad capability superiority from this small prefill corpus.
+- Current matched-workload comparison against the preceding B12X control:
+  E2E throughput +17.584%/+23.327%/+32.207%; engine TTFT -4.201% at32K,
+  +1.323% at128K. B12X has different W4A4/FP8-KV precision and scheduler
+  settings; these are request-level results, not kernel-only improvements
+  or a claim against every B12X scheduler/speculation configuration.
+- Both stacks' client-decode windows include staggered prefill. All-active
+  interval arrival medians c1/c8/c16: SlimServe164.586/673.355/956.427,
+  B12X156.602/663.521/958.554. c8 ranges670.970-677.450 vs656.297-668.646;
+  c16 ranges950.178-958.164 vs950.332-966.750. Batched decode is close;
+  these observed client intervals are NOT replacement TPS or pure GPU time.
+  First-token spread medians at c8/c16 are0.509/1.052s here versus1.315/
+  3.164s there. This explains much of the different first-to-last windows
+  without inferring a cache-salt-induced change in kernel speed.
+- Controller exits0, all owned servers are gone, no active GPU processes at
+  completion. Systemd150GiB/no swap; no concurrent native builds/GPU jobs,
+  driver/clock/power/quant changes. Read-only memory-clock check:13365MHz
+  current,14001MHz maximum, ECC disabled on all four cards; unchanged.
+- Decision: retain the explicit cold-prefix baseline and update stale profile
+  descriptions/handoff priorities. Next is the already prepared whole-model
+  observer control, before the isolated mHC and FP8 probes. The mHC arithmetic-
+  layout/norm-fusion failures and Marlin numerical-gate failure remain rejected;
+  do not repeat them because an old handoff still called them future work.
+- Raw: perf/results/2026-09-08/cold-recipe-baseline/ and runtime-control/
+  {cold-recipe-baseline.log,recipe-cold-client-stream-windows.json}. The latter
+  retains all 27 measured source-file hashes and original metrics.
+- Follow-up documentation validation: all registry fields other than notes
+  compare equal to source803672802; 94 profile/recipe/campaign CPU tests pass.
+  Raw: runtime-control/cold-profile-note-tests.xml. No engine change is hidden
+  in the refreshed performance descriptions.

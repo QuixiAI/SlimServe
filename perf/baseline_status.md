@@ -1919,6 +1919,43 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 explicit cold-prefix baseline and comparison - 2026-09-08
+
+Current selected recipe v1, unchanged repaired native libraries, retained
+spill-free indexer, BF16 KV/activations/lm_head, mHC BF16-storage flag OFF.
+Source803672802; no profiler. Three prescribed starts x three repeats,
+exact 1000/300 and recommended sampling. All 27 rounds/225 requests,
+text/image canaries and expanded quality gates pass, with no exclusions.
+Unique salts enforce zero cached tokens on every warmup and timing request.
+Startup150.075/150.046/140.047s. This confirms the baseline under the explicit
+cold-cache protocol; it is not a new kernel performance change.
+
+| Concurrency | E2E tok/s median [min, max] | Client decode median | B12X cold E2E median | E2E difference |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 155.90 [155.67, 156.16] | 164.59 | 132.59 | +17.6% |
+| 8 | 575.56 [573.89, 579.20] | 589.41 | 466.69 | +23.3% |
+| 16 | 779.06 [775.43, 780.01] | 791.69 | 589.28 | +32.2% |
+
+The separate B12X configuration below uses different W4A4/FP8-KV precision
+and launcher scheduling. Both client-decode windows include staggered prefill.
+Common all-active interval arrival medians at c8/c16 are673.36/956.43 here
+versus663.52/958.55 there: batched decode is close. Those intervals are
+diagnostics, not replacement TPS or pure GPU timing. No kernel-only or
+all-B12X-configurations claim follows from the E2E advantage.
+
+| Input tokens | Client TTFT median ms | Engine TTFT median [min, max] ms | B12X engine median ms | Latency difference |
+| ---: | ---: | ---: | ---: | ---: |
+| 32768 | 2642.38 | 2599.96 [2593.60, 2603.68] | 2713.98 | -4.2% |
+| 131072 | 11077.17 | 10967.70 [10899.93, 11014.55] | 10824.44 | +1.3% |
+
+Nine measured requests per length, every cached_tokens=0, one prescribed
+warmup per length/start retained separately. Per-start4096-token quality
+means -2.723662/-2.729105/-2.733481; all18 needle contrasts pass, minimum
+margin33.0475. These are the defined quality gates, not broad capability proof.
+Controller exits0 and owned servers are gone. No native builds or other GPU
+work during the series. Raw: perf/results/2026-09-08/cold-recipe-baseline/;
+stream diagnostics: runtime-control/recipe-cold-client-stream-windows.json.
+
 ### RTX6000 B12X cold-prefix competitive reference - 2026-09-08
 
 The selected SlimServe recipe remains unchanged. This separate control uses
@@ -1955,8 +1992,8 @@ means -2.916894/-2.917379/-2.921713; all18 needle contrasts rank the target
 first, minimum margin32.2587. This is not a broad model-quality ranking.
 Every owned container exits0/no OOM and is removed. Raw:
 perf/results/2026-09-08/b12x-r281-cold-serving/ (sourcef918c0798).
-A fresh SlimServe --cold-prefix three-start baseline is next; do not substitute
-the earlier cached B12X series or historical best-start records.
+The matched SlimServe --cold-prefix baseline is now recorded above. Do not
+substitute the earlier cached B12X series or historical best-start records.
 
 ### RTX6000 mHC candidate qualification - 2026-09-08 (not promoted)
 
