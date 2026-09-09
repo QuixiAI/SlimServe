@@ -21800,3 +21800,57 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   with or without norm. Register spilling does not explain the batch1 penalty.
   Raw: mhc-norm/native-resources.txt; decoder analyzer check under
   cold-prefill-profile/old-decode-analyzer-check.json in the dated results.
+
+## 2026-09-08: Cold-prefill attribution and indexer tile hypothesis
+
+- Profile run 89a327337 completes: one explicitly diagnostic start, canaries
+  and exact 1000/300 c1 check pass (156.407 E2E tok/s). Unprofiled 32K/128K
+  engine TTFT medians 2596.292/11286.497 ms, three requests each, cache zero.
+  This does not replace the three-start baseline. Additional trace requests
+  follow all timed work. Trace export pauses the 128K request mid-prefill
+  (25.001 s engine TTFT); that number is not benchmark performance.
+- Detailed annotations: full chunks are 7616 tokens, not 8192 (hybrid cache
+  alignment). The 32K trace covers six prefill steps, including 2176/128-token
+  tails, then two decode steps. The 128K trace covers only its first eight
+  chunks, through 60928 context tokens. Every rank's eight steps are retained.
+- Rank0 full-chunk GPU spans grow 571.102 -> 643.884 ms. NCCL all-reduce
+  duration sum stays ~181 ms, 84 expert GEMMs ~122 ms, 11 sparse MLA calls
+  58.64 -> 67.70 ms, 180 FP8 blockwise GEMMs ~42.5 ms, mHC partials ~38.4 ms,
+  pre-mix ~15.2 ms and MoE combine ~16.1 ms. Pooled-indexer scoring grows
+  5.692 -> 68.612 ms. Kernel sums and busy unions are nearly equal here;
+  unlike decode, meaningful kernel overlap is absent in these prefill steps.
+  Other ranks agree on whole-step spans; their all-reduce durations include
+  modest rank skew (about 181-188 ms), so those durations are not pure transfer.
+- Communication inference: a 7616 x 4096 BF16 payload is 62390272 bytes.
+  Under ring's 1.5x TP4 traffic factor, ~2 ms implies ~47 GB/s, consistent
+  with prior peer-copy measurements. This is not a measured physical ceiling.
+  Do not rerun old protocol/channel arms merely because communication is large.
+- Correction to older NCCL notes: the RING_LL kernel NAME does not establish
+  LL protocol. Matching installed NCCL 2.29.7's generate.py maps other protocols
+  to LL-named entry kernels; common.h dispatches the actual function ID.
+  Thus the old claim that NCCL_PROTO=Simple failed to change protocol based on
+  that label was unsupported. Also global NCCL_ALGO=Tree can disable algorithms
+  required by other collectives; its old startup failure does not prove that
+  tree all-reduce itself is unsupported. A future test must use per-collective
+  selection and actual NCCL algorithm/protocol evidence. Serving defaults stay.
+  Sources: https://github.com/NVIDIA/nccl/blob/v2.29.7-1/src/device/generate.py
+  and https://github.com/NVIDIA/nccl/blob/v2.29.7-1/src/device/common.h ; option
+  syntax: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html .
+- Next kernel hypothesis: current indexer scoring uses RT8/PT64/four warps,
+  255 registers/thread and 64 KiB shared memory. Its isolated compiled metadata
+  reports 24 spills. Test smaller row/pool tiles and warp counts without changing
+  BF16 operands, head reduction, pooling, visibility, or selection semantics.
+- Probe: benchmarks/kernels/benchmark_glm53_indexer_tiles.py; 2202 rows,
+  15232 pools, cached prefix 53312, matching the first subchunk of the observed
+  60928-token context. Eight synthetic fixtures rotate >128 MiB of inputs;
+  FP64 sampled-score oracle, all visible-score rtol/atol 1e-5, identical top-512
+  sets on seven predetermined rows/fixture. Three fixed A/B/A rounds x five
+  replays. This is not actual-activation or E2E validation. Two CPU tests pass.
+- Preflight: all four tested configurations pass with scores bit-exact to the
+  original. RT4/PT64/four warps uses 154 registers, zero spills, 32 KiB shared;
+  median paired throughput improves 35.07% (local time ~1.71 -> 1.27 ms).
+  Eight-warps RT8 and RT4 improve 10.72%/20.09%. The original-again control
+  is -0.053%. Full predetermined 30-configuration sweep now running; no
+  serving change or retained performance claim yet.
+- Raw: perf/results/2026-09-08/cold-prefill-profile/ (all-rank traces,
+  prefill32k-rank0.json, prefill128k-all-ranks.json) and indexer-tiles/preflight.json.
