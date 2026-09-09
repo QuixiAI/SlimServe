@@ -294,6 +294,14 @@ and15 fixtures pass; rechecking BOTH builds restores the complete evidence,
 including every scheduling word and the narrowly scoped assertion exception.
 Use index-fused-order-native-sass/comparison-with-control-words.json, not the
 earlier receipt. Failed preflight log retained; no replay/timing samples existed.
+Completed on7d375d9ae: all88 saved-input calls now PASS exactly, all archived
+outputs independently reverified. But the fixed18-shape/five-round A/B/A rejects
+the radix fusion: actual full chunk66.417->116.890us warm (76% slower), last583
+rows10.138->17.224us. Only the no-sort<=512-pool shortcut wins. Do not promote.
+Raw index-fused-order-{saved-input-replay,timing}/ and runtime-control/
+index-fused-order-analysis.json. Next replace, not accumulate, the rejected
+radix candidate with a lighter in-block bitonic network and repeat qualification.
+Serving defaults, diagnostic control and quality contract remain unchanged.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

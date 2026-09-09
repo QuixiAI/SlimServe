@@ -24760,3 +24760,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   There are no existing kernel/timing samples to replace or exclude.
 - Final full CPU suite495 pass/one skip21.26s, raw
   runtime-control/index-fused-order-final-cpu-tests.xml/log. Ruff/diff checks pass.
+
+## 2026-09-09 - Fused radix pool ordering is correct but rejected on latency
+
+- Status: REJECTED as a general selector replacement. Source7d375d9ae,
+  native92c8f136, no serving caller/profile change. No full-model run needed
+  for a candidate that loses the prescribed kernel timing.
+- Actual replay: all88 calls pass on the four original GPUs, both arms exact
+  against the CPU oracle/captured indices, changed NaN/123 undefined tails do
+  not matter. Every archived output is verified again by file/logical hash;
+  all22 outputs/GPU have one identical digest. No missing/replaced samples.
+- Fixed five-round A/B/A across ALL18 shapes completes:270 warm observations
+  and2700 eviction-conditioned observations. Actual7616x1904 matrix warm
+  A/B/A2=66.416640/116.889601/66.396160us; eviction-conditioned
+  86.015999/126.975998/86.015999us. This is~76% MORE warm latency, not a win.
+  Actual last583 rows warm10.137600/17.223680/10.137600us, conditioned
+  14.368000/22.496000/14.368000us. Synthetic long decode loses~1.37-2.00us warm.
+  Full per-arm medians/min/max and all raw observations are retained.
+- Only the<=512-pool shortcut wins: visible250, rows1/8/16/64 warm baseline
+  2.765-2.888us versus fused1.024-1.065us; it never enters the new radix sort.
+  Do not extrapolate this to a successful general fusion or serving speedup.
+  Eviction-conditioned samples include single-graph/event overhead and are
+  not direct DRAM measurements. No native builds/other GPU work overlap timing.
+- Decision: replace the rejected CUB radix-sort candidate with a bounded
+  warp/shared-memory bitonic network for512 integer IDs, keeping the identical
+  membership policy, host guards and no serving caller. Requalify and rerun the
+  SAME fixed replay/timing protocol. Do not retain two unused serving variants.
+  Commit/raw native92c8f136 preserve the rejected implementation for rollback.
+- Raw index-fused-order-saved-input-replay/summary.json
+  SHAe092f8ef23160aad6a7f745a837d7c802eb72a9e645d6ff3b9afc2f7438aff1f;
+  index-fused-order-timing/summary.json
+  SHA6d30d23ec0743e95af959c3e96255f69571d7b08ddd5a1e49f756ca02d7a5692;
+  runtime-control/index-fused-order-analysis.json/log. All receipts/source/native
+  hashes verify; replay/timing/analysis exit0, GPU contexts released.
