@@ -347,6 +347,16 @@ index-fused-{quality-analysis,intervention-comparison}.json. Serialized E2E
 qualified opt-in fusion; next construct stable MoE alignment at the source,
 then qualify uninstrumented serving and revisit TC under the unchanged contract.
 No profile/default/quant/TC change or cross-rank-equality claim.
+Next small-M stable-routing probe passes324 synthetic eager/graph/device cases,
+CPU508/one skip and324 mem/sync cases each, but bounded racecheck FAILS in the
+existing scored top-k loop before scatter. Unchanged installed QC reproduces
+the same shared-memory read/write warning. Timing is paused; add explicit warp
+ordering before marking the selected winner and requalify BOTH atomic/stable
+policies before measuring. Isolated probe80b05608 is preserved, all sources/
+failures in the notebook/runtime-control/stable-route-* and native-route-*.
+Native serving remains unchanged; no output mismatch or link to prior M640
+score variation is proven. This is a new bounded sanitizer finding, not a
+retraction of the full-model fused-indexer equality result above.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

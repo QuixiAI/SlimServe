@@ -37,7 +37,9 @@ __device__ __forceinline__ float apply_scoring(float x, int scoring) {
     return sqrtf(sp);
 }
 
-template <int E, int TOPK>
+// STABLE_ALIGNMENT is a separately qualified opt-in candidate. The existing
+// serving instantiation keeps its atomic scatter until serving qualification.
+template <int E, int TOPK, bool STABLE_ALIGNMENT = false>
 __global__ __launch_bounds__(THREADS) void route_align_kernel(
         const float* __restrict__ logits,      // [M, E]
         const float* __restrict__ bias,        // [E]
@@ -52,8 +54,9 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
     static_assert((E + 31) / 32 > TOPK, "every lane must keep an unselected candidate");
     __shared__ float choice[MAX_TOKENS][E];   // biased scores, -inf once selected
     __shared__ float score[MAX_TOKENS][E];    // unbiased scores (weights)
-    __shared__ int counts[E];
-    __shared__ int cursor[E];
+    constexpr int ASSIGNMENT_WARPS = (MAX_TOKENS * TOPK + 31) / 32;
+    __shared__ int counts[STABLE_ALIGNMENT ? ASSIGNMENT_WARPS * E : E];
+    __shared__ int cursor[STABLE_ALIGNMENT ? 1 : E];
     __shared__ int cumsum[E + 1];
     __shared__ int sel[MAX_TOKENS][TOPK];      // selected experts, always < E
     __shared__ typename cub::BlockScan<int, THREADS>::TempStorage scan_tmp;
@@ -69,7 +72,11 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
         const float c = s + bias[e];
         choice[m][e] = (c == c) ? c : -FLT_MAX;
     }
-    if (tid < E) { counts[tid] = 0; cursor[tid] = 0; }
+    if constexpr (STABLE_ALIGNMENT) {
+        for (int i = tid; i < ASSIGNMENT_WARPS * E; i += THREADS) counts[i] = 0;
+    } else {
+        if (tid < E) { counts[tid] = 0; cursor[tid] = 0; }
+    }
     __syncthreads();
 
     // B. top-k per token, one warp per token: TOPK rounds of warp argmax.
@@ -102,7 +109,11 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
                 const int e = sel[m][k];
                 topk_ids[m * TOPK + k] = e;
                 topk_weights[m * TOPK + k] = score[m][e] * inv * scaling;
-                atomicAdd(&counts[e], 1);
+                // Group by the warp of the flattened assignment, NOT the
+                // scoring warp (one warp/token). TOPK=8 gives four tokens per
+                // assignment warp. These integer histogram sums are exact.
+                const int bucket = STABLE_ALIGNMENT ? (m * TOPK + k) / 32 : 0;
+                atomicAdd(&counts[bucket * E + e], 1);
             }
         }
     }
@@ -110,7 +121,14 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
 
     // C. alignment: per-expert padded counts, exclusive scan, block expert ids.
     int padded = 0;
-    if (tid < E) padded = ((counts[tid] + block_size - 1) / block_size) * block_size;
+    if (tid < E) {
+        int count = counts[tid];
+        if constexpr (STABLE_ALIGNMENT) {
+#pragma unroll
+            for (int w = 1; w < ASSIGNMENT_WARPS; ++w) count += counts[w * E + tid];
+        }
+        padded = ((count + block_size - 1) / block_size) * block_size;
+    }
     int excl = 0, total = 0;
     cub::BlockScan<int, THREADS>(scan_tmp).ExclusiveSum(padded, excl, total);
     if (tid < E) cumsum[tid] = excl;
@@ -122,11 +140,29 @@ __global__ __launch_bounds__(THREADS) void route_align_kernel(
     }
     for (int b = total / block_size + tid; b < max_blocks; b += THREADS) expert_ids[b] = -1;
     __syncthreads();
-    // scatter the assignments (token*TOPK + k) into their expert's range
-    for (int a = tid; a < numel; a += THREADS) {
-        const int e = sel[a / TOPK][a - (a / TOPK) * TOPK];
-        const int pos = cumsum[e] + atomicAdd(&cursor[e], 1);
-        sorted_token_ids[pos] = a;
+    // Scatter assignments into their expert's range. Stable rank counts only
+    // earlier flattened IDs: all earlier assignment warps plus matching lower
+    // lanes. A ballot mask handles partial warps without reading uninitialized
+    // sel entries. No new global workspace, launch, or CTA barrier is needed.
+    if constexpr (STABLE_ALIGNMENT) {
+        static_assert(MAX_TOKENS * TOPK <= THREADS);
+        const unsigned valid = __ballot_sync(0xffffffffu, tid < numel);
+        if (tid < numel) {
+            const int e = sel[tid / TOPK][tid % TOPK];
+            const unsigned peers = __match_any_sync(valid, e);
+            int rank = __popc(peers & ((1u << lane) - 1u));
+#pragma unroll
+            for (int w = 0; w < ASSIGNMENT_WARPS; ++w) {
+                if (w < warp) rank += counts[w * E + e];
+            }
+            sorted_token_ids[cumsum[e] + rank] = tid;
+        }
+    } else {
+        for (int a = tid; a < numel; a += THREADS) {
+            const int e = sel[a / TOPK][a - (a / TOPK) * TOPK];
+            const int pos = cumsum[e] + atomicAdd(&cursor[e], 1);
+            sorted_token_ids[pos] = a;
+        }
     }
 }
 

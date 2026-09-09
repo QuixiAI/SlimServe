@@ -24974,3 +24974,59 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Read-only scratch analyze_fused_indexer_trace.py, verify_fused_indexer_trace.py,
   compare_fused_intervention.py and imported helpers are source-hashed in the
   outputs. The separate fixed cross-rank differences remain open.
+
+## 2026-09-09 - Stable small-M routing probe exposes an existing warp hazard
+
+- Status: isolated candidate functional checks PASS, race qualification FAIL;
+  no serving integration, native rebuild, timing or promotion. Installed core
+  fe4a7c2a/QC4ce80155/MoE1093b8a4 and all profile defaults remain unchanged.
+- Baseline: existing fused E288/top8/M1..16 router, atomic cursor scatter;
+  diagnostic stable alignment adds a separate Triton sort. Candidate reuses
+  the same scored top-k/weights/prefix/fill and constructs ascending assignment
+  order directly: four assignment-warp histograms plus match-any/lower-lane
+  popcount. No extra global workspace, launch or CTA barrier. Compile-time
+  STABLE_ALIGNMENT defaults false; only the isolated probe instantiates true.
+- Local references rechecked: vendored glm_moe_routing.cuh/tm_moe_kernels.cuh,
+  native moe_align_sum_kernels.cu and canonical_moe.py. Generic atomic-scatter
+  precedents do not solve stable ordering. Native source trees mentioned in
+  older notes remain absent; no upstream code copied. CUDA13 warp matching
+  rules confirm the ballot-derived partial-warp mask requirement:
+  https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#warp-match-functions.
+- Isolated CUDA13/-O3/sm_120f probe80b0560832c35e1f2eb05e76235a3904f657eb15c68f3b3cbb1611547ef83fbe
+  builds in two steps,80GiB/no swap/-j2, without GPU workloads. Candidate46
+  registers/46384 shared bytes versus control48/44080; both zero stack/local.
+  Serving native is not replaced. Test source93844618dee4ac4c0764a66e97f1acac97e511c0c772abaacf5c407d8df086bf;
+  headerfbd5e10cf6929163fbdfb7c463a68ef0ad3fb17d1792b6096fb76c8a5dbd8917.
+- All324 GPU cases pass33.48s:320 combinations of M1..16, both scoring modes,
+  renormalize on/off, BM8/16/32/48/64, eight input phases each and sixteen
+  changed-input/poisoned-output graph replays. Includes all ties, maximum skew,
+  NaN/Inf logits and bias, misaligned contiguous inputs/red zones. IDs/weight
+  bits match installed native for both probe policies; stable layout matches
+  independent CPU construction and the diagnostic sort. Four foreign-current-
+  device checks pass. Every case records all source/probe/native hashes; end
+  rehash verifies frozen sources. CPU508 pass/one skip21.81s.
+- Native/probe route-filtered memcheck324 pass26.68s and synccheck324 pass20.90s,
+  zero errors. BOUNDED candidate racecheck M13/BM8/sigmoid, first24 matching
+  launches, FAILS exit99:three warning groups at shared choice scan line92 and
+  selected-winner overwrite line101. Functional test itself passes7.40s.
+- Same bounded case on UNCHANGED installed QC4ce80155 reproduces the same
+  read/write sites (PC0x20b0..0x2330 vs0x27f0), four warning groups, exit99;
+  functional test passes7.55s. This precedes the new scatter and is not caused
+  by its histogram policy. Shuffle synchronization is not shared-memory ordering;
+  add explicit warp synchronization before lane0 overwrites the winner, keeping
+  the existing post-write synchronization. No observed output mismatch or causal
+  link to the earlier M640/full-model variability is established by this probe.
+- Stop timing until the hazard is fixed and both policies requalified. The
+  initial unrun timing script prescribes32 synthetic random/skew M1..16 shapes,
+  five A/B/A rounds, three warmups/five timed20-call graphs per arm. Amend its
+  protocol BEFORE execution to isolate synchronization repair from stable scatter
+  and compare both against the corresponding post-sort path. Never compare the
+  stable candidate only to a knowingly unsafe control and call it the whole gain.
+- Raw runtime-control/stable-route-{probe-tests,memcheck,synccheck}.{xml,log},
+  stable-route-racecheck-m13.{xml,log}, native-route-racecheck-m13.{xml,log},
+  stable-route-probe-resources.log, stable-route-probe.sass and preserved
+  stable-route-pre-sync-probe.so. First test XML
+  SHA7d775c58c7a2f6491d81227d118b31b53154dbca0e6cd635ca6cac1defc8cf05;
+  memcheck XML0cee964254d85ececb535144df90494fbe40bf782d4dc73266e55b3d0a8286a7.
+  Pytest iterator deprecation retained with the initial test-source receipt;
+  no hidden retries, promoted defaults, timing samples or serving claims.
