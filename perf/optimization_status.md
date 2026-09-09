@@ -21512,3 +21512,17 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   is not an independent quant oracle or end-to-end quality qualification.
 - Raw: perf/results/2026-09-08/marlin-schedule/preflight.json; forthcoming
   rotating-sweep.json in the same directory.
+
+## 2026-09-08: Align registry descriptions with the selected measured recipe
+
+- Status: descriptive cleanup only; no numerical or launch-setting changes.
+- Correct the misleading FP8 "last expert layer": all 42 target MoE layers
+  use NVFP4; FP8 layer45 is the separate MTP head. Replace stale bring-up,
+  unrun parity, promised FP8 KV and unbudgeted host-tier wording with current
+  evidence and explicit limits. Preparation/digest checks belong to the
+  selected recipe, not manual source-checkpoint mutation.
+- Marlin's MoE preparation log no longer falsely says the GPU lacks native
+  FP4. It states the actual selected weight-only/16-bit-activation path.
+- Validation: all 123 SlimServe tests pass; recursive comparison confirms
+  every registry field outside title/summary/notes is unchanged. Recipe,
+  checkpoint digests, serving settings and native binary stay fixed.

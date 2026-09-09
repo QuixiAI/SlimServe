@@ -349,11 +349,10 @@ def prepare_nvfp4_moe_layer_for_marlin(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    logger.warning_once(
-        "Your GPU does not have native support for FP4 computation but "
-        "FP4 quantization is being used. Weight-only FP4 compression will "
-        "be used leveraging the Marlin kernel. This may degrade "
-        "performance for compute-heavy workloads."
+    logger.info_once(
+        "Using Marlin weight-only NVFP4 MoE with 16-bit activations. "
+        "This backend selection does not imply that the GPU lacks "
+        "native FP4 support."
     )
 
     input_dtype = get_marlin_input_dtype(prefix="")
@@ -673,7 +672,6 @@ def prepare_moe_mxfp4_layer_for_marlin(
     w2_bias = permute_bias(w2_bias)
 
     return w13, w2, w13_scale, w2_scale, w13_bias, w2_bias
-
 
 
 
