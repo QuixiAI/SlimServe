@@ -35,7 +35,7 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 13:40 UTC)
+### Latest checkpoint (2026-09-09 14:37 UTC)
 
 Small-M origin routing PASSES full-model qualification on c8ba8d56c:
 one prescribed start, three quality passes, every text/needle score and all
@@ -67,11 +67,18 @@ All12,000 samples verify; scatter512 strictly improves26/32 cases versus
 scatter256, none strictly regress. M7616 random21.08us versus222.96us for
 alignment-plus-sort; actualM6405.89-6.09us versus12.95-12.97us. Unstable
 alignment alone still wins30/32 distributions. No serving integration/TPS claim.
-Next integrate the selected policy: M17..32 original256 stable; M33..8192
-direct1024/scatter512. Keep other variants probe-only and M1..16 unchanged.
-Native and real-profile qualification are owed. For the unresolved c16 pause, use
-existing verbose JIT logging on the next diagnostic: default warning_once
-suppresses repeated same-kernel compiles, so silent logs cannot exclude JIT.
+Selected native policy now locally qualified: QC39b302f0, M17..32 original256;
+M33..8192 direct1024/scatter512. All748 old GPU bodies identical, four added.
+171 functional/memory/sync and four bounded races pass;4,800 native timing
+samples verify, all32 cases17.47-90.45% faster than alignment-plus-sort.
+ActualM6405.50-6.01us; M7616/random21.288us. Atomic alone still wins26 cases.
+STABLE_ALIGN defaultsOFF; only actual native construction skips sorting.
+Final CPU573pass/one skip. Source/native receipts and baseline exclusion updated.
+Next ONE real-profile/three-pass equality run stable-align-quality-diagnostic/
+against c8ba8d56c, same quant/TC0/canonical journals, add STABLE_ALIGN1.
+Explicit --jit-monitor-verbose is now forwarded through the profile/campaign
+and marked diagnostic-only to investigate the retained c16 pause. Full-model
+equality and serving performance are NOT yet established for this integration.
 
 ### Chronological evidence (older next-step statements are historical)
 

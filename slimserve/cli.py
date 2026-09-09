@@ -96,6 +96,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include engine request timings and cached prompt-token counts",
     )
+    parser.add_argument(
+        "--jit-monitor-verbose",
+        action="store_true",
+        help="diagnostic: log every monitored JIT compilation and specialization",
+    )
     return parser
 
 
@@ -122,6 +127,7 @@ def _help() -> None:
         ("--torch-profile-dir DIR", "Capture a bounded engine profile trace."),
         ("--cuda-profile", "Enable bounded CUDA profiler API ranges for Nsight."),
         ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
+        ("--jit-monitor-verbose", "Log every monitored JIT compilation for diagnosis."),
         (
             "--request-metrics",
             "Include request timings and cached prompt-token counts.",
@@ -448,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
                 "enable_per_request_metrics": True,
             },
         )
+
+    if args.jit_monitor_verbose:
+        plan = replace(plan, engine={**plan.engine, "jit_monitor_verbose": True})
 
     if args.dry_run:
         _show(plan)

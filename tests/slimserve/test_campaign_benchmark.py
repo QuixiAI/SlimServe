@@ -61,6 +61,7 @@ def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, ac
         ("routing", True),
         ("cuda_traces", True),
         ("quality_repeats", 3),
+        ("jit_monitor_verbose", True),
     ):
         assert bench.diagnostic_only(SimpleNamespace(**(vars(args) | {key: value})))
 

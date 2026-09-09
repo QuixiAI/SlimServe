@@ -46,6 +46,7 @@ def diagnostic_only(args):
     return bool(
         args.routing
         or args.cuda_traces
+        or getattr(args, "jit_monitor_verbose", False)
         or args.quality_repeats > 1
         or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
@@ -81,6 +82,9 @@ def benchmark_sources():
         ),
         "slimserve/smoke.py",
         "slimserve/stream.py",
+        "slimserve/cli.py",
+        "slimserve/server.py",
+        "vllm/utils/jit_monitor.py",
     ]
     return {
         name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in paths
@@ -507,6 +511,11 @@ def main():
     ap.add_argument("--input-tokens", type=int, default=1000)
     ap.add_argument("--output-tokens", type=int, default=300)
     ap.add_argument(
+        "--jit-monitor-verbose",
+        action="store_true",
+        help="diagnostic-only per-specialization JIT logging; not baseline TPS",
+    )
+    ap.add_argument(
         "--cold-prefix",
         action="store_true",
         help="isolate every timing request's cache and require zero cached tokens",
@@ -591,6 +600,10 @@ def main():
             "DIAGNOSTIC ROUTING: scheduling changes; throughput is NOT a baseline",
             flush=True,
         )
+    if args.jit_monitor_verbose:
+        plan = dataclasses.replace(
+            plan, engine={**plan.engine, "jit_monitor_verbose": True}
+        )
     args.output.mkdir(parents=True, exist_ok=False)
     source = args.source.read_text()
     tokenizer = get_tokenizer(str(plan.model_dir))
@@ -648,6 +661,8 @@ def main():
             argv += ["--route-profile-dir", str(folder / "routing")]
         if args.prefill or args.cold_prefix:
             argv += ["--request-metrics"]
+        if args.jit_monitor_verbose:
+            argv += ["--jit-monitor-verbose"]
         run = {"boot": boot, "argv": argv, "status": "starting", "measurements": []}
         if args.routing:
             run["diagnostic_plan"] = dataclasses.asdict(

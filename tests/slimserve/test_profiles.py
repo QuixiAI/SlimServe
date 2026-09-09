@@ -127,6 +127,20 @@ def test_cuda_profiler_is_explicit_bounded_and_does_not_change_recipe(monkeypatc
         cli._parser().parse_args(["--cuda-profile", "--torch-profile-dir", "unused"])
 
 
+def test_verbose_jit_cli_only_changes_observability(monkeypatch):
+    assert not cli._parser().parse_args([]).jit_monitor_verbose
+    original = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    machine = Machine("rtx6000", "RTX PRO 6000 Blackwell", 4)
+    monkeypatch.setattr(cli.hardware, "detect", lambda: machine)
+    seen = []
+    monkeypatch.setattr(cli, "_show", seen.append)
+    assert cli.main(["glm53-nvfp4-4", "--jit-monitor-verbose", "--dry-run"]) == 0
+    configured = seen[0]
+    assert configured.engine == {**original.engine, "jit_monitor_verbose": True}
+    assert replace(configured, engine=original.engine) == original
+    assert engine_kwargs(configured)["jit_monitor_verbose"] is True
+
+
 def test_every_profile_source_names_a_blessed_dspark_download():
     sources = registry._registry()["sources"]
     for profile_id in registry.profile_ids():

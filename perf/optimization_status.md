@@ -25646,3 +25646,48 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   stable-align-native-timing/. No isolated probe is loaded/rebuilt. All outputs
   audited before/after each case, source/native freeze, no exclusions/retries.
   Native timings remain isolated hot-cache GPU latency, not serving throughput.
+
+## 2026-09-09 - Native alignment timing passes; full-profile protocol frozen
+
+- Native fixed timing oncf0d1524d/QC39b302f0 completes; all32 cases/4800 samples
+  verify independently, including shape dispatch, all CPU outputs, actual
+  archives, source/Git identities,171-case native/memory/sync/four-race evidence
+  against frozen2a5800b90, and all748 preserved old GPU bodies. No exclusions,
+  retries, competing workloads or source edits. Raw stable-align-native-timing/
+  summary.json SHA1b7e0791a204ff45186f268af98cffe916c0cb9509fff9d4d0432b227208e0c2;
+  runtime-control/stable-align-native-analysis.json
+  SHAcd90d817624ebc0de65a476c2973aa365a4effb13ddae576c5b9d0821a0dfad6.
+- Every32 candidate distribution strictly beats atomic PLUS sort17.47-90.45%.
+  M7616/random222.946/21.288/222.954us; actualM64012.90-12.97 to5.50-6.01us
+  (53.39-57.56% lower). Atomic ALONE still wins26 distributions; one candidate
+  strictly faster, five overlapping. Stable ordering is not free or a claim
+  of new production TPS. Small fused route/M1..16 remains byte-identical.
+- Existing engine JIT verbosity is now forwarded by explicit SlimServe and
+  campaign --jit-monitor-verbose flags, OFF by default. Campaign marks it
+  diagnostic-only and records the engine option and server argv; CLI/server/
+  monitor sources join its frozen source receipt. No monitor or arithmetic
+  changes. CLI dry-run confirms only the observability/request-metrics engine
+  options differ on the same registered RTX6000/TP4/recipe v1. This observes
+  future stalls; it does not diagnose the retained prior4.371s pause.
+- Final CPU suite573 PASS/one existing device-kernel skip21.79s,14 Torch
+  deprecation warnings. Lint caught an overlong help string; only its wording
+  shortened afterwards, final lint/dry-run pass. Native sources/binaries and
+  profile defaults remain unchanged. Raw stable-align-final-cpu.{log,xml},
+  stable-align-profile-dry-run.log. No performance measurements rerun.
+- Fixed full-profile next: ONE start, three repetitions atc1/c8/c16, cold
+  exact1000/300, text/image canaries, three full4096-score/six-needle passes.
+  Same150GiB/no-swap/OMP1/CUDA13/cache/CUDA_LAUNCH_BLOCKING1, BF16fn1/TC0,
+  unset inheritedNCCL_P2P_DISABLE. All canonical/index/score/model/MoE journals
+  and STABLE_ROUTE1 preserved; add STABLE_ALIGN1 and explicit verbose JIT.
+  Output stable-align-quality-diagnostic/. No replacement starts or exclusions.
+- Configs runtime-control/stable-align-score-config.json
+  SHA300ea629f090d92e54271eb027b3c737ab961ae336c214ad7cc21aa8fecca5c1;
+  stable-align-index-config.json
+  SHA3da583118a8dcbc18ed024155b5e8791d0e014b4ca39cf354271eca6edab9e15.
+  Exact same640/8199 prompt IDs, max_matches3, capture_layer23; only output
+  directory differs from stable-route control. Require25 warmup/75 timed
+  requests,168 uncached quality requests, all348 archives/1024short+94long
+  tensors/rank, every per-token score and allnine cross-pass equalities against
+  c8ba8d56c. Verify source/native receipts throughout; only the declared JIT
+  observability option may differ in the plan. Serving results remain
+  serialized/instrumented diagnostics, not a new competitive baseline.
