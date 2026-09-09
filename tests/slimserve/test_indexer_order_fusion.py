@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import xml.etree.ElementTree as ET
 from itertools import islice
 
 import pytest
@@ -8,7 +9,9 @@ from benchmarks.kernels.benchmark_glm53_indexer_order_fusion import (
     make_call,
     timing_cases,
     verify_assertion_only_changes,
+    verify_generic_decode_qualification,
 )
+from benchmarks.kernels.replay_glm53_indexer import sha
 
 
 @pytest.mark.parametrize("label", ["post-sort", "fused"])
@@ -90,3 +93,49 @@ def test_binary_exception_rejects_any_selection_or_control_change(extra_change):
     else:
         with pytest.raises(AssertionError):
             verify_assertion_only_changes(before, after)
+
+
+@pytest.mark.parametrize(
+    "damage", [None, "native", "source", "failure", "missing", "names"]
+)
+def test_generic_decode_receipts_are_bound_to_binary_source_and_cases(tmp_path, damage):
+    source = tmp_path / "test_source.py"
+    source.write_text("fixture")
+    paths = [tmp_path / "control.xml", tmp_path / "candidate.xml"]
+    proof = {arm + "_binary": {"sha256": arm} for arm in ("before", "candidate")}
+    for path, arm in zip(paths, ("before", "candidate")):
+        suite = ET.Element("testsuite", failures="0", errors="0", skipped="0")
+        for index in range(32):
+            test = ET.SubElement(
+                suite,
+                "testcase",
+                classname="fixture",
+                name=f"test_single_block_decode_changed_inputs[{index}]",
+            )
+            props = ET.SubElement(test, "properties")
+            ET.SubElement(props, "property", name="native_sha256", value=arm)
+            ET.SubElement(
+                props, "property", name="test_source_sha256", value=sha(source)
+            )
+        if arm == "candidate":
+            if damage == "native":
+                props[0].set("value", "wrong native")
+            elif damage == "source":
+                props[1].set("value", "wrong source")
+            elif damage == "failure":
+                ET.SubElement(test, "failure")
+            elif damage == "missing":
+                suite.remove(test)
+            elif damage == "names":
+                test.set("name", "test_single_block_decode_changed_inputs[different]")
+        ET.ElementTree(suite).write(path)
+    if damage is None:
+        assert (
+            verify_generic_decode_qualification(*paths, proof, source)[
+                "tests_per_binary"
+            ]
+            == 32
+        )
+    else:
+        with pytest.raises(AssertionError):
+            verify_generic_decode_qualification(*paths, proof, source)

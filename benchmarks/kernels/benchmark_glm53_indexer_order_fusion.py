@@ -12,6 +12,7 @@ import argparse
 import json
 import statistics
 import subprocess
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import torch
@@ -38,14 +39,59 @@ def verify_assertion_only_changes(before, after):
     return [dict(pc=hex(pc), before=before[pc], after=after[pc]) for pc in changed]
 
 
-def verify_native_comparison(proof, directory):
+def verify_generic_decode_qualification(control, candidate, proof, test_source):
+    """Accept only the fixed matched test corpus on the exact two binaries."""
+    cases = []
+    for path, arm in ((control, "before"), (candidate, "candidate")):
+        root = ET.parse(path).getroot()
+        for suite in root.iter("testsuite"):
+            assert all(
+                int(suite.get(key, 0)) == 0 for key in ("failures", "errors", "skipped")
+            )
+        tests = list(root.iter("testcase"))
+        assert len(tests) == 32
+        for test in tests:
+            assert not any(
+                test.find(key) is not None for key in ("failure", "error", "skipped")
+            )
+            props = {
+                p.attrib["name"]: p.attrib["value"]
+                for p in test.findall("./properties/property")
+            }
+            assert props["native_sha256"] == proof[arm + "_binary"]["sha256"]
+            assert props["test_source_sha256"] == sha(test_source)
+            assert test.attrib["name"].startswith(
+                "test_single_block_decode_changed_inputs["
+            )
+        cases.append(sorted((t.attrib["classname"], t.attrib["name"]) for t in tests))
+        assert len(set(cases[-1])) == 32
+    assert cases[0] == cases[1]
+    return dict(
+        tests_per_binary=32,
+        scope=(
+            "generic insertion/radix score sets, bounds and changed-input graphs; "
+            "not GLM serving"
+        ),
+        sources={str(p): sha(p) for p in (control, candidate, test_source)},
+    )
+
+
+def verify_native_comparison(proof, directory, generic_qualification=None):
     assert not proof["removed_functions"]
     name = "arch = sm_120f _ZN4vllm22glm53TopKPerRowPrefillEPKfPKiS3_Pii"
     added = "arch = sm_120f _ZN4vllm22glm53TopKPerRowOrderedEPKfPKiS3_Pii"
     assert proof["before_functions"] == 4188 and proof["candidate_functions"] == 4189
-    assert proof["identical_common_functions"] == 4187
-    assert proof["changed_common_functions"] == [name]
-    assert set(proof["added_functions"]) == {name, added}
+    extra = set(proof["changed_common_functions"]) - {name}
+    if extra:
+        expected = {
+            f"arch = sm_120f _ZN4vllm16topKPerRowDecodeILi512ELb{radix}"
+            "ELb0ELb0EEEvPKfPKiPiiiiiiPfiS4_"
+            for radix in (0, 1)
+        }
+        assert extra == expected and generic_qualification is not None
+    assert proof["identical_common_functions"] == 4187 - len(extra)
+    assert set(proof["changed_common_functions"]) == {name} | extra
+    assert set(proof["added_functions"]) == {name, added} | extra
 
     def read_body(path, arm):
         with path.open() as stream:
@@ -62,7 +108,10 @@ def verify_native_comparison(proof, directory):
     assert sha(directory / "before.sass") == proof["before_sass"]["sha256"]
     assert sha(directory / "candidate.sass") == proof["candidate_sass"]["sha256"]
     return dict(
-        all4187_other_function_copies_identical=True,
+        all4187_other_function_copies_identical=not extra,
+        identical_other_function_copies=4187 - len(extra),
+        generic_decode_codegen_changes=sorted(extra),
+        generic_decode_qualification=generic_qualification,
         valid_input_selector_instructions_identical=True,
         assertion_only_changes=verify_assertion_only_changes(before, after),
         raw_sha256={
@@ -278,6 +327,8 @@ def main():
     parser.add_argument("--run", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--native-comparison", required=True, type=Path)
+    parser.add_argument("--generic-decode-control-tests", type=Path)
+    parser.add_argument("--generic-decode-candidate-tests", type=Path)
     args = parser.parse_args()
     active = subprocess.check_output(
         ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
@@ -303,7 +354,18 @@ def main():
         == receipt["runtime"]["native_sha256"][str(native.relative_to(root))]
     )
     assert proof["candidate_binary"]["sha256"] == sha(native)
-    binary_check = verify_native_comparison(proof, args.native_comparison.parent)
+    generic_qualification = None
+    if args.generic_decode_control_tests or args.generic_decode_candidate_tests:
+        assert args.generic_decode_control_tests and args.generic_decode_candidate_tests
+        generic_qualification = verify_generic_decode_qualification(
+            args.generic_decode_control_tests,
+            args.generic_decode_candidate_tests,
+            proof,
+            root / "tests/kernels/test_sparse_topk_indices.py",
+        )
+    binary_check = verify_native_comparison(
+        proof, args.native_comparison.parent, generic_qualification
+    )
     args.output.mkdir(parents=True, exist_ok=False)
     sources = (
         "benchmarks/kernels/benchmark_glm53_indexer_order_fusion.py",
@@ -313,6 +375,7 @@ def main():
         "slimserve/canonical_indexer.py",
         "slimserve/canonical_indexer_kernel.py",
         "csrc/libtorch_stable/sampler.cu",
+        "tests/kernels/test_sparse_topk_indices.py",
         "vllm/_custom_ops.py",
     )
 

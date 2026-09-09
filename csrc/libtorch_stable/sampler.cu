@@ -393,9 +393,6 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
                                         kNumFinalItemsPerThread, int>;
   using FinalSortTempStorage =
       std::conditional_t<useRadixSort, typename FinalSort::TempStorage, int>;
-  using PoolSort = cub::BlockRadixSort<int, kNumThreadsPerBlock, 1>;
-  using PoolSortTempStorage =
-      std::conditional_t<canonicalOrder, typename PoolSort::TempStorage, int>;
   // The class to compute the inclusive prefix-sum over the histogram.
   using Scan = cub::BlockScan<int, kNumThreadsPerBlock>;
 
@@ -416,7 +413,6 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
   __shared__ union {
     FinalItems items;
     FinalSortTempStorage finalSort;
-    PoolSortTempStorage poolSort;
     Histogram histo;
   } smemFinal;
 
@@ -610,13 +606,31 @@ static __device__ void topKPerRowJob(const int* indices, const float* logits,
     // Selection and every read of FinalItems/Histogram have completed. Reuse
     // their storage; this needs neither an extra launch nor a global workspace.
     // The <=512 shortcut above is already in ascending pool-ID order.
-    int pool[1] = {smemOutput[threadIdx.x]};
-    pool[0] = pool[0] < 0 ? INT_MAX : pool[0];
+    int pool = smemOutput[threadIdx.x];
+    pool = pool < 0 ? INT_MAX : pool;
     __syncthreads();
-    // Host bounds guarantee valid pool IDs <2^18. Bit18 separates any -1
-    // padding sentinel from valid IDs; sorting only [0,19) is sufficient.
-    PoolSort(smemFinal.poolSort).Sort(pool, 0, 19);
-    outIndices[threadIdx.x] = pool[0] == INT_MAX ? -1 : pool[0];
+    // One integer per thread. Warp-local exchanges stay in registers; only
+    // the ten cross-warp compare stages use shared memory. This replaces the
+    // rejected radix candidate, not an additional serving implementation.
+#pragma unroll
+    for (int size = 2; size <= 512; size *= 2) {
+#pragma unroll
+      for (int distance = size / 2; distance > 0; distance /= 2) {
+        int other;
+        if (distance < 32) {
+          other = VLLM_SHFL_XOR_SYNC_WIDTH(pool, distance, 32);
+        } else {
+          smemFinal.items.indices[threadIdx.x] = pool;
+          __syncthreads();
+          other = smemFinal.items.indices[threadIdx.x ^ distance];
+          __syncthreads();
+        }
+        const bool takeMin = ((threadIdx.x & size) == 0) ==
+                             ((threadIdx.x & distance) == 0);
+        pool = takeMin ? min(pool, other) : max(pool, other);
+      }
+    }
+    outIndices[threadIdx.x] = pool == INT_MAX ? -1 : pool;
   } else {
     // Store to global memory.
     for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock) {

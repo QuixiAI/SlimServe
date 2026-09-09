@@ -302,6 +302,16 @@ Raw index-fused-order-{saved-input-replay,timing}/ and runtime-control/
 index-fused-order-analysis.json. Next replace, not accumulate, the rejected
 radix candidate with a lighter in-block bitonic network and repeat qualification.
 Serving defaults, diagnostic control and quality contract remain unchanged.
+Bitonic replacement locally qualifies:268 GPU cases and native mem/sync/bounded
+race checks pass;40 registers/no spills/static17424+2048 dynamic bytes. Core
+nowfe4a7c2a (full hash/notebook), no serving caller. Binary comparison preserves
+4185 other function copies and the GLM control's valid-input path; two generic
+decode specializations also change compiler output. They are NOT on GLM's
+pooled-select path, but matched32-case old/new regression suites both pass,
+and the checker requires their exact binary/source-bound receipts. Do not
+claim blanket unchanged code. Next same88-call replay and18-shape A/B/A into
+index-bitonic-{saved-input-replay,timing}/, using corrected binary comparison
+and both generic-decode qualification XMLs from the notebook. No timing yet.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

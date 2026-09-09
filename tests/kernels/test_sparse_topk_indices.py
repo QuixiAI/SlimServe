@@ -9,6 +9,9 @@ invariant is that no invalid entry ever appears in the span the attention
 actually reads -- which is min(position + 1, topk_tokens) entries per row.
 """
 
+import hashlib
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -148,3 +151,99 @@ def test_long_decode_topk_is_graph_safe_across_all_model_layers():
     assert (expected < seq_len).all()
     for output in outputs[1:]:
         torch.testing.assert_close(torch.sort(output.long(), dim=1).values, expected)
+
+
+@pytest.mark.parametrize("columns", [8193, 12288, 65537, 199999])
+@pytest.mark.parametrize("topk", [512, 2048])
+@pytest.mark.parametrize("stride", [1, 2])
+@pytest.mark.parametrize("per_row_lengths", [False, True])
+def test_single_block_decode_changed_inputs(
+    columns, topk, stride, per_row_lengths, record_property
+):
+    """Regression guard for both generic single-CTA decode specializations."""
+    root = Path(__file__).resolve().parents[2]
+    for key, path in (
+        ("native_sha256", root / "vllm/_C_stable_libtorch.abi3.so"),
+        ("test_source_sha256", Path(__file__)),
+    ):
+        with path.open("rb") as stream:
+            record_property(key, hashlib.file_digest(stream, "sha256").hexdigest())
+    rows, next_n = 8, 2
+    backing = torch.full((rows * columns * stride + 2,), 417.0, device="cuda")
+    logits = backing[1:-1:stride].view(rows, columns)
+    output = torch.empty(rows, topk, dtype=torch.int32, device="cuda")
+    lengths = torch.zeros(
+        (4, 2) if per_row_lengths else (4,), dtype=torch.int32, device="cuda"
+    )
+    workspace = torch.empty(0, dtype=torch.uint8, device="cuda")
+
+    def call():
+        ops.top_k_per_row_decode(
+            logits,
+            next_n,
+            lengths,
+            output,
+            workspace,
+            rows,
+            logits.stride(0),
+            logits.stride(1),
+            topk,
+        )
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for phase in range(3):
+        g = torch.Generator().manual_seed(2381 + phase)
+        values = (
+            torch.stack(
+                [torch.randperm(columns, generator=g) for _ in range(rows)]
+            ).float()
+            if phase == 0
+            else torch.randint(-2, 3, (rows, columns), generator=g).float()
+        )
+        if phase == 2:
+            values.zero_()
+            values[:, 1::2] = -0.0
+        if per_row_lengths:
+            host_lengths = torch.tensor(
+                [0, 1, topk - 1, topk, topk + 1, columns // 2, columns - 1, columns],
+                dtype=torch.int32,
+            ).view(4, 2)
+            visible = host_lengths.flatten()
+        else:
+            host_lengths = torch.tensor(
+                [0, topk - 1, columns // 2, columns], dtype=torch.int32
+            )
+            visible = (
+                (host_lengths[:, None] - 1 + torch.arange(2)[None, :])
+                .clamp_min(0)
+                .flatten()
+            )
+        defined = torch.arange(columns)[None, :] < visible[:, None]
+        expected = values.masked_fill(~defined, -torch.inf).topk(topk, dim=1).values
+        values[~defined] = float("nan") if phase % 2 == 0 else 123.0
+        logits.copy_(values)
+        lengths.copy_(host_lengths)
+        before = logits.contiguous().view(torch.uint8).clone()
+        for callback in (call, graph.replay):
+            output.fill_(-777)
+            callback()
+            selected = output.cpu()
+            valid = torch.arange(topk)[None, :] < visible.clamp_max(topk)[:, None]
+            assert torch.equal(selected >= 0, valid)
+            assert (selected[~valid] == -1).all()
+            assert ((selected < visible[:, None]) | ~valid).all()
+            sorted_ids = selected.sort(dim=1).values
+            assert (
+                (sorted_ids[:, 1:] != sorted_ids[:, :-1]) | (sorted_ids[:, 1:] == -1)
+            ).all()
+            scores = values.gather(1, selected.clamp_min(0).long()).masked_fill(
+                ~valid, -torch.inf
+            )
+            assert torch.equal(scores.sort(dim=1, descending=True).values, expected)
+            assert torch.equal(before, logits.contiguous().view(torch.uint8))
+            assert backing[0] == 417 and backing[-1] == 417
+            if stride == 2:
+                assert (backing[2:-1:2] == 417).all()

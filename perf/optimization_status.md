@@ -24793,3 +24793,61 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA6d30d23ec0743e95af959c3e96255f69571d7b08ddd5a1e49f756ca02d7a5692;
   runtime-control/index-fused-order-analysis.json/log. All receipts/source/native
   hashes verify; replay/timing/analysis exit0, GPU contexts released.
+
+## 2026-09-09 - Bitonic pool-order fusion qualification
+
+- Status: local qualification, actual replay/timing pending; no serving caller.
+  Replaces rejected radix fusion rather than retaining another unused variant.
+  Baseline remains the canonical native tie selector plus Triton post-sort.
+- Change:512-thread integer bitonic network,35 warp-local exchanges and10
+  shared-memory stages, reusing FinalItems storage. Same tie membership policy,
+  guards, score arithmetic, padding and<=512 shortcut. CUDA/HIP shuffle-width
+  compatibility macro is used; qualification here is SM120 only.
+- Native build2 steps CUDA13/-j2/80GiB/no swap, no warnings; installed core
+  fe4a7c2a3c2c03cc8f725528e40aead70f2570cdbb9bb1481d4874c7e6427639.
+  Rejected92c8f136 preserved as runtime-control/index-fused-radix-rejected.so;
+  current candidate also saved as index-bitonic-candidate.so. No GPU/build overlap.
+  Candidate40 registers/zero local/stack and17424 static+2048 dynamic shared
+  bytes, matching the control's resource counts (radix needed19568 static).
+- All268 GPU cases pass40.81s, including changed-input eager/graphs, full chunks,
+  wide decode, invalid ranges and all-device guards. Memcheck4cases5.71s and
+  synccheck same4cases5.76s:zero errors. Bounded racecheck first8 matching
+  adjacent2049/offset1 launches5.29s:zero hazards/errors/warnings.
+- Complete BOTH-word SASS comparison found4185 other function copies identical,
+  old GLM tie selector valid-input path identical (four assertion metadata
+  changes, line699->731), and two additional GENERIC single-block decode
+  specializations with compiler-generated changes. Those changes include signed/
+  unsigned integer comparisons and register/instruction rearrangements. Do NOT
+  claim all other binaries unchanged or silently dismiss them as metadata.
+  GLM's _pooled_select calls the prefill entry for BOTH prefill and decode;
+  these two generic topKPerRowDecode entries are not on this serving path.
+- Additional generic regression qualification: same32 cases on old8828383f
+  and candidatefe4a7c2a, both pass4.92/4.93s. Each has three changed-input
+  phases/eager+graphs, columns8193/12288/65537/199999 (both insertion/radix),
+  topK512/2048, strides1/2 with misalignment/gap guards, 1D/2D lengths/next_n2,
+  unique/tied/signed-zero scores and poisoned undefined tails. CPU verifies
+  score sets, bounds, uniqueness, padding and input bytes. No canonical order
+  requirement imposed on these generic entries. XML binds every case to exact
+  native and test-source hashes;32 candidate memcheck cases pass6.13s/zero errors.
+- Binary gate now names ONLY these two extra specializations and requires the
+  matched32-case binary/source-bound receipts; no missing/failed/skipped or
+  mismatched cases accepted. The GLM selector still permits ONLY its four
+  assertion-error-path metadata changes.21 parser/receipt fixtures pass1.07s;
+  the actual full binary/receipt preflight passes. Generic performance and
+  other workloads are not established by these bounded correctness tests.
+- Corrected raw comparison index-bitonic-native-sass/comparison-with-control-words.json
+  SHA440d995f2543d3dd06f3c22bbcef93836b2e50b14af8b2c30eeacc5048a80e4a.
+  before.sass is a read-only symlink to the existing8828383f dump; candidate
+  dump has14,335,179 lines, both fully hashed. Raw logs/XML/resources are
+  runtime-control/index-bitonic-*; native is restored to fe4a7c2a after controls.
+- Prescribed next: SAME88-call actual replay and18-shape/five-round A/B/A
+  benchmark_glm53_indexer_order_fusion protocol, source run index-ties-quality-diagnostic/,
+  --native-comparison perf/results/2026-09-09/index-bitonic-native-sass/comparison-with-control-words.json
+  --generic-decode-control-tests perf/results/2026-09-09/runtime-control/index-bitonic-generic-control-tests.xml
+  --generic-decode-candidate-tests perf/results/2026-09-09/runtime-control/index-bitonic-generic-candidate-tests.xml.
+  Output index-bitonic-saved-input-replay/ then index-bitonic-timing/; retain
+  every call/sample and freeze loaded sources/native throughout. Still no
+  speed or full-model claim; TC/profile/quant/quality contract unchanged.
+- Final CPU suite501 pass/one skip21.19s. All32 generic candidate synccheck
+  cases pass5.38s/zero errors; expected JUnit property-extension warnings and
+  all per-case source/native properties retained. Ruff/diff checks pass.
