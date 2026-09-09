@@ -149,3 +149,82 @@ and the new private manifests/cache roots. All other serving commands, fixed
 request counts, source freezes, receipts, original-cache checks and exact-score
 gates are unchanged. These are repaired diagnostic experiments, not replacement
 timing samples; the first startup failure remains part of the campaign record.
+
+## Second failure: lifecycle investigation before further serving
+
+The repaired control on0d5ab7dc7 also fails before health. Ranks0/1/3 finish AOT
+loading; rank2 fails inside loading with the repeated-object-ID guard. No rank
+has sealed. All68 recorded launchers are unchanged; target occurrences1/2/2/2.
+Bare IDs cannot distinguish same-object re-resolution from recycled IDs. The
+fallback warning is misleading: forced-AOT rethrows instead of recompiling.
+No benchmark/quality requests; neither legacy arm has run. Controller130,
+server1, normal teardown, GPUs released. New failure-status handling works.
+Audit verifies5172 original files/22 sources and preserves the raw summary:
+`runtime-control/rmsnorm-noop-bindings-startup-failure.json`,
+SHA256 `66f3ce5a072898e823c429ebd712fcdc02c6b3db3d8bd76c564e9b2777b1f4e5`.
+
+Before prescribing any more full-model starts, extract the seven real serialized
+AOT submodule artifacts without calling the outer model deserializer or loading
+weights. First ONE rank2 loader observation, output `rmsnorm-loader-observe-rank2`,
+in a16GiB/no-swap scope, all four devices visible. Use fresh private copies under
+`rmsnorm-loader-caches`, observer records retaining strong references and the
+actual concurrent `StandaloneCompiledArtifacts.load_all` path. No forward calls,
+timing, model-quality claim or numerical intervention. Check original snapshot
+afterwards. Preserve any loader-only failure. Then qualify an idempotent,
+thread-safe repair against actual deserialization and repeated/aliased futures,
+not just separate synthetic objects. Exact source/config/binary gates remain.
+
+The first loader observation completes seven artifacts, no forwards, and records
+one genuine same-future/same-object resolution on two threads. However its empty
+Triton cache causes static-bundle misses; this is NOT full loader qualification.
+Preserve it. Correct the probe to use the copied serving inductor/per-device
+Triton directories and reject any missing static bundle. One corrected rank2
+observation at `rmsnorm-loader-cached-observe-rank2`, same limits, then the repair.
+
+Corrected observation completes7/7 artifacts,50/50 static kernels,13 resolutions
+with no repeated objects in this scheduling sample. Original5172 files unchanged.
+The earlier two-thread re-resolution was a non-target kernel; it establishes a
+valid lifecycle, not the exact identity cause in the failed serving process.
+
+Idempotent repair qualification, prescribed before running it:
+
+- Retain strong target references; serialize upstream resolution and selection.
+  Already-selected target objects skip upstream cache recheck, which could undo
+  the intervention. Verify source and complete config/binary on every call.
+  Before seal safely reapply the selected launcher and clear its cached callable;
+  after seal allow only read-only repeats of an exact known selected binding.
+  New late objects, changed source, wrong configs/hashes and missing coverage fail.
+- ONE GPU hook run `rmsnorm-intervention-idempotent-gpu`: same28 numerical cases,
+  but11 resolutions per object (initial, repeat,8 simultaneous same/alias calls,
+  one read-only post-seal).14 objects total,154 target resolutions. Require exact
+  direct-config eager/repeat/changed-graph agreement, both control and legacy.
+- If that passes, ONE real loader process per rank per mode,8 total, sequential
+  under16GiB/no-swap; outputs `rmsnorm-loader-{control,legacy}-rank{0,1,2,3}`.
+  Use fresh copies `rmsnorm-loader-qualified-caches`. Require7/7 artifacts,
+  every static bundle loaded, target coverage and hash/config receipts, original
+  snapshot unchanged. No weights, full-model forwards or performance claims.
+- No further full-model serving start is prescribed by this qualification alone.
+
+## Qualified idempotent serving pair
+
+All138 CPU tests,28 exact numerical GPU cases/154 resolutions, and8 real loader
+processes pass. Independent audit verifies56 artifacts/400 static kernels and
+all5172 original files. Qualification audit SHAb70122c0e1becadbdb01277bd279b779abaf1f2e5189a87aa18701485634efff.
+
+Now prescribe exactly TWO full-model starts with the original correctness stop:
+
+1. `rmsnorm-noop-idempotent-control`, control mode, exactly one boot.
+2. ONLY after every no-op score matches all nine native-only passes exactly:
+   `rmsnorm-legacy-idempotent-only`, legacy mode, exactly one boot.
+
+Prepare fresh private copies `rmsnorm-intervention-idempotent-caches` with the
+same preparer; never reuse/mutate earlier failed-run caches. Use the original
+serving command substitutions with these names and their matching manifests,
+same150GiB/no-swap cap, native-order1/TC0/BF16fn1, forced-AOT1, fixed recipe,
+three timing repeats/c1,c8,c16/cold1000-in300-out, text/image, three quality passes.
+Freeze committed source/native state through BOTH arms and their audits. Audit
+using `runtime-control/audit_rmsnorm_intervention.py ARM --commit FROZEN_FULL_SHA`,
+which now verifies binding identities, repeated resolutions, full configs and
+unchanged unrelated launchers. No source edits/commits between these arms.
+Both earlier no-op failures remain part of the record. No replacement timing
+starts, numerical tolerance widening, default promotion or performance claim.

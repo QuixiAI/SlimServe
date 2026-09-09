@@ -82,17 +82,29 @@ def read_manifest():
     return data, path
 
 
+def single_launcher_receipt(launcher):
+    return dict(
+        hash=launcher.cache_hash,
+        config={
+            **launcher.config.kwargs,
+            "num_warps": launcher.config.num_warps,
+            "num_stages": launcher.config.num_stages,
+        },
+    )
+
+
 def launcher_receipt(autotuner):
+    return [single_launcher_receipt(launcher) for launcher in autotuner.launchers]
+
+
+def expected_receipt(saved):
     return [
         dict(
-            hash=launcher.cache_hash,
+            hash=saved["triton_cache_hash"],
             config={
-                **launcher.config.kwargs,
-                "num_warps": launcher.config.num_warps,
-                "num_stages": launcher.config.num_stages,
+                k: saved[k] for k in ("XBLOCK", "R0_BLOCK", "num_warps", "num_stages")
             },
         )
-        for launcher in autotuner.launchers
     ]
 
 
@@ -103,7 +115,10 @@ class Intervention:
         self.mode = selected_mode
         self.target = manifest["targets"][str(rank)]
         self.lock = threading.RLock()
-        self.replaced = set()
+        # Keep the objects alive: bare id() values can be recycled by Python.
+        self.replaced = {}
+        self.resolutions = 0
+        self.compiled_replacement = None
         self.sealed = False
         folder = Path(manifest["receipts"])
         folder.mkdir(exist_ok=True)
@@ -139,8 +154,23 @@ class Intervention:
             # key. This diagnostic reads fixed choices and never persists tuning.
             autotuner.save_cache_hook = None
 
-    def replace(self, autotuner, compile_replacement):
-        """Called once a cached future has resolved, before any model execution."""
+    def resolve(self, future, original_result, compile_replacement, timeout=None):
+        """Resolve and transform atomically across concurrent AOT submodules.
+
+        A cached future may be shared by concurrent source imports. Once its
+        object has been selected, don't let another cache recheck undo that
+        choice. Revalidate it and return the same object on subsequent calls.
+        """
+        with self.lock:
+            autotuner = future.static_autotuner
+            self.relocate(autotuner)
+            if id(autotuner) in self.replaced:
+                return self.replace(autotuner, compile_replacement, "reuse")
+            autotuner = original_result(future, timeout=timeout)
+            return self.replace(autotuner, compile_replacement, "upstream")
+
+    def replace(self, autotuner, compile_replacement, resolved_by="direct"):
+        """Hash-check every resolution; apply the selected config idempotently."""
         with self.lock:
             filename = Path(autotuner.filename or "")
             before = launcher_receipt(autotuner)
@@ -151,27 +181,46 @@ class Intervention:
                 filename=str(filename),
                 target=target,
                 before=before,
+                resolved_by=resolved_by,
+                sealed=self.sealed,
             )
+            known = self.replaced.get(id(autotuner))
+            if known is not None and (known is not autotuner or not target):
+                raise ValueError("RMSNorm binding identity/source changed")
             if target:
-                if self.sealed or id(autotuner) in self.replaced:
-                    raise ValueError("RMSNorm target rebound after replacement/seal")
+                if self.sealed and known is None:
+                    raise ValueError("new RMSNorm target binding after seal")
                 if sha(filename) != self.target["source_sha256"]:
                     raise ValueError("RMSNorm target source changed")
                 native = self.target["configs"][1]
-                if len(before) != 1 or before[0]["hash"] != native["triton_cache_hash"]:
-                    raise ValueError("RMSNorm native cached launcher does not match")
                 saved = self.target["configs"][int(self.mode == "control")]
-                compiled = compile_replacement(saved)
-                launcher = compiled.make_launcher()
-                if launcher.cache_hash != saved["triton_cache_hash"]:
-                    raise ValueError("RMSNorm replacement binary does not match")
-                autotuner.compile_results = [compiled]
-                autotuner.launchers = [launcher]
-                autotuner.configs = None
-                autotuner._cached_launcher = None
-                autotuner.save_cache_hook = None
-                self.replaced.add(id(autotuner))
-                record["binding_index"] = len(self.replaced)
+                allowed = [expected_receipt(saved)] if known is not None else []
+                if not self.sealed:
+                    allowed.append(expected_receipt(native))
+                if before not in allowed:
+                    raise ValueError("RMSNorm native cached launcher does not match")
+                if not self.sealed:
+                    compiled = self.compiled_replacement or compile_replacement(saved)
+                    launcher = compiled.make_launcher()
+                    if [single_launcher_receipt(launcher)] != expected_receipt(saved):
+                        raise ValueError(
+                            "RMSNorm replacement binary/config does not match"
+                        )
+                    self.compiled_replacement = compiled
+                    autotuner.compile_results = [compiled]
+                    autotuner.launchers = [launcher]
+                    autotuner.configs = None
+                    autotuner._cached_launcher = None
+                    autotuner.save_cache_hook = None
+                # After seal, known exact-selected objects are read-only. New
+                # objects or changed binaries fail before touching captured work.
+                self.replaced[id(autotuner)] = autotuner
+                self.resolutions += 1
+                record.update(
+                    binding_index=list(self.replaced).index(id(autotuner)) + 1,
+                    resolution_index=self.resolutions,
+                    repeated=known is not None,
+                )
             record["after"] = launcher_receipt(autotuner)
             if not target and record["before"] != record["after"]:
                 raise ValueError("unrelated launcher changed")
@@ -188,7 +237,15 @@ class Intervention:
                     f"missing source-bound RMSNorm binding on rank{self.rank}"
                 )
             self.sealed = True
-            self.emit(dict(event="sealed", rank=self.rank, targets=len(self.replaced)))
+            self.emit(
+                dict(
+                    event="sealed",
+                    rank=self.rank,
+                    targets=len(self.replaced),
+                    resolutions=self.resolutions,
+                    sources=1,
+                )
+            )
 
 
 def install(runner):
@@ -246,9 +303,7 @@ def install(runner):
 
     @wraps(original_result)
     def result(future, timeout=None):
-        diagnostic.relocate(future.static_autotuner)
-        autotuner = original_result(future, timeout=timeout)
-        return diagnostic.replace(autotuner, compile_replacement)
+        return diagnostic.resolve(future, original_result, compile_replacement, timeout)
 
     result._glm53_rmsnorm_diagnostic = True
     StaticAutotunerFuture.result = result

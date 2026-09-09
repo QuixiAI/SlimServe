@@ -26079,3 +26079,58 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   uses runtime-control/audit_rmsnorm_intervention.py ARM --commit FROZEN_HEAD;
   it checks every source-bound occurrence and records object multiplicities.
   No corrected serving start or full-model quality result yet.
+
+## 2026-09-09 - Second RMSNorm no-op fails in loader identity guard
+
+- Status: rejected diagnostic startup, not a model or performance result.
+- Baseline: frozen0d5ab7dc7, same private native AOT cache and selected recipe.
+- Hypothesis: multi-object repair would let the no-op reach health unchanged.
+- Result: ranks0/1/3 load AOT; rank2 fails inside the loader with repeated integer
+  object ID, before any seal. Current receipts cannot distinguish re-resolution
+  from Python ID reuse. All68 launcher records unchanged, target records1/2/2/2.
+  No health, benchmark or quality requests; legacy not launched. The warning
+  says recompilation but forced-AOT immediately rethrows: no fallback compile.
+- Teardown: verified controller2703537 interrupted after terminal worker error;
+  controller130/server1, complete teardown/no zombies, GPU release0.048535s.
+  Failure-status fix works: root/run both failed with KeyboardInterrupt recorded.
+- Independent audit: all5172 original files and22 frozen sources/native hashes
+  unchanged, GPU check empty. Initial audit assumed four successful loads and
+  stopped without output; actual log supports three plus rank2 load failure.
+  Final audit SHA66f3ce5a072898e823c429ebd712fcdc02c6b3db3d8bd76c564e9b2777b1f4e5.
+- Decision: no third full-model attempt from toy tests. First use the real seven
+  serialized submodules in a bounded weight-free loader reproducer, retaining
+  strong identities and concurrency receipts. Then make resolution idempotent
+  and thread-safe while retaining source/config/binary and exact-quality gates.
+- Raw: `rmsnorm-noop-bindings-control/`, `rmsnorm-intervention-bindings-caches/`,
+  `runtime-control/rmsnorm-noop-bindings-startup-failure.json` under2026-09-09.
+  No new TPS or default/TC promotion; broader campaign remains incomplete.
+
+### Idempotent repair passes real serialized-loader qualification
+
+- Repair retains strong identities, serializes first resolution + transformation,
+  and revalidates known selected objects without letting an upstream cache recheck
+  undo the choice. Exact source, complete config and binary checks every call;
+  late new bindings and missing coverage still fail. Post-seal repeats read-only.
+- CPU104 intervention/campaign/probe tests plus34 native-ordering tests pass;
+ 14 existing deprecation warnings. Lint/diff checks pass.
+- GPU28 numerical cases pass across14 objects and154 target resolutions, covering
+  eight simultaneous same/alias callbacks per object plus repeat/post-seal calls.
+  Eager/repeated/changed-graph outputs exactly match direct expected configurations
+  in both modes. Raw `rmsnorm-intervention-idempotent-gpu/`, summary
+  SHAb2844339f9b817a2f96b032bff5a3a121fae1e02653f4ea106a26f772f3c8b01.
+- New loader-only probe extracts actual7 serialized AOT submodules, without
+  loading model weights or invoking forwards. Initial empty-cache observation
+  showed one real same-future callback on two threads (non-target), but had static
+  bundle misses; retained as limited evidence, NOT loader qualification. Corrected
+  probe matches private serving-cache paths and rejects missing static bundles.
+- All8 prescribed rank/mode processes pass:56/56 artifacts,400/400 static kernels,
+  every target replaced with its recorded config/hash; unrelated launchers match.
+  Binding counts here are1 per source; first-resolution counts differ from full
+  serving, reinforcing that object counts are lifecycle details, not scope gates.
+- Independent audit verifies every receipt and all5172 unchanged original files,
+  final GPUs empty. No model-quality/TPS claim. Raw `rmsnorm-loader-*`,
+  `runtime-control/rmsnorm-loader-qualification-analysis.json`,
+  SHAb70122c0e1becadbdb01277bd279b779abaf1f2e5189a87aa18701485634efff.
+- Next freeze repair, one new no-op serving start, legacy only after exact no-op
+  agreement with every native reference pass. Preserve both failed starts;
+  no default/TC/precision changes and no fresh-compilation claim.

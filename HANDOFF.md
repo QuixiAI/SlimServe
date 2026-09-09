@@ -35,7 +35,47 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 21:22 UTC)
+### Latest checkpoint (2026-09-09 21:50 UTC)
+
+The SECOND no-op `rmsnorm-noop-bindings-control` on0d5ab7dc7 also FAILED BEFORE
+HEALTH. Ranks0/1/3 loaded AOT; rank2 failed inside loading on the bare-object-ID
+guard, before seal. Same-object resolution versus recycled ID is unknowable from
+those receipts. All68 observed launchers unchanged; no benchmark/quality requests,
+neither legacy serving arm ran. Status repair works: root/run failed, controller130,
+server1, teardown complete, GPU release0.048535s. Original5172 files/22 sources
+verified. Audit `runtime-control/rmsnorm-noop-bindings-startup-failure.json`,
+SHA66f3ce5a072898e823c429ebd712fcdc02c6b3db3d8bd76c564e9b2777b1f4e5.
+
+Idempotent repair now qualified, defaultOFF: retain strong target references,
+serialize upstream resolution + replacement, reuse known selected objects without
+letting cache recheck undo the choice. Exact source/config/binary checks every call;
+read-only known repeats after seal, new late objects fail. Source coverage is not
+Python object uniqueness. CPU138pass/14 existing warnings. GPU28 exact cases now
+exercise154 resolutions including concurrent aliases and post-seal callbacks.
+
+NEW weight-free reproducer `benchmarks/kernels/check_glm53_aot_loader.py` exercises
+the actual concurrent serialized submodule loading, not a toy Future. Eight
+prescribed rank/mode processes all load7/7 artifacts,50/50 static kernels each,
+with target coverage and unchanged unrelated launchers. No weights/forward calls.
+Initial empty-cache observation retained: it showed two-thread re-resolution of
+a non-target future but had bundle misses, so is not qualification. Corrected
+cache-matched observation and all eight checks pass; no scheduling-cause claim.
+Audit `runtime-control/rmsnorm-loader-qualification-analysis.json`,
+SHAb70122c0e1becadbdb01277bd279b779abaf1f2e5189a87aa18701485634efff.
+Original5172 files unchanged, all GPUs free. No native/profile/quant/TC changes.
+
+NEXT: freeze the qualified repair and prescribe ONE full-model idempotent no-op,
+`rmsnorm-noop-idempotent-control`, then ONE `rmsnorm-legacy-idempotent-only`
+ONLY IF all three no-op quality passes match all nine native passes exactly.
+Fresh private copies `rmsnorm-intervention-idempotent-caches/{control,legacy}`.
+Use the protocol's fixed commands/workload and new matching cache/manifest paths;
+no source/native changes or commits during pair/audits. Auditor
+`runtime-control/audit_rmsnorm_intervention.py ARM --commit FROZEN_FULL_SHA`
+now handles strong bindings and repeat receipts. No third serving start yet.
+Old failures remain preserved. Native-order defaultOFF and cross-mode quality
+gate still FAILED; reproducible norm policy/performance/TC work remains open.
+
+### Previous checkpoint (2026-09-09 21:22 UTC)
 
 Normalization-only intervention is implemented and locally qualified, defaultOFF.
 CPU128pass; GPU28 exact cases cover real StaticAutotunerFuture hook, four source

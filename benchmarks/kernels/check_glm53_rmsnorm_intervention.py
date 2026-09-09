@@ -9,6 +9,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -160,11 +162,31 @@ def main():
                             rebound.launchers[0].cache_hash
                             == expected.make_launcher().cache_hash
                         )
-                        bindings.append((rebound, expected))
+                        # Same future and distinct future aliases must be safe
+                        # on repeated and simultaneous resolution, in both arms.
+                        alias = StaticAutotunerFuture(rebound)
+                        alias.reload_kernel_from_src = future.reload_kernel_from_src
+                        assert future.result() is rebound
+                        barrier = threading.Barrier(8)
+
+                        def resolve_again(
+                            i, barrier=barrier, rank=rank, future=future, alias=alias
+                        ):
+                            barrier.wait(timeout=10)
+                            with torch.cuda.device(rank):
+                                return (future if i % 2 else alias).result()
+
+                        with ThreadPoolExecutor(max_workers=8) as pool:
+                            assert all(
+                                result is rebound
+                                for result in pool.map(resolve_again, range(8))
+                            )
+                        bindings.append((rebound, expected, alias))
                     assert runner.capture_model() == "sealed"
                     layout = source_layout(copied.read_text(), kernel_name)
                     weight = torch.ones(4096, dtype=torch.bfloat16)
-                    for binding, (rebound, expected) in enumerate(bindings):
+                    for binding, (rebound, expected, alias) in enumerate(bindings):
+                        assert alias.result() is rebound
                         for rows in (16, 640):
                             x, changed = [
                                 make_inputs(rows, seed, 1.0)
@@ -187,11 +209,14 @@ def main():
                                     binding=binding,
                                     rows=rows,
                                     exact=True,
+                                    resolutions_per_binding=11,
                                     hash=rebound.launchers[0].cache_hash,
                                 )
                             )
                             save()
                             print(json.dumps(summary["checks"][-1]), flush=True)
+                    receipt = runner._slimserve_rmsnorm_diagnostic
+                    assert receipt.resolutions == 11 * len(bindings)
                 StaticAutotunerFuture.result = original_result
         summary["status"] = "complete"
     except BaseException as error:

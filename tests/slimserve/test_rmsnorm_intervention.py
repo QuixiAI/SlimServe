@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import json
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -38,7 +41,9 @@ def clean(monkeypatch):
 def fake_launcher(identity):
     return SimpleNamespace(
         cache_hash=identity,
-        config=SimpleNamespace(kwargs={"XBLOCK": 1}, num_warps=8, num_stages=1),
+        config=SimpleNamespace(
+            kwargs={"XBLOCK": 1, "R0_BLOCK": 1024}, num_warps=8, num_stages=1
+        ),
     )
 
 
@@ -48,7 +53,16 @@ def setup_intervention(tmp_path, arm="control"):
     target = dict(
         filename=source.name,
         source_sha256=diagnostic.sha(source),
-        configs=[dict(triton_cache_hash="old"), dict(triton_cache_hash="new")],
+        configs=[
+            dict(
+                triton_cache_hash=key,
+                XBLOCK=1,
+                R0_BLOCK=1024,
+                num_warps=8,
+                num_stages=1,
+            )
+            for key in ("old", "new")
+        ],
     )
     manifest = dict(receipts=str(tmp_path / "receipts"), targets={"0": target})
     path = tmp_path / "manifest.json"
@@ -94,12 +108,20 @@ def test_exact_replacement_and_seal(tmp_path, arm, identity):
     assert tuner._cached_launcher is None
     assert tuner.save_cache_hook is None
     assert tuner.configs is None
-    assert calls == [dict(triton_cache_hash=identity)]
+    assert calls == [instance.target["configs"][int(arm == "control")]]
     instance.seal()
-    with pytest.raises(ValueError, match="rebound"):
-        instance.replace(tuner, compile_config)
+    before = vars(tuner).copy()
+    assert instance.replace(tuner, compile_config) is tuner
+    assert vars(tuner) == before
+    assert len(calls) == 1
     records = [json.loads(line) for line in instance.path.read_text().splitlines()]
-    assert [record["event"] for record in records] == ["begin", "launcher", "sealed"]
+    assert [record["event"] for record in records] == [
+        "begin",
+        "launcher",
+        "sealed",
+        "launcher",
+    ]
+    assert records[-1]["repeated"] and records[-1]["sealed"]
     assert records[1]["before"][0]["hash"] == "new"
     assert records[1]["after"][0]["hash"] == identity
 
@@ -129,6 +151,100 @@ def test_multiple_aot_objects_for_one_source_are_all_replaced(tmp_path, arm):
     records = [json.loads(line) for line in instance.path.read_text().splitlines()]
     assert [r["binding_index"] for r in records if r.get("target")] == [1, 2]
     assert records[-1]["targets"] == 2
+
+
+def compile_fake(saved):
+    return SimpleNamespace(
+        make_launcher=lambda: fake_launcher(saved["triton_cache_hash"])
+    )
+
+
+@pytest.mark.parametrize("arm", ["control", "legacy"])
+def test_aliases_and_concurrent_resolution_do_not_repeat_upstream(tmp_path, arm):
+    instance, tuner = setup_intervention(tmp_path, arm)
+    instance.relocate = lambda obj: None
+    future = SimpleNamespace(static_autotuner=tuner)
+    alias = SimpleNamespace(static_autotuner=tuner)
+    barrier = threading.Barrier(8)
+    calls = []
+
+    def upstream(future, timeout=None):
+        calls.append(timeout)
+        return future.static_autotuner
+
+    def resolve(i):
+        barrier.wait(timeout=5)
+        return instance.resolve(future if i % 2 else alias, upstream, compile_fake, 7)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(result is tuner for result in pool.map(resolve, range(8)))
+    assert calls == [7]
+    assert len(instance.replaced) == 1 and instance.resolutions == 8
+    assert tuner.launchers[0].cache_hash == ("new" if arm == "control" else "old")
+    instance.seal()
+    instance.resolve(alias, upstream, compile_fake)
+    assert calls == [7] and instance.resolutions == 9
+
+
+def test_strong_reference_prevents_id_reuse(tmp_path):
+    instance, fixture = setup_intervention(tmp_path)
+
+    class Tuner:
+        pass
+
+    tuner = Tuner()
+    vars(tuner).update(vars(fixture))
+    reference = weakref.ref(tuner)
+    instance.replace(tuner, compile_fake)
+    identity = id(tuner)
+    del tuner
+    assert reference() is not None
+    assert instance.replaced[identity] is reference()
+
+
+@pytest.mark.parametrize("change", ["source", "hash", "config", "filename"])
+def test_repeat_cannot_bypass_source_or_launcher_checks(tmp_path, change):
+    instance, tuner = setup_intervention(tmp_path)
+    instance.replace(tuner, compile_fake)
+    if change == "source":
+        instance.target["source_sha256"] = "wrong"
+    elif change == "filename":
+        tuner.filename += ".different"
+    elif change == "hash":
+        tuner.launchers[0].cache_hash = "wrong"
+    else:
+        tuner.launchers[0].config.num_warps = 16
+    with pytest.raises(ValueError):
+        instance.replace(tuner, compile_fake)
+
+
+def test_native_reset_can_be_reapplied_only_before_seal(tmp_path):
+    instance, tuner = setup_intervention(tmp_path, "legacy")
+    instance.replace(tuner, compile_fake)
+    tuner.launchers = [fake_launcher("new")]
+    tuner._cached_launcher = "stale native callable"
+    instance.replace(tuner, compile_fake)
+    assert tuner.launchers[0].cache_hash == "old" and tuner._cached_launcher is None
+    instance.seal()
+    tuner.launchers = [fake_launcher("new")]
+    with pytest.raises(ValueError, match="cached launcher"):
+        instance.replace(tuner, compile_fake)
+
+
+def test_new_target_after_seal_fails(tmp_path):
+    instance, tuner = setup_intervention(tmp_path)
+    second = SimpleNamespace(**vars(tuner))
+    instance.replace(tuner, compile_fake)
+    instance.seal()
+    with pytest.raises(ValueError, match="new RMSNorm target"):
+        instance.replace(second, compile_fake)
+
+
+def test_unseen_legacy_launcher_is_not_accepted_as_native(tmp_path):
+    instance, tuner = setup_intervention(tmp_path, "legacy")
+    tuner.launchers = [fake_launcher("old")]
+    with pytest.raises(ValueError, match="cached launcher"):
+        instance.replace(tuner, compile_fake)
 
 
 @pytest.mark.parametrize("bad", ["source", "old_hash", "multiple", "replacement_hash"])
