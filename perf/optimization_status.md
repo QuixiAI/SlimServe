@@ -23316,3 +23316,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   starts the next prescribed boot successfully. This directly reproduces the
   model-scale release delay and validates the wait, beyond the CPU fixtures.
   Raw: mhc-paired-serving-remainder/summary.json, first run teardown receipt.
+
+## 2026-09-08: Paired mHC storage finishes its prescribed serving qualification
+
+- Status: retained on RTX6000 only for a small, consistent c1 gain. No new
+  quantization: original BF16 fn values, FP32 accumulation/base/scale, BF16
+  KV/activations/lm_head, selected recipe v1 and spill-free indexer unchanged.
+- Baseline/hypothesis: lossless storage halves fn bytes; paired prefill staging
+  avoids the previously measured scalar-load overhead. Isolated throughput
+  does not establish whole-model impact. Same QC5d4d3790e9aeb6cb and other
+  native hashes across all prescribed1/3/1 starts; flag0/1/0 is the model change.
+- Full result: control/candidate/return c1 156.205/156.791/155.910, c8
+  576.187/578.993/576.558, c16 779.276/779.940/776.826 E2E tok/s. Candidate
+  ranges156.695-157.097/577.589-580.894/774.878-781.069. The nine candidate
+  c1 readings exceed all six control readings, a median0.38-0.57% gain.
+  Candidate per-start c1 medians156.730/157.020/156.791; no best-start selection.
+- Cold32K control/candidate/return2586.884/2580.066/2588.569ms; 128K
+  10889.242/10883.735/10901.455ms. Candidate nine-sample ranges2577.446-
+  2590.740 and10829.942-10950.216ms. Batched decode and prefill are effectively
+  neutral. Retention is justified by the small c1 gain, not a large prefill claim.
+- Correctness: all45 rounds/375 requests exact1000/300, zero cached tokens
+  and replacement characters; all text/image canaries,4096 scored tokens/start,
+  six needle contrasts/start, and30 cold measured prefill requests pass.
+  Quality means in order:-2.738888/-2.731376/-2.731834/-2.735399/-2.726765.
+  Startup146.079/164.076/142.079/140.039/146.108s; all samples retained.
+- Lifecycle: original chain's failure after candidate1 remains recorded.
+  Exactly the two outstanding candidates and one return were resumed, no extra
+  starts. Only the campaign controller hash differs; request ASTs and seven
+  other benchmark sources are unchanged. All native hashes match. The new
+  release gate observes real driver delays0.990/0.735/0.461s across the three
+  resumed starts and completes safely; controller exit0, no remaining GPUs.
+- Change: profile enables VLLM_GLM5_MHC_BF16_FN=1 on RTX6000 only. A100
+  profiles and default model-wide flag remain unchanged; explicit env0 is the
+  control. Profile notes and stable baseline record the modest gain and limits.
+- Raw: mhc-paired-{fp32-control,serving,serving-remainder,return-control}/;
+  runtime-control/mhc-paired-{aba.log,remainder.log,combined-analysis.json}.
+  Combined analysis verifies exact/cache/canary/quality/native/source gates;
+  original source hashes remain intact after the documented authorship rewrite.
+- Profile validation:267 CPU tests pass/one GPU skip, including explicit
+  RTX6000-only storage selection and existing lossless-loader rejection gates.
+  Ruff/diff checks pass. Raw: runtime-control/mhc-paired-profile-cpu-tests.{xml,log}.

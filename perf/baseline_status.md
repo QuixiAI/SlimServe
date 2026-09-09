@@ -1919,6 +1919,42 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 paired lossless mHC storage retained - 2026-09-08
+
+Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.
+Enable `VLLM_GLM5_MHC_BF16_FN=1` on RTX6000 only: checkpoint fn values are
+preserved exactly, FP32 arithmetic/base/scale remain unchanged, and native
+SM120 prefill uses the qualified paired staging. Native QC5d4d3790e9aeb6cb
+is identical across the prescribed one-control/three-candidate/one-return starts.
+
+| Arm | Starts | E2E c1 / c8 / c16 tok/s | Cold 32K / 128K engine TTFT ms |
+| --- | ---: | --- | --- |
+| FP32 control | 1 | 156.205 / 576.187 / 779.276 | 2586.884 / 10889.242 |
+| BF16 paired | 3 | 156.791 / 578.993 / 779.940 | 2580.066 / 10883.735 |
+| FP32 return | 1 | 155.910 / 576.558 / 776.826 | 2588.569 / 10901.455 |
+
+Three measured repetitions per start/concurrency/context. Candidate nine-sample
+ranges: c1 156.695-157.097, c8 577.589-580.894, c16 774.878-781.069;
+32K 2577.446-2590.740ms, 128K 10829.942-10950.216ms.
+Retained for the small c1 gain (0.38-0.57% against the two controls), with all
+nine candidate readings above all six control readings. Batched decode and
+prefill are effectively neutral, not a large tensor-core or competitive gain.
+
+All 45 timing rounds/375 exact1000/300 requests have zero cached tokens;
+all text/image canaries, 20,480 scored quality tokens and 30 needle contrasts
+pass. All 30 measured long-context requests are cold. Startup in prescribed
+order: 146.079/164.076/142.079/140.039/146.108s. No profiler or competing
+GPU work/native builds. Original chain stopped after candidate1 due to the
+recorded driver-release race; only the two outstanding candidates and return
+were resumed with the teardown-only controller fix. No replacement starts or
+measurement exclusions. New controller chain exits0 and GPUs are released.
+
+Raw: `perf/results/2026-09-08/mhc-paired-{fp32-control,serving,serving-remainder,return-control}/`;
+source-hashed combined analysis: `runtime-control/mhc-paired-combined-analysis.json`.
+Original source commits resolve through `glm53-sm120-authorship-map.json`.
+The earlier explicit cold-prefix/B12X comparison below remains the historical
+matched-stack comparison; do not relabel those old measurements as flag1.
+
 ### RTX6000 explicit cold-prefix baseline and comparison - 2026-09-08
 
 Current selected recipe v1, unchanged repaired native libraries, retained
