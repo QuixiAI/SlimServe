@@ -215,6 +215,25 @@ def round_requests(
     }
 
 
+def process_group_snapshot(pgid):
+    """Record Linux process state without mistaking zombies for running workers."""
+    rows = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # comm may contain spaces or parentheses; fields after its last ')'
+            # begin with state, ppid and pgrp.
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        if int(fields[2]) == pgid:
+            rows.append(
+                {"pid": int(entry.name), "ppid": int(fields[1]), "state": fields[0]}
+            )
+    return sorted(rows, key=lambda row: row["pid"])
+
+
 def stop_owned(process):
     # Workers inherit this newly-created process group. Never match global
     # process names: another workload may start while this campaign is running.
@@ -226,20 +245,45 @@ def stop_owned(process):
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
-            return
+            return []
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             continue
-        # A parent can exit before its workers; finish only when the group is gone.
+        # A parent can exit before its workers. Nsight may adopt terminated
+        # workers without reaping them until this controller exits. Zombies
+        # cannot execute or retain GPU resources; record, but do not wait on,
+        # those entries. Any live member still requires bounded escalation.
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                return
+        while True:
+            members = process_group_snapshot(process.pid)
+            if all(row["state"] == "Z" for row in members):
+                return members
+            if time.monotonic() >= deadline:
+                break
             time.sleep(0.5)
-    raise RuntimeError(f"owned process group {process.pid} did not exit")
+    raise RuntimeError(
+        f"owned process group {process.pid} did not exit; "
+        f"remaining processes: {process_group_snapshot(process.pid)}"
+    )
+
+
+def finish_owned_run(process, run, receipt, record):
+    # A teardown exception must not leave the on-disk run marked 'running',
+    # lose completed quality/prefill results, or start another server.
+    try:
+        zombies = stop_owned(process)
+        run["teardown"] = {
+            "status": "complete",
+            "returncode": process.returncode,
+            "remaining_zombies": zombies,
+        }
+    except Exception as error:
+        run["status"] = "failed"
+        run["teardown"] = {"status": "failed", "error": repr(error)}
+        raise
+    finally:
+        record.write_text(json.dumps(receipt, indent=2) + "\n")
 
 
 def gpu_snapshot():
@@ -640,8 +684,7 @@ def main():
                 run["error"] = repr(error)
                 print(f"boot {boot}: {error}", flush=True)
             finally:
-                stop_owned(process)
-                record.write_text(json.dumps(receipt, indent=2) + "\n")
+                finish_owned_run(process, run, receipt, record)
     receipt["aggregates"] = {}
     for c in args.concurrency:
         values = [

@@ -43,3 +43,24 @@ def test_rejects_non_graph_capture_without_creating_missing_input(tmp_path):
         database.execute("CREATE TABLE other (value)")
     with pytest.raises(ValueError, match="no whole-graph"):
         analyze(path)
+
+
+def test_missing_graph_activity_retains_runtime_launch_and_warning(tmp_path):
+    path = tmp_path / "missing-activity.sqlite"
+    with sqlite3.connect(path) as database:
+        database.execute("CREATE TABLE StringIds (id, value)")
+        database.execute("INSERT INTO StringIds VALUES (1, 'cudaGraphLaunch_v10000')")
+        database.execute(
+            "CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME "
+            "(start, end, globalTid, correlationId, nameId)"
+        )
+        database.execute("INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (1,2,3,4,1)")
+        database.execute("CREATE TABLE DIAGNOSTIC_EVENT (text)")
+        database.execute("INSERT INTO DIAGNOSTIC_EVENT VALUES ('Missing CUDA events')")
+    result = analyze(path)
+    assert result["status"] == "incomplete"
+    assert result["missing_graph_activity_table"]
+    assert result["graph_record_count"] == 0
+    assert result["runtime_graph_launch_count"] == 1
+    assert result["runtime_graph_launches"][0]["correlationId"] == 4
+    assert result["collection_diagnostics"] == [{"text": "Missing CUDA events"}]

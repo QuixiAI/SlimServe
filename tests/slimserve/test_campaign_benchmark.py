@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,82 @@ def _load(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_teardown_always_persists_completed_work_and_failure(
+    monkeypatch, tmp_path, fails
+):
+    bench = _load(monkeypatch)
+    run = {"status": "complete", "quality": {"passed": True}, "prefill": [123]}
+    receipt = {"runs": [run]}
+    record = tmp_path / "summary.json"
+
+    def stop(process):
+        if fails:
+            raise RuntimeError("owned group still exists")
+        return []
+
+    monkeypatch.setattr(bench, "stop_owned", stop)
+    if fails:
+        with pytest.raises(RuntimeError, match="owned group"):
+            bench.finish_owned_run(SimpleNamespace(returncode=0), run, receipt, record)
+    else:
+        bench.finish_owned_run(SimpleNamespace(returncode=0), run, receipt, record)
+    saved = json.loads(record.read_text())["runs"][0]
+    assert saved["status"] == ("failed" if fails else "complete")
+    assert saved["teardown"]["status"] == ("failed" if fails else "complete")
+    assert saved["quality"] == {"passed": True}
+    assert saved["prefill"] == [123]
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_stop_owned_records_zombies_but_never_accepts_live_workers(monkeypatch, live):
+    bench = _load(monkeypatch)
+    members = [{"pid": 12, "ppid": 99, "state": "S" if live else "Z"}]
+    monkeypatch.setattr(bench, "process_group_snapshot", lambda pgid: members)
+    signals = []
+    monkeypatch.setattr(
+        bench.os, "killpg", lambda pgid, sig: signals.append((pgid, sig))
+    )
+    clock = iter(range(0, 1000, 100))
+    monkeypatch.setattr(bench.time, "monotonic", lambda: next(clock))
+    process = SimpleNamespace(pid=11, wait=lambda timeout: 0)
+    if live:
+        with pytest.raises(RuntimeError, match="remaining processes"):
+            bench.stop_owned(process)
+        assert signals == [
+            (11, signal)
+            for signal in (
+                bench.signal.SIGINT,
+                bench.signal.SIGTERM,
+                bench.signal.SIGKILL,
+            )
+        ]
+    else:
+        assert bench.stop_owned(process) == members
+        assert signals == [(11, bench.signal.SIGINT)]
+
+
+def test_process_group_snapshot_keeps_zombies_and_filters_ownership(
+    monkeypatch, tmp_path
+):
+    bench = _load(monkeypatch)
+    for pid, comm, state, ppid, pgid in [
+        (11, "name with ) parens", "S", 10, 11),
+        (12, "worker", "Z", 99, 11),
+        (13, "unrelated", "R", 10, 13),
+    ]:
+        folder = tmp_path / str(pid)
+        folder.mkdir()
+        (folder / "stat").write_text(f"{pid} ({comm}) {state} {ppid} {pgid} 0 0")
+    (tmp_path / "self").mkdir()
+    (tmp_path / "14").mkdir()  # Exited between listing and reading stat.
+    monkeypatch.setattr(bench, "Path", lambda path: tmp_path)
+    assert bench.process_group_snapshot(11) == [
+        {"pid": 11, "ppid": 10, "state": "S"},
+        {"pid": 12, "ppid": 99, "state": "Z"},
+    ]
 
 
 @pytest.mark.parametrize("first_tokens", [1, 2])

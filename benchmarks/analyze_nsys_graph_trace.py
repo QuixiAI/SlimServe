@@ -26,22 +26,44 @@ def analyze(path):
             )
         }
         table = "CUPTI_ACTIVITY_KIND_GRAPH_TRACE"
-        if table not in tables:
+        if table not in tables and "CUPTI_ACTIVITY_KIND_RUNTIME" not in tables:
             raise ValueError(f"no whole-graph activity table in {path}")
-        rows = [
-            dict(row)
-            for row in database.execute(
-                "SELECT start, end, deviceId, globalPid, contextId, streamId, "
-                f"graphId, graphExecId, correlationId FROM {table} "
-                "ORDER BY start, deviceId"
-            )
-        ]
+        rows = (
+            [
+                dict(row)
+                for row in database.execute(
+                    "SELECT start, end, deviceId, globalPid, contextId, streamId, "
+                    f"graphId, graphExecId, correlationId FROM {table} "
+                    "ORDER BY start, deviceId"
+                )
+            ]
+            if table in tables
+            else []
+        )
         kernel_count = (
             database.execute(
                 "SELECT count(*) FROM CUPTI_ACTIVITY_KIND_KERNEL"
             ).fetchone()[0]
             if "CUPTI_ACTIVITY_KIND_KERNEL" in tables
             else 0
+        )
+        graph_launches = (
+            [
+                dict(row)
+                for row in database.execute(
+                    "SELECT r.start, r.end, r.globalTid, r.correlationId, "
+                    "s.value AS name FROM CUPTI_ACTIVITY_KIND_RUNTIME r "
+                    "JOIN StringIds s ON r.nameId=s.id "
+                    "WHERE s.value LIKE 'cudaGraphLaunch%' ORDER BY r.start"
+                )
+            ]
+            if "CUPTI_ACTIVITY_KIND_RUNTIME" in tables and "StringIds" in tables
+            else []
+        )
+        diagnostics = (
+            [dict(row) for row in database.execute("SELECT * FROM DIAGNOSTIC_EVENT")]
+            if "DIAGNOSTIC_EVENT" in tables
+            else []
         )
     groups = defaultdict(list)
     invalid = []
@@ -81,7 +103,11 @@ def analyze(path):
         "sha256": digest,
         "status": "complete" if rows and not invalid else "incomplete",
         "graph_record_count": len(rows),
+        "missing_graph_activity_table": table not in tables,
+        "runtime_graph_launch_count": len(graph_launches),
+        "runtime_graph_launches": graph_launches,
         "ordinary_kernel_record_count": kernel_count,
+        "collection_diagnostics": diagnostics,
         "invalid_boundary_records": invalid,
         "groups": summaries,
     }

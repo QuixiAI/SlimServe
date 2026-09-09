@@ -22972,3 +22972,49 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   compare equal to source803672802; 94 profile/recipe/campaign CPU tests pass.
   Raw: runtime-control/cold-profile-note-tests.xml. No engine change is hidden
   in the refreshed performance descriptions.
+
+## 2026-09-08: Whole-graph observer exposes collection and teardown limitations
+
+- Status: failed diagnostic series, not a baseline. Source dd202a20c,
+  unchanged selected recipe/native libraries; prescribed three starts under
+  graph:host-only Nsight collection. The first start completes all nine exact
+  timing rounds, both profile requests, nine return rounds, text/image canaries,
+  4096-token quality/six needles and cold32K/128K requests. Teardown raises;
+  starts2/3 do not run. Keep all artifacts and the exit1 controller log.
+- Before/after collection E2E medians c1/c8/c16:155.653/574.600/772.979
+  versus154.632/571.766/772.709. These are observer diagnostics, not a new
+  kernel baseline. Quality mean -2.716046039, all six needle contrasts pass.
+  Cold prefill is slower than the unprofiled baseline, particularly128K;
+  do not treat collection as transparent, even outside its active range.
+- c1 range:32 whole-graph records per GPU, all128 retained, no invalid
+  boundaries. Per-rank median graph spans5659.927-5661.224us. All6682
+  ordinary kernel records have NULL graphId: these are outside-graph work,
+  not evidence that per-node graph tracing was enabled.
+- c8 range:129 runtime cudaGraphLaunch calls but NO graph-activity table.
+  Its7736 ordinary kernels also have NULL graphId. Nsight reports possibly
+  missing CUDA events. This range cannot supply c8 graph spans. The analyzer
+  now retains such incomplete ranges, runtime launch records and collector
+  diagnostics rather than losing the entire multi-range analysis.
+- Teardown reproduction (CPU-only, same Nsight process-tree launcher): a
+  terminated orphan is adopted by nsys-launcher and remains stateZ through
+  all six samples while the controller lives. killpg(group,0) therefore is
+  not proof of a live worker. The original model run did not save process
+  states at failure, so this explains a reproduced mechanism, not direct
+  proof of that historical process's state. No compute processes remain.
+- Controller fix: after waiting for the owned parent, inspect only its owned
+  process group. Record zombie members and finish when no live members remain;
+  still escalate/fail for live workers. Always persist quality/prefill and
+  teardown failure receipts before re-raising; never continue with uncertain
+  live ownership. Original failed summary is preserved, not rewritten.
+- Model-free fixed reproduction exits0 in0.0494s and explicitly records the
+  zombie's nsys-launcher parent.28 CPU tests pass, including live-member
+  refusal, ownership filtering, zombie retention and failed-receipt persistence.
+  Real-profile requalification and the missing c8 collection diagnosis remain
+  owed. No driver, graph topology, stream, quant or serving-kernel change.
+- Raw: perf/results/2026-09-08/graph-observer-cold/ and runtime-control/
+  graph-observer-cold{.log,.1.nsys-rep,.2.nsys-rep,.1.sqlite,.2.sqlite,-analysis.json},
+  owned-group-{module,fixed}{.log,.nsys-rep}, zombie-teardown-tests.xml.
+  Initial CPU probe invocation failed an import before spawning any child;
+  owned-group-lifecycle.log retains it. Corrected invocation adds benchmarks
+  to sys.path. The separate paired mHC probe builds successfully using its
+  module entrypoint; the initial direct-script import failure is also retained.
