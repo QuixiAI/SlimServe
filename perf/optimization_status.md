@@ -25416,3 +25416,44 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   as the third A/B/A control, 7,200 samples total. Output
   stable-align-parallel-timing/, no retries/exclusions. Sources frozen from
   qualification through timing; no broader serving dispatch or gain claim.
+
+## 2026-09-09 - Parallel counting qualifies and removes four stable-path regressions
+
+- Frozen source 55b208dc5 / probe de0b2370, existing controls instruction-
+  identical to 87a3736e. All 256 cases pass memcheck 33.03s / synccheck 22.02s,
+  zero errors. Four first-two-matching-launch race processes (256/M17,
+  256/M8192, 1024/M17, 1024/M8192) pass in 7.19/7.41/7.41/7.35s, zero hazards.
+  Candidate and controls receive the same full CPU layout/graph validation.
+  Raw runtime-control/stable-align-parallel-{memcheck,synccheck,racecheck-*}.
+- All 32 fixed cases / 7,200 A/B/A samples complete and independently verify,
+  including source/Git, actual archives, all seven test receipts and full
+  control-instruction identity. No exclusions, retries or serving/native edits.
+  Against atomic PLUS sort, all 32 candidate distributions are strictly faster:
+  4.98-74.42% less latency. Previously regressing M256/random is now
+  6.202/5.893/6.202 us; M1024/random 13.883/11.736/13.886 us.
+  Actual M640 routes fall from 12.96-12.97 to 8.65-9.06 us (30.13-33.30%).
+- Compared directly with the original stable counter, 18 cases strictly
+  improve, nine strictly regress, five overlap. Small sizes still prefer the
+  256-thread variant; worst median regression 12.38%. M7616 random original /
+  new / return: 84.578/57.221/84.605 us, skew 73.656/33.176/73.634 us.
+  Versus unstable alignment alone the candidate remains 2.33-185.68% slower,
+  including 57.219 vs 20.029 us at M7616/random. The sorting diagnostic is an
+  expensive control, not permission to accept avoidable counting overhead.
+- Fresh fixed M7616/random/BM64 stage trace (same three arms / 100 calls per
+  arm, exact outputs and source/native hashes verified) confirms new counter
+  median 42.911 us, unchanged scatter 13.472 us, old counter 11.632 us, old
+  scatter 8.224 us, sort 202.718 us. Expected kernel instance counts all match.
+  Raw runtime-control/stable-align-parallel-stage-{profile.*,kernels.csv,
+  profile-receipt.json}; source-hashed profile_parallel_align_stages.py.
+  This is attribution with profiler overhead, not new production throughput.
+- Raw stable-align-parallel-timing/summary.json
+  SHA5844af835f685dc5a9aadd056532d06a0564849739077e80aacebb46f8f8c2d0;
+  runtime-control/stable-align-parallel-analysis.json
+  SHA29ecc64e0f708ea1254c2ce288552c1fe11519609be7a9c2fb31fc6724fea43a.
+  All scopes exit 0 and GPUs release. Native QC/core/MoE, profile and TC0
+  unchanged. Retain isolated controls; no serving promotion yet.
+- Next hypothesis: warp matching/leader selection is unnecessary counting
+  overhead for this workload. Test direct per-lane integer atomic increments
+  in the 1024-thread counter, preserving histogram layout, padding/prefix,
+  bitmap scatter and all existing controls. This is a hypothesis, not an
+  established microarchitectural cause. Qualify before any latency claim.
