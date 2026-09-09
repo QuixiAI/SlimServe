@@ -26015,3 +26015,22 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   cold exact-token/text/image/three-pass quality workload. No replacement starts
   or original cache edits. All source/native freeze requirements remain in force.
   Final tightened-environment CPU suite124pass5.93s; lint/diff checks pass.
+
+### RMSNorm cached-launcher hook qualification complete
+
+- On1d5ad3fe5, all16 real GPU hook cases pass: four rank/source bindings,
+  both modes, rows16/640, same/changed inputs. Actual StaticAutotunerFuture
+  interception, native/replacement hash checks, seal, eager and graph outputs
+  match the directly compiled expected configuration exactly. No timing claim.
+  Original cached source paths are relocated only after byte verification.
+  Raw rmsnorm-intervention-gpu/summary.json
+  SHA65dd86b69610a378d81092b502ca8d33e2f49c210f6d8d4d7ea1d61420972c8e.
+  GPU job exits0 and all GPUs released.
+- Private serving cache preparation exits0 in8GiB scope. Each arm copies and
+  verifies5172 original AOT files; original snapshot unchanged. Manifests live
+  in rmsnorm-intervention-caches/{control,legacy}/manifest.json. Actual profile
+  dry-run passes with forced AOT/control/private cache, preserving recipe v1,
+  TP4/noEP/no-spec/BF16/Marlin and request metrics. No serving start yet.
+- Next execute the frozen no-op control, audit it against all nine native-only
+  quality passes, then execute legacy ONLY if exact control passes. Source and
+  native binaries freeze across both starts and audits. No replacement starts.
