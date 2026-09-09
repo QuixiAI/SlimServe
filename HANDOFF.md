@@ -35,27 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 13:23 UTC)
+### Latest checkpoint (2026-09-09 13:40 UTC)
 
-The stable cutoff policy plus fused index ordering preserves every prescribed
-quality score and captured tensor versus its stable control (28d2249c1).
-Small-M origin routing now has an isolated17-21% stable-path kernel win and
-qualified native integration. Its investigation also found/repaired missing
-warp ordering in the existing router. Installed QC is33decd2f; corefe4a7c2a
-and MoE1093b8a4 unchanged. Both native policies pass functional/sanitizer checks;
-all746 non-router GPU copies are unchanged. Stable routing remains opt-in,
-requiring the canonical MoE diagnostic. Profile/quant/TC defaults are unchanged.
-Final serving wiring passes713 GPU tests (including compiled custom ops),
-519 CPU tests/one skip and52 baseline-exclusion tests. The post-sort is skipped
-only for the actual reused canonical alignment, never just because M<=16.
-Native32-shape A/B/A is COMPLETE:17.09-21.28% less stable-path latency than
-atomic plus sort, all4800 samples verified, all32 distributions separated.
-Raw stable-route-native-timing/ and runtime-control/stable-route-native-analysis.json.
-Next ONE start/three quality passes in stable-route-quality-diagnostic/ against
-the frozen28d2249c1 fused-indexer control. Full-model qualification is pending.
-The exact640/8199-ID configs and frozen run protocol are in the notebook.
-M>16 origin alignment is next
-after this loop; no new serving TPS gain is claimed.
+Small-M origin routing PASSES full-model qualification on c8ba8d56c:
+one prescribed start, three quality passes, every text/needle score and all
+1,024 short / 94 long tensors per rank exactly repeat and match the frozen
+28d2249c1 control across all nine pass pairs. All 348 archives verify.
+Both text/image canaries and all 25 warmup / 75 timed cold requests pass.
+Raw stable-route-quality-diagnostic/ and runtime-control/stable-route-*
+analyses; the notebook records hashes, warnings and limits.
+
+The native stable path takes 17.09-21.28% less time than atomic routing plus
+sorting across 32 synthetic shapes / 4,800 samples. This removes a separate
+sorting launch; it is NOT a raw-router or serving TPS gain. Installed QC
+33decd2f also repairs missing warp ordering in the existing router; core
+fe4a7c2a and MoE 1093b8a4 are unchanged. All 746 non-router GPU copies match.
+Both native policies pass functional/sanitizer checks; final wiring passes
+713 GPU tests, 519 CPU tests / one skip and 52 baseline-exclusion tests.
+Sorting is skipped only for the actual reused canonical alignment.
+
+Keep the c16 repeat-2 slowdown: 387.96 versus 648.38 / 646.17 tok/s, including
+a shared 4.371-second client-arrival gap before six requests' first tokens.
+Cause unresolved; no replacement sample. These serialized/instrumented rates
+are not production baselines. Stable routing remains opt-in; profile, quant
+and TC defaults are unchanged. Next: isolate and measure M>16 stable alignment
+at its source, then qualify uninstrumented serving and the fair TC comparison.
 
 ### Chronological evidence (older next-step statements are historical)
 

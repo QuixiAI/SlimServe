@@ -25228,3 +25228,63 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   and ALLnine pass-pair equalities versus28d2249c1. No quality-gate relaxation.
   The QC change includes the synchronization repair; equality/latency must not
   be attributed solely to the stable flag. Full-model outcome still pending.
+
+## 2026-09-09 - Stable small-M routing passes full-model equivalence; retain slow sample
+
+- Status: qualified on the prescribed diagnostic workload, not promoted.
+  Frozen source c8ba8d56cc2dff34803010bcd423cac79e73a402, QC33decd2f /
+  corefe4a7c2a / MoE1093b8a4, exact preceding protocol and recipe. ONE start,
+  three timing rounds and three quality passes; no concurrent GPU/build jobs,
+  source edits, replacement starts or exclusions. Controller and both bounded
+  CPU analyses exit 0. Sources remained frozen through verification.
+- All 25 warmup and 75 timed requests have exact 1000-in / 300-out usage and
+  zero cached tokens; text answer 4 and image answer Red pass. Correction to
+  the preceding protocol's shorthand: 75 counts TIMED requests, not warmup
+  plus timed requests. The total including the 25 warmups is 100.
+  All 168 quality requests are uncached; 12,288 text scores / 18 positive
+  needle contrasts pass. Every 4,096 text score and every needle token score
+  repeats exactly; means all -2.7282744364256297. All 1,024 short-model and
+  94 long-trace tensor fingerprints per rank repeat exactly. All 348 archives
+  verify; index bytes 221,004,780 per worker, both 7616+583 chunks / 11 layers.
+  All 4x3x639 captured GPU scores equal HTTP and all observed MoE alignments
+  are canonical. Headers identify canonical-native small routing.
+- ALL nine old/new pass pairs equal the frozen 28d2249c1 fused-index control
+  on every text/needle score and every short/long tensor per rank. Source
+  identities verify against Git (25 old / 28 new); native control/candidate
+  proof rechecks all 746 non-router function copies and native qualification
+  receipts. The intervention includes BOTH stable routing and the warp-order
+  repair; do not attribute equivalence solely to the flag. This qualifies the
+  previous 17.09-21.28% local stable-path latency result, not serving speed.
+- Serialized diagnostic E2E medians c1/c8/c16: 108.7587 / 459.7028 / 646.1722
+  tok/s. Ranges 107.7099-109.6426 / 457.9942-462.8801 / 387.9599-648.3771.
+  Keep c16 repeat 2: 12.3724s wall, 3.5920s mean TTFT, 387.9599 E2E.
+  All-client-arrival gap 4.370963s spans round-relative 2.117767-6.488730s:
+  ten requests had begun generation and six were awaiting their first token.
+  All-active arrival rates in rounds 1/2/3 are 814.914 / 811.003 / 812.974;
+  these only locate the delay before full concurrency and are NOT substitute
+  TPS. No GPU/host cause established. No user/kernel journal entries in the
+  bounded 13:30:55-13:31:30 / 13:30-13:32 UTC checks. No logged inference JIT
+  after 06:30:28 local; do not infer absence of all compilation or scheduling
+  stalls from that monitor. Profiled reproduction remains follow-up work.
+- Other retained diagnostics: allocator warnings while requesting
+  4,718,592,000 bytes on all ranks at 06:32:04/06 local, after timed rounds;
+  requests recovered and the same warnings exist in the prior control.
+  Not evidence for the earlier c16 gap. One shared-memory resource-tracker
+  warning at shutdown also exists in that control. Teardown return 0,
+  GPU release 0.684288s (rank 2 still reported at 0.391309s); transient zombie
+  ranks 0/2/3 recorded, no remaining GPU consumers. Do not call logs warning-free.
+- Raw stable-route-quality-diagnostic/; source-hashed scratch analyzers under
+  /home/tiny/.local/scratch/slimserve-glm53/quality-diagnostics/:
+  analyze_stable_route_trace.py, compare_stable_route_intervention.py and
+  audit_stable_route_requests.py. Reports in runtime-control/:
+  stable-route-quality-analysis.json
+  SHAce1e306eb5010ff6d836c1fd47f0ba38c553b67e0ccf783b2f00c8f7c58c11e7;
+  stable-route-intervention-comparison.json
+  SHA3dae509c3f3f3e805dc8994fbcfaaa07072e606a6ed49ec97a7e0c6ba010a2cb;
+  stable-route-client-stream-windows.json
+  SHA03bfddcb10d12f120b53ec2e795bd561dab33c9f088b39e209631623213a10d8;
+  stable-route-request-audit.json. Every original log/receipt is retained.
+- Decision: keep opt-in integration; no default/profile/quant/TC change and
+  no new production baseline. Next isolate M>16 origin-level stable alignment
+  versus current alignment plus sort, with independent layout/graph/sanitizer
+  checks and actual captured routes before any serving integration.
