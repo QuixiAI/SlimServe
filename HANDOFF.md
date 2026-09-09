@@ -29,6 +29,12 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
+Commit identity is Auroter <auroter@users.noreply.github.com>, not Eric Hartford.
+The 61 misattributed local campaign commits have been corrected without changing
+trees, messages or dates. Original hashes in this handoff and raw receipts map
+through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
+the old history. Upstream history is unchanged and nothing was pushed.
+
 Both current cold-prefix baselines are complete: three prescribed starts
 per stack, all 27 timing rounds/225 exact 1000-in/300-out requests, text/image
 canaries, 4096-token quality and six needle checks per start pass. Every
@@ -42,10 +48,10 @@ Raw: perf/results/2026-09-08/{cold-recipe-baseline,b12x-r281-cold-serving}/.
 B12X is pinned R28.1 with the qualified host-driver/native-FA2 adaptations
 below, no-spec/DCP1, and its unchanged 4096-token/prefill-compute-share0.4
 scheduling. It uses DIFFERENT W4A4/FP8-KV precision, not our selected recipe.
-The profile, quant and spill-free indexer remain unchanged; the mHC BF16-storage
-candidate is still OFF. The baseline used native QC f52c2d3d27a30567. A new
-native paired-staging candidate is installed for qualification (below), not
-yet a promoted performance baseline. No baseline starts were discarded.
+These comparison measurements used mHC BF16 storage OFF and native QC
+f52c2d3d27a30567. The subsequent paired-staging qualification below now enables
+lossless BF16 fn storage on RTX6000; quant and spill-free indexer are unchanged.
+Do not relabel the earlier comparison as flag1. No baseline starts were discarded.
 
 Neither stack's client-decode metric is sustained full-concurrency decode:
 both first-to-last windows include staggered cold prefill. During the common
@@ -66,19 +72,23 @@ and other platforms/dtypes. Native QC136723a73c921cb333e5b1cb367610bb22b8cc62400
 passed this qualification; the previous f52 binary is saved as runtime-control/
 mhc-paired-native-before.so.54 operator tests, four alignment memchecks and
 all7020 installed census cases pass. The fixed1/3/1 FP32/BF16/FP32 cold-profile
-series completed its control and first candidate, including every gate, but
-stopped BEFORE candidate start2: Linux recorded worker1383457 as a zombie,
-while the next GPU preflight still saw that same PID in the driver. It soon
-disappeared without intervention. The controller now waits for owned driver
-entries to clear and records preflight failures. Timing/streaming routines are
-unchanged (AST checked); the other seven benchmark hashes and all native
-libraries stay unchanged. Continue exactly TWO missing candidate starts in
-mhc-paired-serving-remainder/, then mhc-paired-return-control/. Preserve both
-completed starts and the interrupted-series log; do not replace their results.
-First control/candidate c1 medians156.205/156.730; cold32K2.58688/2.58766s,
-128K10.88924/10.91557s. No promotion from this incomplete comparison.
-All69 existing mHC kernels preserve resource usage;
-two paired variants add no spills. Global/profile BF16-storage default staysOFF.
+series is complete on native QC5d4d3790e9aeb6cb below. Its first process chain
+stopped after candidate1 when Linux recorded a zombie still active in the GPU
+driver. After a teardown-only fix, exactly the two outstanding candidates and
+one return completed, with no replacement starts. All45 timing rounds/375
+exact1000/300 requests, text/image,4096 scored tokens and six needle contrasts
+per start, and30 cold32K/128K measurements pass. All native hashes and request
+code are unchanged; only controller teardown/preflight/status changed.
+Candidate E2E medians156.791/578.993/779.940 versus controls156.205/576.187/
+779.276 and155.910/576.558/776.826. All nine candidate c1 readings exceed all
+six control readings:0.38-0.57% median gain. Batched decode and prefill are
+effectively neutral; candidate cold32K/128K engine TTFT2.58007/10.88374s.
+Retain lossless BF16 storage in the RTX6000 profile only; other platforms and
+model-global defaults remain unchanged.267 CPU tests pass/one GPU skip;
+profile dry-run selects the same recipe and flag1. Raw mhc-paired-* directories,
+runtime-control/mhc-paired-combined-analysis.json. New teardown observed real
+driver-release delays0.990/0.735/0.461s and completed safely, exit0, GPUs free.
+All69 existing mHC kernels preserve resource usage; two paired variants add no spills.
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
 was shared across separately loaded CUDA modules, while kernel attributes
 were not. The same flag also ignored device switches. Both call orders and
@@ -115,14 +125,14 @@ changed-input graphs, memcheck, racecheck and synccheck pass. Other platforms
 keep their original geometry. Raw: perf/results/2026-09-08/indexer-tiles/,
 indexer-tile-serving/ and indexer-tile-return-control/.
 
-The mHC BF16-storage fixed A/B/A is complete: one FP32 control, three BF16
+Historical scalar-staging mHC BF16-storage A/B/A: one FP32 control, three BF16
 starts, one FP32 return; all 45 exact timing rounds, text/image canaries,
 4096-token quality and six needle checks per start pass. BF16 c1 median is
 156.76 tok/s versus 155.98/156.00 in the controls, a repeatable ~0.5% gain.
 c8/c16 differences are within the observed variation. Cold 32K/128K engine
 TTFT is 2.614/10.994 s versus return 2.611/10.968 s: no prefill win; the trace
-shows a small (~0.45 ms/full chunk) mHC cost. Keep VLLM_GLM5_MHC_BF16_FN
-opt-in/default OFF pending that tradeoff's follow-up, not a promoted baseline.
+shows a small (~0.45 ms/full chunk) mHC cost. This older result kept storage
+OFF pending the paired-staging follow-up, now completed and retained above.
 All 7020 installed-kernel cases remain bit-exact, with unchanged FP32 arithmetic
 and lossless checkpoint loading. Broader tests/sanitizers pass. Raw: the three
 mhc-storage-{fp32-control,serving,return-control}/ directories in the notebook.
@@ -332,16 +342,19 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-1. Paired BF16 mHC prefill staging: fixed1/3/1 FP32/BF16/FP32 profile starts,
-   all cold-prefix, no profiling,
-   three timing repeats, quality and cold32K/128K. Keep the same new native
-   binary throughout and BF16-storage defaultOFF until a retained decision.
-   Isolated staging gains do not establish the whole-model tradeoff.
+1. mHC tensor-core prefill probe: standalone build and six initial cases pass;
+   full2700-case actual-site/shape/magnitude census with independent FP64
+   partial oracle and changed-input graph checks is running at mhc-tc-census/.
+   Timing uses six banks of all90 fn matrices (>3xL2), five A/B/A rounds;
+   no serving integration or speedup claim yet. This changes dot summation
+   order and must pass the predeclared numerical gates without relaxation.
+   Paired lossless storage is now retained separately, not this new arithmetic.
    Output-parallel arithmetic and actual 20-iteration
    norm fusion already lost; last-block synchronization was neutral. Do not
    repeat those experiments from the old three-iteration fixture.
-2. FP8 launch geometry: run the built actual-weight cold sweep, then test
-   any candidate under routed-expert contention. The old shared ROT24 fit L2
+2. FP8 launch geometry: full cold sweep completed; only downM1 NT16/8/4
+   merits a bounded routed-expert contention check (0.05-0.09us isolated).
+   All other current geometry retained. The old shared ROT24 fit L2
    and never varied warp count. Preserve the existing eight-stage contention
    evidence. The separate Marlin scheduling candidate failed its stricter
    numerical gate and remains unintegrated; the shared-memory race repair is
