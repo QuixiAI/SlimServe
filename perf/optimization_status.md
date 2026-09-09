@@ -21431,3 +21431,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   serving. Move effort to Marlin traffic and producer/consumer scheduling.
 - Raw: perf/results/2026-09-08/mhc-output-parallel/coalesced-stores.json;
   complete A/B/A samples and arithmetic errors retained with source hashes.
+
+## 2026-09-08: Prepare isolated Marlin traffic counters on actual quant bytes
+
+- Status: layer-3 preflight passes; hardware counter collection pending.
+- Baseline/hypothesis: routing census measures unique experts, not DRAM/L2
+  traffic. The old 88%-of-wire claim needs direct evidence before guiding
+  persistent expert-kernel work.
+- Change: isolated probe loads TP4 rank-local gate/up/down slices from the
+  indexed checkpoint and calls the serving Marlin preparation and GEMM path.
+  It requires exact gate/up global-scale equality rather than approximating
+  mismatched scales. Actual expert IDs come from predetermined journal steps;
+  activations and routing weights are synthetic, with GLM's clamp limit 10.
+- Correctness: three CPU selection tests pass. Actual layer-3 batch 1/8/16
+  outputs are finite and bit-exact between eager and captured calls; observed
+  unique counts 8/54/106 and padded rows 64/432/848. No new serving arithmetic.
+- Method: bracket only expert execution with CUDA profiler start/stop;
+  counters use cold caches and no clock-control changes. This is not a
+  serving timing or an exact recreation of overlapping shared projections.
+  The driver restricts GPU counters to administrators; unprivileged query
+  reports ERR_NVGPUCTRPERM. Use a scoped privileged profiler process, without
+  changing the driver permission setting or power/clock configuration.
+- Next: collect layers 3/23/44, batches 1/8/16, three predetermined routing
+  observations per batch. Retain all counters and raw case identity, not just
+  the best bandwidth. Raw: perf/results/2026-09-08/marlin-counters/preflight.json;
+  forthcoming cold-cache counter files in the same directory.
