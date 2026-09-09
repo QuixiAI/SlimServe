@@ -91,51 +91,50 @@ noise is vocabulary-indexed FP32/FP64. Seeded streams change from the old
 sampler-serving/. The persistent slow graph state is unchanged. A separate
 PyTorch reduction race report remains under investigation; see the notebook.
 
-Immediate work: the PyTorch reduction report, stronger quality references,
-and startup graph latency. Sampler and state-copy fixes are live-validated.
-Then revisit these
-kernel candidates with one-factor experiments and fixed-count serving runs.
-The savings below are hypotheses, not measured remaining headroom:
+The stronger quality baseline is complete (9de9ad871): three fixed starts,
+all 27 timing measurements retained, E2E medians 155.93 / 575.96 / 778.33.
+Each start scored 4096 explicit continuation tokens; mean log probability
+ranged -2.735695 to -2.730236. All six equal-length retrieval contrasts ranked
+the true code first at 1K/8K/32K context. This measures prefill quality, not
+teacher-forced decode or broad capability. Raw: quality-baseline/ under the
+same dated results directory. The serving binary/recipe were unchanged.
 
-1. c8 decode fixed overheads: fp8 dense GEMMs stretched under Marlin (net
-   1.7 -> 1.4, ~0.3); mHC 0.99 (next form is a two-barrier cooperative
-   kernel with the serial tail spread over all blocks, est. 0.1-0.5; the
-   last-block mode was neutral at c1 and is untested at c8,
-   VLLM_DSV4_MHC_MODE); cuBLAS wmma 0.39 (the KDA fg_b bmm at M = 8; a
-   small-M kernel ~0.25); sparse MLA decode 0.31 against a 0.11 floor (a
-   head-batched kernel that reads each selected latent row once for all
-   16 heads); norm/glue fusions over ~470 sub-2 us launches (~0.3);
-   indexer 0.23; the 11 DSA layers' bf16 fused_qkv_a / kv_b (0.24; native
-   FP8 exists but shares a module with the BF16 indexer shards). Custom
-   AR 0.94 is measured at both algorithms with ~0 left (forced 1-stage
-   was rejected, -1.5% c8).
-2. c1: lm_head in FP8 (~0.1); shared-expert gate_up on the aux stream (42
-   launches x 7.4 us, row-per-block at M = 1); C++ TORCH_LIBRARY
-   registration of quixicore_decode_linear (a 2-4 us Python trampoline per
-   call); the same fusions; the Phase 4 expert kernel only in its
-   persistent stream-K form (~0.35 at best; the prototype at Marlin parity
-   and its ceilings are in the 2026-09-08 notebook entry and
-   perf/results/2026-09-08/nvfp4-expert-proto/).
-3. Prefill (c8/c16 aggregates): fp8 blockwise GEMM (61 ms of the 446 ms
-   c8 prefill), Marlin at M >= 64 (112 ms; needs a purpose-built FP4
-   grouped GEMM), warming the prefill-only kernels in the boot (pass 1 of
-   any boot is not a prefill reading). The hybrid cache block is 1088
-   tokens, so 1000-token bench prompts never hit the prefix cache.
-   Vocab-parallel candidates-only sampling drops the logits all-gather
-   (26 / 102 / 176 us at c1/c8/c16).
-4. MTP (Phase 3): boots at k=1 once the speculator engine block carries
-   `"attention_backend": "QUIXICORE_MLA_SPARSE"` (the proposer never
-   inherits the target's backend and the sm_120 auto-list lacks ours);
-   index sharing, lm_head and embedding sharing are already wired. Slower
-   today at both shapes under the policy (c1 145.9 / c8 464.7): spec step
-   c1 11.46 / c8 21.32 ms, of which ~2.7 / ~3.0 ms are eager-draft launch
-   gaps, Marlin at c8 streams ~103 distinct experts per step against ~57
-   no-spec, and the M >= 2 kernel paths (custom AR 1.84) cost the rest.
-   Draft CUDA-graph capture is the first fix; the expert-byte tax is
-   physics, so MTP pays at c8 only where acceptance is greedy-like. The
-   rtx6000 record keeps `"speculative": false`. The distinct-expert counts
-   above were estimated, not observed; they do not establish that sampled
-   MTP cannot win after optimization. Use an isolated experiment config.
+Immediate work: actual-step routing capture and isolated mHC A/B tests,
+while continuing the graph-latency investigation. The
+PyTorch reduction warning is isolated to the block-y/block-x shared-memory
+boundary in global_reduce: a one-barrier isolated extension removes it, but
+the installed Torch binary is unchanged and numerical corruption is unproven.
+
+Current candidate priorities (hypotheses, not physical ceilings):
+
+1. MoE routing and traffic: capture the actual experts used together in each
+   scheduler step, then measure DRAM traffic. The current rank-0 c8 trace has
+   about 5.26 ms of Marlin and 4.10 ms of FP8 projection durations with overlap;
+   summing those durations overstates their contribution to the step. Inspect
+   the prior rejected expert prototype before changing its scheduling/layout.
+2. mHC arithmetic and producer/consumer scheduling: an output-parallel warp
+   layout could cut repeated reduction work while preserving FP32 parameters.
+   The last-block synchronization experiment was neutral. The old phase probe
+   used a three-iteration test fixture with fused RMS norm; GLM uses 20 Sinkhorn
+   iterations and separate norms. Re-measure the actual path. B12X's dependent-
+   launch implementation is a relevant separate precedent, not a guaranteed gain.
+3. Sparse-MLA decode, pooled indexer and neighboring norm/glue fusion. Validate
+   numerical and state behavior across decode, prefill and context boundaries.
+   Python-to-C++ registration alone does not remove captured GPU graph nodes.
+4. Fresh long-context prefill attribution and matched TTFT measurements. Keep
+   cold startup/warmup costs recorded separately, with no pass-number selection.
+   The recipe's BF16 lm_head and KV stay fixed; FP8 variants would be a different
+   quant experiment, not an optimization silently applied to this baseline.
+5. MTP: the earlier k=1 probe served but regressed recommended-sampling throughput.
+   Draft CUDA-graph capture remains the first cost-side experiment. Acceptance and
+   actual verifier routing decide the benefit; estimated 57/103 expert counts do
+   not prove a ceiling. Keep speculation off in the production record until a
+   separately identified experiment passes full serving and correctness checks.
+
+Deprioritized by current evidence: KDA f_b/g_b. All eight c8 replays in
+sampler-serving/boot-1 contain 34 gate-projection kernels totaling about
+86 us/step, not the older 0.39 ms attribution. Even a large local improvement
+has little end-to-end value. Check fresh trace counts before reviving that item.
 
 Retained since Phase 0, all default on the rtx6000 record (a switch named
 here exists for one-factor A/Bs only):
@@ -179,10 +178,11 @@ until a fast boot appears or exclude a run because it is slow. Startup
 variability is an unresolved correctness-of-measurement issue to diagnose.
 Profile attribution informs hypotheses; only matched serving measurements
 establish a throughput win. The expert-bandwidth estimates below assume
-near-uniform routing and are not measured DRAM traffic. Gate band
--2.407..-2.478 with ~0.02 within-boot noise (Marlin MoE is
-non-deterministic); gates per plan section 4 (exact-token within the band
-or better, NLL + needle within 0.03 nats); a notebook entry for every
+near-uniform routing and are not measured DRAM traffic. The legacy 256-token
+quality gate's -2.407..-2.478 band belongs only to that old workload, not the
+new 4096-token explicit-ID reference. Compare matched quality cases and their
+measured spread; do not apply an old absolute band to a new corpus. Prompt
+scoring tests prefill, not teacher-forced decode. Keep a notebook entry for every
 result including rejections. Warm the full measured workload before timed
 runs, retain cold warmups separately, and do not discard measured repetitions.
 Profiler captures use a 384-token round after timed runs. Attribute replays by

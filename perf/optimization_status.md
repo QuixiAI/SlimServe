@@ -21284,3 +21284,35 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   failure; record NLL spread instead of selecting a best score or fast boot.
 - Raw destination: perf/results/2026-09-08/quality-baseline/. Run the campaign
   harness with its established source, --boots 3 --repeats 3 --traces --quality.
+
+## 2026-09-08: Expanded quality baseline passes all three fixed starts
+
+- Status: retained regression reference; no serving change or speedup claim.
+- Configuration: clean commit 9de9ad871, recipe v1 and native hashes identical
+  to sampler-serving; three predetermined starts x three repetitions, exact
+  1000/300 at c1/c8/c16 and recommended sampling. Source, serving and harness
+  stayed fixed throughout. Documentation and unimported/unbuilt probes were
+  prepared without changing the running experiment.
+- Results: E2E medians 155.934 / 575.961 / 778.329 tok/s; full ranges
+  155.263-156.315 / 573.455-577.838 / 766.780-783.266. All 27 timings retained,
+  including the slower boot-3 first c16 result. Median client decode
+  164.818 / 589.890 / 791.246 tok/s. No material change from sampler-serving.
+- Correctness: all three text/image canary pairs pass; all 225 measured
+  requests have exact counts and no replacement characters. Quality executes
+  after timed workloads and profiling on each start. All 4096 continuation
+  tokens per start have aligned finite log probabilities. Means:
+  -2.735694586 / -2.730236079 / -2.732938709, spread 0.005458507.
+  All six retrieval contrasts pass on every start; smallest true-code margin
+  33.6363 over the best distractor. Raw prompt scoring exercises prefill,
+  not teacher-forced decode. Broader model quality remains unqualified.
+- Landscape cleanup: current traces put the 34 KDA gate projections at only
+  ~86 us/step, not the old 0.39 ms estimate; deprioritize that candidate.
+  Retire estimated routing/traffic as a physical ceiling. The legacy mHC
+  phase probe uses three Sinkhorn iterations and fused RMS normalization;
+  actual GLM uses twenty and separate norms, so remeasure its real path.
+- Decision: use matched cases and measured reference variation for future
+  quality comparisons; do not transfer the legacy 256-token score band.
+  Next: bounded actual-step routing census, then isolated output-parallel
+  mHC parity and A/B/A timing with actual GLM constants.
+- Raw: perf/results/2026-09-08/quality-baseline/summary.json, every request,
+  per-start quality.json (including raw responses), logs and all-rank traces.

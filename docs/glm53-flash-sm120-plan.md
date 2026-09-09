@@ -1,7 +1,14 @@
 # GLM-5.3-Flash on 4x RTX PRO 6000 Blackwell (sm_120): performance plan
 
-Status: plan, 2026-09-04. Branch `glm53-flash-sm120`, cut from upstream/main
-9247eedad (2026-09-04). No code changes yet. Companion notebook entries go in
+Status: historical research plan with an active validation protocol, updated
+2026-09-08. Branch `glm53-flash-sm120`, cut from upstream/main 9247eedad.
+The implementation has advanced substantially since the original plan.
+Use HANDOFF.md for current priorities and perf/baseline_status.md for current
+fixed-start results. Original target tables and bandwidth estimates below are
+historical hypotheses, not established physical limits or active exit gates.
+The selected recipe is glm53-redhatai-nvfp4-fp8-kda-tp4-v1; other weight/KV
+quants in the research tables are not authorized silent substitutions.
+Companion notebook entries go in
 `perf/optimization_status.md`; baselines in `perf/baseline_status.md`; raw
 logs under `perf/results/YYYY-MM-DD/<run-id>/`.
 
@@ -710,7 +717,9 @@ once the NLL / needle legs run on this platform.
 - Kernel changes: parity test against an fp32 reference (existing pattern:
   `tests/kernels/test_quixicore_sparse_mla_bf16.py`, 2e-3), microbenchmark
   at the real shapes (M = 1, 4, 8, 32, 64 per expert; real `topk_ids` from
-  a captured step), then end to end. Report GB/s against 1.79 TB/s.
+  a captured step), then end to end. Distinguish unique weight footprint
+  from measured DRAM traffic; record operating clocks and do not equate a
+  nominal 1.79 TB/s specification with achieved bandwidth.
 - Kernel choice for anything on the aux stream (2026-09-07, swap-set part
   3): a kernel that runs underneath the Marlin routed-expert kernels is
   tuned from the serving trace under contention (aux_window.py around one
@@ -738,24 +747,28 @@ once the NLL / needle legs run on this platform.
 - One factor per experiment. Every retained or rejected change gets a
   notebook entry (Status / Scope / Baseline / Hypothesis / Change /
   Correctness / Results / Decision / Raw artifacts). Rejections are recorded.
-- Instrument for launch-count changes (2026-09-04, evening): decide on a
+- Instrument for launch-count changes (2026-09-04, evening): attribute with a
   same-tree profiler pair (perf/results/.../route-fused-profile/prof_pair.sh:
   arm A then arm B booted back to back, one c1 capture each, full decode
-  steps only, compare GPU span and launches per step), not on the
-  exact-token harness, whose boot spread (below) hides anything under ~3%.
+  steps only, compare GPU span and launches per step). This explains mechanism;
+  retaining a speedup still requires the fixed-count exact-token serving test.
   The spread itself is inter-kernel idle inside the CUDA graph (0.02 vs
   0.46 ms per step on the same tree), on the GPU timeline, not host work.
 - Noise band on this stack (measured 2026-09-04, both sessions): the
   exact-token c1 cell moves up to ~4% between boots of the same tree
   (pass-to-pass within a boot <0.3%); the 8-slice prompt_logprobs mean
   moves 0.02-0.03 nats between boots and per-token logprobs have sd 0.47
-  nats even between two requests on one boot (MoE routing flips from
-  nondeterministic reductions). These are historical observations, not an
+  nats even between two requests on one boot. These are historical
+  observations, not proof of a particular nondeterministic operation or an
   exclusion rule or proof that all future variation is harmless. Small
   throughput deltas need enough predetermined starts/repetitions to separate
   them from the measured spread. Keep cold warmups and never discard a timed
   cell for proximity to /health; fix missing startup work at its origin.
-  Scoring gates compare boot means with a 0.03 nat band; there
+  The old 0.03 nat band applies only to matched cases, not different corpora.
+  The expanded benchmark_glm53_quality.py reference scores 4096 continuation
+  tokens using explicit IDs and equal-length retrieval contrasts through 32K.
+  Establish its repeat/boot spread before interpreting a change. These prompt
+  scores exercise prefill, not teacher-forced decode; there
   is no bit-exact greedy gate on GLM-5.3 here, parity tests carry that
   burden for kernel changes.
 - Regression rule: a change is retained only if c1 and c8 on the canonical

@@ -1919,6 +1919,29 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 expanded quality reference - 2026-09-08
+
+Commit 9de9ad871, unchanged recipe v1 and corrected-sampler native binary.
+Three predetermined starts x three repeats; same exact 1000/300 workload,
+recommended sampling and full warmups. All 27 measurements retained.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median |
+| ---: | ---: | ---: |
+| 1 | 155.93 [155.26, 156.31] | 164.82 |
+| 8 | 575.96 [573.46, 577.84] | 589.89 |
+| 16 | 778.33 [766.78, 783.27] | 791.25 |
+
+All starts pass text/image canaries and all 225 measured requests are exact.
+Quality runs after timings/traces: 4096 explicit-ID continuation tokens per
+start, mean log probabilities -2.735694586 / -2.730236079 / -2.732938709.
+All six equal-token-length needle contrasts pass per start (1K/8K/32K,
+positions .25/.75); minimum true-vs-best-distractor log-probability margin
+33.6363. This is a prefill regression reference, not teacher-forced decode
+or broad quality certification. Do not compare with the legacy 256-token
+corpus or silently use its tolerance. No speedup is claimed.
+Raw: perf/results/2026-09-08/quality-baseline/, including all raw quality
+responses, exact-token requests, server logs, all-rank traces and identity.
+
 ### RTX6000 corrected-sampler fixed-start baseline - 2026-09-08
 
 Commit 4a7a5a73e, same pinned recipe v1, TP4 no-spec, exact 1000/300,
