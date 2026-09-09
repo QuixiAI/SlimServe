@@ -29,13 +29,15 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-Current priority: a bounded racecheck now reproduces a shared-memory hazard
-in the installed Marlin production configuration, not only a tuning candidate.
-The line-numbered isolated copy matches installed output exactly and identifies
-weight-tile reads overlapping reuse of the same storage for block reduction.
-Test the missing phase barrier before promoting any scheduling change or new
-baseline. No numerical corruption has been established; the sanitizer finding
-still blocks stronger correctness claims. See the latest notebook entry.
+Current priority: validate the repaired Marlin library through the fixed-start
+serving campaign, including explicit cold-prefill measurements. The original
+production library had weight-tile reads overlapping reuse of the same shared
+storage for block reduction. A single entry barrier removes the race in both
+the isolated reproducer and installed auto-scheduled kernels. Memcheck and
+synccheck pass; 24 changed-input cases across all five M tile sizes remain
+bit-exact to the original. This is a native correctness repair, not a serving
+speed claim or proof of numerical corruption in the old kernel. Scheduling
+candidate remains unintegrated. See the latest notebook entry and native hashes.
 
 Goal: exceed the strongest reproducible B12X result on this hardware under
 matched workloads and the model's recommended sampling. The historical R24
@@ -107,8 +109,8 @@ the true code first at 1K/8K/32K context. This measures prefill quality, not
 teacher-forced decode or broad capability. Raw: quality-baseline/ under the
 same dated results directory. The serving binary/recipe were unchanged.
 
-Immediate work: isolate and repair the Marlin shared-memory phase hazard, then
-resume scheduling and explicit cold-prefill measurement. The
+Immediate work: finish the repaired Marlin library's real-profile quality and
+performance checks, then resume scheduling and cold-prefill attribution. The
 PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
 the installed Torch binary is unchanged and numerical corruption is unproven.

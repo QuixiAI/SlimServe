@@ -21639,3 +21639,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/marlin-schedule/memcheck*, racecheck*,
   shared-original.json and shared-original-race.*. Generated source/binaries
   remain in the isolated build directory; installed native libraries unchanged.
+
+## 2026-09-08: Repair Marlin's weight-to-reduction shared-memory transition
+
+- Status: installed native repair validated; real-profile validation pending.
+- Isolated controls use the archived original header, actual layer3/rank0
+  weights, two explicit M8 schedules, and changed-input CUDA graph replays.
+  Compute-entry barrier alone: zero racecheck hazards and bit-exact outputs
+  at batches 1/8/16. Both barriers also pass. Output-entry barrier alone:
+  ten error reports at batch1, with numerical comparisons still exact.
+  This identifies the weight-read/reduction-write boundary specifically.
+- Change: one unconditional block barrier at thread_block_reduce entry.
+  sh_red and sh_b alias; cp_async_wait alone does not join all weight readers.
+  No launch geometry, quantization or reduction arithmetic changes.
+- Retain marlin-before.h and moe-before.so with the hashes in the previous
+  entry. The isolated reproducer accepts --source-header so a future run can
+  reproduce the old source after the serving header changes.
+- Broader regression reference: installed original library, actual layer3
+  rank0 weights, balanced synthetic routes, batches 1/8/16/256/512/1024/1536/2048,
+  three changed-input replays each. All 24 eager/graph pairs are bit-exact.
+  The public dispatcher selects M tiles 8/16/32/48/64 over these cases.
+  Save exact CPU inputs/outputs for the rebuilt-library comparison. A second
+  reference records the identical workload after fixing a Python closure-lint
+  warning; both artifacts remain. No timings or runs were selected by speed.
+- Native build: _moe_C_stable_libtorch with CUDA13.0, sm_120f, two jobs,
+  no fast-math and an 80 GiB memory cap; all 32 build steps complete. Import
+  and operator-schema smoke pass. Installed SHA256
+  1093b8a4ca7cb308d4ebff254ab502d7b01d65eb86423b2640c8f8a4bff4ac1a.
+- Correctness: all 24 outputs are bit-exact against the original library,
+  both normally and under full memcheck and Marlin-filtered synccheck.
+  Both sanitizers report zero errors. The installed production auto-scheduled
+  path also completes racecheck at batches 1/8/16 with zero hazards and exact
+  eager/graph output. No numerical corruption from the original race is claimed.
+  All 134 SlimServe tests and diagnostic Python lint pass.
+- Independent oracle: all 36 auto-scheduled cases pass across three layers
+  and four TP weight ranks; maximum normalized RMS 0.000441920. Every recorded
+  error metric matches the original-library census exactly. The diagnostic's
+  process still exits 1 because the separate scheduling candidate retains the
+  same one strict relative-oracle failure (rank0/layer23/replay2, 0.000591620).
+  That candidate is not integrated and its failure has not been reclassified.
+- Next: three predetermined real profile starts x three timing repetitions
+  with quality, traces and the new cold-prefill workload. No serving performance
+  claim is made before that series. Scheduling and the selected recipe stay fixed.
+- Raw: perf/results/2026-09-08/marlin-schedule/shared-compute-race.*,
+  shared-both-race.*, shared-output-control.*, boundary-before*.json and
+  boundary-reference-v2/ (including native hash and exact tensors),
+  boundary-after.json, native-{memcheck,synccheck,racecheck}.* and
+  native-oracle-census.json. Build configuration/stdout: native-build.log,
+  native-build-cache.txt and native-build.ninja in the same directory.

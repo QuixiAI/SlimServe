@@ -1537,6 +1537,10 @@ __global__ void Marlin(
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
   auto thread_block_reduce = [&]() {
+    // sh_red aliases sh_b. Every warp must finish reading the staged weight
+    // tiles before any warp overwrites that storage with reduction results.
+    // The preceding cp_async_wait only waits for the calling thread's copies.
+    __syncthreads();
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {
       auto red_idx = threadIdx.x / b_sh_stride_threads;

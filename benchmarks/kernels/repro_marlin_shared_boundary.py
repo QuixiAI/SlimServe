@@ -108,7 +108,9 @@ def build(args):
     if not match or match.group(1) != torch.version.cuda:
         raise ValueError("probe toolkit must match the installed Torch toolkit")
     root = Path(__file__).resolve().parents[2]
-    header_path = root / "csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h"
+    header_path = args.source_header or (
+        root / "csrc/libtorch_stable/moe/marlin_moe_wna16/marlin_template.h"
+    )
     original = header_path.read_text()
     namespace = "marlin_shared_probe_" + args.boundary
     source = (
@@ -146,6 +148,11 @@ def build(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
+    parser.add_argument(
+        "--source-header",
+        type=Path,
+        help="Archived header for reproducing the original after a serving fix",
+    )
     parser.add_argument(
         "--boundary",
         choices=["original", "compute", "output", "both"],
