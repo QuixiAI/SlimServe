@@ -11,6 +11,8 @@ With --direct-count, use 1024 threads without warp aggregation and retain both
 original stable counters as controls: four comparisons, 9,600 samples total.
 With --parallel-scatter, use 512 scatter threads with direct counting fixed,
 adding direct-stable as the fifth control: 12,000 samples total.
+With --native, test the installed selected M17..32/M33..8192 dispatch against
+atomic and atomic-plus-sort only: 4,800 samples, no probe loaded or rebuilt.
 Routing scores/IDs, weights and GEMM arithmetic are outside this experiment.
 All buffers are hot; this does not establish model cache effects or serving TPS.
 """
@@ -99,7 +101,14 @@ def main():
     parser.add_argument("--parallel-count", action="store_true")
     parser.add_argument("--direct-count", action="store_true")
     parser.add_argument("--parallel-scatter", action="store_true")
+    parser.add_argument("--native", action="store_true")
     args = parser.parse_args()
+    if args.native and (
+        args.parallel_count or args.direct_count or args.parallel_scatter
+    ):
+        parser.error(
+            "--native selects its own shape policy; probe flags cannot combine"
+        )
     if args.parallel_scatter:
         args.direct_count = True
     if args.direct_count:
@@ -108,7 +117,12 @@ def main():
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
     assert torch.cuda.get_device_capability() == (12, 0)
-    probe = build()
+    if args.native:
+        import vllm._quixicore_C as probe
+
+        from vllm.model_executor.layers.fused_moe.router.glm_stable_align import align
+    else:
+        probe = build()
     import vllm._C_stable_libtorch as core
     import vllm._moe_C_stable_libtorch as moe
 
@@ -138,12 +152,26 @@ def main():
             ],
         )
     )
+    if args.native:
+        sources += [
+            Path(name)
+            for name in (
+                "csrc/quixicore/tm_cuda/tm_cuda_serving.cu",
+                "vllm/quixicore/ops.py",
+                "vllm/model_executor/layers/fused_moe/router/glm_stable_align.py",
+                "tests/kernels/test_glm53_stable_align_native.py",
+            )
+        ]
     hashes = {str(p): sha(p) for p in sources}
     result = dict(
         status="running",
-        count_threads=1024 if args.parallel_count else 256,
-        aggregate=not args.direct_count,
-        scatter_threads=512 if args.parallel_scatter else 256,
+        implementation="native-selected" if args.native else "probe",
+        native_dispatch="M17..32=count256/scatter256; M33..8192=direct1024/scatter512"
+        if args.native
+        else None,
+        count_threads=None if args.native else 1024 if args.parallel_count else 256,
+        aggregate=None if args.native else not args.direct_count,
+        scatter_threads=None if args.native else 512 if args.parallel_scatter else 256,
         diagnostic_only=True,
         protocol=__doc__,
         source_sha256=hashes,
@@ -184,6 +212,8 @@ def main():
             return out
 
         def stable(ids=ids, block=block):
+            if args.native:
+                return align(ids, block)
             return probe.run(
                 ids,
                 block,
@@ -243,6 +273,19 @@ def main():
         check()
         case = dict(
             tokens=tokens,
+            policy=dict(
+                count_threads=256
+                if args.native and tokens <= 32
+                else 1024
+                if args.native or args.parallel_count
+                else 256,
+                aggregate=tokens <= 32 if args.native else not args.direct_count,
+                scatter_threads=256
+                if args.native and tokens <= 32
+                else 512
+                if args.native or args.parallel_scatter
+                else 256,
+            ),
             block_size=block,
             pattern=pattern,
             input_sha256=tensor_sha(cpu_ids),

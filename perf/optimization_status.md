@@ -25626,3 +25626,23 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   parity, all12 actual routes, four foreign-device streams, alias rejection,
   eager/Inductor custom ops and changed-input CUDA graphs. Source/native freeze.
   No serving or native throughput qualification yet.
+
+### Native stable-alignment safety complete; fixed native timing next
+
+- Frozen2a5800b90, QC39b302f0. All171 functional cases PASS17.68s, memcheck
+  PASS30.10s and synccheck PASS18.31s with zero errors. Four first14-launch
+  native races (seven changed inputs) PASS: M17 7.28s, M32 7.50s, M33 7.85s,
+  M8192 8.71s, zero hazards/errors/warnings. All scopes exit0; no overlapping
+  workloads/source edits. Actual routes, CPU/probe parity, redzones, alias
+  rejection, streams/devices and eager/Inductor graphs included.
+- Native resources match the probe: count256 33regs/11,424shared; direct1024
+  48regs/42,144shared; scatter256/512 38regs/10,400 or11,424shared; zero local
+  and stack bytes. Resource match does not imply instruction or timing identity.
+  Raw runtime-control/stable-align-native-{tests,memcheck,synccheck,racecheck-*,
+  resources}. All original logs and independent SASS/probe comparisons retained.
+- Fixed next run: benchmark_glm53_stable_align --native, same32 shapes,
+  atomic/native/atomic and atomic+sort/native/atomic+sort, five A/B/A rounds,
+  three warmups, five timed20-call graphs/arm,4,800 samples. Output
+  stable-align-native-timing/. No isolated probe is loaded/rebuilt. All outputs
+  audited before/after each case, source/native freeze, no exclusions/retries.
+  Native timings remain isolated hot-cache GPU latency, not serving throughput.
