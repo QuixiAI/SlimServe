@@ -60,15 +60,17 @@ Cause unresolved; no replacement sample. These serialized/instrumented rates
 are not production baselines. Stable routing remains opt-in; profile, quant
 and TC defaults are unchanged.
 
-M>16 parallel-counter prototype is qualified in isolation (55b208dc5, probe
-de0b2370): 256 functional/memory/sync cases and four bounded races pass.
-All 7,200 samples verify; all 32 shapes beat alignment-plus-sort by 4.98-74.42%.
-M7616 random is now 57.23 us versus 223.03 us; actual M640 improves 30.13-33.30%.
-But unstable alignment alone is only 20.03 us at M7616, and the 256-thread
-stable control still wins at small sizes. No serving integration or TPS claim.
-Stage tracing confirms the remaining counter bottleneck: 42.91 us, versus
-13.47 us scatter and 11.63 us old counting. Next test direct integer atomic
-counting without warp grouping; preserve the qualified variants as controls.
+M>16 direct-count prototype is qualified in isolation (3805186a7, probe
+01047ece): 387 functional/memory/sync cases and six bounded races pass.
+All 9,600 samples verify; all 32 shapes beat alignment-plus-sort by 11.87-88.82%.
+M7616 random is now 24.95 us versus 223.06 us; actual M640 improves 51.36-52.22%.
+Unstable alignment alone is about 20.14 us at M7616. Small sizes can still
+prefer the original 256-thread stable counter. No serving integration/TPS claim.
+Stage tracing confirms counting is now 11.10 us (old counter 11.65), while
+stable scatter is 13.47 us. Next test 512-thread scatter with direct counting
+fixed; preserve qualified controls. For the unresolved c16 serving pause, use
+existing verbose JIT logging on the next diagnostic: default warning_once
+suppresses repeated same-kernel compiles, so silent logs cannot exclude JIT.
 
 ### Chronological evidence (older next-step statements are historical)
 

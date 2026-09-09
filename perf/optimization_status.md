@@ -25484,3 +25484,46 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   atomic+sort, original-stable, parallel-stable), 9,600 samples total in
   stable-align-direct-timing/. No replacements; source/native freeze. No
   serving integration or new latency claim before this qualification.
+
+## 2026-09-09 - Direct counting removes the measured count bottleneck
+
+- Frozen 3805186a7 / probe01047ece. All 387 tests pass memcheck 50.07s and
+  synccheck 29.45s, zero errors. Six first-two-matching-launch races pass:
+  256/M17 7.17s, 256/M8192 7.52s, 1024/M17 7.38s, 1024/M8192 7.55s,
+  direct/M17 7.39s, direct/M8192 7.51s; zero hazards/errors/warnings.
+  Raw runtime-control/stable-align-direct-{memcheck,synccheck,racecheck-*}.
+- All 32 cases / 9,600 samples and source/Git/test/archive/control-SASS checks
+  independently verify. Every candidate distribution beats atomic PLUS sort,
+  latency reductions 11.87-88.82%. Actual M640 routes: 6.20-6.30 us versus
+  12.95-12.98 us (51.36-52.22% less). M7616 random 223.056/24.947/223.075 us,
+  skew 129.867/29.394/129.851 us. This is isolated warm-graph latency only.
+- Direct versus aggregated1024: 24 strictly faster cases, eight overlapping,
+  none strictly slower, largest median reduction 56.18%. M7616 random paired
+  A/B/A 56.726/24.942/56.712 us; skew 33.048/29.416/33.051 us. Relative to the
+  original256 stable path, 22 strictly improve, three regress, seven overlap;
+  worst median regression 9.38% at a small size. No blanket fastest-path claim.
+  Against unstable alignment alone there are no strictly faster distributions
+  and 31 strictly slower; M7616 random is 24.942 vs 20.142 us. Keep that gap.
+- Fixed fresh M7616/random/BM64 stage trace, same 3x100 calls and verified CPU
+  outputs/source hashes: direct counter median 11.104 us, scatter 13.472 us;
+  old count 11.648, old scatter 8.048, sort 202.750 us. Kernel instance counts
+  match the protocol. Removing warp grouping eliminates the previously
+  measured counting overhead for this shape; this does not identify a precise
+  hardware stall mechanism. The stable scatter is now the larger stage.
+- Raw stable-align-direct-timing/summary.json
+  SHA79c3aa1814a16bafa6d7e2d7d4b56ff4f20d17e5095d2d7bcf0e7ad357cb1687;
+  runtime-control/stable-align-direct-analysis.json
+  SHA2726533a04e0c3b470bc80ca802edea5ba56e7e3815b1417a11cf80d0c1aacd8;
+  stable-align-direct-stage-{profile.*,kernels.csv,profile-receipt.json}.
+  Source-hashed scratch analyze_direct_align_timing.py / profile_direct_align_stages.py.
+  All scopes exit 0; no retries/exclusions/source changes during runs.
+- Next isolated factor: 512 versus 256 threads in bitmap scatter, direct
+  counting fixed. Same outputs, workspace and semantics; validate before
+  measuring. Installed natives/profile/quant/TC0 remain unchanged.
+- Read-only follow-up on the retained c16 4.371s gap: jit_monitor.py
+  _handle_jit_event uses warning_once in default mode, and
+  _log_triton_jit_compile omits specialization details unless verbose. Thus
+  repeated same-kernel compilations can be invisible after the first warning.
+  The existing --jit-monitor-verbose logs every monitored compilation with
+  details; use it for the next serving diagnostic (not a baseline). No monitor
+  code changed and no causal attribution of that gap is established yet.
