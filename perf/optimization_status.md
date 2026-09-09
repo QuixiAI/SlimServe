@@ -24851,3 +24851,39 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Final CPU suite501 pass/one skip21.19s. All32 generic candidate synccheck
   cases pass5.38s/zero errors; expected JUnit property-extension warnings and
   all per-case source/native properties retained. Ruff/diff checks pass.
+
+## 2026-09-09 - Bitonic pool ordering wins the fixed kernel comparison
+
+- Status: local kernel WIN, retained for opt-in full-model qualification, not
+  production promotion. Source934e20c90, corefe4a7c2a, baseline/candidate in
+  the same frozen binary; exact recipe and quality contract unchanged.
+- Actual replay: ALL88 prescribed calls complete; each GPU/both paths match
+  the independent CPU canonical oracle/captured indices exactly. All output
+  archives and all88 tensor hashes are independently reverified. Every source,
+  native, SASS and generic-decode qualification receipt verifies. No exclusions.
+- All18 shapes/five A/B/A rounds finish:270 warm and2700 eviction-conditioned
+  samples, all retained. Actual7616x1904 warm A/B/A2=
+  66.191359/57.661119/66.211839us:12.887-12.914% less latency. Conditioned
+  85.983999/71.648002/85.983999us:16.673% less. Actual first-chunk last583
+  rows warm10.137600/9.216000/10.117120us:8.907-9.091% less; conditioned
+  14.352000/14.304000/14.336000us is effectively neutral at this resolution.
+- Every shape's warm median improves. Synthetic physical262144-column decode,
+  rows1/8/16/64: visible8192 improves~11.6-12.8%, visible32768~6.2-6.8%,
+  visible262144~1.3-1.5%. Short visible250 avoids sorting and improves~60.7-63.8%.
+  These are selector timings, NOT equivalent percentages of model TPS. Several
+  conditioned decode medians are tied/near tied; do not inflate small differences
+  dominated by single-graph/event resolution into general memory-throughput wins.
+- Decision: connect this existing qualified native entry to a separate opt-in
+  diagnostic flag, preserving the two-kernel control, profile defaults and TC0.
+  Qualify the compiled observer/wrapper and then ONE start/three complete quality
+  passes against the8f79 repeatable control. Full-model repeatability/equality
+  and eventual uninstrumented serving performance still require measurement.
+- Raw index-bitonic-saved-input-replay/summary.json
+  SHAa6e125699b50602dff88acf72b8b345863d2684e2a2eb33247c0c47760486136;
+  index-bitonic-timing/summary.json
+  SHA7882b7e0bd2b45a0be830847a13df6e390a52941d49f2f95203283a3cbd457b5;
+  runtime-control/index-bitonic-analysis.json
+  SHA37f949d4a5eb92e9b38aaac30bbe021856b63a66a66b24a5d699872b29122ea3.
+  Scratch analyze_index_bitonic_timing.py verifies every archived output and
+  every sample and records per-arm medians/min/max, source hashes and all
+  binary qualification exceptions. Replay/timing/analysis exit0, GPUs released.

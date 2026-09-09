@@ -312,6 +312,16 @@ and the checker requires their exact binary/source-bound receipts. Do not
 claim blanket unchanged code. Next same88-call replay and18-shape A/B/A into
 index-bitonic-{saved-input-replay,timing}/, using corrected binary comparison
 and both generic-decode qualification XMLs from the notebook. No timing yet.
+Completed on934e20c90: ALL88 actual-input outputs match exactly and all18
+fixed A/B/A shape medians improve warm. Full chunk66.191/57.661/66.212us
+control/bitonic/return (12.9% less selector latency); conditioned85.984/71.648/
+85.984us (16.7% less). Last583 rows~9% warm gain, conditioned essentially
+neutral. Synthetic long decode gains~1.3-12.8% warm; short no-sort case~61-64%.
+All270 warm/2700 conditioned samples and all archives verified; raw index-bitonic-
+{saved-input-replay,timing}/, runtime-control/index-bitonic-analysis.json.
+Next connect the qualified native entry via an OFF-by-default diagnostic flag,
+then compiled-observer and full-model three-pass equality qualification. This
+is a kernel win, NOT a serving TPS gain or production promotion yet.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
