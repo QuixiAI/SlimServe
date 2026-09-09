@@ -118,6 +118,7 @@ def test_three_requests_multiple_chunks_and_extra_match(journal):
     assert len(events[0]["implementation_sha256"]) == 9
     assert events[0]["selection_order"] == "native"
     assert events[0]["selection_ties"] == "native"
+    assert events[0]["selection_order_implementation"] == "native"
     assert events[0]["capture_layer"] == 3
 
 

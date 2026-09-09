@@ -24887,3 +24887,46 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Scratch analyze_index_bitonic_timing.py verifies every archived output and
   every sample and records per-arm medians/min/max, source hashes and all
   binary qualification exceptions. Replay/timing/analysis exit0, GPUs released.
+
+## 2026-09-09 - Opt-in fused selector wiring and full-model protocol
+
+- Status: diagnostic wrapper qualification; full-model run pending.
+- Change: strict SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED=1 selects the qualified
+  native glm53_top_k_per_row_ordered and omits the Triton post-sort. Requires
+  canonical ties, canonical order and all existing model/MoE/index diagnostic
+  prerequisites. Flag0 returns the existing control behavior; all defaults
+  disabled still return the original generic callable. Missing rebuilt native
+  schema fails closed. Journal records selection_order_implementation as
+  native-bitonic/post-sort/native; the campaign marks fusion baseline-ineligible.
+- No native rebuild or arithmetic/profile/quant/TC changes. Corefe4a7c2a,
+  QC4ce80155/MoE1093b8a4 unchanged. CPU508 pass/one skip21.01s, covering exact
+  factory selection, no second sort in fused mode, unchanged return/arguments,
+  prerequisites/invalid flags/missing schema, journal and baseline exclusion.
+- First combined GPU test attempt:40 pass/3fail43.32s. The compiled observer
+  cases passed; three existing archived replay tests need original GPUs1..3,
+  but the command exposed onlyGPU0. Failures are invalid device ordinals,
+  not selector mismatches. Keep index-fused-wrapper-gpu-tests.xml/log; rerun
+  the COMPLETE same suite with CUDA_VISIBLE_DEVICES=0,1,2,3, suffix-final.
+- Prescribed full model after qualification: ONE start, three timing rounds
+  and three COMPLETE quality passes; no replacement starts/retry selection.
+  Same150GiB/no swap/TP4/profile glm53-nvfp4-4/recipe v1/CUDA13/cache/prompt,
+  unset NCCL_P2P_DISABLE, OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0;
+  canonical MoE/order/ties and all journals unchanged; add FUSED=1 only.
+  --boots 1 --repeats 3 --cold-prefix --quality --quality-repeats 3;
+  output index-fused-quality-diagnostic/. Configs runtime-control/
+  index-fused-score-config.json
+  SHA8bd807bee3d9497f57b7678420d8ff55dfe2443eeab08ddf247749f59f02c578;
+  index-fused-index-config.json
+  SHA692d128c0b0d663cf263e28c6ebff2270a27facbcd6e96be61dea8a7eaf27427.
+  Exact640/8199 token lists compared byte-for-byte to the previous configs,
+  max_matches3/capture_layer23 unchanged. Freeze sources/native throughout.
+- Require all quality passes/scores/archives/HTTP/source/native receipts,
+  complete short and long tensor traces, canonical MoE alignment, and exact
+  cross-run equality to8f79's tie-policy control (not the pre-tie run). Its
+  separate generic-decode code-generation differences remain qualified and
+  explicitly recorded, not a blanket unchanged-binary claim. Serialized TPS
+  is diagnostic only; production promotion/uninstrumented speed still pending.
+- Final all-four GPU suite43 pass46.89s:19 native/compiled observer cases
+  (both tile layouts, capture layers3/23, native/order/ties/fused modes) and24
+  canonical-order/saved-input checks. No source/native changes during either
+  attempt. Both logs retained; Ruff/diff checks pass and GPU contexts released.

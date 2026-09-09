@@ -322,6 +322,17 @@ All270 warm/2700 conditioned samples and all archives verified; raw index-bitoni
 Next connect the qualified native entry via an OFF-by-default diagnostic flag,
 then compiled-observer and full-model three-pass equality qualification. This
 is a kernel win, NOT a serving TPS gain or production promotion yet.
+Fused serving wiring is now an opt-in diagnostic under
+SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED=1, requiring all prior canonical flags
+and journals; the header records native-bitonic and the extra Triton sort is
+omitted. CPU508 pass/one skip. First GPU suite exposed onlyGPU0 and therefore
+failed three original-GPU replay cases after40 passes; full all-four rerun
+is required/recorded separately. No native/default/profile changes. Next ONE
+start/three full quality passes in index-fused-quality-diagnostic/ against
+8f79's exact repeated tie-policy control; configs index-fused-{score,index}-config.json,
+same prompt IDs/capture_layer23/TC0. See notebook for the complete frozen protocol.
+Final all-four wrapper/GPU suite now PASSES43 cases46.89s; no kernel/source
+changes were needed for the visibility-only rerun. Full-model run still pending.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

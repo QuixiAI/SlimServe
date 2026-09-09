@@ -99,11 +99,17 @@ def test_native_observer_keeps_inputs_and_records_actual_output(config, family):
 
 @pytest.mark.parametrize("tiles", [(8, 64), (2, 128)])
 @pytest.mark.parametrize(
-    "canonical,ties", [(False, False), (True, False), (True, True)]
+    "canonical,ties,fused",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (True, True, True),
+    ],
 )
 @pytest.mark.parametrize("capture_layer", [3, 23])
 def test_compiled_real_indexer_journal_and_runner_chunks(
-    config, monkeypatch, tiles, canonical, ties, capture_layer
+    config, monkeypatch, tiles, canonical, ties, fused, capture_layer
 ):
     """The registered real opaque op, real CUDA selector and synthetic paged KV.
 
@@ -117,6 +123,7 @@ def test_compiled_real_indexer_journal_and_runner_chunks(
     monkeypatch.setattr(gi, "_POOL_TILE", tiles[1])
     monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER", str(int(canonical)))
     monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES", str(int(ties)))
+    monkeypatch.setenv("SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED", str(int(fused)))
     settings = json.loads(config.read_text())
     settings["capture_layer"] = capture_layer
     config.write_text(json.dumps(settings))
@@ -232,6 +239,9 @@ def test_compiled_real_indexer_journal_and_runner_chunks(
         .splitlines()
     ]
     assert events[-1]["kind"] == "request_complete" and events[-1]["chunks"] == 2
+    assert events[0]["selection_order_implementation"] == (
+        "native-bitonic" if fused else "post-sort" if canonical else "native"
+    )
     runner._slimserve_index_journal.close()
     assert len([e for e in events if e["kind"] == "tensor"]) == 2 * (11 * 4 + 4)
     for item in (e for e in events if "archive" in e):

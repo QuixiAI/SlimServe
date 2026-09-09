@@ -3158,7 +3158,7 @@ def glm53_top_k_per_row_ordered(
     stride1: int,
     topk_tokens: int,
 ) -> None:
-    """Diagnostic fusion candidate; no serving caller until qualified."""
+    """Opt-in diagnostic fused pool order; production defaults stay unchanged."""
     torch.ops._C.glm53_top_k_per_row_ordered(
         logits,
         cu_seqlen_ks,

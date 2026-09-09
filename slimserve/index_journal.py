@@ -133,6 +133,13 @@ class IndexJournal:
                     if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_TIES") == "1"
                     else "native"
                 ),
+                "selection_order_implementation": (
+                    "native-bitonic"
+                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_FUSED") == "1"
+                    else "post-sort"
+                    if os.getenv("SLIMSERVE_GLM53_CANONICAL_INDEX_ORDER") == "1"
+                    else "native"
+                ),
                 "implementation_sha256": {
                     p: hashlib.sha256((root / p).read_bytes()).hexdigest()
                     for p in sources
