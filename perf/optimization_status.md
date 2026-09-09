@@ -22813,3 +22813,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   New scratch build directory: mhc-storage-paired-build. Do not overwrite
   earlier extensions or promote a profile from this isolated probe alone.
 - Raw: perf/results/2026-09-08/runtime-control/mhc-paired-cpu-tests.xml.
+
+## 2026-09-08: Separate client decode windows from cold-prefill staggering
+
+- Status: read-only diagnostic; no timing exclusions or baseline changes.
+- The exact harness's client_decode_tps covers earliest first-token arrival
+  through latest last-token arrival. It is NOT sustained full-concurrency
+  decode: other requests can still be prefilling within that interval.
+- New analyze_glm53_client_streams.py preserves original TPS, all request
+  identities and inter-chunk gap summaries, and reports the common interval
+  after all requests have started and before any finishes. Its token-arrival
+  rate is explicitly diagnostic, not GPU throughput or replacement TPS.
+- In B12X's first cold start, repeat1/c8 first arrivals span0.363-1.678s;
+  earlier requests have up to383-387ms inter-chunk pauses. Common-interval
+  arrival rate667.76 tok/s is close to667.93 in the cached series' same
+  repeat, even though the reported client decode rates are499.79 vs649.59.
+  All prompts are distinct source spans; this is not same-prefix sharing
+  between the eight concurrent requests. Cold prefill staging is visible,
+  not evidence that cache salting slows the steady decode kernel.
+- The cached series' first measured c16 round contains a synchronized
+  ~2.67s stream pause across all16 requests, despite ~16.8ms median chunk
+  gaps. The low608.47 E2E result stays retained. The pause is observed at
+  the client; its origin is NOT established as JIT or CUDA graph state.
+- Both launcher settings and timing windows matter: B12X advertises4096
+  max batched tokens and prefill_compute_share0.4 in the recorded server
+  config. Do not equate a cold-request E2E win with faster sustained decode
+  or a claim against every B12X scheduler/speculation configuration.
+- Six CPU fixture tests pass, including staggered starts, no common interval,
+  token-count/timestamp corruption, and preservation of source metrics.
+  Raw: runtime-control/b12x-client-stream-windows.json (all18 measured rounds
+  from cached boot3/cold boot1, with per-file hashes), client-stream-tests.xml.
+  Full fixed cold-prefix series is still running; no aggregate conclusion yet.
