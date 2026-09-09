@@ -26134,3 +26134,75 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Next freeze repair, one new no-op serving start, legacy only after exact no-op
   agreement with every native reference pass. Preserve both failed starts;
   no default/TC/precision changes and no fresh-compilation claim.
+
+## 2026-09-09 - Full no-op passes; partial legacy intervention exposes coverage gap
+
+- Status: no-op qualified; legacy causal experiment NOT qualified for complete
+  source replacement. Frozen3298bacd1, fixed recipe/native binaries, one start per
+  arm, no source edits or commits between arms/audits, no discarded measurements.
+- Both arms:4 direct AOT loads; text4/imageRed;25 warmup/75 timed exact1000/300
+  cold requests;168 quality requests,12288 text/504 needle-token scores. All
+  request counts/cache/token checks pass. All three score vectors repeat exactly.
+- Control matches every score in all9 prior native passes (27 cross-pair checks).
+  Mean-2.727814820100083, startup154.110s, c1/c8/c16 E2E medians
+  157.291/580.472/781.368. These are diagnostic observations, not new baselines.
+- Static-hook legacy mean-2.73100041148523, startup166.095s, E2E medians
+  157.048/576.874/778.498. Versus native:4096 text/168 needle scores differ;
+  versus old instrumented reference:4095/168 differ, text mean-absolute0.251479
+  and maximum5.883160nat. No claim that aggregate proximity proves equivalence.
+- Audit verifies22 sources,5172 original files, unchanged private seed files,
+  matching unrelated launcher choices. Observed static launchers76/75; target
+  objects1/2/2/2 control and1/2/2/1 legacy. Both server/controller exit0, GPUs
+  released0.9571/0.7888s. Preserve8 recovered allocation warnings each,4/2 zombies
+  at teardown and one shared-memory tracker warning each. Final GPUs empty.
+- Raw control audit SHA8f641ab9bc0249c483afb0ad3f93d0b77b0aed529aefff565c071643e37d9c8a;
+  legacy audit20806d7caca7a45e6b81efd6815fa74a1554c977192c46df89872c2130fa0876.
+  Under `runtime-control/rmsnorm-{noop-idempotent-control,legacy-idempotent-only}-analysis.json`.
+
+### Important follow-up: static coverage is not actual graph coverage
+
+- CPU inventory of both serialized caches:400 static entries/56 generated graph
+  sources, all28 graph pairs identical after namespace normalization.19 changed
+  artifact/source config-list groups across10 sources; duplicated entries can
+  carry both candidate lists and a selected candidate. All6516 old/5172 native
+  cache files unchanged. Initial uniqueness assertion failed; retain that log.
+  Inventory SHA51a2f1dcfb11cfc2ccf2e09235ca35ef3629cf3a0a2202425047ea61e705ace4,
+  `runtime-control/rmsnorm-serialized-static-inventory.json`. Serialized kernel
+  hashes here use hex, not launchers' base32 encoding. No historical execution claim.
+- ONE weight-free real rank2 legacy loader inspection then finds4 target globals
+  in actual graph modules:3 globals (2 distinct objects) bypassed the static hook
+  and still point to native4096/16 launchers; only1 points to legacy1024/8.
+  All50 static bundle entries loaded and originals remain unchanged. This proves
+  the hook's coverage defect without another169B model start. Raw
+  `rmsnorm-graph-bindings-rank2/{loaded-graph-bindings,summary}.json`; exits1 as
+  required. The earlier8 loader checks verified only static callbacks, not globals.
+- Correct interpretation: the live legacy arm was NOT proven a complete
+  four-source intervention. Withdraw the provisional inference that all four
+  changes cannot explain the historical mismatch. Neither old quality gate nor
+  TC is cleared. The no-op equality remains valid; its passing result does not
+  validate legacy completeness. Preserve all raw prior audits unchanged.
+- Repair now adds post-load graph-global binding before returning model callables
+  and independent all-graph coverage at capture. Next source-exact GPU +8 real
+  graph inspections under the protocol, then decide the next serving experiment.
+
+### Complete graph coverage repair qualified locally
+
+- CPU146pass6.42s/14 existing warnings. GPU28 source-exact cases and154 repeated/
+  aliased resolutions pass with the new hook installed. The synthetic probe has
+  no model graphs and explicitly skips that check; serving/real-loader defaults
+  require complete graph coverage. GPU summary
+  SHAb4f488bb8b6588aa179ac9a3a12fb9c1f19b5f05e6bfbcec1fc10d279664d384.
+- All8 prescribed real-loader processes pass BOTH internal and external actual
+  graph-global inspection:18/18 target bindings,56/56 artifacts,400/400 static
+  kernels. Per-rank globals1/2/4/2 in each mode; zero unintercepted or wrong-selected
+  globals. Actual source/config/binary checks remain strict, including symbols
+  removed/replaced/renamed after load. No weights or model forwards run.
+- Independent offline audit verifies every receipt, module source hashes and all
+  5172 unchanged original cache files; final GPU check empty. Raw
+  `rmsnorm-graph-coverage-gpu/`, `rmsnorm-complete-graph-{control,legacy}-rank*/`,
+  `runtime-control/rmsnorm-complete-graph-qualification-analysis.json`,
+  SHAf480e98300607517aad2b1b59a9cda71146dc5e85793b1d913c843ea140e0297.
+- No full-model result with graph-complete binding yet. Next update the serving
+  auditor for graph receipts, then freeze a new one-no-op/one-legacy experiment
+  with fresh outputs/caches and unchanged exact-score stop. All earlier failures
+  and the partial legacy result stay preserved. No TPS/TC/default promotion.

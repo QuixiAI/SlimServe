@@ -50,11 +50,12 @@ def main():
     os.environ["VLLM_FORCE_AOT_LOAD"] = "1"
     import torch
     import triton
-    from torch._inductor.codecache import StaticAutotunerFuture
+    from torch._inductor.codecache import PyCodeCache, StaticAutotunerFuture
 
     audit = json.loads(args.audit.read_text())
     original_namespace = Path(audit["paths"][1]).parent
     original_result = StaticAutotunerFuture.result
+    original_load = PyCodeCache.__dict__["load_by_key_path"]
     summary = dict(
         status="running",
         checks=[],
@@ -125,7 +126,9 @@ def main():
                         speculative_config=None,
                         capture_model=lambda: "sealed",
                     )
-                    diagnostic.install(runner)
+                    # This source-exact probe has no model graph. The separate
+                    # real-AOT loader qualification requires full graph coverage.
+                    diagnostic.install(runner, require_graph_coverage=False)
                     bindings = []
                     # The actual AOT load exposed 1/2/2/2 distinct objects for
                     # the four target sources. Qualify every occurrence.
@@ -218,12 +221,14 @@ def main():
                     receipt = runner._slimserve_rmsnorm_diagnostic
                     assert receipt.resolutions == 11 * len(bindings)
                 StaticAutotunerFuture.result = original_result
+                PyCodeCache.load_by_key_path = original_load
         summary["status"] = "complete"
     except BaseException as error:
         summary.update(status="failed", error=repr(error))
         raise
     finally:
         StaticAutotunerFuture.result = original_result
+        PyCodeCache.load_by_key_path = original_load
         save()
 
 

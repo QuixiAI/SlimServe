@@ -247,6 +247,64 @@ def test_unseen_legacy_launcher_is_not_accepted_as_native(tmp_path):
         instance.replace(tuner, compile_fake)
 
 
+def graph_module(tmp_path, **bindings):
+    source = tmp_path / "graph.py"
+    source.write_text("# graph fixture\n")
+    return SimpleNamespace(__file__=str(source), call=lambda: None, **bindings)
+
+
+def test_graph_hook_covers_non_static_objects_and_aliases(tmp_path):
+    instance, tuner = setup_intervention(tmp_path, "legacy")
+    instance.relocate = lambda obj: None
+    other = SimpleNamespace(**vars(tuner))
+    module = graph_module(tmp_path, norm=tuner, alias=tuner, other=other)
+    instance.bind_graph(module, compile_fake)
+    assert len(instance.replaced) == 2
+    assert len(instance.graph_bindings) == 3
+    assert tuner.launchers[0].cache_hash == other.launchers[0].cache_hash == "old"
+    instance.verify_graphs([module])
+    instance.seal()
+    instance.bind_graph(module, compile_fake)
+    instance.verify_graphs([module])
+
+
+def test_static_source_coverage_does_not_imply_graph_coverage(tmp_path):
+    instance, tuner = setup_intervention(tmp_path, "legacy")
+    instance.replace(tuner, compile_fake)
+    missing = SimpleNamespace(**vars(tuner))
+    missing.launchers = [fake_launcher("new")]
+    module = graph_module(tmp_path, norm=missing)
+    with pytest.raises(ValueError, match="uncovered"):
+        instance.verify_graphs([module])
+
+
+@pytest.mark.parametrize("change", ["object", "hash", "source", "filename", "removed"])
+def test_graph_coverage_detects_post_load_changes(tmp_path, change):
+    instance, tuner = setup_intervention(tmp_path)
+    instance.relocate = lambda obj: None
+    module = graph_module(tmp_path, norm=tuner)
+    instance.bind_graph(module, compile_fake)
+    if change == "object":
+        module.norm = SimpleNamespace(**vars(tuner))
+    elif change == "filename":
+        tuner.filename += ".renamed"
+    elif change == "removed":
+        del module.norm
+    elif change == "hash":
+        tuner.launchers[0].cache_hash = "wrong"
+    else:
+        instance.target["source_sha256"] = "wrong"
+    with pytest.raises(ValueError, match="uncovered"):
+        instance.verify_graphs([module])
+
+
+def test_graph_verification_requires_a_real_binding(tmp_path):
+    instance, tuner = setup_intervention(tmp_path)
+    instance.replace(tuner, compile_fake)
+    with pytest.raises(ValueError, match="missing RMSNorm graph coverage"):
+        instance.verify_graphs([])
+
+
 @pytest.mark.parametrize("bad", ["source", "old_hash", "multiple", "replacement_hash"])
 def test_replacement_gates_fail_before_changing_launcher(tmp_path, bad):
     instance, tuner = setup_intervention(tmp_path)

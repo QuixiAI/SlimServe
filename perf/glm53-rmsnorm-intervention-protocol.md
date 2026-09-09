@@ -228,3 +228,45 @@ which now verifies binding identities, repeated resolutions, full configs and
 unchanged unrelated launchers. No source edits/commits between these arms.
 Both earlier no-op failures remain part of the record. No replacement timing
 starts, numerical tolerance widening, default promotion or performance claim.
+
+## Completed static-hook pair; graph coverage invalidates causal interpretation
+
+On3298bacd1 both prescribed starts reach health and finish every request. The
+no-op repeats all scores and matches all nine native passes exactly. The legacy
+arm repeats its own scores but differs from both references. Source/cache/request
+audits pass, but they prove only the static callbacks they observed.
+
+A subsequent weight-free rank2 inspection finds FOUR actual graph-held bindings,
+THREE still native and unintercepted (two distinct missed objects). All50 static
+bundle entries loaded, so a successful forced-AOT load/static-future census does
+NOT prove complete graph coverage. Preserved failure `rmsnorm-graph-bindings-rank2/`.
+The live legacy arm's actual graph globals were not captured; do NOT claim it
+tested a complete four-source intervention or disproved that causal hypothesis.
+The repeatable partial-intervention score vector and all measurements remain
+recorded, not promoted or retroactively overwritten.
+
+Repair binds exact target objects in every finished PyCodeCache graph module,
+after async compilation resolves and BEFORE its callable returns to the model.
+Keep the static hook for safe relocation/early selection; add an independent
+all-loaded-graph coverage check before capture. No source/config/hash relaxation.
+Require symbol/object identity, selected binary/config and source hash for every
+target global; missing, changed, renamed or removed bindings fail. The source-only
+synthetic probe explicitly has no graphs; real serving/loader paths require them.
+
+Predetermine ONE new28-case source-exact GPU run `rmsnorm-graph-coverage-gpu`,
+then fresh copies `rmsnorm-graph-qualified-caches`, then EIGHT independent real
+loader processes, control/legacy x ranks0..3, sequential16GiB/no-swap scopes.
+Outputs `rmsnorm-complete-graph-{control,legacy}-rank{0,1,2,3}`. Use the external
+`runtime-control/check_rmsnorm_graph_bindings.py` inspection as well as internal
+coverage: every actual target global must have the expected selected hash and
+be intercepted,7/7 artifacts and50/50 static kernels, original snapshot unchanged.
+No full-model replacement starts are prescribed by this qualification alone.
+
+Completed:146 CPU tests,28 numerical GPU cases/154 resolutions, and all8 real
+graph inspections pass. Independent audit f480e98300607517aad2b1b59a9cda71146dc5e85793b1d913c843ea140e0297
+verifies18 actual target globals,56 artifacts,400 static kernels and5172 unchanged
+original files. GPUs released. No graph-complete full-model start yet.
+Before the next serving pair, extend its offline auditor to verify graph_binding
+and graph_coverage receipts, graph-held symbol/object coverage and resolved_by=graph;
+the previous static-only auditor is insufficient. Then freeze fresh named arms,
+still requiring exact no-op equality before legacy. No old result overwrites.

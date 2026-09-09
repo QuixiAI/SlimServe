@@ -57,7 +57,7 @@ def main():
     diagnostic.read_manifest()
     import torch
     from torch._dynamo.aot_compile import AOTCompileUnpickler
-    from torch._inductor.codecache import StaticAutotunerFuture
+    from torch._inductor.codecache import PyCodeCache, StaticAutotunerFuture
     from torch._inductor.triton_bundler import TritonBundler
 
     import vllm._custom_ops  # noqa: F401
@@ -84,6 +84,7 @@ def main():
 
     save()
     original_result = StaticAutotunerFuture.result
+    original_py_load = PyCodeCache.__dict__["load_by_key_path"]
     original_load = TritonBundler.__dict__["load_autotuners"]
     bundle_counts = []
     bundle_lock = threading.RLock()
@@ -183,6 +184,7 @@ def main():
         raise
     finally:
         StaticAutotunerFuture.result = original_result
+        PyCodeCache.load_by_key_path = original_py_load
         TritonBundler.load_autotuners = original_load
         summary["static_bundles"] = bundle_counts
         if observer_stream is not None:

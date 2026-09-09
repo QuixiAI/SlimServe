@@ -119,6 +119,7 @@ class Intervention:
         self.replaced = {}
         self.resolutions = 0
         self.compiled_replacement = None
+        self.graph_bindings = {}
         self.sealed = False
         folder = Path(manifest["receipts"])
         folder.mkdir(exist_ok=True)
@@ -227,6 +228,77 @@ class Intervention:
             self.emit(record)
             return autotuner
 
+    def bind_graph(self, module, compile_replacement):
+        """Cover actual graph globals, including ordinary compilation futures.
+
+        Forced AOT loading does not imply every Triton kernel resolves through
+        StaticAutotunerFuture. Inspect the finished module before its callable
+        can be returned to the model, rather than inferring graph coverage from
+        the number of static callbacks.
+        """
+        if not callable(getattr(module, "call", None)):
+            return
+        with self.lock:
+            for name, autotuner in list(vars(module).items()):
+                filename = getattr(autotuner, "filename", None)
+                if not isinstance(filename, str):
+                    continue
+                if Path(filename).name != self.target["filename"]:
+                    continue
+                key = (id(module), name)
+                if self.sealed and key not in self.graph_bindings:
+                    raise ValueError("new RMSNorm graph binding after seal")
+                self.relocate(autotuner)
+                self.replace(autotuner, compile_replacement, "graph")
+                self.graph_bindings[key] = (module, autotuner)
+                self.emit(
+                    dict(
+                        event="graph_binding",
+                        rank=self.rank,
+                        symbol=name,
+                        module=module.__file__,
+                        module_sha256=sha(module.__file__),
+                        filename=autotuner.filename,
+                        binding_index=list(self.replaced).index(id(autotuner)) + 1,
+                        selected=launcher_receipt(autotuner),
+                    )
+                )
+
+    def verify_graphs(self, modules):
+        """Independently verify all loaded target globals without changing them."""
+        count = 0
+        selected = expected_receipt(self.target["configs"][int(self.mode == "control")])
+        with self.lock:
+            for (_, symbol), (module, autotuner) in self.graph_bindings.items():
+                if (
+                    vars(module).get(symbol) is not autotuner
+                    or Path(autotuner.filename or "").name != self.target["filename"]
+                ):
+                    raise ValueError("uncovered or changed RMSNorm graph binding")
+            for module in modules:
+                if not callable(getattr(module, "call", None)):
+                    continue
+                for name, autotuner in vars(module).items():
+                    filename = getattr(autotuner, "filename", None)
+                    if not isinstance(filename, str):
+                        continue
+                    if Path(filename).name != self.target["filename"]:
+                        continue
+                    binding = self.graph_bindings.get((id(module), name))
+                    if (
+                        binding is None
+                        or binding[0] is not module
+                        or binding[1] is not autotuner
+                        or self.replaced.get(id(autotuner)) is not autotuner
+                        or sha(filename) != self.target["source_sha256"]
+                        or launcher_receipt(autotuner) != selected
+                    ):
+                        raise ValueError("uncovered or changed RMSNorm graph binding")
+                    count += 1
+            if not count:
+                raise ValueError("missing RMSNorm graph coverage")
+            self.emit(dict(event="graph_coverage", rank=self.rank, bindings=count))
+
     def seal(self):
         with self.lock:
             # Separate AOT submodules can own distinct autotuner objects for
@@ -248,14 +320,14 @@ class Intervention:
             )
 
 
-def install(runner):
+def install(runner, *, require_graph_coverage=True):
     selected_mode = mode()
     if not selected_mode:
         return
     validate_environment()
     import torch
     import triton
-    from torch._inductor.codecache import StaticAutotunerFuture
+    from torch._inductor.codecache import PyCodeCache, StaticAutotunerFuture
 
     from benchmarks.kernels.check_glm53_cached_rmsnorm import checked_config
 
@@ -278,7 +350,10 @@ def install(runner):
     manifest, path = read_manifest()
     diagnostic = Intervention(parallel.rank, manifest, path, selected_mode)
     original_result = StaticAutotunerFuture.result
-    if getattr(original_result, "_glm53_rmsnorm_diagnostic", False):
+    original_load = PyCodeCache.__dict__["load_by_key_path"]
+    if getattr(original_result, "_glm53_rmsnorm_diagnostic", False) or getattr(
+        original_load.__func__, "_glm53_rmsnorm_diagnostic", False
+    ):
         raise ValueError("RMSNorm diagnostic installed twice")
 
     def compile_replacement(saved):
@@ -307,10 +382,21 @@ def install(runner):
 
     result._glm53_rmsnorm_diagnostic = True
     StaticAutotunerFuture.result = result
+
+    @wraps(original_load.__func__)
+    def load_by_key_path(cls, *args, **kwargs):
+        module = original_load.__func__(cls, *args, **kwargs)
+        diagnostic.bind_graph(module, compile_replacement)
+        return module
+
+    load_by_key_path._glm53_rmsnorm_diagnostic = True
+    PyCodeCache.load_by_key_path = classmethod(load_by_key_path)
     original_capture = runner.capture_model
 
     @wraps(original_capture)
     def capture(*args, **kwargs):
+        if require_graph_coverage:
+            diagnostic.verify_graphs(PyCodeCache.modules)
         diagnostic.seal()
         return original_capture(*args, **kwargs)
 

@@ -35,7 +35,57 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 21:50 UTC)
+### Latest checkpoint (2026-09-09 22:31 UTC)
+
+The idempotent static-hook serving pair on3298bacd1 is COMPLETE. No-op
+`rmsnorm-noop-idempotent-control` passes every exact-score comparison against
+all9 native reference passes (27 cross-pairs). Both arms complete all cold
+exact-token requests, canaries and three quality passes;22 sources/5172 original
+files/native hashes verify, no commits between arms/audits. GPUs released.
+
+IMPORTANT: `rmsnorm-legacy-idempotent-only` is NOT a qualified complete
+four-source intervention. It repeats its own scores exactly (mean-2.73100041148523)
+but differs from old/native references. A follow-up weight-free rank2 inspection
+PROVES the static hook can miss actual graph globals:3 of4 bindings still native,
+two distinct missed objects. All50 static bundles loaded, so forced-AOT/static
+callback coverage was insufficient. Live graph globals were not captured; do not
+claim their exact missing count. Withdraw the provisional conclusion that all
+four RMSNorm changes fail to explain the historical mismatch. That remains OPEN.
+The no-op equality is valid; it does not validate legacy completeness. Both runs
+and their original audits remain unchanged, including slow readings/warnings.
+
+Current graph-coverage repair is now locally qualified, defaultOFF. It retains
+the idempotent static hook, additionally binds exact target globals after each
+PyCodeCache module finishes loading and BEFORE returning its callable, and checks
+every loaded target symbol/object/source/config/binary at capture. No source/hash
+or quality gate relaxation. Diagnostic sourceSHAc7675323370c64caf38eeb67280376391c98b051e272bf543b025023c129d3c4.
+CPU146pass/14 existing warnings; GPU28 exact numerical cases/154 resolutions;
+8 real loader processes with independent graph-global inspection all pass:
+18/18 target graph bindings (1/2/4/2 per rank per mode),56/56 artifacts,400/400
+static kernels, originals unchanged. No model forwards/weights in these checks.
+Audit `runtime-control/rmsnorm-complete-graph-qualification-analysis.json`,
+SHAf480e98300607517aad2b1b59a9cda71146dc5e85793b1d913c843ea140e0297.
+No full-model start has used this graph-coverage repair yet.
+
+NEXT: update the serving auditor for graph_binding/graph_coverage receipts and
+resolved_by=graph (the existing audit_rmsnorm_intervention.py still audits the
+previous idempotent pair). Then prescribe a fresh one-no-op/one-legacy pair with
+new cache/output names, legacy only after exact no-op equality against all native
+passes. Commit/freeze source before serving; no edits/commits between paired arms.
+Do NOT reuse prior result directories/caches or infer full coverage from counts.
+After actual complete intervention evidence, implement reproducible normalization
+policy and return to measured performance/TC work. Native-order defaultOFF/TC0,
+selected quant and all native binaries unchanged. Campaign remains active.
+
+Additional raw: completed audits `runtime-control/rmsnorm-noop-idempotent-control-analysis.json`
+(8f641ab9...) and `rmsnorm-legacy-idempotent-only-analysis.json` (20806d7c...);
+coverage failure `rmsnorm-graph-bindings-rank2/loaded-graph-bindings.json`
+(ab027656...). Static inventory `runtime-control/rmsnorm-serialized-static-inventory.json`
+(51a2f1dc...) records400 entries/56 identical normalized graph sources and preserves
+all6516 old/5172 native cache files. It inventories serialized configs, not historical
+execution. Full details/results/teardown warnings are in the notebook tail.
+
+### Previous checkpoint (2026-09-09 21:50 UTC)
 
 The SECOND no-op `rmsnorm-noop-bindings-control` on0d5ab7dc7 also FAILED BEFORE
 HEALTH. Ranks0/1/3 loaded AOT; rank2 failed inside loading on the bare-object-ID
