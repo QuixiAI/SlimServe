@@ -256,14 +256,25 @@ and scheduling bits; exactly one new kernel.40 registers/no local spills,
 preservesd45b4ace. Memcheck/synccheck each pass4 selected cases; bounded
 racecheck first8 matching launches passes, zero errors/hazards. Raw
 index-ties-native-sass-final/ and runtime-control/index-ties-* logs/XML.
-Real saved-input replay/full model are NOT yet run for this change. Do not
-promote or claim stability. The new fixed replay tool
-replay_glm53_indexer_ties.py requires a verified old/new native instruction
-comparison, runs both selectors11 times/original GPU and retains all88 outputs.
-After that qualification, ONE start/three full quality passes are prescribed
-in index-ties-quality-diagnostic/, same recipe/all previous diagnostic flags,
-TC0, capture_layer23; only native tie policy is enabled. Both exact prompt-ID
-lists are unchanged; configs runtime-control/index-ties-{score,index}-config.json.
+Both prescribed runs now PASS on8f79f3b5c. Saved-input replay retains all88
+outputs: every score set is valid, inputs unchanged; each GPU's old selector
+emits two memberships while the new selector always matches the independent
+CPU oracle (pool994 at the real row6329 tie). Raw index-ties-saved-input-replay/.
+ONE start/three complete quality passes in index-ties-quality-diagnostic/ now
+produce identical ALL4096 text scores and ALL1K/8K/32K needle-token scores.
+All1024 short tensor hashes and94 long trace tensors per rank match across
+all passes; all348 archives verify. All25 upstream tensors before layer23
+selection match the prior run across all nine pass pairs. Same recipe/TC0,
+all earlier diagnostic flags/serialization, capture_layer23; new native tie
+policy only. Long-context values can change:8K-position0.75 margin is now
+35.229299 versus37.148055 previously; all18 contrasts remain positive. This is
+repeatability for this workload, NOT unchanged general quality or a speed win.
+Serialized E2E107.751/458.922/647.799 tok/s is not a baseline. Exit0, GPU
+release0.108649s; no replacement starts or excluded samples. Analysis and
+cross-run receipts: runtime-control/index-ties-{quality-analysis,
+intervention-comparison}.json. Next remove extra diagnostic sorting launches
+through qualified origin-level ordering, measure uninstrumented timing, then
+revisit TC under the unchanged quality contract. Production defaults stay OFF.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
@@ -546,10 +557,13 @@ Current candidate priorities (hypotheses, not physical ceilings):
    control/control score variability before considering promotion or more
    arithmetic changes. Same-process repeated TC0 scoring reproduces it; the
    first numeric difference is now reproduced by varying only the first MoE's
-   within-expert assignment order. Canonical alignment now makes short-prompt
-   scores exact across3 full-model passes, but8K/32K retrieval still varies.
-   Next capture actual long-context selector logits/order/sets with the
-   bounded index journal; serialization alone did not remove the variation.
+   within-expert assignment order. Canonical MoE alignment, pool output order
+   and native pool-ID cutoff ties now make ALL prescribed short/long scores
+   exact across three full-model passes on8f79f3b5c. The actual-input causal
+   replays and full-model traces verify each intervention. Next replace the
+   extra diagnostic sorts with qualified stable ordering at the source, then
+   measure without tracing/serialization and re-evaluate TC fairly. This
+   diagnostic result alone does not promote TC or establish a speed win.
    The unchanged probe is45d5e817, current nativeQC4ce80155. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
    Five-round cold timing gives29-34% lower small-batch latency but only2.61%

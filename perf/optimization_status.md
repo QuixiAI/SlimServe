@@ -24608,3 +24608,55 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Actual-input replay, full-model correctness/repeatability and TPS are NOT yet
   measured for this candidate. Keep TC OFF and both extra sorting launches
   diagnostic. No retained performance claim or relaxed quality contract.
+
+## 2026-09-09 - Native cutoff ties complete prescribed quality repeatability
+
+- Status: actual-input and full-model qualification PASS on8f79f3b5c; diagnostic
+  only, not promoted. Baseline4cead10f6 and hypothesis/protocol above unchanged.
+- Saved-input replay: all88 prescribed calls complete (each original GPU, both
+  selectors, one warmup/five eager/five graphs). Every output has a valid score
+  set, all input bytes and frozen source/native receipts verify. Old selector
+  emits two memberships on EVERY GPU; new selector emits one, always equal to
+  the independent CPU score-descending/ID-ascending oracle, choosing994 rather
+  than1398 at row6329. Both arms have the same output-order post-sort. All88
+  output matrices retained,22 per GPU in four343,148,073-byte archives; separate
+  read-only verification checks every file/logical hash and tensor shape.
+  Raw index-ties-saved-input-replay/summary.json
+  SHA0701a89767b9f25c14f3a36444a05c06ad57601d9840d3222fa9f625b7390a5c.
+- Full-model: ONE start/three passes, all75 priming/timing requests and168
+  uncached quality requests complete,12,288 text scores/18 positive contrasts.
+  Every one of4096 text scores and every needle candidate-token score at1K,
+  8K and32K is identical across all three passes. Text mean each pass
+  -2.7282744364256297; margins each pass35.291222/35.512668/34.262808/
+  35.229299/37.584232/37.835817. All1024 short model tensor hashes per rank
+  and all94 long trace tensors per rank are exact across every pass pair.
+  All4x3x639 short GPU scores equal HTTP; canonical MoE alignments verify.
+  Every captured layer23 selection matches the independent canonical tie oracle.
+- All348 archives verify, including221,004,780 index bytes per worker. Long
+  traces have both7616+583 chunks/all11 layers. Cross-run Git-tree/source/native
+  comparison verifies all4187 old GPU function copies unchanged, same recipe,
+  all25 tensors before layer23 selection exact across ALLnine old/new pass
+  pairs, same logits/ranges, all1024 short tensors exact. The only layer23
+  membership change is row6329,1398->994 where the old selector chose1398.
+- Important limit: stable ties can change downstream attention values despite
+  identical selected scores. The previously repeatable8K-position0.75 margin
+  was37.148055 and is now35.229299. All retrieval contrasts remain positive;
+  this is NOT proof of unchanged broad model quality or cross-rank equality.
+  Existing fixed cross-rank differences remain a separate open investigation.
+- Same serialized/instrumented diagnostic settings and fixed recipe/TC0; E2E
+  medians107.750656/458.922230/647.798823 tok/s are NOT a performance baseline
+  or optimization gain. Source/native frozen throughout runs and analysis,
+  exit0; GPU release0.108649s. Transient worker0 zombie retained in teardown
+  record. No replacement starts, retries, excluded samples or contract edits.
+- Decision: retain opt-in diagnostic evidence. Next qualify origin-level stable
+  ordering to remove extra post-sort launches, then perform uninstrumented
+  fixed-series timing and re-evaluate TC against the unchanged quality contract.
+  Production profile unchanged; TC stays OFF. Repeatability proven only for
+  this prescribed one-start/three-pass workload, not all workloads or starts.
+- Raw index-ties-quality-diagnostic/; runtime-control/index-ties-quality-analysis.json
+  SHAb7aafe8ab6791547acbb624deb269a76c6c53077d13c58ff38609773e118e789;
+  index-ties-intervention-comparison.json
+  SHAb88f909723d64a71f5371c068206f2050d07a880c3c440677d89264e2d8db4d3.
+  Read-only scratch analyzers analyze_tie_indexer_trace.py,
+  verify_tie_indexer_trace.py and compare_tie_intervention.py; all hashes in
+  outputs. Replay/campaign/analysis logs preserved under runtime-control/.
