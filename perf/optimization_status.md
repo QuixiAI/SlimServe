@@ -23933,3 +23933,42 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   mhc-model-journal-gpu-tests.xml (initial fixture FAILED),
   mhc-model-journal-gpu-fixed-fixture-tests.xml (PASS). TC remains OFF; no quality
   gate change, no candidate promotion and no throughput claim from these runs.
+
+## 2026-09-09: First varying model interval is layer3 feed-forward work
+
+- Status: compiled model-boundary diagnostic COMPLETE ona29fedc15/nativeQC4ce801,
+  same TC0/BF16-storage1/serialized recipe. ONE start, nine exact cold priming
+  rounds/75 requests and three complete quality passes. All168 quality requests
+  cached0,12,288 scores/18 positive retrieval contrasts; sources/native unchanged,
+  no competing work/restarts. Teardown exit0, driver release0.044s.
+- All4x3 model matches contain91 ordered ops/995 tensor records; eight linked
+  model/score journals complete. Across ALL three pairs and all four ranks,
+  first difference is site-008.input.x, after86 identical preceding records.
+  That is layer3 FFN output entering layer4's attention mHC site. The interval
+  starts at identical site7.output.layer_input and includes layer3 post-attention
+  RMSNorm, router, routed/shared experts and final reduction. It is the FIRST
+  MoE layer (layers0-2 are dense). Do not yet name the particular faulty op.
+- All embeddings and positions are unchanged; positions independently hash to
+  int64[0..639]. No broken residual/post/comb links between any adjacent sites.
+  Immediate model return's first639 rows equal the later prompt-head input in
+  all12 matches. All4x3x639 selected GPU scores equal API responses. The observed
+  first divergence is inside forward, not a subsequent prompt-score copy.
+- Full32-window means -2.729150729/-2.729361062/-2.727053339. Pair1/2,1/3,2/3:
+  changed4096/4096/4095; mean absolute0.254527/0.242457/0.248904nat/token;
+  RMS0.440389/0.410180/0.429092; max4.102399/3.040593/4.199177;
+  26/27/26 windows differ by>0.01. All639 traced-window scores differ per pair,
+  RMS0.324039/0.293518/0.308276. Synchronizing the layer boundaries did not
+  remove variation. No threshold adjustment, candidate promotion or timing claim.
+- Next: instrument ONLY the bracketed first MoE interval. Inspect normalized
+  input/router logits/topk, valid alignment prefixes, both Marlin GEMM inputs/
+  outputs/lock workspace, and shared-expert weighted sum. Keep production
+  arithmetic and compilation intact; save bounded exact tensors for an offline
+  reproducer instead of treating the whole model as the smallest test case.
+- Raw: perf/results/2026-09-09/mhc-quality-model-trace-diagnostic/;
+  trace/{model,score}-{1730393,1730531,1730697,1730864}.jsonl;
+  runtime-control/mhc-quality-model-trace-{diagnostic.log,analysis.json}.
+  Read-only analyzer scratch author-fix.ODpxHi/analyze_model_trace.py is hashed
+  in the analysis receipt. SummarySHA37db34c5360563ccf5c50441c52d41dd38c7c36a7adc416947300481869d1737;
+  qualitySHAb0ebebabd2f2f6c640f7df7246cbc619608b6782a4797f224143765d9479021b;
+  8591c13440606a7f58123cbb2b6a54feeab197f60b767f365e27b8241114c0bc;
+  239b1c4f01a2772932e06002f3bcaa0e45b972dc1782c5578096284edfbc1749.

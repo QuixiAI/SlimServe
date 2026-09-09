@@ -146,11 +146,19 @@ across ranks within a pass, but the prompt-head INPUT already differs between
 all three identical requests. Full-workload per-token RMS remains0.427-0.444,
 so instrumentation did not remove the variation. Raw
 mhc-quality-score-trace-diagnostic/ and runtime-control/mhc-quality-score-trace-analysis.json.
-Next: bounded model-boundary fingerprints through the existing compile-opaque
-mHC custom ops, plus immediate model return, to find the first varying interval
-and distinguish forward variation from later buffer clobber. Keep compilation,
-recipe and arithmetic unchanged, and require reproduction under that trace.
-This is diagnosis, not a quality pass or throughput baseline. TC stays OFF.
+The compiled model-boundary trace now also completes ona29fedc15: all4x3
+matches contain91 operations/995 tensor records. Across EVERY pair/rank the
+first difference is site-008.input.x (layer3 FFN output entering layer4 mHC).
+All86 preceding records, including embeddings/positions and site7 FFN input,
+are identical. This brackets layer3 post-attention normalization, router,
+routed/shared experts and final reduction; the exact operation is not yet known.
+All state links between mHC sites remain unchanged and immediate model return
+equals the later prompt-head input. All GPU scores equal HTTP. Full-workload
+RMS variation0.410-0.440 persists, so the trace did not suppress it. Raw
+mhc-quality-model-trace-diagnostic/ and its runtime-control analysis. Next:
+targeted first-MoE routing/Marlin/shared-sum fingerprints and bounded tensors
+for a small reproducer. Keep compilation/recipe/arithmetic unchanged. This is
+diagnosis, not a quality pass or throughput baseline. TC stays OFF.
 E2E control/candidate/return157.051/156.928/156.712 c1,
 578.818/578.200/577.166 c8,781.849/779.553/777.069 c16. Candidate medians lie
 between controls, but retain the slower c16 samples. Cold32K2582.669/
