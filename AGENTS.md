@@ -127,5 +127,8 @@ behavior:
 
 ## Commit authorship
 
-- Eric Hartford is the sole author. Do not add co-author or assistance
-  trailers, and do not discuss automated assistance in commit messages.
+- Use the user's configured Git identity, Auroter
+  <auroter@users.noreply.github.com>, for both author and committer. Do not
+  override it with Eric Hartford's identity; Eric is the user's boss.
+- Do not add co-author or assistance trailers, and do not discuss automated
+  assistance in commit messages.
