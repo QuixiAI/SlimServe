@@ -24723,3 +24723,40 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA31b7e640eeca465137903b73697509d27e9cd2dd6a0588cdac4d03da806016bf.
   Benchmark/replay record the exception and both raw SASS hashes, not a blanket
   unchanged-binary claim. Actual replay and timing remain pending.
+
+## 2026-09-09 - Repair binary-verifier scheduling-word parser before fusion replay
+
+- First replay attempt2c2dc121c FAILED in CPU preflight, before any selector
+  call or timing sample: IndexError checking a nonexistent second encoding
+  word. No output directory was created. Log index-fused-order-saved-input-replay.log
+  is retained; this is a verifier failure, not a kernel/replay result.
+- Root cause: the earlier scratch multiset checker and copied reader accepted
+  /*0x...*/ but cuobjdump prints /* 0x... */. They silently omitted the separate
+  scheduling/control word. Thus their earlier statement that both words were
+  compared was overstated. Full raw disassembly had been saved intact.
+- Fix at the parser: benchmarks/kernels/compare_cuda_sass.py parses BOTH words,
+  rejects a missing/truncated word, preserves duplicate function copies and
+  hashes all raw files.15 fixtures pass1.02s, including whitespace variants,
+  scheduling-only changes, missing words, duplicates and forbidden valid-path
+  changes. The fusion verifier imports this parser; no serving/native changes.
+- Rechecked both complete existing raw pairs with the corrected parser:
+  d45b4ace->8828383f ALL4187 old function copies identical, new tie kernel only;
+  8828383f->92c8f136 ALL4187 other copies identical plus ONLY the same four
+  assertion-error metadata instructions in the old tie kernel. All second
+  words are identical there; all valid-input selector instructions are exact.
+  The actual four-instruction guard check now also passes on these real bodies.
+  The proof is restored by fresh complete comparison, not by ignoring the bug.
+- Corrected receipts: index-ties-native-sass-final/comparison-with-control-words.json
+  SHA62c59df49420b38ea7d30307dae79c1258f5a549944e57e519e966ee52148204;
+  index-fused-order-native-sass/comparison-with-control-words.json
+  SHA1b6891e8e008f2d600806c544a81e96a5e4f1efd447a369593d025a037c8b66e.
+  Executed parser copy runtime-control/compare_cuda_sass-qualified.py
+  SHA134edb066585142e65c2702eb8835b03c589fa7bf54734ced5fd0b15f529d1e7;
+  final source differs only by Ruff import spacing. Raw old receipts and full
+  disassemblies remain untouched. Assertion check log index-fused-order-assertion-check.log.
+- Continue the SAME prescribed88-call replay/18-shape fixed timing after this
+  preflight repair, using --native-comparison .../comparison-with-control-words.json.
+  Replay log suffix-final; output directory still index-fused-order-saved-input-replay/.
+  There are no existing kernel/timing samples to replace or exclude.
+- Final full CPU suite495 pass/one skip21.26s, raw
+  runtime-control/index-fused-order-final-cpu-tests.xml/log. Ruff/diff checks pass.

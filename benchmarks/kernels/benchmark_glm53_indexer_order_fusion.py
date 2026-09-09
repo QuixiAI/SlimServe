@@ -9,15 +9,14 @@ No automatic retries, source edits, frequency changes or serving activation.
 """
 
 import argparse
-import hashlib
 import json
-import re
 import statistics
 import subprocess
 from pathlib import Path
 
 import torch
 
+from benchmarks.kernels.compare_cuda_sass import body_sha, function_bodies
 from benchmarks.kernels.replay_glm53_indexer import sha, tensor_sha, verified_selection
 from benchmarks.kernels.replay_glm53_indexer_ties import (
     canonical_selection,
@@ -49,30 +48,19 @@ def verify_native_comparison(proof, directory):
     assert set(proof["added_functions"]) == {name, added}
 
     def read_body(path, arm):
-        body, arch, active, current = {}, None, False, None
         with path.open() as stream:
-            for line in stream:
-                if re.search(r"arch = sm_", line):
-                    arch = line.strip()
-                if "Function :" in line:
-                    if active:
-                        break
-                    active = arch + " " + line.split("Function :", 1)[1].strip() == name
-                if active:
-                    instruction = re.match(r"\s*/\*([0-9a-f]+)\*/\s*(.*?);", line)
-                    if instruction:
-                        current = int(instruction[1], 16)
-                        assert current not in body
-                        body[current] = line.strip()
-                    elif re.match(r"\s*/\*0x[0-9a-f]+\*/\s*$", line):
-                        assert current is not None
-                        body[current] += "\n" + line.strip()
-        digest = hashlib.sha256("\n".join(body.values()).encode()).hexdigest()
-        assert proof["bodies"][name][arm + "_instances"] == {digest: 1}
-        return body
+            for symbol, body in function_bodies(stream):
+                if symbol == name:
+                    assert proof["bodies"][name][arm + "_instances"] == {
+                        body_sha(body): 1
+                    }
+                    return body
+        raise AssertionError("missing captured selector body")
 
     before = read_body(directory / "before.sass", "before")
     after = read_body(directory / "candidate.sass", "candidate")
+    assert sha(directory / "before.sass") == proof["before_sass"]["sha256"]
+    assert sha(directory / "candidate.sass") == proof["candidate_sass"]["sha256"]
     return dict(
         all4187_other_function_copies_identical=True,
         valid_input_selector_instructions_identical=True,
@@ -319,6 +307,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     sources = (
         "benchmarks/kernels/benchmark_glm53_indexer_order_fusion.py",
+        "benchmarks/kernels/compare_cuda_sass.py",
         "benchmarks/kernels/replay_glm53_indexer_ties.py",
         "benchmarks/kernels/replay_glm53_indexer.py",
         "slimserve/canonical_indexer.py",

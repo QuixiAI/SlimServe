@@ -287,6 +287,13 @@ bit-identical. Four error-path assertion metadata/line-number instructions
 change; the recorded checker permits ONLY these four, not selection changes.
 Actual88-call replay then fixed FIVE-round A/B/A timing across18 actual/synthetic
 shapes prescribed in the notebook. Neither has run yet; no speed claim/promotion.
+First replay preflight stopped on a binary-verifier parser bug BEFORE GPU calls:
+the older checker omitted separately printed scheduling words because of spaces
+inside comments. Full saved disassembly was intact. New strict shared parser
+and15 fixtures pass; rechecking BOTH builds restores the complete evidence,
+including every scheduling word and the narrowly scoped assertion exception.
+Use index-fused-order-native-sass/comparison-with-control-words.json, not the
+earlier receipt. Failed preflight log retained; no replay/timing samples existed.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
