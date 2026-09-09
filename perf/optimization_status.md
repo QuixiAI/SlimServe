@@ -22606,3 +22606,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Nine focused controller tests pass, including changed-binary and failed
   graph rejection. Actual native build/probe and serving remain pending.
 - Raw: runtime-control/fa2-sm120-build/controller-tests.xml.
+
+### FA2 build scheduling and graph analyzer follow-up
+
+- CPU suite now195pass/1GPUskip. Actual layer3/rank0 FP8 sidecar load also
+  confirms gate_up1024x4096/scales8x32 and down4096x512/scales32x4, e4m3/F32;
+  raw runtime-control/fp8-cache-actual-weight-check.json. No GPU timing yet.
+- At03:47 UTC the FA2 -j2 build had completed36/80 objects, no compiler
+  errors, peak8,696,762,368 host bytes and no memory-limit/OOM events. Stop
+  that owned container with SIGINT (exit130, not a compiler failure), retain
+  its receipt, and resume the same build directory/flags/image with -j8.
+  Source patch is unchanged and reverse-apply-check passes. Both Docker and
+  systemd still cap80GiB/no swap. Early -j8 peak31,402,414,080 bytes, no OOM.
+  Completed objects/source/artifacts preserved; only stopped owned container
+  removed. Raw build-j2-container.json and build-j8.log in the FA2 directory.
+- analyze_nsys_graph_trace.py now reads SQLite whole-graph records read-only,
+  groups by device/process/context/stream/graph identity, retains every valid
+  replay and separately records invalid boundaries, and reports latency
+  without inventing kernel busy time. Two fixture tests pass; both lifecycle
+  captures contain exactly four graph records. Ordinary kernels outside a
+  graph may coexist in a model capture and are not called graph-node gaps.
+  Raw runtime-control/nsys-{analysis-tests.xml,lifecycle-graph-analysis.json}.
