@@ -35,7 +35,24 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 22:31 UTC)
+### Latest checkpoint (2026-09-09: graph-complete serving pair frozen)
+
+Serving auditor is now tracked in `benchmarks/analyze_glm53_rmsnorm_intervention.py`
+with tested graph-receipt gates in `analyze_glm53_rmsnorm_graphs.py`.171 CPU tests
+pass; all8 preserved real-loader receipts pass replay,18 total graph bindings.
+Requires the independently inspected module/symbol inventory, not static callback
+counts; graph-source hashes, selected configs/binaries, live coverage and source/
+cache/request/quality checks remain strict. Serving/kernel/profile sources unchanged.
+
+Next prescribed pair: ONE `rmsnorm-noop-complete-graph-control`, then ONE
+`rmsnorm-legacy-complete-graph-only` ONLY after every no-op score equals all9
+native reference passes. Fresh copies `rmsnorm-complete-graph-serving-caches`.
+Use the protocol tail and tracked auditor module with frozen full commit SHA.
+No edits/builds/commits between arms or before audits.150GiB serving/8GiB CPU,
+no swap; GPUs must be free before each start. No completed full-model result for
+this graph-complete repair yet. All earlier failures/partial results preserved.
+
+### Previous checkpoint (2026-09-09 22:31 UTC)
 
 The idempotent static-hook serving pair on3298bacd1 is COMPLETE. No-op
 `rmsnorm-noop-idempotent-control` passes every exact-score comparison against

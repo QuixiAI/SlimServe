@@ -270,3 +270,56 @@ Before the next serving pair, extend its offline auditor to verify graph_binding
 and graph_coverage receipts, graph-held symbol/object coverage and resolved_by=graph;
 the previous static-only auditor is insufficient. Then freeze fresh named arms,
 still requiring exact no-op equality before legacy. No old result overwrites.
+
+## Graph-complete serving pair (prescribed 2026-09-09)
+
+The new tracked auditor `benchmarks/analyze_glm53_rmsnorm_intervention.py`
+uses `analyze_glm53_rmsnorm_graphs.py` to check every graph receipt against the
+independently qualified loader inventory (1/2/4/2 module-symbol bindings by rank).
+It verifies source/module hashes, complete selected configs/binaries, resolution
+ordering, graph coverage before seal, and repeated/aliased objects, including
+`resolved_by=graph`. Static-only receipts cannot pass. Existing source/native,
+original-cache, request/token/cache, quality and exact-score gates remain.
+171 CPU tests pass; replay of all eight independent loader receipts passes.
+These are audit checks, not new GPU qualification or full-model results.
+
+Prescribe exactly TWO starts, with no retries or additional timing starts:
+
+1. `rmsnorm-noop-complete-graph-control`, mode `control`, one boot.
+2. ONLY after its audit confirms every score equals all nine native reference
+   passes: `rmsnorm-legacy-complete-graph-only`, mode `legacy`, one boot.
+
+Prepare fresh copies at `perf/results/2026-09-09/rmsnorm-complete-graph-serving-caches`
+using the existing preparer and exact cache-comparison audit. The command is
+the native-order protocol command, with these substitutions/additions per arm:
+
+```text
+--output perf/results/2026-09-09/<ARM_OUTPUT_ABOVE>
+VLLM_FORCE_AOT_LOAD=1
+SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC=control|legacy
+SLIMSERVE_GLM53_RMSNORM_MANIFEST=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-09/rmsnorm-complete-graph-serving-caches/<MODE>/manifest.json
+VLLM_CACHE_ROOT=/home/tiny/Lazarus/SlimServe/perf/results/2026-09-09/rmsnorm-complete-graph-serving-caches/<MODE>/cache
+```
+
+Use one uniquely named150GiB/no-swap serving scope and preserved launch log per
+arm. One boot, three repetitions at c1/c8/c16, cold exact1000-in/300-out,
+25 warmup/75 timed requests, text/image canaries and three full quality passes.
+Native-order1/BF16fn1/TC0, fixed quant/profile/native binaries, asynchronous
+execution with all legacy ordering/journal flags absent. Recheck GPU ownership
+before each start. Do not change sources, binaries or commits between arms or
+before their audits. No other GPU work or native builds during either arm.
+
+After each arm releases GPUs, audit in an8GiB/no-swap CPU scope:
+
+```bash
+env PYTHONDONTWRITEBYTECODE=1 .venv/bin/python \
+  -m benchmarks.analyze_glm53_rmsnorm_intervention control \
+  --commit <FROZEN_FULL_SHA>
+```
+
+Use `legacy` for the second arm. Audits create new exclusive output files
+`runtime-control/<ARM_OUTPUT_ABOVE>-analysis.json`. Every score mismatch is
+preserved. Exact no-op mismatch or any coverage/source/workload failure stops
+the sequence. A qualified legacy/reference mismatch is causal evidence only
+about this complete four-source intervention, not permission to widen quality
+gates or promote native ordering/TC. All prior failed and partial runs remain.

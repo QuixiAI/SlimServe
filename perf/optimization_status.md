@@ -26206,3 +26206,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   auditor for graph receipts, then freeze a new one-no-op/one-legacy experiment
   with fresh outputs/caches and unchanged exact-score stop. All earlier failures
   and the partial legacy result stay preserved. No TPS/TC/default promotion.
+
+## 2026-09-09 - Graph-complete serving auditor and frozen full-model pair
+
+- Status: audit implementation qualified; full-model pair prescribed, not yet run.
+- Baseline: qualified graph-complete hook onf535d17a7; prior no-op scores valid,
+  prior static-hook legacy result not a complete intervention. Fixed quant,
+  native binaries, native-order1/BF16fn1/TC0 unchanged.
+- Hypothesis: replacing all graph-held instances of the four exact RMSNorm
+  sources may explain the old/native score mismatch. Audit the actual coverage
+  against the independent loader inventory, not callback or object counts.
+- Change: tracked serving auditor plus pure graph-receipt checker; serving and
+  kernel sources unchanged. Verify all1/2/4/2 module-symbol bindings across ranks,
+  module/source hashes, full configs/binaries, repeats/aliases, non-static graph
+  resolutions and seal ordering. Preserve source/cache/token/quality gates.
+- Correctness:171 CPU tests pass6.23s,14 existing deprecation warnings. New tests
+  reject partial inventory, static-only receipts, wrong binary/config/source,
+  unmatched graph resolutions and late bindings. Replay all8 independently
+  inspected real-loader receipts:18/18 graph bindings pass. No new GPU cases or
+  weights/model forwards in these audit checks. Lint passes.
+- Decision: freeze ONE no-op `rmsnorm-noop-complete-graph-control`, followed by
+  ONE `rmsnorm-legacy-complete-graph-only` only after exact equality to all9
+  native passes. Fresh private copies `rmsnorm-complete-graph-serving-caches`.
+  Same full workload and memory limits; no edits/commits through both audits,
+  no retries or discarded results. No performance/default promotion.
+- Raw artifacts: `runtime-control/rmsnorm-graph-serving-cpu.log`,
+  `rmsnorm-graph-serving-auditor-replay.log` and its hashed replay script.
+  Commands and stop conditions: `perf/glm53-rmsnorm-intervention-protocol.md` tail.
