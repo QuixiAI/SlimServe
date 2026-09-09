@@ -94,11 +94,16 @@ initialize B12X PCIe all-reduce and load weights, then fail vision FA2 warmup
 with unsupported PTX toolchain (exit1, no OOM). Its FA2 binary contains only
 SM80 cubins and CUDA13.3 PTX; host580 cannot JIT that PTX for SM120. A native
 SM120 build of the image's exact FA2 source f3e1a4f74c99145c0717709860bf765de1703779
-is in progress, with only the architecture target changed. Independent FP64
+is complete, with only the architecture target changed. Independent FP64
 oracle and original-binary comparison probe: benchmarks/kernels/probe_b12x_fa2.py.
 The original image FA2 under its single-GPU compat driver passes all30
 independent FP64-oracle/changed-input-graph cases (maxNRMS.002277). Rebuilt
-binary qualification is pending; no TPS claim or vision disabling.
+binary qualification also passes all30 cases, bit-exact to the original in
+every case and graph replay. Native library SHA256
+31519f918c17425203dd7aaab19fe8b4c601e7f5ad5164e19aeb2e3f8cde5249;
+76 native SM120 cubins, no PTX. Both containers exit0/no OOM. The next fixed
+three-start serving campaign is b12x-r281-native-serving/ with the explicit
+host-driver/qualified-FA2 adaptations. No TPS claim or vision disabling.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
 SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,

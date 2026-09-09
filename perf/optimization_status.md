@@ -22627,3 +22627,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   captures contain exactly four graph records. Ordinary kernels outside a
   graph may coexist in a model capture and are not called graph-node gaps.
   Raw runtime-control/nsys-{analysis-tests.xml,lifecycle-graph-analysis.json}.
+
+### Exact-source native FA2 build and cross-binary qualification complete
+
+- Status: isolated compatibility repair qualified; full serving recheck next.
+- The resumed -j8 build finishes03:56:56 UTC, exit0/OOMKilled=false; same
+  source, image and compiler flags as the original -j2 phase. Peak observed
+  31,402,414,080 host bytes, no memory-limit/OOM events. No native SlimServe
+  library or installed host environment changes. Stopped owned build
+  containers removed only after their complete exit receipts were recorded.
+- Native FA2 SHA256
+  31519f918c17425203dd7aaab19fe8b4c601e7f5ad5164e19aeb2e3f8cde5249:
+  76 native SM120 cubins, no PTX. CMake/build/patch hashes and explicit
+  cuobjdump stderr confirming no PTX retained beside the build logs.
+- Native-host probe runs03:57:21-03:58:15 UTC, exit0/no OOM, Docker and
+  systemd16-GiB/no-swap,300-second bound. It loads host libcuda580.173.02
+  and unchanged CUDA13.3.29 runtime. All30 independent FP64-oracle cases
+  pass (maxNRMS .002276717); every output is bit-exact to the original
+  compat-driver binary and every changed-input graph replay equals eager.
+  This is numerical/launch qualification, not serving speed or vision quality.
+- Decision: use only this hash-qualified library in the explicit host-driver
+  adapted R28.1 control. Fixed3starts x3repeats, same complete1000/300 timing
+  workload/canaries/quality/cold-prefill, no competing GPU job or native build.
+  Retain all failures; no checkpoint, activation/KV precision, text-kernel,
+  custom-collective or selected SlimServe recipe changes.
+- CPU suite197pass/1GPUskip before the run. Raw:
+  runtime-control/pre-control-full-tests.xml;
+  runtime-control/fa2-sm120-build/{build-j8.log,build-j8-container.json,
+  build-sha256.txt,native-elf-list.txt,native-ptx-check.log,native-host/,
+  native-host.log,native-host-container.json}. Serving output reserved for
+  perf/results/2026-09-08/b12x-r281-native-serving/.
