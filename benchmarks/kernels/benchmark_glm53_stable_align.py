@@ -5,6 +5,8 @@
 ranks: 32 cases. Compare installed alignment alone and alignment plus canonical
 sort separately with the stable probe. Five A/B/A rounds, three warmup graph
 replays and five timed 20-call replays per arm: 4,800 samples, no exclusions.
+With --parallel-count, use 1024 counting threads instead of 256 and add the
+original 256-thread stable path as a third A/B/A control: 7,200 samples total.
 Routing scores/IDs, weights and GEMM arithmetic are outside this experiment.
 All buffers are hot; this does not establish model cache effects or serving TPS.
 """
@@ -90,6 +92,7 @@ def cases():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--parallel-count", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
@@ -128,6 +131,7 @@ def main():
     hashes = {str(p): sha(p) for p in sources}
     result = dict(
         status="running",
+        count_threads=1024 if args.parallel_count else 256,
         diagnostic_only=True,
         protocol=__doc__,
         source_sha256=hashes,
@@ -168,7 +172,7 @@ def main():
             return out
 
         def stable(ids=ids, block=block):
-            return probe.run(ids, block)
+            return probe.run(ids, block, args.parallel_count)
 
         graphs = {
             name: graph_for(call)
@@ -178,6 +182,10 @@ def main():
                 ("stable", stable),
             ]
         }
+        if args.parallel_count:
+            graphs["original-stable"] = graph_for(
+                lambda ids=ids, block=block: probe.run(ids, block, False)
+            )
 
         def check(
             graphs=graphs,
@@ -215,7 +223,10 @@ def main():
             provenance=provenance,
             comparisons=[],
         )
-        for baseline in ("atomic", "atomic-plus-sort"):
+        baselines = ["atomic", "atomic-plus-sort"]
+        if args.parallel_count:
+            baselines.append("original-stable")
+        for baseline in baselines:
             rounds = []
             for repeat in range(5):
                 rounds.append(

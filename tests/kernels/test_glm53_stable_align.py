@@ -3,7 +3,9 @@
 
 import hashlib
 import json
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,9 +37,15 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-@pytest.fixture(scope="module")
-def probe():
-    return build()
+@pytest.fixture(scope="module", params=[256, 1024])
+def probe(request):
+    module = build()
+    return SimpleNamespace(
+        __file__=module.__file__,
+        count_threads=request.param,
+        run=partial(module.run, parallel_count=request.param == 1024),
+        run_into=partial(module.run_into, parallel_count=request.param == 1024),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +53,7 @@ def identities(probe, record_property):
     files = SOURCES + [Path(probe.__file__)]
     hashes = {str(p): sha(p) for p in files}
     record_property("source_sha256", json.dumps(hashes, sort_keys=True))
+    record_property("count_threads", probe.count_threads)
     yield
     assert hashes == {str(p): sha(p) for p in files}
 

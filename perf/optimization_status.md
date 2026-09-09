@@ -25388,3 +25388,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   analyze_stable_align_timing.py and profile_stable_align_stages.py retained.
   All scopes exit 0 and GPUs release before further edits. Profile/quant/TC
   defaults unchanged; no production baseline updated.
+
+### Parallel counter variant isolated, controls preserved
+
+- Only the counter launch geometry varies: 256 versus 1024 threads, the same
+  per-warp integer histogram and padded prefix algorithm. Bitmap scatter is
+  unchanged. The initial 87a3736e binary remains in its original isolated build
+  directory; new build is stable-align-parallel-probe-build, CUDA13.0/sm120f,
+  80GiB/no-swap/MAX_JOBS2. Probe
+  SHAde0b237092ac367f3a44601d5ff8d72fb59f345fb3349dec1c88bf41e0a619da.
+- Full instruction comparison INCLUDING both encoded words proves all 584
+  original counter instructions and all 400 bitmap scatter instructions are
+  identical in the new binary. Only the 1024-thread counter is added. Its
+  resources are 48 registers / 42,144 shared bytes / zero stack/local bytes;
+  the old two kernels' resources are unchanged. Installed serving untouched.
+  Raw runtime-control/stable-align-{original,parallel}.sass and
+  stable-align-parallel-sass-comparison.json
+  SHAcf06ca3af8a965cb198126d1907b118fcb7970713f8ec768bf6b167189c58590.
+- 256 functional tests pass in 14.74s (the same 128 cases for each counter,
+  including actual routes, guards, changed-input graphs and device/stream
+  checks). Test SHA13329ec6a5d6b890a846a0ae910d05d8532e9dd626cff7b337a43ec379625468.
+  Raw runtime-control/stable-align-parallel-{build,tests,resources}. Logs and
+  legacy JUnit properties retained; only 14 Torch deprecation warnings.
+- Next fixed gate: all 256 cases under memcheck and synccheck; bounded first
+  two matching launches for EACH counter at M17/M8192 (four race processes).
+  Then --parallel-count in the same 32-case benchmark adds original-stable
+  as the third A/B/A control, 7,200 samples total. Output
+  stable-align-parallel-timing/, no retries/exclusions. Sources frozen from
+  qualification through timing; no broader serving dispatch or gain claim.

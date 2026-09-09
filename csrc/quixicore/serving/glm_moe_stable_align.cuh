@@ -9,28 +9,31 @@ namespace tms::glm_stable_align {
 
 constexpr int EXPERTS = 288;
 constexpr int THREADS = 256;
-constexpr int WARPS = THREADS / 32;
 constexpr int MAX_WORDS = 8192 * 8 / 32;
 
 // Integer histograms determine the same padded expert ranges as Marlin's
 // alignment. A second CTA initializes all sorted capacity, including tails.
+template<int COUNT_THREADS>
 __global__ void count_prefix(const int* ids, int* sorted, int* experts,
                              int* padded, int* offsets, int numel, int block,
                              int capacity, int max_blocks) {
+    static_assert(COUNT_THREADS == 256 || COUNT_THREADS == 1024);
+    constexpr int WARPS = COUNT_THREADS / 32;
+    constexpr int ITEMS = (EXPERTS + COUNT_THREADS - 1) / COUNT_THREADS;
     const int tid = threadIdx.x;
     if (blockIdx.x == 1) {
-        for (int i = tid; i < capacity; i += THREADS) sorted[i] = numel;
+        for (int i = tid; i < capacity; i += COUNT_THREADS) sorted[i] = numel;
         return;
     }
     __shared__ int histogram[WARPS * EXPERTS];
-    using Scan = cub::BlockScan<int, THREADS>;
+    using Scan = cub::BlockScan<int, COUNT_THREADS>;
     __shared__ typename Scan::TempStorage scan;
-    for (int i = tid; i < WARPS * EXPERTS; i += THREADS) histogram[i] = 0;
+    for (int i = tid; i < WARPS * EXPERTS; i += COUNT_THREADS) histogram[i] = 0;
     __syncthreads();
 
     const int lane = tid % 32, warp = tid / 32;
     // All lanes execute every match, including a partially populated last tile.
-    for (int base = 0; base < numel; base += THREADS) {
+    for (int base = 0; base < numel; base += COUNT_THREADS) {
         const int i = base + tid;
         const int expert = i < numel ? ids[i] : -1;
         const unsigned peers = __match_any_sync(0xffffffffu, expert);
@@ -40,10 +43,10 @@ __global__ void count_prefix(const int* ids, int* sorted, int* experts,
     }
     __syncthreads();
 
-    int counts[2], starts[2];
+    int counts[ITEMS], starts[ITEMS];
     #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int expert = 2 * tid + j;
+    for (int j = 0; j < ITEMS; ++j) {
+        const int expert = ITEMS * tid + j;
         int count = 0;
         if (expert < EXPERTS) {
             #pragma unroll
@@ -53,8 +56,8 @@ __global__ void count_prefix(const int* ids, int* sorted, int* experts,
     }
     Scan(scan).ExclusiveSum(counts, starts);
     #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-        const int expert = 2 * tid + j;
+    for (int j = 0; j < ITEMS; ++j) {
+        const int expert = ITEMS * tid + j;
         if (expert <= EXPERTS) offsets[expert] = starts[j];
         if (expert < EXPERTS) {
             for (int i = 0; i < counts[j]; i += block) {
