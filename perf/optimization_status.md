@@ -21717,3 +21717,39 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   current three-start serving campaign releases the GPUs. No native rebuild
   needed; no production fallback or dispatch option is added.
 - Raw reference: perf/results/2026-09-08/mhc-norm/serving-norm-reference.py.
+
+## 2026-09-08: Marlin repair completes fixed-start serving validation
+
+- Status: retained native correctness repair, performance-neutral. Commit
+  b4388034d; all three predetermined starts complete with every one of 27
+  timings retained. All 225 measured requests are exact; text/image canaries
+  pass every start. No scheduling/recipe/activation/KV change.
+- E2E medians c1/c8/c16: 155.914 / 574.417 / 779.047 tok/s; client decode
+  164.580 / 588.532 / 791.370. Relative to the expanded quality baseline,
+  E2E changes are -0.013% / -0.268% / +0.092%, not a speedup.
+- All 24 c1 rank-0 graph replays contain 1185 kernels. Per-start mean graph
+  span 5739.721 / 5746.884 / 5748.749 us, no-active-kernel time
+  428.322 / 428.446 / 429.117 us. The slow graph-node state persists.
+  Startup-to-health 220.100 / 150.050 / 150.076 seconds, all retained.
+- Quality: 4096 explicit continuation tokens per start, mean log probability
+  -2.719469776 / -2.732947245 / -2.726447199. All six retrieval contrasts
+  pass per start; minimum true/distractor margin 32.5238. Exact prompt IDs
+  match the previous reference; current quality requests report zero cache.
+  No quality improvement is claimed from the favorable first mean.
+- Reference limitation: the unchanged quality-baseline starts themselves
+  differ substantially per token. Against boot1, boot2/3 log-probability
+  delta RMS is 0.42655/0.44819 (maximum absolute 4.21397/4.81127), despite
+  stable aggregate means. New boot1 RMS is 0.45389. Cause is not established;
+  this reference is not a per-token determinism gate or decode-quality proof.
+- Cold prefill is now measured: one cold warmup plus three requests at each
+  32768/131072 context per start, distinct salts, every cache count explicitly
+  zero, eight exact output tokens. Across all nine measured requests/context,
+  client TTFT medians 2680.951/11565.566 ms; engine scheduled-to-first-token
+  2639.955/11447.555 ms; effective input/engine-TTFT 12412.334/11449.781 tok/s.
+  These are not pure GPU kernel rates. Short-output client decode timing can
+  reflect batched streaming events and is not a decode-performance claim.
+- Decision: retain the barrier with clean native safety/oracle evidence and
+  completed real-profile validation. Continue isolated kernel experiments;
+  profile cold-prefill phases before selecting a prefill optimization.
+- Raw: perf/results/2026-09-08/marlin-repair-serving/. Native regression and
+  sanitizer evidence remains in marlin-schedule/ as recorded above.

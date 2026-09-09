@@ -29,15 +29,20 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-Current priority: validate the repaired Marlin library through the fixed-start
-serving campaign, including explicit cold-prefill measurements. The original
+Current priority: measured kernel experiments and fresh cold-prefill attribution.
+The repaired Marlin library has completed the fixed three-start serving campaign:
+all 27 exact timing runs, text/image canaries and expanded quality checks pass.
+E2E medians are **155.91 / 574.42 / 779.05** at c1/c8/c16, performance-neutral.
+Cold 32K/128K engine scheduled-to-first-token medians are **2.640 / 11.448 s**,
+with explicit zero cached tokens, nine measurements per length. The original
 production library had weight-tile reads overlapping reuse of the same shared
 storage for block reduction. A single entry barrier removes the race in both
 the isolated reproducer and installed auto-scheduled kernels. Memcheck and
 synccheck pass; 24 changed-input cases across all five M tile sizes remain
 bit-exact to the original. This is a native correctness repair, not a serving
 speed claim or proof of numerical corruption in the old kernel. Scheduling
-candidate remains unintegrated. See the latest notebook entry and native hashes.
+candidate remains unintegrated because one stricter oracle gate still fails.
+Raw: perf/results/2026-09-08/marlin-repair-serving/. See baseline and notebook.
 
 Goal: exceed the strongest reproducible B12X result on this hardware under
 matched workloads and the model's recommended sampling. The historical R24
@@ -109,8 +114,11 @@ the true code first at 1K/8K/32K context. This measures prefill quality, not
 teacher-forced decode or broad capability. Raw: quality-baseline/ under the
 same dated results directory. The serving binary/recipe were unchanged.
 
-Immediate work: finish the repaired Marlin library's real-profile quality and
-performance checks, then resume scheduling and cold-prefill attribution. The
+Immediate work: complete the isolated mHC/norm fusion assessment and profile
+cold prefill before choosing its kernel target. The existing fused norm loses
+local A/B/A timing at batches 1/2/4/8 despite passing numerical gates; it is
+not integrated. The repaired library leaves the same 1185-node c1 graph and
+about 0.429 ms of inter-kernel gaps. The
 PyTorch reduction warning is isolated to the block-y/block-x shared-memory
 boundary in global_reduce: a one-barrier isolated extension removes it, but
 the installed Torch binary is unchanged and numerical corruption is unproven.

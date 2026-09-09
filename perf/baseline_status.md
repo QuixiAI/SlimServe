@@ -1919,6 +1919,49 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 Marlin repair and cold-prefill baseline - 2026-09-08
+
+Commit b4388034d, pinned recipe v1, TP4 no-spec, BF16 KV/activations/lm_head.
+Three predetermined starts x three repeats, exact 1000/300 and recommended
+sampling. All 27 timings and 225 exact requests retained; text/image canaries
+pass on every start. The rebuilt MoE library repairs a shared-memory phase
+race without changing scheduling or arithmetic. Its SHA256 is
+1093b8a4ca7cb308d4ebff254ab502d7b01d65eb86423b2640c8f8a4bff4ac1a.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median |
+| ---: | ---: | ---: |
+| 1 | 155.91 [155.59, 156.50] | 164.58 |
+| 8 | 574.42 [572.15, 577.49] | 588.53 |
+| 16 | 779.05 [777.08, 780.05] | 791.37 |
+
+Performance-neutral versus the expanded quality reference below. All 24 c1
+rank-0 graph replays have 1185 kernels; mean spans per start are
+5.740/5.747/5.749 ms, with 0.428/0.428/0.429 ms when no kernel is active.
+The persistent slow graph state is not repaired. Time to health was
+220.10/150.05/150.08 seconds; all startup durations are retained.
+
+Each start scores 4096 continuation tokens: mean log probabilities
+-2.719469776 / -2.732947245 / -2.726447199. All six retrieval contrasts pass
+per start, minimum margin 32.5238. These aggregate prefill checks show no
+regression; they do not establish a quality improvement or deterministic
+per-token scores. Identical prompts already have substantial per-token
+variation between the unchanged reference starts (see notebook).
+
+Cold prefill follows timings/traces/quality: one warmup and three measured
+requests at each length per start, eight exact output tokens, unique cache
+salt per request and explicit cached_tokens=0 throughout. Medians of all
+nine measured requests per length (not selected per-start best results):
+
+| Exact input tokens | Client TTFT ms | Engine scheduled-to-first-token ms | Effective input tok/s, engine TTFT |
+| ---: | ---: | ---: | ---: |
+| 32768 | 2680.95 | 2639.95 | 12412.33 |
+| 131072 | 11565.57 | 11447.56 | 11449.78 |
+
+Engine TTFT is not pure GPU prefill time. The short eight-token output is
+not a useful client decode-speed benchmark because streaming can batch tokens.
+Raw: perf/results/2026-09-08/marlin-repair-serving/, including all requests,
+quality responses, native hashes, profiler traces, server logs and commands.
+
 ### RTX6000 expanded quality reference - 2026-09-08
 
 Commit 9de9ad871, unchanged recipe v1 and corrected-sampler native binary.
