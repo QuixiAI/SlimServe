@@ -25188,3 +25188,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   core/MoE and the precisely bounded QC binary change. Timing remains serialized
   and instrumented, not eligible as a production TPS gain. Record concrete
   failure and stop if any prescribed check fails; no replacement starts.
+
+## 2026-09-09 - Native stable-routing timing passes; full-model protocol frozen
+
+- Fixed native timing COMPLETE on4c0574d42, QC33decd2f/corefe4a7c2a/MoE1093b8a4.
+  All32 shapes/two comparisons/five A/B/A rounds/4800 samples and graph-output/
+  input checks verify. Separate read-only analysis verifies every sample and
+  historical719-case native/mem/sync/bounded-race receipt against its exact
+  7b68fe8f6 Git sources, not later wrapper edits. Native binary/SASS hashes
+  reverify and all746 non-router copies remain identical.
+- Stable native scatter is0.0032-0.1328us (0.06-2.70%) slower than synchronized
+  atomic alone, not a raw-router speedup. Compared with synchronized atomic
+  plus diagnostic sort, complete stable routing is17.09-21.28% lower latency,
+  saving0.9200-1.3392us; ALL32 distributions strictly separated from both
+  controls. Random A/B/A microseconds: M1 4.7744/3.8432/4.7664;
+  M8 6.1168/4.9024/6.0976; M16 7.6208/6.3184/7.6304.
+  Synthetic warm-cache graph throughput, NOT serving TPS or full-model proof.
+- Raw stable-route-native-timing/summary.json
+  SHAef38c4cdfc20f2c44def585b2fad5b7dcda6c37f3ce0b1dfcc117bdb7aa9ffb4;
+  runtime-control/stable-route-native-analysis.json
+  SHAbc58c1f2d6d36c2a1b23e2f90ee3400d7a4ad26d67f81798bbd84b126dd2de81.
+  Source-hashed scratch analyze_stable_route_native_timing.py, full log retained.
+  Both exit0; no exclusions/retries/concurrent workloads; GPUs released.
+- Next fixed full-model run: SAME glm53-nvfp4-4/rtx6000/TP4/recipe v1, prompt,
+  CUDA13/cache,150GiB/no swap/OMP1/CUDA_LAUNCH_BLOCKING1, BF16-storage1/TC0,
+  unset NCCL_P2P_DISABLE. Canonical MoE/order/ties/fused index selector and all
+  bounded journals unchanged; add SLIMSERVE_GLM53_STABLE_ROUTE=1. ONE start,
+  --boots 1 --repeats 3 --cold-prefix --quality --quality-repeats 3, output
+  perf/results/2026-09-09/stable-route-quality-diagnostic/. No replacement starts.
+- Exact score/index prompt IDs, max_matches3 and capture_layer23 compared to
+  preceding configs; ONLY output directory changes. SCORE_JOURNAL config
+  runtime-control/stable-route-score-config.json
+  SHA2500be0ead7ab8bbf023da71b45eb2a1e9c5415f478f4c709ada432fb6215862;
+  INDEX_JOURNAL stable-route-index-config.json
+  SHA2c2db12529daaa57248b2abb6d6457601445a261452ef571a4fd7573fe047636.
+  Source/native frozen through serving and analysis. Require all75 priming/
+  timing requests,168 uncached quality requests, every4096 text/needle score,
+  all1024 short/94 long tensors per rank, archive/source/native verification
+  and ALLnine pass-pair equalities versus28d2249c1. No quality-gate relaxation.
+  The QC change includes the synchronization repair; equality/latency must not
+  be attributed solely to the stable flag. Full-model outcome still pending.

@@ -48,9 +48,13 @@ requiring the canonical MoE diagnostic. Profile/quant/TC defaults are unchanged.
 Final serving wiring passes713 GPU tests (including compiled custom ops),
 519 CPU tests/one skip and52 baseline-exclusion tests. The post-sort is skipped
 only for the actual reused canonical alignment, never just because M<=16.
-Next: native32-shape A/B/A in stable-route-native-timing/, then ONE start/three
-quality passes against the frozen28d2249c1 fused-indexer control. Native timing
-and full-model qualification are still pending. M>16 origin alignment is next
+Native32-shape A/B/A is COMPLETE:17.09-21.28% less stable-path latency than
+atomic plus sort, all4800 samples verified, all32 distributions separated.
+Raw stable-route-native-timing/ and runtime-control/stable-route-native-analysis.json.
+Next ONE start/three quality passes in stable-route-quality-diagnostic/ against
+the frozen28d2249c1 fused-indexer control. Full-model qualification is pending.
+The exact640/8199-ID configs and frozen run protocol are in the notebook.
+M>16 origin alignment is next
 after this loop; no new serving TPS gain is claimed.
 
 ### Chronological evidence (older next-step statements are historical)
