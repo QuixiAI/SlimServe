@@ -23775,3 +23775,37 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   override the failed tensor-core promotion gate. Raw CPU tests:
   runtime-control/mhc-quality-repeats-cpu-tests.xml. Live diagnostic output is
   the prescribed directory above, not a replacement serving baseline.
+
+## 2026-09-09: Quality-score variation reproduces without a model restart
+
+- Status: reproduced on unchanged TC0 path, root cause still open. ONE
+  prescribed profile start on808fbb625/nativeQC4ce801, BF16 storage1, no
+  arithmetic/native changes. All nine exact cold timing rounds used only as
+  workload priming; receipt diagnostic_only=true, baseline_eligible=false.
+- All three full quality passes complete:12,288 scored text tokens,18 positive
+  needle contrasts,168 quality requests with cached_tokens=0, identical input
+  IDs/offsets/needle prefixes. Raw scores and summaries independently checked.
+  Means -2.719908825/-2.726596213/-2.726545487. All sources/native hashes match.
+- Pass1/2,1/3,2/3 respectively: changed4096/4095/4096 scores; mean absolute
+  deltas0.247751/0.246299/0.240379nat/token; RMS0.425680/0.426459/0.413911;
+  max3.663739/3.452274/3.954087.25/26/28 of32 windows differ by>0.01. Window
+  extrema across pairs -0.128477 to+0.126933. Aggregate similarity, notably
+  pass2/3 mean delta0.0000507, hides substantial per-token variation.
+- Decision: restart selection and TC arithmetic are not required to reproduce
+  this. Do not claim a culprit, relax the quality gate or promote TC. Source
+  review confirms prompt scores bypass sampling processors and synchronize
+  D2H transfer; actual Marlin MoE calls use non-atomic FP32 split reduction.
+  Those observations alone do not exclude bugs in either path. Need to trace
+  the first varying operation in the owned stack.
+- Next bounded diagnostic: SAME controller/native/recipe, ONE start and three
+  quality passes, add only CUDA_LAUNCH_BLOCKING=1. Keep --boots1 --repeats3
+  --cold-prefix --quality --quality-repeats3, no profiler or extra retries.
+  Output perf/results/2026-09-09/mhc-quality-serialized-diagnostic/ inside the
+  same150GiB/no-swap scope. This tests sensitivity to launch completion order;
+  it is not a fix, performance baseline, or proof against intra-kernel races.
+- Raw: mhc-quality-repeat-diagnostic/; runtime-control/
+  mhc-quality-repeat-{diagnostic.log,analysis.json}. All jobs exit0, GPU release
+  completes in0.340s, no foreign processes touched. Quality file SHA:
+  7499406e1e6e1fff6bf7286a5377b90655f83033ce51fdec28b2c354df6b4d6d;
+  3e5f3352aee0d115c45db9bce2334b613b0c8574f892cae97a5772c58c304b0b;
+  d5e655be65fd7d26d4a15767c2c4ae2bc256a7445c9e30c7cf84299797884c30.
