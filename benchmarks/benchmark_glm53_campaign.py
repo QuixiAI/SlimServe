@@ -358,6 +358,15 @@ def require_gpus_free(receipt, record, boot):
         raise
 
 
+def record_run_failure(run, receipt, error):
+    run.update(status="failed", error=repr(error))
+    receipt["status"] = "failed"
+    # Interrupts must reach the caller after finally performs owned teardown;
+    # they must not leave a stale running receipt or advance to another boot.
+    if not isinstance(error, Exception):
+        raise error
+
+
 def finish_owned_run(process, run, receipt, record):
     # A teardown exception must not leave the on-disk run marked 'running',
     # lose completed quality/prefill results, or start another server.
@@ -856,9 +865,8 @@ def main():
                     run["prefill"] = prefill["aggregates"]
                 require_benchmark_sources()
                 run["status"] = "complete"
-            except Exception as error:
-                run["status"] = "failed"
-                run["error"] = repr(error)
+            except BaseException as error:
+                record_run_failure(run, receipt, error)
                 print(f"boot {boot}: {error}", flush=True)
             finally:
                 finish_owned_run(process, run, receipt, record)

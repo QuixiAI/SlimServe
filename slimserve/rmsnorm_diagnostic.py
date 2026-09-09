@@ -171,6 +171,7 @@ class Intervention:
                 autotuner._cached_launcher = None
                 autotuner.save_cache_hook = None
                 self.replaced.add(id(autotuner))
+                record["binding_index"] = len(self.replaced)
             record["after"] = launcher_receipt(autotuner)
             if not target and record["before"] != record["after"]:
                 raise ValueError("unrelated launcher changed")
@@ -179,9 +180,12 @@ class Intervention:
 
     def seal(self):
         with self.lock:
-            if len(self.replaced) != 1:
+            # Separate AOT submodules can own distinct autotuner objects for
+            # the same generated source. Every occurrence is hash-checked and
+            # replaced above; source coverage is not object uniqueness.
+            if not self.replaced:
                 raise ValueError(
-                    f"expected exactly one RMSNorm binding on rank{self.rank}"
+                    f"missing source-bound RMSNorm binding on rank{self.rank}"
                 )
             self.sealed = True
             self.emit(dict(event="sealed", rank=self.rank, targets=len(self.replaced)))

@@ -104,3 +104,48 @@ replacement receipts, all unaffected launchers, direct AOT loads, original cache
 snapshot, every request and every quality score. Require clean owned-process
 teardown/GPU release before any further development. No TPS gain, default
 promotion, TC exoneration or fresh-compilation invariance claim from these arms.
+
+## Preserved pre-health failure and source-binding repair
+
+The first control on ea2fff9ce directly loads all four AOT models, but fails
+before health: ranks1/2/3 each own TWO distinct autotuner objects for their one
+target source. Rank0 owns one. The hook replaced all seven objects with identical
+native binaries, but the seal incorrectly required one object, not source
+coverage. All72 recorded launchers have identical before/after hashes.
+No benchmark/quality requests ran. The original legacy arm was NOT launched.
+
+Verified controller PID2674507 was interrupted after the terminal worker errors;
+its normal teardown completes, server exit1/controller exit130, GPUs release in
+0.04625s, no zombies. Four shared-memory tracker warnings remain. The original
+summary retains stale running/starting status because main caught Exception but
+not KeyboardInterrupt; preserve it unchanged. Failure audit classifies the
+terminal state and verifies all5172 original cache files and22 source receipts:
+`runtime-control/rmsnorm-noop-startup-failure.json`,
+SHA256 `baf6736a06fbd851328ee99af6a0be4acb8a896acfe57ba477ccef6be477ab93`.
+
+Repair the hook to require source coverage and replace EVERY distinct binding
+of the exact source. Missing sources, repeated replacement of the same object,
+late targets and wrong source/native/replacement hashes still fail. Record binding
+indices and actual object counts; do not confuse Python object count with the
+four-kernel scope. Numerical gates are unchanged. Also fix interrupted startup
+receipts to mark failure before teardown and rethrow the interrupt, not advance
+to another boot. No changes to the old artifacts.
+
+Fixed repair qualification: ONE new GPU hook run at
+`rmsnorm-intervention-bindings-gpu`, same command/resource limits as above but
+new scope/log/output. Exercise the observed1/2/2/2 separate objects, both modes,
+rows16/640:28 cases. Preserve the earlier16-case result separately.
+
+Then prepare fresh copies under `rmsnorm-intervention-bindings-caches` using
+the same preparer (new scope/log/output). Preserve both prior copies. Exactly
+TWO new, repaired diagnostic starts, still with a correctness stop:
+
+1. `rmsnorm-noop-bindings-control`, modecontrol, three quality passes that must
+   match all nine old native-only passes exactly.
+2. ONLY if that passes, `rmsnorm-legacy-bindings-only`, modelegacy, same workload.
+
+Use corresponding `glm53-...` scope and `runtime-control/...-launch.log` names,
+and the new private manifests/cache roots. All other serving commands, fixed
+request counts, source freezes, receipts, original-cache checks and exact-score
+gates are unchanged. These are repaired diagnostic experiments, not replacement
+timing samples; the first startup failure remains part of the campaign record.

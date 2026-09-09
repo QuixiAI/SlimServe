@@ -215,6 +215,31 @@ def test_gpu_release_waits_for_owned_driver_entries_not_foreign_work(monkeypatch
     assert all(r["other_active_pids"] == [99] for r in evidence["samples"])
 
 
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), SystemExit(2)])
+def test_startup_interrupt_marks_receipt_failed_before_teardown(
+    monkeypatch, tmp_path, error
+):
+    bench = _load(monkeypatch)
+    run = {"status": "starting", "measurements": []}
+    receipt = {"status": "running", "runs": [run]}
+    record = tmp_path / "summary.json"
+    monkeypatch.setattr(bench, "process_group_snapshot", lambda _: [])
+    monkeypatch.setattr(bench, "stop_owned", lambda _: [])
+    monkeypatch.setattr(bench, "gpu_compute_pids", lambda: [])
+    with pytest.raises(type(error)):
+        try:
+            bench.record_run_failure(run, receipt, error)
+        finally:
+            bench.finish_owned_run(
+                SimpleNamespace(pid=11, returncode=1), run, receipt, record
+            )
+    saved = json.loads(record.read_text())
+    assert saved["status"] == saved["runs"][0]["status"] == "failed"
+    assert saved["runs"][0]["error"] == repr(error)
+    assert saved["runs"][0]["teardown"]["status"] == "complete"
+    assert saved["runs"][0]["measurements"] == []
+
+
 def test_gpu_release_timeout_keeps_measurements_and_teardown_receipt(
     monkeypatch, tmp_path
 ):

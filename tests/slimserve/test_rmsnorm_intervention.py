@@ -110,8 +110,25 @@ def test_untargeted_launcher_is_not_compiled_or_modified(tmp_path):
     before = vars(tuner).copy()
     instance.replace(tuner, lambda *_: pytest.fail("unrelated compilation"))
     assert vars(tuner) == before
-    with pytest.raises(ValueError, match="exactly one"):
+    with pytest.raises(ValueError, match="missing source-bound"):
         instance.seal()
+
+
+@pytest.mark.parametrize("arm", ["control", "legacy"])
+def test_multiple_aot_objects_for_one_source_are_all_replaced(tmp_path, arm):
+    instance, first = setup_intervention(tmp_path, arm)
+    second = SimpleNamespace(**vars(first))
+    compile_config = lambda saved: SimpleNamespace(
+        make_launcher=lambda: fake_launcher(saved["triton_cache_hash"])
+    )
+    instance.replace(first, compile_config)
+    instance.replace(second, compile_config)
+    assert first.launchers[0].cache_hash == second.launchers[0].cache_hash
+    assert first.launchers[0].cache_hash == ("new" if arm == "control" else "old")
+    instance.seal()
+    records = [json.loads(line) for line in instance.path.read_text().splitlines()]
+    assert [r["binding_index"] for r in records if r.get("target")] == [1, 2]
+    assert records[-1]["targets"] == 2
 
 
 @pytest.mark.parametrize("bad", ["source", "old_hash", "multiple", "replacement_hash"])

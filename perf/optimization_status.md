@@ -26034,3 +26034,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Next execute the frozen no-op control, audit it against all nine native-only
   quality passes, then execute legacy ONLY if exact control passes. Source and
   native binaries freeze across both starts and audits. No replacement starts.
+
+## 2026-09-09 - Preserve no-op startup failure; repair source-versus-object guard
+
+- Status: no full-model result. First no-op on ea2fff9ce loads all four private
+  AOT models without fallback, then fails before health/canaries/benchmarks.
+  Source coverage is four sources, but actual autotuner object counts are
+  1/2/2/2 by rank. The guard incorrectly required exactly one object per rank.
+  All seven replacements and all72 launcher records are bit-identical before/
+  after. No score comparison or performance result exists; legacy NOT launched.
+- Preserved all original artifacts. Verified controller2674507 was sent SIGINT
+  only after terminal worker errors; regular owned teardown succeeds, APIserver
+  exit1/controller130, GPU release0.04625s, no zombies. Four leaked shared-memory
+  objects reported by resource_tracker. Fresh GPU check empty.
+- Secondary harness defect: KeyboardInterrupt bypasses exceptException, leaving
+  original summary running/starting despite terminal process and complete
+  teardown. Do not overwrite that raw summary. Separate failure audit records
+  actual state, all22 source receipts and all5172 unchanged original cache files.
+  Raw runtime-control/rmsnorm-noop-startup-failure.json
+  SHAbaf6736a06fbd851328ee99af6a0be4acb8a896acfe57ba477ccef6be477ab93;
+  original summary6415aea597a4226370c37c27b0b97b2a3f6c99270429a77067639b2a4d312bf4.
+- Repair: cover every distinct object for the exact source; record binding
+  indices, require source presence, reject same-object/late/wrong-hash bindings.
+  Do not impose an unrelated object-uniqueness requirement. Interrupts now mark
+  run/root receipt failed before normal teardown, then propagate without another
+  boot. Original caches/native/quant/numerics and exact-score gates unchanged.
+- Frozen follow-up in perf/glm53-rmsnorm-intervention-protocol.md:28-case actual
+  multi-binding GPU qualification, new byte-identical private copies, then ONE
+  repaired no-op control and ONE legacy arm only after exact no-op equality.
+  No replacement or deletion of the first failed start; no relaxed quality gate.
+  Repair CPU suite128pass8.70s/14 existing warnings; lint/diff checks pass.
