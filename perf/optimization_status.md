@@ -24190,3 +24190,57 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   canonical-MoE quality passes, masking undefined logit tails only in CPU
   diagnostic copies. Prove input identity and distinguish selected-set changes
   from order-only changes before choosing an indexer intervention.
+
+## 2026-09-09 - Qualified bounded long-context selector observer and prescribed run
+
+- Status: diagnostic qualified; full-model capture prescribed, not yet measured.
+- Baseline: canonical-MoE63d7704b0 makes all4096 text scores and1K retrieval
+  scores exact across3 passes, but8K/32K scores still vary. Installed sampler
+  probea702850b6 reproduces order and cutoff-tie membership variation while
+  preserving valid top-k scores. Do not infer model causality from that probe.
+- Hypothesis: determine whether the actual8K request presents identical
+  selector logits but receives differing order and/or tied pool membership.
+  If logits already differ, investigate before this boundary instead.
+- Change: SLIMSERVE_GLM53_INDEX_JOURNAL points to strict8199-token/3-match
+  config. Opt-in wrappers bracket the existing compiled pooled-indexer custom
+  op and its installed native top_k_per_row_prefill call. Track exact token
+  positions across<=8 forwards, all11 DSA layers in order, complete selector
+  row coverage, <=8 selectors/layer, FP32 logits/int32 IDs/top512, width<=2049.
+  Hash defined logits/ranges and returned indices at every observed call;
+  save only layer3/first-chunk/first-call tensors for each match/rank. Private
+  CPU copies zero undefined logit tails; never alter GPU data or selection math.
+  Per-tensor128MiB and per-worker1GiB archive limits. Default-off decorators
+  are the original callables and no runner hook is installed. No native change.
+- Provenance: index header hashes7 implementation files; short score header
+  now hashes15 including both indexer observation sources. Campaign receipt
+  excludes index instrumentation from baseline eligibility even with one pass.
+- Correctness: final436 CPU tests pass/one GPU skip (21.09s). All8 GPU tests
+  pass (31.14s): unique/tied/random selection with poisoned undefined tails,
+  exact actual-output archive checks and independent score-set checks; real
+  registered compiled indexer with8192+7 request chunks at both RT8/PT64 and
+  retained RT2/PT128; previous90-site mHC and native MoE observer checks.
+  The first4 GPU checks used the original tiles (the initial command misspelled
+  the environment flag); the final matrix explicitly tests BOTH layouts.
+  No timing claim, sanitizer or native-arithmetic change. Lint/diff clean.
+- Prescribed ONE start: identical150GiB/no-swap scope, CUDA_VISIBLE_DEVICES0..3,
+  unset NCCL_P2P_DISABLE, CUDA13/VLLM cache/prompt/recipe unchanged,
+  OMP1/CUDA_LAUNCH_BLOCKING1/BF16-storage1/TC0/nativeQC4ce801/core d45b4ace/
+  MoE1093b8a4. MODEL_JOURNAL1/MOE_JOURNAL1/CANONICAL_MOE1 remain enabled.
+  SCORE_JOURNAL=runtime-control/indexer-long-context-score-config.json,
+  SHA1013982201b9b84fcfd5d41113217ada6f7de21ece149e00f8a30b0a5d7ae32d.
+  INDEX_JOURNAL=runtime-control/indexer-long-context-index-config.json,
+  SHAdd62d951fe8c71a169d1173cf8116d92c37148ee3fc33741d611f97e6caaeb2e.
+  Exact8192 prefix+7 true-code suffix IDs come from canonical-run quality.json,
+  needles[2]/candidates[0], position0.25. The640-token short config is unchanged
+  except its output directory. Use the campaign --profile glm53-nvfp4-4
+  --boots 1 --repeats 3 --cold-prefix --quality --quality-repeats 3,
+  output indexer-long-context-quality-diagnostic/. Keep every pass/startup/
+  priming result. No changes to loaded sources/native, builds, competing GPU
+  jobs or profiling until completion and owned-process teardown.
+- Decision: verify all raw/source/native/HTTP/archive evidence and short-score
+  stability, then compare actual first selector inputs/order/sets across all
+  three passes/four ranks. Replay saved inputs before proposing new math.
+  Keep original TC quality contract, TC OFF, stable performance baselines
+  unchanged. The instrumented campaign rates are not baseline eligible.
+- Raw qualification: runtime-control/index-journal-{final-cpu,final-gpu}-tests.xml
+  and logs. Earlier CPU/GPU/integrated checks retained alongside them.

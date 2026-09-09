@@ -26,6 +26,7 @@ def _load(monkeypatch):
     [
         None,
         "SLIMSERVE_GLM53_SCORE_JOURNAL",
+        "SLIMSERVE_GLM53_INDEX_JOURNAL",
         "SLIMSERVE_GLM53_MODEL_JOURNAL",
         "SLIMSERVE_GLM53_MOE_JOURNAL",
         "SLIMSERVE_GLM53_CANONICAL_MOE",
@@ -35,6 +36,7 @@ def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, ac
     bench = _load(monkeypatch)
     keys = (
         "SLIMSERVE_GLM53_SCORE_JOURNAL",
+        "SLIMSERVE_GLM53_INDEX_JOURNAL",
         "SLIMSERVE_GLM53_MODEL_JOURNAL",
         "SLIMSERVE_GLM53_MOE_JOURNAL",
         "SLIMSERVE_GLM53_CANONICAL_MOE",

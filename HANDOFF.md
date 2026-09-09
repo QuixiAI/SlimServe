@@ -178,10 +178,18 @@ All168 requests are cold and all18 retrieval contrasts pass. Long8K/32K needle
 scores still vary (max1.623/1.937nat per scored token); this is NOT complete
 model repeatability. Native/recipe unchanged, TC0; sorting remains diagnostic.
 Raw verification: runtime-control/mhc-canonical-moe-quality-analysis.json.
-Next isolate the long-context path, starting with top_k_per_row_prefill:
-sampler.cu emits selected indices using atomic positions and has unstable
-cutoff ties; the short <=512-pool shortcut is deterministic. This is a lead,
-not yet a demonstrated cause of the remaining long-context scores.
+The installed top_k_per_row_prefill probe now confirms variable selection order
+above512 pools and variable membership for cutoff ties: all360 calls still
+select valid top-k scores. This remains a lead, not full-model causal proof.
+Next prescribed run is indexer-long-context-quality-diagnostic/: ONE start,
+three full quality passes, same canonical-MoE1/TC0 recipe. The new opt-in
+index_journal records all11 selector layers/chunks for the exact8199-token
+first8K true-code request, and archives first-layer/first-chunk logits/ranges/
+indices on all4 ranks. CPU-only copies mask undefined logit tails; GPU buffers
+and arithmetic are unchanged. The existing short model/score/MoE trace remains
+active.436 CPU tests (one skip) and8 GPU observer/integration tests pass,
+including real compiled indexer calls at both tile layouts and8192+7 chunks.
+No performance/default promotion; details and fixed configs are in the notebook.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;
@@ -464,8 +472,10 @@ Current candidate priorities (hypotheses, not physical ceilings):
    control/control score variability before considering promotion or more
    arithmetic changes. Same-process repeated TC0 scoring reproduces it; the
    first numeric difference is now reproduced by varying only the first MoE's
-   within-expert assignment order. Next test deterministic alignment through
-   the model; serialization alone did not remove the variation.
+   within-expert assignment order. Canonical alignment now makes short-prompt
+   scores exact across3 full-model passes, but8K/32K retrieval still varies.
+   Next capture actual long-context selector logits/order/sets with the
+   bounded index journal; serialization alone did not remove the variation.
    The unchanged probe is45d5e817, current nativeQC4ce80155. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
    Five-round cold timing gives29-34% lower small-batch latency but only2.61%

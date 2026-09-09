@@ -48,6 +48,7 @@ def diagnostic_only(args):
         or args.cuda_traces
         or args.quality_repeats > 1
         or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
+        or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
         or any(
             os.environ.get(key) == "1"
             for key in (

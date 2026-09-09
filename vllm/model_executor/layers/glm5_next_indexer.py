@@ -33,6 +33,8 @@ import os
 import torch
 from torch import nn
 
+from slimserve.index_journal import instrument_pooled_indexer
+
 from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
@@ -538,6 +540,7 @@ def _pooled_select(
     )
 
 
+@instrument_pooled_indexer
 def glm5_next_pooled_indexer(
     q: torch.Tensor,
     packed: torch.Tensor,
