@@ -22409,3 +22409,57 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   later commits during the series changed only separate diagnostics/docs.
 - Next: pinned current B12X control and whole-model observer control. The
   registered production recipe/default stays unchanged while these run.
+
+## 2026-09-08: Reproduce the B12X shell compatibility-driver IPC failure
+
+- Status: origin isolated with fixed model-free A/B/A; actual serving recheck
+  in progress. No competitive TPS from the failing image startup.
+- Pinned R28.1 stock-launcher series: all three starts fail before weights
+  load, in PyNcclCommunicator.ncclCommInitRank. All exit1/OOMKilled=false;
+  logs, immutable container IDs/configuration and exit states are retained.
+  Only owned stopped containers were removed. No P2P/custom-AR disabling.
+- One logging-only diagnostic reproduces. Native NCCL says driver13030 and
+  fails in transport/p2p.cc:321 ncclP2pImportShareableBuffer with CUDA
+  invalid device ordinal. The earlier direct-Python probe said driver13000.
+  This is an actual loaded-driver discrepancy, not a version-label guess.
+- Origin: image BASH_ENV=/etc/bash.bashrc sources /etc/shinit_v2. That hook
+  runs cudaCheck with compat/lib.real and, on a context-only success, prepends
+  that directory to LD_LIBRARY_PATH. Reading only the model launcher scripts
+  had missed this inherited shell hook. A direct Python entrypoint skips it.
+- New benchmark_cuda_shell_compat.py executes the EXISTING model-free probe
+  through Bash in three fixed arms, same pinned image/CUDA/NCCL/P2P settings,
+  UID1000,16-GiB/no-swap container and150-second bound:
+
+  | Arm | Loaded libcuda | All four ranks |
+  | --- | --- | --- |
+  | default shell | compat/lib.real/libcuda.so.610.43.02 | IPC import CUDA101 |
+  | BASH_ENV=/dev/null | host libcuda.so.580.173.02 | every-peer writes and three NCCL reductions pass |
+  | default shell return | compat/lib.real/libcuda.so.610.43.02 | IPC import CUDA101 |
+
+  Both failing arms report cudaIpcOpenMemHandle: invalid device ordinal at
+  every rank. All arms load the same libcudart13.3.29/NCCL2.31.2. The passing
+  arm verifies every peer's1024-byte stripe and exact BF16 all-reduce at
+  2/8192/62390272 bytes. No checkpoint/model loading is involved.
+- Minimal container-only adaptation: benchmark_glm53_b12x.py gains explicit
+  --host-cuda-driver (sets BASH_ENV=/dev/null). The supported entrypoint,
+  actual model/quant, CUDA runtime, custom NCCL binary, custom collective,
+  P2P/SYS and tuned image defaults remain. Default behavior is unchanged so
+  the failure stays reproducible. --diagnostic-nccl adds only logging and
+  labels results diagnostic. The actual reference is now explicitly a
+  host-driver-adapted image, not claimed byte-for-byte stock environment.
+- Eleven focused CPU tests pass: fixed failure/success/failure sequence,
+  timeout and interruption teardown, only owned IDs removed, explicit
+  host-hook/logging-only changes and the previous three-start harness cases.
+  Ruff passes. The shell probe records all commands, source/probe hashes,
+  container configuration, logs, loaded libraries and failures.
+- Prescribed real recheck: same3starts x3repeats/full workload as prior current
+  control, with --host-cuda-driver and without diagnostic logging. First
+  start passes communication initialization at03:25 UTC and begins loading;
+  full custom-AR/health/quality/TPS qualification remains owed. No native
+  build or other GPU work may overlap. Startup bound1200 seconds, container
+  150 GiB/no swap, CPU controller16 GiB/no swap. Host driver/clocks untouched.
+- Raw: perf/results/2026-09-08/{b12x-r281-serving,b12x-r281-init-debug,
+  b12x-r281-host-serving}/ and runtime-control/shell-compat/;
+  runtime-control/{b12x-debug-tests,b12x-host-tests,shell-compat-tests}.xml.
+- This proves the R28.1 failure mechanism on this host; it does not claim
+  every old R24 failure had this same cause without reproducing that path.

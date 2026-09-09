@@ -72,6 +72,14 @@ def docker_create_args(args, name, port):
         "NVCC_THREADS": "2",
         "OMP_NUM_THREADS": "1",
     }
+    if args.diagnostic_nccl:
+        # Observation only: never disable transports or replace the library.
+        environment["NCCL_DEBUG"] = "INFO"
+    if args.host_cuda_driver:
+        # The image's automatic shell hook prepends compat/lib.real, whose
+        # CUDA IPC import fails on this host. Keep the injected host libcuda
+        # instead. The launcher, CUDA runtime, NCCL and P2P remain unchanged.
+        environment["BASH_ENV"] = "/dev/null"
     argv = [
         "docker",
         "create",
@@ -134,6 +142,8 @@ def run(args):
         "method": __doc__,
         "image": IMAGE,
         "model_revision": REVISION,
+        "diagnostic_only": args.diagnostic_nccl,
+        "host_cuda_driver": args.host_cuda_driver,
         "command": sys.argv,
         "git_commit": command("git", "rev-parse", "HEAD"),
         "git_status": command("git", "status", "--short"),
@@ -287,6 +297,16 @@ def main():
     parser.add_argument("--boots", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--startup-timeout", type=int, default=1200)
+    parser.add_argument(
+        "--diagnostic-nccl",
+        action="store_true",
+        help="enable NCCL initialization logs; results are diagnostic, not a baseline",
+    )
+    parser.add_argument(
+        "--host-cuda-driver",
+        action="store_true",
+        help="skip the image shell compatibility-driver hook; preserve host libcuda",
+    )
 
     # A controller interruption must run the owned-container finally block.
     def interrupted(signum, frame):

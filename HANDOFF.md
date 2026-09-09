@@ -75,16 +75,22 @@ All 18 phases pass exact output checks; post-profiler timings return near baseli
 This does not establish the full TP4 model's unprofiled graph span. Probe raw:
 runtime-control/graph-profiler-bias/. Whole-model observer control is next.
 
-The digest-pinned R28.1 reference image is downloaded; its source lock and
-four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
-matches the cached model. The actual serving launcher/custom all-reduce and
-a matched competitive serving benchmark still need qualification.
+The digest-pinned R28.1 reference has a reproduced container-startup failure
+and a model-free A/B/A repair: its Bash startup hook selects compat libcuda
+610.43.02, whose peer-memory imports fail with CUDA101 on this host. Skipping
+that hook with BASH_ENV=/dev/null retains host libcuda580.173.02 and passes
+all four ranks' every-peer writes/NCCL tests; restoring the hook fails again.
+CUDA runtime13.3 and NCCL2.31.2 are unchanged. No host-driver changes or
+transport disabling. The original fixed three serving starts all failed and
+remain recorded in b12x-r281-serving/. A new fixed three-start campaign uses
+--host-cuda-driver at b12x-r281-host-serving/; its first start has passed
+communication initialization and begun model loading, but no TPS yet.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
 SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,
 failure-retention and tokenizer gates pass. Both tokenizers produce identical
 427489 full-source token IDs despite serialized-default/template differences.
-Do not run this GPU control alongside the active mHC series. It is a different
+Do not run other GPU work alongside this control. It is a different
 W4A4/FP8-KV configuration, never a replacement for the selected recipe.
 
 The repaired Marlin library has completed the fixed three-start serving campaign:

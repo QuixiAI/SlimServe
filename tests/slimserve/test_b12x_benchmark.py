@@ -38,6 +38,8 @@ def settings(bench, tmp_path):
         boots=3,
         repeats=3,
         startup_timeout=1200,
+        diagnostic_nccl=False,
+        host_cuda_driver=False,
     )
 
 
@@ -62,6 +64,26 @@ def test_launcher_keeps_supported_collectives_and_exact_image(bench, tmp_path):
     args.jit_cache = args.model_cache
     with pytest.raises(ValueError, match="separate"):
         bench.docker_create_args(args, "owned-name", 8123)
+
+
+def test_nccl_diagnostic_only_adds_logging(bench, tmp_path):
+    args = settings(bench, tmp_path)
+    baseline = bench.docker_create_args(args, "owned-name", 8123)
+    args.diagnostic_nccl = True
+    diagnostic = bench.docker_create_args(args, "owned-name", 8123)
+    index = diagnostic.index("NCCL_DEBUG=INFO")
+    assert diagnostic[index - 1] == "-e"
+    assert diagnostic[: index - 1] + diagnostic[index + 1 :] == baseline
+
+
+def test_host_driver_only_suppresses_shell_hook(bench, tmp_path):
+    args = settings(bench, tmp_path)
+    baseline = bench.docker_create_args(args, "owned-name", 8123)
+    args.host_cuda_driver = True
+    adapted = bench.docker_create_args(args, "owned-name", 8123)
+    index = adapted.index("BASH_ENV=/dev/null")
+    assert adapted[index - 1] == "-e"
+    assert adapted[: index - 1] + adapted[index + 1 :] == baseline
 
 
 @pytest.mark.parametrize(
