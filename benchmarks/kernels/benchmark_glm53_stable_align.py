@@ -9,6 +9,8 @@ With --parallel-count, use 1024 counting threads instead of 256 and add the
 original 256-thread stable path as a third A/B/A control: 7,200 samples total.
 With --direct-count, use 1024 threads without warp aggregation and retain both
 original stable counters as controls: four comparisons, 9,600 samples total.
+With --parallel-scatter, use 512 scatter threads with direct counting fixed,
+adding direct-stable as the fifth control: 12,000 samples total.
 Routing scores/IDs, weights and GEMM arithmetic are outside this experiment.
 All buffers are hot; this does not establish model cache effects or serving TPS.
 """
@@ -96,7 +98,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--parallel-count", action="store_true")
     parser.add_argument("--direct-count", action="store_true")
+    parser.add_argument("--parallel-scatter", action="store_true")
     args = parser.parse_args()
+    if args.parallel_scatter:
+        args.direct_count = True
     if args.direct_count:
         args.parallel_count = True
     args.output.mkdir(parents=True, exist_ok=False)
@@ -138,6 +143,7 @@ def main():
         status="running",
         count_threads=1024 if args.parallel_count else 256,
         aggregate=not args.direct_count,
+        scatter_threads=512 if args.parallel_scatter else 256,
         diagnostic_only=True,
         protocol=__doc__,
         source_sha256=hashes,
@@ -178,7 +184,13 @@ def main():
             return out
 
         def stable(ids=ids, block=block):
-            return probe.run(ids, block, args.parallel_count, not args.direct_count)
+            return probe.run(
+                ids,
+                block,
+                args.parallel_count,
+                not args.direct_count,
+                args.parallel_scatter,
+            )
 
         graphs = {
             name: graph_for(call)
@@ -195,6 +207,10 @@ def main():
         if args.direct_count:
             graphs["parallel-stable"] = graph_for(
                 lambda ids=ids, block=block: probe.run(ids, block, True, True)
+            )
+        if args.parallel_scatter:
+            graphs["direct-stable"] = graph_for(
+                lambda ids=ids, block=block: probe.run(ids, block, True, False, False)
             )
 
         def check(
@@ -238,6 +254,8 @@ def main():
             baselines.append("original-stable")
         if args.direct_count:
             baselines.append("parallel-stable")
+        if args.parallel_scatter:
+            baselines.append("direct-stable")
         for baseline in baselines:
             rounds = []
             for repeat in range(5):

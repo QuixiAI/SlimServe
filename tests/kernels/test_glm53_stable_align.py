@@ -40,22 +40,32 @@ def sha(path):
 @pytest.fixture(
     scope="module",
     params=[
-        pytest.param((256, True), id="256"),
-        pytest.param((1024, True), id="1024"),
-        pytest.param((1024, False), id="direct"),
+        pytest.param((256, True, False), id="256"),
+        pytest.param((1024, True, False), id="1024"),
+        pytest.param((1024, False, False), id="direct"),
+        pytest.param((1024, False, True), id="scatter512"),
     ],
 )
 def probe(request):
     module = build()
-    threads, aggregate = request.param
+    threads, aggregate, parallel_scatter = request.param
     return SimpleNamespace(
         __file__=module.__file__,
         module=module,
         count_threads=threads,
         aggregate=aggregate,
-        run=partial(module.run, parallel_count=threads == 1024, aggregate=aggregate),
+        scatter_threads=512 if parallel_scatter else 256,
+        run=partial(
+            module.run,
+            parallel_count=threads == 1024,
+            aggregate=aggregate,
+            parallel_scatter=parallel_scatter,
+        ),
         run_into=partial(
-            module.run_into, parallel_count=threads == 1024, aggregate=aggregate
+            module.run_into,
+            parallel_count=threads == 1024,
+            aggregate=aggregate,
+            parallel_scatter=parallel_scatter,
         ),
     )
 
@@ -67,6 +77,7 @@ def identities(probe, record_property):
     record_property("source_sha256", json.dumps(hashes, sort_keys=True))
     record_property("count_threads", probe.count_threads)
     record_property("aggregate", int(probe.aggregate))
+    record_property("scatter_threads", probe.scatter_threads)
     yield
     assert hashes == {str(p): sha(p) for p in files}
 
@@ -232,6 +243,7 @@ def test_foreign_current_device_and_nondefault_stream(probe, device):
         "offset_size",
         "device",
         "direct_without_parallel",
+        "scatter_without_direct",
     ],
 )
 def test_invalid_contracts(probe, case):
@@ -266,6 +278,10 @@ def test_invalid_contracts(probe, case):
     elif case == "direct_without_parallel":
         with pytest.raises(RuntimeError, match="requires 1024 threads"):
             probe.module.run_into(ids, *outputs, block, False, False)
+        return
+    elif case == "scatter_without_direct":
+        with pytest.raises(RuntimeError, match="requires direct count"):
+            probe.module.run_into(ids, *outputs, block, True, True, True)
         return
     with pytest.raises(RuntimeError):
         probe.run_into(ids, *outputs, block)

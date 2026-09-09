@@ -80,15 +80,17 @@ __global__ void count_prefix(const int* ids, int* sorted, int* experts,
 // scanning popcounts gives stable output positions without atomics or a sort.
 // At the largest shape all CTAs collectively read 72 MiB of route IDs. This
 // deliberate L2-traffic tradeoff must be measured; it is not a bandwidth claim.
+template<int SCATTER_THREADS>
 __global__ void scatter_bitmap(const int* ids, int* sorted, const int* offsets,
                                int numel) {
+    static_assert(SCATTER_THREADS == 256 || SCATTER_THREADS == 512);
     const int expert = blockIdx.x, tid = threadIdx.x;
     if (offsets[expert] == offsets[expert + 1]) return;  // CTA-uniform
     __shared__ unsigned bitmap[MAX_WORDS];
-    using Scan = cub::BlockScan<int, THREADS>;
+    using Scan = cub::BlockScan<int, SCATTER_THREADS>;
     __shared__ typename Scan::TempStorage scan;
     const int words = (numel + 31) / 32;
-    for (int base = 0; base < numel; base += THREADS) {
+    for (int base = 0; base < numel; base += SCATTER_THREADS) {
         const int i = base + tid;
         const bool selected = i < numel && ids[i] == expert;
         const unsigned mask = __ballot_sync(0xffffffffu, selected);
@@ -96,7 +98,7 @@ __global__ void scatter_bitmap(const int* ids, int* sorted, const int* offsets,
     }
     __syncthreads();
 
-    constexpr int ITEMS = MAX_WORDS / THREADS;
+    constexpr int ITEMS = MAX_WORDS / SCATTER_THREADS;
     int counts[ITEMS], starts[ITEMS];
     unsigned masks[ITEMS];
     #pragma unroll

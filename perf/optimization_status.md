@@ -25527,3 +25527,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   The existing --jit-monitor-verbose logs every monitored compilation with
   details; use it for the next serving diagnostic (not a baseline). No monitor
   code changed and no causal attribution of that gap is established yet.
+
+### 512-thread stable scatter isolated; functional/control gates pass
+
+- Only scatter CTA width changes from 256 to 512 with direct1024 counting
+  fixed. The probe keeps every prior policy and rejects scatter512 without
+  direct counting. No serving dispatch or installed native binary changes.
+  Probe SHA9b1ed1328d49b0f723cb2b33f9f06d2b18e91c271296eac5e8057e9e16116d5c,
+  separate stable-align-scatter-probe-build. Scatter512 uses 38 registers,
+  11,424 shared bytes, zero stack/local bytes; 344 encoded instructions.
+- All four old GPU bodies are instruction-identical including both encoded
+  words (only scatter256's template symbol changes): 400/720/584/752
+  instructions. Raw runtime-control/stable-align-scatter-sass-comparison.json
+  SHAf75fb67443efca705c136ec7ac26074d359791210f2bf409e213ef043ee940fb.
+- 520 functional cases pass in 22.40s, 130 per policy, including actual routes,
+  poisoned full-capacity outputs, redzones, graphs, device/stream and invalid
+  contracts. Fourteen Torch deprecation warnings; no failures/replacements.
+  Test SHA2078ad945e5598e3a60bc61eba12072f87d9626cf95e71b5c87e11acc1e6ad5b.
+- Fixed next gate: full 520-case memcheck and synccheck, then eight bounded
+  race processes: policies256/1024/direct/scatter512 at M17/M8192, first two
+  matching glm_stable_align launches each. Require zero errors/hazards.
+  Then --parallel-scatter on the same 32 cases, five comparisons (atomic,
+  atomic+sort, original-stable, parallel-stable, direct-stable), 12,000 samples
+  under stable-align-scatter-timing/. Source/native freeze; no exclusions,
+  retries or overlapping GPU work. No new latency or serving TPS claim yet.

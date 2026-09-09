@@ -9,8 +9,11 @@
 using torch::Tensor;
 
 void run_into(Tensor ids, Tensor sorted, Tensor experts, Tensor padded,
-              Tensor offsets, int64_t block, bool parallel_count, bool aggregate) {
+              Tensor offsets, int64_t block, bool parallel_count, bool aggregate,
+              bool parallel_scatter) {
     TORCH_CHECK(aggregate || parallel_count, "direct count requires 1024 threads");
+    TORCH_CHECK(!parallel_scatter || (parallel_count && !aggregate),
+                "parallel scatter requires direct count");
     TORCH_CHECK(ids.is_cuda() && ids.scalar_type() == torch::kInt32 &&
                 ids.is_contiguous() && ids.dim() == 2 && ids.size(0) >= 17 &&
                 ids.size(0) <= 8192 && ids.size(1) == 8,
@@ -38,12 +41,15 @@ void run_into(Tensor ids, Tensor sorted, Tensor experts, Tensor padded,
         ids.data_ptr<int>(), sorted.data_ptr<int>(), experts.data_ptr<int>(),
         padded.data_ptr<int>(), offsets.data_ptr<int>(), numel, block, capacity, blocks);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    tms::glm_stable_align::scatter_bitmap<<<288, 256, 0, stream>>>(
+    auto scatter = parallel_scatter ? tms::glm_stable_align::scatter_bitmap<512>
+                                    : tms::glm_stable_align::scatter_bitmap<256>;
+    scatter<<<288, parallel_scatter ? 512 : 256, 0, stream>>>(
         ids.data_ptr<int>(), sorted.data_ptr<int>(), offsets.data_ptr<int>(), numel);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::vector<Tensor> run(Tensor ids, int64_t block, bool parallel_count, bool aggregate) {
+std::vector<Tensor> run(Tensor ids, int64_t block, bool parallel_count, bool aggregate,
+                       bool parallel_scatter) {
     TORCH_CHECK(ids.dim() == 2 && ids.size(0) >= 17 && ids.size(0) <= 8192 &&
                 ids.size(1) == 8, "expected [17..8192,8] IDs");
     TORCH_CHECK(block == 8 || block == 16 || block == 32 || block == 48 || block == 64,
@@ -55,15 +61,17 @@ std::vector<Tensor> run(Tensor ids, int64_t block, bool parallel_count, bool agg
     auto experts = torch::empty({(capacity + block - 1) / block}, options);
     auto padded = torch::empty({1}, options);
     auto offsets = torch::empty({289}, options);
-    run_into(ids, sorted, experts, padded, offsets, block, parallel_count, aggregate);
+    run_into(ids, sorted, experts, padded, offsets, block, parallel_count, aggregate,
+             parallel_scatter);
     return {sorted, experts, padded};
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("run", &run, pybind11::arg("ids"), pybind11::arg("block"),
-          pybind11::arg("parallel_count") = false, pybind11::arg("aggregate") = true);
+          pybind11::arg("parallel_count") = false, pybind11::arg("aggregate") = true,
+          pybind11::arg("parallel_scatter") = false);
     m.def("run_into", &run_into, pybind11::arg("ids"), pybind11::arg("sorted"),
           pybind11::arg("experts"), pybind11::arg("padded"), pybind11::arg("offsets"),
           pybind11::arg("block"), pybind11::arg("parallel_count") = false,
-          pybind11::arg("aggregate") = true);
+          pybind11::arg("aggregate") = true, pybind11::arg("parallel_scatter") = false);
 }
