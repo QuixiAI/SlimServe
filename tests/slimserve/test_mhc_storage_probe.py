@@ -24,6 +24,18 @@ def test_storage_probe_rejects_nan_and_any_output_difference():
         exact([value], [value.float()])
 
 
+def test_exact_probe_checks_signed_zero_and_rejects_nan():
+    for dtype in (torch.float32, torch.bfloat16):
+        positive = torch.tensor([0.0], dtype=dtype)
+        negative = torch.tensor([-0.0], dtype=dtype)
+        assert torch.equal(positive, negative)
+        with pytest.raises(AssertionError, match="signed zero"):
+            exact([positive], [negative])
+        nan = torch.tensor([float("nan")], dtype=dtype)
+        with pytest.raises(AssertionError, match="bit-exact"):
+            exact([nan], [nan.clone()])
+
+
 @pytest.mark.parametrize("shared", [False, True])
 @pytest.mark.parametrize("banks", [2, 6])
 def test_timing_banks_share_only_activations_when_requested(monkeypatch, shared, banks):

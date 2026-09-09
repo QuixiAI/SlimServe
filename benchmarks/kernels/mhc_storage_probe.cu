@@ -10,7 +10,7 @@
 using torch::Tensor;
 using namespace tms::dsv4_mhc;
 
-template <bool FUSED, typename FnT>
+template <bool FUSED, typename FnT, bool PAIRED_FN = false>
 std::vector<Tensor> run_typed(
     Tensor x, Tensor residual, Tensor post, Tensor comb, Tensor fn,
     Tensor scale, Tensor base) {
@@ -50,7 +50,8 @@ std::vector<Tensor> run_typed(
             args, 0, stream));
     } else {
         if (T >= 64) {
-            auto kernel = partials_prefill<FUSED, 4096, FnT>;
+            auto kernel = partials_prefill<
+                FUSED, 4096, FnT, PAIRED_FN && std::is_same_v<FnT, __nv_bfloat16>>;
             static const auto configured = cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, PREFILL_SMEM);
             C10_CUDA_CHECK(configured);
@@ -71,6 +72,7 @@ std::vector<Tensor> run_typed(
     return {residual_out, next_post, next_comb, out};
 }
 
+template <bool PAIRED_FN>
 std::vector<Tensor> run(
     Tensor x, Tensor residual, Tensor post, Tensor comb, Tensor fn,
     Tensor scale, Tensor base, bool fused) {
@@ -88,6 +90,10 @@ std::vector<Tensor> run(
         TORCH_CHECK(t.scalar_type() == torch::kFloat32, "expected FP32 parameters");
     TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
                 fn.scalar_type() == torch::kBFloat16, "expected FP32 or BF16 fn");
+    if constexpr (PAIRED_FN) {
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(fn.data_ptr()) % 4 == 0,
+                    "paired fn staging requires a four-byte-aligned allocation");
+    }
     const int T = residual.size(0);
     TORCH_CHECK(x.sizes() == at::IntArrayRef({T, 4096}) &&
                 post.sizes() == at::IntArrayRef({T, 4}) &&
@@ -95,7 +101,7 @@ std::vector<Tensor> run(
                 fn.sizes() == at::IntArrayRef({24, 16384}) &&
                 scale.numel() == 3 && base.numel() == 24,
                 "unexpected probe parameter shape");
-#define RUN(F, TYPE) run_typed<F, TYPE>(x, residual, post, comb, fn, scale, base)
+#define RUN(F, TYPE) run_typed<F, TYPE, PAIRED_FN>(x, residual, post, comb, fn, scale, base)
     if (fn.scalar_type() == torch::kBFloat16) {
         if (fused) return RUN(true, __nv_bfloat16);
         return RUN(false, __nv_bfloat16);
@@ -106,5 +112,6 @@ std::vector<Tensor> run(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run", &run);
+    m.def("run", &run<false>);
+    m.def("run_paired", &run<true>);
 }

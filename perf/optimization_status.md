@@ -22786,3 +22786,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/fp8-cache-control/{summary,analysis}.json,
   runtime-control/fp8-cache-control.log. Analysis groups all15paired rounds
   per shape/batch, not best cases or medians selected by layer.
+
+## 2026-09-08: Prepare isolated paired BF16 mHC prefill staging
+
+- Status: prepared, not built or GPU-qualified; no serving change. The live
+  B12X cold-prefix series owns the GPUs and its loaded benchmark sources stay
+  frozen. Only independent probe/header code and this notebook change here.
+- Baseline: the opt-in BF16 fn storage candidate gives about0.5% c1 serving
+  improvement, but its scalar fn staging adds about0.45 ms across90 mHC sites
+  in a7616-token prefill chunk. It remains defaultOFF.
+- Hypothesis: pairing adjacent BF16 loads, exact FP32 conversions and float2
+  shared stores reduces staging instructions without changing arithmetic,
+  shared layout, reduction order or the quant. A new template argument defaults
+  false for every serving caller; only mhc_storage_probe.run_paired enables it.
+  The probe rejects misaligned fn allocations. No alternate persistent weights.
+- Correctness plan: all90 actual fn/base/scale sites, three input magnitudes,
+  pre/fused transitions, changing graph inputs, batches1/2/4/8/9/16/32/63/64/
+  65/128/129/7616. Require installed FP32/BF16 parity, now including signed
+  zero bits rather than only torch.equal; nonfinite output remains rejected.
+- Prescribed timing: five A/B/A rounds with installed BF16 as A/A2 and the
+  paired candidate as B, batches64/128/129/7616, four graph replays/phase.
+  Six distinct parameter banks (405 MiB BF16 fn, greater than3x L2), shared
+  immutable activation buffers to bound full-prefill allocation. This is an
+  isolated memory-layout control, not a whole-model dependency simulation.
+- CPU helper tests8pass; GPU build/parity/timing and sanitizer results owed.
+  New scratch build directory: mhc-storage-paired-build. Do not overwrite
+  earlier extensions or promote a profile from this isolated probe alone.
+- Raw: perf/results/2026-09-08/runtime-control/mhc-paired-cpu-tests.xml.

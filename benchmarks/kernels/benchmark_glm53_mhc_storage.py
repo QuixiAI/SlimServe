@@ -41,6 +41,12 @@ def exact(reference, candidate):
     for i, (a, b) in enumerate(zip(reference, candidate)):
         if a.dtype != b.dtype or not torch.equal(a, b):
             raise AssertionError(f"output {i} is not bit-exact")
+        if not torch.equal(
+            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
+        ):
+            raise AssertionError(
+                f"output {i} has different bits (including signed zero)"
+            )
 
 
 def timing_rows(sites, narrow, batch, shared_activations=False, weight_banks=2):
@@ -83,6 +89,11 @@ def main():
         help="compare probe BF16 to probe FP32 or the installed BF16 operator",
     )
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument(
+        "--paired-prefill-fn",
+        action="store_true",
+        help="isolated paired BF16 staging candidate; serving kernels stay unchanged",
+    )
     parser.add_argument(
         "--weight-banks",
         type=int,
@@ -133,6 +144,7 @@ def main():
     extension = build(args.build_dir, name="mhc_storage_probe")
     if args.build_only:
         return
+    candidate_run = extension.run_paired if args.paired_prefill_fn else extension.run
     from vllm.quixicore.ops import quixicore_ops as qc
 
     root = Path(__file__).resolve().parents[2]
@@ -209,7 +221,7 @@ def main():
                         result["checks"].append(row)
                         original = extension.run(*data, fused)
                         exact(installed(data, fused), original)
-                        exact(original, extension.run(*candidate, fused))
+                        exact(original, candidate_run(*candidate, fused))
                         if args.check_installed_bf16:
                             exact(original, installed(candidate, fused))
                         # Both storage forms share the same changing activations.
@@ -217,7 +229,7 @@ def main():
                         torch.cuda.synchronize()
                         with torch.cuda.graph(graph):
                             a = extension.run(*data, fused)
-                            b = extension.run(*candidate, fused)
+                            b = candidate_run(*candidate, fused)
                             c = (
                                 installed(candidate, fused)
                                 if args.check_installed_bf16
@@ -249,7 +261,8 @@ def main():
             def timed_call(row, variant):
                 if variant == 0 and args.timing_baseline == "installed-bf16":
                     return installed(row[1], row[2])
-                return extension.run(*row[variant], row[2])
+                call = candidate_run if variant else extension.run
+                return call(*row[variant], row[2])
 
             for variant in (0, 1):
                 for row in rows:
@@ -271,7 +284,9 @@ def main():
                 "narrow_fn_l2_ratio": size / (128 * 2**20),
                 "shared_activations": args.shared_activations,
                 "baseline": args.timing_baseline,
-                "candidate": "probe-bf16",
+                "candidate": "probe-bf16-paired-prefill"
+                if args.paired_prefill_fn
+                else "probe-bf16",
                 "capture_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
                 "rounds": [],
             }

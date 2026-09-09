@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
 #include <cuda/std/functional>
+#include <type_traits>
 
 namespace tms::dsv4_mhc {
 
@@ -138,7 +139,7 @@ constexpr size_t PREFILL_SMEM =
     size_t(MIXES) * PREFILL_FN_STRIDE * sizeof(float) +
     size_t(PREFILL_TILE) * PREFILL_V_STRIDE * sizeof(__nv_bfloat16);
 
-template <bool FUSED_POST, int HIDDEN_SIZE, typename FnT>
+template <bool FUSED_POST, int HIDDEN_SIZE, typename FnT, bool PAIRED_FN = false>
 __global__ void __launch_bounds__(THREADS) partials_prefill(
     const __nv_bfloat16* __restrict__ x,
     const __nv_bfloat16* __restrict__ residual,
@@ -168,12 +169,30 @@ __global__ void __launch_bounds__(THREADS) partials_prefill(
     const int dim_split = split * DIMS;
 
     // Local flat l in [0, 512): stream l / 128, dim dim_split + l % 128.
-    for (int i = tid; i < MIXES * PREFILL_FLATS; i += THREADS) {
-        const int output = i / PREFILL_FLATS;
-        const int l = i - output * PREFILL_FLATS;
-        const int stream = l / DIMS;
-        fn_tile[output * PREFILL_FN_STRIDE + l] =
-            float(fn[output * TOTAL + stream * HIDDEN_SIZE + dim_split + (l - stream * DIMS)]);
+    // Diagnostic instantiation only; all serving callers retain PAIRED_FN=false.
+    // Pair adjacent BF16 loads and exact FP32 conversions without changing the
+    // shared layout, arithmetic or reduction order. DIMS/strides and the
+    // 16-byte shared base make every source pair and float2 store aligned.
+    if constexpr (PAIRED_FN && std::is_same_v<FnT, __nv_bfloat16>) {
+        static_assert(PREFILL_FN_STRIDE % 2 == 0 && DIMS % 2 == 0);
+        for (int pair = tid; pair < MIXES * PREFILL_FLATS / 2; pair += THREADS) {
+            const int i = 2 * pair;
+            const int output = i / PREFILL_FLATS;
+            const int l = i - output * PREFILL_FLATS;
+            const int stream = l / DIMS;
+            const auto packed = *reinterpret_cast<const __nv_bfloat162*>(
+                fn + output * TOTAL + stream * HIDDEN_SIZE + dim_split + (l - stream * DIMS));
+            *reinterpret_cast<float2*>(fn_tile + output * PREFILL_FN_STRIDE + l) =
+                __bfloat1622float2(packed);
+        }
+    } else {
+        for (int i = tid; i < MIXES * PREFILL_FLATS; i += THREADS) {
+            const int output = i / PREFILL_FLATS;
+            const int l = i - output * PREFILL_FLATS;
+            const int stream = l / DIMS;
+            fn_tile[output * PREFILL_FN_STRIDE + l] =
+                float(fn[output * TOTAL + stream * HIDDEN_SIZE + dim_split + (l - stream * DIMS)]);
+        }
     }
     // Staging: thread (t = tid / 8, g = tid % 8) owns token t and dims
     // dim_split + g * 16 .. + 16 as two 8-wide chunks; 16-byte loads, all of
