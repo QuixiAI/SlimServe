@@ -120,7 +120,12 @@ def prepare_case(weights, batch, record, layer_id):
         "refs": refs,
         "input": x,
         "routing_weights": topk_weights,
-        "outputs": {"gate_up": gate, "down": down, "moe": down},
+        "outputs": {
+            "gate_up": gate,
+            "activation": down_input,
+            "down": down,
+            "moe": down,
+        },
         "identity": {
             "layer": layer_id,
             "batch": batch,

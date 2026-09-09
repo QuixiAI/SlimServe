@@ -41,6 +41,9 @@ def oracle(model, layer, rank, expert_ids, x, routing_weights):
         "weight_map"
     ]
     output = torch.empty(len(expert_ids), 8, 4096, dtype=torch.bfloat16)
+    gate_up = torch.empty(len(expert_ids), 8, 1024, dtype=torch.bfloat16)
+    activations = torch.empty(len(expert_ids), 8, 512, dtype=torch.bfloat16)
+    gate_up_exact = torch.empty_like(gate_up, dtype=torch.float64)
     with ExitStack() as stack:
         shards = {}
 
@@ -73,12 +76,15 @@ def oracle(model, layer, rank, expert_ids, x, routing_weights):
                 prefix = f"model.language_model.layers.{layer}.mlp.experts.{expert}."
                 gate, gg = projection(prefix + "gate_proj.", x[token])
                 up, gu = projection(prefix + "up_proj.", x[token])
+                gate_up_exact[token, route] = torch.cat([gate * gg, up * gu])
+                gate_up[token, route] = gate_up_exact[token, route].to(torch.bfloat16)
                 gate = (gate * gg).to(torch.bfloat16).double().clamp(max=10)
                 up = (up * gu).to(torch.bfloat16).double().clamp(-10, 10)
                 # The installed activation kernel returns BF16 SiLU before the
                 # separate up multiply, even in its vectorized clamp path.
                 silu = torch.nn.functional.silu(gate).to(torch.bfloat16).double()
                 activated = (silu * up).to(torch.bfloat16)
+                activations[token, route] = activated
                 down, gd = projection(prefix + "down_proj.", activated, down=True)
                 # The existing weighted Marlin epilogue rounds the dot product
                 # and (global scale * routing weight) separately to BF16, then
@@ -93,7 +99,12 @@ def oracle(model, layer, rank, expert_ids, x, routing_weights):
                 output[token, route] = (
                     down.to(torch.bfloat16).double() * final_scale
                 ).to(torch.bfloat16)
-    return output.flatten(0, 1)
+    return {
+        "moe": output.flatten(0, 1),
+        "gate_up": gate_up.flatten(0, 1),
+        "activation": activations.flatten(0, 1),
+        "gate_up_exact": gate_up_exact.flatten(0, 1),
+    }
 
 
 def errors(value, ref):
@@ -185,12 +196,20 @@ def main():
                         "expert_ids": case["identity"]["expert_ids"],
                     }
                     result["cases"].append(row)
-                    outputs = {}
+                    outputs, intermediates = {}, {}
                     for name, graph in graphs.items():
                         graph.replay()
                         torch.cuda.synchronize()
                         outputs[name] = case["outputs"]["moe"].cpu()
-                        row[name] = errors(outputs[name], reference)
+                        row[name] = errors(outputs[name], reference["moe"])
+                        intermediates[name] = {
+                            phase: case["outputs"][phase].cpu()
+                            for phase in ("gate_up", "activation")
+                        }
+                        row[name]["intermediates"] = {
+                            phase: errors(value, reference[phase])
+                            for phase, value in intermediates[name].items()
+                        }
                     row["candidate_vs_auto"] = errors(
                         outputs["candidate"], outputs["auto"]
                     )
@@ -198,22 +217,55 @@ def main():
                     # A high-precision oracle changes accumulation order. Require
                     # both implementations to be close, and no material increase
                     # relative to the measured auto-scheduler arithmetic error.
-                    assert row["auto"]["normalized_rms"] < 0.002
-                    assert row["candidate"]["normalized_rms"] < max(
-                        0.0005, row["auto"]["normalized_rms"] * 1.25
+                    row["auto_oracle_pass"] = row["auto"]["normalized_rms"] < 0.002
+                    row["candidate_relative_oracle_pass"] = row["candidate"][
+                        "normalized_rms"
+                    ] < max(0.0005, row["auto"]["normalized_rms"] * 1.25)
+                    try:
+                        torch.testing.assert_close(
+                            outputs["candidate"], outputs["auto"], rtol=0.01, atol=0.01
+                        )
+                        row["candidate_auto_close"] = True
+                    except AssertionError as error:
+                        row["candidate_auto_close"] = False
+                        row["close_error"] = str(error)
+                    row["passes"] = all(
+                        row[k]
+                        for k in (
+                            "auto_oracle_pass",
+                            "candidate_relative_oracle_pass",
+                            "candidate_auto_close",
+                        )
                     )
-                    torch.testing.assert_close(
-                        outputs["candidate"], outputs["auto"], rtol=0.01, atol=0.01
-                    )
+                    if not row["passes"]:
+                        artifact = args.output.with_name(
+                            f"{args.output.stem}-rank{rank}-layer{layer}-replay{replay}.pt"
+                        )
+                        torch.save(
+                            {
+                                "input": case["input"].cpu(),
+                                "reference": reference,
+                                "outputs": outputs,
+                                "intermediates": intermediates,
+                            },
+                            artifact,
+                        )
+                        row["failure_tensors"] = str(artifact)
+                    save()
                     print(json.dumps(row), flush=True)
                 del graphs, case, weights
-        result["status"] = "complete"
+        result["status"] = (
+            "complete"
+            if all(row["passes"] for row in result["cases"])
+            else "failed_gates"
+        )
     except Exception as error:
         result.update(status="failed", error=repr(error))
         save()
         raise
     save()
+    return int(result["status"] != "complete")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -21556,3 +21556,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/marlin-schedule/rotating-sweep.json,
   paired.json, oracle-preflight.json, oracle-rounded-preflight.json and
   oracle-boundaries-preflight.json. Three CPU config/footprint/decode tests pass.
+
+## 2026-09-08: Preserve a stricter Marlin numerical-gate failure
+
+- Status: candidate remains unqualified; no serving dispatcher change.
+- The initial all-rank checker stopped at rank0/layer23/replay2. Extend the
+  diagnostic to finish every predetermined case, retaining the same gates,
+  failing process status and CPU tensors for every failure. No retries or
+  tolerance relaxation. All 36 cases are now collected.
+- All auto/candidate absolute comparisons pass (rtol/atol 0.01). Maximum
+  normalized output RMS versus the independent oracle: auto 0.000442,
+  candidate 0.000592; candidate-versus-auto max 0.000424. One of 36 cases
+  fails the extra relative-oracle rule max(0.0005, 1.25 * auto error).
+- Attribution: the failed case has two BF16 gate/up elements differing from
+  the oracle in each implementation. The candidate-specific larger value
+  is 1.640625 vs oracle-rounded 1.6484375; the high-precision dot product
+  1.6445315105354157 is only 2.605e-7 above their rounding midpoint. That is
+  consistent with changed FP32 reduction order, not evidence of invalid
+  memory access. The other mismatch occurs in both schedules. Propagation
+  through activation/down explains the larger output-level relative error.
+- Decision: do not label this an all-gates pass or retained speedup. Preserve
+  the failed strict diagnostic and examine memory safety before deciding
+  whether a separate serving-quality experiment is justified.
+- Raw: perf/results/2026-09-08/marlin-schedule/oracle-all-ranks.json (early
+  failure), oracle-gate-census.json (all 36, failed_gates), and its named
+  rank0-layer23-replay2.pt intermediate/input/reference tensor artifact.
