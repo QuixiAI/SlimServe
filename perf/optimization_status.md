@@ -23809,3 +23809,47 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   7499406e1e6e1fff6bf7286a5377b90655f83033ce51fdec28b2c354df6b4d6d;
   3e5f3352aee0d115c45db9bce2334b613b0c8574f892cae97a5772c58c304b0b;
   d5e655be65fd7d26d4a15767c2c4ae2bc256a7445c9e30c7cf84299797884c30.
+
+## 2026-09-09: Serialized launches retain variation; bounded score-boundary trace
+
+- Status: serialized TC0 diagnostic COMPLETE, root cause still open. Exactly
+  ONE profile start on605fd7b70/nativeQC4ce801, same benchmark sources/recipe,
+  BF16-storage1; only runtime change CUDA_LAUNCH_BLOCKING=1. All three quality
+  passes complete:12,288 scored tokens,18 positive retrieval contrasts,168
+  quality requests cached0. No retries, concurrent GPU work or source changes.
+- Means -2.724949543/-2.730150430/-2.727182269. Pass1/2,1/3,2/3 respectively:
+  all4096 scores differ; mean absolute0.248074/0.246833/0.250298nat/token;
+  RMS0.426511/0.430341/0.437162; max4.174892/4.113906/5.091904;
+  24/28/25 windows differ by>0.01. Launch serialization did not remove the
+  variation; this neither identifies a culprit nor excludes intra-kernel or
+  cross-rank races. All jobs exit0, GPU release0.900s. Priming throughput is
+  diagnostic-only, not a baseline/regression claim. TC remains OFF.
+- Raw: perf/results/2026-09-09/mhc-quality-serialized-diagnostic/ and
+  runtime-control/mhc-quality-serialized-{diagnostic.log,analysis.json}.
+  Three quality SHA7fb12dbe23d8f4d94efbe6d75ea7026d1b80ff585501bb5f339a1676ce25f358;
+  4c78be0c8bba6d9d43a8d885afa24ea0d2e023a975f22a8bc8b5104ebda2a1cb;
+  30385f1a7cb215d9670327adc1685a5a4f9613cd59df0ef45e5af93353bb47df.
+- Hypothesis for next bounded diagnostic: determine whether variation is
+  already present at the additional prompt-head computation, or first appears
+  in vocab projection/gather, log-softmax, selected-score gather, or the later
+  HTTP result. Do not infer a specific layer from a differing head input: this
+  boundary is after the normal model forward AND next-token bookkeeping.
+- Add opt-in SLIMSERVE_GLM53_SCORE_JOURNAL pointing to runtime-control/
+  mhc-score-trace-config.json. Only GLM, exact640-token window0, exactly three
+  matches per worker, entire uncached639-logit chunk and prompt_logprobs0.
+  Record five ordered tensor SHA/dtype/shape/device stages and small final
+  target/score vectors, config/source SHA and completion. Blocking CPU copies
+  use at most1GiB per tensor; no tensor mutation, changed arithmetic or retained
+  model tensor dumps. Invalid scope/chunk/order/extra match fails explicitly.
+  Disabled by default, no profile change; it is intentionally synchronizing
+  instrumentation, not a timing baseline or proof against hidden races.
+- Prescribed next run: SAME150GiB/no-swap serialized environment and native,
+  TC0/BF16-storage1, ONE glm53-nvfp4-4 start, --boots 1 --repeats 3 --cold-prefix
+  --quality --quality-repeats 3. Output mhc-quality-score-trace-diagnostic/;
+  journal output its score-trace/ directory. Keep the exact full priming and
+  three full quality workloads. No profiler/build, retries or source changes.
+  Require variation to reproduce under the trace, validate all four journals
+  and every score against HTTP, then use the first differing boundary to
+  narrow the next investigation. No quality-threshold change or TC promotion.
+- Validation:23 new CPU cases; full SlimServe suite366passed/one skip,14
+  existing deprecation warnings. Raw runtime-control/mhc-score-journal-cpu-tests.xml.

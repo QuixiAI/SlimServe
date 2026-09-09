@@ -5880,6 +5880,14 @@ class GPUModelRunner(
         if not num_prompt_logprobs_dict:
             return {}
 
+        if not hasattr(self, "_slimserve_score_journal"):
+            from slimserve.score_journal import ScoreJournal
+
+            self._slimserve_score_journal = ScoreJournal.from_env(
+                getattr(self.model_config.hf_config, "model_type", None)
+            )
+        score_journal = self._slimserve_score_journal
+
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = {}
 
         # Since prompt logprobs are a rare feature, prioritize simple,
@@ -5940,7 +5948,24 @@ class GPUModelRunner(
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
             prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            trace_match = (
+                score_journal.begin(
+                    request.prompt_token_ids,
+                    start_idx,
+                    num_logits,
+                    num_prompt_logprobs,
+                    req_id,
+                )
+                if score_journal is not None
+                else None
+            )
+            if trace_match is not None:
+                score_journal.record(
+                    trace_match, "prompt_head_input", prompt_hidden_states
+                )
             logits = self.model.compute_logits(prompt_hidden_states)
+            if trace_match is not None:
+                score_journal.record(trace_match, "logits", logits)
 
             # Get the "target" tokens for each index. For prompt at index i,
             # the token at prompt index i+1 is the "sampled" token we want
@@ -5954,9 +5979,15 @@ class GPUModelRunner(
                 scores = logits.to(torch.float32)
             else:
                 scores = self.sampler.compute_logprobs(logits)
+            if trace_match is not None:
+                score_journal.record(trace_match, "scores", scores)
+                score_journal.record(trace_match, "target_token_ids", tgt_token_ids)
             token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
                 scores, num_prompt_logprobs, tgt_token_ids
             )
+            if trace_match is not None:
+                score_journal.record(trace_match, "selected_logprobs", logprobs)
+                score_journal.finish(trace_match)
 
             # Transfer GPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)

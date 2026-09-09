@@ -135,9 +135,17 @@ tokens/18 positive retrieval contrasts. All three pairs differ on4095-4096
 scores, mean absolute0.240-0.248nat/token, max3.452-3.954;25-28/32 windows differ
 by>0.01. No restart or TC arithmetic is needed to reproduce the variation.
 Raw mhc-quality-repeat-diagnostic/ and runtime-control/mhc-quality-repeat-analysis.json.
-Next: ONE otherwise-identical three-pass diagnostic with CUDA_LAUNCH_BLOCKING=1,
-output mhc-quality-serialized-diagnostic/, to test execution-order sensitivity.
-This cannot by itself locate a culprit or rule out intra-kernel races. TC stays OFF.
+The serialized diagnostic also completes all three passes: all4096 scores differ
+in each pair, mean absolute0.247-0.250nat/token, RMS0.427-0.437, max4.114-5.092.
+All168 quality requests cached0;12,288 scored tokens/18 positive contrasts.
+Raw mhc-quality-serialized-diagnostic/ and its runtime-control analysis. Launch
+completion serialization did not remove the variation; it does not rule out
+intra-kernel/cross-rank issues. Next: ONE same serialized three-pass diagnostic,
+mhc-quality-score-trace-diagnostic/, with an opt-in bounded score journal for
+exact text window0. Fingerprint the prompt-head input, logits, log-softmax,
+target IDs and selected scores on each worker; compare final scores with HTTP.
+Blocking tensor copies deliberately perturb execution, so require the variation
+to reproduce under instrumentation before localizing it. TC stays OFF.
 E2E control/candidate/return157.051/156.928/156.712 c1,
 578.818/578.200/577.166 c8,781.849/779.553/777.069 c16. Candidate medians lie
 between controls, but retain the slower c16 samples. Cold32K2582.669/
