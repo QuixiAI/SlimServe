@@ -29,14 +29,22 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
-Current priority: qualify the spill-free pooled-indexer prefill tile through
-the real profile. Cold-prefill traces identified growing indexer scoring cost;
-RT2/PT128/four warps cuts isolated scoring time ~35-38% across four shapes,
-with changed-input graph, FP64 sampled-score and selection gates passing.
-All 14 full-selection tests pass; full memcheck and targeted changed-input
-racecheck are clean. `VLLM_GLM5_INDEXER_SM120_TILES=1` opts in; the registered
-default remains unchanged until fixed-start serving/quality validation passes.
-Raw: perf/results/2026-09-08/indexer-tiles/. This is not yet an E2E speed claim.
+The spill-free pooled-indexer tile is retained in the RTX6000 profile:
+`VLLM_GLM5_INDEXER_SM120_TILES=1` selects RT2/PT128/four warps. Three fixed
+starts x three repeats plus a prescribed return-to-original control pass all
+exact-token, text/image and expanded quality gates. Cold 32K/128K engine TTFT
+is **2.606/10.933 s**, versus **2.634/11.433 s** in the return control: about
+1%/4.4% lower latency. Decode stays **155.98/574.79/778.96** E2E tok/s at
+c1/c8/c16; the persistent graph gap is unchanged. All 14 full-selection tests,
+changed-input graphs, memcheck, racecheck and synccheck pass. Other platforms
+keep their original geometry. Raw: perf/results/2026-09-08/indexer-tiles/,
+indexer-tile-serving/ and indexer-tile-return-control/.
+
+Current isolated kernel hypothesis: retain mHC fn's original BF16 storage
+with unchanged FP32 arithmetic, rather than its lossless FP32 upcast. The
+probe builds from existing templates and requires bit-exact outputs at all
+90 actual sites; no serving mHC integration yet. Separately, qualify the
+current B12X runtime/collectives before a matched competitive serving control.
 
 The repaired Marlin library has completed the fixed three-start serving campaign:
 all 27 exact timing runs, text/image canaries and expanded quality checks pass.
@@ -59,9 +67,13 @@ context-zero decode, NOT this repository's 1000/300 complete-request TPS.
 Do not divide one by the other or infer greedy sampling from acceptance
 alone. B12X also uses a different NVFP4 checkpoint and FP8 KV. The local
 R24 control (134.0 / 483.7 / 598.6 no-spec) did use our exact-token harness,
-but disabled P2P because its CUDA 13.3 image failed on the host driver.
-R28 is now published with public source mirrors; see the 2026-09-08 audit
-entry in perf/optimization_status.md. A matched current control remains owed.
+but disabled P2P/custom all-reduce after a collective initialization timeout.
+The earlier claim that the CUDA version mismatch explained that failure is
+not established: a model-free R24 container probe now passes every-pair IPC
+writes and all three NCCL reductions with P2P enabled, loading host libcuda
+580.173.02 with CUDA runtime 13.3. Its custom collective is not yet qualified.
+R28.1 is now published with public source mirrors; see the 2026-09-08 audit
+entries in perf/optimization_status.md. A matched current control remains owed.
 
 The operator authorized autonomous continuation and incremental commits on
 2026-09-08. The selected RTX6000 weight recipe is now explicit in the

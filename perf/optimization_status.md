@@ -21965,3 +21965,90 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   P2P enabled with SYS level. This establishes the host control for a later
   container comparison, not the container or its custom all-reduce path.
   Raw: perf/results/2026-09-08/runtime-control/host-native/rank-*.json.
+
+## 2026-09-08: Retain spill-free SM120 indexer geometry
+
+- Status: retained in glm53-nvfp4-4/rtx6000 only. Candidate serving source
+  426282462; native libraries, quant recipe v1, BF16 KV/activations/lm_head,
+  TP4 and recommended sampling remain fixed. Register geometry changes only.
+- Fixed campaign completes all three starts x three repeats at c1/c8/c16:
+  27 timings, 225 exact 1000/300 requests, every text/image canary passes.
+  E2E medians 155.98145/574.78538/778.96278 tok/s; ranges
+  155.72217-156.39868 / 574.06719-578.48707 / 775.66129-781.96297.
+  Client-decode medians 164.64447/588.72725/791.72762. Decode is neutral.
+  Startup 156.059/152.044/154.152 seconds; no discarded starts or retries.
+- Quality: 4096 scored tokens/start, means -2.731303551/-2.733894219/
+  -2.722965098. All six retrieval contrasts pass/start, minimum margin
+  33.6909. No measured aggregate regression; not a quality improvement or
+  full context/long-running capability qualification.
+- Cold prefill: nine measured requests/length, excluding each start's one
+  warmup and subsequent trace requests. All exact 32768/131072 inputs,
+  eight outputs, cached_tokens=0. Global engine TTFT medians
+  2606.200531/10933.482567 ms (NOT medians of boot medians); client medians
+  2647.473819/11045.611923 ms. Engine ranges 2597.346978-2612.523439 /
+  10868.564718-11000.686893 ms. Effective engine-TTFT input rates
+  12573.09237/11988.12905 tok/s. Latency -1.28%/-4.49% versus the repaired
+  baseline; corresponding effective rate +1.30%/+4.70%, not pure GPU rates.
+- Prescribed return-to-original start completes with flag 0, same workload
+  order, three repetitions, all gates pass. E2E medians
+  156.17927/575.09095/778.21262; startup 150.104 s. Quality mean
+  -2.730322795, all six contrasts pass. Engine TTFT 2634.221357/11433.337876
+  ms; client 2678.190737/11558.861897 ms. Candidate latency is lower by
+  1.06%/4.37% against this control; the gain survives temporal return testing.
+- Rank0 late sampled 128K prefill chunk: candidate indexer scoring 42.813 ms,
+  original return 68.858 ms (44 scoring launches). Return whole-step span
+  651.233 ms versus candidate 622.791 ms; other operations/host gaps vary,
+  so do not attribute the entire span difference to the kernel. The trace
+  samples only the first eight prefill chunks. First-start candidate decode
+  graph remains 1185 nodes, mean span 5.740 ms/no-active-kernel 0.427 ms.
+- Decision: enable the tile flag in the RTX6000 registry record; retain
+  explicit flag 0 for controlled comparisons and other platform geometries.
+  Full selection and three sanitizer gates were recorded above; all 151 CPU
+  SlimServe tests pass after profile promotion, including platform scoping.
+  No failed
+  experimental kernel is added to the serving path. Broader context/quality,
+  persistent graph latency and matched current B12X control remain open.
+- Command: systemd user scope, MemoryMax=150G/MemorySwapMax=0, env -u
+  NCCL_P2P_DISABLE CUDA_VISIBLE_DEVICES=0,1,2,3 SLIMSERVE_CACHE=/raid/weights
+  CUDA_HOME=/usr/local/cuda-13.0
+  VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache
+  VLLM_GLM5_INDEXER_SM120_TILES=1 .venv/bin/python
+  benchmarks/benchmark_glm53_campaign.py
+  --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt
+  --output perf/results/2026-09-08/indexer-tile-serving
+  --boots 3 --repeats 3 --traces --quality --prefill --prefill-traces.
+  Return control changes only flag to 0, boots to 1 and output directory.
+- Raw: perf/results/2026-09-08/indexer-tile-serving/ and
+  indexer-tile-return-control/, including native hashes, commands, all requests,
+  logs and all-rank traces. Rank0 analyses are in each boot-1 directory.
+
+## 2026-09-08: R24 model-free runtime qualification
+
+- Status: runtime control passes; custom collective and serving unqualified.
+  Local image ab4ff9d6fef8 (jovian-judgement-community-20260904-r24), unchanged
+  host driver/power/clocks. Portable probe commit 4edb3b90b; four ranks,
+  P2P enabled/SYS, each exports 4096 bytes and verifies all three peers'
+  distinct remote writes. BF16 NCCL reductions of 2/8192/62390272 bytes
+  are exact on every rank. CUDA driver/runtime 13000/13030, NCCL 2.31.2.
+- Loaded libraries on every rank: host /usr/lib/x86_64-linux-gnu/
+  libcuda.so.580.173.02, /usr/local/cuda-13.3/targets/x86_64-linux/lib/
+  libcudart.so.13.3.29, /opt/local-inference/nccl/lib/libnccl.so.2.31.2.
+  Default image LD_LIBRARY_PATH was retained; presence of a compat directory
+  in that variable did NOT establish that a compat libcuda was loaded.
+- This falsifies the blanket claim that the container's CUDA version alone
+  requires disabling P2P. It does not reproduce or explain the old B12X
+  custom-buffer setup timeout. The old stack stopped at import-open status
+  exchange; no originating CUDA error was recorded.
+- Source observation: R24 b12x/comm/pcie/_cuda_ipc.py declares a 128-byte
+  ctypes handle, while the same image's driver_types.h defines
+  CUDA_IPC_HANDLE_SIZE=64. The portable probe uses 64. This ABI discrepancy
+  merits a focused wrapper/control comparison; it is not yet the root cause.
+- Initial diagnostic launch with --network none could not resolve torchrun's
+  container hostname and was stopped before any GPU operation. Exit 143;
+  no measurement or CUDA failure. Rerun with --network host passes. Both
+  attempts were bounded by 150 s, 16 GiB container/systemd caps, zero swap;
+  container was read-only with temporary /tmp and /cache, mounted only the
+  probe and result directory, and never loaded model weights.
+- Raw: perf/results/2026-09-08/runtime-control/r24-default/rank-*.json.
+  Host control remains host-native/. Next isolate B12X's actual wrapper and
+  custom setup before attempting a matched latest-image serving comparison.

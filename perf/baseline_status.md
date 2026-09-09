@@ -1919,6 +1919,51 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 spill-free indexer baseline - 2026-09-08
+
+Serving source 426282462, unchanged repaired native libraries and pinned recipe
+v1, TP4 no-spec, BF16 KV/activations/lm_head. RT2/PT128/four-warps prefill
+indexer geometry is now selected by the RTX6000 profile. Other platforms keep
+their original geometry. Three predetermined starts x three repeats, exact
+1000/300, recommended sampling; all 27 runs/225 requests and text/image canaries
+pass. Startup times: 156.06/152.04/154.15 seconds, all retained.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median |
+| ---: | ---: | ---: |
+| 1 | 155.98 [155.72, 156.40] | 164.64 |
+| 8 | 574.79 [574.07, 578.49] | 588.73 |
+| 16 | 778.96 [775.66, 781.96] | 791.73 |
+
+Decode is performance-neutral. First-start c1 graph still has 1185 kernels,
+5.740 ms mean span and 0.427 ms without an active kernel. No claim that the
+persistent slow graph state is fixed. Each start scores 4096 continuation
+tokens; means -2.731303551/-2.733894219/-2.722965098, all six retrieval
+contrasts pass per start, minimum margin 33.6909. These checks show no measured
+regression, not a quality improvement or full-context capability qualification.
+
+Cold prefill: one warmup plus three measured requests per length per start,
+exact input lengths/eight output tokens and explicit cached_tokens=0. Medians
+below include all nine measurements per length, excluding warmups and traces.
+
+| Exact input tokens | Client TTFT ms | Engine scheduled-to-first-token ms [min, max] | Effective input tok/s, engine TTFT |
+| ---: | ---: | ---: | ---: |
+| 32768 | 2647.47 | 2606.20 [2597.35, 2612.52] | 12573.09 |
+| 131072 | 11045.61 | 10933.48 [10868.56, 11000.69] | 11988.13 |
+
+Versus the repaired baseline below, engine TTFT falls 1.28%/4.49% at
+32K/128K. A prescribed return-to-original start (three repeats, same full
+workload order) restores 2634.22/11433.34 ms, confirming 1.06%/4.37% lower
+latency with the candidate. Its E2E medians 156.18/575.09/778.21 and all
+canaries/quality gates pass. No best-start selection. Engine TTFT is not pure
+GPU time; neither table is comparable to B12X's different published workload.
+
+Safety: all 14 full-selection GPU tests pass, including changed-input graphs;
+memcheck, targeted racecheck and synccheck report zero errors. Isolated scoring
+time falls ~35-38% across four shapes; actual serving trace confirms 158
+registers, 16 KiB shared memory and the expected lower scoring time.
+Raw: perf/results/2026-09-08/{indexer-tiles,indexer-tile-serving,
+indexer-tile-return-control}/. Original Marlin repair baseline remains below.
+
 ### RTX6000 Marlin repair and cold-prefill baseline - 2026-09-08
 
 Commit b4388034d, pinned recipe v1, TP4 no-spec, BF16 KV/activations/lm_head.

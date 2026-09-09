@@ -40,6 +40,14 @@ def test_every_profile_resolves_on_a_platform_it_claims():
             assert plan.engine, "a profile with no engine settings would serve nothing"
 
 
+def test_glm53_spill_free_indexer_geometry_is_rtx6000_scoped():
+    key = "VLLM_GLM5_INDEXER_SM120_TILES"
+    rtx = resolve("glm53-nvfp4-4", "rtx6000", 4, None)
+    assert rtx.env[key] == "1"
+    for profile, count in (("glm53-nvfp4-4", 4), ("glm53-nvfp4-8", 8)):
+        assert key not in resolve(profile, "a100", count, None).env
+
+
 def test_every_profile_uses_dspark_with_turboquant():
     for profile_id in registry.profile_ids():
         entry = registry.describe(profile_id)
