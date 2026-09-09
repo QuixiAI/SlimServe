@@ -21,6 +21,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from benchmark_glm53_campaign import LOADED_BENCHMARK_SOURCES, require_benchmark_sources
 from benchmark_glm53_server import run as run_workload
 from benchmark_glm53_server import tokenizer_receipt
 
@@ -208,10 +209,13 @@ def run(args):
     record = args.output / "summary.json"
     receipt = {
         "status": "preparing",
+        "benchmark_implementation_sha256": dict(LOADED_BENCHMARK_SOURCES),
         "method": __doc__,
         "image": IMAGE,
         "model_revision": REVISION,
-        "diagnostic_only": args.diagnostic_nccl,
+        "diagnostic_only": args.diagnostic_nccl or getattr(args, "canary_only", False),
+        "canary_only": getattr(args, "canary_only", False),
+        "cold_prefix": getattr(args, "cold_prefix", False),
         "host_cuda_driver": args.host_cuda_driver,
         "fa2_override": fa2_receipt(args),
         "command": sys.argv,
@@ -225,6 +229,7 @@ def run(args):
 
     save()
     try:
+        require_benchmark_sources()
         receipt["image_inspect"] = json.loads(
             command("docker", "image", "inspect", IMAGE)
         )[0]
@@ -257,6 +262,7 @@ def run(args):
         receipt["status"] = "running"
         save()
         for boot in range(1, args.boots + 1):
+            require_benchmark_sources()
             folder = args.output / f"boot-{boot}"
             folder.mkdir()
             name = f"slimserve-b12x-r281-{secrets.token_hex(6)}"
@@ -324,13 +330,18 @@ def run(args):
                             reference_tokenizer=args.reference_tokenizer,
                             output=folder / "workload",
                             repeats=args.repeats,
+                            canary_only=getattr(args, "canary_only", False),
+                            cold_prefix=getattr(args, "cold_prefix", False),
                             quality=True,
                             prefill=True,
                         )
                     )
-                    row["aggregates"] = workload["aggregates"]
-                    row["quality"] = workload["quality"]
-                    row["prefill"] = workload["prefill"]
+                    if getattr(args, "canary_only", False):
+                        row["canaries"] = workload["canaries"]
+                    else:
+                        row["aggregates"] = workload["aggregates"]
+                        row["quality"] = workload["quality"]
+                        row["prefill"] = workload["prefill"]
                     row["status"] = "complete"
             except BaseException as error:
                 row["status"] = "failed"
@@ -369,6 +380,16 @@ def main():
     parser.add_argument("--boots", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--startup-timeout", type=int, default=1200)
+    parser.add_argument(
+        "--cold-prefix",
+        action="store_true",
+        help="use isolated cache salts and require zero cached prompt tokens",
+    )
+    parser.add_argument(
+        "--canary-only",
+        action="store_true",
+        help="diagnostic only: capture text/image replies without timing workloads",
+    )
     parser.add_argument(
         "--diagnostic-nccl",
         action="store_true",

@@ -175,6 +175,7 @@ def _request(
             {"type": "text", "text": prompt},
         ]
     messages = [{"role": "user", "content": content}]
+    events = []
     started = time.perf_counter()
     raw = "".join(
         chat_completion(
@@ -187,12 +188,14 @@ def _request(
             seed=42,
             chat_template_kwargs=plan.chat_template_kwargs or None,
             timeout=timeout,
+            on_event=events.append,
         )
     )
     answer = visible_text(raw)
     return {
         "answer": answer[:500],
         "seconds": time.perf_counter() - started,
+        "response_events": events,
     }
 
 

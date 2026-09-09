@@ -16,6 +16,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import secrets
 import signal
 import statistics
 import subprocess
@@ -41,6 +42,45 @@ from slimserve.smoke import (
 )
 
 
+def benchmark_sources():
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        *(
+            f"benchmarks/{name}.py"
+            for name in (
+                "benchmark_glm53_campaign",
+                "benchmark_glm53_server",
+                "benchmark_glm53_b12x",
+                "benchmark_dsv4_exact",
+                "benchmark_glm53_quality",
+                "benchmark_glm53_prefill",
+            )
+        ),
+        "slimserve/smoke.py",
+        "slimserve/stream.py",
+    ]
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in paths
+    }
+
+
+# Freeze the client sources when Python imports the workload, not per boot.
+# Editing a loaded module does not change the running function's bytecode.
+LOADED_BENCHMARK_SOURCES = benchmark_sources()
+
+
+def require_benchmark_sources():
+    current = benchmark_sources()
+    changed = sorted(
+        name
+        for name in current.keys() | LOADED_BENCHMARK_SOURCES.keys()
+        if current.get(name) != LOADED_BENCHMARK_SOURCES.get(name)
+    )
+    if changed:
+        raise RuntimeError(f"benchmark source changed after import: {changed}")
+    return dict(LOADED_BENCHMARK_SOURCES)
+
+
 def post(base: str, path: str, body: dict | None = None) -> bytes:
     request = urllib.request.Request(
         base + path,
@@ -51,7 +91,9 @@ def post(base: str, path: str, body: dict | None = None) -> bytes:
         return response.read()
 
 
-def request(base, model, prompt, output_tokens, seed, first_event=None):
+def request(
+    base, model, prompt, output_tokens, seed, first_event=None, cache_salt=None
+):
     body = {
         "model": model,
         "prompt": prompt,
@@ -65,6 +107,8 @@ def request(base, model, prompt, output_tokens, seed, first_event=None):
         "return_token_ids": True,
         "stream_options": {"include_usage": True},
     }
+    if cache_salt is not None:
+        body["cache_salt"] = cache_salt
     req = urllib.request.Request(
         base + "/v1/completions",
         data=json.dumps(body).encode(),
@@ -115,15 +159,37 @@ def request(base, model, prompt, output_tokens, seed, first_event=None):
         "token_ids": token_ids,
         "replacement_characters": output.count("\ufffd"),
         "seed": seed,
+        "cache_salt": cache_salt,
     }
 
 
-def round_requests(base, model, prompts, tokens, seed, profile=False):
+def cold_prefix_verified(result):
+    cached = [
+        (row["usage"].get("prompt_tokens_details") or {}).get("cached_tokens")
+        for row in result["requests"]
+    ]
+    return bool(cached) and all(type(value) is int and value == 0 for value in cached)
+
+
+def round_requests(
+    base, model, prompts, tokens, seed, profile=False, cold_prefix=False
+):
+    require_benchmark_sources()
     events = [threading.Event() for _ in prompts]
+    salt = secrets.token_hex(16) if cold_prefix else None
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(len(prompts)) as pool:
         futures = [
-            pool.submit(request, base, model, p, tokens, seed + i, events[i])
+            pool.submit(
+                request,
+                base,
+                model,
+                p,
+                tokens,
+                seed + i,
+                events[i],
+                f"{salt}:{i}" if salt is not None else None,
+            )
             for i, p in enumerate(prompts)
         ]
         if profile:
@@ -138,6 +204,7 @@ def round_requests(base, model, prompts, tokens, seed, profile=False):
         post(base, "/stop_profile")
     decode_window = max(r["last"] for r in rows) - min(r["first"] for r in rows)
     return {
+        "cache_policy": "isolated-cold" if cold_prefix else "profile-default",
         "wall_seconds": wall,
         "aggregate_output_tps": sum(r["usage"]["completion_tokens"] for r in rows)
         / wall,
@@ -221,13 +288,20 @@ def observer_return_rounds(args, base, model, prompts, folder):
     for rep in range(args.repeats):
         for concurrency in args.concurrency:
             result = round_requests(
-                base, model, prompts[concurrency], args.output_tokens, 42
+                base,
+                model,
+                prompts[concurrency],
+                args.output_tokens,
+                42,
+                cold_prefix=getattr(args, "cold_prefix", False),
             )
             result["gpu_after_round"] = gpu_snapshot()
             result["exact"] = all(
                 request["usage"]["prompt_tokens"] == args.input_tokens
                 and request["usage"]["completion_tokens"] == args.output_tokens
                 for request in result["requests"]
+            ) and (
+                not getattr(args, "cold_prefix", False) or cold_prefix_verified(result)
             )
             path = folder / f"observer-return-{rep + 1}-c{concurrency}.json"
             path.write_text(json.dumps(result, indent=2) + "\n")
@@ -260,6 +334,11 @@ def main():
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 16])
     ap.add_argument("--input-tokens", type=int, default=1000)
     ap.add_argument("--output-tokens", type=int, default=300)
+    ap.add_argument(
+        "--cold-prefix",
+        action="store_true",
+        help="isolate every timing request's cache and require zero cached tokens",
+    )
     profiler = ap.add_mutually_exclusive_group()
     profiler.add_argument("--traces", action="store_true")
     profiler.add_argument(
@@ -301,7 +380,7 @@ def main():
     if args.profile not in compatible:
         ap.error(f"profile not compatible; available: {compatible}")
     plan = registry.resolve(args.profile, machine.platform, machine.count, None)
-    if args.prefill:
+    if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(
             plan,
             engine={
@@ -327,6 +406,7 @@ def main():
     }
     command = lambda *cmd: subprocess.check_output(cmd, text=True).strip()
     receipt = {
+        "benchmark_implementation_sha256": require_benchmark_sources(),
         "git_commit": command("git", "rev-parse", "HEAD"),
         "git_status": command("git", "status", "--short"),
         "source_sha256": hashlib.sha256(args.source.read_bytes()).hexdigest(),
@@ -347,6 +427,7 @@ def main():
     }
     record = args.output / "summary.json"
     for boot in range(1, args.boots + 1):
+        require_benchmark_sources()
         active = command(
             "nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"
         )
@@ -374,7 +455,7 @@ def main():
             argv += ["--cuda-profile"]
         if args.routing:
             argv += ["--route-profile-dir", str(folder / "routing")]
-        if args.prefill:
+        if args.prefill or args.cold_prefix:
             argv += ["--request-metrics"]
         run = {"boot": boot, "argv": argv, "status": "starting", "measurements": []}
         if args.routing:
@@ -425,15 +506,29 @@ def main():
                     # measured requests. A short decode warmup can miss JIT
                     # kernels needed only later in a request (GLM: 1088 tokens).
                     warmup = round_requests(
-                        base, model, prompts[c], args.output_tokens, 42
+                        base,
+                        model,
+                        prompts[c],
+                        args.output_tokens,
+                        42,
+                        cold_prefix=args.cold_prefix,
                     )
                     warmup_path = folder / f"warmup-c{c}.json"
                     warmup_path.write_text(json.dumps(warmup, indent=2) + "\n")
                     run["warmups"].append(str(warmup_path))
+                    if args.cold_prefix and not cold_prefix_verified(warmup):
+                        raise ValueError(
+                            "warmup cold-prefix gate requires cached_tokens=0"
+                        )
                 for rep in range(args.repeats):
                     for c in args.concurrency:
                         result = round_requests(
-                            base, model, prompts[c], args.output_tokens, 42
+                            base,
+                            model,
+                            prompts[c],
+                            args.output_tokens,
+                            42,
+                            cold_prefix=args.cold_prefix,
                         )
                         result["gpu_after_round"] = gpu_snapshot()
                         result["exact"] = all(
@@ -459,6 +554,10 @@ def main():
                             f"TTFT {1000 * result['ttft_mean_seconds']:.1f} ms",
                             flush=True,
                         )
+                        if args.cold_prefix and not cold_prefix_verified(result):
+                            raise ValueError(
+                                "cold-prefix gate requires cached_tokens=0"
+                            )
                         if not result["exact"] or any(
                             r["replacement_characters"] for r in result["requests"]
                         ):
@@ -468,17 +567,28 @@ def main():
                 if args.traces or args.cuda_traces:
                     for c in (c for c in args.concurrency if c in (1, 8)):
                         result = round_requests(
-                            base, model, prompts[c], 384, 42, profile=True
+                            base,
+                            model,
+                            prompts[c],
+                            384,
+                            42,
+                            profile=True,
+                            cold_prefix=args.cold_prefix,
                         )
                         (folder / f"profile-c{c}.json").write_text(
                             json.dumps(result, indent=2) + "\n"
                         )
+                        if args.cold_prefix and not cold_prefix_verified(result):
+                            raise ValueError(
+                                "profile cold-prefix gate requires cached_tokens=0"
+                            )
                 if args.cuda_traces:
                     run["observer_return"] = observer_return_rounds(
                         args, base, model, prompts, folder
                     )
                     record.write_text(json.dumps(receipt, indent=2) + "\n")
                 if args.quality:
+                    require_benchmark_sources()
                     from benchmark_glm53_quality import run as run_quality
 
                     quality_path = folder / "quality.json"
@@ -502,6 +612,7 @@ def main():
                     if not quality["summary"]["all_needles_rank_first"]:
                         raise ValueError("needle contrast gate failed")
                 if args.prefill:
+                    require_benchmark_sources()
                     from benchmark_glm53_prefill import run as run_prefill
 
                     prefill_path = folder / "prefill"
@@ -522,6 +633,7 @@ def main():
                         tokenizer,
                     )
                     run["prefill"] = prefill["aggregates"]
+                require_benchmark_sources()
                 run["status"] = "complete"
             except Exception as error:
                 run["status"] = "failed"

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import regex as re
@@ -70,12 +70,14 @@ def chat_completion(
     seed: int | None = None,
     chat_template_kwargs: dict[str, Any] | None = None,
     timeout: float = 600.0,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> Iterator[str]:
     """Yield content deltas from a streaming chat completion.
 
     Sampling parameters are omitted from the request unless given, so the
     server's (i.e. the model's shipped) defaults apply. Greedy decoding is
     never used in this stack; pass `seed` when a run must be repeatable.
+    An optional observer receives each decoded event before field extraction.
     """
     import requests
 
@@ -110,6 +112,8 @@ def chat_completion(
                 chunk = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            if on_event is not None:
+                on_event(chunk)
             for choice in chunk.get("choices") or []:
                 delta = choice.get("delta") or {}
                 # Reasoning models split the reply across fields, and which

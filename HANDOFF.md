@@ -102,8 +102,17 @@ binary qualification also passes all30 cases, bit-exact to the original in
 every case and graph replay. Native library SHA256
 31519f918c17425203dd7aaab19fe8b4c601e7f5ad5164e19aeb2e3f8cde5249;
 76 native SM120 cubins, no PTX. Both containers exit0/no OOM. The next fixed
-three-start serving campaign is b12x-r281-native-serving/ with the explicit
-host-driver/qualified-FA2 adaptations. No TPS claim or vision disabling.
+three-start serving campaign b12x-r281-native-serving/ is complete with the
+explicit host-driver/qualified-FA2 adaptations. All reach health; starts1/2
+fail the image canary with joined text RedRed; start3 passes and completes
+all nine timing rounds/quality/cold prefill. Its75 timed requests all report
+1000 cached prompt tokens versus0 in SlimServe's retained short-prompt data,
+so its155.79/656.40/922.05 E2E medians are NOT a matched cold-prefix baseline.
+Cold32K/128K engine TTFT2.729/11.000s; quality4096-token mean-2.913825,
+all six needles pass. Raw canary fields were not saved; parser duplication
+versus genuine output repetition remains to be isolated. Explicit canary-only
+event capture and --cold-prefix timing with a zero-cache gate are next.
+No vision disabling, canary relaxation, fastest-start selection or quant change.
 `benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
 through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
 SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,

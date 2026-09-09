@@ -144,12 +144,13 @@ def test_fa2_override_requires_complete_matched_numerical_bundle(bench, tmp_path
 
 
 @pytest.mark.parametrize(
-    "fail_kind", ["none", "workload", "startup", "busy", "interrupt"]
+    "fail_kind", ["none", "workload", "startup", "busy", "interrupt", "canary-only"]
 )
 def test_every_prescribed_start_retained_and_only_owned_ids_removed(
     bench, monkeypatch, tmp_path, fail_kind
 ):
     args = settings(bench, tmp_path)
+    args.canary_only = fail_kind == "canary-only"
     lock = b"source lock\n"
     monkeypatch.setattr(bench, "LOCK_SHA256", hashlib.sha256(lock).hexdigest())
     monkeypatch.setattr(bench.subprocess, "check_output", lambda *a, **k: lock)
@@ -207,6 +208,9 @@ def test_every_prescribed_start_retained_and_only_owned_ids_removed(
 
     def workload(options):
         workloads.append(options)
+        if fail_kind == "canary-only":
+            assert options.canary_only
+            return {"canaries": {"text": {"answer": "4"}, "image": {"answer": "red"}}}
         if fail_kind == "interrupt":
             raise KeyboardInterrupt("operator interruption")
         if fail_kind == "workload" and len(workloads) == 1:
@@ -227,7 +231,14 @@ def test_every_prescribed_start_retained_and_only_owned_ids_removed(
     saved = json.loads((args.output / "summary.json").read_text())
     assert saved == receipt
     assert len(receipt["runs"]) == 3
-    assert receipt["status"] == ("complete" if fail_kind == "none" else "failed")
+    assert receipt["status"] == (
+        "complete" if fail_kind in ("none", "canary-only") else "failed"
+    )
+    if fail_kind == "canary-only":
+        assert receipt["diagnostic_only"]
+        assert all(
+            "aggregates" not in row and "canaries" in row for row in receipt["runs"]
+        )
     assert removed == created
     assert len(created) == (0 if fail_kind == "busy" else 3)
     if fail_kind == "workload":

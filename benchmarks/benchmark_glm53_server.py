@@ -20,9 +20,12 @@ import urllib.parse
 from pathlib import Path
 
 from benchmark_glm53_campaign import (
+    LOADED_BENCHMARK_SOURCES,
+    cold_prefix_verified,
     exact_prompts,
     get_tokenizer,
     gpu_snapshot,
+    require_benchmark_sources,
     round_requests,
 )
 from benchmark_glm53_prefill import run as run_prefill
@@ -88,7 +91,9 @@ def tokenizer_receipt(reference, candidate, source, load=get_tokenizer):
     }
 
 
-def check_round(result, concurrency, input_tokens=1000, output_tokens=300):
+def check_round(
+    result, concurrency, input_tokens=1000, output_tokens=300, cold_prefix=False
+):
     if any(
         row["usage"].get("prompt_tokens") != input_tokens
         or row["usage"].get("completion_tokens") != output_tokens
@@ -99,6 +104,8 @@ def check_round(result, concurrency, input_tokens=1000, output_tokens=300):
         raise ValueError("exact-token or replacement-character gate failed")
     if len(result["requests"]) != concurrency:
         raise ValueError("request/concurrency count mismatch")
+    if cold_prefix and not cold_prefix_verified(result):
+        raise ValueError("cold-prefix gate requires cached_tokens=0 for every request")
 
 
 def run(args):
@@ -111,6 +118,7 @@ def run(args):
     record = args.output / "summary.json"
     receipt = {
         "status": "preparing",
+        "diagnostic_only": getattr(args, "canary_only", False),
         "method": __doc__,
         "settings": {
             k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
@@ -122,7 +130,7 @@ def run(args):
             ["git", "status", "--short"], text=True
         ).strip(),
         "implementation_sha256": {
-            name: file_sha256(Path(__file__).parent / name)
+            name: LOADED_BENCHMARK_SOURCES[f"benchmarks/{name}"]
             for name in (
                 "benchmark_glm53_server.py",
                 "benchmark_glm53_campaign.py",
@@ -131,6 +139,7 @@ def run(args):
                 "benchmark_glm53_prefill.py",
             )
         },
+        "benchmark_implementation_sha256": dict(LOADED_BENCHMARK_SOURCES),
         "source_sha256": file_sha256(args.source),
         "canaries": {},
         "warmups": [],
@@ -142,6 +151,7 @@ def run(args):
 
     save()
     try:
+        require_benchmark_sources()
         source = args.source.read_text()
         tokenizer, receipt["tokenizers"] = tokenizer_receipt(
             args.reference_tokenizer, args.tokenizer, source
@@ -168,6 +178,7 @@ def run(args):
                 ]
             )
             started = time.perf_counter()
+            events = []
             raw = "".join(
                 chat_completion(
                     args.url,
@@ -176,15 +187,21 @@ def run(args):
                     max_tokens=256,
                     seed=42,
                     timeout=600,
+                    on_event=events.append,
                 )
             )
             canary = {
                 "answer": visible_text(raw)[:500],
                 "seconds": time.perf_counter() - started,
+                "response_events": events,
             }
             receipt["canaries"][label] = canary
             save()
             _require_match(canary, pattern, label)
+        if getattr(args, "canary_only", False):
+            require_benchmark_sources()
+            receipt["status"] = "complete"
+            return receipt
         for warmup, count in ((True, 1), (False, args.repeats)):
             for rep in range(1, count + 1):
                 for c in (1, 8, 16):
@@ -198,10 +215,19 @@ def run(args):
                     }
                     receipt["warmups" if warmup else "measurements"].append(row)
                     save()
-                    result = round_requests(args.url, args.model, prompts[c], 300, 42)
+                    result = round_requests(
+                        args.url,
+                        args.model,
+                        prompts[c],
+                        300,
+                        42,
+                        cold_prefix=getattr(args, "cold_prefix", False),
+                    )
                     result["gpu_after_round"] = gpu_snapshot()
                     path.write_text(json.dumps(result, indent=2) + "\n")
-                    check_round(result, c)
+                    check_round(
+                        result, c, cold_prefix=getattr(args, "cold_prefix", False)
+                    )
                     row.update({k: v for k, v in result.items() if k != "requests"})
                     row["status"] = "complete"
                     save()
@@ -211,6 +237,7 @@ def run(args):
                         flush=True,
                     )
         if args.quality:
+            require_benchmark_sources()
             quality = run_quality(
                 argparse.Namespace(
                     url=args.url,
@@ -231,6 +258,7 @@ def run(args):
             if not quality["summary"]["all_needles_rank_first"]:
                 raise ValueError("needle contrast gate failed")
         if args.prefill:
+            require_benchmark_sources()
             prefill = run_prefill(
                 argparse.Namespace(
                     url=args.url,
@@ -260,6 +288,7 @@ def run(args):
                 "min": min(values),
                 "max": max(values),
             }
+        require_benchmark_sources()
         receipt["status"] = "complete"
     except Exception as error:
         receipt["status"] = "failed"
@@ -281,8 +310,12 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--quality", action="store_true")
     parser.add_argument("--prefill", action="store_true")
+    parser.add_argument("--canary-only", action="store_true")
+    parser.add_argument("--cold-prefix", action="store_true")
     result = run(parser.parse_args())
-    print(json.dumps(result["aggregates"], indent=2), flush=True)
+    print(
+        json.dumps(result.get("aggregates", result["canaries"]), indent=2), flush=True
+    )
 
 
 if __name__ == "__main__":

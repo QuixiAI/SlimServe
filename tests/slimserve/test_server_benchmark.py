@@ -68,7 +68,11 @@ def result_for(c):
         "client_decode_tps": 110.0,
         "requests": [
             {
-                "usage": {"prompt_tokens": 1000, "completion_tokens": 300},
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 300,
+                    "prompt_tokens_details": {"cached_tokens": 0},
+                },
                 "token_ids": list(range(300)),
                 "replacement_characters": 0,
             }
@@ -97,9 +101,9 @@ def test_incomplete_round_never_becomes_fast_result(bench, defect):
         bench.check_round(result, 1)
 
 
-@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("failure", [None, "counts", "image", "cache", "canary-only"])
 def test_fixed_workload_uses_shared_function_and_retains_failure(
-    bench, monkeypatch, tmp_path, fail
+    bench, monkeypatch, tmp_path, failure
 ):
     source = tmp_path / "source.txt"
     source.write_text("source")
@@ -113,31 +117,53 @@ def test_fixed_workload_uses_shared_function_and_retains_failure(
         repeats=3,
         quality=False,
         prefill=False,
+        cold_prefix=failure == "cache",
+        canary_only=failure == "canary-only",
     )
     monkeypatch.setattr(bench, "tokenizer_receipt", lambda *a: (Tokenizer(), {}))
     monkeypatch.setattr(
         bench, "exact_prompts", lambda tok, src, c, n, off, repeat: ["prompt"] * c
     )
-    monkeypatch.setattr(
-        bench,
-        "chat_completion",
-        lambda url, model, messages, **kw: [
-            "red" if isinstance(messages[0]["content"], list) else "4"
-        ],
-    )
+
+    def chat(url, model, messages, **kwargs):
+        image = isinstance(messages[0]["content"], list)
+        answer = ("RedRed" if failure == "image" else "red") if image else "4"
+        kwargs["on_event"]({"choices": [{"delta": {"content": answer}}]})
+        return [answer]
+
+    monkeypatch.setattr(bench, "chat_completion", chat)
     monkeypatch.setattr(bench, "gpu_snapshot", lambda: "no GPU used")
     calls = []
 
-    def fake_round(url, model, prompts, output, seed):
+    def fake_round(url, model, prompts, output, seed, cold_prefix=False):
+        assert cold_prefix == (failure == "cache")
         calls.append((len(prompts), output, seed))
         result = result_for(len(prompts))
-        if fail and len(calls) == 4:
+        if failure == "counts" and len(calls) == 4:
             result["requests"][0]["usage"]["completion_tokens"] = 299
+        if failure == "cache" and len(calls) == 4:
+            result["requests"][0]["usage"]["prompt_tokens_details"]["cached_tokens"] = (
+                1000
+            )
         return result
 
     monkeypatch.setattr(bench, "round_requests", fake_round)
-    if fail:
-        with pytest.raises(ValueError, match="exact-token"):
+    if failure == "image":
+        with pytest.raises(RuntimeError, match="image check failed"):
+            bench.run(args)
+        receipt = json.loads((args.output / "summary.json").read_text())
+        assert receipt["status"] == "failed"
+        assert (
+            receipt["canaries"]["image"]["response_events"][0]["choices"][0]["delta"][
+                "content"
+            ]
+            == "RedRed"
+        )
+        assert not calls
+    elif failure in ("counts", "cache"):
+        with pytest.raises(
+            ValueError, match="cold-prefix" if failure == "cache" else "exact-token"
+        ):
             bench.run(args)
         receipt = json.loads((args.output / "summary.json").read_text())
         assert receipt["status"] == "failed"
@@ -146,6 +172,10 @@ def test_fixed_workload_uses_shared_function_and_retains_failure(
         assert len(calls) == 4  # No retry or selection of a later successful round.
     else:
         receipt = bench.run(args)
-        assert calls == [(c, 300, 42) for _ in range(4) for c in (1, 8, 16)]
         assert receipt["status"] == "complete"
-        assert all(row["count"] == 3 for row in receipt["aggregates"].values())
+        if failure == "canary-only":
+            assert not calls and "aggregates" not in receipt
+            assert receipt["diagnostic_only"]
+        else:
+            assert calls == [(c, 300, 42) for _ in range(4) for c in (1, 8, 16)]
+            assert all(row["count"] == 3 for row in receipt["aggregates"].values())

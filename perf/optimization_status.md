@@ -22682,3 +22682,61 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Full CPU suite202pass/1GPUskip; Ruff/format pass. No GPU timing or build
   overlaps the active B12X serving campaign.
 - Raw: runtime-control/mhc-bank-{expanded-tests.xml,full-tests.xml}.
+
+## 2026-09-08: B12X reaches serving; canary extraction and cache comparability need repair
+
+- Status: partial serving evidence, not a matched competitive baseline.
+- Fixed three host-driver/native-FA2 starts all reach health in214.070,
+  148.036,134.036s. Starts1/2 fail the unchanged image regex with joined
+  answer RedRed. Start3 returns Red solid image.Red and passes. All servers
+  exit0/no OOM under owned teardown; all failures/logs retained. Do not
+  select the passing start and call this a successful three-start baseline.
+- Start3 completes all nine1000/300 rounds/75requests. E2E medians c1/c8/c16
+  155.788301/656.404496/922.054397; ranges155.787-155.972,
+  648.627-660.078,608.468-948.121. The slow first c16 round is retained;
+  its TTFT .141s resembles the second .136s, but decode takes~7.72s versus
+  ~5s. No unsupported attribution to a first-JIT stall or GPU node gaps.
+- Critical comparability finding: ALL75 measured requests report
+  cached_tokens=1000. The retained SlimServe1000-token requests report0
+  (its hybrid block boundary is1088). Same prompt text/repeats and enabled
+  prefix caching do not imply the same actual cache work. These cached E2E
+  numbers cannot be divided against SlimServe's cold numbers as a win/loss.
+- The separate long-prefill workload already uses unique cache salts and
+  requires explicit cached_tokens=0. It passes all three measurements per
+  length: engine TTFT32K2728.951ms [2726.594,2735.229],
+  128K11000.327ms [10941.398,11044.941]. Client medians2772.910/11095.690ms.
+  Quality:4096 scored tokens,mean logprob-2.913824762; all six retrieval
+  contrasts pass,min margin33.7615. This is one start/different quant,
+  not a general model-quality ranking or qualified full-context baseline.
+- Canary hypothesis: slimserve.stream.chat_completion concatenates both
+  reasoning aliases and content with no channel boundary. Raw events were
+  not saved, so the RedRed origin remains unproven. New optional on_event
+  observer preserves raw canary fields; default text extraction/requests
+  and regex gates remain unchanged. --canary-only is explicitly diagnostic,
+  performs no timing/quality/prefill work, and cannot produce TPS aggregates.
+- Bookkeeping incident: while preparing the observer at04:07 UTC, on-disk
+  stream/smoke/server files briefly differed from the controller's already
+  imported original code. Boot2 recorded the unexecuted server-file hash
+  4a332576... instead of actual loaded3472d419...; its failed canary still
+  executed the original function. Files were restored before boot3; boot1/3
+  hashes match. Raw receipts are not rewritten. New import-time source
+  snapshot/guards reject changes before starts, timing rounds and scoring
+  phases rather than silently hashing newer files as running code.
+- New explicit --cold-prefix uses a unique recorded salt for EVERY timing
+  request, including warmup/profile/observer-return rounds, preserving
+  prompts, token counts and sampling. Require cached_tokens integer0,
+  reject missing/positive/boolean values after retaining raw results. Use
+  this on BOTH stacks for the next comparison; no profile cache disabling.
+  Historical default timing remains available and labeled profile-default.
+- Raw: perf/results/2026-09-08/b12x-r281-native-serving/; all original
+  warmups,75responses,quality JSON,prefill streams and container exit states.
+  First CPU pass215/1skip; final expanded tests recorded separately below.
+
+- Final CPU suite218pass/1GPUskip, including canary-only owned-container
+  teardown, exact request-body preservation under event observation,
+  failed-canary raw retention, source-drift rejection, distinct per-request
+  salts, strict cold-cache values and unchanged observer-return matrices.
+  Ruff/format pass. Raw runtime-control/canary-cache-final-tests.xml.
+- Next prescribed diagnostic: one host/native-FA2 start, --canary-only,
+  unchanged sampling/regex/default field extraction; output
+  b12x-r281-canary-events/. No timing result from this diagnostic.
