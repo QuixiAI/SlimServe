@@ -27,7 +27,7 @@ physics, research digest and phase gates are in
 `perf/optimization_status.md` entry and the record rows are in
 `perf/baseline_status.md`.
 
-## State (2026-09-08, evening) - start here
+## State (2026-09-09, early morning) - start here
 
 Commit identity is Auroter <auroter@users.noreply.github.com>, not Eric Hartford.
 The 61 misattributed local campaign commits have been corrected without changing
@@ -99,14 +99,22 @@ six needles and six cold32K/128K measurements. E2E157.127/578.478/780.015;
 engine TTFT2.57624/10.85622s. This is a correctness/sanity check, not a new
 multi-start performance baseline. Raw mhc-device-serving-check/.
 
-The isolated tensor-core mHC prototype remains unqualified and outside serving.
-Its original strict parity census failed case2638/2700 at a BF16 rounding
-boundary;2637 cases completed,62 remain untested. Small-batch isolated latency
-is29-34% lower, not a serving gain. Independent FP64 evaluation of the single
-offending row favors the candidate, but does not prove global accuracy. The
-operator approved a separate independent accuracy/model-quality evaluation;
-retain the original failed census and strict gate. See the current notebook
-entries before proceeding; do not promote this prototype from microbenchmarks.
+The isolated tensor-core mHC prototype has completed independent accuracy
+qualification but remains outside serving. Its ORIGINAL strict parity census
+failed case2638/2700 at a BF16 rounding boundary; that run and gate remain
+failed, with2637 completed cases and62 untested. The operator approved a
+separate FP64 accuracy/model-quality evaluation, specified beforehand in
+`perf/glm53-mhc-tc-accuracy-contract.md`. The NEW census completes all2700 eager
+cases (all rows/columns) and8100 changed-input graph phases (all-output bit
+checks, explicitly sampled FP64 rows). Both baseline and candidate pass every
+pointwise accuracy gate; candidate RMS is noninferior in every checked case.
+The exact original seed2240 still fails strict parity and passes independent
+accuracy. Sourceaf3113740, nativeQC20588761, unchanged probe45d5e817; raw
+`perf/results/2026-09-09/mhc-tc-accuracy-census/` and
+`runtime-control/mhc-tc-accuracy-analysis.json`.313 CPU tests pass/one skip.
+Full-size cold A/B/A timing is now running through the complete-receipt gate;
+sanitizers, native integration and fixed1/3/1 serving/quality remain owed.
+Do not equate this numerical qualification with a serving gain or promotion.
 
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
 was shared across separately loaded CUDA modules, while kernel attributes
@@ -361,16 +369,18 @@ separate untested hypothesis.
 
 Current candidate priorities (hypotheses, not physical ceilings):
 
-1. mHC tensor-core prefill probe: census fails after2637 completed cases at
-   T7616/site79/fused. A single BF16 output2.0->2.015625 reaches the strict
-   <2^-7 row-peak boundary. Exact replay uses seed2240 left by the preceding
-   graph checks; independent FP64 rounds to the candidate, but the original
-   parity gate still fails. No full-chunk timing, sanitizer or serving claim.
-   All2160 small-batch cases pass and isolated latency falls29-34% using six
-   banks of all90 fn matrices (>3xL2), five A/B/A rounds. Keep unqualified;
-   any independently specified accuracy qualification is separate work, not
-   a post-hoc relaxation or reclassification of mhc-tc-census/ as passed.
-   Paired lossless storage is now retained separately, not this new arithmetic.
+1. mHC tensor-core prefill probe: separate independent FP64 qualification
+   completes all2700 eager cases/8100 changed-input graph phases, with zero
+   pointwise violations in both kernels. The original strict parity failure
+   at T7616/site79/fused/seed2240 remains recorded, not reclassified. Follow
+   `perf/glm53-mhc-tc-accuracy-contract.md`: complete the current five-round
+   cold timing run, prescribed sanitizers, gated native integration and fixed
+   control/candidate/return serving quality/performance series before promotion.
+   The unchanged probe is45d5e817, current nativeQC20588761. New artifacts are
+   under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
+   Earlier small-batch latency fell29-34%; no full-chunk or serving gain is
+   claimed yet. Paired lossless storage is retained separately from this new
+   arithmetic. Keep the current serving path while remaining gates run.
    Output-parallel arithmetic and actual 20-iteration
    norm fusion already lost; last-block synchronization was neutral. Do not
    repeat those experiments from the old three-iteration fixture.

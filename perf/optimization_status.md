@@ -23543,3 +23543,37 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   limits explicitly. All runs16GiB/no swap, one GPU job at a time, no build.
   Require checker completion, sanitizer exit0 and zero reported errors;
   a complete checker JSON alone does not pass a failed sanitizer launch.
+
+## 2026-09-09: Tensor-core mHC completes independent FP64 accuracy census
+
+- Status: independent numerical qualification passed; no serving promotion.
+  Original strict parity census remains FAILED. New source af3113740,
+  installed QC20588761728d7161, unchanged probe45d5e817520a56bb. No code,
+  numerical budget, seed, parameter or binary changes during the census.
+- Coverage: all 2,700 eager cases, 4,321,080 rows / 17,699,143,680 BF16
+  layer-input coordinates per arm checked against FP64. All 8,100 changed-input
+  graph phases pass all-output graph/eager bit checks; graph FP64 checks cover
+  the explicitly sampled 68,040 boundary rows, not every graph row. Original
+  partial-dot/square bounds pass on all eager and graph phases.
+- Results: zero pointwise accuracy violations for BOTH implementations;
+  candidate RMS noninferior in every case. Maximum post error against FP64
+  reference/candidate 1.0055e-6/6.7467e-7; comb 1.5823e-6/9.4313e-7.
+  Pooled normalized RMS 0.001658697550/0.001658697547 is effectively identical,
+  dominated by BF16 rounding. Non-ideally-rounded coordinates 397,700/302,538;
+  do not turn that kernel diagnostic into a model-quality improvement claim.
+  Partial maxima: dot NRMS 8.6624e-7, row peak 2.6908e-6, square relative
+  3.1564e-6, all within the unchanged predeclared gates.
+- The ONLY strict-parity failure among 10,800 comparisons is the original
+  T7616/site79/magnitude1/fused/seed2240 case: 2.0 versus 2.015625 at
+  row6382/column703. It remains a strict failure and passes the independent
+  accuracy gate. No omitted or replacement cases; elapsed 1,680.272s, exit0.
+- Full journal independently revalidated before timing, including ordered
+  cases, seeds, counts, metrics, flags and digest. Summary SHA
+  b28a280e1152858b32f7e4b858f158818edf0af6391a321b15c90b36c96a33fb;
+  journal fcb944880fe43f8d865785117446b8f9a3f8d9a3af4d2ec6abe6073bd2ac6215.
+- Decision: proceed to the prescribed isolated five-round A/B/A, then bounded
+  sanitizers. Native integration and real-profile quality/performance gates
+  are still required. Current serving library/profile remain unchanged.
+- Raw: perf/results/2026-09-09/mhc-tc-accuracy-census/ and
+  runtime-control/mhc-tc-accuracy-{census.log,analysis.json}. Stock clocks and
+  600W limits are recorded in mhc-tc-qualified-timing-hardware-before.txt.
