@@ -26281,3 +26281,26 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   andac819cd548544053ee14cff2c6590ecc58dd5973ae2022c13bc2d28a4a5a3a13.
   Hash-bound combined `rmsnorm-complete-graph-pair-conclusion.json`
   SHA733c8b239cdb16f70c1914d5af878be0681ac78b7deb58266c3ec3aa8a9c811b.
+
+## 2026-09-09 - Qualify the compiler's explicit deterministic reduction policy
+
+- Status: source-runtime probe implemented; GPU qualification prescribed, pending.
+- Baseline: four RMSNorm config changes causally reproduce the old/native score
+  difference; both historical trees pass the source-exact FP64 oracle. Production
+  policy must make choices explicit instead of relying on timed cache winners.
+- Hypothesis: Inductor's supported `deterministic` option can select a repeatable
+  reduction tree without a production source-hash cache hook. Source inspection
+  shows it filters configs and disables dynamic RBLOCK scaling and coordinate
+  descent; frontend/fusion/full-model effects still require separate qualification.
+- Change: isolated probe copies exact sources and changes ONLY decorator metadata
+  during import, runs the real automatic launcher path, fails any benchmarking,
+  requires a known qualified binary and checks oracle/repeat/graph/guard behavior.
+  No serving/profile/quant/native changes. Existing helpers and real norm weight
+  reused; this tests the new automatic policy, not the completed old/new sweep.
+- CPU:84 tests pass2.25s; final launch adapter follows the actual generated graph's
+  `run(..., stream=...)` API. Lint passes. GPU work not yet run.
+- Decision: exactly two fresh sequential16GiB/no-swap processes,16 cases each;
+  compare every output/config/binary across processes. No retries or discarded
+  samples. Commands/gates in `perf/glm53-deterministic-reductions-protocol.md`.
+- Raw: `runtime-control/deterministic-reduction-cpu.log`; prescribed outputs
+  `rmsnorm-deterministic-policy-{a,b}/`. No throughput/default promotion.

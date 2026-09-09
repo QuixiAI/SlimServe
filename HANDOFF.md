@@ -35,7 +35,29 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 23:05 UTC): RMSNorm cause established
+### Latest checkpoint (2026-09-09): deterministic runtime-policy qualification
+
+The RMSNorm causal investigation below is complete. New isolated probe
+`benchmarks/kernels/check_glm53_deterministic_reductions.py` qualifies the
+installed compiler's deterministic runtime selection, not a production cache
+hook. Source inspection confirms config filtering, disabled dynamic RBLOCK
+scaling and disabled coordinate descent.84 CPU tests pass; lint passes.
+
+Prescribed next: exactly two sequential fresh16GiB/no-swap GPU processes,
+`rmsnorm-deterministic-policy-a` and `rmsnorm-deterministic-policy-b`,16 cases
+each (four exact sources x rows1/16/640/7616, real layer22 norm vector). The normal
+automatic run path must never benchmark and must emit a previously qualified
+binary. Check FP64 <=1 BF16 ULP, eager repeat/changed-input graphs/guards, then
+every output hash across processes. Helpers/native sources and5172 original
+files must remain unchanged. No source edits/commits between these jobs/audit.
+Commands in `perf/glm53-deterministic-reductions-protocol.md`.
+
+No GPU policy result yet. Serving/profile/native sources unchanged; TC0 and
+native-order defaultOFF. This probe substitutes only decorator metadata during
+isolated source import. Even if it passes, frontend propagation and fresh
+full-model compilation/quality are still unqualified and remain the next steps.
+
+### Previous checkpoint (2026-09-09 23:05 UTC): RMSNorm cause established
 
 The graph-complete pair on76afce776 is COMPLETE and both audits pass. No-op
 `rmsnorm-noop-complete-graph-control` matches EVERY text/needle-token score in
