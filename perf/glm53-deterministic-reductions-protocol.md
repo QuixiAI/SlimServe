@@ -64,3 +64,46 @@ and independently compiled choices, and run fixed-start full-model quality and
 performance gates. The cache-bound replacement hook remains diagnostic-only.
 Do not assume the fixed policy will reproduce a historically mixed per-rank tree,
 declare quality from aggregate proximity, or widen existing quality gates.
+
+## Completed runtime-policy qualification and opt-in plan
+
+Both prescribed processes complete on3e497c7c0:32/32 cases pass, with every
+corresponding output exactly repeated across independent empty caches. All four
+sources automatically choose XBLOCK1/RBLOCK1024/eight warps/one stage, and emit
+the already-qualified binary for that rank/source. No benchmarking, dynamic
+RBLOCK scaling or coordinate descent; oracle maximum1 BF16 ULP. All5172 original
+files,5 source/helper receipts and7 native binaries unchanged; GPUs released.
+Audit `runtime-control/rmsnorm-deterministic-policy-analysis.json`,
+SHA8d523f85d74d637e7fe4b01a74cf56a4f976863124288226f1c8a8fddba99332.
+Do not rerun these completed jobs into their outputs.
+
+New `--deterministic-reductions` flag on SlimServe and the campaign harness
+exposes an explicitly diagnostic candidate without changing registered defaults.
+`slimserve/deterministic_reductions.py` copies the resolved engine plan and adds
+only `compilation_config.inductor_compile_config.deterministic=True`. It requires
+the fixed native-order GLM53 RTX6000 recipe, rejects the cached-source intervention
+and conflicting global deterministic/batch-invariant controls. No runtime hook
+or source replacement is used by this candidate. Benchmark receipts now hash23
+implementation files and explicitly contain the compiler option and CLI flag.
+
+220 CPU tests pass, including the actual vLLM compilation hash change, real
+Inductor metadata generator under the config patch (backend identifier mocked,
+no GPU codegen), default-off/no-mutation behavior, CLI scope and agreement between
+the recorded benchmark plan and the launch arguments. Real-machine dry-run:
+
+```bash
+env -u NCCL_P2P_DISABLE SLIMSERVE_CACHE=/raid/weights \
+  SLIMSERVE_GLM53_NATIVE_ORDER=1 \
+  .venv/bin/python -m slimserve.cli glm53-nvfp4-4 \
+  --deterministic-reductions --dry-run
+```
+
+No full-model start has used this option yet. Before prescribing that series,
+add read-only actual-loaded-graph reduction receipts and an offline auditor so
+frontend propagation and every selected reduction can be checked, not inferred
+from static bundle counts or emitted source alone. Then freeze a fresh-compilation
+series (independent empty caches plus a cached return), with full exact-token,
+text/image, repeated quality and32K/128K prefill workloads. Match every score
+across identical-policy starts, retain comparisons to older mixed-tree references,
+and keep TC0/no promotion until the appropriate quality/performance gates pass.
+No full-model start names or launches are prescribed by this checkpoint alone.

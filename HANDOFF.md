@@ -35,7 +35,40 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09): deterministic runtime-policy qualification
+### Latest checkpoint (2026-09-09 23:28 UTC): deterministic runtime policy passes
+
+The TWO source-runtime qualification jobs on3e497c7c0 are COMPLETE:32 cases
+pass,16 corresponding cases exactly identical across independent empty caches.
+All four sources automatically select XBLOCK1/RBLOCK1024/eight warps/one stage,
+emit known qualified binaries, never benchmark, and disable dynamic RBLOCK/
+coordinate descent. FP64 maximum1 BF16 ULP; repeated eager/changed-input graphs/
+guards/mutation checks pass.5 helper/source receipts,7 native binaries,5172
+original files unchanged; GPU-free. No model forwards or frontend GPU codegen.
+Audit `runtime-control/rmsnorm-deterministic-policy-analysis.json`,
+SHA8d523f85d74d637e7fe4b01a74cf56a4f976863124288226f1c8a8fddba99332.
+Do NOT rerun `rmsnorm-deterministic-policy-{a,b}`; all outputs preserved.
+
+Opt-in candidate now wired: `slimserve ... --deterministic-reductions` and matching
+campaign flag call `slimserve/deterministic_reductions.py`. Adds only the supported
+Inductor deterministic=True option to a copied, RECORDED engine plan; requires
+native-order1/fixed GLM53 RTX6000 recipe, rejects cached-source intervention and
+global deterministic/batch-invariant controls. No new environment switch, runtime
+source mutation, registry/default/quant/native changes.23 benchmark source receipts.
+CPU220pass/14 existing warnings, including actual compilation cache-key separation,
+real frontend metadata-generator propagation (backend ID mocked, no GPU codegen),
+CLI/default-off/scope checks and benchmark receipt/command agreement. Real-machine
+dry-run passes with expected config; raw `runtime-control/deterministic-plan-*`.
+
+NEXT: no full-model launch with this option yet. Add read-only actual-loaded-graph
+reduction receipts and their offline audit BEFORE prescribing a fresh-model series.
+Must verify every graph-held reduction's metadata/config/binary, not infer coverage
+from static callbacks or generated files alone. Then freeze independent empty-cache
+starts plus a cached return, repeated full quality/exact cold timing and32K/128K
+prefill. Protocol `perf/glm53-deterministic-reductions-protocol.md` tail. No serving
+start names/launches prescribed yet. Native-order defaultOFF/TC0 remain; no policy
+promotion, old quality-gate widening, TC exoneration or new speed claim.
+
+### Previous checkpoint (2026-09-09): deterministic runtime-policy qualification
 
 The RMSNorm causal investigation below is complete. New isolated probe
 `benchmarks/kernels/check_glm53_deterministic_reductions.py` qualifies the

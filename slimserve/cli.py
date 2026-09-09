@@ -101,6 +101,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="diagnostic: log every monitored JIT compilation and specialization",
     )
+    parser.add_argument(
+        "--deterministic-reductions",
+        action="store_true",
+        help="diagnostic: fixed reductions for native-order GLM53 RTX6000",
+    )
     return parser
 
 
@@ -128,6 +133,10 @@ def _help() -> None:
         ("--cuda-profile", "Enable bounded CUDA profiler API ranges for Nsight."),
         ("--route-profile-dir DIR", "Capture actual GLM53 routing, not baseline TPS."),
         ("--jit-monitor-verbose", "Log every monitored JIT compilation for diagnosis."),
+        (
+            "--deterministic-reductions",
+            "Qualify fixed GLM53 compiler reduction choices.",
+        ),
         (
             "--request-metrics",
             "Include request timings and cached prompt-token counts.",
@@ -464,6 +473,10 @@ def main(argv: list[str] | None = None) -> int:
 
         validate_plan(plan)
         validate_rmsnorm_plan(plan)
+        if args.deterministic_reductions:
+            from slimserve.deterministic_reductions import diagnostic_plan
+
+            plan = diagnostic_plan(plan)
     except ValueError as error:
         term.fail(str(error))
         return 2

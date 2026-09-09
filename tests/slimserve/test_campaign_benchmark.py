@@ -64,6 +64,7 @@ def test_observers_and_ordering_intervention_cannot_be_baselines(monkeypatch, ac
         ("cuda_traces", True),
         ("quality_repeats", 3),
         ("jit_monitor_verbose", True),
+        ("deterministic_reductions", True),
     ):
         assert bench.diagnostic_only(SimpleNamespace(**(vars(args) | {key: value})))
 
@@ -78,6 +79,47 @@ def test_rmsnorm_intervention_is_never_a_baseline(monkeypatch, mode):
     assert "slimserve/rmsnorm_diagnostic.py" in sources
     assert "vllm/v1/worker/gpu_model_runner.py" in sources
     assert "benchmarks/kernels/check_glm53_cached_rmsnorm.py" in sources
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_deterministic_plan_and_server_command_agree(monkeypatch, tmp_path, enabled):
+    from slimserve.hardware import Machine
+
+    bench = _load(monkeypatch)
+    monkeypatch.setenv("SLIMSERVE_GLM53_NATIVE_ORDER", "1")
+    monkeypatch.setattr(bench.hardware, "detect", lambda: Machine("rtx6000", "RTX", 4))
+    monkeypatch.setattr(bench, "compatible_profile_ids", lambda _: ["glm53-nvfp4-4"])
+    monkeypatch.setattr(bench, "get_tokenizer", lambda *a, **k: "tokenizer")
+    monkeypatch.setattr(bench, "exact_prompts", lambda *a, **k: ["prompt"])
+    monkeypatch.setattr(bench, "runtime_identity", lambda: {})
+    monkeypatch.setattr(bench, "require_gpus_free", lambda *a: None)
+    monkeypatch.setattr(bench.subprocess, "check_output", lambda *a, **k: "test")
+    source = tmp_path / "source.txt"
+    source.write_text("source")
+    output = tmp_path / "run"
+    args = ["campaign", "--source", str(source), "--output", str(output)]
+    if enabled:
+        args.append("--deterministic-reductions")
+    monkeypatch.setattr(bench.sys, "argv", args)
+    launched = []
+
+    def capture(argv, **kwargs):
+        launched.append(argv)
+        raise RuntimeError("test stops before launching a process")
+
+    monkeypatch.setattr(bench.subprocess, "Popen", capture)
+    with pytest.raises(RuntimeError, match="test stops before launching"):
+        bench.main()
+    assert len(launched) == 1
+    assert ("--deterministic-reductions" in launched[0]) is enabled
+    receipt = json.loads((output / "summary.json").read_text())
+    options = receipt["plan"]["engine"]["compilation_config"].get(
+        "inductor_compile_config", {}
+    )
+    assert (options.get("deterministic") is True) is enabled
+    assert "slimserve/deterministic_reductions.py" in receipt[
+        "benchmark_implementation_sha256"
+    ]
 
 
 @pytest.mark.parametrize(

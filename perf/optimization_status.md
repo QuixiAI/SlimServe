@@ -26304,3 +26304,35 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   samples. Commands/gates in `perf/glm53-deterministic-reductions-protocol.md`.
 - Raw: `runtime-control/deterministic-reduction-cpu.log`; prescribed outputs
   `rmsnorm-deterministic-policy-{a,b}/`. No throughput/default promotion.
+
+### Runtime policy passes both fresh-cache processes; explicit compiler candidate wired
+
+- Both predetermined processes on3e497c7c0 complete all16 cases each. Across the
+  pair every input/output/config/binary/oracle receipt repeats exactly. Automatic
+  selection is XBLOCK1/RBLOCK1024/eight warps/one stage for every source/rank.
+  All emitted binary hashes equal the source-exact qualified historical binary.
+  Benchmarking is forbidden by the probe; dynamic scaling and coordinate descent
+  are disabled. Eager repeat, changed-input graph replay, guards and mutation
+  checks pass; FP64 oracle maximum1 BF16 ULP, unchanged contract.
+- Offline audit32/32 cases,16 exact cross-process matches,5 source/helpers,
+  7 native libraries and5172 original files unchanged; final GPUs empty. Both
+  summary SHA610e0c9a94b88aeb116f7e8ea2d5d10372e0858096be9aec60a2e41a939a886e
+  (identical content; separate fresh-cache processes/launch logs). Audit
+  `runtime-control/rmsnorm-deterministic-policy-analysis.json`,
+  SHA8d523f85d74d637e7fe4b01a74cf56a4f976863124288226f1c8a8fddba99332.
+- Added opt-in `--deterministic-reductions` to SlimServe/campaign. The helper
+  copies the recorded plan, adds only supported Inductor `deterministic=True`,
+  and enforces fixed native-order GLM53 RTX6000 recipe/no cached intervention/
+  no conflicting global determinism controls. No registry/default/quant/native
+  changes or serving-time source replacement. Receipts hash23 implementation files.
+- CPU220pass6.27s,14 existing deprecation warnings. Tests cover real compilation
+  cache-key separation and actual frontend metadata generator with backend ID
+  mocked, default-off behavior, no registry mutation, scope/conflicts, CLI dry-run
+  and benchmark receipt/launch argument agreement. Lint passes. Real detected
+  profile dry-run shows the expected config and unchanged quant/KV/TP4/no-spec.
+  Raw `runtime-control/deterministic-plan-{cpu-final,dry-run}.log`.
+- Limitation: no actual frontend GPU codegen or full-model run with the new
+  option yet. Next add independent live graph receipts/auditor, then prescribe
+  empty-cache starts plus a cached return with exact scores, cold throughput and
+  long-prefill checks. Do not infer full graph coverage from static callbacks,
+  promote the policy, clear TC, or claim startup variability/performance solved.

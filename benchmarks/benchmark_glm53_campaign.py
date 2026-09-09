@@ -47,6 +47,7 @@ def diagnostic_only(args):
         args.routing
         or args.cuda_traces
         or getattr(args, "jit_monitor_verbose", False)
+        or getattr(args, "deterministic_reductions", False)
         or args.quality_repeats > 1
         or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
@@ -88,6 +89,7 @@ def benchmark_sources():
         "slimserve/server.py",
         "vllm/utils/jit_monitor.py",
         "slimserve/glm53_ordering.py",
+        "slimserve/deterministic_reductions.py",
         "slimserve/rmsnorm_diagnostic.py",
         "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
         "vllm/v1/worker/gpu_model_runner.py",
@@ -538,6 +540,11 @@ def main():
         help="diagnostic-only per-specialization JIT logging; not baseline TPS",
     )
     ap.add_argument(
+        "--deterministic-reductions",
+        action="store_true",
+        help="diagnostic: fixed Inductor reduction choices; not baseline TPS",
+    )
+    ap.add_argument(
         "--cold-prefix",
         action="store_true",
         help="isolate every timing request's cache and require zero cached tokens",
@@ -611,6 +618,10 @@ def main():
     from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
 
     validate_rmsnorm_plan(plan)
+    if args.deterministic_reductions:
+        from slimserve.deterministic_reductions import diagnostic_plan
+
+        plan = diagnostic_plan(plan)
     if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(
             plan,
@@ -691,6 +702,8 @@ def main():
             argv += ["--request-metrics"]
         if args.jit_monitor_verbose:
             argv += ["--jit-monitor-verbose"]
+        if args.deterministic_reductions:
+            argv += ["--deterministic-reductions"]
         run = {"boot": boot, "argv": argv, "status": "starting", "measurements": []}
         if args.routing:
             run["diagnostic_plan"] = dataclasses.asdict(
