@@ -26233,3 +26233,51 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw artifacts: `runtime-control/rmsnorm-graph-serving-cpu.log`,
   `rmsnorm-graph-serving-auditor-replay.log` and its hashed replay script.
   Commands and stop conditions: `perf/glm53-rmsnorm-intervention-protocol.md` tail.
+
+## 2026-09-09 - Complete RMSNorm intervention exactly restores the older score vector
+
+- Status: causal sufficiency established for the fixed old/native workload;
+  diagnostic complete, no default or performance promotion.
+- Baseline: fixed recipe/native binaries/native-order1/BF16fn1/TC0. Frozen
+  source76afce776 through BOTH prescribed starts and all three audits. Earlier
+  static-hook legacy result remains partial/unqualified; its provisional
+  negative causal conclusion stays withdrawn.
+- Hypothesis: the four source-identical RMSNorm reduction config changes alone
+  explain the older instrumented versus native-only full-model score difference.
+- Change: qualified graph-complete hook, one no-op control and one complete
+  legacy substitution; fresh private caches, forced AOT. No retries, source
+  edits/builds/commits, other GPU work or measurement exclusions during pair.
+- Correctness: no-op EVERY score equals all9 native reference passes (27 pairs).
+  Legacy EVERY score equals all3 older instrumented passes (9 pairs), and none
+  of27 comparisons to native is exact. All3 passes within each arm are exact.
+  Means respectively-2.727814820100083 and-2.7282744364256297. Thus the four
+  configuration changes are SUFFICIENT for this complete score-vector difference;
+  no inference that each is individually necessary, or every workload deterministic.
+- Both arms finish25 warmup/75 timed cold exact1000/300 requests, text4/imageRed,
+  168 quality requests/12288 text/504 needle-token scores.9 actual graph bindings
+  each (1/2/4/2 by rank) verify against independent loader inventory. Target object
+  counts differ legitimately:1/2/4/2 control,1/2/3/2 legacy.22 source receipts,
+  native hashes and5172 original files verify; private seed files unchanged.
+- Diagnostic E2E medians [min,max] tok/s, not new baselines:
+  control c1 157.241[157.181,157.466],c8 580.417[578.558,580.956],
+  c16 779.867[779.257,782.499]; legacy c1 156.888[156.814,157.110],
+  c8 577.303[576.449,579.932],c16 780.346[778.565,781.021].
+  Startup154.087/154.083s. No new speed win claimed.
+- Teardown: both controllers/servers exit0; GPUs released0.043898/0.413012s.
+  Keep8 recovered4,718,592,000-byte allocation warnings each. Control reports
+  4 leaked semaphores/6 shared-memory objects and zero remaining zombies;
+  legacy reports1 shared-memory object and2 zombies at teardown. Independent
+  final GPU query empty. Warning cause remains to be measured; prompt-logprob
+  full-vocabulary allocations are a code-level lead, not proven attribution.
+- Decision: close THIS old/native numerical-cause investigation. Build/qualify
+  an explicit reproducible reduction policy next, including fresh compilation,
+  before re-testing TC and resuming performance work. Installed Inductor's
+  deterministic reduction filtering is a relevant precedent. Do not promote
+  the rank/source-hash diagnostic as production, widen quality gates, or declare
+  TC/startup-performance variability resolved. Native-order defaultOFF/TC0 remain.
+- Raw: `rmsnorm-noop-complete-graph-control/`, `rmsnorm-legacy-complete-graph-only/`,
+  fresh `rmsnorm-complete-graph-serving-caches/`; per-arm audits under
+  `runtime-control/` SHAb8a3f1223798174e1f1a4ca691b60e2b2b75357f4f7fa027cd0e073b343fe415
+  andac819cd548544053ee14cff2c6590ecc58dd5973ae2022c13bc2d28a4a5a3a13.
+  Hash-bound combined `rmsnorm-complete-graph-pair-conclusion.json`
+  SHA733c8b239cdb16f70c1914d5af878be0681ac78b7deb58266c3ec3aa8a9c811b.

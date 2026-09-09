@@ -323,3 +323,22 @@ preserved. Exact no-op mismatch or any coverage/source/workload failure stops
 the sequence. A qualified legacy/reference mismatch is causal evidence only
 about this complete four-source intervention, not permission to widen quality
 gates or promote native ordering/TC. All prior failed and partial runs remain.
+
+### Completed result (2026-09-09 23:05 UTC)
+
+Both starts and all audits complete on76afce776, with frozen sources through
+the combined conclusion. No-op matches all9 native passes exactly (27 pairs);
+complete legacy matches all3 older instrumented passes exactly (9 pairs).
+Every text and needle-token score agrees, not merely their averages. Both modes
+repeat exactly internally.9 actual graph bindings per arm,22 sources/native
+binaries/5172 original files verified; private seed files unchanged. Both servers
+and controllers exit0, GPUs released. All fixed requests and canaries complete.
+
+The four source-bound RMSNorm configuration changes are sufficient to reproduce
+this complete old/native score difference. This is causal evidence for the fixed
+workload and AOT source set, not individual-configuration necessity or universal
+determinism. No TC exoneration, new quality tolerance or performance promotion.
+Preserve all earlier partial/failed results. This protocol is complete: do not
+rerun its arms. Next qualify an explicit fresh-compilation reduction policy.
+Combined conclusion SHA733c8b239cdb16f70c1914d5af878be0681ac78b7deb58266c3ec3aa8a9c811b,
+`runtime-control/rmsnorm-complete-graph-pair-conclusion.json`.

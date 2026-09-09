@@ -35,7 +35,45 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09: graph-complete serving pair frozen)
+### Latest checkpoint (2026-09-09 23:05 UTC): RMSNorm cause established
+
+The graph-complete pair on76afce776 is COMPLETE and both audits pass. No-op
+`rmsnorm-noop-complete-graph-control` matches EVERY text/needle-token score in
+all9 native reference passes (27 cross-pairs). Complete legacy substitution
+`rmsnorm-legacy-complete-graph-only` matches EVERY score in all3 older instrumented
+reference passes (9 cross-pairs), repeats exactly internally, and differs from
+native. The FOUR recorded RMSNorm config changes are SUFFICIENT to reproduce
+the full old/native score difference for this workload/AOT source set. This
+resolves that specific causal question; the earlier partial intervention's
+negative interpretation remains withdrawn. Do not rerun completed arms.
+
+Both arms verify9 actual graph bindings (1/2/4/2),22 source receipts,5172
+unchanged original files, unchanged private seed files and native binaries.
+One start each; no edits/builds/commits between arms or before all audits.
+Each completes25 warmup/75 timed cold exact1000/300 requests, text4/imageRed,
+168 quality requests/12288 text/504 needle-token scores. Control/legacy means
+-2.727814820100083/-2.7282744364256297. Diagnostic E2E medians c1/c8/c16:
+157.241/580.417/779.867 and156.888/577.303/780.346; startup154.087/154.083s.
+No new performance win or production promotion. Both controllers/servers exit0,
+GPUs free;8 recovered allocation warnings each. Teardown details in notebook.
+
+Combined conclusion `runtime-control/rmsnorm-complete-graph-pair-conclusion.json`,
+SHA733c8b239cdb16f70c1914d5af878be0681ac78b7deb58266c3ec3aa8a9c811b.
+Arm audits b8a3f1223798174e1f1a4ca691b60e2b2b75357f4f7fa027cd0e073b343fe415
+andac819cd548544053ee14cff2c6590ecc58dd5973ae2022c13bc2d28a4a5a3a13,
+`runtime-control/rmsnorm-{noop-complete-graph-control,legacy-complete-graph-only}-analysis.json`.
+
+NEXT: replace cache-dependent numerical choices with an explicit reproducible
+compiler/normalization policy, qualify fresh compilation and model quality,
+then re-test the TC candidate under a matched fixed policy and return to measured
+decode/prefill optimization. Installed Inductor exposes `deterministic` config
+and reduction filtering; inspect/qualify it before inventing a production cache
+hook. The current hash-bound intervention remains a defaultOFF diagnostic, not
+the production policy. Native-order defaultOFF/TC0 unchanged. This result does
+NOT prove each config individually necessary, universal determinism, TC accuracy,
+fresh-cache behavior, or resolution of startup throughput/allocator variability.
+
+### Previous checkpoint (2026-09-09: graph-complete serving pair frozen)
 
 Serving auditor is now tracked in `benchmarks/analyze_glm53_rmsnorm_intervention.py`
 with tested graph-receipt gates in `analyze_glm53_rmsnorm_graphs.py`.171 CPU tests
