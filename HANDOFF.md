@@ -181,15 +181,24 @@ Raw verification: runtime-control/mhc-canonical-moe-quality-analysis.json.
 The installed top_k_per_row_prefill probe now confirms variable selection order
 above512 pools and variable membership for cutoff ties: all360 calls still
 select valid top-k scores. This remains a lead, not full-model causal proof.
-Next prescribed run is indexer-long-context-quality-diagnostic/: ONE start,
-three full quality passes, same canonical-MoE1/TC0 recipe. The new opt-in
-index_journal records all11 selector layers/chunks for the exact8199-token
-first8K true-code request, and archives first-layer/first-chunk logits/ranges/
-indices on all4 ranks. CPU-only copies mask undefined logit tails; GPU buffers
-and arithmetic are unchanged. The existing short model/score/MoE trace remains
-active.436 CPU tests (one skip) and8 GPU observer/integration tests pass,
-including real compiled indexer calls at both tile layouts and8192+7 chunks.
-No performance/default promotion; details and fixed configs are in the notebook.
+The prescribed indexer-long-context-quality-diagnostic/ run now completes on
+9aa123ebe: one start/three full quality passes, canonical-MoE1/TC0 unchanged.
+All348 archives verify, all168 quality requests are cold, all4096 short scores
+and1024 short model fingerprints/rank stay exact, all18 contrasts pass. The
+exact8199-token request runs7616+583 chunks, all11 selector layers,94 tensors
+per match/rank. The first differing traced stage EVERY pair/rank is layer3
+selection order. Its logits/ranges are identical within each rank across all
+three passes; all selected sets match and no first-layer cutoff ties exist.
+About2.70million index positions change, across5564-5565 of7616 rows. Later
+layer logits and final model outputs differ. Full8K/32K score max deltas are
+2.401/1.124nat. This narrows the lead to order, not a complete causal fix yet.
+Separately, fixed first-layer logits differ between rank groups0/1 and2/3,
+including two pool-set differences; preserve that follow-up instead of assuming
+cross-rank bit equality. Analysis: runtime-control/indexer-long-context-quality-analysis.json.
+GPUs released, serving exit0. Next replay saved native-selector inputs, then
+qualify an order-only model intervention; do not change tie membership or math.
+The bounded observer remains default-off;436 CPU tests (one skip) and8 GPU
+observer/integration tests pass. No performance/default promotion.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

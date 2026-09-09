@@ -24244,3 +24244,56 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   unchanged. The instrumented campaign rates are not baseline eligible.
 - Raw qualification: runtime-control/index-journal-{final-cpu,final-gpu}-tests.xml
   and logs. Earlier CPU/GPU/integrated checks retained alongside them.
+
+## 2026-09-09 - Full-model trace isolates first long-context variation to selection order
+
+- Status: prescribed capture complete and fully verified; order-only causal
+  intervention is next, not yet a production fix or performance result.
+- Source9aa123ebe1a9f5e797417381a0e4f53b9b6c0078, same canonical-MoE1,
+  BF16-storage1/TC0/nativeQC4ce801/core d45b4ace/MoE1093b8a4 and recipe v1.
+  No source/native edits during the run. All75 priming requests and168 quality
+  requests complete; all quality cached_tokens0,12,288 text scores/18 positive
+  retrieval contrasts. Serialized priming TPS107.643/459.061/644.875 is NOT
+  baseline eligible. Fresh compilation17.50s and every sample retained.
+- Short stability holds: all4096 text scores identical across3 passes, mean
+  -2.7282744364256297 each; every1K retrieval score identical. All4x3x639
+  GPU-selected short scores equalHTTP. All1024 short model tensor hashes/rank
+  are identical, canonical routing/static weights/zero locks/buffer links pass.
+- Long trace: all4 workers x3 exact8199-token requests finish in7616+583
+  chunks,11 DSA layers/chunk,94 tensor records/match. First captured selection
+  has7616x1904 FP32 logits and7616x512 IDs;5565 rows exceed512 visible pools.
+  All48 index archives verify (221,004,780 bytes/worker), alongside all300
+  MoE archives (1,383,840,515 bytes/worker). Config/source/native/rawHTTP hashes,
+  row ranges, token positions, complete layer/row coverage and limits verify.
+- Every within-rank pair has IDENTICAL first-layer logits/ranges and EXACTLY
+  the same selected sets; no ambiguous first-layer cutoff ties exist. Yet
+  2,698,418-2,710,031 index positions differ over5564-5565 rows. The first
+  changed traced tensor in every pair/rank is chunk1 layer-03.call-0.indices;
+  the next is layer7 logits. Each pair has44 changed tensors/94, including
+  later-layer logits and model outputs. Within-rank variation is order-only
+  at the first observed changing boundary, not a different valid top-k set.
+- Separate fixed cross-rank observation: first-layer inputs match within
+  groups0/1 and2/3 but differ between groups:67,293/14,500,864 logit entries,
+  max0.16516304 and RMS0.00126453 (RMS includes zero-masked undefined tails).
+  Exactly two selected rows differ between groups,7048 and7402, one pool
+  exchange each. These input/set differences repeat identically in allthree
+  passes; do not mislabel them as unstable ties or assume all-rank equality.
+  Keep this independent follow-up open while isolating repeat-to-repeat order.
+- Quality still varies at8K/32K: max per-token absolute2.401239/1.124259nat.
+  All1K deltas zero, all18 contrasts positive. Do not call full repeatability
+  solved, promote TC, change tie membership, or widen the accuracy contract.
+- Decision/next: replay first saved logits/ranges on each original GPU with
+  unchanged native selector and poisoned undefined tails, fixed eager/graph
+  repeats. Then test canonical ordering of the EXISTING selected IDs before
+  pool expansion. This preserves membership and isolates ordering alone;
+  later ties or other causes may still require further work.
+- Raw: indexer-long-context-quality-diagnostic/; full verification
+  runtime-control/indexer-long-context-quality-analysis.json
+  SHA82a7be9ffc26bcbb945246efc9d337d5fa90333e846123c59035f78c8e07732b.
+  Read-only analyzers: scratch quality-diagnostics/analyze_indexer_trace.py and
+  verify_indexer_trace.py (source hashes recorded in analysis). Independent
+  CPU helper fixture covers order-only changes, cutoff membership exchanges,
+  empty/short rows and invalid score-set rejection; log indexer-analysis-helper-test.log.
+  Cross-rank numeric check: runtime-control/indexer-cross-rank-logit-check.log.
+  Serving exit0; driver release0.436s includes one transient worker zombie
+  retained in teardown evidence. All GPUs free; no replacement starts.
