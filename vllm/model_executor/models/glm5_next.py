@@ -56,7 +56,10 @@ from vllm.model_executor.layers.glm5_next_indexer import (
     Glm5NextPooledIndexer,
 )
 # Import also registers the compile-opaque torch.ops.vllm.glm5_mhc_* operators.
-from vllm.model_executor.layers.glm5_next_mhc_ops import load_lossless_mhc_fn
+from vllm.model_executor.layers.glm5_next_mhc_ops import (
+    load_lossless_mhc_fn,
+    validate_glm53_mhc_prefill_tc,
+)
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
@@ -409,9 +412,14 @@ class Glm5NextDecoderLayer(nn.Module):
                 torch.empty(*shape, dtype=dtype), requires_grad=False
             )
 
-        # Disabled until fixed real-profile validation. Only the original BF16
-        # projection storage changes; native FP32 base/scale repairs stay FP32.
+        # Profile-selected lossless storage; native FP32 base/scale stay FP32.
         bf16_fn = os.getenv("VLLM_GLM5_MHC_BF16_FN", "0") == "1"
+        if os.getenv("VLLM_GLM5_MHC_PREFILL_TC", "0") == "1":
+            validate_glm53_mhc_prefill_tc(config, bf16_fn)
+            logger.info_once(
+                "GLM53 mHC tensor-core prefill enabled: SM120, lossless BF16 fn, "
+                "64..7616 rows; registered decode batches retain their existing path"
+            )
         fn_dtype = torch.bfloat16 if bf16_fn else torch.float32
         self.hc_attn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)
         self.hc_ffn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)

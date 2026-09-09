@@ -55,3 +55,40 @@ def test_registered_fake_ops_keep_fp32_mixes_with_bf16_fn_storage():
         torch.float32,
         torch.bfloat16,
     ]
+
+
+@pytest.mark.parametrize(
+    "failure", [None, "storage", "settings", "device", "library", "runtime"]
+)
+def test_requested_tensor_core_path_fails_closed(monkeypatch, failure):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers import glm5_next_mhc_ops as ops
+
+    config = SimpleNamespace(
+        hidden_size=4096,
+        hc_mult=4,
+        rms_norm_eps=1e-5,
+        hc_eps=1e-6,
+        hc_sinkhorn_iters=20,
+    )
+    if failure == "settings":
+        config.hc_sinkhorn_iters = 3
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda: (8, 0) if failure == "device" else (12, 0),
+    )
+    monkeypatch.setattr(
+        ops,
+        "_qc",
+        lambda: SimpleNamespace(
+            has_glm53_mhc_prefill_tc=lambda: failure != "library",
+            get_glm53_mhc_prefill_tc=lambda: 0 if failure == "runtime" else 1,
+        ),
+    )
+    if failure is None:
+        ops.validate_glm53_mhc_prefill_tc(config, True)
+    else:
+        with pytest.raises((ValueError, RuntimeError), match="mHC tensor-core"):
+            ops.validate_glm53_mhc_prefill_tc(config, failure != "storage")

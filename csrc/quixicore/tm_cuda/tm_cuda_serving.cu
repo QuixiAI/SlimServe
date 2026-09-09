@@ -23,6 +23,7 @@
 #include "glm_moe_combine.cuh"
 #include "bf16_decode_gemm.cuh"
 #include "fp8_decode_gemm.cuh"
+#include "glm53_mhc_prefill_tc.cuh"
 #include "topk_sample.cuh"
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -552,6 +553,45 @@ static void py_set_dsv4_mhc_prefill_min_t(int64_t min_t) {
 static int64_t py_get_dsv4_mhc_prefill_min_t() {
     return dsv4_mhc_prefill_min_t();
 }
+
+// Opt-in until fixed real-profile quality/performance qualification. This
+// changes only prefill dot summation order, never the stored model values.
+static std::atomic<int> g_glm53_mhc_prefill_tc{-1};
+static int64_t py_get_glm53_mhc_prefill_tc() {
+    int enabled = g_glm53_mhc_prefill_tc.load(std::memory_order_relaxed);
+    if (enabled >= 0) return enabled;
+    const char* value = std::getenv("VLLM_GLM5_MHC_PREFILL_TC");
+    TORCH_CHECK(value == nullptr ||
+                ((value[0] == '0' || value[0] == '1') && value[1] == '\0'),
+                "VLLM_GLM5_MHC_PREFILL_TC must be 0 or 1");
+    enabled = value != nullptr && value[0] == '1';
+    g_glm53_mhc_prefill_tc.store(enabled, std::memory_order_relaxed);
+    return enabled;
+}
+static void py_set_glm53_mhc_prefill_tc(int64_t enabled) {
+    TORCH_CHECK(enabled == 0 || enabled == 1, "mHC tensor-core switch must be 0 or 1");
+    g_glm53_mhc_prefill_tc.store(int(enabled), std::memory_order_relaxed);
+}
+template <bool FUSED_POST>
+static void launch_glm53_mhc_prefill_tc(
+        const __nv_bfloat16* x, const __nv_bfloat16* residual,
+        const float* post, const float* comb, const __nv_bfloat16* fn,
+        __nv_bfloat16* residual_out, float* partial, int T) {
+    auto kernel = glm53_mhc_prefill_tc::partials_tc<FUSED_POST>;
+    static thread_local int configured_device = -1;
+    int device = -1;
+    C10_CUDA_CHECK(cudaGetDevice(&device));
+    if (configured_device != device) {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            glm53_mhc_prefill_tc::BYTES));
+        configured_device = device;
+    }
+    kernel<<<dim3(dsv4_mhc::SPLITS, (T + 31) / 32), 256,
+             glm53_mhc_prefill_tc::BYTES, stream()>>>(
+        x, residual, post, comb, fn, residual_out, partial, T);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
 template <bool FUSED_POST, typename FnT, bool PAIRED_FN = false>
 static void launch_dsv4_mhc_partials_prefill_typed(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
@@ -581,7 +621,8 @@ template <bool FUSED_POST>
 static bool launch_dsv4_mhc_partials_prefill(
         const __nv_bfloat16* x, const __nv_bfloat16* residual,
         const float* post, const float* comb, torch::Tensor fn,
-        __nv_bfloat16* residual_out, float* partial, int T, int H) {
+        __nv_bfloat16* residual_out, float* partial, int T, int H,
+        bool allow_tensor_core) {
     const int min_t = dsv4_mhc_prefill_min_t();
     if (min_t == 0 || T < min_t || H != 4096) return false;
     if (fn.scalar_type() == torch::kHalf) {
@@ -591,9 +632,20 @@ static bool launch_dsv4_mhc_partials_prefill(
             partial, T);
     } else if (fn.scalar_type() == torch::kBFloat16) {
         const auto* properties = at::cuda::getDeviceProperties(fn.get_device());
+        const bool sm120 = properties->major == 12 && properties->minor == 0;
+        if (allow_tensor_core && sm120 && T >= 64 && T <= 7616 &&
+                reinterpret_cast<uintptr_t>(fn.data_ptr()) % 16 == 0 &&
+                reinterpret_cast<uintptr_t>(residual) % 16 == 0 &&
+                (!FUSED_POST || (reinterpret_cast<uintptr_t>(x) % 16 == 0 &&
+                                reinterpret_cast<uintptr_t>(residual_out) % 16 == 0)) &&
+                py_get_glm53_mhc_prefill_tc()) {
+            launch_glm53_mhc_prefill_tc<FUSED_POST>(
+                x, residual, post, comb, bp(fn), residual_out, partial, T);
+            return true;
+        }
         // Qualify this layout only on SM120. A contiguous tensor may still
         // have an odd BF16 storage offset; preserve its valid scalar path.
-        const bool paired = properties->major == 12 && properties->minor == 0 &&
+        const bool paired = sm120 &&
                             reinterpret_cast<uintptr_t>(fn.data_ptr()) % 4 == 0;
         if (paired) {
             launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16, true>(
@@ -670,7 +722,9 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     }
     if (!launch_dsv4_mhc_partials_prefill<false>(
             nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
-            fpm(partial), T, H)) {
+            fpm(partial), T, H,
+            !norm_weight && rms_eps == 1e-5 && pre_eps == 1e-6 &&
+            sinkhorn_eps == 1e-6 && post_multiplier == 2.0 && sinkhorn_repeat == 20)) {
         launch_dsv4_mhc_partials<dsv4_mhc::MIXES, false>(
             nullptr, bp(residual), nullptr, nullptr, fn, nullptr,
             fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
@@ -743,7 +797,9 @@ py_dsv4_mhc_fused_post_pre(
     }
     if (!launch_dsv4_mhc_partials_prefill<true>(
             bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
-            bpm(residual_out), fpm(partial), T, H)) {
+            bpm(residual_out), fpm(partial), T, H,
+            !norm_weight && rms_eps == 1e-5 && pre_eps == 1e-6 &&
+            sinkhorn_eps == 1e-6 && post_multiplier == 2.0 && sinkhorn_repeat == 20)) {
         launch_dsv4_mhc_partials<dsv4_mhc::MIXES, true>(
             bp(x), bp(residual), fp(post_mix), fp(comb_mix), fn,
             bpm(residual_out), fpm(partial), H, dim3(dsv4_mhc::SPLITS, T));
@@ -2432,6 +2488,9 @@ void init_serving(py::module_& m) {
     m.def("set_dsv4_mhc_prefill_min_t", &py_set_dsv4_mhc_prefill_min_t,
           "smallest T the split path hands to the prefill-shaped partials kernel (0 = never)");
     m.def("get_dsv4_mhc_prefill_min_t", &py_get_dsv4_mhc_prefill_min_t);
+    m.def("set_glm53_mhc_prefill_tc", &py_set_glm53_mhc_prefill_tc,
+          "opt-in SM120 BF16 mHC prefill tensor cores (0/1); affects eager and future captures only");
+    m.def("get_glm53_mhc_prefill_tc", &py_get_glm53_mhc_prefill_tc);
     m.def("topk_sample", &py_topk_sample, py::arg("logits"), py::arg("top_k"),
           py::arg("top_p") = py::none(), py::arg("noise"),
           "top-k (<= 32, ties kept) / top-p sampling of fp32 logits rows with caller-drawn "

@@ -99,8 +99,8 @@ six needles and six cold32K/128K measurements. E2E157.127/578.478/780.015;
 engine TTFT2.57624/10.85622s. This is a correctness/sanity check, not a new
 multi-start performance baseline. Raw mhc-device-serving-check/.
 
-The isolated tensor-core mHC prototype has completed independent accuracy
-qualification but remains outside serving. Its ORIGINAL strict parity census
+The tensor-core mHC candidate has completed independent accuracy qualification
+and opt-in native integration; the production profile remains OFF. Its ORIGINAL strict parity census
 failed case2638/2700 at a BF16 rounding boundary; that run and gate remain
 failed, with2637 completed cases and62 untested. The operator approved a
 separate FP64 accuracy/model-quality evaluation, specified beforehand in
@@ -114,10 +114,21 @@ accuracy. Sourceaf3113740, nativeQC20588761, unchanged probe45d5e817; raw
 `runtime-control/mhc-tc-accuracy-analysis.json`.313 CPU tests pass/one skip.
 Full-size cold A/B/A timing completes: latency falls 33.5/33.2/29.6/29.5%
 at 64/65/128/129 rows, but only 2.61% at 7616 rows (about 613.37->597.34us).
-Do not extrapolate the small-batch gain to long-context serving. Memcheck
-passes 48 selected cases/144 graph phases with zero errors; synchronization
-and targeted race checks, native integration and fixed1/3/1 serving/quality
-remain owed. The full timing/source receipts are in mhc-tc-qualified-timing/.
+Do not extrapolate the small-batch gain to long-context serving. Probe memcheck
+and synccheck each pass48 selected cases/144 graph phases with zero errors.
+Three bounded racechecks pass at64/65/129: first24 matching launches per process,
+not full-size race qualification. NativeQC4ce801557216c67a adds only two GPU
+kernels; all734 existing instruction bodies are unchanged. All2700 native
+cases/8100 changed-input graph phases match the frozen probe bit-for-bit;
+195 GPU tests and319 CPU tests plus3 receipt tests pass (one CPU-suite skip).
+The44 new native tests also pass memcheck and synccheck, candidate kernels only.
+Opt in with VLLM_GLM5_MHC_PREFILL_TC=1; unsupported settings/dtypes/alignment
+retain the old path, and requested features fail startup on stale native builds.
+The fixed1/3/1 real-profile serving/quality gate remains owed. Outputs are
+prescribed as mhc-tc-serving-{control,candidate,return}/, using nativeQC4ce801
+and retained BF16 storage in ALL arms. Only the new TC flag changes0/1/0.
+The full timing/source receipts are in mhc-tc-qualified-timing/ and the native
+integration proof is in mhc-tc-native-census/ under perf/results/2026-09-09/.
 Do not equate this numerical qualification with a serving gain or promotion.
 
 The FP8 sweep exposed a real decode-launch setup bug: an ELF GNU_UNIQUE flag
@@ -377,10 +388,10 @@ Current candidate priorities (hypotheses, not physical ceilings):
    completes all2700 eager cases/8100 changed-input graph phases, with zero
    pointwise violations in both kernels. The original strict parity failure
    at T7616/site79/fused/seed2240 remains recorded, not reclassified. Follow
-   `perf/glm53-mhc-tc-accuracy-contract.md`: finish the prescribed sanitizers,
-   then gated native integration and fixed
+   `perf/glm53-mhc-tc-accuracy-contract.md`: sanitizers and gated native
+   integration now pass; finish the fixed
    control/candidate/return serving quality/performance series before promotion.
-   The unchanged probe is45d5e817, current nativeQC20588761. New artifacts are
+   The unchanged probe is45d5e817, current nativeQC4ce80155. New artifacts are
    under perf/results/2026-09-09/mhc-tc-accuracy-* and mhc-tc-qualified-timing/.
    Five-round cold timing gives29-34% lower small-batch latency but only2.61%
    at the full chunk. No serving gain is claimed. Paired lossless storage is

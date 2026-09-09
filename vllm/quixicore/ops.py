@@ -287,6 +287,22 @@ class quixicore_ops:
         return int(_qc().get_dsv4_mhc_prefill_min_t())
 
     @staticmethod
+    def has_glm53_mhc_prefill_tc() -> bool:
+        try:
+            return hasattr(_qc(), "get_glm53_mhc_prefill_tc")
+        except Exception:
+            return False
+
+    @staticmethod
+    def set_glm53_mhc_prefill_tc(enabled: int) -> None:
+        """Diagnostic 0/1 switch; existing captured graphs do not change."""
+        _qc().set_glm53_mhc_prefill_tc(int(enabled))
+
+    @staticmethod
+    def get_glm53_mhc_prefill_tc() -> int:
+        return int(_qc().get_glm53_mhc_prefill_tc())
+
+    @staticmethod
     def has_topk_sample() -> bool:
         try:
             return hasattr(_qc(), "topk_sample")

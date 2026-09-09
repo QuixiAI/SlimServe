@@ -45,6 +45,28 @@ def _qc():
     return quixicore_ops
 
 
+def validate_glm53_mhc_prefill_tc(config, bf16_fn: bool) -> None:
+    """Fail before serving if an explicitly requested native path cannot run."""
+    if not bf16_fn:
+        raise ValueError("mHC tensor-core prefill requires lossless BF16 fn storage")
+    expected = {
+        "hidden_size": 4096, "hc_mult": 4, "rms_norm_eps": 1e-5,
+        "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
+    }
+    if any(getattr(config, key, None) != value for key, value in expected.items()):
+        raise ValueError("mHC tensor-core prefill requires the qualified GLM53 settings")
+    if torch.cuda.get_device_capability() != (12, 0):
+        raise ValueError("mHC tensor-core prefill is qualified only on SM120")
+    native = _qc()
+    if not native.has_glm53_mhc_prefill_tc():
+        raise RuntimeError("rebuild the native library for mHC tensor-core prefill")
+    if native.get_glm53_mhc_prefill_tc() != 1:
+        raise RuntimeError(
+            "mHC tensor-core prefill is not enabled in the native runtime; "
+            "restart the process"
+        )
+
+
 def glm5_mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,

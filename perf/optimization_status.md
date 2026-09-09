@@ -23612,3 +23612,65 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   only. Accuracy gates pass, sanitizer exit0 and ERROR SUMMARY: 0 errors;
   elapsed54.310s. Baseline/Torch kernels are not claimed as newly sanitized.
   Raw mhc-tc-memcheck/ and runtime-control/mhc-tc-memcheck{,-sanitizer}.log.
+
+## 2026-09-09: Integrate independently qualified mHC tensor cores behind an opt-in
+
+- Status: native correctness qualification passes; production profile unchanged,
+  real-model quality/performance still pending. Same selected recipe v1, BF16
+  KV/activations/fn and FP32 base/scale. Original strict parity remains FAILED;
+  this integration relies on the separately predeclared FP64 accuracy gate.
+- Probe sanitizer follow-through: synccheck completes48 cases/144 graph phases,
+  no matching-kernel cap, exit0/zero errors,29.427s. Racecheck at64/65/129 in
+  separate processes completes12 cases/36 graph phases each; only first24
+  matching candidate launches instrumented per process, zero hazards/errors/
+  warnings. Elapsed4.553/4.659/4.667s; not all-site or full7616-row race coverage.
+- Native path: copy only the frozen probe's constants and GPU kernel body to
+  csrc/quixicore/serving/glm53_mhc_prefill_tc.cuh; namespace/host wrapper change,
+  arithmetic unchanged. No persistent repack or duplicate model weights.
+  Explicit VLLM_GLM5_MHC_PREFILL_TC=1, default0, SM120/BF16/16-byte alignment,
+  H4096/HC4,64..7616 rows, no RMSNorm fusion, original eps/multiplier/20 iterations.
+  All other dispatches retain existing paths. Module-local checked per-device
+  shared-memory setup; setter changes eager/future captures only. Startup guard
+  rejects requested TC with wrong storage/settings/device or stale native module.
+- Build CUDA13.0/O3/compute_120f+sm_120f, no fast-math; actual configured target
+  _quixicore_C under scratch/build-native-sm120,-j2,80GiB/no swap. Installed SHA
+  4ce801557216c67a2d7d8e13298861216fa776518928f04a0c2df21aadc03744.
+  Previous20588761 binary preserved as runtime-control/mhc-tc-native-before.so.
+  All734 existing GPU instruction bodies unchanged; two candidate kernels added.
+  Pre38 registers/zero stack, fused64 registers/eight-byte stack,58,240 dynamic
+  shared bytes; do not claim fused zero-spill. Kernel body matches frozen probe.
+- Tests:195 GPU pass (151 existing plus44 new: FP64 accuracy, fallbacks, changed
+  input graphs, invalid selector, GPU0/1/0);319 CPU pass/one skip plus3 new receipt
+  tests. New native44-test suite also passes memcheck10.62s/synccheck8.20s,
+  both exit0/zero errors, kns=glm53_mhc_prefill_tc filter, no kernel-count cap.
+  Unchanged baseline/Torch kernels are not claimed as newly sanitized.
+- Full native-to-qualified-probe census:2,700 eager cases,8,100 changed-input
+  graph phases, all90 actual checkpoint sites, original full plan and seeds.
+  Every output bit, including signed zero, matches; each module's graph/eager
+  results match.68.136s, exit0, no exclusions. This transfers the independently
+  qualified probe's results; it is not a newly computed FP64 census. Original
+  qualification receipt, probe/dependency source and actual parameter digests
+  verified; native/kernel/host/Python hashes frozen throughout.
+  Summary650ff931bc87034b21be409163c7849dad5fa226d0e460b81fa79308a6425a5e;
+  journal11aebdcd69f468ee51b9d2505d729a95b702516018a2cbe091383dc899842cc3.
+- Next fixed serving series: one TC0 control, three TC1 candidates, one TC0
+  return; SAME new native library and BF16-storage1 throughout, registered
+  glm53-nvfp4-4/rtx6000/TP4/no-spec. Existing campaign with --boots1/3/1,
+  --repeats3 --cold-prefix --quality --prefill; c1/c8/c16 exact1000/300,
+  text/image,4096 scored tokens/six needles and cold32K/128K every start.
+  Unset inherited NCCL_P2P_DISABLE; CUDA_VISIBLE_DEVICES=0,1,2,3,
+  SLIMSERVE_CACHE=/raid/weights, CUDA_HOME=/usr/local/cuda-13.0,
+  VLLM_CACHE_ROOT=/home/tiny/.local/scratch/slimserve-glm53/vllm-cache,
+  OMP_NUM_THREADS=1,150GiB/no swap. No profiler/build/competing GPU work,
+  restarts for speed, substitutions or source changes. Apply the predeclared
+  per-window/aggregate0.01-nat quality gate against both controls, all needles
+  positive. Retain only measured serving prefill gain with decode in control
+  spread; isolated2.61% full-chunk latency improvement is not sufficient.
+- Raw: perf/results/2026-09-09/mhc-tc-native-census/;
+  runtime-control/mhc-tc-native-{build.log,code-equivalence.json,cpu-tests.xml,
+  gpu-tests.xml,receipt-tests.xml,sanitizers.log,memcheck-tests.xml,
+  synccheck-tests.xml,memcheck-sanitizer.log,synccheck-sanitizer.log}.
+  Probe sanitizer data in mhc-tc-{synccheck,race-64,race-65,race-129}/ and
+  matching runtime-control logs. Serving outputs prescribed as
+  mhc-tc-serving-{control,candidate,return}/; next command is the existing
+  benchmark_glm53_campaign.py with the first arm's TC0/boots1 settings above.
