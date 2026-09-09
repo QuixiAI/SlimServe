@@ -25892,3 +25892,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   target is an explicit reproducible normalization policy, not reliance on a
   lucky cached autotune result. Do not enable global force-first-config, alter
   the quant or resume TC promotion before causality and a fair reference exist.
+
+## 2026-09-09 - Freeze source-exact cached RMSNorm isolation
+
+- Status: diagnostic prepared; no GPU result yet. No serving/native changes.
+- Baseline: four source-bound reduction-width changes in the completed cache
+  audit. Source bodies are identical between legacy/native namespaces; rank0
+  writes three outputs, ranks1/2/3 normalize in place (suffix is not a layout).
+- Hypothesis:1024/8-warps versus4096/16-warps changes FP32 reduction order
+  enough to change BF16 outputs. This could confound full-model comparisons;
+  isolated differences would not establish the complete score-mismatch cause.
+- Probe: benchmarks/kernels/check_glm53_cached_rmsnorm.py, exact source copies
+  and Inductor compilation metadata, require recorded compiled-kernel hashes,
+  private caches. Fixed96 cases at rows1/16/640/7616, two seeds and three actual
+  checkpoint norm vectors/magnitudes. Original and changed graph inputs yield
+  192 cross-config comparisons. Finite/one-BF16-ULP FP64 oracle gate, exact
+  repeats, graph equivalence, output guards and mutation checks. No timing.
+- CPU:15 tests pass0.99s in8GiB scope; lint/diff checks pass. Source signature,
+  config validation, signed-zero/ULP metrics, chunking and oracle tests included.
+  Raw runtime-control/cached-rmsnorm-cpu.xml. Initial lint findings were fixed
+  before tests or GPU execution; no numerical test failed.
+- Frozen command/gates: perf/glm53-cached-rmsnorm-protocol.md. Next ONE bounded
+  GPU process, all four devices sequentially; original caches remain read-only.
