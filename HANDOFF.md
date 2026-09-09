@@ -208,12 +208,21 @@ and keeps -1 padding last; no score access, reselection or native arithmetic
 change. Default-off returns the original native callable. The observer now
 lives in the GLM-specific selector path and records AFTER ordering.
 450 CPU tests/one skip,34 GPU tests, bounded memory/sync/race checks pass.
-Next prescribed ONE start/three full quality passes:
-canonical-index-order-quality-diagnostic/, same recipe/native/TC0/canonical-MoE1,
-with the two runtime-control/canonical-index-order-{score,index}-config.json
-files. No source/build changes during this run. Causality and full-model
-repeatability remain to be demonstrated; performance promotion is not in scope
-for this diagnostic launch.
+The prescribed canonical-index-order-quality-diagnostic/ run now completes on
+145467c58, unchanged recipe/native/TC0/canonical-MoE1. All348 archives and168
+cold quality requests verify. All short scores/model hashes remain exact,
+including against the unsorted control; first-layer inputs and selected sets
+are unchanged, and selected order is now exactly canonical on every rank/pass.
+The8K/position0.75 candidate scores now repeat exactly, but other long contexts
+still vary: order-only is a PARTIAL fix. The first remaining traced difference
+is layer23 indices on GPU3 (identical logits/ranges), followed by layer27 logits
+on every rank. Passes2/3 of the traced true-code request match all94 tensors;
+other candidate requests still vary, so do not infer whole-workload stability.
+Full analysis and cross-intervention verification: runtime-control/
+canonical-index-order-{quality-analysis,intervention-comparison}.json.
+Next capture layer23 logits/ranges/indices to verify the suspected cutoff-tie
+membership issue. No reselection/tie-policy change until that capture; TC stays
+OFF and both ordering kernels remain diagnostic, not production defaults.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

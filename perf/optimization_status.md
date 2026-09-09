@@ -24402,3 +24402,48 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   as a separate follow-up, TC OFF and original quality contract unchanged.
 - Raw qualification: runtime-control/canonical-index-{cpu,gpu}-tests.xml/log,
   canonical-index-{memcheck,synccheck,racecheck}-tests.xml and sanitizer logs.
+
+## 2026-09-09 - Order-only intervention partly stabilizes long scores; layer23 membership remains
+
+- Status: prescribed145467c58 model run complete; order-only causal effect
+  demonstrated, full repeatability NOT solved. Native/recipe unchanged, TC0.
+- All75 priming requests/168 zero-cache quality requests complete,12,288 text
+  scores/18 positive contrasts. All348 tensor archives/source/native/HTTP
+  evidence verify. Both chunks7616+583 and all11 index layers present on all
+  four ranks/three matches. Exit0, GPUs released in0.669s; transient worker
+  zombies retained in teardown evidence. No source edits/builds/replacements.
+- Short text/1K stays exact:4096 text scores at mean -2.7282744364256297 and
+  every1024 short model tensor hashes/rank are identical across passes AND
+  against9aa123ebe's unsorted control. All4x3x639 short GPU scores equalHTTP.
+  Canonical routing/static weights/zero workspaces/buffer links pass.
+- Cross-intervention proof: source hashes verify against each recorded Git
+  tree; native libraries and resolved profile are identical. Every observed
+  first-layer preselection tensor in BOTH chunks matches the control per rank.
+  All12 saved first-layer selected sets remain EXACT; each selected order is
+  exactly the independently canonicalized control. No hidden upstream input,
+  quant or membership change at this boundary.
+- Effect: all28 candidate-token scores at8K/position0.75 now repeat exactly in
+  allthree pairs (previously every score differed). Other long contexts still
+  vary:8K/0.25 max0.811833nat,32K max1.124516nat. Do not treat reduced spread
+  or a repeated margin as a whole-workload pass, or relax the quality gate.
+- First remaining traced difference for passes1/2 and1/3: GPU3 layer23 indices,
+  AFTER canonical sorting, with all25 preceding recorded tensors identical,
+  including that selector's logits/ranges. GPUs0/1/2 keep layer23 indices exact;
+  their first difference is layer27 logits (26 preceding tensors identical).
+  GPU3 changes23/94 tensors, other ranks22/94. All94 tensors on every rank
+  match for passes2/3 of this traced true-code request; its distractor requests
+  still differ. This points to remaining selected-ID membership variability,
+  with cutoff ties the specific hypothesis, NOT yet directly captured proof.
+- Decision/next: keep both ordering interventions opt-in. Capture actual layer23
+  selection inputs/IDs on the same prescribed workload before changing tie
+  behavior. Do not jump to another arithmetic optimization or promote TC.
+  The separate fixed rank-group input discrepancy remains recorded.
+- Serialized TPS107.327/457.382/643.212 is diagnostic-only, not a new baseline.
+  Raw: canonical-index-order-quality-diagnostic/;
+  runtime-control/canonical-index-order-quality-analysis.json
+  SHAd4163058cbb1a8d5c2d1e49f322e7c850413981cade5ae0abeba3e0587543cd9;
+  canonical-index-order-intervention-comparison.json
+  SHA380412a1fae1a5946eb68f13dd1cc1ee88eeed45346d416c12edf6d580f5ec08.
+  Read-only scripts: scratch quality-diagnostics/analyze_ordered_indexer_trace.py,
+  verify_ordered_indexer_trace.py and compare_order_intervention.py; hashes
+  recorded in outputs. No raw artifact exclusions or quality-contract edits.
