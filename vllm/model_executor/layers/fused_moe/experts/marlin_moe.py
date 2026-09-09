@@ -348,6 +348,7 @@ def fused_marlin_moe(
         block_size_m = max(block_size_m, 16)
 
     alignment = glm_route_align.consume(topk_ids)
+    canonical_alignment = False
     if (
         alignment is not None
         and alignment.block_size == block_size_m
@@ -358,6 +359,7 @@ def fused_marlin_moe(
         sorted_token_ids = alignment.sorted_token_ids
         expert_ids = alignment.expert_ids
         num_tokens_post_padded = alignment.num_tokens_post_padded
+        canonical_alignment = alignment.canonical_assignment_order
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids,
@@ -380,13 +382,14 @@ def fused_marlin_moe(
             or global_num_experts != E
         ):
             raise ValueError("canonical alignment diagnostic requires GLM53 NVFP4 TP")
-        canonicalize(
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            tokens=hidden_states.shape[0],
-            block_size=block_size_m,
-        )
+        if not canonical_alignment:
+            canonicalize(
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                tokens=hidden_states.shape[0],
+                block_size=block_size_m,
+            )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(

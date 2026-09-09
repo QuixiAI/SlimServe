@@ -69,6 +69,11 @@ class ModelJournal:
                 "max_tensor_records_per_match": 1024,
                 "expected_operations": 91,
                 "first_moe_snapshots": self.moe_enabled,
+                "small_route_order": (
+                    "canonical-native"
+                    if os.getenv("SLIMSERVE_GLM53_STABLE_ROUTE", "0") == "1"
+                    else "atomic-native"
+                ),
                 "max_moe_dump_bytes_per_worker": 2 * 1024**3,
                 "score_journal": str(score_journal.path),
                 "score_header": json.loads(

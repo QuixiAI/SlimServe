@@ -20,6 +20,15 @@ def enabled():
     return flag == "1"
 
 
+def stable_route_enabled():
+    flag = os.environ.get("SLIMSERVE_GLM53_STABLE_ROUTE", "0")
+    if flag not in ("0", "1"):
+        raise ValueError("stable route flag must be 0 or 1")
+    if flag == "1" and not enabled():
+        raise ValueError("stable route diagnostic requires canonical MoE")
+    return flag == "1"
+
+
 def geometry(tokens, topk, experts, block_size):
     # The scoped router selects DISTINCT top8 experts for every token, so one
     # expert owns at most `tokens` assignments, even for maximally skewed input.

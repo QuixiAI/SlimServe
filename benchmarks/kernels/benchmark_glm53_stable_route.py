@@ -7,6 +7,8 @@ synchronized atomic -> stable probe; synchronized atomic + sort -> stable.
 Each uses five A/B/A rounds, three warmup graph replays, and five timed 20-call
 graph replays per arm/round. All samples retained; no retries. Both probe
 policies contain the warp synchronization repair, isolating it from ordering.
+With --native, both policies use the installed repaired library: only the last
+two comparisons run (4800 samples), avoiding a redundant native/self control.
 """
 
 import argparse
@@ -30,19 +32,20 @@ from vllm.quixicore.ops import quixicore_ops as qc
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--native", action="store_true")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(1)
     torch.cuda.set_device(0)
     assert torch.cuda.get_device_capability() == (12, 0)
-    probe = build()
+    probe = None if args.native else build()
     import vllm._quixicore_C as native
 
     sources = [
         Path(__file__),
-        Path(probe.__file__),
         Path(native.__file__),
         Path("csrc/quixicore/serving/glm_moe_routing.cuh"),
+        Path("csrc/quixicore/tm_cuda/tm_cuda_serving.cu"),
         Path("benchmarks/kernels/glm53_stable_route_probe.cu"),
         Path("benchmarks/kernels/glm53_stable_route_probe.py"),
         Path("benchmarks/kernels/benchmark_mhc_output_parallel.py"),
@@ -53,10 +56,13 @@ def main():
         Path("vllm/model_executor/layers/fused_moe/router/glm_route_align.py"),
         Path("vllm/quixicore/ops.py"),
     ]
+    if probe is not None:
+        sources.append(Path(probe.__file__))
     hashes = {str(p): sha(p) for p in sources}
     result = dict(
         status="running",
         diagnostic_only=True,
+        implementation="native" if args.native else "probe",
         protocol=__doc__,
         torch_version=torch.__version__,
         cuda_version=torch.version.cuda,
@@ -129,7 +135,11 @@ def main():
                     logits, bias, 8, 0, True, 2.5, 8, capacity, blocks
                 )
 
-            def atomic_call(logits=logits, bias=bias):
+            def atomic_call(logits=logits, bias=bias, capacity=capacity, blocks=blocks):
+                if args.native:
+                    return qc.glm_route_align(
+                        logits, bias, 8, 0, True, 2.5, 8, capacity, blocks
+                    )
                 return probe.run(logits, bias, 0, True, 2.5, 8, False)
 
             def sorted_call(atomic_call=atomic_call, tokens=tokens):
@@ -137,20 +147,23 @@ def main():
                 canonicalize(*out[2:], tokens=tokens, block_size=8)
                 return out
 
-            def stable_call(logits=logits, bias=bias):
+            def stable_call(logits=logits, bias=bias, capacity=capacity, blocks=blocks):
+                if args.native:
+                    return qc.glm_route_align(
+                        logits, bias, 8, 0, True, 2.5, 8, capacity, blocks, stable=True
+                    )
                 return probe.run(logits, bias, 0, True, 2.5, 8, True)
 
             reference = native_call()
             expected = expected_alignment(reference[1], 8)
-            graphs = {
-                name: graph_for(call)
-                for name, call in (
-                    ("native", native_call),
-                    ("synchronized-atomic", atomic_call),
-                    ("synchronized-atomic-plus-sort", sorted_call),
-                    ("stable", stable_call),
-                )
-            }
+            callbacks = [
+                ("synchronized-atomic", atomic_call),
+                ("synchronized-atomic-plus-sort", sorted_call),
+                ("stable", stable_call),
+            ]
+            if not args.native:
+                callbacks.insert(0, ("native", native_call))
+            graphs = {name: graph_for(call) for name, call in callbacks}
 
             def check(
                 graphs=graphs,
@@ -183,11 +196,13 @@ def main():
                 bias_sha256=tensor_sha(cpu_bias),
                 comparisons=[],
             )
-            for baseline, candidate in (
-                ("native", "synchronized-atomic"),
+            comparisons = [
                 ("synchronized-atomic", "stable"),
                 ("synchronized-atomic-plus-sort", "stable"),
-            ):
+            ]
+            if not args.native:
+                comparisons.insert(0, ("native", "synchronized-atomic"))
+            for baseline, candidate in comparisons:
                 rounds = []
                 for repeat in range(5):
                     rounds.append(

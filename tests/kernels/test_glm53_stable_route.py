@@ -54,6 +54,8 @@ def source_receipts(probe):
         Path(native.__file__),
         Path("csrc/quixicore/serving/glm_moe_routing.cuh"),
         Path("csrc/quixicore/tm_cuda/tm_cuda_serving.cu"),
+        Path("vllm/quixicore/ops.py"),
+        Path("vllm/model_executor/layers/fused_moe/router/glm_route_align.py"),
         Path("benchmarks/kernels/glm53_stable_route_probe.cu"),
         Path("benchmarks/kernels/glm53_stable_route_probe.py"),
         Path("benchmarks/kernels/benchmark_mhc_output_parallel.py"),
@@ -208,6 +210,7 @@ def test_foreign_current_device(probe, device, stable):
 
 
 @pytest.mark.parametrize("stable", (False, True))
+@pytest.mark.parametrize("probe", ("native",), indirect=True)
 @pytest.mark.parametrize(
     "bad",
     (

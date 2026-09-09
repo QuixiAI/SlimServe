@@ -78,11 +78,17 @@ class quixicore_ops:
         block_size: int,
         max_padded: int,
         max_blocks: int,
+        *,
+        stable: bool = False,
     ) -> list[torch.Tensor]:
         """Fused small-M routing: scored top-k with bias-only selection plus
         the Marlin block alignment, one launch. Returns [topk_weights,
         topk_ids, sorted_token_ids, expert_ids, num_tokens_post_padded]."""
-        return _qc().glm_route_align(
+        native = _qc()
+        if stable and not hasattr(native, "glm_route_align_stable"):
+            raise RuntimeError("stable GLM routing requires rebuilt native kernels")
+        call = native.glm_route_align_stable if stable else native.glm_route_align
+        return call(
             logits, bias, topk, scoring, renormalize, scaling, block_size,
             max_padded, max_blocks,
         )

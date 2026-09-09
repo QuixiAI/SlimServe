@@ -77,6 +77,9 @@ class ScoreJournal:
             "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
             "slimserve/canonical_moe.py",
             "slimserve/canonical_moe_kernel.py",
+            "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
+            "csrc/quixicore/serving/glm_moe_routing.cuh",
+            "csrc/quixicore/tm_cuda/tm_cuda_serving.cu",
         )
         self._write(
             {

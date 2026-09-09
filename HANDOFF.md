@@ -35,6 +35,26 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
+### Latest checkpoint (2026-09-09 13:23 UTC)
+
+The stable cutoff policy plus fused index ordering preserves every prescribed
+quality score and captured tensor versus its stable control (28d2249c1).
+Small-M origin routing now has an isolated17-21% stable-path kernel win and
+qualified native integration. Its investigation also found/repaired missing
+warp ordering in the existing router. Installed QC is33decd2f; corefe4a7c2a
+and MoE1093b8a4 unchanged. Both native policies pass functional/sanitizer checks;
+all746 non-router GPU copies are unchanged. Stable routing remains opt-in,
+requiring the canonical MoE diagnostic. Profile/quant/TC defaults are unchanged.
+Final serving wiring passes713 GPU tests (including compiled custom ops),
+519 CPU tests/one skip and52 baseline-exclusion tests. The post-sort is skipped
+only for the actual reused canonical alignment, never just because M<=16.
+Next: native32-shape A/B/A in stable-route-native-timing/, then ONE start/three
+quality passes against the frozen28d2249c1 fused-indexer control. Native timing
+and full-model qualification are still pending. M>16 origin alignment is next
+after this loop; no new serving TPS gain is claimed.
+
+### Chronological evidence (older next-step statements are historical)
+
 Both current cold-prefix baselines are complete: three prescribed starts
 per stack, all 27 timing rounds/225 exact 1000-in/300-out requests, text/image
 canaries, 4096-token quality and six needle checks per start pass. Every

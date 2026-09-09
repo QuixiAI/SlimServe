@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import torch
 
+from slimserve.canonical_moe import stable_route_enabled
 from vllm.platforms import current_platform
 from vllm.quixicore.ops import quixicore_ops
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -32,6 +33,7 @@ class RoutingAlignment:
     expert_ids: torch.Tensor
     num_tokens_post_padded: torch.Tensor
     block_size: int
+    canonical_assignment_order: bool = False
 
 
 # The router and the Marlin wrapper run back to back inside the moe_forward
@@ -76,6 +78,7 @@ def alignment_geometry(
 # Kill-switch for performance diagnosis: SLIMSERVE_GLM_ROUTE_ALIGN=0 keeps the
 # reference routing (grouped_topk + moe_align_block_size) on every batch.
 _ENABLED = os.getenv("SLIMSERVE_GLM_ROUTE_ALIGN", "1") != "0"
+_STABLE_ALIGNMENT_DIAGNOSTIC = stable_route_enabled()
 
 
 def eligible(router, router_logits: torch.Tensor, indices_type) -> bool:
@@ -118,7 +121,16 @@ def route(router, router_logits: torch.Tensor):
         max_padded,
         max_blocks,
     )
-    publish(RoutingAlignment(ids, sorted_ids, expert_ids, post_pad, block_size))
+    publish(
+        RoutingAlignment(
+            ids,
+            sorted_ids,
+            expert_ids,
+            post_pad,
+            block_size,
+            canonical_assignment_order=_STABLE_ALIGNMENT_DIAGNOSTIC,
+        )
+    )
     return weights, ids
 
 
@@ -133,6 +145,19 @@ def _glm_route_align_impl(
     max_padded: int,
     max_blocks: int,
 ) -> list[torch.Tensor]:
+    if _STABLE_ALIGNMENT_DIAGNOSTIC:
+        return quixicore_ops.glm_route_align(
+            logits,
+            bias,
+            topk,
+            scoring,
+            renormalize,
+            scaling,
+            block_size,
+            max_padded,
+            max_blocks,
+            stable=True,
+        )
     return quixicore_ops.glm_route_align(
         logits,
         bias,

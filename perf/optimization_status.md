@@ -25148,3 +25148,43 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   provenance, native-kernel A/B/A, and real-profile quality/trace equality.
   Stable routing must not suppress a necessary fallback sort or affect other
   platforms. No native timing, serving performance or full-model claim yet.
+
+## 2026-09-09 - Stable-routing diagnostic wiring and native timing protocol
+
+- Added strict OFF-by-default SLIMSERVE_GLM53_STABLE_ROUTE=1, requiring
+  canonical MoE and its bounded model journal. The existing opaque route custom
+  op selects the checked native stable entry; flag0 keeps the prior call and
+  fake schema. Missing native entry fails closed. No profile/default change.
+- RoutingAlignment carries canonical_assignment_order=false by default.
+  Marlin bypasses the diagnostic sort ONLY when it actually consumes this
+  exact topk_ids tensor's canonical alignment for its own block size and no
+  expert map. Otherwise normal alignment and sorting remain. M>16 unchanged.
+  CPU tests exercise stable/atomic/missing/wrong-block/wrong-identity/EP paths;
+  no global small-batch sort bypass. Journal records configured small-route
+  policy and additional router/native source hashes. Campaign rejects this
+  diagnostic as a serving baseline.
+- Final713 GPU tests PASS36.68s:693 kernel/contract/device/prior regressions
+  (duplicate rejection-fixture parameter removed) and20 eager/compiled custom
+  op cases at M1/2/8/13/16, both policies, eight changed-input CUDA graph replays
+  with poisoned outputs and non-finite/tied inputs. Core/native hashes unchanged
+  throughout. Full CPU519 PASS/one skip20.97s, then52 targeted campaign tests
+  PASS4.85s including the added stable-flag baseline-exclusion case. Earlier518
+  CPU pass21.37s is retained, before the explicit stale-native check was added.
+- GPU XML0d0eec19dfca3c9a7f0875a57d9601dfebfa028d7841b36ed92f1d5524d613e4;
+  final CPU XML0300e4edd0d33d6b8c03435d0cfbaf25d07f0c5878af204cdc380338fc1af0d7.
+  Logs/XMLs: runtime-control/stable-route-wiring-{gpu,cpu,cpu-final} and
+  stable-route-baseline-exclusion. Native QC33decd2f remains locally qualified;
+  full-model equality is not yet established for this integration.
+- Prescribed native timing: benchmark_glm53_stable_route --native --output
+  perf/results/2026-09-09/stable-route-native-timing. Same32 random/skew M1..16
+  shapes, sigmoid/renormalize/scale2.5/BM8, GPU0/16GiB/no swap/OMP1. Both arms
+  now use installed native; two A/B/A comparisons (atomic->stable and atomic
+  plus diagnostic sort->stable), five rounds/three warmups/five timed20-call
+  graph replays, all4800 samples. No native/self redundant comparison or probe
+  loading. Source/native frozen, no concurrent CPU/GPU test/build workloads.
+- After native timing: ONE real profile start/three full quality passes with
+  fused index ordering and prior canonical flags/journals, add STABLE_ROUTE=1.
+  Compare all scores/short+long tensor traces against28d2249c1; require unchanged
+  core/MoE and the precisely bounded QC binary change. Timing remains serialized
+  and instrumented, not eligible as a production TPS gain. Record concrete
+  failure and stop if any prescribed check fails; no replacement starts.
