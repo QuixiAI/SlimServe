@@ -29,6 +29,34 @@ physics, research digest and phase gates are in
 
 ## State (2026-09-08, evening) - start here
 
+The current B12X cold-prefix control is complete: three prescribed starts,
+all27 timing rounds/225 exact1000-in/300-out requests, text/image canaries,
+4096-token quality and six needle checks per start pass. E2E medians
+132.588/466.690/589.276 tok/s at c1/c8/c16; cold32K/128K engine TTFT
+2.714/10.824s. Every measured request reports zero cached tokens. All owned
+containers exit0/no OOM and are removed. This is digest-pinned R28.1 with
+the qualified host-driver/native-FA2 adaptations below, no-spec/DCP1 and
+the launcher's unchanged4096-token/prefill-compute-share0.4 scheduling.
+It uses DIFFERENT W4A4/FP8-KV precision, not our selected recipe. Raw:
+perf/results/2026-09-08/b12x-r281-cold-serving/. A fresh SlimServe three-start
+--cold-prefix series is next before a direct current comparison.
+
+Do not read the reference's499.85/615.39 client-decode medians as sustained
+batch8/16 kernel throughput: the first-to-last window includes staggered
+cold prefill. Raw chunk analysis shows ~668 tok/s at c8 once all requests
+are generating, close to the cached run. The cached first c16 timing has a
+synchronized2.67s client pause of unresolved origin; keep its slow result.
+benchmarks/analyze_glm53_client_streams.py preserves every original metric
+and makes the window distinction explicit. Raw: runtime-control/
+b12x-{client-stream-windows,cold-client-stream-windows}.json.
+
+Next isolated kernel candidate is prepared, NOT built or promoted: paired
+BF16 fn staging for mHC prefill, same FP32 arithmetic/reduction order.
+Only the diagnostic probe enables it; serving callers remain unchanged.
+CPU tests8pass, including strict signed-zero parity. Full actual-site GPU
+checks, five fixed A/B/A rounds and sanitizers are owed. See the notebook's
+prescribed shapes and mhc-storage-paired-build scratch directory.
+
 The spill-free pooled-indexer tile is retained in the RTX6000 profile:
 `VLLM_GLM5_INDEXER_SM120_TILES=1` selects RT2/PT128/four warps. Three fixed
 starts x three repeats plus a prescribed return-to-original control pass all

@@ -1919,6 +1919,45 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+### RTX6000 B12X cold-prefix competitive reference - 2026-09-08
+
+The selected SlimServe recipe remains unchanged. This separate control uses
+B12X R28.1 image52ef7badcc33918f, checkpoint46aaae8a82032f77, W4A4 experts
+and FP8 KV, no-spec/DCP1/VRAM through its supported launcher. Host-driver
+selection and exact-source native-SM120 FA2 are the explicitly qualified
+compatibility adaptations; P2P/custom all-reduce remain enabled. It is not
+precision-matched and does not establish the best of every B12X configuration.
+
+Three predetermined starts x three repeats, exact1000/300, recommended
+sampling, identical source/token IDs and unique cache salts for every request.
+All27 measurements/225 requests and text/image canaries pass; zero cached
+tokens throughout. Startup138.065/136.039/134.039s; no discarded starts.
+
+| Concurrency | E2E output tok/s median [min, max] | Client decode tok/s median |
+| ---: | ---: | ---: |
+| 1 | 132.59 [132.40, 132.76] | 156.60 |
+| 8 | 466.69 [461.01, 468.49] | 499.85 |
+| 16 | 589.28 [586.52, 591.61] | 615.39 |
+
+Client decode spans earliest first to latest last token and includes staggered
+prefill; it is NOT steady full-concurrency decode. The recorded launcher uses
+4096 max batched tokens/prefill_compute_share0.4. Common-interval stream
+diagnostics do not replace E2E measurements or remove slow pauses.
+
+| Exact input tokens | Client TTFT median ms | Engine TTFT median [min, max] ms |
+| ---: | ---: | ---: |
+| 32768 | 2758.72 | 2713.98 [2708.85, 2718.85] |
+| 131072 | 10943.87 | 10824.44 [10814.98, 10860.87] |
+
+All nine measured requests per length have cached_tokens=0; one prescribed
+warmup per length/start is retained separately. Per-start4096-token quality
+means -2.916894/-2.917379/-2.921713; all18 needle contrasts rank the target
+first, minimum margin32.2587. This is not a broad model-quality ranking.
+Every owned container exits0/no OOM and is removed. Raw:
+perf/results/2026-09-08/b12x-r281-cold-serving/ (sourcef918c0798).
+A fresh SlimServe --cold-prefix three-start baseline is next; do not substitute
+the earlier cached B12X series or historical best-start records.
+
 ### RTX6000 mHC candidate qualification - 2026-09-08 (not promoted)
 
 The retained profile baseline remains the spill-free indexer below. Lossless

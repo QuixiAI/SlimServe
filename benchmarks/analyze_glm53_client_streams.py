@@ -21,9 +21,9 @@ from pathlib import Path
 def summarize(values):
     return {
         "count": len(values),
-        "min": min(values),
-        "median": statistics.median(values),
-        "max": max(values),
+        "min": min(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "max": max(values) if values else None,
     }
 
 
@@ -36,7 +36,7 @@ def analyze(data):
         chunks = row["chunks"]
         times = [row["start"] + chunk["seconds"] for chunk in chunks]
         if (
-            len(times) < 2
+            not times
             or any(not math.isfinite(t) for t in times)
             or any(b < a for a, b in zip(times, times[1:]))
             or not math.isclose(times[0], row["first"], rel_tol=0, abs_tol=1e-6)
@@ -69,13 +69,13 @@ def analyze(data):
             {
                 "request": index,
                 "seed": row.get("seed"),
-                "cached_tokens": row["usage"]
-                .get("prompt_tokens_details", {})
-                .get("cached_tokens"),
+                "cached_tokens": (row["usage"].get("prompt_tokens_details") or {}).get(
+                    "cached_tokens"
+                ),
                 "first_from_round_start_s": times[0] - origin,
                 "last_from_round_start_s": times[-1] - origin,
                 "inter_chunk_ms": summarize(gaps),
-                "max_gap_after_chunk": gaps.index(max(gaps)),
+                "max_gap_after_chunk": gaps.index(max(gaps)) if gaps else None,
                 "tokens_in_all_active_intersection": overlap_tokens[index],
             }
         )

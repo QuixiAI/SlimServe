@@ -22844,3 +22844,42 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   Raw: runtime-control/b12x-client-stream-windows.json (all18 measured rounds
   from cached boot3/cold boot1, with per-file hashes), client-stream-tests.xml.
   Full fixed cold-prefix series is still running; no aggregate conclusion yet.
+
+## 2026-09-08: Fixed B12X cold-prefix control completes all three starts
+
+- Status: reproducible competitive reference complete, not our selected quant.
+  Pinned R28.1 image52ef7badcc33918f, checkpoint46aaae8a82032f77; host-driver
+  selection and qualified exact-source native-SM120 FA2 only. No speculation,
+  DCP1, FP8 KV/W4A4, stock launcher scheduling4096/prefill_compute_share0.4.
+- Three prescribed starts x three repeats at c1/c8/c16, same exact1000/300
+  prompts/sampling as SlimServe. All27 rounds/225 requests pass. All measured
+  and warmup requests have unique cache salts and integer cached_tokens=0.
+  Benchmark client hashes remain frozen across the complete series; concurrent
+  commits touch only independent probes/analysis/docs, not the image/runtime.
+- Startup138.064563/136.039447/134.039211s. All text/image canaries pass on
+  final content, raw reasoning/content events retained. Quality4096-token
+  means -2.916894296/-2.917379347/-2.921712622; all18 needle contrasts pass,
+  minimum margin32.258711. No broader decode/capability claim from these gates.
+- E2E medians c1/c8/c16:132.588202/466.689648/589.276219 tok/s. Nine-sample
+  ranges132.400869-132.764968/461.009213-468.487829/586.516883-591.614648.
+  Client-decode medians156.601937/499.853053/615.391925; these include cold
+  prefill staggering, as shown in the preceding stream-window diagnostic.
+- Cold32K/128K engine TTFT medians2713.979357/10824.442989ms, ranges
+  2708.853888-2718.854752/10814.977150-10860.871286, nine samples each.
+  Client TTFT medians2758.722974/10943.871166ms. All cached_tokens=0;
+  one warmup/length/start retained separately, including slower128K warmups.
+- Controller exits0; all three containers stop normally, exit0/no OOM and
+  are removed by their owner. GPU processes are absent after completion.
+  Systemd controller16GiB/no swap, Docker150GiB/no swap. No competing GPU
+  work or native builds, no driver/clock/power/transport changes.
+- Decision: retain as the first complete current cold-prefix B12X reference.
+  Do not turn scheduler/cache differences into a sustained-kernel claim or
+  call this every possible B12X configuration. Next: unchanged registered
+  SlimServe recipe, --cold-prefix --quality --prefill, three starts/three
+  repeats without a profiler, then the bounded whole-graph observer control
+  and actual-weight paired mHC experiment.
+- Raw: perf/results/2026-09-08/b12x-r281-cold-serving/ (sourcef918c0798),
+  runtime-control/b12x-r281-cold-serving.log and
+  b12x-cold-client-stream-windows.json (all27 measured rounds). The analysis
+  now also handles one coalesced chunk without fabricating a decode rate;
+  seven CPU tests pass at runtime-control/client-stream-edge-tests.xml.

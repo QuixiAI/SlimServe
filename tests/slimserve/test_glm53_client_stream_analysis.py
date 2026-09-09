@@ -52,6 +52,19 @@ def test_no_all_active_intersection_does_not_fabricate_a_rate():
     assert result["client_arrival_tps"] is None
 
 
+def test_single_coalesced_chunk_has_no_measurable_decode_window():
+    data = receipt()
+    row = data["requests"][0]
+    data["requests"] = [row]
+    row["chunks"] = [{"seconds": 5.0, "tokens": 5}]
+    row["first"] = row["last"]
+    row["usage"]["prompt_tokens_details"] = None
+    result = analyze(data)
+    assert result["all_active_intersection"]["client_arrival_tps"] is None
+    assert result["requests"][0]["inter_chunk_ms"]["count"] == 0
+    assert result["requests"][0]["max_gap_after_chunk"] is None
+
+
 @pytest.mark.parametrize("invalid", ["time", "count", "endpoint", "nan"])
 def test_bad_chunk_receipts_are_rejected(invalid):
     data = receipt()
