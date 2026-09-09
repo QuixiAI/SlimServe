@@ -228,9 +228,21 @@ op fixture cache between independent cases fixes it, with no serving-limit
 change. Both attempts are retained. Next: ONE start/three full quality passes
 in index-layer23-quality-diagnostic/, same canonical MoE/index-order flags,
 TC0/native/recipe and exact prompt IDs. Only the archive target changes3->23.
-Capture layer23 logits/ranges/indices to verify the suspected cutoff-tie
-membership issue. No reselection/tie-policy change until that capture; TC stays
-OFF and both ordering kernels remain diagnostic, not production defaults.
+The prescribed layer23 run now completes on4cead10f6: all348 archives and168
+zero-cache quality requests verify. All25 upstream tensors are identical
+within ranks AND across allnine old/new pass pairs. Actual cutoff ambiguity
+is proven: row6329 has1582 visible pools,511 scores above -8.358503341674805,
+and exactly two at that score: pool994 and1398. GPUs0/2 swap994->1398 andGPU3
+swaps1398->994 in pass1 versus2/3; GPU1 stays fixed. All other selected members
+match. This is exact cutoff membership variability, not invalid top-k scores.
+Short scores/all1024 short tensors/1K and8K-position0.75 stay exact; other long
+scores vary, max0.811271nat at8K and0.687448nat at32K. Pass2/3 of the traced
+true-code request match all94 tensors, but distractors still vary.
+Raw index-layer23-quality-diagnostic/, runtime-control/index-layer23-
+{quality-analysis,observer-comparison}.json. Next implement/qualify a bounded
+opt-in native tie policy at the selector origin, preserving all score values
+and strictly-better selections. TC stays OFF and both ordering kernels remain
+diagnostic, not production defaults; full-workload repeatability is unsolved.
 Upstream issue52525/PR52532 independently report Marlin ordering sensitivity;
 the draft PR uses a post-alignment Torch sort, not a finished fast-path answer.
 Keep the current recipe/native arithmetic;

@@ -24484,3 +24484,48 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   baseline from this serialized instrumented run.
 - Raw qualification: runtime-control/index-layer23-{cpu,gpu}-tests.xml/log
   (first attempt), index-layer23-final-{cpu,gpu}-tests.xml/log (final).
+
+## 2026-09-09 - Actual layer23 capture proves exact cutoff membership variability
+
+- Status: prescribed4cead10f6 run complete; tie hypothesis verified on actual
+  full-model matrices, not yet a tie-policy intervention or full-repeatability fix.
+- All75 priming requests/168 zero-cache quality requests complete,12,288 text
+  scores/18 positive contrasts. All348 archives, source/native/HTTP receipts,
+  semantic routes, zero workspaces and buffer links verify. All12 long traces
+  have7616+583 chunks/all11 layers/94 tensors. Every rank archives221,004,780
+  index bytes. No source/native changes during serving or analysis. Exit0,
+  GPUs released0.144578s; transient worker zombie retained in teardown record.
+- Cross-run observer check: same recipe/native; Git-tree source hashes verify.
+  All25 recorded tensors before layer23 selection match within each rank across
+  ALLnine145467c58/4cead10f6 pass combinations. All1024 short model tensors and
+  all4096 text scores are also exact across both runs. The observer-only archive
+  change does not introduce a different upstream input at this boundary.
+- Actual saved logits:7616x1904 FP32; exactly one ambiguous row6329 on every
+  rank/pass.1582 visible pools,511 strictly above cutoff -8.358503341674805
+  (float hex -0x1.0b78dc0000000p+3), exactly TWO equal-cutoff pools994/1398.
+  Pass1->2 and1->3: GPUs0/2 replace994 with1398; GPU3 replaces1398 with994.
+  GPU1 stays fixed. Each affected pair changes one selected member (symmetric
+  difference2), producing131 shifted positions in the already-sorted output.
+  All other members match; every selected score set is independently valid.
+  This is a NONZERO NEGATIVE tie, not a zero-tail or undefined-tail artifact.
+- First difference is layer23 indices onGPU0/2/3, then layer27 logits on all
+  ranks. Pass2/3 of the traced true-code request have all94 tensors identical;
+  its distractor requests still vary. Short scores at mean -2.7282744364256297,
+  1K needles and8K-position0.75 remain exact. Other quality scores vary:
+ 8K-position0.25 max0.811271nat,32K max0.687448nat. Do not infer full stability.
+- Decision: implement/qualify a separate opt-in native tie-break at the selector
+  origin (pool ID, not temporary atomic arrival position), including the large
+  equal-bin path. Keep score arithmetic and all strictly-better choices intact.
+  Test saved real matrices, synthetic tie/boundary cases, changed-input graphs,
+  sanitizers and the complete prescribed model workload before any promotion.
+  Both existing sorts stay diagnostic; TC remains OFF and quality gate unchanged.
+- Serialized E2E107.436/458.838/645.337 tok/s is diagnostic-only, NOT a baseline.
+  Raw index-layer23-quality-diagnostic/;
+  runtime-control/index-layer23-quality-analysis.json
+  SHAb51c5cee6127c495d9206de98fc4a01d88189d420fdb9fa0296ba0bcf2d54922;
+  index-layer23-observer-comparison.json
+  SHAda4bc8b552e983b47d011f0b375b390eb7d0917f67691b403d08954642bc7a51.
+  Scratch analyzers analyze_layer23_indexer_trace.py, verify_layer23_indexer_trace.py,
+  compare_layer23_capture.py; all source hashes recorded. Five CPU analyzer
+  fixtures pass (1.20s), raw layer23-analysis-fixtures.xml/log; first-pass-only
+  cutoff inspection retained in layer23-first-pass-inspect.log.
