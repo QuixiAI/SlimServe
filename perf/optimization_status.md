@@ -21902,3 +21902,66 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: perf/results/2026-09-08/indexer-tiles/{selection,memcheck,racecheck,
   synccheck,cpu}-tests.xml and {memcheck,racecheck,synccheck}.log.
   Planned serving output: perf/results/2026-09-08/indexer-tile-serving/.
+
+### Serving progress and prescribed return control
+
+- Candidate commit 426282462 is running its fixed three-start campaign. First
+  two starts complete all exact requests, canaries and expanded quality gates.
+  32K engine TTFT medians 2600.013/2606.201 ms; 128K 10901.007/10956.368 ms.
+  These are interim observations, not a promoted baseline. Third start remains.
+- First-start rank0 trace confirms the actual candidate: pooled-indexer scoring
+  at context 60928 falls 68.612 -> 42.813 ms against cold-prefill-profile/,
+  while the whole chunk span falls 643.884 -> 622.791 ms. Other work varies;
+  do not turn that one profiled chunk into a whole-request throughput claim.
+  Its c1 graph still has 1185 kernels and 427.228 us mean no-kernel-active time.
+- Before accepting, run one prescribed return-to-original start with three
+  repetitions, identical quality/cold-prefill/trace workload, flag set to 0.
+  This checks temporal drift after the full candidate series, not a search
+  for a favorable start. Output: indexer-tile-return-control/ in this directory.
+- Only unrelated diagnostic files were authored during this series. Its
+  serving code, native libraries, profile and campaign harness remain frozen.
+
+## 2026-09-08: Next isolated diagnostics prepared during serving validation
+
+- Runtime control: benchmarks/probe_cuda_ipc_nccl.py checks actual every-pair
+  CUDA IPC remote writes, then small and 62390272-byte BF16 NCCL reductions.
+  It records the first failing phase and loaded libcuda/libcudart/libnccl paths;
+  it does not qualify B12X's custom collective. Three CPU contract tests pass.
+  GPU validation is deferred until the serving campaign releases the devices.
+- B12X reference refreshed: R28.1 is now published, digest
+  sha256:52ef7badcc33918f276d778d29bd972a798297584ba776476c7c09b7bdb50e5f.
+  It remains a different ModelOpt W4A4 checkpoint with FP8 target KV. Its CUDA
+  13.3 base is unchanged. Existing local R24 image puts CUDA compat libraries
+  before the host driver in LD_LIBRARY_PATH. NVIDIA documents CUDA 13.x minor
+  compatibility on driver >=580, with feature/PTX limitations. Neither the
+  CUDA version label nor the old collective timeout proves the exact cause;
+  test the loaded-library/IPC/collective path before another model load. No
+  host driver change, image pull, or competing GPU process during timing.
+  Sources: https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm-5.3-flash.md
+  and https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html
+  and https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html .
+- Kernel hypothesis: preserve checkpoint BF16 mHC fn storage instead of its
+  FP32 upcast, converting operands to FP32 inside the unchanged serving kernel
+  templates. Base/scale remain native FP32. This is lossless storage, not FP16
+  re-quantization or reduced-precision accumulation. The isolated probe refuses
+  non-finite/non-roundtrippable values and requires bit-exact installed/eager/
+  changed-input graph output at all 90 real sites and three magnitudes.
+- Relevant prior: the 2026-09-07 phase probe reported 7.2 versus 7.4 us for
+  FP16 fn, but used one hot synthetic matrix, three Sinkhorn iterations and a
+  fused norm via test_quixicore_dsv4_mhc_modes. The old prefill probe used one
+  synthetic matrix and FP16 conversion, not lossless actual BF16 storage.
+  Do not infer a production gain from either. New timing rotates two copies
+  of all 90 fn tensors (135 MiB even for BF16), uses GLM's twenty iterations
+  and separate norm, and requires fixed A/B/A rounds. Large prefill shapes
+  are correctness-only to bound GPU allocations.
+- New files: benchmarks/kernels/benchmark_glm53_mhc_storage.py and
+  mhc_storage_probe.cu. The shared isolated build helper accepts a module name;
+  its original default is unchanged. All 150 CPU SlimServe tests pass, and the
+  isolated extension builds/loads with CUDA 13.0 under an 80 GiB host cap.
+  No serving integration or mHC GPU validation yet. Build log: mhc-storage/build.log.
+- Host runtime probe now passes on all four ranks: every pair's remote write
+  verified, imports closed before exports freed, all three NCCL reductions
+  exact. Loaded host libcuda 580.173.02, CUDA runtime 13.0, NCCL 2.29.7;
+  P2P enabled with SYS level. This establishes the host control for a later
+  container comparison, not the container or its custom all-reduce path.
+  Raw: perf/results/2026-09-08/runtime-control/host-native/rank-*.json.

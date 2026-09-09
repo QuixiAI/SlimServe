@@ -17,7 +17,7 @@ from pathlib import Path
 import torch
 
 
-def build(directory):
+def build(directory, name="mhc_output_parallel_probe"):
     from torch.utils.cpp_extension import CUDA_HOME, load
 
     if CUDA_HOME is None:
@@ -33,8 +33,8 @@ def build(directory):
     root = Path(__file__).resolve().parents[2]
     directory.mkdir(parents=True, exist_ok=True)
     return load(
-        name="mhc_output_parallel_probe",
-        sources=[str(Path(__file__).with_name("mhc_output_parallel_probe.cu"))],
+        name=name,
+        sources=[str(Path(__file__).with_name(name + ".cu"))],
         extra_include_paths=[str(root / "csrc/quixicore/serving")],
         extra_cflags=["-O3"],
         extra_cuda_cflags=[
