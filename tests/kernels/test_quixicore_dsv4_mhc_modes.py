@@ -92,7 +92,7 @@ def _assert_close(a, b, exact):
             torch.testing.assert_close(ta.float(), tb.float(), atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_pre_modes_agree(fn_dtype, with_norm):
     residual, fn, hc_scale, hc_base, _, norm_weight = _inputs(1, fn_dtype)
@@ -107,7 +107,7 @@ def test_pre_modes_agree(fn_dtype, with_norm):
     _assert_close(split, ref, exact=False)
 
 
-@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_fused_post_pre_modes_agree(fn_dtype, with_norm):
     residual, fn, hc_scale, hc_base, x, norm_weight = _inputs(2, fn_dtype)

@@ -49,6 +49,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--replays", type=int, default=20)
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--check-installed-bf16", action="store_true")
     parser.add_argument("--build-only", action="store_true")
     args = parser.parse_args()
     if min(args.rounds, args.replays, *args.batch) < 1 or max(args.batch) > 7616:
@@ -85,12 +86,16 @@ def main():
         Path(__file__).with_name("mhc_storage_probe.cu"),
         Path(__file__).with_name("benchmark_mhc_output_parallel.py"),
         root / "csrc/quixicore/serving/mhc_ampere.cuh",
+        root / "csrc/quixicore/tm_cuda/tm_cuda_serving.cu",
     ]
     result = {
         "status": "running",
         "diagnostic_only": True,
         "method": __doc__,
         "git": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+        "git_status": subprocess.check_output(
+            ["git", "status", "--short"], text=True
+        ).strip(),
         "source_sha256": {
             str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
             for p in sources
@@ -150,18 +155,27 @@ def main():
                         original = extension.run(*data, fused)
                         exact(installed(data, fused), original)
                         exact(original, extension.run(*candidate, fused))
+                        if args.check_installed_bf16:
+                            exact(original, installed(candidate, fused))
                         # Both storage forms share the same changing activations.
                         graph = torch.cuda.CUDAGraph()
                         torch.cuda.synchronize()
                         with torch.cuda.graph(graph):
                             a = extension.run(*data, fused)
                             b = extension.run(*candidate, fused)
+                            c = (
+                                installed(candidate, fused)
+                                if args.check_installed_bf16
+                                else None
+                            )
                         for replay in range(3):
                             fresh = inputs(batch, 2001 + site * 3 + replay, magnitude)
                             for target, source in zip(data[:4], fresh[:4]):
                                 target.copy_(source)
                             graph.replay()
                             exact(a, b)
+                            if c is not None:
+                                exact(a, c)
                         row["status"] = "bit_exact"
                     save()
                 if site % 15 == 0:

@@ -23,6 +23,7 @@ sparse MLA kernel. The MTP head (layer 45) and video inputs are later
 phases.
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -51,10 +52,11 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-import vllm.model_executor.layers.glm5_next_mhc_ops  # noqa: F401  (registers torch.ops.vllm.glm5_mhc_*)
 from vllm.model_executor.layers.glm5_next_indexer import (
     Glm5NextPooledIndexer,
 )
+# Import also registers the compile-opaque torch.ops.vllm.glm5_mhc_* operators.
+from vllm.model_executor.layers.glm5_next_mhc_ops import load_lossless_mhc_fn
 from vllm.model_executor.layers.mla import (
     MLAModules,
     MultiHeadLatentAttentionWrapper,
@@ -80,6 +82,7 @@ from vllm.model_executor.models.utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
@@ -401,13 +404,20 @@ class Glm5NextDecoderLayer(nn.Module):
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
 
-        def _p(*shape):
+        def _p(*shape, dtype=torch.float32):
             return nn.Parameter(
-                torch.empty(*shape, dtype=torch.float32), requires_grad=False
+                torch.empty(*shape, dtype=dtype), requires_grad=False
             )
 
-        self.hc_attn_fn = _p(mix_hc, hc_dim)
-        self.hc_ffn_fn = _p(mix_hc, hc_dim)
+        # Disabled until fixed real-profile validation. Only the original BF16
+        # projection storage changes; native FP32 base/scale repairs stay FP32.
+        bf16_fn = os.getenv("VLLM_GLM5_MHC_BF16_FN", "0") == "1"
+        fn_dtype = torch.bfloat16 if bf16_fn else torch.float32
+        self.hc_attn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)
+        self.hc_ffn_fn = _p(mix_hc, hc_dim, dtype=fn_dtype)
+        if bf16_fn:
+            for param in (self.hc_attn_fn, self.hc_ffn_fn):
+                set_weight_attrs(param, {"weight_loader": load_lossless_mhc_fn})
         self.hc_attn_base = _p(mix_hc)
         self.hc_ffn_base = _p(mix_hc)
         self.hc_attn_scale = _p(3)

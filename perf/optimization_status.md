@@ -22109,3 +22109,65 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Next: finish race gates; then opt-in native BF16 dispatch and guarded
   load-time storage, with installed-kernel tests and fixed real-profile
   serving/quality validation. Do not change the registered default yet.
+
+### Native BF16 mHC dispatch ready for fixed serving validation
+
+- All four isolated race shapes (1/8/16/65), first 96 matching mHC launches
+  each with four workers, finish with zero errors/warnings. Full memcheck and
+  filtered synccheck were already clean. Existing arithmetic templates remain
+  unchanged; add BF16 fn dispatch alongside the existing FP32/FP16 branches.
+- Add VLLM_GLM5_MHC_BF16_FN=1, default OFF. Model construction allocates only
+  hc_attn_fn/hc_ffn_fn in BF16 and attaches a checked loader. The loader rejects
+  non-finite/non-roundtrippable values and wrong shapes/dtypes BEFORE copying.
+  Base/scale remain FP32, and all kernel operands/accumulators remain FP32.
+  This is lossless storage, not a recipe change or new activation quantization.
+- Native build: cmake --build
+  /home/tiny/.local/scratch/slimserve-glm53/build-native-sm120
+  --target _quixicore_C -j2, CUDA13.0/sm120f, existing Release flags,
+  systemd MemoryMax=80G/MemorySwapMax=0. Only serving.cu recompiles. Rebuilt
+  library SHA256 f52c2d3d27a30567c313fd6ce6928e5046850f4dc008b0e085dc31ec463241fe.
+  Original SHA256 256e4f70e305dc92e3fecfac409b5ddcec78de8f0ef54e4fd1d30b31797fd99b
+  is preserved in mhc-storage/quixicore-before.so. Other native libraries stay.
+- Installed import succeeds. All 7020 actual-site cases over 13 batch shapes
+  (1/2/4/8/9/16/32/63/64/65/128/129/7616) pass bit-exact installed FP32,
+  isolated FP32/BF16 and installed BF16 comparisons, including three changed
+  graph replays/case. All 50 broader mode/prefill operator tests pass, including
+  BF16, FP16, FP32 and optional norm; full-suite memcheck reports zero errors.
+  Targeted installed BF16 racecheck (all modes plus 33-row prefill, eight tests)
+  reports zero errors/warnings. All 160 CPU SlimServe tests pass, including
+  checked loading and registered fake-op output dtypes. All 48 preexisting
+  mHC kernels preserve resource
+  usage; 21 BF16 variants are added. Initial unfiltered resource extraction
+  was truncated; native-resources.json explicitly records its replacement by
+  complete prefiltered output. No kernel-resource regression was established.
+- Serving plan prescribed BEFORE measuring: one FP32 control start, three
+  BF16 candidate starts, one FP32 return control. Every start gets three exact
+  1000/300 repetitions at c1/c8/c16, text/image canaries, 4096-token quality,
+  cold 32K/128K prefill and post-timing traces. Use the same new native binary,
+  selected recipe and indexer geometry throughout; change only the mHC flag.
+  No retained E2E mHC gain yet and no profile default promotion.
+- Output directories under perf/results/2026-09-08/:
+  mhc-storage-fp32-control/, mhc-storage-serving/, mhc-storage-return-control/.
+  Command is the indexer serving campaign above, with INDEXER_SM120_TILES=1
+  fixed, VLLM_GLM5_MHC_BF16_FN=0/1/0 and --boots 1/3/1 respectively.
+  All commands retain --repeats 3 --traces --quality --prefill --prefill-traces
+  and the 150-GiB serving memory cap. No competing GPU/native-build jobs.
+- Raw kernel gates: mhc-storage/{installed-checks.json,native-build.log,
+  native-resources.json,operator-tests.xml,installed-memcheck.log,
+  installed-racecheck.log,installed-racecheck-tests.xml,final-cpu-tests.xml}.
+
+### Current R28.1 runtime control
+
+- Pull the published digest 52ef7badcc33918f276d778d29bd972a798297584ba776476c7c09b7bdb50e5f.
+  Its embedded /opt/glm53-flash/source.lock matches published SHA256
+  4473b46dbf696a386da1fbd6f75e7ef9159c36d216d153c6beb5cfe68b7a7477.
+- All four ranks pass the standard model-free IPC/remote-write/NCCL probe
+  with the same 16-GiB/150-second limits. Loaded host libcuda580.173.02,
+  CUDA13.3.29 and NCCL2.31.2; P2P enabled/SYS. This uses the explicit probe
+  entrypoint, not the serving launcher or its custom collective setup.
+- Current public checkpoint revision is 46aaae8a82032f77100f2f03e9cc11b391df3b4d,
+  matching the cached snapshot (Hugging Face API verified live). Future matched
+  control can pin both model and image. It remains a different W4A4/FP8-KV
+  reference, not a silent replacement for our RedHatAI W4A16/BF16-KV recipe.
+- Raw: perf/results/2026-09-08/runtime-control/r281-standard/rank-*.json.
+  Full current competitive serving control remains owed.

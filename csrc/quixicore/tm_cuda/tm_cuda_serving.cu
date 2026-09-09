@@ -512,6 +512,12 @@ static void launch_dsv4_mhc_pre_transition_selected(
         } else {
             LAUNCH_MHC_TYPED(half, 64);
         }
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        if (dsv4_mhc_splits() == 32) {
+            LAUNCH_MHC_TYPED(__nv_bfloat16, 32);
+        } else {
+            LAUNCH_MHC_TYPED(__nv_bfloat16, 64);
+        }
     } else if (dsv4_mhc_splits() == 32) {
         LAUNCH_MHC_TYPED(float, 32);
     } else {
@@ -575,6 +581,9 @@ static bool launch_dsv4_mhc_partials_prefill(
             x, residual, post, comb,
             reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
             partial, T);
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, __nv_bfloat16>(
+            x, residual, post, comb, bp(fn), residual_out, partial, T);
     } else {
         launch_dsv4_mhc_partials_prefill_typed<FUSED_POST, float>(
             x, residual, post, comb, fp(fn), residual_out, partial, T);
@@ -593,6 +602,11 @@ static void launch_dsv4_mhc_partials(
                 x, residual, post, comb,
                 reinterpret_cast<const half*>(fn.data_ptr()), residual_out,
                 partial, hidden_size);
+    } else if (fn.scalar_type() == torch::kBFloat16) {
+        dsv4_mhc::partials<NOUT, FUSED_POST, __nv_bfloat16>
+            <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
+                x, residual, post, comb, bp(fn), residual_out, partial,
+                hidden_size);
     } else {
         dsv4_mhc::partials<NOUT, FUSED_POST, float>
             <<<grid, dsv4_mhc::THREADS, 0, stream()>>>(
@@ -609,8 +623,9 @@ static std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> py_dsv4_mhc_pre(
     CK(residual); CK(fn); CK(hc_scale); CK(hc_base);
     TORCH_CHECK(residual.scalar_type() == torch::kBFloat16, "residual must be bf16");
     TORCH_CHECK(fn.scalar_type() == torch::kFloat32 ||
-                fn.scalar_type() == torch::kFloat16,
-                "fn must be float16 or float32");
+                fn.scalar_type() == torch::kFloat16 ||
+                fn.scalar_type() == torch::kBFloat16,
+                "fn must be bfloat16, float16 or float32");
     const int T = residual.size(0), H = residual.size(2);
     TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
                 "DSV4 mHC expects hc_mult=4 and 24 mix rows");
@@ -676,10 +691,11 @@ py_dsv4_mhc_fused_post_pre(
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16 &&
                 residual.scalar_type() == torch::kBFloat16, "x/residual must be bf16");
     TORCH_CHECK((fn.scalar_type() == torch::kFloat32 ||
-                 fn.scalar_type() == torch::kFloat16) &&
+                 fn.scalar_type() == torch::kFloat16 ||
+                 fn.scalar_type() == torch::kBFloat16) &&
                 post_mix.scalar_type() == torch::kFloat32 &&
                 comb_mix.scalar_type() == torch::kFloat32,
-                "mHC fn must be float16/float32 and mixes must be float32");
+                "mHC fn must be bfloat16/float16/float32 and mixes must be float32");
     const int T = residual.size(0), H = residual.size(2);
     TORCH_CHECK(residual.size(1) == dsv4_mhc::HC && fn.size(0) == dsv4_mhc::MIXES,
                 "DSV4 mHC expects hc_mult=4 and 24 mix rows");

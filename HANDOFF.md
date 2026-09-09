@@ -40,11 +40,20 @@ changed-input graphs, memcheck, racecheck and synccheck pass. Other platforms
 keep their original geometry. Raw: perf/results/2026-09-08/indexer-tiles/,
 indexer-tile-serving/ and indexer-tile-return-control/.
 
-Current isolated kernel hypothesis: retain mHC fn's original BF16 storage
-with unchanged FP32 arithmetic, rather than its lossless FP32 upcast. The
-probe builds from existing templates and requires bit-exact outputs at all
-90 actual sites; no serving mHC integration yet. Separately, qualify the
-current B12X runtime/collectives before a matched competitive serving control.
+Current kernel candidate: retain mHC fn's original BF16 storage with unchanged
+FP32 arithmetic. All 7020 installed-kernel cases pass bit-exact at all 90 sites
+over 13 batch shapes, including changed-input graphs/full prefill chunks.
+Broader operator tests and sanitizer gates pass. VLLM_GLM5_MHC_BF16_FN=1 is
+opt-in and default OFF; checked loading refuses changed checkpoint values,
+and native FP32 base/scale repairs stay intact. The rebuilt library and backup
+hashes are in the notebook. Next fixed sequence: one FP32 control start,
+three BF16 starts, one FP32 return, all on the same rebuilt binary and full
+campaign workload. No retained serving gain or profile promotion yet.
+
+The digest-pinned R28.1 reference image is downloaded; its source lock and
+four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
+matches the cached model. The actual serving launcher/custom all-reduce and
+a matched competitive serving benchmark still need qualification.
 
 The repaired Marlin library has completed the fixed three-start serving campaign:
 all 27 exact timing runs, text/image canaries and expanded quality checks pass.

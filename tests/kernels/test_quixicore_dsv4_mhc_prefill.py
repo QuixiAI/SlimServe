@@ -91,7 +91,7 @@ def _close(a, b):
 
 
 @pytest.mark.parametrize("T", [33, 256, 1000])
-@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_pre_prefill_kernel_agrees(T, fn_dtype, with_norm):
     residual, fn, hc_scale, hc_base, _, _, _, norm_weight = _inputs(1, T, fn_dtype)
@@ -112,7 +112,7 @@ def test_pre_prefill_kernel_agrees(T, fn_dtype, with_norm):
 
 
 @pytest.mark.parametrize("T", [33, 256, 1000])
-@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("fn_dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_fused_prefill_kernel_agrees_and_residual_is_bit_exact(T, fn_dtype, with_norm):
     residual, fn, hc_scale, hc_base, x, post, comb, norm_weight = _inputs(
