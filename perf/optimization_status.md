@@ -23525,3 +23525,21 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `python -m benchmarks.kernels.benchmark_glm53_mhc_tc_qualified --census
   perf/results/2026-09-09/mhc-tc-accuracy-census --output
   perf/results/2026-09-09/mhc-tc-qualified-timing` inside a16GiB/no-swap scope.
+- Broader CPU regression:313 pass/one GPU-only skip,14 existing TorchScript
+  deprecation warnings. CUDA_VISIBLE_DEVICES was empty for this CPU suite;
+  no GPU interference or frozen-census source changes. Raw
+  runtime-control/mhc-accuracy-full-cpu-tests.{xml,log}.
+- Sanitizer execution prescribed before results: after full accuracy and
+  isolated timing, run the accuracy checker at sites0/89, batches64/65/129/7616
+  under memcheck, then synccheck, with --error-exitcode86 and no kernel-count
+  cap (48 eager cases plus144 graph phases per tool). Filter the new candidate
+  with --kernel-name kns=mhc_tc_probe; unchanged native/Torch kernels are not
+  claimed as newly sanitized. Mangled pre/fused symbols were verified in the
+  original probe's SASS dump. Then three separate racecheck processes at
+  batches64/65/129, sites0/89, --launch-count24 --racecheck-num-workers4:
+  only the first24 matching candidate launches per process are instrumented,
+  not every site/magnitude or the full7616-row race case. Each checker still
+  executes all12 selected eager cases/36 graph phases; record both coverage
+  limits explicitly. All runs16GiB/no swap, one GPU job at a time, no build.
+  Require checker completion, sanitizer exit0 and zero reported errors;
+  a complete checker JSON alone does not pass a failed sanitizer launch.
