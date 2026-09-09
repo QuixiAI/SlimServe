@@ -6,6 +6,8 @@ Start its real profile with --request-metrics. Every request has a unique cache
 salt and must report zero cached prompt tokens. Client TTFT includes transport
 and frontend work. Engine TTFT is scheduled-to-first-token, NOT pure GPU prefill.
 All warmups, repetitions, streaming events and failures are retained.
+Optional traces use additional cold requests after ALL timed measurements;
+their timings are diagnostic only and never enter the aggregates.
 """
 
 import argparse
@@ -129,6 +131,26 @@ def request(url, model, ids, output_tokens, output, salt):
     return row["summary"]
 
 
+def profile_control(url, action):
+    req = urllib.request.Request(
+        url.rstrip("/") + "/" + action,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=600) as response:
+        response.read()
+
+
+def profiled_request(url, model, ids, output_tokens, output, salt):
+    # Unlike the decode profiler, start BEFORE submitting the prompt. The
+    # server's iteration cap may cover only a prefix of a long prefill.
+    profile_control(url, "start_profile")
+    try:
+        return request(url, model, ids, output_tokens, output, salt)
+    finally:
+        profile_control(url, "stop_profile")
+
+
 def run(args, tokenizer):
     if min(args.repeats, args.warmups, args.output_tokens, *args.contexts) < 1:
         raise ValueError(
@@ -203,6 +225,37 @@ def run(args, tokenizer):
                 }
                 for key in rows[0]
             }
+        if getattr(args, "traces", False):
+            result["trace_requests"] = []
+            for context in args.contexts:
+                salt = secrets.token_hex(32)
+                if salt in used_salts:
+                    raise ValueError("duplicate cache salt")
+                used_salts.add(salt)
+                path = args.output / f"profile-ctx{context}.json"
+                row = {
+                    "context": context,
+                    "path": str(path),
+                    "diagnostic_only": True,
+                    "status": "running",
+                }
+                result["trace_requests"].append(row)
+                save()
+                try:
+                    row["summary"] = profiled_request(
+                        args.url,
+                        args.model,
+                        ids[:context],
+                        args.output_tokens,
+                        path,
+                        salt,
+                    )
+                    row["status"] = "complete"
+                except Exception as error:
+                    row.update(status="failed", error=repr(error))
+                    raise
+                save()
+                print(json.dumps(row), flush=True)
         result["status"] = "complete"
     except Exception as error:
         result.update(status="failed", error=repr(error))
@@ -225,6 +278,14 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--output-tokens", type=int, default=8)
+    parser.add_argument(
+        "--traces",
+        action="store_true",
+        help=(
+            "additional cold profiler requests after all timings; "
+            "needs a profiler-enabled server"
+        ),
+    )
     args = parser.parse_args()
     run(args, AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True))
 

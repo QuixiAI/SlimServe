@@ -21753,3 +21753,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   profile cold-prefill phases before selecting a prefill optimization.
 - Raw: perf/results/2026-09-08/marlin-repair-serving/. Native regression and
   sanitizer evidence remains in marlin-schedule/ as recorded above.
+
+## 2026-09-08: Reject existing mHC + norm fusion and prepare prefill traces
+
+- Status: fusion rejected; no serving operator or native change. Probe
+  ff264b3d7 uses all 90 real mHC/norm parameter sets, three input magnitudes,
+  batches 1/2/4/8 and three changed-input graph replays. All 2160 checks pass:
+  exact residual/post/comb, norm within one BF16 ULP of compiled reference
+  and independent FP64 norm. Synthetic activations, not an E2E quality claim.
+- Five A/B/A rounds x twenty replays across rotating actual parameters:
+  separate / fused / separate medians (us/site) at batches 1/2/4/8 are
+  11.903/15.172/11.899, 11.535/11.789/11.539,
+  12.834/13.016/12.837 and 14.270/14.471/14.273. Paired speed changes
+  -21.54% / -2.14% / -1.37% / -1.42%; the batch1 preflight also lost 21.57%.
+  Retain both artifacts. Extra norm reduction/tail work is present in source;
+  the larger batch1 penalty is not yet attributed. Do not assume node removal
+  is a win. No sanitizer/serving campaign is warranted for this losing variant.
+- Raw: perf/results/2026-09-08/mhc-norm/{preflight,census}.json and archived
+  generated serving norm. Diagnostic remains quarantined under benchmarks.
+- Next: fresh long-prefill attribution. Add --prefill-traces to the campaign
+  (requires --prefill), reusing the real profile and its eight-iteration Torch
+  profiler. Additional cache-cold requests start profiling BEFORE submitting
+  the exact prompt; the old decode profiler starts after the first output.
+  All normal TTFT measurements finish first. Trace request timings are stored
+  separately and excluded from aggregates. A 128K trace may cover only the
+  first eight chunks; inspect detailed iteration annotations before attribution.
+- CPU tests cover profiler start/request/stop order, stop on request failure,
+  unique cache salts, exact prompt prefixes and exclusion of trace timings.
+  All 139 SlimServe tests pass; touched Python lint and diff checks pass.

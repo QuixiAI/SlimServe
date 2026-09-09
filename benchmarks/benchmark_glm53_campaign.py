@@ -241,7 +241,14 @@ def main():
         action="store_true",
         help="record cold-cache 32K/128K exact-ID TTFT after other workloads",
     )
+    ap.add_argument(
+        "--prefill-traces",
+        action="store_true",
+        help="with --prefill, trace additional cold requests after all TTFT timings",
+    )
     args = ap.parse_args()
+    if args.prefill_traces and not args.prefill:
+        ap.error("--prefill-traces requires --prefill")
     if min(args.boots, args.repeats, *args.concurrency) < 1 or args.output_tokens < 2:
         ap.error("boots, repeats and concurrency must be positive; output tokens >= 2")
     machine = hardware.detect()
@@ -315,7 +322,7 @@ def main():
             str(port),
             "-y",
         ]
-        if args.traces:
+        if args.traces or args.prefill_traces:
             argv += ["--torch-profile-dir", str(folder / "traces")]
         if args.routing:
             argv += ["--route-profile-dir", str(folder / "routing")]
@@ -457,6 +464,7 @@ def main():
                             repeats=3,
                             warmups=1,
                             output_tokens=8,
+                            traces=args.prefill_traces,
                         ),
                         tokenizer,
                     )
