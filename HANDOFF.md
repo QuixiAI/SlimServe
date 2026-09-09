@@ -54,6 +54,13 @@ The digest-pinned R28.1 reference image is downloaded; its source lock and
 four-rank model-free IPC/NCCL probes pass. Its current checkpoint revision
 matches the cached model. The actual serving launcher/custom all-reduce and
 a matched competitive serving benchmark still need qualification.
+`benchmarks/benchmark_glm53_b12x.py` now prepares a fixed three-start control
+through that image's supported no-spec/DCP1/VRAM launcher; it reuses the exact
+SlimServe workload functions via `benchmark_glm53_server.py`. CPU lifecycle,
+failure-retention and tokenizer gates pass. Both tokenizers produce identical
+427489 full-source token IDs despite serialized-default/template differences.
+Do not run this GPU control alongside the active mHC series. It is a different
+W4A4/FP8-KV configuration, never a replacement for the selected recipe.
 
 The repaired Marlin library has completed the fixed three-start serving campaign:
 all 27 exact timing runs, text/image canaries and expanded quality checks pass.

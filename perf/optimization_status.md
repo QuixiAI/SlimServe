@@ -22171,3 +22171,66 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   reference, not a silent replacement for our RedHatAI W4A16/BF16-KV recipe.
 - Raw: perf/results/2026-09-08/runtime-control/r281-standard/rank-*.json.
   Full current competitive serving control remains owed.
+
+## 2026-09-08: Prepare current B12X control without changing the selected recipe
+
+- Status: CPU/client and launcher inspection complete; real competitive serving
+  has NOT run. The fixed mHC storage A/B/A sequence owns the GPUs first.
+- Baseline: retained SlimServe indexer 155.98/574.79/778.96 E2E tok/s, fixed
+  RedHatAI recipe v1. The old R24 control disabled P2P/custom all-reduce and is
+  not the competitive target. Public R28.1 no-spec figures use different
+  request lengths/timing definitions and are not divided into these numbers.
+- New benchmark_glm53_b12x.py pins image digest 52ef7bad...50e5f, published
+  source-lock SHA256 4473b46d...7477 and the cached model revision
+  46aaae8a82032f77100f2f03e9cc11b391df3b4d. It preserves the stock launcher,
+  B12X custom all-reduce, P2P/SYS, W4A4 experts, FP8 KV, no-spec/DCP1/VRAM,
+  4096-token scheduler and image graph defaults. The explicit host-side
+  changes are isolated writable JIT cache, read-only cached model, localhost
+  API, offline Hub access, bounded build parallelism and 150-GiB/no-swap
+  container limit. No driver, clock, power, or shared deployment change.
+- The companion benchmark_glm53_server.py calls the SAME round_requests,
+  exact_prompts, quality and cold-prefill functions as our frozen campaign.
+  Every start gets text/image canaries, a full 1000/300 warmup at c1/c8/c16,
+  three measured repetitions, recommended sampling/seed42+index, 4096 scored
+  continuation tokens, six needle contrasts and three cold 32K/128K measures
+  after warmup. No profiler in competitive timed work. Every failed start and
+  repetition remains represented; only the invocation's immutable container
+  IDs may be stopped/removed, after retaining logs and exit/OOM receipts.
+- Tokenizer identity: all tokenizer.json semantic components match. RedHat's
+  saved truncation default is 2048 versus null; actual vLLM tokenizer loading
+  yields identical full 427489-token source IDs, SHA256
+  255ccec0179c18344352ea84fa2ed7ee98f98ebc67815db6d69d87ca37ae6a4b.
+  tokenizer_config differs only by local_files_only false/null; chat templates
+  contain tool/None-content fixes. Timed completions bypass chat templates.
+  Canaries use each runtime's shipped chat defaults and are not timed metrics.
+- Inspected the image's per-request timing calculation: scheduled-to-first-token,
+  queue time and decode fields have the same timestamp definitions as our
+  fork. The client still requires exact returned token IDs and cached_tokens=0;
+  an unsupported/malformed API result fails instead of silently changing the
+  timing method. This does not prove the live image emits those fields yet.
+- Correctness/tooling: 19 focused CPU tests pass, including semantic tokenizer
+  differences, actual-source mismatch/truncation, incomplete streams/rounds,
+  fixed repetition order, startup/workload failure retention, unrelated GPU
+  ownership, interruption and immutable-ID teardown. The wider CPU run passes
+  175 tests with one GPU-only test skipped (before the added interruption case);
+  raw JUnit is runtime-control/reference-cpu-tests.xml. No GPU model control or
+  TPS claim yet.
+- Planned command after the mHC sequence, from the repository root:
+
+  ```sh
+  systemd-run --user --scope --quiet --unit=slimserve-b12x-r281-serving \
+    --property=MemoryMax=16G --property=MemorySwapMax=0 \
+    env CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 \
+    .venv/bin/python benchmarks/benchmark_glm53_b12x.py \
+    --source /home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt \
+    --output perf/results/2026-09-08/b12x-r281-serving \
+    --model-cache /raid/weights/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4 \
+    --reference-tokenizer /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 \
+    --jit-cache /home/tiny/.local/scratch/slimserve-glm53/b12x-r281-cache \
+    --boots 3 --repeats 3 --startup-timeout 1200
+  ```
+
+  The controller is CPU-only/capped16G; each owned GPU container is separately
+  capped150G/no-swap because Docker's daemon does not inherit that scope.
+- Reference: https://github.com/local-inference-lab/rtx6kpro/blob/master/models/glm-5.3-flash.md
+  and the exact source.lock embedded in the digest-pinned image.
