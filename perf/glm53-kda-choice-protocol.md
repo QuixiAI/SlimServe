@@ -42,7 +42,7 @@ CPU regression: 16 passed in 0.09 s (8 GiB, swap0, GPUs hidden). Raw report:
 Inventory `kda-disk-choice-analysis.json` in that directory, SHA
 744500910b0930425294a1cf425cc05bf51a7a59a5f31d59639c2515f525984b.
 
-## Next isolation (preparation only; no GPU command prescribed yet)
+## Gate isolation (historical preparation)
 
 Test the earliest changed operation: the serving gate/cumsum source at BS32,
 three stages, eight versus two warps. Synthetic BF16 gate inputs and packed beta,
@@ -57,7 +57,7 @@ Finalize the fixed matrix, source checks and one-process command after CPU tests
 No full-model run, source/default/native/quant change or autotuning is authorized
 by this preparation note.
 
-## Gate arithmetic v1: prescribed one-process matrix
+## Gate arithmetic v1: completed one-process matrix (commands historical)
 
 CPU tests exercise the actual serving JIT import, full evidence preparation,
 float64 oracle boundaries, exact launch arguments and audit rejection paths:
@@ -103,3 +103,41 @@ If gate outputs differ, this identifies a source of local numerical sensitivity,
 not its contribution to model scores. If exact, continue down the remaining KDA
 stages with new evidence-based isolation. No full-model start/default promotion
 follows automatically from either result.
+
+## Completed v1 result
+
+On c7b4bb4d1, exactly one GPU0 process completed all168 pairs, with no retries,
+replacements, tuning or omitted cases. Probe and CPU audit exit0. All74 frozen
+source/evidence hashes and both actual compiled cubins verify; GPUs released and
+GPU/driver/power identity unchanged. The source freeze ended after successful
+audit. Consume the completed receipt after later documentation/source changes,
+not the old frozen-manifest validator.
+
+Eight versus two warps are BIT-EXACT on all964,263,936 paired FP32 gate values and
+7,533,312 beta values (both input phases). Eager repeats, graph replay, changed-input
+replay, packed-input mutation and output-guard checks pass. Every element passes
+the prescribed float64-reference criterion. Maximum gate absolute error is
+9.869150130725757e-5; maximum normalized error/allowed bound0.35640318234308466.
+Beta maxima9.106284626358985e-8 and0.03896237065973383 respectively.
+
+Decision: this gate geometry change produced no numerical difference on the fixed
+matrix. This does not prove equality on all inputs or identify the cause of the
+failed model scores. No speed measurement or production/default/quant promotion.
+All existing indexer/no-combo/model gates remain unchanged.
+
+Raw `perf/results/2026-09-10/kda-gate-v1/`:168 pair records, summary, two cubins,
+private compiler cache, attempt marker and analysis. Analysis SHA
+dbb92de6bc14f00c86ba8d19a8a680ab8d5ad82ed696906d300a3432e5d9bf70;
+summary SHAd0ad46d69d1cc1fa1e91b85363496ab908c0e17e5741c258606a0763b651f063.
+
+An additional CPU screen avoids a redundant next GPU test: the retained intra
+sub-chunk candidates at warps2/stages2,3,4 have IDENTICAL whole TTIR/PTX/cubin bytes.
+Cubin SHAdd1ff07093228222878f8cb132c9fa3d8f441c1d3c4167448be1d0736fdae928.
+This applies to those exact compiled candidates, not unrecorded historical live
+bindings. Raw reader/report: runtime-control/screen-kda-intra-stages.py and
+runtime-control/kda-intra-stage-screen.json under2026-09-10.
+
+NEXT: inspect remaining recompute W/U, recurrent-state and output choices. Screen
+same-signature binaries first (especially stage-only changes), then prescribe the
+smallest still-informative numerical comparison. Do not rerun the completed gate
+matrix or a full model just to retest unchanged work. No next GPU job prescribed.

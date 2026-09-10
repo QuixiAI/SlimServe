@@ -1929,6 +1929,11 @@ Original production defaults and the separate failed indexer oracle gate are
 unchanged. Closure/raw measurements and remaining work are in HANDOFF, the geometry
 protocol and optimization notebook; stable baseline tables below remain unchanged.
 
+Subsequent KDA gate arithmetic isolation (c7b4bb4d1) completes168 prescribed pairs:
+eight/two-warp outputs are bit-exact, reference/replay/guard checks pass. No serving
+timing/default promotion follows. This narrows a numerical investigation; it does
+not resolve the failed no-combo model scores. Details: glm53-kda-choice-protocol.md.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

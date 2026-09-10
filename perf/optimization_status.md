@@ -27204,3 +27204,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   All existing indexer/no-combo/model gates unchanged; explicit FP32 probe
   integrity criterion and exact commands in perf/glm53-kda-choice-protocol.md.
 - Raw: runtime-control/kda-gate-{cpu,final-cpu}.xml under2026-09-10. GPU pending.
+
+## 2026-09-10 - KDA gate geometry is bit-exact on the fixed matrix
+
+- Status: completed diagnostic; no performance/default change.
+- Baseline/hypothesis: source/config-exact gate/cumsum at eight versus two warps,
+  BS32/chunk64/stages3. Could the first differing KDA choice change outputs?
+- Workload: c7b4bb4d1; one GPU0 process,168 prescribed pairs with repaired layer0
+  TP4 shards, synthetic BF16 inputs, seven layouts/two seeds/three magnitudes.
+  No autotuning, retries, omitted cases, model starts or native builds.
+- Correctness/result: all eager/replay/changed-input/guard/mutation checks pass.
+  Zero cross-arm bit differences in964,263,936 FP32 gate and7,533,312 beta values.
+  Every output meets the new diagnostic FP32-vs-float64 bound; max gate absolute
+  error9.86915e-5, max fraction of allowed error0.356403; beta9.10628e-8/0.038963.
+  This changes no existing BF16/indexer/model gate and is not full-model causality.
+- Closure: probe/audit exit0,74 source/evidence receipts/two cubins verify, GPUs
+  released, device/driver/power unchanged. Source freeze ended; no TPS measured.
+- CPU follow-up: retained intra sub-chunk warps2/stages2,3,4 candidates have
+  identical whole TTIR/PTX/cubin bytes. No separate GPU test needed for those
+  exact binary candidates; historical per-rank live bindings remain unrecorded.
+- Decision: keep serving unchanged. Inspect remaining recompute/state/output
+  choices, screen binary-equivalent candidates before another numerical probe.
+  No next GPU/model job prescribed; all earlier failed series remain terminal.
+- Raw: perf/results/2026-09-10/kda-gate-v1/analysis.json, SHA
+  dbb92de6bc14f00c86ba8d19a8a680ab8d5ad82ed696906d300a3432e5d9bf70;
+ 168 pair receipts, summary and binaries. CPU reader/report under runtime-control:
+  screen-kda-intra-stages.py, kda-intra-stage-screen.json. Protocol has full details.

@@ -35,7 +35,33 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): remaining KDA choice inventory complete
+### Latest checkpoint (2026-09-10): gate isolation passes; no numerical difference
+
+On c7b4bb4d1, one prescribed GPU0 process completes168 gate/cumsum pairs; audit
+passes,74 source/evidence hashes/two actual cubins verify, GPUs released. Freeze
+ended. No retries, discarded cases, model starts, autotuning or native builds.
+Eight/two-warps are bit-exact on964,263,936 FP32 gate and7,533,312 beta values.
+Float64-reference, eager/changed-input graph replay and guard/mutation checks pass.
+This is local source/config arithmetic evidence, not historical live-choice proof
+or model causality. No speed measurement/default/quant/quality-gate promotion.
+
+CPU follow-up also finds identical whole TTIR/PTX/cubin bytes for the retained
+intra sub-chunk warps2/stages2,3,4 candidates. Skip a redundant GPU test of those
+exact binary candidates; their historical per-rank launch identities are unrecorded.
+
+Raw perf/results/2026-09-10/kda-gate-v1/analysis.json SHA
+dbb92de6bc14f00c86ba8d19a8a680ab8d5ad82ed696906d300a3432e5d9bf70;
+runtime-control/kda-intra-stage-screen.json and its preserved reader. Commands,
+matrix, source boundaries and full result: perf/glm53-kda-choice-protocol.md.
+Do not re-run frozen v1 validators after later source/protocol edits; use completed
+receipts and relevant live-source checks. All old failed series remain terminal.
+
+NEXT: inspect remaining KDA recompute W/U, recurrent-state and output choices;
+screen same-signature binaries first, especially stage-only differences, then
+prescribe the smallest informative numerical comparison. No next GPU/model job
+prescribed. Original H4096 settings retained; indexer/no-combo gates still failed.
+
+### Previous checkpoint (2026-09-10): remaining KDA choice inventory complete
 
 Geometry rejection recorded in e427bd85b (Auroter author/committer). CPU inventory
 now verifies72 retained KDA tuning files against24 original rank-private files.
