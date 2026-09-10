@@ -523,6 +523,9 @@ _DFLASH_DEFAULT_TAPS = (6, 15, 25, 34, 43)  # incoai/GLM-5.3-Flash-DFlash2 targe
 
 
 class _Glm5NextAuxTaps:
+    """Listed BEFORE SupportsEagle3 in the bases: the protocol ships concrete
+    defaults that expect an EagleModelMixin ``self.model``."""
+
     supports_eagle3: ClassVar[Literal[True]] = True
 
     def _text_model(self) -> "Glm5NextTextModel":
@@ -536,7 +539,7 @@ class _Glm5NextAuxTaps:
         return _DFLASH_DEFAULT_TAPS
 
 class Glm5NextForCausalLM(
-    nn.Module, HasInnerState, IsHybrid, SupportsPP, SupportsEagle3, _Glm5NextAuxTaps
+    nn.Module, _Glm5NextAuxTaps, HasInnerState, IsHybrid, SupportsPP, SupportsEagle3
 ):
     """Text-only serving entry for GLM-5.3-Flash (phase 1).
 
@@ -905,8 +908,8 @@ class Glm5NextMultiModalProcessor(BaseMultiModalProcessor[Glm5NextProcessingInfo
     dummy_inputs=Glm5NextDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, HasInnerState, IsHybrid,
-    SupportsEagle3, _Glm5NextAuxTaps,
+    nn.Module, _Glm5NextAuxTaps, SupportsMultiModal, SupportsPP, HasInnerState,
+    IsHybrid, SupportsEagle3,
 ):
     """GLM-5.3-Flash: vision tower + hybrid text backbone."""
 

@@ -24090,3 +24090,14 @@ restart is the operator's call.
   c8 490.3 tok/s vs the V1 record's 109.9 / 494.6 - the same throughput
   class; text (+reasoning), image, tool canaries pass. Raw: perf/results/
   2026-09-10/glm53f-v2-runner-probe/. glm5_next is V2 by default from here.
+- DFLASH2 ON V2 WORKS. First arm (k=3, registered record otherwise
+  unchanged, FULL_DECODE_ONLY): c1 153.3 / c8 514.8 / c16 677.8 tok/s vs
+  the non-spec record 109.9 / 494.6 / 676.0 (+40% / +4% / 0%), mean
+  acceptance length 2.23 (of 4), text/image/tool canaries pass, KV pool
+  3,082,532 tokens (the drafter's weights + KV take ~1.2M tokens of pool).
+  The first boot failed on method resolution (SupportsEagle3's concrete
+  defaults preceded the GLM mixin in the bases; fixed) and k=7 on the
+  compact indexer cache's five-token ring cap (8-row raw ring; widening
+  it is a page-geometry change, deferred). Raw: perf/results/2026-09-10/
+  glm53f-dflash2/d3/. k=5 arm running; c32/c64 and a per-batch schedule
+  follow before the record flips to speculative by default.
