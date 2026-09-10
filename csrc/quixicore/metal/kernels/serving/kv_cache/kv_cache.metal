@@ -16,10 +16,8 @@ kernel void kv_cache_zero(device T *key_cache [[buffer(0)]],
     value_cache[tid] = T(0);
 }
 
-// block_mult: 1 for standard contiguous (nb, bs, H, D) caches; 2 for the
-// page-local (nb, 2, bs, H, D) layout, where the caller binds key_cache to
-// the dense base and value_cache to the base shifted by one block (K and V
-// of block b are dense blocks 2b and 2b+1).
+// Physical stride in elements between logical blocks. Includes interleaved
+// K/V, cross-layer packing and padding; token/head rows remain contiguous.
 template <typename T>
 kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
                              device const T *value [[buffer(1)]],
@@ -29,7 +27,7 @@ kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
                              constant int &num_heads [[buffer(5)]],
                              constant int &head_size [[buffer(6)]],
                              constant int &block_size [[buffer(7)]],
-                             constant int &block_mult [[buffer(8)]],
+                             constant ulong &cache_block_stride [[buffer(8)]],
                              uint token [[threadgroup_position_in_grid]],
                              uint tid [[thread_position_in_threadgroup]],
                              uint tptg [[threads_per_threadgroup]]) {
@@ -38,12 +36,12 @@ kernel void kv_cache_scatter(device const T *key [[buffer(0)]],
         return;
     }
 
-    const long block = (slot / block_size) * block_mult;
+    const long block = slot / block_size;
     const long block_offset = slot % block_size;
     const int row_elems = num_heads * head_size;
     const long src_base = (long)token * row_elems;
     const long dst_base =
-        ((block * block_size + block_offset) * num_heads) * head_size;
+        block * cache_block_stride + block_offset * row_elems;
 
     for (int i = (int)tid; i < row_elems; i += (int)tptg) {
         key_cache[dst_base + i] = key[src_base + i];
@@ -1161,7 +1159,7 @@ instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
                       constant int &num_heads [[buffer(5)]],                  \
                       constant int &head_size [[buffer(6)]],                  \
                       constant int &block_size [[buffer(7)]],                 \
-                      constant int &block_mult [[buffer(8)]],                 \
+                      constant ulong &cache_block_stride [[buffer(8)]],      \
                       uint token [[threadgroup_position_in_grid]],            \
                       uint tid [[thread_position_in_threadgroup]],            \
                       uint tptg [[threads_per_threadgroup]]);                 \

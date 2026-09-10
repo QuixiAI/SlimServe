@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -38,6 +38,9 @@ from vllm.v1.worker.mamba_utils import (
     validate_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.model_states.metal_mamba_align import MetalMambaAlign
 
 
 @dataclass
@@ -139,6 +142,7 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+            self._metal_align: MetalMambaAlign | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -235,6 +239,28 @@ class MambaHybridModelState(DefaultModelState):
         if num_reqs == 0:
             return
         mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        if self.device.type == "mps":
+            from vllm.v1.worker.gpu.model_states.metal_mamba_align import (
+                MetalMambaAlign,
+            )
+
+            if self._metal_align is None:
+                self._metal_align = MetalMambaAlign(
+                    self.vllm_config,
+                    self.model,
+                    kv_cache_config,
+                    self._mamba_state_idx_gpu,
+                )
+            self._metal_align.run(
+                input_batch.idx_mapping[:num_reqs],
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                input_batch.query_start_loc,
+                self.num_accepted_tokens_gpu,
+                mamba_spec.block_size,
+                block_tables=block_tables,
+            )
+            return
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
         # The state-advance + pre-copy kernels run every step; they fast-exit per
@@ -417,6 +443,22 @@ class MambaHybridModelState(DefaultModelState):
         # the V1 align postprocess). num_computed_tokens already holds the
         # post-step advanced count.
         if (
+            self._align_mode
+            and num_computed_tokens is not None
+            and self.device.type == "mps"
+            and self._metal_align is not None
+        ):
+            self._metal_align.run(
+                idx_mapping,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                None,
+                self.num_accepted_tokens_gpu,
+                # _get_mamba_group_info initializes this before _metal_align.
+                self._mamba_spec.block_size,  # type: ignore[union-attr]
+                post=True,
+            )
+        elif (
             self._align_mode
             and num_computed_tokens is not None
             and self._mamba_ctx is not None

@@ -1315,7 +1315,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # token that disagrees).
             self.thinking_budget_state.apply_mask(logits, input_batch)
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+        # Metal's verifier uses a position-keyed inverse CDF, while the plain
+        # sampler uses Gumbel noise. Keep zero-draft rows on the verifier too:
+        # otherwise an unrelated request's drafts change their seeded draw.
+        if self.rejection_sampler is None or (
+            input_batch.num_draft_tokens == 0 and logits.device.type != "mps"
+        ):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:

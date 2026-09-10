@@ -702,32 +702,32 @@ class MetalAttentionImpl(AttentionImpl):
                 kv_start = max(0, seq_len - query_len_req - self.sliding_window + 1)
             seq_len = min(seq_len, num_req_blocks * block_size)
 
-            if self.use_native_range_gather and not bound_mode:
+            first_block = kv_start // block_size
+            if bound_mode and first_block > 0:
+                # The CPU bound can cross the exact window's page boundary.
+                # Include the preceding page; the GPU mask below selects the
+                # exact visible tokens without synchronizing the sequence length.
+                first_block -= 1
+            row_start = 0 if bound_mode else kv_start - first_block * block_size
+            row_end = seq_len - first_block * block_size
+            gather_start = first_block * block_size + row_start
+
+            if self.use_native_range_gather:
                 # MPS index_select uses signed 32-bit element offsets for this
                 # strided source. A hybrid cache page beyond 2^31 elements is
                 # therefore read from the wrong address. The native gather
                 # carries the physical block stride and all cache arithmetic
-                # in 64 bits; it also avoids materializing unused rows in the
-                # first/last page of a sliding-window request. Bound mode
-                # keeps the block-window fallback below: its kv_start may
-                # exceed the exact window, which the fallback absorbs with
-                # the one-block backoff + GPU validity mask.
+                # in 64 bits and avoids MPS materializing the strided pool.
+                # Bound-mode draft attention uses the same page backoff and
+                # GPU validity mask as the fallback, preserving its numerics.
                 keys, values = quixicore_ops.kv_cache_gather_range(
                     key_cache,
                     value_cache,
                     metadata.block_table[req],
-                    kv_start,
-                    seq_len - kv_start,
+                    gather_start,
+                    row_end - row_start,
                 )
             else:
-                first_block = kv_start // block_size
-                if bound_mode and first_block > 0:
-                    # The bound may exceed the exact seq_len by up to the
-                    # draft length, which can push the window start past the
-                    # exact window's first block. Back off one block and
-                    # start at row 0 — the GPU validity mask enforces the
-                    # exact range.
-                    first_block -= 1
                 blocks = (
                     metadata.block_table[req, first_block:num_req_blocks]
                     .to(torch.long)
@@ -736,9 +736,6 @@ class MetalAttentionImpl(AttentionImpl):
                     # discarded; a real run never clamps.
                     .clamp_(0, num_blocks - 1)
                 )
-                row_start = 0 if bound_mode else kv_start - first_block * block_size
-                row_end = seq_len - first_block * block_size
-
                 if dense_kv is not None:
                     keys = dense_kv.index_select(0, blocks * 2)
                     values = dense_kv.index_select(0, blocks * 2 + 1)
@@ -769,6 +766,14 @@ class MetalAttentionImpl(AttentionImpl):
                 if self.sliding_window is not None:
                     lo = (sl - (query_len_req + self.sliding_window - 1)).clamp_min(0)
                     valid &= key_pos >= lo
+                # Recycled sliding-window pages are not necessarily zeroed.
+                # An attention mask alone cannot exclude NaN keys or infinite
+                # values: the matmuls can still evaluate NaN + -inf or 0 * inf.
+                # These gathered tensors are private; clear only invisible
+                # rows, preserving nonfinite values in the actual context.
+                invisible = ~valid[:, None, None]
+                keys.masked_fill_(invisible, 0)
+                values.masked_fill_(invisible, 0)
                 mask = valid[None, None, :]
             if metadata.causal and query_len > 1:
                 # Query j sits at absolute position seq_len - query_len + j and

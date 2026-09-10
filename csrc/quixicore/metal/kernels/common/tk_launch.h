@@ -4210,7 +4210,8 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
                              typename E::out_t key_cache,
                              typename E::out_t value_cache, int num_tokens,
                              int num_heads, int head_size, int block_size,
-                             int block_mult, const std::string& type_name) {
+                             uint64_t cache_block_stride,
+                             const std::string& type_name) {
   e.pipeline(kv_cache_kernel_name("scatter", type_name));
   e.in(key, 0);
   e.in(value, 1);
@@ -4220,7 +4221,7 @@ void launch_kv_cache_scatter(E& e, typename E::in_t key, typename E::in_t value,
   e.bytes(num_heads, 5);
   e.bytes(head_size, 6);
   e.bytes(block_size, 7);
-  e.bytes(block_mult, 8);
+  e.bytes(cache_block_stride, 8);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 

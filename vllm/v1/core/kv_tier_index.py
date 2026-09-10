@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler-side index for the host KV tier (trajectory-centric).
 
 The host tier mirrors a trajectory's immutable full-attention blocks at
@@ -28,19 +29,26 @@ trajectories, never individual slots.
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 
 from vllm.v1.core.kv_cache_utils import BlockHash
+
+_EMPTY_HASH = BlockHash(b"")
 
 
 @dataclass
 class Trajectory:
     hashes: list[BlockHash] = field(default_factory=list)
-    # Attention slots, position-indexed: attn_slots[i] holds block i.
-    # A position may be missing (None) if staging failed; the resumable
-    # span ends at the first gap.
-    attn_slots: list[int | None] = field(default_factory=list)
+    # Attention slots, position-indexed PER GROUP: attn_slots[g][p] holds
+    # attention-group ordinal g's block at position p (positions are in
+    # that group's own page granularity). Group 0 is the primary
+    # full-attention group - its positions align 1:1 with the hash chain
+    # and gate resumability. Non-primary groups (sliding-window MLA pages
+    # etc.) may legally have missing positions: window-skipped pages are
+    # never staged, and the connector pairs them against null target
+    # blocks on resume.
+    attn_slots: list[list[int | None]] = field(default_factory=list)
     # Tail-boundary state: logical block index -> {tier_state_gid: slot}.
     tail_boundary: int = -1
     tail_state_slots: dict[int, int] = field(default_factory=dict)
@@ -50,13 +58,18 @@ class Trajectory:
     # with another conversation's attention blocks would resume with the
     # wrong mamba state (silent output corruption), so a mismatched
     # trajectory is simply dead rather than dangerously matchable.
-    tail_hash: BlockHash = b""
+    tail_hash: BlockHash = BlockHash(b"")
     tail_pending: bool = False  # tail-state writes still in flight
     last_touch: float = 0.0
 
+    def primary_slots(self) -> list[int | None]:
+        return self.attn_slots[0] if self.attn_slots else []
+
     def resumable_blocks(self) -> int:
-        """Longest gap-free attention prefix ending at the tail boundary,
-        with the boundary block's hash matching the saved tail state."""
+        """Longest gap-free PRIMARY-group prefix ending at the tail
+        boundary, with the boundary block's hash matching the saved tail
+        state. Non-primary groups do not gate the span: their missing
+        positions are window skips by construction."""
         if self.tail_boundary <= 0 or self.tail_pending:
             return 0
         if (
@@ -66,7 +79,7 @@ class Trajectory:
         ):
             return 0
         n = 0
-        for slot in self.attn_slots[: self.tail_boundary]:
+        for slot in self.primary_slots()[: self.tail_boundary]:
             if slot is None:
                 break
             n += 1
@@ -82,6 +95,7 @@ class HostKVTierIndex:
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
+        self._readers: Counter[str] = Counter()
 
     # ------------------------------------------------------------------ write
 
@@ -93,21 +107,30 @@ class HostKVTierIndex:
         return slot
 
     def stage_attention(
-        self, owner: str, logical: int, block_hash: BlockHash
+        self, owner: str, gid: int, pos: int, block_hash: BlockHash = _EMPTY_HASH
     ) -> int | None:
-        """Reserve a slot for attention block `logical` of `owner`."""
+        """Reserve a slot for attention-group ordinal ``gid``'s page at
+        ``pos`` (the group's own granularity). The hash chain is recorded
+        only from the primary group (gid 0), whose positions align with
+        the hash blocks."""
         traj = self._trajectories.setdefault(owner, Trajectory())
         self.touch(owner)
-        while len(traj.attn_slots) <= logical:
-            traj.attn_slots.append(None)
-            traj.hashes.append(b"")
-        if traj.attn_slots[logical] is not None:
+        while len(traj.attn_slots) <= gid:
+            traj.attn_slots.append([])
+        row = traj.attn_slots[gid]
+        while len(row) <= pos:
+            row.append(None)
+        if gid == 0:
+            while len(traj.hashes) <= pos:
+                traj.hashes.append(BlockHash(b""))
+        if row[pos] is not None:
             return None
         slot = self._alloc_slot(owner)
         if slot is None:
             return None
-        traj.attn_slots[logical] = slot
-        traj.hashes[logical] = block_hash
+        row[pos] = slot
+        if gid == 0:
+            traj.hashes[pos] = block_hash
         return slot
 
     def stage_tail_states(
@@ -115,7 +138,7 @@ class HostKVTierIndex:
         owner: str,
         boundary: int,
         num_state_groups: int,
-        boundary_hash: BlockHash = b"",
+        boundary_hash: BlockHash = _EMPTY_HASH,
     ) -> dict[int, int] | None:
         """Reserve slots for the tail-boundary state blocks of `owner`.
 
@@ -127,6 +150,10 @@ class HostKVTierIndex:
         Replaces any previously recorded tail (a trajectory grows; its old
         tail states are superseded).
         """
+        if self._readers[owner]:
+            # A concurrent continuation may still be reading the old tail.
+            # Keep that snapshot until its restore completes.
+            return None
         traj = self._trajectories.setdefault(owner, Trajectory())
         self.touch(owner)
         slots: dict[int, int] = {}
@@ -147,6 +174,65 @@ class HostKVTierIndex:
         traj.tail_pending = True
         return slots
 
+    def free_attention(self, owner: str, gid: int, pos: int) -> bool:
+        """Release a non-primary group's staged page whose position slid out
+        of the group's window (the engine's allocation went null there).
+        Without this, a sliding-window group permanently holds one slot for
+        every page that was EVER in-window - measured 11k slots per 23k-token
+        request on DSV4/Metal, 120x the primary cost - and the LRU then
+        reclaims whole live trajectories. Skipped while the write is still
+        in flight (rare; the slot then rides until the trajectory dies)."""
+        if self._readers[owner]:
+            return False
+        traj = self._trajectories.get(owner)
+        if traj is None or gid <= 0 or gid >= len(traj.attn_slots):
+            return False
+        row = traj.attn_slots[gid]
+        slot = row[pos] if pos < len(row) else None
+        if slot is None or slot in self._pending_write:
+            return False
+        row[pos] = None
+        self._free.append(slot)
+        return True
+
+    def stage_attention_tail(self, owner: str) -> int:
+        """Record the resume boundary for a STATELESS (attention-only)
+        trajectory at its current gap-free staged span.
+
+        Models with no recurrent state need no boundary snapshot - any
+        gap-free attention prefix is self-sufficient - but ``lookup``
+        still gates on ``tail_boundary``/``tail_hash`` (they are what
+        binds a resume to one conversation's chain). Without this call an
+        attention-only trajectory is write-only: staged, never
+        resumable. No slots are consumed. Returns the boundary (0 = not
+        stageable yet).
+        """
+        traj = self._trajectories.get(owner)
+        if traj is None:
+            return 0
+        if traj.tail_state_slots and self._readers[owner]:
+            # A lifecycle conversion cannot recycle an active reader's
+            # state snapshot, just like ordinary tail replacement.
+            return 0
+        self.touch(owner)
+        n = 0
+        for slot in traj.primary_slots():
+            if slot is None:
+                break
+            n += 1
+        if n <= 0:
+            return 0
+        for s in traj.tail_state_slots.values():
+            self._pending_write.discard(s)
+            self._free.append(s)
+        traj.tail_state_slots = {}
+        traj.tail_boundary = n
+        traj.tail_hash = traj.hashes[n - 1]
+        # No state writes exist to be in flight; in-flight ATTENTION
+        # writes are already excluded per-slot by lookup's pending check.
+        traj.tail_pending = False
+        return n
+
     def confirm_writes(self, slots: list[int]) -> None:
         for slot in slots:
             self._pending_write.discard(slot)
@@ -160,33 +246,55 @@ class HostKVTierIndex:
 
     def lookup(
         self, hashes: list[BlockHash]
-    ) -> tuple[str, int, list[int], dict[int, int]] | None:
+    ) -> tuple[str, int, list[list[int | None]], dict[int, int]] | None:
         """Match `hashes` against stored trajectories.
 
-        Returns (owner, num_blocks, attention_slots, tail_state_slots) for
-        the deepest resumable trajectory whose hash prefix matches, or
-        None. The owner lets a resuming request ADOPT the trajectory and
-        extend it in place (the conversation's next turn keeps growing one
-        lineage instead of duplicating it).
+        Returns (owner, num_blocks, attn_group_slots, tail_state_slots)
+        for the deepest resumable trajectory whose hash prefix matches, or
+        None. ``attn_group_slots[g]`` is group ordinal g's positional slot
+        list (None marks positions that were never staged - window skips
+        on non-primary groups); the primary list is gap-free for the first
+        ``num_blocks`` positions. The owner lets a resuming request ADOPT
+        the trajectory and extend it in place (the conversation's next
+        turn keeps growing one lineage instead of duplicating it).
         """
-        best: tuple[str, int, list[int], dict[int, int]] | None = None
+        best: tuple[str, int, list[list[int | None]], dict[int, int]] | None = None
         best_owner: str | None = None
         for owner, traj in list(self._trajectories.items()):
             n = traj.resumable_blocks()
-            if n <= 0 or n > len(hashes):
+            if n <= 0:
+                continue
+            if not traj.tail_state_slots:
+                # STATELESS trajectory: any gap-free prefix is valid, so
+                # match as deep as the hashes agree. This is the chat
+                # resume shape - a saved tail routinely crosses into the
+                # request's own generated thinking tokens, which no
+                # follow-up prompt resends, so tail-exact matching would
+                # deadletter most conversations (observed live: tail=4
+                # matched 3 prompt blocks, req_hashes=3).
+                limit = min(n, len(hashes))
+                n = 0
+                while n < limit and traj.hashes[n] == hashes[n]:
+                    n += 1
+                if n <= 0:
+                    continue
+            elif n > len(hashes) or traj.hashes[:n] != hashes[:n]:
+                # STATEFUL trajectory: mamba state exists only at the tail
+                # boundary, so resume is tail-exact or nothing.
                 continue
             if best is not None and n <= best[1]:
                 continue
             if any(
-                s in self._pending_write for s in traj.attn_slots[:n]
+                s in self._pending_write
+                for row in traj.attn_slots
+                for s in row
+                if s is not None
             ):
-                continue
-            if traj.hashes[:n] != hashes[:n]:
                 continue
             best = (
                 owner,
                 n,
-                [s for s in traj.attn_slots[:n] if s is not None],
+                [list(row) for row in traj.attn_slots],
                 dict(traj.tail_state_slots),
             )
             best_owner = owner
@@ -205,7 +313,7 @@ class HostKVTierIndex:
             gap = next(
                 (
                     i
-                    for i, s in enumerate(traj.attn_slots[: traj.tail_boundary])
+                    for i, s in enumerate(traj.primary_slots()[: traj.tail_boundary])
                     if s is None
                 ),
                 None,
@@ -220,12 +328,13 @@ class HostKVTierIndex:
             )
             pend = [
                 s
-                for s in traj.attn_slots[: traj.tail_boundary]
+                for s in traj.primary_slots()[: traj.tail_boundary]
                 if s in self._pending_write
             ]
             notes.append(
                 f"owner={owner[:12]} tail={traj.tail_boundary} "
-                f"tail_pending={traj.tail_pending} attn_len={len(traj.attn_slots)} "
+                f"tail_pending={traj.tail_pending} "
+                f"attn_len={len(traj.primary_slots())} "
                 f"first_gap={gap} hash_mismatch_at={mism} "
                 f"pending_attn={len(pend)} req_hashes={len(hashes)}"
             )
@@ -237,16 +346,35 @@ class HostKVTierIndex:
             traj.last_touch = time.monotonic()
             self._trajectories.move_to_end(owner)
 
+    def pin_read(self, owner: str) -> None:
+        """Hold immutable source slots from lookup through restore completion."""
+        assert owner in self._trajectories
+        self._readers[owner] += 1
+
+    def can_extend(self, owner: str, boundary: int) -> bool:
+        """Appending is safe only when no saved suffix diverges after the hit."""
+        traj = self._trajectories.get(owner)
+        return traj is not None and boundary == len(traj.hashes)
+
+    def is_read_pinned(self, owner: str) -> bool:
+        return self._readers[owner] > 0
+
+    def unpin_read(self, owner: str) -> None:
+        assert self._readers[owner] > 0
+        self._readers[owner] -= 1
+        if not self._readers[owner]:
+            del self._readers[owner]
+
     # --------------------------------------------------------------- eviction
 
     def _traj_slots(self, traj: Trajectory) -> list[int]:
-        return [s for s in traj.attn_slots if s is not None] + list(
+        return [s for row in traj.attn_slots for s in row if s is not None] + list(
             traj.tail_state_slots.values()
         )
 
     def _reclaim(self, protect: str) -> bool:
         for owner in list(self._trajectories.keys()):
-            if owner == protect:
+            if owner == protect or self._readers[owner]:
                 continue
             traj = self._trajectories[owner]
             slots = self._traj_slots(traj)
@@ -260,6 +388,10 @@ class HostKVTierIndex:
     def drop_owner(self, owner: str) -> None:
         traj = self._trajectories.get(owner)
         if traj is None:
+            return
+        if self._readers[owner]:
+            # Invalidate future matches without recycling an active source.
+            traj.tail_boundary = -1
             return
         slots = self._traj_slots(traj)
         if any(s in self._pending_write for s in slots):

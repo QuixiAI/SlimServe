@@ -213,8 +213,10 @@ def _reshape_attention_kv_cache(
 
     if packing is not None:
         offset, block_stride = packing
-        assert inv_order[0] == 0
-        page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+        # The physical layout must put blocks first; the public view may
+        # put K/V first (Metal exposes [2, blocks, ...] with order 1,0,...).
+        assert permuted_kv_cache_shape[0] == num_blocks
+        page_bytes = prod(permuted_kv_cache_shape[1:]) * get_dtype_size(dtype)
         kv_cache = (
             kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
             .view(dtype)
@@ -444,6 +446,14 @@ def _update_hybrid_attention_mamba_layout(
                 continue
             kv_cache = kv_caches[layer_name]
             hidden_size = kv_cache.shape[2:].numel()
+            if (
+                kv_cache.stride(0) == hidden_size
+                and kv_cache.stride(1) >= 2 * hidden_size
+            ):
+                # Already page-local. Packed slabs may include other layers
+                # and padding between pages; collapsing their block stride
+                # makes attention overwrite the hybrid state allocations.
+                continue
             kv_cache.as_strided_(
                 size=kv_cache.shape,
                 stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),

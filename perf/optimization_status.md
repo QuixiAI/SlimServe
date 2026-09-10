@@ -1,5 +1,840 @@
 # SlimServe Optimization Status
 
+## 2026-09-10 - Metal NVMe KV tier qualification complete
+
+- Decision: retain and ship the geometry-fixed candidate for the tested Metal
+  workloads, with the measured Muse c8 throughput tradeoff below. Correctness
+  and durability gates passed; the remaining optimization opportunity is
+  quantified, not a claim of zero tier overhead or maximum-context certification.
+- Candidate: `candidate-cache-geometry-checked` on `e6ef60edcd4309b4e4b51e96e344a2ecb29408fb`.
+  All 14 planned campaign phases finished by 2026-09-10 00:27 PDT. Independent
+  review passed against the unchanged runtime sources, harness and native
+  hashes before final documentation changes. No additional test rounds needed.
+- Platform: Apple M5 Max, 128 GiB, macOS 26.6.2 / 25G83; registered SlimServe
+  profiles and drafters. Exact completion workload: 1,000 input / 2,000 output
+  tokens, API/profile defaults and seed 42. Local ModelConfig/protocol audits
+  confirm effective temperature 1.0, top_p 1.0, top_k 0 for these three models.
+  No greedy sampling. Primary matrices use c1/c8, three repeats per tier, with
+  per-repeat warmups; Muse confirmation reverses order to off/on, three c1
+  repeats and one additional c8 batch per tier.
+- Validation: 202 targeted tests passed, two skipped; unchanged native code
+  also passed the 19-case gather/store qualification including >32-bit address
+  cases. All five machine-compatible registry profiles passed smoke with
+  positive registered-drafter activity, including text/image for Muse and GGUF
+  Qwen and text for DSV4 and the two language-only NVFP4 profiles. The original
+  Qwen failure workload and DSV4/Muse reset workloads passed 36/36 recalls.
+  Natural Qwen pressure added 12/12 correct recalls after 480,000 distinct
+  filler input tokens over three rounds. All 48 readers completed; 12,402
+  restored-block checks across the four acceptance runs had zero byte mismatches.
+- Performance: all 184 timed responses (368,000 output tokens, 44 timing
+  samples) passed exact counts, positive draft work, clock/arithmetic and
+  anti-degeneracy checks. Primary on/off medians in tok/s:
+
+  | Profile | c1 on | c1 off | c8 on | c8 off |
+  | --- | ---: | ---: | ---: | ---: |
+  | Qwen GGUF | 16.101 | 15.995 | 41.765 | 39.258 |
+  | DSV4 XXS | 16.455 | 13.200 | 21.222 | 15.958 |
+  | Muse | 8.236 | 8.757 | 13.464 | 14.475 |
+
+- Muse confirmation: c1 on 9.081 versus off 9.031 tok/s median (+0.56%), with
+  identical text and 17,872 draft tokens in all six responses. The earlier
+  c1 slowdown did not reproduce. C8 on 13.944 versus off 15.395 aggregate
+  tok/s (-9.42%); this confirms a workload-level cost consistent with the
+  primary -6.99% result. The enabled batch used 119,552 versus 110,608 draft
+  tokens (+8.09%); five of eight final texts match exactly, three differ.
+  Draft processing was 104.19 versus 106.42 draft tokens/s (-2.10%). These
+  work counts explain why identical output-token budgets need not be identical
+  inference work, but do not prove the entire TPS difference is caused by
+  sampling or exclude an I/O cost. Retain with the observed 7-9% Muse c8
+  throughput tradeoff; future tuning should measure restore/admission batching
+  and speculative acceptance before changing kernels. Do not describe this
+  candidate as performance-neutral for Muse c8.
+- Scope/limits: long-history restore tests cover approximately 9-13K input
+  tokens, not the profiles' complete 131K/262K context limits or other hardware.
+  This qualifies cache eviction/reuse within a running server, not crash or
+  power-loss persistence. The host had variable unrelated CPU/VM load; later
+  phases sampled Metal compute clients every 15 s and detected no foreign
+  compute overlap. DSV4/Qwen's favorable on/off differences are observations,
+  not causal tier speedup claims. Contended and sleep-interrupted attempts
+  remain quarantined and excluded; all retained exact-token clocks pass.
+- Raw evidence: `perf/results/2026-09-08/nvme-tier-ship/`, especially
+  `geometry-qualification-review.json`, `geometry-release-assessment.json`,
+  `muse-primary-work-audit.json`, `muse-confirmation-work-audit.json`, all
+  `geometry-*` campaign logs/responses, and `tests-geometry-fixed.txt`.
+  `qualification-geometry-campaign.py` and `geometry-extra-phases.json` retain
+  the exact commands. Final documentation and runtime are archived as
+  `candidate-ship-qualified-metal.{zip,json}`; runtime hashes are compared
+  against the tested candidate separately from the two changed notebooks.
+
+- Commit preparation: repository hooks added required copyright headers and
+  formatting. Added explicit type annotations and the required `regex` import
+  in the benchmark harness. Python runtime ASTs match the qualified snapshot
+  after excluding type annotations/checking imports and the regex import;
+  native C++ tokens and the built library hash match exactly. The 27 focused
+  tests pass; all 184 saved completion responses pass both regex engines, and
+  all four acceptance runs produce identical restore-gate results. Remaining
+  applicable pre-commit checks pass, including mypy, Ruff, clang-format,
+  secret scanning and import/license checks. The `typos` and
+  `markdownlint-cli2` hooks are skipped for this commit because they report
+  34 existing spelling tokens and 348 diagnostics in existing notebook content;
+  baseline audits and complete hook logs are retained in the same artifact
+  directory. No inference arithmetic or cache behavior changed in preparation.
+  Commit-ready archive: `candidate-ship-commit-ready.{zip,json}`.
+
+## 2026-09-08 - Metal NVMe KV tier shipping gate (history; completed above)
+
+- Scope: issue #19; `dsv4-xxs-1`, `muse-kdyn-1`, `qwen38-q2kxl-1` on
+  Apple M5 Max / 128 GiB, plus registry-discovered Metal regression profiles.
+- Baseline: uncommitted NVMe backend at parent `e6ef60edc`; 105 targeted tests
+  passed, but a single transfer larger than the 512 MiB staging budget hung
+  before enqueue. Connector shutdown only flushed, leaving its IO thread and
+  open unlinked file alive until process exit. Historical acceptance ended at
+  BOOT_UP; the separate reset cycle accepted empty answers.
+- Change: split offload/restore batches within the staging budget, acknowledge
+  only the final chunk, drain and close on connector shutdown, and reject
+  zero-progress IO. Darwin file preallocation now uses the SDK's F_PREALLOCATE
+  value (42), absent from CPython's fcntl constants; setup errors close the FD.
+  Nocache failures on Darwin are fatal rather than silently consuming cache RAM.
+- Optimization hypothesis: adjacent copy/file operations can be coalesced, and
+  the synchronous drain must yield instead of competing with the IO thread for
+  the GIL. These changes preserve FIFO slot reuse and byte identity.
+- Synthetic measurement: 128 x 64 KiB, MPS, one warmup plus three repeats,
+  sequential old/new runs. Old offload 3.075-4.320 s (median 3.665), restore
+  3.548-3.851 s (median 3.838); new offload 0.877-1.186 ms (median 0.973),
+  restore 2.124-3.488 ms (median 2.172). All roundtrips byte-identical. This
+  measures the backend's synchronous drain, heavily affected by old busy
+  polling; it is NOT SSD hardware bandwidth or an end-to-end serving speedup.
+  The earlier 512-row exploratory run overlapped tests and is excluded.
+- Correctness: 118 targeted tests passed after adding oversized mixed-batch,
+  completion-count, cleanup, partial/zero-progress IO, and acceptance-gate tests.
+- Live gate: the initial DSV4 boot stalled in the weight-residency sweep before
+  tier initialization. Sampling found MPS synchronize waiting; the host had
+  ~68 GiB compressed pages and ~16 GiB swap. Bounded the sweep reductions to
+  16 MiB input / int32 with an inner-loop fence (the former int64 reduction and
+  outer-tensor-only fence could queue large temporaries). The retry completed
+  its first sweep in 145.94 s but compression remained high; validation ongoing.
+- Acceptance harness: `benchmarks/benchmark_kv_tier_serving.py` uses registered
+  plans/drafters, saves raw responses, rejects empty/truncated answers, checks
+  marker recall across concurrent turns, requires completed tier restores, and
+  offers reset eviction or unique filler pressure. Separate `--tier off` runs
+  remove only the transfer config for an explicit diagnostic comparison.
+- Decision: code fixes and synthetic optimization retained pending live gates;
+  NOT ready to ship. No new stable serving baseline is claimed.
+- Follow-up live evidence: DSV4 reached health after 447.6 s and passed text
+  smoke with the registered DSpark/TurboQuant drafter. The sweep still did not
+  converge under host memory pressure; the weight residency set then pinned
+  93.73 GiB. Muse and GGUF Qwen failed at packed-cache reshape: the allocator
+  confused logical K/V-first shape with physical blocks-first layout. Fixed
+  page-size calculation and added a physical-page isolation test. NVFP4 smoke
+  was falsely rejected before startup because the harness compared against the
+  source drafter instead of the registered platform drafter; fixed that check.
+- Native correctness follow-up: Metal KV scatter ignored packed physical block
+  strides while attention/gather already used them. Two sentinel-page tests
+  failed against the original binary. The shader now receives a 64-bit physical
+  stride (including packed layers/padding), with both host launch sites updated.
+  Rebuilt `_quixicore_C` and the metallib; both tests pass. Combined suite:
+  133 passed, two platform/large-allocation skips. A 768 MiB MPS roundtrip also
+  passed through the 512 MiB staging budget (correctness probe; no serving TPS).
+- Raw artifacts: `perf/results/2026-09-08/nvme-tier-ship/` (saved baseline modules,
+  `io-{before,after}-controlled.json`, `tests.txt`, startup samples, smoke logs).
+- Further live failures: `smoke-native.json` rejected all four Muse/Qwen
+  profiles. Qwen GGUF reached a CUDA-only Triton Mamba alignment launch on
+  Metal; NVFP4 variants hit the DS convolution-layout guard. Added a native
+  Metal alignment planner and state copy matching the CUDA implementation,
+  supporting SD/DS convolution layouts, speculative offsets, packed page
+  strides, and in-place shifts. Eight GPU/reference checks passed, including
+  the optional >32-bit KV address check (`align-oracles.txt`). Live Qwen
+  validation remains pending; no throughput claim for this new path.
+- Muse's stricter non-streaming probe was interrupted after its initial answer
+  continued generating without completing (`muse-accept-probe/`). Inspection
+  found two more stale writes: fused target and DFlash used `muse_kv_store`,
+  which assumed contiguous K then V. Both now use the shared 64-bit strided
+  scatter; the obsolete shader is removed. Rebuild/live retest in progress.
+  Streaming API errors now propagate, and the benchmark rejects degenerate
+  exact-count output and requires positive draft-token deltas. Nine harness
+  gate tests passed (`harness-error-tests.txt`).
+- Fused Muse retest: rebuilt library passed seven GPU tests (one optional
+  large-allocation skip); `smoke-aligned` returned coherent text and image
+  responses. Its streaming smoke still concatenated reasoning and final
+  content, so this remains preliminary. Smoke now saves the complete
+  non-streaming response and requires nonempty, untruncated final content.
+  The corresponding reasoning-only false-positive regression passes.
+- Missing Mamba destination state also reproduced a silent abandoned load
+  (`state-target-before.txt`). It now uses the same failure/recompute path as
+  missing attention pages and clears any staged operations. Updated Python
+  suite: 133 passed, one skip (`tests-latest.txt`); strict harness: ten passed
+  (`harness-final-tests.txt`). Qwen live checks and exact-token comparisons
+  are still outstanding.
+- `smoke-aligned` exposed GGUF Qwen generating only `!`; the opt-in
+  `VLLM_METAL_FINITE_PROBE=1` module-output diagnostic stopped at
+  `language_model.model.layers.31.self_attn.attn` (22 x 6144 bf16).
+  `_update_hybrid_attention_mamba_layout` unconditionally collapsed the
+  packed stride after allocation. The new hybrid sentinel test failed before
+  and passes after preserving already page-local strides; nine packing tests
+  passed, one skip (`hybrid-stride-{before,after}.txt`). Strict live rerun
+  uses `smoke-strict/`, with diagnostics disabled for the real workload.
+- NVFP4 image rejection in `smoke-aligned` was a harness error: both Metal
+  variants intentionally register `language_model_only=true` (documented
+  unvalidated compressed-tensors vision path). Smoke now respects this
+  platform setting and tests text only there; Muse and GGUF Qwen still
+  require both text and image. It does not enable or claim NVFP4 vision.
+- Strict live matrix PASSED for all four smaller compatible profiles:
+  GGUF Qwen `4` / `Red`, Muse `4` / `red`, both text-only NVFP4 variants `4`.
+  Registered drafters and TurboQuant settings intact; complete API responses
+  and logs in `smoke-strict.json` / `smoke-strict/`. Combined current tests:
+  143 passed, two skips (`tests-current.txt`), Ruff and diff checks clean.
+  These are smoke results, not the eviction or performance qualification.
+  Four-session, three-round forced-eviction acceptance is now running for
+  Muse and GGUF Qwen in `acceptance-full/` with restore-byte verification on.
+- `acceptance-full` FAILED before the first reset on both models: the
+  exact one-token checkpoint reached Triton's `_bias_kernel` on Metal.
+  Implemented native Metal `v2_logit_bias` for allowed tokens, bias, and
+  minimum-token EOS suppression, keeping decisions GPU-resident. Three
+  CPU-oracle tests pass, including repeated request rows, sentinel rows,
+  padded logits, min-length boundary, and the full 1024-token allowlist
+  (`logit-bias-tests.txt`). Built native artifacts (`build-logit-bias.log`).
+  Acceptance now preflights this sampler path before session setup; the
+  full retry is `acceptance-sampler/`. Still no serving performance claim.
+- Additional capacity correctness gate: six-slot CPU reproducer proved that
+  a new offload could reclaim an already-planned restore source, then write
+  it before the read in the same worker batch. Trajectories now retain read
+  references through worker completion; concurrent readers and cancellation
+  of issued reads are covered. Pending readers also protect window pages and
+  state-tail replacement. 45 index/connector/harness tests pass
+  (`read-pin-{before,tests}.txt`).
+- `acceptance-sampler` passed the minimum-token preflight but hit a 404 on
+  local cache reset. The harness now explicitly enables the loopback dev
+  endpoint for reset acceptance and requires `success=true`, driving queued
+  snapshot releases before retrying. The new full run is `acceptance-pinned/`
+  for Muse, GGUF Qwen, and DSV4, four sessions and three eviction rounds.
+- Long-context inspection found Muse cleared only the attention kernel's
+  inherited window, leaving `Attention.sliding_window=2048` for its 13 global
+  NoPE layers. The allocator consequently advertised all 57 target/draft
+  layers as sliding-window caches. Constructor regression failed before;
+  planner and kernel now both retain global history. The tier explicitly
+  selects a FullAttentionSpec group as primary even if windows are listed
+  first. 36 constructor/index/connector tests pass (`muse-policy-after.txt`).
+- `acceptance-pinned` Muse completed all 12 recalls with byte parity, but this
+  is NOT a qualifying pass: most restores were only 48 tokens of common
+  chat framing. Partial prefix hits adopted an existing lineage whose occupied
+  suffix discarded each divergent session's new hashes. Saves now fork on a
+  partial hit or concurrent writer, retaining both branches; 36 index/connector
+  tests pass (`branch-tests.txt`). Appending to an unbranched inactive lineage
+  still reuses it. The acceptance gate now requires unique completed readers
+  and restoration of the original prompt within one primary block, minimum
+  128 tokens, rejecting the observed boilerplate-only restores. Thirteen
+  harness tests pass (`depth-gate-tests.txt`). Muse needs a new full run with
+  these fixes; the current queued Qwen/DSV4 run remains useful trial evidence.
+- Qwen's `acceptance-pinned` run passed all 12 concurrent recalls with byte
+  verification clean. Retrospective depth audit confirms 2,400-3,200 tokens
+  restored for every request, exceeding the 2,220-token minimum from the
+  original 3,020-3,080-token prompts and 800-token primary blocks. The audit
+  is `acceptance-pinned/qwen38-q2kxl-1/restore-depth-audit.json`. Latest CPU
+  regression run: 115 passed (`tests-qualification-cpu.txt`). DSV4 is loading;
+  Muse's final policy/lineage run and exact-token on/off comparisons remain.
+- DSV4 reached health in 470 s, but session setup failed before eviction:
+  plant 2 asked for `silver maple river` and returned `silver maple tree`,
+  with coherent reasoning that also substituted the phrase. This is a failed
+  correctness gate, not a restore pass. A matched tier-off control is needed
+  to distinguish model/prompt behavior from cache-layout corruption. Raw:
+  `acceptance-pinned/dsv4-xxs-1/plant-2.json`. The latest complete targeted
+  suite passed 152 tests, two skips (`tests-qualification.txt`). Muse's fresh
+  history-policy run is `acceptance-muse-history/`.
+- Muse's corrected global policy exposed a fused-decoder metadata defect:
+  all local layers shared one block table and all global layers another,
+  despite allocation across 12 independent groups. The first planted request
+  degenerated into repeated `to` tokens (`acceptance-muse-history/`). Fused
+  dispatch now receives each layer's actual group table, lengths, and slots,
+  reusing prepared views within a group. Its auxiliary-output variant also
+  distinguishes single-request verify rows from independent decode requests
+  before choosing the shared-KV attention kernel. Rebuilt native library;
+  three policy/group tests passed (`muse-group-tests.txt`). Fresh full run:
+  `acceptance-muse-groups/`.
+- The first group-metadata retry rejected stride-zero broadcast tables in a
+  newly added native validation check. Corrected that check to allow the
+  supported row stride. A two-layer native oracle now exercises distinct
+  packed cache groups at 1,200-token context, both independent requests and
+  speculative row expansion; outputs match the CPU reference and all cache
+  pages match exactly. Fused state can be explicitly released before MPS
+  teardown. Nineteen native/policy/harness tests pass
+  (`muse-native-group-oracle.txt`); final rebuilt retry is
+  `acceptance-muse-groups-final/`.
+- Muse's final rebuilt run PASSED all 12 concurrent recalls, restoring
+  2,048-4,032 tokens per request (required minimum 1,588), with no byte
+  mismatches. Round latency ranges: 19.96-24.71 s, 8.10-9.96 s, 7.07-7.91 s.
+  These are instrumented correctness timings, not serving benchmarks. Raw:
+  `acceptance-muse-groups-final/muse-kdyn-1/acceptance.json` and server log.
+  The matched DSV4 tier-off control is `dsv4-off-control/`.
+- A final reader-lifetime regression also reproduced state-slot recycling
+  when a trajectory converted through the stateless finish path while a
+  restore still held its state snapshot. That conversion now waits for the
+  readers, matching ordinary state-tail replacement. The before failure is
+  `state-conversion-before.txt`; the regression suite is
+  `state-conversion-tests.txt`. This guard does not affect Muse's stateless
+  trajectories or the normal HMA finish path exercised by Qwen.
+- Startup experiment pending: request the existing weight residency set
+  before the bounded sweep. Previously both measured DSV4 starts spent
+  roughly 380 s sweeping still-pageable weights, then pinned them. Keeping
+  earlier pages resident while touching later tensors should prevent that
+  rotation. The current tier-off control was already loaded and uses the
+  old order; the next DSV4 tier-on retry will measure this one startup change.
+  No steady-state performance win is claimed yet.
+- DSV4 tier-off control reproduced all three planted messages exactly,
+  including the 950-token reasoning and incorrect `silver maple tree`
+  answer for session 2. This excludes NVMe as the cause of that failure;
+  the unchanged phrase-copying task is not reliably followed by this model.
+  Byte-identical message audit: `dsv4-off-control/paired-output-audit.json`.
+  Added an explicit `--marker-format quoted` variant for a stricter copying
+  instruction while retaining the original plain case and its failed result.
+  Next tier-on qualification uses that variant and the pin-first startup.
+- Pin-first DSV4 reached health in 88 s versus 443 s (tier-off control) and
+  470 s (tier-on), with model loading still around 40 s. This is a measured
+  startup improvement only, pending completion of the same registered
+  profile's correctness and throughput gates. Raw:
+  `acceptance-dsv4-quoted/dsv4-xxs-1/server.log`.
+- The quoted copying task also failed before eviction (DSV4 dropped
+  `lantern` from the first phrase). Retained that failure and added a direct
+  replay oracle: prime GPU cache, record seeded 128-token completions for
+  four concurrent prompts, reset, and require byte-identical generated text
+  after each of three NVMe restore rounds, alongside restored-depth and
+  cache-byte checks. This measures cache correctness independently of the
+  model's unreliable phrase copying. Raw prompt IDs, controls, and each
+  replay are saved. Current run: `acceptance-dsv4-replay/`; candidate tests:
+  `tests-candidate-replay.txt`.
+- DSV4 replay round 0 restored all four 1,280-token prefixes with exact
+  source/destination bytes (35 pages each), but three generated sequences
+  differed from the concurrent GPU-cache controls; one matched all 128
+  tokens and another matched 621 characters before diverging. This is NOT
+  a passing replay result. The next run repeats the GPU-cache controls
+  before any eviction and records top-20 token logprobs to distinguish
+  control instability, sampling/order sensitivity, and restore-state errors.
+  Raw: `acceptance-dsv4-replay/`; diagnostic: `dsv4-replay-stability/`.
+- The logprob diagnostic crashed before its controls: speculative accepted
+  token flattening still called Triton on Metal. Added the native ragged
+  gather, preserving padded source-row strides and untouched rejected rows.
+  Full selected-token IDs, logprobs/logits, and ranks match CPU in two tests
+  (`spec-logprob-tests.txt`); rebuilt native artifacts. Retry:
+  `dsv4-replay-logprobs/`. That interrupted startup took 170 s (weight load
+  58.5 s, residency request about 95 s, sweep 3.35 s), so pin-first startup
+  has measured 88-170 s, not a fixed 88 s, versus the old 443-470 s range.
+- Seeded control diagnosis: repeated GPU-cache requests changed their first
+  generated token with identical top-20 logprobs (maximum common-logprob
+  difference 0.000002), before any restore. The verifier dump established
+  seed 42 and the same first-token position, but the runner selected ordinary
+  Gumbel sampling for an all-prefill batch and inverse-CDF rejection sampling
+  when a neighbor had draft tokens. Metal speculative profiles now always
+  use their verifier, including zero-draft batches. A native regression with
+  the original routing produced tokens 55 versus 970 for the same request
+  alone/mixed; the corrected routing agrees. Fourteen sampler/logprob tests
+  passed; the rerun is `dsv4-consistent-sampler/`. Raw diagnosis:
+  `dsv4-replay-logprobs/`, `dsv4-sampler-dump/`, `sampling-routing-before.txt`.
+- Reduction hardening: added a threadgroup barrier between reading the
+  shared maximum and reusing that scratch for sums. The sparse 129,280-token
+  vocabulary oracle (offsets 0 and +/-20,000, shuffled request states) already
+  passed the old binary; this is a code-level race prevention, not a measured
+  cause of the live failure or a performance optimization. Native rebuilt;
+  retain only with final profile correctness/performance gates.
+- The corrected sampler routing made all four 128-token GPU-cache controls
+  repeat exactly. Restore round 0 again had byte-exact 1,280-token prefixes
+  and matching first-token probabilities, but three continuations diverged.
+  Subsequent inspection found a separate probability correctness defect:
+  MPS Gumbel's `output_processed_logits[req_indices, cols].copy_(processed)`
+  wrote an advanced-indexing temporary, leaving DSpark's persistent draft
+  distributions stale. Both scalar-column and per-row-column native tests
+  failed against the original path, including padded persistent strides.
+  Indexed assignment now writes the actual destination; 14 tests pass
+  (`draft-logits-{before,after}.txt`). The old-binary marker retry was stopped
+  after this discovery (`dsv4-marker-consistent/`); it is not a qualification
+  result. Prior phrase-copy errors must be reassessed with valid draft
+  probabilities, rather than attributed solely to model quality.
+- With the draft-probability fix, the original prompt still omitted a word
+  before eviction. A persistent registered DSV4 server then passed all 12
+  explicit-question probes: four phrases with short context, four with the
+  original random background, and four with ordinary prose. Added an explicit
+  `--marker-format question-last` variant: the phrase remains before the
+  background; only the copying question is repeated at the end, without
+  repeating the phrase. Raw: `dsv4-context-probe/`, server `dsv4-live.log`.
+  GPU-only 128-token replay controls still diverged at tokens 1, 2, and 92
+  under different scheduling (the fourth matched). Exact stochastic sequence
+  replay therefore remains a diagnostic, not evidence of NVMe corruption;
+  its failures are retained. No cross-batch determinism claim is made.
+- DSV4 question-last, 700 words: PASSED all 12 concurrent recalls across
+  three reset/restore rounds. Every restored prefix was 1,536 tokens, above
+  the 1,449-token minimum; all restored bytes matched. Instrumented request
+  latency 5.79-14.52 s is not a serving throughput result. Raw:
+  `dsv4-question-last-700/`; a four-session, three-round 4,000-word follow-up
+  is running on the same registered server.
+- The first 4,000-word run failed initial phrase 3 after reusing a shorter
+  session prefix. Isolation on the same server established: fresh 9,564-token
+  prompt, GPU-repeat, and full NVMe restore all returned the same correct
+  37-token response (9,472 tokens restored byte-exactly). Reusing a shorter
+  prefix on GPU instead produced the same incorrect 942-token response as
+  reusing it from NVMe, message-exact. This is a retained partial-prefix
+  model-quality/reproducibility limitation, not a tier transfer discrepancy.
+  Raw: `dsv4-long-isolation/`, `dsv4-partial-isolation/`. No claim of perfect
+  phrase accuracy under every prefill partition or stochastic trajectory.
+- DSV4 long acceptance with fresh session histories PASSED all 12 concurrent
+  recalls over three eviction rounds: every restored prefix 9,472 tokens,
+  required minimum 9,296; byte verification clean. Requests initially had
+  9,552-9,576 prompt tokens. Instrumented recall latency 8.29-15.68 s; no TPS
+  claim. An isolated cache namespace kept the previous short diagnostic
+  histories separate while allowing all sessions/rounds within the run to
+  share normally. Raw: `dsv4-long-fresh/`, same registered `dsv4-live.log`.
+  Next: Qwen natural eviction with 160,000 filler tokens per round, Muse
+  long-context recalls, and exact-token on/off matrices.
+- Pre-matrix candidate suite: 178 passed, two skips (platform/optional large
+  allocation), `tests-pre-matrix.txt`; archived 41 changed source/artifact
+  files plus native-library hashes in `candidate-pre-matrix.{zip,json}`.
+- Qwen natural eviction, round 0: PASSED all four concurrent recalls after
+  exactly 160,000 distinct filler prompt tokens (ten 16,000-token requests,
+  up to four submitted concurrently). Each history restored 12,800 tokens,
+  above the 12,063-token minimum, with byte verification clean. Initial
+  histories were 12,863-12,904 prompt tokens. Instrumented recall latency
+  38.83-49.64 s; filler request latency 198.6-840.7 s includes scheduler
+  waiting and is not a decode throughput benchmark. Round 1 also PASSED
+  all four recalls after another 160,000 filler tokens: each restored
+  12,800 tokens byte-exactly, with 32.39-49.77 s request latency. Every
+  restore carried 77 x 16,384,000-byte pages (about 1.17 GiB), split into
+  32/32/13-page chunks through the 512 MiB staging budget. The third and
+  final pressure round also PASSED all four recalls after another 160,000
+  filler tokens (480,000 total), again restoring 12,800 tokens byte-exactly;
+  final-round latency 28.12-42.21 s. Raw: `qwen-natural-pressure/qwen38-q2kxl-1/`,
+  including exact pressure responses and checkpointed acceptance.
+- Muse long acceptance PASSED all 12 recalls across three reset/restore
+  rounds: 9,152-9,408 tokens restored, minimum 9,005, byte verification clean.
+  Instrumented recall latency 7.31-12.59 s. Raw: `muse-long/`.
+- Exact-token candidate matrices (1,000 input / 2,000 output, c1/c8, three
+  repeats, registered sampling defaults, seed 42, active registered drafter)
+  completed for DSV4 and Muse. Median aggregate tok/s, tier on versus off:
+  DSV4 c1 18.114 / 16.965, c8 21.055 / 21.669; Muse c1 8.682 / 8.606,
+  c8 13.600 / 14.515. On/off c8 differences are -2.84% and -6.30%; sequential
+  run spreads overlap, so these are observed integration costs, not isolated
+  IO overhead or statistically established regressions. Raw exact responses,
+  positive draft counts, and clean clock-gap checks in `matrix-{profile}-{on,off}/`.
+  These longer sampling workloads are not directly comparable to historical
+  short/greedy results. Final profile smoke and Qwen matrix remain required.
+- Qwen matrix tier-on c1 produced three valid exact samples at 9.115, 9.028,
+  9.061 tok/s. The first c8 request group exceeded the 1,800 s HTTP deadline
+  while the engine continued generating (four of eight requests completed
+  before shutdown). No c8 TPS is accepted. The concurrency slowdown requires
+  attribution; a shorter c8 tier-off phase-profile diagnostic is running,
+  followed by the exact workload after the cause is isolated. Raw:
+  `matrix-qwen38-q2kxl-1-on/`, `qwen-c8-phase-off/`. Shipping gate remains open.
+- Qwen c8 phase diagnosis: tier-off 1,000/256 diagnostic completed at
+  13.561 aggregate tok/s with synchronization instrumentation (not a baseline).
+  Tier-on attribution showed target costs close to off but drafter costs
+  increasing from about 40 ms/call to hundreds of ms. The tier-on diagnostic
+  was stopped after attribution; its partial interval is not a performance
+  result. Raw: `qwen-c8-phase-{on,off}/`, including profiler snapshots.
+- The remaining DFlash context-write helper used advanced indexing and wrote
+  PAD_SLOT_ID=-1 into the last cache page. Native scatter now skips padded
+  slots and honors packed strides, sliced projections, and cache dtypes.
+  Three padding regressions failed before the change; 10 store/gather tests
+  passed afterwards with one optional large-allocation skip. Isolated writes
+  were byte-exact even above 2^31 offsets; four/32-row timings were sub-ms,
+  so this is NOT the explanation of the c8 slowdown. Raw:
+  `dflash-context-store-{before,after}.txt`, `qwen-context-write-probe.{py,json}`.
+- Benchmark failure preservation: completed peer responses now survive another
+  request timing out in `failed-bench-c*-r*.json`; failed groups never receive
+  a throughput result. All 19 harness tests passed, including timeout peers
+  and the sleep-discontinuity gate. Raw: `harness-partial-batch-tests.txt`.
+- Confirmed Qwen c8 bottleneck: bound-mode DFlash SDPA retained strided
+  `index_select` even after exact-mode attention gained the 64-bit gather.
+  On a real-sized 16,384,000-byte-stride slab, gathering 1,200 tokens took
+  23.603 ms versus 0.188 ms through the native gather, byte-exact. Repeating
+  that read across eight requests and five drafter layers explains the
+  roughly 1 s drafter cost; context writes were exonerated above. Raw:
+  `qwen-bound-gather-probe.{py,json}`, `qwen-c8-pyprof-on/`.
+- Change: native range gather now also serves bound-mode draft attention.
+  It retains the prior one-page backoff and exact GPU visibility mask, so
+  sliding windows crossing an estimated page boundary keep the same tokens.
+  Four routing/oracle cases rejected the original unsafe strided gather;
+  all 15 gather/context-store tests passed after the change, including the
+  optional 5 GiB allocation and bound-mode reads beyond signed-32-bit offsets.
+  Raw: `bound-gather-{before,after,large}.txt`. This is a microbenchmark win;
+  fresh registered-profile exact-token measurements remain the shipping gate.
+- Bound-gather candidate preflight: 190 passed, two platform/optional skips,
+  14 existing torch.jit deprecation warnings in 3.00 s. Separately, all 15
+  gather/store tests passed with the 5 GiB option enabled. Ruff over all
+  modified Python files and `git diff --check` passed. Archived 44 changed
+  files plus native-library hashes in `candidate-bound-gather.{zip,json}`.
+  The final serial campaign is `qualification-final-campaign.py`, state in
+  `final-campaign-state.json`: all five profile smoke checks, then three-round
+  long restores and fresh c1/c8 1,000/2,000-token on/off matrices for Qwen,
+  Muse, and DSV4. Runtime source is frozen during these comparisons.
+- Final campaign stopped on long Qwen acceptance: all five registered profile
+  smoke checks passed (including both supported vision paths), but the second
+  reset/restore round returned three incorrect or empty answers at 12,800
+  restored tokens. Every transfer passed byte verification; the first round
+  was correct. No fresh final throughput matrix ran. Raw:
+  `final-acceptance-qwen38-q2kxl-1/`, `smoke-final.json`.
+- A reduced 700-word, four-session, three-round reset test passed all 12
+  recalls (`qwen-repeat-restore-small/`). This does not clear the long failure.
+  Hypothesis under investigation: a frozen recurrent boundary snapshot changes
+  during reuse, or long-context execution reads the wrong state. Debug-only
+  owner/boundary/physical-page and existing verification-digest logging added;
+  exact long rerun with DEBUG logging is `qwen-long-snapshot-trace/`. No
+  production fix or throughput claim yet; shipping gate remains open.
+- The DEBUG long rerun passed all 12 recalls at 12,800 restored tokens
+  (15.07-24.67 s). Every available same-owner/boundary recurrent snapshot
+  digest remained identical across rounds (`snapshot-comparison.json`);
+  the last queued save had no digest before shutdown and is not compared.
+  This passing rerun does not explain the earlier normal-logging failure.
+  A 12.8 GB packed-state probe also passed 14 bf16/fp32 read/write cases at
+  physical block IDs 1..775 (`qwen-state-view-probe.{py,json}`). The next
+  diagnostic replays the exact failed request bodies under normal logging
+  through fresh prefill, GPU reuse, and two NVMe resets, with unique cache
+  salts (`qwen-failed-body-controls/`); production numerics remain unchanged.
+- Fixed-body control: all four fresh responses were correct (415.60-513.54 s
+  concurrent wall latency). Reuse was also correct, but one request extended
+  its GPU prefix via NVMe, so it was a mixed control. First forced reset:
+  4/4 correct at 12,000-12,800 restored tokens; second reset: 3/4, with session
+  3 returning 45 reasoning tokens containing the correct phrase but no final
+  answer. All transfers were byte-exact. Thus the failure recurred with
+  unchanged request bodies and normal logging; it remains unexplained.
+  Actual SD convolution-layout slices also passed all seven large-offset
+  read/write/sentinel probes (`qwen-state-view-sd-probe.{py,json}`). Next run:
+  `qwen-long-token-trace/`, original four-session 3,000-word histories for up
+  to ten rounds, recording token IDs/logprobs and targeted snapshot logging
+  to distinguish premature generation termination from parser/state failure.
+- Token trace reproduced the second-round empty final answer. Raw output ended
+  directly after Chinese reasoning with `<|im_end|>` (ID 248046), without
+  `</think>` or final content; its target logprob was -0.725746 (~48.4%), tied
+  with newline. This rules out parser loss and an impossible sampled stop for
+  this response. All available frozen-state digests, including the failing
+  request's re-saved boundary, matched their originals. Raw:
+  `qwen-long-token-trace/{token-report,snapshot-comparison}.json`.
+- Independent deterministic bug: bound-mode draft SDPA let nonfinite bytes in
+  masked, recycled sliding-window rows contaminate attention (masking scores
+  does not make NaN arithmetic or `0 * inf` safe). All four fp16/bf16,
+  window/no-window GPU regressions failed before. Clear only invisible rows
+  of the private gathered K/V before SDPA; keep the exact visibility mask and
+  preserve visible values. 18 gather/store tests pass, one optional skip
+  (`bound-nonfinite-{before,after}.txt`). No serving speedup or explanation
+  of the observed high-probability EOS is claimed from this fix alone.
+  `qwen-eos-distribution-control/` now teacher-forces the identical failed
+  reasoning from a fresh cache, then GPU/NVMe reuse, to compare the stop-token
+  distribution independently of sampled paths.
+- Teacher-forced EOS control preserved all 13,120 input token IDs. Premature
+  EOS probabilities were 9.19% fresh, 28.29% GPU reuse (no tier hit), 45.31%
+  first NVMe restore, and 39.39% repeated restore. All chose newline under
+  seed 42; transfers were byte-exact. This demonstrates a non-negligible
+  early-stop probability without NVMe and sensitivity to the prefill/cache
+  path, not distribution identity. Raw:
+  `qwen-eos-distribution-control/comparison.json` and full per-mode responses.
+- The original normal-logging, three-round workload still failed after masked
+  row sanitization (`qwen-nonfinite-fixed-acceptance/`): first round 4/4, second
+  round 3/4, session 3 again reasoning-only. The sanitization fixes its four
+  deterministic regressions but is NOT the fix for this observed stop.
+  Next isolation is `qwen-resident-control/`: same registered packed layout,
+  same original histories, no forced eviction; record any tier hits to avoid
+  mislabeling a mixed run as GPU-only. No fresh throughput campaign has run.
+- `qwen-resident-control/` passed all 12 turns, but every turn extended its
+  resident GPU prefix via NVMe to 12,800 tokens. It is a mixed GPU/NVMe pass,
+  NOT a GPU-only control; reported resume depth is total cached-prefix depth,
+  not necessarily the number of tokens transferred from disk. No reset calls
+  occurred. Corrected control: same wrapper with `--tier off`, output
+  `qwen-resident-tier-off/`, which removes only the registered transfer config.
+  Its unpacked cache layout is an explicit difference from the tiered profile.
+- Current diagnostic command: `caffeinate -i .venv/bin/python
+  perf/results/2026-09-08/nvme-tier-ship/qwen-resident-control.py
+  --profile qwen38-q2kxl-1 --tier off --acceptance-only --context-words 3000
+  --rounds 3 --sessions 4 --marker-format question-last
+  --output perf/results/2026-09-08/nvme-tier-ship/qwen-resident-tier-off`.
+  The prepared `qualification-masked-campaign.py` requires a passed long
+  Qwen gate before starting fresh profile smoke, long restores, and exact-token
+  matrices. Preserve earlier failed directories when retrying; no commit yet.
+- Masked-row candidate archived as `candidate-masked-rows.{zip,json}` (44
+  changed files plus the native-library hash). CPU index/connector/profile/
+  harness checks passed: 133 tests, one platform skip in 7.71 s
+  (`cpu-gates-masked.txt`). The full GPU suite and current-candidate exact-token
+  comparisons remain outstanding; this archive is not a shipping approval.
+- Correct GPU-only control PASSED all 12 recalls with zero tier hits/restores
+  (`qwen-resident-tier-off/`). Round latencies were 145.15-145.78 s,
+  60.29-61.37 s, and 62.53-63.19 s. This does not clear the repeated tiered
+  failure. The failed chat's rendered prompt preserved correctly closed prior
+  reasoning sections (`qwen-failed-prompt-tail.json`), ruling out that framing
+  hypothesis for this response.
+- Current masked-row preflight: 194 passed, two skips, 14 existing warnings
+  in 4.33 s (`tests-masked-current.txt`); all 19 gather/context-store tests
+  passed with the optional 5 GiB allocation enabled in 2.76 s
+  (`tests-masked-large.txt`). Ruff on every changed Python file and diff
+  checks passed.
+- Next isolation: `qwen-eos-equal-boundary-control.py` compares one identical
+  teacher-forced target token after fresh prefill, direct GPU reuse, and NVMe
+  restore. The ignored `direct-gpu-boundary-hook/sitecustomize.py` temporarily
+  omits the conservative drafter lookup backoff during GPU prefix lookup;
+  normal allocation/retention remains intact. This deliberate diagnostic
+  deviation permits matching the target prefix boundary and is NOT generative
+  qualification or a production change. Confirm the logged GPU/NVMe depths
+  actually match before interpreting its logits. Output:
+  `qwen-eos-equal-boundary-control/`.
+- Equal-boundary next-token control PASSED: both GPU-only reuses logged
+  exactly 12,800 cached tokens and no tier hit; both reset/NVMe reuses restored
+  exactly 12,800. All four produced IDENTICAL top-10 logprob maps, including
+  EOS -0.7917404175 (45.3056%), and sampled newline. Fresh full prefill retained
+  EOS -2.3865280151 (9.1948%). Restore byte verification was clean. Thus this
+  distribution shift already exists in the GPU cache at the same prefix
+  boundary; it is not introduced by transferring that snapshot. This is one
+  teacher-forced token, not proof of arbitrary-context distribution identity
+  or a fix for the original reasoning-only response. Raw compact comparison:
+  `qwen-eos-equal-boundary-control/comparison.json`.
+- Current exact-token measurement starts independently of the still-open
+  original chat acceptance gate: `masked-matrix-qwen38-q2kxl-1-on/`, registered
+  Qwen profile, no diagnostic lookup hook, 1,000 input / 2,000 output tokens,
+  c1/c8, three repeats, profile/API sampling defaults and seed 42. Runtime
+  source remains the `candidate-masked-rows` archive. A throughput pass alone
+  does not approve shipping or erase the original chat failures.
+- First current Qwen results: c1 samples 20.758 / 16.223 / 16.113 tok/s
+  (median 16.223), identical generated text and 3,051 draft tokens in each.
+  First c8 sample PASSED all eight exact 2,000-token responses: 31.612 tok/s,
+  506.140 s, 26,670 draft tokens, 0.0035 s clock gap. Two c8 repeats and the
+  matching off run remain. The old candidate's c8 request group timed out;
+  these are current-candidate measurements, not a completed on/off comparison.
+  A separate CPU build and Disk Inventory X scan were active; host/process RSS
+  and thermal samples are retained in `resource-samples.jsonl` and
+  `host-processes-start.json`. Do not label this an idle-machine baseline.
+- Prepared follow-up diagnostics (not yet run): `qwen-eos-chunk-trace.py`
+  records the scheduler's actual prefill splits and cache geometry, using
+  `equal-boundary-chunk-hook/`; `qwen-failed-body-equal-boundary.py` replays
+  all four exact failed chat bodies across GPU/NVMe reuse with token IDs and
+  top-five logprobs. Both are isolated, ignored diagnostics. No acceptance
+  criterion, production sampling default, or registered drafter was changed.
+- CONFIRMED new blocker before completing the matrix: obtaining
+  `DFlashSpeculator.attn_vllm_config` calls `replace(VllmConfig, ...)`, whose
+  validation re-runs `MetalPlatform.check_and_update_config` on the SHARED
+  CacheConfig. A real local Qwen ModelConfig reproducer changed the target's
+  finalized block size from 800 to 16 (`draft-config-mutation-model-before.txt`).
+  The allocated Mamba/cache specs remain 800. The scheduler's 16-token split
+  sequence for the 13,120-token prompt includes 12,288, whereas proper
+  800-token alignment includes 12,000; see `expected-prefill-splits.json`.
+  This makes a mislabeled recurrent boundary a concrete hypothesis, not an
+  assumption that the observed cache sensitivity is benign model numerics.
+  Stopped the owned server during c8 repeat 2; earlier completed samples are
+  retained as diagnostic results, not a qualified candidate. Fix and live
+  scheduler/state trace required before restarting performance qualification.
+- Live pre-fix trace CONFIRMS the geometry mismatch:
+  `cache_bs=16 scheduler_bs=800 hash_bs=800 eagle=True`. The final long-prefill
+  chunks ended at 10,080, 12,096, 13,104, and 13,120. Mamba block index 15
+  receives the state after 12,096 tokens, then is cached under its nominal
+  12,800-token boundary when the state moves to block 16. GPU and NVMe reuse
+  therefore agree on the SAME mislabeled state, explaining why the earlier
+  equal-boundary logprob match did not establish correct prefix semantics.
+  Raw: `qwen-eos-chunk-trace/server.log`. A portable platform regression also
+  failed exactly for the auto-aligned 800-token case; default and explicit
+  block sizes passed (`metal-config-tests-before.txt`, 1 failed / 3 passed).
+- Fix: remove Metal's redundant reset of an automatically selected block size.
+  `CacheConfig` already resolves an unspecified size to 16; revalidation must
+  preserve the backend's finalized alignment. All four platform regressions
+  now pass (`metal-config-tests-after.txt`). Current live trace is
+  `qwen-eos-geometry-fixed.py`, using `geometry-fixed-hook/`: logging only,
+  normal GPU prefix lookup, no conservative-backoff override. Verify the
+  actual prefix semantics and rerun the original chat workload before claiming
+  this resolves the observed EOS failures. No new native build is needed.
+- Corrected live trace PASSED: cache/scheduler/hash block sizes all remain
+  800. Fresh prefill ends at 1,600-token increments, then 12,000 and 13,120;
+  every reuse starts at 12,000 and recomputes the same 1,120-token tail.
+  ALL FIVE top-10 logprob maps are now identical (fresh, two GPU reuses, two
+  NVMe resets), EOS -2.4950237274; no byte mismatch. The GPU reuses had no tier
+  hit; their depth is proven by the scheduler trace, not the absent lookup
+  wrapper lines. Real ModelConfig reproduction also preserves target/draft
+  block_size=800 (`draft-config-mutation-model-after.txt`). Compact output:
+  `qwen-eos-geometry-fixed/comparison.json`.
+- Depth gate corrected for speculative Mamba alignment: require the actual
+  cached guard boundary, `(prompt_tokens // block_size - 1) * block_size`,
+  minimum 128, while retaining the previous attention-only rule. For a
+  12,863-token prompt the valid snapshot is 12,000; the old >=12,063 check
+  incorrectly demanded a 12,800 state inside the final unsplit chunk. Four
+  regressions cover accepting that real boundary while rejecting 11,200,
+  boilerplate-only 800, and an attention-only 12,000 hit. The new positive
+  case failed before the adjustment. No marker, nonempty/final-content,
+  byte-parity, completed-reader, sampling, or exact-token gate was relaxed.
+- Corrected candidate preflight: 202 passed, two skips, 14 existing warnings
+  in 3.08 s (`tests-geometry-fixed.txt`); all changed Python files pass Ruff
+  and diff checks. Archive: `candidate-cache-geometry-checked.{zip,json}`,
+  46 changed files plus native-library hash. The earlier
+  `candidate-cache-geometry` archive precedes a formatting-only test fix.
+  Original four-session / three-reset / 3,000-word chat workload is running
+  without diagnostic hooks in `qwen-geometry-fixed-acceptance/`, with the
+  original request text, default sampling, seed 42, drafter, and byte checks.
+- Original long Qwen acceptance PASSED all 12 recalls after the geometry fix.
+  Round 0 restored 12,000 for all four sessions, 50.77-54.40 s; round 1
+  restored 12,000-12,800, 44.51-45.93 s; round 2 restored 12,000-12,800,
+  39.71-41.12 s. Every round had four completed readers and zero byte
+  mismatches. Later mixed scheduling can legitimately materialize a deeper
+  aligned snapshot. This closes the reproduced original chat failure, with
+  the corrected guard-boundary depth criterion described above.
+- Current serial campaign: `qualification-geometry-campaign.py`, state in
+  `geometry-campaign-state.json`. It checks the candidate hashes and changed
+  file set between phases; all five profile smokes, DSV4/Muse long restores
+  and exact-token on/off matrices, Qwen's original three 160,000-token pressure
+  rounds, then its exact-token on/off matrix. Earlier pre-fix Qwen/Muse live
+  successes do not qualify the corrected candidate's cache semantics. Final
+  readiness remains pending this campaign and an independent artifact review.
+- Corrected-candidate registry smoke PASSED all five compatible profiles:
+  DSV4 with registered DSpark/TurboQuant draft KV; both text-only NVFP4 Qwen
+  variants; Muse and GGUF Qwen text AND image requests. Raw:
+  `smoke-geometry.json` / `smoke-geometry/`. The campaign has advanced to
+  DSV4's four-session, three-round, 4,000-word restore workload. Independent
+  final audit is prepared in `review-geometry-qualification.py`; it checks
+  source hashes, every saved answer, restore depths, all exact-token samples,
+  and the complete 480,000-token Qwen pressure workload before review.
+- Corrected DSV4 long acceptance PASSED all 12 recalls: 9,472 restored tokens
+  per request, required >=9,296, four completed readers each round, 6.38-18.22 s
+  latency, byte verification clean (`geometry-acceptance-dsv4-xxs-1/`). Its on
+  matrix also passed every exact count and clock/drafter gate: c1
+  18.988 / 16.455 / 16.116 tok/s (median 16.455), c8
+  20.914 / 21.222 / 21.336 (median 21.222). Raw:
+  `geometry-matrix-dsv4-xxs-1-on/`. Off comparison is running; no paired
+  performance conclusion yet.
+- DSV4 sampling audit resolves the real local ModelConfig and API request:
+  generation_config=auto, no model sampling overrides, temperature=1.0,
+  top_p=1.0, top_k=0, seed=42 (`dsv4-effective-sampling.txt`). The on/off c1
+  responses have identical generated text hashes and 6,605 draft tokens each
+  (`dsv4-c1-work-equivalence.json`), despite substantial timing variation.
+  This is a shared-workstation run: resource samples record competing host
+  workloads. No macOS thermal/performance warning was reported, but GPU clocks
+  were not measured. Do not infer a precise tier speedup from that variation.
+- Corrected DSV4 on/off matrix PASSED all 54 exact 1,000-in/2,000-out
+  responses (108,000 output tokens), with positive registered DSpark activity
+  and clean clock checks. Independent raw-count/timing audit:
+  `dsv4-geometry-matrix-audit.json`. Off c1: 19.264 / 13.200 / 10.738 tok/s
+  (median 13.200); off c8: 15.958 / 18.355 / 14.682 (median 15.958).
+  On medians are 16.455 / 21.222 at c1/c8. No tier-enabled slowdown was
+  observed in this run; the apparent +24.7%/+33.0% is NOT a controlled
+  speedup claim because unrelated CPU/VM activity changed during the phases.
+  Both boots pinned 93.73 GiB of weights and selected the same 4.82 GiB KV
+  pool. Completion-endpoint sampling is independently confirmed in
+  `dsv4-completion-effective-sampling.txt`. Muse long restore validation is
+  now running; final shipping review remains pending the complete campaign.
+- Corrected Muse long acceptance PASSED all 12 recalls, four completed readers
+  per round, 9,152-9,408 restored tokens (required >=9,005), latency
+  8.08-21.92 s. All 9,822 logged block comparisons across 12 verification
+  batches matched. Raw: `geometry-acceptance-muse-kdyn-1/`. Its tier-enabled
+  exact-token matrix is running. The final artifact audit now also requires
+  positive logged byte-verification evidence for every acceptance phase.
+- Muse performance attempt INTERRUPTED for observed GPU contention, not a
+  serving correctness failure. A separate QuixiProofs training process
+  (PID 55296) consumed Metal GPU time concurrently; c1 samples were
+  8.045 / 7.228 / 4.699 tok/s. Stopped only the owned serving process tree
+  and preserved its outputs under `contended-geometry-matrix-muse-kdyn-1-on-*`.
+  These samples are diagnostic and cannot qualify performance. Raw activity:
+  `muse-on-python-gpu-clients.json`, `geometry-performance-interruption.json`.
+  The user was asked to coordinate a GPU window; no other project's process
+  was changed. Subsequent activity from a QuixiProofs evaluation process is
+  also detected by the new guard.
+- Resume orchestration: `qualification-geometry-resume.py` reuses the exact
+  original commands and candidate hash checks, preserves the five completed
+  phases, and waits for three 15-second samples without foreign Metal compute
+  activity. During each resumed phase it records active AGX client counters
+  every 15 seconds; overlap from Python/vLLM/MLX/llama/train/benchmark clients
+  interrupts and quarantines only the owned attempt before a clean retry.
+  This guard is diagnostic orchestration, not a production code change or a
+  claim of idle CPU/display load. State remains `geometry-campaign-state.json`;
+  activity evidence is in `geometry-gpu-availability.jsonl` and each resumed
+  phase's `*-gpu-activity.jsonl`. Shipping review remains pending.
+- First uncontended Muse retry was rejected by the clock gate: one sample
+  had an 881.224-second difference between wall-clock and monotonic elapsed
+  time. `geometry-sleep-evidence.txt` confirms idle/maintenance sleep and a
+  Dark Wake Thermal Emergency during that interval. Its output is preserved
+  under `clock-interrupted-geometry-matrix-muse-kdyn-1-on-*`; its reported TPS
+  is invalid. No completed qualification phase crossed these sleep intervals.
+  Resumed after a full user wake, open-lid state, and no current thermal
+  warning, using `caffeinate -is` (temporary AC system-sleep assertion scoped
+  to the driver). GPU contention and clock guards remain mandatory. The final
+  audit also rejects foreign compute activity in resumed phase logs.
+- Clean Muse tier-enabled matrix PASSED: c1 8.954 / 8.167 / 8.236 tok/s
+  (median 8.236); c8 11.815 / 13.464 / 13.719 (median 13.464). All 27
+  responses are exact 1,000-in/2,000-out, registered DFlash activity is
+  positive, and clock differences stay within 0.041 s. All three c1 outputs
+  and draft counts are identical (`muse-clean-on-c1-work-equivalence.json`).
+  The full phase has no recorded foreign compute overlap. Raw:
+  `geometry-matrix-muse-kdyn-1-on/` and its `*-gpu-activity.jsonl`.
+  The guarded tier-disabled comparison is running; no final paired Muse
+  performance conclusion yet.
+
+- Muse c1 comparison needs confirmation: enabled median 8.236 versus disabled
+  8.757 tok/s (~5.95% lower), with overlapping sample ranges. All six outputs
+  have identical text hashes and 17,872 draft tokens. The enabled samples had
+  top-12 foreign-process CPU medians of 401% / 204% / 201%, versus
+  110% / 115% / 110% when disabled (`muse-clean-c1-comparison.json`). This
+  does not establish a causal tier overhead. The first two disabled c8 samples
+  are also higher (14.475 / 14.800 tok/s versus enabled median 13.464).
+  Reverse-order off/on confirmation (same 1,000/2,000 tokens, three c1 repeats
+  and one additional full c8 batch per tier) is prepared in
+  `geometry-extra-phases.json`. `finish-geometry-campaign.py` is running under
+  `caffeinate -is`; after primary completion it invokes the resume driver
+  automatically, preserving completed phases and running the four guarded
+  confirmation phases. It stops if primary qualification fails.
+  This confirmation remains required before the shipping assessment.
+
+- Muse c8 work audit while the final disabled repeat runs: enabled draft
+  counts were 122,128 / 118,640 / 117,440 versus 110,608 in each of the
+  first two disabled repeats. Only four of eight r0 response text hashes
+  match across tiers; the two disabled repeats match each other exactly.
+  Later enabled draft-token rates were 99.83 / 100.70 per second versus
+  disabled 100.07 / 102.31. These are diagnostic work counts, not an
+  alternative serving TPS metric or proof that tier overhead is absent.
+  They identify differing speculative work as a confound in the c8 output
+  TPS comparison. Hypothesis: repeat scheduling/prefix reuse changes the
+  sampled paths and acceptance work; reverse-order confirmation remains
+  required. Raw: `muse-clean-c8-work-comparison-partial.json` plus the
+  corresponding matrix responses and resource samples. No production
+  change or shipping decision follows from this partial audit.
+
+- Muse primary matrices COMPLETE: all 54 responses have exactly 1,000 input
+  and 2,000 output tokens, positive DFlash work, and valid clocks/arithmetic.
+  Disabled c8 ended at 14.475 / 14.800 / 11.729 tok/s (median 14.475);
+  enabled median 13.464 is 6.99% lower. C1 remains 5.95% lower. Both ranges
+  overlap. The final disabled c8 repeat changed sampled work too (116,144
+  drafts versus 110,608 in each earlier repeat), while its foreign CPU
+  median rose to 335% from 115-117%. Both boots used the same 12 GiB KV
+  budget and reported 744,673-token capacity. All guarded samples have no
+  detected foreign compute overlap. Raw: `muse-primary-matrix-audit.json`,
+  `muse-primary-work-audit.json`; reproducible work audit:
+  `audit-phase-work.py geometry-matrix-muse-kdyn-1-on
+  geometry-matrix-muse-kdyn-1-off`. Decision: correctness gates pass;
+  performance confirmation remains required. Qwen's original natural
+  pressure workload is now running on the frozen geometry-fixed candidate.
+
+- Qwen natural pressure round 1 PASS: 10 distinct filler responses account
+  for exactly 160,000 input tokens; all four subsequent answers contain the
+  correct original phrases and end normally (63.62-68.50 s). Each restores
+  12,000 tokens; all four readers complete. The 12 verification chunks
+  cover 292 restored blocks with zero byte mismatches. Raw:
+  `geometry-qwen-natural-pressure/qwen38-q2kxl-1/pressure-0.json`,
+  `recall-0-*.json`, `acceptance.json`, and `server.log`. The remaining two
+  pressure rounds and both Qwen performance matrices are still required.
+
+- Qwen natural pressure round 2 PASS: another 10 distinct filler responses
+  account for exactly 160,000 input tokens. All four correct recalls end
+  normally, with one 12,800-token restore and three 12,000-token restores;
+  all four readers complete. Cumulative byte verification: 588 restored
+  block checks across 24 chunks, zero mismatches. Raw: the same run's
+  `pressure-1.json`, `recall-1-*.json`, and `acceptance.json`. The third
+  and final pressure round is running; no extra durability rounds are planned.
+
+- Qwen natural pressure COMPLETE/PASS: all three rounds exercised exactly
+  160,000 distinct filler input tokens each (480,000 total, 30 requests),
+  followed by 12/12 correct recalls with normal stops and all 12 completed
+  readers. Final-round recalls took 42.56-44.48 s. Cumulative verification
+  covered 888 restored blocks in 36 chunks, with zero byte mismatches.
+  Every restore met the 12,000-token minimum. The original repeated-reuse
+  durability gate is satisfied on the geometry-fixed candidate. Raw:
+  `geometry-qwen-natural-pressure/`. Remaining release work is performance
+  qualification: both Qwen matrices, the four planned Muse confirmation
+  phases, then the independent artifact/source audit. No additional
+  durability rounds are planned.
+
+- Qwen tier-enabled matrix COMPLETE/PASS: c1 17.818 / 15.508 / 16.101 tok/s
+  (median 16.101); c8 37.493 / 41.765 / 43.620 aggregate tok/s (median
+  41.765). All 27 responses have exactly 1,000 input and 2,000 output
+  tokens, positive DFlash work, valid clocks and throughput arithmetic.
+  No foreign compute overlap was detected by the guard. Raw:
+  `geometry-matrix-qwen38-q2kxl-1-on/`,
+  `qwen-geometry-on-matrix-audit.json`. The disabled comparison is next;
+  no paired Qwen performance conclusion yet.
+
 This is the running performance notebook. Follow `perf/perf.md`: record the
 baseline, hypothesis, controlled change, correctness result, throughput result,
 decision, and raw artifact locations.

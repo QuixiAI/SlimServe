@@ -281,11 +281,10 @@ class MetalPlatform(Platform):
             if kernel_config.moe_backend == "aiter":
                 kernel_config.moe_backend = "auto"
 
-        cache_config = vllm_config.cache_config
-        if not getattr(cache_config, "user_specified_block_size", False):
-            # The vendored paged-attention and KV-cache kernels take any
-            # multiple of 16; 16 is vLLM's default and the best-tested.
-            cache_config.block_size = 16
+        # CacheConfig already supplies the 16-token default. Preserve backend
+        # alignment here: DFlash revalidates a shallow VllmConfig copy after KV
+        # allocation, sharing the target's CacheConfig. Resetting its resolved
+        # block size would make the scheduler mislabel recurrent snapshots.
 
     @classmethod
     def support_static_graph_mode(cls) -> bool:

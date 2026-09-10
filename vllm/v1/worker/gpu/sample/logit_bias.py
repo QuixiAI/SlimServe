@@ -256,6 +256,24 @@ def apply_logit_bias(
     num_tokens, vocab_size = logits.shape
     from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
+    if logits.device.type == "mps":
+        from vllm.quixicore import quixicore_ops
+
+        quixicore_ops.v2_logit_bias(
+            logits,
+            expanded_idx_mapping.to(torch.int32),
+            pos.to(torch.int64),
+            num_allowed_token_ids,
+            allowed_token_ids,
+            num_logit_bias,
+            logit_bias_token_ids,
+            logit_bias,
+            min_lens,
+            num_stop_token_ids,
+            stop_token_ids,
+        )
+        return
+
     if (
         _use_native_sample_kernels()
         and logits.dtype == torch.float32
