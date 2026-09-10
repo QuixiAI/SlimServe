@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# DEPRECATED (operator directive, 2026-09-10): the V1 GPU model runner is
+# frozen. SlimServe serves every profile on the V2 runner
+# (vllm/v1/worker/gpu/model_runner.py); any model, speculator or feature
+# that V2 lacks gets ADDED to V2 rather than run here. Do not extend this
+# file, do not qualify new records on it, and treat any boot that reaches
+# it (see the warning in gpu_worker.py) as a configuration bug.
 
 import functools
 import gc

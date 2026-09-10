@@ -24042,3 +24042,28 @@ restart is the operator's call.
   serving validation owed once MTP earns its place. Row sharding off
   costs nothing at 1000-token context (c16 +1.6%); TC decode off costs
   3-4% - the sweep baseline has both off for a fair comparison.
+- MTP k sweep under FULL_AND_PIECEWISE (drafter gets piecewise graphs),
+  row shard + TC decode off on every arm, validate_glm5_next.py 1000/300
+  two warmed repeats, aggregate tok/s (mean acceptance length in
+  parentheses; nospec = the full-feature record):
+  | arm            | c1    | c8    | c16   | c32   |
+  | nospec (record)| 109.9 | 494.6 | 676.0 | 929.9 |
+  | fp-nospec-min  | 104.2 | 483.4 | 667.5 | 902.9 |
+  | fp-k1 (1.72)   | 100.2 | 456.6 | 684.9 | 892.4 |
+  | fp-k3 (1.96)   | 117.1 | 410.0 | 598.5 | 472.0 |
+  | fp-k5 (1.96)   |  99.6 | 399.6 | 271.2 | 451.6 |
+  k=3 is the c1 sweet spot (+12% over its equal-feature baseline, +6.5%
+  over the record); acceptance saturates at ~1.96 from k=3 on, so k=5
+  only adds draft cost; c8+ loses at every k and c32 halves (verify rows
+  exceed the 64-token capture set). A speculative step still carries a
+  fixed ~7 ms regardless of k (16.7 ms at k=3 vs 9.6 plain), unexplained
+  on the V1 runner. Raw: perf/results/2026-09-10/glm53f-mtp-sweep/.
+- OPERATOR DIRECTIVE (2026-09-10 17:50): V2 model runner only; V1 is
+  deprecated (banner in gpu_model_runner.py, warning at the selection
+  point in gpu_worker.py). GLM-5.3-Flash currently runs on V1 (hybrid,
+  not in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES) and its MTP adapter is
+  V1-only, so the sweep above is a V1 result and the census/k=4 arms
+  were dropped. Next: GLM on V2, then incoai/GLM-5.3-Flash-DFlash2
+  (operator's choice) through the V2 DFlash2 speculator. Tap contract from
+  SGLang PR 36708: aux hidden state at layer k = hc_contract(stream
+  tensor after layer k) = mean over the 4 mHC streams.

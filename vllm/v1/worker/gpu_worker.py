@@ -417,6 +417,12 @@ class Worker(WorkerBase):
                 GPUModelRunner as GPUModelRunnerV1,
             )
 
+            logger.warning(
+                "DEPRECATED: falling back to the V1 GPU model runner "
+                "(vllm/v1/worker/gpu_model_runner.py). SlimServe serves on the "
+                "V2 runner only (operator directive 2026-09-10); a config that "
+                "lands here needs V2 support added, not a V1 qualification."
+            )
             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
         bootstamp(f"worker[{self.rank}]: model runner ready")
 
