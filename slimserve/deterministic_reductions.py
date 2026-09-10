@@ -32,7 +32,17 @@ def diagnostic_plan(plan):
     options = engine.setdefault("compilation_config", {}).setdefault(
         "inductor_compile_config", {}
     )
-    if "deterministic" in options and options["deterministic"] is not True:
-        raise ValueError("conflicting deterministic compiler option")
-    options["deterministic"] = True
+    # vLLM otherwise enables timed combo fusion. Inductor deliberately rejects
+    # that benchmarking under deterministic=True (fresh-model qualification,
+    # 2026-09-09). Disable this optional fusion in the candidate only. Merely
+    # disabling its timing gate would accept previously unqualified combinations.
+    policy = {
+        "deterministic": True,
+        "combo_kernels": False,
+        "benchmark_combo_kernel": False,
+    }
+    for key, value in policy.items():
+        if key in options and options[key] is not value:
+            raise ValueError(f"conflicting deterministic compiler option: {key}")
+    options.update(policy)
     return replace(plan, engine=engine)

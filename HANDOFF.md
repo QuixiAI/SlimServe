@@ -35,7 +35,40 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-09 23:55 UTC): frontend passes; full-model series prescribed
+### Latest checkpoint (2026-09-10 00:07 UTC): fresh compilation exposes timed-combo conflict
+
+The first full-model deterministic series on7d43c93af is TERMINAL after fresh-a
+fails BEFORE health/capture/requests. Do not launch its fresh-b/cached-a arms.
+vLLM defaults enable combo_kernels=True/benchmark_combo_kernel=True. The actual
+Inductor scheduler calls speedup_by_combo_kernel -> benchmark_fused_nodes ->
+may_ban_benchmarking, which correctly rejects this in deterministic mode. This
+is a compiler-option compatibility failure, not a model correctness/TPS result.
+
+Frozen failure closure checks28 sources,7 native binaries,5172 original files,
+24 benchmark source receipts; cache-b remains empty, no other arms started,
+138 partial cache-a files preserved. Server/controller exit1; teardown complete,
+GPUs released0.044349s, independent query empty. Raw series/audit preserved.
+`runtime-control/deterministic-serving-failure-close.json`,
+SHA67602718eeb3c8019bac83056b1b5c97f6a2e9b174b966f66d20064e4039456f.
+
+Corrected opt-in candidate now records THREE explicit options: deterministic=True,
+combo_kernels=False, benchmark_combo_kernel=False. Default profile untouched.
+This disables optional horizontal combo fusion for qualification; it is NOT a
+performance promotion. Disabling only its timing gate would accept unqualified
+static combinations, so those remain future optimization work. Conflicts reject;
+actual vLLM defaults/cache-key separation/installed scheduler guard tested.
+
+NEXT: ONE fresh16GiB/no-swap extended frontend probe, output
+`perf/results/2026-09-10/deterministic-reduction-no-combo-frontend`.12 cases:
+in-place/three-copy/independent-pointwise-branch graphs x rows1/16/640/7616.
+Same real norm weight/FP64<=1BF16-ULP/replay/guard/mutation checks; new branches
+also require exact eager/replay and CPU operation equality. Compare the eight
+original corresponding outputs to the completed first frontend. Freeze sources
+through probe/audit. No corrected-policy full-model series prescribed yet.
+Read protocol tail. Existing first-series auditor is historical, NOT the next
+series command; adapt it with a fresh namespace only after this probe passes.
+
+### Previous checkpoint (2026-09-09 23:55 UTC): frontend passes; full-model series prescribed
 
 The ONE prescribed frontend GPU process on49f9bff98 completes8/8 cases. Two
 actual vLLM RMSNorm IR graphs x rows1/16/640/7616, native lowering, real layer22

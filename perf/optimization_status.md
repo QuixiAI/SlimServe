@@ -26391,3 +26391,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA48830fce4a1fec6868f23609dd6cd8510f164e32d263f5996d5de72f2b9b815b;
   `runtime-control/deterministic-serving-{cpu-final,audit-replay}.log`.
   Next series root: `deterministic-reduction-serving/` (not launched here).
+
+## 2026-09-10 - Fresh model compile rejects timed combo fusion under deterministic policy
+
+- Status: first full-model series stopped after prescribed fresh-a; candidate
+  compiler options corrected, extended frontend qualification pending.
+- Baseline:7d43c93af, fixed recipe/native-order1/BF16fn1/TC0, independently empty
+  VLLM/Inductor/Triton cache-a. One150GiB/no-swap serving start; sources frozen
+  through exit and failure audits. No discarded or replacement starts.
+- Result: fails BEFORE health/capture/requests; no TPS or model-quality result.
+  First failing operation is Inductor scheduler's timed combo-fusion test, enabled
+  by vLLM defaults. speedup_by_combo_kernel -> benchmark_fused_nodes ->
+  may_ban_benchmarking rejects it under deterministic=True, as designed.
+- Closure:28 sources,24 benchmark receipts,7 native libraries and5172 original
+  files verify. Preserve138 partial cache-a files; cache-b empty. Fresh-b/cached-a
+  never started and MUST NOT be launched. Server/controller exit1, teardown
+  complete, GPUs released0.044349s and independent compute query empty.
+- Change: opt-in plan explicitly disables combo_kernels and benchmark_combo_kernel
+  alongside deterministic=True. Default profile unchanged. This avoids an
+  unqualified static combo schedule; it may cost performance and is not promoted.
+  Real vLLM defaults/hash separation and installed scheduler guard get regression
+  tests. Extended probe adds independent unequal-size pointwise branches.
+- CPU:126 tests pass18.78s; lint and diff checks pass. No GPU model request or
+  throughput claim from these CPU checks.
+- Next: one fresh12-case frontend process in16GiB/no-swap scope, compare original
+  eight output hashes, inspect graph metadata/configs/cubin bytes, then prescribe
+  a NEW full-model series only if qualified. Protocol tail contains exact command.
+- Raw: first series `perf/results/2026-09-09/deterministic-reduction-serving/`;
+  failure closure `runtime-control/deterministic-serving-failure-close.json`,
+  SHA67602718eeb3c8019bac83056b1b5c97f6a2e9b174b966f66d20064e4039456f.
+  Corrected-policy CPU log `runtime-control/deterministic-no-combo-cpu.log` there;
+  prescribed probe `perf/results/2026-09-10/deterministic-reduction-no-combo-frontend/`.

@@ -237,3 +237,62 @@ failed preceding arm. A failed planned series can inform a newly prescribed
 experiment, not a silent retry. No policy/TC/default/performance promotion from
 this diagnostic series alone. After it, qualify any remaining numerical gate
 before returning to TC or claiming a faster serving baseline.
+
+## First series stopped; corrected no-combo policy (2026-09-10 00:07 UTC)
+
+The first series is TERMINAL after its prescribed fresh-a on7d43c93af fails
+before health or CUDA graph capture. No benchmark/canary/quality/prefill requests
+were served. Do NOT launch fresh-b/cached-a or overwrite any of these outputs.
+No numerical or throughput conclusion follows from this startup failure.
+
+Exact stack: vLLM CompilationConfig defaults enable combo_kernels=True and
+benchmark_combo_kernel=True; Inductor Scheduler.create_combo_kernel_nodes calls
+speedup_by_combo_kernel -> benchmark_fused_nodes -> benchmark_gpu ->
+may_ban_benchmarking. Deterministic mode intentionally rejects this unvetted
+timed fusion decision. The small original frontend graphs did not cover it.
+
+Failure closure through frozen sources confirms28 source receipts,7 native
+libraries, all5172 original files and24 benchmark receipts; cache-b empty,
+138 partial cache-a files retained, no other starts. Controller/server exit1,
+teardown complete/GPU release0.044349s, final independent compute query empty.
+The prescribed audit fails its incomplete-run gate, as required. Supplementary
+hash-bound failure closure `runtime-control/deterministic-serving-failure-close.json`,
+SHA67602718eeb3c8019bac83056b1b5c97f6a2e9b174b966f66d20064e4039456f.
+
+Correct the opt-in plan to explicitly set deterministic=True, combo_kernels=False
+and benchmark_combo_kernel=False. Registered defaults, quant/native binaries and
+global numerical modes stay unchanged. This intentionally disables optional
+horizontal combo fusion for qualification. Simply bypassing the benchmarking
+ban is not a fix; merely disabling its timing gate accepts different static
+combinations, an unqualified alternative. Restore/tune deterministic horizontal
+fusion later if measured worthwhile. No claim that this is the fastest policy.
+
+CPU regression reproduces the exact installed scheduler's benchmark guard with
+no GPU, checks real vLLM defaults cannot re-enable combo fusion, rejects conflicts,
+and proves cache-hash separation from BOTH the registered and first deterministic
+plans. Existing CLI/campaign/quality/receipt tests remain in the matrix.
+
+Before another model start, prescribe ONE fresh16GiB/no-swap extended frontend
+probe with the corrected plan. THREE graphs: original in-place/three-copy plus
+RMSNorm with independent unequal-size pointwise branches. Twelve cases at rows
+1/16/640/7616, same real layer22 weight, seeds and oracle contract. Check extras
+exactly against CPU operations and repeated eager/graph outputs. Compare the
+eight original corresponding output hashes against the completed first frontend;
+require inspected emitted reduction choices and byte-hashed cubins. Still NOT
+TP4/full-model validation. Freeze sources/native through this probe and audit.
+
+```bash
+systemd-run --user --scope --unit=glm53-reduction-no-combo-frontend \
+  -p MemoryMax=16G -p MemorySwapMax=0 \
+  env -u CUDA_LAUNCH_BLOCKING CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  CUDA_HOME=/usr/local/cuda-13.0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_reduction_frontend \
+  --model /raid/weights/GLM-5.3-Flash-NVFP4-FP8-KDA-TP4 \
+  --output perf/results/2026-09-10/deterministic-reduction-no-combo-frontend
+```
+
+Preserve a separate launch log under2026-09-10/runtime-control. Do not rerun
+completed/failed outputs. After this probe passes, adapt the serving auditor to
+the three-option policy and prescribe a NEW fresh-cache series/namespace. The
+older first-series commands above are archived, not authorization to continue
+its unused arms. No corrected-policy full-model series is prescribed yet.

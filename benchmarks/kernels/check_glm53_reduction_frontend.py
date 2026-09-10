@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fresh GPU frontend/receipt qualification on vLLM's real RMSNorm IR lowering.
 
-Two small graphs, not the full model or TP execution. The runner facade exercises
+Three small graphs, not the full model or TP execution. The runner facade exercises
 the exact startup recorder before/after capture. No cached-source intervention.
 """
 
@@ -91,8 +91,17 @@ def main():
             out = ir.ops.rms_norm(x, w, 1e-5)
             return out.clone(), out.clone(), out.clone()
 
+        def independent(x, w):
+            # Disjoint pointwise branches exercise horizontal-fusion eligibility,
+            # which the original single-reduction graphs did not cover.
+            return ir.ops.rms_norm(x, w, 1e-5), w + 1, w[:2048] * 2
+
         jobs = []
-        for name, function in (("inplace", inplace), ("triple", triple)):
+        for name, function in (
+            ("inplace", inplace),
+            ("triple", triple),
+            ("independent", independent),
+        ):
             compiled = torch.compile(
                 function, fullgraph=True, dynamic=True, options=options
             )
@@ -130,11 +139,17 @@ def main():
                 x.copy_(changed)
                 graph.replay()
                 actual = [t.cpu() for t in outputs]
-                assert all(torch.equal(t, actual[0]) for t in actual)
+                if name == "independent":
+                    assert torch.equal(actual[1], weight + 1)
+                    assert torch.equal(actual[2], weight[:2048] * 2)
+                    assert torch.equal(first[1], actual[1])
+                    assert torch.equal(first[2], actual[2])
+                else:
+                    assert all(torch.equal(t, actual[0]) for t in actual)
                 assert not torch.equal(actual[0], first[0])
                 assert torch.equal(wg.cpu(), weight)
                 assert torch.all(storage[[0, -1]] == 123).item()
-                if name == "triple":
+                if name != "inplace":
                     assert torch.equal(x.cpu(), changed)
                 metrics = [
                     compare(first[0], oracle(original, weight)),
