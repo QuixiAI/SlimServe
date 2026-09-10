@@ -27934,3 +27934,38 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/prompt-score-rollout-v1/rollout.json`, SHA
   c0edff11d35650a18afe529c63c4c58fc25e4da25cd091806374d1e9db6a76f6;
   `control/audit.json`, full campaign outputs and independent fresh cache retained.
+
+## 2026-09-10 - Historical production controls all fail retrospective window gate
+
+- Status: CPU diagnosis complete; future methodology decision requested, no GPU run.
+- Baseline/hypothesis: is the failed fresh unchunked control distinguishable from
+  historical same-policy quality variation by the current fixed gate?
+- Change: read-only three-control leave-one-out helper, original comparator and
+ 0.01-nat tolerance unchanged. All three chronological retained BF16fn1 production
+  starts included exactly once as held-out observations; original responses/IDs
+  verified. No fake replicas, reference selection or observation exclusions.
+- Correctness: historical environment/engine/recipe/quant/native/packages/affinity
+  match; historical source diff changes only teardown/client bookkeeping/tests/docs.
+  All quality-bearing boots completed; original outer-chain interruption retained.
+- Results: each historical start fails against the other two:6/6/10 windows,
+  maximum deficits0.086295/0.055896/0.105111 nat below allowed floors. Aggregate and
+  needles pass in all folds. New unchunked control fails5/max0.090025, but native
+  hashes and cache state differ: no claim of identical-binary A/A or proven cause.
+- Coverage finding:32 text windows have512+128 tokens, <=639 projected score rows,
+  and bypass the>1024-row chunked scorer even when enabled. Added real-runner
+  dispatch tests at639/1024/1025 for both flag states; exact text score equality
+  alone never demonstrates memory-fix branch coverage. Long needles remain relevant.
+- Decision: no existing failure, tolerance, default, quant or speed baseline changed.
+  Gate rejects the unchanged reference policy; it cannot by itself isolate this new
+  discrepancy. Three dependent folds do not estimate a rejection rate. Asked operator
+  about separating exact same-live-logit scorer parity, repeatability and broader
+  held-out model quality in FUTURE qualification. No GPU job prescribed pending
+  that decision. Do not redo already completed ordering/KDA causal investigations.
+- Raw: `perf/results/2026-09-10/runtime-control/control-variation-v1.{py,json}`;
+  JSON SHAf8cfbb2cbcdda3be5fd1aeeb89cc2031b5eb74d7bedda9fbcfbb0491a540eb8d.
+  Initial CPU36 pass/12.74s; expanded271 pass/36.16s in control-variation-cpu-v2.xml;
+  Ruff/diff checks pass. All CPU work8GiB/swap0 with GPUs hidden.
+  Final sandboxed NVIDIA query could not access the driver; approved read-only
+  query confirms all four expected UUIDs/driver580.173.02/600W, memory34/2/2/2MiB,
+  no compute processes or surviving test scopes. No reset or GPU mutation.
+  Explanation and proposed separation: `perf/glm53-control-quality-diagnosis.md`.

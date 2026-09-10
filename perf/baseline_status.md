@@ -2004,6 +2004,14 @@ historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
+Quality-repeatability limitation (2026-09-10): all three retained BF16 production
+starts fail the later unchanged0.01-nat window gate when each is held out against
+the other two (6/6/10 windows), despite aggregate/needle passes and matching native/
+policy identity. These historical TPS observations are not a reproducible model-
+quality oracle. No old verdict or table replaced. See
+`perf/glm53-control-quality-diagnosis.md`; raw `runtime-control/control-variation-v1.json`
+under2026-09-10, SHAf8cfbb2cbcdda3be5fd1aeeb89cc2031b5eb74d7bedda9fbcfbb0491a540eb8d.
+
 Later prompt-score memory qualification (2026-09-10,414829029) does not change
 these stable baselines: opt-in1024-row post-projection scoring gives exact full-model
 score parity and recovered4.7GB allocation warnings8 ->0 ->8 in prescribed

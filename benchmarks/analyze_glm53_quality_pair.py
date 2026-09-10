@@ -204,6 +204,35 @@ def compare_observations(controls, candidates):
     }
 
 
+def held_out_controls(documents):
+    """Diagnose the fixed gate on three actual same-policy control observations.
+
+    Each observation is held out once against the other two. This does not
+    estimate a false-positive rate, enlarge the envelope, select references,
+    or change a campaign verdict. Callers must establish policy/receipt identity.
+    """
+    require(len(documents) == 3, "three actual control observations required")
+    folds = []
+    for held_out in range(3):
+        controls = [i for i in range(3) if i != held_out]
+        comparison = compare_observations(
+            [documents[i] for i in controls], [documents[held_out]]
+        )
+        folds.append(
+            {
+                "held_out": held_out,
+                "controls": controls,
+                "comparison": comparison,
+            }
+        )
+    return {
+        "method": held_out_controls.__doc__,
+        "folds": folds,
+        "failed_folds": sum(not f["comparison"]["passed"] for f in folds),
+        "campaign_verdict_changed": False,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--control", type=Path, required=True)

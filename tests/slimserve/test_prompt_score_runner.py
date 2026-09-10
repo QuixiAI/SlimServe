@@ -127,6 +127,31 @@ def test_chunked_prefill_defers_completion_and_preserves_offsets(runner_method):
     assert syncs == [True]
 
 
+@pytest.mark.parametrize("rows", [639, 1024, 1025])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_chunk_dispatch_coverage_not_inferred_from_score_equality(
+    runner_method, monkeypatch, rows, enabled
+):
+    from vllm.v1.sample import prompt_logprobs
+
+    method, env = runner_method
+    env.value = "1" if enabled else "0"
+    original = prompt_logprobs.gather_prompt_logprobs
+    calls = []
+
+    def observed(logits, *args, **kwargs):
+        calls.append(logits.shape[0])
+        return original(logits, *args, **kwargs)
+
+    monkeypatch.setattr(prompt_logprobs, "gather_prompt_logprobs", observed)
+    runner, projections, _ = make_runner(rows, 0, "raw_logprobs")
+    method(runner, torch.zeros(rows, 17).bfloat16(), {"a": rows + 1})
+    assert len(projections) == 1
+    # The 512-prefix + 128-continuation quality workload has 639 scored rows:
+    # it cannot exercise the memory fix even when the option is enabled.
+    assert calls == ([rows] if enabled and rows > 1024 else [])
+
+
 def test_empty_skipped_embedding_and_invalid_configuration(runner_method):
     method, env = runner_method
     runner, projections, syncs = make_runner(1025, 0, "raw_logprobs")

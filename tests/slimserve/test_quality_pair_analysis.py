@@ -4,7 +4,11 @@ import statistics
 
 import pytest
 
-from benchmarks.analyze_glm53_quality_pair import compare, compare_observations
+from benchmarks.analyze_glm53_quality_pair import (
+    compare,
+    compare_observations,
+    held_out_controls,
+)
 from benchmarks.benchmark_glm53_quality import CODES
 
 
@@ -158,3 +162,34 @@ def test_negative_needle_cannot_pass_with_consistent_summary(docs):
     candidate["summary"]["needle_margins"][0] = -7.0
     candidate["summary"]["all_needles_rank_first"] = False
     assert not compare(docs[:2], docs[2:])["passed"]
+
+
+def test_held_out_controls_use_each_observation_once(docs):
+    original = copy.deepcopy(docs[:3])
+    report = held_out_controls(docs[:3])
+    assert report["failed_folds"] == 0
+    assert not report["campaign_verdict_changed"]
+    for i, fold in enumerate(report["folds"]):
+        assert fold["held_out"] == i
+        assert fold["controls"] == [j for j in range(3) if j != i]
+        assert fold["comparison"]["tolerance_nat_per_token"] == 0.01
+    assert docs[:3] == original
+
+
+def test_held_out_control_failure_is_not_excused_by_aggregate(docs):
+    for i in range(3):
+        update_window(docs[i], i, -2.03)
+    report = held_out_controls(docs[:3])
+    assert report["failed_folds"] == 3
+    for i, fold in enumerate(report["folds"]):
+        candidate = fold["comparison"]["candidates"][0]
+        assert candidate["aggregate_passed"]
+        assert [w["window"] for w in candidate["windows"] if not w["passed"]] == [i]
+
+
+def test_held_out_controls_reject_incomplete_or_mismatched_evidence(docs):
+    with pytest.raises(ValueError, match="three actual"):
+        held_out_controls(docs[:2])
+    docs[2]["text"][0]["offset"] = 99
+    with pytest.raises(ValueError, match="prompt IDs or source"):
+        held_out_controls(docs[:3])

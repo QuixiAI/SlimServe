@@ -35,7 +35,30 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): fresh production control fails quality gate
+### Latest checkpoint (2026-09-10): historical controls fail their own quality gate
+
+CPU leave-one-out audit of ALL THREE chronological BF16 production baseline starts:
+each fails against the other two at the unchanged0.01-nat window floor (6/6/10
+windows). Aggregate/needles pass. Historical policy/native/package identity matches;
+only harness teardown/bookkeeping and docs changed between those commits. Raw
+`runtime-control/control-variation-v1.json` under2026-09-10, SHA
+f8cfbb2cbcdda3be5fd1aeeb89cc2031b5eb74d7bedda9fbcfbb0491a540eb8d.
+
+The new unchunked control's five failures therefore do not isolate a new regression.
+They remain failures; no compiler/native exoneration or gate relaxation. Existing
+traces already isolated production ordering nondeterminism; do not redo that work.
+Also, all32 text windows have<=639 score rows and NEVER exercise the>1024-row
+memory-fix branch. Added CPU tests observe real runner dispatch at639/1024/1025.
+
+NEXT requires methodology decision: operator asked whether future qualification
+may separate identical-input scorer parity, fresh-cache repeatability, and broader
+held-out model quality. Recommended first diagnostic compares both scorers on the
+SAME live long-prompt logits with explicit branch coverage; not a timing/memory run.
+CPU271 pass/36.16s, Ruff/diff checks pass. See
+`perf/glm53-control-quality-diagnosis.md`. No new GPU job prescribed; defaults,
+quant, all prior failed gates and terminal rollout remain unchanged.
+
+### Previous checkpoint (2026-09-10): fresh production control fails quality gate
 
 Rollout on70dfeafa1 is TERMINAL/FAILED after the first control. Chunking was OFF;
 none of the three candidates or return-control started. Do not resume/retry this
