@@ -66,6 +66,13 @@ MODELS = {
     ),
     "fp64_control": "Full FP64 oracle arithmetic; reference/control only.",
 }
+# Fixed before the screen: these are detection thresholds, not ULP tolerances.
+CANCELLATION_EXPONENTS = (-16, -12, -8)
+SCREEN_MODELS = ("fp32_separate", "fp32_fused_affine")
+PRECISION_BASELINE = RESULTS / "runtime-control/indexer-precision-analysis-v1.json"
+PRECISION_BASELINE_SHA = (
+    "358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764"
+)
 
 
 def joined_cases(summary, audit, manifest, supplement):
@@ -203,13 +210,132 @@ def retained_examples(case, phase, x, weight, bias, reference):
     return evidence
 
 
-def analyze():
+def cancellation_mask(output, bias, exponent):
+    """Output/bias-only detector; no oracle, input moments or FP64 arithmetic.
+
+    Reconstruct the affine term approximately as output - bias. A zero output with
+    nonzero bias is cancellation-prone; zero output AND bias is not cancellation.
+    The future GPU path must validate actual branch arithmetic independently.
+    """
+    import torch
+
+    require(exponent in CANCELLATION_EXPONENTS, "prescribed detector threshold")
+    require(
+        all(
+            t.device.type == "cpu" and t.dtype == torch.bfloat16 for t in (output, bias)
+        ),
+        "CPU BF16 detector inputs required",
+    )
+    require(output.ndim == 2 and bias.shape == (output.shape[1],), "detector shape")
+    require(
+        all(torch.isfinite(t).all() for t in (output, bias)), "finite detector inputs"
+    )
+    y, b = output.float(), bias.float()
+    scale = (y - b).abs() + b.abs()
+    return (scale > 0) & (y.abs() <= (2.0**exponent) * scale)
+
+
+def above_one_ulp(actual, reference):
+    import torch
+
+    def ordered(t):
+        bits = t.view(torch.int16).int() & 0xFFFF
+        return torch.where(bits >= 0x8000, -(bits & 0x7FFF), bits & 0x7FFF)
+
+    return (ordered(actual) - ordered(reference)).abs() > 1
+
+
+def screen_cancellation(outputs, reference, bias, historical):
+    """Coverage/cost estimate only, not a recomputation kernel test."""
+    import torch
+
+    result = {}
+    for exponent in CANCELLATION_EXPONENTS:
+        models = {}
+        for name in SCREEN_MODELS:
+            output = outputs[name]
+            selected = cancellation_mask(output, bias, exponent)
+            failures = above_one_ulp(output, reference)
+            models[name] = dict(
+                elements=output.numel(),
+                rows=len(output),
+                selected_elements=int(selected.sum()),
+                selected_rows=int(selected.any(-1).sum()),
+                failures=int(failures.sum()),
+                detected_failures=int((failures & selected).sum()),
+                missed_failures=int((failures & ~selected).sum()),
+            )
+        historical_by_arm = {}
+        for arm in ("combo", "split"):
+            examples = [p for p in historical if p["arm"] == arm]
+            detected = []
+            for point in examples:
+                output = torch.tensor([[point["actual"]]], dtype=torch.bfloat16)
+                b = bias[point["column"] : point["column"] + 1]
+                detected.append(bool(cancellation_mask(output, b, exponent)[0, 0]))
+            historical_by_arm[arm] = dict(
+                examples=len(examples),
+                detected=sum(detected),
+                missed=[
+                    {k: p[k] for k in ("row", "column", "actual", "bf16_ulp")}
+                    for p, found in zip(examples, detected)
+                    if not found
+                ],
+            )
+        result[str(exponent)] = dict(
+            cpu_models=models, historical_gpu_failures=historical_by_arm
+        )
+    return result
+
+
+def aggregate_screen(records):
+    result = {}
+    for exponent in CANCELLATION_EXPONENTS:
+        screens = [r["cancellation_screen"][str(exponent)] for r in records]
+        models = {}
+        for name in SCREEN_MODELS:
+            metrics = [r["cpu_models"][name] for r in screens]
+            counts = {key: sum(m[key] for m in metrics) for key in metrics[0]}
+            models[name] = dict(
+                **counts,
+                selected_element_fraction=counts["selected_elements"]
+                / counts["elements"],
+                selected_row_fraction=counts["selected_rows"] / counts["rows"],
+            )
+        result[str(exponent)] = dict(
+            threshold=2.0**exponent,
+            cpu_models=models,
+            historical_gpu_failures={
+                arm: dict(
+                    examples=sum(
+                        r["historical_gpu_failures"][arm]["examples"] for r in screens
+                    ),
+                    detected=sum(
+                        r["historical_gpu_failures"][arm]["detected"] for r in screens
+                    ),
+                    missed=sum(
+                        len(r["historical_gpu_failures"][arm]["missed"])
+                        for r in screens
+                    ),
+                )
+                for arm in ("combo", "split")
+            },
+        )
+    return result
+
+
+def analyze(*, cancellation_screen=False):
     import torch
 
     require(os.environ.get("CUDA_VISIBLE_DEVICES") == "", "hide GPUs explicitly")
     require(not torch.cuda.is_initialized(), "CUDA must remain uninitialized")
     torch.set_num_threads(1)
     receipts = {str(RESULTS / name): digest for name, digest in PINS.values()}
+    baseline = None
+    if cancellation_screen:
+        baseline = load_checked(PRECISION_BASELINE, PRECISION_BASELINE_SHA)
+        require(baseline["status"] == "complete", "incomplete precision baseline")
+        receipts[str(PRECISION_BASELINE)] = PRECISION_BASELINE_SHA
     documents = {
         key: load_checked(RESULTS / name, digest)
         for key, (name, digest) in PINS.items()
@@ -255,6 +381,10 @@ def analyze():
                     ),
                 )
             )
+            if cancellation_screen:
+                records[-1]["cancellation_screen"] = screen_cancellation(
+                    outputs, reference, bias, records[-1]["historical_examples"]
+                )
         print(json.dumps({"completed_unique_cases": len(records) // 2}), flush=True)
     worst = documents["supplement"]["worst_example"]
     (case,) = [
@@ -282,6 +412,12 @@ def analyze():
         )
         for name in MODELS
     }
+    if baseline is not None:
+        unscreened = [
+            {k: v for k, v in r.items() if k != "cancellation_screen"} for r in records
+        ]
+        require(unscreened == baseline["records"], "CPU precision baseline drift")
+        require(aggregate == baseline["aggregate"], "CPU aggregate drift")
     require(not torch.cuda.is_initialized(), "unexpected CUDA initialization")
     for path, digest in receipts.items():
         require(sha(path) == digest, "completed receipt changed during analysis")
@@ -314,6 +450,15 @@ def analyze():
         gpu_run=False,
         model_descriptions=MODELS,
         aggregate=aggregate,
+        cancellation_screen=aggregate_screen(records) if cancellation_screen else None,
+        cancellation_screen_limitation=(
+            "Coverage on CPU proxy outputs and retained GPU failing scalars only. "
+            "CPU row/element fractions are not GPU counts, timings or a bound "
+            "for unseen inputs. No extended-precision recomputation kernel "
+            "has been implemented or qualified."
+        )
+        if cancellation_screen
+        else None,
         worst_historical_point=point,
         records=records,
     )
@@ -322,11 +467,12 @@ def analyze():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--screen-cancellation", action="store_true")
     args = parser.parse_args()
     # Exclusive reservation preserves even failed attempts; do not overwrite.
     with args.output.open("x") as stream:
         try:
-            result = analyze()
+            result = analyze(cancellation_screen=args.screen_cancellation)
         except BaseException as error:
             json.dump({"status": "failed", "error": repr(error)}, stream, indent=2)
             stream.write("\n")
@@ -339,6 +485,7 @@ def main():
                 "output": str(args.output),
                 "sha256": sha(args.output),
                 "aggregate": result["aggregate"],
+                "cancellation_screen": result["cancellation_screen"],
             }
         )
     )

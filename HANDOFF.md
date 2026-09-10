@@ -35,7 +35,35 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): indexer CPU precision boundaries isolated
+### Latest checkpoint (2026-09-10): cancellation detector CPU screen complete
+
+The three thresholds prescribed before this CPU screen (2^-16, 2^-12, 2^-8)
+all detect the 12 original and 14 split retained GPU failing scalars, plus all
+21/19 failures of the separate/fused-affine FP32 CPU models. The detector uses
+only BF16 output/bias in FP32, not an oracle or high-precision input moments.
+At 2^-16 both CPU models flag102/99,312 rows (0.103%); at 2^-12 they flag
+1,424/1,423 (1.434%/1.433%); at 2^-8 they flag21,734 (21.885%). These are CPU
+proxy counts, not measurements of full GPU outputs or execution cost.
+
+All60 previous precision records, including every output hash and scalar,
+reproduce exactly against the pinned completed analysis from `cc9a508ea`.
+CPU73 tests pass/3.54s; Ruff/diff pass. No GPU/model job, kernel implementation,
+production/default/quant change or quality/oracle promotion.
+Raw `runtime-control/indexer-cancellation-analysis-v1.json` under 2026-09-10,
+SHA `3474f6692e98b1be257174827dd5387d8d08dedadd647f8c2935a0a18ec25a24`.
+
+NEXT: implement an isolated opt-in Triton correction probe at fixed threshold
+2^-12 (16x the tightest screened threshold, still ~1.43% CPU rows). Run the
+original attention bundle first, detect cancellation from its actual BF16
+indexer output, recompute flagged rows' moments/normalization/affine in FP64,
+and overwrite ONLY flagged indexer elements. Preserve Q/KV/gate/stride guards
+and every unflagged element exactly. Qualify CPU/import/layout checks before
+prescribing GPU starts, actual branch coverage, oracle/replay/guards and timing.
+The threshold is heuristic, not a proven bound; do not loosen the one-ULP gate.
+Model quality remains a later independent gate. Original production attention
+arithmetic stays unchanged. No GPU/model job or source freeze is active yet.
+
+### Previous checkpoint (2026-09-10): indexer CPU precision boundaries isolated
 
 `benchmarks/analyze_glm53_indexer_precision.py` consumes the pinned completed
 rank-private probe, not its expired source freeze. All four rank records match;

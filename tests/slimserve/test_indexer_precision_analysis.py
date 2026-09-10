@@ -210,7 +210,7 @@ def test_failed_attempt_preserved_and_output_never_overwritten(tmp_path, monkeyp
     output = tmp_path / "analysis.json"
     monkeypatch.setattr("sys.argv", ["analysis", "--output", str(output)])
 
-    def fail():
+    def fail(**kwargs):
         raise ValueError("fixture failure")
 
     monkeypatch.setattr(probe, "analyze", fail)
@@ -221,3 +221,55 @@ def test_failed_attempt_preserved_and_output_never_overwritten(tmp_path, monkeyp
     with pytest.raises(FileExistsError):
         probe.main()
     assert output.read_bytes() == original
+
+
+def test_detector_uses_only_output_and_bias_and_handles_zero():
+    output = torch.tensor([[0, 0, 1e-6, 1e-2, 1]], dtype=torch.bfloat16)
+    bias = torch.tensor([0, -1, -1, -1, 0], dtype=torch.bfloat16)
+    saved = output.clone(), bias.clone()
+    masks = [
+        probe.cancellation_mask(output, bias, e) for e in probe.CANCELLATION_EXPONENTS
+    ]
+    assert masks[0].tolist() == [[False, True, True, False, False]]
+    assert all(torch.all(a <= b) for a, b in zip(masks, masks[1:]))
+    assert torch.equal(output, saved[0]) and torch.equal(bias, saved[1])
+    with pytest.raises(ValueError, match="prescribed"):
+        probe.cancellation_mask(output, bias, -20)
+
+
+def test_detector_coverage_counts_misses_not_just_selected_elements():
+    reference = torch.tensor([[0, 1, -1, 0]], dtype=torch.bfloat16)
+    output = torch.tensor([[1e-7, 1.015625, -1.015625, 0]], dtype=torch.bfloat16)
+    bias = torch.tensor([-1, 0, 0, 0], dtype=torch.bfloat16)
+    historical = [
+        dict(arm=arm, row=0, column=col, actual=float(output[0, col]), bf16_ulp=2)
+        for arm in ("combo", "split")
+        for col in (0, 1)
+    ]
+    outputs = {name: output for name in probe.SCREEN_MODELS}
+    screen = probe.screen_cancellation(outputs, reference, bias, historical)
+    for entry in screen.values():
+        for value in entry["cpu_models"].values():
+            assert value["selected_elements"] == value["selected_rows"] == 1
+            assert value["failures"] == 3
+            assert value["detected_failures"] == 1
+            assert value["missed_failures"] == 2
+        for value in entry["historical_gpu_failures"].values():
+            assert value["examples"] == 2 and value["detected"] == 1
+            assert len(value["missed"]) == 1 and value["missed"][0]["column"] == 1
+    totals = probe.aggregate_screen([{"cancellation_screen": screen}] * 2)
+    for entry in totals.values():
+        assert entry["cpu_models"]["fp32_separate"]["elements"] == 8
+        assert entry["cpu_models"]["fp32_separate"]["selected_element_fraction"] == 0.25
+        assert entry["cpu_models"]["fp32_separate"]["selected_row_fraction"] == 1
+        assert entry["historical_gpu_failures"]["combo"]["missed"] == 2
+
+
+def test_one_ulp_mask_preserves_existing_signed_zero_and_distance_convention():
+    actual = torch.tensor(
+        [[0, -0.0, 1.0078125, 1.015625, -1.015625]], dtype=torch.bfloat16
+    )
+    reference = torch.tensor([[-0.0, 0, 1, 1, -1]], dtype=torch.bfloat16)
+    assert probe.above_one_ulp(actual, reference).tolist() == [
+        [False, False, False, True, True]
+    ]

@@ -27600,3 +27600,28 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `indexer-precision-cpu-{v1,final}.xml` under 2026-09-10; analysis SHA
   358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764.
   Exact paths, commands and limitations: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Indexer cancellation detector covers saved failures at low row fraction
+
+- Status: CPU coverage screen complete; no recomputation kernel qualification.
+- Baseline/hypothesis: preceding six-model precision analysis; test whether
+  output/bias-only cancellation detection isolates a small subset for FP64
+  recomputation without using the reference in the detector.
+- Change: prescribe thresholds 2^-16/2^-12/2^-8. Reconstruct all60 phases and
+  verify every previous precision record against its pinned completed receipt.
+- Results: all thresholds detect all12 original/14 split retained GPU failing
+  scalars, plus all21/19 separate/fused-affine CPU errors. CPU row fractions
+  are0.103%, 1.434%/1.433%, 21.885%; actual GPU row counts/cost are unmeasured.
+  Coverage is empirical on this matrix, not a general error bound.
+- Correctness: 73 CPU tests pass/3.54s; Ruff/diff pass. No GPU/model job, native
+  build, TPS, default/quant change or tolerance change. Original oracle remains
+  failed; no oracle-substitution result is called a corrected kernel.
+- Decision: fixed2^-12 for an isolated opt-in GPU prototype after CPU layout/
+  import checks. Preserve original bundle, detect actual BF16 output cancellation,
+  recompute flagged rows in FP64 and overwrite only flagged indexer elements.
+  All non-target/stride/replay guards and the unchanged oracle remain required,
+  followed by independent model quality. No GPU starts prescribed yet.
+- Raw: `runtime-control/indexer-cancellation-analysis-v1.json` and
+  `indexer-cancellation-cpu-v1.xml` under2026-09-10. Analysis SHA
+  3474f6692e98b1be257174827dd5387d8d08dedadd647f8c2935a0a18ec25a24.
+  Commands and limits: `perf/glm53-attention-isolation.md`.

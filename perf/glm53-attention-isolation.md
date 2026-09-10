@@ -502,3 +502,55 @@ Raw `runtime-control/indexer-precision-analysis-v1.json` under 2026-09-10, SHA
 per-case metrics, output hashes, failing coordinates and scalar model values
 retained. Historical GPU receipt hashes are pinned in the analyzer and report;
 their completed audits are consumed without rerunning expired freeze checks.
+
+## Cancellation detector CPU screen (2026-09-10)
+
+Status: completed coverage/cost proxy, not a recomputation kernel qualification.
+The analyzer's `--screen-cancellation` option prescribes thresholds 2^-16, 2^-12
+and 2^-8 before execution. For BF16 output `y` and bias `b`, the FP32 detector is
+`abs(y) <= threshold * (abs(y - b) + abs(b))`, excluding zero scale. No reference
+or input moments enter this predicate. Exact zero output with nonzero bias is
+flagged; zero output and zero bias is not affine cancellation.
+
+All three thresholds detect all 12 original and 14 split retained failing GPU
+scalars after rank deduplication, and all 21/19 above-one-ULP failures in the
+separate/fused-affine FP32 CPU models. The full 60-record CPU precision baseline
+(including numerical metrics, output hashes and scalar evidence) reproduces
+exactly against its pinned completed receipt. No GPU source is imported/run.
+
+| Threshold | CPU selected elements, separate/fused | CPU selected rows, separate/fused | Row fraction |
+| --- | ---: | ---: | ---: |
+| 2^-16 | 102 / 102 | 102 / 102 | 0.103% / 0.103% |
+| 2^-12 | 1,431 / 1,430 | 1,424 / 1,423 | 1.434% / 1.433% |
+| 2^-8 | 24,499 / 24,499 | 21,734 / 21,734 | 21.885% / 21.885% |
+
+Denominators: 12,711,936 elements, 99,312 rows per CPU model. Actual GPU evidence
+only supplies failing scalar locations, not all output values: the selected
+element/row counts are CPU proxies, not actual GPU counts or execution cost.
+All thresholds retain zero missed errors on this matrix; none is a proven bound
+for unseen inputs. The original GPU oracle gate is still failed. Substituting
+oracle values at flagged positions would be tautological, not a kernel test,
+and is not reported as a corrected-kernel result.
+
+Decision: use fixed 2^-12 for the next isolated prototype, a 16x wider trigger
+than the tightest tested threshold at a ~1.43% row proxy cost. First preserve
+the original bundle, then use actual original BF16 indexer output to flag rows.
+Recompute flagged rows' moments/normalization/affine without the failing FP32
+rounding boundary; overwrite only flagged elements. Q/KV, the packed gate,
+input/weight guards and all unflagged indexer outputs must remain exact. CPU
+layout/import tests precede a separately prescribed GPU numerical/replay/guard
+and timing matrix. A serving experiment needs those gates and the independent
+model-quality gate; no default/profile integration follows from this screen.
+
+Source: `cc9a508ea` plus hashed screen changes. CPU73 tests pass/3.54s; Ruff/diff
+pass. One CPU screen, 8 GiB/swap0, one thread, CUDA hidden/uninitialized; no
+GPU/model starts, native builds, TPS, default/quant changes or tolerance changes.
+
+```bash
+systemd-run --user --scope --unit=glm53-indexer-cancellation-cpu-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/slimserve/test_indexer_precision_analysis.py tests/slimserve/test_attention_norm_probe.py tests/slimserve/test_cached_rmsnorm_probe.py tests/slimserve/test_attention_contracts.py --junitxml=perf/results/2026-09-10/runtime-control/indexer-cancellation-cpu-v1.xml
+systemd-run --user --scope --unit=glm53-indexer-cancellation-analysis-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.analyze_glm53_indexer_precision --screen-cancellation --output perf/results/2026-09-10/runtime-control/indexer-cancellation-analysis-v1.json
+```
+
+Raw `runtime-control/indexer-cancellation-analysis-v1.json` under 2026-09-10,
+SHA3474f6692e98b1be257174827dd5387d8d08dedadd647f8c2935a0a18ec25a24.
+CPU XML and all per-phase detector counts/missed-coordinate lists retained.
