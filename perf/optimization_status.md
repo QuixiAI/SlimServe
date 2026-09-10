@@ -26998,3 +26998,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `runtime-control/geometry-post-compile-cpu.json`, SHA
   5f358d74cf27baa047a585cfff440af2543f8142e2aee1680a29624f0f264fa6;
   `runtime-control/geometry-writeback-cpu.xml`.
+
+## 2026-09-10 - All-rank real-AOT RMSNorm geometry qualification passes
+
+- Status: retained diagnostic qualification; v6 complete, source freeze released.
+- Baseline/hypothesis: source-qualified13 H4096 norm geometry changes must bind
+  through the actual cached model loader without changing unrelated graph kernels.
+- Workload: source62a7a3ad0, exactly8 no-weights attempts, control0..3 then geometry0..3,
+  full fresh private copy/process,16GiB GPU/8GiB CPU audits/swap0. Seven real artifacts/
+  46 submodule entries per process through owned concurrent vLLM loading. No model
+  weights, forward, graph capture or numerical/timing execution; no native builds.
+- Correctness: every load/audit and final comparison/closure exits0. Seven live roots
+  and25 launcher bindings/rank. All13 sources cover35 targets/arm (9/8/8/10). All65
+  non-target bindings preserve exact graph/source/config/cubin against control,
+  including attention combo and KDA choices. Two direct calls/five exact upstream
+  writeback closures qualify per process, retaining the original root/mutation data.
+  CPU gate324 passed7.23s before the source freeze. No retries or measurement exclusions.
+- Closure:206 source receipts/5172 original files unchanged; independent GPU query
+  empty. All40 prepared caches v2-v6 retained. Loaded-object counts25-27/process
+  vary, while the selected graph-binding comparison is exact. v1-v5 stay terminal.
+- Decision: the real-AOT qualification prerequisite is satisfied. Next implement
+  opt-in full-model integration and CPU tests, then prescribe a fresh source-frozen
+  control/geometry/return causal series. No quality/default/quant/native promotion,
+  TPS win or resolution of the failed no-combo/indexer gates follows from this test.
+- Raw: `rmsnorm-geometry-aot-qualification-v6/`, pair-analysis SHA
+  46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946;
+  closure SHAff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242.

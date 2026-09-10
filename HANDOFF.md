@@ -35,7 +35,41 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v5 terminal; exact writeback closure supported; NEW v6 prescribed
+### Latest checkpoint (2026-09-10): actual all-rank RMSNorm geometry AOT qualification PASSES
+
+v6 on62a7a3ad0 completes ALL8 prescribed attempts in order: control ranks0..3,
+then geometry ranks0..3. All loads and independent audits exit0, followed by a
+successful cross-rank comparison and final source/cache/release closure. No retries
+or exclusions. Seven actual artifacts/46 entries per process; seven model graph
+roots and25 launcher bindings per rank. All13 target sources cover35 bindings/arm
+(9/8/8/10 by rank); ALL65 non-target bindings exactly match control source/config/
+cubin. This includes original attention combo and KDA selections. Each process
+verifies2 direct root calls and5 exact Torch writeback closures.206 frozen receipts/
+5172 original files unchanged; all GPUs released. Source freeze has ended.
+
+Raw `perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v6/`:
+pair-analysis SHA46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946;
+closure SHAff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242.
+Consume these pinned COMPLETED receipts with source/binary verification; do not
+rerun the source/HEAD-frozen read_manifest after later commits. All40 private caches
+from v2-v6 and every failed attempt are retained. v1-v5 remain terminal.
+
+Scope: real-AOT/binary/live-graph qualification ONLY. The completed numerical
+qualification remains624 passing pairs, but no model weights/forwards/capture or
+TPS were run in v6. Production defaults/quant/native/math/quality gates unchanged.
+The failed no-combo model quality windows and separate indexer gate are unresolved.
+
+NEXT: implement and CPU-test opt-in full-model integration of the qualified loader.
+Use the real profile and shared per-start private namespace, rank-local Triton
+caches, actual artifact-root checks before forward/capture, and target sealing
+separate from the binary observer's lifetime (serving can compile non-target work
+later). Freeze the integration and fresh serving manifests explicitly; only then
+prescribe a control/geometry/return causal series with identical quality floors,
+exact-token workloads and retained failures. No next GPU/model job is currently
+prescribed. Existing single-source legacy diagnostic is a precedent, not this new
+geometry serving hook; do not overwrite its flag/schema. Goal remains ongoing.
+
+### Previous checkpoint (2026-09-10): v5 terminal; exact writeback closure supported; v6 prescribed (now complete)
 
 v5 on838689c68 stops after ONE control-rank0. Seven artifact/root bindings verify
 during deserialization; all7 artifacts/46 entries load,26 CUDA images and17 imported

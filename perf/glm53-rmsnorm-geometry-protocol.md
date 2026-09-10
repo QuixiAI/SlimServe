@@ -7,8 +7,8 @@ API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
 load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all seven
 rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
 inventory's graph/helper classification; v5 stops at post-compile call identity.
-NEW no-weights AOT v6 is prescribed at the tail below;
-no full-model series is prescribed.
+No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
+commands are historical. No next GPU or full-model series is prescribed.
 
 ## Question and fixed factors
 
@@ -572,7 +572,7 @@ Audit final closure against original sources/cache and independent GPU query bef
 releasing the freeze. v1-v4 stay terminal. This protocol does not authorize a model
 causal series or promote a production/default/performance change.
 
-## v5 closure and exact writeback-wrapper provenance; NEW v6
+## v5 closure and exact writeback-wrapper provenance; v6 (now complete)
 
 ONE control-rank0 on838689c68 verifies7 real root bindings during deserialize,
 loads7 artifacts/46 entries and26 original-exact CUDA images. All17 imported
@@ -605,3 +605,40 @@ all prior audits/source hashes/receipts/GPU release. Any failure stops the entir
 series; no unchanged retries. Sources frozen from preparation through terminal
 closure.16GiB GPU/8GiB CPU/swap0, no other GPU work/builds/edits. v1-v5 and unused
 cases stay terminal. No full-model series/default/gate/quant change authorized.
+
+## v6 completed: live all-rank geometry intervention qualified
+
+Source62a7a3ad0, exactly8 prescribed attempts in order, all load/audit exits0.
+Final compare and source/cache/release closure also pass. All seven artifacts/
+46 submodule entries and seven graph roots qualify per process, with25 launcher
+bindings/rank. Thirteen targeted sources cover35 actual bindings/arm (9/8/8/10 by
+rank); all65 non-target graph/source/config/cubin bindings match between arms.
+The original attention combos/KDA choices remain unchanged. Every process verifies
+two direct calls and five exact post-compile writeback wrappers retaining the
+original graph call. No callback-only or helper-as-root substitution.
+
+206 frozen receipts/5172 original files unchanged, GPUs released. No retries or
+exclusions; all40 private caches across v2-v6 remain intact. Observed loaded-object
+counts vary25-27/process; the selected graph bindings remain identical, and
+coverage/config/binary comparisons pass independently of those object counts.
+
+Raw `rmsnorm-geometry-aot-qualification-v6/` under2026-09-10:
+
+- preparation SHA
+  aeae81f27510045cbbd7f548b1871ed30acb101e2263f3b8991256ea67e1cacb.
+- pair-analysis SHA46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946.
+- closure SHAff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242.
+
+Freeze ended after closure. Consume pinned completed receipts and verify relevant
+source/binary hashes; historical read_manifest intentionally rejects later HEADs
+or helper edits. Do not rewrite or rerun the completed sequence. v1-v5 stay terminal.
+The original624-pair numerical qualification remains valid; v6 adds real-loader/
+binary/live-root coverage, not numerical execution, full-model quality or TPS.
+
+Next work: separate opt-in serving hook/manifest schema, CPU tests, fresh per-start
+private namespace with per-rank caches, and pre-forward/capture root verification.
+Target sealing must not prematurely close observation of legitimate later non-target
+compilation. Preserve original attention/KDA/recipe/defaults/quality gates, and the
+existing independent legacy diagnostic. Only after implementation/tests and a new
+explicit freeze should a control/geometry/return full-model causal series be
+prescribed. No next GPU/model job is prescribed at this checkpoint.
