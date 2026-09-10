@@ -27697,3 +27697,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   89f90eb95530b179f4150a5c2dbd37b87f5839f5e3ce62f4c5d169ee79fc240b;
   `indexer-loader-cpu-{v1,final}.xml`, under2026-09-10. CPU8GiB/swap0.
   Commands/next gate: `perf/glm53-indexer-loader-protocol.md`.
+
+## 2026-09-10 - Runnable indexer AOT and bound-leaf qualification CPU-tested
+
+- Status: runnable series implemented; GPU gate pending.
+- Baseline/hypothesis: unchanged source-qualified correction kernel and loader
+  policy should reproduce isolated outputs through actual AOT-held static calls.
+- Change: eight-case private preparation and shared one-attempt controller;
+  independent graph/binary/arena auditor; leaf checks after target seal, before
+  global binary seal. Optional norm-probe observer captures five phase/replay
+  observations and checks all unused arena rows, not only two end guards.
+- Correctness: 336 CPU tests pass/20.74s,14 upstream warnings; Ruff/diff pass.
+  Includes legacy KV/geometry loader and serving regressions, ordered preparation,
+  qualified-output/flag joins, failed replay/guard detection and distinct events.
+  Four small norm tensors are explicitly counted; no model forward/TPS claim.
+- Decision: commit then exactly control ranks0..3/correction ranks0..3. Two actual
+  graph bindings x30 cases each, both input phases,480 total bound-leaf cases.
+  Stop/audit first failure; no retry/replacement, kernel/default/quant change.
+  CPU8GiB/GPU16GiB/swap0; source freeze from preparation through terminal audit.
+- Raw CPU: `runtime-control/indexer-aot-cpu-v1.xml` and
+  `indexer-aot-inspection-v1.json` under2026-09-10. Commands and limitations:
+  `perf/glm53-indexer-loader-protocol.md`.

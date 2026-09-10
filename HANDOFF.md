@@ -35,7 +35,28 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): indexer loader foundation CPU-tested
+### Latest checkpoint (2026-09-10): runnable indexer AOT/leaf series CPU-tested
+
+The ordered preparation/controller/independent auditor now extend the shared
+AOT lifecycle with actual graph-held leaf calls. Control ranks0..3 then correction
+ranks0..3,60 leaf cases per process (two graph bindings x30 cases), both input
+phases and five eager/replay observations. Output/flag hashes join the completed
+isolated correction directly; guards include all unused selection-arena rows.
+No model forward; explicitly four small norm tensors per process, not zero.
+
+CPU336 tests pass/20.74s,14 upstream Torch warnings; Ruff/diff checks pass.
+The actual preparation now includes all120 pinned prior case receipts. Qualified
+kernel and loader policy remain unchanged; shared lifecycle/probe/auditor changes
+are CPU-regression-tested, not yet GPU-qualified.
+
+NEXT after commit: exactly the eight-process AOT/leaf series prescribed in
+`perf/glm53-indexer-loader-protocol.md`, under `perf/results/2026-09-10/indexer-aot-v1/`.
+One fresh cache each; freeze from preparation through terminal/pair audit.
+CPU8GiB/GPU16GiB, swap0, no retries/replacements/concurrent GPU work. If successful,
+continue to opt-in serving integration and scheduler/capture/model-quality gates.
+No production default/quant or speed baseline changes.
+
+### Previous checkpoint (2026-09-10): indexer loader foundation CPU-tested
 
 The opt-in `glm53_indexer_correction_loader.py` policy reuses the existing
 extra-launch lifecycle and observed static CUDA loader. A strict bridge compiles

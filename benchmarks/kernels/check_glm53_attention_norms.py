@@ -447,7 +447,7 @@ def mismatch_examples(actual, reference):
     )
 
 
-def run_launches(launches, data, changed, weights):
+def run_launches(launches, data, changed, weights, *, observe_phase=None):
     import torch
 
     rows = len(data)
@@ -488,12 +488,16 @@ def run_launches(launches, data, changed, weights):
     x.copy_(data)
     launch()
     first = [t.cpu() for t in outputs]
+    if observe_phase is not None:
+        observe_phase(0, first)
     launch()
     require(
         all(torch.equal(t.cpu(), ref) for t, ref in zip(outputs, first)),
         "eager repeat mismatch",
     )
     check_inputs(data)
+    if observe_phase is not None:
+        observe_phase(0, first)
     graph = torch.cuda.CUDAGraph()
     capture_stream = torch.cuda.Stream(device=x.device)
     with torch.cuda.graph(graph, stream=capture_stream):
@@ -502,11 +506,15 @@ def run_launches(launches, data, changed, weights):
     graph.replay()
     second = [t.cpu() for t in outputs]
     check_inputs(changed)
+    if observe_phase is not None:
+        observe_phase(1, second)
     launch()
     require(
         all(torch.equal(t.cpu(), ref) for t, ref in zip(outputs, second)),
         "changed eager/replay mismatch",
     )
+    if observe_phase is not None:
+        observe_phase(1, second)
     x.copy_(data)
     graph.replay()
     require(
@@ -518,6 +526,8 @@ def run_launches(launches, data, changed, weights):
         "vacuous changed-input check",
     )
     check_inputs(data)
+    if observe_phase is not None:
+        observe_phase(0, first)
     return first, second
 
 

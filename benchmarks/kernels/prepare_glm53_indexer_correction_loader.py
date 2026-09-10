@@ -8,6 +8,7 @@ import argparse
 import base64
 import copy
 import importlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -27,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RESULTS = ROOT / "perf/results/2026-09-10"
 QUALIFICATION_SHA = "c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65"
 SELECTION_CAPACITY = 8192  # Explicit diagnostic envelope; serving must check it.
+ORDER = tuple((mode, rank) for mode in ("control", "correction") for rank in range(4))
 
 
 def build_base():
@@ -76,6 +78,18 @@ def build_base():
     for path, digest in contracts["receipts"].items():
         require(sha(path) == digest, "attention contract receipt changed")
         receipts[path] = digest
+    leaf_cases = []
+    require(
+        len(summary["records"]) == len(old["cases"]) == 120,
+        "complete leaf matrix required",
+    )
+    for index, (item, case) in enumerate(zip(summary["records"], old["cases"])):
+        require(item["path"] == f"case-{index:03d}.json", "qualified case path differs")
+        path = folder / item["path"]
+        leaf = load_checked(path, item["sha256"])
+        require({k: leaf[k] for k in case} == case, "qualified case order differs")
+        receipts[str(path)] = item["sha256"]
+        leaf_cases.append(dict(path=str(path), sha256=item["sha256"], case=case))
     targets = {}
     for rank in range(4):
         (source,) = [r for r in old["records"] if r["rank"] == rank]
@@ -171,6 +185,12 @@ def build_base():
         "glm53_binary_observer",
         "glm53_artifact_roots",
         "audit_glm53_geometry_graphs",
+        "glm53_indexer_bound_leaves",
+        "check_glm53_indexer_correction_loader",
+        "audit_glm53_indexer_correction_loader",
+        "check_glm53_geometry_loader",
+        "audit_glm53_kv_loader",
+        "audit_glm53_geometry_loader",
     )
     additions = [
         Path(__file__),
@@ -186,6 +206,7 @@ def build_base():
         ),
     ]
     previous = copy.deepcopy(old["sources"])
+    additions.append(ROOT / "perf/glm53-indexer-loader-protocol.md")
     released = {}
     for name in (
         "perf/glm53-indexer-correction-protocol.md",
@@ -210,6 +231,8 @@ def build_base():
         expected_graphs=graph_inventory(mapping, original),
         expected_gpu_config=summary["gpu_config"],
         selection_capacity=SELECTION_CAPACITY,
+        qualified_leaf_cases=leaf_cases,
+        weight_sha256=old["weight_sha256"],
         sources=sources,
         released_helper_changes={**released, **refreshed},
         git_commit=subprocess.check_output(
@@ -229,11 +252,79 @@ def build_base():
     return base
 
 
+def prepare_series(output):
+    require(not output.exists(), "preserve prior series")
+    require(
+        not subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True
+        ).strip(),
+        "commit implementation/protocol before preparation",
+    )
+    base = build_base()
+    output, original = output.resolve(), Path(base["original_namespace"])
+    require(
+        not output.is_relative_to(original) and not original.is_relative_to(output),
+        "overlapping caches",
+    )
+    require(not any(p.is_symlink() for p in original.rglob("*")), "original aliases")
+    output.mkdir(parents=True)
+    extras = {
+        t["correction"]["relative"]: t["correction"]
+        for ts in base["targets"].values()
+        for t in ts
+    }
+    runs = []
+    for mode, rank in ORDER:
+        folder = output / f"{mode}-rank{rank}"
+        cache = folder / "cache"
+        private = cache / "torch_compile_cache/torch_aot_compile" / NAMESPACE
+        shutil.copytree(original, private)
+        require(
+            all(sha(private / p) == h for p, h in base["original_files"].items()),
+            "private copy differs",
+        )
+        for relative, source in extras.items():
+            target = private / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            require(not target.exists(), "extra source collision")
+            shutil.copyfile(source["source"], target)
+            require(sha(target) == source["source_sha256"], "extra copy differs")
+        manifest = dict(
+            base,
+            rank=rank,
+            mode=mode,
+            cache_root=str(cache),
+            private_namespace=str(private),
+            private_sources={p: r["source_sha256"] for p, r in extras.items()},
+            receipts=str(folder / "receipts"),
+        )
+        path = folder / "manifest.json"
+        write_new(path, manifest)
+        runs.append(
+            dict(mode=mode, rank=rank, manifest=str(path), manifest_sha256=sha(path))
+        )
+    verify(base)
+    write_new(
+        output / "preparation.json",
+        dict(
+            status="prepared",
+            runs=runs,
+            sources=base["sources"],
+            qualification_sha256=QUALIFICATION_SHA,
+        ),
+    )
+    print(f"Prepared {len(runs)} ordered AOT/leaf runs", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--prepare-series", action="store_true")
     args = parser.parse_args()
     require(not args.output.exists(), "preserve prior report")
+    if args.prepare_series:
+        prepare_series(args.output)
+        return
     base = build_base()
     write_new(args.output, base)
     print(

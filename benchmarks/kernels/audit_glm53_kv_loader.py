@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from benchmarks.kernels.audit_glm53_geometry_graphs import compare_unrelated
@@ -16,12 +17,27 @@ from benchmarks.kernels.audit_glm53_geometry_loader import (
 from benchmarks.kernels.check_glm53_attention_norms import require, verify
 from benchmarks.kernels.check_glm53_geometry_loader import check_launch, read_json
 from benchmarks.kernels.check_glm53_kv_loader import (
-    ORDER,
-    prior_receipts,
-    read_manifest,
+    ORDER as ORDER,
+)
+from benchmarks.kernels.check_glm53_kv_loader import (
+    prior_receipts as prior_receipts,
+)
+from benchmarks.kernels.check_glm53_kv_loader import (
+    read_manifest as read_manifest,
 )
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from slimserve.rmsnorm_diagnostic import sha
+
+CANDIDATE_MODE = "kv"
+EXTRA_KEY = "kv"
+EVENT_PREFIX = "kv"
+DISPATCH = "combo_then_kv"
+LOADER_SOURCE = Path(__file__).with_name("glm53_kv_loader.py")
+RUNNER_SOURCE = Path(__file__).with_name("check_glm53_kv_loader.py")
+
+
+def check_extra(extra, manifest):
+    pass
 
 
 def check_graph_records(
@@ -32,7 +48,9 @@ def check_graph_records(
     events,
     *,
     require_global_seal=True,
+    workflow=None,
 ):
+    api = sys.modules[__name__] if workflow is None else workflow
     images = binary_records(
         manifest, binary_events, require_global_seal=require_global_seal
     )
@@ -53,9 +71,10 @@ def check_graph_records(
             )
             return
         require(
-            mode == "kv" and row["dispatch"] == "combo_then_kv", "KV dispatch missing"
+            mode == api.CANDIDATE_MODE and row["dispatch"] == api.DISPATCH,
+            "extra dispatch missing",
         )
-        extra, saved = row["appended"], target["kv"]
+        extra, saved = row["appended"], target[api.EXTRA_KEY]
         observed = images[extra["observed_binary_index"]]
         require(
             extra["source"] == saved["relative"]
@@ -72,6 +91,7 @@ def check_graph_records(
             == saved["selected"]["config"]["num_warps"],
             "appended KV source/config/binary join differs",
         )
+        api.check_extra(extra, manifest)
 
     result = graph_records(manifest, graphs, images, check_target)
     require(
@@ -82,12 +102,13 @@ def check_graph_records(
         ),
         "non-target dispatch intervention",
     )
-    seals = [i for i, e in enumerate(events) if e["event"] == "kv_sealed"]
+    prefix = api.EVENT_PREFIX
+    seals = [i for i, e in enumerate(events) if e["event"] == f"{prefix}_sealed"]
     require(len(seals) == 1, "KV controller requires exactly one seal")
     seal_index = seals[0]
     require(
         events
-        and events[0]["event"] == "kv_begin"
+        and events[0]["event"] == f"{prefix}_begin"
         and (not require_global_seal or seal_index == len(events) - 1)
         and all(e["rank"] == rank for e in events),
         "KV controller lifecycle incomplete",
@@ -96,13 +117,12 @@ def check_graph_records(
     require(
         begin["mode"] == mode
         and begin["manifest_sha256"] == manifest_sha
-        and begin["source_sha256"]
-        == sha(Path(__file__).with_name("glm53_kv_loader.py")),
+        and begin["source_sha256"] == sha(api.LOADER_SOURCE),
         "KV controller identity changed",
     )
     owners, bindings = {}, set()
     for event in events[1:seal_index]:
-        if event["event"] == "kv_binding":
+        if event["event"] == f"{prefix}_binding":
             index = event["binding_index"]
             require(
                 index == len(owners) + 1
@@ -113,7 +133,8 @@ def check_graph_records(
             owners[index] = event["source"]
         else:
             require(
-                event["event"] == "kv_graph_binding", "unexpected KV controller event"
+                event["event"] == f"{prefix}_graph_binding",
+                "unexpected extra-launch controller event",
             )
             require(
                 owners.get(event["binding_index"]) == event["source"],
@@ -138,19 +159,22 @@ def check_graph_records(
     # Serving leaves observation/hooks open for later non-target compilation.
     # Only exact callbacks for already-bound globals may follow target sealing.
     prior_graph_events = [
-        e for e in events[1:seal_index] if e["event"] == "kv_graph_binding"
+        e for e in events[1:seal_index] if e["event"] == f"{prefix}_graph_binding"
     ]
     require(
         all(e in prior_graph_events for e in events[seal_index + 1 :]),
         "new or changed KV controller event after seal",
     )
     result["appended_launchers"] = (
-        sum(r["target"] for r in graphs["bindings"]) if mode == "kv" else 0
+        sum(r["target"] for r in graphs["bindings"])
+        if mode == api.CANDIDATE_MODE
+        else 0
     )
     return result
 
 
-def audit(path):
+def audit(path, *, workflow=None):
+    api = sys.modules[__name__] if workflow is None else workflow
     path = path.resolve()
     output = path.parent / "run"
     require(not (output / "analysis.json").exists(), "preserve prior audit")
@@ -162,19 +186,23 @@ def audit(path):
 
     report = dict(status="failed", manifest_sha256=sha(path), receipts=receipts)
     try:
-        manifest, preparation = read_manifest(path)
+        manifest, preparation = api.read_manifest(path)
         summary = read(output / "summary.json")
         report["summary_sha256"] = sha(output / "summary.json")
-        check_aot_summary(manifest, sha(path), summary)
+        check_aot_summary(
+            manifest,
+            sha(path),
+            summary,
+            expected_weights=getattr(api, "EXPECTED_WEIGHTS", 0),
+        )
         require(
-            summary["source_sha256"]
-            == sha(Path(__file__).with_name("check_glm53_kv_loader.py"))
+            summary["source_sha256"] == sha(api.RUNNER_SOURCE)
             and summary["lifecycle_sha256"]
             == sha(Path(__file__).with_name("check_glm53_geometry_loader.py"))
             and summary["model_sha256"]
             == manifest["original_files"][f"rank_{manifest['rank']}_0/model"]
             and summary["prior_receipts"]
-            == prior_receipts(path, manifest, preparation),
+            == api.prior_receipts(path, manifest, preparation),
             "runner/model/predecessor identity changed",
         )
         graphs = read(output / "graph-bindings.json")
@@ -193,6 +221,7 @@ def audit(path):
                 graphs,
                 read(output / "binary-loads.jsonl", True),
                 read(output / "loader-events.jsonl", True),
+                workflow=api,
             )
         )
         require(
@@ -205,29 +234,33 @@ def audit(path):
             and report["bound_launchers"] == 25,
             "unexpected real AOT binding matrix",
         )
-        if manifest["mode"] == "kv":
+        if manifest["mode"] == api.CANDIDATE_MODE:
             control = (
                 path.parent.parent
                 / f"control-rank{manifest['rank']}/run/graph-bindings.json"
             )
             compare_unrelated(read(control), graphs)
             report["non_target_exact_vs_control"] = True
+        check_leaf = getattr(api, "check_leaf", None)
+        if check_leaf is not None:
+            report.update(check_leaf(manifest, graphs, summary, read))
         verify(manifest)
         report["status"] = "complete"
     except Exception as error:
         report["error"] = repr(error)
-    report["auditor_sha256"] = sha(__file__)
+    report["auditor_sha256"] = sha(api.__file__)
     write_new(output / "analysis.json", report)
     print(json.dumps(report), flush=True)
     return report["status"] == "complete"
 
 
-def compare(series):
+def compare(series, *, workflow=None):
+    api = sys.modules[__name__] if workflow is None else workflow
     require(not (series / "pair-analysis.json").exists(), "preserve final audit")
     reports = []
-    for mode, rank in ORDER:
+    for mode, rank in api.ORDER:
         path = series / f"{mode}-rank{rank}/manifest.json"
-        manifest, preparation = read_manifest(path)
+        manifest, preparation = api.read_manifest(path)
         check_launch(path.parent, sha(path))
         report = read_json(path.parent / "run/analysis.json")
         require(
@@ -239,12 +272,13 @@ def compare(series):
         )
         for filename, digest in report["receipts"].items():
             require(sha(filename) == digest, "audited receipt changed")
-        prior_receipts(path, manifest, preparation)
+        api.prior_receipts(path, manifest, preparation)
         reports.append(
             dict(
                 mode=mode,
                 rank=rank,
                 analysis_sha256=sha(path.parent / "run/analysis.json"),
+                **{k: report[k] for k in getattr(api, "PAIR_FIELDS", ())},
                 **{
                     k: report[k]
                     for k in (
@@ -258,10 +292,14 @@ def compare(series):
         )
     result = dict(
         status="complete",
-        scope="AOT loader/binary/graph coverage; not numerical/model/TPS qualification",
+        scope=getattr(
+            api,
+            "SCOPE",
+            "AOT loader/binary/graph coverage; not numerical/model/TPS qualification",
+        ),
         runs=reports,
         non_target_exact=True,
-        auditor_sha256=sha(__file__),
+        auditor_sha256=sha(api.__file__),
     )
     write_new(series / "pair-analysis.json", result)
     print(json.dumps(result), flush=True)

@@ -158,15 +158,16 @@ def check_records(
     return result
 
 
-def check_aot_summary(manifest, manifest_sha, summary):
-    """Common no-weights/no-forward, complete-artifact and no-fallback gate."""
+def check_aot_summary(manifest, manifest_sha, summary, *, expected_weights=0):
+    """No model forward/fallback; require the workflow's explicit weight count."""
     rank, mode = manifest["rank"], manifest["mode"]
     require(
         summary["status"] == "complete"
         and summary["rank"] == rank
         and summary["mode"] == mode
         and summary["manifest_sha256"] == manifest_sha
-        and summary["model_forward_calls"] == summary["weight_tensors_loaded"] == 0
+        and summary["model_forward_calls"] == 0
+        and summary["weight_tensors_loaded"] == expected_weights
         and summary["artifacts"] == summary["loaded_artifacts"] == 7
         and summary["submodules"] == 46
         and summary["original_cache_unchanged"] is True,

@@ -307,6 +307,12 @@ def run(path, *, workflow=None):
                 )
                 write_new(output / "graph-bindings.json", before)
                 loader.controller.seal(root_modules)
+                qualify = getattr(api, "qualify_bindings", None)
+                if qualify is not None:
+                    summary["weight_tensors_loaded"] = api.LEAF_WEIGHT_COUNT
+                    summary["leaf_qualification"] = qualify(
+                        root_modules, manifest, before, output
+                    )
                 # Global sealing is safe HERE: this no-weights gate performs no
                 # subsequent capture/forward/non-target compilation.
                 loader.observer.seal()
