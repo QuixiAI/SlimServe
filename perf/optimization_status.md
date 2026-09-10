@@ -27275,3 +27275,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   eb997c612a0347924b5a66b49c11a90ed969ba37e10ae5d6ac8ce4bf494fd6a9;
   all196 pair records, summary, binary copies/private cache retained. Protocol
   records the completed command sequence and next state's dtype/layout cautions.
+
+## 2026-09-10 - Prescribe state/output KDA arithmetic isolation
+
+- Status: CPU complete; fixed sequential GPU diagnostics prescribed after commit.
+- Baseline/hypothesis: remaining state stages2/3 (warps4/BV32) and output warps8/4
+  (stages2/BK64/BV64) have different binaries. Do these choices change arithmetic
+  after gate/recompute probes were exact? Historical live selection is unproven.
+- Change/workload: shared diagnostic runner, 224 pairs per stage, seven layouts,
+  four repaired TP4 shards, 56 independent algebraic identity/basis cases and
+  168 conditioned cases. Repeated eager/changed-input graph replay, input/guard
+  checks, output dtype/shape/hash and actual cubin receipts. State's FP32 final
+  tensor is never narrowed to BF16 for comparison. No serving/default changes.
+- Correctness: CPU 53 passed in 7.06 s; earlier 17/40-pass reports retained. Tests
+  include real JIT/preparation, chunk boundaries, mixed dtypes, graph rehearsal,
+  full predecessor receipt checks and terminal exact-failure closure. Lint passes.
+  Conditioned float64 errors/cross-arm differences are observations, not new gates.
+- Decision: commit then state prepare/run/audit once, output only if state audit
+  is complete. Sources frozen through both closures, GPU16GiB/CPU8GiB/swap0.
+  Stop on failure, retain partial evidence; no retries, tuning, builds or model
+  starts. No performance claim or changes to indexer/no-combo quality floors.
+- Raw: `perf/results/2026-09-10/runtime-control/kda-tail-{fixture,runner,final}-cpu.xml`.
+  Exact commands/matrix are in `perf/glm53-kda-choice-protocol.md`; GPU pending.

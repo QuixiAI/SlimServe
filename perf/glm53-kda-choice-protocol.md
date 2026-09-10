@@ -233,4 +233,67 @@ reuse a BF16-only checker for all three. The actual serving state call supplies
 an initial-state tensor even for zero-state sequences, varlen chunk offsets, GK
 gating and USE_EXP2=True. Source is `third_party/flash_linear_attention/ops/chunk_delta_h.py`.
 Use exact algebraic cases plus recorded numerical comparisons; no new model gate.
-No next GPU/model job is currently prescribed.
+No next GPU/model job was prescribed at that checkpoint.
+
+## State/output v1: fixed sequential arithmetic isolation
+
+After committing this protocol and passing CPU tests, prepare/run/audit state
+ONCE, then prepare/run/audit output ONCE only if the state audit is complete.
+Freeze all sources from state preparation through output closure (or terminal
+state failure). No intervening source edits, commits, native builds, autotuning,
+model starts or other GPU work. CPU preparation/audits use 8 GiB, each GPU0 process
+16 GiB, all swap0. Do not retry, replace, omit or restart a failed case/attempt.
+
+Both stages use `benchmarks.kernels.check_glm53_kda_tail` with shared fixtures in
+`glm53_kda_tail.py`. Each has 224 paired cases: ranks 0..3, the seven layouts
+1 / 63 / 64 / 65 / 1000 / (17,63,65,855) / 7616, then identity, basis, and six
+conditioned cases (seeds 530901/530902 x magnitudes 0.125/1/8). Identity/basis use
+seed 530901 and magnitude 1. Thus 56 exact algebraic and 168 conditioned cases
+per stage. Real repaired layer0 TP4 gate shards are used for conditioned fixtures;
+these are mathematical/synthetic inputs, NOT captured model activations.
+
+- State: actual `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`, warps4/BV32,
+  stages2 then stages3, H=Hg16/K=V128/BT64. Varlen offsets, initial state supplied,
+  GK and exp2 enabled, scalar G disabled; save new values and final state. Compare
+  BF16 chunk snapshots/new values and FP32 final state without narrowing it.
+  Identity keeps nonzero state with K=W=0; basis accumulates one-hot K/V with W=0,
+  checking chunk/sequence resets and up to 60 exactly representable visits.
+  Conditioned K/W/V derive from the earlier recompute fixture's mathematical
+  reference; seed 530902 also supplies nonzero initial state.
+- Output: actual serving `chunk_gla_fwd_kernel_o`, warps8 then warps4, stages2,
+  BK64/BV64/BT64, H16/K=V128/scale=128**-0.5. Identity uses Q0/Aidentity;
+  basis uses one-hot Q/A0/identity chunk state, respecting BF16 scale rounding.
+  Conditioned inputs use normalized Q, signed triangular A and BF16 chunk state.
+- Each arm runs twice eagerly, captures/replays original inputs, then multiplies
+  V and initial/chunk state by positive 0.5 on the SAME addresses and compares
+  changed-input replay with eager. Inputs/guards must be intact, outputs finite,
+  repetition/replay exact and output hashes changed by the prescribed mutation.
+- Exact fixtures must match independent algebraic oracles in both phases.
+  Conditioned float64-reference errors and cross-config differences are recorded
+  observations, NOT new accuracy thresholds or full-model qualification. No TPS
+  is measured. No existing indexer/no-combo/model gate or default is changed.
+- Preserve every record, output hash/dtype/shape receipt, actual cubin, private
+  cache and attempt marker. Stop on first structural/replay/guard/exact failure;
+  audit the partial attempt as terminal. Output preparation independently checks
+  all 224 state records, binaries, summary and frozen predecessor manifest, not
+  just a status label. A terminal state failure forbids the output attempt.
+
+From repository root, after commit, each command at most once:
+
+```bash
+systemd-run --user --scope --unit=glm53-kda-state-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail prepare --stage state --manifest perf/results/2026-09-10/runtime-control/kda-state-v1-manifest.json
+systemd-run --user --scope --unit=glm53-kda-state-v1 -p MemoryMax=16G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail run --manifest perf/results/2026-09-10/runtime-control/kda-state-v1-manifest.json --output perf/results/2026-09-10/kda-state-v1
+systemd-run --user --scope --unit=glm53-kda-state-v1-audit -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail audit --manifest perf/results/2026-09-10/runtime-control/kda-state-v1-manifest.json --output perf/results/2026-09-10/kda-state-v1
+```
+
+Only after complete state closure and GPU release:
+
+```bash
+systemd-run --user --scope --unit=glm53-kda-output-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail prepare --stage output --predecessor perf/results/2026-09-10/kda-state-v1/analysis.json --manifest perf/results/2026-09-10/runtime-control/kda-output-v1-manifest.json
+systemd-run --user --scope --unit=glm53-kda-output-v1 -p MemoryMax=16G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail run --manifest perf/results/2026-09-10/runtime-control/kda-output-v1-manifest.json --output perf/results/2026-09-10/kda-output-v1
+systemd-run --user --scope --unit=glm53-kda-output-v1-audit -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_tail audit --manifest perf/results/2026-09-10/runtime-control/kda-output-v1-manifest.json --output perf/results/2026-09-10/kda-output-v1
+```
+
+Numerical differences would locate sensitivity in an isolated operation, not its
+contribution to failed serving scores. Equality narrows this fixed matrix only.
+Use these results to select the next investigation; no model start is prescribed.

@@ -35,7 +35,22 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): recompute isolation complete and bit-exact
+### Latest checkpoint (2026-09-10): state/output isolation ready
+
+Shared state/output probes are ready. Final CPU suite: 53 passed in 7.06 s,
+including real imports/preparation, independent exact algebraic references,
+mixed BF16/FP32 checking, graph orchestration rehearsal and terminal-failure
+closure. Earlier 17/40-pass reports are retained. No serving/native change.
+
+NEXT after commit: exactly one state preparation/GPU0 run/audit, then one output
+preparation/GPU0 run/audit only after complete state closure. Each has 224 pairs
+(56 exact, 168 conditioned); commands, limits and failure policy are at the tail
+of `perf/glm53-kda-choice-protocol.md`. Freeze sources through both closures.
+GPU 16 GiB, CPU 8 GiB, swap0; no model starts, builds, tuning or retries.
+No next manifests/caches/GPU jobs created yet. All old failed gates stay failed;
+conditioned errors are observations, not accuracy or production qualification.
+
+### Previous checkpoint (2026-09-10): recompute isolation complete and bit-exact
 
 On3bd347098, one prescribed GPU0 process completes196 pairs (28 exact identity,
 168 conditioned). Four/eight-warp W/U/KG are bit-exact:1,124,974,592 BF16 values
