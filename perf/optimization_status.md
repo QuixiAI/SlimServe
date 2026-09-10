@@ -27718,3 +27718,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw CPU: `runtime-control/indexer-aot-cpu-v1.xml` and
   `indexer-aot-inspection-v1.json` under2026-09-10. Commands and limitations:
   `perf/glm53-indexer-loader-protocol.md`.
+
+## 2026-09-10 - All-rank indexer AOT-bound correction qualification passes
+
+- Status: AOT/leaf gate complete; full-model integration and quality pending.
+- Baseline/hypothesis: `cf95040f3`, fixed recipe v1/SM120 TP4. Qualified selective
+  correction should reproduce isolated outputs through actual static AOT bindings.
+- Workload: exactly control ranks0..3 then correction ranks0..3, private caches,
+  CPU8GiB/GPU16GiB/swap0. Two graph-held bindings x30 cases each, both phases,
+  five eager/replay observations. Four small norm tensors; no model forward.
+- Correctness:480 cases/960 unique phases/2,400 observations pass qualified
+  output/flag hashes and arena/input/weight/output/stride/gate/replay guards.
+  Each process has seven roots/46 entries,25 bound launchers/two target bindings.
+  Correction adds two observed static launchers/rank; all92 non-targets exact.
+- Closure: all load/leaf/audit/release steps and final pair audit pass. Original
+  5,172-file cache retained, GPUs released, UUID/driver/600W unchanged. No retries,
+  replacements, builds or simultaneous GPU jobs; freeze closed before doc edits.
+- Results: no timing/TPS claim, quality-floor relaxation or stable-baseline change.
+  Historical original oracle remains failed. CPU gate336 pass/20.74s.
+- Decision: retain for opt-in serving integration with actual scheduler/padding
+  and capture/serialized-arena checks, then prescribed model quality comparison.
+  Consume pinned completed receipts; do not rerun expired frozen validators.
+- Raw: `perf/results/2026-09-10/indexer-aot-v1/pair-analysis.json`, SHA
+  89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
+  Full commands and retained per-rank evidence: `perf/glm53-indexer-loader-protocol.md`.

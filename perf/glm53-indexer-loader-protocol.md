@@ -1,7 +1,7 @@
 # GLM53 indexer correction loader qualification
 
-Status: runnable AOT/leaf series implemented; CPU testing and GPU qualification
-in progress. Serving integration remains pending.
+Status: prescribed AOT/leaf series and final pair audit complete on `cf95040f3`.
+Serving integration remains pending.
 The fixed recipe/profile and original production attention remain unchanged.
 
 ## Qualified starting point
@@ -144,3 +144,27 @@ An AOT/leaf pass still does not prove full-model quality, scheduler/padding
 coverage, arbitrary multi-stream reentrancy or serving graph-capture behavior.
 Those require the subsequent opt-in serving integration and separately prescribed
 control/correction/return workload. No production or stable-baseline promotion.
+
+## Completed v1 results
+
+All eight prescribed processes pass loading, leaf qualification, independent
+audit and GPU release.480 cases/960 unique phases/2,400 observations reproduce
+the completed isolated original/corrected output and selection hashes exactly.
+Every run has seven graphs/46 entries,25 bound launchers and two target bindings;
+each correction rank adds two static launchers. All92 non-target bindings exact.
+No forward, serving request, TPS or new timer was run.
+
+The final pair audit passes. Original5,172-file cache preserved; GPUs released,
+UUID/driver580.173.02/600W settings unchanged. One preparation and prescribed
+start per arm, no replacements, builds or concurrent GPU work. Source freeze
+ended after the successful pair audit, before notebook changes.
+
+Raw `perf/results/2026-09-10/indexer-aot-v1/pair-analysis.json`, SHA
+89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
+Per-rank manifests, caches, launch/load/audit logs, driver/root inventories and
+individual leaf receipts remain under that directory. Consume these completed
+receipts in the next integration; do not rerun expired source-frozen validators.
+
+Decision: retain for opt-in serving integration. Scheduler/padding envelope,
+capture/serialized arena lifecycle and full-model quality remain separate gates.
+Historical original indexer oracle failure and stable TPS tables are unchanged.

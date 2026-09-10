@@ -1982,6 +1982,14 @@ TPS/default/quant or stable baseline change. GPUs released; completed raw
 `indexer-correction-v1/analysis.json` under2026-09-10, SHA
 c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65.
 
+Actual-AOT follow-up on `cf95040f3` passes the eight prescribed control/correction
+rank processes and final pair audit:480 bound-leaf cases/2,400 observations,
+qualified output/flag hashes, arena/replay guards and all92 non-target bindings
+exact. GPUs released; no model forward/TPS/default or baseline promotion.
+Serving scheduler/capture and model-quality gates remain pending. Raw
+`indexer-aot-v1/pair-analysis.json` under2026-09-10, SHA
+89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

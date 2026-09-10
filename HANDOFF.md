@@ -35,7 +35,28 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): runnable indexer AOT/leaf series CPU-tested
+### Latest checkpoint (2026-09-10): all-rank indexer AOT/leaf qualification passes
+
+The prescribed series on `cf95040f3` completes: control ranks0..3 then correction
+ranks0..3, one private cache/start each, no retries. All480 bound-leaf cases,
+960 unique phases and2,400 eager/replay observations match the qualified isolated
+outputs/flags. Every process loads seven actual roots/46 entries,25 launchers and
+two target bindings. All92 non-target bindings compare exactly; correction adds
+two independently observed static launchers per rank. Arena/input/output/replay
+guards pass. Four small norm tensors per process; no model forward or timings.
+
+Final pair audit passes; original5,172-file cache retained, GPUs released and
+UUID/driver/600W configuration unchanged. Freeze ended before these notebook edits.
+Raw `perf/results/2026-09-10/indexer-aot-v1/pair-analysis.json`, SHA
+89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
+
+NEXT: opt-in full-model correction diagnostic using these completed receipts;
+validate the actual scheduler/padding bound against the8192-row arena and the
+serialized/capture lifecycle. CPU-qualify integration before prescribing the
+control/correction/return quality series. Do not rerun expired frozen readers
+after source edits. No production/default/quant or speed-baseline promotion.
+
+### Previous checkpoint (2026-09-10): runnable indexer AOT/leaf series CPU-tested
 
 The ordered preparation/controller/independent auditor now extend the shared
 AOT lifecycle with actual graph-held leaf calls. Control ranks0..3 then correction
