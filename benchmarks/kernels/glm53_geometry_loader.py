@@ -48,21 +48,31 @@ class GeometryLoader:
         self.installed = False
         self.templates = {}
 
-    def compile_replacement(self, target, saved):
-        """Use original debug provenance and the unchanged rank-local cache rule."""
-        require(
-            "TRITON_CACHE_DIR" not in os.environ
-            and os.getenv("TORCHINDUCTOR_CACHE_DIR") == str(self.cache),
-            "geometry compiler requires original per-device cache semantics",
-        )
-        import torch
-        import triton
+    def check_cache(self):
+        """Accept Torch's normal unset -> exact per-rank env materialization."""
         from torch._inductor.runtime.cache_dir_utils import triton_cache_dir
 
+        expected = self.cache / "triton" / str(self.rank)
+        actual = os.getenv("TRITON_CACHE_DIR")
         require(
-            Path(triton_cache_dir(self.rank)) == self.cache / "triton" / str(self.rank),
+            actual in (None, str(expected))
+            and os.getenv("TORCHINDUCTOR_CACHE_DIR") == str(self.cache),
+            "geometry compiler cache binding differs: "
+            f"triton={actual!r}, inductor={os.getenv('TORCHINDUCTOR_CACHE_DIR')!r}, "
+            f"expected={str(expected)!r}",
+        )
+        require(
+            Path(triton_cache_dir(self.rank)) == expected
+            and expected.resolve() == expected,
             "resolved geometry cache is not rank-private",
         )
+
+    def compile_replacement(self, target, saved):
+        """Use original debug provenance and the unchanged rank-local cache rule."""
+        self.check_cache()
+        import torch
+        import triton
+
         original = Path(self.manifest["original_namespace"]) / target["relative"]
         copied = self.private / target["relative"]
         debug = Path(target["debug_source"])
@@ -80,15 +90,18 @@ class GeometryLoader:
             template = load_preserving_provenance(
                 copied, original, target["kernel"], name, debug_source=debug
             )
+            self.check_cache()
             self.templates[target["relative"]] = template
         with torch.cuda.device(self.rank):
-            return template._precompile_config(
+            result = template._precompile_config(
                 triton.Config(
                     {key: saved[key] for key in ("XBLOCK", "R0_BLOCK")},
                     num_warps=saved["num_warps"],
                     num_stages=saved["num_stages"],
                 )
             )
+        self.check_cache()
+        return result
 
     @contextmanager
     def intercept(self, *, future_class=None, code_cache=None, kernel_class=None):

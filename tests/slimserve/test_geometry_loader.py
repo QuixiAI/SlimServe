@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import copy
 import json
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -9,8 +10,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import triton
 from torch._inductor.codecache import PyCodeCache, StaticAutotunerFuture
 from torch._inductor.runtime.static_triton_launcher import StaticallyLaunchedCudaKernel
+from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
 from benchmarks.kernels import glm53_geometry_loader as loader_module
 from benchmarks.kernels.audit_glm53_geometry_graphs import (
@@ -290,6 +293,44 @@ def test_replacement_compiler_retains_provenance_and_rank_cache(tmp_path, monkey
     assert copied == loader.private / target["relative"] and kernel == target["kernel"]
     assert [c.kwargs["R0_BLOCK"] for c in configs] == [4096, 1024]
     assert [c.num_warps for c in configs] == [16, 8]
+    loader.close()
+
+
+def test_real_caching_autotuner_materializes_exact_rank_cache(tmp_path, monkeypatch):
+    loader, _, _, _, _ = fixture(tmp_path, monkeypatch)
+    loader.check_cache()
+    assert "TRITON_CACHE_DIR" not in os.environ
+    tuner = CachingAutotuner(
+        SimpleNamespace(__name__="fixture_norm", src="def fixture_norm(): pass"),
+        dict(
+            device=SimpleNamespace(
+                index=0, type="cuda", warp_size=32, max_threads_per_block=1024
+            )
+        ),
+        [triton.Config({"XBLOCK": 1}, num_warps=8)],
+        None,
+        [],
+        False,
+        None,
+    )
+    assert os.environ["TRITON_CACHE_DIR"] == str(loader.cache / "triton/0")
+    loader.check_cache()
+    assert not tuner.compile_results  # Constructor only: no GPU compilation/load.
+    loader.close()
+
+
+@pytest.mark.parametrize("value", ["", "shared", "wrong_rank", "alias"])
+def test_cache_materialization_rejects_other_paths(tmp_path, monkeypatch, value):
+    loader, _, _, _, _ = fixture(tmp_path, monkeypatch)
+    if value == "wrong_rank":
+        value = str(loader.cache / "triton/1")
+    elif value == "alias":
+        path = tmp_path / "alias"
+        path.symlink_to(loader.cache / "triton/0", target_is_directory=True)
+        value = str(path)
+    monkeypatch.setenv("TRITON_CACHE_DIR", value)
+    with pytest.raises(ValueError, match="cache binding"):
+        loader.check_cache()
     loader.close()
 
 

@@ -314,7 +314,7 @@ def launch(path):
             "systemd-run",
             "--user",
             "--scope",
-            f"--unit=glm53-geometry-aot-v2-{label}-{kind}",
+            f"--unit=glm53-geometry-aot-v3-{label}-{kind}",
             "-p",
             f"MemoryMax={memory}G",
             "-p",

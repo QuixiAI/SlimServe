@@ -35,7 +35,32 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): AOT preparation API fixed; NEW v2 prescribed
+### Latest checkpoint (2026-09-10): v2 first AOT load stopped; exact cache lifecycle fixed; v3 prescribed
+
+v2 TERMINAL: ONE control-rank0 load onad6656314 and its audit exit1; remaining
+seven not launched. All7 static bundles/50 entries found without fallback and
+15 actual CUDA loads match original whole bytes. Adapter rejects the legitimate
+autotuner-created TRITON_CACHE_DIR before replacement compilation. No full graph
+coverage, model weights/forward or TPS.201 source receipts/5172 original files
+unchanged, GPUs free. All8 private caches/logs/receipts preserved. Closure
+`rmsnorm-geometry-aot-qualification-v2/closure.json`, SHA
+c84e1f76dcca924103b52e660b30130e120c2f22b68a89800219024a819ae044.
+
+Fixed adapter accepts unset OR exact canonical private rank directory, before/
+after template creation and compilation, without rewriting callback environment.
+New CPU test executes installed CachingAutotuner constructor's actual unset->exact
+path transition; no GPU compilation. Wrong-rank/shared/empty/alias still reject.
+Error now records actual/expected paths (v2 did not log actual env values).
+Focused70 pass2.83s; final related269 pass.
+
+NEXT after commit: NEW v3 protocol at tail. Same eight no-weights AOT cases,
+control0..3 then geometry0..3, in fresh private copies. Root
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v3/`.
+Freeze through preparation/loads/audits/closure,16GiB GPU/8GiB CPU/swap0; stop on
+any failure/no retries/other GPU work/builds. v1/v2 remain stopped; no model series
+prescribed, quant/default/quality unchanged, optimization goal ongoing.
+
+### Previous checkpoint (2026-09-10): AOT preparation API fixed; NEW v2 prescribed
 
 v1 is TERMINAL: its ONE CPU preparation on7e2b8bd0e exits1 BEFORE creating any
 private cache or GPU process. Torch exports standalone_compile as a function,

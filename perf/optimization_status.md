@@ -26882,3 +26882,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `runtime-control/geometry-aot-v1-preparation-failure.json`, SHA
   1a337eb9639c4152ef2a6b02c875b97f5d512468eadd9d852dbeed36fc1f2e23;
   `geometry-loader-{preparation-path,v2-final}-cpu.xml`, under2026-09-10.
+
+## 2026-09-10 - First real-AOT geometry load rejects normal Torch cache materialization
+
+- Status: v2 TERMINAL after ONE control-rank0 load/audit; seven unlaunched cases.
+- Evidence:ad6656314,16GiB load/8GiB audit/swap0. All7 static bundles/50 entries
+  load without fallback;15 actual observed CUDA images match original whole bytes.
+  Replacement compilation stops at the adapter's unset-TRITON_CACHE_DIR assertion.
+  Original5172 files and201 frozen sources unchanged; GPUs released. No actual
+  graph-complete result, model weights/forwards, numerical execution or TPS claim.
+- Cause/fix: installed CachingAutotuner constructor legitimately materializes the
+  exact rank-private path. New CPU test executes that real constructor; adapter
+  accepts absent OR that exact canonical directory and validates before/after
+  template creation/compilation. No callback env rewrites or KDA/shared-cache change.
+  Wrong-rank/shared/empty/aliased paths remain rejected. Failed run lacked actual
+  env values; new errors include them. This CPU diagnosis is not full AOT proof.
+- CPU: focused70 pass2.83s; final related269 pass,8GiB/swap0, lint/diff pass.
+- Decision: preserve v2 copies/logs/audits, never launch its seven unused cases.
+  Commit then NEW v3 same fixed eight-case protocol, freeze through terminal audit.
+- Raw: `rmsnorm-geometry-aot-qualification-v2/closure.json`, SHA
+  c84e1f76dcca924103b52e660b30130e120c2f22b68a89800219024a819ae044;
+  `runtime-control/geometry-loader-rank-cache{,-final}-cpu.xml`, under2026-09-10.

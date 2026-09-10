@@ -4,7 +4,8 @@ Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pa
 matrices pass and match exactly across processes. Their commands below are
 historical; do not rerun them. The first pair remains terminal after its observer
 API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
-load. NEW no-weights AOT v2 is prescribed at the tail below;
+load. v2 stopped on its first GPU load's cache-lifecycle gate. NEW no-weights
+AOT v3 is prescribed at the tail below;
 no full-model series is prescribed.
 
 ## Question and fixed factors
@@ -383,7 +384,7 @@ This gate proves loader/graph/binary coverage, not model score causality or TPS.
 Only after it passes may the opt-in serving adapter and bounded model causal
 series be implemented/prescribed. Quant/defaults/native math/gates unchanged.
 
-## v1 preparation closure; NEW prescribed v2
+## v1 preparation closure; historical v2 (stopped on first load)
 
 ONE CPU preparation on7e2b8bd0e exits1 BEFORE creating the private series or
 launching any GPU load. Dotted import of `torch._inductor.standalone_compile`
@@ -418,3 +419,36 @@ substituting `v2` for `v1` in BOTH the outer unit name and manifest series path.
 The launcher's child scope names are also v2. Only if all eight pass, invoke the
 previous final `compare` command with v2 in BOTH unit and series path. No other
 changes, replacement starts or model workload authorized by this protocol.
+
+## v2 closure and exact cache-lifecycle fix; NEW v3
+
+ONE control-rank0 load onad6656314 exits1, followed by its prescribed failing
+audit. The remaining seven loads were NEVER launched. All seven static bundles
+load without fallback (50 entries total);15 actual CUDA loads match their original
+whole cubin images. Replacement compilation stops at the diagnostic's overly
+strict requirement that TRITON_CACHE_DIR remain absent. No graph-complete coverage,
+replacement numerical result, model forward/weights or TPS claim. All201 frozen
+source receipts/5172 original files verify, independent GPU query empty. v2 is
+TERMINAL and its eight prepared caches/receipts/logs remain intact. Closure
+`rmsnorm-geometry-aot-qualification-v2/closure.json`, SHA
+`c84e1f76dcca924103b52e660b30130e120c2f22b68a89800219024a819ae044`.
+
+Torch's actual CachingAutotuner constructor materializes an initially absent
+TRITON_CACHE_DIR as the SAME rank-private directory. CPU test executes that real
+constructor (no compilation/driver) and verifies the transition. The adapter now
+accepts absent OR exactly `<private>/inductor_cache/triton/<rank>` and checks the
+resolved canonical path before/after template creation AND compilation. It never
+unsets/rewrites the variable in callbacks. Wrong-rank/shared/empty/aliased values
+still reject. Error diagnostics now include the actual/expected cache paths; the
+failed v2 run did not itself record those environment values. Focused70 pass2.83s;
+related269 pass. The real loader must still qualify the corrected adapter.
+
+NEW v3: repeat the SAME prescribed eight-case matrix at a NEW root, not a retry
+of v2. Commit fixes/protocol, then freeze. Use the v2 preparation command above,
+substituting `v3` in BOTH unit and output path. For each LABEL in the original
+fixed order, use the launch command with `v3` in BOTH unit and manifest path;
+child scopes are also v3. Final compare uses v3 unit/path only after all eight
+loads/audits/release checks pass. Root:
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v3/`.
+Same scopes/no-retry/no-edit/no-build/one-GPU-workload rules and every original
+source/binary/graph/non-target gate. Do not launch any unused v1/v2 case.
