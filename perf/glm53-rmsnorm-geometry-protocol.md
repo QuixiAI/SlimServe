@@ -1,9 +1,10 @@
 # GLM53 broader RMSNorm geometry isolation
 
-Status: source-exact numerical probe/auditor implemented on 2026-09-10. The
-two-process kernel pair below is prescribed after the final CPU checks and commit.
-No model series or real-AOT loader job is prescribed yet. All earlier stopped
-series remain terminal; never reuse their unlaunched arms.
+Status: first kernel pair TERMINAL after A stops on a binary-observer API bug
+before numerical tests. Never launch its B. Corrected pre-load observer is CPU
+tested; ONLY the new pair at the end of this document is prescribed after commit.
+No model series or real-AOT loader job is prescribed. All older stopped series
+remain terminal; never reuse their unlaunched arms.
 
 ## Question and fixed factors
 
@@ -85,7 +86,7 @@ in-memory cubins against disk bytes, exact output/metric phase coverage, and the
 entire source freeze. B is programmatically gated on A's successful numerical
 audit, unchanged summary, and rechecked source/binary artifacts.
 
-After CPU tests and source commit, prepare once in an 8 GiB/no-swap scope:
+Historical first-pair commands (STOPPED; do not rerun):
 
 ```bash
 systemd-run --user --scope --unit=glm53-geometry-probe-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
@@ -145,3 +146,65 @@ bounded control/geometry/return full-model series and its auditor, and run it in
 150 GiB/no-swap serving scopes. Preserve the existing per-window quality floors,
 exact score-vector comparisons, cold exact-token workload and all failed/slow
 starts. A diagnostic score change is not a speed win or production promotion.
+
+## First pair closure and corrected pre-load pair
+
+ONE A on28842e5c3 stops before numerical cases: the static CUDA adapter has no
+`asm` attribute. Its `cubin_raw` is consumed and cleared by `load_kernel` inside
+`make_launcher`. The original observer was wrong in both API and lifecycle.
+The first control's emitted disk key/config/whole-cubin bytes match the original;
+182 frozen receipts/5172 original files verify. A exits1, prescribed audit rejects
+the incomplete binary set, GPUs are free, B never launched. Closure:
+`runtime-control/rmsnorm-geometry-binary-api-failure-analysis.json`, SHA
+`ae19129d827af87f55352f6c7b625513c8db81ab2a0bb84e2616486ce124d07a`.
+
+Corrected probe hashes the actual in-memory image BEFORE creating the launcher,
+then compares that hash with the emitted disk binary. The helper handles Triton's
+`asm` and Torch's `cubin_raw`, rejects conflicts/missing bytes, and never falls
+back to guessing a disk image after loading. A CPU test uses the installed
+StaticallyLaunchedCudaKernel.load_kernel lifecycle with only its driver call
+mocked, proving the consumption timing.226 related tests pass5.67s. The static
+launcher implementation is added to the next frozen manifest.
+
+This fixes the SOURCE probe. The multi-target controller will separately need
+pre-load observation for graph-held static objects when implementing real-AOT
+qualification; post-load bytes are unavailable there too. Do not call the
+controller qualified or install it in serving on the strength of these CPU tests.
+
+NEW discovery `runtime-control/rmsnorm-geometry-preload-discovery.json`, SHA
+`d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f`.
+Same13 sources/configs/312-pair matrix and all gates; only the observer changes.
+NEW series, exactly A then (only after pass/audit/GPU release) B:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-preload-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry prepare \
+  --discovery perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-discovery.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --series-root perf/results/2026-09-10/rmsnorm-geometry-preload-qualification
+systemd-run --user --scope --unit=glm53-geometry-preload-a -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-preload-a-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-preload-b -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-preload-b-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-preload-pair-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry compare \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json
+```
+
+Freeze through the entire NEW pair and audits; no edits/builds/commits/other GPU
+work, no replacement attempts, no new model job. Preserve stdout/stderr/statuses.
+Stop on failure; all original first-pair paths remain immutable historical evidence.

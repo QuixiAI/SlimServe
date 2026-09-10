@@ -35,7 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): source-exact geometry probe/auditor implemented
+### Latest checkpoint (2026-09-10): static binary API failure closed; pre-load observer corrected
+
+First geometry pair is TERMINAL: ONE A on28842e5c3 stops before numerical work.
+Torch's static CUDA adapter exposes cubin_raw, not asm, and clears the raw bytes
+inside make_launcher/load_kernel. The observer was wrong; no kernel-quality or
+TPS result. First control's disk key/config/whole bytes match original.182 frozen
+receipts/5172 original files unchanged, GPU query empty; B never launched.
+Closure `runtime-control/rmsnorm-geometry-binary-api-failure-analysis.json`, SHA
+ae19129d827af87f55352f6c7b625513c8db81ab2a0bb84e2616486ce124d07a.
+
+Probe now hashes real in-memory bytes BEFORE make_launcher, then compares disk
+bytes. No post-load disk fallback or weakened gate. CPU test uses the installed
+static adapter's actual load lifecycle with only the driver call mocked.
+226 related tests pass5.67s. New discovery
+`runtime-control/rmsnorm-geometry-preload-discovery.json`, SHA
+d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f.
+
+NEXT after commit: NEW preload manifest/A/audit/B/audit/pair-audit at protocol
+tail, same312 pairs/process/gates. B only after A passes. Freeze sources through
+pair/audits; old paths/unused B remain terminal.16GiB probes/8GiB CPU/swap0.
+The multi-source CONTROLLER still needs pre-load observation for graph-held
+static objects during its future real-AOT qualification; it is NOT serving-ready.
+No model job/default/quality promotion; goal ongoing.
+
+### Previous checkpoint (2026-09-10): source-exact geometry probe/auditor implemented
 
 `benchmarks/kernels/check_glm53_rmsnorm_geometry.py` implements preparation,
 source-exact run, offline per-process audit and independent-process comparison.

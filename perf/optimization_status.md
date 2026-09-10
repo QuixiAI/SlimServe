@@ -26726,3 +26726,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `perf/results/2026-09-10/rmsnorm-geometry-source-qualification/`.
 - Final related CPU224 passed5.72s, lint/diff pass; report
   `runtime-control/rmsnorm-geometry-probe-final-cpu.xml`. Sources ready to freeze.
+
+## 2026-09-10 - Geometry source probe stops on static binary API; fix observation timing
+
+- Status: first prescribed pair TERMINAL, zero numerical cases. Never launch B.
+- Baseline: ONE A on28842e5c3,16GiB/swap0, sources frozen through closure. The
+  static CUDA adapter has no asm member; it uses cubin_raw and clears it on
+  load_kernel inside make_launcher. Observer API/lifecycle bug, not kernel failure.
+- Closure: first emitted control disk key/config/whole cubin matches original;
+  182 source receipts/5172 original files unchanged, GPUs free. A exits1; planned
+  audit rejects incomplete binary set. Both logs and partial files preserved.
+- Fix: read in-memory bytes BEFORE make_launcher; support actual Triton asm and
+  static cubin_raw, reject missing/conflicting images, retain disk/raw whole-byte
+  equality. No post-load disk fallback or numerical tolerance change. Freeze the
+  installed static-launcher source too. The controller's later graph-held static
+  binding qualification still requires pre-load observation; not claimed fixed.
+- CPU:226 related tests pass5.67s. New test executes installed static adapter's
+  Python load/clear lifecycle with the driver call mocked, confirms ordering and
+  rejects observing consumed bytes. Lint/diff pass. No serving or native change.
+- Decision: NEW preload discovery/manifest and NEW same312-pair A/B series after
+  commit, conditional B only after A and audit pass. Stop on failure, no retries,
+  preserve prior attempts; freeze through both runs/audits. Protocol tail.
+- Raw: `runtime-control/rmsnorm-geometry-binary-api-failure-analysis.json`, SHA
+  ae19129d827af87f55352f6c7b625513c8db81ab2a0bb84e2616486ce124d07a;
+  `rmsnorm-geometry-preload-discovery.json`, SHA
+  d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f;
+  `rmsnorm-geometry-preload-cpu.xml`, all under perf/results/2026-09-10/.

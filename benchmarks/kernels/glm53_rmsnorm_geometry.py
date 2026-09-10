@@ -25,7 +25,24 @@ GEOMETRY = dict(XBLOCK=1, R0_BLOCK=1024, num_warps=8, num_stages=1)
 
 
 def binary_sha(compiled):
-    return hashlib.sha256(compiled.kernel.asm["cubin"]).hexdigest()
+    """Hash retained in-memory bytes, before static launcher loading consumes them.
+
+    Torch's static CUDA adapter keeps cubin_raw rather than Triton's asm mapping.
+    Its load_kernel clears both cubin_raw and cubin_path after the driver load.
+    Never substitute a disk/cache lookup for an unobserved in-memory image.
+    """
+    images = []
+    assembly = getattr(compiled.kernel, "asm", None)
+    if isinstance(assembly, dict) and isinstance(assembly.get("cubin"), bytes):
+        images.append(assembly["cubin"])
+    raw = getattr(compiled.kernel, "cubin_raw", None)
+    if isinstance(raw, bytes):
+        images.append(raw)
+    if not images:
+        raise ValueError("in-memory cubin unavailable; observe it before launcher load")
+    if any(image != images[0] for image in images):
+        raise ValueError("conflicting in-memory cubin representations")
+    return hashlib.sha256(images[0]).hexdigest()
 
 
 class MultiIntervention:

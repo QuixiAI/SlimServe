@@ -3,6 +3,7 @@ import base64
 import copy
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -236,6 +237,66 @@ def test_output_is_never_overwritten(tmp_path):
     with pytest.raises(FileExistsError):
         probe.write_new(path, dict(status="second"))
     assert json.loads(path.read_text())["status"] == "first"
+
+
+def test_real_static_cuda_adapter_consumes_bytes_only_after_observation(tmp_path):
+    from torch._inductor.runtime.static_triton_launcher import (
+        StaticallyLaunchedCudaKernel,
+    )
+
+    from benchmarks.kernels.glm53_rmsnorm_geometry import binary_sha
+
+    # Exercise the installed Python lifecycle, replacing only the driver call.
+    # No GPU initialization or launch is needed to test this API contract.
+    binary = b"complete cubin including debug image"
+    path = tmp_path / "kernel.cubin"
+    path.write_bytes(binary)
+    kernel = StaticallyLaunchedCudaKernel.__new__(StaticallyLaunchedCudaKernel)
+    kernel.cubin_raw, kernel.cubin_path = binary, str(path)
+    kernel.name, kernel.shared = "test_norm", 0
+    kernel.function = kernel.module = None
+    calls = []
+
+    def load(filename, name, shared, device):
+        assert (filename, name, shared, device) == (str(path), "test_norm", 0, 0)
+        assert path.read_bytes() == binary
+        calls.append("driver-load")
+        return 101, 102, 32, 0
+
+    kernel.C_impl = SimpleNamespace(_load_kernel=load, _unload_kernel=lambda _: None)
+    compiled = SimpleNamespace(kernel=kernel)
+    expected = hashlib.sha256(binary).hexdigest()
+    assert binary_sha(compiled) == expected
+
+    def make_launcher():
+        kernel.load_kernel(0)
+        return "launcher"
+
+    compiled.make_launcher = make_launcher
+
+    def precompile(config):
+        assert config.kwargs == dict(XBLOCK=1, R0_BLOCK=1024)
+        assert config.num_warps == 8 and config.num_stages == 1
+        return compiled
+
+    template = SimpleNamespace(_precompile_config=precompile)
+    assert probe.compile_recorded(template, probe.GEOMETRY) == ("launcher", expected)
+    assert calls == ["driver-load"]
+    assert kernel.cubin_raw is None and kernel.cubin_path is None
+    with pytest.raises(ValueError, match="before launcher load"):
+        binary_sha(compiled)
+    kernel.close()
+
+
+def test_in_memory_binary_reader_rejects_ambiguous_or_missing_images():
+    from benchmarks.kernels.glm53_rmsnorm_geometry import binary_sha
+
+    kernel = SimpleNamespace(asm=dict(cubin=b"first"), cubin_raw=b"second")
+    with pytest.raises(ValueError, match="conflicting"):
+        binary_sha(SimpleNamespace(kernel=kernel))
+    kernel = SimpleNamespace(cubin_raw=None, cubin_path="/not-a-fallback.cubin")
+    with pytest.raises(ValueError, match="unavailable"):
+        binary_sha(SimpleNamespace(kernel=kernel))
 
 
 @pytest.mark.parametrize("change", ["incomplete", "failed", "summary", "manifest"])

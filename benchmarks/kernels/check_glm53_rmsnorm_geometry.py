@@ -33,7 +33,7 @@ from benchmarks.kernels.check_glm53_cached_rmsnorm import (
 from benchmarks.kernels.glm53_rmsnorm_geometry import CONTROL, GEOMETRY, binary_sha
 from slimserve.rmsnorm_diagnostic import sha, single_launcher_receipt
 
-DISCOVERY_SHA = "4294ff75ea2236c577b8104ea3a44055d65dcf68ca0449685eccf02a2c5f7ea4"
+DISCOVERY_SHA = "d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f"
 SCHEMA = "glm53-rmsnorm-geometry-probe-v1"
 ARMS = ("control", "geometry")
 
@@ -113,9 +113,10 @@ def prepare(discovery_path, manifest_path, series_root):
     for path in (Path(__file__), discovery_path):
         sources[str(path.resolve())] = sha(path)
     import torch._inductor.codecache as codecache
+    import torch._inductor.runtime.static_triton_launcher as static_launcher
     import triton.language.standard as standard
 
-    for module in (codecache, standard):
+    for module in (codecache, static_launcher, standard):
         sources[module.__file__] = sha(module.__file__)
     manifest = dict(
         schema=SCHEMA,
@@ -202,6 +203,21 @@ def prior_a(manifest, manifest_path):
     return dict(analysis_sha256=sha(path), summary_sha256=report["summary_sha256"])
 
 
+def compile_recorded(template, config):
+    """Observe the binary before make_launcher consumes static CUDA raw bytes."""
+    import triton
+
+    compiled = template._precompile_config(
+        triton.Config(
+            {k: config[k] for k in ("XBLOCK", "R0_BLOCK")},
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+        )
+    )
+    in_memory_sha = binary_sha(compiled)
+    return compiled.make_launcher(), in_memory_sha
+
+
 def run(manifest_path, arm):
     manifest = read_manifest(manifest_path)
     output = Path(manifest["outputs"][arm])
@@ -270,19 +286,12 @@ def run(manifest_path, arm):
                 )
                 launches[index] = []
                 for label, config in (("control", CONTROL), ("geometry", GEOMETRY)):
-                    compiled = template._precompile_config(
-                        triton.Config(
-                            {k: config[k] for k in ("XBLOCK", "R0_BLOCK")},
-                            num_warps=config["num_warps"],
-                            num_stages=config["num_stages"],
-                        )
-                    )
-                    launcher = compiled.make_launcher()
+                    launcher, in_memory_sha = compile_recorded(template, config)
                     selected = single_launcher_receipt(launcher)
                     require(selected["config"] == config, "compiled geometry changed")
                     files = binary_files(output, target, selected)
                     require(
-                        files["cubin_sha256"] == binary_sha(compiled),
+                        files["cubin_sha256"] == in_memory_sha,
                         "in-memory/disk binary mismatch",
                     )
                     if label == "control":
