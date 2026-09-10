@@ -1,9 +1,10 @@
 # GLM53 broader RMSNorm geometry isolation
 
 Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pair
-matrices pass and match exactly across processes. All commands below are now
+matrices pass and match exactly across processes. Their commands below are
 historical; do not rerun them. The first pair remains terminal after its observer
-API failure. No model series, real-AOT loader job or other GPU job is prescribed.
+API failure. NEW no-weights AOT qualification is prescribed at the tail below;
+no full-model series is prescribed.
 
 ## Question and fixed factors
 
@@ -312,3 +313,71 @@ manifest preparation, and a prescribed sequential eight-process protocol with
 stop-on-failure/no retries. Then actual graph/global/binary coverage, unchanged
 non-target comparison and cache/source audit must pass before any model series.
 No next GPU/model job is prescribed at this checkpoint.
+
+## NEW prescribed real-AOT qualification v1
+
+Runner `check_glm53_geometry_loader.py`, offline auditor
+`audit_glm53_geometry_loader.py`; both under `benchmarks/kernels/`.
+CPU gate263 passed3.13s (31 new audit/harness tests),8GiB/swap0; report
+`runtime-control/geometry-loader-protocol-cpu.xml`. Initial focused64 pass2.55s
+in `geometry-loader-audit-cpu.xml`. GPUs idle before source freeze.
+
+Exactly EIGHT processes, in this order: control-rank0, control-rank1,
+control-rank2, control-rank3, geometry-rank0, geometry-rank1, geometry-rank2,
+geometry-rank3. One fresh identical full private namespace per process. Each
+loads the original rank's seven cached artifacts/46 entries through the real
+concurrent StandaloneCompiledArtifacts.load_all path, WITHOUT outer model
+deserialization, weights, forwards, capture or timing. Never retry a process.
+
+Before each next load: preceding load exit0, offline audit exit0, original/source
+freeze unchanged, all predecessor receipts/logs unchanged, independent GPU query
+empty. ANY failure terminates the entire sequence; preserve partial/full raw logs,
+summary, binary/controller streams, audit and private caches. No edits, builds,
+commits or other GPU workloads from preparation through final closure/audit.
+
+Required per-process evidence: all seven actual graph sources and every mapped
+target binding, no static bundle fallbacks, each graph launcher tied to its
+observed exact CUDA load image, per-source selected config/cubin, independent
+graph-global inventory joined to controller and binary receipts, complete target
+and observer seals. Geometry additionally requires identical ALL non-target
+graph/source/config/binary records to the corresponding control. The observer's
+global seal occurs only after all loading/inventory/target sealing; there is no
+later capture in this gate. This lifetime is NOT automatically a serving policy.
+
+Prepare AFTER committing the implementation and this protocol:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1
+```
+
+Invoke the following ONCE for each prescribed LABEL above, sequentially and only
+if all earlier labels passed. LABEL is not a tuning choice. The launcher records
+`launch.json`, native stdout/stderr in `load.log`/`audit.log`, exact commands,
+exit codes/log digests and post-load independent GPU query. It starts its GPU
+child in16GiB/swap0 and auditor in8GiB/swap0 scopes and rejects prior attempts.
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-launch-LABEL -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_geometry_loader launch \
+  --manifest perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1/LABEL/manifest.json
+```
+
+Only after ALL eight pass and the GPUs are free:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v1-final-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.audit_glm53_geometry_loader compare \
+  perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1
+```
+
+This gate proves loader/graph/binary coverage, not model score causality or TPS.
+Only after it passes may the opt-in serving adapter and bounded model causal
+series be implemented/prescribed. Quant/defaults/native math/gates unchanged.

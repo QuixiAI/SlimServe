@@ -26841,3 +26841,26 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `geometry-loader-{cpu,cpu-api,expanded-cpu,related-cpu}.xml`. Preserve initial
   fixture failure (obsolete PyCodeCache.cache name), corrected pass, mistaken
   test-path invocation (zero tests) and final related pass. No numerical retries.
+
+## 2026-09-10 - Implement bounded no-weights real-AOT qualification and offline audit
+
+- Status: CPU gates pass; new v1 eight-process GPU sequence prescribed, not yet run.
+- Baseline/hypothesis: source-exact geometry pair passes, but actual AOT coverage
+  is unproven. Load the same owned concurrent seven-artifact/46-entry path without
+  weights/forward/capture before any full-model causal experiment.
+- Change: runner and source-frozen standalone auditor join actual graph globals,
+  observed pre-load cubins and controller receipts; all sources require exact
+  selected configs/bytes/coverage/seals. All non-target bindings must match control.
+  Launcher records native logs, commands, exit codes and independent GPU release;
+  every next attempt checks all successful predecessors. No retry/reset behavior.
+- CPU:263 related tests pass3.13s,8GiB/swap0, lint/diff pass;31 new tests join real
+  CPU-loader receipts and reject missing/drifted graph/binary/controller records,
+  wrong coverage, fallbacks and failed/changed predecessors. Initial focused64 pass
+  2.55s retained. GPU calls mocked; no actual AOT or model claim yet.
+- Decision: commit then freeze, prepare independent private copies, execute exactly
+  control ranks0..3 then geometry ranks0..3, one GPU workload at a time16GiB/swap0,
+  audit8GiB/swap0 after each. Stop entire sequence on failure, no replacement starts.
+  Preserve original cache/recipe/native/attention combo/KDA/quality gates unchanged.
+- Raw/protocol: `runtime-control/geometry-loader-{audit,protocol}-cpu.xml` under
+  2026-09-10; new `rmsnorm-geometry-aot-qualification-v1/` and geometry protocol tail.
+  GPUs idle before preparation; no throughput measured or default promoted.

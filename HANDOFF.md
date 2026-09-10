@@ -35,7 +35,30 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): actual loader adapter and independent graph inventory CPU-tested
+### Latest checkpoint (2026-09-10): no-weights AOT runner/auditor ready; bounded v1 prescribed
+
+`check_glm53_geometry_loader.py` loads the seven actual artifacts/46 submodule
+entries per rank without weights/forward/capture. Its `launch` action preserves
+native logs/statuses and executes one16GiB/swap0 GPU child plus8GiB/swap0 audit.
+`audit_glm53_geometry_loader.py` independently joins graph globals, observed binary
+loads and per-source controller receipts; geometry requires all non-target bindings
+exact against its control. Each next attempt requires ALL prior load/audit/release
+checks and unchanged receipts/logs. No retries; source/original freeze verified.
+
+CPU gate263 passed3.13s, including31 new audit/harness tests (first focused64 pass).
+Preparation now freezes these tools, actual Torch AOT/async/static/bundle/cache
+helpers and owned `vllm/compilation/caching.py`. Sources ready to commit/freeze.
+
+NEXT after commit: execute the new v1 protocol at the TAIL of
+`perf/glm53-rmsnorm-geometry-protocol.md`: prepare eight private copies, then
+control-rank0..3 followed by geometry-rank0..3, sequentially, only after each prior
+load/audit passes and GPU is released; final pair audit. STOP on any failure and
+preserve all evidence. No edits/builds/commits/other GPU jobs through closure.
+Root `perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v1/`.
+No full-model series prescribed; previous series remain terminal. No new TPS,
+quant/default/native/quality change; optimization goal still ongoing.
+
+### Previous checkpoint (2026-09-10): actual loader adapter and independent graph inventory CPU-tested
 
 New diagnostic-only modules, not installed in serving:
 
