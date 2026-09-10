@@ -27186,3 +27186,21 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   perf/results/2026-09-10; analysis SHA
   744500910b0930425294a1cf425cc05bf51a7a59a5f31d59639c2515f525984b.
   Details: perf/glm53-kda-choice-protocol.md.
+
+## 2026-09-10 - Prescribe isolated KDA gate arithmetic v1
+
+- Status: ready for one prescribed GPU process; no performance change.
+- Hypothesis: eight/two-warp gate cumsum settings may change FP32 accumulation
+  before any other KDA stage. This tests source/config arithmetic, not unrecorded
+  historical live winners or full-model causality.
+- Workload:168 pairs, layer0 repaired FP32 TP4 weights, BF16 synthetic gates and
+  packed beta stride6528/offset6144,16x128 heads, chunk64/lower_bound-5. Seven
+  single/ragged layouts, two seeds, three magnitudes; original and changed-input
+  eager/graph checks, guards, float64 oracle, cubin/source receipts. No autotuning.
+- Correctness:22 CPU pass3.54s; real source import and preparation, reference
+  chunk/sequence resets, direct launch arguments and audit rejection tests.
+- Decision: commit then one preparation/run/audit, GPU16GiB/CPU8GiB/swap0,
+  source freeze through closure. Stop on failure; no retries or model starts.
+  All existing indexer/no-combo/model gates unchanged; explicit FP32 probe
+  integrity criterion and exact commands in perf/glm53-kda-choice-protocol.md.
+- Raw: runtime-control/kda-gate-{cpu,final-cpu}.xml under2026-09-10. GPU pending.

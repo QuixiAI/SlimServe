@@ -44,10 +44,14 @@ Earliest is gate/cumsum: BS32/stages3 fixed, eight -> two warps on every rank.
 Shared disk winners are NOT historical per-rank launch receipts; do not infer
 model causality or call these timings serving TPS. CPU16pass0.09s, no GPU run.
 
-NEXT: prepare isolated gate/cumsum comparison before further model execution.
+NEXT: execute the prescribed one-process gate/cumsum v1 diagnostic after commit.
+Probe/tests ready:22 CPU pass3.54s, including real source imports and preparation.
+168 pairs,16GiB/swap0 GPU0, fixed eight/two-warps, no tuning; freeze from preparation
+through8GiB CPU audit. Exact commands/matrix/failure policy are at protocol tail.
+No model execution is prescribed. No caches or GPU job for v1 launched yet.
 Actual CUDA path re-exports kimi_k3/amd/ops/third_party/kda; generic FLA kda.py
 is not the serving implementation. Protocol/evidence boundaries and raw receipt
-are in perf/glm53-kda-choice-protocol.md. No next GPU command prescribed yet.
+are in perf/glm53-kda-choice-protocol.md.
 Quant/default/native libraries unchanged; every failed quality gate remains failed.
 
 ### Previous checkpoint (2026-09-10): full-model v3 complete; geometry candidate rejected

@@ -56,3 +56,50 @@ differences; preserve the failed indexer gate and every existing serving floor.
 Finalize the fixed matrix, source checks and one-process command after CPU tests.
 No full-model run, source/default/native/quant change or autotuning is authorized
 by this preparation note.
+
+## Gate arithmetic v1: prescribed one-process matrix
+
+CPU tests exercise the actual serving JIT import, full evidence preparation,
+float64 oracle boundaries, exact launch arguments and audit rejection paths:
+18 passed in3.86s, 8GiB/swap0, GPUs hidden. Raw `runtime-control/kda-gate-cpu.xml`.
+Final combined regression:22 passed3.54s, `runtime-control/kda-gate-final-cpu.xml`.
+The gate source equals both59ae0c88f (failed fresh) and ce6df61aa (geometry series).
+This does not reconstruct their unrecorded live KDA choices or binary identities.
+
+After committing this protocol and final CPU tests, prepare once and execute ONE
+new GPU0 process, fixed order: rank0..3, then layouts, seeds and magnitudes below.
+Both arms use the exact current serving JIT, direct explicit launch (no autotuner):
+eight warps first, then two; BS32/BT64/stages3,16 heads x128, lower_bound-5.
+The synthetic packed beta stride is6528, offset6144 (128 reserved beta rows,
+only first16 live), not the historical pre-g_a-fusion6288 projection width.
+
+- Layouts: single sequences1,63,64,65,1000; ragged17/63/65/855; single7616.
+- Seeds530901/530902; BF16 random magnitudes0.125/1/8.
+- Real layer0 repaired FP32 A_log/dt_bias, each TP4 shard;168 paired cases.
+- Two eager repetitions, original-input graph replay, then in-place input change
+  (+0.125 gate/-0.25 beta) and replay/eager comparison on the same addresses.
+- Input/packed-sibling/output guards unchanged; repeat and replay bit-exact.
+- Gate and beta mathematical oracle uses float64, chunk/sequence resets and
+  exp/sigmoid/cumsum. Diagnostic FP32 integrity gate:
+  abs(error) <=1e-6 +2e-6*abs(reference), every element.
+  This new FP32 probe criterion does not change any BF16/indexer/model gate.
+- Record pairwise FP32 differences, output hashes, actual compiled cubin bytes,
+  source/compiler/repair hashes and device/driver/power identity. Cross-arm exact
+  equality is an observation, not required. No performance timings are taken.
+- Stop at first structural/replay/mutation/oracle failure; preserve partial
+  results and always audit/close. No retries, replacements or omitted cases.
+- Freeze sources from preparation through audit; no model or other GPU job and
+  no native build. GPU process16GiB, CPU preparation/audit8GiB, all swap0.
+
+From repository root, after commit (each command once):
+
+```bash
+systemd-run --user --scope --unit=glm53-kda-gate-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_gate prepare --manifest perf/results/2026-09-10/runtime-control/kda-gate-v1-manifest.json
+systemd-run --user --scope --unit=glm53-kda-gate-v1 -p MemoryMax=16G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python -m benchmarks.kernels.check_glm53_kda_gate run --manifest perf/results/2026-09-10/runtime-control/kda-gate-v1-manifest.json --output perf/results/2026-09-10/kda-gate-v1
+systemd-run --user --scope --unit=glm53-kda-gate-v1-audit -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_kda_gate audit --manifest perf/results/2026-09-10/runtime-control/kda-gate-v1-manifest.json --output perf/results/2026-09-10/kda-gate-v1
+```
+
+If gate outputs differ, this identifies a source of local numerical sensitivity,
+not its contribution to model scores. If exact, continue down the remaining KDA
+stages with new evidence-based isolation. No full-model start/default promotion
+follows automatically from either result.
