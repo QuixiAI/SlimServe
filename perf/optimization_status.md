@@ -26810,3 +26810,34 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/rmsnorm-binary-observer-{cpu,final-cpu}.xml`;
   `rmsnorm-geometry-candidate-cache-check.json`, SHA
   017120c13bc5fc5b8261903cf8a4dd3ba782b67c00ccfe53a9f58cfcd40a7102.
+
+## 2026-09-10 - Connect multi-source isolation to actual loader APIs and independent inventory
+
+- Status: CPU implementation/validation complete; actual AOT GPU qualification and
+  model-causality result still pending. No serving or production policy change.
+- Baseline/hypothesis: both source-exact geometries are independently qualified,
+  but source probes do not prove every live graph actually uses its replacement.
+- Change: preparer joins pinned A/B reports to actual original sources/debug files
+  and both rank-local cubins; eight private copies are implemented but not created.
+  Adapter installs the binary observer before real static-future/code-cache hooks,
+  retaining original provenance and per-device cache behavior. Independent inventory
+  checks actual call globals, AST run references, source/config/cubin/launcher-object
+  bindings, and all non-target Triton globals. Not based on controller callbacks.
+- Correctness:232 related CPU tests pass2.80s, including33 new tests,8GiB/swap0;
+  lint/diff pass. Real installed PyCodeCache/StaticAutotunerFuture/static-launcher
+  APIs exercised with mocked GPU calls, including four concurrent imports,
+  changed/missing bindings, hook conflicts/cleanup and source/cache provenance.
+  Target seal explicitly allows later non-target binary loading before global seal.
+- Actual artifact check:13 qualified targets/7 mapped graphs per rank,183 source
+  receipts and5172 original files verify. The previously committed observer change
+  to MultiIntervention is the sole refreshed former helper; no native/serving/
+  compiler drift. This is a read-only join, not actual live AOT graph coverage.
+- Results/decision: no GPU/model/native build or TPS measurement. Retain diagnostic
+  implementation; next complete bounded no-weights runner and offline receipt audit,
+  freeze new sources, prepare private manifests, then prescribe actual GPU loads.
+  Do not run the old terminal series or clear quality/indexer gates. GPUs free.
+- Raw: `perf/results/2026-09-10/runtime-control/geometry-loader-source-check.json`,
+  SHAcbe7547de5f0218caa4e5e094a1a1f74b2b17e00a0087c83a8eb5f7b78cb4d84;
+  `geometry-loader-{cpu,cpu-api,expanded-cpu,related-cpu}.xml`. Preserve initial
+  fixture failure (obsolete PyCodeCache.cache name), corrected pass, mistaken
+  test-path invocation (zero tests) and final related pass. No numerical retries.

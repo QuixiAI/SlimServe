@@ -1919,6 +1919,12 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
 
 ## GLM-5.3-Flash NVFP4 (glm53-nvfp4-4 / glm53-nvfp4-8, A100; glm53-nvfp4-4 rtx6000)
 
+2026-09-10 diagnostic status: broader RMSNorm source qualification is complete,
+but its new loader adapter and independent graph inventory are CPU-tested only
+(232 related tests). No real-GPU AOT or full-model causal result, new TPS baseline,
+or production promotion follows from that work. Selected recipe and quality gates
+remain unchanged; current diagnostic details are in HANDOFF and the geometry protocol.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

@@ -273,3 +273,42 @@ Next implement private manifest preparation and actual AOT-loader adapters/audit
 then prescribe the bounded all-rank/control+geometry qualification. Use the proven
 seven-artifact loader path and independently verify actual graph globals. Do not
 substitute static graph references, source probes or callback counts for coverage.
+
+## Actual loader adapter CPU checkpoint
+
+Preparation, scoped loader hooks and independent live-graph inventory are now
+implemented in `prepare_glm53_geometry_loader.py`, `glm53_geometry_loader.py` and
+`audit_glm53_geometry_graphs.py` under `benchmarks/kernels/`. NOT serving hooks.
+Preparation joins the pinned completed pair to both original rank-local binaries,
+copies the full unchanged namespace separately for every rank/mode, and records
+released helper updates without silently changing native/compiler/serving receipts.
+No private copies have yet been made with this preparer.
+
+The adapter observes driver inputs before cached resolution, uses original debug
+provenance for replacements, and leaves `TRITON_CACHE_DIR` UNSET. Torch resolves
+the private Inductor cache's `triton/<rank>` directory exactly as in the original
+AOT path; do not flatten this into a shared directory or change KDA cache behavior.
+Both loader hooks remain active through inventory and target sealing. Their cleanup
+restores unchanged hooks but preserves/rejects foreign edits. Target sealing does
+not globally seal the binary observer; this is tested with a later non-target load.
+
+The independent inventory walks actual module call globals and executable `.run`
+symbols, checks source/graph hashes and selected binary/launcher-object provenance,
+and requires the mapped graphs and every target binding. It also records non-target
+Triton bindings for exact cross-arm comparison. Controller ownership/callback maps
+do not supply its coverage. This CPU implementation is NOT proof that all actual
+AOT graph globals have yet been loaded or that all are supported static launchers.
+
+Related suite232 passes2.80s (33 new tests),8GiB/swap0, including installed
+PyCodeCache/StaticAutotunerFuture/static launcher APIs and concurrent source imports.
+Driver and replacement-compiler calls are mocked; actual artifact join verifies13
+targets/7 graphs per rank/183 source receipts/5172 original files unchanged.
+`runtime-control/geometry-loader-source-check.json` SHA
+`cbe7547de5f0218caa4e5e094a1a1f74b2b17e00a0087c83a8eb5f7b78cb4d84`.
+
+Remaining before GPU work: no-weights AOT runner, separate offline receipt auditor,
+new source freeze including those tools and actual Torch loader helpers, private
+manifest preparation, and a prescribed sequential eight-process protocol with
+stop-on-failure/no retries. Then actual graph/global/binary coverage, unchanged
+non-target comparison and cache/source audit must pass before any model series.
+No next GPU/model job is prescribed at this checkpoint.

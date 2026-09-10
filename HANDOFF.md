@@ -35,7 +35,48 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): static load observer integrated and CPU-tested
+### Latest checkpoint (2026-09-10): actual loader adapter and independent graph inventory CPU-tested
+
+New diagnostic-only modules, not installed in serving:
+
+- `prepare_glm53_geometry_loader.py` joins the pinned completed A/B receipts to
+  original sources/debug identities and both exact rank-local binary images.
+  Implements eight independent private cache/manifest copies (two modes x four
+  ranks); NO copies have been prepared yet. It records released helper changes
+  explicitly and refuses to refresh changed serving/compiler/native artifacts.
+- `glm53_geometry_loader.py` scopes the pre-load observer BEFORE the actual
+  StaticAutotunerFuture/PyCodeCache hooks. Compiles with original debug provenance
+  and unchanged per-device Triton cache semantics. Restores hooks safely.
+- `audit_glm53_geometry_graphs.py` independently reads actual call globals,
+  executable AST run symbols, source/config/binary/launcher-object bindings, and
+  all non-target Triton globals for cross-arm comparison. It does not derive
+  coverage from controller callback receipts or static references alone.
+
+Related CPU suite232 passed2.80s (including33 new tests),8GiB/swap0. Exercises
+installed PyCodeCache loading, StaticAutotunerFuture.result, static make_launcher/
+load_kernel and four concurrent real imports; GPU driver calls are mocked and
+replacement GPU compilation is separately mocked for its provenance/cache test.
+Target sealing leaves the observer open for legitimate non-target compilation;
+global observer sealing remains an explicit final qualification step.
+
+Read-only actual-artifact join passes:13 targets,7 graphs/rank,183 source receipts,
+5172 unchanged original files. The ONLY refreshed former helper is the already
+committed MultiIntervention observer integration. Raw
+`runtime-control/geometry-loader-source-check.json`, SHA
+cbe7547de5f0218caa4e5e094a1a1f74b2b17e00a0087c83a8eb5f7b78cb4d84.
+CPU reports `geometry-loader-{cpu,cpu-api,expanded-cpu,related-cpu}.xml` retain
+initial fixture/API failure and erroneous test-path attempt as well as passes.
+
+NEXT: implement the bounded no-weights AOT runner and OFFLINE receipt auditor
+around this adapter/inventory; include these new sources and actual Torch loader
+helpers in the new manifest freeze. Then prepare the eight private copies and
+prescribe/control their sequential real GPU loads (seven artifacts/46 entries per
+rank), comparing all non-target bindings and independently joining binary/controller
+receipts. No GPU/model job is yet prescribed. Independent GPU query empty; no
+native build, model load, throughput result, serving/default/quant/gate change.
+The model correctness regression and optimization goal remain unresolved.
+
+### Previous checkpoint (2026-09-10): static load observer integrated and CPU-tested
 
 `benchmarks/kernels/glm53_binary_observer.py` observes the exact private cubin
 path passed to the CUDA driver BEFORE load, compares retained raw bytes when
