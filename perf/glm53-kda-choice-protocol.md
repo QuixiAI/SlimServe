@@ -142,7 +142,7 @@ same-signature binaries first (especially stage-only changes), then prescribe th
 smallest still-informative numerical comparison. Do not rerun the completed gate
 matrix or a full model just to retest unchanged work. No next GPU job prescribed.
 
-## Recompute v1 preparation and fixed protocol
+## Recompute v1 completed (preparation/protocol commands historical)
 
 CPU screening finds genuinely different retained binaries for recompute4/8-warps
 and state-update4-warps/stages2/3. Output4/8-warps also differs; its stage-only
@@ -198,3 +198,39 @@ systemd-run --user --scope --unit=glm53-kda-recompute-v1-audit -p MemoryMax=8G -
 ```
 
 Next action depends on the completed result; no full-model run prescribed.
+
+## Completed recompute v1 result
+
+On3bd347098, the one prescribed GPU0 process completes196/196 pairs (28 identity,
+168 conditioned), then its CPU audit passes. No retry, exclusion or replacement.
+Both actual cubins and81 frozen receipts verify; GPU release and unchanged
+device/driver/power identity verify. Source freeze ended after closure.
+
+The four/eight-warp settings produce BIT-EXACT W, U and KG outputs on both input
+phases:1,124,974,592 compared BF16 values per output,3,374,923,776 total. Every
+eager/replay/mutation/guard check and every exact identity oracle passes. This is
+local arithmetic evidence, not proof for every input or unrecorded model launches.
+
+Conditioned-case float64 reference errors remain observations, as prescribed:
+maximum rounded-reference BF16 ULP distances W/U/KG27616/67/49, maximum absolute
+errors0.0011707544/0.1209889725/0.0009765638. Large ULP distances around cancellation
+or tiny values cannot be interpreted from those aggregate maxima alone. Do not
+call these random fixtures oracle-qualified or waive any existing accuracy gate.
+Both arms have identical outputs, so this probe does not implicate the warp choice
+in those reference differences. No production change or TPS measurement.
+
+Raw `perf/results/2026-09-10/kda-recompute-v1/`: all196 records, attempt marker,
+summary, actual cubins and private compiler cache. Closure analysis SHA
+eb997c612a0347924b5a66b49c11a90ed969ba37e10ae5d6ac8ce4bf494fd6a9;
+summary SHAe49d798109bd60d10d0d3c9cf4595ba4a56e0f4025a4e48160c9902e1f939515.
+Consume these completed receipts after further source/protocol edits, not v1's
+now-historical source-frozen validators. All failed model/indexer gates unchanged.
+
+NEXT: isolate state update (warps4/BV32/stages2 versus3), then output (BK64/BV64,
+warps4 versus8; retained same-warp output stage-only variants are byte-identical).
+State outputs include BF16 chunk snapshots/new values and FP32 final state; do not
+reuse a BF16-only checker for all three. The actual serving state call supplies
+an initial-state tensor even for zero-state sequences, varlen chunk offsets, GK
+gating and USE_EXP2=True. Source is `third_party/flash_linear_attention/ops/chunk_delta_h.py`.
+Use exact algebraic cases plus recorded numerical comparisons; no new model gate.
+No next GPU/model job is currently prescribed.

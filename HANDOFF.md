@@ -35,7 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): recompute isolation ready, v1 prescribed
+### Latest checkpoint (2026-09-10): recompute isolation complete and bit-exact
+
+On3bd347098, one prescribed GPU0 process completes196 pairs (28 exact identity,
+168 conditioned). Four/eight-warp W/U/KG are bit-exact:1,124,974,592 BF16 values
+per output. Eager/replay/changed-input/mutation/guard and exact identity checks
+pass; probe/audit exit0.81 frozen receipts/two cubins verify; GPUs released,
+hardware settings unchanged. Freeze ended; no retries, exclusions or model run.
+
+Conditioned FP64-reference errors were observations, NOT accuracy qualification.
+Max W/U/KG BF16-ULP27616/67/49; absolute0.0011707544/0.1209889725/0.0009765638.
+Do not infer general numerical accuracy or explain aggregate ULP maxima without
+element-level evidence. Both arms match exactly; no warp-choice cause shown here.
+No TPS, default, quant or quality-gate promotion.
+
+Raw perf/results/2026-09-10/kda-recompute-v1/analysis.json SHA
+eb997c612a0347924b5a66b49c11a90ed969ba37e10ae5d6ac8ce4bf494fd6a9;
+all196 records, summary and cubins/private cache retained. Source-freeze readers
+are historical after further edits; consume the pinned completion receipts.
+
+NEXT: state update at warps4/BV32/stages2 vs3, then output warps4 vs8/BK64/BV64.
+State has mixed BF16/FP32 outputs and actual varlen/initial-state/GK/exp2 flags;
+see perf/glm53-kda-choice-protocol.md tail. No next GPU/model job prescribed.
+All earlier failed series/gates remain terminal/failed. Serving defaults unchanged.
+
+### Previous checkpoint (2026-09-10): recompute isolation ready, v1 prescribed
 
 Retained state/recompute/output candidates have different binaries; CPU screen
 records36 candidates/seven exact TTIR groups. Recompute4->8-warps is the earliest

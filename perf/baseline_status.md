@@ -1933,6 +1933,10 @@ Subsequent KDA gate arithmetic isolation (c7b4bb4d1) completes168 prescribed pai
 eight/two-warp outputs are bit-exact, reference/replay/guard checks pass. No serving
 timing/default promotion follows. This narrows a numerical investigation; it does
 not resolve the failed no-combo model scores. Details: glm53-kda-choice-protocol.md.
+Recompute isolation on3bd347098 likewise completes196 paired cases with bit-exact
+W/U/KG across four/eight-warps and passing exact identity/replay/guard checks.
+Conditioned FP64-reference errors are observations, not accuracy qualification.
+No new model TPS or default promotion; state/output choices remain to investigate.
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 

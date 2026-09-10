@@ -27253,3 +27253,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   kda-remaining-binary-screen.json SHA
   9c8d8a3f5d8a47a12fe0bb395ada85d448f886360473b0e595387c49830526a0,
   all under perf/results/2026-09-10. Protocol contains exact one-shot commands.
+
+## 2026-09-10 - Recompute warp choice is bit-exact on196 paired cases
+
+- Status: completed local diagnostic; no serving/default/performance change.
+- Baseline/workload:3bd347098, exact prescribed GPU0 process,4/8-warps at stages3,
+  28 identity +168 conditioned triangular cases, both original/changed inputs.
+  No model starts, autotuning, retries, exclusions or native builds.
+- Result: W/U/KG each bit-exact over1,124,974,592 BF16 values (3,374,923,776 total).
+  All eager/graph/changed-input/mutation/guard checks and exact identity oracles
+  pass. This does not prove equality on every input or historical live selection.
+- Reference observations: conditioned W/U/KG max BF16-ULP27616/67/49 versus
+  rounded FP64; max absolute0.0011707544/0.1209889725/0.0009765638. These were
+  predeclared metrics, not qualification thresholds. No general accuracy claim;
+  aggregate ULP maxima do not by themselves locate/explain cancellation errors.
+- Closure: probe/audit exit0;81 frozen receipts/two cubins verify, GPU released
+  and hardware identity unchanged. Source freeze ended. No TPS measured/promoted.
+- Decision: continue to remaining state and output choices; no next GPU job
+  prescribed. Keep original settings and all indexer/no-combo/model gates intact.
+- Raw: perf/results/2026-09-10/kda-recompute-v1/analysis.json, SHA
+  eb997c612a0347924b5a66b49c11a90ed969ba37e10ae5d6ac8ce4bf494fd6a9;
+  all196 pair records, summary, binary copies/private cache retained. Protocol
+  records the completed command sequence and next state's dtype/layout cautions.
