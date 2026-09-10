@@ -74,3 +74,48 @@ Reversibility and contribution are distinct from production acceptance.
 No next GPU/model run is prescribed by this design note. Finalize commands,
 repetitions and failure handling before launch. Do not revive any terminal
 series, weaken the indexer oracle gate or benchmark until a fast start appears.
+
+## KV overwrite adapter v1: prescribed isolated qualification
+
+`benchmarks/kernels/glm53_attention_overwrite.py` retains the original eleven-arg
+combo ABI, calls the precompiled original, then the precompiled split KV launcher
+with arguments 0/1/5, rows/512, on the same stream. It does no allocation, copies,
+tuning or serving installation. Host-call counters include capture, not GPU-only
+graph replay. The new probe is `check_glm53_attention_overwrite.py`.
+
+After final CPU tests and commit, exactly ONE new process uses GPUs 0..3
+sequentially in a 16 GiB/swap0 scope. Preparation/audit use 8 GiB/swap0. No other
+GPU work, serving, native build, source edit or commit from preparation through
+closure. No retries, replacement processes or excluded cases.
+
+- Compile and verify all eight source/config/actual whole-cubin bindings BEFORE
+  numerics: one original combo and one split KV per rank, recorded launch configs,
+  rank-private caches and preserved first-writer debug provenance. Never autotune.
+- Fixed order: ranks 0..3, rows 1/3/16/640/7616, seeds 530901/530902, magnitudes
+  0.125/1/8; 120 cases. Real layer11 BF16 weights and synthetic packed inputs,
+  matching the completed attention matrix. Changed input uses seed+100.
+- For original and adapter: two eager calls, capture, changed-input graph replay
+  and eager comparison, then original-input replay. Inputs/weights, row guards
+  and indexer output stride gap must remain unchanged; all outputs finite.
+- Compare adapter KV exactly with a separate direct split-KV launch. Compare Q
+  and indexer K exactly with original combo outputs. Require all input hashes,
+  original outputs and direct KV outputs to match the completed historical
+  matrix. The changed-KV counts must also match those retained paired records.
+- KV retains the existing <=1 BF16 ULP float64-oracle gate. Indexer LayerNorm
+  remains unchanged and its earlier failed accuracy gate remains FAILED. This
+  qualifies the adapter's transformation, NOT the whole attention bundle or model.
+- Record each case before its numerical audit, plus actual binary copies/caches,
+  hashes, attempt marker and summary. Stop at first failure; retain and audit the
+  partial attempt as terminal. Verify frozen sources, all 5,172 original cache
+  files, unchanged GPU/driver/power identity and GPU release at closure.
+
+Each command below once, from repository root after commit:
+
+```bash
+systemd-run --user --scope --unit=glm53-kv-overwrite-v1-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_attention_overwrite prepare --manifest perf/results/2026-09-10/runtime-control/kv-overwrite-v1-manifest.json
+systemd-run --user --scope --unit=glm53-kv-overwrite-v1 -p MemoryMax=16G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python -m benchmarks.kernels.check_glm53_attention_overwrite run --manifest perf/results/2026-09-10/runtime-control/kv-overwrite-v1-manifest.json --output perf/results/2026-09-10/kv-overwrite-v1
+systemd-run --user --scope --unit=glm53-kv-overwrite-v1-audit -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.check_glm53_attention_overwrite audit --manifest perf/results/2026-09-10/runtime-control/kv-overwrite-v1-manifest.json --output perf/results/2026-09-10/kv-overwrite-v1
+```
+
+No full-model run is yet prescribed. Even a passing adapter probe still needs
+actual graph-loader binding/coverage verification before serving integration.

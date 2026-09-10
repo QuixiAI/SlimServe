@@ -35,7 +35,21 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): attention graph boundaries mapped
+### Latest checkpoint (2026-09-10): KV-only adapter ready for isolated qualification
+
+`KVOnlyOverwrite` retains the original combo ABI and appends only split KV, with
+no tensor copies or serving installation. Probe checks exact non-KV preservation,
+direct KV equality, historical output hashes, existing KV oracle, changed-input
+graph replay and guards. All eight rank-private binaries are checked before
+numerics. CPU final 88 passed in 3.84 s; prior 39/87-pass reports retained.
+
+NEXT after commit: exactly one preparation/GPU process/audit prescribed at
+`perf/glm53-attention-isolation.md` tail. 120 cases, GPUs 0..3 sequentially,
+16 GiB probe/8 GiB CPU/swap0, source freeze through closure. No v1 manifest/cache
+or GPU job created yet. No model start/native build/tuning/retry; all old failures
+stay failed. Actual graph-loader integration remains AFTER this qualification.
+
+### Previous checkpoint (2026-09-10): attention graph boundaries mapped
 
 CPU analyzer `benchmarks/analyze_glm53_attention_contracts.py` verifies all eight
 attention graph pairs (two per rank), with 75 pinned graph/source/evidence hashes.

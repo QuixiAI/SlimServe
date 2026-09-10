@@ -27351,3 +27351,24 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/attention-contracts.json`, SHA
   8337ae7e4ec383563ed2df0230f21e9424556feccbec3a93a61deea94caff3c8;
   `attention-contracts-{cpu,final-cpu}.xml`. Design: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Prescribe KV-only overwrite adapter qualification
+
+- Status: CPU complete; one isolated GPU process prescribed after commit.
+- Baseline/hypothesis: original fused attention bundle versus original plus one
+  split-KV overwrite on the same input/weight/output/stream. Can the adapter
+  reproduce split KV while leaving Q/indexer K and all neighbors unchanged?
+- Change: benchmark-only 33-line adapter, no copies/tuning/serving installation.
+  Probe reuses source-provenance loading and replay/guard helpers, checks all
+  eight original/split KV binaries before numerics, then 120 fixed cases matching
+  the completed attention matrix. Actual output/input hashes must match history.
+- Correctness: 88 CPU passed in 3.84 s (earlier 39/87-pass reports retained),
+  including real tensor/replay orchestration, injected replay failure, ABI/stream/
+  destination ordering, archival hash rejection and terminal failure handling.
+  KV keeps <=1 BF16 ULP; indexer LayerNorm remains on its original failed gate.
+- Decision: commit then one prepare/run/audit, four GPUs used sequentially in
+  one 16 GiB/swap0 process, CPU8GiB. Freeze through closure, stop on failure,
+  preserve partial evidence; no retry/model/native job or default change. No TPS
+  claim; actual graph-loader coverage is a subsequent required integration step.
+- Raw: `perf/results/2026-09-10/runtime-control/kv-overwrite-{cpu,final-cpu,receipts-cpu}.xml`.
+  Commands/matrix/failure policy: `perf/glm53-attention-isolation.md`; GPU pending.
