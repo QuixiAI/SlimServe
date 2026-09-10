@@ -26637,3 +26637,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `analysis.json`, SHA0da742b0b8d7eb08651be0b32fff0b7c874aaa87781d01d47ce2ca3877e06bdb;
   `runtime-control/attention-rank-private-supplement.json`, SHA
   ca1f301a402d655b0e42db598437615864444b927ac723df4cb7db3f5d283f85.
+
+## 2026-09-10 - Map broader4096 normalization geometry to exact graph roles
+
+- Status: CPU correspondence complete; causal experiment preparation, not promotion.
+- Baseline: failed fresh no-combo policy also changes4096 reduction geometry;
+  attention and KDA changes confound attribution. The completed attention probe
+  does not establish full-model causality and its indexer oracle gate stays failed.
+- Hypothesis: broader4096 changes can be isolated in the original graph/cache set,
+  leaving the historical attention combos and KDA tuning unchanged.
+- Change: read-only AST analyzer excludes duplicated compile-time docstrings,
+  binds embedded source+decorator ASTs to hashed inventory, then matches graphs by
+  kernel body, semantic consumer and exact ordered call arguments. New graph
+  paths come only from completed live binding receipts; old paths are static
+  cache evidence, NOT proof of actual historical graph loading.
+- Results:28 matched graph pairs, seven per rank;13 unique changed4096 sources,
+  six input_layernorm/seven post_attention_layernorm (3/3/3/4 sources by rank).
+  Every change is XBLOCK1/R0_BLOCK4096/16 warps to1/1024/eight warps, one stage.
+  Final mean+norm retains1024/eight-warps. No model/kernel/GPU run or TPS result.
+- Correctness: four CPU tests pass0.03s in8GiB/swap0 scope; lint/diff pass.
+  Tests cover docstring exclusion, decorator sensitivity, ambiguous bindings,
+  graph correspondence and argument mismatch. Source/config receipts verified.
+- Decision: retain analyzer; prepare a separate graph-complete multi-source
+  intervention and qualify it before prescribing any model starts. Do not infer
+  numerical causality, broaden quality tolerances, or revive stopped series.
+- Raw: `perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json`, SHA
+  320a6f39c4f92cd78459f21e23653e1e900870620da29bed923f5cba5dbe315e;
+  prior `norm-graph-role-inventory.json` and both analysis logs retained.

@@ -35,7 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): full attention matrix audited; RMS shapes pass, LayerNorm does not
+### Latest checkpoint (2026-09-10): broader RMSNorm graph correspondence established
+
+CPU-only analysis pairs28 old/new generated graphs (seven per rank), using the
+actual AST rather than duplicated compile-time docstrings. Correspondence requires
+identical kernel bodies, semantic consumers and ordered call arguments. It identifies
+13 distinct4096-wide sources changing from XBLOCK1/R0_BLOCK4096/16 warps to
+XBLOCK1/R0_BLOCK1024/eight warps (one stage): six input_layernorm and seven
+post_attention_layernorm sources,3/3/3/4 across ranks. Final mean+norm retains
+1024/eight-warps. Old graph references remain STATIC cache evidence, not proof
+every old graph was loaded; new paths are restricted to completed live receipts.
+
+Analyzer/tests: `benchmarks/analyze_glm53_norm_graph_roles.py`, four CPU tests pass,
+lint/diff pass. Raw `perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json`,
+SHA320a6f39c4f92cd78459f21e23653e1e900870620da29bed923f5cba5dbe315e.
+Initial unpaired inventory and logs retained. No GPU workload, new TPS result,
+production change or quality-gate change in this step.
+
+NEXT: prepare and qualify a graph-complete multi-source diagnostic to change ONLY
+these13 original-cache4096 launch choices, keeping attention combo and KDA choices
+fixed. The existing single-target-per-rank controller is not sufficient as-is.
+Require one atomic future resolver, per-source coverage and sealing, source/config/
+binary qualification before any model run. No new GPU job or model series is
+prescribed yet. All prior attempts remain terminal; indexer gate remains failed.
+
+### Previous checkpoint (2026-09-10): full attention matrix audited; RMS shapes pass, LayerNorm does not
 
 ONE rank-private probe on7c5a8c603 completes ALL120 predetermined pairs, after
 all16 exact source/config/cubin images verify. All4 ranks' outputs/metrics agree
