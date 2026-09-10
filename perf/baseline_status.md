@@ -2010,7 +2010,13 @@ score parity and recovered4.7GB allocation warnings8 ->0 ->8 in prescribed
 control/chunked/return starts. E2E medians157.397/578.121/779.971,
 156.983/579.758/778.748,156.878/579.686/781.038 tok/s; effectively neutral,
 not a speed win. The series uses native-order1; production-policy/default rollout
-remains pending. GPUs released; `prompt-score-serving-v1/closure.json` under
+remains unqualified. Subsequent fresh-production rollout on70dfeafa1 stopped at
+the first UNCHUNKED control: five historical quality windows fail, aggregate and
+needles pass; no candidates ran. No compiler or chunking causality established.
+Control TPS157.074/577.872/777.652, not a new baseline. Raw terminal report
+`prompt-score-rollout-v1/rollout.json` under2026-09-10, SHA
+c0edff11d35650a18afe529c63c4c58fc25e4da25cd091806374d1e9db6a76f6.
+GPUs released; `prompt-score-serving-v1/closure.json` under
 2026-09-10, SHA27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

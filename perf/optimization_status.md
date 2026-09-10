@@ -27908,3 +27908,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/prompt-score-rollout-cpu-v3.xml`;
   earlier passing363/364-test reports retained. Exact command, references and
   predeclared gates: `perf/glm53-prompt-score-rollout-protocol.md`.
+
+## 2026-09-10 - Fresh production rollout stops at unchanged control quality
+
+- Status: terminal/failed at first control; candidates/return never started.
+- Baseline:70dfeafa1, fixed recipe v1/SM120 TP4, native-order0/BF16fn1/TC0,
+  chunking0, independently empty cache, normal production compilation. Serving
+ 150GiB/controller8GiB/swap0. One quality pass, three cold exact1000/300 repeats
+  at c1/c8/c16, text/image, cold32K/128K as prescribed.
+- Hypothesis: qualify memory fix under real production policy. The unmodified
+  control must clear historical quality before the first chunked start is allowed.
+- Correctness: serving health/workloads/teardown complete, serving exit0. Aggregate
+  mean-2.726227950197305 and all needles pass; five unchanged0.01-nat windows fail
+  (zero-indexed1/9/21/22/30), worst21 is0.090025 below its allowed floor. Controller
+  exits1 at this gate. No candidate result or chunking-quality comparison exists.
+- Results: startup188.098s; c1/c8/c16 E2E medians157.074/577.872/777.652 tok/s;
+  cold32K/128K engine TTFT2.583817/10.869529s; quality wall90.837s. Eight recovered
+  4,718,592,000-byte allocator warnings; four transient teardown zombies, GPU
+  release0.924s. Source freeze verified at failure; independent GPU query empty.
+- Decision: preserve all artifacts and terminal failure; no retries, replacement,
+  gate relaxation, default/native/quant changes or speed baseline. Freeze ended
+  before documentation. Investigate production/reference discrepancy: historical
+  controls already differ at4095/4096 scores and two native libraries changed since
+  those references. Fresh compiler causality is not established; chunking was OFF.
+- Raw: `perf/results/2026-09-10/prompt-score-rollout-v1/rollout.json`, SHA
+  c0edff11d35650a18afe529c63c4c58fc25e4da25cd091806374d1e9db6a76f6;
+  `control/audit.json`, full campaign outputs and independent fresh cache retained.

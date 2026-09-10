@@ -1,6 +1,7 @@
 # Prompt-score memory fix: production-policy rollout v1
 
-Status: CPU-qualified365 tests/35.88s, no GPU start yet. Previous native-order1 diagnostic series
+Status: TERMINAL/FAILED on first control; do not resume or replace this series.
+CPU-qualified365 tests/35.88s. Previous native-order1 diagnostic series
 is complete, exact-quality qualified, with allocation warnings8 ->0 ->8; closure
 SHA27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
 
@@ -56,7 +57,7 @@ audited failed report. No edits/commits during the series. Artifacts/private cac
 are retained. All starts are recorded regardless of speed; never launch after a
 terminal failed report. Changing the profile default requires all gates to pass.
 
-After CPU qualification and commit:
+Original launch command (completed; not a next command):
 
 ```bash
 systemd-run --user --scope --unit=glm53-prompt-score-rollout-v1-controller -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.run_glm53_prompt_score_rollout --output perf/results/2026-09-10/prompt-score-rollout-v1
@@ -79,3 +80,30 @@ The first inspection failed a harness check because `Plan.entry_file` is a lazy
 environment-dependent property read after restoring the parent environment. The
 check now runs inside the prescribed environment; inspection-v2 passed, with a
 real-registry regression test. No model/GPU/cache/start was consumed by inspection.
+
+## Completed first-control failure (70dfeafa1)
+
+Only control0 ran. Serving/workload/teardown completed with exit0; controller
+stopped at the prescribed historical-quality gate. Candidates and return remain
+unstarted. Source freeze verified at failure; all GPUs released in0.924s. No retry,
+replacement, changed gate, or promotion. Chunking was OFF throughout this start.
+
+Startup188.098s; E2E c1/c8/c16 medians157.074/577.872/777.652 tok/s. Cold engine
+TTFT32K/128K2.583817/10.869529s. Quality wall90.837s, mean-2.726227950197305;
+aggregate and needles pass, five zero-indexed windows fail:
+
+| Window | Observed mean | Required floor |
+| ---: | ---: | ---: |
+| 1 | -2.0517373084 | -2.0469238705 |
+| 9 | -2.7608458640 | -2.7236238996 |
+| 21 | -2.8744654725 | -2.7844406219 |
+| 22 | -2.5183644067 | -2.4982017523 |
+| 30 | -1.3957387531 | -1.3687888006 |
+
+Eight recovered4,718,592,000-byte allocation warnings and four transient teardown
+zombies retained. `rollout.json` SHA
+`c0edff11d35650a18afe529c63c4c58fc25e4da25cd091806374d1e9db6a76f6`;
+`control/audit.json`, campaign logs/responses and complete fresh cache preserved.
+This does not test chunking's quality impact or establish compiler causality.
+Historical controls also vary in token scores, and two native library hashes
+differ from those historical runs; isolate these confounders before more serving.

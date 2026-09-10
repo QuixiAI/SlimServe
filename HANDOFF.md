@@ -35,7 +35,27 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): fresh production-policy rollout CPU-qualified
+### Latest checkpoint (2026-09-10): fresh production control fails quality gate
+
+Rollout on70dfeafa1 is TERMINAL/FAILED after the first control. Chunking was OFF;
+none of the three candidates or return-control started. Do not resume/retry this
+series. Health, exact1000/300 c1/c8/c16, text/image, quality requests, cold32K/128K
+and teardown completed. Five historical per-window quality gates fail (1/9/21/22/30,
+zero-indexed), despite passing aggregate mean-2.7262279502 and all needles.
+
+E2E medians157.074/577.872/777.652 tok/s; cold engine TTFT2.583817/10.869529s.
+Eight recovered4,718,592,000-byte allocation warnings, four transient teardown
+zombies; GPUs released in0.924s. Source freeze verified at failure and now ended.
+Keep all fresh cache artifacts. Raw `prompt-score-rollout-v1/rollout.json` under
+2026-09-10, SHAc0edff11d35650a18afe529c63c4c58fc25e4da25cd091806374d1e9db6a76f6.
+
+NEXT: isolate fresh-production/reference quality discrepancy before more serving.
+This does NOT implicate chunking (never enabled) or establish compiler causality.
+The two historical references themselves differ at4095/4096 scores; current core
+and QuixiCore native hashes also differ from those historical references. Keep
+memory fix opt-in, production/default/quality gates unchanged; no speed promotion.
+
+### Previous checkpoint (2026-09-10): fresh production-policy rollout CPU-qualified
 
 New `benchmarks/run_glm53_prompt_score_rollout.py` prescribes exactly one control,
 three chunked candidates, one return with independent EMPTY compile caches and
