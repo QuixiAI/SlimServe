@@ -6,6 +6,7 @@ import pytest
 
 from benchmarks.kernels.check_glm53_attention_norms import (
     LAYOUTS,
+    checked_debug_source,
     flat_config,
     layernorm_oracle,
     load_preserving_provenance,
@@ -92,6 +93,46 @@ def test_provenance_rejects_original_import_and_changed_copy(tmp_path):
     copied.write_text("def triton_norm():\n    return 2\n")
     with pytest.raises(ValueError, match="copy differs"):
         load_preserving_provenance(copied, original, "triton_norm", "unused")
+
+
+def test_first_writer_alias_preserves_function_but_not_rank_metadata(tmp_path):
+    original, copied, debug = [
+        tmp_path / n for n in ("original.py", "private.py", "writer.py")
+    ]
+    original.write_text("rank = 0\ndef triton_norm():\n    return rank, __file__\n")
+    copied.write_bytes(original.read_bytes())
+    debug.write_text(original.read_text().replace("rank = 0", "rank = 1"))
+    function = load_preserving_provenance(
+        copied, original, "triton_norm", "norm_alias_test", debug_source=debug
+    )
+    assert function() == (0, str(copied))
+    assert function.__code__.co_filename == str(debug)
+    debug.write_text("\n" + debug.read_text())
+    with pytest.raises(ValueError, match="function/line differs"):
+        load_preserving_provenance(
+            copied, original, "triton_norm", "unused", debug_source=debug
+        )
+    debug.write_text(original.read_text().replace("return rank", "return 2"))
+    with pytest.raises(ValueError, match="function/line differs"):
+        load_preserving_provenance(
+            copied, original, "triton_norm", "unused", debug_source=debug
+        )
+
+
+def test_debug_path_requires_exact_bounded_record(tmp_path):
+    ptx = tmp_path / "kernel.ptx"
+    writer = tmp_path / "writer.py"
+    ptx.write_text(f'\t.file\t1 "{writer}"\n\t.file\t2 "/helper.py"\n')
+    assert checked_debug_source(ptx, tmp_path) == writer
+    for text in (
+        '\t.file 1 "/elsewhere.py"',
+        '\t.file 1 "relative.py"',
+        "",
+        ptx.read_text() * 2,
+    ):
+        ptx.write_text(text)
+        with pytest.raises(ValueError):
+            checked_debug_source(ptx, tmp_path)
 
 
 def test_packed_inputs_replay_seed_and_stride():

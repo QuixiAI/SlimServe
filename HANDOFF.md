@@ -35,7 +35,33 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): preserve source provenance for exact binary replay
+### Latest checkpoint (2026-09-10): first-writer provenance verified for all16 kernels
+
+Second probe on9de50bbe3 also stops BEFORE numerical launches. Historical combo
+now reproduces whole cubin bytes. First split kernel shares its cache key with
+rank1, whose filename remains in the original binary's debug data. Using rank0's
+equivalent source as its debug identity is insufficient. Frozen closure compares
+all38 ELF sections: only.debug_line and.nv.merc.debug_line differ; all non-debug
+sections and compiler metadata match. PTX instruction prefix matches after
+ignoring filename COMMENTS (initial literal-prefix assertion/log retained).
+121 source/native/compiler receipts and5172 original files unchanged; GPUs free.
+Closure `runtime-control/attention-provenance-failure-analysis.json`, SHA
+797a63dd7e137bd3a63dc55be1262fa849be1c1e0d622d896119587c55b6b018.
+
+CPU preflight now resolves the exact PTX .file1 first-writer identity for ALL16
+sources, bounds it to the recorded cache, and checks identical function text AND
+line position. Nine of12 split bindings use rank1's debug identity; original
+rank-specific source/decorator metadata remains unchanged. Private cache paths
+and exact whole-cubin gates remain mandatory. No source/binary substitutions.
+Discovery manifest `runtime-control/attention-first-writer-discovery.json`, SHA
+49ba4df5a3a83bcfcea30383ffcb9683b14a77bbb05f0cbf15dd4704badd9e07.
+
+NEXT after commit: NEW attention-first-writer-manifest.json, ONE NEW
+attention-norm-first-writer-probe, same120-pair matrix/gates; protocol tail.
+Both earlier kernel attempts and all model series remain terminal. No model
+start or subsequent GPU work prescribed. Freeze through audit; goal ongoing.
+
+### Previous checkpoint (2026-09-10): preserve source provenance for exact binary replay
 
 ONE attention-norm probe on14ec731c8 stopped before any numerical launch:
 the first combo kernel has the correct cache key/config but different cubin bytes.

@@ -26553,3 +26553,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   07856ad2966f91ea6ed33a3380c388ce48128c1b8c2f906413e3c6aee362abb5.
 - CPU196 passed16.40s,14 existing Torch deprecation warnings; lint/diff pass.
   Raw `runtime-control/attention-provenance-regression.log`.
+
+## 2026-09-10 - Resolve shared binary first-writer debug provenance before launches
+
+- Status: second kernel attempt terminal; full16-source CPU mapping passes.
+- Baseline: ONE9de50bbe3 provenance probe. Historical combo whole-cubin hash
+  passes; first split kernel fails it before numerical launch. Zero model/TPS
+  result. No numerical case was retried or accepted.
+- Cause: all ranks share split Triton keys; debug data belongs to the first
+  writer (rank1), not each rank's equivalent bound source. Closure compares38 ELF
+  sections: only.debug_line/.nv.merc.debug_line differ; all non-debug sections
+  and compiler metadata equal. PTX instructions match after ignoring filename
+  comments; initial literal-prefix audit failure retained.121 frozen receipts/
+  5172 original files verify; final GPU query empty.
+- Change: preparation now reads exact PTX .file1 identity, bounds cache path,
+  checks function text AND source line position, and freezes its source/PTX/cubin
+  digests. Keep original rank metadata/private filenames; no seeded/substituted
+  binaries or weakened byte/accuracy gates. All16 mappings pass on CPU; nine
+  split bindings refer to rank1's first-writer source.
+- Decision: NEW one-process first-writer probe after tests/commit, same120-pair
+  matrix. Both previous attempts remain stopped; no full-model job prescribed.
+- Raw: `runtime-control/attention-provenance-failure-analysis.json`, SHA
+  797a63dd7e137bd3a63dc55be1262fa849be1c1e0d622d896119587c55b6b018;
+  `runtime-control/attention-first-writer-discovery.json`, SHA
+  49ba4df5a3a83bcfcea30383ffcb9683b14a77bbb05f0cbf15dd4704badd9e07;
+  previous output `perf/results/2026-09-10/attention-norm-provenance-probe/`.
+- CPU198 passed16.59s,14 existing Torch deprecation warnings; lint/diff pass.
+  Raw `runtime-control/attention-first-writer-regression.log`.

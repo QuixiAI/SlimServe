@@ -14,6 +14,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -98,22 +99,56 @@ def load_checked(path, digest):
     return json.loads(path.read_text())
 
 
-def load_preserving_provenance(copied, original, kernel, name):
+def checked_debug_source(ptx_path, source_root):
+    """Resolve only the recorded binary's first-writer source, never search."""
+    matches = re.findall(
+        r'^\s*\.file\s+1\s+("[^"\n]+")\s*$', ptx_path.read_text(), re.M
+    )
+    require(len(matches) == 1, "one PTX primary source required")
+    source = Path(json.loads(matches[0]))
+    require(
+        source.is_absolute() and source.resolve().is_relative_to(source_root.resolve()),
+        "debug source outside recorded cache",
+    )
+    return source
+
+
+def matching_function_provenance(original_text, debug_text, kernel):
+    def extract(text):
+        functions = [
+            n
+            for n in ast.parse(text).body
+            if isinstance(n, ast.FunctionDef) and n.name == kernel
+        ]
+        require(len(functions) == 1, "one named provenance function required")
+        (function,) = functions
+        return function.lineno, ast.get_source_segment(text, function)
+
+    require(
+        extract(original_text) == extract(debug_text),
+        "debug source function/line differs",
+    )
+
+
+def load_preserving_provenance(copied, original, kernel, name, *, debug_source=None):
     """Keep code locations original but decorator/cache filenames private.
 
     Triton's cache key excludes the Python source path, while cubin debug
-    sections embed it. Importing the copy normally changes binary bytes even
-    when all executable sections match. Preserve the original code location;
+    sections embed it. Shared keys retain their first writer's debug filename,
+    which need not be the current rank's otherwise equivalent source. Preserve
+    that verified function/line location while retaining this rank's metadata;
     never seed/substitute a cubin, strip debug data, or write the original cache.
     """
     require(copied.resolve() != original.resolve(), "private copy required")
     source = copied.read_bytes()
     require(source == original.read_bytes(), "source copy differs from original")
+    debug_source = original if debug_source is None else debug_source
+    matching_function_provenance(source.decode(), debug_source.read_text(), kernel)
     spec = importlib.util.spec_from_file_location(name, copied)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     try:
-        exec(compile(source, str(original), "exec"), module.__dict__)
+        exec(compile(source, str(debug_source), "exec"), module.__dict__)
     except BaseException:
         del sys.modules[name]
         raise
@@ -224,6 +259,30 @@ def prepare(path):
         require(
             {r["info"]["widths"][0] for r in splits} == set(LAYOUTS), "missing shape"
         )
+    for record in records:
+        if record["arm"] == "combo":
+            source_root = original_root
+            binary_root = original_root / f"inductor_cache/triton/{record['rank']}"
+        else:
+            binary_root = Path(new["binary_cache_directory"])
+            source_root = RESULTS / "2026-09-10/deterministic-no-combo-serving/cache-a"
+        ptx = (
+            binary_root
+            / record["selected"]["hash"]
+            / (record["info"]["kernel"] + ".ptx")
+        )
+        debug_source = checked_debug_source(ptx, source_root)
+        matching_function_provenance(
+            Path(record["source"]).read_text(),
+            debug_source.read_text(),
+            record["info"]["kernel"],
+        )
+        record.update(
+            debug_source=str(debug_source),
+            debug_source_sha256=sha(debug_source),
+            ptx=str(ptx),
+            ptx_sha256=sha(ptx),
+        )
     sources = {
         str(ROOT / name): sha(ROOT / name)
         for name in (
@@ -248,6 +307,10 @@ def prepare(path):
         sources[str(receipt)] = sha(receipt)
     for row in inventory:
         sources[row["source"]] = row["source_sha256"]
+    for row in records:
+        sources[row["debug_source"]] = row["debug_source_sha256"]
+        sources[row["ptx"]] = row["ptx_sha256"]
+        sources[str(Path(row["ptx"]).with_suffix(".cubin"))] = row["cubin_sha256"]
     sources.update(
         {str(ROOT / name): digest for name, digest in new["native_sha256"].items()}
     )
@@ -478,6 +541,7 @@ def run(manifest_path, output):
                         Path(record["source"]),
                         record["info"]["kernel"],
                         f"attention_norm_{n}",
+                        debug_source=Path(record["debug_source"]),
                     )
                     saved = record["selected"]["config"]
                     config = triton.Config(

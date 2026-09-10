@@ -550,3 +550,40 @@ After exit, same module/manifest/output plus `--audit` in8GiB/no-swap scope
 stdout/stderr with pipefail/tee under runtime-control. No intervening edits,
 builds, commits or GPU jobs through audit. No further job or serving start is
 prescribed. Do not silently retry a failed numerical case or alter its gates.
+
+## Shared first-writer provenance (2026-09-10)
+
+The ONE9de50bbe3 provenance probe is TERMINAL, zero numerical launches. Original
+combo now matches full cubin bytes, then first split kernel fails the byte gate:
+its shared Triton cache entry was compiled first from rank1's equivalent source.
+The bound rank0 source path is not the binary's debug filename. No model result.
+Frozen CPU closure:121 receipts/5172 original files unchanged; all38 ELF sections
+compared, only.debug_line and.nv.merc.debug_line differ. All non-debug sections
+and metadata JSON equal. PTX instructions equal, with differing filename comments;
+the initial literal-prefix assertion/script/log remain preserved. GPU query empty.
+Audit: `runtime-control/attention-provenance-failure-analysis.json`, SHA
+797a63dd7e137bd3a63dc55be1262fa849be1c1e0d622d896119587c55b6b018.
+
+Resolve each binary's explicit PTX .file1 source in CPU preparation, not a cache
+search. Bound it to that original cache and verify exact function text/line
+position against the rank-bound source. Keep the latter's bytes and metadata;
+only compile-time debug filename comes from the recorded first writer. Hash the
+PTX, debug source, and original cubin as frozen inputs. ALL16 pass preparation;
+nine split aliases refer to rank1's first-writer source. CPU discovery manifest
+`runtime-control/attention-first-writer-discovery.json`, SHA
+49ba4df5a3a83bcfcea30383ffcb9683b14a77bbb05f0cbf15dd4704badd9e07.
+No weakened whole-cubin or numerical gates, source/body replacement, binary
+seeding, source-cache writes, or serving changes.
+
+After tests/commit, NEW fixed run (same120 pairs/gates/environment as above):
+
+- Prepare8GiB/swap0 scope `glm53-attention-first-writer-prepare`; same module,
+  `--prepare --manifest perf/results/2026-09-10/runtime-control/attention-first-writer-manifest.json`.
+- Exactly ONE16GiB/swap0 scope `glm53-attention-first-writer-probe`; same module
+  and new manifest, `--output perf/results/2026-09-10/attention-norm-first-writer-probe`.
+- After exit,8GiB/swap0 scope `glm53-attention-first-writer-audit`; same module,
+  manifest/output plus `--audit`; independently verify GPU release.
+
+Keep sources/native frozen through audit. Preserve pipefail/tee logs under
+runtime-control. Both earlier attempts stay terminal, not overwritten or resumed.
+No subsequent GPU/model job prescribed, no numerical or performance promotion.
