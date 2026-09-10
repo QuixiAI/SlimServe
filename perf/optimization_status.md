@@ -24143,3 +24143,17 @@ restart is the operator's call.
   ramp/drain); canaries pass; pool 3,082,532 tokens; no V1 fallback.
   Forced-eviction tier acceptance, WildChat leg and the 1M-context leg
   run next on this record. Raw: perf/results/2026-09-10/glm53f-final-spec/.
+- First tier acceptance on the speculative record FAILED (client timeout):
+  the DFlash2 drafter's five sliding-window layers form KV group 13
+  (SlidingWindowSpec, block 1152); the connector counted it as an
+  attention group, planned a restore into it, found no target block at
+  position 1 (null outside the 2048-token window), dropped the plan and
+  left the request in WAITING_FOR_REMOTE_KVS forever (1 hit, 0 restores,
+  3 tail saves; the churn never got past the build phase). Two fixes
+  (640a9a3d0, 49 tier tests): window-only groups beside mamba state leave
+  the tier-managed set and are zeroed with the final restore chunk (the
+  drafter rebuilds its window from the taps; only acceptance is affected,
+  drafts are verified), and an unstageable restore now fails closed -
+  the promised GPU blocks are reported as failed loads through the
+  worker (invalid_block_ids) and the request is released to recompute.
+  The acceptance reruns after the WildChat leg, ahead of the 1M leg.
