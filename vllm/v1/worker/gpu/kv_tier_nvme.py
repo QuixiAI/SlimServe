@@ -57,7 +57,12 @@ _VERIFY_ROWS = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 def _row_digest(buf) -> str:
     import hashlib
 
-    return hashlib.sha1(bytes(buf)).hexdigest()[:12]  # same digest as kv_tier_dma._digest
+    # The caller pins the slot until verification/IO completion. Hash the
+    # stable contiguous buffer directly instead of allocating and copying a
+    # multi-MiB slab row. Preserve logical C-order bytes for strided callers.
+    view = memoryview(buf)
+    data = view if view.c_contiguous else view.tobytes()
+    return hashlib.sha1(data).hexdigest()[:12]
 
 
 class NvmeTierFile:

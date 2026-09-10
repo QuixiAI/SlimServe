@@ -461,7 +461,10 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         else:
             self._dma: KVTierDMA | None = None
             self._pending_restore_reqs: dict[int, str] = {}
-            self._seq = 1 << 20
+            # Scheduler offloads/write-throughs are positive. Worker restores
+            # count down from zero, so long-lived engines cannot overlap the
+            # namespaces (a finite positive offset eventually collides).
+            self._seq = 0
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         self._block_pool = gpu_block_pool
@@ -1237,7 +1240,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 TierOpBatch(seq=seq, offload=[], restore=[], disk_writes=dops)
             )
         for req_id, ops in meta.restores.items():
-            self._seq += 1
+            self._seq -= 1
             self._pending_restore_reqs[self._seq] = req_id
             zero = meta.zeros.get(req_id, [])
             reads = meta.disk_reads.get(req_id, [])

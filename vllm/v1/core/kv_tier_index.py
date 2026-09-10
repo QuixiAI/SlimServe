@@ -285,6 +285,15 @@ class HostKVTierIndex:
     # ------------------------------------------------------------------ write
 
     def _alloc_slot(self, protect: str) -> int | None:
+        # These collections contain unique IDs within this host arena. If
+        # either covers every slot, no trajectory can release a host slot.
+        # Read the live collections: a completion must immediately enable
+        # the normal reclamation path again, without invalidating a cache.
+        if not self._free and (
+            len(self._host_busy) == self.num_slots
+            or len(self._pending_write) == self.num_slots
+        ):
+            return None
         if not self._free and not self._reclaim(protect):
             return None
         slot = self._free.pop()
@@ -649,7 +658,7 @@ class HostKVTierIndex:
             for gid, d in traj.disk_tail_slots.items():
                 s = self._alloc_slot(owner)
                 if s is None:
-                    self._rollback_promotion(traj, new_slots + list(tail.values()))
+                    self._rollback_promotion(traj, new_slots)
                     return None
                 tail[gid] = s
                 new_slots.append(s)
@@ -734,22 +743,34 @@ class HostKVTierIndex:
                 )
                 best_owner = owner
                 continue
-            n = traj.resumable_blocks(
-                self.due,
-                self._disk_pending,
-                self._main_pending if self.require_main else None,
-            )
+            # Hybrid resumability is exactly tail_boundary or zero. Reject
+            # unrelated chains before walking all their host/disk/main pages.
+            # Positive matches still pass the unchanged readiness checks.
+            n = traj.tail_boundary
             if n <= 0 or n > len(hashes):
                 continue
             if best is not None and n <= best[1]:
+                continue
+            if not traj.hashes or traj.hashes[0] != hashes[0]:
+                continue
+            if not traj._tail_available(self._disk_pending):
+                continue
+            if traj.hashes[:n] != hashes[:n]:
+                continue
+            if (
+                traj.resumable_blocks(
+                    self.due,
+                    self._disk_pending,
+                    self._main_pending if self.require_main else None,
+                )
+                != n
+            ):
                 continue
             if any(
                 s in self._pending_write
                 for d in traj.attn_slots[:n]
                 for s in d.values()
             ):
-                continue
-            if traj.hashes[:n] != hashes[:n]:
                 continue
             tail = {} if traj.tail_pending else dict(traj.tail_state_slots)
             best = (
@@ -814,8 +835,16 @@ class HostKVTierIndex:
         return traj.host_slots()
 
     def _busy(self, traj: Trajectory) -> bool:
+        # Do not materialize every slot before checking the first one. Cached
+        # prefix admission can attempt thousands of reservations while disk
+        # write-through protects the entire host tier.
         return any(
-            s in self._pending_write or s in self._host_busy for s in traj.host_slots()
+            s in self._pending_write or s in self._host_busy
+            for blocks in traj.attn_slots
+            for s in blocks.values()
+        ) or any(
+            s in self._pending_write or s in self._host_busy
+            for s in traj.tail_state_slots.values()
         )
 
     def _delete(self, owner: str, traj: Trajectory) -> None:
@@ -836,6 +865,11 @@ class HostKVTierIndex:
             if owner == protect or owner in self._promotions:
                 continue
             traj = self._trajectories[owner]
+            # Demoted trajectories keep their position-indexed empty dicts.
+            # Their host slot list is empty; test this in C before walking
+            # those dicts in Python or constructing temporary slot lists.
+            if not traj.tail_state_slots and not any(traj.attn_slots):
+                continue
             if self._busy(traj) or self._main_busy(traj):
                 continue
             host = traj.host_slots()

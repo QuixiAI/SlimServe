@@ -25,7 +25,7 @@ class GateLinear(ReplicatedLinear):
     4. fp32 specialized kernel  (SM90+, bf16/fp32 in, fp32 out, M<=32,
        (H, E) in {(3072, 256), (6144, 128), (6144, 256)})
     5. experimental bf16x3 CuteDSL kernel (opt-in, SM100, bf16 in, fp32 weight)
-    6. cuBLAS bf16×bf16→fp32 (SM90+ + bf16 weight + fp32 out_dtype)
+    6. cuBLAS bf16×bf16→fp32 (SM90+, or GLM-5.3-Flash SM80 shape)
     7. F.linear via ReplicatedLinear (ultimate fallback)
 
     The ``out_dtype`` attribute is mutable and can be set after init
@@ -89,6 +89,16 @@ class GateLinear(ReplicatedLinear):
         self.allow_dsv4_ampere_router_gemm = (
             self._dsv4_ampere_router_shape and out_dtype == torch.float32
         )
+        # GLM-5.3-Flash requires FP32 router logits. Ampere supports cuBLAS
+        # BF16 inputs with FP32 output; rounding to BF16 and then casting
+        # back loses information (and adds a copy) before expert selection.
+        self._glm5_next_ampere_router_shape = (
+            not bias
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0))
+            and input_size == 4096
+            and output_size == 288
+        )
 
         # DSV3 specialized kernel eligibility (SM90+, exact dims)
         self.allow_specialized_router_gemm = can_use_specialized_kernels
@@ -129,7 +139,7 @@ class GateLinear(ReplicatedLinear):
 
         # cuBLAS bf16→fp32 eligibility
         self.allow_cublas_router_gemm = (
-            self.allow_specialized_router_gemm
+            (self.allow_specialized_router_gemm or self._glm5_next_ampere_router_shape)
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
@@ -164,7 +174,10 @@ class GateLinear(ReplicatedLinear):
 
         if (
             not self.allow_cublas_router_gemm
-            and self.allow_specialized_router_gemm
+            and (
+                self.allow_specialized_router_gemm
+                or self._glm5_next_ampere_router_shape
+            )
             and out_dtype == torch.float32
         ):
             self.allow_cublas_router_gemm = self.weight.dtype == torch.bfloat16

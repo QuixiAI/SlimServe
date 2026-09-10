@@ -35,7 +35,8 @@ def _spin(dma, cond, timeout=30.0):
         time.sleep(0.002)
 
 
-def test_write_through_then_promote_restores_bytes(tmp_path):
+@pytest.mark.parametrize("restore_seq", [3, -1, -(1 << 40)])
+def test_write_through_then_promote_restores_bytes(tmp_path, restore_seq):
     backing, dma = _dma(tmp_path)
     try:
         blocks = backing.view(-1, STRIDE)
@@ -54,7 +55,11 @@ def test_write_through_then_promote_restores_bytes(tmp_path):
         blocks[5].zero_()
         dma.issue(
             TierOpBatch(
-                seq=3, offload=[], restore=[(9, 5, 0)], disk_reads=[(11, 9)], req_id="r"
+                seq=restore_seq,
+                offload=[],
+                restore=[(9, 5, 0)],
+                disk_reads=[(11, 9)],
+                req_id="r",
             )
         )
         # Not issued to the copy stream until the read lands.
@@ -62,7 +67,7 @@ def test_write_through_then_promote_restores_bytes(tmp_path):
         _spin(dma, lambda: not dma._deferred)
         dma.fence_restores()
         torch.cuda.synchronize()
-        assert dma.flush() == [3]
+        assert dma.flush() == [restore_seq]
         assert torch.equal(blocks[5], src)
         assert dma.take_invalid_blocks() == set()
     finally:
@@ -102,6 +107,45 @@ def test_later_restore_of_same_request_waits_for_reads(tmp_path):
         dma.release()
 
 
+@pytest.mark.parametrize("failed_slot", [11, 12])
+def test_failed_write_is_not_acknowledged_when_later_writes_succeed(
+    tmp_path, monkeypatch, failed_slot
+):
+    device = torch.device("cuda")
+    backing = torch.zeros(BLOCKS * STRIDE, dtype=torch.int8, device=device)
+    # One real IO thread makes the completion order deterministic: the last
+    # write succeeds after a preceding write has failed.
+    disk = NvmeTierFile(str(tmp_path), DISK, padded_stride(STRIDE), threads=1)
+    dma = KVTierDMA(backing, STRIDE, SLOTS, device, disk=disk)
+    transfer = disk._transfer
+
+    def inject_failure(op):
+        if op.write and op.disk_slot == failed_slot:
+            raise OSError("injected disk write failure")
+        transfer(op)
+
+    monkeypatch.setattr(disk, "_transfer", inject_failure)
+    try:
+        backing.view(BLOCKS, STRIDE)[2].fill_(17)
+        dma.issue(TierOpBatch(seq=1, offload=[(2, 7, 0)], restore=[]))
+        dma.issue(TierOpBatch(seq=2, offload=[], restore=[],
+                             disk_writes=[(7, 11), (7, 12), (7, 13)]))
+        _spin(dma, lambda: not dma._disk_ops)
+        assert dma.take_disk_done() == []
+        # A different, entirely successful batch is still acknowledged and
+        # its disk bytes restore faithfully through the real DMA path.
+        dma.issue(TierOpBatch(seq=3, offload=[], restore=[], disk_writes=[(7, 14)]))
+        _spin(dma, lambda: not dma._disk_ops)
+        assert dma.take_disk_done() == [3]
+        dma.issue(TierOpBatch(seq=-1, offload=[], restore=[(8, 3, 0)],
+                             disk_reads=[(14, 8)], req_id="successful-read"))
+        dma.flush()
+        assert torch.equal(backing.view(BLOCKS, STRIDE)[2],
+                           backing.view(BLOCKS, STRIDE)[3])
+    finally:
+        dma.release()
+
+
 def test_failed_read_reports_invalid_blocks(tmp_path):
     backing, dma = _dma(tmp_path)
     try:
@@ -121,7 +165,8 @@ def test_failed_read_reports_invalid_blocks(tmp_path):
         dma.release()
 
 
-def test_verify_digest_survives_promotion(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restore_seq", [3, -1])
+def test_verify_digest_survives_promotion(tmp_path, monkeypatch, restore_seq):
     """VLLM_KV_TIER_VERIFY: a promoted row (fresh host slot, bytes read
     back from disk) must be checked against the ORIGINAL offload digest -
     carried by the write-through's IO-time hash - so a faithful disk tier
@@ -150,11 +195,15 @@ def test_verify_digest_survives_promotion(tmp_path, monkeypatch):
         blocks[5].zero_()
         dma.issue(
             TierOpBatch(
-                seq=3, offload=[], restore=[(9, 5, 0)], disk_reads=[(11, 9)], req_id="r"
+                seq=restore_seq,
+                offload=[],
+                restore=[(9, 5, 0)],
+                disk_reads=[(11, 9)],
+                req_id="r",
             )
         )
         done = []
-        _spin(dma, lambda: (done.extend(dma.poll_done()) or 3 in done))
+        _spin(dma, lambda: (done.extend(dma.poll_done()) or restore_seq in done))
         assert dma._slot_digests[9] == original, "promoted row lost its digest"
         assert torch.equal(blocks[5][:live].cpu(), src[:live].cpu())
     finally:

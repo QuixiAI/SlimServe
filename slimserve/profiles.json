@@ -1183,9 +1183,10 @@
         "local_dir": "GLM-5.3-Flash-NVFP4",
         "engine": {
           "method": "mtp",
-          "num_speculative_tokens": 1
+          "num_speculative_tokens": 1,
+          "attention_backend": "QUIXICORE_MLA_SPARSE"
         },
-        "note": "The checkpoint ships a one-layer MTP head (layer 45: DSA attention + MoE, eh_proj/enorm/hnorm). The glm5_next MTP draft path is not ported yet; profiles stay non-speculative until it is."
+        "note": "The checkpoint ships a one-layer MTP head (layer 45: ordinary residual NoPE pooled MLA + block-128 FP8 MoE, eh_proj/enorm/hnorm). Experimental --spec adapter: TP4 k=1 passes short canaries/exact-token checks but regresses c8/c16 throughput by about 3%; c1 is inconclusive. No TP8 or long-workload MTP qualification. Profiles stay non-speculative by default; see the 2026-09-09 performance notebook."
       },
       "quants": {
         "NVFP4": {
@@ -2888,7 +2889,7 @@
             "enable_expert_parallel": false,
             "max_num_seqs": 16,
             "block_size": 64,
-            "gpu_memory_utilization": 0.85,
+            "gpu_memory_utilization": 0.9,
             "kv_cache_dtype": "auto",
             "attention_config": {
               "backend": "QUIXICORE_MLA_SPARSE",
@@ -2923,7 +2924,7 @@
           },
           "env": {},
           "notes": [
-            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "Context comes from config.json (max_position_embeddings 1048576); main-model KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size). Utilization raised from 0.85 to 0.90 on 2026-09-09 for opt-in checkpoint MTP: its extra MLA/indexer groups require 18.12 GiB at full context versus 17.38 GiB available at 0.85. Full-context MTP serving validation is pending; do not reduce context to disguise a capacity failure.",
             "enable_expert_parallel is off by measurement: with 288 experts at moe_intermediate 2048 the TP shard (512/rank) stays aligned to the NVFP4 group-16 scales, and the expert-parallel arm measured 4-6% slower at c1 and c8 on the optimized path (exact-token, perf/results/2026-09-01/glm53-ep-ab-opt/).",
             "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
             "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",
@@ -2948,6 +2949,17 @@
           "default_quant": "NVFP4",
           "engine": {
             "tensor_parallel_size": 8,
+            "additional_config": {
+              "glm5_next_compact_indexer_cache": true,
+              "glm5_next_shared_indexer_scratch": true,
+              "glm5_next_singleton_marlin_alignment": true,
+              "glm5_next_mhc_projection_overlap": true,
+              "glm5_next_mhc_router_projection_overlap": false,
+              "glm5_next_singleton_pool_update": true,
+              "glm5_next_adaptive_pool_score": false,
+              "glm5_next_sparse_tc_decode": true,
+              "glm5_next_indexer_row_shard": true
+            },
             "enable_expert_parallel": false,
             "max_num_seqs": 64,
             "block_size": 64,
@@ -2986,7 +2998,8 @@
           },
           "env": {},
           "notes": [
-            "Context comes from config.json (max_position_embeddings 1048576); KV is ~17 KiB/token per rank (11 NoPE-MLA layers at 512 bf16 + 11 pooled-indexer rows at 256 bf16, KDA state is fixed-size), so the model default fits the pool at utilization 0.85.",
+            "Context comes from config.json (max_position_embeddings 1048576). Main NoPE-MLA KV stays BF16. The compact pooled indexer stores completed BF16 pools plus a page-owned raw tail ring: logical rows are 64 BF16 values instead of the historical raw 256. Together with model-owned shared decode-logits scratch, the measured TP8 pool is 4278924 tokens at 50.72 GiB KV per rank (2026-09-09), enough for 4.08 resident maximum-length contexts.",
+            "Current compact TP8 page geometry is MLA 576 tokens and indexer 4608 tokens, ratio8; the September 3 tier notes below describe the historical raw indexer ratio2. Compact-only validation passed 633 long-workload turns, 100/100 recall probes up to 530222 context, and six real disk/host restores with 6600 per-rank operations in aggregate and zero reported mismatches. Shared scratch reclaims 640 MiB/rank and passes replay, text/image/tool canaries and exact-token serving checks; throughput is effectively unchanged. Full 1M-context and subsequent combined-change long qualification remain open.",
             "Parallelism is by measurement on the 8x A100 matrix (exact-token, perf/results/2026-09-02/glm53-8gpu-matrix/): TP8 83.0 / 343.7 / 447.7 tok/s at c1 / c8 / c16; TP8+EP 75.3 / 331.1 / 430.8; TP4xDP2 67.2 / 382.8 / 527.6; TP4xDP2+EP 51.3 / 317.0 / 480.1; TP4 on four GPUs 73.6 / 282.6 / 369.9. TP8 wins single-stream latency and keeps one prefix cache and one KV pool for agentic traffic; DP2's c8/c16 lead is the TP8 per-rank fixed cost (8-rank allreduce, replicated mHC and indexer) still to be fused away. The record runs TP8, experts sharded.",
             "attention_config backend is explicit: the Ampere MLA priority list carries no dense MLA by design, and the DSA layers must run sparse (index_topk 2048 over 4-token pools) through QUIXICORE_MLA_SPARSE's NoPE (512-wide) kernel; sparse_mla_force_mqa keeps prefill on the same top-k MQA path.",
             "block_size 64 is required by the pooled-indexer cache backend (DSV3.2 indexer metadata, kernel block 64).",

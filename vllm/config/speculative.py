@@ -36,6 +36,7 @@ logger = init_logger(__name__)
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
+    "glm5_next_mtp",
     "mimo_mtp",
     "glm4_moe_mtp",
     "glm4_moe_lite_mtp",
@@ -347,8 +348,26 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        initial_architecture = hf_config.architectures[0]
+        initial_architecture = (hf_config.architectures or [None])[0]
         text_config = getattr(hf_config, "text_config", None)
+        if hf_config.model_type == "glm5_next":
+            # Flatten the VLM for the text-only drafter without losing the
+            # root checkpoint's NVFP4 quantization metadata.
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            hf_config = copy.deepcopy(text_config)
+            if quantization_config is not None:
+                hf_config.quantization_config = copy.deepcopy(quantization_config)
+        if hf_config.model_type in ("glm5_next_text", "glm5_next_mtp"):
+            hf_config.model_type = "glm5_next_mtp"
+            hf_config.update(
+                {
+                    "n_predict": hf_config.num_nextn_predict_layers,
+                    "architectures": ["Glm5NextMTPModel"],
+                    # Validate GLM's pooled-tail state before enabling the
+                    # ordinary DeepSeek cross-draft index-sharing optimization.
+                    "index_share_for_mtp_iteration": False,
+                }
+            )
         if (
             hf_config.model_type == "glm5v"
             and getattr(text_config, "model_type", None) == "glm_moe_dsa"
@@ -1352,6 +1371,14 @@ class SpeculativeConfig:
             and self.draft_model_config is not None
             and getattr(self.draft_model_config.hf_config, "model_type", None)
             == "qwen4_exp_mtp"
+        )
+
+    def use_glm5_next_mtp(self) -> bool:
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "glm5_next_mtp"
         )
 
     def use_eagle(self) -> bool:

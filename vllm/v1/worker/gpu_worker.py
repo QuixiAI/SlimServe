@@ -979,6 +979,12 @@ class Worker(WorkerBase):
 
         self.profiler.step()
 
+        # step() owns delayed starts and automatic iteration limits. A stopped
+        # profiler object stays attached to the worker; do not keep building
+        # request metadata or record_function ranges after recording ends.
+        if not self.profiler.is_running:
+            return nullcontext()
+
         iteration_details = compute_iteration_details(scheduler_output)
 
         if self.vllm_config.profiler_config.detailed_trace_annotation:

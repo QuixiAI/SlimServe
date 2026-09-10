@@ -27,7 +27,7 @@ from typing import ClassVar
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
@@ -60,6 +60,33 @@ def _page_stride_bytes(kv_cache: torch.Tensor) -> int:
 
 _BF16_PARTITION = 128
 _BF16_PARTITION_SCRATCH_CAP = 512 << 20  # bytes of fp32 partials
+
+
+def _sparse_tc_option(config, heads):
+    """Compiler-hashed explicit opt-in; other profiles keep native dispatch."""
+    enabled = (config.additional_config or {}).get("glm5_next_sparse_tc_decode", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_sparse_tc_decode must be a boolean")
+    if enabled:
+        from vllm.platforms import current_platform
+
+        if not (current_platform.is_cuda()
+                and current_platform.is_device_capability((8, 0))):
+            raise ValueError("Sparse tensor-core decode is qualified only on SM80")
+        if heads != 8 or config.speculative_config is not None:
+            raise ValueError("Sparse tensor-core decode requires 8 heads and no speculation")
+    return enabled
+
+
+def _sparse_tc_split(enabled, q, cache, metadata):
+    # Shape/metadata decisions are CPU-only and stable under CUDA graph replay.
+    # Prefill and unqualified shapes retain the native bounded-scratch path.
+    if (enabled and metadata.num_prefills == 0 and 0 < q.shape[0] <= 32
+            and q.shape[1:] == (8, 512)
+            and q.dtype == cache.dtype == torch.bfloat16
+            and cache.shape[-1] == 512):
+        return 32 if q.shape[0] < 8 else 128
+    return 0
 
 
 def _bf16_partition(q: torch.Tensor, idx: torch.Tensor) -> int:
@@ -315,6 +342,7 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = float(scale)
+        self._sparse_tc_decode = _sparse_tc_option(get_current_vllm_config(), num_heads)
         # Host copy of layer._k_scale. Reading it per call would be a D2H sync,
         # which CUDA graph capture rejects; the scale is fixed once weights are
         # loaded, so it is cached on first use during eager warmup.
@@ -391,6 +419,16 @@ class QuixiCoreMLASparseImpl(MLAAttentionImpl[QuixiCoreMLASparseMetadata]):
 
         if kv_c_and_k_pe_cache.dtype == torch.bfloat16:
             if q.shape[-1] == 512:
+                tc_split = _sparse_tc_split(
+                    self._sparse_tc_decode, q, kv_c_and_k_pe_cache, attn_metadata
+                )
+                if tc_split:
+                    from vllm.quixicore.sparse_mla_tc import sparse_tc_nope
+
+                    return sparse_tc_nope(
+                        q, kv_c_and_k_pe_cache, bt, idx, tlen,
+                        self.softmax_scale, split=tc_split,
+                    ), None
                 # NoPE MLA (glm5_next): no rope segment, 512-wide latents.
                 # Partitioned (128 -> 17 partitions at the 2080-wide list):
                 # the one-warp-per-(head, token) walk was 155 ms/token at

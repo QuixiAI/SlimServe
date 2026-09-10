@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    MLAAttentionSpec,
 )
 
 BLOCK = 16
@@ -84,16 +85,23 @@ def make_groups():
     return [attn, ring, *mamba]
 
 
-def make_connector():
+def make_connector(indexer_ratio=None):
     vllm_config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=8),  # deliberately stale
         kv_transfer_config=SimpleNamespace(
             kv_connector_extra_config={"host_tier_gb_per_rank": 1.0}
         ),
     )
-    kv_cache_config = SimpleNamespace(
-        kv_cache_groups=make_groups(), kv_cache_tensors=[]
-    )
+    groups = make_groups()
+    if indexer_ratio is not None:
+        groups.append(SimpleNamespace(
+            kv_cache_spec=MLAAttentionSpec(
+                block_size=BLOCK * indexer_ratio, num_kv_heads=1,
+                head_size=16 // indexer_ratio, dtype=torch.bfloat16,
+            ),
+            layer_names=["indexer"],
+        ))
+    kv_cache_config = SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=[])
     with (
         patch(
             "vllm.distributed.kv_transfer.kv_connector.v1.host_tier_connector."
@@ -145,7 +153,7 @@ def make_connector():
 
     conn.bind_gpu_block_pool(FakePool())
     assert conn.hash_block_size == BLOCK  # from the attn spec, not config
-    assert conn.attn_groups == [0]
+    assert conn.attn_groups == ([0] if indexer_ratio is None else [0, 4])
     assert conn.state_groups == [2, 3]  # mamba only
     assert conn.ring_groups == [1]
     return conn

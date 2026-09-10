@@ -99,6 +99,36 @@ def test_every_profile_source_names_a_blessed_dspark_download():
         )
 
 
+def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
+    plan = resolve("glm53f-nvfp4-4", "a100", 4, "NVFP4")
+    assert not plan.speculative
+    monkeypatch.setattr(
+        cli.hardware,
+        "detect",
+        Mock(
+            return_value=Mock(
+                known=True, platform="a100", count=4,
+                memory_bytes=0, device_name="A100",
+            )
+        ),
+    )
+    monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=plan))
+    monkeypatch.setattr(cli.fetch, "ensure", Mock())
+    seen = []
+    monkeypatch.setattr(cli, "_chat", lambda resolved, *_: seen.append(resolved) or 0)
+    assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
+    assert len(seen) == 1 and seen[0].speculative
+    config = engine_kwargs(seen[0])["speculative_config"]
+    assert config["method"] == "mtp" and config["num_speculative_tokens"] == 1
+    assert config["attention_backend"] == "QUIXICORE_MLA_SPARSE"
+    assert not plan.speculative
+
+
+def test_spec_cli_flags_are_mutually_exclusive():
+    with pytest.raises(SystemExit):
+        cli._parser().parse_args(["--spec", "--no-spec"])
+
+
 def test_every_source_declares_its_live_smoke_modalities():
     sources = registry._registry()["sources"]
     assert sources["glm52-vision"]["modalities"] == ["text", "image"]

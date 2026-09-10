@@ -9,6 +9,7 @@ import torch
 
 import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation,
@@ -24,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     batched_moe_align_block_size,
     moe_align_block_size,
+)
+from vllm.model_executor.layers.fused_moe.singleton_alignment import (
+    SingletonAlignment,
+    make_singleton_alignment,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
@@ -256,6 +261,7 @@ def fused_marlin_moe(
     clamp_limit: float | None = None,
     gemm1_alpha: float = 1.0,
     gemm1_beta: float = 0.0,
+    singleton_alignment: SingletonAlignment | None = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -328,13 +334,24 @@ def fused_marlin_moe(
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
 
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        block_size_m,
-        global_num_experts,
-        expert_map,
-        ignore_invalid_experts=True,
-    )
+    if (
+        hidden_states.shape[0] == 1
+        and expert_map is None
+        and global_num_experts == E
+        and singleton_alignment is not None
+        and singleton_alignment.compatible(topk_ids, block_size_m)
+    ):
+        sorted_token_ids, expert_ids, num_tokens_post_padded = singleton_alignment.get(
+            topk_ids
+        )
+    else:
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            expert_map,
+            ignore_invalid_experts=True,
+        )
 
     assert activation is not None
     moe_output = _fused_marlin_moe(
@@ -605,6 +622,16 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+        vllm_config = get_current_vllm_config_or_none()
+        extra = vllm_config.additional_config if vllm_config is not None else {}
+        self._singleton_alignment = make_singleton_alignment(
+            moe_config,
+            quant_config,
+            extra,
+            self.input_dtype,
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((8, 0)),
+        )
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -809,6 +836,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 clamp_limit=self.gemm1_clamp_limit,
                 gemm1_alpha=self.gemm1_alpha,
                 gemm1_beta=self.gemm1_beta,
+                singleton_alignment=self._singleton_alignment,
             )
             return
 

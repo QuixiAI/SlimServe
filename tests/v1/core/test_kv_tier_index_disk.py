@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """HostKVTierIndex NVMe tier: write-through, demotion, promotion, reclaim."""
 
+import pytest
+
 from vllm.v1.core.kv_tier_index import HostKVTierIndex
 
 
@@ -8,7 +10,7 @@ def h(i: int) -> bytes:
     return i.to_bytes(8, "little")
 
 
-def build(idx, owner, n, base=0, through=True):
+def build(idx, owner, n, base=0, through=True, tail_groups=2):
     """Stage n attention blocks + a 2-group tail, confirm host writes, and
     (optionally) run the write-through to completion."""
     slots = []
@@ -16,7 +18,7 @@ def build(idx, owner, n, base=0, through=True):
         s = idx.stage_attention(owner, i, h(base + i))
         assert s is not None
         slots.append(s)
-    st = idx.stage_tail_states(owner, n, 2, boundary_hash=h(base + n - 1))
+    st = idx.stage_tail_states(owner, n, tail_groups, boundary_hash=h(base + n - 1))
     assert st is not None
     host = slots + list(st.values())
     idx.confirm_writes(host)
@@ -117,6 +119,49 @@ def test_disk_pressure_reclaims_coldest_disk_copies():
     # "a" is still host-resident and resumable; it just has no disk copy.
     hit = idx.lookup([h(0), h(1), h(2), h(3)])
     assert hit is not None and hit[0] == "a" and not idx.needs_promotion(hit)
+
+
+@pytest.mark.parametrize(
+    "attention_pages,tail_groups,busy_pages",
+    [(3, 2, 1), (8, 4, 1), (8, 4, 2), (8, 4, 3)],
+)
+def test_partial_tail_promotion_rollback_releases_each_slot_once(
+    attention_pages, tail_groups, busy_pages
+):
+    """Failure after the first tail allocation must not alias future pages.
+
+    Attention pages and tail-state pages initially fill the host arena.
+    Demoting that trajectory and reserving busy pages leaves room for all
+    attention pages and only part of the tail during promotion. Include
+    the four independent tail-state groups used by the TP8 GLM profile.
+    """
+    capacity = attention_pages + tail_groups
+    idx = HostKVTierIndex(num_slots=capacity, num_disk_slots=64)
+    build(idx, "a", attention_pages, tail_groups=tail_groups)
+    busy = {idx.stage_attention("b", i, h(100 + i)) for i in range(busy_pages)}
+    assert None not in busy and len(busy) == busy_pages
+    before = set(idx._free)
+    assert len(before) == capacity - busy_pages
+    hashes = [h(i) for i in range(attention_pages + 1)]
+    hit = idx.lookup(hashes)
+    assert hit is not None and idx.needs_promotion(hit)
+
+    assert idx.promote(hit[0], hit[1]) is None
+
+    assert len(idx._free) == len(set(idx._free)), "rollback freed a slot twice"
+    assert set(idx._free) == before
+    assert idx._pending_write == busy
+    assert idx._trajectories["a"].tail_state_slots == {}
+    assert all(not slots for slots in idx._trajectories["a"].attn_slots)
+    retry_hit = idx.lookup(hashes)
+    assert retry_hit is not None and idx.needs_promotion(retry_hit)
+    allocated = [
+        idx.stage_attention("b", i, h(100 + i)) for i in range(busy_pages, capacity)
+    ]
+    assert None not in allocated
+    assert set(allocated) == before
+    assert len(set(allocated)) == len(allocated)
+    assert idx.stage_attention("b", capacity, h(100 + capacity)) is None
 
 
 def test_disk_only_trajectory_dies_when_its_disk_is_reclaimed():

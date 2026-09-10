@@ -35,11 +35,20 @@ from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.glm5_next_indexer_workspace import (
+    Glm5NextIndexerWorkspace,
+)
+from vllm.model_executor.layers.glm5_next_pool_cache import (
+    POOL_CACHE_HEAD_DIM,
+    cached_pool_logits,
+    update_pool_cache,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, MultipleOf
@@ -57,6 +66,68 @@ _ROW_DIM = 2 * _K_DIM  # [k | gate]
 _POOL_PROGRAMS = 128  # programs per row on the pool axis (stride loop inside)
 
 
+def _compact_decode_options(vllm_config, heads):
+    extra = vllm_config.additional_config or {}
+    flags = []
+    for key in ("glm5_next_adaptive_pool_score", "glm5_next_singleton_pool_update"):
+        enabled = extra.get(key, False)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{key} must be a boolean")
+        if enabled and not extra.get("glm5_next_compact_indexer_cache", False):
+            raise ValueError(f"{key} requires compact indexer cache")
+        flags.append(enabled)
+    if flags[0] and heads != 32:
+        raise ValueError("Adaptive GLM pool scoring requires 32 heads")
+    return tuple(flags)
+
+
+def _row_shard_option(vllm_config, heads):
+    extra = vllm_config.additional_config or {}
+    enabled = extra.get("glm5_next_indexer_row_shard", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_indexer_row_shard must be a boolean")
+    if not enabled:
+        return False
+    parallel = vllm_config.parallel_config
+    if (
+        not current_platform.is_cuda()
+        or not current_platform.is_device_capability((8, 0))
+        or heads != 32
+        or parallel.tensor_parallel_size != 8
+        or parallel.data_parallel_size != 1
+        or parallel.pipeline_parallel_size != 1
+        or vllm_config.speculative_config is not None
+        or not extra.get("glm5_next_compact_indexer_cache", False)
+    ):
+        raise ValueError(
+            "Indexer row sharding requires SM80, TP8/DP1/PP1, 32 indexer heads, "
+            "compact cache and no speculation"
+        )
+    return True
+
+
+def _row_shard_dispatch(enabled, rows, num_prefills, next_n):
+    # Capture-stable shape policy. Do NOT inspect context length here: a
+    # Python branch would be frozen at capture, not reevaluated on replay.
+    return enabled and rows in (16, 32) and num_prefills == 0 and next_n == 1
+
+
+def _cache_row_dim(vllm_config: VllmConfig, kp: int) -> int:
+    extra = vllm_config.additional_config
+    enabled = extra.get("glm5_next_compact_indexer_cache", False) if isinstance(extra, dict) else False
+    if not isinstance(enabled, bool):
+        raise ValueError("glm5_next_compact_indexer_cache must be a boolean")
+    if not enabled:
+        return _ROW_DIM
+    if not (current_platform.is_cuda() and current_platform.is_device_capability((8, 0))):
+        raise ValueError("Compact GLM indexer cache is currently qualified only on SM80")
+    num_spec = (vllm_config.speculative_config.num_speculative_tokens
+                if vllm_config.speculative_config else 0)
+    if kp != 4 or num_spec > 5:
+        raise ValueError("Compact GLM indexer cache requires kpool=4 and at most five speculative tokens")
+    return POOL_CACHE_HEAD_DIM
+
+
 class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
     """DSV3.2 indexer metadata (slot mapping, prefill chunks, decode block
     tables) over a 256-wide bf16 row instead of the fp8 128+scale row."""
@@ -67,7 +138,7 @@ class Glm5NextIndexerBackend(DeepseekV32IndexerBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
-        return [_ROW_DIM]
+        return [_ROW_DIM, POOL_CACHE_HEAD_DIM]
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
@@ -251,7 +322,20 @@ def _expand_topk_kernel(
 # --------------------------------------------------------------------- core op
 
 
-def _pooled_select(
+def _prefill_query_requests(chunk) -> torch.Tensor:
+    # token_to_seq maps the gathered KV span, not the current query span.
+    # With cached prefixes (or a sliced query chunk), its first R entries
+    # need not belong to the R queries. Each query's cu_seqlen_ks identifies
+    # its request's start in that KV span, so gather the map at those starts.
+    # No device-to-host readback; int32 index_select preserves the row dtype.
+    assert (chunk.local_cu_seq_lens is None
+            or chunk.local_cu_seq_lens is chunk.cu_seq_lens), (
+        "GLM pooled prefill query mapping requires unsharded KV row bounds"
+    )
+    return torch.index_select(chunk.token_to_seq, 0, chunk.cu_seqlen_ks)
+
+
+def _pooled_topk(
     q: torch.Tensor,           # [R, H, D] bf16
     weights: torch.Tensor,     # [R, H] fp32
     ape: torch.Tensor,         # [KP, D] fp32
@@ -264,21 +348,29 @@ def _pooled_select(
     block_size: int,
     softmax_scale: float,
     ksel: int,
-    topk_out: torch.Tensor,    # [R, OUT_W] int32
     kp: int,
-) -> None:
+    adaptive_score: bool = False,
+) -> torch.Tensor:
     R, H, D = q.shape
-    if R == 0:
-        return
+    assert R > 0
     BLOCK_P = 16
     # Fixed program count per row; each program strides over the row's
     # actual pool tiles (see the kernel docstring).
     grid = (R, min(triton.cdiv(max_pools, BLOCK_P), _POOL_PROGRAMS))
-    _pooled_logits_kernel[grid](
-        q, weights, ape, cache, block_table, row_req, visible,
-        logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
-        BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
-    )
+    if cache.shape[-1] == POOL_CACHE_HEAD_DIM:
+        assert kp == 4 and D == 128 and softmax_scale == 128**-0.5
+        if adaptive_score and R <= 64:
+            from vllm.model_executor.layers.glm5_next_pool_score import adaptive_pool_logits
+
+            adaptive_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
+        else:
+            cached_pool_logits(q, weights, cache, block_table, row_req, visible, logits)
+    else:
+        _pooled_logits_kernel[grid](
+            q, weights, ape, cache, block_table, row_req, visible,
+            logits, max_pools, block_table.stride(0), cache.stride(0), softmax_scale,
+            BLOCK_SIZE=block_size, H=H, D=D, KP=kp, ROW=_ROW_DIM, BLOCK_P=BLOCK_P,
+        )
     # top-k over pools: prefill-style ranges [0, n_pools) per row.
     n_pools = torch.div(visible, kp, rounding_mode="floor").to(torch.int32)
     zeros = torch.zeros_like(n_pools)
@@ -287,6 +379,48 @@ def _pooled_select(
         logits[:R], zeros, n_pools, sel, R, logits.stride(0), logits.stride(1),
         ksel,
     )
+    return sel
+
+
+def _pooled_select(
+    q, weights, ape, cache, block_table, row_req, visible, logits,
+    max_pools, block_size, softmax_scale, ksel, topk_out, kp,
+    adaptive_score=False, row_shard=False,
+) -> None:
+    R = q.shape[0]
+    if R == 0:
+        return
+    if row_shard:
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        assert group.world_size == 8 and 0 <= group.rank_in_group < 8
+        assert R in (16, 32) and q.shape[1:] == (32, 128)
+        assert cache.shape[-1] == POOL_CACHE_HEAD_DIM and kp == 4 and ksel == 512
+        assert not adaptive_score
+        communicator = group.device_communicator
+        assert communicator is not None
+        communicator.wait_for_comm_init()
+        pynccl = communicator.pynccl_comm
+        assert pynccl is not None and not pynccl.disabled
+        local_rows = R // group.world_size
+        lo = group.rank_in_group * local_rows
+        hi = lo + local_rows
+        local_sel = _pooled_topk(
+            q[lo:hi], weights[lo:hi], ape, cache, block_table,
+            row_req[lo:hi], visible[lo:hi], logits[:local_rows],
+            max_pools, block_size, softmax_scale, ksel, kp,
+        )
+        sel = torch.empty((R, ksel), dtype=torch.int32, device=q.device)
+        # Reuse the live serving communicator on the caller stream. Creating
+        # another ProcessGroupNCCL communicator cost 484 MiB/rank on TP8 A100.
+        # Resolve it inside this opaque op, never serialize its pointer in AOT.
+        pynccl.all_gather(sel, local_sel)
+    else:
+        sel = _pooled_topk(
+            q, weights, ape, cache, block_table, row_req, visible, logits,
+            max_pools, block_size, softmax_scale, ksel, kp, adaptive_score,
+        )
     _expand_topk_kernel[(R,)](
         sel, visible, topk_out, sel.stride(0),
         KP=kp, KSEL=ksel, OUT_W=topk_out.shape[1], BLOCK_S=64,
@@ -306,6 +440,9 @@ def glm5_next_pooled_indexer(
     ksel: int,
     kp: int,
     softmax_scale: float,
+    adaptive_score: bool = False,
+    singleton_fused_update: bool = False,
+    row_shard_decode: bool = False,
 ) -> None:
     ctx = get_forward_context()
     attn_metadata = ctx.attn_metadata
@@ -318,16 +455,22 @@ def glm5_next_pooled_indexer(
     # [num_blocks, block_size, ROW]; in the packed cross-layer slab the
     # block dim is strided (stride(0) > block_size * ROW), so kernels
     # address pages as block * stride(0) + offset * ROW, never a flat view.
-    cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], _ROW_DIM)
-    assert cache.stride(2) == 1 and cache.stride(1) == _ROW_DIM
+    row_dim = kv_cache.shape[-1]
+    assert row_dim in (_ROW_DIM, POOL_CACHE_HEAD_DIM)
+    cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], row_dim)
+    assert cache.stride(2) == 1 and cache.stride(1) == row_dim
     block_size = kv_cache.shape[1]
 
     # 1) insert this step's rows.
     BLOCK_T = 64
-    _insert_rows_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
-        packed[:num_tokens], cache, md.slot_mapping, num_tokens, cache.stride(0),
-        BLOCK_SIZE=block_size, ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
-    )
+    if row_dim == POOL_CACHE_HEAD_DIM:
+        update_pool_cache(packed[:num_tokens], md.slot_mapping, ape, cache,
+                          singleton_fused=singleton_fused_update)
+    else:
+        _insert_rows_kernel[(triton.cdiv(num_tokens, BLOCK_T),)](
+            packed[:num_tokens], cache, md.slot_mapping, num_tokens, cache.stride(0),
+            BLOCK_SIZE=block_size, ROW=_ROW_DIM, BLOCK_T=BLOCK_T,
+        )
     topk_indices_buffer[: q.shape[0]] = -1
 
     # 2) prefill chunks.
@@ -338,7 +481,7 @@ def glm5_next_pooled_indexer(
             if R <= 0:
                 continue
             visible = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
-            row_req = chunk.token_to_seq[:R].to(torch.int32)
+            row_req = _prefill_query_requests(chunk)
             max_pools = max(1, chunk.max_seq_len // kp)
             logits = torch.empty(
                 (R, max_pools), dtype=torch.float32, device=q.device
@@ -374,12 +517,15 @@ def glm5_next_pooled_indexer(
             q[:R], weights[:R], ape, cache, dm.block_table, row_req, visible,
             decode_logits, max_pools, block_size, softmax_scale, ksel,
             topk_indices_buffer[:R], kp,
+            adaptive_score=adaptive_score,
+            row_shard=_row_shard_dispatch(row_shard_decode, R, md.num_prefills, next_n),
         )
 
 
 def glm5_next_pooled_indexer_fake(
     q, packed, weights, ape, k_cache_prefix, kv_cache, topk_indices_buffer,
     decode_logits, max_pools_total, ksel, kp, softmax_scale,
+    adaptive_score=False, singleton_fused_update=False, row_shard_decode=False,
 ) -> None:
     return None
 
@@ -404,9 +550,16 @@ class Glm5NextPooledIndexer(nn.Module):
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor,
         prefix: str = "",
+        workspace: Glm5NextIndexerWorkspace | None = None,
     ) -> None:
         super().__init__()
         self.n_heads = config.index_n_heads
+        self.adaptive_score, self.singleton_fused_update = _compact_decode_options(
+            vllm_config, self.n_heads
+        )
+        self.row_shard_decode = _row_shard_option(vllm_config, self.n_heads)
+        if self.row_shard_decode and self.adaptive_score:
+            raise ValueError("Row sharding does not support experimental adaptive scoring")
         self.head_dim = config.index_head_dim
         assert self.head_dim == _K_DIM
         self.index_topk = config.index_topk
@@ -439,7 +592,7 @@ class Glm5NextPooledIndexer(nn.Module):
             torch.zeros(self.head_dim, config.hidden_size), requires_grad=False
         )
         self.k_cache = Glm5NextIndexerCache(
-            head_dim=_ROW_DIM,
+            head_dim=_cache_row_dim(vllm_config, self.kp),
             dtype=torch.bfloat16,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
@@ -453,11 +606,15 @@ class Glm5NextPooledIndexer(nn.Module):
             else 0
         )
         decode_rows = sched.max_num_seqs * (1 + num_spec)
-        self.decode_logits = torch.empty(
-            (decode_rows, self.max_pools_total),
-            dtype=torch.float32,
-            device=torch.cuda.current_device(),
-        )
+        device = torch.device("cuda", torch.cuda.current_device())
+        if workspace is None:
+            self.decode_logits = torch.empty(
+                (decode_rows, self.max_pools_total), dtype=torch.float32, device=device
+            )
+        else:
+            self.decode_logits = workspace.get_decode_logits(
+                decode_rows, self.max_pools_total, device
+            )
         self._ape_f32: torch.Tensor | None = None
 
     def forward(
@@ -498,5 +655,8 @@ class Glm5NextPooledIndexer(nn.Module):
             self.ksel,
             self.kp,
             self.softmax_scale,
+            self.adaptive_score,
+            self.singleton_fused_update,
+            self.row_shard_decode,
         )
         return self.topk_indices_buffer

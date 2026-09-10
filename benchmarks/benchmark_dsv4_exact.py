@@ -23,6 +23,19 @@ os.environ["VLLM_LOGGING_STREAM"] = "ext://sys.stderr"
 
 from vllm.tokenizers.registry import get_tokenizer
 
+if __package__:
+    from .serving_cache_metrics import (
+        CACHE_METRICS,
+        cache_metric_delta,
+        parse_cache_metrics,
+    )
+else:
+    from serving_cache_metrics import (
+        CACHE_METRICS,
+        cache_metric_delta,
+        parse_cache_metrics,
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -95,6 +108,13 @@ def parse_args() -> argparse.Namespace:
         "outputs token-for-token across deliberate numeric changes where the "
         "sha alone cannot say how close a mismatch is.",
     )
+    parser.add_argument(
+        "--dump-responses",
+        default=None,
+        help="Save full response JSON after timing, including diagnostic routed "
+        "expert payloads when enabled on the server. Routing capture adds "
+        "server/transport overhead; such runs are not baseline TPS.",
+    )
     return parser.parse_args()
 
 
@@ -105,9 +125,12 @@ SPEC_METRICS = {
 }
 
 
-def metric_counters(url: str, served_model_name: str) -> dict[str, float]:
+def metric_snapshot(
+    url: str, served_model_name: str
+) -> tuple[dict[str, float], dict[str, float | None]]:
+    """Read speculative and cache counters with one out-of-timer HTTP request."""
     if url == "none":
-        return dict.fromkeys(SPEC_METRICS, 0.0)
+        return dict.fromkeys(SPEC_METRICS, 0.0), dict.fromkeys(CACHE_METRICS)
     with urllib.request.urlopen(url, timeout=30) as response:
         body = response.read().decode("utf-8")
     counters = dict.fromkeys(SPEC_METRICS, 0.0)
@@ -118,7 +141,12 @@ def metric_counters(url: str, served_model_name: str) -> dict[str, float]:
         for key, metric_name in SPEC_METRICS.items():
             if line.startswith(f"{metric_name}{{"):
                 counters[key] += float(line.rsplit(maxsplit=1)[1])
-    return counters
+    return counters, parse_cache_metrics(body, served_model_name)
+
+
+def metric_counters(url: str, served_model_name: str) -> dict[str, float]:
+    """Compatibility accessor for callers needing only speculative counters."""
+    return metric_snapshot(url, served_model_name)[0]
 
 
 def exact_prompts(
@@ -129,14 +157,23 @@ def exact_prompts(
     prompt_offset: int,
     repeat_source: bool,
 ) -> list[str]:
+    if count < 1 or token_count < 1 or prompt_offset < 0:
+        raise ValueError("count and token_count must be positive; offset nonnegative")
     source_ids = tokenizer.encode(source, add_special_tokens=False)
+    if not source_ids:
+        raise ValueError("source must contain at least one token")
+    # A repeated source needs a window for every request, not just enough
+    # tokens for one prompt. Include a full cycle of source start positions
+    # so concurrent requests do not all receive the identical prefix.
+    minimum_length = token_count + prompt_offset + count - 1
+    if repeat_source and len(source_ids) < minimum_length:
+        length = token_count + prompt_offset + max(count - 1, len(source_ids) - 1)
+        repeats = (length + len(source_ids) - 1) // len(source_ids)
+        source_ids = (source_ids * repeats)[:length]
     if len(source_ids) < token_count:
-        if not repeat_source:
-            raise ValueError(
-                f"source has {len(source_ids)} tokens, need at least {token_count}"
-            )
-        repeats = (token_count + len(source_ids) - 1) // len(source_ids)
-        source_ids = (source_ids * repeats)[:token_count]
+        raise ValueError(
+            f"source has {len(source_ids)} tokens, need at least {token_count}"
+        )
 
     max_start = len(source_ids) - token_count
     if prompt_offset < 0 or prompt_offset > max_start:
@@ -164,6 +201,7 @@ def request_completion(
     top_p: float | None,
     top_k: int | None,
     seed: int | None,
+    logprobs: int | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "model": served_model_name,
@@ -182,6 +220,8 @@ def request_completion(
         payload["top_p"] = top_p
     if top_k is not None:
         payload["top_k"] = top_k
+    if logprobs is not None:
+        payload["logprobs"] = logprobs
     body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
     # Servers started with an API key (VLLM_API_KEY) require the bearer token.
@@ -235,7 +275,9 @@ def main() -> None:
                 warmup.result()
 
     # Sampled after the warmup so warmup drafts stay out of the delta.
-    metrics_before = metric_counters(args.metrics_url, args.served_model_name)
+    metrics_before, cache_before = metric_snapshot(
+        args.metrics_url, args.served_model_name
+    )
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=args.concurrency
@@ -257,7 +299,9 @@ def main() -> None:
         ]
         results = [future.result() for future in futures]
     wall_seconds = time.perf_counter() - started
-    metrics_after = metric_counters(args.metrics_url, args.served_model_name)
+    metrics_after, cache_after = metric_snapshot(
+        args.metrics_url, args.served_model_name
+    )
     spec_metrics = {
         key: metrics_after[key] - metrics_before[key] for key in SPEC_METRICS
     }
@@ -269,6 +313,9 @@ def main() -> None:
     dump_dir = Path(args.dump_completions) if args.dump_completions else None
     if dump_dir is not None:
         dump_dir.mkdir(parents=True, exist_ok=True)
+    response_dir = Path(args.dump_responses) if args.dump_responses else None
+    if response_dir is not None:
+        response_dir.mkdir(parents=True, exist_ok=True)
     chars_per_token: list[float] = []
     for index, result in enumerate(results):
         response = result["response"]
@@ -294,6 +341,10 @@ def main() -> None:
         )
         if dump_dir is not None:
             (dump_dir / f"completion_{index}.txt").write_text(choice["text"])
+        if response_dir is not None:
+            (response_dir / f"response_{index}.json").write_text(
+                json.dumps(response, indent=2)
+            )
 
     summary = {
         "model": str(Path(args.model).resolve()),
@@ -315,6 +366,7 @@ def main() -> None:
         "request_latency_median_seconds": statistics.median(latencies),
         "response_sha256": response_sha256,
         "chars_per_token": chars_per_token,
+        "cache_metrics": cache_metric_delta(cache_before, cache_after),
         **spec_metrics,
         "exact": prompt_counts == [args.input_tokens] * args.concurrency
         and completion_counts == [args.output_tokens] * args.concurrency,

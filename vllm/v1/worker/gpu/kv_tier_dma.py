@@ -24,7 +24,6 @@ Ordering contract:
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -33,7 +32,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile
+from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile, _row_digest
 
 logger = init_logger(__name__)
 
@@ -41,7 +40,7 @@ _VERIFY = os.environ.get("VLLM_KV_TIER_VERIFY", "0") == "1"
 
 
 def _digest(t: torch.Tensor) -> str:
-    return hashlib.sha1(t.cpu().numpy().tobytes()).hexdigest()[:12]
+    return _row_digest(t.cpu().numpy())
 
 
 @dataclass
@@ -205,6 +204,7 @@ class KVTierDMA:
         # op id -> ("w", batch_seq) | ("r", req_id)
         self._disk_ops: dict[int, tuple[str, Any]] = {}
         self._write_remaining: dict[int, int] = {}
+        self._write_failed: set[int] = set()
         self._disk_done: list[int] = []
         self._read_remaining: dict[str, int] = {}
         self._read_failed: set[str] = set()
@@ -295,13 +295,17 @@ class KVTierDMA:
                         self._slot_digests[host_slot] = d
                         self._slot_nbytes[host_slot] = n
             if kind == "w":
+                if err is not None:
+                    self._write_failed.add(key)
                 left = self._write_remaining[key] - 1
                 if left <= 0:
                     del self._write_remaining[key]
                     # A failed write leaves the disk slot unconfirmed for
                     # the scheduler (never reported done): the block stays
                     # host-resident and the trajectory is not demotable.
-                    if err is None:
+                    failed = key in self._write_failed
+                    self._write_failed.discard(key)
+                    if not failed:
                         self._disk_done.append(key)
                 else:
                     self._write_remaining[key] = left

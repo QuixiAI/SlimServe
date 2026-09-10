@@ -424,8 +424,16 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
+        router_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        if router_logits is not None:
+            # Only the GLM owned mHC+gate path currently supplies this.
+            # Preserve SP chunking/internal-router semantics everywhere else.
+            assert not self.is_sequence_parallel
+            assert not self.experts.is_internal_router
+            assert router_logits.shape == (num_tokens, self.n_routed_experts)
+            assert router_logits.dtype == self.gate.out_dtype
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # Chunk the hidden states so they aren't replicated across TP ranks.
@@ -438,7 +446,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=hidden_states
             )
         else:
-            router_logits, _ = self.gate(hidden_states)
+            if router_logits is None:
+                router_logits, _ = self.gate(hidden_states)
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )

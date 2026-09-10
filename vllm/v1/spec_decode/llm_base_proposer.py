@@ -1385,6 +1385,7 @@ class SpecDecodeBaseProposer:
                 "Cohere2VisionForConditionalGeneration",
                 "Exaone4_5_ForConditionalGeneration",
                 "GlmOcrForConditionalGeneration",
+                "Glm5NextForConditionalGeneration",
                 "HunYuanVLForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "MiMoV2OmniForCausalLM",
