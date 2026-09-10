@@ -24128,3 +24128,11 @@ restart is the operator's call.
   better), 0 above (c32 loses 12% with k=3; c64 with drafting skipped
   reaches 1089.7). Final schedule arm [[1,16,3],[17,64,0]] with capture
   256 running before the record flips.
+- Final schedule arm [[1,16,3],[17,64,0]], capture 256: c1 141.6 (runs
+  117.2 @1.58 / 165.9 @2.35 acceptance), c8 503.4, c16 693.2, c32 891.6,
+  c64 1076.1. Above 16 requests drafting is skipped except during ramp
+  and drain (acceptance 1.5-1.7 there), costing ~4% at c32 vs non-spec;
+  c64 matches the k=0 arm (1089.7), which also says today's non-spec
+  c64 is ~1080-1090, not the 931.9 of 09-06. RECORD: glm53f-nvfp4-8 goes
+  speculative by default with this schedule. Raw: glm53f-dflash2/
+  sched16-0-cap256/.
