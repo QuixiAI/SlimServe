@@ -27772,3 +27772,39 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `indexer-serving-inspection-v1.json`, under2026-09-10; inspection SHA
   06d82d9ba34a5e44a574d30bc6d7e6b128e4277770feac89442ced5c59792afb.
   Exact protocol/commands and CPU failure history: `perf/glm53-indexer-serving-protocol.md`.
+
+## 2026-09-10 - Selective indexer correction preserves exact full-model scores
+
+- Status: quality-qualified opt-in diagnostic; no production speed promotion.
+- Baseline/workload: `7b8f93afb`, fixed recipe v1/SM120 TP4 Marlin. Exactly
+  control/correction/return, one private cache/start each, three repeats. All27
+  exact1000/300 c1/c8/c16 rounds, nine full quality passes, text/image canaries and
+  cold32K/128K complete. CPU8GiB/serve150GiB, swap0; no native/quant/default changes.
+- Hypothesis: the isolated/AOT-qualified cancellation repair preserves model
+  quality. Result: all4,096 text and168 needle-token scores match the original
+  exactly in all nine passes. Every unchanged window gate passes. Correction does
+  not reproduce failed no-combo. No quality improvement inferred from equality.
+- Provenance: seven AOT roots/46 entries/25 original launchers/two target bindings
+  per rank; candidate appends two static launchers. All92 non-targets remain exact,
+  return restores the full inventory. Actual padded maximum8192; candidate28
+  observed shape/stream records per rank, single live thread/stream, stable guarded
+  two-arena lifetime through capture. No live corrected-element count or arbitrary
+  cross-stream qualification; original oracle failure remains historical.
+- Timing: E2E medians control157.160/579.913/781.671, correction
+  156.457/578.474/777.935, return156.954/579.502/781.081 tok/s. Small extra-launch
+  cost, no speed win. Cold32K/128K medians2581.139/10882.224,
+  2587.435/10913.296,2587.629/10919.193ms; ranges in protocol. No new stable baseline.
+- Operational limits: eight recoverable4,718,592,000-byte allocation warnings
+  in EVERY arm during scoring; requests complete. Size matches2MiB-rounded
+  [7616,154880] FP32 prompt-logit/score storage, not yet stack-attributed. Existing
+  resource-tracker warnings and1/0/3 transient teardown zombies retained.
+- Closure: all serve/audit exits0,1,032 receipts/5,172 original files verify,
+  GPUs released, UUID/driver/600W unchanged. No retries/replacements/exclusions;
+  freeze ended before edits. CPU554 pass/53.12s. Raw caches/failed CPU reports kept.
+- Decision: retain only as quality-qualified opt-in diagnostic. Resume measured
+  performance work; before fusing correction, observe real launch/selection
+  coverage. Investigate common scoring allocation warnings without changing score
+  semantics. No next GPU process prescribed; use completed receipts after edits.
+- Raw: `perf/results/2026-09-10/indexer-serving-v1/closure.json`, SHA
+  0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
+  Full commands/results/limits: `perf/glm53-indexer-serving-protocol.md`.

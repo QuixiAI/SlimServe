@@ -1990,6 +1990,18 @@ Serving scheduler/capture and model-quality gates remain pending. Raw
 `indexer-aot-v1/pair-analysis.json` under2026-09-10, SHA
 89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
 
+Subsequent selective-correction serving series on `7b8f93afb` passes exactly
+control/correction/return-control, three repeats each and final closure. Every
+text/needle score is exactly original in all nine quality passes; runtime8192-row
+bounds, arena/capture guards and all92 non-target bindings verify. Correction is
+quality-qualified on this workload, not a speed win: c1/c8/c16 medians
+156.457/578.474/777.935 versus157.160/579.913/781.671 and
+156.954/579.502/781.081 tok/s controls. Remains opt-in; stable tables unchanged.
+All arms retain eight recoverable4.7GB allocator warnings during scoring. GPUs
+released, no retries or quant/native/default changes; original oracle remains a
+historical failure. Raw `indexer-serving-v1/closure.json` under2026-09-10, SHA
+0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

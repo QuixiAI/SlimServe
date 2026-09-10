@@ -1,6 +1,8 @@
 # GLM53 selective indexer correction: model diagnostic
 
-Status: integration CPU-qualified (554 tests); commit before the prescribed series.
+Status: model series complete on `7b8f93afb`; all audits and final closure pass.
+Correction is quality-qualified on this workload, but has no speed win and stays
+opt-in. Source freeze has ended. Commands below are historical, not restart instructions.
 Production defaults, recipe and original arithmetic are unchanged.
 
 ## Evidence and hypothesis
@@ -128,3 +130,65 @@ mutated a nested shared registry dictionary), corrected with a deep-copied plan;
 `indexer-serving-cpu-final-v3.xml`554 pass/53.12s after additional correction
 closure tests. The first final command named nonexistent CLI/ordering test files
 and stopped before collection; no code/model/case attempt was consumed.
+
+## Completed serving result
+
+Exactly the three prescribed starts, all serving/audit exits0 and final closure
+complete. All27 exact1000/300 timing rounds (225 measured requests), nine quality
+passes, text/image canaries and cold32K/128K checks complete. Every4,096 text score
+and168 needle-token score matches the historical original in all nine passes,
+not only aggregate means. Every unchanged window quality gate passes. Correction
+does not reproduce failed no-combo; no quality improvement is claimed from equality.
+
+All four ranks verify seven real AOT roots/46 entries,25 original launchers and
+two target bindings before forward and around capture. The candidate adds two
+qualified static launchers/rank. All92 non-target bindings compare exactly across
+starts, and return restores the full original binding inventory. This is AOT-root
+coverage, not a comparison of every later non-root runtime kernel.
+
+Runtime envelope is8192 rows; actual captures1,2,4,8,16,24,32,40,48,56,64. Each
+candidate rank records28 distinct observed shape/stream entries, maximum padded
+8192, one worker thread/live stream, and two distinct fixed1,048,832-byte arenas
+with stable addresses/intact end guards through capture. Startup stream changes
+have explicit barriers. No live selection/change-count instrumentation was added:
+score equality does not establish how many real activation values were corrected.
+Arbitrary cross-stream calls and contexts beyond the tested workload remain unqualified.
+
+Diagnostic E2E tok/s, median [min,max] of three repeats:
+
+| Arm | c1 | c8 | c16 |
+| --- | ---: | ---: | ---: |
+| Control | 157.160 [156.957,157.434] | 579.913 [577.775,581.489] | 781.671 [779.696,782.615] |
+| Correction | 156.457 [156.379,156.711] | 578.474 [578.000,578.546] | 777.935 [777.046,780.660] |
+| Return-control | 156.954 [156.858,157.182] | 579.502 [578.781,580.501] | 781.081 [779.999,781.528] |
+
+Cold prefill scheduled-to-first-token ms, median [min,max], no cached tokens:
+
+| Arm | 32K | 128K |
+| --- | ---: | ---: |
+| Control | 2581.139 [2579.520,2583.602] | 10882.224 [10847.315,10915.347] |
+| Correction | 2587.435 [2585.409,2588.407] | 10913.296 [10872.642,10945.535] |
+| Return-control | 2587.629 [2584.422,2589.924] | 10919.193 [10878.127,10951.509] |
+
+Startup168.110/164.111/162.090s; GPU release0.470/0.046/0.727s in order. Each arm
+retains eight recoverable allocator OOM warnings for4,718,592,000-byte temporary
+requests during scoring; requests complete, but the allocator path is not clean.
+The size matches a2MiB-rounded [7616,154880] FP32 buffer. Full prompt logits and
+FP32 log_softmax in GPUModelRunner/Sampler are candidates, not stack-proven cause.
+Teardown receipts retain1/0/3 transient zombies; resource-tracker warnings remain
+(control/return: one shared-memory object; candidate: four semaphores/six shared
+memory objects). No unhandled serving failure, retry, replacement or cache deletion.
+
+Closure verifies1,032 frozen source/evidence receipts,5,172 original files,
+preserved per-arm artifacts, GPU release and unchanged UUID/driver580.173.02/600W.
+Fresh GPU query confirms no compute processes. Freeze ended before notebook edits.
+Raw `perf/results/2026-09-10/indexer-serving-v1/closure.json`, SHA
+0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
+
+Decision: retain as quality-qualified opt-in diagnostic; do not enable it by
+default. It pays a small extra-launch cost without improving these scores. No
+stable speed baseline, quant/native/default change or original-oracle relabeling.
+Resume measured performance work; before a fused correction variant, establish
+actual launch/selection coverage on real activations. Investigate the shared
+scoring allocation warnings without changing score semantics. No new GPU run is
+prescribed by this completed result; consume completed receipts after source edits.

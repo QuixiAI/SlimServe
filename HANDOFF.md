@@ -35,7 +35,43 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): indexer serving integration CPU-qualified
+### Latest checkpoint (2026-09-10): selective indexer correction passes model quality
+
+The full prescribed series on `7b8f93afb` is complete: exactly one control,
+correction and return-control start, three repeats each, all audits/closure pass.
+All nine complete text/needle score vectors match the historical original EXACTLY.
+All unchanged quality windows, text/image canaries, exact1000/300 c1/c8/c16 and
+cold32K/128K checks pass. All92 non-target AOT bindings stay exact; return restores
+the full original inventory. The corrected path does not reproduce failed no-combo.
+
+Actual runtime maximum8192, capture sizes1..64, one live thread/stream per rank;
+two distinct1,048,832-byte arenas/rank retain addresses/end guards around capture.
+This does not count live corrected elements or establish arbitrary cross-stream
+reentrancy/fresh-compilation invariance. Historical original oracle stays failed.
+
+E2E median c1/c8/c16: control157.160/579.913/781.671, correction
+156.457/578.474/777.935, return156.954/579.502/781.081 tok/s. Small extra-launch
+cost, not a speed win; prefill approximately neutral against return. Retain the
+correction as a quality-qualified opt-in diagnostic, not a production default.
+No quant/native/quality-floor or stable-baseline changes.
+
+Closure verifies1,032 receipts and5,172 original files. GPUs released, driver/
+UUID/600W unchanged, no retries/replacements. Freeze ended before these edits.
+Raw `perf/results/2026-09-10/indexer-serving-v1/closure.json`, SHA
+0d1302e05d6f2350d1bcf60be4d04691f489d6c3040f1bbca37fd890d139fa8b.
+All protocols, manifests, caches and unsuccessful CPU development reports retained.
+
+NEXT: resume measured performance work from this stable control, not another
+unqualified arithmetic substitution. Before pursuing fused correction, measure
+actual launch/selection coverage on model activations; unchanged scores alone do
+not show how many values it repaired. Also inspect the repeated4,718,592,000-byte
+allocator warnings: eight in EVERY arm, recovered with completed requests. The
+size matches a2MiB-rounded [7616,154880] FP32 prompt-logit/score buffer; source has
+full-chunk logits and FP32 log_softmax, but no allocation stack yet proves the
+specific operation. Resource-tracker warnings/transient teardown zombies remain
+recorded; no claim of clean allocation/teardown internals. No next GPU job prescribed.
+
+### Previous checkpoint (2026-09-10): indexer serving integration CPU-qualified
 
 Opt-in `SLIMSERVE_GLM53_INDEXER_CORRECTION=control|correction` now joins the
 completed AOT/leaf receipts to the shared real-profile load/capture/workload
