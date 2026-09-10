@@ -10,7 +10,9 @@ from benchmarks.kernels.check_glm53_attention_norms import (
     flat_config,
     layernorm_oracle,
     load_preserving_provenance,
+    mismatch_examples,
     packed_inputs,
+    rank_cache,
     source_info,
 )
 from benchmarks.kernels.check_glm53_cached_rmsnorm import compare, oracle
@@ -135,6 +137,32 @@ def test_debug_path_requires_exact_bounded_record(tmp_path):
             checked_debug_source(ptx, tmp_path)
 
 
+def test_same_key_isolated_in_real_rank_cache_managers(tmp_path):
+    import triton
+    from triton.runtime.cache import get_cache_manager
+
+    original = triton.knobs.cache.dir
+    for rank in range(4):
+        with triton.knobs.cache.scope():
+            triton.knobs.cache.dir = str(rank_cache(tmp_path, rank))
+            manager = get_cache_manager("ab" * 32)
+            manager.put(f"debug-image-{rank}", "kernel.cubin")
+    assert triton.knobs.cache.dir == original
+    for rank in range(4):
+        with triton.knobs.cache.scope():
+            triton.knobs.cache.dir = str(rank_cache(tmp_path, rank))
+            manager = get_cache_manager("ab" * 32)
+            from pathlib import Path
+
+            assert (
+                Path(manager.get_file("kernel.cubin")).read_text()
+                == f"debug-image-{rank}"
+            )
+    for bad in (-1, 4, True, "../elsewhere"):
+        with pytest.raises(ValueError):
+            rank_cache(tmp_path, bad)
+
+
 def test_packed_inputs_replay_seed_and_stride():
     import torch
 
@@ -166,6 +194,21 @@ def test_fp64_reference_uses_single_final_round_and_centered_variance():
     actual = oracle(x, w)
     assert compare(actual, staged)["bit_mismatches"] > 0
     assert torch.equal(actual, (normalized * w.double()).bfloat16())
+
+
+def test_mismatch_examples_preserve_signed_near_zero_values():
+    import torch
+
+    reference = torch.tensor([[0.0, 1e-6, -1e-6]], dtype=torch.bfloat16)
+    actual = reference.clone()
+    actual.view(torch.int16)[0, 1] += 3
+    actual.view(torch.int16)[0, 2] += 4
+    evidence = mismatch_examples(actual, reference)
+    assert evidence["count"] == 2
+    assert [r["bf16_ulp"] for r in evidence["worst"]] == [4, 3]
+    assert evidence["worst"][0]["actual"] < 0
+    assert evidence["worst"][1]["reference"] == float(reference[0, 1])
+    assert mismatch_examples(reference, reference) == dict(count=0, worst=[])
 
 
 @pytest.fixture

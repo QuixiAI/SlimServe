@@ -94,6 +94,11 @@ def flat_config(config):
     }
 
 
+def rank_cache(output, rank):
+    require(type(rank) is int and rank in range(4), "invalid cache rank")
+    return output.resolve() / "triton" / f"rank-{rank}"
+
+
 def load_checked(path, digest):
     require(sha(path) == digest, f"receipt changed: {path}")
     return json.loads(path.read_text())
@@ -348,6 +353,7 @@ def prepare(path):
         ).strip(),
         sources=sources,
         records=records,
+        binary_cache_layout="rank-private-v1",
         inventory=inventory,
         identical_4096_body_matches=matches,
         weight_sha256={k: tensor_sha(w) for k, w in zip(WEIGHTS, load_weights())},
@@ -410,6 +416,35 @@ def packed_inputs(rows, seed, magnitude):
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
     return (torch.randn(rows, 2336, generator=generator) * magnitude).bfloat16()
+
+
+def mismatch_examples(actual, reference):
+    """Keep bounded scalar evidence for failed ULP gates, including near zero."""
+    import torch
+
+    def ordered(value):
+        bits = value.view(torch.int16).int() & 0xFFFF
+        return torch.where(bits >= 0x8000, -(bits & 0x7FFF), bits & 0x7FFF)
+
+    distance = (ordered(actual) - ordered(reference)).abs()
+    positions = (distance > 1).nonzero()
+    if not len(positions):
+        return dict(count=0, worst=[])
+    errors = distance[positions[:, 0], positions[:, 1]]
+    positions = positions[torch.argsort(errors, descending=True, stable=True)[:16]]
+    return dict(
+        count=int((distance > 1).sum()),
+        worst=[
+            dict(
+                row=int(r),
+                column=int(c),
+                actual=float(actual[r, c]),
+                reference=float(reference[r, c]),
+                bf16_ulp=int(distance[r, c]),
+            )
+            for r, c in positions
+        ],
+    )
 
 
 def run_launches(launches, data, changed, weights):
@@ -491,6 +526,10 @@ def run(manifest_path, output):
     manifest = json.loads(manifest_path.read_text())
     verify(manifest)
     require(
+        manifest["binary_cache_layout"] == "rank-private-v1",
+        "rank-private manifest required",
+    )
+    require(
         not subprocess.check_output(
             ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
             text=True,
@@ -527,8 +566,12 @@ def run(manifest_path, output):
         weights = load_weights()
         summary["weights"] = {k: tensor_sha(w) for k, w in zip(WEIGHTS, weights)}
         require(summary["weights"] == manifest["weight_sha256"], "weights changed")
+        arms_by_rank = {}
         for rank in range(4):
-            with torch.cuda.device(rank):
+            with torch.cuda.device(rank), triton.knobs.cache.scope():
+                # Historical rank-local caches have four distinct debug images
+                # under one semantic key. Do not let the first rank shadow them.
+                triton.knobs.cache.dir = str(rank_cache(output, rank))
                 arms = {"combo": {}, "split": {}}
                 for n, record in enumerate(manifest["records"]):
                     if record["rank"] != rank:
@@ -561,7 +604,7 @@ def run(manifest_path, output):
                         "source/config did not reproduce recorded binary key",
                     )
                     cubin = (
-                        Path(os.environ["TRITON_CACHE_DIR"])
+                        rank_cache(output, rank)
                         / actual["hash"]
                         / (record["info"]["kernel"] + ".cubin")
                     )
@@ -584,6 +627,12 @@ def run(manifest_path, output):
                         else record["info"]["widths"][0]
                     )
                     arms[record["arm"]][key] = launcher
+                arms_by_rank[rank] = arms
+                save()
+        require(len(summary["binaries"]) == 16, "all binaries required before numerics")
+        for rank in range(4):
+            with torch.cuda.device(rank):
+                arms = arms_by_rank[rank]
                 for rows in ROWS:
                     for seed in SEEDS:
                         for magnitude in MAGNITUDES:
@@ -639,6 +688,22 @@ def run(manifest_path, output):
                                         ]
                                         for arm, value in values.items()
                                     },
+                                    mismatch_examples={
+                                        arm: [
+                                            [
+                                                mismatch_examples(t, ref)
+                                                if metric["max_bf16_ulp"] > 1
+                                                else None
+                                                for t, ref, metric in zip(
+                                                    phase, refs, phase_metrics
+                                                )
+                                            ]
+                                            for phase, refs, phase_metrics in zip(
+                                                value, references, metrics[arm]
+                                            )
+                                        ]
+                                        for arm, value in values.items()
+                                    },
                                 )
                             )
                             save()
@@ -691,8 +756,7 @@ def audit(manifest_path, output):
             "copied source changed",
         )
         cubin = (
-            output
-            / "triton"
+            rank_cache(output, record["rank"])
             / record["selected"]["hash"]
             / (record["info"]["kernel"] + ".cubin")
         )

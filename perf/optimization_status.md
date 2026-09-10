@@ -26580,3 +26580,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   previous output `perf/results/2026-09-10/attention-norm-provenance-probe/`.
 - CPU198 passed16.59s,14 existing Torch deprecation warnings; lint/diff pass.
   Raw `runtime-control/attention-first-writer-regression.log`.
+
+## 2026-09-10 - Rank0 attention norms measured; isolate per-rank debug images
+
+- Status: partial diagnostic, third attempt terminal after30 rank0 pairs.
+- Baseline: ONE4eb7b664a process,16GiB/swap0, exact four rank0 cubins, source freeze.
+- Numerical: all repeat/replay/guard/mutation checks pass. RMS512/1536 oracle
+  max1 BF16 ULP each; Q1536 exactly equal combo/split on60 outputs. KV512 has139
+  pairwise changed elements; LayerNorm128 has114. LayerNorm oracle max5 ULP old/
+  28 new,5/30 pairs fail in BOTH arms. No all-rank/full-model claim or promotion.
+- Stop: rank1 combo shares rank0's semantic key but its original rank-local
+  cache has a different debug image. Shared probe cache returns rank0's image,
+  failing the byte gate. All41 ELF sections compared; only.debug_line and
+  .nv.merc.debug_line differ; all non-debug sections/metadata equal.
+- Closure:135 frozen receipts/5172 original files unchanged, GPU query empty.
+  Incomplete-matrix audit and partial numerical results retained. No gate changed.
+- Fix: rank-private scoped Triton caches, compile/verify all16 binaries BEFORE
+  numerical work. Add bounded worst-element actual/reference data to failed ULP
+  checks. CPU tests use actual cache-manager isolation and scope restoration.
+- Decision: after tests/commit, ONE NEW same120-pair matrix; require exact
+  agreement with the previous30 rank0 records. Existing attempts stay terminal.
+  No serving job or default/quality/performance promotion prescribed.
+- Raw: `perf/results/2026-09-10/attention-norm-first-writer-probe/`;
+  `runtime-control/attention-first-writer-failure-analysis.json`, SHA
+  e7977af07d26066449b1b874a04a31806a8bd4252a4416b92ec8df823b1b55c3.
+- Final CPU200 passed16.62s,14 existing Torch deprecation warnings; lint/diff
+  pass. Initial test fixture used a non-hex cache key; corrected to the actual
+  API contract, prior failed log retained. Raw `runtime-control/attention-rank-private-{regression,final-regression}.log`.

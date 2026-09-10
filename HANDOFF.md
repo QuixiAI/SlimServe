@@ -35,7 +35,33 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): first-writer provenance verified for all16 kernels
+### Latest checkpoint (2026-09-10): rank0 numerical result; rank-private probe prepared
+
+ONE4eb7b664a process completes30 rank0 pairs before stopping at rank1's combo
+byte gate. Rank0 RMS512/1536 both <=1 BF16 ULP vs FP64; Q1536 combo/split exactly
+equal in all60 original/changed outputs. KV512 differs in139 elements total.
+Indexer LayerNorm128 has114 pairwise differences; oracle max5 ULP(combo)/28(split),
+failing5/30 pairs in BOTH arms. This is partial synthetic evidence, not model
+causality or all-rank qualification. No numerical tolerance changed.
+
+Rank1 failure: four historical combo cubins share ONE semantic key but have FOUR
+debug-image hashes in their original rank-local caches. The probe's shared cache
+returns rank0's already-compiled image. Closure verifies all41 ELF sections;
+only.debug_line/.nv.merc.debug_line differ. All non-debug sections and metadata
+match.135 frozen receipts/5172 original files unchanged; GPUs free. Partial audit:
+`runtime-control/attention-first-writer-failure-analysis.json`, SHA
+e7977af07d26066449b1b874a04a31806a8bd4252a4416b92ec8df823b1b55c3.
+
+Fix is probe-only rank-private Triton caches via its scoped cache API, tested
+with real CPU cache managers. Precompile/verify ALL16 binaries before numerical
+work. Same120-pair matrix and gates; retain bounded worst-element values for
+failed ULP checks to investigate LayerNorm cancellation without guessing.
+NEXT after tests/commit: NEW attention-rank-private-manifest.json and ONE NEW
+attention-norm-rank-private-probe, then audit including exact agreement with the
+previous30 rank0 results (old fields). Protocol tail gives scope/path rules.
+All previous attempts remain terminal. No model start or later GPU job prescribed.
+
+### Previous checkpoint (2026-09-10): first-writer provenance verified for all16 kernels
 
 Second probe on9de50bbe3 also stops BEFORE numerical launches. Historical combo
 now reproduces whole cubin bytes. First split kernel shares its cache key with

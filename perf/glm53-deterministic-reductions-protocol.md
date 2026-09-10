@@ -587,3 +587,46 @@ After tests/commit, NEW fixed run (same120 pairs/gates/environment as above):
 Keep sources/native frozen through audit. Preserve pipefail/tee logs under
 runtime-control. Both earlier attempts stay terminal, not overwritten or resumed.
 No subsequent GPU/model job prescribed, no numerical or performance promotion.
+
+## Rank-private binary images and partial numerical evidence (2026-09-10)
+
+ONE4eb7b664a first-writer probe is TERMINAL after30 rank0 pairs. Four rank0 binary
+images verify exactly, repeat/replay/guard/mutation gates pass. RMS512/1536 stay
+within1 BF16 ULP of FP64; Q1536 is bit-exact combo/split over60 outputs, KV512 has
+139 changed elements. LayerNorm128 has114 changed elements and exceeds its gate:
+max5 ULP(combo)/28(split),5/30 pairs failing in BOTH arms. Do not promote the
+matrix or infer full-model causality from these partial/synthetic results.
+
+Rank1's combo then fails the byte gate: historical rank-local caches hold FOUR
+debug images under ONE semantic key; the probe's single cache returned rank0's
+image. This is distinct from the already-resolved first-writer filename mapping.
+All41 ELF sections compared; only.debug_line/.nv.merc.debug_line differ. Every
+non-debug section and compiler metadata match.135 frozen receipts/5172 original
+files verify, GPU query empty. Incomplete-matrix audit retained. Closure:
+`runtime-control/attention-first-writer-failure-analysis.json`, SHA
+e7977af07d26066449b1b874a04a31806a8bd4252a4416b92ec8df823b1b55c3.
+
+Correct the probe cache layout to `triton/rank-<rank>/` using Triton's scoped
+cache setting. CPU regression exercises actual cache-manager writes/reads with
+the same semantic key in four disjoint temporary directories and verifies scope
+restoration. No serving cache changes or seeded binaries. Compile/verify ALL16
+images before any numerical execution so a receipt failure cannot interrupt a
+partially completed numerical matrix again. Record bounded worst-ULP element
+coordinates and actual/reference values for failed checks; accuracy gates remain
+unchanged. This is not a retry to select a passing numerical sample.
+
+After tests/commit, prescribe ONE NEW process, same120 pairs and existing gates:
+
+- Prepare8GiB/swap0 scope `glm53-attention-rank-private-prepare`; same module,
+  `--prepare --manifest perf/results/2026-09-10/runtime-control/attention-rank-private-manifest.json`.
+- ONE16GiB/swap0 scope `glm53-attention-rank-private-probe`; same module/new
+  manifest, `--output perf/results/2026-09-10/attention-norm-rank-private-probe`,
+  same four-device/environment flags as previous commands.
+- After exit,8GiB/swap0 scope `glm53-attention-rank-private-audit`; same module,
+  manifest/output plus `--audit`; independent GPU query. Supplemental CPU audit
+  must also verify exact agreement of the earlier30 rank0 records' outputs,
+  metrics, input hashes and verdicts (new scalar-evidence field excluded).
+
+Freeze through audit, preserve logs and every failed/partial run. Expected
+LayerNorm failures stay failures; do not clear them to make the matrix pass.
+No subsequent GPU/model job prescribed, no policy/default/performance promotion.
