@@ -24101,3 +24101,8 @@ restart is the operator's call.
   it is a page-geometry change, deferred). Raw: perf/results/2026-09-10/
   glm53f-dflash2/d3/. k=5 arm running; c32/c64 and a per-batch schedule
   follow before the record flips to speculative by default.
+- DFlash2 k=5: c1 155.8 / c8 471.7 / c16 336.5, acceptance 2.40 - +1.6% at
+  c1 over k=3 for -8% at c8 and a halving at c16 (16 x 6 verify rows
+  overflow the 64-token capture set). k=3 is the small-batch choice; a
+  per-batch schedule arm (k=3 to 8 requests, k=1 above, capture 128,
+  c1..c64) decides the drop point. Raw: glm53f-dflash2/d5/.
