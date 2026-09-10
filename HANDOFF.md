@@ -35,7 +35,37 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v1 terminal; exact helper-boundary fix ready
+### Latest checkpoint (2026-09-10): all-rank KV AOT qualification PASSES
+
+On `7b753a65a`, v2 completes exactly eight prescribed GPU processes: control
+ranks 0..3, then KV ranks 0..3. All loads/audits and the final comparison exit 0.
+Each case binds seven actual roots/46 entries, 25 original launchers and two
+target globals. All eight candidate target bindings prove both the original
+combo and appended KV launch against qualified source/config/whole-cubin
+receipts. All 92 non-target bindings across ranks match control exactly.
+
+Final check: all 246 frozen receipts and 5,172 original files verify; GPUs
+released, UUID/driver/600 W settings unchanged. Source freeze ended. No model
+weights/forward/capture, retries within v2, native build, TPS/default/quant change
+or quality-gate promotion. v1's failed load stays terminal and preserved.
+CPU: 475 passed in 42.84 s. Raw
+`perf/results/2026-09-10/kv-aot-qualification-v2/pair-analysis.json`, SHA
+e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7.
+Consume these completed receipts after later edits, not their frozen validators.
+
+NEXT: integrate the qualified KV loader with the existing opt-in serving
+lifecycle and prepare a bounded original/KV/return-original real-profile series.
+Keep the qualified KV loader/compiler/native sources exact; explicitly account
+for serving integration and offline-auditor changes. The shared geometry serving
+helper currently passes all PyCodeCache modules to controller seal/verify; KV
+requires actual root modules. Its stable-binding comparison also needs to ignore
+the appended launch's process-local observed index, not its source/config/cubin.
+Reuse existing profile validation, quality workload and lifecycle snapshots;
+verify qualified bindings before forward and across capture without globally
+sealing legitimate non-target compilation. No next model job prescribed yet.
+Indexer oracle remains failed; model causality and optimization goal stay open.
+
+### Previous checkpoint (2026-09-10): v1 terminal; exact helper-boundary fix ready
 
 On `30ea612a6`, v1 stops on the first control-rank0 load; load/audit exit 1,
 seven other cases unattempted. Seven static bundles loaded with no fallback.

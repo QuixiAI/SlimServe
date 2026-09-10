@@ -324,7 +324,7 @@ launch SHA `edd66fa10d2b8565d6bbbd843c4514589d9867f06d970c01b68c548f55e412ae`.
 CPU `runtime-control/kv-aot-{root-boundary,v2-final}-cpu.xml`. No weights,
 forward, capture, timing, native build, default/quant change or gate relaxation.
 
-## Actual-AOT KV qualification v2: separately prescribed after the fix
+## Actual-AOT KV qualification v2: completed; commands historical
 
 After committing the helper-boundary fix, run the same eight-case order and
 all v1 gates once in the NEW v2 namespace. This is a changed implementation,
@@ -344,3 +344,38 @@ done'
 
 systemd-run --user --scope --unit=glm53-kv-aot-v2-compare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.audit_glm53_kv_loader compare perf/results/2026-09-10/kv-aot-qualification-v2
 ```
+
+## Completed all-rank AOT result
+
+On `7b753a65a`, exactly the eight prescribed v2 GPU processes complete. Every
+load and audit exits 0, then the cross-run comparison passes. Each rank/arm has
+seven actual AOT roots and 46 entries, seven complete static bundles, 25 original
+bound launchers and exactly two target graph bindings. The candidate's eight
+target bindings across four ranks separately prove the original combo and
+appended KV launch against qualified source/config/whole-cubin receipts. All
+92 non-target graph bindings match their rank's control exactly. The exact
+standalone-helper exclusion works without admitting it as a model root.
+
+Final read-only closure verifies all eight successful launch records, 246 frozen
+receipts and all 5,172 original cache files. GPUs are released; GPU UUIDs,
+driver 580.173.02 and 600 W settings are unchanged. Freeze ended before notebook
+edits. No retries within v2, omitted case, model weights/forward/capture, native
+build or TPS measurement. v1's earlier failed attempt remains terminal and
+preserved. CPU final remains 475 passed in 42.84 s, 14 upstream warnings.
+
+Raw `perf/results/2026-09-10/kv-aot-qualification-v2/`: eight private prepared
+manifests/caches, launch/load/audit records, actual root/module/graph/binary/
+controller receipts and `pair-analysis.json`. Pair SHA
+`e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7`.
+After further edits consume the pinned completion receipts, not these now-
+historical source-frozen commands. No new production or model-quality claim.
+
+Next integrate this qualified loader into an opt-in serving lifecycle, reusing
+the existing profile validator and full quality/causal workload. Pass actual
+root modules to KV seal/verify; remove only process-local observer indices when
+comparing qualified bindings, including the appended launch's nested index.
+Preserve all source/config/binary fields. Keep observation open for legitimate
+non-target startup compilation, verify snapshots before forward and before/after
+capture, and explicitly freeze/account for integration changes. Then prescribe
+the bounded original/KV/return-original model series. No next model job has yet
+been prescribed; the separate indexer oracle failure remains open.

@@ -27482,3 +27482,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   SHA fe7113bacf2c8ba8d83aa932426b17a6e607b85d5c5362adcc24903c6c651217;
   CPU `runtime-control/kv-aot-{root-boundary,v2-final}-cpu.xml`. Exact v2 commands
   and failure policy are at the tail of `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - All-rank KV-only AOT loader qualification passes
+
+- Status: actual AOT binding qualification complete; model causality pending.
+- Baseline/workload: `7b753a65a`, original combo versus original plus qualified
+  KV-only adapter, fixed recipe v1 on four SM120 GPUs. Exactly eight prescribed
+  no-weights processes, control ranks 0..3 then KV ranks 0..3, 16 GiB/swap0;
+  CPU preparation/controller/audits 8 GiB. All load/audit/compare exits 0.
+- Results: every case has seven actual roots/46 entries, seven complete bundles,
+  25 original bound launchers and two target globals. All eight candidate target
+  bindings prove both original and appended launch source/config/whole-cubin
+  identity. All 92 non-target bindings across ranks match control exactly.
+  Standalone benchmark helpers are excluded without losing real root coverage.
+- Correctness limits: no numerical/model forward or capture in this stage. The
+  earlier isolated KV adapter remains numerically/replay qualified; combining
+  those results does not establish full-model quality, causality or TPS.
+- Closure: 246 frozen receipts and 5,172 original cache files verify; GPU
+  release and unchanged UUID/driver 580.173.02/600 W identity confirmed. Freeze
+  ended. No retry within v2, omission, model weights, native build or default/
+  quant/quality-gate change. Preserve terminal v1 failure. CPU: 475 pass/42.84 s.
+- Decision: record checkpoint, then opt-in serving integration and prescribed
+  original/KV/return model comparison. Keep qualified loader/compiler/native
+  code exact; account explicitly for integration/auditor source changes. No
+  model process prescribed yet. Separate failed indexer oracle remains failed.
+- Raw: `perf/results/2026-09-10/kv-aot-qualification-v2/pair-analysis.json`, SHA
+  e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7;
+  all eight manifest/cache/log/root/graph/binary/controller/audit records retained.
+  Protocol/results: `perf/glm53-attention-isolation.md`.

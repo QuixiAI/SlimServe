@@ -1943,7 +1943,16 @@ new model TPS/default promotion; remaining attention/normalization causality and
 the separate failed indexer LayerNorm oracle gate are still open.
 The subsequent KV-only overwrite adapter passes 120 isolated cases on `f6ff10453`:
 split KV reproduced exactly, Q/indexer unchanged, KV oracle/replay/guards pass.
-Actual graph-loader and model qualification remain pending; no new TPS baseline.
+At that checkpoint, graph-loader and model qualification remained pending.
+
+Subsequent actual-AOT KV loader qualification passes on `7b753a65a`: exactly
+eight control/KV rank-matched loads and audits, all eight target graph bindings
+verified and all 92 non-target bindings unchanged. No weights/forward/capture
+or timing in this gate; serving integration and model causality remain pending.
+The earlier v1 helper-boundary failure is retained. Production defaults, stable
+TPS tables and the failed indexer oracle gate are unchanged. Pair receipt:
+`kv-aot-qualification-v2/pair-analysis.json` under 2026-09-10, SHA
+e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7.
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
