@@ -2339,6 +2339,28 @@ graph capture for the hybrid GDN+MTP decode, Gemma-aware fused norm+quant.
   `glm53f-tp8-handoff-baseline/` (c16 after CPU isolation). Repeat spreads,
   commands, traces and correctness details are in the optimization notebook.
 
+## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - V2 runner + DFlash2 speculative record, 2026-09-10
+- Runner: V2 (V1 deprecated 2026-09-10). Speculative by default:
+  incoai/GLM-5.3-Flash-DFlash2 (revision bf582e4e) through the V2 DFlash2
+  speculator, k=3 for 1-16 running requests and 0 above
+  (num_speculative_tokens_per_batch_size [[1,16,3],[17,64,0]]),
+  max_cudagraph_capture_size 256 so a 64-request verify step stays
+  graphed. Taps = mean over the four mHC streams of layers 5/14/24/33/42's
+  completed output. Everything else as the 2026-09-06 record (1M context,
+  VRAM 3,082,532-token pool with the drafter resident, 72 GiB host + 256
+  GiB disk tiers per rank, max_num_seqs 64). `--no-spec` restores the
+  non-speculative path.
+- Exact-token (1000 in / 300 out, temp 1.0 / top-p 0.95 / top-k 20,
+  three warmed repeats, medians; acceptance is sampled-text dependent):
+  | c1    | c8    | c16   | c32   | c64    |
+  | 153.6 | 495.0 | 687.3 | 879.5 | 1074.5 |
+  vs non-spec on the same tree 109.9 / 494.6 / 676.0 / 929.9 / ~1085.
+  Mean acceptance length 2.0-2.3 at c1-c16 (k=3); 1.5-1.7 at c32/c64
+  where drafting fires only during ramp and drain. Text (+reasoning),
+  image and tool canaries pass. Raw: perf/results/2026-09-10/
+  glm53f-final-spec/. Forced-eviction tier acceptance, the WildChat leg
+  and the 1M-context leg on this record: see the 2026-09-10 notebook.
+
 ## GLM-5.3-Flash NVFP4 glm53f-nvfp4-8 - maximized record, 2026-09-06
 - TP8, EP off, model-default 1,048,576 context on three KV tiers: VRAM
   pool 50.08 GiB/rank = 3,171,368 tokens (gpu_memory_utilization 0.95),
