@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NvmeTierFile: aligned O_DIRECT round trip through a temp tier file."""
 
 import os
 import time
 
+import pytest
 import torch
 
 from vllm.v1.worker.gpu.kv_tier_nvme import PAGE, DiskOp, NvmeTierFile
+
+pytestmark = pytest.mark.skipif(
+    not hasattr(os, "posix_fallocate"), reason="Linux O_DIRECT NVMe backend"
+)
 
 
 def _aligned_rows(rows: int, row_bytes: int) -> torch.Tensor:
@@ -16,7 +22,7 @@ def _aligned_rows(rows: int, row_bytes: int) -> torch.Tensor:
 
 
 def _wait(tier, ids, timeout=30.0):
-    done = {}
+    done: dict[int, str | None] = {}
     t0 = time.time()
     while len(done) < len(ids):
         for op_id, err in tier.poll_done():
@@ -36,7 +42,9 @@ def test_write_then_read_roundtrip(tmp_path):
     try:
         waited = []
         tier.submit(
-            DiskOp(1, True, 5, memoryview(arena[1].numpy()), wait=lambda: waited.append(1))
+            DiskOp(
+                1, True, 5, memoryview(arena[1].numpy()), wait=lambda: waited.append(1)
+            )
         )
         assert _wait(tier, [1]) == {1: None}
         assert waited == [1]
@@ -66,9 +74,10 @@ def test_many_concurrent_ops_complete(tmp_path):
             tier.submit(DiskOp(i, True, (i * 7) % n, memoryview(arena[i].numpy())))
         assert all(e is None for e in _wait(tier, list(range(n))).values())
         for i in range(n):
-            tier.submit(DiskOp(n + i, False, (i * 7) % n, memoryview(arena[n + i].numpy())))
+            tier.submit(
+                DiskOp(n + i, False, (i * 7) % n, memoryview(arena[n + i].numpy()))
+            )
         assert all(e is None for e in _wait(tier, list(range(n, 2 * n))).values())
         assert torch.equal(arena[n:], rows)
     finally:
         tier.close()
-

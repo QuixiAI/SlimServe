@@ -66,6 +66,27 @@ def layer_is_local(config: MuseGlimmerConfig, layer_idx: int) -> bool:
     return bool(pattern[layer_idx])
 
 
+def _fused_layer_metadata(metadata, layer_names, rows, one_request):
+    """Keep independently allocated cache groups distinct in the fused stack."""
+    groups = {}
+    tables, lengths, slots = [], [], []
+    for name in layer_names:
+        layer = metadata[name]
+        key = id(layer)
+        if key not in groups:
+            table, length = layer.block_table, layer.seq_lens_gpu
+            if one_request:
+                table = table[:1].expand(rows, -1)
+                steps = torch.arange(rows, dtype=torch.int32, device=length.device)
+                length = (length[:1] - (rows - 1)).expand(rows) + steps
+            groups[key] = table, length, layer.slot_mapping.to(torch.long)
+        table, length, slot = groups[key]
+        tables.append(table)
+        lengths.append(length)
+        slots.append(slot)
+    return tables, lengths, slots
+
+
 class MuseGlimmerMLP(nn.Module):
     def __init__(
         self,
@@ -180,7 +201,10 @@ class MuseGlimmerAttention(nn.Module):
             # NoPE layers at ctx > window in the eager path (the fused path
             # registers window=0 for them and was unaffected). Confirmed via
             # per-impl logging: all 52 layers reported window=2048. Force the
-            # impl's window off for global layers.
+            # planner and impl windows off for global layers. Clearing only
+            # the impl lets the cache manager recycle history still read by
+            # these full-attention kernels.
+            self.attn.sliding_window = None
             self.attn.impl.sliding_window = None
 
     def forward(
@@ -317,6 +341,9 @@ class MuseGlimmerModel(nn.Module):
             )
             self._fused_local_name = first_local.self_attn.attn.layer_name
             self._fused_full_name = first_full.self_attn.attn.layer_name
+            self._fused_layer_names = [
+                layer.self_attn.attn.layer_name for layer in self.layers
+            ]
 
             def shards(module, count):
                 cached = getattr(module, "_gguf_hetero_shards", None)
@@ -450,15 +477,9 @@ class MuseGlimmerModel(nn.Module):
         x = hidden_states.contiguous()
         pos = positions.to(torch.int32)
         ctx_len = int(full.seq_lens_gpu.max().item())
-        if is_verify and m > 1:
-            steps = torch.arange(m, dtype=torch.int32, device=x.device)
-            bt_l = local.block_table[:1].expand(m, -1)
-            sl_l = (local.seq_lens_gpu[:1] - (m - 1)).expand(m) + steps
-            bt_f = full.block_table[:1].expand(m, -1)
-            sl_f = (full.seq_lens_gpu[:1] - (m - 1)).expand(m) + steps
-        else:
-            bt_l, sl_l = local.block_table, local.seq_lens_gpu
-            bt_f, sl_f = full.block_table, full.seq_lens_gpu
+        tables, lengths, slots = _fused_layer_metadata(
+            metadata, self._fused_layer_names, m, is_verify and m > 1
+        )
         if aux_ids:
             aux_out = torch.empty(
                 len(aux_ids), m, x.shape[-1], dtype=x.dtype, device=x.device
@@ -466,27 +487,23 @@ class MuseGlimmerModel(nn.Module):
             _qc().muse_step_run_aux(
                 x,
                 pos,
-                bt_l,
-                sl_l,
-                local.slot_mapping.to(torch.long),
-                bt_f,
-                sl_f,
-                full.slot_mapping.to(torch.long),
+                tables,
+                lengths,
+                slots,
                 aux_out,
                 aux_ids,
                 ctx_len,
+                is_verify and m > 1,
             )
             return x, list(aux_out.unbind(0))
         _qc().muse_step_run(
             x,
             pos,
-            bt_l,
-            sl_l,
-            local.slot_mapping.to(torch.long),
-            bt_f,
-            sl_f,
-            full.slot_mapping.to(torch.long),
+            tables,
+            lengths,
+            slots,
             ctx_len,
+            is_verify and m > 1,
         )
         return x
 

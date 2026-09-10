@@ -79,7 +79,7 @@ class NvmeTierFile:
         os.makedirs(directory, exist_ok=True)
         self.direct = True
         self.fd = self._open(directory)
-        os.posix_fallocate(self.fd, 0, num_slots * slot_bytes)
+        os.posix_fallocate(self.fd, 0, num_slots * slot_bytes)  # type: ignore[attr-defined]
         self._queue: deque[DiskOp | None] = deque()
         self._cv = threading.Condition()
         self._done: deque[tuple[int, str | None]] = deque()
@@ -188,7 +188,10 @@ class NvmeTierFile:
                     if exp is not None and got != exp:
                         logger.warning(
                             "kv-nvme DISK ROUND-TRIP MISMATCH disk_slot=%d "
-                            "written=%s read=%s", op.disk_slot, exp, got,
+                            "written=%s read=%s",
+                            op.disk_slot,
+                            exp,
+                            got,
                         )
             except Exception as exc:  # noqa: BLE001 - reported, not raised
                 err = f"{type(exc).__name__}: {exc}"

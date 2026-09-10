@@ -1297,7 +1297,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     tails.append(rid)
             if n <= 0:
                 continue
-            for g in range(start // sub_tokens, min((start + n - 1) // sub_tokens, max_g) + 1):
+            for g in range(
+                start // sub_tokens, min((start + n - 1) // sub_tokens, max_g) + 1
+            ):
                 rid = row_id(req_row, g)
                 if rid >= 0:
                     written.append(rid)
@@ -1439,7 +1441,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # token that disagrees).
             self.thinking_budget_state.apply_mask(logits, input_batch)
 
-        if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+        # Metal's verifier uses a position-keyed inverse CDF, while the plain
+        # sampler uses Gumbel noise. Keep zero-draft rows on the verifier too:
+        # otherwise an unrelated request's drafts change their seeded draw.
+        if self.rejection_sampler is None or (
+            input_batch.num_draft_tokens == 0 and logits.device.type != "mps"
+        ):
             assert self.sampler is not None
             sampler_output = self.sampler(logits, input_batch)
         else:
@@ -1632,7 +1639,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            self._prepare_main_kv_residency(input_batch, block_tables, slot_mappings, False)
+            self._prepare_main_kv_residency(
+                input_batch, block_tables, slot_mappings, False
+            )
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1661,7 +1670,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
-                self._prepare_main_kv_residency(input_batch, block_tables, slot_mappings, True)
+                self._prepare_main_kv_residency(
+                    input_batch, block_tables, slot_mappings, True
+                )
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "

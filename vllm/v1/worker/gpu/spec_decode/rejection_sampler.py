@@ -126,7 +126,7 @@ class RejectionSampler:
         from vllm.v1.worker.gpu.sample.gumbel import _use_native_sample_kernels
 
         if (
-            _use_native_sample_kernels()
+            (_use_native_sample_kernels() or sampled.device.type == "mps")
             and sampled.dtype == torch.int64
             and cu_num_logits.dtype == torch.int32
         ):
@@ -278,19 +278,20 @@ class RejectionSampler:
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np
         )
+        dump_record = None
         if _DUMP_DIR is not None:
             top_vals32, top_ids32 = logits.float().topk(32, dim=-1)
-            _dump_verify_record(
-                {
-                    "draft_sampled": draft_sampled.cpu(),
-                    "pos": pos.cpu(),
-                    "cu_num_logits": input_batch.cu_num_logits[
-                        : input_batch.num_reqs + 1
-                    ].cpu(),
-                    "target_top_ids": top_ids32.cpu(),
-                    "target_top_vals": top_vals32.cpu(),
-                }
-            )
+            dump_record = {
+                "draft_sampled": draft_sampled.cpu(),
+                "pos": pos.cpu(),
+                "idx_mapping": input_batch.idx_mapping.cpu(),
+                "seeds": self.sampler.sampling_states.seeds.gpu.cpu(),
+                "cu_num_logits": input_batch.cu_num_logits[
+                    : input_batch.num_reqs + 1
+                ].cpu(),
+                "target_top_ids": top_ids32.cpu(),
+                "target_top_vals": top_vals32.cpu(),
+            }
 
         max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
         sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
@@ -302,6 +303,10 @@ class RejectionSampler:
             max_chunk_logits,
             max_num_logprobs,
         )
+        if dump_record is not None:
+            dump_record["sampled"] = sampled.cpu()
+            dump_record["num_sampled"] = num_sampled.cpu()
+            _dump_verify_record(dump_record)
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

@@ -422,7 +422,9 @@ def gumbel_sample(
                 # A 0-dim column index broadcasts against req_indices, so the
                 # scalar and per-token cases share one sync-free expression.
                 cols = output_processed_logits_col.to(torch.int64)
-                output_processed_logits[req_indices, cols].copy_(processed)
+                # Advanced indexing produces a copy, so copy_ on the indexed
+                # result would leave the verifier's persistent state untouched.
+                output_processed_logits[req_indices, cols] = processed
         return sampled.to(torch.int64)
 
     BLOCK_SIZE = 1024

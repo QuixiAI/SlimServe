@@ -238,8 +238,10 @@ def _reshape_attention_kv_cache(
 
     if packing is not None:
         offset, block_stride = packing
-        assert inv_order[0] == 0
-        page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(dtype)
+        # The physical layout must put blocks first; the public view may
+        # put K/V first (Metal exposes [2, blocks, ...] with order 1,0,...).
+        assert permuted_kv_cache_shape[0] == num_blocks
+        page_bytes = prod(permuted_kv_cache_shape[1:]) * get_dtype_size(dtype)
         kv_cache = (
             kv_raw_tensor.view(-1, block_stride)[:, offset : offset + page_bytes]
             .view(dtype)
@@ -321,6 +323,7 @@ def _reshape_kv_cache(
             packing = layer_packing.get(layer_name)
             host_tensor = host_resident_tensors.get(layer_name)
             if host_tensor is not None:
+                assert isinstance(kv_cache_spec, AttentionSpec)
                 # Host-resident main KV: the layer's kernel view is the GPU
                 # hot window of sub-rows (block_size / sub_blocks tokens each);
                 # logical blocks resolve through the residency's tables.
@@ -340,10 +343,14 @@ def _reshape_kv_cache(
                         else cache_dtype
                     ),
                 )
-                page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(kv_cache_spec.dtype)
+                page_bytes = prod(kv_cache_shape[1:]) * get_dtype_size(
+                    kv_cache_spec.dtype
+                )
                 assert sub_offset + page_bytes <= sub_stride
                 kv_caches[layer_name] = (
-                    kv_raw_tensor.view(rows, sub_stride)[:, sub_offset : sub_offset + page_bytes]
+                    kv_raw_tensor.view(rows, sub_stride)[
+                        :, sub_offset : sub_offset + page_bytes
+                    ]
                     .view(kv_cache_spec.dtype)
                     .view(kv_cache_shape)
                 )
@@ -503,6 +510,14 @@ def _update_hybrid_attention_mamba_layout(
                 continue
             kv_cache = kv_caches[layer_name]
             hidden_size = kv_cache.shape[2:].numel()
+            if (
+                kv_cache.stride(0) == hidden_size
+                and kv_cache.stride(1) >= 2 * hidden_size
+            ):
+                # Already page-local. Packed slabs may include other layers
+                # and padding between pages; collapsing their block stride
+                # makes attention overwrite the hybrid state allocations.
+                continue
             kv_cache.as_strided_(
                 size=kv_cache.shape,
                 stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
@@ -637,7 +652,9 @@ def init_kv_cache(
             if host_layers[0] in group.layer_names:
                 residency.group_id = gid
                 residency.manager_block_size = group.kv_cache_spec.block_size
-                residency.block_size = group.kv_cache_spec.block_size // residency.sub_blocks
+                residency.block_size = (
+                    group.kv_cache_spec.block_size // residency.sub_blocks
+                )
                 break
     return kv_caches
 

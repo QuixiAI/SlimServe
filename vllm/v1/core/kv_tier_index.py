@@ -101,9 +101,7 @@ class Trajectory:
             and self.main_slots[i] not in main_pending
         )
 
-    def _attn_complete(
-        self, i: int, due: "DueGids", disk_pending: set[int]
-    ) -> bool:
+    def _attn_complete(self, i: int, due: DueGids, disk_pending: set[int]) -> bool:
         """Every attention group DUE at position i is on the host or on disk.
 
         ``due(i)`` is the set of attention groups whose block completes at
@@ -132,7 +130,7 @@ class Trajectory:
 
     def resumable_blocks(
         self,
-        due: "DueGids",
+        due: DueGids,
         disk_pending: set[int] | None = None,
         main_pending: set[int] | None = None,
     ) -> int:
@@ -159,7 +157,7 @@ class Trajectory:
             n += 1
         return n if n == self.tail_boundary else 0
 
-    def attn_prefix_len(self, due: "DueGids") -> int:
+    def attn_prefix_len(self, due: DueGids) -> int:
         """Longest gap-free HOST-staged attention prefix, tail-agnostic.
 
         The resumable span for attention-only models: KV blocks are
@@ -184,7 +182,7 @@ class Trajectory:
             self.disk_tail_slots.values()
         )
 
-    def fully_on_disk(self, due: "DueGids", disk_pending: set[int]) -> bool:
+    def fully_on_disk(self, due: DueGids, disk_pending: set[int]) -> bool:
         """Every resumable position and the current tail are disk-resident,
         so the host copies can be released without losing resumability."""
         if self.tail_boundary <= 0 or self.disk_tail_boundary != self.tail_boundary:
@@ -221,15 +219,11 @@ class HostKVTierIndex:
         # block is a multiple of the hash block). A group is due at position
         # i only when its block completes there; resume boundaries must be
         # multiples of the ratios' lcm so every group's last block is whole.
-        self.attn_ratio = {
-            g: int((attn_ratio or {}).get(g, 1)) for g in self.attn_gids
-        }
+        self.attn_ratio = {g: int((attn_ratio or {}).get(g, 1)) for g in self.attn_gids}
         assert all(r >= 1 for r in self.attn_ratio.values())
         self.resume_align = 1
         for r in self.attn_ratio.values():
-            self.resume_align = self.resume_align * r // math.gcd(
-                self.resume_align, r
-            )
+            self.resume_align = self.resume_align * r // math.gcd(self.resume_align, r)
         self._free: list[int] = list(range(num_slots - 1, -1, -1))
         self._trajectories: OrderedDict[str, Trajectory] = OrderedDict()
         self._pending_write: set[int] = set()
@@ -278,9 +272,7 @@ class HostKVTierIndex:
         """Attention groups whose block completes at hash position i."""
         if self.resume_align == 1:
             return self.attn_gids
-        return frozenset(
-            g for g, r in self.attn_ratio.items() if (i + 1) % r == 0
-        )
+        return frozenset(g for g, r in self.attn_ratio.items() if (i + 1) % r == 0)
 
     # ------------------------------------------------------------------ write
 
