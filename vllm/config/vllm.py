@@ -75,6 +75,12 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         # confound in the 2026-08-12 NaN investigation. Runner choice must be
         # a property of the model, not of the speculative config.
         "DeepseekV4ForCausalLM",
+        # GLM-5.3-Flash (glm5_next, hybrid KDA + sparse MLA + mHC): served on
+        # V2 since 2026-09-10 (operator directive: V2 only, V1 deprecated).
+        # Non-spec boot validated through the registered TP8 profile; the
+        # DFlash2 speculator exists only on V2.
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
         "GraniteMoeForCausalLM",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",

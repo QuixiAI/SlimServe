@@ -1179,14 +1179,14 @@
       "local_dir": "GLM-5.3-Flash-NVFP4",
       "shared_note": "Safetensors checkpoint served from its directory; the vision tower, MTP head (model_mtp.safetensors), tokenizer and processor configs ship in the same repo. Requires transformers >= 5.16.1 for the native glm5_next config and processor.",
       "speculator": {
-        "repo": "RedHatAI/GLM-5.3-Flash-NVFP4",
-        "local_dir": "GLM-5.3-Flash-NVFP4",
+        "repo": "incoai/GLM-5.3-Flash-DFlash2",
+        "revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+        "local_dir": "GLM-5.3-Flash-DFlash2",
         "engine": {
-          "method": "mtp",
-          "num_speculative_tokens": 1,
-          "attention_backend": "QUIXICORE_MLA_SPARSE"
+          "method": "dflash",
+          "num_speculative_tokens": 7
         },
-        "note": "The checkpoint ships a one-layer MTP head (layer 45: ordinary residual NoPE pooled MLA + block-128 FP8 MoE, eh_proj/enorm/hnorm). Experimental --spec adapter: TP4 k=1 passes short canaries/exact-token checks but regresses c8/c16 throughput by about 3%; c1 is inconclusive. No TP8 or long-workload MTP qualification. Profiles stay non-speculative by default; see the 2026-09-09 performance notebook."
+        "note": "DFlash 2 drafter for GLM-5.3-Flash (Inco AI, cc-by-nc-nd-4.0; 2.34 GB bf16, 81 tensors: 5 non-causal sliding-window(2048) qwen3-classed layers H4096 / 32q-8kv heads / FFN 12288, rank-256 top-16 candidate selector, two-tap grouped(16) dynamic convolutions, fc over 5 taps; no own embedding or head - shares the target's embed_tokens and lm_head; mask token 154856). Block size 8 = up to 7 draft tokens per verify. Target taps: dflash_config.target_layer_ids [5, 14, 24, 33, 42] - the completed four-stream mHC output of those layers contracted by the mean over streams (SGLang PR 36708 hc_contract), which glm5_next captures through the EAGLE-3 aux-hidden-state interface. Served through the V2 runner's DFlash2 speculator (V1 is deprecated). Replaces the experimental checkpoint-MTP adapter (V1-only; k=3 gave +6.5% c1 and lost c8+ in the 2026-09-10 sweep) as the registered speculator."
       },
       "quants": {
         "NVFP4": {

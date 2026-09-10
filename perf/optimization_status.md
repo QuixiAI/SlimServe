@@ -24067,3 +24067,26 @@ restart is the operator's call.
   (operator's choice) through the V2 DFlash2 speculator. Tap contract from
   SGLang PR 36708: aux hidden state at layer k = hc_contract(stream
   tensor after layer k) = mean over the 4 mHC streams.
+
+## 2026-09-10: GLM-5.3-Flash moved to the V2 model runner; DFlash2 drafter registered
+
+- V1 deprecated (banner + selection warning, 633f988d5). glm5_next was on
+  V1 because hybrids need an explicit V2 qualification; both GLM
+  architectures are now in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES. First V2
+  boot of the registered TP8 record: health, 4,306,451-token pool (V1:
+  4,280,453), no V2-unsupported-feature warnings. Validation below.
+- incoai/GLM-5.3-Flash-DFlash2 (revision bf582e4e, 2.34 GB bf16, 81
+  tensors, no own embedding/head) is the registered speculator of the
+  glm53f-nvfp4 source (dflash, block 8, up to 7 drafts), replacing the
+  V1-only checkpoint-MTP adapter. Target side: glm5_next now implements
+  the EAGLE-3 aux-hidden-state interface; a tap at layer k is the mean over
+  the four mHC streams of layer k's completed output (glm5_mhc_post of the
+  layer's MLP output against its residual, then mean(dim=1)), matching
+  SGLang PR 36708's hc_contract; taps (6, 15, 25, 34, 43) in the +1
+  convention = target_layer_ids [5, 14, 24, 33, 42]. The V2 DFlash2
+  speculator borrows the target's embed_tokens/lm_head through
+  get_language_model(). Registry: 65 pass; CPU MTP/registry contracts 86.
+- V2 probe validated (validate_glm5_next.py, two warmed repeats): c1 109.6 /
+  c8 490.3 tok/s vs the V1 record's 109.9 / 494.6 - the same throughput
+  class; text (+reasoning), image, tool canaries pass. Raw: perf/results/
+  2026-09-10/glm53f-v2-runner-probe/. glm5_next is V2 by default from here.

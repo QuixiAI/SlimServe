@@ -119,8 +119,12 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
     assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
     assert len(seen) == 1 and seen[0].speculative
     config = engine_kwargs(seen[0])["speculative_config"]
-    assert config["method"] == "mtp" and config["num_speculative_tokens"] == 1
-    assert config["attention_backend"] == "QUIXICORE_MLA_SPARSE"
+    # incoai/GLM-5.3-Flash-DFlash2 (block 8): up to 7 drafts per verify.
+    assert config["method"] == "dflash" and config["num_speculative_tokens"] == 7
+    # Local checkout resolves to its directory; a hub load carries the pin.
+    assert config["model"].endswith("GLM-5.3-Flash-DFlash2") or (
+        config.get("revision") == "bf582e4eacc1810f76656d1811693ff6c6737d2a"
+    )
     assert not plan.speculative
 
 

@@ -25,6 +25,8 @@ phases.
 
 from collections.abc import Iterable
 
+from typing import ClassVar, Literal
+
 import torch
 from torch import nn
 
@@ -79,6 +81,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLP, DeepseekV2MoE
 from vllm.model_executor.models.interfaces import (
+    SupportsEagle3,
     HasInnerState,
     IsHybrid,
     SupportsPP,
@@ -463,6 +466,10 @@ class Glm5NextTextModel(nn.Module):
                 ["hidden_states"], config.hidden_size
             )
         )
+        # EAGLE-3 / DFlash convention: a value v in this tuple captures the
+        # completed output of layer v - 1 (set_eagle3_aux_hidden_state_layers
+        # passes the drafter's target_layer_ids + 1).
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -482,20 +489,55 @@ class Glm5NextTextModel(nn.Module):
         x = hidden_states.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
         residual = post_mix = res_mix = None
         layer = None
-        for layer in self.layers[self.start_layer:self.end_layer]:
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
             x, residual, post_mix, res_mix = layer(
                 x, positions, residual, post_mix, res_mix
             )
+            if (layer_idx + 1) in self.aux_hidden_state_layers:
+                # DFlash / EAGLE-3 tap: the completed output of this layer.
+                # The reference layer output is the four-stream mHC tensor
+                # post_ffn * mlp_out + comb_ffn^T residual (what the next
+                # transition would consume); the drafters were trained on
+                # its hc_contract, the mean over the streams (SGLang PR
+                # 36708, sglang.kernels.ops.layernorm.mhc.hc_contract).
+                taps = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
+                aux_hidden_states.append(taps.mean(dim=1))
         assert layer is not None
         streams = torch.ops.vllm.glm5_mhc_post(x, residual, post_mix, res_mix)
         # HyperHead: unweighted mean over the streams (reference; DSV4's
         # weighted head does not apply).
         hidden_states = streams.mean(dim=1)
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
-class Glm5NextForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
+
+
+# EAGLE-3 / DFlash auxiliary hidden-state taps (V2 speculators call
+# set_eagle3_aux_hidden_state_layers on the top-level model).
+_DFLASH_DEFAULT_TAPS = (6, 15, 25, 34, 43)  # incoai/GLM-5.3-Flash-DFlash2 target_layer_ids + 1
+
+
+class _Glm5NextAuxTaps:
+    supports_eagle3: ClassVar[Literal[True]] = True
+
+    def _text_model(self) -> "Glm5NextTextModel":
+        lm = getattr(self, "language_model", None)
+        return lm.model if lm is not None else self.model
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self._text_model().aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return _DFLASH_DEFAULT_TAPS
+
+class Glm5NextForCausalLM(
+    nn.Module, HasInnerState, IsHybrid, SupportsPP, SupportsEagle3, _Glm5NextAuxTaps
+):
     """Text-only serving entry for GLM-5.3-Flash (phase 1).
 
     The checkpoint's ``model.visual.*`` and MTP (layer 45) tensors are
@@ -863,7 +905,8 @@ class Glm5NextMultiModalProcessor(BaseMultiModalProcessor[Glm5NextProcessingInfo
     dummy_inputs=Glm5NextDummyInputsBuilder,
 )
 class Glm5NextForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsPP, HasInnerState, IsHybrid
+    nn.Module, SupportsMultiModal, SupportsPP, HasInnerState, IsHybrid,
+    SupportsEagle3, _Glm5NextAuxTaps,
 ):
     """GLM-5.3-Flash: vision tower + hybrid text backbone."""
 
