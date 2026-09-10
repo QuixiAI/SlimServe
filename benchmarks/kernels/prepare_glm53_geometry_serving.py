@@ -98,14 +98,17 @@ def completed_evidence(pair_path, closure_path):
     return common, qualified, reference, receipts
 
 
-def integration_sources(previous, additions):
+def integration_sources(previous, additions, *, allowed_changes=None):
+    from slimserve.rmsnorm_geometry import canonical_sources
+
+    allowed_changes = INTEGRATION_SITES if allowed_changes is None else allowed_changes
     sources, changed = {}, {}
-    for name, digest in previous.items():
+    for name, digest in canonical_sources(previous).items():
         path = Path(name).resolve()
         current = sha(path)
         if current != digest:
             require(
-                path in INTEGRATION_SITES,
+                path in allowed_changes,
                 f"qualified non-integration source changed: {path}",
             )
             changed[str(path)] = dict(qualified=digest, integration=current)

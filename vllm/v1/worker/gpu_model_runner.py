@@ -1016,6 +1016,9 @@ class GPUModelRunner(
         from slimserve.index_journal import install_index_journal
 
         install_index_journal(self)
+        from slimserve.kv_diagnostic import install as install_kv_diagnostic
+
+        install_kv_diagnostic(self)
         from slimserve.rmsnorm_geometry import install as install_rmsnorm_geometry
 
         install_rmsnorm_geometry(self)

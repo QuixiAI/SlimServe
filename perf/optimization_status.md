@@ -27510,3 +27510,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7;
   all eight manifest/cache/log/root/graph/binary/controller/audit records retained.
   Protocol/results: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Integrate KV-only diagnostic with the real serving lifecycle
+
+- Status: implementation CPU-qualified; fixed three-start model series prescribed.
+- Baseline/hypothesis: fixed glm53-nvfp4-4/rtx6000 recipe v1, original attention
+  combo versus original plus source/AOT-qualified split-KV overwrite. Isolate
+  model score effects; the additional launch is diagnostic, not a speed proposal.
+- Change: opt-in separate schema/flags and exact recipe/hardware validation;
+  reuse lifecycle, full quality/workload and bounded one-attempt controller.
+  Verify actual-root bindings before forward and across capture, including both
+  binary identities. Seal targets only; observe later non-target compilation.
+  Separate KV event stream, exact-only post-seal callbacks, private source copies,
+  pinned completed receipts, before/after GPU identity and terminal failure audits.
+- Correctness: 628 CPU tests pass/52.07 s, 14 upstream Torch warnings. Actual Torch
+  APIs/fake driver cover original/appended binding, capture, late loads, drift,
+  hook restoration, fixed workload/floors, independent preparation and closure.
+  Ruff/diff checks pass. Initial eleven cache-path fixture failures retained;
+  only the fixture changed. All 5,172 original files and pinned AOT evidence verify.
+- Limits: no GPU probe/model run/native build/TPS measurement in this stage.
+  Production default/quant and failed indexer oracle unchanged. Qualified live
+  loader/compiler/adapter/native sources stay exact; explicit offline-audit and
+  closed notebook updates are not represented as repeated AOT qualification.
+- Decision: commit then prescribe exactly control/KV/return once each, one fresh
+  cache/start and three repeats per case. Full quality, exact1000/300 c1/c8/c16,
+  cold32K/128K and text/image gates. Stop/audit first invalid case, no retries.
+  Freeze until terminal closure, CPU 8 GiB/serve 150 GiB and swap0.
+- Raw: `runtime-control/kv-serving-{initial,lifecycle,integration,final}-cpu.xml`
+  under 2026-09-10; source inspection SHA
+  db8c8a056a7b44d7145593963c5f7d6a97574eb6b2197b9bb3663b891d8e0cd1.
+  Prospective series/commands: `perf/glm53-kv-serving-protocol.md`.

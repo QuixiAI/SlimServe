@@ -23,7 +23,8 @@ from benchmarks.kernels.glm53_geometry_workload import (
     expected_environment,
     read,
 )
-from benchmarks.kernels.prepare_glm53_geometry_serving import CASES
+from slimserve.glm53_serving_diagnostic import cases
+from slimserve.glm53_serving_diagnostic import policy as serving_policy
 from slimserve.rmsnorm_diagnostic import sha
 
 PREFIXES = (
@@ -60,8 +61,6 @@ def local_environment(values):
 
 
 def frozen_manifest(path):
-    from slimserve.rmsnorm_geometry import read_manifest
-
     manifest = read(path)
     require(
         not subprocess.check_output(
@@ -70,7 +69,7 @@ def frozen_manifest(path):
         "commit all changes before the serving freeze",
     )
     with local_environment(environment(path, manifest, cpu=True)):
-        checked, checked_path = read_manifest()
+        checked, checked_path = serving_policy(manifest).read_manifest()
     require(checked_path == path and checked == manifest, "prepared manifest differs")
     return manifest
 
@@ -97,6 +96,17 @@ def release_query(record, key):
         return False
 
 
+def record_gpu_config(manifest, record, key):
+    if "expected_gpu_config" in manifest:
+        from benchmarks.kernels.check_glm53_kda_gate import gpu_config
+
+        record[key] = gpu_config()
+        require(
+            record[key] == manifest["expected_gpu_config"],
+            "GPU identity/driver/power changed",
+        )
+
+
 def inventory(folder):
     files = {}
     for path in sorted(folder.rglob("*")):
@@ -109,6 +119,14 @@ def inventory(folder):
 def check_completed(path):
     folder = path.parent
     record = read(folder / "launch.json")
+    manifest = read(path)
+    if "expected_gpu_config" in manifest:
+        require(
+            record["preflight"]["gpu_config_before"]
+            == record["gpu_config_after"]
+            == manifest["expected_gpu_config"],
+            "completed case GPU configuration changed",
+        )
     require(
         record["status"] == "complete"
         and record["manifest_sha256"] == sha(path)
@@ -142,10 +160,11 @@ def check_completed(path):
 
 
 def preflight(path, manifest):
-    index = [label for label, _ in CASES].index(manifest["label"])
+    order = cases(manifest)
+    index = [label for label, _ in order].index(manifest["label"])
     priors = [
         check_completed(path.parent.parent / label / "manifest.json")
-        for label, _ in CASES[:index]
+        for label, _ in order[:index]
     ]
     require(
         not any(
@@ -156,28 +175,32 @@ def preflight(path, manifest):
     )
     private = Path(manifest["private_namespace"])
     require(
-        inventory(private) == manifest["original_files"], "fresh private cache changed"
+        inventory(private)
+        == {**manifest["original_files"], **manifest.get("private_sources", {})},
+        "fresh private cache changed",
     )
     active = gpu_processes()
     require(not active.strip(), "another GPU workload is active")
     from slimserve import registry
-    from slimserve.rmsnorm_geometry import validate_plan
 
     with local_environment(environment(path, manifest, cpu=True)):
         plan = registry.resolve("glm53-nvfp4-4", "rtx6000", 4, None)
-        validate_plan(plan)
+        serving_policy(manifest).validate_plan(plan)
         require(
             plan.entry_file == MODEL
             and MODEL.is_dir()
             and manifest["workload"]["model"] == str(MODEL),
             "established recipe model directory not selected",
         )
-    return dict(priors=priors, gpu_processes_before=active, model=str(MODEL))
+    record = dict(priors=priors, gpu_processes_before=active, model=str(MODEL))
+    record_gpu_config(manifest, record, "gpu_config_before")
+    return record
 
 
 def execute(kind, path, manifest, record):
     cpu = kind == "audit"
     unit_key = hashlib.sha256(str(path.parent.parent).encode()).hexdigest()[:10]
+    candidate = cases(manifest)[1][0]
     child = (
         ["-m", "benchmarks.kernels.glm53_geometry_workload", str(path)]
         if cpu
@@ -187,7 +210,7 @@ def execute(kind, path, manifest, record):
         "systemd-run",
         "--user",
         "--scope",
-        f"--unit=glm53-geometry-{unit_key}-{manifest['label']}-{kind}",
+        f"--unit=glm53-{candidate}-{unit_key}-{manifest['label']}-{kind}",
         "-p",
         f"MemoryMax={8 if cpu else 150}G",
         "-p",
@@ -264,6 +287,7 @@ def launch(path):
         # Still audit failed/partial work. GPU query failure is not a free GPU.
         audit_code = execute("audit", path, manifest, record)
         released_after_audit = release_query(record, "gpu_processes_after_audit")
+        record_gpu_config(manifest, record, "gpu_config_after")
         verify(manifest)
         require(
             serve_code == audit_code == 0 and released and released_after_audit,
@@ -273,6 +297,15 @@ def launch(path):
         record["status"] = "complete"
     except BaseException as error:
         record.update(status="failed", error=repr(error))
+        if "serve" in record and "audit" not in record:
+            # Exceptions/interruption are terminal too. Retain an offline audit
+            # after the execute helper has stopped this case's owned scope.
+            try:
+                release_query(record, "gpu_processes_after")
+                execute("audit", path, manifest, record)
+                release_query(record, "gpu_processes_after_audit")
+            except BaseException as audit_error:
+                record["exception_audit_error"] = repr(audit_error)
         raise
     finally:
         try:
@@ -300,9 +333,13 @@ def close_series(series):
         result["gpu_processes_after"] = gpu_processes()
         require(not result["gpu_processes_after"].strip(), "GPU release not proven")
         failed = False
-        for label, _ in CASES:
+        order = cases(read(series / "control/manifest.json"))
+        candidate_label = order[1][0]
+        for label, _ in order:
             path = series / label / "manifest.json"
             manifest = frozen_manifest(path)
+            require(cases(manifest) == order, "mixed diagnostic schemas in one series")
+            record_gpu_config(manifest, result, "gpu_config_after")
             marker = path.parent / "launch.json"
             if failed:
                 require(not marker.exists(), "a case launched after terminal failure")
@@ -324,9 +361,9 @@ def close_series(series):
         else:
             audits = {
                 label: read(series / label / "workload-analysis.json")
-                for label, _ in CASES
+                for label, _ in order
             }
-            for label in ("geometry", "return-control"):
+            for label in (candidate_label, "return-control"):
                 require(
                     audits[label]["prefill_prompt_sha256"]
                     == audits["control"]["prefill_prompt_sha256"],
@@ -349,10 +386,14 @@ def close_series(series):
             result.update(
                 status="complete",
                 non_target_exact=True,
-                geometry_reproduces_failed_no_combo=audits["geometry"][
-                    "historical_comparisons"
-                ]["failed-no-combo"]["exact"],
-                geometry_quality_passed=audits["geometry"]["quality_passed"],
+                **{
+                    f"{candidate_label}_reproduces_failed_no_combo": audits[
+                        candidate_label
+                    ]["historical_comparisons"]["failed-no-combo"]["exact"],
+                    f"{candidate_label}_quality_passed": audits[candidate_label][
+                        "quality_passed"
+                    ],
+                },
                 controls_exact_to_original=all(
                     audits[label]["historical_comparisons"]["control"]["exact"]
                     for label in ("control", "return-control")

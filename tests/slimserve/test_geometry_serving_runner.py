@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.kernels import run_glm53_geometry_serving as runner
-from benchmarks.kernels.glm53_geometry_workload import FLAG, MANIFEST, command
+from benchmarks.kernels.glm53_geometry_workload import command
+from benchmarks.kernels.prepare_glm53_geometry_serving import CASES
 from slimserve.rmsnorm_diagnostic import sha
+from slimserve.rmsnorm_geometry import FLAG, MANIFEST
 
 
 def fixture(tmp_path, label="control"):
@@ -15,6 +17,7 @@ def fixture(tmp_path, label="control"):
     folder.mkdir()
     path = folder / "manifest.json"
     manifest = dict(
+        serving_schema="glm53-rmsnorm-geometry-serving-v1",
         label=label,
         mode="geometry" if label == "geometry" else "control",
         cache_root=str(folder / "cache"),
@@ -246,7 +249,7 @@ def test_gpu_query_failure_is_not_release(monkeypatch):
 
 def test_failed_series_closure_keeps_unused_cases_terminal(tmp_path, monkeypatch):
     manifests = {}
-    for label, _ in runner.CASES:
+    for label, _ in CASES:
         path, manifest = fixture(tmp_path, label)
         manifests[path] = manifest
         if label == "control":
@@ -298,7 +301,7 @@ def test_complete_closure_compares_actual_kernel_bindings(
     tmp_path, monkeypatch, mutation
 ):
     manifests = {}
-    for label, _ in runner.CASES:
+    for label, _ in CASES:
         path, manifest = fixture(tmp_path, label)
         manifests[path] = manifest
         audit = dict(

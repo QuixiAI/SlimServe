@@ -58,6 +58,7 @@ def diagnostic_only(args):
         or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC")
         or os.environ.get("SLIMSERVE_GLM53_RMSNORM_GEOMETRY")
+        or os.environ.get("SLIMSERVE_GLM53_KV_DIAGNOSTIC")
         or any(
             os.environ.get(key) == "1"
             for key in (
@@ -590,6 +591,9 @@ def main():
     from slimserve.glm53_ordering import validate_plan
 
     validate_plan(plan)
+    from slimserve.kv_diagnostic import validate_plan as validate_kv_plan
+
+    validate_kv_plan(plan)
     from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
 
     validate_rmsnorm_plan(plan)
@@ -600,6 +604,7 @@ def main():
         from slimserve.deterministic_reductions import diagnostic_plan
 
         plan = diagnostic_plan(plan)
+        validate_kv_plan(plan)
         validate_geometry_plan(plan)
     if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(

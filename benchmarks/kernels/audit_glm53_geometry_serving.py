@@ -13,8 +13,9 @@ from benchmarks.kernels.audit_glm53_geometry_loader import (
 from benchmarks.kernels.check_glm53_attention_norms import require, verify
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from benchmarks.kernels.glm53_geometry_serving import compare_qualified
+from slimserve.glm53_serving_diagnostic import policy as serving_policy
 from slimserve.rmsnorm_diagnostic import sha
-from slimserve.rmsnorm_geometry import AOT_CLOSURE_SHA, AOT_PAIR_SHA, SERVING_SCHEMA
+from slimserve.rmsnorm_geometry import AOT_CLOSURE_SHA, SERVING_SCHEMA
 
 PHASES = ("before-forward", "capture-before", "capture-after")
 
@@ -29,7 +30,10 @@ def check_worker(
     lifecycle,
     targets,
     qualified,
+    *,
+    graph_checker=None,
 ):
+    graph_checker = graph_checker or check_graph_records
     rank = manifest["rank"]
     require(
         summary["status"] == "capture-qualified"
@@ -81,7 +85,7 @@ def check_worker(
             manifest, graph, modules, roots, allow_additional_non_roots=True
         )
         result.update(
-            check_graph_records(
+            graph_checker(
                 manifest,
                 manifest_sha,
                 graph,
@@ -135,10 +139,18 @@ def audit_worker(path, manifest, rank):
         binaries = read(folder / "binary-loads.jsonl", True)
         roots = read(folder / "artifact-roots.jsonl", True)
         lifecycle = read(folder / "lifecycle.jsonl", True)
-        target_events = [
-            read(Path(manifest["receipts"]) / f"target-{i}/rank-{rank}.jsonl", True)
-            for i in range(len(manifest["targets"][str(rank)]))
-        ]
+        graph_checker = None
+        if manifest.get("serving_schema") == "glm53-kv-serving-v1":
+            from benchmarks.kernels.audit_glm53_kv_loader import (
+                check_graph_records as graph_checker,
+            )
+
+            target_events = read(folder / "loader-events.jsonl", True)
+        else:
+            target_events = [
+                read(Path(manifest["receipts"]) / f"target-{i}/rank-{rank}.jsonl", True)
+                for i in range(len(manifest["targets"][str(rank)]))
+            ]
         reference = manifest["qualified_graphs"][manifest["mode"]][str(rank)]
         require(
             sha(reference["path"]) == reference["sha256"],
@@ -155,6 +167,7 @@ def audit_worker(path, manifest, rank):
             lifecycle,
             target_events,
             qualified,
+            graph_checker=graph_checker,
         )
         result["status"] = "complete"
     except Exception as error:
@@ -168,10 +181,13 @@ def audit_worker(path, manifest, rank):
 def audit(path):
     path = path.resolve()
     manifest = json.loads(path.read_text())
+    policy = serving_policy(manifest)
     require(
-        manifest["serving_schema"] == SERVING_SCHEMA
-        and manifest["aot_qualification_sha256"] == AOT_PAIR_SHA
-        and manifest["aot_closure_sha256"] == AOT_CLOSURE_SHA
+        manifest["aot_qualification_sha256"] == policy.AOT_PAIR_SHA
+        and (
+            policy.SERVING_SCHEMA != SERVING_SCHEMA
+            or manifest["aot_closure_sha256"] == AOT_CLOSURE_SHA
+        )
         and manifest["worker_receipts"] == str(path.parent / "worker-receipts")
         and manifest["receipts"] == str(path.parent / "receipts"),
         "unexpected serving qualification manifest",

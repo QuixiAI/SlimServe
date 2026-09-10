@@ -35,7 +35,28 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): all-rank KV AOT qualification PASSES
+### Latest checkpoint (2026-09-10): KV serving integration CPU-qualified
+
+The opt-in KV policy now shares the geometry serving lifecycle/workload/controller.
+Actual root modules feed KV seal/verify; original and appended launch receipts are
+checked before forward and across capture. Binary observation remains open for
+later non-target compilation; KV controller events have their own stream. Only
+exact previously bound graph callbacks may follow target sealing. Production
+defaults, quant, quality floors and the failed indexer oracle are unchanged.
+
+CPU 628 pass/52.07 s; Ruff/diff checks pass. Pinned completed AOT evidence and all
+5,172 original cache files verify. No model process, GPU probe or build ran in this
+step. Qualified loader/compiler/adapter/native sources remain exact; the offline
+event auditor and closed-stage notebook changes are explicitly accounted for.
+
+NEXT after committing: prepare and run exactly control/KV/return-control once
+each, under `perf/results/2026-09-10/kv-serving-v1/`. Full unchanged quality and
+cold-prefix/c1/c8/c16/32K/128K workload. CPU 8 GiB/serve 150 GiB, swap0; audit and
+stop at first invalid process, no replacements. Freeze preparation through terminal
+closure. Exact commands/gates: `perf/glm53-kv-serving-protocol.md`. No new TPS
+baseline or model-causality result yet. Previous completed checkpoint follows.
+
+### Previous checkpoint (2026-09-10): all-rank KV AOT qualification PASSES
 
 On `7b753a65a`, v2 completes exactly eight prescribed GPU processes: control
 ranks 0..3, then KV ranks 0..3. All loads/audits and the final comparison exit 0.

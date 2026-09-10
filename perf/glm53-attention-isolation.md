@@ -379,3 +379,29 @@ non-target startup compilation, verify snapshots before forward and before/after
 capture, and explicitly freeze/account for integration changes. Then prescribe
 the bounded original/KV/return-original model series. No next model job has yet
 been prescribed; the separate indexer oracle failure remains open.
+
+## KV serving integration checkpoint
+
+The opt-in serving integration is CPU-qualified: 628 pass/52.07 s (14 upstream
+warnings), Ruff/diff checks pass. No GPU/model/native build in this stage.
+Shared lifecycle now accepts KV's actual-root inventory and qualified loader;
+separate event stream and independent appended-launch comparison work before
+forward/across capture, while legitimate non-target compilation remains observed.
+The qualified KV loader, adapter, compiler, live graph inventory and native
+sources stay exact. The offline event checker gains a serving-only open-observer
+option permitting exact duplicate graph callbacks after target seal; its original
+no-weights mode remains globally sealed. This notebook is released only between
+closed experiments. Both source changes are explicitly recorded by preparation.
+
+Completed AOT receipts and 5,172 original files verify through pinned-data joins,
+not historical frozen readers. Source inspection SHA
+db8c8a056a7b44d7145593963c5f7d6a97574eb6b2197b9bb3663b891d8e0cd1.
+CPU reports `runtime-control/kv-serving-{initial,lifecycle,integration,final}-cpu.xml`
+retain all attempts, including the corrected CPU fixture path mismatch.
+
+Next model series is now prescribed after the integration commit: exactly
+control/KV/return-control once each, no replacements, same workload and quality
+floors. Preparation begins the freeze; terminal closure ends it. Full commands,
+resource limits, qualification boundaries and failure policy are in
+`perf/glm53-kv-serving-protocol.md`. No TPS/default/quant or failed indexer-oracle
+promotion follows from CPU tests.

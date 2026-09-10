@@ -26,15 +26,24 @@ from slimserve.rmsnorm_diagnostic import sha
 
 
 def stable_bindings(report):
-    return sorted(
-        [
-            {
+    def stable(row):
+        result = {
+            k: v
+            for k, v in row.items()
+            if k not in ("module_index", "observed_binary_index")
+        }
+        # KV has a second independently observed launch. Ignore only its
+        # process-local index, never its source, configuration or binary bytes.
+        if isinstance(result.get("appended"), dict):
+            result["appended"] = {
                 k: v
-                for k, v in r.items()
-                if k not in ("module_index", "observed_binary_index")
+                for k, v in result["appended"].items()
+                if k != "observed_binary_index"
             }
-            for r in report["bindings"]
-        ],
+        return result
+
+    return sorted(
+        [stable(r) for r in report["bindings"]],
         key=lambda r: (r["graph"], r["symbol"], r["source"]),
     )
 
@@ -49,8 +58,19 @@ def compare_qualified(actual, qualified):
 
 
 class ServingGeometry:
-    def __init__(self, rank, manifest, path):
+    def __init__(
+        self,
+        rank,
+        manifest,
+        path,
+        *,
+        loader_type=None,
+        graph_inventory=None,
+        root_only=False,
+    ):
         self.rank, self.manifest, self.path = rank, manifest, Path(path)
+        self.inventory = graph_inventory or inventory
+        self.root_only = root_only
         self.mode = manifest["mode"]
         self.private = Path(manifest["private_namespace"])
         self.folder = Path(manifest["worker_receipts"]) / f"rank-{rank}"
@@ -64,7 +84,7 @@ class ServingGeometry:
         self.lock = threading.RLock()
         self.streams = {
             kind: (self.folder / f"{kind}.jsonl").open("x")
-            for kind in ("binary-loads", "artifact-roots", "lifecycle")
+            for kind in ("binary-loads", "artifact-roots", "lifecycle", "loader-events")
         }
         self.stack = ExitStack()
         self.store = None
@@ -81,12 +101,15 @@ class ServingGeometry:
             observer_globally_sealed=False,
         )
         self.save()
-        self.loader = GeometryLoader(
+        self.loader = (loader_type or GeometryLoader)(
             rank,
             manifest,
             path,
             self.mode,
-            emit=lambda row: self.emit("binary-loads", row),
+            emit=lambda row: self.emit(
+                "loader-events" if row["event"].startswith("kv_") else "binary-loads",
+                row,
+            ),
         )
         self.roots = ArtifactRootObserver(
             manifest["artifact_roots"][str(rank)],
@@ -118,12 +141,14 @@ class ServingGeometry:
         require(phase not in self.summary["snapshots"], "no repeated capture/snapshot")
         modules_path = self.raw_modules(phase)  # Retain evidence before validation.
         roots = self.roots.roots(self.store, PyCodeCache.modules)
-        graph = inventory(
+        graph = self.inventory(
             roots, self.manifest, self.rank, self.mode, self.loader.observer
         )
         compare_qualified(graph, self.qualified)
         if self.loaded:
-            self.loader.controller.verify_graphs(PyCodeCache.modules)
+            self.loader.controller.verify_graphs(
+                roots if self.root_only else PyCodeCache.modules
+            )
         path = self.folder / f"{phase}-bindings.json"
         write_new(path, graph)
         self.summary["snapshots"][phase] = dict(
@@ -174,7 +199,7 @@ class ServingGeometry:
                     )
                     roots = self.roots.roots(store, PyCodeCache.modules)
                     compare_qualified(
-                        inventory(
+                        self.inventory(
                             roots,
                             self.manifest,
                             self.rank,
@@ -183,7 +208,9 @@ class ServingGeometry:
                         ),
                         self.qualified,
                     )
-                    self.loader.controller.verify_graphs(PyCodeCache.modules)
+                    self.loader.controller.verify_graphs(
+                        roots if self.root_only else PyCodeCache.modules
+                    )
                     self.emit("lifecycle", dict(event="aot_store_reuse_verified"))
                     return
                 self.store = store
@@ -221,7 +248,11 @@ class ServingGeometry:
                     "serving static bundle coverage incomplete",
                 )
                 self.snapshot("before-forward")
-                self.loader.controller.seal(PyCodeCache.modules)
+                self.loader.controller.seal(
+                    self.roots.roots(store, PyCodeCache.modules)
+                    if self.root_only
+                    else PyCodeCache.modules
+                )
                 self.loaded = True
                 self.summary.update(
                     status="aot-qualified",
@@ -299,6 +330,10 @@ class ServingGeometry:
             self.stack.close()
         finally:
             self.installed, self.closed = False, True
-            self.loader.close()
-            for stream in self.streams.values():
-                stream.close()
+            try:
+                close = getattr(self.loader, "close", None)
+                if close is not None:
+                    close()
+            finally:
+                for stream in self.streams.values():
+                    stream.close()

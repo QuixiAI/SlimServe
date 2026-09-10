@@ -30,7 +30,7 @@ def scores(documents):
     ]
 
 
-@pytest.mark.parametrize("label", ["control", "geometry", "return-control"])
+@pytest.mark.parametrize("label", ["control", "geometry", "kv", "return-control"])
 def test_original_scores_pass_diagnostic_without_production_promotion(docs, label):
     refs = {
         "control": docs[:1],
@@ -45,7 +45,8 @@ def test_original_scores_pass_diagnostic_without_production_promotion(docs, labe
 
 
 @pytest.mark.parametrize(
-    "label,allowed", [("control", False), ("geometry", True), ("return-control", False)]
+    "label,allowed",
+    [("control", False), ("geometry", True), ("kv", True), ("return-control", False)],
 )
 def test_geometry_regression_is_observation_not_relaxed_quality_gate(
     docs, label, allowed
@@ -67,7 +68,7 @@ def test_geometry_regression_is_observation_not_relaxed_quality_gate(
     )
 
 
-@pytest.mark.parametrize("label", ["control", "geometry", "return-control"])
+@pytest.mark.parametrize("label", ["control", "geometry", "kv", "return-control"])
 def test_nonrepeatable_scores_stop_every_arm(docs, label):
     refs = {"control": docs[:1], "return-control": docs[1:2]}
     update_window(docs[3], 0, -2.001)
@@ -96,6 +97,7 @@ def summary_fixture(tmp_path):
     path = tmp_path / "control/manifest.json"
     folder = path.parent / "campaign/boot-1"
     manifest = dict(
+        serving_schema="glm53-rmsnorm-geometry-serving-v1",
         label="control",
         mode="control",
         git_commit="frozen",
@@ -319,6 +321,7 @@ def test_retained_real_workload_replay_is_a_failed_quality_observation(tmp_path)
     from slimserve.campaign_sources import snapshot
 
     manifest = dict(
+        serving_schema="glm53-rmsnorm-geometry-serving-v1",
         workload=spec,
         label="geometry",
         mode="geometry",

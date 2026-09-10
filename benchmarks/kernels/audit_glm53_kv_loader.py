@@ -24,8 +24,18 @@ from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from slimserve.rmsnorm_diagnostic import sha
 
 
-def check_graph_records(manifest, manifest_sha, graphs, binary_events, events):
-    images = binary_records(manifest, binary_events)
+def check_graph_records(
+    manifest,
+    manifest_sha,
+    graphs,
+    binary_events,
+    events,
+    *,
+    require_global_seal=True,
+):
+    images = binary_records(
+        manifest, binary_events, require_global_seal=require_global_seal
+    )
     rank, mode = manifest["rank"], manifest["mode"]
     private = Path(manifest["private_namespace"])
 
@@ -72,14 +82,17 @@ def check_graph_records(manifest, manifest_sha, graphs, binary_events, events):
         ),
         "non-target dispatch intervention",
     )
+    seals = [i for i, e in enumerate(events) if e["event"] == "kv_sealed"]
+    require(len(seals) == 1, "KV controller requires exactly one seal")
+    seal_index = seals[0]
     require(
         events
         and events[0]["event"] == "kv_begin"
-        and events[-1]["event"] == "kv_sealed"
+        and (not require_global_seal or seal_index == len(events) - 1)
         and all(e["rank"] == rank for e in events),
         "KV controller lifecycle incomplete",
     )
-    begin, seal = events[0], events[-1]
+    begin, seal = events[0], events[seal_index]
     require(
         begin["mode"] == mode
         and begin["manifest_sha256"] == manifest_sha
@@ -88,7 +101,7 @@ def check_graph_records(manifest, manifest_sha, graphs, binary_events, events):
         "KV controller identity changed",
     )
     owners, bindings = {}, set()
-    for event in events[1:-1]:
+    for event in events[1:seal_index]:
         if event["event"] == "kv_binding":
             index = event["binding_index"]
             require(
@@ -121,6 +134,15 @@ def check_graph_records(manifest, manifest_sha, graphs, binary_events, events):
         and seal["targets"] == len(owners) > 0
         and seal["graph_bindings"] == sum(r["target"] for r in graphs["bindings"]),
         "KV controller and independent graph coverage differ",
+    )
+    # Serving leaves observation/hooks open for later non-target compilation.
+    # Only exact callbacks for already-bound globals may follow target sealing.
+    prior_graph_events = [
+        e for e in events[1:seal_index] if e["event"] == "kv_graph_binding"
+    ]
+    require(
+        all(e in prior_graph_events for e in events[seal_index + 1 :]),
+        "new or changed KV controller event after seal",
     )
     result["appended_launchers"] = (
         sum(r["target"] for r in graphs["bindings"]) if mode == "kv" else 0

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fixed full-model causal workload; quality failure is never a performance win.
 
-Controls must reproduce the original scores exactly. Geometry scores are an
+Controls must reproduce the original scores exactly. Candidate scores are an
 observation (including failed unchanged quality floors), provided the workload,
 needles and within-start repetition qualify. This allows the prescribed return
 control to test reversibility without promoting a failed-quality intervention.
@@ -22,8 +22,8 @@ from benchmarks.analyze_glm53_quality_pair import (
     require,
 )
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
+from slimserve.glm53_serving_diagnostic import policy as serving_policy
 from slimserve.rmsnorm_diagnostic import sha
-from slimserve.rmsnorm_geometry import FLAG, MANIFEST
 
 ROOT = Path(__file__).resolve().parents[2]
 PROMPT = Path("/home/tiny/.local/scratch/slimserve-glm53/prompt-source.txt")
@@ -173,6 +173,7 @@ def command(path, manifest):
 
 
 def expected_environment(path, manifest):
+    policy = serving_policy(manifest)
     return {
         **manifest["workload"]["environment"],
         "VLLM_CACHE_ROOT": manifest["cache_root"],
@@ -182,8 +183,8 @@ def expected_environment(path, manifest):
         "VLLM_FORCE_AOT_LOAD": "1",
         "TORCHINDUCTOR_COMPILE_THREADS": "1",
         "TRITON_CACHE_AUTOTUNING": "1",
-        FLAG: manifest["mode"],
-        MANIFEST: str(path),
+        policy.FLAG: manifest["mode"],
+        policy.MANIFEST: str(path),
     }
 
 
@@ -282,6 +283,9 @@ def check_summary(path, manifest, summary):
 
 
 def check_scores(label, documents, scores, reference_docs, reference_scores):
+    require(
+        label in ("control", "return-control", "geometry", "kv"), "unknown causal arm"
+    )
     identity = input_identity(reference_docs["control"][0])
     require(
         all(input_identity(d) == identity for d in documents),
@@ -299,8 +303,8 @@ def check_scores(label, documents, scores, reference_docs, reference_scores):
             text=delta_summary(rows[0]["text"], scores[0]["text"]),
             needles=delta_summary(rows[0]["needles"], scores[0]["needles"]),
         )
-    control = label != "geometry"
-    # A geometry quality regression is retained as a diagnostic observation. The
+    control = label in ("control", "return-control")
+    # A candidate quality regression is retained as a diagnostic observation. The
     # existing floors are evaluated unchanged and never labelled a quality pass.
     passed = repeated and (
         not control or (gate["passed"] and comparisons["control"]["exact"])
