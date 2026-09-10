@@ -160,3 +160,72 @@ complete graph coverage and unchanged non-target bindings. The installed
 `CachingAutotuner.run` has a cached-launcher fast path; explicitly verify that
 the live call path cannot bypass the overwrite. Only then prescribe the bounded
 original/KV/return real-profile series. No next GPU/model job is prescribed yet.
+
+## KV graph-loader implementation: CPU-tested, not GPU-qualified
+
+The new benchmark-only `glm53_kv_loader.py` uses a separate
+`glm53-kv-loader-v1` manifest and `control`/`kv` arms. Both arms assign the target
+autotuner's instance `run` explicitly, bypassing both the ordinary dispatcher and
+its possibly different cached fast launcher. Control calls the exact original
+static launcher; candidate calls the already-qualified `KVOnlyOverwrite.run`.
+The original `compile_results` and `launchers` entries are not replaced with a
+misleading one-kernel description of a two-launch operation.
+
+`audit_glm53_kv_graphs.py` independently walks supplied actual AOT-root modules,
+using the geometry auditor's shared graph/source/call-export checks. It follows
+the live adapter's appended launcher into its observed static CUDA object, then
+checks its kernel name, full configuration, semantic key and whole-cubin hash.
+The original combo is independently checked, and all non-target graph bindings
+remain in the report for exact cross-arm comparison. Controller callback
+coverage is an additional seal, not the source of the independent inventory.
+
+Strong references plus one RLock protect shared target futures. An upstream
+future is resolved once for each target object; aliases revalidate/reuse it.
+Finished graph modules are bound too. Sealing rejects new targets/modules and
+changed run/config/binary/source bindings, while allowing legitimate unrelated
+compilation before capture completes. Source/debug provenance and rank-private
+cache checks are reused. `glm53_loader_hooks.py` shares hook installation and
+exact restoration with geometry, including foreign-hook preservation; future
+geometry preparation includes this dependency in its frozen source list.
+
+CPU final: 449 passed in 41.23 s, 14 upstream Torch deprecation warnings. Tests use
+real CachingAutotuner, StaticAutotunerFuture, PyCodeCache and static launcher
+objects, replacing only the driver's load/launch interface. They cover actual
+eleven-argument combo and five-argument KV calls, stream/destination forwarding,
+the persistent KV configuration without R0_BLOCK, concurrent imports, future
+aliases, complete module binding, cached-path bypass, late targets, tampering,
+non-target inventory/compilation and hook restoration. The preceding 75-pass and
+111-pass reports remain; early fixture failures and the stale historical-source
+test failure are retained too. That last failure was the runtime correctly
+rejecting old qualification after implementation changes. The test now verifies
+rejection at both policy and direct-client entrypoints; no guard was weakened
+and no historical manifest/attempt was rewritten.
+
+Final CPU command (no GPU, 8 GiB/swap0):
+
+```bash
+systemd-run --user --scope --unit=glm53-kv-loader-final-cpu -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m pytest \
+  tests/slimserve/test_kv_loader.py tests/slimserve/test_geometry_loader.py \
+  tests/slimserve/test_binary_observer.py tests/slimserve/test_attention_overwrite.py \
+  tests/slimserve/test_artifact_roots.py tests/slimserve/test_geometry_loader_audit.py \
+  tests/slimserve/test_geometry_serving.py tests/slimserve/test_geometry_serving_runner.py \
+  tests/slimserve/test_geometry_workload.py tests/slimserve/test_rmsnorm_geometry.py \
+  tests/slimserve/test_rmsnorm_geometry_probe.py tests/slimserve/test_rmsnorm_intervention.py \
+  tests/slimserve/test_rmsnorm_graph_audit.py tests/slimserve/test_attention_contracts.py \
+  -q --junitxml=perf/results/2026-09-10/runtime-control/kv-loader-final-cpu.xml
+```
+
+Raw reports are `runtime-control/loader-hooks-cpu.xml` and
+`runtime-control/kv-loader-{cpu,dispatch-cpu,regression-cpu,freeze-cpu,final-cpu}.xml`
+under `perf/results/2026-09-10/`. Lint/diff checks pass. No native build, actual
+GPU load, model start, serving-default/quant change or new TPS measurement.
+The source-level adapter's prior GPU result remains valid historical evidence;
+the new loader itself still needs actual all-rank AOT qualification.
+
+Next implement a dedicated preparer/runner/auditor joining the completed adapter
+and static attention-map receipts. Preserve the original AOT roots and all
+non-target sources, copy the KV sources privately, reproduce their recorded
+binaries from source, and freeze the new loader, shared hooks and audit dependencies. The geometry
+preparer's thirteen-target assumptions do not apply. Prescribe command order,
+failure handling and resource limits and commit before GPU loading. No new
+GPU/model job is prescribed by this implementation checkpoint.

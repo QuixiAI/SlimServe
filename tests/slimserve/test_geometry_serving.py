@@ -623,17 +623,22 @@ def test_source_aliases_keep_identical_receipts_but_reject_conflicts(tmp_path):
         policy.canonical_sources(receipts)
 
 
-def test_real_prepared_manifest_roundtrip_with_current_source_freeze(
+def test_historical_prepared_manifest_enforces_qualified_source_freeze(
     tmp_path, monkeypatch
 ):
     """Actual v1 metadata/qualified receipts; no cache copies, GPU or model load.
 
-    A fresh CPU fixture refreshes only the current implementation hashes and local
-    case paths. It must not rewrite or reuse the terminal v1 manifest/attempt.
+    A fresh CPU fixture refreshes current hashes and local case paths. That is
+    NOT requalification: if a qualified helper changed, both the policy and the
+    actual client must reject it before model work. Historical files stay intact.
     """
     import subprocess
 
-    from benchmarks.kernels.prepare_glm53_geometry_serving import CASES, ROOT
+    from benchmarks.kernels.prepare_glm53_geometry_serving import (
+        CASES,
+        INTEGRATION_SITES,
+        ROOT,
+    )
 
     original = (
         ROOT
@@ -643,6 +648,17 @@ def test_real_prepared_manifest_roundtrip_with_current_source_freeze(
         pytest.skip("local completed campaign receipts are not distributed")
     base = json.loads(original.read_text())
     base["sources"] = {name: sha(name) for name in base["sources"]}
+    reference = base["qualified_manifest"]
+    assert sha(reference["path"]) == reference["sha256"]
+    qualified = json.loads(Path(reference["path"]).read_text())
+    changed = {
+        name
+        for name, digest in policy.canonical_sources(qualified["sources"]).items()
+        if Path(name) not in INTEGRATION_SITES and base["sources"][name] != digest
+    }
+    mismatch = (
+        "serving targets/roots or frozen implementation differ from AOT qualification"
+    )
     base["git_commit"] = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], text=True
     ).strip()
@@ -689,12 +705,17 @@ def test_real_prepared_manifest_roundtrip_with_current_source_freeze(
             "TORCHINDUCTOR_CACHE_DIR",
             str(Path(data["private_namespace"]) / "inductor_cache"),
         )
-        actual, checked = policy.read_manifest()
-        assert actual == data and checked == path
+        if changed:
+            with pytest.raises(ValueError, match=mismatch):
+                policy.read_manifest()
+        else:
+            actual, checked = policy.read_manifest()
+            assert actual == data and checked == path
 
     # Reproduce the actual direct-file client entrypoint in a separate Python
     # process with no inherited repository path. Stop after real profile/manifest
-    # validation but BEFORE tokenizer/model/server work. Hardware discovery alone
+    # validation (or its source-receipt rejection) BEFORE tokenizer/model/server work.
+    # Hardware discovery alone
     # is replaced, so this remains CPU-only on machines without the target GPUs.
     from benchmarks.kernels.glm53_geometry_workload import command
     from benchmarks.kernels.run_glm53_geometry_serving import environment
@@ -720,7 +741,12 @@ sys.argv = {argv!r}
 try:
     main()
 except Validated:
+    assert not {bool(changed)!r}, 'stale qualification reached tokenizer'
     print('real-client-profile-validated-without-model-start')
+except ValueError as error:
+    if not {bool(changed)!r} or str(error) != {mismatch!r}:
+        raise
+    print('real-client-stale-qualification-rejected-without-model-start')
 else:
     raise AssertionError('client did not reach validation boundary')
 """
@@ -735,4 +761,9 @@ else:
         timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "real-client-profile-validated-without-model-start" in result.stdout
+    marker = (
+        "real-client-stale-qualification-rejected-without-model-start"
+        if changed
+        else "real-client-profile-validated-without-model-start"
+    )
+    assert marker in result.stdout

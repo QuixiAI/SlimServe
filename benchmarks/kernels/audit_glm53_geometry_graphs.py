@@ -98,6 +98,21 @@ def run_symbols(source):
 
 
 def inventory(modules, manifest, rank, mode, observer):
+    require(mode in ("control", "geometry"), "invalid graph audit mode")
+
+    def check_target(tuner, target):
+        saved = target["configs"][mode]
+        require(
+            launcher_receipt(tuner) == expected_receipt(saved)
+            and observer.digest(tuner.compile_results[0]) == saved["cubin_sha256"],
+            "graph selected wrong target config/binary",
+        )
+        return {}
+
+    return graph_inventory(modules, manifest, rank, observer, check_target)
+
+
+def graph_inventory(modules, manifest, rank, observer, check_target):
     """Neither controller owners nor its graph_bindings determine this inventory.
 
     The caller supplies actual artifact-root modules, NOT every cached module
@@ -107,7 +122,6 @@ def inventory(modules, manifest, rank, mode, observer):
     bound Triton globals so a later control/geometry comparison can also reject
     unrelated changes. No model execution is performed.
     """
-    require(mode in ("control", "geometry"), "invalid graph audit mode")
     private = Path(manifest["private_namespace"])
     original = Path(manifest["original_namespace"])
     expected_graphs = manifest["expected_graphs"][str(rank)]
@@ -167,17 +181,14 @@ def inventory(modules, manifest, rank, mode, observer):
             observer.verify_launcher(results[0], tuner.launchers[0])
             binary = observer.digest(results[0])
             target = targets.get(source_relative)
+            extra = {}
             if target is not None:
                 key = (relative, symbol, source_relative)
                 require(
                     key in expected_bindings and symbol in referenced,
                     "unexpected or unused target graph binding",
                 )
-                require(
-                    selected == expected_receipt(target["configs"][mode])
-                    and binary == target["configs"][mode]["cubin_sha256"],
-                    "graph selected wrong target config/binary",
-                )
+                extra = check_target(tuner, target)
                 found_targets.add(key)
             bound_symbols.add(symbol)
             record = observer.records[id(results[0].kernel)]
@@ -194,6 +205,7 @@ def inventory(modules, manifest, rank, mode, observer):
                     cubin_sha256=binary,
                     observed_binary_index=record["index"],
                     module_index=len(objects),
+                    **extra,
                 )
             )
         require(

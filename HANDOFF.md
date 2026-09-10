@@ -35,7 +35,36 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): KV-only adapter isolated qualification PASSES
+### Latest checkpoint (2026-09-10): KV graph-loader implementation CPU-tested
+
+`benchmarks/kernels/glm53_kv_loader.py` now binds the actual autotuner instance
+`run` directly: original precompiled combo for control; original combo followed
+by the qualified KV adapter for candidate. Original compile-results/launcher
+metadata stays unchanged, and the appended launch is audited separately from
+the live adapter by `audit_glm53_kv_graphs.py`. Atomic future resolution, finished
+module binding, private-cache provenance and late-binding seals are implemented.
+
+Shared lifecycle moved to `glm53_loader_hooks.py`; graph-root walking is reused
+from the geometry auditor. Future geometry preparation freezes the new helper.
+Final CPU suite: 449 passed in 41.23 s (14 upstream deprecation warnings), including
+real Torch future/code-cache/static-launcher APIs with a fake CUDA driver.
+Reports: `perf/results/2026-09-10/runtime-control/kv-loader-{cpu,dispatch-cpu,
+regression-cpu,freeze-cpu,final-cpu}.xml`, plus `loader-hooks-cpu.xml`.
+Earlier test failures remain recorded. The historical geometry-source guard
+correctly rejects this changed loader; its test now expects that rejection in
+both the policy and direct client, without relaxing qualification.
+
+NEXT: implement preparation and bounded no-weights actual-AOT qualification for
+this separate KV manifest. Join the completed adapter/attention-map receipts,
+copy private caches and KV sources, discover actual serialized roots, freeze all
+new helpers, and prescribe/commit the exact command order before GPU loading.
+Do not pass a KV manifest to the thirteen-target geometry preparer. Then qualify
+all ranks and unchanged non-target bindings before original/KV/return serving.
+No new GPU/model run or source freeze is active/prescribed. CPU tests do NOT
+qualify actual cached graphs, model quality or TPS; production/quant/defaults
+and the separate failed indexer oracle gate are unchanged.
+
+### Previous checkpoint (2026-09-10): KV-only adapter isolated qualification PASSES
 
 On `f6ff10453`, exactly one rank-sequential GPU process completes all 120 cases;
 probe/audit exit0. Adapter KV matches direct split KV over 203,390,976 BF16 values,

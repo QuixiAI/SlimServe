@@ -187,12 +187,14 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         glm53_artifact_roots,
         glm53_binary_observer,
         glm53_geometry_loader,
+        glm53_loader_hooks,
     )
 
     additions = [
         Path(__file__),
         Path(glm53_binary_observer.__file__),
         Path(glm53_geometry_loader.__file__),
+        Path(glm53_loader_hooks.__file__),
         Path(audit_glm53_geometry_graphs.__file__),
         Path(check_glm53_geometry_loader.__file__),
         Path(audit_glm53_geometry_loader.__file__),

@@ -58,7 +58,7 @@ def make_compiled(root, name="norm", config=None, rank=0):
     compiled = StaticTritonCompileResult(
         kernel,
         triton.Config(
-            {k: config[k] for k in ("XBLOCK", "R0_BLOCK")},
+            {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")},
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
         ),

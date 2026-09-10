@@ -27396,3 +27396,35 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   bfaa7a495e7b69f228661a4402f5a6d5229d53b6950b6e7ee8cfa6275975144d;
   all 120 case records, eight binary receipts/caches and source copies retained.
   Full result and historical commands: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Bind KV-only graph diagnostics with independent launch inventory
+
+- Status: implementation CPU-tested; actual AOT/GPU qualification pending.
+- Scope/baseline: fixed glm53-nvfp4-4/rtx6000 recipe v1, original attention combo
+  versus original plus the source-qualified KV-only adapter. Diagnostic extra
+  launch, not an optimization or new performance baseline.
+- Hypothesis: explicit instance-run binding can isolate KV arithmetic in real
+  graph calls without Inductor's cached fast launcher bypassing the intervention.
+- Change: separate KV manifest/controller, atomic target future resolution and
+  finished-module binding. Both arms directly dispatch qualified launchers;
+  original metadata remains unchanged. Independent actual-root inventory follows
+  both live launches to observed CUDA objects and full source/config/cubin
+  receipts. Non-target bindings remain available for exact cross-arm comparison.
+  Reuse shared geometry hook/root-walking machinery and freeze its new helper
+  in future preparation; no production profile installs the KV loader.
+- Correctness: 449 CPU tests passed in 41.23 s, 14 upstream deprecation warnings;
+  real Torch loader/static-launcher APIs, fake CUDA driver. Covers original and
+  persistent-KV ABI/stream forwarding, concurrent aliases, cached-path bypass,
+  late/tampered bindings, non-target preservation and hook restoration. Earlier
+  fixture failures are retained. The historical geometry qualification correctly
+  rejects changed helper sources; its test now asserts policy/client rejection,
+  not stale qualification reuse. No runtime guard or old manifest was relaxed.
+- Results: no GPU load/model start/native build or TPS measurement. Quant,
+  production defaults and all quality gates, including failed indexer oracle,
+  remain unchanged. CPU dispatch tests are not actual AOT or model qualification.
+- Decision: commit checkpoint, then dedicated KV preparation and bounded
+  all-rank no-weights AOT qualification before original/KV/return serving. No
+  next GPU/model command prescribed yet; no source freeze active.
+- Raw: `perf/results/2026-09-10/runtime-control/loader-hooks-cpu.xml` and
+  `kv-loader-{cpu,dispatch-cpu,regression-cpu,freeze-cpu,final-cpu}.xml`.
+  Exact final command and next-stage constraints: `perf/glm53-attention-isolation.md`.

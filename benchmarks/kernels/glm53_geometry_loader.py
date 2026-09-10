@@ -6,9 +6,6 @@ inventory and target sealing. Target sealing does NOT seal the binary observer:
 later non-target compilation is legitimate during serving graph capture.
 """
 
-import os
-from contextlib import contextmanager
-from functools import wraps
 from pathlib import Path
 
 from benchmarks.kernels.check_glm53_attention_norms import (
@@ -16,6 +13,7 @@ from benchmarks.kernels.check_glm53_attention_norms import (
     require,
 )
 from benchmarks.kernels.glm53_binary_observer import StaticCudaBinaryObserver
+from benchmarks.kernels.glm53_loader_hooks import ScopedKernelLoader
 from benchmarks.kernels.glm53_rmsnorm_geometry import MultiIntervention
 from slimserve.rmsnorm_diagnostic import sha
 
@@ -29,7 +27,9 @@ def expected_images(manifest, rank):
     return images
 
 
-class GeometryLoader:
+class GeometryLoader(ScopedKernelLoader):
+    hook_marker = "_glm53_geometry_loader"
+
     def __init__(self, rank, manifest, manifest_path, mode, *, emit=None):
         self.rank = rank
         self.manifest = manifest
@@ -47,25 +47,6 @@ class GeometryLoader:
         )
         self.installed = False
         self.templates = {}
-
-    def check_cache(self):
-        """Accept Torch's normal unset -> exact per-rank env materialization."""
-        from torch._inductor.runtime.cache_dir_utils import triton_cache_dir
-
-        expected = self.cache / "triton" / str(self.rank)
-        actual = os.getenv("TRITON_CACHE_DIR")
-        require(
-            actual in (None, str(expected))
-            and os.getenv("TORCHINDUCTOR_CACHE_DIR") == str(self.cache),
-            "geometry compiler cache binding differs: "
-            f"triton={actual!r}, inductor={os.getenv('TORCHINDUCTOR_CACHE_DIR')!r}, "
-            f"expected={str(expected)!r}",
-        )
-        require(
-            Path(triton_cache_dir(self.rank)) == expected
-            and expected.resolve() == expected,
-            "resolved geometry cache is not rank-private",
-        )
 
     def compile_replacement(self, target, saved):
         """Use original debug provenance and the unchanged rank-local cache rule."""
@@ -102,67 +83,6 @@ class GeometryLoader:
             )
         self.check_cache()
         return result
-
-    @contextmanager
-    def intercept(self, *, future_class=None, code_cache=None, kernel_class=None):
-        if future_class is None or code_cache is None:
-            from torch._inductor.codecache import PyCodeCache, StaticAutotunerFuture
-
-            future_class = StaticAutotunerFuture
-            code_cache = PyCodeCache
-        original_result = future_class.result
-        original_load = code_cache.__dict__["load_by_key_path"]
-        require(
-            isinstance(original_load, classmethod), "expected classmethod loader API"
-        )
-        require(
-            not self.installed
-            and not any(
-                getattr(function, marker, False)
-                for function in (original_result, original_load.__func__)
-                for marker in ("_glm53_geometry_loader", "_glm53_rmsnorm_diagnostic")
-            ),
-            "conflicting geometry/legacy loader hook",
-        )
-        local_result = future_class.__dict__.get("result")
-
-        @wraps(original_result)
-        def result(future, timeout=None):
-            return self.controller.resolve(
-                future, original_result, self.compile_replacement, timeout
-            )
-
-        @wraps(original_load.__func__)
-        def load_by_key_path(cls, *args, **kwargs):
-            module = original_load.__func__(cls, *args, **kwargs)
-            self.controller.bind_graph(module, self.compile_replacement)
-            return module
-
-        result._glm53_geometry_loader = True
-        load_by_key_path._glm53_geometry_loader = True
-        load_hook = classmethod(load_by_key_path)
-        # Observer is installed FIRST: bundle loading can resolve binaries before
-        # any graph-global callback has an opportunity to inspect them.
-        with self.observer.intercept(kernel_class):
-            future_class.result = result
-            code_cache.load_by_key_path = load_hook
-            self.installed = True
-            try:
-                yield self
-            finally:
-                changed = []
-                if future_class.result is not result:
-                    changed.append("static future")
-                elif local_result is None:
-                    delattr(future_class, "result")
-                else:
-                    future_class.result = local_result
-                if code_cache.__dict__["load_by_key_path"] is not load_hook:
-                    changed.append("code cache")
-                else:
-                    code_cache.load_by_key_path = original_load
-                self.installed = False
-                require(not changed, f"foreign loader hook change: {changed}")
 
     def close(self):
         require(not self.installed, "cannot close an active geometry loader")
