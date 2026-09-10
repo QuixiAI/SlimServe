@@ -506,3 +506,47 @@ Audit counts, all metrics/hashes, before/after original5172-file
 inventory, compiler/helper/native source receipts, and final independent GPU
 release. Do not promote the deterministic policy, TC, or a performance baseline
 from this test. No subsequent GPU work is prescribed here.
+
+## Initial attention probe stopped; preserve source provenance (2026-09-10)
+
+The ONE probe on14ec731c8 stops before numerical launches: the first combo key
+and config match but its cubin-byte hash differs. Its original manifest/output
+are TERMINAL, never rerun. The prescribed audit rejects the incomplete matrix.
+Frozen supplemental CPU closure verifies122 source/compiler/native receipts and
+5172 original files. All41 ELF sections are compared: only six debug/debug-line
+relocation sections differ; all non-debug sections, compiler metadata JSON and
+PTX code prefix match. Original vs copied Python filenames explain the debug
+content difference. Independent GPU query empty, process exit1. Zero numerical
+cases, no model or performance result. Missing-pyelftools closure attempt is
+preserved; the completed reader uses only the standard library.
+
+Closure: `runtime-control/attention-norm-byte-failure-analysis.json`, SHA
+07856ad2966f91ea6ed33a3380c388ce48128c1b8c2f906413e3c6aee362abb5.
+
+Correct the probe loader, not the binary gate: verify copied/original bytes,
+compile the copy with the original code filename for debug provenance, and keep
+the module.__file__/Inductor decorator filename in the private probe directory.
+No numerical-source edits, seeded/substituted cubins, stripped debug sections,
+or original-cache mutation. Continue requiring exact whole cubin bytes.
+
+After the tested fix is committed, prescribe NEW one-process comparison with the
+same120 pairs, seeds/shapes/weights/gates,16GiB/swap0 and frozen sources. Prepare
+in8GiB scope `glm53-attention-provenance-prepare` using the same module and
+`--prepare --manifest perf/results/2026-09-10/runtime-control/attention-provenance-manifest.json`.
+Then once:
+
+```bash
+systemd-run --user --scope --unit=glm53-attention-provenance-probe \
+  -p MemoryMax=16G -p MemorySwapMax=0 \
+  env -u CUDA_LAUNCH_BLOCKING CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  CUDA_HOME=/usr/local/cuda-13.0 OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_attention_norms \
+  --manifest perf/results/2026-09-10/runtime-control/attention-provenance-manifest.json \
+  --output perf/results/2026-09-10/attention-norm-provenance-probe
+```
+
+After exit, same module/manifest/output plus `--audit` in8GiB/no-swap scope
+`glm53-attention-provenance-audit`, then independent GPU query. Preserve all
+stdout/stderr with pipefail/tee under runtime-control. No intervening edits,
+builds, commits or GPU jobs through audit. No further job or serving start is
+prescribed. Do not silently retry a failed numerical case or alter its gates.

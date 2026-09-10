@@ -11,16 +11,17 @@ graph-held binding inventory. The new split sources have graph-held receipts.
 import argparse
 import ast
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 from itertools import product
 from pathlib import Path
 
 from benchmarks.analyze_glm53_reduction_receipts import sha
 from benchmarks.kernels.check_glm53_cached_rmsnorm import compare, oracle, tensor_sha
-from benchmarks.kernels.check_glm53_rmsnorm_intervention import load_source
 from slimserve.rmsnorm_diagnostic import single_launcher_receipt
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -95,6 +96,28 @@ def flat_config(config):
 def load_checked(path, digest):
     require(sha(path) == digest, f"receipt changed: {path}")
     return json.loads(path.read_text())
+
+
+def load_preserving_provenance(copied, original, kernel, name):
+    """Keep code locations original but decorator/cache filenames private.
+
+    Triton's cache key excludes the Python source path, while cubin debug
+    sections embed it. Importing the copy normally changes binary bytes even
+    when all executable sections match. Preserve the original code location;
+    never seed/substitute a cubin, strip debug data, or write the original cache.
+    """
+    require(copied.resolve() != original.resolve(), "private copy required")
+    source = copied.read_bytes()
+    require(source == original.read_bytes(), "source copy differs from original")
+    spec = importlib.util.spec_from_file_location(name, copied)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        exec(compile(source, str(original), "exec"), module.__dict__)
+    except BaseException:
+        del sys.modules[name]
+        raise
+    return getattr(module, kernel)
 
 
 def load_weights():
@@ -208,7 +231,6 @@ def prepare(path):
             "benchmarks/analyze_glm53_reduction_receipts.py",
             "benchmarks/analyze_glm53_quality_pair.py",
             "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
-            "benchmarks/kernels/check_glm53_rmsnorm_intervention.py",
             "slimserve/rmsnorm_diagnostic.py",
             "vllm/model_executor/models/glm5_next.py",
             "vllm/model_executor/layers/mla.py",
@@ -451,8 +473,11 @@ def run(manifest_path, output):
                     copied = output / f"source-{n}" / Path(record["source"]).name
                     copied.parent.mkdir()
                     shutil.copyfile(record["source"], copied)
-                    template = load_source(
-                        copied, record["info"]["kernel"], f"attention_norm_{n}"
+                    template = load_preserving_provenance(
+                        copied,
+                        Path(record["source"]),
+                        record["info"]["kernel"],
+                        f"attention_norm_{n}",
                     )
                     saved = record["selected"]["config"]
                     config = triton.Config(

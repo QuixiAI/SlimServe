@@ -26526,3 +26526,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   lint/diff checks pass. Includes audit rejection tests for incomplete matrices,
   incorrect extents/verdicts and inconsistent output hashes. Log:
   `runtime-control/attention-norm-final-regression.log`. GPU probe still pending.
+
+## 2026-09-10 - Attention probe stops on debug provenance, not numerical failure
+
+- Status: initial kernel attempt terminal; probe-only loader fix prepared.
+- Baseline: one16GiB/no-swap process on14ec731c8, fixed120-pair plan, frozen
+  source/native. First combo config and cache key match, full cubin hash does not.
+  Stops before any numerical launch; zero model/quality/TPS results, no retry.
+- Cause: normal import of copied source changes Python filename in cubin debug
+  data. Frozen CPU closure compares all41 ELF sections; six debug/debug-relocation
+  sections differ, every non-debug section identical. PTX code prefix and compiler
+  metadata JSON identical. Do not confuse cache-key equality with byte equality.
+- Closure:122 frozen source/compiler/native receipts and5172 original files
+  verify, final GPU query empty, probe exit1. Original incomplete-matrix audit
+  failure and missing-pyelftools supplemental attempt preserved. Completed
+  supplemental reader uses stdlib only. No numerical gate was exercised/cleared.
+- Change: execute byte-identical source copy with original code filename but
+  private module.__file__/decorator/cache paths. No binary substitution, seeded
+  cache, debug stripping, or serving changes. Whole-cubin byte gate unchanged.
+- Decision: after CPU tests/commit, NEW manifest and ONE new provenance probe,
+  identical120-pair workload. Freeze through audit; protocol tail gives commands.
+  Original output stays terminal; no full-model start or promotion prescribed.
+- Raw: `perf/results/2026-09-10/attention-norm-source-probe/` and
+  `runtime-control/attention-norm-{manifest.json,probe.log,audit.log}`;
+  closure `runtime-control/attention-norm-byte-failure-analysis.json`, SHA
+  07856ad2966f91ea6ed33a3380c388ce48128c1b8c2f906413e3c6aee362abb5.
+- CPU196 passed16.40s,14 existing Torch deprecation warnings; lint/diff pass.
+  Raw `runtime-control/attention-provenance-regression.log`.

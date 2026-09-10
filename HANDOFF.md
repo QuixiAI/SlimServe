@@ -35,7 +35,30 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): source-exact attention comparison prepared
+### Latest checkpoint (2026-09-10): preserve source provenance for exact binary replay
+
+ONE attention-norm probe on14ec731c8 stopped before any numerical launch:
+the first combo kernel has the correct cache key/config but different cubin bytes.
+Frozen closure verifies all41 ELF sections: ONLY six debug/debug-relocation
+sections differ. Every non-debug section (including executable code, constants,
+resource metadata and relocations), compiler JSON, and PTX code prefix matches.
+The cause is copying Python to a different filename, embedded in debug data.
+The strict whole-binary gate correctly stopped the process; zero quality/TPS
+results. GPU query empty. Preserve the failed probe/manifest/audit and closure:
+`runtime-control/attention-norm-byte-failure-analysis.json`, SHA
+07856ad2966f91ea6ed33a3380c388ce48128c1b8c2f906413e3c6aee362abb5.
+
+Probe-only fix executes identical copied source with its ORIGINAL code filename
+while keeping module.__file__/decorator/cache paths PRIVATE. No cubin seeding,
+debug stripping, hash-gate weakening, or original-cache writes. CPU tests cover
+both identities and reject changed/non-private copies. Serving code unchanged.
+
+NEXT: after commit prepare NEW attention-provenance-manifest.json, then ONE
+NEW attention-norm-provenance-probe, same120-pair matrix and unchanged gates.
+Protocol tail gives paths/commands. Freeze through audit; no model starts or
+subsequent GPU work prescribed. The initial kernel attempt is terminal.
+
+### Previous checkpoint (2026-09-10): source-exact attention comparison prepared
 
 The full-model no-combo series below remains STOPPED. New work is an isolated
 kernel diagnostic, not another serving start. Logical Q/KV widths are1536/512;

@@ -8,6 +8,7 @@ from benchmarks.kernels.check_glm53_attention_norms import (
     LAYOUTS,
     flat_config,
     layernorm_oracle,
+    load_preserving_provenance,
     packed_inputs,
     source_info,
 )
@@ -62,6 +63,35 @@ def test_actual_layouts_include_indexer_output_gap():
     assert flat_config(dict(kwargs=dict(XBLOCK=2), num_warps=1, num_stages=1)) == dict(
         XBLOCK=2, num_warps=1, num_stages=1
     )
+
+
+def test_copy_preserves_code_provenance_but_not_cache_filename(tmp_path):
+    import inspect
+
+    original = tmp_path / "original.py"
+    copied = tmp_path / "private.py"
+    source = "def triton_norm():\n    return __file__\n"
+    original.write_text(source)
+    copied.write_text(source)
+    function = load_preserving_provenance(
+        copied, original, "triton_norm", "norm_provenance_test"
+    )
+    assert function() == str(copied)
+    assert function.__code__.co_filename == str(original)
+    assert inspect.getsourcefile(function) == str(original)
+    assert inspect.getsource(function) == source
+    assert original.read_text() == copied.read_text() == source
+
+
+def test_provenance_rejects_original_import_and_changed_copy(tmp_path):
+    original = tmp_path / "original.py"
+    original.write_text("def triton_norm():\n    return 1\n")
+    with pytest.raises(ValueError, match="private copy"):
+        load_preserving_provenance(original, original, "triton_norm", "unused")
+    copied = tmp_path / "private.py"
+    copied.write_text("def triton_norm():\n    return 2\n")
+    with pytest.raises(ValueError, match="copy differs"):
+        load_preserving_provenance(copied, original, "triton_norm", "unused")
 
 
 def test_packed_inputs_replay_seed_and_stride():
