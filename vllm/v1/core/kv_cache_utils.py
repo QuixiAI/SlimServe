@@ -186,6 +186,20 @@ class KVCacheBlockCopy(NamedTuple):
     dst_block_id: int
 
 
+
+def _assert_unlinked(block: "KVCacheBlock", where: str) -> None:
+    """A block entering the free list must not already be in it: a second
+    append silently splices a cycle into the list and the corruption only
+    surfaces later as ``get_new_blocks`` popping a block with ref_cnt > 0.
+    Fail here instead, at the offending free."""
+    if block.prev_free_block is not None or block.next_free_block is not None:
+        raise RuntimeError(
+            f"{where}: block {block.block_id} (ref_cnt={block.ref_cnt}, "
+            f"hash={'set' if block.block_hash is not None else 'none'}) is "
+            "already in the free list (double free)"
+        )
+
+
 class FreeKVCacheBlockQueue:
     """This class organizes a list of KVCacheBlock objects to a doubly linked
     list of free blocks. We implement this class instead of using Python
@@ -340,6 +354,7 @@ class FreeKVCacheBlockQueue:
                 "prev_free_block of fake_free_list_tail should always exist"
             )
         last_block: KVCacheBlock = self.fake_free_list_tail.prev_free_block
+        _assert_unlinked(block, "FreeKVCacheBlockQueue.append")
 
         # Connect the new block after the last block.
         last_block.next_free_block = block
@@ -363,6 +378,7 @@ class FreeKVCacheBlockQueue:
 
         prev_block = self.fake_free_list_head
         for block in blocks:
+            _assert_unlinked(block, "FreeKVCacheBlockQueue.prepend_n")
             block.prev_free_block = prev_block
             prev_block.next_free_block = block
             prev_block = block
@@ -387,6 +403,7 @@ class FreeKVCacheBlockQueue:
         )
         # Add inter-connections between consecutive blocks
         for block in blocks:
+            _assert_unlinked(block, "FreeKVCacheBlockQueue.append_n")
             block.prev_free_block = last_block
             last_block.next_free_block = block
             last_block = block

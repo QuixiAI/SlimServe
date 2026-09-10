@@ -25013,3 +25013,31 @@ restart is the operator's call.
   the promised GPU blocks are reported as failed loads through the
   worker (invalid_block_ids) and the request is released to recompute.
   The acceptance reruns after the WildChat leg, ahead of the 1M leg.
+- WildChat leg on the speculative record (before the connector fixes
+  booted): 71/72 marker recalls, prefix hit 85.4%, 191 tier hits and
+  restores over 38 minutes of forced eviction, then the engine died at
+  20:14:24 in `scheduler.schedule -> allocate_slots ->
+  BlockPool.get_new_blocks` with `assert block.ref_cnt == 0`: a block
+  came off the free list holding a reference, i.e. an earlier double
+  free or an in-place refcount write on a free-list block. Eight
+  sessions errored at the death. The last scheduler event was a pinned
+  boundary-state save. Static tracing of every refcount writer (tail
+  pins touch/free through the same per-group pool; CoW retentions
+  release through the multi-pool free helper; the two in-place
+  increments in the mamba manager act on blocks already off the free
+  list) did not isolate the site, so the block pool now fails fast at
+  the offending call instead: a second append of a block into the free
+  list, a free below zero, or a touch of a block sitting in the free
+  list raises with the block id (`kv_cache_utils._assert_unlinked`,
+  `BlockPool.free_blocks/touch`); the leg reruns on that tree
+  (`glm53f-leg-spec-instr`) after the tier acceptance. The 1M leg is
+  parked until the root cause is fixed. Raw: perf/results/2026-09-10/
+  glm53f-leg-spec/ (server.log holds the traceback).
+- Tier acceptance RERUN on the speculative record with the connector
+  fixes (window group 13 excluded and zeroed; fail-closed restores):
+  PASS. 6/6 markers recalled after a 3,891,841-token churn of the
+  3,096,255-token pool; 20 hits, 20 restores staged, failed_closed 0,
+  2,578 tail saves, VLLM_KV_TIER_VERIFY 160 batches / 0 mismatched.
+  Log: "window-only groups [13] are not tier-managed (zeroed on
+  resume)". No block-pool assert in this run (20 restores; the leg
+  needed ~190). Raw: perf/results/2026-09-10/glm53f-final-spec-tier2/.

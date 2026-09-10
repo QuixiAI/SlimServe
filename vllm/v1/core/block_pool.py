@@ -667,7 +667,9 @@ class BlockPool:
         if self.enable_caching:
             for block in ret:
                 self._maybe_evict_cached_block(block)
-                assert block.ref_cnt == 0
+                assert block.ref_cnt == 0, (
+                    f"free-list block {block.block_id} has ref_cnt={block.ref_cnt}"
+                )
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
@@ -715,6 +717,11 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+            elif block.prev_free_block is not None and not block.is_null:
+                raise RuntimeError(
+                    f"BlockPool.touch: block {block.block_id} has "
+                    f"ref_cnt={block.ref_cnt} but sits in the free list"
+                )
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
@@ -732,6 +739,11 @@ class BlockPool:
         blocks_without_hash = []
         for block in ordered_blocks:
             block.ref_cnt -= 1
+            if block.ref_cnt < 0 and not block.is_null:
+                raise RuntimeError(
+                    f"BlockPool.free_blocks: block {block.block_id} freed "
+                    f"below zero (ref_cnt={block.ref_cnt})"
+                )
             if block.ref_cnt == 0 and not block.is_null:
                 # When caching is disabled we always append for better
                 # GPU cache locality from reusing recently used blocks
