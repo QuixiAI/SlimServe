@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare private AOT caches from completed, pinned RMSNorm qualification.
 
-No GPU work and no unpickling. Old helper freezes have ended: consume their
+No GPU work. Unpickle only the trusted owned model to discover source roots;
+never post-compile during preparation. Old helper freezes have ended: consume their
 pinned reports, verify the actual source/binary artifacts, then freeze current
 helpers explicitly. Never silently refresh serving, compiler or native hashes.
 """
@@ -39,6 +40,9 @@ def loader_source_files():
         "torch._inductor.standalone_compile",
         "torch._inductor.triton_bundler",
         "torch._inductor.runtime.cache_dir_utils",
+        "torch._inductor.output_code",
+        "torch._dynamo.aot_compile_types",
+        "torch._functorch._aot_autograd.aot_autograd_result",
     )
     return [Path(importlib.import_module(name).__file__) for name in names]
 
@@ -179,6 +183,7 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         audit_glm53_geometry_graphs,
         audit_glm53_geometry_loader,
         check_glm53_geometry_loader,
+        glm53_artifact_roots,
         glm53_binary_observer,
         glm53_geometry_loader,
     )
@@ -190,6 +195,7 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         Path(audit_glm53_geometry_graphs.__file__),
         Path(check_glm53_geometry_loader.__file__),
         Path(audit_glm53_geometry_loader.__file__),
+        Path(glm53_artifact_roots.__file__),
         *loader_source_files(),
         Path(__file__).resolve().parents[2] / "vllm/compilation/caching.py",
     ]
@@ -210,6 +216,17 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         ).strip(),
     )
     verify(base)
+    roots = {}
+    for rank in range(4):
+        store, _ = glm53_artifact_roots.read_store(original / f"rank_{rank}_0/model")
+        require(
+            store.num_artifacts() == 7 and store.num_entries() == 46,
+            "unexpected serialized artifact matrix",
+        )
+        roots[str(rank)] = glm53_artifact_roots.discover(
+            store, original, graphs[str(rank)]
+        )
+    base["artifact_roots"] = roots
     require(
         not any(p.is_symlink() for p in original.rglob("*")),
         "original cache contains aliases",

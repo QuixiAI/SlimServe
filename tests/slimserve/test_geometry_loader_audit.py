@@ -227,25 +227,28 @@ def test_prescribed_predecessors_must_all_have_unchanged_successful_audits(tmp_p
 def test_real_torch_loader_module_resolution_and_full_private_preparation(
     tmp_path, monkeypatch
 ):
+    from benchmarks.kernels import glm53_artifact_roots
     from benchmarks.kernels.prepare_glm53_geometry_loader import (
         loader_source_files,
         qualified_targets,
     )
+    from tests.slimserve.test_artifact_roots import serialized_fixture
 
     paths = loader_source_files()
-    assert len(paths) == 5 and all(p.is_file() for p in paths)
+    assert len(paths) == 8 and all(p.is_file() for p in paths)
     assert "standalone_compile.py" in {p.name for p in paths}
     old, binaries = qualified_fixture(tmp_path)
     targets = qualified_targets(old, binaries)
     original = Path(old["original_namespace"])
     graphs = {str(rank): {} for rank in range(4)}
+    stores = {}
     for rank in range(4):
-        for index in range(7):
-            relative = f"inductor_cache/gg/graph{rank}_{index}.py"
-            path = original / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("def call():\n    pass\n")
-            graphs[str(rank)][relative] = sha(path)
+        store, rank_graphs, _ = serialized_fixture(original, count=7, rank=rank)
+        stores[str(original / f"rank_{rank}_0/model")] = store
+        graphs[str(rank)] = rank_graphs
+    monkeypatch.setattr(
+        glm53_artifact_roots, "read_store", lambda path: (stores[str(path)], {})
+    )
     old["sources"] = {}
     old["original_files"] = {
         str(p.relative_to(original)): sha(p) for p in original.rglob("*") if p.is_file()

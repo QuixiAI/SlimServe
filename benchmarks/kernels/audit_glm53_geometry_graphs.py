@@ -100,7 +100,9 @@ def run_symbols(source):
 def inventory(modules, manifest, rank, mode, observer):
     """Neither controller owners nor its graph_bindings determine this inventory.
 
-    Inspect the call function's actual globals, the source's executable run calls,
+    The caller supplies actual artifact-root modules, NOT every cached module
+    exporting call (kernel benchmark helpers also export it). Inspect the call
+    function's actual globals, the source's executable run calls,
     each selected config and each launcher's observed CUDA object. Include ALL
     bound Triton globals so a later control/geometry comparison can also reject
     unrelated changes. No model execution is performed.
@@ -133,7 +135,7 @@ def inventory(modules, manifest, rank, mode, observer):
         relative = str(path.relative_to(private))
         require(
             relative in expected_graphs and sha(path) == expected_graphs[relative],
-            "unexpected or changed graph source",
+            f"unexpected or changed graph source: {path}",
         )
         namespace = vars(module)
         source_text = path.read_text()

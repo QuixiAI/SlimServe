@@ -35,7 +35,57 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v3 loads seven artifacts, parser fixed; NEW v4 prescribed
+### Latest checkpoint (2026-09-10): artifact-root provenance CPU gate passed; NEW v5 prescribed
+
+All28 serialized model roots (seven/rank) have exact original source bytes/keys;
+each rank's46 submodule entries map to its seven roots. CPU inspection only, no
+post-compile/forward/GPU load. `runtime-control/geometry-artifact-roots-all-ranks.json`,
+SHA33db464e59736405d7893e3c45ffb152403c2be16599b5db55ca56b4ae8ba10a.
+
+New diagnostic `glm53_artifact_roots.py` observes each actual AOT deserialize,
+its live CompiledFxGraph.after_deserialization call/runner/module binding, and
+the identical artifact retained by vLLM. Complete module paths/hashes are saved
+BEFORE validation, also on failure. Imported helpers must be original-exact and
+cannot substitute for roots. Every target/non-target root launcher remains audited;
+controller graph callbacks remain a separate cross-check. Preparation freezes the
+new tool and actual Torch source helpers, plus serialized-root receipts.
+
+Related CPU310 pass6.94s, including real concurrent vLLM load_all and actual
+CompiledFxGraph/PyCodeCache imports (outer test AOT wrapper reduced, no GPU calls).
+Initial104-pass/3-failure fixture cleanup and subsequent passes are retained.
+Raw `runtime-control/geometry-artifact-root-{binding,binding-final,real-store}-cpu.xml`.
+
+NEXT after commit: NEW v5 at protocol tail, control0..3 then geometry0..3,
+one no-weights load per fresh private cache,16GiB GPU/8GiB CPU/swap0. Freeze
+sources through loads/audits/closure; stop on any failure, no retries. v1-v4 and
+their unused cases remain terminal. No model series, TPS or quality/default/quant
+promotion; original numerical qualification and separate failed indexer gate stand.
+
+### Previous checkpoint (2026-09-10): v4 terminal; artifact-root provenance repair
+
+v4 TERMINAL on5213afeb5 after ONE control-rank0 load/audit. All7 artifacts/46
+entries load and27 observed CUDA images match original whole bytes. Independent
+inventory fails with `unexpected or changed graph source`. Every private generated
+Python source matches the original snapshot: the inventory is including an extra
+imported call-export module, not detecting source drift. Its path was not logged;
+do not claim the unexpected module's identity is proven. All201 source receipts/
+5172 original files verify, GPUs released. Other seven cases never launched.
+Closure `rmsnorm-geometry-aot-qualification-v4/closure.json`, SHA
+934fe0e8b53960e38c8270ffadf86990a77559bc642a53dc832a0ca8e559a428.
+v1-v4 remain stopped; all24 private caches from v2-v4 are preserved. Freeze ended.
+
+CPU source catalog finds76 call-export modules (19/rank), including generated
+kernel benchmark helpers; only28 are mapped model roots. CPU-only trusted rank0
+artifact inspection recovers the seven expected root keys from compiled_fw.result.
+NEXT: verify serialized root source bytes on all four ranks, observe the actual
+CompiledFxGraph.after_deserialization binding to current_callable/runner, and
+retain a complete module inventory BEFORE validation. Audit all target/non-target
+root globals; do not simply allow every cached callable. CPU tests and a new
+committed protocol are required before any new GPU series. No model/forward/TPS,
+quality/default/quant promotion or next GPU run currently prescribed.
+Raw `runtime-control/geometry-{all-export-source-inventory,artifact-root-inspection}.json`.
+
+### Previous checkpoint (2026-09-10): v3 loads seven artifacts, parser fixed; v4 prescribed (now stopped)
 
 v3 TERMINAL: ONE control-rank0 on14ab95575 loads7 artifacts/46 entries and26
 CUDA images match original whole bytes. Its independent AST inventory rejects

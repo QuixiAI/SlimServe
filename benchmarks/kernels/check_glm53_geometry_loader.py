@@ -6,10 +6,8 @@ in the prescribed order, with audited predecessors. No model forwards or timers.
 """
 
 import argparse
-import io
 import json
 import os
-import pickle
 import subprocess
 import sys
 import threading
@@ -19,6 +17,12 @@ from pathlib import Path
 from benchmarks.kernels.audit_glm53_geometry_graphs import inventory
 from benchmarks.kernels.check_glm53_attention_norms import require, verify
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
+from benchmarks.kernels.glm53_artifact_roots import (
+    ArtifactRootObserver,
+    discover,
+    module_inventory,
+    read_store,
+)
 from benchmarks.kernels.glm53_geometry_loader import GeometryLoader
 from benchmarks.kernels.glm53_rmsnorm_geometry import SCHEMA
 from benchmarks.kernels.prepare_glm53_geometry_loader import QUALIFICATION_SHA
@@ -63,6 +67,10 @@ def read_manifest(path):
         and [len(manifest["targets"][str(r)]) for r in range(4)] == [3, 3, 3, 4]
         and all(len(manifest["expected_graphs"][str(r)]) == 7 for r in range(4)),
         "wrong rank/mode/private cache or graph/target coverage",
+    )
+    require(
+        all(len(manifest["artifact_roots"][str(r)]) == 7 for r in range(4)),
+        "serialized graph root provenance missing",
     )
     require(
         subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
@@ -204,14 +212,15 @@ def run(path):
 
     save()
     loader = None
+    code_cache = None
     try:
         import torch
-        from torch._dynamo.aot_compile import AOTCompileUnpickler
         from torch._inductor.codecache import PyCodeCache
         from torch._inductor.triton_bundler import TritonBundler
 
         import vllm._custom_ops  # noqa: F401
 
+        code_cache = PyCodeCache
         rank = manifest["rank"]
         torch.cuda.set_device(rank)
         require(torch.cuda.get_device_capability(rank) == (12, 0), "SM120 required")
@@ -219,22 +228,37 @@ def run(path):
         summary["model_sha256"] = sha(model)
         summary["torch"] = torch.__version__
         summary["cuda"] = torch.version.cuda
-        with (output / "binary-loads.jsonl").open("x") as stream:
+        with (
+            (output / "binary-loads.jsonl").open("x") as stream,
+            (output / "artifact-roots.jsonl").open("x") as root_stream,
+        ):
 
             def emit(record):
                 stream.write(json.dumps(record, sort_keys=True) + "\n")
                 stream.flush()
 
             loader = GeometryLoader(rank, manifest, path, manifest["mode"], emit=emit)
+
+            def emit_root(record):
+                root_stream.write(json.dumps(record, sort_keys=True) + "\n")
+                root_stream.flush()
+
+            roots = ArtifactRootObserver(
+                manifest["artifact_roots"][str(rank)], private, emit=emit_root
+            )
             with (
                 loader.intercept(),
+                roots.intercept(),
                 checked_bundles(TritonBundler, summary["static_bundles"]),
             ):
                 # Same concurrent deduplicated artifact path as forced AOT serving.
                 # Never deserialize the outer model or invoke any forward/capture.
-                outer = AOTCompileUnpickler({}, io.BytesIO(model.read_bytes())).load()
-                inner = pickle.loads(outer["compiled_fn"][1])
-                store = inner["standalone_compile_artifacts"]
+                store, aot_config = read_store(model)
+                require(
+                    discover(store, private, manifest["expected_graphs"][str(rank)])
+                    == manifest["artifact_roots"][str(rank)],
+                    "private serialized roots differ from prepared originals",
+                )
                 summary.update(
                     artifacts=store.num_artifacts(), submodules=store.num_entries()
                 )
@@ -242,12 +266,17 @@ def run(path):
                     summary["artifacts"] == 7 and summary["submodules"] == 46,
                     "unexpected cached artifact matrix",
                 )
-                with torch._functorch.config.patch(inner["aot_autograd_config"]):
+                with torch._functorch.config.patch(aot_config):
                     store.load_all()
                 summary["loaded_artifacts"] = len(store.loaded_submodule_store)
+                write_new(
+                    output / "module-inventory.json",
+                    module_inventory(PyCodeCache.modules),
+                )
                 require(summary["loaded_artifacts"] == 7, "incomplete artifact load")
+                root_modules = roots.roots(store, PyCodeCache.modules)
                 before = inventory(
-                    PyCodeCache.modules,
+                    root_modules,
                     manifest,
                     rank,
                     manifest["mode"],
@@ -261,7 +290,7 @@ def run(path):
                 loader.controller.verify_graphs(PyCodeCache.modules)
                 require(
                     inventory(
-                        PyCodeCache.modules,
+                        roots.roots(store, PyCodeCache.modules),
                         manifest,
                         rank,
                         manifest["mode"],
@@ -276,6 +305,10 @@ def run(path):
         summary.update(status="failed", error=repr(error))
         raise
     finally:
+        if code_cache is not None and not (output / "module-inventory.json").exists():
+            write_new(
+                output / "module-inventory.json", module_inventory(code_cache.modules)
+            )
         if loader is not None:
             loader.close()
         try:
@@ -314,7 +347,7 @@ def launch(path):
             "systemd-run",
             "--user",
             "--scope",
-            f"--unit=glm53-geometry-aot-v4-{label}-{kind}",
+            f"--unit=glm53-geometry-aot-v5-{label}-{kind}",
             "-p",
             f"MemoryMax={memory}G",
             "-p",

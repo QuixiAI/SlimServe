@@ -26925,3 +26925,50 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `runtime-control/geometry-bound-export-source-check.json`, SHA
   c43d449aa00bc4ffffc0f628efd291a16d199f54c69df7770c971121b457da36;
   `geometry-loader-bound-export{,-final}-cpu.xml`, under the same runtime-control.
+
+## 2026-09-10 - AOT v4 terminal: call-export helpers are not model graph roots
+
+- Status: v4 terminal; source freeze released; no new GPU series prescribed.
+- Baseline/hypothesis: source-exact numerical pair remains qualified; real-AOT
+  coverage requires independently checking artifact roots and every bound launcher.
+- Result: ONE control-rank0 on5213afeb5 loads7 artifacts/46 entries and27 observed
+  original-exact CUDA images. Inventory rejects an extra call-export module; all
+  private Python sources match originals. Its path was not logged, so its specific
+  identity remains unproven. Other seven cases never launched. No model/TPS result.
+- Closure:201 frozen source receipts/5172 original files unchanged; GPUs released.
+  All24 caches across v2-v4 retained; never launch unused cases in terminal series.
+- CPU evidence:76 original call-export sources (19/rank), including kernel benchmark
+  helpers;28 mapped roots. Trusted rank0 artifact inspection without GPU/post-compile
+  resolves seven expected serialized root cache keys; source-byte/all-rank checks next.
+- Decision: fix scope using actual serialized roots AND actual live compiled-graph
+  call/runner bindings. Preserve raw module paths before validation, keep every
+  target/non-target audit. No blanket callable allowlist or quality-gate change.
+- Raw: `rmsnorm-geometry-aot-qualification-v4/closure.json`, SHA
+  934fe0e8b53960e38c8270ffadf86990a77559bc642a53dc832a0ca8e559a428;
+  `runtime-control/geometry-all-export-source-inventory.json`, SHA
+  a3541ef157db55a8c7ef6470786ed655d8b8147922b790fcc913fea0def3f087;
+  `runtime-control/geometry-artifact-root-inspection.json`, SHA
+  2412cea3a8d68dc1612ad06b4b4293c2cd1f7dbd8a947fa9c6df6e15131e25e8.
+
+## 2026-09-10 - Bind actual AOT artifacts to live graph roots, not imported helpers
+
+- Status: CPU gate passed; new source-frozen v5 prescribed, not yet run.
+- Baseline/hypothesis: v4 loaded artifacts but its callable-based scope confused
+  kernel benchmark helpers with model graphs. Root provenance must come from the
+  actual serialized artifacts and the live loader, independently of target callbacks.
+- Change: discovery joins all28 serialized root source bytes/keys to originals;
+  real AOT deserialize/CompiledFxGraph hooks verify exact live call, runner, module
+  and returned-artifact identity in vLLM's store. Full module inventory saved before
+  validation and on failure. Offline join checks root events plus original-exact
+  helper sources and all target/non-target root launchers. No serving changes.
+- CPU:310 pass6.94s,8GiB/swap0/GPUs hidden; lint/diff pass. Tests exercise actual
+  vLLM concurrent load_all, Torch CompiledFxGraph.after_deserialization/write_to_disk
+  and PyCodeCache, with reduced outer AOT fixture wrapper. Initial104-pass/3-failure
+  fixture-hook cleanup issue fixed; initial and both310-pass reports retained.
+- Result/decision: serialized-source-only all-rank check passes (46 entries/rank),
+  not yet real-AOT or model proof. Commit and new v5 same eight-case matrix; freeze
+  through closure, no retries/unused old cases. Quant/native/math/default/quality
+  gates unchanged, no forward or throughput measurement.
+- Raw: `runtime-control/geometry-artifact-roots-all-ranks.json`, SHA
+  33db464e59736405d7893e3c45ffb152403c2be16599b5db55ca56b4ae8ba10a;
+  `geometry-artifact-root-{binding,binding-final,real-store}-cpu.xml`; protocol tail.

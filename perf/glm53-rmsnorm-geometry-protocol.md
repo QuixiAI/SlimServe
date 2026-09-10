@@ -5,8 +5,8 @@ matrices pass and match exactly across processes. Their commands below are
 historical; do not rerun them. The first pair remains terminal after its observer
 API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
 load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all seven
-rank0 artifacts but stopped at the auditor's export parser. NEW no-weights
-AOT v4 is prescribed at the tail below;
+rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
+inventory's graph/helper classification. NEW no-weights AOT v5 is prescribed at the tail below;
 no full-model series is prescribed.
 
 ## Question and fixed factors
@@ -454,7 +454,7 @@ loads/audits/release checks pass. Root:
 Same scopes/no-retry/no-edit/no-build/one-GPU-workload rules and every original
 source/binary/graph/non-target gate. Do not launch any unused v1/v2 case.
 
-## v3 closure and exported Runner.call support; NEW v4
+## v3 closure and exported Runner.call support; historical v4 (stopped)
 
 ONE control-rank0 process on14ab95575 loads ALL7 artifacts/46 entries; its26
 observed CUDA images match original whole bytes. The independent AST inventory
@@ -484,3 +484,89 @@ commands with `v4` in BOTH unit/series path. Child scopes are v4. Root:
 Freeze through terminal audits, one GPU workload at a time,16GiB GPU/8GiB CPU/
 swap0, stop entire series on any failure. No retries or unused v1/v2/v3 cases.
 This still does not prescribe a full-model run or change production defaults.
+
+## v4 closure: root graphs must come from actual serialized artifacts
+
+ONE control-rank0 on5213afeb5 loads7 artifacts/46 entries and27 original-exact
+CUDA images. Load/audit exit1 at `unexpected or changed graph source`; the failing
+module path was not retained. ALL private Python files equal the original snapshot.
+The validator wrongly classifies every cached module exporting callable `call` as
+a model root, although generated kernel benchmark helpers also export `call`.
+All201 sources/5172 original files unchanged, GPUs released. v4 is TERMINAL;
+remaining seven cases never launched. All copies/logs retained, freeze released.
+Closure `rmsnorm-geometry-aot-qualification-v4/closure.json`, SHA
+934fe0e8b53960e38c8270ffadf86990a77559bc642a53dc832a0ca8e559a428.
+
+CPU catalog:76 call-export sources,19/rank (eight bound Runner,11 direct).
+Only seven bound roots/rank belong to the norm mapping. Trusted rank0 pickle
+inspection, with GPUs hidden and without post-compile, recovers those same seven
+cache keys from the serialized compiled forward results. Full source-byte equality
+and all-rank discovery still need verification. Do not infer root status from
+callability, names or controller callbacks. Observe actual artifact-to-live-call
+bindings; retain all loaded-module paths before validation, plus target/non-target
+root launcher checks. No replacement/unused v1-v4 attempt or new GPU series is
+prescribed at this checkpoint. Model quality and indexer gates remain unchanged.
+
+## Artifact-root provenance qualification: NEW v5
+
+CPU-only discovery matches ALL28 serialized root source bytes/cache keys against
+the original graph files (seven/rank,46 submodule references/rank). Report
+`runtime-control/geometry-artifact-roots-all-ranks.json`, SHA
+33db464e59736405d7893e3c45ffb152403c2be16599b5db55ca56b4ae8ba10a.
+No post-compile/forward/GPU calls in that check. The observer now scopes actual
+AOTCompiledArtifact.deserialize to its payload receipt, observes the actual live
+CompiledFxGraph.after_deserialization call/runner/module, and joins the identical
+returned artifact to vLLM's loaded store. Do not use the deep-copied serializable
+result as a substitute for the live graph. Save the complete loaded-module catalog
+before coverage checks and on failure; original-exact imported helpers are recorded
+separately. Root source/config/binary/target/non-target coverage remains mandatory.
+
+CPU gate310 pass6.94s; real vLLM concurrent load_all and Torch graph loading,
+with only the outer AOT fixture wrapper reduced. First fixture-cleanup failures
+and subsequent passes retained in `runtime-control/geometry-artifact-root-*-cpu.xml`.
+Actual GPU/AOT validation is still required. No serving code, quant, native binary,
+compiler math, quality floor or indexer gate is changed.
+
+Commit this implementation/protocol, then freeze all sources through closure.
+Exactly eight attempts, one each in this order: control-rank0, control-rank1,
+control-rank2, control-rank3, geometry-rank0, geometry-rank1, geometry-rank2,
+geometry-rank3. Same no-weights/no-forward/no-capture/no-timing workload and all
+previous source/binary/seal/coverage gates. Any failed preparation, load, audit or
+release stops the entire series; never launch remaining cases or replace an attempt.
+All predecessor audits, logs and source hashes must pass before the next case.
+Keep one GPU workload at a time; no native builds or source edits during the series.
+
+Prepare once in8GiB/swap0 with GPUs hidden (trusted local pickle discovery only):
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5
+```
+
+For each LABEL in the fixed order, ONCE, conditional on all predecessors passing:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-LABEL-launch -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 CUDA_HOME=/usr/local/cuda-13.0 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_geometry_loader launch \
+  --manifest perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5/LABEL/manifest.json
+```
+
+Launcher retains load/audit logs and statuses, plus independent GPU-release query;
+child scopes use v5,16GiB GPU/8GiB CPU/swap0. Only if ALL eight complete successfully:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v5-compare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.audit_glm53_geometry_loader compare \
+  perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v5
+```
+
+Audit final closure against original sources/cache and independent GPU query before
+releasing the freeze. v1-v4 stay terminal. This protocol does not authorize a model
+causal series or promote a production/default/performance change.

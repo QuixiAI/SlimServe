@@ -8,6 +8,7 @@ from pathlib import Path
 
 from benchmarks.kernels.audit_glm53_geometry_graphs import (
     compare_unrelated,
+    exported_call,
     run_symbols,
 )
 from benchmarks.kernels.check_glm53_attention_norms import require, verify
@@ -24,6 +25,94 @@ from slimserve.rmsnorm_diagnostic import expected_receipt, sha
 
 def json_lines(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def check_root_records(manifest, graphs, modules, events):
+    """Join the complete module catalog to observed serialized artifact roots.
+
+    Extra call exports are imported helpers only when they are original-exact
+    sources AND absent from the complete actual artifact-root set. They cannot
+    substitute for a missing root. Root launcher coverage is still audited below.
+    """
+    private = Path(manifest["private_namespace"])
+    expected = manifest["artifact_roots"][str(manifest["rank"])]
+    by_artifact = {row["artifact"]: row for row in expected}
+    require(
+        len(by_artifact) == len(expected)
+        and {row["graph"]: row["graph_sha256"] for row in expected}
+        == manifest["expected_graphs"][str(manifest["rank"])],
+        "artifact provenance and expected root sources differ",
+    )
+    by_module = {}
+    for index, row in enumerate(modules, 1):
+        path = Path(row["path"])
+        require(
+            row["module_index"] == index
+            and path.resolve() == path
+            and path.is_relative_to(private),
+            f"module inventory has invalid path/index: {path}",
+        )
+        relative = str(path.relative_to(private))
+        require(
+            row.get("source_sha256")
+            == sha(path)
+            == manifest["original_files"].get(relative),
+            f"imported module differs from original source: {path}",
+        )
+        if row["callable"]:
+            definition, cls, _ = exported_call(path.read_text())
+            require(
+                row["call_filename"] == str(path)
+                and row["call_line"] == definition.lineno
+                and row["bound"] is (cls is not None),
+                f"imported call export differs from source: {path}",
+            )
+        by_module[index] = row
+    phases = {key: [] for key in by_artifact}
+    bound = {}
+    for event in events:
+        key = event["artifact"]
+        require(
+            key in by_artifact
+            and {k: event[k] for k in by_artifact[key]} == by_artifact[key],
+            "observed serialized artifact provenance changed",
+        )
+        phases[key].append(event["event"])
+        if event["event"] == "artifact_root_bound":
+            row = by_module[event["module_index"]]
+            require(
+                row["path"] == str(private / event["graph"])
+                and row["source_sha256"] == event["graph_sha256"]
+                and row["callable"],
+                "artifact root does not join actual loaded module",
+            )
+            bound[key] = event["module_index"]
+    require(
+        all(
+            p
+            == [
+                "artifact_deserialize_begin",
+                "artifact_root_bound",
+                "artifact_deserialize_complete",
+            ]
+            for p in phases.values()
+        )
+        and len(set(bound.values())) == len(expected),
+        "incomplete or repeated artifact-root load sequence",
+    )
+    indices = {
+        row["graph"]: i + 1
+        for i, row in enumerate(sorted(expected, key=lambda r: r["artifact"]))
+    }
+    require(
+        all(row["module_index"] == indices[row["graph"]] for row in graphs["bindings"]),
+        "root launcher inventory differs from observed artifact modules",
+    )
+    return dict(
+        artifact_roots=len(expected),
+        imported_modules=len(modules),
+        non_root_imported_modules=len(modules) - len(expected),
+    )
 
 
 def check_records(
@@ -275,6 +364,9 @@ def audit(path):
             "predecessor gate changed",
         )
         graphs = read(output / "graph-bindings.json")
+        modules = read(output / "module-inventory.json")
+        roots = read(output / "artifact-roots.jsonl", True)
+        report.update(check_root_records(manifest, graphs, modules, roots))
         binaries = read(output / "binary-loads.jsonl", True)
         targets = [
             read(
