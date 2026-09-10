@@ -230,7 +230,7 @@ preparer's thirteen-target assumptions do not apply. Prescribe command order,
 failure handling and resource limits and commit before GPU loading. No new
 GPU/model job is prescribed by this implementation checkpoint.
 
-## Actual-AOT KV qualification v1: fixed protocol
+## Actual-AOT KV qualification v1: terminal; commands historical
 
 The dedicated `prepare_glm53_kv_loader.py`, `check_glm53_kv_loader.py` and
 `audit_glm53_kv_loader.py` now reuse the existing no-weights loading lifecycle,
@@ -290,4 +290,57 @@ for kv_aot_mode in control kv; do
 done'
 
 systemd-run --user --scope --unit=glm53-kv-aot-v1-compare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.audit_glm53_kv_loader compare perf/results/2026-09-10/kv-aot-qualification-v1
+```
+
+## v1 result and standalone-helper boundary fix
+
+On `30ea612a6`, preparation completes. The first control-rank0 load fails at
+`KVIntervention.replace()` before completing AOT loading; its offline audit
+also exits 1, and the controller stops. Exactly one GPU process was attempted;
+the other seven remain unattempted. All seven static bundles loaded exactly
+(4/4/6/6/6/12/12 kernels), so this is not a bundle fallback or model-quality result.
+
+The preserved traceback identifies `AsyncCompile.triton()`'s synchronous path:
+it calls `load_kernel()` BEFORE `kernel.precompile()`. That imports the standalone
+combo source via PyCodeCache. Its benchmark helper also exports `call`; the
+controller mistook this uncompiled template for a finished model graph. One
+actual graph binding had already succeeded through the static future path.
+
+The fix binds only registered original AOT graph paths. It leaves the exact
+standalone target source untouched after checking its path, source/debug hashes
+and kernel symbol. Other non-root target modules still fail; actual graph/root,
+config/binary/coverage and no-fallback gates remain intact. The CPU reproducer
+covers the uncompiled helper, later finished roots, and wrong path/symbol/source
+rejections. Initial 147 tests pass in 6.77 s; full 475 pass in 42.84 s (14 upstream
+warnings). Final error messages include launcher/result counts and override state.
+
+v1 is terminal, not retried. A final read-only check verified all 246 frozen
+receipts and 5,172 original files, the sole failed attempt/seven unattempted cases,
+GPU release and unchanged GPU/driver/power identity. Its source freeze ended
+before edits. Raw `kv-aot-qualification-v1/control-rank0/`: load/audit logs,
+partial root/module/binary/controller receipts, summary and failed analysis.
+Analysis SHA `fe7113bacf2c8ba8d83aa932426b17a6e607b85d5c5362adcc24903c6c651217`;
+launch SHA `edd66fa10d2b8565d6bbbd843c4514589d9867f06d970c01b68c548f55e412ae`.
+CPU `runtime-control/kv-aot-{root-boundary,v2-final}-cpu.xml`. No weights,
+forward, capture, timing, native build, default/quant change or gate relaxation.
+
+## Actual-AOT KV qualification v2: separately prescribed after the fix
+
+After committing the helper-boundary fix, run the same eight-case order and
+all v1 gates once in the NEW v2 namespace. This is a changed implementation,
+not a replacement attempt in v1. Sources remain frozen from preparation to
+terminal audit. The controller stops and audits at first failure; no retries,
+extra starts, model forwards or performance claim. Exact commands:
+
+```bash
+systemd-run --user --scope --unit=glm53-kv-aot-v2-prepare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.prepare_glm53_kv_loader --output perf/results/2026-09-10/kv-aot-qualification-v2
+
+systemd-run --user --scope --unit=glm53-kv-aot-v2-controller -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_HOME=/usr/local/cuda-13.0 bash -c '
+for kv_aot_mode in control kv; do
+  for kv_aot_rank in 0 1 2 3; do
+    .venv/bin/python -m benchmarks.kernels.check_glm53_kv_loader launch --manifest "perf/results/2026-09-10/kv-aot-qualification-v2/${kv_aot_mode}-rank${kv_aot_rank}/manifest.json" || exit "$?"
+  done
+done'
+
+systemd-run --user --scope --unit=glm53-kv-aot-v2-compare -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= .venv/bin/python -m benchmarks.kernels.audit_glm53_kv_loader compare perf/results/2026-09-10/kv-aot-qualification-v2
 ```

@@ -154,7 +154,10 @@ class KVIntervention:
             require(
                 len(tuner.compile_results) == len(tuner.launchers) == 1
                 and "run" not in vars(tuner),
-                "one original launcher and no foreign run override required",
+                "one original launcher and no foreign run override required: "
+                f"results={len(tuner.compile_results)}, "
+                f"launchers={len(tuner.launchers)}, "
+                f"run_override={'run' in vars(tuner)}",
             )
             compiled, launcher = tuner.compile_results[0], tuner.launchers[0]
             check_launcher(compiled, launcher, target, self.observer)
@@ -211,9 +214,36 @@ class KVIntervention:
         if not callable(getattr(module, "call", None)):
             return
         with self.lock:
-            for symbol, tuner in list(vars(module).items()):
-                if self.target(tuner) is None:
-                    continue
+            bound = [
+                (symbol, tuner, self.target(tuner))
+                for symbol, tuner in list(vars(module).items())
+                if self.target(tuner) is not None
+            ]
+            if not bound:
+                return
+            filename = getattr(module, "__file__", None)
+            require(isinstance(filename, str), "target module lacks source provenance")
+            path = Path(filename)
+            require(
+                path.resolve() == path and path.is_relative_to(self.private),
+                "target module outside private cache",
+            )
+            relative = str(path.relative_to(self.private))
+            expected = self.manifest["expected_graphs"][str(self.rank)]
+            if relative not in expected:
+                # AsyncCompile's synchronous path imports the standalone source
+                # BEFORE precompile(). Its benchmark call export is not an AOT
+                # root. Leave that template alone; bind its finished root later.
+                require(len(bound) == 1, "unexpected non-root target module")
+                symbol, _, target = bound[0]
+                require(
+                    relative == target["relative"] and symbol == target["kernel"],
+                    "unexpected non-root target module",
+                )
+                check_source(target, self.private)
+                return
+            require(sha(path) == expected[relative], "target graph source changed")
+            for symbol, tuner, _ in bound:
                 key = id(module), symbol
                 previous = self.graph_bindings.get(key)
                 require(

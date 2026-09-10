@@ -19,7 +19,7 @@ from slimserve.rmsnorm_diagnostic import NAMESPACE, sha
 
 MODULE = "benchmarks.kernels.check_glm53_kv_loader"
 AUDITOR_MODULE = "benchmarks.kernels.audit_glm53_kv_loader"
-UNIT_PREFIX = "glm53-kv-aot-v1"
+UNIT_PREFIX = "glm53-kv-aot-v2"
 LOADER = KVLoader
 
 

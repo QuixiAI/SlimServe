@@ -27455,3 +27455,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/kv-aot-source-inspection.json`,
   `kv-aot-{hooks,audit,runner,final}-cpu.xml`. Exact prospective commands and
   failure handling: end of `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - AOT KV v1 stops at standalone helper; constrain binding to roots
+
+- Status: v1 terminal; narrow boundary fix CPU-tested, new v2 prescribed.
+- Baseline/workload: `30ea612a6`, first no-weights control-rank0 load of eight
+  prescribed cases. All seven bundles load exactly (4/4/6/6/6/12/12 kernels).
+  Load/audit exit 1; controller stops, seven cases remain unattempted.
+- Cause: traceback enters standalone combo source via synchronous
+  AsyncCompile.load_kernel before precompile. Its benchmark `call` export was
+  mistaken for a completed graph, triggering the unresolved-launcher guard.
+  One actual target graph had already bound successfully through a static future.
+- Fix: bind only registered original AOT root paths; skip only the exact
+  standalone source with verified path/hash/debug/symbol. Preserve strict
+  actual-root/source/config/binary coverage and no-fallback gates. Include
+  original launcher/result/override state in future rejection diagnostics.
+- Correctness: CPU 147 pass/6.77 s; full 475 pass/42.84 s, 14 upstream warnings.
+  Reproduces the precompile helper and rejects unknown/wrong/changed helpers.
+- Closure: all 246 frozen receipts and 5,172 original cache files verify; GPU
+  release and unchanged UUID/driver/600 W identity confirmed. Freeze ended before
+  edits. No retry, model weights/forward/capture, native build or TPS measurement.
+- Decision: retain v1 failure, commit fix, then separately prescribed v2 in a
+  new namespace with the same eight-case order/gates. No default/quant/quality
+  promotion, and the separate failed indexer oracle remains failed.
+- Raw: `kv-aot-qualification-v1/control-rank0/` under 2026-09-10; failed analysis
+  SHA fe7113bacf2c8ba8d83aa932426b17a6e607b85d5c5362adcc24903c6c651217;
+  CPU `runtime-control/kv-aot-{root-boundary,v2-final}-cpu.xml`. Exact v2 commands
+  and failure policy are at the tail of `perf/glm53-attention-isolation.md`.

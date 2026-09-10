@@ -35,7 +35,28 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): actual-AOT KV qualification v1 ready
+### Latest checkpoint (2026-09-10): v1 terminal; exact helper-boundary fix ready
+
+On `30ea612a6`, v1 stops on the first control-rank0 load; load/audit exit 1,
+seven other cases unattempted. Seven static bundles loaded with no fallback.
+The traceback proves the hook treated the standalone combo benchmark helper's
+`call` export as a completed AOT graph before Torch's synchronous precompile.
+
+Controller now binds only registered AOT roots and skips only the exact
+source/hash/kernel-verified standalone helper. Wrong non-root targets still fail.
+CPU reproducer: 147 passed in 6.77 s; full suite: 475 in 42.84 s, 14 warnings.
+v1 receipts are retained; final check verified 246 frozen receipts/5,172 cache
+files, GPU release and unchanged hardware. Source freeze ended before edits.
+
+NEXT: commit then run the separately prescribed v2 preparation/controller/compare
+commands at the tail of `perf/glm53-attention-isolation.md`. Same fixed eight
+cases/gates, new cache namespace, no retry within either series. Freeze through
+closure. No model/weights/forward/capture/TPS/default/quant/gate change.
+Raw v1 `control-rank0/run/analysis.json` SHA
+fe7113bacf2c8ba8d83aa932426b17a6e607b85d5c5362adcc24903c6c651217;
+CPU `runtime-control/kv-aot-{root-boundary,v2-final}-cpu.xml` under 2026-09-10.
+
+### Previous checkpoint (2026-09-10): actual-AOT KV qualification v1 ready
 
 Dedicated preparer/runner/offline auditor implemented, reusing shared AOT
 lifecycle and graph/driver/root checks. Actual-cache CPU inspection verifies

@@ -295,6 +295,9 @@ def test_finished_module_binding_without_static_future(tmp_path, monkeypatch):
     with f.loader.intercept():
         f.tuner.precompile()
         module = ModuleType("finished")
+        module.__file__ = str(
+            f.loader.private / next(iter(f.manifest["expected_graphs"]["0"]))
+        )
         module.call = lambda: None
         module.combo = f.tuner
         f.loader.controller.bind_graph(module, f.loader.compile_replacement)
@@ -317,6 +320,9 @@ def test_new_target_or_graph_after_seal_fails(tmp_path, monkeypatch, which):
                 future.result()
         else:
             module = ModuleType("late")
+            module.__file__ = str(
+                f.loader.private / next(iter(f.manifest["expected_graphs"]["0"]))
+            )
             module.call = lambda: None
             module.combo = f.tuner
             with pytest.raises(ValueError, match="after seal"):
@@ -474,3 +480,45 @@ def test_later_non_target_future_is_not_transformed(tmp_path, monkeypatch):
         assert future.result() is tuner and len(rechecks) == 1
         assert "run" not in vars(tuner) and tuner.compile_results == [result]
         assert len(f.loader.controller.owners) == 1
+
+
+def test_standalone_combo_helper_is_not_a_finished_aot_graph(tmp_path, monkeypatch):
+    f = fixture(tmp_path, monkeypatch)
+    helper = ModuleType("standalone_combo")
+    helper.__file__ = str(f.loader.private / "inductor_cache/aa/combo.py")
+    helper.call = lambda *_: pytest.fail("helper benchmark must never run")
+    template = CachingAutotuner.__new__(CachingAutotuner)
+    template.filename = helper.__file__
+    template.compile_results, template.launchers = [], []
+    helper.combo = template
+    with f.loader.intercept():
+        f.loader.controller.bind_graph(helper, f.loader.compile_replacement)
+        assert not f.loader.controller.owners and not f.compiles
+        assert "run" not in vars(template) and not template.compile_results
+        assert not template.launchers
+        report = f.loader.controller.seal(load_graphs(f))
+        assert report["target_bindings"] == 2
+        # Seeing the same exact helper after seal still cannot invent a root.
+        f.loader.controller.bind_graph(helper, f.loader.compile_replacement)
+        assert len(f.loader.controller.owners) == 1
+
+
+@pytest.mark.parametrize("change", ["wrong_file", "wrong_symbol", "changed_source"])
+def test_only_exact_standalone_source_can_bypass_root_binding(
+    tmp_path, monkeypatch, change
+):
+    f = fixture(tmp_path, monkeypatch)
+    helper = ModuleType("untrusted_nonroot")
+    helper.__file__ = str(f.loader.private / "inductor_cache/aa/combo.py")
+    helper.call = lambda: None
+    helper.combo = f.tuner
+    if change == "wrong_file":
+        helper.__file__ = str(f.loader.private / "inductor_cache/aa/unknown.py")
+    elif change == "wrong_symbol":
+        helper.wrong = helper.combo
+        del helper.combo
+    else:
+        Path(helper.__file__).write_text("# changed\n")
+    with pytest.raises(ValueError):
+        f.loader.controller.bind_graph(helper, f.loader.compile_replacement)
+    assert not f.compiles
