@@ -1973,6 +1973,15 @@ reproductions; original/split oracle gates remain failed. No new TPS/default or
 stable baseline. Raw `runtime-control/indexer-precision-analysis-v1.json`, SHA
 358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764, under 2026-09-10.
 
+Selective correction follow-up on `f5ad4f884` passes120 isolated all-rank cases
+and both input phases at unchanged max1BF16ULP, with detector/guard/replay and
+non-target preservation checks. This new corrected-kernel gate does not relabel
+the original failure or qualify model quality. Extra-launch diagnostic cost:
+0.696/0.746/3.253/4.444us at rows1/16/640/7616, including flag writes. No serving
+TPS/default/quant or stable baseline change. GPUs released; completed raw
+`indexer-correction-v1/analysis.json` under2026-09-10, SHA
+c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

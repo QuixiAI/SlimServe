@@ -554,3 +554,24 @@ systemd-run --user --scope --unit=glm53-indexer-cancellation-analysis-v1 -p Memo
 Raw `runtime-control/indexer-cancellation-analysis-v1.json` under 2026-09-10,
 SHA3474f6692e98b1be257174827dd5387d8d08dedadd647f8c2935a0a18ec25a24.
 CPU XML and all per-phase detector counts/missed-coordinate lists retained.
+
+## Selective correction GPU result (2026-09-10)
+
+The follow-up on `f5ad4f884` completes exactly one all-rank process,120 cases,
+both input phases. Corrected indexer max1 BF16 ULP passes the unchanged gate;
+actual detector coverage, original hashes, all non-target/unselected outputs,
+mutation/stride/selection guards and graph replay pass. All ranks agree exactly.
+Unique-matrix GPU counts:1,430 selected elements,1,423 selected rows,121 changed
+elements. No original failing location missed. The original historical oracle
+failure is not relabeled; this is a new corrected-kernel qualification.
+
+Diagnostic extra-launch median cost is0.696/0.746/3.253/4.444us at
+rows1/16/640/7616, including selection writes. No speed win or serving result.
+Model quality and actual graph-loader/forward/capture integration remain pending;
+preserve the qualified instrumented binary and original production arithmetic.
+
+Full protocol, timing ranges, sources and limits:
+`perf/glm53-indexer-correction-protocol.md`. Terminal audit verifies236 receipts,
+all5,172 original files and unchanged hardware; GPUs released and freeze ended.
+Raw `indexer-correction-v1/analysis.json` under2026-09-10, SHA
+c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65.

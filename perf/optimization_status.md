@@ -27645,3 +27645,29 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   remains failed; model-quality validation is separate. CPU8GiB/GPU16GiB, swap0.
 - Raw CPU: `runtime-control/indexer-correction-cpu-{v1,final}.xml` under2026-09-10.
   Full prospective commands: `perf/glm53-indexer-correction-protocol.md`.
+
+## 2026-09-10 - Selective indexer correction passes isolated GPU qualification
+
+- Status: isolated GPU correctness candidate retained; serving qualification pending.
+- Scope/baseline: `f5ad4f884`, recipe v1/TP4 SM120, original rank-specific bundle
+  with historically failed indexer oracle. One fixed2^-12 correction launch,
+  FP64 through affine, no production/default/quant/native changes.
+- Correctness: all120 cases/two phases pass unchanged max1BF16ULP oracle.
+  GPU/CPU detector exact, no missed original errors; original input/output hashes,
+  Q/KV/unselected indexer/packed gate/guards, eager repeat and changed/restored
+  replay pass. All four rank numerical records exact; four new cubins identical.
+  Totals5,720 selected elements/5,692 rows/484 changes; unique matrix1,430/1,423/121.
+- Timing: after numerical success, fixed rank0 three-repeat32-call graph matrix.
+  Original->corrected median us: rows1 1.282->1.978;16 1.472->2.218;
+  640 2.300->5.553;7616 13.387->17.831. Includes selection writes; not a speed win.
+- Closure: one preparation/process/audit, no retries/replacements/exclusions.
+  236 frozen receipts and5,172 original files verify; GPUs released and
+  UUID/driver/600W settings unchanged. Freeze ended before notebook edits.
+  CPU95 pass/5.13s; no model/TPS/quality-floor or baseline promotion.
+- Decision: retain isolated candidate for opt-in AOT-loader/forward/capture
+  qualification, then separately prescribe model control/correction/return gates.
+  Historical original oracle failure remains recorded. Keep qualified flag writes;
+  local accuracy does not imply model quality. No next GPU/model job prescribed.
+- Raw: `indexer-correction-v1/analysis.json` under2026-09-10, SHA
+  c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65.
+  Full commands/ranges/receipt hashes: `perf/glm53-indexer-correction-protocol.md`.

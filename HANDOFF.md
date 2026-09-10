@@ -35,7 +35,42 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): isolated indexer correction CPU-qualified
+### Latest checkpoint (2026-09-10): selective indexer correction passes GPU probe
+
+On `f5ad4f884`, the one prescribed GPU process completes all120 rank-matched
+cases and both input phases. Corrected indexer max1 BF16 ULP meets the unchanged
+oracle. Actual GPU/CPU detector flags agree; zero original failures missed.
+Q/KV, unselected indexer values, packed gate, guards, eager repeats and changed/
+restored graph replay all pass. Original input/output hashes reproduce exactly.
+All four rank numerical records agree. Across ranks:5,720 selected elements,
+5,692 selected rows,484 changed elements; per unique matrix1,430/1,423/121.
+
+Terminal audit verifies236 frozen sources/receipts and5,172 original files.
+Four correction cubins are byte-identical, SHA
+`bd00effc35c7c0619ce74d3819aa3322cc110e423ce157ce855994f30188453e`.
+GPUs released; identities/driver/600W settings unchanged. Source freeze ended
+after terminal audit; no retry/replacement, model launch or native build.
+
+Diagnostic median bundle timings, original -> original+correction:
+rows1:1.282->1.978us;16:1.472->2.218;640:2.300->5.553;7616:13.387->17.831.
+Selection-write overhead is included. This is a correctness candidate with a
+measured extra-launch cost, NOT a speed win, serving result or baseline change.
+The historical original oracle failure remains recorded; model quality has not
+been tested. Production attention/profile/quant/defaults are unchanged.
+
+Raw `perf/results/2026-09-10/indexer-correction-v1/analysis.json`, SHA
+`c6ac3d0399af92be467ef47831f512c4edee60ff08fe0772afb399c59a18cc65`.
+CPU95 pass/5.13s. Exact commands/limits: `perf/glm53-indexer-correction-protocol.md`.
+Use this completed receipt after future edits; do not rerun its expired freeze.
+
+NEXT: qualify an opt-in graph-loader/serving diagnostic using the tested kernel
+and exact original bundle. Verify actual AOT binding and forward/capture coverage
+before a prescribed control/correction/return model-quality comparison. The KV
+result demonstrates that local ULP parity is not enough. Keep the instrumented
+kernel unchanged for that qualification; do not silently remove its flag writes.
+No next GPU/model job or source freeze is active/prescribed yet.
+
+### Previous checkpoint (2026-09-10): isolated indexer correction CPU-qualified
 
 Opt-in probe only: `benchmarks/kernels/glm53_indexer_correction.py` and
 `check_glm53_indexer_correction.py`. Original compiled combo remains first;
