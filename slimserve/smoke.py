@@ -22,12 +22,12 @@ from typing import Any
 
 import pybase64 as base64
 import regex as re
+import requests
 
 from slimserve import fetch, hardware, registry
 from slimserve.engine import engine_kwargs
 from slimserve.registry import Plan, ProfileError
 from slimserve.server import Server
-from slimserve.stream import chat_completion, visible_text
 
 _TEXT_PROMPT = "What is 2 + 2? Reply with only the number."
 _IMAGE_PROMPT = "What is the dominant color in this image? Reply with one word."
@@ -132,13 +132,16 @@ def validate_acceleration(plan: Plan) -> dict[str, Any]:
     speculative = engine_kwargs(plan).get("speculative_config")
     if not isinstance(speculative, dict):
         raise RuntimeError("resolved plan has no speculative configuration")
-    registered = plan.source["speculator"]["engine"]
+    registered = plan.speculator["engine"]
     required = dict(registered)
     if registered.get("method") == "dspark":
         required.update(
             attention_backend="TURBOQUANT",
             kv_cache_dtype="turboquant_k8v4",
         )
+    # Platform variants can register a different drafter/method or verify
+    # width; those are part of the profile's authoritative configuration.
+    required.update(plan.speculative_overrides)
     mismatches = {
         key: speculative.get(key)
         for key, expected in required.items()
@@ -176,23 +179,31 @@ def _request(
         ]
     messages = [{"role": "user", "content": content}]
     started = time.perf_counter()
-    raw = "".join(
-        chat_completion(
-            base_url,
-            plan.engine.get("served_model_name", "model"),
-            messages,
-            max_tokens=max_tokens,
-            # No sampling overrides: the model's shipped defaults apply.
-            # Seeded for repeatable smoke answers; greedy is never used.
-            seed=42,
-            chat_template_kwargs=plan.chat_template_kwargs or None,
-            timeout=timeout,
-        )
-    )
-    answer = visible_text(raw)
+    body = {
+        "model": plan.engine.get("served_model_name", "model"),
+        "messages": messages,
+        "max_tokens": max_tokens,
+        # Keep the registered sampling and thinking defaults.
+        "seed": 42,
+    }
+    if plan.chat_template_kwargs:
+        body["chat_template_kwargs"] = plan.chat_template_kwargs
+    with requests.post(
+        f"{base_url}/v1/chat/completions", json=body, timeout=timeout
+    ) as response:
+        response.raise_for_status()
+        result = response.json()
+    if result.get("error"):
+        raise RuntimeError(f"chat failed: {result['error']}")
+    choice = result["choices"][0]
+    answer = choice["message"].get("content") or ""
+    # A correct-looking number in the reasoning is not a completed answer.
+    if not answer.strip() or choice["finish_reason"] == "length":
+        raise RuntimeError(f"empty or truncated chat answer: {result}")
     return {
-        "answer": answer[:500],
+        "answer": answer,
         "seconds": time.perf_counter() - started,
+        "response": result,
     }
 
 
@@ -200,6 +211,13 @@ def _require_match(result: dict[str, Any], pattern: str, label: str) -> None:
     answer = str(result["answer"])
     if not re.search(pattern, answer, flags=re.IGNORECASE):
         raise RuntimeError(f"{label} check failed; answer was {answer!r}")
+
+
+def profile_modalities(plan: Plan) -> list[str]:
+    """Honor platform-specific text-only profiles of multimodal checkpoints."""
+    if plan.engine.get("language_model_only"):
+        return ["text"]
+    return list(plan.source["modalities"])
 
 
 def run_profile(
@@ -239,7 +257,7 @@ def run_profile(
         _require_match(text_result, r"(?<!\d)4(?!\d)", "text")
 
         image_result = None
-        if "image" in plan.source["modalities"]:
+        if "image" in profile_modalities(plan):
             image_result = _request(
                 plan,
                 server.base_url,
@@ -255,7 +273,7 @@ def run_profile(
         "source": plan.source_key,
         "quant": plan.quant.name,
         "gpus": plan.gpus,
-        "modalities": plan.source["modalities"],
+        "modalities": profile_modalities(plan),
         "speculative_method": speculative.get("method"),
         "speculative_tokens": speculative["num_speculative_tokens"],
         "draft_attention_backend": speculative.get("attention_backend"),
@@ -305,12 +323,19 @@ def main() -> int:
                 "source": plan.source_key,
                 "quant": plan.quant.name,
                 "gpus": plan.gpus,
-                "modalities": plan.source["modalities"],
+                "modalities": profile_modalities(plan),
                 "log": str(log_dir / f"{plan.profile_id}.log"),
                 "passed": False,
                 "error": str(error),
             }
         results.append(result)
+        # Keep completed rows even if a later model crashes or the matrix
+        # is interrupted. The final aggregate JSON remains the pass gate.
+        print(json.dumps(result), file=sys.stderr, flush=True)
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            with args.output.with_suffix(".jsonl").open("a") as stream:
+                stream.write(json.dumps(result) + "\n")
         if not result["passed"] and args.fail_fast:
             break
 

@@ -3,6 +3,50 @@
 This file holds stable baseline snapshots for comparison. Raw outputs belong in
 `perf/results/`; summarize only the numbers needed to compare future work.
 
+## Metal NVMe KV tier qualification - 2026-09-10
+
+- Apple M5 Max / 128 GiB, macOS 26.6.2 (25G83); candidate
+  `candidate-cache-geometry-checked`, parent `e6ef60edc`. Registered profiles
+  and drafters, exact 1,000 input / 2,000 output tokens, API/profile defaults
+  with seed 42 (effective temperature 1.0 / top_p 1.0 / top_k 0, verified from
+  local ModelConfig and API sampling construction). Per-repeat warmups, three
+  timed repeats per tier and concurrency. C8 TPS is aggregate.
+
+| Profile | Tier | c1 median [range] tok/s | c8 median [range] tok/s |
+| --- | --- | ---: | ---: |
+| `qwen38-q2kxl-1` | on | 16.101 [15.508-17.818] | 41.765 [37.493-43.620] |
+| `qwen38-q2kxl-1` | off | 15.995 [15.775-17.867] | 39.258 [38.752-40.667] |
+| `dsv4-xxs-1` | on | 16.455 [16.116-18.988] | 21.222 [20.914-21.336] |
+| `dsv4-xxs-1` | off | 13.200 [10.738-19.264] | 15.958 [14.682-18.355] |
+| `muse-kdyn-1` | on | 8.236 [8.167-8.954] | 13.464 [11.815-13.719] |
+| `muse-kdyn-1` | off | 8.757 [8.710-9.346] | 14.475 [11.729-14.800] |
+
+- Muse counter-order confirmation (off then on): three c1 repeats give
+  on 9.081 [9.051-9.605] versus off 9.031 [8.992-9.216] tok/s. All six
+  outputs and draft counts match; the earlier c1 slowdown did not repeat.
+  One additional c8 batch per tier gives on 13.944 versus off 15.395 tok/s
+  (-9.42%). Draft counts differ: 119,552 on / 110,608 off (+8.09%); five
+  final responses match, three differ. Draft processing rates are 104.19 on /
+  106.42 off per second. This is a measured 7-9% Muse c8 serving tradeoff,
+  not evidence that the tier has zero overhead. Retained with that cost.
+- All 184 timed responses / 368,000 output tokens pass exact counts,
+  positive registered-drafter work, clock/arithmetic and anti-degeneracy
+  checks. All five compatible profiles pass text smoke and, where registered,
+  image smoke. Reset/reuse acceptance passes 36/36 long-history recalls;
+  Qwen natural pressure passes another 12/12 after 480,000 filler tokens.
+  All 48 readers complete; all 12,402 restored-block byte checks match.
+- This is a shared-host baseline with recorded variable CPU/VM load, not
+  an idle-machine ceiling. Later phases have no detected competing Metal
+  compute; interrupted runs are excluded. Favorable DSV4/Qwen comparisons
+  do not establish causal tier speedups. Restore coverage is approximately
+  9-13K input tokens, not full native context limits or restart persistence.
+- Raw: `perf/results/2026-09-08/nvme-tier-ship/`, including all
+  `geometry-matrix-*` and `geometry-confirm-*` samples,
+  `geometry-qualification-review.json`, `geometry-release-assessment.json`,
+  `muse-confirmation-work-audit.json` and source/native hash manifests.
+  See the 2026-09-10 entry in `perf/optimization_status.md` for the release
+  decision, full validation scope, and reproducible campaign commands.
+
 ## Qwen3.8-Flash-Next (qwen4_exp)
 
 ### 4x RTX 3090 - qwen38fn-nvfp4-4 concurrency record - 2026-09-08 (32 seqs, dynamic k, int8 tiles to 128 rows)

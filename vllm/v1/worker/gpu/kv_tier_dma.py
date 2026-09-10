@@ -26,6 +26,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,7 +59,7 @@ class TierOpBatch:
     # host copy an EARLIER batch produced (the scheduler stages them one
     # confirmation later); promotion reads (disk_slot, host_slot) that must
     # land before this request's restore copies run.
-    disk_writes: list[tuple[int, int]] = None  # type: ignore[assignment]
+    disk_writes: Sequence[tuple[int, int] | tuple[int, int, int]] = None  # type: ignore[assignment]
     disk_reads: list[tuple[int, int]] = None  # type: ignore[assignment]
     req_id: str | None = None
 

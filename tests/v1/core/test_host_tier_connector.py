@@ -97,21 +97,30 @@ def make_connector(indexer_ratio=None, window=False):
     if window:
         # A drafter's sliding-window group (DFlash2 on GLM-5.3-Flash): the
         # tier neither stages nor restores it; it is zeroed on resume.
-        groups.append(SimpleNamespace(
-            kv_cache_spec=SlidingWindowSpec(
-                block_size=BLOCK, num_kv_heads=1, head_size=8,
-                dtype=torch.bfloat16, sliding_window=2 * BLOCK,
-            ),
-            layer_names=["draft_swa"],
-        ))
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=SlidingWindowSpec(
+                    block_size=BLOCK,
+                    num_kv_heads=1,
+                    head_size=8,
+                    dtype=torch.bfloat16,
+                    sliding_window=2 * BLOCK,
+                ),
+                layer_names=["draft_swa"],
+            )
+        )
     if indexer_ratio is not None:
-        groups.append(SimpleNamespace(
-            kv_cache_spec=MLAAttentionSpec(
-                block_size=BLOCK * indexer_ratio, num_kv_heads=1,
-                head_size=16 // indexer_ratio, dtype=torch.bfloat16,
-            ),
-            layer_names=["indexer"],
-        ))
+        groups.append(
+            SimpleNamespace(
+                kv_cache_spec=MLAAttentionSpec(
+                    block_size=BLOCK * indexer_ratio,
+                    num_kv_heads=1,
+                    head_size=16 // indexer_ratio,
+                    dtype=torch.bfloat16,
+                ),
+                layer_names=["indexer"],
+            )
+        )
     kv_cache_config = SimpleNamespace(kv_cache_groups=groups, kv_cache_tensors=[])
     with (
         patch(

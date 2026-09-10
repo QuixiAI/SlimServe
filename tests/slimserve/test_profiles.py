@@ -107,15 +107,23 @@ def test_spec_cli_opt_in_keeps_registered_glm_defaults(monkeypatch):
         "detect",
         Mock(
             return_value=Mock(
-                known=True, platform="a100", count=4,
-                memory_bytes=0, device_name="A100",
+                known=True,
+                platform="a100",
+                count=4,
+                memory_bytes=0,
+                device_name="A100",
             )
         ),
     )
     monkeypatch.setattr(cli.registry, "resolve", Mock(return_value=plan))
     monkeypatch.setattr(cli.fetch, "ensure", Mock())
     seen = []
-    monkeypatch.setattr(cli, "_chat", lambda resolved, *_: seen.append(resolved) or 0)
+
+    def record_chat(resolved, *_):
+        seen.append(resolved)
+        return 0
+
+    monkeypatch.setattr(cli, "_chat", record_chat)
     assert cli.main(["glm53f-nvfp4-4", "--quant", "NVFP4", "--spec"]) == 0
     assert len(seen) == 1 and seen[0].speculative
     config = engine_kwargs(seen[0])["speculative_config"]
@@ -153,6 +161,17 @@ def test_qwen38_uses_measured_metal_speculation_settings():
     assert speculative["num_speculative_tokens"] == 3
     assert speculative["quantization"] == "gguf"
     assert plan.env["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+
+
+def test_metal_smoke_accepts_registered_variant_drafters():
+    machine = Machine("metal", "Apple M5 Max", 1, memory_bytes=2**37)
+    profiles = compatible_profile_ids(machine)
+    assert {"qwen38-nvfp4-1", "qwen38-nvfp4-1-tq"} <= set(profiles)
+    for profile in profiles:
+        plan = resolve(profile, "metal", 1, None, 2**37)
+        spec = validate_acceleration(plan)
+        expected = {**plan.speculator["engine"], **plan.speculative_overrides}
+        assert all(spec[k] == v for k, v in expected.items())
 
 
 def test_qwen38_uses_measured_mi300x_speculation_settings():
@@ -1215,3 +1234,55 @@ def test_mi300x_glm52_and_dsv4_profiles_carry_the_host_kv_tier():
         else:
             assert "enable_cross_layers_blocks" not in extra, profile_id
     assert seen == 7, "expected three GLM and four DSV4 MI300X variants"
+
+
+def test_metal_tier_profiles_carry_the_nvme_kv_tier():
+    """The issue #19 Metal records declare the NVMe-backed tier.
+
+    Unified memory makes a host-RAM tier meaningless on Metal (staging
+    bytes and KV-pool bytes are one physical pool), so these records use
+    nvme_tier_gb_per_rank, never host_tier_gb_per_rank. dsv4-xxs-1 gets
+    the packed slab via the is_dsv4 gate; the hybrid/multi-group records
+    force it with enable_cross_layers_blocks.
+    """
+    tiered = {
+        "dsv4-xxs-1": False,
+        "qwen38-q2kxl-1": True,
+        "muse-kdyn-1": True,
+    }
+    seen = 0
+    for profile_id, needs_cross_layers in tiered.items():
+        record = (
+            registry._registry()["profiles"][profile_id]
+            .get("variants", {})
+            .get("metal")
+        )
+        assert record is not None, profile_id
+        seen += 1
+        transfer = record["engine"]["kv_transfer_config"]
+        assert transfer["kv_connector"] == "HostTierConnector", profile_id
+        assert transfer["kv_role"] == "kv_both", profile_id
+        extra = transfer["kv_connector_extra_config"]
+        assert transfer["kv_connector_module_path"] == (
+            "vllm.distributed.kv_transfer.kv_connector.v1.metal_host_tier_connector"
+        ), profile_id
+        assert extra["nvme_tier_gb_per_rank"] > 0, profile_id
+        assert "host_tier_gb_per_rank" not in extra, profile_id
+        if needs_cross_layers:
+            assert extra["enable_cross_layers_blocks"] == "True", profile_id
+    assert seen == 3, "expected the three issue-#19 metal records"
+
+
+def test_no_metal_profile_uses_a_host_ram_tier():
+    """host_tier_gb_per_rank on a metal record would silently rebuild the
+    pinned-RAM tier on unified memory - the config the NVMe tier exists
+    to prevent."""
+    for profile_id, entry in registry._registry()["profiles"].items():
+        record = entry.get("variants", {}).get("metal")
+        if record is None:
+            continue
+        transfer = record["engine"].get("kv_transfer_config")
+        if transfer is None:
+            continue
+        extra = transfer.get("kv_connector_extra_config", {})
+        assert "host_tier_gb_per_rank" not in extra, profile_id

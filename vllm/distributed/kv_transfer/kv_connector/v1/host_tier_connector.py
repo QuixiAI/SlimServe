@@ -108,7 +108,9 @@ class HostTierMeta(KVConnectorMetadata):
     # req_id -> [gpu_block_id, ...] blocks to zero alongside the restore
     # (the ring block, whose framework zeroing was skipped for the
     # async-load range but which the tier deliberately does not restore).
-    zeros: dict[str, list[tuple[int, int]]] = field(default_factory=dict)  # (block, group)
+    zeros: dict[str, list[tuple[int, int]]] = field(
+        default_factory=dict
+    )  # (block, group)
     # req_id -> [gpu_block_id, ...] promised restores the scheduler side
     # could not stage (no target block); the worker reports the request
     # received and the blocks invalid so the scheduler recomputes them
@@ -251,7 +253,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # sub-rows each) reserved at allocation, flushed at fill, rebound on
         # restore. Size from main_kv_tier_gb_per_rank.
         host_tensors = [
-            t for t in kv_cache_config.kv_cache_tensors if getattr(t, "host_resident", False)
+            t
+            for t in kv_cache_config.kv_cache_tensors
+            if getattr(t, "host_resident", False)
         ]
         self._main_block_bytes = host_tensors[0].block_stride if host_tensors else 0
         main_gb = float(extra.get("main_kv_tier_gb_per_rank", 0) or 0)
@@ -305,7 +309,9 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             if has_state and isinstance(groups[gid].kv_cache_spec, SlidingWindowSpec)
         ]
         if self.window_groups:
-            self.attn_groups = [g for g in self.attn_groups if g not in self.window_groups]
+            self.attn_groups = [
+                g for g in self.attn_groups if g not in self.window_groups
+            ]
         # Per-request state groups saved once at finish and restored on
         # resume: the mamba align-state groups only. In align mode the
         # engine freezes each boundary state in the pool's prefix cache
@@ -381,17 +387,17 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         # ``ratio`` hash positions and is due (complete, offloadable,
         # restorable) only at the last of them.
         self._attn_ratio: dict[int, int] = {}
-        for g, bs_g in attn_block_sizes.items():
+        for attn_gid, bs_g in attn_block_sizes.items():
             if bs_g % self.hash_block_size != 0:
                 raise ValueError(
-                    "host-tier: attention group %d block %d is not a multiple "
-                    "of the hash block %d" % (g, bs_g, self.hash_block_size)
+                    f"host-tier: attention group {attn_gid} block {bs_g} is not "
+                    f"a multiple of the hash block {self.hash_block_size}"
                 )
-            self._attn_ratio[g] = bs_g // self.hash_block_size
+            self._attn_ratio[attn_gid] = bs_g // self.hash_block_size
         self._resume_align = 1
         for r in self._attn_ratio.values():
-            self._resume_align = self._resume_align * r // math.gcd(
-                self._resume_align, r
+            self._resume_align = (
+                self._resume_align * r // math.gcd(self._resume_align, r)
             )
         # Per-group live bytes within a block-stride row: each group's
         # layers occupy a contiguous prefix [0, sum) of its own rows (the
@@ -410,7 +416,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                 else:
                     total += spec.page_size_bytes
             self._group_nbytes[gid] = min(
-                total, self._pool_strides.get(self._gid_pool.get(gid, 0), self.block_stride)
+                total,
+                self._pool_strides.get(self._gid_pool.get(gid, 0), self.block_stride),
             )
 
         if role == KVConnectorRole.SCHEDULER:
@@ -464,7 +471,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     self.num_disk_slots,
                     self.row_bytes,
                 )
-            self._staged_disk_writes: dict[int, list[tuple[int, int]]] = {}
+            self._staged_disk_writes: dict[int, list[tuple[int, int, int]]] = {}
             self._staged_disk_reads: dict[str, list[tuple[int, int]]] = {}
             # Write-through batches awaiting every rank's completion report.
             self._disk_write_batches: dict[int, list[tuple[int, int]]] = {}
@@ -696,14 +703,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
                     )
                     self._fail_restore(request, track)
                     return
-                ops.append(
-                    (track.planned_attn_slots[logical][gid], gb[gidx], gid)
-                )
+                ops.append((track.planned_attn_slots[logical][gid], gb[gidx], gid))
                 if gid == self._main_gid and track.planned_main_slots:
                     slot = track.planned_main_slots[logical]
-                    self._staged_main_rebinds.setdefault(
-                        request.request_id, []
-                    ).append((gb[gidx], slot))
+                    self._staged_main_rebinds.setdefault(request.request_id, []).append(
+                        (gb[gidx], slot)
+                    )
                     # The block's rows point into the slot from now on;
                     # the hold outlives the request (the block stays in
                     # the GPU prefix cache).
@@ -768,7 +773,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if covered == track.planned_blocks:
             track.planned_blocks = 0  # restore fully staged
 
-    def _fail_restore(self, request: "Request", track: _ReqTrack) -> None:
+    def _fail_restore(self, request: Request, track: _ReqTrack) -> None:
         """A promised restore cannot be staged: hand the scheduler every GPU
         block of the promised span as a failed load. The worker reports the
         request received and those blocks invalid, so the engine recomputes
@@ -1105,7 +1110,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
         if slots is None:
             return False, None
         pin_blocks = [
-            self._state_pool_for(tier_gid).blocks[b] for tier_gid, b in enumerate(targets)
+            self._state_pool_for(tier_gid).blocks[b]
+            for tier_gid, b in enumerate(targets)
         ]
         for tier_gid, blk in enumerate(pin_blocks):
             self._state_pool_for(tier_gid).touch([blk])
@@ -1171,7 +1177,12 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             packed_key = max(by_storage, key=lambda k: len(by_storage[k]))
         pool_keys: dict[int, int] = {}
         for key, pool in storage_pool.items():
-            if key != packed_key and pool is not None and pool > 0 and pool in self._pool_strides:
+            if (
+                key != packed_key
+                and pool is not None
+                and pool > 0
+                and pool in self._pool_strides
+            ):
                 pool_keys[pool] = key
         outside = {
             k: v
@@ -1263,6 +1274,7 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             from vllm.v1.worker.gpu.kv_residency import get_main_kv_residency
 
             residency = get_main_kv_residency()
+            assert residency is not None
             base = self._main_arena_base
             stride = self._main_block_bytes
             for block in meta.main_release:
@@ -1272,8 +1284,8 @@ class HostTierConnector(KVConnectorBase_V1, SupportsHMA):
             for req_ops in meta.main_rebinds.values():
                 for block, slot in req_ops:
                     residency.rebind(block, base + slot * stride)
-            for ops in meta.main_flush.values():
-                for block, _slot in ops:
+            for flush_ops in meta.main_flush.values():
+                for block, _slot in flush_ops:
                     residency.flush(block)
         # Everything is issued here rather than in wait_for_save:
         # start_load_kv runs on EVERY step, including empty (no_forward)

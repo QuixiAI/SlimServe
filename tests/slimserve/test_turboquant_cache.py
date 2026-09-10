@@ -39,6 +39,51 @@ def test_turboquant_indexes_pages_by_block_stride() -> None:
     assert TurboQuantAttentionBackend.indexes_kv_by_block_stride()
 
 
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_packed_metal_kv_view_keeps_both_halves_in_each_physical_page(hybrid):
+    from vllm.v1.attention.backends.metal_attn import MetalAttentionBackend
+
+    blocks = 3
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=8, dtype=torch.float16
+    )
+    shape = MetalAttentionBackend.get_kv_cache_shape(blocks, 16, 2, 8)
+    page_bytes = 2 * 16 * 2 * 8 * 2
+    offset, stride = 128, page_bytes + 256
+    raw = torch.zeros(blocks * stride, dtype=torch.int8)
+    cache = _reshape_attention_kv_cache(
+        raw,
+        spec,
+        shape,
+        MetalAttentionBackend.get_kv_cache_stride_order(),
+        blocks,
+        (offset, stride),
+    )
+    if hybrid:
+        from vllm.v1.worker.gpu.attn_utils import _update_hybrid_attention_mamba_layout
+
+        group = SimpleNamespace(
+            kv_cache_spec=spec,
+            kv_cache_group_id=0,
+            backend=MetalAttentionBackend,
+            layer_names=["attention"],
+        )
+        _update_hybrid_attention_mamba_layout(
+            [group], {"attention": cache}, [16], "auto"
+        )
+    assert cache.shape == shape
+    for block in range(blocks):
+        cache[0, block].fill_(block + 1)
+        cache[1, block].fill_(block + 11)
+    physical = raw.view(blocks, stride)
+    assert torch.count_nonzero(physical[:, :offset]) == 0
+    assert torch.count_nonzero(physical[:, offset + page_bytes :]) == 0
+    for block in range(blocks):
+        page = physical[block, offset : offset + page_bytes].view(torch.float16)
+        assert torch.all(page[: page.numel() // 2] == block + 1)
+        assert torch.all(page[page.numel() // 2 :] == block + 11)
+
+
 def test_turboquant_kernel_uses_the_physical_cache_block() -> None:
     assert select_common_block_size(512, [TurboQuantAttentionBackend]) == 512
 

@@ -715,18 +715,36 @@ void muse_step_layer(
 }
 
 void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
-                        const at::Tensor& bt_local, const at::Tensor& sl_local,
-                        const at::Tensor& slot_local, const at::Tensor& bt_full,
-                        const at::Tensor& sl_full, const at::Tensor& slot_full,
+                        const std::vector<at::Tensor>& block_tables,
+                        const std::vector<at::Tensor>& seq_lens,
+                        const std::vector<at::Tensor>& slot_mappings,
                         const at::Tensor* aux_out,
                         const std::vector<int64_t>& aux_layers, int ctx_len,
                         bool rows_are_one_request) {
   using namespace muse_step;
   TORCH_CHECK(g.ready, "muse_step not initialized");
+  TORCH_CHECK(block_tables.size() == g.layers.size() &&
+                  seq_lens.size() == g.layers.size() &&
+                  slot_mappings.size() == g.layers.size(),
+              "muse_step requires cache metadata for every layer");
   const int m = static_cast<int>(x.size(0));
   TORCH_CHECK(m >= 1 && m <= g.max_rows, "row count out of range");
   TORCH_CHECK(x.is_contiguous() && x.scalar_type() == at::kBFloat16,
               "x must be contiguous bf16");
+  for (size_t li = 0; li < g.layers.size(); ++li) {
+    const auto& bt = block_tables[li];
+    const auto& sl = seq_lens[li];
+    const auto& slots = slot_mappings[li];
+    check_mps_strided(bt, "block_table");
+    check_mps(sl, "seq_lens");
+    check_mps(slots, "slot_mapping");
+    TORCH_CHECK(bt.scalar_type() == at::kInt && bt.dim() == 2 &&
+                    bt.size(0) >= m && bt.stride(1) == 1 &&
+                    sl.scalar_type() == at::kInt && sl.is_contiguous() &&
+                    sl.numel() >= m && slots.scalar_type() == at::kLong &&
+                    slots.is_contiguous() && slots.numel() >= m,
+                "muse_step invalid cache metadata for layer ", li);
+  }
   const int hidden = g.hidden;
   const int hd = g.head_dim;
   const int n4_hidden = m * hidden / 4;
@@ -747,9 +765,9 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
         e.dispatch((n4_hidden + 255) / 256, 1, 1, 256, 1, 1);
         aux_j++;
       }
-      const at::Tensor& bt = L.is_local ? bt_local : bt_full;
-      const at::Tensor& sl = L.is_local ? sl_local : sl_full;
-      const at::Tensor& slots = L.is_local ? slot_local : slot_full;
+      const at::Tensor& bt = block_tables[li];
+      const at::Tensor& sl = seq_lens[li];
+      const at::Tensor& slots = slot_mappings[li];
       const int window = L.is_local ? g.window : 0;
 
       // h = rms(x, norm1)
@@ -779,21 +797,10 @@ void muse_step_run_impl(const at::Tensor& x, const at::Tensor& positions,
         e.dispatch(m * g.kv_heads, 1, 1, 32, 1, 1);
       }
       // write K/V into the paged cache
-      {
-        const long half = L.kv_cache.numel() / 2;
-        e.pipeline("mittens::muse_kv_store");
-        e.out(L.kv_cache, 0);
-        e.in(g.k, 1);
-        e.in(g.v, 2);
-        e.in(slots, 3);
-        e.bytes(static_cast<int>(L.kv_cache.size(2)), 4);
-        e.bytes(g.kv_heads, 5);
-        e.bytes(hd, 6);
-        e.bytes(half, 7);
-        e.bytes(m, 8);
-        const int total4 = m * g.kv_heads * hd / 4;
-        e.dispatch((total4 + 255) / 256, 1, 1, 256, 1, 1);
-      }
+      tk::launch_kv_cache_scatter(
+          e, g.k, g.v, slots, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1),
+          m, g.kv_heads, hd, static_cast<int>(L.kv_cache.size(2)),
+          static_cast<uint64_t>(L.kv_cache.stride(1)), "bfloat16");
       // paged attention over the cache. Global layers at length use the
       // multi-query kernel: one shared K/V pass for the m rows (3.9x per
       // layer at 9.9k ctx) with the per-row causal boundary in-kernel.
@@ -1457,9 +1464,10 @@ void muse_q38_run(const at::Tensor& x, const at::Tensor& residual_out,
           e.bytes(m * width4, 4);
           emit_elem(e, m * width4);  // v_copy
         }
-        tk::launch_kv_cache_scatter(e, g.k, g.v, attn_slots[gi], L.kc, L.vc, m,
-                                    g.kv_heads, g.head_dim, g.block_size,
-                                    L.block_mult, "bfloat16");
+        tk::launch_kv_cache_scatter(
+            e, g.k, g.v, attn_slots[gi], L.kc, L.vc, m, g.kv_heads, g.head_dim,
+            g.block_size, static_cast<uint64_t>(L.kc.stride(0)) * L.block_mult,
+            "bfloat16");
         if (g.head_dim == 256) {
           tk::launch_paged_attention_partition(
               e, g.q, L.kc, L.vc, exp_bt_g[gi], exp_seq_g[gi], g.pa_tmp,
@@ -1670,21 +1678,10 @@ void dflash_step_run(const at::Tensor& x, const at::Tensor& positions,
       e.bytes(d.kv_heads, 3);
       e.bytes(d.theta, 4);
       e.dispatch(m * d.kv_heads, 1, 1, 32, 1, 1);
-      {
-        const long half = L.kv_cache.numel() / 2;
-        e.pipeline("mittens::muse_kv_store");
-        e.out(L.kv_cache, 0);
-        e.in(d.k, 1);
-        e.in(d.v, 2);
-        e.in(slots, 3);
-        e.bytes(static_cast<int>(L.kv_cache.size(2)), 4);
-        e.bytes(d.kv_heads, 5);
-        e.bytes(hd, 6);
-        e.bytes(half, 7);
-        e.bytes(m, 8);
-        const int total4 = m * d.kv_heads * hd / 4;
-        e.dispatch((total4 + 255) / 256, 1, 1, 256, 1, 1);
-      }
+      tk::launch_kv_cache_scatter(
+          e, d.k, d.v, slots, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1),
+          m, d.kv_heads, hd, static_cast<int>(L.kv_cache.size(2)),
+          static_cast<uint64_t>(L.kv_cache.stride(1)), "bfloat16");
       tk::launch_paged_attention(
           e, d.q, L.kv_cache.select(0, 0), L.kv_cache.select(0, 1), bt, sl,
           d.attn_out, m, d.heads, d.kv_heads, hd,
@@ -1754,25 +1751,25 @@ at::Tensor dflash_sample_greedy(const at::Tensor& hidden,
 }
 
 void muse_step_run(const at::Tensor& x, const at::Tensor& positions,
-                   const at::Tensor& bt_local, const at::Tensor& sl_local,
-                   const at::Tensor& slot_local, const at::Tensor& bt_full,
-                   const at::Tensor& sl_full, const at::Tensor& slot_full,
-                   int64_t ctx_len) {
-  muse_step_run_impl(x, positions, bt_local, sl_local, slot_local, bt_full,
-                     sl_full, slot_full, nullptr, {}, static_cast<int>(ctx_len),
-                     /*rows_are_one_request=*/false);
+                   const std::vector<at::Tensor>& block_tables,
+                   const std::vector<at::Tensor>& seq_lens,
+                   const std::vector<at::Tensor>& slot_mappings,
+                   int64_t ctx_len, bool rows_are_one_request) {
+  muse_step_run_impl(x, positions, block_tables, seq_lens, slot_mappings,
+                     nullptr, {}, static_cast<int>(ctx_len),
+                     rows_are_one_request);
 }
 
 // Verify-step variant: also snapshots the residual stream entering each
 // layer listed in aux_layers (ascending) into aux_out[j] for the DFlash
 // drafter. aux_out is (len(aux_layers), rows, hidden) bf16.
 void muse_step_run_aux(const at::Tensor& x, const at::Tensor& positions,
-                       const at::Tensor& bt_local, const at::Tensor& sl_local,
-                       const at::Tensor& slot_local, const at::Tensor& bt_full,
-                       const at::Tensor& sl_full, const at::Tensor& slot_full,
+                       const std::vector<at::Tensor>& block_tables,
+                       const std::vector<at::Tensor>& seq_lens,
+                       const std::vector<at::Tensor>& slot_mappings,
                        const at::Tensor& aux_out,
-                       const std::vector<int64_t>& aux_layers,
-                       int64_t ctx_len) {
+                       const std::vector<int64_t>& aux_layers, int64_t ctx_len,
+                       bool rows_are_one_request) {
   using namespace muse_step;
   check_mps(aux_out, "aux_out");
   TORCH_CHECK(aux_out.scalar_type() == at::kBFloat16 && aux_out.dim() == 3 &&
@@ -1784,10 +1781,9 @@ void muse_step_run_aux(const at::Tensor& x, const at::Tensor& positions,
                     aux_layers[j] < (int64_t)g.layers.size(),
                 "aux_layers must be ascending in-range layer indices");
   }
-  muse_step_run_impl(x, positions, bt_local, sl_local, slot_local, bt_full,
-                     sl_full, slot_full, &aux_out, aux_layers,
-                     static_cast<int>(ctx_len),
-                     /*rows_are_one_request=*/true);
+  muse_step_run_impl(x, positions, block_tables, seq_lens, slot_mappings,
+                     &aux_out, aux_layers, static_cast<int>(ctx_len),
+                     rows_are_one_request);
 }
 
 // Standalone rm-variant probe: row-major bf16 in/out, fresh partials per
@@ -2168,6 +2164,168 @@ void qc_swiglu(const at::Tensor& x, at::Tensor& y,
   });
 }
 
+void v2_flatten_sampled(const at::Tensor& output, const at::Tensor& sampled,
+                        const at::Tensor& counts, const at::Tensor& offsets) {
+  check_mps(output, "flat_sampled");
+  check_mps_strided(sampled, "sampled");
+  check_mps(counts, "num_sampled");
+  check_mps(offsets, "cu_num_logits");
+  TORCH_CHECK(output.scalar_type() == at::kLong && output.dim() == 1 &&
+                  sampled.scalar_type() == at::kLong && sampled.dim() == 2 &&
+                  sampled.stride(1) == 1 && counts.scalar_type() == at::kInt &&
+                  offsets.scalar_type() == at::kInt &&
+                  counts.numel() == sampled.size(0) &&
+                  offsets.numel() == sampled.size(0) + 1,
+              "invalid sampled-token flattening geometry");
+  const int requests = static_cast<int>(sampled.size(0));
+  if (requests == 0) return;
+  const uint64_t stride = static_cast<uint64_t>(sampled.stride(0));
+  encode([&](TorchEncoder& e) {
+    e.pipeline("v2_flatten_sampled");
+    e.out(output, 0);
+    e.in(sampled, 1);
+    e.in(counts, 2);
+    e.in(offsets, 3);
+    e.bytes(stride, 4);
+    e.dispatch(requests, 1, 1, 32, 1, 1);
+  });
+}
+
+void v2_logit_bias(const at::Tensor& logits, const at::Tensor& mapping,
+                   const at::Tensor& positions, const at::Tensor& allowed_count,
+                   const at::Tensor& allowed_ids, const at::Tensor& bias_count,
+                   const at::Tensor& bias_ids, const at::Tensor& biases,
+                   const at::Tensor& min_lens, const at::Tensor& stop_count,
+                   const at::Tensor& stop_ids) {
+  for (const auto& t : {logits, allowed_ids, bias_ids, biases, stop_ids}) {
+    check_mps_strided(t, "logit bias matrix");
+    TORCH_CHECK(t.dim() == 2 && t.stride(1) == 1,
+                "logit bias matrices must have dense rows");
+  }
+  for (const auto& t :
+       {mapping, allowed_count, bias_count, min_lens, stop_count}) {
+    check_mps(t, "logit bias indices");
+    TORCH_CHECK(t.scalar_type() == at::kInt,
+                "logit bias indices must be int32");
+  }
+  check_mps(positions, "positions");
+  TORCH_CHECK(positions.scalar_type() == at::kLong &&
+                  logits.scalar_type() == at::kFloat &&
+                  biases.scalar_type() == at::kFloat,
+              "logit bias requires int64 positions and float32 logits/biases");
+  for (const auto& t : {allowed_ids, bias_ids, stop_ids}) {
+    TORCH_CHECK(t.scalar_type() == at::kInt && t.size(1) <= 1024,
+                "logit bias token IDs must be int32 with at most 1024 columns");
+  }
+  const int rows = logits.size(0), vocab = logits.size(1);
+  TORCH_CHECK(mapping.numel() >= rows && positions.numel() >= rows,
+              "logit bias row metadata too short");
+  if (!rows) return;
+  const uint64_t strides[] = {static_cast<uint64_t>(logits.stride(0)),
+                              static_cast<uint64_t>(allowed_ids.stride(0)),
+                              static_cast<uint64_t>(bias_ids.stride(0)),
+                              static_cast<uint64_t>(biases.stride(0)),
+                              static_cast<uint64_t>(stop_ids.stride(0))};
+  encode("v2_logit_bias", [&](TorchEncoder& e) {
+    e.pipeline("v2_logit_bias");
+    e.out(logits, 0);
+    e.in(mapping, 1);
+    e.in(positions, 2);
+    e.in(allowed_count, 3);
+    e.in(allowed_ids, 4);
+    e.in(bias_count, 5);
+    e.in(bias_ids, 6);
+    e.in(biases, 7);
+    e.in(min_lens, 8);
+    e.in(stop_count, 9);
+    e.in(stop_ids, 10);
+    e.bytes(strides, 11);
+    e.bytes(vocab, 12);
+    e.dispatch(rows, 1, 1, 256, 1, 1);
+  });
+}
+
+void mamba_align(const std::vector<at::Tensor>& states,
+                 const std::vector<at::Tensor>& tables,
+                 const std::vector<int64_t>& groups,
+                 const std::vector<int64_t>& kinds, const at::Tensor& mapping,
+                 const at::Tensor& state_idx, const at::Tensor& computed,
+                 const at::Tensor& query_start, const at::Tensor& accepted,
+                 const at::Tensor& src, const at::Tensor& dst,
+                 const at::Tensor& bias, int64_t block_size, bool post) {
+  TORCH_CHECK(states.size() == groups.size() && states.size() == kinds.size(),
+              "mamba align metadata mismatch");
+  for (const auto& t :
+       {mapping, state_idx, computed, query_start, accepted, src, dst, bias}) {
+    check_mps(t, "mamba align index");
+    TORCH_CHECK(t.scalar_type() == at::kInt,
+                "mamba align indices must be int32");
+  }
+  int n = static_cast<int>(mapping.numel());
+  TORCH_CHECK(block_size > 0 && (post || query_start.numel() >= n + 1),
+              "mamba align invalid block/query shape");
+  if (!n) return;
+  encode("mamba_align", [&](TorchEncoder& e) {
+    e.pipeline("mamba_align_plan");
+    e.in(mapping, 0);
+    e.out(state_idx, 1);
+    e.in(computed, 2);
+    e.in(query_start, 3);
+    e.out(accepted, 4);
+    e.out(src, 5);
+    e.out(dst, 6);
+    e.out(bias, 7);
+    int bs = static_cast<int>(block_size), post_i = post;
+    e.bytes(bs, 8);
+    e.bytes(n, 9);
+    e.bytes(post_i, 10);
+    e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+    for (size_t i = 0; i < states.size(); ++i) {
+      const auto& state = states[i];
+      TORCH_CHECK(groups[i] >= 0 && groups[i] < tables.size(),
+                  "invalid state group");
+      const auto& table = tables[groups[i]];
+      check_mps_strided(state, "mamba state");
+      check_mps_strided(table, "mamba block table");
+      TORCH_CHECK(table.scalar_type() == at::kInt && table.stride(1) == 1,
+                  "mamba block table must have dense int32 rows");
+      int kind = static_cast<int>(kinds[i]);
+      TORCH_CHECK(kind >= 0 && kind <= 2 && state.dim() >= 2,
+                  "invalid mamba state kind/shape");
+      int element_size = state.element_size(), width = 0;
+      uint64_t row_stride = 0;
+      uint64_t copy_bytes = state[0].numel() * element_size;
+      if (kind) {
+        TORCH_CHECK(state.dim() == 3 && state.stride(2) == 1,
+                    "conv states must have dense last dimension");
+        width = static_cast<int>(state.size(kind == 1 ? 1 : 2));
+        copy_bytes = state.size(kind == 1 ? 2 : 1) * element_size;
+        row_stride = state.stride(1) * element_size;
+      } else {
+        TORCH_CHECK(state[0].is_contiguous(),
+                    "temporal state block must be dense");
+      }
+      uint64_t block_stride = state.stride(0) * element_size;
+      uint64_t table_stride = table.stride(0);
+      e.pipeline("mamba_align_copy");
+      e.out(state, 0);
+      e.in(table, 1);
+      e.in(mapping, 2);
+      e.in(src, 3);
+      e.in(dst, 4);
+      e.in(bias, 5);
+      e.bytes(block_stride, 6);
+      e.bytes(row_stride, 7);
+      e.bytes(copy_bytes, 8);
+      e.bytes(width, 9);
+      e.bytes(element_size, 10);
+      e.bytes(kind, 11);
+      e.bytes(table_stride, 12);
+      e.dispatch(static_cast<int>((copy_bytes + 4095) / 4096), n, 1, 256, 1, 1);
+    }
+  });
+}
+
 void qc_kv_cache_scatter(const at::Tensor& key, const at::Tensor& value,
                          const at::Tensor& slot_mapping,
                          const at::Tensor& key_cache,
@@ -2195,6 +2353,11 @@ void qc_kv_cache_scatter(const at::Tensor& key, const at::Tensor& value,
                   value_cache.scalar_type() == key.scalar_type() &&
                   value.scalar_type() == key.scalar_type(),
               "kv_cache_scatter dtype mismatch");
+  TORCH_CHECK(
+      key_cache.stride(0) == value_cache.stride(0) &&
+          key_cache.stride(1) == num_heads * head_size &&
+          value_cache.stride(1) == num_heads * head_size,
+      "kv_cache_scatter requires matching block strides and dense rows");
   if (T == 0) {
     return;
   }
@@ -2203,7 +2366,8 @@ void qc_kv_cache_scatter(const at::Tensor& key, const at::Tensor& value,
         e, key, value, slot_mapping, key_cache, value_cache,
         static_cast<int>(T), static_cast<int>(num_heads),
         static_cast<int>(head_size), static_cast<int>(block_size),
-        static_cast<int>(block_mult), activation_type_name(key));
+        static_cast<uint64_t>(key_cache.stride(0)) * block_mult,
+        activation_type_name(key));
   });
 }
 
@@ -5605,6 +5769,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("muse_step_layer", &muse_step_layer,
         "Register one decoder layer's weights for the fused decode step");
   m.def(
+      "muse_step_clear", []() { muse_step::g = muse_step::State{}; },
+      "Release registered Muse weights and scratch while MPS is active");
+  m.def(
       "dflash_step_debug",
       []() {
         using namespace dflash_step;
@@ -5633,19 +5800,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Fused verify step: muse_step_run plus residual-stream snapshots "
         "entering each aux layer (for the DFlash drafter)",
         pybind11::arg("x"), pybind11::arg("positions"),
-        pybind11::arg("bt_local"), pybind11::arg("sl_local"),
-        pybind11::arg("slot_local"), pybind11::arg("bt_full"),
-        pybind11::arg("sl_full"), pybind11::arg("slot_full"),
-        pybind11::arg("aux_out"), pybind11::arg("aux_layers"),
-        pybind11::arg("ctx_len") = 0);
+        pybind11::arg("block_tables"), pybind11::arg("seq_lens"),
+        pybind11::arg("slot_mappings"), pybind11::arg("aux_out"),
+        pybind11::arg("aux_layers"), pybind11::arg("ctx_len") = 0,
+        pybind11::arg("rows_are_one_request") = false);
   m.def("muse_step_run", &muse_step_run,
         "Encode the whole decoder stack for one decode step into a single "
         "command buffer; x is updated in place",
         pybind11::arg("x"), pybind11::arg("positions"),
-        pybind11::arg("bt_local"), pybind11::arg("sl_local"),
-        pybind11::arg("slot_local"), pybind11::arg("bt_full"),
-        pybind11::arg("sl_full"), pybind11::arg("slot_full"),
-        pybind11::arg("ctx_len") = 0);
+        pybind11::arg("block_tables"), pybind11::arg("seq_lens"),
+        pybind11::arg("slot_mappings"), pybind11::arg("ctx_len") = 0,
+        pybind11::arg("rows_are_one_request") = false);
 
   m.def("muse_q38_init", &muse_q38_init,
         "Register geometry and allocate scratch for the Qwen3.8 hybrid "
@@ -5758,6 +5923,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("oai_form") = false, pybind11::arg("alpha") = 1.0,
         pybind11::arg("beta") = 0.0);
 
+  m.def("mamba_align", &mamba_align,
+        "GPU-resident Mamba align state migration");
+  m.def("v2_logit_bias", &v2_logit_bias,
+        "Allowed IDs, bias, and minimum tokens");
+  m.def("v2_flatten_sampled", &v2_flatten_sampled,
+        "Gather accepted tokens into their ragged logits rows");
   m.def("qc_kv_cache_scatter", &qc_kv_cache_scatter,
         "Paged KV insert: one dispatch writes K and V rows by slot "
         "(block_mult=2 for the page-local dense layout; slot<0 rows "
