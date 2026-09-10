@@ -35,7 +35,29 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): static binary API failure closed; pre-load observer corrected
+### Latest checkpoint (2026-09-10): both source-exact geometry processes and audits PASS
+
+Prescribed A and B on4b0fa3701 each complete312 pairs and exit0. All26 source/
+config binaries verify before numerics in each process; every control reproduces
+the original whole-cubin image. Both arms meet FP64<=1 BF16 ULP in ALL624 pairs;
+eager repeat, changed-input replay, guards, read-only mutation and triple-output
+checks pass. All312 corresponding inputs/outputs/metrics/binaries match EXACTLY
+across the independent fresh-cache processes.183 receipts/5172 original files
+unchanged; GPUs free. Pair/audits terminal, source freeze released.
+
+Geometry vs control differs in14,820/5,286,248,448 paired elements per process;
+these are bounded kernel-level arithmetic differences, NOT full-model causality
+or a speed win. Real weights at the three prescribed sites, synthetic activations.
+Default/quant/native/attention/KDA settings and indexer gate unchanged.
+Raw `perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/`;
+pair-analysis SHA3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69.
+
+NEXT: implement/test a pre-load binary observer for already-loaded static CUDA
+objects, integrate it into the multi-source controller, then qualify actual AOT
+graph bindings before a model causal series. The source-only probe does NOT
+qualify that controller. No next GPU/model job prescribed; goal ongoing.
+
+### Previous checkpoint (2026-09-10): static binary API failure closed; pre-load observer corrected
 
 First geometry pair is TERMINAL: ONE A on28842e5c3 stops before numerical work.
 Torch's static CUDA adapter exposes cubin_raw, not asm, and clears the raw bytes

@@ -26752,3 +26752,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   `rmsnorm-geometry-preload-discovery.json`, SHA
   d98fffd11b5f0f60880a3754ea6641201435aa9779bcfeb1bdb4ff95bd0d3a5f;
   `rmsnorm-geometry-preload-cpu.xml`, all under perf/results/2026-09-10/.
+
+## 2026-09-10 - Broader RMSNorm geometry passes both independent source probes
+
+- Status: prescribed corrected pair COMPLETE, source/config numerical qualification
+  passed; no actual-model or multi-target graph-loader result yet.
+- Baseline: fixed thirteen original sources, control1/4096/16-warps vs geometry
+  1/1024/eight-warps, one stage, three real checkpoint norm vectors, synthetic
+  activations. Same source4b0fa3701/native libraries/recipe throughout both starts
+  and all audits,16GiB/swap0; no retries, edits, builds or concurrent GPU workload.
+- Results: A and B each complete312 pairs and exit0. All26 source/config binaries
+  verify before numerics in each; every control exactly matches the original cubin.
+  Both configurations have FP64 max1 BF16 ULP, all624 pairs pass. Eager repeat,
+  original/changed-input graphs, guards, read-only mutation and triple-output
+  agreement all pass. No throughput was measured.
+- Reproducibility: all312 corresponding input/output hashes, oracle metrics,
+  cross-config metrics and source/config/binary receipts match EXACTLY across the
+  independent fresh-cache processes.183 source/native/compiler receipts and5172
+  original files unchanged. Independent post-process GPU queries empty.
+- Cross-config difference:14,820/5,286,248,448 paired elements per process, all
+  within the source oracle gate. Does not establish the cause of the model score
+  change or clear the separate indexer gate; no default/TC/quant promotion.
+- Decision: retain qualification; implement pre-load binary observation for the
+  multi-target controller, then qualify actual AOT graph coverage before a model
+  causal series. Source freeze released; all current attempts/audits terminal.
+  No next GPU/model job prescribed.
+- Raw: `perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/`;
+  pair-analysis SHA3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69.

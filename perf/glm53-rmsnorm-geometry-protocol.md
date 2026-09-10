@@ -1,10 +1,9 @@
 # GLM53 broader RMSNorm geometry isolation
 
-Status: first kernel pair TERMINAL after A stops on a binary-observer API bug
-before numerical tests. Never launch its B. Corrected pre-load observer is CPU
-tested; ONLY the new pair at the end of this document is prescribed after commit.
-No model series or real-AOT loader job is prescribed. All older stopped series
-remain terminal; never reuse their unlaunched arms.
+Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pair
+matrices pass and match exactly across processes. All commands below are now
+historical; do not rerun them. The first pair remains terminal after its observer
+API failure. No model series, real-AOT loader job or other GPU job is prescribed.
 
 ## Question and fixed factors
 
@@ -208,3 +207,31 @@ systemd-run --user --scope --unit=glm53-geometry-preload-pair-audit -p MemoryMax
 Freeze through the entire NEW pair and audits; no edits/builds/commits/other GPU
 work, no replacement attempts, no new model job. Preserve stdout/stderr/statuses.
 Stop on failure; all original first-pair paths remain immutable historical evidence.
+
+## Completed pre-load pair result
+
+Both prescribed processes exit0,312/312 pairs each; all26 source/config bindings
+verified before numerical work in each. Original control whole-cubin bytes match.
+Both geometries have maximum one BF16 ULP vs FP64; all eager/replay/guard/mutation/
+triple-output checks pass. Final audit requires and observes exact equality of all
+312 corresponding inputs, outputs, metrics and binaries across processes.
+183 source/native/compiler receipts and5172 original files remain unchanged.
+Independent GPU queries are empty after each process. Source freeze is released.
+
+Per-process geometry/control comparison:14,820 differing elements among
+5,286,248,448 paired elements. This is synthetic-input qualification on the three
+real norm weight vectors, not actual model activations, score causality or TPS.
+It does not clear the separate indexer LayerNorm gate or qualify the controller.
+
+Final `rmsnorm-geometry-preload-qualification/pair-analysis.json` SHA
+`3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69`.
+A/B analysis SHAs respectively
+`9a7ea3bf24f4b811861ed373c7c10ba51a318871609ea6deecf026af3d926f6b` and
+`9bc9117e8b3417864e80e05f560b25ac2232e5fde957dd2cf16d9a11b7d67592`.
+Raw root: `perf/results/2026-09-10/`; all prior attempts and logs retained.
+
+Next CPU work: observe the actual static CUDA driver-load input before bytes are
+consumed, retain object/handle provenance, and tie each graph-held launch callable
+to its observed kernel. Then qualify the multi-target hook against the real AOT
+loader. No additional GPU process is prescribed until that implementation and its
+bounded qualification protocol are ready.
