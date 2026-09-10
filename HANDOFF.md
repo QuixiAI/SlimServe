@@ -35,20 +35,33 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): state/output isolation ready
+### Latest checkpoint (2026-09-10): state/output isolation complete and bit-exact
 
-Shared state/output probes are ready. Final CPU suite: 53 passed in 7.06 s,
-including real imports/preparation, independent exact algebraic references,
-mixed BF16/FP32 checking, graph orchestration rehearsal and terminal-failure
-closure. Earlier 17/40-pass reports are retained. No serving/native change.
+On `4832f4ce7`, the prescribed state process/audit then output process/audit all
+exit 0. Each completes 224 pairs (56 exact, 168 conditioned). State stages2/3
+are bit-exact over 2,650,800,128 BF16 snapshots, 1,285,685,248 BF16 new values and
+167,772,160 FP32 final-state values. Output warps8/4 is bit-exact over another
+1,285,685,248 BF16 values. All exact-oracle/eager/replay/mutation/guard checks pass.
+State verifies 83 receipts/two cubins; output verifies 312/two, including its
+complete state predecessor. GPUs released; hardware unchanged; source freeze
+ended. No retries, exclusions, autotuning, model starts or native builds.
 
-NEXT after commit: exactly one state preparation/GPU0 run/audit, then one output
-preparation/GPU0 run/audit only after complete state closure. Each has 224 pairs
-(56 exact, 168 conditioned); commands, limits and failure policy are at the tail
-of `perf/glm53-kda-choice-protocol.md`. Freeze sources through both closures.
-GPU 16 GiB, CPU 8 GiB, swap0; no model starts, builds, tuning or retries.
-No next manifests/caches/GPU jobs created yet. All old failed gates stay failed;
-conditioned errors are observations, not accuracy or production qualification.
+Conditioned float64-reference errors remain observations, NOT qualification.
+State max absolute snapshot/new/final: 0.03125/0.03125/0.005167722702026367;
+output: 0.12482273578643799. No accuracy threshold was introduced or widened.
+No TPS, production/default/quant promotion. CPU 53 passed in 7.06 s.
+
+Raw `perf/results/2026-09-10/kda-{state,output}-v1/analysis.json` SHA respectively:
+f28c002eacc2dbe1ab664f8c1fbded2c4745bc4604a1f4c4e805acfe644bc49c;
+2b5c863eb453d252b05461e6d4ed02e8f171714b4c1713b49efd4e97daab943b.
+Consume completed receipts after later edits, not historical frozen validators.
+
+NEXT: KDA's tested choices show no numerical difference; this is not a proof for
+all activations or unrecorded historical launches. Focus the next causal design
+on remaining attention combo/split normalization differences (KV512/LayerNorm128)
+and actual workload boundaries. Q1536 was exact in the earlier probe. Keep the
+separate LayerNorm oracle failure explicit; neither RMSNorm geometry nor KDA tests
+clear it. No next GPU/model job prescribed. All old failed series remain terminal.
 
 ### Previous checkpoint (2026-09-10): recompute isolation complete and bit-exact
 

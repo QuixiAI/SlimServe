@@ -1936,7 +1936,11 @@ not resolve the failed no-combo model scores. Details: glm53-kda-choice-protocol
 Recompute isolation on3bd347098 likewise completes196 paired cases with bit-exact
 W/U/KG across four/eight-warps and passing exact identity/replay/guard checks.
 Conditioned FP64-reference errors are observations, not accuracy qualification.
-No new model TPS or default promotion; state/output choices remain to investigate.
+State/output isolation on `4832f4ce7` then completes 224 pairs per stage, including
+the mixed BF16/FP32 state outputs: all compared values are bit-exact, exact
+algebraic/replay/guard checks pass. Conditioned errors remain observations. No
+new model TPS/default promotion; remaining attention/normalization causality and
+the separate failed indexer LayerNorm oracle gate are still open.
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 

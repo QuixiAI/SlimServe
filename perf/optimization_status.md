@@ -27297,3 +27297,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   starts. No performance claim or changes to indexer/no-combo quality floors.
 - Raw: `perf/results/2026-09-10/runtime-control/kda-tail-{fixture,runner,final}-cpu.xml`.
   Exact commands/matrix are in `perf/glm53-kda-choice-protocol.md`; GPU pending.
+
+## 2026-09-10 - State and output KDA choices are bit-exact on fixed matrices
+
+- Status: completed local diagnostic; no performance/default change.
+- Baseline/workload: `4832f4ce7`, actual serving state stages2/3 at warps4/BV32,
+  then output warps8/4 at stages2/BK64/BV64. Exactly one process per stage,
+  224 pairs each (56 exact, 168 conditioned), both original/changed inputs.
+  GPU0/SM120, driver 580.173.02/CUDA13, 600W unchanged; GPU16GiB/CPU8GiB/swap0.
+- Results: zero bit differences across 2,650,800,128 BF16 state snapshots,
+  1,285,685,248 BF16 new values, 167,772,160 FP32 final-state values and
+  1,285,685,248 BF16 outputs. Exact algebraic, finite, eager/replay/mutation/guard
+  checks all pass. No full-model causality or universal equivalence claim.
+- Reference observations: conditioned max absolute snapshot/new/final errors
+  0.03125/0.03125/0.005167722702026367; output 0.12482273578643799. Rounded-reference
+  BF16 ULP maxima 30192/30000/116 for snapshot/new/output. These are predeclared
+  observations, not accuracy qualification; FP32 final state was not narrowed.
+- Closure: all four run/audit exits0; state verifies 83 receipts/two binaries,
+  output 312/two including all predecessor records. GPUs released, hardware
+  unchanged; source freeze ended. No retry, omitted case, tuning, model or build.
+- Decision: KDA choices tested so far do not explain the failed fresh-model
+  scores on these inputs. Focus next causal design on attention combo/split
+  normalization and actual workload boundaries; keep the indexer LayerNorm gate
+  failed. No next GPU/model job prescribed; no TPS or quant/default promotion.
+- Raw: `perf/results/2026-09-10/kda-{state,output}-v1/`, 224 records each plus
+  summaries, binaries/private caches and audits. Analysis SHA state
+  f28c002eacc2dbe1ab664f8c1fbded2c4745bc4604a1f4c4e805acfe644bc49c;
+  output 2b5c863eb453d252b05461e6d4ed02e8f171714b4c1713b49efd4e97daab943b.
+  Full protocol/results and evidence limits: `perf/glm53-kda-choice-protocol.md`.

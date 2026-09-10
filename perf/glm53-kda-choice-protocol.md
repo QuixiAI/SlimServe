@@ -235,7 +235,7 @@ gating and USE_EXP2=True. Source is `third_party/flash_linear_attention/ops/chun
 Use exact algebraic cases plus recorded numerical comparisons; no new model gate.
 No next GPU/model job was prescribed at that checkpoint.
 
-## State/output v1: fixed sequential arithmetic isolation
+## State/output v1: completed sequential isolation (commands historical)
 
 After committing this protocol and passing CPU tests, prepare/run/audit state
 ONCE, then prepare/run/audit output ONCE only if the state audit is complete.
@@ -297,3 +297,50 @@ systemd-run --user --scope --unit=glm53-kda-output-v1-audit -p MemoryMax=8G -p M
 Numerical differences would locate sensitivity in an isolated operation, not its
 contribution to failed serving scores. Equality narrows this fixed matrix only.
 Use these results to select the next investigation; no model start is prescribed.
+
+## Completed state/output v1 result
+
+On `4832f4ce7`, exactly one state process/audit then one output process/audit all
+exit 0, with 224/224 paired cases each. No retries, omitted cases, autotuning,
+model starts or native builds. All exact algebraic, finite-output, eager-repeat,
+original/changed-input graph replay, mutation and guard checks pass. State checks
+83 frozen source/evidence receipts and two actual cubins; output checks 312 and
+two, including the complete state predecessor. GPU release and unchanged
+device/driver/power identity verify. The source freeze has ended.
+
+| Compared output | Type | Elements, both phases | Cross-config bit differences |
+| --- | --- | ---: | ---: |
+| State chunk snapshots | BF16 | 2,650,800,128 | 0 |
+| State new values | BF16 | 1,285,685,248 | 0 |
+| Final recurrent state | FP32 | 167,772,160 | 0 |
+| Output | BF16 | 1,285,685,248 | 0 |
+
+Conditioned-reference observations, not accuracy qualification: max absolute
+snapshot/new-value/final-state errors are 0.03125 / 0.03125 /
+0.005167722702026367; output 0.12482273578643799. Max BF16 ULP distances from the
+rounded reference are 30192 / 30000 for snapshot/new values and 116 for output.
+Final state uses FP32 comparison, not a BF16 ULP metric. These aggregate maxima
+do not establish an element-level cause. Exact algebraic fixtures do qualify;
+the conditioned random fixtures do not inherit an unprescribed accuracy gate.
+
+Decision: neither state staging nor output warp choice changes these fixed
+inputs. Combined with gate/recompute equality and the intra-stage identical
+binaries, the examined KDA settings have not shown a numerical explanation for
+the failed fresh-model scores. This is NOT proof across every activation or of
+unrecorded historical live configurations. No speed measurement, serving/default
+change or production promotion. All indexer/no-combo/model quality gates remain.
+Next causal work should focus on remaining attention combo/split normalization
+and actual workload boundaries. Do not automatically launch another model run.
+
+Raw directories under `perf/results/2026-09-10/`: `kda-state-v1/` and
+`kda-output-v1/`, each retaining 224 records, binaries/private cache, attempt,
+summary and analysis. Analysis SHA respectively:
+
+- State: `f28c002eacc2dbe1ab664f8c1fbded2c4745bc4604a1f4c4e805acfe644bc49c`.
+- Output: `2b5c863eb453d252b05461e6d4ed02e8f171714b4c1713b49efd4e97daab943b`.
+
+Summary SHA: state `7b9b5bd3da57e18d75ebd6bdd870201c8cdbe889effdced0317c3ac7c5446fef`,
+output `7fe0e90ec181333f399f9fea1bf1801eeda9d4859c96a9ffd6bec923c058d1b7`.
+CPU final 53 passed in 7.06 s; earlier 17/40-pass reports also retained under
+runtime-control. After documentation/source edits, consume these completed
+receipts rather than re-running the historical source-frozen validators.
