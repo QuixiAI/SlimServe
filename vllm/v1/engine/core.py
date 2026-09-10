@@ -2119,7 +2119,10 @@ class DPEngineCoreProc(EngineCoreProc):
                     continue
 
                 # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping.
+                # engine is sleeping. Replicated-MoE DP has no cross-replica
+                # collective to keep in step, so an idle replica just yields.
+                elif self.vllm_config.parallel_config.data_parallel_replicate_moe:
+                    time.sleep(0.0005)
                 elif not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()

@@ -25072,3 +25072,25 @@ restart is the operator's call.
   replica). 9 unit tests incl. the balancer request path. NOT yet live:
   the DP2 validation runs measure it (multi-turn recall on the leg is the
   check: hit rate must not halve under DP2).
+- DP OVERHEAD ROOT CAUSE (code + boot evidence): with expert parallel off,
+  vLLM's FusedMoEParallelConfig.make flattens the MoE tensor-parallel
+  group across DP (tp_size = dp x tp, rank = dp_rank x tp + tp_rank), so
+  "TP4 x DP2" holds only 1/8 of every expert per rank and every MoE layer
+  all-gathers tokens across both replicas (naive dispatch/combine on the
+  EP group), which is also why idle replicas must dummy-step in lockstep
+  and why the runner syncs token counts across DP every step. Boot logs
+  prove it: model weights 24.96 GiB/rank under TP4 x DP2 vs 44.89 GiB at
+  plain TP4 (perf/results/2026-09-02/glm53-8gpu-matrix/{tp4dp2,tp4}).
+  So the 09-03 "DP2" arm was TP4 attention over TP8 MoE in lockstep, not
+  two independent engines; its 10% c1 loss vs standalone TP4 is that
+  coupling. New `--data-parallel-replicate-moe` (ParallelConfig
+  data_parallel_replicate_moe): each replica keeps the full expert set
+  sharded over its own TP group (moe dp_size 1: no naive dispatch), the
+  forward context builds no DPMetadata, the V2 runner dispatches the
+  batch descriptor locally instead of the cross-DP all-reduce, and an
+  idle replica yields instead of dummy-stepping. Rejected with EP. Costs
+  dp x expert memory (fits: 45 GiB/rank on 80 GB). 4 unit tests
+  (tests/model_executor/test_moe_parallel_config_replicate.py). The
+  matrix now runs mx-tp4dp2 (replicated) beside mx-tp4dp2-flat (default
+  flattening) and mx-tp4 (standalone) - the replicated arm's c1 should
+  match standalone TP4 and its c8+ should beat the flattened arm.
