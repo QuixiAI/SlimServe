@@ -188,6 +188,7 @@ class KVIntervention:
                     mode=self.mode,
                     source=target["relative"],
                     resolved_by=resolved_by,
+                    binding_index=list(self.owners).index(id(tuner)) + 1,
                 )
             )
             return tuner
@@ -225,6 +226,16 @@ class KVIntervention:
                 )
                 self.replace(tuner, compile_replacement, "graph")
                 self.graph_bindings[key] = module, tuner
+                self.emit(
+                    dict(
+                        event="kv_graph_binding",
+                        rank=self.rank,
+                        graph=getattr(module, "__file__", None),
+                        symbol=symbol,
+                        source=self.owners[id(tuner)]["target"]["relative"],
+                        binding_index=list(self.owners).index(id(tuner)) + 1,
+                    )
+                )
 
     def verify_graphs(self, modules):
         from benchmarks.kernels.audit_glm53_kv_graphs import inventory
@@ -251,6 +262,15 @@ class KVIntervention:
     def seal(self, modules):
         with self.lock:
             report = self.verify_graphs(modules)
+            if not self.sealed:
+                self.emit(
+                    dict(
+                        event="kv_sealed",
+                        rank=self.rank,
+                        targets=len(self.owners),
+                        graph_bindings=len(self.graph_bindings),
+                    )
+                )
             self.sealed = True
             return report
 
@@ -273,6 +293,15 @@ class KVLoader(ScopedKernelLoader):
         )
         self.controller = KVIntervention(rank, manifest, mode, self.observer, emit=emit)
         self.installed, self.templates = False, {}
+        self.controller.emit(
+            dict(
+                event="kv_begin",
+                rank=rank,
+                mode=mode,
+                manifest_sha256=sha(self.manifest_path),
+                source_sha256=sha(__file__),
+            )
+        )
 
     def compile_replacement(self, record):
         self.check_cache()

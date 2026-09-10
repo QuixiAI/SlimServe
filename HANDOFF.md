@@ -35,7 +35,27 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): KV graph-loader implementation CPU-tested
+### Latest checkpoint (2026-09-10): actual-AOT KV qualification v1 ready
+
+Dedicated preparer/runner/offline auditor implemented, reusing shared AOT
+lifecycle and graph/driver/root checks. Actual-cache CPU inspection verifies
+all 5,172 original files, one target/two graph uses per rank, seven actual roots
+and 46 entries per rank. Final CPU: 471 passed in 42.52 s, including real concurrent
+store loading without forwards/launches and one-attempt failure handling.
+Raw `runtime-control/kv-aot-source-inspection.json` and
+`kv-aot-{hooks,audit,runner,final}-cpu.xml`, under 2026-09-10.
+
+NEXT: after commit, execute the exact v1 preparation/controller/compare commands
+at the end of `perf/glm53-attention-isolation.md`. Fixed order: control ranks 0..3,
+then KV ranks 0..3, eight processes total; CPU 8 GiB/GPU 16 GiB, swap0. Preparation
+requires a clean committed worktree and starts the source freeze. No retries,
+model weights/forward/capture, speed claim or native build. Stop on first failure,
+retain/audit it and confirm integrity/release before ending the freeze. Candidate
+must preserve all non-target bindings; the 25 original launchers/two targets
+per rank plus appended KV receipts are audited. Source-level adapter remains
+the only GPU-qualified KV stage so far. Production/quant/indexer gates unchanged.
+
+### Previous checkpoint (2026-09-10): KV graph-loader implementation CPU-tested
 
 `benchmarks/kernels/glm53_kv_loader.py` now binds the actual autotuner instance
 `run` directly: original precompiled combo for control; original combo followed

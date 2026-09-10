@@ -56,7 +56,9 @@ def check_root_records(
             f"module inventory has invalid path/index: {path}",
         )
         relative = str(path.relative_to(private))
-        original = manifest["original_files"].get(relative)
+        original = manifest["original_files"].get(
+            relative, manifest.get("private_sources", {}).get(relative)
+        )
         require(
             row.get("source_sha256") == sha(path)
             and (
@@ -145,6 +147,19 @@ def check_root_records(
 def check_records(
     manifest, manifest_sha, summary, graphs, binary_events, target_events
 ):
+    check_aot_summary(manifest, manifest_sha, summary)
+    result = check_graph_records(
+        manifest, manifest_sha, graphs, binary_events, target_events
+    )
+    require(
+        result["observed_binary_objects"] == summary["observed_binary_objects"],
+        "reported binary object count differs",
+    )
+    return result
+
+
+def check_aot_summary(manifest, manifest_sha, summary):
+    """Common no-weights/no-forward, complete-artifact and no-fallback gate."""
     rank, mode = manifest["rank"], manifest["mode"]
     require(
         summary["status"] == "complete"
@@ -162,31 +177,11 @@ def check_records(
         and all(b["expected"] == b["loaded"] > 0 for b in summary["static_bundles"]),
         "incomplete static bundle coverage",
     )
-    result = check_graph_records(
-        manifest, manifest_sha, graphs, binary_events, target_events
-    )
-    require(
-        result["observed_binary_objects"] == summary["observed_binary_objects"],
-        "reported binary object count differs",
-    )
-    return result
 
 
-def check_graph_records(
-    manifest,
-    manifest_sha,
-    graphs,
-    binary_events,
-    target_events,
-    *,
-    require_global_seal=True,
-):
-    """Shared source/config/binary/controller audit; no model-workload assertions.
-
-    Serving keeps the observer open for legitimate later non-target compilation.
-    The no-weights qualifier still requires its exact terminal global seal.
-    """
-    rank, mode = manifest["rank"], manifest["mode"]
+def binary_records(manifest, binary_events, *, require_global_seal=True):
+    """Verify actual driver-load receipts independently of a target intervention."""
+    rank = manifest["rank"]
     loaded = [r for r in binary_events if r["event"] == "binary_loaded"]
     sealed = [r for r in binary_events if r["event"] == "binary_observer_sealed"]
     require(
@@ -205,7 +200,6 @@ def check_graph_records(
     )
     images = {r["index"]: r for r in loaded}
     private = Path(manifest["private_namespace"])
-    original = Path(manifest["original_namespace"])
     seen_images, is_sealed = set(), False
     for event in binary_events:
         require(event["rank"] == rank, "binary event rank changed")
@@ -237,6 +231,14 @@ def check_graph_records(
             and all(type(h) is int and h != 0 for h in event["handles"]),
             "binary load receipt changed",
         )
+    return images
+
+
+def graph_records(manifest, graphs, images, check_target):
+    """Join graph/root/source/observed-image evidence with a target-specific check."""
+    rank = manifest["rank"]
+    private = Path(manifest["private_namespace"])
+    original = Path(manifest["original_namespace"])
     targets = {t["relative"]: t for t in manifest["targets"][str(rank)]}
     expected = {
         (str(Path(u["graph"]).relative_to(original)), u["symbol"], t["relative"])
@@ -284,12 +286,10 @@ def check_graph_records(
         if target is not None:
             key = (row["graph"], row["symbol"], row["source"])
             require(
-                key in expected
-                and referenced
-                and row["selected"] == expected_receipt(target["configs"][mode])
-                and row["cubin_sha256"] == target["configs"][mode]["cubin_sha256"],
+                key in expected and referenced,
                 "wrong target selection or coverage",
             )
+            check_target(row, target, image)
             actual.add(key)
     require(
         seen_graphs == set(expected_graphs)
@@ -298,6 +298,39 @@ def check_graph_records(
         and graphs["target_bindings"] == len(expected),
         "incomplete actual graph coverage",
     )
+    return dict(
+        graphs=len(seen_graphs),
+        target_bindings=len(actual),
+        bound_launchers=len(graphs["bindings"]),
+        observed_binary_objects=len(images),
+    )
+
+
+def check_graph_records(
+    manifest,
+    manifest_sha,
+    graphs,
+    binary_events,
+    target_events,
+    *,
+    require_global_seal=True,
+):
+    """Shared graph/image checks plus the original geometry controller receipts."""
+    rank, mode = manifest["rank"], manifest["mode"]
+    private = Path(manifest["private_namespace"])
+    targets = {t["relative"]: t for t in manifest["targets"][str(rank)]}
+    images = binary_records(
+        manifest, binary_events, require_global_seal=require_global_seal
+    )
+
+    def check_target(row, target, image):
+        require(
+            row["selected"] == expected_receipt(target["configs"][mode])
+            and row["cubin_sha256"] == target["configs"][mode]["cubin_sha256"],
+            "wrong target selection or coverage",
+        )
+
+    result = graph_records(manifest, graphs, images, check_target)
     require(len(target_events) == len(targets), "missing target receipt streams")
     for target, events in zip(targets.values(), target_events):
         begin = [r for r in events if r["event"] == "begin"]
@@ -380,12 +413,7 @@ def check_graph_records(
             ),
             "controller coverage count differs from actual globals",
         )
-    return dict(
-        graphs=len(seen_graphs),
-        target_bindings=len(actual),
-        bound_launchers=len(graphs["bindings"]),
-        observed_binary_objects=len(images),
-    )
+    return result
 
 
 def audit(path):

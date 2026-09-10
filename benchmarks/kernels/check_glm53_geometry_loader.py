@@ -14,7 +14,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from benchmarks.kernels.audit_glm53_geometry_graphs import inventory
+from benchmarks.kernels.audit_glm53_geometry_graphs import inventory  # noqa: F401
 from benchmarks.kernels.check_glm53_attention_norms import require, verify
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from benchmarks.kernels.glm53_artifact_roots import (
@@ -30,6 +30,10 @@ from slimserve import rmsnorm_diagnostic
 from slimserve.rmsnorm_diagnostic import NAMESPACE, sha
 
 ORDER = tuple((mode, rank) for mode in ("control", "geometry") for rank in range(4))
+MODULE = "benchmarks.kernels.check_glm53_geometry_loader"
+AUDITOR_MODULE = "benchmarks.kernels.audit_glm53_geometry_loader"
+UNIT_PREFIX = "glm53-geometry-aot-v6"
+LOADER = GeometryLoader
 
 
 def read_json(path):
@@ -81,8 +85,8 @@ def read_manifest(path):
     return manifest, preparation
 
 
-def prior_receipts(path, manifest, preparation):
-    index = ORDER.index((manifest["mode"], manifest["rank"]))
+def prior_receipts(path, manifest, preparation, *, order=ORDER):
+    index = order.index((manifest["mode"], manifest["rank"]))
     receipts = []
     for row in preparation["runs"][:index]:
         folder = Path(row["manifest"]).parent
@@ -120,6 +124,11 @@ def check_launch(folder, manifest_sha):
         require(
             sha(folder / f"{kind}.log") == record[kind]["log_sha256"],
             "preserved process log changed",
+        )
+    if "gpu_config_before" in record:
+        require(
+            record["gpu_config_before"] == record["gpu_config_after"],
+            "GPU identity changed",
         )
 
 
@@ -175,12 +184,14 @@ def checked_bundles(bundle_class, counts):
         bundle_class.load_autotuners = original
 
 
-def run(path):
+def run(path, *, workflow=None):
+    """Shared no-weights lifecycle; workflow supplies manifest and target policy."""
+    api = sys.modules[__name__] if workflow is None else workflow
     path = path.resolve()
-    manifest, preparation = read_manifest(path)
+    manifest, preparation = api.read_manifest(path)
     output = path.parent / "run"
     require(not output.exists(), "preserve prior attempt; no replacement starts")
-    priors = prior_receipts(path, manifest, preparation)
+    priors = api.prior_receipts(path, manifest, preparation)
     require(
         not subprocess.check_output(
             ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
@@ -193,6 +204,13 @@ def run(path):
         all(sha(private / p) == h for p, h in manifest["original_files"].items()),
         "private cache not identical before first load",
     )
+    require(
+        all(
+            sha(private / p) == h
+            for p, h in manifest.get("private_sources", {}).items()
+        ),
+        "private diagnostic sources changed",
+    )
     environment(manifest)
     output.mkdir()
     summary = dict(
@@ -200,7 +218,8 @@ def run(path):
         rank=manifest["rank"],
         mode=manifest["mode"],
         manifest_sha256=sha(path),
-        source_sha256=sha(__file__),
+        source_sha256=sha(api.__file__),
+        lifecycle_sha256=sha(__file__),
         prior_receipts=priors,
         model_forward_calls=0,
         weight_tensors_loaded=0,
@@ -231,13 +250,17 @@ def run(path):
         with (
             (output / "binary-loads.jsonl").open("x") as stream,
             (output / "artifact-roots.jsonl").open("x") as root_stream,
+            (output / "loader-events.jsonl").open("x") as loader_stream,
         ):
 
             def emit(record):
-                stream.write(json.dumps(record, sort_keys=True) + "\n")
-                stream.flush()
+                destination = (
+                    stream if record["event"].startswith("binary_") else loader_stream
+                )
+                destination.write(json.dumps(record, sort_keys=True) + "\n")
+                destination.flush()
 
-            loader = GeometryLoader(rank, manifest, path, manifest["mode"], emit=emit)
+            loader = api.LOADER(rank, manifest, path, manifest["mode"], emit=emit)
 
             def emit_root(record):
                 root_stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -275,7 +298,7 @@ def run(path):
                 )
                 require(summary["loaded_artifacts"] == 7, "incomplete artifact load")
                 root_modules = roots.roots(store, PyCodeCache.modules)
-                before = inventory(
+                before = api.inventory(
                     root_modules,
                     manifest,
                     rank,
@@ -283,13 +306,13 @@ def run(path):
                     loader.observer,
                 )
                 write_new(output / "graph-bindings.json", before)
-                loader.controller.seal(PyCodeCache.modules)
+                loader.controller.seal(root_modules)
                 # Global sealing is safe HERE: this no-weights gate performs no
                 # subsequent capture/forward/non-target compilation.
                 loader.observer.seal()
-                loader.controller.verify_graphs(PyCodeCache.modules)
+                loader.controller.verify_graphs(root_modules)
                 require(
-                    inventory(
+                    api.inventory(
                         roots.roots(store, PyCodeCache.modules),
                         manifest,
                         rank,
@@ -309,7 +332,7 @@ def run(path):
             write_new(
                 output / "module-inventory.json", module_inventory(code_cache.modules)
             )
-        if loader is not None:
+        if loader is not None and hasattr(loader, "close"):
             loader.close()
         try:
             verify(manifest)
@@ -325,11 +348,12 @@ def run(path):
     require(summary["status"] == "complete", "AOT loader qualification failed")
 
 
-def launch(path):
+def launch(path, *, workflow=None):
     """One bounded attempt plus offline audit; preserve native stdout and status."""
+    api = sys.modules[__name__] if workflow is None else workflow
     path = path.resolve()
-    manifest, preparation = read_manifest(path)
-    prior_receipts(path, manifest, preparation)
+    manifest, preparation = api.read_manifest(path)
+    api.prior_receipts(path, manifest, preparation)
     folder = path.parent
     marker = folder / "launch.json"
     require(not marker.exists(), "this prescribed process was already attempted")
@@ -340,6 +364,14 @@ def launch(path):
         rank=manifest["rank"],
         manifest_sha256=sha(path),
     )
+    if "expected_gpu_config" in manifest:
+        from benchmarks.kernels.check_glm53_kda_gate import gpu_config
+
+        record["gpu_config_before"] = gpu_config()
+        require(
+            record["gpu_config_before"] == manifest["expected_gpu_config"],
+            "GPU/driver/power identity changed",
+        )
     write_new(marker, record)
 
     def execute(kind, memory, module, arguments):
@@ -347,7 +379,7 @@ def launch(path):
             "systemd-run",
             "--user",
             "--scope",
-            f"--unit=glm53-geometry-aot-v6-{label}-{kind}",
+            f"--unit={api.UNIT_PREFIX}-{label}-{kind}",
             "-p",
             f"MemoryMax={memory}G",
             "-p",
@@ -381,7 +413,7 @@ def launch(path):
         run_code = execute(
             "load",
             16,
-            "benchmarks.kernels.check_glm53_geometry_loader",
+            api.MODULE,
             ["run", "--manifest", str(path)],
         )
         record["gpu_processes_after"] = subprocess.check_output(
@@ -395,9 +427,15 @@ def launch(path):
         audit_code = execute(
             "audit",
             8,
-            "benchmarks.kernels.audit_glm53_geometry_loader",
+            api.AUDITOR_MODULE,
             ["audit", str(path)],
         )
+        if "expected_gpu_config" in manifest:
+            record["gpu_config_after"] = gpu_config()
+            require(
+                record["gpu_config_before"] == record["gpu_config_after"],
+                "GPU/driver/power changed during load",
+            )
         require(
             run_code == audit_code == 0 and not record["gpu_processes_after"].strip(),
             "load/audit/release gate failed; stop this series",

@@ -27428,3 +27428,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/runtime-control/loader-hooks-cpu.xml` and
   `kv-loader-{cpu,dispatch-cpu,regression-cpu,freeze-cpu,final-cpu}.xml`.
   Exact final command and next-stage constraints: `perf/glm53-attention-isolation.md`.
+
+## 2026-09-10 - Prescribe real-AOT KV-only binding qualification
+
+- Status: implementation/CPU gates complete; eight fixed GPU loads prescribed.
+- Baseline/hypothesis: original combo versus qualified KV-only adapter in the
+  actual cached model graphs, without changing non-target selections. This is
+  a no-weights loader-coverage gate, not a performance experiment.
+- Change: dedicated pinned-evidence KV preparation and offline target audit,
+  sharing the geometry campaign's concurrent AOT lifecycle, actual-root and
+  driver-image checks. Explicit controller/source/graph/binary joins; private
+  copies, no fallback, one attempt per rank/mode, audit on failure, hardware/
+  release checks. Static Torch loader dependencies are included in the freeze.
+- Evidence: actual-cache CPU inspection verifies 5,172 original files, one
+  combo/two target graphs and seven roots/46 entries per rank. It does not load
+  GPUs or begin the source freeze. SHA
+  5e3d5fe19d386a5ff3fc4c4077f2a603f1412f6cef9e45d9552d69feefd5b35d.
+- Correctness: 471 CPU passed in 42.52 s, 14 upstream warnings. Real concurrent
+  store loading with fake CUDA, no forwards/launches; its deliberately missing
+  bundles are independently rejected. Copy/manifest/resource/terminal-failure
+  and receipt-tampering checks pass. All earlier CPU reports retained.
+- Decision: commit, then control ranks 0..3/KV ranks 0..3 once each, 16 GiB/swap0;
+  CPU 8 GiB. Stop/audit first failure, no replacement starts. Freeze from clean
+  preparation through final comparison/integrity/release. No model run, native
+  build, new TPS baseline or production/quant/quality-gate promotion follows.
+- Raw: `perf/results/2026-09-10/runtime-control/kv-aot-source-inspection.json`,
+  `kv-aot-{hooks,audit,runner,final}-cpu.xml`. Exact prospective commands and
+  failure handling: end of `perf/glm53-attention-isolation.md`.
