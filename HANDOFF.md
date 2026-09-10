@@ -35,7 +35,32 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): v2 first AOT load stopped; exact cache lifecycle fixed; v3 prescribed
+### Latest checkpoint (2026-09-10): v3 loads seven artifacts, parser fixed; NEW v4 prescribed
+
+v3 TERMINAL: ONE control-rank0 on14ab95575 loads7 artifacts/46 entries and26
+CUDA images match original whole bytes. Its independent AST inventory rejects
+the bound `Runner.call` export (incorrectly expected top-level def). Three source
+controller callback counts3/4/2 are NOT independent graph proof. Load/audit exit1,
+other seven never launched; all201 source receipts/5172 original files unchanged,
+GPUs free. All private copies and logs retained. Closure
+`rmsnorm-geometry-aot-qualification-v3/closure.json`, SHA
+352a2e15d3a2bae0bc67b1cfdfb0de4aaf6017c372ca4eaa15bbadee9f1ef6d6.
+
+Auditor now resolves explicit exported instance/class/method AST bindings and
+checks live function, instance, class, source line/filename and globals. All28
+original graph sources match exported Runner.call and their recorded run symbols.
+`runtime-control/geometry-bound-export-source-check.json`, SHA
+c43d449aa00bc4ffffc0f628efd291a16d199f54c69df7770c971121b457da36.
+Focused79 pass2.87s; final related278 pass3.47s; nine new actual bound-method tests.
+
+NEXT after commit: NEW v4 protocol at tail. Same control0..3 then geometry0..3
+no-weights loads, new copies under
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v4/`.
+Freeze through preparation/loads/audits/closure,16GiB GPU/8GiB CPU/swap0, one GPU
+workload, stop on any failure/no retries. v1/v2/v3 unused cases remain stopped.
+No full-model series or quality/default/quant promotion; goal ongoing.
+
+### Previous checkpoint (2026-09-10): v2 first AOT load stopped; exact cache lifecycle fixed; v3 prescribed
 
 v2 TERMINAL: ONE control-rank0 load onad6656314 and its audit exit1; remaining
 seven not launched. All7 static bundles/50 entries found without fallback and

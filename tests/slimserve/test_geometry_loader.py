@@ -18,6 +18,7 @@ from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 from benchmarks.kernels import glm53_geometry_loader as loader_module
 from benchmarks.kernels.audit_glm53_geometry_graphs import (
     compare_unrelated,
+    exported_call,
     inventory,
     run_symbols,
 )
@@ -359,6 +360,85 @@ def test_run_symbols_ignores_embedded_compile_time_docstring():
     assert run_symbols(
         '"""def call(): unused.run()"""\ndef call():\n    actual.run()\n'
     ) == {"actual"}
+
+
+def bound_graph_fixture(tmp_path, monkeypatch):
+    loader, manifest, graph, _, _ = fixture(tmp_path, monkeypatch)
+    text = graph.read_text().split("def call():", 1)[0]
+    text += (
+        "class Runner:\n    def __init__(self, partitions):\n"
+        "        self.partitions = partitions\n"
+    )
+    text += "    def call(self):\n" + "\n".join(
+        f"        norm{i}.run()" for i in range(4)
+    )
+    text += "\nrunner = Runner(partitions=[])\ncall = runner.call\n"
+    relative = str(graph.relative_to(loader.private))
+    for root in (loader.private, Path(manifest["original_namespace"])):
+        (root / relative).write_text(text)
+    manifest["original_files"][relative] = sha(graph)
+    manifest["expected_graphs"]["0"][relative] = sha(graph)
+    return loader, manifest, graph
+
+
+def test_real_codecache_exported_bound_runner_inventory(tmp_path, monkeypatch):
+    loader, manifest, graph = bound_graph_fixture(tmp_path, monkeypatch)
+    with loader.intercept():
+        module = PyCodeCache.load_by_key_path("bound-fixture", str(graph))
+        assert module.call.__self__ is module.runner
+        report = inventory(
+            PyCodeCache.modules, manifest, 0, "geometry", loader.observer
+        )
+        assert report["target_bindings"] == 3 and len(report["bindings"]) == 4
+        loader.controller.seal(PyCodeCache.modules)
+    loader.close()
+
+
+@pytest.mark.parametrize("change", ["instance", "class", "function"])
+def test_changed_live_runner_export_rejected(tmp_path, monkeypatch, change):
+    loader, manifest, graph = bound_graph_fixture(tmp_path, monkeypatch)
+    with loader.intercept():
+        module = PyCodeCache.load_by_key_path("bound-fixture", str(graph))
+        if change == "instance":
+            module.runner = module.Runner(partitions=[])
+        elif change == "class":
+            module.Runner = type("Runner", (), {})
+        else:
+            module.Runner.call = lambda self: None
+        with pytest.raises(ValueError, match="exported runner"):
+            inventory(PyCodeCache.modules, manifest, 0, "geometry", loader.observer)
+    loader.close()
+
+
+def test_export_parser_follows_bound_call_not_unrelated_helpers_or_strings():
+    text = '''"""def call(): fake.run()"""
+class Unused:
+    def call(self): wrong.run()
+class Runner:
+    def call(self): actual.run()
+runner = Runner(partitions=[])
+call = runner.call
+'''
+    function, cls, instance = exported_call(text)
+    assert (function.lineno, cls, instance) == (5, "Runner", "runner")
+    assert run_symbols(text) == {"actual"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "class Runner:\n    def call(self): k.run()\n",
+        "def call(): k.run()\ncall = something_else\n",
+        "class Runner:\n    def call(self): k.run()\ncall = Runner.call\n",
+        (
+            "class Runner:\n    def call(self): k.run()\n"
+            "runner = factory()\ncall = runner.call\n"
+        ),
+    ],
+)
+def test_ambiguous_or_unbound_graph_exports_rejected(text):
+    with pytest.raises(ValueError):
+        exported_call(text)
 
 
 def test_non_target_comparison_ignores_handles_but_not_selection():

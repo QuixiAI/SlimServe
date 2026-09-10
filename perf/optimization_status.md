@@ -26903,3 +26903,25 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `rmsnorm-geometry-aot-qualification-v2/closure.json`, SHA
   c84e1f76dcca924103b52e660b30130e120c2f22b68a89800219024a819ae044;
   `runtime-control/geometry-loader-rank-cache{,-final}-cpu.xml`, under2026-09-10.
+
+## 2026-09-10 - Real AOT artifacts load; independent inventory needs bound Runner.call
+
+- Status: v3 terminal after ONE control-rank0 load/audit; seven cases unlaunched.
+- Result:14ab95575 loads ALL7 actual cached artifacts/46 entries. All26 observed
+  CUDA load images match their original whole cubins; controller graph callbacks
+  cover3/4/2 bindings across the three rank0 sources. Independent AST audit then
+  fails because these graphs export `call = runner.call`, not top-level def call.
+  Callback counts are NOT independently qualified coverage; no model/TPS result.
+- Closure: both load/audit exit1, all201 source receipts/5172 original files verify,
+  GPUs released. Every private copy/log/receipt preserved; no further v3 attempts.
+- Fix/CPU: explicit exported AST binding resolution plus live method/instance/class/
+  filename/line/global identity checks. All28 mapped original graph exports and
+  recorded kernel run symbols match. Focused79 pass2.87s; related278 pass3.47s,
+  including nine new real PyCodeCache bound-method/negative tests,8GiB/swap0.
+- Decision: retain diagnostic fix, commit and NEW v4 same fixed eight-case protocol.
+  No binary/math/quant/default/quality tolerance change; one GPU job, no retries.
+- Raw: `rmsnorm-geometry-aot-qualification-v3/closure.json`, SHA
+  352a2e15d3a2bae0bc67b1cfdfb0de4aaf6017c372ca4eaa15bbadee9f1ef6d6;
+  `runtime-control/geometry-bound-export-source-check.json`, SHA
+  c43d449aa00bc4ffffc0f628efd291a16d199f54c69df7770c971121b457da36;
+  `geometry-loader-bound-export{,-final}-cpu.xml`, under the same runtime-control.

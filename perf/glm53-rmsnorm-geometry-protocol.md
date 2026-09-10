@@ -4,8 +4,9 @@ Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pa
 matrices pass and match exactly across processes. Their commands below are
 historical; do not rerun them. The first pair remains terminal after its observer
 API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
-load. v2 stopped on its first GPU load's cache-lifecycle gate. NEW no-weights
-AOT v3 is prescribed at the tail below;
+load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all seven
+rank0 artifacts but stopped at the auditor's export parser. NEW no-weights
+AOT v4 is prescribed at the tail below;
 no full-model series is prescribed.
 
 ## Question and fixed factors
@@ -420,7 +421,7 @@ The launcher's child scope names are also v2. Only if all eight pass, invoke the
 previous final `compare` command with v2 in BOTH unit and series path. No other
 changes, replacement starts or model workload authorized by this protocol.
 
-## v2 closure and exact cache-lifecycle fix; NEW v3
+## v2 closure and exact cache-lifecycle fix; historical v3 (stopped)
 
 ONE control-rank0 load onad6656314 exits1, followed by its prescribed failing
 audit. The remaining seven loads were NEVER launched. All seven static bundles
@@ -452,3 +453,34 @@ loads/audits/release checks pass. Root:
 `perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v3/`.
 Same scopes/no-retry/no-edit/no-build/one-GPU-workload rules and every original
 source/binary/graph/non-target gate. Do not launch any unused v1/v2 case.
+
+## v3 closure and exported Runner.call support; NEW v4
+
+ONE control-rank0 process on14ab95575 loads ALL7 artifacts/46 entries; its26
+observed CUDA images match original whole bytes. The independent AST inventory
+then rejects the generated module's `call = runner.call` export because it only
+recognized a top-level function. All3 sources have controller graph callbacks
+(3/4/2), but those callbacks alone do NOT qualify actual graph coverage. Load and
+prescribed audit exit1; remaining seven cases never launched. All201 sources/
+5172 original files unchanged; GPUs free. v3 is TERMINAL, all copies/logs retained.
+Closure `rmsnorm-geometry-aot-qualification-v3/closure.json`, SHA
+`352a2e15d3a2bae0bc67b1cfdfb0de4aaf6017c372ca4eaa15bbadee9f1ef6d6`.
+
+Auditor now follows the explicit exported instance/class/method AST bindings,
+or a direct call function. It checks the live method's exact instance, class,
+function, source filename/line and globals. It excludes compile-time strings and
+unexported methods. Read-only source check matches ALL28 mapped original graph
+exports and recorded kernel run symbols. Report
+`runtime-control/geometry-bound-export-source-check.json`, SHA
+`c43d449aa00bc4ffffc0f628efd291a16d199f54c69df7770c971121b457da36`.
+Focused79 tests pass2.87s; related278 pass3.47s,8GiB/swap0. Nine new CPU tests
+include actual PyCodeCache bound Runner.call imports and changed live exports.
+
+NEW v4 after commit: SAME eight cases, order, independent private copies and
+unchanged source/binary/graph/non-target/numerical gates. Use the explicit v2
+prepare command with `v4` in BOTH unit/output path; use the launch/final compare
+commands with `v4` in BOTH unit/series path. Child scopes are v4. Root:
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v4/`.
+Freeze through terminal audits, one GPU workload at a time,16GiB GPU/8GiB CPU/
+swap0, stop entire series on any failure. No retries or unused v1/v2/v3 cases.
+This still does not prescribe a full-model run or change production defaults.

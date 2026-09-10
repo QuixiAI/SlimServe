@@ -8,16 +8,88 @@ from benchmarks.kernels.check_glm53_attention_norms import require
 from slimserve.rmsnorm_diagnostic import expected_receipt, launcher_receipt, sha
 
 
-def run_symbols(source):
-    functions = [
-        node
-        for node in ast.parse(source).body
-        if isinstance(node, ast.FunctionDef) and node.name == "call"
+def exported_call(source):
+    """Resolve the actual export: direct call or instance-bound Runner.call.
+
+    Follow explicit top-level bindings, not arbitrary nested methods named call
+    or compile-time source strings. Returned names also bind the live method.
+    """
+    body = ast.parse(source).body
+
+    def assignments(name):
+        return [
+            node
+            for node in body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+        ]
+
+    functions = [n for n in body if isinstance(n, ast.FunctionDef) and n.name == "call"]
+    aliases = assignments("call")
+    if functions:
+        require(len(functions) == 1 and not aliases, "ambiguous direct call export")
+        return functions[0], None, None
+    require(len(aliases) == 1, "one explicit graph call export required")
+    alias = aliases[0].value
+    require(
+        isinstance(alias, ast.Attribute)
+        and alias.attr == "call"
+        and isinstance(alias.value, ast.Name),
+        "unsupported graph call export",
+    )
+    instance_name = alias.value.id
+    instances = assignments(instance_name)
+    require(len(instances) == 1, "one exported runner instance required")
+    constructor = instances[0].value
+    require(
+        isinstance(constructor, ast.Call) and isinstance(constructor.func, ast.Name),
+        "explicit runner constructor required",
+    )
+    class_name = constructor.func.id
+    classes = [n for n in body if isinstance(n, ast.ClassDef) and n.name == class_name]
+    require(len(classes) == 1, "one exported runner class required")
+    methods = [
+        n
+        for n in classes[0].body
+        if isinstance(n, ast.FunctionDef) and n.name == "call"
     ]
-    require(len(functions) == 1, "one actual graph call function required")
+    require(len(methods) == 1, "one exported runner call method required")
+    return methods[0], class_name, instance_name
+
+
+def verify_call_export(module, source):
+    definition, class_name, instance_name = exported_call(source)
+    call = module.call
+    namespace = vars(module)
+    if class_name is None:
+        function = call
+        require(getattr(call, "__self__", None) is None, "direct call became bound")
+    else:
+        instance = namespace.get(instance_name)
+        cls = namespace.get(class_name)
+        function = getattr(call, "__func__", None)
+        require(
+            instance is not None
+            and type(instance) is cls
+            and getattr(call, "__self__", None) is instance
+            and function is vars(cls).get("call"),
+            "live call is not its exported runner method",
+        )
+    code = getattr(function, "__code__", None)
+    require(
+        getattr(function, "__globals__", None) is namespace
+        and code is not None
+        and code.co_filename == module.__file__
+        and code.co_firstlineno == definition.lineno,
+        "live call definition differs from inventoried source/globals",
+    )
+
+
+def run_symbols(source):
+    function, _, _ = exported_call(source)
     return {
         node.func.value.id
-        for node in ast.walk(functions[0])
+        for node in ast.walk(function)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "run"
@@ -64,11 +136,9 @@ def inventory(modules, manifest, rank, mode, observer):
             "unexpected or changed graph source",
         )
         namespace = vars(module)
-        require(
-            getattr(call, "__globals__", None) is namespace,
-            "call does not execute the inventoried globals",
-        )
-        referenced = run_symbols(path.read_text())
+        source_text = path.read_text()
+        verify_call_export(module, source_text)
+        referenced = run_symbols(source_text)
         found_graphs.add(relative)
         bound_symbols = set()
         for symbol, tuner in namespace.items():
