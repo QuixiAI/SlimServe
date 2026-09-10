@@ -8,7 +8,8 @@ load. v2 stopped on its first GPU load's cache-lifecycle gate; v3 loaded all sev
 rank0 artifacts but stopped at the auditor's export parser. v4 stopped at the
 inventory's graph/helper classification; v5 stops at post-compile call identity.
 No-weights AOT v6 now PASSES all eight loads/audits and final comparison; its
-commands are historical. No next GPU or full-model series is prescribed.
+commands are historical. The opt-in serving integration is now CPU-tested (see
+tail); no next GPU or full-model series is prescribed.
 
 ## Question and fixed factors
 
@@ -642,3 +643,37 @@ compilation. Preserve original attention/KDA/recipe/defaults/quality gates, and 
 existing independent legacy diagnostic. Only after implementation/tests and a new
 explicit freeze should a control/geometry/return full-model causal series be
 prescribed. No next GPU/model job is prescribed at this checkpoint.
+
+## Opt-in serving integration checkpoint (CPU only)
+
+`slimserve/rmsnorm_geometry.py` validates the fixed recipe, BF16 activation/KV,
+native ordering, original compiler/combo policy, completed pinned AOT evidence,
+private paths and current sources. The separate flag/schema leaves the legacy
+diagnostic intact. `glm53_geometry_serving.py` verifies actual serialized/live roots
+and all target/non-target launcher bindings before forward and around capture.
+Targets seal before AOT loading returns; global binary observation intentionally
+remains active. No checks are inserted into token execution.
+
+`prepare_glm53_geometry_serving.py` can prepare three independent shared-per-start
+namespaces with rank-private Triton caches. It consumes completed v6 receipts,
+not the historical HEAD-frozen reader. The freeze now explicitly includes serving
+and client entrypoints plus all 32 shared campaign source paths. Qualified live
+loader/compiler/kernel/native files remain exact; only explicit integration sites
+and the extracted shared offline auditor may differ from the old qualification.
+`audit_glm53_geometry_serving.py` checks all-rank load/capture receipts independently
+of workload claims. Additional non-root modules must be private and receipt-exact;
+original sources and all real root bindings retain strict qualification checks.
+
+CPU gate: 511 passed, 10.03 s, 8 GiB/swap0/GPUs hidden; lint/diff pass. Tests use
+actual vLLM/Torch loading APIs with reduced outer fixtures and mocked CUDA, not
+actual serving. Source/evidence join: 340 receipts, 5,172 original files unchanged;
+default registered profile dry-run passes. Raw under `runtime-control/`:
+`geometry-serving-source-freeze-cpu.xml`, `geometry-serving-final-evidence.json`
+(SHA 8a09c4ed1a9dab521f7eac7528f5af7a4b622958ed6755cf398ba7b18a1902fd),
+`geometry-serving-default-dry-run.log`. Initial evidence/test reports retained.
+
+No new private serving copies, weights, forwards, captures or TPS were run.
+Next implement/test workload/causal auditing and the predecessor/release controller,
+confirm `/raid/weights` profile resolution, then commit the bounded full-model
+protocol before any preparation or launch. All existing quality floors and terminal
+failed series remain intact. This checkpoint does not prescribe a model/GPU job.

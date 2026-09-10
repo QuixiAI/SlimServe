@@ -52,6 +52,7 @@ def diagnostic_only(args):
         or os.environ.get("SLIMSERVE_GLM53_SCORE_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_INDEX_JOURNAL")
         or os.environ.get("SLIMSERVE_GLM53_RMSNORM_DIAGNOSTIC")
+        or os.environ.get("SLIMSERVE_GLM53_RMSNORM_GEOMETRY")
         or any(
             os.environ.get(key) == "1"
             for key in (
@@ -70,41 +71,9 @@ def diagnostic_only(args):
 
 
 def benchmark_sources():
-    root = Path(__file__).resolve().parents[1]
-    paths = [
-        *(
-            f"benchmarks/{name}.py"
-            for name in (
-                "benchmark_glm53_campaign",
-                "benchmark_glm53_server",
-                "benchmark_glm53_b12x",
-                "benchmark_dsv4_exact",
-                "benchmark_glm53_quality",
-                "benchmark_glm53_prefill",
-            )
-        ),
-        "slimserve/smoke.py",
-        "slimserve/stream.py",
-        "slimserve/cli.py",
-        "slimserve/server.py",
-        "vllm/utils/jit_monitor.py",
-        "slimserve/glm53_ordering.py",
-        "slimserve/deterministic_reductions.py",
-        "slimserve/reduction_receipts.py",
-        "slimserve/rmsnorm_diagnostic.py",
-        "benchmarks/kernels/check_glm53_cached_rmsnorm.py",
-        "vllm/v1/worker/gpu_model_runner.py",
-        "slimserve/canonical_moe.py",
-        "slimserve/canonical_indexer.py",
-        "vllm/model_executor/layers/fused_moe/router/glm_route_align.py",
-        "vllm/model_executor/layers/fused_moe/router/glm_stable_align.py",
-        "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
-        "vllm/model_executor/layers/glm5_next_indexer.py",
-        "vllm/quixicore/ops.py",
-    ]
-    return {
-        name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in paths
-    }
+    from slimserve.campaign_sources import snapshot
+
+    return snapshot()
 
 
 # Freeze the client sources when Python imports the workload, not per boot.
@@ -619,10 +588,14 @@ def main():
     from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
 
     validate_rmsnorm_plan(plan)
+    from slimserve.rmsnorm_geometry import validate_plan as validate_geometry_plan
+
+    validate_geometry_plan(plan)
     if args.deterministic_reductions:
         from slimserve.deterministic_reductions import diagnostic_plan
 
         plan = diagnostic_plan(plan)
+        validate_geometry_plan(plan)
     if args.prefill or args.cold_prefix:
         plan = dataclasses.replace(
             plan,

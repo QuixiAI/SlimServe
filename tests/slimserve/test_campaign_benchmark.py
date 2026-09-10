@@ -81,6 +81,18 @@ def test_rmsnorm_intervention_is_never_a_baseline(monkeypatch, mode):
     assert "benchmarks/kernels/check_glm53_cached_rmsnorm.py" in sources
 
 
+@pytest.mark.parametrize("mode", ["control", "geometry", "invalid"])
+def test_geometry_intervention_is_never_a_baseline(monkeypatch, mode):
+    bench = _load(monkeypatch)
+    monkeypatch.setenv("SLIMSERVE_GLM53_RMSNORM_GEOMETRY", mode)
+    args = SimpleNamespace(routing=False, cuda_traces=False, quality_repeats=1)
+    assert bench.diagnostic_only(args)
+    sources = bench.benchmark_sources()
+    assert "slimserve/rmsnorm_geometry.py" in sources
+    assert "benchmarks/kernels/glm53_geometry_serving.py" in sources
+    assert "benchmarks/kernels/glm53_artifact_roots.py" in sources
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_deterministic_plan_and_server_command_agree(monkeypatch, tmp_path, enabled):
     from slimserve.hardware import Machine

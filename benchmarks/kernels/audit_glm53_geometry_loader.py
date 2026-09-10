@@ -28,7 +28,9 @@ def json_lines(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def check_root_records(manifest, graphs, modules, events):
+def check_root_records(
+    manifest, graphs, modules, events, *, allow_additional_non_roots=False
+):
     """Join the complete module catalog to observed serialized artifact roots.
 
     Extra call exports are imported helpers only when they are original-exact
@@ -54,10 +56,18 @@ def check_root_records(manifest, graphs, modules, events):
             f"module inventory has invalid path/index: {path}",
         )
         relative = str(path.relative_to(private))
+        original = manifest["original_files"].get(relative)
         require(
-            row.get("source_sha256")
-            == sha(path)
-            == manifest["original_files"].get(relative),
+            row.get("source_sha256") == sha(path)
+            and (
+                row["source_sha256"] == original
+                or (
+                    allow_additional_non_roots
+                    and original is None
+                    and relative
+                    not in manifest["expected_graphs"][str(manifest["rank"])]
+                )
+            ),
             f"imported module differs from original source: {path}",
         )
         if row["callable"]:
@@ -152,12 +162,41 @@ def check_records(
         and all(b["expected"] == b["loaded"] > 0 for b in summary["static_bundles"]),
         "incomplete static bundle coverage",
     )
+    result = check_graph_records(
+        manifest, manifest_sha, graphs, binary_events, target_events
+    )
+    require(
+        result["observed_binary_objects"] == summary["observed_binary_objects"],
+        "reported binary object count differs",
+    )
+    return result
+
+
+def check_graph_records(
+    manifest,
+    manifest_sha,
+    graphs,
+    binary_events,
+    target_events,
+    *,
+    require_global_seal=True,
+):
+    """Shared source/config/binary/controller audit; no model-workload assertions.
+
+    Serving keeps the observer open for legitimate later non-target compilation.
+    The no-weights qualifier still requires its exact terminal global seal.
+    """
+    rank, mode = manifest["rank"], manifest["mode"]
     loaded = [r for r in binary_events if r["event"] == "binary_loaded"]
     sealed = [r for r in binary_events if r["event"] == "binary_observer_sealed"]
     require(
-        len(sealed) == 1
-        and sealed[0]["rank"] == rank
-        and sealed[0]["objects"] == len(loaded) == summary["observed_binary_objects"],
+        (
+            len(sealed) == 1
+            and sealed[0]["rank"] == rank
+            and sealed[0]["objects"] == len(loaded)
+        )
+        if require_global_seal
+        else not sealed,
         "binary observer not completely sealed",
     )
     require(

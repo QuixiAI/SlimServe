@@ -35,7 +35,37 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): actual all-rank RMSNorm geometry AOT qualification PASSES
+### Latest checkpoint (2026-09-10): opt-in geometry serving integration CPU-tested
+
+The qualified thirteen-source intervention now has a separate, default-off serving
+hook (`SLIMSERVE_GLM53_RMSNORM_GEOMETRY=control|geometry`) and manifest schema.
+Actual AOT roots/launchers are checked and targets sealed before the loader returns
+to model execution, then checked before and after capture. Binary observation stays
+active for legitimate later non-target compilation. The legacy diagnostic is intact.
+Preparation supports three fresh per-start caches: control, geometry, return-control.
+No serving caches have been prepared and no model/GPU job has run at this checkpoint.
+
+CPU regression: 511 passed (10.03 s), 8 GiB/swap0, GPUs hidden. Real vLLM concurrent
+store/Torch graph APIs are exercised with reduced outer fixtures and mocked CUDA.
+Read-only evidence join verifies 340 source/evidence receipts and 5,172 original
+files; all 32 campaign source files are now covered by a shared catalog. Qualified
+live loader/compiler/kernel/native sources remain unchanged. Default profile dry-run
+passes; neither these tests nor the worker auditor establish serving quality or TPS.
+Raw `runtime-control/geometry-serving-source-freeze-cpu.xml`,
+`geometry-serving-final-evidence.json` (SHA
+8a09c4ed1a9dab521f7eac7528f5af7a4b622958ed6755cf398ba7b18a1902fd), and
+`geometry-serving-default-dry-run.log`, all under `perf/results/2026-09-10/`.
+
+NEXT: implement/test the full workload controller and causal auditor, preserving
+all 32 quality-window floors, exact-token/text/image/quality-repeat/cold-prefill
+workloads, predecessor audits, source freeze and GPU-release gates. Confirm the
+established `/raid/weights` model location explicitly (`SLIMSERVE_CACHE`); the
+default dry-run resolves under `/home/tiny/models`, not the campaign path. Commit
+and prescribe the exact three-case series before preparation or serving. No next
+GPU/model job is prescribed. Failed no-combo/indexer gates remain unresolved;
+quant, production defaults and stable performance baselines are unchanged.
+
+### Previous checkpoint (2026-09-10): actual all-rank RMSNorm geometry AOT qualification PASSES
 
 v6 on62a7a3ad0 completes ALL8 prescribed attempts in order: control ranks0..3,
 then geometry ranks0..3. All loads and independent audits exit0, followed by a

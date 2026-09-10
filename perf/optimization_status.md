@@ -27024,3 +27024,31 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `rmsnorm-geometry-aot-qualification-v6/`, pair-analysis SHA
   46b9c695c2734759deb55d3c15ee085dc8e3bd8eea67153ab074cdd1cb4fe946;
   closure SHAff9b29e175d6d8ac2f1c787d6ca35ee522786e20541a4ac5f3ffdf6fdfd98242.
+
+## 2026-09-10 - Opt-in geometry serving lifecycle and preparation CPU-tested
+
+- Status: retained diagnostic integration checkpoint; not model-qualified.
+- Baseline/hypothesis: completed v6 proves real AOT loading without model execution.
+  The same thirteen-source intervention must bind before full-model forward/capture
+  while preserving unrelated attention/KDA choices and the fixed quant recipe.
+- Change: independent default-off flag/schema, strict profile/precision/source gates,
+  actual artifact/root checks and target sealing before forward; recheck around
+  capture while allowing observed non-target compilation. Independent worker audit
+  covers all three snapshots and raw lifecycle/binary/controller/root receipts.
+  Preparation implements control/geometry/return-control private namespaces but
+  has NOT been run. Legacy diagnostic unchanged; no token-loop instrumentation.
+- Correctness: 511 CPU tests passed in 10.03 s, 8 GiB/swap0/GPUs hidden. Actual
+  vLLM/Torch APIs, reduced outer AOT fixtures, mocked CUDA; lint/diff pass. The
+  read-only evidence join checks 340 receipts and 5,172 unchanged original files.
+  Shared source catalog fixes missing serving/client entrypoint freeze coverage;
+  all 32 campaign sources covered, qualified live compiler/kernel/native unchanged.
+- Results: default profile dry-run passes; no new cache copies, GPU workload,
+  model load, forward, capture, native build, download or measured throughput.
+- Decision: commit integration; next build the workload/causal audit and prescribed
+  launch chain. Keep 32-window quality floors, failed no-combo/indexer gates and
+  production defaults unchanged. Confirm established model location explicitly;
+  default dry-run points at `/home/tiny/models`, campaign uses `/raid/weights`.
+- Raw: `perf/results/2026-09-10/runtime-control/geometry-serving-source-freeze-cpu.xml`,
+  `geometry-serving-final-evidence.json` (SHA
+  8a09c4ed1a9dab521f7eac7528f5af7a4b622958ed6755cf398ba7b18a1902fd),
+  `geometry-serving-default-dry-run.log`; all initial reports retained.
