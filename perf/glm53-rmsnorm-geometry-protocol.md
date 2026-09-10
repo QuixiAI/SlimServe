@@ -3,7 +3,8 @@
 Status: corrected pre-load A/B pair COMPLETE and audited on4b0fa3701. Both312-pair
 matrices pass and match exactly across processes. Their commands below are
 historical; do not rerun them. The first pair remains terminal after its observer
-API failure. NEW no-weights AOT qualification is prescribed at the tail below;
+API failure. AOT v1 stopped during CPU preparation before any private cache/GPU
+load. NEW no-weights AOT v2 is prescribed at the tail below;
 no full-model series is prescribed.
 
 ## Question and fixed factors
@@ -314,7 +315,7 @@ stop-on-failure/no retries. Then actual graph/global/binary coverage, unchanged
 non-target comparison and cache/source audit must pass before any model series.
 No next GPU/model job is prescribed at this checkpoint.
 
-## NEW prescribed real-AOT qualification v1
+## Historical real-AOT qualification v1 (stopped in CPU preparation)
 
 Runner `check_glm53_geometry_loader.py`, offline auditor
 `audit_glm53_geometry_loader.py`; both under `benchmarks/kernels/`.
@@ -381,3 +382,39 @@ systemd-run --user --scope --unit=glm53-geometry-aot-v1-final-audit -p MemoryMax
 This gate proves loader/graph/binary coverage, not model score causality or TPS.
 Only after it passes may the opt-in serving adapter and bounded model causal
 series be implemented/prescribed. Quant/defaults/native math/gates unchanged.
+
+## v1 preparation closure; NEW prescribed v2
+
+ONE CPU preparation on7e2b8bd0e exits1 BEFORE creating the private series or
+launching any GPU load. Dotted import of `torch._inductor.standalone_compile`
+resolves Torch's package-exported FUNCTION rather than its module, so source-file
+freezing raises AttributeError. Original5172 files and183 source receipts verify,
+GPU query empty. v1 is TERMINAL, none of its eight loads may be launched.
+Closure `runtime-control/geometry-aot-v1-preparation-failure.json`, SHA
+`1a337eb9639c4152ef2a6b02c875b97f5d512468eadd9d852dbeed36fc1f2e23`.
+
+Fixed with explicit `importlib.import_module` resolution for all five loader
+modules. New CPU test executes actual module resolution plus the WHOLE eight-copy
+preparation, frozen manifest readback and source/original verification on small
+fixtures, and rejects overwriting the output. Focused65 tests pass2.75s; related
+264 pass. No GPU/math/default/gate change. Initial evidence and tests retained.
+
+NEW v2: exactly the SAME eight rank/mode attempts, loader path, scopes, order,
+no-retry policy and gates prescribed above, at a NEW series root. Commit the fix
+then freeze through preparation/loads/audits/closure. Prepare once:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-aot-v2-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.prepare_glm53_geometry_loader \
+  --pair perf/results/2026-09-10/rmsnorm-geometry-preload-qualification/pair-analysis.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-preload-manifest.json \
+  --mapping perf/results/2026-09-10/runtime-control/norm-graph-role-pairs.json \
+  --output perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v2
+```
+
+Then invoke the previous `launch` command once for each prescribed LABEL in order,
+substituting `v2` for `v1` in BOTH the outer unit name and manifest series path.
+The launcher's child scope names are also v2. Only if all eight pass, invoke the
+previous final `compare` command with v2 in BOTH unit and series path. No other
+changes, replacement starts or model workload authorized by this protocol.

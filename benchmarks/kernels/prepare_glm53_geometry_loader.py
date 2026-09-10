@@ -8,6 +8,7 @@ helpers explicitly. Never silently refresh serving, compiler or native hashes.
 
 import argparse
 import copy
+import importlib
 import json
 import shutil
 import subprocess
@@ -27,6 +28,19 @@ from benchmarks.kernels.prepare_glm53_rmsnorm_geometry import PAIR_SHA
 from slimserve.rmsnorm_diagnostic import NAMESPACE, sha
 
 QUALIFICATION_SHA = "3b5bcff2c1d23b4b8a2ffa7c648267d5ee74003f67f6ce6495528d1c69516f69"
+
+
+def loader_source_files():
+    # Torch also exports standalone_compile as a function on its package.
+    # Resolve module objects explicitly, not dotted-import package attributes.
+    names = (
+        "torch._dynamo.aot_compile",
+        "torch._inductor.async_compile",
+        "torch._inductor.standalone_compile",
+        "torch._inductor.triton_bundler",
+        "torch._inductor.runtime.cache_dir_utils",
+    )
+    return [Path(importlib.import_module(name).__file__) for name in names]
 
 
 def qualified_targets(manifest, binaries):
@@ -161,12 +175,6 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         not output.is_relative_to(original) and not original.is_relative_to(output),
         "private series overlaps original cache",
     )
-    import torch._dynamo.aot_compile as aot_compile
-    import torch._inductor.async_compile as async_compile
-    import torch._inductor.runtime.cache_dir_utils as cache_dir_utils
-    import torch._inductor.standalone_compile as standalone_compile
-    import torch._inductor.triton_bundler as triton_bundler
-
     from benchmarks.kernels import (
         audit_glm53_geometry_graphs,
         audit_glm53_geometry_loader,
@@ -182,16 +190,7 @@ def prepare(pair_path, manifest_path, mapping_path, output):
         Path(audit_glm53_geometry_graphs.__file__),
         Path(check_glm53_geometry_loader.__file__),
         Path(audit_glm53_geometry_loader.__file__),
-        *(
-            Path(module.__file__)
-            for module in (
-                aot_compile,
-                async_compile,
-                standalone_compile,
-                triton_bundler,
-                cache_dir_utils,
-            )
-        ),
+        *loader_source_files(),
         Path(__file__).resolve().parents[2] / "vllm/compilation/caching.py",
     ]
     sources, refreshed = current_sources(old["sources"], additions)

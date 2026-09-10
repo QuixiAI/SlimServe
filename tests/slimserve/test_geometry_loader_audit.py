@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 from torch._inductor.codecache import PyCodeCache
 
+from benchmarks.kernels import prepare_glm53_geometry_loader as preparation_module
 from benchmarks.kernels.audit_glm53_geometry_graphs import inventory
 from benchmarks.kernels.audit_glm53_geometry_loader import check_records, json_lines
 from benchmarks.kernels.check_glm53_geometry_loader import (
@@ -15,9 +16,10 @@ from benchmarks.kernels.check_glm53_geometry_loader import (
     checked_bundles,
     environment,
     prior_receipts,
+    read_manifest,
 )
 from slimserve.rmsnorm_diagnostic import sha
-from tests.slimserve.test_geometry_loader import fixture
+from tests.slimserve.test_geometry_loader import fixture, qualified_fixture
 
 
 def actual_receipts(tmp_path, monkeypatch, mode="geometry"):
@@ -220,3 +222,47 @@ def test_prescribed_predecessors_must_all_have_unchanged_successful_audits(tmp_p
     earliest.write_text("drift\n")
     with pytest.raises(ValueError, match="predecessors"):
         prior_receipts(None, manifest, preparation)
+
+
+def test_real_torch_loader_module_resolution_and_full_private_preparation(
+    tmp_path, monkeypatch
+):
+    from benchmarks.kernels.prepare_glm53_geometry_loader import (
+        loader_source_files,
+        qualified_targets,
+    )
+
+    paths = loader_source_files()
+    assert len(paths) == 5 and all(p.is_file() for p in paths)
+    assert "standalone_compile.py" in {p.name for p in paths}
+    old, binaries = qualified_fixture(tmp_path)
+    targets = qualified_targets(old, binaries)
+    original = Path(old["original_namespace"])
+    graphs = {str(rank): {} for rank in range(4)}
+    for rank in range(4):
+        for index in range(7):
+            relative = f"inductor_cache/gg/graph{rank}_{index}.py"
+            path = original / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("def call():\n    pass\n")
+            graphs[str(rank)][relative] = sha(path)
+    old["sources"] = {}
+    old["original_files"] = {
+        str(p.relative_to(original)): sha(p) for p in original.rglob("*") if p.is_file()
+    }
+    monkeypatch.setattr(
+        preparation_module, "evidence", lambda *args: (old, targets, graphs, {})
+    )
+    output = tmp_path / "series"
+    preparation_module.prepare(None, None, None, output)
+    for mode, rank in ORDER:
+        path = output / f"{mode}-rank{rank}/manifest.json"
+        manifest, prepared = read_manifest(path)
+        assert len(prepared["runs"]) == 8
+        assert manifest["rank"] == rank and manifest["mode"] == mode
+        assert all(str(p.resolve()) in manifest["sources"] for p in paths)
+        for relative, digest in old["original_files"].items():
+            copied = Path(manifest["private_namespace"]) / relative
+            assert sha(copied) == digest and not copied.samefile(original / relative)
+    with pytest.raises(ValueError, match="new series"):
+        preparation_module.prepare(None, None, None, output)

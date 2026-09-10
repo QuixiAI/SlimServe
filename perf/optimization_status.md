@@ -26864,3 +26864,21 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw/protocol: `runtime-control/geometry-loader-{audit,protocol}-cpu.xml` under
   2026-09-10; new `rmsnorm-geometry-aot-qualification-v1/` and geometry protocol tail.
   GPUs idle before preparation; no throughput measured or default promoted.
+
+## 2026-09-10 - AOT v1 stops in CPU preparation; fix module provenance lookup
+
+- Status: v1 terminal before private-cache creation/GPU work; new v2 prescribed.
+- Failure: ONE preparation on7e2b8bd0e exits1 when Torch's package-exported
+  standalone_compile function is mistaken for its module by dotted import.
+  No weights, numerical workload, AOT GPU load or TPS measurement occurred.
+- Closure:5172 original files/183 source receipts unchanged; independent GPU query
+  empty. No v1 copies or manifests exist; do not launch its unused rank/mode jobs.
+- Fix: explicit importlib module resolution for all five loader-source receipts.
+  Added actual module plus full eight-cache preparation/frozen readback CPU test,
+  including no-overwrite and independent-copy checks. Focused65 pass2.75s and
+  final related264 pass; lint/diff pass. No math/quant/quality/default change.
+- Decision: commit then NEW v2 preparation and same eight-process conditional
+  sequence at protocol tail. Freeze through terminal audits, no retries or builds.
+- Raw: `runtime-control/geometry-aot-v1-preparation-failure.json`, SHA
+  1a337eb9639c4152ef2a6b02c875b97f5d512468eadd9d852dbeed36fc1f2e23;
+  `geometry-loader-{preparation-path,v2-final}-cpu.xml`, under2026-09-10.

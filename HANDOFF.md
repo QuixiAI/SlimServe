@@ -35,7 +35,27 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): no-weights AOT runner/auditor ready; bounded v1 prescribed
+### Latest checkpoint (2026-09-10): AOT preparation API fixed; NEW v2 prescribed
+
+v1 is TERMINAL: its ONE CPU preparation on7e2b8bd0e exits1 BEFORE creating any
+private cache or GPU process. Torch exports standalone_compile as a function,
+so dotted-import source freezing tried to access function.__file__. All5172
+original files/183 source receipts verify; GPUs free. Closure
+`runtime-control/geometry-aot-v1-preparation-failure.json`, SHA
+1a337eb9639c4152ef2a6b02c875b97f5d512468eadd9d852dbeed36fc1f2e23.
+
+Preparer now resolves real module objects with importlib. Added full CPU test of
+all eight private copies plus frozen manifest readback, actual Torch modules,
+unchanged originals and no overwrite. Focused65 pass2.75s; related264 pass.
+
+NEXT after commit: NEW v2 commands at protocol tail. Same exactly eight no-weights
+loads, control-rank0..3 then geometry-rank0..3, conditional on prior audits/release,
+16GiB GPU/8GiB CPU/swap0. Root
+`perf/results/2026-09-10/rmsnorm-geometry-aot-qualification-v2/`.
+Freeze through preparation/loads/audits/closure; no retries/builds/other GPU work.
+Do not launch v1. No model series, TPS/default/quality promotion; goal ongoing.
+
+### Previous checkpoint (2026-09-10): no-weights AOT runner/auditor ready; bounded v1 prescribed
 
 `check_glm53_geometry_loader.py` loads the seven actual artifacts/46 submodule
 entries per rank without weights/forward/capture. Its `launch` action preserves
