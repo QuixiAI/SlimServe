@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from functools import partial
 from pathlib import Path
 
 from benchmarks.kernels.audit_glm53_geometry_loader import (
@@ -140,12 +141,27 @@ def audit_worker(path, manifest, rank):
         roots = read(folder / "artifact-roots.jsonl", True)
         lifecycle = read(folder / "lifecycle.jsonl", True)
         graph_checker = None
-        if manifest.get("serving_schema") == "glm53-kv-serving-v1":
+        if manifest.get("serving_schema") in (
+            "glm53-kv-serving-v1",
+            "glm53-indexer-correction-serving-v1",
+        ):
             from benchmarks.kernels.audit_glm53_kv_loader import (
                 check_graph_records as graph_checker,
             )
 
             target_events = read(folder / "loader-events.jsonl", True)
+            if manifest["serving_schema"] == "glm53-indexer-correction-serving-v1":
+                from benchmarks.kernels import audit_glm53_indexer_correction_loader
+                from benchmarks.kernels.glm53_indexer_correction_serving import (
+                    check_runtime_records,
+                )
+
+                graph_checker = partial(
+                    graph_checker, workflow=audit_glm53_indexer_correction_loader
+                )
+                result["runtime_envelope"] = check_runtime_records(
+                    manifest, summary, read(folder / "runtime-envelope.jsonl", True)
+                )
         else:
             target_events = [
                 read(Path(manifest["receipts"]) / f"target-{i}/rank-{rank}.jsonl", True)

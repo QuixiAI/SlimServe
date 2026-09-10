@@ -469,11 +469,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         from slimserve.glm53_ordering import validate_plan
+        from slimserve.indexer_correction_diagnostic import (
+            validate_plan as validate_indexer_correction,
+        )
         from slimserve.kv_diagnostic import validate_plan as validate_kv_plan
         from slimserve.rmsnorm_diagnostic import validate_plan as validate_rmsnorm_plan
         from slimserve.rmsnorm_geometry import validate_plan as validate_geometry_plan
 
         validate_plan(plan)
+        validate_indexer_correction(plan)
         validate_kv_plan(plan)
         validate_rmsnorm_plan(plan)
         validate_geometry_plan(plan)
@@ -481,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
             from slimserve.deterministic_reductions import diagnostic_plan
 
             plan = diagnostic_plan(plan)
+            validate_indexer_correction(plan)
             validate_kv_plan(plan)
             validate_geometry_plan(plan)
     except ValueError as error:

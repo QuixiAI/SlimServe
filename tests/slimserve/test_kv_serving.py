@@ -35,11 +35,35 @@ from tests.slimserve.test_kv_loader import fixture
 from vllm.compilation.caching import StandaloneCompiledArtifacts
 
 
-def serving_fixture(tmp_path, monkeypatch, mode="kv"):
-    f = fixture(tmp_path, monkeypatch, mode)
+def serving_fixture(
+    tmp_path,
+    monkeypatch,
+    mode="kv",
+    *,
+    kernel_fixture=None,
+    serving_type=ServingKV,
+    serving_policy=policy,
+    separate_owners=False,
+):
+    f = (kernel_fixture or fixture)(tmp_path, monkeypatch, mode)
     manifest = f.manifest
     original, private = Path(manifest["original_namespace"]), f.loader.private
     target = manifest["targets"]["0"][0]
+    extra_key = f.loader.controller.extra_key
+    if separate_owners:
+        from torch._inductor.codecache import StaticAutotunerFuture
+
+        second = type(f.tuner).__new__(type(f.tuner))
+        vars(second).update(vars(f.tuner))
+        second.launchers = []
+
+        def precompile(**kwargs):
+            second.launchers = [second.compile_results[0].make_launcher()]
+
+        second.precompile = precompile
+        second_future = StaticAutotunerFuture(second)
+        second_future.reload_kernel_from_src = lambda: pytest.fail("source reload")
+        sys.modules["glm53_kv_fixture"].future2 = second_future
     side, side_path, _ = make_compiled(f.loader.cache / "triton/0", "side")
     relative = "inductor_cache/ss/side.py"
     for root in (original, private):
@@ -62,7 +86,11 @@ def serving_fixture(tmp_path, monkeypatch, mode="kv"):
         relative_graph = f"inductor_cache/ra/graph{index}.py"
         text = "from glm53_kv_fixture import side_result\nside = side_result()\n"
         if index < 2:
-            text += "from glm53_kv_fixture import future\ncombo = future.result()\n"
+            future_name = "future2" if separate_owners and index == 1 else "future"
+            text += (
+                f"from glm53_kv_fixture import {future_name} as future\n"
+                "combo = future.result()\n"
+            )
         text += "def call(args, stream):\n"
         if index < 2:
             text += "    combo.run(*args, stream=stream)\n"
@@ -116,11 +144,17 @@ def serving_fixture(tmp_path, monkeypatch, mode="kv"):
             )
             if is_target:
                 row.update(
-                    dispatch="direct_combo" if mode == "control" else "combo_then_kv",
+                    dispatch="direct_combo"
+                    if mode == "control"
+                    else (
+                        "combo_then_indexer_correction"
+                        if extra_key == "correction"
+                        else "combo_then_kv"
+                    ),
                     appended=None,
                 )
-                if mode == "kv":
-                    kv = target["kv"]
+                if mode != "control":
+                    kv = target[extra_key]
                     row["appended"] = dict(
                         source=kv["relative"],
                         source_sha256=kv["source_sha256"],
@@ -128,6 +162,13 @@ def serving_fixture(tmp_path, monkeypatch, mode="kv"):
                         cubin_sha256=kv["cubin_sha256"],
                         observed_binary_index=200,
                     )
+                    if extra_key == "correction":
+                        row["appended"].update(
+                            selection_capacity=8192,
+                            selection_bytes=8194 * 128,
+                            selection_dtype="uint8",
+                            selection_device="cuda:0",
+                        )
             rows.append(row)
     manifest["expected_graphs"] = {"0": graphs}
     manifest["artifact_roots"] = {"0": discover(store, private, graphs)}
@@ -138,7 +179,7 @@ def serving_fixture(tmp_path, monkeypatch, mode="kv"):
     qualified = tmp_path / "qualified.json"
     qualified.write_text(json.dumps(dict(graphs=7, target_bindings=2, bindings=rows)))
     manifest.update(
-        serving_schema=policy.SERVING_SCHEMA,
+        serving_schema=serving_policy.SERVING_SCHEMA,
         mode=mode,
         receipts=str(tmp_path / "targets"),
         worker_receipts=str(tmp_path / "workers"),
@@ -162,7 +203,7 @@ def serving_fixture(tmp_path, monkeypatch, mode="kv"):
     monkeypatch.setattr(
         TritonBundler, "load_autotuners", classmethod(lambda cls, ts: ts)
     )
-    diagnostic = ServingKV(0, manifest, path)
+    diagnostic = serving_type(0, manifest, path)
     diagnostic.loader.compile_replacement = f.loader.compile_replacement
     return diagnostic, store, f
 

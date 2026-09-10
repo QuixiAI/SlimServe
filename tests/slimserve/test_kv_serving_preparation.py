@@ -9,7 +9,7 @@ import pytest
 from benchmarks.kernels import glm53_geometry_workload as workload
 from benchmarks.kernels import prepare_glm53_kv_serving as preparation
 from benchmarks.kernels import run_glm53_geometry_serving as runner
-from slimserve import glm53_ordering
+from slimserve import glm53_ordering, indexer_correction_diagnostic
 from slimserve import kv_diagnostic as policy
 from slimserve.glm53_serving_diagnostic import cases
 from slimserve.glm53_serving_diagnostic import policy as serving_policy
@@ -153,27 +153,29 @@ def test_kv_return_checks_control_then_kv_not_geometry(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "mutation", [None, "non-target", "return-target", "prefill", "schema"]
 )
+@pytest.mark.parametrize("active_policy", [policy, indexer_correction_diagnostic])
 def test_kv_complete_closure_keeps_quality_failure_and_kernel_guards(
-    tmp_path, monkeypatch, mutation
+    tmp_path, monkeypatch, mutation, active_policy
 ):
     manifests = {}
-    for label, mode in policy.CASES:
+    candidate = active_policy.CASES[1][0]
+    for label, mode in active_policy.CASES:
         path, manifest = runner_fixture(tmp_path, label)
-        manifest.update(serving_schema=policy.SERVING_SCHEMA, mode=mode)
-        if mutation == "schema" and label == "kv":
+        manifest.update(serving_schema=active_policy.SERVING_SCHEMA, mode=mode)
+        if mutation == "schema" and label == candidate:
             manifest["serving_schema"] = "glm53-rmsnorm-geometry-serving-v1"
         path.write_text(json.dumps(manifest))
         manifests[path] = manifest
         audit = dict(
             diagnostic_tps={},
             prefill_prompt_sha256={"32768": "prompt", "131072": "long"},
-            quality_passed=label != "kv",
+            quality_passed=label != candidate,
             historical_comparisons={
-                "control": {"exact": label != "kv"},
-                "failed-no-combo": {"exact": label == "kv"},
+                "control": {"exact": label != candidate},
+                "failed-no-combo": {"exact": label == candidate},
             },
         )
-        if label == "kv" and mutation == "prefill":
+        if label == candidate and mutation == "prefill":
             audit["prefill_prompt_sha256"]["131072"] = "changed"
         (path.parent / "workload-analysis.json").write_text(json.dumps(audit))
         for rank in range(4):
@@ -184,8 +186,8 @@ def test_kv_complete_closure_keeps_quality_failure_and_kernel_guards(
                 symbol="target",
                 source="target",
                 target=True,
-                appended={"cubin_sha256": "kv", "observed_binary_index": 10}
-                if label == "kv"
+                appended={"cubin_sha256": candidate, "observed_binary_index": 10}
+                if label == candidate
                 else None,
             )
             other = dict(
@@ -195,7 +197,7 @@ def test_kv_complete_closure_keeps_quality_failure_and_kernel_guards(
                 target=False,
                 cubin_sha256="side",
             )
-            if label == "kv" and mutation == "non-target":
+            if label == candidate and mutation == "non-target":
                 other["cubin_sha256"] = "changed"
             if label == "return-control" and mutation == "return-target":
                 target["appended"] = {"cubin_sha256": "unexpected"}
@@ -209,8 +211,9 @@ def test_kv_complete_closure_keeps_quality_failure_and_kernel_guards(
     result = runner.read(tmp_path / "closure.json")
     assert not result["production_qualified"]
     if mutation is None:
-        assert result["kv_reproduces_failed_no_combo"]
-        assert result["controls_exact_to_original"] and not result["kv_quality_passed"]
+        assert result[f"{candidate}_reproduces_failed_no_combo"]
+        assert result["controls_exact_to_original"]
+        assert not result[f"{candidate}_quality_passed"]
         assert not any(k.startswith("geometry_") for k in result)
 
 

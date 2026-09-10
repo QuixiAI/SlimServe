@@ -284,7 +284,8 @@ def check_summary(path, manifest, summary):
 
 def check_scores(label, documents, scores, reference_docs, reference_scores):
     require(
-        label in ("control", "return-control", "geometry", "kv"), "unknown causal arm"
+        label in ("control", "return-control", "geometry", "kv", "correction"),
+        "unknown causal arm",
     )
     identity = input_identity(reference_docs["control"][0])
     require(

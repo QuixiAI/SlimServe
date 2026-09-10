@@ -10,14 +10,23 @@ import copy
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from benchmarks.kernels.check_glm53_attention_norms import load_checked, require, verify
 from benchmarks.kernels.check_glm53_geometry_loader import check_launch
 from benchmarks.kernels.check_glm53_rmsnorm_geometry import write_new
 from benchmarks.kernels.prepare_glm53_geometry_serving import integration_sources
-from benchmarks.kernels.prepare_glm53_kv_loader import ORDER
-from slimserve.kv_diagnostic import AOT_PAIR_SHA, CASES, SERVING_SCHEMA
+from benchmarks.kernels.prepare_glm53_kv_loader import ORDER as ORDER
+from slimserve.kv_diagnostic import (
+    AOT_PAIR_SHA as AOT_PAIR_SHA,
+)
+from slimserve.kv_diagnostic import (
+    CASES as CASES,
+)
+from slimserve.kv_diagnostic import (
+    SERVING_SCHEMA as SERVING_SCHEMA,
+)
 from slimserve.rmsnorm_diagnostic import sha
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -42,20 +51,26 @@ COMMON_FIELDS = (
     "private_sources",
     "expected_gpu_config",
 )
+EXTRA_KEY = "kv"
 
 
-def completed_evidence(pair_path):
+def check_completed_report(report, row, manifest):
+    """Optional extra qualification gate for another extra-launch policy."""
+
+
+def completed_evidence(pair_path, *, workflow=None):
+    workflow = workflow or sys.modules[__name__]
     pair_path = pair_path.resolve()
-    pair = load_checked(pair_path, AOT_PAIR_SHA)
+    pair = load_checked(pair_path, workflow.AOT_PAIR_SHA)
     require(
         pair["status"] == "complete"
         and pair["non_target_exact"] is True
-        and [(r["mode"], r["rank"]) for r in pair["runs"]] == list(ORDER),
+        and [(r["mode"], r["rank"]) for r in pair["runs"]] == list(workflow.ORDER),
         "completed eight-case KV AOT qualification required",
     )
-    receipts = {str(pair_path): AOT_PAIR_SHA}
+    receipts = {str(pair_path): workflow.AOT_PAIR_SHA}
     common, reference = None, None
-    graphs = {m: {} for m in ("control", "kv")}
+    graphs = {m: {} for m in ("control", workflow.EXTRA_KEY)}
     for row in pair["runs"]:
         mode, rank = row["mode"], row["rank"]
         folder = pair_path.parent / f"{mode}-rank{rank}"
@@ -69,7 +84,7 @@ def completed_evidence(pair_path):
             and report["graphs"] == report["artifact_roots"] == 7
             and report["bound_launchers"] == 25
             and report["target_bindings"] == 2
-            and report["appended_launchers"] == (2 if mode == "kv" else 0)
+            and report["appended_launchers"] == (2 if mode == workflow.EXTRA_KEY else 0)
             and (mode == "control" or report["non_target_exact_vs_control"] is True)
             and report["auditor_sha256"] == pair["auditor_sha256"]
             and (manifest["mode"], manifest["rank"]) == (mode, rank)
@@ -78,6 +93,7 @@ def completed_evidence(pair_path):
             == manifest["expected_gpu_config"],
             "incomplete KV serving reference or hardware identity changed",
         )
+        workflow.check_completed_report(report, row, manifest)
         for filename, digest in report["receipts"].items():
             require(sha(filename) == digest, "completed KV AOT receipt changed")
             receipts[str(Path(filename).resolve())] = digest
@@ -89,7 +105,7 @@ def completed_evidence(pair_path):
             folder / "audit.log",
         ):
             receipts[str(p)] = sha(p)
-        fields = {k: manifest[k] for k in COMMON_FIELDS}
+        fields = {k: manifest[k] for k in workflow.COMMON_FIELDS}
         if common is None:
             common = fields
             reference = dict(path=str(path), sha256=sha(path))
@@ -131,22 +147,23 @@ def serving_sources(previous):
     )
 
 
-def prepare(pair_path, output, *, inspect_only=False):
+def prepare(pair_path, output, *, inspect_only=False, workflow=None):
+    workflow = workflow or sys.modules[__name__]
     require(
         not output.exists(),
         "new serving series/report required; preserve previous attempts",
     )
-    old, graphs, reference, receipts = completed_evidence(pair_path)
+    old, graphs, reference, receipts = workflow.completed_evidence(pair_path)
     from benchmarks.kernels.glm53_geometry_workload import reference_evidence
 
     workload, workload_sources, _, _ = reference_evidence()
-    sources, changes = serving_sources(old["sources"])
+    sources, changes = workflow.serving_sources(old["sources"])
     sources.update(receipts)
     sources.update(workload_sources)
     base = copy.deepcopy(old)
     base.update(
-        serving_schema=SERVING_SCHEMA,
-        aot_qualification_sha256=AOT_PAIR_SHA,
+        serving_schema=workflow.SERVING_SCHEMA,
+        aot_qualification_sha256=workflow.AOT_PAIR_SHA,
         aot_pair_path=str(pair_path.resolve()),
         qualified_manifest=reference,
         qualified_graphs=graphs,
@@ -180,7 +197,7 @@ def prepare(pair_path, output, *, inspect_only=False):
     )
     output.mkdir(parents=True)
     rows = []
-    for label, mode in CASES:
+    for label, mode in workflow.CASES:
         folder = output / label
         cache = folder / "cache"
         private = cache / "torch_compile_cache/torch_aot_compile" / base["namespace"]
@@ -188,8 +205,14 @@ def prepare(pair_path, output, *, inspect_only=False):
         copied = {}
         for targets in base["targets"].values():
             for target in targets:
-                kv = target["kv"]
+                kv = target[workflow.EXTRA_KEY]
                 source, dest = Path(kv["source"]), private / kv["relative"]
+                if kv["relative"] in copied:
+                    require(
+                        copied[kv["relative"]] == kv["source_sha256"] == sha(dest),
+                        "shared private source identity differs",
+                    )
+                    continue
                 require(
                     dest.resolve() == dest
                     and dest.is_relative_to(private)

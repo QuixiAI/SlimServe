@@ -35,7 +35,31 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): all-rank indexer AOT/leaf qualification passes
+### Latest checkpoint (2026-09-10): indexer serving integration CPU-qualified
+
+Opt-in `SLIMSERVE_GLM53_INDEXER_CORRECTION=control|correction` now joins the
+completed AOT/leaf receipts to the shared real-profile load/capture/workload
+lifecycle. Qualified correction kernel/loader/ABI bytes remain exact. Separate
+events, schema, CLI/worker admission and offline graph/arena checks; KV remains
+the shared helpers' default policy and its regression tests pass.
+
+The actual scheduler/capture envelope must fit8192 rows. Runtime padded batches
+are checked before forward; DP/DCP/SP/microbatching and multiple worker threads
+are rejected. Startup stream changes synchronize explicitly; live execution must
+keep one stream. Both controls have identical diagnostic instrumentation. Arenas
+retain guarded stable addresses through capture; arbitrary cross-stream calls
+remain unqualified. No production baseline claims from these instrumented timings.
+
+Final CPU554 pass/53.12s,14 upstream warnings; Ruff/diff checks pass. Earlier
+fixture-copy and test-isolation failures are retained and corrected in tests only.
+Inspection joins1,032 source/evidence receipts and5,172 original files; no model
+start yet. NEXT after commit: prepare then exactly control/correction/return-control
+under `perf/results/2026-09-10/indexer-serving-v1/`, per
+`perf/glm53-indexer-serving-protocol.md`. CPU8GiB/serve150GiB, swap0. Freeze sources
+through terminal closure; no retries/replacements or concurrent GPU/native work.
+If a series is running, resume its controller; do not create a replacement.
+
+### Previous checkpoint (2026-09-10): all-rank indexer AOT/leaf qualification passes
 
 The prescribed series on `cf95040f3` completes: control ranks0..3 then correction
 ranks0..3, one private cache/start each, no retries. All480 bound-leaf cases,

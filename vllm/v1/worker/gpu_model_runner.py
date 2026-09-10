@@ -1016,6 +1016,11 @@ class GPUModelRunner(
         from slimserve.index_journal import install_index_journal
 
         install_index_journal(self)
+        from slimserve.indexer_correction_diagnostic import (
+            install as install_indexer_correction,
+        )
+
+        install_indexer_correction(self)
         from slimserve.kv_diagnostic import install as install_kv_diagnostic
 
         install_kv_diagnostic(self)

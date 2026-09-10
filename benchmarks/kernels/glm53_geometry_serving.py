@@ -107,7 +107,9 @@ class ServingGeometry:
             path,
             self.mode,
             emit=lambda row: self.emit(
-                "loader-events" if row["event"].startswith("kv_") else "binary-loads",
+                "loader-events"
+                if row["event"].startswith(("kv_", "indexer_correction_"))
+                else "binary-loads",
                 row,
             ),
         )

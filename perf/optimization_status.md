@@ -27742,3 +27742,33 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/indexer-aot-v1/pair-analysis.json`, SHA
   89fecf567bfe98ebcdb8ae6b948db7ad7387f4492877cba52c1f90ba65206061.
   Full commands and retained per-rank evidence: `perf/glm53-indexer-loader-protocol.md`.
+
+## 2026-09-10 - Integrate qualified indexer correction with real serving lifecycle
+
+- Status: CPU-qualified diagnostic; prescribed model series pending.
+- Baseline/hypothesis: fixed recipe v1/TP4 SM120, original attention combo versus
+  qualified selective indexer correction. Does local cancellation repair preserve
+  model quality? Extra-launch diagnostic, not a proposed speed optimization.
+- Change: reuse KV's completed-evidence preparation/manifest helpers and geometry's
+  real-profile controller/lifecycle. Separate correction schema/flag/event routing,
+  CLI/worker admission and independent graph/arena audit. Qualified live correction
+  kernel/loader/ABI bytes unchanged; no native build, profile or compiler change.
+- Bounds/lifetime: require actual scheduler/capture sizes<=8192; check every real
+  padded batch before forward. Reject parallel microbatches/DP/DCP/SP or multiple
+  worker threads. Explicit startup stream-transition barriers, one live stream,
+  guarded fixed per-binding addresses verified before forward and around capture.
+  Both control arms use identical diagnostic instrumentation; no production TPS.
+- Correctness: final554 CPU tests pass/53.12s,14 upstream warnings. Simulated CUDA
+  driver/allocation, actual Torch AOT/capture interfaces, independent audits and
+  legacy KV/geometry/campaign regressions. Ruff/diff pass. Earlier fixture-copy and
+  nested-registry test pollution corrected in tests; failed reports retained.
+- Evidence: inspection joins1,032 receipts and5,172 original files, no cache/model
+  job. Completed AOT records consumed without expired-source validator reruns.
+- Decision: commit then exactly one control/correction/return start, private caches,
+  three repeats exact1000/300 c1/c8/c16, unchanged quality/text/image/cold32K/128K.
+  CPU8GiB/serve150GiB, swap0; freeze through closure. No retry/replacement or
+  quality-floor/default/quant change. Historical original oracle remains failed.
+- Raw: `runtime-control/indexer-serving-*-cpu*.xml` and
+  `indexer-serving-inspection-v1.json`, under2026-09-10; inspection SHA
+  06d82d9ba34a5e44a574d30bc6d7e6b128e4277770feac89442ced5c59792afb.
+  Exact protocol/commands and CPU failure history: `perf/glm53-indexer-serving-protocol.md`.

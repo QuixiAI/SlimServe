@@ -134,6 +134,18 @@ def test_kv_intervention_is_never_a_baseline(monkeypatch, mode):
     assert "benchmarks/kernels/glm53_kv_loader.py" in sources
 
 
+@pytest.mark.parametrize("mode", ["control", "correction", "invalid"])
+def test_indexer_correction_is_never_a_baseline(monkeypatch, mode):
+    bench = _load(monkeypatch)
+    monkeypatch.setenv("SLIMSERVE_GLM53_INDEXER_CORRECTION", mode)
+    args = SimpleNamespace(routing=False, cuda_traces=False, quality_repeats=1)
+    assert bench.diagnostic_only(args)
+    sources = bench.benchmark_sources()
+    assert "slimserve/indexer_correction_diagnostic.py" in sources
+    assert "benchmarks/kernels/glm53_indexer_correction_serving.py" in sources
+    assert "benchmarks/kernels/glm53_indexer_correction_loader.py" in sources
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_deterministic_plan_and_server_command_agree(monkeypatch, tmp_path, enabled):
     from slimserve.hardware import Machine

@@ -4,6 +4,7 @@
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from slimserve import glm53_ordering, rmsnorm_diagnostic, rmsnorm_geometry
@@ -28,19 +29,22 @@ def validate_environment():
         raise ValueError("KV cannot combine with the RMSNorm geometry diagnostic")
 
 
-def read_manifest():
+def read_manifest(*, workflow=None, preparation=None):
     from benchmarks.kernels.check_glm53_attention_norms import require, verify
-    from benchmarks.kernels.glm53_kv_loader import SCHEMA
-    from benchmarks.kernels.prepare_glm53_kv_serving import (
-        COMMON_FIELDS,
-        completed_evidence,
-        serving_sources,
-    )
+    from benchmarks.kernels.glm53_kv_loader import SCHEMA as KV_SCHEMA
 
-    selected = mode()
-    validate_environment()
-    require(bool(selected) and bool(os.getenv(MANIFEST)), "KV manifest required")
-    path = Path(os.environ[MANIFEST]).resolve()
+    if preparation is None:
+        from benchmarks.kernels import prepare_glm53_kv_serving as preparation
+    workflow = workflow or sys.modules[__name__]
+    schema = getattr(workflow, "SCHEMA", KV_SCHEMA)
+
+    selected = workflow.mode()
+    workflow.validate_environment()
+    require(
+        bool(selected) and bool(os.getenv(workflow.MANIFEST)),
+        "diagnostic manifest required",
+    )
+    path = Path(os.environ[workflow.MANIFEST]).resolve()
     data = json.loads(path.read_text())
     private, original = (
         Path(data["private_namespace"]),
@@ -48,18 +52,18 @@ def read_manifest():
     )
     cache = path.parent / "cache"
     require(
-        data["serving_schema"] == SERVING_SCHEMA
-        and data["schema"] == SCHEMA
+        data["serving_schema"] == workflow.SERVING_SCHEMA
+        and data["schema"] == schema
         and data["mode"] == selected
         and data["namespace"] == rmsnorm_diagnostic.NAMESPACE
-        and data["aot_qualification_sha256"] == AOT_PAIR_SHA
+        and data["aot_qualification_sha256"] == workflow.AOT_PAIR_SHA
         and data["cache_root"] == str(cache)
         and private
         == cache / "torch_compile_cache/torch_aot_compile" / data["namespace"]
         and data["receipts"] == str(path.parent / "receipts")
         and data["worker_receipts"] == str(path.parent / "worker-receipts")
         and path.parent.name == data["label"]
-        and (data["label"], selected) in CASES,
+        and (data["label"], selected) in workflow.CASES,
         "unexpected KV serving manifest or private paths",
     )
     require(
@@ -71,35 +75,37 @@ def read_manifest():
         and os.getenv("TORCHINDUCTOR_CACHE_DIR") == str(private / "inductor_cache"),
         "KV requires exact nonoverlapping private caches",
     )
-    preparation = json.loads((path.parent.parent / "preparation.json").read_text())
+    prepared = json.loads((path.parent.parent / "preparation.json").read_text())
     require(
-        preparation["status"] == "prepared"
-        and preparation["sources"] == data["sources"]
-        and preparation["integration_changes"] == data["integration_changes"]
-        and preparation["git_commit"]
+        prepared["status"] == "prepared"
+        and prepared["sources"] == data["sources"]
+        and prepared["integration_changes"] == data["integration_changes"]
+        and prepared["git_commit"]
         == data["git_commit"]
         == subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        and [(r["label"], r["mode"]) for r in preparation["runs"]] == list(CASES),
+        and [(r["label"], r["mode"]) for r in prepared["runs"]] == list(workflow.CASES),
         "prepared KV serving identity or case order changed",
     )
-    for row in preparation["runs"]:
+    for row in prepared["runs"]:
         expected = path.parent.parent / row["label"] / "manifest.json"
         require(
             row["manifest"] == str(expected)
             and row["manifest_sha256"] == rmsnorm_diagnostic.sha(expected),
             "prepared KV serving manifest changed",
         )
-    qualified, graphs, reference, receipts = completed_evidence(
+    qualified, graphs, reference, receipts = preparation.completed_evidence(
         Path(data["aot_pair_path"])
     )
-    sources, changes = serving_sources(qualified["sources"])
+    sources, changes = preparation.serving_sources(qualified["sources"])
     sources.update(receipts)
     require(
         data["qualified_manifest"] == reference
         and data["qualified_graphs"] == graphs
         and data["integration_changes"] == changes
         and all(data["sources"].get(p) == h for p, h in sources.items())
-        and all(data[k] == qualified[k] for k in COMMON_FIELDS if k != "sources"),
+        and all(
+            data[k] == qualified[k] for k in preparation.COMMON_FIELDS if k != "sources"
+        ),
         "KV serving differs from completed AOT qualification",
     )
     verify(data)
