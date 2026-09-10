@@ -306,8 +306,13 @@ class FreeKVCacheBlockQueue:
         curr_block = self.fake_free_list_head.next_free_block
         # Pop n blocks from the head of the list
         ret = []
-        for _ in range(n):
-            assert curr_block is not None
+        for i in range(n):
+            if curr_block is None:
+                raise RuntimeError(
+                    "FreeKVCacheBlockQueue.popleft_n: free list ended after "
+                    f"{i} blocks but num_free_blocks claimed {self.num_free_blocks + n} "
+                    f"(asked for {n}); the count and the list have diverged"
+                )
             ret.append(curr_block)
             last_block = curr_block
             curr_block = curr_block.next_free_block

@@ -704,6 +704,16 @@ class BlockPool:
         self._emit_block_removed_events(evicted_hashes)
         return True
 
+    def _check_owned(self, block: KVCacheBlock, where: str) -> None:
+        """Every list/refcount operation must go through the block's own
+        pool: unlinking a block from another pool's free list leaves that
+        pool's count ahead of its list (popleft_n then walks off the end)."""
+        if block.pool_id != self.pool_id and not block.is_null:
+            raise RuntimeError(
+                f"BlockPool.{where}: block {block.block_id} belongs to pool "
+                f"{block.pool_id}, not pool {self.pool_id}"
+            )
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -713,6 +723,7 @@ class BlockPool:
             blocks: A list of blocks to touch.
         """
         for block in blocks:
+            self._check_owned(block, "touch")
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
@@ -738,6 +749,7 @@ class BlockPool:
         blocks_with_hash = []
         blocks_without_hash = []
         for block in ordered_blocks:
+            self._check_owned(block, "free_blocks")
             block.ref_cnt -= 1
             if block.ref_cnt < 0 and not block.is_null:
                 raise RuntimeError(
