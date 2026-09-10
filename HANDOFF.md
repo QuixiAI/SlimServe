@@ -35,7 +35,27 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): multi-source mechanics and exact discovery ready
+### Latest checkpoint (2026-09-10): source-exact geometry probe/auditor implemented
+
+`benchmarks/kernels/check_glm53_rmsnorm_geometry.py` implements preparation,
+source-exact run, offline per-process audit and independent-process comparison.
+All26 original-source/config bindings compile and verify BEFORE numerical work;
+control requires original whole-cubin bytes. Matrix312 pairs/process retains
+all numerical failures, with the unchanged FP64<=1 BF16 ULP gate. Rank-private
+caches and original debug identities; no timed autotuning. B is gated on A's
+successful audit AND unchanged source/binary artifacts. Serving code unchanged.
+
+Final related CPU suite224 passed5.72s; lint/diff pass. Report
+`runtime-control/rmsnorm-geometry-probe-final-cpu.xml` under2026-09-10.
+
+NEXT after commit: prepare ONE new manifest, then the prescribed
+A/audit/B/audit/pair-audit in `perf/glm53-rmsnorm-geometry-protocol.md`. B only if
+A passes; never retry either arm. Freeze through the pair/audits,16GiB probes/
+8GiB audits/swap0, one GPU workload at a time. No model or real-AOT multi-target
+loader job prescribed yet. Actual geometry candidate binaries remain unqualified
+until this pair passes. All older stopped series stay terminal; goal ongoing.
+
+### Previous checkpoint (2026-09-10): multi-source mechanics and exact discovery ready
 
 CPU-only multi-source diagnostic implemented under `benchmarks/kernels/`, NOT
 wired into serving. One atomic resolver covers concurrent aliases without repeated

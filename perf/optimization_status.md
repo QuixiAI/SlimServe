@@ -26697,3 +26697,32 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   71a570836980643a2f537635402167e16ec8fb16db64699377ce6f040d423d55
   and `rmsnorm-geometry-cpu.xml` retained; final discovery differs only by its
   controller source receipt after the two additional negative gates.
+
+## 2026-09-10 - Implement source-exact broader geometry qualification
+
+- Status: probe/auditor implemented; fixed two-process kernel pair prescribed,
+  not yet launched. No model or real-AOT multi-source qualification yet.
+- Baseline/hypothesis: thirteen original4096 sources can isolate geometry from
+  attention combos/fresh KDA choices, provided both binary/config and numerical
+  behavior are qualified before intervention.
+- Change: compile all26 source/config bindings before numerical work, direct
+  explicit configs/no timed tuning, rank-private caches and original debug
+  identities. Original control key/whole cubin must match; record candidate key/
+  bytes independently.312 pairs/process using the existing rows/seeds/three real
+  checkpoint-weight sites, eager/replay/guard/mutation helpers and FP64 oracle.
+  Preserve the full numerical matrix even on ULP failures; do not widen gates.
+- Audit: metadata/config/key and whole disk/in-memory binary agreement, exact
+  matrix/phase/rank/hash/metric consistency, all source receipts and original
+  files unchanged. B requires A's successful audited result and rechecked source/
+  binary files; final pair comparison requires exact outputs/metrics/binaries.
+- CPU: initial related144 tests pass1.50s in8GiB/swap0; lint/diff pass. No new
+  numerical/GPU/performance evidence. Tests include incomplete matrices, fake
+  verdicts, changed binaries/metadata, nonfinite metrics and failed-A gating.
+- Decision: after final tests/commit, prepare once and run the bounded A/audit/
+  B/audit/pair-audit.16GiB probes/8GiB CPU/swap0; freeze through all audits, no
+  retries/edits/builds/commits/other GPU work. Stop pair on any gate failure.
+- Raw: `runtime-control/rmsnorm-geometry-probe-cpu.xml` under2026-09-10.
+  Commands/paths: `perf/glm53-rmsnorm-geometry-protocol.md`; new series root
+  `perf/results/2026-09-10/rmsnorm-geometry-source-qualification/`.
+- Final related CPU224 passed5.72s, lint/diff pass; report
+  `runtime-control/rmsnorm-geometry-probe-final-cpu.xml`. Sources ready to freeze.

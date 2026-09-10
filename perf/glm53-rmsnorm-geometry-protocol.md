@@ -1,9 +1,9 @@
 # GLM53 broader RMSNorm geometry isolation
 
-Status: CPU preparation complete on 2026-09-10. No GPU job or model series is
-prescribed by this document yet. The steps below define the pending qualification
-work, not permission to run incomplete tooling. All earlier stopped series remain
-terminal; never reuse their unlaunched arms.
+Status: source-exact numerical probe/auditor implemented on 2026-09-10. The
+two-process kernel pair below is prescribed after the final CPU checks and commit.
+No model series or real-AOT loader job is prescribed yet. All earlier stopped
+series remain terminal; never reuse their unlaunched arms.
 
 ## Question and fixed factors
 
@@ -47,16 +47,16 @@ All raw paths above are under `perf/results/2026-09-10/`.
 Static old graph uses are discovery evidence, not proof of historical live
 coverage or of a working new hook. No throughput was measured here.
 
-## Next implementation: source-exact numerical qualification
+## Source-exact numerical qualification
 
-Implement a dedicated probe using the discovered thirteen ORIGINAL sources,
+The dedicated probe uses the discovered thirteen ORIGINAL sources,
 the provenance-preserving loader and rank-private Triton cache scopes from
 `check_glm53_attention_norms.py`, and the existing in-place/triple-output oracle,
 guard, eager-repeat and changed-input replay helpers from
 `check_glm53_cached_rmsnorm.py`. Keep generated metadata unchanged. Compile the
 two explicit configurations directly; do not call timed autotuning.
 
-Planned bounded matrix, to freeze with implemented/tested commands before launch:
+Bounded matrix, frozen with the commands below before launch:
 
 - Two fresh, sequential processes A/B, independent empty private caches.
   Run B only after A and its audit pass; no replacement starts or retries.
@@ -77,9 +77,59 @@ Planned bounded matrix, to freeze with implemented/tested commands before launch
   audits. One GPU workload at a time; 16 GiB/no-swap probes, 8 GiB audits.
   Preserve every artifact and verify all original cache files remain unchanged.
 
-Before launching, implement the probe and auditor, test their negative gates,
-record exact fresh output paths/commands and commit the frozen sources. The
-discovery artifact currently lacks qualified geometry binary receipts on purpose.
+Implementation: `benchmarks/kernels/check_glm53_rmsnorm_geometry.py`, with
+negative-gate tests in `tests/slimserve/test_rmsnorm_geometry_probe.py`. The
+discovery artifact lacks qualified geometry binary receipts on purpose; this
+probe establishes them. It also checks compiler metadata against each key/config,
+in-memory cubins against disk bytes, exact output/metric phase coverage, and the
+entire source freeze. B is programmatically gated on A's successful numerical
+audit, unchanged summary, and rechecked source/binary artifacts.
+
+After CPU tests and source commit, prepare once in an 8 GiB/no-swap scope:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-probe-prepare -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry prepare \
+  --discovery perf/results/2026-09-10/runtime-control/rmsnorm-geometry-final-discovery.json \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json \
+  --series-root perf/results/2026-09-10/rmsnorm-geometry-source-qualification
+```
+
+Exactly one process A, then its audit. Preserve stdout/stderr and exit statuses:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-source-a -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm a
+systemd-run --user --scope --unit=glm53-geometry-source-a-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm a
+```
+
+Only after A passes and the independent GPU query is empty, exactly one B:
+
+```bash
+systemd-run --user --scope --unit=glm53-geometry-source-b -p MemoryMax=16G -p MemorySwapMax=0 \
+  env CUDA_HOME=/usr/local/cuda-13.0 PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 \
+  .venv/bin/python -m benchmarks.kernels.check_glm53_rmsnorm_geometry run \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-source-b-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry audit \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json --arm b
+systemd-run --user --scope --unit=glm53-geometry-source-pair-audit -p MemoryMax=8G -p MemorySwapMax=0 \
+  env PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python \
+  -m benchmarks.kernels.check_glm53_rmsnorm_geometry compare \
+  --manifest perf/results/2026-09-10/runtime-control/rmsnorm-geometry-probe-manifest.json
+```
+
+Any structural, binary, freeze, or numerical failure terminates this pair;
+preserve its partial/full evidence and audit before any new design. No code
+edits, builds, commits or other GPU work between preparation and final audit.
+Do not interpret these source probes as actual graph-loader or model validation.
 
 ## Subsequent gates, not yet prescribed
 
