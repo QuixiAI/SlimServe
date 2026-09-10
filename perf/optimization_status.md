@@ -27372,3 +27372,27 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   claim; actual graph-loader coverage is a subsequent required integration step.
 - Raw: `perf/results/2026-09-10/runtime-control/kv-overwrite-{cpu,final-cpu,receipts-cpu}.xml`.
   Commands/matrix/failure policy: `perf/glm53-attention-isolation.md`; GPU pending.
+
+## 2026-09-10 - KV-only adapter passes exact-output and graph-replay qualification
+
+- Status: isolated adapter qualification complete; no serving/default change.
+- Baseline/workload: `f6ff10453`, original combo + split-KV overwrite versus
+  original/direct split, exactly one process, 120 prescribed cases on rank-matched
+  SM120 GPUs sequentially. Driver 580.173.02/CUDA13/600W unchanged; 16GiB/swap0.
+- Results: KV matches direct split across 203,390,976 BF16 values, reproducing
+  exactly 556 historical changes from original. Q/indexer preserve all
+  610,172,928 / 50,847,744 values. All input/original/direct hashes match history.
+  KV <=1 BF16 ULP; eager/replay/mutation/row-guard/stride-gap checks all pass.
+- Evidence limits: unchanged indexer output does not clear its earlier oracle
+  failure. Source-level adapter replay does not prove serving-loader coverage or
+  full-model causality. Extra launch is diagnostic, not a speed implementation.
+- Closure: probe/audit exit0; eight actual binaries, 202 frozen receipts and
+  5,172 original files verify. GPUs released; source freeze ended. No retry,
+  omitted case, autotuning, model execution or build. CPU final 88pass/3.84s.
+- Decision: qualify actual graph-loader bindings/coverage next, including both
+  launchers and cached fast-path behavior, before original/KV/return serving.
+  No next GPU/model job prescribed, no TPS/quant/default/quality-gate promotion.
+- Raw: `perf/results/2026-09-10/kv-overwrite-v1/analysis.json`, SHA
+  bfaa7a495e7b69f228661a4402f5a6d5229d53b6950b6e7ee8cfa6275975144d;
+  all 120 case records, eight binary receipts/caches and source copies retained.
+  Full result and historical commands: `perf/glm53-attention-isolation.md`.

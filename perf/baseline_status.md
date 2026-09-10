@@ -1941,6 +1941,9 @@ the mixed BF16/FP32 state outputs: all compared values are bit-exact, exact
 algebraic/replay/guard checks pass. Conditioned errors remain observations. No
 new model TPS/default promotion; remaining attention/normalization causality and
 the separate failed indexer LayerNorm oracle gate are still open.
+The subsequent KV-only overwrite adapter passes 120 isolated cases on `f6ff10453`:
+split KV reproduced exactly, Q/indexer unchanged, KV oracle/replay/guards pass.
+Actual graph-loader and model qualification remain pending; no new TPS baseline.
 
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 

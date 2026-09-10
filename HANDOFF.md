@@ -35,19 +35,29 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): KV-only adapter ready for isolated qualification
+### Latest checkpoint (2026-09-10): KV-only adapter isolated qualification PASSES
 
-`KVOnlyOverwrite` retains the original combo ABI and appends only split KV, with
-no tensor copies or serving installation. Probe checks exact non-KV preservation,
-direct KV equality, historical output hashes, existing KV oracle, changed-input
-graph replay and guards. All eight rank-private binaries are checked before
-numerics. CPU final 88 passed in 3.84 s; prior 39/87-pass reports retained.
+On `f6ff10453`, exactly one rank-sequential GPU process completes all 120 cases;
+probe/audit exit0. Adapter KV matches direct split KV over 203,390,976 BF16 values,
+with exactly 556 changes from original. Q/indexer remain exact over
+610,172,928 / 50,847,744 values. Input/original/direct-KV hashes match the completed
+historical matrix. KV <=1 BF16 ULP, eager/changed-input graph replay/guards pass.
+The separate indexer LayerNorm oracle failure remains FAILED; no model-quality
+or performance qualification follows from this adapter test.
 
-NEXT after commit: exactly one preparation/GPU process/audit prescribed at
-`perf/glm53-attention-isolation.md` tail. 120 cases, GPUs 0..3 sequentially,
-16 GiB probe/8 GiB CPU/swap0, source freeze through closure. No v1 manifest/cache
-or GPU job created yet. No model start/native build/tuning/retry; all old failures
-stay failed. Actual graph-loader integration remains AFTER this qualification.
+All eight actual rank-private cubins, 202 frozen receipts and 5,172 original
+cache files verify. GPUs released, hardware unchanged, source freeze ended.
+No retries, omissions, autotuning, model starts or native builds. CPU 88 passed
+in 3.84 s. Raw `perf/results/2026-09-10/kv-overwrite-v1/analysis.json`, SHA
+bfaa7a495e7b69f228661a4402f5a6d5229d53b6950b6e7ee8cfa6275975144d.
+Consume the completed receipt after further edits, not its frozen validator.
+
+NEXT: implement actual graph-loader binding/coverage for this qualified adapter
+using the existing binary observer and actual AOT-root inventory. Source-level
+graph replay is not actual serving-loader qualification. Inspect both original
+and appended launchers and all non-target bindings before capture; do not let
+Inductor's cached fast launcher bypass the intervention. No next GPU/model job
+prescribed. Plan: `perf/glm53-attention-isolation.md`; production defaults unchanged.
 
 ### Previous checkpoint (2026-09-10): attention graph boundaries mapped
 

@@ -75,7 +75,7 @@ No next GPU/model run is prescribed by this design note. Finalize commands,
 repetitions and failure handling before launch. Do not revive any terminal
 series, weaken the indexer oracle gate or benchmark until a fast start appears.
 
-## KV overwrite adapter v1: prescribed isolated qualification
+## KV overwrite adapter v1: completed qualification (commands historical)
 
 `benchmarks/kernels/glm53_attention_overwrite.py` retains the original eleven-arg
 combo ABI, calls the precompiled original, then the precompiled split KV launcher
@@ -119,3 +119,44 @@ systemd-run --user --scope --unit=glm53-kv-overwrite-v1-audit -p MemoryMax=8G -p
 
 No full-model run is yet prescribed. Even a passing adapter probe still needs
 actual graph-loader binding/coverage verification before serving integration.
+
+## Completed adapter v1 result
+
+On `f6ff10453`, exactly one process completes all 120 prescribed cases, then its
+audit passes. All eight source/config/actual whole-cubin bindings verify before
+numerics. At closure, 202 source/evidence hashes and all 5,172 original cache
+files remain unchanged; GPU release and device/driver/power identity verify.
+No retries, excluded cases, autotuning, model starts or native builds. The source
+freeze has ended. CPU final 88 passed in 3.84 s; earlier 39/87-pass reports retained.
+
+| Output | Compared BF16 values, both phases | Adapter vs intended result | Adapter vs original |
+| --- | ---: | ---: | ---: |
+| KV512 | 203,390,976 | 0 differences from direct split KV | 556 differences |
+| Q1536 | 610,172,928 | 0 differences from original | 0 differences |
+| Indexer K128 | 50,847,744 | 0 differences from original | 0 differences |
+
+All input hashes, original output hashes and direct-KV hashes exactly match the
+retained historical matrix. The 556 KV changes reproduce its per-case counts.
+KV's existing float64-oracle gate passes with maximum one BF16 ULP. Every eager,
+original/changed-input graph replay, mutation, row-guard and stride-gap check
+passes. The adapter only changes the prescribed output on these inputs.
+
+The indexer LayerNorm accuracy gate remains FAILED. Its unchanged output is
+not newly accuracy-qualified. This is adapter functional qualification, not
+actual serving-loader coverage, full-model causality, universal accuracy or a
+speedup. No profile/default/quant/quality-floor change.
+
+Raw `perf/results/2026-09-10/kv-overwrite-v1/`: 120 case records, eight binary
+receipts/private caches, source copies, attempt marker, summary and analysis.
+Analysis SHA `bfaa7a495e7b69f228661a4402f5a6d5229d53b6950b6e7ee8cfa6275975144d`;
+summary SHA `aa26ada81eda043f410dbc81d31c85877f9277eb8fc1019b2c836fd925aaa5c6`.
+Consume these completion receipts after later edits; do not rerun the now-
+historical frozen-manifest commands.
+
+Next: actual graph-loader adapter and all-rank binding/coverage qualification.
+Reuse the existing binary observer and serialized AOT-root inventory. Verify the
+original combo and appended KV launchers, source/config/whole-cubin receipts,
+complete graph coverage and unchanged non-target bindings. The installed
+`CachingAutotuner.run` has a cached-launcher fast path; explicitly verify that
+the live call path cannot bypass the overwrite. Only then prescribe the bounded
+original/KV/return real-profile series. No next GPU/model job is prescribed yet.
