@@ -405,3 +405,36 @@ floors. Preparation begins the freeze; terminal closure ends it. Full commands,
 resource limits, qualification boundaries and failure policy are in
 `perf/glm53-kv-serving-protocol.md`. No TPS/default/quant or failed indexer-oracle
 promotion follows from CPU tests.
+
+## KV-only full-model result: rejected, reversible, not the no-combo vector
+
+On `c42b72325`, exactly control/KV/return-control complete with all serve/audit exits
+zero and complete final closure. All ranks pass before-forward and capture
+binding checks; original/appended KV identities verify, all 92 non-target AOT
+bindings match, and return-control restores the full original inventory.
+
+Both controls reproduce historical per-token text and needle scores exactly in
+all three repeats. KV repeats exactly but fails 15/32 unchanged quality windows
+each time, and does not reproduce the failed no-combo vector. All six needle tests
+still rank correct first. KV changes all 4,096 text scores: mean delta -0.00916196,
+mean absolute delta 0.24100639, max absolute delta 5.25359750. Local <=1-ULP source
+qualification was not sufficient for this full-model quality gate.
+
+All 27 exact-token timing rounds, nine quality passes, text/image canaries and
+cold 32K/128K tests retained. Diagnostic E2E c1/c8/c16 medians: control
+157.332/580.279/778.425, KV 156.585/577.794/778.805, return
+156.728/578.758/778.591 tok/s. No speed win or new baseline. No model retry,
+replacement start, native build, quant/default change or relaxed quality floor.
+
+Closure verifies 386 frozen receipts and 5,172 original files, GPU release and
+unchanged hardware/driver/600 W settings. Freeze ended before notebook edits.
+Raw `kv-serving-v1/closure.json`, SHA
+a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588,
+under `perf/results/2026-09-10/`. Full commands, ranges and limitations:
+`perf/glm53-kv-serving-protocol.md`. Do not rerun completed source-frozen readers.
+
+Preserve original attention arithmetic for production tuning. KV alone is not
+the full no-combo explanation; isolated model effects need not add linearly.
+The separate indexer LayerNorm128 affine-cancellation oracle failure remains open
+(max 5/28 BF16 ULP original/split). Inspect its retained worst-element evidence
+before another replacement. No next GPU/model job prescribed yet.

@@ -35,7 +35,38 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): KV serving integration CPU-qualified
+### Latest checkpoint (2026-09-10): KV-only model comparison complete; candidate rejected
+
+On `c42b72325`, exactly control/KV/return-control completed, one private cache and
+one start each. All serving/worker/workload audits and final closure passed. Both
+controls reproduce historical text/needle vectors exactly in all three repeats.
+KV repeats exactly but fails 15/32 unchanged quality windows in every repeat;
+it does NOT reproduce the failed no-combo vector. All 92 non-target AOT bindings
+match across arms; return-control restores every original binding. No production
+default, quant, native binary, quality-floor or failed indexer-oracle change.
+
+Diagnostic E2E medians c1/c8/c16: control 157.332/580.279/778.425 tok/s;
+KV 156.585/577.794/778.805; return 156.728/578.758/778.591. No speed win or new
+baseline. All 27 exact-token rounds, nine quality passes, text/image canaries and
+cold 32K/128K tests retained. No model retry, replacement or omitted case.
+
+Closure verifies 386 frozen receipts and 5,172 original files; GPUs released,
+UUID/driver/600 W settings unchanged. Source freeze ended before notebook edits.
+Raw `perf/results/2026-09-10/kv-serving-v1/closure.json`, SHA
+`a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588`.
+Commands are historical now; consume completed receipts after later edits rather
+than rerunning their frozen readers. CPU gate remains 628 pass/52.07 s.
+
+NEXT: preserve original attention arithmetic for production tuning. KV alone has
+a reproducible model-quality effect but is not the complete no-combo explanation;
+do not combine isolated results as if their effects were additive. The independent
+indexer LayerNorm128 oracle still fails from affine cancellation (documented
+max 5/28 BF16 ULP original/split); investigate its precision with the retained
+worst-element evidence before proposing another replacement. No further GPU/model
+job is prescribed yet. Campaign goal and production startup-variability work remain
+open. Full results and limitations: `perf/glm53-kv-serving-protocol.md`.
+
+### Previous checkpoint (2026-09-10): KV serving integration CPU-qualified
 
 The opt-in KV policy now shares the geometry serving lifecycle/workload/controller.
 Actual root modules feed KV seal/verify; original and appended launch receipts are

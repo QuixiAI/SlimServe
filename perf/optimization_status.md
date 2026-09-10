@@ -27540,3 +27540,36 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   under 2026-09-10; source inspection SHA
   db8c8a056a7b44d7145593963c5f7d6a97574eb6b2197b9bb3663b891d8e0cd1.
   Prospective series/commands: `perf/glm53-kv-serving-protocol.md`.
+
+## 2026-09-10 - KV-only model comparison closes; reject quality regression
+
+- Status: full diagnostic comparison complete; candidate rejected.
+- Baseline/workload: `c42b72325`, fixed recipe v1/SM120 TP4 Marlin. Exactly one
+  control, one KV and one return-control start, independent caches, three repeats
+  each. CPU 8 GiB/serve 150 GiB, swap0; unchanged driver/GPU/600 W settings.
+- Hypothesis: isolate the source/AOT-qualified split-KV arithmetic while keeping
+  original Q/indexer and other AOT bindings; test score contribution/reversibility,
+  not an extra-launch production speedup.
+- Correctness: all serving and independent worker/workload audits pass. Both
+  controls match historical per-token text/needle vectors exactly in all repeats.
+  KV repeats exactly but fails 15/32 unchanged quality windows every time; it does
+  NOT reproduce the failed no-combo vector. Correct needle answers remain first.
+  All 92 non-target AOT bindings match, return restores the complete original
+  inventory. Local one-ULP source qualification did not ensure model quality.
+- Measurements: all 27 exact1000/300 rounds (225 requests), nine quality passes,
+  text/image and cold 32K/128K complete. E2E c1/c8/c16 medians: control
+  157.332/580.279/778.425, KV 156.585/577.794/778.805, return
+  156.728/578.758/778.591 tok/s. Cold prefill medians 2580.919/10880.784,
+  2587.057/10908.757, 2585.712/10903.597 ms. Full ranges in protocol. No speed win.
+- Closure: 386 frozen receipts and 5,172 original files verify; GPUs released,
+  hardware configuration unchanged. Freeze ended before notebook edits. No model
+  retries/replacements, native build, quant/default change or quality relaxation.
+  Earlier optional CPU-wrapper import failure retained; no case/source mutation.
+- Decision: reject candidate, retain only as explicit diagnostic. Preserve
+  original attention arithmetic for tuning; isolated arithmetic effects need not
+  add linearly. Independent indexer LayerNorm128 cancellation/oracle issue stays
+  failed; inspect retained precision evidence next. No new GPU/model job prescribed.
+- Raw: `perf/results/2026-09-10/kv-serving-v1/closure.json`, SHA
+  a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588.
+  All manifests/caches/logs/worker/workload/launch/audit artifacts retained.
+  Commands/results: `perf/glm53-kv-serving-protocol.md`. CPU gate 628 pass/52.07 s.

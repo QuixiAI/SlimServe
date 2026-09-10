@@ -1954,6 +1954,17 @@ TPS tables and the failed indexer oracle gate are unchanged. Pair receipt:
 `kv-aot-qualification-v2/pair-analysis.json` under 2026-09-10, SHA
 e650a2a5f806085ab6f748169b1d54cf8950a2fd7656dfeda11d5e6f25a018f7.
 
+Subsequent KV-only full-model series completes on `c42b72325`: exactly
+control/KV/return-control, all load/capture/workload audits and closure pass.
+Both controls reproduce original per-token scores exactly; KV repeats exactly
+but fails 15/32 unchanged quality windows and does not reproduce no-combo.
+All 92 non-target AOT bindings remain exact. Candidate rejected; no new speed
+baseline/default/quant or indexer-oracle promotion. Diagnostic c1/c8/c16 medians
+are 157.332/580.279/778.425 (control), 156.585/577.794/778.805 (KV),
+156.728/578.758/778.591 (return). Stable tables below remain unchanged.
+Raw `kv-serving-v1/closure.json` under 2026-09-10, SHA
+a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

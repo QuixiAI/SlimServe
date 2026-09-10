@@ -1,8 +1,10 @@
 # KV-only real-model causal comparison
 
-Implementation CPU gate passed: 628 tests in 52.07 s, 14 upstream Torch warnings.
-Actual model load/capture, quality and performance remain untested. After committing
-this protocol, the v1 series below is prescribed once with no replacement starts.
+Completed on `c42b72325`: exactly control/KV/return-control, all audits and final
+closure pass. KV fails 15/32 unchanged quality windows, repeating exactly; both
+controls reproduce original per-token scores exactly. Candidate rejected. No
+production/default/quant promotion or speed win. Source freeze ended. The commands
+below are historical, not instructions to rerun a completed attempt.
 
 ## Hypothesis and fixed scope
 
@@ -54,7 +56,7 @@ sources stay exact. The offline KV auditor's serving lifecycle option and the
 closed attention notebook are the only explicitly released former sources.
 All new integration/client/protocol sources and completed evidence are frozen.
 
-## Prospective workload and terminal conditions
+## Executed workload and terminal conditions
 
 Exactly control / KV / return-control, one start and private namespace each,
 three measurements at each c1/c8/c16, exact1000 input/300 output, cold-prefix;
@@ -76,7 +78,7 @@ terminal source/cache/receipt/hardware/release checks complete. Any interruption
 stops only the uniquely named owned scope. Record complete or terminal-failure
 closure, preserve all raw files and only then end the source freeze.
 
-## CPU gate and prescribed v1 commands
+## CPU gate and executed v1 commands (historical)
 
 CPU reports under `perf/results/2026-09-10/runtime-control/`:
 `kv-serving-initial-cpu.xml` retains the eleven fixture cache-path failures;
@@ -116,3 +118,67 @@ cases. It checks frozen sources/original files, preserved attempted-case files,
 GPU release and qualified UUID/driver/power; model success additionally requires
 all worker and workload audits. Stop if another GPU workload is active. No edits,
 builds or commits during this series. Commit measured results only after closure.
+
+## Completed v1 result
+
+Exactly three prescribed model processes on `c42b72325`, one per arm, through the
+real `glm53-nvfp4-4` / `rtx6000` profile. All serve/audit exits are zero; final
+closure is complete. Each rank verifies seven AOT roots/46 entries, 25 original
+launchers and two target graph bindings before forward and before/after capture.
+The candidate's original combo and appended KV binary identities both verify.
+All 92 non-target AOT bindings match; return-control restores the complete original
+binding inventory. This is AOT-root coverage, not an assertion that every later
+non-root runtime kernel was independently compared across processes.
+
+All 27 exact1000/300 timing rounds (225 requests), nine quality passes, text/image
+canaries and cold 32K/128K tests complete. Both controls reproduce all historical
+per-token text/needle scores exactly, including all repetitions. KV's three
+complete score vectors are also identical to one another, but each fails 15 of
+32 unchanged quality windows. All six needle tests still rank the correct answer
+first. Mean text logprob: original -2.727814820100083, KV -2.7369767803805773.
+All 4,096 text and 168 needle scores change; text mean absolute delta 0.2410064,
+max absolute delta 5.2535975. Small aggregate mean drift is not proof of stable
+individual predictions. KV does not reproduce the failed no-combo vector.
+
+Diagnostic E2E tok/s, median [min, max] of three repetitions per cell:
+
+| Arm | c1 | c8 | c16 |
+| --- | ---: | ---: | ---: |
+| Control | 157.332 [157.063,157.369] | 580.279 [577.965,580.348] | 778.425 [776.320,781.881] |
+| KV | 156.585 [156.438,156.748] | 577.794 [576.835,578.856] | 778.805 [777.704,781.233] |
+| Return-control | 156.728 [156.487,156.921] | 578.758 [578.743,579.569] | 778.591 [772.706,781.845] |
+
+Cold prefill engine scheduled-to-first-token ms, median [min, max]:
+
+| Arm | 32K | 128K |
+| --- | ---: | ---: |
+| Control | 2580.919 [2577.827,2582.692] | 10880.784 [10844.034,10916.345] |
+| KV | 2587.057 [2584.781,2589.216] | 10908.757 [10869.901,10942.119] |
+| Return-control | 2585.712 [2583.806,2588.888] | 10903.597 [10865.301,10939.129] |
+
+Startup 164.083/162.111/160.092 s in prescribed order. The extra-launch candidate
+has no speed win and fails quality; retain only as quarantined diagnostic code.
+No new baseline, native build, production/default/quant change or quality-floor
+relaxation. The independent indexer LayerNorm128 oracle remains failed.
+
+Closure verifies all 386 frozen source/evidence receipts, 5,172 original files,
+preserved per-case inventories, GPU release and identical UUID/driver/600 W
+configuration. Source freeze ended before recording these results. Raw root
+`perf/results/2026-09-10/kv-serving-v1/`, closure SHA
+`a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588`.
+All three manifests, caches, launch logs, worker graph/binary/lifecycle receipts,
+workload JSON and audits remain retained. No model retries or replacement starts.
+
+Before model work, an optional CPU-only `runpy` wrapper omitted the direct script's
+`benchmarks/` import directory and failed importing `benchmark_dsv4_exact`.
+Correcting only that wrapper let all three real client/profile/manifest checks
+pass before output creation/tokenizer/model. Neither invocation consumed a case
+or changed frozen sources/caches. Both `client-preflight-v{1,2}.json` records are
+retained. This was not a serving restart or a kernel/source change.
+
+Decision: retain original attention arithmetic for production tuning. The KV-only
+intervention is a reversible contributor to model score changes on this workload,
+not the full no-combo explanation. Do not assume arithmetic effects are additive
+across H4096/KV/indexer changes. Next inspect the retained indexer affine-cancellation
+evidence and precision choices under the existing oracle gate, before qualifying
+another replacement. No further GPU/model process is prescribed by this result.
