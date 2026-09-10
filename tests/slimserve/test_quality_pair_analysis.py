@@ -4,7 +4,7 @@ import statistics
 
 import pytest
 
-from benchmarks.analyze_glm53_quality_pair import compare
+from benchmarks.analyze_glm53_quality_pair import compare, compare_observations
 from benchmarks.benchmark_glm53_quality import CODES
 
 
@@ -133,6 +133,17 @@ def test_rejects_incomplete_or_inconsistent_evidence(docs, mutation):
 def test_rejects_missing_candidate(docs):
     with pytest.raises(ValueError, match="fixed two controls"):
         compare(docs[:2], docs[2:4])
+
+
+def test_actual_single_observation_uses_unchanged_envelope(docs):
+    one = compare_observations(docs[:2], docs[2:3])
+    three = compare(docs[:2], docs[2:])
+    assert one["candidates"] == three["candidates"][:1]
+    assert one["tolerance_nat_per_token"] == three["tolerance_nat_per_token"] == 0.01
+    update_window(docs[2], 3, -2.011)
+    assert not compare_observations(docs[:2], docs[2:3])["passed"]
+    with pytest.raises(ValueError, match="observations"):
+        compare_observations(docs[:2], [])
 
 
 def test_negative_needle_cannot_pass_with_consistent_summary(docs):

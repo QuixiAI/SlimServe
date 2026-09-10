@@ -35,7 +35,26 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): prompt scoring eliminates recovered OOM warnings
+### Latest checkpoint (2026-09-10): fresh production-policy rollout CPU-qualified
+
+New `benchmarks/run_glm53_prompt_score_rollout.py` prescribes exactly one control,
+three chunked candidates, one return with independent EMPTY compile caches and
+native-order0 (production). No AOT transplant/forced loading or arithmetic diagnostics.
+Three exact1000/300 c1/c8/c16 repeats, text/image, one quality pass/start and cold
+32K/128K. Each start must satisfy pinned chronological production quality references;
+final candidates also satisfy unchanged1/3/1 window/aggregate gates against fresh
+controls. No duplicated observations or tolerance relaxation. Strict cold counts,
+native/hardware/source freeze, all artifacts retained, no retry/replacement.
+
+CPU365 pass/35.88s and real-registry/evidence inspection pass. No GPU start yet.
+NEXT after commit: run the exact controller command in
+`perf/glm53-prompt-score-rollout-protocol.md`. CPU8GiB/serve150GiB/swap0. Also
+requires candidate performance nonregression,<=2.5% across-start TPS spread,
+historical absolute throughput floor, and allocation warnings in controls but zero
+in all three candidates. Failure stops rollout and leaves profile default unchanged.
+The source freeze lasts through terminal report. Parent process owns no GPU context.
+
+### Previous checkpoint (2026-09-10): prompt scoring eliminates recovered OOM warnings
 
 Series on414829029 CLOSED/PASS: exactly control/chunked/return, all27 timing rounds,
 nine quality passes, text/image and cold32K/128K pass. Every4096 text/168 needle

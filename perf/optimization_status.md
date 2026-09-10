@@ -27881,3 +27881,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
 - Raw: `perf/results/2026-09-10/prompt-score-serving-v1/closure.json`, SHA
   27c35be7e4a7bbd5de6b2b2a0d48b8af1a306c38e450590e0ff85e516eb8529b.
   Commands, spread and retained failure history: `perf/glm53-prompt-score-protocol.md`.
+
+## 2026-09-10 - Prepare production-policy prompt-score rollout with fresh caches
+
+- Status: CPU-qualified; fixed1/3/1 serving series pending.
+- Baseline/hypothesis: completed memory-fix diagnostic has exact scores and8->0->8
+  warnings, but uses native-order1. Production is native-order0, part of the AOT key.
+  Qualify under actual production policy and independently empty caches; do not
+  assume copied diagnostic artifact results exonerate fresh compiler variability.
+- Change: small dedicated rollout controller reuses real profile campaign and
+  exact-token/prefill/quality audits. Existing1/3/1 quality comparator unchanged;
+  extracted same fixed envelope can gate an actual single start without synthetic
+  duplicates. Pin chronological retained BF16fn1/native-order0 reference starts.
+- Gates: exactly control/three candidates/return; three timing repeats per start,
+  one full quality pass, text/image/cold32K/128K. Every start passes historical
+  window gates, final candidates also pass fresh1/3/1 gates. Candidate relative
+  TPS/TTFT<=2.5% regression; across-start TPS spread<=2.5%; all starts meet97.5%
+  of historical TPS floor. All three candidates zero allocation warnings; controls
+  reproduce warnings. No retries/replacements or compiler/quality relaxation.
+- Correctness: final365 CPU tests pass/35.88s; tests cover failure preservation,
+  scopes, policy isolation, real profile paths and all audit gates. Initial CPU
+  inspection exposed a lazy `Plan.entry_file` check outside its environment;
+  fixed and regression-covered before any GPU start. Evidence inspection passed.
+- Decision: commit then run prescribed controller, CPU8GiB/serve150GiB/swap0,
+  source freeze through terminal report. No profile/default/quant/native change yet.
+- Raw: `perf/results/2026-09-10/runtime-control/prompt-score-rollout-cpu-v3.xml`;
+  earlier passing363/364-test reports retained. Exact command, references and
+  predeclared gates: `perf/glm53-prompt-score-rollout-protocol.md`.

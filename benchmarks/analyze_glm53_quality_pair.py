@@ -113,6 +113,20 @@ def compare(controls, candidates):
         len(controls) == 2 and len(candidates) == 3,
         "fixed two controls and three candidates required",
     )
+    return compare_observations(controls, candidates)
+
+
+def compare_observations(controls, candidates):
+    """Apply the same quality envelope to actual observations, without replicas.
+
+    The historical 1/3/1 CLI and ``compare`` retain their exact cardinality. This
+    entry point also checks each fresh production start against pinned historical
+    controls before proceeding. It does not expose a tolerance override.
+    """
+    require(
+        len(controls) == 2 and len(candidates) > 0,
+        "two controls and observations required",
+    )
     documents = [*controls, *candidates]
     scores = [verified_quality(d) for d in documents]
     identity = input_identity(controls[0])
