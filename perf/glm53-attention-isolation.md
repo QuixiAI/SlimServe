@@ -438,3 +438,67 @@ the full no-combo explanation; isolated model effects need not add linearly.
 The separate indexer LayerNorm128 affine-cancellation oracle failure remains open
 (max 5/28 BF16 ULP original/split). Inspect its retained worst-element evidence
 before another replacement. No next GPU/model job prescribed yet.
+
+## CPU indexer precision boundaries (2026-09-10)
+
+Status: completed diagnostic; no kernel or serving promotion. Baseline remains
+the source-exact probe's failed one-BF16-ULP oracle (original max5, split max28).
+Hypothesis: the final affine's cancellation might be fixed by increasing only
+affine precision. The experiment rejects that simple fix on the saved matrix.
+
+`benchmarks/analyze_glm53_indexer_precision.py` joins four pinned completed
+receipts, checks the entire 120-pair order and all-rank numerical equality, then
+reconstructs the 30 unique cases and both input phases. Every packed-input hash,
+all four real layer11 BF16 weight hashes and all 26 retained failing scalars
+verify. The full FP64 control exactly matches the unchanged chunked oracle.
+The original worst split point again has result 3.982235657895572e-7 and
+cancellation ratio 2,883,902.4; its saved GPU result is not replaced by CPU data.
+
+All models below round final outputs to BF16; 12,711,936 unique elements each.
+CPU reductions, rsqrt and explicit dtype boundaries are **not** reproductions
+of Triton trees, GPU instructions/contraction or saved kernel outputs.
+
+| CPU arithmetic model | Outputs above 1 ULP | Failing phases /60 | Max BF16 ULP |
+| --- | ---: | ---: | ---: |
+| FP32 moments, normalization, separate affine | 21 | 11 | 22 |
+| FP32 normalization, fused-affine emulation | 19 | 10 | 20 |
+| FP32 normalization, FP64 affine | 19 | 10 | 20 |
+| FP32 moments, FP64 recenter/rsqrt/normalization/affine | 9 | 7 | 8 |
+| FP64 normalization rounded to FP32, FP64 affine | 8 | 6 | 5 |
+| Full FP64 reference/control | 0 | 0 | 0 |
+
+Fused-affine emulation evaluates the final product/add in FP64 and rounds to
+FP32 before BF16. It and the FP64-affine model have identical BF16 outputs on
+this matrix. That alone does not repair errors introduced earlier. Both the
+FP32 moment boundary and FP32 normalized-value rounding can independently leave
+failures even when subsequent arithmetic is FP64. This is not a proof that every
+possible FP32 formulation fails or that wider arithmetic ensures model quality.
+
+Next bounded hypothesis: use a cancellation detector to trigger extended-
+precision recomputation for a small subset, preserving original outputs
+elsewhere. First screen detector coverage and row/element fraction on CPU;
+do not choose a tolerance after looking at a GPU result. Any eventual candidate
+still needs GPU numerical, replay, mutation/stride guards, source/binary binding
+and model-quality validation. The KV-only result shows why local ULP parity
+cannot substitute for that model gate. No GPU/model job is prescribed here.
+
+CPU tests: final 70 pass/2.94s (initial 47 pass/1.59s), including joins,
+failed-gate preservation, rank drift,
+input mutation/shape/dtype rejection, chunked FP64 control, scalar reconstruction
+and exclusive output/failure retention. Ruff/diff checks pass. Resources: CPU
+one Torch/OMP thread, 8 GiB, swap0, CUDA hidden and uninitialized. No native build,
+production/default/quant change, speed measurement or quality-floor change.
+
+Commands (CPU analysis performed once, on 95efefa6f plus hashed analyzer):
+
+```bash
+systemd-run --user --scope --unit=glm53-indexer-precision-cpu-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/slimserve/test_indexer_precision_analysis.py tests/slimserve/test_attention_norm_probe.py --junitxml=perf/results/2026-09-10/runtime-control/indexer-precision-cpu-v1.xml
+systemd-run --user --scope --unit=glm53-indexer-precision-analysis-v1 -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.analyze_glm53_indexer_precision --output perf/results/2026-09-10/runtime-control/indexer-precision-analysis-v1.json
+systemd-run --user --scope --unit=glm53-indexer-precision-cpu-final -p MemoryMax=8G -p MemorySwapMax=0 env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 .venv/bin/python -m pytest -q tests/slimserve/test_indexer_precision_analysis.py tests/slimserve/test_attention_norm_probe.py tests/slimserve/test_cached_rmsnorm_probe.py tests/slimserve/test_attention_contracts.py --junitxml=perf/results/2026-09-10/runtime-control/indexer-precision-cpu-final.xml
+```
+
+Raw `runtime-control/indexer-precision-analysis-v1.json` under 2026-09-10, SHA
+358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764;
+per-case metrics, output hashes, failing coordinates and scalar model values
+retained. Historical GPU receipt hashes are pinned in the analyzer and report;
+their completed audits are consumed without rerunning expired freeze checks.

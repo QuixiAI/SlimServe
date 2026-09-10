@@ -1965,6 +1965,14 @@ are 157.332/580.279/778.425 (control), 156.585/577.794/778.805 (KV),
 Raw `kv-serving-v1/closure.json` under 2026-09-10, SHA
 a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588.
 
+Subsequent CPU indexer precision analysis rejects affine-only repair: all60
+reconstructed phases/12,711,936 unique elements verify, but FP64 affine after
+FP32 normalization still leaves19 outputs above1BF16ULP. Even FP64 normalization
+rounded to FP32 before affine leaves eight. These CPU models are not GPU-source
+reproductions; original/split oracle gates remain failed. No new TPS/default or
+stable baseline. Raw `runtime-control/indexer-precision-analysis-v1.json`, SHA
+358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764, under 2026-09-10.
+
 ### RTX6000 paired lossless mHC storage retained - 2026-09-08
 
 Selected recipe v1, BF16 KV/activations/lm_head and spill-free indexer unchanged.

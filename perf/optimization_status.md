@@ -27573,3 +27573,30 @@ Down projection (N=4096, K=512), v3: c1 10.7 us (49%; load-only 10.4), c8 54.9 u
   a4e2ac3b120e3493cf11586a5b258123ad257d1de2cf67aacec8c1ace4478588.
   All manifests/caches/logs/worker/workload/launch/audit artifacts retained.
   Commands/results: `perf/glm53-kv-serving-protocol.md`. CPU gate 628 pass/52.07 s.
+
+## 2026-09-10 - Indexer precision analysis rejects affine-only repair
+
+- Status: CPU diagnostic complete; no GPU/serving qualification.
+- Scope/baseline: fixed GLM53 recipe v1/SM120 TP4. Original/split LayerNorm128
+  retain failed one-BF16-ULP gate (max5/28); production arithmetic unchanged.
+- Hypothesis: increasing only affine precision repairs cancellation failures.
+- Change: offline six-model CPU analyzer of the pinned completed probe. All120
+  pair records join; four ranks agree exactly. Reconstruct60 packed inputs,
+  four real layer11 weight hashes and all26 retained failing scalars.
+- Correctness/results: 12,711,936 unique outputs per model. Above1ULP/maxULP:
+  FP32 separate21/22; fused-affine emulation19/20; FP64 affine-only19/20;
+  FP32 moments+FP64 tail9/8; FP64 normalization roundedFP32+FP64 affine8/5.
+  Full FP64 is the exact oracle control. CPU models do not reproduce GPU
+  reduction trees/rsqrt/contraction; no claim of source-exact GPU causality.
+- Tests: final 70 pass/2.94s, initial47 pass/1.59s; Ruff/diff pass.
+  CPU8GiB/swap0, one thread, CUDA hidden
+  and uninitialized. No GPU/model process, native build, TPS, default/quant
+  change or quality relaxation. No stable baseline changes.
+- Decision: reject affine-only precision hypothesis on this matrix. Screen
+  cancellation-triggered extended-precision recomputation next; record detector
+  coverage and affected row fraction before a GPU prototype. No GPU job yet.
+  Original oracle remains failed and model-quality qualification remains required.
+- Raw: `runtime-control/indexer-precision-analysis-v1.json` and
+  `indexer-precision-cpu-{v1,final}.xml` under 2026-09-10; analysis SHA
+  358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764.
+  Exact paths, commands and limitations: `perf/glm53-attention-isolation.md`.

@@ -35,7 +35,37 @@ trees, messages or dates. Original hashes in this handoff and raw receipts map
 through `perf/glm53-sm120-authorship-map.json`; a local backup branch preserves
 the old history. Upstream history is unchanged and nothing was pushed.
 
-### Latest checkpoint (2026-09-10): KV-only model comparison complete; candidate rejected
+### Latest checkpoint (2026-09-10): indexer CPU precision boundaries isolated
+
+`benchmarks/analyze_glm53_indexer_precision.py` consumes the pinned completed
+rank-private probe, not its expired source freeze. All four rank records match;
+all 60 packed-input hashes, four real layer11 weight hashes and 26 retained
+failing scalars reproduce. Six CPU arithmetic models cover 12,711,936 unique
+indexer outputs. These are NOT GPU-source reproductions or serving measurements.
+
+FP32 separate affine has 21 outputs above one BF16 ULP (max22); fused-affine
+emulation/FP64 affine alone each leave 19 (max20). FP32 moments with an FP64
+tail leave nine (max8). Even FP64 normalization rounded to FP32 before FP64
+affine leaves eight (max5). Full FP64 is the exact reference control, not a
+qualified candidate. Affine-only precision is insufficient on this matrix;
+both moment precision and the normalized-value rounding boundary matter.
+
+CPU tests: 70 passed/2.94s; Ruff/diff checks pass. No GPU/model job, native build,
+production/default/quant change, tolerance relaxation or new speed baseline.
+Raw `runtime-control/indexer-precision-analysis-v1.json` under 2026-09-10, SHA
+`358f4a155dbeea926e4e6e3f7b192c8c9e3ded3a0f4ee5b857d1951af7502764`.
+Details and command: final section of `perf/glm53-attention-isolation.md`.
+
+NEXT: screen a cancellation-triggered extended-precision recomputation on CPU,
+including detector coverage and fraction of affected rows, before prescribing a
+GPU prototype. It must not round the normalized value back to FP32 ahead of
+affine. This is a hypothesis, not approval to install a replacement: the original
+GPU oracle remains failed; GPU numerical/replay/guard and full model quality
+checks remain required. Preserve original production attention arithmetic.
+The rejected KV-only result and startup-variability investigation remain open
+context; no next GPU/model job or source freeze is active.
+
+### Previous checkpoint (2026-09-10): KV-only model comparison complete; candidate rejected
 
 On `c42b72325`, exactly control/KV/return-control completed, one private cache and
 one start each. All serving/worker/workload audits and final closure passed. Both
